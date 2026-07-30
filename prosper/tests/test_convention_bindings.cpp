@@ -79,6 +79,34 @@ int main() {
         CHECK(distinct, "every resource gets a distinct binding");
     }
 
+    // A separately-installed fetch prolog and main shader share one architectural register file,
+    // descriptor set, and linked instruction stream. Main-program fetch provenance must move by the
+    // exact executable prolog prefix while every resource receives a fresh collision-free binding.
+    {
+        auto prolog = std::make_shared<ShaderResourceTable>();
+        auto main = std::make_shared<ShaderResourceTable>();
+        ShaderResource prolog_buffer = res(RC::VertexBuffer);
+        prolog_buffer.fetch_pc = 1;
+        ShaderResource main_buffer = res(RC::ConstantBuffer);
+        main_buffer.fetch_pc = 3;
+        ShaderResource main_texture = res(RC::Texture);
+        main_texture.fetch_pc = 7;
+        prolog->resources.push_back(prolog_buffer);
+        main->resources = {main_buffer, main_texture};
+
+        const auto merged = merge_vertex_chain_resource_tables(prolog, main, 10);
+        CHECK(merged && merged->resources.size() == 3,
+              "vertex prolog/main resource contracts merge without dropping entries");
+        CHECK(merged && merged->resources[0].fetch_pc == 1 &&
+                  merged->resources[1].fetch_pc == 13 && merged->resources[2].fetch_pc == 17,
+              "main-program fetch provenance is rebased by the linked prolog prefix");
+        CHECK(merged && merged->resources[0].binding == 2 &&
+                  merged->resources[1].binding == 3 && merged->resources[2].binding == 4,
+              "linked vertex resources receive one collision-free descriptor layout");
+        CHECK(merge_vertex_chain_resource_tables(nullptr, nullptr, 10) == nullptr,
+              "an empty vertex chain retains the absent resource-table contract");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

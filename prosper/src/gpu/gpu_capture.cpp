@@ -12,6 +12,7 @@
 #include "rdna2_decode.hpp"
 #include "rdna2_to_spirv.hpp"
 #include "tile.hpp"
+#include "videoout_present.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -64,7 +65,23 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v29: retain resolved depth-bias state per realized and failed pipeline.
 // v30: each const-fold-resolved buffer fetch retains its proven vertex/instance/shader VADDR source.
 // This is a per-resource trailing block so every v1-v29 record prefix stays byte-exact.
-constexpr uint32_t kVersion = 30;
+// v31: retain an optional linked vertex-main raw stream and the graphics-LDS allocation per draw.
+// v32: retain the per-layer full-mip-chain stride and selected-level offset for thin 2D arrays and
+// cube faces. Without them replay treated layer one's allocation-level bytes as layer zero's mip.
+// v33: extend the append-only DataFormat enum with 8/16-bit USCALED and SSCALED buffer formats.
+// Their numeric values follow every v1-v32 value, so old captures remain byte-identical/readable.
+// v34: retain all eight hardware color-buffer slots and their fixed-function state.
+// v35: retain the exact resource-descriptor metadata for each failed shader stage. This makes a
+// table-dependent recompile retry deterministic offline instead of reducing the table to a count.
+// v36: retain the resolved SPI_PS_INPUT_CNTL linkage (including metadata-only PARAM0 passthrough)
+// and SPI_PS_INPUT_ENA/ADDR system-VGPR ABI for every realized draw. Raw graphics replay otherwise
+// invents a different module even when the captured RDNA2 bytes are exact.
+// v37: retain the required compute subgroup size. Native-subgroup SPIR-V reconstructs guest wave
+// membership from SubgroupId/SubgroupLocalInvocationId and therefore must replay with the same
+// required-size/full-subgroups pipeline contract used when the module was created.
+// v38: extend the existing RTT-seed color-format enum with R8_UNORM and R32_UINT. No record layout
+// changes: older versions never contain the new append-only enum values.
+constexpr uint32_t kVersion = 38;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -262,6 +279,74 @@ bool read_mrt1_pipeline(Reader& r, ResolvedPipelineState& p) {
            r.u32(p.color1_write_mask);
 }
 
+void write_color_target_pipeline(Writer& w, const ResolvedPipelineState::ColorTarget& target) {
+    w.u32(target.format); w.u8(target.has_clear);
+    for (float value : target.clear) w.f32(value);
+    w.u8(target.blend_enable);
+    w.u32(target.src_color_blend_factor); w.u32(target.dst_color_blend_factor);
+    w.u32(target.color_blend_op); w.u32(target.src_alpha_blend_factor);
+    w.u32(target.dst_alpha_blend_factor); w.u32(target.alpha_blend_op);
+    w.u32(target.write_mask); w.u8(target.disable_rop3);
+}
+
+bool read_color_target_pipeline(Reader& r, ResolvedPipelineState::ColorTarget& target) {
+    uint8_t has_clear = 0, blend_enable = 0, disable_rop3 = 0;
+    if (!r.u32(target.format) || !r.u8(has_clear) || has_clear > 1) return false;
+    for (float& value : target.clear) if (!r.f32(value)) return false;
+    if (!r.u8(blend_enable) || blend_enable > 1 ||
+        !r.u32(target.src_color_blend_factor) ||
+        !r.u32(target.dst_color_blend_factor) || !r.u32(target.color_blend_op) ||
+        !r.u32(target.src_alpha_blend_factor) ||
+        !r.u32(target.dst_alpha_blend_factor) || !r.u32(target.alpha_blend_op) ||
+        !r.u32(target.write_mask) || target.write_mask > 0xfu ||
+        !r.u8(disable_rop3) || disable_rop3 > 1)
+        return false;
+    target.has_clear = has_clear != 0;
+    target.blend_enable = blend_enable != 0;
+    target.disable_rop3 = disable_rop3 != 0;
+    return true;
+}
+
+void restore_legacy_color_target_aliases(GpuCapturedDraw& draw) {
+    draw.color_targets[0] = {draw.color0_base, draw.color0_width, draw.color0_height};
+    draw.color_targets[1] = {draw.color1_base, draw.color1_width, draw.color1_height};
+    auto& target0 = draw.ps.color_targets[0];
+    target0.format = draw.ps.color0_format; target0.has_clear = draw.ps.has_clear_color;
+    std::copy(std::begin(draw.ps.clear_color), std::end(draw.ps.clear_color), target0.clear);
+    target0.blend_enable = draw.ps.blend_enable;
+    target0.src_color_blend_factor = draw.ps.src_color_blend_factor;
+    target0.dst_color_blend_factor = draw.ps.dst_color_blend_factor;
+    target0.color_blend_op = draw.ps.color_blend_op;
+    target0.src_alpha_blend_factor = draw.ps.src_alpha_blend_factor;
+    target0.dst_alpha_blend_factor = draw.ps.dst_alpha_blend_factor;
+    target0.alpha_blend_op = draw.ps.alpha_blend_op;
+    target0.write_mask = draw.ps.color_write_mask;
+    auto& target1 = draw.ps.color_targets[1];
+    target1.format = draw.ps.color1_format; target1.has_clear = draw.ps.has_clear_color1;
+    std::copy(std::begin(draw.ps.clear_color1), std::end(draw.ps.clear_color1), target1.clear);
+    target1.blend_enable = draw.ps.blend1_enable;
+    target1.src_color_blend_factor = draw.ps.src_color_blend_factor1;
+    target1.dst_color_blend_factor = draw.ps.dst_color_blend_factor1;
+    target1.color_blend_op = draw.ps.color_blend_op1;
+    target1.src_alpha_blend_factor = draw.ps.src_alpha_blend_factor1;
+    target1.dst_alpha_blend_factor = draw.ps.dst_alpha_blend_factor1;
+    target1.alpha_blend_op = draw.ps.alpha_blend_op1;
+    target1.write_mask = draw.ps.color1_write_mask;
+}
+
+void restore_legacy_color_target_aliases(GpuCapturedOperationFailure& diagnostic) {
+    diagnostic.color_targets[0] = {
+        diagnostic.color0_base, diagnostic.color0_width, diagnostic.color0_height};
+    diagnostic.color_targets[1] = {
+        diagnostic.color1_base, diagnostic.color1_width, diagnostic.color1_height};
+    if (!diagnostic.pipeline_present) return;
+    GpuCapturedDraw aliases;
+    aliases.ps = diagnostic.pipeline;
+    restore_legacy_color_target_aliases(aliases);
+    diagnostic.pipeline.color_targets[0] = aliases.ps.color_targets[0];
+    diagnostic.pipeline.color_targets[1] = aliases.ps.color_targets[1];
+}
+
 void write_scissor_pipeline(Writer& w, const ResolvedPipelineState& p) {
     w.u8(p.has_scissor);
     w.u32(std::bit_cast<uint32_t>(p.scissor_left));
@@ -312,7 +397,7 @@ void write_resource(Writer& w, const GpuCapturedResource& c) {
 bool read_resource(Reader& rd, GpuCapturedResource& c, uint32_t version) {
     auto& r = c.resource; uint32_t cls, fmt; uint8_t b;
     if (!rd.u32(cls) || cls > static_cast<uint32_t>(ResourceClass::StorageImage) ||
-        !rd.u32(fmt) || fmt > static_cast<uint32_t>(DataFormat::Sint2_10_10_10)) return false;
+        !rd.u32(fmt) || fmt > static_cast<uint32_t>(DataFormat::Sscaled16)) return false;
     r.cls = static_cast<ResourceClass>(cls); r.format = static_cast<DataFormat>(fmt);
     if (!rd.u32(r.num_components) || !rd.u32(r.binding) || !rd.u64(r.gpu_addr) || !rd.u32(r.size) ||
         !rd.u32(r.stride) || !rd.u32(r.srt_offset) || !rd.u32(r.sgpr_base) || !rd.u32(r.fetch_pc) ||
@@ -361,32 +446,54 @@ uint32_t resolved_linear_row_pitch(const ShaderResource& r, uint32_t width, uint
 uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tight) {
     uint64_t result = r.size;
     if (r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage) return result;
-    const uint64_t layers = r.img_dim == 3u ? 6u : (r.img_dim == 2u ? std::max(r.depth, 1u) : 1u);
+    const uint64_t layers = r.img_dim == 3u ? 6u
+        : ((r.img_dim == 2u || r.img_dim == 5u) ? std::max(r.depth, 1u) : 1u);
     uint32_t w = r.width ? r.width : 4, h = r.height ? r.height : 4;
     const uint32_t bc = bc_block_bytes(r.format);
     uint64_t decoded = 0;
+    bool decoded_is_volume = false;
     if (bc) {
         uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
         decoded = tile_mode_is_tiled(r.tile_mode) ? tiled_elements_bytes(bw, bh, bc, r.tile_mode)
                                                   : checked_mul(checked_mul(bw, bh), bc);
     } else {
         uint32_t bpt = data_format_bytes(r.format) * (r.num_components ? r.num_components : 1);
-        const bool f16 = r.format == DataFormat::Float16 && (bpt == 2 || bpt == 4 || bpt == 8);
-        if (bpt == 0 || (bpt > 4 && !f16)) bpt = 4;
+        const bool native_wide = r.cls == ResourceClass::StorageImage ||
+            (r.format == DataFormat::Float16 && (bpt == 2 || bpt == 4 || bpt == 8));
+        if (bpt == 0 || (bpt > 4 && !native_wide)) bpt = 4;
         if (tile_mode_is_tiled(r.tile_mode)) {
-            decoded = tiled_surface_bytes(w, h, r.tile_mode, 0, bpt);
+            if (r.img_dim == 2u && r.depth > 1u) {
+                decoded = tiled_volume_bytes(w, h, r.depth, r.tile_mode, bpt);
+                decoded_is_volume = decoded != 0;
+            }
+            if (!decoded_is_volume)
+                decoded = tiled_surface_bytes(w, h, r.tile_mode, 0, bpt);
         } else if (r.tile_mode == static_cast<uint32_t>(TileMode::Linear) &&
-                   r.cls == ResourceClass::Texture && r.img_dim == 1u &&
+                   ((r.cls == ResourceClass::Texture && r.img_dim == 1u) ||
+                    ((r.img_dim == 3u || r.img_dim == 5u) && r.layer_stride_bytes)) &&
                    !r.compression_enabled && !legacy_linear_tight) {
             // Guest-backed linear sampled images default to GFX10's 256-byte row alignment. Exact
             // HLE-producer provenance may override it (AvPlayer's CPU-staged NV12 is tight). Capturing
             // only width*height*bpt made genuinely padded video planes drift and omitted their tail.
-            decoded = checked_mul(resolved_linear_row_pitch(r, w, bpt), h);
+            const uint32_t row_pitch = (r.img_dim == 3u || r.img_dim == 5u)
+                ? static_cast<uint32_t>(linear_sampled_row_pitch(w, bpt))
+                : resolved_linear_row_pitch(r, w, bpt);
+            decoded = checked_mul(row_pitch, h);
         } else {
             decoded = checked_mul(checked_mul(w, h), bpt);
         }
     }
-    decoded = checked_mul(decoded, layers);
+    if (r.layer_stride_bytes && layers > 1) {
+        const uint64_t selected_bytes = r.in_mip_tail ? r.mip_tail_bytes : decoded;
+        const uint64_t level_offset = r.in_mip_tail ? 0u : r.layer_mip_offset_bytes;
+        decoded = checked_mul(r.layer_stride_bytes, layers - 1u);
+        decoded = decoded > UINT64_MAX - level_offset
+            ? UINT64_MAX : decoded + level_offset;
+        decoded = decoded > UINT64_MAX - selected_bytes
+            ? UINT64_MAX : decoded + selected_bytes;
+    } else if (!decoded_is_volume) {
+        decoded = checked_mul(decoded, layers);
+    }
     return std::max(result, decoded);
 }
 
@@ -444,7 +551,24 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
             uint64_t n = resource_footprint(r);
             if (n) {
                 if (n > kMaxBlobBytes || r.gpu_addr > std::numeric_limits<uint64_t>::max() - n) {
-                    error = "resource capture range is invalid or exceeds 1 GiB"; return false;
+                    char detail[512];
+                    std::snprintf(
+                        detail, sizeof(detail),
+                        "resource capture range is invalid or exceeds 1 GiB: binding=%u class=%u "
+                        "addr=0x%llx declared=%llu footprint=%llu format=%u components=%u "
+                        "extent=%ux%ux%u img-dim=%u tile=%u layer-stride=%llu "
+                        "layer-mip-offset=%llu mip-tail=%d/%llu",
+                        r.binding, static_cast<unsigned>(r.cls),
+                        static_cast<unsigned long long>(r.gpu_addr),
+                        static_cast<unsigned long long>(r.size),
+                        static_cast<unsigned long long>(n), static_cast<unsigned>(r.format),
+                        r.num_components, r.width, r.height, r.depth, r.img_dim, r.tile_mode,
+                        static_cast<unsigned long long>(r.layer_stride_bytes),
+                        static_cast<unsigned long long>(r.layer_mip_offset_bytes),
+                        r.in_mip_tail ? 1 : 0,
+                        static_cast<unsigned long long>(r.mip_tail_bytes));
+                    error = detail;
+                    return false;
                 }
                 intervals.push_back({r.gpu_addr, r.gpu_addr + n});
             }
@@ -557,7 +681,15 @@ bool env_enabled(const char* name) {
     return value && *value && std::strcmp(value, "0") && std::strcmp(value, "off");
 }
 
-bool capture_resource_limit(uint64_t& bytes, std::string& error) {
+bool capture_resource_limit(uint64_t& bytes, std::string& error, uint64_t override_bytes = 0) {
+    if (override_bytes) {
+        if (override_bytes > kMaxTotalBlobBytes) {
+            error = "capture resource limit exceeds 3 GiB";
+            return false;
+        }
+        bytes = override_bytes;
+        return true;
+    }
     bytes = kDefaultResourceCaptureBytes;
     const char* value = std::getenv("PROSPER_GPU_CAPTURE_MAX_MB");
     if (!value || !*value) return true;
@@ -579,6 +711,9 @@ bool validate_rtt_seed(const GpuCaptureRttSeed& seed, std::string& error) {
     switch (seed.format) {
         case GpuCaptureColorFormat::Rgba8Unorm: bytes_per_pixel = 4; break;
         case GpuCaptureColorFormat::Rgba16Float: bytes_per_pixel = 8; break;
+        case GpuCaptureColorFormat::R11G11B10Float: bytes_per_pixel = 4; break;
+        case GpuCaptureColorFormat::R8Unorm: bytes_per_pixel = 1; break;
+        case GpuCaptureColorFormat::R32Uint: bytes_per_pixel = 4; break;
         default: error = "RTT seed has an unsupported color format"; return false;
     }
     const uint64_t pixels = checked_mul(seed.width, seed.height);
@@ -799,7 +934,8 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
     std::set<OperationIdentity> diagnosed;
     std::vector<bool> raw_referenced(capture.raw_shader_versions.size(), false);
     for (const auto& draw : capture.draws) {
-        for (uint32_t index : {draw.vs_raw_shader_index, draw.fs_raw_shader_index}) {
+        for (uint32_t index : {draw.vs_raw_shader_index, draw.fs_raw_shader_index,
+                               draw.vs_chain_raw_shader_index}) {
             if (index == 0xFFFFFFFFu) continue;
             if (index >= capture.raw_shader_versions.size()) {
                 error = "realized draw references an invalid raw shader";
@@ -831,7 +967,13 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
             error = "duplicate failed-operation diagnostic";
             return false;
         }
-        std::set<uint8_t> stage_kinds;
+        // A hardware graphics stage can be assembled from more than one separately allocated
+        // program.  In particular, AGC's NGG vertex path binds a prolog that transfers control to
+        // the separately registered main shader.  Keep both raw streams in a failed-operation
+        // diagnostic: treating the logical stage as unique made exactly the capture needed to
+        // diagnose a linked-stage failure impossible.  The (kind,address) identity must still be
+        // unique so an accidentally duplicated record remains fail-visible.
+        std::set<std::pair<uint8_t, uint64_t>> stage_programs;
         for (const auto& stage : diagnostic.stages) {
             if (stage.stage > ShaderProgramStage::Compute ||
                 (stage.raw_shader_index != 0xFFFFFFFFu &&
@@ -844,8 +986,19 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
                 stage.coverage.unsupported > stage.coverage.total ||
                 (!stage.resource_table_present && stage.resource_count != 0) ||
                 (!stage.program_addr && stage.raw_shader_index != 0xFFFFFFFFu) ||
-                !stage_kinds.insert(static_cast<uint8_t>(stage.stage)).second) {
+                !stage_programs.emplace(static_cast<uint8_t>(stage.stage),
+                                        stage.program_addr).second) {
                 error = "invalid failed-stage diagnostic metadata";
+                return false;
+            }
+            // Rewriting a v7-v34 capture cannot invent tables that the old file reduced to a
+            // presence/count summary. Preserve that summary with an absent v35 table so retry
+            // reports "capture predates v35" explicitly. Any table that is actually retained must
+            // agree exactly with the summary.
+            if ((stage.resource_table.present || !stage.resource_table.resources.empty()) &&
+                (stage.resource_table.present != stage.resource_table_present ||
+                 stage.resource_table.resources.size() != stage.resource_count)) {
+                error = "failed-stage resource table disagrees with its diagnostic summary";
                 return false;
             }
             if (stage.raw_shader_index != 0xFFFFFFFFu)
@@ -895,6 +1048,11 @@ bool capture_failure_diagnostics(
         diagnostic.color1_base = failure.color1_base;
         diagnostic.color1_width = failure.color1_width;
         diagnostic.color1_height = failure.color1_height;
+        diagnostic.color_targets = failure.color_targets;
+        diagnostic.color_targets[0] = {
+            diagnostic.color0_base, diagnostic.color0_width, diagnostic.color0_height};
+        diagnostic.color_targets[1] = {
+            diagnostic.color1_base, diagnostic.color1_width, diagnostic.color1_height};
         diagnostic.vertex_count = failure.vertex_count;
         diagnostic.compute_launch = failure.compute_launch;
         for (const auto& runtime_stage : failure.stages) {
@@ -908,6 +1066,8 @@ bool capture_failure_diagnostics(
             stage.coverage = runtime_stage.coverage;
             stage.descriptor_issue_count = runtime_stage.descriptor_issue_count;
             stage.first_descriptor_issue = runtime_stage.first_descriptor_issue;
+            if (!capture_table(runtime_stage.resources.get(), {}, false,
+                               stage.resource_table, error)) return false;
             if (!capture_raw_shader_version(stage.program_addr, reader, capture, raw_words,
                                             raw_shader_index_by_address,
                                             stage.raw_shader_index, error)) return false;
@@ -941,6 +1101,27 @@ bool capture_failure_diagnostics(
 }
 
 } // namespace
+
+void annotate_gpu_capture_scanout(GpuCaptureMetadata& metadata) {
+    const uint64_t address = present_front_address();
+    if (!address) return;
+    char value[24];
+    std::snprintf(value, sizeof(value), "0x%llx",
+                  static_cast<unsigned long long>(address));
+    const auto existing = std::find_if(metadata.renderer_env.begin(), metadata.renderer_env.end(),
+        [](const auto& entry) { return entry.first == kGpuReplayScanoutAddressEnv; });
+    if (existing == metadata.renderer_env.end())
+        metadata.renderer_env.emplace_back(kGpuReplayScanoutAddressEnv, value);
+    else
+        existing->second = value;
+}
+
+uint64_t parse_gpu_replay_scanout_address(const char* value) {
+    if (!value || !*value) return 0;
+    char* end = nullptr;
+    const uint64_t parsed = std::strtoull(value, &end, 0);
+    return end && end != value && !*end ? parsed : 0;
+}
 
 uint64_t gpu_capture_resource_footprint(const ShaderResource& resource) {
     return resource_footprint(resource);
@@ -998,7 +1179,8 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                           const CaptureMemoryReader& reader, GpuCaptureFile& out,
                           std::string& error, const CaptureRttSeedReader& rtt_reader,
                           const std::vector<OperationRealizationFailure>& failures,
-                          const std::vector<GpuState::DmaCopy>& dma_copies) {
+                          const std::vector<GpuState::DmaCopy>& dma_copies,
+                          uint64_t resource_limit_bytes_override) {
     error.clear(); out = {}; out.format_version = kVersion; out.metadata = metadata;
     out.failure_diagnostics_available = true;
     if (draws.size() > kMaxDraws || computes.size() > kMaxComputes ||
@@ -1009,7 +1191,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
     if (!reader) { error = "capture memory reader is missing"; return false; }
     const bool include_resource_data = !env_enabled("PROSPER_GPU_CAPTURE_METADATA_ONLY");
     uint64_t resource_limit_bytes = 0;
-    if (!capture_resource_limit(resource_limit_bytes, error)) return false;
+    if (!capture_resource_limit(resource_limit_bytes, error, resource_limit_bytes_override)) return false;
     if (!include_resource_data && std::none_of(
             out.metadata.renderer_env.begin(), out.metadata.renderer_env.end(),
             [](const auto& entry) { return entry.first == "PROSPER_GPU_CAPTURE_METADATA_ONLY"; }))
@@ -1044,13 +1226,24 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.color0_width = d.color0_width; c.color0_height = d.color0_height;
         c.color1_base = d.color1_base;
         c.color1_width = d.color1_width; c.color1_height = d.color1_height;
+        c.color_targets = d.color_targets;
+        c.color_targets[0] = {c.color0_base, c.color0_width, c.color0_height};
+        c.color_targets[1] = {c.color1_base, c.color1_width, c.color1_height};
         c.draw_index = d.draw_index; c.command_order = d.command_order;
         if (!capture_raw_shader_version(d.vs_guest_addr, reader, out, raw_shader_words,
                                         raw_shader_index_by_address,
                                         c.vs_raw_shader_index, error) ||
             !capture_raw_shader_version(d.fs_guest_addr, reader, out, raw_shader_words,
                                         raw_shader_index_by_address,
-                                        c.fs_raw_shader_index, error)) return false;
+                                        c.fs_raw_shader_index, error) ||
+            !capture_raw_shader_version(d.vs_chain_guest_addr, reader, out, raw_shader_words,
+                                        raw_shader_index_by_address,
+                                        c.vs_chain_raw_shader_index, error)) return false;
+        c.vertex_lds_dwords = d.vertex_lds_dwords;
+        c.pixel_inputs = d.pixel_inputs;
+        c.system_inputs = d.system_inputs;
+        c.has_pixel_inputs = d.has_pixel_inputs;
+        c.has_system_inputs = d.has_system_inputs;
         if (!capture_table(d.vrt.get(), intervals, include_resource_data, c.vrt, error) ||
             !capture_table(d.prt.get(), intervals, include_resource_data, c.prt, error)) return false;
         out.draws.push_back(std::move(c));
@@ -1063,6 +1256,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.dispatch_index = compute.dispatch_index;
         c.submit_no = compute.submit_no;
         c.command_order = compute.command_order;
+        c.required_subgroup_size = compute.required_subgroup_size;
         if (!capture_table(compute.resources.get(), intervals, include_resource_data,
                            c.resources, error)) return false;
         out.computes.push_back(std::move(c));
@@ -1121,6 +1315,9 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         };
         for (const auto& item : draws) {
             add_table(item.vrt.get()); add_table(item.prt.get());
+            for (const auto& target : item.color_targets)
+                if (target.base) candidates.push_back(target.base);
+            // Preserve direct callers that only populate the named compatibility fields.
             if (item.color0_base) candidates.push_back(item.color0_base);
             if (item.color1_base) candidates.push_back(item.color1_base);
         }
@@ -1170,7 +1367,8 @@ static CaptureMemoryReader ordered_gpustate_capture_reader(const GpuState& state
 bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              uint32_t width, uint32_t height,
                              const GpuCaptureMetadata& metadata,
-                             GpuCaptureFile& out, std::string& error) {
+                             GpuCaptureFile& out, std::string& error,
+                             uint64_t resource_limit_bytes) {
     const bool caplog = std::getenv("PROSPER_GPU_CAPTURE_LOG") != nullptr;
     std::vector<OperationRealizationFailure> failures, compute_failures;
     if (caplog) std::fprintf(stderr, "[cap] realize_gpustate_draws...\n");
@@ -1190,7 +1388,8 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
     // ordered DMA reads its host pixels, so overlay those exact bytes into the pre-submit closure.
     CaptureMemoryReader ordered_reader = ordered_gpustate_capture_reader(state);
     return capture_submit_items(draws, computes, ops, actual, ordered_reader, out, error,
-                                g_rtt_seed_reader, failures, state.dma_copies);
+                                g_rtt_seed_reader, failures, state.dma_copies,
+                                resource_limit_bytes);
 }
 
 bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
@@ -1688,6 +1887,104 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         write_fetch_index_modes(draw.prt);
     }
     for (const auto& compute : c.computes) write_fetch_index_modes(compute.resources);
+    // v31 retains a separately-installed NGG vertex main stage and the exact graphics-LDS
+    // allocation. This lets diagnostic replay reconstruct linked prolog+main programs instead of
+    // incorrectly probing the fetch prolog alone. Older captures keep both fields unavailable.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        w.u32(draw.vs_chain_raw_shader_index);
+        w.u32(draw.vertex_lds_dwords);
+    }
+    // v32 keeps the selected mip's placement inside every thin-2D array or cube slice. This is a
+    // trailing block so v1-v31 records remain byte-exact and old captures retain their tight-layer
+    // default.
+    w.u32(static_cast<uint32_t>(resource_depth_count));
+    auto write_layer_layout = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            const ShaderResource& resource = captured.resource;
+            const bool enabled = resource.layer_stride_bytes != 0;
+            if ((!enabled && resource.layer_mip_offset_bytes != 0) ||
+                (enabled && ((resource.img_dim != 3 && resource.img_dim != 5) ||
+                             resource.depth < 2 ||
+                             resource.layer_mip_offset_bytes >= resource.layer_stride_bytes ||
+                             (resource.in_mip_tail && resource.layer_mip_offset_bytes != 0)))) {
+                error = "invalid resource layered mip layout";
+                return false;
+            }
+            w.u32(resource.layer_stride_bytes);
+            w.u32(resource.layer_mip_offset_bytes);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_layer_layout(draw.vrt) || !write_layer_layout(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_layer_layout(compute.resources)) return false;
+    // v34 retains all hardware color-buffer slots. MRT0/MRT1 keep their byte-exact historical
+    // records; this tail adds slots 2..7 so live and standalone replay execute the same deferred
+    // rendering graph instead of silently discarding G-buffer exports.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        for (uint32_t slot = 2; slot < kColorTargetCount; ++slot) {
+            const auto& binding = draw.color_targets[slot];
+            w.u64(binding.base); w.u32(binding.width); w.u32(binding.height);
+            write_color_target_pipeline(w, draw.ps.color_targets[slot]);
+        }
+    }
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics) {
+        for (uint32_t slot = 2; slot < kColorTargetCount; ++slot) {
+            const auto& binding = diagnostic.color_targets[slot];
+            w.u64(binding.base); w.u32(binding.width); w.u32(binding.height);
+        }
+        if (diagnostic.pipeline_present)
+            for (uint32_t slot = 2; slot < kColorTargetCount; ++slot)
+                write_color_target_pipeline(w, diagnostic.pipeline.color_targets[slot]);
+    }
+    // v35 keeps failed-stage descriptor metadata in a self-contained tail. The ordinary table
+    // prefix already includes every field the recompiler uses for binding/provenance decisions;
+    // blob references are intentionally unset because a failed stage is retried, not rendered.
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics) {
+        w.u32(static_cast<uint32_t>(diagnostic.stages.size()));
+        for (const auto& stage : diagnostic.stages) write_table(w, stage.resource_table);
+    }
+    // v36 keeps the exact pixel-stage ABI used for the stored modules. Fields are conditional so a
+    // draw with no programmed SPI input state remains explicit instead of gaining an invented zero
+    // mapping during replay.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        if ((draw.has_pixel_inputs && !draw.pixel_inputs.valid_mask) ||
+            (draw.pixel_inputs.passthrough_mask & ~draw.pixel_inputs.valid_mask) ||
+            (draw.has_system_inputs && !draw.system_inputs.ena && !draw.system_inputs.addr)) {
+            error = "invalid realized-draw pixel-stage ABI";
+            return false;
+        }
+        const uint8_t flags = (draw.has_pixel_inputs ? 1u : 0u) |
+                              (draw.has_system_inputs ? 2u : 0u);
+        w.u8(flags);
+        if (draw.has_pixel_inputs) {
+            w.u32(draw.pixel_inputs.valid_mask);
+            w.u32(draw.pixel_inputs.passthrough_mask);
+            for (uint32_t control : draw.pixel_inputs.controls) w.u32(control);
+        }
+        if (draw.has_system_inputs) {
+            w.u32(draw.system_inputs.ena);
+            w.u32(draw.system_inputs.addr);
+        }
+    }
+    // v37 keeps the pipeline-stage contract beside the already-stored native-subgroup module.
+    // The realized translator only emits wave32/wave64 modules; reject invented values here so a
+    // malformed capsule cannot ask Vulkan for an unrelated device-specific subgroup width.
+    w.u32(static_cast<uint32_t>(c.computes.size()));
+    for (const auto& compute : c.computes) {
+        if (compute.required_subgroup_size != 0 && compute.required_subgroup_size != 32 &&
+            compute.required_subgroup_size != 64) {
+            error = "invalid compute required-subgroup size";
+            return false;
+        }
+        w.u32(compute.required_subgroup_size);
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2372,6 +2669,139 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         for (auto& compute : c.computes)
             if (!read_fetch_index_modes(compute.resources)) return false;
     }
+    if (version >= 31) {   // linked NGG vertex main stage + graphics LDS
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid linked-vertex draw-state count"; return false;
+        }
+        for (auto& draw : c.draws) {
+            if (!r.u32(draw.vs_chain_raw_shader_index) || !r.u32(draw.vertex_lds_dwords))
+                return false;
+            if (draw.vertex_lds_dwords > 16384u) {
+                error = "invalid linked-vertex LDS allocation"; return false;
+            }
+        }
+    }
+    if (version >= 32) {   // selected mip placement inside each thin-2D array or cube slice
+        size_t expected = 0;
+        for (auto& draw : c.draws) expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (auto& compute : c.computes) expected += compute.resources.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid resource layered layout count"; return false;
+        }
+        auto read_layer_layout = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                ShaderResource& resource = captured.resource;
+                if (!r.u32(resource.layer_stride_bytes) ||
+                    !r.u32(resource.layer_mip_offset_bytes))
+                    return false;
+                const bool enabled = resource.layer_stride_bytes != 0;
+                if ((!enabled && resource.layer_mip_offset_bytes != 0) ||
+                    (enabled && ((resource.img_dim != 3 && resource.img_dim != 5) ||
+                                 resource.depth < 2 ||
+                                 resource.layer_mip_offset_bytes >= resource.layer_stride_bytes ||
+                                 (resource.in_mip_tail && resource.layer_mip_offset_bytes != 0)))) {
+                    error = "invalid resource layered mip layout";
+                    return false;
+                }
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_layer_layout(draw.vrt) || !read_layer_layout(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_layer_layout(compute.resources)) return false;
+    }
+    if (version >= 34) {   // complete hardware color-target bindings and pipeline state
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid complete-MRT draw-state count"; return false;
+        }
+        for (auto& draw : c.draws) {
+            for (uint32_t slot = 2; slot < kColorTargetCount; ++slot) {
+                auto& binding = draw.color_targets[slot];
+                if (!r.u64(binding.base) || !r.u32(binding.width) || !r.u32(binding.height) ||
+                    !read_color_target_pipeline(r, draw.ps.color_targets[slot]))
+                    return false;
+            }
+        }
+        uint32_t failure_count = 0;
+        if (!r.u32(failure_count) || failure_count != c.failure_diagnostics.size()) {
+            error = "invalid complete-MRT failure-state count"; return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics) {
+            for (uint32_t slot = 2; slot < kColorTargetCount; ++slot) {
+                auto& binding = diagnostic.color_targets[slot];
+                if (!r.u64(binding.base) || !r.u32(binding.width) || !r.u32(binding.height))
+                    return false;
+            }
+            if (diagnostic.pipeline_present)
+                for (uint32_t slot = 2; slot < kColorTargetCount; ++slot)
+                    if (!read_color_target_pipeline(
+                            r, diagnostic.pipeline.color_targets[slot])) return false;
+        }
+    }
+    if (version >= 35) {   // exact failed-stage resource-descriptor metadata
+        uint32_t failure_count = 0;
+        if (!r.u32(failure_count) || failure_count != c.failure_diagnostics.size()) {
+            error = "invalid failed-stage resource-table failure count"; return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics) {
+            uint32_t stage_count = 0;
+            if (!r.u32(stage_count) || stage_count != diagnostic.stages.size()) {
+                error = "invalid failed-stage resource-table stage count"; return false;
+            }
+            for (auto& stage : diagnostic.stages)
+                if (!read_table(r, stage.resource_table, version)) return false;
+        }
+    }
+    if (version >= 36) {   // exact resolved pixel-stage ABI for raw graphics replay
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid pixel-stage ABI draw count"; return false;
+        }
+        for (auto& draw : c.draws) {
+            uint8_t flags = 0;
+            if (!r.u8(flags) || (flags & ~3u)) {
+                error = "invalid realized-draw pixel-stage ABI flags"; return false;
+            }
+            draw.has_pixel_inputs = (flags & 1u) != 0;
+            draw.has_system_inputs = (flags & 2u) != 0;
+            if (draw.has_pixel_inputs) {
+                if (!r.u32(draw.pixel_inputs.valid_mask) ||
+                    !r.u32(draw.pixel_inputs.passthrough_mask)) return false;
+                for (uint32_t& control : draw.pixel_inputs.controls)
+                    if (!r.u32(control)) return false;
+                if (!draw.pixel_inputs.valid_mask ||
+                    (draw.pixel_inputs.passthrough_mask & ~draw.pixel_inputs.valid_mask)) {
+                    error = "invalid realized-draw pixel input mapping"; return false;
+                }
+            }
+            if (draw.has_system_inputs) {
+                if (!r.u32(draw.system_inputs.ena) || !r.u32(draw.system_inputs.addr)) return false;
+                if (!draw.system_inputs.ena && !draw.system_inputs.addr) {
+                    error = "invalid realized-draw pixel system inputs"; return false;
+                }
+            }
+        }
+    }
+    if (version >= 37) {   // exact required-size/full-subgroups compute pipeline contract
+        uint32_t compute_count = 0;
+        if (!r.u32(compute_count) || compute_count != c.computes.size()) {
+            error = "invalid compute subgroup-contract count"; return false;
+        }
+        for (auto& compute : c.computes) {
+            if (!r.u32(compute.required_subgroup_size)) return false;
+            if (compute.required_subgroup_size != 0 && compute.required_subgroup_size != 32 &&
+                compute.required_subgroup_size != 64) {
+                error = "invalid compute required-subgroup size"; return false;
+            }
+        }
+    }
+    for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
+    for (auto& diagnostic : c.failure_diagnostics)
+        restore_legacy_color_target_aliases(diagnostic);
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
@@ -2480,10 +2910,20 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         d.color0_width = x.color0_width; d.color0_height = x.color0_height;
         d.color1_base = x.color1_base;
         d.color1_width = x.color1_width; d.color1_height = x.color1_height;
+        d.color_targets = x.color_targets;
+        d.color_targets[0] = {d.color0_base, d.color0_width, d.color0_height};
+        d.color_targets[1] = {d.color1_base, d.color1_width, d.color1_height};
         d.draw_index = x.draw_index; d.command_order = x.command_order;
         d.vs_raw_shader_index = x.vs_raw_shader_index;
         d.fs_raw_shader_index = x.fs_raw_shader_index;
+        d.vs_chain_raw_shader_index = x.vs_chain_raw_shader_index;
+        d.vertex_lds_dwords = x.vertex_lds_dwords;
+        d.pixel_inputs = x.pixel_inputs;
+        d.system_inputs = x.system_inputs;
+        d.has_pixel_inputs = x.has_pixel_inputs;
+        d.has_system_inputs = x.has_system_inputs;
         if (!table(x.vrt, d.vrt) || !table(x.prt, d.prt)) return false;
+        if (d.vrt) d.vrt->vertices_per_instance = d.vertex_count;
         out.items.push_back(std::move(d));
     }
     out.computes.reserve(c.computes.size());
@@ -2495,6 +2935,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         compute.dispatch_index = x.dispatch_index;
         compute.submit_no = x.submit_no;
         compute.command_order = x.command_order;
+        compute.required_subgroup_size = x.required_subgroup_size;
         if (!table(x.resources, compute.resources)) return false;
         out.computes.push_back(std::move(compute));
     }
@@ -2530,6 +2971,19 @@ bool read_gpu_capture_rtt_seed(uint64_t guest_addr, GpuCaptureRttSeed& seed, std
     if (!g_rtt_seed_reader) { error = "live renderer has no RTT seed reader"; return false; }
     if (!g_rtt_seed_reader(guest_addr, seed)) { error = "render target is absent from live cache"; return false; }
     return validate_rtt_seed(seed, error);
+}
+bool capture_gpu_rtt_seed(GpuCaptureFile& capture, uint64_t guest_addr, std::string& error) {
+    error.clear();
+    if (!guest_addr) return true;
+    if (std::any_of(capture.rtt_seeds.begin(), capture.rtt_seeds.end(),
+                    [&](const GpuCaptureRttSeed& seed) {
+                        return seed.guest_addr == guest_addr;
+                    }))
+        return true;
+    GpuCaptureRttSeed seed;
+    if (!read_gpu_capture_rtt_seed(guest_addr, seed, error)) return false;
+    capture.rtt_seeds.push_back(std::move(seed));
+    return true;
 }
 void set_gpu_capture_rtt_seed_snapshot_reader(CaptureRttSeedSnapshotReader reader) {
     g_rtt_seed_snapshot_reader = std::move(reader);
@@ -2664,6 +3118,7 @@ namespace {
 // non-empty path means a grab is armed; the guard makes arm/consume race-free across threads.
 std::mutex g_interactive_capture_mx;
 std::string g_interactive_capture_path;
+std::atomic<bool> g_output_capture_claimed{false};
 std::string take_interactive_gpu_capture() {
     std::lock_guard<std::mutex> lk(g_interactive_capture_mx);
     return std::exchange(g_interactive_capture_path, std::string());
@@ -2679,12 +3134,63 @@ bool interactive_gpu_capture_armed() {
     return !g_interactive_capture_path.empty();
 }
 
+bool gpu_capture_output_nonzero_matches(const std::vector<uint8_t>& output, size_t min_nonzero,
+                                        size_t max_nonzero, size_t* observed) {
+    const size_t nonzero = static_cast<size_t>(std::count_if(
+        output.begin(), output.end(), [](uint8_t value) { return value != 0; }));
+    if (observed) *observed = nonzero;
+    return !output.empty() && nonzero >= min_nonzero &&
+           (!max_nonzero || nonzero <= max_nonzero);
+}
+
+namespace {
+bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
+                                     const std::vector<DrawItem>& draws,
+                                     const std::vector<ComputeItem>& computes,
+                                     const std::vector<SubmitOperation>& operations,
+                                     const GpuState* semantic_state,
+                                     const std::vector<OperationRealizationFailure>* exact_failures,
+                                     std::string& error) {
+    const GpuCaptureMetadata metadata = pending.capture.metadata;
+    const bool has_ordered_dma = semantic_state && !semantic_state->dma_copies.empty();
+    bool captured = false;
+    if (has_ordered_dma) {
+        captured = capture_gpustate_submit(*semantic_state, metadata.submit_index,
+                                           metadata.width, metadata.height, metadata,
+                                           pending.capture, error);
+    } else {
+        // Preserve exact realized lists while retaining diagnostics for semantic operations rejected
+        // before they reached those lists.
+        std::vector<OperationRealizationFailure> failures = exact_failures
+            ? *exact_failures : std::vector<OperationRealizationFailure>{};
+        if (semantic_state && !exact_failures) {
+            std::vector<OperationRealizationFailure> compute_failures;
+            (void)realize_gpustate_draws(*semantic_state, 0x10000, 1.0f, 1.0f,
+                                         &failures, false, false);
+            (void)realize_compute_dispatches(*semantic_state, metadata.submit_index,
+                                             &compute_failures);
+            failures.insert(failures.end(),
+                            std::make_move_iterator(compute_failures.begin()),
+                            std::make_move_iterator(compute_failures.end()));
+        }
+        captured = capture_submit_items(draws, computes, operations, metadata,
+                                        read_capture_guest_memory, pending.capture, error,
+                                        g_rtt_seed_reader, failures);
+    }
+    if (!captured) return false;
+    pending.materialized = true;
+    return !gpu_capture_ds_seed_snapshot_available() ||
+           capture_referenced_gpu_ds_seeds(pending.capture, error);
+}
+}  // namespace
+
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     const std::vector<DrawItem>& draws, const std::vector<ComputeItem>& computes,
     const std::vector<SubmitOperation>& operations, uint32_t width, uint32_t height,
-    const GpuState* semantic_state, uint64_t submit_no, uint64_t semantic_draw_count) {
-    const bool has_ordered_dma = semantic_state && !semantic_state->dma_copies.empty();
-    const uint64_t candidate_draw_count = has_ordered_dma && semantic_draw_count != UINT64_MAX
+    const GpuState* semantic_state, uint64_t submit_no, uint64_t semantic_draw_count,
+    const std::vector<OperationRealizationFailure>* exact_failures,
+    bool defer_materialization) {
+    const uint64_t candidate_draw_count = semantic_state && semantic_draw_count != UINT64_MAX
         ? semantic_draw_count : static_cast<uint64_t>(draws.size());
     // Interactive one-shot (hotkey): consume the armed request on the first DRAWING invocation so the
     // grab lands on real frame content, and skip the env AT/AFTER/MIN selectors (a live keypress has no
@@ -2695,6 +3201,9 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     const bool interactive = !interactive_path.empty();
     const char* env_path = std::getenv("PROSPER_GPU_CAPTURE");
     if (!interactive && (!env_path || !*env_path)) return {};
+    const char* output_min_env = std::getenv("PROSPER_GPU_CAPTURE_OUTPUT_NZ_MIN");
+    const bool output_triggered = !interactive && output_min_env && *output_min_env;
+    if (output_triggered && g_output_capture_claimed.load(std::memory_order_acquire)) return {};
     uint64_t current = 0;
     if (!interactive) {
         static std::atomic<uint64_t> invocation_sequence{0};
@@ -2702,18 +3211,91 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
         uint64_t after = 0;
         if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER")) after = std::strtoull(v, nullptr, 0);
         if (invocation < after) return {};
+        static const auto capture_started = std::chrono::steady_clock::now();
+        if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER_MS")) {
+            const uint64_t after_ms = std::strtoull(v, nullptr, 0);
+            const uint64_t elapsed_ms = static_cast<uint64_t>(std::chrono::duration_cast<
+                std::chrono::milliseconds>(std::chrono::steady_clock::now() - capture_started).count());
+            if (elapsed_ms < after_ms) return {};
+        }
+        if (const char* value = std::getenv("PROSPER_GPU_CAPTURE_COMPUTE_ADDR")) {
+            char* end = nullptr;
+            errno = 0;
+            const uint64_t wanted_code_addr = std::strtoull(value, &end, 0);
+            if (errno || end == value || !end || *end) return {};
+            const bool realized_contains_program = std::any_of(
+                computes.begin(), computes.end(), [&](const ComputeItem& compute) {
+                    return compute.code_addr == wanted_code_addr;
+                });
+            const bool semantic_contains_program = semantic_state && std::any_of(
+                semantic_state->dispatches.begin(), semantic_state->dispatches.end(),
+                [&](const GpuState::Dispatch& dispatch) {
+                    return compute_dispatch_code_addr(*semantic_state, dispatch) == wanted_code_addr;
+                });
+            if (!realized_contains_program && !semantic_contains_program) return {};
+        }
+        if (const char* value = std::getenv("PROSPER_GPU_CAPTURE_SHADER_ADDR")) {
+            char* end = nullptr;
+            errno = 0;
+            const uint64_t wanted_code_addr = std::strtoull(value, &end, 0);
+            if (errno || end == value || !end || *end) return {};
+            const bool realized_contains_program = std::any_of(
+                draws.begin(), draws.end(), [&](const DrawItem& draw) {
+                    return draw.vs_guest_addr == wanted_code_addr ||
+                           draw.vs_chain_guest_addr == wanted_code_addr ||
+                           draw.fs_guest_addr == wanted_code_addr;
+                });
+            const bool semantic_contains_program = semantic_state && std::any_of(
+                semantic_state->draws.begin(), semantic_state->draws.end(),
+                [&](const GpuState::Draw& draw) {
+                    const GpuState& draw_state = draw.state ? *draw.state : *semantic_state;
+                    const RenderState state = extract_render_state(draw_state);
+                    return state.es_addr == wanted_code_addr || state.gs_addr == wanted_code_addr ||
+                           state.hs_addr == wanted_code_addr || state.ps_addr == wanted_code_addr;
+                });
+            if (!realized_contains_program && !semantic_contains_program) return {};
+        }
+        if (const char* value = std::getenv("PROSPER_GPU_CAPTURE_TARGET_DIM")) {
+            uint32_t wanted_width = 0, wanted_height = 0;
+            char trailing = 0;
+            if (std::sscanf(value, "%ux%u%c", &wanted_width, &wanted_height, &trailing) != 2 ||
+                !wanted_width || !wanted_height)
+                return {};
+            const bool realized_contains_target = std::any_of(
+                draws.begin(), draws.end(), [&](const DrawItem& draw) {
+                    return draw.color0_width == wanted_width && draw.color0_height == wanted_height;
+                });
+            const bool semantic_contains_target = semantic_state && std::any_of(
+                semantic_state->draws.begin(), semantic_state->draws.end(),
+                [&](const GpuState::Draw& draw) {
+                    const GpuState& draw_state = draw.state ? *draw.state : *semantic_state;
+                    const RenderState state = extract_render_state(draw_state);
+                    return state.color0_width == wanted_width &&
+                           state.color0_height == wanted_height;
+                });
+            if (!realized_contains_target && !semantic_contains_target) return {};
+        }
         uint64_t min_draws = 0, max_draws = std::numeric_limits<uint64_t>::max();
         if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MIN_DRAWS")) min_draws = std::strtoull(v, nullptr, 0);
         if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MAX_DRAWS")) max_draws = std::strtoull(v, nullptr, 0);
         if (candidate_draw_count < min_draws || candidate_draw_count > max_draws) return {};
         static std::atomic<uint64_t> sequence{0}; static std::atomic<bool> claimed{false};
         current = sequence.fetch_add(1);
-        uint64_t wanted = 0;
-        if (const char* at = std::getenv("PROSPER_GPU_CAPTURE_AT")) wanted = std::strtoull(at, nullptr, 0);
-        if (current != wanted || claimed.exchange(true)) return {};
+        if (!output_triggered) {
+            uint64_t wanted = 0;
+            if (const char* at = std::getenv("PROSPER_GPU_CAPTURE_AT")) wanted = std::strtoull(at, nullptr, 0);
+            if (current != wanted || claimed.exchange(true)) return {};
+        }
     }
     auto pending = std::make_unique<PendingGpuCapture>();
+    pending->materialized = false;
     pending->path = interactive ? interactive_path : std::string(env_path);
+    pending->output_triggered = output_triggered;
+    if (output_triggered) {
+        pending->output_min_nonzero = static_cast<size_t>(std::strtoull(output_min_env, nullptr, 0));
+        if (const char* max = std::getenv("PROSPER_GPU_CAPTURE_OUTPUT_NZ_MAX"))
+            pending->output_max_nonzero = static_cast<size_t>(std::strtoull(max, nullptr, 0));
+    }
     GpuCaptureMetadata m; m.width = width; m.height = height;
     m.submit_index = submit_no ? submit_no : current;
 #ifdef PROSPER_GIT_REVISION
@@ -2741,29 +3323,95 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
         "PROSPER_TESTLUT", "PROSPER_TESTLUT32"
     };
     for (const char* name : render_env) if (const char* value = std::getenv(name)) m.renderer_env.emplace_back(name, value);
+    annotate_gpu_capture_scanout(m);
+    pending->capture.metadata = m;
+    // Output predicates must remain observational: do not read guest resources or renderer caches
+    // for rejected candidates. The synchronous executor supplies the still-valid semantic state only
+    // after this same submit's pixels match, and materialization happens once for that winner.
+    if (output_triggered || defer_materialization) return pending;
     std::string error;
-    const bool captured = has_ordered_dma
-        ? capture_gpustate_submit(*semantic_state, m.submit_index, width, height, m,
-                                  pending->capture, error)
-        : capture_submit_items(draws, computes, operations, m, read_capture_guest_memory,
-                               pending->capture, error, g_rtt_seed_reader);
-    if (!captured) {
+    if (!materialize_pending_gpu_capture(*pending, draws, computes, operations,
+                                         semantic_state, exact_failures, error)) {
         std::fprintf(stderr, "[gpucap] capture failed: %s\n", error.c_str()); return {};
     }
+    // A normal one-shot capture has the same temporal DS dependency as a timeline endpoint.  The
+    // renderer callback runs before this submit is executed, so these are the exact pre-submit
+    // planes consumed by depth/stencil reads in the capsule.  Timeline capture has always added
+    // them explicitly; omitting them here made F9/environment capsules replay a different frame
+    // whenever the selected submit reused persistent depth or stencil from an earlier submit.
     std::fprintf(stderr, "[gpucap] captured %s submit %llu: %zu draws, %zu computes, "
-                         "%zu DMA copies, %zu operations, %zu blobs, %zu RTT seeds -> %s\n",
+                         "%zu DMA copies, %zu operations, %zu blobs, %zu RTT seeds, "
+                         "%zu DS seeds -> %s\n",
                  interactive ? "interactive" : "match",
                  static_cast<unsigned long long>(m.submit_index),
                  pending->capture.draws.size(), pending->capture.computes.size(),
                  pending->capture.dma_copies.size(), pending->capture.operations.size(),
                  pending->capture.blobs.size(),
-                 pending->capture.rtt_seeds.size(), pending->path.c_str());
+                 pending->capture.rtt_seeds.size(), pending->capture.ds_seeds.size(),
+                 pending->path.c_str());
     return pending;
 }
 
 bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
-                                  const std::vector<uint8_t>& output, std::string& error) {
+                                  const std::vector<uint8_t>& output, std::string& error,
+                                  const std::vector<DrawItem>* draws,
+                                  const std::vector<ComputeItem>* computes,
+                                  const std::vector<SubmitOperation>* operations,
+                                  const GpuState* semantic_state,
+                                  const std::vector<OperationRealizationFailure>* exact_failures) {
     if (!pending) return true;
+    if (pending->output_triggered) {
+        size_t nonzero = 0;
+        if (!gpu_capture_output_nonzero_matches(output, pending->output_min_nonzero,
+                                                pending->output_max_nonzero, &nonzero)) {
+            std::fprintf(stderr,
+                         "[gpucap] output candidate submit %llu rejected: nonzero=%zu range=%zu..%zu\n",
+                         static_cast<unsigned long long>(pending->capture.metadata.submit_index), nonzero,
+                         pending->output_min_nonzero, pending->output_max_nonzero);
+            return true;
+        }
+        if (g_output_capture_claimed.load(std::memory_order_acquire)) return true;
+        std::fprintf(stderr,
+                     "[gpucap] output trigger matched submit %llu: nonzero=%zu range=%zu..%zu\n",
+                     static_cast<unsigned long long>(pending->capture.metadata.submit_index), nonzero,
+                     pending->output_min_nonzero, pending->output_max_nonzero);
+        if (!draws || !operations) {
+            error = "output-triggered capture is missing its synchronous submit state";
+            return false;
+        }
+        static const std::vector<ComputeItem> no_computes;
+        if (!materialize_pending_gpu_capture(*pending, *draws,
+                                             computes ? *computes : no_computes,
+                                             *operations, semantic_state, exact_failures, error))
+            return false;
+        if (g_output_capture_claimed.exchange(true, std::memory_order_acq_rel)) return true;
+        std::fprintf(stderr,
+                     "[gpucap] captured output match submit %llu: %zu draws, %zu computes, "
+                     "%zu operations, %zu blobs, %zu RTT seeds, %zu DS seeds -> %s\n",
+                     static_cast<unsigned long long>(pending->capture.metadata.submit_index),
+                     pending->capture.draws.size(), pending->capture.computes.size(),
+                     pending->capture.operations.size(), pending->capture.blobs.size(),
+                     pending->capture.rtt_seeds.size(), pending->capture.ds_seeds.size(),
+                     pending->path.c_str());
+    }
+    if (!pending->materialized) {
+        if (!draws || !operations) {
+            error = "deferred capture is missing its exact submit realization";
+            return false;
+        }
+        static const std::vector<ComputeItem> no_computes;
+        if (!materialize_pending_gpu_capture(*pending, *draws,
+                                             computes ? *computes : no_computes,
+                                             *operations, semantic_state, exact_failures, error))
+            return false;
+        std::fprintf(stderr,
+                     "[gpucap] captured deferred submit %llu: %zu draws, %zu computes, "
+                     "%zu operations, %zu failures -> %s\n",
+                     static_cast<unsigned long long>(pending->capture.metadata.submit_index),
+                     pending->capture.draws.size(), pending->capture.computes.size(),
+                     pending->capture.operations.size(),
+                     pending->capture.failure_diagnostics.size(), pending->path.c_str());
+    }
     pending->capture.expected_output_valid = !output.empty();
     pending->capture.expected_output_bytes = output.size();
     pending->capture.expected_output_hash = output.empty() ? 0 : gpu_capture_hash(output);

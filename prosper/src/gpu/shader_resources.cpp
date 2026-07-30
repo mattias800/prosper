@@ -16,9 +16,11 @@ uint32_t data_format_bytes(DataFormat f) {
     switch (f) {
         case DataFormat::Float32: case DataFormat::Uint32: case DataFormat::Sint32: return 4;
         case DataFormat::Float16: case DataFormat::Unorm16: case DataFormat::Snorm16:
-        case DataFormat::Uint16:  case DataFormat::Sint16:  return 2;
+        case DataFormat::Uint16:  case DataFormat::Sint16:
+        case DataFormat::Uscaled16: case DataFormat::Sscaled16: return 2;
         case DataFormat::Unorm8:  case DataFormat::Snorm8:
-        case DataFormat::Uint8:   case DataFormat::Sint8:   return 1;
+        case DataFormat::Uint8:   case DataFormat::Sint8:
+        case DataFormat::Uscaled8: case DataFormat::Sscaled8: return 1;
         default: return 0;
     }
 }
@@ -271,6 +273,7 @@ struct TypeInfo {
     uint32_t image_dim = 0xFFFFFFFFu;
     bool image_arrayed = false;
     bool image_depth = false;
+    bool image_multisampled = false;
     bool scalar_float = false;
     std::vector<uint32_t> members;
 };
@@ -347,54 +350,31 @@ SpirvDescriptorKind descriptor_kind(const VariableInfo& var,
     return SpirvDescriptorKind::Unknown;
 }
 
-bool descriptor_storage_float(const VariableInfo& var,
-                              const std::unordered_map<uint32_t, TypeInfo>& types) {
+const TypeInfo* descriptor_image_type(const VariableInfo& var,
+                                      const std::unordered_map<uint32_t, TypeInfo>& types) {
     auto pi = types.find(var.pointer_type);
-    if (pi == types.end() || pi->second.kind != TypeKind::Pointer) return false;
+    if (pi == types.end() || pi->second.kind != TypeKind::Pointer) return nullptr;
     uint32_t type = pi->second.element;
     for (uint32_t depth = 0; depth < 8; ++depth) {
         auto ti = types.find(type);
-        if (ti == types.end()) return false;
-        if (ti->second.kind == TypeKind::Array) {
+        if (ti == types.end()) return nullptr;
+        if (ti->second.kind == TypeKind::Array || ti->second.kind == TypeKind::SampledImage) {
             type = ti->second.element;
             continue;
         }
-        if (ti->second.kind != TypeKind::Image || ti->second.image_sampled != 2) return false;
-        auto sampled_type = types.find(ti->second.element);
-        return sampled_type != types.end() && sampled_type->second.kind == TypeKind::Scalar &&
-               sampled_type->second.scalar_float;
+        return ti->second.kind == TypeKind::Image ? &ti->second : nullptr;
     }
-    return false;
+    return nullptr;
 }
 
-struct DescriptorImageShape {
-    uint32_t dim = 0xFFFFFFFFu;
-    bool arrayed = false;
-    bool depth = false;
-};
-
-DescriptorImageShape descriptor_image_shape(
-    const VariableInfo& var, const std::unordered_map<uint32_t, TypeInfo>& types) {
-    auto pi = types.find(var.pointer_type);
-    if (pi == types.end() || pi->second.kind != TypeKind::Pointer) return {};
-    uint32_t type = pi->second.element;
-    for (uint32_t depth = 0; depth < 8; ++depth) {
-        auto ti = types.find(type);
-        if (ti == types.end()) return {};
-        if (ti->second.kind == TypeKind::Array) {
-            type = ti->second.element;
-            continue;
-        }
-        if (ti->second.kind == TypeKind::SampledImage) {
-            type = ti->second.element;
-            continue;
-        }
-        if (ti->second.kind == TypeKind::Image)
-            return {ti->second.image_dim, ti->second.image_arrayed,
-                    ti->second.image_depth};
-        return {};
-    }
-    return {};
+bool descriptor_storage_float(const VariableInfo& var,
+                              const std::unordered_map<uint32_t, TypeInfo>& types) {
+    const TypeInfo* image = descriptor_image_type(var, types);
+    if (!image || image->image_sampled != 2) return false;
+    const auto sampled_type = types.find(image->element);
+    return sampled_type != types.end() &&
+           sampled_type->second.kind == TypeKind::Scalar &&
+           sampled_type->second.scalar_float;
 }
 
 SpirvDescriptorKind resource_kind(const ShaderResource& r) {
@@ -452,6 +432,16 @@ uint64_t reflection_entry_bytes(const DescriptorReflectionCacheEntry& entry) {
 bool DescriptorValidationReport::ok() const {
     for (const auto& issue : issues) if (issue.error) return false;
     return true;
+}
+
+const SpirvDescriptorBinding* find_spirv_descriptor_binding(
+    const DescriptorValidationReport& report, uint32_t set, uint32_t binding) {
+    const auto found = std::find_if(
+        report.descriptors.begin(), report.descriptors.end(),
+        [&](const SpirvDescriptorBinding& descriptor) {
+            return descriptor.set == set && descriptor.binding == binding;
+        });
+    return found == report.descriptors.end() ? nullptr : &*found;
 }
 
 const char* spirv_descriptor_kind_name(SpirvDescriptorKind kind) {
@@ -542,10 +532,17 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                 if (n >= 3) { TypeInfo t; t.kind = TypeKind::Vector; t.element = word(in, 1); t.count = word(in, 2); types[word(in, 0)] = t; }
                 break;
             case OpTypeImage:
-                if (n >= 8) { TypeInfo t; t.kind = TypeKind::Image; t.element = word(in, 1);
-                    t.image_dim = word(in, 2); t.image_depth = word(in, 3) == 1u;
+                if (n >= 8) {
+                    TypeInfo t;
+                    t.kind = TypeKind::Image;
+                    t.element = word(in, 1);
+                    t.image_dim = word(in, 2);
+                    t.image_depth = word(in, 3) == 1u;
                     t.image_arrayed = word(in, 4) != 0;
-                    t.image_sampled = word(in, 6); types[word(in, 0)] = t; }
+                    t.image_multisampled = word(in, 5) != 0;
+                    t.image_sampled = word(in, 6);
+                    types[word(in, 0)] = t;
+                }
                 break;
             case OpTypeSampledImage:
                 if (n >= 2) { TypeInfo t; t.kind = TypeKind::SampledImage; t.element = word(in, 1); types[word(in, 0)] = t; }
@@ -759,14 +756,24 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     for (uint32_t var : used_vars) {
         auto si = sets.find(var), bi = bindings.find(var);
         if (si == sets.end() || bi == bindings.end()) { add_malformed(report); continue; }
-        const auto image_shape = descriptor_image_shape(variables[var], types);
+        uint32_t image_dim = UINT32_MAX;
+        bool image_arrayed = false, image_multisampled = false, image_depth = false;
+        auto vi = variables.find(var);
+        const TypeInfo* image = vi == variables.end()
+            ? nullptr : descriptor_image_type(vi->second, types);
+        if (image) {
+            image_dim = image->image_dim;
+            image_arrayed = image->image_arrayed;
+            image_multisampled = image->image_multisampled;
+            image_depth = image->image_depth;
+        }
         report.descriptors.push_back({var, si->second, bi->second, descriptor_vars[var], stage,
                                       required[var], dynamic[var], read_vars.count(var) != 0,
                                       written_vars.count(var) != 0,
                                       normalized_sample_vars.count(var) != 0,
                                       texel_access_vars.count(var) != 0,
-                                      storage_float_vars.count(var) != 0,
-                                      image_shape.dim, image_shape.arrayed, image_shape.depth,
+                                      storage_float_vars.count(var) != 0, image_dim,
+                                      image_arrayed, image_multisampled, image_depth,
                                       atomic_vars.count(var) != 0});
     }
     std::sort(report.descriptors.begin(), report.descriptors.end(), [](const auto& a, const auto& b) {

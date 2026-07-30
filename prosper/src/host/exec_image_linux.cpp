@@ -2182,13 +2182,30 @@ namespace {
             // pthread stack, so non-guest words are filtered out).
             {
                 char lb[160]; int ln;
+#ifndef __APPLE__
+                // The fault can occur before a pointer-dump mode has initialized the pipe-based probe,
+                // and worker frames may live on either a host pthread stack or a guest mapping.
+                // process_vm_readv is EFAULT-safe across both kinds of mapping; use it here so the most
+                // important word -- the return address above a real-PRX call -- is not silently lost.
+                auto safe_qword = [](uint64_t addr, uint64_t* value) -> bool {
+                    struct iovec local = { value, sizeof *value };
+                    struct iovec remote = { (void*)(uintptr_t)addr, sizeof *value };
+                    return syscall(SYS_process_vm_readv, getpid(), &local, 1UL, &remote, 1UL, 0UL) ==
+                           (ssize_t)sizeof *value;
+                };
+#else
+                auto safe_qword = [](uint64_t addr, uint64_t* value) -> bool {
+                    if (!probe_readable(addr)) return false;
+                    *value = *(const uint64_t*)(uintptr_t)addr;
+                    return true;
+                };
+#endif
                 ln = snprintf(lb, sizeof lb, "[prosper]   guest fp-chain (rbp=0x%llx):\n", (unsigned long long)g_rbp);
                 if (ln > 0) raw_write(2, lb, (size_t)ln);
                 uint64_t fp = g_rbp;
                 for (int depth = 0; depth < 16; depth++) {
-                    if (!probe_readable(fp) || !probe_readable(fp + 8)) break;
-                    uint64_t ra  = *(const uint64_t*)(uintptr_t)(fp + 8);
-                    uint64_t nfp = *(const uint64_t*)(uintptr_t)fp;
+                    uint64_t ra = 0, nfp = 0;
+                    if (!safe_qword(fp, &nfp) || !safe_qword(fp + 8, &ra)) break;
                     if (g_base && ra >= g_base && ra < g_base + 0x100000000ull)
                         ln = snprintf(lb, sizeof lb, "[prosper]     #%d ra=0x%llx (eboot+0x%llx)\n",
                                       depth, (unsigned long long)ra, (unsigned long long)(ra - g_base));
@@ -2203,8 +2220,8 @@ namespace {
                 if (ln > 0) raw_write(2, lb, (size_t)ln);
                 for (int i = 0, shown = 0; i < 64 && shown < 16; i++) {
                     uint64_t sa = g_rsp + (uint64_t)i * 8;
-                    if (!probe_readable(sa)) continue;
-                    uint64_t q = *(const uint64_t*)(uintptr_t)sa;
+                    uint64_t q = 0;
+                    if (!safe_qword(sa, &q)) continue;
                     if (g_base && q >= g_base && q < g_base + 0x100000000ull) {
                         ln = snprintf(lb, sizeof lb, "[prosper]     rsp+0x%03x = 0x%llx (eboot+0x%llx)\n",
                                       i * 8, (unsigned long long)q, (unsigned long long)(q - g_base));
@@ -2631,24 +2648,21 @@ void install_trap_handler() {
     install_sigaltstack();
     struct sigaction sa{};
     sa.sa_sigaction = fault_handler;
-    sa.sa_flags = SA_SIGINFO;   // (SA_ONSTACK disabled by default: siglongjmp from the alt stack tripped
-                                // glibc's %fs-guarded ____longjmp_chk -> jump-to-garbage fault storm)
-    // PROSPER_FAULT_ONSTACK: run the handler on the per-thread sigaltstack. Needed to diagnose a
-    // guest-thread STACK OVERFLOW: the fault destroys the thread's own stack, so a handler without an
-    // alt stack cannot even enter (nested #PF -> forced-default SIGSEGV, killed with no report — the
-    // exact "fatal signal 11, no output" we see mid-load). On the alt stack the worker-thread fault
-    // path (which does NOT siglongjmp) can print the faulting RIP. Gated so the default boot's
-    // main-thread siglongjmp recovery is unchanged. CONFIDENCE: HIGH (mechanism).
-    // On macOS the alt stack is MANDATORY, not diagnostic: a guest fault whose access is on the
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    // Run the handler on the per-thread sigaltstack. Besides making stack-overflow diagnostics
+    // possible, this keeps page-protection write-watch faults out of a guest function's live SysV red
+    // zone. The old Linux opt-in predated the host-%fs restoration in fault_handler: siglongjmp once
+    // entered glibc with the guest TCB and its bogus stack guard, causing a jump-to-garbage storm.
+    // Recovery from wild/null/SIGFPE init faults now runs on the alt stack in
+    // test_initfault_dump_survives, proving that the repaired host-%fs path is safe by default.
+    // PROSPER_FAULT_NO_ONSTACK remains a diagnostic escape hatch and deliberately disables write
+    // watches through guest_write_watch_set_fault_onstack below.
+    // On macOS the alt stack is also mandatory: a guest fault whose access is on the
     // faulting thread's own stack (a bad indirect branch into the stack, a stack overflow) cannot
     // push a signal frame onto that same stack, so without SA_ONSTACK the kernel force-kills the
     // process with no handler entry (the "SIGSEGV, no output" we first saw). The Darwin recovery
-    // path siglongjmps out of the handler, which is safe from the alt stack (no glibc
-    // %fs-guarded ____longjmp_chk to trip, unlike Linux — that is why it stays opt-in there).
-#ifdef __APPLE__
-    sa.sa_flags |= SA_ONSTACK;
-#endif
-    if (getenv("PROSPER_FAULT_ONSTACK")) sa.sa_flags |= SA_ONSTACK;
+    // path likewise siglongjmps out of the handler safely.
+    if (getenv("PROSPER_FAULT_NO_ONSTACK")) sa.sa_flags &= ~SA_ONSTACK;
     // The texture write-watch (guest_write_watch.cpp) resolves its faults by return, not siglongjmp, so
     // it is red-zone-safe ONLY when this handler runs on the sigaltstack. Tell it whether that holds;
     // otherwise create() refuses to arm and callers keep the exact byte-comparison fallback (#1144).

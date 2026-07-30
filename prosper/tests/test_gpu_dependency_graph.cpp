@@ -2,6 +2,7 @@
 #include "../src/gpu/gpu_dependency_graph.hpp"
 
 #include <cstdio>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,6 +24,28 @@ static ShaderResource resource(uint64_t addr, uint64_t bytes, uint32_t binding,
     return result;
 }
 
+static void emit(std::vector<uint32_t>& spv, uint16_t op,
+                 std::initializer_list<uint32_t> words) {
+    spv.push_back((static_cast<uint32_t>(words.size() + 1) << 16) | op);
+    spv.insert(spv.end(), words.begin(), words.end());
+}
+
+static std::vector<uint32_t> storage_image_copy_spirv() {
+    // Binding 5 is read-only and binding 6 is independently write-only.
+    std::vector<uint32_t> spv = {0x07230203u, 0x00010000u, 0, 24, 0};
+    emit(spv, 15, {5, 20, 0x6e69616d, 0});
+    emit(spv, 21, {1, 32, 0});
+    emit(spv, 25, {2, 1, 1, 0, 0, 0, 2, 0});
+    emit(spv, 32, {3, 0, 2});
+    emit(spv, 59, {3, 4, 0}); emit(spv, 59, {3, 5, 0});
+    emit(spv, 71, {4, 34, 0}); emit(spv, 71, {4, 33, 5});
+    emit(spv, 71, {5, 34, 0}); emit(spv, 71, {5, 33, 6});
+    emit(spv, 61, {2, 6, 4}); emit(spv, 61, {2, 7, 5});
+    emit(spv, 98, {8, 9, 6, 10});
+    emit(spv, 99, {7, 10, 9});
+    return spv;
+}
+
 int main() {
     std::printf("== test_gpu_dependency_graph ==\n");
     GpuReplayFrame replay;
@@ -36,6 +59,8 @@ int main() {
     producer.color1_base = 0x2000;
     producer.color1_width = 8;
     producer.color1_height = 8;
+    producer.ps.color_write_mask = 0xf;
+    producer.ps.color1_write_mask = 0xf;
     producer.prt = std::make_shared<ShaderResourceTable>();
     producer.prt->resources.push_back(resource(0x1000, 0x100, 4));
 
@@ -120,6 +145,80 @@ int main() {
               scalar_compute.resources->resources.empty() && scalar_graph.edges.empty() &&
               scalar_graph.external_leaves.empty(),
           "#636: dependency graph ignores unconsumed descriptor-looking scalar arguments");
+
+    ComputeItem reflected_compute;
+    reflected_compute.dispatch_index = 637;
+    reflected_compute.command_order = 637;
+    reflected_compute.spirv = storage_image_copy_spirv();
+    reflected_compute.resources = std::make_shared<ShaderResourceTable>();
+    ShaderResource reflected_src = resource(0x7000, 4, 5, ResourceClass::StorageImage);
+    reflected_src.width = reflected_src.height = 1;
+    reflected_src.format = DataFormat::Unorm8;
+    reflected_src.num_components = 4;
+    ShaderResource reflected_dst = reflected_src;
+    reflected_dst.binding = 6;
+    reflected_dst.gpu_addr = 0x8000;
+    reflected_compute.resources->resources = {reflected_src, reflected_dst};
+    GpuReplayFrame reflected_replay;
+    reflected_replay.computes = {reflected_compute};
+    reflected_replay.operations = {
+        {SubmitOperationKind::Dispatch, 637, 637, true},
+    };
+    GpuDependencyGraph reflected_graph;
+    CHECK(build_gpu_dependency_graph(reflected_replay, reflected_graph, error) &&
+              reflected_graph.external_leaves.size() == 1 &&
+              reflected_graph.external_leaves[0].access.addr == reflected_src.gpu_addr &&
+              reflected_graph.external_leaves[0].first_future_writer == UINT32_MAX,
+          "reflected compute graph keeps the read-only input and does not invent a temporal "
+          "read of the write-only output");
+
+    GpuReplayFrame image_overlap_replay;
+    DrawItem image_writer;
+    image_writer.draw_index = 70;
+    image_writer.command_order = 70;
+    image_writer.color0_base = 0x9000;
+    image_writer.color0_width = image_writer.color0_height = 8;
+    image_writer.ps.color_write_mask = 0xf;
+    DrawItem interior_reader;
+    interior_reader.draw_index = 71;
+    interior_reader.command_order = 71;
+    interior_reader.prt = std::make_shared<ShaderResourceTable>();
+    ShaderResource interior = resource(0x9040, 4, 4, ResourceClass::Texture);
+    interior.width = interior.height = 1;
+    interior_reader.prt->resources = {interior};
+    image_overlap_replay.items = {image_writer, interior_reader};
+    image_overlap_replay.operations = {
+        {SubmitOperationKind::Draw, 70, 70, true},
+        {SubmitOperationKind::Draw, 71, 71, true},
+    };
+    GpuDependencyGraph image_overlap_graph;
+    CHECK(build_gpu_dependency_graph(image_overlap_replay, image_overlap_graph, error) &&
+              image_overlap_graph.edges.empty() &&
+              image_overlap_graph.external_leaves.size() == 1 &&
+              image_overlap_graph.external_leaves[0].first_future_writer == UINT32_MAX,
+          "an interior byte overlap does not invent an exact-base RTT image dependency");
+
+    GpuReplayFrame masked_target_replay;
+    DrawItem masked_writer = image_writer;
+    masked_writer.draw_index = 72;
+    masked_writer.command_order = 72;
+    masked_writer.ps.color_write_mask = 0;
+    DrawItem masked_reader = interior_reader;
+    masked_reader.draw_index = 73;
+    masked_reader.command_order = 73;
+    masked_reader.prt = std::make_shared<ShaderResourceTable>(*interior_reader.prt);
+    masked_reader.prt->resources[0].gpu_addr = masked_writer.color0_base;
+    masked_target_replay.items = {masked_writer, masked_reader};
+    masked_target_replay.operations = {
+        {SubmitOperationKind::Draw, 72, 72, true},
+        {SubmitOperationKind::Draw, 73, 73, true},
+    };
+    GpuDependencyGraph masked_target_graph;
+    CHECK(build_gpu_dependency_graph(masked_target_replay, masked_target_graph, error) &&
+              masked_target_graph.edges.empty() &&
+              masked_target_graph.external_leaves.size() == 1 &&
+              masked_target_graph.external_leaves[0].access.addr == masked_writer.color0_base,
+          "a programmed color target with a zero write mask is not a dependency producer");
 
     replay.operations[4].realized = true;
     CHECK(!build_gpu_dependency_graph(replay, graph, error) &&

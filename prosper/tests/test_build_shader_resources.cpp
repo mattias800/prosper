@@ -111,9 +111,12 @@ int main() {
         CHECK(darray.base_array == 4 && darray.depth == 4,
               "array T# derives layer count from LAST_ARRAY minus BASE_ARRAY");
         Gen5ImageFormatInfo array_format;
-        CHECK(gen5_image_format(56, &array_format) &&
-              !image_base_level_view(darray, array_format).supported,
-              "nonzero BASE_ARRAY fails closed until slice-offset layout is modeled");
+        CHECK(gen5_image_format(56, &array_format), "array-view fixture format is mapped");
+        const DecodedImageView varray = image_base_level_view(darray, array_format);
+        CHECK(varray.supported &&
+                  varray.base == 0x13000000ull + 4u * 4096u &&
+                  varray.layer_stride == 4096u && varray.layer_mip_offset == 0,
+              "2D-array BASE_ARRAY advances by the complete per-slice mip-chain stride");
         CHECK(d3d.compression_enabled && d3d.write_compress_enabled && d3d.meta_pipe_aligned &&
               d3d.alpha_is_on_msb && d3d.color_transform &&
               d3d.max_uncompressed_block_size == 2 && d3d.max_compressed_block_size == 1 &&
@@ -155,13 +158,58 @@ int main() {
                   vmip7.mip_tail_bytes == 4096 && vmip7.mip_tail_x == 4 &&
                   vmip7.mip_tail_y == 0,
               "packed-tail base level keeps the shared block base and exact in-block origin");
-        uint32_t tmip_cube[8]; memcpy(tmip_cube, tmip, sizeof tmip_cube);
-        tmip_cube[3] = (tmip_cube[3] & ~(0xfu << 28)) | (11u << 28); // CUBE
+        uint32_t tmip_cube[8];
+        make_tsharp(tmip_cube, 0x18000000ull, 2048, 1152, /*fmt*/56,
+                    /*SW_4KB_S*/5, /*CUBE*/11, /*faces*/6);
+        tmip_cube[3] |= (7u << 12) | (7u << 16);
+        tmip_cube[5] |= 11u << 4;
         const DecodedImageDescriptor dmip_cube = decode_image_descriptor(tmip_cube);
         const DecodedImageView vmip_cube = image_base_level_view(dmip_cube, mip_format);
-        CHECK(!vmip_cube.supported && vmip_cube.base == dmip_cube.base &&
-                  vmip_cube.mip_offset == 0,
-              "nonzero cube mip view is rejected until its slice/tail layout is modeled");
+        CHECK(vmip_cube.supported && vmip_cube.in_mip_tail &&
+                  vmip_cube.base == dmip_cube.base && vmip_cube.width == 16 &&
+                  vmip_cube.height == 9 && vmip_cube.mip_offset == 2048 &&
+                  vmip_cube.layer_stride == 12623872u &&
+                  vmip_cube.layer_mip_offset == 0,
+              "cube mip view retains the complete per-face chain stride and tail coordinates");
+
+        uint32_t tplucky[8];
+        make_tsharp(tplucky, 0x31465d0000ull, 256, 256, /*RGBA16F*/71,
+                    /*SW_64KB_R_X*/27, /*2D array*/13, /*layers*/6);
+        tplucky[3] |= (1u << 12) | (1u << 16); // selected BASE/LAST_LEVEL 1
+        tplucky[5] |= 8u << 4;                 // complete nine-level allocation
+        const DecodedImageDescriptor dplucky = decode_image_descriptor(tplucky);
+        Gen5ImageFormatInfo plucky_format;
+        CHECK(gen5_image_format(71, &plucky_format),
+              "Plucky reflection-array format is mapped");
+        const DecodedImageView vplucky = image_base_level_view(dplucky, plucky_format);
+        CHECK(vplucky.supported && vplucky.base == dplucky.base &&
+                  vplucky.width == 128 && vplucky.height == 128 &&
+                  vplucky.layer_stride == 720896u &&
+                  vplucky.layer_mip_offset == 65536u && !vplucky.in_mip_tail,
+              "multi-layer mip view retains allocation base plus exact slice stride/level offset");
+        uint32_t tplucky_cube[8]; memcpy(tplucky_cube, tplucky, sizeof tplucky_cube);
+        tplucky_cube[3] = (tplucky_cube[3] & ~(0xfu << 28)) | (11u << 28);
+        const DecodedImageDescriptor dplucky_cube = decode_image_descriptor(tplucky_cube);
+        const DecodedImageView vplucky_cube = image_base_level_view(
+            dplucky_cube, plucky_format);
+        CHECK(vplucky_cube.supported && vplucky_cube.base == dplucky_cube.base &&
+                  vplucky_cube.width == 128 && vplucky_cube.height == 128 &&
+                  vplucky_cube.layer_stride == vplucky.layer_stride &&
+                  vplucky_cube.layer_mip_offset == vplucky.layer_mip_offset,
+              "cube and 2D-array views share the proven per-slice selected-mip placement");
+        uint32_t tsmall_cube[8];
+        make_tsharp(tsmall_cube, 0x303ecb0000ull, 32, 32, /*RGBA16F*/71,
+                    /*SW_64KB_R_X*/27, /*CUBE*/11, /*faces*/6);
+        tsmall_cube[3] |= 5u << 16;
+        tsmall_cube[5] |= 5u << 4;
+        const DecodedImageDescriptor dsmall_cube = decode_image_descriptor(tsmall_cube);
+        const DecodedImageView vsmall_cube = image_base_level_view(
+            dsmall_cube, plucky_format);
+        CHECK(vsmall_cube.supported && vsmall_cube.in_mip_tail &&
+                  vsmall_cube.base == dsmall_cube.base && vsmall_cube.width == 32 &&
+                  vsmall_cube.height == 32 && vsmall_cube.mip_offset == 32768u &&
+                  vsmall_cube.layer_stride == 65536u && vsmall_cube.layer_mip_offset == 0,
+              "small cube whose entire mip chain occupies the tail retains one-block face stride");
         tmip[3] &= ~(0x1fu << 20); // SW_MODE 0: AddrLib linear mip chain
         const DecodedImageDescriptor dlinear = decode_image_descriptor(tmip);
         const DecodedImageView vlinear = image_base_level_view(dlinear, mip_format);
@@ -185,6 +233,37 @@ int main() {
                   vastro.supported && vastro.in_mip_tail && vastro.width == 30 &&
                   vastro.height == 16 && vastro.base == dastro.base,
               "PS5 final-pyramid BASE=LAST=MAX_MIP+1 descriptor resolves to its packed tail view");
+    }
+
+    // The runtime resource carries the array-slice layout through shader realization so live compute
+    // and .prgcap replay gather the same selected mip from all six layers.
+    {
+        uint32_t sg[8];
+        make_tsharp(sg, 0x31465d0000ull, 256, 256, /*RGBA16F*/71,
+                    /*SW_64KB_R_X*/27, /*2D array*/13, /*layers*/6);
+        sg[3] |= (1u << 12) | (1u << 16);
+        sg[5] |= 8u << 4;
+        AgcShaderSharp sharp[1]; sharp[0].bits = 0;
+        AgcShaderUserData ud{};
+        ud.sharp_resource_offset[0] = sharp;
+        ud.sharp_resource_count[0] = 1;
+        AgcShaderHeader sh{};
+        sh.file_header = 0x34333231u; sh.version = 0x18; sh.type = 1; sh.user_data = &ud;
+        const ShaderResourceTable resources = build_shader_resources(sh, sg, 8);
+        const ShaderResource* array = resources.by_sgpr_base(0);
+        CHECK(array && array->img_dim == 5 && array->depth == 6 &&
+                  array->gpu_addr == 0x31465d0000ull &&
+                  array->layer_stride_bytes == 720896u &&
+                  array->layer_mip_offset_bytes == 65536u,
+              "realized 2D-array resource preserves selected-mip slice layout");
+        sg[3] = (sg[3] & ~(0xfu << 28)) | (11u << 28);
+        const ShaderResourceTable cube_resources = build_shader_resources(sh, sg, 8);
+        const ShaderResource* cube = cube_resources.by_sgpr_base(0);
+        CHECK(cube && cube->img_dim == 3 && cube->depth == 6 &&
+                  cube->gpu_addr == 0x31465d0000ull &&
+                  cube->layer_stride_bytes == 720896u &&
+                  cube->layer_mip_offset_bytes == 65536u,
+              "realized cube resource preserves selected-mip per-face layout");
     }
 
     // A shifted thin-2D mip emits the selected extent and a matching backing span. Allocation-level

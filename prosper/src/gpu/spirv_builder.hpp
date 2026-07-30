@@ -14,4 +14,12 @@ namespace prosper::gpu {
 // Returns the SPIR-V module as 32-bit words. Deterministic; no I/O.
 std::vector<uint32_t> build_compute_scale_bias(float scale, float bias);
 
+// Emit a compute shader (local_size_x = 256, SPIR-V 1.3) that compares arrays of
+// four uint32_t words at storage-buffer bindings 0 and 1. A differing vector
+// atomically sets binding 2 word 0 to one and updates that vector in binding 1.
+// The number of vectors to compare is push-constant word 0. The caller clears the
+// flag before dispatch. This is exact: the atomic only reduces collision-free
+// component equality, while binding 1 becomes the next exact baseline.
+std::vector<uint32_t> build_compute_compare_uvec4();
+
 } // namespace prosper::gpu

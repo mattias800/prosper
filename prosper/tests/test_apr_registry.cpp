@@ -15,6 +15,7 @@
 #include <sys/mman.h>   // mmap/munmap — WriteAddress fault-safety check (#1149/#1154)
 #endif
 #include "../src/host/exec_image.hpp"
+#include "../src/host/guest_write_watch.hpp"
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 
@@ -115,6 +116,50 @@ int main() {
     CHECK(completion[0] == (uint64_t)(uintptr_t)destination.data() &&
               completion[1] == 0 && completion[2] == read_size,
           "AMPR completion publishes destination, success, and byte count");
+
+#ifndef _WIN32
+    // APR writes are performed by the host kernel, so they do not enter the guest SIGSEGV handler
+    // that normally disarms a renderer/compute dirty-tracking page.  Guard a real mapped destination
+    // to prove ReadFile explicitly disarms the watch, copies every byte, and invalidates the cache.
+    constexpr size_t watched_size = 0x4000;
+    auto* watched_destination = static_cast<uint8_t*>(mmap(
+        nullptr, watched_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    CHECK(watched_destination != MAP_FAILED, "map watched APR destination");
+    if (watched_destination != MAP_FAILED) {
+        constexpr uint64_t watched_phys = 0x7a0000;
+        host::guest_write_watch_set_fault_onstack(true);
+        host::guest_write_watch_notify_direct_mapping_added(
+            (uint64_t)(uintptr_t)watched_destination, watched_size, watched_phys,
+            0x3 /* SCE CPU_READ|CPU_WRITE */);
+        host::GuestWriteWatch destination_watch = host::GuestWriteWatch::create(
+            (uint64_t)(uintptr_t)watched_destination, watched_size);
+
+        std::array<uint64_t, 3> watched_completion{};
+        uint64_t watched_result = read_file_guest(
+            (uint64_t)(uintptr_t)request.data(), 0,
+            (uint64_t)(uintptr_t)watched_completion.data(), fixture_id,
+            (uint64_t)(uintptr_t)watched_destination, read_size,
+            read_offset, 0, 0);
+        CHECK(watched_result == 0 &&
+                  std::memcmp(watched_destination, expected.data() + read_offset, read_size) == 0,
+              "AMPR read fills a write-protected DMA destination completely");
+        CHECK(watched_completion[0] == (uint64_t)(uintptr_t)watched_destination,
+              "AMPR publishes the guarded destination instead of a fallback staging pointer");
+        if (destination_watch) {
+            CHECK(destination_watch.query() == host::GuestWriteWatchQuery::Dirty,
+                  "AMPR host write invalidates the destination cache watch");
+        } else {
+            CHECK(destination_watch.query() == host::GuestWriteWatchQuery::Unknown,
+                  "unsupported destination watch retains the exact comparison fallback");
+        }
+
+        destination_watch.reset();
+        host::guest_write_watch_notify_direct_mapping_removed(
+            (uint64_t)(uintptr_t)watched_destination, watched_size);
+        host::guest_write_watch_set_fault_onstack(false);
+        munmap(watched_destination, watched_size);
+    }
+#endif
 
     // Regression (Terminator 2D: NO FATE, PPSA25872, Unity IL2CPP): some titles pass the completion
     // record INSIDE the request object — a2 = req+0x20, so the bytes-transferred slot a2+0x10 aliases

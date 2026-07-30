@@ -3,6 +3,7 @@
 // data-driven coverage report over the real game shaders (shader_histo).
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/shader_resources.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <vector>
@@ -143,6 +144,33 @@ int main() {
     CHECK(!has(safe_execz_branches_for_test(execz_loop, sizeof(execz_loop)/sizeof(execz_loop[0])), 0u),
           "safe_execz_branches leaves a loop-exit execz for the divergent-loop structurizer (#1183)");
 
+    // UE4 uses VCC_LO/HI as temporary scalar data inside an execz arm, then reads only VCC_LO with
+    // vector ALU before a VOPC overwrites the complete pair. The high half is dead at the merge: a
+    // 32-bit vector source at VCC_LO must not be mistaken for a B64 read of VCC_HI. Once both body
+    // writes are proven dead the whole-wave empty guard is a safe predication optimization.
+    const uint32_t vcc_scratch_guard[] = {
+        0x7C220080u,                 //  0: v_cmpx_neq_f32 exec, 0, v0 (narrow EXEC)
+        0xBF880002u,                 //  1: s_cbranch_execz -> pc=4
+        0xF4241A84u, 0xFA000020u,    //  2: s_buffer_load_dwordx2 vcc, s[8:11], 0x20
+        0xF4201A84u, 0xFA000000u,    //  4: s_buffer_load_dword vcc_lo, s[8:11], 0
+        0x100600F9u, 0x0696066Au,    //  6: v_mul_f32 v3, vcc_lo, v0 (32-bit low-half read)
+        0x7D880E23u,                 //  8: v_cmp_* vcc, s35, v7 (kills both physical halves)
+        0x87866A06u,                 //  9: s_and_b64 s[6:7], s[6:7], vcc
+        0xBF810000u,
+    };
+    CHECK(has(safe_execz_branches_for_test(vcc_scratch_guard,
+                                            std::size(vcc_scratch_guard)), 1u),
+          "a VCC_LO vector read does not keep the dead VCC_HI scalar scratch word live");
+
+    uint32_t live_vcc_hi_guard[std::size(vcc_scratch_guard)];
+    std::copy(std::begin(vcc_scratch_guard), std::end(vcc_scratch_guard),
+              std::begin(live_vcc_hi_guard));
+    live_vcc_hi_guard[6] = 0x7E06546Bu;   // v_cvt_f32_u32 v3, vcc_hi: true direct high-half read
+    live_vcc_hi_guard[7] = 0xBF800000u;   // s_nop (the replacement is one dword)
+    CHECK(!has(safe_execz_branches_for_test(live_vcc_hi_guard,
+                                             std::size(live_vcc_hi_guard)), 1u),
+          "a real VCC_HI vector read keeps the guarded scalar write non-linearizable");
+
     // tbuffer_load_format_x v0, v0, s[8:11], 0 format:32_FLOAT ; s_endpgm.
     // MTBUF needs a resolved V# binding, so the table-less coverage pass must classify it as
     // recompilable-in-context rather than truly unsupported.
@@ -174,6 +202,19 @@ int main() {
     CHECK(mtbuf_tfe.total == 1 && mtbuf_tfe.table_dependent == 0 &&
           mtbuf_tfe.unsupported == 1 && mtbuf_tfe.first_bad_op == 0u,
           "MTBUF TFE remains explicit unsupported coverage until its status write is modeled");
+
+    // Messenger's bindless VS loads a V# through a register-offset s_load_dwordx4. The production
+    // emitter resolves it only with the per-draw resource table, so the table-less coverage pass must
+    // classify this as context-dependent (the same contract as MUBUF/MTBUF), not unsupported.
+    const uint32_t smem_descriptor[] = {
+        0xF408020Cu, 0xD6000000u, // s_load_dwordx4 s[8:11], s[24:25], vcc_hi
+        0xBF810000u,
+    };
+    RecompileCoverage smem = recompile_coverage(
+        smem_descriptor, sizeof(smem_descriptor) / sizeof(smem_descriptor[0]));
+    CHECK(smem.total == 1 && smem.table_dependent == 1 && smem.unsupported == 0 &&
+          smem.first_bad_fmt < 0,
+          "register-offset SMEM descriptor loads report resource-table dependence");
 
     // Astro Bot world-map PS ends with this exact raw x3 store. The table-less coverage shell uses
     // its conventional binding 2, so accepting the instruction must classify it as handled ALU/memory

@@ -320,19 +320,17 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     view.base = d.base;
     view.width = d.width;
     view.height = d.height;
-    // The selected array slice changes the texel origin.  Until the per-tile-mode slice stride is
-    // modeled, a nonzero BASE_ARRAY must fail closed instead of binding slice zero with the selected
-    // layer count.
-    if (d.base_array != 0 || d.depth == 0) {
+    if (d.depth == 0) {
         view.supported = false;
         return view;
     }
-    // The offset helper models thin 2D allocations. A 2D_ARRAY view selecting exactly its sole layer
-    // has the same mip placement (there is no inter-slice pitch to apply), which Sonic Origins uses
-    // for its post-process pyramid. Multi-layer arrays, cube, 3D, and MSAA resources have additional
-    // slice/tail rules and remain rejected for non-zero views.
-    const bool thin_2d = d.type == 9 || (d.type == 13 && d.depth == 1);
-    if (!thin_2d) {
+    // Plain 2D, 2D-array slices, and cube faces share the thin-2D mip placement. Every array slice or
+    // cube face owns a complete independently aligned mip chain; the returned stride/offset lets a
+    // backend gather the selected level without pretending those levels are tightly packed. 3D and
+    // MSAA resources have different slice semantics and remain fail-closed for nonzero views.
+    const bool thin_2d = d.type == 9;
+    const bool thin_2d_layered = d.type == 11 || d.type == 13;
+    if ((!thin_2d && !thin_2d_layered) || (d.base_array != 0 && !thin_2d_layered)) {
         view.supported = d.base_level == 0;
         return view;
     }
@@ -353,8 +351,9 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     const TiledMipLevelLayout layout = tiled_mip_level_layout(
         element_width, element_height, fi.bytes_per_block, d.tile_mode,
         effective_max_mip, d.base_level);
-    // Linear mip chains and invalid tiled descriptors have no proven placement. A tiled level whose
-    // byte origin is zero can still be valid (the final packed-tail mip), hence the explicit status.
+    // Invalid descriptors have no proven placement. A level whose byte origin is zero can still be
+    // valid (including the final packed-tail mip), hence the explicit status rather than an offset
+    // truthiness test.
     if (!layout.supported) {
         view.supported = d.base_level == 0;
         return view;
@@ -370,6 +369,20 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     }
     view.width = std::max(d.width >> d.base_level, 1u);
     view.height = std::max(d.height >> d.base_level, 1u);
+    if (thin_2d_layered) {
+        const size_t stride = tiled_mip_chain_bytes(
+            element_width, element_height, fi.bytes_per_block, d.tile_mode, effective_max_mip);
+        if (!stride || stride > UINT32_MAX || d.base_array > (UINT64_MAX - view.base) / stride) {
+            view.supported = false;
+            return view;
+        }
+        view.base += static_cast<uint64_t>(d.base_array) * stride;
+        if (d.depth > 1) {
+            view.layer_stride = stride;
+            view.layer_mip_offset = view.in_mip_tail ? 0 : view.mip_offset;
+            return view;
+        }
+    }
     // Non-tail mips own a disjoint byte range. Tail levels share the allocation's first block, so
     // shifting the guest pointer would lose sibling-preserving writeback and overstate readability.
     if (!view.in_mip_tail) view.base += view.mip_offset;
@@ -715,6 +728,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.mip_tail_bytes = view.mip_tail_bytes;
             r.mip_tail_x = view.mip_tail_x;
             r.mip_tail_y = view.mip_tail_y;
+            r.layer_stride_bytes = static_cast<uint32_t>(view.layer_stride);
+            r.layer_mip_offset_bytes = static_cast<uint32_t>(view.layer_mip_offset);
             r.max_uncompressed_block_size = d.max_uncompressed_block_size;
             r.max_compressed_block_size = d.max_compressed_block_size;
             // DCC metadata has its own per-mip layout. Until that offset is proven, a shifted texel

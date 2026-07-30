@@ -39,9 +39,9 @@ int main() {
     CHECK(classify_acquire(VK_TIMEOUT) == AcquireAction::skip);
     CHECK(classify_acquire(VK_NOT_READY) == AcquireAction::skip);
 
-    // Acquire: a stale/lost swapchain or device must be rebuilt.
+    // Acquire: stale surfaces rebuild, but a lost device is terminal and must not enter a rebuild loop.
     CHECK(classify_acquire(VK_ERROR_OUT_OF_DATE_KHR) == AcquireAction::recreate);
-    CHECK(classify_acquire(VK_ERROR_DEVICE_LOST) == AcquireAction::recreate);
+    CHECK(classify_acquire(VK_ERROR_DEVICE_LOST) == AcquireAction::fail);
     CHECK(classify_acquire(VK_ERROR_SURFACE_LOST_KHR) == AcquireAction::recreate);
     CHECK(classify_acquire(VK_ERROR_OUT_OF_HOST_MEMORY) == AcquireAction::recreate);
 
@@ -50,7 +50,11 @@ int main() {
     CHECK(classify_present(VK_SUCCESS) == PresentAttempt::presented);
     CHECK(classify_present(VK_SUBOPTIMAL_KHR) == PresentAttempt::out_of_date);
     CHECK(classify_present(VK_ERROR_OUT_OF_DATE_KHR) == PresentAttempt::out_of_date);
-    CHECK(classify_present(VK_ERROR_DEVICE_LOST) == PresentAttempt::out_of_date);
+    CHECK(classify_present(VK_ERROR_DEVICE_LOST) == PresentAttempt::failed);
+
+    // A recoverable submit failure replaces synchronization once; device loss stops immediately.
+    CHECK(classify_submit_failure(VK_ERROR_OUT_OF_DATE_KHR) == PresentAttempt::out_of_date);
+    CHECK(classify_submit_failure(VK_ERROR_DEVICE_LOST) == PresentAttempt::failed);
 
     if (failures == 0) std::printf("present_policy: OK\n");
     return failures == 0 ? 0 : 1;

@@ -242,8 +242,9 @@ int main() {
           "Astro v_cvt_f32_i32 SDWA WORD_1+SEXT packet is admitted");
     const uint32_t dpp16[] = { 0x4a0e0cfau, 0xff011106u };   // v_add_nc_u32_dpp v7, v6, v6 row_shr:1
     Rdna2Inst dp = rdna2_decode_one(dpp16, 2);
-    CHECK(dp.fmt == Rdna2Format::VOP2 && dp.len_dwords == 2 && dp.has_modifier,
-          "VOP2 DPP16 form is 2 dwords and flagged has_modifier");
+    CHECK(dp.fmt == Rdna2Format::VOP2 && dp.len_dwords == 2 && !dp.has_modifier && dp.has_dpp &&
+          dp.dpp_ctrl == 0x111u && !dp.dpp_bound_ctrl,
+          "VOP2 DPP16 ROW_SHR form retains its unbounded lane control");
     const uint32_t ngg_row_shift[] = { 0x4a1e1efau, 0xff09110fu };
     Rdna2Inst nrs = rdna2_decode_one(ngg_row_shift, 2);
     CHECK(nrs.fmt == Rdna2Format::VOP2 && nrs.opcode == 0x25u && !nrs.has_modifier &&
@@ -261,6 +262,11 @@ int main() {
           fpx.src[1].value == -1 && fpx.src[2].kind == OperandKind::InlineInt &&
           fpx.src[2].value == -1,
           "Astro fragment PERMLANEX16 adjacent-row broadcast decodes exactly");
+    const uint32_t dpp16_bounded[] = { 0x4a1412fau, 0xff091109u };
+    Rdna2Inst dpb = rdna2_decode_one(dpp16_bounded, 2);
+    CHECK(dpb.fmt == Rdna2Format::VOP2 && dpb.len_dwords == 2 && !dpb.has_modifier && dpb.has_dpp &&
+          dpb.dpp_ctrl == 0x111u && dpb.dpp_bound_ctrl && isV(dpb.src[0], 9) && isV(dpb.src[1], 9),
+          "Plucky Squire bounded ROW_SHR:1 preserves source and BOUND_CTRL fields");
     const uint32_t dpp8[] = { 0x4a0e0ce9u, 0xfac68806u };    // v_add_nc_u32_dpp v7, v6, v6 dpp8:[...]
     Rdna2Inst d8 = rdna2_decode_one(dpp8, 2);
     CHECK(d8.fmt == Rdna2Format::VOP2 && d8.len_dwords == 2 && d8.has_modifier,

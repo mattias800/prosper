@@ -51,6 +51,11 @@ enum class DataFormat : uint32_t {
     Snorm2_10_10_10,
     Uint2_10_10_10,
     Sint2_10_10_10,
+    // Integer fields converted to floating-point without normalization. GFX10's USCALED/SSCALED
+    // buffer formats are valid vertex/typed-buffer inputs (for example 8_8_USCALED format 16), but
+    // are not sampled-image formats in Prosper's current upload contract. Keep these at the end so
+    // existing capture enum values remain stable.
+    Uscaled8, Sscaled8, Uscaled16, Sscaled16,
 };
 
 // Address source for a const-fold-resolved graphics buffer fetch. Automatic preserves the legacy
@@ -213,6 +218,12 @@ struct ShaderResource {
     uint32_t      mip_tail_bytes    = 0;
     uint32_t      mip_tail_x        = 0;
     uint32_t      mip_tail_y        = 0;
+    // Selected view inside a multi-layer thin-2D allocation. Zero preserves the historical tightly
+    // packed selected-level representation. When nonzero, gpu_addr is the first selected slice's
+    // allocation base and each layer's level begins at layer*stride + layer_mip_offset; packed-tail
+    // levels instead use mip_tail_x/y within each slice base.
+    uint32_t      layer_stride_bytes = 0;
+    uint32_t      layer_mip_offset_bytes = 0;
     bool          srgb              = false;              // T# is a gamma-encoded (sRGB) surface — sample with sRGB->linear (#263)
     uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;
 
@@ -291,6 +302,10 @@ struct ShaderResource {
 // recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
 struct ShaderResourceTable {
     std::vector<ShaderResource> resources;
+    // Graphics-only draw ABI input used by the portable NGG shell. Hardware packs consecutive
+    // vertex/instance invocations into guest waves; flattening InstanceIndex therefore needs the
+    // submitted number of vertices per instance. Zero keeps standalone shader fixtures compatible.
+    uint32_t vertices_per_instance = 0;
 
     // Resolve the resource whose descriptor originates at `srt_offset` (indirect/`s_load` provenance);
     // nullptr if none. Deterministic; first match wins.
@@ -351,9 +366,11 @@ struct SpirvDescriptorBinding {
     bool storage_float = false;
     // Exact OpTypeImage shape. Backends use this instead of guessing from the guest T#: a DIM=5
     // packet may deliberately compile either as the historical base-slice 2D fallback or as a real
-    // 2D-array image whose layer coordinate must match a VK_IMAGE_VIEW_TYPE_2D_ARRAY view.
-    uint32_t image_dim = 0xFFFFFFFFu;
+    // 2D-array image whose layer coordinate must match a VK_IMAGE_VIEW_TYPE_2D_ARRAY view. It also
+    // distinguishes a guest cube descriptor compiled as an ordinary 2D face view.
+    uint32_t image_dim = UINT32_MAX;
     bool image_arrayed = false;
+    bool image_multisampled = false;
     // OpTypeImage Depth. IMAGE_SAMPLE_C* currently lowers to an in-shader comparison over an
     // ordinary color sampler, so this remains false even when ShaderResource::depth_compare says
     // that the guest instruction performs a comparison. Backends must follow the SPIR-V type here.
@@ -403,6 +420,12 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     uint32_t expected_set,
     SpirvShaderStage expected_stage,
     bool report_unused = true);
+
+// Locate one binding in the reflected, statically-used descriptor interface. Runtime tables can
+// retain descriptor candidates recovered while folding the guest shader even when the final SPIR-V
+// does not reference them; consumers should not materialize those unused candidates.
+const SpirvDescriptorBinding* find_spirv_descriptor_binding(
+    const DescriptorValidationReport& report, uint32_t set, uint32_t binding);
 
 const char* spirv_descriptor_kind_name(SpirvDescriptorKind kind);
 const char* descriptor_issue_name(DescriptorIssueCode code);

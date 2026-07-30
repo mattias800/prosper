@@ -24,6 +24,7 @@ using namespace prosper;
 
 // Front-half stats exposed by hle_agc.cpp.
 extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws);
+extern "C" bool prosper_agc_submit_sh_reg(uint64_t queue, uint32_t offset, uint32_t* value);
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -45,6 +46,7 @@ int main() {
 
     auto reset  = Hle::lookup("TRO721eVt4g");   // GraphicsDcbResetQueue
     auto setcx  = Hle::lookup("ZvwO9euwYzc");   // GraphicsDcbSetCxRegistersIndirect
+    auto setsh  = Hle::lookup("pFLArOT53+w");   // GraphicsDcbSetShRegisterDirect
     auto setidx = Hle::lookup("GIIW2J37e70");   // GraphicsDcbSetIndexSize
     auto draw   = Hle::lookup("Yw0jKSqop+E");   // GraphicsDcbDrawIndexAuto
     auto submit = Hle::lookup("UglJIZjGssM");   // GraphicsDriverSubmitDcb
@@ -53,9 +55,9 @@ int main() {
     auto maxname = Hle::lookup("uJziRsODk1c");   // sceAgcDriverGetResourceRegistrationMaxNameLength
     auto release = reinterpret_cast<HostHle9>(Hle::lookup("wr23dPKyWc0")); // GraphicsCbReleaseMem
     auto waitmem = reinterpret_cast<HostHle9>(Hle::lookup("VmW0Tdpy420")); // GraphicsDcbWaitRegMem
-    CHECK(reset && setcx && setidx && draw && submit && submit_acb && regmem && maxname && release && waitmem,
+    CHECK(reset && setcx && setsh && setidx && draw && submit && submit_acb && regmem && maxname && release && waitmem,
           "AGC Dcb/Acb submit and resource-registration functions registered");
-    if (!(reset && setcx && setidx && draw && submit && submit_acb && regmem && maxname && release && waitmem)) {
+    if (!(reset && setcx && setsh && setidx && draw && submit && submit_acb && regmem && maxname && release && waitmem)) {
         printf("== FAIL ==\n"); return 1;
     }
 
@@ -186,6 +188,69 @@ int main() {
               "SubmitAcb accepts the ArcRunner ABI (count in a2, queue id mirrored in a3)");
         uint64_t after2 = 0; prosper_agc_submit_stats(&after2, &ignored);
         CHECK(after2 == before2 + 1, "ArcRunner-ABI SubmitAcb folds one async command stream");
+
+        // Plucky sets the record's 32-bit FLAGS field to 1. Reading {count,flags} as one qword made
+        // count 0x100000004 here and rejected the otherwise valid packet before range validation.
+        Packet flagged_packet = packet;
+        flagged_packet.pad[0] = 1;
+        uint64_t before3 = 0; prosper_agc_submit_stats(&before3, &ignored);
+        CHECK(submit_acb(0x20 /*queue*/, (uint64_t)(uintptr_t)&flagged_packet,
+                         packet.dw_num /*count mirrored in a2*/, 0x20 /*queue mirror*/,
+                         0, 0) == 0,
+              "SubmitAcb reads Plucky's count and non-zero flags as separate 32-bit fields");
+        uint64_t after3 = 0; prosper_agc_submit_stats(&after3, &ignored);
+        CHECK(after3 == before3 + 1,
+              "flagged Plucky-ABI SubmitAcb folds one async command stream");
+
+        // Graphics and async compute have independent SH register files. Plucky submits real ACBs;
+        // folding their user-data writes into the persistent graphics state replaced vertex shader
+        // pointers with compute descriptors and made otherwise-supported gameplay draws disappear.
+        static uint32_t gfx_buffer[16]{};
+        Dcb gfx{};
+        gfx.bottom = gfx_buffer; gfx.top = gfx_buffer + 16;
+        gfx.cursor_up = gfx_buffer; gfx.cursor_down = gfx_buffer + 16;
+        reset((uint64_t)(uintptr_t)&gfx, 0x3ff, 0, 0, 0, 0);
+        setsh((uint64_t)(uintptr_t)&gfx, ((uint64_t)0x11112222u << 32) | 0x123u, 0, 0, 0, 0);
+        Packet gfx_packet{gfx_buffer, (uint32_t)(gfx.cursor_up - gfx_buffer), {0,0,0,0}};
+        CHECK(submit((uint64_t)(uintptr_t)&gfx_packet, 0, 0, 0, 0, 0) == 0,
+              "graphics SH-register setup submits");
+
+        static uint32_t isolated_acb_buffer[16]{};
+        Dcb isolated_acb{};
+        isolated_acb.bottom = isolated_acb_buffer;
+        isolated_acb.top = isolated_acb_buffer + 16;
+        isolated_acb.cursor_up = isolated_acb_buffer;
+        isolated_acb.cursor_down = isolated_acb_buffer + 16;
+        acb_reset((uint64_t)(uintptr_t)&isolated_acb, 0x3ff, 0, 0, 0, 0);
+        setsh((uint64_t)(uintptr_t)&isolated_acb,
+              ((uint64_t)0xaaaabbbbu << 32) | 0x123u, 0, 0, 0, 0);
+        Packet isolated_packet{isolated_acb_buffer,
+                               (uint32_t)(isolated_acb.cursor_up - isolated_acb_buffer),
+                               {1,0,0,0}};
+        CHECK(submit_acb(0x20, (uint64_t)(uintptr_t)&isolated_packet,
+                         isolated_packet.dw_num, 0x20, 0, 0) == 0,
+              "async-compute SH-register setup submits");
+        static uint32_t second_acb_buffer[16]{};
+        Dcb second_acb{};
+        second_acb.bottom = second_acb_buffer; second_acb.top = second_acb_buffer + 16;
+        second_acb.cursor_up = second_acb_buffer; second_acb.cursor_down = second_acb_buffer + 16;
+        acb_reset((uint64_t)(uintptr_t)&second_acb, 0x3ff, 0, 0, 0, 0);
+        setsh((uint64_t)(uintptr_t)&second_acb,
+              ((uint64_t)0xccccddddu << 32) | 0x123u, 0, 0, 0, 0);
+        Packet second_packet{second_acb_buffer,
+                             (uint32_t)(second_acb.cursor_up - second_acb_buffer),
+                             {1,0,0,0}};
+        CHECK(submit_acb(0x40, (uint64_t)(uintptr_t)&second_packet,
+                         second_packet.dw_num, 0x40, 0, 0) == 0,
+              "second async-compute queue SH-register setup submits");
+        uint32_t graphics_value = 0, compute_value = 0, second_compute_value = 0;
+        CHECK(prosper_agc_submit_sh_reg(0, 0x123, &graphics_value) &&
+              prosper_agc_submit_sh_reg(0x20, 0x123, &compute_value) &&
+              prosper_agc_submit_sh_reg(0x40, 0x123, &second_compute_value) &&
+              graphics_value == 0x11112222u && compute_value == 0xaaaabbbbu,
+              "ACB SH writes remain isolated from persistent graphics bindings");
+        CHECK(second_compute_value == 0xccccddddu,
+              "independent async-compute queues retain independent SH bindings");
     }
 
     // A valid header at the last dword of a readable page must not make the decoder walk into the

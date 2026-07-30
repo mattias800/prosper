@@ -23,6 +23,17 @@ struct GpuCaptureMetadata {
     std::vector<std::pair<std::string, std::string>> renderer_env;
 };
 
+inline constexpr const char* kGpuReplayScanoutAddressEnv =
+    "PROSPER_GPU_REPLAY_SCANOUT_ADDR";
+
+// Preserve the exact registered front-buffer identity as replay metadata. The replay process has no
+// live VideoOut registry, so extent alone cannot distinguish scanout from same-sized intermediates.
+void annotate_gpu_capture_scanout(GpuCaptureMetadata& metadata);
+
+// Parse the replay-only front-buffer identity. Bundle replay updates this value at each captured
+// submit, so consumers must not cache the result across renderer callbacks.
+uint64_t parse_gpu_replay_scanout_address(const char* value);
+
 struct GpuCaptureBlob {
     uint64_t guest_addr = 0;
     uint64_t bytes_read = 0;
@@ -85,10 +96,21 @@ struct GpuCapturedDraw {
     uint32_t color0_width = 0, color0_height = 0;
     uint64_t color1_base = 0;
     uint32_t color1_width = 0, color1_height = 0;
+    // v34: complete RDNA2 color-target identity. Slots 0/1 mirror the named legacy fields.
+    std::array<DrawItem::ColorTargetBinding, kColorTargetCount> color_targets{};
     uint64_t draw_index = 0;
     uint64_t command_order = 0;
     uint32_t vs_raw_shader_index = 0xFFFFFFFFu;
     uint32_t fs_raw_shader_index = 0xFFFFFFFFu;
+    // v31: optional separately-installed vertex main stage and its exact graphics-LDS allocation.
+    uint32_t vs_chain_raw_shader_index = 0xFFFFFFFFu;
+    uint32_t vertex_lds_dwords = 0;
+    // v36: exact fixed-function pixel-stage ABI required to recompile the retained raw graphics
+    // programs. Older captures deliberately leave both unavailable.
+    PixelInputMapping pixel_inputs{};
+    PixelSystemInputMapping system_inputs{};
+    bool has_pixel_inputs = false;
+    bool has_system_inputs = false;
 };
 
 struct GpuCapturedCompute {
@@ -99,6 +121,9 @@ struct GpuCapturedCompute {
     uint64_t dispatch_index = 0;
     uint64_t submit_no = 0;
     uint64_t command_order = 0;
+    // v37: exact VkPipeline required-subgroup/full-subgroups contract used by the stored module.
+    // Zero retains the historical portable shader path.
+    uint32_t required_subgroup_size = 0;
 };
 
 struct GpuCapturedOperation {
@@ -131,6 +156,13 @@ struct GpuCapturedStageDiagnostic {
     RecompileCoverage coverage;
     uint32_t descriptor_issue_count = 0;
     uint32_t first_descriptor_issue = 0xFFFFFFFFu;
+    // v35: the exact descriptor metadata supplied to the failed recompiler invocation. Earlier
+    // captures retained only presence/count, which was enough to describe the failure but not to
+    // retry it offline: table-dependent SMEM/MUBUF/MIMG lowering rejected before reaching the real
+    // unsupported instruction. Resource bytes remain deliberately absent from this diagnostic
+    // table; once a fix realizes the operation, an ordinary follow-up capture retains its renderable
+    // resource closure through GpuCapturedDraw/GpuCapturedCompute.
+    GpuCapturedTable resource_table;
 };
 
 struct GpuCapturedOperationFailure {
@@ -146,6 +178,8 @@ struct GpuCapturedOperationFailure {
     uint64_t color1_base = 0;
     uint32_t color1_width = 0;
     uint32_t color1_height = 0;
+    // v34: complete failed-draw target identity. Slots 0/1 mirror the named legacy fields.
+    std::array<DrawItem::ColorTargetBinding, kColorTargetCount> color_targets{};
     uint32_t vertex_count = 0;
     ComputeLaunchDimensions compute_launch;
     std::vector<GpuCapturedStageDiagnostic> stages;
@@ -157,6 +191,9 @@ struct GpuCapturedOperationFailure {
 enum class GpuCaptureColorFormat : uint32_t {
     Rgba8Unorm = 1,
     Rgba16Float = 2,
+    R11G11B10Float = 3,
+    R8Unorm = 4,
+    R32Uint = 5,
 };
 
 struct GpuCaptureRttSeed {
@@ -230,11 +267,13 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                           const CaptureMemoryReader& reader, GpuCaptureFile& out,
                           std::string& error, const CaptureRttSeedReader& rtt_reader = {},
                           const std::vector<OperationRealizationFailure>& failures = {},
-                          const std::vector<GpuState::DmaCopy>& dma_copies = {});
+                          const std::vector<GpuState::DmaCopy>& dma_copies = {},
+                          uint64_t resource_limit_bytes = 0);
 bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              uint32_t width, uint32_t height,
                              const GpuCaptureMetadata& metadata,
-                             GpuCaptureFile& out, std::string& error);
+                             GpuCaptureFile& out, std::string& error,
+                             uint64_t resource_limit_bytes = 0);
 bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
                                     uint32_t width, uint32_t height,
                                     uint32_t target_width, uint32_t target_height,
@@ -287,6 +326,9 @@ using ReplayRttSeedWriter = std::function<bool(const GpuCaptureRttSeed& seed, st
 using ReplayDsSeedWriter = std::function<bool(const GpuCaptureDsSeed& seed, std::string& error)>;
 void set_gpu_capture_rtt_seed_reader(CaptureRttSeedReader reader);
 bool read_gpu_capture_rtt_seed(uint64_t guest_addr, GpuCaptureRttSeed& seed, std::string& error);
+// Add one exact live renderer target to a capture unless it is already dependency-seeded. Used by
+// frame-boundary capture for a held VideoOut scanout that may predate every submit in the window.
+bool capture_gpu_rtt_seed(GpuCaptureFile& capture, uint64_t guest_addr, std::string& error);
 void set_gpu_capture_rtt_seed_snapshot_reader(CaptureRttSeedSnapshotReader reader);
 bool read_all_gpu_capture_rtt_seeds(std::vector<GpuCaptureRttSeed>& seeds, std::string& error);
 void set_gpu_replay_rtt_seed_writer(ReplayRttSeedWriter writer);
@@ -303,23 +345,38 @@ uint64_t gpu_capture_hash(const uint8_t* data, size_t size);
 inline uint64_t gpu_capture_hash(const std::vector<uint8_t>& data) {
     return gpu_capture_hash(data.data(), data.size());
 }
+bool gpu_capture_output_nonzero_matches(const std::vector<uint8_t>& output, size_t min_nonzero,
+                                        size_t max_nonzero, size_t* observed = nullptr);
 const char* shader_program_stage_name(ShaderProgramStage stage);
 const char* realization_failure_reason_name(RealizationFailureReason reason);
 
 // Runtime hook used by execute_and_present. PROSPER_GPU_CAPTURE=<path> captures exactly one realized
-// submit. MIN_DRAWS/MAX_DRAWS select a semantic candidate class; PROSPER_GPU_CAPTURE_AT=N then selects
-// the zero-based matching invocation (default first match).
+// submit. MIN_DRAWS/MAX_DRAWS, COMPUTE_ADDR, SHADER_ADDR, and TARGET_DIM select a candidate class;
+// PROSPER_GPU_CAPTURE_AT=N then selects the zero-based matching invocation (default first match).
 struct PendingGpuCapture {
     std::string path;
     GpuCaptureFile capture;
+    // Hand-built pending captures used by tests/tools already carry a complete capture. Runtime
+    // begin_requested_gpu_capture explicitly clears this while it owns metadata only.
+    bool materialized = true;
+    bool output_triggered = false;
+    size_t output_min_nonzero = 0;
+    size_t output_max_nonzero = 0;
 };
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     const std::vector<DrawItem>& draws, const std::vector<ComputeItem>& computes,
     const std::vector<SubmitOperation>& operations, uint32_t width, uint32_t height,
     const GpuState* semantic_state = nullptr, uint64_t submit_no = 0,
-    uint64_t semantic_draw_count = UINT64_MAX);
+    uint64_t semantic_draw_count = UINT64_MAX,
+    const std::vector<OperationRealizationFailure>* exact_failures = nullptr,
+    bool defer_materialization = false);
 bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
-                                  const std::vector<uint8_t>& output, std::string& error);
+                                  const std::vector<uint8_t>& output, std::string& error,
+                                  const std::vector<DrawItem>* draws = nullptr,
+                                  const std::vector<ComputeItem>* computes = nullptr,
+                                  const std::vector<SubmitOperation>* operations = nullptr,
+                                  const GpuState* semantic_state = nullptr,
+                                  const std::vector<OperationRealizationFailure>* exact_failures = nullptr);
 
 // Interactive one-shot capture (frame_grab tool): arm a capture from a hotkey WITHOUT predicting a
 // submit index ahead of time. The next drawing invocation reaching begin_requested_gpu_capture() writes

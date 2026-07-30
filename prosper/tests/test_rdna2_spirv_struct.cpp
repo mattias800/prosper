@@ -611,6 +611,7 @@ int main() {
     printf("  [ok]   s_andn1_saveexec_b32 negates its source operand\n");
 
     const uint32_t wave32_fragment_readlane31[] = {
+        0x7e140280u,                         // v_mov_b32 v10, 0
         0xd7600000u, 0x00013f0au,            // v_readlane_b32 s0, v10, 31
         0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
         0xf800000fu, 0x03020100u,
@@ -624,6 +625,7 @@ int main() {
         return 1;
     }
     const uint32_t wave32_fragment_readlane32[] = {
+        0x7e140280u,                         // v_mov_b32 v10, 0
         0xd7600000u, 0x0001410au,            // v_readlane_b32 s0, v10, 32 (out of range)
         0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
         0xf800000fu, 0x03020100u,

@@ -218,6 +218,35 @@ int main() {
     printf("  kernel6 mismatches=%u (out[10]=%g expect=%g)\n", bad6, got6.size()==N?got6[10]:-1, exp6[10]);
     CHECK(got6.size()==N && bad6==0, "recompiled kernel 6 computes max via compare+select correctly");
 
+    // Kernel 6b: NGG prologs merge a scalar lane-bit dword into one VCC half. Start with a false
+    // VOPC predicate, OR bit 0 into VCC_LO, and select input0 only for guest lane 0. Repeat for
+    // VCC_HI bit 0 (guest lane 32) to prove that a B32 write preserves the untouched half.
+    auto check_vcc_half_merge = [&](bool high) {
+        const uint32_t code[] = {
+            0xBE940381u,                         // s_mov_b32 s20, 1
+            0x7C000100u,                         // v_cmp_lt_f32 vcc, v0, v0 (false)
+            high ? 0x886B6B14u : 0x886A6A14u,   // s_or_b32 vcc_{hi,lo}, s20, vcc_{hi,lo}
+            0x02000101u,                         // v_cndmask_b32 v0, v1, v0, vcc
+            0xBF810000u,
+        };
+        const auto words = recompile_valu(code, std::size(code), 2, 0);
+        std::vector<float> input(64 * 2), expected(64);
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            input[lane * 2] = 10.0f;
+            input[lane * 2 + 1] = 20.0f;
+            expected[lane] = lane == (high ? 32u : 0u) ? 10.0f : 20.0f;
+        }
+        const auto output = prosper::test::run_compute(words, input, 64, 64);
+        uint32_t bad = 0;
+        for (uint32_t lane = 0; lane < output.size() && lane < expected.size(); ++lane)
+            if (std::fabs(output[lane] - expected[lane]) > 1e-3f) ++bad;
+        CHECK(!words.empty() && output.size() == 64 && bad == 0,
+              high ? "VCC_HI scalar-mask merge updates lane 32 and preserves VCC_LO"
+                   : "VCC_LO scalar-mask merge updates lane 0 and preserves VCC_HI");
+    };
+    check_vcc_half_merge(false);
+    check_vcc_half_merge(true);
+
     // Kernel 7: signed min/max/ashr. i=(int)a; range=max(i0,i1)-min(i0,i1); out=(float)(range >> (i2&31)).
     const uint32_t code7[] = {
         0x7E001100u, 0x7E021101u, 0x7E041102u, 0x22060300u, 0x24080300u, 0x4C060704u, 0x30060702u, 0x7E000B03u, 0xBF810000u,
@@ -1527,6 +1556,46 @@ int main() {
     CHECK(got32b2.size()==1 && std::fabs(got32b2[0]-10.0f)<1e-3f,
           "kernel 32b2 DS_READ2_B32 applies both packed dword offsets exactly");
 
+    // Kernel 32b3: The Plucky Squire's title compute path writes two independent LDS dwords with
+    // DS_WRITE2_B32 before reading the same pair. Use the exact adjacent-offset encoding and make
+    // both values observable as 1+2=3.
+    const uint32_t code32b_write2[] = {
+        0x7e000280u, 0x7e0202f2u, 0x7e0402f4u,
+        0xd8380100u, 0x00020100u, 0xbf8a0000u,
+        0xd8dc0100u, 0x03000000u, 0x06060903u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b_write2 = recompile_valu(
+        code32b_write2, std::size(code32b_write2), 0, 3);
+    CHECK(!spv32b_write2.empty(), "recompiled kernel 32b3 (DS_WRITE2_B32 + DS_READ2_B32) -> SPIR-V");
+    std::vector<float> got32b_write2 = prosper::test::run_compute(
+        spv32b_write2, std::vector<float>(1), 1, 1);
+    CHECK(got32b_write2.size()==1 && std::fabs(got32b_write2[0]-3.0f)<1e-3f,
+          "kernel 32b3 DS_WRITE2_B32 stores DATA0/1 at both packed dword offsets");
+
+    // Kernel 32b3a: Plucky's first-gameplay compute program uses ADDTID as a per-wave LDS spill.
+    // Exercise the exact live write/read encodings with M0=0x40 and immediate=0x100. Each lane
+    // writes a distinct input to LDS[0x140 + TID*4] and reads its own value back. This catches both
+    // accidentally ignoring TID (all lanes alias) and using DATA0/VDST from the wrong DS byte.
+    const uint32_t code32b_addtid[] = {
+        0xb07c0040u,                         // s_movk_i32 m0, 0x40
+        0xdac00100u, 0x00000000u,           // ds_write_addtid_b32 v0 offset:0x100
+        0xbf8cc07fu,                         // s_waitcnt lgkmcnt(0)
+        0xdac40100u, 0x01000000u,           // ds_read_addtid_b32 v1 offset:0x100
+        0xbf8cc07fu,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b_addtid = recompile_valu(
+        code32b_addtid, std::size(code32b_addtid), 1, 1);
+    CHECK(!spv32b_addtid.empty(),
+          "recompiled kernel 32b3a (Plucky DS_WRITE/READ_ADDTID_B32) -> SPIR-V");
+    std::vector<float> in32b_addtid(WG);
+    for (uint32_t lane = 0; lane < WG; ++lane)
+        in32b_addtid[lane] = 1000.0f + static_cast<float>(lane) * 3.0f;
+    std::vector<float> got32b_addtid = prosper::test::run_compute(
+        spv32b_addtid, in32b_addtid, WG, WG);
+    CHECK(got32b_addtid == in32b_addtid,
+          "kernel 32b3a ADDTID addresses one distinct LDS dword per hardware-wave lane");
+
     // Kernel 32b2w: Astro Bot's world-map reduction pairs that read with DS_WRITE2_B32. Use its
     // exact offset0/1=(0,1), DATA0=v2, DATA1=v1 instruction, then expose OFFSET0 alone. A
     // position-sensitive result proves DATA0/DATA1 are not swapped or treated as one VGPR pair.
@@ -1747,6 +1816,62 @@ int main() {
     std::vector<float> got32c = prosper::test::run_compute(spv32c, std::vector<float>(1), 1, 1);
     CHECK(got32c.size()==1 && std::fabs(got32c[0]-7.0f)<1e-3f,
           "kernel 32c LDS min/max atomics update shared memory exactly");
+
+    // Plucky Squire's first-gameplay compute shaders use the non-returning DS_OR_B32 form. Seed an
+    // LDS dword with 4, OR in 3 using the exact opcode-0x0a encoding, then read back 7.
+    const uint32_t code32c_or[] = {
+        0x7e000280u, 0x7e020284u,
+        0xd8340000u, 0x00000100u,           // ds_write_b32 v0, v1
+        0x7e040283u,
+        0xd8280000u, 0x00000200u,           // ds_or_b32 v0, v2
+        0xd8d80000u, 0x03000000u,           // ds_read_b32 v3, v0
+        0x7e060d03u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32c_or = recompile_valu(
+        code32c_or, std::size(code32c_or), 0, 3);
+    CHECK(!spv32c_or.empty(), "recompiled kernel 32c (Plucky DS_OR_B32 word) -> SPIR-V");
+    std::vector<float> got32c_or = prosper::test::run_compute(
+        spv32c_or, std::vector<float>(1), 1, 1);
+    CHECK(got32c_or.size()==1 && std::fabs(got32c_or[0]-7.0f)<1e-3f,
+          "kernel 32c DS_OR_B32 atomically ORs the LDS dword");
+
+    // Plucky Squire's first-gameplay compute path classifies floats before its LDS reduction. The
+    // ten lanes below cover every GFX10 V_CMP_CLASS_F32 category; a second set deliberately selects
+    // the next category so both the true and false VCC results are exercised. V_CNDMASK leaves SRC0
+    // in v0 on true and selects the mask bits from v1 on false, making the result bit-exact even for
+    // signalling/quiet NaNs and signed zero.
+    const uint32_t code32c_class[] = {
+        0x7d100300u,                         // v_cmp_class_f32 vcc, v0, v1
+        0x02000101u,                         // v_cndmask_b32 v0, v1, v0, vcc
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32c_class = recompile_valu(
+        code32c_class, std::size(code32c_class), 2, 0);
+    CHECK(!spv32c_class.empty(),
+          "recompiled kernel 32c (Plucky V_CMP_CLASS_F32 word) -> SPIR-V");
+    const uint32_t class_values[10] = {
+        0x7f800001u, 0x7fc00000u, 0xff800000u, 0xbf800000u, 0x80000001u,
+        0x80000000u, 0x00000000u, 0x00000001u, 0x3f800000u, 0x7f800000u,
+    };
+    std::vector<float> in32c_class(40);
+    std::vector<uint32_t> expected32c_class(20);
+    for (uint32_t bit = 0; bit < 10; ++bit) {
+        const uint32_t matching_mask = 1u << bit;
+        const uint32_t nonmatching_mask = 1u << ((bit + 1u) % 10u);
+        std::memcpy(&in32c_class[(2u * bit) * 2u], &class_values[bit], 4);
+        std::memcpy(&in32c_class[(2u * bit) * 2u + 1u], &matching_mask, 4);
+        std::memcpy(&in32c_class[(2u * bit + 1u) * 2u], &class_values[bit], 4);
+        std::memcpy(&in32c_class[(2u * bit + 1u) * 2u + 1u], &nonmatching_mask, 4);
+        expected32c_class[2u * bit] = class_values[bit];
+        expected32c_class[2u * bit + 1u] = nonmatching_mask;
+    }
+    std::vector<float> got32c_class = prosper::test::run_compute(
+        spv32c_class, in32c_class, 20, 20);
+    uint32_t bad32c_class = 0;
+    for (uint32_t i = 0; i < 20 && got32c_class.size() == 20; ++i)
+        if (bits_of(got32c_class[i]) != expected32c_class[i]) ++bad32c_class;
+    CHECK(got32c_class.size()==20 && bad32c_class==0,
+          "kernel 32c V_CMP_CLASS_F32 distinguishes every IEEE-754 class and mask bit");
 
     // Kernel 32c2: ds_add_rtn_u32 returns the old value (10) while atomically updating LDS to 13.
     // Convert and add both observations so the single output must be 23.
@@ -2455,6 +2580,42 @@ int main() {
     };
     std::vector<uint32_t> spv47c = recompile_valu(code47c, sizeof(code47c)/sizeof(code47c[0]), 2, /*out_vgpr*/3);
     CHECK(spv47c.empty(), "kernel 47c (special-reg (vcc) write in divergent block) correctly REJECTED");
+
+    // Kernel 47c2 (#1390): Plucky's gameplay post-process has the same divergent VCC scratch write,
+    // but the value is dead after the merge. A later, unrelated forward EXECZ splits control flow;
+    // BOTH paths reach a non-X VOPC that overwrites VCC before any read. The CFG liveness proof must
+    // follow both successors rather than rejecting merely because lexical scanning met a branch.
+    const uint32_t code47c2[] = {
+        0x7e0602ffu, 0x40e00000u,            // v3=7.0 default
+        0x7d880300u, 0xbe80246au,             // vcc=(u0>u1); saveexec s[0:1],vcc
+        0xbf880002u,                          // execz -> pc 7 (merge)
+        0xbeea0385u,                          // guarded vcc_lo=5 scalar scratch
+        0x7e06026au,                          // guarded v3=vcc_lo (raw bits 5)
+        0xbefe0400u,                          // pc 7: restore exec
+        0xbf880001u,                          // unrelated execz: both pc 9 and pc 10 are possible
+        0x7e080304u,                          // fallthrough no-op v4=v4
+        0x7d820100u,                          // both paths overwrite VCC (v0<v0 = false)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv47c2 = recompile_valu(
+        code47c2, std::size(code47c2), 2, 3);
+    CHECK(!spv47c2.empty(),
+          "kernel 47c2 (dead VCC scratch across post-merge branch) recompiles");
+    std::vector<float> got47c2 = prosper::test::run_compute(spv47c2, in18, N, N);
+    uint32_t bad47c2 = 0;
+    for (uint32_t i = 0; i < N && got47c2.size() == N; ++i) {
+        const uint32_t expected = (i % 17) > (i % 13) ? 5u : bits_of(7.0f);
+        if (bits_of(got47c2[i]) != expected) ++bad47c2;
+    }
+    CHECK(got47c2.size()==N && bad47c2==0,
+          "kernel 47c2 preserves predicated VGPR results while dead VCC scratch is discarded");
+
+    // Negative sibling: the fallthrough path reads VCC through V_CNDMASK before the common overwrite.
+    // Even though the branch's taken path is safe, all-successor liveness must reject the block.
+    std::vector<uint32_t> code47c3(std::begin(code47c2), std::end(code47c2));
+    code47c3[9] = 0x02060703u;                // v_cndmask_b32 v3,v3,v3,vcc (implicit VCC read)
+    CHECK(recompile_valu(code47c3.data(), code47c3.size(), 2, 3).empty(),
+          "kernel 47c3 rejects when either post-merge branch path reads VCC scratch");
 
     // Kernel 47d (NEGATIVE, soundness): s5 is written in the block, then an SOPK s_addk_i32 s5 (a
     // read-modify-write whose SIMM16 operand leaves n_src==0) reads s5 after the merge -> s5 is LIVE. The
@@ -3236,6 +3397,45 @@ int main() {
     }
     CHECK(gotT8.size()==N && badT8==0, "T8: s_mov_b64 copies a plain scalar pair");
 
+    // T8b: S_BCNT1_I32_B64 consumes both scalar dwords and writes a 32-bit population count.
+    // This is also the data-domain fallback used when the source is not a tracked wave mask.
+    const uint32_t codeT8b[] = {
+        0xbe8603ffu, 0xf0f0f0f0u,
+        0xbe8703ffu, 0x80000001u,
+        0xbe801006u,              // s_bcnt1_i32_b64 s0, s[6:7]
+        0x7e020200u,              // v_mov_b32 v1, s0
+        0xBF810000u,
+    };
+    const auto spvT8b = recompile_valu(codeT8b, std::size(codeT8b), 1, 1);
+    CHECK(!spvT8b.empty(), "recompiled T8b (s_bcnt1_i32_b64 scalar pair) -> SPIR-V");
+    const auto gotT8b = prosper::test::run_compute(spvT8b, inX, N, N);
+    uint32_t badT8b = 0;
+    for (uint32_t i = 0; i < N && gotT8b.size() == N; ++i)
+        if (bits_of(gotT8b[i]) != 18u) ++badT8b;
+    CHECK(gotT8b.size() == N && badT8b == 0,
+          "T8b: bcnt1 sums the low/high dword population counts exactly");
+
+    // T8c: GFX10's complete scalar halfword pack family.  Distinct halves catch every selector.
+    const uint32_t pack_ops[] = {0x99000706u, 0x99800706u, 0x9a000706u};
+    const uint32_t pack_expected[] = {0x77883344u, 0x55663344u, 0x55661122u};
+    for (size_t pack = 0; pack < std::size(pack_ops); ++pack) {
+        const uint32_t codeT8c[] = {
+            0xbe8603ffu, 0x11223344u,
+            0xbe8703ffu, 0x55667788u,
+            pack_ops[pack],
+            0x7e020200u,
+            0xBF810000u,
+        };
+        const auto spvT8c = recompile_valu(codeT8c, std::size(codeT8c), 1, 1);
+        CHECK(!spvT8c.empty(), "recompiled T8c (scalar halfword pack) -> SPIR-V");
+        const auto gotT8c = prosper::test::run_compute(spvT8c, inX, N, N);
+        uint32_t badT8c = 0;
+        for (uint32_t i = 0; i < N && gotT8c.size() == N; ++i)
+            if (bits_of(gotT8c[i]) != pack_expected[pack]) ++badT8c;
+        CHECK(gotT8c.size() == N && badT8c == 0,
+              "T8c: LL/LH/HH select the documented scalar halves exactly");
+    }
+
     // Kernel T9: TWO SEQUENTIAL forward uniform ifs (the DOLL color-grade PS shape, #273).
     // u=(uint)a0; scc=(3<5)=1 -> if1 RUNS (+10,+20); scc=(3<2)=0 -> if2 SKIPPED (+40).
     // out = (float)(u + 30). Previously rejected (single-forward-if only).
@@ -3811,6 +4011,222 @@ int main() {
               "T25: compute DPP16 returns the selected neighbor from each quad");
     }
 
+    // T25b (#1390): Plucky's gameplay reduction uses DPP ROW_SHR:1 repeatedly for a 16-lane
+    // prefix min/max. With BOUND_CTRL=0, lane zero of each row is disabled and preserves VDST;
+    // every other lane reads SRC0 from its left neighbor. The second kernel covers BOUND_CTRL=1,
+    // where the first two lanes receive architectural zero instead.
+    std::vector<float> inT25b(128), expT25b(128), expT25b_bound(128);
+    for (uint32_t i = 0; i < 128; ++i) {
+        inT25b[i] = (float)(i + 1u);
+        const uint32_t row_lane = i & 15u;
+        expT25b[i] = row_lane == 0 ? inT25b[i] : inT25b[i - 1u];
+        expT25b_bound[i] = row_lane < 2 ? 0.0f : inT25b[i - 2u];
+    }
+    const uint32_t codeT25b[] = {
+        0x1e0000fau, 0xff011100u,             // v_min_f32_dpp v0,v0,v0 row_shr:1 BC:0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT25b = recompile_valu(
+        codeT25b, std::size(codeT25b), 1, 0);
+    CHECK(!spvT25b.empty(), "recompiled T25b (Plucky DPP ROW_SHR:1 min) -> SPIR-V");
+    CHECK(compute_spirv_min_subgroup_size(spvT25b) == 16,
+          "T25b: row-shuffle module advertises its 16-lane host contract");
+
+    const uint32_t codeT25b_bound[] = {
+        0x7e0002fau, 0xff091200u,             // v_mov_b32_dpp v0,v0 row_shr:2 BC:1
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT25b_bound = recompile_valu(
+        codeT25b_bound, std::size(codeT25b_bound), 1, 0);
+    CHECK(!spvT25b_bound.empty(), "recompiled T25b (bounded DPP ROW_SHR:2 mov) -> SPIR-V");
+    const auto subgroupT25b = prosper::test::default_compute_subgroup_properties();
+    const bool can_shuffleT25b = subgroupT25b.size &&
+        (subgroupT25b.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroupT25b.operations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
+    if (can_shuffleT25b) {
+        std::vector<float> hostExpT25b(128), hostExpT25bBound(128);
+        for (uint32_t i = 0; i < 128; ++i) {
+            const uint32_t lane = i % subgroupT25b.size;
+            const uint32_t row_lane = lane & 15u;
+            hostExpT25b[i] = row_lane == 0 ? inT25b[i] : inT25b[i - 1u];
+            hostExpT25bBound[i] = row_lane < 2 ? 0.0f : inT25b[i - 2u];
+        }
+        const std::vector<float> gotT25b = prosper::test::run_compute(
+            spvT25b, inT25b, 128, 128);
+        const std::vector<float> gotT25bBound = prosper::test::run_compute(
+            spvT25b_bound, inT25b, 128, 128);
+        CHECK(gotT25b == hostExpT25b && gotT25bBound == hostExpT25bBound,
+              "T25b: emitted shuffles and row-edge controls execute exactly at host subgroup width");
+        if (subgroupT25b.size >= 16) {
+            CHECK(gotT25b == expT25b && gotT25bBound == expT25b_bound,
+                  "T25b: supported host preserves the architectural 16-lane DPP rows exactly");
+        } else {
+            std::printf("  [skip] T25b architectural execution: host subgroup %u is narrower than 16\n",
+                        subgroupT25b.size);
+        }
+    } else {
+        std::printf("  [skip] T25b execution: host lacks compute subgroup shuffle support\n");
+    }
+
+    // T25c (#1390): Plucky's second gameplay dispatch converts a permuted float after arbitrary
+    // quad tables (not merely XOR swaps). Exercise its exact 0xee control: [2,3,2,3].
+    const uint32_t codeT25c[] = {
+        0x7e000efau, 0xff08ee00u,             // v_cvt_u32_f32_dpp v0,v0 quad_perm:[2,3,2,3]
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25c = recompile_valu(
+        codeT25c, std::size(codeT25c), 1, 0);
+    CHECK(!spvT25c.empty(), "recompiled T25c (Plucky DPP quad conversion) -> SPIR-V");
+    CHECK(compute_spirv_min_subgroup_size(spvT25c) == 4,
+          "T25c: quad-only shuffle advertises only its four-lane host contract");
+    std::vector<uint32_t> spvT25cWithArithmetic = spvT25c;
+    spvT25cWithArithmetic.insert(spvT25cWithArithmetic.begin() + 5,
+                                 {(2u << 16) | 17u, 63u}); // OpCapability GroupNonUniformArithmetic
+    CHECK(compute_spirv_min_subgroup_size(spvT25cWithArithmetic) == 4,
+          "T25c: genuine subgroup capabilities do not masquerade as width metadata");
+    if (can_shuffleT25b) {
+        std::vector<float> inT25c(128), expectedT25c(128);
+        for (uint32_t i = 0; i < 128; ++i) inT25c[i] = static_cast<float>(100u + i);
+        for (uint32_t i = 0; i < 128; ++i) {
+            const uint32_t selected = (0xeeu >> (2u * (i & 3u))) & 3u;
+            const uint32_t converted = static_cast<uint32_t>(inT25c[(i & ~3u) | selected]);
+            std::memcpy(&expectedT25c[i], &converted, sizeof(converted));
+        }
+        const std::vector<float> gotT25c = prosper::test::run_compute(
+            spvT25c, inT25c, 128, 128);
+        CHECK(gotT25c == expectedT25c,
+              "T25c: arbitrary DPP quad permutation precedes float-to-uint conversion exactly");
+    }
+
+    // T25d (#1390): the reduction's final step uses the exact GFX10 V_PERMLANE16_B32 and
+    // V_PERMLANEX16_B32 encodings. The first selector table duplicates 0x76543210 in both halves,
+    // so lanes 8..15 gather lanes 0..7 of their own row. The cross-row form uses -1:-1, selecting
+    // lane 15 of the paired row for every destination lane. Both exact words set BOUND_CTRL.
+    const uint32_t codeT25d_row[] = {
+        0xd7771000u, 0x03fdff00u, 0x76543210u,
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25dRow = recompile_valu(
+        codeT25d_row, std::size(codeT25d_row), 1, 0);
+    CHECK(!spvT25dRow.empty(),
+          "recompiled T25d (Plucky V_PERMLANE16_B32 exact word) -> SPIR-V");
+    CHECK(compute_spirv_min_subgroup_size(spvT25dRow) == 16,
+          "T25d: within-row permlane advertises its 16-lane host contract");
+
+    const uint32_t codeT25d_cross[] = {
+        0xd7781000u, 0x03058300u,
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25dCross = recompile_valu(
+        codeT25d_cross, std::size(codeT25d_cross), 1, 0);
+    CHECK(!spvT25dCross.empty(),
+          "recompiled T25d (Plucky V_PERMLANEX16_B32 exact word) -> SPIR-V");
+    CHECK(compute_spirv_min_subgroup_size(spvT25dCross) == 32,
+          "T25d: paired-row permlane advertises its 32-lane host contract");
+
+    if (can_shuffleT25b && subgroupT25b.size >= 32) {
+        std::vector<float> inT25d(128), expectedT25dRow(128), expectedT25dCross(128);
+        for (uint32_t i = 0; i < 128; ++i) inT25d[i] = static_cast<float>(i);
+        for (uint32_t i = 0; i < 128; ++i) {
+            const uint32_t subgroup_lane = i % subgroupT25b.size;
+            const uint32_t subgroup_base = i - subgroup_lane;
+            const uint32_t row_base = subgroup_lane & ~15u;
+            const uint32_t selected = subgroup_lane & 7u;
+            expectedT25dRow[i] = inT25d[subgroup_base + row_base + selected];
+            expectedT25dCross[i] = inT25d[
+                subgroup_base + (row_base ^ 16u) + 15u];
+        }
+        const std::vector<float> gotT25dRow = prosper::test::run_compute(
+            spvT25dRow, inT25d, 128, 128);
+        const std::vector<float> gotT25dCross = prosper::test::run_compute(
+            spvT25dCross, inT25d, 128, 128);
+        CHECK(gotT25dRow == expectedT25dRow,
+              "T25d: V_PERMLANE16 gathers every packed selector within its row");
+        CHECK(gotT25dCross == expectedT25dCross,
+              "T25d: V_PERMLANEX16 gathers lane 15 from each paired row");
+    } else {
+        std::printf("  [skip] T25d execution: host subgroup %u is narrower than 32\n",
+                    subgroupT25b.size);
+    }
+
+    // T25e (#1390): V_READLANE_B32 reads an ordinary VGPR lane into an SGPR, independent of EXEC.
+    // Plucky reads lanes 31 and 63 after its permlane reduction; exercise the exact lane-63 form and
+    // move the scalar result back to v0 so the compute shell can expose it.
+    const uint32_t codeT25e[] = {
+        0xd7600002u, 0x00017f00u,             // v_readlane_b32 s2,v0,63
+        0x7e000202u,                          // v_mov_b32 v0,s2
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25e = recompile_valu(
+        codeT25e, std::size(codeT25e), 1, 0);
+    CHECK(!spvT25e.empty(),
+          "recompiled T25e (Plucky V_READLANE_B32 lane 63 exact word) -> SPIR-V");
+    CHECK(compute_spirv_min_subgroup_size(spvT25e) == 64,
+          "T25e: wave64 readlane advertises its 64-lane host contract");
+    if (can_shuffleT25b && subgroupT25b.size >= 64) {
+        std::vector<float> inT25e(128), expectedT25e(128);
+        for (uint32_t i = 0; i < 128; ++i) inT25e[i] = static_cast<float>(i);
+        for (uint32_t i = 0; i < 128; ++i) {
+            const uint32_t subgroup_lane = i % subgroupT25b.size;
+            const uint32_t subgroup_base = i - subgroup_lane;
+            expectedT25e[i] = inT25e[subgroup_base + (subgroup_lane & ~63u) + 63u];
+        }
+        const std::vector<float> gotT25e = prosper::test::run_compute(
+            spvT25e, inT25e, 128, 128);
+        CHECK(gotT25e == expectedT25e,
+              "T25e: V_READLANE_B32 broadcasts lane 63 within each guest wave64");
+    } else {
+        std::printf("  [skip] T25e execution: host subgroup %u is narrower than 64\n",
+                    subgroupT25b.size);
+    }
+
+    // T25f (#1390): DS_SWIZZLE_B32 does not access LDS; it maps the source VGPR across active
+    // lanes. The captured offset 0x020f is the architectural group32 bitmask form
+    // ((lane & 15) | 16), while 0x80e4 is the identity quad selector table.
+    const uint32_t codeT25f_group32[] = {
+        0xd8d4020fu, 0x00000000u,             // ds_swizzle_b32 v0,v0 offset:0x020f
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25fGroup32 = recompile_valu(
+        codeT25f_group32, std::size(codeT25f_group32), 1, 0);
+    CHECK(!spvT25fGroup32.empty(),
+          "recompiled T25f (Plucky DS_SWIZZLE_B32 group32 exact word) -> SPIR-V");
+    CHECK(compute_spirv_min_subgroup_size(spvT25fGroup32) == 32,
+          "T25f: group32 DS swizzle advertises its 32-lane host contract");
+    const uint32_t codeT25f_quad[] = {
+        0xd8d480e4u, 0x00000000u,             // ds_swizzle_b32 v0,v0 quad:[0,1,2,3]
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25fQuad = recompile_valu(
+        codeT25f_quad, std::size(codeT25f_quad), 1, 0);
+    CHECK(!spvT25fQuad.empty(),
+          "recompiled T25f (DS_SWIZZLE_B32 quad basic mode) -> SPIR-V");
+    CHECK(compute_spirv_min_subgroup_size(spvT25fQuad) == 4,
+          "T25f: quad DS swizzle advertises only its four-lane host contract");
+    if (can_shuffleT25b) {
+        std::vector<float> inT25f(128), expectedT25f(128);
+        for (uint32_t i = 0; i < 128; ++i) inT25f[i] = static_cast<float>(i);
+        const std::vector<float> gotT25fQuad = prosper::test::run_compute(
+            spvT25fQuad, inT25f, 128, 128);
+        CHECK(gotT25fQuad == inT25f,
+              "T25f: DS_SWIZZLE_B32 quad selector gathers the requested lane");
+        if (subgroupT25b.size >= 32) {
+            for (uint32_t i = 0; i < 128; ++i) {
+                const uint32_t subgroup_lane = i % subgroupT25b.size;
+                const uint32_t subgroup_base = i - subgroup_lane;
+                expectedT25f[i] = inT25f[
+                    subgroup_base + (subgroup_lane & ~31u) + ((subgroup_lane & 15u) | 16u)];
+            }
+            const std::vector<float> gotT25fGroup32 = prosper::test::run_compute(
+                spvT25fGroup32, inT25f, 128, 128);
+            CHECK(gotT25fGroup32 == expectedT25f,
+                  "T25f: captured group32 bitmask performs the architectural lane mapping");
+        } else {
+            std::printf("  [skip] T25f group32 execution: host subgroup %u is narrower than 32\n",
+                        subgroupT25b.size);
+        }
+    }
+
     // T26: Astro title-ship VS exact VOP3 opcode word for v_cvt_pknorm_u16_f32. The high half is
     // fixed at 0.5; the low half exercises clamping and round-to-nearest-even across [0,1].
     const uint32_t codeT26[] = {
@@ -3852,6 +4268,40 @@ int main() {
     std::vector<float> gotT27 = prosper::test::run_compute(spvT27, inT27, 8, 8);
     CHECK(gotT27 == expT27,
           "T27: SDWA BYTE_0 conversion produces the exact zero-extended byte value");
+
+    // T27b: Plucky Squire's first gameplay compute pass uses these exact four
+    // v_mul_u32_u24_sdwa packets to multiply each selected byte of v10 by the inline integer 3.
+    // Verify every selector, including the scalar-source encoding in the SDWA control dword.
+    const uint32_t plucky_mul_words[][2] = {
+        {0x166614f9u, 0x01860683u}, // v51 = 3 * BYTE_1(v10)
+        {0x161014f9u, 0x00860683u}, // v8  = 3 * BYTE_0(v10)
+        {0x166214f9u, 0x02860683u}, // v49 = 3 * BYTE_2(v10)
+        {0x165014f9u, 0x03860683u}, // v40 = 3 * BYTE_3(v10)
+    };
+    const uint32_t plucky_dst[] = {51u, 8u, 49u, 40u};
+    const uint32_t plucky_cvt[] = {0x7e660d33u, 0x7e100d08u, 0x7e620d31u, 0x7e500d28u};
+    const uint32_t plucky_shift[] = {8u, 0u, 16u, 24u};
+    const uint32_t plucky_raw[] = {0x12345678u, 0xff008001u, 0x04030201u, 0xabcdef80u};
+    for (size_t k = 0; k < std::size(plucky_mul_words); ++k) {
+        const uint32_t codeT27b[] = {
+            plucky_mul_words[k][0], plucky_mul_words[k][1],
+            plucky_cvt[k], 0xbf810000u,
+        };
+        std::vector<uint32_t> spvT27b = recompile_valu(
+            codeT27b, std::size(codeT27b), 11, plucky_dst[k]);
+        CHECK(!spvT27b.empty(), "recompiled T27b (Plucky integer SDWA byte multiply) -> SPIR-V");
+        std::vector<float> inT27b(std::size(plucky_raw) * 11u, 0.0f);
+        std::vector<float> expT27b(std::size(plucky_raw));
+        for (size_t i = 0; i < std::size(plucky_raw); ++i) {
+            std::memcpy(&inT27b[i * 11u + 10u], &plucky_raw[i], sizeof(uint32_t));
+            expT27b[i] = static_cast<float>(3u * ((plucky_raw[i] >> plucky_shift[k]) & 0xffu));
+        }
+        std::vector<float> gotT27b = prosper::test::run_compute(
+            spvT27b, inT27b, static_cast<uint32_t>(std::size(plucky_raw)),
+            static_cast<uint32_t>(std::size(plucky_raw)));
+        CHECK(gotT27b == expT27b,
+              "T27b: integer SDWA zero-extends the selected byte before U24 multiplication");
+    }
 
     // T28: Astro title compute exact rejected word from the live trace. DPP applies only to src0
     // (v3); src1 (v15) stays in the current lane. With quad_perm [1,0,3,2], every lane receives its
@@ -3910,6 +4360,66 @@ int main() {
     std::vector<float> gotT30 = prosper::test::run_compute(spvT30, inT30, 128, 128);
     CHECK(gotT30 == expT30,
           "T30: inline B64 mask 15 activates exactly four lanes per wave64");
+
+    // T30b: Plucky Squire's exact first-gameplay compute word resets EXEC with the ORN2
+    // self-complement identity while saving OLD EXEC in VCC. The following VCC restore proves the
+    // destination received the saved mask rather than retaining stale compare state.
+    const uint32_t codeT30b[] = {
+        0x7e0602ffu, 0x40e00000u,            // v_mov_b32 v3, 7.0
+        0xbeea287eu,                         // s_orn2_saveexec_b64 vcc, exec => EXEC=all-on
+        0x7e0602ffu, 0x42280000u,            // v_mov_b32 v3, 42.0
+        0xbefe046au,                         // s_mov_b64 exec, vcc (restore OLD EXEC)
+        0x7e000303u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spvT30b = recompile_valu(codeT30b, std::size(codeT30b), 1, 0);
+    CHECK(!spvT30b.empty(),
+          "recompiled T30b (Plucky s_orn2_saveexec_b64 vcc,exec) -> SPIR-V");
+    std::vector<float> gotT30b = prosper::test::run_compute(spvT30b, inT30, 128, 128);
+    CHECK(gotT30b == std::vector<float>(128, 42.0f),
+          "T30b: ORN2 self-complement runs all lanes and VCC restores OLD EXEC");
+
+    // Exercise the complete SAVEEXEC boolean family with a nontrivial VCC source. Each shader starts
+    // with full EXEC, forms m=(lane<4), applies one boolean operation, writes 42 under the resulting
+    // EXEC (7 otherwise), then restores OLD EXEC from s[4:5]. This checks both halves of the contract:
+    // D receives OLD EXEC and EXEC receives the requested boolean result, for every opcode we accept.
+    const uint32_t saveexec_ops[] = {0x24, 0x25, 0x26, 0x27, 0x28,
+                                     0x29, 0x2a, 0x2b, 0x37, 0x38};
+    const uint8_t saveexec_expect[] = {
+        1, 2, 3, 0, 1, 3, 0, 1, 3, 2,
+        // 0=false, 1=m, 2=true, 3=!m (OLD EXEC starts true).
+    };
+    std::vector<float> inT30c(128), expT30c(128);
+    for (uint32_t lane = 0; lane < 128; ++lane) {
+        const uint32_t local_lane = lane % 64u;
+        std::memcpy(&inT30c[lane], &local_lane, 4);
+    }
+    uint32_t badT30c = 0;
+    for (size_t k = 0; k < std::size(saveexec_ops); ++k) {
+        const std::vector<uint32_t> codeT30c = {
+            0x7e0402ffu, 0x40e00000u,                         // v2=7.0
+            0x7e020284u,                                     // v1=4
+            0x7d820300u,                                     // vcc=(v0<v1) unsigned
+            0xbe84006au | (saveexec_ops[k] << 8),             // s_*_saveexec_b64 s[4:5],vcc
+            0x7e0402ffu, 0x42280000u,                         // active v2=42.0
+            0xbefe0404u,                                     // restore exec=s[4:5]
+            0x7e000302u, 0xbf810000u,                        // output v0=v2
+        };
+        std::vector<uint32_t> spvT30c = recompile_valu(
+            codeT30c.data(), codeT30c.size(), 1, 0);
+        if (spvT30c.empty()) { ++badT30c; continue; }
+        for (uint32_t lane = 0; lane < 128; ++lane) {
+            const bool m = (lane % 64u) < 4u;
+            const bool active = saveexec_expect[k] == 0 ? false
+                              : saveexec_expect[k] == 1 ? m
+                              : saveexec_expect[k] == 2 ? true : !m;
+            expT30c[lane] = active ? 42.0f : 7.0f;
+        }
+        const std::vector<float> gotT30c = prosper::test::run_compute(
+            spvT30c, inT30c, 128, 128);
+        if (gotT30c != expT30c) ++badT30c;
+    }
+    CHECK(badT30c == 0,
+          "T30c: every SAVEEXEC boolean form updates EXEC and saves OLD EXEC exactly");
 
     // T31: Astro's exact title-PS SDWA controls, reduced only to v0. WORD_1 is sign-extended before
     // v_cvt_f32_i32, so both positive and negative int16 values must survive the conversion.
@@ -4032,19 +4542,44 @@ int main() {
 
     // Astro world-map PC1918: s_lshl1_add_u32 uses the same full-width carry rule. A high bit in
     // 0x80000000<<1 carries out -> 11; 2<<1+1 stays in range -> 4. out = bits+15.
-    const uint32_t codeA2b[] = { 0xbe8103ffu, 0x80000000u, 0x97028101u, 0x8503848bu,
+    const uint32_t codeA2Astro[] = { 0xbe8103ffu, 0x80000000u, 0x97028101u, 0x8503848bu,
                                  0xbe810382u, 0x97028101u, 0x8504848bu,
                                  0x4a020003u, 0x4a020204u, 0xBF810000u };
-    std::vector<uint32_t> spvA2b = recompile_valu(codeA2b, std::size(codeA2b), 1, 1);
-    CHECK(!spvA2b.empty(), "recompiled Astro s_lshl1_add_u32 carry kernel -> SPIR-V");
-    std::vector<float> gotA2b = prosper::test::run_compute(spvA2b, inX, N, N);
-    uint32_t badA2b = 0;
-    for (uint32_t i = 0; i < N && gotA2b.size() == N; i++) {
-        uint32_t gb; std::memcpy(&gb, &gotA2b[i], 4);
-        if (gb != bits_of(inX[i]) + 15u) badA2b++;
+    std::vector<uint32_t> spvA2Astro = recompile_valu(
+        codeA2Astro, std::size(codeA2Astro), 1, 1);
+    CHECK(!spvA2Astro.empty(), "recompiled Astro s_lshl1_add_u32 carry kernel -> SPIR-V");
+    std::vector<float> gotA2Astro = prosper::test::run_compute(spvA2Astro, inX, N, N);
+    uint32_t badA2Astro = 0;
+    for (uint32_t i = 0; i < N && gotA2Astro.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotA2Astro[i], 4);
+        if (gb != bits_of(inX[i]) + 15u) badA2Astro++;
     }
-    CHECK(gotA2b.size()==N && badA2b==0,
+    CHECK(gotA2Astro.size()==N && badA2Astro==0,
           "Astro s_lshl1_add_u32 SCC = full 64-bit carry (1 then 0)");
+
+    // A2b (#1390): exercise the complete gfx10 s_lshl{1,2,3,4}_add_u32 opcode family. Each
+    // instruction computes (1 << N) + 1 without carry; sum 3+5+9+17 = 34. The first word is the
+    // exact S_LSHL1_ADD_U32 encoding used by The Plucky Squire's title fragment shader.
+    const uint32_t codeA2b[] = {
+        0xbe950381u,                         // s_mov_b32 s21, 1
+        0x976a8115u,                         // s_lshl1_add_u32 vcc_lo, s21, 1 (live title word)
+        0x97018115u,                         // s_lshl1_add_u32 s1, s21, 1
+        0x97828115u,                         // s_lshl2_add_u32 s2, s21, 1
+        0x98038115u,                         // s_lshl3_add_u32 s3, s21, 1
+        0x98848115u,                         // s_lshl4_add_u32 s4, s21, 1
+        0x7e000201u,                         // v_mov_b32 v0, s1
+        0x7e020202u, 0x4a000300u,            // v0 += s2
+        0x7e020203u, 0x4a000300u,            // v0 += s3
+        0x7e020204u, 0x4a000300u,            // v0 += s4
+        0x7e02026au, 0x4a000300u,            // v0 += live-word VCC_LO result
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvA2b = recompile_valu(codeA2b, std::size(codeA2b), 0, 0);
+    CHECK(!spvA2b.empty(), "recompiled A2b (complete S_LSHL1..4_ADD_U32 family) -> SPIR-V");
+    std::vector<float> gotA2b = prosper::test::run_compute(spvA2b, std::vector<float>(1), 1, 1);
+    uint32_t a2b_bits = 0; if (gotA2b.size() == 1) std::memcpy(&a2b_bits, &gotA2b[0], 4);
+    CHECK(gotA2b.size() == 1 && a2b_bits == 37u,
+          "A2b: live VCC_LO destination and all four shift-add results execute exactly");
 
     // A3 (#880): the NEG modifier is a sign-bit toggle: neg(+0.0) = -0.0. v_add_f32_e64
     // v1, -v0, -v0 with v0=+0.0 must produce -0.0 (bits 0x80000000); the old FSub(0,x)
@@ -4101,6 +4636,43 @@ int main() {
         if (gb != bits_of(inX[i])) badA7++;
     }
     CHECK(gotA7.size()==N && badA7==0, "A7: s_bfe_u64 width 0 extracts 0 (defined result)");
+
+    // A7b (#1390): NGG merged-stage prologues build an active-lane mask with s_bfe_u64 and write it
+    // directly to EXEC. VCC_LO is scalar scratch here (the offset/width control 0x00080020), not a
+    // VOPC mask. Offset 32 also proves the inline -1 source is correctly sign-extended to a B64
+    // operand. The first eight lanes of every wave write 1.0; all other masked lanes retain 0.
+    const uint32_t codeA7b[] = {
+        0xbeea03ffu, 0x00080020u, // s_mov_b32 vcc_lo, width=8 offset=32
+        0x94fe6ac1u,              // s_bfe_u64 exec, -1, vcc
+        0x7e0202f2u,              // v_mov_b32 v1, 1.0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvA7b = recompile_valu(codeA7b, std::size(codeA7b), 1, 1);
+    CHECK(!spvA7b.empty(), "A7b: s_bfe_u64 writing EXEC recompiles");
+    std::vector<float> gotA7b = prosper::test::run_compute(spvA7b, inX, N, N);
+    uint32_t badA7b = 0;
+    for (uint32_t i = 0; i < N && gotA7b.size() == N; ++i)
+        if (gotA7b[i] != ((i & 63u) < 8u ? 1.0f : 0.0f)) ++badA7b;
+    CHECK(gotA7b.size() == N && badA7b == 0,
+          "A7b: s_bfe_u64 updates EXEC with the extracted per-lane mask");
+
+    // A7c (#1390): the same BFE destination can be VCC. Moving that mask into EXEC must consume the
+    // freshly extracted VCC bits, not the stale per-lane condition that preceded the scalar write.
+    const uint32_t codeA7c[] = {
+        0xbeea03ffu, 0x00080000u, // s_mov_b32 vcc_lo, width=8 offset=0
+        0x94ea6ac1u,              // s_bfe_u64 vcc, -1, vcc
+        0xbefe046au,              // s_mov_b64 exec, vcc
+        0x7e0202f2u,              // v_mov_b32 v1, 1.0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvA7c = recompile_valu(codeA7c, std::size(codeA7c), 1, 1);
+    CHECK(!spvA7c.empty(), "A7c: s_bfe_u64 writing VCC recompiles");
+    std::vector<float> gotA7c = prosper::test::run_compute(spvA7c, inX, N, N);
+    uint32_t badA7c = 0;
+    for (uint32_t i = 0; i < N && gotA7c.size() == N; ++i)
+        if (gotA7c[i] != ((i & 63u) < 8u ? 1.0f : 0.0f)) ++badA7c;
+    CHECK(gotA7c.size() == N && badA7c == 0,
+          "A7c: s_bfe_u64 updates VCC and a later mask consumer observes it");
 
     // A8 (#880): an inline float constant in a 16-bit operand supplies the f16 encoding.
     // v_cvt_f32_f16_e32 v1, 1.0 must produce 1.0f (the old raw-f32-pattern unpack gave 0.0).
@@ -4293,6 +4865,46 @@ int main() {
                    gotStructuredWave[64], gotStructuredWave[127]);
         CHECK(gotStructuredWave.size() == 128 && badStructuredWave == 0,
               "#1373: structured branch performs one exact 64-lane guest-wave vote");
+
+        // UE4 reduction kernels also use sequential top-level EXEC tests separated by workgroup
+        // barriers, with no loop in the shader. A scalar write in each arm makes the result visible
+        // to every invocation in the complete guest wave, not merely the host subgroup containing
+        // the one active lane. This proves the structured exact-wave path independently of loops.
+        const uint32_t barrier_reduction_cs[] = {
+            0xBE800380u,               //  0: s_mov_b32 s0, 0
+            0xBE810380u,               //  1: s_mov_b32 s1, 0
+            0x7DA20200u,               //  2: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880001u,               //  3: s_cbranch_execz +1 -> 5
+            0xBE800381u,               //  4: s_mov_b32 s0, 1 (wave-visible arm result)
+            0xBEFE04C1u,               //  5: s_mov_b64 exec, -1
+            0xBF8A0000u,               //  6: s_barrier
+            0x7DA20600u,               //  7: v_cmpx_lt_u32 exec, s0, v3
+            0xBF880001u,               //  8: s_cbranch_execz +1 -> 10
+            0xBE810382u,               //  9: s_mov_b32 s1, 2 (wave-visible arm result)
+            0xBEFE04C1u,               // 10: s_mov_b64 exec, -1
+            0xBF8A0000u,               // 11: s_barrier
+            0x80020100u,               // 12: s_add_u32 s2, s0, s1
+            0x7E040C02u,               // 13: v_cvt_f32_u32 v2, s2
+            0xBF810000u,               // 14: s_endpgm
+        };
+        std::vector<uint32_t> spvBarrierReduction = recompile_valu(
+            barrier_reduction_cs, std::size(barrier_reduction_cs), 4, 2);
+        CHECK(!spvBarrierReduction.empty(),
+              "barrier-separated top-level wave reductions recompile without a loop");
+        std::vector<float> inBarrierReduction(128 * 4, 0.0f);
+        std::vector<float> expBarrierReduction(128);
+        for (uint32_t i = 0; i < 128; ++i) {
+            inBarrierReduction[i * 4 + 1] = i == 63 ? 1.0f : 0.0f;   // v1
+            inBarrierReduction[i * 4 + 3] = i == 127 ? 1.0f : 0.0f;  // v3
+            expBarrierReduction[i] = i < 64 ? 1.0f : 2.0f;
+        }
+        const std::vector<float> gotBarrierReduction = prosper::test::run_compute(
+            spvBarrierReduction, inBarrierReduction, 128, 128);
+        uint32_t badBarrierReduction = 0;
+        for (uint32_t i = 0; i < 128 && gotBarrierReduction.size() == 128; ++i)
+            if (gotBarrierReduction[i] != expBarrierReduction[i]) ++badBarrierReduction;
+        CHECK(gotBarrierReduction.size() == 128 && badBarrierReduction == 0,
+              "barrier-separated reductions perform independent exact 64-lane guest-wave votes");
 
         std::vector<uint32_t> divergentBarrierStructuredWave(
             std::begin(structured_wave_cs), std::end(structured_wave_cs));

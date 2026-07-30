@@ -176,6 +176,32 @@ RenderState extract_render_state(const GpuState& st) {
     rs.color1_clear_word1 = st.cx.count(P::CB_COLOR1_CLEAR_WORD1)
         ? rd(st.cx, P::CB_COLOR1_CLEAR_WORD1) : 0u;
 
+    // Complete RDNA2 MRT programming. CB_COLORn's main block has a 0xf-register stride; BASE_EXT
+    // and ATTRIB2 are dense arrays. Keep the named MRT0/MRT1 fields above for source compatibility,
+    // while every new consumer uses this hardware-sized array.
+    for (uint32_t slot = 0; slot < rs.color_targets.size(); ++slot) {
+        constexpr uint32_t kColorRegisterStride = 0xf;
+        ColorTargetState& target = rs.color_targets[slot];
+        const uint32_t base_reg = P::CB_COLOR0_BASE + slot * kColorRegisterStride;
+        const uint32_t info_reg = P::CB_COLOR0_INFO + slot * kColorRegisterStride;
+        const uint32_t clear0_reg = P::CB_COLOR0_CLEAR_WORD0 + slot * kColorRegisterStride;
+        const uint32_t clear1_reg = clear0_reg + 1u;
+        target.base = addr_of(rd(st.cx, base_reg), rd(st.cx, P::CB_COLOR0_BASE_EXT + slot));
+        const uint32_t info = rd(st.cx, info_reg);
+        target.format = PM4_FIELD(info, CB_COLOR0_INFO, FORMAT);
+        target.number_type = PM4_FIELD(info, CB_COLOR0_INFO, NUMBER_TYPE);
+        target.comp_swap = PM4_FIELD(info, CB_COLOR0_INFO, COMP_SWAP);
+        const auto attrib2 = st.cx.find(P::CB_COLOR0_ATTRIB2 + slot);
+        if (attrib2 != st.cx.end()) {
+            target.has_extent = true;
+            target.width = PM4_FIELD(attrib2->second, CB_COLOR0_ATTRIB2, MIP0_WIDTH) + 1u;
+            target.height = PM4_FIELD(attrib2->second, CB_COLOR0_ATTRIB2, MIP0_HEIGHT) + 1u;
+        }
+        target.has_clear = st.cx.count(clear0_reg) || st.cx.count(clear1_reg);
+        target.clear_word0 = st.cx.count(clear0_reg) ? rd(st.cx, clear0_reg) : 0u;
+        target.clear_word1 = st.cx.count(clear1_reg) ? rd(st.cx, clear1_reg) : 0u;
+    }
+
     // Primitive topology. VGT_PRIMITIVE_TYPE (0x242) is a UCONFIG register in RDNA2 (the game sets it via
     // a Uc-class SetRegsIndirect / CreatePrimState's uc[2]), NOT a context register — read it from st.uc.
     // (Reading st.cx left it 0 -> the default PointList topology, so triangles rasterized as ~3 points.)
@@ -267,6 +293,21 @@ RenderState extract_render_state(const GpuState& st) {
     rs.alpha1_dst_blend = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ALPHA_DESTBLEND);
     rs.alpha1_comb_fcn = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ALPHA_COMB_FCN);
     rs.disable_rop3_1 = PM4_FIELD(bc1, CB_BLEND0_CONTROL, DISABLE_ROP3) != 0;
+
+    for (uint32_t slot = 0; slot < rs.color_targets.size(); ++slot) {
+        ColorTargetState& target = rs.color_targets[slot];
+        const uint32_t blend = rd(st.cx, P::CB_BLEND0_CONTROL + slot);
+        target.blend_enable = PM4_FIELD(blend, CB_BLEND0_CONTROL, ENABLE) != 0;
+        target.color_src_blend = PM4_FIELD(blend, CB_BLEND0_CONTROL, COLOR_SRCBLEND);
+        target.color_dst_blend = PM4_FIELD(blend, CB_BLEND0_CONTROL, COLOR_DESTBLEND);
+        target.color_comb_fcn = PM4_FIELD(blend, CB_BLEND0_CONTROL, COLOR_COMB_FCN);
+        target.separate_alpha_blend =
+            PM4_FIELD(blend, CB_BLEND0_CONTROL, SEPARATE_ALPHA_BLEND) != 0;
+        target.alpha_src_blend = PM4_FIELD(blend, CB_BLEND0_CONTROL, ALPHA_SRCBLEND);
+        target.alpha_dst_blend = PM4_FIELD(blend, CB_BLEND0_CONTROL, ALPHA_DESTBLEND);
+        target.alpha_comb_fcn = PM4_FIELD(blend, CB_BLEND0_CONTROL, ALPHA_COMB_FCN);
+        target.disable_rop3 = PM4_FIELD(blend, CB_BLEND0_CONTROL, DISABLE_ROP3) != 0;
+    }
 
     // Faithful raw state registers.
     rs.db_depth_control  = dc;
@@ -638,6 +679,55 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     ps.color_write_mask = effective_color_mask & 0xFu;
     ps.color1_write_mask = (effective_color_mask >> 4) & 0xFu;
 
+    // Resolve the complete MRT array. Slots 0/1 mirror the named compatibility fields; slots 2..7
+    // come directly from the generic register decode above.
+    for (uint32_t slot = 0; slot < ps.color_targets.size(); ++slot) {
+        auto& out = ps.color_targets[slot];
+        const ColorTargetState& in = rs.color_targets[slot];
+        out.format = in.format ? static_cast<uint32_t>(
+            vk_color_format(in.format, in.number_type, in.comp_swap)) : 0u;
+        out.has_clear = decode_clear_color(
+            in.format, in.number_type, in.comp_swap, in.has_clear, in.clear_word0, out.clear);
+        out.blend_enable = in.blend_enable;
+        vk_blend_factors(in.color_src_blend, in.color_dst_blend,
+                         out.src_color_blend_factor, out.dst_color_blend_factor);
+        out.color_blend_op = vk_blend_op(in.color_comb_fcn);
+        if (in.separate_alpha_blend) {
+            vk_blend_factors(in.alpha_src_blend, in.alpha_dst_blend,
+                             out.src_alpha_blend_factor, out.dst_alpha_blend_factor);
+            out.alpha_blend_op = vk_blend_op(in.alpha_comb_fcn);
+        } else {
+            out.src_alpha_blend_factor = out.src_color_blend_factor;
+            out.dst_alpha_blend_factor = out.dst_color_blend_factor;
+            out.alpha_blend_op = out.color_blend_op;
+        }
+        out.write_mask = (effective_color_mask >> (slot * 4u)) & 0xFu;
+        out.disable_rop3 = in.disable_rop3;
+    }
+    // Direct/synthetic RenderState callers predate color_targets and still populate the named fields.
+    auto& out0 = ps.color_targets[0];
+    out0.format = ps.color0_format; out0.has_clear = ps.has_clear_color;
+    std::copy(std::begin(ps.clear_color), std::end(ps.clear_color), out0.clear);
+    out0.blend_enable = ps.blend_enable;
+    out0.src_color_blend_factor = ps.src_color_blend_factor;
+    out0.dst_color_blend_factor = ps.dst_color_blend_factor;
+    out0.color_blend_op = ps.color_blend_op;
+    out0.src_alpha_blend_factor = ps.src_alpha_blend_factor;
+    out0.dst_alpha_blend_factor = ps.dst_alpha_blend_factor;
+    out0.alpha_blend_op = ps.alpha_blend_op;
+    out0.write_mask = ps.color_write_mask; out0.disable_rop3 = rs.disable_rop3;
+    auto& out1 = ps.color_targets[1];
+    out1.format = ps.color1_format; out1.has_clear = ps.has_clear_color1;
+    std::copy(std::begin(ps.clear_color1), std::end(ps.clear_color1), out1.clear);
+    out1.blend_enable = ps.blend1_enable;
+    out1.src_color_blend_factor = ps.src_color_blend_factor1;
+    out1.dst_color_blend_factor = ps.dst_color_blend_factor1;
+    out1.color_blend_op = ps.color_blend_op1;
+    out1.src_alpha_blend_factor = ps.src_alpha_blend_factor1;
+    out1.dst_alpha_blend_factor = ps.dst_alpha_blend_factor1;
+    out1.alpha_blend_op = ps.alpha_blend_op1;
+    out1.write_mask = ps.color1_write_mask; out1.disable_rop3 = rs.disable_rop3_1;
+
     // MODE=DISABLE suppresses color-buffer writes, not the whole draw: depth/stencil tests and
     // updates still execute. An absent CB_COLOR_CONTROL retains the legacy normal-draw behavior;
     // otherwise a zero-initialized synthetic RenderState would unexpectedly lose every color draw.
@@ -648,6 +738,7 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         if (cb_mode == P::CB_COLOR_CONTROL_MODE_DISABLE) {
             ps.color_write_mask = 0;
             ps.color1_write_mask = 0;
+            for (auto& target : ps.color_targets) target.write_mask = 0;
         } else if (cb_mode == P::CB_COLOR_CONTROL_MODE_RESOLVE) {
             // MSAA resolve: color0 (MSAA source) -> color1 (single-sample dest). The live backend copies
             // the already-rendered color0 surface into color1 instead of running these as ordinary draws.
@@ -666,12 +757,16 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     const uint32_t rop3 = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, ROP3);
     uint32_t logic_op = 3;
     if (cb_mode == P::CB_COLOR_CONTROL_MODE_NORMAL && vk_logic_op(rop3, logic_op) && logic_op != 3u) {
-        const bool target0_active = ps.color_write_mask != 0;
-        const bool target1_active = ps.color1_format != 0 && ps.color1_write_mask != 0;
-        const bool any_target_uses_rop3 = (target0_active && !rs.disable_rop3) ||
-                                           (target1_active && !rs.disable_rop3_1);
-        const bool every_target_uses_rop3 = (!target0_active || !rs.disable_rop3) &&
-                                             (!target1_active || !rs.disable_rop3_1);
+        bool any_target_uses_rop3 = false;
+        bool every_target_uses_rop3 = true;
+        for (uint32_t slot = 0; slot < ps.color_targets.size(); ++slot) {
+            const auto& target = ps.color_targets[slot];
+            // Preserve the historical MRT0 contract for synthetic/direct callers: a programmed
+            // target mask is enough to exercise ROP3 even when no CB format was supplied.
+            const bool active = target.write_mask != 0 && (slot == 0 || target.format != 0);
+            any_target_uses_rop3 |= active && !target.disable_rop3;
+            every_target_uses_rop3 &= !active || !target.disable_rop3;
+        }
         if (any_target_uses_rop3 && every_target_uses_rop3) {
             ps.logic_op_enable = true;
             ps.logic_op = logic_op;

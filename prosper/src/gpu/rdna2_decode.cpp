@@ -189,15 +189,40 @@ void decode_operands(Rdna2Inst& i) {
                 if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
                     !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
                     i.has_modifier = false;
+                // Integer VOP2 SDWA may select a byte/word from either source before the ALU
+                // operation.  Plucky Squire's first gameplay scene uses the four byte selectors
+                // with v_mul_u32_u24 to unpack an RGBA8 value (three times BYTE_0..3).  Admit the
+                // general no-SEXT/no-saturation integer subset: source values are zero-extended,
+                // the destination is a full dword, and the normal integer VOP2 lowering remains
+                // responsible for the operation itself.  Signed extension, integer clamp and
+                // sub-dword destinations remain fail-visible until their distinct semantics are
+                // modeled.
+                else {
+                    const uint32_t op = (w >> 25) & 0x3Fu;
+                    const bool integer_op =
+                        op == 0x0Bu || (op >= 0x11u && op <= 0x14u) ||
+                        op == 0x16u || op == 0x18u || (op >= 0x1Au && op <= 0x1Eu) ||
+                        (op >= 0x25u && op <= 0x2Au);
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
+                    if (integer_op && dsel == 6u && dun == 0u &&
+                        s0sel <= 6u && s1sel <= 6u &&
+                        !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu) &&
+                        !i.clamp && !i.omod) {
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.sdwa_src1_sel = static_cast<uint8_t>(s1sel);
+                        i.has_modifier = false;
+                    }
+                }
                 // WORD-dst v_mul_f16_sdwa (#273 — the f16 half-packing idiom): dst WORD_0/1 with
                 // UNUSED_PRESERVE, src sels WORD/DWORD, no sext/neg/abs/clamp/omod. (llvm-mc gfx1010:
                 // 0x6a0000f9 0x0686156a -> v_mul_f16_sdwa v0, vcc_lo, v0 dst_sel:WORD_1
                 // dst_unused:UNUSED_PRESERVE — DOLL's box-blur tail.)
-                else if (((w >> 25) & 0x3Fu) == 0x32u ||
+                if (i.has_modifier && (((w >> 25) & 0x3Fu) == 0x32u ||
                          ((w >> 25) & 0x3Fu) == 0x33u ||
                          ((w >> 25) & 0x3Fu) == 0x35u ||
                          ((w >> 25) & 0x3Fu) == 0x39u ||
-                         ((w >> 25) & 0x3Fu) == 0x3Au) {
+                         ((w >> 25) & 0x3Fu) == 0x3Au)) {
                     uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
                     const bool preserve_word = (dsel == 4u || dsel == 5u) && dun == 2u;
@@ -212,7 +237,7 @@ void decode_operands(Rdna2Inst& i) {
                 }
                 // WORD-destination v_cndmask_b32_sdwa selects one 16-bit source through VCC and
                 // preserves the opposite destination half (the producer's packed conditional).
-                else if (((w >> 25) & 0x3Fu) == 0x01u) {
+                else if (i.has_modifier && ((w >> 25) & 0x3Fu) == 0x01u) {
                     uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
                     if ((dsel == 4u || dsel == 5u) && dun == 2u &&
@@ -326,6 +351,13 @@ void decode_operands(Rdna2Inst& i) {
             // selects the destination half. Reuse the packed-op selector field for this family.
             if (i.opcode == 0x34Bu)
                 i.vop3p_opsel = static_cast<uint8_t>((w >> 11) & 0xFu);
+            // V_PERMLANE16_B32 / V_PERMLANEX16_B32 overload OPSEL[0] as FI and OPSEL[1] as
+            // BOUND_CTRL. OPSEL[2:3], ABS, NEG, CLAMP and OMOD remain reserved/unsupported and are
+            // rejected by the emitter so malformed encodings cannot silently lose modifiers.
+            if (i.opcode == 0x377u || i.opcode == 0x378u) {
+                i.permlane_fetch_inactive = ((w >> 11) & 1u) != 0;
+                i.permlane_bound_ctrl = ((w >> 12) & 1u) != 0;
+            }
             break;
         }
         case Rdna2Format::VOP3P: {
@@ -558,22 +590,23 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
             i.has_sdwa = (src0 == 0xF9u);
             i.len_dwords = (max_dwords >= 2) ? 2 : 1;
             if (max_dwords >= 2) i.words[1] = code[1];
-            // DPP16 (src0 == 0xFA) QUAD_PERM subset (#273): dword1 = SRC0[7:0], DPP_CTRL[16:8]
-            // (< 0x100 = quad_perm), FI[18], BC[19], src neg/abs [23:20], bank_mask[27:24],
-            // row_mask[31:28]. A full-quad permute (masks 0xf, no neg/abs/FI) is handleable — the
-            // recompiler reconstructs the lane value from screen-space derivatives. The fragment
-            // recompiler also has an exact subgroup-shuffle lowering for full-mask v_or_b32
-            // row_shr (Astro's 16-lane material-mask reduction). Anything else (other row
-            // shifts/broadcasts, partial masks, modifiers) keeps has_modifier -> rejected.
+            // DPP16 (src0 == 0xFA) modeled subsets (#273/#1390): dword1 = SRC0[7:0],
+            // DPP_CTRL[16:8] (< 0x100 = quad_perm; 0x111..0x11f = row_shr:1..15), FI[18],
+            // BC[19], src neg/abs [23:20], bank_mask[27:24], row_mask[31:28].  Full-mask operations
+            // without source modifiers/FI can be lowered by a supported shader-stage model,
+            // including Astro's fragment row reduction and Plucky's bounded compute shift. Other
+            // row operations, partial masks, and modifiers keep has_modifier -> rejected.
             // (Field layout verified against llvm-mc gfx1010 round-trips of DOLL's live words,
             // e.g. 0x7e0802fa 0xff08a002 -> v_mov_b32_dpp v4, v2 quad_perm:[0,0,2,2]
             // row_mask:0xf bank_mask:0xf bound_ctrl:1.)
             if (src0 == 0xFAu && max_dwords >= 2 && vf != Rdna2Format::VOPC) {
                 const uint32_t d1 = code[1];
                 const uint32_t ctrl = (d1 >> 8) & 0x1FFu;
-                if (ctrl < 0x100u && ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
+                const bool modeled_ctrl = ctrl < 0x100u || (ctrl >= 0x111u && ctrl <= 0x11Fu);
+                if (modeled_ctrl && ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
                     ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 18) & 1u) == 0u) {
                     i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
+                    i.dpp_bound_ctrl = ((d1 >> 19) & 1u) != 0u;
                 }
                 // Astro's world-map material PS OR-reduces a lane value across each 16-lane row
                 // with row_shr:{1,2,4,8}. BOUND_CTRL=0 retains src0 for an out-of-row fetch, which

@@ -177,9 +177,18 @@ struct BackendColorTarget {
     VkFormat format1 = VK_FORMAT_UNDEFINED;
 };
 
+// Optional complete-MRT readback contract. `color_count` is the active Vulkan attachment prefix
+// (1..8); slots 1..count-1 receive their native-format bytes after rendering. Slot 0 remains the
+// function's return value for compatibility with every existing caller.
+struct BackendMrtOutputs {
+    uint32_t color_count = 1;
+    std::array<std::vector<uint8_t>, prosper::gpu::kColorTargetCount> colors;
+};
+
 inline VkFormat backend_color_format(VkFormat format) {
-    if (format == VK_FORMAT_R16G16B16A16_SFLOAT)
-        return VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+        format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+        return format;
     if (format == VK_FORMAT_R8_UNORM)
         return VK_FORMAT_R8_UNORM;
     if (format == VK_FORMAT_R32_UINT)
@@ -417,10 +426,14 @@ inline bool persistent_pipeline_cache_enabled() {
     return getenv("PROSPER_NO_BACKEND_PIPELINE_CACHE") == nullptr;
 }
 
+inline size_t persistent_pipeline_cache_limit_value(const char* value) {
+    return value ? static_cast<size_t>(strtoull(value, nullptr, 10)) : size_t{4096};
+}
+
 inline size_t persistent_pipeline_cache_limit() {
     static const size_t limit = [] {
-        const char* value = getenv("PROSPER_PIPELINE_CACHE_ENTRIES");
-        return value ? static_cast<size_t>(strtoull(value, nullptr, 10)) : size_t{1024};
+        return persistent_pipeline_cache_limit_value(
+            getenv("PROSPER_PIPELINE_CACHE_ENTRIES"));
     }();
     return limit;
 }
@@ -1149,6 +1162,51 @@ inline void init_persistent_color_target_device_budget(
             (unsigned long long)(heap / (1024ull * 1024ull)));
 }
 
+// Sampled images and color targets are independent residency pools. A large immutable source can
+// legitimately approach one GiB by itself (for example a maximum-size block-compressed atlas after
+// expansion), so the historical fixed 1 GiB image budget can continuously evict the rest of a hot
+// set. Keep small GPUs at that old bound while allowing capable devices up to 2 GiB. Unlike an
+// allocation, this is only a ceiling; memory is committed on exact-version cache insertion.
+inline VkDeviceSize persistent_texture_cache_budget_for_heap(VkDeviceSize heap) {
+    constexpr VkDeviceSize min_bytes = 1024ull * 1024ull * 1024ull;
+    constexpr VkDeviceSize max_bytes = 2048ull * 1024ull * 1024ull;
+    return std::clamp<VkDeviceSize>(heap / 8u, min_bytes, max_bytes);
+}
+
+inline VkDeviceSize& persistent_texture_cache_device_budget() {
+    static VkDeviceSize budget = 0;
+    return budget;
+}
+
+inline void init_persistent_texture_cache_device_budget(
+    const VkPhysicalDeviceMemoryProperties& memp) {
+    if (persistent_texture_cache_device_budget() != 0) return;
+    VkDeviceSize heap = 0;
+    for (uint32_t i = 0; i < memp.memoryHeapCount; ++i)
+        if (memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            heap = std::max(heap, memp.memoryHeaps[i].size);
+    persistent_texture_cache_device_budget() =
+        persistent_texture_cache_budget_for_heap(heap);
+    fprintf(stderr, "[render] persistent texture-image residency budget = %llu MiB "
+            "(device-local heap %llu MiB)\n",
+            (unsigned long long)(persistent_texture_cache_device_budget() /
+                                 (1024ull * 1024ull)),
+            (unsigned long long)(heap / (1024ull * 1024ull)));
+}
+
+inline VkDeviceSize persistent_texture_cache_limit() {
+    static const bool have_env = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB") != nullptr;
+    static const VkDeviceSize env_limit = []() -> VkDeviceSize {
+        const char* value = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB");
+        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 1024ull;
+        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
+    }();
+    if (have_env) return env_limit;
+    const VkDeviceSize device_budget = persistent_texture_cache_device_budget();
+    return device_budget ? device_budget : 1024ull * 1024ull * 1024ull;
+}
+
 // Max number of distinct render targets kept GPU-resident (sampleable) at once. A target that would
 // exceed this count is created non-resident (no SAMPLED_BIT), forcing every later sample of it onto the
 // CPU detile path. At 4K a deferred renderer (G-buffer MRTs + lighting + post chain) easily needs more
@@ -1828,9 +1886,10 @@ inline bool guest_ranges_overlap(uint64_t a, uint64_t a_size, uint64_t b, uint64
 }
 
 // The host image is deliberately detached from guest tiled depth/stencil memory. A guest-side GPU
-// write to any plane base therefore makes the cached Vulkan contents stale. HTILE fast clears are
-// especially important: Unity fills the metadata allocation without emitting DB_RENDER_CONTROL clear
-// bits, and hardware treats the surface as cleared on its next use (#611).
+// write therefore makes the corresponding cached Vulkan aspect stale. Keep the other aspect valid:
+// depth and stencil have independent guest allocations and Vulkan load/store operations, and a
+// stencil-only compute update must not discard depth that a later pass samples. HTILE fast clears are
+// the exception because the metadata can describe both aspects; conservatively invalidate both.
 inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size) {
     if (!addr || !size) return 0;
     size_t invalidated = 0;
@@ -1840,13 +1899,16 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         const uint64_t htile_blocks = static_cast<uint64_t>((key.w + 7) / 8) *
                                       ((key.h + 7) / 8);
         const uint64_t htile_size = (htile_blocks * 4 + 0x7fff) & ~0x7fffull;
-        if (!guest_ranges_overlap(addr, size, key.dr, depth_size) &&
-            !guest_ranges_overlap(addr, size, key.dw, depth_size) &&
-            !guest_ranges_overlap(addr, size, key.sr, stencil_size) &&
-            !guest_ranges_overlap(addr, size, key.sw, stencil_size) &&
-            !guest_ranges_overlap(addr, size, key.htile, htile_size)) continue;
-        image.depth_valid = false;
-        image.stencil_valid = false;
+        const bool depth_overlap =
+            guest_ranges_overlap(addr, size, key.dr, depth_size) ||
+            guest_ranges_overlap(addr, size, key.dw, depth_size);
+        const bool stencil_overlap =
+            guest_ranges_overlap(addr, size, key.sr, stencil_size) ||
+            guest_ranges_overlap(addr, size, key.sw, stencil_size);
+        const bool htile_overlap = guest_ranges_overlap(addr, size, key.htile, htile_size);
+        if (!depth_overlap && !stencil_overlap && !htile_overlap) continue;
+        if (depth_overlap || htile_overlap) image.depth_valid = false;
+        if (stencil_overlap || htile_overlap) image.stencil_valid = false;
         ++invalidated;
     }
     if (invalidated && getenv("PROSPER_DSLOG"))
@@ -2490,7 +2552,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                   std::vector<uint8_t>* out_rgba1 = nullptr,
                                                   BackendSubmissionBatch* submission_batch = nullptr,
                                                   bool flush_submission_batch = true,
-                                                  std::span<const BackendDraw> logical_ds_draws = {}) {
+                                                  std::span<const BackendDraw> logical_ds_draws = {},
+                                                  BackendMrtOutputs* mrt_outputs = nullptr) {
     using TimingClock = std::chrono::steady_clock;
     const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -2502,6 +2565,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     maybe_report_hash_stats();   // gated cumulative hashing economics (#1268)
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
+    if (mrt_outputs)
+        for (auto& color : mrt_outputs->colors) color.clear();
     if (draws.empty()) return out;
     if (backend_has_unproven_submission()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
@@ -2521,37 +2586,50 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const bool aniso_enabled = ctx.aniso_enabled; const float max_aniso_limit = ctx.max_aniso_limit;
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
     init_persistent_color_target_device_budget(memp);   // size the residency budget once (#1177)
+    init_persistent_texture_cache_device_budget(memp);
     auto pick = [&](uint32_t bits, VkMemoryPropertyFlags want) -> uint32_t {
         for (uint32_t i = 0; i < memp.memoryTypeCount; i++)
             if ((bits & (1u << i)) && (memp.memoryTypes[i].propertyFlags & want) == want) return i;
         return UINT32_MAX; };
-    const bool use_color1 = out_rgba1 != nullptr;
-    const auto first_pipeline_format = [&](bool color1) {
+    const bool use_color1 = out_rgba1 != nullptr ||
+        (mrt_outputs && mrt_outputs->color_count > 1);
+    const uint32_t color_count = mrt_outputs
+        ? std::clamp(mrt_outputs->color_count, 1u, prosper::gpu::kColorTargetCount)
+        : (use_color1 ? 2u : 1u);
+    const auto first_pipeline_format = [&](uint32_t slot) {
         for (const auto& draw : draws) {
             if (!draw.ps) continue;
-            const VkFormat format = static_cast<VkFormat>(
-                color1 ? draw.ps->color1_format : draw.ps->color0_format);
+            uint32_t raw = draw.ps->color_targets[slot].format;
+            if (slot == 0 && !raw) raw = draw.ps->color0_format;
+            if (slot == 1 && !raw) raw = draw.ps->color1_format;
+            const VkFormat format = static_cast<VkFormat>(raw);
             if (format != VK_FORMAT_UNDEFINED) return backend_color_format(format);
         }
         return VK_FORMAT_R8G8B8A8_UNORM;
     };
     const VkFormat FMT = color_target && color_target->format != VK_FORMAT_UNDEFINED
         ? backend_color_format(color_target->format)
-        : first_pipeline_format(false);
-    const VkFormat FMT1 = use_color1
-        ? (color_target && color_target->format1 != VK_FORMAT_UNDEFINED
-               ? backend_color_format(color_target->format1)
-               : first_pipeline_format(true))
-        : VK_FORMAT_UNDEFINED;
+        : first_pipeline_format(0);
+    std::array<VkFormat, prosper::gpu::kColorTargetCount> color_formats{};
+    std::array<VkDeviceSize, prosper::gpu::kColorTargetCount> color_bytes{};
+    std::array<VkDeviceSize, prosper::gpu::kColorTargetCount> color_offsets{};
+    color_formats[0] = FMT;
+    VkDeviceSize readback_bytes = 0;
+    for (uint32_t slot = 0; slot < color_count; ++slot) {
+        if (slot) color_formats[slot] = first_pipeline_format(slot);
+        if (slot == 1 && color_target && color_target->format1 != VK_FORMAT_UNDEFINED)
+            color_formats[slot] = backend_color_format(color_target->format1);
+        color_offsets[slot] = readback_bytes;
+        color_bytes[slot] = static_cast<VkDeviceSize>(W) * H *
+            backend_color_bytes_per_pixel(color_formats[slot]);
+        readback_bytes += color_bytes[slot];
+    }
+    const VkFormat FMT1 = use_color1 ? color_formats[1] : VK_FORMAT_UNDEFINED;
     const bool persistent_color1_enabled = persistent_color_targets_enabled && use_color1 &&
                                            color_target && color_target->persistent_id1 &&
                                            color_target->persistent_id1 != color_target->persistent_id;
-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(W) * H *
-                               backend_color_bytes_per_pixel(FMT);
-    const VkDeviceSize bytes1 = use_color1
-        ? static_cast<VkDeviceSize>(W) * H * backend_color_bytes_per_pixel(FMT1)
-        : 0;
-    const uint32_t color_count = use_color1 ? 2u : 1u;
+    const VkDeviceSize bytes = color_bytes[0];
+    const VkDeviceSize bytes1 = use_color1 ? color_bytes[1] : 0;
     const uint32_t ds_attachment = color_count;
     // A feedback split is a physical Vulkan detail, not a guest draw-pass boundary. Attachment
     // identity/format and fresh-image fallback values therefore come from the original logical
@@ -2893,6 +2971,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 (int)color_target->load_existing, seed_rgba != nullptr,
                 (int)color_target->readback, (int)load_cached_color);
 
+    std::array<VkImage, prosper::gpu::kColorTargetCount> extra_images{};
+    std::array<VkDeviceMemory, prosper::gpu::kColorTargetCount> extra_memories{};
+    std::array<VkImageView, prosper::gpu::kColorTargetCount> extra_views{};
     bool persistent_color1 = persistent_color1_enabled;
     PersistentColorTargetKey color_key1{};
     PersistentColorTargetImage* cached_color1 = nullptr;
@@ -2987,6 +3068,36 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     const bool load_cached_color1 = cached_color1 && cached_color1->valid &&
                                     color_target->load_existing1 && !seed_rgba1;
+    if (use_color1) {
+        extra_images[1] = img1;
+        extra_memories[1] = imem1;
+        extra_views[1] = view1;
+    }
+    for (uint32_t slot = 2; slot < color_count; ++slot) {
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType = VK_IMAGE_TYPE_2D; ci.format = color_formats[slot];
+        ci.extent = {W, H, 1}; ci.mipLevels = 1; ci.arrayLayers = 1;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        vkCreateImage(dev, &ci, nullptr, &extra_images[slot]);
+        if (!extra_images[slot]) return out;
+        VkMemoryRequirements requirements{};
+        vkGetImageMemoryRequirements(dev, extra_images[slot], &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = pick(requirements.memoryTypeBits, 0);
+        extra_memories[slot] = allocate_transient_render_memory(
+            dev, allocation.allocationSize, allocation.memoryTypeIndex);
+        VkImageViewCreateInfo view_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view_ci.image = extra_images[slot]; view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_ci.format = color_formats[slot];
+        view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const bool ready = extra_memories[slot] &&
+            vkBindImageMemory(dev, extra_images[slot], extra_memories[slot], 0) == VK_SUCCESS &&
+            vkCreateImageView(dev, &view_ci, nullptr, &extra_views[slot]) == VK_SUCCESS &&
+            extra_views[slot];
+        if (!ready) return out;
+    }
 
     if (use_ds && !dimg) {
         VkImageCreateInfo dci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -3011,7 +3122,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (cached_ds) { cached_ds->image = dimg; cached_ds->memory = dmem; cached_ds->view = dview; }
     }
 
-    VkAttachmentDescription att[3]{};
+    std::array<VkAttachmentDescription, prosper::gpu::kColorTargetCount + 1> att{};
     att[0].format = FMT; att[0].samples = VK_SAMPLE_COUNT_1_BIT;
     // Seeded or persistent: the attachment already holds valid pixels before this pass, so LOAD them.
     att[0].loadOp = (seed_rgba || load_cached_color) ? VK_ATTACHMENT_LOAD_OP_LOAD
@@ -3034,6 +3145,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         att[1].finalLayout = persistent_color1 ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                                : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     }
+    for (uint32_t slot = 2; slot < color_count; ++slot) {
+        att[slot].format = color_formats[slot];
+        att[slot].samples = VK_SAMPLE_COUNT_1_BIT;
+        att[slot].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att[slot].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att[slot].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[slot].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        att[slot].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    }
     att[ds_attachment].format = DFMT; att[ds_attachment].samples = VK_SAMPLE_COUNT_1_BIT;
     // A guest-identified DS surface survives calls. New attachments get a defined initial value;
     // existing ones LOAD. Explicit DB_RENDER_CONTROL clears execute at their draw below, preserving
@@ -3053,27 +3174,27 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         : (ds_layout_initialized ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
                                  : VK_IMAGE_LAYOUT_UNDEFINED);
     att[ds_attachment].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    VkAttachmentReference ar[2] = {
-        {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-        {1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-    };
+    std::array<VkAttachmentReference, prosper::gpu::kColorTargetCount> ar{};
+    for (uint32_t slot = 0; slot < color_count; ++slot)
+        ar[slot] = {slot, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference dar{
         ds_attachment,
         self_sampled_depth ? self_depth_layout
                            : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub{}; sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount = color_count; sub.pColorAttachments = ar;
+    sub.colorAttachmentCount = color_count; sub.pColorAttachments = ar.data();
     if (use_ds) sub.pDepthStencilAttachment = &dar;
     VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpci.attachmentCount = color_count + (use_ds ? 1u : 0u); rpci.pAttachments = att;
+    rpci.attachmentCount = color_count + (use_ds ? 1u : 0u); rpci.pAttachments = att.data();
     rpci.subpassCount = 1; rpci.pSubpasses = &sub;
     VkRenderPass rp; vkCreateRenderPass(dev, &rpci, nullptr, &rp);
-    VkImageView fbviews[3] = {view, VK_NULL_HANDLE, VK_NULL_HANDLE};
-    if (use_color1) fbviews[1] = view1;
+    std::array<VkImageView, prosper::gpu::kColorTargetCount + 1> fbviews{};
+    fbviews[0] = view;
+    for (uint32_t slot = 1; slot < color_count; ++slot) fbviews[slot] = extra_views[slot];
     if (use_ds) fbviews[ds_attachment] = dview;
     VkFramebufferCreateInfo fbci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fbci.renderPass = rp; fbci.attachmentCount = color_count + (use_ds ? 1u : 0u);
-    fbci.pAttachments = fbviews; fbci.width = W; fbci.height = H; fbci.layers = 1;
+    fbci.pAttachments = fbviews.data(); fbci.width = W; fbci.height = H; fbci.layers = 1;
     VkFramebuffer fb; vkCreateFramebuffer(dev, &fbci, nullptr, &fb);
 
     auto mkmod = [&](const std::vector<uint32_t>& c) -> VkShaderModule {
@@ -3194,12 +3315,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const uint64_t texture_generation = ++persistent_texture_generation;
     const bool persistent_textures_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES") == nullptr;
-    const VkDeviceSize persistent_texture_limit = []() -> VkDeviceSize {
-        const char* value = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB");
-        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 1024ull;
-        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
-        return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
-    }();
+    const VkDeviceSize persistent_texture_limit = persistent_texture_cache_limit();
     const bool share_backend_resources =
         getenv("PROSPER_NO_BACKEND_RESOURCE_SHARE") == nullptr;
     const bool reuse_host_buffers = render_host_buffer_pool_enabled();
@@ -3439,6 +3555,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         DV& v = dv[di];
         const uint32_t required_fragment_subgroup_size =
             prosper::gpu::fragment_spirv_required_subgroup_size(bd_fs);
+        const uint32_t required_fragment_subgroup_features =
+            prosper::gpu::fragment_spirv_required_subgroup_features(bd_fs);
         const bool uses_internal_gds =
             prosper::gpu::fragment_spirv_uses_internal_gds(bd_fs);
         if (required_fragment_subgroup_size &&
@@ -3447,7 +3565,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
              required_fragment_subgroup_size > ctx.max_subgroup_size ||
              !(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
              !(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
-             !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) ||
+             ((required_fragment_subgroup_features & prosper::gpu::kFragmentSubgroupArithmetic) &&
+              !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)) ||
+             ((required_fragment_subgroup_features & prosper::gpu::kFragmentSubgroupVote) &&
+              !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT)) ||
              (uses_internal_gds && !ctx.fragment_stores_atomics))) {
             const uint64_t shader_key = bd.fs_identity
                 ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
@@ -3458,10 +3579,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 std::fprintf(stderr,
                              "[render] skip draw: fragment shader requires subgroup size %u "
                              "(device range %u..%u required-stages=0x%x subgroup-stages=0x%x "
-                             "ops=0x%x control=%d gds=%d fragment-atomics=%d)\n",
+                             "ops=0x%x required-ops=0x%x control=%d gds=%d fragment-atomics=%d)\n",
                              required_fragment_subgroup_size, ctx.min_subgroup_size,
                              ctx.max_subgroup_size, ctx.required_subgroup_size_stages,
                              ctx.subgroup_stages, ctx.subgroup_operations,
+                             required_fragment_subgroup_features,
                              static_cast<int>(ctx.subgroup_size_control),
                              static_cast<int>(uses_internal_gds),
                              static_cast<int>(ctx.fragment_stores_atomics));
@@ -3586,8 +3708,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineColorBlendAttachmentState cba[2]{};
-        cba[0].colorWriteMask = 0xF; cba[1].colorWriteMask = 0xF;
+        std::array<VkPipelineColorBlendAttachmentState,
+                   prosper::gpu::kColorTargetCount> cba{};
+        for (uint32_t slot = 0; slot < color_count; ++slot) cba[slot].colorWriteMask = 0xF;
         if (ps) {
             cba[0].colorWriteMask = ps->color_write_mask;
             cba[0].blendEnable    = ps->blend_enable ? VK_TRUE : VK_FALSE;
@@ -3610,6 +3733,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             cba[1].srcAlphaBlendFactor = (VkBlendFactor)ps->src_alpha_blend_factor1;
             cba[1].dstAlphaBlendFactor = (VkBlendFactor)ps->dst_alpha_blend_factor1;
             cba[1].alphaBlendOp = (VkBlendOp)ps->alpha_blend_op1;
+            for (uint32_t slot = 2; slot < color_count; ++slot) {
+                const auto& target = ps->color_targets[slot];
+                cba[slot].colorWriteMask = target.write_mask;
+                cba[slot].blendEnable = target.blend_enable ? VK_TRUE : VK_FALSE;
+                if (getenv("PROSPER_NO_BLEND")) cba[slot].blendEnable = VK_FALSE;
+                cba[slot].srcColorBlendFactor =
+                    static_cast<VkBlendFactor>(target.src_color_blend_factor);
+                cba[slot].dstColorBlendFactor =
+                    static_cast<VkBlendFactor>(target.dst_color_blend_factor);
+                cba[slot].colorBlendOp = static_cast<VkBlendOp>(target.color_blend_op);
+                cba[slot].srcAlphaBlendFactor =
+                    static_cast<VkBlendFactor>(target.src_alpha_blend_factor);
+                cba[slot].dstAlphaBlendFactor =
+                    static_cast<VkBlendFactor>(target.dst_alpha_blend_factor);
+                cba[slot].alphaBlendOp = static_cast<VkBlendOp>(target.alpha_blend_op);
+            }
         }
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         if (ps && ps->logic_op_enable) {
@@ -3623,7 +3762,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 });
             }
         }
-        cb.attachmentCount = color_count; cb.pAttachments = cba;
+        cb.attachmentCount = color_count; cb.pAttachments = cba.data();
         VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         if (ps && ps->depth_test_enable) {
             dss.depthTestEnable  = VK_TRUE;
@@ -4394,9 +4533,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(8); // key schema version (depth bias in rasterization state, #1349)
-            append(W); append(H); append(color_count); append(static_cast<uint32_t>(FMT));
-            append(static_cast<uint32_t>(FMT1)); append(use_ds); append(static_cast<uint32_t>(DFMT));
+            append(9); // key schema version (complete MRT attachment formats, #1390)
+            append(W); append(H); append(color_count);
+            for (uint32_t slot = 0; slot < color_count; ++slot)
+                append(static_cast<uint32_t>(color_formats[slot]));
+            append(use_ds); append(static_cast<uint32_t>(DFMT));
             const bool exact_shader_identities = bd.vs_identity && bd.fs_identity;
             append(bd.vs_identity != 0);
             if (bd.vs_identity) {
@@ -4555,10 +4696,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+    // Persistent MRT0/MRT1 attachments retain their independent readback contracts. In particular,
+    // merely requesting the complete MRT shape must not materialize either GPU-resident image on the
+    // CPU. Slots 2+ are currently transient backend attachments, so a caller requesting them through
+    // BackendMrtOutputs still needs those planes copied before the images are released.
     const bool readback_color0 = !persistent_color || color_target->readback;
     const bool readback_color1 = use_color1 &&
         (!persistent_color1 || color_target->readback1);
-    const bool readback_requested = readback_color0 || readback_color1;
+    const bool readback_requested = readback_color0 || readback_color1 || color_count > 2;
     const bool storage_writeback_requested = std::any_of(
         texture_uploads.begin(), texture_uploads.end(),
         [](const SharedTextureUpload& upload) {
@@ -4566,9 +4711,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         });
     const bool synchronous_results_requested =
         readback_requested || storage_writeback_requested;
-    const VkDeviceSize readback_color1_offset = readback_color0 ? bytes : 0;
-    const VkDeviceSize readback_bytes = (readback_color0 ? bytes : 0) +
-                                        (readback_color1 ? bytes1 : 0);
     VkBuffer rb = VK_NULL_HANDLE;
     VkDeviceMemory bmem = VK_NULL_HANDLE;
     if (readback_requested) {
@@ -4681,17 +4823,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         memcpy(sp, seed_rgba1, static_cast<size_t>(bytes1)); vkUnmapMemory(dev, seedmem1);
         VkImageMemoryBarrier s0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         s0.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; s0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        s0.image = img1; s0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        s0.image = extra_images[1]; s0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         s0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &s0);
         VkBufferImageCopy sc{}; sc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         sc.imageExtent = {W, H, 1};
-        vkCmdCopyBufferToImage(cmd, seedbuf1, img1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &sc);
+        vkCmdCopyBufferToImage(cmd, seedbuf1, extra_images[1],
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &sc);
         VkImageMemoryBarrier s1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         s1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         s1.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        s1.image = img1; s1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        s1.image = extra_images[1]; s1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         s1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         s1.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -4831,12 +4974,24 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     float cc1[4] = {0.0f, 0.0f, 1.0f, 1.0f};
     if (clear_rgba1 && getenv("PROSPER_CLEAR_DEBUG") == nullptr)
         for (int i = 0; i < 4; ++i) cc1[i] = clear_rgba1[i];
-    VkClearValue clear[3]{}; clear[0].color = {{cc[0], cc[1], cc[2], cc[3]}};
+    std::array<VkClearValue, prosper::gpu::kColorTargetCount + 1> clear{};
+    clear[0].color = {{cc[0], cc[1], cc[2], cc[3]}};
     if (use_color1) clear[1].color = {{cc1[0], cc1[1], cc1[2], cc1[3]}};
+    for (uint32_t slot = 2; slot < color_count; ++slot) {
+        float value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        for (const auto& draw : logical_draws) {
+            if (!draw.ps || !draw.ps->color_targets[slot].has_clear) continue;
+            std::copy(std::begin(draw.ps->color_targets[slot].clear),
+                      std::end(draw.ps->color_targets[slot].clear), value);
+            break;
+        }
+        clear[slot].color = {{value[0], value[1], value[2], value[3]}};
+    }
     clear[ds_attachment].depthStencil = {depth_clear, stencil_clear}; // guest DB clear/default
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}};
-    rpbi.clearValueCount = color_count + (use_ds ? 1u : 0u); rpbi.pClearValues = clear;
+    rpbi.clearValueCount = color_count + (use_ds ? 1u : 0u);
+    rpbi.pClearValues = clear.data();
     if (getenv("PROSPER_PIPELOG")) {   // diag: how many draws' pipelines built + will be recorded
         int nok = 0; for (auto& v : dv) if (v.ok) nok++;
         fprintf(stderr, "[pipe] %zu draws, %d pipelines OK, use_depth=%d use_stencil=%d; counts:", dv.size(), nok, (int)use_depth, (int)use_stencil);
@@ -5111,9 +5266,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkCmdCopyImageToBuffer(
                 cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp);
         if (readback_color1) {
-            VkBufferImageCopy cp1 = cp; cp1.bufferOffset = readback_color1_offset;
+            VkBufferImageCopy cp1 = cp; cp1.bufferOffset = color_offsets[1];
             vkCmdCopyImageToBuffer(
                 cmd, img1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp1);
+        }
+        for (uint32_t slot = 2; slot < color_count; ++slot) {
+            VkBufferImageCopy extra_copy = cp;
+            extra_copy.bufferOffset = color_offsets[slot];
+            vkCmdCopyImageToBuffer(cmd, extra_images[slot],
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   rb, 1, &extra_copy);
         }
         auto restore_persistent_color = [&](bool persistent, bool readback, VkImage image) {
             if (!persistent || !readback) return;
@@ -5454,8 +5616,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (readback_color0)
             out.assign(readback, readback + static_cast<size_t>(bytes));
         if (readback_color1)
-            out_rgba1->assign(readback + static_cast<size_t>(readback_color1_offset),
-                              readback + static_cast<size_t>(readback_color1_offset + bytes1));
+            (out_rgba1 ? *out_rgba1 : mrt_outputs->colors[1]).assign(
+                readback + static_cast<size_t>(color_offsets[1]),
+                readback + static_cast<size_t>(color_offsets[1] + color_bytes[1]));
+        if (mrt_outputs)
+            for (uint32_t slot = 2; slot < color_count; ++slot)
+                mrt_outputs->colors[slot].assign(
+                    readback + static_cast<size_t>(color_offsets[slot]),
+                    readback + static_cast<size_t>(color_offsets[slot] + color_bytes[slot]));
         vkUnmapMemory(dev, bmem);
         color_target_stats.readbacks = persistent_color ? 1 : 0;
     }
@@ -5602,7 +5770,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
          shared_buffer_arenas = std::move(shared_buffer_arenas),
          texture_uploads = std::move(texture_uploads), seedbuf, seedmem, seedbuf1, seedmem1,
          rb, bmem, fb, rp, transient_color, view, img, imem, transient_color1, view1, img1,
-         imem1, transient_ds, dview, dimg, dmem, ds_stats_pool, ds_occ_pool,
+         imem1, color_count, extra_views, extra_images, extra_memories,
+         transient_ds, dview, dimg, dmem, ds_stats_pool, ds_occ_pool,
          geom_buf, geom_mem, geom_counter, geom_counter_mem, ctx_ptr,
          color_target_generation]() mutable {
             vkDestroyCommandPool(dev, pool, nullptr);
@@ -5676,6 +5845,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 vkDestroyImageView(dev, view1, nullptr);
                 vkDestroyImage(dev, img1, nullptr);
                 release_transient_render_memory(dev, imem1);
+            }
+            for (uint32_t slot = 2; slot < color_count; ++slot) {
+                vkDestroyImageView(dev, extra_views[slot], nullptr);
+                vkDestroyImage(dev, extra_images[slot], nullptr);
+                release_transient_render_memory(dev, extra_memories[slot]);
             }
             if (transient_ds) {
                 vkDestroyImageView(dev, dview, nullptr);
@@ -5923,14 +6097,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               const float* clear_rgba1 = nullptr,
                                               std::vector<uint8_t>* out_rgba1 = nullptr,
                                               BackendSubmissionBatch* submission_batch = nullptr,
-                                              bool flush_submission_batch = true) {
+                                              bool flush_submission_batch = true,
+                                              BackendMrtOutputs* mrt_outputs = nullptr) {
     const std::span<const BackendDraw> all(draws);
     if (!persist_depth_stencil ||
         depth_feedback_split_index(all, W, H) == all.size())
         return render_draw_pass_rgba(all, W, H, seed_rgba, clear_rgba,
                                      persist_depth_stencil, color_target, seed_rgba1,
                                      clear_rgba1, out_rgba1, submission_batch,
-                                     flush_submission_batch);
+                                     flush_submission_batch, {}, mrt_outputs);
 
     BackendColorTargetStats aggregate_color{};
     BackendTextureUploadStats aggregate_textures{};
@@ -6045,7 +6220,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             all.subspan(begin, end - begin), W, H, next_seed0,
             begin ? nullptr : clear_rgba, true, segment_target_ptr, next_seed1,
             begin ? nullptr : clear_rgba1, segment_out1, submission_batch,
-            final ? flush_submission_batch : false, all);
+            final ? flush_submission_batch : false, all,
+            final ? mrt_outputs : nullptr);
         add_stats();
 
         if (final) {

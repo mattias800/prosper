@@ -70,6 +70,7 @@ int fails = 0;
 
 extern "C" size_t prosper_agc_shader_count();
 extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_code_addr);
+extern "C" uint64_t prosper_agc_shader_continuation_for_code(uint64_t code_addr);
 
 int main() {
     printf("== test_agc_shader ==\n");
@@ -146,6 +147,10 @@ int main() {
         CHECK(prosper_agc_fused_back_header_for_front(
                   reinterpret_cast<uint64_t>(front.code)) == &back,
               "GS fusion publishes the back-half body for the bound front address");
+        CHECK(prosper_agc_shader_continuation_for_code(
+                  reinterpret_cast<uint64_t>(front.code)) ==
+                  reinterpret_cast<uint64_t>(back.code),
+              "GS fusion retains the separately allocated back-program continuation");
 
         ShaderRegister hs_regs[] = {
             {SPI_SHADER_PGM_LO_LS, 0},

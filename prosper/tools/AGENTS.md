@@ -93,6 +93,14 @@ PROSPER_GPU_CAPTURE=/tmp/messenger-level.prgcap PROSPER_GPU_CAPTURE_AT=0 \
 `PROSPER_GPU_CAPTURE_MIN_DRAWS`/`MAX_DRAWS` filter by realized item count; `PROSPER_GPU_CAPTURE_AT`
 counts matching invocations that reach the registered renderer, after the normal `RENDER_EVERY`
 sampling. Aim the live run near the target first; the capture itself writes once.
+`PROSPER_GPU_CAPTURE_COMPUTE_ADDR=0x...` additionally requires the exact compute program address.
+Use it for a late or intermittent compute fault when predicting a renderer invocation or semantic
+submit number would be fragile.
+`PROSPER_GPU_CAPTURE_SHADER_ADDR=0x...` does the same for any realized or semantic draw stage,
+including a shader whose draw failed realization and therefore never reached the renderer.
+`PROSPER_GPU_CAPTURE_TARGET_DIM=WxH` requires at least one realized or semantic color target with the
+exact dimensions. Use it to select a native composition submit without relying on a title-specific
+shader address; malformed or zero dimensions do not match.
 The live hook snapshots realized draws, compute dispatches, and the original mixed PM4 operation order
 before executing the selected submit, then attaches the rendered pixel oracle afterward. An inspected
 mixed capsule must report the same draw/compute/operation counts as the live timing line; `computes=0`
