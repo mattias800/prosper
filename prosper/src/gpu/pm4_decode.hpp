@@ -37,6 +37,10 @@ enum : uint32_t {
     // sceAgcDcbSetPredication appends R_SET_PRED = "begin (addr!=0) / end (addr==0) a predication
     // window over the following packets, condition = the 64-bit value at addr".
     R_JUMP = 0x1e, R_SET_PRED = 0x1f,
+    // Gen5 indirect execution state. SetBase selects the guest argument buffer for graphics (0)
+    // or compute (1); the following indirect packet carries a byte offset into that buffer.
+    R_SET_BASE_INDIRECT_ARGS = 0x20, R_STALL_COMMAND_BUFFER_PARSER = 0x21,
+    R_DRAW_INDEX_INDIRECT = 0x22, R_DISPATCH_INDIRECT = 0x23,
     R_NUM = 0x40,
 };
 
@@ -52,6 +56,7 @@ struct Pm4Command {
         SetNumInstances,
         DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem,
         DispatchDirect, SetIndexBase, SetIndexCount, DrawIndexOffset, Jump, SetPredication,
+        SetBaseIndirectArgs, StallCommandBufferParser, DrawIndexIndirect, DispatchIndirect,
         DmaData, Unknown,
     } kind = Kind::Unknown;
 
@@ -83,6 +88,12 @@ struct Pm4Command {
     // workgroup counts. [3..4] is the 64-bit dispatch modifier from the CS shader's specials block.
     uint32_t threads_x = 0, threads_y = 0, threads_z = 0;
     uint64_t dispatch_modifier = 0;          // DispatchDirect modifier bits
+
+    // Indirect draw/dispatch family. SetBaseIndirectArgs selects one of the two hardware bases;
+    // Draw/DispatchIndirect use `indirect_offset` bytes from the corresponding current base.
+    uint32_t indirect_shader_type = 0;       // SetBase: 0=graphics, 1=compute
+    uint64_t indirect_base = 0;              // SetBase: guest argument-buffer address
+    uint32_t indirect_offset = 0;            // Draw/Dispatch: byte offset from selected base
 
     // DrawIndex/DrawIndexAuto modifier. Both custom HLE packets retain the shader's trailing
     // 64-bit ShaderDrawModifier; DrawIndex additionally carries an index-buffer address.

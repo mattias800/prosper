@@ -3263,6 +3263,52 @@ bool gpu_capture_output_nonzero_matches(const std::vector<uint8_t>& output, size
 }
 
 namespace {
+CaptureMemoryReader pending_capture_reader(const PendingGpuCapture& pending) {
+    return [&pending](uint64_t addr, uint8_t* destination, size_t bytes) -> size_t {
+        size_t copied = read_capture_guest_memory(addr, destination, bytes);
+        if (!bytes || addr > std::numeric_limits<uint64_t>::max() - bytes) return copied;
+        const uint64_t end = addr + bytes;
+        for (const auto& snapshot : pending.pre_submit_memory) {
+            if (snapshot.guest_addr > std::numeric_limits<uint64_t>::max() -
+                    snapshot.bytes.size())
+                continue;
+            const uint64_t snapshot_end = snapshot.guest_addr + snapshot.bytes.size();
+            const uint64_t overlap_begin = std::max(addr, snapshot.guest_addr);
+            const uint64_t overlap_end = std::min(end, snapshot_end);
+            if (overlap_begin >= overlap_end) continue;
+            const size_t destination_offset = static_cast<size_t>(overlap_begin - addr);
+            const size_t snapshot_offset = static_cast<size_t>(overlap_begin - snapshot.guest_addr);
+            const size_t overlap_bytes = static_cast<size_t>(overlap_end - overlap_begin);
+            std::memcpy(destination + destination_offset,
+                        snapshot.bytes.data() + snapshot_offset, overlap_bytes);
+            const size_t readable_overlap = snapshot.bytes_read > snapshot_offset
+                ? std::min(overlap_bytes, snapshot.bytes_read - snapshot_offset) : 0;
+            copied = std::max(copied, destination_offset + readable_overlap);
+        }
+        return copied;
+    };
+}
+
+std::vector<ComputeItem> with_pending_gds_snapshot(
+    const PendingGpuCapture& pending, const std::vector<ComputeItem>& computes) {
+    if (pending.pre_submit_compute_gds.empty()) return computes;
+    std::vector<ComputeItem> exact = computes;
+    for (auto& compute : exact) {
+        if (!compute.resources) continue;
+        const bool has_gds = std::any_of(
+            compute.resources->resources.begin(), compute.resources->resources.end(),
+            [](const ShaderResource& resource) { return is_compute_internal_gds(resource); });
+        if (!has_gds) continue;
+        compute.resources = std::make_shared<ShaderResourceTable>(*compute.resources);
+        for (auto& resource : compute.resources->resources) {
+            if (!is_compute_internal_gds(resource)) continue;
+            resource.host_data = const_cast<uint8_t*>(pending.pre_submit_compute_gds.data());
+            resource.host_data_size = pending.pre_submit_compute_gds.size();
+        }
+    }
+    return exact;
+}
+
 bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
                                      const std::vector<DrawItem>& draws,
                                      const std::vector<ComputeItem>& computes,
@@ -3271,37 +3317,45 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
                                      const std::vector<OperationRealizationFailure>* exact_failures,
                                      std::string& error) {
     const GpuCaptureMetadata metadata = pending.capture.metadata;
-    const bool has_ordered_dma = semantic_state && !semantic_state->dma_copies.empty();
-    bool captured = false;
-    if (has_ordered_dma) {
-        captured = capture_gpustate_submit(*semantic_state, metadata.submit_index,
-                                           metadata.width, metadata.height, metadata,
-                                           pending.capture, error);
-    } else {
-        // Preserve exact realized lists while retaining diagnostics for semantic operations rejected
-        // before they reached those lists.
-        std::vector<OperationRealizationFailure> failures = exact_failures
-            ? *exact_failures : std::vector<OperationRealizationFailure>{};
-        if (semantic_state && !exact_failures) {
-            std::vector<OperationRealizationFailure> compute_failures;
-            (void)realize_gpustate_draws(*semantic_state, 0x10000, 1.0f, 1.0f,
-                                         &failures, false, false);
-            (void)realize_compute_dispatches(*semantic_state, metadata.submit_index,
-                                             &compute_failures);
-            failures.insert(failures.end(),
-                            std::make_move_iterator(compute_failures.begin()),
-                            std::make_move_iterator(compute_failures.end()));
-        }
-        captured = capture_submit_items(draws, computes, operations, metadata,
-                                        read_capture_guest_memory, pending.capture, error,
-                                        g_rtt_seed_reader, failures);
+    // Preserve exact realized lists while retaining diagnostics for semantic operations rejected
+    // before they reached those lists. DMA-bearing deferred captures must not fall back to eager
+    // semantic realization: their indirect arguments do not exist until the ordered copy executes.
+    std::vector<OperationRealizationFailure> failures = exact_failures
+        ? *exact_failures : std::vector<OperationRealizationFailure>{};
+    if (semantic_state && !exact_failures) {
+        std::vector<OperationRealizationFailure> compute_failures;
+        (void)realize_gpustate_draws(*semantic_state, 0x10000, 1.0f, 1.0f,
+                                     &failures, false, false);
+        (void)realize_compute_dispatches(*semantic_state, metadata.submit_index,
+                                         &compute_failures);
+        failures.insert(failures.end(),
+                        std::make_move_iterator(compute_failures.begin()),
+                        std::make_move_iterator(compute_failures.end()));
     }
+    const std::vector<ComputeItem> snapshot_computes =
+        with_pending_gds_snapshot(pending, computes);
+    const std::vector<SubmitOperation> semantic_operations =
+        operations.empty() && semantic_state ? plan_submit_operations(*semantic_state)
+                                             : std::vector<SubmitOperation>{};
+    const std::vector<SubmitOperation>& exact_operations =
+        semantic_operations.empty() ? operations : semantic_operations;
+    const CaptureMemoryReader reader = pending_capture_reader(pending);
+    const bool captured = capture_submit_items(
+        draws, snapshot_computes, exact_operations, metadata, reader, pending.capture, error,
+        g_rtt_seed_reader, failures,
+        semantic_state ? semantic_state->dma_copies : std::vector<GpuState::DmaCopy>{});
     if (!captured) return false;
     pending.materialized = true;
     return !gpu_capture_ds_seed_snapshot_available() ||
            capture_referenced_gpu_ds_seeds(pending.capture, error);
 }
 }  // namespace
+
+void snapshot_pending_gpu_capture_compute_gds(PendingGpuCapture* pending,
+                                              const uint8_t* data, size_t bytes) {
+    if (!pending || pending->materialized || !data || !bytes) return;
+    pending->pre_submit_compute_gds.assign(data, data + bytes);
+}
 
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     const std::vector<DrawItem>& draws, const std::vector<ComputeItem>& computes,
@@ -3444,9 +3498,31 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     for (const char* name : render_env) if (const char* value = std::getenv(name)) m.renderer_env.emplace_back(name, value);
     annotate_gpu_capture_scanout(m);
     pending->capture.metadata = m;
-    // Output predicates must remain observational: do not read guest resources or renderer caches
-    // for rejected candidates. The synchronous executor supplies the still-valid semantic state only
-    // after this same submit's pixels match, and materialization happens once for that winner.
+    if ((output_triggered || defer_materialization) && semantic_state &&
+        !semantic_state->dma_copies.empty()) {
+        const CaptureMemoryReader reader = ordered_gpustate_capture_reader(*semantic_state);
+        auto snapshot = [&](uint64_t addr, uint32_t bytes) {
+            const auto duplicate = std::find_if(
+                pending->pre_submit_memory.begin(), pending->pre_submit_memory.end(),
+                [&](const PendingGpuCapture::MemorySnapshot& existing) {
+                    return existing.guest_addr == addr && existing.bytes.size() == bytes;
+                });
+            if (duplicate != pending->pre_submit_memory.end()) return;
+            PendingGpuCapture::MemorySnapshot range;
+            range.guest_addr = addr;
+            range.bytes.resize(bytes);
+            range.bytes_read = reader(addr, range.bytes.data(), range.bytes.size());
+            pending->pre_submit_memory.push_back(std::move(range));
+        };
+        for (const auto& copy : semantic_state->dma_copies) {
+            snapshot(copy.dst, copy.bytes);
+            snapshot(copy.src, copy.bytes);
+        }
+    }
+    // Full output-candidate materialization remains deferred until its pixels match. The small
+    // pre-submit snapshots above are the deliberate exception: known DMA endpoints cannot be
+    // recovered after execution, while every unrelated guest resource and renderer cache remains
+    // untouched for rejected candidates.
     if (output_triggered || defer_materialization) return pending;
     std::string error;
     if (!materialize_pending_gpu_capture(*pending, draws, computes, operations,
