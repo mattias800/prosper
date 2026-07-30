@@ -340,6 +340,10 @@ target calls are retained without logging the boot/menu workloads. For example, 
 Dead Cells post-parse workload while excluding its 54-56-draw loading loop.
 Selected lightweight records are formatted together and written to stderr in one batch at submit completion;
 this preserves one parseable line per target without paying a Windows console write for every target.
+Compute phase/image timing can likewise be restricted to one exact program address with
+`PROSPER_COMPUTE_TIMING_CODE=0x...`. This filter does not enable the heavier compute trace or its hashing,
+so use it for a representative long-running dispatch A/B rather than flooding every compute program's
+per-image records.
 
 Ordered graphics/compute submits retain a bounded journal of exact guest-memory ranges written by the
 compute backend. A persistent texture validated in an earlier graphics span can therefore skip its repeated
@@ -363,6 +367,12 @@ host result fallback with a GPU baseline invalidates that obsolete fallback befo
 readable, and replay-owned targets retain their original exact contract. Set
 `PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB` to retune the crossover. The broader
 `PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1` control restores immediate storage-result snapshots.
+
+A sampled image that successfully imports an authoritative renderer-owned Vulkan image does not validate,
+snapshot, convert, or cache its guest backing. This includes a persistent depth/stencil import, whose
+authority is intentionally separate from the color-RTT registry: the imported image is the descriptor the
+dispatch consumes, while the raw guest bytes may be stale. Set
+`PROSPER_NO_IMPORTED_IMAGE_GUEST_BYPASS=1` to restore the redundant guest preparation for an A/B.
 
 Windows protection-fault watches are deliberately unsupported: the Windows
 exception dispatcher writes below the interrupted stack pointer before a vectored handler runs, which can
