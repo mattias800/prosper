@@ -483,6 +483,22 @@ int main() {
                              compute_cfg_dispatch_scalar_shift.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "the dispatcher preserves 64-bit scalar address shifts through VCC");
+    std::vector<uint32_t> compute_cfg_dispatch_saved_mask_not = {
+        0xBE94037Eu, // s_mov_b32 s20, exec_lo (complete Wave32 mask)
+        0xBEEA0381u, // s_mov_b32 vcc_lo, 1 (older scalar-data lifetime)
+        0xBF070000u, // s_cmp_lg_u32 s0, s0 (false)
+        0xBF850003u, // s_cbranch_scc1 +3 -> mask merge
+        0x856B807Eu, // s_cselect_b32 vcc_hi, exec_lo, 0
+        0xBEEA0714u, // s_not_b32 vcc_lo, s20
+        0x8D6A6B6Au, // s_nor_b32 vcc_lo, vcc_lo, vcc_hi
+    };
+    compute_cfg_dispatch_saved_mask_not.insert(
+        compute_cfg_dispatch_saved_mask_not.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_saved_mask_not.data(),
+                             compute_cfg_dispatch_saved_mask_not.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the dispatcher inverts a saved Wave32 SGPR mask before recombining VCC");
     wave32_dispatch_config.native_subgroup_size = 0;
     // The dispatcher includes branch-target/fallthrough blocks even when no entry path can reach
     // them. This dead block overwrites half of direct V# s[8:11] and then targets the live entry;

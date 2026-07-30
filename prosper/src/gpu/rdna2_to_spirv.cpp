@@ -4976,6 +4976,52 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_srt.erase(in.dst.value);
                 return true;
             }
+            if (b.allow_b32_masks &&
+                (b.is_fragment || (b.is_compute && b.wave_size == 32)) &&
+                in.opcode == 0x07) {   // s_not_b32 (mask-domain form)
+                // Wave32 shader compilers also invert a saved one-word mask in an ordinary SGPR
+                // before combining it back into VCC. Astro's world-map kernel does exactly this:
+                //   s_mov_b32 s20, exec_lo
+                //   ...
+                //   s_not_b32 vcc_lo, s20
+                //   s_nor_b32 vcc_lo, vcc_lo, vcc_hi
+                // The old special case below only recognized `s_not_b32 vcc_lo,vcc_lo`; routing the
+                // saved-SGPR form through scalar DATA either rejected (there are no uint bits for a
+                // per-lane mask) or left a stale VCC lifetime at a dispatcher boundary. Accept only
+                // an unambiguous complete Wave32 mask source with no competing scalar-data value.
+                auto data_value_present = [&](int reg) {
+                    return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
+                };
+                uint32_t source_mask = 0;
+                if (in.src[0].value == 126) {
+                    source_mask = rs.exec;
+                } else if ((in.src[0].kind == OperandKind::SGPR ||
+                            in.src[0].kind == OperandKind::Special) &&
+                           rs.sreg_bool_b32.contains(in.src[0].value) &&
+                           !data_value_present(in.src[0].value)) {
+                    auto found = rs.sreg_bool.find(in.src[0].value);
+                    if (found != rs.sreg_bool.end()) source_mask = found->second;
+                    else if (in.src[0].value == 106) source_mask = rs.vcc;
+                }
+                if (source_mask && in.dst.value != 127) {
+                    const uint32_t result = b.logical_not(source_mask);
+                    if (in.dst.value == 126) {
+                        rs.exec = result;
+                        rs.exec_narrowed = true;
+                    } else {
+                        rs.sreg_bool[in.dst.value] = result;
+                        // Complementing an arbitrary mask may activate any previously-clear lane;
+                        // it is not a proof that the result is the full wave.
+                        rs.sreg_bool_narrowed[in.dst.value] = true;
+                        rs.sreg_bool_b32.insert(in.dst.value);
+                        if (in.dst.value == 106) rs.vcc = result;
+                    }
+                    rs.sreg.erase(in.dst.value);
+                    rs.sreg_srt.erase(in.dst.value);
+                    rs.scc = 0; // SCC=(complete written dword != 0) needs a guest-wave reduction.
+                    return true;
+                }
+            }
             if (in.opcode == 0x10) {   // s_bcnt1_i32_b64: popcount the complete scalar pair
                 // A VOPC may write an arbitrary SGPR pair as a wave mask.  In the portable vertex
                 // shell that pair contains the one represented guest lane, so its exact population
