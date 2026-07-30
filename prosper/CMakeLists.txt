@@ -360,6 +360,12 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_game_library PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_game_library COMMAND test_prosper_app_game_library)
 
+  # Library grid selection movement (#1471): arithmetic only, so the navigation rules are covered in
+  # normal CI rather than by someone pressing arrow keys. No ImGui, no SDL, no window.
+  add_executable(test_prosper_app_library_nav frontends/prosper-app/test_library_nav.cpp)
+  target_include_directories(test_prosper_app_library_nav PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_library_nav COMMAND test_prosper_app_library_nav)
+
   # Fault-safe guest-pointer read in the PROSPER_AMPRLOG diagnostic (#1154): an unmapped, aligned,
   # > 0xffff pointer (GTA V's 0x302200) must report unreadable, not SIGSEGV. POSIX-only
   # (process_vm_readv / mmap); ampr_arglog lives in the __linux__||__APPLE__ half of hle_kernel_mem.
@@ -1244,9 +1250,29 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     find_package(Vulkan QUIET)
   endif()
   if(Vulkan_FOUND)
-    add_executable(prosper-app frontends/prosper-app/main.cpp)
-    target_include_directories(prosper-app PRIVATE src)
-    target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan)
+    # Dear ImGui for the game library view (#1471), vendored under third_party/imgui. FRONTEND ONLY:
+    # prosper_core neither links nor sees it, so the one-way dependency arrow in docs/FRONTEND_APP.md
+    # is unchanged. Built as its own static lib so the vendored sources compile with their own
+    # warning expectations rather than prosper's.
+    add_library(prosper_imgui STATIC
+                third_party/imgui/src/imgui.cpp
+                third_party/imgui/src/imgui_draw.cpp
+                third_party/imgui/src/imgui_tables.cpp
+                third_party/imgui/src/imgui_widgets.cpp
+                third_party/imgui/backends/imgui_impl_sdl3.cpp
+                third_party/imgui/backends/imgui_impl_vulkan.cpp)
+    target_include_directories(prosper_imgui PUBLIC third_party/imgui/src third_party/imgui/backends)
+    target_link_libraries(prosper_imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan)
+    # Vendored third-party code is not held to prosper's warning settings; keep its noise out of our
+    # build output so a real warning in prosper's own code stays visible.
+    if(NOT MSVC)
+      target_compile_options(prosper_imgui PRIVATE -w)
+    endif()
+
+    add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp)
+    target_include_directories(prosper-app PRIVATE src third_party/stb)
+    target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan prosper_imgui)
+    target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_LIBRARY_UI=1)
     # Share the live renderer with boot_trace so the window shows composited game frames (not blank).
     if(TARGET prosper_live_renderer)
       target_link_libraries(prosper-app PRIVATE prosper_live_renderer)

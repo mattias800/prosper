@@ -141,8 +141,29 @@ boots: that gate accepts `sce_sys/param.json` on its own, so a metadata-only fol
 is listed and will fail when opened. Keeping one definition of "is this a title" across all three entry
 points is worth more than pre-filtering the list.
 
-The library **view** — a grid with cover art, and a settings screen — is stage 2 of #1471 and not in
-this build; the data and the command-line surface are.
+### The library view
+
+With a games directory set, launching with no game shows a grid of cover art instead of an empty
+window. Arrow keys move the selection, Enter/Space opens the highlighted title, clicking a cover opens it
+directly, and **Change folder...** picks a different games directory and remembers it. Esc quits. With no
+directory set yet, the window explains that and offers the same folder picker on Enter or a click.
+
+Keyboard and mouse only for now — **controller navigation is not implemented** (tracked separately).
+Nothing initializes SDL's gamepad subsystem while the library is up: the pad backend does that inside
+the guest boot, by which point the library is gone.
+
+Cover art is each dump's `sce_sys/icon0.png`. A title whose icon is missing or undecodable still appears
+as a launchable button labelled with its content id — what matters is that it is bootable, not that it
+has a picture.
+
+The view is drawn with Dear ImGui on the app's existing Vulkan device and swapchain
+(`third_party/imgui`), and disappears the moment a guest boots: prosper runs one game per launch, so the
+library never draws over a running title. If it cannot be brought up — no ImGui in this build, or a
+device that refuses the render pass — the window falls back to the flat idle colour and every
+command-line path keeps working.
+
+Selection movement lives in `library_nav.hpp`, which is pure and unit-tested, so the grid's behaviour is
+covered in ordinary CI rather than only by someone pressing arrow keys.
 
 ## Options
 
