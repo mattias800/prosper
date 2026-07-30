@@ -272,9 +272,15 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   reaches 1.5 GB, so a few sessions of ordinary capture work exhaust the quota. When that happens it does
   not just fail your write — it **eats the machine's RAM and kills the Bash tool outright for every
   agent**, because the harness stores each command's output under `$TMPDIR`. Put captures, frame dumps,
-  screenshots and logs in a gitignored worktree-local directory or under `/var/tmp` (real disk, and
-  `systemd-tmpfiles` already ages it), and always build with `TMPDIR` off the tmpfs — gcc's compile
-  temporaries are large enough on their own to break a `-j8` build with
+  screenshots and logs under **`$HOME`** — a gitignored worktree-local directory, or a scratch directory
+  such as `~/dq-work/`. **Do not send a run's artifacts to `/var/tmp`: distrobox shares `$HOME` but NOT
+  `/var/tmp`**, so anything the emulator writes there lands in the *container's* private `/var/tmp` and is
+  invisible from the host (the host path shows up inside the container as `/run/host/var/tmp`). The shell
+  redirect that captures a run log happens on the host, so a `/var/tmp` run directory silently ends up
+  holding only the log while every screenshot and capsule goes somewhere you cannot see. `/var/tmp` is
+  still fine for host-side scratch (it is real disk and `systemd-tmpfiles` ages it) — just not for output
+  produced inside the container. Always build with `TMPDIR` off the tmpfs too; gcc's compile temporaries
+  are large enough on their own to break a `-j8` build with
   `error writing to /tmp/ccXXXX.s: Disk quota exceeded`:
   ```bash
   mkdir -p <worktree>/build/tmpdir
