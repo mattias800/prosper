@@ -1078,7 +1078,8 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     }
     notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
     ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, packet_addr);
-    if (writer_provenance_enabled() && c.dd_bytes >= 256)
+    if (writer_provenance_enabled() &&
+        (c.dd_bytes >= 256 || writer_provenance_full_enabled()))
         record_guest_write(GuestWriterKind::DmaData, c.dd_dst, c.dd_bytes,
                            0, 0, c.stream_order, packet_addr);
     wake_on_label(c.dd_dst);
@@ -1128,7 +1129,8 @@ static void honor_write_data(const Pm4Command& c) {
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   WriteData [0x%llx] %u dwords (first=0x%08x)\n",
                 (unsigned long long)c.wd_addr, c.wd_num, c.wd_data[0]);
-    if (writer_provenance_enabled() && c.wd_num >= 64)
+    if (writer_provenance_enabled() &&
+        (c.wd_num >= 64 || writer_provenance_full_enabled()))
         record_guest_write(GuestWriterKind::WriteData, c.wd_addr,
                            static_cast<uint64_t>(c.wd_num) * 4, 0, 0,
                            c.stream_order, pkt_addr(c));

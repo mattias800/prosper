@@ -149,6 +149,7 @@ struct ShaderResourceCompileKey {
     uint32_t fetch_index_mode = 0;
     uint32_t flat_base_sgpr = 0;
     uint32_t bvh_box_grow = 0;
+    bool null_bvh = false;
     bool srgb = false;
     bool depth_compare = false;
     uint32_t depth_compare_func = 0;
@@ -327,6 +328,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.fetch_index_mode);
             hash = hash_mix(hash, resource.flat_base_sgpr);
             hash = hash_mix(hash, resource.bvh_box_grow);
+            hash = hash_mix(hash, resource.null_bvh);
             hash = hash_mix(hash, resource.srgb);
             hash = hash_mix(hash, resource.depth_compare);
             hash = hash_mix(hash, resource.depth_compare_func);
@@ -987,6 +989,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
             compiled.flat_base_sgpr = resource.flat_base_sgpr;
             compiled.bvh_box_grow = resource.bvh_box_grow;
+            compiled.null_bvh = is_proven_null_bvh(resource);
             compiled.srgb = storage_image && resource.srgb;
             compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
             compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
@@ -1608,6 +1611,61 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
     return dwords;
 }
 
+// A null BVH marker is only safe when the static ray instruction is inside a real EXEC region. Prove
+// the narrow compiler shape `EXEC writer; s_cbranch_execz MERGE; ... ray ...; MERGE`, and reject any
+// external branch edge into the region. This is intentionally stronger than merely observing an
+// earlier forward branch: the prior no-hit experiment did not establish dominance and could hide an
+// unguarded missing descriptor.
+bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc) {
+    auto changes_exec = [](const Rdna2Inst& in) {
+        if (in.fmt == Rdna2Format::VOPC)
+            return (in.opcode >= 0x10 && in.opcode <= 0x1f) ||
+                   (in.opcode >= 0x90 && in.opcode <= 0x9f) ||
+                   (in.opcode >= 0xd0 && in.opcode <= 0xdf);
+        return in.fmt == Rdna2Format::SOP1 &&
+               ((in.opcode >= 0x24 && in.opcode <= 0x2b) ||
+                in.opcode == 0x37 || in.opcode == 0x38 ||
+                in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44);
+    };
+    auto is_branch = [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::SOPP &&
+               (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
+    };
+    auto target = [](const Rdna2Inst& in) -> int64_t {
+        return static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
+    };
+
+    for (size_t i = 1; i < instructions.size(); ++i) {
+        const Rdna2Inst& guard = instructions[i];
+        if (guard.fmt != Rdna2Format::SOPP || guard.opcode != 0x08 ||
+            guard.simm16 <= 0 || guard.pc >= use_pc)
+            continue;
+        const int64_t merge64 = target(guard);
+        if (merge64 <= static_cast<int64_t>(use_pc) || merge64 > UINT32_MAX)
+            continue;
+        const uint32_t merge = static_cast<uint32_t>(merge64);
+        const Rdna2Inst& exec_writer = instructions[i - 1];
+        if (exec_writer.pc + exec_writer.len_dwords != guard.pc ||
+            !changes_exec(exec_writer))
+            continue;
+        if (std::none_of(instructions.begin(), instructions.end(),
+                         [&](const Rdna2Inst& in) { return in.pc == merge; }))
+            continue;
+
+        bool external_entry = false;
+        for (const Rdna2Inst& branch : instructions) {
+            if (!is_branch(branch) || &branch == &guard) continue;
+            const int64_t branch_target = target(branch);
+            const bool target_inside = branch_target > static_cast<int64_t>(guard.pc) &&
+                                       branch_target < static_cast<int64_t>(merge);
+            const bool source_inside = branch.pc > guard.pc && branch.pc < merge;
+            if (target_inside && !source_inside) { external_entry = true; break; }
+        }
+        if (!external_entry) return true;
+    }
+    return false;
+}
+
 // --- Bindless-dynamic vertex-fetch resolution (const-fold the scalar setup) ---------------------------
 // This game's NGG vertex shader loads its vertex-buffer V# from a descriptor table at a RUNTIME-computed
 // offset (e.g. `s_load_dwordx4 s[8:11], s[24:25], vcc_hi` where `vcc_hi = (s64<<4)&0x1f0` and
@@ -1705,6 +1763,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::bitset<kFoldSgprs> descr8_known;
     std::array<uint32_t, kFoldSgprs> descr8_key{};
     std::bitset<kFoldSgprs> descr8_key_known;
+    // Exact null-pointer dataflow for guarded BVHs. Each mapped zero qword load receives a unique
+    // origin; failed dereferences and scalar address/descriptor ALU retain that origin. A null BVH is
+    // published only when all four live descriptor words carry the SAME origin, so an unrelated
+    // unknown/zero SGPR cannot turn an unresolved ray instruction into a synthetic result.
+    std::array<uint32_t, kFoldSgprs> null_chain_origin{};
+    std::bitset<kFoldSgprs> null_chain_known;
+    uint32_t next_null_chain_origin = 0;
     // SGPRs overwritten by an s_load since seeding — the seed-V# MUBUF fallback below must not use a
     // stale user-data snapshot once the register was RELOADED from memory (ALU patches deliberately
     // don't count: descriptor snapshots are load-time semantics, pre-patch, like `descr`).
@@ -1729,6 +1794,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_known.set((size_t)r);
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
+            null_chain_known.reset((size_t)r);
             mask_state[(size_t)r] = FoldMask::Unknown;
         }
     };
@@ -1737,6 +1803,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_known.reset((size_t)r);
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
+            null_chain_known.reset((size_t)r);
             mask_state[(size_t)r] = FoldMask::Unknown;
         }
     };
@@ -1776,6 +1843,21 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         if (!valid_reg(r) || !val_known.test((size_t)r)) return false;
         v = val[(size_t)r];
         return true;
+    };
+    auto null_origin = [&](int r) -> uint32_t {
+        return valid_reg(r) && null_chain_known.test((size_t)r)
+            ? null_chain_origin[(size_t)r] : 0u;
+    };
+    auto mark_null_origin = [&](int r, uint32_t origin) {
+        if (!origin || !valid_reg(r)) return;
+        null_chain_origin[(size_t)r] = origin;
+        null_chain_known.set((size_t)r);
+    };
+    auto operand_null_origin = [&](const Operand& operand) -> uint32_t {
+        if ((operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
+            valid_reg(operand.value))
+            return null_origin(operand.value);
+        return 0u;
     };
     auto unchanged_seed_range = [&](int first, int count) {
         if (!untouched_seed_range(first, count)) return false;
@@ -1857,6 +1939,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             case Rdna2Format::SOP1:
                 if (in.opcode == 0x03) {                        // s_mov_b32
                     uint32_t v, source_key = 0;
+                    const uint32_t source_null_origin = operand_null_origin(in.src[0]);
                     const bool source_key_known =
                         in.src[0].kind == OperandKind::SGPR && valid_reg(in.src[0].value) &&
                         val_srt_key_known.test((size_t)in.src[0].value) &&
@@ -1877,6 +1960,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             val_seed_origin_known.set((size_t)in.dst.value);
                         }
                     } else forget(in.dst.value);
+                    mark_null_origin(in.dst.value, source_null_origin);
                 } else if (in.opcode == 0x34) {                 // s_abs_i32
                     // This is a 32-bit destination. Treating every unmodeled SOP1 as a possible
                     // 64-bit pair write erased the untouched adjacent SGPR; Astro Bot keeps the
@@ -1891,6 +1975,25 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         set_value(in.dst.value, static_cast<int32_t>(v) < 0 ? 0u - v : v);
                     else
                         forget(in.dst.value);
+                } else if ((in.opcode == 0x1c || in.opcode == 0x1d) &&
+                           in.dst.kind == OperandKind::SGPR) {  // s_bitset{0,1}_b32
+                    // These are in-place read/modify/write operations: SDST is both the old value
+                    // and destination, while SRC0 is only the bit index. Astro sets the descriptor's
+                    // SORT bit after extracting a zero BVH base, so preserve the exact null-root
+                    // provenance while applying that constant field patch.
+                    uint32_t old_value = 0, bit_index = 0;
+                    const uint32_t old_null_origin = null_origin(in.dst.value);
+                    const bool old_known = known(in.dst.value, old_value);
+                    const bool bit_known = in.src[0].kind == OperandKind::Literal
+                        ? (bit_index = in.literal, true) : srcval(in.src[0], bit_index);
+                    if (old_known && bit_known) {
+                        const uint32_t bit = 1u << (bit_index & 31u);
+                        set_value(in.dst.value, in.opcode == 0x1c
+                            ? old_value & ~bit : old_value | bit);
+                    } else {
+                        forget(in.dst.value);
+                    }
+                    mark_null_origin(in.dst.value, old_null_origin);
                 } else if (in.opcode == 0x04 &&                 // s_mov_b64
                            in.dst.kind == OperandKind::SGPR &&
                            in.src[0].kind == OperandKind::SGPR) {
@@ -1900,6 +2003,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     std::array<uint32_t, 2> source_values{};
                     std::array<uint32_t, 2> source_keys{};
                     std::array<uint32_t, 2> source_origins{};
+                    std::array<uint32_t, 2> source_null_origins{};
                     std::array<bool, 2> source_key_known{};
                     std::array<bool, 2> source_origin_known{};
                     bool source_known = true;
@@ -1914,6 +2018,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             val_seed_origin_known.test((size_t)src);
                         if (source_origin_known[(size_t)k])
                             source_origins[(size_t)k] = val_seed_origin[(size_t)src];
+                        source_null_origins[(size_t)k] = null_origin(src);
                     }
                     for (int k = 0; k < 2; ++k) {
                         const int dst = in.dst.value + k;
@@ -1930,6 +2035,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             val_seed_origin[(size_t)dst] = source_origins[(size_t)k];
                             val_seed_origin_known.set((size_t)dst);
                         }
+                        mark_null_origin(dst, source_null_origins[(size_t)k]);
                     }
                 } else if (in.dst.kind == OperandKind::SGPR) {
                     // Not a modeled scalar move -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
@@ -1969,6 +2075,22 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 int d = in.dst.value; bool ok = ka && kc; uint32_t r = 0;
                 uint32_t hi64 = 0; bool wrote_pair = false;
                 int next_scc = scc;
+                const uint32_t null0 = operand_null_origin(in.src[0]);
+                const uint32_t null1 = operand_null_origin(in.src[1]);
+                // s_addc_u32 remains derived from the same pointer chain even when its concrete
+                // carry is unknown; the taint is provenance, not a claim about the folded value.
+                const bool null_chain_opcode =
+                    in.opcode <= 0x04 || in.opcode == 0x0E || in.opcode == 0x10 ||
+                    in.opcode == 0x12 || in.opcode == 0x1E || in.opcode == 0x20 ||
+                    in.opcode == 0x26 || (in.opcode >= 0x2E && in.opcode <= 0x31) ||
+                    in.opcode == 0x27 || in.opcode == 0x1F || in.opcode == 0x21 ||
+                    in.opcode == 0x29;
+                uint32_t propagated_null_origin = 0;
+                if (null_chain_opcode) {
+                    if (null0 && null1 && null0 == null1) propagated_null_origin = null0;
+                    else if (null0 && !null1 && kc) propagated_null_origin = null0;
+                    else if (null1 && !null0 && ka) propagated_null_origin = null1;
+                }
                 if (ok) switch (in.opcode) {
                     case 0x00: {                                           // s_add_u32
                         const uint64_t sum = static_cast<uint64_t>(a) + c;
@@ -2069,6 +2191,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // opcode switch may not have reached the point that marks wrote_pair).
                 else    { forget(d); if (wrote_pair || in.opcode == 0x1F || in.opcode == 0x21 ||
                                          in.opcode == 0x29) forget(d + 1); }
+                mark_null_origin(d, propagated_null_origin);
+                if (wrote_pair || in.opcode == 0x1F || in.opcode == 0x21 || in.opcode == 0x29)
+                    mark_null_origin(d + 1, propagated_null_origin);
                 break;
             }
             case Rdna2Format::SOPC: {   // scalar compare -> SCC (feeds the format patch's s_cselect)
@@ -2100,6 +2225,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 switch (in.opcode & 7) { case 0: n = 1; break; case 1: n = 2; break; case 2: n = 4; break;
                                          case 3: n = 8; break; case 4: n = 16; break; default: n = 0; }
                 int sbase = in.src[0].value, sdst = in.dst.value;
+                const uint32_t null_base_lo = null_origin(sbase);
+                const uint32_t null_base_hi = null_origin(sbase + 1);
+                const uint32_t null_base_origin =
+                    null_base_lo && null_base_lo == null_base_hi ? null_base_lo : 0u;
                 uint32_t soff_field = (in.words[1] >> 25) & 0x7Fu;         // SOFFSET SGPR (125 = null)
                 uint32_t soff_val = 0; bool soff_ok = true;
                 if (soff_field < 106) soff_ok = known((int)soff_field, soff_val);          // SGPR
@@ -2173,7 +2302,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // or gets folded to zero.
                     if (have_pending_srt_use && n != 0 && base_ok && !soff_ok)
                         srt_uses->push_back(pending_srt_use);
-                    for (uint32_t k = 0; k < n; k++) forget(sdst + (int)k);
+                    for (uint32_t k = 0; k < n; k++) {
+                        forget(sdst + (int)k);
+                        mark_null_origin(sdst + (int)k, null_base_origin);
+                    }
                     break;
                 }
                 // in.literal is the SIGN-EXTENDED 21-bit immediate (#149) — add it as signed so a
@@ -2210,10 +2342,41 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 if (is_buffer) addr_readable = readable(addr, n * 4);
                 if (!addr_readable) { if (trc) fprintf(stderr, "[dyntrace]   addr 0x%llx unreadable\n", (unsigned long long)addr);
-                                      for (uint32_t k = 0; k < n; k++) forget(sdst + (int)k); break; }
+                                      for (uint32_t k = 0; k < n; k++) {
+                                          forget(sdst + (int)k);
+                                          mark_null_origin(sdst + (int)k, null_base_origin);
+                                      }
+                                      break; }
+                if (trc && writer_provenance_enabled()) {
+                    const auto writer = last_guest_write_overlap(addr, n * 4);
+                    if (writer) {
+                        fprintf(stderr,
+                                "[dyntrace]   latest GPU writer kind=%s seq=%llu "
+                                "range=[0x%llx,+0x%llx) submit=%llu item=%llu order=%llu "
+                                "identity=0x%llx\n",
+                                guest_writer_kind_name(writer->kind),
+                                (unsigned long long)writer->sequence,
+                                (unsigned long long)writer->addr,
+                                (unsigned long long)writer->size,
+                                (unsigned long long)writer->submit,
+                                (unsigned long long)writer->item,
+                                (unsigned long long)writer->order,
+                                (unsigned long long)writer->identity);
+                    } else {
+                        fprintf(stderr,
+                                "[dyntrace]   no recorded GPU writer overlaps [0x%llx,+0x%x)\n",
+                                (unsigned long long)addr, n * 4);
+                    }
+                }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
                 for (uint32_t k = 0; k < n; k++) set_value(sdst + (int)k, mem[k]);
+                if (!is_buffer && n == 2 && mem[0] == 0 && mem[1] == 0) {
+                    uint32_t origin = ++next_null_chain_origin;
+                    if (!origin) origin = ++next_null_chain_origin;
+                    mark_null_origin(sdst, origin);
+                    mark_null_origin(sdst + 1, origin);
+                }
                 if ((n == 4 || n == 8) && valid_reg(sdst) && valid_reg(sdst + (int)n - 1)) {
                     const uint32_t key = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu;
                     for (uint32_t k = 0; k < n; ++k) {
@@ -2299,6 +2462,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             ? decode_bvh_descriptor(live_bvh.data()) : DecodedBvhDescriptor{};
                         const bool plausible = live_known && (snapshot_provenance || seed_provenance) &&
                             d.type == 8u && d.base > 0x10000u && d.size_bytes != 0;
+                        uint32_t proven_null_origin = valid_reg(bbase) ? null_origin(bbase) : 0u;
+                        for (int k = 1; proven_null_origin && k < 4; ++k)
+                            if (null_origin(bbase + k) != proven_null_origin)
+                                proven_null_origin = 0;
+                        const bool guarded_null = !plausible && proven_null_origin &&
+                            guarded_bvh_use(ins, in.pc);
                         if (trc) {
                             fprintf(stderr,
                                     "[dyntrace] BVH pc=%u srsrc=s%d snapshot=%d seed=%d bvh=",
@@ -2309,6 +2478,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                         (unsigned long long)d.base,
                                         (unsigned long long)d.size_bytes, d.type,
                                         d.triangle_return_mode, d.box_grow);
+                            } else if (guarded_null) {
+                                fprintf(stderr, "<guarded-null origin=%u>", proven_null_origin);
                             } else {
                                 fprintf(stderr, "<unknown>");
                             }
@@ -2319,6 +2490,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             u.kind = 2;
                             u.key = 0xFFFFFFFFu;
                             u.bvh4 = live_bvh;
+                            u.use_pc = in.pc;
+                            srt_uses->push_back(u);
+                        } else if (guarded_null) {
+                            SrtUse u;
+                            u.kind = 3;
+                            u.key = 0xFFFFFFFFu;
                             u.use_pc = in.pc;
                             srt_uses->push_back(u);
                         }
@@ -2844,6 +3021,21 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
 
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
+        if (u.kind == 3) {
+            const uint64_t dk = 0x8000000300000000ull | u.use_pc;
+            if (!seen.insert(dk).second) continue;
+            alignas(256) static std::array<uint8_t, 256> null_bvh{};
+            ShaderResource r;
+            r.cls = ResourceClass::ConstantBuffer;
+            r.format = DataFormat::Uint32;
+            r.num_components = 1;
+            r.size = static_cast<uint32_t>(null_bvh.size());
+            r.fetch_pc = u.use_pc;
+            r.host_data = null_bvh.data();
+            r.host_data_size = null_bvh.size();
+            table.resources.push_back(r);
+            continue;
+        }
         if (u.kind == 2) {
             const DecodedBvhDescriptor d = decode_bvh_descriptor(u.bvh4.data());
             if (d.type != 8u || d.base <= 0x10000u || d.size_bytes == 0 ||

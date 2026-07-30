@@ -313,6 +313,18 @@ struct ShaderResource {
     uint64_t       host_data_size   = 0;
 };
 
+// A null BVH is represented by a bounded host-owned marker. The front-half creates this only after
+// proving that a mapped zero pointer feeds the complete descriptor inside an EXEC-guarded region.
+// The exact shape survives capture/replay without adding a capture-format field and cannot alias a
+// title allocation because gpu_addr is zero.
+inline bool is_proven_null_bvh(const ShaderResource& resource) {
+    return resource.cls == ResourceClass::ConstantBuffer &&
+           resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
+           resource.gpu_addr == 0 && resource.size == 256u && resource.stride == 0u &&
+           resource.fetch_pc != 0xFFFFFFFFu && resource.host_data != nullptr &&
+           resource.host_data_size >= resource.size;
+}
+
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the
 // recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
 struct ShaderResourceTable {

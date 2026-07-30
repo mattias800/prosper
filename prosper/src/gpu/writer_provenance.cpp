@@ -35,16 +35,18 @@ uint64_t span_end(uint64_t addr, uint64_t size) {
 } // namespace
 
 bool writer_provenance_enabled() {
-    const char* explicit_mode = std::getenv("PROSPER_WRITER_PROVENANCE");
+    const bool explicitly_on = writer_provenance_full_enabled();
     const char* dimension_mode = std::getenv("PROSPER_PROVENANCE_DIM");
     const char* resource_hash_mode = std::getenv("PROSPER_RESOURCE_HASH_DIM");
     const char* timeline_depth_hash_mode = std::getenv("PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM");
-    const bool explicitly_on = explicit_mode && *explicit_mode &&
-                               std::strcmp(explicit_mode, "0") &&
-                               std::strcmp(explicit_mode, "off");
     return explicitly_on || (dimension_mode && *dimension_mode) ||
            (resource_hash_mode && *resource_hash_mode) ||
            (timeline_depth_hash_mode && *timeline_depth_hash_mode);
+}
+
+bool writer_provenance_full_enabled() {
+    const char* value = std::getenv("PROSPER_WRITER_PROVENANCE");
+    return value && *value && std::strcmp(value, "0") && std::strcmp(value, "off");
 }
 
 const char* guest_writer_kind_name(GuestWriterKind kind) {

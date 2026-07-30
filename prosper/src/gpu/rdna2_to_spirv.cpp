@@ -8592,6 +8592,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
 
+                // The front-half only creates this marker when one mapped zero qword load taints all
+                // four descriptor words and the ray instruction is dominated by an EXEC-narrowing
+                // guard with no external region entry. This is an explicit empty acceleration
+                // structure for this dispatch, not a fallback for an unresolved descriptor.
+                if (is_proven_null_bvh(*bvh)) {
+                    for (uint32_t k = 0; k < 4; ++k) {
+                        const int vd = in.dst.value + static_cast<int>(k);
+                        const uint32_t old = vreg_old(b, rs, vd);
+                        rs.vreg[vd] = b.uconst(0xffffffffu);
+                        predicate_write(b, rs, vd, old);
+                    }
+                    return true;
+                }
+
                 auto addr_vgpr = [&](uint32_t k) -> int {
                     if (k == 0u) return in.src[0].value;
                     const uint32_t j = k - 1u;
