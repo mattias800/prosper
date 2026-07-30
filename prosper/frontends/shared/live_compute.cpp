@@ -141,16 +141,26 @@ uint8_t sampled_float16_to_unorm8(uint16_t half_bits) {
 }
 
 bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t components,
-                                   prosper::gpu::LiveTargetPixelFormat target_format) {
+                                   prosper::gpu::LiveTargetPixelFormat target_format,
+                                   bool normalized_sampling) {
     using prosper::gpu::DataFormat;
     using prosper::gpu::LiveTargetPixelFormat;
-    return (components == 4 &&
-            ((format == DataFormat::Unorm8 &&
-              target_format == LiveTargetPixelFormat::Rgba8Unorm) ||
-             (format == DataFormat::Float16 &&
-              target_format == LiveTargetPixelFormat::Rgba16Float))) ||
-           (components == 3 && format == DataFormat::Float10_11_11 &&
-            target_format == LiveTargetPixelFormat::R11G11B10Float);
+    const bool exact =
+        (components == 4 &&
+         ((format == DataFormat::Unorm8 &&
+           target_format == LiveTargetPixelFormat::Rgba8Unorm) ||
+          (format == DataFormat::Float16 &&
+           target_format == LiveTargetPixelFormat::Rgba16Float))) ||
+        (components == 3 && format == DataFormat::Float10_11_11 &&
+         target_format == LiveTargetPixelFormat::R11G11B10Float);
+    // The renderer's RGBA8 fallback already stores the numeric UNORM value. Expanding each byte to
+    // uint16 as byte*257 and sampling R16_UNORM produces exactly byte/255 again, so a shader that
+    // uses only normalized sample/gather operations may bind the RGBA8 image directly. Other image
+    // data-access contracts are deliberately left on the converted exact-format path.
+    const bool normalized_unorm = normalized_sampling && components == 4 &&
+        format == DataFormat::Unorm16 &&
+        target_format == LiveTargetPixelFormat::Rgba8Unorm;
+    return exact || normalized_unorm;
 }
 
 namespace {
@@ -1884,6 +1894,7 @@ struct BoundImage {
     bool storage = false;               // storage image: read back + pack to guest after the dispatch
     bool native_float_storage = false;  // Vulkan performs exact UNORM/float conversion at native width
     bool packed_r11_storage = false;    // shader packs exact R11G11B10 words into typed R32_UINT
+    bool normalized_unorm_rtt = false;  // normalized R16 view reuses authoritative RGBA8 values
     bool graphics_sampled_usage = false;// native image was created with SAMPLED usage for export
     bool exact_storage_bytes() const { return native_float_storage || packed_r11_storage; }
     uint32_t texel_depth = 1;           // logical Z/layer count represented in the staging buffer
@@ -2853,6 +2864,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const long v = e ? std::strtol(e, nullptr, 10) : 1;
                 return v > 0 ? static_cast<uint32_t>(v) : 1u;
             }();
+            static const bool normalized_unorm_bind_enabled =
+                std::getenv("PROSPER_NO_NORMALIZED_UNORM_RTT_BIND") == nullptr;
             if (renderer_owned && (dim_3d || dim_2d_array || r->depth != 1)) {
                 // The renderer cache represents one concrete 2D color image. An address match from
                 // a 3D/layered descriptor is therefore a resource-lifetime alias, not that cached
@@ -2885,12 +2898,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 !dim_1d && !dim_3d && !dim_2d_array &&
                 r->depth == 1 && !r->depth_compare) {
                 LiveTargetImageImport import;
-                const bool normalized_sampling =
+                const bool scalable_normalized_sampling =
                     image_descriptors[i].normalized_sampling &&
                     !image_descriptors[i].texel_access;
+                const bool format_normalized_sampling =
+                    image_descriptors[i].normalized_sampling &&
+                    !image_descriptors[i].unnormalized_texel_access;
                 const LiveTargetImageRequest import_request{
                     r->width, r->height, render_scale, depth_import_eligible,
-                    normalized_sampling};
+                    scalable_normalized_sampling};
                 const bool import_available = import_live_render_target_image(
                     r->gpu_addr, import_request, import);
                 if (trace)
@@ -2915,13 +2931,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT)
                         : direct_sampled_rtt_compatible(
                               r->format, r->num_components ? r->num_components : 1,
-                              import.format);
+                              import.format,
+                              format_normalized_sampling && normalized_unorm_bind_enabled);
                     const bool compatible_device =
                         import.device == static_cast<void*>(ctx.device);
                     const bool direct_extent =
                         prosper::frontend::rtt_direct_import_compatible(
                             bi.storage, r->width, r->height, import.width, import.height,
-                            render_scale, normalized_sampling);
+                            render_scale, scalable_normalized_sampling);
                     if (compatible_format && direct_extent && compatible_device) {
                         bi.imported = true;
                         bi.imported_depth = depth_import;
@@ -3175,6 +3192,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          (unsigned)r->format, nc);
                     }
                 }
+                bi.normalized_unorm_rtt = renderer_owned && !bi.storage &&
+                    r->format == DataFormat::Unorm16 &&
+                    direct_sampled_rtt_compatible(
+                        r->format, r->num_components ? r->num_components : 1u,
+                        live_target.format,
+                        normalized_unorm_bind_enabled &&
+                            image_descriptors[i].normalized_sampling &&
+                            !image_descriptors[i].unnormalized_texel_access);
             }
             // Exact descriptor aliases share one Vulkan image. Storage aliases must observe the same
             // read/modify/write state and produce one guest writeback; sampled aliases avoid repeatedly
@@ -3182,6 +3207,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             for (size_t j = 0; j < i; j++) {
                 const BoundImage& prior = images[j];
                 const ShaderResource* p = prior.resource;
+                // Identical guest descriptors can appear at multiple bindings with different
+                // reflected access contracts. Do not fold an exact R16 upload into the normalized
+                // RGBA8 representation (or vice versa), and only share borrowed renderer images
+                // when both bindings acquired the same concrete image/view format.
+                const bool same_backing_representation =
+                    prior.imported == bi.imported &&
+                    prior.normalized_unorm_rtt == bi.normalized_unorm_rtt &&
+                    (!bi.imported ||
+                     (prior.image == bi.image &&
+                      prior.imported_depth == bi.imported_depth &&
+                      prior.imported_format == bi.imported_format &&
+                      prior.imported_pixel_format == bi.imported_pixel_format));
                 const bool same_dcc_identity = p &&
                     p->max_uncompressed_block_size == r->max_uncompressed_block_size &&
                     p->max_compressed_block_size == r->max_compressed_block_size &&
@@ -3194,7 +3231,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     p->dcc_metadata_size == r->dcc_metadata_size &&
                     p->dcc_metadata_host_data == r->dcc_metadata_host_data &&
                     p->dcc_metadata_host_data_size == r->dcc_metadata_host_data_size;
-                const bool same_view = p && prior.storage == bi.storage &&
+                const bool same_view = p && same_backing_representation &&
+                    prior.storage == bi.storage &&
                     p->gpu_addr == r->gpu_addr && p->size == r->size &&
                     p->width == r->width && p->height == r->height && p->depth == r->depth &&
                     prior.texel_depth == bi.texel_depth && prior.array_layers == bi.array_layers &&
@@ -3296,7 +3334,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ? (r->format == DataFormat::Float10_11_11
                        ? 4u : data_format_bytes(r->format) * sampled_components)
                 : 0u;
-            const uint32_t texel_bytes = bi.exact_storage_bytes() ? native_storage_bytes
+            const uint32_t imported_color_bytes = bi.imported && !bi.imported_depth
+                ? (bi.imported_pixel_format == LiveTargetPixelFormat::Rgba16Float ? 8u : 4u)
+                : 0u;
+            const uint32_t texel_bytes = imported_color_bytes ? imported_color_bytes
+                                         : bi.normalized_unorm_rtt ? 4u
+                                         : bi.exact_storage_bytes() ? native_storage_bytes
                                          : bi.storage ? 16u
                                          : sampled_float32_native ? sampled_components * 4u
                                          : sampled_float32 ? 16u
@@ -3310,6 +3353,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool sampled_r11g11b10 = !bi.storage &&
                 r->format == DataFormat::Float10_11_11 && sampled_components == 3;
             const VkFormat image_format = bi.imported_depth ? bi.imported_format
+                : bi.imported
+                    ? (bi.imported_pixel_format == LiveTargetPixelFormat::Rgba16Float
+                           ? VK_FORMAT_R16G16B16A16_SFLOAT
+                       : bi.imported_pixel_format == LiveTargetPixelFormat::R11G11B10Float
+                           ? VK_FORMAT_B10G11R11_UFLOAT_PACK32
+                           : VK_FORMAT_R8G8B8A8_UNORM)
+                : bi.normalized_unorm_rtt ? VK_FORMAT_R8G8B8A8_UNORM
                 : bi.packed_r11_storage ? VK_FORMAT_R32_UINT
                 : bi.native_float_storage
                 ? (r->format == DataFormat::Unorm8
@@ -3804,7 +3854,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool r11g11b10 = sampled_r11g11b10;
                 if (renderer_owned) {
                     const std::vector<uint8_t>& pixels = *live_target.pixels;
-                    if (r11g11b10) {
+                    if (bi.normalized_unorm_rtt) {
+                        std::memcpy(upload, pixels.data(), upload_size);
+                    } else if (r11g11b10) {
                         if (!pack_live_target_r11g11b10(live_target, upload, upload_size)) {
                             skip_image(r, "renderer RTT R11G11B10 reconstruction failed");
                             break;
@@ -4219,11 +4271,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (image_timing)
                 std::fprintf(stderr,
                              "[compute-image] code=0x%llx binding=%u class=%s imported=%u "
-                             "extent=%ux%ux%u guest=%zu staging=%llu ms=%.3f\n",
+                             "extent=%ux%ux%u guest=%zu staging=%llu "
+                             "normalized=%u texel=%u unnormalized-data=%u rgba8-reuse=%u ms=%.3f\n",
                              (unsigned long long)item.code_addr, bi.binding,
                              bi.storage ? "storage" : "sampled", bi.imported ? 1u : 0u,
                              r->width, r->height, r->depth, bi.guest_bytes,
                              (unsigned long long)sbytes,
+                             image_descriptors[i].normalized_sampling ? 1u : 0u,
+                             image_descriptors[i].texel_access ? 1u : 0u,
+                             image_descriptors[i].unnormalized_texel_access ? 1u : 0u,
+                             bi.normalized_unorm_rtt ? 1u : 0u,
                              std::chrono::duration<double, std::milli>(
                                  ComputeClock::now() - image_start).count());
         }

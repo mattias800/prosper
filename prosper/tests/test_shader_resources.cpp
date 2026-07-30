@@ -71,6 +71,19 @@ static std::vector<uint32_t> image_fetch_test_spirv() {
     return s;
 }
 
+static std::vector<uint32_t> image_sample_fetch_test_spirv() {
+    std::vector<uint32_t> s = image_test_spirv();
+    emit(s, 95, {1, 9, 6, 8});                             // %9 = OpImageFetch %6
+    return s;
+}
+
+static std::vector<uint32_t> image_sample_query_test_spirv() {
+    std::vector<uint32_t> s = image_test_spirv();
+    emit(s, 100, {2, 9, 6});                               // %9 = OpImage %6
+    emit(s, 106, {1, 10, 9});                              // %10 = OpImageQueryLevels %9
+    return s;
+}
+
 static std::vector<uint32_t> image_query_test_spirv() {
     std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 16, 0};
     emit(s, 15, {5, 12, 0x6e69616d, 0});                    // OpEntryPoint Compute %12 "main"
@@ -375,6 +388,7 @@ int main() {
     CHECK(ir.ok() && ir.descriptors.size() == 1 &&
           ir.descriptors[0].kind == SpirvDescriptorKind::CombinedImageSampler &&
           ir.descriptors[0].normalized_sampling && !ir.descriptors[0].texel_access &&
+          !ir.descriptors[0].unnormalized_texel_access &&
           ir.descriptors[0].image_dim == 1 && !ir.descriptors[0].image_arrayed &&
           !ir.descriptors[0].image_multisampled,
           "sampled-image reflection validates its concrete 2D non-array texture binding");
@@ -384,15 +398,31 @@ int main() {
         image_fetch_test_spirv(), &image_table, 1, SpirvShaderStage::Fragment);
     CHECK(fetch_report.ok() && fetch_report.descriptors.size() == 1 &&
               !fetch_report.descriptors[0].normalized_sampling &&
-              fetch_report.descriptors[0].texel_access,
+              fetch_report.descriptors[0].texel_access &&
+              fetch_report.descriptors[0].unnormalized_texel_access,
           "OpImageFetch reflection requires the descriptor's exact texel extent");
+    const auto mixed_access_report = validate_spirv_descriptor_interface(
+        image_sample_fetch_test_spirv(), &image_table, 1, SpirvShaderStage::Fragment);
+    CHECK(mixed_access_report.ok() && mixed_access_report.descriptors.size() == 1 &&
+              mixed_access_report.descriptors[0].normalized_sampling &&
+              mixed_access_report.descriptors[0].texel_access &&
+              mixed_access_report.descriptors[0].unnormalized_texel_access,
+          "a normalized sample does not hide an unnormalized texel read on the same image");
     const auto query_report = validate_spirv_descriptor_interface(
         image_query_test_spirv(), &image_table, 0, SpirvShaderStage::Compute);
     CHECK(query_report.ok() && query_report.descriptors.size() == 1 &&
               query_report.descriptors[0].readable &&
               !query_report.descriptors[0].normalized_sampling &&
-              query_report.descriptors[0].texel_access,
+              query_report.descriptors[0].texel_access &&
+              !query_report.descriptors[0].unnormalized_texel_access,
           "query-only sampled images stay reflected and require their exact guest extent");
+    const auto sample_query_report = validate_spirv_descriptor_interface(
+        image_sample_query_test_spirv(), &image_table, 1, SpirvShaderStage::Fragment);
+    CHECK(sample_query_report.ok() && sample_query_report.descriptors.size() == 1 &&
+              sample_query_report.descriptors[0].normalized_sampling &&
+              sample_query_report.descriptors[0].texel_access &&
+              !sample_query_report.descriptors[0].unnormalized_texel_access,
+          "image queries preserve exact-extent requirements without blocking normalized values");
 
     ShaderResource storage_src{};
     storage_src.cls = ResourceClass::StorageImage; storage_src.binding = 5;

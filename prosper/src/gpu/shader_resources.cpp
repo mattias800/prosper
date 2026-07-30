@@ -607,6 +607,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     std::set<uint32_t> atomic_vars;
     std::set<uint32_t> normalized_sample_vars;
     std::set<uint32_t> texel_access_vars;
+    std::set<uint32_t> unnormalized_texel_access_vars;
     std::unordered_map<uint32_t, PointerAccess> accesses;
     // Result id of OpLoad/OpSampledImage -> descriptor variable. An image descriptor load accesses
     // the descriptor object, not its texels; only the later image opcode establishes read/write data
@@ -662,6 +663,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                 access.pointee_type = pointer_type->second.element;
                 accesses[result] = access;
                 texel_access_vars.insert(image_var);
+                unnormalized_texel_access_vars.insert(image_var);
             }
         } else if (in.opcode == OpLoad && n >= 3) {
             const uint32_t root = pointer_root(word(in, 2));
@@ -694,9 +696,14 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             // OpImageSample* (87..94) and Gather/DrefGather (96..97) consume normalized sampler
             // coordinates. OpImageFetch (95) and OpImageRead (98) consume integer texel coordinates
             // and therefore cannot observe a reduced render target as if it had the native extent.
-            mark_image_coordinate_contract(
-                word(in, 2), (in.opcode >= 87u && in.opcode <= 94u) ||
-                                 in.opcode == 96u || in.opcode == 97u);
+            const bool normalized = (in.opcode >= 87u && in.opcode <= 94u) ||
+                                    in.opcode == 96u || in.opcode == 97u;
+            mark_image_coordinate_contract(word(in, 2), normalized);
+            if (!normalized) {
+                auto origin = image_objects.find(word(in, 2));
+                if (origin != image_objects.end())
+                    unnormalized_texel_access_vars.insert(origin->second);
+            }
         } else if (in.opcode == 99u /* OpImageWrite */ && n >= 1) {
             mark_image(word(in, 0), false, true);
         } else if (in.opcode == 100u /* OpImage */ && n >= 3) {
@@ -776,6 +783,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                                       written_vars.count(var) != 0,
                                       normalized_sample_vars.count(var) != 0,
                                       texel_access_vars.count(var) != 0,
+                                      unnormalized_texel_access_vars.count(var) != 0,
                                       storage_float_vars.count(var) != 0, image_format, image_dim,
                                       image_arrayed, image_multisampled, image_depth,
                                       atomic_vars.count(var) != 0});

@@ -365,6 +365,9 @@ struct SpirvDescriptorBinding {
     // descriptor's exact declared extent. A binding can use both, in which case exact extent wins.
     bool normalized_sampling = false;
     bool texel_access = false;
+    // True only for data reads that consume integer texel coordinates (OpImageFetch/Read), not
+    // size/LOD queries. A query requires the exact extent but does not observe texel format/width.
+    bool unnormalized_texel_access = false;
     // Storage-image sampled type encoded by SPIR-V. This is the backend's authoritative choice
     // between a native float VkFormat and the portable raw-uvec4 conversion path, including replay.
     bool storage_float = false;
