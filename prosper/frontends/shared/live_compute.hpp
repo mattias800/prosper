@@ -26,6 +26,18 @@ constexpr bool compute_image_cache_default_eligible(
     return bytes >= compute_image_cache_default_minimum_bytes(image_class);
 }
 
+// A sampled descriptor needs guest validation/conversion only when neither renderer authority path
+// supplied its pixels. Depth images can be imported from the persistent Vulkan DS cache even though
+// they deliberately have no color-RTT identity; that import must not fall through and snapshot stale
+// guest backing that the dispatch will never consume.
+constexpr bool compute_sampled_guest_prepare_required(bool storage_image,
+                                                       bool renderer_owned,
+                                                       bool imported_image,
+                                                       bool imported_bypass_disabled = false) {
+    return !storage_image && !renderer_owned &&
+           (!imported_image || imported_bypass_disabled);
+}
+
 // Keep enough persistent image residency for modern multi-pass workloads without claiming an
 // unreasonable share of small discrete GPUs. The 512 MiB historical floor remains appropriate for
 // a 4 GiB heap, while larger devices contribute one eighth of their local heap up to 2 GiB. An

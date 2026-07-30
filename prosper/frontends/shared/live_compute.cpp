@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -2603,6 +2604,15 @@ bool trace_compute_item(const prosper::gpu::ComputeItem& item) {
     return true;
 }
 
+bool time_compute_item(const prosper::gpu::ComputeItem& item) {
+    const char* code_env = std::getenv("PROSPER_COMPUTE_TIMING_CODE");
+    if (!code_env || !*code_env) return true;
+    char* end = nullptr;
+    errno = 0;
+    const uint64_t wanted = std::strtoull(code_env, &end, 0);
+    return !errno && end != code_env && end && !*end && item.code_addr == wanted;
+}
+
 void maybe_dump_traced_compute_spirv(const prosper::gpu::ComputeItem& item, bool trace) {
     const char* path = std::getenv("PROSPER_COMPUTELOG_SPIRV");
     if (!trace || !path || !*path || item.spirv.empty()) return;
@@ -2844,6 +2854,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         std::getenv("PROSPER_COMPUTE_TIMING_TRACE_ONLY") != nullptr;
     const bool phase_timing =
         std::getenv("PROSPER_COMPUTE_PHASE_TIMING") != nullptr &&
+        time_compute_item(item) &&
         (!timing_trace_only || trace);
     if (has_storage_images && !ctx.image_support) {
         static bool warned = false;
@@ -3182,10 +3193,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         };
         const bool image_timing =
             std::getenv("PROSPER_COMPUTE_IMAGE_TIMING") != nullptr &&
+            time_compute_item(item) &&
             (!timing_trace_only || trace);
         for (size_t i = 0; i < image_descriptors.size() && images_ready; i++) {
             const auto image_start = ComputeClock::now();
             double import_ms = 0.0;
+            double query_ms = 0.0;
+            double cache_lookup_ms = 0.0;
+            double staging_ms = 0.0;
+            double prepare_upload_ms = 0.0;
+            double image_allocation_ms = 0.0;
             double view_ms = 0.0;
             double sampler_ms = 0.0;
             const ShaderResource* r = item.resources->by_binding(image_descriptors[i].binding);
@@ -3325,7 +3342,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // descriptors may borrow its Vulkan image directly; storage descriptors use the CPU
             // snapshot path below so their guest writeback keeps overlapping aliases coherent.
             LiveTargetSnapshot live_target;
+            const auto query_start = ComputeClock::now();
             bool renderer_owned = !r->in_mip_tail && is_live_render_target(r->gpu_addr);
+            query_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - query_start).count();
             static const uint32_t render_scale = [] {
                 const char* e = std::getenv("PROSPER_RENDER_SCALE");
                 const long v = e ? std::strtol(e, nullptr, 10) : 1;
@@ -3892,7 +3912,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool sampled_f32 = sampled_float32;
             size_t sampled_guest_need = 0;
             const uint8_t* sampled_guest_source = nullptr;
-            if (!bi.storage && !renderer_owned) {
+            static const bool imported_guest_bypass_disabled =
+                std::getenv("PROSPER_NO_IMPORTED_IMAGE_GUEST_BYPASS") != nullptr;
+            if (compute_sampled_guest_prepare_required(
+                    bi.storage, renderer_owned, bi.imported,
+                    imported_guest_bypass_disabled)) {
                 // Resolve and validate the guest source before allocating staging. A proven cache
                 // hit can then avoid the staging buffer/map as well as conversion and GPU upload.
                 if (sampled_bpb && dim_3d) {
@@ -4013,6 +4037,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.cache_candidate = dcc_cache_safe &&
                     persistent_compute_image_enabled(sbytes, ComputeImageCacheClass::sampled);
                 if (bi.cache_candidate) {
+                    const auto cache_lookup_start = ComputeClock::now();
                     bi.cache_key = {
                         r->gpu_addr, reinterpret_cast<uintptr_t>(r->host_data),
                         static_cast<uint32_t>(sampled_guest_need), r->size,
@@ -4066,6 +4091,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.cache_source_snapshot.assign(
                             sampled_guest_source,
                             sampled_guest_source + sampled_guest_need);
+                    cache_lookup_ms = std::chrono::duration<double, std::milli>(
+                        ComputeClock::now() - cache_lookup_start).count();
                 }
             }
 
@@ -4079,6 +4106,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ? size_t{0} : (size_t)sbytes;
             // A retained storage image still needs a fresh destination for its post-dispatch
             // transfer. Only a read-only sampled cache hit can omit staging altogether.
+            const auto staging_start = ComputeClock::now();
             if (!bi.imported &&
                 (bi.storage || (!bi.compute_transfer_seed_borrowed &&
                                 !(bi.persistent && bi.upload_skipped)))) {
@@ -4107,7 +4135,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     images_ready = false; break;
                 }
             }
+            staging_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - staging_start).count();
             auto* upload = static_cast<uint8_t*>(upload_mapping.data);
+            const auto prepare_upload_start = ComputeClock::now();
             if (bi.imported) {
                 // The renderer's sampled image is the source, so direct imports need no transfer.
                 bi.guest_bytes = 0;
@@ -4189,6 +4220,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     !bi.poison_verify && (bi.exact_storage_bytes() || bi.seed_skip) &&
                     persistent_compute_image_enabled(sbytes, ComputeImageCacheClass::storage);
                 if (bi.cache_candidate) {
+                    const auto cache_lookup_start = ComputeClock::now();
                     bi.cache_key = storage_image_cache_key(
                         *r, static_cast<uint32_t>(guest_bytes), image_format);
                     bi.persistent = ctx.acquire_cached_image(
@@ -4204,6 +4236,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      "addr=0x%llx guest=%zu upload-skipped=%u\n",
                                      bi.binding, (unsigned long long)r->gpu_addr,
                                      guest_bytes, bi.upload_skipped ? 1u : 0u);
+                    cache_lookup_ms = std::chrono::duration<double, std::milli>(
+                        ComputeClock::now() - cache_lookup_start).count();
                 }
                 if (!(bi.persistent && bi.upload_skipped)) {
                 const size_t linear_size = (bi.seed_skip || bi.seed_from_imported != SIZE_MAX)
@@ -4682,6 +4716,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 
             // Host writes are complete before this allocation is consumed by vkCmdCopyBufferToImage.
             upload_mapping.unmap();
+            prepare_upload_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - prepare_upload_start).count();
 
             // Device-local image.
             VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -4702,6 +4738,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             // An imported binding already holds the renderer's image; only the view/sampler below
             // are ours to create. `ici` is still filled above so the view matches its format/layers.
+            const auto image_allocation_start = ComputeClock::now();
             if (!bi.imported && !bi.image) {
                 if (!vk_ok(vkCreateImage(ctx.device, &ici, nullptr, &bi.image),
                            "image-create")) { images_ready = false; break; }
@@ -4714,6 +4751,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     !vk_ok(vkBindImageMemory(ctx.device, bi.image, bi.memory, 0), "image-bind")) {
                     images_ready = false; break; }
             }
+            image_allocation_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - image_allocation_start).count();
             VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             vci.image = bi.image;
             vci.viewType = dim_1d ? VK_IMAGE_VIEW_TYPE_1D
@@ -4785,7 +4824,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              "[compute-image] code=0x%llx binding=%u class=%s imported=%u "
                              "extent=%ux%ux%u guest=%zu staging=%llu "
                              "normalized=%u texel=%u sampled-float=%u rgba8-reuse=%u "
-                             "import_ms=%.3f view_ms=%.3f sampler_ms=%.3f ms=%.3f\n",
+                             "query_ms=%.3f import_ms=%.3f cache_ms=%.3f "
+                             "staging_ms=%.3f prepare_ms=%.3f allocation_ms=%.3f "
+                             "view_ms=%.3f sampler_ms=%.3f ms=%.3f\n",
                              (unsigned long long)item.code_addr, bi.binding,
                              bi.storage ? "storage" : "sampled", bi.imported ? 1u : 0u,
                              r->width, r->height, r->depth, bi.guest_bytes,
@@ -4794,7 +4835,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              image_descriptors[i].texel_access ? 1u : 0u,
                              image_descriptors[i].sampled_float ? 1u : 0u,
                              bi.unorm_rtt_value_reuse ? 1u : 0u,
-                             import_ms, view_ms, sampler_ms,
+                             query_ms, import_ms, cache_lookup_ms,
+                             staging_ms, prepare_upload_ms, image_allocation_ms,
+                             view_ms, sampler_ms,
                              std::chrono::duration<double, std::milli>(
                                  ComputeClock::now() - image_start).count());
         }

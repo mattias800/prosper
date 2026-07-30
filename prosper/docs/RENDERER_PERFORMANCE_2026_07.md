@@ -1505,13 +1505,59 @@ authority, an external mutation forces writeback, and the disable switch preserv
 An alternating A/B/A regression injects GPU-baseline ownership failure after B and proves an older host A
 fallback cannot leave B in guest memory when A returns.
 
+## Plucky imported-depth guest preparation
+
+The cold-image measurements above predated the adaptive compute-image cache sizing from #1519. A fresh
+160-second comparison on the combined renderer confirmed that capacity now controls how often the old
+`0x30180d0000` cold path occurs: a forced 512 MiB cache produced 113 calls with `setup_ms > 50` and
+49,522 MiB of source snapshots, while the adaptive 2 GiB default produced three such calls and
+21,796 MiB. The ordinary (not cold-filtered) program median was neutral at 2.87 versus 2.89 ms. This closes
+the repeated cold-snapshot bottleneck as a priority; it does not make the whole title fast.
+
+The next per-image trace instead exposed a renderer-authority error in sampled compute inputs. A persistent
+Vulkan depth image can be imported directly even though it deliberately is not registered as a color render
+target. The import populated the descriptor's `VkImage`, but the sampled-source condition checked only the
+color `renderer_owned` flag. It therefore fell through to guest validation, cache lookup, and sometimes
+conversion of raw depth backing that was stale and never consumed. A cache hit was also allowed to replace
+the imported `VkImage` while the binding remained marked imported, making the redundant path a potential
+correctness and lifetime hazard as well as CPU work.
+
+Sampled guest preparation now runs only when neither renderer authority path supplied the image. The policy
+is expressed as a small independently tested helper and covers guest-backed, color-renderer-owned,
+direct-depth-imported, storage, and recovery-switch cases. `PROSPER_NO_IMPORTED_IMAGE_GUEST_BYPASS=1`
+restores the previous fall-through for a same-binary diagnostic. Per-binding timing now separates renderer
+query/import, cache lookup, staging, source preparation, allocation, view, and sampler costs;
+`PROSPER_COMPUTE_TIMING_CODE=0x...` limits those records to one exact program without enabling compute trace
+hashing.
+
+Two 160-second full-resolution runs of the same binary and scripted route compared that recovery switch.
+For `0x3017580000` binding 14, the imported-depth samples spent a 1.519 ms median in cache lookup and
+1.524 ms total under the old path (282 imported samples of 283). With the bypass, all 98 observed samples
+were imported and spent 0.000 ms in cache lookup / 0.003 ms total. Whole-program medians and aggregate
+snapshot totals are not treated as an A/B result: the game reached different resource-authority states,
+with binding 15 imported in 276 control samples but guest-backed in all fixed samples. That difference
+changed the program mix despite similar presented-frame totals (1,403 / 1,350). The binding-14 comparison
+isolates the fixed branch because its imported contract is identical in both runs.
+
+An uninstrumented 90-second route presented 1,348 frames (about 15 FPS), confirming that the remaining broad
+slowdown is real rather than entirely caused by diagnostics. A heavily logged run showed white flashes over
+the studio/publisher intro; intrusive output clearly worsened cadence, but the flashes have not yet been
+confirmed or disproved in a clean capture. Treat that visual report as an open correctness item, not as a
+known timing artifact.
+
 ## Next renderer step
 
-The remaining gameplay form of `0x30180d0000` spends roughly 60-70 ms converting two guest-backed
-3840x2160 Float16 inputs to RGBA8 on the CPU. Measure a generic raw-FP16 upload/GPU conversion or exact
-native-sampling alternative against the known RADV regression that originally selected RGBA8; do not simply
-re-enable native FP16 globally. In parallel, capture a fresh v39 rolling temporal window around the Plucky
-title/gameplay transition. It must include the producers for the two 48x48 volumes and close with zero
-unresolved leaves, providing a native pixel oracle as well as exact compute pipeline contracts. Keep the
-exact-byte and disable-switch A/B discipline used here, and preserve screenshot/capture correctness while
-reducing the synchronous boundaries.
+First reproduce the reported white intro flashes with lightweight capture or a clean live run. Heavy
+per-image/per-dispatch logging changes the title's already-slow timing and must not be the visual oracle.
+If a capture retains the affected producer history, use GPU replay to separate a deterministic renderer
+defect from presentation/cadence behavior.
+
+For performance, a fresh adaptive-cache trace ranked `0x3017580000` and `0x30181a0000` at roughly 16.00 and
+15.41 ms median. The imported-depth work above removes one dead input path, but a guest-backed 3840x2160
+Float16 input in the fixed run still spent about 6.9 ms in source preparation. Measure a generic raw-FP16
+upload/GPU conversion or exact native-sampling alternative against the known RADV regression that originally
+selected RGBA8; do not simply re-enable native FP16 globally. In parallel, capture a fresh v39 rolling
+temporal window around the Plucky title/gameplay transition. It must include the producers for the two
+48x48 volumes and close with zero unresolved leaves, providing a native pixel oracle as well as exact compute
+pipeline contracts. Keep the exact-byte and disable-switch A/B discipline used here, and preserve
+screenshot/capture correctness while reducing the synchronous boundaries.

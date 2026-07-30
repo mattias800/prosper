@@ -63,6 +63,17 @@ int main() {
           prosper::frontend::compute_image_cache_default_limit_bytes(UINT64_MAX) ==
               2048ull * 1024ull * 1024ull,
           "image cache limit scales with local memory and retains bounded floor and ceiling");
+    CHECK(prosper::frontend::compute_sampled_guest_prepare_required(false, false, false),
+          "guest-backed sampled image prepares its source");
+    CHECK(!prosper::frontend::compute_sampled_guest_prepare_required(false, true, false),
+          "renderer-owned sampled image uses renderer authority instead of guest backing");
+    CHECK(!prosper::frontend::compute_sampled_guest_prepare_required(false, false, true),
+          "directly imported depth image does not validate unused guest backing");
+    CHECK(prosper::frontend::compute_sampled_guest_prepare_required(
+              false, false, true, true),
+          "imported-image recovery switch restores guest validation");
+    CHECK(!prosper::frontend::compute_sampled_guest_prepare_required(true, false, false),
+          "storage image retains its independent seed/writeback path");
     CHECK(prosper::frontend::storage_writeback_can_tile_mapped_bytes(
               true, 27, false, false),
           "exact-width tiled storage can feed mapped bytes directly to the tiler");
