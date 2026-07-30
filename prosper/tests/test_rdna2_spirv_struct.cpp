@@ -188,6 +188,37 @@ bool binary_id_operands_are_nonzero(const std::vector<uint32_t>& spv, uint32_t o
     return true;
 }
 
+// ANDN1_SAVEEXEC must compute old_EXEC & ~source.  With source=false, the emitted boolean graph
+// therefore contains LogicalNot(false) as an operand of LogicalAnd.  The formerly reversed
+// lowering (~old_EXEC & source) instead fed false directly to the AND and silently killed all lanes.
+bool logical_not_of_false_feeds_and(const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpConstantFalse = 42, OpLogicalAnd = 167, OpLogicalNot = 168;
+    uint32_t false_id = 0;
+    std::unordered_map<uint32_t, uint32_t> logical_not_sources;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstantFalse && wc == 3) false_id = spv[i + 2];
+        if (op == OpLogicalNot && wc == 4)
+            logical_not_sources[spv[i + 2]] = spv[i + 3];
+        i += wc;
+    }
+    if (!false_id) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpLogicalAnd && wc == 5) {
+            const auto left = logical_not_sources.find(spv[i + 3]);
+            const auto right = logical_not_sources.find(spv[i + 4]);
+            if ((left != logical_not_sources.end() && left->second == false_id) ||
+                (right != logical_not_sources.end() && right->second == false_id))
+                return true;
+        }
+        i += wc;
+    }
+    return false;
+}
+
 bool phi_ids_are_nonzero(const std::vector<uint32_t>& spv) {
     constexpr uint32_t OpPhi = 245;
     if (spv.size() < 5) return false;
@@ -407,6 +438,27 @@ int main() {
     }
     printf("  [ok]   Wave32 B32 alpha-test vote linearizes its terminal null-export branch\n");
 
+    const auto wave32_mask_branches = mask_test_branches_for_test(
+        wave32_fragment_b32_logic, std::size(wave32_fragment_b32_logic), true);
+    bool found_mask_branch = false;
+    for (const uint32_t pc : wave32_mask_branches)
+        if (pc == 5) found_mask_branch = true;
+    if (!found_mask_branch) {
+        printf("  [FAIL] proven Wave32 B32 mask vote was not recognized at PC5\n");
+        return 1;
+    }
+    const uint32_t wave32_scalar_scc_branch[] = {
+        0x87008104u,                         // s_and_b32 s0, s4, 1 (ordinary scalar data)
+        0xbf840002u,                         // s_cbranch_scc0
+        0xbf810000u,
+    };
+    if (!mask_test_branches_for_test(wave32_scalar_scc_branch,
+                                     std::size(wave32_scalar_scc_branch), true).empty()) {
+        printf("  [FAIL] ordinary Wave32 scalar SCC branch was mistaken for a mask vote\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 branch linearization requires proven mask provenance\n");
+
     // The same live shader selects EXEC_LO or an empty mask into VCC_HI from an ordinary scalar
     // comparison. This is s_cselect_b32's mask-domain form, not a scalar integer selection.
     const uint32_t wave32_fragment_b32_cselect[] = {
@@ -454,6 +506,25 @@ int main() {
         return 1;
     }
     printf("  [ok]   explicit Wave32 VOPC SGPR destinations feed B32 mask logic\n");
+
+    // A VOPC write to s0 must not erase the adjacent, independently-live s1 mask. In Wave32 each
+    // explicit compare destination occupies exactly one scalar word; the old generic inventory
+    // incorrectly treated both compares as two-word writes.
+    const uint32_t wave32_fragment_adjacent_vopc_masks[] = {
+        0x7d865cf9u, 0x06868104u,            // v_cmp_le_u32_sdwa s1, s4, v46
+        0x7d8654f9u, 0x06868004u,            // v_cmp_le_u32_sdwa s0, s4, v42
+        0x876a0100u,                         // s_and_b32 vcc_lo, s0, s1
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (recompile_fragment_wave32_for_test(
+            wave32_fragment_adjacent_vopc_masks,
+            std::size(wave32_fragment_adjacent_vopc_masks)).empty()) {
+        printf("  [FAIL] adjacent explicit Wave32 VOPC masks clobbered each other\n");
+        return 1;
+    }
+    printf("  [ok]   explicit Wave32 VOPC destinations preserve adjacent SGPR masks\n");
 
     // VCC_LO/HI remain physical scalar scratch registers too. A B32 ALU destination alone does not
     // prove mask-domain use: the live shader builds M0 from ordinary integer data through VCC_LO.
@@ -519,6 +590,52 @@ int main() {
         return 1;
     }
     printf("  [ok]   Wave32 AND/ORN2/ANDN1 saveexec family preserves saved EXEC\n");
+
+    // Use a distinct dynamic old EXEC and a false source so the operand order is observable in the
+    // emitted SPIR-V, rather than merely checking that the saveexec family can be translated.
+    const uint32_t wave32_fragment_andn1_saveexec[] = {
+        0x7c220300u,                         // v_cmpx_lt_f32 v0, v1
+        0xbe804480u,                         // s_andn1_saveexec_b32 s0, 0
+        0xbefe0300u,                         // s_mov_b32 exec_lo, s0
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto wave32_fragment_andn1_saveexec_spv = recompile_fragment_wave32_for_test(
+        wave32_fragment_andn1_saveexec, std::size(wave32_fragment_andn1_saveexec));
+    if (wave32_fragment_andn1_saveexec_spv.empty() ||
+        !logical_not_of_false_feeds_and(wave32_fragment_andn1_saveexec_spv)) {
+        printf("  [FAIL] s_andn1_saveexec_b32 did not compute old_EXEC & ~source\n");
+        return 1;
+    }
+    printf("  [ok]   s_andn1_saveexec_b32 negates its source operand\n");
+
+    const uint32_t wave32_fragment_readlane31[] = {
+        0xd7600000u, 0x00013f0au,            // v_readlane_b32 s0, v10, 31
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto wave32_fragment_readlane31_spv = recompile_fragment_wave32_for_test(
+        wave32_fragment_readlane31, std::size(wave32_fragment_readlane31));
+    if (wave32_fragment_readlane31_spv.empty() ||
+        fragment_spirv_required_subgroup_size(wave32_fragment_readlane31_spv) != 32) {
+        printf("  [FAIL] Wave32 fragment v_readlane requested the wrong subgroup size\n");
+        return 1;
+    }
+    const uint32_t wave32_fragment_readlane32[] = {
+        0xd7600000u, 0x0001410au,            // v_readlane_b32 s0, v10, 32 (out of range)
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (!recompile_fragment_wave32_for_test(
+            wave32_fragment_readlane32,
+            std::size(wave32_fragment_readlane32)).empty()) {
+        printf("  [FAIL] Wave32 fragment v_readlane accepted lane 32\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 fragment v_readlane retains a 32-lane subgroup contract\n");
 
     const uint32_t fragment_cvt_i32_word_sdwa[] = {
         0x7e1a10f9u, 0x0006140du,            // v_cvt_i32_f32_sdwa v13,v13 WORD_0/PRESERVE
@@ -1042,32 +1159,33 @@ int main() {
     }
     printf("  [ok]   complex fragment CFG exports active state from both alternate sites\n");
 
-    // Astro Bot's second world-map material is Wave32 and carries saved EXEC_LO masks through the
-    // same non-lexical branch graph. The dispatcher must persist the one-word mask value and reload
-    // it in the mask domain at each case; treating its Function-variable backing word as scalar data
-    // makes the later EXEC_LO restore reject. Every incoming edge below agrees that s0 is a mask.
+    // Astro Bot's second world-map material is Wave32 and carries saved one-word masks through the
+    // same non-lexical branch graph. The explicit VOPC writes below intentionally target adjacent
+    // s1 then s0: both independent masks must survive every dispatcher case and feed the later EXEC
+    // restore. Treating either compare as a two-word write erases s1 or persists it as scalar zero.
     const uint32_t wave32_fragment_cfg_masks[] = {
-        0xbe80037eu,                         // pc0:  s_mov_b32 s0, exec_lo
-        0xbefe097eu,                         // pc1:  s_wqm_b32 exec_lo, exec_lo
-        0x7e040280u,                         // pc2:  v_mov_b32 v2, 0
-        0x7e060280u,                         // pc3:  v_mov_b32 v3, 0
-        0x7e080280u,                         // pc4:  v_mov_b32 v4, 0
-        0x7e0a0280u,                         // pc5:  v_mov_b32 v5, 0
-        0x7c020300u,                         // pc6:  v_cmp_lt_f32 vcc, v0, v1
-        0xbf860003u,                         // pc7:  s_cbranch_vccz -> pc11
-        0x7c020300u,                         // pc8:  v_cmp_lt_f32 vcc, v0, v1
-        0xbf860002u,                         // pc9:  s_cbranch_vccz -> pc12 (crosses pc7 region)
-        0x7e040281u,                         // pc10: v_mov_b32 v2, 1
-        0x7e060281u,                         // pc11: v_mov_b32 v3, 1
-        0x7c020300u,                         // pc12: v_cmp_lt_f32 vcc, v0, v1
-        0xbf860004u,                         // pc13: s_cbranch_vccz -> alternate restore at pc18
-        0xbefe0300u,                         // pc14: s_mov_b32 exec_lo, s0
-        0xf800180fu, 0x05040302u,            // pc15: exp mrt0 v2, v3, v4, v5 done vm
-        0xbf820004u,                         // pc17: s_branch -> verified tail exit at pc22
-        0xbefe0300u,                         // pc18: alternate s_mov_b32 exec_lo, s0
-        0xf800180fu, 0x05040302u,            // pc19: alternate exp mrt0 v2, v3, v4, v5 done vm
-        0xbf810000u,                         // pc21: s_endpgm
-        0xbf810000u,                         // pc22: branch-target s_endpgm
+        0x7d865cf9u, 0x06868104u,            // pc0:  v_cmp_le_u32_sdwa s1, s4, v46
+        0x7d8654f9u, 0x06868004u,            // pc2:  v_cmp_le_u32_sdwa s0, s4, v42
+        0xbefe097eu,                         // pc4:  s_wqm_b32 exec_lo, exec_lo
+        0x7e040280u,                         // pc5:  v_mov_b32 v2, 0
+        0x7e060280u,                         // pc6:  v_mov_b32 v3, 0
+        0x7e080280u,                         // pc7:  v_mov_b32 v4, 0
+        0x7e0a0280u,                         // pc8:  v_mov_b32 v5, 0
+        0x7c020300u,                         // pc9:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc10: s_cbranch_vccz -> pc14
+        0x7c020300u,                         // pc11: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860002u,                         // pc12: s_cbranch_vccz -> pc15 (crosses pc10 region)
+        0x7e040281u,                         // pc13: v_mov_b32 v2, 1
+        0x7e060281u,                         // pc14: v_mov_b32 v3, 1
+        0x7c020300u,                         // pc15: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860004u,                         // pc16: s_cbranch_vccz -> alternate restore at pc21
+        0x877e0100u,                         // pc17: s_and_b32 exec_lo, s0, s1
+        0xf800180fu, 0x05040302u,            // pc18: exp mrt0 v2, v3, v4, v5 done vm
+        0xbf820004u,                         // pc20: s_branch -> verified tail exit at pc25
+        0x877e0100u,                         // pc21: alternate s_and_b32 exec_lo, s0, s1
+        0xf800180fu, 0x05040302u,            // pc22: alternate exp mrt0 v2, v3, v4, v5 done vm
+        0xbf810000u,                         // pc24: s_endpgm
+        0xbf810000u,                         // pc25: branch-target s_endpgm
     };
     const auto wave32_fragment_cfg_spv = recompile_fragment_wave32_for_test(
         wave32_fragment_cfg_masks, std::size(wave32_fragment_cfg_masks));
