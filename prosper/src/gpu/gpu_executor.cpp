@@ -155,6 +155,7 @@ struct ShaderResourceCompileKey {
     uint32_t addr_u = 0;
     uint32_t addr_v = 0;
     uint32_t border_color_type = 0;
+    bool bvh_no_hit_fallback = false;
 
     bool operator==(const ShaderResourceCompileKey&) const = default;
 };
@@ -332,6 +333,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.addr_u);
             hash = hash_mix(hash, resource.addr_v);
             hash = hash_mix(hash, resource.border_color_type);
+            hash = hash_mix(hash, resource.bvh_no_hit_fallback);
         }
         return static_cast<size_t>(hash);
     }
@@ -991,6 +993,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.addr_u = manual_compare ? resource.addr_uvw[0] : 0u;
             compiled.addr_v = manual_compare ? resource.addr_uvw[1] : 0u;
             compiled.border_color_type = manual_compare ? resource.border_color_type : 0u;
+            compiled.bvh_no_hit_fallback = is_bvh_no_hit_fallback(resource);
             key.resources.push_back(compiled);
         }
     }
@@ -2311,11 +2314,18 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             }
                             fputc('\n', stderr);
                         }
-                        if (plausible) {
+                        if (plausible || (!live_known &&
+                                          (snapshot_provenance || seed_provenance))) {
                             SrtUse u;
                             u.kind = 2;
                             u.key = 0xFFFFFFFFu;
-                            u.bvh4 = live_bvh;
+                            // A descriptor load can be control-flow guarded even though static
+                            // translation still sees the later BVH instruction. Preserve an
+                            // all-zero marker when that load did not resolve: resource
+                            // materialization binds a bounded no-hit BVH so the rest of the
+                            // compute program can execute. A known but malformed descriptor is
+                            // deliberately not converted into this fallback.
+                            if (plausible) u.bvh4 = live_bvh;
                             u.use_pc = in.pc;
                             srt_uses->push_back(u);
                         }
@@ -2843,6 +2853,27 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
     for (const auto& u : srt_uses) {
         if (u.kind == 2) {
             const DecodedBvhDescriptor d = decode_bvh_descriptor(u.bvh4.data());
+            const bool unresolved = std::all_of(u.bvh4.begin(), u.bvh4.end(),
+                                                [](uint32_t word) { return word == 0; });
+            if (unresolved) {
+                const uint64_t dk = 0x8000000200000000ull | u.use_pc;
+                if (!seen.insert(dk).second) continue;
+                // Guest control flow normally skips this unresolved descriptor. The exact
+                // host-owned marker lets the recompiler emit a compact deterministic no-hit if
+                // the static instruction remains in the module, without instantiating a large
+                // software traversal body merely to satisfy Vulkan pipeline compilation.
+                alignas(256) static std::array<uint8_t, 256> null_bvh{};
+                ShaderResource r;
+                r.cls = ResourceClass::ConstantBuffer;
+                r.format = DataFormat::Uint32;
+                r.num_components = 1;
+                r.size = static_cast<uint32_t>(null_bvh.size());
+                r.fetch_pc = u.use_pc;
+                r.host_data = null_bvh.data();
+                r.host_data_size = null_bvh.size();
+                table.resources.push_back(r);
+                continue;
+            }
             if (d.type != 8u || d.base <= 0x10000u || d.size_bytes == 0 ||
                 d.size_bytes > 0x10000000u || d.size_bytes > UINT32_MAX ||
                 !d.triangle_return_mode || d.box_node_64b || d.sort_enabled)

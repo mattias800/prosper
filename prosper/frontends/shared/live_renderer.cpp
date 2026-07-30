@@ -562,7 +562,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     // exact-match identity and immutable CPU snapshot used by live compute (#590).
     prosper::gpu::set_live_target_query([invalidate_ds](uint64_t addr) {
         drain_guest_gpu_writes(g_rtt, invalidate_ds);
-        return g_rtt.count(addr) != 0;
+        auto it = g_rtt.find(addr);
+        if (it == g_rtt.end()) return false;
+        const RttSurf& surface = it->second;
+        const VkFormat format = prosper::test::backend_color_format(surface.format);
+        const uint32_t bytes_per_pixel =
+            prosper::test::backend_color_bytes_per_pixel(format);
+        const bool has_cpu_snapshot = surface.rgba &&
+            prosper::frontend::live_rtt_cpu_snapshot_matches(
+                surface.w, surface.h, bytes_per_pixel, surface.rgba->size());
+        return prosper::frontend::live_rtt_compute_authoritative(
+            surface.gpu_valid, has_cpu_snapshot);
     });
     prosper::gpu::set_live_target_reader(
         [invalidate_ds](uint64_t addr, prosper::gpu::LiveTargetSnapshot& snapshot) {

@@ -17,6 +17,7 @@ using prosper::frontend::rtt_scaled_axis;
 using prosper::frontend::rtt_scaled_extent_compatible;
 using prosper::frontend::LiveRttAuthority;
 using prosper::frontend::live_rtt_authority;
+using prosper::frontend::live_rtt_compute_authoritative;
 using prosper::frontend::live_rtt_cpu_snapshot_matches;
 using prosper::frontend::live_rtt_gpu_importable;
 using prosper::frontend::LiveRttGuestWriteEffect;
@@ -87,6 +88,10 @@ int main() {
     CHECK(live_rtt_gpu_importable(true, true));
     CHECK(!live_rtt_gpu_importable(false, true));
     CHECK(!live_rtt_gpu_importable(false, false));
+    CHECK(live_rtt_compute_authoritative(true, false));
+    CHECK(live_rtt_compute_authoritative(true, true));
+    CHECK(live_rtt_compute_authoritative(false, true));
+    CHECK(!live_rtt_compute_authoritative(false, false));
     CHECK(live_rtt_cpu_snapshot_matches(1920, 1080, 8, 1920ull * 1080 * 8));
     CHECK(!live_rtt_cpu_snapshot_matches(1920, 1080, 8, 1920ull * 1080 * 4));
     CHECK(!live_rtt_cpu_snapshot_matches(0, 1080, 8, 0));

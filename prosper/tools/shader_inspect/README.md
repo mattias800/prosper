@@ -23,6 +23,19 @@ success_cs_6f6a5fdd6e9f8d73_2339aa565126d182.bin
 success_cs_6f6a5fdd6e9f8d73_2339aa565126d182.spv
 ```
 
+For a large live compute program that reaches the backend but fails during Vulkan pipeline creation,
+filter the backend trace by guest code address and dump only that exact translated module:
+
+```sh
+PROSPER_COMPUTELOG_CODE=0x50057b800 \
+PROSPER_COMPUTELOG_SPIRV=~/prosper-shaders/target.spv \
+  ./build-linux/prosper-app --dump <DUMP_ROOT>/PPSA21564-app0
+spirv-val --target-env vulkan1.2 ~/prosper-shaders/target.spv
+```
+
+The destination directory must already exist. As with raw shader dumps, the resulting SPIR-V is
+title-derived diagnostic data: keep it local and do not commit it.
+
 The first hash identifies the translated SPIR-V and the second identifies the exact raw RDNA2 stream.
 Pass the `.bin` file to `shader_inspect`; use the adjacent `.spv` for SPIR-V disassembly or validation.
 The dump directory is created automatically. `vs`, `ps`, and `cs` identify vertex, pixel, and compute stages.

@@ -24,6 +24,13 @@ constexpr bool live_rtt_gpu_importable(bool gpu_valid, bool has_cpu_snapshot) {
     return authority == LiveRttAuthority::gpu || authority == LiveRttAuthority::mirrored;
 }
 
+// Compute must override guest backing only while the renderer actually owns a current pixel
+// representation. A cache entry can survive with identity/metadata alone after an invalidation;
+// treating that stale shell as authoritative makes a later dispatch reject valid guest bytes.
+constexpr bool live_rtt_compute_authoritative(bool gpu_valid, bool has_cpu_snapshot) {
+    return live_rtt_authority(gpu_valid, has_cpu_snapshot) != LiveRttAuthority::none;
+}
+
 constexpr bool live_rtt_cpu_snapshot_matches(uint32_t width, uint32_t height,
                                              uint32_t bytes_per_pixel,
                                              size_t snapshot_bytes) {

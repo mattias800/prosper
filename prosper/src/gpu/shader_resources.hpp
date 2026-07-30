@@ -298,6 +298,18 @@ struct ShaderResource {
     uint64_t       host_data_size   = 0;
 };
 
+// A statically proven missing BVH descriptor is materialized as this exact host-owned resource.
+// Guest address zero cannot name a real BVH allocation, so the recompiler may replace the guarded
+// IMAGE_BVH_INTERSECT_RAY use with a compact deterministic no-hit result. Keeping the marker derived
+// from serialized resource fields also preserves capture/replay without changing the capture ABI.
+inline bool is_bvh_no_hit_fallback(const ShaderResource& resource) {
+    return resource.cls == ResourceClass::ConstantBuffer &&
+           resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
+           resource.gpu_addr == 0 && resource.size == 256u && resource.stride == 0u &&
+           resource.fetch_pc != 0xFFFFFFFFu && resource.host_data != nullptr &&
+           resource.host_data_size >= resource.size;
+}
+
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the
 // recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
 struct ShaderResourceTable {

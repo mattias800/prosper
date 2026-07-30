@@ -276,6 +276,36 @@ bool phi_ids_are_nonzero(const std::vector<uint32_t>& spv) {
     return true;
 }
 
+bool store_object_ids_are_nonzero(const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpStore = 62;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t word = spv[i];
+        const uint32_t op = word & 0xffffu, wc = word >> 16u;
+        if (wc == 0 || i + wc > spv.size()) return false;
+        if (op == OpStore && (wc < 3 || spv[i + 1] == 0 || spv[i + 2] == 0)) return false;
+        i += wc;
+    }
+    return true;
+}
+
+bool select_ids_are_nonzero(const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpSelect = 169;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t word = spv[i];
+        const uint32_t op = word & 0xffffu, wc = word >> 16u;
+        if (wc == 0 || i + wc > spv.size()) return false;
+        if (op == OpSelect) {
+            if (wc != 6) return false;
+            for (uint32_t operand = 1; operand < wc; ++operand)
+                if (spv[i + operand] == 0) return false;
+        }
+        i += wc;
+    }
+    return true;
+}
+
 // Whether the module contains OpDecorate (71) with the given decoration (word[i+2]).
 bool has_decoration(const std::vector<uint32_t>& spv, uint32_t decoration) {
     enum : uint32_t { OpDecorateL = 71 };
@@ -427,6 +457,44 @@ int main() {
         printf("  [FAIL] proven Wave32 compute mask moves did not recompile\n");
         return 1;
     }
+    // A Wave32 VOPC creates a VCC mask lifetime; one arm then recycles VCC_LO as ordinary scalar
+    // data. The mask view is deliberately poisoned on that arm, but the structured merge and CFG
+    // boundary must use a real false id rather than emitting an illegal id-zero OpPhi/OpStore.
+    const uint32_t wave32_compute_recycled_vcc[] = {
+        0x7d840000u,                         // v_cmp_eq_u32 vcc, v0, v0
+        0xbf060000u,                         // s_cmp_eq_u32 s0, s0
+        0xbf840001u,                         // s_cbranch_scc0 +1
+        0xbeea0385u,                         // s_mov_b32 vcc_lo, 5 (scalar-data lifetime)
+        0x7e020280u,                         // v_mov_b32 v1, 0
+        0xbf810000u,
+    };
+    wave32_compute_config.native_subgroup_size = 32;
+    wave32_compute_config.local_x = 32;
+    const auto recycled_vcc_spv = recompile_compute(
+        wave32_compute_recycled_vcc, std::size(wave32_compute_recycled_vcc), nullptr,
+        wave32_compute_config);
+    if (recycled_vcc_spv.empty() || !phi_ids_are_nonzero(recycled_vcc_spv) ||
+        !store_object_ids_are_nonzero(recycled_vcc_spv) ||
+        !select_ids_are_nonzero(recycled_vcc_spv)) {
+        printf("  [FAIL] recycled Wave32 VCC lifetime emitted an id-zero merge/store\n");
+        return 1;
+    }
+    printf("  [ok]   recycled Wave32 VCC lifetime stays valid across CFG boundaries\n");
+    const uint32_t wave32_compute_recycled_vcc_half[] = {
+        0x7d840000u,                         // v_cmp_eq_u32 vcc, v0, v0
+        0xbeea0385u,                         // s_mov_b32 vcc_lo, 5 (poisons mask view)
+        0x876b0100u,                         // s_and_b32 vcc_hi, s0, s1
+        0xbf810000u,
+    };
+    wave32_compute_config.user_sgprs = {1u, 1u};
+    const auto recycled_vcc_half_spv = recompile_compute(
+        wave32_compute_recycled_vcc_half, std::size(wave32_compute_recycled_vcc_half), nullptr,
+        wave32_compute_config);
+    if (recycled_vcc_half_spv.empty() || !select_ids_are_nonzero(recycled_vcc_half_spv)) {
+        printf("  [FAIL] recycled Wave32 VCC half-write selected an id-zero prior mask\n");
+        return 1;
+    }
+    printf("  [ok]   recycled Wave32 VCC half-write selects a valid false prior mask\n");
     wave32_compute_config.wave_size = 64;
     if (!recompile_compute(wave32_compute_masks, std::size(wave32_compute_masks), nullptr,
                            wave32_compute_config).empty()) {
@@ -1875,6 +1943,23 @@ int main() {
         printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY lacks its SSBO/ALU lowering\n");
         return 1;
     }
+    uint32_t null_bvh_words[64]{};
+    ShaderResourceTable rt_null_bvh;
+    { ShaderResource bvh{}; bvh.cls = ResourceClass::ConstantBuffer;
+      bvh.format = DataFormat::Uint32; bvh.num_components = 1;
+      bvh.binding = 4; bvh.size = sizeof(null_bvh_words); bvh.fetch_pc = 0;
+      bvh.host_data = reinterpret_cast<uint8_t*>(null_bvh_words);
+      bvh.host_data_size = sizeof(null_bvh_words); rt_null_bvh.resources.push_back(bvh); }
+    const std::vector<uint32_t> null_bvh_spv = recompile_compute(
+        cs_bvh_intersect, std::size(cs_bvh_intersect), &rt_null_bvh, bvh_config);
+    const DescriptorValidationReport null_bvh_report = validate_spirv_descriptor_interface(
+        null_bvh_spv, &rt_null_bvh, 0, SpirvShaderStage::Compute, false);
+    if (null_bvh_spv.empty() || !null_bvh_report.ok() ||
+        null_bvh_spv.size() >= bvh_spv.size() || has_opcode(null_bvh_spv, 136u)) {
+        printf("  [FAIL] null IMAGE_BVH_INTERSECT_RAY did not specialize to no-hit\n");
+        return 1;
+    }
+    printf("  [ok]   null IMAGE_BVH_INTERSECT_RAY specializes to compact no-hit\n");
     if (!recompile_compute(cs_bvh_intersect, std::size(cs_bvh_intersect),
                            nullptr, bvh_config).empty()) {
         printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY was accepted without its BVH bytes\n");
