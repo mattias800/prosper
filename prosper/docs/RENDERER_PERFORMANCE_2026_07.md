@@ -1412,9 +1412,54 @@ selects a 512x512 fallback instead of the capture's 3840x2160 live oracle becaus
 seed window, so the equal BMPs are deterministic stored/current regression evidence, not a claim that this
 capsule reproduces the complete live frame. A rolling producer window remains the next correctness oracle.
 
+## Plucky storage-result validation snapshots
+
+Profiling the full-resolution gameplay route found another synchronous CPU copy outside the Vulkan
+dispatch itself. After every successful persistent storage-image writeback, compute retained an exact
+copy of the complete guest target as its next source-validation baseline. This is necessary for a
+read/modify/write storage image, but it duplicated 30-70 MiB every frame even for a proven-full
+write-only target whose seed is unobservable.
+
+Directly replacing every result snapshot with a Linux page-protection watch was not a valid fix. It
+regressed changing targets through repeated protection churn: an early version raised
+`0x3017be0000` writeback from about 3 ms to 50-61 ms. A later same-binary A/B that promoted only stable
+results still raised `0x30180d0000` setup from 1.02 to 5.27 ms median because querying a large watch
+walked its host-page records. It also failed to reduce total snapshot traffic materially.
+
+The final policy uses no new page watches. For a proven-full write-only target, the existing exact GPU
+result comparison runs even when no source baseline is available. A changing result is written back
+normally and releases the unobservable source snapshot. The first repeated result repairs the guest
+mirror and retains one exact byte baseline; later GPU-identical skips neither rewrite the guest nor
+recopy that baseline. Read/modify/write, partial, and replay-owned targets keep the old exact-snapshot
+contract. `PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1` restores the complete prior policy.
+
+The production-backend regression covers all three boundaries: identical skipped output does not
+recopy its baseline, an external guest mutation still forces exact repair, and alternating proven-full
+writers carry no result snapshots. A second invocation under the recovery switch proves the disabled
+path preserves old snapshot behavior without adding copies to identical skips. The existing injected
+post-submit readback failure continues to prove that a GPU baseline cannot publish stale guest bytes.
+
+A matched 180-second native-resolution Plucky A/B used the same binary, route, audio/input frontends,
+and timing settings; the control changed only the recovery switch. Storage-result snapshot traffic fell
+from 33,478.7 MiB to 30,125.3 MiB (10.0%). Representative complete-dispatch timings were:
+
+| program | control median | adaptive median | samples (control/adaptive) |
+|---|---:|---:|---:|
+| `0x3017be0000` | 4.75 ms | 3.73 ms | 124 / 124 |
+| `0x30180d0000` | 4.05 ms | 4.24 ms | 2,058 / 2,032 |
+| `0x3017bb0000` | 10.54 ms | 9.16 ms | 121 / 121 |
+
+The dominant stable title dispatch therefore remains neutral instead of paying page-watch query cost,
+while the changing 1920x1080 writer improves by 21.5% at the median. Its 124 adaptive samples remained
+bounded at 5.92 ms p95 and 15.47 ms maximum, with no recurrence of the experimental 50-61 ms state.
+Different submit counts reflect real route progression, so these are supporting live measurements rather
+than a standalone FPS or pixel-equality claim.
+
 ## Next renderer step
 
-Capture a fresh v39 rolling temporal window on current code around the Plucky title/gameplay transition. It
-must include the producers for the two 48x48 volumes and close with zero unresolved leaves, providing a native
-pixel oracle as well as exact compute pipeline contracts. Keep the exact-byte and disable-switch A/B
-discipline used here, and preserve screenshot/capture correctness while reducing the synchronous boundaries.
+Attribute the remaining compute-image source snapshots by cache entry and distinguish unavoidable readable
+storage inputs from cache churn. In parallel, capture a fresh v39 rolling temporal window around the Plucky
+title/gameplay transition. It must include the producers for the two 48x48 volumes and close with zero
+unresolved leaves, providing a native pixel oracle as well as exact compute pipeline contracts. Keep the
+exact-byte and disable-switch A/B discipline used here, and preserve screenshot/capture correctness while
+reducing the synchronous boundaries.

@@ -33,6 +33,8 @@ int main() {
     setenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0", 1);
     setenv("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1", 1);
 #endif
+    const bool adaptive_storage_result_validation_enabled =
+        std::getenv("PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION") == nullptr;
     using prosper::frontend::ComputeImageCacheClass;
     CHECK(prosper::frontend::compute_image_cache_default_minimum_bytes(
               ComputeImageCacheClass::sampled) == 1024ull * 1024ull &&
@@ -2151,6 +2153,8 @@ int main() {
 #if defined(__linux__)
             auto repeated_write_watch = prosper::host::GuestWriteWatch::create(
                 reinterpret_cast<uint64_t>(fill_guest), fill_guest_bytes);
+            const uint64_t repeated_snapshots_before =
+                prosper::frontend::live_compute_storage_result_snapshot_bytes();
 #endif
             uint32_t repeated_write_notifications = 0;
             set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
@@ -2168,6 +2172,9 @@ int main() {
             CHECK(static_cast<bool>(repeated_write_watch) && repeated_write_watch.query() ==
                       prosper::host::GuestWriteWatchQuery::Unchanged,
                   "identical retained output leaves guest-byte dirty tracking clean");
+            CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
+                      repeated_snapshots_before,
+                  "identical retained output does not recopy its guest-byte baseline");
             repeated_write_watch.reset();
 #endif
 
@@ -2330,6 +2337,14 @@ int main() {
                     if (addr == fdst.gpu_addr && size == fdst.size)
                         ++changed_write_notifications;
                 });
+#if defined(__linux__)
+                // The nested compute-import fixture temporarily disables the synthetic fault
+                // handler when it tears down. Restore the outer mapping's emulator contract before
+                // exercising this target again.
+                prosper::host::guest_write_watch_set_fault_onstack(true);
+                const uint64_t storage_snapshots_before =
+                    prosper::frontend::live_compute_storage_result_snapshot_bytes();
+#endif
                 CHECK(prosper::frontend::execute_live_compute_items({changed}),
                       "storage image retries after a failed post-submit readback");
                 set_guest_gpu_write_observer({});
@@ -2337,10 +2352,51 @@ int main() {
                       "retry invalidates the stale baseline and publishes the changed output");
                 CHECK(changed_write_notifications == 1,
                       "recovered storage output forces guest writeback and invalidation");
+#if defined(__linux__)
+                const uint64_t storage_snapshots_after =
+                    prosper::frontend::live_compute_storage_result_snapshot_bytes();
+                CHECK(storage_snapshots_after >=
+                          storage_snapshots_before + fill_guest_bytes,
+                      "post-failure repair replaces its invalidated exact result baseline");
+
+                auto recovered_write_watch = prosper::host::GuestWriteWatch::create(
+                    reinterpret_cast<uint64_t>(fill_guest), fill_guest_bytes);
+                const uint64_t recovered_snapshots_before =
+                    prosper::frontend::live_compute_storage_result_snapshot_bytes();
+#endif
+                uint32_t recovered_repeat_notifications = 0;
+                set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                    if (addr == fdst.gpu_addr && size == fdst.size)
+                        ++recovered_repeat_notifications;
+                });
+                CHECK(prosper::frontend::execute_live_compute_items({changed}),
+                      "recovered storage image repeats an identical dispatch");
+                set_guest_gpu_write_observer({});
+                CHECK(fill_equals(changed_expected),
+                      "post-recovery identical dispatch preserves the repaired guest result");
+                CHECK(recovered_repeat_notifications == 1,
+                      "post-recovery identical result still invalidates renderer aliases");
+#if defined(__linux__)
+                CHECK(static_cast<bool>(recovered_write_watch) &&
+                          recovered_write_watch.query() ==
+                              prosper::host::GuestWriteWatchQuery::Unchanged,
+                      "post-recovery identical result does not rewrite guest bytes");
+                CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
+                          recovered_snapshots_before,
+                      "post-recovery identical result does not recopy its repaired baseline");
+                recovered_write_watch.reset();
+#endif
             }
 
             // Guest memory no longer matches the retained source. Exact source validation must
             // force a writeback rather than trusting only the GPU-side output baseline.
+#if defined(__linux__)
+            // The production emulator installs the SIGSEGV write-fault handler; this compact test
+            // does not. Model its architectural CPU write through the ordinary pre-write hook so
+            // the armed page is made writable and marked Dirty before touching it.
+            prosper::host::guest_write_watch_notify_host_write(
+                reinterpret_cast<uint64_t>(fill_guest), 1);
+#endif
             fill_guest[0] ^= 0xff;
             uint32_t repaired_write_notifications = 0;
             set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
@@ -2354,6 +2410,33 @@ int main() {
                   "retained output repairs an externally changed guest mirror");
             CHECK(repaired_write_notifications == 1,
                   "externally changed guest mirror forces writeback and invalidation");
+
+#if defined(__linux__)
+            // Alternate two proven-full writers and verify that a changing target carries no exact
+            // source snapshot: its old seed is unobservable, and the next GPU result comparison is
+            // independently collision-free.
+            if (!changed_spirv.empty()) {
+                ComputeItem alternating_changed = it;
+                alternating_changed.spirv = changed_spirv;
+                alternating_changed.code_addr = 0x1122f12du;
+                alternating_changed.resources = std::make_shared<ShaderResourceTable>(fill_rt);
+                const uint64_t dynamic_snapshots_before =
+                    prosper::frontend::live_compute_storage_result_snapshot_bytes();
+                CHECK(prosper::frontend::execute_live_compute_items({alternating_changed}) &&
+                          prosper::frontend::execute_live_compute_items({it}),
+                      "alternating full-coverage storage results execute");
+                const uint64_t dynamic_snapshots_after =
+                    prosper::frontend::live_compute_storage_result_snapshot_bytes();
+                if (adaptive_storage_result_validation_enabled) {
+                    CHECK(dynamic_snapshots_after == dynamic_snapshots_before,
+                          "dynamic full-overwrite result avoids redundant snapshots");
+                } else {
+                    CHECK(dynamic_snapshots_after >=
+                              dynamic_snapshots_before + 2 * fill_guest_bytes,
+                          "disabled adaptive policy preserves exact dynamic snapshots");
+                }
+            }
+#endif
         }
 #if defined(__linux__)
         prosper::host::guest_write_watch_notify_direct_mapping_removed(

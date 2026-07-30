@@ -806,6 +806,12 @@ size_t compute_write_watch_promotion_budget_bytes() {
     return value;
 }
 
+bool adaptive_storage_result_validation_enabled() {
+    static const bool enabled =
+        std::getenv("PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION") == nullptr;
+    return enabled;
+}
+
 struct CachedComputePipeline {
     VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
     VkShaderModule shader = VK_NULL_HANDLE;
@@ -859,6 +865,10 @@ struct VulkanComputeContext {
     uint64_t image_cache_clock = 0;
     uint64_t image_validation_clock = 0;
     WriteWatchPromotionBudget write_watch_promotion_budget;
+    uint64_t image_source_snapshot_copies = 0;
+    uint64_t image_source_snapshot_bytes = 0;
+    uint64_t storage_result_snapshot_copies = 0;
+    uint64_t storage_result_snapshot_bytes = 0;
     VkDescriptorSetLayout compare_descriptor_layout = VK_NULL_HANDLE;
     VkShaderModule compare_shader = VK_NULL_HANDLE;
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
@@ -1209,6 +1219,19 @@ struct VulkanComputeContext {
                write_watch_promotion_budget.try_consume(source_bytes);
     }
 
+    void remember_image_source_snapshot(CachedComputeImage& cached,
+                                        const uint8_t* source, size_t bytes,
+                                        bool storage_result = false) {
+        if (!source) return;
+        cached.source_snapshot.assign(source, source + bytes);
+        ++image_source_snapshot_copies;
+        image_source_snapshot_bytes += bytes;
+        if (storage_result) {
+            ++storage_result_snapshot_copies;
+            storage_result_snapshot_bytes += bytes;
+        }
+    }
+
     bool make_buffer_cache_room(VkDeviceSize bytes) {
         const VkDeviceSize limit = persistent_compute_buffer_limit();
         if (bytes > limit) return false;
@@ -1461,7 +1484,8 @@ struct VulkanComputeContext {
 
     bool acquire_cached_image(const ComputeImageCacheKey& key, const uint8_t* source,
                               uint64_t validation_epoch, VkImage& image,
-                              VkDeviceMemory& memory, bool& upload_skipped) {
+                              VkDeviceMemory& memory, bool& upload_skipped,
+                              bool source_snapshot_required = true) {
         auto found = image_cache.find(key);
         if (found == image_cache.end()) return false;
         CachedComputeImage& cached = found->second;
@@ -1515,9 +1539,10 @@ struct VulkanComputeContext {
                     cached.write_watch_stable_validations, true,
                     compute_write_watch_promotion_validations());
             }
-        } else if (!upload_skipped && source) {
+        } else if (!upload_skipped && source && source_snapshot_required) {
             cached.write_watch_stable_validations = 0;
-            cached.source_snapshot.assign(source, source + key.guest_bytes);
+            remember_image_source_snapshot(
+                cached, source, key.guest_bytes, key.storage);
             // Do not trust the new mirror until the corresponding transfer completes. A failed
             // submit leaves this false, so the next use refreshes instead of skipping stale pixels.
             cached.content_valid = false;
@@ -1570,7 +1595,8 @@ struct VulkanComputeContext {
         if (!key.host_data)
             cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         if (source)
-            cached.source_snapshot.assign(source, source + key.guest_bytes);
+            remember_image_source_snapshot(
+                cached, source, key.guest_bytes, key.storage);
         auto [it, inserted] = image_cache.emplace(key, std::move(cached));
         if (!inserted) return false;
         image_cache_bytes += allocation_bytes;
@@ -1587,33 +1613,79 @@ struct VulkanComputeContext {
         if (found == image_cache.end()) return;
         CachedComputeImage& cached = found->second;
         cached.content_valid = false;
+        cached.graphics_export_valid = false;
+        cached.write_watch.reset();
+        if (!cached.source_snapshot.empty())
+            std::vector<uint8_t>().swap(cached.source_snapshot);
         // acquire_cached_image may otherwise reuse a same-submit validation result before checking
-        // content_valid. A failed post-submit readback invalidates both forms of authority.
+        // content_valid. A failed post-submit readback can leave the retained image/result buffer
+        // newer than guest memory, so every source/export authority must be rebuilt by the retry.
         cached.validation_epoch = 0;
         cached.validation_result = false;
     }
 
     void validate_cached_image_source(const ComputeImageCacheKey& key,
-                                      const uint8_t* current_source = nullptr) {
+                                      const uint8_t* current_source = nullptr,
+                                      bool result_unchanged = false,
+                                      bool source_snapshot_required = true) {
         auto found = image_cache.find(key);
         if (found == image_cache.end()) return;
         CachedComputeImage& cached = found->second;
+        const bool source_was_valid = cached.content_valid;
         // A storage dispatch replaces both the image and its guest-memory mirror. Retain those
         // result bytes as the exact comparison baseline; keeping the pre-dispatch input here could
         // misclassify a later guest write that restores that old input as "unchanged".
-        if (current_source)
-            cached.source_snapshot.assign(current_source,
-                                          current_source + key.guest_bytes);
         cached.content_valid = true;
         if (!key.host_data)
             cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         cached.write_watch_stable_validations = 0;
         if (key.host_data) {
+            if (current_source)
+                remember_image_source_snapshot(
+                    cached, current_source, key.guest_bytes, true);
             cached.write_watch.reset();
             return;
         }
-        if (cached.write_watch && cached.write_watch.rearm()) return;
+        if (!adaptive_storage_result_validation_enabled()) {
+            // Diagnostic/control path matching the pre-optimization policy: every successful
+            // storage writeback retains exact guest bytes, and only an already-existing generic
+            // source watch may be rearmed.
+            if (current_source)
+                remember_image_source_snapshot(
+                    cached, current_source, key.guest_bytes, true);
+            if (cached.write_watch && cached.write_watch.rearm()) return;
+            cached.write_watch.reset();
+            return;
+        }
+        if (source_snapshot_required) {
+            // Read/modify/write and partial storage targets still need the ordinary exact source
+            // contract because their prior guest bytes are observable by the next dispatch.
+            if (current_source)
+                remember_image_source_snapshot(
+                    cached, current_source, key.guest_bytes, true);
+            if (cached.write_watch && cached.write_watch.rearm()) return;
+            cached.write_watch.reset();
+            return;
+        }
+        // Storage-result adaptation deliberately uses exact bytes, not a page watch. Page-watch
+        // queries walk one record per host page and were slower than memcmp for Plucky's stable
+        // post-process targets. A repeated result keeps one collision-free baseline; an identical
+        // GPU skip never reaches this function, so that baseline is not recopied.
         cached.write_watch.reset();
+        if (!source_was_valid) {
+            // A failed dispatch/readback may have advanced the retained GPU result while leaving
+            // guest memory at the old baseline. The successful repair must replace that invalidated
+            // authority even when the GPU comparator calls the retried result "unchanged".
+            if (current_source)
+                remember_image_source_snapshot(
+                    cached, current_source, key.guest_bytes, true);
+        } else if (result_unchanged) {
+            if (current_source && cached.source_snapshot.empty())
+                remember_image_source_snapshot(
+                    cached, current_source, key.guest_bytes, true);
+        } else if (!cached.source_snapshot.empty()) {
+            std::vector<uint8_t>().swap(cached.source_snapshot);
+        }
     }
 
     bool cached_image_result_matches(const ComputeImageCacheKey& key,
@@ -3786,7 +3858,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         *r, static_cast<uint32_t>(guest_bytes), image_format);
                     bi.persistent = ctx.acquire_cached_image(
                         bi.cache_key, resource_bytes_for(r, guest_bytes), image_validation_epoch,
-                        bi.image, bi.memory, bi.upload_skipped);
+                        bi.image, bi.memory, bi.upload_skipped,
+                        !bi.seed_skip || !adaptive_storage_result_validation_enabled());
                     if (bi.persistent)
                         ctx.cached_image_result_buffer(
                             bi.cache_key, bi.exact_result_bytes, bi.result_baseline);
@@ -4546,8 +4619,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); ++i) {
             BoundImage& image = images[i];
             if (image.storage && image.cache_candidate && image.persistent &&
-                image.upload_skipped && image.result_baseline &&
-                image.exact_result_bytes && !(image.exact_result_bytes & 15u) && staging[i])
+                (image.upload_skipped ||
+                 (image.seed_skip && adaptive_storage_result_validation_enabled())) &&
+                image.result_baseline && image.exact_result_bytes &&
+                !(image.exact_result_bytes & 15u) && staging[i])
                 compare_targets.push_back({
                     staging[i], image.result_baseline, image.exact_result_bytes,
                     VK_ACCESS_TRANSFER_WRITE_BIT, nullptr, &image});
@@ -5229,7 +5304,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // GPU comparison is an exact word-for-word equality reduction and acquire_cached_image
             // independently proved that the guest mirror still contains that baseline. This path
             // therefore needs neither a large staging mapping nor a CPU memory pass.
-            if (bi.gpu_result_unchanged) {
+            if (bi.gpu_result_unchanged && bi.upload_skipped) {
                 if (trace)
                     std::fprintf(stderr,
                                  "[compute]   skipped GPU-identical storage writeback binding=%u "
@@ -5494,9 +5569,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             if (bi.cache_candidate) {
                 if (bi.persistent) {
-                    // Guest bytes now mirror the retained image again; discard the self-write
-                    // notification and arm the next external-write check from this exact state.
-                    ctx.validate_cached_image_source(bi.cache_key, destination);
+                    // Guest bytes now mirror the retained image again. A changing full-overwrite
+                    // target needs no source snapshot; the first repeated result retains one exact
+                    // baseline, and subsequent identical GPU skips do not recopy it.
+                    ctx.validate_cached_image_source(
+                        bi.cache_key, destination, bi.gpu_result_unchanged, !bi.seed_skip);
                 } else if (bi.image && bi.memory && bi.allocation_bytes &&
                            ctx.retain_image(bi.cache_key, bi.image, bi.memory,
                                             bi.allocation_bytes, destination)) {
@@ -5669,6 +5746,10 @@ uint64_t live_compute_sampled_image_upload_skips() {
     return g_sampled_image_upload_skips.load(std::memory_order_relaxed);
 }
 
+uint64_t live_compute_storage_result_snapshot_bytes() {
+    return g_live_compute_context ? g_live_compute_context->storage_result_snapshot_bytes : 0;
+}
+
 void live_compute_fail_next_storage_readback_for_test() {
     g_fail_next_storage_readback_for_test.store(true, std::memory_order_release);
 }
@@ -5830,6 +5911,15 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
                          pool.cached_allocations,
                          static_cast<double>(pool.cached_bytes) / (1024.0 * 1024.0),
                          (unsigned long long)pool.discarded);
+            std::fprintf(stderr,
+                         "[render-timing] compute_image_source snapshots=%llu %.1f MiB "
+                         "storage_results=%llu %.1f MiB\n",
+                         (unsigned long long)context.image_source_snapshot_copies,
+                         static_cast<double>(context.image_source_snapshot_bytes) /
+                             (1024.0 * 1024.0),
+                         (unsigned long long)context.storage_result_snapshot_copies,
+                         static_cast<double>(context.storage_result_snapshot_bytes) /
+                             (1024.0 * 1024.0));
             std::fprintf(stderr,
                          "[render-window] compute calls=%llu dispatches=%.1f avg_ms=%.2f\n",
                          (unsigned long long)window.calls,

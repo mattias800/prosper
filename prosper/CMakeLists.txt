@@ -805,6 +805,9 @@ if(TARGET prosper_core)
       add_executable(test_game_compute tests/test_game_compute.cpp)
       target_link_libraries(test_game_compute PRIVATE prosper_live_renderer)
       add_test(NAME game_compute_exec COMMAND test_game_compute)
+      add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
+      set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
+        ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
     else()
       message(STATUS "Vulkan not found — Windows boot_trace built without the live renderer")
     endif()
@@ -937,6 +940,9 @@ if(TARGET prosper_core)
       add_executable(test_game_compute tests/test_game_compute.cpp)
       target_link_libraries(test_game_compute PRIVATE prosper_live_renderer)
       add_test(NAME game_compute_exec COMMAND test_game_compute)
+      add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
+      set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
+        ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
 
       # Prove our own SPIR-V emitter produces valid, correct, runnable SPIR-V (execution-differential).
       add_executable(test_spirv_builder tests/test_spirv_builder.cpp)
