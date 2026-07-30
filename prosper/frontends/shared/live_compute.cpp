@@ -5452,7 +5452,8 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
         sampled_resource.cls != prosper::gpu::ResourceClass::Texture ||
         sampled_resource.host_data || !guest_bytes || guest_bytes > UINT32_MAX ||
         sampled_resource.img_dim != 1 || sampled_resource.depth != 1 ||
-        sampled_resource.in_mip_tail || sampled_resource.srgb ||
+        sampled_resource.declared_mip_levels != 1 || sampled_resource.in_mip_tail ||
+        sampled_resource.srgb ||
         sampled_resource.depth_compare)
         return false;
     const uint32_t components = sampled_resource.num_components

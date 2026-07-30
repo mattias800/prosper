@@ -1890,8 +1890,14 @@ int main() {
                 const bool rejected_srgb =
                     !prosper::frontend::import_live_compute_storage_image(
                         mismatched_fill, import_dst.size, rejected_import);
-                CHECK(rejected_extent && rejected_layout && rejected_replay && rejected_srgb,
-                      "compute-image import requires full identity and keeps replay/sRGB fallback");
+                mismatched_fill = sampled_fill;
+                mismatched_fill.declared_mip_levels = 2;
+                const bool rejected_mips =
+                    !prosper::frontend::import_live_compute_storage_image(
+                        mismatched_fill, import_dst.size, rejected_import);
+                CHECK(rejected_extent && rejected_layout && rejected_replay && rejected_srgb &&
+                          rejected_mips,
+                      "compute-image import requires full identity and keeps replay/mip/sRGB fallback");
                 compute_import = {};
                 // This binary does not install the emulator's SIGSEGV write-fault handler. Mark the
                 // same page dirty through the DMA/GPU side of the watch API; the importer must not

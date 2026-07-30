@@ -1703,7 +1703,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             !getenv("PROSPER_NO_DIRECT_COMPUTE_IMAGE_BIND") &&
                             !has_live_rtt && !has_ds_live && r.cls == RC::Texture &&
                             r.img_dim == 1u && r.depth == 1u && !r.in_mip_tail &&
-                            !r.srgb && !r.depth_compare && !r.host_data &&
+                            r.declared_mip_levels == 1u && !r.srgb &&
+                            !r.depth_compare && !r.host_data &&
                             persistent_source_size &&
                             (!r.compression_enabled || persistent_dcc_uncompressed) &&
                             compute_image_format != VK_FORMAT_UNDEFINED;
