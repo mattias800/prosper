@@ -2912,6 +2912,21 @@ int main() {
            got63.size()==N?got63[5]:-1, exp63[5], got63.size()==N?got63[70]:-1, exp63[70]);
     CHECK(got63.size()==N && bad63==0, "recompiled kernel 63 (v_mbcnt full-exec = localid) correct");
 
+    ComputeShaderConfig native_cfg63;
+    native_cfg63.local_x = 8;
+    native_cfg63.local_y = 8;
+    native_cfg63.wave_size = 64;
+    native_cfg63.native_subgroup_size = 64;
+    const std::vector<uint32_t> native_spv63 = recompile_compute(
+        code63, std::size(code63), nullptr, native_cfg63);
+    CHECK(compute_shader_prefers_native_multiwave(code63, std::size(code63)) &&
+              !compute_shader_prefers_native_multiwave(code62, std::size(code62)),
+          "multi-wave policy recognizes scan-heavy shaders without title-specific identity");
+    CHECK(!native_spv63.empty() && count_spirv_opcode(native_spv63, 349) == 2,
+          "straight-line exact-wave MBCNT lowers both halves to subgroup scans");
+    CHECK(count_spirv_opcode(native_spv63, 224) == 0,
+          "straight-line exact-wave MBCNT emits no workgroup control barrier");
+
     // Kernel 64: v_mbcnt with DIVERGENT exec — the real compaction use. v_cmpx narrows exec to (a>thr);
     // then mbcnt gives each active lane its index among active lanes. Even lanes active (a=1>0.5), odd
     // inactive (a=0): active lane L -> L/2 (count of active lanes below); inactive lanes keep 0 (the
@@ -4916,6 +4931,20 @@ int main() {
         CHECK(gotStructuredWave.size() == 128 && badStructuredWave == 0,
               "#1373: structured branch performs one exact 64-lane guest-wave vote");
 
+        ComputeShaderConfig nativeStructuredWaveConfig;
+        nativeStructuredWaveConfig.local_x = 8;
+        nativeStructuredWaveConfig.local_y = 8;
+        nativeStructuredWaveConfig.wave_size = 64;
+        nativeStructuredWaveConfig.native_subgroup_size = 64;
+        const std::vector<uint32_t> nativeStructuredWaveSpv = recompile_compute(
+            structured_wave_cs, std::size(structured_wave_cs), nullptr,
+            nativeStructuredWaveConfig);
+        CHECK(!nativeStructuredWaveSpv.empty() &&
+                  count_spirv_opcode(nativeStructuredWaveSpv, 335) >= 1,
+              "structured exact-wave branch lowers its vote to subgroup-any");
+        CHECK(count_spirv_opcode(nativeStructuredWaveSpv, 224) == 1,
+              "structured exact-wave branch retains only its guest workgroup barrier");
+
         // UE4 reduction kernels also use sequential top-level EXEC tests separated by workgroup
         // barriers, with no loop in the shader. A scalar write in each arm makes the result visible
         // to every invocation in the complete guest wave, not merely the host subgroup containing
@@ -4955,6 +4984,80 @@ int main() {
             if (gotBarrierReduction[i] != expBarrierReduction[i]) ++badBarrierReduction;
         CHECK(gotBarrierReduction.size() == 128 && badBarrierReduction == 0,
               "barrier-separated reductions perform independent exact 64-lane guest-wave votes");
+
+        // The automatic multi-wave policy must follow translated structure, not raw opcode counts.
+        // Four valid sequential top-level wave votes each cost two synchronized scratch barriers in
+        // portable lowering and none in exact-subgroup lowering. The two-vote kernel above remains
+        // below the conservative threshold.
+        const uint32_t vote_heavy_policy_cs[] = {
+            0xBE800380u,               //  0: s_mov_b32 s0, 0
+            0xBE810380u,               //  1: s_mov_b32 s1, 0
+            0x7DA20200u,               //  2: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880001u,               //  3: s_cbranch_execz +1 -> 5
+            0xBE800381u,               //  4: s_mov_b32 s0, 1
+            0xBEFE04C1u,               //  5: s_mov_b64 exec, -1
+            0xBF8A0000u,               //  6: s_barrier
+            0x7DA20600u,               //  7: v_cmpx_lt_u32 exec, s0, v3
+            0xBF880001u,               //  8: s_cbranch_execz +1 -> 10
+            0xBE810382u,               //  9: s_mov_b32 s1, 2
+            0xBEFE04C1u,               // 10: s_mov_b64 exec, -1
+            0xBF8A0000u,               // 11: s_barrier
+            0x7DA20200u,               // 12: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880001u,               // 13: s_cbranch_execz +1 -> 15
+            0xBE800383u,               // 14: s_mov_b32 s0, 3
+            0xBEFE04C1u,               // 15: s_mov_b64 exec, -1
+            0xBF8A0000u,               // 16: s_barrier
+            0x7DA20600u,               // 17: v_cmpx_lt_u32 exec, s0, v3
+            0xBF880001u,               // 18: s_cbranch_execz +1 -> 20
+            0xBE810384u,               // 19: s_mov_b32 s1, 4
+            0xBEFE04C1u,               // 20: s_mov_b64 exec, -1
+            0xBF8A0000u,               // 21: s_barrier
+            0x80020100u,               // 22: s_add_u32 s2, s0, s1
+            0x7E040C02u,               // 23: v_cvt_f32_u32 v2, s2
+            0xBF810000u,               // 24: s_endpgm
+        };
+        ComputeShaderConfig portableVotePolicyConfig;
+        portableVotePolicyConfig.local_x = 8;
+        portableVotePolicyConfig.local_y = 8;
+        portableVotePolicyConfig.wave_size = 64;
+        ComputeShaderConfig nativeVotePolicyConfig = portableVotePolicyConfig;
+        nativeVotePolicyConfig.native_subgroup_size = 64;
+        const std::vector<uint32_t> portableVotePolicySpv = recompile_compute(
+            vote_heavy_policy_cs, std::size(vote_heavy_policy_cs), nullptr,
+            portableVotePolicyConfig);
+        const std::vector<uint32_t> nativeVotePolicySpv = recompile_compute(
+            vote_heavy_policy_cs, std::size(vote_heavy_policy_cs), nullptr,
+            nativeVotePolicyConfig);
+        const uint32_t linearized_vote_policy_cs[] = {
+            0xBF8A0000u,               //  0: s_barrier (uniform, before all guarded work)
+            0x7DA20200u,               //  1: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880007u,               //  2: s_cbranch_execz +7 -> 10 (safe guard to end)
+            0x7DA20200u,               //  3: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880005u,               //  4: s_cbranch_execz +5 -> 10 (safe guard to end)
+            0x7DA20200u,               //  5: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880003u,               //  6: s_cbranch_execz +3 -> 10 (safe guard to end)
+            0x7DA20200u,               //  7: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880001u,               //  8: s_cbranch_execz +1 -> 10 (safe guard to end)
+            0x7E040C00u,               //  9: v_cvt_f32_u32 v2, s0
+            0xBF810000u,               // 10: s_endpgm
+        };
+        const std::vector<uint32_t> linearizedVotePolicySpv = recompile_compute(
+            linearized_vote_policy_cs, std::size(linearized_vote_policy_cs), nullptr,
+            portableVotePolicyConfig);
+        CHECK(compute_shader_prefers_native_multiwave(
+                  vote_heavy_policy_cs, std::size(vote_heavy_policy_cs)) &&
+                  !compute_shader_prefers_native_multiwave(
+                      barrier_reduction_cs, std::size(barrier_reduction_cs)) &&
+                  !compute_shader_prefers_native_multiwave(
+                      linearized_vote_policy_cs, std::size(linearized_vote_policy_cs)),
+              "multi-wave vote policy counts accepted structured wave branches");
+        CHECK(!portableVotePolicySpv.empty() && !nativeVotePolicySpv.empty() &&
+                  count_spirv_opcode(portableVotePolicySpv, 224) ==
+                      count_spirv_opcode(nativeVotePolicySpv, 224) + 8,
+              "multi-wave vote policy proves exact lowering removes eight scratch barriers");
+        CHECK(!linearizedVotePolicySpv.empty() &&
+                  count_spirv_opcode(linearizedVotePolicySpv, 224) == 1,
+              "raw branch density alone does not opt a linearized shader into multi-wave mode");
 
         std::vector<uint32_t> divergentBarrierStructuredWave(
             std::begin(structured_wave_cs), std::end(structured_wave_cs));
