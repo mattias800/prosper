@@ -3312,7 +3312,7 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
             mask_dst = in.dst.kind == OperandKind::SGPR ? in.dst.value : 106;
             writes_b32_mask = true;
         } else if (in.fmt == Rdna2Format::SOP1 &&
-                   (in.opcode == 0x03 || in.opcode == 0x09 ||
+                   (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
                     in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) {
             writes_b32_mask = tracked_mask_source(in.src[0]) && in.dst.value != 127;
             mask_dst = in.dst.value;
@@ -4609,7 +4609,7 @@ bool has_unpersisted_b32_mask_lifetime(const std::vector<Rdna2Inst>& ins,
         if (in.is_end || in.pc < lo || in.pc >= hi || in.fmt != Rdna2Format::SOP1)
             continue;
         if (in.opcode == 0x09) return true; // s_wqm_b32 creates/consumes the same width state
-        if (in.opcode != 0x03) continue;
+        if (in.opcode != 0x03 && in.opcode != 0x07) continue;
         const bool register_source = in.src[0].kind == OperandKind::SGPR ||
                                      in.src[0].kind == OperandKind::Special;
         if ((register_source && possible_mask_sources.contains(in.src[0].value)) ||
@@ -9988,7 +9988,7 @@ bool emit_cfg_state_machine(
 
                 bool writes_b32_mask = false;
                 if (in.fmt == Rdna2Format::SOP1 &&
-                    (in.opcode == 0x03 || in.opcode == 0x09 ||
+                    (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
                      in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) {
                     const bool source_mask = in.src[0].value == 126 ||
                         ((in.src[0].kind == OperandKind::SGPR ||

@@ -499,6 +499,21 @@ int main() {
                              compute_cfg_dispatch_saved_mask_not.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "the dispatcher inverts a saved Wave32 SGPR mask before recombining VCC");
+    std::vector<uint32_t> compute_cfg_dispatch_saved_mask_not_boundary = {
+        0xBE94037Eu, // s_mov_b32 s20, exec_lo (complete Wave32 mask)
+        0xBE950714u, // s_not_b32 s21, s20
+        0xBF070000u, // s_cmp_lg_u32 s0, s0 (false, but creates a conditional CFG edge)
+        0xBF850001u, // s_cbranch_scc1 +1 -> consumer
+        0xBE960380u, // unreachable s_mov_b32 s22, 0
+        0xBEFE0315u, // s_mov_b32 exec_lo, s21 (mask-only consumer)
+    };
+    compute_cfg_dispatch_saved_mask_not_boundary.insert(
+        compute_cfg_dispatch_saved_mask_not_boundary.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_saved_mask_not_boundary.data(),
+                             compute_cfg_dispatch_saved_mask_not_boundary.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the dispatcher persists a saved Wave32 mask inverted before a block boundary");
     wave32_dispatch_config.native_subgroup_size = 0;
     // The dispatcher includes branch-target/fallthrough blocks even when no entry path can reach
     // them. This dead block overwrites half of direct V# s[8:11] and then targets the live entry;
