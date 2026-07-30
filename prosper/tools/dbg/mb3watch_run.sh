@@ -3,7 +3,7 @@
 # head slot (base+0x20) the instant getspecific/setspecific hands the guest that base — before any
 # store — to catch the off-by-one corruptor in the act. Vars live in this file (safe from cmdline
 # stripping). Usage: mb3watch_run.sh <first> <count> [extra env VAR=VAL ...]
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a48ff9e03b626cc45/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a48ff9e03b626cc45/prosper"
 cd "$WT" || exit 1
 FIRST=${1:-1}; COUNT=${2:-1}; shift 2 2>/dev/null
 SCRIPT="15:cross;20:start;25:cross;30:start;35:cross;40:cross;45:start;50:cross;60:cross;70:start;80:cross;90:cross;100:cross;110:cross;120:cross;130:cross"

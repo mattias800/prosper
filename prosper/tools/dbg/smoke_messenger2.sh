@@ -1,8 +1,8 @@
 #!/bin/bash
 # Messenger render smoke (this worktree): must reach 1000+ frames with 0 faults.
-cd /mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a36ca69a115e7c61a/prosper || exit 1
+cd "${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a36ca69a115e7c61a/prosper" || exit 1
 PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER_GFXLOG=1 \
-  timeout 240 ./build-linux/boot_trace /mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0 > /root/smoke2.log 2>&1
+  timeout 240 ./build-linux/boot_trace "${PROSPER_REPO_ROOT:?set to your checkout root}/PPSA24651-app0" > /root/smoke2.log 2>&1
 echo "rc=$?"
 echo "flips=$(grep -ac GpuFlip /root/smoke2.log)"
 echo "presented=$(grep -ac presented /root/smoke2.log)"

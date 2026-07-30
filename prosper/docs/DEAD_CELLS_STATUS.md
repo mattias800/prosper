@@ -114,7 +114,7 @@ Build in WSL from the repository root. Adjust the dump path if needed:
 ```bash
 cd prosper
 cmake -S . -B build-linux \
-  -DGAME_DUMP=/mnt/c/Users/matti/repos/ps5ys/PPSA15552-app0
+  -DGAME_DUMP=<DUMP_ROOT>/PPSA15552-app0
 cmake --build build-linux -j8 --target boot_trace gpu_timeline gpu_replay
 ```
 
@@ -143,7 +143,7 @@ PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES=8 \
 PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES=8 \
 PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1 \
   ./build-linux/boot_trace \
-  /mnt/c/Users/matti/repos/ps5ys/PPSA15552-app0 \
+  <DUMP_ROOT>/PPSA15552-app0 \
   > /tmp/dead-cells-current.log 2>&1
 ```
 

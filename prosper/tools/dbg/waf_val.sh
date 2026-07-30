@@ -3,7 +3,7 @@
 # timing (no MB3WATCH). Tallies ALL fatal signatures (Canary / unrecognized block / worker-fault /
 # 0x20015f00) + WAF suppression activity + DOLL progression. Vars live in-file (cmdline-strip safe).
 # Usage: waf_val.sh <first> <N> <timeout_s> [GUARD]   (GUARD=0 for the session-10 A/B baseline)
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a8f10a7598f626404/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a8f10a7598f626404/prosper"
 cd "$WT" || exit 1
 FIRST=${1:-1}; N=${2:-4}; TMO=${3:-120}; GUARD=${4:-1}
 SCRIPT="15:cross;20:start;25:cross;30:start;35:cross;40:cross;45:start;50:cross;60:cross;70:start;80:cross;90:cross;100:cross;110:cross;120:cross;130:cross"

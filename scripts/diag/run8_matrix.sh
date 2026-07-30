@@ -2,7 +2,7 @@
 # DOLL progression probe, run 8: pad-connected matrix. 8a = PAD_PRESS only; 8b = PAD_PRESS+NETCTL_CB.
 # Usage: run8_matrix.sh a|b
 set -u
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-aa922b2bc59375888
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-aa922b2bc59375888"
 V=$1
 cp -f "$WT/prosper/build-linux/boot_trace" /root/bt_diag_$V
 DUMP=/root/PPSA17942-app0

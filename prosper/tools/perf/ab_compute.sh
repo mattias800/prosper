@@ -9,7 +9,7 @@
 #
 # Usage: ab_compute.sh <switch=value> <route.pad> <dump-dir> [reps] [seconds]
 #   e.g. ab_compute.sh PROSPER_NO_DIRECT_RTT_BIND=1 scripts/blasphemous2/title-screen-idle.pad \
-#          /home/mattias800/repos/ps5ys/PPSA13579-app0 3 60
+#          <REPO_ROOT>/PPSA13579-app0 3 60
 # The switch names the OFF (baseline) condition; ON is the same run with the switch unset.
 set -u
 SWITCH="${1:?switch=value naming the OFF condition}"

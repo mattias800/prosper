@@ -2,7 +2,7 @@
 # #312 menu-drive repro + inline summary. Usage: run312.sh <tag> [extra env as VAR=VAL ...]
 # Log: /root/doll312x_<tag>.log
 TAG=$1; shift
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a8ffd958941d2a852/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a8ffd958941d2a852/prosper"
 LOG=/root/doll312x_${TAG}.log
 cd "$WT" || exit 1
 timeout 170 env PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_FILELOG=1 PROSPER_PROGRESS=5 \

@@ -247,7 +247,7 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   ```bash
   git worktree add .claude/worktrees/<your-slug> -b <your-branch>   # isolated tree + branch
   # build in a worktree-local build dir; pass -DGAME_DUMP=... (dump lives outside the worktree)
-  cmake -S prosper -B prosper/build-linux -DGAME_DUMP=/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0
+  cmake -S prosper -B prosper/build-linux -DGAME_DUMP=<DUMP_ROOT>/PPSA24651-app0
   ```
   Never `cd` back to the main repo root to run git or builds. If you MUST touch the main checkout,
   assume another agent is actively working there — check `git status` first and don't reset/stash/
@@ -261,9 +261,9 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   only for cmake/build/run**. Don't mix the two on one repo (it also avoids CRLF/filemode index churn).
 - **Build/run in WSL Ubuntu-24.04 as root.** Build dir `prosper/build-linux` (Linux, primary),
   `prosper/build-windows` (Windows/MinGW, secondary). Game dump at
-  `/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0` (gitignored — **never commit it**).
+  `<DUMP_ROOT>/PPSA24651-app0` (gitignored — **never commit it**).
   ```bash
-  cd /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
+  cd <REPO_ROOT>/prosper/build-linux
   cmake --build . -j8 && ctest        # 99/99 expected green on Linux
   ```
 - **Write run artifacts and build temporaries to the real disk, never `/tmp`.** On the Linux box `/tmp`

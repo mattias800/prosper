@@ -1,5 +1,5 @@
 #!/bin/bash
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a2d51084866d8d045/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a2d51084866d8d045/prosper"
 PID=$(cat /root/pid232.txt)
 kill -0 $PID 2>/dev/null || { echo "DEAD pid=$PID"; exit 1; }
 echo "probing pid=$PID"

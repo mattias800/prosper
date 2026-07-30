@@ -1,6 +1,6 @@
 #!/bin/bash
 # Issue #232: catch the stack-smash abort with a real core dump.
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a36ca69a115e7c61a/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a36ca69a115e7c61a/prosper"
 cd "$WT" || exit 1
 echo '/root/cores/core.%p' > /proc/sys/kernel/core_pattern
 mkdir -p /root/cores; rm -f /root/cores/core.*

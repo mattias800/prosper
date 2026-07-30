@@ -2,7 +2,7 @@
 # DOLL progression probe, run 3: WITH live renderer (llvmpipe) — quantify presented-frame
 # throughput and whether render throttling changes guest progression. PADLOG shows input polling.
 set -u
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-aa922b2bc59375888
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-aa922b2bc59375888"
 cp -f "$WT/prosper/build-linux/boot_trace" /root/bt_diag
 BT=/root/bt_diag
 DUMP=/root/PPSA17942-app0

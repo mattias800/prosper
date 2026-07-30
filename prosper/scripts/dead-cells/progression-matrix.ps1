@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Dump = 'C:\Users\matti\repos\ps5ys\PPSA15552-app0',
+    [string]$Dump,
     [string]$BuildDir,
     [string]$OutputDir,
     [ValidateSet('all', 'headless-full', 'app-full', 'headless-publish-10',
@@ -19,6 +19,9 @@ if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core') {
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
 $prosperRoot = Join-Path $repoRoot 'prosper'
 if (-not $BuildDir) { $BuildDir = Join-Path $prosperRoot 'build-mingw-app' }
+# Default the dump to the checkout root, which is where the gitignored PPSA* dirs live, rather than
+# hard-coding one machine's absolute path into a public repository.
+if (-not $Dump) { $Dump = Join-Path $repoRoot 'PPSA15552-app0' }
 $BuildDir = [IO.Path]::GetFullPath($BuildDir)
 $Dump = (Resolve-Path -LiteralPath $Dump).Path
 

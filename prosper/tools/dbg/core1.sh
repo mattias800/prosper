@@ -1,5 +1,5 @@
 #!/bin/bash
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a36ca69a115e7c61a/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a36ca69a115e7c61a/prosper"
 CORE=$(ls -t /root/cores/core.* | head -1)
 gdb "$WT/build-linux/boot_trace" "$CORE" -batch \
   -ex "set pagination off" \

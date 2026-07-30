@@ -1,7 +1,7 @@
 #!/bin/bash
 # Issue #232 session 5: boot DOLL, capture the unimplemented-service call log + draw evidence.
 # Usage: run232svc.sh <logname> [extra soak iterations]
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a2d51084866d8d045/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a2d51084866d8d045/prosper"
 LOG=/root/${1:-d232svc}.log
 ITERS=${2:-8}
 cd "$WT" || exit 1

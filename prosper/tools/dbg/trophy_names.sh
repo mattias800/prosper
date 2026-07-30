@@ -1,7 +1,7 @@
 #!/bin/bash
 # Brute-force candidate names for the NpTrophy2 NIDs via the nid test tool if it supports hashing,
 # else compile a one-off hasher against nid.cpp.
-cd /mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-ae005ba42de93cd40/prosper
+cd "${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-ae005ba42de93cd40/prosper"
 cat > /tmp/nidhash.cpp << "EOF"
 #include <cstdio>
 #include <string>

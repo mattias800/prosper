@@ -142,7 +142,7 @@ cmake -S prosper -B prosper/build-mingw-app -G Ninja `
   -DCMAKE_BUILD_TYPE=RelWithDebInfo `
   -DCMAKE_C_COMPILER="$wlb\gcc.exe" -DCMAKE_CXX_COMPILER="$wlb\g++.exe" `
   -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON `
-  -DGAME_DUMP=C:/Users/matti/repos/ps5ys/PPSA24651-app0
+  -DGAME_DUMP=<DUMP_ROOT>/PPSA24651-app0
 cmake --build prosper/build-mingw-app -j 8
 ```
 
@@ -152,7 +152,7 @@ Smoke-test the actual SDL window and Vulkan swapchain without a game, then run t
 prosper/build-mingw-app/prosper-app.exe --test-pattern --frames 120
 $env:PROSPER_GUEST_FS = '1'
 $env:PROSPER_GUEST_ARGS = '-force-gfx-direct'
-prosper/build-mingw-app/prosper-app.exe --dump C:/Users/matti/repos/ps5ys/PPSA24651-app0
+prosper/build-mingw-app/prosper-app.exe --dump <DUMP_ROOT>/PPSA24651-app0
 ```
 
 For unattended evidence, `screenshot.exe` uses Windows Imaging Component to write normal PNGs and
@@ -162,10 +162,10 @@ fully lit first-level milestones:
 
 ```powershell
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$env:PROSPER_PAD_SCRIPT = '@C:/Users/matti/repos/ps5ys/prosper/scripts/messenger/reach-first-level-windows.pad'
+$env:PROSPER_PAD_SCRIPT = '@<REPO_ROOT>/prosper/scripts/messenger/reach-first-level-windows.pad'
 $env:PROSPER_PAD_SCRIPT_LOG = '1'
 $env:PROSPER_SAVEDATA_DIR = "$env:TEMP/prosper-messenger-$stamp"
-prosper/build-mingw-app/screenshot.exe C:/Users/matti/repos/ps5ys/PPSA24651-app0 `
+prosper/build-mingw-app/screenshot.exe <DUMP_ROOT>/PPSA24651-app0 `
   --seconds 10 --count 36 --out "$env:USERPROFILE/Downloads/messenger-windows-$stamp" `
   --min-distinct-frames 25 --min-pixel-distinct-frames 10 --require-composited-frame
 ```
@@ -186,11 +186,11 @@ This smaller Git Bash recipe remains useful when only `boot_trace` and verbose c
 needed. It shares the same compiler and Vulkan SDK prerequisites as the full build above:
 
 ```bash
-WLB="/c/Users/matti/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin"
+WLB="$HOME/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin"
 export PATH="$WLB:$PATH"   # + the Ninja package bin
 cmake -S prosper -B prosper/build-mingw-vk -G Ninja -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_C_COMPILER="$WLB/gcc.exe" -DCMAKE_CXX_COMPILER="$WLB/g++.exe" \
-  -DGAME_DUMP=/c/Users/matti/repos/ps5ys/PPSA24651-app0     # VULKAN_SDK must be in env
+  -DGAME_DUMP=<DUMP_ROOT>/PPSA24651-app0     # VULKAN_SDK must be in env
 cmake --build prosper/build-mingw-vk --target boot_trace -j8
 ```
 
@@ -199,7 +199,7 @@ Run from Git Bash (guest-fs is default-on on Windows):
 ```bash
 cd prosper/build-mingw-vk
 PROSPER_GFXLOG=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
-  PROSPER_FRAME_DIR=/some/dir ./boot_trace.exe /c/Users/matti/repos/ps5ys/PPSA24651-app0
+  PROSPER_FRAME_DIR=/some/dir ./boot_trace.exe <DUMP_ROOT>/PPSA24651-app0
 ```
 
 Performance diagnostics: set `PROSPER_RENDER_TIMING=1` for aggregate graphics/compute stage timings, or

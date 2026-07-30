@@ -1,7 +1,7 @@
 #!/bin/bash
 # #312 free-canary guard validation: N guard-ON runs, longer timeout, check for fatal/wedge + how far
 # DOLL gets. Vars live in the file (safe from cmdline stripping). Usage: poolstomp_val.sh <N> <timeout_s>
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a5d8efe035816c6c7/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a5d8efe035816c6c7/prosper"
 cd "$WT" || exit 1
 N=${1:-4}; TMO=${2:-135}; GUARD=${3:-1}
 SCRIPT="15:cross;20:start;25:cross;30:start;35:cross;40:cross;45:start;50:cross;60:cross;70:start;80:cross;90:cross;100:cross;110:cross;120:cross;130:cross"

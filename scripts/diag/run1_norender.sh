@@ -3,7 +3,7 @@
 # Boots for DUR seconds with file/event logging + the PROSPER_PROGRESS heartbeat, samples /proc
 # every 20 s, then prints a bucketed progression analysis. Run inside WSL Ubuntu-24.04 as root.
 set -u
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-aa922b2bc59375888
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-aa922b2bc59375888"
 BT="$WT/prosper/build-linux/boot_trace"
 DUMP=/root/PPSA17942-app0
 DUR=${DUR:-420}

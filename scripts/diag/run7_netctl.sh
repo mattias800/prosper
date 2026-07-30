@@ -3,7 +3,7 @@
 # callback (PROSPER_NETCTL_CB=1) and watch whether the boot flow advances (new file IO after the
 # t=6s wall, pad open, sms_opening movie open, new NIDs).
 set -u
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-aa922b2bc59375888
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-aa922b2bc59375888"
 cp -f "$WT/prosper/build-linux/boot_trace" /root/bt_diag
 DUMP=/root/PPSA17942-app0
 DUR=${DUR:-300}
