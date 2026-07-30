@@ -283,6 +283,10 @@ int main() {
         volatile uint32_t* cell = (volatile uint32_t*)(uintptr_t)committed;
         *cell = 0x343343u;
         CHECK(*cell == 0x343343u, "the committed page is writable");
+        CHECK(prosper_reserved_range_state(base) == 1 &&
+                  prosper_reserved_range_state(middle) == 2 &&
+                  prosper_reserved_range_state(middle + page) == 1,
+              "ordered lazy-commit lookup preserves split reservation states");
     }
     memset(info, 0, sizeof(info));
     CHECK(query(middle, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
@@ -332,6 +336,10 @@ int main() {
           "range protection keeps the trailing page uncommitted");
 
     CHECK(unmap(base, len, 0, 0, 0, 0) == 0, "the test reservation unmaps cleanly");
+    CHECK(prosper_reserved_range_state(base) == 0 &&
+              prosper_reserved_range_state(middle) == 0 &&
+              prosper_reserved_range_state(middle + page) == 0,
+          "ordered lazy-commit lookup rejects every unmapped split");
     protection_start = UINT64_MAX;
     protection_end = UINT64_MAX;
     protection_value = UINT32_MAX;
