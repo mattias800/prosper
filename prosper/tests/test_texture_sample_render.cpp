@@ -31,6 +31,10 @@ int main() {
               backend_submission_state(true, true) == BackendSubmissionState::Complete &&
               backend_submission_state(true, false) == BackendSubmissionState::Pending,
           "submission cleanup distinguishes never-submitted, completed, and pending work");
+    CHECK(prosper::test::backend_timestamp_delta(0xfdu, 0x03u, 8) == 6u &&
+              prosper::test::backend_timestamp_delta(11u, 29u, 64) == 18u &&
+              prosper::test::backend_timestamp_delta(11u, 29u, 0) == 0u,
+          "device timestamp deltas handle valid-bit wrap and unsupported queues");
 
     {
         bool speculative_state_valid = true;
@@ -421,6 +425,14 @@ int main() {
                   consumer_timing.command_buffers == 2 &&
                   consumer_timing.queue_submits == 1 && consumer_timing.fence_waits == 1,
               "batched producer-to-sampler output matches synchronous output with one submit/wait");
+        const auto& timing_ctx = prosper::test::render_vk_ctx();
+        const bool gpu_timestamps_supported = timing_ctx.timestamp_valid_bits != 0 &&
+                                              timing_ctx.timestamp_period_ns > 0.0;
+        CHECK(!gpu_timestamps_supported ||
+                  (consumer_timing.gpu_timestamp_samples == 2 &&
+                   consumer_timing.gpu_execute_ms >= 0.0 &&
+                   consumer_timing.gpu_execute_ms <= consumer_timing.gpu_wait_ms + 0.25),
+              "batched timing reports one bounded device interval per command buffer");
 
         prosper::test::BackendDraw add_green;
         add_green.vs = vert; add_green.fs = green; add_green.ps = &additive;
