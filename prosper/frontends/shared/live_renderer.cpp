@@ -347,6 +347,7 @@ struct DecodedTexture {
     uint32_t output_height = 0;
     bool narrow = false;
     uint64_t persistent_id = 0;
+    uint64_t persistent_version = 0;
 };
 
 struct PersistentDecodedTexture {
@@ -360,6 +361,7 @@ struct PersistentDecodedTexture {
     bool narrow = false;
     uint64_t last_use = 0;
     uint64_t persistent_id = 0;
+    uint64_t persistent_version = 0;
     prosper::gpu::GuestGpuWriteSnapshot validation_snapshot;
     prosper::host::GuestWriteWatch source_watch;
     uint32_t source_watch_dirty_count = 0;
@@ -1644,6 +1646,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             r.format == prosper::gpu::DataFormat::Unorm8 &&
                             r.num_components == 1 && r.tile_mode == 0u &&
                             !r.compression_enabled && !linear_padded_read;
+                        // AvPlayer's exact chroma plane is already tight interleaved RG8. Keeping it
+                        // native halves the upload bytes and avoids the CPU RGBA expansion on every
+                        // decoded frame while the descriptor swizzle still preserves U/V semantics.
+                        const bool native_rg8_sampled = avplayer_chroma_layout;
                         // Storage-image atomics require a typed integer Vulkan view. Keep R32_UINT
                         // texels byte-exact through the existing 4-B read/detile path instead of
                         // silently normalizing the view to RGBA8_UNORM.
@@ -1652,7 +1658,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             r.format == prosper::gpu::DataFormat::Uint32 &&
                             r.num_components == 1 && !r.compression_enabled;
                         const bool persistent_source_matches_pixels =
-                            native_r8_sampled ||
+                            native_r8_sampled || native_rg8_sampled ||
                             (persistent_unorm8_texture && r.num_components == 4 &&
                              !linear_padded_read &&
                              !prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
@@ -2002,7 +2008,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     persistent_reuse = {cached->second.pixels.data(),
                                                         cached->second.output_height,
                                                         cached->second.narrow,
-                                                        cached->second.persistent_id};
+                                                        cached->second.persistent_id,
+                                                        cached->second.persistent_version};
                                     decoded_reuse = &persistent_reuse;
                                     resource_persistent_hit = true;
                                     if (timing_enabled) pending_timing.persistent_hits++;
@@ -2107,6 +2114,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             fr.img_dim = r.img_dim;
                             if (native_r8_sampled)
                                 fr.texture_format = VK_FORMAT_R8_UNORM;
+                            else if (native_rg8_sampled)
+                                fr.texture_format = VK_FORMAT_R8G8_UNORM;
                             else if (sampled_source_f32)
                                 fr.texture_format = VK_FORMAT_R16G16B16A16_SFLOAT;
                             // #1272: plain 2D guest textures only — cube outputs stack 6 faces into
@@ -2116,9 +2125,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 fr.declared_mip_levels = r.declared_mip_levels;
                             narrow_done = decoded_reuse->narrow;
                             fr.persistent_texture_id = decoded_reuse->persistent_id;
+                            fr.persistent_texture_version = decoded_reuse->persistent_version;
                             decoded_textures.emplace(
                                 decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
-                                                          fr.persistent_texture_id});
+                                                          fr.persistent_texture_id,
+                                                          fr.persistent_texture_version});
                             if (timing_enabled) pending_timing.texture_reuses++;
                         } else {
                         // PROSPER_DETILE_STATS: this branch is the texture-decode MISS path — the cache
@@ -2244,8 +2255,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             ? live_rtt->second.format
                             : (native_r32ui_storage ? VK_FORMAT_R32_UINT
                                : (native_r8_sampled ? VK_FORMAT_R8_UNORM
+                               : (native_rg8_sampled ? VK_FORMAT_R8G8_UNORM
                                : (sampled_source_f32 ? VK_FORMAT_R16G16B16A16_SFLOAT
-                                                     : VK_FORMAT_R8G8B8A8_UNORM)));
+                                                     : VK_FORMAT_R8G8B8A8_UNORM))));
                         fr.texture_format = live_rtt_format;
                         const uint32_t output_bpp =
                             prosper::test::backend_color_bytes_per_pixel(live_rtt_format);
@@ -2669,6 +2681,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                           texture_pixels.end(), 0);
                             narrow_decode_done = true;
                             narrow_done = true;
+                        } else if (native_rg8_sampled) {
+                            // Tight RG8 is already the backend's two-byte sampled representation.
+                            linear_source_prefix_size = copy_resource(
+                                texture_pixels.data(), r.gpu_addr, texture_pixels.size());
+                            if (linear_source_prefix_size < texture_pixels.size())
+                                std::fill(texture_pixels.begin() + linear_source_prefix_size,
+                                          texture_pixels.end(), 0);
+                            narrow_decode_done = true;
+                            narrow_done = true;
                         } else if (bpt < 4) {
                             // Narrow (single/dual-channel) surface: read at the REAL element size and detile
                             // with the matching bpe geometry (1 B -> 64x64, 2 B -> 64x32 micro-tiles, #119),
@@ -2948,6 +2969,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                             texture_pixels[((size_t)z * th + y) * tw + x] =
                                                 ck ? 200 : 40;
                                         }
+                            } else if (fr.texture_format == VK_FORMAT_R8G8_UNORM) {
+                                for (uint32_t z = 0; z < slices; ++z)
+                                    for (uint32_t y = 0; y < th; ++y)
+                                        for (uint32_t x = 0; x < tw; ++x) {
+                                            const bool ck = ((x / 64) ^ (y / 64) ^ z) & 1;
+                                            uint8_t* p = &texture_pixels[
+                                                (((size_t)z * th + y) * tw + x) * 2];
+                                            p[0] = ck ? 200 : 40;
+                                            p[1] = ck ? 40 : 200;
+                                        }
                             } else {
                                 for (uint32_t z = 0; z < slices; ++z)
                                     for (uint32_t y = 0; y < th; ++y)
@@ -3038,6 +3069,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             bool inherited_watch_disabled = false;
                             prosper::host::GuestWriteWatch inherited_source_watch =
                                 std::move(pending_source_watch);
+                            uint64_t inherited_persistent_id = 0;
+                            uint64_t inherited_persistent_version = 0;
                             if (old != persistent_decoded_textures.end() &&
                                 old->second.source_addr == persistent_source_addr &&
                                 old->second.source_size == persistent_source_size) {
@@ -3047,6 +3080,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 inherited_watch_disabled = old->second.source_watch_disabled;
                                 if (!inherited_watch_disabled)
                                     inherited_source_watch = std::move(old->second.source_watch);
+                                inherited_persistent_id = old->second.persistent_id;
+                                inherited_persistent_version = old->second.persistent_version;
                             }
                             const bool can_replace = old == persistent_decoded_textures.end() ||
                                 old->second.last_use != decode_generation;
@@ -3089,9 +3124,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 cached.output_height = fr.th;
                                 cached.narrow = narrow_done;
                                 cached.last_use = decode_generation;
-                                cached.persistent_id = ++persistent_texture_id;
-                                if (!cached.persistent_id)
+                                cached.persistent_id = inherited_persistent_id;
+                                if (!cached.persistent_id) {
                                     cached.persistent_id = ++persistent_texture_id;
+                                    if (!cached.persistent_id)
+                                        cached.persistent_id = ++persistent_texture_id;
+                                }
+                                cached.persistent_version = inherited_persistent_version + 1;
+                                if (!cached.persistent_version) cached.persistent_version = 1;
                                 cached.validation_snapshot =
                                     prosper::gpu::guest_gpu_write_snapshot();
                                 cached.source_watch_dirty_count = inherited_watch_dirty_count;
@@ -3105,13 +3145,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     persistent_decoded_texture_bytes += inserted->second.bytes();
                                     fr.tex_rgba = inserted->second.pixels.data();
                                     fr.persistent_texture_id = inserted->second.persistent_id;
+                                    fr.persistent_texture_version =
+                                        inserted->second.persistent_version;
                                 }
                             }
                         }
                         if (!resource_rtt_hit && !resource_compute_image_hit && !has_live_rtt)
                             decoded_textures.emplace(
                                 decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
-                                                          fr.persistent_texture_id});
+                                                          fr.persistent_texture_id,
+                                                          fr.persistent_texture_version});
                         }
                         if (native_r32ui_storage && writable_storage_image) {
                             const uint32_t writeback_pitch = getenv("PROSPER_PITCH")
