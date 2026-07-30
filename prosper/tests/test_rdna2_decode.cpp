@@ -303,6 +303,17 @@ int main() {
     CHECK(n3.fmt == Rdna2Format::MIMG && n3.opcode == 0x00u && n3.len_dwords == 3 && n3.mimg_dim == 2u &&
           (n3.words[1] & 0xFFu) == 0u && (n3.words[2] & 0xFFu) == 7u && ((n3.words[2] >> 8) & 0xFFu) == 3u,
           "NSA MIMG 3D captures the extra address dword; coords decode to v0,v7,v3");
+    // Astro Bot's world-map ray traversal uses the maximum three NSA dwords to name eleven input
+    // VGPRs. Retaining dword4 is required for ray_inv_dir.y/z (v71/v72).
+    const uint32_t mimg_bvh[] = {
+        0xf1989f07u, 0x00040303u, 0x43440d3fu, 0x46424140u, 0x00004847u,
+    };
+    Rdna2Inst bvh = rdna2_decode_one(mimg_bvh, std::size(mimg_bvh));
+    CHECK(bvh.fmt == Rdna2Format::MIMG && bvh.opcode == 0xe6u && bvh.len_dwords == 5 &&
+          bvh.mimg_dmask == 0xfu && bvh.mimg_unorm && bvh.mimg_dim == 0u &&
+          bvh.dst.value == 3 && bvh.src[0].value == 3 && bvh.src[1].value == 16 &&
+          bvh.words[4] == 0x00004847u,
+          "Astro IMAGE_BVH_INTERSECT_RAY retains its third NSA address dword");
     // Astro Bot's live image_atomic_swap packet. Bit 13 is GLC: atomically exchange v9 with the
     // R32_UINT texel at (v0,v1), returning the pre-operation value to v9.
     const uint32_t mimg_atomic_swap[] = { 0xf03c2108u, 0x00000900u };

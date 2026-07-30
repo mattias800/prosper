@@ -433,6 +433,34 @@ int main() {
                              compute_cfg_dispatch_vcc_gt_zero.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "the complex dispatcher preserves Wave32 VCC_LO > 0 scalar mask semantics");
+    std::vector<uint32_t> compute_cfg_dispatch_ff1 = {
+        0xBE800385u, // s_mov_b32 s0, 5
+        0x7D840000u, // v_cmp_eq_u32 vcc, s0, v0
+        0xBEEA136Au, // s_ff1_i32_b32 vcc_lo, vcc_lo
+        0x7E04026Au, // v_mov_b32 v2, vcc_lo (consume the scalar-data result)
+    };
+    compute_cfg_dispatch_ff1.insert(
+        compute_cfg_dispatch_ff1.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_ff1.data(),
+                             compute_cfg_dispatch_ff1.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the complex dispatcher lowers exact Wave32 s_ff1 mask reduction to scalar data");
+    std::vector<uint32_t> compute_cfg_dispatch_dynamic_writelane = {
+        0x7E780300u,              // v_mov_b32 v60, v0
+        0xBEEB0389u,              // s_mov_b32 vcc_hi, 9 (scalar data)
+        0xBEAD0385u,              // s_mov_b32 s45, 5
+        0xD761003Cu, 0x00005A6Bu, // v_writelane_b32 v60, vcc_hi, s45 (Astro PC1039)
+        0xD7600000u, 0x00005B3Cu, // v_readlane_b32 s0, v60, s45
+        0x7E040200u,              // v_mov_b32 v2, s0 (consume selected scalar)
+    };
+    compute_cfg_dispatch_dynamic_writelane.insert(
+        compute_cfg_dispatch_dynamic_writelane.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_dynamic_writelane.data(),
+                             compute_cfg_dispatch_dynamic_writelane.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the complex dispatcher lowers Astro's exact dynamic v_writelane packet");
     // A physical VCC half may hold ordinary scalar data before a later block starts a mask lifetime
     // in the same word. Block discovery must not retroactively reinterpret the earlier comparison as
     // a wave vote after the B32 dataflow learns about that later lifetime (Astro world-map PC436).
