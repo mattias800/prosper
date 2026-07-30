@@ -332,6 +332,12 @@ struct ComputeItem {
     uint64_t submit_no = 0;
     uint64_t command_order = 0;
     uint32_t required_subgroup_size = 0;
+    // Capture v39 retains the raw compute program and every semantic launch/recompiler input. The
+    // stored SPIR-V remains the default replay artifact; --recompile-raw may rebuild it with the
+    // current translator and replay device's optional format/subgroup capabilities.
+    uint32_t raw_shader_index = 0xFFFFFFFFu;
+    ComputeShaderConfig recompile_config{};
+    bool recompile_config_available = false;
 };
 
 enum class SubmitOperationKind : uint8_t { Draw, Dispatch, DmaCopy };

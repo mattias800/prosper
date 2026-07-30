@@ -1385,9 +1385,36 @@ logged no direct decisions and reached 2,040. Their final 25-submit texture-reso
 present (1,058) but asynchronous readback completed on different later presents and captured different menu
 states, so they remain independent correctness/progression evidence rather than a pixel-equality oracle.
 
+### Raw compute replay closes the portable-capture profiling gap
+
+The next measured Plucky hotspot was program `0x30180d0000`, binding 30: a 3840x2160 RGBA16F
+storage result whose captured portable module expands 66,846,720 guest bytes into a 132,710,400-byte
+RGBA32_UINT interchange image. Inspection proved that this is not necessarily the live steady-state path.
+The renderer device advertises RGBA16F storage support and ordinary uncaptured execution already emits the
+native-width float image, but capture-bound translation intentionally stores portable SPIR-V. Realized
+compute captures retained neither raw RDNA2 nor the semantic launch ABI, so replay could not regenerate the
+current/device-specific module and its timing overstated live cost.
+
+Capture v39 now retains that missing source and ABI state. `gpu_replay --recompile-raw` rebuilds compute as
+well as graphics, substitutes only successful modules, restores captured push constants, and selects typed
+storage/subgroup capabilities from the initialized replay device when rendering. Tests cover v39 roundtrip,
+owned materialization, current-SPIR-V substitution, missing-source fallback, malformed state, and pre-v39
+compatibility. This makes a fresh capture an honest stored-portable versus current-live A/B for the remaining
+Plucky compute work.
+
+A fresh targeted v39 capsule of submit 7 then retained raw state for all 27 realized dispatches. The current
+replay rebuilt all 27 on the Radeon device (`device-formats=0x3ff`), and both generated BMPs were byte-identical
+(`sha256 9e2733eda3327c11ae662cd59708b9d5b344fa59f2b694009c9854755a59745e`). For `0x30180d0000`
+binding 30, validated SPIR-V changed from a `%uint` portable storage image to a `%float` native storage image;
+staging fell from 132,710,400 to 66,355,200 bytes and setup from 68.69 ms to 53.77 ms. The same A/B exposed a
+larger aggregate win in the `0x30194e0000` mip dispatch: 49.10 ms to 32.74 ms. The single-submit replay still
+selects a 512x512 fallback instead of the capture's 3840x2160 live oracle because this early endpoint has no RTT
+seed window, so the equal BMPs are deterministic stored/current regression evidence, not a claim that this
+capsule reproduces the complete live frame. A rolling producer window remains the next correctness oracle.
+
 ## Next renderer step
 
-Capture a fresh v38 rolling temporal window on current code around the Plucky title/gameplay transition. It
+Capture a fresh v39 rolling temporal window on current code around the Plucky title/gameplay transition. It
 must include the producers for the two 48x48 volumes and close with zero unresolved leaves, providing a native
 pixel oracle as well as exact compute pipeline contracts. Keep the exact-byte and disable-switch A/B
 discipline used here, and preserve screenshot/capture correctness while reducing the synchronous boundaries.

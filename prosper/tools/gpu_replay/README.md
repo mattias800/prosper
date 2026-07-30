@@ -294,17 +294,29 @@ FragCoord-dependent terms).
 ./build-linux/gpu_replay ~/cap/frame.prgcap /tmp/stored.bmp                    # stored (capture-time) shaders
 ./build-linux/gpu_replay --recompile-raw ~/cap/frame.prgcap /tmp/current.bmp   # CURRENT recompiler
 # [recompile-raw] substituted vs=1563 fs=1563 kept-stored vs=0 fs=0 of 1563 draws
+# [recompile-raw] substituted compute=52 kept-stored=0 of 52 dispatches device-formats=0x3ff
 ```
 
 A capsule stores already-recompiled SPIR-V, so recompiler changes are invisible to a default replay.
 `--recompile-raw` re-recompiles **every** retained raw VS/FS with the current recompiler and substitutes the
-results — any v19+ capsule becomes a deterministic ~seconds-per-iteration A/B vehicle for recompiler work
+results — any v19+ capsule becomes a deterministic ~seconds-per-iteration A/B vehicle for graphics work
 (compare the replay hashes / BMPs), instead of a multi-minute live route per experiment. This was the
 iteration loop that localized #1394 for #1287. Items without a retained raw stream, or whose re-recompile
 fails, keep their stored SPIR-V — the `[recompile-raw]` line counts them; a nonzero `kept-stored` means the
 A/B is partial, never silent. Composes with `PROSPER_FS_TAP` (masked during the mass loop so the per-draw tap
 block keeps exclusive ownership of its semantic draw). Interface hints are re-derived from the raw streams,
 the same contract as the probes above.
+
+Capture v39 extends the same loop to realized compute dispatches. It retains the bounded raw RDNA2 stream,
+user SGPR push constants, launch/thread ABI, wave/TGID/LDS controls, and the capture host's optional typed-
+storage capability mask. A rendering replay initializes Vulkan before recompilation and selects storage
+formats and subgroup contracts from the replay device's actually enabled capabilities. Non-rendering
+`--inspect-only`, `--validate`, and `--graph` invocations can rebuild without Vulkan using the recorded
+capture-host policy; combine `--dump-compute` with `--inspect-only` for the same offline-only behavior. The
+stored SPIR-V remains the default replay artifact. Capture-bound live translation deliberately stores its
+portable module, so the stored/current A/B directly measures device-specific native-width paths without
+making them mandatory for other replay hosts. Pre-v39 captures stay readable and report that their compute
+modules were kept rather than inventing raw source or launch state.
 
 Two render_runner provenance logs pair with it when a capsule replay disagrees with expectations
 (both inert by default): `PROSPER_MIPLOG=1` prints each texture binding's mip-eligibility inputs
@@ -352,9 +364,11 @@ validity, and raw valid-plane bytes. Counts, extents, formats, duplicate identit
 1 GiB total are validated before allocation or Vulkan upload. Captures v1-v7 remain readable with zero DS
 seeds. `--inspect-only` prints every seed's identity, validity, byte counts, and content hashes.
 
-Compute selectors use the realized compute index printed by `--inspect-only`. The resource selector is
+Compute selectors use the realized compute index printed by `--inspect-only`; v39 also prints `raw=yes` when
+that dispatch has complete current-translator replay state. The resource selector is
 `COMPUTE:BINDING`; it writes the captured pre-dispatch storage-buffer bytes, while `--dump-compute` writes
-the exact specialized SPIR-V executed by replay. `--compute-only N` retains just that realized dispatch and
+the exact specialized SPIR-V executed by replay (the rebuilt module when combined with `--recompile-raw`).
+`--compute-only N` retains just that realized dispatch and
 its captured resources, making a driver or recompiler failure deterministic without running unrelated draws
 or dispatches. `--override-compute-spv N PATH` replaces that dispatch's module after capture materialization;
 the input must be a 20-byte-to-16-MiB SPIR-V binary with the standard magic word. Overrides intentionally
