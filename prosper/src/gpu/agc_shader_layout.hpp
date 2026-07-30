@@ -127,6 +127,7 @@ struct DecodedBvhDescriptor {
     uint64_t base = 0;
     uint64_t size_bytes = 0;
     uint8_t type = 0;
+    uint8_t box_grow = 0;
     bool triangle_return_mode = false;
     bool box_node_64b = false;
     bool sort_enabled = false;

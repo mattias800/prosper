@@ -5325,9 +5325,8 @@ int main() {
         }
         CHECK(box_ok, "IMAGE_BVH_INTERSECT_RAY returns the four unsorted FP32-box child hits");
 
-        // RTIP 1.1 conservatively grows the far edge by six 2^-24 increments. Make the
-        // X near edge one float ULP beyond the Y far edge: an exact slab comparison misses,
-        // while the architectural interval growth retains the edge-touching child.
+        // Make the X near edge one float ULP beyond the Y far edge. BOX_GROW=0 must miss;
+        // BOX_GROW=6 expands the far edge by six 2^-24 increments and retains the child.
         for (uint32_t lane = 0; lane < lanes; ++lane) {
             set_ray(lane, 5u, 0.0f, 0.0f, 0.0f);
             bvh_inputs[lane * inputs_per_lane + 64] = 1.0f;
@@ -5344,10 +5343,21 @@ int main() {
             bvh_code, std::size(bvh_code), inputs_per_lane, 3, &bvh_rt);
         const std::vector<float> edge_output = prosper::test::run_compute(
             edge_module, bvh_inputs, lanes, lanes, box_words);
-        bool edge_ok = edge_output.size() == lanes;
+        bool edge_zero_ok = edge_output.size() == lanes;
         for (uint32_t lane = 0; lane < edge_output.size(); ++lane)
-            edge_ok &= bits_of(edge_output[lane]) == 0x100u;
-        CHECK(edge_ok, "IMAGE_BVH_INTERSECT_RAY conservatively retains edge-touching boxes");
+            edge_zero_ok &= bits_of(edge_output[lane]) == 0xffffffffu;
+        CHECK(edge_zero_ok, "IMAGE_BVH_INTERSECT_RAY honors zero box growth");
+
+        bvh_rt.resources[0].bvh_box_grow = 6u;
+        const std::vector<uint32_t> grown_edge_module = recompile_valu(
+            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &bvh_rt);
+        const std::vector<float> grown_edge_output = prosper::test::run_compute(
+            grown_edge_module, bvh_inputs, lanes, lanes, box_words);
+        bool edge_grown_ok = grown_edge_output.size() == lanes;
+        for (uint32_t lane = 0; lane < grown_edge_output.size(); ++lane)
+            edge_grown_ok &= bits_of(grown_edge_output[lane]) == 0x100u;
+        CHECK(edge_grown_ok,
+              "IMAGE_BVH_INTERSECT_RAY applies descriptor-selected box growth");
 
         std::vector<uint32_t> tri_words(32, 0u);
         tri_words[0] = bits_of(9.0f); tri_words[1] = bits_of(9.0f); tri_words[2] = bits_of(9.0f);

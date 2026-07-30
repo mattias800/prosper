@@ -148,6 +148,7 @@ struct ShaderResourceCompileKey {
     uint32_t fetch_pc = 0;
     uint32_t fetch_index_mode = 0;
     uint32_t flat_base_sgpr = 0;
+    uint32_t bvh_box_grow = 0;
     bool srgb = false;
     bool depth_compare = false;
     uint32_t depth_compare_func = 0;
@@ -155,7 +156,6 @@ struct ShaderResourceCompileKey {
     uint32_t addr_u = 0;
     uint32_t addr_v = 0;
     uint32_t border_color_type = 0;
-    bool bvh_no_hit_fallback = false;
 
     bool operator==(const ShaderResourceCompileKey&) const = default;
 };
@@ -326,6 +326,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.fetch_pc);
             hash = hash_mix(hash, resource.fetch_index_mode);
             hash = hash_mix(hash, resource.flat_base_sgpr);
+            hash = hash_mix(hash, resource.bvh_box_grow);
             hash = hash_mix(hash, resource.srgb);
             hash = hash_mix(hash, resource.depth_compare);
             hash = hash_mix(hash, resource.depth_compare_func);
@@ -333,7 +334,6 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.addr_u);
             hash = hash_mix(hash, resource.addr_v);
             hash = hash_mix(hash, resource.border_color_type);
-            hash = hash_mix(hash, resource.bvh_no_hit_fallback);
         }
         return static_cast<size_t>(hash);
     }
@@ -986,6 +986,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.fetch_pc = resource.fetch_pc;
             compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
             compiled.flat_base_sgpr = resource.flat_base_sgpr;
+            compiled.bvh_box_grow = resource.bvh_box_grow;
             compiled.srgb = storage_image && resource.srgb;
             compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
             compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
@@ -993,7 +994,6 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.addr_u = manual_compare ? resource.addr_uvw[0] : 0u;
             compiled.addr_v = manual_compare ? resource.addr_uvw[1] : 0u;
             compiled.border_color_type = manual_compare ? resource.border_color_type : 0u;
-            compiled.bvh_no_hit_fallback = is_bvh_no_hit_fallback(resource);
             key.resources.push_back(compiled);
         }
     }
@@ -2305,27 +2305,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                     in.pc, bbase, snapshot_provenance, seed_provenance);
                             if (plausible) {
                                 for (uint32_t word : live_bvh) fprintf(stderr, "%08x ", word);
-                                fprintf(stderr, "-> base=0x%llx size=0x%llx type=%u tri_mode=%u",
+                                fprintf(stderr, "-> base=0x%llx size=0x%llx type=%u tri_mode=%u grow=%u",
                                         (unsigned long long)d.base,
                                         (unsigned long long)d.size_bytes, d.type,
-                                        d.triangle_return_mode);
+                                        d.triangle_return_mode, d.box_grow);
                             } else {
                                 fprintf(stderr, "<unknown>");
                             }
                             fputc('\n', stderr);
                         }
-                        if (plausible || (!live_known &&
-                                          (snapshot_provenance || seed_provenance))) {
+                        if (plausible) {
                             SrtUse u;
                             u.kind = 2;
                             u.key = 0xFFFFFFFFu;
-                            // A descriptor load can be control-flow guarded even though static
-                            // translation still sees the later BVH instruction. Preserve an
-                            // all-zero marker when that load did not resolve: resource
-                            // materialization binds a bounded no-hit BVH so the rest of the
-                            // compute program can execute. A known but malformed descriptor is
-                            // deliberately not converted into this fallback.
-                            if (plausible) u.bvh4 = live_bvh;
+                            u.bvh4 = live_bvh;
                             u.use_pc = in.pc;
                             srt_uses->push_back(u);
                         }
@@ -2853,27 +2846,6 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
     for (const auto& u : srt_uses) {
         if (u.kind == 2) {
             const DecodedBvhDescriptor d = decode_bvh_descriptor(u.bvh4.data());
-            const bool unresolved = std::all_of(u.bvh4.begin(), u.bvh4.end(),
-                                                [](uint32_t word) { return word == 0; });
-            if (unresolved) {
-                const uint64_t dk = 0x8000000200000000ull | u.use_pc;
-                if (!seen.insert(dk).second) continue;
-                // Guest control flow normally skips this unresolved descriptor. The exact
-                // host-owned marker lets the recompiler emit a compact deterministic no-hit if
-                // the static instruction remains in the module, without instantiating a large
-                // software traversal body merely to satisfy Vulkan pipeline compilation.
-                alignas(256) static std::array<uint8_t, 256> null_bvh{};
-                ShaderResource r;
-                r.cls = ResourceClass::ConstantBuffer;
-                r.format = DataFormat::Uint32;
-                r.num_components = 1;
-                r.size = static_cast<uint32_t>(null_bvh.size());
-                r.fetch_pc = u.use_pc;
-                r.host_data = null_bvh.data();
-                r.host_data_size = null_bvh.size();
-                table.resources.push_back(r);
-                continue;
-            }
             if (d.type != 8u || d.base <= 0x10000u || d.size_bytes == 0 ||
                 d.size_bytes > 0x10000000u || d.size_bytes > UINT32_MAX ||
                 !d.triangle_return_mode || d.box_node_64b || d.sort_enabled)
@@ -2883,7 +2855,8 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             bool mapped = false;
             for (auto& r0 : table.resources) {
                 if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
-                    r0.size != static_cast<uint32_t>(d.size_bytes))
+                    r0.size != static_cast<uint32_t>(d.size_bytes) ||
+                    r0.bvh_box_grow != d.box_grow)
                     continue;
                 if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
                 if (r0.fetch_pc == u.use_pc) { mapped = true; break; }
@@ -2896,6 +2869,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             r.gpu_addr = d.base;
             r.size = static_cast<uint32_t>(d.size_bytes);
             r.fetch_pc = u.use_pc;
+            r.bvh_box_grow = d.box_grow;
             table.resources.push_back(r);
             continue;
         }
@@ -4085,12 +4059,13 @@ std::vector<ComputeItem> realize_compute_dispatches(
                             std::fprintf(stderr,
                                          "[dynfail]     BVH(bvh4) use_pc=%u "
                                          "bvh4=%08x:%08x:%08x:%08x base=0x%llx size=%llu "
-                                         "type=%u tri_mode=%u box64=%u sort=%u\n",
+                                         "type=%u tri_mode=%u box64=%u sort=%u grow=%u\n",
                                          u.use_pc, u.bvh4[0], u.bvh4[1], u.bvh4[2], u.bvh4[3],
                                          (unsigned long long)d.base,
                                          (unsigned long long)d.size_bytes, d.type,
                                          (unsigned)d.triangle_return_mode,
-                                         (unsigned)d.box_node_64b, (unsigned)d.sort_enabled);
+                                         (unsigned)d.box_node_64b, (unsigned)d.sort_enabled,
+                                         (unsigned)d.box_grow);
                         }
                     }
                 }

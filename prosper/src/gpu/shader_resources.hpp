@@ -184,6 +184,11 @@ struct ShaderResource {
     uint32_t      fetch_pc      = 0xFFFFFFFFu;
     VertexFetchIndexMode fetch_index_mode = VertexFetchIndexMode::Automatic;
 
+    // BVH descriptor BOX_GROW (bits 62:55). IMAGE_BVH_INTERSECT_RAY expands box intervals by
+    // this many 2^-24 increments; zero is exact/no growth. Meaningful only for the per-fetch raw
+    // ConstantBuffer view created from a validated BVH descriptor.
+    uint32_t      bvh_box_grow  = 0;
+
     // FLAT-window (#1171) provenance: for a general flat_load whose 64-bit source pointer lives in the
     // consecutive user SGPRs s[flat_base_sgpr : +1], the executor binds the containing guest allocation
     // as this SSBO (keyed by the load's fetch_pc) and the emitter lowers the load to an indexed read at
@@ -297,18 +302,6 @@ struct ShaderResource {
     uint8_t*       host_data        = nullptr;
     uint64_t       host_data_size   = 0;
 };
-
-// A statically proven missing BVH descriptor is materialized as this exact host-owned resource.
-// Guest address zero cannot name a real BVH allocation, so the recompiler may replace the guarded
-// IMAGE_BVH_INTERSECT_RAY use with a compact deterministic no-hit result. Keeping the marker derived
-// from serialized resource fields also preserves capture/replay without changing the capture ABI.
-inline bool is_bvh_no_hit_fallback(const ShaderResource& resource) {
-    return resource.cls == ResourceClass::ConstantBuffer &&
-           resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
-           resource.gpu_addr == 0 && resource.size == 256u && resource.stride == 0u &&
-           resource.fetch_pc != 0xFFFFFFFFu && resource.host_data != nullptr &&
-           resource.host_data_size >= resource.size;
-}
 
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the
 // recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.

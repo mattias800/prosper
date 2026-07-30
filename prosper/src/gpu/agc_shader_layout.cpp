@@ -167,6 +167,7 @@ DecodedBvhDescriptor decode_bvh_descriptor(const uint32_t v[4]) {
     d.base = base_256 << 8;
     d.size_bytes = (size_64_minus_one + 1u) << 6;
     d.type = static_cast<uint8_t>(v[3] >> 28);
+    d.box_grow = static_cast<uint8_t>((v[1] >> 23) & 0xFFu);
     d.triangle_return_mode = (v[3] & (1u << 24)) != 0;
     d.box_node_64b = (v[3] & (1u << 20)) != 0;
     d.sort_enabled = (v[1] & (1u << 31)) != 0;

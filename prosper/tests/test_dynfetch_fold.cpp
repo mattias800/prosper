@@ -648,7 +648,7 @@ int main() {
     const uint64_t astro_bvh_base = reinterpret_cast<uint64_t>(astro_bvh_backing);
     const uint32_t astro_bvh_seed[4] = {
         static_cast<uint32_t>(astro_bvh_base >> 8),
-        static_cast<uint32_t>((astro_bvh_base >> 40) & 0xFFu),
+        static_cast<uint32_t>((astro_bvh_base >> 40) & 0xFFu) | (6u << 23),
         63u,                         // (63 + 1) * 64 = 4096 bytes
         0x81000000u,                // TYPE=8, TRIANGLE_RETURN_MODE=1
     };
@@ -659,8 +659,14 @@ int main() {
     const DecodedBvhDescriptor decoded_bvh = decode_bvh_descriptor(astro_bvh_seed);
     CHECK(decoded_bvh.base == astro_bvh_base && decoded_bvh.size_bytes == sizeof(astro_bvh_backing) &&
               decoded_bvh.type == 8u && decoded_bvh.triangle_return_mode &&
-              !decoded_bvh.box_node_64b && !decoded_bvh.sort_enabled,
+              decoded_bvh.box_grow == 6u && !decoded_bvh.box_node_64b &&
+              !decoded_bvh.sort_enabled,
           "GFX10 BVH descriptor decodes its 256-byte base, 64-byte count and flags");
+    uint32_t zero_grow_bvh_seed[4];
+    std::copy(std::begin(astro_bvh_seed), std::end(astro_bvh_seed), zero_grow_bvh_seed);
+    zero_grow_bvh_seed[1] &= ~(0xFFu << 23);
+    CHECK(decode_bvh_descriptor(zero_grow_bvh_seed).box_grow == 0u,
+          "GFX10 BVH descriptor preserves a zero box-grow value");
     std::vector<SrtUse> astro_bvh_uses;
     resolve_dynamic_fetch(astro_bvh_intersect, std::size(astro_bvh_intersect),
                           astro_bvh_seed, std::size(astro_bvh_seed), 16, &astro_bvh_uses);
@@ -679,45 +685,9 @@ int main() {
               astro_bvh_table.resources[0].cls == ResourceClass::ConstantBuffer &&
               astro_bvh_table.resources[0].gpu_addr == astro_bvh_base &&
               astro_bvh_table.resources[0].size == sizeof(astro_bvh_backing) &&
+              astro_bvh_table.resources[0].bvh_box_grow == 6u &&
               astro_bvh_table.resources[0].fetch_pc == 0,
           "Astro BVH bytes materialize as the instruction-scoped read-only compute buffer");
-
-    // The first live world-map dispatch reaches static BVH instructions with a null descriptor
-    // table entry. Guest control flow guards those instructions, but static SPIR-V translation
-    // still needs their descriptor bindings. A failed descriptor snapshot therefore receives a
-    // bounded host-owned marker that the recompiler specializes to a deterministic no-hit result
-    // if the guarded path is unexpectedly taken.
-    const uint32_t unresolved_bvh_intersect[] = {
-        0xF4100404u, 0xFA000000u,            // s_load_dwordx16 s[16:31], s[8:9], 0 (prior block)
-        0xF4100405u, 0xFA000000u,            // s_load_dwordx16 s[16:31], s[10:11], 0 (null)
-        0xF1989F07u, 0x00040303u, 0x43440D3Fu, 0x46424140u, 0x00004847u,
-        0xBF810000u,
-    };
-    std::array<uint32_t, 32> null_bvh_seed{};
-    null_bvh_seed[8] = static_cast<uint32_t>(astro_bvh_base);
-    null_bvh_seed[9] = static_cast<uint32_t>(astro_bvh_base >> 32);
-    std::vector<SrtUse> unresolved_bvh_uses;
-    resolve_dynamic_fetch(unresolved_bvh_intersect, std::size(unresolved_bvh_intersect),
-                          null_bvh_seed.data(), null_bvh_seed.size(), 0,
-                          &unresolved_bvh_uses);
-    CHECK(unresolved_bvh_uses.size() == 1 && unresolved_bvh_uses[0].kind == 2 &&
-              unresolved_bvh_uses[0].use_pc == 4 &&
-              std::all_of(unresolved_bvh_uses[0].bvh4.begin(),
-                          unresolved_bvh_uses[0].bvh4.end(),
-                          [](uint32_t word) { return word == 0; }),
-          "guarded unresolved Astro BVH use retains an exact-pc no-hit marker");
-    ShaderResourceTable unresolved_bvh_table;
-    add_compute_buffer_resources(unresolved_bvh_table, unresolved_bvh_intersect,
-                                 std::size(unresolved_bvh_intersect), null_bvh_seed.data(),
-                                 null_bvh_seed.size());
-    CHECK(unresolved_bvh_table.resources.size() == 1 &&
-              unresolved_bvh_table.resources[0].cls == ResourceClass::ConstantBuffer &&
-              unresolved_bvh_table.resources[0].gpu_addr == 0 &&
-              unresolved_bvh_table.resources[0].size == 256 &&
-              unresolved_bvh_table.resources[0].fetch_pc == 4 &&
-              unresolved_bvh_table.resources[0].host_data != nullptr &&
-              unresolved_bvh_table.resources[0].host_data_size == 256,
-          "guarded unresolved Astro BVH use materializes a bounded host no-hit buffer");
 
     // Recreate the live descriptor builder rather than seeding its final words: the header pointer
     // is stored in 8-byte units, the allocation count is loaded from byte offset 0x58, and a

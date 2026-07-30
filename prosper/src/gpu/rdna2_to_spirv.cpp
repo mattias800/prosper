@@ -4,6 +4,7 @@
 #include "rdna2_decode.hpp"
 #include "shader_resources.hpp"
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -5323,8 +5324,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t in_half = in.dst.value == 106
                     ? b.ucmp(Op_ULessThan, lane, b.uconst(32))
                     : b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32));
-                const uint32_t prior_vcc = rs.vcc ? rs.vcc : b.bfalse();
-                rs.vcc = b.bsel(in_half, b.logical_not(prior_vcc), prior_vcc);
+                if (!rs.vcc) { ok = false; return true; }
+                rs.vcc = b.bsel(in_half, b.logical_not(rs.vcc), rs.vcc);
                 rs.sreg_bool[in.dst.value] = rs.vcc;
                 rs.sreg_bool_narrowed[in.dst.value] = true;
                 if (b.allow_b32_masks) rs.sreg_bool_b32.insert(in.dst.value);
@@ -5892,8 +5893,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.ibin(Op_BitwiseAnd,
                                b.ibin(Op_ShiftRightLogical, result, bit), b.uconst(1)),
                         b.uconst(0));
-                    rs.vcc = b.bsel(in_written_half, result_bit,
-                                    rs.vcc ? rs.vcc : b.bfalse());
+                    if (!rs.vcc) { ok = false; return true; }
+                    rs.vcc = b.bsel(in_written_half, result_bit, rs.vcc);
                     rs.sreg_bool[in.dst.value] = rs.vcc;
                     rs.sreg_bool_narrowed[in.dst.value] = true;
                     return true;
@@ -5933,8 +5934,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                       : in.opcode == 0x18 ? b.lor(n0, n1)
                                       : in.opcode == 0x1a ? b.land(n0, n1)
                                       : b.logical_not(x);
-                rs.vcc = b.bsel(in_written_half, result,
-                                rs.vcc ? rs.vcc : b.bfalse());
+                if (!rs.vcc) { ok = false; return true; }
+                rs.vcc = b.bsel(in_written_half, result, rs.vcc);
                 rs.sreg_bool[in.dst.value] = rs.vcc;
                 rs.sreg_bool_narrowed[in.dst.value] = true;
                 rs.sreg.erase(in.dst.value);
@@ -6664,6 +6665,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             uint32_t& d = vreg[in.dst.value];
             switch (in.opcode) {
                 case 0x01: {                                         // v_cndmask_b32: dst = vcc ? src1 : src0
+                    if (!vcc) { ok = false; return true; }
                     if (in.sdwa_dst_sel == 6) { d = b.sel(vcc, c, a); break; }
                     auto word = [&](uint32_t raw, uint8_t sel) {
                         if (sel == 5) raw = b.ibin(Op_ShiftRightLogical, raw, b.uconst(16));
@@ -6716,6 +6718,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Carry ops (VOP2 e32 form): carry-in + carry-out are VCC. v_add_co_ci(0x28)/
                 // v_sub_co_ci(0x29)/v_subrev_co_ci(0x2a). Mirrors the VOP3B 0x128/129/12A logic with VCC.
                 case 0x28: case 0x29: case 0x2A: {
+                    if (!vcc) { ok = false; return true; }
                     uint32_t cin = b.sel(vcc, b.uconst(1), b.uconst(0));
                     uint32_t carry;
                     if (in.opcode == 0x28) {                          // (a + c) + cin
@@ -8588,21 +8591,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
 
-                // The front-half emits this marker only when descriptor provenance is proven but
-                // the guarded descriptor load resolved to null. The instruction must still compile
-                // because it exists in the static control-flow graph, but no BVH bytes exist to
-                // traverse. Four invalid child IDs are the conservative no-hit result and avoid
-                // triplicating the large software intersection body in Astro Bot's world-map kernel.
-                if (is_bvh_no_hit_fallback(*bvh)) {
-                    for (uint32_t k = 0; k < 4; ++k) {
-                        const int vd = in.dst.value + static_cast<int>(k);
-                        const uint32_t old = vreg_old(b, rs, vd);
-                        rs.vreg[vd] = b.uconst(0xffffffffu);
-                        predicate_write(b, rs, vd, old);
-                    }
-                    return true;
-                }
-
                 auto addr_vgpr = [&](uint32_t k) -> int {
                     if (k == 0u) return in.src[0].value;
                     const uint32_t j = k - 1u;
@@ -8760,12 +8748,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const uint32_t nan_interval = b.lor(
                         b.fcmp(Op_FUnordNotEqual, near_unclamped, near_unclamped),
                         b.fcmp(Op_FUnordNotEqual, far_unclamped, far_unclamped));
+                    const float box_multiplier = 1.0f +
+                        static_cast<float>(bvh->bvh_box_grow) * (1.0f / 16777216.0f);
                     const uint32_t hit = b.land(
                         b.logical_not(nan_interval),
-                        // RTIP 1.1 grows the post-projection far edge by 6 * 2^-24;
-                        // at 1.0f that multiplier is exactly three float ULPs.
                         b.fcmp(Op_FOrdLessThanEqual, near_t,
-                               fmul(far_t, b.uconst(0x3f800003u))));
+                               fmul(far_t, b.uconst(std::bit_cast<uint32_t>(box_multiplier)))));
                     box_out[child] = b.sel(b.land(box_valid, hit), w[child], invalid);
                 }
 
@@ -10662,10 +10650,10 @@ bool emit_cfg_state_machine(
         b.store_function(kv.second, value);
     }
     b.store_function(scc_var, initial.scc ? initial.scc : no);
-    // VCC can be deliberately poisoned (id 0) when its physical SGPR word is recycled as scalar
-    // data. As with SCC, a dispatcher boundary ends that unrepresentable lifetime; persist false
-    // until a later architectural mask writer establishes a fresh value.
-    b.store_function(vcc_var, initial.vcc ? initial.vcc : no);
+    // The dispatcher has no runtime type tag for a physical VCC word recycled as scalar data.
+    // Keep that unsupported join fail-visible instead of persisting an invented false mask.
+    if (!initial.vcc) return false;
+    b.store_function(vcc_var, initial.vcc);
     b.store_function(exec_var, initial.exec);
     b.store_function(pc_var, b.uconst(0));
     b.store_function(active_var, yes);
@@ -10764,7 +10752,7 @@ bool emit_cfg_state_machine(
         // A poisoned (0) SCC degrades to bfalse at the block boundary: the same-block consumers
         // reject on the sentinel; cross-block staleness matches the pre-poison model.
         b.store_function(scc_var, state.scc ? state.scc : b.bfalse());
-        b.store_function(vcc_var, state.vcc ? state.vcc : b.bfalse());
+        b.store_function(vcc_var, state.vcc);
         b.store_function(exec_var, state.exec);
     };
 
@@ -11053,6 +11041,8 @@ bool emit_cfg_state_machine(
                 b.store_function(vote_to_scc_var, yes);
             }
         }
+        if (!state.vcc)
+            return reject_cfg(starts[final_block], "poisoned-vcc-boundary");
         save_state(state, dispatch);
         if (mbcnt) {
             if (!set_next(mbcnt->pc + mbcnt->len_dwords))
@@ -11815,6 +11805,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // the last architectural SCC writer, unrepresentable per-lane) must reject — this is
             // exactly the non-adjacent stale-SCC consumer from the ISA audit (#879).
             if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
+            if (F.on_vcc && !rs.vcc) return false;
             uint32_t condition = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
             if (b.is_fragment && (F.on_exec || F.on_vcc))
                 condition = b.fragment_wave_any(condition);
@@ -11872,9 +11863,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 rs.scc = b.emit_phi_2way(b.t_bool, then_scc ? then_scc : b.bfalse(), then_block,
                                          rs.scc ? rs.scc : b.bfalse(), else_block);
             if (then_vcc != rs.vcc)
-                rs.vcc = b.emit_phi_2way(
-                    b.t_bool, then_vcc ? then_vcc : b.bfalse(), then_block,
-                    rs.vcc ? rs.vcc : b.bfalse(), else_block);
+                rs.vcc = !then_vcc || !rs.vcc ? 0u : b.emit_phi_2way(
+                    b.t_bool, then_vcc, then_block, rs.vcc, else_block);
             if (then_exec != rs.exec)
                 rs.exec = b.emit_phi_2way(b.t_bool, then_exec, then_block, rs.exec, else_block);
             rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
@@ -11922,7 +11912,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // A poisoned (0) SCC live-in degrades to bfalse — the loop shapes re-produce SCC via their
         // in-loop s_cmp before any read, so the phi seed is dead in practice; 0 would be invalid SSA.
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
-        { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc ? rs.vcc : b.bfalse(), preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
+        if (rs.vcc) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
         if (carry_vertex_exec) {
             size_t p;
             uint32_t ph = b.emit_phi2(b.t_bool, rs.exec, preheader, p);
@@ -11964,8 +11954,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         : pr.dom == 1 ? sget(pr.reg)
                         : pr.dom == 2 ? rs.scc
                         : pr.dom == 3 ? rs.vcc : rs.exec;
-            if (!nv && (pr.dom == 2 || pr.dom == 3))
-                nv = b.bfalse(); // poisoned transient wave flag: false at the loop boundary
+            if (!nv && pr.dom == 3) return false;
+            if (!nv && pr.dom == 2)
+                nv = b.bfalse(); // poisoned SCC back-edge value: false when dead in practice
             b.patch_phi(pr.patch, nv, cont);
         }
         b.emit_branch(hdr);
@@ -12222,7 +12213,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // A poisoned (0) SCC live-in degrades to bfalse (invalid as an SSA phi input; dead in
             // practice — the loop shapes re-produce SCC before any read).
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
-            { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc ? rs.vcc : b.bfalse(), preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
+            if (rs.vcc) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.exec, preheader, p); rs.exec = ph; phis.push_back({0, 4, ph, p}); }
             std::vector<int> mask_keys;                        // saved masks live at entry: loop-carried bools
             for (auto& kv : rs.sreg_bool) mask_keys.push_back(kv.first);
@@ -12242,6 +12233,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
             const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
             uint32_t loop_cond = L.condition == DivLoop::Condition::Exec ? rs.exec : rs.vcc;
+            if (!loop_cond) return false;
             // EXECZ/VCCZ are scalar wave decisions. Keeping every fragment invocation in the loop
             // until the complete guest wave becomes empty makes scalar state and nested wave votes
             // exact; vector writes remain predicated by the per-lane EXEC bool.
@@ -12282,22 +12274,24 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             : pr.dom == 3 ? rs.vcc
                             : pr.dom == 4 ? rs.exec
                             : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
-                if (!nv && (pr.dom == 2 || pr.dom == 3)) nv = b.bfalse();
+                if (!nv && pr.dom == 3) return false;
+                if (!nv && pr.dom == 2) nv = b.bfalse();
                 b.patch_phi(pr.patch, nv, cont);
             }
             b.emit_branch(hdr);
             b.emit_label(merge);
             for (auto& pr : phis) {
+                if (pr.dom == 3 && (!vcc_chk || !rs.vcc)) return false;
                 uint32_t chk_value = pr.dom == 0 ? (condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi)
                                    : pr.dom == 1 ? (conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi)
                                    : pr.dom == 2 ? (scc_chk ? scc_chk : b.bfalse())
-                                   : pr.dom == 3 ? (vcc_chk ? vcc_chk : b.bfalse())
+                                   : pr.dom == 3 ? vcc_chk
                                    : pr.dom == 4 ? exec_chk
                                    : (bool_chk.count(pr.reg) ? bool_chk.at(pr.reg) : pr.phi);
                 uint32_t body_value = pr.dom == 0 ? vget(pr.reg)
                                     : pr.dom == 1 ? sget(pr.reg)
                                     : pr.dom == 2 ? (rs.scc ? rs.scc : b.bfalse())
-                                    : pr.dom == 3 ? (rs.vcc ? rs.vcc : b.bfalse())
+                                    : pr.dom == 3 ? rs.vcc
                                     : pr.dom == 4 ? rs.exec
                                     : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
                 const uint32_t merged = (L.direct_exec_breaks || L.direct_wave_breaks) &&
@@ -12348,6 +12342,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // A poisoned SCC (0: last written by a 64-bit mask op) cannot condition a real
                 // structured if — reject (the ISA-audit #879 stale-SCC consumer).
                 if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
+                if (F.on_vcc && !rs.vcc) return false;
                 // Compute VCC/EXEC branches normally return through the exact guest-wave dispatcher.
                 // The narrow structured-wave path above accepts only top-level vote sites, where all
                 // workgroup invocations may participate in the scratch barriers uniformly.
@@ -12418,9 +12413,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         rs.scc = b.emit_phi_2way(b.t_bool, pre_scc ? pre_scc : b.bfalse(), preblock,
                                                  then_scc ? then_scc : b.bfalse(), thenEnd);
                     if (then_vcc != pre_vcc)
-                        rs.vcc = b.emit_phi_2way(
-                            b.t_bool, pre_vcc ? pre_vcc : b.bfalse(), preblock,
-                            then_vcc ? then_vcc : b.bfalse(), thenEnd);
+                        rs.vcc = !pre_vcc || !then_vcc ? 0u : b.emit_phi_2way(
+                            b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
                     // EXEC changed inside the arm (saveexec / v_cmpx / restore): merge it like any value.
                     // Narrowed-ness is sticky (either edge narrowed → post-merge writes stay predicated).
                     if (then_exec != pre_exec) rs.exec = b.emit_phi_2way(b.t_bool, pre_exec, preblock, then_exec, thenEnd);
@@ -12488,9 +12482,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         rs.scc = b.emit_phi_2way(b.t_bool, then_scc ? then_scc : b.bfalse(), thenEnd,
                                                  rs.scc ? rs.scc : b.bfalse(), elseEnd);
                     if (then_vcc != rs.vcc)
-                        rs.vcc = b.emit_phi_2way(
-                            b.t_bool, then_vcc ? then_vcc : b.bfalse(), thenEnd,
-                            rs.vcc ? rs.vcc : b.bfalse(), elseEnd);
+                        rs.vcc = !then_vcc || !rs.vcc ? 0u : b.emit_phi_2way(
+                            b.t_bool, then_vcc, thenEnd, rs.vcc, elseEnd);
                     if (then_exec != rs.exec) rs.exec = b.emit_phi_2way(b.t_bool, then_exec, thenEnd, rs.exec, elseEnd);
                     rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
                     rs.sreg_written.insert(then_written.begin(), then_written.end());

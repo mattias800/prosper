@@ -2454,17 +2454,25 @@ bool trace_compute_item(const prosper::gpu::ComputeItem& item) {
 void maybe_dump_traced_compute_spirv(const prosper::gpu::ComputeItem& item, bool trace) {
     const char* path = std::getenv("PROSPER_COMPUTELOG_SPIRV");
     if (!trace || !path || !*path || item.spirv.empty()) return;
+    uint64_t module_hash = 1469598103934665603ull;
+    for (uint32_t word : item.spirv) {
+        module_hash ^= word;
+        module_hash *= 1099511628211ull;
+    }
     static std::mutex mutex;
     static std::unordered_set<uint64_t> dumped;
     std::lock_guard lock(mutex);
-    if (!dumped.insert(item.code_addr).second) return;
+    if (dumped.contains(module_hash)) return;
     FILE* file = std::fopen(path, "wb");
     const size_t bytes = item.spirv.size() * sizeof(uint32_t);
     const bool ok = file && std::fwrite(item.spirv.data(), 1, bytes, file) == bytes;
     if (file) std::fclose(file);
+    if (ok) dumped.insert(module_hash);
     std::fprintf(stderr,
-                 "[compute]   traced SPIR-V program=0x%llx words=%zu path=%s result=%s\n",
-                 static_cast<unsigned long long>(item.code_addr), item.spirv.size(), path,
+                 "[compute]   traced SPIR-V program=0x%llx module=%016llx words=%zu "
+                 "path=%s result=%s\n",
+                 static_cast<unsigned long long>(item.code_addr),
+                 static_cast<unsigned long long>(module_hash), item.spirv.size(), path,
                  ok ? "written" : "failed");
 }
 
