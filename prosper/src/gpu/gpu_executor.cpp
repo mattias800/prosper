@@ -4921,11 +4921,7 @@ bool resolve_indirect_dispatch_arguments(const GpuState::Dispatch& source,
     resolved.threads_z = args[2];
     resolved.indirect = false;
     const ComputeLaunchDimensions launch = resolve_compute_launch(resolved);
-    constexpr uint32_t kPortableMaxWorkgroups = 65535;
-    if (!launch.groups_x || !launch.groups_y || !launch.groups_z ||
-        launch.groups_x > kPortableMaxWorkgroups ||
-        launch.groups_y > kPortableMaxWorkgroups ||
-        launch.groups_z > kPortableMaxWorkgroups) {
+    if (!launch.groups_x || !launch.groups_y || !launch.groups_z) {
         static std::atomic<int> warned{0};
         if (warned.fetch_add(1) < 24)
             std::fprintf(stderr,
@@ -4937,11 +4933,16 @@ bool resolve_indirect_dispatch_arguments(const GpuState::Dispatch& source,
     }
     if (std::getenv("PROSPER_INDIRECTLOG")) {
         static std::atomic<int> logged{0};
+        const uint64_t code_addr = source.state
+            ? compute_dispatch_code_addr(*source.state, source) : 0;
         if (logged.fetch_add(1) < 256)
             std::fprintf(stderr,
-                         "[agc-indirect] dispatch args=0x%llx dims=%ux%ux%u groups=%ux%ux%u\n",
-                         static_cast<unsigned long long>(source.indirect_args_addr), args[0], args[1],
-                         args[2], launch.groups_x, launch.groups_y, launch.groups_z);
+                         "[agc-indirect] dispatch args=0x%llx code=0x%llx "
+                         "dims=%ux%ux%u groups=%ux%ux%u\n",
+                         static_cast<unsigned long long>(source.indirect_args_addr),
+                         static_cast<unsigned long long>(code_addr),
+                         args[0], args[1], args[2], launch.groups_x, launch.groups_y,
+                         launch.groups_z);
     }
     return true;
 }
