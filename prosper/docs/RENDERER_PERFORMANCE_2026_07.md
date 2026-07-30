@@ -1470,9 +1470,10 @@ is unobservable, and a later external guest write still forces ordinary exact re
 GPU result may skip writeback. An aligned exact storage result also goes directly into its retained GPU
 comparison buffer instead of first filling a host vector that the successful ownership transfer
 immediately clears. If that ownership transfer fails, any older host result fallback is invalidated so
-it cannot suppress a later changed writeback. Separately, sampled-image admission now moves its already-snapshotted source into
-the cache. Small, partial/readable, replay-owned, failed-recovery, and non-GPU-comparable paths retain
-their prior snapshots. `PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB` tunes the cold crossover, while
+it cannot suppress a later changed writeback. Separately, sampled-image admission now moves its
+already-snapshotted source into the cache. Small, partial/readable, replay-owned, failed-recovery, and
+non-GPU-comparable paths retain their prior snapshots. `PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB` tunes the
+cold crossover, while
 `PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1` remains the complete storage-source control.
 
 Matched 160-second native-resolution runs used the same build, route, audio/input frontends, and timing
@@ -1484,6 +1485,12 @@ smaller title-screen use:
 | merged baseline | 88.01 ms | 113.17 ms | 206.61 ms | 103 |
 | cold-result copies removed | 95.19 ms | 68.98 ms | 168.42 ms | 103 |
 | sampled snapshots moved too | 91.53 ms | 12.79 ms | 110.25 ms | 115 |
+
+These measurements predate the adaptive image-cache sizing merged in #1519. That change raises the
+historical 512 MiB default to one eighth of the largest device-local heap, capped at 2 GiB, and should
+reduce how often the same Plucky identities become cold. The table therefore measures the cost of an
+observed cold dispatch, not the frequency or whole-route impact on the current combined renderer; those
+must be measured again on the rebased exact head.
 
 The final dispatch-local total is 46.6% below the merged baseline; writeback is 88.7% lower. Presented
 frame totals varied with route progression (2,430 / 2,209 / 2,544), so they are recorded only as a
