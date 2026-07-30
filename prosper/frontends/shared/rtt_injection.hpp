@@ -12,6 +12,22 @@
 
 namespace prosper::frontend {
 
+// Whether a render pass produces color that may be published as the content of its color0 base.
+//
+// A pass whose every draw masks off all color components (the MRT0 nibble of CB_TARGET_MASK is 0) is a
+// depth/stencil-only pass — a depth prepass, or an occlusion/predication pass. The hardware writes no
+// color for it at all, and its color binding is a dummy: `color0_base` can name a completely different,
+// smaller live surface, while the extent the renderer uses for such a pass is deliberately derived from
+// the viewport to size the DEPTH image rather than from that surface. Publishing its readback as color
+// therefore replaces a real surface with a blank one at the wrong extent, and every later sample of that
+// address reads nothing.
+//
+// The one case where a color-disabled pass does produce color is a programmed fast clear, which the
+// backend applies to the attachment before the draws — so that keeps publishing.
+inline bool pass_publishes_color(bool all_draws_color_write_masked, bool any_draw_has_clear_color) {
+    return !all_draws_color_write_masked || any_draw_has_clear_color;
+}
+
 // An immutable CPU RTT snapshot can back a FrameResource directly only when the consumer uses the
 // producer's exact extent and byte layout. Scaled views still need their owned nearest-neighbor copy;
 // malformed snapshots stay on the guest-decode fallback.

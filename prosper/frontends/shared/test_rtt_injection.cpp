@@ -6,6 +6,7 @@
 
 using prosper::frontend::inject_rtt_pixels;
 using prosper::frontend::exact_rtt_snapshot_borrowable;
+using prosper::frontend::pass_publishes_color;
 using prosper::frontend::RttInjectionCache;
 
 static int failures = 0;
@@ -91,6 +92,17 @@ int main() {
     CHECK(!cache.materialize(
         std::make_shared<const std::vector<uint8_t>>(malformed), 1, 1, 1, 1, 8));
     CHECK(cache.size() == 3);
+
+    // pass_publishes_color (#1510): a pass whose every draw masks off all color components writes no
+    // color, so its readback must not be published as its color0 base's surface or as the presented
+    // frame. DQ VII's title went black because a CB_TARGET_MASK=0 depth prepass, sized from its 4K
+    // viewport, replaced the live 960x1080 bloom target that shared its dummy color base.
+    CHECK(pass_publishes_color(/*all_masked=*/false, /*any_clear=*/false)); // ordinary color pass
+    CHECK(!pass_publishes_color(/*all_masked=*/true, /*any_clear=*/false)); // depth/stencil-only pass
+    // A programmed fast clear is the one case where a color-disabled pass does produce color: the
+    // backend applies it to the attachment before the draws, so that result stays authoritative.
+    CHECK(pass_publishes_color(/*all_masked=*/true, /*any_clear=*/true));
+    CHECK(pass_publishes_color(/*all_masked=*/false, /*any_clear=*/true));
 
     if (!failures) std::printf("rtt_injection: OK\n");
     return failures ? 1 : 0;

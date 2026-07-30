@@ -3935,6 +3935,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                draw->ps.depth_clear_enable || draw->ps.stencil_enable ||
                                draw->ps.stencil_clear_enable;
                     });
+                    // A depth/stencil-only pass writes no color, so its readback must not be published as
+                    // this base's surface nor as the presented frame — see pass_publishes_color(). DQ VII's
+                    // title screen went black exactly this way: a 5-draw CB_TARGET_MASK=0 pass, sized
+                    // 3840x2160 from its viewport, overwrote the live 960x1080 bloom target sharing its
+                    // dummy color base, and the composite then sampled a blank surface (#1510).
+                    const bool publishes_color = prosper::frontend::pass_publishes_color(
+                        color_disabled,
+                        std::any_of(pass.begin(), pass.end(), [](const auto* draw) {
+                            return draw->ps.has_clear_color;
+                        }));
                     if (color_disabled && uses_ds && w && h) {
                         float viewport_x = 0.0f, viewport_y = 0.0f;
                         for (const auto* draw : pass) {
@@ -4261,7 +4271,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         pending_timing.color_target_cached_entries = color_target_call.cached_entries;
                     }
                     auto pass_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(gpx));
-                    if (base && color_target_call.writes) {
+                    if (rtt_log && base && !publishes_color)
+                        fprintf(stderr,
+                                "[rtt] pass target=0x%llx extent=%ux%u (%zu draws) color-disabled -> "
+                                "not published (depth/stencil-only pass, dummy color binding)\n",
+                                (unsigned long long)base, gw, gh, pass.size());
+                    if (base && publishes_color && color_target_call.writes) {
                         RttSurf& surface = g_rtt[base];
                         surface.w = gw;
                         surface.h = gh;
@@ -4296,7 +4311,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 }
                             }
                         }
-                    } else if (base && !pass_pixels->empty()) {
+                    } else if (base && publishes_color && !pass_pixels->empty()) {
                         RttSurf& surface = g_rtt[base];
                         surface.rgba = pass_pixels;
                         surface.w = gw;
@@ -4524,7 +4539,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                         }
                     }
-                    if (!rendered_pixels.empty() && pass_format == VK_FORMAT_R8G8B8A8_UNORM) {
+                    if (!rendered_pixels.empty() && publishes_color &&
+                        pass_format == VK_FORMAT_R8G8B8A8_UNORM) {
                         if (base && base == front_va) px_front = pass_pixels;  // the flipped buffer
                         if (is_vo)                    px_vo = pass_pixels;     // any registered scanout
                         px_last = pass_pixels;                                  // last non-empty (fallback)
