@@ -31,6 +31,10 @@ int main() {
               backend_submission_state(true, true) == BackendSubmissionState::Complete &&
               backend_submission_state(true, false) == BackendSubmissionState::Pending,
           "submission cleanup distinguishes never-submitted, completed, and pending work");
+    CHECK(prosper::test::backend_timestamp_delta(0xfdu, 0x03u, 8) == 6u &&
+              prosper::test::backend_timestamp_delta(11u, 29u, 64) == 18u &&
+              prosper::test::backend_timestamp_delta(11u, 29u, 0) == 0u,
+          "device timestamp deltas handle valid-bit wrap and unsupported queues");
 
     {
         bool speculative_state_valid = true;
@@ -409,6 +413,14 @@ int main() {
             {batched_sample}, W, H, nullptr, nullptr, false, nullptr,
             nullptr, nullptr, nullptr, &submission_batch, true);
         const auto consumer_timing = prosper::test::backend_render_timing_stats();
+        constexpr uint64_t forced_sync_target_id = 0x9940000000000002ull;
+        prosper::test::BackendColorTarget forced_sync_target{
+            forced_sync_target_id, false, true};
+        prosper::test::BackendSubmissionBatch forced_sync_batch;
+        const std::vector<uint8_t> forced_sync_pixels = prosper::test::render_draws_rgba(
+            {producer}, W, H, nullptr, nullptr, false, &forced_sync_target,
+            nullptr, nullptr, nullptr, &forced_sync_batch, false);
+        const auto forced_sync_timing = prosper::test::backend_render_timing_stats();
 #ifdef _WIN32
         _putenv_s("PROSPER_RENDER_TIMING", "");
 #else
@@ -421,6 +433,21 @@ int main() {
                   consumer_timing.command_buffers == 2 &&
                   consumer_timing.queue_submits == 1 && consumer_timing.fence_waits == 1,
               "batched producer-to-sampler output matches synchronous output with one submit/wait");
+        const auto& timing_ctx = prosper::test::render_vk_ctx();
+        const bool gpu_timestamps_supported = timing_ctx.timestamp_valid_bits != 0 &&
+                                              timing_ctx.timestamp_period_ns > 0.0;
+        CHECK(!gpu_timestamps_supported ||
+                  (consumer_timing.gpu_timestamp_samples == 1 &&
+                   consumer_timing.gpu_device_ms > 0.0 &&
+                   consumer_timing.gpu_device_ms <= consumer_timing.gpu_wait_ms),
+              "batched timing reports one device envelope across all command buffers");
+        CHECK(forced_sync_pixels == first && forced_sync_timing.queue_submits == 1 &&
+                  (!gpu_timestamps_supported ||
+                   (forced_sync_timing.gpu_timestamp_samples == 1 &&
+                    forced_sync_timing.gpu_device_ms > 0.0 &&
+                    forced_sync_timing.gpu_device_ms <= forced_sync_timing.gpu_wait_ms)),
+              "synchronous readback closes its device envelope despite a deferred-flush hint");
+        prosper::test::invalidate_persistent_color_target(forced_sync_target_id);
 
         prosper::test::BackendDraw add_green;
         add_green.vs = vert; add_green.fs = green; add_green.ps = &additive;
