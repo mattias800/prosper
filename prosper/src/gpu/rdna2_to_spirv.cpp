@@ -7727,6 +7727,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // SOFFSET is NULL/0. Stores retain their existing stricter paths.
             bool dyn_half = false;   // Float16 components at an arbitrary runtime byte address
             bool dyn_int = false;    // integer sub-dword FORMAT component at a runtime (unaligned) byte addr
+            bool dyn_norm = false;   // normalized sub-dword FORMAT component at an arbitrary byte addr
             bool dyn_int_store = false;  // integer sub-dword FORMAT store via race-free atomic clear+set
             if (packed && !raw_subword) {
                 bool base_aligned;
@@ -7757,6 +7758,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // address (join the straddled dwords, then bfe), so it needs no static alignment.
                     // Only LOADS: the packed store path still rejects sub-dword ints (they don't pack).
                     if (!dyn_half) dyn_int = int_subword && !is_store;
+                    // UNORM/SNORM 8/16 loads use the same runtime extraction, followed by the format's
+                    // normalization. Astro's world-map VS fetches SNORM16x3 with a shader-computed
+                    // SOFFSET; treating it as statically packed rejected the complete map draw.
+                    if (!dyn_half && !dyn_int)
+                        dyn_norm = !packed_word && !is_store && norm != 0.0f &&
+                                   (comp_bytes == 1 || comp_bytes == 2);
                     // An integer sub-dword FORMAT STORE writes ONE lane's disjoint bit field of the
                     // containing dword. A plain masked read-modify-write would race (adjacent lanes' fields
                     // share a dword), but atomicAnd(clear field)+atomicOr(set field) COMMUTE across lanes
@@ -7766,7 +7773,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (!dyn_half && !dyn_int && is_store && int_subword && !offen && !dyn_vfetch &&
                         (offset % comp_bytes) == 0 && (!idxen || (stride % comp_bytes) == 0) && soff_zero)
                         dyn_int_store = true;
-                    if (!dyn_half && !dyn_int && !dyn_int_store) {
+                    if (!dyn_half && !dyn_int && !dyn_norm && !dyn_int_store) {
                         if (getenv("PROSPER_DBG"))
                             fprintf(stderr, "[mubuf-unaligned] pc=%u fmt=%u off=%u offen=%d idxen=%d stride=%u\n",
                                     in.pc, (unsigned)fmt, offset, (int)offen, (int)idxen, stride);
@@ -7954,11 +7961,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     joined = b.ibin(Op_BitwiseOr, joined,
                                     b.sel(b.ucmp(Op_IEqual, shift, b.uconst(0)), b.uconst(0), upper));
                     value = b.unpack_half(joined, 0);
-                } else if (dyn_int) {
-                    // Integer sub-dword FORMAT component k at a runtime byte address (addr + k*comp_bytes):
+                } else if (dyn_int || dyn_norm) {
+                    // Integer/normalized sub-dword FORMAT component k at a runtime byte address
+                    // (addr + k*comp_bytes):
                     // shift the loaded dword right by (byteaddr&3)*8, join the next dword when a 16-bit
-                    // field straddles the boundary, then zero-/sign-extend the comp_bytes*8-bit field.
-                    // Mirrors the raw_subword path but per packed component (stride-1 Uint8, unaligned u16).
+                    // field straddles the boundary, then extend or normalize the low field. Mirrors the
+                    // raw_subword path but per packed component (stride-1 Uint8, unaligned u16/SNORM16).
                     const uint32_t caddr = k ? b.ibin(Op_IAdd, addr, b.uconst(k * comp_bytes)) : addr;
                     const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
                     const uint32_t shift = b.ibin(Op_ShiftLeftLogical,
@@ -7972,8 +7980,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         joined = b.ibin(Op_BitwiseOr, joined,
                                         b.sel(b.ucmp(Op_IEqual, shift, b.uconst(0)), b.uconst(0), upper));
                     }
-                    value = is_sint ? b.bfe_s(joined, b.uconst(0), b.uconst(comp_bytes * 8))
-                                    : b.bfe_u(joined, b.uconst(0), b.uconst(comp_bytes * 8));
+                    value = dyn_norm
+                        ? b.unpack_norm(joined, 0, comp_bytes * 8, is_snorm, norm)
+                        : is_sint ? b.bfe_s(joined, b.uconst(0), b.uconst(comp_bytes * 8))
+                                  : b.bfe_u(joined, b.uconst(0), b.uconst(comp_bytes * 8));
                 } else {
                     // Component k lives at byte k*comp_bytes within the element: pick its dword + field.
                     uint32_t byte_off = k * comp_bytes;

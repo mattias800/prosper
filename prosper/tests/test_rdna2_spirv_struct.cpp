@@ -1647,6 +1647,34 @@ int main() {
     }
     printf("  [ok]   Float16x4 vertex fetch handles a runtime SOFFSET\n");
 
+    // Astro's world-map VS uses the same arbitrary byte-address shape for a three-component SNORM16
+    // attribute. Its stride is dword-aligned, but the shader-computed SOFFSET can select either half
+    // of a dword, and a component beginning at byte three must join the following dword.
+    const uint32_t vs_fetch_snorm16x3_soffset[] = {
+        0xb0040002u,                         // s_movk_i32 s4, 2
+        0xe0082000u, 0x04000405u,            // buffer_load_format_xyz v[4:6], v5, s[0:3], s4 idxen
+        0x7e0e02f2u,                         // v_mov_b32 v7, 1.0
+        0xf80008cfu, 0x07060504u,            // exp pos0 v4,v5,v6,v7
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_snorm16x3;
+    ShaderResource vb_snorm16x3{};
+    vb_snorm16x3.cls = ResourceClass::VertexBuffer;
+    vb_snorm16x3.format = DataFormat::Snorm16;
+    vb_snorm16x3.num_components = 3;
+    vb_snorm16x3.binding = 6;
+    vb_snorm16x3.stride = 28;
+    vb_snorm16x3.fetch_pc = 1;
+    vb_snorm16x3.fetch_index_mode = VertexFetchIndexMode::Shader;
+    rt_snorm16x3.resources.push_back(vb_snorm16x3);
+    const auto snorm16x3_spv = recompile_vertex(
+        vs_fetch_snorm16x3_soffset, std::size(vs_fetch_snorm16x3_soffset), &rt_snorm16x3);
+    if (snorm16x3_spv.empty() || snorm16x3_spv[0] != 0x07230203u) {
+        printf("  [FAIL] SNORM16x3 vertex fetch with runtime SOFFSET did not recompile\n");
+        return 1;
+    }
+    printf("  [ok]   SNORM16x3 vertex fetch handles a runtime SOFFSET\n");
+
     // image_sample LOD mode per execution model (#151): OpImageSampleImplicitLod is only legal in
     // the Fragment execution model — the compute and vertex shells have no derivatives, so an
     // image_sample there must lower to OpImageSampleExplicitLod (LOD 0) or spirv-val rejects the

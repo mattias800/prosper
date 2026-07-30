@@ -1196,13 +1196,23 @@ int main() {
     CHECK(!spv_store16.empty() && store16_out.size() == N / 2 && bad_store16 == 0,
           "#590: stride-2 Uint16 buffer_store_format_x lands disjoint fields race-free (dword k = 2k|(2k+1)<<16)");
 
-    // Kernel 24b (#150): the SAME unorm8x4 fetch but with a NON-dword-aligned inst offset (offset:2).
-    // The packed unpack extracts components at static byte offsets from a dword-aligned base and drops
-    // addr&3, so a non-aligned element base would decode the wrong bits — it must be REJECTED (the
-    // alignment can't be proven) rather than silently mis-decoded. Kernel 24 (offset 0) still succeeds.
+    // Kernel 24b: the SAME unorm8x4 fetch at a NON-dword-aligned inst offset (offset:2). The runtime
+    // normalized-component path must begin at byte 2 of each record and join the following dword for
+    // the later components. Reading v1 back proves the first component is B rather than the old R.
     const uint32_t code24b[] = { 0x7e000f00u, 0xe00c2002u, 0x80020100u, 0xbf810000u };
-    CHECK(recompile_valu(code24b, sizeof(code24b)/sizeof(code24b[0]), 1, /*out_vgpr*/1, &rt24).empty(),
-          "kernel 24b (packed unorm8x4 at a non-dword-aligned offset:2) is REJECTED (not mis-decoded)");
+    std::vector<uint32_t> spv24b = recompile_valu(
+        code24b, std::size(code24b), 1, /*out_vgpr*/1, &rt24);
+    std::vector<uint32_t> vbuf24b = vbuf24;
+    vbuf24b.push_back(0u); // final XYZW fetch straddles one dword past the last record
+    const std::vector<float> got24b = prosper::test::run_compute(
+        spv24b, in24, N, N, {}, vbuf24b);
+    uint32_t bad24b = 0;
+    for (uint32_t i = 0; i < N && got24b.size() == N; ++i) {
+        const float blue = static_cast<float>((vbuf24[i] >> 16) & 0xffu) / 255.0f;
+        if (std::fabs(got24b[i] - blue) > 1e-5f) ++bad24b;
+    }
+    CHECK(!spv24b.empty() && got24b.size() == N && bad24b == 0,
+          "kernel 24b extracts normalized components from a non-dword-aligned runtime address");
 
     // Kernel 25: SNORM16x2 vertex fetch — signed 16-bit fields, normalized /32767 and clamped to -1.0
     // (the SNORM rule: -32768 maps to -1.0, not -1.00003). out = v1 + 10*v2. y is fixed at -32768 to
