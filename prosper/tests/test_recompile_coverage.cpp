@@ -433,6 +433,61 @@ int main() {
                              compute_cfg_dispatch_vcc_gt_zero.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "the complex dispatcher preserves Wave32 VCC_LO > 0 scalar mask semantics");
+    // Astro's world-map traversal intersects three complete Wave32 predicates in VCC_LO, then
+    // branches on the SCC written by the final s_and_b32. Hardware SCC is any(result mask), so an
+    // exact 32-lane native subgroup can lower it without scalarizing or guessing at one lane.
+    std::vector<uint32_t> compute_cfg_dispatch_mask_scc = {
+        0xBE9B037Eu,              // s_mov_b32 s27, exec_lo
+        0x7D8A0A15u,              // v_cmp_* vcc, s21, v5       (Astro PC1079)
+        0x7D8A0AF9u, 0x0686EB19u, // v_cmp_* s107, s25, v5      (Astro PC1080)
+        0x7D8A0AF9u, 0x06869C1Au, // v_cmp_* s28, s26, v5       (Astro PC1082)
+        0x876A6A1Bu,              // s_and_b32 vcc_lo, s27, vcc_lo
+        0x876A6B6Au,              // s_and_b32 vcc_lo, vcc_lo, vcc_hi
+        0x876A1C6Au,              // s_and_b32 vcc_lo, vcc_lo, s28
+        0xBF840001u,              // s_cbranch_scc0 +1
+        0xBF800000u,              // fallthrough work
+    };
+    compute_cfg_dispatch_mask_scc.insert(
+        compute_cfg_dispatch_mask_scc.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_mask_scc.data(),
+                             compute_cfg_dispatch_mask_scc.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the exact Wave32 dispatcher branches on the SCC from a B32 mask intersection");
+    ComputeShaderConfig portable_mask_scc_config = wave32_dispatch_config;
+    portable_mask_scc_config.native_subgroup_size = 0;
+    CHECK(recompile_compute(compute_cfg_dispatch_mask_scc.data(),
+                            compute_cfg_dispatch_mask_scc.size(), &dispatch_rt,
+                            portable_mask_scc_config).empty(),
+          "a portable dispatcher rejects unsynchronized Wave32 mask SCC instead of using stale state");
+    std::vector<uint32_t> compute_cfg_dispatch_ff1 = {
+        0xBE800385u, // s_mov_b32 s0, 5
+        0x7D840000u, // v_cmp_eq_u32 vcc, s0, v0
+        0xBEEA136Au, // s_ff1_i32_b32 vcc_lo, vcc_lo
+        0x7E04026Au, // v_mov_b32 v2, vcc_lo (consume the scalar-data result)
+    };
+    compute_cfg_dispatch_ff1.insert(
+        compute_cfg_dispatch_ff1.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_ff1.data(),
+                             compute_cfg_dispatch_ff1.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the complex dispatcher lowers exact Wave32 s_ff1 mask reduction to scalar data");
+    std::vector<uint32_t> compute_cfg_dispatch_dynamic_writelane = {
+        0x7E780300u,              // v_mov_b32 v60, v0
+        0xBEEB0389u,              // s_mov_b32 vcc_hi, 9 (scalar data)
+        0xBEAD0385u,              // s_mov_b32 s45, 5
+        0xD761003Cu, 0x00005A6Bu, // v_writelane_b32 v60, vcc_hi, s45 (Astro PC1039)
+        0xD7600000u, 0x00005B3Cu, // v_readlane_b32 s0, v60, s45
+        0x7E040200u,              // v_mov_b32 v2, s0 (consume selected scalar)
+    };
+    compute_cfg_dispatch_dynamic_writelane.insert(
+        compute_cfg_dispatch_dynamic_writelane.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_dynamic_writelane.data(),
+                             compute_cfg_dispatch_dynamic_writelane.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the complex dispatcher lowers Astro's exact dynamic v_writelane packet");
     // A physical VCC half may hold ordinary scalar data before a later block starts a mask lifetime
     // in the same word. Block discovery must not retroactively reinterpret the earlier comparison as
     // a wave vote after the B32 dataflow learns about that later lifetime (Astro world-map PC436).

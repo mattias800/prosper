@@ -563,6 +563,28 @@ struct SpirvCompute {
             {t_bool, result, uconst(Scope_Subgroup), value});
         return result;
     }
+    uint32_t native_wave_first_active(uint32_t mask_bit) {
+        if (!native_subgroup_size) return 0;
+        const uint32_t lane = subgroup_local_id();
+        if (!declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
+        }
+        // The exclusive population count is zero only for the first active lane. Exactly one lane
+        // therefore contributes its index to the reduction; an empty mask is distinguished by the
+        // accompanying wave vote. This is exact only under the enforced guest-size subgroup
+        // contract checked by the caller.
+        const uint32_t contribution = sel(mask_bit, uconst(1), uconst(0));
+        uint32_t prefix = id();
+        put(code, Op_GroupNonUniformIAdd,
+            {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, contribution});
+        const uint32_t elected = land(mask_bit, ucmp(Op_IEqual, prefix, uconst(0)));
+        const uint32_t selected_lane = sel(elected, lane, uconst(0));
+        uint32_t first = id();
+        put(code, Op_GroupNonUniformIAdd,
+            {t_u32, first, uconst(Scope_Subgroup), GroupOp_Reduce, selected_lane});
+        return sel(native_wave_any(mask_bit), first, uconst(0xffffffffu));
+    }
     uint32_t native_compute_mbcnt(uint32_t mask_bit, uint32_t acc_bits, uint32_t lo) {
         if (!native_subgroup_size) return 0;
         const uint32_t lane = subgroup_local_id();
@@ -4777,6 +4799,51 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     if (in.has_modifier) { ok = false; return true; }
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
+            if (b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
+                in.opcode == 0x13) { // s_ff1_i32_b32
+                // RDNA2 returns the first set bit from the low end, or 0xffffffff for an empty
+                // source. In Wave32, VCC_LO/EXEC_LO and one-word saved masks are complete scalar
+                // masks. The live Astro traversal kernel uses this to select the first hit lane.
+                // A required 32-wide Vulkan subgroup makes the reduction architectural rather than
+                // an implementation-width approximation.
+                const auto data_value_present = [&](int reg) {
+                    return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
+                };
+                uint32_t mask = 0;
+                if (in.src[0].value == 126 && !data_value_present(126)) {
+                    mask = rs.exec;
+                } else if (in.src[0].value == 106 && !data_value_present(106)) {
+                    mask = rs.vcc;
+                } else if ((in.src[0].kind == OperandKind::SGPR ||
+                            in.src[0].kind == OperandKind::Special) &&
+                           rs.sreg_bool_b32.contains(in.src[0].value) &&
+                           !data_value_present(in.src[0].value)) {
+                    auto saved = rs.sreg_bool.find(in.src[0].value);
+                    if (saved != rs.sreg_bool.end()) mask = saved->second;
+                }
+                if (!mask || in.dst.value == 126 || in.dst.value == 127) {
+                    ok = false;
+                    return true;
+                }
+
+                const uint32_t result = b.native_wave_first_active(mask);
+                rs.sreg[in.dst.value] = result;
+                rs.sreg_srt.erase(in.dst.value);
+                rs.sreg_bool.erase(in.dst.value);
+                rs.sreg_bool_narrowed.erase(in.dst.value);
+                rs.sreg_bool_b32.erase(in.dst.value);
+                if (in.dst.value == 106) {
+                    // VCC_LO is also a physical scalar dword. Preserve its architectural mask view
+                    // for any implicit VCC consumer while publishing the same bits as scalar data.
+                    const uint32_t lane = b.subgroup_local_id();
+                    const uint32_t bit = b.ibin(
+                        Op_BitwiseAnd,
+                        b.ibin(Op_ShiftRightLogical, result, lane), b.uconst(1));
+                    rs.vcc = b.ucmp(Op_INotEqual, bit, b.uconst(0));
+                }
+                // S_FF1 does not modify SCC.
+                return true;
+            }
             if ((b.is_compute || b.is_fragment) && b.wave_size == 64 &&
                 in.opcode == 0x03 && (in.dst.value == 126 || in.dst.value == 127) &&
                 (in.src[0].value == 106 || in.src[0].value == 107) &&
@@ -6950,14 +7017,43 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // SCALAR-SPILL lane slots (#273): v_writelane_b32 (0x361) / v_readlane_b32 (0x360) with a
             // COMPILE-TIME lane index — the pack-scalars-into-a-VGPR's-lanes idiom (DOLL's big post PS
             // spills 19 s_buffer_load results into v36 and reads them back). Per-invocation each
-            // (vgpr, lane) is a named wave-uniform scalar. The portable NGG vertex shell additionally
-            // projects an ordinary VGPR read from any physical lane onto its one represented live
-            // lane; this is the same collapsed-wave contract used for MBCNT and Function LDS. Other
-            // compute/fragment stages use a native subgroup shuffle for ordinary VGPR reads and
-            // therefore support both scalar and inline lane selectors. Neither op is EXEC-predicated
-            // on hardware, so no predicate_write.
+            // (vgpr, lane) is a named wave-uniform scalar. An exact native compute wave also supports
+            // a dynamic writelane selector by updating the one matching subgroup invocation in an
+            // ordinary VGPR lifetime. The portable NGG vertex shell additionally projects an ordinary
+            // VGPR read from any physical lane onto its one represented live lane; this is the same
+            // collapsed-wave contract used for MBCNT and Function LDS. Other compute/fragment stages
+            // use a native subgroup shuffle for ordinary VGPR reads and therefore support both scalar
+            // and inline lane selectors. Neither op is EXEC-predicated on hardware, so no
+            // predicate_write.
             // VERIFIED(round-trip llvm-mc gfx1030: 0xd761 v_writelane_b32 / 0xd760 v_readlane_b32).
             if (in.opcode == 0x361) {                                 // v_writelane_b32 vDST, sSRC, lane
+                if (b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
+                    in.src[1].kind != OperandKind::InlineInt) {
+                    // RDNA2 masks the scalar selector to the Wave32 lane range and replaces VDST
+                    // only in that physical lane. Under the enforced 32-wide native-subgroup
+                    // contract, SubgroupLocalInvocationId is that architectural lane. The scalar
+                    // source and selector are uniform, so this needs no shuffle or barrier. Astro's
+                    // traversal kernel reaches this form after readlane publishes its chosen hit as
+                    // scalar data.
+                    if (in.src[1].kind == OperandKind::VGPR ||
+                        rs.vgpr_lane_slots.count(in.dst.value) ||
+                        rs.vgpr_lane_mask_slots.count(in.dst.value)) {
+                        ok = false; return true;
+                    }
+                    const uint32_t value = val(in.src[0]);
+                    const uint32_t selector = val(in.src[1]);
+                    if (!ok) return true;
+                    const uint32_t lane = b.subgroup_local_id();
+                    const uint32_t selected = b.ucmp(
+                        Op_IEqual, lane,
+                        b.ibin(Op_BitwiseAnd, selector, b.uconst(31)));
+                    rs.vreg[in.dst.value] = b.sel(
+                        selected, value, vreg_old(b, rs, in.dst.value));
+                    rs.invalidated_vgpr_lane_slots.erase(in.dst.value);
+                    rs.vgpr_lane_slots.erase(in.dst.value);
+                    rs.vgpr_lane_mask_slots.erase(in.dst.value);
+                    return true;
+                }
                 if (in.src[1].kind != OperandKind::InlineInt || in.src[1].value < 0 || in.src[1].value > 63) {
                     ok = false; return true;
                 }
@@ -9761,6 +9857,31 @@ bool emit_cfg_state_machine(
                           : in.opcode == 0x09;                // 0 >= mask
     };
 
+    // A Wave32 B32 logical writes SCC=any(result mask). The ordinary lane-local emitter poisons
+    // that SCC because it cannot reduce a guest wave by itself. Inside an exact native dispatcher,
+    // however, every lane reaches the same switch case and an immediately consuming SCC branch can
+    // use one exact subgroup vote. Restrict the vote to the last architectural SCC writer before
+    // the branch; generated traversal kernels often chain several mask intersections and only the
+    // final result is live, so voting after every intermediate AND would add needless hot-loop work.
+    auto b32_mask_logical_opcode = [](uint32_t opcode) {
+        return opcode == 0x0e || opcode == 0x10 || opcode == 0x12 ||
+               opcode == 0x14 || opcode == 0x16 || opcode == 0x18 ||
+               opcode == 0x1a || opcode == 0x1c;
+    };
+    std::unordered_set<uint32_t> native_b32_mask_scc_vote_pcs;
+    if (b.native_subgroup_size && proven_wave32_masks) {
+        for (size_t i = 0; i + 1 < ins.size(); ++i) {
+            const Rdna2Inst& producer = ins[i];
+            const Rdna2Inst& consumer = ins[i + 1];
+            if (producer.fmt == Rdna2Format::SOP2 &&
+                b32_mask_logical_opcode(producer.opcode) &&
+                consumer.fmt == Rdna2Format::SOPP &&
+                (consumer.opcode == 0x04 || consumer.opcode == 0x05) &&
+                producer.pc + producer.len_dwords == consumer.pc)
+                native_b32_mask_scc_vote_pcs.insert(producer.pc);
+        }
+    }
+
     // Split at every branch target/fallthrough and around every cross-lane operation. Case values are
     // dense block indices, not guest PCs. A cross-lane op must end its block so the common synchronized
     // phase can publish its result before any invocation advances to the following guest instruction.
@@ -10566,6 +10687,13 @@ bool emit_cfg_state_machine(
                         std::fprintf(stderr, "[cfg-recompile-reject] pc=%u fmt=%d op=0x%x\n",
                                      in.pc, static_cast<int>(in.fmt), in.opcode);
                     return false;
+                }
+                if (!state.scc && native_b32_mask_scc_vote_pcs.contains(in.pc)) {
+                    const auto result = state.sreg_bool.find(in.dst.value);
+                    if (result == state.sreg_bool.end() ||
+                        !state.sreg_bool_b32.contains(in.dst.value))
+                        return reject_cfg(in.pc, "missing-b32-mask-scc-source");
+                    state.scc = b.native_wave_any(result->second);
                 }
             }
             const bool last = member + 1 == dispatch_blocks[dispatch].size();

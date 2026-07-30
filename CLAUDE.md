@@ -272,9 +272,15 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   reaches 1.5 GB, so a few sessions of ordinary capture work exhaust the quota. When that happens it does
   not just fail your write — it **eats the machine's RAM and kills the Bash tool outright for every
   agent**, because the harness stores each command's output under `$TMPDIR`. Put captures, frame dumps,
-  screenshots and logs in a gitignored worktree-local directory or under `/var/tmp` (real disk, and
-  `systemd-tmpfiles` already ages it), and always build with `TMPDIR` off the tmpfs — gcc's compile
-  temporaries are large enough on their own to break a `-j8` build with
+  screenshots and logs under **`$HOME`** — a gitignored worktree-local directory, or a scratch directory
+  such as `~/dq-work/`. **Do not send a run's artifacts to `/var/tmp`: distrobox shares `$HOME` but NOT
+  `/var/tmp`**, so anything the emulator writes there lands in the *container's* private `/var/tmp` and is
+  invisible from the host (the host path shows up inside the container as `/run/host/var/tmp`). The shell
+  redirect that captures a run log happens on the host, so a `/var/tmp` run directory silently ends up
+  holding only the log while every screenshot and capsule goes somewhere you cannot see. `/var/tmp` is
+  still fine for host-side scratch (it is real disk and `systemd-tmpfiles` ages it) — just not for output
+  produced inside the container. Always build with `TMPDIR` off the tmpfs too; gcc's compile temporaries
+  are large enough on their own to break a `-j8` build with
   `error writing to /tmp/ccXXXX.s: Disk quota exceeded`:
   ```bash
   mkdir -p <worktree>/build/tmpdir
@@ -443,6 +449,21 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   **Do NOT add "Generated with Claude Code" attribution lines** (the 🤖 badge, "Generated with
   [Claude Code](...)" footers, session links) to PR bodies, commit messages, issue text, or
   comments — anywhere. They are noise in the project record; the co-author trailer alone is enough.
+- **Never publish the developer machine's local paths.** This repository is public. An absolute path
+  leaks the account name and the private directory layout of someone's computer, and it is never the
+  information a reader needs — the *shape* of the command is. So keep absolute host paths out of commit
+  messages, PR titles/bodies/comments, issue text and review comments, and out of committed files
+  (docs, scripts, tests, code comments). Use placeholders instead, or a path relative to the repository:
+  ```text
+  <REPO_ROOT>    the checkout root          <WORKTREE>   a worktree root
+  <DUMP_ROOT>    where the game dumps live  ~/           the developer's home
+  ```
+  So write `-DGAME_DUMP=<DUMP_ROOT>/PPSA24651-app0`, not the real path, and
+  `cd <WORKTREE> && cmake --build build -j6`. Paths *inside* the repo (`prosper/src/gpu/…`) and generic
+  system paths (`/usr/lib64/libc.so.6`, `/tmp`, `/var/tmp`) are fine — the rule is about the private
+  part above the repository root. This is a privacy matter, not a security one: nothing here is secret,
+  and it still should not be published. Sanitize before you post; if something already published slipped
+  through, edit it (`gh api -X PATCH repos/OWNER/REPO/issues/comments/<id> -f body=…` edits a comment).
 - **Track work in GitHub issues** (`gh issue ...`). The rules:
   - **Any bug you find but do not fix in the same session gets an issue, immediately**, while the
     context is fresh: exact `file:line`, the concrete failure scenario (inputs/state → wrong

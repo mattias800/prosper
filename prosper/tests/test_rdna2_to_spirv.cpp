@@ -585,6 +585,122 @@ int main() {
     CHECK(has_spirv_local_size(native_spv17d, 64, 1, 1),
           "multidimensional guest wave flattens Vulkan LocalSize X for full subgroups");
 
+    // Kernel 17d1: Astro's Wave32 BVH traversal turns a VOPC predicate into the first matching
+    // lane with s_ff1_i32_b32, then immediately uses VCC_LO as ordinary scalar data. The first
+    // subgroup has one match at lane 5; the second subgroup is empty and must return -1. Store the
+    // scalar result from every invocation so real Vulkan execution checks the complete reduction.
+    const uint32_t code17d1[] = {
+        0xbe800385u,              // s_mov_b32 s0, 5
+        0x7d840000u,              // v_cmp_eq_u32 vcc, s0, v0
+        0xbeea136au,              // s_ff1_i32_b32 vcc_lo, vcc_lo (exact live destination/source)
+        0x7e02026au,              // v_mov_b32 v1, vcc_lo (scalar-data lifetime)
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable rt17d1;
+    { ShaderResource dst{}; dst.cls = ResourceClass::ConstantBuffer;
+      dst.format = DataFormat::Uint32; dst.num_components = 1;
+      dst.binding = 3; dst.stride = 4; dst.sgpr_base = 8;
+      rt17d1.resources.push_back(dst); }
+    ComputeShaderConfig native_cfg17d1;
+    native_cfg17d1.local_x = 64;
+    native_cfg17d1.wave_size = 32;
+    native_cfg17d1.native_subgroup_size = 32;
+    // Astro's traversal combines three VOPC masks, then immediately branches on the SCC written by
+    // the final B32 AND. Keep the irreducible dispatcher tail from kernel 17d and prove that this
+    // exact native path adds one (and only one) subgroup vote for the live final intersection.
+    std::vector<uint32_t> code17d1s = {
+        0xbe9b037eu,              // s_mov_b32 s27, exec_lo
+        0x7d8a0a15u,              // v_cmp_* vcc, s21, v5
+        0x7d8a0af9u, 0x0686eb19u, // v_cmp_* s107, s25, v5
+        0x7d8a0af9u, 0x06869c1au, // v_cmp_* s28, s26, v5
+        0x876a6a1bu,              // s_and_b32 vcc_lo, s27, vcc_lo
+        0x876a6b6au,              // s_and_b32 vcc_lo, vcc_lo, vcc_hi
+        0x876a1c6au,              // s_and_b32 vcc_lo, vcc_lo, s28
+        0xbf840001u,              // s_cbranch_scc0 +1
+        0xbf800000u,              // fallthrough work
+    };
+    code17d1s.insert(code17d1s.end(), std::begin(code17d), std::end(code17d));
+    const std::vector<uint32_t> native_spv17d32 = recompile_compute(
+        code17d, std::size(code17d), nullptr, native_cfg17d1);
+    const std::vector<uint32_t> native_spv17d1s = recompile_compute(
+        code17d1s.data(), code17d1s.size(), nullptr, native_cfg17d1);
+    CHECK(!native_spv17d32.empty() && !native_spv17d1s.empty() &&
+              count_spirv_opcode(native_spv17d1s, 335) ==
+                  count_spirv_opcode(native_spv17d32, 335) + 1,
+          "Wave32 mask SCC branch emits only the final live subgroup-any vote");
+    ComputeShaderConfig portable_cfg17d1s = native_cfg17d1;
+    portable_cfg17d1s.native_subgroup_size = 0;
+    CHECK(recompile_compute(code17d1s.data(), code17d1s.size(), nullptr,
+                            portable_cfg17d1s).empty(),
+          "Wave32 mask SCC branch rejects without an exact native subgroup contract");
+    const std::vector<uint32_t> native_spv17d1 = recompile_compute(
+        code17d1, std::size(code17d1), &rt17d1, native_cfg17d1);
+    CHECK(!native_spv17d1.empty() && count_spirv_opcode(native_spv17d1, 349) >= 2 &&
+              count_spirv_opcode(native_spv17d1, 335) >= 1,
+          "Wave32 s_ff1_i32_b32 lowers to an exact first-active subgroup reduction");
+    ComputeShaderConfig portable_cfg17d1 = native_cfg17d1;
+    portable_cfg17d1.native_subgroup_size = 0;
+    CHECK(recompile_compute(code17d1, std::size(code17d1), &rt17d1,
+                            portable_cfg17d1).empty(),
+          "s_ff1_i32_b32 rejects without an exact 32-lane subgroup contract");
+    const auto subgroup17d1 = prosper::test::default_compute_subgroup_properties();
+    const bool can_execute17d1 = subgroup17d1.size == 32 &&
+        (subgroup17d1.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup17d1.operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
+        (subgroup17d1.operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+    if (can_execute17d1) {
+        std::vector<uint32_t> initial17d1(64, 0u), got17d1;
+        prosper::test::run_compute(native_spv17d1, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, initial17d1, &got17d1);
+        uint32_t bad17d1 = 0;
+        for (uint32_t lane = 0; lane < 64 && got17d1.size() == 64; ++lane) {
+            const uint32_t expected = lane < 32 ? 5u : 0xffffffffu;
+            bad17d1 += got17d1[lane] != expected;
+        }
+        CHECK(got17d1.size() == 64 && bad17d1 == 0,
+              "Wave32 s_ff1 returns lane 5 for a hit and -1 for an empty mask");
+    } else {
+        std::printf("  [skip] s_ff1 execution: host default subgroup is %u or lacks vote/arithmetic\n",
+                    subgroup17d1.size);
+    }
+
+    // Kernel 17d1w: the next Astro traversal instruction writes a scalar-data VCC_HI value to the
+    // VGPR lane selected by s45. Preserve v1's local-id value in every other lane so execution tests
+    // both halves of V_WRITELANE's read/modify/write behavior. These are the exact GFX10 packets for
+    // a dynamic scalar selector; the selector is not an inline lane-slot spill.
+    const uint32_t code17d1w[] = {
+        0x7e020300u,              // v_mov_b32 v1, v0
+        0xbeeb0389u,              // s_mov_b32 vcc_hi, 9 (ordinary scalar-data lifetime)
+        0xbead0385u,              // s_mov_b32 s45, 5
+        0xd7610001u, 0x00005a6bu, // v_writelane_b32 v1, vcc_hi, s45
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> native_spv17d1w = recompile_compute(
+        code17d1w, std::size(code17d1w), &rt17d1, native_cfg17d1);
+    CHECK(!native_spv17d1w.empty(),
+          "Wave32 dynamic v_writelane_b32 lowers under an exact native subgroup contract");
+    CHECK(recompile_compute(code17d1w, std::size(code17d1w), &rt17d1,
+                            portable_cfg17d1).empty(),
+          "dynamic v_writelane_b32 rejects without an exact 32-lane subgroup contract");
+    if (can_execute17d1) {
+        std::vector<uint32_t> initial17d1w(64, 0u), got17d1w;
+        prosper::test::run_compute(native_spv17d1w, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, initial17d1w, &got17d1w);
+        uint32_t bad17d1w = 0;
+        for (uint32_t lane = 0; lane < 64 && got17d1w.size() == 64; ++lane) {
+            const uint32_t wave_lane = lane & 31u;
+            const uint32_t expected = wave_lane == 5 ? 9u : lane;
+            bad17d1w += got17d1w[lane] != expected;
+        }
+        CHECK(got17d1w.size() == 64 && bad17d1w == 0,
+              "dynamic v_writelane changes only selected lane 5 in each Wave32");
+    } else {
+        std::printf("  [skip] dynamic writelane execution: host default subgroup is %u\n",
+                    subgroup17d1.size);
+    }
+
     // Kernel 17d2: Astro's mask-priority sequence compares a VOPC-produced SGPR pair against zero,
     // then uses that wave-uniform SCC in s_cselect_b64.  Keep the irreducible prefix so this exercises
     // the generic dispatcher.  Wave 0's mask is empty and selects all lanes; wave 1 has one set bit in
