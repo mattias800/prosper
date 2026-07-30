@@ -689,6 +689,56 @@ int main() {
               astro_bvh_table.resources[0].fetch_pc == 0,
           "Astro BVH bytes materialize as the instruction-scoped read-only compute buffer");
 
+    // Astro's first world-map dispatch explicitly writes a null qword to the root pointer consumed
+    // by this scalar chain. Preserve that fact only through the exact dependent descriptor ALU, and
+    // only when an EXEC-changing instruction plus forward EXECZ branch dominates the ray use. This
+    // is deliberately stricter than the old generic unresolved-BVH fallback rejected in review.
+    alignas(8) uint64_t null_bvh_root = 0;
+    const uint64_t null_bvh_root_addr = reinterpret_cast<uint64_t>(&null_bvh_root);
+    std::array<uint32_t, 8> null_bvh_seed{};
+    null_bvh_seed[0] = static_cast<uint32_t>(null_bvh_root_addr);
+    null_bvh_seed[1] = static_cast<uint32_t>(null_bvh_root_addr >> 32);
+    std::array<uint32_t, 24> guarded_null_bvh = {
+        0xBEAB446Au,                         // pc0:  Astro s_andn1_saveexec_b32 (narrows EXEC)
+        0xBF880014u,                         // pc1:  s_cbranch_execz pc22
+        0xF4040080u, 0xFA000000u,            // pc2:  s_load_dwordx2 s[2:3], s[0:1], 0 -> null
+        0xBF8CC07Fu,                         // pc4:  s_waitcnt
+        0xF4040181u, 0xFA000058u,            // pc5:  s_load_dwordx2 s[6:7], s[2:3], 0x58
+        0xBF8CC07Fu,                         // pc7:  s_waitcnt
+        0x8006C106u,                         // pc8:  s_add_u32 s6,s6,-1
+        0x8207C107u,                         // pc9:  s_addc_u32 s7,s7,-1
+        0x876A07FFu, 0x000003FFu,            // pc10: s_and_b32 s106, 0x3ff, s7
+        0x9484FF02u, 0x00280008u,            // pc12: s_bfe_u64 s[4:5], s[2:3], 8:40
+        0x8807FF6Au, 0x81000000u,            // pc14: s_or_b32 s7, s106, TYPE/mode
+        0xBE851D9Fu,                         // pc16: s_bitset1_b32 s5,31 (SORT field)
+        0xF1989F07u, 0x00010303u, 0x094F4E3Fu, 0x11100F0Eu, 0x00001312u,
+        0xBF800000u,                         // pc22: merge
+        0xBF810000u,                         // pc23: s_endpgm
+    };
+    std::vector<SrtUse> guarded_null_uses;
+    resolve_dynamic_fetch(guarded_null_bvh.data(), guarded_null_bvh.size(),
+                          null_bvh_seed.data(), null_bvh_seed.size(), 0,
+                          &guarded_null_uses);
+    CHECK(guarded_null_uses.size() == 1 && guarded_null_uses[0].kind == 3 &&
+              guarded_null_uses[0].use_pc == 17,
+          "mapped null BVH root plus dominating EXEC guard publishes an exact-pc null use");
+    ShaderResourceTable guarded_null_table;
+    add_compute_buffer_resources(guarded_null_table, guarded_null_bvh.data(),
+                                 guarded_null_bvh.size(), null_bvh_seed.data(),
+                                 null_bvh_seed.size());
+    CHECK(guarded_null_table.resources.size() == 1 &&
+              is_proven_null_bvh(guarded_null_table.resources[0]) &&
+              guarded_null_table.resources[0].fetch_pc == 17,
+          "proven null BVH materializes as a bounded capture-stable marker");
+
+    guarded_null_bvh[1] = 0xBF800000u;       // remove the EXECZ region proof
+    std::vector<SrtUse> unguarded_null_uses;
+    resolve_dynamic_fetch(guarded_null_bvh.data(), guarded_null_bvh.size(),
+                          null_bvh_seed.data(), null_bvh_seed.size(), 0,
+                          &unguarded_null_uses);
+    CHECK(unguarded_null_uses.empty(),
+          "mapped null BVH root without a dominating EXEC guard remains fail-visible");
+
     // Recreate the live descriptor builder rather than seeding its final words: the header pointer
     // is stored in 8-byte units, the allocation count is loaded from byte offset 0x58, and a
     // carry-propagating subtract produces the 64-byte count-minus-one before TYPE/mode are ORed in.

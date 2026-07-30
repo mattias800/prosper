@@ -26,6 +26,9 @@ struct GuestWriteEvent {
 
 // The opt-in live history is enabled by either the existing dimension probe or its explicit alias.
 bool writer_provenance_enabled();
+// Explicit provenance requests retain even tiny label/pointer writes. The dimension probes keep
+// their historical large-resource filter so their diagnostic overhead does not unexpectedly grow.
+bool writer_provenance_full_enabled();
 const char* guest_writer_kind_name(GuestWriterKind kind);
 
 uint64_t record_guest_write(GuestWriterKind kind, uint64_t addr, uint64_t size,

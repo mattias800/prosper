@@ -5301,6 +5301,23 @@ int main() {
         };
         for (uint32_t lane = 0; lane < lanes; ++lane) set_ray(lane, 5u, 0.0f, 0.0f, -5.0f);
 
+        alignas(256) static std::array<uint8_t, 256> null_bvh_bytes{};
+        ShaderResourceTable null_bvh_rt = bvh_rt;
+        null_bvh_rt.resources[0].gpu_addr = 0;
+        null_bvh_rt.resources[0].size = static_cast<uint32_t>(null_bvh_bytes.size());
+        null_bvh_rt.resources[0].host_data = null_bvh_bytes.data();
+        null_bvh_rt.resources[0].host_data_size = null_bvh_bytes.size();
+        const std::vector<uint32_t> null_bvh_module = recompile_valu(
+            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &null_bvh_rt);
+        const std::vector<float> null_bvh_output = prosper::test::run_compute(
+            null_bvh_module, bvh_inputs, lanes, lanes,
+            std::vector<uint32_t>(null_bvh_bytes.size() / sizeof(uint32_t)));
+        bool null_bvh_ok = !null_bvh_module.empty() && null_bvh_output.size() == lanes;
+        for (float value : null_bvh_output)
+            null_bvh_ok &= bits_of(value) == 0xffffffffu;
+        CHECK(null_bvh_ok,
+              "proven guarded null BVH returns architectural no-hit child IDs");
+
         std::vector<uint32_t> box_words(32, 0u);
         box_words[0] = 0x100u; box_words[1] = 0x200u;
         box_words[2] = 0x300u; box_words[3] = 0x400u;
