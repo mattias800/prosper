@@ -50,7 +50,7 @@ int main() {
           "image residency policy includes each crossover exactly without caching smaller inputs");
     CHECK(prosper::frontend::storage_writeback_can_tile_mapped_bytes(
               true, 27, false, false),
-          "native tiled storage can feed mapped bytes directly to the tiler");
+          "exact-width tiled storage can feed mapped bytes directly to the tiler");
     CHECK(!prosper::frontend::storage_writeback_can_tile_mapped_bytes(
               false, 27, false, false),
           "converted storage retains its mutable packed buffer");
@@ -907,6 +907,119 @@ int main() {
         CHECK(run_format_copy(DataFormat::Float10_11_11, 3, 4, s) == s,
               "R11G11B10 storage copy round-trips native packed texels bit-exact (#590)");
     }
+    {   // No native R11 storage: shader-side R32_UINT packing must preserve every f11 code.
+        constexpr uint32_t PACKED_W = 2048;
+        std::vector<uint32_t> indices(PACKED_W), src(PACKED_W), dst(PACKED_W, 0x5a5a5a5au);
+        for (uint32_t t = 0; t < PACKED_W; ++t) {
+            indices[t] = t;
+            src[t] = t | (((t * 1031u) & 0x7ffu) << 11) | ((t & 0x3ffu) << 22);
+        }
+        ShaderResourceTable packed_rt = irt;
+        for (ShaderResource& resource : packed_rt.resources) {
+            if (resource.binding == 0) {
+                resource.gpu_addr = reinterpret_cast<uint64_t>(indices.data());
+                resource.size = static_cast<uint32_t>(indices.size() * sizeof(uint32_t));
+            }
+            if (resource.binding != 4 && resource.binding != 5) continue;
+            resource.img_dim = 1;
+            resource.format = DataFormat::Float10_11_11;
+            resource.num_components = 3;
+            resource.width = PACKED_W;
+            resource.height = resource.depth = 1;
+            resource.tile_mode = 0;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(
+                resource.binding == 4 ? src.data() : dst.data());
+            resource.size = PACKED_W * sizeof(uint32_t);
+        }
+        const std::vector<uint32_t> packed_spirv = recompile_valu(
+            image_copy_2d, std::size(image_copy_2d), 1, 0, &packed_rt);
+        const auto packed_report = validate_spirv_descriptor_interface(
+            packed_spirv, &packed_rt, 0, SpirvShaderStage::Compute, false);
+        CHECK(!packed_spirv.empty() && packed_report.ok() &&
+                  packed_report.descriptors.size() == 4 &&
+                  packed_report.descriptors[2].storage_image_format == kSpirvImageFormatR32ui &&
+                  packed_report.descriptors[3].storage_image_format == kSpirvImageFormatR32ui,
+              "R11G11B10 fallback recompiles both 2D storage views as typed R32ui");
+        if (!packed_spirv.empty()) {
+            ComputeItem packed_item;
+            packed_item.spirv = packed_spirv;
+            packed_item.resources = std::make_shared<ShaderResourceTable>(packed_rt);
+            packed_item.launch.threads_x = PACKED_W;
+            packed_item.launch.local_x = 64;
+            packed_item.launch.groups_x = PACKED_W / 64;
+            packed_item.launch.local_y = packed_item.launch.local_z = 1;
+            packed_item.launch.groups_y = packed_item.launch.groups_z = 1;
+            packed_item.code_addr = 0x590b10;
+            const bool packed_executed =
+                prosper::frontend::execute_live_compute_items({packed_item});
+            if (packed_executed && dst != src) {
+                const auto mismatch = std::mismatch(src.begin(), src.end(), dst.begin());
+                const size_t index = static_cast<size_t>(mismatch.first - src.begin());
+                std::printf("  packed R11 mismatch texel=%zu src=%08x dst=%08x\n",
+                            index, src[index], dst[index]);
+            }
+            CHECK(packed_executed && dst == src,
+                  "shader-side R11G11B10 pack/unpack round-trips every encoded f11 value exactly");
+        }
+
+        // Also compare arbitrary raw f32 channel bits against the CPU's exact RNE oracle. The
+        // representable-code round-trip above cannot exercise values on either side of a packing
+        // boundary, negative clamping, f32 underflow, overflow, or payload truncation.
+        std::vector<uint32_t> float_channels(PACKED_W * 4), expected(PACKED_W);
+        const uint32_t edge_bits[] = {
+            0x00000000u, 0x00000001u, 0x007fffffu, 0x00800000u,
+            0x80000000u, 0xbf800000u, 0x3f800000u, 0x3f810000u,
+            0x477fe000u, 0x477ff000u, 0x47800000u, 0x7f800000u,
+            0xff800000u, 0x7f800001u, 0x7fc12345u, 0xffc54321u,
+        };
+        auto bits_float = [](uint32_t bits) {
+            float value = 0.0f;
+            std::memcpy(&value, &bits, sizeof(value));
+            return value;
+        };
+        for (uint32_t t = 0; t < PACKED_W; ++t) {
+            for (uint32_t c = 0; c < 4; ++c)
+                float_channels[t * 4 + c] = t < std::size(edge_bits)
+                    ? edge_bits[(t + c * 5u) % std::size(edge_bits)]
+                    : (t * 2654435761u + c * 2246822519u);
+            expected[t] = static_cast<uint32_t>(float_to_f11(
+                              bits_float(float_channels[t * 4 + 0]))) |
+                          (static_cast<uint32_t>(float_to_f11(
+                              bits_float(float_channels[t * 4 + 1]))) << 11) |
+                          (static_cast<uint32_t>(float_to_f10(
+                              bits_float(float_channels[t * 4 + 2]))) << 22);
+        }
+        std::fill(dst.begin(), dst.end(), 0x5a5a5a5au);
+        ShaderResourceTable conversion_rt = packed_rt;
+        for (ShaderResource& resource : conversion_rt.resources) {
+            if (resource.binding != 4 && resource.binding != 5) continue;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(
+                resource.binding == 4 ? float_channels.data() : dst.data());
+            if (resource.binding == 4) {
+                resource.format = DataFormat::Float32;
+                resource.num_components = 4;
+                resource.size = static_cast<uint32_t>(float_channels.size() * sizeof(uint32_t));
+            }
+        }
+        const std::vector<uint32_t> conversion_spirv = recompile_valu(
+            image_copy_2d, std::size(image_copy_2d), 1, 0, &conversion_rt);
+        if (!conversion_spirv.empty()) {
+            ComputeItem conversion_item;
+            conversion_item.spirv = conversion_spirv;
+            conversion_item.resources = std::make_shared<ShaderResourceTable>(conversion_rt);
+            conversion_item.launch.threads_x = PACKED_W;
+            conversion_item.launch.local_x = 64;
+            conversion_item.launch.groups_x = PACKED_W / 64;
+            conversion_item.launch.local_y = conversion_item.launch.local_z = 1;
+            conversion_item.launch.groups_y = conversion_item.launch.groups_z = 1;
+            conversion_item.code_addr = 0x590b11;
+            CHECK(prosper::frontend::execute_live_compute_items({conversion_item}) &&
+                      dst == expected,
+                  "shader-side R11G11B10 packing matches the CPU oracle for arbitrary f32 bits");
+        } else {
+            CHECK(false, "mixed Float32-to-R11G11B10 storage conversion recompiles");
+        }
+    }
 
     // The backend publishes ordinary tiled texels, not hardware-compressed blocks. Prove that a
     // DCC-enabled storage destination atomically becomes the uncompressed (0xff) metadata state,
@@ -1580,6 +1693,72 @@ int main() {
               "writable renderer RTT publishes guest writeback for cache invalidation");
     }
     set_guest_gpu_write_observer({});
+    set_live_target_reader({});
+    set_live_target_query({});
+
+    // The exact packed fallback must obey the same authority rule. Keep stale zeroes in guest RAM,
+    // publish distinct R11G11B10 renderer pixels, overwrite only row zero, and require every other
+    // row to survive from the snapshot rather than the stale allocation.
+    std::vector<uint32_t> packed_rtt_source(W * TILED_H);
+    std::vector<uint32_t> packed_rtt_guest(W * TILED_H, 0);
+    auto packed_rtt = std::make_shared<std::vector<uint8_t>>(W * TILED_H * sizeof(uint32_t));
+    std::vector<uint32_t> packed_rtt_expected(W * TILED_H);
+    for (size_t t = 0; t < packed_rtt_source.size(); ++t) {
+        packed_rtt_source[t] = static_cast<uint32_t>(float_to_f11((t % 19u) * 0.25f)) |
+            (static_cast<uint32_t>(float_to_f11((t % 23u) * 0.375f)) << 11) |
+            (static_cast<uint32_t>(float_to_f10((t % 29u) * 0.5f)) << 22);
+        const uint32_t live_word = static_cast<uint32_t>(float_to_f11((t % 31u) * 0.125f)) |
+            (static_cast<uint32_t>(float_to_f11((t % 37u) * 0.1875f)) << 11) |
+            (static_cast<uint32_t>(float_to_f10((t % 41u) * 0.3125f)) << 22);
+        std::memcpy(packed_rtt->data() + t * sizeof(live_word), &live_word, sizeof(live_word));
+        packed_rtt_expected[t] = live_word;
+    }
+    std::copy_n(packed_rtt_source.begin(), W, packed_rtt_expected.begin());
+    ShaderResourceTable packed_writable_rt = tiled2d_rt;
+    for (ShaderResource& resource : packed_writable_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.format = DataFormat::Float10_11_11;
+        resource.num_components = 3;
+        resource.tile_mode = 0;
+        resource.size = W * TILED_H * sizeof(uint32_t);
+        resource.gpu_addr = reinterpret_cast<uint64_t>(
+            resource.binding == 4 ? packed_rtt_source.data() : packed_rtt_guest.data());
+    }
+    const uint64_t packed_writable_addr =
+        reinterpret_cast<uint64_t>(packed_rtt_guest.data());
+    set_live_target_query(
+        [packed_writable_addr](uint64_t addr) { return addr == packed_writable_addr; });
+    set_live_target_reader(
+        [packed_writable_addr, packed_rtt](uint64_t addr, LiveTargetSnapshot& snapshot) {
+            if (addr != packed_writable_addr) return false;
+            snapshot.width = W;
+            snapshot.height = TILED_H;
+            snapshot.format = LiveTargetPixelFormat::R11G11B10Float;
+            snapshot.pixels = packed_rtt;
+            return true;
+        });
+    const std::vector<uint32_t> packed_writable_spirv = recompile_valu(
+        image_copy_2d, std::size(image_copy_2d), 1, 0, &packed_writable_rt);
+    CHECK(!packed_writable_spirv.empty(),
+          "partial R11G11B10 renderer RTT copy kernel recompiles");
+    if (!packed_writable_spirv.empty()) {
+        ComputeItem item;
+        item.spirv = packed_writable_spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(packed_writable_rt);
+        item.launch.threads_x = W;
+        item.launch.local_x = 64;
+        item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x590b12;
+        CHECK(prosper::frontend::execute_live_compute_items({item}),
+              "live backend partially writes an authoritative packed renderer RTT");
+        CHECK(packed_rtt_guest == packed_rtt_expected,
+              "packed renderer RTT seeds from live pixels and preserves every untouched row");
+        CHECK(std::any_of(packed_rtt_guest.begin() + W, packed_rtt_guest.end(),
+                          [](uint32_t word) { return word != 0; }),
+              "packed renderer RTT never falls back to its stale zeroed guest backing");
+    }
     set_live_target_reader({});
     set_live_target_query({});
 

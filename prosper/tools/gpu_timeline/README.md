@@ -56,6 +56,7 @@ PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=/tmp/dead-cells-gameplay.prgbundle \
 PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=1000 \
 PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=1024 \
 PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM=642x362 \
+PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DRAW_INDEX=0:8 \
 PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=636x420 \
 PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=77:85 \
 PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=91 \
@@ -190,6 +191,11 @@ unique-byte budget enforcement remains authoritative.
 that writes a target with that extent. Use it when native-speed lifetime evidence identifies the beginning of
 the relevant surface family; earlier submits remain in the timeline but do not perturb progression or consume
 bundle budget. The matching start submit is included.
+
+`PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DRAW_INDEX=MIN:MAX` additionally requires that the start extent
+occur in the zero-based semantic draw-index window. Use it when an extent is shared by unrelated boot and
+gameplay passes; it prevents the earlier pass from starting an expensive rolling capture. It requires
+`PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM` and does not change the independent endpoint selector.
 
 `PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1` terminates the process after the selected standalone
 capsule and any requested bundle have been installed successfully. Use it for long captures instead of a

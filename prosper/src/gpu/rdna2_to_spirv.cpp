@@ -86,7 +86,7 @@ enum : uint32_t {
     ImgOp_Offset=0x10,                   // ImageOperands bit: dynamic texel offset (needs ImageGatherExtended)
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
-    ImgFmt_R32ui=33,         // exact uint32 storage image format required by image atomics
+    ImgFmt_R32ui=kSpirvImageFormatR32ui, // exact uint32 storage image format required by image atomics
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Grad=4, ImgOp_Sample=0x40,   // ImageOperands bits.
     SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
     MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage-buffer/LDS AcquireRelease semantics
@@ -238,6 +238,7 @@ struct SpirvCompute {
     // subgroup size equal to the PS5 wave. Native votes/scans are then architecture-exact.
     uint32_t native_subgroup_size=0;
     uint32_t native_storage_format_support=0;
+    bool packed_r11_storage=true;
     uint32_t compute_min_subgroup_size=0;             // non-semantic backend contract (4/16/32/64)
     uint32_t fragment_required_subgroup_size=0;       // exact guest-wave contract (32 or 64)
     uint32_t v_subgroupid=0, v_subgroup_localid=0, t_ptr_in_u32=0;
@@ -956,6 +957,77 @@ struct SpirvCompute {
         uint32_t half = ibin(Op_ShiftLeftLogical, raw, uconst(bits == 11 ? 4u : 5u));
         return unpack_half(half, 0);
     }
+    // Round a 24-bit significand right by a dynamic amount using round-to-nearest-even. SPIR-V
+    // shifts by the word width are undefined, so clamp the executed shift and select zero for the
+    // large-shift case (the significand is then strictly below halfway).
+    uint32_t round_shift_even_u32(uint32_t value, uint32_t shift) {
+        const uint32_t safe_shift = uext2(Glsl_UMin, shift, uconst(31));
+        const uint32_t nonzero_shift = uext2(Glsl_UMax, safe_shift, uconst(1));
+        const uint32_t rounded = ibin(Op_ShiftRightLogical, value, nonzero_shift);
+        const uint32_t one_shifted = ibin(Op_ShiftLeftLogical, uconst(1), nonzero_shift);
+        const uint32_t remainder = ibin(
+            Op_BitwiseAnd, value, ibin(Op_ISub, one_shifted, uconst(1)));
+        const uint32_t halfway_shift = ibin(Op_ISub, nonzero_shift, uconst(1));
+        const uint32_t halfway = ibin(Op_ShiftLeftLogical, uconst(1), halfway_shift);
+        const uint32_t above = ucmp(Op_UGreaterThan, remainder, halfway);
+        const uint32_t tie = land(
+            ucmp(Op_IEqual, remainder, halfway),
+            ucmp(Op_INotEqual, ibin(Op_BitwiseAnd, rounded, uconst(1)), uconst(0)));
+        const uint32_t incremented = ibin(Op_IAdd, rounded, sel(lor(above, tie), uconst(1), uconst(0)));
+        const uint32_t finite = sel(ucmp(Op_IEqual, shift, uconst(0)), value, incremented);
+        return sel(ucmp(Op_UGreaterThanEqual, shift, uconst(32)), uconst(0), finite);
+    }
+    // Exact inverse of unpack_ufloat for R11G11B10 stores. This mirrors float_to_f11/f10 without
+    // going through binary16, which would double-round values near the shortened-mantissa ties.
+    uint32_t pack_ufloat(uint32_t bits, uint32_t mantissa_bits) {
+        const uint32_t exponent = bfe_u(bits, uconst(23), uconst(8));
+        const uint32_t mantissa = ibin(Op_BitwiseAnd, bits, uconst(0x7fffff));
+        const uint32_t sign = ibin(Op_ShiftRightLogical, bits, uconst(31));
+        const uint32_t exponent_bits = uconst(0x1fu << mantissa_bits);
+        const uint32_t mantissa_mask = uconst((1u << mantissa_bits) - 1u);
+
+        const uint32_t payload_shifted = ibin(
+            Op_ShiftRightLogical, mantissa, uconst(23u - mantissa_bits));
+        const uint32_t payload = sel(
+            ucmp(Op_IEqual, payload_shifted, uconst(0)), uconst(1), payload_shifted);
+        const uint32_t special = sel(
+            ucmp(Op_IEqual, mantissa, uconst(0)), exponent_bits,
+            ibin(Op_BitwiseOr, exponent_bits, payload));
+
+        const uint32_t significand = ibin(Op_BitwiseOr, uconst(0x800000), mantissa);
+        const uint32_t sub_shift = ibin(
+            Op_ISub, uconst(136u - mantissa_bits), exponent);
+        const uint32_t sub_rounded = round_shift_even_u32(significand, sub_shift);
+        const uint32_t subnormal = sel(
+            ucmp(Op_UGreaterThanEqual, sub_rounded, uconst(1u << mantissa_bits)),
+            uconst(1u << mantissa_bits), sub_rounded);
+
+        const uint32_t normal_rounded = round_shift_even_u32(
+            significand, uconst(23u - mantissa_bits));
+        const uint32_t carry = ucmp(
+            Op_IEqual, normal_rounded, uconst(1u << (mantissa_bits + 1u)));
+        const uint32_t target_exponent = ibin(Op_ISub, exponent, uconst(112));
+        const uint32_t carried_exponent = ibin(
+            Op_IAdd, target_exponent, sel(carry, uconst(1), uconst(0)));
+        const uint32_t carried_mantissa = sel(
+            carry, uconst(0), ibin(Op_BitwiseAnd, normal_rounded, mantissa_mask));
+        const uint32_t normal_finite = ibin(
+            Op_BitwiseOr,
+            ibin(Op_ShiftLeftLogical, carried_exponent, uconst(mantissa_bits)),
+            carried_mantissa);
+        const uint32_t normal = sel(
+            ucmp(Op_UGreaterThanEqual, carried_exponent, uconst(31)),
+            exponent_bits, normal_finite);
+
+        const uint32_t finite = sel(
+            ucmp(Op_ULessThanEqual, exponent, uconst(112)), subnormal,
+            sel(ucmp(Op_UGreaterThanEqual, exponent, uconst(143)), exponent_bits, normal));
+        const uint32_t invalid = lor(
+            ucmp(Op_INotEqual, sign, uconst(0)), ucmp(Op_IEqual, exponent, uconst(0)));
+        const uint32_t ordinary = sel(invalid, uconst(0), finite);
+        // Infinity and NaN are handled before the sign clamp, matching the guest conversion.
+        return sel(ucmp(Op_IEqual, exponent, uconst(0xff)), special, ordinary);
+    }
     // Inverse of unpack_norm: pack a float VGPR (bits) into a `bits`-wide UNORM/SNORM integer field:
     // clamp to [0,1] (unsigned) or [-1,1] (signed), scale by `norm`, round-to-nearest-even, mask to width.
     uint32_t pack_norm(uint32_t fbits, uint32_t bits, bool is_signed, float norm) {
@@ -1355,8 +1427,9 @@ struct SpirvCompute {
     }
 
     // --- STORAGE images (MIMG image_load / image_store WITHOUT a sampler; compute copy/blit) ---
-    // Integer/packed formats use a UINT-sampled OpTypeImage and the host converts between raw VGPR
-    // channels and guest texels. Four-channel UNORM8/FLOAT16/FLOAT32 use a FLOAT-sampled image instead:
+    // Integer/packed formats use a UINT-sampled OpTypeImage. The portable host path converts between
+    // raw VGPR channels and guest texels; the exact R11G11B10 fallback instead packs one R32ui word
+    // in the shader. Four-channel UNORM8/FLOAT16/FLOAT32 use a FLOAT-sampled image instead:
     // Vulkan then performs exactly the descriptor's normalized/float load-store conversion and the
     // host can stage the guest texels at their native width. VGPRs remain raw u32 bits; float image
     // components are bitcast at this boundary. Both paths use Format=Unknown and therefore require
@@ -1369,6 +1442,7 @@ struct SpirvCompute {
     std::unordered_map<uint32_t, uint32_t> stg_img_var;    // binding -> storage-image OpVariable id
     std::unordered_map<uint32_t, bool> stg_img_float;      // binding -> float (rather than uint) texels
     std::unordered_map<uint32_t, uint32_t> stg_img_format; // binding -> SPIR-V Image Format
+    std::unordered_map<uint32_t, bool> stg_img_packed_r11; // binding -> R11G11B10 packed in R32ui
     bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false, declared_ms = false, declared_msarray = false;
     static uint32_t stg_key(uint32_t dim, bool arrayed, bool ms, bool float_texel,
                             uint32_t image_format) {
@@ -1379,7 +1453,8 @@ struct SpirvCompute {
     // multisampled) at set 0, `binding`. Float and uint sampled types are keyed separately.
     void declare_storage_image(uint32_t binding, uint32_t dim, bool arrayed = false,
                                bool ms = false, bool float_texel = false,
-                               uint32_t image_format = ImgFmt_Unknown) {
+                               uint32_t image_format = ImgFmt_Unknown,
+                               bool packed_r11 = false) {
         if (dim == Dim_1D && !declared_sampled1d) {   // SPIR-V: Dim=1D needs Sampled1D; storage 1D also needs Image1D
             put(caps, Op_Capability, {Cap_Sampled1D});
             put(caps, Op_Capability, {Cap_Image1D});
@@ -1404,6 +1479,7 @@ struct SpirvCompute {
         stg_img_var[binding] = v;
         stg_img_float[binding] = float_texel;
         stg_img_format[binding] = image_format;
+        stg_img_packed_r11[binding] = packed_r11;
     }
     // Build the integer coordinate operand from `n` raw-bit VGPR coords (u32 texel indices, incl. the
     // array layer as the last component for arrayed images). n=1 -> scalar u32; 2 -> uvec2; 3 -> uvec3.
@@ -1444,6 +1520,15 @@ struct SpirvCompute {
         uint32_t res   = id();
         if (ms) put(code, Op_ImageRead, {vector_type, res, img, coord, ImgOp_Sample, sample});
         else    put(code, Op_ImageRead, {vector_type, res, img, coord});
+        if (stg_img_packed_r11[binding]) {
+            uint32_t packed = id();
+            put(code, Op_CompositeExtract, {t_u32, packed, res, 0});
+            out[0] = unpack_ufloat(packed, 0, 11);
+            out[1] = unpack_ufloat(packed, 11, 11);
+            out[2] = unpack_ufloat(packed, 22, 10);
+            out[3] = bcu(fconstf(1.0f));
+            return;
+        }
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id();
             put(code, Op_CompositeExtract, {float_texel ? t_f32 : t_u32, e, res, c});
@@ -1467,7 +1552,14 @@ struct SpirvCompute {
                                     stg_img_var[binding]});
         uint32_t coord = stg_coord(ncoord, coords);
         uint32_t texel = id();
-        if (float_texel)
+        if (stg_img_packed_r11[binding]) {
+            const uint32_t r = pack_ufloat(vals[0], 6);
+            const uint32_t g = ibin(Op_ShiftLeftLogical, pack_ufloat(vals[1], 6), uconst(11));
+            const uint32_t b = ibin(Op_ShiftLeftLogical, pack_ufloat(vals[2], 5), uconst(22));
+            const uint32_t packed = ibin(Op_BitwiseOr, ibin(Op_BitwiseOr, r, g), b);
+            put(code, Op_CompositeConstruct,
+                {t_v4u(), texel, packed, uconst(0), uconst(0), uconst(0)});
+        } else if (float_texel)
             put(code, Op_CompositeConstruct,
                 {t_v4f, texel, bcf(vals[0]), bcf(vals[1]), bcf(vals[2]), bcf(vals[3])});
         else
@@ -8122,6 +8214,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     res->format, components, res->srgb,
                     (b.native_storage_format_support &
                      native_storage_format_support_bit(res->format, components)) != 0);
+                const bool packed_r11 = !native_float && b.packed_r11_storage && ordinary_2d &&
+                    !arrayed && !ms && !is_atomic &&
+                    res->format == DataFormat::Float10_11_11 && components == 3;
                 // Existing load/store-only uint images retain the raw uvec4/Format=Unknown contract
                 // used by the compute backend. The atomic's exact R32_UINT gate above is the only path
                 // that opts into a typed R32ui image.
@@ -8134,7 +8229,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else {
                     const bool native_r32ui = is_atomic;
                     b.declare_storage_image(res->binding, dim, arrayed, ms, native_float,
-                                            native_r32ui ? ImgFmt_R32ui : ImgFmt_Unknown);
+                                            (native_r32ui || packed_r11)
+                                                ? ImgFmt_R32ui : ImgFmt_Unknown,
+                                            packed_r11);
                 }
                 // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):
                 // split across the extra address dwords — coord0 = VADDR, coord k>=1 = byte (k-1) of
@@ -11552,6 +11649,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     b.native_subgroup_size = config.native_subgroup_size == wave_size &&
         local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
     b.native_storage_format_support = config.native_storage_format_support;
+    b.packed_r11_storage = config.packed_r11_storage;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
     b.allow_b32_masks = wave_size == 32;

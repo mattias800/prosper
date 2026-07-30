@@ -186,6 +186,7 @@ struct ShaderCompileKey {
     uint32_t compute_lds_bytes = 0;
     uint32_t compute_native_subgroup_size = 0;
     uint32_t compute_native_storage_format_support = 0;
+    bool compute_packed_r11_storage = true;
     uint32_t vertex_lds_dwords = 0;
     uint32_t vertices_per_instance = 0;
     // Aliases ShaderCodeAnalysis::code and keeps that immutable analysis alive. Warm lookups used to
@@ -235,6 +236,7 @@ struct ShaderCompileKey {
                compute_native_subgroup_size == other.compute_native_subgroup_size &&
                compute_native_storage_format_support ==
                    other.compute_native_storage_format_support &&
+               compute_packed_r11_storage == other.compute_packed_r11_storage &&
                vertex_lds_dwords == other.vertex_lds_dwords &&
                vertices_per_instance == other.vertices_per_instance &&
                resources == other.resources && same_code && same_chain_code;
@@ -297,6 +299,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.compute_lds_bytes);
             hash = hash_mix(hash, key.compute_native_subgroup_size);
             hash = hash_mix(hash, key.compute_native_storage_format_support);
+            hash = hash_mix(hash, key.compute_packed_r11_storage);
         }
         hash = hash_mix(hash, key.vertex_lds_dwords);
         hash = hash_mix(hash, key.vertices_per_instance);
@@ -902,6 +905,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         key.compute_native_subgroup_size = compute_config->native_subgroup_size;
         key.compute_native_storage_format_support =
             compute_config->native_storage_format_support;
+        key.compute_packed_r11_storage = compute_config->packed_r11_storage;
     }
     const std::shared_ptr<const ShaderCodeAnalysis> analysis =
         code && dwords ? analyze_shader_code_cached(code, dwords) : nullptr;
@@ -3796,9 +3800,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
             shared_vulkan.storage_image_write_without_format;
         config.native_storage_format_support = shared_compute_adoptable
             ? shared_vulkan.native_storage_format_support : 0;
+        config.packed_r11_storage =
+            std::getenv("PROSPER_NO_PACKED_R11_STORAGE") == nullptr;
         // Realized captures store SPIR-V but not enough raw compute launch state to recompile a
         // device-specific typed-storage module on replay. Compile capture-bound dispatches through
-        // the portable raw-uvec4 path so optional format support never becomes an artifact ABI.
+        // device-independent storage paths (raw uvec4 or exact packed R32ui), so optional format
+        // support never becomes an artifact ABI.
         const bool capture_bound = std::getenv("PROSPER_GPU_CAPTURE") ||
             std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
             interactive_gpu_capture_armed() || interactive_capture_bundle_active();
