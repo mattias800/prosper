@@ -923,7 +923,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 uint64_t backend_gpu_timestamp_samples = 0;
                 double backend_target_ms = 0, backend_draw_setup_ms = 0;
                 double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
-                double backend_gpu_execute_ms = 0;
+                double backend_gpu_device_ms = 0;
                 double backend_readback_ms = 0, backend_cleanup_ms = 0;
                 double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
                 double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
@@ -978,7 +978,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 pending_timing.backend_draw_setup_ms += backend.draw_setup_ms;
                 pending_timing.backend_record_upload_ms += backend.record_upload_ms;
                 pending_timing.backend_gpu_wait_ms += backend.gpu_wait_ms;
-                pending_timing.backend_gpu_execute_ms += backend.gpu_execute_ms;
+                pending_timing.backend_gpu_device_ms += backend.gpu_device_ms;
                 pending_timing.backend_readback_ms += backend.readback_ms;
                 pending_timing.backend_cleanup_ms += backend.cleanup_ms;
                 pending_timing.backend_setup_shader_ms += backend.setup_shader_ms;
@@ -1001,8 +1001,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     "[rtt-timing] submit=%d target=0x%llx extent=%ux%u draws=%zu "
                     "span=%d/%d authoritative=%d deferred=%d cmd=%llu submit=%llu wait=%llu "
                     "measured=%.2f detail=%.2f other=%.2f target_setup=%.2f "
-                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f "
-                    "gpu_device=%.2f gpu_overhead=%.2f timestamps=%llu "
+                    "draw_setup=%.2f record_upload=%.2f batch_wait=%.2f "
+                    "batch_device=%.2f batch_overhead=%.2f batch_timestamps=%llu "
                     "readback=%.2f cleanup=%.2f gpu_target=%llu load=%llu sample=%llu cpu=%llu\n",
                     record.submit, (unsigned long long)record.target,
                     record.width, record.height, record.draws,
@@ -1014,8 +1014,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     record.measured_ms, detail_ms,
                     record.measured_ms - detail_ms,
                     timing.target_ms, timing.draw_setup_ms, timing.record_upload_ms,
-                    timing.gpu_wait_ms, timing.gpu_execute_ms,
-                    std::max(0.0, timing.gpu_wait_ms - timing.gpu_execute_ms),
+                    timing.gpu_wait_ms, timing.gpu_device_ms,
+                    std::max(0.0, timing.gpu_wait_ms - timing.gpu_device_ms),
                     (unsigned long long)timing.gpu_timestamp_samples,
                     timing.readback_ms, timing.cleanup_ms,
                     (unsigned long long)record.color_target.writes,
@@ -4780,7 +4780,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     uint64_t backend_gpu_timestamp_samples = 0;
                     double backend_target_ms = 0, backend_draw_setup_ms = 0;
                     double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
-                    double backend_gpu_execute_ms = 0;
+                    double backend_gpu_device_ms = 0;
                     double backend_readback_ms = 0, backend_cleanup_ms = 0;
                     double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
                     double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
@@ -4818,7 +4818,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     timing.backend_draw_setup_ms += pending_timing.backend_draw_setup_ms;
                     timing.backend_record_upload_ms += pending_timing.backend_record_upload_ms;
                     timing.backend_gpu_wait_ms += pending_timing.backend_gpu_wait_ms;
-                    timing.backend_gpu_execute_ms += pending_timing.backend_gpu_execute_ms;
+                    timing.backend_gpu_device_ms += pending_timing.backend_gpu_device_ms;
                     timing.backend_readback_ms += pending_timing.backend_readback_ms;
                     timing.backend_cleanup_ms += pending_timing.backend_cleanup_ms;
                     timing.backend_setup_shader_ms += pending_timing.backend_setup_shader_ms;
@@ -4882,8 +4882,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             totals.backend_ms / nsub, backend_detail_ms / nsub,
                             totals.backend_target_ms / nsub, totals.backend_draw_setup_ms / nsub,
                             totals.backend_record_upload_ms / nsub, totals.backend_gpu_wait_ms / nsub,
-                            totals.backend_gpu_execute_ms / nsub,
-                            std::max(0.0, totals.backend_gpu_wait_ms - totals.backend_gpu_execute_ms) / nsub,
+                            totals.backend_gpu_device_ms / nsub,
+                            std::max(0.0, totals.backend_gpu_wait_ms - totals.backend_gpu_device_ms) / nsub,
                             totals.backend_readback_ms / nsub, totals.backend_cleanup_ms / nsub,
                             (totals.backend_ms - backend_detail_ms) / nsub);
                     fprintf(stderr,
@@ -5047,8 +5047,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             window.backend_ms / wn, window_backend_detail_ms / wn,
                             window.backend_target_ms / wn, window.backend_draw_setup_ms / wn,
                             window.backend_record_upload_ms / wn, window.backend_gpu_wait_ms / wn,
-                            window.backend_gpu_execute_ms / wn,
-                            std::max(0.0, window.backend_gpu_wait_ms - window.backend_gpu_execute_ms) / wn,
+                            window.backend_gpu_device_ms / wn,
+                            std::max(0.0, window.backend_gpu_wait_ms - window.backend_gpu_device_ms) / wn,
                             window.backend_readback_ms / wn, window.backend_cleanup_ms / wn,
                             (window.backend_ms - window_backend_detail_ms) / wn);
                     fprintf(stderr,

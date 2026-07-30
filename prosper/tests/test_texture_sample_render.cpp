@@ -429,10 +429,10 @@ int main() {
         const bool gpu_timestamps_supported = timing_ctx.timestamp_valid_bits != 0 &&
                                               timing_ctx.timestamp_period_ns > 0.0;
         CHECK(!gpu_timestamps_supported ||
-                  (consumer_timing.gpu_timestamp_samples == 2 &&
-                   consumer_timing.gpu_execute_ms >= 0.0 &&
-                   consumer_timing.gpu_execute_ms <= consumer_timing.gpu_wait_ms + 0.25),
-              "batched timing reports one bounded device interval per command buffer");
+                  (consumer_timing.gpu_timestamp_samples == 1 &&
+                   consumer_timing.gpu_device_ms > 0.0 &&
+                   consumer_timing.gpu_device_ms <= consumer_timing.gpu_wait_ms),
+              "batched timing reports one device envelope across all command buffers");
 
         prosper::test::BackendDraw add_green;
         add_green.vs = vert; add_green.fs = green; add_green.ps = &additive;
