@@ -18,9 +18,9 @@ gap this investigation found is #1483.
 Headless, native Vulkan, no diagnostic substitution. Run from a worktree build:
 
 ```bash
-distrobox enter ps5ys -- bash -lc "cd <worktree> && \
-  env PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_GUEST_ARGS= TMPDIR=<worktree>/build/tmpdir \
-  ./build/screenshot /var/home/mattias800/repos/ps5ys/PPSA17942-app0 \
+distrobox enter ps5ys -- bash -lc "cd <WORKTREE> && \
+  env PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_GUEST_ARGS= TMPDIR=<WORKTREE>/build/tmpdir \
+  ./build/screenshot <DUMP_ROOT>/PPSA17942-app0 \
   --seconds 9 --count 30 --out DIR --timeout 900"
 ```
 
