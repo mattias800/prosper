@@ -553,7 +553,7 @@ struct RenderVkCtx {
     // occlusion queries. Enabled at device creation only when advertised; inert otherwise.
     bool pipeline_stats_enabled = false;
     bool occlusion_precise = false;
-    // Geometry-probe (PROSPER_GEOM_PROBE): VK_EXT_transform_feedback for capturing gl_Position.
+    // Geometry-probe (PROSPER_GEOM_PROBE): transform feedback for final clip-space positions.
     bool transform_feedback_enabled = false;
     bool subgroup_size_control = false;
     bool compute_full_subgroups = false;
@@ -749,8 +749,8 @@ inline const RenderVkCtx& render_vk_ctx() {
                       r.subgroup_operations = subgroup_core_properties.supportedOperations;
                   }
               }
-              // Geometry-probe (PROSPER_GEOM_PROBE): transform feedback to capture gl_Position. Enable
-              // only the base transformFeedback feature (VS-only capture; geometryStreams not needed).
+              // Geometry-probe (PROSPER_GEOM_PROBE): capture the last pre-rasterization stage. Enable
+              // only the base transformFeedback feature; separate geometry streams are not needed.
               if (!strcmp(de[i].extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) {
                   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
                   f2.pNext = &tf_features; vkGetPhysicalDeviceFeatures2(r.phys, &f2);
@@ -5111,7 +5111,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
 
     // Geometry probe (PROSPER_GEOM_PROBE=N): capture draw N's post-transform clip-space vertices via
     // transform feedback and report where they land (degenerate / off-screen / behind-camera / NaN).
-    // Requires VK_EXT_transform_feedback + the VS recompiled with gl_Position xfb-decorated (gated on
+    // Requires VK_EXT_transform_feedback + the last pre-rasterization shader xfb-decorated (gated on
     // the same env var in gpu_executor). Only active with the env var, TF support, AND a flush here.
     const char* geom_env = getenv("PROSPER_GEOM_PROBE");
     uint64_t geom_target = 0;

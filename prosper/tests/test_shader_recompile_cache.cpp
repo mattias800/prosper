@@ -712,6 +712,25 @@ int main() {
               stats.misses == chain_misses + 1,
           "changing only the chained main shader invalidates compiled cache identity");
 
+    clear_shader_recompile_cache();
+    uint64_t normal_identity = 0, capture_identity = 0, repeated_capture_identity = 0;
+    const auto normal_vertex = recompile_graphics_shader_cached(
+        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr,
+        &normal_identity);
+    const auto capture_vertex = recompile_graphics_shader_cached(
+        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr,
+        &capture_identity, false, 0, true);
+    const auto repeated_capture_vertex = recompile_graphics_shader_cached(
+        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr,
+        &repeated_capture_identity, false, 0, true);
+    stats = shader_recompile_cache_stats();
+    CHECK(!normal_vertex.empty() && !capture_vertex.empty() &&
+              normal_vertex != capture_vertex && normal_identity != capture_identity &&
+              capture_vertex == repeated_capture_vertex &&
+              capture_identity == repeated_capture_identity &&
+              stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
+          "geometry-probe vertex capture has a distinct, reusable cache identity");
+
     if (failures) {
         std::printf("== FAIL: %d ==\n", failures);
         return 1;

@@ -163,6 +163,7 @@ struct ShaderCompileKey {
     ShaderProgramStage stage = ShaderProgramStage::Vertex;
     bool has_resource_table = false;
     bool force_position_w = false;
+    bool capture_position = false;
     bool has_pixel_inputs = false;
     PixelInputMapping pixel_inputs{};
     bool has_system_inputs = false;
@@ -207,6 +208,7 @@ struct ShaderCompileKey {
         return stage == other.stage &&
                has_resource_table == other.has_resource_table &&
                force_position_w == other.force_position_w &&
+               capture_position == other.capture_position &&
                has_pixel_inputs == other.has_pixel_inputs &&
                pixel_inputs == other.pixel_inputs &&
                has_system_inputs == other.has_system_inputs &&
@@ -260,6 +262,7 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, static_cast<uint32_t>(key.stage));
         hash = hash_mix(hash, key.has_resource_table);
         hash = hash_mix(hash, key.force_position_w);
+        hash = hash_mix(hash, key.capture_position);
         hash = hash_mix(hash, key.has_pixel_inputs);
         if (key.has_pixel_inputs) {
             hash = hash_mix(hash, key.pixel_inputs.valid_mask);
@@ -863,7 +866,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                                          size_t chain_dwords = 0,
                                          uint32_t vertex_lds_dwords = 0,
                                          const ComputeShaderConfig* compute_config = nullptr,
-                                         bool fragment_wave32 = false) {
+                                         bool fragment_wave32 = false,
+                                         bool capture_position = false) {
     ShaderCompileKey key;
     key.stage = stage;
     key.vertex_lds_dwords = stage == ShaderProgramStage::Vertex
@@ -872,6 +876,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         ? resources->vertices_per_instance : 0u;
     key.has_resource_table = resources != nullptr;
     key.force_position_w = getenv("PROSPER_FORCE_W") != nullptr;
+    key.capture_position = stage == ShaderProgramStage::Vertex && capture_position;
     key.has_pixel_inputs = stage != ShaderProgramStage::Compute && pixel_inputs != nullptr;
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
@@ -994,18 +999,17 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
     const uint32_t* code = !key.code || key.code->empty() ? nullptr : key.code->data();
     const size_t code_size = key.code ? key.code->size() : 0u;
     if (stage == ShaderProgramStage::Vertex)
-        // Geometry probe (PROSPER_GEOM_PROBE): decorate gl_Position for transform-feedback capture on
-        // the LIVE path (which recompiles here). Capsule replay substitutes an xfb VS in gpu_replay,
-        // because a capsule stores already-recompiled SPIR-V. Inert to the shader's computation.
+        // Geometry probe: decorate gl_Position only when the caller proved the VS is the last
+        // pre-rasterization stage. Generated interpolation geometry stages own XFB themselves.
         return key.chain_code
             ? recompile_vertex_chain(code, code_size, key.chain_code->data(),
                                      key.chain_code->size(), resources,
                                      key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
-                                     getenv("PROSPER_GEOM_PROBE") != nullptr,
+                                     key.capture_position,
                                      key.vertex_lds_dwords)
             : recompile_vertex(code, code_size, resources,
                                key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
-                               getenv("PROSPER_GEOM_PROBE") != nullptr,
+                               key.capture_position,
                                key.vertex_lds_dwords);
     if (stage == ShaderProgramStage::Fragment) {
         const FragmentInterpolationLayout interpolation = fragment_interpolation_layout(
@@ -1224,11 +1228,12 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
-        bool fragment_wave32, uint32_t vertex_lds_dwords) {
+        bool fragment_wave32, uint32_t vertex_lds_dwords,
+        bool vertex_capture_position) {
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
                                                    system_inputs, nullptr, 0,
                                                    vertex_lds_dwords, nullptr,
-                                                   fragment_wave32);
+                                                   fragment_wave32, vertex_capture_position);
     return cache_compiled_graphics_shader(stage, std::move(key), resources, cache_identity);
 }
 
@@ -1236,10 +1241,11 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
         const uint32_t* prolog, size_t prolog_dwords,
         const uint32_t* main, size_t main_dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
-        uint64_t* cache_identity, uint32_t vertex_lds_dwords) {
+        uint64_t* cache_identity, uint32_t vertex_lds_dwords,
+        bool capture_position) {
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Vertex, prolog, prolog_dwords, resources, pixel_inputs, nullptr,
-        main, main_dwords, vertex_lds_dwords);
+        main, main_dwords, vertex_lds_dwords, nullptr, false, capture_position);
     if (!key.chain_code) {
         if (cache_identity) *cache_identity = 0;
         return {};
@@ -1252,10 +1258,11 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
-        bool fragment_wave32, uint32_t vertex_lds_dwords) {
+        bool fragment_wave32, uint32_t vertex_lds_dwords,
+        bool vertex_capture_position) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
-        fragment_wave32, vertex_lds_dwords);
+        fragment_wave32, vertex_lds_dwords, vertex_capture_position);
     return words ? *words : std::vector<uint32_t>{};
 }
 

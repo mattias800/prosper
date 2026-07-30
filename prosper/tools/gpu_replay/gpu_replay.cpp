@@ -64,6 +64,7 @@ void usage(const char* argv0) {
                          "[--dump-realized-shader DRAW:vs|vs-main|fs PATH] "
                          "[--override-compute-spv N PATH] "
                          "[--dump-failed-shader FAILURE:STAGE PATH] "
+                         "[--retry-failed-chain FAILURE] "
                          "[--retry-failed-stage FAILURE:STAGE] "
                          "[--dump-compute-resource N:BINDING PATH] "
                          "[--legacy-htile-before-stencil] "
@@ -1376,7 +1377,7 @@ int main(int argc, char** argv) {
     std::string compute_override_spec, compute_override_path;
     std::string compute_resource_spec, compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
-    std::string retry_failed_stage_spec;
+    std::string retry_failed_chain_spec, retry_failed_stage_spec;
     std::string realized_shader_spec, realized_shader_path;
     std::string rtt_seed_path;
     std::string graph_json_path, prepend_path;
@@ -1507,6 +1508,8 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-failed-shader" && i + 2 < argc) {
             failed_shader_spec = argv[++i]; failed_shader_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--retry-failed-chain" && i + 1 < argc)
+            retry_failed_chain_spec = argv[++i];
         else if (std::string(argv[i]) == "--retry-failed-stage" && i + 1 < argc)
             retry_failed_stage_spec = argv[++i];
         else positional.push_back(argv[i]);
@@ -1523,6 +1526,7 @@ int main(int argc, char** argv) {
             !realized_shader_spec.empty() ||
             !compute_override_spec.empty() ||
             !compute_resource_spec.empty() || !failed_shader_spec.empty() ||
+            !retry_failed_chain_spec.empty() ||
             !prepend_path.empty() || !draw_steps_prefix.empty()) {
             usage(argv[0]); return 2;
         }
@@ -1651,11 +1655,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[recompile-raw] substituted vs=%zu fs=%zu kept-stored vs=%zu fs=%zu of %zu draws\n",
                      vs_swapped, fs_swapped, vs_kept, fs_kept, replay.items.size());
     }
-    // Geometry probe (PROSPER_GEOM_PROBE=N): a capsule stores already-recompiled SPIR-V, so to capture
-    // draw N's gl_Position via transform feedback we re-recompile its raw RDNA2 VS with xfb decorations
-    // and swap it in here; render_runner then binds a TF buffer around that draw and reports where its
-    // post-transform vertices land. v31+ capsules also retain separately-installed linked vertex mains
-    // and graphics LDS; earlier capsules can probe only single-stage vertex programs.
+    // Geometry probe (PROSPER_GEOM_PROBE=N): a capsule stores already-recompiled SPIR-V, so rebuild
+    // draw N from its raw RDNA2 and decorate the last pre-rasterization stage for transform feedback.
+    // That is normally the VS, but explicit interpolation inserts a generated GS which must own XFB.
+    // render_runner then binds a TF buffer around the draw and reports where the final clip vertices
+    // land. v31+ capsules retain separately-installed linked vertex mains and graphics LDS.
     if (const char* g = std::getenv("PROSPER_GEOM_PROBE")) {
         if (capture.format_version < 36) {
             std::fprintf(stderr,
@@ -1676,7 +1680,43 @@ int main(int argc, char** argv) {
                 prosper::tools::replay_operation_index_for_draw(replay, n);
             const long long operation_label = operation_index == SIZE_MAX
                 ? -1 : static_cast<long long>(operation_index);
-            if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) {
+            const auto* pixel_inputs = it.has_pixel_inputs ? &it.pixel_inputs : nullptr;
+            const auto* system_inputs = it.has_system_inputs ? &it.system_inputs : nullptr;
+            std::vector<uint32_t> rebuilt_geometry;
+            if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
+                const auto& fragment = replay.raw_shader_versions[it.fs_raw_shader_index];
+                const auto interpolation = prosper::gpu::fragment_interpolation_layout(
+                    fragment.words.data(), fragment.words.size(), system_inputs, pixel_inputs);
+                if (interpolation.valid && interpolation.requires_geometry &&
+                    it.ps.topology >= 3u && it.ps.topology <= 5u) {
+                    rebuilt_geometry = prosper::gpu::recompile_interpolation_geometry(
+                        interpolation, true);
+                }
+            }
+            const bool has_raw_vertex =
+                it.vs_raw_shader_index < replay.raw_shader_versions.size();
+            const auto probe_stage = prosper::tools::select_geometry_probe_stage(
+                !rebuilt_geometry.empty(), !it.gs.empty(), has_raw_vertex);
+            if (probe_stage == prosper::tools::GeometryProbeStage::Unsupported) {
+                if (!it.gs.empty()) {
+                    std::fprintf(stderr,
+                                 "[geom-probe] draw %llu: cannot rebuild its geometry stage for xfb\n",
+                                 draw_label);
+                } else {
+                    std::fprintf(stderr, "[geom-probe] draw %llu: no captured raw VS stream "
+                                         "(capsule predates v19 or source was unreadable)\n",
+                                         draw_label);
+                }
+                return 2;
+            }
+            if (probe_stage == prosper::tools::GeometryProbeStage::GeneratedGeometry) {
+                it.gs = std::move(rebuilt_geometry);
+                std::fprintf(stderr,
+                             "[geom-probe] draw=%llu item=%zu operation=%lld reused stored VS "
+                             "with xfb in GS (%zu VS words, %zu GS words, lds=%u dwords)\n",
+                             draw_label, item_index, operation_label, it.vs_words().size(),
+                             it.gs.size(), it.vertex_lds_dwords);
+            } else {
                 const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
                 std::vector<uint32_t> xfb;
                 const bool linked =
@@ -1686,29 +1726,24 @@ int main(int argc, char** argv) {
                         replay.raw_shader_versions[it.vs_chain_raw_shader_index];
                     xfb = prosper::gpu::recompile_vertex_chain(
                         raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
-                        it.vrt.get(), it.has_pixel_inputs ? &it.pixel_inputs : nullptr, true,
-                        it.vertex_lds_dwords);
+                        it.vrt.get(), pixel_inputs, true, it.vertex_lds_dwords);
                 } else {
                     xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
-                                                         it.vrt.get(),
-                                                         it.has_pixel_inputs ? &it.pixel_inputs : nullptr,
-                                                         true,
+                                                         it.vrt.get(), pixel_inputs, true,
                                                          it.vertex_lds_dwords);
                 }
-                if (!xfb.empty()) {
-                    it.set_vs(std::move(xfb));
-                    std::fprintf(stderr,
-                                 "[geom-probe] draw=%llu item=%zu operation=%lld VS%s re-recompiled "
-                                 "with xfb capture (%zu words, lds=%u dwords)\n",
-                                 draw_label, item_index, operation_label,
-                                 linked ? "+main" : "", it.vs.size(), it.vertex_lds_dwords);
-                } else {
+                if (xfb.empty()) {
                     std::fprintf(stderr, "[geom-probe] draw %llu: xfb re-recompile produced no VS "
-                                         "(no raw stream / unsupported)\n", draw_label);
+                                         "(unsupported raw stream)\n", draw_label);
+                    return 2;
                 }
-            } else {
-                std::fprintf(stderr, "[geom-probe] draw %llu: no captured raw VS stream "
-                                     "(capsule predates v19)\n", draw_label);
+                it.set_vs(std::move(xfb));
+                std::fprintf(stderr,
+                             "[geom-probe] draw=%llu item=%zu operation=%lld VS%s re-recompiled "
+                             "with xfb in VS (%zu VS words, 0 GS words, lds=%u dwords)\n",
+                             draw_label, item_index, operation_label,
+                             linked ? "+main" : "", it.vs_words().size(),
+                             it.vertex_lds_dwords);
             }
         } else {
             std::fprintf(stderr, "[geom-probe] unrealized semantic draw %llu\n", draw_label);
@@ -1972,6 +2007,59 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] dumped failed shader %s (%zu bytes) to %s\n",
                      failed_shader_spec.c_str(), bytes, failed_shader_path.c_str());
         if (positional.size() == 1 && !inspect) return 0;
+    }
+    if (!retry_failed_chain_spec.empty()) {
+        char* failure_end = nullptr;
+        const long failure_index = std::strtol(
+            retry_failed_chain_spec.c_str(), &failure_end, 0);
+        if (!failure_end || *failure_end || failure_index < 0 ||
+            static_cast<size_t>(failure_index) >= replay.failure_diagnostics.size()) {
+            std::fprintf(stderr, "gpu_replay: invalid failed-chain selector %s\n",
+                         retry_failed_chain_spec.c_str());
+            return 2;
+        }
+        const auto& failure = replay.failure_diagnostics[static_cast<size_t>(failure_index)];
+        if (failure.stages.size() < 2 ||
+            failure.stages[0].stage != prosper::gpu::ShaderProgramStage::Vertex ||
+            failure.stages[1].stage != prosper::gpu::ShaderProgramStage::Vertex) {
+            std::fprintf(stderr,
+                         "gpu_replay: failure %s does not retain a split vertex chain\n",
+                         retry_failed_chain_spec.c_str());
+            return 2;
+        }
+        const auto& prolog_stage = failure.stages[0];
+        const auto& main_stage = failure.stages[1];
+        if (prolog_stage.raw_shader_index >= replay.raw_shader_versions.size() ||
+            main_stage.raw_shader_index >= replay.raw_shader_versions.size()) {
+            std::fprintf(stderr,
+                         "gpu_replay: failed chain %s has no captured raw streams\n",
+                         retry_failed_chain_spec.c_str());
+            return 2;
+        }
+        if (prolog_stage.resource_table_present != prolog_stage.resource_table.present ||
+            prolog_stage.resource_count != prolog_stage.resource_table.resources.size()) {
+            std::fprintf(stderr,
+                         "gpu_replay: failed chain %s lacks exact resource metadata "
+                         "(capture predates v35)\n", retry_failed_chain_spec.c_str());
+            return 2;
+        }
+        prosper::gpu::ShaderResourceTable table;
+        table.resources.reserve(prolog_stage.resource_table.resources.size());
+        for (const auto& captured : prolog_stage.resource_table.resources)
+            table.resources.push_back(captured.resource);
+        const auto& prolog = replay.raw_shader_versions[prolog_stage.raw_shader_index];
+        const auto& main = replay.raw_shader_versions[main_stage.raw_shader_index];
+        const prosper::gpu::ShaderResourceTable* resources =
+            prolog_stage.resource_table.present ? &table : nullptr;
+        const std::vector<uint32_t> spirv = prosper::gpu::recompile_vertex_chain(
+            prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
+            resources);
+        std::fprintf(stderr,
+                     "[retry-failed-chain] %s %s resources=%zu spirv-dwords=%zu\n",
+                     retry_failed_chain_spec.c_str(),
+                     spirv.empty() ? "rejected" : "recompiled", table.resources.size(),
+                     spirv.size());
+        if (positional.size() == 1 && !inspect) return spirv.empty() ? 1 : 0;
     }
     if (!retry_failed_stage_spec.empty()) {
         const size_t colon = retry_failed_stage_spec.find(':');

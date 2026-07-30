@@ -187,7 +187,7 @@ Works on both `gpu_replay` and the live app because it lives in the shared rende
 
 ```bash
 PROSPER_GEOM_PROBE=4 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/out.bmp
-# [geom-probe] draw 4 VS re-recompiled with xfb capture (1700 words)
+# [geom-probe] draw=4 item=2 operation=19 reused stored VS with xfb in GS (1700 VS words, 676 GS words)
 # [geom-probe] draw=4 verts=1024 finite=1024 on-screen=0 clipped=1024 (offscreen=1023 w<=0=1 nan/inf=0)
 # [geom-probe]   clip-bbox x[-4.86,0] y[-1.14,3.81] z[0,0] w[0,1] -> ALL-VERTS-OUTSIDE-CLIP-CUBE(...)
 # [geom-probe]   v0 = (-2.9, -0.771, 0, 1) ...
@@ -208,13 +208,14 @@ owns *where the geometry is* — a large full-screen quad can have every vertex 
 rasterize, so "all verts clipped" is not "renders nothing"; the bbox tells them apart.
 
 Mechanics: on a capsule (stored SPIR-V) gpu_replay resolves semantic draw N to its compact item, then
-re-recompiles that draw's raw RDNA2 VS with `gl_Position`
-xfb-decorated and swaps it in for that one draw. A v19+ capsule is sufficient for an ordinary vertex shader;
-v31+ additionally retains a separately-installed NGG main stage and its graphics-LDS allocation, allowing
-linked prolog+main programs to be probed faithfully. The live app recompiles fresh. Requires the device to
-advertise `VK_EXT_transform_feedback` (RADV, lavapipe). The
-probed draw's rendered pixels may be inexact (the re-recompile drops pixel-input remapping), but the captured
-`gl_Position` values are faithful; inert and byte-identical when the env var is unset.
+decorates the **last pre-rasterization stage** for XFB. That is normally a recompiled raw RDNA2 VS. If explicit
+fragment interpolation inserted Prosper's generated GS, gpu_replay rebuilds that GS with XFB output and
+reuses the stored VS instead; Vulkan sources transform feedback only from the final such stage.
+A v19+ capsule is sufficient for an ordinary vertex shader; v31+ additionally retains a separately-installed
+NGG main stage and its graphics-LDS allocation, allowing linked prolog+main programs to be probed faithfully.
+Existing guest geometry stages cannot yet be rebuilt and are rejected visibly. The live app follows the same
+stage selection while recompiling fresh. Requires `VK_EXT_transform_feedback` (RADV, lavapipe). The captured
+final `gl_Position` values are faithful; inert and byte-identical when the env var is unset.
 
 ### Geometry-health line (`[geom-health]`, printed alongside the probe)
 
@@ -337,6 +338,13 @@ stage is fault-safely read once, content-deduplicated, capped at 64 KiB, and sto
 `s_endpgm`/unknown instruction or the cap. Total failed-stage data is capped at 64 MiB, diagnostics cannot
 outnumber semantic operations, and every reference/hash is validated while reading. Captures v1-v6 remain
 readable and print `failure-diagnostics: unavailable (capture predates v7)` rather than inventing evidence.
+
+`--retry-failed-stage FAILURE:STAGE` reruns one retained stage through the current recompiler with its exact
+captured resource table. For split vertex programs, `--retry-failed-chain FAILURE` instead reconstructs the
+first two retained vertex stages as one prolog/main chain and calls the production chain recompiler. Both modes
+exit successfully only when SPIR-V is produced and avoid Vulkan rendering, so they are the fast feedback path
+after a translator change. Chain retry requires the exact resource metadata added in capture v35 and rejects
+older or incomplete diagnostics explicitly.
 
 Capture v8 adds persistent depth/stencil checkpoints. Each seed stores the renderer's complete guest cache
 identity (depth/stencil read/write bases, HTILE base, extent, and D32/D32S8 format), independent depth/stencil

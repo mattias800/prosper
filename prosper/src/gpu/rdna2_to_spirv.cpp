@@ -2374,12 +2374,13 @@ struct SpirvCompute {
     // Descriptor-free geometry pass-through used when a fragment program asks for AMD's explicit
     // P0/P10/P20 vertex parameters on a Vulkan device without a barycentric/vertex-parameter
     // extension. Input assembly has already decomposed lists/strips/fans into triangles here.
-    std::vector<uint32_t> build_interpolation_geometry(const FragmentInterpolationLayout& layout) {
+    std::vector<uint32_t> build_interpolation_geometry(
+            const FragmentInterpolationLayout& layout, bool capture_geometry_position) {
         if (!layout.requires_geometry || !layout.valid) return {};
 
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
-        const uint32_t t_per_vertex = id();
+        const uint32_t t_input_per_vertex = id(), t_output_per_vertex = id();
         const uint32_t c_three = id();
         const uint32_t t_input_positions = id(), t_input_varyings = id();
         const uint32_t ptr_in_positions = id(), ptr_in_varyings = id();
@@ -2405,6 +2406,7 @@ struct SpirvCompute {
 
         put(caps, Op_Capability, {Cap_Shader});
         put(caps, Op_Capability, {Cap_Geometry});
+        if (capture_geometry_position) put(caps, Op_Capability, {Cap_TransformFeedback});
         { std::vector<uint32_t> operands{glsl}; pstr(operands, "GLSL.std.450");
           putv(extimp, Op_ExtInstImport, operands); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
@@ -2412,9 +2414,17 @@ struct SpirvCompute {
         put(exec, Op_ExecutionMode, {f_main, EM_Triangles});
         put(exec, Op_ExecutionMode, {f_main, EM_OutputTriangleStrip});
         put(exec, Op_ExecutionMode, {f_main, EM_OutputVertices, 3});
+        if (capture_geometry_position) put(exec, Op_ExecutionMode, {f_main, EM_Xfb});
 
-        put(deco, Op_MemberDecorate, {t_per_vertex, 0, Dec_BuiltIn, BI_Position});
-        put(deco, Op_Decorate, {t_per_vertex, Dec_Block});
+        put(deco, Op_MemberDecorate, {t_input_per_vertex, 0, Dec_BuiltIn, BI_Position});
+        put(deco, Op_Decorate, {t_input_per_vertex, Dec_Block});
+        put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_BuiltIn, BI_Position});
+        put(deco, Op_Decorate, {t_output_per_vertex, Dec_Block});
+        if (capture_geometry_position) {
+            put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_XfbBuffer, 0});
+            put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_XfbStride, 16});
+            put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_Offset, 0});
+        }
         for (uint32_t attr = 0; attr < 32; ++attr) {
             if (attribute_inputs[attr]) {
                 put(deco, Op_Decorate, {attribute_inputs[attr], Dec_Location, attr});
@@ -2451,14 +2461,15 @@ struct SpirvCompute {
         put(types, Op_TypeInt, {t_i32, 32, 1});
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
-        put(types, Op_TypeStruct, {t_per_vertex, t_v4f});
+        put(types, Op_TypeStruct, {t_input_per_vertex, t_v4f});
+        put(types, Op_TypeStruct, {t_output_per_vertex, t_v4f});
         put(types, Op_Constant, {t_u32, c_three, 3});
-        put(types, Op_TypeArray, {t_input_positions, t_per_vertex, c_three});
+        put(types, Op_TypeArray, {t_input_positions, t_input_per_vertex, c_three});
         put(types, Op_TypeArray, {t_input_varyings, t_v4f, c_three});
         put(types, Op_TypePointer, {ptr_in_positions, SC_Input, t_input_positions});
         put(types, Op_TypePointer, {ptr_in_varyings, SC_Input, t_input_varyings});
         put(types, Op_TypePointer, {ptr_in_v4f, SC_Input, t_v4f});
-        put(types, Op_TypePointer, {ptr_out_position, SC_Output, t_per_vertex});
+        put(types, Op_TypePointer, {ptr_out_position, SC_Output, t_output_per_vertex});
         put(types, Op_TypePointer, {ptr_out_v4f, SC_Output, t_v4f});
         put(types, Op_Variable, {ptr_in_positions, input_position, SC_Input});
         put(types, Op_Variable, {ptr_out_position, output_position, SC_Output});
@@ -2693,9 +2704,9 @@ FragmentInterpolationLayout fragment_interpolation_layout(
 }
 
 std::vector<uint32_t> recompile_interpolation_geometry(
-        const FragmentInterpolationLayout& layout) {
+        const FragmentInterpolationLayout& layout, bool capture_position) {
     SpirvCompute builder;
-    return builder.build_interpolation_geometry(layout);
+    return builder.build_interpolation_geometry(layout, capture_position);
 }
 
 // Machine state during recompilation: the VGPR and SGPR files (VGPR/SGPR number -> current SSA bits
@@ -10716,9 +10727,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (branch.pc < L.header_pc && target >= L.exit_pc) guarded_narrow_entry = true;
         }
         // 1. Pre-loop body. A compiler may place one ordinary uniform if/else before the canonical
-        // counted loop (Evergate selects one of two constant blocks this way). Structure that choice
-        // with the same two-arm PHIs as the general forward-if path, then enter the existing counted
-        // loop lowering. Anything nested/more complex stays unsupported and rejects visibly.
+        // counted loop (Evergate selects one of two constant blocks this way; Astro's NGG culling
+        // prelude also has a one-arm conditional). Structure that choice with the same two-arm PHIs
+        // as the general forward-if path, then enter the existing counted-loop lowering. Anything
+        // nested/more complex stays unsupported and rejects visibly.
         std::vector<Rdna2Inst> preloop;
         for (const auto& in : ins) {
             if (in.pc >= L.header_pc) break;
@@ -10738,9 +10750,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         const std::vector<ForwardIf> preloop_ifs = detect_forward_ifs(
             preloop, /*allow_vcc*/!b.is_compute, code, dwords, &effective_safe, nullptr,
             &preloop_rejected, /*compute_wave_branches*/b.is_compute);
-        if (preloop_rejected || preloop_ifs.size() > 1 ||
-            (!preloop_ifs.empty() && (!preloop_ifs[0].has_else ||
-                                      preloop_ifs[0].merge_pc > L.header_pc))) {
+        // detect_forward_ifs clamps a branch to an immediate s_endpgm at its artificial end marker
+        // and records it as early_out. In this truncated prelude that can be a real branch over the
+        // entire counted loop, so it cannot be structured as an ordinary one-arm conditional.
+        const bool preloop_if_unsupported = !preloop_ifs.empty() &&
+            (preloop_ifs[0].early_out ||
+             (preloop_ifs[0].has_else ? preloop_ifs[0].merge_pc : preloop_ifs[0].target_pc) >
+                 L.header_pc);
+        if (preloop_rejected || preloop_ifs.size() > 1 || preloop_if_unsupported) {
             if (getenv("PROSPER_DBG"))
                 fprintf(stderr,
                         "[recompile-reject] counted-loop prelude cfg rejected=%u ifs=%zu header=%u\n",
@@ -10764,16 +10781,21 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             condition = F.on_scc0 ? condition : b.logical_not(condition);
             const RegState before = rs;
             std::set<int> written_v, written_s;
-            loop_written_regs(ins, F.branch_pc + 1, F.sb_pc, written_v, written_s);
-            loop_written_regs(ins, F.target_pc, F.merge_pc, written_v, written_s);
+            const uint32_t then_end = F.has_else ? F.sb_pc : F.target_pc;
+            const uint32_t merge_pc = F.has_else ? F.merge_pc : F.target_pc;
+            loop_written_regs(ins, F.branch_pc + 1, then_end, written_v, written_s);
+            if (F.has_else)
+                loop_written_regs(ins, F.target_pc, merge_pc, written_v, written_s);
             const uint32_t then_label = b.id(), else_label = b.id(), merge_label = b.id();
             b.emit_selmerge(merge_label);
             b.emit_condbranch(condition, then_label, else_label);
 
             b.emit_label(then_label);
-            if (!emit_range(F.branch_pc + 1, F.sb_pc)) return false;
-            if (idx >= ins.size() || ins[idx].pc != F.sb_pc) return false;
-            ++idx; // consume the then arm's jump to the merge
+            if (!emit_range(F.branch_pc + 1, then_end)) return false;
+            if (F.has_else) {
+                if (idx >= ins.size() || ins[idx].pc != F.sb_pc) return false;
+                ++idx; // consume the then arm's jump to the merge
+            }
             const uint32_t then_block = b.cur_block;
             std::unordered_map<int, uint32_t> then_v, then_s;
             for (int reg : written_v) then_v[reg] = vget(reg);
@@ -10787,7 +10809,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
 
             rs = before;
             b.emit_label(else_label);
-            if (!emit_range(F.target_pc, F.merge_pc)) return false;
+            if (F.has_else && !emit_range(F.target_pc, merge_pc)) return false;
             const uint32_t else_block = b.cur_block;
             b.emit_branch(merge_label);
             b.emit_label(merge_label);
@@ -10821,7 +10843,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     fprintf(stderr, "[recompile-reject] counted-loop prelude changes mask domain\n");
                 return false; // no mask-domain PHIs in this narrow composition
             }
-            if (!emit_range(F.merge_pc, L.header_pc)) return false;
+            if (!emit_range(merge_pc, L.header_pc)) return false;
         }
         // Ordinary counted loops require full EXEC at entry. An NGG vertex is already represented by
         // one independent Vulkan invocation, however, so its EXEC bit is an ordinary per-invocation
@@ -12136,14 +12158,20 @@ static bool is_astro_bot_ngg_one_lane_wrapper(const uint32_t* code, size_t dword
     if (!code) return false;
     std::vector<Rdna2Inst> instructions;
     const size_t program_dwords = rdna2_walk(code, dwords, instructions);
-    if (program_dwords != 54 && program_dwords != 734 && program_dwords != 3124 &&
-        program_dwords != 3435 && program_dwords != 3917)
+    if (program_dwords != 54 && program_dwords != 734 && program_dwords != 749 &&
+        program_dwords != 3124 && program_dwords != 3435 && program_dwords != 3455 &&
+        program_dwords != 3917)
         return false;
     const uint64_t hash = shader_program_hash(code, program_dwords);
     return (program_dwords == 54 && hash == 0x9e9d8e37bcc70607ull) ||
            (program_dwords == 734 && hash == 0x79eb2b954b07dc8eull) ||
+           // The same 734-word culling wrapper is live-linked after its exact 15-word fetch prolog.
+           (program_dwords == 749 && hash == 0xb440349937df751eull) ||
            (program_dwords == 3124 && hash == 0x41e6ac616c18d295ull) ||
            (program_dwords == 3435 && hash == 0xfad7a9f486523cfcull) ||
+           // The same 3435-word wrapper is live-linked after its exact 20-word fetch prolog.
+           // Hashing the complete concatenated program keeps the one-lane projection byte-exact.
+           (program_dwords == 3455 && hash == 0x562ce5ad01c4c6e3ull) ||
            (program_dwords == 3917 && hash == 0x7f5f2349e2816f5eull);
 }
 
