@@ -1474,8 +1474,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // scratch copy. The normal exact-extent path can borrow the immutable RTT
                         // snapshot and avoid copying it into texstore before the backend upload.
                         static const bool cpu_rtt_copy_diagnostics =
-                            getenv("PROSPER_DUMP_SAMPLED_RTT") || getenv("PROSPER_DUMP_TEX") ||
-                            getenv("PROSPER_DUMP_ATLAS") || getenv("PROSPER_KILL_RING");
+                            getenv("PROSPER_DUMP_SAMPLED_RTT") || getenv("PROSPER_DUMP_RAWTEX") ||
+                            getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESOURCE_HASH_DIM") ||
+                            getenv("PROSPER_PALETTELOG") || getenv("PROSPER_TESTTEX") ||
+                            getenv("PROSPER_TESTLUT") || getenv("PROSPER_TESTLUT32") ||
+                            getenv("PROSPER_DUMP_TEX") || getenv("PROSPER_DUMP_ATLAS") ||
+                            getenv("PROSPER_KILL_RING");
                         const bool borrow_cpu_live_rtt = has_cpu_live_rtt &&
                             borrow_exact_cpu_rtt && !cpu_rtt_copy_diagnostics &&
                             prosper::frontend::exact_rtt_snapshot_borrowable(
