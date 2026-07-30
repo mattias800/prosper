@@ -2416,6 +2416,18 @@ int main() {
     CHECK(got43a_taken.size() == N && got43a_skipped.size() == N && bad43a == 0,
           "kernel 43a merges taken/skipped pre-loop values into the counted loop exactly");
 
+    // Kernel 43b: a pre-loop conditional that jumps over the complete counted loop to s_endpgm.
+    // The prelude CFG scan uses the loop header as an artificial end marker, so it must preserve the
+    // early-out classification and reject rather than silently execute the loop on both outcomes.
+    const uint32_t code43b[] = {
+        0xBE800385u, 0xBE810383u, 0xBF0A0100u, 0xBF840009u, 0xB0020005u,
+        0xBE800380u, 0x7E020280u, 0xBF0A0200u, 0xBF840003u, 0x4A020200u,
+        0x81008100u, 0xBF82FFFBu, 0x7E000D01u, 0xBF810000u,
+    };
+    const auto spv43b = recompile_valu(code43b, std::size(code43b), 0, 0);
+    CHECK(spv43b.empty(),
+          "kernel 43b rejects a pre-loop early-out that skips the counted loop");
+
     // Kernel 44: a value advanced in the CONDITION region and read after the loop. s0 is incremented by
     //   10 at the header (which runs on the exiting iteration too), so hardware yields 40, not the phi's
     //   back-edge value 30. Regression guard for the condition-region-vs-body merge-value distinction.

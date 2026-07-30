@@ -10733,10 +10733,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         const std::vector<ForwardIf> preloop_ifs = detect_forward_ifs(
             preloop, /*allow_vcc*/!b.is_compute, code, dwords, &effective_safe, nullptr,
             &preloop_rejected, /*compute_wave_branches*/b.is_compute);
-        const bool preloop_if_escapes = !preloop_ifs.empty() &&
-            (preloop_ifs[0].has_else ? preloop_ifs[0].merge_pc : preloop_ifs[0].target_pc) >
-                L.header_pc;
-        if (preloop_rejected || preloop_ifs.size() > 1 || preloop_if_escapes) {
+        // detect_forward_ifs clamps a branch to an immediate s_endpgm at its artificial end marker
+        // and records it as early_out. In this truncated prelude that can be a real branch over the
+        // entire counted loop, so it cannot be structured as an ordinary one-arm conditional.
+        const bool preloop_if_unsupported = !preloop_ifs.empty() &&
+            (preloop_ifs[0].early_out ||
+             (preloop_ifs[0].has_else ? preloop_ifs[0].merge_pc : preloop_ifs[0].target_pc) >
+                 L.header_pc);
+        if (preloop_rejected || preloop_ifs.size() > 1 || preloop_if_unsupported) {
             if (getenv("PROSPER_DBG"))
                 fprintf(stderr,
                         "[recompile-reject] counted-loop prelude cfg rejected=%u ifs=%zu header=%u\n",
