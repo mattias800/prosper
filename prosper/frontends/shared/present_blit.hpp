@@ -38,7 +38,7 @@ namespace prosper::frontend {
 struct GpuScanoutFrame {
     VkImage     image = VK_NULL_HANDLE;      // RGBA8_UNORM, in TRANSFER_SRC_OPTIMAL, ready to read
     uint32_t    width = 0, height = 0;
-    uint64_t    frame_seq = 0;               // renderer frame identity that produced this image
+    uint64_t    frame_seq = 0;               // caller-supplied source identity (guest flip in production)
     int         slot = -1;                   // opaque handle to pass back to present_blit_release
     bool valid() const { return image && width && height && slot >= 0; }
 };

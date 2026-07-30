@@ -4,6 +4,7 @@
 
 using prosper::frontend::present_blit_wait_completed;
 using prosper::frontend::present_blit_has_new_flip;
+using prosper::frontend::present_source_is_newer;
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -23,6 +24,14 @@ int main() {
     CHECK(present_blit_has_new_flip(0, 1));
     CHECK(!present_blit_has_new_flip(42, 42));
     CHECK(present_blit_has_new_flip(UINT64_MAX, UINT64_MAX));
+
+    // The first source is always displayable, including the pre-flip identity zero. Thereafter,
+    // duplicate or stale CPU/GPU representations must not overwrite the newest frame.
+    CHECK(present_source_is_newer(false, 0, 0));
+    CHECK(present_source_is_newer(false, 99, 3));
+    CHECK(!present_source_is_newer(true, 7, 6));
+    CHECK(!present_source_is_newer(true, 7, 7));
+    CHECK(present_source_is_newer(true, 7, 8));
 
     if (!failures) std::printf("present_blit_policy: OK\n");
     return failures ? 1 : 0;

@@ -19,6 +19,7 @@ std::atomic<uint64_t> g_frame_seq{0};   // # of rendered frames handed in via pr
 std::mutex           g_frame_mx;
 std::shared_ptr<const std::vector<uint8_t>> g_frame; // w*h*4 bytes when a frame is present
 uint32_t             g_frame_w = 0, g_frame_h = 0;
+uint64_t             g_frame_guest_present_count = 0;
 std::atomic<bool>    g_have_frame{false};
 
 bool current_scanout(VideoOutBufferSnapshot& out, int* index = nullptr) {
@@ -45,6 +46,7 @@ void present_write_frame(std::shared_ptr<const std::vector<uint8_t>> pixels,
     std::lock_guard<std::mutex> lk(g_frame_mx);
     g_frame = std::move(pixels);
     g_frame_w = w; g_frame_h = h;
+    g_frame_guest_present_count = g_present_count.load(std::memory_order_relaxed);
     g_have_frame.store(true, std::memory_order_release);
     g_frame_seq.fetch_add(1, std::memory_order_relaxed);
 }
@@ -121,6 +123,7 @@ bool present_acquire_rendered_frame(PresentFrameLease& out) {
     std::lock_guard<std::mutex> lk(g_frame_mx);
     if (!g_frame || g_frame->empty() || !g_frame_w || !g_frame_h) return false;
     out.frame_seq = g_frame_seq.load(std::memory_order_relaxed);
+    out.guest_present_count = g_frame_guest_present_count;
     out.width = g_frame_w;
     out.height = g_frame_h;
     out.rgba = g_frame;
@@ -162,6 +165,7 @@ void present_reset() {
     g_present_count.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_frame_mx);
     g_frame.reset(); g_frame_w = g_frame_h = 0;
+    g_frame_guest_present_count = 0;
     g_frame_seq.store(0, std::memory_order_relaxed);   // #399: reset the rendered-frame counter too
     g_have_frame.store(false, std::memory_order_release);
 }
