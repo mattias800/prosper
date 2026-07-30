@@ -355,6 +355,13 @@ same exact-first rule, with `PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS` and
 `PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB`. `PROSPER_WRITE_WATCH_MAX_KB` is an emergency host-wide range
 limit (zero/unset is unbounded); a declined watch always returns to exact comparison.
 
+Proven-full write-only storage targets at least 16 MiB do not copy their first successful result into
+an immediately redundant CPU source baseline. If the same cache identity returns, ordinary exact
+validation establishes the baseline needed for later identical-result skips; partial/readable and
+replay-owned targets retain their original exact contract. Set
+`PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB` to retune the crossover. The broader
+`PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1` control restores immediate storage-result snapshots.
+
 Windows protection-fault watches are deliberately unsupported: the Windows
 exception dispatcher writes below the interrupted stack pointer before a vectored handler runs, which can
 corrupt the guest's valid SysV red-zone locals. Timing therefore reports those watch attempts as `unknown`

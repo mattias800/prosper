@@ -2530,6 +2530,42 @@ int main() {
                           "disabled adaptive policy preserves exact dynamic snapshots");
                 }
             }
+
+            // The first dispatch to a new target is the cache-churn shape seen in full-resolution
+            // post-processing: the shader/extent already has a Full proof, but this address has no
+            // retained image yet. This reduced target deliberately stays below the cold-source
+            // deferral crossover, while its aligned exact GPU result must still avoid a transient
+            // host vector before becoming the comparison baseline.
+            std::vector<uint8_t> cold_guest(W * 8, 0x6b);
+            ShaderResourceTable cold_rt = fill_rt;
+            cold_rt.resources.back().gpu_addr =
+                reinterpret_cast<uint64_t>(cold_guest.data());
+            ComputeItem cold_item = it;
+            cold_item.resources = std::make_shared<ShaderResourceTable>(cold_rt);
+            const uint64_t cold_source_snapshots_before =
+                prosper::frontend::live_compute_storage_result_snapshot_bytes();
+            const uint64_t cold_result_snapshots_before =
+                prosper::frontend::live_compute_image_result_snapshot_bytes();
+            CHECK(prosper::frontend::execute_live_compute_items({cold_item}),
+                  "proven-full writer executes on a cold retained target");
+            const uint64_t cold_source_snapshots_after =
+                prosper::frontend::live_compute_storage_result_snapshot_bytes();
+            const uint64_t cold_result_snapshots_after =
+                prosper::frontend::live_compute_image_result_snapshot_bytes();
+            CHECK(cold_source_snapshots_after >=
+                      cold_source_snapshots_before + fill_guest_bytes,
+                  "small cold target retains its immediately useful source snapshot");
+            CHECK(cold_result_snapshots_after == cold_result_snapshots_before,
+                  "cold exact target retains its GPU baseline without a transient host copy");
+            CHECK(prosper::frontend::cold_storage_result_snapshot_can_defer(
+                      false, true, 64u << 20, 16u << 20) &&
+                      !prosper::frontend::cold_storage_result_snapshot_can_defer(
+                          true, true, 64u << 20, 16u << 20) &&
+                      !prosper::frontend::cold_storage_result_snapshot_can_defer(
+                          false, false, 64u << 20, 16u << 20) &&
+                      !prosper::frontend::cold_storage_result_snapshot_can_defer(
+                          false, true, 8u << 20, 16u << 20),
+                  "cold snapshot deferral is limited to large proven-full guest targets");
 #endif
         }
 #if defined(__linux__)

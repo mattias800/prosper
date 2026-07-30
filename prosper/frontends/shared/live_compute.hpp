@@ -128,6 +128,13 @@ uint64_t live_compute_cpu_fill_dispatches();
 // Monotonic attribution for storage-result source validation. Production-backend tests use this to
 // prove that changing proven-full results do not copy a redundant guest-byte snapshot.
 uint64_t live_compute_storage_result_snapshot_bytes();
+// Monotonic attribution for the collision-free host fallback used when a retained storage result
+// cannot keep an exact GPU comparison buffer. Eligible GPU baselines must not be copied here first.
+uint64_t live_compute_image_result_snapshot_bytes();
+// A cold, proven-full guest target has no observable old seed. Large targets may defer their exact
+// source baseline until an address actually repeats; replay-owned and partial targets may not.
+bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
+                                            size_t guest_bytes, size_t minimum_bytes);
 
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
