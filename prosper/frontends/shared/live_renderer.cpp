@@ -1703,17 +1703,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool persistent_source_is_tiled =
                             persistent_sampled_texture && !getenv("PROSPER_NODETILE") &&
                             prosper::gpu::tile_mode_is_tiled(r.tile_mode);
-                        // A sampled LINEAR (tile_mode 0) 2D surface whose tight row is not 256-aligned
+                        // A sampled LINEAR (tile_mode 0) 2D surface (or the selected base slice of a
+                        // 2D array) whose tight row is not 256-aligned
                         // is pitch-padded: RDNA2 requires a sampled linear texture's row pitch to be aligned
                         // (256 B here), so its real pitch is align(tw*bytes_per_texel,256). The decode
                         // below must read it row-by-row at that pitch (else every row drifts -> horizontal
                         // scramble, e.g. Dead Cells' 348-wide Motion Twin splash whose real pitch is 384
                         // texels). Guards keep
-                        // this narrow and regression-safe: 2D only (volume/cube layouts untouched); tile_mode
-                        // == 0 exactly, so unrecognized/actually-tiled modes are NOT strided (they fall to the
-                        // contiguous read + auto-detile pass); exact HLE-producer provenance can select a
-                        // tight guest layout (AvPlayer NV12); !host_data keeps ordinary CPU-uploaded test
-                        // fixtures contiguous unless capture replay supplies an explicit guest-layout pitch.
+                        // this narrow and regression-safe: 2D or the already-selected 2D-array base slice
+                        // only (volume/cube layouts untouched); tile_mode == 0 exactly, so
+                        // unrecognized/actually-tiled modes are NOT strided (they fall to the contiguous
+                        // read + auto-detile pass); exact HLE-producer provenance can select a tight guest
+                        // layout (AvPlayer NV12); !host_data keeps ordinary CPU-uploaded test fixtures
+                        // contiguous unless capture replay supplies an explicit guest-layout pitch.
                         // The tightly-packed
                         // LINEAR_GENERAL layout is a buffer/copy layout, not a sampled-texture layout, so it
                         // does not reach here. r.size is the TIGHT extent (tw*th*bpp), so it cannot gate this.
@@ -1730,7 +1732,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (const char* lp = getenv("PROSPER_LINPITCH"))
                             linear_src_row = (size_t)strtoull(lp, nullptr, 0) * sampled_source_bpt;
                         const bool linear_padded_read =
-                            r.cls == RC::Texture && r.img_dim == 1u && r.tile_mode == 0 &&
+                            r.cls == RC::Texture && (r.img_dim == 1u || r.img_dim == 5u) &&
+                            r.tile_mode == 0 &&
                             (!r.host_data || r.linear_row_pitch_bytes != 0) &&
                             !r.compression_enabled && persistent_bc_block_bytes == 0 &&
                             linear_dst_row != 0 && linear_src_row > linear_dst_row;

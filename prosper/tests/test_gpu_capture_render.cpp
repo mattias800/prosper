@@ -480,7 +480,12 @@ int main() {
                 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f,
             };
             std::memcpy(array_base, base_values, sizeof(base_values));
-            std::memcpy(array_selected, float_values, sizeof(float_values));
+            constexpr size_t array_row_pitch = 0x100;
+            constexpr size_t array_tight_row = 2u * 4u * sizeof(float);
+            std::memcpy(array_selected, float_values, array_tight_row);
+            std::memcpy(reinterpret_cast<uint8_t*>(array_selected) + array_row_pitch,
+                        reinterpret_cast<const uint8_t*>(float_values) + array_tight_row,
+                        array_tight_row);
             DrawItem array_draw = cached_float_draw;
             array_draw.color0_base = 0xd90000;
             auto array_table = std::make_shared<ShaderResourceTable>(*array_draw.prt);
@@ -491,6 +496,7 @@ int main() {
             array_resource.depth = 4;
             array_resource.layer_stride_bytes = 0x1000;
             array_resource.layer_mip_offset_bytes = 0x100;
+            array_resource.linear_row_pitch_bytes = array_row_pitch;
             array_draw.prt = std::move(array_table);
 
             const std::vector<uint8_t> first_array =
