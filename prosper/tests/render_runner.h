@@ -3557,6 +3557,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             prosper::gpu::fragment_spirv_required_subgroup_size(bd_fs);
         const uint32_t required_fragment_subgroup_features =
             prosper::gpu::fragment_spirv_required_subgroup_features(bd_fs);
+        uint32_t available_fragment_subgroup_features = 0;
+        if (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT)
+            available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupVote;
+        if (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)
+            available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupArithmetic;
+        if (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT)
+            available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupShuffle;
         const bool uses_internal_gds =
             prosper::gpu::fragment_spirv_uses_internal_gds(bd_fs);
         if (required_fragment_subgroup_size &&
@@ -3565,10 +3572,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
              required_fragment_subgroup_size > ctx.max_subgroup_size ||
              !(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
              !(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
-             ((required_fragment_subgroup_features & prosper::gpu::kFragmentSubgroupArithmetic) &&
-              !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)) ||
-             ((required_fragment_subgroup_features & prosper::gpu::kFragmentSubgroupVote) &&
-              !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT)) ||
+             !prosper::gpu::fragment_subgroup_features_supported(
+                 required_fragment_subgroup_features,
+                 available_fragment_subgroup_features) ||
              (uses_internal_gds && !ctx.fragment_stores_atomics))) {
             const uint64_t shader_key = bd.fs_identity
                 ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());

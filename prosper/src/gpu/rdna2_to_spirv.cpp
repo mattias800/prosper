@@ -703,13 +703,15 @@ struct SpirvCompute {
             {t_u32, result, uconst(Scope_Subgroup), value, lane});
         return result;
     }
-    uint32_t subgroup_row_shr(uint32_t value, uint32_t active, uint32_t amount) {
+    uint32_t subgroup_row_shr(uint32_t value, uint32_t active, uint32_t amount,
+                              uint32_t* valid_lane = nullptr) {
         mark_subgroup_min16();
         const uint32_t lane = subgroup_local_id();
         const uint32_t row_lane = ibin(Op_BitwiseAnd, lane, uconst(15));
         const uint32_t in_bounds = ucmp(Op_UGreaterThanEqual, row_lane, uconst(amount));
-        // Keep the shuffle index valid even for row-leading lanes. DPP BOUND_CTRL=0 retains the
-        // unpermuted source for those lanes. FI=0 also makes an EXEC-inactive source invalid.
+        // Keep the shuffle index valid even for row-leading lanes. FI=0 also makes an EXEC-inactive
+        // source invalid. The caller uses `valid` to preserve VDST for BOUND_CTRL=0; returning VALUE
+        // here is only a safe placeholder for the disabled lane, not its architectural result.
         const uint32_t source_lane = sel(in_bounds,
             ibin(Op_ISub, lane, uconst(amount)), lane);
         const uint32_t shifted = subgroup_shuffle(value, source_lane);
@@ -717,6 +719,7 @@ struct SpirvCompute {
             sel(active, uconst(1), uconst(0)), source_lane);
         const uint32_t valid = land(in_bounds,
             ucmp(Op_INotEqual, source_active, uconst(0)));
+        if (valid_lane) *valid_lane = valid;
         return sel(valid, shifted, value);
     }
     uint32_t subgroup_quad_permute(uint32_t value, uint32_t ctrl) {
@@ -3106,6 +3109,10 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
 
 bool vopc_is_cmpx(uint32_t opcode);
 
+namespace {
+uint32_t scalar_write_width(const Rdna2Inst& in);
+}
+
 // FRAGMENT alpha-test / clip() discard via a SCALAR BRANCH. A per-lane condition (v_cmp -> VCC) is folded
 // into a saved-EXEC survivor mask by a 64-bit wave-mask op (s_and/s_andn2_b64 sDST,sDST,vcc — which on HW
 // sets SCC = "any lane survives"), then `s_cbranch_scc0 <fwd>` skips the shading when NO lane survives; the
@@ -3190,19 +3197,22 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
                 mask_dst = in.sdst.value;
             }
 
-            // End the prior one-word lifetime on every explicit scalar write before publishing a
-            // newly-proven mask result. This local proof is deliberately conservative: its only job
-            // is deciding whether dropping the immediately following SCC branch is semantics-free.
-            const bool scalar_dst =
-                (in.dst.kind == OperandKind::SGPR || in.dst.kind == OperandKind::Special) &&
-                (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
-                 in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SMEM ||
-                 in.fmt == Rdna2Format::VOPC ||
-                 (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02) ||
-                 (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360));
-            if (scalar_dst) b32_masks.erase(in.dst.value);
+            // End every overwritten word's prior lifetime before publishing a newly-proven mask
+            // result. In particular, a B64 write must invalidate an independently tracked Wave32
+            // mask in its high word; otherwise a later ordinary B32 ALU op can inherit stale mask
+            // provenance and make us drop a real SCC branch.
+            auto erase_written_words = [&](int base, uint32_t width) {
+                for (uint32_t word = 0; word < width; ++word)
+                    b32_masks.erase(base + static_cast<int>(word));
+            };
+            const uint32_t dst_width = scalar_write_width(in);
+            if (dst_width) erase_written_words(in.dst.value, dst_width);
+            if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+                in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
+                erase_written_words(in.dst.value, 1);
             if (in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR)
-                b32_masks.erase(in.sdst.value);
+                erase_written_words(in.sdst.value,
+                    in.opcode >= 0x128 && in.opcode <= 0x12a ? 1u : 2u);
             if (writes_b32_mask && mask_dst >= 0 && mask_dst != 126) {
                 b32_masks.insert(mask_dst);
                 b32_mask_writer_pcs.insert(in.pc);
@@ -5991,11 +6001,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         a = b.uconst(0);
                     } else if (b.is_fragment) {
                         // Astro's material mask uses unbounded v_or_b32 ROW_SHR:{1,2,4,8}. An
-                        // out-of-row or EXEC-inactive source retains src0, the OR identity here.
+                        // out-of-row or EXEC-inactive source disables the instruction, preserving
+                        // the old destination even when VDST and the two sources are distinct.
                         if (in.opcode != 0x1c || in.dpp_bound_ctrl) {
                             ok = false; return true;
                         }
-                        a = b.subgroup_row_shr(a, rs.exec, in.dpp_ctrl - 0x110u);
+                        a = b.subgroup_row_shr(
+                            a, rs.exec, in.dpp_ctrl - 0x110u, &dpp_active);
                     } else {
                         if (!b.is_compute || !fop) { ok = false; return true; }
                         // ROW_SHR:N reads SRC0 from lane-N inside each architectural 16-lane row.
@@ -11637,6 +11649,24 @@ static uint64_t shader_program_hash(const uint32_t* code, size_t dwords) {
     return hash;
 }
 
+static uint32_t effective_fragment_wave_size(uint32_t requested_wave_size,
+                                             size_t program_dwords,
+                                             uint64_t program_hash) {
+    if (requested_wave_size != 32 && requested_wave_size != 64) return 0;
+    // Compatibility for the one captured Astro fragment whose older producer omitted
+    // SPI_PS_IN_CONTROL.PS_W32_EN. Its complete byte identity proves the same Wave32 contract; that
+    // contract must select both one-word mask semantics and a 32-lane native subgroup.
+    const bool legacy_wave32 = requested_wave_size == 64 && program_dwords == 3142 &&
+        program_hash == 0x616dd4c0b241fbb1ull;
+    return requested_wave_size == 32 || legacy_wave32 ? 32u : 64u;
+}
+
+uint32_t fragment_effective_wave_size_for_test(uint32_t requested_wave_size,
+                                               size_t program_dwords,
+                                               uint64_t program_hash) {
+    return effective_fragment_wave_size(requested_wave_size, program_dwords, program_hash);
+}
+
 uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
@@ -11711,15 +11741,15 @@ static std::vector<uint32_t> recompile_fragment_impl(
             fprintf(stderr, "[recompile-reject] invalid fragment interpolation layout\n");
         return {};
     }
+    const uint32_t effective_wave_size = effective_fragment_wave_size(
+        wave_size, program_dwords, shader_program_hash(code, program_dwords));
     SpirvCompute b;
-    b.wave_size = wave_size;
+    b.wave_size = effective_wave_size;
     b.begin_fragment(rt, color_mask);
     // SPI_PS_IN_CONTROL.PS_W32_EN proves that EXEC_HI/VCC_HI are unused and the low-half mask
     // operations below represent the complete wave. Keep the older byte-exact captured exception
     // until every replay/capture producer carries the stage register into this entry point.
-    b.allow_b32_masks = wave_size == 32 ||
-        (program_dwords == 3142 &&
-         shader_program_hash(code, program_dwords) == 0x616dd4c0b241fbb1ull);
+    b.allow_b32_masks = effective_wave_size == 32;
     // Fragment I/O value tap (PROSPER_FS_TAP=draw:pc): redirect the MRT0 colour export to the intermediate
     // VGPR produced at that PC so the rendered frame visualises the value. The `draw:` prefix is consumed by
     // gpu_replay (which re-recompiles only that draw's FS). Parse the same complete selector here so an
@@ -11944,6 +11974,8 @@ uint32_t fragment_spirv_required_subgroup_features(const std::vector<uint32_t>& 
                 features |= kFragmentSubgroupVote;
             else if (spirv[offset + 1] == Cap_GroupNonUniformArithmetic)
                 features |= kFragmentSubgroupArithmetic;
+            else if (spirv[offset + 1] == Cap_GroupNonUniformShuffle)
+                features |= kFragmentSubgroupShuffle;
         }
         offset += words;
     }

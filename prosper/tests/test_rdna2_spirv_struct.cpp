@@ -87,6 +87,28 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+bool has_select_with_false_constant(const std::vector<uint32_t>& spv, uint32_t literal) {
+    constexpr uint32_t OpConstant = 43, OpSelect = 169;
+    std::unordered_set<uint32_t> matching_constants;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4 && spv[i + 3] == literal)
+            matching_constants.insert(spv[i + 2]);
+        i += wc;
+    }
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        // OpSelect {result-type, result, condition, true-object, false-object}.
+        if (op == OpSelect && wc == 6 && matching_constants.contains(spv[i + 5]))
+            return true;
+        i += wc;
+    }
+    return false;
+}
+
 bool has_explicit_lod_constant(const std::vector<uint32_t>& spv, uint32_t expected) {
     constexpr uint32_t OpConstant = 43, OpImageSampleExplicitLod = 88, OpBitcast = 124;
     constexpr uint32_t ImageOperandsLod = 0x2;
@@ -365,6 +387,15 @@ int main() {
     }
     printf("  [ok]   registered Wave32 fragment EXEC_LO/VCC_LO mask moves emit valid SPIR-V\n");
 
+    if (fragment_effective_wave_size_for_test(
+            64, 3142, 0x616dd4c0b241fbb1ull) != 32 ||
+        fragment_effective_wave_size_for_test(
+            64, 3142, 0x616dd4c0b241fbb0ull) != 64) {
+        printf("  [FAIL] legacy Astro Wave32 capture did not select one coherent subgroup contract\n");
+        return 1;
+    }
+    printf("  [ok]   legacy Astro Wave32 capture selects a 32-lane subgroup and mask contract\n");
+
     const uint32_t wave32_compute_masks[] = {
         0xbe80037eu,                         // s_mov_b32 s0, exec_lo
         0xbeea037eu,                         // s_mov_b32 vcc_lo, exec_lo
@@ -458,6 +489,23 @@ int main() {
         return 1;
     }
     printf("  [ok]   Wave32 branch linearization requires proven mask provenance\n");
+
+    // A wide scalar write kills every physical SGPR word it covers. Keep the compare in s1
+    // deliberately adjacent to s0: if s_mov_b64 only invalidates its low word, the stale s1 mask
+    // provenance infects the ordinary s_and_b32 and makes its real SCC branch look disposable.
+    const uint32_t wave32_mask_overwritten_by_b64[] = {
+        0x7d865cf9u, 0x06868104u,            // v_cmp_le_u32_sdwa s1, s4, v46
+        0xbe800480u,                         // s_mov_b64 s[0:1], 0
+        0x87008101u,                         // s_and_b32 s0, s1, 1 (ordinary scalar data)
+        0xbf840002u,                         // s_cbranch_scc0
+        0xbf810000u,
+    };
+    if (!mask_test_branches_for_test(wave32_mask_overwritten_by_b64,
+                                     std::size(wave32_mask_overwritten_by_b64), true).empty()) {
+        printf("  [FAIL] B64 scalar overwrite retained stale high-word mask provenance\n");
+        return 1;
+    }
+    printf("  [ok]   B64 scalar writes invalidate every covered Wave32 mask word\n");
 
     // The same live shader selects EXEC_LO or an empty mask into VCC_HI from an ordinary scalar
     // comparison. This is s_cselect_b32's mask-domain form, not a scalar integer selection.
@@ -1289,6 +1337,29 @@ int main() {
         return 1;
     }
     printf("  [ok]   Astro fragment DPP/PERMLANEX/readlane reduction uses exact wave64 shuffles\n");
+
+    const uint32_t fragment_dpp_distinct_row_or[] = {
+        0x7e000281u,                         // v_mov_b32 v0, 1
+        0x7e020282u,                         // v_mov_b32 v1, 2
+        0x7e0402ffu, 0x12345678u,            // v_mov_b32 v2, unique old destination
+        0x380402fau, 0xff011100u,            // v_or_b32_dpp v2,v0,v1 row_shr:1 BC:0
+        0xf800000fu, 0x02020202u,
+        0xbf810000u,
+    };
+    const auto fragment_dpp_distinct_spv = recompile_fragment(
+        fragment_dpp_distinct_row_or, std::size(fragment_dpp_distinct_row_or));
+    const uint32_t fragment_dpp_features =
+        fragment_spirv_required_subgroup_features(fragment_dpp_distinct_spv);
+    if (fragment_dpp_distinct_spv.empty() ||
+        !has_select_with_false_constant(fragment_dpp_distinct_spv, 0x12345678u) ||
+        !(fragment_dpp_features & kFragmentSubgroupShuffle) ||
+        fragment_subgroup_features_supported(
+            fragment_dpp_features,
+            kFragmentSubgroupVote | kFragmentSubgroupArithmetic)) {
+        printf("  [FAIL] unbounded fragment DPP did not preserve VDST/gate subgroup shuffle\n");
+        return 1;
+    }
+    printf("  [ok]   unbounded fragment DPP preserves VDST and requires host shuffle support\n");
     // #1474: partially-overlapping LOOPS in the fragment shell. Two back-edges whose ranges cross
     // without nesting (B's header lies inside A's body, B's back-edge outside it) are what the narrow
     // pattern structurizer calls unstructured and rejects. Since the graphics CFG dispatcher above
