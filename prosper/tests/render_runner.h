@@ -102,6 +102,11 @@ struct FrameResource {
     // Optional immutable owner for borrowed frontend pixels. Keeping this beside the raw pointer
     // makes FrameResource copies/moves retain the source through synchronous backend upload setup.
     std::shared_ptr<const std::vector<uint8_t>> tex_rgba_owner;
+    // A DCC fast-clear is already a complete image description. Keep it compact until command
+    // recording and initialize the full-size Vulkan image with vkCmdClearColorImage instead of
+    // allocating, filling, and uploading tens of MiB of identical CPU pixels.
+    bool has_uniform_color = false;
+    std::array<float, 4> uniform_color{};
     uint32_t tw = 0, th = 0, td = 1;
     // T#-declared mip-chain length (#1272). 1 (default) = single-level upload, the historical
     // behavior. >1 lets the backend generate a box-filtered chain — bounded by this declared count —
@@ -170,7 +175,7 @@ struct FrameResource {
         return dwords_view && dwords_view_count ? dwords_view_count : dwords.size();
     }
     bool is_texture() const {
-        return tex_rgba != nullptr || persistent_render_target_id != 0 ||
+        return tex_rgba != nullptr || has_uniform_color || persistent_render_target_id != 0 ||
                persistent_depth_target_id != 0 || borrowed_compute_image != nullptr;
     }
 };
@@ -3336,12 +3341,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         uint32_t mip_levels = 1;   // effective uploaded chain length (#1272)
         VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
         bool storage_image = false;
+        std::array<uint32_t, 4> uniform_color_bits{};
         bool operator==(const TextureUploadKey& other) const {
             return pixels == other.pixels && render_target_id == other.render_target_id &&
                    borrowed_compute_image == other.borrowed_compute_image &&
                    width == other.width && height == other.height && depth == other.depth &&
                    img_dim == other.img_dim && mip_levels == other.mip_levels &&
-                   format == other.format && storage_image == other.storage_image;
+                   format == other.format && storage_image == other.storage_image &&
+                   uniform_color_bits == other.uniform_color_bits;
         }
     };
     struct TextureUploadKeyHash {
@@ -3357,6 +3364,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             h ^= static_cast<size_t>(key.mip_levels) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.format) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.storage_image) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            for (uint32_t bits : key.uniform_color_bits)
+                h ^= static_cast<size_t>(bits) + 0x9e3779b9u + (h << 6) + (h >> 2);
             return h;
         }
     };
@@ -3371,6 +3380,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkDeviceSize image_bytes = 0;
         bool persistent_hit = false;
         bool persistent_refresh = false;
+        bool uniform_clear = false;
+        VkClearColorValue uniform_color{};
         bool borrowed_target = false;
         bool borrowed_compute = false;
         VkImageLayout borrowed_compute_layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -4029,13 +4040,19 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     }
                     // A DS-bridged resource shares the id slot: both are guest plane addresses, and
                     // pixels stays null for either direct bind, so distinct surfaces cannot collide.
+                    std::array<uint32_t, 4> uniform_color_bits{};
+                    if (r.has_uniform_color)
+                        for (size_t channel = 0; channel < uniform_color_bits.size(); ++channel)
+                            std::memcpy(&uniform_color_bits[channel], &r.uniform_color[channel],
+                                        sizeof(uint32_t));
                     const TextureUploadKey texture_key{
                         r.tex_rgba,
                         r.persistent_render_target_id ? r.persistent_render_target_id
                                                       : r.persistent_depth_target_id,
                         r.borrowed_compute_image,
                         r.tw, r.th, r.td, r.img_dim,
-                        tex_mip_levels, backend_color_format(r.texture_format), r.is_storage_image};
+                        tex_mip_levels, backend_color_format(r.texture_format), r.is_storage_image,
+                        uniform_color_bits};
                     size_t upload_index = SIZE_MAX;
                     if (share_texture_uploads) {
                         auto found = texture_upload_indices.find(texture_key);
@@ -4206,46 +4223,52 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             // copy site). A CPU box filter here was the first implementation and
                             // collapsed titles that re-upload large mip-eligible textures per frame
                             // (Evergate's title froze the publish rate — snapshot-gate catch).
-                            const VkDeviceSize tbytes =
-                                static_cast<VkDeviceSize>(r.tw) * r.th * r.td *
-                                backend_color_bytes_per_pixel(r.texture_format);
-                            VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                            stci.size = tbytes;
-                            stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                (r.is_storage_image
-                                     ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u);
-                            vkCreateBuffer(dev, &stci, nullptr, &upload.staging);
-                            VkMemoryRequirements sr;
-                            vkGetBufferMemoryRequirements(dev, upload.staging, &sr);
-                            VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                            sai.allocationSize = sr.size;
-                            sai.memoryTypeIndex = pick(sr.memoryTypeBits,
-                                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                            upload.staging_memory = allocate_transient_render_memory(
-                                dev, sai.allocationSize, sai.memoryTypeIndex);
-                            vkBindBufferMemory(dev, upload.staging, upload.staging_memory, 0);
-                            void* sp = nullptr;
-                            vkMapMemory(dev, upload.staging_memory, 0, tbytes, 0, &sp);
-                            if (r.tex_rgba) {
-                                std::memcpy(sp, r.tex_rgba, static_cast<size_t>(tbytes));
+                            if (r.has_uniform_color) {
+                                upload.uniform_clear = true;
+                                std::copy(r.uniform_color.begin(), r.uniform_color.end(),
+                                          upload.uniform_color.float32);
                             } else {
-                                // Only a declined/missed depth-plane borrow reaches the creation
-                                // path with no CPU pixels (#1275: the bridge deliberately carries
-                                // none — e.g. the consumer samples its own bound DS attachment, or
-                                // the plane was invalidated between the frontend gate and this
-                                // lookup). Bind well-defined zeros — the value the guest-byte
-                                // decode of an unwritten depth address produced — and say so.
-                                std::memset(sp, 0, static_cast<size_t>(tbytes));
-                                static int declined_logged = 0;
-                                if (declined_logged++ < 16)
-                                    fprintf(stderr,
-                                            "[dsbridge] borrow declined/missed for 0x%llx %ux%u -> "
-                                            "zero texture\n",
-                                            (unsigned long long)r.persistent_depth_target_id,
-                                            r.tw, r.th);
+                                const VkDeviceSize tbytes =
+                                    static_cast<VkDeviceSize>(r.tw) * r.th * r.td *
+                                    backend_color_bytes_per_pixel(r.texture_format);
+                                VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                                stci.size = tbytes;
+                                stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                    (r.is_storage_image
+                                         ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u);
+                                vkCreateBuffer(dev, &stci, nullptr, &upload.staging);
+                                VkMemoryRequirements sr;
+                                vkGetBufferMemoryRequirements(dev, upload.staging, &sr);
+                                VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                                sai.allocationSize = sr.size;
+                                sai.memoryTypeIndex = pick(sr.memoryTypeBits,
+                                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                                upload.staging_memory = allocate_transient_render_memory(
+                                    dev, sai.allocationSize, sai.memoryTypeIndex);
+                                vkBindBufferMemory(dev, upload.staging, upload.staging_memory, 0);
+                                void* sp = nullptr;
+                                vkMapMemory(dev, upload.staging_memory, 0, tbytes, 0, &sp);
+                                if (r.tex_rgba) {
+                                    std::memcpy(sp, r.tex_rgba, static_cast<size_t>(tbytes));
+                                } else {
+                                    // Only a declined/missed depth-plane borrow reaches the creation
+                                    // path with no CPU pixels (#1275: the bridge deliberately carries
+                                    // none — e.g. the consumer samples its own bound DS attachment, or
+                                    // the plane was invalidated between the frontend gate and this
+                                    // lookup). Bind well-defined zeros — the value the guest-byte
+                                    // decode of an unwritten depth address produced — and say so.
+                                    std::memset(sp, 0, static_cast<size_t>(tbytes));
+                                    static int declined_logged = 0;
+                                    if (declined_logged++ < 16)
+                                        fprintf(stderr,
+                                                "[dsbridge] borrow declined/missed for 0x%llx %ux%u -> "
+                                                "zero texture\n",
+                                                (unsigned long long)r.persistent_depth_target_id,
+                                                r.tw, r.th);
+                                }
+                                vkUnmapMemory(dev, upload.staging_memory);
                             }
-                            vkUnmapMemory(dev, upload.staging_memory);
                         }
                     }
                     if (r.is_storage_image && r.storage_image_writeback &&
@@ -4885,7 +4908,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     texture_stats.persistent_hits = persistent_texture_hits;
     texture_stats.persistent_misses = persistent_texture_misses;
     for (const auto& upload : texture_uploads) {
-        if (!upload.staging) continue;
+        if (!upload.staging && !upload.uniform_clear) continue;
         ++texture_stats.unique_uploads;
         texture_stats.upload_bytes += static_cast<uint64_t>(upload.key.width) * upload.key.height *
                                       upload.key.depth * backend_color_bytes_per_pixel(upload.key.format);
@@ -5045,7 +5068,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Upload each distinct texture once. Draw descriptors may use separate views/samplers over the
     // same image, preserving per-binding swizzle and sampler state without duplicating pixel storage.
     for (const auto& upload : texture_uploads) {
-        if (!upload.staging) continue;  // exact-validated persistent image already has shader-read layout
+        if (!upload.staging && !upload.uniform_clear)
+            continue;  // exact-validated persistent image already has shader-read layout
         VkImageMemoryBarrier b0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b0.oldLayout = upload.persistent_refresh
             ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
@@ -5060,15 +5084,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 ? (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
                 : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b0);
-        VkBufferImageCopy tc{}; tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        tc.imageExtent = {upload.key.width, upload.key.height, upload.key.depth};
-        vkCmdCopyBufferToImage(cmd, upload.staging, upload.image,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
+        if (upload.uniform_clear) {
+            const VkImageSubresourceRange range{
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels, 0, 1};
+            vkCmdClearColorImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 &upload.uniform_color, 1, &range);
+        } else {
+            VkBufferImageCopy tc{}; tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            tc.imageExtent = {upload.key.width, upload.key.height, upload.key.depth};
+            vkCmdCopyBufferToImage(cmd, upload.staging, upload.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
+        }
         // #1272: generate levels 1..N-1 with a linear-filtered blit cascade (GPU-side, once per
         // upload — a CPU box filter here collapsed titles that re-upload large textures per frame).
         // Each source level transitions DST->SRC before feeding the next; the final barrier below
         // then flips the whole chain to shader-read. RGBA8 linear-blit support is mandatory Vulkan.
-        for (uint32_t l = 1; l < upload.key.mip_levels; l++) {
+        for (uint32_t l = 1; !upload.uniform_clear && l < upload.key.mip_levels; l++) {
             VkImageMemoryBarrier bs{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             bs.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             bs.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -5091,7 +5122,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                            upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                            VK_FILTER_LINEAR);
         }
-        if (upload.key.mip_levels > 1) {
+        if (!upload.uniform_clear && upload.key.mip_levels > 1) {
             // Levels 0..N-2 sit in TRANSFER_SRC after feeding the cascade; return them to
             // TRANSFER_DST so the single final-layout barrier below covers the whole chain.
             VkImageMemoryBarrier br{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};

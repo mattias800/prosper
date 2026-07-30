@@ -136,6 +136,34 @@ int main() {
               "R32_UINT storage images retain their typed four-byte Vulkan format");
     }
 
+    // A uniform DCC clear reaches the sampled image without a full CPU-sized pixel allocation or
+    // staging upload. Keep the declared extent larger than one texel so this also covers arbitrary
+    // normalized coordinates over the full image.
+    {
+        std::vector<uint32_t> ps(ps_template,
+                                 ps_template + sizeof(ps_template) / sizeof(ps_template[0]));
+        ps[1] = C075; ps[3] = C075;
+        std::vector<uint32_t> frag = recompile_fragment(ps.data(), ps.size(), &rt);
+        prosper::test::FrameResource resource;
+        resource.binding = 4; resource.set = 1;
+        resource.has_uniform_color = true;
+        resource.uniform_color = {0.25f, 0.5f, 0.75f, 1.0f};
+        resource.tw = 64; resource.th = 32;
+        prosper::test::BackendDraw draw;
+        draw.vs = vert; draw.fs = frag; draw.R = {resource}; draw.vcount = 3;
+        const std::vector<uint8_t> pixels =
+            prosper::test::render_draws_rgba({draw}, W, H);
+        const uint8_t* center = pixels.size() == static_cast<size_t>(W) * H * 4
+            ? &pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4] : nullptr;
+        CHECK(center && center[0] >= 63 && center[0] <= 65 &&
+                         center[1] >= 127 && center[1] <= 129 &&
+                         center[2] >= 190 && center[2] <= 192,
+              "uniform texture is initialized by a GPU clear and samples the requested color");
+        const auto stats = prosper::test::backend_texture_upload_stats();
+        CHECK(stats.unique_uploads == 1 && stats.upload_bytes == 64u * 32u * 4u,
+              "uniform GPU clear is accounted without CPU pixel backing");
+    }
+
     // The live renderer commonly submits hundreds of draws that reference the same few decoded
     // textures. The backend must upload identical pixels once per call while preserving the legacy
     // rendered bytes and separate per-descriptor views/samplers.

@@ -6,6 +6,7 @@
 
 using prosper::frontend::inject_rtt_pixels;
 using prosper::frontend::exact_rtt_snapshot_borrowable;
+using prosper::frontend::fill_repeating_pixel;
 using prosper::frontend::RttInjectionCache;
 
 static int failures = 0;
@@ -13,6 +14,26 @@ static int failures = 0;
     std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
 
 int main() {
+    const uint8_t rgba_pixel[] = {0x12, 0x34, 0x56, 0x78};
+    std::vector<uint8_t> repeated_rgba(5 * sizeof(rgba_pixel));
+    CHECK(fill_repeating_pixel(
+        repeated_rgba, rgba_pixel, sizeof(rgba_pixel)));
+    for (size_t i = 0; i < repeated_rgba.size(); ++i)
+        CHECK(repeated_rgba[i] == rgba_pixel[i % sizeof(rgba_pixel)]);
+    const uint8_t fp16_pixel[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<uint8_t> repeated_fp16(4096 * sizeof(fp16_pixel));
+    CHECK(fill_repeating_pixel(
+        repeated_fp16, fp16_pixel, sizeof(fp16_pixel)));
+    CHECK(std::equal(repeated_fp16.end() - sizeof(fp16_pixel),
+                     repeated_fp16.end(), fp16_pixel));
+    std::vector<uint8_t> empty;
+    CHECK(fill_repeating_pixel(empty, rgba_pixel, sizeof(rgba_pixel)));
+    std::vector<uint8_t> malformed_repeat(7, 0xcc);
+    CHECK(!fill_repeating_pixel(
+        malformed_repeat, rgba_pixel, sizeof(rgba_pixel)));
+    CHECK(std::all_of(malformed_repeat.begin(), malformed_repeat.end(),
+                      [](uint8_t byte) { return byte == 0xcc; }));
+
     CHECK(exact_rtt_snapshot_borrowable(4, 2, 4, 2, 8, 4 * 2 * 8));
     CHECK(!exact_rtt_snapshot_borrowable(2, 1, 4, 2, 8, 4 * 2 * 8));
     CHECK(!exact_rtt_snapshot_borrowable(4, 2, 4, 2, 8, 4 * 2 * 8 - 1));
