@@ -944,6 +944,20 @@ int main() {
         CHECK(prosper::test::persistent_texture_cache_budget_for_heap(128ull * GiB) == 4ull * GiB,
               "sampled-image auto sizing remains capped at 4 GiB");
 
+        // Live exact-extent RTT consumers borrow an immutable snapshot instead of copying it
+        // through frontend scratch. FrameResource copies retain that backing through upload setup.
+        auto pixels = std::make_shared<const std::vector<uint8_t>>(16, 0x5a);
+        prosper::test::FrameResource source;
+        source.tex_rgba_owner = pixels;
+        source.tex_rgba = pixels->data();
+        prosper::test::FrameResource retained = source;
+        source.tex_rgba_owner.reset();
+        pixels.reset();
+        CHECK(retained.tex_rgba_owner &&
+                  retained.tex_rgba == retained.tex_rgba_owner->data() &&
+                  retained.tex_rgba_owner->front() == 0x5a,
+              "a copied FrameResource retains borrowed RTT pixels");
+
         using prosper::frontend::texture_decode_cache_candidate;
         CHECK(texture_decode_cache_candidate(false, false, false, 1u, true, true),
               "an ordinary supported guest 2D texture uses the decoded-texture cache");
