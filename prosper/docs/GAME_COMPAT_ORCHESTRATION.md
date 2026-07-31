@@ -16,17 +16,41 @@ log, while this document is the map that helps the next orchestrator find and in
 
 - Repository: `mattias800/prosper` (renamed from `mattias800/ps5ys`).
 - Remote branch: `master`.
-- Exact master at handoff: `81a9548e4cf79f9b653bbf78acb38e149f0c373e`.
-- Active title lanes: Astro Bot, Dragon Quest VII, and The Plucky Squire.
-- Repository state: every outgoing game agent froze with a clean worktree and no uncommitted source changes.
-- Process state: no Prosper, `gpu_replay`, compiler, or game process was intentionally left running.
-- GPU state: unclaimed. GPU sharing is the default; see the scheduling rules below.
-- Highest-value next experiment: Dragon Quest VII binding-36 point-versus-linear sampling A/B on the retained
-  submit-1060 capsule.
-- Highest-value implementation uncertainty: Astro Bot operation 221's R11G11B10 storage output under stored versus
-  current raw shader lowering.
-- Highest-risk proof frontier: Plucky Squire's barrier-spanning pc915 VCCZ branch; no implementation is justified
-  until workgroup-uniform entry-SGPR provenance is established.
+- Exact master at this update: `b8064e54` (2026-07-31 session).
+- Active title lanes: Astro Bot, Dragon Quest VII, The Plucky Squire, Alex Kidd, and The Pathless.
+- GPU state: sharing is the default; see the scheduling rules below.
+
+**Read the falsification record before planning anything.** The three lanes handed over on `81a9548e` each had
+their assigned premise **falsified** during the 2026-07-31 session, including both items the previous handoff
+called its highest-value work. Re-running them wastes a session:
+
+| Previous "highest-value" item | Outcome |
+|---|---|
+| Astro op221 R11G11B10 storage lowering | **FALSIFIED.** Stored (packed R32ui) and current-raw (native typed float) take provably different backend paths yet produce byte-identical output `28b5ea9a3fbd2ca9`. |
+| Dragon Quest binding-36 sampling | **EXONERATED entirely.** LUT contents, tile27 detile, DCC, 10:10:10:2 unpack, 3D coordinate wiring, dimensional opcode, dmask, swizzle, address modes, sampler filtering, and draw90's shader translation are all ruled out. |
+| Plucky pc915 barrier-spanning branch | **PROVEN workgroup-uniform and merged** (#1572). |
+
+Two lanes were added because the inherited allocation was skewed to the hardest titles while easier ground sat
+idle: **Alex Kidd** (PPSA02664) and **The Pathless** (PPSA01826). Alex Kidd reached the gameplay rung in one
+session. Prefer breadth when a hard lane stalls — overall library progress matters more than any single title.
+
+### Tooling hazards that cost real time this session
+
+1. **Build inside the `ps5ys` distrobox.** The host has only the Vulkan *loader*, not the headers. A host
+   configure **succeeds while silently omitting** `gpu_replay`, the offscreen graphics harness, and every Vulkan
+   **execution** test, logging just `Vulkan not found`. A green host `ctest` is therefore not evidence that
+   execution tests ran — confirm the binaries exist and report test names, not an exit code. Wipe the build dir
+   when switching; a stale cache keeps Vulkan disabled.
+2. **`shader_inspect` was misreporting ~96% of known-good shaders** (109 of 114, across all three stages) as
+   `rejected`, because a raw dump carries no descriptors. Fixed in #1575 — it now reports
+   `undetermined-no-resource-table` with exit 3. Any shader verdict taken from it before `37dfe752` is suspect.
+3. **Instrumentation produced two phantom defects this session, not reasoning.** `PROSPER_FS_TAP` exports
+   `(dst, dst+1, dst+2, dst+3)`, so comparing taps with different `dst` compares *different registers* — that
+   manufactured a "~14x amplification" that did not exist. Treat a surprising measurement as a possible tool
+   artifact before treating it as a finding.
+4. **`-DGAME_DUMP` against a non-Messenger title fails 3 dump-parameterized tests** (`module_loads_eboot`,
+   `boot_reaches_first_syscall`, `real_shader_render`). This is expected, not a regression — current master is
+   **162/162** when configured against `PPSA24651`. Tracked as #1573.
 
 ## The orchestration contract
 
@@ -183,6 +207,11 @@ These changes are already on current master and should not be reimplemented:
 | [#1564](https://github.com/mattias800/prosper/pull/1564) | `1634c1e7597731b4d2a5da8d616e2755ef202518` | Structures scalar multi-loops; live Plucky stage `0x3017450000` executes. |
 | [#1565](https://github.com/mattias800/prosper/pull/1565) | `2d6ff9fb800d5e8689209958c17963d4f49b6a46` | Captures frames at exact guest-log phases; enabled deterministic Astro world-map capture. |
 | [#1566](https://github.com/mattias800/prosper/pull/1566) | `81a9548e4cf79f9b653bbf78acb38e149f0c373e` | Composes multiple structured preludes with counted-loop lowering. |
+| [#1572](https://github.com/mattias800/prosper/pull/1572) | `276b8f92` | Admits barrier-spanning VCC branches **proved** workgroup-uniform. Plucky stage `0x3017460000` reaches `unsupported=0`. |
+| [#1574](https://github.com/mattias800/prosper/pull/1574) | `24a98629` | `gpu_replay --inspect-only` reports resolved `SPI_PS_INPUT_CNTL` linkage, so a synthesized-constant varying is visible offline. |
+| [#1575](https://github.com/mattias800/prosper/pull/1575) | `37dfe752` | `shader_inspect` reports a missing resource table as `undetermined` (exit 3), not as a shader rejection. |
+
+Current master is **162/162 ctest** when configured against `PPSA24651`, with all of the above composed.
 
 PR #1566's focused translator/render set was:
 
@@ -277,54 +306,60 @@ black, so no progression screenshot was published.
 10. The 1x1 value is sane and finite. Black does not begin at op19. Current evidence has not yet distinguished
     op221's 1920x1080 result from later/final composition.
 
-### Highest-value unresolved fork
+### Falsified: the R11G11B10 storage fork
 
-Op221 stored and current raw SPIR-V are not binary-identical:
+Op221's stored (14,543 words, `5ad826b552f23191`) and current-raw (12,019 words, `4d55000d1c32f046`) SPIR-V are
+not binary-identical, and the difference does concentrate in R11G11B10 storage lowering — stored packs float RGB
+into an R32ui image, current writes a float vector with `StorageImageWriteWithoutFormat`.
 
-| Variant | Words | FNV/hash | SHA-256 |
-|---|---:|---|---|
-| Stored | 14,543 | `5ad826b552f23191` | `060d685ecae0a3832861bacacd113e82ca40155586cc8820c25863f227b2ee8e` |
-| Current raw | 12,019 | `4d55000d1c32f046` | `d2c54a3292b7b59513c904f158d4cee81b7462292a61370cd9422918b783ce6a` |
+**This is not a defect.** Forcing each module explicitly with `--override-compute-spv 15 PATH` proved the two arms
+take genuinely different backend paths (`native-storage=0` "exact packed R11G11B10 storage via R32_UINT" versus
+`native-storage=1` typed float) and still produce **byte-identical** output `28b5ea9a3fbd2ca9`. The divergence is
+by design: `gpu_executor.cpp` forces `native_storage_format_support=0` whenever a capture is bound, keeping stored
+modules device-independent. Do not spend a PR here.
 
-The difference concentrates in R11G11B10 storage lowering. Stored SPIR-V manually packs float RGB into an R32ui
-image; current SPIR-V writes a float vector to a typed/unknown-format image with
-`StorageImageWriteWithoutFormat`. Static intent may be equivalent, but output parity is unproved.
+Also falsified: seed-skip/poison corruption (`PROSPER_NO_SKIP_SEED=1` gives an identical hash); op221 itself
+(it writes zeros, but from a genuinely empty upstream); and the b49 1x1 control (draw 206's only real image input
+is `0x5420f0000`).
 
-Final draw206/op236 also needs a targeted raw-recompile proof. A mass raw run retained the stored hashes, but only
-7 of 36 draw pairs were substituted, so unchanged hashes alone do not prove this pair rebuilt.
+### Current Astro frontier: a frame-wide zero colour write mask
 
-### Next Astro assignment
+The world map is **not** a "dark grayscale pattern" — contrast-stretching the output shows a uniform diagonal
+sawtooth with **zero scene content**. The prior "min 0 / max 13 / mean 5.97" reading is a content-free ramp.
 
-Start with two short retained-bundle GPU A/Bs; neither requires exclusive GPU ownership:
+**No geometry draw writes colour anywhere in the captured frame.** Across 7 submits / 43 realized draws, 28 draws
+target the G-buffer `0x520440000` with `cwm=0` *and* `cwm1=0` while carrying real indexed geometry
+(2,776–5,736 verts) and a **140,825-word** material fragment shader; ~170 further draws are suppressed as
+no-effect for the same reason. Only 3 draws write full RGBA. Meanwhile the *captured* G-buffer holds 12,267,587
+non-zero bytes of real content.
 
-1. Compare default stored op221 against `--recompile-raw` on the same bundle and bounded output. Confirm op221 was
-   actually substituted and compare image/output hashes. Existing `--override-compute-spv 15 PATH` can force the
-   stored or current module explicitly.
-2. Trace/substitute final b49 with `PROSPER_RESOURCE_HASH_DIM=1x1` and a selector-miss versus binding-49 hit using
-   `PROSPER_TESTTEX_DRAW=206`, `PROSPER_TESTTEX_BINDING=49`, and either checker or zero. Run draw206 with its compute
-   prefix or the full submit.
+`render_state.cpp` resolves an **absent** `CB_TARGET_MASK`/`CB_SHADER_MASK` to **write-all**, so `cwm=0` means one
+of those registers is **present with value zero**, or `MODE` is `DISABLE`. The live trace never once observed
+`MODE=1 (CB_NORMAL)` — only mode 0 and mode 6 — which is not what an ordinary renderer looks like.
 
-Interpretation:
+A tempting prior was the Gen5 stale-register-fold class. It was **investigated and not confirmed**, and the prior
+itself turned out to rest on a superseded diagnosis:
 
-- Stored-versus-current op221 divergence localizes the first implementation target to R11G11B10 storage lowering.
-- Identical op221 results plus a material b49 substitution effect moves the investigation to later consumers or final
-  fragment composition.
-- If current tools still cannot attribute the boundary, add a reusable post-operation resource dump: after
-  `--through-operation 221`, export capture-owned `host_data` for `0x5460b000` before later consumers. The current
-  pre-submit resource dump cannot do this.
+- `SetRegsIndirect` reads a flat `{offset,value}` array and drops only `offset >= kRegOffsetLimit`, so the
+  present-and-zero *capability* is real and generic.
+- But #1364's "second record format / bit31-tag misparse" family diagnosis was **overturned**. The real mechanism
+  was an HLE **success stub**: the SDK interpolant helper `dbOlWdppb4o` advertised 32 output records it never
+  wrote, leaving **host stack residue** whose dword halves fold as present-and-zero registers. Fixed by #1368
+  and #1411; current master emits zero `[dbbase-clobber]` events on 380 s+ routes.
+- PRs #1344 and #1363 are downstream *symptom recoveries*, not fold-level invariants.
+- Residue historically lands in the **low** offset cluster (DB `0x00-0x1F`, scissors `0x0C-0x0D`), whereas
+  `CB_TARGET_MASK` is `0x8E`, `CB_SHADER_MASK` `0x8F`, and `CB_COLOR_CONTROL` `0x202`. That is counter-evidence.
+- `PROSPER_DBBASETRACE` **cannot decide this**: it is hardcoded to DB offsets and only fires on a
+  nonzero-then-zero-within-one-array signature, so it never fires for a register the guest never writes.
 
-Relevant code:
+**Next Astro step.** Capture **v43** (PR #1576) retains the raw colour-state triple per draw with presence flags
+and surfaces it in `--inspect`, which is what makes `cwm=0` attributable offline. The retained bundle is v42, so
+it reports `color-state unavailable` — a **fresh v43 capture** is required. Take one, then determine whether the
+zero masks are genuine guest intent or a prosper defect. If they are genuine intent, "real content exists but
+nothing reaches the screen" via small mipped 4 KiB surfaces becomes the natural next suspect.
 
-```text
-prosper/src/gpu/gpu_capture.cpp
-prosper/src/gpu/gpu_dependency_graph.cpp
-prosper/frontends/shared/live_compute.cpp
-prosper/frontends/shared/live_renderer.cpp
-prosper/tools/gpu_replay/gpu_replay.cpp
-```
-
-Do not recapture the world map, revisit submit 6279, or implement compute-writer closure until contradictory evidence
-appears.
+Do not recapture the world map for any other reason, revisit submit 6279, or implement compute-writer closure:
+b6 is already captured, materialized, detiled and seeded, and no earlier producer exists in the bundle.
 
 ## Lane B: Dragon Quest VII overexposed composite
 
@@ -451,38 +486,75 @@ scrambling, alternating bad slices, or discontinuity at 8/16-voxel boundaries. T
 10:10:10:2 unpacking are now unlikely primary causes. Before citing exact runtime parity, confirm that current
 master's tile conversion source matches the tested `2d6ff9f` version.
 
+### Binding 36 is exonerated — do not re-open it
+
+A point-versus-linear A/B produced `linear` byte-identical to baseline **because the T# already reports
+`filt=1/1/1`**, with `point` (`b005d9f5045a2f6d`) differing on 8,243,869 of 8,294,400 pixels. Both arms provably
+took distinct paths, so this is a real negative, not a broken experiment.
+
+`PROSPER_FS_TAP` measured draw90's actual sample coordinates as **(0.385, 0.536, 0.688)** — none saturated — and
+the LUT correctly returns (0.424, 0.768, 0.975) there. draw90's FS is a faithful UE4 tonemapper with
+`unsupported=0`. Ruled out and not to be re-run: LUT contents, tile27 volume detile, DCC, 10:10:10:2 unpack,
+binding/view/3D-coordinate wiring, dimensional opcode, dmask, swizzle, address modes, sampler filtering, and
+draw90's shader translation.
+
+The LUT's corners look absurd as an RGB cube (pure R gives 255,224,190) but are exactly right for UE4's
+**log-encoded `CombineLUTs`** volume.
+
+**Caution:** the older "`--recompile-raw` at op117 is byte-identical" result **predates a `rdna2_to_spirv.cpp`
+change** and must be re-measured before being cited again. Verify source parity by hashing the specific
+translation units rather than assuming.
+
+### Also cleared: the auto-exposure producer and delivery
+
+- **Producer format** — `b15` is `fmt=4 nc=4` Float16x4, `declared=16320 = 60x34x8`, seed tagged `rgba16f`. Exact
+  agreement, so this is **not** a #773-class native-format loss.
+- **Producer content** — draw77 writes R .0973 / G .3472 / B .9731, luma `.33929`, with `rgb_nonblack=2040`
+  (all texels) and `HIT` on every sample.
+- **Stale seed** — falsified; the near-black buffer is draw79 (operation 105, *after* op103), which is capture
+  ordering rather than a bug.
+- **Delivery** — `1=param1`, a real `PARAM1` export consumed at `pc=0177`. No draw90 input is a
+  `ConstantDefault` (`valid=ffffffff`, only `param0..3`), and every PS attribute read falls inside its VS
+  export's EN mask. Confirmed with the #1574 seam.
+
+The eye-adaptation buffer reporting average luminance **629** is **not** the cause, and the arithmetic shows why:
+too-high average luminance implies too-*small* exposure implies a too-**dark** frame, but the frame is too
+**bright**. Against the oracle the error is ~1–2 stops (a factor of **2–4**), nowhere near the ~8192x a broken
+exposure implies.
+
+Two retractions worth preserving so they are not re-derived: a "multiplier is exactly 1.0" claim derived by
+inverting *means* through a `log` is invalid under Jensen's inequality — it was re-established by direct
+measurement instead (`tap-177` uniform at `0.984314`, one distinct value across all 8.29M pixels). And a
+"~14x amplification" in the post chain was an artifact of comparing **different registers** via `PROSPER_FS_TAP`'s
+`(dst..dst+3)` export window.
+
+### Not bloom: film grain and chromatic aberration
+
+pc=214–256 decodes to literals summing to `0.99999999` (Rec.601 luma), then `1/(2π)` → `v_sin_f32` (which prosper
+lowers as `sin(x·2π)`, cancelling it) → `493013.0` → `v_fract_f32`: `fract(sin(x)·493013)` hash noise applied as
+`c·(1 + noise·s)`. Zero-centred and multiplicative, so it averages to ~1.0 and **cannot** produce systematic gain.
+pc=154/157/164 use the *same* T# and sampler with different coordinate VGPRs and dmasks 1/2/4 — one texture
+sampled three times at offset UVs, one channel each: **chromatic aberration**. b34/b37/b38 aliasing one surface is
+three descriptor slots on one texture, not three reads.
+
 ### Next Dragon Quest assignment
 
-The leading area is b36 sampling semantics in the translated fragment shader or backend sampler state.
+The lane reduces to one number: the frame is bright because b34 is bright and the effective exposure is ≈1.0,
+since `s97 x ExposureScale` is a measured uniform `0.984314`. `tap-171` renders exactly 0 across all 8.29M pixels,
+bounding delivered `ExposureScale < 1/510`, so **`s97 > 502` is already established** and `s97 = 1.0` is excluded.
 
-1. First post the full-volume result to issue #1486; it was produced after the last existing public comment.
-2. Run the binding-36-scoped `PROSPER_TESTTEX_FILTER=point` versus `linear` A/B through op117 while retaining the
-   original pixels. Include baseline, hashes, image metrics, and confirmation that both reached op117. Two bounded
-   correctness replays do not require exclusive GPU use.
-3. If filtering is not explanatory, inspect draw90's exact b36 sample path:
-   - normalized versus integer coordinates;
-   - 3D dimensional opcode and coordinate component order;
-   - descriptor swizzle;
-   - address modes;
-   - sample versus load behavior;
-   - min/mag/mip filter construction.
-4. If current seams cannot separate these, prefer a reusable draw/stage/binding-scoped decoded-resource dump that
-   records hashes for pre-DCC/base, post-DCC, post-detile packed, and post-unpack upload data.
-5. A draw/binding-scoped identity 3D LUT (`RGB = normalized XYZ`) after unpack is a useful synthetic control if
-   existing checker patterns cannot isolate coordinate semantics. It is diagnostic, not a title fix.
+Measure `s97` at `b33+0x878` and `s106` at `b32+0x50` directly with two bounded `--dump-resource 90:ps:32` and
+`90:ps:33` runs rather than inferring them. Two outcomes:
 
-Relevant current controls:
+- **`s97 ≈ 8192`** — a UE4 **PreExposure** reciprocal, meaning the ≈1.0 cancellation is by design and the defect
+  is upstream: prosper's base pass never applied the matching PreExposure factor. That would be a shared UE4-path
+  change touching Plucky, ArcRunner and The Pathless, so it needs a generic contract and regression first.
+- **`s97` is some other value > 502** — op103 wrote a different value in replay than the capture recorded,
+  relocating the defect to op103's execution with no cross-title blast radius.
 
-```text
---dump-resource DRAW:ps:BINDING PATH
-PROSPER_DUMP_RAWTILE
-PROSPER_DUMP_RAWTEX
-PROSPER_DUMP_RESOURCE_VERSION
-PROSPER_NODETILE                 # global; avoid as a clean A/B
-PROSPER_TESTTEX_FILTER=point|linear
-```
-
-There is no current binding-scoped DCC bypass, complete post-unpack 3D-volume export, or `--override-resource`.
+Note the standing counter-evidence against the PreExposure reading: if the base pass had applied
+PreExposure = 8192, b34 would hold values in the thousands, but b34 is a smooth gradient at (0.098, 0.348, 0.971).
+And the ~2–4x magnitude needed to match the oracle is far too small for a PreExposure-scale defect.
 
 ## Lane C: The Plucky Squire skipped compute
 
@@ -552,105 +624,198 @@ map those values.
 Do not infer safety merely from the fact that the guest shader exists. If these scalar entry values differ by wave,
 placing a Vulkan workgroup barrier inside an ordinary structured arm can violate uniform barrier participation.
 
+### Resolved and merged (#1572)
+
+The pc915 branch is **proven workgroup-uniform** and admitted by a generic rule. Two obligations are proved
+independently and mechanically:
+
+1. **EXEC is full at the branch on every path**, by forward must-dataflow (greatest fixpoint, sound across
+   back-edges). This leg was missing from the original framing and is load-bearing: `VCCZ` is *also* true for a
+   wave whose EXEC is empty, a genuinely per-wave property no amount of scalar uniformity recovers.
+2. **VCC is `SCC ? EXEC : 0`**, optionally combined by `s_and_b64`/`s_or_b64`, with every contributing SCC from a
+   scalar compare whose every scalar input traces to launch data.
+
+Unproved provenance stays rejected: EXEC/SCC as data, `V_READFIRSTLANE`/`V_READLANE`, VOPC masks, SGPRs above the
+launch range, and definitions entering from outside the straight-line region.
+
+The uniformity guarantee is a property of **prosper's own compute entry seeding**, not an assumption about the
+guest: user SGPRs come from `load_push_constant` (dispatch-uniform), system SGPRs from `b.groupid[]`
+(`gl_WorkGroupID`, workgroup-uniform), TG_SIZE is a constant, and local invocation IDs are seeded into **VGPRs**,
+which the provenance walk rejects outright. Nothing at compute entry places a wave-varying value into an SGPR.
+
+Supporting CFG facts for the retained stage: in `[916,1963)` there are 12 barriers and 35 branches, all forward
+`s_cbranch_execz` with no back-edges, none spanning a barrier; across the whole program only three edges cross any
+barrier (`pc83→899`, `pc898→82`, `pc915→1963`), making pc915 the sole barrier-crossing edge. Coverage moved from
+`unsupported=1` to `total=1326 alu=1261 table=65 unsupported=0`.
+
 ### Next Plucky assignment
 
-This lane is static/offline first and needs no GPU:
+**This is not yet a live-execution claim.** `stage-recompile status=rejected` still persists for the *raw* stage
+because it lacks the live resource table and stops at table-dependent MUBUF pc31 — separate and pre-existing.
 
-1. Enumerate every SOPP branch/backedge and every `S_BARRIER` in `[916,1963)`. Determine whether pc915 is the only
-   edge crossing each barrier and classify every nested branch.
-2. Inspect retained capture/log state for compute program metadata, `COMPUTE_PGM_RSRC2`, user/system SGPR enables,
-   local dimensions, and dispatch mapping. Map s12:s14 before considering code.
-3. Trace compute launch construction in the executor/resource table. Mechanically prove or disprove that s12:s13,
-   s14, and the scalar memory values s16:s17 are identical for every wave in one workgroup.
-4. Only after that proof, design a generic rule that promotes a barrier-spanning wave branch to workgroup-uniform when
-   every predicate source has dispatch- or workgroup-invariant provenance. Unknown entry SGPRs, wave/lane values,
-   mask-derived values, and readfirstlane-derived values must remain rejected.
-5. Add positive and negative structural/execution tests before touching the live path. Do not specialize on program
-   address `0x3017460000`.
+Run the ~10-minute native-cadence route and confirm `0x3017460000` actually executes, then identify what is
+skipped next (#1554 reported three skipped compute programs; the preceding `0x3017450000` already executes 48
+times with zero skips after #1564). Useful instrumentation, pinned by reading the source rather than guessing:
+`[compute] skip unsupported program` is ungated and deduped per program, so its **absence proves zero skips**;
+`[compute] execute submit=…` needs the targeted `PROSPER_COMPUTELOG_CODE=<addr>` rather than blanket
+`PROSPER_COMPUTELOG`, which would flood ~13k submits and distort a realtime route.
 
-Relevant machinery:
+Note `RecompileCoverage` keeps `table_dependent` in a **separate bucket** from `unsupported` by design, so the
+`generic-coverage` line was structurally immune to the `shader_inspect` defect described above. Prefer the live
+path's own rejection reasons (`[recompile-reject] pc=… op=0x…` under `PROSPER_DBG`) over any offline verdict.
 
-```text
-prosper/src/gpu/rdna2_to_spirv.cpp
-  detect_forward_ifs
-  analyze_barrier_phased_compute
-  emit_cfg_state_machine
-  structured_compute_wave_cfg / top_level_pc
-  scalar provenance and constant analysis
+## Lane D: Alex Kidd in Miracle World DX (PPSA02664)
 
-prosper/tests/test_rdna2_to_spirv.cpp
-  kernel43a2 VCC-with-barrier negative
-  barrier-phased compute tests
-  exact-wave CFG tests
+Added 2026-07-31 because the inherited allocation was skewed to the hardest titles. **It reached the gameplay
+rung in one session**, and the root cause was a **generic tiling defect**, not a title quirk.
 
-prosper/tests/test_rdna2_spirv_struct.cpp
-prosper/tests/test_game_compute.cpp
-prosper/tests/test_recompile_coverage.cpp
-prosper/tools/shader_inspect
-```
+`tiled_mip_level_layout` converted `mip_x`/`mip_y` — which count whole **256-byte** blocks — to elements using a
+multiplier derived from the *macroblock* (`block_width >> 4`). That is correct only when the macroblock is 16x the
+256-byte block (the 64 KiB modes) and **four times too small for every 4 KiB mode**. The struct contradicted
+itself, reporting `byte_offset=0x800` alongside `tail_x=4` (byte `0x80`) for the same level, and the consumer used
+`tail_x`. **53 of 130 packed-tail levels violated the origin-agreement invariant; zero after the fix.**
 
-The existing barrier-phased path peels a workgroup-uniform SCC outer guard, emits barrier-free phases, and leaves
-barriers in a uniform shell. It is a plausible transformation model, but pc915's VCC predicate requires a stronger
-provenance proof first.
+The correct multiplier is the 256-byte block's element extent, which depends only on element size (AddrLib
+Block256_2d): 1B=16x16, 2B=16x8, 4B=8x8, 8B=8x4, 16B=4x4 — every entry multiplying to exactly 256 bytes.
 
-## Suggested initial allocation for a new orchestrator
+The visible consequence shows how far a texture-origin bug can travel: mipped 4x4 SpriteMask sprites decoded as
+foreign, fully transparent texels, so every mask fragment failed its alpha test and a **legitimate** "visible
+outside mask" fill covered the entire frame. A black screen, several layers from its cause.
 
-Use three title agents plus the orchestrator:
+Falsified along the way: both prior size hypotheses (the guest's T# really is 4x4 with `base_level=0`), descriptor
+selection, Gen5 size decode, the 4x4 fallback, blend/stencil semantics, guest-state divergence, and stale texture
+content. The much older "`fs2949` premultiplies by vertex-colour alpha 0" diagnosis remains falsified — that
+capsule was the intro narration crawl, where alpha-0 is correct.
+
+**Two things to carry forward.** Existing `.prgcap` files **bake the resolved tail coordinates**, so pre-fix
+capsules replay unchanged even on a fixed binary; re-verifying anything tiling-related needs a **fresh** capture.
+And scene identity must be established from rendered *semantic content*, never from submit ordinals, guest VAs,
+draw counts, or shader-hash signatures — that invariant was violated once here already.
+
+Remaining: a title-level snapshot guard. Proposed contract — route `scripts/ppsa02664/reach-first-gameplay.pad`,
+sample 70–120 s, richest frame must have non-black >= 95% **and** >= 20,000 distinct colours (pre-fix: 13.7% and
+3,010). Do **not** use colour count alone; a seed-miss gradient can outscore real content. Needs
+`snapshot.py verify` plus image review before adopting a baseline. #710 (title/menu renders incorrectly) is
+plausibly the same root cause and is now cheap to re-check.
+
+## Lane E: The Pathless (PPSA01826)
+
+First triage 2026-07-31. **Not greenfield** — #1213 exists with prior work, was closed apparently by accident,
+and has been reopened. Current state is tracked in **#1570**.
+
+UE4 4.27-class with Wwise. Boots remarkably far — Wwise up, full UE4 thread topology including a Navmesh Tile
+Builder (so a real level is loaded), 6,150 submits / 28,859 draws / 27,350 dispatches in 75 s — but **every
+presented frame is a flat colour** (blue then white) and progression freezes at ~18 s. That is **rung 0**.
+
+The #1213 worker SIGSEGV at `eboot+0x1b70cd0` **did not reproduce** across four runs. An offline capture (485
+draws, 1 dispatch, **0 failures**, replaying hash-exact at `a5e7b61cbf984383`) shows 482 draws plus 1 compute
+writing a 768x768 Slate/UMG surface, and only **3** draws touching the 3840x2160 front buffer — all three binding
+a 1x1 white texture. prosper faithfully realizes what the guest submits; the defect is composition/progression.
+
+Later stepping showed the front buffer goes black → white, and the three front-buffer draws are the ones painting
+white. Their pixel shader's entire constant buffer is a single RGBA of `(1.0, 0.4545, 0.0, 1.0)` — **orange** — and
+the export is a COMPR packed-FP16 MRT0 export fed by `V_PACK_B32_F16`, consistent with `export=4` (FP16_ABGR). So
+the shape is "a tint constant that should produce orange yields white", pointing at the **packed-FP16 export
+path** rather than texel decode. The 1x1 white texture looks like a deliberate Slate white-brush dummy.
+
+Open question the capture cannot yet answer: whether the composite lives in a different submit or the game is
+genuinely blank — the capture is 1 submit of ~6,150. A `.prgtl` timeline survey of all submits is the next step
+and is CPU-only.
+
+Generic gaps found, all `area:infra` and all benefiting other UE titles: DCC `tile=27` sampled images and metadata
+extents unsupported; a 400x400x212 image exceeding the 512 MiB backend bound; and 40+
+`[agc] WaitRegMem q=F … dependency violated` — the same per-queue barrier gap as ArcRunner #1226. Estimated cost:
+**rung 1 ≈ one medium focused investigation** (answerable offline from the existing capture), **rung 3 ≈ several
+sessions**.
+
+## Suggested allocation for a new orchestrator
 
 | Agent | First bounded task | GPU |
 |---|---|---|
-| Dragon Quest VII | Post decode evidence, then point/linear b36 A/B and inspect exact 3D sample semantics | Two short shared correctness replays |
-| Astro Bot | Stored/current op221 A/B, then binding49 selector-miss/hit value trace | Short shared correctness replay |
-| Plucky Squire | Map pc915 entry SGPRs and barrier-region CFG; no code without uniformity proof | None initially |
-| Orchestrator | Validate evidence, prevent overlap, review/publish worthy diffs, keep master/current docs synchronized | Coordinates leases |
+| Astro Bot | Take a **fresh v43** capture, then attribute the frame-wide `cwm=0` from the raw colour-state triple | One bounded capture |
+| Dragon Quest VII | Measure `s97`/`s106` with two `--dump-resource` runs; decide PreExposure versus op103 execution | Two ~2 s runs |
+| The Plucky Squire | Live route: confirm `0x3017460000` executes; identify the next skipped stage | ~10 min routed run |
+| Alex Kidd | Land the snapshot guard; re-check #710 against the tiling fix | Snapshot verify |
+| The Pathless | `.prgtl` survey of all ~6,150 submits for the real composite; then the packed-FP16 export path | CPU first |
+| Orchestrator | Review diffs, sequence GPU, publish/merge, keep this document current | Coordinates leases |
 
-Dragon Quest currently has the shortest path to a visually meaningful correction. Astro has the strongest candidate
-for a shared R11G11B10 storage-lowering fix. Plucky is valuable recompiler work but must remain proof-driven because
-an invalid barrier transformation can hang or silently misexecute a workgroup.
+**Balance breadth against depth.** Astro Bot is a AAA showcase title and has produced no shippable title fix
+across two sessions; Dragon Quest and Plucky are deep but tractable. Alex Kidd went from stuck to gameplay in one
+session, and The Pathless was never attempted. When a hard lane stalls, reassign rather than persist — overall
+library progress matters more than any single title, and the user has said so explicitly.
 
-If one lane stalls on missing evidence, reassign that agent to an easier title rather than manufacturing speculative
-code. Real progress in any game is more valuable than preserving the original title allocation.
+**Expect the generic wins to come from tooling and shared subsystems.** This session's merges were a recompiler
+uniformity rule, two diagnostic seams, a tooling-honesty fix, and one shared tiling fix. Every one of them helps
+titles beyond the lane that found it.
 
 ## Ready-to-send subagent prompts
 
-### Dragon Quest VII
-
-```text
-Read CLAUDE.md, docs/GAME_COMPAT_ORCHESTRATION.md, docs/DRAGON_QUEST_STATUS.md,
-and issue #1486. Create a private worktree and branch from the exact current origin/master.
-Reuse ~/agent-tmp/dq-cap3/black.prgcap. First post the retained full-volume LUT decode result
-from the orchestration doc to #1486 with public paths sanitized. Then run only the bounded op117
-binding36 PROSPER_TESTTEX_FILTER point-versus-linear A/B, including a baseline if needed. Report
-exact commands, hashes, op117 completion, pixel metrics, and interpretation. If filtering does not
-explain the overexposure, inspect the exact draw90 b36 3D sample semantics and backend sampler state.
-Do not edit until you can name a generic contract and regression. No live game run and no exclusive
-GPU request for these short correctness replays.
-```
+Give every agent: its worktree path, its branch, the exact `origin/master` SHA, the dump root, the **distrobox**
+build command, and the instruction to keep evidence under `~/` and out of `/tmp`, the repo, and public text.
 
 ### Astro Bot
 
 ```text
-Read CLAUDE.md, docs/GAME_COMPAT_ORCHESTRATION.md, the Astro handoff doc, and issue #1459.
-Create a fresh private branch from current origin/master; the old closure branch is evidence-only.
-Reuse ~/.local/state/prosper/evidence/astro-worldmap-c5698376-froute.KyRLdP/worldmap.prgbundle.
-Do not implement compute-writer closure: b6 is already captured and seeded, and no prior included
-writer exists. Run a bounded stored-versus-current op221 replay, prove module substitution, and compare
-outputs; then use a selector-miss and draw206/b49 hit to prove final 1x1 contribution. Localize black
-to op221 output or downstream composition before editing. If a tool gap remains, propose the smallest
-generic post-operation resource dump. No live recapture and no exclusive GPU request initially.
+Read CLAUDE.md, docs/GAME_COMPAT_ORCHESTRATION.md (Lane A), and issue #1459.
+Do NOT re-run the R11G11B10 storage fork (falsified: byte-identical output across different
+backend paths), compute-writer closure, submit 6279, or the b49 1x1 control.
+The frontier is that no geometry draw writes colour anywhere in the frame: 28 realized draws
+resolve cwm=0 and cwm1=0. An ABSENT target/shader mask resolves to write-all, so cwm=0 means
+present-and-zero, or MODE=DISABLE. Capture v43 retains the raw triple; the retained bundle is
+v42 and reports "color-state unavailable", so take a FRESH v43 capture first. Then determine
+whether the zero masks are guest intent or a prosper defect. The Gen5 stale-fold prior was
+investigated and NOT confirmed; read the lane notes before reviving it.
+```
+
+### Dragon Quest VII
+
+```text
+Read CLAUDE.md, docs/GAME_COMPAT_ORCHESTRATION.md (Lane B), docs/DRAGON_QUEST_STATUS.md, and #1486.
+Binding 36 is EXONERATED and the op103 auto-exposure producer and interpolant delivery are CLEARED.
+Film grain and chromatic aberration are both excluded. Do not re-open any of them.
+Measure s97 at b33+0x878 and s106 at b32+0x50 with two bounded --dump-resource 90:ps:32 and
+90:ps:33 runs. s97 > 502 is already established. If s97 is approximately 8192 it is a UE4
+PreExposure reciprocal and the defect is upstream in the base pass (shared UE4 blast radius —
+name a generic contract first); otherwise op103 wrote a different value in replay than captured.
+Note the counter-evidence: b34 is a smooth gradient, not thousands-valued, and the oracle gap is
+only 2-4x. Re-state tile.cpp parity against current master rather than citing an old blob hash.
 ```
 
 ### The Plucky Squire
 
 ```text
-Read CLAUDE.md, docs/GAME_COMPAT_ORCHESTRATION.md, issue #1554, and PRs #1564/#1566.
-Transfer the clean investigate/plucky-pc915-proof worktree at current master or create a fresh equivalent.
-Reuse ~/plucky-work/post1564-live-retry.fwpVFI/shader-dumps/exec_cs_3017460000.bin.
-Enumerate the pc915 arm CFG/barriers and map entry SGPRs s12:s14 from compute launch metadata.
-Prove whether (s16>0)&&(s14==s17-1) is identical across every workgroup wave. No code until a
-mechanical workgroup-uniform provenance rule exists; guest shader existence is not proof. Report a
-generic positive/negative test design or a defensible conclusion that the branch must remain rejected.
-This task is CPU/offline and needs no GPU.
+Read CLAUDE.md, docs/GAME_COMPAT_ORCHESTRATION.md (Lane C), #1554, and PRs #1564/#1566/#1572.
+The pc915 uniformity work is MERGED; do not redo it. It is not yet a live-execution claim.
+Run the ~10-minute native-cadence route and confirm 0x3017460000 executes, then identify the
+next skipped stage. Absence of "[compute] skip unsupported program" proves zero skips. Use the
+targeted PROSPER_COMPUTELOG_CODE=<addr>, not blanket PROSPER_COMPUTELOG. Prefer the live path's
+own rejection reasons over any offline verdict. Keep PROSPER_RENDER_SCALE=1 and RENDER_EVERY=1.
+```
+
+### Alex Kidd
+
+```text
+Read CLAUDE.md, docs/GAME_COMPAT_ORCHESTRATION.md (Lane D), and #320.
+The generic packed-mip-tail tiling defect is FIXED; the title reaches gameplay. Remaining work is
+the snapshot guard: route scripts/ppsa02664/reach-first-gameplay.pad, sample 70-120 s, require the
+richest frame to have non-black >= 95% AND >= 20,000 distinct colours, paired with the existing
+SSIM comparison. Never use colour count alone — a seed-miss gradient outscores real content.
+Run snapshot.py verify and inspect every retained image before adopting a baseline. Then re-check
+#710, plausibly the same root cause. Pre-fix .prgcap files bake resolved tail coordinates, so any
+tiling re-verification needs a fresh capture.
+```
+
+### The Pathless
+
+```text
+Read CLAUDE.md, docs/GAME_COMPAT_ORCHESTRATION.md (Lane E), #1570, and #1213 (reopened).
+The title is at rung 0: it boots deep into the UE4 frame loop with real GPU work but presents flat
+colour and freezes at ~18 s. The #1213 SIGSEGV does not reproduce. Survey the .prgtl timeline
+across all ~6,150 submits to find whether the real composite lives in another submit — this is
+CPU-only. The current lead is the packed-FP16 MRT0 export path: a tint constant of
+(1.0, 0.4545, 0.0, 1.0) (orange) is presenting as white through a COMPR V_PACK_B32_F16 export.
+Generic gaps worth fixing for all UE titles: DCC tile=27 sampled images, the per-queue WaitRegMem
+barrier model (shared with ArcRunner #1226), and the 512 MiB backend image bound.
 ```
 
 ## Orchestrator cadence and reporting
