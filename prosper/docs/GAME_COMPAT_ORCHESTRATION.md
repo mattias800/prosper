@@ -708,11 +708,32 @@ capsules replay unchanged even on a fixed binary; re-verifying anything tiling-r
 And scene identity must be established from rendered *semantic content*, never from submit ordinals, guest VAs,
 draw counts, or shader-hash signatures — that invariant was violated once here already.
 
-Remaining: a title-level snapshot guard. Proposed contract — route `scripts/ppsa02664/reach-first-gameplay.pad`,
-sample 70–120 s, richest frame must have non-black >= 95% **and** >= 20,000 distinct colours (pre-fix: 13.7% and
-3,010). Do **not** use colour count alone; a seed-miss gradient can outscore real content. Needs
-`snapshot.py verify` plus image review before adopting a baseline. #710 (title/menu renders incorrectly) is
-plausibly the same root cause and is now cheap to re-check.
+**The title now reaches rung 6.** The `alexkidd-gameplay` guard is reviewed and landed, so PPSA02664 is
+"done" by the ladder's own definition and the lane can close.
+
+The adopted contract keeps the proposed `min_colors=20000` but moves the window to **95–145 s**. Measuring the
+route first (`tools/snapshot/profile_route.py`, added with the guard) showed the level loads at 75 s at scale 4
+and 72 s at native, so the proposed 70–120 s window would have straddled the load transition: five dark frames
+sat inside it, and a run loading only ten seconds later would have pushed the guard below its content-match
+ratio and failed on healthy output. The window now opens twenty seconds after the observed load **and after the
+route's last pad press at 89 s**, so it samples a settled scene whose only motion is cloud drift and enemy
+animation. That is what buys the margin: the worst of 100 reviewed frames scores SSIM **0.93** against a
+0.85 floor, where the phase-sensitive `blue-prince-hall`/`terminator-boot` guards fail on healthy frames.
+Non-black is `min_nonblack_ratio=0.5` (the tool's conservative half of the reviewed 1.0), not the proposed
+0.95 — the approval flow derives that floor and it still sits 3.6x above the pre-fix 0.137. Colour count is one
+of five conjoined conditions and must never become the contract alone.
+
+Three independent runs: verify CONTENT-STABLE (richest 35,308/34,984, 50/50 qualifying in both), then
+`check` OK (50/50 qualifying, 50/50 structural, 50/50 non-black). Pre-fix was 3,010 colours at 13.7%.
+
+**#710 (title/menu renders incorrectly) is substantially resolved but not closed.** Against the hardware oracle
+the panel base is now (253,183,0) vs (250,184,1) — it was (91,66,14) — and the logo, previously "faded /
+semi-transparent", matches the oracle's regional mean within 3/255. What remains is narrow and measured: the
+panel's watermark overlay lifts the base by only about **half** the hardware amount (G +14 vs +26, B +53 vs
++104). That ratio is a consistent 0.52 in display space but 0.51/0.26 in linear, which argues **against** a
+linear-vs-sRGB blend-space explanation and leaves the earlier "semi-transparent tiles composite at too-low
+alpha" factor as the live hypothesis. Re-verify any tiling-related claim with a **fresh** capture: pre-fix
+`.prgcap` files bake the resolved tail coordinates.
 
 ## Lane E: The Pathless (PPSA01826)
 

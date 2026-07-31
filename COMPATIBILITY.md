@@ -22,7 +22,7 @@ Last updated: 2026-07-31
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Day One gameplay renders; the manor entrance hall matches the hardware reference |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
 | *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 title, name entry, name confirmation, and first-run `System Settings 1/4` onboarding reached; gameplay is not yet validated |
-| Additional Unity/IL2CPP target | `PPSA02664` | Unity / IL2CPP | 🔬 Exercised, with no published gameplay milestone |
+| *Alex Kidd in Miracle World DX* | `PPSA02664` | Unity / IL2CPP | ✅ First level reached and rendered at native 1920×1080; colour matches the hardware reference, with a minor title-overlay contrast defect |
 
 ¹ Exact retail game name pending confirmation.
 
@@ -286,6 +286,28 @@ text pass, so no gameplay milestone is claimed.
 This 2D action title reaches its main menu and attract-mode gameplay, verified and recorded by the
 project owner, with a menu-reach snapshot guard in place. The title ID is confirmed; the exact retail
 name is pending confirmation.
+
+## Alex Kidd in Miracle World DX — `PPSA02664`
+
+<p align="center">
+  <img src="assets/screenshots/alex-kidd.png" alt="Alex Kidd in Miracle World DX — Mt. Eternal first level">
+</p>
+
+A scripted route reaches the first level (Mt. Eternal) and renders it in full colour at native
+1920x1080: sky gradient and sun rays, parallax mountains, drifting clouds, terrain and floating
+platforms, the player and enemy sprites, gold blocks, the lives and coin HUD, and the dialogue box.
+
+The level previously rendered as a black screen behind the dialogue box. The cause was a **generic
+tiling defect**, not a title-specific one: packed mip-tail levels in 4 KiB tile modes resolved to an
+element origin four times too small, because the block-to-element multiplier was derived from the
+macroblock rather than from the 256-byte block's element extent. Mipped 4x4 SpriteMask sprites then
+decoded as fully transparent foreign texels, every mask fragment failed its alpha test, and a
+legitimate "visible outside mask" fill covered the whole frame. Fixed in #1578, which also added an
+origin-agreement invariant to the tile tests.
+
+A reviewed content guard (`alexkidd-gameplay`) covers the route in `tools/snapshot`. One known
+defect remains: the title screen's watermark overlay composites at roughly half the hardware
+strength (#710).
 
 ## Requirements and scope
 
