@@ -28,6 +28,7 @@ struct GuestWriteWatchStats {
     uint64_t dirty = 0;
     uint64_t unknown = 0;
     uint64_t faults = 0;
+    uint64_t stale_faults = 0;
     uint64_t physical_writes = 0;
     uint64_t rearms = 0;
 };

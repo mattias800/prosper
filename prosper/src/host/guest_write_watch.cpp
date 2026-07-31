@@ -84,6 +84,7 @@ struct AtomicStats {
     std::atomic<uint64_t> dirty{0};
     std::atomic<uint64_t> unknown{0};
     std::atomic<uint64_t> faults{0};
+    std::atomic<uint64_t> stale_faults{0};
     std::atomic<uint64_t> physical_writes{0};
     std::atomic<uint64_t> rearms{0};
 };
@@ -339,6 +340,7 @@ GuestWriteWatchStats guest_write_watch_stats() {
         value.dirty.load(std::memory_order_relaxed),
         value.unknown.load(std::memory_order_relaxed),
         value.faults.load(std::memory_order_relaxed),
+        value.stale_faults.load(std::memory_order_relaxed),
         value.physical_writes.load(std::memory_order_relaxed),
         value.rearms.load(std::memory_order_relaxed),
     };
@@ -495,7 +497,8 @@ struct AtomicStats {
         create_bytes_le_1m{0}, create_bytes_le_8m{0}, create_bytes_le_32m{0},
         create_bytes_gt_32m{0},
         create_protect_failures{0},
-        queries{0}, unchanged{0}, dirty{0}, unknown{0}, faults{0}, physical_writes{0}, rearms{0};
+        queries{0}, unchanged{0}, dirty{0}, unknown{0}, faults{0}, stale_faults{0},
+        physical_writes{0}, rearms{0};
 };
 AtomicStats& stats() { static AtomicStats* value = new AtomicStats; return *value; }
 inline void bump(std::atomic<uint64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); }
@@ -841,7 +844,8 @@ GuestWriteWatchStats guest_write_watch_stats() {
             v.create_bytes_le_8m.load(), v.create_bytes_le_32m.load(),
             v.create_bytes_gt_32m.load(), v.create_protect_failures.load(),
             v.queries.load(), v.unchanged.load(), v.dirty.load(),
-            v.unknown.load(), v.faults.load(), v.physical_writes.load(), v.rearms.load()};
+            v.unknown.load(), v.faults.load(), v.stale_faults.load(),
+            v.physical_writes.load(), v.rearms.load()};
 }
 
 void guest_write_watch_set_fault_onstack(bool on_altstack) {
@@ -1009,9 +1013,27 @@ bool guest_write_watch_handle_fault(uint64_t addr) {
         sched_yield();
         return true;
     }
-    auto it = w.pages_by_addr.find(addr & ~(kPage - 1));
-    if (it == w.pages_by_addr.end() || !it->second || !it->second->armed) return false;
+    const uint64_t fault_page = addr & ~(kPage - 1);
+    auto it = w.pages_by_addr.find(fault_page);
+    if (it == w.pages_by_addr.end() || !it->second) return false;
     WatchedPage* page = it->second;
+    if (!page->armed) {
+        // Two guest workers can take the same RO-page fault before either signal handler runs. The
+        // first handler restores RW and clears `armed`; the second delivery is already queued and used
+        // to fall through as a fatal guest fault despite the store now being safe to retry (Cobra's
+        // parallel vertex jobs hit exactly this race). Accept the stale delivery only while the live
+        // topology still describes this VA as CPU-writable. Protection changes update `w.aliases`, and
+        // unmaps remove both the alias and address index, so real read-only/unmapped faults stay fatal.
+        const bool live_cpu_writable = std::any_of(
+            w.aliases.begin(), w.aliases.end(), [&](const AliasRange& alias) {
+                return fault_page >= alias.addr && fault_page < alias.addr + alias.size &&
+                       cpu_writable(alias.prot);
+            });
+        if (!live_cpu_writable) return false;
+        bump(stats().faults);
+        bump(stats().stale_faults);
+        return true;
+    }
     // Allocation-free (signal context): restore write directly on the page's aliases. mprotect is a
     // syscall; the alias vector is already allocated and mutation-protected by the held lock. Do NOT
     // call set_pages_armed here — its rollback vector would malloc, which can deadlock a thread caught
@@ -1019,7 +1041,6 @@ bool guest_write_watch_handle_fault(uint64_t addr) {
     // store would re-fault forever, so keep the page armed (retry) rather than clearing it and dropping
     // into the fatal handler on the next fault. Disarming (RO->RW) merges VMAs and effectively never
     // fails, so this is a belt-and-braces guard, not an expected path.
-    const uint64_t fault_page = addr & ~(kPage - 1);
     bool faulting_alias_restored = true;
     for (const PageAlias& al : page->aliases) {
         if (!cpu_writable(al.prot)) continue;

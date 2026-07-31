@@ -178,6 +178,30 @@ int main() {
     CHECK(a[page + 0x40] == 0x5a, "write through alias A lands (no lost store)");
     CHECK(watch.query() == GuestWriteWatchQuery::Dirty, "watch reads Dirty after a CPU write");
 
+    // Two workers can fault on the same armed page before either handler restores it. Model the
+    // second, already-queued delivery deterministically: the first real signal above disarmed the
+    // still-live CPU-writable page, so a sibling delivery must be accepted and allowed to retry.
+    CHECK(prosper::host::guest_write_watch_handle_fault(
+              reinterpret_cast<uint64_t>(a + page + 0x48)),
+          "a stale sibling fault on a known writable page retries instead of becoming fatal");
+    CHECK(!prosper::host::guest_write_watch_handle_fault(0x9000000000ULL),
+          "an unknown stale-fault address remains unhandled");
+
+    // Fail closed when guest topology has genuinely made the known VA read-only. WatchedPage retains
+    // its registration until query/reset, so this specifically proves the stale-delivery path consults
+    // current mapping topology instead of accepting every known-but-disarmed page.
+    CHECK(mprotect(a + page, page, PROT_READ) == 0,
+          "known watched alias can be reprotected read-only for stale-fault test");
+    prosper::host::guest_write_watch_notify_direct_mapping_protection(
+        reinterpret_cast<uint64_t>(a + page), page, 0x1 /* CPU_READ only */);
+    CHECK(!prosper::host::guest_write_watch_handle_fault(
+              reinterpret_cast<uint64_t>(a + page + 0x48)),
+          "a genuine fault on a known read-only alias remains unhandled");
+    CHECK(mprotect(a + page, page, PROT_READ | PROT_WRITE) == 0,
+          "known watched alias restored writable after stale-fault test");
+    prosper::host::guest_write_watch_notify_direct_mapping_protection(
+        reinterpret_cast<uint64_t>(a + page), page, kCpuRw);
+
     // Re-arm, don't write -> Unchanged again.
     CHECK(watch.rearm(), "rearm succeeds");
     CHECK(watch.query() == GuestWriteWatchQuery::Unchanged, "no write since rearm -> Unchanged");
@@ -375,6 +399,7 @@ int main() {
     const auto stats = prosper::host::guest_write_watch_stats();
     CHECK(stats.registrations >= 1, "at least one watch armed");
     CHECK(stats.faults >= 2, "both alias-A and alias-B write faults were handled");
+    CHECK(stats.stale_faults >= 1, "stale concurrent fault delivery was counted");
     CHECK(stats.rearms >= 2, "rearm path exercised");
     CHECK(stats.create_oversized >= 1, "oversized exact-comparison fallback is observable");
 
