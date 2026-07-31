@@ -219,5 +219,21 @@ convergence diagnostic, not evidence that the first native frame contained those
 `PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=MIN:MAX` restricts the matching target to a zero-based
 semantic draw-index window. Establish the range across multiple desired captures and nearby negative samples;
 realized replay indices can differ when earlier semantic draws are unrealized.
+`PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM=ADDR` and
+`PROSPER_GPU_TIMELINE_CAPTURE_WHEN_FRAGMENT_PROGRAM=ADDR` optionally select semantic ES/vertex and pixel
+program addresses. When both are set, one draw must bind the exact pair; target extent and draw-index
+predicates must also match that draw. Zero or an unset variable disables its stage. Matching only reads the
+already-folded register snapshots after the cheaper submit, target, and count predicates pass; it does not
+realize shaders, read resources, allocate capture data, or invoke Vulkan until an endpoint is selected.
+When combined with a compute-program or dispatch-dimension selector, the graphics draw and compute dispatch
+must occur in the same submit; this is a phase conjunction and does not imply a producer/consumer edge.
+`PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM=ADDR` instead provides an explicit cross-submit phase
+gate. The exact compute program may arm the request before the configured endpoint lower bound, but its own
+submit can never be selected; the ordinary endpoint conjunction is permitted only on a strictly later submit
+at or after the lower bound. Zero or an unset variable disables the gate. Before it is armed, the enabled path
+only scans retained semantic dispatch register snapshots for the program address; after arming, it performs
+only the latched-submit comparison. It does not realize compute, read resources, allocate capture data, or
+invoke Vulkan. The latch belongs to the process-local capture request and still does not establish dependency
+or causality between the phase dispatch and a later draw.
 `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES=N` and
 `PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES=N` restrict the same checkpoint by semantic dispatch count.
