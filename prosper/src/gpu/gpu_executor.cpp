@@ -366,7 +366,9 @@ ShaderCache& shader_cache() {
 struct DecodedShader {
     std::vector<uint32_t> code;
     std::vector<Rdna2Inst> instructions;
+    std::vector<Rdna2Inst> shader_constant_instructions;
     size_t source_dwords = 0;
+    bool shader_constant_specialized = false;
     bool terminated = false;
     uint64_t bytes = 0;
 };
@@ -588,43 +590,56 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                     scalar_spill_vgprs.insert(instruction.src[0].value);    // v_readlane_b32
             }
         }
+        auto retain_fold_instructions = [&](const std::vector<Rdna2Inst>& source,
+                                            std::vector<Rdna2Inst>& retained) {
+            retained.reserve(source.size());
+            for (const Rdna2Inst& instruction : source) {
+                if (instruction.is_end) break;
+                const bool scalar_spill = instruction.fmt == Rdna2Format::VOP3 &&
+                                          (instruction.opcode == 0x360 || instruction.opcode == 0x361);
+                const bool vector_index_select =
+                    ((instruction.fmt == Rdna2Format::VOP3 && instruction.opcode == 0x101) ||
+                     (instruction.fmt == Rdna2Format::VOP2 && instruction.opcode == 0x01)) &&
+                    instruction.dst.kind == OperandKind::VGPR &&
+                    fetch_vaddr_vgprs.contains(instruction.dst.value);
+                // Index provenance begins at the hardware ABI VGPRs and is killed by any later shader
+                // computation of a register used as VADDR. Keep only writes to actual fetch-address
+                // registers; retaining every VALU instruction would make the otherwise-small scalar fold
+                // walk large UE shaders in full. This is what distinguishes DQ's first v5=vertex_id fetch
+                // from its later v5=3*vertex_id+1 packed-attribute fetch.
+                const bool fetch_vaddr_write = instruction.dst.kind == OperandKind::VGPR &&
+                                               fetch_vaddr_vgprs.contains(instruction.dst.value);
+                const bool scalar_spill_invalidation = instruction.dst.kind == OperandKind::VGPR &&
+                                                       scalar_spill_vgprs.contains(instruction.dst.value);
+                const bool fold_format = instruction.fmt == Rdna2Format::SOP1 ||
+                                         instruction.fmt == Rdna2Format::SOP2 ||
+                                         instruction.fmt == Rdna2Format::SOPC ||
+                                         instruction.fmt == Rdna2Format::SOPK ||
+                                         instruction.fmt == Rdna2Format::SOPP ||
+                                         instruction.fmt == Rdna2Format::SMEM ||
+                                         instruction.fmt == Rdna2Format::MIMG ||
+                                         instruction.fmt == Rdna2Format::MUBUF ||
+                                         instruction.fmt == Rdna2Format::MTBUF;
+                if (fold_format || scalar_spill || vector_index_select || fetch_vaddr_write ||
+                    scalar_spill_invalidation || instruction.dst.kind == OperandKind::SGPR)
+                    retained.push_back(instruction);
+            }
+        };
         // Retain only instructions that can affect fold state or emit a descriptor use, preserving
-        // their original order and PCs.
-        result->instructions.reserve(decoded.size());
-        for (const Rdna2Inst& instruction : decoded) {
-            if (instruction.is_end) break;
-            const bool scalar_spill = instruction.fmt == Rdna2Format::VOP3 &&
-                                      (instruction.opcode == 0x360 || instruction.opcode == 0x361);
-            const bool vector_index_select =
-                ((instruction.fmt == Rdna2Format::VOP3 && instruction.opcode == 0x101) ||
-                 (instruction.fmt == Rdna2Format::VOP2 && instruction.opcode == 0x01)) &&
-                instruction.dst.kind == OperandKind::VGPR &&
-                fetch_vaddr_vgprs.contains(instruction.dst.value);
-            // Index provenance begins at the hardware ABI VGPRs and is killed by any later shader
-            // computation of a register used as VADDR. Keep only writes to actual fetch-address
-            // registers; retaining every VALU instruction would make the otherwise-small scalar fold
-            // walk large UE shaders in full. This is what distinguishes DQ's first v5=vertex_id fetch
-            // from its later v5=3*vertex_id+1 packed-attribute fetch.
-            const bool fetch_vaddr_write = instruction.dst.kind == OperandKind::VGPR &&
-                                           fetch_vaddr_vgprs.contains(instruction.dst.value);
-            const bool scalar_spill_invalidation = instruction.dst.kind == OperandKind::VGPR &&
-                                                   scalar_spill_vgprs.contains(instruction.dst.value);
-            const bool fold_format = instruction.fmt == Rdna2Format::SOP1 ||
-                                     instruction.fmt == Rdna2Format::SOP2 ||
-                                     instruction.fmt == Rdna2Format::SOPC ||
-                                     instruction.fmt == Rdna2Format::SOPK ||
-                                     instruction.fmt == Rdna2Format::SOPP ||
-                                     instruction.fmt == Rdna2Format::SMEM ||
-                                     instruction.fmt == Rdna2Format::MIMG ||
-                                     instruction.fmt == Rdna2Format::MUBUF ||
-                                     instruction.fmt == Rdna2Format::MTBUF;
-            if (fold_format || scalar_spill || vector_index_select || fetch_vaddr_write ||
-                scalar_spill_invalidation ||
-                instruction.dst.kind == OperandKind::SGPR)
-                result->instructions.push_back(instruction);
-        }
+        // their original order and PCs. Prove shader-constant branches against the FULL decoded
+        // stream first: the compact fold stream intentionally omits most VALU, including implicit
+        // VCC writers that must invalidate a scalar-data proof through s106:s107.
+        retain_fold_instructions(decoded, result->instructions);
+        std::vector<Rdna2Inst> shader_constant_decoded = decoded;
+        result->shader_constant_specialized =
+            rdna2_specialize_shader_constant_branches(shader_constant_decoded) != 0;
+        if (result->shader_constant_specialized)
+            retain_fold_instructions(shader_constant_decoded,
+                                     result->shader_constant_instructions);
         result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
-                        static_cast<uint64_t>(result->instructions.size()) * sizeof(Rdna2Inst);
+                        static_cast<uint64_t>(result->instructions.size() +
+                                              result->shader_constant_instructions.size()) *
+                            sizeof(Rdna2Inst);
         return result;
     };
 
@@ -1707,6 +1722,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         }
         fold_instructions = &specialized;
     }
+    // The cache specializes the full decoded stream before compacting it for the scalar fold. A
+    // PC-relative dispatch is already a separate explicit specialization and keeps its historical
+    // filtered stream here; combining the two requires proving the selected full-stream CFG first.
+    if (fold_instructions == &decoded->instructions && decoded->shader_constant_specialized)
+        fold_instructions = &decoded->shader_constant_instructions;
     const auto& ins = *fold_instructions;
 
     auto readable = [&](uint64_t addr, uint32_t bytes) {

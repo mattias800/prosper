@@ -9923,12 +9923,216 @@ bool specialize_pcrel_dispatch(std::vector<Rdna2Inst>& ins, const PcrelDispatchI
     return true;
 }
 
+struct ShaderConstantValue {
+    bool known = false;
+    uint32_t value = 0;
+};
+
+ShaderConstantValue shader_constant_operand(
+        const std::vector<Rdna2Inst>& ins, size_t block_first, size_t use_index,
+        const Rdna2Inst& use, const Operand& operand, uint32_t depth) {
+    if (depth > 16) return {};
+    if (operand.kind == OperandKind::InlineInt)
+        return {true, static_cast<uint32_t>(operand.value)};
+    if (operand.kind == OperandKind::Literal)
+        return use.has_literal ? ShaderConstantValue{true, use.literal} : ShaderConstantValue{};
+    if (operand.kind != OperandKind::SGPR && operand.kind != OperandKind::Special)
+        return {};
+
+    const int reg = operand.value;
+    for (size_t i = use_index; i-- > block_first;) {
+        const Rdna2Inst& writer = ins[i];
+        // VCC_LO/HI can temporarily hold ordinary scalar data, as in Astro's exact branch setup,
+        // but any intervening vector ALU may replace the architectural VCC pair implicitly. The
+        // shared scalar-writer inventory intentionally models that in the Bool domain, so reject it
+        // explicitly here instead of walking past a VOPC to an obsolete scalar definition.
+        if ((reg == 106 || reg == 107) &&
+            (writer.fmt == Rdna2Format::VOP1 || writer.fmt == Rdna2Format::VOP2 ||
+             writer.fmt == Rdna2Format::VOPC || writer.fmt == Rdna2Format::VOP3 ||
+             writer.fmt == Rdna2Format::VOP3P))
+            return {};
+        bool writes = false;
+        uint32_t width = 0;
+        int base = -1;
+        for_each_scalar_write(writer, [&](int candidate_base, uint32_t candidate_width) {
+            if (reg >= candidate_base &&
+                reg < candidate_base + static_cast<int>(candidate_width)) {
+                writes = true;
+                base = candidate_base;
+                width = candidate_width;
+            }
+        });
+        if (!writes) continue;
+
+        // Only one-dword pure scalar data writers participate. A pair write, memory result, lane
+        // read, or wave-mask producer is intentionally not a shader-constant proof.
+        if (base != reg || width != 1) return {};
+        if (writer.fmt == Rdna2Format::SOP1 && writer.opcode == 0x03) { // s_mov_b32
+            return shader_constant_operand(
+                ins, block_first, i, writer, writer.src[0], depth + 1);
+        }
+        if (writer.fmt != Rdna2Format::SOP2) return {};
+
+        const ShaderConstantValue lhs = shader_constant_operand(
+            ins, block_first, i, writer, writer.src[0], depth + 1);
+        const ShaderConstantValue rhs = shader_constant_operand(
+            ins, block_first, i, writer, writer.src[1], depth + 1);
+        if (!lhs.known || !rhs.known) return {};
+
+        switch (writer.opcode) {
+            case 0x00: return {true, lhs.value + rhs.value}; // s_add_u32
+            case 0x01: return {true, lhs.value - rhs.value}; // s_sub_u32
+            case 0x02: return {true, lhs.value + rhs.value}; // s_add_i32
+            case 0x03: return {true, lhs.value - rhs.value}; // s_sub_i32
+            case 0x0e: return {true, lhs.value & rhs.value}; // s_and_b32
+            default: return {};
+        }
+    }
+    // No in-block writer means an entry/user SGPR or other runtime state. Never specialize it.
+    return {};
+}
+
+bool shader_constant_compare(const std::vector<Rdna2Inst>& ins, size_t block_first,
+                             size_t compare_index, bool& result) {
+    const Rdna2Inst& compare = ins[compare_index];
+    if (compare.fmt != Rdna2Format::SOPC || compare.opcode > 0x0b) return false;
+    const ShaderConstantValue lhs = shader_constant_operand(
+        ins, block_first, compare_index, compare, compare.src[0], 0);
+    const ShaderConstantValue rhs = shader_constant_operand(
+        ins, block_first, compare_index, compare, compare.src[1], 0);
+    if (!lhs.known || !rhs.known) return false;
+    const int32_t signed_lhs = std::bit_cast<int32_t>(lhs.value);
+    const int32_t signed_rhs = std::bit_cast<int32_t>(rhs.value);
+
+    switch (compare.opcode) {
+        case 0x00: result = signed_lhs == signed_rhs; break;
+        case 0x01: result = signed_lhs != signed_rhs; break;
+        case 0x02: result = signed_lhs >  signed_rhs; break;
+        case 0x03: result = signed_lhs >= signed_rhs; break;
+        case 0x04: result = signed_lhs <  signed_rhs; break;
+        case 0x05: result = signed_lhs <= signed_rhs; break;
+        case 0x06: result = lhs.value == rhs.value; break;
+        case 0x07: result = lhs.value != rhs.value; break;
+        case 0x08: result = lhs.value >  rhs.value; break;
+        case 0x09: result = lhs.value >= rhs.value; break;
+        case 0x0a: result = lhs.value <  rhs.value; break;
+        case 0x0b: result = lhs.value <= rhs.value; break;
+        default: return false;
+    }
+    return true;
+}
+
+size_t specialize_shader_constant_branches(std::vector<Rdna2Inst>& ins) {
+    if (ins.empty()) return 0;
+    // An indirect PC transfer can enter code outside the explicit SOPP graph. Keep the whole shader
+    // unspecialized rather than treating its lexical successor as the only possible destination.
+    if (std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::SOP1 &&
+                   in.opcode >= 0x20 && in.opcode <= 0x22;
+        })) return 0;
+
+    std::unordered_map<uint32_t, size_t> index_by_pc;
+    for (size_t i = 0; i < ins.size(); ++i) index_by_pc.emplace(ins[i].pc, i);
+
+    std::set<size_t> block_starts{0};
+    auto is_branch = [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::SOPP &&
+            (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
+    };
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const Rdna2Inst& in = ins[i];
+        if (is_branch(in)) {
+            const auto target = index_by_pc.find(scalar_branch_target(in));
+            if (target != index_by_pc.end()) block_starts.insert(target->second);
+        }
+        if ((is_branch(in) || in.is_end ||
+             (in.fmt == Rdna2Format::SOPP && in.opcode == 0x12)) &&
+            i + 1 < ins.size())
+            block_starts.insert(i + 1);
+    }
+
+    size_t specialized_count = 0;
+    for (size_t i = 1; i < ins.size(); ++i) {
+        Rdna2Inst& branch = ins[i];
+        if (branch.fmt != Rdna2Format::SOPP ||
+            (branch.opcode != 0x04 && branch.opcode != 0x05) || branch.simm16 <= 0)
+            continue; // shader-constant SCC only; VCCZ/EXECZ remain runtime wave conditions
+        if (!index_by_pc.contains(scalar_branch_target(branch)))
+            continue; // do not specialize an exit beyond the decoded instruction graph
+        const Rdna2Inst& compare = ins[i - 1];
+        if (compare.pc + compare.len_dwords != branch.pc ||
+            compare.fmt != Rdna2Format::SOPC)
+            continue;
+        const auto block = block_starts.upper_bound(i - 1);
+        const size_t block_first = block == block_starts.begin() ? 0 : *std::prev(block);
+        if (block_first > i - 1) continue;
+
+        bool scc = false;
+        if (!shader_constant_compare(ins, block_first, i - 1, scc)) continue;
+        const bool taken = branch.opcode == 0x05 ? scc : !scc;
+        if (taken) {
+            branch.opcode = 0x02; // s_branch: retain the exact immediate target
+            branch.words[0] = 0xbf820000u | static_cast<uint16_t>(branch.simm16);
+        } else {
+            branch.opcode = 0x00; // s_nop 0: retain fallthrough
+            branch.simm16 = 0;
+            branch.words[0] = 0xbf800000u;
+        }
+        ++specialized_count;
+    }
+    if (!specialized_count) return 0;
+
+    // Entry-rooted reachability after replacing proven conditions. Unknown conditional branches
+    // retain both successors, so an unresolved resource remains in the instruction stream whenever
+    // any runtime path can execute it.
+    std::vector<bool> reachable(ins.size(), false);
+    std::vector<size_t> pending{0};
+    while (!pending.empty()) {
+        const size_t i = pending.back();
+        pending.pop_back();
+        if (i >= ins.size() || reachable[i]) continue;
+        reachable[i] = true;
+        const Rdna2Inst& in = ins[i];
+        if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode == 0x12)) continue;
+        if (is_branch(in)) {
+            const auto target = index_by_pc.find(scalar_branch_target(in));
+            if (target != index_by_pc.end()) pending.push_back(target->second);
+            if (in.opcode == 0x02) continue;
+        }
+        if (i + 1 < ins.size()) pending.push_back(i + 1);
+    }
+
+    std::vector<Rdna2Inst> retained;
+    retained.reserve(ins.size());
+    for (size_t i = 0; i < ins.size(); ++i)
+        if (reachable[i]) retained.push_back(ins[i]);
+    // Once a taken branch's omitted arm is gone, its target is often the next retained instruction.
+    // Turn that now-redundant edge into a no-op so the ordinary straight-line/structured paths do not
+    // need to reconstruct an empty branch region.
+    for (size_t i = 0; i + 1 < retained.size(); ++i) {
+        Rdna2Inst& in = retained[i];
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x02 &&
+            scalar_branch_target(in) == retained[i + 1].pc) {
+            in.opcode = 0x00;
+            in.simm16 = 0;
+            in.words[0] = 0xbf800000u;
+        }
+    }
+    ins = std::move(retained);
+    return specialized_count;
+}
+
 } // namespace
 
 bool rdna2_specialize_pcrel_dispatch(std::vector<Rdna2Inst>& instructions,
                                      const PcrelDispatchInfo& info,
                                      uint32_t selected_target) {
     return specialize_pcrel_dispatch(instructions, info, selected_target);
+}
+
+size_t rdna2_specialize_shader_constant_branches(
+        std::vector<Rdna2Inst>& instructions) {
+    return specialize_shader_constant_branches(instructions);
 }
 
 PcrelDispatchInfo rdna2_pcrel_dispatch_info(const uint32_t* code, size_t dwords) {
@@ -12585,6 +12789,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ComputeShaderConfig& config) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    (void)rdna2_specialize_shader_constant_branches(ins);
     // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is
     // only a place to finish the invocation after either guest arm has terminated.
     (void)extend_terminating_if_else(code, dwords, ins);

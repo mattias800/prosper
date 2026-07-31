@@ -62,6 +62,14 @@ bool rdna2_specialize_pcrel_dispatch(std::vector<Rdna2Inst>& instructions,
                                      const PcrelDispatchInfo& info,
                                      uint32_t selected_target);
 
+// Prove scalar conditional branches whose SCC input depends only on shader-embedded integer
+// constants, then remove instructions unreachable from the shader entry. The proof deliberately
+// excludes entry/user SGPRs, memory loads, wave masks, and values crossing another basic-block
+// boundary, so specialization depends only on shader bytes already present in the compile key.
+// Returns the number of conditional branches specialized.
+size_t rdna2_specialize_shader_constant_branches(
+    std::vector<Rdna2Inst>& instructions);
+
 // Return the portion of a raw shader blob that participates in recompilation. This normally ends at
 // S_ENDPGM, but compiler-generated PC-relative lookup tables may live immediately after the program and
 // must remain part of an owning/cache copy. The result never exceeds `dwords`.

@@ -10,6 +10,7 @@
 // tracked values, routing the s_bfe_u64 result into V#.dword3 (desc_v3). All encodings assembled /
 // round-trip verified with llvm-mc -mcpu=gfx1030.
 #include "../src/gpu/gpu_execute.hpp"
+#include "../src/gpu/rdna2_decode.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -738,6 +739,109 @@ int main() {
                           &unguarded_null_uses);
     CHECK(unguarded_null_uses.empty(),
           "mapped null BVH root without a dominating EXEC guard remains fail-visible");
+
+    // Astro's live PC848..859 sequence computes its branch condition exclusively from shader
+    // constants: 37 & 7 = 5; 5 + (-4) = 1; 1 <= 2, so s_cbranch_scc1 skips the two lexical BVH
+    // sites that cannot execute. Resource discovery and translation must consume the same pruned
+    // instruction stream. The proof must not broaden to an entry/user-SGPR comparison.
+    const uint32_t shader_constant_dead_fetch[] = {
+        0xBE8B03A5u,             // pc0: s_mov_b32 s11, 37
+        0x876A870Bu,             // pc1: s_and_b32 s106, s11, 7
+        0x816AC46Au,             // pc2: s_add_i32 s106, s106, -4
+        0xBF0B826Au,             // pc3: s_cmp_le_u32 s106, 2
+        0xBF850002u,             // pc4: s_cbranch_scc1 pc7
+        0xE0002000u, 0x80030100u,// pc5: dead buffer_load_format_x ..., s[12:15]
+        0xBF810000u,             // pc7: s_endpgm
+    };
+    std::array<uint32_t, 16> constant_branch_seed{};
+    constant_branch_seed[12] = 0x10000u;
+    constant_branch_seed[14] = 64u;
+    std::vector<Rdna2Inst> pruned_constant_branch;
+    rdna2_walk(shader_constant_dead_fetch, std::size(shader_constant_dead_fetch),
+               pruned_constant_branch);
+    CHECK(rdna2_specialize_shader_constant_branches(pruned_constant_branch) == 1 &&
+              std::none_of(pruned_constant_branch.begin(), pruned_constant_branch.end(),
+                           [](const Rdna2Inst& in) { return in.pc == 5; }),
+          "shader-constant SCC branch prunes its dead resource block");
+    CHECK(resolve_dynamic_fetch(shader_constant_dead_fetch,
+                                std::size(shader_constant_dead_fetch),
+                                constant_branch_seed.data(), constant_branch_seed.size(), 0).empty(),
+          "dynamic resource discovery ignores the provably dead buffer fetch");
+
+    const uint32_t runtime_dead_fetch[] = {
+        0xBF0B8200u,             // pc0: s_cmp_le_u32 s0, 2 (entry/user SGPR)
+        0xBF850002u,             // pc1: s_cbranch_scc1 pc4
+        0xE0002000u, 0x80030100u,// pc2: runtime-reachable buffer_load_format_x ..., s[12:15]
+        0xBF810000u,             // pc4: s_endpgm
+    };
+    std::vector<DynFetch> runtime_branch_fetch = resolve_dynamic_fetch(
+        runtime_dead_fetch, std::size(runtime_dead_fetch), constant_branch_seed.data(),
+        constant_branch_seed.size(), 0);
+    CHECK(runtime_branch_fetch.size() == 1 && runtime_branch_fetch[0].fetch_pc == 2,
+          "entry-dependent scalar branch keeps both resource paths fail-visible");
+
+    const uint32_t vcc_clobbered_dead_fetch[] = {
+        0xBEEA0381u,             // pc0: s_mov_b32 s106, 1 (ordinary scalar-data lifetime)
+        0x7D846A80u,             // pc1: v_cmp_* -> implicit architectural VCC overwrite
+        0xBF0B826Au,             // pc2: s_cmp_le_u32 s106, 2 (reads the new VCC bits)
+        0xBF850002u,             // pc3: s_cbranch_scc1 pc6
+        0xE0002000u, 0x80030100u,// pc4: potentially reachable buffer fetch
+        0xBF810000u,             // pc6: s_endpgm
+    };
+    std::vector<Rdna2Inst> vcc_clobbered_instructions;
+    rdna2_walk(vcc_clobbered_dead_fetch, std::size(vcc_clobbered_dead_fetch),
+               vcc_clobbered_instructions);
+    CHECK(rdna2_specialize_shader_constant_branches(vcc_clobbered_instructions) == 0 &&
+              resolve_dynamic_fetch(vcc_clobbered_dead_fetch,
+                                    std::size(vcc_clobbered_dead_fetch),
+                                    constant_branch_seed.data(),
+                                    constant_branch_seed.size(), 0).size() == 1,
+          "implicit VCC writer invalidates a prior scalar-data constant in s106:s107");
+
+    const uint32_t shader_constant_dead_bvh[] = {
+        0xBE8B03A5u,                         // pc0:  s_mov_b32 s11, 37
+        0x876A870Bu,                         // pc1:  s_and_b32 s106, s11, 7
+        0x816AC46Au,                         // pc2:  s_add_i32 s106, s106, -4
+        0xBF0B826Au,                         // pc3:  s_cmp_le_u32 s106, 2
+        0xBF850005u,                         // pc4:  s_cbranch_scc1 pc10
+        0xF1989F07u, 0x00040303u, 0x43440D3Fu, 0x46424140u, 0x00004847u,
+        0xF1989F07u, 0x00010303u, 0x094F4E3Fu, 0x11100F0Eu, 0x00001312u,
+        0xBF810000u,                         // pc15: s_endpgm
+    };
+    alignas(256) std::array<uint8_t, 256> shader_constant_null_bvh{};
+    ShaderResourceTable shader_constant_bvh_table;
+    { ShaderResource marker{};
+      marker.cls = ResourceClass::ConstantBuffer;
+      marker.format = DataFormat::Uint32;
+      marker.num_components = 1;
+      marker.binding = 4;
+      marker.size = shader_constant_null_bvh.size();
+      marker.fetch_pc = 10;
+      marker.host_data = shader_constant_null_bvh.data();
+      marker.host_data_size = shader_constant_null_bvh.size();
+      shader_constant_bvh_table.resources.push_back(marker); }
+    ComputeShaderConfig shader_constant_bvh_config;
+    shader_constant_bvh_config.local_x = 1;
+    CHECK(!recompile_compute(shader_constant_dead_bvh,
+                             std::size(shader_constant_dead_bvh),
+                             &shader_constant_bvh_table,
+                             shader_constant_bvh_config).empty(),
+          "compute translation omits a dead BVH site proven by shader constants");
+
+    const uint32_t runtime_dead_bvh[] = {
+        0xBF0B8200u,                         // pc0: s_cmp_le_u32 s0, 2
+        0xBF850005u,                         // pc1: s_cbranch_scc1 pc7
+        0xF1989F07u, 0x00040303u, 0x43440D3Fu, 0x46424140u, 0x00004847u,
+        0xF1989F07u, 0x00010303u, 0x094F4E3Fu, 0x11100F0Eu, 0x00001312u,
+        0xBF810000u,                         // pc12: s_endpgm
+    };
+    ShaderResourceTable runtime_bvh_table = shader_constant_bvh_table;
+    runtime_bvh_table.resources[0].fetch_pc = 7;
+    ComputeShaderConfig runtime_bvh_config = shader_constant_bvh_config;
+    runtime_bvh_config.user_sgprs = {1u};
+    CHECK(recompile_compute(runtime_dead_bvh, std::size(runtime_dead_bvh),
+                            &runtime_bvh_table, runtime_bvh_config).empty(),
+          "compute translation rejects an unresolved BVH on an entry-dependent branch");
 
     // Recreate the live descriptor builder rather than seeding its final words: the header pointer
     // is stored in 8-byte units, the allocation count is loaded from byte offset 0x58, and a
