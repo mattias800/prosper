@@ -603,6 +603,9 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                         stage.recompiled ? "yes" : "no",
                         stage.resource_table_present ? "present" : "absent",
                         stage.resource_count, stage.descriptor_issue_count);
+            if (stage.stage == prosper::gpu::ShaderProgramStage::Compute)
+                std::printf(" config=%s",
+                            stage.recompile_config_available ? "present" : "absent");
             if (stage.first_descriptor_issue != 0xFFFFFFFFu)
                 std::printf(" first-descriptor=%s", prosper::gpu::descriptor_issue_name(
                     static_cast<prosper::gpu::DescriptorIssueCode>(stage.first_descriptor_issue)));
@@ -613,6 +616,15 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                 std::printf(" first-reject pc=%u fmt=%d op=0x%x", stage.coverage.first_bad_pc,
                             stage.coverage.first_bad_fmt, stage.coverage.first_bad_op);
             std::printf("\n");
+            if (stage.recompile_config_available) {
+                const auto& config = stage.recompile_config;
+                std::printf("    compute-config user-sgprs=%zu local=%ux%ux%u "
+                            "threads=%ux%ux%u wave=%u lds=%u subgroup=%u\n",
+                            config.user_sgprs.size(), config.local_x, config.local_y,
+                            config.local_z, config.threads_x, config.threads_y,
+                            config.threads_z, config.wave_size, config.lds_bytes,
+                            config.native_subgroup_size);
+            }
             for (size_t resource_index = 0;
                  resource_index < stage.resource_table.resources.size(); ++resource_index) {
                 const auto& resource =
@@ -2167,10 +2179,12 @@ int main(int argc, char** argv) {
                     raw.words.data(), raw.words.size(), resources);
                 break;
             case prosper::gpu::ShaderProgramStage::Compute:
-                std::fprintf(stderr,
-                             "gpu_replay: failed compute retry needs its launch/user-SGPR "
-                             "specialization, which v35 does not retain\n");
-                return 2;
+                if (!prosper::tools::recompile_failed_compute_stage(
+                        stage, replay.raw_shader_versions, spirv, error)) {
+                    std::fprintf(stderr, "gpu_replay: %s\n", error.c_str());
+                    return 2;
+                }
+                break;
         }
         std::fprintf(stderr,
                      "[retry-failed-stage] %s %s resources=%zu spirv-dwords=%zu\n",

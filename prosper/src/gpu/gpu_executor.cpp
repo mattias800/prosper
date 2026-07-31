@@ -3888,7 +3888,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
         failure.compute_launch = resolve_compute_launch(dispatch);
         auto record_failure = [&](RealizationFailureReason reason,
                                   const std::shared_ptr<ShaderResourceTable>& resources,
-                                  const std::vector<uint32_t>& spirv) {
+                                  const std::vector<uint32_t>& spirv,
+                                  const ComputeShaderConfig* recompile_config = nullptr) {
             if (!failures) return;
             failure.reason = reason;
             ShaderRealizationDiagnostic stage;
@@ -3896,6 +3897,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
             stage.program_addr = code_addr;
             stage.resources = resources;
             stage.recompiled = !spirv.empty();
+            if (recompile_config) {
+                stage.recompile_config = *recompile_config;
+                stage.recompile_config_available = true;
+            }
             if (!spirv.empty()) {
                 const DescriptorValidationReport diagnostic_report =
                     validate_spirv_descriptor_interface(spirv, resources.get(), 0,
@@ -4278,7 +4283,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
         item.submit_no = submit_no;
         item.command_order = dispatch.command_order;
         if (item.spirv.empty()) {
-            record_failure(RealizationFailureReason::ShaderRecompile, item.resources, item.spirv);
+            record_failure(RealizationFailureReason::ShaderRecompile, item.resources, item.spirv,
+                           &config);
             // PROSPER_DYNTRACE_FAIL=1: replay the FAILED compute program's resource build with the
             // const-fold walk trace + user-data dump forced on (once per distinct program) — the
             // compute analog of the graphics VS/PS fail-replay (gpu_execute.hpp). Compute dispatches
@@ -4381,7 +4387,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
         const DescriptorValidationReport report = validate_spirv_descriptor_interface(
             item.spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
         if (!report.ok()) {
-            record_failure(RealizationFailureReason::DescriptorContract, item.resources, item.spirv);
+            record_failure(RealizationFailureReason::DescriptorContract, item.resources, item.spirv,
+                           &config);
             static std::set<uint64_t> logged;
             if (logged.insert(code_addr).second) {
                 std::fprintf(stderr, "[compute] skip invalid descriptor contract for program 0x%llx\n",

@@ -490,6 +490,10 @@ struct ShaderRealizationDiagnostic {
     bool recompiled = false;
     uint32_t descriptor_issue_count = 0;
     uint32_t first_descriptor_issue = 0xFFFFFFFFu;
+    // Failed compute recompilation depends on the complete dispatch ABI, not only the raw program
+    // and its resource table. Graphics stages leave this unavailable.
+    ComputeShaderConfig recompile_config{};
+    bool recompile_config_available = false;
 };
 
 struct OperationRealizationFailure {

@@ -89,7 +89,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v41: complete the v35 failed-stage resource tables with descriptor fields that historical version
 // tails only wrote for realized draw/compute tables, plus flat-load provenance omitted from the base
 // record. Without this, raw failed-stage retry silently reset image/layout and codegen state.
-constexpr uint32_t kVersion = 41;
+// v42: retain the exact ComputeShaderConfig for failed compute stages. Raw code and v41 resources do
+// not encode user SGPRs, dispatch dimensions, wave ABI, LDS size, or subgroup/storage policy, so an
+// offline retry must never reconstruct those inputs from defaults.
+constexpr uint32_t kVersion = 42;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -198,6 +201,44 @@ struct Reader {
         v.resize(static_cast<size_t>(n)); return take(v.data(), v.size());
     }
 };
+
+void write_compute_config(Writer& w, const ComputeShaderConfig& config) {
+    w.words(config.user_sgprs);
+    w.u32(config.local_x); w.u32(config.local_y); w.u32(config.local_z);
+    w.u8(config.exact_thread_extent ? 1u : 0u);
+    w.u32(config.threads_x); w.u32(config.threads_y); w.u32(config.threads_z);
+    w.u32(config.wave_size); w.u32(config.tidig_comp_cnt);
+    const uint8_t flags = (config.tgid_x_en ? 1u : 0u) |
+                          (config.tgid_y_en ? 2u : 0u) |
+                          (config.tgid_z_en ? 4u : 0u) |
+                          (config.tg_size_en ? 8u : 0u) |
+                          (config.packed_r11_storage ? 16u : 0u);
+    w.u8(flags);
+    w.u32(config.lds_bytes);
+    w.u32(config.native_subgroup_size);
+    w.u32(config.native_storage_format_support);
+}
+
+bool read_compute_config(Reader& r, ComputeShaderConfig& config) {
+    uint8_t exact = 0, flags = 0;
+    if (!r.words_bounded(config.user_sgprs, 32,
+                         "invalid compute user-SGPR count") ||
+        !r.u32(config.local_x) || !r.u32(config.local_y) ||
+        !r.u32(config.local_z) || !r.u8(exact) || exact > 1u ||
+        !r.u32(config.threads_x) || !r.u32(config.threads_y) ||
+        !r.u32(config.threads_z) || !r.u32(config.wave_size) ||
+        !r.u32(config.tidig_comp_cnt) || !r.u8(flags) || (flags & ~0x1fu) ||
+        !r.u32(config.lds_bytes) || !r.u32(config.native_subgroup_size) ||
+        !r.u32(config.native_storage_format_support))
+        return false;
+    config.exact_thread_extent = exact != 0;
+    config.tgid_x_en = (flags & 1u) != 0;
+    config.tgid_y_en = (flags & 2u) != 0;
+    config.tgid_z_en = (flags & 4u) != 0;
+    config.tg_size_en = (flags & 8u) != 0;
+    config.packed_r11_storage = (flags & 16u) != 0;
+    return true;
+}
 
 void write_pipeline(Writer& w, const ResolvedPipelineState& p) {
     w.u32(p.topology); w.u32(p.color0_format); w.u8(p.has_clear_color); for (float v : p.clear_color) w.f32(v);
@@ -935,6 +976,35 @@ bool capture_raw_shader_version(uint64_t addr, const CaptureMemoryReader& reader
     return true;
 }
 
+bool validate_compute_config(const ComputeShaderConfig& config,
+                             const ComputeLaunchDimensions& launch,
+                             uint32_t required_subgroup_size,
+                             const char* state_error,
+                             std::string& error) {
+    const bool subgroup_valid = config.native_subgroup_size == 0 ||
+        config.native_subgroup_size == 32 || config.native_subgroup_size == 64;
+    if ((required_subgroup_size != 0 && required_subgroup_size != 32 &&
+         required_subgroup_size != 64) || !subgroup_valid) {
+        error = "invalid compute required-subgroup size";
+        return false;
+    }
+    if (config.user_sgprs.size() > 32 || !config.local_x || !config.local_y ||
+        !config.local_z || config.local_x != launch.local_x ||
+        config.local_y != launch.local_y || config.local_z != launch.local_z ||
+        config.threads_x != launch.threads_x ||
+        config.threads_y != launch.threads_y ||
+        config.threads_z != launch.threads_z ||
+        (config.wave_size != 32 && config.wave_size != 64) ||
+        config.tidig_comp_cnt > 3 || config.lds_bytes > 65536 ||
+        (config.lds_bytes & 511u) ||
+        config.native_subgroup_size != required_subgroup_size ||
+        (config.native_storage_format_support & ~kNativeStorageFormatSupportMask)) {
+        error = state_error;
+        return false;
+    }
+    return true;
+}
+
 bool validate_compute_recompile_state(const GpuCapturedCompute& compute,
                                       std::string& error) {
     if (!compute.recompile_config_available) {
@@ -944,29 +1014,9 @@ bool validate_compute_recompile_state(const GpuCapturedCompute& compute,
         }
         return true;
     }
-    const ComputeShaderConfig& config = compute.recompile_config;
-    const bool subgroup_valid = config.native_subgroup_size == 0 ||
-        config.native_subgroup_size == 32 || config.native_subgroup_size == 64;
-    if ((compute.required_subgroup_size != 0 && compute.required_subgroup_size != 32 &&
-         compute.required_subgroup_size != 64) || !subgroup_valid) {
-        error = "invalid compute required-subgroup size";
-        return false;
-    }
-    if (config.user_sgprs.size() > 32 || !config.local_x || !config.local_y ||
-        !config.local_z || config.local_x != compute.launch.local_x ||
-        config.local_y != compute.launch.local_y || config.local_z != compute.launch.local_z ||
-        config.threads_x != compute.launch.threads_x ||
-        config.threads_y != compute.launch.threads_y ||
-        config.threads_z != compute.launch.threads_z ||
-        (config.wave_size != 32 && config.wave_size != 64) ||
-        config.tidig_comp_cnt > 3 || config.lds_bytes > 65536 ||
-        (config.lds_bytes & 511u) ||
-        config.native_subgroup_size != compute.required_subgroup_size ||
-        (config.native_storage_format_support & ~kNativeStorageFormatSupportMask)) {
-        error = "invalid compute recompile state";
-        return false;
-    }
-    return true;
+    return validate_compute_config(compute.recompile_config, compute.launch,
+                                   compute.required_subgroup_size,
+                                   "invalid compute recompile state", error);
 }
 
 bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& error) {
@@ -1068,6 +1118,15 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
                 error = "failed-stage resource table disagrees with its diagnostic summary";
                 return false;
             }
+            if (stage.recompile_config_available &&
+                (diagnostic.kind != SubmitOperationKind::Dispatch ||
+                 stage.stage != ShaderProgramStage::Compute ||
+                 !validate_compute_config(stage.recompile_config, diagnostic.compute_launch,
+                                          stage.recompile_config.native_subgroup_size,
+                                          "invalid failed-compute recompile state", error))) {
+                if (error.empty()) error = "invalid failed-compute recompile state";
+                return false;
+            }
             if (stage.raw_shader_index != 0xFFFFFFFFu)
                 raw_referenced[stage.raw_shader_index] = true;
             const uint32_t max_issue = static_cast<uint32_t>(DescriptorIssueCode::UnusedRuntimeBinding);
@@ -1133,6 +1192,8 @@ bool capture_failure_diagnostics(
             stage.coverage = runtime_stage.coverage;
             stage.descriptor_issue_count = runtime_stage.descriptor_issue_count;
             stage.first_descriptor_issue = runtime_stage.first_descriptor_issue;
+            stage.recompile_config = runtime_stage.recompile_config;
+            stage.recompile_config_available = runtime_stage.recompile_config_available;
             if (!capture_table(runtime_stage.resources.get(), {}, false,
                                stage.resource_table, error)) return false;
             if (!capture_raw_shader_version(stage.program_addr, reader, capture, raw_words,
@@ -2077,21 +2138,7 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u8(compute.recompile_config_available ? 1u : 0u);
         w.u32(compute.raw_shader_index);
         if (!compute.recompile_config_available) continue;
-        const ComputeShaderConfig& config = compute.recompile_config;
-        w.words(config.user_sgprs);
-        w.u32(config.local_x); w.u32(config.local_y); w.u32(config.local_z);
-        w.u8(config.exact_thread_extent ? 1u : 0u);
-        w.u32(config.threads_x); w.u32(config.threads_y); w.u32(config.threads_z);
-        w.u32(config.wave_size); w.u32(config.tidig_comp_cnt);
-        const uint8_t flags = (config.tgid_x_en ? 1u : 0u) |
-                              (config.tgid_y_en ? 2u : 0u) |
-                              (config.tgid_z_en ? 4u : 0u) |
-                              (config.tg_size_en ? 8u : 0u) |
-                              (config.packed_r11_storage ? 16u : 0u);
-        w.u8(flags);
-        w.u32(config.lds_bytes);
-        w.u32(config.native_subgroup_size);
-        w.u32(config.native_storage_format_support);
+        write_compute_config(w, compute.recompile_config);
     }
     // v40 keeps the BVH BOX_GROW descriptor field in deterministic resource-table order. Failed
     // stages are included because raw diagnostic replay may recompile those tables later.
@@ -2209,6 +2256,20 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         for (const auto& stage : diagnostic.stages)
             if (!write_failed_resource_state(stage.resource_table)) return false;
+    // v42 retains the exact launch/user-SGPR specialization passed to a failed compute
+    // translation. Failed dispatches never enter the realized-compute list, so v39 could not
+    // preserve this state and offline retry had to refuse rather than invent an ABI. Keep the
+    // append-only tail in diagnostic/stage order so v1-v41 readers remain reproducible by removing
+    // only this block and lowering the version.
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics) {
+        w.u32(static_cast<uint32_t>(diagnostic.stages.size()));
+        for (const auto& stage : diagnostic.stages) {
+            w.u8(stage.recompile_config_available ? 1u : 0u);
+            if (stage.recompile_config_available)
+                write_compute_config(w, stage.recompile_config);
+        }
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -3040,23 +3101,7 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 }
                 continue;
             }
-            ComputeShaderConfig& config = compute.recompile_config;
-            uint8_t exact = 0, flags = 0;
-            if (!r.words_bounded(config.user_sgprs, 32,
-                                 "invalid compute user-SGPR count") ||
-                !r.u32(config.local_x) || !r.u32(config.local_y) ||
-                !r.u32(config.local_z) || !r.u8(exact) || exact > 1 ||
-                !r.u32(config.threads_x) || !r.u32(config.threads_y) ||
-                !r.u32(config.threads_z) || !r.u32(config.wave_size) ||
-                !r.u32(config.tidig_comp_cnt) || !r.u8(flags) || (flags & ~0x1fu) ||
-                !r.u32(config.lds_bytes) || !r.u32(config.native_subgroup_size) ||
-                !r.u32(config.native_storage_format_support)) return false;
-            config.exact_thread_extent = exact != 0;
-            config.tgid_x_en = (flags & 1u) != 0;
-            config.tgid_y_en = (flags & 2u) != 0;
-            config.tgid_z_en = (flags & 4u) != 0;
-            config.tg_size_en = (flags & 8u) != 0;
-            config.packed_r11_storage = (flags & 16u) != 0;
+            if (!read_compute_config(r, compute.recompile_config)) return false;
             if (!validate_compute_recompile_state(compute, error)) return false;
         }
     }
@@ -3165,6 +3210,39 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         for (auto& diagnostic : c.failure_diagnostics)
             for (auto& stage : diagnostic.stages)
                 if (!read_failed_resource_state(stage.resource_table)) return false;
+    }
+    if (version >= 42) {   // exact failed-compute launch and user-SGPR specialization
+        uint32_t failure_count = 0;
+        if (!r.u32(failure_count) || failure_count != c.failure_diagnostics.size()) {
+            error = "invalid failed-compute recompile-state failure count";
+            return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics) {
+            uint32_t stage_count = 0;
+            if (!r.u32(stage_count) || stage_count != diagnostic.stages.size()) {
+                error = "invalid failed-compute recompile-state stage count";
+                return false;
+            }
+            for (auto& stage : diagnostic.stages) {
+                uint8_t available = 0;
+                if (!r.u8(available) || available > 1u) {
+                    error = "invalid failed-compute recompile-state availability";
+                    return false;
+                }
+                stage.recompile_config_available = available != 0;
+                if (!stage.recompile_config_available) continue;
+                if (diagnostic.kind != SubmitOperationKind::Dispatch ||
+                    stage.stage != ShaderProgramStage::Compute ||
+                    !read_compute_config(r, stage.recompile_config) ||
+                    !validate_compute_config(stage.recompile_config,
+                                             diagnostic.compute_launch,
+                                             stage.recompile_config.native_subgroup_size,
+                                             "invalid failed-compute recompile state", error)) {
+                    if (error.empty()) error = "invalid failed-compute recompile state";
+                    return false;
+                }
+            }
+        }
     }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)
@@ -3630,6 +3708,11 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
                 continue;
             const GpuState::Dispatch& dispatch = semantic_state->dispatches[failure.index];
             if (failure.command_order != dispatch.command_order) continue;
+            // The indirect producer may leave group/thread counts unresolved, but the shader
+            // register snapshot still provides the exact local size. Preserve those known fields
+            // (and explicit zero unknowns) so the captured config can be validated without
+            // inventing dispatch arguments.
+            failure.compute_launch = resolve_compute_launch(dispatch);
             GpuState diagnostic_state = dispatch.state ? *dispatch.state : *semantic_state;
             diagnostic_state.dispatches.clear();
             diagnostic_state.dispatches.push_back(dispatch);
@@ -3641,6 +3724,9 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
                 stage.stage = ShaderProgramStage::Compute;
                 stage.program_addr = semantic_items.front().code_addr;
                 stage.resources = semantic_items.front().resources;
+                stage.recompile_config = semantic_items.front().recompile_config;
+                stage.recompile_config_available =
+                    semantic_items.front().recompile_config_available;
                 failure.stages.push_back(std::move(stage));
             } else if (!semantic_failures.empty() &&
                        !semantic_failures.front().stages.empty()) {
@@ -3650,6 +3736,9 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
                 stage.stage = semantic_stage.stage;
                 stage.program_addr = semantic_stage.program_addr;
                 stage.resources = semantic_stage.resources;
+                stage.recompile_config = semantic_stage.recompile_config;
+                stage.recompile_config_available =
+                    semantic_stage.recompile_config_available;
                 failure.stages.push_back(std::move(stage));
             }
         }

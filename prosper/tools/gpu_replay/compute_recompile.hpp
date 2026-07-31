@@ -69,4 +69,45 @@ inline bool recompile_captured_compute(
     return true;
 }
 
+// Retry one failed compute translation without Vulkan. A successful return means the capsule had
+// complete, internally consistent retry inputs; an empty SPIR-V vector remains the translator's
+// fail-visible rejection. Older captures and incomplete diagnostics return false with a precise
+// metadata error instead of silently substituting default launch or user-SGPR state.
+inline bool recompile_failed_compute_stage(
+    const gpu::GpuCapturedStageDiagnostic& stage,
+    const std::vector<gpu::GpuCaptureRawShaderVersion>& raw_shader_versions,
+    std::vector<uint32_t>& spirv,
+    std::string& error) {
+    error.clear();
+    spirv.clear();
+    if (stage.stage != gpu::ShaderProgramStage::Compute) {
+        error = "failed stage is not compute";
+        return false;
+    }
+    if (stage.raw_shader_index >= raw_shader_versions.size()) {
+        error = "failed compute stage has no captured raw stream";
+        return false;
+    }
+    if (stage.resource_table_present != stage.resource_table.present ||
+        stage.resource_count != stage.resource_table.resources.size()) {
+        error = "failed compute stage lacks exact resource metadata (capture predates v35)";
+        return false;
+    }
+    if (!stage.recompile_config_available) {
+        error = "failed compute stage lacks exact specialization "
+                "(capture predates v42 or diagnostic is incomplete)";
+        return false;
+    }
+
+    gpu::ShaderResourceTable table;
+    table.resources.reserve(stage.resource_table.resources.size());
+    for (const auto& captured : stage.resource_table.resources)
+        table.resources.push_back(captured.resource);
+    const gpu::ShaderResourceTable* resources = stage.resource_table.present ? &table : nullptr;
+    const auto& raw = raw_shader_versions[stage.raw_shader_index];
+    spirv = gpu::recompile_compute_shader_cached(
+        raw.words.data(), raw.words.size(), resources, stage.recompile_config);
+    return true;
+}
+
 } // namespace prosper::tools

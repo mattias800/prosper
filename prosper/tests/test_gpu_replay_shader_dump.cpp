@@ -164,6 +164,49 @@ int main() {
               raw_compute, compute_raw, nullptr, false, false, true),
           "raw compute replay keeps the stored module when source is unavailable");
 
+    gpu::GpuCapturedStageDiagnostic failed_compute;
+    failed_compute.stage = gpu::ShaderProgramStage::Compute;
+    failed_compute.raw_shader_index = 0;
+    failed_compute.resource_table_present = false;
+    failed_compute.resource_count = 0;
+    failed_compute.recompile_config_available = true;
+    failed_compute.recompile_config.user_sgprs = {0x12345678u, 0x9abcdef0u};
+    failed_compute.recompile_config.local_x = 8;
+    failed_compute.recompile_config.local_y = 4;
+    failed_compute.recompile_config.local_z = 1;
+    failed_compute.recompile_config.exact_thread_extent = true;
+    failed_compute.recompile_config.threads_x = 17;
+    failed_compute.recompile_config.threads_y = 9;
+    failed_compute.recompile_config.threads_z = 1;
+    failed_compute.recompile_config.wave_size = 64;
+    failed_compute.recompile_config.tidig_comp_cnt = 2;
+    failed_compute.recompile_config.tgid_x_en = true;
+    failed_compute.recompile_config.tgid_y_en = true;
+    failed_compute.recompile_config.tg_size_en = true;
+    failed_compute.recompile_config.lds_bytes = 512;
+    failed_compute.recompile_config.native_subgroup_size = 0;
+    std::vector<uint32_t> failed_compute_spirv;
+    const auto direct_failed_compute_spirv = gpu::recompile_compute_shader_cached(
+        compute_raw[0].words.data(), compute_raw[0].words.size(), nullptr,
+        failed_compute.recompile_config);
+    CHECK(tools::recompile_failed_compute_stage(
+              failed_compute, compute_raw, failed_compute_spirv, error) &&
+              !failed_compute_spirv.empty() &&
+              failed_compute_spirv == direct_failed_compute_spirv,
+          "failed compute retry reproduces the exact captured specialization byte-for-byte");
+    auto different_failed_compute = failed_compute;
+    different_failed_compute.recompile_config.local_x = 4;
+    std::vector<uint32_t> different_failed_compute_spirv;
+    CHECK(tools::recompile_failed_compute_stage(
+              different_failed_compute, compute_raw, different_failed_compute_spirv, error) &&
+              different_failed_compute_spirv != failed_compute_spirv,
+          "failed compute retry consumes the captured local-size specialization");
+    failed_compute.recompile_config_available = false;
+    CHECK(!tools::recompile_failed_compute_stage(
+              failed_compute, compute_raw, failed_compute_spirv, error) &&
+              error.find("predates v42") != std::string::npos,
+          "failed compute retry refuses older captures instead of inventing ABI state");
+
     tools::ReplayRenderIntent render_intent;
     render_intent.positional_count = 1;
     CHECK(tools::replay_will_render(render_intent),

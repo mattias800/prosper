@@ -360,7 +360,10 @@ captured resource table. For split vertex programs, `--retry-failed-chain FAILUR
 first two retained vertex stages as one prolog/main chain and calls the production chain recompiler. Both modes
 exit successfully only when SPIR-V is produced and avoid Vulkan rendering, so they are the fast feedback path
 after a translator change. Chain retry requires the exact resource metadata added in capture v35 and rejects
-older or incomplete diagnostics explicitly.
+older or incomplete diagnostics explicitly. Failed compute retry additionally requires capture v42, which
+retains the exact launch dimensions, user SGPR values, wave/LDS state, and subgroup/storage specialization used
+by the rejected translator invocation. Older or incomplete failed-compute diagnostics are refused explicitly;
+the tool never substitutes default compute ABI state.
 
 Capture v8 adds persistent depth/stencil checkpoints. Each seed stores the renderer's complete guest cache
 identity (depth/stencil read/write bases, HTILE base, extent, and D32/D32S8 format), independent depth/stencil
