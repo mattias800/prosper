@@ -194,6 +194,30 @@ int main() {
               !failed_compute_spirv.empty() &&
               failed_compute_spirv == direct_failed_compute_spirv,
           "failed compute retry reproduces the exact captured specialization byte-for-byte");
+    const gpu::DescriptorValidationReport retry_contract =
+        tools::validate_recompiled_failed_stage_contract(
+            failed_compute.stage, failed_compute_spirv, nullptr);
+    const gpu::DescriptorValidationReport live_contract =
+        gpu::validate_spirv_descriptor_interface(
+            failed_compute_spirv, nullptr, 0, gpu::SpirvShaderStage::Compute, false);
+    CHECK(retry_contract.ok() == live_contract.ok() &&
+          retry_contract.descriptors.size() == live_contract.descriptors.size() &&
+          retry_contract.issues.size() == live_contract.issues.size(),
+          "failed-stage retry reports the same accepted descriptor contract as live compute");
+    const std::vector<uint32_t> rejected_retry_spirv;
+    const gpu::DescriptorValidationReport rejected_retry_contract =
+        tools::validate_recompiled_failed_stage_contract(
+            failed_compute.stage, rejected_retry_spirv, nullptr);
+    const gpu::DescriptorValidationReport rejected_live_contract =
+        gpu::validate_spirv_descriptor_interface(
+            rejected_retry_spirv, nullptr, 0, gpu::SpirvShaderStage::Compute, false);
+    CHECK(!rejected_retry_contract.ok() &&
+          rejected_retry_contract.ok() == rejected_live_contract.ok() &&
+          rejected_retry_contract.issues.size() == rejected_live_contract.issues.size() &&
+          !rejected_retry_contract.issues.empty() &&
+          rejected_retry_contract.issues.front().code ==
+              gpu::DescriptorIssueCode::MalformedSpirv,
+          "failed-stage retry preserves live contract rejection instead of becoming a fallback");
     auto different_failed_compute = failed_compute;
     different_failed_compute.recompile_config.local_x = 4;
     std::vector<uint32_t> different_failed_compute_spirv;

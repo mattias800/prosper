@@ -368,6 +368,15 @@ enum class SpirvShaderStage : uint32_t {
     Unknown = 0xFFFFFFFFu,
 };
 
+// Semantic carried by the strict two-byte -> one-dword storage-buffer materialization contract.
+// It is explicit because Uint16 and Float16 share the same physical bytes but produce different
+// guest VGPR values; a cached module or replay marker must never infer one from the other.
+enum class StorageBufferTailSemantic : uint32_t {
+    None = 0,
+    Uint16,
+    Float16,
+};
+
 // SPIR-V Image Format operand used by the exact one-word storage fallback. Keep this public so the
 // recompiler, reflection, live backend, and their contract tests cannot drift through magic values.
 constexpr uint32_t kSpirvImageFormatR32ui = 33;
@@ -416,7 +425,40 @@ struct SpirvDescriptorBinding {
     // The descriptor is reached by an OpAtomic*. Compute uses this to recognize the deliberately
     // buffer-backed view of an exact R32_UINT StorageImage (the RADV image-atomic workaround).
     bool atomic_access = false;
+    // A generated module may prove that every access to this storage-buffer binding is an exact
+    // one-record scalar Uint16/Float16 format-load contract. Vulkan storage buffers are arrays of u32 in our
+    // portable ABI, so that two-byte guest record is materialized as one zero-padded dword. These
+    // values are non-zero only when a strict Prosper.OpModuleProcessed marker survives reflection;
+    // ordinary/raw accesses never receive the exception.
+    uint64_t zero_pad_logical_bytes = 0;
+    uint64_t zero_pad_binding_bytes = 0;
+    StorageBufferTailSemantic zero_pad_semantic = StorageBufferTailSemantic::None;
 };
+
+struct StorageBufferMaterializationPlan {
+    uint64_t logical_bytes = 0;
+    uint64_t binding_bytes = 0;
+    StorageBufferTailSemantic semantic = StorageBufferTailSemantic::None;
+    bool zero_padded_tail = false;
+    bool valid = false;
+};
+
+// Derive the exact host binding range from reflected shader semantics plus the runtime V#. The only
+// range expansion currently admitted is a read-only one-record scalar Uint16/Float16 FORMAT load
+// (2 -> 4 bytes).
+// Any marker/runtime mismatch fails closed. Ordinary buffers keep logical==binding==resource.size.
+StorageBufferMaterializationPlan plan_storage_buffer_materialization(
+    const SpirvDescriptorBinding& descriptor,
+    const ShaderResource& resource);
+
+// Deterministically seed a planned binding. The destination is cleared before the exact logical
+// source bytes are copied, so a padded tail can never borrow bytes from the following guest object.
+bool materialize_storage_buffer_bytes(
+    const StorageBufferMaterializationPlan& plan,
+    const uint8_t* source,
+    uint64_t source_bytes,
+    uint8_t* destination,
+    uint64_t destination_bytes);
 
 enum class DescriptorIssueCode : uint32_t {
     MalformedSpirv,

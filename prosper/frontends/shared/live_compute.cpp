@@ -599,8 +599,10 @@ struct ComputeBufferCacheKey {
     uint64_t gpu_addr = 0;
     uintptr_t host_data = 0;
     uint32_t bytes = 0;
+    ComputeBufferMaterializationDiscriminator materialization;
     bool operator==(const ComputeBufferCacheKey& other) const {
-        return gpu_addr == other.gpu_addr && host_data == other.host_data && bytes == other.bytes;
+        return gpu_addr == other.gpu_addr && host_data == other.host_data &&
+               bytes == other.bytes && materialization == other.materialization;
     }
 };
 
@@ -609,6 +611,10 @@ struct ComputeBufferCacheKeyHash {
         size_t result = std::hash<uint64_t>{}(key.gpu_addr);
         result ^= std::hash<uintptr_t>{}(key.host_data) << 1;
         result ^= std::hash<uint32_t>{}(key.bytes) << 2;
+        result ^= std::hash<uint64_t>{}(key.materialization.logical_bytes) << 3;
+        result ^= std::hash<uint64_t>{}(key.materialization.binding_bytes) << 4;
+        result ^= std::hash<uint32_t>{}(
+            static_cast<uint32_t>(key.materialization.semantic)) << 5;
         return result;
     }
 };
@@ -3020,6 +3026,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             buffers[i].resource = resource;
             buffers[i].guest_bytes = resource->size;
             buffers[i].writable = descriptors[i].writable;
+            const StorageBufferMaterializationPlan materialization =
+                plan_storage_buffer_materialization(descriptors[i], *resource);
+            if (!materialization.valid) {
+                skip_buffer(descriptors[i].binding, resource,
+                            "invalid storage-buffer materialization contract");
+                break;
+            }
             buffers[i].atomic_image = descriptors[i].atomic_access &&
                 resource->cls == ResourceClass::StorageImage &&
                 resource->format == DataFormat::Uint32 && resource->num_components == 1 &&
@@ -3054,7 +3067,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 buffers[i].guest_bytes = guest_image_bytes;
             }
             buffers[i].bytes = buffers[i].atomic_image
-                ? static_cast<size_t>(linear_image_bytes) : resource->size;
+                ? static_cast<size_t>(linear_image_bytes)
+                : static_cast<size_t>(materialization.binding_bytes);
             for (size_t j = 0; j < i; ++j) {
                 const ShaderResource* prior = buffers[j].resource;
                 if (!prior || prior->gpu_addr != resource->gpu_addr ||
@@ -3099,11 +3113,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      (unsigned long long)resource->gpu_addr,
                                      resource->width, resource->height,
                                      resource->tile_mode, buffers[i].bytes);
+                } else if (materialization.zero_padded_tail) {
+                    buffers[i].linear_seed.resize(buffers[i].bytes);
+                    if (!materialize_storage_buffer_bytes(
+                            materialization, source, buffers[i].guest_bytes,
+                            buffers[i].linear_seed.data(), buffers[i].linear_seed.size())) {
+                        skip_buffer(descriptors[i].binding, resource,
+                                    "failed zero-padded storage-buffer materialization");
+                        break;
+                    }
+                    source = buffers[i].linear_seed.data();
                 }
                 if (trace) buffers[i].before_hash = fnv1a(source, buffers[i].bytes);
                 buffers[i].cache_key = {
                     resource->gpu_addr, reinterpret_cast<uintptr_t>(resource->host_data),
-                    static_cast<uint32_t>(buffers[i].bytes)};
+                    static_cast<uint32_t>(buffers[i].bytes),
+                    compute_buffer_materialization_discriminator(materialization)};
                 const bool cache_candidate = !buffers[i].atomic_image &&
                     persistent_compute_buffer_enabled(static_cast<uint32_t>(buffers[i].bytes));
                 if (cache_candidate && ctx.acquire_cached_buffer(

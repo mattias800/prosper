@@ -3467,6 +3467,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (getenv("PROSPER_ALPHA1")) fr.swizzle[3] = 1;
                     } else {
                         fr.buffer_identity = r.gpu_addr;
+                        const prosper::gpu::StorageBufferMaterializationPlan materialization =
+                            prosper::gpu::plan_storage_buffer_materialization(
+                                *reflected_binding, r);
+                        if (!materialization.valid) {
+                            fprintf(stderr,
+                                    "[buffer-materialization-reject] set=%u binding=%u addr=%llx "
+                                    "declared=%u\n",
+                                    set, r.binding, (unsigned long long)r.gpu_addr, r.size);
+                            continue;
+                        }
                         // #1427: the guest's declared V#/V-buffer size is the real requirement — a
                         // vertex fetch indexes anywhere inside it. The old 1 MiB clamp silently
                         // truncated larger buffers, so every element past the cap read ZEROS: those
@@ -3480,7 +3490,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // truncation that does happen FAIL-VISIBLE. PROSPER_MAX_BUFFER_UPLOAD_MB
                         // lowers the ceiling for a same-build A/B of this exact defect.
                         const uint32_t requested_bytes = r.size ? r.size : 256u;
-                        uint32_t nb = prosper::frontend::buffer_upload_bytes(requested_bytes);
+                        uint32_t nb = materialization.zero_padded_tail
+                            ? static_cast<uint32_t>(materialization.binding_bytes)
+                            : prosper::frontend::buffer_upload_bytes(requested_bytes);
                         if (nb < (requested_bytes & ~3u)) {
                             static std::set<uint64_t> truncated_reported;
                             if (truncated_reported.size() < 32 &&
@@ -3500,7 +3512,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool unavailable_guest_buffer = !r.host_data &&
                             (r.gpu_addr < 0x1000 ||
                              prosper_reserved_range_state(r.gpu_addr) == 0);
-                        if (unavailable_guest_buffer) {
+                        if (materialization.zero_padded_tail) {
+                            uint8_t logical[2] = {};
+                            const uint8_t* logical_source = nullptr;
+                            if (r.host_data && r.host_data_size >= sizeof(logical)) {
+                                logical_source = r.host_data;
+                            } else if (!r.host_data && !unavailable_guest_buffer &&
+                                       copy_resource(logical, r.gpu_addr, sizeof(logical)) ==
+                                           sizeof(logical)) {
+                                logical_source = logical;
+                            }
+                            fr.dwords.assign(1, 0);
+                            if (!logical_source ||
+                                !prosper::gpu::materialize_storage_buffer_bytes(
+                                    materialization, logical_source, sizeof(logical),
+                                    reinterpret_cast<uint8_t*>(fr.dwords.data()),
+                                    sizeof(uint32_t))) {
+                                fprintf(stderr,
+                                        "[buffer-materialization-reject] set=%u binding=%u "
+                                        "two-byte source unavailable\n",
+                                        set, r.binding);
+                                continue;
+                            }
+                        } else if (unavailable_guest_buffer) {
                             const uint64_t minimum_bytes = std::min<uint64_t>(
                                 std::max<uint64_t>(reflected_binding->required_bytes, 256u),
                                 kMaxBufferUploadBytes);
@@ -3520,7 +3554,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         }
                         const auto copy_start = timing_enabled
                             ? RenderClock::now() : RenderClock::time_point{};
-                        if (!unavailable_guest_buffer && !fr.dwords_view_count &&
+                        if (!materialization.zero_padded_tail &&
+                            !unavailable_guest_buffer && !fr.dwords_view_count &&
                             use_direct_buffer_views) {
                             if (nb >= 4) {
                                 fr.dwords.assign(nb / sizeof(uint32_t), 0);
@@ -3529,7 +3564,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     fr.dwords.clear();
                             }
                             if (fr.dwords.empty()) fr.dwords.assign(64, 0);
-                        } else if (!unavailable_guest_buffer && !use_direct_buffer_views) {
+                        } else if (!materialization.zero_padded_tail &&
+                                   !unavailable_guest_buffer && !use_direct_buffer_views) {
                             if (nb >= 4) {
                                 std::vector<uint8_t> tmp(nb, 0);
                                 if (copy_resource(tmp.data(), r.gpu_addr, nb) > 0)

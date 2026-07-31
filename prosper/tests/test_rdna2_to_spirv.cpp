@@ -4029,6 +4029,172 @@ int main() {
     CHECK(!spvT13structured.empty() && gotT13structured.size() == N && badT13structured == 0,
           "T13 structured: stride-2 Uint16 format load uses computed VADDR and runtime half");
 
+    // Plucky Squire's post-desk compute shader binds three one-record Uint16 V#s. Prosper's portable
+    // SSBO ABI loads u32, so each exact two-byte guest range carries a reflected 2 -> 4 zero-pad
+    // contract. The shader itself guards the original record index: record 0 reads the low half and
+    // every later record returns zero, even if the materialized upper half is deliberately poisoned.
+    const uint32_t codeT13tail[] = {
+        0x7e020f00u,                         // v1 = uint(input v0): record index
+        0xe0002000u, 0x80020101u,           // format_x v1, v1, s[8:11], idxen
+        0xbf8c3f70u, 0x7e000d01u, 0xbf810000u,
+    };
+    uint16_t tail_host_value = 0x1234u;
+    ShaderResourceTable rtT13tail;
+    { ShaderResource cb{}; cb.cls = ResourceClass::ConstantBuffer;
+      cb.format = DataFormat::Uint16; cb.num_components = 1; cb.binding = 3;
+      cb.size = 2; cb.stride = 2; cb.sgpr_base = 8; cb.fetch_pc = 1;
+      cb.host_data = reinterpret_cast<uint8_t*>(&tail_host_value); cb.host_data_size = 2;
+      rtT13tail.resources.push_back(cb); }
+    const std::vector<uint32_t> spvT13tail = recompile_valu(
+        codeT13tail, std::size(codeT13tail), 1, 0, &rtT13tail);
+    uint32_t shell_binding_value = 0;
+    ShaderResourceTable rtT13tailValidation = rtT13tail;
+    for (uint32_t binding : {0u, 1u}) {
+        ShaderResource shell{};
+        shell.cls = ResourceClass::ConstantBuffer;
+        shell.format = DataFormat::Uint32;
+        shell.num_components = 1;
+        shell.binding = binding;
+        shell.size = sizeof(shell_binding_value);
+        shell.stride = sizeof(shell_binding_value);
+        shell.host_data = reinterpret_cast<uint8_t*>(&shell_binding_value);
+        shell.host_data_size = sizeof(shell_binding_value);
+        rtT13tailValidation.resources.push_back(shell);
+    }
+    const DescriptorValidationReport tail_report = validate_spirv_descriptor_interface(
+        spvT13tail, &rtT13tailValidation, 0, SpirvShaderStage::Compute, false);
+    const SpirvDescriptorBinding* tail_binding =
+        find_spirv_descriptor_binding(tail_report, 0, 3);
+    for (const auto& descriptor : tail_report.descriptors)
+        printf("  T13 tail descriptor binding=%u required=%llu%s zero-pad=%llu->%llu\n",
+               descriptor.binding, (unsigned long long)descriptor.required_bytes,
+               descriptor.dynamic_access ? "+dynamic" : "",
+               (unsigned long long)descriptor.zero_pad_logical_bytes,
+               (unsigned long long)descriptor.zero_pad_binding_bytes);
+    for (const auto& issue : tail_report.issues)
+        printf("  T13 tail issue=%s error=%d binding=%u required=%llu available=%llu\n",
+               descriptor_issue_name(issue.code), issue.error, issue.binding,
+               (unsigned long long)issue.required_bytes,
+               (unsigned long long)issue.available_bytes);
+    CHECK(!spvT13tail.empty() && tail_report.ok() && tail_binding &&
+          tail_binding->required_bytes == 4 && !tail_binding->dynamic_access &&
+          tail_binding->zero_pad_logical_bytes == 2 &&
+          tail_binding->zero_pad_binding_bytes == 4 &&
+          tail_binding->zero_pad_semantic == StorageBufferTailSemantic::Uint16,
+          "one-record Uint16 format load reflects and accepts the strict 2 -> 4 contract");
+    const std::vector<float> tail_indices = {0.0f, 1.0f};
+    const std::vector<uint32_t> poisoned_tail_word = {0xdead1234u};
+    const std::vector<float> gotT13tail = prosper::test::run_compute(
+        spvT13tail, tail_indices, 2, 2, {}, poisoned_tail_word);
+    CHECK(gotT13tail.size() == 2 && gotT13tail[0] == 0x1234u && gotT13tail[1] == 0.0f,
+          "one-record Uint16 format load returns record 0 and rejects the poisoned padded record");
+
+    const uint32_t codeT13floatTail[] = {
+        0x7e020f00u,                         // v1 = uint(input v0): record index
+        0xe0002000u, 0x80020101u,           // format_x v1, v1, s[8:11], idxen
+        0xbf8c3f70u, 0xbf810000u,
+    };
+    uint16_t float_tail_host_value = 0x3e00u; // binary16 1.5
+    ShaderResourceTable rtT13floatTail;
+    { ShaderResource cb{}; cb.cls = ResourceClass::ConstantBuffer;
+      cb.format = DataFormat::Float16; cb.num_components = 1; cb.binding = 3;
+      cb.size = 2; cb.stride = 2; cb.sgpr_base = 8; cb.fetch_pc = 1;
+      cb.host_data = reinterpret_cast<uint8_t*>(&float_tail_host_value); cb.host_data_size = 2;
+      rtT13floatTail.resources.push_back(cb); }
+    const std::vector<uint32_t> spvT13floatTail = recompile_valu(
+        codeT13floatTail, std::size(codeT13floatTail), 1, 1, &rtT13floatTail);
+    ShaderResourceTable rtT13floatTailValidation = rtT13floatTail;
+    rtT13floatTailValidation.resources.insert(
+        rtT13floatTailValidation.resources.end(),
+        rtT13tailValidation.resources.end() - 2,
+        rtT13tailValidation.resources.end());
+    const DescriptorValidationReport float_tail_report = validate_spirv_descriptor_interface(
+        spvT13floatTail, &rtT13floatTailValidation, 0, SpirvShaderStage::Compute, false);
+    const SpirvDescriptorBinding* float_tail_binding =
+        find_spirv_descriptor_binding(float_tail_report, 0, 3);
+    const std::vector<uint32_t> poisoned_float_tail_word = {0xdead3e00u};
+    const std::vector<float> gotT13floatTail = prosper::test::run_compute(
+        spvT13floatTail, tail_indices, 2, 2, {}, poisoned_float_tail_word);
+    CHECK(!spvT13floatTail.empty() && float_tail_report.ok() && float_tail_binding &&
+          float_tail_binding->zero_pad_semantic == StorageBufferTailSemantic::Float16 &&
+          gotT13floatTail.size() == 2 && gotT13floatTail[0] == 1.5f &&
+          gotT13floatTail[1] == 0.0f,
+          "one-record Float16 format load unpacks record 0 and rejects the poisoned padded record");
+
+    const uint32_t codeT13threeTail[] = {
+        0x7e020f00u,
+        0xe0002000u, 0x80020101u,           // pc 1: s[8:11]  -> binding 6
+        0xe0002000u, 0x80030101u,           // pc 3: s[12:15] -> binding 8
+        0xe0002000u, 0x80040101u,           // pc 5: s[16:19] -> binding 10
+        0xbf8c3f70u, 0x7e000d01u, 0xbf810000u,
+    };
+    uint16_t three_tail_values[] = {0x3c00u, 0x4000u, 0x4200u};
+    ShaderResourceTable rtT13threeTail;
+    for (uint32_t i = 0; i < 3; ++i) {
+        ShaderResource cb{};
+        cb.cls = ResourceClass::ConstantBuffer;
+        cb.format = DataFormat::Float16;
+        cb.num_components = 1;
+        cb.binding = 6u + i * 2u;
+        cb.size = 2;
+        cb.stride = 2;
+        cb.sgpr_base = 8u + i * 4u;
+        cb.fetch_pc = 1u + i * 2u;
+        cb.host_data = reinterpret_cast<uint8_t*>(&three_tail_values[i]);
+        cb.host_data_size = 2;
+        rtT13threeTail.resources.push_back(cb);
+    }
+    const std::vector<uint32_t> spvT13threeTail = recompile_valu(
+        codeT13threeTail, std::size(codeT13threeTail), 1, 0, &rtT13threeTail);
+    ShaderResourceTable rtT13threeTailValidation = rtT13threeTail;
+    rtT13threeTailValidation.resources.insert(
+        rtT13threeTailValidation.resources.end(),
+        rtT13tailValidation.resources.end() - 2,
+        rtT13tailValidation.resources.end());
+    const DescriptorValidationReport three_tail_report = validate_spirv_descriptor_interface(
+        spvT13threeTail, &rtT13threeTailValidation, 0, SpirvShaderStage::Compute, false);
+    for (const auto& descriptor : three_tail_report.descriptors)
+        printf("  T13 three-tail descriptor binding=%u required=%llu%s zero-pad=%llu->%llu\n",
+               descriptor.binding, (unsigned long long)descriptor.required_bytes,
+               descriptor.dynamic_access ? "+dynamic" : "",
+               (unsigned long long)descriptor.zero_pad_logical_bytes,
+               (unsigned long long)descriptor.zero_pad_binding_bytes);
+    for (const auto& issue : three_tail_report.issues)
+        printf("  T13 three-tail issue=%s error=%d binding=%u required=%llu available=%llu\n",
+               descriptor_issue_name(issue.code), issue.error, issue.binding,
+               (unsigned long long)issue.required_bytes,
+               (unsigned long long)issue.available_bytes);
+    bool all_three_tail_bindings = three_tail_report.ok();
+    for (uint32_t binding : {6u, 8u, 10u}) {
+        const SpirvDescriptorBinding* reflected =
+            find_spirv_descriptor_binding(three_tail_report, 0, binding);
+        all_three_tail_bindings &= reflected && reflected->required_bytes == 4 &&
+            !reflected->dynamic_access && reflected->zero_pad_logical_bytes == 2 &&
+            reflected->zero_pad_binding_bytes == 4 &&
+            reflected->zero_pad_semantic == StorageBufferTailSemantic::Float16;
+    }
+    CHECK(!spvT13threeTail.empty() && all_three_tail_bindings,
+          "Plucky reduced contract accepts all three one-record bindings 6/8/10");
+
+    const uint32_t codeT13rawTail[] = {
+        0x7e020f00u,
+        0xe0302000u, 0x80020101u,           // raw buffer_load_dword, same size-2 V#
+        0xbf8c3f70u, 0x7e000d01u, 0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT13rawTail = recompile_valu(
+        codeT13rawTail, std::size(codeT13rawTail), 1, 0, &rtT13tail);
+    const DescriptorValidationReport raw_tail_report = validate_spirv_descriptor_interface(
+        spvT13rawTail, &rtT13tailValidation, 0, SpirvShaderStage::Compute, false);
+    const SpirvDescriptorBinding* raw_tail_binding =
+        find_spirv_descriptor_binding(raw_tail_report, 0, 3);
+    bool raw_tail_undersized = false;
+    for (const auto& issue : raw_tail_report.issues)
+        raw_tail_undersized |= issue.error && issue.code == DescriptorIssueCode::UndersizedBuffer &&
+                              issue.required_bytes == 4 && issue.available_bytes == 2;
+    CHECK(!spvT13rawTail.empty() && !raw_tail_report.ok() && raw_tail_binding &&
+          raw_tail_binding->zero_pad_logical_bytes == 0 && raw_tail_undersized,
+          "raw u32 load against the same two-byte V# remains rejected required=4 available=2");
+
     // Kernel T14: SINT8x1 vertex fetch — sign-extended integer. Same code; V# format Sint8; the
     // final convert is v_cvt_f32_i32 so -1 (0xFF) comes back as -1.0.
     const uint32_t codeT14[] = { 0x7e020f00u, 0xe0002000u, 0x80020101u, 0xbf8c3f70u, 0x7e000b01u, 0xbf810000u };

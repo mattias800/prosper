@@ -110,4 +110,29 @@ inline bool recompile_failed_compute_stage(
     return true;
 }
 
+// A retry is diagnostic recompilation, not a bypass around the live descriptor contract. Validate
+// the resulting module with the same stage/set mapping used by execution so a capsule cannot report
+// "recompiled" while the live backend will immediately reject its resources.
+inline gpu::DescriptorValidationReport validate_recompiled_failed_stage_contract(
+    gpu::ShaderProgramStage stage,
+    const std::vector<uint32_t>& spirv,
+    const gpu::ShaderResourceTable* resources) {
+    uint32_t set = 0;
+    gpu::SpirvShaderStage spirv_stage = gpu::SpirvShaderStage::Unknown;
+    switch (stage) {
+        case gpu::ShaderProgramStage::Vertex:
+            spirv_stage = gpu::SpirvShaderStage::Vertex;
+            break;
+        case gpu::ShaderProgramStage::Fragment:
+            set = 1;
+            spirv_stage = gpu::SpirvShaderStage::Fragment;
+            break;
+        case gpu::ShaderProgramStage::Compute:
+            spirv_stage = gpu::SpirvShaderStage::Compute;
+            break;
+    }
+    return gpu::validate_spirv_descriptor_interface(
+        spirv, resources, set, spirv_stage, false);
+}
+
 } // namespace prosper::tools

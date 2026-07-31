@@ -10,6 +10,24 @@ namespace prosper::frontend {
 
 enum class ComputeImageCacheClass : uint8_t { sampled, storage };
 
+// Persistent SSBO identity must distinguish guest bytes from their Vulkan materialization. A
+// one-record 16-bit source and an ordinary four-byte source can otherwise share address, host-data
+// identity, and bound size while requiring different upper bytes and typed shader semantics.
+struct ComputeBufferMaterializationDiscriminator {
+    uint64_t logical_bytes = 0;
+    uint64_t binding_bytes = 0;
+    prosper::gpu::StorageBufferTailSemantic semantic =
+        prosper::gpu::StorageBufferTailSemantic::None;
+
+    bool operator==(const ComputeBufferMaterializationDiscriminator&) const = default;
+};
+
+constexpr ComputeBufferMaterializationDiscriminator
+compute_buffer_materialization_discriminator(
+    const prosper::gpu::StorageBufferMaterializationPlan& plan) {
+    return {plan.logical_bytes, plan.binding_bytes, plan.semantic};
+}
+
 // Read-only sampled inputs are often tiny, numerous, and cheap to upload; retaining all of them
 // wastes cache identities and device memory. A storage target has a different cost model: even a
 // small repeated output otherwise incurs staging readback, guest-format packing, and layout work.
