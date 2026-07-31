@@ -1147,17 +1147,28 @@ int main() {
 
         // Live exact-extent RTT consumers borrow an immutable snapshot instead of copying it
         // through frontend scratch. FrameResource copies retain that backing through upload setup.
-        auto pixels = std::make_shared<const std::vector<uint8_t>>(16, 0x5a);
+        constexpr uint32_t retained_width = 2;
+        constexpr uint32_t retained_height = 2;
+        constexpr VkFormat retained_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        const size_t retained_bytes = static_cast<size_t>(retained_width) * retained_height *
+            prosper::test::backend_color_bytes_per_pixel(retained_format);
+        auto pixels = std::make_shared<const std::vector<uint8_t>>(retained_bytes, 0x5a);
         prosper::test::FrameResource source;
         source.tex_rgba_owner = pixels;
         source.tex_rgba = pixels->data();
+        source.tw = retained_width;
+        source.th = retained_height;
+        source.texture_format = retained_format;
         prosper::test::FrameResource retained = source;
         source.tex_rgba_owner.reset();
         pixels.reset();
         CHECK(retained.tex_rgba_owner &&
                   retained.tex_rgba == retained.tex_rgba_owner->data() &&
+                  retained.tex_rgba_owner->size() == retained_bytes &&
+                  retained.tw == retained_width && retained.th == retained_height &&
+                  retained.texture_format == retained_format &&
                   retained.tex_rgba_owner->front() == 0x5a,
-              "a copied FrameResource retains borrowed RTT pixels");
+              "a copied FrameResource retains the borrowed RTT lifetime, extent, and FP16 format");
 
         using prosper::frontend::texture_decode_cache_candidate;
         CHECK(texture_decode_cache_candidate(false, false, false, 1u, true, true),
@@ -1172,6 +1183,25 @@ int main() {
               "a retained sampled-depth image bypasses guest-byte decode-cache work");
         CHECK(!texture_decode_cache_candidate(true, false, false, 1u, true, true),
               "a retained color image bypasses guest-byte decode-cache work");
+
+        using prosper::frontend::persistent_texture_decode_cache_eligible;
+        CHECK(persistent_texture_decode_cache_eligible(
+                  /*guest_decode_candidate=*/true, /*compute_image_hit=*/false,
+                  /*is_storage_image=*/false, /*cache_disabled=*/false,
+                  /*compression_supported=*/true, /*cache_limit=*/1u << 30,
+                  /*source_size=*/retained_bytes),
+              "an ordinary supported guest texture remains eligible for persistent decode caching");
+        CHECK(!persistent_texture_decode_cache_eligible(
+                   texture_decode_cache_candidate(
+                       /*has_live_color_target=*/true, /*has_live_depth_target=*/false,
+                       /*has_captured_host_data=*/false, /*image_dimension=*/1u,
+                       /*is_sampled_texture=*/true, /*format_supported=*/true),
+                   /*compute_image_hit=*/false, /*is_storage_image=*/false,
+                   /*cache_disabled=*/false, /*compression_supported=*/true,
+                   /*cache_limit=*/1u << 30,
+                   // DCC metadata can make this nonzero even though live color is authoritative.
+                   /*source_size=*/retained_bytes),
+              "a live FP16 RTT cannot be overwritten by a DCC-backed guest decode-cache entry");
 
         using prosper::frontend::texture_decode_source_address;
         CHECK(texture_decode_source_address(0x100000u, 5u, false, 0x24000u) == 0x124000u,

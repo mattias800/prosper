@@ -466,6 +466,17 @@ bool texture_decode_cache_candidate(bool has_live_color_target,
         is_sampled_texture && format_supported;
 }
 
+bool persistent_texture_decode_cache_eligible(bool guest_decode_candidate,
+                                              bool compute_image_hit,
+                                              bool is_storage_image,
+                                              bool cache_disabled,
+                                              bool compression_supported,
+                                              size_t cache_limit,
+                                              size_t source_size) {
+    return guest_decode_candidate && !compute_image_hit && !is_storage_image &&
+        !cache_disabled && compression_supported && cache_limit && source_size;
+}
+
 uint64_t texture_decode_source_address(uint64_t gpu_address,
                                        uint32_t image_dimension,
                                        bool in_mip_tail,
@@ -1903,12 +1914,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 ? copy_dcc_metadata(dst, bytes)
                                 : copy_resource(dst, sampled_source_addr, bytes);
                         };
-                        const bool persistent_cache_eligible = !resource_compute_image_hit &&
-                            !fr.is_storage_image &&
-                            !getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") &&
-                            (!r.compression_enabled || persistent_dcc_uncompressed ||
-                             persistent_dcc_fast_clear) &&
-                            persistent_decode_limit && persistent_source_size != 0;
+                        const bool persistent_cache_eligible =
+                            persistent_texture_decode_cache_eligible(
+                                persistent_sampled_texture, resource_compute_image_hit,
+                                fr.is_storage_image,
+                                getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") != nullptr,
+                                !r.compression_enabled || persistent_dcc_uncompressed ||
+                                    persistent_dcc_fast_clear,
+                                persistent_decode_limit, persistent_source_size);
                         static const bool cross_submit_watch_enabled =
                             !getenv("PROSPER_NO_CROSS_SUBMIT_TEXTURE_WRITE_WATCH");
                         // Page-protection watches have a fixed setup/query cost and may need to
