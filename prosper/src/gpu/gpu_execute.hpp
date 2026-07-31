@@ -802,31 +802,52 @@ inline uint32_t resolve_nonindexed_vertex_count(uint32_t draw_count, uint32_t vb
     return draw_count ? draw_count : vb_records;
 }
 
+struct ColorStateTraceConfig {
+    bool enabled = false;
+    bool filter_by_dimension = false;
+    uint32_t width = 0, height = 0;
+};
+
+// Parse the process-wide diagnostic switch once. Draw realization is a hot path even when tracing is
+// disabled, so its ordinary per-draw cost is only a cached boolean check -- never getenv or sscanf.
+inline const ColorStateTraceConfig& color_state_trace_config() {
+    static const ColorStateTraceConfig config = [] {
+        ColorStateTraceConfig parsed;
+        const char* setting = std::getenv("PROSPER_COLORSTATETRACE");
+        if (!setting || !*setting) return parsed;
+        if (std::strcmp(setting, "1") == 0 || std::strcmp(setting, "all") == 0) {
+            parsed.enabled = true;
+            return parsed;
+        }
+
+        char trailing = 0;
+        if (std::sscanf(setting, "%ux%u%c", &parsed.width, &parsed.height, &trailing) == 2 &&
+            parsed.width && parsed.height) {
+            parsed.enabled = true;
+            parsed.filter_by_dimension = true;
+            return parsed;
+        }
+        std::fprintf(stderr,
+                     "[color-state] invalid PROSPER_COLORSTATETRACE='%s' "
+                     "(expected 1, all, or WxH)\n",
+                     setting);
+        return ColorStateTraceConfig{};
+    }();
+    return config;
+}
+
 // PROSPER_COLORSTATETRACE=1|all|WxH: one raw-to-resolved color/depth state record per matching draw.
 // This deliberately runs before the no-effect fast path so a zero raw mask remains observable even
 // when shader/resource realization is skipped. It is diagnostic-only and does not mutate draw state.
 inline void trace_color_state_if_requested(const RenderState& rs,
                                            const ResolvedPipelineState& ps) {
-    const char* setting = std::getenv("PROSPER_COLORSTATETRACE");
-    if (!setting || !*setting) return;
+    const ColorStateTraceConfig& config = color_state_trace_config();
+    if (!config.enabled) return;
 
     const ColorStateTraceSnapshot snapshot = snapshot_color_state_trace(rs, ps);
-    if (std::strcmp(setting, "1") != 0 && std::strcmp(setting, "all") != 0) {
-        uint32_t width = 0, height = 0;
-        char trailing = 0;
-        if (std::sscanf(setting, "%ux%u%c", &width, &height, &trailing) != 2 ||
-            !width || !height) {
-            static std::once_flag warned;
-            std::call_once(warned, [&] {
-                std::fprintf(stderr,
-                             "[color-state] invalid PROSPER_COLORSTATETRACE='%s' "
-                             "(expected 1, all, or WxH)\n",
-                             setting);
-            });
-            return;
-        }
-        if (!color_state_trace_matches_dimension(snapshot, width, height)) return;
-    }
+    if (config.filter_by_dimension &&
+        !color_state_trace_matches_dimension(snapshot, config.width, config.height))
+        return;
 
     // Draw realization may run on worker threads. Keep each snapshot contiguous so target rows do
     // not become associated with another draw's raw register line in a busy live trace.
