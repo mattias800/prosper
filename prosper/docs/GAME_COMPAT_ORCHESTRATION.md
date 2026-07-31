@@ -16,7 +16,7 @@ log, while this document is the map that helps the next orchestrator find and in
 
 - Repository: `mattias800/prosper` (renamed from `mattias800/ps5ys`).
 - Remote branch: `master`.
-- Exact master at this update: `b8064e54` (2026-07-31 session).
+- Exact master at this update: `ede320b6` (2026-07-31 session; eleven merges).
 - Active title lanes: Astro Bot, Dragon Quest VII, The Plucky Squire, Alex Kidd, and The Pathless.
 - GPU state: sharing is the default; see the scheduling rules below.
 
@@ -44,13 +44,41 @@ session. Prefer breadth when a hard lane stalls — overall library progress mat
 2. **`shader_inspect` was misreporting ~96% of known-good shaders** (109 of 114, across all three stages) as
    `rejected`, because a raw dump carries no descriptors. Fixed in #1575 — it now reports
    `undetermined-no-resource-table` with exit 3. Any shader verdict taken from it before `37dfe752` is suspect.
-3. **Instrumentation produced two phantom defects this session, not reasoning.** `PROSPER_FS_TAP` exports
-   `(dst, dst+1, dst+2, dst+3)`, so comparing taps with different `dst` compares *different registers* — that
-   manufactured a "~14x amplification" that did not exist. Treat a surprising measurement as a possible tool
-   artifact before treating it as a finding.
-4. **`-DGAME_DUMP` against a non-Messenger title fails 3 dump-parameterized tests** (`module_loads_eboot`,
+3. **`-DGAME_DUMP` against a non-Messenger title fails 3 dump-parameterized tests** (`module_loads_eboot`,
    `boot_reaches_first_syscall`, `real_shader_render`). This is expected, not a regression — current master is
    **162/162** when configured against `PPSA24651`. Tracked as #1573.
+
+### The instrument-not-the-subject list — read this before believing any surprising measurement
+
+**Eleven phantom defects in one session (2026-07-31) came from the measuring apparatus, not the subject.**
+Several cost hours; one cost two sessions. This is the single highest-value page in this document.
+
+| # | Instrument | How it lied |
+|---|---|---|
+| 1 | `shader_inspect` | Reported **109 of 114 known-good shaders** as `rejected` — a raw dump has no descriptors, so table-dependent MIMG/MUBUF/MTBUF (and SMEM in graphics) correctly refuse. Fixed #1575. |
+| 2 | `PROSPER_FS_TAP` | Exports `(dst, dst+1, dst+2, dst+3)`, so taps with different `dst` compare **different registers**. Manufactured a "~14x amplification". |
+| 3 | Snapshot guards | `blue-prince-hall` and `terminator-boot` "FAILED" on **fully-rendered healthy frames** whose routes had drifted to another scene/animation phase. A control run on master reproduced both. |
+| 4 | `sgpr:106` | Is `VCC_LO` **scratch**, not a uniform — a static constant-buffer read cannot resolve its value at point of use. |
+| 5 | `--through-operation N` | Renders the **last executed draw target**, so adjacent prefixes show *different surfaces*. #1486's founding "corruption boundary" was 1920x1080 vs 3840x2160. Fixed by #1580's `target=`. |
+| 6 | `git checkout <file>` | Restores from the **index** — it is not an undo for a temporary edit, and silently wipes uncommitted work. |
+| 7 | A stale `in-progress` label | Read as occupancy. #1284's claim had been dead six days (no open PR, no activity); CLAUDE.md expires claims at 24 h. |
+| 8 | An orchestrator's instruction | "If it is a missing capability, implement it" — all three opcodes were **already implemented**; following it would have duplicated a working `image_gather4_lz`. |
+| 9 | `[compute] skip unsupported program` | **Deduped per `code_addr`**: one line means "failed at least once", NOT "always fails". A program running 763 times and failing once looks identical to a permanently blocked one. |
+| 10 | `PROSPER_COMPUTELOG_CODE=<addr>` | Correctly protects a realtime route from ~13k submits of logging, and thereby **suppresses `execute` lines for every other program**. Right for one question, silently wrong for the next asked of the same log. |
+| 11 | SHA reachability after a **squash** merge | `git merge-base --is-ancestor` reports "unmerged" for work that *is* on master. Verify by **content**, not by SHA. |
+
+**Working rules that follow:**
+
+- Prefer experiments that **detect their own invalidity** — e.g. render two adjacent operations and assert both
+  return the same resolution, so a surface switch invalidates the comparison instead of producing a phantom.
+- **Open the image.** Believe neither a metric win nor a metric failure without looking. A diagnostic clear can
+  out-score real content on colour count; a healthy frame can fail SSIM on animation phase.
+- A measurement that is **right for one question can be silently wrong for the next one asked of the same data**.
+- Never re-derive a bisect boundary without confirming both sides render the **same target**.
+- Check whether a later comment or merged PR already **superseded** an inherited premise before acting on it
+  (Bendy's "CPU software-detile dominates" had been overtaken by #1179/#1190/#1269 in its own issue).
+- Write `Refs #NN`, not `Fixes #NN`, when a PR only partially addresses an issue — a parenthetical qualifier does
+  **not** stop GitHub's auto-close, and #1554 was closed that way despite a comment saying to keep it open.
 
 ## The orchestration contract
 
@@ -664,21 +692,42 @@ Supporting CFG facts for the retained stage: in `[916,1963)` there are 12 barrie
 barrier (`pc83→899`, `pc898→82`, `pc915→1963`), making pc915 the sole barrier-crossing edge. Coverage moved from
 `unsupported=1` to `total=1326 alu=1261 table=65 unsupported=0`.
 
+### Live confirmation, and a retraction that matters
+
+**`0x3017460000` executes live**: 196 dispatches, every one `result=ok`, zero skips, deterministic at a single
+SPIR-V hash, zero Vulkan errors across 51,808 log lines.
+
+The proof was **genuinely exercised, not trivially satisfied**: `local=128x1x1` with `subgroup=0` (the portable
+path) means **more than one guest wave per workgroup**. In a single-wave workgroup, wave-uniform would imply
+workgroup-uniform for free and the barrier promotion would never have been under load. Twelve barriers inside a
+VCC-entered region, multiple waves that must agree, 196 times.
+
+All three programs named in #1554 now execute: `0x3017d90000` (#1561), `0x3017450000` (#1564),
+`0x3017460000` (#1572).
+
+**RETRACTED — the "three remaining blocked programs" finding was wrong.** A follow-up investigation reported that
+`0x30133e0000`, `0x3013430000` and `0x30194c0000` were blocked by descriptor-resolution failures. Unfiltered
+logging showed they execute **3,501 times** with a **single** transient failure (1 in 763, self-recovering, 108
+successes before and 655 after). See instruments #9 and #10 in the list above: deduped skip lines plus a targeted
+`PROSPER_COMPUTELOG_CODE` filter hid thousands of successes. Tracked as **#1581**, retitled to match.
+
+What survives unchanged: `image_gather4_lz` (0x47), `image_store` (0x08) and MUBUF `<=0x07` are **all already
+implemented**, and offline coverage is `unsupported=0` for all three. This was never an instruction-coverage gap.
+
+Also: **#282's own comment retracts its premise** and its design doc is gone from master, so neither #282 nor
+#485 covers this area — do not inherit them as background.
+
 ### Next Plucky assignment
 
-**This is not yet a live-execution claim.** `stage-recompile status=rejected` still persists for the *raw* stage
-because it lacks the live resource table and stops at table-dependent MUBUF pc31 — separate and pre-existing.
+**Rung 4 needs a human.** The one thing no agent here can produce is a visual milestone: a screenshot attempt
+returned the KDE lock screen, and was correctly quarantined as non-evidence rather than published. An unlocked,
+human-present session is required.
 
-Run the ~10-minute native-cadence route and confirm `0x3017460000` actually executes, then identify what is
-skipped next (#1554 reported three skipped compute programs; the preceding `0x3017450000` already executes 48
-times with zero skips after #1564). Useful instrumentation, pinned by reading the source rather than guessing:
-`[compute] skip unsupported program` is ungated and deduped per program, so its **absence proves zero skips**;
-`[compute] execute submit=…` needs the targeted `PROSPER_COMPUTELOG_CODE=<addr>` rather than blanket
-`PROSPER_COMPUTELOG`, which would flood ~13k submits and distort a realtime route.
-
-Note `RecompileCoverage` keeps `table_dependent` in a **separate bucket** from `unsupported` by design, so the
-`generic-coverage` line was structurally immune to the `shader_inspect` defect described above. Prefer the live
-path's own rejection reasons (`[recompile-reject] pc=… op=0x…` under `PROSPER_DBG`) over any offline verdict.
+The remaining lead is narrow and **not diagnosed**: for the single failing dispatch the realized resource table
+is **byte-identical** to succeeding ones, yet `[compute-cfg]` reports `branches=2` on failure and `branches=1` on
+success with the same `hash4k`. Recorded on #1581 as a lead. Severity is low — one dropped dispatch in 763,
+self-recovering, visible impact unmeasured — so **do not spend a lane on it** until something visible is
+attributed to it.
 
 ## Lane D: Alex Kidd in Miracle World DX (PPSA02664)
 
