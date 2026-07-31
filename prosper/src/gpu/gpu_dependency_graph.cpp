@@ -51,7 +51,8 @@ void append_accesses(const ShaderResourceTable* table, const char* stage,
         const uint64_t size = resource_size(resource);
         if (!resource.gpu_addr || !size || resource.cls == ResourceClass::Sampler) continue;
         accesses.push_back({resource.gpu_addr, size, resource.width, resource.height,
-                            resource.binding, resource.cls, stage});
+                            resource.binding, resource.cls, stage, resource.format,
+                            resource.num_components, resource.srgb});
     }
 }
 
@@ -70,7 +71,8 @@ void append_compute_accesses(const ComputeItem& compute,
             if (!resource->gpu_addr || !size) continue;
             if (descriptor.readable)
                 reads.push_back({resource->gpu_addr, size, resource->width, resource->height,
-                                 resource->binding, resource->cls, "cs"});
+                                 resource->binding, resource->cls, "cs", resource->format,
+                                 resource->num_components, resource->srgb});
             if (descriptor.writable)
                 writes.push_back({0, resource->gpu_addr, size, resource->width,
                                   resource->height,
@@ -88,6 +90,27 @@ void append_compute_accesses(const ComputeItem& compute,
 }
 
 } // namespace
+
+bool gpu_dependency_rtt_seed_matches(const GpuDependencyAccess& access,
+                                     const GpuCaptureRttSeed& seed) {
+    if (!access.addr || !access.width || !access.height || access.srgb ||
+        seed.guest_addr != access.addr || seed.width != access.width ||
+        seed.height != access.height)
+        return false;
+    switch (seed.format) {
+        case GpuCaptureColorFormat::Rgba8Unorm:
+            return access.format == DataFormat::Unorm8 && access.num_components == 4;
+        case GpuCaptureColorFormat::Rgba16Float:
+            return access.format == DataFormat::Float16 && access.num_components == 4;
+        case GpuCaptureColorFormat::R11G11B10Float:
+            return access.format == DataFormat::Float10_11_11 && access.num_components == 3;
+        case GpuCaptureColorFormat::R8Unorm:
+            return access.format == DataFormat::Unorm8 && access.num_components == 1;
+        case GpuCaptureColorFormat::R32Uint:
+            return access.format == DataFormat::Uint32 && access.num_components == 1;
+    }
+    return false;
+}
 
 bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
                                 GpuDependencyGraph& graph, std::string& error) {
@@ -160,7 +183,14 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
             if (producer == writers.rend()) {
                 auto leaf = std::find_if(graph.external_leaves.begin(), graph.external_leaves.end(),
                     [&](const GpuDependencyLeaf& candidate) {
-                        return candidate.access.addr == access.addr && candidate.access.size == access.size;
+                        return candidate.access.addr == access.addr &&
+                               candidate.access.size == access.size &&
+                               candidate.access.width == access.width &&
+                               candidate.access.height == access.height &&
+                               candidate.access.resource_class == access.resource_class &&
+                               candidate.access.format == access.format &&
+                               candidate.access.num_components == access.num_components &&
+                               candidate.access.srgb == access.srgb;
                     });
                 if (leaf == graph.external_leaves.end())
                     graph.external_leaves.push_back({access, {static_cast<uint32_t>(operation_index)}, UINT32_MAX});

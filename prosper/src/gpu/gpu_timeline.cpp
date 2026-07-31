@@ -37,7 +37,7 @@ namespace {
 
 constexpr uint8_t kFileMagic[8] = {'P', 'R', 'G', 'T', 'L', 'N', '\0', '\0'};
 constexpr uint8_t kRecordMagic[4] = {'T', 'L', 'R', 'C'};
-constexpr uint32_t kVersion = 8;
+constexpr uint32_t kVersion = 9;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint32_t kMaxPayloadBytes = 1u << 20;
 constexpr uint32_t kFlushInterval = 256;
@@ -270,6 +270,17 @@ struct RuntimeDetailRequest {
     std::atomic<bool> predecessor_failed{false};
     bool bundle_start_reached = false;
     bool after_compute_seen = false;
+    std::atomic<uint64_t> phase_observation_submits{0};
+    std::atomic<uint64_t> phase_dispatches_scanned{0};
+    std::atomic<uint64_t> prearm_history_submits_skipped{0};
+    std::atomic<uint64_t> prearm_history_draws_skipped{0};
+    std::atomic<uint64_t> prearm_bundle_submits_skipped{0};
+    std::atomic<uint64_t> history_submits_recorded{0};
+    std::atomic<uint64_t> bundle_submits_captured{0};
+    std::atomic<uint64_t> detail_submits_captured{0};
+    std::atomic<uint64_t> bundle_provenance_failures{0};
+    std::atomic<uint64_t> history_lower_bound_submit_no{0};
+    std::atomic<bool> history_phase_bounded{false};
 
     RuntimeDetailRequest() {
         const char* path_env = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE");
@@ -581,9 +592,12 @@ struct RuntimeProducerHistory {
     uint64_t dropped_submits = 0;
     std::unordered_map<RuntimeTargetKey, RuntimeTargetAggregate, RuntimeTargetKeyHash> lifetimes;
     bool lifetime_truncated = false;
+    uint64_t lower_bound_submit_no = 0;
+    bool phase_bounded = false;
 
     RuntimeProducerHistory() {
-        enabled = runtime_detail_request().valid;
+        const RuntimeDetailRequest& request = runtime_detail_request();
+        enabled = request.valid && !request.select_after_compute_program;
         if (const char* value = std::getenv("PROSPER_GPU_TIMELINE_HISTORY")) {
             char* end = nullptr;
             const uint64_t parsed = std::strtoull(value, &end, 0);
@@ -593,6 +607,7 @@ struct RuntimeProducerHistory {
 
     void remember(const GpuState& state, uint64_t submit_no) {
         if (!enabled) return;
+        runtime_detail_request().history_submits_recorded.fetch_add(1, std::memory_order_relaxed);
         if (!first_submit_no) first_submit_no = submit_no;
         std::vector<RuntimeTargetWrite> writes;
         writes.reserve(state.draws.size() * kColorTargetCount);
@@ -638,24 +653,35 @@ struct RuntimeProducerHistory {
         while (submits.size() > capacity) { submits.pop_front(); ++dropped_submits; }
     }
 
-    const RuntimeTargetWrite* latest_overlap(uint64_t addr, uint64_t size) const {
-        auto end = [](uint64_t base, uint64_t bytes) {
-            return bytes > UINT64_MAX - base ? UINT64_MAX : base + bytes;
-        };
+    void begin_phase(uint64_t submit_no) {
+        submits.clear();
+        lifetimes.clear();
+        first_submit_no = 0;
+        dropped_submits = 0;
+        lifetime_truncated = false;
+        lower_bound_submit_no = submit_no;
+        phase_bounded = true;
+        enabled = true;
+    }
+
+    const RuntimeTargetWrite* latest_image(uint64_t addr, uint32_t width,
+                                           uint32_t height) const {
         for (auto submit = submits.rbegin(); submit != submits.rend(); ++submit)
             for (auto write = submit->rbegin(); write != submit->rend(); ++write)
-                if (addr < end(write->addr, write->size) && write->addr < end(addr, size))
+                if (write->addr == addr && (!width || write->width == width) &&
+                    (!height || write->height == height))
                     return &*write;
         return nullptr;
     }
 
-    RuntimeTargetLifetime lifetime_overlap(uint64_t addr, uint64_t size) const {
-        auto end = [](uint64_t base, uint64_t bytes) {
-            return bytes > UINT64_MAX - base ? UINT64_MAX : base + bytes;
-        };
+    RuntimeTargetLifetime lifetime_image(uint64_t addr, uint32_t width,
+                                         uint32_t height) const {
         RuntimeTargetLifetime lifetime;
         for (const auto& [key, aggregate] : lifetimes) {
-            if (addr >= end(key.addr, key.size) || key.addr >= end(addr, size)) continue;
+            (void)key;
+            if (aggregate.last.addr != addr || (width && aggregate.last.width != width) ||
+                (height && aggregate.last.height != height))
+                continue;
             if (!lifetime.first || aggregate.first.submit_no < lifetime.first->submit_no ||
                 (aggregate.first.submit_no == lifetime.first->submit_no &&
                  aggregate.first.command_order < lifetime.first->command_order))
@@ -688,6 +714,7 @@ struct RuntimeCaptureBundle {
     std::chrono::steady_clock::time_point started_at;
     uint64_t captured_resource_bytes = 0;
     uint64_t captured_submit_count = 0;
+    GpuTimelineBundleProvenanceState provenance;
 };
 
 RuntimeCaptureBundle& runtime_capture_bundle() {
@@ -695,27 +722,86 @@ RuntimeCaptureBundle& runtime_capture_bundle() {
     return state;
 }
 
+void reset_runtime_capture_bundle() {
+    runtime_capture_bundle() = {};
+}
+
+GpuTimelineProducerProvenance runtime_image_provenance(
+    const GpuDependencyAccess& access, const GpuCaptureFile& capture,
+    const RuntimeProducerHistory& history) {
+    if (history.latest_image(access.addr, access.width, access.height))
+        return GpuTimelineProducerProvenance::ProducerHistory;
+    if (std::any_of(capture.rtt_seeds.begin(), capture.rtt_seeds.end(),
+                    [&](const GpuCaptureRttSeed& seed) {
+                        return gpu_dependency_rtt_seed_matches(access, seed);
+                    }))
+        return GpuTimelineProducerProvenance::ExactRttSeed;
+    return history.phase_bounded
+        ? GpuTimelineProducerProvenance::PhaseHistoryBounded
+        : GpuTimelineProducerProvenance::Unknown;
+}
+
+bool observe_runtime_bundle_provenance(const GpuCaptureFile& capture,
+                                       const RuntimeProducerHistory& history,
+                                       GpuTimelineBundleProvenanceState& provenance,
+                                       uint64_t submit_no, std::string& error) {
+    GpuReplayFrame replay;
+    GpuDependencyGraph graph;
+    if (!materialize_gpu_replay(capture, replay, error) ||
+        !build_gpu_dependency_graph(replay, graph, error))
+        return false;
+    for (const auto& leaf : graph.external_leaves) {
+        if (leaf.access.resource_class != ResourceClass::Texture &&
+            leaf.access.resource_class != ResourceClass::StorageImage)
+            continue;
+        gpu_timeline_observe_bundle_provenance(
+            provenance, submit_no,
+            runtime_image_provenance(leaf.access, capture, history),
+            leaf.first_future_writer);
+    }
+    return true;
+}
+
+enum class RuntimeCapturePhaseObservation { Ready, Waiting, ArmedThisSubmit };
+
+RuntimeCapturePhaseObservation observe_runtime_capture_phase(RuntimeDetailRequest& request,
+                                                             const GpuState& state,
+                                                             uint64_t submit_no) {
+    if (!request.select_after_compute_program || request.after_compute_seen)
+        return RuntimeCapturePhaseObservation::Ready;
+    request.phase_observation_submits.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& dispatch : state.dispatches) {
+        request.phase_dispatches_scanned.fetch_add(1, std::memory_order_relaxed);
+        if (compute_dispatch_code_addr(state, dispatch) != request.select_after_compute_program)
+            continue;
+        request.after_compute_submit_no = submit_no;
+        request.after_compute_seen = true;
+        std::fprintf(stderr,
+                     "[timeline] capture after-compute gate armed submit=%llu program=0x%llx "
+                     "observed-submits=%llu dispatches-scanned=%llu history-submits-skipped=%llu "
+                     "history-draws-skipped=%llu bundle-submits-skipped=%llu\n",
+                     static_cast<unsigned long long>(submit_no),
+                     static_cast<unsigned long long>(request.select_after_compute_program),
+                     static_cast<unsigned long long>(
+                         request.phase_observation_submits.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(
+                         request.phase_dispatches_scanned.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(
+                         request.prearm_history_submits_skipped.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(
+                         request.prearm_history_draws_skipped.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(
+                         request.prearm_bundle_submits_skipped.load(std::memory_order_relaxed)));
+        return RuntimeCapturePhaseObservation::ArmedThisSubmit;
+    }
+    return RuntimeCapturePhaseObservation::Waiting;
+}
+
 bool runtime_capture_endpoint_matches(RuntimeDetailRequest& request,
                                       const GpuTimelineSubmit& submit,
                                       const GpuState& state) {
     const uint64_t submit_no = submit.submit_no;
     if (request.select_after_compute_program) {
-        if (!request.after_compute_seen) {
-            for (const auto& dispatch : state.dispatches) {
-                if (compute_dispatch_code_addr(state, dispatch) !=
-                    request.select_after_compute_program)
-                    continue;
-                request.after_compute_submit_no = submit_no;
-                request.after_compute_seen = true;
-                std::fprintf(stderr,
-                             "[timeline] capture after-compute gate armed submit=%llu "
-                             "program=0x%llx\n",
-                             static_cast<unsigned long long>(submit_no),
-                             static_cast<unsigned long long>(
-                                 request.select_after_compute_program));
-                break;
-            }
-        }
         // The phase program's submit only arms the request. Even if it also satisfies every
         // endpoint predicate, capture begins with a strictly later submit.
         if (!request.after_compute_seen ||
@@ -891,6 +977,13 @@ GpuCaptureMetadata runtime_capture_metadata(uint64_t submit_no) {
     metadata.title_id = env_or_empty("PROSPER_CAPTURE_TITLE");
     metadata.input_route = env_or_empty("PROSPER_PAD_SCRIPT");
     metadata.savedata_dir = env_or_empty("PROSPER_SAVEDATA_DIR");
+    RuntimeDetailRequest& request = runtime_detail_request();
+    const uint64_t history_lower_bound =
+        request.history_lower_bound_submit_no.load(std::memory_order_relaxed);
+    if (request.history_phase_bounded.load(std::memory_order_relaxed))
+        metadata.renderer_env.emplace_back(
+            "PROSPER_CAPTURE_HISTORY_LOWER_BOUND_SUBMIT", std::to_string(history_lower_bound));
+    annotate_gpu_capture_save_roots(metadata);
     annotate_gpu_capture_scanout(metadata);
     return metadata;
 }
@@ -925,6 +1018,49 @@ void log_capture_detail(const GpuTimelineDetail& detail) {
 }
 
 } // namespace
+
+GpuTimelineCaptureCounters gpu_timeline_capture_counters() {
+    const RuntimeDetailRequest& request = runtime_detail_request();
+    GpuTimelineCaptureCounters counters;
+    counters.phase_observation_submits =
+        request.phase_observation_submits.load(std::memory_order_relaxed);
+    counters.phase_dispatches_scanned =
+        request.phase_dispatches_scanned.load(std::memory_order_relaxed);
+    counters.prearm_history_submits_skipped =
+        request.prearm_history_submits_skipped.load(std::memory_order_relaxed);
+    counters.prearm_history_draws_skipped =
+        request.prearm_history_draws_skipped.load(std::memory_order_relaxed);
+    counters.prearm_bundle_submits_skipped =
+        request.prearm_bundle_submits_skipped.load(std::memory_order_relaxed);
+    counters.history_submits_recorded =
+        request.history_submits_recorded.load(std::memory_order_relaxed);
+    counters.bundle_submits_captured =
+        request.bundle_submits_captured.load(std::memory_order_relaxed);
+    counters.detail_submits_captured =
+        request.detail_submits_captured.load(std::memory_order_relaxed);
+    counters.bundle_provenance_failures =
+        request.bundle_provenance_failures.load(std::memory_order_relaxed);
+    counters.history_lower_bound_submit_no =
+        request.history_lower_bound_submit_no.load(std::memory_order_relaxed);
+    counters.history_phase_bounded =
+        request.history_phase_bounded.load(std::memory_order_relaxed);
+    return counters;
+}
+
+bool gpu_timeline_bundle_provenance_complete(GpuTimelineProducerProvenance provenance,
+                                             uint32_t future_writer_operation) {
+    return future_writer_operation == UINT32_MAX ||
+           provenance != GpuTimelineProducerProvenance::PhaseHistoryBounded;
+}
+
+void gpu_timeline_observe_bundle_provenance(
+    GpuTimelineBundleProvenanceState& state, uint64_t submit_no,
+    GpuTimelineProducerProvenance provenance, uint32_t future_writer_operation) {
+    if (gpu_timeline_bundle_provenance_complete(provenance, future_writer_operation)) return;
+    if (state.complete) state.first_incomplete_submit_no = submit_no;
+    state.complete = false;
+    ++state.bounded_unknown_leaf_count;
+}
 
 struct GpuTimelineWriter::Impl {
     FILE* file = nullptr;
@@ -1126,6 +1262,8 @@ bool GpuTimelineWriter::append_producer(const GpuTimelineProducer& producer, std
     payload.u32(producer.first_color_control_mode);
     payload.u32(producer.first_target_mask);
     payload.u32(producer.first_color_format);
+    payload.u64(producer.history_lower_bound_submit_no);
+    payload.u32(static_cast<uint32_t>(producer.provenance));
     return impl_->append(RecordType::Producer, payload, error);
 }
 
@@ -1404,6 +1542,18 @@ bool read_gpu_timeline(const std::string& path, GpuTimelineFile& timeline, std::
                 producer.lifetime_truncated = lifetime_truncated != 0;
                 producer.history_window_truncated = window_truncated != 0;
                 producer.first_color_has_clear = has_clear != 0;
+            }
+            if (version >= 9) {
+                uint32_t provenance = 0;
+                if (!p.u64(producer.history_lower_bound_submit_no) || !p.u32(provenance) ||
+                    provenance > static_cast<uint32_t>(
+                        GpuTimelineProducerProvenance::PhaseHistoryBounded)) {
+                    error = "invalid timeline producer provenance record";
+                    return false;
+                }
+                producer.provenance = static_cast<GpuTimelineProducerProvenance>(provenance);
+            } else if (producer.resolved) {
+                producer.provenance = GpuTimelineProducerProvenance::ProducerHistory;
             }
             if (p.left) { error = "invalid timeline producer record size"; return false; }
             timeline.producers.push_back(std::move(producer));
@@ -1871,6 +2021,27 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
 
     RuntimeDetailRequest& request = runtime_detail_request();
     RuntimeProducerHistory& history = runtime_producer_history();
+    const RuntimeCapturePhaseObservation phase = request.valid
+        ? observe_runtime_capture_phase(request, state, submit_no)
+        : RuntimeCapturePhaseObservation::Ready;
+    if (phase == RuntimeCapturePhaseObservation::Waiting) {
+        request.prearm_history_submits_skipped.fetch_add(1, std::memory_order_relaxed);
+        request.prearm_history_draws_skipped.fetch_add(state.draws.size(),
+                                                       std::memory_order_relaxed);
+        if (!request.bundle_path.empty())
+            request.prearm_bundle_submits_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (phase == RuntimeCapturePhaseObservation::ArmedThisSubmit) {
+        history.begin_phase(submit_no);
+        request.history_lower_bound_submit_no.store(submit_no, std::memory_order_relaxed);
+        request.history_phase_bounded.store(true, std::memory_order_relaxed);
+        reset_runtime_capture_bundle();
+        // A bundle-start target observed before the semantic phase is not a valid post-phase
+        // boundary. Re-evaluate the arming submit below so it can be retained when it is the first
+        // valid start and producer.
+        request.bundle_start_reached = false;
+    }
     if (request.valid && request.bundle_start_target_width && !request.bundle_start_reached &&
         runtime_submit_has_target(state, request.bundle_start_target_width,
                                   request.bundle_start_target_height,
@@ -1902,16 +2073,36 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                                              metadata, predecessor, error)
             : capture_gpustate_submit(state, submit_no, metadata.width, metadata.height,
                                       metadata, predecessor, error);
-        if (!captured ||
+        RuntimeCaptureBundle& bundle_state = runtime_capture_bundle();
+        const bool provenance_was_complete = bundle_state.provenance.complete;
+        if (captured && history.phase_bounded) {
+            std::string provenance_error;
+            if (!observe_runtime_bundle_provenance(
+                    predecessor, history, bundle_state.provenance, submit_no,
+                    provenance_error)) {
+                bundle_state.provenance.complete = false;
+                bundle_state.provenance.graph_unavailable = true;
+                bundle_state.provenance.first_incomplete_submit_no = submit_no;
+                error = "dependency graph unavailable for phase-bounded bundle submit: " +
+                        provenance_error;
+            } else if (!bundle_state.provenance.complete) {
+                error = "phase-bounded producer history leaves temporal image dependencies "
+                        "unresolved in bundle submit " + std::to_string(
+                            bundle_state.provenance.first_incomplete_submit_no);
+            }
+            if (provenance_was_complete && !bundle_state.provenance.complete)
+                request.bundle_provenance_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!captured || !bundle_state.provenance.complete ||
             !append_runtime_capture_bundle(predecessor, request.bundle_max_unique_bytes, error)) {
-            runtime_capture_bundle().failed = !runtime_capture_bundle().budget_exhausted;
+            bundle_state.failed = !bundle_state.budget_exhausted;
             std::fprintf(stderr, "[timeline] bundle submit %llu capture failed: %s\n",
                          static_cast<unsigned long long>(submit_no), error.c_str());
         } else {
             if (request.semantic_selector)
                 trim_runtime_capture_bundle(request.bundle_depth - 1);
-            RuntimeCaptureBundle& bundle_state = runtime_capture_bundle();
             ++bundle_state.captured_submit_count;
+            request.bundle_submits_captured.fetch_add(1, std::memory_order_relaxed);
             if (request.bundle_checkpoint_interval &&
                 !(bundle_state.captured_submit_count % request.bundle_checkpoint_interval)) {
                 if (!write_gpu_capture_bundle(request.bundle_path, bundle_state.bundle, error)) {
@@ -1969,6 +2160,7 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
 
     GpuCaptureFile capture;
     if (!request.bundle_path.empty()) begin_runtime_capture_bundle();
+    request.detail_submits_captured.fetch_add(1, std::memory_order_relaxed);
     const auto capture_started = std::chrono::steady_clock::now();
     std::fprintf(stderr, "[timeline] submit %llu detailed capture starting: semantic-draws=%zu "
                          "semantic-dispatches=%zu metadata-only=%s\n",
@@ -2033,6 +2225,10 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                  static_cast<unsigned long long>(total_ms), request.path.c_str());
     GpuReplayFrame replay;
     GpuDependencyGraph graph;
+    RuntimeCaptureBundle* requested_bundle = request.bundle_path.empty()
+        ? nullptr : &runtime_capture_bundle();
+    const bool endpoint_provenance_was_complete =
+        !requested_bundle || requested_bundle->provenance.complete;
     if (materialize_gpu_replay(capture, replay, error) &&
         build_gpu_dependency_graph(replay, graph, error)) {
         for (const auto& leaf : graph.external_leaves) {
@@ -2046,9 +2242,10 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
             producer.resource_size = leaf.access.size;
             producer.resource_width = leaf.access.width;
             producer.resource_height = leaf.access.height;
-            const RuntimeTargetLifetime lifetime = history.lifetime_overlap(
-                leaf.access.addr, leaf.access.size);
+            const RuntimeTargetLifetime lifetime = history.lifetime_image(
+                leaf.access.addr, leaf.access.width, leaf.access.height);
             producer.history_window_first_submit_no = history.window_first_submit_no();
+            producer.history_lower_bound_submit_no = history.lower_bound_submit_no;
             producer.lifetime_truncated = history.lifetime_truncated;
             producer.history_window_truncated = history.dropped_submits != 0;
             producer.history_write_count = lifetime.write_count;
@@ -2068,7 +2265,9 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                 producer.first_color_format = lifetime.first->color_format;
             }
             const RuntimeTargetWrite* match = lifetime.last
-                ? lifetime.last : history.latest_overlap(leaf.access.addr, leaf.access.size);
+                ? lifetime.last : history.latest_image(
+                    leaf.access.addr, leaf.access.width, leaf.access.height);
+            producer.provenance = runtime_image_provenance(leaf.access, capture, history);
             if (match) {
                 producer.resolved = true;
                 producer.producer_submit_no = match->submit_no;
@@ -2078,15 +2277,29 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                 producer.producer_width = match->width;
                 producer.producer_height = match->height;
             }
+            if (requested_bundle)
+                gpu_timeline_observe_bundle_provenance(
+                    requested_bundle->provenance, submit_no, producer.provenance,
+                    leaf.first_future_writer);
             if (!writer->append_producer(producer, error)) {
                 runtime_recorder().mark_failed(error);
                 history.remember(state, submit_no);
                 return;
             }
+            const char* provenance = "unknown";
+            switch (producer.provenance) {
+                case GpuTimelineProducerProvenance::ProducerHistory:
+                    provenance = "producer-history"; break;
+                case GpuTimelineProducerProvenance::ExactRttSeed:
+                    provenance = "exact-rtt-seed"; break;
+                case GpuTimelineProducerProvenance::PhaseHistoryBounded:
+                    provenance = "phase-history-bounded/unknown"; break;
+                case GpuTimelineProducerProvenance::Unknown: break;
+            }
             std::fprintf(stderr, "[timeline] temporal resource 0x%llx/%ux%u op=%u -> %s",
                          static_cast<unsigned long long>(producer.resource_addr),
                          producer.resource_width, producer.resource_height,
-                         producer.consumer_operation, producer.resolved ? "producer" : "unresolved");
+                         producer.consumer_operation, provenance);
             if (producer.resolved)
                 std::fprintf(stderr, " submit=%llu draw=%llu order=%llu target=0x%llx/%ux%u",
                              static_cast<unsigned long long>(producer.producer_submit_no),
@@ -2107,13 +2320,26 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                              producer.first_color_has_clear ? "programmed" : "absent",
                              producer.first_color_control_mode, producer.first_target_mask,
                              producer.first_color_format);
+            if (history.phase_bounded)
+                std::fprintf(stderr, " history-lower-bound=%llu",
+                             static_cast<unsigned long long>(
+                                 producer.history_lower_bound_submit_no));
             std::fprintf(stderr, "\n");
         }
     } else {
         std::fprintf(stderr, "[timeline] dependency graph failed for submit %llu: %s\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
+        if (history.phase_bounded && requested_bundle) {
+            if (requested_bundle->provenance.complete)
+                requested_bundle->provenance.first_incomplete_submit_no = submit_no;
+            requested_bundle->provenance.complete = false;
+            requested_bundle->provenance.graph_unavailable = true;
+        }
         error.clear();
     }
+    if (requested_bundle && endpoint_provenance_was_complete &&
+        !requested_bundle->provenance.complete)
+        request.bundle_provenance_failures.fetch_add(1, std::memory_order_relaxed);
     const bool predecessor_requested = !request.semantic_selector &&
         !request.predecessor_path.empty() && request.submit_no > 1;
     bool requested_artifacts_written = !predecessor_requested ||
@@ -2121,7 +2347,22 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     if (!request.bundle_path.empty()) {
         RuntimeCaptureBundle& state = runtime_capture_bundle();
         GpuCaptureBundle& bundle = state.bundle;
-        if (state.failed) {
+        if (!state.provenance.complete) {
+            state.failed = true;
+            if (state.provenance.bounded_unknown_leaf_count)
+                error = "phase-bounded bundle submit " + std::to_string(
+                    state.provenance.first_incomplete_submit_no) + " has " +
+                    std::to_string(state.provenance.bounded_unknown_leaf_count) +
+                    " unresolved temporal image dependency/dependencies";
+            else
+                error = "phase-bounded dependency graph unavailable at bundle submit " +
+                    std::to_string(state.provenance.first_incomplete_submit_no) +
+                    "; temporal closure is unknown";
+            std::fprintf(stderr,
+                         "[timeline] capture bundle finalization refused: %s; standalone capsule "
+                         "remains available at %s\n",
+                         error.c_str(), request.path.c_str());
+        } else if (state.failed) {
             error = "capture bundle has a failed or missing predecessor submit";
         } else if (state.budget_exhausted) {
             error = "capture bundle unique-byte budget was exhausted before the selected submit";
@@ -2133,6 +2374,7 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
             requested_artifacts_written = false;
             std::fprintf(stderr, "[timeline] capture bundle write failed: %s\n", error.c_str());
         } else {
+            request.bundle_submits_captured.fetch_add(1, std::memory_order_relaxed);
             const uint64_t unique_bytes = gpu_capture_bundle_unique_bytes(bundle);
             const GpuCaptureBundleStats stats = gpu_capture_bundle_stats(bundle);
             const uint64_t capture_ms = state.started ? static_cast<uint64_t>(

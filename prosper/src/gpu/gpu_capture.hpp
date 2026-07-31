@@ -25,10 +25,16 @@ struct GpuCaptureMetadata {
 
 inline constexpr const char* kGpuReplayScanoutAddressEnv =
     "PROSPER_GPU_REPLAY_SCANOUT_ADDR";
+inline constexpr const char* kGpuCaptureSave0Env = "PROSPER_SAVE0";
+inline constexpr const char* kGpuCaptureDefaultSave0Root = "/tmp/prosper-savedata0";
 
 // Preserve the exact registered front-buffer identity as replay metadata. The replay process has no
 // live VideoOut registry, so extent alone cannot distinguish scanout from same-sized intermediates.
 void annotate_gpu_capture_scanout(GpuCaptureMetadata& metadata);
+
+// Capture the effective host root behind guest /savedata0. This is distinct from savedata_dir,
+// which describes the SaveDataMemory API, and is cached independently by the HLE runtime.
+void annotate_gpu_capture_save_roots(GpuCaptureMetadata& metadata);
 
 // Parse the replay-only front-buffer identity. Bundle replay updates this value at each captured
 // submit, so consumers must not cache the result across renderer callbacks.

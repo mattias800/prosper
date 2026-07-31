@@ -97,9 +97,12 @@ static int run_selector_env_child(const std::string& mode) {
         ("prosper-gpu-timeline-selector-" + mode + "-" + std::to_string(nonce));
     const std::string timeline_path = base.string() + ".prgtl";
     const std::string capture_path = base.string() + ".prgcap";
+    const std::string bundle_path = base.string() + ".prgbundle";
+    bool intermediate_ok = true;
     set_test_env("PROSPER_GPU_TIMELINE", timeline_path);
     set_test_env("PROSPER_GPU_TIMELINE_CAPTURE", capture_path);
-    set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1");
+    if (mode != "after-work")
+        set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1");
 
     if (mode == "invalid") {
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "1");
@@ -209,6 +212,56 @@ static int run_selector_env_child(const std::string& mode) {
             begin_gpu_timeline_submit(submit_no);
             record_gpu_timeline_submit(submits[i], submit_no);
         }
+    } else if (mode == "after-work") {
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "1");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM", "642x362");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM",
+                     program_address(kSelectorCompute));
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE", bundle_path);
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_DEPTH", "2");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM", "642x362");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DRAW_INDEX", "0:0");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_CHECKPOINT_EVERY", "1");
+
+        const auto exact = selector_draw_state(642, 362, kSelectorVs, kSelectorPs);
+        begin_gpu_timeline_submit(1);
+        record_gpu_timeline_submit(selector_submit({exact}, 10, kWrongSelectorCompute), 1);
+        begin_gpu_timeline_submit(2);
+        record_gpu_timeline_submit(selector_submit({exact}, 20), 2);
+        GpuTimelineCaptureCounters counters = gpu_timeline_capture_counters();
+        intermediate_ok = counters.phase_observation_submits == 2 &&
+            counters.phase_dispatches_scanned == 1 &&
+            counters.prearm_history_submits_skipped == 2 &&
+            counters.prearm_history_draws_skipped == 2 &&
+            counters.prearm_bundle_submits_skipped == 2 &&
+            counters.history_submits_recorded == 0 &&
+            counters.bundle_submits_captured == 0 &&
+            counters.detail_submits_captured == 0 &&
+            counters.bundle_provenance_failures == 0 &&
+            counters.history_lower_bound_submit_no == 0 &&
+            !counters.history_phase_bounded &&
+            !std::filesystem::exists(bundle_path) &&
+            !std::filesystem::exists(capture_path);
+
+        begin_gpu_timeline_submit(3);
+        record_gpu_timeline_submit(selector_submit({exact}, 30, kSelectorCompute), 3);
+        counters = gpu_timeline_capture_counters();
+        GpuCaptureBundle armed_bundle;
+        std::string armed_error;
+        intermediate_ok = intermediate_ok && counters.phase_observation_submits == 3 &&
+            counters.phase_dispatches_scanned == 2 &&
+            counters.prearm_history_submits_skipped == 2 &&
+            counters.history_submits_recorded == 1 &&
+            counters.bundle_submits_captured == 1 &&
+            counters.detail_submits_captured == 0 &&
+            counters.history_lower_bound_submit_no == 3 &&
+            counters.history_phase_bounded &&
+            read_gpu_capture_bundle(bundle_path, armed_bundle, armed_error) &&
+            armed_bundle.submits.size() == 1 &&
+            armed_bundle.submits[0].submit_index == 3;
+
+        begin_gpu_timeline_submit(4);
+        record_gpu_timeline_submit(selector_submit({exact}, 40), 4);
     } else if (mode == "after-submit-zero") {
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "1");
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM", "642x362");
@@ -255,15 +308,40 @@ static int run_selector_env_child(const std::string& mode) {
         ok = ok && timeline.submits.size() == 4 && timeline.details.size() == 1 &&
              timeline.details[0].submit_no == 4 &&
              read_gpu_capture(capture_path, capture, error) && capture.metadata.submit_index == 4;
+    } else if (mode == "after-work") {
+        GpuCaptureFile capture;
+        GpuCaptureBundle bundle;
+        const GpuTimelineCaptureCounters counters = gpu_timeline_capture_counters();
+        const auto lower_bound = [&](const auto& entry) {
+            return entry.first == "PROSPER_CAPTURE_HISTORY_LOWER_BOUND_SUBMIT" &&
+                   entry.second == "3";
+        };
+        ok = ok && intermediate_ok && timeline.submits.size() == 4 &&
+             timeline.details.size() == 2 && timeline.details[0].submit_no == 3 &&
+             timeline.details[1].submit_no == 4 && counters.history_submits_recorded == 2 &&
+             counters.bundle_submits_captured == 2 && counters.detail_submits_captured == 1 &&
+             counters.bundle_provenance_failures == 0 &&
+             read_gpu_capture(capture_path, capture, error) && capture.metadata.submit_index == 4 &&
+             std::any_of(capture.metadata.renderer_env.begin(), capture.metadata.renderer_env.end(),
+                         lower_bound) &&
+             read_gpu_capture_bundle(bundle_path, bundle, error) && bundle.submits.size() == 2 &&
+             bundle.submits[0].submit_index == 3 && bundle.submits[1].submit_index == 4;
     } else {
         GpuCaptureFile capture;
+        const auto zero_lower_bound = [&](const auto& entry) {
+            return entry.first == "PROSPER_CAPTURE_HISTORY_LOWER_BOUND_SUBMIT" &&
+                   entry.second == "0";
+        };
         ok = ok && timeline.submits.size() == 2 && timeline.details.size() == 1 &&
              timeline.details[0].submit_no == 1 &&
-             read_gpu_capture(capture_path, capture, error) && capture.metadata.submit_index == 1;
+             read_gpu_capture(capture_path, capture, error) && capture.metadata.submit_index == 1 &&
+             std::any_of(capture.metadata.renderer_env.begin(), capture.metadata.renderer_env.end(),
+                         zero_lower_bound);
     }
     std::error_code ec;
     std::filesystem::remove(timeline_path, ec);
     std::filesystem::remove(capture_path, ec);
+    std::filesystem::remove(bundle_path, ec);
     if (!ok) {
         std::fprintf(stderr, "selector child '%s' failed: %s\n", mode.c_str(), error.c_str());
         return 91;
@@ -285,6 +363,33 @@ int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--selector-child")
         return run_selector_env_child(argv[2]);
     std::printf("== test_gpu_timeline ==\n");
+    CHECK(!gpu_timeline_bundle_provenance_complete(
+              GpuTimelineProducerProvenance::PhaseHistoryBounded, 9),
+          "a temporal phase-bounded unknown makes requested bundle closure fail");
+    CHECK(gpu_timeline_bundle_provenance_complete(
+              GpuTimelineProducerProvenance::ExactRttSeed, 9) &&
+              gpu_timeline_bundle_provenance_complete(
+                  GpuTimelineProducerProvenance::ProducerHistory, 9),
+          "an exact live RTT seed or post-arm producer closes a temporal bundle dependency");
+    CHECK(gpu_timeline_bundle_provenance_complete(
+              GpuTimelineProducerProvenance::PhaseHistoryBounded, UINT32_MAX),
+          "a non-temporal guest image input does not require pre-phase producer history");
+    GpuTimelineBundleProvenanceState unresolved_arm;
+    gpu_timeline_observe_bundle_provenance(
+        unresolved_arm, 3, GpuTimelineProducerProvenance::PhaseHistoryBounded, 7);
+    gpu_timeline_observe_bundle_provenance(
+        unresolved_arm, 4, GpuTimelineProducerProvenance::ExactRttSeed, 8);
+    CHECK(!unresolved_arm.complete && unresolved_arm.first_incomplete_submit_no == 3 &&
+              unresolved_arm.bounded_unknown_leaf_count == 1,
+          "a closed endpoint cannot repair an unresolved phase-arm bundle constituent");
+    GpuTimelineBundleProvenanceState closed_constituents;
+    gpu_timeline_observe_bundle_provenance(
+        closed_constituents, 3, GpuTimelineProducerProvenance::ExactRttSeed, 7);
+    gpu_timeline_observe_bundle_provenance(
+        closed_constituents, 4, GpuTimelineProducerProvenance::ProducerHistory, 8);
+    CHECK(closed_constituents.complete &&
+              closed_constituents.bounded_unknown_leaf_count == 0,
+          "exactly seeded and post-arm-produced constituents keep the whole bundle closed");
     CHECK(run_self(argv[0], "invalid") == 0,
           "malformed graphics-program selector is rejected without capturing");
     CHECK(run_self(argv[0], "after-invalid") == 0,
@@ -299,6 +404,9 @@ int main(int argc, char** argv) {
           "graphics conjunction once");
     CHECK(run_self(argv[0], "after-bound") == 0,
           "cross-submit compute gate may arm before the independent endpoint lower bound");
+    CHECK(run_self(argv[0], "after-work") == 0,
+          "phase-gated capture performs no history or full bundle work before arming, then retains "
+          "the arm submit and a strictly later endpoint");
     CHECK(run_self(argv[0], "after-submit-zero") == 0,
           "cross-submit compute gate retains a submit-zero arm for a later submit-one capture");
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -367,12 +475,23 @@ int main(int argc, char** argv) {
     producer.history_first_submit_no = 2; producer.history_first_draw_index = 7;
     producer.history_first_command_order = 80; producer.history_write_count = 31;
     producer.history_submit_count = 8; producer.history_window_first_submit_no = 1;
+    producer.history_lower_bound_submit_no = 2;
+    producer.provenance = GpuTimelineProducerProvenance::ProducerHistory;
     producer.lifetime_truncated = true; producer.history_window_truncated = true;
     producer.first_color_has_clear = true; producer.first_color_clear_word0 = 0x11223344;
     producer.first_color_clear_word1 = 0x55667788; producer.first_color_control = 0x60;
     producer.first_color_control_mode = 6; producer.first_target_mask = 0xf;
     producer.first_color_format = 10;
     CHECK(writer.append_producer(producer, error), "writer appends a prior-producer identity");
+    GpuTimelineProducer bounded;
+    bounded.consumer_submit_no = 10; bounded.consumer_operation = 20;
+    bounded.future_writer_operation = 29; bounded.resource_addr = 0x900000;
+    bounded.resource_size = 642ull * 362 * 4; bounded.resource_width = 642;
+    bounded.resource_height = 362; bounded.history_window_first_submit_no = 7;
+    bounded.history_lower_bound_submit_no = 7;
+    bounded.provenance = GpuTimelineProducerProvenance::PhaseHistoryBounded;
+    CHECK(writer.append_producer(bounded, error),
+          "writer appends explicit phase-bounded unknown provenance");
     GpuTimelineSubmit second = first;
     second.submit_no = 11; second.draw_count = 4; second.dispatch_count = 0;
     second.target_spans[1].draw_count = 3;
@@ -386,12 +505,12 @@ int main(int argc, char** argv) {
           timeline.metadata.title_id == metadata.title_id &&
           timeline.metadata.input_route == metadata.input_route,
           "metadata round-trips");
-    CHECK(timeline.version == 8 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
-          timeline.details.size() == 1 && timeline.producers.size() == 1,
+    CHECK(timeline.version == 9 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
+          timeline.details.size() == 1 && timeline.producers.size() == 2,
           "version and record counts round-trip");
     CHECK(timeline.submits[0].sequence == 1 && timeline.presents[0].sequence == 2 &&
           timeline.details[0].sequence == 3 && timeline.producers[0].sequence == 4 &&
-          timeline.submits[1].sequence == 5,
+          timeline.producers[1].sequence == 5 && timeline.submits[1].sequence == 6,
           "global record ordering round-trips");
     CHECK(timeline.submits[0].color0_base == 0x12340000 &&
           timeline.submits[0].color0_width == 642 && timeline.submits[0].color0_height == 362,
@@ -448,12 +567,20 @@ int main(int argc, char** argv) {
           timeline.producers[0].resource_width == 642 &&
           timeline.producers[0].history_first_submit_no == 2 &&
           timeline.producers[0].history_write_count == 31 &&
+          timeline.producers[0].history_lower_bound_submit_no == 2 &&
+          timeline.producers[0].provenance ==
+              GpuTimelineProducerProvenance::ProducerHistory &&
           timeline.producers[0].first_writer_kind == GpuTimelineWriterKind::Graphics &&
           timeline.producers[0].lifetime_truncated &&
           timeline.producers[0].history_window_truncated &&
           timeline.producers[0].first_color_has_clear &&
           timeline.producers[0].first_color_clear_word1 == 0x55667788,
           "prior-producer resource and writer identities round-trip");
+    CHECK(!timeline.producers[1].resolved &&
+          timeline.producers[1].history_lower_bound_submit_no == 7 &&
+          timeline.producers[1].provenance ==
+              GpuTimelineProducerProvenance::PhaseHistoryBounded,
+          "phase-bounded unknown provenance remains fail-visible after round-trip");
 
     std::ifstream input(good, std::ios::binary);
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)), {});
@@ -463,7 +590,7 @@ int main(int argc, char** argv) {
     GpuTimelineFile partial;
     CHECK(read_gpu_timeline(truncated, partial, error), "reader recovers complete records from a truncated tail");
     CHECK(partial.truncated_tail && partial.submits.size() == 1 && partial.presents.size() == 1 &&
-          partial.details.size() == 1 && partial.producers.size() == 1,
+          partial.details.size() == 1 && partial.producers.size() == 2,
           "truncated final submit is ignored explicitly");
 
     std::vector<uint8_t> corrupt_bytes = bytes;

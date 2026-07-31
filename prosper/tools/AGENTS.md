@@ -169,12 +169,14 @@ After a translator change, use `gpu_replay --retry-failed-stage FAILURE:STAGE` f
 `--retry-failed-chain FAILURE` for a captured split vertex prolog/main pair. These offline paths reuse the exact
 captured resource table and report whether the current production recompiler now produces SPIR-V, without a
 guest boot or Vulkan replay.
-Timeline version 6 retains the version-5 sliding graphics-target window plus full-run aggregate lifetime metadata
+Timeline version 9 retains the version-5 sliding graphics-target window plus aggregate lifetime metadata
 when a detailed capture is requested. `PROSPER_GPU_TIMELINE_HISTORY=N` raises the window to at most 65536.
 Producer records identify the latest overlapping prior submit/draw/PM4 order, earliest observed graphics
 writer, write/submit counts, truncation, and raw first-writer clear/target state. Raw clear registers are
-provenance, not proof of an implicit hardware clear. The timeline intentionally retains no delayed pointers
-to mutable guest bytes.
+provenance, not proof of an implicit hardware clear. Version 9 also records an explicit producer-history lower
+bound and classifies each external image as producer-history, exact-RTT-seeded, generic unknown, or
+`phase-history-bounded/unknown`; the last state must never be treated as a proven initialization or replaced
+with synthetic zeroes. The timeline intentionally retains no delayed pointers to mutable guest bytes.
 Every current submit also records the v5 distinct DS plane/HTILE identities, raw view/format/size programming,
 target extents, and test/write/clear counts. `gpu_timeline FILE --depth-summary [WxH]` groups their full lifetimes.
 For a focused run, `PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM=WxH` adds guest depth/stencil/HTILE hashes and latest
@@ -236,9 +238,16 @@ conjunction, not evidence of a producer/consumer relationship.
 For a strict cross-submit phase gate, use
 `PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM=ADDR`. The exact program arms the runtime request even
 before the endpoint lower bound, its own submit is never eligible, and normal endpoint predicates are allowed
-only on a later submit at or after the bound. Zero/unset disables it. The pre-arm path scans only retained
-dispatch register snapshots; the request-local latch adds no compute realization, resource reads, allocation,
-or Vulkan work and is not dependency evidence.
+only on a later submit at or after the bound. Zero/unset disables it. Before the gate, the runtime writes only
+the compact timeline and scans retained dispatch register snapshots: producer history, bundle-start matching,
+bundle capture, resource reads, and Vulkan work remain disabled. The arming submit resets and begins the
+explicitly bounded producer/bundle window, so it is retained as a possible producer while the endpoint remains
+strictly later. The arm log includes observation/skip counters; detailed capsules record the history lower
+bound in their capture environment. Every constituent is checked before append/checkpoint; a requested bundle
+is latched failed when any constituent has a read-before-write image leaf with only
+`phase-history-bounded/unknown` provenance. The standalone endpoint capsule remains available for diagnosis.
+Exact live RTT seeds are accepted only when address, extent, and sampled format semantics agree. The phase
+latch is not dependency evidence.
 When the endpoint moves, predecessor manifests roll forward so the final bundle retains the latest requested
 depth; dictionary bytes observed by evicted manifests still count against the unique-byte budget.
 Per-target RTT is the normal renderer path. `PROSPER_RTT_SINGLE_TARGET=1` restores the obsolete flattened

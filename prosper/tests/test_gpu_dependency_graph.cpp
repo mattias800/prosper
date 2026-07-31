@@ -168,9 +168,30 @@ int main() {
     CHECK(build_gpu_dependency_graph(reflected_replay, reflected_graph, error) &&
               reflected_graph.external_leaves.size() == 1 &&
               reflected_graph.external_leaves[0].access.addr == reflected_src.gpu_addr &&
+              reflected_graph.external_leaves[0].access.format == DataFormat::Unorm8 &&
+              reflected_graph.external_leaves[0].access.num_components == 4 &&
               reflected_graph.external_leaves[0].first_future_writer == UINT32_MAX,
           "reflected compute graph keeps the read-only input and does not invent a temporal "
           "read of the write-only output");
+    GpuCaptureRttSeed exact_seed;
+    exact_seed.guest_addr = reflected_src.gpu_addr;
+    exact_seed.width = exact_seed.height = 1;
+    exact_seed.format = GpuCaptureColorFormat::Rgba8Unorm;
+    exact_seed.rgba.resize(4);
+    CHECK(gpu_dependency_rtt_seed_matches(reflected_graph.external_leaves[0].access, exact_seed),
+          "an exact live RTT address, extent, and format closes an image dependency");
+    GpuCaptureRttSeed wrong_extent = exact_seed;
+    wrong_extent.width = 2;
+    GpuCaptureRttSeed wrong_format = exact_seed;
+    wrong_format.format = GpuCaptureColorFormat::Rgba16Float;
+    GpuDependencyAccess srgb_access = reflected_graph.external_leaves[0].access;
+    srgb_access.srgb = true;
+    CHECK(!gpu_dependency_rtt_seed_matches(reflected_graph.external_leaves[0].access,
+                                           wrong_extent) &&
+              !gpu_dependency_rtt_seed_matches(reflected_graph.external_leaves[0].access,
+                                               wrong_format) &&
+              !gpu_dependency_rtt_seed_matches(srgb_access, exact_seed),
+          "address-only RTT matches cannot hide extent, format, or sRGB reinterpretation");
 
     GpuReplayFrame image_overlap_replay;
     DrawItem image_writer;

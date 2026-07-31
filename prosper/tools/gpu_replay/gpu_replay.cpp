@@ -2299,6 +2299,23 @@ int main(int argc, char** argv) {
                  replay.ds_seeds.size(),
                  replay.expected_output_valid ? "yes" : "no",
                  metadata_only ? "omitted" : "present");
+    const auto history_lower_bound = std::find_if(
+        m.renderer_env.begin(), m.renderer_env.end(), [](const auto& entry) {
+            return entry.first == "PROSPER_CAPTURE_HISTORY_LOWER_BOUND_SUBMIT";
+        });
+    if (history_lower_bound != m.renderer_env.end())
+        std::fprintf(stderr,
+                     "[gpureplay] producer history is phase-bounded at submit=%s; "
+                     "unseeded earlier temporal provenance is unknown\n",
+                     history_lower_bound->second.c_str());
+    const auto save0 = std::find_if(
+        m.renderer_env.begin(), m.renderer_env.end(), [](const auto& entry) {
+            return entry.first == prosper::gpu::kGpuCaptureSave0Env;
+        });
+    if (save0 != m.renderer_env.end() || !m.savedata_dir.empty())
+        std::fprintf(stderr, "[gpureplay] capture save roots: save0=%s savedata-memory=%s\n",
+                     save0 == m.renderer_env.end() ? "unknown" : save0->second.c_str(),
+                     m.savedata_dir.empty() ? "unknown" : m.savedata_dir.c_str());
     if (inspect) inspect_frame(replay);
     if (validate_only) return validate_frame(replay) ? 0 : 1;
     if (inspect_only) return 0;

@@ -127,6 +127,16 @@ enum class GpuTimelineWriterKind : uint32_t {
     WriteData = 4,
 };
 
+// How an external image input was made reproducible, or why its producer remains unknown. A phase-
+// bounded result is deliberately distinct from a generic miss: the capture only observed producers
+// at/after an explicit semantic gate and must not imply that no earlier renderer writer existed.
+enum class GpuTimelineProducerProvenance : uint32_t {
+    Unknown = 0,
+    ProducerHistory = 1,
+    ExactRttSeed = 2,
+    PhaseHistoryBounded = 3,
+};
+
 struct GpuTimelineProducer {
     uint64_t sequence = 0;
     uint64_t elapsed_ns = 0;
@@ -151,6 +161,8 @@ struct GpuTimelineProducer {
     uint64_t history_write_count = 0;
     uint64_t history_submit_count = 0;
     uint64_t history_window_first_submit_no = 0;
+    uint64_t history_lower_bound_submit_no = 0;
+    GpuTimelineProducerProvenance provenance = GpuTimelineProducerProvenance::Unknown;
     bool lifetime_truncated = false;
     bool history_window_truncated = false;
     bool first_color_has_clear = false;
@@ -161,6 +173,43 @@ struct GpuTimelineProducer {
     uint32_t first_target_mask = 0;
     uint32_t first_color_format = 0;
 };
+
+// Cheap runtime counters for semantic detailed-capture diagnostics and focused tests. The counters
+// distinguish compact phase observation from producer history and full submit materialization, so a
+// long boot can prove that an AFTER_COMPUTE gate remained lightweight before it armed.
+struct GpuTimelineCaptureCounters {
+    uint64_t phase_observation_submits = 0;
+    uint64_t phase_dispatches_scanned = 0;
+    uint64_t prearm_history_submits_skipped = 0;
+    uint64_t prearm_history_draws_skipped = 0;
+    uint64_t prearm_bundle_submits_skipped = 0;
+    uint64_t history_submits_recorded = 0;
+    uint64_t bundle_submits_captured = 0;
+    uint64_t detail_submits_captured = 0;
+    uint64_t bundle_provenance_failures = 0;
+    uint64_t history_lower_bound_submit_no = 0;
+    bool history_phase_bounded = false;
+};
+
+// A read-before-write image leaf is temporal. Phase-bounded unknown provenance cannot close that
+// dependency, so a requested bundle must remain an explicitly failed checkpoint instead of being
+// advertised as complete. Non-temporal inputs remain ordinary guest-memory resources.
+bool gpu_timeline_bundle_provenance_complete(GpuTimelineProducerProvenance provenance,
+                                             uint32_t future_writer_operation);
+
+// Bundle closure is cumulative across every retained submit. Once one constituent exposes a
+// phase-bounded temporal image with no seed/producer, a later closed endpoint cannot make the
+// earlier submit reproducible.
+struct GpuTimelineBundleProvenanceState {
+    bool complete = true;
+    bool graph_unavailable = false;
+    uint64_t first_incomplete_submit_no = 0;
+    uint64_t bounded_unknown_leaf_count = 0;
+};
+
+void gpu_timeline_observe_bundle_provenance(
+    GpuTimelineBundleProvenanceState& state, uint64_t submit_no,
+    GpuTimelineProducerProvenance provenance, uint32_t future_writer_operation);
 
 struct GpuTimelineFile {
     uint32_t version = 0;
@@ -195,6 +244,7 @@ private:
 bool read_gpu_timeline(const std::string& path, GpuTimelineFile& timeline, std::string& error);
 bool gpu_timeline_submit_matches(const GpuTimelineSubmit& submit,
                                  const GpuTimelineSelector& selector);
+GpuTimelineCaptureCounters gpu_timeline_capture_counters();
 
 // Runtime hooks. Inert unless PROSPER_GPU_TIMELINE=<path> is set. They record folded semantic state
 // before renderer sampling and never realize shaders, copy resources, or invoke Vulkan.
