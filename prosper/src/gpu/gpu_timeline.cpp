@@ -253,7 +253,11 @@ struct RuntimeDetailRequest {
     uint32_t select_max_draws = UINT32_MAX;
     uint32_t select_min_dispatches = 0;
     uint32_t select_max_dispatches = UINT32_MAX;
+    uint64_t select_vertex_program = 0;
+    uint64_t select_fragment_program = 0;
     uint64_t select_compute_program = 0;
+    uint64_t select_after_compute_program = 0;
+    uint64_t after_compute_submit_no = 0;
     uint32_t select_dispatch_threads_x = 0;
     uint32_t select_dispatch_threads_y = 0;
     uint32_t select_dispatch_threads_z = 0;
@@ -265,6 +269,7 @@ struct RuntimeDetailRequest {
     std::atomic<bool> predecessor_claimed{false};
     std::atomic<bool> predecessor_failed{false};
     bool bundle_start_reached = false;
+    bool after_compute_seen = false;
 
     RuntimeDetailRequest() {
         const char* path_env = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE");
@@ -432,6 +437,30 @@ struct RuntimeDetailRequest {
                          "[timeline] capture minimum dispatches exceeds maximum dispatches\n");
             return;
         }
+        auto parse_graphics_program = [&](const char* env_name, const char* stage,
+                                          uint64_t& selected) {
+            const char* program = std::getenv(env_name);
+            if (!program) return true;
+            char* program_end = nullptr;
+            errno = 0;
+            const uint64_t value = std::strtoull(program, &program_end, 0);
+            if (errno || program_end == program || !program_end || *program_end) {
+                std::fprintf(stderr,
+                             "[timeline] capture %s program must be an address or zero\n",
+                             stage);
+                return false;
+            }
+            selected = value;
+            semantic_selector |= value != 0;
+            return true;
+        };
+        if (!parse_graphics_program(
+                "PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM", "vertex",
+                select_vertex_program) ||
+            !parse_graphics_program(
+                "PROSPER_GPU_TIMELINE_CAPTURE_WHEN_FRAGMENT_PROGRAM", "fragment",
+                select_fragment_program))
+            return;
         if (const char* program = std::getenv(
                 "PROSPER_GPU_TIMELINE_CAPTURE_WHEN_COMPUTE_PROGRAM")) {
             char* program_end = nullptr;
@@ -444,6 +473,19 @@ struct RuntimeDetailRequest {
             }
             select_compute_program = value;
             semantic_selector = true;
+        }
+        if (const char* program = std::getenv(
+                "PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM")) {
+            char* program_end = nullptr;
+            errno = 0;
+            const uint64_t value = std::strtoull(program, &program_end, 0);
+            if (errno || program_end == program || !program_end || *program_end) {
+                std::fprintf(stderr,
+                             "[timeline] capture after-compute program must be an address or zero\n");
+                return;
+            }
+            select_after_compute_program = value;
+            semantic_selector |= value != 0;
         }
         if (const char* dimensions = std::getenv(
                 "PROSPER_GPU_TIMELINE_CAPTURE_WHEN_DISPATCH_DIM")) {
@@ -466,12 +508,16 @@ struct RuntimeDetailRequest {
         if (semantic_selector)
             std::fprintf(stderr, "[timeline] semantic capture endpoint submit>=%llu "
                                  "target=%ux%u target-index=%u..%u draws=%u..%u "
-                                 "dispatches=%u..%u compute=0x%llx threads=%ux%ux%u\n",
+                                 "dispatches=%u..%u vertex=0x%llx fragment=0x%llx "
+                                 "compute=0x%llx after-compute=0x%llx threads=%ux%ux%u\n",
                          static_cast<unsigned long long>(submit_no), select_target_width,
                          select_target_height, select_target_min_index,
                          select_target_max_index, select_min_draws, select_max_draws,
                          select_min_dispatches, select_max_dispatches,
+                         static_cast<unsigned long long>(select_vertex_program),
+                         static_cast<unsigned long long>(select_fragment_program),
                          static_cast<unsigned long long>(select_compute_program),
+                         static_cast<unsigned long long>(select_after_compute_program),
                          select_dispatch_threads_x, select_dispatch_threads_y,
                          select_dispatch_threads_z);
     }
@@ -649,10 +695,33 @@ RuntimeCaptureBundle& runtime_capture_bundle() {
     return state;
 }
 
-bool runtime_capture_endpoint_matches(const RuntimeDetailRequest& request,
+bool runtime_capture_endpoint_matches(RuntimeDetailRequest& request,
                                       const GpuTimelineSubmit& submit,
                                       const GpuState& state) {
     const uint64_t submit_no = submit.submit_no;
+    if (request.select_after_compute_program) {
+        if (!request.after_compute_seen) {
+            for (const auto& dispatch : state.dispatches) {
+                if (compute_dispatch_code_addr(state, dispatch) !=
+                    request.select_after_compute_program)
+                    continue;
+                request.after_compute_submit_no = submit_no;
+                request.after_compute_seen = true;
+                std::fprintf(stderr,
+                             "[timeline] capture after-compute gate armed submit=%llu "
+                             "program=0x%llx\n",
+                             static_cast<unsigned long long>(submit_no),
+                             static_cast<unsigned long long>(
+                                 request.select_after_compute_program));
+                break;
+            }
+        }
+        // The phase program's submit only arms the request. Even if it also satisfies every
+        // endpoint predicate, capture begins with a strictly later submit.
+        if (!request.after_compute_seen ||
+            submit_no <= request.after_compute_submit_no)
+            return false;
+    }
     if (submit_no < request.submit_no) return false;
     if (!request.semantic_selector)
         return submit_no == request.submit_no;
@@ -667,6 +736,30 @@ bool runtime_capture_endpoint_matches(const RuntimeDetailRequest& request,
     selector.min_dispatches = request.select_min_dispatches;
     selector.max_dispatches = request.select_max_dispatches;
     if (!gpu_timeline_submit_matches(submit, selector)) return false;
+    if (request.select_vertex_program || request.select_fragment_program) {
+        bool matching_draw = false;
+        for (size_t draw_index = 0; draw_index < state.draws.size(); ++draw_index) {
+            const RenderState render = extract_render_state(state.state_at_draw(draw_index));
+            if (request.select_vertex_program &&
+                render.es_addr != request.select_vertex_program)
+                continue;
+            if (request.select_fragment_program &&
+                render.ps_addr != request.select_fragment_program)
+                continue;
+            // Keep target and program predicates attached to one semantic draw.  Submit-wide
+            // independent matches can otherwise select a pass whose target belongs to one draw
+            // while the requested shader pair belongs to another.
+            if (request.select_target_width &&
+                (render.color0_width != request.select_target_width ||
+                 render.color0_height != request.select_target_height ||
+                 draw_index < request.select_target_min_index ||
+                 draw_index > request.select_target_max_index))
+                continue;
+            matching_draw = true;
+            break;
+        }
+        if (!matching_draw) return false;
+    }
     if (request.select_compute_program || request.select_dispatch_threads_x) {
         bool matching_dispatch = false;
         for (const auto& dispatch : state.dispatches) {

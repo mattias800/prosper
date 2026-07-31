@@ -8,8 +8,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 using namespace prosper::gpu;
 
@@ -23,8 +27,280 @@ static bool write_bytes(const std::filesystem::path& path, const std::vector<uin
     return static_cast<bool>(out);
 }
 
-int main() {
+static void set_test_env(const char* name, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
+}
+
+alignas(256) static const uint32_t kSelectorVs[] = {0xBF810000u};
+alignas(256) static const uint32_t kSelectorPs[] = {0xBF810000u};
+alignas(256) static const uint32_t kWrongSelectorVs[] = {0xBF810000u};
+alignas(256) static const uint32_t kWrongSelectorPs[] = {0xBF810000u};
+alignas(256) static const uint32_t kSelectorCompute[] = {0xBF810000u};
+alignas(256) static const uint32_t kWrongSelectorCompute[] = {0xBF810000u};
+
+static std::string program_address(const uint32_t* program) {
+    char value[32];
+    std::snprintf(value, sizeof(value), "0x%llx",
+                  static_cast<unsigned long long>(reinterpret_cast<uint64_t>(program)));
+    return value;
+}
+
+static std::shared_ptr<GpuState> selector_draw_state(
+    uint32_t width, uint32_t height, const uint32_t* vertex, const uint32_t* fragment) {
+    namespace P = prosper::agc::Pm4;
+    auto state = std::make_shared<GpuState>();
+    auto set_program = [&](uint32_t lo, uint32_t hi, const uint32_t* program) {
+        const uint64_t address = reinterpret_cast<uint64_t>(program);
+        state->sh[lo] = static_cast<uint32_t>(address >> 8);
+        state->sh[hi] = static_cast<uint32_t>((address >> 40) & 0xffu);
+    };
+    set_program(P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, vertex);
+    set_program(P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, fragment);
+    state->cx[P::CB_COLOR0_ATTRIB2] = ((width - 1u) << 14) | (height - 1u);
+    return state;
+}
+
+static GpuState selector_submit(
+    std::initializer_list<std::shared_ptr<GpuState>> draw_states, uint64_t first_order,
+    const uint32_t* compute = nullptr) {
+    namespace P = prosper::agc::Pm4;
+    GpuState state;
+    uint64_t order = first_order;
+    for (const auto& draw_state : draw_states) {
+        GpuState::Draw draw{3};
+        draw.state = draw_state;
+        draw.command_order = order++;
+        state.draws.push_back(std::move(draw));
+    }
+    if (compute) {
+        auto dispatch_state = std::make_shared<GpuState>();
+        const uint64_t address = reinterpret_cast<uint64_t>(compute);
+        dispatch_state->sh[P::COMPUTE_PGM_LO] = static_cast<uint32_t>(address >> 8);
+        dispatch_state->sh[P::COMPUTE_PGM_HI] =
+            static_cast<uint32_t>((address >> 40) & 0xffu);
+        GpuState::Dispatch dispatch;
+        dispatch.state = std::move(dispatch_state);
+        dispatch.command_order = order++;
+        state.dispatches.push_back(std::move(dispatch));
+    }
+    state.command_order = order;
+    return state;
+}
+
+static int run_selector_env_child(const std::string& mode) {
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto base = std::filesystem::temp_directory_path() /
+        ("prosper-gpu-timeline-selector-" + mode + "-" + std::to_string(nonce));
+    const std::string timeline_path = base.string() + ".prgtl";
+    const std::string capture_path = base.string() + ".prgcap";
+    set_test_env("PROSPER_GPU_TIMELINE", timeline_path);
+    set_test_env("PROSPER_GPU_TIMELINE_CAPTURE", capture_path);
+    set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1");
+
+    if (mode == "invalid") {
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "1");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM", "not-an-address");
+        begin_gpu_timeline_submit(1);
+        record_gpu_timeline_submit(GpuState{}, 1);
+    } else if (mode == "after-invalid") {
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "1");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM",
+                     "not-an-address");
+        begin_gpu_timeline_submit(1);
+        record_gpu_timeline_submit(GpuState{}, 1);
+    } else if (mode == "zero") {
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "1");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM", "0");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_FRAGMENT_PROGRAM", "0x0");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM", "0");
+        begin_gpu_timeline_submit(1);
+        record_gpu_timeline_submit(GpuState{}, 1);
+    } else if (mode == "semantic") {
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "3");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM", "642x362");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM",
+                     program_address(kSelectorVs));
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_FRAGMENT_PROGRAM",
+                     program_address(kSelectorPs));
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_COMPUTE_PROGRAM",
+                     program_address(kSelectorCompute));
+
+        const auto exact = selector_draw_state(642, 362, kSelectorVs, kSelectorPs);
+        const auto wrong_vs = selector_draw_state(642, 362, kWrongSelectorVs, kSelectorPs);
+        const auto wrong_ps = selector_draw_state(642, 362, kSelectorVs, kWrongSelectorPs);
+        const auto split_vs = selector_draw_state(642, 362, kSelectorVs, kWrongSelectorPs);
+        const auto split_ps = selector_draw_state(642, 362, kWrongSelectorVs, kSelectorPs);
+        const auto exact_wrong_target = selector_draw_state(1, 1, kSelectorVs, kSelectorPs);
+        const auto target_wrong_pair = selector_draw_state(
+            642, 362, kWrongSelectorVs, kWrongSelectorPs);
+        std::vector<GpuState> submits;
+        submits.push_back(selector_submit(                            // below lower bound
+            {exact}, 10, kSelectorCompute));
+        submits.push_back(selector_submit(                            // below lower bound
+            {exact}, 20, kSelectorCompute));
+        submits.push_back(selector_submit(                            // stages on different draws
+            {split_vs, split_ps}, 30, kSelectorCompute));
+        submits.push_back(selector_submit({wrong_vs}, 40, kSelectorCompute));
+        submits.push_back(selector_submit({wrong_ps}, 50, kSelectorCompute));
+        submits.push_back(selector_submit(                              // submit-wide false positive
+            {exact_wrong_target, target_wrong_pair}, 60, kSelectorCompute));
+        submits.push_back(selector_submit({exact}, 70));               // compute absent
+        submits.push_back(selector_submit({exact}, 80,                 // wrong compute program
+                                          kWrongSelectorCompute));
+        submits.push_back(selector_submit({exact}, 90,                 // first exact conjunction
+                                          kSelectorCompute));
+        submits.push_back(selector_submit({exact}, 100,                // must not retarget
+                                          kSelectorCompute));
+        for (size_t i = 0; i < submits.size(); ++i) {
+            const uint64_t submit_no = i + 1;
+            begin_gpu_timeline_submit(submit_no);
+            record_gpu_timeline_submit(submits[i], submit_no);
+        }
+    } else if (mode == "after") {
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "1");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM", "642x362");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM",
+                     program_address(kSelectorVs));
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_FRAGMENT_PROGRAM",
+                     program_address(kSelectorPs));
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM",
+                     program_address(kSelectorCompute));
+
+        const auto exact = selector_draw_state(642, 362, kSelectorVs, kSelectorPs);
+        const auto wrong_vs = selector_draw_state(642, 362, kWrongSelectorVs, kSelectorPs);
+        const auto split_vs = selector_draw_state(642, 362, kSelectorVs, kWrongSelectorPs);
+        const auto split_ps = selector_draw_state(642, 362, kWrongSelectorVs, kSelectorPs);
+        std::vector<GpuState> submits;
+        submits.push_back(selector_submit({exact}, 10, kWrongSelectorCompute));
+        submits.push_back(selector_submit({exact}, 20));               // wrong gate did not arm
+        submits.push_back(selector_submit({exact}, 30,                 // arm, never capture here
+                                          kSelectorCompute));
+        submits.push_back(selector_submit({wrong_vs}, 40));            // armed, wrong graphics
+        submits.push_back(selector_submit({split_vs, split_ps}, 50));  // split graphics pair
+        submits.push_back(selector_submit({exact}, 60));               // first valid later submit
+        submits.push_back(selector_submit({exact}, 70));               // must not retarget
+        for (size_t i = 0; i < submits.size(); ++i) {
+            const uint64_t submit_no = i + 1;
+            begin_gpu_timeline_submit(submit_no);
+            record_gpu_timeline_submit(submits[i], submit_no);
+        }
+    } else if (mode == "after-bound") {
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "4");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM", "642x362");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM",
+                     program_address(kSelectorVs));
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_FRAGMENT_PROGRAM",
+                     program_address(kSelectorPs));
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM",
+                     program_address(kSelectorCompute));
+
+        const auto exact = selector_draw_state(642, 362, kSelectorVs, kSelectorPs);
+        std::vector<GpuState> submits;
+        submits.push_back(selector_submit({exact}, 10, kSelectorCompute)); // arm before bound
+        submits.push_back(selector_submit({exact}, 20));                   // still below bound
+        submits.push_back(selector_submit({exact}, 30));                   // still below bound
+        submits.push_back(selector_submit({exact}, 40));                   // first at bound
+        for (size_t i = 0; i < submits.size(); ++i) {
+            const uint64_t submit_no = i + 1;
+            begin_gpu_timeline_submit(submit_no);
+            record_gpu_timeline_submit(submits[i], submit_no);
+        }
+    } else if (mode == "after-submit-zero") {
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "1");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM", "642x362");
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM",
+                     program_address(kSelectorVs));
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_FRAGMENT_PROGRAM",
+                     program_address(kSelectorPs));
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM",
+                     program_address(kSelectorCompute));
+
+        const auto exact = selector_draw_state(642, 362, kSelectorVs, kSelectorPs);
+        begin_gpu_timeline_submit(0);
+        record_gpu_timeline_submit(selector_submit({exact}, 10, kSelectorCompute), 0);
+        begin_gpu_timeline_submit(1);
+        record_gpu_timeline_submit(selector_submit({exact}, 20), 1);
+    } else {
+        return 90;
+    }
+    close_gpu_timeline();
+
+    GpuTimelineFile timeline;
+    std::string error;
+    const bool timeline_ok = read_gpu_timeline(timeline_path, timeline, error);
+    bool ok = timeline_ok;
+    if (mode == "invalid" || mode == "after-invalid") {
+        ok = ok && timeline.submits.size() == 1 && timeline.details.empty() &&
+             !std::filesystem::exists(capture_path);
+    } else if (mode == "zero") {
+        GpuCaptureFile capture;
+        ok = ok && timeline.details.size() == 1 &&
+             read_gpu_capture(capture_path, capture, error) && capture.metadata.submit_index == 1;
+    } else if (mode == "semantic") {
+        GpuCaptureFile capture;
+        ok = ok && timeline.submits.size() == 10 && timeline.details.size() == 1 &&
+             timeline.details[0].submit_no == 9 &&
+             read_gpu_capture(capture_path, capture, error) && capture.metadata.submit_index == 9;
+    } else if (mode == "after") {
+        GpuCaptureFile capture;
+        ok = ok && timeline.submits.size() == 7 && timeline.details.size() == 1 &&
+             timeline.details[0].submit_no == 6 &&
+             read_gpu_capture(capture_path, capture, error) && capture.metadata.submit_index == 6;
+    } else if (mode == "after-bound") {
+        GpuCaptureFile capture;
+        ok = ok && timeline.submits.size() == 4 && timeline.details.size() == 1 &&
+             timeline.details[0].submit_no == 4 &&
+             read_gpu_capture(capture_path, capture, error) && capture.metadata.submit_index == 4;
+    } else {
+        GpuCaptureFile capture;
+        ok = ok && timeline.submits.size() == 2 && timeline.details.size() == 1 &&
+             timeline.details[0].submit_no == 1 &&
+             read_gpu_capture(capture_path, capture, error) && capture.metadata.submit_index == 1;
+    }
+    std::error_code ec;
+    std::filesystem::remove(timeline_path, ec);
+    std::filesystem::remove(capture_path, ec);
+    if (!ok) {
+        std::fprintf(stderr, "selector child '%s' failed: %s\n", mode.c_str(), error.c_str());
+        return 91;
+    }
+    return 0;
+}
+
+static int run_self(const char* executable, const char* mode) {
+    const std::string command = std::string("\"") + executable + "\" --selector-child " + mode;
+    const int status = std::system(command.c_str());
+#ifdef _WIN32
+    return status;
+#else
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--selector-child")
+        return run_selector_env_child(argv[2]);
     std::printf("== test_gpu_timeline ==\n");
+    CHECK(run_self(argv[0], "invalid") == 0,
+          "malformed graphics-program selector is rejected without capturing");
+    CHECK(run_self(argv[0], "after-invalid") == 0,
+          "malformed cross-submit compute gate is rejected without capturing");
+    CHECK(run_self(argv[0], "zero") == 0,
+          "zero graphics-program selectors and cross-submit compute gate remain disabled");
+    CHECK(run_self(argv[0], "semantic") == 0,
+          "graphics and compute selectors require one post-bound submit with the same-draw "
+          "graphics conjunction");
+    CHECK(run_self(argv[0], "after") == 0,
+          "cross-submit compute gate arms only on the exact program and captures a later exact "
+          "graphics conjunction once");
+    CHECK(run_self(argv[0], "after-bound") == 0,
+          "cross-submit compute gate may arm before the independent endpoint lower bound");
+    CHECK(run_self(argv[0], "after-submit-zero") == 0,
+          "cross-submit compute gate retains a submit-zero arm for a later submit-one capture");
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto base = std::filesystem::temp_directory_path() /
         ("prosper-gpu-timeline-" + std::to_string(nonce));

@@ -226,6 +226,19 @@ submit at or after `CAPTURE_SUBMIT`; `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=N` 
 raw semantic draw sequence. `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES=N` and
 `PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES=N` add dispatch-count bounds. Derive the full conjunction from
 repeated positives and nearby negative samples with the offline v6 selector.
+`PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM=ADDR` and
+`PROSPER_GPU_TIMELINE_CAPTURE_WHEN_FRAGMENT_PROGRAM=ADDR` further require one semantic draw to bind the
+configured ES/vertex and pixel programs. A target extent/index selector must match that same draw. Zero or
+unset stages are disabled. The program scan happens only after the cheaper timeline predicates and does not
+realize shaders or read resources before the endpoint is claimed.
+Combined graphics and compute selectors require both operations in one submit; treat this only as a phase
+conjunction, not evidence of a producer/consumer relationship.
+For a strict cross-submit phase gate, use
+`PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM=ADDR`. The exact program arms the runtime request even
+before the endpoint lower bound, its own submit is never eligible, and normal endpoint predicates are allowed
+only on a later submit at or after the bound. Zero/unset disables it. The pre-arm path scans only retained
+dispatch register snapshots; the request-local latch adds no compute realization, resource reads, allocation,
+or Vulkan work and is not dependency evidence.
 When the endpoint moves, predecessor manifests roll forward so the final bundle retains the latest requested
 depth; dictionary bytes observed by evicted manifests still count against the unique-byte budget.
 Per-target RTT is the normal renderer path. `PROSPER_RTT_SINGLE_TARGET=1` restores the obsolete flattened
