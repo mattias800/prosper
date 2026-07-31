@@ -1005,6 +1005,103 @@ int main() {
     }
     printf("  [ok]   Wave64 VCC branches still reject synchronized in-arm operations\n");
 
+    // #1554: The Plucky Squire's chapter-one kernel guards a barrier-separated tail with a VCC
+    // branch whose mask is built ONLY from launch data over a full EXEC:
+    //     s_mov_b64 exec,-1 ; s_cmp_* <entry sgprs> ; s_cselect_b64 <mask>,exec,0 ; s_and_b64 vcc,..
+    // recompile_compute seeds entry SGPRs from push-constant user data and WorkGroupId, both of
+    // which are identical for every wave of a workgroup, so with EXEC full the branch decides
+    // identically for all waves and the arm may synchronize. local_x=128/wave_size=64 means two
+    // guest waves, so this genuinely exercises the cross-wave case rather than a single-wave shader.
+    const uint32_t wave64_uniform_vcc_barrier[] = {
+        0xbefe04c1u,                         // pc0: s_mov_b64 exec, -1
+        0xbf088002u,                         // pc1: s_cmp_gt_u32 s2, 0
+        0x858a807eu,                         // pc2: s_cselect_b64 s[10:11], exec, 0
+        0xbf060403u,                         // pc3: s_cmp_eq_u32 s3, s4
+        0x85ea807eu,                         // pc4: s_cselect_b64 vcc, exec, 0
+        0x87ea0a6au,                         // pc5: s_and_b64 vcc, vcc, s[10:11]
+        0xbf860002u,                         // pc6: s_cbranch_vccz -> pc9
+        0xbf8a0000u,                         // pc7: guest workgroup barrier
+        0xbf800000u,                         // pc8: s_nop
+        0xbf810000u,                         // pc9: s_endpgm
+    };
+    const auto wave64_uniform_vcc_barrier_spv = recompile_compute(
+        wave64_uniform_vcc_barrier, std::size(wave64_uniform_vcc_barrier), nullptr,
+        portable_wave64_compute_config);
+    if (wave64_uniform_vcc_barrier_spv.empty() ||
+        !has_opcode(wave64_uniform_vcc_barrier_spv, 224) ||  // OpControlBarrier: the guest barrier
+        !has_opcode(wave64_uniform_vcc_barrier_spv, 247) ||  // OpSelectionMerge: retained guest arm
+        !type_result_ids_are_nonzero(wave64_uniform_vcc_barrier_spv, nullptr) ||
+        !phi_ids_are_nonzero(wave64_uniform_vcc_barrier_spv)) {
+        printf("  [FAIL] launch-uniform VCC branch rejected a barrier it provably enters uniformly\n");
+        return 1;
+    }
+    printf("  [ok]   launch-uniform VCC branch admits an in-arm workgroup barrier\n");
+
+    // Every obligation of that proof must be independently load-bearing. Each variant below changes
+    // exactly ONE thing about the accepted kernel and must go back to rejecting the barrier.
+    //
+    // (a) EXEC is not provably full: VCCZ is then also true for a wave whose EXEC happens to be
+    //     empty, which is a per-wave property no amount of scalar uniformity can recover.
+    const uint32_t wave64_uniform_vcc_partial_exec[] = {
+        0xbefe04c1u,                         // pc0: s_mov_b64 exec, -1
+        0x7da80100u,                         // pc1: v_cmpx_eq_u32 v0, v0   (narrows EXEC per lane)
+        0xbf088002u, 0x858a807eu, 0xbf060403u, 0x85ea807eu, 0x87ea0a6au,
+        0xbf860002u, 0xbf8a0000u, 0xbf800000u, 0xbf810000u,
+    };
+    // (b) VCC is combined with a VOPC-written mask instead of a second proved select, so the branch
+    //     tests lane occupancy rather than a scalar predicate.
+    const uint32_t wave64_uniform_vcc_lane_scc[] = {
+        0xbefe04c1u,                         // pc0: s_mov_b64 exec, -1
+        0x7d840000u,                         // pc1: v_cmp_eq_u32 vcc, v0, v0   (lane-derived mask)
+        0xbf088002u,                         // pc2: s_cmp_gt_u32 s2, 0
+        0x858a807eu,                         // pc3: s_cselect_b64 s[10:11], exec, 0
+        0x87ea0a6au,                         // pc4: s_and_b64 vcc, vcc, s[10:11]
+        0xbf860002u,                         // pc5: s_cbranch_vccz -> pc8
+        0xbf8a0000u, 0xbf800000u, 0xbf810000u,
+    };
+    // (c) A contributing compare reads a V_READFIRSTLANE result: uniform per wave, not per workgroup.
+    const uint32_t wave64_uniform_vcc_readfirstlane[] = {
+        0xbefe04c1u,
+        0x7e0a0500u,                         // v_readfirstlane_b32 s5, v0
+        0xbf088002u, 0x858a807eu,
+        0xbf060503u,                         // s_cmp_eq_u32 s3, s5
+        0x85ea807eu, 0x87ea0a6au,
+        0xbf860002u, 0xbf8a0000u, 0xbf800000u, 0xbf810000u,
+    };
+    // (d) The mask is combined with raw EXEC rather than another proved select.
+    const uint32_t wave64_uniform_vcc_exec_operand[] = {
+        0xbefe04c1u, 0xbf088002u, 0x858a807eu, 0xbf060403u, 0x85ea807eu,
+        0x87ea7e6au,                         // s_and_b64 vcc, vcc, exec
+        0xbf860002u, 0xbf8a0000u, 0xbf800000u, 0xbf810000u,
+    };
+    // Report every variant rather than stopping at the first, so a weakened proof shows exactly which
+    // obligations stopped carrying weight instead of hiding behind whichever check happens to be first.
+    struct UniformVccNegative {
+        const char* what;
+        const uint32_t* code;
+        size_t words;
+    };
+    const UniformVccNegative uniform_vcc_negatives[] = {
+        {"a non-full EXEC", wave64_uniform_vcc_partial_exec,
+         std::size(wave64_uniform_vcc_partial_exec)},
+        {"a lane-derived mask operand", wave64_uniform_vcc_lane_scc,
+         std::size(wave64_uniform_vcc_lane_scc)},
+        {"a readfirstlane SCC", wave64_uniform_vcc_readfirstlane,
+         std::size(wave64_uniform_vcc_readfirstlane)},
+        {"a raw EXEC mask operand", wave64_uniform_vcc_exec_operand,
+         std::size(wave64_uniform_vcc_exec_operand)},
+    };
+    bool uniform_vcc_negatives_held = true;
+    for (const auto& negative : uniform_vcc_negatives) {
+        if (recompile_compute(negative.code, negative.words, nullptr,
+                              portable_wave64_compute_config).empty())
+            continue;
+        printf("  [FAIL] %s still admitted a barrier-spanning VCC branch\n", negative.what);
+        uniform_vcc_negatives_held = false;
+    }
+    if (!uniform_vcc_negatives_held) return 1;
+    printf("  [ok]   every workgroup-uniformity obligation independently rejects the barrier\n");
+
     wave32_compute_config.wave_size = 64;
     if (!recompile_compute(wave32_compute_masks, std::size(wave32_compute_masks), nullptr,
                            wave32_compute_config).empty()) {
