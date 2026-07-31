@@ -1041,12 +1041,12 @@ bool write_runtime_capture_bundle_checkpoint(const std::string& path,
                                              std::string& error) {
     RuntimeCaptureBundle& state = runtime_capture_bundle();
     const bool has_boundary = !state.bundle.submits.empty() && !state.boundary_ds.empty();
-    if (!install_runtime_bundle_boundary_ds(error) ||
-        !compact_gpu_capture_bundle(state.bundle, error))
-        return false;
-    const bool written = runtime_capture_bundle_within_budget(max_unique_bytes, error) &&
+    if (!install_runtime_bundle_boundary_ds(error)) return false;
+    const bool prepared = compact_gpu_capture_bundle(state.bundle, error);
+    const bool written = prepared &&
+        runtime_capture_bundle_within_budget(max_unique_bytes, error) &&
         write_gpu_capture_bundle(path, state.bundle, error);
-    const std::string write_error = error;
+    const std::string operation_error = error;
     if (!has_boundary) return written;
     std::string restore_error;
     const bool restored = replace_gpu_capture_bundle_submit_ds_seeds(
@@ -1057,7 +1057,7 @@ bool write_runtime_capture_bundle_checkpoint(const std::string& path,
         state.failed = true;
         return false;
     }
-    if (!written) error = write_error;
+    if (!written) error = operation_error;
     return written;
 }
 
@@ -2486,19 +2486,22 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
         std::vector<GpuCaptureDsSeed> standalone_ds;
         RuntimeCaptureBundle::BoundaryDs endpoint_boundary;
         bool endpoint_boundary_ok = true;
+        bool captured_endpoint_boundary = false;
         if (phase_bundle) {
             standalone_ds = std::move(capture.ds_seeds);
             endpoint_boundary.submit_no = submit_no;
-            if (state.boundary_ds.empty())
+            if (state.boundary_ds.empty()) {
+                captured_endpoint_boundary = true;
                 endpoint_boundary_ok = snapshot_runtime_bundle_boundary_ds(
                     capture, submit_no, request.bundle_max_unique_bytes,
                     endpoint_boundary, error);
+            }
         }
         const bool appended = !state.failed && !state.budget_exhausted &&
             endpoint_boundary_ok && append_runtime_capture_bundle(
                 capture, request.bundle_max_unique_bytes, error);
         if (phase_bundle) capture.ds_seeds = std::move(standalone_ds);
-        if (appended && phase_bundle) {
+        if (appended && captured_endpoint_boundary) {
             state.boundary_ds_bytes += endpoint_boundary.bytes;
             state.boundary_ds.push_back(std::move(endpoint_boundary));
         }
