@@ -24,6 +24,8 @@ Last updated: 2026-07-31
 | *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 title, name entry, name confirmation, and first-run `System Settings 1/4` onboarding reached; gameplay is not yet validated |
 | *Alex Kidd in Miracle World DX* | `PPSA02664` | Unity / IL2CPP | ✅ First level reached and rendered at native 1920×1080; colour matches the hardware reference, with a minor title-overlay contrast defect |
 | *New Joe &amp; Mac: Caveman Ninja* | `PPSA02801` | Unity / IL2CPP | ✅ Title screen, menus and level 1 gameplay render at native 1920×1080 — reached on the first boot with no code changes |
+| *Asterix &amp; Obelix: Slap Them All!* | `PPSA08576` | Unity / IL2CPP | ✅ Title screen and first forest level render at native 1920×1080 — reached on unmodified master with no code changes |
+| *Summer Sports Games* | `PPSA03416` | Unity / IL2CPP | ✅ Mode select and live 3D athletics render at native 3840×2160 with no code changes |
 | *Worms Armageddon: Anniversary Edition* | `PPSA20052` | Custom (Digital Eclipse) | 🚧 Studio splash and title screen render at native 1920×1080; gameplay blocked because the guest never opens a pad |
 | *Earthion* | `PPSA28061` | Custom (Ancient) | 🚧 Developer logo, intro story text and CRT bezel render; the 320×224 game picture inside the bezel is still missing |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🔬 Boots deep into the UE4 frame loop with real GPU work; presented frames are still a flat colour |
@@ -358,6 +360,38 @@ several pages, so guest logic, input timing and presentation are healthy.
 What is missing is the picture inside the bezel: a single MIMG descriptor-provenance gap drops the
 320×224 game-picture composite, leaving the TV screen black. Tracked on #1590. No screenshot is
 published here because the game area itself is not yet rendering.
+
+## Asterix & Obelix: Slap Them All! — `PPSA08576`
+
+<p align="center">
+  <img src="assets/screenshots/asterix-slap-them-all.png" alt="Asterix &amp; Obelix: Slap Them All! — first forest level">
+</p>
+
+Reaches the title screen with no input at all, and a scripted route reaches the first forest level:
+Asterix animating, dual character portraits with health and rage gauges, score and TOP counters, a
+multi-layer parallax forest, a wandering rabbit and a correct ground shadow, at native 1920×1080.
+
+A 150-second route produced **zero recompiler rejections, zero skipped dispatches and zero
+unsupported formats** on completely unmodified master. The only stubs exercised are PSN telemetry
+(UDS, WebApi2, SessionSignaling), all non-blocking.
+
+Note this is a **different title** from *Asterix & Obelix: Babylon Mission* (`PPSA30490`), which is a
+Unity 6 game currently at the research tier.
+
+## Summer Sports Games — `PPSA03416`
+
+<p align="center">
+  <img src="assets/screenshots/summer-sports-games.png" alt="Summer Sports Games — javelin event at 3840×2160">
+</p>
+
+Mode select and live 3D athletics render at native 3840×2160 with no code changes: a full stadium
+with animated crowd, banners, camera rigs and track markings, plus the `ATTEMPT 1/3` and `SPEED`
+HUD and `FOUL!` / `POOR` result overlays.
+
+Beyond the title itself this is a useful **3D** reference workload: it is deterministic, routed, and
+runs with a 100% shader realization rate. `docs/RENDERER_PERFORMANCE_2026_07.md` records that the
+remaining synchronous graphics/compute boundaries must be evaluated against a 3D workload rather
+than against Messenger's 2D scene, and this is the first clean candidate for that.
 
 ## Requirements and scope
 
