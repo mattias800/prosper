@@ -24,10 +24,14 @@ Last updated: 2026-07-31
 | *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 title, name entry, name confirmation, and first-run `System Settings 1/4` onboarding reached; gameplay is not yet validated |
 | *Alex Kidd in Miracle World DX* | `PPSA02664` | Unity / IL2CPP | ✅ First level reached and rendered at native 1920×1080; colour matches the hardware reference, with a minor title-overlay contrast defect |
 | *New Joe &amp; Mac: Caveman Ninja* | `PPSA02801` | Unity / IL2CPP | ✅ Title screen, menus and level 1 gameplay render at native 1920×1080 — reached on the first boot with no code changes |
+| *Asterix &amp; Obelix: Slap Them All!* | `PPSA08576` | Unity / IL2CPP | ✅ Title screen and first forest level render at native 1920×1080 — reached on unmodified master with no code changes |
+| *Summer Sports Games* | `PPSA03416` | Unity / IL2CPP | ✅ Mode select and live 3D athletics render at native 3840×2160 with no code changes |
 | *Worms Armageddon: Anniversary Edition* | `PPSA20052` | Custom (Digital Eclipse) | 🚧 Studio splash and title screen render at native 1920×1080; gameplay blocked because the guest never opens a pad |
 | *Earthion* | `PPSA28061` | Custom (Ancient) | 🚧 Developer logo, intro story text and CRT bezel render; the 320×224 game picture inside the bezel is still missing |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🔬 Boots deep into the UE4 frame loop with real GPU work; presented frames are still a flat colour |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Audio and sound bank initialise; the game's own code lives in a runtime-loaded PRX that prosper cannot yet load |
+| *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
+| *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
 
 ¹ Exact retail game name pending confirmation.
 
@@ -292,6 +296,46 @@ This 2D action title reaches its main menu and attract-mode gameplay, verified a
 project owner, with a menu-reach snapshot guard in place. The title ID is confirmed; the exact retail
 name is pending confirmation.
 
+## Rugrats: Adventure in Gameland — `PPSA23396`
+
+<p align="center">
+  <img src="assets/screenshots/rugrats-title.png" alt="Rugrats: Adventure in Gameland — title and game-mode selector">
+</p>
+<p align="center">
+  <img src="assets/screenshots/rugrats.png" alt="Rugrats: Adventure in Gameland — first nursery level">
+</p>
+
+A Unity 2022.3 / IL2CPP title that boots on first attempt with **no rejected shader, no unimplemented
+render-path NID, and no AGC gap** in a full routed run. The route crosses the splash logos, the
+"GAME MODE: MODERN HD" selector and the menus into the first nursery level at native 1920×1080: Tommy
+and Chuckie with their animation, the block platforms, the playpen gate, the locked door, the curtained
+window, and the baby-bottle health HUD.
+
+The route is `prosper/scripts/rugrats/reach-gameplay.pad`.
+
+## Greak: Memories of Azur — `PPSA02849`
+
+<p align="center">
+  <img src="assets/screenshots/greak-title.png" alt="Greak: Memories of Azur — title screen">
+</p>
+<p align="center">
+  <img src="assets/screenshots/greak.png" alt="Greak: Memories of Azur — first level gameplay">
+</p>
+
+A Unity 2019.4 / IL2CPP title that boots cleanly on first attempt. The route crosses the publisher
+logo, the full hand-drawn animated intro cutscene, a long asset-load phase, and the title screen into
+sustained first-level gameplay at native 1920×1080: the player character and its animation, layered
+parallax terrain and pine forest, volumetric fog, drifting particles, the portrait/health/ammo HUD, the
+ability bar, and the button-prompt overlay.
+
+The route is `prosper/scripts/greak/reach-gameplay.pad`. Note that the title screen only appears after a
+roughly 70-second black asset-loading phase following the intro; a capture window shorter than about
+150 seconds ends before it and misreads the load as a black-screen defect.
+
+One shared recompiler gap was found and closed during bring-up: `s_ttracedata` (SOPP `0x16`), a
+thread-trace profiling instruction with no architectural effect, was rejecting the entire vertex stage
+that carried it.
+
 ## Alex Kidd in Miracle World DX — `PPSA02664`
 
 <p align="center">
@@ -358,6 +402,38 @@ several pages, so guest logic, input timing and presentation are healthy.
 What is missing is the picture inside the bezel: a single MIMG descriptor-provenance gap drops the
 320×224 game-picture composite, leaving the TV screen black. Tracked on #1590. No screenshot is
 published here because the game area itself is not yet rendering.
+
+## Asterix & Obelix: Slap Them All! — `PPSA08576`
+
+<p align="center">
+  <img src="assets/screenshots/asterix-slap-them-all.png" alt="Asterix &amp; Obelix: Slap Them All! — first forest level">
+</p>
+
+Reaches the title screen with no input at all, and a scripted route reaches the first forest level:
+Asterix animating, dual character portraits with health and rage gauges, score and TOP counters, a
+multi-layer parallax forest, a wandering rabbit and a correct ground shadow, at native 1920×1080.
+
+A 150-second route produced **zero recompiler rejections, zero skipped dispatches and zero
+unsupported formats** on completely unmodified master. The only stubs exercised are PSN telemetry
+(UDS, WebApi2, SessionSignaling), all non-blocking.
+
+Note this is a **different title** from *Asterix & Obelix: Babylon Mission* (`PPSA30490`), which is a
+Unity 6 game currently at the research tier.
+
+## Summer Sports Games — `PPSA03416`
+
+<p align="center">
+  <img src="assets/screenshots/summer-sports-games.png" alt="Summer Sports Games — javelin event at 3840×2160">
+</p>
+
+Mode select and live 3D athletics render at native 3840×2160 with no code changes: a full stadium
+with animated crowd, banners, camera rigs and track markings, plus the `ATTEMPT 1/3` and `SPEED`
+HUD and `FOUL!` / `POOR` result overlays.
+
+Beyond the title itself this is a useful **3D** reference workload: it is deterministic, routed, and
+runs with a 100% shader realization rate. `docs/RENDERER_PERFORMANCE_2026_07.md` records that the
+remaining synchronous graphics/compute boundaries must be evaluated against a 3D workload rather
+than against Messenger's 2D scene, and this is the first clean candidate for that.
 
 ## Requirements and scope
 
