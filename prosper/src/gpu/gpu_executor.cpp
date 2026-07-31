@@ -32,6 +32,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -366,7 +367,9 @@ ShaderCache& shader_cache() {
 struct DecodedShader {
     std::vector<uint32_t> code;
     std::vector<Rdna2Inst> instructions;
+    std::vector<Rdna2Inst> shader_constant_instructions;
     size_t source_dwords = 0;
+    bool shader_constant_specialized = false;
     bool terminated = false;
     uint64_t bytes = 0;
 };
@@ -588,43 +591,56 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                     scalar_spill_vgprs.insert(instruction.src[0].value);    // v_readlane_b32
             }
         }
+        auto retain_fold_instructions = [&](const std::vector<Rdna2Inst>& source,
+                                            std::vector<Rdna2Inst>& retained) {
+            retained.reserve(source.size());
+            for (const Rdna2Inst& instruction : source) {
+                if (instruction.is_end) break;
+                const bool scalar_spill = instruction.fmt == Rdna2Format::VOP3 &&
+                                          (instruction.opcode == 0x360 || instruction.opcode == 0x361);
+                const bool vector_index_select =
+                    ((instruction.fmt == Rdna2Format::VOP3 && instruction.opcode == 0x101) ||
+                     (instruction.fmt == Rdna2Format::VOP2 && instruction.opcode == 0x01)) &&
+                    instruction.dst.kind == OperandKind::VGPR &&
+                    fetch_vaddr_vgprs.contains(instruction.dst.value);
+                // Index provenance begins at the hardware ABI VGPRs and is killed by any later shader
+                // computation of a register used as VADDR. Keep only writes to actual fetch-address
+                // registers; retaining every VALU instruction would make the otherwise-small scalar fold
+                // walk large UE shaders in full. This is what distinguishes DQ's first v5=vertex_id fetch
+                // from its later v5=3*vertex_id+1 packed-attribute fetch.
+                const bool fetch_vaddr_write = instruction.dst.kind == OperandKind::VGPR &&
+                                               fetch_vaddr_vgprs.contains(instruction.dst.value);
+                const bool scalar_spill_invalidation = instruction.dst.kind == OperandKind::VGPR &&
+                                                       scalar_spill_vgprs.contains(instruction.dst.value);
+                const bool fold_format = instruction.fmt == Rdna2Format::SOP1 ||
+                                         instruction.fmt == Rdna2Format::SOP2 ||
+                                         instruction.fmt == Rdna2Format::SOPC ||
+                                         instruction.fmt == Rdna2Format::SOPK ||
+                                         instruction.fmt == Rdna2Format::SOPP ||
+                                         instruction.fmt == Rdna2Format::SMEM ||
+                                         instruction.fmt == Rdna2Format::MIMG ||
+                                         instruction.fmt == Rdna2Format::MUBUF ||
+                                         instruction.fmt == Rdna2Format::MTBUF;
+                if (fold_format || scalar_spill || vector_index_select || fetch_vaddr_write ||
+                    scalar_spill_invalidation || instruction.dst.kind == OperandKind::SGPR)
+                    retained.push_back(instruction);
+            }
+        };
         // Retain only instructions that can affect fold state or emit a descriptor use, preserving
-        // their original order and PCs.
-        result->instructions.reserve(decoded.size());
-        for (const Rdna2Inst& instruction : decoded) {
-            if (instruction.is_end) break;
-            const bool scalar_spill = instruction.fmt == Rdna2Format::VOP3 &&
-                                      (instruction.opcode == 0x360 || instruction.opcode == 0x361);
-            const bool vector_index_select =
-                ((instruction.fmt == Rdna2Format::VOP3 && instruction.opcode == 0x101) ||
-                 (instruction.fmt == Rdna2Format::VOP2 && instruction.opcode == 0x01)) &&
-                instruction.dst.kind == OperandKind::VGPR &&
-                fetch_vaddr_vgprs.contains(instruction.dst.value);
-            // Index provenance begins at the hardware ABI VGPRs and is killed by any later shader
-            // computation of a register used as VADDR. Keep only writes to actual fetch-address
-            // registers; retaining every VALU instruction would make the otherwise-small scalar fold
-            // walk large UE shaders in full. This is what distinguishes DQ's first v5=vertex_id fetch
-            // from its later v5=3*vertex_id+1 packed-attribute fetch.
-            const bool fetch_vaddr_write = instruction.dst.kind == OperandKind::VGPR &&
-                                           fetch_vaddr_vgprs.contains(instruction.dst.value);
-            const bool scalar_spill_invalidation = instruction.dst.kind == OperandKind::VGPR &&
-                                                   scalar_spill_vgprs.contains(instruction.dst.value);
-            const bool fold_format = instruction.fmt == Rdna2Format::SOP1 ||
-                                     instruction.fmt == Rdna2Format::SOP2 ||
-                                     instruction.fmt == Rdna2Format::SOPC ||
-                                     instruction.fmt == Rdna2Format::SOPK ||
-                                     instruction.fmt == Rdna2Format::SOPP ||
-                                     instruction.fmt == Rdna2Format::SMEM ||
-                                     instruction.fmt == Rdna2Format::MIMG ||
-                                     instruction.fmt == Rdna2Format::MUBUF ||
-                                     instruction.fmt == Rdna2Format::MTBUF;
-            if (fold_format || scalar_spill || vector_index_select || fetch_vaddr_write ||
-                scalar_spill_invalidation ||
-                instruction.dst.kind == OperandKind::SGPR)
-                result->instructions.push_back(instruction);
-        }
+        // their original order and PCs. Prove shader-constant branches against the FULL decoded
+        // stream first: the compact fold stream intentionally omits most VALU, including implicit
+        // VCC writers that must invalidate a scalar-data proof through s106:s107.
+        retain_fold_instructions(decoded, result->instructions);
+        std::vector<Rdna2Inst> shader_constant_decoded = decoded;
+        result->shader_constant_specialized =
+            rdna2_specialize_shader_constant_branches(shader_constant_decoded) != 0;
+        if (result->shader_constant_specialized)
+            retain_fold_instructions(shader_constant_decoded,
+                                     result->shader_constant_instructions);
         result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
-                        static_cast<uint64_t>(result->instructions.size()) * sizeof(Rdna2Inst);
+                        static_cast<uint64_t>(result->instructions.size() +
+                                              result->shader_constant_instructions.size()) *
+                            sizeof(Rdna2Inst);
         return result;
     };
 
@@ -1707,6 +1723,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         }
         fold_instructions = &specialized;
     }
+    // The cache specializes the full decoded stream before compacting it for the scalar fold. A
+    // PC-relative dispatch is already a separate explicit specialization and keeps its historical
+    // filtered stream here; combining the two requires proving the selected full-stream CFG first.
+    if (fold_instructions == &decoded->instructions && decoded->shader_constant_specialized)
+        fold_instructions = &decoded->shader_constant_instructions;
     const auto& ins = *fold_instructions;
 
     auto readable = [&](uint64_t addr, uint32_t bytes) {
@@ -3116,6 +3137,44 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
 
 namespace { constexpr uint32_t kPsBindingBase = 32; }
 
+// Preserve the exact resource-path proof across the decoded analysis and raw-byte translation
+// passes. Ordinary instruction-scoped resources disappear with their consumers, but the dispatch-
+// scoped null marker must survive because the raw translator independently repeats the proof.
+ComputeResourcePathSpecializationReport specialize_compute_resource_paths(
+        std::vector<Rdna2Inst>& instructions, ShaderResourceTable& resources,
+        uint32_t wave_size) {
+    ComputeResourcePathSpecializationReport report;
+    std::vector<uint32_t> original_pcs;
+    original_pcs.reserve(instructions.size());
+    for (const Rdna2Inst& instruction : instructions)
+        original_pcs.push_back(instruction.pc);
+
+    report.proven_null_exits = rdna2_specialize_proven_null_bvh_paths(
+        instructions, &resources, wave_size);
+    if (!report.proven_null_exits) return report;
+    report.shader_constant_branches =
+        rdna2_specialize_shader_constant_branches(instructions);
+
+    std::unordered_set<uint32_t> live_pcs;
+    live_pcs.reserve(instructions.size());
+    for (const Rdna2Inst& instruction : instructions)
+        live_pcs.insert(instruction.pc);
+    for (uint32_t pc : original_pcs)
+        if (!live_pcs.contains(pc)) report.removed_pcs.push_back(pc);
+
+    const size_t resources_before = resources.resources.size();
+    std::erase_if(resources.resources, [&](const ShaderResource& resource) {
+        // The raw-byte translator repeats resource-path specialization. Keep its dispatch-scoped
+        // null proof even though the marked IMAGE_BVH instruction disappeared from this analysis
+        // stream; all ordinary instruction-scoped resources can be pruned with their consumer.
+        return resource.fetch_pc != 0xFFFFFFFFu &&
+               !is_proven_null_bvh(resource) &&
+               !live_pcs.contains(resource.fetch_pc);
+    });
+    report.removed_resources = resources_before - resources.resources.size();
+    return report;
+}
+
 // Assign each resource its OWN descriptor binding, starting at `first` (0/1 reserved). The N-buffer
 // model: the shader reads several distinct constant buffers (Unity's per-draw transform, per-frame,
 // …) + vertex buffers + textures, and each must land at a separate binding so they don't collapse.
@@ -3879,6 +3938,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
         auto field = [&](uint32_t shift, uint32_t mask) { return (rsrc2 >> shift) & mask; };
         const uint32_t user_count = field(P::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT,
                                           P::COMPUTE_PGM_RSRC2_USER_SGPR_MASK);
+        const uint32_t compute_wave_size = ((dispatch.modifier >>
+            P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
+            P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;
         const ComputeLaunchDimensions launch = resolve_compute_launch(dispatch);
         const bool tgid_x_en = field(P::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT,
                                      P::COMPUTE_PGM_RSRC2_TGID_X_EN_MASK) != 0;
@@ -4091,12 +4153,34 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                  fl.load_pc, fl.base_sgpr, (unsigned long long)base, w.size);
             }
         }
-        assign_convention_bindings(*table, 2);
         bool native_multiwave_wave_work = false;
         {
             std::vector<Rdna2Inst> decoded;
             rdna2_walk(reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                        shader_dwords, decoded);
+            // Keep dispatch-scoped resource discovery and translation on the same specialized
+            // instruction stream. A proven-null BVH can collapse only the exact no-hit exit and a
+            // fully matched empty-stack traversal cycle; shader-byte constant folding may then
+            // remove any remaining unreachable arm.
+            // Drop only instruction-scoped resources whose consumers disappeared. Direct resources
+            // (fetch_pc == UINT32_MAX) remain available to every surviving use of their SGPR/SRT key.
+            std::vector<Rdna2Inst> resource_paths = decoded;
+            const ComputeResourcePathSpecializationReport path_report =
+                specialize_compute_resource_paths(resource_paths, *table, compute_wave_size);
+            if (std::getenv("PROSPER_DBG") && path_report.proven_null_exits) {
+                std::fprintf(stderr,
+                             "[compute-resource-specialization] code=0x%llx null-exits=%zu constants=%zu "
+                             "removed-resources=%zu removed-pcs=",
+                             static_cast<unsigned long long>(code_addr),
+                             path_report.proven_null_exits,
+                             path_report.shader_constant_branches,
+                             path_report.removed_resources);
+                for (size_t index = 0; index < path_report.removed_pcs.size(); ++index)
+                    std::fprintf(stderr, "%s%u", index ? "," : "",
+                                 path_report.removed_pcs[index]);
+                std::fprintf(stderr, "\n");
+            }
+            assign_convention_bindings(*table, 2);
             native_multiwave_wave_work = compute_shader_prefers_native_multiwave(
                 decoded, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                 shader_dwords);
@@ -4129,9 +4213,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         config.threads_x = launch.threads_x;
         config.threads_y = launch.threads_y;
         config.threads_z = launch.threads_z;
-        config.wave_size = ((dispatch.modifier >>
-            P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
-            P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;
+        config.wave_size = compute_wave_size;
         const SharedVulkanContext shared_vulkan = shared_vulkan_context();
         const bool shared_compute_adoptable = shared_vulkan.valid() &&
             shared_vulkan.compute_queue_supported &&
@@ -4209,7 +4291,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
             if (getenv("PROSPER_DYNTRACE_FAIL")) {
                 static std::set<uint64_t> traced_cs;
                 if (traced_cs.insert(code_addr).second) {
-                    std::fprintf(stderr, "[dynfail] replaying COMPUTE 0x%llx resource build with trace:\n",
+                    std::fprintf(stderr,
+                                 "[dynfail] replaying PRE-SPECIALIZATION raw COMPUTE 0x%llx "
+                                 "resource build with trace:\n",
                                  (unsigned long long)code_addr);
                     std::fprintf(stderr, "[dynfail]   compute user-data SGPRs (s0..s%u):\n", kUserSgprs - 1);
                     std::fprintf(stderr,
@@ -4228,7 +4312,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
                                           sgprs, kUserSgprs, 0, &cs_uses);
                     g_dyntrace_force = false;
-                    std::fprintf(stderr, "[dynfail]   const-fold recovered %zu descriptor use(s):\n",
+                    std::fprintf(stderr,
+                                 "[dynfail]   pre-specialization raw const-fold recovered %zu "
+                                 "descriptor use(s):\n",
                                  cs_uses.size());
                     for (const auto& u : cs_uses) {
                         if (u.kind == 0) {

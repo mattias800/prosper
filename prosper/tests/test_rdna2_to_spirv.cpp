@@ -665,6 +665,57 @@ int main() {
                     subgroup17d1.size);
     }
 
+    // Kernel 17d1m: Astro reuses physical VCC_LO as ordinary scalar data, then copies that complete
+    // dword into EXEC_LO.  A Wave32 translation must select this invocation's bit from the scalar
+    // value: mask 1 activates lane zero of each guest wave and leaves every other destination word
+    // untouched.  An untracked special-register source remains fail-visible.
+    const uint32_t code17d1m[] = {
+        0xbe800381u,              // s_mov_b32 s0, 1
+        0xbefe0300u,              // s_mov_b32 exec_lo, s0
+        0x7e020287u,              // v_mov_b32 v1, 7
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> native_spv17d1m = recompile_compute(
+        code17d1m, std::size(code17d1m), &rt17d1, native_cfg17d1);
+    CHECK(!native_spv17d1m.empty(),
+          "Wave32 scalar-data dword lowers when copied into EXEC_LO");
+    const std::vector<uint32_t> portable_spv17d1m = recompile_compute(
+        code17d1m, std::size(code17d1m), &rt17d1, portable_cfg17d1);
+    CHECK(!portable_spv17d1m.empty(),
+          "Wave32 scalar-data EXEC mask does not require native subgroup operations");
+    const uint32_t code17d1m_bad[] = {
+        0xbefe037cu,              // s_mov_b32 exec_lo, untracked m0
+        0xbf810000u,
+    };
+    CHECK(recompile_compute(code17d1m_bad, std::size(code17d1m_bad), nullptr,
+                            native_cfg17d1).empty(),
+          "untracked scalar source copied into EXEC_LO remains fail-visible");
+    const uint32_t code17d1m_wave64[] = {
+        0xbe800381u,              // s_mov_b32 s0, 1
+        0xbefe0300u,              // s_mov_b32 exec_lo, s0
+        0xbf810000u,
+    };
+    CHECK(recompile_compute(code17d1m_wave64, std::size(code17d1m_wave64), nullptr,
+                            native_cfg17d).empty(),
+          "Wave64 scalar-data EXEC-half writes remain fail-visible");
+    std::vector<uint32_t> initial17d1m(64, 0xdeadbeefu), got17d1m;
+    prosper::test::run_compute(portable_spv17d1m, std::vector<float>(64, 0.0f),
+                               64, 64, {}, initial17d1m, &got17d1m);
+    uint32_t bad17d1m = 0;
+    for (uint32_t lane = 0; lane < 64 && got17d1m.size() == 64; ++lane) {
+        const uint32_t expected = (lane & 31u) == 0 ? 7u : 0xdeadbeefu;
+        bad17d1m += got17d1m[lane] != expected;
+    }
+    std::printf("  scalar-exec out[0]=0x%08x out[1]=0x%08x "
+                "out[32]=0x%08x out[33]=0x%08x mismatches=%u\n",
+                got17d1m.size() == 64 ? got17d1m[0] : 0u,
+                got17d1m.size() == 64 ? got17d1m[1] : 0u,
+                got17d1m.size() == 64 ? got17d1m[32] : 0u,
+                got17d1m.size() == 64 ? got17d1m[33] : 0u, bad17d1m);
+    CHECK(got17d1m.size() == 64 && bad17d1m == 0,
+          "Wave32 scalar mask activates only its selected guest lanes");
+
     // Kernel 17d1w: the next Astro traversal instruction writes a scalar-data VCC_HI value to the
     // VGPR lane selected by s45. Preserve v1's local-id value in every other lane so execution tests
     // both halves of V_WRITELANE's read/modify/write behavior. These are the exact GFX10 packets for

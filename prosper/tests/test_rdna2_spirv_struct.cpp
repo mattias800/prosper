@@ -453,6 +453,7 @@ int main() {
         0xbf840001u,                         // s_cbranch_scc0 +1
         0xbeea0385u,                         // one arm recycles vcc_lo as scalar data
         0x876b0100u,                         // s_and_b32 vcc_hi, s0, s1
+        0x02020100u,                         // implicit VCC_LO read remains ambiguous
         0xbf810000u,
     };
     wave32_compute_config.user_sgprs = {1u, 1u};
@@ -462,7 +463,160 @@ int main() {
         printf("  [FAIL] partial VCC write accepted an unknown prior mask\n");
         return 1;
     }
-    printf("  [ok]   partial VCC write rejects an unknown prior mask\n");
+    printf("  [ok]   partial VCC_HI write cannot validate an ambiguous VCC_LO read\n");
+
+    // A complete scalar-data write to VCC_LO defines every architectural predicate bit in Wave32.
+    // Consume it immediately through the implicit e32 cndmask form so this cannot pass merely by
+    // treating the new lifetime as dead scalar scratch.
+    const uint32_t wave32_compute_scalar_vcc_lo_consumer[] = {
+        0x876a8181u,                         // s_and_b32 vcc_lo, 1, 1
+        0x02020100u,                         // v_cndmask_b32 v1, v0, v0, vcc
+        0xbf810000u,
+    };
+    if (recompile_compute(wave32_compute_scalar_vcc_lo_consumer,
+                          std::size(wave32_compute_scalar_vcc_lo_consumer), nullptr,
+                          wave32_compute_config).empty()) {
+        printf("  [FAIL] full Wave32 scalar VCC_LO write did not feed implicit cndmask\n");
+        return 1;
+    }
+    printf("  [ok]   full Wave32 scalar VCC_LO write feeds its implicit mask consumer\n");
+
+    // Astro's exact PC458 packet explicitly selects physical VCC_HI in Wave32. A typed B32 mask in
+    // that word must drive the select independently of VCC_LO; absent or path-dependent HI mask
+    // lifetimes must remain fail-visible instead of falling back to the implicit VCC predicate.
+    const uint32_t wave32_compute_explicit_vcc_hi_cndmask[] = {
+        0xbf060000u,                         // s_cmp_eq_u32 s0,s0
+        0x856b807eu,                         // s_cselect_b32 vcc_hi, exec_lo, 0
+        0xd5010000u, 0x01ad0280u,            // v_cndmask_b32_e64 v0, 0, 1, vcc_hi
+        0xbf810000u,
+    };
+    const auto explicit_vcc_hi_cndmask_spv = recompile_compute(
+        wave32_compute_explicit_vcc_hi_cndmask,
+        std::size(wave32_compute_explicit_vcc_hi_cndmask), nullptr,
+        wave32_compute_config);
+    if (explicit_vcc_hi_cndmask_spv.empty() ||
+        !type_result_ids_are_nonzero(explicit_vcc_hi_cndmask_spv, nullptr) ||
+        !phi_ids_are_nonzero(explicit_vcc_hi_cndmask_spv)) {
+        printf("  [FAIL] explicit Wave32 VCC_HI cndmask source was not preserved\n");
+        return 1;
+    }
+    const uint32_t wave32_compute_absent_vcc_hi_cndmask[] = {
+        0xbeeb0380u,                         // scalar-data vcc_hi=0, not a mask
+        0xd5010000u, 0x01ad0280u,            // v_cndmask_b32_e64 v0, 0, 1, vcc_hi
+        0xbf810000u,
+    };
+    if (!recompile_compute(wave32_compute_absent_vcc_hi_cndmask,
+                           std::size(wave32_compute_absent_vcc_hi_cndmask), nullptr,
+                           wave32_compute_config).empty()) {
+        printf("  [FAIL] explicit VCC_HI cndmask accepted an absent mask lifetime\n");
+        return 1;
+    }
+    const uint32_t wave32_compute_ambiguous_vcc_hi_cndmask[] = {
+        0xbf060000u,                         // pc0: scalar branch condition
+        0xbf840001u,                         // pc1: one edge skips the HI definition
+        0x856b807eu,                         // pc2: other edge defines a VCC_HI mask
+        0xd5010000u, 0x01ad0280u,            // pc3: joined VCC_HI read
+        0xbf810000u,
+    };
+    if (!recompile_compute(wave32_compute_ambiguous_vcc_hi_cndmask,
+                           std::size(wave32_compute_ambiguous_vcc_hi_cndmask), nullptr,
+                           wave32_compute_config).empty()) {
+        printf("  [FAIL] explicit VCC_HI cndmask accepted a path-dependent mask lifetime\n");
+        return 1;
+    }
+    printf("  [ok]   explicit Wave32 VCC_HI cndmask requires its own unambiguous mask\n");
+
+    // Exact control/data lifetime from Astro Bot's world-map phase, reduced only to its register-
+    // independent instructions: a scalar-data VCC_LO lifetime feeds CMPX (which changes EXEC but
+    // preserves VCC), one crossing arm defines and immediately consumes a fresh VCC mask, and the
+    // other arm skips that definition. The rejoined VCC lifetime is invalid but dead. Crossing
+    // EXECZ regions force the same arbitrary-CFG dispatcher as the 216..306 production phase.
+    const uint32_t wave32_compute_dead_vcc_join[] = {
+        0xbeea0385u,                         // pc0: scalar-data vcc_lo=5
+        0x7da40100u,                         // pc1: v_cmpx_eq_u32 v0,v0 (EXEC only)
+        0xbf880003u,                         // pc2: execz -> pc6, skipping the VCC definition
+        0x7d840100u,                         // pc3: v_cmp_eq_u32 vcc,v0,v0 (fresh mask)
+        0x02020100u,                         // pc4: v_cndmask_b32 v1,v0,v0,vcc
+        0xbf880002u,                         // pc5: execz -> pc8 (crosses the pc2 region)
+        0xbf060000u,                         // pc6: rejoin; scalar compare, no VCC read
+        0xbf850001u,                         // pc7: third branch -> pc9 forces complex CFG
+        0x7e040280u,                         // pc8: no mask read before termination
+        0xbf810000u,
+    };
+    const auto dead_vcc_join_spv = recompile_compute(
+        wave32_compute_dead_vcc_join, std::size(wave32_compute_dead_vcc_join), nullptr,
+        wave32_compute_config);
+    if (dead_vcc_join_spv.empty() || !has_opcode(dead_vcc_join_spv, 251) ||
+        !type_result_ids_are_nonzero(dead_vcc_join_spv, nullptr) ||
+        !phi_ids_are_nonzero(dead_vcc_join_spv)) {
+        printf("  [FAIL] Wave32 CFG rejected Astro's dead VCC lifetime at a crossing join\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 CFG carries Astro's invalid-but-dead VCC lifetime across a join\n");
+
+    std::vector<uint32_t> dead_vcc_read_at_join(
+        std::begin(wave32_compute_dead_vcc_join),
+        std::end(wave32_compute_dead_vcc_join));
+    dead_vcc_read_at_join[6] = 0x02040500u; // v_cndmask_b32 v2,v0,v2,vcc
+    if (!recompile_compute(dead_vcc_read_at_join.data(), dead_vcc_read_at_join.size(),
+                           nullptr, wave32_compute_config).empty()) {
+        printf("  [FAIL] Wave32 CFG accepted a VCC read after the ambiguous join\n");
+        return 1;
+    }
+    std::vector<uint32_t> dead_vcc_missing_definition(
+        std::begin(wave32_compute_dead_vcc_join),
+        std::end(wave32_compute_dead_vcc_join));
+    dead_vcc_missing_definition[3] = 0x7da40100u; // CMPX does not define VCC
+    if (!recompile_compute(dead_vcc_missing_definition.data(),
+                           dead_vcc_missing_definition.size(), nullptr,
+                           wave32_compute_config).empty()) {
+        printf("  [FAIL] Wave32 CFG accepted a cndmask after replacing its VCC definition\n");
+        return 1;
+    }
+    std::vector<uint32_t> dead_vcc_entered_consumer(
+        std::begin(wave32_compute_dead_vcc_join),
+        std::end(wave32_compute_dead_vcc_join));
+    dead_vcc_entered_consumer[2] = 0xbf880001u; // topology now enters pc4, past the definition
+    if (!recompile_compute(dead_vcc_entered_consumer.data(),
+                           dead_vcc_entered_consumer.size(), nullptr,
+                           wave32_compute_config).empty()) {
+        printf("  [FAIL] Wave32 CFG accepted a branch edge entering past the VCC definition\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 CFG rejects VCC-read, definition, and branch-topology deviations\n");
+
+    // The production shader wraps barrier-separated work in a workgroup-uniform early-out. Its
+    // first barrier-free phase has the same crossing Wave32 CFG as the fixture above and no guest
+    // S_ENDPGM of its own. The phase splitter must supply an emitter-only terminator so the
+    // dispatcher can become inactive, rejoin the uniform outer shell, and reach the guest barrier.
+    const uint32_t wave32_compute_guarded_cfg_phase[] = {
+        0xbf060000u,                         // pc0: uniform s_cmp_eq_u32 s0,s0
+        0xbf84000cu,                         // pc1: early-out -> terminal pc14
+        0xbeea0385u,                         // pc2: scalar-data vcc_lo=5
+        0x7da40100u,                         // pc3: v_cmpx_eq_u32 v0,v0 (EXEC only)
+        0xbf880003u,                         // pc4: execz -> pc8
+        0x7d840100u,                         // pc5: fresh VCC definition
+        0x02020100u,                         // pc6: consume the fresh VCC
+        0xbf880002u,                         // pc7: execz -> pc10
+        0xbf060000u,                         // pc8: rejoin without reading VCC
+        0xbf850001u,                         // pc9: branch -> pc11, skipping pc10
+        0x7e040280u,                         // pc10: first arm
+        0x7e060280u,                         // pc11: phase-local join
+        0xbf8a0000u,                         // pc12: uniform guest barrier
+        0x7e080280u,                         // pc13: tail phase
+        0xbf810000u,                         // pc14: terminal s_endpgm
+    };
+    const auto guarded_cfg_phase_spv = recompile_compute(
+        wave32_compute_guarded_cfg_phase, std::size(wave32_compute_guarded_cfg_phase), nullptr,
+        wave32_compute_config);
+    if (guarded_cfg_phase_spv.empty() || !has_opcode(guarded_cfg_phase_spv, 251) ||
+        !type_result_ids_are_nonzero(guarded_cfg_phase_spv, nullptr) ||
+        !phi_ids_are_nonzero(guarded_cfg_phase_spv)) {
+        printf("  [FAIL] barrier phase rejected Astro's crossing Wave32 CFG\n");
+        return 1;
+    }
+    printf("  [ok]   barrier phase terminates and rejoins Astro's crossing Wave32 CFG\n");
+
     wave32_compute_config.wave_size = 64;
     if (!recompile_compute(wave32_compute_masks, std::size(wave32_compute_masks), nullptr,
                            wave32_compute_config).empty()) {

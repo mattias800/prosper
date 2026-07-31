@@ -243,6 +243,21 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                                                  uint32_t linear_threads_x = 0,
                                                  uint32_t tgid_x_sgpr = UINT32_MAX);
 
+// Apply the exact dispatch-scoped resource-path specialization used by the live compute executor.
+// The report makes the production decision observable to tests and diagnostics: callers can verify
+// which raw PCs disappeared and which instruction-scoped resources were removed before translation.
+// A proven-null marker is retained even after its fetch disappears because recompile_compute repeats
+// the same proof from raw shader bytes; dropping that marker would silently undo the specialization.
+struct ComputeResourcePathSpecializationReport {
+    size_t proven_null_exits = 0;
+    size_t shader_constant_branches = 0;
+    size_t removed_resources = 0;
+    std::vector<uint32_t> removed_pcs;
+};
+ComputeResourcePathSpecializationReport specialize_compute_resource_paths(
+    std::vector<Rdna2Inst>& instructions, ShaderResourceTable& resources,
+    uint32_t wave_size);
+
 // The dynamic descriptor fold and shader-cache key builder both walk immutable shader instructions
 // on every draw. Cache only the decoded instructions, validating the complete consumed byte range on
 // every hit. Concrete SGPR values and descriptor-table memory remain per-draw inputs to the fold.
