@@ -637,6 +637,29 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                                 failure.pipeline.stencil_op_val[1]);
             }
             std::printf("\n");
+            // #1459: a suppressed draw is usually suppressed BECAUSE its resolved write mask is
+            // zero, so the raw registers behind that mask are exactly what this population needs to
+            // explain. Realized draws print the same line; without it here the no-effect draws --
+            // often the bulk of a frame's geometry -- stay unattributable offline.
+            if (failure.pipeline_present) {
+                if (format_version >= 43)
+                    std::printf("  color-state cb-control=%d:%08x mode=%u target-mask=%d:%08x "
+                                "shader-mask=%d:%08x effective=%02x\n",
+                                failure.pipeline.has_cb_color_control,
+                                failure.pipeline.cb_color_control,
+                                (failure.pipeline.cb_color_control >>
+                                 prosper::agc::Pm4::CB_COLOR_CONTROL_MODE_SHIFT) &
+                                    prosper::agc::Pm4::CB_COLOR_CONTROL_MODE_MASK,
+                                failure.pipeline.has_cb_target_mask,
+                                failure.pipeline.cb_target_mask,
+                                failure.pipeline.has_cb_shader_mask,
+                                failure.pipeline.cb_shader_mask,
+                                (failure.pipeline.cb_target_mask &
+                                 failure.pipeline.cb_shader_mask) & 0xFFu);
+                else
+                    std::printf("  color-state unavailable (capture v%u predates v43)\n",
+                                format_version);
+            }
         } else {
             const auto& launch = failure.compute_launch;
             std::printf("  threads=%ux%ux%u local=%ux%ux%u groups=%ux%ux%u\n",
