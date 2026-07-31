@@ -287,6 +287,28 @@ This 2D action title reaches its main menu and attract-mode gameplay, verified a
 project owner, with a menu-reach snapshot guard in place. The title ID is confirmed; the exact retail
 name is pending confirmation.
 
+## Alex Kidd in Miracle World DX — `PPSA02664`
+
+<p align="center">
+  <img src="assets/screenshots/alex-kidd.png" alt="Alex Kidd in Miracle World DX — Mt. Eternal first level">
+</p>
+
+A scripted route reaches the first level (Mt. Eternal) and renders it in full colour at native
+1920x1080: sky gradient and sun rays, parallax mountains, drifting clouds, terrain and floating
+platforms, the player and enemy sprites, gold blocks, the lives and coin HUD, and the dialogue box.
+
+The level previously rendered as a black screen behind the dialogue box. The cause was a **generic
+tiling defect**, not a title-specific one: packed mip-tail levels in 4 KiB tile modes resolved to an
+element origin four times too small, because the block-to-element multiplier was derived from the
+macroblock rather than from the 256-byte block's element extent. Mipped 4x4 SpriteMask sprites then
+decoded as fully transparent foreign texels, every mask fragment failed its alpha test, and a
+legitimate "visible outside mask" fill covered the whole frame. Fixed in #1578, which also added an
+origin-agreement invariant to the tile tests.
+
+A reviewed content guard (`alexkidd-gameplay`) covers the route in `tools/snapshot`. One known
+defect remains: the title screen's watermark overlay composites at roughly half the hardware
+strength (#710).
+
 ## Requirements and scope
 
 - Game files, keys, and copyrighted Sony code are not included. You must supply your own
