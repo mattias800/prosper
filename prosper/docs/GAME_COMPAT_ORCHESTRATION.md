@@ -191,6 +191,31 @@ Before starting a GPU run, inspect existing processes. A Prosper process older t
 stale because known tests should finish in minutes. Resolve the exact command and owner, then terminate that exact
 process safely. Never use a broad pattern that could kill another agent's unrelated work.
 
+**Count with `pgrep -x`. Both `ps | grep` idioms are wrong, in opposite directions.** This is a safety rule, not a
+style preference: a wrong count either blocks you from a free GPU or makes you kill a peer's live run.
+
+| Idiom | Failure | Observed |
+|---|---|---|
+| `ps aux \| grep -cE "prosper-app\|boot_trace"` | **Over-counts** — matches the Bash wrapper shell and any `sleep` watcher whose command line contains the literal | reported **23** when the true count was **0** |
+| `ps -eo comm \| grep -c '^prosper-app$'` | **Under-counts** — `ps` pads the `comm` column, so the `$` anchor never matches | reported **0** against a **live** process |
+
+The second is the dangerous one. On 2026-07-31 an agent reported "GPU released" from that idiom repeatedly; a
+blind `pkill -f prosper-app` on the strength of one such reading would have killed a **successor agent's run 35
+seconds after it started**. It was caught only because the release check was re-run with `pgrep -x`.
+
+Use:
+
+```bash
+pgrep -c -x prosper-app        # count, exact name
+pgrep -ax prosper-app          # list with full command lines
+readlink /proc/<pid>/cwd       # whose worktree is this?
+tr '\0' '\n' < /proc/<pid>/environ | grep PROSPER_   # and whose run?
+```
+
+Before terminating anything, confirm the exact PID **and** that its `cwd`/`environ` identify it as yours. Never
+kill from a pattern count. Note `comm` is truncated to 15 characters by the kernel, so a longer binary name needs
+`pgrep -f` with a **bracketed** pattern (`pgrep -f "prosper[-]app"`) so it cannot match your own shell.
+
 ### Fast evidence loop
 
 For rendering correctness, use this order:
