@@ -3,8 +3,9 @@
 # pulses continue across the title and default new-game setup even when renderer throughput changes
 # the number of flips reached before each screen. The opening movies expose a hold-Square skip meter,
 # so separated Square holds skip those rather than sending ineffective Cross presses into the FMV.
-# Later Cross pulses advance dialogue; the final Right hold proves that the routed tutorial is
-# player-controlled rather than an attract sequence.
+# The first combat dialogue visibly asks for Cross, then the tutorial asks for R2. Separated R2
+# windows cover prompt timing variance while alternating left/right movement provides causal player
+# control evidence and avoids mistaking autonomous enemy fire for progression.
 # Validate this route with the default write-watch configuration; disabling or limiting watches does
 # not exercise the Unity worker-fault path that previously stopped progression at the movie skip.
 f300-312:cross
@@ -36,23 +37,10 @@ f4100-4112:cross
 55-56:cross
 60-64:square
 70-74:square
-80-84:square
-90-94:square
-100-104:square
-110-111:cross
-115-116:cross
-120-121:cross
-125-126:cross
-130-131:cross
-135-136:cross
-140-141:cross
-145-146:cross
-150-151:cross
-155-156:cross
-160-161:cross
-165-166:cross
-170-171:cross
-175-176:cross
-180-181:cross
-185-186:cross
-190-220:left-stick-right
+75-77:cross
+78-80:cross
+82-84:r2
+86-94:r2+left-stick-left
+96-104:r2+left-stick-right
+106-114:r2+left-stick-left
+116-124:r2+left-stick-right
