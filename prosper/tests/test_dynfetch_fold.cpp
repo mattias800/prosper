@@ -836,16 +836,37 @@ int main() {
       marker.host_data = loop_null_bvh.data();
       marker.host_data_size = loop_null_bvh.size();
       loop_null_table.resources.push_back(marker); }
+    for (uint32_t fetch_pc : {968u, 1007u}) {
+        ShaderResource dead{};
+        dead.cls = ResourceClass::ConstantBuffer;
+        dead.format = DataFormat::Uint32;
+        dead.num_components = 1;
+        dead.size = 4;
+        dead.fetch_pc = fetch_pc;
+        loop_null_table.resources.push_back(dead);
+    }
     std::vector<Rdna2Inst> null_pruned_loop = loop_variant_branch;
-    CHECK(rdna2_specialize_proven_null_bvh_paths(
-              null_pruned_loop, &loop_null_table, 32) == 1 &&
-              rdna2_specialize_shader_constant_branches(null_pruned_loop) == 0 &&
+    const ComputeResourcePathSpecializationReport null_path_report =
+        specialize_compute_resource_paths(null_pruned_loop, loop_null_table, 32);
+    CHECK(null_path_report.proven_null_exits == 1 &&
+              null_path_report.shader_constant_branches == 0 &&
+              null_path_report.removed_resources == 2 &&
+              std::find(null_path_report.removed_pcs.begin(),
+                        null_path_report.removed_pcs.end(), 968) !=
+                  null_path_report.removed_pcs.end() &&
+              std::find(null_path_report.removed_pcs.begin(),
+                        null_path_report.removed_pcs.end(), 1007) !=
+                  null_path_report.removed_pcs.end() &&
               std::none_of(null_pruned_loop.begin(), null_pruned_loop.end(),
                            [](const Rdna2Inst& in) {
                                return in.pc == 968 || in.pc == 1007 || in.pc == 1610 ||
                                       in.pc == 1663 || in.pc == 1671 || in.pc == 1674;
-                           }),
-          "exact null-root plus empty stack removes the unseeded traversal cycle");
+                           }) &&
+              loop_null_table.resources.size() == 1 &&
+              is_proven_null_bvh(loop_null_table.resources.front()) &&
+              loop_null_table.resources.front().fetch_pc == 1346,
+          "executor resource-path specialization reports the exact removed traversal PCs, "
+          "prunes their resources, and retains the null proof for raw translation");
 
     ShaderResourceTable nonnull_loop_table = loop_null_table;
     nonnull_loop_table.resources[0].gpu_addr = 0x10000u;

@@ -5920,6 +5920,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.ibin(Op_BitwiseAnd,
                                b.ibin(Op_ShiftRightLogical, result, bit), b.uconst(1)),
                         b.uconst(0));
+                    if (b.wave_size == 32) {
+                        // A complete scalar write covers every architectural bit of VCC_LO in
+                        // Wave32, so it establishes a fresh predicate without needing the old VCC
+                        // lifetime. VCC_HI is ordinary scratch outside the 32-lane mask and cannot
+                        // affect the implicit VCC condition at all. This distinction matters for
+                        // generated kernels that load scalar data into LO, derive a flag in HI, and
+                        // compare both as uints before creating their next vector predicate.
+                        if (writes_hi) {
+                            rs.sreg_bool.erase(107);
+                            rs.sreg_bool_narrowed.erase(107);
+                            rs.sreg_bool_b32.erase(107);
+                        } else {
+                            rs.vcc = result_bit;
+                            rs.sreg_bool[106] = result_bit;
+                            rs.sreg_bool_narrowed[106] = true;
+                        }
+                        return true;
+                    }
                     if (!rs.vcc) { ok = false; return true; }
                     rs.vcc = b.bsel(in_written_half, result_bit, rs.vcc);
                     rs.sreg_bool[in.dst.value] = rs.vcc;
@@ -7660,7 +7678,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 vreg[in.dst.value] = fresult(b.sel(anyz, zb, b.fbin(Op_FMul, s0b, s1b)));
             } else if (in.opcode == 0x101) {                          // v_cndmask_b32_e64: src2_mask ? src1 : src0
                 const Operand& s2 = in.src[2]; uint32_t m = 0;        // src2 is an SGPR-pair (or VCC) wave mask
-                if (s2.value == 106 || s2.value == 107) m = rs.vcc;
+                if (s2.value == 106 || s2.value == 107) {
+                    // Wave32 e64/SDWA forms may explicitly select either physical VCC word as an
+                    // independent one-dword mask. Prefer that typed lifetime when present. Only
+                    // VCC_LO may fall back to the architectural implicit predicate; VCC_HI is a
+                    // distinct word in Wave32 and must have its own proven mask lifetime.
+                    auto it = rs.sreg_bool.find(s2.value);
+                    if (rs.sreg_bool_b32.contains(s2.value) && it != rs.sreg_bool.end())
+                        m = it->second;
+                    else if (s2.value == 106)
+                        m = rs.vcc;
+                }
                 else if (s2.kind == OperandKind::SGPR) {
                     auto it = rs.sreg_bool.find(s2.value);
                     if (it != rs.sreg_bool.end()) {
@@ -10432,7 +10460,8 @@ bool emit_cfg_state_machine(
     const bool graphics = b.is_fragment || b.is_vertex;
     auto reject_cfg = [&](uint32_t pc, const char* reason) {
         if (getenv("PROSPER_DBG"))
-            std::fprintf(stderr, "[graphics-cfg-reject] pc=%u reason=%s\n", pc, reason);
+            std::fprintf(stderr, "[%s-cfg-reject] pc=%u reason=%s\n",
+                         b.is_compute ? "compute" : "graphics", pc, reason);
         return false;
     };
     if ((!b.is_compute && !graphics) || ins.empty()) return false;
@@ -10758,7 +10787,37 @@ bool emit_cfg_state_machine(
     if (b.allow_b32_masks && !starts.empty()) {
         b32_mask_in.front().insert(
             initial.sreg_bool_b32.begin(), initial.sreg_bool_b32.end());
+        // `vcc` is the implicit VCC_LO mask even when no instruction has needed an explicit
+        // sreg_bool[106] alias yet. Preserve that valid entry lifetime in the same physical-domain
+        // analysis as explicit Wave32 masks. A zero SSA id instead means the caller currently has
+        // ordinary scalar data in the VCC words, so it deliberately does not seed the mask domain.
+        if (initial.vcc) b32_mask_in.front().insert(106);
         b32_mask_reachable.front() = true;
+        auto implicit_vcc_mask_source = [](const Rdna2Inst& in) -> int {
+            if (in.fmt == Rdna2Format::SOPP &&
+                (in.opcode == 0x06 || in.opcode == 0x07))
+                return 106; // s_cbranch_vccz/nz
+            if (in.fmt == Rdna2Format::VOP2 &&
+                (in.opcode == 0x01 ||
+                 (in.opcode >= 0x28 && in.opcode <= 0x2a)))
+                return 106; // e32 cndmask and carry-in/out forms use implicit VCC
+            if (in.fmt == Rdna2Format::VOP3 &&
+                (in.opcode == 0x101 ||
+                 (in.opcode >= 0x128 && in.opcode <= 0x12a))) {
+                const Operand& mask = in.src[2];
+                if ((mask.kind == OperandKind::SGPR || mask.kind == OperandKind::Special) &&
+                    (mask.value == 106 || mask.value == 107))
+                    return mask.value;
+            }
+            if (in.fmt == Rdna2Format::VOP3 &&
+                (in.opcode == 0x365 || in.opcode == 0x366)) {
+                const Operand& mask = in.src[0];
+                if ((mask.kind == OperandKind::SGPR || mask.kind == OperandKind::Special) &&
+                    (mask.value == 106 || mask.value == 107))
+                    return mask.value;
+            }
+            return -1;
+        };
         std::vector<uint32_t> pending{0};
         while (!pending.empty()) {
             const uint32_t block = pending.back();
@@ -10769,6 +10828,21 @@ bool emit_cfg_state_machine(
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
+
+                // The dispatcher may use a false backing value for a physical VCC lifetime that is
+                // provably dead. Do not let that implementation placeholder become observable: every
+                // instruction whose ISA encoding requires a VCC mask must see one on all incoming
+                // paths. Explicit SGPR operands remain governed by the data/mask-domain checks below.
+                const int implicit_vcc = implicit_vcc_mask_source(in);
+                if (implicit_vcc >= 0 &&
+                    (!masks.contains(implicit_vcc) || ambiguous.contains(implicit_vcc))) {
+                    if (getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[%s-cfg-reject] pc=%u "
+                                     "reason=missing-wave32-vcc-mask\n",
+                                     b.is_compute ? "compute" : "graphics", in.pc);
+                    return false;
+                }
 
                 bool reads_ambiguous = false;
                 for (uint32_t source = 0; source < in.n_src; ++source) {
@@ -10784,8 +10858,9 @@ bool emit_cfg_state_machine(
                 if (reads_ambiguous) {
                     if (getenv("PROSPER_DBG"))
                         std::fprintf(stderr,
-                                     "[graphics-cfg-reject] pc=%u reason=wave32-ambiguous-mask-read\n",
-                                     in.pc);
+                                     "[%s-cfg-reject] pc=%u "
+                                     "reason=wave32-ambiguous-mask-read\n",
+                                     b.is_compute ? "compute" : "graphics", in.pc);
                     return false;
                 }
 
@@ -11126,9 +11201,13 @@ bool emit_cfg_state_machine(
     }
     b.store_function(scc_var, initial.scc ? initial.scc : no);
     // The dispatcher has no runtime type tag for a physical VCC word recycled as scalar data.
-    // Keep that unsupported join fail-visible instead of persisting an invented false mask.
-    if (!initial.vcc) return false;
-    b.store_function(vcc_var, initial.vcc);
+    // Wave32's compile-time mask-domain analysis above proves whether each implicit VCC consumer
+    // sees a real mask. It is therefore safe to persist false while that lifetime is absent/dead;
+    // load_state keeps the placeholder out of RegState on those entries. Other modes retain the
+    // old fail-visible contract because they have no equivalent proof.
+    if (!initial.vcc && !proven_wave32_masks)
+        return reject_cfg(ins.front().pc, "missing-entry-vcc");
+    b.store_function(vcc_var, initial.vcc ? initial.vcc : no);
     b.store_function(exec_var, initial.exec);
     b.store_function(pc_var, b.uconst(0));
     b.store_function(active_var, yes);
@@ -11164,7 +11243,8 @@ bool emit_cfg_state_machine(
             state.vgpr_lane_mask_slots[kv.first.first][kv.first.second] =
                 b.load_function(b.t_bool, kv.second);
         state.scc = b.load_function(b.t_bool, scc_var);
-        state.vcc = b.load_function(b.t_bool, vcc_var);
+        state.vcc = (!entry_b32 || entry_b32->contains(106))
+            ? b.load_function(b.t_bool, vcc_var) : 0;
         state.exec = b.load_function(b.t_bool, exec_var);
         if (entry_b32) {
             for (int reg : *entry_b32) {
@@ -11227,7 +11307,7 @@ bool emit_cfg_state_machine(
         // A poisoned (0) SCC degrades to bfalse at the block boundary: the same-block consumers
         // reject on the sentinel; cross-block staleness matches the pre-poison model.
         b.store_function(scc_var, state.scc ? state.scc : b.bfalse());
-        b.store_function(vcc_var, state.vcc);
+        b.store_function(vcc_var, state.vcc ? state.vcc : no);
         b.store_function(exec_var, state.exec);
     };
 
@@ -11516,8 +11596,6 @@ bool emit_cfg_state_machine(
                 b.store_function(vote_to_scc_var, yes);
             }
         }
-        if (!state.vcc)
-            return reject_cfg(starts[final_block], "poisoned-vcc-boundary");
         save_state(state, dispatch);
         if (mbcnt) {
             if (!set_next(mbcnt->pc + mbcnt->len_dwords))
@@ -11941,6 +12019,17 @@ bool emit_cfg_state_machine(
     // Expose the final emulated state to the caller. Graphics exports are emitted in their exact
     // cases, while any post-body bookkeeping still sees this invocation's final register values.
     initial = load_state();
+    if (proven_wave32_masks) {
+        const auto end_block = block_for_pc.find(end_pc);
+        if (end_block != block_for_pc.end() &&
+            (!b32_mask_reachable[end_block->second] ||
+             !b32_mask_in[end_block->second].contains(106))) {
+            initial.vcc = 0;
+            initial.sreg_bool.erase(106);
+            initial.sreg_bool_narrowed.erase(106);
+            initial.sreg_bool_b32.erase(106);
+        }
+    }
     return true;
 }
 
@@ -12078,17 +12167,31 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
 
             size_t phase_begin = phased.guard_index + 1;
             for (size_t barrier_index : phased.barriers) {
-                const std::vector<Rdna2Inst> phase(
+                std::vector<Rdna2Inst> phase(
                     ins.begin() + phase_begin, ins.begin() + barrier_index);
                 if (!phase.empty()) {
+                    // A phase is a complete control-flow region even though the guest's real
+                    // S_ENDPGM follows the final phase. The arbitrary-CFG fallback requires an end
+                    // block so its persistent dispatcher can become inactive and rejoin this outer
+                    // barrier sequence. Give each proven split a synthetic, emitter-only terminator
+                    // at the boundary; no branch crosses the boundary (proved above), and the raw
+                    // barrier remains emitted exactly once by this outer shell.
+                    Rdna2Inst phase_end;
+                    phase_end.pc = ins[barrier_index].pc;
+                    phase_end.fmt = Rdna2Format::SOPP;
+                    phase_end.opcode = 0x01u;
+                    phase_end.len_dwords = 1;
+                    phase_end.is_end = true;
+                    phase.push_back(phase_end);
                     if (getenv("PROSPER_DBG"))
                         std::fprintf(stderr, "[compute-phase] begin=%u end=%u barrier=%u\n",
-                                     phase.front().pc, phase.back().pc, ins[barrier_index].pc);
+                                     phase.front().pc, phase[phase.size() - 2].pc,
+                                     ins[barrier_index].pc);
                     if (!emit_body(b, rs, phase, safe, rt, allow_exec_update, allow_smem,
                                    exp_fn, code, dwords, &dead_masks)) {
                         if (getenv("PROSPER_DBG"))
                             std::fprintf(stderr, "[compute-phase-reject] begin=%u end=%u\n",
-                                         phase.front().pc, phase.back().pc);
+                                         phase.front().pc, phase[phase.size() - 2].pc);
                         return false;
                     }
                 }
@@ -12816,13 +12919,30 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // mask bits to the architecture's wave-wide "any lane active" predicate.
                 // A poisoned SCC (0: last written by a 64-bit mask op) cannot condition a real
                 // structured if — reject (the ISA-audit #879 stale-SCC consumer).
-                if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
-                if (F.on_vcc && !rs.vcc) return false;
+                if (!F.on_exec && !F.on_vcc && !rs.scc) {
+                    if (getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[compute-struct-reject] poisoned SCC at branch pc=%u\n",
+                                     F.branch_pc);
+                    return false;
+                }
+                if (F.on_vcc && !rs.vcc) {
+                    if (getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[compute-struct-reject] missing VCC at branch pc=%u\n",
+                                     F.branch_pc);
+                    return false;
+                }
                 // Compute VCC/EXEC branches normally return through the exact guest-wave dispatcher.
                 // The narrow structured-wave path above accepts only top-level vote sites, where all
                 // workgroup invocations may participate in the scratch barriers uniformly.
-                if (b.is_compute && (F.on_exec || F.on_vcc) && !structured_compute_wave_cfg)
+                if (b.is_compute && (F.on_exec || F.on_vcc) && !structured_compute_wave_cfg) {
+                    if (getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[compute-struct-reject] unavailable wave vote at branch pc=%u\n",
+                                     F.branch_pc);
                     return false;
+                }
                 uint32_t cond_reg = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
                 if (b.is_compute && (F.on_exec || F.on_vcc))
                     cond_reg = b.native_subgroup_size
@@ -12922,7 +13042,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // `hi` and the merge coincides with the region end.
                     uint32_t else_hi = F.merge_pc;
                     if (F.merge_pc >= hi) {
-                        if (F.merge_pc != cont && F.merge_pc != hi) return false;
+                        if (F.merge_pc != cont && F.merge_pc != hi) {
+                            if (getenv("PROSPER_DBG"))
+                                std::fprintf(stderr,
+                                             "[compute-struct-reject] escaping merge pc=%u merge=%u "
+                                             "region=%u continuation=%u\n",
+                                             F.branch_pc, F.merge_pc, hi, cont);
+                            return false;
+                        }
                         else_hi = hi;
                     }
                     const RegState pre = rs;                // FULL snapshot: the else-arm re-runs from it
@@ -12993,7 +13120,18 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // scalar already; EXECZ/VCCZ use fragment_wave_any), so native wave operations in any
         // structured arm observe the complete guest wave.
         wave_ok = b.is_fragment;
-        if (!emit_structured(0, UINT32_MAX, UINT32_MAX)) return false;
+        if (!emit_structured(0, UINT32_MAX, UINT32_MAX)) {
+            if (getenv("PROSPER_DBG")) {
+                const uint32_t next_pc = idx < ins.size() ? ins[idx].pc : UINT32_MAX;
+                const uint32_t next_if = bi < Fs.size() ? Fs[bi].branch_pc : UINT32_MAX;
+                const uint32_t next_loop = li < Ls.size() ? Ls[li].header_pc : UINT32_MAX;
+                std::fprintf(stderr,
+                             "[compute-struct-reject] structured emission stopped next-pc=%u "
+                             "next-if=%u next-loop=%u\n",
+                             next_pc, next_if, next_loop);
+            }
+            return false;
+        }
     }
     (void)safe_branches;
     return true;

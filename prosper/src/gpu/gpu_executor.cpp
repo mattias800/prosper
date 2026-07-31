@@ -3137,6 +3137,44 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
 
 namespace { constexpr uint32_t kPsBindingBase = 32; }
 
+// Preserve the exact resource-path proof across the decoded analysis and raw-byte translation
+// passes. Ordinary instruction-scoped resources disappear with their consumers, but the dispatch-
+// scoped null marker must survive because the raw translator independently repeats the proof.
+ComputeResourcePathSpecializationReport specialize_compute_resource_paths(
+        std::vector<Rdna2Inst>& instructions, ShaderResourceTable& resources,
+        uint32_t wave_size) {
+    ComputeResourcePathSpecializationReport report;
+    std::vector<uint32_t> original_pcs;
+    original_pcs.reserve(instructions.size());
+    for (const Rdna2Inst& instruction : instructions)
+        original_pcs.push_back(instruction.pc);
+
+    report.proven_null_exits = rdna2_specialize_proven_null_bvh_paths(
+        instructions, &resources, wave_size);
+    if (!report.proven_null_exits) return report;
+    report.shader_constant_branches =
+        rdna2_specialize_shader_constant_branches(instructions);
+
+    std::unordered_set<uint32_t> live_pcs;
+    live_pcs.reserve(instructions.size());
+    for (const Rdna2Inst& instruction : instructions)
+        live_pcs.insert(instruction.pc);
+    for (uint32_t pc : original_pcs)
+        if (!live_pcs.contains(pc)) report.removed_pcs.push_back(pc);
+
+    const size_t resources_before = resources.resources.size();
+    std::erase_if(resources.resources, [&](const ShaderResource& resource) {
+        // The raw-byte translator repeats resource-path specialization. Keep its dispatch-scoped
+        // null proof even though the marked IMAGE_BVH instruction disappeared from this analysis
+        // stream; all ordinary instruction-scoped resources can be pruned with their consumer.
+        return resource.fetch_pc != 0xFFFFFFFFu &&
+               !is_proven_null_bvh(resource) &&
+               !live_pcs.contains(resource.fetch_pc);
+    });
+    report.removed_resources = resources_before - resources.resources.size();
+    return report;
+}
+
 // Assign each resource its OWN descriptor binding, starting at `first` (0/1 reserved). The N-buffer
 // model: the shader reads several distinct constant buffers (Unity's per-draw transform, per-frame,
 // …) + vertex buffers + textures, and each must land at a separate binding so they don't collapse.
@@ -4127,17 +4165,20 @@ std::vector<ComputeItem> realize_compute_dispatches(
             // Drop only instruction-scoped resources whose consumers disappeared. Direct resources
             // (fetch_pc == UINT32_MAX) remain available to every surviving use of their SGPR/SRT key.
             std::vector<Rdna2Inst> resource_paths = decoded;
-            if (rdna2_specialize_proven_null_bvh_paths(
-                    resource_paths, table.get(), compute_wave_size)) {
-                (void)rdna2_specialize_shader_constant_branches(resource_paths);
-                std::unordered_set<uint32_t> live_pcs;
-                live_pcs.reserve(resource_paths.size());
-                for (const Rdna2Inst& instruction : resource_paths)
-                    live_pcs.insert(instruction.pc);
-                std::erase_if(table->resources, [&](const ShaderResource& resource) {
-                    return resource.fetch_pc != 0xFFFFFFFFu &&
-                           !live_pcs.contains(resource.fetch_pc);
-                });
+            const ComputeResourcePathSpecializationReport path_report =
+                specialize_compute_resource_paths(resource_paths, *table, compute_wave_size);
+            if (std::getenv("PROSPER_DBG") && path_report.proven_null_exits) {
+                std::fprintf(stderr,
+                             "[compute-resource-specialization] code=0x%llx null-exits=%zu constants=%zu "
+                             "removed-resources=%zu removed-pcs=",
+                             static_cast<unsigned long long>(code_addr),
+                             path_report.proven_null_exits,
+                             path_report.shader_constant_branches,
+                             path_report.removed_resources);
+                for (size_t index = 0; index < path_report.removed_pcs.size(); ++index)
+                    std::fprintf(stderr, "%s%u", index ? "," : "",
+                                 path_report.removed_pcs[index]);
+                std::fprintf(stderr, "\n");
             }
             assign_convention_bindings(*table, 2);
             native_multiwave_wave_work = compute_shader_prefers_native_multiwave(
@@ -4250,7 +4291,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
             if (getenv("PROSPER_DYNTRACE_FAIL")) {
                 static std::set<uint64_t> traced_cs;
                 if (traced_cs.insert(code_addr).second) {
-                    std::fprintf(stderr, "[dynfail] replaying COMPUTE 0x%llx resource build with trace:\n",
+                    std::fprintf(stderr,
+                                 "[dynfail] replaying PRE-SPECIALIZATION raw COMPUTE 0x%llx "
+                                 "resource build with trace:\n",
                                  (unsigned long long)code_addr);
                     std::fprintf(stderr, "[dynfail]   compute user-data SGPRs (s0..s%u):\n", kUserSgprs - 1);
                     std::fprintf(stderr,
@@ -4269,7 +4312,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
                                           sgprs, kUserSgprs, 0, &cs_uses);
                     g_dyntrace_force = false;
-                    std::fprintf(stderr, "[dynfail]   const-fold recovered %zu descriptor use(s):\n",
+                    std::fprintf(stderr,
+                                 "[dynfail]   pre-specialization raw const-fold recovered %zu "
+                                 "descriptor use(s):\n",
                                  cs_uses.size());
                     for (const auto& u : cs_uses) {
                         if (u.kind == 0) {
