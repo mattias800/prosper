@@ -3726,8 +3726,8 @@ CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
     return L;
 }
 
-// DIVERGENT EXEC/VCC-EXIT LOOPS (#273/#615 — post-process and light-accumulation PSes, the title-composite
-// content producers). The compiled shape:
+// MULTI-LOOP EXEC/VCC/SCC EXITS (#273/#615/#1554 — post-process and light-accumulation PSes,
+// title-composite content producers, and compute histogram loops). The divergent compiled shape:
 //     header: <exec recompute: v_cmpx_.. counter,bound  |  v_cmp..;s_andn2_b64 exec,exec,vcc>
 //             s_cbranch_execz EXIT                      ; leave when no lane remains
 //     body:   ... (nested forward-execz if regions, saveexec/restore, scalar counter++) ...
@@ -3746,15 +3746,18 @@ CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
 // supports a VCCZ break with an unconditional back-edge by carrying the uniform continue vote to the
 // loop latch and branching the complete wave directly to the loop merge.
 struct DivLoop {
-    enum class Condition : uint8_t { Exec, Vcc };
+    enum class Condition : uint8_t { Exec, Vcc, Scc };
     uint32_t header_pc = 0;        // back-edge target; condition region = [header_pc, exit_branch_pc)
-    uint32_t exit_branch_pc = 0;   // canonical forward execz/vccz branch whose target is exit_pc
+    uint32_t exit_branch_pc = 0;   // canonical forward execz/vccz/scc branch whose target is exit_pc
     uint32_t backedge_pc = 0;      // backward s_branch (unconditional) or s_cbranch_execnz
     uint32_t exit_pc = 0;          // backedge_pc + its length (first pc after the loop)
     std::vector<uint32_t> break_pcs;   // extra forward vccz/execz -> exit_pc (lowered as body ifs)
     bool direct_exec_breaks = false;   // unconditional back-edge: an interior execz exits directly
     bool direct_wave_breaks = false;   // fragment wave64: an interior vccz exits the complete wave
     Condition condition = Condition::Exec;
+    // EXECZ/VCCZ and SCC0 all continue while their represented predicate is set. SCC1 is the one
+    // admitted opposite-polarity canonical exit: it leaves the loop while SCC is set.
+    bool continue_on_set = true;
 };
 
 // Number of consecutive VGPRs an instruction writes, starting at dst. This is intentionally an
@@ -4042,6 +4045,13 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                         // Fragment reduces the real VCC mask through a forced wave64 vote. Other
                         // structured stages require the compare to be proven uniform first.
                         L.condition = DivLoop::Condition::Vcc;
+                    } else if ((in.opcode == 0x04 || in.opcode == 0x05) && !execnz) {
+                        // A scalar SCC exit with an unconditional back-edge is the same canonical
+                        // top-tested while loop accepted by CountedLoop. Keep it in this multi-loop
+                        // region form when several disjoint/nested loops coexist in one shader.
+                        // scc0 exits while SCC==0 (continue on set); scc1 has the opposite polarity.
+                        L.condition = DivLoop::Condition::Scc;
+                        L.continue_on_set = in.opcode == 0x04;
                     } else {
                         return {};
                     }
@@ -4252,6 +4262,7 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 }
                 break;
             case 0x04: case 0x05:                                    // scc0 / scc1
+                if (loop_exit(in.pc)) continue;                      // scalar loop condition: loop emitter owns it
                 if (skip && skip->count(in.pc)) continue;            // kill-mask branch: linearized, not an if
                 break;
             default: continue;                                       // hints
@@ -6344,6 +6355,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg[in.dst.value] = b.ibin(
                         Op_IMul, a, b.uconst(static_cast<uint32_t>(in.simm16)));
                     rs.sreg_srt.erase(in.dst.value);
+                    break;
+                }
+                case 0x0F: {                                // s_addk_i32 (read-modify-write)
+                    // SIMM16 is sign-extended, the destination receives the low 32 bits, and SCC
+                    // reports signed overflow. This is the immediate form of SOP2 s_add_i32, so use
+                    // the same two's-complement overflow identity: (~(a^c)) & (a^d), bit 31.
+                    const uint32_t a = val(in.dst);
+                    const uint32_t c = b.uconst(static_cast<uint32_t>(in.simm16));
+                    const uint32_t d = b.ibin(Op_IAdd, a, c);
+                    const uint32_t overflow = b.ibin(
+                        Op_BitwiseAnd,
+                        b.iun(Op_Not, b.ibin(Op_BitwiseXor, a, c)),
+                        b.ibin(Op_BitwiseXor, a, d));
+                    rs.sreg[in.dst.value] = d;
+                    rs.sreg_srt.erase(in.dst.value);
+                    rs.scc = b.ucmp(
+                        Op_INotEqual,
+                        b.ibin(Op_ShiftRightLogical, overflow, b.uconst(31)),
+                        b.uconst(0));
                     break;
                 }
                 case 0x03: case 0x04: case 0x05: case 0x06:
@@ -13227,7 +13257,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             !emit_body(b, rs, postloop, effective_safe, rt, allow_exec_update, allow_smem,
                        exp_fn, code, dwords)) return false;
     } else if (std::vector<DivLoop> Ls; true) {
-        // EXEC/VCC-exit loops (#273/#615) + structured scalar IFs. Each is a real structured SPIR-V
+        // EXEC/VCC/SCC-exit loops (#273/#615/#1554) + structured scalar IFs. Each is a real SPIR-V
         // loop with header phis for carried register/mask state. Fragment conditions are exact wave64
         // votes; vertex and the guarded compute cases retain their per-invocation form. The IF
         // machinery recurses into loop bodies and handles their nested forward-execz regions.
@@ -13247,6 +13277,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             //     workgroup-divergent control flow (UB). DOLL's blocked light/fill kernels are
             //     straight-line bodies, so nothing observed is lost. CONFIDENCE: MED-HIGH (shared
             //     emit machinery; spirv-val + coverage tests + Messenger guard gate it).
+            // SCC-condition loops use exact architectural scalar control and may retain ordinary
+            // LDS effects; their synchronized/cross-lane operations remain rejected below.
             // Condition::Vcc loops are accepted under the detector's uniformity proof (#615/#590).
             // Condition::Exec loops (#590 — DOLL's nested post-process kernel is the observed compute
             // case) lower with the per-invocation model: this invocation
@@ -13260,7 +13292,15 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 for (const auto& in : ins) {
                     if (in.is_end || in.pc >= L.exit_pc) break;
                     if (in.pc < L.header_pc) continue;
-                    if (in.fmt == Rdna2Format::DS ||
+                    const bool ds_wave_collective = in.fmt == Rdna2Format::DS &&
+                        (in.opcode == 0x35 || in.opcode == 0x3d || in.opcode == 0x3e);
+                    // SCC is architectural scalar control, so an SCC loop executes ordinary LDS
+                    // effects uniformly within each guest wave just like the existing CountedLoop
+                    // path. EXEC/VCC loops retain their per-invocation approximation and therefore
+                    // keep rejecting all LDS. Cross-lane DS collectives, MBCNT, and a guest barrier
+                    // remain unavailable in every multi-loop condition domain.
+                    if ((in.fmt == Rdna2Format::DS &&
+                         (L.condition != DivLoop::Condition::Scc || ds_wave_collective)) ||
                         (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) ||
                         (in.fmt == Rdna2Format::VOP3 &&
                          (in.opcode == 0x365 || in.opcode == 0x366))) { compute_ok = false; break; }
@@ -13423,7 +13463,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // uses its exact guest-wave reduction paths. Either may enter/leave with EXEC narrowed, and
         // EXEC is phi'd across the merge like any other value.
         std::function<bool(uint32_t, uint32_t, uint32_t)> emit_structured;
-        // Emit one EXEC/VCC-exit loop (#273/#615) as structured SPIR-V. Same block shape as
+        // Emit one EXEC/VCC/SCC-exit loop (#273/#615/#1554) as structured SPIR-V. Same block shape as
         // the counted-loop path (hdr -> chk -> body -> cont -> hdr, exit chk->merge) with three
         // differences: (1) fragment votes the complete wave's EXEC/VCC after the header recompute
         // (other guarded stages consume this lane's bool); (2) the body is
@@ -13464,25 +13504,36 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (int k : mask_keys) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.sreg_bool[k], preheader, p); rs.sreg_bool[k] = ph; phis.push_back({k, 5, ph, p}); }
             invalidate_loop_descriptor_provenance(rs, scalar_may_writes);
             b.emit_loopmerge(merge, cont); b.emit_branch(chk); b.emit_label(chk);
-            // An EXEC-governed loop predicates vector writes. A VCC-governed loop branches on this
-            // invocation's VCC bit but does not itself change EXEC, matching the hardware loop body.
+            // An EXEC-governed loop predicates vector writes. VCC/SCC-governed loops branch on their
+            // represented predicate but do not themselves change EXEC, matching the hardware body.
             if (L.condition == DivLoop::Condition::Exec) rs.exec_narrowed = true;
             // Condition region [header, exit_branch): branch-free (validated), straight-line.
+            const uint32_t condition_entry_scc = rs.scc;
             if (!emit_range(L.header_pc, L.exit_branch_pc)) return false;
+            // A canonical SCC loop must compute a fresh representable scalar predicate on every
+            // header visit. Reusing the header phi would admit stale SCC, while a B64 wave-mask
+            // producer poisons rs.scc to zero; both remain fail-visible.
+            if (L.condition == DivLoop::Condition::Scc &&
+                (!rs.scc || rs.scc == condition_entry_scc))
+                return false;
             // chk-end snapshots: the exit path flows THROUGH this block, so these dominate the merge.
             std::unordered_map<int, uint32_t> condv_val, conds_val;
             for (int r : condv) condv_val[r] = vget(r);
             for (int r : conds) conds_val[r] = sget(r);
             const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
             const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
-            uint32_t loop_cond = L.condition == DivLoop::Condition::Exec ? rs.exec : rs.vcc;
+            uint32_t loop_cond = L.condition == DivLoop::Condition::Exec ? rs.exec
+                               : L.condition == DivLoop::Condition::Vcc ? rs.vcc : rs.scc;
             if (!loop_cond) return false;
+            if (!L.continue_on_set)
+                loop_cond = b.logical_not(loop_cond);
             // EXECZ/VCCZ are scalar wave decisions. Keeping every fragment invocation in the loop
             // until the complete guest wave becomes empty makes scalar state and nested wave votes
             // exact; vector writes remain predicated by the per-lane EXEC bool.
-            if (b.is_fragment) loop_cond = b.fragment_wave_any(loop_cond);
+            if (b.is_fragment && L.condition != DivLoop::Condition::Scc)
+                loop_cond = b.fragment_wave_any(loop_cond);
             const uint32_t chk_end = b.cur_block;
-            b.emit_condbranch(loop_cond, body, merge);         // execz/vccz exit: continue while bit set
+            b.emit_condbranch(loop_cond, body, merge);         // canonical exit: branch on continue predicate
             while (idx < ins.size() && ins[idx].pc < L.exit_branch_pc) ++idx;
             if (idx < ins.size() && ins[idx].pc == L.exit_branch_pc) ++idx;   // consume the exit branch
             b.emit_label(body);
