@@ -21,7 +21,7 @@ Last updated: 2026-07-31
 | Terminator (2D)&nbsp;¹ | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay reached (user-verified) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Day One gameplay renders; the manor entrance hall matches the hardware reference |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
-| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 title, name entry, and new-save name confirmation reached; gameplay is not yet validated |
+| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 title, name entry, name confirmation, and first-run `System Settings 1/4` onboarding reached; gameplay is not yet validated |
 | Additional Unity/IL2CPP target | `PPSA02664` | Unity / IL2CPP | 🔬 Exercised, with no published gameplay milestone |
 
 ¹ Exact retail game name pending confirmation.
@@ -211,6 +211,10 @@ individually probed and confirmed as legitimate frustum culls (#1435).
   <img src="assets/screenshots/dragon-quest-vii-name-confirmation.png" alt="Dragon Quest VII Reimagined — new-save name confirmation with Yes selected">
 </p>
 
+<p align="center">
+  <img src="assets/screenshots/dragon-quest-vii-onboarding.png" alt="Dragon Quest VII Reimagined — first-run System Settings 1/4 onboarding">
+</p>
+
 This Unreal Engine 4 target renders its localized, animated title screen at native 3840×2160. A
 current-master run with unique roots for both save backends reached it in about 34 seconds with seven
 ordinary Cross pulses; the first image above is an unmodified native frontend capture of the
@@ -236,9 +240,20 @@ the title. Cross is confirm and Circle is cancel in this flow.
 A fresh-root follow-up on exact master continued through the keyboard controls: the validated route
 selected `Back`, moved down to `OK`, and pressed Cross once at 160 seconds. That opened the name
 confirmation prompt with `Yes` selected and `No` below. The third image above is the direct, unmodified
-native 3840×2160 Linux `tools/screenshot` capture from that state; no input followed the confirming
-Cross, so `Yes` itself was not pressed. Save creation and gameplay are still unvalidated. See the
-unchanged exact title route in
+native 3840×2160 Linux `tools/screenshot` capture from that state. In that earlier checkpoint, no input
+followed the confirming Cross, so `Yes` itself was not pressed.
+
+A subsequent fresh-root run preserved the route, pressed the selected `Yes` once, and sent no later
+input. The name was confirmed and the game advanced to its first-run `System Settings 1/4` onboarding
+prompt. The fourth image above is the direct, unmodified native 3840×2160 Linux `tools/screenshot`
+capture from that new milestone.
+
+The current composition intermittently exposes an animated ocean/horizon pass beneath a severely white
+upper field. The same pass appeared before `Yes` was pressed while name confirmation was still active,
+and onboarding frames continued after later ocean samples. It is therefore an intermediate/background
+render pass leaking into the presentation, not an authored camera transition, a first 3D scene, or
+gameplay. The severe white/composition defect, save creation, gameplay, visual correctness, and full-speed
+performance remain open. See the unchanged exact title route in
 [`prosper/scripts/dragon-quest-vii/README.md`](prosper/scripts/dragon-quest-vii/README.md) and the renderer
 analysis in [`prosper/docs/DRAGON_QUEST_STATUS.md`](prosper/docs/DRAGON_QUEST_STATUS.md).
 
