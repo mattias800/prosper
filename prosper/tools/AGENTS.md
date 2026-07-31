@@ -54,6 +54,13 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`gpu_timeline/`** — inspect a native-speed `.prgtl` submit/present index recorded with
   `PROSPER_GPU_TIMELINE=<path>`. It does not invoke Vulkan; use it to locate progression and producer
   windows before making an expensive realized `.prgcap`. Timeline files are gitignored and local-only.
+- **`colorstate/colorstate_report.py`** — reduce a `PROSPER_COLORSTATETRACE` log to a verdict on the
+  "why is it black?" question: do draws reach the **scanout** (vs offscreen only), and are their colour
+  writes enabled or suppressed by `CB_COLOR_CONTROL.MODE=DISABLE` / a zero target/shader mask? Prints a
+  per-guest-minute suppressed-percentage series. **Always compare a known-good phase against the bad one** —
+  on Plucky the suppressed fraction is *higher* while the world renders correctly (88-95%) than while the
+  screen is black (83%), because `CB_DISABLE` is the depth/shadow prepass. Reading one phase alone yields a
+  confident wrong answer. `--selftest` needs no capture. See `tools/colorstate/README.md`.
 - **`spv_validate/`** — `spirv-val` wrapper for recompiled SPIR-V.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`hostprof/hostprof.py`** — poor-man's **native sampling profiler**: attach to a running process
