@@ -7,10 +7,13 @@ the 40-second capture. Bring-up ladder rung: **2 (title screen rendered)**. Game
 validated.
 
 Extended clean runs also reach the new-save name keyboard and remain alive through at least 262 seconds
-without the historical MallocBinned3 failure. A focused control probe established that these post-title
-menus advance differently: Circle advanced the highlighted unused adventure slot to the normal “Which
-slot would you like to use?” prompt, while Cross did not advance and behaved as cancel in the probed
-flow. A complete corrected route has not yet been validated, so save creation and gameplay remain
+without the historical MallocBinned3 failure. A later exact-master replay with both save roots isolated
+corrected #1553's temporal/flicker interpretation: Cross at 55 seconds had already entered and highlighted
+`1: Unused` with its normal “Which slot would you like to use?” prompt. Circle at 140 seconds then
+canceled to the adventure-log list, and Circle at 270 seconds canceled again to the title. Start/Options
+at 330 seconds and Circle at 350 seconds did not advance the title. Cross is confirm and Circle is cancel
+in this flow; #1553 incorrectly attributed the already-visible post-Cross prompt to the later Circle
+press. A complete corrected route has not yet been validated, so save creation and gameplay remain
 unproven; the name-entry screen is not a gameplay milestone.
 
 The same build can remain black after the startup sequence when run with **no input**. That is authored

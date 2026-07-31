@@ -213,10 +213,13 @@ full-speed performance remain open.
 The apparently permanent black frame in no-input runs is authored UI state, not a lost final composite:
 the complete sky/ocean scene exists underneath an opaque-black Slate background, and the routed input
 changes the foreground lifecycle so the title becomes visible. Older work navigated the save-slot menu
-and began content loading. A current isolated run now reaches the new-save name keyboard and remains
-alive there without the historical allocator failure. A focused probe confirmed that the post-title
-flow advanced the highlighted unused slot with Circle, while Cross did not advance and behaved as
-cancel. A complete corrected route and gameplay are still unvalidated. See the exact title route in
+and began content loading. Separate isolated runs reach the new-save name keyboard and remain alive
+there without the historical allocator failure. A later exact-master replay corrected #1553's
+temporal/flicker interpretation: Cross at 55 seconds had already entered and highlighted `1: Unused`
+with its slot prompt; Circle at 140 seconds canceled to the adventure-log list, and Circle at 270
+seconds canceled to the title. Start/Options at 330 seconds and Circle at 350 seconds did not advance
+the title. Cross is confirm and Circle is cancel in this flow. A complete corrected route and gameplay
+are still unvalidated. See the unchanged exact title route in
 [`prosper/scripts/dragon-quest-vii/README.md`](prosper/scripts/dragon-quest-vii/README.md) and the renderer
 analysis in [`prosper/docs/DRAGON_QUEST_STATUS.md`](prosper/docs/DRAGON_QUEST_STATUS.md).
 

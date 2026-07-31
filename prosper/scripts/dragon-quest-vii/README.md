@@ -41,10 +41,15 @@ files through the mounted `/savedata0` backend controlled by `PROSPER_SAVE0`;
 `PROSPER_SAVEDATA_DIR` covers the separate SaveDataMemory API and does not isolate
 those mounted files by itself.
 
-A focused post-title probe advanced the highlighted unused slot with Circle;
-Cross did not advance and behaved as cancel in that flow. The startup/title
-route intentionally retains Cross because those screens accept it. Validate the
-remaining Circle presses before committing a later checkpoint route.
+A later exact-master replay corrected #1553's temporal/flicker interpretation.
+Cross at 55 seconds had already entered and highlighted `1: Unused` with its
+normal slot prompt. Circle at 140 seconds canceled to the adventure-log list,
+and Circle at 270 seconds canceled again to the title. Start/Options at 330
+seconds and Circle at 350 seconds did not advance the title. Cross is confirm
+and Circle is cancel in this flow; #1553 incorrectly attributed the already-
+visible post-Cross prompt to the later Circle press. The startup/title route
+above is unchanged. Validate the remaining Cross presses before committing a
+later checkpoint route.
 
 The title is animated. Some retained frames currently show a dark/purple
 background behind the stable logo while adjacent frames show the expected sky
