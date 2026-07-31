@@ -585,6 +585,93 @@ int main() {
     }
     printf("  [ok]   Wave32 CFG rejects VCC-read, definition, and branch-topology deviations\n");
 
+    // Reduced lifetime from Astro Bot's world-map compute PC396/972/1062/1063/2311/2312. An
+    // earlier s_mov_b64 makes s[32:33] a saved mask, a dominating multiword SMEM data load ends that
+    // lifetime, and s35 then remains numeric on both entries to the CMPX loop header. The crossing
+    // loops force the arbitrary-CFG dispatcher used by the production shader.
+    const uint32_t wave32_compute_recycled_b64_before_loop[] = {
+        0xbea0047eu,                         // pc0:  s_mov_b64 s[32:33], exec
+        0xf4280800u, 0xfa000000u,            // pc1:  s_buffer_load_dwordx4 s[32:35],s[0:3],0
+        0xbea30320u,                         // pc3:  s_mov_b32 s35,s32
+        0x7d820023u,                         // pc4:  CMPX consumes numeric s35 (reduced v0 source)
+        0xbf880006u,                         // pc5:  A exit -> pc12
+        0x7d820023u,                         // pc6:  crossing B header consumes numeric s35
+        0xbf880004u,                         // pc7:  B exit -> pc12
+        0x81238123u,                         // pc8:  s_sub_u32 s35,s35,1
+        0xbf82fffau,                         // pc9:  backedge -> pc4
+        0x81238123u,                         // pc10: unreachable second decrement
+        0xbf82fffau,                         // pc11: syntactic crossing backedge -> pc6
+        0xbf810000u,                         // pc12: s_endpgm
+    };
+    ShaderResourceTable recycled_b64_resources;
+    ShaderResource recycled_b64_cbuf;
+    recycled_b64_cbuf.cls = ResourceClass::ConstantBuffer;
+    recycled_b64_cbuf.format = DataFormat::Uint32;
+    recycled_b64_cbuf.num_components = 1;
+    recycled_b64_cbuf.binding = 2;
+    recycled_b64_cbuf.sgpr_base = 0;
+    recycled_b64_cbuf.size = 64;
+    recycled_b64_resources.resources.push_back(recycled_b64_cbuf);
+    ComputeShaderConfig recycled_b64_config = wave32_compute_config;
+    recycled_b64_config.user_sgprs.resize(4);
+    const auto recycled_b64_loop_spv = recompile_compute(
+        wave32_compute_recycled_b64_before_loop,
+        std::size(wave32_compute_recycled_b64_before_loop), &recycled_b64_resources,
+        recycled_b64_config);
+    if (recycled_b64_loop_spv.empty() || !has_opcode(recycled_b64_loop_spv, 251) ||
+        !type_result_ids_are_nonzero(recycled_b64_loop_spv, nullptr) ||
+        !phi_ids_are_nonzero(recycled_b64_loop_spv)) {
+        printf("  [FAIL] dominating scalar overwrite did not end a stale B64 mask lifetime\n");
+        return 1;
+    }
+
+    std::vector<uint32_t> recycled_b64_missing_overwrite(
+        std::begin(wave32_compute_recycled_b64_before_loop),
+        std::end(wave32_compute_recycled_b64_before_loop));
+    recycled_b64_missing_overwrite[1] = 0xbf800000u; // remove both dominating data writes
+    recycled_b64_missing_overwrite[2] = 0xbf800000u;
+    if (!recompile_compute(recycled_b64_missing_overwrite.data(),
+                           recycled_b64_missing_overwrite.size(), &recycled_b64_resources,
+                           recycled_b64_config).empty()) {
+        printf("  [FAIL] B64-mask first entry joined numeric loop backedge without rejection\n");
+        return 1;
+    }
+
+    const uint32_t wave32_compute_b64_overwrite_bypass[] = {
+        0xbea0047eu,                         // pc0:  saved B64 mask in s[32:33]
+        0xbf060000u,                         // pc1:  scalar branch condition
+        0xbf840002u,                         // pc2:  one edge bypasses both data writes -> pc5
+        0xf4280800u, 0xfa000000u,            // pc3:  s_buffer_load_dwordx4 s[32:35],s[0:3],0
+        0xbea30320u,                         // pc5:  ambiguous s32 -> s35 copy
+        0x7d820023u,                         // pc6:  numeric CMPX consumption (reduced v0 source)
+        0xbf880006u,                         // pc7:  A exit -> pc14
+        0x7d820023u,                         // pc8:  crossing B header
+        0xbf880004u,                         // pc9:  B exit -> pc14
+        0x81238123u,                         // pc10: numeric decrement
+        0xbf82fffau,                         // pc11: backedge -> pc6
+        0x81238123u,                         // pc12: unreachable second decrement
+        0xbf82fffau,                         // pc13: syntactic crossing backedge -> pc8
+        0xbf810000u,                         // pc14: s_endpgm
+    };
+    if (!recompile_compute(wave32_compute_b64_overwrite_bypass,
+                           std::size(wave32_compute_b64_overwrite_bypass),
+                           &recycled_b64_resources, recycled_b64_config).empty()) {
+        printf("  [FAIL] branch bypass of the B64-to-data overwrite was accepted\n");
+        return 1;
+    }
+
+    std::vector<uint32_t> recycled_b64_mask_backedge(
+        std::begin(wave32_compute_recycled_b64_before_loop),
+        std::end(wave32_compute_recycled_b64_before_loop));
+    recycled_b64_mask_backedge[8] = 0xbea3037eu; // reachable backedge keeps a real mask in s35
+    if (!recompile_compute(recycled_b64_mask_backedge.data(),
+                           recycled_b64_mask_backedge.size(), &recycled_b64_resources,
+                           recycled_b64_config).empty()) {
+        printf("  [FAIL] numeric first entry joined a real-mask backedge without rejection\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 B64 mask lifetimes end only on dominating scalar-data overwrites\n");
+
     // The production shader wraps barrier-separated work in a workgroup-uniform early-out. Its
     // first barrier-free phase has the same crossing Wave32 CFG as the fixture above and no guest
     // S_ENDPGM of its own. The phase splitter must supply an emitter-only terminator so the
