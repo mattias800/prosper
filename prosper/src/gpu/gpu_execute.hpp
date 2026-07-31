@@ -802,6 +802,70 @@ inline uint32_t resolve_nonindexed_vertex_count(uint32_t draw_count, uint32_t vb
     return draw_count ? draw_count : vb_records;
 }
 
+// PROSPER_COLORSTATETRACE=1|all|WxH: one raw-to-resolved color/depth state record per matching draw.
+// This deliberately runs before the no-effect fast path so a zero raw mask remains observable even
+// when shader/resource realization is skipped. It is diagnostic-only and does not mutate draw state.
+inline void trace_color_state_if_requested(const RenderState& rs,
+                                           const ResolvedPipelineState& ps) {
+    const char* setting = std::getenv("PROSPER_COLORSTATETRACE");
+    if (!setting || !*setting) return;
+
+    const ColorStateTraceSnapshot snapshot = snapshot_color_state_trace(rs, ps);
+    if (std::strcmp(setting, "1") != 0 && std::strcmp(setting, "all") != 0) {
+        uint32_t width = 0, height = 0;
+        char trailing = 0;
+        if (std::sscanf(setting, "%ux%u%c", &width, &height, &trailing) != 2 ||
+            !width || !height) {
+            static std::once_flag warned;
+            std::call_once(warned, [&] {
+                std::fprintf(stderr,
+                             "[color-state] invalid PROSPER_COLORSTATETRACE='%s' "
+                             "(expected 1, all, or WxH)\n",
+                             setting);
+            });
+            return;
+        }
+        if (!color_state_trace_matches_dimension(snapshot, width, height)) return;
+    }
+
+    // Draw realization may run on worker threads. Keep each snapshot contiguous so target rows do
+    // not become associated with another draw's raw register line in a busy live trace.
+    static std::mutex trace_mutex;
+    std::lock_guard lock(trace_mutex);
+    std::fprintf(stderr,
+                 "[color-state] es=0x%llx ps=0x%llx "
+                 "cb-control=%d:%08x mode=%u target-mask=%d:%08x "
+                 "shader-mask=%d:%08x\n",
+                 static_cast<unsigned long long>(snapshot.es_addr),
+                 static_cast<unsigned long long>(snapshot.ps_addr),
+                 snapshot.has_cb_color_control, snapshot.cb_color_control,
+                 snapshot.cb_color_mode, snapshot.has_cb_target_mask,
+                 snapshot.cb_target_mask, snapshot.has_cb_shader_mask,
+                 snapshot.cb_shader_mask);
+    for (uint32_t slot = 0; slot < snapshot.color_targets.size(); ++slot) {
+        const auto& target = snapshot.color_targets[slot];
+        if (!target.base && !target.raw_format && !target.resolved_format &&
+            !target.resolved_write_mask)
+            continue;
+        std::fprintf(stderr,
+                     "[color-state]   color%u=0x%llx %ux%u raw-format=%u "
+                     "resolved-format=%u resolved-cwm=%x\n",
+                     slot, static_cast<unsigned long long>(target.base),
+                     target.width, target.height, target.raw_format,
+                     target.resolved_format, target.resolved_write_mask);
+    }
+    std::fprintf(stderr,
+                 "[color-state]   depth=%d:%ux%u raw-size=%08x test=%d write=%d "
+                 "z=0x%llx/0x%llx s=0x%llx/0x%llx htile=0x%llx stencil=%d\n",
+                 snapshot.has_depth_extent, snapshot.depth_width, snapshot.depth_height,
+                 snapshot.raw_depth_size_xy, ps.depth_test_enable, ps.depth_write_enable,
+                 static_cast<unsigned long long>(snapshot.depth_read_base),
+                 static_cast<unsigned long long>(snapshot.depth_write_base),
+                 static_cast<unsigned long long>(snapshot.stencil_read_base),
+                 static_cast<unsigned long long>(snapshot.stencil_write_base),
+                 static_cast<unsigned long long>(snapshot.htile_data_base), ps.stencil_enable);
+}
+
 // Realize ONE draw of `ds` (a register snapshot or the folded state) into a DrawItem: recompile the
 // VS+PS, resolve fixed-function state, and — for an indexed draw — fetch the guest index buffer.
 // `draw` is the PM4 draw record (index count + indexed/index_addr); null means "no record" (hand-built
@@ -871,6 +935,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     const ResolvedPipelineState resolved_pipeline = failure
         ? failure->pipeline : resolve_pipeline_state(rs);
+    trace_color_state_if_requested(rs, resolved_pipeline);
     // CB_TARGET_MASK/CB_SHADER_MASK are upstream hardware gates: a fragment export can narrow these
     // masks, but cannot enable a component that they already disabled.  When fixed-function state also
     // has no depth/stencil side effect, shader/resource realization cannot change the no-op verdict.

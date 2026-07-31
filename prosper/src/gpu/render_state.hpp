@@ -114,6 +114,7 @@ struct RenderState {
     // plane bases alone do not distinguish mip/slice views, HTILE metadata, or a re-described backing.
     uint32_t db_depth_view = 0, db_render_override = 0, db_render_override2 = 0;
     uint64_t htile_data_base = 0;
+    bool has_db_depth_size_xy = false;
     uint32_t db_depth_size_xy = 0, db_dfsm_control = 0, db_depth_info = 0;
     uint32_t db_z_info = 0, db_stencil_info = 0;
     uint32_t db_depth_size = 0, db_depth_slice = 0;
@@ -153,10 +154,14 @@ struct RenderState {
     bool     has_cb_color_control = false;
     uint32_t cb_color_control  = 0;   // CB_COLOR_CONTROL
     uint32_t cb_blend0_control = 0;   // CB_BLEND0_CONTROL
+    // The effective values below intentionally default to write-all when absent. Keep presence as a
+    // separate diagnostic fact so a zero programmed mask can be distinguished from that fallback.
+    bool     has_cb_target_mask = false;
     uint32_t cb_target_mask    = 0;   // CB_TARGET_MASK (per-MRT write mask)
     // Synthetic/direct RenderState users historically supplied only CB_TARGET_MASK. Match the
     // hardware/command-stream absent-register fallback so adding CB_SHADER_MASK cannot silently
     // turn those otherwise-valid color writes off.
+    bool     has_cb_shader_mask = false;
     uint32_t cb_shader_mask    = 0xFFFFFFFFu; // CB_SHADER_MASK (components exported by the pixel shader)
     uint32_t spi_shader_col_format = 0; // SPI_SHADER_COL_FORMAT (4-bit export format per MRT)
     uint32_t sx_ps_downconvert = 0;      // SX_PS_DOWNCONVERT (4-bit target conversion per MRT)
@@ -323,6 +328,33 @@ struct ResolvedPipelineState {
     // Complete hardware MRT state. Slots 0/1 mirror the legacy named fields above.
     std::array<ColorTarget, kColorTargetCount> color_targets{};
 };
+
+// Immutable facts emitted by the opt-in late-draw color-state trace. Keeping construction pure makes
+// the diagnostic boundary testable without environment variables, logging, shader recompilation, or
+// Vulkan. Raw-register presence is intentionally distinct from its effective fallback value.
+struct ColorStateTraceSnapshot {
+    struct Target {
+        uint64_t base = 0;
+        uint32_t width = 0, height = 0;
+        uint32_t raw_format = 0, resolved_format = 0, resolved_write_mask = 0;
+    };
+
+    uint64_t es_addr = 0, ps_addr = 0;
+    bool has_cb_color_control = false, has_cb_target_mask = false, has_cb_shader_mask = false;
+    uint32_t cb_color_control = 0, cb_color_mode = 0;
+    uint32_t cb_target_mask = 0, cb_shader_mask = 0;
+    std::array<Target, kColorTargetCount> color_targets{};
+
+    bool has_depth_extent = false;
+    uint32_t depth_width = 0, depth_height = 0, raw_depth_size_xy = 0;
+    uint64_t depth_read_base = 0, depth_write_base = 0;
+    uint64_t stencil_read_base = 0, stencil_write_base = 0, htile_data_base = 0;
+};
+
+ColorStateTraceSnapshot snapshot_color_state_trace(const RenderState& rs,
+                                                   const ResolvedPipelineState& ps);
+bool color_state_trace_matches_dimension(const ColorStateTraceSnapshot& snapshot,
+                                         uint32_t width, uint32_t height);
 
 // A color-disabled draw must still execute when it can change the depth/stencil attachment consumed
 // by later draws. KEEP-only stencil tests without a depth write have no attachment side effect.

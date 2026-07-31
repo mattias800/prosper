@@ -254,6 +254,7 @@ RenderState extract_render_state(const GpuState& st) {
     rs.db_render_override = rd(st.cx, P::DB_RENDER_OVERRIDE);
     rs.db_render_override2 = rd(st.cx, P::DB_RENDER_OVERRIDE2);
     rs.htile_data_base = addr_of(rd(st.cx, P::DB_HTILE_DATA_BASE), rd(st.cx, P::DB_HTILE_DATA_BASE_HI));
+    rs.has_db_depth_size_xy = st.cx.count(P::DB_DEPTH_SIZE_XY) != 0;
     rs.db_depth_size_xy = rd(st.cx, P::DB_DEPTH_SIZE_XY);
     rs.db_dfsm_control = rd(st.cx, P::DB_DFSM_CONTROL);
     rs.db_depth_info = rd(st.cx, P::DB_DEPTH_INFO);
@@ -348,11 +349,13 @@ RenderState extract_render_state(const GpuState& st) {
     // NOT 0 — reading 0 dropped every color draw (color_write_mask==0 skip), i.e. the "blue screen" where
     // the real art rendered only under PROSPER_FORCE_COLORWRITE. A register that IS present (even 0) is
     // honored, so a genuine depth-only pass that programs mask 0 still skips correctly.
+    rs.has_cb_target_mask = st.cx.count(P::CB_TARGET_MASK) != 0;
     rs.cb_target_mask    = st.cx.count(P::CB_TARGET_MASK) ? rd(st.cx, P::CB_TARGET_MASK) : 0xFFFFFFFFu;
     // CB_SHADER_MASK is programmed from the pixel shader's color-export contract. Like the target
     // mask, an absent register must not suppress color in synthetic/legacy command streams. The
     // resolved Vulkan write mask intersects both registers so channels the shader does not export
     // preserve their existing attachment contents (AMD RDNA2 EXP EN semantics, Table 56).
+    rs.has_cb_shader_mask = st.cx.count(P::CB_SHADER_MASK) != 0;
     rs.cb_shader_mask    = st.cx.count(P::CB_SHADER_MASK) ? rd(st.cx, P::CB_SHADER_MASK) : 0xFFFFFFFFu;
     rs.spi_shader_col_format = st.cx.count(P::SPI_SHADER_COL_FORMAT)
         ? rd(st.cx, P::SPI_SHADER_COL_FORMAT) : 0u;
@@ -521,6 +524,50 @@ RenderState extract_render_state(const GpuState& st) {
     }
 
     return rs;
+}
+
+ColorStateTraceSnapshot snapshot_color_state_trace(const RenderState& rs,
+                                                   const ResolvedPipelineState& ps) {
+    ColorStateTraceSnapshot out;
+    out.es_addr = rs.es_addr;
+    out.ps_addr = rs.ps_addr;
+    out.has_cb_color_control = rs.has_cb_color_control;
+    out.has_cb_target_mask = rs.has_cb_target_mask;
+    out.has_cb_shader_mask = rs.has_cb_shader_mask;
+    out.cb_color_control = rs.cb_color_control;
+    out.cb_color_mode = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE);
+    out.cb_target_mask = rs.cb_target_mask;
+    out.cb_shader_mask = rs.cb_shader_mask;
+    for (uint32_t slot = 0; slot < out.color_targets.size(); ++slot) {
+        out.color_targets[slot] = {
+            rs.color_targets[slot].base,
+            rs.color_targets[slot].width,
+            rs.color_targets[slot].height,
+            rs.color_targets[slot].format,
+            ps.color_targets[slot].format,
+            ps.color_targets[slot].write_mask,
+        };
+    }
+    out.has_depth_extent = rs.has_db_depth_size_xy;
+    out.raw_depth_size_xy = rs.db_depth_size_xy;
+    if (out.has_depth_extent) {
+        out.depth_width = PM4_FIELD(rs.db_depth_size_xy, DB_DEPTH_SIZE_XY, X_MAX) + 1u;
+        out.depth_height = PM4_FIELD(rs.db_depth_size_xy, DB_DEPTH_SIZE_XY, Y_MAX) + 1u;
+    }
+    out.depth_read_base = rs.depth_read_base;
+    out.depth_write_base = rs.depth_write_base;
+    out.stencil_read_base = rs.stencil_read_base;
+    out.stencil_write_base = rs.stencil_write_base;
+    out.htile_data_base = rs.htile_data_base;
+    return out;
+}
+
+bool color_state_trace_matches_dimension(const ColorStateTraceSnapshot& snapshot,
+                                         uint32_t width, uint32_t height) {
+    return std::any_of(snapshot.color_targets.begin(), snapshot.color_targets.end(),
+                       [&](const auto& target) {
+                           return target.width == width && target.height == height;
+                       });
 }
 
 ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
