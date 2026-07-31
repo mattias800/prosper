@@ -392,9 +392,25 @@ Durable comments:
 
 The A/B manifest SHA-256 is `f2f44602c178226539ba456d9a9879c1ab5b04634f3cb590010434577771290d`.
 
-### Exact corruption boundary
+### The "exact corruption boundary" is a BISECT ARTIFACT — retained as a warning
 
-Adaptive operation-prefix replay found:
+> **FALSIFIED 2026-07-31.** The op116 -> op117 "corruption boundary" below, on which this entire lane was
+> founded, **does not exist**. `--through-operation N` renders **the last executed draw target**, so
+> consecutive cutoffs display *different surfaces*. The retained logs show it plainly — every cutoff is a
+> different resolution: op104 30x34, op111 480x270, op114 960x1080, **op116 1920x1080, op117 3840x2160**.
+>
+> **op116 and op117 were never the same buffer, so the transition between them cannot be a corruption event.**
+>
+> op116's identity is pinned independently: it is a *dispatch*, so its output selects op115's target
+> `0x3083db0000` = draw90's `b35`, and its content (R .0124 / G .0443 / B .1865) matches `tap-142` —
+> draw90's own sample of b35 — to three decimals. **op116 is a post-process input that draw90 consumes.
+> It is dark because such buffers are dark**, not because it is the last good frame before corruption.
+>
+> Do not re-derive a boundary from prefix replay without first confirming both prefixes render the **same
+> target at the same resolution**. This is the single most expensive mistake recorded in this document: it
+> shaped every hypothesis in the lane for two sessions.
+
+The original (now-falsified) table, retained only so the claim is recognisable if it resurfaces:
 
 | Prefix | Output | Hash / metrics |
 |---|---|---|
