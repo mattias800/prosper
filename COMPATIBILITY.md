@@ -23,6 +23,7 @@ Last updated: 2026-07-31
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
 | *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 title, name entry, name confirmation, and first-run `System Settings 1/4` onboarding reached; gameplay is not yet validated |
 | *Alex Kidd in Miracle World DX* | `PPSA02664` | Unity / IL2CPP | ✅ First level reached and rendered at native 1920×1080; colour matches the hardware reference, with a minor title-overlay contrast defect |
+| *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
 
 ¹ Exact retail game name pending confirmation.
 
@@ -286,6 +287,29 @@ text pass, so no gameplay milestone is claimed.
 This 2D action title reaches its main menu and attract-mode gameplay, verified and recorded by the
 project owner, with a menu-reach snapshot guard in place. The title ID is confirmed; the exact retail
 name is pending confirmation.
+
+## Greak: Memories of Azur — `PPSA02849`
+
+<p align="center">
+  <img src="assets/screenshots/greak-title.png" alt="Greak: Memories of Azur — title screen">
+</p>
+<p align="center">
+  <img src="assets/screenshots/greak.png" alt="Greak: Memories of Azur — first level gameplay">
+</p>
+
+A Unity 2019.4 / IL2CPP title that boots cleanly on first attempt. The route crosses the publisher
+logo, the full hand-drawn animated intro cutscene, a long asset-load phase, and the title screen into
+sustained first-level gameplay at native 1920×1080: the player character and its animation, layered
+parallax terrain and pine forest, volumetric fog, drifting particles, the portrait/health/ammo HUD, the
+ability bar, and the button-prompt overlay.
+
+The route is `prosper/scripts/greak/reach-gameplay.pad`. Note that the title screen only appears after a
+roughly 70-second black asset-loading phase following the intro; a capture window shorter than about
+150 seconds ends before it and misreads the load as a black-screen defect.
+
+One shared recompiler gap was found and closed during bring-up: `s_ttracedata` (SOPP `0x16`), a
+thread-trace profiling instruction with no architectural effect, was rejecting the entire vertex stage
+that carried it.
 
 ## Alex Kidd in Miracle World DX — `PPSA02664`
 
