@@ -3,6 +3,7 @@
 // host C library. Registered by NID so the loader binds imports directly to them.
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "gpu/gpu_timeline.hpp"
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
@@ -19,6 +20,7 @@
 #include <condition_variable>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 // setjmp/longjmp — the guest's Boehm GC calls setjmp to flush callee-saved registers to a
 // buffer so it can scan them as GC roots (and the runtime uses it for exception unwinding).
@@ -417,8 +419,72 @@ static uint64_t h_sprintf(void* buf, const char* fmt, ...) {
     va_list ap; va_start(ap, fmt); int r = vsprintf((char*)buf, fmt, ap); va_end(ap);
     return (uint64_t)(int64_t)r;
 }
+
+namespace {
+// A %n conversion writes through a guest pointer while formatting. The capture adapter must never
+// evaluate it speculatively, so conservatively leave such calls on the original one-pass vprintf path.
+bool format_may_write_n(const char* format) {
+    if (!format) return false;
+    constexpr const char* conversions = "diouxXfFeEgGaAcspnm%";
+    for (const char* p = format; *p; ++p) {
+        if (*p != '%') continue;
+        ++p;
+        if (!*p) break;
+        if (*p == '%') continue;
+        while (*p) {
+            if (std::strchr(conversions, *p)) {
+                if (*p == 'n') return true;
+                break;
+            }
+            ++p;
+        }
+        if (!*p) break;
+    }
+    return false;
+}
+
+int capture_aware_vprintf(const char* format, va_list args) {
+    if (!prosper::gpu::guest_log_capture_bundle_enabled() || format_may_write_n(format))
+        return vprintf(format, args);
+
+    // One byte beyond the accepted line limit is enough to put the bounded observer into its
+    // overlong-line state. Ordinary guest log calls fit and are formatted exactly once; unusually
+    // large calls fall back to the original vprintf for complete stdout fidelity, while the observer
+    // consumes only this bounded prefix and marks the omitted suffix as a safe discontinuity.
+    std::vector<char> formatted(prosper::gpu::kGuestLogCaptureMaxLineBytes + 2);
+    va_list observed;
+    va_copy(observed, args);
+    const int wanted = vsnprintf(formatted.data(), formatted.size(), format, observed);
+    va_end(observed);
+    if (wanted < 0) return vprintf(format, args);
+
+    if (static_cast<size_t>(wanted) < formatted.size()) {
+        const size_t bytes = static_cast<size_t>(wanted);
+        const size_t written = fwrite(formatted.data(), 1, bytes, stdout);
+        if (written) prosper::gpu::observe_guest_log_for_capture(formatted.data(), written);
+        return written == bytes ? wanted : -1;
+    }
+
+    const int result = vprintf(format, args);
+    if (result >= 0) {
+        prosper::gpu::observe_guest_log_for_capture(formatted.data(), formatted.size() - 1);
+        prosper::gpu::observe_guest_log_capture_gap();
+    }
+    return result;
+}
+
+void observe_guest_c_string(const char* text, bool known_newline) {
+    if (!text || !prosper::gpu::guest_log_capture_bundle_enabled()) return;
+    const size_t probe = prosper::gpu::kGuestLogCaptureMaxLineBytes + 1;
+    const size_t bytes = strnlen(text, probe);
+    prosper::gpu::observe_guest_log_for_capture(text, bytes);
+    if (bytes == probe) prosper::gpu::observe_guest_log_capture_gap();
+    if (known_newline) prosper::gpu::observe_guest_log_for_capture("\n", 1);
+}
+} // namespace
+
 static uint64_t h_printf(const char* fmt, ...) {
-    va_list ap; va_start(ap, fmt); int r = vprintf(fmt, ap); va_end(ap);
+    va_list ap; va_start(ap, fmt); int r = capture_aware_vprintf(fmt, ap); va_end(ap);
     return (uint64_t)(int64_t)r;
 }
 // sscanf: a REAL variadic host thunk (like the *printf family) — the import stub tail-jumps with the
@@ -429,9 +495,15 @@ static uint64_t h_sscanf(const char* s, const char* fmt, ...) {
     va_list ap; va_start(ap, fmt); int r = vsscanf(s, fmt, ap); va_end(ap);
     return (uint64_t)(int64_t)r;
 }
-HLE(h_puts)      { int r = fputs((const char*)P(a0), stdout); fputc('\n', stdout); return (uint64_t)(int64_t)r; }
-HLE(h_putchar)   { return (uint64_t)(int64_t)putchar((int)a0); }
-HLE(h_fputs)     { return (uint64_t)(int64_t)fputs((const char*)P(a0), a1 ? (FILE*)P(a1) : stdout); }
+HLE(h_puts)      { const char* s = (const char*)P(a0); int r = fputs(s, stdout); int nl = fputc('\n', stdout);
+                   if (r != EOF && nl != EOF) observe_guest_c_string(s, true);
+                   return (uint64_t)(int64_t)r; }
+HLE(h_putchar)   { int r = putchar((int)a0); if (r != EOF) { const char c = (char)a0;
+                   prosper::gpu::observe_guest_log_for_capture(&c, 1); }
+                   return (uint64_t)(int64_t)r; }
+HLE(h_fputs)     { const char* s = (const char*)P(a0); FILE* stream = a1 ? (FILE*)P(a1) : stdout;
+                   int r = fputs(s, stream); if (r != EOF && stream == stdout) observe_guest_c_string(s, false);
+                   return (uint64_t)(int64_t)r; }
 
 // --- locale / ctype (Dinkumware CRT: _Getpctype/_Getpt{o,}lower return table ptrs) ---
 // The 257-entry C-locale table and masks match Dinkumware 5.00: _XD=0x01, _UP=0x02,

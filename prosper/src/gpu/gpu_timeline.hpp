@@ -3,6 +3,7 @@
 
 #include "command_processor.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -271,5 +272,17 @@ void close_gpu_timeline();
 void request_interactive_capture_bundle(const std::string& path, uint32_t max_mb = 0,
                                         uint32_t delay_presents = 0);
 bool interactive_capture_bundle_active();
+
+// Optional guest-stdout phase gate for the same whole-frame bundle. When
+// PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG is configured together with the existing
+// PROSPER_CAPTURE_BUNDLE path, an exact completed guest-log line arms one capture after skipping one
+// completed present. The byte-stream observer is fragment-safe and bounded; normal play pays only the
+// enabled check when the environment variable is absent.
+inline constexpr size_t kGuestLogCaptureMaxLineBytes = 4096;
+bool guest_log_capture_bundle_enabled();
+void observe_guest_log_for_capture(const char* bytes, size_t size);
+// Marks bytes omitted by a bounded stdout adapter. It deliberately discards through the next observed
+// line ending so an unobserved suffix can cause only a missed match, never a false exact-line match.
+void observe_guest_log_capture_gap();
 
 } // namespace prosper::gpu

@@ -133,6 +133,14 @@ renderer: the capture **seeds** the renderer-owned RTTs the frame *samples* (def
 temporal-AA history) with their live pixels (#1291), so a single submit no longer replays black. Drill
 into one submit with `--bundle-extract-submit K sub.prgcap`, then `--draw-steps` / `--inspect-only` /
 `--dump-resource`.
+For a scripted route with a stable guest phase line, set
+`PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG='exact complete line'` together with the existing
+`PROSPER_CAPTURE_BUNDLE=/path/frame.prgbundle` and optional `PROSPER_CAPTURE_BUNDLE_MAX_MB=N` settings.
+The matcher is one-shot, requires exact line equality (CR, LF, and CRLF are equivalent terminators), and
+arms the same seeded whole-frame capture after skipping exactly one completed present. It is safe across
+fragmented `printf`/`puts` output and deliberately rejects overlong lines; do not use a substring or a
+program address as a substitute for a real phase marker. Persistent color/depth targets must remain enabled
+so the bundle can seed the frame boundary it is intended to preserve.
 `PROSPER_SUBMITLOG_DIM=WxH` prints the exact renderer invocation for any submit targeting that Gen5
 surface extent, even while `PROSPER_RENDER_FIRST` skips Vulkan work. Use it to start a later render
 window on a one-time offscreen producer rather than after the producer has already been lost.
