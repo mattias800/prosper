@@ -1020,6 +1020,209 @@ int main() {
                           [](const Rdna2Inst& in) { return in.pc == 968 || in.pc == 1007; }),
           "external entry that bypasses the zero initializer keeps the cycle fail-visible");
 
+    // Exact reduced Wave64 sibling from Astro's larger traversal shader. PC2148/2187 are reachable
+    // only through loop back-edges, while the first selector (s20=37) enters the guarded root at
+    // PC2434. A null result creates a complete zero mask pair, takes the u64 SCC0 exit, then observes
+    // the s46=0 stack. This proves that no first work item can reach either unresolved ray site.
+    std::vector<Rdna2Inst> wave64_loop;
+    auto append_wave64_instruction = [&](uint32_t pc,
+                                         std::initializer_list<uint32_t> words) {
+        Rdna2Inst instruction = rdna2_decode_one(words.begin(), words.size());
+        instruction.pc = pc;
+        wave64_loop.push_back(instruction);
+    };
+    append_wave64_instruction(2029, {0xBEAE0380u}); // s_mov_b32 s46, 0 (empty stack)
+    append_wave64_instruction(2032, {0x802F080Au}); // independent address setup
+    append_wave64_instruction(2033, {0xBE9403A5u}); // s_mov_b32 s20, 37 (root selector)
+    append_wave64_instruction(2039, {0xBE88047Eu}); // loop header: s_mov_b64 s[8:9], exec
+    append_wave64_instruction(2040, {0x876A8714u});
+    append_wave64_instruction(2041, {0x816AC46Au});
+    append_wave64_instruction(2042, {0xBF0B826Au});
+    append_wave64_instruction(2043, {0xBF85017Eu}); // s_cbranch_scc1 2426
+    append_wave64_instruction(2148, {0xF1989F07u, 0x00040505u, 0x4442413Du,
+                                     0x4543403Eu, 0x00004746u}); // unresolved loop BVH
+    append_wave64_instruction(2187, {0xF1989F07u, 0x00040505u, 0x4442413Du,
+                                     0x4543403Eu, 0x00004746u}); // unresolved loop BVH
+    append_wave64_instruction(2426, {0x7E0A02C1u}); // v5..v8 = invalid
+    append_wave64_instruction(2427, {0x7E0C02C1u});
+    append_wave64_instruction(2428, {0x7E0E02C1u});
+    append_wave64_instruction(2429, {0x7E1002C1u});
+    append_wave64_instruction(2430, {0xBEEA2408u}); // s_and_saveexec_b64 vcc, s[8:9]
+    append_wave64_instruction(2431, {0xBF88000Au}); // empty EXEC -> no-hit compare
+    append_wave64_instruction(2432, {0x7E0A0214u}); // root index from s20
+    append_wave64_instruction(2433, {0xBF800000u});
+    append_wave64_instruction(2434, {0xF1989F07u, 0x00010505u, 0x39370A3Du,
+                                     0x33323130u, 0x00003534u}); // guarded null BVH
+    append_wave64_instruction(2439, {0xBF8C3F70u});
+    append_wave64_instruction(2440, {0x7D8A0AF9u, 0x068688C1u}); // v_cmp_ne_u32 s[8:9],-1,v5
+    append_wave64_instruction(2442, {0xBF138008u});              // s_cmp_lg_u64 s[8:9],0
+    append_wave64_instruction(2443, {0xBEFE046Au});              // s_mov_b64 exec,vcc
+    append_wave64_instruction(2444, {0xBF8400D8u});              // s_cbranch_scc0 2661
+    append_wave64_instruction(2624, {0xBE9403C1u});              // loop-carried s20 = -1
+    append_wave64_instruction(2660, {0xBF82FD93u});              // s_branch 2040
+    append_wave64_instruction(2661, {0xBF072E80u});              // s_cmp_lg_u32 0,s46
+    append_wave64_instruction(2662, {0xBF840004u});              // empty stack -> 2667
+    append_wave64_instruction(2663, {0x812EC12Eu});              // pop stack
+    append_wave64_instruction(2664, {0xD7600014u, 0x00005D3Bu});
+    append_wave64_instruction(2666, {0xBF82FD8Cu});              // s_branch 2039
+    append_wave64_instruction(2667, {0x060A7AFFu, 0x3A83126Fu});
+    append_wave64_instruction(3271, {0xBF810000u});
+
+    alignas(256) std::array<uint8_t, 256> wave64_null_bvh{};
+    auto wave64_resources = [&]() {
+        ShaderResourceTable table;
+        ShaderResource marker{};
+        marker.cls = ResourceClass::ConstantBuffer;
+        marker.format = DataFormat::Uint32;
+        marker.num_components = 1;
+        marker.binding = 4;
+        marker.size = wave64_null_bvh.size();
+        marker.fetch_pc = 2434;
+        marker.host_data = wave64_null_bvh.data();
+        marker.host_data_size = wave64_null_bvh.size();
+        table.resources.push_back(marker);
+        for (uint32_t fetch_pc : {2148u, 2187u}) {
+            ShaderResource unresolved{};
+            unresolved.cls = ResourceClass::ConstantBuffer;
+            unresolved.format = DataFormat::Uint32;
+            unresolved.num_components = 1;
+            unresolved.binding = static_cast<uint32_t>(table.resources.size() + 4);
+            unresolved.size = 4;
+            unresolved.fetch_pc = fetch_pc;
+            table.resources.push_back(unresolved);
+        }
+        return table;
+    };
+    std::vector<Rdna2Inst> wave64_constant_only = wave64_loop;
+    CHECK(rdna2_specialize_shader_constant_branches(wave64_constant_only) == 0 &&
+              std::any_of(wave64_constant_only.begin(), wave64_constant_only.end(),
+                          [](const Rdna2Inst& in) {
+                              return in.pc == 2148 || in.pc == 2187;
+                          }),
+          "Wave64 loop-carried selector keeps unresolved BVHs before the null-cycle proof");
+
+    ShaderResourceTable wave64_pruned_resources = wave64_resources();
+    std::vector<Rdna2Inst> wave64_pruned_loop = wave64_loop;
+    const ComputeResourcePathSpecializationReport wave64_path_report =
+        specialize_compute_resource_paths(wave64_pruned_loop, wave64_pruned_resources, 64);
+    CHECK(wave64_path_report.proven_null_exits == 1 &&
+              wave64_path_report.shader_constant_branches == 0 &&
+              wave64_path_report.removed_resources == 2 &&
+              std::find(wave64_path_report.removed_pcs.begin(),
+                        wave64_path_report.removed_pcs.end(), 2148) !=
+                  wave64_path_report.removed_pcs.end() &&
+              std::find(wave64_path_report.removed_pcs.begin(),
+                        wave64_path_report.removed_pcs.end(), 2187) !=
+                  wave64_path_report.removed_pcs.end() &&
+              std::none_of(wave64_pruned_loop.begin(), wave64_pruned_loop.end(),
+                           [](const Rdna2Inst& in) {
+                               return in.pc == 2148 || in.pc == 2187 || in.pc == 2624 ||
+                                      in.pc == 2660 || in.pc == 2663 || in.pc == 2666;
+                           }) &&
+              wave64_pruned_resources.resources.size() == 1 &&
+              is_proven_null_bvh(wave64_pruned_resources.resources.front()) &&
+              wave64_pruned_resources.resources.front().fetch_pc == 2434,
+          "exact Wave64 null cycle prunes loop BVHs, back-edges, and their resources");
+
+    // Materialize the same exact-PC reduced stream with NOPs in omitted spans so the production raw
+    // translator repeats the proof. Retain an independent runtime loop at entry so this follows the
+    // target shader's arbitrary-CFG compute path (which already supports its exact Wave64 mask tail),
+    // rather than accidentally exercising the ordinary structured emitter after reducing the target.
+    // Every exit from this loop still reaches the stack initializer, so it cannot bypass the proof.
+    // The synthetic terminal at PC2667 is the proven empty-stack target.
+    std::vector<uint32_t> wave64_null_exit_shader(2668, 0xBF800000u);
+    wave64_null_exit_shader[0] = 0xBF850002u; // s_cbranch_scc1 pc3
+    wave64_null_exit_shader[1] = 0xBF840001u; // s_cbranch_scc0 pc3
+    wave64_null_exit_shader[2] = 0xBF82FFFDu; // s_branch pc0 (multi-exit back-edge)
+    for (const Rdna2Inst& instruction : wave64_loop) {
+        if (instruction.pc >= 2667) continue;
+        for (uint32_t word = 0; word < instruction.len_dwords; ++word)
+            wave64_null_exit_shader[instruction.pc + word] = instruction.words[word];
+    }
+    wave64_null_exit_shader[2667] = 0xBF810000u;
+    ShaderResourceTable wave64_translation_resources = wave64_resources();
+    ComputeShaderConfig wave64_null_exit_config;
+    wave64_null_exit_config.local_x = 1;
+    wave64_null_exit_config.wave_size = 64;
+    CHECK(!recompile_compute(wave64_null_exit_shader.data(),
+                             wave64_null_exit_shader.size(),
+                             &wave64_translation_resources,
+                             wave64_null_exit_config).empty(),
+          "exact-PC Wave64 null cycle reaches production compute translation");
+
+    auto wave64_has_unresolved_sites = [](const std::vector<Rdna2Inst>& instructions) {
+        return std::any_of(instructions.begin(), instructions.end(),
+                           [](const Rdna2Inst& in) {
+                               return in.pc == 2148 || in.pc == 2187;
+                           });
+    };
+    for (int deviation = 0; deviation < 7; ++deviation) {
+        std::vector<Rdna2Inst> changed = wave64_loop;
+        auto at = [&](uint32_t pc) {
+            return std::find_if(changed.begin(), changed.end(),
+                                [&](const Rdna2Inst& in) { return in.pc == pc; });
+        };
+        if (deviation == 0) at(2442)->opcode = 0x07u;       // low-word compare only
+        if (deviation == 1) at(2442)->src[0].value = 10;    // different mask pair
+        if (deviation == 2) at(2443)->opcode = 0x03u;       // low-word EXEC copy only
+        if (deviation == 3) at(2440)->dst.value = 106;      // not an ordinary complete pair
+        if (deviation == 4) at(2440)->src[0].value = 0;     // compare is not against no-hit -1
+        if (deviation == 5) at(2440)->src[1].value = 6;     // compare is not the ray result
+        if (deviation == 6) at(2440)->dst.value = 105;      // pair overlaps architectural VCC
+        ShaderResourceTable table = wave64_resources();
+        CHECK(rdna2_specialize_proven_null_bvh_paths(changed, &table, 64) == 0 &&
+                  wave64_has_unresolved_sites(changed),
+              "Wave64 no-hit proof rejects width/pair/EXEC/result shape deviations");
+    }
+
+    ShaderResourceTable wave64_nonnull_resources = wave64_resources();
+    wave64_nonnull_resources.resources[0].gpu_addr = 0x10000u;
+    std::vector<Rdna2Inst> wave64_nonnull_loop = wave64_loop;
+    CHECK(rdna2_specialize_proven_null_bvh_paths(
+              wave64_nonnull_loop, &wave64_nonnull_resources, 64) == 0 &&
+              wave64_has_unresolved_sites(wave64_nonnull_loop),
+          "Wave64 cycle keeps unresolved sites when the root resource is not proven null");
+
+    for (int deviation = 0; deviation < 2; ++deviation) {
+        std::vector<Rdna2Inst> changed = wave64_loop;
+        auto at = [&](uint32_t pc) {
+            return std::find_if(changed.begin(), changed.end(),
+                                [&](const Rdna2Inst& in) { return in.pc == pc; });
+        };
+        if (deviation == 0) at(2029)->src[0].value = 1; // non-empty initial stack
+        if (deviation == 1) at(2033)->src[0].value = 36;// different root selector
+        ShaderResourceTable table = wave64_resources();
+        CHECK(rdna2_specialize_proven_null_bvh_paths(changed, &table, 64) == 1 &&
+                  wave64_has_unresolved_sites(changed),
+              "Wave64 empty-cycle proof rejects stack/selector deviations");
+    }
+
+    std::vector<Rdna2Inst> wave64_stack_pair_clobber = wave64_loop;
+    const std::array<uint32_t, 1> stack_pair_clobber_words{
+        0xBEAD047Eu}; // s_mov_b64 s[45:46], exec: high word overlaps stack s46
+    Rdna2Inst stack_pair_clobber = rdna2_decode_one(
+        stack_pair_clobber_words.data(), stack_pair_clobber_words.size());
+    stack_pair_clobber.pc = 2032;
+    *std::find_if(wave64_stack_pair_clobber.begin(), wave64_stack_pair_clobber.end(),
+                  [](const Rdna2Inst& in) { return in.pc == 2032; }) = stack_pair_clobber;
+    ShaderResourceTable wave64_stack_pair_resources = wave64_resources();
+    CHECK(rdna2_specialize_proven_null_bvh_paths(
+              wave64_stack_pair_clobber, &wave64_stack_pair_resources, 64) == 1 &&
+              wave64_has_unresolved_sites(wave64_stack_pair_clobber),
+          "Wave64 empty-cycle proof sees a B64 high-word stack clobber");
+
+    std::vector<Rdna2Inst> wave64_external_entry = wave64_loop;
+    const std::array<uint32_t, 1> wave64_external_words{0xBF82000Au}; // pc2028 -> pc2039
+    Rdna2Inst wave64_external = rdna2_decode_one(
+        wave64_external_words.data(), wave64_external_words.size());
+    wave64_external.pc = 2028;
+    wave64_external_entry.insert(wave64_external_entry.begin(), wave64_external);
+    ShaderResourceTable wave64_external_resources = wave64_resources();
+    CHECK(rdna2_specialize_proven_null_bvh_paths(
+              wave64_external_entry, &wave64_external_resources, 64) == 1 &&
+              wave64_has_unresolved_sites(wave64_external_entry),
+          "Wave64 external entry bypassing stack initialization keeps the cycle fail-visible");
+
     const uint32_t runtime_dead_fetch[] = {
         0xBF0B8200u,             // pc0: s_cmp_le_u32 s0, 2 (entry/user SGPR)
         0xBF850002u,             // pc1: s_cbranch_scc1 pc4

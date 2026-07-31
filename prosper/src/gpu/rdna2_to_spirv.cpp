@@ -10277,7 +10277,7 @@ size_t specialize_shader_constant_branches(std::vector<Rdna2Inst>& ins) {
 size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
                                         const ShaderResourceTable* rt,
                                         uint32_t wave_size) {
-    if (!rt || wave_size != 32 || ins.empty()) return 0;
+    if (!rt || (wave_size != 32 && wave_size != 64) || ins.empty()) return 0;
     std::unordered_map<uint32_t, size_t> index_by_pc;
     for (size_t i = 0; i < ins.size(); ++i) index_by_pc.emplace(ins[i].pc, i);
 
@@ -10302,9 +10302,13 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
         //   s_cmp_lg_u32 0, sM
         //   s_mov_b32 exec_lo, vcc_lo
         //   s_cbranch_scc0 EXIT
+        // The Wave64 sibling uses the complete two-word mask instead:
+        //   v_cmp_ne_u32 s[M:M+1], -1, vN
+        //   s_cmp_lg_u64 s[M:M+1], 0
+        //   s_mov_b64 exec, vcc
         // The null lowering writes -1 to every ray result for each active lane. The saved compare
         // mask is therefore exactly zero, making SCC zero and the exit unconditional. Requiring the
-        // explicit one-word mask form and Wave32 avoids assuming anything about an unobserved high
+        // exact width-specific compare and EXEC copy avoids assuming anything about an unobserved
         // mask half. Adjacency and exact register links prevent a nearby unrelated compare from
         // proving the branch.
         const bool ray_shape = ray.fmt == Rdna2Format::MIMG && ray.opcode == 0xe6u &&
@@ -10314,17 +10318,26 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
             wait.words[0] == 0xbf8c3f70u; // s_waitcnt vmcnt(0)
         const bool compare_shape = compare.pc == wait.pc + wait.len_dwords &&
             compare.fmt == Rdna2Format::VOPC && compare.opcode == 0xc5u &&
-            compare.dst.kind == OperandKind::SGPR && compare.dst.value <= 105 &&
+            compare.dst.kind == OperandKind::SGPR &&
+            compare.dst.value <= (wave_size == 32 ? 105 : 104) &&
             compare.src[0].kind == OperandKind::InlineInt && compare.src[0].value == -1 &&
             compare.src[1].kind == OperandKind::VGPR && compare.src[1].value == ray.dst.value;
         const bool scalar_shape = scalar_compare.pc == compare.pc + compare.len_dwords &&
-            scalar_compare.fmt == Rdna2Format::SOPC && scalar_compare.opcode == 0x07u &&
-            scalar_compare.src[0].kind == OperandKind::InlineInt &&
-            scalar_compare.src[0].value == 0 &&
-            scalar_compare.src[1].kind == OperandKind::SGPR &&
-            scalar_compare.src[1].value == compare.dst.value;
+            scalar_compare.fmt == Rdna2Format::SOPC &&
+            (wave_size == 32
+                ? scalar_compare.opcode == 0x07u &&
+                  scalar_compare.src[0].kind == OperandKind::InlineInt &&
+                  scalar_compare.src[0].value == 0 &&
+                  scalar_compare.src[1].kind == OperandKind::SGPR &&
+                  scalar_compare.src[1].value == compare.dst.value
+                : scalar_compare.opcode == 0x13u &&
+                  scalar_compare.src[0].kind == OperandKind::SGPR &&
+                  scalar_compare.src[0].value == compare.dst.value &&
+                  scalar_compare.src[1].kind == OperandKind::InlineInt &&
+                  scalar_compare.src[1].value == 0);
         const bool copy_shape = exec_copy.pc == scalar_compare.pc + scalar_compare.len_dwords &&
-            exec_copy.fmt == Rdna2Format::SOP1 && exec_copy.opcode == 0x03u &&
+            exec_copy.fmt == Rdna2Format::SOP1 &&
+            exec_copy.opcode == (wave_size == 32 ? 0x03u : 0x04u) &&
             exec_copy.dst.kind == OperandKind::SGPR && exec_copy.dst.value == 126 &&
             exec_copy.src[0].kind == OperandKind::Special && exec_copy.src[0].value == 106;
         const bool exit_shape = exit.pc == exec_copy.pc + exec_copy.len_dwords &&
@@ -10385,10 +10398,15 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
             const Rdna2Inst& empty_guard = ins[root_block + 5];
             const Rdna2Inst& root_index = ins[root_block + 6];
             const Rdna2Inst& root_nop = ins[root_block + 7];
-            if (mask_copy.fmt != Rdna2Format::SOP1 || mask_copy.opcode != 0x3cu ||
-                mask_copy.dst.kind != OperandKind::SGPR || mask_copy.dst.value != 106 ||
-                mask_copy.src[0].kind != OperandKind::Special ||
-                mask_copy.src[0].value != 107 ||
+            const bool mask_copy_shape = wave_size == 32
+                ? mask_copy.fmt == Rdna2Format::SOP1 && mask_copy.opcode == 0x3cu &&
+                  mask_copy.dst.kind == OperandKind::SGPR && mask_copy.dst.value == 106 &&
+                  mask_copy.src[0].kind == OperandKind::Special &&
+                  mask_copy.src[0].value == 107
+                : mask_copy.fmt == Rdna2Format::SOP1 && mask_copy.opcode == 0x24u &&
+                  mask_copy.dst.kind == OperandKind::SGPR && mask_copy.dst.value == 106 &&
+                  mask_copy.src[0].kind == OperandKind::SGPR;
+            if (!mask_copy_shape ||
                 empty_guard.fmt != Rdna2Format::SOPP || empty_guard.opcode != 0x08u ||
                 scalar_branch_target(empty_guard) != scalar_compare.pc ||
                 root_index.fmt != Rdna2Format::VOP1 || root_index.opcode != 0x01u ||
@@ -10399,7 +10417,7 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
                 return false;
 
             size_t selector_branch_index = SIZE_MAX;
-            size_t selector_init_index = SIZE_MAX;
+            size_t stack_init_index = SIZE_MAX;
             bool selector_scc = false;
             for (size_t i = root_block; i-- > 2;) {
                 const Rdna2Inst& branch = ins[i];
@@ -10410,29 +10428,59 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
                     continue;
                 for (size_t j = i - 1; j-- > 1;) {
                     const Rdna2Inst& selector_init = ins[j];
-                    const Rdna2Inst& stack_init = ins[j - 1];
-                    if (stack_init.pc + stack_init.len_dwords != selector_init.pc ||
-                        stack_init.fmt != Rdna2Format::SOP1 || stack_init.opcode != 0x03u ||
-                        stack_init.dst.kind != OperandKind::SGPR ||
-                        stack_init.dst.value != stack_reg ||
-                        stack_init.src[0].kind != OperandKind::InlineInt ||
-                        stack_init.src[0].value != 0 ||
-                        selector_init.fmt != Rdna2Format::SOP1 ||
+                    if (selector_init.fmt != Rdna2Format::SOP1 ||
                         selector_init.opcode != 0x03u ||
                         selector_init.dst.kind != OperandKind::SGPR ||
                         selector_init.src[0].kind != OperandKind::InlineInt ||
                         selector_init.src[0].value != 37 ||
                         root_index.src[0].value != selector_init.dst.value)
                         continue;
+                    size_t candidate_stack_init = SIZE_MAX;
+                    if (wave_size == 32) {
+                        const Rdna2Inst& stack_init = ins[j - 1];
+                        if (stack_init.pc + stack_init.len_dwords == selector_init.pc &&
+                            stack_init.fmt == Rdna2Format::SOP1 &&
+                            stack_init.opcode == 0x03u &&
+                            stack_init.dst.kind == OperandKind::SGPR &&
+                            stack_init.dst.value == stack_reg &&
+                            stack_init.src[0].kind == OperandKind::InlineInt &&
+                            stack_init.src[0].value == 0)
+                            candidate_stack_init = j - 1;
+                    } else {
+                        // The Wave64 sibling schedules independent scalar address setup between
+                        // `stack=0` and `selector=37`. Accept only the nearest in-block write to the
+                        // derived stack register, and require it to be the exact zero initializer.
+                        for (size_t k = j; k-- > 0;) {
+                            bool writes_candidate = false;
+                            for_each_scalar_write(ins[k], [&](int base, uint32_t width) {
+                                writes_candidate |= base <= stack_reg &&
+                                    stack_reg < base + static_cast<int>(width);
+                            });
+                            if (!writes_candidate) {
+                                if (scalar_cfg_branch(ins[k]) || ins[k].is_end) break;
+                                continue;
+                            }
+                            const Rdna2Inst& stack_init = ins[k];
+                            if (stack_init.fmt == Rdna2Format::SOP1 &&
+                                stack_init.opcode == 0x03u &&
+                                stack_init.dst.kind == OperandKind::SGPR &&
+                                stack_init.dst.value == stack_reg &&
+                                stack_init.src[0].kind == OperandKind::InlineInt &&
+                                stack_init.src[0].value == 0)
+                                candidate_stack_init = k;
+                            break;
+                        }
+                    }
+                    if (candidate_stack_init == SIZE_MAX) continue;
                     bool has_branch = false;
-                    for (size_t k = j; k < i; ++k)
+                    for (size_t k = candidate_stack_init + 1; k < i; ++k)
                         has_branch |= scalar_cfg_branch(ins[k]);
                     if (has_branch ||
                         !shader_constant_compare(ins, j, i - 1, selector_scc) ||
                         !selector_scc)
                         continue;
                     selector_branch_index = i;
-                    selector_init_index = j;
+                    stack_init_index = candidate_stack_init;
                     break;
                 }
                 if (selector_branch_index != SIZE_MAX) break;
@@ -10444,18 +10492,18 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
                 for_each_scalar_write(instruction, [&](int base, uint32_t width) {
                     writes |= base <= stack_reg &&
                         stack_reg < base + static_cast<int>(width);
-                }, /*proven_wave32_masks*/true);
+                }, /*wave32_one_word_masks=*/wave_size == 32);
                 return writes;
             };
             // Only the selector setup, root/no-hit block, and empty-stack comparison are reachable
             // before the proven exits.  None may alter the initialized stack depth.
-            for (size_t i = selector_init_index; i <= selector_branch_index; ++i)
+            for (size_t i = stack_init_index + 1; i <= selector_branch_index; ++i)
                 if (writes_stack(ins[i])) return false;
             for (size_t i = root_block; i <= ray_index + 5; ++i)
                 if (writes_stack(ins[i])) return false;
             if (writes_stack(stack_compare)) return false;
 
-            const uint32_t proof_begin = ins[selector_init_index - 1].pc;
+            const uint32_t proof_begin = ins[stack_init_index].pc;
             // An indirect transfer or an external edge into the middle of the proof could bypass
             // the zero initializer.  Re-entry at the initializer itself is harmless: it resets the
             // invariant before the selector is evaluated again.
