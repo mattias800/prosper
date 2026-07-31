@@ -2754,6 +2754,144 @@ int main() {
     std::vector<uint32_t> spv44e = recompile_valu(code44e, sizeof(code44e)/sizeof(code44e[0]), 0, 0);
     CHECK(spv44e.empty(), "kernel 44e: do-while with inner forward scc break conservatively rejects");
 
+    // Kernel 44f (#1554): two SEQUENTIAL top-tested scalar loops. CountedLoop deliberately owns only
+    // one back-edge, so this exercises the multi-loop structurizer's SCC condition alongside ordinary
+    // LDS effects. The second loop contains Plucky's nested EXECZ arm; barriers remain outside both
+    // loops. Each invocation owns one LDS dword: loop 1 adds 1 three times, loop 2 adds 2 three times,
+    // and the final read therefore returns 9.
+    const uint32_t code44f[] = {
+        0x7E020F00u,              //  0: v_cvt_u32_f32 v1,v0 (lane-local LDS index)
+        0x34020282u,              //  1: v_lshlrev_b32 v1,2,v1 (byte address)
+        0x7E040280u,              //  2: v_mov_b32 v2,0 (accumulator)
+        0xBE800380u,              //  3: s_mov_b32 s0,0 (loop-1 counter)
+        0xBE810380u,              //  4: s_mov_b32 s1,0 (loop-2 counter)
+        0xB0020003u,              //  5: s_movk_i32 s2,3 (bound)
+        0xBF8A0000u,              //  6: s_barrier (before both loops)
+        0xBF0A0200u,              //  7: L1: s_cmp_lt_u32 s0,s2
+        0xBF840005u,              //  8: s_cbranch_scc0 -> pc14 (exact loop exit)
+        0x4A040481u,              //  9: v_add_nc_u32 v2,1,v2
+        0xD8340000u, 0x00000201u, // 10: ds_write_b32 v1,v2
+        0x81008100u,              // 12: s_add_i32 s0,s0,1
+        0xBF82FFF9u,              // 13: s_branch -> pc7
+        0xBF0A0201u,              // 14: L2: s_cmp_lt_u32 s1,s2
+        0xBF84000Au,              // 15: s_cbranch_scc0 -> pc26 (exact loop exit)
+        0xBE84047Eu,              // 16: save EXEC in s[4:5]
+        0x7D840100u,              // 17: v_cmp_eq_u32 vcc,v0,v0 (all lanes active)
+        0xBEFE046Au,              // 18: s_mov_b64 exec,vcc
+        0xBF880003u,              // 19: s_cbranch_execz -> pc23 (nested arm)
+        0x4A040482u,              // 20: v_add_nc_u32 v2,2,v2
+        0xD8340000u, 0x00000201u, // 21: ds_write_b32 v1,v2
+        0xBEFE0404u,              // 23: restore EXEC from s[4:5]
+        0x81018101u,              // 24: s_add_i32 s1,s1,1
+        0xBF82FFF4u,              // 25: s_branch -> pc14
+        0xBF8A0000u,              // 26: s_barrier (after both loops)
+        0xD8D80000u, 0x03000001u, // 27: ds_read_b32 v3,v1
+        0xBF8CC07Fu,              // 29: s_waitcnt
+        0x7E000D03u,              // 30: v_cvt_f32_u32 v0,v3
+        0xBF810000u,              // 31: s_endpgm
+    };
+    const std::vector<uint32_t> spv44f = recompile_valu(
+        code44f, std::size(code44f), 1, 0);
+    CHECK(!spv44f.empty(),
+          "kernel 44f: two sequential SCC0 loops + LDS + nested EXECZ recompile");
+    std::vector<float> in44f(64);
+    for (uint32_t i = 0; i < in44f.size(); ++i) in44f[i] = static_cast<float>(i);
+    const std::vector<float> got44f = prosper::test::run_compute(spv44f, in44f, 64, 64);
+    CHECK(got44f.size() == 64 &&
+              std::all_of(got44f.begin(), got44f.end(), [](float value) { return value == 9.0f; }),
+          "kernel 44f: sequential scalar loops preserve PHIs and ordinary LDS effects");
+
+    // The same second loop with the opposite canonical polarity: GE sets SCC at the bound and SCC1
+    // exits. This locks the polarity bit independently of the retained game's SCC0 encoding.
+    std::vector<uint32_t> code44f_scc1(std::begin(code44f), std::end(code44f));
+    code44f_scc1[14] = 0xBF090201u; // s_cmp_ge_u32 s1,s2
+    code44f_scc1[15] = 0xBF85000Au; // s_cbranch_scc1 -> pc26
+    const std::vector<uint32_t> spv44f_scc1 = recompile_valu(
+        code44f_scc1.data(), code44f_scc1.size(), 1, 0);
+    const std::vector<float> got44f_scc1 = prosper::test::run_compute(
+        spv44f_scc1, in44f, 64, 64);
+    CHECK(!spv44f_scc1.empty() && got44f_scc1.size() == 64 &&
+              std::all_of(got44f_scc1.begin(), got44f_scc1.end(),
+                          [](float value) { return value == 9.0f; }),
+          "kernel 44f: SCC1 canonical exit uses the opposite loop polarity");
+
+    // Negative siblings retain fail-visible structural and predicate-domain rejection.
+    std::vector<uint32_t> code44f_bad_target(std::begin(code44f), std::end(code44f));
+    code44f_bad_target[8] = 0xBF840006u; // exits past pc14 instead of backedge+1
+    CHECK(recompile_valu(code44f_bad_target.data(), code44f_bad_target.size(), 1, 0).empty(),
+          "kernel 44f: SCC loop exit must target exactly backedge+1");
+
+    std::vector<uint32_t> code44f_extra_exit(std::begin(code44f), std::end(code44f));
+    code44f_extra_exit[10] = 0xBF060000u; // s_cmp_eq_u32 s0,s0
+    code44f_extra_exit[11] = 0xBF850002u; // second SCC exit -> pc14
+    CHECK(recompile_valu(code44f_extra_exit.data(), code44f_extra_exit.size(), 1, 0).empty(),
+          "kernel 44f: an extra SCC exit inside a canonical loop rejects");
+
+    std::vector<uint32_t> code44f_poisoned(std::begin(code44f), std::end(code44f));
+    code44f_poisoned[7] = 0x87866A6Au; // s_and_b64 s[6:7],vcc,vcc: SCC is a guest-wave reduction
+    CHECK(recompile_valu(code44f_poisoned.data(), code44f_poisoned.size(), 1, 0).empty(),
+          "kernel 44f: mask-poisoned SCC cannot control a scalar loop");
+
+    std::vector<uint32_t> code44f_inner_barrier(std::begin(code44f), std::end(code44f));
+    code44f_inner_barrier[9] = 0xBF8A0000u; // s_barrier inside loop 1
+    CHECK(recompile_valu(code44f_inner_barrier.data(), code44f_inner_barrier.size(), 1, 0).empty(),
+          "kernel 44f: a workgroup barrier inside an SCC loop rejects");
+
+    std::vector<uint32_t> code44f_inner_swizzle(std::begin(code44f), std::end(code44f));
+    code44f_inner_swizzle[10] = 0xD8D4020Fu; // ds_swizzle_b32 v0,v0 offset:0x020f
+    code44f_inner_swizzle[11] = 0x00000000u;
+    CHECK(recompile_valu(code44f_inner_swizzle.data(), code44f_inner_swizzle.size(), 1, 0).empty(),
+          "kernel 44f: a cross-lane DS collective inside an SCC loop rejects");
+
+    // Kernel 44g (#1554): SOPK s_addk_i32 is a signed-16 immediate read/modify/write. Its data result
+    // is the low 32-bit sum and SCC reports signed overflow, matching SOP2 s_add_i32.
+    const uint32_t code44g[] = {
+        0xB000000Au, // s_movk_i32 s0,10
+        0xB780FFFDu, // s_addk_i32 s0,-3
+        0x7E000200u, // v_mov_b32 v0,s0
+        0x7E000B00u, // v_cvt_f32_i32 v0,v0
+        0xBF810000u,
+    };
+    const std::vector<uint32_t> spv44g = recompile_valu(code44g, std::size(code44g), 0, 0);
+    const std::vector<float> got44g = prosper::test::run_compute(spv44g, {0.0f}, 1, 1);
+    CHECK(!spv44g.empty() && got44g.size() == 1 && got44g[0] == 7.0f,
+          "kernel 44g: s_addk_i32 sign-extends SIMM16 and writes the low-32 sum");
+
+    const uint32_t code44g_wrap[] = {
+        0xBE8003FFu, 0x7FFFFFFFu, // s_mov_b32 s0,INT_MAX
+        0xB7800001u,              // s_addk_i32 s0,1 -> INT_MIN bits
+        0x7E000200u,              // v_mov_b32 v0,s0
+        0x7E000B00u,              // v_cvt_f32_i32 v0,v0
+        0xBF810000u,
+    };
+    const std::vector<uint32_t> spv44g_wrap = recompile_valu(
+        code44g_wrap, std::size(code44g_wrap), 0, 0);
+    const std::vector<float> got44g_wrap = prosper::test::run_compute(
+        spv44g_wrap, {0.0f}, 1, 1);
+    CHECK(!spv44g_wrap.empty() && got44g_wrap.size() == 1 &&
+              got44g_wrap[0] == -2147483648.0f,
+          "kernel 44g: s_addk_i32 wraps the data result to the low 32 bits");
+
+    auto addk_overflow_result = [](uint32_t initial, uint32_t addk_word) {
+        const uint32_t code[] = {
+            0xBE8003FFu, initial, // s_mov_b32 s0,literal
+            addk_word,            // s_addk_i32 s0,imm
+            0x85018081u,          // s_cselect_b32 s1,1,0
+            0x7E000201u,          // v_mov_b32 v0,s1
+            0x7E000D00u,          // v_cvt_f32_u32 v0,v0
+            0xBF810000u,
+        };
+        const std::vector<uint32_t> spv = recompile_valu(code, std::size(code), 0, 0);
+        const std::vector<float> got = prosper::test::run_compute(spv, {0.0f}, 1, 1);
+        return got.size() == 1 ? got[0] : -1.0f;
+    };
+    CHECK(addk_overflow_result(0x7FFFFFFFu, 0xB7800001u) == 1.0f,
+          "kernel 44g: s_addk_i32 detects positive signed overflow");
+    CHECK(addk_overflow_result(0x80000000u, 0xB780FFFFu) == 1.0f,
+          "kernel 44g: s_addk_i32 detects negative signed overflow");
+    CHECK(addk_overflow_result(7u, 0xB7800001u) == 0.0f,
+          "kernel 44g: s_addk_i32 leaves SCC clear without signed overflow");
+
     // Kernel 45: EXEC-narrowed-state tracking regression (the review-flagged under-narrow bug). Save all-on
     //   exec to vcc; v_cmp overwrites vcc with a per-lane mask (lanes i<4); restore exec FROM vcc — exec is
     //   now narrowed, so v_mov v2,7 must be EXEC-predicated (only i<4 get 7; i>=4 keep 0). If the narrowed
@@ -2881,15 +3019,29 @@ int main() {
     CHECK(recompile_valu(code47c3.data(), code47c3.size(), 2, 3).empty(),
           "kernel 47c3 rejects when either post-merge branch path reads VCC scratch");
 
-    // Kernel 47d (NEGATIVE, soundness): s5 is written in the block, then an SOPK s_addk_i32 s5 (a
-    // read-modify-write whose SIMM16 operand leaves n_src==0) reads s5 after the merge -> s5 is LIVE. The
-    // liveness scan must NOT mistake the SOPK dst for a redefinition; the block must be rejected. Empty.
+    // Kernel 47d: s5 is written in the block, then SOPK s_addk_i32 s5 (a read-modify-write whose
+    // SIMM16 operand leaves n_src==0) reads s5 after the merge. The liveness scan must NOT mistake the
+    // SOPK dst for a redefinition and linearize the block. The exact wave-uniform EXECZ structurizer
+    // instead carries s5 through its merge, after which ADDK adds 16 to the raw 50.0f bit pattern.
     const uint32_t code47d[] = {
         0x7e0602ffu, 0x42c80000u, 0x7d880300u, 0xbe80246au, 0xbf880003u, 0xbe8503ffu, 0x42480000u,
         0x06060005u, 0xbefe0400u, 0xb7850010u, 0x06060605u, 0xbf810000u,
     };
     std::vector<uint32_t> spv47d = recompile_valu(code47d, sizeof(code47d)/sizeof(code47d[0]), 2, /*out_vgpr*/3);
-    CHECK(spv47d.empty(), "kernel 47d (SOPK RMW reads block scalar after merge) correctly REJECTED");
+    CHECK(!spv47d.empty(),
+          "kernel 47d (live SOPK RMW input uses structured wave-uniform EXECZ) recompiles");
+    float addk47d = 0.0f;
+    const uint32_t addk47d_bits = 0x42480010u;
+    std::memcpy(&addk47d, &addk47d_bits, sizeof(addk47d));
+    const std::vector<float> got47d = prosper::test::run_compute(spv47d, in18, N, N);
+    uint32_t bad47d = 0;
+    for (uint32_t i = 0; i < N && got47d.size() == N; ++i) {
+        const uint32_t u0 = i % 17, u1 = i % 13;
+        const float expected = (u0 > u1 ? static_cast<float>(u0) + 50.0f : 100.0f) + addk47d;
+        if (got47d[i] != expected) ++bad47d;
+    }
+    CHECK(got47d.size() == N && bad47d == 0,
+          "kernel 47d carries the live scalar into s_addk_i32 on both EXEC paths");
 
     // Kernel 48: v_mac_f32 (VOP2 0x1f) = src0*src1 + dst (accumulate). v3 = 3.0; v3 = a0*a1 + v3.
     // op 0x1f is v_mac_f32 on the PS5 ISA — the RDNA1/gfx1010 encoding (removed on desktop gfx1030, where
