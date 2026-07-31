@@ -732,6 +732,87 @@
         }
       ],
       "min_nonblack_ratio": 0.5
+    },
+    {
+      "name": "rugrats-gameplay",
+      "dump": "PPSA23396-app0",
+      "scale": 4,
+      "timeout": 180,
+      "capture_after_seconds": 118,
+      "capture_before_seconds": 175,
+      "pad_script": "scripts/rugrats/reach-gameplay.pad",
+      "savedata_policy": "fresh",
+      "env": {},
+      "min_colors": 12000,
+      "min_qualifying_frames": 20,
+      "min_pixel_changes": 20,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 20,
+      "min_content_match_ratio": 0.75,
+      "dims": [
+        480,
+        270
+      ],
+      "review": "Approved all 16 composited images from two independent runs on 2026-07-31. Every image is the first nursery level (BABIES IN GAMELAND) at 480x270: the pink nursery wall, the textured green carpet, the stacked multi-colour block platform, the expanding wooden playpen gate with its dark-red section and gold padlock, the orange curtain and daylit window, both babies (Tommy and Chuckie) with their animation, and both baby-bottle HUD icons -- fully composited, with no black regions, missing layers, or diagnostic-only output. The babies occupy visibly different gate heights and poses across all eight timestamps of each run and between the two runs, confirming a live progressing scene rather than a frozen frame; the window's 57 frames hold 33 and 34 distinct pixel CRCs while every consecutive pair differs, which is the repeating climb/jump cycle the route's Cross presses drive. Measured 17,256-17,565 distinct colours and 0.9976-0.9978 non-black coverage in all 57 window frames of both runs, identical in range across runs. Contrasting states measured on the same route: the GAME MODE menu reaches 56,090 colours, the BABIES IN GAMELAND title card is fully opaque at 1,551 colours, and the boot's black frames measure 1 colour at 0.0 coverage -- so min_colors=12000 and min_nonblack_ratio=0.4988 sit well below the reviewed gameplay range and well above every observed failure state.",
+      "_note": "Reviewed fresh-save guard for Rugrats: Adventure in Gameland's first nursery level (BABIES IN GAMELAND). Profiling the committed route once per second across the whole boot placed the level at 98s, so the evidence window opens at 118s -- twenty seconds later -- and runs to 175s, giving 57 samples entirely inside settled gameplay. Because min_content_match_ratio rejects a window once a quarter of its frames are off-scene, that start also tolerates the level arriving as late as roughly 132s before the guard can fail on healthy output. Colour count is deliberately ONE of five conjoined conditions (richness, non-black coverage, SSIM against reviewed luminance references, stable dimensions, frame-to-frame change) and must never become the contract on its own. This title demonstrates why with unusual clarity: the two richest frames in the entire run are the GAME MODE selector at 56,071-56,090 colours, which is 3.2x richer than the best gameplay frame in the run at 17,645, so a colour-only guard would rank a menu above every frame of the scene it is supposed to protect. Coverage alone fails symmetrically -- the BABIES IN GAMELAND level-title card and its fade score a full 1.0 non-black ratio at only 1,551-3,448 colours, and 54 frames of the run reach 0.999 coverage with as few as 1,551 colours.",
+      "structural_references": [
+        {
+          "luma16x9": "a5a3a6a6a6a6a6a6a6a6a6a69c8f8eb19d7d7383a5a3a5a3a5a3a2a4968887c877707a7b8d8d909d897c7e8e896894bea3736e8b888d8bab858a7888948498b220446f7489888a9a886f8092958f776b304a7d7584888488848676829192869a2a1a21577b787c777a787178807c74837e7e7c7e7d7d7f7b7e7b7e7f7f7e7e7e74757376767776757576767377767773",
+          "average_hash": "0000c4cc7c8cfdff",
+          "difference_hash": "a028381090505940"
+        },
+        {
+          "luma16x9": "a5a3a6a6a6a6a6a6a6a6a6a69c8f8eb19d7d7383a5a3a5a3a5a3a2a4968887c877707a7b8d8d93a589797d8e896894bea3736e8b888d89a2878a7b88948498b220446f7489888a9788738192958f776b304a7d7584888488848877829192869a2a1a21577b787c777a787178807c74837e7e7c7e7d7d7f7b7e7b7e7f7f7e7e7e74757376767776757576767377767773",
+          "average_hash": "0000c4cc7c8cfdff",
+          "difference_hash": "a028381090505940"
+        },
+        {
+          "luma16x9": "a5a3a6a6a6a6a6a6a6a6a6a69c8f8eb19d7d7383a5a3a5a3a5a3a2a4968887c877707a7b8d8d98bb897b7f8e896894bea3736e8b888d8a9d86867a88948498b220446f748988898a887f7e92958f776b304a7d7584888488848877829192869a2a1a21577b787c777a787178807c74837e7e7c7e7d7d7f7b7e7b7e7f7f7e7e7e74757376767776757576767377767773",
+          "average_hash": "0000c4dc5c8cfdff",
+          "difference_hash": "a028380090505940"
+        },
+        {
+          "luma16x9": "a5a3a6a6a6a6a6a6a6a6a6a69c8f8eb19d7d7383a5a3a5a2a5a3a2a4968887c877707a7b8d8d98c0887c7d8e896894bea3736e8b888d8b9b88817b88948498b220446f748988898988827e92958f776b304a7d7584888488848877829192869a2a1a21577b787c777a787178807c74837e7e7c7e7d7d7f7b7e7b7e7f7f7e7e7e74757376767776757576767377767773",
+          "average_hash": "0000c4dc4c8cfdff",
+          "difference_hash": "a028380090505140"
+        },
+        {
+          "luma16x9": "a5a3a6a6a6a6a6a6a6a6a6a69c8f8eb19d7d7383a5a3a5a7a59fa0a4968887c877707a7b8d8d95c1868c7b8e896894bea3736e8b888d8c9388717688948498b220446f748988898988878192958f776b304a7d7584888488848877829192869a2a1a21577b787c777a787178807c74837e7e7c7e7d7d7f7b7e7b7e7f7f7e7e7e74757376767776757576767377767773",
+          "average_hash": "0000c4dc4c9cfdff",
+          "difference_hash": "a028380098505140"
+        },
+        {
+          "luma16x9": "a5a3a6a6a6a6a6a6a6a6a6a69c8f8eb19d7d7383a5a3a5aaa59fa0a4968887c877707a7b8d8d94be868c7b8e896894bea3736e8b888d8c9388717688948498b220446f748988898988878192958f776b304a7d7584888488848877829192869a2a1a21577b787c777a787178807c74837e7e7c7e7d7d7f7b7e7b7e7f7f7e7e7e74757376767776757576767377767773",
+          "average_hash": "0000c4dc4c9cfdff",
+          "difference_hash": "a028380098505140"
+        },
+        {
+          "luma16x9": "a5a3a6a6a6a6a6a6a6a6a6a69c8f8eb19d7d7383a5a3a6b0a59b9fa4968887c877707a7b8d8d92b785867a8e896894bea3736e8b888d8b9289737988948498b220446f748988898988878692958f776b304a7d7584888488848877829192869a2a1a21577b787c777a787178807c74837e7e7c7e7d7d7f7b7e7b7e7f7f7e7e7e74757376767776757576767377767773",
+          "average_hash": "0000c4dc6c8cfdff",
+          "difference_hash": "a028380098505140"
+        },
+        {
+          "luma16x9": "a5a3a6a6a6a6a6a6a6a6a6a69c8f8eb19d7d7383a5a3a6b3a4969da4968887c877707a7b8d8d91b385897a8e896894bea3736e8b888d8b9189707988948498b220446f748988898988888692958f776b304a7d7584888488848877829192869a2a1a21577b787c777a787178807c74837e7e7c7e7d7d7f7b7e7b7e7f7f7e7e7e74757376767776757576767377767773",
+          "average_hash": "0000c4dc6c8cfdff",
+          "difference_hash": "a028380098505140"
+        },
+        {
+          "luma16x9": "a5a3a6a6a6a6a6a6a6a6a6a69c8f8eb19d7d7383a5a3a5a2a5a3a2a4968887c877707a7b8d8d98c0897b7d8e896894bea3736e8b888d8b9b88837b88948498b220446f748988898988817e92958f776b304a7d7584888488848877829192869a2a1a21577b787c777a787178807c74837e7e7c7e7d7d7f7b7e7b7e7f7f7e7e7e74757376767776757576767377767773",
+          "average_hash": "0000c4dc4c8cfdff",
+          "difference_hash": "a028380090505140"
+        },
+        {
+          "luma16x9": "a5a3a6a6a6a6a6a6a6a6a6a69c8f8eb19d7d7383a5a3a5aca59b9fa4968887c877707a7b8d8d93bb85867a8e896894bea3736e8b888d8c9289737988948498b220446f748988898988878692958f776b304a7d7584888488848877829192869a2a1a21577b787c777a787178807c74837e7e7c7e7d7d7f7b7e7b7e7f7f7e7e7e74757376767776757576767377767773",
+          "average_hash": "0000c4dc6c8cfdff",
+          "difference_hash": "a028380098505140"
+        },
+        {
+          "luma16x9": "a5a3a6a6a6a6a6a6a6a6a6a69c8f8eb19d7d7383a5a3a7b6a1939aa4968887c877707a7b8d8d91ae87897a8e896894bea3736e8b888d8a9189727a88948498b220446f748988898988898692958f776b304a7d7584888488848877829192869a2a1a21577b787c777a787178807c74837e7e7c7e7d7d7f7b7e7b7e7f7f7e7e7e74757376767776757576767377767773",
+          "average_hash": "0000c4dc7c8cfdff",
+          "difference_hash": "a028380098505140"
+        }
+      ],
+      "min_nonblack_ratio": 0.498796
     }
   ]
 }
