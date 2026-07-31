@@ -17,6 +17,7 @@
 #include "../host/guest_memory_map.hpp"
 #include "../host/guest_write_watch.hpp"
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -130,6 +131,17 @@ void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t 
 // envs. Set (and cleared) by realize_draw_item's failure replay — the submit path is serialized
 // by the HLE submit mutex, so a plain global is safe there.
 bool g_dyntrace_force = false;
+
+bool dyntrace_failed_shader_enabled(uint64_t code_addr) {
+    if (!std::getenv("PROSPER_DYNTRACE_FAIL")) return false;
+    const char* filter = std::getenv("PROSPER_DYNTRACE_FAIL_ADDR");
+    if (!filter) return true;
+
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(filter, &end, 16);
+    return errno == 0 && end != filter && *end == '\0' && parsed == code_addr;
+}
 
 namespace {
 
@@ -2492,18 +2504,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             guarded_bvh_use(ins, in.pc);
                         if (trc) {
                             fprintf(stderr,
-                                    "[dyntrace] BVH pc=%u srsrc=s%d snapshot=%d seed=%d bvh=",
-                                    in.pc, bbase, snapshot_provenance, seed_provenance);
-                            if (plausible) {
+                                    "[dyntrace] BVH pc=%u srsrc=s%d snapshot=%d seed=%d "
+                                    "live_known=%d bvh=",
+                                    in.pc, bbase, snapshot_provenance, seed_provenance, live_known);
+                            if (live_known) {
                                 for (uint32_t word : live_bvh) fprintf(stderr, "%08x ", word);
+                            } else {
+                                fprintf(stderr, "<unknown> ");
+                            }
+                            if (plausible) {
                                 fprintf(stderr, "-> base=0x%llx size=0x%llx type=%u tri_mode=%u grow=%u",
                                         (unsigned long long)d.base,
                                         (unsigned long long)d.size_bytes, d.type,
                                         d.triangle_return_mode, d.box_grow);
                             } else if (guarded_null) {
                                 fprintf(stderr, "<guarded-null origin=%u>", proven_null_origin);
-                            } else {
-                                fprintf(stderr, "<unknown>");
+                            } else if (live_known) {
+                                fprintf(stderr, "<insufficient-provenance>");
                             }
                             fputc('\n', stderr);
                         }
@@ -4305,7 +4322,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
             // This trace reveals whether the failing dispatch's descriptors ARE const-fold-resolvable
             // (i.e. loaded via a foldable s_load chain) — the ground truth for #590 before extending
             // the compute resource build. Read-only: it does not change what the executor binds.
-            if (getenv("PROSPER_DYNTRACE_FAIL")) {
+            if (dyntrace_failed_shader_enabled(code_addr)) {
                 static std::set<uint64_t> traced_cs;
                 if (traced_cs.insert(code_addr).second) {
                     std::fprintf(stderr,

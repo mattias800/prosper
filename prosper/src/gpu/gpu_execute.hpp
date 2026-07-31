@@ -294,6 +294,11 @@ void clear_shader_analysis_cache();
 // draw without needing the shader's address up front (the UI draws it targets are rare/phase-bound).
 extern bool g_dyntrace_force;
 
+// True when failed-shader tracing is enabled for this exact program. With no address filter this
+// preserves the historical behavior of tracing every distinct failed program; the optional filter
+// keeps a long boot's diagnostic volume bounded to one known shader.
+bool dyntrace_failed_shader_enabled(uint64_t code_addr);
+
 // Assign each resource in `t` a descriptor binding from `first`: constant/vertex buffers first, then
 // textures / storage images — never on binding 2 or 3 (the recompiler's two hardwired cbufs) so a
 // texture-first shader can't collide two descriptor types at one binding (#157). Exposed for testing.
@@ -1120,7 +1125,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         // PROSPER_DYNTRACE_FAIL=1: replay the FAILED vertex stage's resource build with the
         // dynamic-fetch walk trace + user-data block dump forced on (once per distinct VS), so the
         // failing draw's exact seeding/s_load chain is captured without knowing its address up front.
-        if (vs_words.empty() && getenv("PROSPER_DYNTRACE_FAIL")) {
+        if (vs_words.empty() && dyntrace_failed_shader_enabled(vs_program_addr)) {
             static std::set<uint64_t> traced;
             if (traced.insert(vs_program_addr).second) {
                 fprintf(stderr, "[dynfail] replaying VS 0x%llx resource build with trace:\n",
@@ -1131,7 +1136,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
         }
         // Same replay for a FAILED pixel stage (#273 — the PS-side descriptor-resolution walls).
-        if (fs_words.empty() && getenv("PROSPER_DYNTRACE_FAIL")) {
+        if (fs_words.empty() && dyntrace_failed_shader_enabled(rs.ps_addr)) {
             static std::set<uint64_t> traced_ps;
             if (traced_ps.insert(rs.ps_addr).second) {
                 fprintf(stderr, "[dynfail] replaying PS 0x%llx resource build with trace:\n",

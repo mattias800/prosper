@@ -14,6 +14,7 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -22,8 +23,33 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+static void set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
+
 int main() {
     printf("== test_dynfetch_fold ==\n");
+
+    set_test_env("PROSPER_DYNTRACE_FAIL", nullptr);
+    set_test_env("PROSPER_DYNTRACE_FAIL_ADDR", nullptr);
+    CHECK(!dyntrace_failed_shader_enabled(0x500571000ull),
+          "failed-shader dyntrace remains disabled by default");
+    set_test_env("PROSPER_DYNTRACE_FAIL", "1");
+    CHECK(dyntrace_failed_shader_enabled(0x500571000ull),
+          "unfiltered failed-shader dyntrace preserves all-program behavior");
+    set_test_env("PROSPER_DYNTRACE_FAIL_ADDR", "0x500571000");
+    CHECK(dyntrace_failed_shader_enabled(0x500571000ull) &&
+              !dyntrace_failed_shader_enabled(0x500571100ull),
+          "failed-shader dyntrace address filter selects one exact program");
+    set_test_env("PROSPER_DYNTRACE_FAIL_ADDR", "not-an-address");
+    CHECK(!dyntrace_failed_shader_enabled(0x500571000ull),
+          "malformed failed-shader dyntrace address filter fails closed");
+    set_test_env("PROSPER_DYNTRACE_FAIL", nullptr);
+    set_test_env("PROSPER_DYNTRACE_FAIL_ADDR", nullptr);
 
     uint32_t readable_probe = 0;
     CHECK(!guest_readable(0, sizeof(uint32_t)), "null guest address is not readable");
@@ -689,6 +715,22 @@ int main() {
               astro_bvh_table.resources[0].bvh_box_grow == 6u &&
               astro_bvh_table.resources[0].fetch_pc == 0,
           "Astro BVH bytes materialize as the instruction-scoped read-only compute buffer");
+
+    // Concrete descriptor words alone are diagnostic evidence, not binding provenance. Keep this
+    // case unresolved while allowing dyntrace to print the exact live words that led to rejection.
+    const uint32_t unproven_live_bvh[] = {
+        0xBE9003FFu, 0x00123456u,            // pc0: s_mov_b32 s16, literal
+        0xBE9103FFu, 0x03000000u,            // pc2: s_mov_b32 s17, literal
+        0xBE9203FFu, 0x0000003Fu,            // pc4: s_mov_b32 s18, literal
+        0xBE9303FFu, 0x81000000u,            // pc6: s_mov_b32 s19, literal
+        0xF1989F07u, 0x00040303u, 0x43440D3Fu, 0x46424140u, 0x00004847u,
+        0xBF810000u,
+    };
+    std::vector<SrtUse> unproven_live_bvh_uses;
+    resolve_dynamic_fetch(unproven_live_bvh, std::size(unproven_live_bvh), nullptr, 0, 0,
+                          &unproven_live_bvh_uses);
+    CHECK(unproven_live_bvh_uses.empty(),
+          "live-known BVH words without descriptor provenance remain fail-visible");
 
     // Astro's first world-map dispatch explicitly writes a null qword to the root pointer consumed
     // by this scalar chain. Preserve that fact only through the exact dependent descriptor ALU, and
