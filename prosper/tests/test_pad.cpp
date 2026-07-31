@@ -310,6 +310,7 @@ int main() {
         CHECK(pad_button_by_name("options") == SCE_PAD_BUTTON_OPTIONS, "name: options -> OPTIONS");
         CHECK(pad_button_by_name("cross")   == SCE_PAD_BUTTON_CROSS,   "name: cross -> CROSS");
         CHECK(pad_button_by_name("x")       == SCE_PAD_BUTTON_CROSS,   "name: x -> CROSS");
+        CHECK(pad_button_by_name("r2")      == SCE_PAD_BUTTON_R2,      "name: r2 -> R2");
         CHECK(pad_button_by_name("up")      == SCE_PAD_BUTTON_UP,      "name: up -> UP");
         CHECK(pad_button_by_name("nonsense")== 0,                      "name: unknown -> 0");
         CHECK(pad_button_names(SCE_PAD_BUTTON_OPTIONS) == "options", "names: options is canonical");
@@ -379,6 +380,16 @@ int main() {
         CHECK(overlaid.left_x == 0x80 && overlaid.left_y == 0x80 &&
               overlaid.right_x == 0x22 && overlaid.right_y == 0x00,
               "overlay: active axes map to Sony bytes and unspecified axes remain unchanged");
+
+        auto trigger_move = parse_pad_script("1-3:r2+left-stick-left");
+        CHECK(trigger_move.size() == 1 && trigger_move[0].button_mask == SCE_PAD_BUTTON_R2 &&
+              trigger_move[0].axis_mask == PAD_SCRIPT_LEFT_X && trigger_move[0].left_x == -1,
+              "parse: R2 and left-stick movement share a route entry");
+        const auto trigger_move_state = pad_script_state_at(trigger_move, 2.0, hold);
+        CHECK(trigger_move_state.button_mask == SCE_PAD_BUTTON_R2 &&
+              trigger_move_state.axis_mask == PAD_SCRIPT_LEFT_X &&
+              trigger_move_state.left_x == -1,
+              "eval: combined R2 and movement stay active inside their explicit range");
 
         // Malformed pieces are skipped, not fatal; an all-unknown entry drops out.
         auto s2 = parse_pad_script("nocolon;5:garbagebtn;7:down");
