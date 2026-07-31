@@ -4057,6 +4057,48 @@ int main() {
     CHECK(gotT11e.size()==N && badT11e==0,
           "T11e: v_bcnt_u32_b32 adds the exact 32-bit population count");
 
+    // Worms Armageddon (PPSA20052) rejects every one of its vertex shaders at pc=7 on VOP3 0x15d
+    // (v_sad_u32). Its shipped .ags shader assets carry the identical word, so the encoding is
+    // independently attested. D.u32 = abs(S0.u32 - S1.u32) + S2.u32 — an UNSIGNED magnitude, which
+    // is why the lowering must be max-min and not a signed absolute value.
+    //   v96 = 0x40000000 (the inline 2.0f constant), v95 unwritten = 0.
+    const uint32_t codeTsad1[] = {
+        0x7ec20300u,               // v_mov_b32 v97, v0
+        0x7ec002f4u,               // v_mov_b32 v96, 2.0   (bit pattern 0x40000000)
+        0xd55d0062u, 0x057ec161u,  // v_sad_u32 v98, v97, v96, v95
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad1 = recompile_valu(
+        codeTsad1, sizeof(codeTsad1)/sizeof(codeTsad1[0]), 1, /*out_vgpr*/98);
+    CHECK(!spvTsad1.empty(), "recompiled Tsad1 (Worms v_sad_u32 word) -> SPIR-V");
+    std::vector<float> gotTsad1 = prosper::test::run_compute(spvTsad1, inX, N, N);
+    uint32_t badTsad1 = 0;
+    for (uint32_t i=0;i<N&&gotTsad1.size()==N;i++) {
+        const uint32_t x = bits_of(inX[i]), c = 0x40000000u;
+        const uint32_t want = (x > c ? x - c : c - x);
+        if (bits_of(gotTsad1[i]) != want) ++badTsad1;
+    }
+    CHECK(gotTsad1.size()==N && badTsad1==0,
+          "Tsad1: v_sad_u32 is the unsigned absolute difference plus the accumulator");
+
+    // The exact form Worms emits: src1 is the inline 0 and src2 is the destination, i.e. an
+    // unsigned accumulate. Seed v98 with 5 so a dropped S2 addend cannot pass.
+    const uint32_t codeTsad2[] = {
+        0x7ec20300u,               // v_mov_b32 v97, v0
+        0x7ec40285u,               // v_mov_b32 v98, 5
+        0xd55d0062u, 0x05890161u,  // v_sad_u32 v98, v97, 0, v98
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad2 = recompile_valu(
+        codeTsad2, sizeof(codeTsad2)/sizeof(codeTsad2[0]), 1, /*out_vgpr*/98);
+    CHECK(!spvTsad2.empty(), "recompiled Tsad2 (Worms v_sad_u32 accumulate form) -> SPIR-V");
+    std::vector<float> gotTsad2 = prosper::test::run_compute(spvTsad2, inX, N, N);
+    uint32_t badTsad2 = 0;
+    for (uint32_t i=0;i<N&&gotTsad2.size()==N;i++)
+        if (bits_of(gotTsad2[i]) != bits_of(inX[i]) + 5u) ++badTsad2;
+    CHECK(gotTsad2.size()==N && badTsad2==0,
+          "Tsad2: v_sad_u32 with src1=0 adds S0 to the S2 accumulator");
+
     // Astro's next blocker is VOP3B v_mad_u64_u32. Exercise all three architectural
     // outputs with an overflowing case:
     //   0xffffffff*2 + 0xffffffffffffffff = carry:1, hi:1, lo:0xfffffffd.
