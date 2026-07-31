@@ -46,6 +46,43 @@ the stage-agnostic `recompile_coverage` result. That coverage is intentionally c
 control-flow shape may remain listed there even when the vertex/fragment structurizer accepts it.
 `--stage vertex|fragment|compute` additionally runs the complete stage translator, which exposes contextual
 resource and structured-control-flow failures that per-instruction coverage cannot decide.
+
+## `--stage` cannot prove a shader is unsupported (#1571)
+
+**`shader_inspect` has no resource table, and a table-less stage rejection is NOT evidence of a shader
+defect.** A raw dump carries instructions but no descriptors, so the tool can never build a
+`ShaderResourceTable`. The recompiler then refuses — by design — to lower anything that resolves a
+V#/T#/S# through that table: `MIMG`, `MUBUF` and `MTBUF` in every stage, and additionally `SMEM` in the
+**vertex and fragment** stages, which gate scalar memory on `allow_smem = (rt != nullptr)`. Compute
+passes `allow_smem = true`, so constant-buffer loads are fine there — but compute image and buffer ops
+still need the table.
+
+The gates live in `emit_alu` in `src/gpu/rdna2_to_spirv.cpp` (MIMG rejects on `!allow_smem || !rt`,
+SMEM on `!allow_smem`); the per-stage `allow_smem` values are set by `recompile_fragment_impl` and
+`recompile_vertex_impl` (`rt != nullptr`) versus `recompile_compute` (`true`). Those functions are named
+rather than cited by line because line numbers drift — grep the names.
+
+When such an instruction is present the tool now reports:
+
+```text
+stage-recompile stage=fragment status=undetermined-no-resource-table spirv_dwords=0 table_dependent=17
+stage-recompile NOTE: TOOL LIMITATION, NOT A SHADER DEFECT. ...
+```
+
+Treat `undetermined-no-resource-table` as "no verdict", never as a missing opcode. This mattered: on a
+corpus of 114 shaders that had provably recompiled and rendered live, the pre-fix tool called **109 of
+them `rejected`** — 33/35 compute, 27/29 fragment, 49/50 vertex. Agents acted on those false leads.
+
+**For a table-accurate verdict, use `gpu_replay`**, which has the real descriptors from a capture:
+
+```bash
+gpu_replay <capture>.prgcap --inspect-only                     # per-draw realize/fail status
+gpu_replay <capture>.prgcap --dump-failed-shader FAILURE:STAGE out.bin   # a genuinely failed stage
+```
+
+Exit codes: `0` recompiled, `1` genuine defect (truncated stream, or a rejection attributable to the
+shader), `2` usage/IO error, `3` undetermined because no resource table could be supplied. `3` is
+deliberately non-zero — a table-less run is never reported as a pass.
 When a shader contains the fully proven bounded scalar `s_setpc_b64` jump-table idiom, the header also
 prints its constant-buffer selector, adjustment/clamp, complete target list, merge PC, and owning span.
 

@@ -670,6 +670,15 @@ if(TARGET prosper_core)
   add_executable(shader_inspect tools/shader_inspect/shader_inspect.cpp)
   target_link_libraries(shader_inspect PRIVATE prosper_core)
 
+  # Resource-table honesty (#1571): a raw dump carries no descriptors, so a table-less stage
+  # rejection must be reported as an UNDETERMINED tool limitation, never as a shader defect.
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME shader_inspect_resource_table_honesty
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_shader_inspect.py"
+                     "$<TARGET_FILE:shader_inspect>")
+  endif()
+
   # spv_validate: recompile one shader from every path and run spirv-val on each — a strict-validation
   # gate (the render tests only prove llvmpipe accepts them; llvmpipe is lenient). No Vulkan needed;
   # skips validation gracefully if spirv-val is not on PATH (still checks recompilation succeeds).
