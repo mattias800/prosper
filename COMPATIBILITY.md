@@ -23,6 +23,11 @@ Last updated: 2026-07-31
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
 | *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 title, name entry, name confirmation, and first-run `System Settings 1/4` onboarding reached; gameplay is not yet validated |
 | *Alex Kidd in Miracle World DX* | `PPSA02664` | Unity / IL2CPP | ✅ First level reached and rendered at native 1920×1080; colour matches the hardware reference, with a minor title-overlay contrast defect |
+| *New Joe &amp; Mac: Caveman Ninja* | `PPSA02801` | Unity / IL2CPP | ✅ Title screen, menus and level 1 gameplay render at native 1920×1080 — reached on the first boot with no code changes |
+| *Worms Armageddon: Anniversary Edition* | `PPSA20052` | Custom (Digital Eclipse) | 🚧 Studio splash and title screen render at native 1920×1080; gameplay blocked because the guest never opens a pad |
+| *Earthion* | `PPSA28061` | Custom (Ancient) | 🚧 Developer logo, intro story text and CRT bezel render; the 320×224 game picture inside the bezel is still missing |
+| *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🔬 Boots deep into the UE4 frame loop with real GPU work; presented frames are still a flat colour |
+| *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Audio and sound bank initialise; the game's own code lives in a runtime-loaded PRX that prosper cannot yet load |
 
 ¹ Exact retail game name pending confirmation.
 
@@ -308,6 +313,51 @@ origin-agreement invariant to the tile tests.
 A reviewed content guard (`alexkidd-gameplay`) covers the route in `tools/snapshot`. One known
 defect remains: the title screen's watermark overlay composites at roughly half the hardware
 strength (#710).
+
+## New Joe & Mac: Caveman Ninja — `PPSA02801`
+
+<p align="center">
+  <img src="assets/screenshots/joe-mac.png" alt="New Joe &amp; Mac: Caveman Ninja — level 1 gameplay">
+</p>
+<p align="center">
+  <img src="assets/screenshots/joe-mac-menu.png" alt="New Joe &amp; Mac: Caveman Ninja — arcade menu">
+</p>
+
+Reached **gameplay on the first boot ever attempted, with no code changes and no recompiler
+rejections** — the only title so far to do so. A scripted controller press moves from the title
+screen through the arcade menu into level 1: the player animates, the HUD shows name, score, health
+and lives, and parallax jungle backgrounds, foreground foliage and enemies all composite correctly.
+Over a routed run the score changes, the health bar drains, the lives counter decrements, and a
+respawn banner appears, so guest logic and input are healthy end to end.
+
+## Worms Armageddon: Anniversary Edition — `PPSA20052`
+
+<p align="center">
+  <img src="assets/screenshots/worms-armageddon-title.png" alt="Worms Armageddon: Anniversary Edition — title screen">
+</p>
+
+The Digital Eclipse studio splash and the full title screen render at native 1920×1080. Reaching
+them needed one small generic recompiler addition: VOP3 `v_sad_u32`, which this title's PSSL
+compiler emits as its vertex-shader index prologue. Without it the vertex stage was rejected and
+nothing rendered at all.
+
+Gameplay is blocked for an unrelated reason: the guest calls `scePadInit` and then never calls
+`scePadOpen`, so no scripted input can reach it. Tracked on #1592.
+
+This title is also a useful reverse-engineering surface in its own right — it ships its AGC shaders
+as loose `.ags` assets in the dump root, which can be inspected statically without a capture.
+
+## Earthion — `PPSA28061`
+
+A 79 MB dump — a 2.3 MB eboot plus a single 24 MB `game.bin` — running Ancient's own engine directly
+on AGC. It boots on the first attempt with no code changes, loads all ten of its `.gnf` textures,
+initialises audio, reaches its frame loop, and renders its developer logo, its legible intro story
+text, and the retro CRT-TV bezel that frames the whole game. The intro advances normally through
+several pages, so guest logic, input timing and presentation are healthy.
+
+What is missing is the picture inside the bezel: a single MIMG descriptor-provenance gap drops the
+320×224 game-picture composite, leaving the TV screen black. Tracked on #1590. No screenshot is
+published here because the game area itself is not yet rendering.
 
 ## Requirements and scope
 
