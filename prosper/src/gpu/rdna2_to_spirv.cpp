@@ -12820,7 +12820,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                bool allow_exec_update, bool allow_smem,
                const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
                const uint32_t* code = nullptr, size_t dwords = 0,
-               const std::unordered_set<uint32_t>* inherited_dead_masks = nullptr) {
+               const std::unordered_set<uint32_t>* inherited_dead_masks = nullptr,
+               bool allow_cfg_dispatcher = true) {
                // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
                // whole-shader liveness valid when a barrier-separated body is compiled in phases.
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
@@ -13056,11 +13057,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // detect_forward_ifs clamps a branch to an immediate s_endpgm at its artificial end marker
         // and records it as early_out. In this truncated prelude that can be a real branch over the
         // entire counted loop, so it cannot be structured as an ordinary one-arm conditional.
-        const bool preloop_if_unsupported = !preloop_ifs.empty() &&
-            (preloop_ifs[0].early_out ||
-             (preloop_ifs[0].has_else ? preloop_ifs[0].merge_pc : preloop_ifs[0].target_pc) >
-                 L.header_pc);
-        if (preloop_rejected || preloop_ifs.size() > 1 || preloop_if_unsupported) {
+        const bool preloop_if_unsupported = std::any_of(
+            preloop_ifs.begin(), preloop_ifs.end(), [&](const ForwardIf& branch) {
+                return branch.early_out ||
+                    (branch.has_else ? branch.merge_pc : branch.target_pc) > L.header_pc;
+            });
+        if (preloop_rejected || preloop_if_unsupported) {
             if (getenv("PROSPER_DBG"))
                 fprintf(stderr,
                         "[recompile-reject] counted-loop prelude cfg rejected=%u ifs=%zu header=%u\n",
@@ -13069,6 +13071,26 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         if (preloop_ifs.empty()) {
             if (!emit_range(0, L.header_pc)) return false;
+        } else if (preloop_ifs.size() > 1) {
+            // The general structurizer already owns nested and disjoint ForwardIf trees, including
+            // exact guest-wave EXEC/VCC tests in compute. Reuse it for a multi-choice prefix instead
+            // of duplicating another recursive IF emitter inside the counted-loop path. Keep every
+            // real prefix instruction here (including a proven-safe guard spanning the whole loop):
+            // the truncated scan above intentionally omitted that guard only so it was not mistaken
+            // for an early-out at the artificial end marker. effective_safe still makes emit_alu
+            // linearize a proven spanning guard, and inherited dead masks retain whole-shader liveness.
+            std::vector<Rdna2Inst> preloop_body;
+            for (const auto& in : ins) {
+                if (in.pc >= L.header_pc) break;
+                preloop_body.push_back(in);
+            }
+            preloop_body.push_back(preloop_end);
+            if (!emit_body(b, rs, preloop_body, effective_safe, rt, allow_exec_update,
+                           allow_smem, exp_fn, code, dwords, &dead_masks,
+                           /*allow_cfg_dispatcher*/false))
+                return false;
+            while (idx < ins.size() && ins[idx].pc < L.header_pc) ++idx;
+            if (idx >= ins.size() || ins[idx].pc != L.header_pc) return false;
         } else {
             const ForwardIf F = preloop_ifs[0];
             if (!emit_range(0, F.branch_pc)) return false;
@@ -13410,7 +13432,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                          "structured_ifs=%zu loops=%zu cf_rejected=%d\n",
                          b.is_fragment ? "fragment" : "vertex", cfg_branches,
                          cfg_has_backedge, complex_graphics_cfg, Fs.size(), Ls.size(), cf_rejected);
-        if (exact_compute_wave_cfg && !structured_compute_wave_cfg) {
+        if (allow_cfg_dispatcher && exact_compute_wave_cfg && !structured_compute_wave_cfg) {
             // Native Vulkan subgroup widths may be 8/16/32 while the guest wave is 32/64. A native
             // subgroupAny would let different pieces of one guest wave take different scalar edges.
             // The dispatcher performs the reduction through Workgroup scratch and synchronized common
@@ -13423,7 +13445,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return false;
             return true;
         }
-        if (complex_compute_cfg && (cf_rejected || Ls.empty()) &&
+        if (allow_cfg_dispatcher && complex_compute_cfg && (cf_rejected || Ls.empty()) &&
             emit_cfg_state_machine(b, rs, ins, safe, rt,
                                    allow_exec_update, allow_smem, exp_fn, code, dwords))
             return true;
@@ -13431,7 +13453,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // control flow therefore needs no workgroup vote: the dispatcher selects the next block from
         // this pixel/vertex's SCC, VCC, or EXEC bit. Keep ordinary structured shaders on their compact
         // SSA path and use the Function-variable fallback only after the narrow structurizer rejects.
-        if (complex_graphics_cfg && cf_rejected &&
+        if (allow_cfg_dispatcher && complex_graphics_cfg && cf_rejected &&
             emit_cfg_state_machine(b, rs, ins, safe, rt,
                                    allow_exec_update, allow_smem, exp_fn, code, dwords))
             return true;
@@ -14154,9 +14176,47 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     // back-edge + exit, and the forward-if branch) as handled, so coverage matches what actually recompiles
     // (previously the MSAA-resolve loop shaders 031-034 were mis-flagged "blocked" at their s_cbranch_scc0).
     const CountedLoop cL = detect_counted_loop(ins);
-    const std::vector<ForwardIf> cFs = detect_forward_ifs(ins, /*allow_vcc*/false, code, dwords,
-                                                          nullptr, nullptr, nullptr,
-                                                          /*compute_wave_branches*/true);   // matches the compute shell (#590)
+    std::vector<ForwardIf> cFs;
+    if (cL.found) {
+        // Match emit_body's counted-loop composition: inspect the truncated prefix independently
+        // from the loop exit/back-edge, then inspect the recursively-emitted suffix. Feeding the
+        // complete stream to detect_forward_ifs makes the canonical exit look like an IF whose
+        // alleged else terminator is the backward loop branch, so otherwise-valid prefix/postfix
+        // branches are incorrectly counted as unsupported.
+        std::vector<Rdna2Inst> prefix;
+        for (const auto& in : ins) {
+            if (in.pc >= cL.header_pc) break;
+            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x08 &&
+                branch_target(in) >= cL.header_pc) continue;
+            prefix.push_back(in);
+        }
+        Rdna2Inst prefix_end;
+        prefix_end.pc = cL.header_pc;
+        prefix_end.is_end = true;
+        prefix.push_back(prefix_end);
+        bool prefix_rejected = false;
+        std::vector<ForwardIf> prefix_ifs = detect_forward_ifs(
+            prefix, /*allow_vcc*/false, code, dwords, &safe_branches, nullptr,
+            &prefix_rejected, /*compute_wave_branches*/true);
+        const bool prefix_crosses_loop = std::any_of(
+            prefix_ifs.begin(), prefix_ifs.end(), [&](const ForwardIf& branch) {
+                return branch.early_out ||
+                    (branch.has_else ? branch.merge_pc : branch.target_pc) > cL.header_pc;
+            });
+        if (!prefix_rejected && !prefix_crosses_loop)
+            cFs.insert(cFs.end(), prefix_ifs.begin(), prefix_ifs.end());
+
+        std::vector<Rdna2Inst> suffix;
+        for (const auto& in : ins) if (in.pc >= cL.exit_pc) suffix.push_back(in);
+        std::vector<ForwardIf> suffix_ifs = detect_forward_ifs(
+            suffix, /*allow_vcc*/false, code, dwords, &safe_branches, nullptr, nullptr,
+            /*compute_wave_branches*/true);
+        cFs.insert(cFs.end(), suffix_ifs.begin(), suffix_ifs.end());
+    } else {
+        cFs = detect_forward_ifs(ins, /*allow_vcc*/false, code, dwords,
+                                 nullptr, nullptr, nullptr,
+                                 /*compute_wave_branches*/true);   // matches the compute shell (#590)
+    }
     auto cf_reconstructed = [&](const Rdna2Inst& i) {
         if (cL.found && (i.pc == cL.backedge_pc || i.pc == cL.exit_branch_pc)) return true;
         for (const auto& F : cFs)
