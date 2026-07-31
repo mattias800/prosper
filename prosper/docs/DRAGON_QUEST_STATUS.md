@@ -1,35 +1,63 @@
 # Dragon Quest VII Reimagined (`PPSA17942`) — title-screen status
 
-**Status as of 2026-07-31.** The game boots, composites its studio splashes correctly, and reaches a
-state where it renders a complete UE4 frame (base pass, shadow atlas, lighting, bloom pyramid, tonemap)
-every submit — but the presented frame is **pure black**. Bring-up ladder rung: **1 (real graphics:
-splashes)**. Rung 2 (title screen rendered) is **not** reached.
+**Status as of 2026-07-31.** Current master reaches the localized, animated title screen at native
+3840x2160 from a fresh save. The validated route sends six Cross pulses at 3, 6, 9, 12, 15, and 18
+seconds; the title first appeared at about 28 seconds and remained animated through the 40-second
+capture. Bring-up ladder rung: **2 (title screen rendered)**. Gameplay has not been validated.
 
-The oracle screenshot is attached to #1373. The remaining defects are tracked by #1486; the recompiler
-gap this investigation found is #1483.
+The same build can remain black after the startup sequence when run with **no input**. That is authored
+Slate state, not a lost final composite: current-master operation-prefix replay shows a coherent
+sky/ocean/title scene after draw 92, then draw 94 deliberately covers it with opaque black. Routed input
+changes the foreground lifecycle and reveals the title. The remaining visual/performance work is tracked
+by #1486; the earlier recompiler gap was fixed by #1483.
 
 > Naming note: this dump is labelled `DOLL` in the older docs (`DOLL_LOADING_PROGRESSION.md`,
 > `DOLL_POSTPROCESS_HANDOFF.md`) — it is the same title. #1373's specific root cause (Gen5 virtual
-> interpolant registers) was fixed by #1411; the title composition was not, so do not treat #1373 as
-> "the title works".
+> interpolant registers) was fixed by #1411. The old mostly-white `MENUNAME_Title_001` screenshot is
+> historical; the current capture renders the localized Dragon Quest VII logo, sky, and ocean.
 
 ## Reproduction recipe
 
-Headless, native Vulkan, no diagnostic substitution. Run from a worktree build:
+Direct native Vulkan frontend capture, no diagnostic substitution. Run from `prosper/` with a fresh
+save root. In the recipe, `<EVIDENCE_ROOT>` is a unique directory created under `$HOME`; substitute
+its absolute path before running the command so screenshots stay outside the worktree and `/tmp`.
 
 ```bash
-distrobox enter ps5ys -- bash -lc "cd <WORKTREE> && \
-  env PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_GUEST_ARGS= TMPDIR=<WORKTREE>/build/tmpdir \
-  ./build/screenshot <DUMP_ROOT>/PPSA17942-app0 \
-  --seconds 9 --count 30 --out DIR --timeout 900"
+PROSPER_GUEST_FS=1 \
+PROSPER_NULL_PAGE=1 \
+PROSPER_GUEST_ARGS= \
+PROSPER_SAVEDATA_DIR=<FRESH_SAVE_ROOT> \
+PROSPER_PAD_SCRIPT=@scripts/dragon-quest-vii/reach-title-screen.pad \
+PROSPER_PAD_SCRIPT_LOG=1 \
+./build-linux/screenshot <DUMP_ROOT>/PPSA17942-app0 \
+  --seconds 1 --count 40 --out <EVIDENCE_ROOT>/shots --timeout 300 --require-composited-frame
 ```
 
 Note `PROSPER_GUEST_ARGS=` (empty) and `PROSPER_NULL_PAGE=1` — the UE4 recipe. The Unity/Messenger
 default (`-force-gfx-direct`) is wrong for this title. `tools/screenshot` defaults it, so pass the empty
-value explicitly.
+value explicitly. The reusable route and its input-delivery expectations are documented in
+[`scripts/dragon-quest-vii/README.md`](../scripts/dragon-quest-vii/README.md).
 
-Observed progression (distinct-colour count of a 160×90 luminance thumbnail per frame; timings are from
-a ~5.8 submit/s run and move ±20 s between runs):
+The validated run observed all six Cross/neutral edges. It presented roughly 20–22 frames per second
+during the title window; treat that as a ballpark single-run observation, not a performance benchmark.
+
+### Routed current-master progression
+
+| t | content |
+|---|---------|
+| 0–27 s | startup logos/movie transitions, advanced by Cross |
+| ~28 s | **localized Dragon Quest VII Reimagined title appears** |
+| 28–40 s | animated logo, sky/ocean, birds and water |
+
+Some one-second samples show a dark/purple background behind the stable logo while adjacent samples
+show the expected sky and ocean. That may be an authored transition or a remaining rhythmic background
+flicker; settle it with a high-cadence sequence before changing renderer behavior.
+
+### Historical no-input progression
+
+The earlier table below used **no scripted input**. It remains useful for reproducing the authored-black
+state, but it is not the title-screen route. Distinct-colour counts are from a 160x90 luminance thumbnail;
+timings are from a ~5.8 submit/s run and move ±20 s between runs:
 
 | t | content | distinct colours |
 |---|---------|------------------|
@@ -41,10 +69,13 @@ a ~5.8 submit/s run and move ±20 s between runs):
 | 162 s → end (350 s+ observed) | **pure black** | **1** |
 
 The workload does not change across that boundary: the guest submits ~88–96 draws and ~28 dispatches
-per submit continuously from t≈5 s to the end of the run. The black frames are *not* an idle or stalled
-guest.
+per submit continuously from t≈5 s to the end of the run. The black frames are not an idle or stalled
+guest, but they are also not evidence that the rendered scene is missing.
 
-## What is actually happening in a black frame
+## Historical no-input black-frame investigation
+
+This section preserves the investigation that localized the late no-input composite. Its original
+draw-95 conclusion was wrong and is corrected in **What is actually established** below.
 
 Capture one late submit offline and bisect it — this is far faster than re-routing live:
 
@@ -67,27 +98,32 @@ are **not** the defect.
 
 Per-operation bisect of the captured frame:
 
-| operation | mean | distinct colours |
-|-----------|------|------------------|
-| 95–117 | 92–120 | 2740–3554 |
-| 118–122 | **247** | 1322–1354 |
-| **123 (draw 95)** | **0** | **1** |
+Current-master prefix replay corrected the old interpretation:
 
-So the frame carries real content all the way to the last draw, and **the final Slate quad (draw 95)
-blacks the whole screen**.
+| operation | semantic draw | result |
+|-----------|---------------|--------|
+| 120 | 92 | coherent sky/ocean/title scene |
+| 121 | 93 | unchanged (`reason=no-effect`) |
+| 122 | 94 | first exact opaque-black output |
+| 123 | 95 | remains black; empty sample makes this draw a no-op |
 
-### Defect 1 — the final Slate quad samples an empty renderer-owned surface (#1486)
+So the frame carries real content through draw 92, and **draw 94 is the first black output**.
+
+### Original defect-1 hypothesis — withdrawn
 
 Draws 94 and 95 are the same shader pair (`vs=73a37ede4c0c6c82 fs=71e10841003bafd3`), a 4-vertex
-full-screen quad with `blend=1 color=6,7 alpha=1,7` (VK `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA`). They differ
-only in the sampled texture:
+full-screen quad with `blend=1 color=6,7 alpha=1,7` (VK `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA`). The original
+analysis noticed the sampled textures but missed the decisive per-vertex colors:
 
-- draw 94: `addr=…12450000 1x1 dcc=0` — a 1×1 white texture (Slate's solid-colour stand-in). Harmless.
+- draw 94: `addr=…12450000 1x1 dcc=0` — a 1×1 white texture and packed vertex color
+  `0xFF000000` (opaque black).
 - draw 95: `addr=…98330000 1920x1080 fmt=4 tile=27 dcc=1 nz=0 meta-unique=1 meta-first=0x40`
-  — **all-zero guest surface bytes with uniform DCC metadata `0x40`**, tagged `temporal-RTT-seed`.
+  — **all-zero guest surface bytes with uniform DCC metadata `0x40`**, tagged `temporal-RTT-seed`,
+  with packed vertex color `0xFFFFFFFF` (white).
 
 `0x40` is PAL's `ClearColor0001`, i.e. clear-to-`(0,0,0,1)`; `gfx10_dcc_fast_clear_rgba8` decodes it
-correctly to **opaque** black, which then wipes the frame through the alpha blend. In the live run this
+correctly to **opaque** black. The original analysis incorrectly attributed the final output to that
+sample. In the live run this
 is visible as `[render] DCC fast-clear addr=… code=0x40`. Offline the RTT cache hits instead
 (`PROSPER_RTTLOG=1` → `sample tex addr=…98330000 1920x1080 -> HIT`) and the injected pixels are equally
 empty: dumping the seed with `--dump-rtt-seed` gives **13 non-zero halves out of 12.4 M**.
@@ -113,13 +149,13 @@ and either could be the fix:
 2. The one-off 4K pass produced only alpha where the identical pass at the two ping-pong addresses
    produces 32.8 M non-zero bytes, so that pass's own inputs were probably missing.
 
-Next step: capture the producer chain as an ordered bundle
+The historical proposed next step was to capture the producer chain as an ordered bundle
 (`PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE` + `PROSPER_GPU_TIMELINE_CAPTURE_DEPTH`) so the 1920×1080 producer
 submit and the one-off 4K pass can both be replayed offline, then decide between (1) and (2) with the
-producer's own draw steps. Do **not** "fix" this by suppressing the DCC fast clear: `0x40` decodes
-correctly, and the metadata is only stale because prosper never writes DCC keys back.
+producer's own draw steps. Current evidence made that unnecessary for title visibility. Do **not**
+"fix" this by suppressing the DCC fast clear or authored draw 94.
 
-### Defect 2 — the 4K composite underneath is massively over-exposed (#1486)
+### Original defect-2 hypothesis — withdrawn
 
 Operations 118–122 are the scanout buffer (`…9fc0000000`) after the tonemap and the first Slate quad,
 and they reach mean 247/255 with the title scene's structure clearly visible (sky gradient, sun disc,
@@ -137,10 +173,10 @@ another submit:
 [compute] skip unsupported program 0x3013e80000            # run-local address
 ```
 
-`(0 res)` means the shader-resource table for that dispatch is **empty** — a user-data/EUD descriptor
-resolution gap (#282), not a missing opcode. A skipped exposure/grading producer is the standard cause
-of exactly this symptom (see the Messenger LUT precedent in CLAUDE.md), so resolve this dispatch's
-descriptors before looking anywhere else for the exposure error.
+The raw shader later proved to be an exact four-instruction, one-dimensional zero-clear kernel, not an
+exposure or grading pass. Its decoded output range does not overlap draw 95's foreground surface, and
+the earlier title-screen milestone was reached while the dispatch was still skipped. It is not the
+title-visibility blocker.
 
 ## Superseded analysis — read this before trusting the sections above
 
@@ -167,21 +203,24 @@ current build.
 
 ## What is actually established (measured, current)
 
-- **The black frame is a faithful presentation, not a renderer loss.** `PROSPER_DUMP_PERSISTENT=1` over a
-  full route reports `scanout=HIT` on *every* present — the cache entry is found, extent and format match
-  — and `rgb_nonblack=0` throughout the black window. Cross-checked against the passes: the scanout pass
-  in that window reports `px_nonzero=8294400`, exactly `3840*2160`, i.e. one non-zero byte per pixel =
-  **alpha only**. The presented PNGs measure `max=0` at full resolution. The guest's own composite is
-  producing black RGB and prosper presents it correctly. **Search inside the composite, not in
-  presentation.**
-- **The tonemap source has real content.** The pass writing draw 92's source reports
-  `px_nonzero=11321053` of 33,177,600, 200-300 times per run. Draw 92 replaces (`blend=0`) with it.
-- **Draw 95's source has no writer at all.** `PROSPER_PROVENANCE_DIM=3840x2160` reports, for every
-  address in the rotating family it samples:
-  `no recorded color/compute/DMA/WRITE_DATA overlap for [0x…,+0x7e9000)`. Nothing prosper tracks fills
-  them, and they miss the RTT cache, so they decode from guest memory. Note `0x7e9000` = 8,294,400 =
-  exactly `3840*2160`, i.e. one byte per pixel, which does not match a 4-byte view of that extent and is
-  worth checking on its own.
+- **The title screen is reached on current master.** A fresh-save direct frontend run with
+  `reach-title-screen.pad` produced the localized Dragon Quest VII logo over animated sky/ocean from
+  28 through 40 seconds at native 3840x2160. All six Cross/neutral transitions were observed by the
+  guest. The representative repository screenshot is an unmodified frame from that run.
+- **Draw 92 is healthy.** Mixed-operation prefix replay through operation 120 produces the coherent
+  scene (sky, ocean, islands and ships). A fragment tap at draw 92 also preserves that structured
+  content. The old statement that draw 92 leaves alpha only is false.
+- **Draw 94 is authored opaque black.** It samples a valid 1x1 white texture, but all four exact
+  40-byte Slate vertex records carry packed color `0xFF000000` = `(0,0,0,1)`. The vertex and fragment
+  shaders decode and multiply that value normally. Suppressing this draw would discard guest-authored
+  UI state.
+- **Draw 95 is the foreground layer.** In the no-input capture its sample is empty and its computed
+  alpha is zero, so it is a no-op and draw 94 remains visible. In an older visible capture the same
+  draw/state samples a non-empty 3840x2160 foreground surface. Routed input changes this lifecycle and
+  exposes the title.
+- **The remaining zero-clear compute is separate.** Its live direct descriptor decodes to a bounded
+  strided buffer range that does not overlap draw 95's foreground texture. Historical title evidence
+  also reached the title with this dispatch skipped, so it is not the route blocker.
 
 ## Eliminated — do not re-run these
 
@@ -197,21 +236,21 @@ current build.
   accompanies the transition.
 - **Not the `no-effect` draws**: all 22 have `cwm=0` with no depth or stencil write.
 
-## Open question for the next investigator
+## Open questions for the next investigator
 
-Why does draw 92 — a full-viewport replace (`blend=0`, `mask=0xf`) from a source that demonstrably holds
-11.3M non-zero bytes — leave the scanout with alpha only? Everything downstream (draws 94, 95) is then
-irrelevant, because the pass as a whole never carries colour.
+1. Is the dark/purple background visible in some title samples an authored transition or a rhythmic
+   renderer flicker? Capture a short high-cadence sequence at the already-routed title and correlate
+   only adjacent frames; do not compare equal wall-clock indices from separate boots.
+2. What input sequence advances the current title into save selection and gameplay, and does the old
+   MallocBinned3 content-load failure still reproduce on current master? Extend the checked-in route
+   only after `PROSPER_PAD_SCRIPT_LOG=1` proves each transition.
+3. The historical `(u, v, u)` ramp from the rejected #1510 experiment remains unexplained but is not
+   present in the accepted current-master title capture. Do not revive that patch without a separate
+   generic reproducer.
 
-A secondary, separable question: what actually produces the `(u, v, u)` ramp seen when the #1510 fix is
-applied? Measured as `R = B = x/width`, `G = y/height`. It is **not** the diagnostic clear (that is a flat
-`(0,0,1,1)` blue, `render_runner.h`), not `PROSPER_TESTTEX` (`(u, v, checker)`, and the var was unset) and
-not descriptor poison mode (also unset). Bisecting it offline with
-`gpu_replay --draw-steps --draw-steps-every 1` on a captured frame is the cheapest way to identify it.
+## Historical tooling blocker (resolved on current master)
 
-## Blocker on the tooling you will want to use
-
-**#1505 blocks capture and replay on master.** `live_gpu_targets` is disabled by every capture/diagnostic
+The handoff build used for the original analysis hit **#1505**: `live_gpu_targets` was disabled by every capture/diagnostic
 switch (`live_renderer.cpp`, the `PROSPER_GPU_CAPTURE` / `PROSPER_GPU_TIMELINE_CAPTURE` /
 `PROSPER_RTTLOG` / `PROSPER_DUMP_DRAWSTEPS` / `PROSPER_RESOURCE_HASH_DIM` / `PROSPER_TARGET_STEP_HASH_DIM`
 list), and the CPU RTT path it falls back to reads out of bounds and SIGSEGVs a few seconds into
@@ -219,7 +258,12 @@ rendering. Plain runs are unaffected and hide it.
 
 Add **`PROSPER_NO_RTT_SNAPSHOT_BORROW=1`** to every capture or diagnostic run. That is sufficient for
 `PROSPER_RTTLOG` and the timeline capture, but **not** for `PROSPER_TARGET_STEP_HASH_DIM`, which still
-faults — there is a second out-of-bounds path on that side.
+faults — there was a second out-of-bounds path on that side.
+
+Do not carry that workaround forward blindly. The accepted current-master direct frontend capture and
+the retained current-master capsule inspection both complete without it. If a new diagnostic still
+faults, report the exact switch and current revision instead of treating #1505 as an active blanket
+blocker.
 
 ## Methodology traps this investigation actually fell into
 
@@ -246,6 +290,9 @@ faults — there is a second out-of-bounds path on that side.
   dispatcher bailed out, the straight-line fallback rejected at the kernel's first `s_cbranch_vccz`,
   and the dispatch was skipped. Before the fix two compute programs were skipped at the title; after
   it, one.
+- **#1529** — kept live owner-backed RTT snapshots authoritative when DCC metadata made the guest
+  decode cache eligible again. This removed the synthetic `(u, v, u)` coordinate-ramp regression from
+  retained title-frame replay without special-casing Dragon Quest.
 
 ## Known-good diagnostics for this title
 
@@ -263,7 +310,11 @@ faults — there is a second out-of-bounds path on that side.
 
 ## Do not restart
 
-- The "mostly white" title composition (#1373) — fixed by #1411; the current symptom is black.
+- The "mostly white" title composition (#1373) — fixed by #1411. The checked-in screenshot now shows
+  the localized title rather than `MENUNAME_Title_001`.
+- The premise that no-input black means the title scene failed to render. Use the checked-in route;
+  draw 92 already contains the coherent scene and authored draw 94 covers it while that UI state is
+  active.
 - Everything in the **Eliminated** section above.
 - The two withdrawn conclusions in **Superseded analysis** — in particular, do not re-derive "draw 95
   blacks the frame"; its shader has been read and it is a no-op with the texels it receives.
