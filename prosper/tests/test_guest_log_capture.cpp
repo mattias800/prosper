@@ -11,6 +11,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace prosper::gpu;
 
@@ -34,6 +39,14 @@ static void clear_test_env(const char* name) {
 #endif
 }
 
+static int stream_fd(FILE* stream) {
+#ifdef _WIN32
+    return _fileno(stream);
+#else
+    return fileno(stream);
+#endif
+}
+
 int main() {
     std::printf("== test_guest_log_capture ==\n");
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -51,12 +64,17 @@ int main() {
 
     prosper::register_builtin_hle();
     using PrintfFn = int (*)(const char*, ...);
-    using FputsHleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+    using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
     auto guest_printf = reinterpret_cast<PrintfFn>(
         reinterpret_cast<void*>(prosper::Hle::lookup(prosper::nid_hash("printf"))));
-    auto guest_fputs = reinterpret_cast<FputsHleFn>(
+    auto guest_fputs = reinterpret_cast<HleFn>(
         reinterpret_cast<void*>(prosper::Hle::lookup(prosper::nid_hash("fputs"))));
-    CHECK(guest_printf && guest_fputs, "guest stdout adapters are registered for the integration probe");
+    auto guest_fwrite = reinterpret_cast<HleFn>(
+        reinterpret_cast<void*>(prosper::Hle::lookup(prosper::nid_hash("fwrite"))));
+    auto guest_write = reinterpret_cast<HleFn>(
+        reinterpret_cast<void*>(prosper::Hle::lookup(prosper::nid_hash("sceKernelWrite"))));
+    CHECK(guest_printf && guest_fputs && guest_fwrite && guest_write,
+          "guest stdout adapters are registered for the integration probe");
 
     guest_printf("prefix %s suffix\n", "phase-ready");
     observe_guest_log_for_capture("phase-ready-suffix\r\n", 20);
@@ -70,15 +88,39 @@ int main() {
     observe_guest_log_for_capture("\r", 1);
     CHECK(!interactive_capture_bundle_active(), "an overlong line is discarded through its terminator");
 
+    FILE* non_stdout = std::tmpfile();
+    CHECK(non_stdout != nullptr, "create non-stdout stream exclusion probe");
+    if (non_stdout) {
+        const char excluded[] = "phase-ready\n";
+        CHECK(guest_fwrite(reinterpret_cast<uint64_t>(excluded), 1, sizeof(excluded) - 1,
+                           reinterpret_cast<uint64_t>(non_stdout), 0, 0) == sizeof(excluded) - 1,
+              "guest fwrite reports its successful item count");
+        std::fflush(non_stdout);
+        const int non_stdout_fd = stream_fd(non_stdout);
+        CHECK(non_stdout_fd >= 0 && non_stdout_fd != 1,
+              "non-stdout stream has a distinct file descriptor");
+        if (non_stdout_fd >= 0 && non_stdout_fd != 1)
+            CHECK(guest_write(non_stdout_fd, reinterpret_cast<uint64_t>(excluded),
+                              sizeof(excluded) - 1, 0, 0, 0) == sizeof(excluded) - 1,
+                  "guest write reports its successful byte count");
+        std::fclose(non_stdout);
+    }
+    CHECK(!interactive_capture_bundle_active(),
+          "fwrite on a non-stdout stream and write on fd != 1 are excluded");
+
     const char fragment_a[] = "phase-";
-    const char fragment_b[] = "ready";
-    const char fragment_crlf[] = "\r\n";
+    const char fragment_b[] = "rea";
+    const char fragment_c[] = "dy\r\n";
     guest_fputs(reinterpret_cast<uint64_t>(fragment_a), 0, 0, 0, 0, 0);
-    guest_fputs(reinterpret_cast<uint64_t>(fragment_b), 0, 0, 0, 0, 0);
+    CHECK(guest_fwrite(reinterpret_cast<uint64_t>(fragment_b), sizeof(fragment_b) - 1, 1,
+                       reinterpret_cast<uint64_t>(stdout), 0, 0) == 1,
+          "stdout fwrite observes exactly its reported complete items");
     CHECK(!interactive_capture_bundle_active(), "a fragmented exact line waits for completion");
-    guest_fputs(reinterpret_cast<uint64_t>(fragment_crlf), 0, 0, 0, 0, 0);
+    CHECK(guest_write(1, reinterpret_cast<uint64_t>(fragment_c), sizeof(fragment_c) - 1,
+                      0, 0, 0) == sizeof(fragment_c) - 1,
+          "fd 1 write observes exactly its reported successful bytes");
     CHECK(interactive_capture_bundle_active() && !guest_log_capture_bundle_enabled(),
-          "fragmented CRLF exact match arms once and suppresses the LF half");
+          "fputs/fwrite/write fragmented CRLF exact match arms once and suppresses the LF half");
 
     // The first completed present is deliberately skipped. Repeating the exact marker afterward must
     // not re-arm/reset that delay, including concurrent duplicate observers.

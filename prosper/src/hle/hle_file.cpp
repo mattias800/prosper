@@ -7,6 +7,7 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
+#include "../gpu/gpu_timeline.hpp" // optional exact guest-stdout capture gate
 #include "../host/guest_write_watch.hpp"   // #1144 B5: disarm texture watches before reading into guest mem
 #include "../host/boot_program.hpp"        // #1226: resolve_host_path_case (PS5 FS namespace is case-insensitive)
 #include <cctype>        // #1237: case-insensitive PROSPER_DENY_SUBSTR matching
@@ -908,7 +909,14 @@ HLE(f_fread)   { if (!a3) return 0;
                       P(a0), (unsigned long long)a1, (unsigned long long)a2, (void*)f,
                       (unsigned long long)n, feof(f), ferror(f), errno);
                   return (uint64_t)n; }
-HLE(f_fwrite)  { return a3 ? (uint64_t)fwrite(P(a0), a1, a2, (FILE*)P(a3)) : 0; }
+HLE(f_fwrite)  { if (!a3) return 0;
+                  FILE* stream = (FILE*)P(a3);
+                  const size_t items = fwrite(P(a0), a1, a2, stream);
+                  if (stream == stdout && items && a1 <= SIZE_MAX / items)
+                      gpu::observe_guest_log_for_capture(
+                          (const char*)P(a0), items * (size_t)a1,
+                          gpu::GuestLogCaptureSource::Fwrite);
+                  return (uint64_t)items; }
 HLE(f_fseek)   { return a0 ? (uint64_t)(int64_t)fseek((FILE*)P(a0), (long)a1, (int)a2) : -1; }
 HLE(f_ftell)   { return a0 ? (uint64_t)(int64_t)ftell((FILE*)P(a0)) : -1; }
 HLE(f_fgets)   { return (uint64_t)(uintptr_t)(a2 ? fgets((char*)P(a0), (int)a1, (FILE*)P(a2)) : nullptr); }
@@ -1422,12 +1430,18 @@ HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
 #endif
              }
 HLE(f_write) {
+               int64_t written;
 #ifndef _WIN32
-               return (uint64_t)write_full((int)a0, P(a1), (size_t)a2, false, 0);
+               written = write_full((int)a0, P(a1), (size_t)a2, false, 0);
 #else
                ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
-               return (uint64_t)(int64_t)::write((int)a0, P(a1), (size_t)a2);
+               written = (int64_t)::write((int)a0, P(a1), (size_t)a2);
 #endif
+               if ((int)a0 == 1 && written > 0)
+                   gpu::observe_guest_log_for_capture(
+                       (const char*)P(a1), (size_t)written,
+                       gpu::GuestLogCaptureSource::Write);
+               return (uint64_t)written;
              }
 HLE(f_lseek) { if (fdlog_on() && ((int)a2 != SEEK_CUR || a1 != 0)) preadlog("lseek", a0, a1, (uint64_t)a2);
 #ifdef _WIN32

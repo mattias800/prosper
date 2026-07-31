@@ -1881,6 +1881,7 @@ struct GuestLogCaptureBundleState {
     std::atomic<bool> fired{false};
     std::mutex mx;
     std::string line;
+    uint32_t line_sources = 0;
     bool discard_line = false;
     bool suppress_lf_after_cr = false;
 
@@ -1926,11 +1927,13 @@ bool guest_log_capture_bundle_enabled() {
     return state.enabled && !state.fired.load(std::memory_order_acquire);
 }
 
-void observe_guest_log_for_capture(const char* bytes, size_t size) {
+void observe_guest_log_for_capture(const char* bytes, size_t size,
+                                   GuestLogCaptureSource source) {
     GuestLogCaptureBundleState& state = guest_log_capture_bundle_state();
     if (!state.enabled || !bytes || !size || state.fired.load(std::memory_order_acquire)) return;
 
     bool matched = false;
+    uint32_t matched_sources = 0;
     {
         std::lock_guard<std::mutex> lock(state.mx);
         if (state.fired.load(std::memory_order_relaxed)) return;
@@ -1938,8 +1941,10 @@ void observe_guest_log_for_capture(const char* bytes, size_t size) {
             if (!state.discard_line && state.line == state.marker) {
                 state.fired.store(true, std::memory_order_release);
                 matched = true;
+                matched_sources = state.line_sources;
             }
             state.line.clear();
+            state.line_sources = 0;
             state.discard_line = false;
         };
         for (size_t i = 0; i < size && !matched; ++i) {
@@ -1948,6 +1953,7 @@ void observe_guest_log_for_capture(const char* bytes, size_t size) {
                 state.suppress_lf_after_cr = false;
                 if (ch == '\n') continue;
             }
+            state.line_sources |= uint32_t{1} << static_cast<uint32_t>(source);
             if (ch == '\r') {
                 complete_line();
                 state.suppress_lf_after_cr = true;
@@ -1969,10 +1975,19 @@ void observe_guest_log_for_capture(const char* bytes, size_t size) {
     // transition boundary cannot be mistaken for the scene it announced, then use the established
     // F9 whole-frame path to retain every submit and persistent RTT/DS boundary seed.
     request_interactive_capture_bundle(state.path, state.max_mb, 1);
+    std::string source_names;
+    constexpr const char* names[] = {
+        "unknown", "printf", "puts", "putchar", "fputs", "fwrite", "write",
+    };
+    for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        if (!(matched_sources & (uint32_t{1} << i))) continue;
+        if (!source_names.empty()) source_names += ',';
+        source_names += names[i];
+    }
     std::fprintf(stderr,
-                 "[grab] exact guest-log line matched; whole-frame capture armed after one "
-                 "completed present -> %s\n",
-                 state.path.c_str());
+                 "[grab] exact guest-log line matched via %s; whole-frame capture armed after "
+                 "one completed present -> %s\n",
+                 source_names.empty() ? "unknown" : source_names.c_str(), state.path.c_str());
 }
 
 void observe_guest_log_capture_gap() {
@@ -1981,6 +1996,7 @@ void observe_guest_log_capture_gap() {
     std::lock_guard<std::mutex> lock(state.mx);
     if (state.fired.load(std::memory_order_relaxed)) return;
     state.line.clear();
+    state.line_sources = 0;
     state.discard_line = true;
     state.suppress_lf_after_cr = false;
 }

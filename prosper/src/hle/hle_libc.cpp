@@ -461,25 +461,29 @@ int capture_aware_vprintf(const char* format, va_list args) {
     if (static_cast<size_t>(wanted) < formatted.size()) {
         const size_t bytes = static_cast<size_t>(wanted);
         const size_t written = fwrite(formatted.data(), 1, bytes, stdout);
-        if (written) prosper::gpu::observe_guest_log_for_capture(formatted.data(), written);
+        if (written) prosper::gpu::observe_guest_log_for_capture(
+            formatted.data(), written, prosper::gpu::GuestLogCaptureSource::Printf);
         return written == bytes ? wanted : -1;
     }
 
     const int result = vprintf(format, args);
     if (result >= 0) {
-        prosper::gpu::observe_guest_log_for_capture(formatted.data(), formatted.size() - 1);
+        prosper::gpu::observe_guest_log_for_capture(
+            formatted.data(), formatted.size() - 1,
+            prosper::gpu::GuestLogCaptureSource::Printf);
         prosper::gpu::observe_guest_log_capture_gap();
     }
     return result;
 }
 
-void observe_guest_c_string(const char* text, bool known_newline) {
+void observe_guest_c_string(const char* text, bool known_newline,
+                            prosper::gpu::GuestLogCaptureSource source) {
     if (!text || !prosper::gpu::guest_log_capture_bundle_enabled()) return;
     const size_t probe = prosper::gpu::kGuestLogCaptureMaxLineBytes + 1;
     const size_t bytes = strnlen(text, probe);
-    prosper::gpu::observe_guest_log_for_capture(text, bytes);
+    prosper::gpu::observe_guest_log_for_capture(text, bytes, source);
     if (bytes == probe) prosper::gpu::observe_guest_log_capture_gap();
-    if (known_newline) prosper::gpu::observe_guest_log_for_capture("\n", 1);
+    if (known_newline) prosper::gpu::observe_guest_log_for_capture("\n", 1, source);
 }
 } // namespace
 
@@ -496,13 +500,16 @@ static uint64_t h_sscanf(const char* s, const char* fmt, ...) {
     return (uint64_t)(int64_t)r;
 }
 HLE(h_puts)      { const char* s = (const char*)P(a0); int r = fputs(s, stdout); int nl = fputc('\n', stdout);
-                   if (r != EOF && nl != EOF) observe_guest_c_string(s, true);
+                   if (r != EOF && nl != EOF) observe_guest_c_string(
+                       s, true, prosper::gpu::GuestLogCaptureSource::Puts);
                    return (uint64_t)(int64_t)r; }
 HLE(h_putchar)   { int r = putchar((int)a0); if (r != EOF) { const char c = (char)a0;
-                   prosper::gpu::observe_guest_log_for_capture(&c, 1); }
+                   prosper::gpu::observe_guest_log_for_capture(
+                       &c, 1, prosper::gpu::GuestLogCaptureSource::Putchar); }
                    return (uint64_t)(int64_t)r; }
 HLE(h_fputs)     { const char* s = (const char*)P(a0); FILE* stream = a1 ? (FILE*)P(a1) : stdout;
-                   int r = fputs(s, stream); if (r != EOF && stream == stdout) observe_guest_c_string(s, false);
+                   int r = fputs(s, stream); if (r != EOF && stream == stdout) observe_guest_c_string(
+                       s, false, prosper::gpu::GuestLogCaptureSource::Fputs);
                    return (uint64_t)(int64_t)r; }
 
 // --- locale / ctype (Dinkumware CRT: _Getpctype/_Getpt{o,}lower return table ptrs) ---
