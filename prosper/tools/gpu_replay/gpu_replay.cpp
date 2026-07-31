@@ -302,6 +302,7 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
         std::printf("  %s %-7s b=%u addr=%016llx declared=%u footprint=%llu captured=%llu "
                     "nz=%zu hash=%016llx first=%08x "
                     "fmt=%u nc=%u stride=%u %ux%ux%u tile=%u row-pitch=%u layer=%u+%u "
+                    "mip-levels=%u in-tail=%u tail-off=%u tail-bytes=%u tail-xy=%u,%u "
                     "addr=%u%u%u swz=%u%u%u%u filt=%u/%u/%u "
                     "dcc=%u meta=%016llx meta-bytes=%llu/%llu meta-nz=%zu meta-unique=%zu "
                     "meta-first=%08x meta-hash=%016llx "
@@ -315,6 +316,11 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
                     static_cast<unsigned>(r.format), r.num_components, r.stride,
                     r.width, r.height, r.depth, r.tile_mode, r.linear_row_pitch_bytes,
                     r.layer_stride_bytes, r.layer_mip_offset_bytes,
+                    // A packed mip tail resolves the level's origin INSIDE a shared block, so a
+                    // level's real texels are at tail-xy, not (0,0). #1578 was a wrong element
+                    // origin here that no capsule report could show, because these never printed.
+                    r.declared_mip_levels, static_cast<unsigned>(r.in_mip_tail),
+                    r.mip_tail_offset, r.mip_tail_bytes, r.mip_tail_x, r.mip_tail_y,
                     r.addr_uvw[0], r.addr_uvw[1], r.addr_uvw[2],
                     r.swizzle[0], r.swizzle[1], r.swizzle[2], r.swizzle[3],
                     r.mag_filter, r.min_filter, r.mip_filter,
