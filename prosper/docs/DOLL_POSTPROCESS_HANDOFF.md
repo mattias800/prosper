@@ -191,7 +191,9 @@ All gated, off by default. Names are `PROSPER_*` env vars unless noted.
 - **`PROSPER_DYNTRACE_FAIL=1`** — for a compute dispatch that fails to recompile, dumps the **user
   SGPRs** and replays `resolve_dynamic_fetch`, printing each recovered descriptor (`[dynfail] …`,
   `[dyntrace] MUBUF fetch pc=… SRSRC=sN … have_descr=…`). This is how you read a shader's actual V#
-  format/stride/base for a failing dispatch (e.g. it revealed the stride-2 Uint16 store).
+  format/stride/base for a failing dispatch (e.g. it revealed the stride-2 Uint16 store). Add
+  **`PROSPER_DYNTRACE_FAIL_ADDR=<hex code address>`** to replay only that exact failed program; a BVH
+  trace prints all four live descriptor words even when their provenance is insufficient to bind it.
 - **`PROSPER_SHADER_DUMP=<dir>`** — writes each failing shader's raw bytes to
   `<dir>/exec_cs_<addr>.bin` (also `exec_vs_/exec_ps_`). Decode offline with **`shader_inspect
   <file>`** (built tool): per-dword PCs, decoded fmt/op, branch targets. This is how you read a
