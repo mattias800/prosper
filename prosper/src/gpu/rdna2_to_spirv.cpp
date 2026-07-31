@@ -10265,12 +10265,18 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
                 stack_compare.src[0].kind != OperandKind::InlineInt ||
                 stack_compare.src[0].value != 0 ||
                 stack_compare.src[1].kind != OperandKind::SGPR ||
-                stack_compare.src[1].value != 45 ||
+                stack_compare.src[1].value < 0 || stack_compare.src[1].value > 105 ||
                 stack_exit.pc != stack_compare.pc + stack_compare.len_dwords ||
                 stack_exit.fmt != Rdna2Format::SOPP || stack_exit.opcode != 0x04u ||
                 stack_exit.simm16 <= 0 ||
                 !index_by_pc.contains(scalar_branch_target(stack_exit)))
                 return false;
+            // The compiler allocates this scalar stack depth opportunistically (the observed
+            // traversal kernels use both s41 and s45). Derive the physical word from the exact
+            // empty-stack comparison, then require the initializer and every write check below to
+            // agree with it. This broadens only register allocation, not the proven control/data
+            // relationship.
+            const int stack_reg = stack_compare.src[1].value;
             const uint32_t stack_exit_pc = scalar_branch_target(stack_exit);
 
             // The first-iteration selector branch targets the block that initializes all four
@@ -10319,7 +10325,8 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
                     const Rdna2Inst& stack_init = ins[j - 1];
                     if (stack_init.pc + stack_init.len_dwords != selector_init.pc ||
                         stack_init.fmt != Rdna2Format::SOP1 || stack_init.opcode != 0x03u ||
-                        stack_init.dst.kind != OperandKind::SGPR || stack_init.dst.value != 45 ||
+                        stack_init.dst.kind != OperandKind::SGPR ||
+                        stack_init.dst.value != stack_reg ||
                         stack_init.src[0].kind != OperandKind::InlineInt ||
                         stack_init.src[0].value != 0 ||
                         selector_init.fmt != Rdna2Format::SOP1 ||
@@ -10347,7 +10354,8 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
             auto writes_stack = [&](const Rdna2Inst& instruction) {
                 bool writes = false;
                 for_each_scalar_write(instruction, [&](int base, uint32_t width) {
-                    writes |= base <= 45 && 45 < base + static_cast<int>(width);
+                    writes |= base <= stack_reg &&
+                        stack_reg < base + static_cast<int>(width);
                 }, /*proven_wave32_masks*/true);
                 return writes;
             };

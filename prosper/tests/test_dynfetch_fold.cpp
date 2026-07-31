@@ -868,6 +868,57 @@ int main() {
           "executor resource-path specialization reports the exact removed traversal PCs, "
           "prunes their resources, and retains the null proof for raw translation");
 
+    // The same compiler template may allocate its scalar traversal-stack depth to a different
+    // ordinary SGPR. Astro's larger sibling kernel uses s41 rather than s45; the proof must follow
+    // the register linked by the zero initializer and empty-stack comparison, not a title-specific
+    // physical number.
+    std::vector<Rdna2Inst> s41_loop = loop_variant_branch;
+    auto s41_at = [&](uint32_t pc) {
+        return std::find_if(s41_loop.begin(), s41_loop.end(),
+                            [&](const Rdna2Inst& in) { return in.pc == pc; });
+    };
+    const std::array<uint32_t, 1> s41_init_words{0xBEA90380u};
+    Rdna2Inst s41_init = rdna2_decode_one(s41_init_words.data(), s41_init_words.size());
+    s41_init.pc = 847;
+    *s41_at(847) = s41_init;
+    const std::array<uint32_t, 1> s41_compare_words{0xBF072980u};
+    Rdna2Inst s41_compare =
+        rdna2_decode_one(s41_compare_words.data(), s41_compare_words.size());
+    s41_compare.pc = 1664;
+    *s41_at(1664) = s41_compare;
+    ShaderResourceTable s41_loop_table = loop_null_table;
+    for (uint32_t fetch_pc : {968u, 1007u}) {
+        ShaderResource dead{};
+        dead.cls = ResourceClass::ConstantBuffer;
+        dead.format = DataFormat::Uint32;
+        dead.num_components = 1;
+        dead.size = 4;
+        dead.fetch_pc = fetch_pc;
+        s41_loop_table.resources.push_back(dead);
+    }
+    const ComputeResourcePathSpecializationReport s41_path_report =
+        specialize_compute_resource_paths(s41_loop, s41_loop_table, 32);
+    CHECK(s41_path_report.proven_null_exits == 1 &&
+              s41_path_report.removed_resources == 2 &&
+              std::none_of(s41_loop.begin(), s41_loop.end(),
+                           [](const Rdna2Inst& in) {
+                               return in.pc == 968 || in.pc == 1007;
+                           }),
+          "empty-stack BVH cycle proof derives the compiler-allocated stack SGPR");
+
+    std::vector<Rdna2Inst> mismatched_stack_loop = loop_variant_branch;
+    auto mismatched_compare = std::find_if(
+        mismatched_stack_loop.begin(), mismatched_stack_loop.end(),
+        [](const Rdna2Inst& in) { return in.pc == 1664; });
+    mismatched_compare->src[1].value = 41;
+    CHECK(rdna2_specialize_proven_null_bvh_paths(
+              mismatched_stack_loop, &loop_null_table, 32) == 1 &&
+              std::any_of(mismatched_stack_loop.begin(), mismatched_stack_loop.end(),
+                          [](const Rdna2Inst& in) {
+                              return in.pc == 968 || in.pc == 1007;
+                          }),
+          "empty-stack BVH cycle rejects a counter without a matching zero initializer");
+
     ShaderResourceTable nonnull_loop_table = loop_null_table;
     nonnull_loop_table.resources[0].gpu_addr = 0x10000u;
     std::vector<Rdna2Inst> nonnull_loop = loop_variant_branch;
