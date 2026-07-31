@@ -118,6 +118,9 @@ uint64_t ult_report(size_t index) {
     const bool success = g_return_success.load(std::memory_order_relaxed);
     const uint64_t ret = success ? 0ull : kUltNotImplemented;
     // Log at 1, 10, 100, 1e3, ... — bounded (a 1e6-call spin costs 7 lines) but never silent.
+    // The threshold is a plain load/store rather than a CAS: guest threads racing here can at worst
+    // emit the SAME milestone line twice, never suppress one. A duplicate diagnostic line is
+    // harmless; a lock taken to avoid it would sit on a path the guest hits a million times.
     uint64_t due = g_next_report[index].load(std::memory_order_relaxed);
     if (n >= due) {
         uint64_t next = due ? due * 10 : 10;
