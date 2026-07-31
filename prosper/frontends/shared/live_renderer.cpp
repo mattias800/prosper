@@ -5,10 +5,12 @@
 #include "rtt_injection.hpp"
 #include "rtt_scale.hpp"
 #include "readback_policy.hpp"
+#include "capture_renderer_policy.hpp"
 #include "write_watch_policy.hpp"
 #include "live_compute.hpp"
 
 #include "gpu/gpu_execute.hpp"          // DrawItem, set_submit_renderer
+#include "gpu/gpu_timeline.hpp"         // phase-gated detailed-capture policy
 #include "gpu/writer_provenance.hpp"
 #include "gpu/gpu_capture.hpp"          // temporal RTT capture/replay seeds
 #include "gpu/guest_texture_layout.hpp" // exact pitch for HLE-produced guest textures
@@ -918,17 +920,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     static const bool pertarget = getenv("PROSPER_RTT_PERTARGET") != nullptr ||
                                   getenv("PROSPER_RTT_SINGLE_TARGET") == nullptr;
     static const bool rtt_on = getenv("PROSPER_RTT") != nullptr || pertarget;
+    static const bool timeline_capture_requested =
+        getenv("PROSPER_GPU_TIMELINE_CAPTURE") != nullptr;
+    static const bool timeline_capture_phase_gated = timeline_capture_requested &&
+        prosper::gpu::gpu_timeline_capture_is_after_compute_gated();
+    static const bool timeline_capture_permits_live_targets =
+        timeline_capture_allows_persistent_targets(
+            timeline_capture_requested, timeline_capture_phase_gated);
     // Retain intermediate color targets on the GPU by default. Captures and per-target pixel
     // diagnostics require authoritative CPU pixels at every pass, so they retain the established
     // readback path. The explicit opt-out keeps a direct A/B and a recovery switch for driver issues.
     static const bool live_gpu_targets = pertarget &&
         !getenv("PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS") && !getenv("PROSPER_GPU_CAPTURE") &&
-        !getenv("PROSPER_GPU_TIMELINE_CAPTURE") && !getenv("PROSPER_GPU_REPLAY_EXPORT_RTT") &&
+        timeline_capture_permits_live_targets && !getenv("PROSPER_GPU_REPLAY_EXPORT_RTT") &&
         !getenv("PROSPER_GPU_REPLAY_RTT_SEEDS") && !getenv("PROSPER_DUMP_SAMPLED_RTT") &&
         !getenv("PROSPER_DUMP_RTGROUPS") && !getenv("PROSPER_DUMP_RTGROUPS_RGBA") &&
         !getenv("PROSPER_DUMP_DRAWSTEPS") &&
         !getenv("PROSPER_RESOURCE_HASH_DIM") && !getenv("PROSPER_TARGET_STEP_HASH_DIM") &&
         !getenv("PROSPER_RTTLOG");
+    if (timeline_capture_phase_gated)
+        fprintf(stderr, "[render] phase-gated timeline capture retains live targets; "
+                        "capture readback is on demand\n");
     static const bool defer_intermediate_scanout = live_gpu_targets &&
         !getenv("PROSPER_NO_INTERMEDIATE_SCANOUT_DEFER");
     // Ordered passes share one queue and keep their attachments GPU-resident, so submit the callback's

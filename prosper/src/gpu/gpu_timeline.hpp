@@ -245,6 +245,9 @@ bool read_gpu_timeline(const std::string& path, GpuTimelineFile& timeline, std::
 bool gpu_timeline_submit_matches(const GpuTimelineSubmit& submit,
                                  const GpuTimelineSelector& selector);
 GpuTimelineCaptureCounters gpu_timeline_capture_counters();
+// True only for a fully valid detailed-capture request with a nonzero AFTER_COMPUTE phase gate.
+// Frontends use this canonical parse to distinguish dormant phase capture from eager capture.
+bool gpu_timeline_capture_is_after_compute_gated();
 
 // Runtime hooks. Inert unless PROSPER_GPU_TIMELINE=<path> is set. They record folded semantic state
 // before renderer sampling and never realize shaders, copy resources, or invoke Vulkan.

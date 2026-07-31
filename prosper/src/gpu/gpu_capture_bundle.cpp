@@ -412,6 +412,54 @@ bool materialize_gpu_capture_bundle_submit(const GpuCaptureBundle& bundle, size_
     return true;
 }
 
+bool replace_gpu_capture_bundle_submit_ds_seeds(
+    GpuCaptureBundle& bundle, size_t submit_index,
+    const std::vector<GpuCaptureDsSeed>& ds_seeds, std::string& error) {
+    error.clear();
+    if (bundle.version != kVersion || submit_index >= bundle.submits.size()) {
+        error = "bundle DS replacement requires a current-version submit";
+        return false;
+    }
+    GpuCaptureFile manifest;
+    if (!materialize_gpu_capture_bundle_manifest(bundle, submit_index, manifest, error))
+        return false;
+    manifest.ds_seeds = ds_seeds;
+    std::vector<uint8_t> bytes;
+    if (!serialize_gpu_capture(manifest, bytes, error)) return false;
+
+    GpuCaptureBundleSubmit& submit = bundle.submits[submit_index];
+    const size_t old_chunk_count = bundle.chunks.size();
+    const size_t old_hash_count = bundle.chunk_hashes.size();
+    const uint64_t old_manifest_bytes = submit.manifest_bytes;
+    const uint64_t old_logical_bytes = submit.logical_bytes;
+    if (old_logical_bytes < old_manifest_bytes) {
+        error = "bundle submit logical size is smaller than its manifest";
+        return false;
+    }
+    const uint64_t resource_bytes = old_logical_bytes - old_manifest_bytes;
+    if (bytes.size() > UINT64_MAX - resource_bytes ||
+        bundle.logical_bytes < old_logical_bytes ||
+        bundle.logical_bytes - old_logical_bytes >
+            UINT64_MAX - (bytes.size() + resource_bytes)) {
+        error = "bundle DS replacement size overflow";
+        return false;
+    }
+    std::vector<uint32_t> indices;
+    if (!append_chunks(bundle, bytes, indices, error)) {
+        bundle.chunks.resize(old_chunk_count);
+        bundle.chunk_hashes.resize(old_hash_count);
+        bundle.chunk_indices_by_hash.clear();
+        for (uint32_t i = 0; i < bundle.chunks.size(); ++i)
+            bundle.chunk_indices_by_hash[bundle.chunk_hashes[i]].push_back(i);
+        return false;
+    }
+    submit.chunk_indices = std::move(indices);
+    submit.manifest_bytes = bytes.size();
+    submit.logical_bytes = bytes.size() + resource_bytes;
+    bundle.logical_bytes = bundle.logical_bytes - old_logical_bytes + submit.logical_bytes;
+    return true;
+}
+
 bool compact_gpu_capture_bundle(GpuCaptureBundle& bundle, std::string& error) {
     error.clear();
     if (bundle.chunk_hashes.size() != bundle.chunks.size()) {

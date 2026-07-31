@@ -99,6 +99,15 @@ static int run_selector_env_child(const std::string& mode) {
     const std::string capture_path = base.string() + ".prgcap";
     const std::string bundle_path = base.string() + ".prgbundle";
     bool intermediate_ok = true;
+    unsigned ds_snapshots = 0;
+    GpuCaptureDsSeed expected_ds_seed;
+    expected_ds_seed.depth_read_base = expected_ds_seed.depth_write_base = 0x310000;
+    expected_ds_seed.htile_data_base = 0x300000;
+    expected_ds_seed.width = 2;
+    expected_ds_seed.height = 2;
+    expected_ds_seed.format = GpuCaptureDsFormat::D32Float;
+    expected_ds_seed.depth_valid = true;
+    expected_ds_seed.depth.assign(16, 0x5a);
     set_test_env("PROSPER_GPU_TIMELINE", timeline_path);
     set_test_env("PROSPER_GPU_TIMELINE_CAPTURE", capture_path);
     if (mode != "after-work")
@@ -107,12 +116,14 @@ static int run_selector_env_child(const std::string& mode) {
     if (mode == "invalid") {
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "1");
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM", "not-an-address");
+        intermediate_ok = !gpu_timeline_capture_is_after_compute_gated();
         begin_gpu_timeline_submit(1);
         record_gpu_timeline_submit(GpuState{}, 1);
     } else if (mode == "after-invalid") {
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "1");
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM",
                      "not-an-address");
+        intermediate_ok = !gpu_timeline_capture_is_after_compute_gated();
         begin_gpu_timeline_submit(1);
         record_gpu_timeline_submit(GpuState{}, 1);
     } else if (mode == "zero") {
@@ -120,6 +131,7 @@ static int run_selector_env_child(const std::string& mode) {
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM", "0");
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_FRAGMENT_PROGRAM", "0x0");
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM", "0");
+        intermediate_ok = !gpu_timeline_capture_is_after_compute_gated();
         begin_gpu_timeline_submit(1);
         record_gpu_timeline_submit(GpuState{}, 1);
     } else if (mode == "semantic") {
@@ -131,6 +143,7 @@ static int run_selector_env_child(const std::string& mode) {
                      program_address(kSelectorPs));
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_COMPUTE_PROGRAM",
                      program_address(kSelectorCompute));
+        intermediate_ok = !gpu_timeline_capture_is_after_compute_gated();
 
         const auto exact = selector_draw_state(642, 362, kSelectorVs, kSelectorPs);
         const auto wrong_vs = selector_draw_state(642, 362, kWrongSelectorVs, kSelectorPs);
@@ -172,6 +185,7 @@ static int run_selector_env_child(const std::string& mode) {
                      program_address(kSelectorPs));
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM",
                      program_address(kSelectorCompute));
+        intermediate_ok = gpu_timeline_capture_is_after_compute_gated();
 
         const auto exact = selector_draw_state(642, 362, kSelectorVs, kSelectorPs);
         const auto wrong_vs = selector_draw_state(642, 362, kWrongSelectorVs, kSelectorPs);
@@ -200,6 +214,7 @@ static int run_selector_env_child(const std::string& mode) {
                      program_address(kSelectorPs));
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM",
                      program_address(kSelectorCompute));
+        intermediate_ok = gpu_timeline_capture_is_after_compute_gated();
 
         const auto exact = selector_draw_state(642, 362, kSelectorVs, kSelectorPs);
         std::vector<GpuState> submits;
@@ -223,13 +238,22 @@ static int run_selector_env_child(const std::string& mode) {
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DRAW_INDEX", "0:0");
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_CHECKPOINT_EVERY", "1");
 
+        intermediate_ok = gpu_timeline_capture_is_after_compute_gated();
+        set_gpu_capture_ds_seed_snapshot_reader(
+            [&](std::vector<GpuCaptureDsSeed>& seeds, std::string&) {
+                ++ds_snapshots;
+                seeds = {expected_ds_seed};
+                return true;
+            });
+
         const auto exact = selector_draw_state(642, 362, kSelectorVs, kSelectorPs);
+        const auto wrong_target = selector_draw_state(1, 1, kSelectorVs, kSelectorPs);
         begin_gpu_timeline_submit(1);
         record_gpu_timeline_submit(selector_submit({exact}, 10, kWrongSelectorCompute), 1);
         begin_gpu_timeline_submit(2);
         record_gpu_timeline_submit(selector_submit({exact}, 20), 2);
         GpuTimelineCaptureCounters counters = gpu_timeline_capture_counters();
-        intermediate_ok = counters.phase_observation_submits == 2 &&
+        intermediate_ok = intermediate_ok && counters.phase_observation_submits == 2 &&
             counters.phase_dispatches_scanned == 1 &&
             counters.prearm_history_submits_skipped == 2 &&
             counters.prearm_history_draws_skipped == 2 &&
@@ -240,6 +264,7 @@ static int run_selector_env_child(const std::string& mode) {
             counters.bundle_provenance_failures == 0 &&
             counters.history_lower_bound_submit_no == 0 &&
             !counters.history_phase_bounded &&
+            ds_snapshots == 0 &&
             !std::filesystem::exists(bundle_path) &&
             !std::filesystem::exists(capture_path);
 
@@ -247,6 +272,7 @@ static int run_selector_env_child(const std::string& mode) {
         record_gpu_timeline_submit(selector_submit({exact}, 30, kSelectorCompute), 3);
         counters = gpu_timeline_capture_counters();
         GpuCaptureBundle armed_bundle;
+        GpuCaptureFile armed_capture;
         std::string armed_error;
         intermediate_ok = intermediate_ok && counters.phase_observation_submits == 3 &&
             counters.phase_dispatches_scanned == 2 &&
@@ -256,12 +282,19 @@ static int run_selector_env_child(const std::string& mode) {
             counters.detail_submits_captured == 0 &&
             counters.history_lower_bound_submit_no == 3 &&
             counters.history_phase_bounded &&
+            ds_snapshots == 1 &&
             read_gpu_capture_bundle(bundle_path, armed_bundle, armed_error) &&
             armed_bundle.submits.size() == 1 &&
-            armed_bundle.submits[0].submit_index == 3;
+            armed_bundle.submits[0].submit_index == 3 &&
+            materialize_gpu_capture_bundle_submit(
+                armed_bundle, 0, armed_capture, armed_error) &&
+            armed_capture.ds_seeds.size() == 1 &&
+            armed_capture.ds_seeds[0].depth == expected_ds_seed.depth;
 
         begin_gpu_timeline_submit(4);
-        record_gpu_timeline_submit(selector_submit({exact}, 40), 4);
+        record_gpu_timeline_submit(selector_submit({wrong_target}, 40), 4);
+        begin_gpu_timeline_submit(5);
+        record_gpu_timeline_submit(selector_submit({exact}, 50), 5);
     } else if (mode == "after-submit-zero") {
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "1");
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM", "642x362");
@@ -271,6 +304,7 @@ static int run_selector_env_child(const std::string& mode) {
                      program_address(kSelectorPs));
         set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM",
                      program_address(kSelectorCompute));
+        intermediate_ok = gpu_timeline_capture_is_after_compute_gated();
 
         const auto exact = selector_draw_state(642, 362, kSelectorVs, kSelectorPs);
         begin_gpu_timeline_submit(0);
@@ -285,7 +319,7 @@ static int run_selector_env_child(const std::string& mode) {
     GpuTimelineFile timeline;
     std::string error;
     const bool timeline_ok = read_gpu_timeline(timeline_path, timeline, error);
-    bool ok = timeline_ok;
+    bool ok = timeline_ok && intermediate_ok;
     if (mode == "invalid" || mode == "after-invalid") {
         ok = ok && timeline.submits.size() == 1 && timeline.details.empty() &&
              !std::filesystem::exists(capture_path);
@@ -311,21 +345,30 @@ static int run_selector_env_child(const std::string& mode) {
     } else if (mode == "after-work") {
         GpuCaptureFile capture;
         GpuCaptureBundle bundle;
+        GpuCaptureFile first_bundle_capture, second_bundle_capture;
         const GpuTimelineCaptureCounters counters = gpu_timeline_capture_counters();
         const auto lower_bound = [&](const auto& entry) {
             return entry.first == "PROSPER_CAPTURE_HISTORY_LOWER_BOUND_SUBMIT" &&
                    entry.second == "3";
         };
-        ok = ok && intermediate_ok && timeline.submits.size() == 4 &&
-             timeline.details.size() == 2 && timeline.details[0].submit_no == 3 &&
-             timeline.details[1].submit_no == 4 && counters.history_submits_recorded == 2 &&
-             counters.bundle_submits_captured == 2 && counters.detail_submits_captured == 1 &&
+        ok = ok && intermediate_ok && timeline.submits.size() == 5 &&
+             timeline.details.size() == 3 && timeline.details[0].submit_no == 3 &&
+             timeline.details[1].submit_no == 4 && timeline.details[2].submit_no == 5 &&
+             counters.history_submits_recorded == 3 &&
+             counters.bundle_submits_captured == 3 && counters.detail_submits_captured == 1 &&
              counters.bundle_provenance_failures == 0 &&
-             read_gpu_capture(capture_path, capture, error) && capture.metadata.submit_index == 4 &&
+             read_gpu_capture(capture_path, capture, error) && capture.metadata.submit_index == 5 &&
              std::any_of(capture.metadata.renderer_env.begin(), capture.metadata.renderer_env.end(),
                          lower_bound) &&
              read_gpu_capture_bundle(bundle_path, bundle, error) && bundle.submits.size() == 2 &&
-             bundle.submits[0].submit_index == 3 && bundle.submits[1].submit_index == 4;
+             bundle.submits[0].submit_index == 4 && bundle.submits[1].submit_index == 5 &&
+             materialize_gpu_capture_bundle_submit(
+                 bundle, 0, first_bundle_capture, error) &&
+             materialize_gpu_capture_bundle_submit(
+                 bundle, 1, second_bundle_capture, error) &&
+             first_bundle_capture.ds_seeds.size() == 1 &&
+             first_bundle_capture.ds_seeds[0].depth == expected_ds_seed.depth &&
+             second_bundle_capture.ds_seeds.empty() && ds_snapshots == 3;
     } else {
         GpuCaptureFile capture;
         const auto zero_lower_bound = [&](const auto& entry) {
@@ -338,6 +381,7 @@ static int run_selector_env_child(const std::string& mode) {
              std::any_of(capture.metadata.renderer_env.begin(), capture.metadata.renderer_env.end(),
                          zero_lower_bound);
     }
+    set_gpu_capture_ds_seed_snapshot_reader({});
     std::error_code ec;
     std::filesystem::remove(timeline_path, ec);
     std::filesystem::remove(capture_path, ec);
