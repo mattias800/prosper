@@ -16,6 +16,9 @@ struct GpuDependencyAccess {
     uint32_t binding = 0;
     ResourceClass resource_class = ResourceClass::ConstantBuffer;
     std::string stage;
+    DataFormat format = DataFormat::Unknown;
+    uint32_t num_components = 0;
+    bool srgb = false;
 };
 
 struct GpuDependencyNode {
@@ -46,5 +49,11 @@ struct GpuDependencyGraph {
 
 bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
                                 GpuDependencyGraph& graph, std::string& error);
+
+// A live RTT seed is a closed external image dependency only when it represents the exact sampled
+// view. Address-only matches are unsafe: the same allocation can be reinterpreted at another extent
+// or format, which would make a nominally complete bundle replay different pixels.
+bool gpu_dependency_rtt_seed_matches(const GpuDependencyAccess& access,
+                                     const GpuCaptureRttSeed& seed);
 
 } // namespace prosper::gpu

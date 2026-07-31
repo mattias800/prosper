@@ -22,6 +22,16 @@ const char* writer_kind_name(GpuTimelineWriterKind kind) {
     }
 }
 
+const char* producer_provenance_name(GpuTimelineProducerProvenance provenance) {
+    switch (provenance) {
+        case GpuTimelineProducerProvenance::ProducerHistory: return "producer-history";
+        case GpuTimelineProducerProvenance::ExactRttSeed: return "exact-rtt-seed";
+        case GpuTimelineProducerProvenance::PhaseHistoryBounded:
+            return "phase-history-bounded/unknown";
+        default: return "unknown";
+    }
+}
+
 struct DepthKey {
     GpuTimelineDepthSurface ds;
     bool operator<(const DepthKey& other) const {
@@ -361,7 +371,7 @@ int main(int argc, char** argv) {
         std::printf("producer consumer=%llu/op%u resource=%016llx/%ux%u -> %s"
                     " submit=%llu draw=%llu order=%llu target=%016llx/%ux%u "
                     "lifetime=%llu..%llu submits=%llu writes=%llu window-first=%llu "
-                    "lifetime-truncated=%s window-truncated=%s "
+                    "lifetime-truncated=%s window-truncated=%s lower-bound=%llu provenance=%s "
                     "first-kind=%s first-draw=%llu first-order=%llu clear=%s/%08x:%08x "
                     "mode=%u mask=%x format=%u\n",
                     static_cast<unsigned long long>(producer.consumer_submit_no),
@@ -381,6 +391,8 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(producer.history_window_first_submit_no),
                     producer.lifetime_truncated ? "yes" : "no",
                     producer.history_window_truncated ? "yes" : "no",
+                    static_cast<unsigned long long>(producer.history_lower_bound_submit_no),
+                    producer_provenance_name(producer.provenance),
                     writer_kind_name(producer.first_writer_kind),
                     static_cast<unsigned long long>(producer.history_first_draw_index),
                     static_cast<unsigned long long>(producer.history_first_command_order),
@@ -471,8 +483,8 @@ int main(int argc, char** argv) {
                 const auto& x = timeline.producers[xi++];
                 std::printf("%llu %.6f producer consumer=%llu/op%u resource=%016llx/%ux%u "
                             "future=%u resolved=%s submit=%llu draw=%llu order=%llu "
-                            "lifetime=%llu..%llu/%llu writes=%llu window=%llu "
-                            "lifetime-truncated=%s window-truncated=%s kind=%s\n",
+                            "lifetime=%llu..%llu/%llu writes=%llu window=%llu lower-bound=%llu "
+                            "lifetime-truncated=%s window-truncated=%s provenance=%s kind=%s\n",
                             static_cast<unsigned long long>(x.sequence), x.elapsed_ns / 1e9,
                             static_cast<unsigned long long>(x.consumer_submit_no), x.consumer_operation,
                             static_cast<unsigned long long>(x.resource_addr), x.resource_width,
@@ -485,8 +497,10 @@ int main(int argc, char** argv) {
                             static_cast<unsigned long long>(x.history_submit_count),
                             static_cast<unsigned long long>(x.history_write_count),
                             static_cast<unsigned long long>(x.history_window_first_submit_no),
+                            static_cast<unsigned long long>(x.history_lower_bound_submit_no),
                             x.lifetime_truncated ? "yes" : "no",
                             x.history_window_truncated ? "yes" : "no",
+                            producer_provenance_name(x.provenance),
                             writer_kind_name(x.first_writer_kind));
             }
         }
