@@ -35,6 +35,10 @@ in [Game compatibility](COMPATIBILITY.md).
   <em><strong>Evergate</strong> — first tutorial room</em>
 </p>
 <p align="center">
+  <img src="assets/screenshots/gris.png" alt="GRIS — opening gameplay"><br>
+  <em><strong>GRIS</strong> — opening gameplay, native 1920×1080</em>
+</p>
+<p align="center">
   <img src="assets/screenshots/blue-prince-title.png" alt="Blue Prince — title screen"><br>
   <em><strong>Blue Prince</strong> — title screen</em>
 </p>
