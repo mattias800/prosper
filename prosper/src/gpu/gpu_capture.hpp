@@ -175,6 +175,11 @@ struct GpuCapturedStageDiagnostic {
     // table; once a fix realizes the operation, an ordinary follow-up capture retains its renderable
     // resource closure through GpuCapturedDraw/GpuCapturedCompute.
     GpuCapturedTable resource_table;
+    // v42: exact semantic launch/user-SGPR inputs supplied to a failed compute recompile. Resource
+    // state alone cannot reproduce compute translation; graphics stages and older captures leave
+    // this explicitly unavailable.
+    ComputeShaderConfig recompile_config{};
+    bool recompile_config_available = false;
 };
 
 struct GpuCapturedOperationFailure {
