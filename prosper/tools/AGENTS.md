@@ -243,8 +243,9 @@ the compact timeline and scans retained dispatch register snapshots: producer hi
 bundle capture, resource reads, and Vulkan work remain disabled. The arming submit resets and begins the
 explicitly bounded producer/bundle window, so it is retained as a possible producer while the endpoint remains
 strictly later. The arm log includes observation/skip counters; detailed capsules record the history lower
-bound in their capture environment. A requested bundle is not finalized when a read-before-write image leaf
-has only `phase-history-bounded/unknown` provenance; the standalone capsule remains available for diagnosis.
+bound in their capture environment. Every constituent is checked before append/checkpoint; a requested bundle
+is latched failed when any constituent has a read-before-write image leaf with only
+`phase-history-bounded/unknown` provenance. The standalone endpoint capsule remains available for diagnosis.
 Exact live RTT seeds are accepted only when address, extent, and sampled format semantics agree. The phase
 latch is not dependency evidence.
 When the endpoint moves, predecessor manifests roll forward so the final bundle retains the latest requested

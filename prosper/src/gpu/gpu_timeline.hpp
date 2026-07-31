@@ -197,6 +197,20 @@ struct GpuTimelineCaptureCounters {
 bool gpu_timeline_bundle_provenance_complete(GpuTimelineProducerProvenance provenance,
                                              uint32_t future_writer_operation);
 
+// Bundle closure is cumulative across every retained submit. Once one constituent exposes a
+// phase-bounded temporal image with no seed/producer, a later closed endpoint cannot make the
+// earlier submit reproducible.
+struct GpuTimelineBundleProvenanceState {
+    bool complete = true;
+    bool graph_unavailable = false;
+    uint64_t first_incomplete_submit_no = 0;
+    uint64_t bounded_unknown_leaf_count = 0;
+};
+
+void gpu_timeline_observe_bundle_provenance(
+    GpuTimelineBundleProvenanceState& state, uint64_t submit_no,
+    GpuTimelineProducerProvenance provenance, uint32_t future_writer_operation);
+
 struct GpuTimelineFile {
     uint32_t version = 0;
     GpuTimelineMetadata metadata;

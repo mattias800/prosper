@@ -374,6 +374,22 @@ int main(int argc, char** argv) {
     CHECK(gpu_timeline_bundle_provenance_complete(
               GpuTimelineProducerProvenance::PhaseHistoryBounded, UINT32_MAX),
           "a non-temporal guest image input does not require pre-phase producer history");
+    GpuTimelineBundleProvenanceState unresolved_arm;
+    gpu_timeline_observe_bundle_provenance(
+        unresolved_arm, 3, GpuTimelineProducerProvenance::PhaseHistoryBounded, 7);
+    gpu_timeline_observe_bundle_provenance(
+        unresolved_arm, 4, GpuTimelineProducerProvenance::ExactRttSeed, 8);
+    CHECK(!unresolved_arm.complete && unresolved_arm.first_incomplete_submit_no == 3 &&
+              unresolved_arm.bounded_unknown_leaf_count == 1,
+          "a closed endpoint cannot repair an unresolved phase-arm bundle constituent");
+    GpuTimelineBundleProvenanceState closed_constituents;
+    gpu_timeline_observe_bundle_provenance(
+        closed_constituents, 3, GpuTimelineProducerProvenance::ExactRttSeed, 7);
+    gpu_timeline_observe_bundle_provenance(
+        closed_constituents, 4, GpuTimelineProducerProvenance::ProducerHistory, 8);
+    CHECK(closed_constituents.complete &&
+              closed_constituents.bounded_unknown_leaf_count == 0,
+          "exactly seeded and post-arm-produced constituents keep the whole bundle closed");
     CHECK(run_self(argv[0], "invalid") == 0,
           "malformed graphics-program selector is rejected without capturing");
     CHECK(run_self(argv[0], "after-invalid") == 0,
