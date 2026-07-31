@@ -37,7 +37,8 @@ Baseline evidence requires visual review even though routine regression runs do
 not. This prevents checksums or thresholds from blessing black output or the
 wrong scene.
 
-1. Set `review` to `pending` and run `snapshot.py verify NAME`.
+1. Write the whole candidate entry, **including `_note`**, and set `review` to
+   `pending`. Then run `snapshot.py verify NAME`.
 2. Inspect every image retained from both independent runs in
    `tools/snapshot/review/NAME/`. Confirm the intended gameplay state, expected
    layers, and progression across multiple timestamps.
@@ -50,9 +51,37 @@ wrong scene.
    conservative non-black coverage floor; exact mode records the identical
    pixel hash. Never use exact hashes for threaded gameplay merely because one
    run happened to be stable.
-5. Run `snapshot.py check NAME` after approval.
+5. Replace the generic `review` string that `update` wrote with the factual note
+   describing what was actually inspected.
+6. Run `snapshot.py check NAME` after approval.
 
 See `README.md` for every manifest field and the current title matrix.
+
+### Three ordering traps that silently produce a bad baseline
+
+Each of these leaves a guard that *looks* adopted. None of them fails loudly, so
+follow the order above rather than the obvious one.
+
+- **The factual `review` note must be written after `update --reviewed`, not
+  before.** `approve_content_candidate` unconditionally overwrites `review` with
+  a generic "Approved N composited images ... visually confirmed" string. A note
+  written before approval is destroyed by the approval itself, and the guard then
+  carries boilerplate that records no evidence while still satisfying `check`'s
+  "not pending" test.
+- **`_note` must be set before `verify`, because it is part of the candidate
+  fingerprint.** `entry_fingerprint` excludes only `hash`, `dims`, `review`,
+  `structural_references`, `perceptual_references`, and `min_nonblack_ratio`;
+  every other key, `_note` included, is hashed. Adding or editing `_note` after
+  `verify` makes `update` refuse with "snapshot configuration changed after
+  verify", costing a full two-capture rerun.
+- **`min_content_match_ratio` applies to every frame in the window, not to the
+  qualifying ones.** The requirement is
+  `max(min_structural_matches, ceil(total_window_frames * ratio))`, so at the
+  0.75 default, three quarters of *all* window frames must clear both SSIM and
+  non-black coverage. A window that merely contains good gameplay but also
+  straddles a load, a fade, or a transition will fail on a perfectly healthy run.
+  Place the window entirely inside the settled state and confirm the margin with
+  `profile_route.py` instead of assuming it.
 
 ## Environment
 
