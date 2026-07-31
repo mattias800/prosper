@@ -92,7 +92,14 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v42: retain the exact ComputeShaderConfig for failed compute stages. Raw code and v41 resources do
 // not encode user SGPRs, dispatch dimensions, wave ABI, LDS size, or subgroup/storage policy, so an
 // offline retry must never reconstruct those inputs from defaults.
-constexpr uint32_t kVersion = 42;
+// v43 (#1459): retain the raw color-state triple — CB_COLOR_CONTROL, CB_TARGET_MASK, CB_SHADER_MASK,
+// each with an explicit present flag — for realized and failed draw pipelines. A capsule stores an
+// already-resolved pipeline, so a zero color write mask was previously unattributable offline: an
+// absent target/shader mask resolves to write-all, meaning a zero resolved mask implies one of those
+// registers is PRESENT with value zero, or MODE is DISABLE. Those causes demand different fixes and
+// only the raw registers separate them. Append-only tail; v1-v42 prefixes stay byte-exact and older
+// captures report the state as unavailable rather than inventing write-all defaults.
+constexpr uint32_t kVersion = 43;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -201,6 +208,28 @@ struct Reader {
         v.resize(static_cast<size_t>(n)); return take(v.data(), v.size());
     }
 };
+
+// v43 (#1459): the raw color-state triple behind a resolved color write mask. Presence is packed
+// alongside the values because "absent" and "present with value 0" resolve to opposite masks —
+// write-all versus write-nothing — and only the raw registers distinguish them offline.
+void write_color_state(Writer& w, const ResolvedPipelineState& ps) {
+    const uint8_t present = (ps.has_cb_color_control ? 1u : 0u) |
+                            (ps.has_cb_target_mask ? 2u : 0u) |
+                            (ps.has_cb_shader_mask ? 4u : 0u);
+    w.u8(present);
+    w.u32(ps.cb_color_control);
+    w.u32(ps.cb_target_mask);
+    w.u32(ps.cb_shader_mask);
+}
+
+bool read_color_state(Reader& r, ResolvedPipelineState& ps) {
+    uint8_t present = 0;
+    if (!r.u8(present) || present > 7u) return false;
+    ps.has_cb_color_control = (present & 1u) != 0;
+    ps.has_cb_target_mask = (present & 2u) != 0;
+    ps.has_cb_shader_mask = (present & 4u) != 0;
+    return r.u32(ps.cb_color_control) && r.u32(ps.cb_target_mask) && r.u32(ps.cb_shader_mask);
+}
 
 void write_compute_config(Writer& w, const ComputeShaderConfig& config) {
     w.words(config.user_sgprs);
@@ -2270,6 +2299,14 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
                 write_compute_config(w, stage.recompile_config);
         }
     }
+    // v43 (#1459) appends the raw color-state triple that determines every resolved color write
+    // mask. Presence travels with each value because an absent CB_TARGET_MASK/CB_SHADER_MASK means
+    // write-all, not zero. Enumeration matches the v25/v26 blocks so the tail stays removable.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) write_color_state(w, draw.ps);
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (diagnostic.pipeline_present) write_color_state(w, diagnostic.pipeline);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -3243,6 +3280,22 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 }
             }
         }
+    }
+    if (version >= 43) {   // #1459: raw color-state provenance for every resolved write mask
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid color-state draw count"; return false;
+        }
+        for (auto& draw : c.draws)
+            if (!read_color_state(r, draw.ps)) { error = "invalid color-state draw record"; return false; }
+        uint32_t failure_count = 0;
+        if (!r.u32(failure_count) || failure_count != c.failure_diagnostics.size()) {
+            error = "invalid color-state failure count"; return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics) if (diagnostic.pipeline_present)
+            if (!read_color_state(r, diagnostic.pipeline)) {
+                error = "invalid color-state failure record"; return false;
+            }
     }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)

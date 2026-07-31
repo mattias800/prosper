@@ -339,7 +339,7 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
     }
 }
 
-void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
+void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_version) {
     for (const auto& seed : replay.rtt_seeds) {
         const uint64_t hash = prosper::gpu::gpu_capture_hash(seed.rgba);
         const char* format = seed.format == prosper::gpu::GpuCaptureColorFormat::Rgba16Float
@@ -451,6 +451,24 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     d.ps.src_color_blend_factor, d.ps.dst_color_blend_factor, d.ps.color_blend_op,
                     d.ps.src_alpha_blend_factor, d.ps.dst_alpha_blend_factor, d.ps.alpha_blend_op,
                     d.ps.logic_op_enable, d.ps.logic_op);
+        // Per-draw diagnostic lines are ordered: color fixed-function state first (blend above, then
+        // the raw color-state registers that decide the write masks on the draw line), then pixel
+        // shader input linkage. Keep new lines grouped with the concern they explain.
+        //
+        // #1459: why this draw's color write mask is what it is. An absent target/shader mask means
+        // write-all, so `present:value` is reported rather than the value alone — a zero mask from a
+        // PRESENT zero register and one from MODE=DISABLE demand completely different fixes.
+        if (format_version >= 43)
+            std::printf("  color-state cb-control=%d:%08x mode=%u target-mask=%d:%08x "
+                        "shader-mask=%d:%08x effective=%02x\n",
+                        d.ps.has_cb_color_control, d.ps.cb_color_control,
+                        (d.ps.cb_color_control >> prosper::agc::Pm4::CB_COLOR_CONTROL_MODE_SHIFT) &
+                            prosper::agc::Pm4::CB_COLOR_CONTROL_MODE_MASK,
+                        d.ps.has_cb_target_mask, d.ps.cb_target_mask,
+                        d.ps.has_cb_shader_mask, d.ps.cb_shader_mask,
+                        (d.ps.cb_target_mask & d.ps.cb_shader_mask) & 0xFFu);
+        else
+            std::printf("  color-state unavailable (capture v%u predates v43)\n", format_version);
         // Resolved SPI_PS_INPUT_CNTL linkage (see pixel_input_linkage.hpp): which producer PARAM
         // slot each pixel-shader input actually reads, or whether the interpolator synthesizes a
         // constant instead. Retained since capture v36; older captures print `none` rather than
@@ -2378,7 +2396,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] capture save roots: save0=%s savedata-memory=%s\n",
                      save0 == m.renderer_env.end() ? "unknown" : save0->second.c_str(),
                      m.savedata_dir.empty() ? "unknown" : m.savedata_dir.c_str());
-    if (inspect) inspect_frame(replay);
+    if (inspect) inspect_frame(replay, capture.format_version);
     if (validate_only) return validate_frame(replay) ? 0 : 1;
     if (inspect_only) return 0;
     if (metadata_only) {

@@ -174,6 +174,11 @@ int main() {
     draw.ps.depth_bias_clamp = 0.5f;
     draw.ps.spi_shader_col_format = 4;
     draw.ps.sx_ps_downconvert = 5;
+    // #1459: v43 raw color-state provenance. A PRESENT zero target mask is deliberately chosen here
+    // because it is exactly the state an absent register must NOT be confused with.
+    draw.ps.has_cb_color_control = true; draw.ps.cb_color_control = 0x00CC0010u;
+    draw.ps.has_cb_target_mask = true;   draw.ps.cb_target_mask = 0u;
+    draw.ps.has_cb_shader_mask = true;   draw.ps.cb_shader_mask = 0x000000FFu;
     draw.ps.has_scissor = true; draw.ps.scissor_left = 12; draw.ps.scissor_top = 19;
     draw.ps.scissor_right = 70; draw.ps.scissor_bottom = 75;
     draw.ps.logic_op_enable = true; draw.ps.logic_op = 6;
@@ -428,6 +433,15 @@ int main() {
         return bytes;
     };
 
+    // v43 (#1459): byte length of the trailing raw color-state block. One present-bitmask byte plus
+    // three raw registers per realized draw and per pipeline-bearing failure diagnostic.
+    auto v43_tail = [](const GpuCaptureFile& f) -> size_t {
+        size_t present_failures = 0;
+        for (const auto& diagnostic : f.failure_diagnostics)
+            if (diagnostic.pipeline_present) ++present_failures;
+        return 4 + f.draws.size() * 13 + 4 + present_failures * 13;
+    };
+
     // v25 (#1240): byte length of the trailing resolve-state block.
     auto v25_tail = [](const GpuCaptureFile& f) -> size_t {
         size_t present_failures = 0;
@@ -459,6 +473,7 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - v43_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v42_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v41_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v40_tail(v16_scissor_source));
@@ -569,7 +584,7 @@ int main() {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 42 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 43 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -579,7 +594,7 @@ int main() {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 42 &&
+              video_loaded.format_version == 43 &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(video_loaded, video_replay, error) &&
@@ -602,7 +617,7 @@ int main() {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 42 &&
+              upgraded_video.format_version == 43 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -684,7 +699,7 @@ int main() {
           "Plucky RGBA16 32-cubed S3 capture uses its four true 3D macroblocks");
     CHECK(serialize_gpu_capture(array_layout_capture, array_layout_bytes, error) &&
               deserialize_gpu_capture(array_layout_bytes, array_layout_loaded, error) &&
-              array_layout_loaded.format_version == 42 &&
+              array_layout_loaded.format_version == 43 &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
           "v32 capture round-trips thin-array slice stride and selected-mip offset");
@@ -783,6 +798,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - v43_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v42_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v41_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v40_tail(volume_capture));
@@ -883,6 +899,7 @@ int main() {
     CHECK(serialize_gpu_capture(pre_v31_source, v20_bytes, error) && v20_bytes.size() >= 21,
           "v21 capture serializes the logic-op extension");
     if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - v43_tail(pre_v31_source));
         v20_bytes.resize(v20_bytes.size() - v42_tail(pre_v31_source));
         v20_bytes.resize(v20_bytes.size() - v41_tail(pre_v31_source));
         v20_bytes.resize(v20_bytes.size() - v40_tail(pre_v31_source));
@@ -939,6 +956,34 @@ int main() {
     CHECK(loaded.draws[0].ps.spi_shader_col_format == 4 &&
           loaded.draws[0].ps.sx_ps_downconvert == 5,
           "v26 color export/downconversion state round-trips explicitly");
+    CHECK(loaded.draws[0].ps.has_cb_color_control &&
+              loaded.draws[0].ps.cb_color_control == 0x00CC0010u &&
+              loaded.draws[0].ps.has_cb_target_mask &&
+              loaded.draws[0].ps.cb_target_mask == 0u &&
+              loaded.draws[0].ps.has_cb_shader_mask &&
+              loaded.draws[0].ps.cb_shader_mask == 0x000000FFu,
+          "v43 raw color-state round-trips a PRESENT zero target mask distinctly (#1459)");
+    // v43 is an append-only tail, so a v42 fixture is this capture minus exactly that block. It must
+    // reopen reporting the provenance ABSENT rather than fabricating a write-all or zero default.
+    {
+        auto v43_tail = [](const GpuCaptureFile& f) -> size_t {
+            size_t present_failures = 0;
+            for (const auto& diagnostic : f.failure_diagnostics)
+                if (diagnostic.pipeline_present) ++present_failures;
+            return 4 + f.draws.size() * 13 + 4 + present_failures * 13;
+        };
+        std::vector<uint8_t> v42_bytes;
+        CHECK(serialize_gpu_capture(captured, v42_bytes, error),
+              "v43 capture serializes before the color-state downgrade");
+        v42_bytes.resize(v42_bytes.size() - v43_tail(captured));
+        v42_bytes[8] = 42; v42_bytes[9] = v42_bytes[10] = v42_bytes[11] = 0;
+        GpuCaptureFile v42_loaded;
+        CHECK(deserialize_gpu_capture(v42_bytes, v42_loaded, error) &&
+                  !v42_loaded.draws[0].ps.has_cb_color_control &&
+                  !v42_loaded.draws[0].ps.has_cb_target_mask &&
+                  !v42_loaded.draws[0].ps.has_cb_shader_mask,
+              "v42 capture reopens with color-state provenance absent, not a fabricated default");
+    }
     CHECK(loaded.draws[0].raw_draw_modifier == 0x1122334455667788ull &&
           loaded.draws[0].vertex_offset == -37,
           "v27 draw modifier and vertex offset round-trip explicitly");
@@ -950,7 +995,7 @@ int main() {
     std::vector<uint8_t> v24_resolve_bytes;
     GpuCaptureFile v24_resolve_loaded;
     CHECK(serialize_gpu_capture(pre_v31_source, v24_resolve_bytes, error) &&
-          v24_resolve_bytes.size() >= v42_tail(pre_v31_source) +
+          v24_resolve_bytes.size() >= v43_tail(pre_v31_source) + v42_tail(pre_v31_source) +
               v41_tail(pre_v31_source) +
               v40_tail(pre_v31_source) +
               v39_tail(pre_v31_source) +
@@ -963,7 +1008,7 @@ int main() {
               v27_tail(pre_v31_source) + v26_tail(pre_v31_source) +
               v25_tail(pre_v31_source),
           "v25 capture exposes a removable trailing resolve-state block");
-    if (v24_resolve_bytes.size() >= v42_tail(pre_v31_source) +
+    if (v24_resolve_bytes.size() >= v43_tail(pre_v31_source) + v42_tail(pre_v31_source) +
             v41_tail(pre_v31_source) +
             v40_tail(pre_v31_source) +
             v39_tail(pre_v31_source) +
@@ -975,6 +1020,7 @@ int main() {
             v29_tail(pre_v31_source) + v28_tail(pre_v31_source) +
             v27_tail(pre_v31_source) + v26_tail(pre_v31_source) +
             v25_tail(pre_v31_source)) {
+        v24_resolve_bytes.resize(v24_resolve_bytes.size() - v43_tail(pre_v31_source));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v42_tail(pre_v31_source));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v41_tail(pre_v31_source));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v40_tail(pre_v31_source));
@@ -1071,7 +1117,8 @@ int main() {
               v37_compatible_bytes.size() >= 12,
           "current capture prepares the layout-compatible v37 fixture");
     if (v37_compatible_bytes.size() >=
-        v42_tail(captured) + v41_tail(captured) + v40_tail(captured) + v39_tail(captured)) {
+        v43_tail(captured) + v42_tail(captured) + v41_tail(captured) + v40_tail(captured) + v39_tail(captured)) {
+        v37_compatible_bytes.resize(v37_compatible_bytes.size() - v43_tail(captured));
         v37_compatible_bytes.resize(v37_compatible_bytes.size() - v42_tail(captured));
         v37_compatible_bytes.resize(v37_compatible_bytes.size() - v41_tail(captured));
         v37_compatible_bytes.resize(v37_compatible_bytes.size() - v40_tail(captured));
@@ -1105,6 +1152,16 @@ int main() {
     CHECK(materialize_gpu_replay(loaded, replay, error), "capture materializes owned replay draw items");
     CHECK(replay.items.size() == 1 && replay.items[0].ps.cb_resolve,
           "materialized gpu_replay draw retains MODE=3 resolve intent");
+    // #1459: gpu_replay --inspect reads the color-state line from the MATERIALIZED item, so assert
+    // the provenance survives that step too — a round-trip into GpuCaptureFile alone would not prove
+    // the offline diagnostic can actually see a present-and-zero mask.
+    CHECK(replay.items[0].ps.has_cb_color_control &&
+              replay.items[0].ps.cb_color_control == 0x00CC0010u &&
+              replay.items[0].ps.has_cb_target_mask &&
+              replay.items[0].ps.cb_target_mask == 0u &&
+              replay.items[0].ps.has_cb_shader_mask &&
+              replay.items[0].ps.cb_shader_mask == 0x000000FFu,
+          "materialized gpu_replay draw retains the v43 raw color-state provenance (#1459)");
     const auto& rr = replay.items[0].vrt->resources;
     CHECK(rr[0].gpu_addr == 0x1000 && rr[1].gpu_addr == 0x1008, "replay retains logical guest addresses");
     CHECK(rr[0].host_data && rr[1].host_data == rr[0].host_data + 8 && rr[1].host_data[0] == memory[8],
@@ -1251,16 +1308,17 @@ int main() {
     v36_compute_source.raw_shader_versions.clear();
     CHECK(serialize_gpu_capture(v36_compute_source, v36_compute_bytes, error) &&
               v36_compute_bytes.size() >=
-                  v42_tail(v36_compute_source) + v41_tail(v36_compute_source) +
+                  v43_tail(v36_compute_source) + v42_tail(v36_compute_source) + v41_tail(v36_compute_source) +
                       v40_tail(v36_compute_source) +
                       v39_tail(v36_compute_source) +
                       v37_tail(v36_compute_source),
           "v37 capture exposes a removable compute subgroup-contract tail");
     if (v36_compute_bytes.size() >=
-        v42_tail(v36_compute_source) + v41_tail(v36_compute_source) +
+        v43_tail(v36_compute_source) + v42_tail(v36_compute_source) + v41_tail(v36_compute_source) +
             v40_tail(v36_compute_source) +
             v39_tail(v36_compute_source) +
             v37_tail(v36_compute_source)) {
+        v36_compute_bytes.resize(v36_compute_bytes.size() - v43_tail(v36_compute_source));
         v36_compute_bytes.resize(v36_compute_bytes.size() - v42_tail(v36_compute_source));
         v36_compute_bytes.resize(v36_compute_bytes.size() - v41_tail(v36_compute_source));
         v36_compute_bytes.resize(v36_compute_bytes.size() - v40_tail(v36_compute_source));
@@ -1466,7 +1524,7 @@ int main() {
     GpuCaptureFile failed_compute_loaded;
     CHECK(serialize_gpu_capture(failed_compute_capture, failed_compute_bytes, error) &&
               deserialize_gpu_capture(failed_compute_bytes, failed_compute_loaded, error) &&
-              failed_compute_loaded.format_version == 42 &&
+              failed_compute_loaded.format_version == 43 &&
               failed_compute_loaded.failure_diagnostics[0].compute_launch.threads_x == 37 &&
               failed_compute_loaded.failure_diagnostics[0].stages[0]
                       .recompile_config.user_sgprs ==
@@ -1479,7 +1537,8 @@ int main() {
 
     std::vector<uint8_t> v41_failed_compute_bytes = failed_compute_bytes;
     v41_failed_compute_bytes.resize(
-        v41_failed_compute_bytes.size() - v42_tail(failed_compute_capture));
+        v41_failed_compute_bytes.size() - v43_tail(failed_compute_capture) -
+            v42_tail(failed_compute_capture));
     v41_failed_compute_bytes[8] = 41;
     v41_failed_compute_bytes[9] = v41_failed_compute_bytes[10] =
         v41_failed_compute_bytes[11] = 0;
@@ -1675,7 +1734,7 @@ int main() {
                 loaded_failed_stage->resource_table.resources.size() == 1
             ? &loaded_failed_stage->resource_table.resources[0]
             : nullptr;
-    CHECK(failed_loaded.format_version == 42 && loaded_shadow &&
+    CHECK(failed_loaded.format_version == 43 && loaded_shadow &&
           loaded_shadow->resource.depth == 4 &&
           loaded_shadow->resource.max_uncompressed_block_size == 2 &&
           loaded_shadow->resource.max_compressed_block_size == 1 &&
@@ -1706,10 +1765,11 @@ int main() {
     GpuCaptureFile v40_failed_loaded;
     CHECK(serialize_gpu_capture(failed_capture, v40_failed_bytes, error) &&
               v40_failed_bytes.size() >=
-                  v42_tail(failed_capture) + v41_tail(failed_capture),
+                  v43_tail(failed_capture) + v42_tail(failed_capture) + v41_tail(failed_capture),
           "v41 failed-stage resource tail is removable for a v40 compatibility fixture");
     if (v40_failed_bytes.size() >=
-        v42_tail(failed_capture) + v41_tail(failed_capture)) {
+        v43_tail(failed_capture) + v42_tail(failed_capture) + v41_tail(failed_capture)) {
+        v40_failed_bytes.resize(v40_failed_bytes.size() - v43_tail(failed_capture));
         v40_failed_bytes.resize(v40_failed_bytes.size() - v42_tail(failed_capture));
         v40_failed_bytes.resize(v40_failed_bytes.size() - v41_tail(failed_capture));
         v40_failed_bytes[8] = 40;
@@ -1791,6 +1851,7 @@ int main() {
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - v43_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v42_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v41_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v40_tail(legacy_source));
@@ -1831,6 +1892,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - v43_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v42_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v41_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v40_tail(legacy_source));
@@ -1897,9 +1959,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 43;   // kVersion + 1: a future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 44;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 43",
+          error == "unsupported capture version 44",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;
