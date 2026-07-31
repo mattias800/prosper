@@ -269,7 +269,7 @@ struct RuntimeDetailRequest {
     std::atomic<bool> predecessor_claimed{false};
     std::atomic<bool> predecessor_failed{false};
     bool bundle_start_reached = false;
-    bool after_compute_seen = false;
+    std::atomic<bool> after_compute_seen{false};
     std::atomic<uint64_t> phase_observation_submits{0};
     std::atomic<uint64_t> phase_dispatches_scanned{0};
     std::atomic<uint64_t> prearm_history_submits_skipped{0};
@@ -779,7 +779,8 @@ enum class RuntimeCapturePhaseObservation { Ready, Waiting, ArmedThisSubmit };
 RuntimeCapturePhaseObservation observe_runtime_capture_phase(RuntimeDetailRequest& request,
                                                              const GpuState& state,
                                                              uint64_t submit_no) {
-    if (!request.select_after_compute_program || request.after_compute_seen)
+    if (!request.select_after_compute_program ||
+        request.after_compute_seen.load(std::memory_order_acquire))
         return RuntimeCapturePhaseObservation::Ready;
     request.phase_observation_submits.fetch_add(1, std::memory_order_relaxed);
     for (const auto& dispatch : state.dispatches) {
@@ -787,7 +788,7 @@ RuntimeCapturePhaseObservation observe_runtime_capture_phase(RuntimeDetailReques
         if (compute_dispatch_code_addr(state, dispatch) != request.select_after_compute_program)
             continue;
         request.after_compute_submit_no = submit_no;
-        request.after_compute_seen = true;
+        request.after_compute_seen.store(true, std::memory_order_release);
         std::fprintf(stderr,
                      "[timeline] capture after-compute gate armed submit=%llu program=0x%llx "
                      "observed-submits=%llu dispatches-scanned=%llu history-submits-skipped=%llu "
@@ -816,7 +817,7 @@ bool runtime_capture_endpoint_matches(RuntimeDetailRequest& request,
     if (request.select_after_compute_program) {
         // The phase program's submit only arms the request. Even if it also satisfies every
         // endpoint predicate, capture begins with a strictly later submit.
-        if (!request.after_compute_seen ||
+        if (!request.after_compute_seen.load(std::memory_order_acquire) ||
             submit_no <= request.after_compute_submit_no)
             return false;
     }
@@ -1119,6 +1120,12 @@ void log_capture_detail(const GpuTimelineDetail& detail) {
 
 bool gpu_timeline_capture_is_after_compute_gated() {
     return runtime_detail_request_is_after_compute_gated();
+}
+
+bool gpu_timeline_capture_after_compute_gate_armed() {
+    const RuntimeDetailRequest& request = runtime_detail_request();
+    return request.valid && request.select_after_compute_program != 0 &&
+        request.after_compute_seen.load(std::memory_order_acquire);
 }
 
 GpuTimelineCaptureCounters gpu_timeline_capture_counters() {

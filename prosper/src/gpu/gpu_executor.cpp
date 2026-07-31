@@ -7,6 +7,7 @@
 #include "gpu_execute.hpp"
 #include "gpu_capture.hpp"
 #include "gpu_timeline.hpp"
+#include "capture_compute_policy.hpp"
 #include "videoout_present.hpp"   // present_write_frame
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
@@ -4234,8 +4235,18 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // device-independent storage paths (raw uvec4 or exact packed R32ui), so optional format
         // support never becomes an artifact ABI. Capture v39 also retains the raw shader and
         // semantic launch ABI, allowing --recompile-raw to reconstruct a device-specific module.
+        static const bool timeline_capture_requested =
+            std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") != nullptr;
+        static const bool timeline_capture_after_compute_gated =
+            timeline_capture_requested && gpu_timeline_capture_is_after_compute_gated();
+        const bool timeline_capture_after_compute_armed =
+            timeline_capture_after_compute_gated &&
+            gpu_timeline_capture_after_compute_gate_armed();
+        const bool timeline_capture_bound = timeline_capture_requires_portable_compute(
+            timeline_capture_requested, timeline_capture_after_compute_gated,
+            timeline_capture_after_compute_armed);
         const bool capture_bound = std::getenv("PROSPER_GPU_CAPTURE") ||
-            std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
+            timeline_capture_bound ||
             interactive_gpu_capture_armed() || interactive_capture_bundle_active();
         if (capture_bound)
             config.native_storage_format_support = 0;
