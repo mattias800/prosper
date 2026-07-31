@@ -2,6 +2,7 @@
 // and the recompiler/pipeline lookups both halves rely on. Pure (no Vulkan), runs in CI.
 #include "../src/gpu/shader_resources.hpp"
 #include "../src/gpu/gpu_execute.hpp"
+#include "../frontends/shared/live_compute.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
@@ -15,6 +16,47 @@ static int fails = 0;
 static void emit(std::vector<uint32_t>& spv, uint16_t op, std::initializer_list<uint32_t> words) {
     spv.push_back((static_cast<uint32_t>(words.size() + 1) << 16) | op);
     spv.insert(spv.end(), words.begin(), words.end());
+}
+
+static void emit_string(std::vector<uint32_t>& spv, uint16_t op, const char* string) {
+    std::vector<uint32_t> words;
+    uint32_t packed = 0;
+    uint32_t byte = 0;
+    do {
+        const uint8_t value = static_cast<uint8_t>(*string);
+        packed |= static_cast<uint32_t>(value) << (byte * 8u);
+        if (++byte == 4u) {
+            words.push_back(packed);
+            packed = 0;
+            byte = 0;
+        }
+        if (!value) break;
+        ++string;
+    } while (true);
+    if (byte) words.push_back(packed);
+    spv.push_back((static_cast<uint32_t>(words.size() + 1u) << 16u) | op);
+    spv.insert(spv.end(), words.begin(), words.end());
+}
+
+static std::vector<uint32_t> tail_marker_test_spirv(bool writable = false,
+                                                    bool dynamic = false) {
+    std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 32, 0};
+    emit(s, 15, {5, 20, 0x6e69616d, 0});                    // OpEntryPoint Compute %20 "main"
+    emit_string(s, 330, "Prosper.StorageBufferZeroPad=0,9,2,4,u16");
+    emit(s, 21, {1, 32, 0});                               // %1 = u32
+    emit(s, 29, {2, 1});                                   // %2 = runtime array u32
+    emit(s, 30, {3, 2});                                   // %3 = struct {%2}
+    emit(s, 32, {4, 12, 3});                               // %4 = StorageBuffer pointer to %3
+    emit(s, 32, {5, 12, 1});                               // %5 = StorageBuffer pointer to u32
+    emit(s, 43, {1, 6, 0});                                // %6 = 0
+    emit(s, 59, {4, 8, 12});                               // %8 = buffer
+    emit(s, 71, {2, 6, 4});                                // ArrayStride 4
+    emit(s, 72, {3, 0, 35, 0});                            // member 0 Offset 0
+    emit(s, 71, {8, 34, 0}); emit(s, 71, {8, 33, 9});     // set 0 binding 9
+    emit(s, 65, {5, 9, 8, 6, dynamic ? 20u : 6u});        // %9 = &buffer[0][index]
+    if (writable) emit(s, 62, {9, 6});                     // store %9
+    else emit(s, 61, {1, 10, 9});                         // %10 = load %9
+    return s;
 }
 
 static std::vector<uint32_t> descriptor_test_spirv() {
@@ -162,6 +204,130 @@ int main() {
     CHECK(data_format_bytes(DataFormat::Unorm8) == 1 && data_format_bytes(DataFormat::Sint8) == 1,
           "8-bit formats are 1 byte");
     CHECK(data_format_bytes(DataFormat::Unknown) == 0, "Unknown format is 0 bytes");
+
+    SpirvDescriptorBinding tail_descriptor;
+    tail_descriptor.kind = SpirvDescriptorKind::StorageBuffer;
+    tail_descriptor.required_bytes = 4;
+    tail_descriptor.readable = true;
+    tail_descriptor.zero_pad_logical_bytes = 2;
+    tail_descriptor.zero_pad_binding_bytes = 4;
+    tail_descriptor.zero_pad_semantic = StorageBufferTailSemantic::Uint16;
+    ShaderResource tail_resource;
+    tail_resource.cls = ResourceClass::ConstantBuffer;
+    tail_resource.format = DataFormat::Uint16;
+    tail_resource.num_components = 1;
+    tail_resource.size = 2;
+    tail_resource.stride = 2;
+    const StorageBufferMaterializationPlan tail_plan =
+        plan_storage_buffer_materialization(tail_descriptor, tail_resource);
+    const uint8_t tail_source[2] = {0x34, 0x12};
+    uint8_t tail_destination[4] = {0xa5, 0xa5, 0xa5, 0xa5};
+    CHECK(tail_plan.valid && tail_plan.zero_padded_tail &&
+          tail_plan.logical_bytes == 2 && tail_plan.binding_bytes == 4 &&
+          materialize_storage_buffer_bytes(
+              tail_plan, tail_source, sizeof(tail_source),
+              tail_destination, sizeof(tail_destination)) &&
+          tail_destination[0] == 0x34 && tail_destination[1] == 0x12 &&
+          tail_destination[2] == 0 && tail_destination[3] == 0,
+          "one-record Uint16 materialization copies two bytes and deterministically clears the tail");
+    ShaderResource ordinary_four_byte_resource = tail_resource;
+    ordinary_four_byte_resource.format = DataFormat::Uint32;
+    ordinary_four_byte_resource.size = 4;
+    ordinary_four_byte_resource.stride = 4;
+    SpirvDescriptorBinding ordinary_descriptor;
+    ordinary_descriptor.kind = SpirvDescriptorKind::StorageBuffer;
+    ordinary_descriptor.required_bytes = 4;
+    ordinary_descriptor.readable = true;
+    const StorageBufferMaterializationPlan ordinary_four_byte_plan =
+        plan_storage_buffer_materialization(
+            ordinary_descriptor, ordinary_four_byte_resource);
+    auto float_tail_descriptor = tail_descriptor;
+    float_tail_descriptor.zero_pad_semantic = StorageBufferTailSemantic::Float16;
+    ShaderResource float_tail_resource = tail_resource;
+    float_tail_resource.format = DataFormat::Float16;
+    const StorageBufferMaterializationPlan float_tail_plan =
+        plan_storage_buffer_materialization(float_tail_descriptor, float_tail_resource);
+    const auto tail_cache_discriminator =
+        prosper::frontend::compute_buffer_materialization_discriminator(tail_plan);
+    const auto ordinary_cache_discriminator =
+        prosper::frontend::compute_buffer_materialization_discriminator(
+            ordinary_four_byte_plan);
+    const auto float_tail_cache_discriminator =
+        prosper::frontend::compute_buffer_materialization_discriminator(float_tail_plan);
+    CHECK(ordinary_four_byte_plan.valid && float_tail_plan.valid &&
+          !(tail_cache_discriminator == ordinary_cache_discriminator) &&
+          !(tail_cache_discriminator == float_tail_cache_discriminator),
+          "persistent compute cache partitions logical2/u16/f16 from ordinary bound4 sources");
+    auto writable_tail_descriptor = tail_descriptor;
+    writable_tail_descriptor.writable = true;
+    CHECK(!plan_storage_buffer_materialization(
+               writable_tail_descriptor, tail_resource).valid,
+          "zero-padded tail contract rejects writable storage buffers");
+    SpirvDescriptorBinding partial_tail_descriptor;
+    partial_tail_descriptor.zero_pad_semantic = StorageBufferTailSemantic::Uint16;
+    CHECK(!plan_storage_buffer_materialization(
+               partial_tail_descriptor, tail_resource).valid,
+          "semantic-only partial zero-pad metadata fails closed");
+
+    uint8_t marker_host[2] = {0x34, 0x12};
+    tail_resource.binding = 9;
+    tail_resource.host_data = marker_host;
+    tail_resource.host_data_size = sizeof(marker_host);
+    ShaderResourceTable tail_runtime;
+    tail_runtime.resources.push_back(tail_resource);
+    const DescriptorValidationReport valid_tail_marker =
+        validate_spirv_descriptor_interface(
+            tail_marker_test_spirv(), &tail_runtime, 0, SpirvShaderStage::Compute, false);
+    const SpirvDescriptorBinding* valid_tail_binding =
+        find_spirv_descriptor_binding(valid_tail_marker, 0, 9);
+    CHECK(valid_tail_marker.ok() && valid_tail_binding &&
+          valid_tail_binding->zero_pad_logical_bytes == 2 &&
+          valid_tail_binding->zero_pad_binding_bytes == 4,
+          "strict zero-pad marker reflects one exact read-only constant-index SSBO contract");
+    ShaderResourceTable mismatched_tail_runtime = tail_runtime;
+    mismatched_tail_runtime.resources[0].format = DataFormat::Float16;
+    const DescriptorValidationReport mismatched_tail_marker =
+        validate_spirv_descriptor_interface(
+            tail_marker_test_spirv(), &mismatched_tail_runtime,
+            0, SpirvShaderStage::Compute, false);
+    CHECK(!mismatched_tail_marker.ok() &&
+          has_issue(mismatched_tail_marker, DescriptorIssueCode::InvalidBufferMetadata),
+          "u16 zero-pad marker rejects a runtime Float16 V# instead of inferring semantics");
+
+    auto malformed_tail_marker = tail_marker_test_spirv();
+    emit_string(malformed_tail_marker, 330,
+                "Prosper.StorageBufferZeroPad=0,9,two,4,u16");
+    auto duplicate_tail_marker = tail_marker_test_spirv();
+    emit_string(duplicate_tail_marker, 330,
+                "Prosper.StorageBufferZeroPad=0,9,2,4,u16");
+    auto wrong_binding_tail_marker = tail_marker_test_spirv();
+    emit_string(wrong_binding_tail_marker, 330,
+                "Prosper.StorageBufferZeroPad=0,10,2,4,u16");
+    auto non_ssbo_tail_marker = image_test_spirv();
+    emit_string(non_ssbo_tail_marker, 330,
+                "Prosper.StorageBufferZeroPad=1,4,2,4,u16");
+    auto unknown_semantic_tail_marker = tail_marker_test_spirv();
+    emit_string(unknown_semantic_tail_marker, 330,
+                "Prosper.StorageBufferZeroPad=0,9,2,4,unknown");
+    const auto strict_marker_rejects = [&](const std::vector<uint32_t>& spirv) {
+        const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+            spirv, &tail_runtime, 0, SpirvShaderStage::Compute, false);
+        return !report.ok() && has_issue(report, DescriptorIssueCode::MalformedSpirv);
+    };
+    CHECK(strict_marker_rejects(malformed_tail_marker),
+          "malformed zero-pad marker rejects as malformed SPIR-V");
+    CHECK(strict_marker_rejects(unknown_semantic_tail_marker),
+          "unknown zero-pad semantic token rejects as malformed SPIR-V");
+    CHECK(strict_marker_rejects(duplicate_tail_marker),
+          "duplicate zero-pad marker for one binding rejects as malformed SPIR-V");
+    CHECK(strict_marker_rejects(wrong_binding_tail_marker),
+          "unconsumed zero-pad marker for the wrong binding rejects as malformed SPIR-V");
+    CHECK(strict_marker_rejects(tail_marker_test_spirv(true, false)),
+          "zero-pad marker inconsistent with a writable SSBO rejects as malformed SPIR-V");
+    CHECK(strict_marker_rejects(tail_marker_test_spirv(false, true)),
+          "zero-pad marker inconsistent with a dynamic SSBO access rejects as malformed SPIR-V");
+    CHECK(strict_marker_rejects(non_ssbo_tail_marker),
+          "zero-pad marker inconsistent with a non-SSBO descriptor rejects as malformed SPIR-V");
 
     CHECK(float_to_half(0.0f) == 0x0000u && float_to_half(-0.0f) == 0x8000u &&
           float_to_half(1.0f) == 0x3c00u && float_to_half(-2.0f) == 0xc000u &&

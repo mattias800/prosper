@@ -224,6 +224,11 @@ struct SpirvCompute {
     int32_t guest_scratch_min_byte=0, guest_scratch_saddr=-1;
     uint32_t guest_scratch_dwords=0;
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
+    // A two-byte guest V# can only back our u32 SSBO ABI when every use of that binding is the exact
+    // one-record Uint16/Float16 path. Ordinary load/store/atomic helpers blacklist their bindings;
+    // finish() emits the explicit typed zero-pad contract only for candidates with no competing use.
+    std::map<uint32_t, StorageBufferTailSemantic> cbuf_zero_pad_candidates;
+    std::set<uint32_t> cbuf_ordinary_accesses;
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
     bool     is_vertex=0;                            // true in every vertex shell
     bool     allow_b32_masks=0;                      // proven Wave32 or byte-exact graphics exception
@@ -1676,15 +1681,27 @@ struct SpirvCompute {
     }
     // Load one dword (raw bits) from the constant/vertex buffer at descriptor `binding` at dword index
     // `idx` (SMEM). The 1-arg form keeps the legacy slot convention (0 -> binding 2, 1 -> binding 3).
-    uint32_t cbuf_load(uint32_t idx, uint32_t binding = 2) {
+    uint32_t cbuf_load_impl(uint32_t idx, uint32_t binding) {
         uint32_t buf = buf_for_binding(binding);
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
         uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
+    }
+    uint32_t cbuf_load(uint32_t idx, uint32_t binding = 2) {
+        cbuf_ordinary_accesses.insert(binding);
+        return cbuf_load_impl(idx, binding);
+    }
+    uint32_t cbuf_load_zero_padded_tail(uint32_t binding,
+                                        StorageBufferTailSemantic semantic) {
+        auto [candidate, inserted] = cbuf_zero_pad_candidates.emplace(binding, semantic);
+        if (!inserted && candidate->second != semantic)
+            cbuf_ordinary_accesses.insert(binding);
+        return cbuf_load_impl(uconst(0), binding);
     }
     // Store one dword `value` to the buffer at descriptor `binding` at dword index `idx` (MUBUF store).
     // When `predicated`, the store is wrapped in a selection merge on `pred` (the per-lane EXEC bool) so
     // inactive lanes do not write — a real conditional store, not a select of a loaded old value.
     void cbuf_store(uint32_t idx, uint32_t value, uint32_t binding, bool predicated, uint32_t pred) {
+        cbuf_ordinary_accesses.insert(binding);
         uint32_t buf = buf_for_binding(binding);
         if (!predicated) {
             uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
@@ -1704,6 +1721,7 @@ struct SpirvCompute {
     // clobber VDATA, hence the predicated path joins the old destination through OpPhi.
     uint32_t cbuf_atomic_rtn(uint32_t op, uint32_t idx, uint32_t value, uint32_t binding,
                              bool predicated, uint32_t pred, uint32_t fallback) {
+        cbuf_ordinary_accesses.insert(binding);
         const uint32_t buf = buf_for_binding(binding);
         auto emit = [&]() {
             uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
@@ -2707,6 +2725,18 @@ struct SpirvCompute {
             char marker[64];
             std::snprintf(marker, sizeof marker, "Prosper.FragmentSubgroupSize=%u",
                           fragment_required_subgroup_size);
+            std::vector<uint32_t> words;
+            pstr(words, marker);
+            putv(debug, Op_ModuleProcessed, words);
+        }
+        for (const auto& [binding, semantic] : cbuf_zero_pad_candidates) {
+            if (cbuf_ordinary_accesses.count(binding)) continue;
+            char marker[96];
+            const char* token = semantic == StorageBufferTailSemantic::Uint16 ? "u16" :
+                                semantic == StorageBufferTailSemantic::Float16 ? "f16" : nullptr;
+            if (!token) continue;
+            std::snprintf(marker, sizeof marker, "Prosper.StorageBufferZeroPad=%u,%u,2,4,%s",
+                          desc_set, binding, token);
             std::vector<uint32_t> words;
             pstr(words, marker);
             putv(debug, Op_ModuleProcessed, words);
@@ -8239,6 +8269,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                        // attribute fetch, whose element address is exactly gl_VertexIndex*stride.
             bool instance_vfetch = false;
             bool folded_vfetch = false; // by-fetch V# base already includes OFFSET/SOFFSET
+            const ShaderResource* resolved_buffer = nullptr;
             if (is_format) {
                 // A format load reads a vertex/buffer attribute — it needs the V# descriptor for the
                 // binding, stride, and data format. Resolve SRSRC (src[1]) via provenance: an s_load
@@ -8329,6 +8360,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     ok = false; return true;
                 }
+                resolved_buffer = res;
                 binding = res->binding;
                 stride = res->stride;
                 if (in.fmt == Rdna2Format::MTBUF) {
@@ -8370,6 +8402,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     ok = false; return true;   // unresolvable V# -> reject; NEVER default to binding 2
                 }
+                resolved_buffer = res;
                 binding = res->binding;
                 stride  = res->stride;
                 // fmt stays raw Uint32: untyped ops move raw dwords regardless of the V#'s declared format.
@@ -8412,6 +8445,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // below wrongly rejected as unaligned. Handle it with a runtime byte/halfword extract.
             const bool int_subword = is_format && !raw_subword && (is_uint || is_sint) &&
                                      (comp_bytes == 1 || comp_bytes == 2);
+            const bool zero_soffset =
+                (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+            // Vulkan exposes storage buffers as u32 arrays in Prosper's portable ABI. Admit a two-byte
+            // guest range only for Plucky Squire's exact one-record UINT16/FLOAT16 scalar format fetch:
+            // the original element index itself is checked against zero, the sole load is constant
+            // dword 0, and the host supplies a zero upper half. No raw/store/atomic/offset variant can
+            // inherit this contract.
+            const StorageBufferTailSemantic one_record_tail_semantic = !resolved_buffer
+                ? StorageBufferTailSemantic::None
+                : resolved_buffer->format == DataFormat::Uint16
+                    ? StorageBufferTailSemantic::Uint16
+                    : resolved_buffer->format == DataFormat::Float16
+                        ? StorageBufferTailSemantic::Float16
+                        : StorageBufferTailSemantic::None;
+            const bool one_record_16bit_tail =
+                in.fmt == Rdna2Format::MUBUF && in.opcode == 0u && n == 1u &&
+                one_record_tail_semantic != StorageBufferTailSemantic::None &&
+                resolved_buffer->num_components == 1u && resolved_buffer->stride == 2u &&
+                resolved_buffer->size == 2u && idxen && !offen && offset == 0u && zero_soffset &&
+                !folded_vfetch && in.src[0].kind == OperandKind::VGPR;
             float norm = 0.0f;
             switch (fmt) {
                 case DataFormat::Unorm8:  norm = 255.0f;   break;
@@ -8609,6 +8663,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (is_format && fmt_ncomp && k >= fmt_ncomp) {
                     uint32_t one = fmt_is_int ? 1u : 0x3f800000u;   // integer 1 vs float 1.0 (raw bits)
                     value = b.uconst(in.fmt != Rdna2Format::MTBUF && k == 3 ? one : 0u);
+                } else if (one_record_16bit_tail) {
+                    const uint32_t packed_value = b.cbuf_load_zero_padded_tail(
+                        binding, one_record_tail_semantic);
+                    const uint32_t in_bounds = b.ucmp(
+                        Op_IEqual, val(in.src[0]), b.uconst(0));
+                    const uint32_t typed_value =
+                        one_record_tail_semantic == StorageBufferTailSemantic::Float16
+                            ? b.unpack_half(packed_value, 0)
+                            : b.bfe_u(packed_value, b.uconst(0), b.uconst(16));
+                    value = b.sel(in_bounds, typed_value, b.uconst(0));
                 } else if (raw_subword) {
                     // Raw byte/short loads use their full byte address, unlike typed packed-format
                     // loads whose component packing is descriptor-defined. A 16-bit access may begin

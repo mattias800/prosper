@@ -2,12 +2,14 @@
 #include "shader_resources.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <unordered_map>
 
 namespace prosper::gpu {
@@ -233,6 +235,7 @@ enum : uint32_t {
     OpAtomicFlagClear = 319,
     OpDecorate = 71,
     OpMemberDecorate = 72,
+    OpModuleProcessed = 330,
 };
 enum : uint32_t {
     StorageUniformConstant = 0,
@@ -249,6 +252,59 @@ struct Instruction {
     uint16_t words = 0;
     uint16_t opcode = 0;
 };
+
+struct StorageBufferZeroPadMarker {
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    uint64_t logical_bytes = 0;
+    uint64_t binding_bytes = 0;
+    StorageBufferTailSemantic semantic = StorageBufferTailSemantic::None;
+};
+
+std::string instruction_string(const std::vector<uint32_t>& spirv,
+                               const Instruction& instruction) {
+    std::string value;
+    bool terminated = false;
+    for (uint32_t operand = 0; operand + 1u < instruction.words; ++operand) {
+        const uint32_t packed = spirv[instruction.offset + 1u + operand];
+        for (uint32_t byte = 0; byte < 4; ++byte) {
+            const char c = static_cast<char>(packed >> (byte * 8u));
+            if (!c) {
+                terminated = true;
+                break;
+            }
+            value.push_back(c);
+        }
+        if (terminated) break;
+    }
+    return terminated ? value : std::string{};
+}
+
+bool parse_storage_buffer_zero_pad_marker(const std::string& text,
+                                          StorageBufferZeroPadMarker& marker) {
+    constexpr const char kPrefix[] = "Prosper.StorageBufferZeroPad=";
+    if (!text.starts_with(kPrefix)) return false;
+    const char* cursor = text.data() + sizeof(kPrefix) - 1u;
+    const char* end = text.data() + text.size();
+    auto parse = [&](auto& value, char delimiter) {
+        const auto result = std::from_chars(cursor, end, value);
+        if (result.ec != std::errc{} || result.ptr == cursor) return false;
+        cursor = result.ptr;
+        if (delimiter) {
+            if (cursor == end || *cursor != delimiter) return false;
+            ++cursor;
+        }
+        return true;
+    };
+    if (!parse(marker.set, ',') || !parse(marker.binding, ',') ||
+        !parse(marker.logical_bytes, ',') || !parse(marker.binding_bytes, ','))
+        return false;
+    const std::string_view token(cursor, static_cast<size_t>(end - cursor));
+    if (token == "u16") marker.semantic = StorageBufferTailSemantic::Uint16;
+    else if (token == "f16") marker.semantic = StorageBufferTailSemantic::Float16;
+    else return false;
+    return true;
+}
 
 enum class TypeKind {
     Unknown,
@@ -430,6 +486,64 @@ uint64_t reflection_entry_bytes(const DescriptorReflectionCacheEntry& entry) {
 
 } // namespace
 
+StorageBufferMaterializationPlan plan_storage_buffer_materialization(
+    const SpirvDescriptorBinding& descriptor,
+    const ShaderResource& resource) {
+    StorageBufferMaterializationPlan plan;
+    plan.logical_bytes = resource.size;
+    plan.binding_bytes = resource.size;
+
+    const bool has_logical = descriptor.zero_pad_logical_bytes != 0;
+    const bool has_binding = descriptor.zero_pad_binding_bytes != 0;
+    const bool has_semantic =
+        descriptor.zero_pad_semantic != StorageBufferTailSemantic::None;
+    if (!has_logical && !has_binding && !has_semantic) {
+        plan.valid = true;
+        return plan;
+    }
+    if (!has_logical || !has_binding || !has_semantic) return plan;
+
+    const bool buffer_resource = resource.cls == ResourceClass::ConstantBuffer ||
+                                 resource.cls == ResourceClass::VertexBuffer;
+    const bool semantic_matches =
+        (descriptor.zero_pad_semantic == StorageBufferTailSemantic::Uint16 &&
+         resource.format == DataFormat::Uint16) ||
+        (descriptor.zero_pad_semantic == StorageBufferTailSemantic::Float16 &&
+         resource.format == DataFormat::Float16);
+    if (descriptor.kind != SpirvDescriptorKind::StorageBuffer || !buffer_resource ||
+        !descriptor.readable || descriptor.writable || descriptor.atomic_access ||
+        descriptor.dynamic_access || descriptor.required_bytes != 4u ||
+        descriptor.zero_pad_logical_bytes != 2u ||
+        descriptor.zero_pad_binding_bytes != 4u ||
+        !semantic_matches || resource.num_components != 1u ||
+        resource.stride != 2u || resource.size != 2u)
+        return plan;
+
+    plan.logical_bytes = 2;
+    plan.binding_bytes = 4;
+    plan.semantic = descriptor.zero_pad_semantic;
+    plan.zero_padded_tail = true;
+    plan.valid = true;
+    return plan;
+}
+
+bool materialize_storage_buffer_bytes(
+    const StorageBufferMaterializationPlan& plan,
+    const uint8_t* source,
+    uint64_t source_bytes,
+    uint8_t* destination,
+    uint64_t destination_bytes) {
+    if (!plan.valid || plan.logical_bytes > plan.binding_bytes ||
+        source_bytes < plan.logical_bytes || destination_bytes < plan.binding_bytes ||
+        (plan.logical_bytes && !source) || (plan.binding_bytes && !destination))
+        return false;
+    if (plan.binding_bytes)
+        std::memset(destination, 0, static_cast<size_t>(plan.binding_bytes));
+    if (plan.logical_bytes)
+        std::memcpy(destination, source, static_cast<size_t>(plan.logical_bytes));
+    return true;
+}
+
 bool DescriptorValidationReport::ok() const {
     for (const auto& issue : issues) if (issue.error) return false;
     return true;
@@ -515,6 +629,8 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     std::unordered_map<uint32_t, uint32_t> sets, bindings;
     std::unordered_map<uint32_t, uint64_t> array_strides;
     std::unordered_map<uint64_t, uint64_t> member_offsets;
+    std::map<uint64_t, StorageBufferZeroPadMarker> zero_pad_markers;
+    bool malformed_zero_pad_marker = false;
     auto word = [&](const Instruction& in, uint32_t operand) { return spirv[in.offset + 1u + operand]; };
     for (const Instruction& in : insts) {
         const uint32_t n = in.words - 1u;
@@ -579,10 +695,28 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                 if (n >= 4 && word(in, 2) == DecorationOffset)
                     member_offsets[member_key(word(in, 0), word(in, 1))] = word(in, 3);
                 break;
+            case OpModuleProcessed: {
+                const std::string marker_text = instruction_string(spirv, in);
+                constexpr const char kPrefix[] = "Prosper.StorageBufferZeroPad=";
+                if (!marker_text.starts_with(kPrefix)) break;
+                StorageBufferZeroPadMarker marker;
+                if (!parse_storage_buffer_zero_pad_marker(marker_text, marker) ||
+                    marker.logical_bytes != 2u || marker.binding_bytes != 4u ||
+                    marker.semantic == StorageBufferTailSemantic::None) {
+                    malformed_zero_pad_marker = true;
+                    break;
+                }
+                const uint64_t key = (static_cast<uint64_t>(marker.set) << 32u) |
+                                     marker.binding;
+                if (!zero_pad_markers.emplace(key, marker).second)
+                    malformed_zero_pad_marker = true;
+                break;
+            }
             default:
                 break;
         }
     }
+    if (malformed_zero_pad_marker) add_malformed(report);
     for (auto& [id, type] : types) if (type.kind == TypeKind::Array) {
         auto ci = constants.find(type.count_id);
         if (ci != constants.end() && ci->second <= std::numeric_limits<uint32_t>::max())
@@ -759,6 +893,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         }
     }
 
+    std::set<uint64_t> consumed_zero_pad_markers;
     for (uint32_t var : used_vars) {
         auto si = sets.find(var), bi = bindings.find(var);
         if (si == sets.end() || bi == bindings.end()) { add_malformed(report); continue; }
@@ -775,16 +910,33 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             image_multisampled = image->image_multisampled;
             image_depth = image->image_depth;
         }
-        report.descriptors.push_back({var, si->second, bi->second, descriptor_vars[var], stage,
-                                      required[var], dynamic[var], read_vars.count(var) != 0,
-                                      written_vars.count(var) != 0,
-                                      normalized_sample_vars.count(var) != 0,
-                                      texel_access_vars.count(var) != 0,
-                                      sampled_float_vars.count(var) != 0,
-                                      storage_float_vars.count(var) != 0, image_format, image_dim,
-                                      image_arrayed, image_multisampled, image_depth,
-                                      atomic_vars.count(var) != 0});
+        SpirvDescriptorBinding descriptor{
+            var, si->second, bi->second, descriptor_vars[var], stage,
+            required[var], dynamic[var], read_vars.count(var) != 0,
+            written_vars.count(var) != 0,
+            normalized_sample_vars.count(var) != 0,
+            texel_access_vars.count(var) != 0,
+            sampled_float_vars.count(var) != 0,
+            storage_float_vars.count(var) != 0, image_format, image_dim,
+            image_arrayed, image_multisampled, image_depth,
+            atomic_vars.count(var) != 0};
+        const uint64_t marker_key = (static_cast<uint64_t>(descriptor.set) << 32u) |
+                                    descriptor.binding;
+        if (auto marker = zero_pad_markers.find(marker_key); marker != zero_pad_markers.end()) {
+            if (descriptor.kind != SpirvDescriptorKind::StorageBuffer ||
+                descriptor.required_bytes != 4u || descriptor.dynamic_access ||
+                !descriptor.readable || descriptor.writable || descriptor.atomic_access) {
+                add_malformed(report);
+            } else {
+                descriptor.zero_pad_logical_bytes = marker->second.logical_bytes;
+                descriptor.zero_pad_binding_bytes = marker->second.binding_bytes;
+                descriptor.zero_pad_semantic = marker->second.semantic;
+                consumed_zero_pad_markers.insert(marker_key);
+            }
+        }
+        report.descriptors.push_back(descriptor);
     }
+    if (consumed_zero_pad_markers.size() != zero_pad_markers.size()) add_malformed(report);
     std::sort(report.descriptors.begin(), report.descriptors.end(), [](const auto& a, const auto& b) {
         return a.set != b.set ? a.set < b.set : a.binding < b.binding;
     });
@@ -876,7 +1028,16 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             continue;
         }
         if (d.kind == SpirvDescriptorKind::StorageBuffer) {
-            uint64_t minimum = std::max<uint64_t>(d.required_bytes, 4);
+            const StorageBufferMaterializationPlan materialization =
+                plan_storage_buffer_materialization(d, r);
+            if (!materialization.valid) {
+                report.issues.push_back({DescriptorIssueCode::InvalidBufferMetadata, true, d.set,
+                                         d.binding, d.kind, actual, d.required_bytes, r.size});
+                continue;
+            }
+            const uint64_t minimum = materialization.zero_padded_tail
+                ? materialization.logical_bytes
+                : std::max<uint64_t>(d.required_bytes, 4);
             uint64_t available = r.size;
             if (r.host_data) available = std::min<uint64_t>(available, r.host_data_size);
             if (!null_descriptor && available < minimum)

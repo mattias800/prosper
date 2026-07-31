@@ -157,6 +157,7 @@ struct ShaderResourceCompileKey {
     bool compression_enabled = false;
     uint32_t binding = 0;
     uint32_t stride = 0;
+    uint32_t one_record_tail_semantic = 0;
     uint32_t srt_offset = 0;
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
@@ -336,6 +337,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.compression_enabled);
             hash = hash_mix(hash, resource.binding);
             hash = hash_mix(hash, resource.stride);
+            hash = hash_mix(hash, resource.one_record_tail_semantic);
             hash = hash_mix(hash, resource.srt_offset);
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
@@ -1012,6 +1014,14 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.compression_enabled = storage_image && resource.compression_enabled;
             compiled.binding = resource.binding;
             compiled.stride = resource.stride;
+            const bool one_record_tail = resource.num_components == 1u &&
+                resource.stride == 2u && resource.size == 2u;
+            compiled.one_record_tail_semantic = static_cast<uint32_t>(
+                one_record_tail && resource.format == DataFormat::Uint16
+                    ? StorageBufferTailSemantic::Uint16
+                    : one_record_tail && resource.format == DataFormat::Float16
+                        ? StorageBufferTailSemantic::Float16
+                        : StorageBufferTailSemantic::None);
             compiled.srt_offset = resource.srt_offset;
             compiled.sgpr_base = resource.sgpr_base;
             compiled.fetch_pc = resource.fetch_pc;

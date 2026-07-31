@@ -480,6 +480,46 @@ int main() {
               changed_compute != direct_compute && stats.misses == 2 && stats.hits == 1,
           "compute cache reuses push-constant variants and separates launch-specialized modules");
 
+    // A one-record 16-bit V# emits an explicit index guard and typed tail marker. Keep the cache
+    // partition compact (none/u16/f16), while ensuring a wider range or the sibling conversion can
+    // never reuse that specialized module.
+    clear_shader_recompile_cache();
+    static const uint32_t kTailCompute[] = {
+        0xe0002000u, 0x80020100u, // buffer_load_format_x v1, v0, s[8:11], idxen
+        0xbf810000u,
+    };
+    ShaderResource tail_buffer;
+    tail_buffer.cls = ResourceClass::ConstantBuffer;
+    tail_buffer.format = DataFormat::Uint16;
+    tail_buffer.num_components = 1;
+    tail_buffer.binding = 3;
+    tail_buffer.size = 2;
+    tail_buffer.stride = 2;
+    tail_buffer.sgpr_base = 8;
+    tail_buffer.fetch_pc = 0;
+    ShaderResourceTable tail_table;
+    tail_table.resources.push_back(tail_buffer);
+    ComputeShaderConfig tail_config;
+    tail_config.user_sgprs.resize(12);
+    tail_config.local_x = 64;
+    const auto cached_u16_tail = recompile_compute_shader_cached(
+        kTailCompute, std::size(kTailCompute), &tail_table, tail_config);
+    tail_table.resources[0].size = 4;
+    const auto cached_wide_tail = recompile_compute_shader_cached(
+        kTailCompute, std::size(kTailCompute), &tail_table, tail_config);
+    tail_table.resources[0].size = 2;
+    tail_table.resources[0].format = DataFormat::Float16;
+    const auto cached_f16_tail = recompile_compute_shader_cached(
+        kTailCompute, std::size(kTailCompute), &tail_table, tail_config);
+    tail_table.resources[0].format = DataFormat::Uint16;
+    const auto repeated_u16_tail = recompile_compute_shader_cached(
+        kTailCompute, std::size(kTailCompute), &tail_table, tail_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!cached_u16_tail.empty() && !cached_wide_tail.empty() && !cached_f16_tail.empty() &&
+              cached_u16_tail != cached_wide_tail && cached_u16_tail != cached_f16_tail &&
+              repeated_u16_tail == cached_u16_tail && stats.misses == 3 && stats.hits == 1,
+          "compute cache partitions ordinary/u16/f16 one-record tail semantics exactly");
+
     // Resource descriptor fields that specialize SPIR-V must participate in the cache identity.
     // Storage-image sRGB state changes whether the module declares a native float image or the raw
     // uint-channel fallback, even when the guest code and every binding/provenance field are equal.

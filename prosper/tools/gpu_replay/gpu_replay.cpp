@@ -2186,12 +2186,27 @@ int main(int argc, char** argv) {
                 }
                 break;
         }
+        const prosper::gpu::DescriptorValidationReport retry_contract =
+            prosper::tools::validate_recompiled_failed_stage_contract(
+                stage.stage, spirv, resources);
         std::fprintf(stderr,
-                     "[retry-failed-stage] %s %s resources=%zu spirv-dwords=%zu\n",
+                     "[retry-failed-stage] %s %s resources=%zu spirv-dwords=%zu contract=%s\n",
                      retry_failed_stage_spec.c_str(),
                      spirv.empty() ? "rejected" : "recompiled",
-                     table.resources.size(), spirv.size());
-        if (positional.size() == 1 && !inspect) return spirv.empty() ? 1 : 0;
+                     table.resources.size(), spirv.size(),
+                     retry_contract.ok() ? "accepted" : "rejected");
+        for (const auto& issue : retry_contract.issues) {
+            if (!issue.error) continue;
+            std::fprintf(stderr,
+                         "[retry-failed-stage] contract error=%s set=%u binding=%u "
+                         "required=%llu available=%llu\n",
+                         prosper::gpu::descriptor_issue_name(issue.code), issue.set,
+                         issue.binding,
+                         static_cast<unsigned long long>(issue.required_bytes),
+                         static_cast<unsigned long long>(issue.available_bytes));
+        }
+        if (positional.size() == 1 && !inspect)
+            return spirv.empty() || !retry_contract.ok() ? 1 : 0;
     }
     if (!compute_shader_spec.empty()) {
         char* end = nullptr;
