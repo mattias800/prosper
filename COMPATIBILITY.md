@@ -21,7 +21,7 @@ Last updated: 2026-07-31
 | Terminator (2D)&nbsp;¹ | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay reached (user-verified) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Day One gameplay renders; the manor entrance hall matches the hardware reference |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
-| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Interactive title and save-slot flow; later content load is blocked |
+| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 animated title reached; gameplay is not yet validated |
 | Additional Unity/IL2CPP target | `PPSA02664` | Unity / IL2CPP | 🔬 Exercised, with no published gameplay milestone |
 
 ¹ Exact retail game name pending confirmation.
@@ -203,14 +203,20 @@ individually probed and confirmed as legitimate frustum culls (#1435).
   <img src="assets/screenshots/dragon-quest-vii-title.png" alt="Dragon Quest VII Reimagined — title screen">
 </p>
 
-This Unreal Engine 4 target renders its interactive title screen at native 3840×2160, navigates the
-save-slot menu, and starts the subsequent content-load flow. The current title capture still exposes a
-localization key in place of the localized logo text. Honest offline and signed-out service behavior
-removed the earlier permanent loading-screen gate. The next documented blocker is a MallocBinned3
-heap-corruption failure during menu-driven content loading, so no gameplay milestone is claimed here.
+This Unreal Engine 4 target renders its localized, animated title screen at native 3840×2160. A
+fresh-save current-master run reached it in about 28 seconds with six ordinary Cross pulses; the
+representative image above is an unmodified native frontend capture from that route. The title window
+advanced at roughly 20–22 presented frames per second in that run. Some animation samples still show a
+dark/purple background behind the stable logo, so visual correctness and full-speed performance remain
+open.
 
-The investigation and current blocker are documented in
-[`prosper/docs/DOLL_LOADING_PROGRESSION.md`](prosper/docs/DOLL_LOADING_PROGRESSION.md).
+The apparently permanent black frame in no-input runs is authored UI state, not a lost final composite:
+the complete sky/ocean scene exists underneath an opaque-black Slate background, and the routed input
+changes the foreground lifecycle so the title becomes visible. Older work navigated the save-slot menu
+and began content loading, but that later path has not been revalidated on current master and no gameplay
+milestone is claimed. See the exact route in
+[`prosper/scripts/dragon-quest-vii/README.md`](prosper/scripts/dragon-quest-vii/README.md) and the renderer
+analysis in [`prosper/docs/DRAGON_QUEST_STATUS.md`](prosper/docs/DRAGON_QUEST_STATUS.md).
 
 ## Grand Theft Auto V — `PPSA04263`
 
