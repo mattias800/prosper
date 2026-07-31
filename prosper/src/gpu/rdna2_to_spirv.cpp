@@ -10265,12 +10265,18 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
                 stack_compare.src[0].kind != OperandKind::InlineInt ||
                 stack_compare.src[0].value != 0 ||
                 stack_compare.src[1].kind != OperandKind::SGPR ||
-                stack_compare.src[1].value != 45 ||
+                stack_compare.src[1].value < 0 || stack_compare.src[1].value > 105 ||
                 stack_exit.pc != stack_compare.pc + stack_compare.len_dwords ||
                 stack_exit.fmt != Rdna2Format::SOPP || stack_exit.opcode != 0x04u ||
                 stack_exit.simm16 <= 0 ||
                 !index_by_pc.contains(scalar_branch_target(stack_exit)))
                 return false;
+            // The compiler allocates this scalar stack depth opportunistically (the observed
+            // traversal kernels use both s41 and s45). Derive the physical word from the exact
+            // empty-stack comparison, then require the initializer and every write check below to
+            // agree with it. This broadens only register allocation, not the proven control/data
+            // relationship.
+            const int stack_reg = stack_compare.src[1].value;
             const uint32_t stack_exit_pc = scalar_branch_target(stack_exit);
 
             // The first-iteration selector branch targets the block that initializes all four
@@ -10319,7 +10325,8 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
                     const Rdna2Inst& stack_init = ins[j - 1];
                     if (stack_init.pc + stack_init.len_dwords != selector_init.pc ||
                         stack_init.fmt != Rdna2Format::SOP1 || stack_init.opcode != 0x03u ||
-                        stack_init.dst.kind != OperandKind::SGPR || stack_init.dst.value != 45 ||
+                        stack_init.dst.kind != OperandKind::SGPR ||
+                        stack_init.dst.value != stack_reg ||
                         stack_init.src[0].kind != OperandKind::InlineInt ||
                         stack_init.src[0].value != 0 ||
                         selector_init.fmt != Rdna2Format::SOP1 ||
@@ -10347,7 +10354,8 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
             auto writes_stack = [&](const Rdna2Inst& instruction) {
                 bool writes = false;
                 for_each_scalar_write(instruction, [&](int base, uint32_t width) {
-                    writes |= base <= 45 && 45 < base + static_cast<int>(width);
+                    writes |= base <= stack_reg &&
+                        stack_reg < base + static_cast<int>(width);
                 }, /*proven_wave32_masks*/true);
                 return writes;
             };
@@ -10771,22 +10779,29 @@ bool emit_cfg_state_machine(
         if (reads_dynamic_vector_range) vector_reads[block] = vregs;
     }
 
-    // Wave32 saved masks occupy one physical SGPR and can therefore be replaced by an ordinary
-    // scalar-data lifetime. The dispatcher reloads a statically-shaped register file at every case,
-    // so carry the B32 domain as a compile-time property of each basic-block entry. This is exact
-    // whenever all reachable predecessors agree. A disagreement means that the same word is a mask
-    // on one edge and scalar data on another; keep that genuinely dynamic type join fail-visible.
+    // Wave32 saved masks can be replaced by ordinary scalar-data lifetimes. The dispatcher reloads
+    // a statically-shaped register file at every case, so carry both the one-word B32 mask domain
+    // and B64 saved-mask domain as compile-time properties of each basic-block entry. This is exact
+    // whenever all reachable predecessors agree. A disagreement means that the same physical SGPR
+    // is a mask on one edge and scalar data on another; keep that genuinely dynamic type join
+    // fail-visible.
     //
     // This is deliberately a MUST/equality analysis rather than a union: loading a stale Boolean on
     // the scalar-data edge would be a silent miscompile. Compiler-generated save/restore regions,
     // including Astro Bot's large Wave32 material loop, have identical domains at their joins.
-    const std::set<int> static_b64_mask_keys = static_mask_keys;
     std::vector<std::set<int>> b32_mask_in(starts.size());
     std::vector<std::set<int>> b32_mask_ambiguous_in(starts.size());
+    std::vector<std::set<int>> b64_mask_in(starts.size());
+    std::vector<std::set<int>> b64_mask_ambiguous_in(starts.size());
     std::vector<bool> b32_mask_reachable(starts.size(), false);
     if (b.allow_b32_masks && !starts.empty()) {
         b32_mask_in.front().insert(
             initial.sreg_bool_b32.begin(), initial.sreg_bool_b32.end());
+        for (const auto& mask : initial.sreg_bool) {
+            if (!initial.sreg_bool_b32.contains(mask.first) &&
+                mask.first != 106 && mask.first != 107)
+                b64_mask_in.front().insert(mask.first);
+        }
         // `vcc` is the implicit VCC_LO mask even when no instruction has needed an explicit
         // sreg_bool[106] alias yet. Preserve that valid entry lifetime in the same physical-domain
         // analysis as explicit Wave32 masks. A zero SSA id instead means the caller currently has
@@ -10824,6 +10839,8 @@ bool emit_cfg_state_machine(
             pending.pop_back();
             std::set<int> masks = b32_mask_in[block];
             std::set<int> ambiguous = b32_mask_ambiguous_in[block];
+            std::set<int> b64_masks = b64_mask_in[block];
+            std::set<int> b64_ambiguous = b64_mask_ambiguous_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
@@ -10847,9 +10864,12 @@ bool emit_cfg_state_machine(
                 bool reads_ambiguous = false;
                 for (uint32_t source = 0; source < in.n_src; ++source) {
                     if ((in.src[source].kind == OperandKind::SGPR ||
-                         in.src[source].kind == OperandKind::Special) &&
-                        ambiguous.contains(in.src[source].value))
-                        reads_ambiguous = true;
+                         in.src[source].kind == OperandKind::Special)) {
+                        const int reg = in.src[source].value;
+                        reads_ambiguous |= ambiguous.contains(reg);
+                        for (int base : b64_ambiguous)
+                            reads_ambiguous |= reg == base || reg == base + 1;
+                    }
                 }
                 if (in.fmt == Rdna2Format::SOPP &&
                     (in.opcode == 0x06 || in.opcode == 0x07) &&
@@ -10865,28 +10885,28 @@ bool emit_cfg_state_machine(
                 }
 
                 bool writes_b32_mask = false;
+                auto register_mask = [&](const Operand& source) {
+                    return source.value == 126 || source.value == 127 ||
+                        ((source.kind == OperandKind::SGPR ||
+                          source.kind == OperandKind::Special) &&
+                         (masks.contains(source.value) ||
+                          b64_masks.contains(source.value)));
+                };
+                auto source_mask = [&](const Operand& source) {
+                    return register_mask(source) || source.kind == OperandKind::InlineInt;
+                };
                 if (in.fmt == Rdna2Format::SOP1 &&
                     (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
                      in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) {
-                    const bool source_mask = in.src[0].value == 126 ||
-                        ((in.src[0].kind == OperandKind::SGPR ||
-                          in.src[0].kind == OperandKind::Special) &&
-                         (masks.contains(in.src[0].value) ||
-                          static_b64_mask_keys.contains(in.src[0].value))) ||
+                    const bool source_is_mask = register_mask(in.src[0]) ||
                         (in.dst.value == 126 && in.src[0].kind == OperandKind::InlineInt);
-                    writes_b32_mask = source_mask && in.dst.value != 127 &&
+                    writes_b32_mask = source_is_mask && in.dst.value != 127 &&
                         ((in.opcode != 0x3c && in.opcode != 0x40 && in.opcode != 0x44) ||
                          in.dst.value != 126);
                 }
                 if (in.fmt == Rdna2Format::SOP2 &&
                     (in.opcode == 0x0a || (in.opcode >= 0x0e &&
                                            in.opcode <= 0x1c && (in.opcode & 1u) == 0))) {
-                    auto source_mask = [&](const Operand& source) {
-                        return source.value == 126 || masks.contains(source.value) ||
-                            (source.kind == OperandKind::SGPR &&
-                             static_b64_mask_keys.contains(source.value)) ||
-                            source.kind == OperandKind::InlineInt;
-                    };
                     const bool mask_domain = in.dst.value == 126 || in.src[0].value == 126 ||
                         in.src[1].value == 126 ||
                         (((in.src[0].kind == OperandKind::SGPR ||
@@ -10903,17 +10923,59 @@ bool emit_cfg_state_machine(
                 if (in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x128 &&
                     in.opcode <= 0x12a && in.sdst.kind == OperandKind::SGPR) {
                     const Operand& carry_in = in.src[2];
-                    const bool source_mask =
-                        ((carry_in.kind == OperandKind::SGPR ||
-                          carry_in.kind == OperandKind::Special) &&
-                         (masks.contains(carry_in.value) ||
-                          static_b64_mask_keys.contains(carry_in.value)));
-                    if (source_mask) b32_write_reg = in.sdst.value;
+                    if (register_mask(carry_in)) b32_write_reg = in.sdst.value;
                 }
+
+                // B64 mask-shaped instructions are not sufficient to prove a live mask lifetime:
+                // s_mov_b64 and the logical family also move ordinary 64-bit scalar data. Require
+                // their sources to be masks in the current path state. Saveexec always writes OLD
+                // EXEC to its explicit destination, while BFM and VOP3B construct fresh masks.
+                bool writes_b64_mask = false;
+                if (in.fmt == Rdna2Format::SOP1 && in.dst.value <= 105) {
+                    if (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a)
+                        writes_b64_mask = source_mask(in.src[0]);
+                    else if ((in.opcode >= 0x24 && in.opcode <= 0x2b) ||
+                             in.opcode == 0x37 || in.opcode == 0x38)
+                        writes_b64_mask = true;
+                }
+                if (in.fmt == Rdna2Format::SOP2 && in.dst.value <= 105) {
+                    if (in.opcode == 0x25)
+                        writes_b64_mask = true;
+                    else if (in.opcode == 0x0b ||
+                             (in.opcode >= 0x0f && in.opcode <= 0x1d &&
+                              (in.opcode & 1u) == 1))
+                        writes_b64_mask = source_mask(in.src[0]) && source_mask(in.src[1]);
+                }
+                const bool vop3_b32_carry = in.fmt == Rdna2Format::VOP3 &&
+                    in.opcode >= 0x128 && in.opcode <= 0x12a;
+                // rdna2_decode populates `sdst` only for its explicit ten-opcode VOP3B whitelist:
+                // add/sub carry, div-scale flag, and 64-bit multiply-add carry outputs. Each SDST
+                // is a per-lane scalar mask/flag; ordinary VOP3A scalar data never appears here
+                // (v_readlane uses `dst`, not `sdst`).
+                if (in.fmt == Rdna2Format::VOP3 && !vop3_b32_carry &&
+                    in.sdst.kind == OperandKind::SGPR && in.sdst.value <= 105)
+                    writes_b64_mask = true;
+                int b64_write_reg = writes_b64_mask ?
+                    (in.fmt == Rdna2Format::VOP3 ? in.sdst.value : in.dst.value) : -1;
+
+                auto erase_b64_overlapping = [&](int base, uint32_t width) {
+                    auto erase = [&](std::set<int>& values) {
+                        for (auto it = values.begin(); it != values.end();) {
+                            const int mask_base = *it;
+                            if (base < mask_base + 2 && mask_base < base + static_cast<int>(width))
+                                it = values.erase(it);
+                            else
+                                ++it;
+                        }
+                    };
+                    erase(b64_masks);
+                    erase(b64_ambiguous);
+                };
 
                 for_each_scalar_write(in, [&](int base, uint32_t width) {
                     const bool one_word_write = base == b32_write_reg;
                     const uint32_t effective_width = one_word_write ? 1u : width;
+                    erase_b64_overlapping(base, effective_width);
                     for (uint32_t word = 0; word < effective_width; ++word) {
                         const int reg = base + static_cast<int>(word);
                         if (!one_word_write || reg != b32_write_reg) {
@@ -10927,10 +10989,20 @@ bool emit_cfg_state_machine(
                     }
                 }, proven_wave32_masks);
 
+                if (b64_write_reg >= 0) {
+                    for (int word = 0; word < 2; ++word) {
+                        masks.erase(b64_write_reg + word);
+                        ambiguous.erase(b64_write_reg + word);
+                    }
+                    b64_masks.insert(b64_write_reg);
+                    b64_ambiguous.erase(b64_write_reg);
+                }
+
                 // Every non-CMPX VOPC destination is a one-word mask in proven Wave32, including
                 // explicit ordinary SGPRs. CMPX writes EXEC only and establishes no VCC lifetime.
                 if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) {
                     const int destination = in.dst.kind == OperandKind::SGPR ? in.dst.value : 106;
+                    erase_b64_overlapping(destination, 1);
                     masks.insert(destination);
                     ambiguous.erase(destination);
                 }
@@ -10941,6 +11013,8 @@ bool emit_cfg_state_machine(
                     b32_mask_reachable[successor] = true;
                     b32_mask_in[successor] = masks;
                     b32_mask_ambiguous_in[successor] = ambiguous;
+                    b64_mask_in[successor] = b64_masks;
+                    b64_mask_ambiguous_in[successor] = b64_ambiguous;
                     pending.push_back(successor);
                 } else {
                     std::set<int> joined_masks;
@@ -10955,10 +11029,27 @@ bool emit_cfg_state_machine(
                         if (!b32_mask_in[successor].contains(reg)) joined_ambiguous.insert(reg);
                     joined_ambiguous.insert(ambiguous.begin(), ambiguous.end());
                     for (int reg : joined_ambiguous) joined_masks.erase(reg);
+                    std::set<int> joined_b64_masks;
+                    std::set<int> joined_b64_ambiguous = b64_mask_ambiguous_in[successor];
+                    std::set_intersection(
+                        b64_mask_in[successor].begin(), b64_mask_in[successor].end(),
+                        b64_masks.begin(), b64_masks.end(),
+                        std::inserter(joined_b64_masks, joined_b64_masks.end()));
+                    for (int reg : b64_mask_in[successor])
+                        if (!b64_masks.contains(reg)) joined_b64_ambiguous.insert(reg);
+                    for (int reg : b64_masks)
+                        if (!b64_mask_in[successor].contains(reg)) joined_b64_ambiguous.insert(reg);
+                    joined_b64_ambiguous.insert(
+                        b64_ambiguous.begin(), b64_ambiguous.end());
+                    for (int reg : joined_b64_ambiguous) joined_b64_masks.erase(reg);
                     if (joined_masks != b32_mask_in[successor] ||
-                        joined_ambiguous != b32_mask_ambiguous_in[successor]) {
+                        joined_ambiguous != b32_mask_ambiguous_in[successor] ||
+                        joined_b64_masks != b64_mask_in[successor] ||
+                        joined_b64_ambiguous != b64_mask_ambiguous_in[successor]) {
                         b32_mask_in[successor] = std::move(joined_masks);
                         b32_mask_ambiguous_in[successor] = std::move(joined_ambiguous);
+                        b64_mask_in[successor] = std::move(joined_b64_masks);
+                        b64_mask_ambiguous_in[successor] = std::move(joined_b64_ambiguous);
                         pending.push_back(successor);
                     }
                 }
@@ -10967,6 +11058,9 @@ bool emit_cfg_state_machine(
         for (const auto& masks : b32_mask_in)
             for (int reg : masks)
                 if (reg <= 107) static_mask_keys.insert(reg);
+        for (const auto& masks : b64_mask_in)
+            for (int reg : masks)
+                if (reg <= 105) static_mask_keys.insert(reg);
     }
 
     std::vector<std::unordered_set<int>> scalar_may_write_in(starts.size());
@@ -11225,12 +11319,22 @@ bool emit_cfg_state_machine(
         }
         for (const auto& kv : sv) state.sreg[kv.first] = b.load_function(b.t_u32, kv.second);
         const std::set<int>* entry_b32 = nullptr;
-        if (dispatch != UINT32_MAX && b.allow_b32_masks) {
-            const uint32_t entry_block = dispatch_blocks[dispatch].front();
-            if (b32_mask_reachable[entry_block]) entry_b32 = &b32_mask_in[entry_block];
+        const std::set<int>* entry_b64 = nullptr;
+        if (b.allow_b32_masks) {
+            uint32_t entry_block = UINT32_MAX;
+            if (dispatch != UINT32_MAX)
+                entry_block = dispatch_blocks[dispatch].front();
+            else if (const auto terminal = block_for_pc.find(end_pc);
+                     terminal != block_for_pc.end())
+                entry_block = terminal->second;
+            if (entry_block != UINT32_MAX && b32_mask_reachable[entry_block]) {
+                entry_b32 = &b32_mask_in[entry_block];
+                entry_b64 = &b64_mask_in[entry_block];
+            }
         }
         for (const auto& kv : mv) {
-            if (!static_b64_mask_keys.contains(kv.first) &&
+            if (b.allow_b32_masks &&
+                (!entry_b64 || !entry_b64->contains(kv.first)) &&
                 (!entry_b32 || !entry_b32->contains(kv.first)))
                 continue;
             state.sreg_bool[kv.first] = b.load_function(b.t_bool, kv.second);
