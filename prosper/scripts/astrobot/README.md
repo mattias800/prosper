@@ -14,6 +14,22 @@ GAME: Level has started: intro_next
 PLAY: SubLevelLocator sublevel_locator_hub [hub_crashsite_tutorial], state changed 1->4
 ```
 
+### Route pacing is frontend-sensitive
+
+`reach-first-level.pad` mixes wall-time pulses (60-96 s) with flip-anchored pulses at `f3800`+. Under
+`boot_trace` the wall-time pulses are all spent by 96 s while the run is only near frame 1100, so
+`f3800` is never reached and the guest stalls at `title_controller_ship`. That route is calibrated for
+a frontend that flips far more slowly per wall-second than headless `boot_trace` does.
+
+To reach the **world map** under `boot_trace`, use a flip-anchored route in the f730-960 window
+instead; that is the pacing the retained world-map captures were produced with. Check
+`PROSPER_PAD_SCRIPT_LOG=1` output against the observed frame counter before assuming a route applies
+to a new frontend.
+
+`boot_trace` also writes a 3840x2160 BMP per sampled frame by default (`dump=1`), which reaches
+gigabytes over a multi-minute route. Set `PROSPER_NO_FRAME_DUMPS=1` for capture runs that only need
+the `.prgbundle`.
+
 ## Captures
 
 These are unmodified frontend captures from the documented routes. The incomplete rendering is
