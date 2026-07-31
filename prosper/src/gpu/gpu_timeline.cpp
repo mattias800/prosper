@@ -539,6 +539,11 @@ RuntimeDetailRequest& runtime_detail_request() {
     return request;
 }
 
+bool runtime_detail_request_is_after_compute_gated() {
+    const RuntimeDetailRequest& request = runtime_detail_request();
+    return request.valid && request.select_after_compute_program != 0;
+}
+
 struct RuntimeTargetWrite {
     uint64_t submit_no = 0;
     uint64_t draw_index = 0;
@@ -707,6 +712,11 @@ RuntimeProducerHistory& runtime_producer_history() {
 }
 
 struct RuntimeCaptureBundle {
+    struct BoundaryDs {
+        uint64_t submit_no = 0;
+        uint64_t bytes = 0;
+        std::vector<GpuCaptureDsSeed> seeds;
+    };
     GpuCaptureBundle bundle;
     bool budget_exhausted = false;
     bool failed = false;
@@ -714,6 +724,8 @@ struct RuntimeCaptureBundle {
     std::chrono::steady_clock::time_point started_at;
     uint64_t captured_resource_bytes = 0;
     uint64_t captured_submit_count = 0;
+    uint64_t boundary_ds_bytes = 0;
+    std::deque<BoundaryDs> boundary_ds;
     GpuTimelineBundleProvenanceState provenance;
 };
 
@@ -956,11 +968,97 @@ bool append_runtime_capture_bundle(const GpuCaptureFile& capture, uint64_t max_u
 }
 
 void trim_runtime_capture_bundle(size_t max_submits) {
-    GpuCaptureBundle& bundle = runtime_capture_bundle().bundle;
+    RuntimeCaptureBundle& state = runtime_capture_bundle();
+    GpuCaptureBundle& bundle = state.bundle;
     while (bundle.submits.size() > max_submits) {
+        const uint64_t removed_submit = bundle.submits.front().submit_index;
         bundle.logical_bytes -= bundle.submits.front().logical_bytes;
         bundle.submits.erase(bundle.submits.begin());
+        if (!state.boundary_ds.empty() && state.boundary_ds.front().submit_no == removed_submit) {
+            state.boundary_ds_bytes -= state.boundary_ds.front().bytes;
+            state.boundary_ds.pop_front();
+        }
     }
+}
+
+bool capture_metadata_only(const GpuCaptureFile& capture) {
+    return std::any_of(
+        capture.metadata.renderer_env.begin(), capture.metadata.renderer_env.end(),
+        [](const auto& entry) {
+            return entry.first == "PROSPER_GPU_CAPTURE_METADATA_ONLY" &&
+                   !entry.second.empty() && entry.second != "0" && entry.second != "off";
+        });
+}
+
+bool snapshot_runtime_bundle_boundary_ds(const GpuCaptureFile& capture, uint64_t submit_no,
+                                         uint64_t max_bytes,
+                                         RuntimeCaptureBundle::BoundaryDs& boundary,
+                                         std::string& error) {
+    boundary = {};
+    boundary.submit_no = submit_no;
+    if (capture_metadata_only(capture) || !gpu_capture_ds_seed_snapshot_available()) return true;
+    if (!read_all_gpu_capture_ds_seeds(boundary.seeds, error)) return false;
+    for (const auto& seed : boundary.seeds) {
+        const uint64_t bytes = seed.depth.size() + seed.stencil.size();
+        if (boundary.bytes > UINT64_MAX - bytes) {
+            error = "phase-bundle DS boundary size overflow";
+            return false;
+        }
+        boundary.bytes += bytes;
+    }
+    const RuntimeCaptureBundle& state = runtime_capture_bundle();
+    if (boundary.bytes > max_bytes || state.boundary_ds_bytes > max_bytes - boundary.bytes) {
+        error = "phase-bundle DS boundaries exceed the capture byte budget";
+        return false;
+    }
+    return true;
+}
+
+bool install_runtime_bundle_boundary_ds(std::string& error) {
+    RuntimeCaptureBundle& state = runtime_capture_bundle();
+    if (state.bundle.submits.empty() || state.boundary_ds.empty()) return true;
+    if (state.bundle.submits.front().submit_index != state.boundary_ds.front().submit_no) {
+        error = "phase-bundle DS boundary does not match its first retained submit";
+        return false;
+    }
+    return replace_gpu_capture_bundle_submit_ds_seeds(
+        state.bundle, 0, state.boundary_ds.front().seeds, error);
+}
+
+bool runtime_capture_bundle_within_budget(uint64_t max_unique_bytes, std::string& error) {
+    RuntimeCaptureBundle& state = runtime_capture_bundle();
+    const uint64_t unique_bytes = gpu_capture_bundle_unique_bytes(state.bundle);
+    if (unique_bytes <= max_unique_bytes) return true;
+    state.budget_exhausted = true;
+    error = "capture bundle unique bytes " + std::to_string(unique_bytes) +
+            " exceeded limit " + std::to_string(max_unique_bytes) +
+            " after installing the DS boundary";
+    return false;
+}
+
+bool write_runtime_capture_bundle_checkpoint(const std::string& path,
+                                             uint64_t max_unique_bytes,
+                                             std::string& error) {
+    RuntimeCaptureBundle& state = runtime_capture_bundle();
+    const bool has_boundary = !state.bundle.submits.empty() && !state.boundary_ds.empty();
+    if (!install_runtime_bundle_boundary_ds(error) ||
+        !compact_gpu_capture_bundle(state.bundle, error))
+        return false;
+    const bool written = runtime_capture_bundle_within_budget(max_unique_bytes, error) &&
+        write_gpu_capture_bundle(path, state.bundle, error);
+    const std::string write_error = error;
+    if (!has_boundary) return written;
+    std::string restore_error;
+    const bool restored = replace_gpu_capture_bundle_submit_ds_seeds(
+        state.bundle, 0, {}, restore_error) &&
+        compact_gpu_capture_bundle(state.bundle, restore_error);
+    if (!restored) {
+        error = "could not restore rolling bundle after DS checkpoint: " + restore_error;
+        state.failed = true;
+        return false;
+    }
+    if (!written) error = write_error;
+    return written;
 }
 
 GpuCaptureMetadata runtime_capture_metadata(uint64_t submit_no) {
@@ -1018,6 +1116,10 @@ void log_capture_detail(const GpuTimelineDetail& detail) {
 }
 
 } // namespace
+
+bool gpu_timeline_capture_is_after_compute_gated() {
+    return runtime_detail_request_is_after_compute_gated();
+}
 
 GpuTimelineCaptureCounters gpu_timeline_capture_counters() {
     const RuntimeDetailRequest& request = runtime_detail_request();
@@ -2064,16 +2166,26 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
         submit_no >= bundle_first &&
         (!request.bundle_start_target_width || request.bundle_start_reached) &&
         !capture_endpoint) {
+        // Semantic endpoints are not known until they arrive. Keep the rolling predecessor window
+        // at depth-2 before appending this submit, so its exact pre-submit DS snapshot can become the
+        // boundary if older constituents roll out.
+        if (request.semantic_selector)
+            trim_runtime_capture_bundle(request.bundle_depth - 2);
         begin_runtime_capture_bundle();
         GpuCaptureFile predecessor;
         const GpuCaptureMetadata metadata = runtime_capture_metadata(submit_no);
-        const bool captured = request.bundle_target_width
+        bool captured = request.bundle_target_width
             ? capture_gpustate_target_submit(state, submit_no, metadata.width, metadata.height,
                                              request.bundle_target_width, request.bundle_target_height,
                                              metadata, predecessor, error)
             : capture_gpustate_submit(state, submit_no, metadata.width, metadata.height,
                                       metadata, predecessor, error);
         RuntimeCaptureBundle& bundle_state = runtime_capture_bundle();
+        RuntimeCaptureBundle::BoundaryDs boundary_ds;
+        if (captured && history.phase_bounded &&
+            !snapshot_runtime_bundle_boundary_ds(
+                predecessor, submit_no, request.bundle_max_unique_bytes, boundary_ds, error))
+            captured = false;
         const bool provenance_was_complete = bundle_state.provenance.complete;
         if (captured && history.phase_bounded) {
             std::string provenance_error;
@@ -2099,13 +2211,16 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
             std::fprintf(stderr, "[timeline] bundle submit %llu capture failed: %s\n",
                          static_cast<unsigned long long>(submit_no), error.c_str());
         } else {
-            if (request.semantic_selector)
-                trim_runtime_capture_bundle(request.bundle_depth - 1);
+            if (history.phase_bounded) {
+                bundle_state.boundary_ds_bytes += boundary_ds.bytes;
+                bundle_state.boundary_ds.push_back(std::move(boundary_ds));
+            }
             ++bundle_state.captured_submit_count;
             request.bundle_submits_captured.fetch_add(1, std::memory_order_relaxed);
             if (request.bundle_checkpoint_interval &&
                 !(bundle_state.captured_submit_count % request.bundle_checkpoint_interval)) {
-                if (!write_gpu_capture_bundle(request.bundle_path, bundle_state.bundle, error)) {
+                if (!write_runtime_capture_bundle_checkpoint(
+                        request.bundle_path, request.bundle_max_unique_bytes, error)) {
                     std::fprintf(stderr,
                                  "[timeline] capture bundle checkpoint at submit %llu failed: %s\n",
                                  static_cast<unsigned long long>(submit_no), error.c_str());
@@ -2367,9 +2482,29 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
         } else if (state.budget_exhausted) {
             error = "capture bundle unique-byte budget was exhausted before the selected submit";
         }
-        if (state.failed || state.budget_exhausted || !append_runtime_capture_bundle(
-                capture, request.bundle_max_unique_bytes, error) ||
+        const bool phase_bundle = history.phase_bounded;
+        std::vector<GpuCaptureDsSeed> standalone_ds;
+        RuntimeCaptureBundle::BoundaryDs endpoint_boundary;
+        bool endpoint_boundary_ok = true;
+        if (phase_bundle) {
+            standalone_ds = std::move(capture.ds_seeds);
+            endpoint_boundary.submit_no = submit_no;
+            if (state.boundary_ds.empty())
+                endpoint_boundary_ok = snapshot_runtime_bundle_boundary_ds(
+                    capture, submit_no, request.bundle_max_unique_bytes,
+                    endpoint_boundary, error);
+        }
+        const bool appended = !state.failed && !state.budget_exhausted &&
+            endpoint_boundary_ok && append_runtime_capture_bundle(
+                capture, request.bundle_max_unique_bytes, error);
+        if (phase_bundle) capture.ds_seeds = std::move(standalone_ds);
+        if (appended && phase_bundle) {
+            state.boundary_ds_bytes += endpoint_boundary.bytes;
+            state.boundary_ds.push_back(std::move(endpoint_boundary));
+        }
+        if (!appended || !install_runtime_bundle_boundary_ds(error) ||
             !compact_gpu_capture_bundle(bundle, error) ||
+            !runtime_capture_bundle_within_budget(request.bundle_max_unique_bytes, error) ||
             !write_gpu_capture_bundle(request.bundle_path, bundle, error)) {
             requested_artifacts_written = false;
             std::fprintf(stderr, "[timeline] capture bundle write failed: %s\n", error.c_str());

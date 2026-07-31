@@ -52,6 +52,11 @@ bool materialize_gpu_capture_bundle_manifest(const GpuCaptureBundle& bundle, siz
                                              GpuCaptureFile& capture, std::string& error);
 bool materialize_gpu_capture_bundle_submit(const GpuCaptureBundle& bundle, size_t submit_index,
                                            GpuCaptureFile& capture, std::string& error);
+// Replace only one submit manifest's depth/stencil boundary. Resource dictionary references stay
+// intact; callers may compact afterward to discard the superseded manifest chunks.
+bool replace_gpu_capture_bundle_submit_ds_seeds(
+    GpuCaptureBundle& bundle, size_t submit_index,
+    const std::vector<GpuCaptureDsSeed>& ds_seeds, std::string& error);
 bool compact_gpu_capture_bundle(GpuCaptureBundle& bundle, std::string& error);
 bool write_gpu_capture_bundle(const std::string& path, const GpuCaptureBundle& bundle,
                               std::string& error);

@@ -388,6 +388,10 @@ if(TARGET prosper_core)
   target_include_directories(test_readback_policy PRIVATE frontends/shared)
   add_test(NAME readback_policy COMMAND test_readback_policy)
 
+  add_executable(test_capture_renderer_policy frontends/shared/test_capture_renderer_policy.cpp)
+  target_include_directories(test_capture_renderer_policy PRIVATE frontends/shared)
+  add_test(NAME capture_renderer_policy COMMAND test_capture_renderer_policy)
+
   add_executable(test_write_watch_policy frontends/shared/test_write_watch_policy.cpp)
   target_include_directories(test_write_watch_policy PRIVATE frontends/shared)
   add_test(NAME write_watch_policy COMMAND test_write_watch_policy)
