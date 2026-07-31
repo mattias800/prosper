@@ -3359,6 +3359,17 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             if (!any) fprintf(stderr, " none");
             fprintf(stderr, "\n");
         }
+        // A stage pointer may carry aperture/tag bits above the title's usable GPU VA, exactly as the
+        // scalar fold's S_LOAD canonicalization assumes. Accept a dword pair as a pointer when the
+        // raw 64-bit value or either canonical form is mapped, so a tagged-but-valid table pointer is
+        // never reported as unmapped.
+        const auto pointer_is_mapped = [](uint64_t value) {
+            for (uint64_t mask : {~uint64_t{0}, uint64_t{0xFFFFFFFFFFFF}, uint64_t{0xFFFFFFFFFF}}) {
+                const uint64_t candidate = value & mask;
+                if (candidate > 0x10000 && guest_readable(candidate, 8)) return true;
+            }
+            return false;
+        };
         if (const AgcShaderUserData* ud = hdr->user_data) {
             uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
             fprintf(stderr, "[udmap] %s code=0x%llx declared direct:",
@@ -3370,7 +3381,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     (uint64_t)sgprs[off] | ((uint64_t)sgprs[off + 1] << 32);
                 fprintf(stderr, " [%u]@dw%u=0x%llx(%s)", t, off,
                         (unsigned long long)candidate,
-                        guest_readable(candidate, 8) ? "readable" : "UNMAPPED");
+                        pointer_is_mapped(candidate) ? "readable" : "UNMAPPED");
             }
             // Self-validating half: search the 32-dword window for the ONE seed offset at which
             // EVERY declared direct pointer becomes a mapped guest address. If that offset equals
@@ -3391,7 +3402,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     if (off + 1 >= kUserSgprs) { all_mapped = false; break; }
                     const uint64_t value =
                         (uint64_t)probe[off] | ((uint64_t)probe[off + 1] << 32);
-                    all_mapped = value > 0x10000 && guest_readable(value, 8);
+                    all_mapped = pointer_is_mapped(value);
                 }
                 if (all_mapped) { implied = seed; break; }
             }
