@@ -1,9 +1,10 @@
 # Dragon Quest VII Reimagined — skip the startup sequence and idle at the title.
-# These are the six point pulses used by the original title-screen capture and
-# revalidated from a fresh save on current master. No input is sent after 18 s.
+# A genuinely isolated console needs the seventh pulse after the post-logo
+# authored-black state. No input is sent after 30 s so the title can idle.
 3:cross
 6:cross
 9:cross
 12:cross
 15:cross
 18:cross
+30:cross

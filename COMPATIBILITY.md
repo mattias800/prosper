@@ -204,17 +204,19 @@ individually probed and confirmed as legitimate frustum culls (#1435).
 </p>
 
 This Unreal Engine 4 target renders its localized, animated title screen at native 3840×2160. A
-fresh-save current-master run reached it in about 28 seconds with six ordinary Cross pulses; the
-representative image above is an unmodified native frontend capture from that route. The title window
-advanced at roughly 20–22 presented frames per second in that run. Some animation samples still show a
-dark/purple background behind the stable logo, so visual correctness and full-speed performance remain
-open.
+current-master run with unique roots for both save backends reached it in about 34 seconds with seven
+ordinary Cross pulses; the representative image above is an unmodified native frontend capture of the
+same validated title state. Title performance remains below full speed and varies with concurrent GPU work. Some
+animation samples still show a dark/purple background behind the stable logo, so visual correctness and
+full-speed performance remain open.
 
 The apparently permanent black frame in no-input runs is authored UI state, not a lost final composite:
 the complete sky/ocean scene exists underneath an opaque-black Slate background, and the routed input
 changes the foreground lifecycle so the title becomes visible. Older work navigated the save-slot menu
-and began content loading, but that later path has not been revalidated on current master and no gameplay
-milestone is claimed. See the exact route in
+and began content loading. A current isolated run now reaches the new-save name keyboard and remains
+alive there without the historical allocator failure. A focused probe confirmed that the post-title
+flow advanced the highlighted unused slot with Circle, while Cross did not advance and behaved as
+cancel. A complete corrected route and gameplay are still unvalidated. See the exact title route in
 [`prosper/scripts/dragon-quest-vii/README.md`](prosper/scripts/dragon-quest-vii/README.md) and the renderer
 analysis in [`prosper/docs/DRAGON_QUEST_STATUS.md`](prosper/docs/DRAGON_QUEST_STATUS.md).
 

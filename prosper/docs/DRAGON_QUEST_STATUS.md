@@ -1,9 +1,17 @@
 # Dragon Quest VII Reimagined (`PPSA17942`) — title-screen status
 
 **Status as of 2026-07-31.** Current master reaches the localized, animated title screen at native
-3840x2160 from a fresh save. The validated route sends six Cross pulses at 3, 6, 9, 12, 15, and 18
-seconds; the title first appeared at about 28 seconds and remained animated through the 40-second
-capture. Bring-up ladder rung: **2 (title screen rendered)**. Gameplay has not been validated.
+3840x2160 from a genuinely isolated save. The validated route sends seven Cross pulses at 3, 6, 9,
+12, 15, 18, and 30 seconds; the title first appeared at about 34 seconds and remained animated through
+the 40-second capture. Bring-up ladder rung: **2 (title screen rendered)**. Gameplay has not been
+validated.
+
+Extended clean runs also reach the new-save name keyboard and remain alive through at least 262 seconds
+without the historical MallocBinned3 failure. A focused control probe established that these post-title
+menus advance differently: Circle advanced the highlighted unused adventure slot to the normal “Which
+slot would you like to use?” prompt, while Cross did not advance and behaved as cancel in the probed
+flow. A complete corrected route has not yet been validated, so save creation and gameplay remain
+unproven; the name-entry screen is not a gameplay milestone.
 
 The same build can remain black after the startup sequence when run with **no input**. That is authored
 Slate state, not a lost final composite: current-master operation-prefix replay shows a coherent
@@ -18,15 +26,17 @@ by #1486; the earlier recompiler gap was fixed by #1483.
 
 ## Reproduction recipe
 
-Direct native Vulkan frontend capture, no diagnostic substitution. Run from `prosper/` with a fresh
-save root. In the recipe, `<EVIDENCE_ROOT>` is a unique directory created under `$HOME`; substitute
-its absolute path before running the command so screenshots stay outside the worktree and `/tmp`.
+Direct native Vulkan frontend capture, no diagnostic substitution. Run from `prosper/` with unique
+save roots under `$HOME`. In the recipe, `<EVIDENCE_ROOT>` and `<FRESH_SAVE_ROOT>` are unique
+directories created under `$HOME`; substitute their absolute paths before running the command so
+screenshots and both save backends stay outside the worktree and `/tmp`.
 
 ```bash
 PROSPER_GUEST_FS=1 \
 PROSPER_NULL_PAGE=1 \
 PROSPER_GUEST_ARGS= \
-PROSPER_SAVEDATA_DIR=<FRESH_SAVE_ROOT> \
+PROSPER_SAVE0=<FRESH_SAVE_ROOT>/save0 \
+PROSPER_SAVEDATA_DIR=<FRESH_SAVE_ROOT>/savedata \
 PROSPER_PAD_SCRIPT=@scripts/dragon-quest-vii/reach-title-screen.pad \
 PROSPER_PAD_SCRIPT_LOG=1 \
 ./build-linux/screenshot <DUMP_ROOT>/PPSA17942-app0 \
@@ -38,16 +48,16 @@ default (`-force-gfx-direct`) is wrong for this title. `tools/screenshot` defaul
 value explicitly. The reusable route and its input-delivery expectations are documented in
 [`scripts/dragon-quest-vii/README.md`](../scripts/dragon-quest-vii/README.md).
 
-The validated run observed all six Cross/neutral edges. It presented roughly 20–22 frames per second
-during the title window; treat that as a ballpark single-run observation, not a performance benchmark.
+The validated run observed all seven Cross/neutral edges. Performance varies with concurrent GPU work;
+treat the current title cadence as a ballpark observation, not a benchmark.
 
 ### Routed current-master progression
 
 | t | content |
 |---|---------|
-| 0–27 s | startup logos/movie transitions, advanced by Cross |
-| ~28 s | **localized Dragon Quest VII Reimagined title appears** |
-| 28–40 s | animated logo, sky/ocean, birds and water |
+| 0–33 s | startup logos/movie transitions and post-logo black state, advanced by Cross |
+| ~34 s | **localized Dragon Quest VII Reimagined title appears** |
+| 34–40 s | animated logo, sky/ocean, birds and water |
 
 Some one-second samples show a dark/purple background behind the stable logo while adjacent samples
 show the expected sky and ocean. That may be an authored transition or a remaining rhythmic background
@@ -203,10 +213,12 @@ current build.
 
 ## What is actually established (measured, current)
 
-- **The title screen is reached on current master.** A fresh-save direct frontend run with
+- **The title screen is reached on current master.** A direct frontend run with unique roots for both
+  `PROSPER_SAVE0` and `PROSPER_SAVEDATA_DIR` and
   `reach-title-screen.pad` produced the localized Dragon Quest VII logo over animated sky/ocean from
-  28 through 40 seconds at native 3840x2160. All six Cross/neutral transitions were observed by the
-  guest. The representative repository screenshot is an unmodified frame from that run.
+  about 34 through 40 seconds at native 3840x2160. All seven Cross/neutral transitions were observed by the
+  guest. The representative repository screenshot is an unmodified native frontend capture of the same
+  validated title state; its earlier capture did not isolate both save roots.
 - **Draw 92 is healthy.** Mixed-operation prefix replay through operation 120 produces the coherent
   scene (sky, ocean, islands and ships). A fragment tap at draw 92 also preserves that structured
   content. The old statement that draw 92 leaves alpha only is false.
