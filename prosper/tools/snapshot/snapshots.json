@@ -813,6 +813,112 @@
         }
       ],
       "min_nonblack_ratio": 0.498796
+    },
+    {
+      "name": "greak-gameplay",
+      "dump": "PPSA02849-app0",
+      "scale": 4,
+      "timeout": 250,
+      "capture_after_seconds": 150,
+      "capture_before_seconds": 240,
+      "pad_script": "scripts/greak/reach-gameplay.pad",
+      "savedata_policy": "fresh",
+      "env": {},
+      "min_colors": 20000,
+      "min_qualifying_frames": 30,
+      "min_pixel_changes": 30,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 30,
+      "min_content_match_ratio": 0.75,
+      "min_nonblack_ratio": 0.9,
+      "dims": [
+        480,
+        270
+      ],
+      "review": "Approved all 16 composited images from two independent runs on 2026-07-31. Every image is the first level at 480x270: Greak on the cliff-edge platform, layered parallax pine forest receding into volumetric fog, the rock face and distant mountains, drifting snow particles, the circular portrait/health HUD top-left, and the ability indicators bottom-left and bottom-right -- fully composited, with no black regions, missing layers, letterbox bars, or diagnostic-only output. The character is airborne mid-jump in some frames and grounded in others, and its position and pose differ across all eight timestamps of each run and between the runs, confirming a live progressing scene; all 90 window frames of each run carry distinct pixel CRCs. Measured 32,057-43,167 distinct colours in run 1 and 32,125-43,067 in run 2, with non-black coverage of exactly 1.000000 in all 180 frames across both runs and not one frame below 0.95. Contrasting states measured on the same route: the letterboxed level-intro cinematic at 123-130s reaches 32,153 colours -- only 87 below this window's floor -- but is held to 0.6667 coverage by its bars, and the boot's black frames measure 1 colour at 0.0 coverage. min_colors=20000 is therefore a gross-collapse floor only, and min_nonblack_ratio=0.9 is the threshold that actually rejects the cinematic; its 10% margin is backed by 180 reviewed frames with zero observed variance.",
+      "_note": "Reviewed fresh-save guard for Greak: Memories of Azur's first level. Profiling the committed route once per second across a 255s boot placed the phases at: boot and logos to 45s, the hand-drawn intro cutscene 46-117s, a short dark transition 118-122s, a LETTERBOXED level-intro cinematic 123-130s, and full-screen gameplay from 131s to the end of the profile. The evidence window is 150-240s, about twenty seconds after gameplay begins, giving 90 samples entirely inside it; because min_content_match_ratio rejects a window once a quarter of its frames are off-scene, that start also tolerates gameplay arriving as late as roughly 172s. Note the documented 'roughly 70-second black asset load' did NOT appear as black frames on this host: 46-117s measured 18,685-61,886 colours at 0.99-1.0 coverage and is the intro cutscene, so do not treat that span as a hang. This title is the MIRROR IMAGE of rugrats-gameplay for threshold choice, and together they show why the contract must be conjoined. Here colour count is nearly useless as a scene discriminator: the letterboxed cinematic peaks at 32,153 colours while the gameplay floor is 32,240, a gap of only 87 colours (0.27%), so no sane min_colors can separate them. What separates them is COVERAGE -- the cinematic's letterbox bars hold it at 0.6667 while all 90 gameplay frames measure exactly 1.0000 -- plus SSIM. In Rugrats the reverse held: coverage was useless there (its title card is fully opaque at 1,551 colours) and colour count separated the scenes. min_colors is therefore set at 20,000 purely as a gross-collapse floor, not as a scene discriminator, and min_nonblack_ratio is deliberately raised to 0.9 rather than the tool-derived 0.5 so that a window drifting into the letterboxed cinematic fails on coverage instead of passing it.",
+      "structural_references": [
+        {
+          "luma16x9": "d2b5e4e8d2c7c1e0e9edead4c6ecc25bc1b8e6e5e3e2ded8ebece15f6aa5bb73f1efece9e8ebedefdeedab6288afb974efebe8e4e2e5b6f1bde5b77c9aa8b471ece8e4e1c0e27bd9aed58f87938fa375e8e4e1cb7bdd68a0a6a67d877d729a7dd6dbd7a994ab848694916c5750453c399e9b9e958046585b5a5b564e413c3b43a17e8e917e535964565058595a4d4b5b",
+          "average_hash": "000117171f1f1f7f",
+          "difference_hash": "57f67377a7aba6a6"
+        },
+        {
+          "luma16x9": "d3b5e4e9d1c5c0e1e9edead6cbedbe5ac1b8e6e4e3e2ddd8ebece25f69a8bb73f2efece9e8ebedeedfeda85e86afb874efebe8e4e2e6b9f2bae5b4799aa9b570ece8e4e1c3e27bd89cd58e86928fa474e8e4e2cc7ddd669da2a77b877d749b7cd8dcd8aa93b08897a99a705a53463f3c9f9da196804c697d7f705e50413c3b42a17e8d927d58627a67575c5a5a4c4b5b",
+          "average_hash": "000117171f1f1f7f",
+          "difference_hash": "77f67377a7aba6a6"
+        },
+        {
+          "luma16x9": "d3b5e4e9d1c5c0e1e8edead7cceebc5ac1b8e6e4e3e2ddd8ecece2606aa9bb73f2efece9e8ebedeedfeda75e86afb774efebe8e4e2e6baf2bae6b3799aa9b570ece8e4e1c4e27bd99dd58d86938fa473e8e5e2cb7edd659da2a67b877d749c7bd9dcd9aa92b18898a99a715a5346403c9f9ea1967f4c697d7f715e50413c3b42a17e8d927c58627b67585c5a5a4c4a5b",
+          "average_hash": "000117171f1f1f7f",
+          "difference_hash": "77f67377a7bba6a6"
+        },
+        {
+          "luma16x9": "d2b5e4e8d2c7c1e0e9edead3c6edbe5cc1b8e6e5e3e2ded8ebecdf5b6ba7b973f1efece9e8ecedefdeeda66088b0b773efebe7e4e3e6b6f2b8e6b27a9aa8b46fece8e4e1c0e279d79cd58986928ea473e8e4e1c97ddc669da4a57d877c729c7bd6dbd7a894ab8696a7986e5851453b399e9b9e957d4d697d7d6f5d50423d3b43a17e8e927c59627966585d5b5b4c4b5b",
+          "average_hash": "000117171f1f1f7f",
+          "difference_hash": "77f67377a7aba6a6"
+        },
+        {
+          "luma16x9": "d2b5e4e8d2c9c1e0e9edead0c2edbf5dc2b8e7e5e4e3dfd9ebecdc596ca6b874f1efece9e8ebedefdceda5628ab0b773efebe7e4e2e5b3f1b7e5b17b9aa8b36eece8e4e1bde277d59cd48687918da472e7e4e1c77ddb679da5a37f877c709a7bd4dad6a796a78494a6966c574f453a369d999c957b4d697d7b6e5d50423d3c43a17e8e917c5a637866585d5c5b4d4c5c",
+          "average_hash": "000117171f1f1f7f",
+          "difference_hash": "77f67377a7aba6a6"
+        },
+        {
+          "luma16x9": "d0b5e3e6d5d0c5deebeceac3b2e7c260c3b9e8e6e6e4e1dbebecd3516fa4b475f1efebe8e7ebeaf1d8eca5678eb0b871eeeae6e3e1e5a8efb1e4ae7e9aa5b16debe7e4e0b1e172cf9bcf7d878f8aa271e6e3e1c17cd86e9daaa2858375688e73cbd4d2a499978090a18f67544d4438359b939693764d677b75695a4f453e3e45a1808f917e5d6476665a5f5f5d4f4f5e",
+          "average_hash": "000017171f1f1f7f",
+          "difference_hash": "77f6f377a7afaea6"
+        },
+        {
+          "luma16x9": "cfb4e2e5d6d3c7ddececeabbaae3c262c3bae9e6e7e4e3dceaecce4f71a4b275f1eeebe8e7eae9f1d5eca56990b0b871eeeae6e3e1e4a2eeaee4ad7f9aa3b06cebe7e4deace16fcc9acb79878e88a272e6e3e0bd7cd6739fada387807164886fc7d1cfa398907c8d9e8b65544c4337349a909393764e657b7266574f463e3f47a1808f917f5e6575655b60615e50505e",
+          "average_hash": "000003171f1f1f7f",
+          "difference_hash": "5777f377a7afaea6"
+        },
+        {
+          "luma16x9": "cfb5e2e5d7d3c7ddececeabba9e3c262c4bae9e6e7e4e3ddeaeccd4f71a4b275f1eeebe8e7eae8f1d5eca56990b0b870eeeae6e3e1e4a1eeaee4ad7f9aa3af6cebe7e4deabe16fcb9acb78878f88a271e6e3e0bd7cd6739fada3877f7164886fc7d1cfa3988f7c8b9e8b65544b4337349a909393764d657b7266574f463f3f47a1808f917f5f6575665c60625e50505f",
+          "average_hash": "000003171f1f1f7f",
+          "difference_hash": "5777f377a7afaea6"
+        },
+        {
+          "luma16x9": "d2b5e4e8d2c7c1e0e9edead4c6ecc25bc1b8e6e5e4e2ded8ebece15e6aa5bb73f2efece9e8ebedefdeedab6288afb974efebe7e4e2e5b6f1bde5b77c9aa8b471ece8e4e1c0e27bd9aed58f87928ea375e8e4e1cb7bdd68a0a4a67d877d719a7dd6dbd7a994ab848793916c5750453b399e9b9e957f46585c5a5b564e413c3b43a17e8e917e535964575058595a4d4b5b",
+          "average_hash": "000117171f1f1f7f",
+          "difference_hash": "57f67377a7aba6a6"
+        },
+        {
+          "luma16x9": "d3b5e4e9d1c6c0e0e9edead6cbedbf5ac1b8e6e4e3e2ddd8ecece26069a8bc73f2efece9e8ebedeedfeda95e86afb874efece8e4e2e6b9f2bae5b4799aa9b570ece8e4e1c3e27bd89dd58e86928fa474e8e5e2cb7ddd669da3a77b877d749b7cd8dcd8aa93b08897aa9a705a52463e3b9f9da096804c697d7e705e50423c3b42a17e8d927d58627a67575c5a5a4c4b5b",
+          "average_hash": "000117171f1f1f7f",
+          "difference_hash": "77f67377a7aba6a6"
+        },
+        {
+          "luma16x9": "d3b5e4e9d1c6c0e0e9edead6cbedbe5bc1b8e6e4e3e2ddd8ecece15e6aa9bb73f1efece9e8ebedefdfeda75f87b0b874efebe8e4e2e6b9f2bae5b3799aa9b570ece8e4e1c2e27ad89dd58c86928fa473e8e4e2cb7ddd669da3a67c877d749b7bd8dcd8a993b08797a899705a52463f3c9f9da0967f4c697d7f705e50413c3b42a17e8d927d58627a67585c5b5b4c4b5b",
+          "average_hash": "000117171f1f1f7f",
+          "difference_hash": "77f67377a7bba6a6"
+        },
+        {
+          "luma16x9": "d2b5e4e8d2c7c1e0e9edead3c6edbe5cc1b8e6e5e3e2ded8ebecdf5b6ba7b973f1efece9e8ebedefdeeda66088b0b773efebe7e4e2e6b6f2b8e5b27a9aa8b46fece8e4e1c0e279d79cd58986928ea473e8e4e1c97ddc669da4a57d877c729c7bd6dbd7a894ab8696a8986e5851453b399e9b9e957d4d697d7d6f5d50423d3b43a17e8e927c59627966585d5b5b4d4b5b",
+          "average_hash": "000117171f1f1f7f",
+          "difference_hash": "77f67377a7aba6a6"
+        },
+        {
+          "luma16x9": "d2b5e4e8d2c9c1e0e9edead0c3edbe5cc2b8e7e5e4e3dfd9ebecdd596ca7b874f1efece9e8ecedefddeda5628ab0b773efebe7e4e2e5b3f1b7e5b17b9aa8b46eece8e4e1bee277d59cd48787918ea472e7e4e1c77ddb679da5a47f877c709a7ad4dad6a795a78595a5966d574f453a369e999d957b4d697d7c6e5d50423d3c43a17e8e927c5a637966585d5c5b4d4c5c",
+          "average_hash": "000117171f1f1f7f",
+          "difference_hash": "77f67377a7bba6a6"
+        },
+        {
+          "luma16x9": "d1b5e3e7d3ccc3dfeaedeacbbbeac15ec2b9e8e5e5e3e0d9ebecd8556da5b674f1efece8e8ebecf0daeca5648bb0b772eeebe7e3e2e5aef1b4e5b07c9aa6b26eece8e4e0b8e275d29bd28287918ca372e7e4e1c47cda6a9da8a38286796c9477d0d7d4a6989f8292a49369554e4539359c969994794d687c786c5c4f433d3d44a17f8f917d5b637866595d5e5c4e4d5d",
+          "average_hash": "000017171f1f1f7f",
+          "difference_hash": "77f6f377a7abaea6"
+        },
+        {
+          "luma16x9": "d0b5e3e6d5d0c5deebeceac4b2e7c260c3b9e8e6e6e4e1dbebecd3516fa4b475f1efebe8e7ebeaf1d8eca5678eb0b871eeeae7e3e1e5a8efb1e4ae7e9ba5b16debe7e4e0b2e172cf9bcf7d87908aa271e6e3e1c17cd86e9daaa3858375688e73ccd4d2a49997808fa18f67544d4438359b939693774d677b75695a4f453e3e45a1808f917e5d6476665a5f5f5d4f4f5e",
+          "average_hash": "000017171f1f1f7f",
+          "difference_hash": "77f6f377a7afaea6"
+        },
+        {
+          "luma16x9": "cfb5e2e5d7d3c7ddececeabba9e3c362c4bae9e6e7e4e3ddeaecce4f71a4b275f1eeebe8e7eae8f1d5eca66990b0b870eeeae6e3e1e4a1eeaee3ad7f9aa3af6cebe7e4deabe16fcb9acb79878e88a271e6e3e0bd7cd6739faca3877f7164886fc7d1cfa3988f7c8b9e8b65544b4337349a909393764d657b7266574f463f3f47a1808f917f5f6575665c60625e51505f",
+          "average_hash": "000003171f1f1f7f",
+          "difference_hash": "5777f377a7afaaa6"
+        }
+      ]
     }
   ]
 }

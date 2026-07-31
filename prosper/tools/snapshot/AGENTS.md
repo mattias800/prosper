@@ -31,14 +31,24 @@ python3 tools/snapshot/snapshot.py check blasphemous2-gameplay
 - Do not lower a threshold merely to pass. Explain intentional contract changes
   and repeat the baseline-review workflow below.
 
-### Why the content contract is conjoined, measured on a real title
+### Why the content contract is conjoined, measured on real titles
 
 "Colour count must never be the contract on its own" is not a precaution; it is
-a measured result. Profiling the Rugrats route (`PPSA23396`) once per second
-across a whole boot produced both halves of the argument from one run, and they
-fail in **opposite** directions — which is exactly why neither metric can stand
-alone, and why `min_colors`, `min_nonblack_ratio`, SSIM, `dims` and
-`min_pixel_changes` are conjoined:
+a measured result. Two profiled titles settle it by demonstration, and they
+matter as a **pair**: in each one, a different metric goes blind, so neither can
+be the contract alone.
+
+| title | colour count | non-black coverage |
+|---|---|---|
+| **Rugrats** (`PPSA23396`) | separates cleanly — menu 56,090 vs gameplay 17,645 | **blind** — title card fully opaque at 1,551 colours |
+| **Greak** (`PPSA02849`) | **blind** — 87-colour gap (0.27%) between cinematic peak 32,153 and gameplay floor 32,240 | separates cleanly — letterboxed 0.6667 vs gameplay 1.0000 |
+
+Whichever metric you were about to trust on its own, one of these two titles is
+the counter-example. That is the whole argument for conjoining `min_colors`,
+`min_nonblack_ratio`, SSIM, `dims` and `min_pixel_changes`.
+
+Profiling the Rugrats route once per second across a whole boot produced both
+halves of the argument from one run, and they fail in **opposite** directions:
 
 - **Colour count alone prefers a menu to the game.** The two richest frames of
   the entire run are the GAME MODE selector at 56,071-56,090 distinct colours.
@@ -51,6 +61,13 @@ alone, and why `min_colors`, `min_nonblack_ratio`, SSIM, `dims` and
   coverage with as few as 1,551 colours, so a coverage-only guard treats a
   title card as a rendered level.
 
+Greak then supplied the inverse case. Its route passes through a **letterboxed**
+level-intro cinematic immediately before gameplay, and that cinematic peaks at
+32,153 colours while the gameplay floor is 32,240 — a gap of **87 colours, or
+0.27%**. No usable `min_colors` separates them. What does separate them is
+coverage: the letterbox bars hold the cinematic at 0.6667 while every gameplay
+frame measures exactly 1.0000.
+
 The practical rule: let SSIM decide *scene identity*, and keep `min_colors` as a
 gross-collapse floor rather than tuning it to separate two valid scenes. For
 Rugrats the tempting floor is ~16,000 — just under the 17,259 gameplay minimum
@@ -59,6 +76,16 @@ with SSIM while making the guard fragile against a slightly dimmer healthy
 frame. 12,000 was chosen instead: comfortably below the observed gameplay range
 and far above every observed failure state (black at 1 colour, logos at most
 3,830, title card at most 3,448).
+
+The corollary is that **when the usual discriminator goes blind, the other
+threshold has to carry the load, and should be set for that job rather than from
+the generic formula**. `greak-gameplay` therefore sets `min_nonblack_ratio` to
+0.9 instead of the derived 0.5 (half the lowest reviewed coverage): colour count
+provably cannot catch a window drifting into that cinematic, so coverage must,
+and the derived 0.5 would have admitted the 0.6667 letterbox. Raising a
+threshold this way needs the same evidence as lowering one — here, every
+reviewed gameplay frame measured exactly 1.0000 with zero variance across
+independent runs, leaving a 10% margin.
 
 ## New Or Changed Baselines
 
