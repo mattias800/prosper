@@ -30,6 +30,8 @@ Last updated: 2026-07-31
 | *Earthion* | `PPSA28061` | Custom (Ancient) | 🚧 Developer logo, intro story text and CRT bezel render; the 320×224 game picture inside the bezel is still missing |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🔬 Boots deep into the UE4 frame loop with real GPU work; presented frames are still a flat colour |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Audio and sound bank initialise; the game's own code lives in a runtime-loaded PRX that prosper cannot yet load |
+| *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
+| *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
 
 ¹ Exact retail game name pending confirmation.
 
@@ -293,6 +295,46 @@ text pass, so no gameplay milestone is claimed.
 This 2D action title reaches its main menu and attract-mode gameplay, verified and recorded by the
 project owner, with a menu-reach snapshot guard in place. The title ID is confirmed; the exact retail
 name is pending confirmation.
+
+## Rugrats: Adventure in Gameland — `PPSA23396`
+
+<p align="center">
+  <img src="assets/screenshots/rugrats-title.png" alt="Rugrats: Adventure in Gameland — title and game-mode selector">
+</p>
+<p align="center">
+  <img src="assets/screenshots/rugrats.png" alt="Rugrats: Adventure in Gameland — first nursery level">
+</p>
+
+A Unity 2022.3 / IL2CPP title that boots on first attempt with **no rejected shader, no unimplemented
+render-path NID, and no AGC gap** in a full routed run. The route crosses the splash logos, the
+"GAME MODE: MODERN HD" selector and the menus into the first nursery level at native 1920×1080: Tommy
+and Chuckie with their animation, the block platforms, the playpen gate, the locked door, the curtained
+window, and the baby-bottle health HUD.
+
+The route is `prosper/scripts/rugrats/reach-gameplay.pad`.
+
+## Greak: Memories of Azur — `PPSA02849`
+
+<p align="center">
+  <img src="assets/screenshots/greak-title.png" alt="Greak: Memories of Azur — title screen">
+</p>
+<p align="center">
+  <img src="assets/screenshots/greak.png" alt="Greak: Memories of Azur — first level gameplay">
+</p>
+
+A Unity 2019.4 / IL2CPP title that boots cleanly on first attempt. The route crosses the publisher
+logo, the full hand-drawn animated intro cutscene, a long asset-load phase, and the title screen into
+sustained first-level gameplay at native 1920×1080: the player character and its animation, layered
+parallax terrain and pine forest, volumetric fog, drifting particles, the portrait/health/ammo HUD, the
+ability bar, and the button-prompt overlay.
+
+The route is `prosper/scripts/greak/reach-gameplay.pad`. Note that the title screen only appears after a
+roughly 70-second black asset-loading phase following the intro; a capture window shorter than about
+150 seconds ends before it and misreads the load as a black-screen defect.
+
+One shared recompiler gap was found and closed during bring-up: `s_ttracedata` (SOPP `0x16`), a
+thread-trace profiling instruction with no architectural effect, was rejecting the entire vertex stage
+that carried it.
 
 ## Alex Kidd in Miracle World DX — `PPSA02664`
 

@@ -428,6 +428,23 @@ int main() {
     printf("  kernel15 mismatches=%u (out[1]=0x%08x expect=0x%08x)\n", bad15, got15.size()==N?bits_of(got15[1]):0, exp15[1]);
     CHECK(got15.size()==N && bad15==0, "recompiled kernel 15 (v_bfrev_b32) reverses bits exactly");
 
+    // Kernel 15b: kernel 15 with s_ttracedata (SOPP 0x16, 0xbf960000) spliced into the body. The
+    // instruction sends M0 to the thread-trace stream — a profiling side channel that writes no
+    // SGPR/VGPR/memory and does not branch — so the correct lowering emits nothing and the kernel must
+    // stay bit-identical to kernel 15. Greak (PPSA02849) ships it at pc=2 in live vertex shaders, and
+    // before this was recognized the whole stage was rejected (empty SPIR-V) and its draws were dropped.
+    const uint32_t code15b[] = { 0x7e000f00u, 0xbf960000u, 0x7e007100u, 0xbf810000u };
+    std::vector<uint32_t> spv15b = recompile_valu(code15b, sizeof(code15b)/sizeof(code15b[0]), 1, 0);
+    CHECK(!spv15b.empty(), "recompiled kernel 15b (s_ttracedata in the body) -> SPIR-V");
+    // Guard the execution harness: a rejected stage yields empty SPIR-V, and handing that to
+    // run_compute faults instead of reporting the real failure (the CHECK above).
+    std::vector<float> got15b = spv15b.empty() ? std::vector<float>()
+                                               : prosper::test::run_compute(spv15b, in15, N, N);
+    uint32_t bad15b = 0; for (uint32_t i=0;i<N&&got15b.size()==N;i++) if (bits_of(got15b[i]) != exp15[i]) bad15b++;
+    printf("  kernel15b mismatches=%u\n", bad15b);
+    CHECK(got15b.size()==N && bad15b==0,
+          "recompiled kernel 15b (s_ttracedata) matches kernel 15 bit-exactly");
+
     // Kernel 16: v_cmpx_gt_u32 (0xd4) — EXEC/predication. exec = (u0 > u1); then out = (float)(u0+u1),
     // but the store is EXEC-predicated: lanes with u0<=u1 don't write, so they keep the zero-inited slot.
     const uint32_t code16[] = {

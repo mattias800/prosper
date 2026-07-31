@@ -1,0 +1,48 @@
+# Greak: Memories of Azur (PPSA02849): cross the logo, the hand-drawn intro cutscene, the title
+# screen's "PRESS X TO START", and the main menu into gameplay. Seconds are measured from the first
+# pad poll. One-second Cross holds are poll-safe under slow software rendering (only a few pad polls
+# per second). The title screen appears at roughly 112 s on a Linux hardware-Vulkan boot, after a long
+# black post-cutscene load, so the presses start before that and repeat: Cross both advances the
+# cutscene and confirms the title and the default main-menu entry.
+2-3:cross
+6-7:cross
+10-11:cross
+14-15:cross
+20-21:cross
+26-27:cross
+32-33:cross
+38-39:cross
+44-45:cross
+50-51:cross
+56-57:cross
+62-63:cross
+68-69:cross
+74-75:cross
+80-81:cross
+86-87:cross
+92-93:cross
+98-99:cross
+104-105:cross
+110-111:cross
+114-115:cross
+118-119:cross
+122-123:cross
+126-127:cross
+130-131:cross
+134-135:cross
+138-139:cross
+142-143:cross
+146-147:cross
+150-151:cross
+154-155:cross
+158-159:cross
+162-163:cross
+166-167:cross
+170-171:cross
+174-175:cross
+178-179:cross
+182-183:cross
+186-187:cross
+190-191:cross
+194-195:cross
+198-199:cross

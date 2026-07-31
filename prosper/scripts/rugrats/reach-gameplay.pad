@@ -1,0 +1,53 @@
+# Rugrats: Adventure in Gameland (PPSA23396): cross the splash logos, the "GAME MODE" selector, and
+# the main menu into gameplay. Seconds are measured from the first pad poll. One-second Cross holds are
+# poll-safe under slow rendering. The mode selector appears at roughly 33 s on a Linux hardware-Vulkan
+# boot; Cross confirms the default mode and advances the menus, so repeated presses reach gameplay
+# without directional navigation. Options is a fallback for a start-button title prompt.
+2-3:options
+6-7:cross
+12-13:cross
+18-19:cross
+24-25:cross
+30-31:cross
+34-35:cross
+38-39:cross
+42-43:cross
+46-47:cross
+50-51:cross
+54-55:cross
+58-59:cross
+62-63:cross
+66-67:cross
+70-71:cross
+74-75:cross
+78-79:cross
+82-83:cross
+86-87:cross
+90-91:cross
+94-95:cross
+98-99:cross
+102-103:cross
+106-107:cross
+110-111:cross
+114-115:cross
+118-119:cross
+122-123:cross
+126-127:cross
+130-131:cross
+134-135:cross
+138-139:cross
+142-143:cross
+146-147:cross
+150-151:cross
+154-155:cross
+158-159:cross
+162-163:cross
+166-167:cross
+170-171:cross
+174-175:cross
+178-179:cross
+182-183:cross
+186-187:cross
+190-191:cross
+194-195:cross
+198-199:cross

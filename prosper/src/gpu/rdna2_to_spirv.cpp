@@ -8199,6 +8199,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x10:   // s_sendmsg        (NGG GS_ALLOC_REQ etc. — no wave/primitive allocation in
                              //                   our per-invocation model; only meaningful for NGG/GS,
                              //                   which we lower per-invocation, so it's a safe no-op)
+                case 0x16:   // s_ttracedata     (sends M0 to the thread-trace stream — a profiling side
+                             //                   channel with no architectural effect: it writes no SGPR,
+                             //                   VGPR, or memory and does not branch. Prosper models no
+                             //                   thread trace, so emitting nothing IS the correct lowering.
+                             //                   Observed live in Greak (PPSA02849) vertex shaders, which
+                             //                   ship it at pc=2 and were rejected whole. CONFIDENCE: HIGH
+                             //                   — round-tripped against llvm-mc gfx1030.)
                 case 0x17:   // s_cbranch_cdbgsys (Prosper exposes no attached GPU system debugger, so
                              //                    COND_DBG_SYS is permanently clear and the branch falls through)
                 case 0x20:   // s_inst_prefetch  (I-cache hint)
