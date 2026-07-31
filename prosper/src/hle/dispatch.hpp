@@ -103,6 +103,20 @@ void register_http_hle();
 void register_font_hle();
 // libSceFiber cooperative guest-stack switching; called by register_builtin_hle().
 void register_fiber_hle();
+// libSceUlt (user-level threading) — deliberately NOT implemented. Registers fail-VISIBLE counted
+// stubs for the entry points titles actually import, so the missing semantics stop being silent
+// (#1603); see hle_ult.cpp. Called by register_builtin_hle().
+void register_ult_hle();
+// Calls made to the unimplemented libSceUlt surface, by NID (0 for an unregistered/uncalled NID).
+// Counted PER CALL, unlike the first-seen dedup in prosper_on_unimpl. Diagnostics + tests.
+uint64_t ult_call_count(const char* nid);
+// Append the libSceUlt call table to `f` (nothing if the title never touched Ult). Called from
+// dump_call_log so the existing PROSPER_PROGRESS_UNIMPL periodic dump reports real Ult volume.
+void ult_dump_call_log(FILE* f);
+// Test seams for the return policy (PROSPER_ULT_RETURN_SUCCESS) and the counters. Returns the
+// previous policy. Production code must not call these.
+bool ult_set_return_success_for_test(bool return_success);
+void ult_reset_counts_for_test();
 // libScePad game-controller input (real host controller via input/pad.cpp); called by register_builtin_hle().
 void register_pad_hle();
 // Headless graphics bring-up (libSceAgc/libSceVideoOut placeholders); see hle_graphics.cpp.

@@ -182,6 +182,10 @@ void dump_call_log(FILE* f) {
                 nid.c_str(), nm.empty() ? "" : "  [", nm.c_str(), nm.empty() ? "" : "]");
     }
     fprintf(f, "  (%zu distinct unimplemented functions)\n", g_order.size());
+    // libSceUlt is registered (hle_ult.cpp) precisely so its calls do NOT land in the deduped table
+    // above, which reported one line for 1,005,742 sceUltMutexLock calls. Its own per-call table
+    // follows, and prints nothing when the title never touched Ult.
+    ult_dump_call_log(f);
 }
 
 } // namespace prosper
