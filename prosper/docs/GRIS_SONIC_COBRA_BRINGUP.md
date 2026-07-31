@@ -1,13 +1,14 @@
 # GRIS, Sonic Origins, and Space Adventure Cobra bring-up
 
-Validated on Linux on 2026-07-25. This note records the reproducible evidence for issue #1356.
-Raw PCM, verbose logs, and GPU captures are local diagnostics and are intentionally not committed.
+Validated on Linux on 2026-07-25, with GRIS opening gameplay revalidated on current master on
+2026-07-31. This note records the reproducible evidence for issue #1356. Raw PCM, verbose logs, and
+GPU captures are local diagnostics and are intentionally not committed.
 
 ## Result matrix
 
 | Title | Revision | Visual milestone | Audio evidence |
 | --- | --- | --- | --- |
-| GRIS (`PPSA09804`) | 01.001.000 | Native 1920×1080 **NEW GAME** title | CLEAN, `rms=0.1800`, `peak=1.2689`, duplicated grains 0.0% |
+| GRIS (`PPSA09804`) | 01.001.000 | Native 1920×1080 opening gameplay with scripted movement | CLEAN on current master over the first 35 seconds: `rms=0.0082`, `peak=0.1173`, duplicated grains 0.0% |
 | Sonic Origins (`PPSA05325`) | 02.002.000 update targeting 02.001.000 | Blocked: update-only dump is missing two base title assets | AudioOut2 port 17 runs, but guest PCM is zero while startup is blocked |
 | Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | Native 1920×1080 title | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
 
@@ -20,6 +21,15 @@ Raw PCM, verbose logs, and GPU captures are local diagnostics and are intentiona
 Route: `scripts/gris/reach-title-screen.pad`. The title appears without input; the comments-only
 route keeps a neutral scripted controller connected and prevents an evidence run from selecting
 **NEW GAME**.
+
+![GRIS — opening gameplay](../../assets/screenshots/gris.png)
+
+Route: `scripts/gris/reach-first-gameplay.pad`. Poll-safe Cross edges select the default New Game
+entry and cover the opening sequence's timing variation. Right is held from 78 through 150 seconds.
+On exact master `2562269711f89b59f7f3038eab1bb4dcf8468b52`, the direct native `screenshot` route
+reached the controllable ink-ground scene around 130 seconds: the character moved and animated under
+the scripted input, then settled after the route returned to neutral. The retained 170-second run
+contained 85 source-distinct and 85 pixel-distinct unmodified 1920×1080 frontend frames.
 
 ### Space Adventure Cobra — The Awakening
 
@@ -40,6 +50,10 @@ PROSPER_PAD_SCRIPT=@prosper/scripts/gris/reach-title-screen.pad \
   prosper/build-linux/screenshot /path/PPSA09804-app0 \
   --seconds 1 --count 35 --timeout 90 --out /tmp/gris-shots
 
+PROSPER_PAD_SCRIPT=@prosper/scripts/gris/reach-first-gameplay.pad \
+  prosper/build-linux/screenshot /path/PPSA09804-app0 \
+  --seconds 2 --count 85 --timeout 210 --out /tmp/gris-gameplay-shots
+
 PROSPER_PAD_SCRIPT=@prosper/scripts/cobra/reach-title-or-gameplay.pad \
   prosper/build-linux/screenshot /path/PPSA17337-app0 \
   --seconds 1 --count 90 --timeout 180 --out /tmp/cobra-shots
@@ -55,11 +69,21 @@ python3 prosper/tools/audio_analyze.py /tmp/gris.port1.raw \
   --fmt f32 --channels 2 --rate 48000 --tail-seconds 30
 ```
 
-The validated GRIS verdict was:
+The 2026-07-25 validated GRIS verdict was:
 
 ```text
 CLEAN: corr(block 1024f)=+0.095 neighbor-max=+0.047 spike=+0.048 (threshold 0.35) dup-grains=0.0% rms=0.1800 peak=1.2689
 ```
+
+The 2026-07-31 exact-master gameplay rerun opened the same stereo float32 port 1 and auxiliary
+stereo s16 port 3. Port 1's first 35 seconds were non-zero and passed the repetition check:
+
+```text
+CLEAN: corr(block 1024f)=+0.008 neighbor-max=+0.012 spike=-0.004 (threshold 0.35) dup-grains=0.0% rms=0.0082 peak=0.1173
+```
+
+The final 30 seconds of the 170-second route were silent and therefore produced no repetition
+verdict. That quiet tail is not evidence that the complete capture or output path was silent.
 
 The validated Cobra verdict was:
 

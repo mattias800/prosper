@@ -5,7 +5,7 @@ describe specific, user-supplied PS5 dumps tested primarily on Linux. A mileston
 documented route is reproducible; it does **not** mean the entire game is playable or free of bugs.
 Different title revisions may behave differently.
 
-Last updated: 2026-07-25
+Last updated: 2026-07-31
 
 ## Summary
 
@@ -15,7 +15,7 @@ Last updated: 2026-07-25
 | *Dead Cells* | `PPSA15552` | Custom | ✅ Controllable Prisoners' Quarters scene renders in full color |
 | *Blasphemous 2* | `PPSA13579` | Unity | ✅ Opening route reaches and renders the first playable room |
 | *Evergate* | `PPSA01885` | Unity | ✅ Reaches and renders the first tutorial-room gameplay |
-| *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Native 1920×1080 title reached; opening route and audio verified |
+| *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Native 1920×1080 opening gameplay reached; scripted input and audio verified |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Native 1920×1080 title and audio verified |
 | *Sonic Origins*&nbsp;² | `PPSA05325` | Hedgehog Engine | 🔬 Frontend loop reached; supplied update-only dump lacks its base title assets |
 | Terminator (2D)&nbsp;¹ | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay reached (user-verified) |
@@ -115,10 +115,20 @@ The reproducible route is in
 <p align="center">
   <img src="prosper/docs/screenshots/issue-1356-gris-title.png" alt="GRIS — New Game title screen">
 </p>
+<p align="center">
+  <img src="assets/screenshots/gris.png" alt="GRIS — opening gameplay">
+</p>
 
-The Unity/IL2CPP title reaches its animated **NEW GAME** screen at native 1920×1080 and accepts the
-scripted default selection into the opening sequence. Its Wwise path produces sustained non-zero
-PCM; the objective repetition check reports clean audio (`rms=0.1800`, no duplicated grains).
+The Unity/IL2CPP title reaches its animated **NEW GAME** screen at native 1920×1080, accepts the
+scripted default selection, and continues through the opening fall into real gameplay. In an
+exact-master native `screenshot` run, the player appeared on the opening ink-ground scene around
+130 seconds, moved and animated while scripted Right input remained held, and settled after the route
+returned to neutral at 150 seconds. All 85 samples in the 170-second run were pixel-distinct.
+
+The original bring-up produced sustained clean Wwise PCM (`rms=0.1800`, no duplicated grains). The
+2026-07-31 current-master route also produced non-zero, repetition-free port-1 PCM during its first
+35 seconds (`rms=0.0082`, `peak=0.1173`, no duplicated grains); its later quiet gameplay window is
+reported separately rather than treating one silent tail as a silent whole capture.
 
 ## Space Adventure Cobra — The Awakening — `PPSA17337`
 
