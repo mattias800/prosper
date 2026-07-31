@@ -1872,6 +1872,135 @@ bool interactive_capture_bundle_active() {
     return g_interactive_frame_active.load(std::memory_order_acquire);
 }
 
+namespace {
+struct GuestLogCaptureBundleState {
+    bool enabled = false;
+    std::string marker;
+    std::string path;
+    uint32_t max_mb = 0;
+    std::atomic<bool> fired{false};
+    std::mutex mx;
+    std::string line;
+    uint32_t line_sources = 0;
+    bool discard_line = false;
+    bool suppress_lf_after_cr = false;
+
+    GuestLogCaptureBundleState() {
+        const char* marker_env = std::getenv("PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG");
+        if (!marker_env || !*marker_env) return;
+        const char* path_env = std::getenv("PROSPER_CAPTURE_BUNDLE");
+        if (!path_env || !*path_env) {
+            std::fprintf(stderr,
+                         "[grab] PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG requires "
+                         "PROSPER_CAPTURE_BUNDLE\n");
+            return;
+        }
+        marker = marker_env;
+        path = path_env;
+        if (marker.size() > kGuestLogCaptureMaxLineBytes) {
+            std::fprintf(stderr,
+                         "[grab] PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG exceeds the %zu-byte "
+                         "line limit\n",
+                         kGuestLogCaptureMaxLineBytes);
+            return;
+        }
+        if (const char* limit = std::getenv("PROSPER_CAPTURE_BUNDLE_MAX_MB")) {
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long parsed = std::strtoul(limit, &end, 0);
+            if (!errno && end != limit && end && !*end && parsed <= UINT32_MAX)
+                max_mb = static_cast<uint32_t>(parsed);
+        }
+        line.reserve(std::min<size_t>(marker.size() + 16, kGuestLogCaptureMaxLineBytes));
+        enabled = true;
+    }
+};
+
+GuestLogCaptureBundleState& guest_log_capture_bundle_state() {
+    static GuestLogCaptureBundleState state;
+    return state;
+}
+} // namespace
+
+bool guest_log_capture_bundle_enabled() {
+    const GuestLogCaptureBundleState& state = guest_log_capture_bundle_state();
+    return state.enabled && !state.fired.load(std::memory_order_acquire);
+}
+
+void observe_guest_log_for_capture(const char* bytes, size_t size,
+                                   GuestLogCaptureSource source) {
+    GuestLogCaptureBundleState& state = guest_log_capture_bundle_state();
+    if (!state.enabled || !bytes || !size || state.fired.load(std::memory_order_acquire)) return;
+
+    bool matched = false;
+    uint32_t matched_sources = 0;
+    {
+        std::lock_guard<std::mutex> lock(state.mx);
+        if (state.fired.load(std::memory_order_relaxed)) return;
+        auto complete_line = [&] {
+            if (!state.discard_line && state.line == state.marker) {
+                state.fired.store(true, std::memory_order_release);
+                matched = true;
+                matched_sources = state.line_sources;
+            }
+            state.line.clear();
+            state.line_sources = 0;
+            state.discard_line = false;
+        };
+        for (size_t i = 0; i < size && !matched; ++i) {
+            const char ch = bytes[i];
+            if (state.suppress_lf_after_cr) {
+                state.suppress_lf_after_cr = false;
+                if (ch == '\n') continue;
+            }
+            state.line_sources |= uint32_t{1} << static_cast<uint32_t>(source);
+            if (ch == '\r') {
+                complete_line();
+                state.suppress_lf_after_cr = true;
+            } else if (ch == '\n') {
+                complete_line();
+            } else if (!state.discard_line) {
+                if (state.line.size() < kGuestLogCaptureMaxLineBytes) {
+                    state.line.push_back(ch);
+                } else {
+                    state.line.clear();
+                    state.discard_line = true;
+                }
+            }
+        }
+    }
+    if (!matched) return;
+
+    // The marker is a phase gate, not a frame oracle. Skip exactly one completed present so the
+    // transition boundary cannot be mistaken for the scene it announced, then use the established
+    // F9 whole-frame path to retain every submit and persistent RTT/DS boundary seed.
+    request_interactive_capture_bundle(state.path, state.max_mb, 1);
+    std::string source_names;
+    constexpr const char* names[] = {
+        "unknown", "printf", "puts", "putchar", "fputs", "fwrite", "write",
+    };
+    for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        if (!(matched_sources & (uint32_t{1} << i))) continue;
+        if (!source_names.empty()) source_names += ',';
+        source_names += names[i];
+    }
+    std::fprintf(stderr,
+                 "[grab] exact guest-log line matched via %s; whole-frame capture armed after "
+                 "one completed present -> %s\n",
+                 source_names.empty() ? "unknown" : source_names.c_str(), state.path.c_str());
+}
+
+void observe_guest_log_capture_gap() {
+    GuestLogCaptureBundleState& state = guest_log_capture_bundle_state();
+    if (!state.enabled || state.fired.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(state.mx);
+    if (state.fired.load(std::memory_order_relaxed)) return;
+    state.line.clear();
+    state.line_sources = 0;
+    state.discard_line = true;
+    state.suppress_lf_after_cr = false;
+}
+
 // Called per submit: when a frame grab is in progress, append this submit's realized state to the bundle.
 void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_no) {
     if (!g_interactive_frame_active.load(std::memory_order_acquire)) return;

@@ -620,8 +620,52 @@ int main() {
     CHECK(rs.db_depth_control  == 0x00000046u, "db_depth_control raw preserved");
     CHECK(rs.has_cb_color_control && rs.cb_color_control == 0x00CC0010u,
           "programmed cb_color_control presence and raw value preserved");
-    CHECK(rs.cb_target_mask    == 0x000000FFu, "cb_target_mask raw preserved");
-    CHECK(rs.cb_shader_mask    == 0x000000F3u, "cb_shader_mask raw preserved");
+    CHECK(rs.has_cb_target_mask && rs.cb_target_mask == 0x000000FFu,
+          "programmed cb_target_mask presence and raw value preserved");
+    CHECK(rs.has_cb_shader_mask && rs.cb_shader_mask == 0x000000F3u,
+          "programmed cb_shader_mask presence and raw value preserved");
+    CHECK(rs.has_db_depth_size_xy,
+          "programmed DB_DEPTH_SIZE_XY presence is distinct from an absent zero value");
+
+    // The opt-in late-draw trace snapshots the raw-to-resolved boundary without depending on
+    // environment variables or logging. This is the evidence needed to distinguish an explicit
+    // disabled color mode from either fixed-function mask suppressing an otherwise-live shader.
+    {
+        const ResolvedPipelineState resolved = resolve_pipeline_state(rs);
+        const ColorStateTraceSnapshot trace = snapshot_color_state_trace(rs, resolved);
+        CHECK(trace.es_addr == rs.es_addr && trace.ps_addr == rs.ps_addr &&
+              trace.has_cb_color_control && trace.cb_color_control == 0x00CC0010u &&
+              trace.cb_color_mode == P::CB_COLOR_CONTROL_MODE_NORMAL,
+              "color-state snapshot retains shader identity and raw CB color mode");
+        CHECK(trace.has_cb_target_mask && trace.cb_target_mask == 0xFFu &&
+              trace.has_cb_shader_mask && trace.cb_shader_mask == 0xF3u &&
+              trace.color_targets[0].resolved_write_mask == 0x3u &&
+              trace.color_targets[1].resolved_write_mask == 0xFu,
+              "color-state snapshot relates raw target/shader masks to every resolved MRT mask");
+        CHECK(trace.color_targets[0].base == rs.color0_base &&
+              trace.color_targets[0].width == 1024u && trace.color_targets[0].height == 32u &&
+              trace.color_targets[0].raw_format == 0xAu,
+              "color-state snapshot retains color target identity, dimensions, and raw format");
+        CHECK(trace.has_depth_extent && trace.depth_width == 0x235u &&
+              trace.depth_height == 0x124u && trace.raw_depth_size_xy == 0x01230234u &&
+              trace.depth_read_base == rs.depth_read_base &&
+              trace.depth_write_base == rs.depth_write_base &&
+              trace.stencil_read_base == rs.stencil_read_base &&
+              trace.stencil_write_base == rs.stencil_write_base &&
+              trace.htile_data_base == rs.htile_data_base,
+              "color-state snapshot retains decoded depth extent and every backing identity");
+        CHECK(color_state_trace_matches_dimension(trace, 1024u, 32u) &&
+              !color_state_trace_matches_dimension(trace, 3840u, 2160u),
+              "color-state trace dimension filter matches programmed color targets only");
+
+        const RenderState empty = extract_render_state(GpuState{});
+        const ColorStateTraceSnapshot empty_trace =
+            snapshot_color_state_trace(empty, resolve_pipeline_state(empty));
+        CHECK(!empty_trace.has_cb_color_control && !empty_trace.has_cb_target_mask &&
+              !empty_trace.has_cb_shader_mask && empty_trace.cb_target_mask == 0xFFFFFFFFu &&
+              empty_trace.cb_shader_mask == 0xFFFFFFFFu && !empty_trace.has_depth_extent,
+              "color-state snapshot distinguishes absent registers from effective write-all fallbacks");
+    }
 
     // #919: an explicit MODE=DISABLE suppresses MRT writes but must not suppress depth/stencil.
     // Presence matters because zero is also the historical value of an absent register in direct

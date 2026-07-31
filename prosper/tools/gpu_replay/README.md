@@ -20,6 +20,14 @@ The app logs both the guest-present count saved when it arms the screenshot and 
 the readback finishes. Use the armed count, not the host frame number or later written count: swapchain
 presents and guest VideoOut flips are separate clocks, and the guest can advance during readback.
 
+When the guest emits a deterministic phase line, a single run can bypass that calibration round trip:
+set `PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG='exact complete line'` with
+`PROSPER_CAPTURE_BUNDLE=/path/frame.prgbundle`. The exact, bounded, one-shot line match skips one completed
+present and then records the following whole frame using the same persistent RTT/DS seeds as F9. The gate
+does not accept substrings; CR, LF, and CRLF differ only as line terminators. Fragmented guest stdout via
+`printf`, `puts`, `putchar`, `fputs`, `fwrite`, or fd writes is observed, and the match diagnostic names the
+contributing adapter(s). Non-stdout output is ignored. Keep persistent targets enabled.
+
 Normal capture preflights merged resource ranges and rejects plans above 512 MiB before allocating.
 `PROSPER_GPU_CAPTURE_MAX_MB=1..3072` overrides that bound. If descriptor metadata is the evidence you
 need, `PROSPER_GPU_CAPTURE_METADATA_ONLY=1` writes a thin capsule with shaders, operations, pipeline
