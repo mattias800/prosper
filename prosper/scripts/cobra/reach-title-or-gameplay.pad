@@ -1,7 +1,12 @@
 # Space Adventure Cobra boots through several skippable video/legal screens before its menu.
-# Repeated, separated Cross pulses keep the route deterministic across video-decoder timing while
-# avoiding a held-button interpretation. Reaching gameplay is acceptable if a pulse confirms the
-# title's default selection.
+# Early flip-anchored pulses skip the decoder-driven splash sequence. Later poll-safe wall-clock
+# pulses continue across the title and default new-game setup even when renderer throughput changes
+# the number of flips reached before each screen. The opening movies expose a hold-Square skip meter,
+# so separated Square holds skip those rather than sending ineffective Cross presses into the FMV.
+# Later Cross pulses advance dialogue; the final Right hold proves that the routed tutorial is
+# player-controlled rather than an attract sequence.
+# Validate this route with the default write-watch configuration; disabling or limiting watches does
+# not exercise the Unity worker-fault path that previously stopped progression at the movie skip.
 f300-312:cross
 f500-512:cross
 f700-712:cross
@@ -10,3 +15,44 @@ f1100-1112:cross
 f1300-1312:cross
 f1500-1512:cross
 f1700-1712:cross
+f1900-1912:cross
+f2100-2112:cross
+f2300-2312:cross
+f2500-2512:cross
+f2700-2712:cross
+f2900-2912:cross
+f3100-3112:cross
+f3300-3312:cross
+f3500-3512:cross
+f3700-3712:cross
+f3900-3912:cross
+f4100-4112:cross
+25-26:cross
+30-31:cross
+35-36:cross
+40-41:cross
+45-46:cross
+50-51:cross
+55-56:cross
+60-64:square
+70-74:square
+80-84:square
+90-94:square
+100-104:square
+110-111:cross
+115-116:cross
+120-121:cross
+125-126:cross
+130-131:cross
+135-136:cross
+140-141:cross
+145-146:cross
+150-151:cross
+155-156:cross
+160-161:cross
+165-166:cross
+170-171:cross
+175-176:cross
+180-181:cross
+185-186:cross
+190-220:left-stick-right

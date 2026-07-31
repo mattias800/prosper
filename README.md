@@ -39,6 +39,10 @@ in [Game compatibility](COMPATIBILITY.md).
   <em><strong>GRIS</strong> — opening gameplay, native 1920×1080</em>
 </p>
 <p align="center">
+  <img src="assets/screenshots/space-adventure-cobra.png" alt="Space Adventure Cobra — tutorial combat"><br>
+  <em><strong>Space Adventure Cobra — The Awakening</strong> — tutorial combat, native 1920×1080</em>
+</p>
+<p align="center">
   <img src="assets/screenshots/blue-prince-title.png" alt="Blue Prince — title screen"><br>
   <em><strong>Blue Prince</strong> — title screen</em>
 </p>

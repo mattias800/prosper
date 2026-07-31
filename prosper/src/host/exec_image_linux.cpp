@@ -1006,6 +1006,20 @@ namespace {
         return true;
     }
 
+    // Guest write-watch handling enters std::mutex and glibc mprotect. Both use host TLS through %fs
+    // (`pthread_mutex_trylock` reads the host TID and a failing mprotect stores errno), while a guest
+    // worker reaches this signal handler with %fs pointing at its guest TCB. Scope only that host work
+    // onto the saved host TCB, then restore the original guest %fs before either resuming the store or
+    // continuing through the ordinary fault path. Keep this helper stack-protector-free because it
+    // deliberately changes %fs within its own frame.
+    __attribute__((no_stack_protector))
+    bool handle_guest_write_watch_fault(uint64_t addr) {
+        const uint64_t saved_guest_fs = guest_fs_to_host_scoped();
+        const bool handled = prosper::host::guest_write_watch_handle_fault(addr);
+        guest_fs_restore_scoped(saved_guest_fs);
+        return handled;
+    }
+
     // NO stack-protector here: the canary lives at %fs:0x28, and this handler runs on whatever %fs the
     // faulting GUEST thread had — under PROSPER_GUEST_FS that is the guest TP, whose [fs+0x28] is plain
     // guest data. Sony libc's abort stub (libc.prx+0x48d0: `mov $stopcode, %fs:0x28 ; int $0x45`) even
@@ -1029,7 +1043,7 @@ namespace {
         // the store re-executes. Returns false for any address we did not arm, so genuine guest faults
         // fall through untouched. Only ever true when this handler is on the sigaltstack (red-zone-safe).
         if (sig == SIGSEGV && si->si_addr &&
-            prosper::host::guest_write_watch_handle_fault(reinterpret_cast<uint64_t>(si->si_addr)))
+            handle_guest_write_watch_fault(reinterpret_cast<uint64_t>(si->si_addr)))
             return;
         // A SIGILL we did NOT emulate: log the faulting instruction bytes so the offending opcode can be
         // identified (another AMD-only ISA extension, or a decode miss in try_emulate_sse4a). #163-progress.

@@ -1,8 +1,8 @@
 # GRIS, Sonic Origins, and Space Adventure Cobra bring-up
 
-Validated on Linux on 2026-07-25, with GRIS opening gameplay revalidated on current master on
-2026-07-31. This note records the reproducible evidence for issue #1356. Raw PCM, verbose logs, and
-GPU captures are local diagnostics and are intentionally not committed.
+Validated on Linux on 2026-07-25, with GRIS opening gameplay and Cobra tutorial combat revalidated
+on 2026-07-31. This note records the reproducible evidence for issue #1356. Raw PCM, verbose logs,
+and GPU captures are local diagnostics and are intentionally not committed.
 
 ## Result matrix
 
@@ -10,7 +10,7 @@ GPU captures are local diagnostics and are intentionally not committed.
 | --- | --- | --- | --- |
 | GRIS (`PPSA09804`) | 01.001.000 | Native 1920×1080 opening gameplay with scripted movement | CLEAN on current master over the first 35 seconds: `rms=0.0082`, `peak=0.1173`, duplicated grains 0.0% |
 | Sonic Origins (`PPSA05325`) | 02.002.000 update targeting 02.001.000 | Blocked: update-only dump is missing two base title assets | AudioOut2 port 17 runs, but guest PCM is zero while startup is blocked |
-| Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | Native 1920×1080 title | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
+| Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | Native 1920×1080 tutorial combat with scripted progression | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
 
 ## Visual evidence
 
@@ -35,11 +35,22 @@ contained 85 source-distinct and 85 pixel-distinct unmodified 1920×1080 fronten
 
 ![Space Adventure Cobra — The Awakening title](screenshots/issue-1356-space-adventure-cobra-title.png)
 
+![Space Adventure Cobra — tutorial combat](../../assets/screenshots/space-adventure-cobra.png)
+
 Route: `scripts/cobra/reach-title-or-gameplay.pad`.
 
-The normal screenshot frontend produced both images through the composited present path at
-1920×1080. No debug shader, resource override, render scaling, sparse rendering, or warm-up shortcut
-was used for the committed visual evidence.
+The route combines early flip-anchored Cross pulses with wall-clock hold-Square actions for the
+opening movies and later Cross pulses for dialogue. A fresh-save, default-configuration run observed
+Square at 60, 70, 80, 90, and 100 seconds, reached the readable `Press R2 to shoot with the
+Psychogun.` tutorial at 85 seconds, and continued through full-color combat for the complete
+180-second bound. All 36 captures came from distinct composited source frames; 33 were pixel-distinct.
+
+Write watches remained fully enabled in that run: 63 registrations covered 65,504 pages and handled
+8,447 write faults without a worker crash. The fault path temporarily restores host `%fs` around the
+host mutex and `mprotect`, then restores guest `%fs` before resuming the interrupted store. A
+production-handler regression test locks that TLS boundary. The normal screenshot frontend produced
+the committed images at 1920×1080 with no debug shader, resource override, render scaling, sparse
+rendering, warm-up shortcut, or write-watch escape hatch.
 
 ## Reproduction
 
@@ -48,24 +59,26 @@ Run from the repository root and point each command at a legally obtained app di
 ```bash
 PROSPER_PAD_SCRIPT=@prosper/scripts/gris/reach-title-screen.pad \
   prosper/build-linux/screenshot /path/PPSA09804-app0 \
-  --seconds 1 --count 35 --timeout 90 --out /tmp/gris-shots
+  --seconds 1 --count 35 --timeout 90 --out "$HOME/prosper-artifacts/gris-shots"
 
 PROSPER_PAD_SCRIPT=@prosper/scripts/gris/reach-first-gameplay.pad \
   prosper/build-linux/screenshot /path/PPSA09804-app0 \
-  --seconds 2 --count 85 --timeout 210 --out /tmp/gris-gameplay-shots
+  --seconds 2 --count 85 --timeout 210 --out "$HOME/prosper-artifacts/gris-gameplay-shots"
 
+PROSPER_SAVEDATA_DIR="$HOME/prosper-artifacts/cobra-savedata" \
+PROSPER_SAVE0="$HOME/prosper-artifacts/cobra-save0" \
 PROSPER_PAD_SCRIPT=@prosper/scripts/cobra/reach-title-or-gameplay.pad \
   prosper/build-linux/screenshot /path/PPSA17337-app0 \
-  --seconds 1 --count 90 --timeout 180 --out /tmp/cobra-shots
+  --seconds 5 --count 36 --timeout 195 --out "$HOME/prosper-artifacts/cobra-shots"
 ```
 
-Capture final mixed PCM with `PROSPER_AUDIO_DUMP=/tmp/<title>`. GRIS's title is silent, so use
+Capture final mixed PCM with `PROSPER_AUDIO_DUMP="$HOME/prosper-artifacts/<title>"`. GRIS's title is silent, so use
 `scripts/gris/reach-first-gameplay.pad` for its audio exercise; the title-screen route remains the
 visual evidence route. Analyze the active port using its logged format; GRIS uses stereo float32 on
 port 1 (its auxiliary port 3 remained silent):
 
 ```bash
-python3 prosper/tools/audio_analyze.py /tmp/gris.port1.raw \
+python3 prosper/tools/audio_analyze.py "$HOME/prosper-artifacts/gris.port1.raw" \
   --fmt f32 --channels 2 --rate 48000 --tail-seconds 30
 ```
 
@@ -147,7 +160,7 @@ compatibility result. Reproduce it with:
 PROSPER_GAME_INTENT_ACTIVITY_ID=TITLE_SONIC_1_CLASSIC \
 PROSPER_PAD_SCRIPT=@prosper/scripts/sonic/reach-title-or-gameplay.pad \
   prosper/build-linux/screenshot /path/PPSA05325-app0 \
-  --seconds 1 --count 60 --timeout 120 --out /tmp/sonic-activity-shots
+  --seconds 1 --count 60 --timeout 120 --out "$HOME/prosper-artifacts/sonic-activity-shots"
 ```
 
 The control is off by default; an ordinary launch continues to report no pending Game Intent.
