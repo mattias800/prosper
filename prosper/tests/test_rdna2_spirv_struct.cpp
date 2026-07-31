@@ -732,6 +732,218 @@ int main() {
     }
     printf("  [ok]   barrier phase terminates and rejoins Astro's crossing Wave32 CFG\n");
 
+    // The terminal workgroup guard may have unrelated lane-local setup before its scalar condition.
+    // Only the backwards slice feeding SCC matters: this vector write cannot affect s0 or the SOPC,
+    // so all invocations still enter/skip the barrier sequence together. The phase-local crossing
+    // CFG is the same dispatcher-requiring shape as above.
+    const uint32_t wave32_compute_vector_prefixed_guarded_phase[] = {
+        0x7e000280u,                         // pc0: unrelated v_mov_b32 v0,0
+        0xbf060000u,                         // pc1: workgroup-uniform s_cmp_eq_u32 s0,s0
+        0xbf84000cu,                         // pc2: early-out -> terminal pc15
+        0xbeea0385u,                         // pc3: scalar-data vcc_lo=5
+        0x7da40100u,                         // pc4: v_cmpx_eq_u32 v0,v0 (EXEC only)
+        0xbf880003u,                         // pc5: execz -> pc9
+        0x7d840100u,                         // pc6: fresh VCC definition
+        0x02020100u,                         // pc7: consume the fresh VCC
+        0xbf880002u,                         // pc8: execz -> pc11
+        0xbf060000u,                         // pc9: rejoin without reading VCC
+        0xbf850001u,                         // pc10: branch -> pc12, skipping pc11
+        0x7e040280u,                         // pc11: first arm
+        0x7e060280u,                         // pc12: phase-local join
+        0xbf8a0000u,                         // pc13: uniform guest barrier
+        0x7e080280u,                         // pc14: tail phase
+        0xbf810000u,                         // pc15: terminal s_endpgm
+    };
+    const auto vector_prefixed_guarded_spv = recompile_compute(
+        wave32_compute_vector_prefixed_guarded_phase,
+        std::size(wave32_compute_vector_prefixed_guarded_phase), nullptr,
+        wave32_compute_config);
+    if (vector_prefixed_guarded_spv.empty() || !has_opcode(vector_prefixed_guarded_spv, 251) ||
+        !type_result_ids_are_nonzero(vector_prefixed_guarded_spv, nullptr) ||
+        !phi_ids_are_nonzero(vector_prefixed_guarded_spv)) {
+        printf("  [FAIL] lane-local setup hid a scalar-uniform terminal barrier guard\n");
+        return 1;
+    }
+
+    // A scalar produced by V_READFIRSTLANE can differ between guest waves. Feeding it into the same
+    // terminal SCC guard would place the guest barrier under workgroup-divergent control flow, so the
+    // relaxed prefix analysis must remain fail-closed.
+    std::vector<uint32_t> lane_guarded_phase(
+        std::begin(wave32_compute_vector_prefixed_guarded_phase),
+        std::end(wave32_compute_vector_prefixed_guarded_phase));
+    lane_guarded_phase[0] = 0x7e000500u;     // v_readfirstlane_b32 s0,v0
+    lane_guarded_phase[1] = 0xbf068000u;     // s_cmp_eq_u32 s0,0
+    if (!recompile_compute(lane_guarded_phase.data(), lane_guarded_phase.size(), nullptr,
+                           wave32_compute_config).empty()) {
+        printf("  [FAIL] lane-derived SCC admitted a divergent terminal barrier guard\n");
+        return 1;
+    }
+
+    // A uniform literal is not a uniform reaching definition when a lane-derived wave branch can
+    // skip it. The textual backwards slice must not cross that branch and place the barrier under a
+    // condition that can differ between guest waves.
+    const uint32_t conditionally_written_guarded_phase[] = {
+        0x7d840300u,                         // pc0: v_cmp_eq_u32 vcc,v0,v1
+        0xbf860001u,                         // pc1: vccz -> pc3, skipping the scalar write
+        0xbe800380u,                         // pc2: s_mov_b32 s0,0
+        0xbf068000u,                         // pc3: s_cmp_eq_u32 s0,0
+        0xbf84000cu,                         // pc4: early-out -> terminal pc17
+        0xbeea0385u,                         // pc5: scalar-data vcc_lo=5
+        0x7da40100u,                         // pc6: v_cmpx_eq_u32 v0,v0 (EXEC only)
+        0xbf880003u,                         // pc7: execz -> pc11
+        0x7d840100u,                         // pc8: fresh VCC definition
+        0x02020100u,                         // pc9: consume the fresh VCC
+        0xbf880002u,                         // pc10: execz -> pc13
+        0xbf060000u,                         // pc11: rejoin without reading VCC
+        0xbf850001u,                         // pc12: branch -> pc14, skipping pc13
+        0x7e040280u,                         // pc13: first arm
+        0x7e060280u,                         // pc14: phase-local join
+        0xbf8a0000u,                         // pc15: guest barrier
+        0x7e080280u,                         // pc16: tail phase
+        0xbf810000u,                         // pc17: terminal s_endpgm
+    };
+    if (!recompile_compute(conditionally_written_guarded_phase,
+                           std::size(conditionally_written_guarded_phase), nullptr,
+                           wave32_compute_config).empty()) {
+        printf("  [FAIL] barrier guard slice crossed a lane-derived conditional write\n");
+        return 1;
+    }
+    std::vector<uint32_t> fork_guarded_phase(
+        std::begin(conditionally_written_guarded_phase),
+        std::end(conditionally_written_guarded_phase));
+    fork_guarded_phase[1] = 0xbf830001u; // s_cbranch_i_fork also invalidates textual dominance
+    if (!recompile_compute(fork_guarded_phase.data(), fork_guarded_phase.size(), nullptr,
+                           wave32_compute_config).empty()) {
+        printf("  [FAIL] barrier guard slice crossed s_cbranch_i_fork\n");
+        return 1;
+    }
+    printf("  [ok]   barrier guard slicing ignores unrelated VALU but rejects lane-derived SCC\n");
+
+    ComputeShaderConfig portable_wave64_compute_config;
+    portable_wave64_compute_config.local_x = 128;
+    portable_wave64_compute_config.wave_size = 64;
+
+    // Exercise the ordinary integer-B64 emitter separately from the mask-domain vote below.
+    // Exact llvm-mc gfx1010 encoding: v_cmp_gt_u64_e64 vcc_lo,s[0:1],0.
+    const uint32_t wave64_u64_compare[] = {
+        0xd4e4006au, 0x00010000u,
+        0xbf810000u,
+    };
+    const auto wave64_u64_compare_spv = recompile_compute(
+        wave64_u64_compare, std::size(wave64_u64_compare), nullptr,
+        portable_wave64_compute_config);
+    if (wave64_u64_compare_spv.empty() ||
+        !type_result_ids_are_nonzero(wave64_u64_compare_spv, nullptr)) {
+        printf("  [FAIL] e64 unsigned-B64 comparison did not lower structurally\n");
+        return 1;
+    }
+
+    // Exact reduced Astro Wave64 shape from PC478..1195: an e64 unsigned-B64 comparison broadcasts
+    // whether VCC contains any live lane, then a later s_and_b64 publishes SCC=(result mask != 0).
+    // Ordinary VALU can be scheduled between the mask producer and its SCC branch. Crossing SCC/
+    // EXEC regions force the portable arbitrary-CFG dispatcher, whose common phase must perform
+    // both guest-wave votes without placing a workgroup barrier inside one dynamic switch arm.
+    const uint32_t wave64_compute_live_b64_mask_scc[] = {
+        0x7d840000u,                         // pc0: v_cmp_eq_u32 vcc,v0,v0
+        0xd4e4006au, 0x0001006au,            // pc1: v_cmp_gt_u64_e64 vcc,vcc,0
+        0xbea0047eu,                         // pc3: s_mov_b64 s[32:33],exec
+        0x87ea6a20u,                         // pc4: s_and_b64 vcc,s[32:33],vcc -> live SCC
+        0x7e000280u,                         // pc5: SCC-preserving scheduled VALU
+        0xbf840003u,                         // pc6: s_cbranch_scc0 -> pc10
+        0x7d840100u,                         // pc7: fresh VCC definition
+        0x02020100u,                         // pc8: consume the fresh VCC
+        0xbf860002u,                         // pc9: s_cbranch_vccz -> pc12 (crossing region)
+        0xbf060000u,                         // pc10: later SCC lifetime, after first consumer
+        0xbf850001u,                         // pc11: third branch -> pc13 forces complex CFG
+        0x7e020280u,                         // pc12: crossing arm
+        0xbf810000u,                         // pc13: s_endpgm
+    };
+    const auto live_b64_mask_scc_spv = recompile_compute(
+        wave64_compute_live_b64_mask_scc, std::size(wave64_compute_live_b64_mask_scc),
+        nullptr, portable_wave64_compute_config);
+    if (live_b64_mask_scc_spv.empty() ||
+        !has_opcode(live_b64_mask_scc_spv, 224) || // synchronized guest-wave vote
+        !has_opcode(live_b64_mask_scc_spv, 251) || // arbitrary CFG dispatcher
+        !type_result_ids_are_nonzero(live_b64_mask_scc_spv, nullptr) ||
+        !phi_ids_are_nonzero(live_b64_mask_scc_spv)) {
+        printf("  [FAIL] live B64 mask SCC did not reach its crossing dispatcher branch\n");
+        return 1;
+    }
+
+    // A later SOPC owns SCC, so the old mask producer must not be selected speculatively. The
+    // crossing graph remains valid and branches on the ordinary scalar comparison.
+    std::vector<uint32_t> overwritten_b64_mask_scc(
+        std::begin(wave64_compute_live_b64_mask_scc),
+        std::end(wave64_compute_live_b64_mask_scc));
+    overwritten_b64_mask_scc[5] = 0xbf060000u; // s_cmp_eq_u32 s0,s0 overwrites SCC
+    if (recompile_compute(overwritten_b64_mask_scc.data(), overwritten_b64_mask_scc.size(),
+                          nullptr, portable_wave64_compute_config).empty()) {
+        printf("  [FAIL] SCC overwrite was confused with the earlier B64 mask producer\n");
+        return 1;
+    }
+
+    // SCC use by scalar dataflow is deliberately outside this branch-only proof. Broadening the
+    // vote to make s_cselect consume the poisoned per-wave result would synchronize speculatively.
+    std::vector<uint32_t> nonbranch_b64_mask_scc(
+        std::begin(wave64_compute_live_b64_mask_scc),
+        std::end(wave64_compute_live_b64_mask_scc));
+    nonbranch_b64_mask_scc[6] = 0x85a2807eu; // s_cselect_b64 s[34:35],exec,0
+    if (!recompile_compute(nonbranch_b64_mask_scc.data(), nonbranch_b64_mask_scc.size(),
+                           nullptr, portable_wave64_compute_config).empty()) {
+        printf("  [FAIL] non-branch SCC consumer gained a speculative B64 mask vote\n");
+        return 1;
+    }
+
+    // A branch target starts a new SCC lifetime: another predecessor can enter without executing
+    // the textually preceding mask producer. The branch-only proof must not cross that CFG join.
+    std::vector<uint32_t> joined_b64_mask_scc(
+        std::begin(wave64_compute_live_b64_mask_scc),
+        std::end(wave64_compute_live_b64_mask_scc));
+    joined_b64_mask_scc[3] = 0xbf820001u; // pc3: s_branch pc5, making pc5 a block entry
+    if (!recompile_compute(joined_b64_mask_scc.data(), joined_b64_mask_scc.size(), nullptr,
+                           portable_wave64_compute_config).empty()) {
+        printf("  [FAIL] B64 mask SCC producer was associated across a CFG join\n");
+        return 1;
+    }
+
+    // With two mask producers, only the last architectural SCC writer feeds the branch. The first
+    // producer stays ordinary mask dataflow; the second is the single synchronized vote source.
+    std::vector<uint32_t> superseded_b64_mask_scc(
+        std::begin(wave64_compute_live_b64_mask_scc),
+        std::end(wave64_compute_live_b64_mask_scc));
+    superseded_b64_mask_scc[5] = 0x88a26a7eu; // s_or_b64 s[34:35],exec,vcc -> newer SCC
+    if (recompile_compute(superseded_b64_mask_scc.data(), superseded_b64_mask_scc.size(),
+                          nullptr, portable_wave64_compute_config).empty()) {
+        printf("  [FAIL] last-live B64 mask producer was not selected uniquely\n");
+        return 1;
+    }
+
+    // An ordinary scalar B64 logical writes an exact SCC directly. Even in the complex dispatcher,
+    // it must not be diverted into the synchronized mask vote merely because a branch consumes SCC.
+    const uint32_t ordinary_b64_scalar_scc[] = {
+        0xbea00481u,                         // pc0: s_mov_b64 s[32:33],1
+        0xbea20483u,                         // pc1: s_mov_b64 s[34:35],3
+        0x87a42220u,                         // pc2: s_and_b64 s[36:37],s[32:33],s[34:35]
+        0x7e000280u,                         // pc3: SCC-preserving scheduled VALU
+        0xbf840003u,                         // pc4: s_cbranch_scc0 -> pc8
+        0x7d840100u,                         // pc5: fresh VCC definition
+        0x06020100u,                         // pc6: consume the fresh VCC
+        0xbf860002u,                         // pc7: s_cbranch_vccz -> pc10
+        0xbf060000u,                         // pc8: later SCC lifetime
+        0xbf850001u,                         // pc9: third branch -> pc11 forces complex CFG
+        0x7e020280u,                         // pc10: crossing arm
+        0xbf810000u,                         // pc11: s_endpgm
+    };
+    const auto ordinary_b64_scalar_scc_spv = recompile_compute(
+        ordinary_b64_scalar_scc, std::size(ordinary_b64_scalar_scc), nullptr,
+        portable_wave64_compute_config);
+    if (ordinary_b64_scalar_scc_spv.empty() ||
+        !has_opcode(ordinary_b64_scalar_scc_spv, 251)) {
+        printf("  [FAIL] ordinary scalar B64 SCC was diverted into a mask vote\n");
+        return 1;
+    }
+    printf("  [ok]   B64 mask SCC votes are branch-only and select the last live producer\n");
+
     // Astro Bot's Wave64 world-map kernel selects ordinary LDS-write sequences with
     // S_CBRANCH_VCCZ. The scalar edge is exact per guest wave, but different waves in the workgroup
     // may choose different arms. That is legal for ordinary LDS loads/stores/atomics: unlike a guest
@@ -744,9 +956,6 @@ int main() {
         0xd8340084u, 0x00000002u,            // pc2: ds_write_b32 v2,v0 offset:0x84
         0xbf810000u,                         // pc4: s_endpgm
     };
-    ComputeShaderConfig portable_wave64_compute_config;
-    portable_wave64_compute_config.local_x = 128;
-    portable_wave64_compute_config.wave_size = 64;
     const auto wave64_compute_vcc_lds_spv = recompile_compute(
         wave64_compute_vcc_lds_write, std::size(wave64_compute_vcc_lds_write), nullptr,
         portable_wave64_compute_config);

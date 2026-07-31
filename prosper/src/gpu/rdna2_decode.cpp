@@ -333,6 +333,18 @@ void decode_operands(Rdna2Inst& i) {
             // Applied to the float result in the recompiler (rdna2_to_spirv VOP3 float ops).
             i.clamp = ((w >> 15) & 1u) != 0;
             i.omod  = (uint8_t)((d1 >> 27) & 3u);
+            // VOPC-as-VOP3 (the e64 compare encoding) occupies opcodes 0x000..0x0ff. Its
+            // dword0 low field is an explicit scalar-mask destination, not VDST, and it has only
+            // two data sources. Classify it as VOPC after retaining the e64 source modifiers so
+            // every mask/provenance consumer sees the architectural destination. Treating Astro's
+            // `v_cmp_gt_u64_e64 vcc_lo,vcc,0` as ordinary VOP3 invented a VGPR106 write and made the
+            // compute CFG dispatcher reject opcode 0xe4.
+            if (i.opcode < 0x100u) {
+                i.fmt = Rdna2Format::VOPC;
+                i.dst = sgpr(w & 0x7Fu);
+                i.src[2] = {};
+                i.n_src = 2;
+            }
             // VOP3B (sec 13.3.4 — the complete opcode list: v_add/sub/subrev_co_ci_u32
             // 0x128/0x129/0x12A, v_div_scale_f32/f64 0x16D/0x16E, v_mad_u64_u32/v_mad_i64_i32
             // 0x176/0x177, v_add/sub/subrev_co_u32 0x30F/0x310/0x319): dword0[14:8] is a scalar
