@@ -732,6 +732,70 @@ int main() {
     }
     printf("  [ok]   barrier phase terminates and rejoins Astro's crossing Wave32 CFG\n");
 
+    // Astro Bot's Wave64 world-map kernel selects ordinary LDS-write sequences with
+    // S_CBRANCH_VCCZ. The scalar edge is exact per guest wave, but different waves in the workgroup
+    // may choose different arms. That is legal for ordinary LDS loads/stores/atomics: unlike a guest
+    // barrier or synthesized wave collective, they impose no workgroup-wide reconvergence point.
+    // Keep this portable (native_subgroup_size=0) and use two guest waves so the test exercises the
+    // exact scratch vote rather than accidentally inheriting the host subgroup's branch domain.
+    const uint32_t wave64_compute_vcc_lds_write[] = {
+        0x7d840000u,                         // pc0: v_cmp_eq_u32 vcc,v0,v0
+        0xbf860002u,                         // pc1: s_cbranch_vccz -> pc4
+        0xd8340084u, 0x00000002u,            // pc2: ds_write_b32 v2,v0 offset:0x84
+        0xbf810000u,                         // pc4: s_endpgm
+    };
+    ComputeShaderConfig portable_wave64_compute_config;
+    portable_wave64_compute_config.local_x = 128;
+    portable_wave64_compute_config.wave_size = 64;
+    const auto wave64_compute_vcc_lds_spv = recompile_compute(
+        wave64_compute_vcc_lds_write, std::size(wave64_compute_vcc_lds_write), nullptr,
+        portable_wave64_compute_config);
+    if (wave64_compute_vcc_lds_spv.empty() ||
+        !has_opcode(wave64_compute_vcc_lds_spv, 224) || // OpControlBarrier: exact scratch vote
+        !has_opcode(wave64_compute_vcc_lds_spv, 247) || // OpSelectionMerge: retained guest arm
+        !type_result_ids_are_nonzero(wave64_compute_vcc_lds_spv, nullptr) ||
+        !phi_ids_are_nonzero(wave64_compute_vcc_lds_spv)) {
+        printf("  [FAIL] Wave64 VCC branch rejected an ordinary in-arm LDS write\n");
+        return 1;
+    }
+    printf("  [ok]   Wave64 VCC branch retains ordinary LDS effects after an exact wave vote\n");
+
+    // The acceptance above must not become a blanket escape hatch for operations whose lowering
+    // contains a workgroup/subgroup synchronization phase. Those remain fail-visible inside a
+    // per-wave arm until a common-phase transformation proves every invocation participates.
+    const uint32_t wave64_compute_vcc_barrier[] = {
+        0x7d840000u,
+        0xbf860002u,                         // vccz -> pc4
+        0xbf8a0000u,                         // guest workgroup barrier
+        0xbf800000u,
+        0xbf810000u,
+    };
+    const uint32_t wave64_compute_vcc_mbcnt[] = {
+        0x7d840000u,
+        0xbf860002u,                         // vccz -> pc4
+        0xd7650004u, 0x000100c1u,            // v_mbcnt_lo_u32_b32 v4,-1,0
+        0xbf810000u,
+    };
+    const uint32_t wave64_compute_vcc_swizzle[] = {
+        0x7d840000u,
+        0xbf860002u,                         // vccz -> pc4
+        0xd8d4020fu, 0x00000000u,            // ds_swizzle_b32 v0,v0 offset:0x020f
+        0xbf810000u,
+    };
+    if (!recompile_compute(wave64_compute_vcc_barrier,
+                           std::size(wave64_compute_vcc_barrier), nullptr,
+                           portable_wave64_compute_config).empty() ||
+        !recompile_compute(wave64_compute_vcc_mbcnt,
+                           std::size(wave64_compute_vcc_mbcnt), nullptr,
+                           portable_wave64_compute_config).empty() ||
+        !recompile_compute(wave64_compute_vcc_swizzle,
+                           std::size(wave64_compute_vcc_swizzle), nullptr,
+                           portable_wave64_compute_config).empty()) {
+        printf("  [FAIL] synchronized operation escaped through a Wave64 VCC branch\n");
+        return 1;
+    }
+    printf("  [ok]   Wave64 VCC branches still reject synchronized in-arm operations\n");
+
     wave32_compute_config.wave_size = 64;
     if (!recompile_compute(wave32_compute_masks, std::size(wave32_compute_masks), nullptr,
                            wave32_compute_config).empty()) {
