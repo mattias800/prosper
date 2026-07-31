@@ -31,6 +31,35 @@ python3 tools/snapshot/snapshot.py check blasphemous2-gameplay
 - Do not lower a threshold merely to pass. Explain intentional contract changes
   and repeat the baseline-review workflow below.
 
+### Why the content contract is conjoined, measured on a real title
+
+"Colour count must never be the contract on its own" is not a precaution; it is
+a measured result. Profiling the Rugrats route (`PPSA23396`) once per second
+across a whole boot produced both halves of the argument from one run, and they
+fail in **opposite** directions — which is exactly why neither metric can stand
+alone, and why `min_colors`, `min_nonblack_ratio`, SSIM, `dims` and
+`min_pixel_changes` are conjoined:
+
+- **Colour count alone prefers a menu to the game.** The two richest frames of
+  the entire run are the GAME MODE selector at 56,071-56,090 distinct colours.
+  The best actual gameplay frame reaches 17,645. A colour-only guard would rank
+  a menu **3.2x above every frame of the scene it exists to protect**, so it
+  would pass a build whose gameplay had collapsed as long as the menu still drew.
+- **Coverage alone accepts a nearly colourless screen.** The "BABIES IN
+  GAMELAND" level-title card and its fade are **fully opaque — a 1.0 non-black
+  ratio — at only 1,551-3,448 colours**. 54 frames of the run reach 0.999
+  coverage with as few as 1,551 colours, so a coverage-only guard treats a
+  title card as a rendered level.
+
+The practical rule: let SSIM decide *scene identity*, and keep `min_colors` as a
+gross-collapse floor rather than tuning it to separate two valid scenes. For
+Rugrats the tempting floor is ~16,000 — just under the 17,259 gameplay minimum
+and just over the 15,030 menu ceiling — but that discrimination is redundant
+with SSIM while making the guard fragile against a slightly dimmer healthy
+frame. 12,000 was chosen instead: comfortably below the observed gameplay range
+and far above every observed failure state (black at 1 colour, logos at most
+3,830, title card at most 3,448).
+
 ## New Or Changed Baselines
 
 Baseline evidence requires visual review even though routine regression runs do
