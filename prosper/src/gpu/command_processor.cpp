@@ -32,6 +32,73 @@ namespace prosper { void prosper_eq_trigger_eop(); }
 
 namespace prosper::gpu {
 
+std::vector<RegWatchEntry> parse_reg_watch(const char* setting) {
+    std::vector<RegWatchEntry> entries;
+    if (!setting || !*setting) return entries;
+    const std::string text(setting);
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t comma = text.find(',', start);
+        std::string item = text.substr(start, comma == std::string::npos ? std::string::npos
+                                                                         : comma - start);
+        start = comma == std::string::npos ? text.size() + 1 : comma + 1;
+        // Trim surrounding spaces so a human-written list stays forgiving.
+        while (!item.empty() && std::isspace(static_cast<unsigned char>(item.front())))
+            item.erase(item.begin());
+        while (!item.empty() && std::isspace(static_cast<unsigned char>(item.back())))
+            item.pop_back();
+        if (item.empty()) continue;
+        RegWatchEntry entry;
+        const size_t colon = item.find(':');
+        if (colon != std::string::npos) {
+            const std::string cls = item.substr(0, colon);
+            if (cls == "Cx" || cls == "cx") entry.reg_class = RegClass::Cx;
+            else if (cls == "Sh" || cls == "sh") entry.reg_class = RegClass::Sh;
+            else if (cls == "Uc" || cls == "uc") entry.reg_class = RegClass::Uc;
+            else continue;   // unknown class: skip this entry, keep the rest of the list
+            item = item.substr(colon + 1);
+            if (item.empty()) continue;
+        }
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long parsed = std::strtoul(item.c_str(), &end, 0);
+        if (errno || !end || *end || parsed > 0xFFFFFFFFul) continue;
+        entry.offset = static_cast<uint32_t>(parsed);
+        if (std::find(entries.begin(), entries.end(), entry) == entries.end())
+            entries.push_back(entry);
+    }
+    return entries;
+}
+
+namespace {
+const std::vector<RegWatchEntry>& reg_watch_entries() {
+    static const std::vector<RegWatchEntry> entries =
+        parse_reg_watch(std::getenv("PROSPER_REGWATCH"));
+    return entries;
+}
+
+// One line per watched write. `values`/`count` describe a direct multi-register span so a watched
+// offset inside a larger SET_*_REG range still reports the dword that actually landed on it.
+void reg_watch_report(RegClass reg_class, uint32_t offset, uint32_t value, uint32_t count,
+                      const uint32_t* values, const char* path, uint64_t command_order) {
+    const auto& entries = reg_watch_entries();
+    if (entries.empty()) return;
+    for (const auto& entry : entries) {
+        if (entry.reg_class != reg_class) continue;
+        if (entry.offset < offset || entry.offset >= offset + (count ? count : 1u)) continue;
+        const uint32_t index = entry.offset - offset;
+        const uint32_t written = values && index < count ? values[index] : value;
+        static std::atomic<int> emitted{0};
+        if (emitted.fetch_add(1) >= 400000) return;
+        const char* cn = reg_class == RegClass::Cx ? "Cx"
+                       : reg_class == RegClass::Sh ? "Sh" : "Uc";
+        std::fprintf(stderr, "[regwatch] class=%s off=0x%x val=0x%08x path=%s span=0x%x+%u order=%llu\n",
+                     cn, entry.offset, written, path, offset, count,
+                     static_cast<unsigned long long>(command_order));
+    }
+}
+}  // namespace
+
 // Readability probe (gpu_executor.cpp, declared in gpu_execute.hpp): page-granular check that a
 // guest range is mapped, so the Jump fold below never walks an unmapped segment address.
 bool guest_readable(uint64_t addr, uint32_t bytes);
@@ -2005,6 +2072,11 @@ void GpuState::apply(const Pm4Command& c) {
                 }
                 // Hardware drops writes to nonexistent register offsets; mirror that instead of
                 // folding placeholder/stale array slots into the register file (see kRegOffsetLimit).
+                // PROSPER_REGWATCH: indirect-path half. Reported before the bounds drop for the same
+                // reason as the direct path — a watched register whose only writes are dropped here
+                // is a different finding from one that is never written.
+                reg_watch_report(c.reg_class, offset, regs[i].value, 1u, nullptr,
+                                 "indirect", command_order);
                 if (offset >= kRegOffsetLimit) {
                     if (bad++ == 0) first_bad = i;
                     static std::atomic<int> dropped_note{0};
@@ -2095,6 +2167,13 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         }
         case K::SetRegDirect: {
+            // PROSPER_REGWATCH: direct-path half of the register-write watch (see below for the
+            // indirect half). Emitted before the bounds check so a dropped out-of-range write is
+            // still observable — "the write happened but landed nowhere" is a distinct diagnosis
+            // from "the write never happened".
+            reg_watch_report(c.reg_class, c.reg_offset,
+                             c.reg_data && c.reg_count ? c.reg_data[0] : c.reg_value,
+                             c.reg_data ? c.reg_count : 1u, c.reg_data, "direct", command_order);
             // SET_*_REG writes a consecutive range into the file named by its opcode. SH commonly
             // uploads a whole user-data SGPR block, while the direct APIs emit one Cx/Sh/Uc pair.
             auto& file = (c.reg_class == RegClass::Cx) ? cx

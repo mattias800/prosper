@@ -494,6 +494,43 @@ int main() {
         }
     }
 
+    // PROSPER_REGWATCH selector (#1459). The parse is pure so the register-write watch can be
+    // validated without a guest, a GPU, or an environment variable.
+    {
+        using prosper::gpu::parse_reg_watch;
+        using prosper::gpu::RegClass;
+
+        CHECK(parse_reg_watch(nullptr).empty() && parse_reg_watch("").empty(),
+              "an absent or empty PROSPER_REGWATCH watches nothing");
+
+        const auto plain = parse_reg_watch("0x202");
+        CHECK(plain.size() == 1 && plain[0].offset == 0x202u &&
+                  plain[0].reg_class == RegClass::Cx,
+              "a bare offset defaults to the Cx context register file");
+
+        const auto list = parse_reg_watch(" 0x202 , 0x8e,0x8f ");
+        CHECK(list.size() == 3 && list[0].offset == 0x202u && list[1].offset == 0x8eu &&
+                  list[2].offset == 0x8fu,
+              "a comma list parses every entry and tolerates surrounding spaces");
+
+        const auto classed = parse_reg_watch("Sh:0x10,Uc:2,cx:0x202");
+        CHECK(classed.size() == 3 && classed[0].reg_class == RegClass::Sh &&
+                  classed[1].reg_class == RegClass::Uc && classed[1].offset == 2u &&
+                  classed[2].reg_class == RegClass::Cx,
+              "an explicit class prefix selects the register file and decimal offsets parse");
+
+        // One malformed entry must not silently disable the rest of the watch: a selector that
+        // quietly narrows itself would make "no writes observed" mean two different things.
+        const auto tolerant = parse_reg_watch("0x202,notahex,Zz:5,,0x8e");
+        CHECK(tolerant.size() == 2 && tolerant[0].offset == 0x202u &&
+                  tolerant[1].offset == 0x8eu,
+              "unparsable and unknown-class entries are skipped without dropping valid ones");
+
+        const auto deduped = parse_reg_watch("0x202,0x202,Cx:0x202");
+        CHECK(deduped.size() == 1,
+              "a repeated register is watched once so one write reports one line");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

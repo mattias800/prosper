@@ -232,6 +232,26 @@ extern "C" void prosper_gpu_set_fold_origin(uint8_t origin);
 // from the submit paths, under the submit mutex.
 void submit_completion_pulse(bool submit_rejected = false);
 
+// PROSPER_REGWATCH=[Cx:|Sh:|Uc:]OFF[,...]: log every write to nominated registers from BOTH the
+// direct (SET_*_REG) and indirect (Set*RegsIndirect) paths, with value and command order.
+//
+// Resolved state alone cannot answer "which packet wrote this register, and was it ever written at
+// all?" — a register the guest never programs and one it programs to a value that happens to look
+// like a default are indistinguishable after folding, yet they resolve to opposite behaviour for
+// several registers (an absent CB_TARGET_MASK means write-all; a present zero means write-nothing).
+// Keeping the parse pure makes the selector testable without a guest, a GPU, or an environment.
+struct RegWatchEntry {
+    RegClass reg_class = RegClass::Cx;
+    uint32_t offset = 0;
+    bool operator==(const RegWatchEntry& o) const {
+        return reg_class == o.reg_class && offset == o.offset;
+    }
+};
+
+// Parses the selector. Unparsable or out-of-range entries are skipped rather than aborting the list,
+// so one bad entry cannot silently disable a whole watch. An empty/absent setting yields no entries.
+std::vector<RegWatchEntry> parse_reg_watch(const char* setting);
+
 } // namespace prosper::gpu
 
 // Apply every pending pipe-drain completion write NOW, in submission order (#312 — see the
