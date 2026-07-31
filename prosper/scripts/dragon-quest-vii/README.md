@@ -48,8 +48,23 @@ and Circle at 270 seconds canceled again to the title. Start/Options at 330
 seconds and Circle at 350 seconds did not advance the title. Cross is confirm
 and Circle is cancel in this flow; #1553 incorrectly attributed the already-
 visible post-Cross prompt to the later Circle press. The startup/title route
-above is unchanged. Validate the remaining Cross presses before committing a
-later checkpoint route.
+above is unchanged.
+
+A subsequent current-master run validated the next control using only Cross.
+After the checked-in title sequence, Cross at 35 seconds left the title and
+Cross at 55 seconds opened the slot prompt with `1: Unused` highlighted. The
+route then paused on that visible prompt before one Cross at 200 seconds; the
+player-name keyboard was visible by 204 seconds and had a clean direct frontend
+frame at 222.3 seconds. The long
+pause is an evidence-gathering aid, not a claim that the guest requires that
+delay. No character was entered, no normal game-save artifact was created, and
+gameplay remains unvalidated. The representative unmodified capture is
+[`../../../assets/screenshots/dragon-quest-vii-name-entry.png`](../../../assets/screenshots/dragon-quest-vii-name-entry.png).
+
+This name-entry state ran at roughly 5.5 rendered FPS during a shared-GPU run,
+with intermittent white/blue washed frames around otherwise coherent keyboard
+frames. Treat that as an open rendering/performance limitation. Validate the
+remaining name-entry presses before committing a later checkpoint route.
 
 The title is animated. Some retained frames currently show a dark/purple
 background behind the stable logo while adjacent frames show the expected sky

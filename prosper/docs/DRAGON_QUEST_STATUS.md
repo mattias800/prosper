@@ -1,4 +1,4 @@
-# Dragon Quest VII Reimagined (`PPSA17942`) — title-screen status
+# Dragon Quest VII Reimagined (`PPSA17942`) — title/name-entry status
 
 **Status as of 2026-07-31.** Current master reaches the localized, animated title screen at native
 3840x2160 from a genuinely isolated save. The validated route sends seven Cross pulses at 3, 6, 9,
@@ -6,15 +6,24 @@
 the 40-second capture. Bring-up ladder rung: **2 (title screen rendered)**. Gameplay has not been
 validated.
 
-Extended clean runs also reach the new-save name keyboard and remain alive through at least 262 seconds
-without the historical MallocBinned3 failure. A later exact-master replay with both save roots isolated
-corrected #1553's temporal/flicker interpretation: Cross at 55 seconds had already entered and highlighted
-`1: Unused` with its normal “Which slot would you like to use?” prompt. Circle at 140 seconds then
+An exact-current-master Cross-only continuation with both save roots isolated now independently reaches
+the new-save name keyboard without the historical MallocBinned3 failure. After the validated title route,
+Cross at 35 seconds left the title, Cross at 55 seconds entered and highlighted `1: Unused`, and one
+deliberately delayed Cross at 200 seconds confirmed that slot. The direct frontend reached the keyboard
+by 204 seconds; the checked-in unmodified 3840x2160 frame at 222.3 seconds clearly shows the keyboard with
+`A` highlighted and twelve empty name positions. No `GameSaveData*.dat` artifact existed when the run was
+stopped; only the system and language files were present, so save creation and gameplay remain unproven.
+The post-confirmation cadence was roughly 5.5 rendered FPS in this shared-GPU run. Adjacent frames still
+intermittently wash white or blue, so this is a progression/control milestone rather than visual-correctness
+evidence.
+
+The earlier exact-master replay corrected #1553's temporal/flicker interpretation: Cross at 55 seconds
+had already entered and highlighted `1: Unused` with its normal “Which slot would you like to use?” prompt. Circle at 140 seconds then
 canceled to the adventure-log list, and Circle at 270 seconds canceled again to the title. Start/Options
 at 330 seconds and Circle at 350 seconds did not advance the title. Cross is confirm and Circle is cancel
 in this flow; #1553 incorrectly attributed the already-visible post-Cross prompt to the later Circle
-press. A complete corrected route has not yet been validated, so save creation and gameplay remain
-unproven; the name-entry screen is not a gameplay milestone.
+press. The Cross-only continuation validates the next confirmation through name entry, but the
+name-entry screen is not a gameplay milestone.
 
 The same build can remain black after the startup sequence when run with **no input**. That is authored
 Slate state, not a lost final composite: current-master operation-prefix replay shows a coherent
@@ -61,6 +70,23 @@ treat the current title cadence as a ballpark observation, not a benchmark.
 | 0–33 s | startup logos/movie transitions and post-logo black state, advanced by Cross |
 | ~34 s | **localized Dragon Quest VII Reimagined title appears** |
 | 34–40 s | animated logo, sky/ocean, birds and water |
+
+### Validated Cross-only continuation to name entry
+
+The title route remains the short, checked-in regression recipe. A separate direct frontend run kept
+the title's seven Cross pulses, then sent Cross at 35, 55, and 200 seconds. The long final pause was
+intentional: it allowed a clean frame to anchor the selected `1: Unused` prompt before one confirmation.
+
+| t | content |
+|---|---------|
+| ~76–168 s | `1: Unused` highlighted; “Which slot would you like to use?” |
+| 200.046 s | Cross delivered; neutral at 200.453 s |
+| 204–252 s | player-name keyboard, intermittently mixed with white/blue washed samples |
+
+The representative image is
+[`assets/screenshots/dragon-quest-vii-name-entry.png`](../../assets/screenshots/dragon-quest-vii-name-entry.png),
+an unmodified native Linux `tools/screenshot` PNG from 222.3 seconds. The run was stopped after establishing
+this state; no character was entered and no gameplay claim is made.
 
 Some one-second samples show a dark/purple background behind the stable logo while adjacent samples
 show the expected sky and ocean. That may be an authored transition or a remaining rhythmic background
@@ -256,8 +282,8 @@ current build.
 1. Is the dark/purple background visible in some title samples an authored transition or a rhythmic
    renderer flicker? Capture a short high-cadence sequence at the already-routed title and correlate
    only adjacent frames; do not compare equal wall-clock indices from separate boots.
-2. What input sequence advances the current title into save selection and gameplay, and does the old
-   MallocBinned3 content-load failure still reproduce on current master? Extend the checked-in route
+2. What input sequence completes name entry, creates the save, and advances into gameplay, and does the
+   old MallocBinned3 content-load failure still reproduce on current master? Extend the checked-in route
    only after `PROSPER_PAD_SCRIPT_LOG=1` proves each transition.
 3. The historical `(u, v, u)` ramp from the rejected #1510 experiment remains unexplained but is not
    present in the accepted current-master title capture. Do not revive that patch without a separate
