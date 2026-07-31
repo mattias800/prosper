@@ -526,6 +526,22 @@ int main() {
                              compute_cfg_dispatch_bitset.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "the dispatcher preserves an in-place scalar bitset update");
+    const uint32_t plucky_scalar_bitset0[] = {
+        0xBEEB03C1u, // s_mov_b32 vcc_hi, -1 (scalar-data lifetime)
+        0xBEEB1B9Fu, // s_bitset0_b32 vcc_hi, 31 (exact Plucky #1554 packet)
+        0xBF810000u, // s_endpgm
+    };
+    CHECK(!recompile_compute(plucky_scalar_bitset0, std::size(plucky_scalar_bitset0),
+                             nullptr, ComputeShaderConfig{}).empty(),
+          "Plucky scalar-data s_bitset0_b32 sequence recompiles");
+    const uint32_t scalar_bitset0_b64[] = {
+        0xBE8404C1u, // s_mov_b64 s[4:5], -1
+        0xBE841C9Fu, // s_bitset0_b64 s[4:5], 31 (distinct unsupported opcode 0x1c)
+        0xBF810000u, // s_endpgm
+    };
+    CHECK(recompile_compute(scalar_bitset0_b64, std::size(scalar_bitset0_b64),
+                            nullptr, ComputeShaderConfig{}).empty(),
+          "unmodeled B64 bitset remains fail-visible instead of using B32 semantics");
     std::vector<uint32_t> compute_cfg_dispatch_scalar_shift = {
         0xBEEA0381u, // s_mov_b32 vcc_lo, 1 (scalar-data lifetime)
         0xBEEB0380u, // s_mov_b32 vcc_hi, 0

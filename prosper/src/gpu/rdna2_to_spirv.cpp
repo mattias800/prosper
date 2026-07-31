@@ -5416,10 +5416,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_bool_narrowed.erase(in.dst.value);
                 return true;
             }
-            if (in.opcode == 0x1c || in.opcode == 0x1d) {
+            if (in.opcode == 0x1b || in.opcode == 0x1d) {
                 // s_bitset{0,1}_b32 is an in-place scalar read/modify/write. The encoded source is
                 // the bit index while SDST supplies both the old value and destination. Astro's
-                // world-map kernel uses `s_bitset1_b32 s5,31` in a resource-table address path.
+                // world-map kernel uses `s_bitset1_b32 s5,31` in a resource-table address path;
+                // Plucky's post-Desk transition uses `s_bitset0_b32 vcc_hi,31`. Opcode 0x1c is the
+                // distinct B64 clear form and must remain fail-visible until both words are modeled.
                 if (in.dst.value == 126 || in.dst.value == 127) {
                     ok = false; return true;
                 }
@@ -5437,7 +5439,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!ok) return true;
                 const uint32_t mask = b.ibin(
                     Op_ShiftLeftLogical, b.uconst(1), bit);
-                rs.sreg[in.dst.value] = in.opcode == 0x1c
+                rs.sreg[in.dst.value] = in.opcode == 0x1b
                     ? b.ibin(Op_BitwiseAnd, old_value, b.iun(Op_Not, mask))
                     : b.ibin(Op_BitwiseOr, old_value, mask);
                 rs.sreg_srt.erase(in.dst.value);
