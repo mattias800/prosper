@@ -86,7 +86,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // stored capture-safe SPIR-V, including native-width storage formats supported by the replay device.
 // v40: retain the BVH descriptor BOX_GROW value for every resource table. The software RTIP 1.1
 // lowering uses it to reproduce the guest's conservative box-interval expansion exactly.
-constexpr uint32_t kVersion = 40;
+// v41: complete the v35 failed-stage resource tables with descriptor fields that historical version
+// tails only wrote for realized draw/compute tables, plus flat-load provenance omitted from the base
+// record. Without this, raw failed-stage retry silently reset image/layout and codegen state.
+constexpr uint32_t kVersion = 41;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -2124,6 +2127,88 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
                 error = "invalid BVH box-grow value";
                 return false;
             }
+    // v41 completes the resource records embedded by v35. Those tables deliberately carry no
+    // resource blobs, but retry still needs every descriptor/codegen field that the older v9-v32
+    // extension tails wrote only for realized draw/compute tables. Keep one bounded count followed
+    // by fixed-size records in the already-stable failure/stage/resource order. BOX_GROW is already
+    // retained for failed stages by v40.
+    uint64_t failed_resource_count = 0;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            failed_resource_count += stage.resource_table.resources.size();
+    if (failed_resource_count > UINT32_MAX) {
+        error = "invalid failed-stage resource-state count";
+        return false;
+    }
+    w.u32(static_cast<uint32_t>(failed_resource_count));
+    auto write_failed_resource_state = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            const ShaderResource& resource = captured.resource;
+            if (!resource.depth || resource.depth > 8192u ||
+                !resource.declared_mip_levels) {
+                error = "invalid failed-stage resource image state";
+                return false;
+            }
+            if (resource.max_uncompressed_block_size > 3u ||
+                resource.max_compressed_block_size > 3u) {
+                error = "invalid failed-stage resource DCC state";
+                return false;
+            }
+            const uint8_t dcc_flags = (resource.meta_pipe_aligned ? 1u : 0u) |
+                                      (resource.write_compress_enabled ? 2u : 0u) |
+                                      (resource.compression_enabled ? 4u : 0u) |
+                                      (resource.alpha_is_on_msb ? 8u : 0u) |
+                                      (resource.color_transform ? 16u : 0u);
+            const bool mip_tail_valid =
+                (!resource.in_mip_tail && resource.mip_tail_offset == 0 &&
+                 resource.mip_tail_bytes == 0 && resource.mip_tail_x == 0 &&
+                 resource.mip_tail_y == 0) ||
+                (resource.in_mip_tail &&
+                 (resource.mip_tail_bytes == 4096u || resource.mip_tail_bytes == 65536u) &&
+                 resource.mip_tail_offset < resource.mip_tail_bytes);
+            if (!mip_tail_valid) {
+                error = "invalid failed-stage resource mip-tail state";
+                return false;
+            }
+            if (static_cast<uint32_t>(resource.fetch_index_mode) >
+                static_cast<uint32_t>(VertexFetchIndexMode::Instance)) {
+                error = "invalid failed-stage resource fetch-index mode";
+                return false;
+            }
+            const bool layered = resource.layer_stride_bytes != 0;
+            if ((!layered && resource.layer_mip_offset_bytes != 0) ||
+                (layered && ((resource.img_dim != 3 && resource.img_dim != 5) ||
+                             resource.depth < 2 ||
+                             resource.layer_mip_offset_bytes >= resource.layer_stride_bytes ||
+                             (resource.in_mip_tail &&
+                              resource.layer_mip_offset_bytes != 0)))) {
+                error = "invalid failed-stage resource layered mip layout";
+                return false;
+            }
+            w.u32(resource.depth);
+            w.u8(dcc_flags);
+            w.u32(resource.max_uncompressed_block_size);
+            w.u32(resource.max_compressed_block_size);
+            w.u64(resource.metadata_addr);
+            w.u8(resource.depth_compare ? 1u : 0u);
+            w.u8(resource.in_mip_tail ? 1u : 0u);
+            w.u32(resource.mip_tail_offset);
+            w.u32(resource.mip_tail_bytes);
+            w.u32(resource.mip_tail_x);
+            w.u32(resource.mip_tail_y);
+            w.u32(resource.declared_mip_levels);
+            w.u32(resource.linear_row_pitch_bytes);
+            w.u64(captured.captured_size);
+            w.u32(static_cast<uint32_t>(resource.fetch_index_mode));
+            w.u32(resource.layer_stride_bytes);
+            w.u32(resource.layer_mip_offset_bytes);
+            w.u32(resource.flat_base_sgpr);
+        }
+        return true;
+    };
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (!write_failed_resource_state(stage.resource_table)) return false;
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -3003,6 +3088,83 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         for (auto& diagnostic : c.failure_diagnostics)
             for (auto& stage : diagnostic.stages)
                 if (!read_bvh_box_grow(stage.resource_table)) return false;
+    }
+    if (version >= 41) {   // complete versioned state for v35 failed-stage resource tables
+        size_t expected = 0;
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid failed-stage resource-state count";
+            return false;
+        }
+        auto read_failed_resource_state = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                ShaderResource& resource = captured.resource;
+                uint8_t dcc_flags = 0, depth_compare = 0, in_mip_tail = 0;
+                uint32_t fetch_index_mode = 0;
+                if (!r.u32(resource.depth) || !resource.depth || resource.depth > 8192u ||
+                    !r.u8(dcc_flags) || (dcc_flags & ~0x1fu) ||
+                    !r.u32(resource.max_uncompressed_block_size) ||
+                    !r.u32(resource.max_compressed_block_size) ||
+                    !r.u64(resource.metadata_addr) ||
+                    resource.max_uncompressed_block_size > 3u ||
+                    resource.max_compressed_block_size > 3u ||
+                    !r.u8(depth_compare) || depth_compare > 1u ||
+                    !r.u8(in_mip_tail) || in_mip_tail > 1u ||
+                    !r.u32(resource.mip_tail_offset) ||
+                    !r.u32(resource.mip_tail_bytes) ||
+                    !r.u32(resource.mip_tail_x) ||
+                    !r.u32(resource.mip_tail_y) ||
+                    !r.u32(resource.declared_mip_levels) || !resource.declared_mip_levels ||
+                    !r.u32(resource.linear_row_pitch_bytes) ||
+                    !r.u64(captured.captured_size) ||
+                    !r.u32(fetch_index_mode) ||
+                    fetch_index_mode > static_cast<uint32_t>(VertexFetchIndexMode::Instance) ||
+                    !r.u32(resource.layer_stride_bytes) ||
+                    !r.u32(resource.layer_mip_offset_bytes) ||
+                    !r.u32(resource.flat_base_sgpr)) {
+                    error = "invalid failed-stage resource state";
+                    return false;
+                }
+                resource.meta_pipe_aligned = (dcc_flags & 1u) != 0;
+                resource.write_compress_enabled = (dcc_flags & 2u) != 0;
+                resource.compression_enabled = (dcc_flags & 4u) != 0;
+                resource.alpha_is_on_msb = (dcc_flags & 8u) != 0;
+                resource.color_transform = (dcc_flags & 16u) != 0;
+                resource.depth_compare = depth_compare != 0;
+                resource.in_mip_tail = in_mip_tail != 0;
+                resource.fetch_index_mode =
+                    static_cast<VertexFetchIndexMode>(fetch_index_mode);
+                const bool mip_tail_valid =
+                    (!resource.in_mip_tail && resource.mip_tail_offset == 0 &&
+                     resource.mip_tail_bytes == 0 && resource.mip_tail_x == 0 &&
+                     resource.mip_tail_y == 0) ||
+                    (resource.in_mip_tail &&
+                     (resource.mip_tail_bytes == 4096u ||
+                      resource.mip_tail_bytes == 65536u) &&
+                     resource.mip_tail_offset < resource.mip_tail_bytes);
+                const bool layered = resource.layer_stride_bytes != 0;
+                if (!mip_tail_valid ||
+                    (!layered && resource.layer_mip_offset_bytes != 0) ||
+                    (layered && ((resource.img_dim != 3 && resource.img_dim != 5) ||
+                                 resource.depth < 2 ||
+                                 resource.layer_mip_offset_bytes >=
+                                     resource.layer_stride_bytes ||
+                                 (resource.in_mip_tail &&
+                                  resource.layer_mip_offset_bytes != 0)))) {
+                    error = "invalid failed-stage resource layout state";
+                    return false;
+                }
+                captured.metadata_size = dcc_metadata_footprint(resource);
+                resource.dcc_metadata_size = captured.metadata_size;
+            }
+            return true;
+        };
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_failed_resource_state(stage.resource_table)) return false;
     }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)
