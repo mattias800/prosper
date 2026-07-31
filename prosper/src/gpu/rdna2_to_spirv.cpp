@@ -10218,6 +10218,146 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
             !exit_shape)
             continue;
 
+        // Some compiler-generated traversal loops enter with an empty scalar stack, visit one
+        // root ray, then pop work written by that ray.  When the dispatch-scoped root is proven
+        // null, the exact no-hit branch above reaches the empty-stack test without writing the
+        // depth.  That makes the pop/back-edge arm unreachable, which in turn proves that the
+        // loop-selected ray sites cannot seed themselves.  Keep this deliberately narrower than
+        // ordinary scalar constant propagation: every entry, register relationship, and branch on
+        // the first path must match the observed stack idiom.
+        auto specialize_empty_stack = [&]() {
+            const uint32_t null_exit_pc = scalar_branch_target(exit);
+            const auto tail_found = index_by_pc.find(null_exit_pc);
+            if (tail_found == index_by_pc.end() || tail_found->second + 1 >= ins.size())
+                return false;
+            const size_t tail_index = tail_found->second;
+            const Rdna2Inst& stack_compare = ins[tail_index];
+            Rdna2Inst& stack_exit = ins[tail_index + 1];
+            if (stack_compare.fmt != Rdna2Format::SOPC || stack_compare.opcode != 0x07u ||
+                stack_compare.src[0].kind != OperandKind::InlineInt ||
+                stack_compare.src[0].value != 0 ||
+                stack_compare.src[1].kind != OperandKind::SGPR ||
+                stack_compare.src[1].value != 45 ||
+                stack_exit.pc != stack_compare.pc + stack_compare.len_dwords ||
+                stack_exit.fmt != Rdna2Format::SOPP || stack_exit.opcode != 0x04u ||
+                stack_exit.simm16 <= 0 ||
+                !index_by_pc.contains(scalar_branch_target(stack_exit)))
+                return false;
+            const uint32_t stack_exit_pc = scalar_branch_target(stack_exit);
+
+            // The first-iteration selector branch targets the block that initializes all four
+            // ray results to invalid before the guarded root query.  Requiring this complete
+            // eight-instruction prefix prevents a nearby null ray from being mistaken for the
+            // traversal root that owns the scalar stack below.
+            if (ray_index < 8) return false;
+            const size_t root_block = ray_index - 8;
+            for (uint32_t lane = 0; lane < 4; ++lane) {
+                const Rdna2Inst& init = ins[root_block + lane];
+                if (init.fmt != Rdna2Format::VOP1 || init.opcode != 0x01u ||
+                    init.dst.kind != OperandKind::VGPR ||
+                    init.dst.value != ray.dst.value + static_cast<int>(lane) ||
+                    init.src[0].kind != OperandKind::InlineInt || init.src[0].value != -1)
+                    return false;
+            }
+            const Rdna2Inst& mask_copy = ins[root_block + 4];
+            const Rdna2Inst& empty_guard = ins[root_block + 5];
+            const Rdna2Inst& root_index = ins[root_block + 6];
+            const Rdna2Inst& root_nop = ins[root_block + 7];
+            if (mask_copy.fmt != Rdna2Format::SOP1 || mask_copy.opcode != 0x3cu ||
+                mask_copy.dst.kind != OperandKind::SGPR || mask_copy.dst.value != 106 ||
+                mask_copy.src[0].kind != OperandKind::Special ||
+                mask_copy.src[0].value != 107 ||
+                empty_guard.fmt != Rdna2Format::SOPP || empty_guard.opcode != 0x08u ||
+                scalar_branch_target(empty_guard) != scalar_compare.pc ||
+                root_index.fmt != Rdna2Format::VOP1 || root_index.opcode != 0x01u ||
+                root_index.dst.kind != OperandKind::VGPR ||
+                root_index.dst.value != ray.dst.value ||
+                root_index.src[0].kind != OperandKind::SGPR ||
+                root_nop.fmt != Rdna2Format::SOPP || root_nop.opcode != 0x00u)
+                return false;
+
+            size_t selector_branch_index = SIZE_MAX;
+            size_t selector_init_index = SIZE_MAX;
+            bool selector_scc = false;
+            for (size_t i = root_block; i-- > 2;) {
+                const Rdna2Inst& branch = ins[i];
+                if (branch.fmt != Rdna2Format::SOPP || branch.opcode != 0x05u ||
+                    scalar_branch_target(branch) != ins[root_block].pc ||
+                    ins[i - 1].pc + ins[i - 1].len_dwords != branch.pc ||
+                    ins[i - 1].fmt != Rdna2Format::SOPC)
+                    continue;
+                for (size_t j = i - 1; j-- > 1;) {
+                    const Rdna2Inst& selector_init = ins[j];
+                    const Rdna2Inst& stack_init = ins[j - 1];
+                    if (stack_init.pc + stack_init.len_dwords != selector_init.pc ||
+                        stack_init.fmt != Rdna2Format::SOP1 || stack_init.opcode != 0x03u ||
+                        stack_init.dst.kind != OperandKind::SGPR || stack_init.dst.value != 45 ||
+                        stack_init.src[0].kind != OperandKind::InlineInt ||
+                        stack_init.src[0].value != 0 ||
+                        selector_init.fmt != Rdna2Format::SOP1 ||
+                        selector_init.opcode != 0x03u ||
+                        selector_init.dst.kind != OperandKind::SGPR ||
+                        selector_init.src[0].kind != OperandKind::InlineInt ||
+                        selector_init.src[0].value != 37 ||
+                        root_index.src[0].value != selector_init.dst.value)
+                        continue;
+                    bool has_branch = false;
+                    for (size_t k = j; k < i; ++k)
+                        has_branch |= scalar_cfg_branch(ins[k]);
+                    if (has_branch ||
+                        !shader_constant_compare(ins, j, i - 1, selector_scc) ||
+                        !selector_scc)
+                        continue;
+                    selector_branch_index = i;
+                    selector_init_index = j;
+                    break;
+                }
+                if (selector_branch_index != SIZE_MAX) break;
+            }
+            if (selector_branch_index == SIZE_MAX) return false;
+
+            auto writes_stack = [&](const Rdna2Inst& instruction) {
+                bool writes = false;
+                for_each_scalar_write(instruction, [&](int base, uint32_t width) {
+                    writes |= base <= 45 && 45 < base + static_cast<int>(width);
+                }, /*proven_wave32_masks*/true);
+                return writes;
+            };
+            // Only the selector setup, root/no-hit block, and empty-stack comparison are reachable
+            // before the proven exits.  None may alter the initialized stack depth.
+            for (size_t i = selector_init_index; i <= selector_branch_index; ++i)
+                if (writes_stack(ins[i])) return false;
+            for (size_t i = root_block; i <= ray_index + 5; ++i)
+                if (writes_stack(ins[i])) return false;
+            if (writes_stack(stack_compare)) return false;
+
+            const uint32_t proof_begin = ins[selector_init_index - 1].pc;
+            // An indirect transfer or an external edge into the middle of the proof could bypass
+            // the zero initializer.  Re-entry at the initializer itself is harmless: it resets the
+            // invariant before the selector is evaluated again.
+            for (const Rdna2Inst& instruction : ins) {
+                if (instruction.fmt == Rdna2Format::SOP1 &&
+                    instruction.opcode >= 0x20u && instruction.opcode <= 0x22u)
+                    return false;
+                if (!scalar_cfg_branch(instruction)) continue;
+                const uint32_t target = scalar_branch_target(instruction);
+                const bool source_inside = instruction.pc >= proof_begin &&
+                    instruction.pc < stack_exit_pc;
+                if (!source_inside && target > proof_begin && target < stack_exit_pc)
+                    return false;
+            }
+
+            Rdna2Inst& selector_branch = ins[selector_branch_index];
+            selector_branch.opcode = 0x02u;
+            selector_branch.words[0] = 0xbf820000u |
+                static_cast<uint16_t>(selector_branch.simm16);
+            stack_exit.opcode = 0x02u;
+            stack_exit.words[0] = 0xbf820000u |
+                static_cast<uint16_t>(stack_exit.simm16);
+            return true;
+        };
+
+        (void)specialize_empty_stack();
         exit.opcode = 0x02;
         exit.words[0] = 0xbf820000u | static_cast<uint16_t>(exit.simm16);
         ++specialized;
@@ -12899,9 +13039,10 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ComputeShaderConfig& config) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
-    // A dispatch-scoped proven-null BVH can collapse the exact no-hit loop exit before generic
-    // shader-byte constant folding. Resource identity (including null marker + fetch PC) is already
-    // part of the compute module cache key, so a later non-null dispatch receives a distinct module.
+    // A dispatch-scoped proven-null BVH can collapse an exact no-hit exit and fully matched empty-stack
+    // traversal cycle before generic shader-byte constant folding. Resource identity (including null
+    // marker + fetch PC) is already part of the compute module cache key, so a later non-null dispatch
+    // receives a distinct module.
     (void)rdna2_specialize_proven_null_bvh_paths(ins, rt, config.wave_size);
     (void)rdna2_specialize_shader_constant_branches(ins);
     // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is

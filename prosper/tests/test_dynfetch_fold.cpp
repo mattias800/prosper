@@ -767,18 +767,20 @@ int main() {
                                 constant_branch_seed.data(), constant_branch_seed.size(), 0).empty(),
           "dynamic resource discovery ignores the provably dead buffer fetch");
 
-    // Exact instruction words and PCs from the live loop shape that motivated this pass. Although
-    // the first entry computes the same true condition as the straight-line fixture above, PC855 is
-    // also a loop header and the back-edge path rewrites s11 to -1. The next iteration therefore has
-    // a different SCC result. Keep this title-derived evidence deliberately minimal: only the
-    // preheader, condition, target, mutation, back-edge, and terminator needed to preserve the CFG.
+    // Exact instruction words and PCs from the live traversal loop. The loop-selected BVH sites at
+    // PC968/1007 can write work into v59/v60 and return through PC1671/1674, so shader-constant
+    // folding alone must retain them. The first entry, however, initializes s45=0 and s11=37, visits
+    // the dispatch-proven null root at PC1346, and reaches the PC1665 empty-stack exit without a
+    // write to s45. That closed cycle has no first work item and can be pruned only as one proof.
     std::vector<Rdna2Inst> loop_variant_branch;
     auto append_exact_instruction = [&](uint32_t pc, std::initializer_list<uint32_t> words) {
         Rdna2Inst instruction = rdna2_decode_one(words.begin(), words.size());
         instruction.pc = pc;
         loop_variant_branch.push_back(instruction);
     };
-    append_exact_instruction(848,  {0xBE8B03A5u}); // s_mov_b32 s11, 37 (preheader)
+    append_exact_instruction(847,  {0xBEAD0380u}); // s_mov_b32 s45, 0 (empty stack)
+    append_exact_instruction(848,  {0xBE8B03A5u}); // s_mov_b32 s11, 37 (root selector)
+    append_exact_instruction(854,  {0xBE88037Eu}); // loop header
     append_exact_instruction(855,  {0x876A870Bu}); // loop: s_and_b32 s106, s11, 7
     append_exact_instruction(856,  {0x876B087Eu});
     append_exact_instruction(857,  {0x816AC46Au}); // s_add_i32 s106, s106, -4
@@ -788,7 +790,14 @@ int main() {
                                     0x46424140u, 0x00004847u}); // unresolved loop BVH
     append_exact_instruction(1007, {0xF1989F07u, 0x00040303u, 0x43440D3Fu,
                                     0x46424140u, 0x00004847u}); // unresolved loop BVH
-    append_exact_instruction(1338, {0x7E0602C1u}); // exact taken target
+    append_exact_instruction(1338, {0x7E0602C1u}); // v3..v6 = invalid
+    append_exact_instruction(1339, {0x7E0802C1u});
+    append_exact_instruction(1340, {0x7E0A02C1u});
+    append_exact_instruction(1341, {0x7E0C02C1u});
+    append_exact_instruction(1342, {0xBEEA3C6Bu});
+    append_exact_instruction(1343, {0xBF88000Au}); // empty EXEC skips to the no-hit compare
+    append_exact_instruction(1344, {0x7E06020Bu}); // root index from s11
+    append_exact_instruction(1345, {0xBF800000u});
     append_exact_instruction(1346, {0xF1989F07u, 0x00010303u, 0x094F4E3Fu,
                                     0x11100F0Eu, 0x00001312u}); // guarded null BVH
     append_exact_instruction(1351, {0xBF8C3F70u});
@@ -798,12 +807,22 @@ int main() {
     append_exact_instruction(1356, {0xBF840133u});              // s_cbranch_scc0 1664
     append_exact_instruction(1610, {0xBE8B03C1u});              // s_mov_b32 s11, -1
     append_exact_instruction(1663, {0xBF82FCD7u});              // s_branch 855 (back-edge)
-    append_exact_instruction(1664, {0xBF072D80u});              // exact null-exit target
+    append_exact_instruction(1664, {0xBF072D80u});              // s_cmp_lg_u32 0,s45
+    append_exact_instruction(1665, {0xBF840009u});              // empty stack -> 1675
+    append_exact_instruction(1666, {0x812DC12Du});              // pop stack
+    append_exact_instruction(1667, {0xBF09A02Du});
+    append_exact_instruction(1668, {0xBF840003u});
+    append_exact_instruction(1669, {0xD760000Bu, 0x00005B3Cu}); // s11 = readlane(v60,s45)
+    append_exact_instruction(1671, {0xBF82FCCEu});              // s_branch 854
+    append_exact_instruction(1672, {0xD760000Bu, 0x00005B3Bu}); // s11 = readlane(v59,s45)
+    append_exact_instruction(1674, {0xBF82FCCBu});              // s_branch 854
+    append_exact_instruction(1675, {0x06067EFFu, 0x3A83126Fu}); // exact empty-stack target
     append_exact_instruction(3276, {0xBF810000u});              // s_endpgm
     CHECK(rdna2_specialize_shader_constant_branches(loop_variant_branch) == 0 &&
-              loop_variant_branch.size() == 19 &&
-              loop_variant_branch[5].fmt == Rdna2Format::SOPP &&
-              loop_variant_branch[5].opcode == 0x05,
+              std::any_of(loop_variant_branch.begin(), loop_variant_branch.end(),
+                          [](const Rdna2Inst& in) {
+                              return in.pc == 859 && in.opcode == 0x05;
+                          }),
           "loop-carried scalar mutation prevents one-shot SCC branch specialization");
 
     alignas(256) std::array<uint8_t, 256> loop_null_bvh{};
@@ -820,12 +839,13 @@ int main() {
     std::vector<Rdna2Inst> null_pruned_loop = loop_variant_branch;
     CHECK(rdna2_specialize_proven_null_bvh_paths(
               null_pruned_loop, &loop_null_table, 32) == 1 &&
-              rdna2_specialize_shader_constant_branches(null_pruned_loop) == 1 &&
+              rdna2_specialize_shader_constant_branches(null_pruned_loop) == 0 &&
               std::none_of(null_pruned_loop.begin(), null_pruned_loop.end(),
                            [](const Rdna2Inst& in) {
-                               return in.pc == 968 || in.pc == 1007 || in.pc == 1610 || in.pc == 1663;
+                               return in.pc == 968 || in.pc == 1007 || in.pc == 1610 ||
+                                      in.pc == 1663 || in.pc == 1671 || in.pc == 1674;
                            }),
-          "exact null-BVH exit removes loop back-edges before constant preheader pruning");
+          "exact null-root plus empty stack removes the unseeded traversal cycle");
 
     ShaderResourceTable nonnull_loop_table = loop_null_table;
     nonnull_loop_table.resources[0].gpu_addr = 0x10000u;
@@ -853,6 +873,38 @@ int main() {
                   changed, &loop_null_table, 32) == 0,
               "null-BVH exit proof rejects opcode/register/guard deviations");
     }
+
+    for (int deviation = 0; deviation < 5; ++deviation) {
+        std::vector<Rdna2Inst> changed = loop_variant_branch;
+        auto at = [&](uint32_t pc) {
+            return std::find_if(changed.begin(), changed.end(),
+                                [&](const Rdna2Inst& in) { return in.pc == pc; });
+        };
+        if (deviation == 0) at(847)->src[0].value = 1;
+        if (deviation == 1) at(1339)->dst.value = 5;
+        if (deviation == 2) at(1342)->opcode = 0x03u;
+        if (deviation == 3) at(1664)->src[1].value = 44;
+        if (deviation == 4) at(1665)->opcode = 0x05u;
+        CHECK(rdna2_specialize_proven_null_bvh_paths(
+                  changed, &loop_null_table, 32) == 1 &&
+                  std::any_of(changed.begin(), changed.end(),
+                              [](const Rdna2Inst& in) {
+                                  return in.pc == 968 || in.pc == 1007;
+                              }),
+              "empty-stack cycle proof rejects initializer/prefix/tail deviations");
+    }
+
+    std::vector<Rdna2Inst> externally_entered_loop = loop_variant_branch;
+    const std::array<uint32_t, 1> external_entry_words{0xBF820007u}; // pc846 -> pc854
+    Rdna2Inst external_entry = rdna2_decode_one(external_entry_words.data(),
+                                                external_entry_words.size());
+    external_entry.pc = 846;
+    externally_entered_loop.insert(externally_entered_loop.begin(), external_entry);
+    CHECK(rdna2_specialize_proven_null_bvh_paths(
+              externally_entered_loop, &loop_null_table, 32) == 1 &&
+              std::any_of(externally_entered_loop.begin(), externally_entered_loop.end(),
+                          [](const Rdna2Inst& in) { return in.pc == 968 || in.pc == 1007; }),
+          "external entry that bypasses the zero initializer keeps the cycle fail-visible");
 
     const uint32_t runtime_dead_fetch[] = {
         0xBF0B8200u,             // pc0: s_cmp_le_u32 s0, 2 (entry/user SGPR)

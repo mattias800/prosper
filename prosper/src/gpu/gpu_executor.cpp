@@ -4121,8 +4121,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
             rdna2_walk(reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                        shader_dwords, decoded);
             // Keep dispatch-scoped resource discovery and translation on the same specialized
-            // instruction stream. A proven-null BVH can collapse only the exact no-hit loop exit;
-            // after that, shader-byte constant folding may remove the now-unreachable loop arm.
+            // instruction stream. A proven-null BVH can collapse only the exact no-hit exit and a
+            // fully matched empty-stack traversal cycle; shader-byte constant folding may then
+            // remove any remaining unreachable arm.
             // Drop only instruction-scoped resources whose consumers disappeared. Direct resources
             // (fetch_pc == UINT32_MAX) remain available to every surviving use of their SGPR/SRT key.
             std::vector<Rdna2Inst> resource_paths = decoded;

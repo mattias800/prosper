@@ -70,11 +70,11 @@ bool rdna2_specialize_pcrel_dispatch(std::vector<Rdna2Inst>& instructions,
 size_t rdna2_specialize_shader_constant_branches(
     std::vector<Rdna2Inst>& instructions);
 
-// A dispatch-scoped proven-null BVH can make the exact Wave32 no-hit loop exit unconditional. Prune
-// that resource-dependent path before shader-byte-only branch folding; the compute resource builder
-// and translator call this same helper so dead instruction-scoped descriptors cannot diverge. The
-// resource table's null marker and fetch PC are part of the module cache key. Returns the number of
-// proven exits specialized.
+// A dispatch-scoped proven-null BVH can make an exact Wave32 no-hit exit unconditional and, for the
+// fully proven empty-stack idiom, remove an unseeded traversal cycle. Prune that resource-dependent
+// path before shader-byte-only branch folding; the compute resource builder and translator call this
+// same helper so dead instruction-scoped descriptors cannot diverge. The resource table's null marker
+// and fetch PC are part of the module cache key. Returns the number of proven exits specialized.
 size_t rdna2_specialize_proven_null_bvh_paths(
     std::vector<Rdna2Inst>& instructions, const ShaderResourceTable* resources,
     uint32_t wave_size);
