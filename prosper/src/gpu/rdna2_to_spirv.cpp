@@ -7969,6 +7969,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t p = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, val(in.src[0]), m24),
                                               b.ibin(Op_BitwiseAnd, val(in.src[1]), m24));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, p, val(in.src[2]));
+            } else if (in.opcode == 0x15D) {                          // v_sad_u32 = |s0-s1| (unsigned) + s2
+                // RDNA2 ISA (document 70648), V_SAD_U32: D.u32 = abs(S0.u32 - S1.u32) + S2.u32.
+                // The absolute difference is the UNSIGNED magnitude, so max-min is exact and cannot
+                // wrap (a signed abs would be wrong for operands straddling 0x80000000). Worms
+                // Armageddon's PSSL compiler emits the src1=0 accumulate form `v_sad_u32 vN, sM, 0,
+                // vN` as its vertex-shader index prologue; its shipped .ags shader assets carry the
+                // identical word. VERIFIED(llvm-mc gfx1030: VOP3 0x15d = v_sad_u32).
+                // CONFIDENCE: HIGH.
+                const uint32_t s0 = val(in.src[0]), s1 = val(in.src[1]);
+                const uint32_t diff = b.ibin(Op_ISub, b.uext2(Glsl_UMax, s0, s1),
+                                                       b.uext2(Glsl_UMin, s0, s1));
+                vreg[in.dst.value] = b.ibin(Op_IAdd, diff, val(in.src[2]));
             } else if (in.opcode == 0x148 || in.opcode == 0x149) {    // v_bfe_u32 / v_bfe_i32
                 uint32_t off = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
                 uint32_t cnt = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
