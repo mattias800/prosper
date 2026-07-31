@@ -1214,8 +1214,21 @@ TiledMipLevelLayout tiled_mip_level_layout(uint32_t ew, uint32_t eh, uint32_t bp
             }
         }
         result.byte_offset = mip_offset;
-        result.tail_x = mip_x * (block_width >> 4u);   // Block256_2d element dimensions
-        result.tail_y = mip_y * (block_height >> 4u);
+        // mip_x/mip_y count whole 256-BYTE blocks, so converting them to elements needs that block's
+        // element extent, which depends ONLY on the element size (AddrLib Block256_2d): 1B=16x16,
+        // 2B=16x8, 4B=8x8, 8B=8x4, 16B=4x4. The previous `block_width >> 4` derived the multiplier
+        // from the macroblock instead, which is right only when the macroblock happens to be 16x the
+        // 256-byte block (the 64 KiB modes) and four times too small for every 4 KiB mode. A 4 KiB
+        // 32-bpp macroblock is 32x32 elements, so it produced tail_x=4 where the level really starts
+        // at element 16 -- i.e. byte 0x80 instead of the byte_offset 0x800 reported alongside it, so
+        // the two origins in this same struct disagreed and packed-tail levels decoded foreign texels.
+        // The invariant now asserted by the tile tests: the element origin must address exactly
+        // byte_offset under the surface's own swizzle.
+        static constexpr uint32_t kBlock256Width[5]  = {16, 16, 8, 8, 4};
+        static constexpr uint32_t kBlock256Height[5] = {16,  8, 8, 4, 4};
+        if (elem_log2 >= 5) return {};
+        result.tail_x = mip_x * kBlock256Width[elem_log2];
+        result.tail_y = mip_y * kBlock256Height[elem_log2];
         result.tail_block_bytes = 1u << block_log2;
         result.in_tail = true;
         return result;
