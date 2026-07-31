@@ -658,6 +658,54 @@ int main() {
               !color_state_trace_matches_dimension(trace, 3840u, 2160u),
               "color-state trace dimension filter matches programmed color targets only");
 
+        // #1459: a resolved pipeline must carry WHY its color write mask is zero, not merely that it
+        // is. These three states all resolve to color_write_mask == 0 for entirely different reasons
+        // — a present zero target mask, a present zero shader mask, and MODE=DISABLE with both masks
+        // write-all. Each demands a different fix, so a capsule that records only the resolved mask
+        // makes them indistinguishable offline. Assert the retained triple separates all three.
+        GpuState zero_target_state;
+        zero_target_state.cx[P::CB_TARGET_MASK] = 0u;
+        zero_target_state.cx[P::CB_SHADER_MASK] = 0xFFu;
+        zero_target_state.cx[P::CB_COLOR_CONTROL] = 0x00CC0010u;   // MODE = NORMAL
+        const ResolvedPipelineState zero_target =
+            resolve_pipeline_state(extract_render_state(zero_target_state));
+
+        GpuState zero_shader_state;
+        zero_shader_state.cx[P::CB_TARGET_MASK] = 0xFFu;
+        zero_shader_state.cx[P::CB_SHADER_MASK] = 0u;
+        zero_shader_state.cx[P::CB_COLOR_CONTROL] = 0x00CC0010u;   // MODE = NORMAL
+        const ResolvedPipelineState zero_shader =
+            resolve_pipeline_state(extract_render_state(zero_shader_state));
+
+        GpuState disabled_state;
+        disabled_state.cx[P::CB_TARGET_MASK] = 0xFFu;
+        disabled_state.cx[P::CB_SHADER_MASK] = 0xFFu;
+        disabled_state.cx[P::CB_COLOR_CONTROL] = 0x00CC0000u;      // MODE = DISABLE
+        const ResolvedPipelineState disabled =
+            resolve_pipeline_state(extract_render_state(disabled_state));
+
+        CHECK(zero_target.color_write_mask == 0 && zero_shader.color_write_mask == 0 &&
+              disabled.color_write_mask == 0,
+              "all three suppression causes resolve to the same zero color write mask");
+        CHECK(zero_target.has_cb_target_mask && zero_target.cb_target_mask == 0u &&
+              zero_target.has_cb_shader_mask && zero_target.cb_shader_mask == 0xFFu,
+              "a present zero CB_TARGET_MASK is retained as present-and-zero");
+        CHECK(zero_shader.has_cb_shader_mask && zero_shader.cb_shader_mask == 0u &&
+              zero_shader.has_cb_target_mask && zero_shader.cb_target_mask == 0xFFu,
+              "a present zero CB_SHADER_MASK is distinguishable from a zero target mask");
+        CHECK(disabled.has_cb_color_control &&
+              ((disabled.cb_color_control >> P::CB_COLOR_CONTROL_MODE_SHIFT) &
+               P::CB_COLOR_CONTROL_MODE_MASK) == P::CB_COLOR_CONTROL_MODE_DISABLE &&
+              disabled.cb_target_mask == 0xFFu && disabled.cb_shader_mask == 0xFFu,
+              "MODE=DISABLE is distinguishable from either mask being zero");
+
+        // The absent case must stay distinct from all of them: no register programmed at all
+        // resolves to write-all, which is the opposite outcome of a present zero.
+        const ResolvedPipelineState absent = resolve_pipeline_state(extract_render_state(GpuState{}));
+        CHECK(!absent.has_cb_target_mask && !absent.has_cb_shader_mask &&
+              !absent.has_cb_color_control && absent.color_write_mask == 0xFu,
+              "an absent color-state triple stays distinct and still resolves to write-all");
+
         const RenderState empty = extract_render_state(GpuState{});
         const ColorStateTraceSnapshot empty_trace =
             snapshot_color_state_trace(empty, resolve_pipeline_state(empty));

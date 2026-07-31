@@ -213,6 +213,19 @@ struct ResolvedPipelineState {
     // live backend implements it as a straight copy of the already-rendered color0 surface into color1.
     bool     cb_resolve       = false;
 
+    // Raw color-state registers behind the resolved color write masks (#1459). Presence is
+    // deliberately distinct from the effective fallback value, because an ABSENT CB_TARGET_MASK or
+    // CB_SHADER_MASK resolves to write-all: a resolved mask of zero therefore means one of them is
+    // PRESENT with a zero value, or CB_COLOR_CONTROL.MODE is DISABLE. Only the raw triple can tell
+    // those causes apart, and a capsule stores already-resolved pipeline state, so without these
+    // fields "why is this draw's color write mask zero" is unanswerable offline for every title.
+    bool     has_cb_color_control = false;
+    bool     has_cb_target_mask   = false;
+    bool     has_cb_shader_mask   = false;
+    uint32_t cb_color_control     = 0;
+    uint32_t cb_target_mask       = 0;
+    uint32_t cb_shader_mask       = 0;
+
     // Color-target clear value, decoded from CB_COLOR0_CLEAR_WORD0/1 per the surface format (#309).
     // has_clear_color == the game programmed a fast-clear that we decoded; clear_color is RGBA in
     // Vulkan order (float32[0]=R). When has_clear_color is false the backend clears to opaque black —

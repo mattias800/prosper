@@ -579,6 +579,15 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         vk_color_format(rs.color1_format, rs.color1_number_type, rs.color1_comp_swap)) : 0u;
     ps.spi_shader_col_format = rs.spi_shader_col_format;
     ps.sx_ps_downconvert = rs.sx_ps_downconvert;
+    // Carry the raw color-state triple through resolution unchanged (#1459). These are pure
+    // provenance for the masks computed below: nothing here reads them back, so a resolved pipeline
+    // keeps recording WHY its color write mask ended up where it did, not merely what it became.
+    ps.has_cb_color_control = rs.has_cb_color_control;
+    ps.has_cb_target_mask = rs.has_cb_target_mask;
+    ps.has_cb_shader_mask = rs.has_cb_shader_mask;
+    ps.cb_color_control = rs.cb_color_control;
+    ps.cb_target_mask = rs.cb_target_mask;
+    ps.cb_shader_mask = rs.cb_shader_mask;
 
     // Fast-clear color: decode the CB_COLOR0_CLEAR_WORD when the game programmed one (#309). A
     // decode miss (no fast-clear, or an unmapped format) leaves has_clear_color false and the
