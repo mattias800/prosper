@@ -16,7 +16,7 @@ Last updated: 2026-07-31
 | *Blasphemous 2* | `PPSA13579` | Unity | ✅ Opening route reaches and renders the first playable room |
 | *Evergate* | `PPSA01885` | Unity | ✅ Reaches and renders the first tutorial-room gameplay |
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Native 1920×1080 opening gameplay reached; scripted input and audio verified |
-| *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Native 1920×1080 title and audio verified |
+| *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Native 1920×1080 tutorial combat and audio verified |
 | *Sonic Origins*&nbsp;² | `PPSA05325` | Hedgehog Engine | 🔬 Frontend loop reached; supplied update-only dump lacks its base title assets |
 | Terminator (2D)&nbsp;¹ | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay reached (user-verified) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Day One gameplay renders; the manor entrance hall matches the hardware reference |
@@ -135,13 +135,24 @@ reported separately rather than treating one silent tail as a silent whole captu
 <p align="center">
   <img src="prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.png" alt="Space Adventure Cobra — The Awakening title screen">
 </p>
+<p align="center">
+  <img src="assets/screenshots/space-adventure-cobra.png" alt="Space Adventure Cobra — The Awakening tutorial combat">
+</p>
 
-This Unity/IL2CPP title boots through its opening flow and renders the complete title composition at
-native 1920×1080. Its captured output also passes the objective repetition check (`rms=0.0436`, no
-duplicated grains). Cobra imports an SDK-revision alias of `sceAgcCreateInterpolantMapping`; routing
-that alias to the real builder initializes all 32 advertised Cx records instead of exposing stale
-stack entries as register writes. The command processor therefore preserves every valid register
-write and rejects only offsets outside its register window.
+This Unity/IL2CPP title boots through its opening flow, accepts the displayed hold-Square movie skip,
+and reaches the opening desert tutorial at native 1920×1080. A fresh-save, default-configuration run
+survived the complete 180-second scripted route with write watches enabled, displayed the readable
+`Press R2 to shoot with the Psychogun.` prompt, and continued through full-color combat with Cobra,
+enemies, projectiles, and HUD intact. This is a reproducible opening-gameplay milestone, not a claim
+that the complete game is playable or performance-complete.
+
+The route exercises guest write-watch faults from Unity worker threads. Write-watch handling now
+temporarily restores host `%fs` while entering the host mutex and `mprotect`, then restores guest
+`%fs` before the interrupted store resumes; this prevents host TLS operations from corrupting the
+guest worker's TLS. Its captured audio also passes the objective repetition check (`rms=0.0436`, no
+duplicated grains). Cobra additionally imports an SDK-revision alias of
+`sceAgcCreateInterpolantMapping`; routing that alias to the real builder initializes all 32
+advertised Cx records instead of exposing stale stack entries as register writes.
 
 ## Sonic Origins — `PPSA05325`
 

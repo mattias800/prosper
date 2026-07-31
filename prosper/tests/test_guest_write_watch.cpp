@@ -1,4 +1,6 @@
 #include "host/guest_write_watch.hpp"
+#include "host/exec_image.hpp"
+#include "hle/dispatch.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -83,7 +85,6 @@ int main() {
 #else   // ---- Linux: exercise the real mprotect + SIGSEGV dirty-tracking (#1144) ------------------
 
 #include <cerrno>
-#include <csignal>
 #include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -93,15 +94,6 @@ namespace {
 // is exercised, not just a single mapping.
 constexpr uint32_t kCpuRw = 0x3;   // SCE CPU_READ|CPU_WRITE (see host_prot in guest_write_watch.cpp)
 
-void seg_handler(int sig, siginfo_t* si, void*) {
-    if (sig == SIGSEGV && si->si_addr &&
-        prosper::host::guest_write_watch_handle_fault(reinterpret_cast<uint64_t>(si->si_addr)))
-        return;                                   // resolved: page restored writable, store re-runs
-    // A fault we did not arm: fail loudly rather than loop forever.
-    const char m[] = "FAIL: unexpected SIGSEGV not owned by the write-watch\n";
-    (void)!write(2, m, sizeof m - 1);
-    _exit(2);
-}
 } // namespace
 
 int main() {
@@ -122,14 +114,12 @@ int main() {
     if (a == MAP_FAILED || b == MAP_FAILED) return 1;
     constexpr uint64_t kPhys = 0x20000;   // arbitrary distinct phys base for the test
 
-    // Install the SIGSEGV handler on a sigaltstack (SA_ONSTACK) — the red-zone-safe configuration the
-    // real path requires; then tell the write-watch that onstack holds so create() will arm.
-    static uint8_t altbuf[128 * 1024];   // ample; SIGSTKSZ is not a compile-time constant on glibc
-    stack_t ss{}; ss.ss_sp = altbuf; ss.ss_size = sizeof altbuf; ss.ss_flags = 0;
-    CHECK(sigaltstack(&ss, nullptr) == 0, "sigaltstack installed");
-    struct sigaction sa{}; sa.sa_sigaction = seg_handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&sa.sa_mask);
-    CHECK(sigaction(SIGSEGV, &sa, nullptr) == 0, "SIGSEGV handler installed");
+    // Use the production SIGSEGV handler, not a test-local approximation. Besides covering the
+    // sigaltstack gate, the guest-FS regression below must prove the exact signal boundary used by a
+    // running title restores host TLS around write-watch handling and guest TLS before resuming.
+    CHECK(unsetenv("PROSPER_FAULT_NO_ONSTACK") == 0,
+          "production write-watch signal path enabled for the test");
+    prosper::install_trap_handler();
 
     // The real emulator calls set_fault_onstack(true) once at startup, before any dmem map records an
     // alias (and the notify hooks only record while the feature is enabled). Mirror that: enable, record
@@ -291,6 +281,87 @@ int main() {
     // A watch over a range with NO known mapping must return Unknown (exact fallback), not arm.
     GuestWriteWatch none = GuestWriteWatch::create(0x9000000000ULL, page);
     CHECK(!static_cast<bool>(none), "create over an unmapped range yields Unknown");
+
+    // A title's Job.Worker executes guest code with %fs pointing at its guest TCB. The production
+    // SIGSEGV handler must temporarily restore host %fs before GuestWriteWatch enters std::mutex and
+    // glibc mprotect, then restore guest %fs before the faulting store resumes. Make that boundary
+    // observable by adding a deliberately stale non-faulting alias after arming: the real alias's
+    // mprotect succeeds, the stale alias's mprotect fails with ENOMEM, and glibc writes errno through
+    // the active %fs. Without the production scope this overwrites the guest-TCB errno slot while the
+    // real host errno remains zero.
+    {
+        int tls_fd = memfd_create("prosper-ww-guest-fs", 0);
+        CHECK(tls_fd >= 0 && ftruncate(tls_fd, static_cast<off_t>(page)) == 0,
+              "guest-FS watch memfd sized");
+        auto* guest_page = static_cast<uint8_t*>(
+            mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_SHARED, tls_fd, 0));
+        CHECK(guest_page != MAP_FAILED, "guest-FS watched mapping created");
+        if (tls_fd >= 0 && guest_page != MAP_FAILED) {
+            constexpr uint64_t kGuestFsPhys = 0x80000;
+            constexpr uint64_t kStaleAlias = 0x700000000000ull;
+            prosper::host::guest_write_watch_notify_direct_mapping_added(
+                reinterpret_cast<uint64_t>(guest_page), page, kGuestFsPhys, kCpuRw);
+            GuestWriteWatch guest_watch = GuestWriteWatch::create(
+                reinterpret_cast<uint64_t>(guest_page), page);
+            CHECK(static_cast<bool>(guest_watch), "guest-FS watch armed");
+
+            // The fake VA is intentionally not mapped. Adding it after the page is armed records the
+            // stale alias and makes its immediate mprotect fail without preventing the real alias from
+            // remaining armed. Rearm accepts the updated generation because the physical page itself
+            // is still armed.
+            prosper::host::guest_write_watch_notify_direct_mapping_added(
+                kStaleAlias, page, kGuestFsPhys, kCpuRw);
+            CHECK(guest_watch.rearm(), "guest-FS watch rearmed after stale-alias injection");
+            CHECK(guest_watch.query() == GuestWriteWatchQuery::Unchanged,
+                  "guest-FS watch clean before the fault");
+
+            uint64_t host_fs = 0;
+            __asm__ volatile("rdfsbase %0" : "=r"(host_fs));
+            const intptr_t errno_offset = reinterpret_cast<intptr_t>(&errno) -
+                                          static_cast<intptr_t>(host_fs);
+            CHECK(errno_offset < 0 && errno_offset >= -0x20000,
+                  "glibc errno fits inside the provisioned guest TLS test block");
+
+            CHECK(unsetenv("PROSPER_NO_GUEST_FS") == 0,
+                  "Linux guest-FS path enabled for write-watch test");
+            prosper::TlsModuleDesc tls_modules[2]{};  // index zero is reserved
+            tls_modules[1].memsz = 0x20000;
+            tls_modules[1].align = 64;
+            prosper::guest_tls_set_templates(tls_modules, 2);
+            CHECK(prosper::guest_tls_enabled(), "guest TLS configured for write-watch fault");
+
+            errno = 0;
+            const uint64_t guest_fs = prosper::guest_tls_activate_thread();
+            constexpr int kGuestErrnoSentinel = 0x51a7e11;
+            auto* guest_errno = reinterpret_cast<volatile int*>(guest_fs + errno_offset);
+            *guest_errno = kGuestErrnoSentinel;
+
+            // No libc between activating guest FS and capturing the post-signal state.
+            guest_page[0x80] = 0xa7;
+            uint64_t fs_at_resume = 0;
+            __asm__ volatile("rdfsbase %0" : "=r"(fs_at_resume));
+            const int guest_errno_after = *guest_errno;
+            const uint8_t landed = guest_page[0x80];
+            prosper::guest_fs_enter_host_for_signal();
+
+            CHECK(guest_fs != 0 && guest_fs != host_fs,
+                  "guest-FS write-watch test activated a distinct guest TCB");
+            CHECK(landed == 0xa7, "guest-FS fault resumed and the original store landed");
+            CHECK(fs_at_resume == guest_fs,
+                  "write-watch signal return restored the caller's guest FS");
+            CHECK(errno == ENOMEM,
+                  "failing mprotect updated host errno through host FS");
+            CHECK(guest_errno_after == kGuestErrnoSentinel,
+                  "host write-watch handling did not overwrite guest TLS errno");
+
+            guest_watch.reset();
+            prosper::host::guest_write_watch_notify_direct_mapping_removed(kStaleAlias, page);
+            prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                reinterpret_cast<uint64_t>(guest_page), page);
+            munmap(guest_page, page);
+        }
+        if (tls_fd >= 0) close(tls_fd);
+    }
 
     watch.reset();
     // After reset the pages are writable and stores fault no more (the handler would _exit(2) if a
