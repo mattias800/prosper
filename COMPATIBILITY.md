@@ -30,6 +30,8 @@ Last updated: 2026-07-31
 | *Earthion* | `PPSA28061` | Custom (Ancient) | 🚧 Developer logo, intro story text and CRT bezel render; the 320×224 game picture inside the bezel is still missing |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🔬 Boots deep into the UE4 frame loop with real GPU work; presented frames are still a flat colour |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Audio and sound bank initialise; the game's own code lives in a runtime-loaded PRX that prosper cannot yet load |
+| *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Warning screen, publisher logo, title screen and EULA render at native 3840×2160 with no code changes; the 3D world is dropped by a descriptor-provenance gap |
+| *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
 
@@ -434,6 +436,35 @@ Beyond the title itself this is a useful **3D** reference workload: it is determ
 runs with a 100% shader realization rate. `docs/RENDERER_PERFORMANCE_2026_07.md` records that the
 remaining synchronous graphics/compute boundaries must be evaluated against a 3D workload rather
 than against Messenger's 2D scene, and this is the first clean candidate for that.
+
+## Nikoderiko: The Magical World — `PPSA23760`
+
+<p align="center">
+  <img src="assets/screenshots/nikoderiko-title.png" alt="Nikoderiko: The Magical World — title screen at 3840×2160">
+</p>
+
+Renders its epilepsy warning, the Knights Peak publisher logo and the full title screen at native
+3840×2160 on unmodified master, with no code changes. A scripted route continues into the legible
+MY.GAMES EULA dialog.
+
+The **3D world** is what is missing, and the cause is named: 246 recompiler rejections, each preceded
+by an unresolved MIMG or MUBUF descriptor (`srt_tag=NONE key_res=null pc_res=null`). The 8-SGPR
+`SRSRC` range is **computed inside the shader**, so `sreg_range_written` is set and the user-data
+fallback is skipped, dropping 66 draw pipelines. The opcodes themselves are all implemented — this is
+descriptor provenance, not instruction coverage, and the fix is shared recompiler infrastructure
+likely to help other Unreal titles. Tracked on #1607.
+
+## The Oregon Trail — `PPSA19244`
+
+Boots cleanly and holds a steady ~50 fps frame loop — 5,957 frames in 120 s, with frames provably
+advancing — but every one is uniformly black. There are **zero** recompiler rejections, zero
+unresolved resources and zero skipped dispatches.
+
+An offline capture shows the entire Unreal post-process chain intact (HDR scene colour, a bloom
+pyramid from 960×540 down to 60×34, tonemap, a 32×32×32 LUT, front-buffer composite) and replays
+byte-exactly. The decisive measurement is upstream of all of it: dumping the seed for the 1920×1080
+HDR scene-colour target shows it is *already* uniformly black on entry. **The image is gone before
+post-processing runs**, so the base pass is where to look. Tracked on #1606.
 
 ## Requirements and scope
 
