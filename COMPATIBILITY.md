@@ -34,6 +34,8 @@ Last updated: 2026-07-31
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
+| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 Autosave notice and profile-select menu render after implementing `sceAgcAcbWriteData`; the right portion of the frame is still black |
+| *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🔬 Runs a healthy ~113 fps Unity frame loop with a real post chain, but the guest's own composite is empty |
 
 ¹ Exact retail game name pending confirmation.
 
@@ -465,6 +467,38 @@ pyramid from 960×540 down to 60×34, tonemap, a 32×32×32 LUT, front-buffer co
 byte-exactly. The decisive measurement is upstream of all of it: dumping the seed for the 1920×1080
 HDR scene-colour target shows it is *already* uniformly black on entry. **The image is gone before
 post-processing runs**, so the base pass is where to look. Tracked on #1606.
+## Syberia: Remastered — `PPSA30140`
+
+<p align="center">
+  <img src="assets/screenshots/syberia-profile.png" alt="Syberia: Remastered — profile-select menu (the right portion of the frame is still black)">
+</p>
+
+On unmodified master this title **hard-hung** at boot: 7 submits, 2 flips, one present, frozen
+forever. The cause was `sceAgcAcbWriteData` being unregistered and silently returning 0, so the
+packet that *sets* a fence label was never built and Unity's main thread parked permanently in the
+guest's own poll loop waiting for a value nothing would ever write.
+
+Registering it against the shared DCB builder — the same treatment the five sibling ACB builders
+already had — takes the boot to **523+ submits, 5,028+ draws and 88 flips**, rendering the autosave
+notice with animated gears and then the profile-select menu with its boarding-pass save slots.
+
+The screenshot is captioned honestly: the right ~55% of the frame is still black, and whether that
+is a missing layer or the game's own art direction is not yet established.
+
+## Tales of Graces f Remastered — `PPSA19991`
+
+Unusually healthy for a title that renders nothing: **20,296 presents in 180 s (~113 fps)**, a full
+Unity thread topology, addressable bundles loading, exactly **one** unimplemented NID in the whole
+log, and zero recompiler rejections, compute skips or faults. A captured steady-state frame replays
+**bit-exactly**, and the replay is a single colour — so prosper is faithfully rendering what the
+guest submits, and **the guest's own composite is empty**.
+
+A real Unity post chain is running behind it (16 RTT seeds, 960×540 half-res targets sampled back as
+temporal history, LUT-shaped surfaces, reverse-Z). One draw per frame fails to realize with
+`stages=0`, which rules out a shader gap and is the concrete next lead.
+
+Ruled out and not worth re-running: an intro-movie stall (despite 20 `libSceAvPlayer` imports and
+`Movie/h264/` assets, tracing shows **zero** AvPlayer calls), deadlock, and a slow black asset load.
 
 ## Requirements and scope
 
