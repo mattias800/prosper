@@ -32,6 +32,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -3899,6 +3900,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
         auto field = [&](uint32_t shift, uint32_t mask) { return (rsrc2 >> shift) & mask; };
         const uint32_t user_count = field(P::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT,
                                           P::COMPUTE_PGM_RSRC2_USER_SGPR_MASK);
+        const uint32_t compute_wave_size = ((dispatch.modifier >>
+            P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
+            P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;
         const ComputeLaunchDimensions launch = resolve_compute_launch(dispatch);
         const bool tgid_x_en = field(P::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT,
                                      P::COMPUTE_PGM_RSRC2_TGID_X_EN_MASK) != 0;
@@ -4111,12 +4115,30 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                  fl.load_pc, fl.base_sgpr, (unsigned long long)base, w.size);
             }
         }
-        assign_convention_bindings(*table, 2);
         bool native_multiwave_wave_work = false;
         {
             std::vector<Rdna2Inst> decoded;
             rdna2_walk(reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                        shader_dwords, decoded);
+            // Keep dispatch-scoped resource discovery and translation on the same specialized
+            // instruction stream. A proven-null BVH can collapse only the exact no-hit loop exit;
+            // after that, shader-byte constant folding may remove the now-unreachable loop arm.
+            // Drop only instruction-scoped resources whose consumers disappeared. Direct resources
+            // (fetch_pc == UINT32_MAX) remain available to every surviving use of their SGPR/SRT key.
+            std::vector<Rdna2Inst> resource_paths = decoded;
+            if (rdna2_specialize_proven_null_bvh_paths(
+                    resource_paths, table.get(), compute_wave_size)) {
+                (void)rdna2_specialize_shader_constant_branches(resource_paths);
+                std::unordered_set<uint32_t> live_pcs;
+                live_pcs.reserve(resource_paths.size());
+                for (const Rdna2Inst& instruction : resource_paths)
+                    live_pcs.insert(instruction.pc);
+                std::erase_if(table->resources, [&](const ShaderResource& resource) {
+                    return resource.fetch_pc != 0xFFFFFFFFu &&
+                           !live_pcs.contains(resource.fetch_pc);
+                });
+            }
+            assign_convention_bindings(*table, 2);
             native_multiwave_wave_work = compute_shader_prefers_native_multiwave(
                 decoded, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                 shader_dwords);
@@ -4149,9 +4171,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         config.threads_x = launch.threads_x;
         config.threads_y = launch.threads_y;
         config.threads_z = launch.threads_z;
-        config.wave_size = ((dispatch.modifier >>
-            P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
-            P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;
+        config.wave_size = compute_wave_size;
         const SharedVulkanContext shared_vulkan = shared_vulkan_context();
         const bool shared_compute_adoptable = shared_vulkan.valid() &&
             shared_vulkan.compute_queue_supported &&

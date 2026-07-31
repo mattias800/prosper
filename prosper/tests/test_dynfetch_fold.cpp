@@ -740,10 +740,9 @@ int main() {
     CHECK(unguarded_null_uses.empty(),
           "mapped null BVH root without a dominating EXEC guard remains fail-visible");
 
-    // Astro's live PC848..859 sequence computes its branch condition exclusively from shader
-    // constants: 37 & 7 = 5; 5 + (-4) = 1; 1 <= 2, so s_cbranch_scc1 skips the two lexical BVH
-    // sites that cannot execute. Resource discovery and translation must consume the same pruned
-    // instruction stream. The proof must not broaden to an entry/user-SGPR comparison.
+    // A straight-line compiler sequence can compute a branch condition exclusively from shader
+    // constants: 37 & 7 = 5; 5 + (-4) = 1; 1 <= 2. Resource discovery and translation must consume
+    // the same pruned instruction stream. The proof must not broaden to an entry/user-SGPR comparison.
     const uint32_t shader_constant_dead_fetch[] = {
         0xBE8B03A5u,             // pc0: s_mov_b32 s11, 37
         0x876A870Bu,             // pc1: s_and_b32 s106, s11, 7
@@ -767,6 +766,93 @@ int main() {
                                 std::size(shader_constant_dead_fetch),
                                 constant_branch_seed.data(), constant_branch_seed.size(), 0).empty(),
           "dynamic resource discovery ignores the provably dead buffer fetch");
+
+    // Exact instruction words and PCs from the live loop shape that motivated this pass. Although
+    // the first entry computes the same true condition as the straight-line fixture above, PC855 is
+    // also a loop header and the back-edge path rewrites s11 to -1. The next iteration therefore has
+    // a different SCC result. Keep this title-derived evidence deliberately minimal: only the
+    // preheader, condition, target, mutation, back-edge, and terminator needed to preserve the CFG.
+    std::vector<Rdna2Inst> loop_variant_branch;
+    auto append_exact_instruction = [&](uint32_t pc, std::initializer_list<uint32_t> words) {
+        Rdna2Inst instruction = rdna2_decode_one(words.begin(), words.size());
+        instruction.pc = pc;
+        loop_variant_branch.push_back(instruction);
+    };
+    append_exact_instruction(848,  {0xBE8B03A5u}); // s_mov_b32 s11, 37 (preheader)
+    append_exact_instruction(855,  {0x876A870Bu}); // loop: s_and_b32 s106, s11, 7
+    append_exact_instruction(856,  {0x876B087Eu});
+    append_exact_instruction(857,  {0x816AC46Au}); // s_add_i32 s106, s106, -4
+    append_exact_instruction(858,  {0xBF0B826Au}); // s_cmp_le_u32 s106, 2
+    append_exact_instruction(859,  {0xBF8501DEu}); // s_cbranch_scc1 1338
+    append_exact_instruction(968,  {0xF1989F07u, 0x00040303u, 0x43440D3Fu,
+                                    0x46424140u, 0x00004847u}); // unresolved loop BVH
+    append_exact_instruction(1007, {0xF1989F07u, 0x00040303u, 0x43440D3Fu,
+                                    0x46424140u, 0x00004847u}); // unresolved loop BVH
+    append_exact_instruction(1338, {0x7E0602C1u}); // exact taken target
+    append_exact_instruction(1346, {0xF1989F07u, 0x00010303u, 0x094F4E3Fu,
+                                    0x11100F0Eu, 0x00001312u}); // guarded null BVH
+    append_exact_instruction(1351, {0xBF8C3F70u});
+    append_exact_instruction(1352, {0x7D8A06F9u, 0x068688C1u}); // v_cmp_ne_u32 s8,-1,v3
+    append_exact_instruction(1354, {0xBF070880u});              // s_cmp_lg_u32 0,s8
+    append_exact_instruction(1355, {0xBEFE036Au});              // s_mov_b32 exec_lo,vcc_lo
+    append_exact_instruction(1356, {0xBF840133u});              // s_cbranch_scc0 1664
+    append_exact_instruction(1610, {0xBE8B03C1u});              // s_mov_b32 s11, -1
+    append_exact_instruction(1663, {0xBF82FCD7u});              // s_branch 855 (back-edge)
+    append_exact_instruction(1664, {0xBF072D80u});              // exact null-exit target
+    append_exact_instruction(3276, {0xBF810000u});              // s_endpgm
+    CHECK(rdna2_specialize_shader_constant_branches(loop_variant_branch) == 0 &&
+              loop_variant_branch.size() == 19 &&
+              loop_variant_branch[5].fmt == Rdna2Format::SOPP &&
+              loop_variant_branch[5].opcode == 0x05,
+          "loop-carried scalar mutation prevents one-shot SCC branch specialization");
+
+    alignas(256) std::array<uint8_t, 256> loop_null_bvh{};
+    ShaderResourceTable loop_null_table;
+    { ShaderResource marker{};
+      marker.cls = ResourceClass::ConstantBuffer;
+      marker.format = DataFormat::Uint32;
+      marker.num_components = 1;
+      marker.size = loop_null_bvh.size();
+      marker.fetch_pc = 1346;
+      marker.host_data = loop_null_bvh.data();
+      marker.host_data_size = loop_null_bvh.size();
+      loop_null_table.resources.push_back(marker); }
+    std::vector<Rdna2Inst> null_pruned_loop = loop_variant_branch;
+    CHECK(rdna2_specialize_proven_null_bvh_paths(
+              null_pruned_loop, &loop_null_table, 32) == 1 &&
+              rdna2_specialize_shader_constant_branches(null_pruned_loop) == 1 &&
+              std::none_of(null_pruned_loop.begin(), null_pruned_loop.end(),
+                           [](const Rdna2Inst& in) {
+                               return in.pc == 968 || in.pc == 1007 || in.pc == 1610 || in.pc == 1663;
+                           }),
+          "exact null-BVH exit removes loop back-edges before constant preheader pruning");
+
+    ShaderResourceTable nonnull_loop_table = loop_null_table;
+    nonnull_loop_table.resources[0].gpu_addr = 0x10000u;
+    std::vector<Rdna2Inst> nonnull_loop = loop_variant_branch;
+    CHECK(rdna2_specialize_proven_null_bvh_paths(
+              nonnull_loop, &nonnull_loop_table, 32) == 0 &&
+              rdna2_specialize_shader_constant_branches(nonnull_loop) == 0 &&
+              std::any_of(nonnull_loop.begin(), nonnull_loop.end(),
+                          [](const Rdna2Inst& in) { return in.pc == 968 || in.pc == 1007; }),
+          "non-null resource preserves loop-reachable BVH sites");
+
+    for (int deviation = 0; deviation < 4; ++deviation) {
+        std::vector<Rdna2Inst> changed = loop_variant_branch;
+        auto wait = std::find_if(changed.begin(), changed.end(),
+                                 [](const Rdna2Inst& in) { return in.pc == 1351; });
+        auto compare = std::find_if(changed.begin(), changed.end(),
+                                    [](const Rdna2Inst& in) { return in.pc == 1352; });
+        auto exit = std::find_if(changed.begin(), changed.end(),
+                                 [](const Rdna2Inst& in) { return in.pc == 1356; });
+        if (deviation == 0) compare->opcode = 0xc4u;
+        if (deviation == 1) compare->src[1].value = 4;
+        if (deviation == 2) exit->opcode = 0x05u;
+        if (deviation == 3) wait->words[0] = 0xbf8c3f71u;
+        CHECK(rdna2_specialize_proven_null_bvh_paths(
+                  changed, &loop_null_table, 32) == 0,
+              "null-BVH exit proof rejects opcode/register/guard deviations");
+    }
 
     const uint32_t runtime_dead_fetch[] = {
         0xBF0B8200u,             // pc0: s_cmp_le_u32 s0, 2 (entry/user SGPR)
@@ -827,6 +913,70 @@ int main() {
                              &shader_constant_bvh_table,
                              shader_constant_bvh_config).empty(),
           "compute translation omits a dead BVH site proven by shader constants");
+
+    // Contiguous form of the exact null-result loop relationship above. PC5 is unresolved but can
+    // execute only through a loop back-edge. A proven null marker at PC10 makes the PC20 SCC0 exit
+    // unconditional; after that prune, the shader-constant PC4 entry branch removes PC5. This tests
+    // the complete translation path rather than only the decoded-instruction helper.
+    const uint32_t null_exit_loop_shader[] = {
+        0xBE8B03A5u,                         // pc0:  s_mov_b32 s11, 37
+        0x876A870Bu,                         // pc1:  loop condition from s11
+        0x816AC46Au,                         // pc2
+        0xBF0B826Au,                         // pc3
+        0xBF850005u,                         // pc4:  initial entry -> pc10
+        0xF1989F07u, 0x00040303u, 0x43440D3Fu, 0x46424140u, 0x00004847u,
+        0xF1989F07u, 0x00010303u, 0x094F4E3Fu, 0x11100F0Eu, 0x00001312u,
+        0xBF8C3F70u,                         // pc15: wait for null ray
+        0x7D8A06F9u, 0x068688C1u,            // pc16: v_cmp_ne_u32 s8,-1,v3
+        0xBF070880u,                         // pc18: s_cmp_lg_u32 0,s8
+        0xBEFE036Au,                         // pc19: s_mov_b32 exec_lo,vcc_lo
+        0xBF840002u,                         // pc20: s_cbranch_scc0 pc23
+        0xBE8B03C1u,                         // pc21: loop-carried s11 = -1
+        0xBF82FFEAu,                         // pc22: s_branch pc1
+        0xBF810000u,                         // pc23: s_endpgm
+    };
+    ShaderResourceTable null_exit_loop_table;
+    { ShaderResource marker{};
+      marker.cls = ResourceClass::ConstantBuffer;
+      marker.format = DataFormat::Uint32;
+      marker.num_components = 1;
+      marker.binding = 4;
+      marker.size = shader_constant_null_bvh.size();
+      marker.fetch_pc = 10;
+      marker.host_data = shader_constant_null_bvh.data();
+      marker.host_data_size = shader_constant_null_bvh.size();
+      null_exit_loop_table.resources.push_back(marker); }
+    ComputeShaderConfig null_exit_loop_config;
+    null_exit_loop_config.local_x = 1;
+    null_exit_loop_config.wave_size = 32;
+    std::vector<Rdna2Inst> contiguous_null_exit;
+    rdna2_walk(null_exit_loop_shader, std::size(null_exit_loop_shader), contiguous_null_exit);
+    CHECK(rdna2_specialize_proven_null_bvh_paths(
+              contiguous_null_exit, &null_exit_loop_table, 32) == 1 &&
+              rdna2_specialize_shader_constant_branches(contiguous_null_exit) == 1 &&
+              std::none_of(contiguous_null_exit.begin(), contiguous_null_exit.end(),
+                           [](const Rdna2Inst& in) { return in.pc == 5 || in.pc == 21 || in.pc == 22; }),
+          "contiguous null-result loop shares the discovery/translation specialization decision");
+    CHECK(!recompile_compute(null_exit_loop_shader,
+                             std::size(null_exit_loop_shader),
+                             &null_exit_loop_table,
+                             null_exit_loop_config).empty(),
+          "proven null result prunes loop-reachable unresolved BVH before translation");
+
+    ShaderResourceTable nonnull_exit_loop_table = null_exit_loop_table;
+    nonnull_exit_loop_table.resources[0].gpu_addr = 0x20000u;
+    CHECK(recompile_compute(null_exit_loop_shader,
+                            std::size(null_exit_loop_shader),
+                            &nonnull_exit_loop_table,
+                            null_exit_loop_config).empty(),
+          "different/non-null resource preserves unresolved loop BVH fail-visible");
+    std::vector<uint32_t> changed_null_exit(std::begin(null_exit_loop_shader),
+                                           std::end(null_exit_loop_shader));
+    changed_null_exit[20] = 0xBF850002u;      // SCC1 is not the proven no-hit exit
+    CHECK(recompile_compute(changed_null_exit.data(), changed_null_exit.size(),
+                            &null_exit_loop_table,
+                            null_exit_loop_config).empty(),
+          "null loop guard opcode deviation remains fail-visible in translation");
 
     const uint32_t runtime_dead_bvh[] = {
         0xBF0B8200u,                         // pc0: s_cmp_le_u32 s0, 2

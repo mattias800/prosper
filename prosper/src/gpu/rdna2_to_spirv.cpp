@@ -4892,9 +4892,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // idioms that wave64 shaders express with s_mov_b64.  A wave mask is one bool in this
             // per-invocation model, so preserve that bool domain when either source is an
             // unambiguous low-half mask or EXEC_LO is the destination.  VCC_LO remains available as
-            // ordinary scalar scratch when its source is ordinary data, matching the data path
-            // below.  High-half moves remain unsupported: without the guest wave mode they may name
-            // another lane rather than this invocation's bit.
+            // ordinary scalar scratch; when that scalar dword is copied back to EXEC_LO, select this
+            // invocation's bit from the complete Wave32 value.  High-half moves remain unsupported:
+            // without the guest wave mode they may name another lane rather than this invocation's bit.
             if (b.allow_b32_masks && in.opcode == 0x03) {   // s_mov_b32 (mask-domain form)
                 const auto data_value_present = [&](int reg) {
                     return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
@@ -4909,7 +4909,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg_bool_b32.contains(in.src[0].value) &&
                     !data_value_present(in.src[0].value);
                 const bool dst_exec_lo = in.dst.value == 126;
+                uint32_t scalar_mask_data = 0;
+                bool src_scalar_data = false;
+                if (dst_exec_lo &&
+                    (in.src[0].kind == OperandKind::SGPR ||
+                     (in.src[0].kind == OperandKind::Special &&
+                      in.src[0].value >= 106 && in.src[0].value <= 124))) {
+                    auto current = rs.sreg.find(in.src[0].value);
+                    if (current != rs.sreg.end()) {
+                        scalar_mask_data = current->second;
+                        src_scalar_data = true;
+                    } else {
+                        auto input = rs.sreg_input.find(in.src[0].value);
+                        if (input != rs.sreg_input.end()) {
+                            scalar_mask_data = input->second;
+                            src_scalar_data = true;
+                        }
+                    }
+                }
                 const bool mask_move = src_exec_lo || src_vcc_lo || src_saved_mask ||
+                    src_scalar_data ||
                     (dst_exec_lo && in.src[0].kind == OperandKind::InlineInt);
                 if (mask_move) {
                     uint32_t mask = 0;
@@ -4925,6 +4944,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         mask = saved->second;
                         auto state = rs.sreg_bool_narrowed.find(in.src[0].value);
                         narrowed = state == rs.sreg_bool_narrowed.end() || state->second;
+                    } else if (src_scalar_data) {
+                        const uint32_t lane = b.ibin(
+                            Op_BitwiseAnd, b.guest_lane_id(), b.uconst(31));
+                        const uint32_t bit = b.ibin(
+                            Op_BitwiseAnd,
+                            b.ibin(Op_ShiftRightLogical, scalar_mask_data, lane),
+                            b.uconst(1));
+                        mask = b.ucmp(Op_INotEqual, bit, b.uconst(0));
                     } else if (in.src[0].value == -1) {
                         mask = b.btrue();
                         narrowed = false;
@@ -10022,6 +10049,52 @@ bool shader_constant_compare(const std::vector<Rdna2Inst>& ins, size_t block_fir
     return true;
 }
 
+bool scalar_cfg_branch(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOPP &&
+        (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
+}
+
+void prune_scalar_cfg_reachability(std::vector<Rdna2Inst>& ins) {
+    if (ins.empty()) return;
+    std::unordered_map<uint32_t, size_t> index_by_pc;
+    for (size_t i = 0; i < ins.size(); ++i) index_by_pc.emplace(ins[i].pc, i);
+
+    std::vector<bool> reachable(ins.size(), false);
+    std::vector<size_t> pending{0};
+    while (!pending.empty()) {
+        const size_t i = pending.back();
+        pending.pop_back();
+        if (i >= ins.size() || reachable[i]) continue;
+        reachable[i] = true;
+        const Rdna2Inst& in = ins[i];
+        if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode == 0x12)) continue;
+        if (scalar_cfg_branch(in)) {
+            const auto target = index_by_pc.find(scalar_branch_target(in));
+            if (target != index_by_pc.end()) pending.push_back(target->second);
+            if (in.opcode == 0x02) continue;
+        }
+        if (i + 1 < ins.size()) pending.push_back(i + 1);
+    }
+
+    std::vector<Rdna2Inst> retained;
+    retained.reserve(ins.size());
+    for (size_t i = 0; i < ins.size(); ++i)
+        if (reachable[i]) retained.push_back(ins[i]);
+    // Once a taken branch's omitted arm is gone, its target is often the next retained instruction.
+    // Turn that now-redundant edge into a no-op so the ordinary straight-line/structured paths do not
+    // need to reconstruct an empty branch region.
+    for (size_t i = 0; i + 1 < retained.size(); ++i) {
+        Rdna2Inst& in = retained[i];
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x02 &&
+            scalar_branch_target(in) == retained[i + 1].pc) {
+            in.opcode = 0x00;
+            in.simm16 = 0;
+            in.words[0] = 0xbf800000u;
+        }
+    }
+    ins = std::move(retained);
+}
+
 size_t specialize_shader_constant_branches(std::vector<Rdna2Inst>& ins) {
     if (ins.empty()) return 0;
     // An indirect PC transfer can enter code outside the explicit SOPP graph. Keep the whole shader
@@ -10035,17 +10108,13 @@ size_t specialize_shader_constant_branches(std::vector<Rdna2Inst>& ins) {
     for (size_t i = 0; i < ins.size(); ++i) index_by_pc.emplace(ins[i].pc, i);
 
     std::set<size_t> block_starts{0};
-    auto is_branch = [](const Rdna2Inst& in) {
-        return in.fmt == Rdna2Format::SOPP &&
-            (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
-    };
     for (size_t i = 0; i < ins.size(); ++i) {
         const Rdna2Inst& in = ins[i];
-        if (is_branch(in)) {
+        if (scalar_cfg_branch(in)) {
             const auto target = index_by_pc.find(scalar_branch_target(in));
             if (target != index_by_pc.end()) block_starts.insert(target->second);
         }
-        if ((is_branch(in) || in.is_end ||
+        if ((scalar_cfg_branch(in) || in.is_end ||
              (in.fmt == Rdna2Format::SOPP && in.opcode == 0x12)) &&
             i + 1 < ins.size())
             block_starts.insert(i + 1);
@@ -10085,41 +10154,76 @@ size_t specialize_shader_constant_branches(std::vector<Rdna2Inst>& ins) {
     // Entry-rooted reachability after replacing proven conditions. Unknown conditional branches
     // retain both successors, so an unresolved resource remains in the instruction stream whenever
     // any runtime path can execute it.
-    std::vector<bool> reachable(ins.size(), false);
-    std::vector<size_t> pending{0};
-    while (!pending.empty()) {
-        const size_t i = pending.back();
-        pending.pop_back();
-        if (i >= ins.size() || reachable[i]) continue;
-        reachable[i] = true;
-        const Rdna2Inst& in = ins[i];
-        if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode == 0x12)) continue;
-        if (is_branch(in)) {
-            const auto target = index_by_pc.find(scalar_branch_target(in));
-            if (target != index_by_pc.end()) pending.push_back(target->second);
-            if (in.opcode == 0x02) continue;
-        }
-        if (i + 1 < ins.size()) pending.push_back(i + 1);
-    }
-
-    std::vector<Rdna2Inst> retained;
-    retained.reserve(ins.size());
-    for (size_t i = 0; i < ins.size(); ++i)
-        if (reachable[i]) retained.push_back(ins[i]);
-    // Once a taken branch's omitted arm is gone, its target is often the next retained instruction.
-    // Turn that now-redundant edge into a no-op so the ordinary straight-line/structured paths do not
-    // need to reconstruct an empty branch region.
-    for (size_t i = 0; i + 1 < retained.size(); ++i) {
-        Rdna2Inst& in = retained[i];
-        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x02 &&
-            scalar_branch_target(in) == retained[i + 1].pc) {
-            in.opcode = 0x00;
-            in.simm16 = 0;
-            in.words[0] = 0xbf800000u;
-        }
-    }
-    ins = std::move(retained);
+    prune_scalar_cfg_reachability(ins);
     return specialized_count;
+}
+
+size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
+                                        const ShaderResourceTable* rt,
+                                        uint32_t wave_size) {
+    if (!rt || wave_size != 32 || ins.empty()) return 0;
+    std::unordered_map<uint32_t, size_t> index_by_pc;
+    for (size_t i = 0; i < ins.size(); ++i) index_by_pc.emplace(ins[i].pc, i);
+
+    size_t specialized = 0;
+    for (const ShaderResource& resource : rt->resources) {
+        if (!is_proven_null_bvh(resource)) continue;
+        const auto found = index_by_pc.find(resource.fetch_pc);
+        if (found == index_by_pc.end()) continue;
+        const size_t ray_index = found->second;
+        if (ray_index + 5 >= ins.size()) continue;
+        const Rdna2Inst& ray = ins[ray_index];
+        const Rdna2Inst& wait = ins[ray_index + 1];
+        const Rdna2Inst& compare = ins[ray_index + 2];
+        const Rdna2Inst& scalar_compare = ins[ray_index + 3];
+        const Rdna2Inst& exec_copy = ins[ray_index + 4];
+        Rdna2Inst& exit = ins[ray_index + 5];
+
+        // Exact Wave32 no-hit idiom:
+        //   image_bvh_intersect_ray vN..vN+3, NULL_BVH
+        //   s_waitcnt ...
+        //   v_cmp_ne_u32 sM, -1, vN
+        //   s_cmp_lg_u32 0, sM
+        //   s_mov_b32 exec_lo, vcc_lo
+        //   s_cbranch_scc0 EXIT
+        // The null lowering writes -1 to every ray result for each active lane. The saved compare
+        // mask is therefore exactly zero, making SCC zero and the exit unconditional. Requiring the
+        // explicit one-word mask form and Wave32 avoids assuming anything about an unobserved high
+        // mask half. Adjacency and exact register links prevent a nearby unrelated compare from
+        // proving the branch.
+        const bool ray_shape = ray.fmt == Rdna2Format::MIMG && ray.opcode == 0xe6u &&
+            ray.mimg_dmask == 0xfu && ray.dst.kind == OperandKind::VGPR;
+        const bool wait_shape = wait.pc == ray.pc + ray.len_dwords &&
+            wait.fmt == Rdna2Format::SOPP && wait.opcode == 0x0cu &&
+            wait.words[0] == 0xbf8c3f70u; // s_waitcnt vmcnt(0)
+        const bool compare_shape = compare.pc == wait.pc + wait.len_dwords &&
+            compare.fmt == Rdna2Format::VOPC && compare.opcode == 0xc5u &&
+            compare.dst.kind == OperandKind::SGPR && compare.dst.value <= 105 &&
+            compare.src[0].kind == OperandKind::InlineInt && compare.src[0].value == -1 &&
+            compare.src[1].kind == OperandKind::VGPR && compare.src[1].value == ray.dst.value;
+        const bool scalar_shape = scalar_compare.pc == compare.pc + compare.len_dwords &&
+            scalar_compare.fmt == Rdna2Format::SOPC && scalar_compare.opcode == 0x07u &&
+            scalar_compare.src[0].kind == OperandKind::InlineInt &&
+            scalar_compare.src[0].value == 0 &&
+            scalar_compare.src[1].kind == OperandKind::SGPR &&
+            scalar_compare.src[1].value == compare.dst.value;
+        const bool copy_shape = exec_copy.pc == scalar_compare.pc + scalar_compare.len_dwords &&
+            exec_copy.fmt == Rdna2Format::SOP1 && exec_copy.opcode == 0x03u &&
+            exec_copy.dst.kind == OperandKind::SGPR && exec_copy.dst.value == 126 &&
+            exec_copy.src[0].kind == OperandKind::Special && exec_copy.src[0].value == 106;
+        const bool exit_shape = exit.pc == exec_copy.pc + exec_copy.len_dwords &&
+            exit.fmt == Rdna2Format::SOPP && exit.opcode == 0x04u && exit.simm16 > 0 &&
+            index_by_pc.contains(scalar_branch_target(exit));
+        if (!ray_shape || !wait_shape || !compare_shape || !scalar_shape || !copy_shape ||
+            !exit_shape)
+            continue;
+
+        exit.opcode = 0x02;
+        exit.words[0] = 0xbf820000u | static_cast<uint16_t>(exit.simm16);
+        ++specialized;
+    }
+    if (specialized) prune_scalar_cfg_reachability(ins);
+    return specialized;
 }
 
 } // namespace
@@ -10133,6 +10237,12 @@ bool rdna2_specialize_pcrel_dispatch(std::vector<Rdna2Inst>& instructions,
 size_t rdna2_specialize_shader_constant_branches(
         std::vector<Rdna2Inst>& instructions) {
     return specialize_shader_constant_branches(instructions);
+}
+
+size_t rdna2_specialize_proven_null_bvh_paths(
+        std::vector<Rdna2Inst>& instructions, const ShaderResourceTable* resources,
+        uint32_t wave_size) {
+    return specialize_proven_null_bvh_exits(instructions, resources, wave_size);
 }
 
 PcrelDispatchInfo rdna2_pcrel_dispatch_info(const uint32_t* code, size_t dwords) {
@@ -12789,6 +12899,10 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ComputeShaderConfig& config) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    // A dispatch-scoped proven-null BVH can collapse the exact no-hit loop exit before generic
+    // shader-byte constant folding. Resource identity (including null marker + fetch PC) is already
+    // part of the compute module cache key, so a later non-null dispatch receives a distinct module.
+    (void)rdna2_specialize_proven_null_bvh_paths(ins, rt, config.wave_size);
     (void)rdna2_specialize_shader_constant_branches(ins);
     // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is
     // only a place to finish the invocation after either guest arm has terminated.
