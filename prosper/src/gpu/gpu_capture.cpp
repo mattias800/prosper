@@ -1180,6 +1180,17 @@ void annotate_gpu_capture_scanout(GpuCaptureMetadata& metadata) {
         existing->second = value;
 }
 
+void annotate_gpu_capture_save_roots(GpuCaptureMetadata& metadata) {
+    const char* configured = std::getenv(kGpuCaptureSave0Env);
+    const std::string effective = configured ? configured : kGpuCaptureDefaultSave0Root;
+    const auto existing = std::find_if(metadata.renderer_env.begin(), metadata.renderer_env.end(),
+        [](const auto& entry) { return entry.first == kGpuCaptureSave0Env; });
+    if (existing == metadata.renderer_env.end())
+        metadata.renderer_env.emplace_back(kGpuCaptureSave0Env, effective);
+    else
+        existing->second = effective;
+}
+
 uint64_t parse_gpu_replay_scanout_address(const char* value) {
     if (!value || !*value) return 0;
     char* end = nullptr;
@@ -3645,6 +3656,7 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
         "PROSPER_TESTLUT", "PROSPER_TESTLUT32"
     };
     for (const char* name : render_env) if (const char* value = std::getenv(name)) m.renderer_env.emplace_back(name, value);
+    annotate_gpu_capture_save_roots(m);
     annotate_gpu_capture_scanout(m);
     pending->capture.metadata = m;
     if ((output_triggered || defer_materialization) && semantic_state &&

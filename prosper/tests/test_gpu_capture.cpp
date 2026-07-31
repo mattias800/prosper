@@ -74,6 +74,23 @@ static void set_test_env(const char* name, const char* value) {
 
 int main() {
     std::printf("== test_gpu_capture ==\n");
+    const char* original_save0_value = std::getenv(kGpuCaptureSave0Env);
+    const bool had_original_save0 = original_save0_value != nullptr;
+    const std::string original_save0 = original_save0_value ? original_save0_value : "";
+    GpuCaptureMetadata save_roots;
+    set_test_env(kGpuCaptureSave0Env, "/tmp/prosper-test-effective-save0");
+    annotate_gpu_capture_save_roots(save_roots);
+    CHECK(save_roots.renderer_env.size() == 1 &&
+              save_roots.renderer_env[0].first == kGpuCaptureSave0Env &&
+              save_roots.renderer_env[0].second == "/tmp/prosper-test-effective-save0",
+          "capture diagnostics retain the effective /savedata0 host root");
+    set_test_env(kGpuCaptureSave0Env, nullptr);
+    annotate_gpu_capture_save_roots(save_roots);
+    CHECK(save_roots.renderer_env.size() == 1 &&
+              save_roots.renderer_env[0].second == kGpuCaptureDefaultSave0Root,
+          "capture diagnostics make the default /savedata0 root explicit");
+    set_test_env(kGpuCaptureSave0Env,
+                 had_original_save0 ? original_save0.c_str() : nullptr);
     std::vector<uint8_t> memory(32);
     for (size_t i = 0; i < memory.size(); ++i) memory[i] = static_cast<uint8_t>(0x40 + i);
     auto reader = [&](uint64_t addr, uint8_t* dst, size_t n) -> size_t {

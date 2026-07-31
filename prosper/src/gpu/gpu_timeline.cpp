@@ -946,6 +946,7 @@ GpuCaptureMetadata runtime_capture_metadata(uint64_t submit_no) {
     if (request.history_phase_bounded.load(std::memory_order_relaxed))
         metadata.renderer_env.emplace_back(
             "PROSPER_CAPTURE_HISTORY_LOWER_BOUND_SUBMIT", std::to_string(history_lower_bound));
+    annotate_gpu_capture_save_roots(metadata);
     annotate_gpu_capture_scanout(metadata);
     return metadata;
 }
