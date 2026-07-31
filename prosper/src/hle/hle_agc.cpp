@@ -1999,6 +1999,16 @@ void register_agc_hle() {
     RN("KT-hTp-Ch14", agc_dcb_acquire_mem);       // sceAgcAcbAcquireMem
     RN("cFazmnXpJOE", agc_dcb_event_write);       // sceAgcAcbEventWrite
     RN("htn36gPnBk4", agc_dcb_wait_reg_mem);      // sceAgcAcbWaitRegMem
+    // sceAgcAcbWriteData — the WriteData member of this same ACB set, omitted when the others landed.
+    // Syberia: Remastered (PPSA30140, Unity/IL2CPP) builds its ACB fence cluster with it; dropping the
+    // call left the label permanently unwritten and parked Unity's main thread in the guest's own
+    // poll loop (`mov (%rdx),%rsi; cmp %rcx,%rsi; jne .-3` at eboot+0x1152b7e3) after 1 flip. The
+    // guest never reached a second present. Sharing the DCB builder unblocks the boot to its profile
+    // menu. ABI verified against the DCB sibling by the num_dwords guard below staying silent across
+    // a full boot: a shifted ABI would land garbage in a5 and trip the loud REJECT.
+    // CONFIDENCE: MED (matches the five ACB builders above; sceAgcAcbDmaData is the known exception
+    // that needed its own shifted-ABI handler, so re-check if a title ever trips the reject here).
+    RN("eZ4+17OQz4Q", agc_dcb_write_data);        // sceAgcAcbWriteData
     // Indirect-register patch helpers (SetAddress patches cmd[2..3]; AddRegisters patches cmd[1]).
     RN("vcmNN+AAXnY", agc_patch_set_address);   RN("d-6uF9sZDIU", agc_patch_add_registers);   // Cx
     RN("Qrj4c+61z4A", agc_patch_set_address);   RN("z2duB-hHQSM", agc_patch_add_registers);   // Sh
