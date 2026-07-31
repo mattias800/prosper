@@ -21,7 +21,7 @@ Last updated: 2026-07-31
 | Terminator (2D)&nbsp;¹ | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay reached (user-verified) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Day One gameplay renders; the manor entrance hall matches the hardware reference |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
-| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 title and new-save name entry reached; gameplay is not yet validated |
+| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 title, name entry, and new-save name confirmation reached; gameplay is not yet validated |
 | Additional Unity/IL2CPP target | `PPSA02664` | Unity / IL2CPP | 🔬 Exercised, with no published gameplay milestone |
 
 ¹ Exact retail game name pending confirmation.
@@ -207,9 +207,13 @@ individually probed and confirmed as legitimate frustum culls (#1435).
   <img src="assets/screenshots/dragon-quest-vii-name-entry.png" alt="Dragon Quest VII Reimagined — new-save name entry">
 </p>
 
+<p align="center">
+  <img src="assets/screenshots/dragon-quest-vii-name-confirmation.png" alt="Dragon Quest VII Reimagined — new-save name confirmation with Yes selected">
+</p>
+
 This Unreal Engine 4 target renders its localized, animated title screen at native 3840×2160. A
 current-master run with unique roots for both save backends reached it in about 34 seconds with seven
-ordinary Cross pulses; the representative image above is an unmodified native frontend capture of the
+ordinary Cross pulses; the first image above is an unmodified native frontend capture of the
 same validated title state. Title performance remains below full speed and varies with concurrent GPU work. Some
 animation samples still show a dark/purple background behind the stable logo, so visual correctness and
 full-speed performance remain open.
@@ -227,8 +231,14 @@ washed white or blue. A later exact-master replay corrected #1553's temporal/fli
 Cross at 55 seconds had already entered and highlighted `1: Unused`
 with its slot prompt; Circle at 140 seconds canceled to the adventure-log list, and Circle at 270
 seconds canceled to the title. Start/Options at 330 seconds and Circle at 350 seconds did not advance
-the title. Cross is confirm and Circle is cancel in this flow. Save creation and gameplay are still
-unvalidated. See the unchanged exact title route in
+the title. Cross is confirm and Circle is cancel in this flow.
+
+A fresh-root follow-up on exact master continued through the keyboard controls: the validated route
+selected `Back`, moved down to `OK`, and pressed Cross once at 160 seconds. That opened the name
+confirmation prompt with `Yes` selected and `No` below. The third image above is the direct, unmodified
+native 3840×2160 Linux `tools/screenshot` capture from that state; no input followed the confirming
+Cross, so `Yes` itself was not pressed. Save creation and gameplay are still unvalidated. See the
+unchanged exact title route in
 [`prosper/scripts/dragon-quest-vii/README.md`](prosper/scripts/dragon-quest-vii/README.md) and the renderer
 analysis in [`prosper/docs/DRAGON_QUEST_STATUS.md`](prosper/docs/DRAGON_QUEST_STATUS.md).
 
