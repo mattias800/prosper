@@ -457,6 +457,21 @@ order and all earlier work. Prefix output uses the last executed draw target's n
 a hash-verified seeded final capsule for fast composition bisection; unlike `--draw`, it does not discard
 DMA copies, compute dispatches, or earlier draws.
 
+**Always read `target=` before comparing two cutoffs.** Because prefix output follows the *last executed draw
+target*, adjacent cutoffs can render two completely different buffers, and comparing them then looks like one
+surface changing. The render summary names the surface it selected:
+
+```text
+[gpureplay] output=1920x1080 target=0000003083db0000 draw=88 bytes=8294400 hash=…
+[gpureplay] output=3840x2160 target=00000030867e0000 draw=90 bytes=33177600 hash=…
+```
+
+Differing `target=` values mean the two images are **not like-for-like** and no conclusion may be drawn from
+their difference. `target=capture` means the extent came from the capture's presentation metadata rather than
+a draw, so no single draw target describes it. This exists because #1486's "exact corruption boundary" was
+derived from exactly such a pair — a 1920x1080 post-process input versus the 3840x2160 graded scene — and the
+resulting hypothesis shaped two sessions of work before the extents were noticed.
+
 `--draw-steps PREFIX [--draw-steps-every N] [--draw-steps-target WxH]` is the **visual bisection** primitive —
 the fastest way to localize a composition defect (a black quad, a lost layer, a wrong-blended overlay) to the
 exact operation that introduces it, with **no oracle screenshot**. It renders the `--through-operation` prefix

@@ -82,6 +82,70 @@ int main() {
     CHECK(extent.width == 3840 && extent.height == 2160,
           "capture-sized renderer output overrides stale native draw dimensions");
 
+    // Regression for the #1486 class of false bisect boundary. Two adjacent ordered-prefix cutoffs
+    // that resolve to DIFFERENT color targets must report different addresses, so that comparing
+    // their images is visibly not like-for-like. Reporting only an extent is what let op116
+    // (a 1920x1080 post-process input) and op117 (the 3840x2160 graded scene) read as a single
+    // surface being corrupted between two cutoffs, when they were never the same buffer.
+    {
+        GpuReplayFrame bisect;
+        bisect.metadata.width = 3840;
+        bisect.metadata.height = 2160;
+
+        DrawItem post;                       // the post-process input a later draw samples
+        post.draw_index = 88;
+        post.color0_base = 0x3083db0000ull;
+        post.color0_width = 1920;
+        post.color0_height = 1080;
+
+        DrawItem scene;                      // the full-resolution graded scene
+        scene.draw_index = 90;
+        scene.color0_base = 0x30867e0000ull;
+        scene.color0_width = 3840;
+        scene.color0_height = 2160;
+
+        bisect.items = {post, scene};
+        bisect.operations = {
+            {SubmitOperationKind::Draw, 88, 100, true},
+            {SubmitOperationKind::Dispatch, 26, 200, true},
+            {SubmitOperationKind::Draw, 90, 300, true},
+        };
+
+        const OutputExtent earlier = replay_output_extent(
+            bisect, OutputExtentMode::OrderedPrefix, static_cast<size_t>(1920) * 1080 * 4, 2);
+        const OutputExtent later_cut = replay_output_extent(
+            bisect, OutputExtentMode::OrderedPrefix, static_cast<size_t>(3840) * 2160 * 4, 3);
+
+        CHECK(earlier.target_addr == 0x3083db0000ull && earlier.target_draw_index == 88,
+              "prefix ending at a dispatch reports the draw target it actually rendered");
+        CHECK(later_cut.target_addr == 0x30867e0000ull && later_cut.target_draw_index == 90,
+              "the next cutoff reports the full-resolution target");
+        CHECK(earlier.target_addr != later_cut.target_addr,
+              "adjacent cutoffs on different surfaces report different targets");
+    }
+
+    // The capture-extent fallback must not claim a draw target whose dimensions it does not report;
+    // an address next to the wrong extent would be worse than reporting none.
+    {
+        GpuReplayFrame plain;
+        plain.metadata.width = 64;
+        plain.metadata.height = 64;
+        DrawItem odd;
+        odd.draw_index = 3;
+        odd.color0_base = 0x1234000ull;
+        odd.color0_width = 8;
+        odd.color0_height = 8;
+        plain.items = {odd};
+        plain.operations = {{SubmitOperationKind::Draw, 3, 10, true}};
+
+        const OutputExtent fallback = replay_output_extent(
+            plain, OutputExtentMode::OrderedPrefix, static_cast<size_t>(64) * 64 * 4, 1);
+        CHECK(fallback.width == 64 && fallback.height == 64,
+              "byte count disproving the draw extent falls back to the capture extent");
+        CHECK(fallback.target_addr == 0,
+              "capture-extent fallback reports no target rather than a mismatched address");
+    }
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");
     return 0;

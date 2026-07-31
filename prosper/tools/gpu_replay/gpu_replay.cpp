@@ -2584,9 +2584,18 @@ int main(int argc, char** argv) {
     const uint32_t output_width = output_extent.width;
     const uint32_t output_height = output_extent.height;
     uint64_t hash = prosper::gpu::gpu_capture_hash(pixels);
-    std::fprintf(stderr, "[gpureplay] output=%ux%u bytes=%zu hash=%016llx "
+    // Name the surface, not just its size. A prefix replay renders the LAST EXECUTED DRAW TARGET, so
+    // adjacent `--through-operation` cutoffs can report two different buffers; without the address that
+    // reads as one surface changing. `target=` makes such a comparison self-invalidating.
+    char target_tag[64] = " target=capture";
+    if (output_extent.target_addr)
+        std::snprintf(target_tag, sizeof target_tag, " target=%016llx draw=%llu",
+                      static_cast<unsigned long long>(output_extent.target_addr),
+                      static_cast<unsigned long long>(output_extent.target_draw_index));
+    std::fprintf(stderr, "[gpureplay] output=%ux%u%s bytes=%zu hash=%016llx "
                          "expected_bytes=%llu expected_hash=%016llx\n",
-                 output_width, output_height, pixels.size(), static_cast<unsigned long long>(hash),
+                 output_width, output_height, target_tag,
+                 pixels.size(), static_cast<unsigned long long>(hash),
                  static_cast<unsigned long long>(replay.expected_output_bytes),
                  static_cast<unsigned long long>(replay.expected_output_hash));
     if (positional.size() == 2 && !pixels.empty() &&

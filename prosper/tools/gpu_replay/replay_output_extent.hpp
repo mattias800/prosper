@@ -17,6 +17,17 @@ enum class OutputExtentMode {
 struct OutputExtent {
     uint32_t width = 0;
     uint32_t height = 0;
+    // Guest base address of the color target the reported extent came from, and the draw that wrote
+    // it. Zero when the extent came from the capture's presentation metadata rather than a draw.
+    //
+    // Reporting WHICH surface was selected matters because a prefix replay renders the last executed
+    // draw target, so two adjacent `--through-operation` cutoffs can display two completely different
+    // buffers. Without the address, that reads as one surface changing between the cutoffs -- which is
+    // how #1486's "exact corruption boundary" was derived from op116 (1920x1080, a post-process input)
+    // versus op117 (3840x2160, the graded scene). They were never the same surface. Printing the
+    // address makes that class of false boundary self-evident instead of load-bearing.
+    uint64_t target_addr = 0;
+    uint64_t target_draw_index = 0;
 };
 
 struct OutputTarget {
@@ -57,7 +68,8 @@ inline OutputExtent replay_output_extent(const GpuReplayFrame& replay, OutputExt
     OutputExtent selected_extent = capture_extent;
     auto select_draw = [&](const DrawItem& draw) {
         if (draw.color0_width && draw.color0_height)
-            selected_extent = {draw.color0_width, draw.color0_height};
+            selected_extent = {draw.color0_width, draw.color0_height,
+                               draw.color0_base, draw.draw_index};
     };
 
     if (mode == OutputExtentMode::SelectedDraws) {
@@ -83,8 +95,18 @@ inline OutputExtent replay_output_extent(const GpuReplayFrame& replay, OutputExt
                                    capture_extent.height * 4;
     const uint64_t selected_bytes = static_cast<uint64_t>(selected_extent.width) *
                                     selected_extent.height * 4;
-    if (capture_bytes == output_bytes) return capture_extent;
-    return selected_bytes == output_bytes ? selected_extent : capture_extent;
+    // Attach the target identity only when the returned extent is the one that draw actually
+    // produced. Reporting an address next to dimensions it does not describe would be worse than
+    // reporting none, since the whole point is to identify the surface on screen.
+    auto with_target = [&](OutputExtent chosen) {
+        if (chosen.width == selected_extent.width && chosen.height == selected_extent.height) {
+            chosen.target_addr = selected_extent.target_addr;
+            chosen.target_draw_index = selected_extent.target_draw_index;
+        }
+        return chosen;
+    };
+    if (capture_bytes == output_bytes) return with_target(capture_extent);
+    return with_target(selected_bytes == output_bytes ? selected_extent : capture_extent);
 }
 
 } // namespace prosper::gpu::replay_tool
