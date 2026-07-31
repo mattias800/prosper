@@ -41,6 +41,17 @@ bool texture_decode_cache_candidate(bool has_live_color_target,
                                     bool is_sampled_texture,
                                     bool format_supported);
 
+// Apply the remaining runtime gates to a texture_decode_cache_candidate(). Keeping the candidate
+// explicit is important: DCC metadata can provide a nonzero source span even when renderer-owned
+// color is authoritative, but that metadata must never make guest decode-cache state eligible.
+bool persistent_texture_decode_cache_eligible(bool guest_decode_candidate,
+                                              bool compute_image_hit,
+                                              bool is_storage_image,
+                                              bool cache_disabled,
+                                              bool compression_supported,
+                                              size_t cache_limit,
+                                              size_t source_size);
+
 // Graphics currently lowers sampled 2D arrays to a 2D base-slice image. Array descriptors retain
 // the allocation base plus the selected mip's per-layer offset, so CPU decode must begin at that
 // offset (except for packed mip tails, whose coordinates are relative to the shared block base).
