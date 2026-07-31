@@ -435,6 +435,41 @@ runs with a 100% shader realization rate. `docs/RENDERER_PERFORMANCE_2026_07.md`
 remaining synchronous graphics/compute boundaries must be evaluated against a 3D workload rather
 than against Messenger's 2D scene, and this is the first clean candidate for that.
 
+| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 Autosave notice and profile-select menu render after implementing `sceAgcAcbWriteData`; the right portion of the frame is still black |
+| *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🔬 Runs a healthy ~113 fps Unity frame loop with a real post chain, but the guest's own composite is empty |
+## Syberia: Remastered — `PPSA30140`
+
+<p align="center">
+  <img src="assets/screenshots/syberia-profile.png" alt="Syberia: Remastered — profile-select menu (the right portion of the frame is still black)">
+</p>
+
+On unmodified master this title **hard-hung** at boot: 7 submits, 2 flips, one present, frozen
+forever. The cause was `sceAgcAcbWriteData` being unregistered and silently returning 0, so the
+packet that *sets* a fence label was never built and Unity's main thread parked permanently in the
+guest's own poll loop waiting for a value nothing would ever write.
+
+Registering it against the shared DCB builder — the same treatment the five sibling ACB builders
+already had — takes the boot to **523+ submits, 5,028+ draws and 88 flips**, rendering the autosave
+notice with animated gears and then the profile-select menu with its boarding-pass save slots.
+
+The screenshot is captioned honestly: the right ~55% of the frame is still black, and whether that
+is a missing layer or the game's own art direction is not yet established.
+
+## Tales of Graces f Remastered — `PPSA19991`
+
+Unusually healthy for a title that renders nothing: **20,296 presents in 180 s (~113 fps)**, a full
+Unity thread topology, addressable bundles loading, exactly **one** unimplemented NID in the whole
+log, and zero recompiler rejections, compute skips or faults. A captured steady-state frame replays
+**bit-exactly**, and the replay is a single colour — so prosper is faithfully rendering what the
+guest submits, and **the guest's own composite is empty**.
+
+A real Unity post chain is running behind it (16 RTT seeds, 960×540 half-res targets sampled back as
+temporal history, LUT-shaped surfaces, reverse-Z). One draw per frame fails to realize with
+`stages=0`, which rules out a shader gap and is the concrete next lead.
+
+Ruled out and not worth re-running: an intro-movie stall (despite 20 `libSceAvPlayer` imports and
+`Movie/h264/` assets, tracing shows **zero** AvPlayer calls), deadlock, and a slow black asset load.
+
 ## Requirements and scope
 
 - Game files, keys, and copyrighted Sony code are not included. You must supply your own
