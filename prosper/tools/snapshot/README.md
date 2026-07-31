@@ -133,6 +133,31 @@ inspection unless they fail.
   multiple moving frames in the first playable area.
 - `terminator-boot`: reviewed fresh-save guard for Terminator 2D's boot intro
   and settled main menu.
+- `alexkidd-gameplay`: reviewed fresh-save guard for Alex Kidd in Miracle World
+  DX's first level. Its window opens after the route's last pad press, so it
+  samples a settled scene whose only motion is cloud drift and enemy animation.
+
+## Choosing A Window And Thresholds
+
+A candidate entry cannot report the range its thresholds should sit below:
+`verify` only accepts or rejects the numbers it is given, and a rejected
+candidate saves no evidence to learn from. `profile_route.py` runs one capture
+with a permissive candidate and prints every sample, so the evidence window and
+`min_colors` come from the title's measured behaviour:
+
+```bash
+python3 tools/snapshot/profile_route.py '{"name":"probe","dump":"PPSA02664-app0",
+  "scale":4,"timeout":150,"sample_seconds":1,"capture_after_seconds":0,
+  "capture_before_seconds":150,"pad_script":"scripts/ppsa02664/reach-first-gameplay.pad",
+  "savedata_policy":"fresh","env":{},"min_colors":1}' ~/route-profile
+```
+
+Prefer a window that begins well after the guarded state is reached and, where
+the route allows, after its last input: a settled scene keeps SSIM comfortably
+above the threshold across animation phases, whereas a window straddling a load
+or transition makes the guard fail on healthy frames. Confirm the margin rather
+than assuming it — for `alexkidd-gameplay` the worst of 100 reviewed frames
+scores 0.93 against the reviewed references, against a 0.85 floor.
 
 ## Environment
 

@@ -626,6 +626,112 @@
         }
       ],
       "min_nonblack_ratio": 0.85
+    },
+    {
+      "name": "alexkidd-gameplay",
+      "dump": "PPSA02664-app0",
+      "scale": 4,
+      "timeout": 150,
+      "capture_after_seconds": 95,
+      "capture_before_seconds": 145,
+      "pad_script": "scripts/ppsa02664/reach-first-gameplay.pad",
+      "savedata_policy": "fresh",
+      "env": {},
+      "min_colors": 20000,
+      "min_qualifying_frames": 6,
+      "min_pixel_changes": 5,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 6,
+      "min_content_match_ratio": 0.75,
+      "dims": [
+        480,
+        270
+      ],
+      "review": "Approved all 16 composited images from two independent runs on 2026-07-31. Every image is the first level (Mt. Eternal) with the sky gradient and sun rays, parallax mountains, drifting clouds, both terrain platforms and the floating platform, the player, the enemy, gold blocks, grass/flower detail, the lives and coin HUD, the scroll card, and the dialogue box -- fully composited, with no black regions, missing layers, or diagnostic-only output. Cloud drift and enemy animation differ across all eight timestamps of each run and between the runs, confirming a live progressing scene rather than a frozen frame. Measured 33,414-35,308 distinct colours and exactly 1.0 non-black coverage in all 50 window frames of both runs; the pre-#1578 defect measured 3,010 colours at 0.137 coverage, so min_colors=20000 and min_nonblack_ratio=0.5 sit far below the reviewed range and far above the failure.",
+      "_note": "Reviewed fresh-save guard for Alex Kidd in Miracle World DX's first level (Mt. Eternal). The evidence window opens 95s in -- twenty seconds after the level was observed to load and entirely after the route's last pad press at 89s -- so it samples settled gameplay rather than the load transition, and tolerates a level load arriving as late as ~107s before the content-match ratio can drop. Colour count is deliberately ONE of five conjoined conditions (richness, non-black coverage, SSIM against reviewed luminance references, stable dimensions, frame-to-frame change) and must never become the contract on its own: a seed-miss diagnostic gradient can score MORE distinct colours than real content, so a colour-only guard can be passed by output that is visibly broken.",
+      "structural_references": [
+        {
+          "luma16x9": "83868e7a858c8d9fa49686b18d76755fa99c959db6939394a69ac6dfdeb99c6dadc4c4cdcec9ba9a9baba19b9395897aaebec5c5bfa8aca99ea2acb4dbb2929192989ab3b1a4a2a3a3a3a8b2c1a39ba6414e5e607079bbd4d4aca077686d6c6147211c2053bfefedebd2c5aa4b2f212e3a3d17339daaa8a49991abb3a13c202d1f29312e92a5a7734287bb9f9b841e17",
+          "average_hash": "243c38feff7f7f38",
+          "difference_hash": "c8d1f1d4ceecc5d2"
+        },
+        {
+          "luma16x9": "6c89a3ba989789937d7574716e747560b896a1b8c894bee2d69782807ea99f83dcc3c0c1c8c69d9595918f8e8c8cd1ebafc8cdc5c2b2c0a59d9d9ec8ceaba2a18d9db7b9baacb1b8a6a2a6adbda2ada6424e5f627180c7e3beaa9f77676d6d6147221d2156dcefece7c5b9a34b2f212e3b3e18349daeaba39891aab3a13c202d2029322f92a5a7734287bb9f9b841f17",
+          "average_hash": "243c38feffffdf0e",
+          "difference_hash": "c8d9f1f4da1d35b6"
+        },
+        {
+          "luma16x9": "89a18b8a7d879c89858ca680717475607e8fc8ded49c9bab969196b3b7af9d6eb3bdc0c0bfae90a1afa3d7f6f6deb283bcc1c1bfc2a39c9da9bccceacaa69e9993a59da5afaba2a2a2a9b0b2bda9b7a6414e5e606f80d3ceaba9a077676e6d6147211b2054d9eceae3b6b2a14b2f212e3a3d17339dacaba19791aab3a13d202d1f29312e92a5a7734287bb9f9b841f17",
+          "average_hash": "243c38feffff7e2b",
+          "difference_hash": "c8d9f9b0cdc4d4e9"
+        },
+        {
+          "luma16x9": "96a6beb27a7375757575747281867b7aefb8b0bdb0878692b58f84817ea9b3c8c2c2c0c2c7b9ccf6f0e4c0988b87837db3c5c8c3c1b3bcb6b6afddd29f928c8f8ba2acadb3a8a9a6a2a3a9adbec1a5a5414e5f61707fd2b2a9a89f76696f6d6148211c2154d4eae5d5b0aaa14b2f212e393f18349eaea99f9790a9b2a13c202d1f29322e92a8a7734287bb9f9a841e17",
+          "average_hash": "243c38feff3fdf03",
+          "difference_hash": "c8d9f9b8caf03586"
+        },
+        {
+          "luma16x9": "6c8c8b6f778ea99cc2bcaf9a8175755f7c849497b3a8afbfacbfc6ece2b79c6dacbdbecdced8d9bec1b0beaba28e827aadbfc0c0bea9b6c3bbd1e5c7a49b8e8f879999a5aba5a3aab7b5b9b4cfc19ea6414d5e606f7dbaa9adb3a3776a6f6d6145201b2053d1e9e1c1aeaea24b2f212e3b3c17339daea79f9790aab3a13c202d1f29312e91a5a7734187bb9f9b841f17",
+          "average_hash": "243c38feff7f7e38",
+          "difference_hash": "c8d9f9a0e2f8c4e2"
+        },
+        {
+          "luma16x9": "73869f929aaecfbe95807e8878747560a69b9bbaa69db7f1f6b38b878fad9e7dc5c6bdc1c7baa6a1bdb79a938e93b6ecaabdbec0beb2b2abaee2d1a3999ea4a2889096a5aca9b4aca9a8afb4c4ab9ba7414c5e606f7eacafabaa9f786a6e6c6148201b2053d1e4d1bca9a9a14b2f212e393e17339eaca59f9690a9b4a13c202d1f29322e91a4a6734187bb9f9a841f17",
+          "average_hash": "243c38feffffdf1e",
+          "difference_hash": "c8d1f9d0e82cb5da"
+        },
+        {
+          "luma16x9": "758d8d8abaa59389a8c69c7e7a867b60728396d5e2d2b9a599adc8aeb3b8a379a4bcbcbdc0b4b3baada3c9fdf8ebc394a6bcbdbfbda19fb1d2e8c5bac6b0a09b848d94a2aaa09fa2abb5b0c0c4ada1a8404c5d5f6f7aa6a6a7aaa47a6a6e6d6245201b1f52d0ddbfb1a8aaa24c30212e3b3c16339daaa59e9690a9b3a13d202d1f29312e91a4a6734187bba19b841f17",
+          "average_hash": "243c38fcffff7e14",
+          "difference_hash": "c8d9f9c4e4c48cac"
+        },
+        {
+          "luma16x9": "90a5987e7e7b7b80847874727b887d6ad6ccd5a38d8e8a92b3a486817ea9a9c3bbc0c5c6c1b4b5f6f3eece9e8c86827ccdc7c7c3c9b2b4c5e9ceaea79b918c8fa5c1adaebcc2aca5a7a5b0c7bca09aa543526161707ab0aaa8acb379696d6c6149221d2153cdccbbada8aaa14b2f212e3a3f1834a1aca69e9690a9b3a13c202d1f29322e93a5a7724187bca09a841e17",
+          "average_hash": "243c38feff3fdf01",
+          "difference_hash": "c8d9f9c8f5f436b7"
+        },
+        {
+          "luma16x9": "888b8c85777475788b8479927574755f9c9faa9ec08c84828385bbdacdb49c6dcec0c6cdcfceb895909091908e87817abccbc9c3c3aab6a99c9c9bacd8b18d8ea2acb2acb5aaa4a8a4a2a5acbea19aa5434f5f617079bcd5d5aca077676d6c6148221d2153bfefedead3c5aa4b2f212e3a3e18349daba8a49991abb3a13c202d1f29322e93a5a7734287bc9f9c841e17",
+          "average_hash": "643c38feff7f6700",
+          "difference_hash": "c8d1f1f49ed9ccc6"
+        },
+        {
+          "luma16x9": "677a8b7ca2bcbeab96aca77a6f747560a9888c918c9fdff7e6a8a6a784a9a083c2c0bcbfc1b4a7bfc3a79ba2a590d1eba9bcbebfbea8a5a8b7bbaccdd5b6a4a1868e97a3aba9aaa7a7b0b6b2c0a5b1a7404c5e606f7fc8e1b9aba277686e6d6245201b2054d9eeebe7c5b9a34b2f212e3b3d17339daba9a39791abb3a13d202d1f29322e92a5a7734288bb9f9b841f17",
+          "average_hash": "243c38feffffff3c",
+          "difference_hash": "c8d9f1f0c07471e8"
+        },
+        {
+          "luma16x9": "7f898ea6a17b83928da4908f7a757560989bb7e0e7ba9197a8a6bfa9c1b29d6eabc5bdbec1c2b9b1acb6e0fef5e1b483a9bdc4c8c0a5b2bebdbfd6efdea9a09a8a9299b8b8aba5aeb8bbb6b9c4b9b8a6414d5e617181d4cfafb5aa78686f6e6247211c2054dbedebe3b7b7a74c30222e3a3d17339dacaca19791abb4a43d202d1f29312e91a5a7734287bb9f9b841f17",
+          "average_hash": "243c38feffff7f12",
+          "difference_hash": "c8d9f9a0c4cccce4"
+        },
+        {
+          "luma16x9": "6c77826c6e76787c8498807381867b7ac4977b787d88999ebc9ca28b7ea9b3c8afbdbabbbeb2d2fbf5e7c8ae9387837da7bdbebebca8b2bec7b8e1d7ad968c8f888e97a2aaa1a1a3aab2afb0c0c6a6a5404c5d606f7fd1b1a9aca4776a6f6d6147201b2053d3eae5d5afaba24b2f212e393e17339daea99f9790a9b4a13c202d1f28322e92a5a7734287bb9f9b841f17",
+          "average_hash": "643c38feff7ff910",
+          "difference_hash": "c8d9f9a0c4f031a2"
+        },
+        {
+          "luma16x9": "708097817c909c91a69e8ba9aa7a755f858d97afbe999ca8aaa8b6e1e6bf9d6eacbec0cdcfd5c5a9acb1aea09599957ca7bec0c0c0b0b6ada8c5e7bfa2969499859199a4aeaeaca7a3a8afb7cdc29ea9414c5e60707dbdadaaa8a0776b6f6d6145201b2053d1e9e2c1ada9a14b2f212e3b3c17339daea79f9790a9b3a13c202d1f29312e91a5a6734187bb9f9b841f17",
+          "average_hash": "243c38feff7f7e78",
+          "difference_hash": "c8d9f990e8e8c4d2"
+        },
+        {
+          "luma16x9": "67798e8eab9f8fa5c68b7c7c877a7560a2917f87a1afb3e3ead5978986ae9f7dc7c5bbbcc1bfb3a29fa9ba9b918ebff0abbdbebfbca2adb4b2d9ceb59ea2a3a9878f98a3aaa0a0aaadabaab4cbae9da7404c5d606f7ea9a7aaaba0786a6e6d6147201b2053d1e3d0baa8aaa14b2f212e393e17339daca59f9690a9b2a13c202d1f29322e91a4a6734187bd9f9b841f17",
+          "average_hash": "643c38fefffffd1e",
+          "difference_hash": "c8d1f9a4e06cb1b4"
+        },
+        {
+          "luma16x9": "9e98998189807e757b877e7c7b857760889eafe7e3af928b85909a98b1b8a274b4c0bfc1c2b0939b9996c0faf3eac293b0c2c0c1c0aba2a0c6e2beb7bca79e9b8c9c9fa7afafaba4a4aba9bcc3a79da7414d5e606f7aababa9a8a2796a6e6d6145201b2053d0ddc1b2a8a9a14b2f212e3b3c17339eaca59e9690a9b2a13c202d1f29312e92a5a7724187bb9f9a841f17",
+          "average_hash": "643c38feffff6f03",
+          "difference_hash": "c8d9f9c0e0c48caf"
+        },
+        {
+          "luma16x9": "a39a958084967b78848d807a89997f6cc6c0aa8f8b8d9691b0a8988b85aaadc7aabec1bfc1b1b5f7f2edd2aa938a8684abbdbfbfc0a9b1c2e9cdadaca2958d90899298a4ada4a1a2a6a5afc7bea39ba6414d5e606f78a5a5a7acb3796a6d6c6147201b2052cccab7ada8a9a14b2f212e393e17339caaa59e9690a9b2a13c202d1f29322e92a4a6724187bb9f9a841e17",
+          "average_hash": "643c38feff7fff45",
+          "difference_hash": "c8d9f9c4f4f433af"
+        }
+      ],
+      "min_nonblack_ratio": 0.5
     }
   ]
 }
