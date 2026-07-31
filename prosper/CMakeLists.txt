@@ -725,6 +725,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_replay_shader_dump PRIVATE prosper_core)
   add_test(NAME gpu_replay_shader_dump COMMAND test_gpu_replay_shader_dump)
 
+  # Offline SPI_PS_INPUT_CNTL linkage classification: a pixel-shader input wired to the constant
+  # form consumes no producer export, and must never be reported as a PARAM consumer.
+  add_executable(test_gpu_replay_pixel_inputs tests/test_gpu_replay_pixel_inputs.cpp)
+  target_link_libraries(test_gpu_replay_pixel_inputs PRIVATE prosper_core)
+  add_test(NAME gpu_replay_pixel_inputs COMMAND test_gpu_replay_pixel_inputs)
+
   add_executable(test_gpu_dependency_graph tests/test_gpu_dependency_graph.cpp)
   target_link_libraries(test_gpu_dependency_graph PRIVATE prosper_core)
   add_test(NAME gpu_dependency_graph COMMAND test_gpu_dependency_graph)

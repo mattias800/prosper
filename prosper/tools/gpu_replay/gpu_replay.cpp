@@ -8,6 +8,7 @@
 #include "replay_output_extent.hpp"
 #include "compute_recompile.hpp"
 #include "realized_shader_dump.hpp"
+#include "pixel_input_linkage.hpp"
 #include "render_runner.h"
 
 #include <algorithm>
@@ -450,6 +451,38 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     d.ps.src_color_blend_factor, d.ps.dst_color_blend_factor, d.ps.color_blend_op,
                     d.ps.src_alpha_blend_factor, d.ps.dst_alpha_blend_factor, d.ps.alpha_blend_op,
                     d.ps.logic_op_enable, d.ps.logic_op);
+        // Resolved SPI_PS_INPUT_CNTL linkage (see pixel_input_linkage.hpp): which producer PARAM
+        // slot each pixel-shader input actually reads, or whether the interpolator synthesizes a
+        // constant instead. Retained since capture v36; older captures print `none` rather than
+        // inventing a mapping.
+        if (!d.has_pixel_inputs) {
+            std::printf("  ps-inputs none\n");
+        } else {
+            const auto& pi = d.pixel_inputs;
+            const uint32_t effective = pi.effective_passthrough_mask();
+            std::printf("  ps-inputs valid=%08x passthrough=%08x effective-passthrough=%08x",
+                        pi.valid_mask, pi.passthrough_mask, effective);
+            for (uint32_t input = 0; input < pi.controls.size(); ++input) {
+                const auto linkage = prosper::gpu::replay_tool::pixel_input_linkage(
+                    pi, input, effective);
+                switch (linkage.kind) {
+                    case prosper::gpu::replay_tool::PixelInputKind::Unused:
+                        break;
+                    case prosper::gpu::replay_tool::PixelInputKind::Param:
+                        std::printf(" %u=param%u", input, linkage.param);
+                        break;
+                    case prosper::gpu::replay_tool::PixelInputKind::ParamPassthrough:
+                        std::printf(" %u=param%u/pass", input, linkage.param);
+                        break;
+                    case prosper::gpu::replay_tool::PixelInputKind::ConstantDefault:
+                        std::printf(" %u=default(xyz=%s,w=%s)", input,
+                                    linkage.default_xyz_one ? "1.0" : "0.0",
+                                    linkage.default_w_one ? "1.0" : "0.0");
+                        break;
+                }
+            }
+            std::printf("\n");
+        }
         for (uint32_t slot = 2; slot < d.color_targets.size(); ++slot) {
             const auto& target = d.color_targets[slot];
             const auto& pipeline = d.ps.color_targets[slot];
