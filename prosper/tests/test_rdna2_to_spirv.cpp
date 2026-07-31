@@ -2630,6 +2630,89 @@ int main() {
     CHECK(got43a_taken.size() == N && got43a_skipped.size() == N && bad43a == 0,
           "kernel 43a merges taken/skipped pre-loop values into the counted loop exactly");
 
+    // Kernel 43a2: TWO disjoint choices before the same counted loop. This is the composition used by
+    // Plucky Squire's histogram kernel: an exact guest-wave EXECZ one-arm region is followed by a
+    // scalar SCC if/else, and both merged values seed the counted loop. Wave 0 enters the EXEC arm
+    // (s4=3); wave 1 is empty and skips it (s4=0). Compile both scalar outcomes so all four material
+    // combinations reach the loop: (EXEC enter/skip) x (SCC then/else).
+    const uint32_t code43a2_then[] = {
+        0x7E000F00u, 0x7E020F01u, 0xBE840380u, 0x7DA80300u, 0xBF880001u,
+        0xBE840383u, 0xBEFE04C1u, 0xB0020003u, 0xB0030005u, 0xBF0A0302u,
+        0xBF840002u, 0xBE85038Au, 0xBF820001u, 0xBE850394u, 0x80060504u,
+        0xB0010005u, 0xBE800380u, 0xBF0A0100u, 0xBF840003u, 0x80060006u,
+        0x81008100u, 0xBF82FFFBu, 0x7E040C06u, 0xBF810000u,
+    };
+    const uint32_t code43a2_else[] = {
+        0x7E000F00u, 0x7E020F01u, 0xBE840380u, 0x7DA80300u, 0xBF880001u,
+        0xBE840383u, 0xBEFE04C1u, 0xB0020005u, 0xB0030003u, 0xBF0A0302u,
+        0xBF840002u, 0xBE85038Au, 0xBF820001u, 0xBE850394u, 0x80060504u,
+        0xB0010005u, 0xBE800380u, 0xBF0A0100u, 0xBF840003u, 0x80060006u,
+        0x81008100u, 0xBF82FFFBu, 0x7E040C06u, 0xBF810000u,
+    };
+    const RecompileCoverage coverage43a2_then = recompile_coverage(
+        code43a2_then, std::size(code43a2_then));
+    const RecompileCoverage coverage43a2_else = recompile_coverage(
+        code43a2_else, std::size(code43a2_else));
+    CHECK(coverage43a2_then.unsupported == 0 && coverage43a2_else.unsupported == 0,
+          "kernel 43a2 coverage claims both pre-loop choices and the counted loop");
+    const auto spv43a2_then = recompile_valu(
+        code43a2_then, std::size(code43a2_then), 2, 2);
+    const auto spv43a2_else = recompile_valu(
+        code43a2_else, std::size(code43a2_else), 2, 2);
+    CHECK(!spv43a2_then.empty() && !spv43a2_else.empty(),
+          "recompiled kernel 43a2 (EXEC one-arm + SCC if/else + counted loop) -> SPIR-V");
+    std::vector<float> in43a2(N * 2), exp43a2_then(N), exp43a2_else(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const bool exec_arm = i < 64;
+        in43a2[i * 2 + 0] = exec_arm ? 2.0f : 1.0f;
+        in43a2[i * 2 + 1] = exec_arm ? 1.0f : 2.0f;
+        exp43a2_then[i] = exec_arm ? 23.0f : 20.0f;
+        exp43a2_else[i] = exec_arm ? 33.0f : 30.0f;
+    }
+    const auto got43a2_then = prosper::test::run_compute(spv43a2_then, in43a2, N, N);
+    const auto got43a2_else = prosper::test::run_compute(spv43a2_else, in43a2, N, N);
+    uint32_t bad43a2 = 0;
+    for (uint32_t i = 0;
+         i < N && got43a2_then.size() == N && got43a2_else.size() == N; ++i) {
+        if (got43a2_then[i] != exp43a2_then[i] ||
+            got43a2_else[i] != exp43a2_else[i]) ++bad43a2;
+    }
+    CHECK(got43a2_then.size() == N && got43a2_else.size() == N && bad43a2 == 0,
+          "kernel 43a2 preserves all EXEC/SCC pre-loop PHI combinations through the loop");
+
+    // A per-wave VCC early-out may not contain a workgroup barrier: different waves can take
+    // different arms, which would make Vulkan barrier participation non-uniform. The accepted
+    // two-choice prelude and counted loop must not hide that independent post-loop rejection.
+    const uint32_t code43a2_barrier_vcc[] = {
+        0x7E000F00u, 0x7E020F01u, 0xBE840380u, 0x7DA80300u, 0xBF880001u,
+        0xBE840383u, 0xBEFE04C1u, 0xB0020003u, 0xB0030005u, 0xBF0A0302u,
+        0xBF840002u, 0xBE85038Au, 0xBF820001u, 0xBE850394u, 0x80060504u,
+        0xB0010005u, 0xBE800380u, 0xBF0A0100u, 0xBF840003u, 0x80060006u,
+        0x81008100u, 0xBF82FFFBu, 0x7E040C06u, 0x7C020300u, 0xBF860002u,
+        0xBF8A0000u, 0x7E040281u, 0xBF810000u,
+    };
+    const RecompileCoverage coverage43a2_barrier_vcc = recompile_coverage(
+        code43a2_barrier_vcc, std::size(code43a2_barrier_vcc));
+    CHECK(coverage43a2_barrier_vcc.unsupported == 1 &&
+              coverage43a2_barrier_vcc.first_bad_fmt >= 0 &&
+              coverage43a2_barrier_vcc.first_bad_op == 0x06u &&
+              coverage43a2_barrier_vcc.first_bad_pc == 24u,
+          "kernel 43a2 leaves only the post-loop VCCZ-with-barrier branch unsupported");
+    CHECK(recompile_valu(code43a2_barrier_vcc, std::size(code43a2_barrier_vcc), 2, 2).empty(),
+          "kernel 43a2 rejects a per-wave VCC arm spanning a workgroup barrier");
+
+    // Partially-overlapping pre-loop regions are not a structured IF tree. Their branch intervals
+    // [3,7) and [5,9) cross, so the prefix must reject instead of entering the counted loop with
+    // invented merge semantics.
+    const uint32_t code43a2_overlap[] = {
+        0xBE800383u, 0xBE810385u, 0xBF0A0100u, 0xBF840003u, 0xBF0A0100u,
+        0xBF840003u, 0xBE830381u, 0xBE830382u, 0xBE830383u, 0xB0020005u,
+        0xBE800380u, 0x7E020280u, 0xBF0A0200u, 0xBF840003u, 0x4A020200u,
+        0x81008100u, 0xBF82FFFBu, 0x7E000D01u, 0xBF810000u,
+    };
+    CHECK(recompile_valu(code43a2_overlap, std::size(code43a2_overlap), 0, 0).empty(),
+          "kernel 43a2 rejects partially-overlapping pre-loop IF regions");
+
     // Kernel 43b: a pre-loop conditional that jumps over the complete counted loop to s_endpgm.
     // The prelude CFG scan uses the loop header as an artificial end marker, so it must preserve the
     // early-out classification and reject rather than silently execute the loop on both outcomes.
