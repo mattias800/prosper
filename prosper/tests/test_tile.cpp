@@ -408,12 +408,12 @@ int main() {
         const TiledMipLevelLayout tail7 =
             tiled_mip_level_layout(2048, 1152, 4, M, 11, 7);
         CHECK(tail7.supported && tail7.in_tail && tail7.byte_offset == 2048 &&
-                  tail7.tail_x == 4 && tail7.tail_y == 0 && tail7.tail_block_bytes == 4096,
+                  tail7.tail_x == 16 && tail7.tail_y == 0 && tail7.tail_block_bytes == 4096,
               "first SW_4KB_S tail level exposes AddrLib byte and element origins");
         const TiledMipLevelLayout tail11 =
             tiled_mip_level_layout(2048, 1152, 4, M, 11, 11);
         CHECK(tail11.supported && tail11.in_tail && tail11.byte_offset == 768 &&
-                  tail11.tail_x == 2 && tail11.tail_y == 2,
+                  tail11.tail_x == 8 && tail11.tail_y == 8,
               "last allocated tail level retains its sparse max-tail slot");
 
         // Pack level 7 into its shared block using the equivalent global tail coordinate, then read
@@ -448,6 +448,56 @@ int main() {
         for (size_t i = 0; i < rewritten.size(); ++i) changed += rewritten[i] != shared_tail[i];
         CHECK(changed <= replacement.size(),
               "tail writeback does not clear or overwrite sibling padding bytes");
+    }
+
+    // A packed-tail level reports TWO origins for the same texels: byte_offset and (tail_x, tail_y).
+    // They must agree, i.e. the element origin has to land on byte_offset under the surface's own
+    // swizzle. The round-trip above cannot see a disagreement because it both writes and reads at
+    // (tail_x, tail_y); only cross-checking against byte_offset pins the real placement. This caught
+    // 4 KiB tail levels resolving to a quarter of their true element origin (#320: PPSA02664's
+    // mipped 4x4 SpriteMask sprites decoded foreign, fully transparent texels, so every mask
+    // fragment failed its alpha test and a "visible outside mask" fill covered the whole frame).
+    {
+        struct Case { uint32_t mode, bpe, w, h, max_mip; };
+        const Case cases[] = {
+            {(uint32_t)TileMode::Sw4KbS,   4,    4,    4,  2},   // PPSA02664 mask sprite
+            {(uint32_t)TileMode::Sw4KbS,   4, 2048, 1152, 11},
+            {(uint32_t)TileMode::Sw4KbS,   8,  256,  256,  8},
+            {(uint32_t)TileMode::Sw4KbS,  16,  256,  256,  8},
+            {(uint32_t)TileMode::Sw64KbS,  4, 1920, 1080,  7},
+            {(uint32_t)TileMode::Sw64KbS,  8,  512,  512,  9},
+        };
+        size_t checked = 0, disagreed = 0;
+        for (const Case& c : cases) {
+            // Element extent of one whole block for this mode/bpe, found through the public API.
+            const size_t block_bytes = tiled_elements_bytes(1, 1, c.bpe, c.mode);
+            uint32_t bw = 0, bh = 0;
+            for (uint32_t w = 1; w <= 1024 && !bw; w <<= 1)
+                for (uint32_t h = 1; h <= 1024; h <<= 1)
+                    if ((size_t)w * h * c.bpe == block_bytes &&
+                        tiled_elements_bytes(w, h, c.bpe, c.mode) == block_bytes) { bw = w; bh = h; break; }
+            if (!bw || !bh) continue;
+            // Stamp every element of one block with its own coordinate, then tile it.
+            std::vector<uint8_t> linear(block_bytes, 0), tiled(block_bytes, 0);
+            for (uint32_t y = 0; y < bh; ++y) for (uint32_t x = 0; x < bw; ++x) {
+                const uint32_t stamp = (y << 16) | x;
+                std::memcpy(linear.data() + ((size_t)y * bw + x) * c.bpe, &stamp, 4);
+            }
+            tile_surface(tiled.data(), linear.data(), bw, bh, c.mode, 0, c.bpe);
+            for (uint32_t level = 0; level <= c.max_mip; ++level) {
+                const TiledMipLevelLayout l =
+                    tiled_mip_level_layout(c.w, c.h, c.bpe, c.mode, c.max_mip, level);
+                if (!l.supported || !l.in_tail) continue;
+                if (l.byte_offset + 4 > tiled.size()) continue;
+                uint32_t stamp = 0;
+                std::memcpy(&stamp, tiled.data() + l.byte_offset, 4);
+                ++checked;
+                if ((stamp & 0xffffu) != l.tail_x || (stamp >> 16) != l.tail_y) ++disagreed;
+            }
+        }
+        CHECK(checked >= 20, "tail-origin cross-check exercised the packed-tail levels");
+        CHECK(disagreed == 0,
+              "every packed-tail element origin addresses exactly its reported byte_offset");
     }
 
     // Tiled footprint: a 64KB block holds 65536 bytes; its element dims depend on bpe

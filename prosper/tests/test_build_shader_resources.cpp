@@ -155,7 +155,7 @@ int main() {
         const DecodedImageView vmip7 = image_base_level_view(dmip7, mip_format);
         CHECK(vmip7.supported && vmip7.in_mip_tail && vmip7.base == 0x18000000ull &&
                   vmip7.width == 16 && vmip7.height == 9 && vmip7.mip_offset == 2048 &&
-                  vmip7.mip_tail_bytes == 4096 && vmip7.mip_tail_x == 4 &&
+                  vmip7.mip_tail_bytes == 4096 && vmip7.mip_tail_x == 16 &&
                   vmip7.mip_tail_y == 0,
               "packed-tail base level keeps the shared block base and exact in-block origin");
         uint32_t tmip_cube[8];
@@ -299,7 +299,7 @@ int main() {
         CHECK(tail && tail->gpu_addr == 0x18000000ull && tail->width == 16 &&
                   tail->height == 9 && tail->size == 16u * 9u * 4u &&
                   tail->in_mip_tail && tail->mip_tail_offset == 2048 &&
-                  tail->mip_tail_bytes == 4096 && tail->mip_tail_x == 4 &&
+                  tail->mip_tail_bytes == 4096 && tail->mip_tail_x == 16 &&
                   tail->mip_tail_y == 0,
               "packed-tail resource retains the shared base and exact swizzled level coordinate");
         CHECK(tail && !tail->compression_enabled && tail->metadata_addr == 0,
