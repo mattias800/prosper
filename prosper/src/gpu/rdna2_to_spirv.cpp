@@ -7052,14 +7052,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         rs.sreg_srt.erase(in.dst.value);
                         if (in.dst.value == 106) vcc = masked;
                     } else {
-                        // VOPC architecturally overwrites VCC, including any earlier scalar-data use
-                        // of its physical words. In Wave32 the low word is itself the complete mask;
-                        // retain that domain marker so a following s_mov_b32 save sees the fresh VCC
-                        // rather than stale dispatcher-loaded scalar data.
+                        // VOPC replaces the architectural VCC predicate. In Wave32 the complete mask
+                        // occupies VCC_LO only; VCC_HI remains available as ordinary scalar scratch
+                        // (Astro's sibling traversal keeps a float there across an implicit compare).
+                        // Wave64 still replaces both physical words. Retain the low-word mask marker
+                        // so a following s_mov_b32 save sees the fresh predicate rather than stale
+                        // dispatcher-loaded scalar data.
                         vcc = masked;
-                        mask_write_clobbers_pair(rs, 106);
+                        if (b.wave_size == 32) {
+                            rs.sreg.erase(106);
+                            rs.sreg_srt.erase(106);
+                        } else {
+                            mask_write_clobbers_pair(rs, 106);
+                        }
                         rs.sreg_bool_narrowed[106] = true;
-                        rs.sreg_bool_narrowed[107] = true;
+                        if (b.wave_size != 32) rs.sreg_bool_narrowed[107] = true;
                         if (b.allow_b32_masks &&
                             (b.is_fragment || (b.is_compute && b.wave_size == 32))) {
                             rs.sreg_bool[106] = masked;

@@ -481,6 +481,34 @@ int main() {
     }
     printf("  [ok]   full Wave32 scalar VCC_LO write feeds its implicit mask consumer\n");
 
+    // Astro's larger world-map sibling keeps an ordinary scalar in VCC_HI while an implicit VOPC
+    // compare replaces the complete Wave32 predicate in VCC_LO. The unused high word must retain
+    // its data lifetime; the same sequence is intentionally invalid in Wave64, where VCC_HI is the
+    // upper half of the compare mask and is therefore overwritten.
+    const uint32_t wave32_compute_vopc_preserves_vcc_hi_data[] = {
+        0xbeeb03ffu, 0x3f400000u,            // s_mov_b32 vcc_hi, 0.75f
+        0x7d841680u,                         // v_cmp_eq_u32 vcc, 0, v11
+        0x7e4e026bu,                         // v_mov_b32 v39, vcc_hi
+        0xbf810000u,
+    };
+    if (recompile_compute(wave32_compute_vopc_preserves_vcc_hi_data,
+                          std::size(wave32_compute_vopc_preserves_vcc_hi_data), nullptr,
+                          wave32_compute_config).empty()) {
+        printf("  [FAIL] implicit Wave32 VOPC clobbered adjacent VCC_HI scalar data\n");
+        return 1;
+    }
+    ComputeShaderConfig wave64_compute_config = wave32_compute_config;
+    wave64_compute_config.wave_size = 64;
+    wave64_compute_config.native_subgroup_size = 64;
+    wave64_compute_config.local_x = 64;
+    if (!recompile_compute(wave32_compute_vopc_preserves_vcc_hi_data,
+                           std::size(wave32_compute_vopc_preserves_vcc_hi_data), nullptr,
+                           wave64_compute_config).empty()) {
+        printf("  [FAIL] implicit Wave64 VOPC preserved overwritten VCC_HI scalar data\n");
+        return 1;
+    }
+    printf("  [ok]   implicit VOPC preserves VCC_HI scalar data only in Wave32\n");
+
     // Astro's exact PC458 packet explicitly selects physical VCC_HI in Wave32. A typed B32 mask in
     // that word must drive the select independently of VCC_LO; absent or path-dependent HI mask
     // lifetimes must remain fail-visible instead of falling back to the implicit VCC predicate.
