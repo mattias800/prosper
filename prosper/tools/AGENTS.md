@@ -36,6 +36,16 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`shader_inspect/`** — decode one raw `PROSPER_SHADER_DUMP` binary offline. It prints bounded
   instruction PCs, operands, raw words, signed branch immediates, and resolved branch targets so a
   failed shader's CFG can be mapped without hand-counting variable-length instructions.
+  **`--stage` cannot prove a shader is unsupported (#1571).** A raw dump has no descriptors, so the tool
+  has no `ShaderResourceTable`, and the recompiler correctly refuses `MIMG`/`MUBUF`/`MTBUF` in any stage
+  plus `SMEM` in the vertex/fragment stages (`recompile_fragment_impl` / `recompile_vertex_impl` gate on
+  `allow_smem = (rt != nullptr)`; `recompile_compute` passes `true`, and `emit_alu` holds both the MIMG
+  `!allow_smem || !rt` and SMEM `!allow_smem` rejects). That is a
+  limitation of *this tool's inputs*, not a property of the shader. Such a run reports
+  `status=undetermined-no-resource-table` (exit 3) — treat it as **no verdict**, never as a missing
+  opcode. Before this was fixed the tool called 109 of 114 known-good shaders `rejected` and agents
+  chased those false leads. **For a table-accurate verdict use `gpu_replay --inspect-only`**, which has
+  the real descriptors from a capture. See `shader_inspect/README.md`.
 - **`imgdump/`** — decode/dump a guest texture to an image for inspection.
 - **`gpu_replay/`** — replay a local `PROSPER_GPU_CAPTURE` realized-submit capsule through the same
   Vulkan backend without booting the guest. Capsules include game shaders/resources, use `.prgcap`,

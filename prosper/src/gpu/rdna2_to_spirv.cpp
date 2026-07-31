@@ -3310,6 +3310,8 @@ bool vopc_is_cmpx(uint32_t opcode);
 
 namespace {
 uint32_t scalar_write_width(const Rdna2Inst& in);
+// Defined after the scalar-writer inventory it depends on; used by detect_forward_ifs above it.
+bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch_pc);
 }
 
 // FRAGMENT alpha-test / clip() discard via a SCALAR BRANCH. A per-lane condition (v_cmp -> VCC) is folded
@@ -4127,6 +4129,10 @@ struct ForwardIf {
     // (v_cmpx … s_cbranch_execz — DOLL's FXAA PS). Fragment reduces EXEC across an enforced wave64;
     // other structured stages use the guarded per-invocation model. EXEC is phi'd at the merge.
     bool on_exec = false;
+    // Compute only (#1554): this VCC branch was PROVED to decide identically for every wave in the
+    // workgroup, so its region may contain guest barriers and nested wave votes. Left false for every
+    // branch whose uniformity is not proved, which keeps the conservative per-wave treatment.
+    bool uniform_workgroup = false;
     // IF/ELSE (#273): the then-arm [branch_pc+1, sb_pc) is terminated by `s_branch merge_pc` at sb_pc
     // (the instruction immediately before target_pc); the else-arm starts at target_pc and runs to
     // merge_pc (or to the enclosing region's end when merge_pc is the shared OUTER merge — DOLL's
@@ -4396,6 +4402,15 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 }
             }
         }
+        // A branch whose mask is built only from launch data over a full EXEC decides identically for
+        // every wave of the workgroup (#1554), so its region may synchronize. Prove it before the
+        // per-wave restriction below applies.
+        if (compute_uniform_vcc && vcc_branch_is_workgroup_uniform(ins, in.pc)) {
+            F.uniform_workgroup = true;
+            compute_uniform_vcc = false;
+            if (getenv("PROSPER_DBG"))
+                std::fprintf(stderr, "[compute-cfg] workgroup-uniform vcc branch pc=%u\n", in.pc);
+        }
         if (compute_uniform_vcc) {
             // The exact branch decision is per-WAVE, so different waves in one workgroup may take
             // different arms. Ordinary LDS loads/stores/atomics are valid under that control flow:
@@ -4530,6 +4545,291 @@ void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit,
     if (in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR)
         visit(in.sdst.value, wave32_one_word_masks &&
                               in.opcode >= 0x128 && in.opcode <= 0x12a ? 1u : 2u);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Workgroup-uniform wave branch (#1554).
+//
+// A compute `s_cbranch_vccz`/`vccnz` decides per WAVE, so two waves of one workgroup may take
+// different arms. A guest `S_BARRIER` inside such an arm violates Vulkan's uniform-participation
+// requirement for OpControlBarrier, so detect_forward_ifs rejects that combination.
+//
+// Real kernels nevertheless build some of these masks entirely out of launch state:
+//
+//     s_load_dwordx4        s[8:11], s[12:13], 0x20    ; s12:s13 is entry data
+//     s_buffer_load_dwordx2 s[16:17], s[8:11], 0xc
+//     s_add_i32             vcc_lo, s17, -1            ; VCC_LO used as scalar scratch
+//     s_cmp_gt_u32          s16, 0
+//     s_cselect_b64         s[10:11], exec, 0
+//     s_cmp_eq_u32          s14, vcc_lo
+//     s_cselect_b64         vcc, exec, 0
+//     s_and_b64             vcc, vcc, s[10:11]
+//     s_cbranch_vccz        END
+//
+// With EXEC full, VCC is nonzero exactly when the scalar predicate holds, and that predicate reads
+// only compute launch SGPRs. recompile_compute seeds those from push-constant user data and from
+// WorkGroupId system SGPRs (see the entry seeding in recompile_compute), both of which are identical
+// for every wave of a workgroup — so the branch is workgroup-uniform and its arm may synchronize.
+//
+// Two obligations are proved independently and mechanically:
+//
+//   (1) EXEC is full at the branch on EVERY path. Without it, VCCZ is also true for a wave whose
+//       EXEC happens to be empty, which is a genuinely per-wave property. A forward must-dataflow
+//       proves this, so a loop that restores `s_mov_b64 exec, -1` before its back-edge still
+//       qualifies while an arm that narrows EXEC does not.
+//   (2) VCC is `SCC ? EXEC : 0`, optionally combined by s_and_b64/s_or_b64; every contributing SCC
+//       comes from a scalar compare, and every scalar input traces to launch data.
+//
+// Everything not proved stays rejected: EXEC or SCC read as data, V_READFIRSTLANE/V_READLANE,
+// VOPC-written masks, SGPRs above the launch range, and any definition reaching the branch from
+// outside its own straight-line region unless it provably still holds its entry value.
+//
+// CONFIDENCE: HIGH — the accepted provenance set is closed and every rejection is fail-visible.
+
+// Forward "must" dataflow over the decoded stream. `fact[i]` is true only when the tracked property
+// holds at entry to ins[i] along EVERY path that reaches it. `gen` re-establishes the property,
+// `kill` destroys it, and anything else passes it through. Optimistic initialization followed by
+// iteration to a fixpoint is the standard greatest-fixpoint formulation, which is what makes the
+// result sound across back-edges. Returns an empty vector when the stream contains an edge this walk
+// cannot resolve, so every caller treats "unanalyzable" as "not proved".
+template <typename Gen, typename Kill>
+std::vector<uint8_t> must_fact_at(const std::vector<Rdna2Inst>& ins, Gen&& gen, Kill&& kill,
+                                  bool entry_holds) {
+    if (ins.empty()) return {};
+    std::unordered_map<uint32_t, size_t> index_of;
+    for (size_t i = 0; i < ins.size(); ++i) index_of[ins[i].pc] = i;
+
+    auto is_branch = [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
+               in.opcode != 0x03;
+    };
+
+    std::vector<std::vector<size_t>> succ(ins.size());
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const Rdna2Inst& in = ins[i];
+        if (in.is_end) continue;
+        if (is_branch(in)) {
+            const uint32_t target = branch_target(in);
+            auto found = index_of.find(target);
+            if (found != index_of.end()) succ[i].push_back(found->second);
+            else if (target <= ins.back().pc) return {};   // an edge this walk cannot resolve
+            // A target past the decoded stream is an early-out that terminates the wave; it
+            // contributes no successor inside this function.
+        }
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x02) continue;   // s_branch: no fallthrough
+        if (i + 1 < ins.size()) succ[i].push_back(i + 1);
+    }
+
+    std::vector<uint8_t> fact(ins.size(), 1);
+    if (!entry_holds) fact[0] = 0;
+    // Each round can only turn a 1 into a 0, so the fixpoint is reached in at most size()+1 rounds.
+    for (size_t round = 0; round <= ins.size() + 1; ++round) {
+        std::vector<uint8_t> next(ins.size(), 1);
+        if (!entry_holds) next[0] = 0;
+        for (size_t i = 0; i < ins.size(); ++i) {
+            uint8_t out = fact[i];
+            if (gen(ins[i])) out = 1;
+            else if (kill(ins[i])) out = 0;
+            if (out) continue;
+            for (size_t s : succ[i]) next[s] = 0;
+        }
+        if (next == fact) return fact;
+        fact.swap(next);
+    }
+    return fact;
+}
+
+// `s_mov_b64 exec, -1` is the only accepted full-mask definition. A 32-bit literal written to a
+// 64-bit scalar destination is zero-extended, so it activates only the low half and is NOT a full
+// wave64 mask; the inline -1 constant is sign-extended and is.
+bool exec_write_sets_full_mask(const Rdna2Inst& in) {
+    if (in.fmt != Rdna2Format::SOP1 || in.opcode != 0x04 || in.n_src != 1) return false;
+    if ((in.dst.kind != OperandKind::SGPR && in.dst.kind != OperandKind::Special) ||
+        in.dst.value != 126)
+        return false;
+    return in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1;
+}
+
+bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch_pc) {
+    size_t branch_index = ins.size();
+    for (size_t i = 0; i < ins.size(); ++i)
+        if (ins[i].pc == branch_pc) { branch_index = i; break; }
+    if (branch_index == ins.size() || branch_index == 0) return false;
+
+    // Obligation (1): EXEC is full at the branch along every path.
+    const std::vector<uint8_t> exec_full = must_fact_at(
+        ins, exec_write_sets_full_mask,
+        [](const Rdna2Inst& in) { return instruction_may_change_exec(in); }, true);
+    if (exec_full.empty() || !exec_full[branch_index]) return false;
+
+    auto is_branch = [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
+               in.opcode != 0x03;
+    };
+    std::set<uint32_t> targets;
+    for (const auto& in : ins)
+        if (is_branch(in)) targets.insert(branch_target(in));
+
+    // The straight-line region ending at the branch. Every definition consumed from inside it has a
+    // unique reaching definition, which is what lets the backwards slice below be a textual walk.
+    size_t block_start = branch_index;
+    while (block_start > 0) {
+        if (targets.count(ins[block_start].pc)) break;      // another edge enters here
+        const Rdna2Inst& prev = ins[block_start - 1];
+        if (prev.is_end || is_branch(prev)) break;
+        --block_start;
+    }
+
+    auto writes_reg = [](const Rdna2Inst& in, int reg, uint32_t words) {
+        bool hit = false;
+        for_each_scalar_write(in, [&](int base, uint32_t width) {
+            if (reg < base + static_cast<int>(width) && base < reg + static_cast<int>(words))
+                hit = true;
+        });
+        // A VOPC without an explicit scalar destination writes architectural VCC implicitly; the
+        // writer inventory only reports the explicit SGPR form.
+        if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+            in.dst.kind == OperandKind::Special && in.dst.value == 106 &&
+            reg < 108 && 106 < reg + static_cast<int>(words))
+            hit = true;
+        return hit;
+    };
+
+    auto last_writer = [&](int reg, uint32_t words, size_t before) -> size_t {
+        for (size_t i = before; i-- > block_start;)
+            if (writes_reg(ins[i], reg, words)) return i;
+        return ins.size();
+    };
+
+    // A register with no definition inside the region is accepted only when it provably still holds
+    // its wave-entry value at the branch. Entry SGPRs are launch data, hence workgroup-uniform.
+    std::map<int, bool> entry_value_cache;
+    auto still_entry_value = [&](int reg) {
+        auto cached = entry_value_cache.find(reg);
+        if (cached != entry_value_cache.end()) return cached->second;
+        const std::vector<uint8_t> fact = must_fact_at(
+            ins, [](const Rdna2Inst&) { return false; },
+            [&](const Rdna2Inst& in) { return writes_reg(in, reg, 1); }, true);
+        const bool proved = !fact.empty() && fact[branch_index] != 0;
+        entry_value_cache[reg] = proved;
+        return proved;
+    };
+
+    std::function<bool(int, size_t, uint32_t)> uniform_scalar;
+    std::function<bool(size_t, uint32_t)> uniform_scc;
+    std::function<bool(int, size_t, uint32_t)> uniform_mask;
+
+    auto uniform_operand = [&](const Operand& op, uint32_t words, size_t before,
+                               uint32_t depth) -> bool {
+        switch (op.kind) {
+            case OperandKind::InlineInt:
+            case OperandKind::InlineFloat:
+            case OperandKind::Literal:
+                return true;
+            case OperandKind::Special:
+                if (op.value == 125) return true;                       // SGPR_NULL
+                if (op.value == 126 || op.value == 127 || op.value == 253)
+                    return false;                                       // EXEC and SCC are not data
+                [[fallthrough]];
+            case OperandKind::SGPR:
+                for (uint32_t word = 0; word < words; ++word)
+                    if (!uniform_scalar(op.value + static_cast<int>(word), before, depth + 1))
+                        return false;
+                return true;
+            default:
+                return false;                                           // VGPR and everything else
+        }
+    };
+
+    uniform_scalar = [&](int reg, size_t before, uint32_t depth) -> bool {
+        if (depth > 64) return false;
+        const size_t w = last_writer(reg, 1, before);
+        if (w == ins.size()) return reg >= 0 && reg <= 105 && still_entry_value(reg);
+        const Rdna2Inst& in = ins[w];
+        switch (in.fmt) {
+            case Rdna2Format::SOP1:
+                if (in.opcode == 0x1f) return true;                     // s_getpc_b64
+                if (instruction_may_change_exec(in) || in.n_src != 1) return false;
+                return uniform_operand(in.src[0], scalar_write_width(in) == 2 ? 2u : 1u, w, depth);
+            case Rdna2Format::SOP2: {
+                // Carry and cselect forms consume SCC as well as their decoded operands; the mask
+                // slice models the cselect shape explicitly and nothing else may use them as data.
+                if (in.opcode == 0x04 || in.opcode == 0x05 || in.opcode == 0x0a ||
+                    in.opcode == 0x0b)
+                    return false;
+                const uint32_t words = scalar_write_width(in) == 2 ? 2u : 1u;
+                return in.n_src == 2 && uniform_operand(in.src[0], words, w, depth) &&
+                       uniform_operand(in.src[1], words, w, depth);
+            }
+            case Rdna2Format::SMEM: {
+                // Scalar-buffer loads use a four-dword descriptor; scalar-memory loads a base pair.
+                if (!scalar_write_width(in) || in.n_src < 1) return false;
+                const uint32_t base_words = in.opcode >= 0x8 ? 4u : 2u;
+                if (!uniform_operand(in.src[0], base_words, w, depth)) return false;
+                return in.n_src < 2 || uniform_operand(in.src[1], 1, w, depth);
+            }
+            case Rdna2Format::SOPK:
+                return in.opcode == 0x00;                               // s_movk_i32 is a literal
+            default:
+                return false;         // VOPC masks, v_readfirstlane, v_readlane, everything else
+        }
+    };
+
+    uniform_scc = [&](size_t before, uint32_t depth) -> bool {
+        if (depth > 64) return false;
+        for (size_t i = before; i-- > block_start;) {
+            const Rdna2Inst& in = ins[i];
+            if (sopp_is_noop(in)) continue;
+            if (in.fmt == Rdna2Format::SOPC) {
+                if (in.n_src == 0) return false;
+                const uint32_t words = in.opcode == 0x12 || in.opcode == 0x13 ? 2u : 1u;
+                for (uint32_t s = 0; s < in.n_src; ++s)
+                    if (!uniform_operand(in.src[s], words, i, depth)) return false;
+                return true;
+            }
+            // Any scalar ALU or SOPK instruction may write SCC. Stop rather than accidentally
+            // consuming an older compare through an unmodeled SCC writer.
+            if (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
+                in.fmt == Rdna2Format::SOPK)
+                return false;
+        }
+        return false;                 // SCC entering the region from outside is not proved
+    };
+
+    uniform_mask = [&](int reg, size_t before, uint32_t depth) -> bool {
+        if (depth > 64) return false;
+        const size_t w = last_writer(reg, 2, before);
+        if (w == ins.size()) return false;      // a mask entering from outside is not proved
+        const Rdna2Inst& in = ins[w];
+        if (in.fmt != Rdna2Format::SOP2 || in.dst.value != reg || scalar_write_width(in) != 2 ||
+            in.n_src != 2)
+            return false;
+        auto is_exec = [](const Operand& op) {
+            return (op.kind == OperandKind::SGPR || op.kind == OperandKind::Special) &&
+                   op.value == 126;
+        };
+        auto is_zero = [](const Operand& op) {
+            return op.kind == OperandKind::InlineInt && op.value == 0;
+        };
+        if (in.opcode == 0x0b) {                // s_cselect_b64 dst, EXEC, 0  (either polarity)
+            const bool shape = (is_exec(in.src[0]) && is_zero(in.src[1])) ||
+                               (is_zero(in.src[0]) && is_exec(in.src[1]));
+            return shape && uniform_scc(w, depth + 1);
+        }
+        if (in.opcode == 0x0f || in.opcode == 0x11) {          // s_and_b64 / s_or_b64
+            for (uint32_t s = 0; s < 2; ++s) {
+                const Operand& op = in.src[s];
+                if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special) return false;
+                if (op.value == 126 || op.value == 127) return false;   // raw EXEC is per-wave
+                if (!uniform_mask(op.value, w, depth + 1)) return false;
+            }
+            return true;
+        }
+        return false;
+    };
+
+    // Obligation (2): architectural VCC at the branch is a select over workgroup-uniform SCCs.
+    return uniform_mask(106, branch_index, 0);
 }
 
 // True when this explicit scalar destination is written in the per-lane B64 mask domain.  Keep
@@ -13394,6 +13694,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // same safety argument. Neither a vote nor a guest barrier may be nested in a varying region.
         auto top_level_pc = [&](uint32_t pc) {
             for (const auto& parent : Fs) {
+                // A proved workgroup-uniform region is entered or skipped by EVERY invocation of the
+                // workgroup together (#1554), so it does not make a nested barrier or scratch vote
+                // divergent. Only genuinely per-wave regions hide their contents from this test.
+                if (parent.uniform_workgroup) continue;
                 const uint32_t parent_end = parent.has_else ? parent.merge_pc : parent.target_pc;
                 if (parent.branch_pc < pc && pc < parent_end)
                     return false;

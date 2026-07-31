@@ -94,6 +94,33 @@ not ask for — visible **offline** from a capsule, without a live boot. It was 
 menu wedges) could only be diagnosed by booting the game repeatedly with `PROSPER_DRAWLOG`; the capsule stored
 only the realized `vcount=1024`, hiding that the guest's real count was 6.
 
+## Interpolant linkage — `ps-inputs` on each `--inspect-only` draw line (#1486)
+
+Each draw also reports the resolved `SPI_PS_INPUT_CNTL` linkage retained with the capture (v36+):
+
+```text
+  ps-inputs valid=ffffffff passthrough=00000000 effective-passthrough=00000000 0=param0 1=param1 2=param2 …
+```
+
+Each `N=…` entry names what pixel-shader input slot `N` actually consumes:
+
+- `param<K>` — consumes producer PARAM export `K`.
+- `param<K>/pass` — explicit parameter-cache pass-through of PARAM `K`.
+- `default(xyz=…,w=…)` — `OFFSET=0x20`: the interpolator **synthesizes a constant** and consumes no
+  producer export at all. `DEFAULT_VAL` selects 0.0 or 1.0 independently for xyz and for w.
+
+Slots outside `valid` are omitted; a pre-v36 capture prints `ps-inputs none` rather than inventing a mapping.
+
+This answers "is this varying carrying real vertex-stage data, or a hardware constant?" — a question the VS/FS
+instruction streams cannot answer on their own, because a shader wired to `default` looks perfectly correct in
+isolation while receiving no producer output. `PROSPER_INTERPLOG` reports the same linkage but only fires on
+the **live executor** path, so offline capsule analysis previously had no way to see it. It was added while
+localizing #1486's overexposed Dragon Quest VII composite, to decide whether the tonemapper's `ExposureScale`
+varying reached the pixel shader from the vertex stage or was being replaced by a constant 1.0 (it reached it:
+draw 90 reports `1=param1`, matching the VS's `PARAM1` export). The classifier lives in
+`pixel_input_linkage.hpp` and mirrors `recompile_vertex_impl`'s own export predicates, so the diagnostic
+cannot describe a mapping the lowering does not perform; `test_gpu_replay_pixel_inputs` pins every branch.
+
 ## Reading graph output
 
 - `edge producer=P consumer=C` means operation `C` reads a range last written by earlier operation `P`.

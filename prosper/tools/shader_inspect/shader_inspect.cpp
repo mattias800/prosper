@@ -44,6 +44,36 @@ void print_operand(const char* label, const Operand& operand) {
     std::printf(" %s=%s:%d", label, operand_kind_name(operand.kind), operand.value);
 }
 
+// Does lowering this instruction require a ShaderResourceTable in this stage?
+//
+// shader_inspect reads a RAW shader dump, which carries instructions but no descriptors, so it can
+// never supply a resource table. The stage recompilers then legitimately refuse to lower any
+// instruction that resolves a V#/T#/S# through that table — see `emit_alu` in rdna2_to_spirv.cpp,
+// which rejects MIMG on `!allow_smem || !rt` and SMEM on `!allow_smem`. That refusal is a property
+// of THIS TOOL's inputs, not of the shader, and must never be reported as an unsupported
+// instruction (#1571).
+//
+// The table-dependent formats are the same ones RecompileCoverage documents (MIMG / MUBUF / MTBUF).
+// SMEM is additionally table-dependent in the GRAPHICS stages only, because `recompile_fragment_impl`
+// and `recompile_vertex_impl` pass `allow_smem = (rt != nullptr)` while `recompile_compute` passes
+// `allow_smem = true` unconditionally.
+//
+// Line numbers drift, so the functions above are named rather than cited by line. At the time of
+// writing (master 276b8f92) they were: emit_alu SMEM reject rdna2_to_spirv.cpp:8280, emit_alu MIMG
+// gate :9109, recompile_compute :14295, recompile_fragment_impl :14828, recompile_vertex_impl :15676.
+bool needs_resource_table(Rdna2Format fmt, const std::string& stage) {
+    switch (fmt) {
+        case Rdna2Format::MIMG:
+        case Rdna2Format::MUBUF:
+        case Rdna2Format::MTBUF:
+            return true;
+        case Rdna2Format::SMEM:
+            return stage == "vertex" || stage == "fragment";
+        default:
+            return false;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -52,6 +82,18 @@ int main(int argc, char** argv) {
     if ((argc != 2 && argc != 4) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
+        std::fprintf(stderr,
+            "\n"
+            "Decodes a raw RDNA2 shader dump. With --stage it also attempts a stage recompile.\n"
+            "\n"
+            "IMPORTANT: shader_inspect has NO resource table (a raw dump carries no descriptors), so\n"
+            "the recompiler cannot lower MIMG/MUBUF/MTBUF — nor SMEM in the vertex/fragment stages.\n"
+            "When such an instruction is present, a failed stage recompile is reported as\n"
+            "status=undetermined-no-resource-table and is NOT evidence of an unsupported shader.\n"
+            "For a table-accurate verdict use gpu_replay, which has the real descriptors:\n"
+            "  gpu_replay <capture>.prgcap --inspect-only\n"
+            "\n"
+            "Exit: 0 ok, 1 genuine defect, 2 usage/IO error, 3 undetermined (no resource table).\n");
         return 2;
     }
 
@@ -92,6 +134,7 @@ int main(int argc, char** argv) {
                 coverage.first_bad_fmt < 0 ? "none" : format_name(static_cast<Rdna2Format>(coverage.first_bad_fmt)),
                 coverage.first_bad_op);
     bool stage_ok = true;
+    bool stage_undetermined = false;
     if (!stage.empty()) {
         std::vector<uint32_t> spirv;
         if (stage == "vertex") {
@@ -107,8 +150,43 @@ int main(int argc, char** argv) {
             spirv = recompile_compute(words.data(), words.size(), nullptr, config);
         }
         stage_ok = !spirv.empty();
-        std::printf("stage-recompile stage=%s status=%s spirv_dwords=%zu\n",
-                    stage.c_str(), stage_ok ? "ok" : "rejected", spirv.size());
+
+        // A table-less rejection is only attributable to the SHADER when the shader contains no
+        // instruction that would have needed a resource table anyway. Otherwise the rejection is
+        // unattributable and must be reported as such (#1571).
+        uint32_t table_dependent = 0;
+        uint32_t per_format[static_cast<size_t>(Rdna2Format::Unknown) + 1] = {};
+        for (const auto& in : instructions) {
+            if (!needs_resource_table(in.fmt, stage)) continue;
+            ++table_dependent;
+            const size_t index = static_cast<size_t>(in.fmt);
+            if (index < std::size(per_format)) ++per_format[index];
+        }
+        stage_undetermined = !stage_ok && table_dependent > 0;
+
+        std::printf("stage-recompile stage=%s status=%s spirv_dwords=%zu table_dependent=%u\n",
+                    stage.c_str(),
+                    stage_ok ? "ok" : (stage_undetermined ? "undetermined-no-resource-table" : "rejected"),
+                    spirv.size(), table_dependent);
+        if (stage_undetermined) {
+            std::printf("stage-recompile NOTE: TOOL LIMITATION - THIS IS NOT EVIDENCE OF A SHADER DEFECT.\n");
+            std::printf("stage-recompile NOTE: shader_inspect reads a raw dump, which carries no descriptors, so it\n");
+            std::printf("stage-recompile NOTE: cannot supply a resource table. This shader has %u instruction(s)\n",
+                        table_dependent);
+            std::printf("stage-recompile NOTE: that need one (");
+            bool first = true;
+            for (size_t i = 0; i < std::size(per_format); ++i) {
+                if (!per_format[i]) continue;
+                std::printf("%s%s=%u", first ? "" : " ", format_name(static_cast<Rdna2Format>(i)), per_format[i]);
+                first = false;
+            }
+            std::printf("), so the recompiler refused them BY DESIGN and this\n");
+            std::printf("stage-recompile NOTE: rejection is UNATTRIBUTABLE. It is not evidence that the shader is\n");
+            std::printf("stage-recompile NOTE: unsupported - and equally not evidence that it is fine: a genuine\n");
+            std::printf("stage-recompile NOTE: defect may also be present and would look identical here.\n");
+            std::printf("stage-recompile NOTE: For a verdict use gpu_replay, which has the real descriptors:\n");
+            std::printf("stage-recompile NOTE:   gpu_replay <capture>.prgcap --inspect-only\n");
+        }
     }
     const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(words.data(), words.size());
     if (dispatch.valid) {
@@ -146,5 +224,11 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
-    return ended && stage_ok ? 0 : 1;
+    // Exit codes: 0 = stage recompiled (or no --stage given and the stream ends cleanly);
+    // 1 = genuine defect (truncated stream, or a rejection attributable to the shader);
+    // 2 = usage/IO error; 3 = verdict UNDETERMINED because no resource table could be supplied (#1571).
+    // 3 is deliberately non-zero: shader_inspect must never report a table-less run as a pass.
+    if (!ended) return 1;
+    if (stage_undetermined) return 3;
+    return stage_ok ? 0 : 1;
 }
