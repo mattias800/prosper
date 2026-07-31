@@ -38,6 +38,22 @@ constexpr bool compute_sampled_guest_prepare_required(bool storage_image,
            (!imported_image || imported_bypass_disabled);
 }
 
+// Materialize a proven uniform DCC fast clear for the narrow sampled representation used by an
+// ordinary guest-backed 2D RGBA16F compute input. The complete metadata plane, guest shape,
+// reflected non-arrayed view, and rollback state are part of the proof; any unsupported state
+// returns false and leaves the caller on its established base-byte path. `texel_count` may be one
+// for eligibility probing or the complete image size for staging materialization.
+bool compute_sampled_dcc_fast_clear_rgba8(
+    const prosper::gpu::ShaderResource& resource,
+    bool ordinary_guest_backed_sampled_view,
+    bool arrayed_sampled_view,
+    bool disabled,
+    uint8_t* rgba,
+    size_t texel_count,
+    const uint8_t* metadata,
+    size_t metadata_bytes,
+    uint8_t* clear_code = nullptr);
+
 // Keep enough persistent image residency for modern multi-pass workloads without claiming an
 // unreasonable share of small discrete GPUs. The 512 MiB historical floor remains appropriate for
 // a 4 GiB heap, while larger devices contribute one eighth of their local heap up to 2 GiB. An

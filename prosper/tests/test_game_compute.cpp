@@ -143,6 +143,104 @@ int main() {
     CHECK(half_range_x4_matches,
           "packed RGBA binary16 sampled range matches every scalar lookup value");
 
+    // Compute's ordinary guest-backed 2D RGBA16F sampled path uses an RGBA8 staging image. A
+    // uniform embedded DCC clear is authoritative over the compressed base allocation, so prove
+    // that the narrow fast-clear gate produces exactly the same sampled bytes as an explicitly
+    // materialized uncompressed FP16 image. DCC_CLEAR_0001 is especially important: its alpha-one
+    // value is absent from a zero-filled compressed base and is consumed by Plucky's composite.
+    {
+        constexpr uint32_t clear_width = 64;
+        constexpr size_t clear_texels = clear_width;
+        ShaderResource clear_resource{};
+        clear_resource.cls = ResourceClass::Texture;
+        clear_resource.format = DataFormat::Float16;
+        clear_resource.num_components = 4;
+        clear_resource.img_dim = 1;
+        clear_resource.width = clear_width;
+        clear_resource.height = clear_resource.depth = 1;
+        clear_resource.tile_mode = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        clear_resource.size = static_cast<uint32_t>(
+            tiled_surface_bytes(clear_width, 1, clear_resource.tile_mode, 0, 8));
+        clear_resource.compression_enabled = true;
+        clear_resource.meta_pipe_aligned = true;
+        clear_resource.alpha_is_on_msb = true;
+        clear_resource.metadata_addr = 0x301758d000ull;
+        const size_t clear_metadata_bytes = gpu_capture_dcc_metadata_footprint(clear_resource);
+        std::vector<uint8_t> clear_metadata(clear_metadata_bytes, 0x40);
+        std::vector<uint8_t> clear_rgba(clear_texels * 4, 0xa5);
+        uint8_t clear_code = 0;
+        CHECK(clear_metadata_bytes &&
+              prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                  clear_resource, true, false, false, clear_rgba.data(), clear_texels,
+                  clear_metadata.data(), clear_metadata.size(), &clear_code) &&
+              clear_code == 0x40,
+              "compute recognizes a complete uniform RGBA16F DCC_CLEAR_0001 plane");
+
+        std::vector<uint8_t> explicit_fp16(clear_texels * 8, 0);
+        const uint16_t half_one = float_to_half(1.0f);
+        for (size_t texel = 0; texel < clear_texels; ++texel)
+            std::memcpy(explicit_fp16.data() + texel * 8 + 6,
+                        &half_one, sizeof(half_one));
+        std::vector<uint8_t> explicit_rgba(clear_texels * 4, 0);
+        prosper::frontend::sampled_float16_to_unorm8_range(
+            explicit_fp16.data(), 4, clear_texels, explicit_rgba.data());
+        CHECK(clear_rgba == explicit_rgba,
+              "DCC_CLEAR_0001 matches explicitly materialized FP16 (0,0,0,1)");
+        bool clear_channels_match = true;
+        for (size_t texel = 0; texel < clear_texels; ++texel)
+            clear_channels_match &= clear_rgba[texel * 4 + 0] == 0 &&
+                                    clear_rgba[texel * 4 + 1] == 0 &&
+                                    clear_rgba[texel * 4 + 2] == 0 &&
+                                    clear_rgba[texel * 4 + 3] == 255;
+        CHECK(clear_channels_match,
+              "MSB alpha placement preserves the DCC alpha-one sampled channel");
+
+        ShaderResource lsb_alpha = clear_resource;
+        lsb_alpha.alpha_is_on_msb = false;
+        uint8_t lsb_pixel[4]{};
+        CHECK(prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                  lsb_alpha, true, false, false, lsb_pixel, 1,
+                  clear_metadata.data(), clear_metadata.size()) &&
+              std::vector<uint8_t>(lsb_pixel, lsb_pixel + 4) ==
+                  std::vector<uint8_t>({255, 0, 0, 0}),
+              "LSB alpha placement routes DCC_CLEAR_0001 to component zero");
+
+        std::vector<uint8_t> rejected = clear_metadata;
+        rejected.back() = 0x00;
+        uint8_t rejected_pixel[4]{};
+        CHECK(!prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                  clear_resource, true, false, false, rejected_pixel, 1,
+                  rejected.data(), rejected.size()) &&
+              !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                  clear_resource, true, false, false, rejected_pixel, 1,
+                  clear_metadata.data(), clear_metadata.size() - 1) &&
+              !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                  clear_resource, false, false, false, rejected_pixel, 1,
+                  clear_metadata.data(), clear_metadata.size()) &&
+              !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                  clear_resource, true, true, false, rejected_pixel, 1,
+                  clear_metadata.data(), clear_metadata.size()) &&
+              !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                  clear_resource, true, false, true, rejected_pixel, 1,
+                  clear_metadata.data(), clear_metadata.size()),
+              "mixed, incomplete, non-guest, arrayed, and rollback DCC states retain the old path");
+        std::fill(rejected.begin(), rejected.end(), 0xff);
+        ShaderResource wrong_shape = clear_resource;
+        wrong_shape.declared_mip_levels = 2;
+        ShaderResource wrong_format = clear_resource;
+        wrong_format.format = DataFormat::Unorm8;
+        CHECK(!prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                  clear_resource, true, false, false, rejected_pixel, 1,
+                  rejected.data(), rejected.size()) &&
+              !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                  wrong_shape, true, false, false, rejected_pixel, 1,
+                  clear_metadata.data(), clear_metadata.size()) &&
+              !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                  wrong_format, true, false, false, rejected_pixel, 1,
+                  clear_metadata.data(), clear_metadata.size()),
+              "uncompressed metadata, mip chains, and non-FP16 views fail closed");
+    }
+
     std::vector<uint32_t> half_storage_x4(65536u);
     prosper::frontend::storage_unpack_float16x4_range(
         half_source_x4.data(), 65536u / 4u, half_storage_x4.data());
@@ -1251,6 +1349,102 @@ int main() {
     // DCC-enabled storage destination atomically becomes the uncompressed (0xff) metadata state,
     // including replay-owned metadata that a later sampled descriptor shares by logical address.
     const uint32_t dcc_tile = static_cast<uint32_t>(TileMode::Sw64KbRX);
+
+    // The production sampled-image path must agree with a semantic uncompressed reference, not with
+    // the old compressed-base fallback. A zero base plus DCC_CLEAR_0001 logically contains
+    // FP16 (0,0,0,1); copy both representations through the same generated shader and require the
+    // resulting guest RGBA8 storage bytes and hashes to match exactly.
+    {
+        const size_t clear_source_bytes = tiled_surface_bytes(W, 1, dcc_tile, 0, 8);
+        const size_t clear_metadata_bytes =
+            gfx10_dcc_metadata_bytes(W, 1, 1, dcc_tile, 8, true);
+        std::vector<uint8_t> compressed_base(clear_source_bytes, 0);
+        std::vector<uint8_t> clear_metadata(clear_metadata_bytes, 0x40);
+        std::vector<uint8_t> reference_linear(W * 8, 0);
+        const uint16_t one = float_to_half(1.0f);
+        for (uint32_t texel = 0; texel < W; ++texel)
+            std::memcpy(reference_linear.data() + texel * 8 + 6, &one, sizeof(one));
+        std::vector<uint8_t> reference_tiled(clear_source_bytes, 0);
+        tile_surface(reference_tiled.data(), reference_linear.data(), W, 1,
+                     dcc_tile, 0, 8);
+        std::vector<uint8_t> clear_dst(W * 4, 0xa5);
+        std::vector<uint8_t> reference_dst(W * 4, 0x5a);
+
+        auto sampled_clear_table = [&](std::vector<uint8_t>& source,
+                                       std::vector<uint8_t>& destination,
+                                       bool compressed) {
+            ShaderResourceTable table = irt;
+            for (ShaderResource& resource : table.resources) {
+                if (resource.binding != 4 && resource.binding != 5) continue;
+                resource.img_dim = 1;
+                resource.width = W;
+                resource.height = resource.depth = 1;
+                resource.declared_mip_levels = 1;
+                resource.in_mip_tail = false;
+                resource.layer_stride_bytes = resource.layer_mip_offset_bytes = 0;
+                if (resource.binding == 4) {
+                    resource.cls = ResourceClass::Texture;
+                    resource.format = DataFormat::Float16;
+                    resource.num_components = 4;
+                    resource.tile_mode = dcc_tile;
+                    resource.gpu_addr = reinterpret_cast<uint64_t>(source.data());
+                    resource.size = static_cast<uint32_t>(source.size());
+                    resource.swizzle[0] = 4;
+                    resource.swizzle[1] = 5;
+                    resource.swizzle[2] = 6;
+                    resource.swizzle[3] = 7;
+                    resource.compression_enabled = compressed;
+                    resource.meta_pipe_aligned = compressed;
+                    resource.alpha_is_on_msb = compressed;
+                    resource.metadata_addr = compressed ? 0x301758d000ull : 0;
+                    resource.dcc_metadata_size = compressed ? clear_metadata.size() : 0;
+                    resource.dcc_metadata_host_data = compressed ? clear_metadata.data() : nullptr;
+                    resource.dcc_metadata_host_data_size = compressed ? clear_metadata.size() : 0;
+                } else {
+                    resource.cls = ResourceClass::StorageImage;
+                    resource.format = DataFormat::Unorm8;
+                    resource.num_components = 4;
+                    resource.tile_mode = 0;
+                    resource.gpu_addr = reinterpret_cast<uint64_t>(destination.data());
+                    resource.size = static_cast<uint32_t>(destination.size());
+                }
+            }
+            return table;
+        };
+        ShaderResourceTable clear_rt = sampled_clear_table(
+            compressed_base, clear_dst, true);
+        ShaderResourceTable reference_rt = sampled_clear_table(
+            reference_tiled, reference_dst, false);
+        const std::vector<uint32_t> clear_spirv = recompile_valu(
+            image_copy_2d, std::size(image_copy_2d), 1, 0, &clear_rt);
+        CHECK(!clear_spirv.empty(),
+              "sampled DCC fast-clear semantic-reference kernel recompiles");
+        auto run_clear = [&](ShaderResourceTable& table, uint64_t code_addr) {
+            if (clear_spirv.empty()) return false;
+            ComputeItem item;
+            item.spirv = clear_spirv;
+            item.resources = std::make_shared<ShaderResourceTable>(table);
+            item.launch.threads_x = W;
+            item.launch.local_x = 64;
+            item.launch.groups_x = 1;
+            item.launch.local_y = item.launch.local_z = 1;
+            item.launch.groups_y = item.launch.groups_z = 1;
+            item.code_addr = code_addr;
+            return prosper::frontend::execute_live_compute_items({item});
+        };
+        const bool clear_ok = run_clear(clear_rt, 0x301758d1) &&
+                              run_clear(reference_rt, 0x301758d2);
+        std::vector<uint8_t> expected(W * 4, 0);
+        for (uint32_t texel = 0; texel < W; ++texel) expected[texel * 4 + 3] = 255;
+        const uint64_t clear_hash = gpu_capture_hash(clear_dst.data(), clear_dst.size());
+        const uint64_t reference_hash =
+            gpu_capture_hash(reference_dst.data(), reference_dst.size());
+        const uint64_t expected_hash = gpu_capture_hash(expected.data(), expected.size());
+        CHECK(clear_ok && clear_dst == reference_dst && clear_dst == expected &&
+                  clear_hash == reference_hash && clear_hash == expected_hash,
+              "sampled DCC clear output matches explicit uncompressed FP16 (0,0,0,1)");
+    }
+
     const size_t tiled_bytes = tiled_surface_bytes(W, 1, dcc_tile, 0, 4);
     const size_t metadata_bytes = gfx10_dcc_metadata_bytes(W, 1, 1, dcc_tile, 4, true);
     std::vector<uint8_t> tiled_src(tiled_bytes, 0), tiled_dst(tiled_bytes, 0);

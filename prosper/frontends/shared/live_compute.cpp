@@ -46,6 +46,35 @@
 
 namespace prosper::frontend {
 
+bool compute_sampled_dcc_fast_clear_rgba8(
+    const prosper::gpu::ShaderResource& resource,
+    bool ordinary_guest_backed_sampled_view,
+    bool arrayed_sampled_view,
+    bool disabled,
+    uint8_t* rgba,
+    size_t texel_count,
+    const uint8_t* metadata,
+    size_t metadata_bytes,
+    uint8_t* clear_code) {
+    const uint32_t components = resource.num_components ? resource.num_components : 1u;
+    if (disabled || !ordinary_guest_backed_sampled_view || arrayed_sampled_view ||
+        resource.cls != prosper::gpu::ResourceClass::Texture ||
+        resource.format != prosper::gpu::DataFormat::Float16 || components != 4u ||
+        resource.img_dim != 1u || resource.depth != 1u ||
+        resource.declared_mip_levels != 1u || resource.in_mip_tail ||
+        resource.layer_stride_bytes || resource.layer_mip_offset_bytes ||
+        resource.srgb || resource.depth_compare || !resource.compression_enabled ||
+        !resource.metadata_addr || !rgba || !texel_count)
+        return false;
+    const uint64_t expected_metadata = prosper::gpu::gpu_capture_dcc_metadata_footprint(resource);
+    if (!expected_metadata || expected_metadata > SIZE_MAX ||
+        metadata_bytes != static_cast<size_t>(expected_metadata))
+        return false;
+    return prosper::gpu::gfx10_dcc_fast_clear_rgba8(
+        rgba, texel_count, metadata, metadata_bytes, components,
+        resource.alpha_is_on_msb, clear_code);
+}
+
 uint8_t storage_pack_unorm8(uint32_t float_bits) {
     float value;
     std::memcpy(&value, &float_bits, sizeof(value));
@@ -3912,8 +3941,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool sampled_f32 = sampled_float32;
             size_t sampled_guest_need = 0;
             const uint8_t* sampled_guest_source = nullptr;
+            const uint8_t* sampled_dcc_metadata = nullptr;
+            size_t sampled_dcc_metadata_bytes = 0;
+            bool sampled_dcc_fast_clear = false;
             static const bool imported_guest_bypass_disabled =
                 std::getenv("PROSPER_NO_IMPORTED_IMAGE_GUEST_BYPASS") != nullptr;
+            static const bool sampled_dcc_fast_clear_disabled =
+                std::getenv("PROSPER_NO_COMPUTE_DCC_FAST_CLEAR") != nullptr;
             if (compute_sampled_guest_prepare_required(
                     bi.storage, renderer_owned, bi.imported,
                     imported_guest_bypass_disabled)) {
@@ -4014,27 +4048,66 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     skip_image(r, "sampled backing exceeds the 512 MiB backend bound"); break;
                 }
                 bi.guest_bytes = sampled_guest_need;
-                sampled_guest_source = resource_bytes_for(r, sampled_guest_need);
-                const bool readable =
-                    (r->host_data && r->host_data_size >= sampled_guest_need) ||
-                    guest_readable(r->gpu_addr, static_cast<uint32_t>(sampled_guest_need));
-                if (!readable) { skip_image(r, "sampled surface unreadable"); break; }
+
+                // A complete uniform DCC fast-clear plane is the authoritative image contents;
+                // compressed base bytes are intentionally meaningless in that state. Restrict the
+                // first compute materialization to the ordinary 2D RGBA16F -> RGBA8 sampled path,
+                // where the renderer already proves the same embedded 0/1 clear codes. This probe
+                // happens before resolving the base pointer so a valid fast clear never reads or
+                // validates tens of MiB of irrelevant compressed allocation bytes.
+                if (r->compression_enabled) {
+                    const uint64_t metadata_bytes = gpu_capture_dcc_metadata_footprint(*r);
+                    if (metadata_bytes && metadata_bytes <= SIZE_MAX &&
+                        metadata_bytes <= UINT32_MAX) {
+                        sampled_dcc_metadata_bytes = static_cast<size_t>(metadata_bytes);
+                        if (r->dcc_metadata_host_data &&
+                            r->dcc_metadata_host_data_size >= metadata_bytes) {
+                            sampled_dcc_metadata = r->dcc_metadata_host_data;
+                        } else if (guest_readable(
+                                       r->metadata_addr,
+                                       static_cast<uint32_t>(metadata_bytes))) {
+                            sampled_dcc_metadata = reinterpret_cast<const uint8_t*>(
+                                uintptr_t(r->metadata_addr));
+                        }
+                    }
+                }
+                uint8_t sampled_dcc_clear_pixel[4]{};
+                uint8_t sampled_dcc_clear_code = 0;
+                sampled_dcc_fast_clear = compute_sampled_dcc_fast_clear_rgba8(
+                    *r, !bi.storage && !renderer_owned && !bi.imported,
+                    image_descriptors[i].image_arrayed,
+                    sampled_dcc_fast_clear_disabled,
+                    sampled_dcc_clear_pixel, 1,
+                    sampled_dcc_metadata, sampled_dcc_metadata_bytes,
+                    &sampled_dcc_clear_code);
+                if (sampled_dcc_fast_clear && trace)
+                    std::fprintf(stderr,
+                                 "[compute]   sampled DCC fast-clear binding=%u addr=0x%llx "
+                                 "meta=0x%llx code=0x%02x -> RGBA8 staging\n",
+                                 bi.binding, (unsigned long long)r->gpu_addr,
+                                 (unsigned long long)r->metadata_addr,
+                                 sampled_dcc_clear_code);
+
+                if (!sampled_dcc_fast_clear) {
+                    sampled_guest_source = resource_bytes_for(r, sampled_guest_need);
+                    const bool readable =
+                        (r->host_data && r->host_data_size >= sampled_guest_need) ||
+                        guest_readable(r->gpu_addr, static_cast<uint32_t>(sampled_guest_need));
+                    if (!readable) { skip_image(r, "sampled surface unreadable"); break; }
+                }
 
                 bool dcc_cache_safe = !r->compression_enabled;
                 if (r->compression_enabled) {
-                    const uint64_t metadata_bytes = gpu_capture_dcc_metadata_footprint(*r);
-                    const uint8_t* metadata =
-                        r->dcc_metadata_host_data &&
-                                r->dcc_metadata_host_data_size >= metadata_bytes
-                            ? r->dcc_metadata_host_data : nullptr;
-                    if (!metadata && metadata_bytes && metadata_bytes <= UINT32_MAX &&
-                        guest_readable(r->metadata_addr, static_cast<uint32_t>(metadata_bytes)))
-                        metadata = reinterpret_cast<const uint8_t*>(uintptr_t(r->metadata_addr));
-                    dcc_cache_safe = metadata && metadata_bytes &&
-                        std::all_of(metadata, metadata + metadata_bytes,
+                    dcc_cache_safe = sampled_dcc_metadata && sampled_dcc_metadata_bytes &&
+                        std::all_of(sampled_dcc_metadata,
+                                    sampled_dcc_metadata + sampled_dcc_metadata_bytes,
                                     [](uint8_t value) { return value == 0xff; });
                 }
-                bi.cache_candidate = dcc_cache_safe &&
+                // Fast clears are keyed by metadata, not by the inactive base allocation. Keep
+                // this first narrow path uncached rather than teaching the existing base-byte key
+                // an unsafe partial identity; staging materialization is still far cheaper than
+                // detiling and converting the 2x-larger FP16 base.
+                bi.cache_candidate = !sampled_dcc_fast_clear && dcc_cache_safe &&
                     persistent_compute_image_enabled(sbytes, ComputeImageCacheClass::sampled);
                 if (bi.cache_candidate) {
                     const auto cache_lookup_start = ComputeClock::now();
@@ -4532,7 +4605,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     const uint8_t* src = sampled_guest_source;
                     const bool needs_sampled_upload = !bi.upload_skipped &&
                         !bi.compute_transfer_seed_borrowed;
-                    if (needs_sampled_upload && bpb) {               // BCn: (block-detile ->) decode
+                    if (needs_sampled_upload && sampled_dcc_fast_clear) {
+                        if (!compute_sampled_dcc_fast_clear_rgba8(
+                                *r, true, image_descriptors[i].image_arrayed,
+                                sampled_dcc_fast_clear_disabled,
+                                upload, static_cast<size_t>(volume_texels),
+                                sampled_dcc_metadata, sampled_dcc_metadata_bytes)) {
+                            skip_image(r, "sampled DCC fast-clear materialization changed");
+                            break;
+                        }
+                    } else if (needs_sampled_upload && bpb) {        // BCn: (block-detile ->) decode
                         const uint32_t bw = (r->width + 3) / 4, bh = (r->height + 3) / 4;
                         const size_t linear_slice = static_cast<size_t>(bw) * bh * bpb;
                         const uint32_t layers = sampled_layers;
