@@ -4183,8 +4183,9 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::SOPP) continue;
-        // Set when a compute vccz/vccnz if is accepted via the #590 uniformity proof — its region is
-        // then required to be barrier/LDS/cross-lane free (checked after the target/merge is known).
+        // Set when a compute vccz/vccnz if is accepted for exact guest-wave control flow. Its region
+        // must remain free of operations that require every workgroup invocation to reach one common
+        // synchronized phase (checked after the target/merge is known).
         bool compute_uniform_vcc = false;
         switch (in.opcode) {
             case 0x02: continue;                                     // s_branch: validated in pass 2
@@ -4352,22 +4353,26 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
             }
         }
         if (compute_uniform_vcc) {
-            // (#590) the uniformity proof is per-WAVE: reject when the guarded region contains a
-            // barrier / LDS / cross-lane op (mirroring the compute loop-body guard — a barrier under
-            // control flow whose condition could differ across the workgroup's waves would be
-            // workgroup-divergent, UB).
+            // The exact branch decision is per-WAVE, so different waves in one workgroup may take
+            // different arms. Ordinary LDS loads/stores/atomics are valid under that control flow:
+            // they are per-invocation memory effects and impose no reconvergence requirement. A
+            // guest barrier is not valid there, and synthesized wave collectives need the CFG
+            // dispatcher's common phase rather than the compact structured emitter. Keep those
+            // synchronized operations fail-visible here; raw LDS memory effects can remain in-arm.
             const uint32_t region_end = F.has_else ? F.merge_pc : F.target_pc;
             for (const auto& r : ins) {
                 if (r.is_end || r.pc >= region_end) break;
                 if (r.pc <= in.pc) continue;
-                if (r.fmt == Rdna2Format::DS ||
-                    (r.fmt == Rdna2Format::SOPP && r.opcode == 0x0a) ||
+                const bool ds_wave_collective = r.fmt == Rdna2Format::DS &&
+                    (r.opcode == 0x35 || r.opcode == 0x3d || r.opcode == 0x3e);
+                if ((r.fmt == Rdna2Format::SOPP && r.opcode == 0x0a) ||
+                    ds_wave_collective ||
                     (r.fmt == Rdna2Format::VOP3 &&
                      (r.opcode == 0x365 || r.opcode == 0x366))) {
                     if (getenv("PROSPER_DBG"))
                         std::fprintf(stderr,
                                      "[compute-struct-reject] vcc branch pc=%u contains "
-                                     "wave/workgroup op pc=%u fmt=%d op=0x%x\n",
+                                     "synchronized op pc=%u fmt=%d op=0x%x\n",
                                      in.pc, r.pc, static_cast<int>(r.fmt), r.opcode);
                     return reject();
                 }
