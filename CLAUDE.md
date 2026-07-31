@@ -239,6 +239,11 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
 
 ## How to work here
 
+- **Concurrent game work starts with `prosper/docs/GAME_COMPAT_ORCHESTRATION.md`.** It defines the orchestrator and
+  subagent contract, shared-GPU policy, evidence/PR cadence, and the dated current handoff for active title lanes.
+  Update its current-state sections when ownership, evidence, or the exact frontier changes; keep detailed findings in
+  GitHub issues so the document remains a discoverable map rather than the only record.
+
 - **Work in your OWN git worktree — the main checkout is shared.** Several agents (and the human)
   run this repo concurrently, so the main working directory and its build dir are contended:
   branch-switching, staging, or `cmake --build` there collides with whatever someone else is
