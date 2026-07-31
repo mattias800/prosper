@@ -248,6 +248,9 @@ GpuTimelineCaptureCounters gpu_timeline_capture_counters();
 // True only for a fully valid detailed-capture request with a nonzero AFTER_COMPUTE phase gate.
 // Frontends use this canonical parse to distinguish dormant phase capture from eager capture.
 bool gpu_timeline_capture_is_after_compute_gated();
+// True once the matching AFTER_COMPUTE dispatch has been observed. Published atomically because
+// compute realization uses it to change capture portability policy at the semantic boundary.
+bool gpu_timeline_capture_after_compute_gate_armed();
 
 // Runtime hooks. Inert unless PROSPER_GPU_TIMELINE=<path> is set. They record folded semantic state
 // before renderer sampling and never realize shaders, copy resources, or invoke Vulkan.
