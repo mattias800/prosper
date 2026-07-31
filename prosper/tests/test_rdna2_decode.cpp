@@ -286,6 +286,14 @@ int main() {
     Rdna2Inst v3n = rdna2_decode_one(vop3_nolit, 2);
     CHECK(v3n.fmt == Rdna2Format::VOP3 && v3n.len_dwords == 2 && !v3n.has_literal,
           "VOP3 without a literal src is 2 dwords");
+    // VOPC-as-VOP3 uses the same 64-bit packet prefix but its low dword0 field is an SGPR-mask
+    // destination, never a VGPR. Exact Astro world-map encoding, round-tripped with llvm-mc gfx1010.
+    const uint32_t vopc_e64_u64[] = { 0xd4e4006au, 0x0001006au };
+    Rdna2Inst ce64 = rdna2_decode_one(vopc_e64_u64, 2);
+    CHECK(ce64.fmt == Rdna2Format::VOPC && ce64.opcode == 0xe4u && ce64.len_dwords == 2 &&
+          isS(ce64.dst, 106) && ce64.n_src == 2 && ce64.src[0].value == 106 &&
+          ce64.src[1].kind == OperandKind::InlineInt && ce64.src[1].value == 0,
+          "Astro v_cmp_gt_u64_e64 decodes its explicit VCC destination and two sources");
 
     // MIMG length: non-NSA image op is 2 dwords; NSA form adds dword0[2:1] extra address dwords.
     // Encodings from llvm-mc gfx1030 (image_load 2D non-NSA; image_sample 2D NSA [v0,v1] = 1 extra).

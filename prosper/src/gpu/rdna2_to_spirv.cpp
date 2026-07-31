@@ -3788,8 +3788,11 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
 
 bool vopc_is_cmpx(uint32_t opcode) {
     return (opcode >= 0x10 && opcode <= 0x1f) ||
+           (opcode >= 0x30 && opcode <= 0x3f) ||
            (opcode >= 0x90 && opcode <= 0x9f) ||
-           (opcode >= 0xd0 && opcode <= 0xdf);
+           (opcode >= 0xb0 && opcode <= 0xbf) ||
+           (opcode >= 0xd0 && opcode <= 0xdf) ||
+           (opcode >= 0xf0 && opcode <= 0xff);
 }
 
 bool instruction_may_change_exec(const Rdna2Inst& in) {
@@ -6883,18 +6886,29 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         case Rdna2Format::VOPC: {                                     // v_cmp_* -> VCC; v_cmpx_* also -> EXEC
             const uint32_t ra = val(in.src[0]), rc = val(in.src[1]);  // raw bits (f16 compares re-derive)
             uint32_t a = ra, c = rc;
+            uint32_t op = in.opcode;
+            bool is_cmpx = vopc_is_cmpx(op);
+            if (is_cmpx && !allow_exec_update) { ok = false; return true; }
+            uint32_t eff = is_cmpx ? op - 0x10 : op;
+            const bool integer64_compare =
+                (eff >= 0xA1u && eff <= 0xA6u) ||
+                (eff >= 0xE1u && eff <= 0xE6u);
+            // Integer compares have no ABS/NEG source semantics. A malformed e64 packet carrying
+            // those bits must not be lowered as an unmodified integer operation.
+            if (integer64_compare &&
+                (in.src_abs[0] || in.src_abs[1] || in.src_neg[0] || in.src_neg[1])) {
+                ok = false;
+                return true;
+            }
             // Float source modifiers (abs then neg — hardware order), set only on FLOAT compares by the
             // assembler (VOP3-encoded e64 or SDWA forms; e.g. DOLL's `v_cmp_gt_f32_sdwa vcc, |v5|, s4`).
             if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
             if (in.src_neg[0]) a = b.fneg(a);
             if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);
             if (in.src_neg[1]) c = b.fneg(c);
-            // v_cmpx_* shares each type's compare set at base+0x10 (f32 0x10-0x1f, i32 0x90-0x9f,
-            // u32 0xd0-0xdf); it writes EXEC in addition to VCC. Map to the base compare, then narrow.
-            uint32_t op = in.opcode;
-            bool is_cmpx = vopc_is_cmpx(op);
-            if (is_cmpx && !allow_exec_update) { ok = false; return true; }
-            uint32_t eff = is_cmpx ? op - 0x10 : op;
+            // v_cmpx_* shares each type's compare set at base+0x10. It writes EXEC in addition to
+            // VCC. Map to the base compare, then narrow; vopc_is_cmpx covers the f32/f64,
+            // i32/i64, and u32/u64 windows.
             const bool integer_compare =
                 (eff >= 0x81u && eff <= 0x86u) ||
                 (eff >= 0xC1u && eff <= 0xC6u);
@@ -6906,6 +6920,33 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 };
                 a = sdwa_integer(ra, in.sdwa_src0_sel);
                 c = sdwa_integer(rc, in.sdwa_src1_sel);
+            }
+            struct Integer64Halves { uint32_t lo = 0, hi = 0; };
+            auto integer64_halves = [&](const Operand& operand, uint32_t lo) {
+                Integer64Halves result{lo, b.uconst(0)};
+                if (operand.kind == OperandKind::VGPR || operand.kind == OperandKind::SGPR ||
+                    (operand.kind == OperandKind::Special && operand.value >= 106 &&
+                     operand.value <= 123)) {
+                    Operand high = operand;
+                    ++high.value;
+                    result.hi = val(high);
+                } else if (operand.kind == OperandKind::InlineInt) {
+                    result.hi = b.uconst(operand.value < 0 ? 0xffffffffu : 0u);
+                } else if (operand.kind == OperandKind::Literal ||
+                           (operand.kind == OperandKind::Special && operand.value == 125)) {
+                    // Integer/untyped 32-bit literals and SGPR_NULL zero-extend in a B64 source.
+                    result.hi = b.uconst(0);
+                } else {
+                    // In particular, an inline floating-point constant is a 64-bit DOUBLE operand
+                    // in a 64-bit compare, not an integer pair assembled from its f32 bit pattern.
+                    ok = false;
+                }
+                return result;
+            };
+            Integer64Halves a64, c64;
+            if (integer64_compare) {
+                a64 = integer64_halves(in.src[0], ra);
+                c64 = integer64_halves(in.src[1], rc);
             }
             uint32_t cmp = 0;
             switch (eff) {
@@ -6942,6 +6983,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x84: cmp = b.scmp(Op_SGreaterThan, a, c); break;         // v_cmp_gt_i32
                 case 0x85: cmp = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_i32 (sign-agnostic)
                 case 0x86: cmp = b.scmp(Op_SGreaterThanEqual, a, c); break;    // v_cmp_ge_i32
+                case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA5: case 0xA6: {
+                    const uint32_t lhs = b.u64_from_lohi(a64.lo, a64.hi);
+                    const uint32_t rhs = b.u64_from_lohi(c64.lo, c64.hi);
+                    // Flipping the sign bit maps two's-complement signed order onto unsigned order.
+                    // Keep the values in the declared u64 type: the generic `scmp` helper bitcasts
+                    // 32-bit operands and therefore cannot be used for a 64-bit scalar.
+                    const uint32_t ordered_lhs = b.u64_from_lohi(
+                        a64.lo, b.ibin(Op_BitwiseXor, a64.hi, b.uconst(0x80000000u)));
+                    const uint32_t ordered_rhs = b.u64_from_lohi(
+                        c64.lo, b.ibin(Op_BitwiseXor, c64.hi, b.uconst(0x80000000u)));
+                    switch (eff) {
+                        case 0xA1: cmp = b.ucmp(Op_ULessThan, ordered_lhs, ordered_rhs); break; // v_cmp_lt_i64
+                        case 0xA2: cmp = b.ucmp(Op_IEqual, lhs, rhs); break;               // v_cmp_eq_i64
+                        case 0xA3: cmp = b.ucmp(Op_ULessThanEqual, ordered_lhs, ordered_rhs); break; // v_cmp_le_i64
+                        case 0xA4: cmp = b.ucmp(Op_UGreaterThan, ordered_lhs, ordered_rhs); break; // v_cmp_gt_i64
+                        case 0xA5: cmp = b.ucmp(Op_INotEqual, lhs, rhs); break;            // v_cmp_ne_i64
+                        default:   cmp = b.ucmp(Op_UGreaterThanEqual, ordered_lhs, ordered_rhs); break; // v_cmp_ge_i64
+                    }
+                    break;
+                }
                 case 0x88: {                                                   // v_cmp_class_f32
                     // CLASS tests the raw IEEE-754 category rather than doing a floating-point
                     // comparison. Keep this entirely in the integer domain so signalling/quiet
@@ -6988,6 +7049,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0xC4: cmp = b.ucmp(Op_UGreaterThan, a, c); break;         // v_cmp_gt_u32
                 case 0xC5: cmp = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_u32
                 case 0xC6: cmp = b.ucmp(Op_UGreaterThanEqual, a, c); break;    // v_cmp_ge_u32
+                case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6: {
+                    const uint32_t lhs = b.u64_from_lohi(a64.lo, a64.hi);
+                    const uint32_t rhs = b.u64_from_lohi(c64.lo, c64.hi);
+                    switch (eff) {
+                        case 0xE1: cmp = b.ucmp(Op_ULessThan, lhs, rhs); break;             // v_cmp_lt_u64
+                        case 0xE2: cmp = b.ucmp(Op_IEqual, lhs, rhs); break;                // v_cmp_eq_u64
+                        case 0xE3: cmp = b.ucmp(Op_ULessThanEqual, lhs, rhs); break;        // v_cmp_le_u64
+                        case 0xE4: cmp = b.ucmp(Op_UGreaterThan, lhs, rhs); break;          // v_cmp_gt_u64
+                        case 0xE5: cmp = b.ucmp(Op_INotEqual, lhs, rhs); break;             // v_cmp_ne_u64
+                        default:   cmp = b.ucmp(Op_UGreaterThanEqual, lhs, rhs); break;     // v_cmp_ge_u64
+                    }
+                    break;
+                }
                 // f16 compares (0xC8-0xCF; cmpx at +0x10 = 0xD8-0xDF folds here too — DOLL's title
                 // post PSes: `v_cmp_lt_f16_sdwa s6, 0, v7`). VERIFIED(round-trip llvm-mc gfx1030:
                 // v_cmp_lt/eq/le/gt/lg/ge_f16 = VOPC 0xC9-0xCE). The f16 value lives in the source's
@@ -10588,6 +10662,39 @@ bool emit_cfg_state_machine(
                           : in.opcode == 0x09;                // 0 >= mask
     };
 
+    // VOPC e64 can compare a complete 64-bit scalar mask as integer data. Generated Wave64 code
+    // uses `v_cmp_gt_u64 vcc,vcc,0` to broadcast (old VCC != 0) back into every active VCC lane.
+    // The per-invocation mask representation has no 64-bit scalar payload, but the comparison is
+    // exactly one guest-wave ANY vote. Keep the admission deliberately narrow: unsigned B64,
+    // architectural VCC destination, one proven mask source, literal zero, and predicates whose
+    // result is either ANY or !ANY. Other B64 arithmetic comparisons remain fail-visible.
+    auto vopc_mask_zero_compare_source = [&](const Rdna2Inst& in) -> int {
+        if (in.fmt != Rdna2Format::VOPC || vopc_is_cmpx(in.opcode) ||
+            in.dst.kind != OperandKind::SGPR || in.dst.value != 106 ||
+            in.src_abs[0] || in.src_abs[1] || in.src_neg[0] || in.src_neg[1])
+            return -1;
+        auto zero = [](const Operand& operand) {
+            return operand.kind == OperandKind::InlineInt && operand.value == 0;
+        };
+        auto possible_mask = [](const Operand& operand) {
+            return operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special;
+        };
+        const bool mask_first = in.opcode == 0xe2 || in.opcode == 0xe3 ||
+                                in.opcode == 0xe4 || in.opcode == 0xe5;
+        const bool mask_second = in.opcode == 0xe1 || in.opcode == 0xe2 ||
+                                 in.opcode == 0xe5 || in.opcode == 0xe6;
+        if (mask_first && possible_mask(in.src[0]) && zero(in.src[1]))
+            return in.src[0].value;
+        if (mask_second && zero(in.src[0]) && possible_mask(in.src[1]))
+            return in.src[1].value;
+        return -1;
+    };
+    auto vopc_mask_zero_compare_inverts = [&](const Rdna2Inst& in) {
+        const bool mask_first = in.src[0].kind != OperandKind::InlineInt;
+        return mask_first ? in.opcode == 0xe2 || in.opcode == 0xe3 // mask ==/<= 0
+                          : in.opcode == 0xe2 || in.opcode == 0xe6; // 0 ==/>= mask
+    };
+
     // A Wave32 B32 logical writes SCC=any(result mask). The ordinary lane-local emitter poisons
     // that SCC because it cannot reduce a guest wave by itself. Inside an exact native dispatcher,
     // however, every lane reaches the same switch case and an immediately consuming SCC branch can
@@ -10610,6 +10717,66 @@ bool emit_cfg_state_machine(
                 (consumer.opcode == 0x04 || consumer.opcode == 0x05) &&
                 producer.pc + producer.len_dwords == consumer.pc)
                 native_b32_mask_scc_vote_pcs.insert(producer.pc);
+        }
+    }
+
+    // A B64 mask logical writes SCC=(result mask != 0). Find the producer only when that SCC is
+    // actually consumed by a later scalar branch, walking backwards across instructions that are
+    // architecturally SCC-preserving. This avoids a synchronized vote after every intermediate
+    // mask operation in branch-heavy kernels while retaining fail-closed behavior across another
+    // scalar ALU/control-flow instruction whose SCC effect is not proven here.
+    auto b64_mask_logical_opcode = [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::SOP2 &&
+               (in.opcode == 0x0f || in.opcode == 0x11 || in.opcode == 0x13 ||
+                in.opcode == 0x15 || in.opcode == 0x17 || in.opcode == 0x19 ||
+                in.opcode == 0x1b || in.opcode == 0x1d);
+    };
+    std::unordered_set<uint32_t> scalar_block_starts{ins.front().pc};
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const Rdna2Inst& terminator = ins[i];
+        if (!cfg_terminator(terminator)) continue;
+        if (terminator.fmt == Rdna2Format::SOPP && terminator.opcode >= 0x02 &&
+            terminator.opcode <= 0x09 && terminator.opcode != 0x03) {
+            const uint32_t target = scalar_branch_target(terminator);
+            if (target <= end_pc) scalar_block_starts.insert(target);
+        }
+        if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+            scalar_block_starts.insert(ins[i + 1].pc);
+    }
+    std::unordered_set<uint32_t> b64_mask_scc_vote_pcs;
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const Rdna2Inst& consumer = ins[i];
+        if (consumer.is_end) break;
+        if (consumer.fmt != Rdna2Format::SOPP ||
+            (consumer.opcode != 0x04 && consumer.opcode != 0x05))
+            continue;
+        // SCC at a block entry may come from more than one predecessor. Do not associate a linear
+        // producer across that join: this narrow proof owns only the branch's current basic block.
+        size_t block_begin = i;
+        while (block_begin > 0 && !scalar_block_starts.contains(ins[block_begin].pc))
+            --block_begin;
+        for (size_t j = i; j-- > block_begin;) {
+            const Rdna2Inst& candidate = ins[j];
+            if (b64_mask_logical_opcode(candidate)) {
+                b64_mask_scc_vote_pcs.insert(candidate.pc);
+                break;
+            }
+            const bool preserves_scc =
+                candidate.fmt == Rdna2Format::VOP1 ||
+                candidate.fmt == Rdna2Format::VOP2 ||
+                candidate.fmt == Rdna2Format::VOP3 ||
+                candidate.fmt == Rdna2Format::VOP3P ||
+                candidate.fmt == Rdna2Format::VOPC ||
+                candidate.fmt == Rdna2Format::SMEM ||
+                candidate.fmt == Rdna2Format::MUBUF ||
+                candidate.fmt == Rdna2Format::MTBUF ||
+                candidate.fmt == Rdna2Format::MIMG ||
+                candidate.fmt == Rdna2Format::DS ||
+                candidate.fmt == Rdna2Format::FLAT ||
+                candidate.fmt == Rdna2Format::EXP ||
+                candidate.fmt == Rdna2Format::VINTRP ||
+                sopp_is_noop(candidate);
+            if (!preserves_scc) break;
         }
     }
 
@@ -10649,6 +10816,16 @@ bool emit_cfg_state_machine(
                 start_set.insert(ins[i + 1].pc);
         }
         if (mask_zero_compare_candidate_source(in) >= 0) {
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (vopc_mask_zero_compare_source(in) >= 0) {
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (b64_mask_scc_vote_pcs.contains(in.pc)) {
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -11122,7 +11299,9 @@ bool emit_cfg_state_machine(
             synchronized_block[block] = synchronized_block[block] ||
                 mbcnt_event_for_pc.contains(in.pc) || append_event_for_pc.contains(in.pc) ||
                 swizzle_pcs.contains(in.pc) ||
-                mask_zero_compare_candidate_source(in) >= 0;
+                mask_zero_compare_candidate_source(in) >= 0 ||
+                vopc_mask_zero_compare_source(in) >= 0 ||
+                b64_mask_scc_vote_pcs.contains(in.pc);
             conditional_block[block] = conditional_block[block] ||
                 (!linearized_branch(in) && in.fmt == Rdna2Format::SOPP &&
                  in.opcode >= 0x04 && in.opcode <= 0x09 && in.opcode != 0x03);
@@ -11250,6 +11429,7 @@ bool emit_cfg_state_machine(
     const uint32_t vote_value_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_invert_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_to_scc_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t vote_to_vcc_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_taken_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t vote_next_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t mbcnt_pending_var = b.function_var(b.t_bool, ptr_bool);
@@ -11449,6 +11629,7 @@ bool emit_cfg_state_machine(
         b.store_function(vote_value_var, no);
         b.store_function(vote_invert_var, no);
         b.store_function(vote_to_scc_var, no);
+        b.store_function(vote_to_vcc_var, no);
         b.store_function(vote_taken_var, zero);
         b.store_function(vote_next_var, zero);
         b.store_function(mbcnt_pending_var, no);
@@ -11513,6 +11694,8 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* append = nullptr;
         const Rdna2Inst* swizzle = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
+        const Rdna2Inst* vopc_mask_compare = nullptr;
+        const Rdna2Inst* b64_mask_scc_vote = nullptr;
         const uint32_t final_block = dispatch_blocks[dispatch].back();
         const uint32_t final_hi = final_block + 1 < starts.size()
             ? starts[final_block + 1] : UINT32_MAX;
@@ -11525,6 +11708,8 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_append = nullptr;
             const Rdna2Inst* block_swizzle = nullptr;
             const Rdna2Inst* block_mask_compare = nullptr;
+            const Rdna2Inst* block_vopc_mask_compare = nullptr;
+            const Rdna2Inst* block_b64_mask_scc_vote = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi) continue;
                 if (cfg_terminator(in)) {
@@ -11555,6 +11740,18 @@ bool emit_cfg_state_machine(
                     block_mask_compare = &in;
                     break;
                 }
+                const int vopc_mask_compare_source =
+                    vopc_mask_zero_compare_source(in);
+                if (vopc_mask_compare_source >= 0 &&
+                    (state.sreg_bool.contains(vopc_mask_compare_source) ||
+                     (vopc_mask_compare_source == 106 && state.vcc))) {
+                    if (getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[compute-vopc-mask-compare] pc=%u source=s%d op=0x%x\n",
+                                     in.pc, vopc_mask_compare_source, in.opcode);
+                    block_vopc_mask_compare = &in;
+                    break;
+                }
                 if (in.fmt == Rdna2Format::EXP) {
                     if (!exp_fn(state, in)) return reject_cfg(in.pc, "export");
                     continue;
@@ -11569,6 +11766,12 @@ bool emit_cfg_state_machine(
                                      in.pc, static_cast<int>(in.fmt), in.opcode);
                     return false;
                 }
+                // Ordinary scalar B64 logicals already produced an exact nonzero SCC id above.
+                // Only divert the mask-domain form, whose cross-wave SCC is deliberately poisoned.
+                if (b64_mask_scc_vote_pcs.contains(in.pc) && !state.scc) {
+                    block_b64_mask_scc_vote = &in;
+                    break;
+                }
                 if (!state.scc && native_b32_mask_scc_vote_pcs.contains(in.pc)) {
                     const auto result = state.sreg_bool.find(in.dst.value);
                     if (result == state.sreg_bool.end() ||
@@ -11581,6 +11784,7 @@ bool emit_cfg_state_machine(
             if (!last) {
                 // Group construction admits only one-successor plain blocks before the tail.
                 if (block_mbcnt || block_append || block_swizzle || block_mask_compare ||
+                    block_vopc_mask_compare || block_b64_mask_scc_vote ||
                     (block_terminator && (block_terminator->is_end ||
                                           block_terminator->opcode != 0x02)))
                     return reject_cfg(starts[block], "invalid-fused-block");
@@ -11591,6 +11795,8 @@ bool emit_cfg_state_machine(
             append = block_append;
             swizzle = block_swizzle;
             mask_compare = block_mask_compare;
+            vopc_mask_compare = block_vopc_mask_compare;
+            b64_mask_scc_vote = block_b64_mask_scc_vote;
         }
         if (mbcnt) {
             if (graphics) {
@@ -11712,6 +11918,70 @@ bool emit_cfg_state_machine(
                 b.store_function(vote_to_scc_var, yes);
             }
         }
+        if (vopc_mask_compare) {
+            if (b.is_vertex) {
+                if (getenv("PROSPER_DBG"))
+                    std::fprintf(stderr,
+                                 "[graphics-cfg-reject] pc=%u reason=vopc-wave-mask-compare\n",
+                                 vopc_mask_compare->pc);
+                return false;
+            }
+            const int source = vopc_mask_zero_compare_source(*vopc_mask_compare);
+            const auto saved_value = state.sreg_bool.find(source);
+            const uint32_t value = source == 106 && state.vcc
+                ? state.vcc
+                : saved_value != state.sreg_bool.end() ? saved_value->second : 0;
+            if (!value)
+                return reject_cfg(vopc_mask_compare->pc,
+                                  "missing-vopc-mask-compare-source");
+            if (b.native_subgroup_size || b.is_fragment) {
+                const uint32_t wave_any = b.is_fragment
+                    ? b.fragment_wave_any(value)
+                    : b.native_wave_any(value);
+                if (!wave_any) return reject_cfg(vopc_mask_compare->pc, "vopc-mask-vote");
+                const uint32_t condition =
+                    vopc_mask_zero_compare_inverts(*vopc_mask_compare)
+                        ? b.logical_not(wave_any) : wave_any;
+                state.vcc = b.land(state.exec, condition);
+                state.sreg_bool[106] = state.vcc;
+                state.sreg_bool_narrowed[106] = true;
+                if (const auto saved_vcc = mv.find(106); saved_vcc != mv.end())
+                    b.store_function(saved_vcc->second, state.vcc);
+            } else {
+                b.store_function(vote_pending_var, yes);
+                b.store_function(vote_value_var, value);
+                b.store_function(vote_invert_var,
+                    vopc_mask_zero_compare_inverts(*vopc_mask_compare) ? yes : no);
+                b.store_function(vote_to_vcc_var, yes);
+            }
+        }
+        if (b64_mask_scc_vote) {
+            uint32_t value = 0;
+            if (b64_mask_scc_vote->dst.value == 126 ||
+                b64_mask_scc_vote->dst.value == 127) {
+                value = state.exec;
+            } else if (b64_mask_scc_vote->dst.value == 106 ||
+                       b64_mask_scc_vote->dst.value == 107) {
+                value = state.vcc;
+            } else {
+                const auto saved = state.sreg_bool.find(b64_mask_scc_vote->dst.value);
+                if (saved != state.sreg_bool.end()) value = saved->second;
+            }
+            if (!value)
+                return reject_cfg(b64_mask_scc_vote->pc, "missing-b64-mask-scc-source");
+            if (b.native_subgroup_size || b.is_fragment) {
+                const uint32_t wave_any = b.is_fragment
+                    ? b.fragment_wave_any(value)
+                    : b.native_wave_any(value);
+                if (!wave_any) return reject_cfg(b64_mask_scc_vote->pc, "b64-mask-scc-vote");
+                state.scc = wave_any;
+            } else {
+                b.store_function(vote_pending_var, yes);
+                b.store_function(vote_value_var, value);
+                b.store_function(vote_invert_var, no);
+                b.store_function(vote_to_scc_var, yes);
+            }
+        }
         save_state(state, dispatch);
         if (mbcnt) {
             if (!set_next(mbcnt->pc + mbcnt->len_dwords))
@@ -11725,6 +11995,14 @@ bool emit_cfg_state_machine(
         } else if (mask_compare) {
             if (!set_next(mask_compare->pc + mask_compare->len_dwords))
                 return reject_cfg(mask_compare->pc, "mask-compare-successor");
+        } else if (vopc_mask_compare) {
+            if (!set_next(vopc_mask_compare->pc + vopc_mask_compare->len_dwords))
+                return reject_cfg(vopc_mask_compare->pc,
+                                  "vopc-mask-compare-successor");
+        } else if (b64_mask_scc_vote) {
+            if (!set_next(b64_mask_scc_vote->pc + b64_mask_scc_vote->len_dwords))
+                return reject_cfg(b64_mask_scc_vote->pc,
+                                  "b64-mask-scc-successor");
         } else if (!terminator) {
             if (!set_next(final_hi)) return reject_cfg(starts[final_block], "fallthrough-successor");
         } else if (terminator->is_end || terminator->opcode == 0x12) {
@@ -12124,7 +12402,18 @@ bool emit_cfg_state_machine(
     const uint32_t write_scc = b.land(pending, vote_to_scc);
     b.store_function(scc_var,
         b.bsel(write_scc, vote_condition, b.load_function(b.t_bool, scc_var)));
-    const uint32_t write_pc = b.land(pending, b.logical_not(vote_to_scc));
+    const uint32_t vote_to_vcc = b.load_function(b.t_bool, vote_to_vcc_var);
+    const uint32_t write_vcc = b.land(pending, vote_to_vcc);
+    const uint32_t compared_vcc = b.land(
+        b.load_function(b.t_bool, exec_var), vote_condition);
+    b.store_function(vcc_var,
+        b.bsel(write_vcc, compared_vcc, b.load_function(b.t_bool, vcc_var)));
+    if (const auto saved_vcc = mv.find(106); saved_vcc != mv.end())
+        b.store_function(saved_vcc->second,
+            b.bsel(write_vcc, compared_vcc,
+                   b.load_function(b.t_bool, saved_vcc->second)));
+    const uint32_t write_pc = b.land(
+        pending, b.land(b.logical_not(vote_to_scc), b.logical_not(vote_to_vcc)));
     b.store_function(pc_var, b.sel(write_pc, selected_pc, b.load_function(b.t_u32, pc_var)));
     const uint32_t group_active = b.ucmp(
         Op_INotEqual, b.cfg_scratch_load(b.uconst(group_active_slot)), zero);
@@ -12155,6 +12444,149 @@ struct BarrierPhasedCompute {
     std::vector<size_t> barriers;
     bool found = false;
 };
+
+// Prove the SCC consumed by a terminal compute guard is identical for every wave in the workgroup,
+// while allowing unrelated lane-local setup to precede it. The legacy barrier-phase proof required
+// every instruction before the guard to be scalar; generated kernels commonly interleave vector
+// address setup with a scalar descriptor load that independently produces the guard condition.
+//
+// This is deliberately a narrow backwards slice. The last SCC writer must be an SOPC, and every
+// scalar word feeding that compare must trace through launch SGPRs, scalar ALU, or scalar memory.
+// V_READFIRSTLANE/V_READLANE, vector mask writes, EXEC, and unresolved special registers terminate
+// the proof. Existing all-scalar prefixes retain their established admission path below.
+bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins,
+                                             size_t guard_index) {
+    // This is a textual backwards slice, not a reaching-definition analysis. Keep the prefix
+    // branch-free so every scalar definition it finds dominates the terminal guard. In particular,
+    // a VCC/EXEC branch may vary between guest waves even when the literal or SMEM value written in
+    // one arm is itself uniform.
+    for (size_t i = 0; i < guard_index; ++i) {
+        const Rdna2Inst& prefix = ins[i];
+        if ((prefix.fmt == Rdna2Format::SOPP && !sopp_is_noop(prefix)) ||
+            (prefix.fmt == Rdna2Format::SOP1 && prefix.opcode >= 0x20u &&
+             prefix.opcode <= 0x22u))
+            return false;
+    }
+
+    std::function<bool(int, uint32_t, uint32_t)> uniform_reg_at;
+    auto operand_uniform_at = [&](const Operand& operand, uint32_t words, uint32_t use_pc,
+                                  auto&& self) -> bool {
+        switch (operand.kind) {
+            case OperandKind::InlineInt:
+            case OperandKind::InlineFloat:
+            case OperandKind::Literal:
+                return true;
+            case OperandKind::Special:
+                if (operand.value == 125) return true; // SGPR_NULL
+                if (operand.value == 126 || operand.value == 127 || operand.value == 253)
+                    return false; // EXEC and SCC are not scalar launch data.
+                [[fallthrough]];
+            case OperandKind::SGPR:
+                for (uint32_t word = 0; word < words; ++word)
+                    if (!self(operand.value + static_cast<int>(word), use_pc, 0)) return false;
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    uniform_reg_at = [&](int reg, uint32_t use_pc, uint32_t depth) -> bool {
+        if (depth > 64) return false;
+        for (size_t i = ins.size(); i-- > 0;) {
+            const Rdna2Inst& writer = ins[i];
+            if (writer.pc >= use_pc) continue;
+            bool writes = false;
+            for_each_scalar_write(writer, [&](int base, uint32_t width) {
+                writes |= reg >= base && reg < base + static_cast<int>(width);
+            });
+            // Implicit VOPC writes target architectural VCC even when the decoder exposes it as a
+            // Special operand rather than an ordinary SGPR destination.
+            if ((reg == 106 || reg == 107) && writer.fmt == Rdna2Format::VOPC &&
+                !vopc_is_cmpx(writer.opcode))
+                writes = true;
+            if (!writes) continue;
+
+            auto uniform_operand = [&](const Operand& operand, uint32_t words) {
+                switch (operand.kind) {
+                    case OperandKind::InlineInt:
+                    case OperandKind::InlineFloat:
+                    case OperandKind::Literal:
+                        return true;
+                    case OperandKind::Special:
+                        if (operand.value == 125) return true;
+                        if (operand.value == 126 || operand.value == 127 || operand.value == 253)
+                            return false;
+                        [[fallthrough]];
+                    case OperandKind::SGPR:
+                        for (uint32_t word = 0; word < words; ++word)
+                            if (!uniform_reg_at(operand.value + static_cast<int>(word),
+                                                writer.pc, depth + 1))
+                                return false;
+                        return true;
+                    default:
+                        return false;
+                }
+            };
+
+            switch (writer.fmt) {
+                case Rdna2Format::SOP1: {
+                    // GETPC is identical for every wave. Mask/saveexec operations consume EXEC and
+                    // are rejected by instruction_may_change_exec; ordinary scalar operations trace
+                    // their source at the destination's architectural width.
+                    if (writer.opcode == 0x1f) return true;
+                    if (instruction_may_change_exec(writer) || writer.n_src != 1) return false;
+                    return uniform_operand(writer.src[0], scalar_write_width(writer) == 2 ? 2u : 1u);
+                }
+                case Rdna2Format::SOP2: {
+                    // Carry/cselect forms consume SCC in addition to their decoded operands. They are
+                    // outside this narrow slice until SCC itself is represented as a recursive value.
+                    if (writer.opcode == 0x04 || writer.opcode == 0x05 ||
+                        writer.opcode == 0x0a || writer.opcode == 0x0b)
+                        return false;
+                    const uint32_t words = scalar_write_width(writer) == 2 ? 2u : 1u;
+                    return writer.n_src == 2 && uniform_operand(writer.src[0], words) &&
+                           uniform_operand(writer.src[1], words);
+                }
+                case Rdna2Format::SMEM: {
+                    // Scalar-buffer loads use a four-dword descriptor; scalar-memory loads use a
+                    // base pair. The scalar offset is one dword in both forms.
+                    if (!scalar_write_width(writer) || writer.n_src < 1) return false;
+                    const uint32_t base_words = writer.opcode >= 0x8 ? 4u : 2u;
+                    if (!uniform_operand(writer.src[0], base_words)) return false;
+                    return writer.n_src < 2 || uniform_operand(writer.src[1], 1);
+                }
+                case Rdna2Format::SOPK:
+                    // S_MOVK is a literal definition. Other SOPK data writers are read/modify/write
+                    // or hardware-register reads and stay outside this proof.
+                    return writer.opcode == 0x00;
+                default:
+                    return false;
+            }
+        }
+        // Ordinary compute launch SGPRs (user data and enabled system SGPRs) are uniform within one
+        // workgroup. Special registers are numbered above this range and were handled explicitly.
+        return reg >= 0 && reg <= 105;
+    };
+
+    for (size_t i = guard_index; i-- > 0;) {
+        const Rdna2Inst& candidate = ins[i];
+        if (sopp_is_noop(candidate)) continue;
+        if (candidate.fmt == Rdna2Format::SOPC) {
+            const uint32_t words = candidate.opcode == 0x12 || candidate.opcode == 0x13 ? 2u : 1u;
+            for (uint32_t source = 0; source < candidate.n_src; ++source)
+                if (!operand_uniform_at(candidate.src[source], words, candidate.pc,
+                                        uniform_reg_at))
+                    return false;
+            return candidate.n_src != 0;
+        }
+        // Vector/memory operations cannot write SCC. Any scalar ALU or SOPK instruction might, so
+        // stop rather than accidentally consuming an older compare through an unmodeled SCC writer.
+        if (candidate.fmt == Rdna2Format::SOP1 || candidate.fmt == Rdna2Format::SOP2 ||
+            candidate.fmt == Rdna2Format::SOPK)
+            return false;
+    }
+    return false;
+}
 
 // Recognize a workgroup-uniform scalar terminal guard around barrier-separated compute phases.
 // Keeping this proof shared is important: emit_body uses it to split the shader, while the native
@@ -12188,7 +12620,8 @@ BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdna2Inst>
 
     bool valid = result.guard_index < first_barrier && first_barrier < result.end_index &&
         branch_count > 2;
-    for (size_t i = 0; valid && i < result.guard_index; ++i) {
+    bool scalar_prefix = valid;
+    for (size_t i = 0; scalar_prefix && i < result.guard_index; ++i) {
         const Rdna2Inst& in = ins[i];
         // Scalar ALU/loads retain workgroup-uniform values when entered from compute user data and
         // TGIDs. EXEC is lane state, so any explicit access to either half invalidates this proof.
@@ -12198,7 +12631,7 @@ BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdna2Inst>
             in.fmt == Rdna2Format::SOPC || in.fmt == Rdna2Format::SMEM ||
             (in.fmt == Rdna2Format::SOPP && sopp_is_noop(in));
         if (!scalar) {
-            valid = false;
+            scalar_prefix = false;
             break;
         }
         auto is_exec = [](const Operand& operand) {
@@ -12206,10 +12639,12 @@ BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdna2Inst>
                     operand.kind == OperandKind::Special) &&
                    (operand.value == 126 || operand.value == 127);
         };
-        if (is_exec(in.dst)) valid = false;
+        if (is_exec(in.dst)) scalar_prefix = false;
         for (uint32_t source = 0; source < in.n_src; ++source)
-            if (is_exec(in.src[source])) valid = false;
+            if (is_exec(in.src[source])) scalar_prefix = false;
     }
+    if (valid && !scalar_prefix)
+        valid = terminal_guard_scc_is_workgroup_uniform(ins, result.guard_index);
 
     for (size_t i = result.guard_index + 1; valid && i < result.end_index; ++i)
         if (ins[i].fmt == Rdna2Format::SOPP && ins[i].opcode == 0x0a)

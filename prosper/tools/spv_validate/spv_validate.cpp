@@ -212,6 +212,21 @@ int main(int argc, char** argv) {
       vb.binding=3; vb.sgpr_base=8; vb.stride=16; vb.format=DataFormat::Float32;
       vb.num_components=4; rt.resources.push_back(vb);
       dump(dir, "compute_cfg_dispatch", recompile_valu(c, sizeof(c)/4, 0, 0, &rt)); }
+    // Ordinary e64 integer-pair comparisons (unsigned then signed), separate from mask provenance.
+    { const uint32_t c[] = {0xd4e4006au,0x00010000u,0xd4a4006au,0x00010000u,
+                            0xbf810000u};
+      ComputeShaderConfig cfg; cfg.local_x=128; cfg.wave_size=64;
+      dump(dir, "compute_i64_compare",
+           recompile_compute(c, sizeof(c)/4, nullptr, cfg)); }
+    // Astro Bot Wave64: e64 mask-vs-zero normalization followed by a last-live B64 mask SCC vote.
+    // Both reductions use the portable dispatcher's uniform common phase.
+    { const uint32_t c[] = {0x7d840000u,0xd4e4006au,0x0001006au,0xbea0047eu,
+                            0x87ea6a20u,0x7e000280u,0xbf840003u,0x7d840100u,
+                            0x02020100u,0xbf860002u,0xbf060000u,0xbf850001u,
+                            0x7e020280u,0xbf810000u};
+      ComputeShaderConfig cfg; cfg.local_x=128; cfg.wave_size=64;
+      dump(dir, "compute_wave64_mask_vote",
+           recompile_compute(c, sizeof(c)/4, nullptr, cfg)); }
 
     // --- #273 additions (DOLL recompiler frontier) ---
     // Fragment: 3D image_load (integer LUT fetch through the combined sampler; OpImage+OpImageFetch).
