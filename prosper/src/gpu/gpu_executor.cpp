@@ -3335,6 +3335,85 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             for (uint32_t i = 0; i < kUserSgprs; i++) fprintf(stderr, " %08x", sgprs[i]);
             fprintf(stderr, "\n");
         }
+        // USER-DATA POINTER MAP. A stage's descriptor-table pointers are ordinary 64-bit guest
+        // addresses sitting in consecutive user-data dwords, and every bindless descriptor chain
+        // starts by dereferencing one. When a stage fails to resolve its V#/T#, the first question
+        // is whether the seeded block even CONTAINS the pointers the shader loads from — the AGC
+        // header's direct-resource offsets and the shader's own SBASE registers both name dword
+        // positions, so a block whose readable pointers sit elsewhere is not the block that shader
+        // ran with. Report every dword pair that is a mapped guest address, plus the readability of
+        // each header-declared direct offset, so that question is answered by data rather than by
+        // eye. Probing is bounded to the 32-dword window and uses the fault-safe readability probe.
+        for (uint32_t base : bases) {
+            uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, base, sgprs);
+            fprintf(stderr, "[udmap] %s code=0x%llx base=0x%x readable-ptr dwords:",
+                    is_ps ? "PS" : "VS", (unsigned long long)code_addr, base);
+            bool any = false;
+            for (uint32_t i = 0; i + 1 < kUserSgprs; i++) {
+                const uint64_t candidate =
+                    (uint64_t)sgprs[i] | ((uint64_t)sgprs[i + 1] << 32);
+                if (candidate <= 0x10000 || !guest_readable(candidate, 8)) continue;
+                fprintf(stderr, " [%u]=0x%llx", i, (unsigned long long)candidate);
+                any = true;
+            }
+            if (!any) fprintf(stderr, " none");
+            fprintf(stderr, "\n");
+        }
+        // A stage pointer may carry aperture/tag bits above the title's usable GPU VA, exactly as the
+        // scalar fold's S_LOAD canonicalization assumes. Accept a dword pair as a pointer when the
+        // raw 64-bit value or either canonical form is mapped, so a tagged-but-valid table pointer is
+        // never reported as unmapped.
+        const auto pointer_is_mapped = [](uint64_t value) {
+            for (uint64_t mask : {~uint64_t{0}, uint64_t{0xFFFFFFFFFFFF}, uint64_t{0xFFFFFFFFFF}}) {
+                const uint64_t candidate = value & mask;
+                if (candidate > 0x10000 && guest_readable(candidate, 8)) return true;
+            }
+            return false;
+        };
+        if (const AgcShaderUserData* ud = hdr->user_data) {
+            uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
+            fprintf(stderr, "[udmap] %s code=0x%llx declared direct:",
+                    is_ps ? "PS" : "VS", (unsigned long long)code_addr);
+            for (uint16_t t = 0; t < ud->direct_resource_count && t < 16; t++) {
+                const uint32_t off = ud->direct_resource_offset[t];
+                if (off == 0xFFFFu || off + 1 >= kUserSgprs) continue;
+                const uint64_t candidate =
+                    (uint64_t)sgprs[off] | ((uint64_t)sgprs[off + 1] << 32);
+                fprintf(stderr, " [%u]@dw%u=0x%llx(%s)", t, off,
+                        (unsigned long long)candidate,
+                        pointer_is_mapped(candidate) ? "readable" : "UNMAPPED");
+            }
+            // Self-validating half: search the 32-dword window for the ONE seed offset at which
+            // EVERY declared direct pointer becomes a mapped guest address. If that offset equals
+            // the shader's raw user_data_range_start, the block is simply seeded from the wrong
+            // register and the metadata already said so; if no offset works, the block genuinely
+            // does not contain this shader's pointers and the seeding origin is not the defect.
+            uint32_t implied = UINT32_MAX;
+            uint32_t declared_pointers = 0;
+            for (uint16_t t = 0; t < ud->direct_resource_count && t < 16; t++)
+                if (ud->direct_resource_offset[t] != 0xFFFFu) ++declared_pointers;
+            for (uint32_t seed = 0; declared_pointers && seed < kUserSgprs; ++seed) {
+                uint32_t probe[kUserSgprs];
+                read_user_sgprs(st.sh, bases[0] + seed, probe);
+                bool all_mapped = true;
+                for (uint16_t t = 0; all_mapped && t < ud->direct_resource_count && t < 16; t++) {
+                    const uint32_t off = ud->direct_resource_offset[t];
+                    if (off == 0xFFFFu) continue;
+                    if (off + 1 >= kUserSgprs) { all_mapped = false; break; }
+                    const uint64_t value =
+                        (uint64_t)probe[off] | ((uint64_t)probe[off + 1] << 32);
+                    all_mapped = pointer_is_mapped(value);
+                }
+                if (all_mapped) { implied = seed; break; }
+            }
+            const uint32_t raw_start = hdr->specials ? hdr->specials->user_data_range_start : 0u;
+            const uint32_t raw_end = hdr->specials ? hdr->specials->user_data_range_end : 0u;
+            fprintf(stderr, " | specials raw=[%u,%u) seeded=%u implied=",
+                    raw_start, raw_end, range_start);
+            if (implied == UINT32_MAX) fprintf(stderr, "none");
+            else fprintf(stderr, "%u", implied);
+            fprintf(stderr, "\n");
+        }
         // ALL set sh registers (sorted) — finds where the user-data SGPRs actually landed, including
         // any at unexpected offsets (a wrong indirect-register decode would scatter them).
         fprintf(stderr, "[resdump]   %zu sh regs set; lowest 48 offsets:", st.sh.size());

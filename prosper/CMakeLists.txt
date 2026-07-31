@@ -284,6 +284,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_fiber PRIVATE prosper_core)
   add_test(NAME fiber_hle COMMAND test_fiber)
 
+  # #1603: libSceUlt has no implementation, so it must fail VISIBLY rather than return 0 = SCE_OK.
+  # Pure, no game dump.
+  add_executable(test_ult_fail_visible tests/test_ult_fail_visible.cpp)
+  target_link_libraries(test_ult_fail_visible PRIVATE prosper_core)
+  add_test(NAME ult_fail_visible COMMAND test_ult_fail_visible)
+
   add_executable(test_posix_sem tests/test_posix_sem.cpp)
   target_link_libraries(test_posix_sem PRIVATE prosper_core)
   add_test(NAME posix_sem_hle COMMAND test_posix_sem)
