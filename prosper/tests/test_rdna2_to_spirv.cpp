@@ -297,6 +297,22 @@ int main() {
     printf("  kernel9 mismatches=%u (out[5]=%g expect=%g)\n", bad9, got9.size()==N?got9[5]:-1, exp9[5]);
     CHECK(got9.size()==N && bad9==0, "recompiled kernel 9 (scalar s_mov/s_add/s_lshl) computes a0+30");
 
+    // Plucky Squire's post-Desk transition shader clears the top bit of a scalar-data VCC_HI
+    // lifetime before combining the two VCC dwords into a buffer address. This is the exact
+    // gfx1030 s_bitset0_b32 packet retained by the failed-dispatch capsule for #1554.
+    const uint32_t code9b[] = {
+        0xbeeb03c1u,              // s_mov_b32 vcc_hi, -1
+        0xbeeb1b9fu,              // s_bitset0_b32 vcc_hi, 31
+        0x7e00026bu,              // v_mov_b32 v0, vcc_hi
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv9b = recompile_valu(
+        code9b, std::size(code9b), 1, 0);
+    CHECK(!spv9b.empty(), "recompiled Plucky s_bitset0_b32 scalar-data sequence -> SPIR-V");
+    const std::vector<float> got9b = prosper::test::run_compute(spv9b, {0.0f}, 1, 1);
+    CHECK(got9b.size() == 1 && bits_of(got9b[0]) == 0x7fffffffu,
+          "s_bitset0_b32 clears the selected bit of its in-place scalar destination");
+
     // Kernel 10: VOP3 3-operand ops. u2=mad24(u0,u1,u1); u3=add3(u0,u1,u2); u3=bfi(u0,u1,u3);
     //            u3=bfe_u(u3, off=u0, cnt=u1); out=(float)u3.
     const uint32_t code10[] = {
