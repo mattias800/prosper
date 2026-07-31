@@ -332,9 +332,18 @@ sustained first-level gameplay at native 1920×1080: the player character and it
 parallax terrain and pine forest, volumetric fog, drifting particles, the portrait/health/ammo HUD, the
 ability bar, and the button-prompt overlay.
 
-The route is `prosper/scripts/greak/reach-gameplay.pad`. Note that the title screen only appears after a
-roughly 70-second black asset-loading phase following the intro; a capture window shorter than about
-150 seconds ends before it and misreads the load as a black-screen defect.
+The route is `prosper/scripts/greak/reach-gameplay.pad`, and gameplay is guarded by the
+`greak-gameplay` snapshot. **A capture window placed too early lands in non-gameplay content, not in
+gameplay** — profiling the route once per second across a 255-second boot measured boot and logos to
+45 s, the hand-drawn intro cutscene 46-117 s, a short dark transition 118-122 s, a *letterboxed*
+level-intro cinematic 123-130 s, and full-screen gameplay only from 131 s. Anything shorter than about
+150 seconds therefore ends before the level.
+
+Do **not** expect a long black phase while waiting: an earlier note here described "a roughly
+70-second black asset-loading phase following the intro", but that span does not render black on
+current master. 46-117 s measures 18,685-61,886 distinct colours at 0.99-1.0 non-black coverage and is
+the intro cutscene playing normally. Reading that span as a black-screen defect or a hang is the
+misdiagnosis to avoid.
 
 One shared recompiler gap was found and closed during bring-up: `s_ttracedata` (SOPP `0x16`), a
 thread-trace profiling instruction with no architectural effect, was rejecting the entire vertex stage
