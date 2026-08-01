@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include "test_scratch.h"
 
 using namespace prosper::gpu;
 
@@ -17,7 +18,7 @@ static int fails = 0;
 int main() {
     std::printf("== test_gpu_capture_bundle ==\n");
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto path = std::filesystem::temp_directory_path() /
+    const auto path = prosper_test::test_scratch_dir() /
         ("prosper-gpu-bundle-" + std::to_string(nonce) + ".prgbundle");
     const auto corrupt_path = path.string() + ".corrupt";
 
@@ -238,14 +239,14 @@ int main() {
     CHECK(!interactive_capture_bundle_active(), "frame-bundle grab is inert by default");
     record_gpu_timeline_present(1, 0, 0, 1920, 1080);
     CHECK(!interactive_capture_bundle_active(), "a present with no armed grab stays inert");
-    request_interactive_capture_bundle("/tmp/prosper_frame_grab_unit.prgbundle");
+    request_interactive_capture_bundle(prosper_test::test_scratch_file("prosper_frame_grab_unit.prgbundle"));
     CHECK(interactive_capture_bundle_active(), "F9 arms a whole-frame grab");
     record_gpu_timeline_present(2, 0, 0, 1920, 1080);   // start capturing the next frame
     CHECK(interactive_capture_bundle_active(), "the next present starts the frame (still active)");
     record_gpu_timeline_present(3, 0, 0, 1920, 1080);   // end the frame (no submits captured here)
     CHECK(!interactive_capture_bundle_active(),
           "the following present ends the frame and disarms (no re-arm)");
-    request_interactive_capture_bundle("/tmp/prosper_frame_grab_unit2.prgbundle");
+    request_interactive_capture_bundle(prosper_test::test_scratch_file("prosper_frame_grab_unit2.prgbundle"));
     CHECK(interactive_capture_bundle_active(), "the grab can be re-armed for another press");
     record_gpu_timeline_present(4, 0, 0, 1920, 1080);
     record_gpu_timeline_present(5, 0, 0, 1920, 1080);
@@ -254,7 +255,7 @@ int main() {
     // Persistent depth/stencil images can predate the captured frame (for example a shadow-atlas
     // cascade retained from the previous frame). F9 must snapshot them at the capture boundary and
     // attach them to the first submit so bundle replay does not start those planes at zero (#1307).
-    const auto ds_bundle_path = std::filesystem::temp_directory_path() /
+    const auto ds_bundle_path = prosper_test::test_scratch_dir() /
         ("prosper-f9-ds-seed-" + std::to_string(nonce) + ".prgbundle");
     unsigned ds_snapshots = 0;
     set_gpu_capture_ds_seed_snapshot_reader(

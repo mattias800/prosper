@@ -251,6 +251,10 @@ int main() {
 #ifndef _WIN32
     // WSL's /mnt/c metadata bridge reports synthetic permission bits. Verify exact POSIX chmod
     // behavior on a unique native-filesystem fixture while retaining /app0 translation above.
+    // Deliberately NOT tests/test_scratch.h (#1613): the point of this fixture is the *native*
+    // temporary filesystem's metadata semantics, and under WSL the build directory is the /mnt/c
+    // mount whose bridge is what this checks against. mkstemp already makes the name unique, and
+    // the file is empty, so neither the tmpfs quota nor a concurrent ctest case is exposed here.
     std::string mode_path =
         (std::filesystem::temp_directory_path() / "prosper-test-chmod-mode-XXXXXX").string();
     const int mode_fd = ::mkstemp(mode_path.data());
@@ -311,6 +315,7 @@ int main() {
 #else
     // The source tree can live on WSL's /mnt/c mount, whose metadata bridge truncates subsecond
     // timestamps. Exercise microsecond preservation on the native temporary filesystem instead.
+    // Deliberately NOT tests/test_scratch.h — see the chmod fixture above for why (#1613).
     std::string precision_path =
         (std::filesystem::temp_directory_path() / "prosper-test-utimes-precision-XXXXXX").string();
     const int precision_fd = ::mkstemp(precision_path.data());
