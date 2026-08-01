@@ -1,5 +1,6 @@
 #include "mb3_freelist.hpp"
 #include "gpu_execute.hpp"
+#include "../host/boot_program.hpp"   // #1659: BOOT_EBOOT (the real mapped base)
 
 #include <atomic>
 #include <cstdlib>
@@ -113,7 +114,10 @@ uint64_t discover_global_recycler_bin() {
     // DOLL's eboot address. The signature includes the following per-thread count transfer and slot
     // probe; the displacement itself is the only wildcard.
     static const uint64_t discovered = [] {
-        constexpr uint64_t kImageBase = 0x400000000ull;
+        // #1659: this SCANS guest memory for an instruction signature, so a stale base is not a
+        // labelling problem — 0x400000000 is the pre-#825 eboot address and is now a direct-memory
+        // aperture, meaning the scan swept 64 MiB of the wrong region and could never match.
+        constexpr uint64_t kImageBase = prosper::BOOT_EBOOT;
         constexpr uint64_t kScanBytes = 0x04000000ull;
         constexpr uint32_t kChunk = 0x10000;
         constexpr uint32_t kOverlap = 0x40;

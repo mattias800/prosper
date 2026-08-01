@@ -3,6 +3,7 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "hle_kernel_time.hpp"
+#include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "heap_mutex.hpp"   // #707: keep hot equeue/APR mutexes off macOS __DATA
 #include "sync_futex.hpp"
@@ -897,9 +898,10 @@ HLE(k_eq_delete) {
     return 0;
 }
 HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUseconds* timeout)
-    if (evlog()) fprintf(stderr, "[ev] WaitEqueue eq=0x%llx num=%llu timeout=%s ra=eboot+0x%llx\n",
+    if (evlog()) fprintf(stderr, "[ev] WaitEqueue eq=0x%llx num=%llu timeout=%s ra=%s+0x%llx\n",
         (unsigned long long)a0, (unsigned long long)a2, a4 ? "yes" : "inf",
-        (unsigned long long)((uint64_t)__builtin_return_address(0) - 0x400000000ull));
+        prosper::guest_module_name((uint64_t)__builtin_return_address(0)),
+        (unsigned long long)prosper::guest_module_offset((uint64_t)__builtin_return_address(0)));
     const int num = static_cast<int32_t>(a2);
     auto s = eq_find(a0);
     // Match the API's validation order: queue handle, event array, then count. EFAULT does not
@@ -920,7 +922,9 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
             const char* p = dc;
             while (*p) {
                 uint64_t off = strtoull(p, nullptr, 16);
-                const uint8_t* code = (const uint8_t*)(uintptr_t)(0x400000000ull + off);
+                // #1659: this DEREFERENCES the computed address, so the stale base did not merely mislabel —
+                // PROSPER_DUMPCODE read 0x10000000 below the intended instruction.
+                const uint8_t* code = (const uint8_t*)(uintptr_t)(prosper::BOOT_EBOOT + off);
                 fprintf(stderr, "[dumpcode] eboot+0x%llx:", (unsigned long long)off);
                 for (int b = 0; b < 224; b++) fprintf(stderr, "%02x", code[b]);
                 fprintf(stderr, "\n");
@@ -935,7 +939,7 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
             uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
             for (int i = 0; i < 160; i++) {
                 uint64_t v = sp[i];
-                if (v < 0x400000000ull || v >= 0x4c0000000ull) continue;   // eboot / IL2CPP executable range
+                if (!prosper::guest_va_in_module(v)) continue;   // any fixed guest module (#1659)
                 // A genuine caller is a return address preceded by a call: `call rel32` (0xe8 at v-5,
                 // any target — the import call goes through an in-eboot thunk, NOT straight to the
                 // stub region, so no target filter) or an indirect `call` (0xff at v-6/-3/-2).
@@ -943,9 +947,9 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
                 bool is_call = pre[3] == 0xe8 ||                            // call rel32 at v-5
                                pre[2] == 0xff || pre[5] == 0xff || pre[6] == 0xff;  // call r/m64 forms
                 if (!is_call) continue;
-                fprintf(stderr, "[waitcaller] eq=0x%llx num=%llu stack[%d] eboot+0x%llx | code@ra-0x18:",
+                fprintf(stderr, "[waitcaller] eq=0x%llx num=%llu stack[%d] %s+0x%llx | code@ra-0x18:",
                         (unsigned long long)a0, (unsigned long long)a2, i,
-                        (unsigned long long)(v - 0x400000000ull));
+                        prosper::guest_module_name(v), (unsigned long long)prosper::guest_module_offset(v));
                 const uint8_t* code = (const uint8_t*)(uintptr_t)(v - 0x18);
                 for (int b = 0; b < 0x40; b++) fprintf(stderr, "%02x", code[b]);
                 fprintf(stderr, "\n");
@@ -981,8 +985,9 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
         n++;
     }
     if (a3) *(int32_t*)P(a3) = n;
-    if (evlog() && n > 0) fprintf(stderr, "[ev]   -> delivered %d ev(s) eq=0x%llx ra=eboot+0x%llx (ident=%lld filter=%d)\n",
-        n, (unsigned long long)a0, (unsigned long long)((uint64_t)__builtin_return_address(0) - 0x400000000ull),
+    if (evlog() && n > 0) fprintf(stderr, "[ev]   -> delivered %d ev(s) eq=0x%llx ra=%s+0x%llx (ident=%lld filter=%d)\n",
+        n, (unsigned long long)a0, prosper::guest_module_name((uint64_t)__builtin_return_address(0)),
+        (unsigned long long)prosper::guest_module_offset((uint64_t)__builtin_return_address(0)),
         (long long)(ev ? ev[0].ident : 0), (int)(ev ? ev[0].filter : 0));
     // Timed wait that expired with nothing: the real API distinguishes this from success (Kyty
     // EventQueue.cpp:310 KERNEL_ERROR_ETIMEDOUT). Only reachable with a timeout arg — the infinite

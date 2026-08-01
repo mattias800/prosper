@@ -19,7 +19,8 @@
 # function at <addr> reference".
 #
 # Input is a FLATTENED ELF (p_offset==p_vaddr) as produced by tools/il2cpp/prx_to_elf.py.
-# Runtime address = module_load_base + VA (e.g. eboot base 0x400000000).
+# Runtime address = module_load_base + VA (e.g. eboot base 0x410000000; it moved from
+# 0x400000000 in #825 — see prosper/src/host/boot_program.hpp for the authoritative set).
 #
 # Usage:
 #   xref.py <module.elf> to   <hexaddr>     # who references this address

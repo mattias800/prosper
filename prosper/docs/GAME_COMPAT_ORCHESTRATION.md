@@ -125,6 +125,18 @@ count, read the last row's number.
   ran*, not of when the events happened. Print a common ordinal (`command_order`) on both and join on it. This
   is why the `order=` field exists on the `[exec] skip draw early` line — **it is not redundant with the
   register values on the same line, and removing it silently re-opens the phantom above.**
+- **A `<module>+0x<rva>` offset larger than the module's image is a labelling artifact, not a wild pointer.**
+  Guest module bases are fixed constants in `src/host/boot_program.hpp`, and they *move*: #825 relocated the
+  eboot from `0x400000000` to `0x410000000` so Astro Bot's direct-memory mapping would stop aliasing code.
+  Diagnostics that had hard-coded the old literal kept printing `eboot+0x…` against it, so every offset was
+  the real RVA **plus `0x10000000`** — an offset past the end of a 161 MB image, and one that no longer
+  round-tripped through `PROSPER_BP` (which adds the *mapped* base). #1659 converged every printer onto
+  `prosper::guest_module_name()` / `guest_module_offset()`; if you are hand-computing a base anywhere, that
+  is the bug. Two corollaries worth keeping: an address below the lowest module base is **data, not code**
+  (that region is now a DMEM aperture), and a single wide range test labelled every module in it "eboot",
+  so a wrong *binary* is as likely as a wrong offset. Static tools are unaffected — `xref.py`, `edis.py` and
+  `prx_to_elf.py` compute from ELF `p_vaddr`/file offsets and never add a runtime base, so RVAs recorded
+  from disassembly stay trustworthy.
 - **Before quoting a diagnostic's line count as a rate, grep for its cap.** These sites use a
   `static std::atomic<int>` counter or a per-key dedupe set; check for one before concluding "this fires N
   times" or "this is rare". When the site prints its own counter — `WaitRegMem #%d` *is* `ln` — the true

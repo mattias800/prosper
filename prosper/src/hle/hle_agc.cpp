@@ -9,6 +9,7 @@
 // reverse-engineered the real libSceAgc ABI. A later CommandProcessor will decode this PM4 stream to
 // Vulkan (see docs/AGC_IMPL_PLAN.md). Registered by raw NID (AGC lib is undocumented).
 #include "dispatch.hpp"
+#include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "hle_kernel_time.hpp"
 #include "gpu/pm4_registers.hpp"
 #include "gpu/command_processor.hpp"
@@ -586,7 +587,7 @@ HLE9(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, ca
         uint64_t ra = 0, ra2 = 0, ra3 = 0;
         for (int i = 1; i < 96; i++) {
             uint64_t v = stack_scan[i];
-            if (v >= 0x400000000ull && v < 0x4c0000000ull) {
+            if (prosper::guest_va_in_module(v)) {   // #1659: was a stale literal base
                 if (!ra) ra = v; else if (!ra2) ra2 = v; else { ra3 = v; break; }
             }
         }
@@ -597,10 +598,13 @@ HLE9(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, ca
             for (int i = 0; i < n && i < 16; i++) if (seen_ra[i] == key) { logged = true; break; }
             if (!logged && n < 16) {
                 seen_ra[seen_n.fetch_add(1) & 15] = key;
-                fprintf(stderr, "[agc] fence1-builder ra=eboot+0x%llx ra2=eboot+0x%llx ra3=eboot+0x%llx addr=0x%llx action=0x%llx\n",
-                        (unsigned long long)(ra - 0x400000000ull),
-                        (unsigned long long)(ra2 ? ra2 - 0x400000000ull : 0),
-                        (unsigned long long)(ra3 ? ra3 - 0x400000000ull : 0),
+                fprintf(stderr, "[agc] fence1-builder ra=%s+0x%llx ra2=%s+0x%llx ra3=%s+0x%llx addr=0x%llx action=0x%llx\n",
+                        prosper::guest_module_name(ra),
+                        (unsigned long long)prosper::guest_module_offset(ra),
+                        ra2 ? prosper::guest_module_name(ra2) : "",
+                        (unsigned long long)(ra2 ? prosper::guest_module_offset(ra2) : 0),
+                        ra3 ? prosper::guest_module_name(ra3) : "",
+                        (unsigned long long)(ra3 ? prosper::guest_module_offset(ra3) : 0),
                         (unsigned long long)a5, (unsigned long long)a1);
             }
         }
