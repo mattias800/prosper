@@ -202,7 +202,7 @@ analysed differently, or rendered to something audible offline.
 VII's own format selector (eboot `0x605b02a` in a flattened image, adjacent to the CRIWARE wrapper
 that owns the `E2020070207:sceAudioOut2PortCreate() is failed` string) is a four-armed switch that
 writes `data_format` and a channel count into parallel fields — `0x100`/1, `0x200`/2, `0x800`/8,
-and `0xc00`/**12**. That is the cross-check instrument-trap 40 asks for: a measurement whose value
+and `0xc00`/**12**. That is the cross-check instrument-trap 42 asks for: a measurement whose value
 does not come from the decode being tested. Note what it does NOT establish — the *order* of those
 12 channels appears nowhere in it.
 

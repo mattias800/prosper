@@ -403,7 +403,7 @@ current build.
   `2,310,144 B/s` figure above are both *derived from the same channel count*, so neither
   corroborates it, and "12 channels" reads as "a 7.1.4 bed with height" when the measured bed is
   stereo with ten of its twelve channels carrying nothing audible. Measure the channels before designing a fold for them; see
-  instrument-trap 40.
+  instrument-trap 42.
 - **Read the `LIFE:` totals, not a single interval.** This finding was initially called the opposite
   ("the guest submits only silence") from one report line in which port1 showed `nonzero=0/577536`.
   Playback has gaps, so any one interval can land in one; in the same run the port's run total is
