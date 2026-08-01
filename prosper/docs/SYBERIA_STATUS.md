@@ -5,7 +5,7 @@ validated route (`scripts/syberia/reach-gameplay.pad`). Two composition defects 
 on #1619.
 
 Read **`## Ruled out`** below before repeating any experiment on the "right side of the frame is
-black" question. Six hypotheses about that frame — including the one this document originally
+black" question. Seven hypotheses about that frame — including the one this document originally
 narrowed to — are falsified with evidence.
 
 ## Ruled out
