@@ -263,8 +263,20 @@ current build.
   strided buffer range that does not overlap draw 95's foreground texture. Historical title evidence
   also reached the title with this dispatch skipped, so it is not the route blocker.
 
-## Eliminated — do not re-run these
+## Ruled out — eliminated, do not re-run these
 
+- **"The failing draws run with the previous pipeline's *user data*."** This title's own
+  `[dynfail]`/`[drawpkt]` evidence founded #305 on that mechanism, and the **user-data half is now
+  falsified**: measured on the louder Nikoderiko reproduction, the block is written by the
+  *immediately preceding* bind, a handful of packets before the draw. **The PGM half still holds and
+  is not ruled out** — every sampled failing draw is the first bind-or-draw event of its own `q3`
+  fold and does inherit the previous `q1` submit's program; that inheritance is normal on a shared
+  ring, and the defect is that the inherited state is wrong. Also falsified: the
+  stale-shader-registry, missing/mis-ordered-bind, user-data-tail-alignment and TYPE-0-data-packet
+  (#140) candidates. The full falsification list with its numbers lives in
+  [`RESOURCE_BINDING.md`](RESOURCE_BINDING.md) § `Ruled out`; #305 was retitled on 2026-08-01 so its
+  title no longer asserts the dead mechanism. The observable condition that *does* hold is that the
+  programmed user-data block is **larger** than the bound pipeline's `USER_SGPR` window.
 - **The depth-only-pass RTT clobber is not the cause.** It is a real defect (#1510) and it is real for
   other titles too, but fixing it does not fix this. Three variants were built and measured; all three
   made offline replay of a captured title frame produce a `(u, v, u)` colour ramp instead of the previous
@@ -356,6 +368,6 @@ blocker.
 - The premise that no-input black means the title scene failed to render. Use the checked-in route;
   draw 92 already contains the coherent scene and authored draw 94 covers it while that UI state is
   active.
-- Everything in the **Eliminated** section above.
+- Everything in the **Ruled out** section above.
 - The two withdrawn conclusions in **Superseded analysis** — in particular, do not re-derive "draw 95
   blacks the frame"; its shader has been read and it is a no-op with the texels it receives.

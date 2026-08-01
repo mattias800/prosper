@@ -59,183 +59,84 @@ prosper/
   tests/           unit + boot + Vulkan-execution tests (ctest)
 ```
 
-Key docs to orient: `prosper/README.md` (status), `prosper/docs/ROADMAP.md`, `prosper/docs/GRAPHICS.md`,
-`prosper/docs/RENDER_LOOP.md` (the historical render bring-up log), and
-`prosper/docs/MESSENGER_BLACK_RENDER.md` (the revisioned Messenger investigation status). The current
-Dead Cells graphics status and exact regression recipe are in `prosper/docs/DEAD_CELLS_STATUS.md`.
+Key docs to orient: `prosper/README.md` (status) and `prosper/docs/ROADMAP.md` (what is planned).
+For anything title- or subsystem-specific, use the table in the next section rather than guessing.
 
-## Historical frontier (superseded 2026-07-11)
+## Where the project stands (2026-08-01)
 
-The game **boots through IL2CPP into Unity's frame loop and submits real GPU draws.** A live Vulkan
-renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V** and its real descriptors
-+ 1920×1080 sampled texture decode correctly. The **one** remaining step to the first rendered frame is
-**bindless-dynamic vertex-fetch resolution** for the vertex shader — fully specified in
-`prosper/docs/NEXT_STEP_VERTEX_FETCH.md`. This paragraph is historical only.
+`COMPATIBILITY.md` is authoritative for **per-title milestones** — 25 titles, 14 at gameplay. Do not
+duplicate it here; read it, then open the one doc named below for whatever you are about to touch.
+This section is a map, not a status report.
 
-## Current frontier (2026-07-14)
+**Concurrent game work starts with `prosper/docs/GAME_COMPAT_ORCHESTRATION.md`** — lane ownership,
+shared-GPU policy, the instrument-not-the-subject list, and the dated current handoff.
 
-The game now **boots through IL2CPP, renders its intro/title/menu, and reaches gameplay with real GPU
-draws.** The old bindless vertex-fetch frontier is complete: both shader stages recompile and dynamic
-V#/T#/S# resources resolve on current master. Do **not** start from `NEXT_STEP_VERTEX_FETCH.md`; it is
-retained as a historical bring-up record.
+### Which doc to read next
 
-The native Windows/MinGW substrate now runs the same SDL3/Vulkan frontend and normal PNG screenshot
-workflow through a routed Messenger fresh save and a fully lit first-level frame (#683). The route
-exposed a stale Windows `guest_readable` stub in dynamic-fetch folding; a `VirtualQuery` range guard
-fixes the resulting loading-time host access violation (#688). Start Windows work from
-`docs/WINDOWS_PORT_HANDOFF.md`, not the historical pre-render fence investigation.
+| Title / area | State | Read this next |
+| --- | --- | --- |
+| *The Messenger* `PPSA24651` | rung 6 — complete first level, checked against PS5 hardware; `messenger-scene` guard | `docs/MESSENGER_BLACK_RENDER.md` |
+| *Dead Cells* `PPSA15552` | rung 6 — full-colour Prisoners' Quarters; `dead-cells-gameplay` guard | `docs/DEAD_CELLS_STATUS.md` |
+| *Blasphemous 2* `PPSA13579` | rung 6 — first playable room; `blasphemous2-gameplay` guard | `scripts/blasphemous2/README.md` |
+| *Alex Kidd in Miracle World DX* `PPSA02664` | rung 6 — resolved by #1578 (generic 4 KiB mip-tail tiling); `alexkidd-gameplay` guard | `docs/PPSA02664_BLACK_WORLD.md` (historical) |
+| *Blue Prince* `PPSA25009` | rung 5 — entrance hall matches the hardware reference; by-eye play-through still outstanding | `docs/BLUE_PRINCE_STATUS.md` |
+| *Syberia: Remastered* `PPSA30140` | rung 3 — gameplay renders; menu 3D layer and gameplay composite degraded (#1619 / #1627) | `docs/SYBERIA_STATUS.md` |
+| *Dragon Quest VII Reimagined* `PPSA17942` (a.k.a. DOLL) | rung 2 — title, name entry, onboarding; composition defect and gameplay open | `docs/DRAGON_QUEST_STATUS.md` |
+| *Nikoderiko* `PPSA23760` | rung 2 — 3D world dropped; **blocked on #305**, not on the recompiler | `docs/NIKODERIKO_STATUS.md` |
+| *The Oregon Trail* `PPSA19244` | rung 0 — the guest issues no base pass; prosper decodes 100% of what it submits | `docs/OREGON_TRAIL_STATUS.md` |
+| *GRIS*, *Space Adventure Cobra*, *Sonic Origins* | rung 3 / rung 3 / incomplete dump | `docs/GRIS_SONIC_COBRA_BRINGUP.md` |
+| Astro Bot, The Plucky Squire, The Pathless | active orchestration lanes | `docs/GAME_COMPAT_ORCHESTRATION.md` |
+| Every other title | — | `COMPATIBILITY.md` |
+| UE4 / IoStore bring-up (shared) | — | `docs/UE4_APR_IOSTORE_BRINGUP.md`, `docs/CROSS_ENGINE_UE4.md` |
+| Renderer performance | July pass complete; the stop decision is recorded | `docs/RENDERER_PERFORMANCE_2026_07.md` |
+| Windows port / release | native SDL3+Vulkan frontend, screenshots, release path | `docs/WINDOWS_PORT_HANDOFF.md`, `docs/WINDOWS_RELEASE.md` |
+| GPU capture / replay / timeline tooling | F9 frame grab → offline `.prgbundle` / `.prgcap` workflow, and every `PROSPER_*` graphics diagnostic | `tools/gpu_replay/README.md`, `tools/gpu_timeline/README.md`, `tools/AGENTS.md` |
+| Graphics architecture, resource binding, recompiler | — | `docs/GRAPHICS.md`, `docs/RESOURCE_BINDING.md`, `docs/RECOMPILER_REMAINING.md` |
 
-The July native-renderer performance pass and its stop decision are documented in
-`docs/RENDERER_PERFORMANCE_2026_07.md`. Exact-byte texture decode reuse, per-submit readable-range
-reuse, output-copy removal, and corrected mixed-operation capture improve Messenger's first level
-from roughly 12 to 24 FPS. The remaining synchronous graphics/compute boundaries must be evaluated
-against a 3D workload; do not resume Messenger-specific cache work toward 60 FPS first. Windows
-release users start from `docs/WINDOWS_RELEASE.md`; build/debug work stays in the port handoff.
+### Before you form a hypothesis, read the `## Ruled out` section
 
-The save-game list is visible (#299 closed), and retaining color-disabled depth/stencil passes (#520) recovers
-the first level's source scene. The black gameplay root cause was fixed on master by #528 (`e5fce22`):
-the direct 1024x32 RGBA16F grading-LUT producer was skipped because the recompiler lacked
-`V_CVT_OFF_F32_I4`, while the live renderer also treated its offscreen target as a VideoOut-sized surface.
-Resource-producer history (#524) identified the exact writer; implementing the opcode and decoding
-`CB_COLOR0_ATTRIB2` target dimensions (#526/#527) produces the real LUT, preserves it through the original
-grading shader, and yields a visible first-level front buffer without diagnostic resource substitution.
+Every `docs/*_STATUS.md` in that table — and `PPSA02664_BLACK_WORLD.md`, `MESSENGER_BLACK_RENDER.md`
+and `GRIS_SONIC_COBRA_BRINGUP.md` — carries a **`## Ruled out`** section: one line per
+already-falsified hypothesis, the evidence that killed it, and the issue/PR link. (Blasphemous 2's
+row points at a route README, which has none.) Cross-title
+falsifications live in the area doc (`docs/RESOURCE_BINDING.md`, `docs/RECOMPILER_REMAINING.md`).
+These exist so nobody re-derives a dead answer at full cost — they are the most expensive knowledge
+in the repository. Extend them; see the recording rule under *How to work here*.
 
-Two later fixes complete the hardware-oracle composition and restore boot progression: #534 corrects reversed
-`VkFrontFace` enum translation, recovering the foreground tree, terrain/platforms, waterline, and structures;
-#541 tracks depth and stencil validity independently in persistent D32S8 surfaces, so stencil-only logo use
-cannot poison the intro's reverse-Z depth plane. A clean scripted route produced 180 native 1920×1080 frames,
-and the user confirmed the first-level graphics match the hardware reference. #530 and #540 are closed.
+The standing warnings that are **not** title-specific:
 
-*Blasphemous 2* now passes FMOD initialization (#638/#640), renders its logos/title/EULA after the corrected
-AGC marker implementation (#641), and passes the post-EULA telemetry parser after `sceHttpUriParse` gained its
-two-pass caller-pool contract (#642). Normal-return guest pthreads also leave host `%fs` active before glibc
-thread cleanup (#644), so the route loads gameplay scenes/assets without the old host crash. One-second
-poll-safe presses plus observed-state logging (#646) make the long opening reproducible under slow software
-rendering, and a native 1920x1080 capture now confirms the complete first playable room: player, HUD,
-foreground/background art, lighting, and interaction prompt. Use `scripts/blasphemous2/README.md` for the
-validated sampled-render screenshot recipe. Screenshot manifests report source and pixel progression
-separately (#648), because a newly published renderer frame can still contain byte-identical pixels. The
-remaining black-world composition was stale opaque alpha: PS5 primitive type 7 is a RectList clear, but the
-standard RDNA2 table labels 7 reserved and prosper fell back to PointList. The captured vertex shader maps
-indices 0..3 to all four clip-space corners while the guest submits count 3. #654 maps the PS5 topology to a
-Vulkan strip and invokes the fourth procedural vertex for the observed no-VB form. A 420-frame native run
-then showed full-screen moving gameplay with no accumulated tutorial glyphs.
+- **Do not restart the superseded Messenger depth, vertex-fetch, geometry, palette, or tiling
+  hypotheses without contradictory new evidence.** Each is falsified with evidence in
+  `docs/MESSENGER_BLACK_RENDER.md` § Ruled out. The real cause was a missing recompiler instruction
+  plus loss of per-target dimensions (#526/#527, fixed by #528), with #534 and #541 behind it.
+- **Do not resume Messenger-specific renderer cache work toward 60 FPS.** The July pass deliberately
+  stopped at roughly 12 → 24 FPS on the first level; the remaining synchronous graphics/compute
+  boundaries must be evaluated against a **3D** workload first (*Summer Sports Games* `PPSA03416` is
+  the first clean candidate). `docs/RENDERER_PERFORMANCE_2026_07.md`.
+- **Start Windows work from `docs/WINDOWS_PORT_HANDOFF.md`**, not the solved pre-render fence
+  investigation; Windows *release* users start from `docs/WINDOWS_RELEASE.md`.
+- **A historical capture hash is not a current renderer oracle**, and neither is a target extent or a
+  raw draw count on its own. Addresses and operation ordinals are run-local. Re-derive the selector
+  with `gpu_timeline --signatures` / `--select` before recording a new bundle.
+- **`PROSPER_UD_TAIL_ALIGN` must stay off.** It exists only so the A/B that falsified the
+  user-data-tail hypothesis stays reproducible (`docs/RESOURCE_BINDING.md` § Ruled out).
+- **Read `GAME_COMPAT_ORCHESTRATION.md`'s instrument-not-the-subject list before believing any
+  surprising measurement** — fourteen phantom defects have come from the apparatus rather than the
+  subject, and several cost hours. Two of its positive rules bind on any graphics investigation, not
+  just orchestrated ones: **a decoded-draw census is meaningless without the render phase and a
+  positive control** (draw counts vary by two orders of magnitude *within one title* — count per
+  sample interval, calibrate against a title known to render the thing you claim is missing, and
+  open the frames), and **prefer experiments that detect their own invalidity** over experiments that
+  can fail silently. Check a diagnostic's rate limit before quoting its volume as a frequency, and
+  check whether it clears `live_gpu_targets` before comparing it against a default run.
 
-Cross-title breadth has advanced: *Dead Cells* now starts reliably after both AGC resource-registration output
-queries were implemented (#544, #660). The old success stubs left stack data in the max-name and required-memory
-outputs, causing intermittent multi-gigabyte stack or texture-pool allocations. Its
-exercised NGS2 lifecycle returns initialized sizes/handles/state and silent output (#554), and a late render
-window reaches the Evil Empire splash. #545 was software-render throughput, not a guest deadlock: synchronous
-3840×2160 llvmpipe rendering stretches its ~13,000-submit startup into minutes.
+### Superseded documents
 
-Dead Cells now has a deterministic route through splash/menu into full-color gameplay.
-Version-4 `.prgcap` captures seeded temporal RTT inputs (#568) historically isolated the earlier warmup artifact
-at draw 18; one 642x362 input had no prior color-target writer. The kernel-derived dispatch
-thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V# binding (#574)
-now execute the real fill kernel against guest buffers before submit completion (#576). Range provenance proved
-draw 19 consumes one backing, dispatch 5 fills it, then draw 31 consumes it again in one submit. Graphics spans and
-compute now execute by retained PM4 order (#584), fixing that future-read. The later overbright screenshot was a
-warmup artifact: the 35-second render delay skipped a 642x362 RTT producer, then a replace-copy sampled dispatch
-4's raw all-`0xFF` backing and cached it indefinitely. `PROSPER_RENDER_TARGET_DIM=642x362` preserves the real
-opening vignette/level geometry; #586 established a practical late checkpoint with that history intact. The
-residual seeded replay mismatch (#569) exposed persistent depth/stencil state outside color RTT seeds. The
-faithful closure reuses one 642x362 depth identity, but timeline-v5 backing provenance proves compute fills its
-HTILE allocation before drawing; #611 now invalidates the detached Vulkan DS cache on that guest GPU write.
-The Dead Cells splash regression guard is now a run-level content check: after a three-second renderer warmup,
-the richest frame in a 20-second window must contain at least 1,500 distinct colors. This replaces the historical
-animation-sensitive exact-frame contract from #573/#596.
-
-The current tooling frontier is deterministic offline capture rather than longer live-render windows.
-Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact-submit selector can materialize
-immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a version-8 `.prgcap` (#594/#569).
-`gpu_replay --graph` / `--graph-json` now resolve in-submit versions and temporal read-before-write leaves (#600;
-full workflow: `prosper/tools/gpu_replay/README.md`). Timeline version 6 retains the version-5 bounded same-run
-target/depth history and adds compact per-draw target spans for offline scene selection. Ordered `.prgbundle`
-windows now capture producer-time submits with content-defined
-cross-submit deduplication and replay them through one persistent renderer (#603). Dead Cells depth 16 resolves
-all 30 internal temporal edges in submits 18735..18750 while storing 2.883 GiB logical data in 166.3 MiB, but
-the earliest submit still has two unseeded 642x362 leaves. Full-run aggregation places their first observed
-graphics writers around submit 17,400 and records roughly 1,200-1,350 writes before the selected submit (#604).
-A transparent-zero boundary A/B yields the exact unseeded hash, so zero initialization is not the missing state.
-Bundle v2 (#606) now uses fault-safe bulk guest reads plus an exact shared-resource chunk dictionary: a fixed
-1,200-submit full-state run folded 122.97 GiB into 301.1 MiB in 169.4 seconds. Semantic endpoints, rolling
-windows, successful-only exit, final compaction, and `gpu_replay --bundle-tail` prevent timing drift and replay
-holes. A compact two-submit closure resolves both 642x362 edges with no bounded leaves, but its 80-draw endpoint
-is the opening vignette rather than gameplay. The preserved #608 playable bundle used exactly 90 semantic draws
-and the 738x420 target at draw 79..81. Current routes use 91..94 draws, exactly 8 dispatches, and the 636x420
-target at draw 77..85; timeline selection isolates sustained gameplay without depending on run-local submits.
-Target extent or total draw count alone also selects cinematic/transition frames and must not be used as the
-oracle. This checkpoint established the stable offline baseline used to isolate the composition defects.
-The faithful playable bundle spans submits 18,165..19,047, stores 158.94 GiB logical state in 739 MiB, and
-resolves all 1,764 temporal image dependencies. Its pre-#611/#615 historical hash was `5759c125812154dc`; do
-not use that old absolute hash as a current renderer oracle. A two-submit color-bounded replay remains
-`71b84bdfae53933c`; `gpu_replay --bundle-find-ds ADDR` scans manifest-only DS use in seconds and proves
-the shared surface has no draw/register clear intent. The missing hardware boundary is now identified and
-implemented (#611): timeline-v5 retains complete raw DS programming plus optional guest backing hashes/writer
-provenance, which found compute program `0x401aec200` filling the exact 32 KiB HTILE allocation with
-`0xfffffff0` before scene drawing. Guest GPU writes notify the live backend, and overlapping persistent Vulkan
-DS entries become invalid so the next use follows the existing compare-derived clear path. A routed live A/B
-restores the foreground/platform/HUD layers that remain black with invalidation disabled. The explicit
-`--legacy-htile-before-stencil` switch supplies the omitted HTILE identity only for the preserved pre-v6 bundle.
-Capture v8 closes the exact offline boundary (#569). Current #611-enabled full-bundle and standalone output are
-both `fac9ca4cbbba8196`. An invalidation-disabled stale-depth A/B is `535256588b67a536` in both paths with
-byte-identical BMPs; the self-contained capsule carries 12 RTT surfaces, one 929,616-byte 642x362 D32S8 depth
-plane, effective DS lifetime/legacy settings, and the 33,177,600-byte source oracle. Standalone replay takes
-about 3.3 seconds instead of roughly 24 minutes.
-The four repeated Dead Cells fragment failures were canonical VCCZ-exit light-accumulation loops. #615 adds a
-stage-specific proof: every VOPC input must be scalar/inline/literal or have a nearest overlapping VGPR
-definition from an unmodified uniform VOP1 move/conversion. Only then can the wave-empty VCC test lower to a
-per-invocation structured loop; varying bounds and compute remain fail-visible. `shader_inspect` decodes raw
-`PROSPER_SHADER_DUMP` files with exact dword PCs and branch targets. Current live gameplay samples realize all
-semantic draws. Capture v7 (#618) retains a failed stage fault-safely through `s_endpgm` or a 64 KiB cap,
-content-deduplicates it, and records exact coverage/opcode/PC, decoded pipeline/launch state, and
-resource/descriptor summaries. Start with `gpu_replay --inspect-only`; extract a raw stage with
-`--dump-failed-shader FAILURE:STAGE PATH` instead of rerunning the title.
-
-The remaining Dead Cells color defect was fixed by #626. Its world shaders emit color exports in descending
-MRT3..MRT0 order; the single-attachment recompiler incorrectly used the first export, presenting a grayscale
-G-buffer plane as color0. Selecting MRT0 restores the full-color Prisoners' Quarters composition. The same PR
-also exposes the directly placed destination V# for a format-copy compute shader, taking the current checkpoint
-from seven to eight realized dispatches. #566 is closed. Use `prosper/docs/DEAD_CELLS_STATUS.md` for the current
-route and regression workflow rather than restarting the completed composition localization.
-
-The later giant translucent gameplay surface was native-format loss (#773). Draw 23 sampled a 642x362
-`Float16x4` lighting target that the backend had rendered and reuploaded as RGBA8, clamping its HDR data.
-Renderer-owned targets now preserve `VK_FORMAT_R16G16B16A16_SFLOAT` through attachments, readback/seed bytes,
-sampled images, and persistent target/texture/pipeline cache identities. Capture v13 tags RTT seeds as `rgba8`
-or `rgba16f` and reads v1..v12 artifacts. The current semantic selector is documented in
-`prosper/docs/DEAD_CELLS_STATUS.md`; do not reuse the historical 738x420 predicate for new captures.
-
-The first FP16 live run then exposed stale temporal history (#780), not another shader defect. Compute operation
-19 resets the same lighting backing to RGBA16F `(0,0,0,1)` before draws 17..22, but guest-write notification
-invalidated only the persistent Vulkan target; the frontend immediately uploaded the previous frame's CPU RTT
-copy as a seed and brightness fed back toward white/yellow. Guest GPU writes now discard overlapping CPU RTT
-entries using their native byte width as well as invalidating GPU targets. Live user validation reports stable,
-artifact-free composition apart from separately tracked window-light banding (#781). The corrected 77-submit
-source and standalone capsule are byte-identical at `13b4ccdfa15b1f4d`.
-The #781 investigation localizes that residual pattern to the additive window-light visibility pass and rejects
-depth, history-alpha, simple sampler-filter, and perspective-interpolation explanations. It remains open and
-deprioritized; see `docs/DEAD_CELLS_STATUS.md` before repeating live experiments. Successful raw RDNA2/SPIR-V
-pairs can now be captured with `PROSPER_SHADER_DUMP_SUCCESS=DIR` for offline inspection.
-Capture v19 also retains the exact bounded raw VS/FS source for every realized draw; export one offline with
-`gpu_replay --dump-realized-shader DRAW:vs|fs PATH` and inspect it with `shader_inspect`.
-
-`--bundle-final-capsule` snapshots both color RTT state and exact valid planes from persistent Vulkan
-depth/stencil images into capture v8 (#569). Capture v8 reads v1-v7 artifacts; pre-v7 failed-operation diagnostics
-report unavailable and pre-v8 captures contain no invented DS seeds. Timeline v6 reads timeline v1-v5
-artifacts. Addresses and operation ordinals are run-local. Use
-`gpu_timeline FILE --signatures DRAWS DISPATCHES` to discover target spans and `--select` to validate the exact
-live-capture predicate before recording another detailed bundle. The Dead Cells splash guard deliberately
-uses `min_colors=1500` rather than an exact hash: unchanged builds select multiple valid animation states with
-1,650-1,698 distinct colors, while observed partial transitions contain only about 325-339.
-`PROSPER_PROVENANCE_DIM=WxH` reports overlapping color, compute, DMA_DATA, and WRITE_DATA writers with
-submit/item/PM4 ordinals.
-`PROSPER_RESOURCE_HASH_DIM=WxH` correlates raw and sampled hashes with those writers at each live draw;
-`PROSPER_TARGET_STEP_HASH_DIM=WxH` plus `PROSPER_TARGET_STEP_HASH_MIN_DRAWS=N` prefix-bisects a target
-pass using content metrics without writing per-draw images.
-`PROSPER_DESCRIPTOR_VALIDATE=strict|poison` and `gpu_replay --validate` are landed capabilities from #515.
-Do not restart the superseded
-Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without contradictory new evidence.
+`docs/NEXT_STEP_VERTEX_FETCH.md` (bindless-dynamic vertex fetch, superseded 2026-07-11) and
+`docs/RENDER_LOOP.md` (the render bring-up log) are historical records. Both frontiers are complete:
+both shader stages recompile and dynamic V#/T#/S# resources resolve on current master, and the
+render-loop frontier is complete. Each carries its own superseded banner — do not start work from
+either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
 
 ## How to work here
 
@@ -243,6 +144,15 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   subagent contract, shared-GPU policy, evidence/PR cadence, and the dated current handoff for active title lanes.
   Update its current-state sections when ownership, evidence, or the exact frontier changes; keep detailed findings in
   GitHub issues so the document remains a discoverable map rather than the only record.
+
+- **A PR that falsifies a hypothesis records it in the relevant `## Ruled out` section before merging** —
+  the same way instrument traps are recorded in `GAME_COMPAT_ORCHESTRATION.md`. One line: the dead
+  hypothesis, the evidence that killed it, and the issue/PR link. Title-specific → that title's status
+  doc; cross-title → the area doc (`RESOURCE_BINDING.md`, `RECOMPILER_REMAINING.md`, …). A falsification
+  that lives only in a PR body or an issue comment is one the next agent will re-derive at full cost.
+  **A result reported only in a message to an orchestrator is not in the project record at all** — if a
+  lane reports an A/B to you, land it in the doc or the issue before the session ends. Read the
+  `## Ruled out` section of every doc you are about to work in **before** forming a hypothesis.
 
 - **Work in your OWN git worktree — the main checkout is shared.** Several agents (and the human)
   run this repo concurrently, so the main working directory and its build dir are contended:

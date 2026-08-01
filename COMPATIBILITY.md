@@ -30,7 +30,7 @@ Last updated: 2026-08-01
 | *Earthion* | `PPSA28061` | Custom (Ancient) | 🚧 Developer logo, intro story text and CRT bezel render; the 320×224 game picture inside the bezel is still missing |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🔬 Boots deep into the UE4 frame loop with real GPU work; presented frames are still a flat colour |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Audio and sound bank initialise; the game's own code lives in a runtime-loaded PRX that prosper cannot yet load |
-| *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Warning screen, publisher logo, title screen and EULA render at native 3840×2160 with no code changes; the 3D world is dropped by a descriptor-provenance gap |
+| *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Warning screen, publisher logo, title screen and EULA render at native 3840×2160 with no code changes; the 3D world is dropped because the programmed user-data block is larger than the bound pipeline's user-SGPR window (#305) |
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
@@ -472,12 +472,15 @@ Renders its epilepsy warning, the Knights Peak publisher logo and the full title
 3840×2160 on unmodified master, with no code changes. A scripted route continues into the legible
 MY.GAMES EULA dialog.
 
-The **3D world** is what is missing, and the cause is named: 246 recompiler rejections, each preceded
-by an unresolved MIMG or MUBUF descriptor (`srt_tag=NONE key_res=null pc_res=null`). The 8-SGPR
-`SRSRC` range is **computed inside the shader**, so `sreg_range_written` is set and the user-data
-fallback is skipped, dropping 66 draw pipelines. The opcodes themselves are all implemented — this is
-descriptor provenance, not instruction coverage, and the fix is shared recompiler infrastructure
-likely to help other Unreal titles. Tracked on #1607.
+The **3D world** is what is missing, and the cause is named. The original reading — that the 8-SGPR
+`SRSRC` range is *computed inside the shader* and defeats descriptor provenance — was measured and
+**falsified**; the fetch is the canonical bindless-dynamic form the recompiler already handles. The
+real blocker is upstream, in graphics register state: for 11 of 13 traced vertex stages the user-data
+block the guest most recently programmed is **larger** than the bound pipeline's user-SGPR window, so
+the shader dereferences a V# tail as a pointer, the const-fold correctly refuses to invent a
+descriptor, and 25 distinct `(es, ps)` pipelines are dropped. That is #305, for which this title is
+the loudest reproduction. Status, evidence and the falsification list are in
+[`prosper/docs/NIKODERIKO_STATUS.md`](prosper/docs/NIKODERIKO_STATUS.md); tracked on #1607 and #305.
 
 ## The Oregon Trail — `PPSA19244`
 
@@ -489,7 +492,17 @@ An offline capture shows the entire Unreal post-process chain intact (HDR scene 
 pyramid from 960×540 down to 60×34, tonemap, a 32×32×32 LUT, front-buffer composite) and replays
 byte-exactly. The decisive measurement is upstream of all of it: dumping the seed for the 1920×1080
 HDR scene-colour target shows it is *already* uniformly black on entry. **The image is gone before
-post-processing runs**, so the base pass is where to look. Tracked on #1606.
+post-processing runs**, so the base pass is where to look.
+
+Follow-up measurement moved the question out of the GPU subsystem entirely: prosper consumes the
+whole command stream with no unrecognised opcodes and no unimplemented submit path, and **the guest
+clears its 3840×2160 scene target every frame and then draws nothing into it** — about 23 decoded
+draws per frame, which is a post-process chain with no world underneath. Prosper is faithful here;
+the empty base-pass draw list is upstream, on the CPU side. Status, the four killed leads, and the
+reproduction are in
+[`prosper/docs/OREGON_TRAIL_STATUS.md`](prosper/docs/OREGON_TRAIL_STATUS.md); tracked on #1606 and
+#1641.
+
 ## Syberia: Remastered — `PPSA30140`
 
 <p align="center">

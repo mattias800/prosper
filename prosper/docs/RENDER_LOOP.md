@@ -1,5 +1,13 @@
 # The render-loop frontier — post-boot-wall (2026-07-06)
 
+> **SUPERSEDED — historical bring-up log.** This document's "Status: open" below refers to July 2026.
+> That frontier is complete: The Messenger renders its complete first level at native 1920x1080,
+> checked against PS5 hardware, and fourteen titles reach gameplay. Do not start work from this
+> document or treat its open questions as current. Current status is in
+> [`../../COMPATIBILITY.md`](../../COMPATIBILITY.md) and the per-title docs named in `CLAUDE.md`; the
+> Messenger record specifically is [`MESSENGER_BLACK_RENDER.md`](MESSENGER_BLACK_RENDER.md). The
+> remainder is retained as implementation history.
+
 **Status:** open (the next big frontier). The GfxDevice boot wall is RESOLVED (see
 `GFXDEVICE_BRINGUP_PROBLEM.md`); the game now boots into asset loading + its frame loop but does not yet
 render. This documents exactly where it is and what's needed, so the next session picks up cleanly.

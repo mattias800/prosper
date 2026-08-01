@@ -68,6 +68,27 @@ The old bindless vertex-fetch frontier is solved, and `NEXT_STEP_VERTEX_FETCH.md
 vertex-color binding were made on changing revisions and were later overturned. Do not combine them into a
 new proof without reproducing them against the retained capsule or a fully recorded current-master run.
 
+## Ruled out
+
+One line per dead hypothesis, the evidence that killed it, and where that evidence lives. **Do not
+restart any of these without contradictory new evidence** — this is the list `CLAUDE.md` points at.
+
+| Hypothesis for the black first level | Verdict and evidence | Source |
+|---|---|---|
+| Depth / stencil state | **Not the cause.** Replaying draws 0:30 of the retained capsule already produces the real first-level landscape (56,036 RGB-nonblack px); the frame is lost later, at the grading pass. The separate D32S8 validity defect (#541) was a *boot-progression* fix, not the black-level cause. | #300 / #522, #520 |
+| Vertex fetch / bindless-dynamic descriptor resolution | **Solved and closed.** Both stages recompile and dynamic V#/T#/S# resolve on master. `NEXT_STEP_VERTEX_FETCH.md` is a historical bring-up record and carries its own superseded banner — do not start from it. | #514, #515 |
+| Geometry, transform collapse, or a missing vertex-colour binding | **Overturned.** These #300-era claims were made on changing revisions and were later contradicted; geometry, vertex fetch and asset textures are demonstrably working in the same capsule that renders black. Do not recombine them into a new proof without reproducing them against the retained capsule or a fully recorded current-master run. | #300 |
+| The 256x16 pixel-art palette fade is stuck | **Falsified.** A repaired hardware-breakpoint trace observes `PaletteSwapImageEffect.FadeBlackToGameCoroutine.MoveNext` progress through all eight entries and complete, with eight distinct native texture pointers and matching live descriptor addresses. | #525 |
+| Detiling of the 256x16 palette | **Not the cause.** That pass is transitional; it produces the expected coloured scene, which the grading pass then erases. | #525 |
+| A compute dispatch bakes the 1024x32 grading LUT | **Falsified.** Retained per-dispatch state contains no matching direct 1024x32 image; the writer is raw *draw* 40 in the same submit, immediately before the grading consumer. | #524 |
+| Texture decode / alpha / render-target propagation | **Overturned**, same provenance as the geometry claims above. | #300 |
+
+**The actual root cause**, for contrast: a missing recompiler instruction (`V_CVT_OFF_F32_I4`, VOP1
+`0x0e`, #526) in the LUT producer plus loss of per-target dimensions (`CB_COLOR0_ATTRIB2`, #527),
+fixed together by #528 (`e5fce22`); then two follow-ups the black frame had been hiding — reversed
+`VkFrontFace` translation (#534) and depth/stencil validity tracked independently in persistent D32S8
+surfaces (#541). The formerly invisible save-game list was #299.
+
 ## Evidence policy
 
 Every new finding posted to #300 or #522 must include:
@@ -154,9 +175,9 @@ into a scrub-and-look instead of a guess, and is the recommended first step of t
 
 ## Decision boundary
 
-Do not start another depth/stencil, vertex-fetch, palette-fade, compute, tiling, or whole-stack rewrite from the
-historical #300 comments. The producer, missing opcode, target extent, consumer, and front-buffer result are now
-connected by one live trace. Preserve that chain as the regression boundary and use the same provenance-first
+Do not start another depth/stencil, vertex-fetch, geometry, palette-fade, compute, tiling, or whole-stack rewrite
+from the historical #300 comments — see `## Ruled out` above for the evidence against each. The producer, missing
+opcode, target extent, consumer, and front-buffer result are now connected by one live trace. Preserve that chain as the regression boundary and use the same provenance-first
 method for the next title failure. Dead Cells startup is stable and its Evil Empire splash is captured
 (#539/#545 closed); active work has moved to practical software-render progression capture (#549), reusable
 checkpoints/snapshots (#302/#248), late offline-service contracts (#552), and existing 3D Unity/Unreal workloads.

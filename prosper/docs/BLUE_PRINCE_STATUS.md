@@ -148,7 +148,7 @@ were confirmed as legitimate frustum culls.
 - The #1352-era scissor three-stage traces are parked on branch
   `fix/issue-1335-regindirect-tags`.
 
-## Do-not-redo list
+## Ruled out (do-not-redo list)
 
 Exonerated with evidence (do not re-chase without new contradictory evidence): present staleness,
 capture transposition, texture/descriptor decode for the Day One hold (#1287/#1334/#1335 record);
@@ -158,3 +158,8 @@ do not reopen a light-accumulation-math hypothesis for it; if rings reappear, ch
 interpolant-resolution path first. Likewise the "dark slab"/sloped-floor artifact is CLOSED
 (#1427) — missing geometry from a truncated buffer upload, not a misplaced or mis-transformed
 surface; if large geometry disappears again, run `PROSPER_DRAW_STATS` before any shading theory.
+
+Also closed: the **27 draws that still vanish at clip in the entrance hall are not a defect**. Each
+was individually probed and confirmed as a legitimate frustum cull, and the transparent passes
+reproduced the same off-screen bounds as their opaque passes (#1435/#1443). Do not re-open a
+vanished-draw triage for that room without a *new* symptom.

@@ -4,8 +4,42 @@ Unity / IL2CPP, Microids / Virtuallyz Gaming. **Rung 3 — gameplay reached** wi
 validated route (`scripts/syberia/reach-gameplay.pad`). Two composition defects remain, both tracked
 on #1619.
 
-Read this before repeating any experiment on the "right side of the frame is black" question. Three
-hypotheses about that frame are **falsified** below; do not re-run them.
+Read **`## Ruled out`** below before repeating any experiment on the "right side of the frame is
+black" question. Seven hypotheses about that frame — including the one this document originally
+narrowed to — are dead: four falsified with evidence, three rejected as not-the-cause or not
+established.
+
+## Ruled out
+
+One line per dead hypothesis, the evidence that killed it, and where that evidence lives. Do not
+re-derive these without contradictory new evidence.
+
+| Hypothesis | Verdict and evidence | Source |
+|---|---|---|
+| The published screenshot caught an unfinished slide-in animation | **Falsified.** The panel settles at t=183 s and holds byte-identical for the next 57 s (`crc32=453d400c`, 107,936 distinct colours). | #1619 |
+| A scissor or viewport clips draws to the left of the frame | **Falsified.** Every realized draw's `viewport=` and `scissor=` covers its **full** target (1920x1080, or the 2048² / 1024² / 512² shadow-atlas extents). | #1619 |
+| The menu is a flat 2D screen with nothing to draw on the right | **Falsified.** The frame is 472 draws + 81 dispatches with 2048² shadow cascades, 512² spot shadows, `R11G11B10F` HDR targets and a 960x540→15x8 bloom pyramid. It renders a real lit interior. | #1619 |
+| The `R11G11B10F` gap in `set_live_target_image_written_notifier` is what blacks this frame | **Falsified as the mechanism for this frame** (the *defect* is real and is fixed by #1626). A routed live A/B — same route, same timings, no diagnostics in either arm, differing only in the notifier line — produced a **byte-identical** settled menu (`md5 1fc612606b4e32adc89db9bfd35c92b2`, `crc=bdf7a33a` for every capture from t=165 s to t=220 s), and the right ~55% is still pure black. The verdict rests on that A/B alone and does not need the mechanism. The mechanism, offered as the explanation: the notifier is called from exactly one site (`live_compute.cpp`, guarded by `bi.mirror_result_to_imported`) which the seed-skip path excludes, so it provably cannot fire for a write-only binding proved to cover every texel. That implication is verified by code; its **premise** — that this dispatch's binding 23 took the seed-skip path — rests on a `[seed-skip-verify]` line **recorded once in this issue's body and never re-observed**, which independent review could not confirm either. Treat the premise as a recorded observation, not re-derived fact. | #1619 comments, PR #1626 |
+| The offline localization transfers to the default render path | **Not established — do not assume it does.** `PROSPER_RTTLOG` and `PROSPER_RESOURCE_HASH_DIM` both clear `live_gpu_targets` (`live_renderer.cpp:933`) and force the **CPU readback** RTT path. The frame is black on both paths, but reproducing on both does **not** make it the same mechanism on both; the issue's own wording is "black on both, by (at least partly) different code". The chain in `## Where the scene dies, exactly` is sound about the CPU-readback path only. | #1619 comments |
+| The ten `reason=shader-recompile` dispatches black the scene | **Not the cause.** The lit composite is already correct at draw 465, after all ten have been skipped. They are real FATAL gaps per `CLAUDE.md` and are tracked separately on #1628. | #1619, #1628 |
+| The `[agc] WaitRegMem … dependency violated` burst at t≈129 s is a finding | **Not a measurement.** The diagnostic is capped at 40 printed lines (`command_processor.cpp:2450`) and the counter in the message is the true total; an unsatisfied wait is documented in the code as normal handled state. The same over-read was recorded independently on Oregon Trail (#1606) and as instrument trap #13 in `GAME_COMPAT_ORCHESTRATION.md`. | #1619, #1606 |
+
+**Still open:** what blacks this frame on the **default** path. Establish first whether the mirrored
+write path is taken for that dispatch at all — `PROSPER_COMPUTELOG_CODE=<code_addr>` is outside the
+`live_gpu_targets` exclusion list and therefore observes the real path, but guest code addresses are
+run-local, so the recorded `0x2134c14100` cannot be pre-seeded from an older run (a fresh run confirms
+it does not appear); filter by `PROSPER_COMPUTELOG_SIZE` or take the full trace.
+
+**The leading unverified hypothesis for the default path**, stated so the next agent has a start, not
+as a finding: a seed-skipped write-only storage binding still runs the ordinary writeback — it reads
+the storage image back, packs the guest bytes, and calls `notify_guest_gpu_write`. That guest write
+invalidates every overlapping renderer-owned target and erases the CPU RTT entry, and because the
+mirrored-write path was skipped, **nothing republishes it** — the same end state the notifier bug
+produced, reached by a different route. If that is right the contract is broader than the one #1619
+states: *a compute dispatch that fully overwrites a renderer-owned target must leave the renderer
+owning the result, whether it got there through a seeded mirrored write **or** through a proven
+full-coverage write-only store.* To confirm or kill it, check whether `bi.imported` is true for that
+storage binding on the default path, and whether the target is re-established for draw 469.
 
 ## Route and timing (Linux, hardware Vulkan, RADV, 1920x1080)
 
@@ -44,13 +78,7 @@ question until a capture says otherwise.
 layer** of the menu is black; the UI layer (leather panel, boarding passes, copyright) survives and
 happens to occupy only the left 45%.
 
-Falsified along the way:
-
-| Hypothesis | Outcome |
-|---|---|
-| The screenshot caught an unfinished slide-in animation | **Falsified.** The panel settles at 183 s and holds byte-identical for 57 s. |
-| A scissor or viewport clips draws to the left of the frame | **Falsified.** Every realized draw's `viewport=` and `scissor=` covers its **full** target (1920x1080, or 2048x2048 / 1024x1024 / 512x512 shadow atlas extents). |
-| The menu is a flat 2D screen with nothing to draw on the right | **Falsified.** The frame is 472 draws + 81 dispatches with 2048² shadow cascades, 512² spot shadows, `R11G11B10F` HDR targets and a 960x540→15x8 bloom pyramid. It renders a real lit interior. |
+The hypotheses falsified along the way are listed in `## Ruled out` above.
 
 ### The pass chain in one settled frame
 
@@ -109,7 +137,13 @@ cache entry on a `color_plane` overlap.
 
 Draw 469 (order `1455541`) is the next consumer and reads black.
 
-### Narrowed: `R11G11B10F` is missing from the compute write-back notifier
+### Narrowed: `R11G11B10F` is missing from the compute write-back notifier — real defect, **not this frame's mechanism**
+
+> **Superseded as a diagnosis for this frame.** The gap below is real and is fixed by #1626, but a
+> routed live A/B showed the settled menu is byte-identical with and without that fix, and the
+> notifier provably cannot fire for this dispatch's seed-skipped write-only binding. See
+> `## Ruled out`. The rest of this section is retained because the format contract it states is
+> correct and the fix is landed.
 
 `0x2110310000` is `fmt=122` = `R11G11B10_FLOAT` (`VK_FORMAT_B10G11R11_UFLOAT_PACK32`).
 `LiveTargetPixelFormat` (`src/gpu/gpu_execute.hpp:566`) has three members, and `R11G11B10Float` is
