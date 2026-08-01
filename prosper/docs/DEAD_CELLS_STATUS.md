@@ -91,6 +91,22 @@ The important fixes already on `master` are:
 The producer-complete post-#626 checkpoint realizes every semantic draw and all eight dispatches. Descriptor
 validation has not identified a missing or undersized binding in the exercised frame.
 
+## Ruled out
+
+One line per dead hypothesis, the evidence that killed it, and where that evidence lives. Do not
+re-derive these without contradictory new evidence.
+
+| Hypothesis | Verdict and evidence | Source |
+|---|---|---|
+| The title deadlocks in the guest before gameplay | **Falsified.** It is software-render throughput: synchronous 3840x2160 llvmpipe rendering stretches the ~13,000-submit startup into minutes. | #545 (closed) |
+| The overbright / mostly-white repeated-block image is the composition bug | **Falsified — it is a warmup artifact.** A 35-second render delay skipped a 642x362 RTT producer, then a replace-copy sampled a dispatch's raw all-`0xFF` backing and cached it indefinitely. **Do not use a sparse-render or late-started screenshot as a colour oracle.** | #586 |
+| The two unseeded 642x362 temporal leaves are simply uninitialized (zero) | **Falsified.** A transparent-zero boundary A/B yields the *exact* unseeded hash, so zero initialization is not the missing state. Full-run aggregation places their first observed graphics writers around submit 17,400, with roughly 1,200–1,350 writes before the selected submit. | #604, #606 |
+| The shared depth/stencil surface is missing a draw- or register-programmed clear | **Falsified.** `gpu_replay --bundle-find-ds ADDR` scans manifest-only DS use in seconds and proves the surface has no clear intent. The real boundary was a compute program filling that surface's exact 32 KiB HTILE allocation with `0xfffffff0` before scene drawing. | #611 |
+| A target's extent, or its total draw count, identifies the gameplay scene | **Falsified.** Either predicate alone also selects cinematic/transition frames. Use the semantic selector in `## Recreate the regression checkpoint`; the historical 738x420 / 90-draw predicate from the preserved #608 bundle no longer selects gameplay. | #608, #773 |
+| The residual window-light banding (#781) is depth, history alpha, sampler filtering, or perspective interpolation | **Each independently rejected.** Disabling depth, forcing linear filtering on draw 19's history input, and switching its varying to non-perspective interpolation all left the output unchanged. Forcing linear filtering on draw 23's FP16 light input *did* soften the standalone image, but a matching live run retained the visible radial bands — so that override is not a fix. | #781 (open, deprioritized) |
+| An exact-frame hash is a valid splash regression contract | **Falsified — it is animation-sensitive.** Unchanged builds select multiple valid animation states with 1,650–1,698 distinct colours, while observed partial transitions contain only about 325–339. The guard is therefore a run-level content check (`min_colors=1500`) rather than the historical exact-frame contract. | #573, #596 |
+| The pre-#611/#615 bundle hash `5759c125812154dc` is a renderer oracle | **No — historical only.** So is the preserved #608 bundle: it was captured before #615 and its final submit has five holes that capture-v8 migration represents explicitly as `Unknown`. Current #611-enabled output is `fac9ca4cbbba8196`; the corrected post-#780 source and capsule are `13b4ccdfa15b1f4d`. | see `## Evidence boundary` |
+
 ## Evidence boundary
 
 The preserved #608 bundle is useful historical evidence, but it is not a current live-frame oracle. It contains

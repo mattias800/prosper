@@ -244,6 +244,13 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   Update its current-state sections when ownership, evidence, or the exact frontier changes; keep detailed findings in
   GitHub issues so the document remains a discoverable map rather than the only record.
 
+- **A PR that falsifies a hypothesis records it in the relevant `## Ruled out` section before merging** —
+  the same way instrument traps are recorded in `GAME_COMPAT_ORCHESTRATION.md`. One line: the dead
+  hypothesis, the evidence that killed it, and the issue/PR link. Title-specific → that title's status
+  doc; cross-title → the area doc (`RESOURCE_BINDING.md`, `RECOMPILER_REMAINING.md`, …). A falsification
+  that lives only in a PR body or an issue comment is one the next agent will re-derive at full cost.
+  Read the `## Ruled out` section of every doc you are about to work in **before** forming a hypothesis.
+
 - **Work in your OWN git worktree — the main checkout is shared.** Several agents (and the human)
   run this repo concurrently, so the main working directory and its build dir are contended:
   branch-switching, staging, or `cmake --build` there collides with whatever someone else is

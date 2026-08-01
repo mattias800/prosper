@@ -183,3 +183,27 @@ graphics blocker is the boot wall, the highest-value next steps are, in order:
 
 Marginal instruction-coverage ops (e.g. `v_cndmask_b32_e64`, `s_bfe_u64`) can still be added safely but
 **complete no additional shader** on their own, so they are deferred in favour of the above.
+
+## Ruled out
+
+Cross-title falsifications where the **recompiler was blamed and exonerated**. One line per dead
+hypothesis, the evidence that killed it, and where that evidence lives. Do not re-derive these
+without contradictory new evidence.
+
+| Hypothesis | Verdict and evidence | Source |
+|---|---|---|
+| Nikoderiko's dropped 3D world is a **descriptor-provenance gap**: its 8-SGPR `SRSRC` range is *computed inside the shader*, so `sreg_range_written` is set and the user-data fallback is skipped | **Falsified**, and #1607 was retitled so nobody starts from it. Disassembly of 27 dumped failing stages shows every failing vertex stage uses the **canonical bindless-dynamic vertex fetch** — an ordinary table read whose index is wave-uniform and whose base is a user-data pointer, i.e. the exact shape `resolve_dynamic_fetch` exists to handle. `sreg_range_written` is a *symptom* of that legitimate reload, not its cause. **The three-step ladder is not the defect**; two upstream defects starve it. | #1607 |
+| The Oregon Trail's black frame is a shader/recompiler gap | **Falsified.** On the default path there are **zero** `[recompile-reject]` lines: the draws are rejected earlier by the no-effect gate (`gpu_execute.hpp:968`), because the guest genuinely programs `CB_COLOR_CONTROL.MODE=0` on them. The MIMG gap that appears when the gate is bypassed with `PROSPER_FORCE_COLORWRITE=1` (#1634) is real and must be fixed, but the frame stays byte-identically black with the gate bypassed, so it is **not** established as the root cause. | #1606, #1634 |
+| Syberia's black menu scene is caused by its 10 failing compute dispatches | **Not the cause.** The lit composite is already correct at draw 465, after all ten have been skipped. They remain FATAL gaps per `CLAUDE.md` and are tracked on #1628 with exact `pc`/`fmt`/`op` values. | #1619, #1628 |
+| The stages failing #305's user-data condition indicate a recompiler defect | **No — the recompiler is behaving correctly and fail-visibly.** When the seeded user-data block is wrong, the const-fold refuses to invent a descriptor (`SOFFSET untracked -> fetch left unresolved (not folded to 0)`) and the draw is skipped rather than drawing garbage. The defect is upstream, in graphics register state — see [`RESOURCE_BINDING.md`](RESOURCE_BINDING.md) § `Ruled out`. | #305, #1607 |
+
+**Genuinely open on the recompiler side** (do not confuse with the above): the const-fold is
+**path-insensitive**. A PC reachable only via a taken branch inherits the scalar state left by the
+mutually-exclusive fall-through arm, so `resolve_dynamic_fetch` can apply a load that provably cannot
+execute on that path. Affects 1 of 13 traced Nikoderiko vertex stages. The proposed generic contract:
+a PC not reachable by fall-through begins a block whose scalar state is its branch predecessors'
+state; with exactly one recorded forward branch targeting it, adopt that branch's captured state;
+with more than one, or with a backward edge, **invalidate** every scalar value, descriptor snapshot
+and provenance tag rather than continuing with a provably impossible state. The second half is a
+tightening — today the fold silently believes a wrong-arm value, which is the invented-descriptor
+failure mode in disguise. Carries cross-title regression risk; needs snapshot coverage. (#1607)
