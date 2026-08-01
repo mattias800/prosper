@@ -219,6 +219,29 @@ anywhere yet**, so they are deliberately left unplaced and logged rather than fo
 dataFormat, u32 sampleRate, u32 flags, u64 userHandle}` — live-captured), and this title never
 calls `sceAudioOut2GetSpeakerInfo`, so nothing in the guest's own setup names the order.
 
+**A sustained left/right level imbalance in the output is CONTENT, not the fold — measured, so it
+does not have to be re-investigated.** Dragon Quest VII's mixed bed runs about 38 % louder on the
+right across a whole capture, which is large enough for a music bed to look like an unequal gain or
+a mis-sided channel, and small enough to sound like ordinary mixing — exactly the class of defect a
+listening test cannot catch. One run capturing both the raw port
+(`PROSPER_AUDIO_LAYOUT_DUMP`) and the host sink (`PROSPER_AUDIO_DUMP`) settles it, because the two
+imbalances can be compared directly:
+
+| | ratio | |
+|---|---|---|
+| source `rms(ch1)/rms(ch0)` | **1.3842** | 2.5999e-2 -> 3.5989e-2 |
+| output `rms(R)/rms(L)` | **1.3842** | 2.6002e-2 -> 3.5991e-2 |
+| ratio of ratios | **1.00000** | the fold adds no imbalance of its own |
+
+Stronger than the ratio, and the check to prefer: applying the fold table above to the raw capture
+**offline** reproduces prosper's actual host output to within **2.7e-14** peak absolute difference
+over 5,240,320 frames, with zero frames differing by more than 1e-6. The mix loop is doing exactly
+the documented matrix on the guest's own samples, so any asymmetry in the result came in with the
+content. Note what this does *not* show: it proves the fold is internally faithful, **not** that
+prosper's left is the game's intended left — that is the orientation question below. It does make
+that question sharper, because a bed this asymmetric would make a swapped mapping measurable against
+a hardware reference rather than a matter of taste.
+
 **What no amount of this evidence can settle, and what would.** The probe **groups** channels by
 side; it does not **orient** the groups, and those are different claims. Correlation is symmetric,
 so it proves ch0/ch1 are a genuine front pair — and that {ch4,ch6} and {ch5,ch7} are the two
