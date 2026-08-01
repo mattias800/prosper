@@ -219,6 +219,45 @@ int main() {
                       "Videodec2 flush rejects the 48-byte output ABI without writing past it");
                 CHECK(destroy(decoder, 0, 0, 0, 0, 0) == 0,
                       "Videodec2 decoder lifecycle tears down cleanly");
+
+                // #1658: kjrLbcyhEiw is sceVideodec2GetAvcPictureInfo, a DIFFERENT export from the
+                // generic NtXRa3dRzU0 — the 3.20 firmware database names them separately and prosper
+                // had both under one name.
+                auto picture_info     = Hle::lookup("NtXRa3dRzU0");
+                auto avc_picture_info = Hle::lookup("kjrLbcyhEiw");
+                CHECK(picture_info && avc_picture_info,
+                      "#1658: both Videodec2 picture-info entry points resolve");
+                CHECK(picture_info != avc_picture_info,
+                      "#1658: the AVC form is a distinct handler, not an alias of the generic one");
+                // The NAME is what #1658 is about, and nothing above asserts it: binding the AVC NID
+                // to a distinct handler under the WRONG name passes every other assertion here. That
+                // is the original defect in a new costume — exactly the corollary this PR adds to the
+                // instrument doc (a test of the helper is not a test of the behaviour).
+                CHECK(std::string(Hle::name_of("kjrLbcyhEiw")) == "sceVideodec2GetAvcPictureInfo",
+                      "#1658: kjrLbcyhEiw is registered as sceVideodec2GetAvcPictureInfo");
+                CHECK(std::string(Hle::name_of("NtXRa3dRzU0")) == "sceVideodec2GetPictureInfo",
+                      "#1658: NtXRa3dRzU0 keeps the generic name");
+                // Both accept the known 56-byte output ABI today. The AVC layout is NOT established
+                // from title evidence, so this pins current behaviour rather than a guessed struct.
+                alignas(8) uint8_t pinfo[56]{}; *(uint64_t*)pinfo = 56;
+                CHECK(picture_info((uint64_t)(uintptr_t)pinfo, 0, 0, 0, 0, 0) == 0 &&
+                      avc_picture_info((uint64_t)(uintptr_t)pinfo, 0, 0, 0, 0, 0) == 0,
+                      "#1658: both picture-info forms accept the 56-byte VdecOutput ABI");
+                // A mismatched size must be REJECTED, not silently accepted — that rejection is what
+                // captures an AVC-specific layout the first time a title passes one.
+                alignas(8) uint8_t pinfo_bad[64]{}; *(uint64_t*)pinfo_bad = 64;
+                CHECK(avc_picture_info((uint64_t)(uintptr_t)pinfo_bad, 0, 0, 0, 0, 0) == 0x811d0101ull,
+                      "#1658: an unexpected AVC struct size is rejected, not assumed compatible");
+
+                // The live Tales blocker: QueryDecoderMemoryInfo returns 0x811d0200 for a config with
+                // no compute queue. Pin that it is still rejected (the check is deliberately retained,
+                // not relaxed on a hunch) — the fix is that it now names the field it rejected.
+                Config no_queue = config;
+                no_queue.queue = 0;
+                uint64_t probe_memory[9] = {72};
+                CHECK(query_decoder((uint64_t)(uintptr_t)&no_queue,
+                                    (uint64_t)(uintptr_t)probe_memory, 0, 0, 0, 0) == 0x811d0200ull,
+                      "#1658: a decoder config with no compute queue is rejected with VDEC_ERR_CONFIG");
             }
         }
     }

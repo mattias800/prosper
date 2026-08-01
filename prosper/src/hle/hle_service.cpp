@@ -228,15 +228,58 @@ static_assert(sizeof(VdecInput) == 48 && sizeof(VdecFrame) == 32 && sizeof(VdecO
 std::mutex g_vdec_mx;
 std::unordered_map<uint64_t, uint32_t> g_vdec_codecs;
 
+// A rejected decoder config is a hard stop for a title's movie playback, and the guest only prints the
+// bare SCE code — 0x811d0200 covers TWO different conditions here, so "err=0x811d0200" alone cannot tell
+// anyone which. Name the failing field and its observed value, unconditionally but rate-limited: this
+// fires at most a handful of times per boot and is the difference between a one-run diagnosis and a
+// guess. (Tales of Graces f / criMvPly stops exactly here; see #1658.)
+uint64_t vdec_reject(const char* field, uint64_t observed, uint64_t err) {
+    // Rate-limit PER FIELD, not globally. One shared counter meant a caller looping on an early
+    // condition could burn the whole budget and silence a later, different rejection — including the
+    // one a run was started to capture. `field` is always a string literal, so the pointer is a stable
+    // key and the map stays bounded by the number of call sites.
+    static std::mutex mx;
+    static std::unordered_map<const char*, int> shown;
+    {
+        std::lock_guard<std::mutex> lk(mx);
+        if (shown[field]++ >= 4) return err;
+    }
+    fprintf(stderr, "[vdec] decoder config REJECTED: %s = 0x%llx -> err=0x%llx\n",
+            field, (unsigned long long)observed, (unsigned long long)err);
+    return err;
+}
 uint64_t vdec_validate_config(const VdecConfig* c) {
-    if (!c || c->size != sizeof(*c)) return !c ? VDEC_ERR_ARG : VDEC_ERR_STRUCT;
-    if (c->resource != 1) return VDEC_ERR_RESOURCE;
-    if (c->reserved0 || c->reserved1) return VDEC_ERR_CONFIG;
-    if (!c->input_depth) return VDEC_ERR_INPUT_DEPTH;
-    if (c->max_dpb < -1 || c->max_dpb == 0) return VDEC_ERR_DPB;
+    if (!c) return VDEC_ERR_ARG;
+    if (c->size != sizeof(*c)) return vdec_reject("size", c->size, VDEC_ERR_STRUCT);
+    if (c->resource != 1) return vdec_reject("resource", c->resource, VDEC_ERR_RESOURCE);
+    if (c->reserved0 || c->reserved1)
+        return vdec_reject("reserved0/1", ((uint64_t)c->reserved0 << 8) | c->reserved1,
+                           VDEC_ERR_CONFIG);
+    if (!c->input_depth) return vdec_reject("input_depth", c->input_depth, VDEC_ERR_INPUT_DEPTH);
+    if (c->max_dpb < -1 || c->max_dpb == 0)
+        return vdec_reject("max_dpb", (uint64_t)(int64_t)c->max_dpb, VDEC_ERR_DPB);
     if (c->max_width < -1 || c->max_height < -1 || !c->max_width || !c->max_height)
-        return VDEC_ERR_DIMS;
-    if (!c->compute_queue) return VDEC_ERR_CONFIG;
+        return vdec_reject("max_width/height",
+                           ((uint64_t)(uint32_t)c->max_width << 32) | (uint32_t)c->max_height,
+                           VDEC_ERR_DIMS);
+    // This is the condition most likely to reject a caller that queries memory sizes BEFORE it
+    // allocates a compute queue — the natural order for "how much do I need?".
+    //
+    // Retained, but the honest state of the evidence is: there is NONE either way. The check arrived
+    // in #1368 (8b37be95) with no comment, no rationale and no test — defensive, not derived. No title
+    // is recorded anywhere in this repo as reaching QueryDecoderMemoryInfo at all; the only live
+    // Videodec2 calls in docs/ are QueryComputeMemoryInfo. An earlier version of this comment claimed
+    // "Sonic Origins' CRI Mana backend passes it" — that was unsupported and is withdrawn.
+    //
+    // So this is retained on the weaker ground that removing an unexplained validation is also a
+    // guess, and a rejection is at least visible. Note it does NOT protect a size contract:
+    // s_videodec2_query_decoder_memory ignores compute_queue entirely and writes fixed VDEC_MIN_MEMORY
+    // constants, so rejecting only fails earlier than succeeding would.
+    //
+    // If a live log names this field, the evidenced narrow move is a SPLIT — keep the requirement on
+    // CreateDecoder, which genuinely needs a queue, and drop it from the pure sizing query — rather
+    // than a blanket relaxation. CONFIDENCE: LOW that requiring it here is right.
+    if (!c->compute_queue) return vdec_reject("compute_queue", c->compute_queue, VDEC_ERR_CONFIG);
     return 0;
 }
 void vdec_no_picture(VdecFrame* frame, VdecOutput* out, uint32_t codec) {
@@ -263,11 +306,17 @@ HLE(s_videodec2_allocate_compute_queue) {
     auto* out = (uint64_t*)PW(a2);
     if (!config || !memory || !out) return VDEC_ERR_ARG;
     if (config->size != sizeof(*config) || memory->size != sizeof(*memory)) return VDEC_ERR_STRUCT;
-    if (config->reserved0 || config->reserved1) return VDEC_ERR_CONFIG;
-    if (config->pipe > 4) return VDEC_ERR_PIPE;
-    if (config->queue > 7) return VDEC_ERR_QUEUE;
-    if (memory->shared_size < VDEC_MIN_MEMORY) return VDEC_ERR_MEMORY_SIZE;
-    if (!memory->shared) return VDEC_ERR_MEMORY_PTR;
+    // These share 0x811d0200/0x811d02xx with the decoder-config validator, so a bare guest error code
+    // cannot say which call produced it. Name them too, or a run that fails HERE prints nothing.
+    if (config->reserved0 || config->reserved1)
+        return vdec_reject("computeQueue.reserved0/1",
+                           ((uint64_t)config->reserved0 << 8) | config->reserved1, VDEC_ERR_CONFIG);
+    if (config->pipe > 4) return vdec_reject("computeQueue.pipe", config->pipe, VDEC_ERR_PIPE);
+    if (config->queue > 7) return vdec_reject("computeQueue.queue", config->queue, VDEC_ERR_QUEUE);
+    if (memory->shared_size < VDEC_MIN_MEMORY)
+        return vdec_reject("computeQueue.shared_size", memory->shared_size, VDEC_ERR_MEMORY_SIZE);
+    if (!memory->shared)
+        return vdec_reject("computeQueue.shared", memory->shared, VDEC_ERR_MEMORY_PTR);
     *out = memory->shared;
     if (svclog()) fprintf(stderr, "[svc]   Videodec2 compute queue -> 0x%llx (%llu bytes)\n",
                           (unsigned long long)*out, (unsigned long long)memory->shared_size);
@@ -337,9 +386,50 @@ HLE(s_videodec2_flush) {
 HLE(s_videodec2_reset) {
     std::lock_guard<std::mutex> lk(g_vdec_mx); return g_vdec_codecs.count(a0) ? 0 : VDEC_ERR_DECODER;
 }
-HLE(s_videodec2_picture_info) {
+// sceVideodec2GetPictureInfo / ...GetAvcPictureInfo. `which` names the entry point so a size mismatch
+// identifies itself (#1658).
+//
+// Both currently validate against VdecOutput. That is an ASSUMPTION for the AVC form: the two exist as
+// separate exports, which is normally because the AVC one carries codec-specific picture metadata in a
+// larger structure. prosper has no title evidence for that layout — the firmware database gives names
+// and NIDs, never bodies — so inventing a second struct would be fabricating an ABI. Instead the
+// mismatch path reports the size the guest actually passed, which IS the evidence needed: the first
+// title to call it prints `sizeof` its own struct, and the layout can then be derived rather than guessed.
+// CONFIDENCE: LOW that a shared layout is correct; HIGH that guessing one would be worse.
+static uint64_t vdec_picture_info(const char* which, uint64_t a0, uint64_t a1, uint64_t a2,
+                                  uint64_t a3) {
+    // Report the FIRST call to each entry point unconditionally, with the later arguments.
+    //
+    // Relying on a size mismatch alone would have been a weak plan: both forms take the same
+    // OutputInfo in a0, so if what distinguishes them is what they WRITE to a later out-param, a0
+    // matches, the mismatch branch never fires, and a run set up to capture the AVC layout captures
+    // nothing while appearing to work. Printing a1..a3 once costs two lines a boot and cannot miss.
+    static std::mutex mx;
+    static std::unordered_map<const char*, int> seen;   // `which` is a literal: stable key
+    bool first = false;
+    { std::lock_guard<std::mutex> lk(mx); first = (seen[which]++ == 0); }
+    if (first)
+        fprintf(stderr, "[vdec] %s FIRST CALL: a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx (#1658 — the "
+                        "AVC layout is unestablished; these arguments are the evidence)\n",
+                which, (unsigned long long)a0, (unsigned long long)a1,
+                (unsigned long long)a2, (unsigned long long)a3);
     auto* out = (const VdecOutput*)PW(a0); if (!out) return VDEC_ERR_ARG;
-    return out->size == sizeof(*out) ? 0 : VDEC_ERR_STRUCT;
+    if (out->size == sizeof(*out)) return 0;
+    static std::mutex bad_mx;
+    static std::unordered_map<const char*, int> bad;
+    bool report = false;
+    { std::lock_guard<std::mutex> lk(bad_mx); report = (bad[which]++ < 4); }
+    if (report)
+        fprintf(stderr, "[vdec] %s: caller struct size 0x%llx != VdecOutput 0x%zx — rejected. If this "
+                        "is the AVC form, that size IS its layout evidence (#1658).\n",
+                which, (unsigned long long)out->size, sizeof(*out));
+    return VDEC_ERR_STRUCT;
+}
+HLE(s_videodec2_picture_info) {
+    return vdec_picture_info("sceVideodec2GetPictureInfo", a0, a1, a2, a3);
+}
+HLE(s_videodec2_avc_picture_info) {
+    return vdec_picture_info("sceVideodec2GetAvcPictureInfo", a0, a1, a2, a3);
 }
 // sceUserServiceGetEvent(SceUserServiceEvent* ev): the event stream. A real system delivers the initial
 // user's LOGIN event once at startup, then reports "no more events" so the game's drain loop terminates.
@@ -3022,8 +3112,13 @@ void register_service_hle() {
     Hle::register_fn("852F5+q6+iM", (HleFn)s_videodec2_decode, "sceVideodec2Decode");
     Hle::register_fn("l1hXwscLuCY", (HleFn)s_videodec2_flush, "sceVideodec2Flush");
     Hle::register_fn("wJXikG6QFN8", (HleFn)s_videodec2_reset, "sceVideodec2Reset");
+    // #1658: kjrLbcyhEiw is sceVideodec2GetAvcPictureInfo, not a second NID for the generic form —
+    // the 3.20 firmware database names them separately. They still share a handler because no title
+    // evidence yet shows the AVC output layout differs; the handler says so and captures the first
+    // mismatch rather than assuming they are identical.
     Hle::register_fn("NtXRa3dRzU0", (HleFn)s_videodec2_picture_info, "sceVideodec2GetPictureInfo");
-    Hle::register_fn("kjrLbcyhEiw", (HleFn)s_videodec2_picture_info, "sceVideodec2GetPictureInfo");
+    Hle::register_fn("kjrLbcyhEiw", (HleFn)s_videodec2_avc_picture_info,
+                     "sceVideodec2GetAvcPictureInfo");
     R("sceUserServiceInitialize", s_ok);
     R("sceUserServiceTerminate", s_ok);
     // NP — an honest signed-out console (#306). NIDs verified against the PS5 3.20

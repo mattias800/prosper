@@ -126,6 +126,17 @@ count, read the last row's number.
   ran*, not of when the events happened. Print a common ordinal (`command_order`) on both and join on it. This
   is why the `order=` field exists on the `[exec] skip draw early` line — **it is not redundant with the
   register values on the same line, and removing it silently re-opens the phantom above.**
+- **A fix that makes an instrument lie more convincingly is worse than the bug.** This one is about
+  *repairs*, not measurements, and it is the inverse of everything else on this page. #1659's own fix
+  briefly introduced it: the diagnostics were widened to resolve any guest module, but several kept a
+  hard-coded `eboot+` label. Before the change an Il2Cpp frame printed an offset *larger than the image* —
+  the exact tell the entry below tells you to look for. After it, the same frame printed a small,
+  plausible, in-range offset under the **wrong module name**, with no tell at all. The fault was
+  unchanged; only the symptom was removed. Any correction that deletes a symptom without deleting the
+  fault produces a **quieter** failure, and quiet failures are the expensive ones. When you fix an
+  instrument, ask what its wrongness used to look like and confirm you removed the wrongness rather than
+  the appearance of it. Corollary for tests: a test that exercises the *helper* you added will not catch
+  this — it has to render through the real formatter and assert the text a reader would see.
 - **A `<module>+0x<rva>` offset larger than the module's image is a labelling artifact, not a wild pointer.**
   Guest module bases are fixed constants in `src/host/boot_program.hpp`, and they *move*: #825 relocated the
   eboot from `0x400000000` to `0x410000000` so Astro Bot's direct-memory mapping would stop aliasing code.
