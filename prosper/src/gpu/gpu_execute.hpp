@@ -978,11 +978,12 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
         if (log) fprintf(stderr, "[exec] skip draw early: no color/depth/stencil effect "
                                 "cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u "
-                                "color0=0x%llx/%ux%u es=0x%llx ps=0x%llx\n",
+                                "color0=0x%llx/%ux%u es=0x%llx ps=0x%llx order=%llu\n",
                          rs.cb_target_mask, rs.cb_color_control,
                          resolved_pipeline.color0_format,
                          (unsigned long long)rs.color0_base, rs.color0_width, rs.color0_height,
-                         (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
+                         (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                         (unsigned long long)(draw ? draw->command_order : 0));
         return false;
     }
     const auto* fused_back = static_cast<const AgcShaderHeader*>(
