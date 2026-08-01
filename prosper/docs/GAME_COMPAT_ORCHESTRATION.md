@@ -246,6 +246,29 @@ level up.
 - Write `Refs #NN`, not `Fixes #NN`, when a PR only partially addresses an issue — a parenthetical qualifier does
   **not** stop GitHub's auto-close, and #1554 was closed that way despite a comment saying to keep it open.
 
+### State only what is true at the moment and scope you state it
+
+**A statement should only assert what is true at the moment and scope it is made. A line that announces an
+*intention* in the grammar of a *fact* is indistinguishable from a result — and both humans and agents act on it
+as one.** A confident statement reads identically whether or not it is earned, so nothing announces itself when
+it stops being true.
+
+Instances, all the same shape:
+
+- The F9 arming line announced a filename it could not guarantee. A grab that aborted then left a `.bmp` beside a
+  same-named `.prgbundle` from a different boot 51 minutes earlier, and a lane was handed the two as a matched
+  pair. Fixed by naming the title at arm time and the real path per artifact after each file exists (#1693).
+- A PR body asserted a `CONFIDENCE: HIGH` the source had already retracted; merging would have written the
+  withdrawn version into the permanent record.
+- An issue title asserted a mechanism that had been falsified, and kept sending agents at it for a day.
+
+The practical form:
+
+- If you cannot guarantee it when you write it, **state what you do know** and emit the fact when you have it.
+- If a claim rests on three examples, **say "verified on three cases"** — not "for every input".
+- A document, title, or comment that outlives its reasoning becomes **an assertion nobody is checking**.
+  Retitling a falsified issue and correcting a stale PR body are correctness work, not tidying.
+
 ### A test seam that pins a policy makes its env-var A/B silently void
 
 An A/B was run by setting `PROSPER_ULT_RETURN_SUCCESS=1` to force libSceUlt's mutex to a no-op, expecting the

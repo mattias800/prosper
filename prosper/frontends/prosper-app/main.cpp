@@ -33,6 +33,7 @@
 #include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam
 #include "game_path.hpp"                 // dropped/picked path -> app0 root + open action, pure seam
 #include "game_library.hpp"              // scan a games dir -> titles + metadata, pure seam
+#include "frame_grab_naming.hpp"         // one stamp + one exclusively claimed name pair per F9 grab
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
 #ifdef PROSPER_HAVE_LIBRARY_UI
 #include "library_ui.hpp"                // the ImGui library grid drawn while no game is running
@@ -807,6 +808,30 @@ static bool save_app_config(const prosper::frontend::AppConfig& cfg) {
     return ok;
 }
 
+// The title component of an F9 capture's filename, plus the label its log line says.
+//
+// The FILENAME uses the content id ("PPSA25009") and never the display name: it is short, ASCII,
+// locale-independent, free of spaces and punctuation, and it is already how this project identifies a
+// title everywhere else (PROSPER_CAPTURE_TITLE, the game: issue labels, the status docs). Display
+// names are the opposite on all four counts — PPSA20052's is "Worms Armageddon: Anniversary Edition"
+// and PPSA08576's is "Asterix & Obelix Slap Them All!", and a language lookup that goes wrong yields
+// "DER KÜHNE KNAPPE" for The Plucky Squire (#1471). The display name still appears in the
+// arming LOG line, where none of that matters and it helps a person recognise the run.
+struct CaptureTitle { std::string id, label; };
+static CaptureTitle capture_title_for(const std::string& dump) {
+    CaptureTitle out;
+    if (dump.empty()) return out;
+    const std::string json = host_library_io().read_file(dump + "/sce_sys/param.json");
+    out.id = prosper::frontend::sanitize_capture_component(
+        prosper::frontend::parse_param_title_id(json));
+    // param.json missing, unreadable, or without titleId: the dump directory is named after the
+    // content id in every dump we have, so it is a faithful fallback rather than a guess.
+    if (out.id.empty()) out.id = prosper::frontend::title_id_from_app0_path(dump);
+    const std::string name = prosper::frontend::parse_param_title_name(json);
+    out.label = out.id.empty() ? name : (name.empty() ? out.id : out.id + " (" + name + ")");
+    return out;
+}
+
 // "prosper — <game name>" for a booted game (name from param.json, falling back to the app0
 // basename), else a label that says what the empty window is waiting for.
 static std::string window_title_for(const std::string& dump, bool test_pattern) {
@@ -1255,7 +1280,8 @@ int main(int argc, char** argv) {
                     "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  "
                     "Pause/F10=pause  F11/Alt+Enter=fullscreen  Esc=quit\n");
     fprintf(stderr, "[app] F9 = grab the current frame: writes a replayable .prgbundle + a .bmp "
-                    "screenshot (to PROSPER_CAPTURE_DIR, default cwd) for gpu_replay debugging "
+                    "screenshot named frame_grab_<titleId>_<date>-<time>-<ms>.* (to "
+                    "PROSPER_CAPTURE_DIR, default cwd) for gpu_replay debugging "
                     "(brief hitch on press; PROSPER_CAPTURE_FRAMES>1 grabs an animation).\n");
 
     const bool frameTrace = getenv("PROSPER_APP_FRAME_TRACE") != nullptr;
@@ -1278,10 +1304,17 @@ int main(int argc, char** argv) {
     uint64_t lastPresentedGuestFlip = 0;
     int gpuPrevSlot = -1;   // #1270: the GPU scanout slot presented last frame (released after its read)
     unsigned timedDumpCount = 0;
-    // Interactive frame grab (F9): base output dir + a per-session counter; when a grab was armed we
-    // also snapshot the next presented CPU frame to a BMP next to its .prgcap.
+    // Interactive frame grab (F9): output dir plus the namer that claims one stamped, title-tagged
+    // name pair per press (frame_grab_naming.hpp). The old per-process counter (frame_grab_001) let a
+    // second title played in the same directory overwrite the first title's captures, and let an
+    // aborted grab's .bmp sit beside a same-named .prgbundle from an earlier boot.
     const std::string grabDir = getenv("PROSPER_CAPTURE_DIR") ? getenv("PROSPER_CAPTURE_DIR") : ".";
-    unsigned grabCounter = 0;
+    prosper::frontend::FrameGrabNamer grabNamer;
+    grabNamer.set_directory(grabDir);
+    {
+        const CaptureTitle ct = capture_title_for(dump);
+        grabNamer.set_title(ct.id, ct.label);
+    }
     // 0 = keep the built-in default; the timeline clamps whatever is supplied to 64..3072 MiB.
     // Parse strictly, matching the two checked parses of this same variable in gpu_timeline.cpp. An
     // unchecked strtoul truncates into uint32_t, so 4294967360 would arrive as 64 — silently the
@@ -1302,18 +1335,40 @@ int main(int argc, char** argv) {
     std::chrono::steady_clock::time_point grabNoticeUntil{};
     std::string pendingGrabScreenshot;   // non-empty => write the next presented CPU frame to this path
     uint64_t pendingGrabGuestPresent = 0;
+    unsigned pendingGrabSuffix = 0;      // the collision suffix this capture owns, 0 when it needed none
+    // The suffix of each armed bundle, so the completion line can name it. Keyed by path because the
+    // bundle finishes on the render thread and a second F9 can be armed before the first reports.
+    // Bounded: a capture that never reports (the process died) must not accumulate here.
+    std::vector<std::pair<std::string, unsigned>> grabBundleSuffixes;
+    auto take_bundle_suffix = [&](const std::string& path) -> unsigned {
+        for (size_t i = 0; i < grabBundleSuffixes.size(); ++i) {
+            if (grabBundleSuffixes[i].first != path) continue;
+            const unsigned suffix = grabBundleSuffixes[i].second;
+            grabBundleSuffixes.erase(grabBundleSuffixes.begin() + static_cast<ptrdiff_t>(i));
+            return suffix;
+        }
+        return 0;
+    };
     auto flushGrabScreenshot = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
         if (pendingGrabScreenshot.empty()) return;
         const bool ok = write_frame_bmp(pendingGrabScreenshot, rgba, w, h);
-        std::fprintf(stderr,
-                     "[grab] screenshot%s armed at guest present %llu "
-                     "(written at guest present %llu) -> %s\n",
-                     ok ? "" : " write FAILED",
-                     static_cast<unsigned long long>(pendingGrabGuestPresent),
-                     static_cast<unsigned long long>(gpu::present_count()),
-                     pendingGrabScreenshot.c_str());
+        char detail[128];
+        std::snprintf(detail, sizeof detail, "armed at guest present %llu, written at guest present %llu",
+                      static_cast<unsigned long long>(pendingGrabGuestPresent),
+                      static_cast<unsigned long long>(gpu::present_count()));
+        // Emitted AFTER the write, and it names the file that now exists. The arming line deliberately
+        // named none: see the F9 handler.
+        if (ok) {
+            std::fprintf(stderr, "%s\n",
+                         prosper::frontend::frame_grab_write_line(
+                             "screenshot", pendingGrabScreenshot, pendingGrabSuffix, detail).c_str());
+        } else {
+            std::fprintf(stderr, "[grab] screenshot write FAILED (%s); the reserved file is still "
+                                 "empty: %s\n", detail, pendingGrabScreenshot.c_str());
+        }
         pendingGrabScreenshot.clear();
         pendingGrabGuestPresent = 0;
+        pendingGrabSuffix = 0;
     };
     const uint64_t scheduledScreenshotFrame = prosper::frontend::parse_capture_frame(
         getenv("PROSPER_CAPTURE_SCREENSHOT_AT_FRAME"));
@@ -1432,6 +1487,12 @@ int main(int argc, char** argv) {
             }
             title = window_title_for(root, false);
             SDL_SetWindowTitle(win, title.c_str());
+            // A title opened after startup owns the captures from here on: name them after IT, not
+            // after the empty window this process started as.
+            {
+                const CaptureTitle ct = capture_title_for(root);
+                grabNamer.set_title(ct.id, ct.label);
+            }
 #ifdef PROSPER_HAVE_LIBRARY_UI
             // Hand the swapchain back before the guest's first frame: from here the game present path
             // owns it, and two presenters acquiring the same images would fight.
@@ -1494,19 +1555,46 @@ int main(int argc, char** argv) {
                 // only — near-zero cost until pressed, so it never distorts the FPS you are observing.
                 if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
                     ev.key.key == SDLK_F9) {
-                    char base[512];
-                    std::snprintf(base, sizeof base, "%s/frame_grab_%03u", grabDir.c_str(), ++grabCounter);
+                    // Claim both output names now, from ONE timestamp, with an exclusive create. Doing
+                    // it here rather than at each write is what binds the two artifacts of this
+                    // capture together: they are written seconds apart on two different threads, and a
+                    // name derived independently at each write would let a bundle take a collision
+                    // suffix its screenshot did not — which is exactly the mismatched pair this
+                    // change exists to make impossible.
+                    const prosper::frontend::FrameGrabPaths grab = grabNamer.reserve();
+                    if (!grab.ok) {
+                        std::fprintf(stderr, "[grab] F9 #%u: could not reserve capture files: %s\n",
+                                     grab.index, grab.error.c_str());
+                        continue;
+                    }
+                    // This line names NO file, deliberately. A log line must assert only what is true
+                    // when it is emitted: at arm time the capture may still abort, the write may fail,
+                    // and a collision suffix makes the eventual path unequal to any guess. An intention
+                    // written in the grammar of a result is one a reader — human or agent — cannot tell
+                    // apart from a result, and this fleet's agents read these logs to find artifacts.
+                    // The real paths are logged by the writes, once the files exist. Do not "helpfully"
+                    // restore a filename here.
+                    std::fprintf(stderr, "%s\n",
+                                 prosper::frontend::frame_grab_arm_line(
+                                     grab.index, grabNamer.title_label()).c_str());
                     // Honour PROSPER_CAPTURE_BUNDLE_MAX_MB here too (#1587). It was consulted only on
                     // the headless/scheduled paths, so the hotkey was pinned to the 2 GiB default with
                     // no way to raise it without editing code — and one 3840x2160 frame of a deferred
                     // renderer exceeds that, which made F9 unusable on 4K UE titles.
-                    prosper::gpu::request_interactive_capture_bundle(
-                        std::string(base) + ".prgbundle", grabBundleMaxMb);
-                    pendingGrabScreenshot = std::string(base) + ".bmp";
+                    prosper::gpu::request_interactive_capture_bundle(grab.bundle, grabBundleMaxMb);
+                    // A press before the previous screenshot was written drops that one. Say so: its
+                    // reserved .bmp stays on disk at zero bytes, and an unexplained empty file is how
+                    // a reader ends up inventing a reason for it.
+                    if (!pendingGrabScreenshot.empty())
+                        std::fprintf(stderr,
+                                     "[grab] the previous capture's screenshot was still pending and is "
+                                     "superseded; its reserved file stays empty: %s\n",
+                                     pendingGrabScreenshot.c_str());
+                    pendingGrabScreenshot = grab.screenshot;
                     pendingGrabGuestPresent = gpu::present_count();
-                    std::fprintf(stderr,
-                        "[grab] F9: arming a whole-frame capture -> %s.prgbundle (+ .bmp screenshot)\n",
-                        base);
+                    pendingGrabSuffix = grab.suffix;
+                    if (grabBundleSuffixes.size() >= 32) grabBundleSuffixes.erase(grabBundleSuffixes.begin());
+                    grabBundleSuffixes.emplace_back(grab.bundle, grab.suffix);
                     continue;
                 }
                 // Ctrl+O opens a title in the empty window (#1469). Deliberately unavailable once a
@@ -1776,6 +1864,7 @@ int main(int argc, char** argv) {
                 scheduledScreenshotFrame, shown, scheduledScreenshotArmed)) {
             pendingGrabScreenshot = scheduledScreenshotPath;
             pendingGrabGuestPresent = gpu::present_count();
+            pendingGrabSuffix = 0;   // an explicitly configured path, not a claimed frame-grab name
             scheduledScreenshotArmed = true;
             fprintf(stderr,
                     "[grab] scheduled screenshot armed at host frame %llu (guest present %llu)\n",
@@ -1796,20 +1885,38 @@ int main(int argc, char** argv) {
         {
             prosper::gpu::InteractiveGrabOutcome grab;
             if (prosper::gpu::take_interactive_grab_outcome(grab)) {
+                const unsigned bundleSuffix = take_bundle_suffix(grab.bundle_path);
                 if (grab.ok) {
-                    std::fprintf(stderr, "[grab] OK -> %s\n", grab.bundle_path.c_str());
+                    // The file exists now, so this line may name it.
+                    std::fprintf(stderr, "%s\n",
+                                 prosper::frontend::frame_grab_write_line(
+                                     "bundle", grab.bundle_path, bundleSuffix).c_str());
                     grabNotice = "F9: captured " +
                         std::filesystem::path(grab.bundle_path).filename().string();
                 } else {
+                    // The grab reserved this name at arm time, so an empty file is sitting there.
+                    // Remove it: leaving a zero-byte .prgbundle after saying none was written would
+                    // be the same class of untrue statement this logging is built to avoid. Only when
+                    // it is genuinely empty — anything with bytes in it is somebody's real capture.
+                    std::error_code ec;
+                    const bool removedReservation =
+                        !grab.bundle_path.empty() &&
+                        std::filesystem::exists(grab.bundle_path, ec) && !ec &&
+                        std::filesystem::file_size(grab.bundle_path, ec) == 0 && !ec &&
+                        std::filesystem::remove(grab.bundle_path, ec) && !ec;
                     std::fprintf(stderr,
                         "\n=========================== F9 FRAME GRAB FAILED ===========================\n"
                         "  %s\n"
-                        "  no .prgbundle was written: %s\n"
-                        "  the .bmp screenshot for this press was written separately and is unaffected\n"
+                        "  no bundle content was written; the name reserved for it was %s\n"
+                        "  %s\n"
+                        "  the .bmp screenshot for this press is a separate file with the same stem\n"
                         "  budget in force: %llu MiB — raise it with "
                         "PROSPER_CAPTURE_BUNDLE_MAX_MB=<64..3072> and press F9 again\n"
                         "============================================================================\n\n",
                         grab.error.c_str(), grab.bundle_path.c_str(),
+                        removedReservation ? "the empty reservation has been removed"
+                                           : "the reserved file is still on disk (it is empty, or could"
+                                             " not be removed)",
                         static_cast<unsigned long long>(grab.max_unique_bytes >> 20));
                     grabNotice = "F9 GRAB FAILED — see console (raise PROSPER_CAPTURE_BUNDLE_MAX_MB)";
                 }

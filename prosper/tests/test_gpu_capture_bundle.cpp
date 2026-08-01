@@ -219,7 +219,22 @@ int main() {
           error.find("checksum") != std::string::npos,
           "bundle rejects manifest corruption");
 
+    // An interactive frame grab claims its output names when it is ARMED, so a grab that never
+    // completes (the app was killed mid-capture) leaves a zero-byte .prgbundle on disk. That file must
+    // be unmistakable to the tool: an empty capture is "this never finished", not "this frame had no
+    // work" and not a corruption to go hunting for.
+    const auto empty_path = path.string() + ".empty";
+    { std::ofstream empty(empty_path, std::ios::binary); }
+    GpuCaptureBundle from_empty;
+    CHECK(!read_gpu_capture_bundle(empty_path, from_empty, error) &&
+          error.find("empty bundle file") != std::string::npos &&
+          error.find("never completed") != std::string::npos,
+          "an empty bundle is rejected as an unfinished capture, by name");
+    CHECK(from_empty.submits.empty(),
+          "an empty bundle never loads as a capture that simply contained no submits");
+
     std::error_code ec; std::filesystem::remove(path, ec); std::filesystem::remove(corrupt_path, ec);
+    std::filesystem::remove(empty_path, ec);
     std::filesystem::remove(v1_path, ec);
 
     // Interactive F9 whole-frame grab (prosper-app): the present-boundary state machine. A grab is armed

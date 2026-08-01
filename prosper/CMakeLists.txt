@@ -393,6 +393,14 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_game_library PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_game_library COMMAND test_prosper_app_game_library)
 
+  # F9 frame-grab file naming: one stamp and one exclusively claimed name pair per capture, so two
+  # titles in one directory cannot overwrite each other and an aborted grab cannot pair with a
+  # different capture. Uses a real directory under the build tree and an injected clock — no SDL, no
+  # window, no GPU.
+  add_executable(test_prosper_app_frame_grab_naming frontends/prosper-app/test_frame_grab_naming.cpp)
+  target_include_directories(test_prosper_app_frame_grab_naming PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_frame_grab_naming COMMAND test_prosper_app_frame_grab_naming)
+
   # Library grid selection movement (#1471): arithmetic only, so the navigation rules are covered in
   # normal CI rather than by someone pressing arrow keys. No ImGui, no SDL, no window.
   add_executable(test_prosper_app_library_nav frontends/prosper-app/test_library_nav.cpp)
