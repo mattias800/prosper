@@ -1535,11 +1535,92 @@ static void report_short_fold(const char* who, uint64_t submit_no, const uint32_
             100.0 * (double)consumed / (double)declared, stop,
             (size_t)declared - consumed, n == 31 ? " [further reports suppressed]" : "");
 }
+// #305 submit ORDER vs FOLD order (PROSPER_SUBMITORDER=1).
+//
+// prosper folds every submit synchronously inside the caller's HLE handler, serialised by
+// g_agc_state_mu. That makes the FOLD order a property of lock acquisition, not of the guest's
+// program order — and #305 turns on exactly that distinction: a q3 (SubmitDcbFinal) fold appears
+// immediately after a q1 (SubmitDcb) bind, and the question is whether hardware would have run them
+// in that order at all. Nikoderiko additionally issues its two submits from two DIFFERENT guest
+// functions (eboot+0xfb0c10 and eboot+0xfb04b0), not one loop over a buffer array as the DOLL
+// derivation assumed, so the ordering prosper inherits has never been checked against this title.
+//
+// The call stamp is therefore taken at HLE ENTRY, BEFORE the mutex. Taking it after would record the
+// order the lock happened to grant and answer the question with its own assumption.
+struct SubmitCallStamp { uint64_t call_seq; uint64_t ns; uint64_t thread; };
+static std::atomic<uint64_t> g_submit_call_seq{0};
+static std::atomic<uint64_t> g_submit_thread_next{1};
+static thread_local uint64_t t_submit_thread_token = 0;
+static bool submitorder_on() {
+    static const bool on = getenv("PROSPER_SUBMITORDER") != nullptr;
+    return on;
+}
+// Identity only, never a handle: pthread_t is opaque and must not be compared as an integer.
+static SubmitCallStamp stamp_submit_call() {
+    if (!t_submit_thread_token)
+        t_submit_thread_token = g_submit_thread_next.fetch_add(1, std::memory_order_relaxed);
+    SubmitCallStamp st{};
+    st.thread = t_submit_thread_token;
+    st.ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+    st.call_seq = g_submit_call_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+    return st;
+}
+// Emitted AFTER the fold, carrying the pre-lock stamp. `call` and `fold` diverging is the signal: a
+// submit the guest issued earlier was folded later, so prosper's register state at a draw is not the
+// state the guest's own submission order would produce.
+//
+// Counted always, logged SPARSELY. A line per submit would be ~70 MB over a 440 s route, and the I/O
+// would perturb the very ordering this is measuring — the instrument would become part of the result.
+// So: the opening submits (to see the steady-state shape), every out-of-order event (the exception
+// that matters), and a periodic census.
+static void report_submit_order(const char* who, const SubmitCallStamp& st, uint64_t fold_seq,
+                                const uint32_t* addr, uint32_t dw_num, size_t draws) {
+    if (!submitorder_on()) return;
+    struct Census { std::atomic<uint64_t> n{0}, threads{0}; };
+    static std::atomic<uint64_t> last_call{0}, out_of_order{0}, total{0};
+    static std::atomic<uint64_t> per_thread[8]{};        // count by thread token (1..7 observed)
+    static std::atomic<uint64_t> final_per_thread[8]{};  // ...for SubmitDcbFinal specifically
+    const bool is_final = strcmp(who, "SubmitDcbFinal") == 0;
+    const uint64_t n = total.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (st.thread < 8) {
+        per_thread[st.thread].fetch_add(1, std::memory_order_relaxed);
+        if (is_final) final_per_thread[st.thread].fetch_add(1, std::memory_order_relaxed);
+    }
+    const uint64_t prev = last_call.exchange(st.call_seq, std::memory_order_acq_rel);
+    const bool inverted = st.call_seq < prev;
+    if (inverted) {
+        const uint64_t k = out_of_order.fetch_add(1, std::memory_order_relaxed);
+        if (k < 32)
+            fprintf(stderr, "[submitorder] *** FOLDED OUT OF CALL ORDER *** %s call=%llu (previous "
+                            "fold's call=%llu) fold=%llu thread=%llu t=%lluus dw=%u draws=%zu\n",
+                    who, (unsigned long long)st.call_seq, (unsigned long long)prev,
+                    (unsigned long long)fold_seq, (unsigned long long)st.thread,
+                    (unsigned long long)(st.ns / 1000ull), dw_num, draws);
+    }
+    if (n <= 20 || (n % 20000) == 0) {
+        char tb[128]; int o = 0;
+        for (int i = 1; i < 8 && o < 100; ++i) {
+            const uint64_t c = per_thread[i].load(std::memory_order_relaxed);
+            if (c) o += snprintf(tb + o, sizeof(tb) - o, " t%d=%llu/%llu", i,
+                                 (unsigned long long)c,
+                                 (unsigned long long)final_per_thread[i].load(std::memory_order_relaxed));
+        }
+        fprintf(stderr, "[submitorder] %-14s call=%llu fold=%llu thread=%llu t=%lluus addr=%p dw=%u "
+                        "draws=%zu | total=%llu inverted=%llu by-thread(all/final):%s\n",
+                who, (unsigned long long)st.call_seq, (unsigned long long)fold_seq,
+                (unsigned long long)st.thread, (unsigned long long)(st.ns / 1000ull),
+                (const void*)addr, dw_num, draws, (unsigned long long)n,
+                (unsigned long long)out_of_order.load(std::memory_order_relaxed), tb);
+    }
+}
+
 static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const char* who,
                                   uint64_t queue_id = 0) {
     if (!addr) return 0;
     constexpr uint32_t kUnknownCap = 0x80000;   // 512 KiB of dwords — well past any real Dcb
     uint32_t walk = dw_num ? dw_num : kUnknownCap;
+    const SubmitCallStamp call_stamp = stamp_submit_call();   // BEFORE the lock: see the note above
     std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
     const bool async_compute = strcmp(who, "SubmitAcb") == 0;
     gpu::GpuState& state = async_compute ? agc_compute_state(queue_id) : agc_graphics_state();
@@ -1561,6 +1642,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     size_t applied = gpu::run_command_buffer(addr, walk, state, &consumed);
     g_submit_count++;
     report_short_fold(who, g_submit_count, addr, dw_num, consumed);
+    report_submit_order(who, call_stamp, g_submit_count, addr, dw_num, state.draws.size());
     gpu::diagnose_compute_dispatches(state, g_submit_count);
     static unsigned draw_submits2 = 0;
     execute_submit_work(state, g_submit_count, draw_submits2);
@@ -1675,6 +1757,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; };
     const auto* p = (const Packet*)(uintptr_t)a0;
     if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
+    const SubmitCallStamp call_stamp = stamp_submit_call();   // BEFORE the lock: see the note above
     std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with submit_dcb_stream/w1KFAHVqpaU (#278)
     gpu::prosper_gpu_set_fold_origin(1);   // #1226: this direct entry is the graphics SubmitDcb path
     // Reset the per-submit draw list BEFORE folding this Dcb. The folded GpuState is process-lifetime and
@@ -1694,6 +1777,8 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state(), &consumed);
     g_submit_count++;
     report_short_fold("SubmitDcb", g_submit_count, p->addr, p->dw_num, consumed);
+    report_submit_order("SubmitDcb", call_stamp, g_submit_count, p->addr, p->dw_num,
+                        agc_gpu_state().draws.size());
     gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
     static unsigned draw_submits = 0;
     execute_submit_work(agc_gpu_state(), g_submit_count, draw_submits);
