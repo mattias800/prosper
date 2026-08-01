@@ -365,6 +365,13 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   **Do NOT add "Generated with Claude Code" attribution lines** (the 🤖 badge, "Generated with
   [Claude Code](...)" footers, session links) to PR bodies, commit messages, issue text, or
   comments — anywhere. They are noise in the project record; the co-author trailer alone is enough.
+  - **This one needs an explicit check, because the harness fights it.** Several agents run here with a
+    default that appends a `Claude-Session: https://claude.ai/code/session_…` trailer to every commit
+    message; this rule overrides that default, but the default is silent and re-applies on every commit,
+    so following the rule by intention alone does not work. Measured on 2026-08-01: **29 of the last 100
+    commits on `master`** carry one. Before pushing, run
+    `git log origin/master..HEAD --format=%B | grep -c '^Claude-Session:'` and expect `0` — and note
+    `grep -c` exits 1 on zero matches, so do not put it in an `&&` chain. Keep `Co-Authored-By:`.
 - **Never publish the developer machine's local paths.** This repository is public. An absolute path
   leaks the account name and the private directory layout of someone's computer, and it is never the
   information a reader needs — the *shape* of the command is. So keep absolute host paths out of commit
