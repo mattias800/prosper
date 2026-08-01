@@ -474,6 +474,8 @@ struct ParallelDrawRealizationStats {
 };
 ParallelDrawRealizationStats parallel_draw_realization_stats();
 
+// APPEND ONLY, and update kMaxRealizationFailureReason below. The value is serialized as a raw byte
+// into .prgcap, and both the in-memory validator and the reader bound-check it against that maximum.
 enum class RealizationFailureReason : uint8_t {
     None,
     Unknown,
@@ -483,7 +485,16 @@ enum class RealizationFailureReason : uint8_t {
     NoEffect,
     ZeroVertices,
     Filtered,
+    // The three exits below are reached in the ordered-submit path BEFORE realize_draw_item runs, so
+    // they can never carry a shader/pipeline diagnostic. They are distinct reasons rather than
+    // Unknown because "nothing was attempted, and here is why" is the answer an investigation needs
+    // (#1636) — collapsing them to Unknown is indistinguishable from the reason being lost.
+    RetainedDrawNotSelected,   // the retained-submit policy did not select this draw index
+    IndirectArguments,         // indirect draw/dispatch arguments could not be resolved
+    IndirectDependencies,      // an indirect operation's producer had not landed for this submit
 };
+inline constexpr RealizationFailureReason kMaxRealizationFailureReason =
+    RealizationFailureReason::IndirectDependencies;
 
 // Capture-facing facts collected at the exact point an operation is dropped. These contain no raw
 // shader bytes; gpu_capture reads those through its fault-safe, size-bounded memory reader.

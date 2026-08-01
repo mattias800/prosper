@@ -1093,7 +1093,7 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
     for (const auto& diagnostic : capture.failure_diagnostics) {
         if (diagnostic.kind > SubmitOperationKind::Dispatch ||
             diagnostic.reason <= RealizationFailureReason::None ||
-            diagnostic.reason > RealizationFailureReason::Filtered ||
+            diagnostic.reason > kMaxRealizationFailureReason ||
             diagnostic.stages.size() > kMaxFailureStages) {
             error = "invalid failed-operation diagnostic metadata";
             return false;
@@ -1324,6 +1324,9 @@ const char* realization_failure_reason_name(RealizationFailureReason reason) {
         case RealizationFailureReason::NoEffect: return "no-effect";
         case RealizationFailureReason::ZeroVertices: return "zero-vertices";
         case RealizationFailureReason::Filtered: return "filtered";
+        case RealizationFailureReason::RetainedDrawNotSelected: return "retained-draw-not-selected";
+        case RealizationFailureReason::IndirectArguments: return "indirect-arguments";
+        case RealizationFailureReason::IndirectDependencies: return "indirect-dependencies";
     }
     return "unknown";
 }
@@ -2486,7 +2489,7 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (!r.u8(kind) || kind > static_cast<uint8_t>(SubmitOperationKind::Dispatch) ||
                 !r.u64(diagnostic.source_index) || !r.u64(diagnostic.command_order) ||
                 !r.u8(reason) || reason <= static_cast<uint8_t>(RealizationFailureReason::None) ||
-                reason > static_cast<uint8_t>(RealizationFailureReason::Filtered) ||
+                reason > static_cast<uint8_t>(kMaxRealizationFailureReason) ||
                 !r.u8(pipeline_present)) {
                 error = "invalid failed-operation diagnostic metadata";
                 return false;

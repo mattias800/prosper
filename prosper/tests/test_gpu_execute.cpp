@@ -24,6 +24,16 @@
 #endif
 
 using namespace prosper::gpu;
+
+// Set or clear an environment variable (nullptr clears), so a test can arm a capture and disarm it
+// again without leaking the setting into the rest of the run.
+static void set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
 namespace P = prosper::agc::Pm4;
 
 static int fails = 0;
@@ -1122,6 +1132,112 @@ int main() {
         CHECK(backend.vs_words() == std::vector<uint32_t>({0x07230203u, 999u}) &&
                   !backend.vs_shared && backend.vs_identity == 0,
               "BackendDraw::set_vs substitutes and clears the shared value and identity");
+    }
+
+
+    // #1636: a draw that does not realize must record WHY, at the point it failed. This path used to
+    // `break` without touching capture_trace->failures, so gpu_capture synthesized an empty Unknown
+    // record and offline inspection reported reason=unknown with no target, extent or pipeline.
+    //
+    // Each case below asserts the SPECIFIC reason. Asserting merely that a record exists, or that it
+    // is non-empty, would pass against a fix that reports Unknown for everything — which is the exact
+    // failure mode this guards.
+    {
+        const auto capture_path =
+            prosper_test::test_scratch_dir() / "prosper_draw_failure_reasons.prgcap";
+        auto run_and_read = [&](const GpuState& state, uint64_t submit_no,
+                                GpuCaptureFile& captured) -> bool {
+            std::error_code ec;
+            std::filesystem::remove(capture_path, ec);
+            // The interactive (F9) arm deliberately bypasses every env AT/AFTER/MIN selector, so it
+            // is the only trigger that reliably fires on an arbitrary submit inside a test process.
+            request_interactive_gpu_capture(capture_path.string());
+            set_submit_renderer([&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                return RenderedFrame{};
+            });
+            execute_ordered_and_present(state, W, H, submit_no, /*publish=*/false);
+            set_submit_renderer({});
+            std::string error;
+            return read_gpu_capture(capture_path.string(), captured, error);
+        };
+        auto reason_for_draw = [](const GpuCaptureFile& captured, uint64_t command_order) {
+            for (const auto& diagnostic : captured.failure_diagnostics)
+                if (diagnostic.kind == SubmitOperationKind::Draw &&
+                    diagnostic.command_order == command_order)
+                    return diagnostic.reason;
+            return RealizationFailureReason::None;
+        };
+
+        // (a) Unresolvable indirect arguments — returns before realize_draw_item is ever reached, so
+        // it cannot inherit a shader/pipeline diagnostic and needs a reason of its own.
+        {
+            GpuState indirect = st;
+            indirect.draws.clear();
+            indirect.dispatches.clear();
+            indirect.dma_copies.clear();
+            indirect.ordered_memory_effects.clear();
+            GpuState::Draw bad_args;
+            bad_args.indirect = true;
+            bad_args.indirect_args_addr = 0xdead00000000ull;   // not guest-readable
+            bad_args.command_order = 300;
+            indirect.draws.push_back(bad_args);
+            GpuCaptureFile captured;
+            const bool read = run_and_read(indirect, 2101, captured);
+            const auto reason = reason_for_draw(captured, 300);
+            CHECK(read && reason == RealizationFailureReason::IndirectArguments,
+                  "#1636: an unresolvable indirect draw records reason=indirect-arguments");
+            CHECK(read && reason != RealizationFailureReason::Unknown,
+                  "#1636: ...and specifically NOT the old synthesized Unknown");
+        }
+
+        // (b) A draw whose realization genuinely fails inside realize_draw_item must FORWARD that
+        // reason, not flatten it. No pixel shader is bound here, so the executor knows exactly why.
+        {
+            uint32_t dma_source[2] = {1, 2};
+            uint32_t dma_destination[2] = {};
+            GpuState no_program = st;
+            no_program.draws.clear();
+            no_program.dispatches.clear();
+            no_program.dma_copies.clear();
+            no_program.ordered_memory_effects.clear();
+            no_program.sh[P::SPI_SHADER_PGM_LO_PS] = 0;
+            no_program.sh[P::SPI_SHADER_PGM_HI_PS] = 0;
+            no_program.sh[P::SPI_SHADER_PGM_LO_ES] = 0;
+            no_program.sh[P::SPI_SHADER_PGM_HI_ES] = 0;
+            GpuState::Draw plain;
+            plain.index_count = 3;
+            plain.command_order = 310;
+            no_program.draws.push_back(plain);
+            // An ordered DMA both routes the submit through the ordered path AND disables eager
+            // pre-realization (can_eagerly_realize_draws = !has_ordered_dma && !has_indirect), so
+            // the draw is realized by realize_retained_draw — the function this issue is about.
+            // With eager realization active the reason is lost in a DIFFERENT pass that has no
+            // failure channel at all; that is tracked separately and is NOT what this asserts.
+            no_program.dma_copies.push_back({
+                (uint64_t)(uintptr_t)dma_destination, (uint64_t)(uintptr_t)dma_source,
+                sizeof(dma_destination), 0, 305, 0});
+            GpuCaptureFile captured;
+            const bool read = run_and_read(no_program, 2102, captured);
+            const auto reason = reason_for_draw(captured, 310);
+            CHECK(read && reason != RealizationFailureReason::None,
+                  "#1636: a draw that fails inside realize_draw_item records a failure at all");
+            CHECK(read && reason != RealizationFailureReason::Unknown,
+                  "#1636: ...and forwards realize_draw_item's specific reason rather than Unknown");
+            CHECK(read && reason == RealizationFailureReason::MissingProgram,
+                  "#1636: an unbound shader program records reason=missing-program");
+        }
+
+        // (c) The reason names must round-trip through the capture format. A new enum value that the
+        // validator or the reader still bounds at Filtered would fail the whole capture write.
+        CHECK(std::string(realization_failure_reason_name(
+                  RealizationFailureReason::IndirectArguments)) == "indirect-arguments" &&
+              std::string(realization_failure_reason_name(
+                  RealizationFailureReason::IndirectDependencies)) == "indirect-dependencies" &&
+              std::string(realization_failure_reason_name(
+                  RealizationFailureReason::RetainedDrawNotSelected)) == "retained-draw-not-selected",
+              "#1636: the new reasons have names, so gpu_replay --inspect-only can print them");
+        std::error_code cleanup;
+        std::filesystem::remove(capture_path, cleanup);
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
