@@ -536,7 +536,14 @@ struct FlowPort {
     uint16_t type = 0;
     uint32_t data_format = 0;
     FlowSignal sig;
-    bool seen = false;
+    bool     seen = false;
+    uint32_t ctx_slot = 0;      // owning context, so each context reports only ITS ports
+    // Run-total signal, never reset. A per-interval line alone is a trap: a port can be silent for
+    // the interval that happens to be read (a gap between cues, or the moments before playback
+    // starts) while carrying strong signal over the run. Reading one such line cost this
+    // investigation a completely inverted conclusion, so every line carries the lifetime total too.
+    uint64_t life_nonzero = 0, life_samples = 0;
+    double   life_peak = 0.0;
 };
 
 struct FlowCtx {
@@ -563,6 +570,23 @@ std::atomic<uint64_t> g_flow_pcm_published{0};   // PortSetAttributes calls that
 std::mutex g_flow_mx;
 FlowCtx    g_flow_ctx[4];
 FlowPort   g_flow_port[kA2MaxPorts];
+
+// Tag a port slot with the context that owns it, so each context reports only its own ports.
+void flow_tag_port(FlowPort& fp, uint32_t ctx_slot, uint16_t type, uint32_t data_format) {
+    fp.seen = true;
+    fp.ctx_slot = ctx_slot;
+    fp.type = type;
+    fp.data_format = data_format;
+}
+
+// Accumulate one sample into both the per-interval and the never-reset run totals.
+void flow_add_sample(FlowPort& fp, float v) {
+    fp.sig.add(v);
+    ++fp.life_samples;
+    if (v != 0.0f) ++fp.life_nonzero;
+    const double a = v < 0 ? -(double)v : (double)v;
+    if (a > fp.life_peak) fp.life_peak = a;
+}
 
 // Emit one interval line per context plus a line per port that this context actually touched.
 // Caller must NOT hold g_flow_mx.
@@ -591,17 +615,24 @@ void audio_flow_report(uint32_t slot) {
             (unsigned long long)g_flow_pcm_published.load());
     for (uint32_t i = 0; i < kA2MaxPorts; ++i) {
         FlowPort& p = g_flow_port[i];
-        if (!p.seen) continue;
+        // Only this context's own ports. g_flow_port[] is a single global table, so without this
+        // filter every context prints (and RESETS) every other context's counters, splitting each
+        // port's per-second totals arbitrarily across unrelated context lines.
+        if (!p.seen || p.ctx_slot != slot) continue;
         fprintf(stderr,
                 "[audio-flow]   port%u type=0x%x fmt=0x%x reads=%llu mixed=%llu frames=%llu bytes=%llu"
-                " peak=%.5f rms=%.5f nonzero=%llu/%llu no-pcm=%llu skip-fmt=%llu skip-not-main=%llu short=%llu\n",
+                " peak=%.5f rms=%.5f nonzero=%llu/%llu no-pcm=%llu skip-fmt=%llu skip-not-main=%llu short=%llu"
+                " | life: nonzero=%llu/%llu peak=%.5f\n",
                 i + 1, p.type, p.data_format, (unsigned long long)p.reads,
                 (unsigned long long)p.mixed, (unsigned long long)p.frames,
                 (unsigned long long)p.bytes, p.sig.peak, p.sig.rms(),
                 (unsigned long long)p.sig.nonzero, (unsigned long long)p.sig.samples,
                 (unsigned long long)p.no_pcm, (unsigned long long)p.skip_fmt,
-                (unsigned long long)p.skip_not_main, (unsigned long long)p.short_read);
+                (unsigned long long)p.skip_not_main, (unsigned long long)p.short_read,
+                (unsigned long long)p.life_nonzero, (unsigned long long)p.life_samples,
+                p.life_peak);
         // Per-interval counters: reset so each line describes the LAST second, not the whole run.
+        // The `life:` totals above are deliberately NOT reset.
         p.reads = p.mixed = p.frames = p.bytes = 0;
         p.no_pcm = p.skip_fmt = p.skip_not_main = p.short_read = 0;
         p.seen = false;
@@ -1234,7 +1265,7 @@ HLE(audio2_ctx_push) {
                 if (flow) {
                     std::lock_guard<std::mutex> flk(g_flow_mx);
                     FlowPort& fp = g_flow_port[this_pidx];
-                    fp.seen = true; fp.type = ps.type; fp.data_format = ps.data_format;
+                    flow_tag_port(fp, context_slot, ps.type, ps.data_format);
                     ++fp.no_pcm;
                 }
                 continue;
@@ -1248,7 +1279,7 @@ HLE(audio2_ctx_push) {
                 if (flow) {
                     std::lock_guard<std::mutex> flk(g_flow_mx);
                     FlowPort& fp = g_flow_port[this_pidx];
-                    fp.seen = true; fp.type = ps.type; fp.data_format = ps.data_format;
+                    flow_tag_port(fp, context_slot, ps.type, ps.data_format);
                     ++fp.skip_fmt;
                 }
                 // A port rejected for its LAYOUT is never read, so "no signal here" would otherwise
@@ -1277,7 +1308,7 @@ HLE(audio2_ctx_push) {
                     for (size_t k = 0, nf = rej_frames * channels; k < nf; ++k) {
                         const float v = data_type == 0 ? tmp[k]
                                                        : (float)tmp_s16[k] * (1.0f / 32768.0f);
-                        fp.sig.add(v == v ? v : 0.0f);
+                        flow_add_sample(fp, v == v ? v : 0.0f);
                     }
                 }
                 continue;
@@ -1305,7 +1336,7 @@ HLE(audio2_ctx_push) {
             if (flow) {
                 std::lock_guard<std::mutex> flk(g_flow_mx);
                 FlowPort& fp = g_flow_port[this_pidx];
-                fp.seen = true; fp.type = ps.type; fp.data_format = ps.data_format;
+                flow_tag_port(fp, context_slot, ps.type, ps.data_format);
                 ++fp.reads;
                 fp.frames += frames_got;
                 fp.bytes += frames_got * channels *
@@ -1313,7 +1344,7 @@ HLE(audio2_ctx_push) {
                 if (frames_got < grain) ++fp.short_read;
                 for (size_t k = 0, nf = frames_got * channels; k < nf; ++k) {
                     const float v = data_type == 0 ? tmp[k] : (float)tmp_s16[k] * (1.0f / 32768.0f);
-                    fp.sig.add(v == v ? v : 0.0f);   // NaN counts as silence, as the mixer treats it
+                    flow_add_sample(fp, v == v ? v : 0.0f);  // NaN counts as silence, as the mixer does
                 }
                 if (ps.type != 0) ++fp.skip_not_main; else ++fp.mixed;
             }

@@ -62,14 +62,19 @@ completely different fixes:
 `ContextAdvance` and `ContextPush`, so each branch has its own signature:
 
 ```text
-[audio-flow] ctx1 created: grain=256 queue_depth=2 (host sink port 18)
-[audio-flow] port2 created: type=0x0 data_format=0x800 flags=0x0 (MAIN -> mixed to host)
-[audio-flow] ctx1 advance=188 push=188 (with-pcm=188 silent-paced=0 not-ready=0) sink=open port=18 \
-             grains=188 bytes=385024 bed-peak=0.00000 bed-rms=0.00000 bed-nonzero=0/96256 \
-             | lifetime: ctx=2 ports=2 pcm-published=2228
-[audio-flow]   port2 type=0x0 fmt=0x800 reads=169 mixed=169 frames=43264 bytes=1384448 \
-               peak=0.00000 rms=0.00000 nonzero=0/346112 no-pcm=0 skip-fmt=0 skip-not-main=0 short=0
+[audio-flow] ctx0 created: grain=256 queue_depth=2 (host sink port 17)
+[audio-flow] port1 created: type=0x0 data_format=0xc00 flags=0x0 (MAIN -> mixed to host)
+[audio-flow] ctx0 advance=189 push=189 (with-pcm=0 silent-paced=189 not-ready=0) sink=never-opened \
+             port=17 grains=0 bytes=0 bed-peak=0.00000 bed-rms=0.00000 bed-nonzero=0/96768 \
+             | lifetime: ctx=2 ports=2 pcm-published=747
+[audio-flow]   port1 type=0x0 fmt=0xc00 reads=189 mixed=0 frames=48384 bytes=2322432 \
+               peak=0.00000 rms=0.00000 nonzero=0/580608 no-pcm=0 skip-fmt=189 skip-not-main=0 \
+               short=0 | life: nonzero=594272/1714176 peak=0.00000
 ```
+
+That real example is worth reading closely: this interval reports `nonzero=0/580608`, yet the same
+line's `life:` total is `594272/1714176`. The port is **not** silent — the interval simply landed in
+a gap between cues, and `mixed=0 … skip-fmt=189` shows prosper discarding it 189 times a second.
 
 | Observation | Meaning |
 |---|---|
@@ -88,6 +93,11 @@ Read the counters, not just presence:
 - **`nonzero=N/M` is the measure that decides silent vs quiet.** Peak and RMS both print `0.00000`
   for a correctly-mixed quiet passage; only an exact `nonzero=0/M` proves the guest submitted a
   cleared buffer. The rule lives in `AudioSignalStats` (`src/hle/audio.hpp`) and is unit-tested.
+- **Judge a port by its `life:` totals, never by one interval.** Per-interval counters reset every
+  second, and real playback has gaps, so any single line can read `nonzero=0/M` on a port that
+  carries strong signal over the run. The never-reset `life: nonzero=N/M peak=P` on every port line
+  is what makes one line sufficient — reading only the last interval inverted this investigation's
+  first conclusion (instrument-trap 38).
 - **Per-port attribution** locates loss the mixed bed hides: `skip-not-main` (a port with signal
   discarded for not being MAIN), `skip-fmt` (unsupported layout), `no-pcm` (no buffer published),
   `short` (a partial/faulting guest read).
