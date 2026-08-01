@@ -483,10 +483,13 @@ size_t texture_decode_cache_limit_bytes(const char* override_mib,
 }
 
 bool submit_local_texture_decode_reusable(uint64_t entry_span, uint64_t current_span,
-                                          uint64_t source_size,
+                                          uint64_t entry_source_addr, uint64_t entry_source_size,
+                                          uint64_t current_source_addr, uint64_t current_source_size,
                                           prosper::gpu::GuestGpuWriteQuery journal_query) {
     if (entry_span == current_span) return true;
-    return source_size != 0 &&
+    return current_source_size != 0 &&
+        entry_source_addr == current_source_addr &&
+        entry_source_size == current_source_size &&
         journal_query == prosper::gpu::GuestGpuWriteQuery::Unchanged;
 }
 
@@ -1368,13 +1371,32 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             };
             // PROSPER_NO_SUBMIT_TEXTURE_DECODE_SCOPE=1 restores the pre-#1691 span-scoped lifetime on
             // the same build, so a routed A/B measures the change and not two compilers' luck.
+            //
+            // PROSPER_RESOURCE_HASH_DIM does the same, for a different reason: it correlates each
+            // decode's raw and sampled hashes with that range's writers, and it reports from inside
+            // the decode path. Retaining an identity across a span boundary would silently drop
+            // correlation points a previous build emitted, which would make the instrument disagree
+            // with itself across builds while investigating exactly the kind of question it exists
+            // for. Keep its output identical to pre-#1691 rather than make it cheaper.
             static const bool submit_decode_scope_disabled =
-                getenv("PROSPER_NO_SUBMIT_TEXTURE_DECODE_SCOPE") != nullptr;
+                getenv("PROSPER_NO_SUBMIT_TEXTURE_DECODE_SCOPE") != nullptr ||
+                getenv("PROSPER_RESOURCE_HASH_DIM") != nullptr;
             static thread_local std::unordered_map<TextureDecodeKey, DecodedTexture,
                                                    TextureDecodeKeyHash> decoded_textures;
             static thread_local uint64_t decode_span_ordinal = 0;
             ++decode_span_ordinal;
-            const bool rebuild_decode_scope = phase.first_span || submit_decode_scope_disabled;
+            // `phase.first_span` is the normal submit boundary, but it is not the only one: the
+            // warmup/window gates above (PROSPER_RENDER_FIRST, PROSPER_RENDER_DELAY_MS,
+            // PROSPER_RENDER_LAST) return before this point, so a submit can reach here first at a
+            // later span. Tracking the submit ordinal as well keeps the rebuild exact under those
+            // recipes — without it the pins and the LRU generation would sit frozen across the whole
+            // warmup. Retained entries were never unsafe there (a foreign submit serial makes the
+            // journal query Unknown, which refuses reuse before dereferencing anything), but stale
+            // state that outlives its submit is not something to leave resting on that.
+            static thread_local int decode_scope_submit = -1;
+            const bool rebuild_decode_scope = phase.first_span || submit_decode_scope_disabled ||
+                g_this_submit != decode_scope_submit;
+            decode_scope_submit = g_this_submit;
             const bool use_direct_buffer_views =
                 getenv("PROSPER_NO_FRONTEND_BUFFER_VIEW") == nullptr;
             static std::unordered_map<TextureDecodeKey, PersistentDecodedTexture, TextureDecodeKeyHash>
@@ -2041,24 +2063,33 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         bool narrow_decode_done = false;
                         auto reused = (has_live_rtt || resource_compute_image_hit)
                             ? decoded_textures.end() : decoded_textures.find(decode_key);
-                        // A retained entry from an EARLIER span in this submit is only usable while the
-                        // ordered journal proves nothing wrote the exact range it decoded. Overlap (an
-                        // interleaved compute/DMA/EOP write landed on the backing) and Unknown (no
-                        // journal, overflowed, or a different submit) both drop it, releasing its
-                        // scratch pin, and the resolve falls through to the persistent cache's own
-                        // validation exactly as it did before the map was widened.
-                        if (reused != decoded_textures.end() &&
-                            !submit_local_texture_decode_reusable(
-                                reused->second.span, decode_span_ordinal,
-                                reused->second.source_size,
-                                prosper::gpu::guest_gpu_writes_since(
-                                    reused->second.snapshot, reused->second.source_addr,
-                                    reused->second.source_size))) {
-                            if (reused->second.texstore_slot < texstore_pinned.size())
-                                texstore_pinned[reused->second.texstore_slot] = false;
-                            decoded_textures.erase(reused);
-                            reused = decoded_textures.end();
-                            ++g_texture_decode_scope.invalidations;
+                        // A retained entry from an EARLIER span in this submit is usable only while
+                        // its range is still this binding's range AND the ordered journal proves
+                        // nothing wrote it. Overlap (an interleaved compute/DMA/EOP write landed on
+                        // the backing), a moved range, and Unknown (no journal, overflowed, or a
+                        // different submit) all drop the entry, releasing its scratch pin, and the
+                        // resolve falls through to the persistent cache's own validation exactly as
+                        // it did before the map was widened. The journal query is skipped for a
+                        // same-span hit: its verdict cannot change the answer, and this runs once
+                        // per texture reference.
+                        if (reused != decoded_textures.end()) {
+                            const bool same_span = reused->second.span == decode_span_ordinal;
+                            const prosper::gpu::GuestGpuWriteQuery journal_query = same_span
+                                ? prosper::gpu::GuestGpuWriteQuery::Unchanged
+                                : prosper::gpu::guest_gpu_writes_since(
+                                      reused->second.snapshot, reused->second.source_addr,
+                                      reused->second.source_size);
+                            if (!submit_local_texture_decode_reusable(
+                                    reused->second.span, decode_span_ordinal,
+                                    reused->second.source_addr, reused->second.source_size,
+                                    persistent_source_addr, cross_span_source_size,
+                                    journal_query)) {
+                                if (reused->second.texstore_slot < texstore_pinned.size())
+                                    texstore_pinned[reused->second.texstore_slot] = false;
+                                decoded_textures.erase(reused);
+                                reused = decoded_textures.end();
+                                ++g_texture_decode_scope.invalidations;
+                            }
                         }
                         DecodedTexture persistent_reuse;
                         const DecodedTexture* decoded_reuse = reused != decoded_textures.end()
@@ -2387,20 +2418,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             narrow_done = decoded_reuse->narrow;
                             fr.persistent_texture_id = decoded_reuse->persistent_id;
                             fr.persistent_texture_version = decoded_reuse->persistent_version;
-                            // Reached with `decoded_reuse` pointing either at the entry just found in
-                            // this map (emplace is then a no-op on the existing key) or at a persistent
-                            // -cache hit, whose pixels the persistent entry owns. Either way the bytes
-                            // live in storage the scratch allocator never recycles, so no scratch pin
-                            // is needed, and the retained range is the one the persistent cache itself
-                            // validates for this identity.
-                            decoded_textures.emplace(
-                                decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
-                                                          fr.persistent_texture_id,
-                                                          fr.persistent_texture_version,
-                                                          decode_span_ordinal,
-                                                          prosper::gpu::guest_gpu_write_snapshot(),
-                                                          persistent_source_addr,
-                                                          cross_span_source_size, SIZE_MAX});
+                            // Only a persistent-cache hit needs to be recorded here; a submit-local
+                            // hit is already in the map under this key, and emplacing over it would
+                            // build and discard a node on every repeat reference. Persistent-hit
+                            // pixels are owned by the persistent entry, so the bytes live in storage
+                            // the scratch allocator never recycles and no pin is needed; the retained
+                            // range is the one that cache itself validates for this identity.
+                            if (!resource_local_reuse)
+                                decoded_textures.emplace(
+                                    decode_key,
+                                    DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
+                                                   fr.persistent_texture_id,
+                                                   fr.persistent_texture_version,
+                                                   decode_span_ordinal,
+                                                   prosper::gpu::guest_gpu_write_snapshot(),
+                                                   persistent_source_addr,
+                                                   cross_span_source_size, SIZE_MAX});
                             if (timing_enabled) pending_timing.texture_reuses++;
                         } else {
                         // PROSPER_DETILE_STATS: this branch is the texture-decode MISS path — the cache
@@ -2542,9 +2575,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // is true a retained identity entry must pin `texture_slot`, or the next span
                         // would decode an unrelated texture into the very slot it points at.
                         bool decoded_pixels_in_texstore = false;
-                        // Cleared only on the defensive path where ownership moved but no owner was
-                        // established; such pixels must never enter the identity map.
-                        bool decoded_pixels_valid = true;
                         if (retain_cpu_live_rtt) texture_pixels.clear();
                         else texture_pixels.resize(nb);
                         auto copy_linear_padded_rows = [&](uint8_t* dst, size_t dst_row,
@@ -3472,15 +3502,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     // persistent cache just took is their stable home.
                                     decoded_pixels_in_texstore = false;
                                 } else {
-                                    // Unreachable while the erase above precedes this emplace, but a
-                                    // failed insert would leave `texture_pixels` moved-from and
-                                    // `fr.tex_rgba` pointing at released bytes. Never retain that.
-                                    decoded_pixels_valid = false;
+                                    // Unreachable: the erase above leaves this key absent, so the
+                                    // insert cannot collide. Were it ever reachable, the move has
+                                    // already emptied `texture_pixels` and `fr.tex_rgba` would point
+                                    // at released bytes — which THIS draw would sample, not only the
+                                    // identity map. Bind the colliding entry's pixels instead; it is
+                                    // the same key, so it is the same decode.
+                                    fr.tex_rgba = inserted->second.pixels.data();
+                                    fr.persistent_texture_id = inserted->second.persistent_id;
+                                    fr.persistent_texture_version =
+                                        inserted->second.persistent_version;
+                                    decoded_pixels_in_texstore = false;
                                 }
                             }
                         }
-                        if (decoded_pixels_valid && !resource_rtt_hit &&
-                            !resource_compute_image_hit && !has_live_rtt) {
+                        if (!resource_rtt_hit && !resource_compute_image_hit && !has_live_rtt) {
                             // Pin the scratch slot only for an entry that can actually outlive this
                             // span AND whose pixels the persistent cache did not take: then the slot
                             // IS the storage and a later span reusing it would rewrite what the entry

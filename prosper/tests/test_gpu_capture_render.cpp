@@ -1237,16 +1237,31 @@ int main() {
         using prosper::frontend::submit_local_texture_decode_reusable;
         using prosper::frontend::texture_decode_scope_stats;
 
-        CHECK(submit_local_texture_decode_reusable(9, 9, 0, GuestGpuWriteQuery::Unknown),
+        constexpr uint64_t SRC = 0x40000, LEN = 64;
+        CHECK(submit_local_texture_decode_reusable(9, 9, SRC, LEN, SRC, LEN,
+                                                   GuestGpuWriteQuery::Unknown),
               "reuse inside the span that decoded the pixels keeps the historical guarantee");
-        CHECK(submit_local_texture_decode_reusable(9, 10, 64, GuestGpuWriteQuery::Unchanged),
+        CHECK(submit_local_texture_decode_reusable(9, 10, SRC, LEN, SRC, LEN,
+                                                   GuestGpuWriteQuery::Unchanged),
               "a proven-unchanged source range carries one decode across a span boundary");
-        CHECK(!submit_local_texture_decode_reusable(9, 10, 64, GuestGpuWriteQuery::Overlap),
+        CHECK(!submit_local_texture_decode_reusable(9, 10, SRC, LEN, SRC, LEN,
+                                                    GuestGpuWriteQuery::Overlap),
               "a guest GPU write over the decoded range forces a fresh cross-span resolve");
-        CHECK(!submit_local_texture_decode_reusable(9, 10, 64, GuestGpuWriteQuery::Unknown),
+        CHECK(!submit_local_texture_decode_reusable(9, 10, SRC, LEN, SRC, LEN,
+                                                    GuestGpuWriteQuery::Unknown),
               "an unusable journal never counts as proof that a decode survived a span boundary");
-        CHECK(!submit_local_texture_decode_reusable(9, 10, 0, GuestGpuWriteQuery::Unchanged),
+        CHECK(!submit_local_texture_decode_reusable(9, 10, SRC, LEN, SRC, 0,
+                                                    GuestGpuWriteQuery::Unchanged),
               "a resource with no validated source range keeps the span-local lifetime");
+        // The resolved range is not a pure function of the decode key: a DCC fast clear moves it to
+        // the metadata plane, and the HLE pitch registry can move its extent. An entry proved clean
+        // over its own range says nothing about a range that has since moved.
+        CHECK(!submit_local_texture_decode_reusable(9, 10, SRC, LEN, SRC + 0x1000, LEN,
+                                                    GuestGpuWriteQuery::Unchanged),
+              "a retained entry is refused once the binding resolves to a different source address");
+        CHECK(!submit_local_texture_decode_reusable(9, 10, SRC, LEN, SRC, LEN * 2,
+                                                    GuestGpuWriteQuery::Unchanged),
+              "a retained entry is refused once the binding resolves to a different source extent");
 
         // The end-to-end half needs a LIVE texture: captured replay backing sets host_data, which
         // excludes the resource from the persistent cache and therefore from cross-span retention.
@@ -1418,8 +1433,80 @@ int main() {
                       distinct_keys.invalidations == 0,
                   "two identities differing only in source row pitch decode separately");
 
-            // (4) The identity map does not outlive its submit: an entry established in one submit
-            // must never serve the next, whose indirect descriptor memory may have moved on.
+            // (4) SCRATCH PINNING — the aliasing hazard, which the cases above cannot reach because
+            // the persistent cache accepts their pixels and therefore owns them. Re-decoding an
+            // identity the persistent cache already holds THIS submit cannot replace that entry (its
+            // LRU generation is current), so the fresh pixels stay in the scratch slot and the map
+            // entry points straight at it. A later span must not be handed that slot.
+            //
+            //   span 1: decode -> persistent insert
+            //   dispatch A: rewrite the backing red->green and report it
+            //   span 2: forced re-decode, persistent entry not replaceable -> pixels live in scratch
+            //   dispatch B: write an unrelated range
+            //   span 3: draw a DIFFERENT texture first (the slot grab), then the retained identity
+            //
+            // Unpinned, span 3's first decode takes the slot span 2 is still pointing at and the
+            // second draw renders blue. Pinned, the allocator skips it and green survives.
+            const uint64_t pinned_texture = guest_base + 0x5000;
+            const uint64_t other_texture = guest_base + 0x6000;
+            const std::vector<uint8_t> blue_2x2 = {
+                0, 0, 255, 255,   0, 0, 255, 255,
+                0, 0, 255, 255,   0, 0, 255, 255,
+            };
+            std::memcpy(guest + 0x5000, red_2x2.data(), red_2x2.size());
+            std::memcpy(guest + 0x6000, blue_2x2.data(), blue_2x2.size());
+            std::vector<ComputeItem> two_dispatches(2);
+            two_dispatches[0].dispatch_index = 0;
+            two_dispatches[1].dispatch_index = 1;
+            int dispatch_seen = 0;
+            LiveComputeFn write_then_idle = [&](const std::vector<ComputeItem>&) {
+                if (dispatch_seen++ == 0) {
+                    std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(pinned_texture)),
+                                green_2x2.data(), green_2x2.size());
+                    notify_guest_gpu_write(pinned_texture, green_2x2.size());
+                } else {
+                    notify_guest_gpu_write(unrelated, 4);
+                }
+                return true;
+            };
+            uint64_t pin_targets[4] = {0, 0, 0, 0};
+            uint64_t pin_next_target = 0x101000000ull;
+            auto pin_draw = [&](uint64_t texture_addr, uint64_t draw_index, uint64_t order) {
+                DrawItem draw = texture_draw(texture_addr, 2, 2, 8, 0, order);
+                draw.draw_index = draw_index;
+                draw.color0_base = pin_next_target;
+                pin_targets[draw_index] = pin_next_target;
+                pin_next_target += 0x100000ull;
+                return draw;
+            };
+            dispatch_seen = 0;
+            reset_texture_decode_scope_stats();
+            execute_ordered_items(
+                {{SubmitOperationKind::Draw, 0, 100},
+                 {SubmitOperationKind::Dispatch, 0, 150},
+                 {SubmitOperationKind::Draw, 1, 200},
+                 {SubmitOperationKind::Dispatch, 1, 250},
+                 {SubmitOperationKind::Draw, 2, 300},
+                 {SubmitOperationKind::Draw, 3, 310}},
+                {pin_draw(pinned_texture, 0, 100), pin_draw(pinned_texture, 1, 200),
+                 pin_draw(other_texture, 2, 300), pin_draw(pinned_texture, 3, 310)},
+                two_dispatches, counting_render, write_then_idle, W, H);
+            const auto pinned = texture_decode_scope_stats();
+            std::vector<uint8_t> pin_second, pin_last;
+            const uint8_t* pin_span2 = target_center(pin_targets[1], pin_second);
+            const uint8_t* pin_span3 = target_center(pin_targets[3], pin_last);
+            CHECK(pinned.cross_span_reuses >= 1 && pinned.invalidations == 1,
+                  "the twice-decoded identity is retained again and served across the next boundary");
+            CHECK(pin_span2 && pin_span3 &&
+                      pin_span2[1] > 0xC0 && pin_span2[0] < 0x40 &&
+                      pin_span3[1] > 0xC0 && pin_span3[0] < 0x40,
+                  "a scratch-backed retained entry survives a later span decoding another texture");
+
+            // (5) The identity map does not outlive its submit: an entry established in one submit
+            // must never serve the next, whose indirect descriptor memory may have moved on. The
+            // discriminating counter is `invalidations` — a map that leaked across the boundary
+            // would FIND the stale entry and then refuse it on its foreign submit serial, which is
+            // safe but is not the contract. Zero invalidations means it was never there to find.
             const uint64_t across_texture = guest_base + 0x4000;
             std::memcpy(guest + 0x4000, red_2x2.data(), red_2x2.size());
             dispatch_writes = 0;
@@ -1433,9 +1520,9 @@ int main() {
                                   {texture_draw(across_texture, 2, 2, 8, 0, 100)},
                                   {}, counting_render, interleaved_write, W, H);
             const auto second_submit = texture_decode_scope_stats();
-            CHECK(first_submit.decodes == 1 && first_submit.cross_span_reuses == 0 &&
-                      second_submit.cross_span_reuses == 0 &&
-                      second_submit.same_span_reuses == first_submit.same_span_reuses,
+            CHECK(first_submit.decodes == 1 && first_submit.invalidations == 0 &&
+                      second_submit.invalidations == 0 &&
+                      second_submit.cross_span_reuses == 0,
                   "a new submit rebuilds the identity map instead of inheriting the previous one");
         }
     }

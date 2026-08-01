@@ -20,20 +20,30 @@ namespace prosper::frontend {
 // the range it decoded.
 //
 // Reuse inside the span that produced the entry keeps the historical span-local guarantee and needs
-// no proof. Crossing a span boundary needs both halves:
+// no proof. Crossing a span boundary needs all three of:
 //
-//   * `source_size` != 0 — a known validated source range. It is the persistent decode cache's own
-//     range for this identity, so the fast path asserts exactly what that cache asserts, and it is
-//     deliberately zero for resources the persistent cache does not validate (captured replay
-//     backing, storage images, unsupported DCC states). Those keep the pre-#1691 span lifetime rather
-//     than being retained against a range nobody established.
+//   * `current_source_size` != 0 — a known validated source range. It is the persistent decode
+//     cache's own range for this identity, and is deliberately zero for resources that cache does
+//     not validate (captured replay backing, storage images, unsupported DCC states). Those keep the
+//     pre-#1691 span lifetime rather than being retained against a range nobody established.
+//   * the entry's range still being THIS binding's range. The resolved range is not a pure function
+//     of `TextureDecodeKey`: it switches to the DCC metadata plane when live metadata content reads
+//     as a fast clear, and it can follow the HLE allocation registry's pitch — neither is in the key.
+//     An entry retained over the base texels must therefore not be served to a binding that now
+//     resolves to the metadata plane, or a metadata-only rewrite between spans would read as
+//     journal-clean over a range that is no longer the authority. The persistent cache makes exactly
+//     this comparison before its own reuse; a fast path that short-circuits it must not assert less.
 //   * `journal_query` == Unchanged — the ordered in-submit journal proves no retained GPU operation
 //     wrote that range since the entry was established. Overlap means the guest GPU did write it
 //     (the #780 stale-copy shape); Unknown (journal inactive, overflowed, or from a different submit)
 //     is not evidence of anything. Both force a fresh resolve through the persistent cache's exact
 //     validation, which is the pre-#1691 behavior.
+//
+// `journal_query` is ignored when the spans match, so a same-span caller may pass any value rather
+// than paying for a query whose verdict cannot matter — this runs once per texture reference.
 bool submit_local_texture_decode_reusable(uint64_t entry_span, uint64_t current_span,
-                                          uint64_t source_size,
+                                          uint64_t entry_source_addr, uint64_t entry_source_size,
+                                          uint64_t current_source_addr, uint64_t current_source_size,
                                           prosper::gpu::GuestGpuWriteQuery journal_query);
 
 // Identity-scope accounting for the decoded-texture map, maintained unconditionally so a routed run
