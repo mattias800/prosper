@@ -980,9 +980,13 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
         int nf = 0; uint64_t last = 0;
         for (int i = 0; i < 1600 && i < maxw && nf < 20 && p < (int)sizeof line - 24; i++) {
             uint64_t v = sp[i];
+            // #1659: was a two-branch dispatcher whose eboot base was the stale pre-#825 literal
+            // (the il2cpp one was current). This formatter already carried a per-entry module tag, so
+            // unlike [preadlog] above it can name every module correctly.
             const char* m = nullptr; uint64_t o = 0;
-            if (v >= 0x400000000ull && v < 0x420000000ull) { m = "eb"; o = v - 0x400000000ull; }
-            else if (v >= 0x440000000ull && v < 0x4c0000000ull) { m = "il"; o = v - 0x440000000ull; }
+            if (prosper::guest_va_in_module(v)) {
+                m = prosper::guest_module_name(v); o = prosper::guest_module_offset(v);
+            }
             if (m && o != last) { p += snprintf(line + p, sizeof line - p, " %s+%llx", m, (unsigned long long)o); last = o; nf++; }
         }
         fprintf(stderr, "%s\n", line);

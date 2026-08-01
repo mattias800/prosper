@@ -4591,7 +4591,9 @@ uint64_t sync_guest_caller() {
     uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
     for (int i = 0; i < 160; i++) {
         uint64_t v = sp[i];
-        if (v < 0x400000000ull || v >= 0x600000000ull) continue;   // guest MODULES only (exclude 0x6.. import stubs)
+        // #1659: says "guest MODULES only" and now means it — the old lower bound admitted the
+        // pre-#825 aperture, which is direct memory, not a module.
+        if (!prosper::guest_va_in_module(v) || v >= prosper::BOOT_STUB) continue;
         if ((v & 0xfff) < 8) continue;                             // keep the 6-byte look-back on v's page
         // A stack word in the guest range may be data, not a return address, and could point at an
         // UNMAPPED gap between modules — so confirm the page is committed+readable before dereferencing

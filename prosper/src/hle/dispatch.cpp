@@ -1,4 +1,5 @@
 #include "dispatch.hpp"
+#include "../host/boot_program.hpp"   // #1659
 #include <cstdlib>
 #include <unordered_map>
 #include <mutex>
@@ -39,7 +40,8 @@ namespace {
 
 #ifdef _WIN32
     bool executable_guest_address(uint64_t address) {
-        if (address < 0x400000000ull || address >= 0x600000000ull) return false;
+        // #1659: module range, not the pre-#825 literal (which admitted the DMEM aperture).
+        if (!prosper::guest_va_in_module(address) || address >= prosper::BOOT_STUB) return false;
         MEMORY_BASIC_INFORMATION memory{};
         if (!VirtualQuery((const void*)(uintptr_t)address, &memory, sizeof(memory)) ||
             memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD)) return false;

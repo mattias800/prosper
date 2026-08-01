@@ -2909,7 +2909,8 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         unsigned guest_return_count = 0;
         for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && guest_return_count < 8; ++i) {
             const uint64_t candidate = stack_words[i];
-            if (candidate < 0x400000000ull || candidate >= 0x600000000ull) continue;
+            // #1659: module range, not the pre-#825 literal.
+            if (!prosper::guest_va_in_module(candidate) || candidate >= prosper::BOOT_STUB) continue;
             bool in_guest_module = false;
             for (const UnwindModuleDesc& guest_module : modules)
                 in_guest_module |= candidate >= guest_module.lo && candidate < guest_module.hi;
