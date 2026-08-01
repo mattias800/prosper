@@ -118,9 +118,76 @@ static int64_t call_raw(const char* nid, uint64_t a0 = 0, uint64_t a1 = 0, uint6
 }
 static uint64_t PTR(const void* p) { return (uint64_t)(uintptr_t)p; }
 
+// AudioSignalStats is the decision rule PROSPER_AUDIO_FLOW rests on when classifying a silent
+// title: "the guest submitted nothing" vs "submitted exactly-zero PCM" vs "submitted real signal".
+// A wrong answer here sends the next investigation at the wrong subsystem entirely, so pin the
+// distinction that peak and RMS alone cannot make — quiet-but-real must NOT read as silent.
+static void test_signal_stats() {
+    // An all-zero buffer: the signature of a guest that submitted a cleared grain.
+    AudioSignalStats zero;
+    for (int i = 0; i < 512; i++) zero.add(0.0f);
+    CHECK(zero.samples == 512);
+    CHECK(zero.nonzero == 0);
+    CHECK(zero.silent());
+    CHECK(zero.peak == 0.0);
+    CHECK(zero.rms() == 0.0);
+
+    // A genuinely QUIET but real mix, far below any threshold one would pick for "audible".
+    // This is the case an RMS-threshold rule gets wrong, and the assertion that fails if the
+    // measure is changed to one.
+    AudioSignalStats quiet;
+    for (int i = 0; i < 512; i++) quiet.add(i % 2 ? 3.0e-7f : -3.0e-7f);
+    CHECK(quiet.nonzero == 512);
+    CHECK(!quiet.silent());
+    CHECK(quiet.peak < 1.0e-6);
+    CHECK(quiet.rms() < 1.0e-6);
+    CHECK(quiet.rms() > 0.0);              // but exactly, measurably non-zero
+
+    // NaN is the one input class where "non-zero" and "non-zero peak" disagree: `a > peak` is false
+    // for NaN, so a peak-based rule reports an all-NaN buffer as silent while the nonzero count
+    // reports it as full. Pins the semantics against a peak==0.0 implementation, which satisfies
+    // every other case here. The probe counts NaN separately and then treats it as the silence the
+    // sink's clamp turns it into, so this distinction must stay visible at the accumulator.
+    AudioSignalStats nans;
+    const float nan_v = std::nan("");
+    for (int i = 0; i < 64; i++) nans.add(nan_v);
+    CHECK(nans.samples == 64);
+    CHECK(nans.nonzero == 64);             // a peak-based rule would say 0 here
+    CHECK(!nans.silent());
+    CHECK(nans.peak == 0.0);               // NaN never raises the running peak
+
+    // Real programme material: peak and RMS both meaningful, nonzero tracks the samples.
+    AudioSignalStats loud;
+    for (int i = 0; i < 4; i++) loud.add(i == 2 ? -0.5f : 0.25f);
+    CHECK(loud.samples == 4);
+    CHECK(loud.nonzero == 4);
+    CHECK(!loud.silent());
+    CHECK(std::fabs(loud.peak - 0.5) < 1e-9);
+    CHECK(std::fabs(loud.rms() - std::sqrt((0.0625 * 3 + 0.25) / 4.0)) < 1e-9);
+
+    // A lone transient in an otherwise silent buffer: peak alone would call this a healthy signal,
+    // so the report must expose that only one sample of many is actually non-zero.
+    AudioSignalStats transient;
+    transient.add(1.0f);
+    for (int i = 0; i < 999; i++) transient.add(0.0f);
+    CHECK(transient.peak == 1.0);
+    CHECK(transient.nonzero == 1);
+    CHECK(transient.samples == 1000);
+    CHECK(!transient.silent());
+    CHECK(transient.rms() < 0.04);         // ~0.0316: far below the peak it reports
+
+    // An empty accumulator must not divide by zero, and reset must return to that state.
+    AudioSignalStats empty;
+    CHECK(empty.rms() == 0.0);
+    CHECK(empty.silent());
+    loud.reset();
+    CHECK(loud.samples == 0 && loud.nonzero == 0 && loud.peak == 0.0 && loud.rms() == 0.0);
+}
+
 int main() {
     printf("== test_audio ==\n");
     register_builtin_hle();
+    test_signal_stats();
 
     // --- 1. format decoding (all 8 SceAudioOutParamFormat values + an unknown) ---------------
     struct { uint32_t param; int ch; AudioFmt fmt; } fmts[] = {

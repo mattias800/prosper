@@ -7,6 +7,7 @@
 // frontend (e.g. SDL3, see frontends/audio_sdl3/) lives OUTSIDE prosper_core and installs
 // itself via audio_set_sink(), keeping prosper_core dependency-free and unit-testable.
 #pragma once
+#include <cmath>
 #include <cstdint>
 
 namespace prosper {
@@ -38,6 +39,41 @@ int audio_peak_channel_volume(uint32_t mask, const int* vols);
 // Reserve one AudioOut2 device-queue slot. Kept as a pure transition so queue accounting can be
 // verified independently of the wall-clock drain performed by sceAudioOut2ContextGetQueueLevel.
 bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth);
+
+// Non-silence measure for submitted PCM (see PROSPER_AUDIO_FLOW in hle_audio.cpp). Diagnosing a
+// silent title requires separating "the guest submitted nothing", "the guest submitted zeros" and
+// "the guest submitted real signal we then lost", and no single statistic does that:
+//   peak    catches a lone transient but says nothing about how much signal is present — one stray
+//           sample in an otherwise empty buffer reports the same peak as a full mix;
+//   rms()   separates an audible mix from a denormal noise floor, but is a threshold judgement: any
+//           cutoff you pick calls some genuinely-mixed quiet passage "silent";
+//   nonzero counts samples differing from exactly zero. It is the only EXACT member of the three,
+//           and the only one that separates the two cases the caller must not confuse: a buffer the
+//           guest cleared has nonzero==0 exactly, whereas real programme material — however quiet —
+//           has nonzero close to samples. Note it is exactness, not print precision, that matters:
+//           a level low enough to print as 0.00000 can still be unambiguously non-silent here.
+// Kept as a pure accumulator so the decision rule the diagnostic rests on is unit-testable
+// without a device, a guest, or a live boot.
+struct AudioSignalStats {
+    double   peak    = 0.0;
+    double   sumsq   = 0.0;
+    uint64_t samples = 0;
+    uint64_t nonzero = 0;
+
+    void add(float v) {
+        const double d = (double)v;
+        const double a = d < 0 ? -d : d;
+        if (a > peak) peak = a;
+        sumsq += d * d;
+        ++samples;
+        if (v != 0.0f) ++nonzero;
+    }
+    double rms() const { return samples ? std::sqrt(sumsq / (double)samples) : 0.0; }
+    // True only for a buffer that is exactly zero everywhere — the signature of a guest that
+    // submitted a cleared buffer, as opposed to one that mixed something quiet.
+    bool silent() const { return nonzero == 0; }
+    void reset() { peak = 0.0; sumsq = 0.0; samples = 0; nonzero = 0; }
+};
 
 // Pluggable audio backend. All calls arrive on the guest's audio thread; output() MAY block to
 // pace it (as real hardware does — sceAudioOutOutput blocks until the ring has room).

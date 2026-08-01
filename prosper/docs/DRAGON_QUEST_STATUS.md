@@ -318,6 +318,36 @@ current build.
   strided buffer range that does not overlap draw 95's foreground texture. Historical title evidence
   also reached the title with this dispatch skipped, so it is not the route blocker.
 
+- **Audio: the guest submits REAL audio and prosper discards all of it (#1692, fix tracked as #1700).**
+  Measured with `PROSPER_AUDIO_FLOW=1` (see `AUDIO.md`) on a `reach-title-screen.pad` run of the
+  direct SDL3 frontend. The title creates **two** AudioOut2 contexts, each with one MAIN
+  (`type=0x0`) port, and they carry opposite content. All figures below are the never-reset `LIFE:`
+  run totals from the **final report line of a single run**, not summed interval samples:
+
+  | | ctx0 / port1 | ctx1 / port2 |
+  |---|---|---|
+  | `data_format` | `0xc00` -> 12ch f32 | `0x800` -> 8ch f32 |
+  | pushes / s | 188 | 188 |
+  | guest PCM read / s | 48,128 frames, 2,310,144 B | 48,128 frames, 1,540,096 B |
+  | mixed to host | **no — discarded, `skip-fmt=188`** | yes, 188 grains/s to sink port 18 |
+  | **`LIFE: nonzero`** | **1,782,048 / 18,456,576** | **0 / 15,007,744** |
+  | **`LIFE: peak` / `rms`** | **0.38976 / 0.01033** | 0.00000 / 0.00000 |
+  | `LIFE: nan` | 0 | 0 |
+  | context sink | `never-opened`, `silent-paced=188` | `open`, `BED LIFE: nonzero=0/3,751,936` |
+
+  So the audio the title actually renders is in the **12-channel port**, at healthy levels — and
+  prosper's push mix loop rejects `channels > 8` and throws away all 2.31 MB/s of it, 188 times a
+  second. Because port1 is ctx0's only port, `have_pcm` is never true for that context, so it
+  **never opens a host sink at all**. The 8-channel port that prosper *does* mix and forward to the
+  real device is the one that is exactly zero-filled — which is why the device opens, plays, and is
+  silent. `nan=0` on both ports rules out a NaN/decode artifact. This is a defect in prosper, not
+  upstream in the title.
+- **Read the `LIFE:` totals, not a single interval.** This finding was initially called the opposite
+  ("the guest submits only silence") from one report line in which port1 showed `nonzero=0/577536`.
+  Playback has gaps, so any one interval can land in one; in the same run the port's run total is
+  1.78 M non-zero samples at peak 0.38976. Every port and context line now carries a never-reset
+  total for exactly this reason. See instrument-trap 39.
+
 ## Ruled out — eliminated, do not re-run these
 
 - **"The failing draws run with the previous pipeline's *user data*."** This title's own
@@ -450,6 +480,7 @@ blocker.
 | what the presented frame actually holds | `PROSPER_DUMP_PERSISTENT=1` -> `[persist] present: … scanout=HIT/MISS rgb_nonblack=N` |
 | who writes a surface (colour, compute, DMA, WRITE_DATA) | `PROSPER_PROVENANCE_DIM=WxH` |
 | a successful shader's raw RDNA2 + SPIR-V | `PROSPER_SHADER_DUMP_SUCCESS=DIR` (**create DIR first**) + `shader_inspect` |
+| whether audio is absent, silent, or dropped by us | `PROSPER_AUDIO_FLOW=1` -> `[audio-flow]` (see `AUDIO.md`); read `nonzero=N/M`, not peak/rms |
 
 ## Do not restart
 

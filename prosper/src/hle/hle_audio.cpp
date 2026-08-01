@@ -15,6 +15,7 @@
 #include "../host/posix_shim.hpp" // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <deque>
 #include <chrono>
 #include <cstdint>
@@ -196,18 +197,22 @@ const char* audio_dump_path() {
     return (p && *p) ? p : nullptr;
 }
 
-// Peak |sample| of one grain, normalized to [0,1] for either sample format.
-double audio_pcm_peak(const void* pcm, int frames, const AudioPortInfo& info) {
+// Peak |sample| of one grain, normalized to [0,1] for either sample format. `sumsq` accumulates
+// the squared samples so the caller can also report RMS: peak alone cannot distinguish a mix that
+// is audibly present from one stray non-zero sample in an otherwise silent buffer.
+double audio_pcm_peak(const void* pcm, int frames, const AudioPortInfo& info,
+                      double* sumsq = nullptr) {
     if (!pcm || frames <= 0) return 0.0;
     const int n = frames * info.channels;
-    double peak = 0.0;
+    double peak = 0.0, ss = 0.0;
     if (info.fmt == AudioFmt::F32) {
         const float* s = (const float*)pcm;
-        for (int i = 0; i < n; i++) { double v = s[i] < 0 ? -(double)s[i] : (double)s[i]; if (v > peak) peak = v; }
+        for (int i = 0; i < n; i++) { double v = s[i] < 0 ? -(double)s[i] : (double)s[i]; if (v > peak) peak = v; ss += (double)s[i] * (double)s[i]; }
     } else {
         const int16_t* s = (const int16_t*)pcm;
-        for (int i = 0; i < n; i++) { double v = (s[i] < 0 ? -(double)s[i] : (double)s[i]) / 32768.0; if (v > peak) peak = v; }
+        for (int i = 0; i < n; i++) { double f = (double)s[i] / 32768.0; double v = f < 0 ? -f : f; if (v > peak) peak = v; ss += f * f; }
     }
+    if (sumsq) *sumsq += ss;
     return peak;
 }
 
@@ -217,20 +222,27 @@ double audio_pcm_peak(const void* pcm, int frames, const AudioPortInfo& info) {
 void audio_observe_output(int handle, const void* pcm, int frames, const AudioPortInfo& info) {
     if (!audiolog() && !audio_dump_path()) return;
     if (handle < 1 || handle > kMaxSinkPorts) return;
-    static struct Obs { uint64_t calls = 0; double peak = 0.0; FILE* dump = nullptr;
+    static struct Obs { uint64_t calls = 0; uint64_t bytes = 0; uint64_t samples = 0;
+                        double peak = 0.0; double sumsq = 0.0; FILE* dump = nullptr;
                         std::chrono::steady_clock::time_point last{}; } st[kMaxSinkPorts];
     Obs& s = st[handle - 1];
     s.calls++;
-    double p = audio_pcm_peak(pcm, frames, info);
+    if (pcm && frames > 0) {
+        s.bytes += (uint64_t)frames * audio_frame_bytes(info);
+        s.samples += (uint64_t)frames * info.channels;
+    }
+    double p = audio_pcm_peak(pcm, frames, info, &s.sumsq);
     if (p > s.peak) s.peak = p;
     if (audiolog()) {
         auto now = std::chrono::steady_clock::now();
         if (s.last.time_since_epoch().count() == 0) s.last = now;
         if (now - s.last >= std::chrono::seconds(1)) {
-            fprintf(stderr, "[audio] port %d: %llu output calls, 1s-peak=%.4f (fmt=%s ch=%d freq=%d grain=%d)\n",
-                    handle, (unsigned long long)s.calls, s.peak,
+            fprintf(stderr, "[audio] port %d: %llu output calls (total), 1s-bytes=%llu 1s-peak=%.4f 1s-rms=%.4f"
+                            " (fmt=%s ch=%d freq=%d grain=%d)\n",
+                    handle, (unsigned long long)s.calls, (unsigned long long)s.bytes, s.peak,
+                    s.samples ? std::sqrt(s.sumsq / (double)s.samples) : 0.0,
                     info.fmt == AudioFmt::F32 ? "f32" : "s16", info.channels, info.freq, info.grain);
-            s.last = now; s.peak = 0.0;
+            s.last = now; s.peak = 0.0; s.sumsq = 0.0; s.samples = 0; s.bytes = 0;
         }
     }
     if (const char* base = audio_dump_path()) {
@@ -483,6 +495,216 @@ A2PortState g_a2_port_state[kA2MaxPorts];
 bool g_a2_speaker_arrays[32]{};
 constexpr int kA2SinkPortBase = kMaxPorts + 1; // host-only ports 17..20, one per AudioOut2 context
 
+// --- PROSPER_AUDIO_FLOW: end-to-end audio submission probe --------------------------------
+// A silent title has three mutually exclusive causes that look IDENTICAL from outside, and each
+// needs a different fix:
+//   (1) the guest never submits PCM        -> the defect is upstream (mixer/voice/HLE return),
+//   (2) the guest submits all-zero PCM     -> the defect is in the title's own mixing/decode,
+//   (3) the guest submits real PCM and we  -> the defect is ours (routing/sink/volume).
+//       drop, discard or mute it
+// The pre-existing diagnostics cannot separate these, because BOTH of them fall silent in cases
+// (1) and (2): the once-per-second `[audio] port N` line is only reached after `have_pcm &&
+// open_ok` (so it never prints if no MAIN port yielded frames), and `PROSPER_AUDIO2_PROBE` only
+// prints a port whose `|max| > 0` (so an all-zero submission prints nothing). "No output" was
+// therefore an uninformative negative.
+//
+// PROSPER_AUDIO_FLOW=1 reports UNCONDITIONALLY — including all-zero signal and zero-length reads —
+// once per second per AudioOut2 context, from BOTH Advance and Push, so every branch is visible:
+//   no lines at all              -> the guest never created a context / never ran its pump loop
+//   `advance=N push=0`           -> the pump runs but never submits            (case 1)
+//   `push=N ... bed-peak=0.0000` -> real submissions carrying silence          (case 2)
+//   `push=N ... bed-peak>0`      -> real signal reaches the host sink          (case 3)
+// The per-port breakdown additionally attributes losses that the mixed bed alone hides: a port
+// carrying signal that is discarded for not being MAIN (`skip-not-main`), an unsupported format
+// (`skip-fmt`), a never-published PCM pointer (`no-pcm`), or a short/faulting guest read
+// (`short`). Reported per interval: submission count, byte count, and both peak and RMS.
+namespace {
+
+bool audio_flow() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PROSPER_AUDIO_FLOW"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v == 1;
+}
+
+// The non-silence measure itself lives in audio.hpp as AudioSignalStats so the rule this whole
+// diagnostic rests on (silent vs quiet vs absent) is unit-tested without a device or a live boot.
+using FlowSignal = AudioSignalStats;
+
+struct FlowPort {
+    uint64_t reads = 0, mixed = 0, frames = 0, bytes = 0;
+    uint64_t no_pcm = 0, skip_fmt = 0, skip_not_main = 0, short_read = 0;
+    uint16_t type = 0;
+    uint32_t data_format = 0;
+    FlowSignal sig;
+    bool     seen = false;
+    uint32_t ctx_slot = 0;      // owning context, so each context reports only ITS ports
+    // Run-total signal, never reset. A per-interval line alone is a trap: a port can be silent for
+    // the interval that happens to be read (a gap between cues, or the moments before playback
+    // starts) while carrying strong signal over the run. Reading one such line cost this
+    // investigation a completely inverted conclusion, so every line carries the lifetime total too.
+    // Deliberately the SAME accumulator type as the interval measure: the verdict is drawn from
+    // this number, so it must not be a second, untested hand-rolled copy of the rule.
+    AudioSignalStats life;
+    // NaN is neither silence nor signal, and mapping it to either hides a real defect: the sink
+    // clamps NaN to zero, so a NaN-producing guest is audibly silent while carrying "data".
+    uint64_t nan_samples = 0, life_nan = 0;
+};
+
+struct FlowCtx {
+    uint64_t advances = 0, pushes = 0, pushes_with_pcm = 0, silent_paced = 0, not_ready = 0;
+    uint64_t sink_grains = 0, sink_bytes = 0;
+    FlowSignal bed;
+    // The mixed bed needs a never-reset total for exactly the reason each port does — and more
+    // urgently, because `bed-nonzero` is what the documented decision table keys on. A per-interval
+    // bed value is a RATE; only the run total is a verdict.
+    FlowSignal bed_life;
+    uint64_t bed_nan = 0, bed_life_nan = 0;
+    bool sink_opened = false, sink_open_ok = false;
+    std::chrono::steady_clock::time_point last{};
+};
+
+// Reached-ness counters, so a null reading is a FINDING rather than an ambiguity. "Zero
+// submissions" means something completely different depending on how far the guest got, and
+// those cases are indistinguishable from the submission counters alone:
+//   ports_created=0                 -> the guest never built an audio graph at all
+//   ports_created>0, pcm_published=0 -> it built one but never handed us a PCM buffer
+//   pcm_published>0, pushes=0        -> buffers are wired up but the pump never submits
+// Counted globally (not per context) because they are lifecycle facts about the whole run.
+std::atomic<uint64_t> g_flow_ctx_created{0};
+std::atomic<uint64_t> g_flow_ports_created{0};
+std::atomic<uint64_t> g_flow_pcm_published{0};   // PortSetAttributes calls that set a PCM pointer
+
+// g_flow_mx is a LEAF: no other lock may be acquired while it is held, and the report must never
+// read g_a2_* state from inside it. That is the invariant, not "acquired last" — it is taken both
+// with g_a2_mx/g_a2_sink_mx held and with nothing held, and only leaf-ness makes both safe.
+// Concretely: do NOT look a port's owning context up from g_a2_port_state inside the report (the
+// obvious way to filter by context) — that would be g_flow_mx -> g_a2_mx against the
+// g_a2_mx -> g_flow_mx order used by the push path, i.e. a genuine deadlock. FlowPort::ctx_slot is
+// cached precisely so the report needs no other lock.
+std::mutex g_flow_mx;
+FlowCtx    g_flow_ctx[4];
+FlowPort   g_flow_port[kA2MaxPorts];
+
+// Tag a port slot with the context that owns it, so each context reports only its own ports.
+void flow_tag_port(FlowPort& fp, uint32_t ctx_slot, uint16_t type, uint32_t data_format) {
+    fp.seen = true;
+    fp.ctx_slot = ctx_slot;
+    fp.type = type;
+    fp.data_format = data_format;
+}
+
+// Accumulate one raw sample into both the per-interval and the never-reset run totals.
+// NaN is counted and then treated as silence, matching what the sink actually outputs.
+void flow_add_sample(FlowPort& fp, float v) {
+    if (v != v) { ++fp.nan_samples; ++fp.life_nan; v = 0.0f; }
+    fp.sig.add(v);
+    fp.life.add(v);
+}
+
+// Same for the mixed stereo bed. The bed must classify NaN exactly as the ports do: the output
+// path clamps NaN to zero, so counting it as signal would report "case 3, signal reaches the sink"
+// for a guest whose audio is inaudible.
+void flow_add_bed_sample(FlowCtx& f, float v) {
+    if (v != v) { ++f.bed_nan; ++f.bed_life_nan; v = 0.0f; }
+    f.bed.add(v);
+    f.bed_life.add(v);
+}
+
+// Emit one interval line per context plus a line per port that this context actually touched.
+// Caller must NOT hold g_flow_mx.
+void audio_flow_report(uint32_t slot) {
+    if (!audio_flow() || slot >= 4) return;
+    std::lock_guard<std::mutex> lk(g_flow_mx);
+    FlowCtx& f = g_flow_ctx[slot];
+    const auto now = std::chrono::steady_clock::now();
+    if (f.last.time_since_epoch().count() == 0) { f.last = now; return; }
+    if (now - f.last < std::chrono::seconds(1)) return;
+    f.last = now;
+    fprintf(stderr,
+            "[audio-flow] ctx%u advance=%llu push=%llu (with-pcm=%llu silent-paced=%llu not-ready=%llu)"
+            " sink=%s port=%d grains=%llu bytes=%llu bed-peak=%.5f bed-rms=%.5f bed-nonzero=%llu/%llu"
+            " bed-nan=%llu | BED LIFE: nonzero=%llu/%llu peak=%.5f rms=%.5f nan=%llu"
+            " | lifetime: ctx=%llu ports=%llu pcm-published=%llu\n",
+            slot, (unsigned long long)f.advances, (unsigned long long)f.pushes,
+            (unsigned long long)f.pushes_with_pcm, (unsigned long long)f.silent_paced,
+            (unsigned long long)f.not_ready,
+            !f.sink_opened ? "never-opened" : (f.sink_open_ok ? "open" : "OPEN-FAILED"),
+            kA2SinkPortBase + (int)slot,
+            (unsigned long long)f.sink_grains, (unsigned long long)f.sink_bytes,
+            f.bed.peak, f.bed.rms(),
+            (unsigned long long)f.bed.nonzero, (unsigned long long)f.bed.samples,
+            (unsigned long long)f.bed_nan,
+            (unsigned long long)f.bed_life.nonzero, (unsigned long long)f.bed_life.samples,
+            f.bed_life.peak, f.bed_life.rms(), (unsigned long long)f.bed_life_nan,
+            (unsigned long long)g_flow_ctx_created.load(),
+            (unsigned long long)g_flow_ports_created.load(),
+            (unsigned long long)g_flow_pcm_published.load());
+    for (uint32_t i = 0; i < kA2MaxPorts; ++i) {
+        FlowPort& p = g_flow_port[i];
+        // Only this context's own ports. g_flow_port[] is a single global table, so without this
+        // filter every context prints (and RESETS) every other context's counters, splitting each
+        // port's per-second totals arbitrarily across unrelated context lines.
+        if (!p.seen || p.ctx_slot != slot) continue;
+        fprintf(stderr,
+                "[audio-flow]   port%u type=0x%x fmt=0x%x reads=%llu mixed=%llu frames=%llu bytes=%llu"
+                " peak=%.5f rms=%.5f nonzero=%llu/%llu nan=%llu no-pcm=%llu skip-fmt=%llu"
+                " skip-not-main=%llu short=%llu"
+                " | LIFE: nonzero=%llu/%llu peak=%.5f rms=%.5f nan=%llu\n",
+                i + 1, p.type, p.data_format, (unsigned long long)p.reads,
+                (unsigned long long)p.mixed, (unsigned long long)p.frames,
+                (unsigned long long)p.bytes, p.sig.peak, p.sig.rms(),
+                (unsigned long long)p.sig.nonzero, (unsigned long long)p.sig.samples,
+                (unsigned long long)p.nan_samples,
+                (unsigned long long)p.no_pcm, (unsigned long long)p.skip_fmt,
+                (unsigned long long)p.skip_not_main, (unsigned long long)p.short_read,
+                (unsigned long long)p.life.nonzero, (unsigned long long)p.life.samples,
+                p.life.peak, p.life.rms(), (unsigned long long)p.life_nan);
+        // Per-interval counters: reset so each line describes the LAST second, not the whole run.
+        // The `life:` totals above are deliberately NOT reset.
+        p.reads = p.mixed = p.frames = p.bytes = 0;
+        p.no_pcm = p.skip_fmt = p.skip_not_main = p.short_read = p.nan_samples = 0;
+        p.seen = false;
+        p.sig.reset();
+    }
+    f.advances = f.pushes = f.pushes_with_pcm = f.silent_paced = f.not_ready = 0;
+    f.sink_grains = f.sink_bytes = 0;
+    f.bed_nan = 0;
+    f.bed.reset();          // f.bed_life / f.bed_life_nan are deliberately NOT reset
+}
+
+// One-shot lifecycle markers. These make "no [audio-flow] lines at all" a POSITIVE result rather
+// than an ambiguous one: with a ctx-create marker present and no interval lines following it, the
+// guest demonstrably built an audio context and then never ran its pump loop.
+void audio_flow_note_create(uint32_t slot, uint32_t grain, uint32_t queue_depth) {
+    if (!audio_flow() || slot >= 4) return;
+    ++g_flow_ctx_created;
+    std::lock_guard<std::mutex> lk(g_flow_mx);
+    g_flow_ctx[slot] = FlowCtx{};   // a recycled context slot starts a fresh history, lifetime included
+    fprintf(stderr, "[audio-flow] ctx%u created: grain=%u queue_depth=%u (host sink port %d)\n",
+            slot, grain, queue_depth, kA2SinkPortBase + (int)slot);
+}
+
+void audio_flow_note_port_create(uint32_t port_index, uint16_t type, uint32_t data_format,
+                                 uint32_t flags) {
+    if (!audio_flow()) return;
+    ++g_flow_ports_created;
+    // Port slots are recycled first-free, and object-heavy titles churn far more ports than there
+    // are slots. Without this clear, slot i's never-reset `LIFE:` total would merge a music port's
+    // history with an unrelated SFX bus that later reuses the slot — the same mis-attribution the
+    // per-context filter fixes, one level down, and now more damaging because the docs direct the
+    // reader to judge a port by exactly that total. Caller holds g_a2_mx; g_flow_mx is a leaf.
+    if (port_index < kA2MaxPorts) {
+        std::lock_guard<std::mutex> lk(g_flow_mx);
+        g_flow_port[port_index] = FlowPort{};
+    }
+    fprintf(stderr, "[audio-flow] port%u created: type=0x%x data_format=0x%x flags=0x%x%s\n",
+            port_index + 1, type, data_format, flags,
+            type == 0 ? " (MAIN -> mixed to host)" : " (non-MAIN -> NOT mixed to host)");
+}
+
+} // namespace
+
+
 uint32_t audio2_next_generation(uint32_t generation) {
     ++generation;
     return generation ? generation : 1;
@@ -541,6 +763,16 @@ static void audio2_reset() {
         for (auto& port : g_a2_port_state) audio2_clear_slot(port);
         std::fill(std::begin(g_a2_speaker_arrays), std::end(g_a2_speaker_arrays), false);
         g_a2_users = 0;
+    }
+    // The probe's own state is per-lifecycle too: leaving stale contexts/ports/lifetime totals here
+    // would carry one application's audio history into the next (and across tests).
+    if (audio_flow()) {
+        std::lock_guard<std::mutex> lk(g_flow_mx);
+        for (auto& f : g_flow_ctx) f = FlowCtx{};
+        for (auto& fp : g_flow_port) fp = FlowPort{};
+        g_flow_ctx_created = 0;
+        g_flow_ports_created = 0;
+        g_flow_pcm_published = 0;
     }
     if (AudioSink* sink = audio_sink())
         for (size_t i = 0; i < 4; ++i)
@@ -820,6 +1052,7 @@ HLE(audio2_ctx_create) {
             audio2_clear_slot(g_a2_ctx[i]);
             return kA2ErrInvalidParam;
         }
+        audio_flow_note_create((uint32_t)i, grain, queue_depth);
         return 0;
     }
     return kA2ErrInvalidParam;
@@ -892,6 +1125,7 @@ HLE(audio2_port_create) {
         port.type = ptype;
         port.data_format = data_format;
         port.flags = flags;
+        audio_flow_note_port_create(id - 1, ptype, data_format, flags);
         return 0;
     }
     return kA2ErrPortFull;
@@ -953,7 +1187,12 @@ HLE(audio2_port_set_attr) {
         if (!audio_read_bytes(a1 + i * 0x18, &at, sizeof at)) break;
         if (at.id == 0 && at.vsize == 8) {
             uint64_t pcm = 0;
-            if (audio_read_bytes(at.vptr, &pcm, 8)) port->pcm_ptr = pcm;
+            if (audio_read_bytes(at.vptr, &pcm, 8)) {
+                port->pcm_ptr = pcm;
+                // Reached-ness: the guest handing us a PCM buffer address is the last step before
+                // submission, so this separates "never wired up audio" from "wired up, never pushed".
+                if (pcm && audio_flow()) ++g_flow_pcm_published;
+            }
             if (getenv("PROSPER_AUDIO2_PROBE")) {
                 // Keep probe history per AudioOut2 port. Object-heavy titles routinely create
                 // more than 16 ports; aliasing this table made their alternating grain buffers
@@ -991,10 +1230,20 @@ HLE(audio2_port_set_attr) {
 // sceAudioOut2ContextAdvance(ctx) -> 0. Update the public queue clock; PCM submission lives in Push.
 HLE(audio2_ctx_advance) {
     A2LOG("sceAudioOut2ContextAdvance");
-    std::lock_guard<std::mutex> lk(g_a2_mx);
-    A2Context* context = audio2_context_locked(a0);
-    if (!context) return kA2ErrInvalidParam;
-    audio2_update_queue_locked(*context, std::chrono::steady_clock::now());
+    uint32_t advance_slot = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_a2_mx);
+        A2Context* context = audio2_context_locked(a0, &advance_slot);
+        if (!context) return kA2ErrInvalidParam;
+        audio2_update_queue_locked(*context, std::chrono::steady_clock::now());
+        if (audio_flow()) {
+            std::lock_guard<std::mutex> flk(g_flow_mx);
+            ++g_flow_ctx[advance_slot].advances;
+        }
+    }
+    // Reported from Advance as well as Push so a pump loop that advances but never submits still
+    // produces interval lines (the `advance=N push=0` signature of case 1).
+    audio_flow_report(advance_slot);
     return 0;
 }
 
@@ -1024,7 +1273,13 @@ HLE(audio2_ctx_push) {
             wait_duration = std::chrono::nanoseconds(
                 (long long)(context->grain ? context->grain : 256) * 1000000000LL / 48000);
         }
-        if (!a1) return kA2ErrNotReady;
+        if (!a1) {
+            if (audio_flow()) {
+                std::lock_guard<std::mutex> flk(g_flow_mx);
+                ++g_flow_ctx[context_slot].not_ready;
+            }
+            return kA2ErrNotReady;
+        }
         std::this_thread::sleep_for(wait_duration);
     }
     // Mix each active port's current grain into a stereo bed. AudioOut2 data_format encodes the
@@ -1043,19 +1298,77 @@ HLE(audio2_ctx_push) {
         grain = (c->grain >= 64 && c->grain <= 4096) ? c->grain : 256;
         std::memset(bed.data(), 0, sizeof(float) * grain * 2);
         const bool probe = getenv("PROSPER_AUDIO2_PROBE") != nullptr;
+        const bool flow = audio_flow();
         uint32_t object_ports_with_pcm = 0;
         float object_peak = 0.0f;
         int object_peak_port = 0;
         int pidx_probe = 0;
         for (const auto& ps : g_a2_port_state) {
             const int this_pidx = pidx_probe++;
-            if (!ps.used || ps.context != a0 || !ps.pcm_ptr) continue;
+            if (!ps.used || ps.context != a0) continue;
+            // A port belonging to this context but carrying no published PCM pointer is a distinct
+            // failure from one that was never created: count it rather than skipping invisibly.
+            if (!ps.pcm_ptr) {
+                if (flow) {
+                    std::lock_guard<std::mutex> flk(g_flow_mx);
+                    FlowPort& fp = g_flow_port[this_pidx];
+                    flow_tag_port(fp, context_slot, ps.type, ps.data_format);
+                    ++fp.no_pcm;
+                }
+                continue;
+            }
             const uint32_t data_type = ps.data_format & 0x7fu;
             const uint32_t channels = audio2_format_channels(ps.data_format);
             if ((data_type != 0 && data_type != 1) || channels < 1 || channels > 8) {
                 if (probe) fprintf(stderr, "[audio2-probe] port%d skipped: format=0x%x "
                                            "type=%u channels=%u unsupported\n",
                                            this_pidx + 1, ps.data_format, data_type, channels);
+                // A port rejected for its LAYOUT is never read, so "no signal here" would otherwise
+                // be an assumption rather than a measurement — and a rejected port is precisely
+                // where lost audio would hide. Under the probe only (so the default hot path is
+                // unchanged), read and measure it anyway, fault-safely, without mixing it.
+                // The bound is audio2_format_channels()'s own clamp, so the buffer sizing reasoned
+                // about below stays true if that clamp ever changes. One flag, used by both arms,
+                // so `skip_fmt` is counted exactly once per push either way.
+                const bool rej_sizable = (data_type == 0 || data_type == 1) &&
+                                         channels >= 1 && channels <= 16;
+                if (flow && !rej_sizable) {
+                    // Nothing to measure for a layout we cannot even size; just record the skip.
+                    std::lock_guard<std::mutex> flk(g_flow_mx);
+                    FlowPort& fp = g_flow_port[this_pidx];
+                    flow_tag_port(fp, context_slot, ps.type, ps.data_format);
+                    ++fp.skip_fmt;
+                }
+                if (flow && rej_sizable) {
+                    const uint32_t rej_samples = channels * grain;
+                    size_t rej_frames = 0;
+                    if (data_type == 0) {
+                        if (tmp.size() < rej_samples) tmp.resize(rej_samples);
+                        rej_frames = audio_read_bytes_partial(ps.pcm_ptr, tmp.data(),
+                                        sizeof(float) * rej_samples) / (sizeof(float) * channels);
+                    } else {
+                        if (tmp_s16.size() < rej_samples) tmp_s16.resize(rej_samples);
+                        rej_frames = audio_read_bytes_partial(ps.pcm_ptr, tmp_s16.data(),
+                                        sizeof(int16_t) * rej_samples) / (sizeof(int16_t) * channels);
+                    }
+                    // Single lock scope covering tag + counters + samples: an earlier version
+                    // tagged the port, released the lock for the guest read, then re-locked — and a
+                    // report landing in that window cleared `seen`, so the measurement never printed.
+                    std::lock_guard<std::mutex> flk(g_flow_mx);
+                    FlowPort& fp = g_flow_port[this_pidx];
+                    flow_tag_port(fp, context_slot, ps.type, ps.data_format);
+                    ++fp.skip_fmt;
+                    ++fp.reads;
+                    fp.frames += rej_frames;
+                    fp.bytes += rej_frames * channels *
+                                (data_type == 0 ? sizeof(float) : sizeof(int16_t));
+                    if (rej_frames < grain) ++fp.short_read;
+                    for (size_t k = 0, nf = rej_frames * channels; k < nf; ++k) {
+                        const float v = data_type == 0 ? tmp[k]
+                                                       : (float)tmp_s16[k] * (1.0f / 32768.0f);
+                        flow_add_sample(fp, v);
+                    }
+                }
                 continue;
             }
             const uint32_t read_samples = channels * grain;
@@ -1076,6 +1389,23 @@ HLE(audio2_ctx_push) {
                 return data_type == 0 ? tmp[sample]
                                       : (float)tmp_s16[sample] * (1.0f / 32768.0f);
             };
+            // Measure EVERY port that yielded bytes, before the MAIN-only routing filter, so signal
+            // that prosper discards is attributable to the discard rather than to a silent guest.
+            if (flow) {
+                std::lock_guard<std::mutex> flk(g_flow_mx);
+                FlowPort& fp = g_flow_port[this_pidx];
+                flow_tag_port(fp, context_slot, ps.type, ps.data_format);
+                ++fp.reads;
+                fp.frames += frames_got;
+                fp.bytes += frames_got * channels *
+                            (data_type == 0 ? sizeof(float) : sizeof(int16_t));
+                if (frames_got < grain) ++fp.short_read;
+                for (size_t k = 0, nf = frames_got * channels; k < nf; ++k) {
+                    const float v = data_type == 0 ? tmp[k] : (float)tmp_s16[k] * (1.0f / 32768.0f);
+                    flow_add_sample(fp, v);   // NaN counted, then treated as the silence it becomes
+                }
+                if (ps.type != 0) ++fp.skip_not_main; else ++fp.mixed;
+            }
             if (probe) {
                 static uint64_t call_ct[kA2MaxPorts] = {0};
                 const size_t nf = frames_got * channels;
@@ -1151,6 +1481,16 @@ HLE(audio2_ctx_push) {
                 fprintf(stderr, "[audio2-probe] objects: pcm_ports=%u peak_port=%d |max|=%.4g\n",
                         object_ports_with_pcm, object_peak_port, object_peak);
         }
+        if (flow) {
+            std::lock_guard<std::mutex> flk(g_flow_mx);
+            FlowCtx& f = g_flow_ctx[context_slot];
+            ++f.pushes;
+            if (have_pcm) ++f.pushes_with_pcm;
+            // Measure the bed as it stands after mixing (pre-clamp): this is exactly the signal the
+            // host sink is about to receive, so a zero here with non-zero per-port peaks localizes
+            // the loss to routing rather than to the guest.
+            for (uint32_t i = 0; i < grain * 2; ++i) flow_add_bed_sample(f, bed[i]);
+        }
     }
     // From this point through host output or silent pacing, serialize with Destroy for this exact
     // sink slot. Revalidate the full generation under g_a2_mx after acquiring the slot mutex.
@@ -1195,6 +1535,13 @@ HLE(audio2_ctx_push) {
             open_ok = context->sink_open_ok;
         }
         const int sink_port = kA2SinkPortBase + (int)context_slot;
+        if (audio_flow()) {
+            std::lock_guard<std::mutex> flk(g_flow_mx);
+            FlowCtx& f = g_flow_ctx[context_slot];
+            f.sink_opened = true;
+            f.sink_open_ok = open_ok;
+            if (open_ok) { ++f.sink_grains; f.sink_bytes += (uint64_t)grain * 2 * sizeof(float); }
+        }
         if (open_ok) {
             for (uint32_t i = 0; i < grain * 2; i++) {
                 float v = bed[i];
@@ -1203,13 +1550,26 @@ HLE(audio2_ctx_push) {
             }
             audio_observe_output(sink_port, bed.data(), (int)grain, info);
             sink->output(sink_port, bed.data(), (int)grain);
+            audio_flow_report(context_slot);
             return 0;
         }
-        return pace_silently();
+        if (audio_flow()) {
+            std::lock_guard<std::mutex> flk(g_flow_mx);
+            ++g_flow_ctx[context_slot].silent_paced;
+        }
+        const uint64_t paced = pace_silently();
+        audio_flow_report(context_slot);
+        return paced;
     }
     // No sink / no data yet: keep the silent real-time pacing so the guest's pump thread does not
     // hot-spin (on hardware Push blocks while the output queue is full).
-    return pace_silently();
+    if (audio_flow()) {
+        std::lock_guard<std::mutex> flk(g_flow_mx);
+        ++g_flow_ctx[context_slot].silent_paced;
+    }
+    const uint64_t paced = pace_silently();
+    audio_flow_report(context_slot);
+    return paced;
 }
 
 // Targeted control-surface tracing. AudioOut2 ports feed a pre-mastering speaker bed, so these
