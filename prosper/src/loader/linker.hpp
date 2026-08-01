@@ -57,6 +57,29 @@ struct Program {
     struct SkippedModule { std::string path, nid, owner_path; };
     std::vector<SkippedModule> skipped_modules;
 
+    // Exports that were ALIASED rather than skipped: a module linked by name contributed a NID the
+    // global table already had, so `emplace` kept the first definition and discarded this one
+    // silently (#1635). First-wins is the intended policy and is unchanged — going unreported was
+    // not. The loser stays mapped and its init_array still runs, and sceKernelDlsym consults the
+    // handle's own table first (#147), so the same NID can resolve to two different addresses
+    // depending on which handle is asked. Retained rather than only logged so the caller can report
+    // it and a test can assert it.
+    //
+    // This is not hypothetical: a census over 30 local dumps found 41 aliased NIDs across 7 titles,
+    // all among modules linked BY NAME — PSNCommon.prx + PSNCore.prx share 4 on six titles,
+    // libfmod.prx + libfmodstudio.prx share 16, and AkMotion/AkSoundEngine/AkVorbisHwAccelerator
+    // share one three ways. See tools/re/dup_exports.py.
+    //
+    // MEASURED SEVERITY TODAY: nil. Cross-referencing self_dump's [IMPORTS BY LIBRARY] for every
+    // linked module of those 7 titles, NONE of the 21 distinct aliased NIDs is imported by anything —
+    // so no import currently resolves through an alias, and no title's behaviour depends on which
+    // module won. That is why this is a diagnostic and not a policy change. It is also why the
+    // diagnostic matters: the moment a title does import one, the winner becomes load-order-dependent
+    // and this is the only thing that would say so. Re-check with tools/re/dup_exports.py before
+    // assuming it still holds for a newly added dump.
+    struct AliasedExport { std::string nid, winner_path, loser_path; uint64_t winner, loser; };
+    std::vector<AliasedExport> aliased_exports;
+
     // Stats for reporting.
     size_t total_imports = 0, resolved_cross_module = 0, stubbed = 0;
 };

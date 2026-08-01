@@ -185,6 +185,40 @@ int main(int argc, char** argv) {
                 CHECK(pg.skipped_modules[0].owner_path == plugin, "skip record names the owner");
                 CHECK(!pg.skipped_modules[0].nid.empty(), "skip record carries the colliding NID");
             }
+
+            // #1635: the CONTROL case is the real-world shape — two modules exporting the same NIDs,
+            // neither flagged, both linked. exports.emplace() keeps the first and discards the second
+            // with no warning, no counter and nothing in the summary. That silence is the defect;
+            // first-wins itself is the intended policy and is unchanged.
+            //
+            // Measured, not hypothetical: a census over 30 local dumps found 41 aliased NIDs across 7
+            // titles, ALL among modules linked by name (tools/re/dup_exports.py).
+            CHECK(!pc.aliased_exports.empty(),
+                  "#1635: linking a duplicate records the aliased exports instead of silently dropping them");
+            CHECK(pg.aliased_exports.empty(),
+                  "#1635: a module the guard skipped contributes no aliases");
+            if (!pc.aliased_exports.empty()) {
+                const auto& a = pc.aliased_exports.front();
+                CHECK(!a.nid.empty(), "#1635: the alias record carries the NID");
+                CHECK(a.winner_path == plugin && a.loser_path == plugin,
+                      "#1635: the alias record names both the winner and the discarded loser");
+                // The two copies are mapped at different bases, so the discarded definition really is
+                // a different address — proof this is an alias, not a duplicate of one address.
+                CHECK(a.winner != a.loser,
+                      "#1635: the discarded definition is a genuinely different address");
+                // first-wins means the winner lies inside the image of the EARLIER-linked module.
+                // Comparing the two addresses directly would only assert this fixture's base ordering
+                // (0x5d0000000 < 0x5d4000000) — both records share one RVA, so that comparison is a
+                // statement about the test's own setup, not about the loader's policy.
+                bool winner_in_first = false, loser_in_second = false;
+                if (pc.imgs.size() >= 3) {
+                    const uint64_t b1 = pc.imgs[1].base, b2 = pc.imgs[2].base;
+                    winner_in_first  = a.winner >= b1 && a.winner < b2;
+                    loser_in_second  = a.loser  >= b2;
+                }
+                CHECK(winner_in_first && loser_in_second,
+                      "#1635: first-wins — the winner is in the earlier image, the loser in the later");
+            }
         } else {
             printf("  [skip] %s has no Media/Plugins/PSN.prx — link wiring not exercised\n",
                    dump_root.c_str());

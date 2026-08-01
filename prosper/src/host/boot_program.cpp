@@ -211,8 +211,26 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     for (const auto& s : p.skipped_modules)
         printf("plugin auto-link: SKIPPED %s — it exports NID %s, already provided by %s\n",
                s.path.c_str(), s.nid.c_str(), s.owner_path.c_str());
-    printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
-           p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(), p.init_fns.size());
+    // Aliased exports (#1635). first-wins is the policy and is unchanged; being silent about it was
+    // the defect. Both modules stay mapped and both init_arrays run, and sceKernelDlsym consults the
+    // handle's own table first (#147) — so a NID listed here resolves to DIFFERENT addresses
+    // depending on which handle asks. Bounded print, full count, so a busy pair cannot bury the line.
+    if (!p.aliased_exports.empty()) {
+        constexpr size_t kMaxShown = 8;
+        const size_t shown = std::min(p.aliased_exports.size(), kMaxShown);
+        for (size_t i = 0; i < shown; i++) {
+            const auto& a = p.aliased_exports[i];
+            printf("export alias: NID %s -> %s (0x%llx); %s also exports it (0x%llx), discarded\n",
+                   a.nid.c_str(), a.winner_path.c_str(), (unsigned long long)a.winner,
+                   a.loser_path.c_str(), (unsigned long long)a.loser);
+        }
+        if (p.aliased_exports.size() > shown)
+            printf("export alias: ... and %zu more\n", p.aliased_exports.size() - shown);
+    }
+    printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns; "
+           "%zu aliased exports\n",
+           p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(),
+           p.init_fns.size(), p.aliased_exports.size());
 
     // sceKernelDlsym resolves exports by name against all loaded modules.
     set_module_exports(&p.exports);
