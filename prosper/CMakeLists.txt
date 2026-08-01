@@ -372,6 +372,13 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_library_nav PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_library_nav COMMAND test_prosper_app_library_nav)
 
+  # Library background art and focus music (#1630): DDS/BC7 and RIFF/ATRAC9 container validation plus
+  # the debounce, two-stage fade and LRU policy. Pure byte and arithmetic work — the containers are
+  # synthesized in the test, so no dump, no GPU and no audio device is involved.
+  add_executable(test_prosper_app_launcher_media frontends/prosper-app/test_launcher_media.cpp)
+  target_include_directories(test_prosper_app_launcher_media PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_launcher_media COMMAND test_prosper_app_launcher_media)
+
   # Fault-safe guest-pointer read in the PROSPER_AMPRLOG diagnostic (#1154): an unmapped, aligned,
   # > 0xffff pointer (GTA V's 0x302200) must report unreadable, not SIGSEGV. POSIX-only
   # (process_vm_readv / mmap); ampr_arglog lives in the __linux__||__APPLE__ half of hle_kernel_mem.
