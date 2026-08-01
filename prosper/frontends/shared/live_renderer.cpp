@@ -3528,12 +3528,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 const uint32_t mip_tail_x = r.mip_tail_x;
                                 const uint32_t mip_tail_y = r.mip_tail_y;
                                 fr.storage_image_writeback =
+                                    // `decoded_textures` and `texstore_pinned` are thread-local
+                                    // statics since #1691 and are deliberately NOT captured: a
+                                    // variable with static storage duration cannot appear in a
+                                    // capture list (clang rejects it outright), and the body reaches
+                                    // the render thread's own instances directly — which is the
+                                    // right identity, since this callback runs on that thread.
                                     [guest_addr, replay_data, guest_bytes, linear_bytes,
                                      tw, th, tile_mode,
                                      writeback_pitch, in_mip_tail, mip_tail_x,
-                                     mip_tail_y, &decoded_textures,
-                                     &texstore_pinned](const uint8_t* pixels,
-                                                       size_t bytes) {
+                                     mip_tail_y](const uint8_t* pixels, size_t bytes) {
                                         if (!pixels || bytes != linear_bytes) return;
                                         uint8_t* destination = replay_data;
                                         if (!destination) {
