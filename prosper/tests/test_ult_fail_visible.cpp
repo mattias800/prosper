@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 using namespace prosper;
 
@@ -23,9 +24,11 @@ static int fails = 0;
 // value is a derived convention rather than an invented libSceUlt constant.
 static constexpr uint64_t kEnosys = 0x8002004Eull;
 
-// Every libSceUlt NID Earthion (PPSA28061) imports. Split by what prosper does with each one, so the
-// split itself is a checked fact rather than a comment.
-static const char* const kImplementedNids[] = {
+// Every libSceUlt NID Earthion (PPSA28061) imports whose contract returns a STATUS. All of them are
+// implemented; the semantics are tested in test_ult_semantics.cpp. What this file guards is that they
+// are registered, counted per call, and that none of them reports success for an object that does not
+// exist — the property that made the pre-#1603 tree lie to the guest a million times per boot.
+static const char* const kStatusNids[] = {
     "hZIg1EWGsHM",  // sceUltInitialize
     "d-kSG2fLrvI",  // sceUltFinalize
     "jw9FkZBXo-g",  // _sceUltUlthreadRuntimeCreate
@@ -34,10 +37,6 @@ static const char* const kImplementedNids[] = {
     "8hEGkR1pfr8",  // sceUltMutexLock
     "h0XebKiMBtk",  // sceUltMutexUnlock
     "jW+HnafeS3Y",  // sceUltMutexDestroy
-};
-// Registered, counted, and refused — not yet implemented. "Not seen in the measured window" is not
-// "never called": these are the teardown and blocking paths.
-static const char* const kUnimplementedNids[] = {
     "znI3q8S7KQ4",  // _sceUltUlthreadCreate
     "gCeAI57LGgI",  // sceUltUlthreadJoin
     "jnKaHGkrxZ4",  // _sceUltConditionVariableCreate
@@ -65,9 +64,8 @@ int main() {
     ult_set_legacy_enosys_for_test(false);
 
     bool all_registered = true;
-    for (const char* nid : kImplementedNids)   all_registered &= Hle::lookup(nid) != nullptr;
-    for (const char* nid : kUnimplementedNids) all_registered &= Hle::lookup(nid) != nullptr;
-    for (const char* nid : kSizeNids)          all_registered &= Hle::lookup(nid) != nullptr;
+    for (const char* nid : kStatusNids) all_registered &= Hle::lookup(nid) != nullptr;
+    for (const char* nid : kSizeNids)   all_registered &= Hle::lookup(nid) != nullptr;
     CHECK(all_registered,
           "every libSceUlt NID Earthion imports is registered (no longer the silent generic path)");
 
@@ -90,11 +88,19 @@ int main() {
     CHECK(ult_call_count("8hEGkR1pfr8") == before + 2 && ult_call_count("h0XebKiMBtk") >= 1,
           "calls are counted individually, not deduped to one first-seen entry");
 
-    // What is not implemented must refuse, loudly and non-zero — never return 0 = SCE_OK.
+    // Called against objects that were never created, EVERY status entry point must refuse. This is
+    // the property the pre-#1603 tree violated on every single call: the generic unresolved-import
+    // path returned 0, which is SCE_OK, so the guest was told a lock it never took was held. The two
+    // lifecycle calls take no object and legitimately succeed, so they are excluded by name.
     bool all_refuse = true;
-    for (const char* nid : kUnimplementedNids)
-        all_refuse &= Hle::lookup(nid)(0, 0, 0, 0, 0, 0) == kEnosys;
-    CHECK(all_refuse, "every not-yet-implemented entry point returns SCE_KERNEL_ERROR_ENOSYS");
+    for (const char* nid : kStatusNids) {
+        if (!std::strcmp(nid, "hZIg1EWGsHM") || !std::strcmp(nid, "d-kSG2fLrvI")) continue;
+        if (Hle::lookup(nid)(0, 0, 0, 0, 0, 0) == 0) {
+            std::printf("         (%s reported success for a non-existent object)\n", nid);
+            all_refuse = false;
+        }
+    }
+    CHECK(all_refuse, "no entry point reports success for an object that was never created");
 
     // #1618. These return a size_t AS THEIR RETURN VALUE — there is no out-parameter (Earthion's call
     // site does `call …; mov [rbp-0x10],rax; mov rdi,[rbp-0x10]; call malloc`). Such a signature has

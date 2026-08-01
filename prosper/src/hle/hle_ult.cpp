@@ -152,6 +152,7 @@ constexpr uint64_t kUltErrSrch        = 0x80020003ull;   // ESRCH   — stale / 
 constexpr uint64_t kUltErrDeadlk      = 0x8002000Bull;   // EDEADLK — self-relock of a non-recursive mutex
 constexpr uint64_t kUltErrNoMem       = 0x8002000Cull;   // ENOMEM
 constexpr uint64_t kUltErrInval       = 0x80020016ull;   // EINVAL
+constexpr uint64_t kUltErrAgain       = 0x80020023ull;   // EAGAIN  — runtime is at numMaxUlthread
 constexpr uint64_t kUltNotImplemented = 0x8002004Eull;   // ENOSYS — still-unimplemented entry points
 
 // A size-returning contract has no error channel (#1618): whatever these return is read as a byte
@@ -279,6 +280,19 @@ struct UltObject {
     std::atomic<bool> warned_concurrency{false};
     std::atomic<uint32_t> bound_sync_objects{0};
     std::atomic<bool> warned_pool_capacity{false};
+
+    // ConditionVariable wake accounting (see the condvar block for why these are lock-free).
+    std::atomic<uint64_t> wait_seq{0}, wake_seq{0};
+    std::atomic<bool> destroying{false};
+
+    // Ulthread.
+    uint64_t runtime_id = 0;
+    uint64_t context = 0, context_size = 0;
+    uint64_t host_thread = 0;
+    std::atomic<bool> finished{false}, joined{false};
+    std::atomic<uint32_t> exit_status{0};
+    std::atomic<uint64_t> stack_used{0};
+    std::atomic<bool> stack_exact{false};   // false => stack_used is a lower bound (probe < context)
 };
 
 std::shared_mutex                          g_reg_lock;
@@ -467,6 +481,8 @@ void abstime_in_ms(struct timespec& ts, uint64_t ms) {
 // ---------------------------------------------------------------------------------------------
 std::atomic<bool>     g_initialized{false};
 std::atomic<uint64_t> g_init_calls{0};
+// Last joined ulthread's measured guest-stack high-water (amendment 6). Diagnostics + tests.
+std::atomic<uint64_t> g_last_join_stack_used{0}, g_last_join_context_size{0};
 
 void print_banner() {
     if (g_banner_printed.exchange(true)) return;
@@ -508,17 +524,6 @@ bool implement(size_t index, uint64_t* out) {
     if (g_legacy_enosys.load(std::memory_order_relaxed)) { *out = kUltNotImplemented; return false; }
     if (g_return_success.load(std::memory_order_relaxed)) { *out = kUltOk; return false; }
     return true;
-}
-
-// An entry point that is registered and counted but whose semantics are not implemented yet.
-uint64_t refuse(size_t index) {
-    uint64_t out = 0;
-    if (!implement(index, &out)) return out;
-    static std::atomic<uint64_t> reported[kUltCount];
-    if (reported[index].fetch_add(1, std::memory_order_relaxed) < 4)
-        log_line("%s is NOT IMPLEMENTED — returning 0x%llx (SCE_KERNEL_ERROR_ENOSYS)",
-                 kUlt[index].name, (unsigned long long)kUltNotImplemented);
-    return kUltNotImplemented;
 }
 
 std::string guest_string(uint64_t addr) {
@@ -893,14 +898,459 @@ PROSPER_SYSV_ABI uint64_t ult_mutex_destroy(uint64_t a0, uint64_t, uint64_t, uin
 }
 
 // =============================================================================================
-// Not yet implemented: ulthread create/join and the condition variables. Registered, counted and
-// refused; see the ABI block at the top of this file for their established layouts.
+// Ulthreads
+//
+// One real guest thread per ulthread, spawned through the same trampoline scePthreadCreate uses so
+// the guest %fs TCB, stack registration, sigaltstack and TLS-purge behaviour are the proven ones
+// rather than a second copy. The guest's own `context`/`sizeContext` pair IS the ulthread's stack on
+// hardware, and prosper enters the guest on exactly that range.
+//
+// Two deviations from hardware are instrumented rather than trusted:
+//   * CONCURRENCY WIDTH. Hardware runs at most numWorkerThread ulthreads simultaneously. The runtime
+//     counts RUNNING ulthreads at the real guest-code boundary (the on_enter/on_exit hooks fire on
+//     the host %fs immediately around the guest entry) and reports the first crossing. Safe here
+//     because numWorkerThread is a function-local constant at eboot+0x9ca3 with exactly two reads —
+//     this size query and this Create — so the guest sizes and indexes nothing by worker count.
+//   * GUEST STACK. Earthion gives each ulthread 0x2000 bytes, and guest code has never run on a
+//     guest-supplied stack in this path before. The context is filled with a pattern at create and
+//     the untouched prefix measured at exit, so an ulthread approaching its stack limit is reported
+//     instead of silently overflowing into whatever the guest packed next to the buffer.
 // =============================================================================================
-template <size_t Index>
-PROSPER_SYSV_ABI uint64_t ult_refuse(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
-    return refuse(Index);
+constexpr uint8_t kStackFillByte = 0xCD;
+// Only the BOTTOM of the context is patterned, not all of it. The guest stack grows down from
+// base+size, so the bottom is the only region an overflow has to cross, and probing just that region
+// answers the question that matters — "did this ulthread come close to the end of its stack?" —
+// without the cost of the alternative. Filling the whole buffer would force every page of it
+// resident: Earthion's "Leaderboards Thread" asks for an 8 MiB context, so a full fill would commit
+// 8 MiB of guest memory the title might never have touched, and the measurement would have changed
+// the thing it was measuring. A context at or below the probe size (Earthion's other three are 8 KiB,
+// 8 KiB and 32 KiB) is covered end to end, giving an exact high-water figure.
+constexpr uint64_t kStackProbeBytes = 64 * 1024;
+// Warn when the deepest frame came within a quarter of the probe of the bottom — close enough to
+// predict the overflow, far enough not to fire on healthy usage.
+constexpr uint64_t kStackWarnFraction = 4;
+
+uint64_t stack_probe_bytes(uint64_t size) {
+    return size < kStackProbeBytes ? size : kStackProbeBytes;
 }
 
+// Bytes of untouched pattern remaining at the BOTTOM of the context. probe == the full probe region
+// means the stack never reached into it.
+uint64_t stack_untouched_at_bottom(uint64_t base, uint64_t size) {
+    const uint64_t probe = stack_probe_bytes(size);
+    if (!base || !probe || !gpu::guest_readable(base, 1)) return probe;
+    const auto* p = (const uint8_t*)(uintptr_t)base;
+    uint64_t untouched = 0;
+    while (untouched < probe && p[untouched] == kStackFillByte) ++untouched;
+    return untouched;
+}
+
+void ulthread_on_enter(void* opaque) {
+    auto* o = (UltObject*)opaque;
+    UltObject* rt = object_from_id(o->runtime_id, UltType::Runtime);
+    if (!rt) return;
+    const uint32_t running = rt->running_ulthreads.fetch_add(1, std::memory_order_acq_rel) + 1;
+    uint32_t hw = rt->high_water.load(std::memory_order_relaxed);
+    while (running > hw && !rt->high_water.compare_exchange_weak(hw, running,
+                                                                 std::memory_order_relaxed)) {}
+    if (running > rt->num_worker_thread && !rt->warned_concurrency.exchange(true))
+        log_line("CONCURRENCY: %u ulthreads of runtime \"%s\" are running at once, but it was created "
+                 "with numWorkerThread=%u. prosper runs ulthreads one-to-one on real guest threads "
+                 "instead of multiplexing them onto that many workers, so more can run in parallel "
+                 "than on hardware. Reported, deliberately NOT capped — capping would trade a visible "
+                 "deviation for a hidden scheduling stall",
+                 running, rt->name.c_str(), rt->num_worker_thread);
+}
+
+void ulthread_on_exit(void* opaque, uint64_t retval) {
+    auto* o = (UltObject*)opaque;
+    o->exit_status.store((uint32_t)retval, std::memory_order_relaxed);
+    o->finished.store(true, std::memory_order_release);
+    const uint64_t probe = stack_probe_bytes(o->context_size);
+    const uint64_t untouched = stack_untouched_at_bottom(o->context, o->context_size);
+    // Exact when the probe covered the whole context; otherwise a lower bound (the stack never
+    // reached the probed bottom, so it used less than size - probe).
+    const uint64_t used = untouched >= probe ? o->context_size - probe : o->context_size - untouched;
+    o->stack_used.store(used, std::memory_order_relaxed);
+    o->stack_exact.store(probe >= o->context_size, std::memory_order_relaxed);
+    if (probe && untouched < probe / kStackWarnFraction)
+        log_line("GUEST STACK: ulthread \"%s\" came within %llu bytes of the bottom of its "
+                 "%llu-byte context. The context buffer IS the ulthread's stack; overflowing it "
+                 "corrupts whatever the guest allocated next to it",
+                 o->name.c_str(), (unsigned long long)untouched,
+                 (unsigned long long)o->context_size);
+    if (UltObject* rt = object_from_id(o->runtime_id, UltType::Runtime))
+        rt->running_ulthreads.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+// Claim / release a slot in the runtime's guest work area. The work area is what makes
+// sceUltUlthreadRuntimeGetWorkAreaSize's answer load-bearing rather than decorative.
+bool runtime_claim_slot(UltObject* rt, uint64_t ulthread_id, uint64_t context, uint64_t context_size) {
+    if (!rt->work_area || !gpu::guest_readable(rt->work_area, sizeof(RuntimeWorkArea))) return false;
+    auto* wa = (RuntimeWorkArea*)(uintptr_t)rt->work_area;
+    if (wa->magic != kWorkMagicRuntime) {
+        log_line("runtime \"%s\" work area at 0x%llx no longer carries prosper's header (0x%llx) — "
+                 "freed or reused by the guest while the runtime is still live",
+                 rt->name.c_str(), (unsigned long long)rt->work_area, (unsigned long long)wa->magic);
+        return false;
+    }
+    auto* slots = (RuntimeSlot*)(uintptr_t)(rt->work_area + sizeof(RuntimeWorkArea));
+    for (uint32_t i = 0; i < wa->num_max_ulthread; ++i) {
+        if (slots[i].ulthread_id) continue;
+        slots[i].ulthread_id = ulthread_id;
+        slots[i].context = context;
+        slots[i].context_size = context_size;
+        slots[i].host_thread = 0;
+        return true;
+    }
+    return false;
+}
+
+void runtime_release_slot(UltObject* rt, uint64_t ulthread_id) {
+    if (!rt || !rt->work_area || !gpu::guest_readable(rt->work_area, sizeof(RuntimeWorkArea))) return;
+    auto* wa = (RuntimeWorkArea*)(uintptr_t)rt->work_area;
+    if (wa->magic != kWorkMagicRuntime) return;
+    auto* slots = (RuntimeSlot*)(uintptr_t)(rt->work_area + sizeof(RuntimeWorkArea));
+    for (uint32_t i = 0; i < wa->num_max_ulthread; ++i)
+        if (slots[i].ulthread_id == ulthread_id) { slots[i] = RuntimeSlot{0, 0, 0, 0}; return; }
+}
+
+// _sceUltUlthreadCreate(ult, name, entry, arg, context, sizeContext, runtime, optParam, apiVersion).
+// 9 args; runtime/optParam/apiVersion arrive on the guest stack and the import bridge forwards them.
+PROSPER_SYSV_ABI uint64_t ult_ulthread_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                              uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,
+                                              uint64_t a8) {
+    uint64_t out = 0;
+    if (!implement(kIdxUlthreadCreate, &out)) return out;
+    note_uninitialised("_sceUltUlthreadCreate");
+    (void)a7;   // optParam: NULL at every observed call site
+
+    if (!guest_object_writable(a0)) {
+        log_line("_sceUltUlthreadCreate: unusable ulthread pointer 0x%llx", (unsigned long long)a0);
+        return kUltErrInval;
+    }
+    if (!a2 || !gpu::guest_readable(a2, 1)) {
+        log_line("_sceUltUlthreadCreate: entry 0x%llx is not executable guest code",
+                 (unsigned long long)a2);
+        return kUltErrInval;
+    }
+    UltObject* rt = resolve(a6, UltType::Runtime, "_sceUltUlthreadCreate(runtime)");
+    if (!rt) return kUltErrInval;
+    if (!a4 || !a5 || !gpu::guest_readable(a4, (uint32_t)std::min<uint64_t>(a5, 4096))) {
+        log_line("_sceUltUlthreadCreate: context 0x%llx size %llu is unusable as this ulthread's stack",
+                 (unsigned long long)a4, (unsigned long long)a5);
+        return kUltErrInval;
+    }
+
+    // numMaxUlthread is unambiguous and the guest chose it, so it is enforced rather than merely
+    // reported: exceeding it means the runtime the guest sized is genuinely full.
+    const uint32_t live = rt->live_ulthreads.load(std::memory_order_relaxed);
+    if (live >= rt->num_max_ulthread) {
+        log_line("_sceUltUlthreadCreate: runtime \"%s\" already holds %u of numMaxUlthread=%u "
+                 "ulthreads — refusing", rt->name.c_str(), live, rt->num_max_ulthread);
+        return kUltErrAgain;
+    }
+
+    UltObject* o = allocate_object(UltType::Ulthread);
+    o->name = guest_string(a1);
+    o->guest_addr = a0;
+    o->api_version = (uint32_t)a8;
+    o->runtime_id = make_id(rt->slot, rt->generation);
+    o->context = a4;
+    o->context_size = a5;
+    o->host_thread = 0;
+    o->finished.store(false, std::memory_order_relaxed);
+    o->joined.store(false, std::memory_order_relaxed);
+    o->exit_status.store(0, std::memory_order_relaxed);
+    o->stack_used.store(0, std::memory_order_relaxed);
+    o->alive.store(true, std::memory_order_release);
+    const uint64_t id = make_id(o->slot, o->generation);
+
+    if (!runtime_claim_slot(rt, id, a4, a5)) {
+        log_line("_sceUltUlthreadCreate: runtime \"%s\" has no free work-area slot", rt->name.c_str());
+        o->alive.store(false, std::memory_order_release);
+        return kUltErrAgain;
+    }
+    if (!publish_object(a0, UltType::Ulthread, id)) {
+        runtime_release_slot(rt, id);
+        o->alive.store(false, std::memory_order_release);
+        return kUltErrInval;
+    }
+
+    // Amendment 6: the context IS the stack. Fill it so the untouched prefix at exit measures the
+    // high-water mark. Safe to write — the guest malloc'd this buffer immediately before the call
+    // (eboot+0x9de0) purely to hand it over, so nothing of its own is in it yet.
+    std::memset((void*)(uintptr_t)a4, kStackFillByte, (size_t)stack_probe_bytes(a5));
+
+    rt->live_ulthreads.fetch_add(1, std::memory_order_acq_rel);
+    GuestThreadHooks hooks;
+    hooks.on_enter = ulthread_on_enter;
+    hooks.on_exit  = ulthread_on_exit;
+    hooks.opaque   = o;
+    uint64_t thread = 0;
+    const int rc = guest_thread_spawn(a2, a3, o->name.empty() ? "ulthread" : o->name.c_str(),
+                                      (void*)(uintptr_t)a4, (size_t)a5, &hooks, &thread);
+    if (rc != 0) {
+        log_line("_sceUltUlthreadCreate(\"%s\"): guest thread spawn failed (%d)", o->name.c_str(), rc);
+        rt->live_ulthreads.fetch_sub(1, std::memory_order_acq_rel);
+        runtime_release_slot(rt, id);
+        unpublish_object(a0);
+        o->alive.store(false, std::memory_order_release);
+        return kUltErrNoMem;
+    }
+    o->host_thread = thread;
+    log_line("_sceUltUlthreadCreate(\"%s\") ulthread=0x%llx entry=0x%llx arg=0x%llx "
+             "context=0x%llx+%llu runtime=\"%s\" apiVersion=0x%x -> running on guest thread 0x%llx",
+             o->name.c_str(), (unsigned long long)a0, (unsigned long long)a2,
+             (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5,
+             rt->name.c_str(), o->api_version, (unsigned long long)thread);
+    return kUltOk;
+}
+
+// sceUltUlthreadJoin(ulthread, int32_t* status). The status out-param is 4 bytes: the call site at
+// eboot+0x9f1e passes `lea rsi,[rbp-0xc]`, a 4-byte local below the stack canary at [rbp-0x8].
+PROSPER_SYSV_ABI uint64_t ult_ulthread_join(uint64_t a0, uint64_t a1, uint64_t, uint64_t, uint64_t,
+                                            uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxUlthreadJoin, &out)) return out;
+    UltObject* o = resolve(a0, UltType::Ulthread, "sceUltUlthreadJoin");
+    if (!o) return kUltErrSrch;
+    if (o->joined.exchange(true, std::memory_order_acq_rel)) {
+        log_line("sceUltUlthreadJoin: ulthread \"%s\" (0x%llx) was already joined", o->name.c_str(),
+                 (unsigned long long)a0);
+        return kUltErrInval;
+    }
+
+    // Watchdog: the guest frees the context buffer right after join returns, so a join that never
+    // returns is both a hang AND the reason a later use-after-free would look inexplicable.
+    if (!o->finished.load(std::memory_order_acquire)) {
+        const uint64_t warn_ms = block_warn_ms();
+        struct timespec deadline;
+        abstime_in_ms(deadline, warn_ms);
+        int rc = 0;
+#if defined(__linux__)
+        rc = pthread_timedjoin_np((pthread_t)(uintptr_t)o->host_thread, nullptr, &deadline);
+        if (rc == ETIMEDOUT) {
+            log_line("BLOCKED >%llums: sceUltUlthreadJoin on \"%s\" (0x%llx) — the ulthread has not "
+                     "returned. Still waiting. (PROSPER_ULT_BLOCK_WARN_MS)",
+                     (unsigned long long)warn_ms, o->name.c_str(), (unsigned long long)a0);
+            rc = pthread_join((pthread_t)(uintptr_t)o->host_thread, nullptr);
+        }
+#else
+        rc = pthread_join((pthread_t)(uintptr_t)o->host_thread, nullptr);
+#endif
+        if (rc != 0 && rc != ESRCH) {
+            log_line("sceUltUlthreadJoin on \"%s\" failed: pthread rc=%d", o->name.c_str(), rc);
+            return kUltErrInval;
+        }
+    } else {
+        pthread_join((pthread_t)(uintptr_t)o->host_thread, nullptr);
+    }
+
+    // The ulthread entry is int32_t(*)(uint64_t); its return travels in eax.
+    const uint32_t status = o->exit_status.load(std::memory_order_relaxed);
+    if (a1) {
+        if (!gpu::guest_readable(a1, sizeof(int32_t))) {
+            log_line("sceUltUlthreadJoin: status out-param 0x%llx is unusable — not writing it",
+                     (unsigned long long)a1);
+        } else {
+            *(int32_t*)(uintptr_t)a1 = (int32_t)status;
+        }
+    }
+    g_last_join_stack_used.store(o->stack_used.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+    g_last_join_context_size.store(o->context_size, std::memory_order_relaxed);
+    log_line("sceUltUlthreadJoin(\"%s\") -> status %d, guest stack high-water %s%llu of %llu bytes",
+             o->name.c_str(), (int)status,
+             o->stack_exact.load(std::memory_order_relaxed) ? "" : "<=",
+             (unsigned long long)o->stack_used.load(), (unsigned long long)o->context_size);
+
+    UltObject* rt = object_from_id(o->runtime_id, UltType::Runtime);
+    if (rt) {
+        runtime_release_slot(rt, make_id(o->slot, o->generation));
+        rt->live_ulthreads.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    unpublish_object(a0);
+    o->alive.store(false, std::memory_order_release);
+    return kUltOk;
+}
+
+// =============================================================================================
+// Condition variables
+//
+// sceUltConditionVariableWait takes ONE argument: the mutex is bound at create. Two facts from the
+// guest's own call sites shape this implementation, and both were established before writing it.
+//
+//  1. THE CALLER HOLDS THE BOUND MUTEX AT EVERY Wait. All five sites are immediately preceded by
+//     sceUltMutexLock on exactly the mutex the condvar was created with (eboot 0xbda0->0xbdba,
+//     0x13808->0x1381b, 0x1386d->0x13880, 0x1427e->0x14291, 0xff433->0xff446). That is what makes
+//     pthread_cond_wait's atomic release/reacquire correct rather than undefined.
+//
+//  2. THE CALLER DOES *NOT* HOLD IT AT Signal. At every one of the eleven Signal sites the bound
+//     mutex is unheld — the guest either holds a DIFFERENT mutex (0xb582 unlocks +0x70 before
+//     signalling the condvar at +0x170, whose bound mutex is +0x270) or holds nothing at all
+//     (0xff502, 0xff5db). Signalling outside the mutex is legal, but it means the wake accounting
+//     cannot be protected by the bound mutex, because Signal never takes it.
+//
+// So wakes are accounted with two monotonic counters instead of a shared lock. A waiter takes ticket
+// N from `wait_seq` and proceeds only once `wake_seq` reaches N; Signal advances `wake_seq` by one
+// and broadcasts. This gives exactly-one-waiter-released-per-Signal, suppresses spurious wakeups
+// (the guest must not resume on an unmet predicate if any of its five sites turns out not to loop on
+// one), and preserves the POSIX rule that a Signal with no waiter is LOST rather than remembered —
+// `wake_seq` never overtakes `wait_seq`.
+//
+// The one window this leaves is a broadcast landing between a waiter's ticket test and its
+// pthread_cond_timedwait, which no lock-free scheme can close while Signal does not take the mutex.
+// It is bounded rather than papered over: waiters poll on a short interval, so a missed broadcast
+// costs at most kCondPollMs, never a hang. With at most numMaxUlthread waiters that is free.
+// CONFIDENCE: HIGH on the two call-site facts; MED that real libSceUlt suppresses spurious wakeups
+// (prosper has no capture of a real console's Wait returning), and suppressing is the safe direction:
+// a guest that loops on its predicate cannot tell the difference, and one that does not is protected.
+constexpr uint64_t kCondPollMs = 20;
+
+PROSPER_SYSV_ABI uint64_t ult_cond_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                          uint64_t a4, uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxCondCreate, &out)) return out;
+    note_uninitialised("_sceUltConditionVariableCreate");
+    if (!guest_object_writable(a0)) {
+        log_line("_sceUltConditionVariableCreate: unusable condvar pointer 0x%llx",
+                 (unsigned long long)a0);
+        return kUltErrInval;
+    }
+    UltObject* mutex = resolve(a2, UltType::Mutex, "_sceUltConditionVariableCreate(mutex)");
+    if (!mutex) return kUltErrInval;
+
+    UltObject* o = allocate_object(UltType::Cond);
+    if (!o->cond_valid) {
+        const int rc = pthread_cond_init(&o->cond, nullptr);
+        if (rc) {
+            log_line("_sceUltConditionVariableCreate: pthread_cond_init failed (%d)", rc);
+            return kUltErrNoMem;
+        }
+        o->cond_valid = true;
+    }
+    o->name = guest_string(a1);
+    o->guest_addr = a0;
+    o->api_version = (uint32_t)a4;
+    o->mutex_id = make_id(mutex->slot, mutex->generation);
+    o->wait_seq.store(0, std::memory_order_relaxed);
+    o->wake_seq.store(0, std::memory_order_relaxed);
+    o->destroying.store(false, std::memory_order_relaxed);
+    o->alive.store(true, std::memory_order_release);
+    const uint64_t id = make_id(o->slot, o->generation);
+    if (!publish_object(a0, UltType::Cond, id)) {
+        o->alive.store(false, std::memory_order_release);
+        return kUltErrInval;
+    }
+    // Bound to the same pool the mutex came from, so pool accounting sees condvars too.
+    if (UltObject* pool = object_from_id(mutex->pool_id, UltType::Pool)) {
+        o->pool_id = mutex->pool_id;
+        pool->bound_sync_objects.fetch_add(1, std::memory_order_relaxed);
+    }
+    log_line("_sceUltConditionVariableCreate(\"%s\") cv=0x%llx mutex=0x%llx(\"%s\") apiVersion=0x%x -> ok",
+             o->name.c_str(), (unsigned long long)a0, (unsigned long long)a2, mutex->name.c_str(),
+             o->api_version);
+    return kUltOk;
+}
+
+PROSPER_SYSV_ABI uint64_t ult_cond_wait(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
+                                        uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxCondWait, &out)) return out;
+    UltObject* o = resolve(a0, UltType::Cond, "sceUltConditionVariableWait");
+    if (!o) return kUltErrSrch;
+    UltObject* m = object_from_id(o->mutex_id, UltType::Mutex);
+    if (!m) {
+        log_line("sceUltConditionVariableWait: condvar \"%s\" (0x%llx) has no live bound mutex — it "
+                 "was destroyed while the condvar still refers to it",
+                 o->name.c_str(), (unsigned long long)a0);
+        return kUltErrInval;
+    }
+    const uint64_t me = self_thread();
+    // The classic contract, and one this title does honour at all five sites. Waiting without the
+    // mutex is undefined for pthread_cond_wait, so it is refused rather than executed.
+    if (m->owner.load(std::memory_order_relaxed) != me) {
+        static std::atomic<uint64_t> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8)
+            log_line("sceUltConditionVariableWait on \"%s\" by thread 0x%llx, which does NOT hold the "
+                     "bound mutex \"%s\" (holder 0x%llx) — refusing rather than entering undefined "
+                     "behaviour", o->name.c_str(), (unsigned long long)me, m->name.c_str(),
+                     (unsigned long long)m->owner.load(std::memory_order_relaxed));
+        return kUltErrPerm;
+    }
+
+    const uint64_t ticket = o->wait_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+    uint64_t waited_ms = 0;
+    bool noted = false;
+    uint64_t rc = kUltOk;
+    m->owner.store(0, std::memory_order_relaxed);       // released for the duration of the wait
+    while (o->wake_seq.load(std::memory_order_acquire) < ticket) {
+        if (o->destroying.load(std::memory_order_acquire)) {
+            log_line("sceUltConditionVariableWait on \"%s\" returning because the condvar is being "
+                     "destroyed", o->name.c_str());
+            rc = kUltErrSrch;
+            break;
+        }
+        struct timespec deadline;
+        abstime_in_ms(deadline, kCondPollMs);
+        pthread_cond_timedwait(&o->cond, &m->mtx, &deadline);
+        waited_ms += kCondPollMs;
+        if (!noted && waited_ms >= cond_note_ms()) {
+            noted = true;
+            log_line("WAITING >%llums: sceUltConditionVariableWait on \"%s\" (0x%llx), thread 0x%llx. "
+                     "This is informational — a worker waiting for work is normal — but if the title "
+                     "appears hung, nothing has signalled this condvar. (PROSPER_ULT_COND_NOTE_MS)",
+                     (unsigned long long)cond_note_ms(), o->name.c_str(), (unsigned long long)a0,
+                     (unsigned long long)me);
+        }
+    }
+    m->owner.store(me, std::memory_order_relaxed);      // reacquired by pthread_cond_timedwait
+    return rc;
+}
+
+PROSPER_SYSV_ABI uint64_t ult_cond_signal(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
+                                          uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxCondSignal, &out)) return out;
+    UltObject* o = resolve(a0, UltType::Cond, "sceUltConditionVariableSignal");
+    if (!o) return kUltErrSrch;
+    // Release at most one un-woken waiter, and only if one exists: a Signal with nobody waiting is
+    // LOST, as it is for a real condition variable. wake_seq therefore never overtakes wait_seq.
+    uint64_t woken = o->wake_seq.load(std::memory_order_acquire);
+    for (;;) {
+        const uint64_t issued = o->wait_seq.load(std::memory_order_acquire);
+        if (woken >= issued) return kUltOk;             // no waiter to release
+        if (o->wake_seq.compare_exchange_weak(woken, woken + 1, std::memory_order_acq_rel,
+                                              std::memory_order_acquire))
+            break;
+    }
+    // Broadcast rather than signal: waiters select themselves by ticket, so every one must
+    // re-evaluate. Bounded by numMaxUlthread, which the guest sizes at 16.
+    pthread_cond_broadcast(&o->cond);
+    return kUltOk;
+}
+
+PROSPER_SYSV_ABI uint64_t ult_cond_destroy(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
+                                           uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxCondDestroy, &out)) return out;
+    UltObject* o = resolve(a0, UltType::Cond, "sceUltConditionVariableDestroy");
+    if (!o) return kUltErrSrch;
+    const uint64_t issued = o->wait_seq.load(std::memory_order_acquire);
+    const uint64_t woken = o->wake_seq.load(std::memory_order_acquire);
+    if (issued > woken)
+        log_line("sceUltConditionVariableDestroy on \"%s\" (0x%llx) with %llu waiter(s) still "
+                 "blocked — releasing them with an error rather than leaving them stuck",
+                 o->name.c_str(), (unsigned long long)a0, (unsigned long long)(issued - woken));
+    o->destroying.store(true, std::memory_order_release);
+    pthread_cond_broadcast(&o->cond);
+    unpublish_object(a0);
+    o->alive.store(false, std::memory_order_release);
+    if (UltObject* pool = object_from_id(o->pool_id, UltType::Pool))
+        pool->bound_sync_objects.fetch_sub(1, std::memory_order_relaxed);
+    return kUltOk;
+}
 }  // namespace
 
 void register_ult_hle() {
@@ -920,18 +1370,14 @@ void register_ult_hle() {
     Hle::register_fn(kUlt[kIdxMutexUnlock].nid,  (HleFn)ult_mutex_unlock,  kUlt[kIdxMutexUnlock].name);
     Hle::register_fn(kUlt[kIdxMutexDestroy].nid, (HleFn)ult_mutex_destroy, kUlt[kIdxMutexDestroy].name);
 
-    Hle::register_fn(kUlt[kIdxUlthreadCreate].nid, (HleFn)ult_refuse<kIdxUlthreadCreate>,
+    Hle::register_fn(kUlt[kIdxUlthreadCreate].nid, (HleFn)ult_ulthread_create,
                      kUlt[kIdxUlthreadCreate].name);
-    Hle::register_fn(kUlt[kIdxUlthreadJoin].nid,   (HleFn)ult_refuse<kIdxUlthreadJoin>,
+    Hle::register_fn(kUlt[kIdxUlthreadJoin].nid,   (HleFn)ult_ulthread_join,
                      kUlt[kIdxUlthreadJoin].name);
-    Hle::register_fn(kUlt[kIdxCondCreate].nid,     (HleFn)ult_refuse<kIdxCondCreate>,
-                     kUlt[kIdxCondCreate].name);
-    Hle::register_fn(kUlt[kIdxCondWait].nid,       (HleFn)ult_refuse<kIdxCondWait>,
-                     kUlt[kIdxCondWait].name);
-    Hle::register_fn(kUlt[kIdxCondSignal].nid,     (HleFn)ult_refuse<kIdxCondSignal>,
-                     kUlt[kIdxCondSignal].name);
-    Hle::register_fn(kUlt[kIdxCondDestroy].nid,    (HleFn)ult_refuse<kIdxCondDestroy>,
-                     kUlt[kIdxCondDestroy].name);
+    Hle::register_fn(kUlt[kIdxCondCreate].nid,  (HleFn)ult_cond_create,  kUlt[kIdxCondCreate].name);
+    Hle::register_fn(kUlt[kIdxCondWait].nid,    (HleFn)ult_cond_wait,    kUlt[kIdxCondWait].name);
+    Hle::register_fn(kUlt[kIdxCondSignal].nid,  (HleFn)ult_cond_signal,  kUlt[kIdxCondSignal].name);
+    Hle::register_fn(kUlt[kIdxCondDestroy].nid, (HleFn)ult_cond_destroy, kUlt[kIdxCondDestroy].name);
 }
 
 uint64_t ult_call_count(const char* nid) {
@@ -943,6 +1389,16 @@ uint64_t ult_call_count(const char* nid) {
 
 bool ult_set_return_success_for_test(bool return_success) {
     return g_return_success.exchange(return_success, std::memory_order_relaxed);
+}
+
+uint64_t ult_runtime_high_water_for_test(uint64_t guest_runtime_addr) {
+    UltObject* rt = resolve(guest_runtime_addr, UltType::Runtime, "ult_runtime_high_water_for_test");
+    return rt ? rt->high_water.load(std::memory_order_relaxed) : 0;
+}
+
+uint64_t ult_last_join_stack_used_for_test(uint64_t* context_size) {
+    if (context_size) *context_size = g_last_join_context_size.load(std::memory_order_relaxed);
+    return g_last_join_stack_used.load(std::memory_order_relaxed);
 }
 
 bool ult_set_legacy_enosys_for_test(bool legacy_enosys) {

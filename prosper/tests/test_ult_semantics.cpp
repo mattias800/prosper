@@ -19,6 +19,7 @@
 #include "../src/hle/dispatch.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -62,6 +63,48 @@ static const char* const kMtxLock     = "8hEGkR1pfr8";
 static const char* const kMtxUnlock   = "h0XebKiMBtk";
 static const char* const kMtxDestroy  = "jW+HnafeS3Y";
 static const char* const kInitialize  = "hZIg1EWGsHM";
+static const char* const kUltCreate   = "znI3q8S7KQ4";
+static const char* const kUltJoin     = "gCeAI57LGgI";
+static const char* const kCvCreate    = "jnKaHGkrxZ4";
+static const char* const kCvWait      = "5xGAHCxA8M0";
+static const char* const kCvSignal    = "JTw1cAVkuc0";
+static const char* const kCvDestroy   = "xrmmI832R4U";
+
+// _sceUltUlthreadCreate takes 9 arguments; runtime/optParam/apiVersion arrive on the guest stack and
+// the import bridge forwards them as ordinary parameters.
+using HleFn9 = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t);
+static uint64_t call9(const char* nid, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                      uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
+    HleFn fn = Hle::lookup(nid);
+    if (!fn) { std::printf("  [FAIL] NID %s is not registered\n", nid); ++fails; return ~0ull; }
+    return ((HleFn9)fn)(a0, a1, a2, a3, a4, a5, a6, a7, a8);
+}
+
+// Ulthread entries. Earthion gives each ulthread 0x2000 bytes; this test uses a larger context
+// because the entry is host-compiled test code rather than the guest's own tightly-sized worker.
+static constexpr uint64_t kContextBytes = 64 * 1024;
+static constexpr uint64_t kTouchBytes   = 24 * 1024;
+static std::atomic<int> g_entry_ran{0};
+static std::atomic<int> g_entry_gate{0};
+static volatile uint64_t g_sink = 0;
+
+// Touches a known depth of its stack so the context high-water measurement has a floor to clear.
+// `volatile` so the writes survive optimisation — an elided frame would measure nothing.
+static int32_t touch_stack_entry(uint64_t arg) {
+    volatile unsigned char buf[kTouchBytes];
+    for (size_t i = 0; i < kTouchBytes; i += 64) buf[i] = (unsigned char)(i ^ 0x5A);
+    for (size_t i = 0; i < kTouchBytes; i += 64) g_sink += buf[i];
+    g_entry_ran.fetch_add(1);
+    return (int32_t)(arg & 0x7fffffff);
+}
+
+// Announces itself and then spins until released, so several ulthreads are provably running at once.
+static int32_t gated_entry(uint64_t arg) {
+    g_entry_ran.fetch_add(1);
+    while (g_entry_gate.load() == 0) std::this_thread::yield();
+    return (int32_t)arg;
+}
 
 // Earthion's own parameters, so the test exercises the values the only importing title actually uses.
 static constexpr uint32_t kNumMaxUlthread = 16, kNumWorkerThread = 3;
@@ -219,6 +262,201 @@ int main() {
     CHECK(call(kMtxLock, (uint64_t)(uintptr_t)&g_mutex_b) == 0 &&
           call(kMtxUnlock, (uint64_t)(uintptr_t)&g_mutex_b) == 0,
           "the second mutex locks and unlocks independently of the first");
+
+    // --- ulthreads ----------------------------------------------------------------------------
+    // Each ulthread runs its entry on the guest-supplied context buffer, which IS its stack on
+    // hardware. These assertions are all impossible on a tree where _sceUltUlthreadCreate refused:
+    // the entry never ran at all, so the counter stays 0 and no status is ever produced.
+    {
+        g_entry_ran.store(0);
+        g_entry_gate.store(0);
+        UltBlob ult;
+        std::memset(&ult, 0, sizeof(ult));
+        std::vector<unsigned char> ctx(kContextBytes);
+
+        const uint64_t rc = call9(kUltCreate, (uint64_t)(uintptr_t)&ult, 0,
+                                  (uint64_t)(uintptr_t)&touch_stack_entry, 0x1234,
+                                  (uint64_t)(uintptr_t)ctx.data(), kContextBytes,
+                                  (uint64_t)(uintptr_t)&g_runtime, 0, kApiVersion);
+        CHECK(rc == 0, "_sceUltUlthreadCreate starts the ulthread");
+
+        int32_t status = -1;
+        const uint64_t jrc = call(kUltJoin, (uint64_t)(uintptr_t)&ult, (uint64_t)(uintptr_t)&status);
+        CHECK(jrc == 0, "sceUltUlthreadJoin returns once the ulthread has finished");
+        CHECK(g_entry_ran.load() == 1, "the ulthread entry ACTUALLY RAN (it never did before)");
+        // The entry is int32_t(*)(uint64_t) and returns its argument's low bits; join reports it
+        // through the 4-byte out-param the guest passes at eboot+0x9f1e.
+        CHECK(status == 0x1234, "sceUltUlthreadJoin writes the entry's int32 return into *status");
+
+        // Amendment 6: the context buffer is filled at create and the untouched prefix measured at
+        // exit, so an ulthread approaching its stack limit is reported rather than silently
+        // overflowing. The entry deliberately touches kTouchBytes.
+        uint64_t ctx_size = 0;
+        const uint64_t used = ult_last_join_stack_used_for_test(&ctx_size);
+        CHECK(ctx_size == kContextBytes && used >= kTouchBytes && used <= kContextBytes,
+              "the guest-stack high-water is measured and lands within the context buffer");
+        if (!(used >= kTouchBytes && used <= kContextBytes))
+            std::printf("         (used=%llu touched=%llu context=%llu)\n",
+                        (unsigned long long)used, (unsigned long long)kTouchBytes,
+                        (unsigned long long)kContextBytes);
+
+        // A joined ulthread is gone: joining again must be refused, not silently repeated.
+        CHECK(call(kUltJoin, (uint64_t)(uintptr_t)&ult, 0) != 0,
+              "joining an already-joined ulthread is refused");
+    }
+
+    // Amendment 2b: prosper runs ulthreads one-to-one rather than multiplexing them onto
+    // numWorkerThread, so more can run at once than on hardware. That deviation must be OBSERVED,
+    // not assumed — the runtime carries a high-water mark of simultaneously running ulthreads.
+    {
+        g_entry_ran.store(0);
+        g_entry_gate.store(0);                 // entries spin here until released
+        constexpr int kN = 6;                  // deliberately > numWorkerThread (3)
+        UltBlob ults[kN];
+        std::vector<std::vector<unsigned char>> ctxs;
+        bool all_started = true;
+        for (int i = 0; i < kN; ++i) {
+            std::memset(&ults[i], 0, sizeof(ults[i]));
+            ctxs.emplace_back(kContextBytes);
+        }
+        for (int i = 0; i < kN; ++i)
+            all_started &= call9(kUltCreate, (uint64_t)(uintptr_t)&ults[i], 0,
+                                 (uint64_t)(uintptr_t)&gated_entry, (uint64_t)i,
+                                 (uint64_t)(uintptr_t)ctxs[i].data(), kContextBytes,
+                                 (uint64_t)(uintptr_t)&g_runtime, 0, kApiVersion) == 0;
+        CHECK(all_started, "six ulthreads start in a runtime created for numMaxUlthread=16");
+        // Wait until every entry is spinning, so the high-water reflects real simultaneity.
+        for (int spins = 0; g_entry_ran.load() < kN && spins < 200000; ++spins)
+            std::this_thread::yield();
+        const uint64_t hw = ult_runtime_high_water_for_test((uint64_t)(uintptr_t)&g_runtime);
+        g_entry_gate.store(1);
+        for (int i = 0; i < kN; ++i) call(kUltJoin, (uint64_t)(uintptr_t)&ults[i], 0);
+        CHECK(hw > kNumWorkerThread,
+              "the runtime OBSERVES that more ulthreads ran at once than numWorkerThread=3");
+        if (hw <= kNumWorkerThread)
+            std::printf("         (high-water %llu — the deviation counter is not measuring)\n",
+                        (unsigned long long)hw);
+    }
+
+    // numMaxUlthread is the guest's own bound and is unambiguous, so it is ENFORCED rather than
+    // merely reported: a runtime sized for 1 must refuse the second ulthread.
+    {
+        g_entry_ran.store(0);
+        g_entry_gate.store(0);
+        UltBlob small_rt, u1, u2;
+        std::memset(&small_rt, 0, sizeof(small_rt));
+        std::memset(&u1, 0, sizeof(u1));
+        std::memset(&u2, 0, sizeof(u2));
+        const uint64_t bytes = call(kRtSize, 1, 1);
+        std::vector<unsigned char> work((size_t)bytes, 0);
+        std::vector<unsigned char> c1(kContextBytes), c2(kContextBytes);
+        CHECK(call7(kRtCreate, (uint64_t)(uintptr_t)&small_rt, 0, 1, 1,
+                    (uint64_t)(uintptr_t)work.data(), 0, kApiVersion) == 0,
+              "a runtime sized for numMaxUlthread=1 is created");
+        const uint64_t first = call9(kUltCreate, (uint64_t)(uintptr_t)&u1, 0,
+                                     (uint64_t)(uintptr_t)&gated_entry, 0,
+                                     (uint64_t)(uintptr_t)c1.data(), kContextBytes,
+                                     (uint64_t)(uintptr_t)&small_rt, 0, kApiVersion);
+        const uint64_t second = call9(kUltCreate, (uint64_t)(uintptr_t)&u2, 0,
+                                      (uint64_t)(uintptr_t)&gated_entry, 0,
+                                      (uint64_t)(uintptr_t)c2.data(), kContextBytes,
+                                      (uint64_t)(uintptr_t)&small_rt, 0, kApiVersion);
+        CHECK(first == 0 && second != 0,
+              "the runtime refuses an ulthread beyond the numMaxUlthread the guest asked for");
+        g_entry_gate.store(1);
+        call(kUltJoin, (uint64_t)(uintptr_t)&u1, 0);
+    }
+
+    // --- condition variables --------------------------------------------------------------------
+    // sceUltConditionVariableWait takes ONE argument; the mutex is bound at create. The tests below
+    // exercise the two facts the implementation is built on, both established from the guest's own
+    // call sites: the caller HOLDS the bound mutex at Wait, and does NOT hold it at Signal.
+    {
+        UltBlob cv, cv_mutex;
+        std::memset(&cv, 0, sizeof(cv));
+        std::memset(&cv_mutex, 0, sizeof(cv_mutex));
+        CHECK(call(kMtxCreate, (uint64_t)(uintptr_t)&cv_mutex, 0, (uint64_t)(uintptr_t)&g_pool, 0,
+                   kApiVersion) == 0,
+              "a mutex for the condvar to bind is created");
+        CHECK(call(kCvCreate, (uint64_t)(uintptr_t)&cv, 0, (uint64_t)(uintptr_t)&cv_mutex, 0,
+                   kApiVersion) == 0,
+              "_sceUltConditionVariableCreate binds the condvar to that mutex");
+
+        // Binding to something that is not a mutex must be refused.
+        UltBlob cv2, not_a_mutex;
+        std::memset(&cv2, 0, sizeof(cv2));
+        std::memset(&not_a_mutex, 0, sizeof(not_a_mutex));
+        CHECK(call(kCvCreate, (uint64_t)(uintptr_t)&cv2, 0, (uint64_t)(uintptr_t)&not_a_mutex, 0,
+                   kApiVersion) != 0,
+              "_sceUltConditionVariableCreate refuses a mutex that was never created");
+
+        // Waiting WITHOUT the bound mutex is undefined for pthread_cond_wait, so it must be refused
+        // rather than executed. (The guest never does this — all five of its Wait sites lock first —
+        // but a fake implementation that ignored the mutex entirely would pass every other check.)
+        CHECK(call(kCvWait, (uint64_t)(uintptr_t)&cv) != 0,
+              "sceUltConditionVariableWait without holding the bound mutex is refused");
+
+        // A Signal with nobody waiting is LOST, exactly as for a real condition variable. If it were
+        // remembered, the next Wait would return immediately without ever being signalled — the
+        // difference between a condvar and a semaphore, and a real source of guest logic bugs.
+        CHECK(call(kCvSignal, (uint64_t)(uintptr_t)&cv) == 0, "a Signal with no waiter succeeds");
+
+        // The real contract: a waiter blocks until signalled, and the signaller does NOT hold the
+        // bound mutex when it signals — which is what the guest does at all eleven of its sites.
+        std::atomic<int> waiter_state{0};   // 1 = about to wait, 2 = returned from wait
+        std::thread waiter([&] {
+            if (call(kMtxLock, (uint64_t)(uintptr_t)&cv_mutex) != 0) return;
+            waiter_state.store(1);
+            if (call(kCvWait, (uint64_t)(uintptr_t)&cv) == 0) waiter_state.store(2);
+            call(kMtxUnlock, (uint64_t)(uintptr_t)&cv_mutex);
+        });
+        while (waiter_state.load() == 0) std::this_thread::yield();
+        // Give the waiter time to actually block. If the earlier lost Signal had been remembered, or
+        // if Wait returned spuriously, it would have advanced to 2 by now.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        const bool still_waiting = waiter_state.load() == 1;
+        // Signal from a thread that holds NOTHING — the guest's own pattern.
+        call(kCvSignal, (uint64_t)(uintptr_t)&cv);
+        waiter.join();
+        CHECK(still_waiting,
+              "a waiter stays blocked: an earlier signal with no waiter was lost, not remembered");
+        CHECK(waiter_state.load() == 2,
+              "sceUltConditionVariableSignal from a thread holding no mutex wakes the waiter");
+
+        // Exactly one waiter per Signal, and the bound mutex is genuinely reacquired on return —
+        // both threads increment a non-atomic counter while nominally holding it.
+        {
+            static volatile int guarded = 0;
+            std::atomic<int> woken{0}, ready{0};
+            std::thread w1, w2;
+            auto body = [&] {
+                call(kMtxLock, (uint64_t)(uintptr_t)&cv_mutex);
+                ready.fetch_add(1);
+                if (call(kCvWait, (uint64_t)(uintptr_t)&cv) == 0) {
+                    const int v = guarded; guarded = v + 1;   // must run under the reacquired mutex
+                    woken.fetch_add(1);
+                }
+                call(kMtxUnlock, (uint64_t)(uintptr_t)&cv_mutex);
+            };
+            w1 = std::thread(body);
+            w2 = std::thread(body);
+            while (ready.load() < 2) std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            call(kCvSignal, (uint64_t)(uintptr_t)&cv);
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const int after_one = woken.load();
+            call(kCvSignal, (uint64_t)(uintptr_t)&cv);
+            w1.join(); w2.join();
+            CHECK(after_one == 1, "one Signal releases exactly ONE of two waiters, not both");
+            CHECK(woken.load() == 2 && guarded == 2,
+                  "the second Signal releases the other, and both ran under the reacquired mutex");
+        }
+
+        CHECK(call(kCvDestroy, (uint64_t)(uintptr_t)&cv) == 0,
+              "sceUltConditionVariableDestroy succeeds");
+        CHECK(call(kCvSignal, (uint64_t)(uintptr_t)&cv) != 0,
+              "signalling a DESTROYED condvar is refused");
+    }
 
     // --- the counters stay real ----------------------------------------------------------------
     CHECK(ult_call_count(kMtxLock) > 40000 && ult_call_count(kMtxUnlock) > 40000,

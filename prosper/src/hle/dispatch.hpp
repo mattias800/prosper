@@ -103,6 +103,21 @@ void register_http_hle();
 void register_font_hle();
 // libSceFiber cooperative guest-stack switching; called by register_builtin_hle().
 void register_fiber_hle();
+// Optional host-side hooks around a spawned guest thread's guest-code region. Both run on the HOST
+// %fs — on_enter as the last host action before the guest entry, on_exit as the first after it
+// returns — so either may call host libc. Null hooks are the default and change nothing.
+struct GuestThreadHooks {
+    void (*on_enter)(void* opaque) = nullptr;
+    void (*on_exit)(void* opaque, uint64_t retval) = nullptr;
+    void* opaque = nullptr;
+};
+// Spawn a guest-code thread through the same trampoline scePthreadCreate uses, entering the guest on
+// an explicit caller-supplied stack. Returns 0 on success, otherwise an errno-style code. Used by
+// libSceUlt to run an ulthread on its guest-supplied context buffer (#1603).
+int guest_thread_spawn(uint64_t entry, uint64_t arg, const char* name,
+                       void* guest_stack, size_t guest_stack_size,
+                       const GuestThreadHooks* hooks, uint64_t* out_thread);
+
 // libSceUlt (user-level threading): the ulthread runtime, waiting-queue resource pool, mutexes and
 // condition variables, with the ABI derived from the importing title's own call sites (#1603).
 // Entry points not yet implemented stay registered, counted and fail-visible; see hle_ult.cpp.
@@ -118,6 +133,10 @@ void ult_dump_call_log(FILE* f);
 // the counters. Each setter returns the previous policy. Production code must not call these.
 bool ult_set_return_success_for_test(bool return_success);
 bool ult_set_legacy_enosys_for_test(bool legacy_enosys);
+// Highest number of ulthreads of this runtime observed RUNNING at once (the #1603 amendment-2b
+// deviation counter), and the last join's measured guest-stack high-water (amendment 6).
+uint64_t ult_runtime_high_water_for_test(uint64_t guest_runtime_addr);
+uint64_t ult_last_join_stack_used_for_test(uint64_t* context_size);
 void ult_reset_counts_for_test();
 // libScePad game-controller input (real host controller via input/pad.cpp); called by register_builtin_hle().
 void register_pad_hle();
