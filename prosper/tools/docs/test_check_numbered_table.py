@@ -23,18 +23,36 @@ FAILURES: list[str] = []
 
 
 def run(name: str, body: str, *, sequential: bool = False, header: str | None = None,
-        want_problems: bool, expect_text: str | None = None) -> None:
+        want_problems: bool, expect_text: str | None = None, want_count: int | None = None,
+        want_lines: list[int] | None = None) -> None:
+    """Check one document.
+
+    `want_count`/`want_lines` exist because asserting mere truthiness cannot see a detector that
+    finds the FIRST instance of a defect and stops -- a common shape (early return, comparing only
+    against the previous element) that single-instance fixtures are blind to. An earlier draft of
+    this checker had exactly that bug, and a truthiness-only version of this suite stayed green
+    when it was reintroduced. Any case covering more than one defect must pin the count.
+    """
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "case.md"
         path.write_text(body, encoding="utf-8")
         problems = check(path, sequential, header)
-    got = bool(problems)
-    if got != want_problems:
+    if bool(problems) != want_problems:
         FAILURES.append(
             f"{name}: expected {'problems' if want_problems else 'clean'}, got "
             f"{problems if problems else 'clean'}"
         )
         return
+    if want_count is not None and len(problems) != want_count:
+        FAILURES.append(
+            f"{name}: expected exactly {want_count} problem(s), got {len(problems)}: {problems}"
+        )
+        return
+    if want_lines is not None:
+        got = sorted({int(p.split(":")[1]) for p in problems if p.split(":")[1].strip().isdigit()})
+        if got != sorted(want_lines):
+            FAILURES.append(f"{name}: expected problems at lines {sorted(want_lines)}, got {got}")
+            return
     if expect_text and not any(expect_text in p for p in problems):
         FAILURES.append(f"{name}: expected a message containing {expect_text!r}, got {problems}")
         return
@@ -60,7 +78,26 @@ run("blank line after the delimiter",
 # silently misses the second. The file that prompted this check had exactly this shape.
 run("two blank lines split the same table",
     "| # | What |\n|---|---|\n| 1 | a |\n\n| 2 | b |\n\n| 3 | c |\n",
-    want_problems=True, expect_text="blank line splits the table")
+    want_problems=True, want_count=2, want_lines=[4, 6],
+    expect_text="blank line splits the table")
+
+# R1: a row that lost its leading pipe ends the table just as a blank line does, and is the more
+# likely lane accident. Everything below it silently leaves the sequence check too, so a duplicate
+# number underneath would pass green -- which is the defect this whole check exists to prevent.
+run("a row that lost its leading pipe ends the table",
+    "| # | What |\n|---|---|\n| 1 | a |\n2 | b |\n| 3 | c |\n",
+    want_problems=True, want_count=1, want_lines=[4],
+    expect_text="lose its leading")
+
+# Structural errors are reported first and the broken remainder leaves the sequence check, the way
+# a compiler stops elaborating a malformed declaration. What matters is that the file CANNOT pass
+# green while hiding a duplicate below the break -- the previous revision reported
+# "contiguous and unbroken", exit 0, on exactly this input. Fix the structure, re-run, get the
+# duplicate.
+run("a duplicate hidden below an interruption cannot pass green",
+    "| # | What |\n|---|---|\n| 1 | a |\n2 | b |\n| 5 | c |\n| 5 | d |\n",
+    sequential=True, want_problems=True, want_count=1, want_lines=[4],
+    expect_text="drops out of any sequence check")
 
 # The #1696 collision: two branches append the same number; the merge is textually clean.
 run("duplicate row number",
@@ -107,8 +144,10 @@ run("two separate tables separated only by a blank line",
     want_problems=False)
 
 # The docs paste tool output containing pipes; the defect example in this very PR is fenced.
+# Discriminating: the fenced run has no delimiter, so without fence handling it reads as a
+# fragment continuing the table above and reports a break.
 run("table-like lines inside a fenced block",
-    TABLE + "\nprose\n\n```\n| 33 | 34 | 35 | 32 |\nsome output\n```\n",
+    TABLE + "\n```\n| 33 | 34 | 35 | 32 |\n| 9 | more output |\n```\n",
     want_problems=False)
 
 run("fenced block between two tables",

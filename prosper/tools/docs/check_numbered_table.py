@@ -113,7 +113,8 @@ def parse_tables(lines: list[str]) -> tuple[list[Table], set[int]]:
             continue
         if fenced:
             continue
-        if line.lstrip().startswith("|"):
+        # 4+ spaces is an indented code block in Markdown, not a table row.
+        if line.startswith("|") or (line[:4].strip() and line.lstrip().startswith("|")):
             if not run:
                 run_start = i
             run.append(line)
@@ -152,28 +153,37 @@ def check(path: Path, sequential: bool, table_header: str | None) -> list[str]:
     problems: list[str] = []
 
     # `origin` is the proper table the current run of fragments descends from. It must survive a
-    # fragment, because a table broken twice yields fragment-after-fragment: comparing only
-    # against the immediately preceding run would report the first break and silently miss every
-    # later one. The file that prompted this check had exactly that shape -- two breaks, and a
-    # first draft found one.
+    # fragment, because a table broken twice yields fragment-after-fragment: comparing each run
+    # only against the run immediately above it would report the first break and miss every later
+    # one.
+    #
+    # What separates the runs does NOT decide whether this is a break -- only whether the run
+    # below is a proper table does. A blank line and a row that lost its leading pipe both end a
+    # table, and the second is the likelier lane accident. Treating a non-blank gap as "these are
+    # unrelated" loses that entirely: the rows below leave the sequence check with it, so a
+    # duplicate number underneath passes green, and the success line reports the truncated row
+    # count as though it were the whole table.
     origin: Table | None = None
     for previous, current in zip(tables, tables[1:]):
         if previous.proper:
             origin = previous
+        if current.proper or origin is None:
+            continue  # a table of its own, or a fragment with no proper table above it
         gap_start = previous.start + len(previous.lines)
-        contiguous = all(n in blanks for n in range(gap_start, current.start))
-        if current.proper or not contiguous:
-            if not contiguous:
-                origin = None  # separated by prose: whatever follows starts fresh
-            continue
-        if origin is None:
-            continue  # a fragment with no properly delimited table above it
         for n in range(gap_start, current.start):
-            problems.append(
-                f"{path}:{n}: blank line splits the table that starts at line {origin.start} -- "
-                f"in Markdown a blank line ends a table, so line {current.start} onward renders "
-                f"as a separate table. Delete the blank line."
-            )
+            if n in blanks:
+                problems.append(
+                    f"{path}:{n}: blank line splits the table that starts at line {origin.start} "
+                    f"-- in Markdown a blank line ends a table, so line {current.start} onward "
+                    f"renders as a separate table. Delete the blank line."
+                )
+            else:
+                problems.append(
+                    f"{path}:{n}: line is not a table row but sits inside the table that starts at "
+                    f"line {origin.start}, ending it -- so line {current.start} onward renders as "
+                    f"a separate table and drops out of any sequence check. Did it lose its "
+                    f"leading '|'? Line reads: {lines[n - 1].strip()[:60]!r}"
+                )
 
     if not sequential:
         return problems
@@ -241,6 +251,8 @@ def main() -> int:
         help="emit ::error:: annotations so failures surface on the GitHub Actions summary",
     )
     args = ap.parse_args()
+    if args.table_header and not args.sequential:
+        ap.error("--table-header only applies with --sequential")
 
     problems: list[str] = []
     for path in args.paths:
