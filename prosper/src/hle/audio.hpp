@@ -40,6 +40,22 @@ int audio_peak_channel_volume(uint32_t mask, const int* vols);
 // verified independently of the wall-clock drain performed by sceAudioOut2ContextGetQueueLevel.
 bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth);
 
+// --- Multichannel MAIN bed -> stereo host sink -------------------------------------------------
+// prosper's host sink is stereo, so every MAIN port wider than two channels has to be folded down.
+// The fold is expressed as one gain pair per SOURCE channel rather than inline in the mix loop:
+// it is a pure function of the layout, so it is unit-testable without a device or a guest, and a
+// channel prosper cannot place is then representable as {0, 0} instead of being silently smeared
+// into the bed at a guessed position.
+struct AudioStereoGain { float left = 0.0f, right = 0.0f; };
+
+// Fill out[0..channels) with the stereo fold-down gains for a `channels`-wide MAIN bed and return
+// how many of those channels prosper could NOT place. A non-zero return is a fail-visible gap, not
+// a rounding detail: those channels contribute nothing and the caller must report them.
+// `channels` above kAudioMaxBedChannels, or an out_capacity too small, places nothing and returns
+// `channels`.
+constexpr unsigned kAudioMaxBedChannels = 16;
+unsigned audio_stereo_downmix(unsigned channels, AudioStereoGain* out, unsigned out_capacity);
+
 // Non-silence measure for submitted PCM (see PROSPER_AUDIO_FLOW in hle_audio.cpp). Diagnosing a
 // silent title requires separating "the guest submitted nothing", "the guest submitted zeros" and
 // "the guest submitted real signal we then lost", and no single statistic does that:
