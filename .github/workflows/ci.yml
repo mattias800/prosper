@@ -93,18 +93,6 @@ jobs:
         run: |
           ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
 
-      # TEMPORARY (#1690 evidence, removed before merge): ctest hides a passing test's stdout, so run
-      # the two formerly-excluded registrations verbosely to capture the executed-assertion count
-      # this PR restores, measured on the runner rather than estimated from a grep.
-      - name: game_compute_exec assertion census (#1690 evidence)
-        if: always()
-        run: |
-          . /etc/os-release; echo "OS: $PRETTY_NAME"
-          dpkg-query -W -f='${Package} ${Version}\n' mesa-vulkan-drivers libvulkan1 || true
-          ctest --test-dir prosper/build-ci -V --timeout 600 \
-            -R '^game_compute_exec(_no_adaptive_storage_result)?$' 2>&1 \
-            | grep -E 'assertions executed|volume diff|FAIL:|tests passed' || true
-
   linux-app:
     name: Linux App
     runs-on: ubuntu-latest
