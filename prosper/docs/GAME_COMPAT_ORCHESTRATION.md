@@ -108,6 +108,23 @@ for d in joe-mac asterix summer-sports; do grep -v '^#' "$d/reach-gameplay.pad" 
 Seconds of work invalidated three documents. The same check applies to route scripts, per-title status
 docs, issue comments and PR bodies — anywhere parallel artifacts assert parallel results.
 
+**It also happens in source comments, which is where it does the most damage.** "It happens in `.pad`
+files" understates the trap; a second lane hit it the same day in `hle_service.cpp`. Recording the
+first live confirmation of `VdecConfig` (#1687), the comment claimed the guest's values were
+"individually meaningful at **every** offset" and that a wrong field order "**could not**" produce
+them. Checking the pairs one at a time instead of asserting the general claim: `profile=100` /
+`max_level=41` cannot swap (41 is not a `profile_idc`, 100 is not a `level_idc`), `max_dpb` /
+`input_depth` cannot (depth would go negative), width/height cannot (the movie would be portrait) —
+and `resource` / `codec` are **both `1`** in that title, so that one pair is not discriminated at all
+and still rests on the commit that introduced it. The sweeping version was written first and read as
+established fact.
+
+A doc carries a `docs/` path and some ambient suspicion; a source comment sitting above a
+`static_assert` reads as verified by construction, nothing marks it as inference, and every future
+reader inherits it. So when a comment records evidence, **enumerate what the evidence forces and name
+what it does not** — "HIGH except this pair, which is MED, and a non-AVC title settles it in one line
+of log" is a comment the next reader can act on. A general confidence claim is one they cannot check.
+
 This is **worse than a stale `UNVALIDATED` banner**, and for a specific reason: a banner tells the reader
 to check. A confident, specific, plausible header tells the reader **not to bother**, so it survives every
 subsequent reading. The remedy is not to flip a banner but to **add accurate provenance where a confident
