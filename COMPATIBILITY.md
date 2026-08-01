@@ -387,6 +387,25 @@ and lives, and parallax jungle backgrounds, foreground foliage and enemies all c
 Over a routed run the score changes, the health bar drains, the lives counter decrements, and a
 respawn banner appears, so guest logic and input are healthy end to end.
 
+The route is `prosper/scripts/joe-mac/reach-gameplay.pad` — exactly the Cross anchors from the
+tracking issue, with no directional input — and gameplay is guarded by the `joe-mac-gameplay`
+snapshot. Because the route never moves Joe, he is killed roughly every 22 s and **respawns at the
+same level-1 opening**, so the 52-125 s evidence window deliberately spans three lives instead of
+trying to fit between them: every respawn returns to one visual state, and only the brief death fades
+fail. A movement-based variant was tried first and rejected. Holding `left-stick-right` sustains more
+convincing play, but then Joe's position at any wall-clock second depends on ~100 s of accumulated
+progress; a window placed in it passed twice and then drifted onto a level transition and two death
+fades, failing with 19 structural matches against 24 required. **For a snapshot guard the stationary
+route is the more deterministic subject, even though it is the less impressive play.**
+
+This title is also the clearest case of colour count being blind upward: the richest frame of the
+whole run is the **arcade menu** at 79,167 distinct colours, **13.2%** above the best frame inside
+the guard window (69,963). That blindness was measured against the one state that defeats *both*
+numeric floors — the GAME OVER screen the stationary route reaches at 138 s, whose 17 frames all
+clear the guard's colour floor and its coverage floor, and which is excluded only by SSIM, where it
+reaches at most **0.5775** against a 0.85 floor (0 of 17 qualify). The window ends 13 s before it
+appears.
+
 ## Worms Armageddon: Anniversary Edition — `PPSA20052`
 
 <p align="center">
@@ -444,6 +463,14 @@ A 150-second route produced **zero recompiler rejections, zero skipped dispatche
 unsupported formats** on completely unmodified master. The only stubs exercised are PSN telemetry
 (UDS, WebApi2, SessionSignaling), all non-blocking.
 
+The route is `prosper/scripts/asterix/reach-gameplay.pad`, and gameplay is guarded by the
+`asterix-gameplay` snapshot. The level loads at about 45 s, settles by 49 s, and then holds unbroken
+to the end of a 210-second profile — all 161 samples from 49.1 s onward measure 74,569-75,235
+distinct colours with no black frame, fade or transition anywhere — which makes this the most stable
+of the three routes by a wide margin. The route uses no directional input, so Asterix idles and the
+score stays at zero; the guard's pixel-change requirement rests on the idle animation, the wandering
+rabbit and the blinking `GO!` prompt.
+
 Note this is a **different title** from *Asterix & Obelix: Babylon Mission* (`PPSA30490`), which is a
 Unity 6 game currently at the research tier.
 
@@ -461,6 +488,23 @@ Beyond the title itself this is a useful **3D** reference workload: it is determ
 runs with a 100% shader realization rate. `docs/RENDERER_PERFORMANCE_2026_07.md` records that the
 remaining synchronous graphics/compute boundaries must be evaluated against a 3D workload rather
 than against Messenger's 2D scene, and this is the first clean candidate for that.
+
+The route is `prosper/scripts/summer-sports/reach-gameplay.pad`, and gameplay is guarded by the
+`summer-sports-gameplay` snapshot. Three things about this title trap a guard built by metric alone.
+Because it renders at 3840×2160, the snapshot scale of 4 produces **960×540** frames rather than the
+480×270 every 1080p title gives, so `dims` must be read from a profile rather than assumed. Its
+non-black coverage is exactly 1.0000 for *every* frame of the run, menus included, so coverage
+discriminates nothing here. And the most metrically stable span of the whole route is the static
+`JAVELIN THROW` standings overlay the game rests on after 144 s — settled from 150 s, where all 60
+remaining samples measure 48,201-48,489 colours at 1.0000 coverage with SSIM 1.000 against itself —
+so a window chosen by stability lands on a results screen. The guard samples 55-80 s instead, inside
+the first live attempt, which was settled by opening the frames rather than by ranking them.
+
+The window's right edge was pulled in from 85 s after measurement. The end-of-attempt `FOUL!`/`POOR`
+banner at 85-86 s is drawn over the same stadium, but it scores only **0.6558** against the adopted
+55-80 s references — below the 0.85 floor — and carries 96,000-102,000 colours against the attempt's
+57,000-68,000. With 85 s as the edge it drifted in and out between runs, eating match margin and
+swinging the window's richest frame by 1.5×. At 80 s the window is a single visual state.
 
 ## Nikoderiko: The Magical World — `PPSA23760`
 

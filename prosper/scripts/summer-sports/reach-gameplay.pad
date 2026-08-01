@@ -1,0 +1,51 @@
+# Summer Sports Games (PPSA03416): cross the logos and the mode selector into the first athletics
+# event. Seconds are measured from the first pad poll. These are exactly the Cross anchors recorded
+# in issue #1597; no directional input is needed. They are bare time points, so each press holds
+# PROSPER_PAD_HOLD (default 300ms, hle_pad.cpp:105).
+#
+# Observed on a Linux hardware-Vulkan boot through tools/snapshot at PROSPER_RENDER_SCALE=4. This
+# title renders at 3840x2160, so scale 4 gives 960x540 frames, not the 480x270 the 1080p titles
+# produce -- the guard's dims are 960x540 for that reason. Sampling once per second: black and boot
+# logos to 19s, the mode selector and event menus 21-47s, a black load at 48s, then the javelin
+# throw event from 49.1s: full stadium, animated crowd, athlete run-up, ATTEMPT 1/3 counter, SPEED
+# power meter and the throw reticle.
+#
+# The run then alternates between live attempts and result overlays, and the last Cross press at
+# 115s leaves the game on a static JAVELIN THROW standings screen, which appears at 144s and is
+# settled from 150s to the end of the profiled 209s capture. That standings screen is the most
+# metrically stable part of the whole run -- all 60 samples from 150s onward measure 48,201-48,489
+# colours at 1.0000 coverage, SSIM 1.000 against itself -- so a window chosen by stability alone
+# lands on it. It is not gameplay. The guard therefore samples 55-80s, inside the first live attempt,
+# which was confirmed by opening the frames.
+#
+# The right edge was pulled in from 85s after measurement. The end-of-attempt FOUL!/POOR banner at
+# 85.2-86.2s is drawn over the same stadium but is not the same visual state: it scored 0.7313 and
+# 0.6948 against the reference set built from the original 55-85s window, and scores at most 0.6558
+# against the adopted 55-80s references -- below the 0.85 floor either way -- and it carries
+# 96,000-102,000 colours against the attempt's 57,000-68,000. With 85s as the edge it drifted in and
+# out between runs, eating match margin and swinging the window's richest frame by 1.5x.
+#
+# Coverage is 1.0000 for every frame of this title, gameplay and menus alike, so non-black coverage
+# carries no discrimination here and scene identity rests on SSIM.
+3:cross
+6:cross
+9:cross
+12:cross
+15:cross
+18:cross
+22:cross
+26:cross
+30:cross
+34:cross
+38:cross
+42:cross
+46:cross
+50:cross
+56:cross
+62:cross
+68:cross
+75:cross
+85:cross
+95:cross
+105:cross
+115:cross

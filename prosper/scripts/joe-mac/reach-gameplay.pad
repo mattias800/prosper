@@ -1,0 +1,47 @@
+# New Joe & Mac: Caveman Ninja (PPSA02801): cross the logos and the arcade menu into level 1.
+# Seconds are measured from the first pad poll. These are exactly the Cross anchors recorded in issue
+# #1593; no directional input is needed. They are bare time points, so each holds for
+# PROSPER_PAD_HOLD (default 300ms, hle_pad.cpp:105).
+#
+# Observed on a Linux hardware-Vulkan boot through tools/snapshot at PROSPER_RENDER_SCALE=4
+# (480x270), sampling once per second: black to 5s, publisher/engine logos 6-17s, black 18-19s, the
+# title screen and arcade menu 20-37s, a letterboxed transition 39-45s, black at 46s, then level 1
+# from 47.1s. The richest frame of the entire run is the arcade MENU at 79,167 distinct colours,
+# 13.2% above the best frame inside the guard window (69,963), so colour count is blind upward here.
+#
+# The route deliberately does not move Joe. That has a specific consequence a guard must account for:
+# he is killed roughly every 22s (68s, 91s, 114s) and respawns at the same level-1 opening, and after
+# three deaths the run reaches a GAME OVER screen at 138.2-154.3s. The last press is at 100s, so
+# nothing answers that screen; the profile shows the run leaving it on its own after 155s into
+# non-gameplay content (max SSIM 0.5505 against the adopted references, 0 of 42 frames reaching the
+# floor). Those 17 GAME OVER frames measure 46,494-46,739 colours at 0.9756-0.9758 coverage -- they
+# clear any plausible colour floor AND any plausible coverage floor while not being gameplay. Against
+# the adopted references they reach at most SSIM 0.5775, and 0 of 17 reach the 0.85 floor, so SSIM is
+# the only thing that excludes them. This is the measured case for keeping the guard contract
+# conjoined rather than numeric. The arcade menu is the next closest at 0.5506.
+#
+# The snapshot guard joe-mac-gameplay samples 52-125s. Because Joe respawns to the same opening
+# scene, that span stays one visual state across three lives: in the profile 71 of its 73 samples
+# clear the colour floor and all 73 clear coverage, and across check runs 70-72 of 73 clear coverage;
+# the frames that fail are the brief death fades. The window opens about 6s after the last
+# pre-gameplay frame (black at 46s) and ends 13s before GAME OVER appears.
+2:cross
+5:cross
+8:cross
+11:cross
+14:cross
+17:cross
+20:cross
+24:cross
+28:cross
+32:cross
+36:cross
+40:cross
+45:cross
+50:cross
+55:cross
+60:cross
+70:cross
+80:cross
+90:cross
+100:cross

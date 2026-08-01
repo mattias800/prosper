@@ -1,0 +1,38 @@
+# Asterix & Obelix: Slap Them All! (PPSA08576): cross the logos, the title screen and the menus into
+# the first forest level. Seconds are measured from the first pad poll. These are exactly the Cross
+# anchors recorded in issue #1601; no directional input is needed.
+#
+# Observed on a Linux hardware-Vulkan boot through tools/snapshot at PROSPER_RENDER_SCALE=4
+# (480x270), sampling once per second: black to 6s, publisher/engine logos 7-17s, black 18s, an
+# intro screen 20-23s, the title screen and menus 25-39s, a black load 40-44s, then the first forest
+# level from 45.1s, fading in over 45-48s (40,234 colours at 45.1s, then about 70,900) and settling
+# from 49.1s. Gameplay then holds unbroken to the end of the profiled 209s capture: all 161 samples
+# from 49.1s onward measure 74,569-75,235 distinct colours at 0.9975-0.9991 coverage, with no black
+# frame, no fade and no transition anywhere in that span.
+#
+# Asterix idles rather than walking under this route, so the level is rendered with both character
+# portraits, health and rage gauges, score and TOP score, the parallax forest and the blinking GO!
+# prompt. That is the milestone this route exists to protect ("title and first forest level"), and
+# consecutive samples still differ because of the idle animation, the wandering rabbit and the
+# blinking prompt: the 60-frame guard window measured 59 pixel changes -- the maximum possible -- in
+# both verify runs and in the checks that reported it.
+#
+# The snapshot guard asterix-gameplay samples 70-130s, well inside that span.
+3:cross
+8:cross
+13:cross
+18:cross
+23:cross
+28:cross
+33:cross
+38:cross
+44:cross
+50:cross
+56:cross
+62:cross
+70:cross
+80:cross
+90:cross
+100:cross
+110:cross
+120:cross
