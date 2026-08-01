@@ -606,9 +606,28 @@ zero tag as "not really bound", so the completion event was never delivered and 
 
 With both fixed, the title loads 100+ asset bundles including its title-screen textures, and renders
 the Bandai Namco and CRIWARE logos. It then goes black and stays black for the rest of the run
-(58 of 60 sampled frames are byte-identical): the opening movie cannot start, because
-`sceVideodec2QueryDecoderMemoryInfo` fails with `0x811d0200`, so `criMvPly_AllocateWorkBufferWithWork`
-never gets a decoder. The title screen is behind that movie and has not been reached.
+(58 of 60 sampled frames are byte-identical). The title screen is behind the opening movie and has
+not been reached.
+
+The movie was originally blocked at `sceVideodec2QueryDecoderMemoryInfo`, which failed with
+`0x811d0200` so `criMvPly_AllocateWorkBufferWithWork` never got a decoder. **That cause is fixed**
+(#1687): the sizing query no longer demands a compute-queue handle the guest cannot hold until after
+sizing, and the title now creates an AVC decoder and feeds it real access units.
+
+**The title does not advance visibly as a result, and the rung is unchanged at 1.** A 180 s A/B at
+native 1920×1080 through the `screenshot` frontend — both arms in one session, identical parameters,
+`#1687` against the exact base commit it forked from — settles it. Both arms render the Bandai Namco
+and CRIWARE logos, pass through the same phase structure at the same time, and then hold one
+unchanging frame for the remaining ~164 s of 30 samples. The **only** difference is the colour of
+that held frame: the base commit holds **black**, #1687 holds **white**. Neither is the movie and
+neither is the title screen. This is the expected outcome — decode produces no pictures (#1688) — and
+it is recorded because "the gate opened and nothing behind it moved" is the result, not a gap in it.
+
+One observation about the **base commit**, unrelated to this change and beyond what the logo
+description above implies: master transiently renders the game's own **"Checking add-on…" dialog** —
+real in-game UI in the title's art style, not a logo — at `t≈6 s`, before settling. Both arms sample
+at 6 s intervals so a short-lived phase is caught by luck; whether #1687 also passes through it was
+not established and would need a denser capture.
 
 ### Ruled out
 
@@ -622,6 +641,25 @@ never gets a decoder. The title screen is behind that movie and has not been rea
   `criMvPly` over `sceVideodec2`, which is a different subsystem (#1658).
 - **DLC / AppContent entitlement** — falsified. `AddContentsManager` is registration 29 and completes
   normally; it is not one of the three that faulted.
+- **The `sceVideodec2` block is a missing or unimplemented entry point** — falsified. Every entry
+  point `criMvPly` uses was implemented; the block was a single over-strict validation.
+  `sceVideodec2QueryDecoderMemoryInfo` is a *pure sizing query* — the guest asks how large a decoder
+  would be **before** building one — and prosper required a compute-queue handle the guest cannot
+  possess until after sizing. The guest draws the line in exactly the same place prosper now does: it
+  passes an identical codec config to both entry points, `compute_queue = 0` to the sizing query and
+  the real allocated handle to `CreateDecoder` (#1687). With the requirement split, the title creates
+  an AVC decoder and is fed real access units.
+- **Reaching `sceVideodec2Decode` will produce a movie** — false by construction, and stated here so
+  a black movie is not re-investigated as a defect. prosper's `Videodec2` decode is a deliberate
+  no-picture implementation and there is no H.264 decoder in the tree; #705's `VideoBackend` is
+  file/demux shaped and does not fit an access-unit interface. Scoped in #1688.
+- **The decoded-draw drop from 27-31 to a single-digit count marks the title leaving the logo phase
+  because of #1687** — falsified by the A/B that was run to check it. Both arms show the identical
+  phase structure `27 → 28 → 31 → single digit` at `t≈15-16 s`, holding flat for the remaining
+  ~164 s; the base commit drops to **7** and #1687 to **8**. The transition is normal behaviour of
+  this title, not an effect of the change, and a one-draw difference is all that separates them. The
+  hypothesis came from reading a `boot_trace` run against #1609's `screenshot`-frontend numbers —
+  two different apparatus — and did not survive running both arms through one.
 
 ## Requirements and scope
 

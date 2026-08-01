@@ -172,12 +172,21 @@ HLE(s_user_age)       { if (a1) *(int32_t*)PW(a1) = 18; return 0; }          // 
 // default user 1 as number 1, consistent with the rest of the UserService handlers above.
 HLE(s_user_number)    { if (a1) *(int32_t*)PW(a1) = 1; return 0; }
 // --- libSceVideodec2 ---------------------------------------------------------------------------
-// Sonic's CRI Mana movie backend uses the native VideoDec2 compute queue and decoder lifecycle.
 // These ABI layouts/NIDs are the PS5 3.20 interfaces.  Decoding is intentionally a no-picture
 // implementation for now: it consumes each access unit, reports a valid lifecycle, and lets the
 // movie reach EOF instead of faking video pixels.  Critically, every successful query/open writes
 // all output fields.  The former generic success stubs left a null compute queue and crashed libc
 // at +0xfe66 on its first queue use.
+//
+// WHO ACTUALLY EXERCISES THIS, as recorded rather than as assumed.  A header line here used to read
+// "Sonic's CRI Mana movie backend uses the native VideoDec2 compute queue and decoder lifecycle."
+// It came from #1368 (8b37be95) — the same commit that added the unexplained compute_queue check
+// below and an equally unsupported "Sonic Origins' CRI Mana backend passes it", which was already
+// withdrawn.  No Videodec2 evidence for Sonic exists anywhere in docs/ or COMPATIBILITY.md, so it is
+// withdrawn on the same basis rather than left to be inherited a third time.  What IS recorded:
+//   - QueryComputeMemoryInfo only — Dragon Quest VII Reimagined and the UE4 bring-up.
+//   - The full decoder lifecycle — Tales of Graces f Remastered (PPSA19991) via criMvPly, and only
+//     after #1687; before that no title in this repo's history had ever reached CreateDecoder.
 namespace {
 // The current no-picture backend has no hardware decoder workspace: it only needs a stable,
 // caller-owned address for the opaque compute-queue identity.  Keep one guest page so clients that
@@ -224,6 +233,59 @@ struct VdecOutput {
 static_assert(sizeof(VdecComputeMemory) == 24 && sizeof(VdecComputeConfig) == 16);
 static_assert(sizeof(VdecConfig) == 72 && sizeof(VdecMemory) == 72);
 static_assert(sizeof(VdecInput) == 48 && sizeof(VdecFrame) == 32 && sizeof(VdecOutput) == 56);
+// LIVE CONFIRMATION of the two structs above, from the first title to reach the decoder lifecycle
+// (Tales of Graces f Remastered PPSA19991, criMvPly, PROSPER_SVCLOG; see #1658). These were written
+// in #1368 without title evidence; a real guest now writes values that are meaningful at nearly
+// every offset, which is much stronger than a matching size:
+//
+// The two calls are labelled, because they are NOT the same dump: everything down to +0x28 appears
+// in both, while affinity/priority differ between them and are therefore CreateDecoder's values.
+//
+//   VdecConfig  +0x00 size=0x48  +0x08 resource=1     +0x0c codec=1 (AVC)          [both calls]
+//               +0x10 profile=100 (High)              +0x14 max_level=41 (4.1)     [both calls]
+//               +0x18 max_width=1920                  +0x1c max_height=1088        [both calls]
+//               +0x20 max_dpb=-1 (auto)               +0x24 input_depth=4          [both calls]
+//               +0x28 compute_queue = 0                                            [sizing query]
+//               +0x28 compute_queue = the allocated handle                         [CreateDecoder]
+//               +0x30 affinity=0x1fff                 +0x38 priority=700           [CreateDecoder]
+//               (the sizing query's affinity/priority are 0 / -1)
+//   VdecMemory  +0x00 size=0x48, then alternating size/pointer slots at +0x08..+0x38
+//
+// NOTE the observation boundary: svc_log clamps to 8 qwords, so despite both call sites asking for
+// 9, NOTHING at +0x40 was ever dumped — VdecConfig::extra and VdecMemory::frame_alignment/reserved
+// are unobserved, not confirmed. The table stops at +0x38 for that reason. (The clamp is silent and
+// is itself instrument-trap-13 shaped; filed rather than fixed here to keep this PR narrow.)
+//
+// Most of those pairings are FORCED, not merely consistent, which is what makes this evidence and
+// not a coincidence: swap profile/max_level and you get profile=41 (not a valid H.264 profile_idc)
+// with level=100 (not a valid level_idc); swap max_dpb/input_depth and input_depth is negative;
+// swapping width/height would make the movie portrait 1088x1920.
+//
+// One pair is NOT discriminated and is called out rather than glossed: `resource` and `codec` are
+// BOTH 1 in this title, so this evidence cannot tell their order apart. It rests on #1368 there, and
+// a title using a non-AVC codec or a different resource selector would settle it in one line of log.
+// So: CONFIDENCE: HIGH on VdecConfig's layout except the resource/codec pair, which stays MED.
+//
+// VdecMemory needs the SAME discipline applied to it, and it does not survive it as well. "The guest
+// echoed back the sizes we wrote" is near-tautological: this file wrote one identical constant into
+// cpu_size, gpu_size, shared_size AND max_frame_size, so the echo is byte-identical under any
+// permutation of those four, and the three pointer slots are three distinct guest addresses carrying
+// no role marker. What the echo genuinely proves is the SHAPE — size=0x48 at +0x00 and alternating
+// size/pointer slots thereafter — which is real and non-trivial. So: CONFIDENCE: HIGH on VdecMemory's
+// shape, MED on which of the four size roles and three pointer roles sits in which slot; those still
+// rest on #1368. (Now that the sizing query reports a max_frame_size distinct from the other three,
+// the next boot's Decode call discriminates that one field for free.)
+//
+// VdecInput's first five fields are confirmed (size=0x30, data, data_size) with the same caveat on
+// the last two: pts and dts are BOTH -1 here and are mutually undiscriminated. VdecFrame's first
+// three are confirmed (size=0x20, data, data_size). Only the SIZE of VdecOutput is confirmed (0x38)
+// — its interior is written by us, not the guest, and the AVC picture-info layout remains open
+// (#1658).
+//
+// One naming caveat, deliberately not "fixed": VdecInput's last field, named `attached` here,
+// carried a clean 0,1,2,...  sequence across consecutive access units rather than a flag or a
+// pointer. That is evidence it may be an access-unit index, not an attachment. Nothing depends on
+// the name today and no title evidence settles it, so it is recorded rather than renamed.
 
 std::mutex g_vdec_mx;
 std::unordered_map<uint64_t, uint32_t> g_vdec_codecs;
@@ -232,7 +294,8 @@ std::unordered_map<uint64_t, uint32_t> g_vdec_codecs;
 // bare SCE code — 0x811d0200 covers TWO different conditions here, so "err=0x811d0200" alone cannot tell
 // anyone which. Name the failing field and its observed value, unconditionally but rate-limited: this
 // fires at most a handful of times per boot and is the difference between a one-run diagnosis and a
-// guess. (Tales of Graces f / criMvPly stops exactly here; see #1658.)
+// guess. (Tales of Graces f / criMvPly stopped exactly here, on `compute_queue`, which is the
+// evidence the split below rests on; see #1658.)
 uint64_t vdec_reject(const char* field, uint64_t observed, uint64_t err) {
     // Rate-limit PER FIELD, not globally. One shared counter meant a caller looping on an early
     // condition could burn the whole budget and silence a later, different rejection — including the
@@ -248,7 +311,9 @@ uint64_t vdec_reject(const char* field, uint64_t observed, uint64_t err) {
             field, (unsigned long long)observed, (unsigned long long)err);
     return err;
 }
-uint64_t vdec_validate_config(const VdecConfig* c) {
+// `require_queue` splits the compute-queue requirement between the two callers of this validator.
+// See the long note at the check itself for why the two differ.
+uint64_t vdec_validate_config(const VdecConfig* c, bool require_queue) {
     if (!c) return VDEC_ERR_ARG;
     if (c->size != sizeof(*c)) return vdec_reject("size", c->size, VDEC_ERR_STRUCT);
     if (c->resource != 1) return vdec_reject("resource", c->resource, VDEC_ERR_RESOURCE);
@@ -262,24 +327,38 @@ uint64_t vdec_validate_config(const VdecConfig* c) {
         return vdec_reject("max_width/height",
                            ((uint64_t)(uint32_t)c->max_width << 32) | (uint32_t)c->max_height,
                            VDEC_ERR_DIMS);
-    // This is the condition most likely to reject a caller that queries memory sizes BEFORE it
-    // allocates a compute queue — the natural order for "how much do I need?".
+    // THE SPLIT (#1658). A compute queue is required to CREATE a decoder and is NOT required to ask
+    // how large one would be.
     //
-    // Retained, but the honest state of the evidence is: there is NONE either way. The check arrived
-    // in #1368 (8b37be95) with no comment, no rationale and no test — defensive, not derived. No title
-    // is recorded anywhere in this repo as reaching QueryDecoderMemoryInfo at all; the only live
-    // Videodec2 calls in docs/ are QueryComputeMemoryInfo. An earlier version of this comment claimed
-    // "Sonic Origins' CRI Mana backend passes it" — that was unsupported and is withdrawn.
+    // The check arrived in #1368 (8b37be95) with no comment, no rationale and no test — defensive,
+    // not derived — and applied to both callers. The predecessor comment here predicted exactly how
+    // that would fail ("most likely to reject a caller that queries memory sizes BEFORE it allocates
+    // a compute queue") and pre-registered this split as the evidenced move if a live log ever named
+    // the field. A Tales of Graces f (PPSA19991) boot then named it: 7 calls to
+    // sceVideodec2QueryDecoderMemoryInfo, all 7 rejected on `compute_queue = 0`, zero calls to
+    // sceVideodec2CreateDecoder — so the guest is sizing a decoder it has not built yet, which is
+    // precisely when it cannot hold a queue handle. Everything else in that config validates
+    // (size=0x48, resource=1, AVC High@4.1, 1920x1088, max_dpb=-1 auto, input_depth=4).
     //
-    // So this is retained on the weaker ground that removing an unexplained validation is also a
-    // guess, and a rejection is at least visible. Note it does NOT protect a size contract:
-    // s_videodec2_query_decoder_memory ignores compute_queue entirely and writes fixed VDEC_MIN_MEMORY
-    // constants, so rejecting only fails earlier than succeeding would.
+    // Rejecting the sizing query also protected no size contract: s_videodec2_query_decoder_memory
+    // ignores compute_queue entirely, so the rejection only failed EARLIER than succeeding would.
     //
-    // If a live log names this field, the evidenced narrow move is a SPLIT — keep the requirement on
-    // CreateDecoder, which genuinely needs a queue, and drop it from the pure sizing query — rather
-    // than a blanket relaxation. CONFIDENCE: LOW that requiring it here is right.
-    if (!c->compute_queue) return vdec_reject("compute_queue", c->compute_queue, VDEC_ERR_CONFIG);
+    // The requirement stays on CreateDecoder, which genuinely needs a queue to build a decoder on,
+    // and which is where a caller that truly has none must still fail visibly rather than receive an
+    // invented handle.
+    //
+    // CONFIDENCE: HIGH that the sizing query must not require it — live title evidence, and
+    // *prosper's* query cannot use the field. (That second clause argues from our own implementation,
+    // not from Sony's: a real library could legitimately consult a queue handle for queue-specific
+    // alignment. The HIGH rests on the live evidence alone.)
+    //
+    // CONFIDENCE: MED that CreateDecoder must require it. The same title now DOES reach CreateDecoder
+    // and supplies a real queue there — but that proves the guest HAS one, not that the library
+    // demands one, and those are different claims. So this half remains the #1368 default,
+    // deliberately kept fail-visible rather than relaxed on the strength of a caller being
+    // well-behaved.
+    if (require_queue && !c->compute_queue)
+        return vdec_reject("compute_queue", c->compute_queue, VDEC_ERR_CONFIG);
     return 0;
 }
 void vdec_no_picture(VdecFrame* frame, VdecOutput* out, uint32_t codec) {
@@ -328,10 +407,87 @@ HLE(s_videodec2_query_decoder_memory) {
     auto* config = (const VdecConfig*)PW(a0); auto* info = (VdecMemory*)PW(a1);
     if (!config || !info) return VDEC_ERR_ARG;
     if (info->size != sizeof(*info)) return VDEC_ERR_STRUCT;
-    uint64_t valid = vdec_validate_config(config); if (valid) return valid;
-    info->cpu_size = info->gpu_size = info->shared_size = info->max_frame_size = VDEC_MIN_MEMORY;
+    // Pure sizing query: no compute queue required (#1658).
+    uint64_t valid = vdec_validate_config(config, /*require_queue=*/false); if (valid) return valid;
+
+    // max_frame_size is the buffer the GUEST allocates and hands straight back as VdecFrame.data for
+    // every decoded picture. That coupling is observed, not assumed: this file reported
+    // VDEC_MIN_MEMORY (0x10000) and the title's next VdecFrame.data_size came back as exactly
+    // 0x10000.
+    //
+    // VDEC_MIN_MEMORY was derived as a compute-queue identity page (see its definition), never as a
+    // decoder frame estimate, and it does not vary with resolution — a 4K request got the same
+    // 64 KiB. That is safe ONLY while vdec_no_picture never writes into frame->data. The moment a
+    // real decoder lands (#1688), writing a 1920x1088 NV12 picture into a 64 KiB guest allocation is
+    // a ~3 MiB guest-heap overflow, and it would present as a decoder bug rather than as the sizing
+    // answer that caused it. Report a size the guest can actually decode into, now, while doing so
+    // costs nothing and cannot be mistaken for a decoder defect later.
+    //
+    // NV12 is the format PS5 video decode delivers (see video_backend.hpp): a full-resolution luma
+    // plane plus a half-resolution interleaved chroma plane, each chroma dimension rounded UP —
+    // `w*h + 2*ceil(w/2)*ceil(h/2)` — then rounded up to frame_alignment. The exact expression and
+    // why the `*3/2` shorthand is NOT used are below, at the computation. An unreasonable request
+    // yields an honestly unreasonable size that the guest's own allocator rejects visibly, which is
+    // the behaviour we want.
+    //
+    // Dimensions may legitimately be -1 ("auto"). prosper has no evidence for what a real library
+    // reports then, and a level-implied maximum would be invention, so that path keeps the
+    // documented floor unchanged and is called out rather than papered over.
+    //
+    // CONFIDENCE: MED on the NV12 derivation — the format is established and the guest's observed
+    // 1920x1088 (macroblock-rounded) request fits it exactly, but whether Sony's library adds
+    // per-plane padding or a decoder-private tail is unproven. LOW on the auto-dimension path.
+    // The cpu/gpu/shared workspace sizes stay at the floor: nothing here is evidence for those, and
+    // inflating them has broken a title before (see VDEC_MIN_MEMORY's own note on the 16 MiB
+    // placeholder exhausting a CRI pool).
+    // Compute the EXACT NV12 size — luma plus a half-resolution interleaved chroma plane, each
+    // chroma dimension rounded UP: `w*h + 2*ceil(w/2)*ceil(h/2)`.
+    //
+    // The obvious shorthand `w*h*3/2` is deliberately not used, and neither is `wh + (wh+1)/2`. Both
+    // are exact only when BOTH dimensions are even, and that rule is unusually easy to state wrongly:
+    // it was stated wrongly three times on this change, by an author under review, because every size
+    // anyone checked (1920x1088, 1920x1080, 640x480) happens to be both-even and so confirmed the
+    // true rule and the wrong one equally. "Even product" is not sufficient and is the seductive
+    // version — 1920x1081 has an even product and `wh + (wh+1)/2` is 960 bytes short there. The exact
+    // form removes the need to state the rule at all, which is worth more than the two divisions it
+    // costs on a path called 7-8 times per boot. (Instrument-trap 34.)
+    //
+    // WIDEN BEFORE ARITHMETIC — this is the trap in the "simpler" version. Written as
+    // `2*((config->max_width+1)/2)*...` the `+1` is evaluated in `int32_t`, so `max_width ==
+    // INT32_MAX` is signed overflow and undefined behaviour BEFORE any cast. Widening first makes
+    // every operation unsigned 64-bit; peak intermediate is then 37.5% of UINT64_MAX at INT32_MAX
+    // dimensions, so a future factor (a DPB count, a 10-bit bytes-per-sample term) still has room,
+    // though less than it looks — re-check the bound rather than assuming.
+    constexpr uint32_t VDEC_FRAME_ALIGN = 0x100;
+    uint64_t frame_bytes = 0;
+    if (config->max_width > 0 && config->max_height > 0) {
+        // Use the dimensions the guest ASKED FOR, which are macroblock-rounded (this title requests
+        // 1088 for a 1080-line movie). That is not a safety margin to be trimmed later: H.264 codes
+        // in 16x16 macroblocks, so a 1080-row picture is physically written as 1088 rows and cropped
+        // for display via the SPS frame_cropping fields. Sizing from 1080 would be short by 8 rows
+        // times the pitch — a real overflow, not conservatism.
+        const uint64_t w = (uint64_t)config->max_width;
+        const uint64_t h = (uint64_t)config->max_height;
+        frame_bytes = w * h + 2 * ((w + 1) / 2) * ((h + 1) / 2);
+    } else {
+        // Auto dimensions: the value below is a FLOOR, not a derivation, and the original
+        // resolution-independent hazard survives on this path. Nothing in the code distinguishes the
+        // two cases at the call site, so say it once rather than let the next reader — or the real
+        // decoder that #1688 adds — treat 64 KiB as a computed answer.
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            fprintf(stderr,
+                    "[vdec] QueryDecoderMemoryInfo: max_width/max_height are auto (%d x %d), so "
+                    "max_frame_size falls back to the 0x%llx FLOOR — this is not a derived size, and "
+                    "a real decoder must not write a picture into it unchecked (#1688)\n",
+                    config->max_width, config->max_height, (unsigned long long)VDEC_MIN_MEMORY);
+    }
+    frame_bytes = (frame_bytes + VDEC_FRAME_ALIGN - 1) & ~(uint64_t)(VDEC_FRAME_ALIGN - 1);
+
+    info->cpu_size = info->gpu_size = info->shared_size = VDEC_MIN_MEMORY;
+    info->max_frame_size = frame_bytes > VDEC_MIN_MEMORY ? frame_bytes : VDEC_MIN_MEMORY;
     info->cpu = info->gpu = info->shared = 0;
-    info->frame_alignment = 0x100; info->reserved = 0;
+    info->frame_alignment = VDEC_FRAME_ALIGN; info->reserved = 0;
     return 0;
 }
 HLE(s_videodec2_create_decoder) {
@@ -340,7 +496,9 @@ HLE(s_videodec2_create_decoder) {
     auto* out = (uint64_t*)PW(a2);
     if (!config || !memory || !out) return VDEC_ERR_ARG;
     if (memory->size != sizeof(*memory)) return VDEC_ERR_STRUCT;
-    uint64_t valid = vdec_validate_config(config); if (valid) return valid;
+    // Building a decoder DOES need a queue to build it on, and a caller that reaches here without one
+    // must fail visibly rather than be handed a decoder handle backed by no queue (#1658).
+    uint64_t valid = vdec_validate_config(config, /*require_queue=*/true); if (valid) return valid;
     if (memory->cpu_size < VDEC_MIN_MEMORY || memory->gpu_size < VDEC_MIN_MEMORY ||
         memory->shared_size < VDEC_MIN_MEMORY || memory->max_frame_size < VDEC_MIN_MEMORY)
         return VDEC_ERR_MEMORY_SIZE;
@@ -357,8 +515,20 @@ HLE(s_videodec2_delete_decoder) {
     return g_vdec_codecs.erase(a0) ? 0 : VDEC_ERR_DECODER;
 }
 HLE(s_videodec2_decode) {
-    if (svclog()) { static std::atomic<unsigned> n{0}; if (n.fetch_add(1) < 8)
-        svc_log("sceVideodec2Decode", a0, a1, a2, a3, a4, a5, 7); }
+    // This log is CAPPED at 8 access units, and it is the only Videodec2 entry point that caps.
+    // Say so in the log itself: once a title actually feeds this path, "8 decodes in the log" reads
+    // exactly like "the guest decoded 8 frames and stopped", which is a different and much more
+    // alarming finding than "the cap was reached". (Instrument-trap 13 in
+    // docs/GAME_COMPAT_ORCHESTRATION.md — a print cap misread as a frequency. Nearly banked as a
+    // result on the very first boot that reached here, #1658.)
+    if (svclog()) {
+        static std::atomic<unsigned> n{0};
+        unsigned seq = n.fetch_add(1);
+        if (seq < 8) svc_log("sceVideodec2Decode", a0, a1, a2, a3, a4, a5, 7);
+        else if (seq == 8)
+            fprintf(stderr, "[vdec] sceVideodec2Decode: log capped at 8 access units; further "
+                            "calls still execute but are NOT logged (this cap is not a count)\n");
+    }
     uint32_t codec;
     { std::lock_guard<std::mutex> lk(g_vdec_mx); auto it = g_vdec_codecs.find(a0);
       if (it == g_vdec_codecs.end()) return VDEC_ERR_DECODER; codec = it->second; }
