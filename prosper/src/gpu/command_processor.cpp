@@ -2310,8 +2310,12 @@ void GpuState::apply(const Pm4Command& c) {
                         draws.size(), rd(0xc8), c.index_count ? c.index_count : index_num, (int)state_dirty_,
                         rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f), rd(0x90), rd(0x91), rd(0x92), rd(0x93));
             }
-            // #305: bind-vs-draw sequence in stream order. Cached — this runs per draw, and a
-            // per-draw environ scan is measurable at this title's ~876k draws per route.
+            // #305: bind-vs-work sequence in stream order. Cached — this runs per draw/dispatch,
+            // and a per-item environ scan is measurable at this title's ~876k items per route.
+            // The three graphics arms emit "DRAW"; the two compute arms below emit "DISPATCH", so
+            // an analysis over these lines is never silently counting dispatches as draws (a
+            // compute item does not consume SPI_SHADER_PGM_LO_ES at all, so mixing them corrupts
+            // any bind/draw agreement statistic).
             static const bool bindtrace_draw = getenv("PROSPER_BINDTRACE") != nullptr;
             if (bindtrace_draw) {
                 auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
@@ -2357,8 +2361,12 @@ void GpuState::apply(const Pm4Command& c) {
             // write dirties it), so a future per-draw executor can render each draw under its own
             // shaders/mask/blend instead of the end-of-submit fold. Inert for the current renderer.
             // The snapshot also carries index_type — the index element size a DrawIndex needs (#64).
-            // #305: bind-vs-draw sequence in stream order. Cached — this runs per draw, and a
-            // per-draw environ scan is measurable at this title's ~876k draws per route.
+            // #305: bind-vs-work sequence in stream order. Cached — this runs per draw/dispatch,
+            // and a per-item environ scan is measurable at this title's ~876k items per route.
+            // The three graphics arms emit "DRAW"; the two compute arms below emit "DISPATCH", so
+            // an analysis over these lines is never silently counting dispatches as draws (a
+            // compute item does not consume SPI_SHADER_PGM_LO_ES at all, so mixing them corrupts
+            // any bind/draw agreement statistic).
             static const bool bindtrace_draw = getenv("PROSPER_BINDTRACE") != nullptr;
             if (bindtrace_draw) {
                 auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
@@ -2396,8 +2404,12 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         }
         case K::DrawIndexIndirect: {
-            // #305: bind-vs-draw sequence in stream order. Cached — this runs per draw, and a
-            // per-draw environ scan is measurable at this title's ~876k draws per route.
+            // #305: bind-vs-work sequence in stream order. Cached — this runs per draw/dispatch,
+            // and a per-item environ scan is measurable at this title's ~876k items per route.
+            // The three graphics arms emit "DRAW"; the two compute arms below emit "DISPATCH", so
+            // an analysis over these lines is never silently counting dispatches as draws (a
+            // compute item does not consume SPI_SHADER_PGM_LO_ES at all, so mixing them corrupts
+            // any bind/draw agreement statistic).
             static const bool bindtrace_draw = getenv("PROSPER_BINDTRACE") != nullptr;
             if (bindtrace_draw) {
                 auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
@@ -2575,15 +2587,19 @@ void GpuState::apply(const Pm4Command& c) {
             // Retain the dispatch and its exact register snapshot. The submit executor recompiles
             // supported compute programs and runs them in this vector's stream order before exposing
             // completion; unsupported programs remain visible in diagnostics (#576).
-            // #305: bind-vs-draw sequence in stream order. Cached — this runs per draw, and a
-            // per-draw environ scan is measurable at this title's ~876k draws per route.
+            // #305: bind-vs-work sequence in stream order. Cached — this runs per draw/dispatch,
+            // and a per-item environ scan is measurable at this title's ~876k items per route.
+            // The three graphics arms emit "DRAW"; the two compute arms below emit "DISPATCH", so
+            // an analysis over these lines is never silently counting dispatches as draws (a
+            // compute item does not consume SPI_SHADER_PGM_LO_ES at all, so mixing them corrupts
+            // any bind/draw agreement statistic).
             static const bool bindtrace_draw = getenv("PROSPER_BINDTRACE") != nullptr;
             if (bindtrace_draw) {
                 auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
                 static std::atomic<int> nd{0};
                 if (nd.fetch_add(1) < 2000000)
                     fprintf(stderr,
-                            "[bind] DRAW order=%llu q%u f%u j%u es_lo=0x%x rsrc2=0x%x "
+                            "[bind] DISPATCH order=%llu q%u f%u j%u es_lo=0x%x rsrc2=0x%x "
                             "ud0..3=%08x %08x %08x %08x\n",
                             (unsigned long long)command_order, (unsigned)c.queue_origin,
                             g_fold_seq.load(std::memory_order_relaxed), jump_depth,
@@ -2603,15 +2619,19 @@ void GpuState::apply(const Pm4Command& c) {
             dispatch_count++;
             break;
         case K::DispatchIndirect: {
-            // #305: bind-vs-draw sequence in stream order. Cached — this runs per draw, and a
-            // per-draw environ scan is measurable at this title's ~876k draws per route.
+            // #305: bind-vs-work sequence in stream order. Cached — this runs per draw/dispatch,
+            // and a per-item environ scan is measurable at this title's ~876k items per route.
+            // The three graphics arms emit "DRAW"; the two compute arms below emit "DISPATCH", so
+            // an analysis over these lines is never silently counting dispatches as draws (a
+            // compute item does not consume SPI_SHADER_PGM_LO_ES at all, so mixing them corrupts
+            // any bind/draw agreement statistic).
             static const bool bindtrace_draw = getenv("PROSPER_BINDTRACE") != nullptr;
             if (bindtrace_draw) {
                 auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
                 static std::atomic<int> nd{0};
                 if (nd.fetch_add(1) < 2000000)
                     fprintf(stderr,
-                            "[bind] DRAW order=%llu q%u f%u j%u es_lo=0x%x rsrc2=0x%x "
+                            "[bind] DISPATCH order=%llu q%u f%u j%u es_lo=0x%x rsrc2=0x%x "
                             "ud0..3=%08x %08x %08x %08x\n",
                             (unsigned long long)command_order, (unsigned)c.queue_origin,
                             g_fold_seq.load(std::memory_order_relaxed), jump_depth,
