@@ -1,8 +1,8 @@
 // #1612: every errno the guest observes must be a FreeBSD errno.
 //
-// The PS5 kernel is FreeBSD-derived. Linux and FreeBSD agree on 1..34 and diverge above it, so a
-// constant copied out of the host's <errno.h> looks right in review and reaches the guest meaning
-// something else. The pair that matters most is EAGAIN/EDEADLK, which the two systems *swap*:
+// The PS5 kernel is FreeBSD-derived. Linux and FreeBSD agree across most of 1..34 and diverge above
+// it, so a constant copied out of the host's <errno.h> looks right in review and reaches the guest
+// meaning something else. 11 is the exception inside the low range, and it is the headline case. The pair that matters most is EAGAIN/EDEADLK, which the two systems *swap*:
 // FreeBSD EAGAIN=35 / EDEADLK=11, Linux EAGAIN=11 / EDEADLK=35. Handing back the host number turns
 // "would block, retry" into "deadlock avoided" and vice versa — and a guest that retries on EAGAIN
 // can spin forever on a condition that will never change.
@@ -93,6 +93,29 @@ int main() {
         CHECK(all, "the shared table reproduces every value of the file layer's original ladder");
         CHECK(prosper::hle::freebsd_errno_from_host(0x7ffffffe, FreeBsdErrno::EIo) == FreeBsdErrno::EIo,
               "the file layer keeps its EIO fallback for an unmapped host failure");
+        // The original ladder had an explicit EWOULDBLOCK arm. On Linux/macOS it aliases EAGAIN, so
+        // a host-value comparison cannot tell whether the row survived the fold — but on MinGW/UCRT
+        // EWOULDBLOCK is 140, a distinct value that would silently take the fallback. Assert by
+        // NAME so the check is meaningful on the platform where it can actually regress.
+        CHECK(prosper::hle::freebsd_errno_from_host(EWOULDBLOCK) == FreeBsdErrno::EAgain,
+              "EWOULDBLOCK maps to FreeBSD EAGAIN even where it is not an alias of host EAGAIN");
+        CHECK(prosper::hle::freebsd_errno_from_host(EOPNOTSUPP) == FreeBsdErrno::EOpNotSupp &&
+              prosper::hle::freebsd_errno_from_host(ENOTSUP) == FreeBsdErrno::EOpNotSupp,
+              "both spellings of 'not supported' reach FreeBSD EOPNOTSUPP");
+        // Rows MinGW/UCRT does not define at all must still work where the host does define them,
+        // and must not have been dropped from the table to make Windows compile.
+#ifdef EDQUOT
+        CHECK(prosper::hle::freebsd_errno_from_host(EDQUOT) == FreeBsdErrno::EDQuot,
+              "EDQUOT survives the per-row #ifdef guarding");
+#endif
+#ifdef ESTALE
+        CHECK(prosper::hle::freebsd_errno_from_host(ESTALE) == FreeBsdErrno::EStale,
+              "ESTALE survives the per-row #ifdef guarding");
+#endif
+#ifdef EMULTIHOP
+        CHECK(prosper::hle::freebsd_errno_from_host(EMULTIHOP) == FreeBsdErrno::EMultiHop,
+              "EMULTIHOP survives the per-row #ifdef guarding");
+#endif
     }
 
     FreeBsdErrno decoded{};

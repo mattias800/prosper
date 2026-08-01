@@ -7,18 +7,19 @@
 //   ############################################################################################
 //
 // The PS5 kernel is FreeBSD-derived, so the guest interprets that byte with FreeBSD's numbering.
-// Linux and FreeBSD agree on 1..34 and diverge from 35 upward — which is exactly why a wrong
-// constant survives review. Every value a developer double-checks by reflex (EINVAL 22, ENOENT 2,
-// EFAULT 14, ENOMEM 12) is identical on both, so the mistake only bites on the values nobody
-// second-guesses:
+// Linux and FreeBSD agree across most of 1..34 and diverge from 35 upward — which is exactly why a
+// wrong constant survives review. Every value a developer double-checks by reflex (EINVAL 22,
+// ENOENT 2, EFAULT 14, ENOMEM 12) is identical on both, so the mistake only bites on the values
+// nobody second-guesses. Note 11 is INSIDE the "low" range and still differs — it is the headline
+// case here, so "anything under 35 is safe" is not a valid shortcut:
 //
 //      value  |  FreeBSD (what the guest reads)  |  Linux (where the wrong value came from)
 //      -------+----------------------------------+------------------------------------------
 //         11  |  EDEADLK                         |  EAGAIN
 //         35  |  EAGAIN / EWOULDBLOCK            |  EDEADLK
 //         38  |  ENOTSOCK                        |  ENOSYS
-//         60  |  ETIMEDOUT                       |  ENOTCONN
-//         78  |  ENOSYS                          |  EBADFD
+//         60  |  ETIMEDOUT                       |  ENOSTR
+//         78  |  ENOSYS                          |  EREMCHG
 //        110  |  (unallocated)                   |  ETIMEDOUT
 //
 // The failure is silent and easy to misdiagnose: a guest that branches on the errno sees a
@@ -144,7 +145,13 @@ inline constexpr uint64_t kSceKernelErrorENOSYS    = sce_kernel_error(FreeBsdErr
 //
 // The table is keyed on the host's own macro NAMES, never on numbers, so it is correct wherever it
 // is compiled: on a BSD-numbered host (macOS) most entries are identities, on Linux the divergent
-// ones are remapped, and a host that lacks a macro entirely just drops that row. An unrecognized
+// ones are remapped, and a host that lacks a macro entirely drops that row — every row carries its
+// own #ifdef, because MinGW/UCRT genuinely lacks EDQUOT, ESTALE and EMULTIHOP.
+//
+// EWOULDBLOCK and ENOTSUP need an inequality guard as well as an #ifdef: they alias EAGAIN and
+// EOPNOTSUPP on Linux/macOS (where an unguarded row is a duplicate case label and will not compile)
+// but are DISTINCT values on MinGW/UCRT, where omitting the row silently drops them to the
+// caller's fallback. An unrecognized
 // errno falls back to EInval rather than being passed through raw, because passing it through is
 // precisely the defect this function exists to prevent — a raw Linux 38 would reach the guest as
 // ENOTSOCK.
@@ -157,84 +164,219 @@ inline constexpr uint64_t kSceKernelErrorENOSYS    = sce_kernel_error(FreeBsdErr
 inline FreeBsdErrno freebsd_errno_from_host(int host_errno,
                                             FreeBsdErrno fallback = FreeBsdErrno::EInval) {
     switch (host_errno) {
-#define PROSPER_ERRNO_ROW(host_macro, freebsd_name) \
-    case host_macro: return FreeBsdErrno::freebsd_name;
-        PROSPER_ERRNO_ROW(EPERM,        EPerm)
-        PROSPER_ERRNO_ROW(ENOENT,       ENoEnt)
-        PROSPER_ERRNO_ROW(ESRCH,        ESrch)
-        PROSPER_ERRNO_ROW(EINTR,        EIntr)
-        PROSPER_ERRNO_ROW(EIO,          EIo)
-        PROSPER_ERRNO_ROW(ENXIO,        ENxIo)
-        PROSPER_ERRNO_ROW(E2BIG,        E2Big)
-        PROSPER_ERRNO_ROW(ENOEXEC,      ENoExec)
-        PROSPER_ERRNO_ROW(EBADF,        EBadF)
-        PROSPER_ERRNO_ROW(ECHILD,       EChild)
-        PROSPER_ERRNO_ROW(EDEADLK,      EDeadlk)      // Linux 35 -> FreeBSD 11
-        PROSPER_ERRNO_ROW(ENOMEM,       ENoMem)
-        PROSPER_ERRNO_ROW(EACCES,       EAcces)
-        PROSPER_ERRNO_ROW(EFAULT,       EFault)
-        PROSPER_ERRNO_ROW(EBUSY,        EBusy)
-        PROSPER_ERRNO_ROW(EEXIST,       EExist)
-        PROSPER_ERRNO_ROW(EXDEV,        EXDev)
-        PROSPER_ERRNO_ROW(ENODEV,       ENoDev)
-        PROSPER_ERRNO_ROW(ENOTDIR,      ENotDir)
-        PROSPER_ERRNO_ROW(EISDIR,       EIsDir)
-        PROSPER_ERRNO_ROW(EINVAL,       EInval)
-        PROSPER_ERRNO_ROW(ENFILE,       ENFile)
-        PROSPER_ERRNO_ROW(EMFILE,       EMFile)
-        PROSPER_ERRNO_ROW(ENOTTY,       ENotTty)
-#ifdef ETXTBSY
-        PROSPER_ERRNO_ROW(ETXTBSY,      ETxtBsy)
+#ifdef EPERM
+    case EPERM: return FreeBsdErrno::EPerm;
 #endif
-        PROSPER_ERRNO_ROW(EFBIG,        EFBig)
-        PROSPER_ERRNO_ROW(ENOSPC,       ENoSpc)
-        PROSPER_ERRNO_ROW(ESPIPE,       ESPipe)
-        PROSPER_ERRNO_ROW(EROFS,        ERoFs)
-        PROSPER_ERRNO_ROW(EMLINK,       EMLink)
-        PROSPER_ERRNO_ROW(EPIPE,        EPipe)
-        PROSPER_ERRNO_ROW(EDOM,         EDom)
-        PROSPER_ERRNO_ROW(ERANGE,       ERange)
-        PROSPER_ERRNO_ROW(EAGAIN,       EAgain)       // Linux 11 -> FreeBSD 35
-        PROSPER_ERRNO_ROW(EINPROGRESS,  EInProgress)
-        PROSPER_ERRNO_ROW(EALREADY,     EAlready)
-        PROSPER_ERRNO_ROW(ENOTSOCK,     ENotSock)
-        PROSPER_ERRNO_ROW(EDESTADDRREQ, EDestAddrReq)
-        PROSPER_ERRNO_ROW(EMSGSIZE,     EMsgSize)
-        PROSPER_ERRNO_ROW(EOPNOTSUPP,   EOpNotSupp)
-        PROSPER_ERRNO_ROW(EADDRINUSE,   EAddrInUse)
-        PROSPER_ERRNO_ROW(ENETDOWN,     ENetDown)
-        PROSPER_ERRNO_ROW(ENETUNREACH,  ENetUnreach)
-        PROSPER_ERRNO_ROW(ECONNABORTED, EConnAborted)
-        PROSPER_ERRNO_ROW(ECONNRESET,   EConnReset)
-        PROSPER_ERRNO_ROW(ENOBUFS,      ENoBufs)
-        PROSPER_ERRNO_ROW(EISCONN,      EIsConn)
-        PROSPER_ERRNO_ROW(ENOTCONN,     ENotConn)
-        PROSPER_ERRNO_ROW(ETIMEDOUT,    ETimedOut)    // Linux 110 -> FreeBSD 60
-        PROSPER_ERRNO_ROW(ECONNREFUSED, EConnRefused)
-        PROSPER_ERRNO_ROW(ELOOP,        ELoop)        // Linux 40 -> FreeBSD 62
-        PROSPER_ERRNO_ROW(ENAMETOOLONG, ENameTooLong) // Linux 36 -> FreeBSD 63
-        PROSPER_ERRNO_ROW(EHOSTUNREACH, EHostUnreach)
-        PROSPER_ERRNO_ROW(ENOTEMPTY,    ENotEmpty)    // Linux 39 -> FreeBSD 66
-        PROSPER_ERRNO_ROW(EDQUOT,       EDQuot)
-        PROSPER_ERRNO_ROW(ESTALE,       EStale)
-        PROSPER_ERRNO_ROW(ENOLCK,       ENoLck)       // Linux 37 -> FreeBSD 77
-        PROSPER_ERRNO_ROW(ENOSYS,       ENoSys)       // Linux 38 -> FreeBSD 78
-        PROSPER_ERRNO_ROW(EIDRM,        EIdRm)
-        PROSPER_ERRNO_ROW(ENOMSG,       ENoMsg)
-        PROSPER_ERRNO_ROW(EOVERFLOW,    EOverflow)
-        PROSPER_ERRNO_ROW(ECANCELED,    ECanceled)
-        PROSPER_ERRNO_ROW(EILSEQ,       EIlSeq)
-        PROSPER_ERRNO_ROW(EBADMSG,      EBadMsg)
-        PROSPER_ERRNO_ROW(EPROTO,       EProto)
-        PROSPER_ERRNO_ROW(EMULTIHOP,    EMultiHop)
-        PROSPER_ERRNO_ROW(ENOLINK,      ENoLink)
+#ifdef ENOENT
+    case ENOENT: return FreeBsdErrno::ENoEnt;
+#endif
+#ifdef ESRCH
+    case ESRCH: return FreeBsdErrno::ESrch;
+#endif
+#ifdef EINTR
+    case EINTR: return FreeBsdErrno::EIntr;
+#endif
+#ifdef EIO
+    case EIO: return FreeBsdErrno::EIo;
+#endif
+#ifdef ENXIO
+    case ENXIO: return FreeBsdErrno::ENxIo;
+#endif
+#ifdef E2BIG
+    case E2BIG: return FreeBsdErrno::E2Big;
+#endif
+#ifdef ENOEXEC
+    case ENOEXEC: return FreeBsdErrno::ENoExec;
+#endif
+#ifdef EBADF
+    case EBADF: return FreeBsdErrno::EBadF;
+#endif
+#ifdef ECHILD
+    case ECHILD: return FreeBsdErrno::EChild;
+#endif
+#ifdef EDEADLK
+    case EDEADLK: return FreeBsdErrno::EDeadlk;
+#endif
+#ifdef ENOMEM
+    case ENOMEM: return FreeBsdErrno::ENoMem;
+#endif
+#ifdef EACCES
+    case EACCES: return FreeBsdErrno::EAcces;
+#endif
+#ifdef EFAULT
+    case EFAULT: return FreeBsdErrno::EFault;
+#endif
+#ifdef EBUSY
+    case EBUSY: return FreeBsdErrno::EBusy;
+#endif
+#ifdef EEXIST
+    case EEXIST: return FreeBsdErrno::EExist;
+#endif
+#ifdef EXDEV
+    case EXDEV: return FreeBsdErrno::EXDev;
+#endif
+#ifdef ENODEV
+    case ENODEV: return FreeBsdErrno::ENoDev;
+#endif
+#ifdef ENOTDIR
+    case ENOTDIR: return FreeBsdErrno::ENotDir;
+#endif
+#ifdef EISDIR
+    case EISDIR: return FreeBsdErrno::EIsDir;
+#endif
+#ifdef EINVAL
+    case EINVAL: return FreeBsdErrno::EInval;
+#endif
+#ifdef ENFILE
+    case ENFILE: return FreeBsdErrno::ENFile;
+#endif
+#ifdef EMFILE
+    case EMFILE: return FreeBsdErrno::EMFile;
+#endif
+#ifdef ENOTTY
+    case ENOTTY: return FreeBsdErrno::ENotTty;
+#endif
+#ifdef ETXTBSY
+    case ETXTBSY: return FreeBsdErrno::ETxtBsy;
+#endif
+#ifdef EFBIG
+    case EFBIG: return FreeBsdErrno::EFBig;
+#endif
+#ifdef ENOSPC
+    case ENOSPC: return FreeBsdErrno::ENoSpc;
+#endif
+#ifdef ESPIPE
+    case ESPIPE: return FreeBsdErrno::ESPipe;
+#endif
+#ifdef EROFS
+    case EROFS: return FreeBsdErrno::ERoFs;
+#endif
+#ifdef EMLINK
+    case EMLINK: return FreeBsdErrno::EMLink;
+#endif
+#ifdef EPIPE
+    case EPIPE: return FreeBsdErrno::EPipe;
+#endif
+#ifdef EDOM
+    case EDOM: return FreeBsdErrno::EDom;
+#endif
+#ifdef ERANGE
+    case ERANGE: return FreeBsdErrno::ERange;
+#endif
+#ifdef EAGAIN
+    case EAGAIN: return FreeBsdErrno::EAgain;
+#endif
+#ifdef EINPROGRESS
+    case EINPROGRESS: return FreeBsdErrno::EInProgress;
+#endif
+#ifdef EALREADY
+    case EALREADY: return FreeBsdErrno::EAlready;
+#endif
+#ifdef ENOTSOCK
+    case ENOTSOCK: return FreeBsdErrno::ENotSock;
+#endif
+#ifdef EDESTADDRREQ
+    case EDESTADDRREQ: return FreeBsdErrno::EDestAddrReq;
+#endif
+#ifdef EMSGSIZE
+    case EMSGSIZE: return FreeBsdErrno::EMsgSize;
+#endif
+#ifdef EOPNOTSUPP
+    case EOPNOTSUPP: return FreeBsdErrno::EOpNotSupp;
+#endif
+#ifdef EADDRINUSE
+    case EADDRINUSE: return FreeBsdErrno::EAddrInUse;
+#endif
+#ifdef ENETDOWN
+    case ENETDOWN: return FreeBsdErrno::ENetDown;
+#endif
+#ifdef ENETUNREACH
+    case ENETUNREACH: return FreeBsdErrno::ENetUnreach;
+#endif
+#ifdef ECONNABORTED
+    case ECONNABORTED: return FreeBsdErrno::EConnAborted;
+#endif
+#ifdef ECONNRESET
+    case ECONNRESET: return FreeBsdErrno::EConnReset;
+#endif
+#ifdef ENOBUFS
+    case ENOBUFS: return FreeBsdErrno::ENoBufs;
+#endif
+#ifdef EISCONN
+    case EISCONN: return FreeBsdErrno::EIsConn;
+#endif
+#ifdef ENOTCONN
+    case ENOTCONN: return FreeBsdErrno::ENotConn;
+#endif
+#ifdef ETIMEDOUT
+    case ETIMEDOUT: return FreeBsdErrno::ETimedOut;
+#endif
+#ifdef ECONNREFUSED
+    case ECONNREFUSED: return FreeBsdErrno::EConnRefused;
+#endif
+#ifdef ELOOP
+    case ELOOP: return FreeBsdErrno::ELoop;
+#endif
+#ifdef ENAMETOOLONG
+    case ENAMETOOLONG: return FreeBsdErrno::ENameTooLong;
+#endif
+#ifdef EHOSTUNREACH
+    case EHOSTUNREACH: return FreeBsdErrno::EHostUnreach;
+#endif
+#ifdef ENOTEMPTY
+    case ENOTEMPTY: return FreeBsdErrno::ENotEmpty;
+#endif
+#ifdef EDQUOT
+    case EDQUOT: return FreeBsdErrno::EDQuot;
+#endif
+#ifdef ESTALE
+    case ESTALE: return FreeBsdErrno::EStale;
+#endif
+#ifdef ENOLCK
+    case ENOLCK: return FreeBsdErrno::ENoLck;
+#endif
+#ifdef ENOSYS
+    case ENOSYS: return FreeBsdErrno::ENoSys;
+#endif
+#ifdef EIDRM
+    case EIDRM: return FreeBsdErrno::EIdRm;
+#endif
+#ifdef ENOMSG
+    case ENOMSG: return FreeBsdErrno::ENoMsg;
+#endif
+#ifdef EOVERFLOW
+    case EOVERFLOW: return FreeBsdErrno::EOverflow;
+#endif
+#ifdef ECANCELED
+    case ECANCELED: return FreeBsdErrno::ECanceled;
+#endif
+#ifdef EILSEQ
+    case EILSEQ: return FreeBsdErrno::EIlSeq;
+#endif
+#ifdef EBADMSG
+    case EBADMSG: return FreeBsdErrno::EBadMsg;
+#endif
+#ifdef EPROTO
+    case EPROTO: return FreeBsdErrno::EProto;
+#endif
+#ifdef EMULTIHOP
+    case EMULTIHOP: return FreeBsdErrno::EMultiHop;
+#endif
+#ifdef ENOLINK
+    case ENOLINK: return FreeBsdErrno::ENoLink;
+#endif
 #ifdef ENOTRECOVERABLE
-        PROSPER_ERRNO_ROW(ENOTRECOVERABLE, ENotRecoverable)
+    case ENOTRECOVERABLE: return FreeBsdErrno::ENotRecoverable;
 #endif
 #ifdef EOWNERDEAD
-        PROSPER_ERRNO_ROW(EOWNERDEAD,   EOwnerDead)
+    case EOWNERDEAD: return FreeBsdErrno::EOwnerDead;
 #endif
-#undef PROSPER_ERRNO_ROW
+#if defined(EWOULDBLOCK) && defined(EAGAIN) && EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK: return FreeBsdErrno::EAgain;
+#endif
+#if defined(ENOTSUP) && defined(EOPNOTSUPP) && ENOTSUP != EOPNOTSUPP
+    case ENOTSUP: return FreeBsdErrno::EOpNotSupp;
+#endif
     default: return fallback;
     }
 }
@@ -244,84 +386,213 @@ inline FreeBsdErrno freebsd_errno_from_host(int host_errno,
 // re-introduce the bug in the opposite direction.
 inline int host_errno_from_freebsd(FreeBsdErrno e) {
     switch (e) {
-#define PROSPER_ERRNO_ROW(host_macro, freebsd_name) \
-    case FreeBsdErrno::freebsd_name: return host_macro;
-        PROSPER_ERRNO_ROW(EPERM,        EPerm)
-        PROSPER_ERRNO_ROW(ENOENT,       ENoEnt)
-        PROSPER_ERRNO_ROW(ESRCH,        ESrch)
-        PROSPER_ERRNO_ROW(EINTR,        EIntr)
-        PROSPER_ERRNO_ROW(EIO,          EIo)
-        PROSPER_ERRNO_ROW(ENXIO,        ENxIo)
-        PROSPER_ERRNO_ROW(E2BIG,        E2Big)
-        PROSPER_ERRNO_ROW(ENOEXEC,      ENoExec)
-        PROSPER_ERRNO_ROW(EBADF,        EBadF)
-        PROSPER_ERRNO_ROW(ECHILD,       EChild)
-        PROSPER_ERRNO_ROW(EDEADLK,      EDeadlk)
-        PROSPER_ERRNO_ROW(ENOMEM,       ENoMem)
-        PROSPER_ERRNO_ROW(EACCES,       EAcces)
-        PROSPER_ERRNO_ROW(EFAULT,       EFault)
-        PROSPER_ERRNO_ROW(EBUSY,        EBusy)
-        PROSPER_ERRNO_ROW(EEXIST,       EExist)
-        PROSPER_ERRNO_ROW(EXDEV,        EXDev)
-        PROSPER_ERRNO_ROW(ENODEV,       ENoDev)
-        PROSPER_ERRNO_ROW(ENOTDIR,      ENotDir)
-        PROSPER_ERRNO_ROW(EISDIR,       EIsDir)
-        PROSPER_ERRNO_ROW(EINVAL,       EInval)
-        PROSPER_ERRNO_ROW(ENFILE,       ENFile)
-        PROSPER_ERRNO_ROW(EMFILE,       EMFile)
-        PROSPER_ERRNO_ROW(ENOTTY,       ENotTty)
-#ifdef ETXTBSY
-        PROSPER_ERRNO_ROW(ETXTBSY,      ETxtBsy)
+#ifdef EPERM
+    case FreeBsdErrno::EPerm: return EPERM;
 #endif
-        PROSPER_ERRNO_ROW(EFBIG,        EFBig)
-        PROSPER_ERRNO_ROW(ENOSPC,       ENoSpc)
-        PROSPER_ERRNO_ROW(ESPIPE,       ESPipe)
-        PROSPER_ERRNO_ROW(EROFS,        ERoFs)
-        PROSPER_ERRNO_ROW(EMLINK,       EMLink)
-        PROSPER_ERRNO_ROW(EPIPE,        EPipe)
-        PROSPER_ERRNO_ROW(EDOM,         EDom)
-        PROSPER_ERRNO_ROW(ERANGE,       ERange)
-        PROSPER_ERRNO_ROW(EAGAIN,       EAgain)
-        PROSPER_ERRNO_ROW(EINPROGRESS,  EInProgress)
-        PROSPER_ERRNO_ROW(EALREADY,     EAlready)
-        PROSPER_ERRNO_ROW(ENOTSOCK,     ENotSock)
-        PROSPER_ERRNO_ROW(EDESTADDRREQ, EDestAddrReq)
-        PROSPER_ERRNO_ROW(EMSGSIZE,     EMsgSize)
-        PROSPER_ERRNO_ROW(EOPNOTSUPP,   EOpNotSupp)
-        PROSPER_ERRNO_ROW(EADDRINUSE,   EAddrInUse)
-        PROSPER_ERRNO_ROW(ENETDOWN,     ENetDown)
-        PROSPER_ERRNO_ROW(ENETUNREACH,  ENetUnreach)
-        PROSPER_ERRNO_ROW(ECONNABORTED, EConnAborted)
-        PROSPER_ERRNO_ROW(ECONNRESET,   EConnReset)
-        PROSPER_ERRNO_ROW(ENOBUFS,      ENoBufs)
-        PROSPER_ERRNO_ROW(EISCONN,      EIsConn)
-        PROSPER_ERRNO_ROW(ENOTCONN,     ENotConn)
-        PROSPER_ERRNO_ROW(ETIMEDOUT,    ETimedOut)
-        PROSPER_ERRNO_ROW(ECONNREFUSED, EConnRefused)
-        PROSPER_ERRNO_ROW(ELOOP,        ELoop)
-        PROSPER_ERRNO_ROW(ENAMETOOLONG, ENameTooLong)
-        PROSPER_ERRNO_ROW(EHOSTUNREACH, EHostUnreach)
-        PROSPER_ERRNO_ROW(ENOTEMPTY,    ENotEmpty)
-        PROSPER_ERRNO_ROW(EDQUOT,       EDQuot)
-        PROSPER_ERRNO_ROW(ESTALE,       EStale)
-        PROSPER_ERRNO_ROW(ENOLCK,       ENoLck)
-        PROSPER_ERRNO_ROW(ENOSYS,       ENoSys)
-        PROSPER_ERRNO_ROW(EIDRM,        EIdRm)
-        PROSPER_ERRNO_ROW(ENOMSG,       ENoMsg)
-        PROSPER_ERRNO_ROW(EOVERFLOW,    EOverflow)
-        PROSPER_ERRNO_ROW(ECANCELED,    ECanceled)
-        PROSPER_ERRNO_ROW(EILSEQ,       EIlSeq)
-        PROSPER_ERRNO_ROW(EBADMSG,      EBadMsg)
-        PROSPER_ERRNO_ROW(EPROTO,       EProto)
-        PROSPER_ERRNO_ROW(EMULTIHOP,    EMultiHop)
-        PROSPER_ERRNO_ROW(ENOLINK,      ENoLink)
+#ifdef ENOENT
+    case FreeBsdErrno::ENoEnt: return ENOENT;
+#endif
+#ifdef ESRCH
+    case FreeBsdErrno::ESrch: return ESRCH;
+#endif
+#ifdef EINTR
+    case FreeBsdErrno::EIntr: return EINTR;
+#endif
+#ifdef EIO
+    case FreeBsdErrno::EIo: return EIO;
+#endif
+#ifdef ENXIO
+    case FreeBsdErrno::ENxIo: return ENXIO;
+#endif
+#ifdef E2BIG
+    case FreeBsdErrno::E2Big: return E2BIG;
+#endif
+#ifdef ENOEXEC
+    case FreeBsdErrno::ENoExec: return ENOEXEC;
+#endif
+#ifdef EBADF
+    case FreeBsdErrno::EBadF: return EBADF;
+#endif
+#ifdef ECHILD
+    case FreeBsdErrno::EChild: return ECHILD;
+#endif
+#ifdef EDEADLK
+    case FreeBsdErrno::EDeadlk: return EDEADLK;
+#endif
+#ifdef ENOMEM
+    case FreeBsdErrno::ENoMem: return ENOMEM;
+#endif
+#ifdef EACCES
+    case FreeBsdErrno::EAcces: return EACCES;
+#endif
+#ifdef EFAULT
+    case FreeBsdErrno::EFault: return EFAULT;
+#endif
+#ifdef EBUSY
+    case FreeBsdErrno::EBusy: return EBUSY;
+#endif
+#ifdef EEXIST
+    case FreeBsdErrno::EExist: return EEXIST;
+#endif
+#ifdef EXDEV
+    case FreeBsdErrno::EXDev: return EXDEV;
+#endif
+#ifdef ENODEV
+    case FreeBsdErrno::ENoDev: return ENODEV;
+#endif
+#ifdef ENOTDIR
+    case FreeBsdErrno::ENotDir: return ENOTDIR;
+#endif
+#ifdef EISDIR
+    case FreeBsdErrno::EIsDir: return EISDIR;
+#endif
+#ifdef EINVAL
+    case FreeBsdErrno::EInval: return EINVAL;
+#endif
+#ifdef ENFILE
+    case FreeBsdErrno::ENFile: return ENFILE;
+#endif
+#ifdef EMFILE
+    case FreeBsdErrno::EMFile: return EMFILE;
+#endif
+#ifdef ENOTTY
+    case FreeBsdErrno::ENotTty: return ENOTTY;
+#endif
+#ifdef ETXTBSY
+    case FreeBsdErrno::ETxtBsy: return ETXTBSY;
+#endif
+#ifdef EFBIG
+    case FreeBsdErrno::EFBig: return EFBIG;
+#endif
+#ifdef ENOSPC
+    case FreeBsdErrno::ENoSpc: return ENOSPC;
+#endif
+#ifdef ESPIPE
+    case FreeBsdErrno::ESPipe: return ESPIPE;
+#endif
+#ifdef EROFS
+    case FreeBsdErrno::ERoFs: return EROFS;
+#endif
+#ifdef EMLINK
+    case FreeBsdErrno::EMLink: return EMLINK;
+#endif
+#ifdef EPIPE
+    case FreeBsdErrno::EPipe: return EPIPE;
+#endif
+#ifdef EDOM
+    case FreeBsdErrno::EDom: return EDOM;
+#endif
+#ifdef ERANGE
+    case FreeBsdErrno::ERange: return ERANGE;
+#endif
+#ifdef EAGAIN
+    case FreeBsdErrno::EAgain: return EAGAIN;
+#endif
+#ifdef EINPROGRESS
+    case FreeBsdErrno::EInProgress: return EINPROGRESS;
+#endif
+#ifdef EALREADY
+    case FreeBsdErrno::EAlready: return EALREADY;
+#endif
+#ifdef ENOTSOCK
+    case FreeBsdErrno::ENotSock: return ENOTSOCK;
+#endif
+#ifdef EDESTADDRREQ
+    case FreeBsdErrno::EDestAddrReq: return EDESTADDRREQ;
+#endif
+#ifdef EMSGSIZE
+    case FreeBsdErrno::EMsgSize: return EMSGSIZE;
+#endif
+#ifdef EOPNOTSUPP
+    case FreeBsdErrno::EOpNotSupp: return EOPNOTSUPP;
+#endif
+#ifdef EADDRINUSE
+    case FreeBsdErrno::EAddrInUse: return EADDRINUSE;
+#endif
+#ifdef ENETDOWN
+    case FreeBsdErrno::ENetDown: return ENETDOWN;
+#endif
+#ifdef ENETUNREACH
+    case FreeBsdErrno::ENetUnreach: return ENETUNREACH;
+#endif
+#ifdef ECONNABORTED
+    case FreeBsdErrno::EConnAborted: return ECONNABORTED;
+#endif
+#ifdef ECONNRESET
+    case FreeBsdErrno::EConnReset: return ECONNRESET;
+#endif
+#ifdef ENOBUFS
+    case FreeBsdErrno::ENoBufs: return ENOBUFS;
+#endif
+#ifdef EISCONN
+    case FreeBsdErrno::EIsConn: return EISCONN;
+#endif
+#ifdef ENOTCONN
+    case FreeBsdErrno::ENotConn: return ENOTCONN;
+#endif
+#ifdef ETIMEDOUT
+    case FreeBsdErrno::ETimedOut: return ETIMEDOUT;
+#endif
+#ifdef ECONNREFUSED
+    case FreeBsdErrno::EConnRefused: return ECONNREFUSED;
+#endif
+#ifdef ELOOP
+    case FreeBsdErrno::ELoop: return ELOOP;
+#endif
+#ifdef ENAMETOOLONG
+    case FreeBsdErrno::ENameTooLong: return ENAMETOOLONG;
+#endif
+#ifdef EHOSTUNREACH
+    case FreeBsdErrno::EHostUnreach: return EHOSTUNREACH;
+#endif
+#ifdef ENOTEMPTY
+    case FreeBsdErrno::ENotEmpty: return ENOTEMPTY;
+#endif
+#ifdef EDQUOT
+    case FreeBsdErrno::EDQuot: return EDQUOT;
+#endif
+#ifdef ESTALE
+    case FreeBsdErrno::EStale: return ESTALE;
+#endif
+#ifdef ENOLCK
+    case FreeBsdErrno::ENoLck: return ENOLCK;
+#endif
+#ifdef ENOSYS
+    case FreeBsdErrno::ENoSys: return ENOSYS;
+#endif
+#ifdef EIDRM
+    case FreeBsdErrno::EIdRm: return EIDRM;
+#endif
+#ifdef ENOMSG
+    case FreeBsdErrno::ENoMsg: return ENOMSG;
+#endif
+#ifdef EOVERFLOW
+    case FreeBsdErrno::EOverflow: return EOVERFLOW;
+#endif
+#ifdef ECANCELED
+    case FreeBsdErrno::ECanceled: return ECANCELED;
+#endif
+#ifdef EILSEQ
+    case FreeBsdErrno::EIlSeq: return EILSEQ;
+#endif
+#ifdef EBADMSG
+    case FreeBsdErrno::EBadMsg: return EBADMSG;
+#endif
+#ifdef EPROTO
+    case FreeBsdErrno::EProto: return EPROTO;
+#endif
+#ifdef EMULTIHOP
+    case FreeBsdErrno::EMultiHop: return EMULTIHOP;
+#endif
+#ifdef ENOLINK
+    case FreeBsdErrno::ENoLink: return ENOLINK;
+#endif
 #ifdef ENOTRECOVERABLE
-        PROSPER_ERRNO_ROW(ENOTRECOVERABLE, ENotRecoverable)
+    case FreeBsdErrno::ENotRecoverable: return ENOTRECOVERABLE;
 #endif
 #ifdef EOWNERDEAD
-        PROSPER_ERRNO_ROW(EOWNERDEAD,   EOwnerDead)
+    case FreeBsdErrno::EOwnerDead: return EOWNERDEAD;
 #endif
-#undef PROSPER_ERRNO_ROW
     default: return EINVAL;
     }
 }
@@ -346,8 +617,8 @@ inline bool sce_kernel_error_errno(uint64_t value, FreeBsdErrno& out) {
 // codes overlap the errno range while meaning something else (ERROR_ACCESS_DENIED is 5, which the
 // guest would read as EIO), and many exceed 255 outright, so masking pushes the value out of the
 // errno byte and into an unrelated part of the SCE error space (ERROR_INVALID_ADDRESS, 487, lands
-// on 0x800201E7). Map deliberately, and keep the raw code in the emulator log rather than in the
-// guest-visible value.
+// on 0x800201E7). Map deliberately; this helper does not log, so a caller that wants the raw status
+// preserved must log it itself (hle_kernel.cpp's win_exc_sce_error does exactly that).
 //
 // CONFIDENCE: MED — the mapping is the conventional Win32->POSIX correspondence, but which errno a
 // real PS5 libkernel would report for these conditions is not observable from a Windows host. The

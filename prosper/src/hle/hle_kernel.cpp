@@ -591,7 +591,11 @@ namespace {
         return 0;
 #else
         rusage usage{};
-        if (getrusage(RUSAGE_SELF, &usage) != 0) return fbsd_errno(errno ? errno : EINVAL);
+        // HOST errno on purpose: this helper's result flows up to k_cond_timedwait, which applies
+        // fbsd_errno() itself. Translating here would translate twice — and the second pass reads a
+        // FreeBSD number as a host one, so ETIMEDOUT (60) would come back out as EINVAL. Its sibling
+        // return paths are host errnos for the same reason.
+        if (getrusage(RUSAGE_SELF, &usage) != 0) return errno ? errno : EINVAL;
         int64_t sec = usage.ru_utime.tv_sec;
         int64_t usec = usage.ru_utime.tv_usec;
         if (clock_id == kSonyClockProf) {
@@ -2481,6 +2485,20 @@ void win_exc_log(const char* msg) {
     WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, (DWORD)strlen(msg), &written, nullptr);
 }
 
+// The guest-visible result is a FreeBSD errno, so the Win32 status that produced it is not
+// recoverable from the return value (#1612). Keep the raw code where a developer can still see it —
+// it is the part that actually names what the host refused to do.
+static uint64_t win_exc_sce_error(const char* where, DWORD win32_error) {
+    if (g_exc_log || g_exc_log2) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg), "[exc] %s failed: Win32 %lu -> 0x%llx\n", where,
+                      (unsigned long)win32_error,
+                      (unsigned long long)prosper::hle::sce_error_from_win32(win32_error));
+        win_exc_log(msg);
+    }
+    return prosper::hle::sce_error_from_win32(win32_error);
+}
+
 extern "C" __attribute__((noinline, noreturn))
 void prosper_win_exc_delivery(WinExcDelivery* delivery) {
     PCONTEXT captured = delivery->saved;
@@ -2576,7 +2594,7 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
         if (previous_suspend == (DWORD)-1) {
             DWORD e = GetLastError();
             VirtualFree(delivery, 0, MEM_RELEASE);
-            return prosper::hle::sce_error_from_win32(e);
+            return win_exc_sce_error("SuspendThread", e);
         }
         if (previous_suspend != 0) {
             ResumeThread(thread);
@@ -2591,7 +2609,7 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
             DWORD e = GetLastError();
             ResumeThread(thread);
             VirtualFree(delivery, 0, MEM_RELEASE);
-            return prosper::hle::sce_error_from_win32(e);
+            return win_exc_sce_error("GetThreadContext", e);
         }
         const uintptr_t rsp = static_cast<uintptr_t>(captured.Rsp);
         if (rsp >= exception_stack && rsp < exception_stack + kWinExcStackSize) {
@@ -2608,7 +2626,7 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
     }
 
     DWORD previous_suspend = target_suspended ? 0 : SuspendThread(thread);
-    if (previous_suspend == (DWORD)-1) { DWORD e = GetLastError(); stack_slot->active.store(0, std::memory_order_release); VirtualFree(delivery, 0, MEM_RELEASE); return prosper::hle::sce_error_from_win32(e); }
+    if (previous_suspend == (DWORD)-1) { DWORD e = GetLastError(); stack_slot->active.store(0, std::memory_order_release); VirtualFree(delivery, 0, MEM_RELEASE); return win_exc_sce_error("raise-exception host call", e); }
     if (previous_suspend != 0) {
         ResumeThread(thread);
         win_exc_log_rejected("already-suspended", g_win_exc_suspended_busy,
@@ -2627,7 +2645,7 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
     }
     if (!GetThreadContext(thread, delivery->saved)) {
         DWORD e = GetLastError(); ResumeThread(thread); stack_slot->active.store(0, std::memory_order_release); VirtualFree(delivery, 0, MEM_RELEASE);
-        return prosper::hle::sce_error_from_win32(e);
+        return win_exc_sce_error("raise-exception host call", e);
     }
     win_exc_trace(WinExcTraceKind::Redirect, target, GetThreadId(thread),
                   delivery->saved->Rip, delivery->saved->Rsp);
@@ -2645,11 +2663,11 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
                             &delivery_ptr, sizeof(delivery_ptr), &written) ||
         written != sizeof(delivery_ptr)) {
         DWORD e = GetLastError(); ResumeThread(thread); stack_slot->active.store(0, std::memory_order_release); VirtualFree(delivery, 0, MEM_RELEASE);
-        return prosper::hle::sce_error_from_win32(e);
+        return win_exc_sce_error("raise-exception host call", e);
     }
     if (!SetThreadContext(thread, &injected)) {
         DWORD e = GetLastError(); ResumeThread(thread); stack_slot->active.store(0, std::memory_order_release); VirtualFree(delivery, 0, MEM_RELEASE);
-        return prosper::hle::sce_error_from_win32(e);
+        return win_exc_sce_error("raise-exception host call", e);
     }
     // Wake while the target is still suspended. Its registration is stable until resume, and the
     // wait will be ready to return as soon as Windows restores the redirected context. This avoids
@@ -2662,7 +2680,7 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
             stack_slot->active.store(0, std::memory_order_release);
             VirtualFree(delivery, 0, MEM_RELEASE);
         }
-        return prosper::hle::sce_error_from_win32(e);
+        return win_exc_sce_error("raise-exception host call", e);
     }
     // A redirected Windows CONTEXT is not dispatched until a blocking syscall returns. Current
     // IL2CPP targets commonly sit in a condition-variable or WaitOnAddress HLE; waking its registered
