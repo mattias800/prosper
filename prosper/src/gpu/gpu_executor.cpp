@@ -49,6 +49,11 @@
 // Look up a registered AGC shader header by its bound code address (hle_agc.cpp). Layout-compatible
 // with gpu::AgcShaderHeader (file_header@0, user_data@0x08, code@0x10, type@0x5a).
 extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
+// #305 instrument (hle_agc.cpp): every registered shader bound to one code address, oldest first.
+extern "C" size_t prosper_agc_shader_headers_for_code(uint64_t code_addr, const void** out,
+                                                      size_t max);
+extern "C" size_t prosper_agc_shader_count();
+extern "C" const void* prosper_agc_shader_at(size_t index);
 
 namespace prosper::gpu {
 
@@ -3296,6 +3301,58 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         }
     }
 
+    // PROSPER_UD_TAIL_ALIGN (#305 A/B) — FALSIFIED, retained as a documented negative result.
+    //
+    // The hypothesis was that a stage's user data is the TAIL of the block the pipeline programmed:
+    // on Nikoderiko the failing stages' declared descriptors do land on clean guest pointers exactly
+    // `programmed - user_data_range_end` dwords above USER_DATA_*_0, and the stages that resolve
+    // today are exactly those where `programmed == range_end`. Two independent measurements kill it:
+    //
+    //  * SPI_SHADER_PGM_RSRC2_GS.USER_SGPR equals `user_data_range_end` for every stage measured
+    //    (8/8, 12/12, 20/20, ...). That field is the count of user SGPRs the hardware loads, starting
+    //    at USER_DATA_GS_0 — so a stage with range_end=12 physically cannot see GS_12..GS_31, and no
+    //    tail alignment can be what the guest intended. It also confirms the existing seeding base
+    //    and the 8 leading system SGPRs of the merged-stage ABI are correct.
+    //  * A live A/B with the semantics-derived prefix raised Nikoderiko's exec-recompile rejects
+    //    well above the unmodified baseline rather than clearing them.
+    //
+    // Keep the switch so the measurement is reproducible; it must stay off. CONFIDENCE: HIGH that
+    // tail alignment is wrong.
+    static const char* const tail_mode = std::getenv("PROSPER_UD_TAIL_ALIGN");
+    if (tail_mode) {
+        const uint32_t e = (hdr->specials &&
+                            guest_readable((uint64_t)(uintptr_t)hdr->specials,
+                                           sizeof(AgcShaderSpecials)))
+                               ? hdr->specials->user_data_range_end : 0u;
+        const uint32_t rsrc2 = [&] {
+            const auto it = st.sh.find(is_ps ? P::SPI_SHADER_PGM_RSRC2_PS : P::SPI_SHADER_PGM_RSRC2_GS);
+            return it == st.sh.end() ? 0u : it->second;
+        }();
+        uint32_t user_sgprs = (rsrc2 >> P::SPI_SHADER_PGM_RSRC2_GS_USER_SGPR_SHIFT) &
+                              P::SPI_SHADER_PGM_RSRC2_GS_USER_SGPR_MASK;
+        if (!is_ps)
+            user_sgprs |= ((rsrc2 >> P::SPI_SHADER_PGM_RSRC2_GS_USER_SGPR_MSB_SHIFT) &
+                           P::SPI_SHADER_PGM_RSRC2_GS_USER_SGPR_MSB_MASK) << 5;
+        // Two candidate sources for the size of the block that precedes this stage's own user data:
+        // the hardware user-SGPR count the pipeline programmed, and the shader's own declared vertex
+        // input count (one 4-dword V# per input, the fetch block). Report both, drive with one.
+        const uint32_t sem_prefix = is_ps ? 0u : hdr->num_input_semantics * 4u;
+        const uint32_t rsrc2_prefix = (user_sgprs >= e) ? user_sgprs - e : UINT32_MAX;
+        const bool use_sem = tail_mode[0] == 's';
+        const uint32_t prefix = use_sem ? sem_prefix : rsrc2_prefix;
+        if (log || g_dyntrace_force) {
+            static std::set<uint64_t> logged;
+            if (logged.insert(code_addr).second)
+                fprintf(stderr,
+                        "[udtail] %s 0x%llx rsrc2=0x%08x user_sgprs=%u range_end=%u num_in_sem=%u "
+                        "prefix_rsrc2=%d prefix_sem=%u mode=%s\n",
+                        is_ps ? "PS" : "VS", (unsigned long long)code_addr, rsrc2, user_sgprs, e,
+                        hdr->num_input_semantics, (int)rsrc2_prefix, sem_prefix,
+                        use_sem ? "sem" : "rsrc2");
+        }
+        if (e && prefix != UINT32_MAX && prefix + e <= kUserSgprs) range_start = prefix;
+    }
+
     // PROSPER_RESDUMP: raw dump of the user-data struct + SGPR block per base, so the EUD layout
     // (which sharps have offset_dw>=16, and where the EUD pointer sits) can be read empirically.
     bool resdump = getenv("PROSPER_RESDUMP") != nullptr;
@@ -3413,6 +3470,188 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             if (implied == UINT32_MAX) fprintf(stderr, "none");
             else fprintf(stderr, "%u", implied);
             fprintf(stderr, "\n");
+        }
+        // #305 instrument: the code address alone does not identify a shader. CreateShader's registry
+        // is append-only and the header lookup returns the FIRST registration bound to an address, so
+        // a guest that re-registers a different shader over a recycled code allocation resolves to the
+        // OLDEST layout while the register block holds the newest bind. Enumerate every candidate and
+        // report, for each, whether ALL of its declared direct offsets land on mapped pointers in the
+        // block this draw actually has — the candidate that does is the layout the guest programmed.
+        {
+            const void* cands[16] = {};
+            const size_t total =
+                prosper_agc_shader_headers_for_code(code_addr, cands, std::size(cands));
+            uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
+            fprintf(stderr, "[udcand] %s code=0x%llx registrations=%zu\n",
+                    is_ps ? "PS" : "VS", (unsigned long long)code_addr, total);
+            for (size_t ci = 0; ci < total && ci < std::size(cands); ci++) {
+                const auto* ch = static_cast<const AgcShaderHeader*>(cands[ci]);
+                // This loop exists to enumerate EXTRA registrations at one code address — i.e. the
+                // recycled-allocation case — so its entries are the ones most likely to point into
+                // a blob the guest has already freed. Probe every hop, exactly as the whole-registry
+                // scan below does.
+                if (!ch || !guest_readable((uint64_t)(uintptr_t)ch, sizeof(AgcShaderHeader)))
+                    continue;
+                const bool sp_ok = ch->specials && guest_readable((uint64_t)(uintptr_t)ch->specials,
+                                                                  sizeof(AgcShaderSpecials));
+                fprintf(stderr, "[udcand]   #%zu hdr=%p type=%u range=[%u,%u) direct:", ci,
+                        (const void*)ch, ch->type,
+                        sp_ok ? (uint32_t)ch->specials->user_data_range_start : 0u,
+                        sp_ok ? (uint32_t)ch->specials->user_data_range_end : 0u);
+                bool all = true, any = false;
+                const AgcShaderUserData* cud = ch->user_data;
+                if (cud && !guest_readable((uint64_t)(uintptr_t)cud, sizeof(AgcShaderUserData)))
+                    cud = nullptr;
+                uint16_t cud_count = 0;
+                const uint16_t* cud_offsets = nullptr;
+                if (cud) {
+                    cud_count = cud->direct_resource_count;
+                    cud_offsets = cud->direct_resource_offset;
+                    if (!cud_offsets || !cud_count || cud_count > 64 ||
+                        !guest_readable((uint64_t)(uintptr_t)cud_offsets,
+                                        cud_count * (uint32_t)sizeof(uint16_t)))
+                        cud = nullptr;
+                }
+                if (cud) {
+                    for (uint16_t t = 0; t < cud_count && t < 16; t++) {
+                        const uint32_t off = cud_offsets[t];
+                        if (off == 0xFFFFu) continue;
+                        any = true;
+                        if (off + 1 >= kUserSgprs) { all = false; fprintf(stderr, " [%u]@dw%u=OOB", t, off); continue; }
+                        const uint64_t v = (uint64_t)sgprs[off] | ((uint64_t)sgprs[off + 1] << 32);
+                        const bool ok = pointer_is_mapped(v);
+                        all = all && ok;
+                        fprintf(stderr, " [%u]@dw%u=0x%llx(%s)", t, off, (unsigned long long)v,
+                                ok ? "readable" : "UNMAPPED");
+                    }
+                    fprintf(stderr, " sharps={%u,%u,%u,%u}", cud->sharp_resource_count[0],
+                            cud->sharp_resource_count[1], cud->sharp_resource_count[2],
+                            cud->sharp_resource_count[3]);
+                }
+                fprintf(stderr, " -> %s\n", !any ? "no-direct" : (all ? "FITS-BLOCK" : "misfit"));
+            }
+            // Whole-registry search: the block this draw programmed is a fact; the header is an
+            // inference from the PGM register. If the resolved header does not fit the block but
+            // some OTHER registered shader's declared layout does — and its declared size equals the
+            // contiguous extent this draw's own bind freshly wrote — then the PGM register, not the
+            // register block, is what is stale. `fresh` is that extent, from the write-provenance
+            // instrument (dwords sharing the newest write order, from dw0 up).
+            uint32_t fresh = 0;
+            if (prosper::gpu::udprov_enabled()) {
+                uint64_t newest = 0;
+                for (uint32_t i = 0; i < kUserSgprs; i++) {
+                    const auto it = st.sh_prov.find(bases[0] + i);
+                    if (it != st.sh_prov.end())
+                        newest = std::max(newest, it->second & ~GpuState::kProvIndirect);
+                }
+                for (uint32_t i = 0; i < kUserSgprs; i++) {
+                    const auto it = st.sh_prov.find(bases[0] + i);
+                    if (it == st.sh_prov.end() ||
+                        (it->second & ~GpuState::kProvIndirect) != newest) break;
+                    fresh = i + 1;
+                }
+            }
+            const size_t registry = prosper_agc_shader_count();
+            fprintf(stderr, "[udcand]   block: fresh_extent=%u registry=%zu fitting:", fresh, registry);
+            size_t fits = 0;
+            for (size_t si = 0; si < registry; si++) {
+                const auto* sh = static_cast<const AgcShaderHeader*>(prosper_agc_shader_at(si));
+                // This walks the WHOLE registry (thousands of entries), and every pointer in it is
+                // guest-owned metadata that may point into a blob the guest has since freed. Probe
+                // each hop before dereferencing it — the resolved-header path above only ever
+                // touches one entry, this one touches all of them.
+                if (!sh || !guest_readable((uint64_t)(uintptr_t)sh, sizeof(AgcShaderHeader)))
+                    continue;
+                if (!sh->user_data ||
+                    !guest_readable((uint64_t)(uintptr_t)sh->user_data, sizeof(AgcShaderUserData)))
+                    continue;
+                const uint16_t direct_count = sh->user_data->direct_resource_count;
+                const uint16_t* direct_offsets = sh->user_data->direct_resource_offset;
+                if (!direct_offsets || !direct_count || direct_count > 64 ||
+                    !guest_readable((uint64_t)(uintptr_t)direct_offsets,
+                                    direct_count * (uint32_t)sizeof(uint16_t)))
+                    continue;
+                if (!sh->specials ||
+                    !guest_readable((uint64_t)(uintptr_t)sh->specials, sizeof(AgcShaderSpecials)))
+                    continue;
+                const uint32_t end = sh->specials->user_data_range_end;
+                if (!fresh || end != fresh) continue;   // must match what this bind actually wrote
+                bool all = true, any = false;
+                for (uint16_t t = 0; all && t < direct_count && t < 16; t++) {
+                    const uint32_t off = direct_offsets[t];
+                    if (off == 0xFFFFu) continue;
+                    any = true;
+                    if (off + 1 >= kUserSgprs) { all = false; break; }
+                    all = pointer_is_mapped((uint64_t)sgprs[off] |
+                                            ((uint64_t)sgprs[off + 1] << 32));
+                }
+                if (!any || !all) continue;
+                if (fits++ < 8)
+                    fprintf(stderr, " 0x%llx(type=%u,end=%u)",
+                            (unsigned long long)(uintptr_t)sh->code, sh->type, end);
+            }
+            if (!fits) fprintf(stderr, " none");
+            fprintf(stderr, " total=%zu\n", fits);
+        }
+        // PROSPER_UDPROV (#305): write provenance for the block this stage was seeded from, plus the
+        // program-address registers that named the stage. "The block holds a previous pipeline's
+        // user data" is a claim about WHEN each dword was last written relative to the draw — values
+        // alone cannot express it. Print, per dword, the value and the command_order of its last
+        // write (i = indirect path, d = direct), the orders of the PGM registers that selected this
+        // shader, and the draw's own order.
+        if (prosper::gpu::udprov_enabled()) {
+            // order + path + SOURCE. `q` is the queue origin the packet folded under
+            // (0=unknown/graphics, 1=Dcb, 2=Acb, 3=DcbFinal), `f` the top-level fold (submit
+            // stream) id, `j` the sceAgcDcbJump recursion depth. A write whose q/f differs from
+            // the draw's own is one that did not arrive in this submit's inline position.
+            const auto prov = [&](uint32_t reg) -> std::string {
+                const auto it = st.sh_prov.find(reg);
+                if (it == st.sh_prov.end()) return "never";
+                char buf[64];
+                const auto sit = st.sh_prov_src.find(reg);
+                const uint64_t src = sit == st.sh_prov_src.end() ? 0 : sit->second;
+                snprintf(buf, sizeof(buf), "%c%llu/q%u,f%llu,j%u",
+                         (it->second & GpuState::kProvIndirect) ? 'i' : 'd',
+                         (unsigned long long)(it->second & ~GpuState::kProvIndirect),
+                         (unsigned)(src & 0xFFu), (unsigned long long)(src >> 16),
+                         (unsigned)((src >> 8) & 0xFFu));
+                return buf;
+            };
+            const auto shv = [&](uint32_t reg) {
+                const auto it = st.sh.find(reg);
+                return it == st.sh.end() ? 0u : it->second;
+            };
+            fprintf(stderr,
+                    "[udprov] %s code=0x%llx draw_order=%llu pgm: ES_LO=0x%x@%s ES_HI=0x%x@%s "
+                    "GS_LO=0x%x@%s GS_HI=0x%x@%s PS_LO=0x%x@%s\n",
+                    is_ps ? "PS" : "VS", (unsigned long long)code_addr,
+                    (unsigned long long)st.command_order,
+                    shv(P::SPI_SHADER_PGM_LO_ES), prov(P::SPI_SHADER_PGM_LO_ES).c_str(),
+                    shv(P::SPI_SHADER_PGM_HI_ES), prov(P::SPI_SHADER_PGM_HI_ES).c_str(),
+                    shv(P::SPI_SHADER_PGM_LO_GS), prov(P::SPI_SHADER_PGM_LO_GS).c_str(),
+                    shv(P::SPI_SHADER_PGM_HI_GS), prov(P::SPI_SHADER_PGM_HI_GS).c_str(),
+                    shv(P::SPI_SHADER_PGM_LO_PS), prov(P::SPI_SHADER_PGM_LO_PS).c_str());
+            {
+                const auto cxv = [&](uint32_t reg) {
+                    const auto it = st.cx.find(reg);
+                    return it == st.cx.end() ? 0u : it->second;
+                };
+                fprintf(stderr,
+                        "[udprov]   stages: HS_LO=0x%x@%s LS_LO=0x%x@%s RSRC2_GS=0x%x@%s "
+                        "VGT_SHADER_STAGES_EN=0x%x\n",
+                        shv(P::SPI_SHADER_PGM_LO_HS), prov(P::SPI_SHADER_PGM_LO_HS).c_str(),
+                        shv(P::SPI_SHADER_PGM_LO_LS), prov(P::SPI_SHADER_PGM_LO_LS).c_str(),
+                        shv(P::SPI_SHADER_PGM_RSRC2_GS), prov(P::SPI_SHADER_PGM_RSRC2_GS).c_str(),
+                        cxv(P::VGT_SHADER_STAGES_EN));
+            }
+            for (uint32_t bi = 0; bi < std::size(bases); ++bi) {
+                fprintf(stderr, "[udprov]   base=0x%x:", bases[bi]);
+                for (uint32_t i = 0; i < kUserSgprs; i++) {
+                    const uint32_t reg = bases[bi] + i;
+                    fprintf(stderr, " dw%u=0x%08x@%s", i, shv(reg), prov(reg).c_str());
+                }
+                fprintf(stderr, "\n");
+            }
         }
         // ALL set sh registers (sorted) — finds where the user-data SGPRs actually landed, including
         // any at unexpected offsets (a wrong indirect-register decode would scatter them).

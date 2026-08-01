@@ -788,10 +788,46 @@ extern "C" size_t prosper_agc_shader_count() {
 // sides take the registry mutex (an unlocked read raced push_back's reallocation — UAF).
 extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr) {
     if (!code_addr) return nullptr;
+    // PROSPER_SHADER_HEADER_NEWEST=1 (#305 A/B): resolve to the MOST RECENT registration bound to
+    // this code address instead of the first. Diagnostic switch for the recycled-allocation
+    // hypothesis; see prosper_agc_shader_headers_for_code below.
+    static const bool newest = std::getenv("PROSPER_SHADER_HEADER_NEWEST") != nullptr;
     std::lock_guard<std::mutex> lk(agc_shaders_mx());
+    if (newest) {
+        const auto& all = agc_shaders();
+        for (size_t i = all.size(); i-- > 0;)
+            if (all[i] && (uint64_t)(uintptr_t)all[i]->code == code_addr) return all[i];
+        return nullptr;
+    }
     for (const AgcShader* h : agc_shaders())
         if (h && (uint64_t)(uintptr_t)h->code == code_addr) return h;
     return nullptr;
+}
+
+// #305 instrument: enumerate the registry by index, so a diagnostic can ask "which registered
+// shader's declared user-data layout matches the block this draw actually programmed?".
+extern "C" const void* prosper_agc_shader_at(size_t index) {
+    std::lock_guard<std::mutex> lk(agc_shaders_mx());
+    const auto& all = agc_shaders();
+    return index < all.size() ? all[index] : nullptr;
+}
+
+// #305 instrument: how many registered shaders bind the SAME code address, and which. The registry
+// is append-only (CreateShader never removes), and the lookup above returns the FIRST match, so a
+// guest that re-registers a different shader over a recycled code allocation keeps resolving to the
+// oldest header — a correct register block read through a stale user-data layout. Fills `out` in
+// registration order (oldest first) and returns the TOTAL match count, which may exceed `max`.
+extern "C" size_t prosper_agc_shader_headers_for_code(uint64_t code_addr, const void** out,
+                                                      size_t max) {
+    if (!code_addr) return 0;
+    std::lock_guard<std::mutex> lk(agc_shaders_mx());
+    size_t n = 0;
+    for (const AgcShader* h : agc_shaders()) {
+        if (!h || (uint64_t)(uintptr_t)h->code != code_addr) continue;
+        if (out && n < max) out[n] = h;
+        ++n;
+    }
+    return n;
 }
 
 // A fused GS/HS programs the front-half address into the stage register while retaining the actual

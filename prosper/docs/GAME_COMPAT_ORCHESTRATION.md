@@ -71,6 +71,9 @@ highest-value page in this document.
 | 13 | A **print-capped** diagnostic read as a frequency | `[agc] WaitRegMem … NOT satisfied` prints the first 40 then every 1024th (`ln < 40 \|\| (ln & 1023) == 0`); `[agc] out-of-range indirect reg write dropped` stops after **4**; `[agc] indexed indirect draw skipped` after 24. #1606 called the `WaitRegMem` volume "the loudest signal, dozens per second"; the true rate is **~1.5/s** (see below). A line count from these is a cap, not a rate. Same trap as #9's dedupe, different mechanism. |
 
 | 14 | A **decoded-draw census read without the render phase** | Draw counts per frame are phase-dependent by two orders of magnitude *within one title*. Blue Prince (rung 3) decodes **7-13 draws/frame on its own menus** and **1,500-3,200 in its 3D scene**. So Nikoderiko's 53/frame on a title/EULA screen looks exactly like #1641's "implausibly few" signature and is simply **normal for a 2D UI screen**. Reporting it would have sent a lane chasing nothing. |
+| 15 | "is this dword pair a mapped pointer?" | The user-data window is 32 dwords and holds many live pointers, so **several** seed offsets satisfy "every declared descriptor is readable". On #305 a shifted seed made all declared pointers land cleanly on **9 of 9** stages — and the hardware field that bounds the window (`SPI_SHADER_PGM_RSRC2_GS.USER_SGPR`) proved the stage cannot see there at all. A live A/B then raised rejects 118-141 -> 521. A numeric fit over a pointer-shaped predicate is weak evidence; find the register that bounds the search space. |
+| 16 | One diagnostic **label** covering two packet kinds | #305's bind trace emitted `[bind] DRAW` from all five per-item snapshot sites in `GpuState::apply` — and **two of those are compute dispatches**. A dispatch never consumes `SPI_SHADER_PGM_LO_ES`, so a bind/draw agreement statistic computed over those lines mixes in events that cannot agree by construction. Graphics-queue dispatches read the *graphics* register file, so they print plausible `es_lo` and are **indistinguishable from draws in the log** — a re-run, not a re-parse. **Re-measured after relabelling** (a fresh boot — the two figures are not the same run: 434,239 bind packets vs 193,397), the contaminated "871,648 of 876,217 (99.5%)" became **300,404 of 300,404 (100%)**, so the residue had been dispatches. Tag every emitter with the kind it actually observed. |
+| 17 | **Asymmetric** exhaustion of per-site caps | A cousin of #13. When one side of a paired trace caps (bind lines, one counter at 4,000) and the other runs on **five independent counters**, the first side dies during the pre-title load while the second keeps emitting; a "does each draw follow a bind?" analysis then reported a 41% mismatch that was pure counter exhaustion. Bound the analysis to the region where **every** stream is still logging. Related: `command_order` is **per-submit and resets**, so ordering events globally by it interleaves submits and manufactures impossible pairs. |
 
 **Working rules that follow:**
 
@@ -893,6 +896,57 @@ extents unsupported; a 400x400x212 image exceeding the 512 MiB backend bound; an
 `[agc] WaitRegMem q=F … dependency violated` — the same per-queue barrier gap as ArcRunner #1226. Estimated cost:
 **rung 1 ≈ one medium focused investigation** (answerable offline from the existing capture), **rung 3 ≈ several
 sessions**.
+
+## Lane F: Nikoderiko (PPSA23760) — the #305 user-data condition
+
+Triaged 2026-08-01. Tracked in **#305**, which was **retitled that day**: its founding premise —
+*"first draws run with the PREVIOUS pipeline's user data (missing bind in decoded stream)"* — is
+**measured and falsified**. Anyone starting from "stale bind" is starting from a dead tree.
+
+The title renders its logos, title screen and EULA correctly at 3840x2160 and reaches **rung 2**. The
+whole 3D world is missing: 25 distinct `(es, ps)` pipelines dropped, the world behind the title black.
+
+**The condition that actually holds.** A stage resolves garbage descriptors exactly when the
+user-data block the guest most recently programmed is **larger** than the bound pipeline's user-SGPR
+window (`SPI_SHADER_PGM_RSRC2_{GS,PS}.USER_SGPR`, which equals the shader's own
+`user_data_range_end`). The shader then dereferences a V# `num_records`/`dword3` tail as a pointer —
+the `0x0004dfac…` constant family — the const-fold correctly refuses to invent a descriptor, and the
+draw is skipped fail-visibly. 12→12 resolves; 8→12, 12→28, 12→30, 20→30, 24→28, 24→30 all fail. The
+original DOLL (`PPSA17942`) evidence in the issue records the **same** numeric relationship (a
+12-dword block against an 8-user-SGPR pipeline), so this is one condition across two UE4 titles.
+
+**Falsified, with the measurement — do not re-derive:** the block is not stale (write provenance puts
+it a handful of packets before the draw, from the immediately preceding bind); the shader-registry
+lookup is not stale (`registrations=1` across a 2,725-entry registry); no bind is missing or
+mis-ordered (193,397 bind packets, **0 of 141** distinct register arrays ever applying more than one
+`(es_lo, rsrc2)`, and **300,404 of 300,404** draws folding with the immediately preceding bind — see
+hazard 16 for the earlier, contaminated version of that number);
+the stage's data is **not** the tail of the programmed block (see hazard 12 above); and **#140
+(TYPE-0 AGC data packets) is the wrong tree** — every register write that matters arrives as an
+ordinary decoded packet whose provenance is now observable, and none is missing.
+
+The same measurement **confirms** two assumptions previously taken on faith: the seeding base
+`USER_DATA_<stage>_0 + user_data_range_start`, and the merged-stage convention that user data begins
+at shader SGPR `s8`.
+
+**Remaining candidate:** cross-queue / multi-buffer submit ordering — a larger, later `SET_SH_REG`
+whose ordered position prosper places differently from the guest's intent (another command buffer, a
+`sceAgcDcbJump` segment, or a second submit entry point).
+
+**Acceptance test for any proposed mechanism: it must explain the GS-versus-PS asymmetry.** Every
+traced pixel stage in this title has its declared direct pointer readable; only the vertex/GS block
+loses. A submit-ordering story that does not say why the PS block survives is incomplete.
+
+**Instruments** (`PROSPER_UDPROV`, `PROSPER_BINDTRACE`, `[udcand]`, `PROSPER_SHADER_HEADER_NEWEST`,
+and the deliberately-off `PROSPER_UD_TAIL_ALIGN`) are on PR #1639, with queue/fold/jump-depth write
+provenance following. Use them rather than rebuilding the measurement.
+
+**Instrument warning:** the diagnostics serialize draw realization, so the title screen arrives at
+~112 s rather than ~90 s. A 200 s window times out in the pre-title load with **zero rejects** and
+looks deceptively like the issue is fixed. Budget ~440 s per run.
+
+Estimated cost: **rung 3 ≈ one to two focused sessions** if submit ordering is confirmed; the
+condition is now cheap to detect, so the remaining work is attribution and a generic contract.
 
 ## Suggested allocation for a new orchestrator
 
