@@ -74,8 +74,30 @@ int main() {
             vert, scalar_vcc_frag, W, H);
         const uint8_t* p = scalar_vcc_px.empty() ? nullptr
             : &scalar_vcc_px[((size_t)(H / 2) * W + W / 2) * 4];
-        CHECK(p && p[0] > 0x80 && p[1] < 0x40 && p[2] < 0x40,
-              "fragment scalar VCC_LO dword reaches compare/select exactly");
+        // #1681: this fixture writes VCC_LO from a scalar ALU chain, which the recompiler lowers
+        // through a native wave64 subgroup vote, so the module requires an exact 64-lane fragment
+        // subgroup. RADV enforces it; llvmpipe is fixed at 8 and the backend correctly rejects the
+        // draw rather than run wrong wave semantics, leaving the BLUE clear. Gate the rendered-pixel
+        // assertion on the capability the same way test_recompiled_fragment already does.
+        const auto& ctx = prosper::test::render_vk_ctx();
+        const bool supports_fragment_wave64_vote = ctx.subgroup_size_control &&
+            ctx.min_subgroup_size <= 64 && ctx.max_subgroup_size >= 64 &&
+            (ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+            (ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+            (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
+            (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+        if (p) printf("  scalar-vcc center=(%u,%u,%u,%u) wave64-vote=%d\n",
+                      p[0], p[1], p[2], p[3], static_cast<int>(supports_fragment_wave64_vote));
+        // The skipped arm pairs the clear colour with the module's own declared requirement, so it
+        // asserts "this shader demanded wave64 and the device therefore left the target untouched"
+        // rather than the weaker "no draw landed here", which any pipeline failure would satisfy.
+        CHECK(p && (supports_fragment_wave64_vote
+                        ? (p[0] > 0x80 && p[1] < 0x40 && p[2] < 0x40)
+                        : (fragment_spirv_required_subgroup_size(scalar_vcc_frag) == 64 &&
+                           p[2] > 0x80 && p[0] < 0x40 && p[1] < 0x40)),
+              supports_fragment_wave64_vote
+                  ? "fragment scalar VCC_LO dword reaches compare/select exactly"
+                  : "device without fragment wave64 vote skips the scalar-VCC draw fail-visible");
     }
 
     // An NGG hardware vertex program uses LDS even when its logical output is an ordinary vertex.

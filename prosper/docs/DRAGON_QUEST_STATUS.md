@@ -217,6 +217,61 @@ exposure or grading pass. Its decoded output range does not overlap draw 95's fo
 the earlier title-screen milestone was reached while the dispatch was still skipped. It is not the
 title-visibility blocker.
 
+## The flashing white screen and the UI noise block are one defect: `CB_COLOR_CONTROL.MODE=2` (#1588)
+
+**Read this before any further work on this title's composition.** It supersedes the "final Slate quad"
+line of investigation below, which was chasing an ordinary draw that is not ordinary.
+
+The project owner played through to the System Settings onboarding screens and reported the screen
+flashing white with roughly one frame in ten "decent", plus a block of colour noise where the dialogue
+box belongs. Two F9 grabs from that session (3840x2160 composite submits, 97 and 98 draws) show the same
+structure, and the cause is visible in capture metadata without replaying anything:
+
+Each submit contains **exactly two `mode=2` draws** — draw-scoped census `mode=0` x7/x8, `mode=1` x88,
+**`mode=2` x2**, summing to the 97/98 draws — and they are the only draws covering the two defect regions:
+
+| | scissor | topo | cwm | blend | position in submit |
+|---|---|---|---|---|---|
+| box | `[700,1560)-[3140,1988)` | 4 (`raw=3`) | f | 0 | mid-frame |
+| screen | `[0,0)-[3840,2160)` | 4 (`raw=3`) | f | 0 | **last operation** |
+
+- the white screenshot is 3840x2160 with **one distinct colour**, `(255,255,255)`, at 100% of pixels;
+- the noise block's measured bounding box is x 700..3139, y 1560..1987 — **exact on all four edges**
+  against the box draw's scissor, and the two grabs are from the same run two minutes apart.
+
+`MODE=2` is `CB_ELIMINATE_FAST_CLEAR`, a colour-block metadata operation. `render_state.cpp` models
+DISABLE(0), NORMAL(1), RESOLVE(3) and DCC_DECOMPRESS(6) and lets every other mode **fall through to an
+ordinary draw** after a once-per-mode warning (`[gpu] resolve_pipeline_state: unsupported
+CB_COLOR_CONTROL.MODE=2 -> ordinary draw fallback`, present in the session log). The only downstream
+consumer of `cb_color_mode` is a diagnostic print, so nothing rescues it later.
+
+The draws carry hardware's decompress signature, which is why the fall-through is destructive:
+
+- both bind the **same 486-byte vertex shader that no other draw in the frame uses**, with no vertex
+  resources at all (`VS: none`). Disassembled it is the procedural rect: `id & 1`, `id >> 1`,
+  `v_cvt_f32_u32`, `fma(2.0, v, -1.0)`, exporting the four clip-space corners;
+- both are 3-vertex RectLists (`topo=4 raw=3 indices=0`);
+- both **inherit the pixel shader of the draw immediately before them** — correct on hardware, where the
+  colour block performs the expansion and the bound PS is irrelevant.
+
+**Why white and not black.** The inherited full-screen shader clamps its sample with
+`v_med3_f32(s19, x, 0.25)` where `s19 = 1.0`, scales by `s16 = 1.0`, then linear-to-sRGB encodes. Its
+output **floor is sRGB(0.25) ~ 0.54 and it saturates at 1.0** — it can only produce a bright field. Note
+that the "alpha is `s18` x clamp = 0, so the draw is a no-op" reasoning recorded further down this
+document does **not** transfer: that applies under `SRC_ALPHA` blending, and these draws are `blend=0`.
+The two `mode=2` draws also bind different textures, which fits the two appearances: the box one samples a
+2048x2048 single-channel R8 glyph atlas (`swz=0004`), the full-screen one a 48x36 texture.
+
+The eliminate pass is emitted per fast-cleared surface, so which regions get overwritten varies frame to
+frame — and the title double-buffers its scanout. In the white grab the two buffers' pre-frame RTT seeds
+are one correct System Settings screen (7,410 distinct colours) and one **single-colour pure white** plane,
+which is the buffer that submit renders into. That is the flashing.
+
+`tests/test_render_state.cpp` currently **asserts the fall-through** for MODE=2 and MODE=5 ("unmodeled CB
+modes log once per distinct value while retaining fallback behavior"). A correct fix must update that
+block, and it is the natural home for the regression — state this in the PR, because a test that pins the
+buggy behaviour makes a correct fix look like a regression to anyone who does not read it.
+
 ## Superseded analysis — read this before trusting the sections above
 
 The two "defect" sections above were written on 2026-07-30 from a capsule taken on a **pre-#1483**
@@ -288,6 +343,21 @@ current build.
 - **Not movie/USM playback**: the frame is a fully rendered UE4 scene and no AvPlayer activity
   accompanies the transition.
 - **Not the `no-effect` draws**: all 22 have `cwm=0` with no depth or stencil write.
+- **The `[dynvb]` guessed vertex format is not the cause of the flashing or the UI noise block.** prosper
+  does substitute a format it could not decode on this title (`[dynvb] PS code=… has unknown V# format
+  0x0; using Float32x4`, and at one fetch it derives a 1.3 GB range from an all-zero V#), which is a real
+  charter violation and belongs to its own issue. But it lands on a scene draw in the 4K HDR pass
+  (`indices=9360`, matching the log's `draw_vertices=9360`), and that pass's target seeds to a coherent
+  sunset sky/ocean image in the same capture. The two composition defects are `mode=2` draws whose only
+  resources are one constant buffer and one texture each. Same for the `[buffer-truncated]` non-pointer
+  descriptors (`addr=808080808080 declared=4294967295`, i.e. `0xFFFFFFFF`): real, tracked under the #305
+  family, not these defects.
+- **"The guest never asks for audio" is false.** A grep for `sceAudioOut`/`sceNgs2` returns nothing in a
+  whole session, which reads as "audio was never initialised". This title drives **`sceAudioOut2`**, which
+  emits neither name. `prosper-audio: opened port 18` is the tell: `hle_audio.cpp` sets `kMaxPorts = 16`
+  and `kA2SinkPortBase = kMaxPorts + 1`, so host sink ports 17..20 are the AudioOut2 contexts. A real
+  48 kHz stereo device opened. Whether the guest ever pushes PCM into it is unmeasured — #1692 carries
+  the three-way `PROSPER_AUDIOLOG=1` instrument that settles it in one run.
 
 ## Open questions for the next investigator
 
@@ -331,6 +401,21 @@ blocker.
    analysis that matched a `PROSPER_RTTLOG` window from one run against addresses from another produced a
    confident and wrong conclusion.
 4. **`bash -n` proves syntax, not semantics** — it cannot see an unquoted expansion that word-splits.
+5. **`grep -c "^  color-state"` is not a draw census.** `--inspect-only` emits that line for graphics
+   *dispatches* as well as draws, so a raw grep over one capsule returned 121 rows for 97 draws and a
+   `mode=0` count of 31 where the draw-scoped figure is 7 — a total that does not even sum to the draw
+   count, which is the tell. Scope the census to rows under a `draw[` header before quoting it. The
+   `mode=2` figure survived only because it was independently confirmed by a lever that iterates draws.
+   This is `GAME_COMPAT_ORCHESTRATION.md` trap #16 (one diagnostic label covering two packet kinds).
+6. **A `.bmp` and a same-named `.prgbundle` are not necessarily one grab.** The frontend writes the bundle
+   through a `.tmp` and the screenshot separately, so killing the app mid-grab leaves a `.bmp` whose
+   same-named `.prgbundle` is from a **previous** grab. Two files handed to this investigation as "the same
+   scene in two states" were 51 minutes and one boot apart; the screenshot's real partner was the abandoned
+   `.tmp` written 0.7 s before it, which loads fine. Analysing the mismatched pair would have produced a
+   large artefactual 1920x1080/1519-draw-vs-3840x2160/97-draw "difference" in exactly the comparison that
+   was believed to be the highest-value evidence available. **`stat` the artifacts and confirm sub-second
+   pairing before treating a screenshot as evidence about a bundle.** Recorded as trap #35 in
+   `GAME_COMPAT_ORCHESTRATION.md`.
 
 ## What has been fixed
 
