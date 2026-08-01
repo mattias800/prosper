@@ -27,7 +27,8 @@ static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
 constexpr uint32_t IT_NOP = 0x10, IT_NUM_INSTANCES = 0x2F, IT_SET_CONTEXT_REG = 0x69,
                    IT_SET_SH_REG = 0x76, IT_SET_UCONFIG_REG = 0x79,
                    R_DRAW_RESET = 0x05, R_PUSH_MARKER = 0x0b, R_POP_MARKER = 0x0c,
-                   R_CX_REGS_INDIRECT = 0x12, R_DMA_DATA = 0x19;
+                   R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12,
+                   R_UC_REGS_INDIRECT = 0x13, R_DMA_DATA = 0x19;
 
 struct ShaderRegister { uint32_t offset, value; };
 
@@ -101,6 +102,48 @@ int main() {
     CHECK(cmd[1] == 8, "PatchAddRegisters did cmd[1] += 5 (3 -> 8)");
     p_addr(rc, 0xAABBCCDD00112233ull, 0, 0, 0, 0);
     CHECK(cmd[2] == 0x00112233u && cmd[3] == 0xAABBCCDDu, "PatchSetAddress rewrote cmd[2]/cmd[3]");
+
+    // PatchSetNumRegisters SETS the count outright — the only member of this family that can
+    // LOWER one. The AGC record-then-patch idiom reserves the packet before the register array is
+    // known, so an ignored patch leaves the RECORD-TIME placeholder in cmd[1]: a packet reserved
+    // with 0 applies no registers at all (GpuState::apply returns early on num_regs == 0) and the
+    // whole bind disappears from the decoded stream. All three class variants must be registered,
+    // must write the count slot, and must refuse a packet of the wrong class.
+    auto p_num_cx = Hle::lookup("whb1RL7K4Ss");   // sceAgcSetCxRegIndirectPatchSetNumRegisters
+    auto p_num_sh = Hle::lookup("nCUgItdN2ms");   // sceAgcSetShRegIndirectPatchSetNumRegisters
+    auto p_num_uc = Hle::lookup("fRG-JOH5+sI");   // sceAgcSetUcRegIndirectPatchSetNumRegisters
+    auto setsh_ind = Hle::lookup("-HOOCn0JY48");  // sceAgcDcbSetShRegistersIndirect
+    auto setuc_ind = Hle::lookup("hvUfkUIQcOE");  // sceAgcDcbSetUcRegistersIndirect
+    CHECK(p_num_cx && p_num_sh && p_num_uc && setsh_ind && setuc_ind,
+          "all three PatchSetNumRegisters NIDs and the Sh/Uc indirect builders are registered");
+    if (p_num_cx && p_num_sh && p_num_uc && setsh_ind && setuc_ind) {
+        p_num_cx(rc, 2, 0, 0, 0, 0);
+        CHECK(cmd[1] == 2, "Cx PatchSetNumRegisters SETS the count (8 -> 2), it does not accumulate");
+        CHECK(cmd[2] == 0x00112233u && cmd[3] == 0xAABBCCDDu,
+              "Cx PatchSetNumRegisters leaves the array address untouched");
+
+        // The record-with-a-placeholder-count sequence the defect turned into a dropped bind.
+        uint64_t sh_rc = setsh_ind(D, 0, 0, 0, 0, 0);
+        auto* sh_cmd = (uint32_t*)(uintptr_t)sh_rc;
+        CHECK(sh_cmd && sh_cmd[0] == PM4(4, IT_NOP, R_SH_REGS_INDIRECT) && sh_cmd[1] == 0,
+              "SetShRegistersIndirect reserves a packet with the placeholder count 0");
+        p_addr(sh_rc, 0x0000000340000000ull, 0, 0, 0, 0);
+        p_num_sh(sh_rc, 12, 0, 0, 0, 0);
+        CHECK(sh_cmd[1] == 12, "Sh PatchSetNumRegisters turns the reserved 0-count packet into 12");
+        CHECK(sh_cmd[2] == 0x40000000u && sh_cmd[3] == 0x00000003u,
+              "Sh reserved packet keeps its patched array address");
+
+        uint64_t uc_rc = setuc_ind(D, 0, 7, 0, 0, 0);
+        auto* uc_cmd = (uint32_t*)(uintptr_t)uc_rc;
+        p_num_uc(uc_rc, 1, 0, 0, 0, 0);
+        CHECK(uc_cmd && uc_cmd[1] == 1, "Uc PatchSetNumRegisters lowers a recorded count (7 -> 1)");
+
+        // Class check: the Sh patcher must refuse the Cx packet rather than corrupt its count.
+        const uint32_t cx_num_before = cmd[1];
+        p_num_sh(rc, 999, 0, 0, 0, 0);
+        CHECK(cmd[1] == cx_num_before,
+              "PatchSetNumRegisters refuses a packet of a different register class");
+    }
 
     // #395 F5: all three single-register direct NIDs append the native packet opcode and preserve
     // the by-value ShaderRegister's offset/value halves. Previously SH was dead code and Cx/Uc fell
