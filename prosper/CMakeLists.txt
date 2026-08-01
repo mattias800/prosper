@@ -546,8 +546,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_plugin_autolink PRIVATE prosper_core)
   if(HAVE_GAME_DUMP)
     add_test(NAME plugin_autolink COMMAND test_plugin_autolink "${GAME_DUMP}")
+    set_tests_properties(plugin_autolink PROPERTIES SKIP_RETURN_CODE 77)
   else()
     add_test(NAME plugin_autolink COMMAND test_plugin_autolink)
+    set_tests_properties(plugin_autolink PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 
   # ATRAC9 decode (vendored LibAtrac9 + prosper glue): an embedded 16-superframe slice of a real PS5

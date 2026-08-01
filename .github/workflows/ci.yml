@@ -19,10 +19,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config libavformat-dev libavcodec-dev \
-            libavutil-dev libswresample-dev libswscale-dev libva-dev
+            libavutil-dev libswresample-dev libswscale-dev libva-dev \
+            libvulkan-dev mesa-vulkan-drivers
 
+      # #1675: Vulkan was disabled here because it was never installed, not by choice — and that
+      # silently removed 27 tests (~1,700 assertions) from every "green" CI run, including every
+      # shader-recompiler and GPU-execution differential. They are designed for a software device
+      # (llvmpipe/lavapipe) and run in seconds locally, so CI can run them too.
       - name: Configure
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      # A configuration that quietly loses Vulkan would silently drop those tests again and still
+      # report 100% green. Fail the job instead of shrinking the suite.
+      - name: Verify the GPU tests are actually registered
+        run: |
+          n=$(ctest --test-dir prosper/build-ci -N | tail -1 | grep -oE '[0-9]+$')
+          echo "registered tests: $n"
+          if [ "$n" -lt 160 ]; then
+            echo "::error::only $n tests registered — the Vulkan-gated suite is missing (see #1675)"
+            exit 1
+          fi
 
       - name: Build
         run: cmake --build prosper/build-ci
