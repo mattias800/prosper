@@ -3395,6 +3395,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 inherited_persistent_id = old->second.persistent_id;
                                 inherited_persistent_version = old->second.persistent_version;
                             }
+                            // `decode_generation` is per SUBMIT since #1691, so an identity already
+                            // established earlier in this submit is not replaced by a later re-decode
+                            // of the same key. That protection is what makes retained pointers into
+                            // this cache safe. The re-decode itself still renders from its own
+                            // scratch bytes and still populates the submit-scoped map, so the only
+                            // cost is that the persistent copy stays stale until the next submit
+                            // re-validates it and misses. This is reachable only when a guest GPU
+                            // write invalidated the identity mid-submit, which is already the
+                            // expensive path.
                             const bool can_replace = old == persistent_decoded_textures.end() ||
                                 old->second.last_use != decode_generation;
                             if (old != persistent_decoded_textures.end() && can_replace) {
@@ -3472,12 +3481,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         }
                         if (decoded_pixels_valid && !resource_rtt_hit &&
                             !resource_compute_image_hit && !has_live_rtt) {
-                            // Pin the scratch slot for as long as this entry can be served: while the
-                            // persistent cache does not own the pixels, the slot IS the storage, and a
-                            // later span reusing it would rewrite what this entry points at.
-                            const size_t pinned_slot =
-                                decoded_pixels_in_texstore ? texture_slot : SIZE_MAX;
-                            if (decoded_pixels_in_texstore) texstore_pinned[texture_slot] = true;
+                            // Pin the scratch slot only for an entry that can actually outlive this
+                            // span AND whose pixels the persistent cache did not take: then the slot
+                            // IS the storage and a later span reusing it would rewrite what the entry
+                            // points at. An entry with no validated range is refused at its first
+                            // cross-span lookup, and within one span the cursor never hands the same
+                            // slot out twice — pinning those would strand one scratch allocation per
+                            // decode, which on a replay submit (every resource carries captured
+                            // backing, so none is retainable) is the whole submit's texture working
+                            // set instead of one span's.
+                            const bool pin_scratch =
+                                decoded_pixels_in_texstore && cross_span_source_size != 0;
+                            const size_t pinned_slot = pin_scratch ? texture_slot : SIZE_MAX;
+                            if (pin_scratch) texstore_pinned[texture_slot] = true;
                             decoded_textures.emplace(
                                 decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
                                                           fr.persistent_texture_id,
