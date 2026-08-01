@@ -1340,6 +1340,7 @@ int main(int argc, char** argv) {
         libraryUi.set_games(std::move(found), gamesDir);
     };
     if (wantLibrary) {
+        libraryUi.set_music_preference(appConfig.launcher_music);
         if (libraryUi.init(win, vk.instance, vk.phys, vk.device, vk.qfamily, vk.queue, vk.swapchain,
                            vk.scFormat, vk.scImages, vk.scExtent)) {
             rescan_library();
@@ -1712,6 +1713,16 @@ int main(int argc, char** argv) {
                 case prosper::frontend::LibraryAction::Kind::quit:
                     running = false;
                     break;
+                case prosper::frontend::LibraryAction::Kind::set_music: {
+                    // Persist the choice, keeping every other setting (including ones this build does
+                    // not understand) intact. A write failure is not worth interrupting the user over;
+                    // the toggle still applies for this run.
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.launcher_music = act.music_on;
+                    if (!save_app_config(cfg))
+                        fprintf(stderr, "[app] could not persist the music setting\n");
+                    break;
+                }
                 case prosper::frontend::LibraryAction::Kind::set_games_dir:
                 case prosper::frontend::LibraryAction::Kind::none:
                     break;

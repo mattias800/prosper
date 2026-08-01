@@ -274,6 +274,35 @@ copy path, so a binding-miss run with the same environment is the control for a 
   update `README.md`/compatibility docs as appropriate and attach direct unmodified frontend captures. A black frame
   needs no screenshot. A checker/forced-state/debug draw may be attached only as clearly labeled diagnostic evidence.
 
+### The environment is part of the system under test
+
+A sound, log line, or visual artifact that appears to come from the program may be **the desktop responding
+to the program's output**, not the program. Rule the environment out before building a theory on top of it.
+
+Worked example (#1630). A short chime was heard repeatedly during library-view test runs and was taken as
+evidence of an audio defect — a wrong sample rate, a truncated track, a fade discontinuity. It was none of
+those. It was **KDE's terminal bell** (`ocean/stereo/bell-window-system.oga`): Konsole's default bell mode
+is "System Notification", so any `0x07` reaching the terminal plays a real sound. Synthetic arrow keys from
+an `xdotool`-driven route that miss the app's window land on the shell instead, where readline rings the
+bell at the start of a line.
+
+What made it convincing is exactly what made it misleading: the user described it as sounding like "a real
+sound effect, identical every time", which reads as strong evidence for real decoded audio being replayed.
+It sounded like a real effect because it *is* one — just not ours. **A property that seems to discriminate
+between your hypotheses can be equally consistent with one you have not considered.**
+
+Practical consequences for any routed run on a developer's desktop:
+
+- Send every byte of a run's output to a file, never to a terminal, or strip `\007` from it. Free, and it
+  removes the confound permanently.
+- Guard synthetic input on the target window still existing (`xdotool getwindowname "$WID"`), so keys
+  cannot leak to whatever has focus after the app exits.
+- Prefer an instrument over an ear or an eye. The default sink can be recorded
+  (`parecord --device=<sink>.monitor`) and checked for non-silence, which turns "did it make a sound?" into
+  a measurement. Validate the instrument on a silent baseline first.
+- When output and observation disagree, suspect the harness before the subject — a capture synchronized to
+  a log line can easily record a *different* moment than the line it is labelled with.
+
 ## Recently merged foundation
 
 These changes are already on current master and should not be reimplemented:

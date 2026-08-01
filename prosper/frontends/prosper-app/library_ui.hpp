@@ -13,12 +13,18 @@
 // resources, and event translation.
 
 #include "game_library.hpp"
+#include "library_media.hpp"
 
 #include <SDL3/SDL.h>
 #include <vulkan/vulkan.h>
 
 #include <string>
 #include <vector>
+
+// ImGui's type, declared at global scope so the member below refers to the real one rather than
+// introducing prosper::frontend::ImFont. This header deliberately does not include imgui.h: only the
+// implementation needs it, and the app's other translation units should not pick it up.
+struct ImFont;
 
 namespace prosper::frontend {
 
@@ -29,11 +35,13 @@ struct LibraryAction {
         open,          // launch `app0_root`
         browse,        // asked for the folder picker (no games directory, or wants another folder)
         set_games_dir, // chose `path` as the games directory; persist it and rescan
+        set_music,     // toggled launcher music to `music_on`; persist it
         quit,
     };
     Kind kind = Kind::none;
     std::string app0_root;   // Kind::open
     std::string path;        // Kind::set_games_dir
+    bool music_on = true;    // Kind::set_music
 };
 
 class LibraryUi {
@@ -53,6 +61,11 @@ public:
               uint32_t queue_family, VkQueue queue, VkSwapchainKHR swapchain,
               VkFormat swapchain_format, const std::vector<VkImage>& swapchain_images,
               VkExtent2D extent);
+
+    // Seed the launcher-music preference from the persisted settings, before init() brings the media
+    // layer up. PROSPER_LAUNCHER_MUSIC still overrides this, matching how every other host setting in
+    // app_config.hpp is layered. Has no effect once init() has run.
+    void set_music_preference(bool on) { musicToggle_ = on; }
 
     // Release every Vulkan object. Safe to call twice, and safe to call without a successful init.
     void shutdown();
@@ -120,6 +133,32 @@ private:
     VkSampler        sampler_    = VK_NULL_HANDLE;
     std::vector<VkImageView>   views_;
     std::vector<VkFramebuffer> framebuffers_;
+
+    // Paint the focused title's own art behind the grid, and darken it enough that the UI stays
+    // readable over arbitrary artwork (#1630).
+    void draw_backdrop();
+
+    ImFont*                titleFont_ = nullptr;   // 2x atlas entry used only for the game titles
+
+    LibraryMedia           media_;
+    bool                   musicToggle_ = true;   // mirrors the persisted setting for the in-UI switch
+
+    // PROSPER_LIBRARY_STATS=1: per-frame timing for the library view, reported at shutdown. A mean
+    // cannot detect a stutter — a 40 ms frame among 5 ms ones averages away — so what is kept is the
+    // maximum and the count over one and two vsync intervals, which is what "is the UI smooth" means.
+    bool                   stats_        = false;
+    uint64_t               frameCount_   = 0;
+    uint64_t               frameOver16_  = 0;
+    uint64_t               frameOver33_  = 0;
+    double                 frameTotalMs_ = 0.0;
+    double                 frameMaxMs_   = 0.0;
+    uint64_t               frameMaxIndex_ = 0;   // which frame was the worst — startup or a load?
+    uint64_t               lastFrameNs_  = 0;
+    bool                   statsReported_ = false;
+    // For percentiles. Bounded, and recording simply STOPS at the cap: the reported percentiles
+    // then describe the first kMaxFrameSamples frames, which is stated rather than disguised.
+    static constexpr size_t kMaxFrameSamples = 200000;
+    std::vector<double>    frameSamples_;
 
     std::vector<GameEntry> games_;
     std::vector<Cover>     covers_;

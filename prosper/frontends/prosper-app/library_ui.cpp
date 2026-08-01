@@ -13,15 +13,21 @@
 #define STBI_NO_FAILURE_STRINGS
 #include "stb_image.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
 namespace prosper::frontend {
 namespace {
 
-constexpr float kCoverSize   = 160.0f;   // cover art is square (icon0.png is 512x512 in every dump)
-constexpr float kCellPadding = 24.0f;
-constexpr float kLabelHeight = 42.0f;    // two lines of wrapped title under each cover
+// Cover art is square (icon0.png is 512x512 in every dump), so 320 still samples the source DOWN and
+// cannot show resampling artefacts. The previous 160 read as very small on a desktop monitor.
+constexpr float kCoverSize   = 320.0f;
+// Wide gutters are what let the focused title's background art actually be seen between the cards
+// (#1630) — at the old spacing the grid covered almost all of it.
+constexpr float kCellPadding = 96.0f;
+constexpr float kLabelHeight = 84.0f;    // up to three lines of wrapped title at the larger font
+constexpr float kTitleFontPx = 26.0f;    // 2x ImGui's 13px default; integer scale keeps the bitmap crisp
 constexpr float kCellWidth   = kCoverSize + kCellPadding;
 constexpr float kCellHeight  = kCoverSize + kLabelHeight + kCellPadding;
 
@@ -113,6 +119,15 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     io.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad);
     ImGui::StyleColorsDark();
 
+    // Game titles are drawn at twice the UI font size. A SECOND atlas entry rather than
+    // SetWindowFontScale: ImGui's default font is a bitmap designed for 13 px, and scaling it at draw
+    // time blurs it, while baking it at an exact 2x integer multiple stays sharp. The first font added
+    // remains the default, so the header, footer and buttons are unchanged.
+    io.Fonts->AddFontDefault();
+    ImFontConfig titleCfg;
+    titleCfg.SizePixels = kTitleFontPx;
+    titleFont_ = io.Fonts->AddFontDefault(&titleCfg);
+
     if (!ImGui_ImplSDL3_InitForVulkan(window_)) { fprintf(stderr, "[library] SDL3 backend init failed\n"); shutdown(); return false; }
     sdlInit_ = true;
     ImGui_ImplVulkan_InitInfo vi{};
@@ -130,6 +145,25 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     if (!ImGui_ImplVulkan_Init(&vi)) { fprintf(stderr, "[library] Vulkan backend init failed\n"); shutdown(); return false; }
     vulkanInit_ = true;
     ready_ = true;
+
+    // Background art and focus music (#1630). Must come after the ImGui Vulkan backend, which owns the
+    // descriptor allocation the backgrounds register through. A failure here is not fatal: the library
+    // then looks exactly as it did before this feature existed.
+    const char* statsEnv = SDL_getenv("PROSPER_LIBRARY_STATS");
+    stats_ = statsEnv && *statsEnv && statsEnv[0] != '0';
+
+    // PROSPER_LIBRARY_STATS marks a measurement/automation run — a person browsing their games does not
+    // ask for a frame-time histogram. Such a run is silent unless PROSPER_LAUNCHER_MUSIC=1 explicitly
+    // asks for sound, so screenshot captures, timing sweeps and scripted routes cannot play audio on
+    // the developer's desktop by default.
+    const char* musicEnv = SDL_getenv("PROSPER_LAUNCHER_MUSIC");
+    musicToggle_ = resolve_launcher_music(musicEnv, musicToggle_, /*automated=*/stats_);
+    const float gain = resolve_launcher_music_gain(SDL_getenv("PROSPER_LAUNCHER_MUSIC_VOLUME"));
+    if (!media_.init(phys_, device_, queue_, qfamily_, sampler_, musicToggle_, gain))
+        fprintf(stderr, "[library] background art and music unavailable\n");
+    // Mirror the EFFECTIVE state, not the request: if the audio device could not be opened the checkbox
+    // must show unticked, or set_music_enabled() sees no change on the first click and swallows it.
+    musicToggle_ = media_.music_enabled();
     return true;
 }
 
@@ -204,7 +238,28 @@ bool LibraryUi::recreate_swapchain(VkSwapchainKHR swapchain, VkFormat format,
 }
 
 void LibraryUi::shutdown() {
+    if (stats_ && frameCount_ > 0 && !statsReported_) {
+        statsReported_ = true;   // shutdown() is idempotent and can run twice; the report should not
+        std::vector<double> s = frameSamples_;
+        std::sort(s.begin(), s.end());
+        const auto pct = [&](double p) {
+            if (s.empty()) return 0.0;
+            size_t i = static_cast<size_t>(p * (s.size() - 1));
+            return s[i];
+        };
+        fprintf(stderr,
+                "[library] frames=%llu mean=%.2fms median=%.2fms p99=%.2fms max=%.2fms(frame #%llu) "
+                "over-16.7ms=%llu over-33.3ms=%llu loads=%llu discarded=%llu\n",
+                (unsigned long long)frameCount_, frameTotalMs_ / (double)frameCount_,
+                pct(0.50), pct(0.99), frameMaxMs_, (unsigned long long)frameMaxIndex_,
+                (unsigned long long)frameOver16_, (unsigned long long)frameOver33_,
+                (unsigned long long)media_.loads_started(),
+                (unsigned long long)media_.loads_discarded());
+    }
     if (device_) vkDeviceWaitIdle(device_);
+    // Before the ImGui Vulkan backend goes away: the backgrounds hold descriptor sets allocated from
+    // it, and it also stops the worker and closes the audio device, so no music survives into a boot.
+    media_.shutdown();
     destroy_covers();
     // Each step is separately conditional: a failure part-way through init must still unwind whatever
     // was created, and shutdown() is called from those failure paths.
@@ -417,6 +472,48 @@ void LibraryUi::discard_acquired_frame() {
     if (vkQueueSubmit(queue_, 1, &su, inFlight_) != VK_SUCCESS) ready_ = false;
 }
 
+// Paint the focused title's key art full-bleed behind everything, then a scrim over it.
+//
+// The art is COVER-fitted, not stretched: pic1 is 16:9 and the window need not be, so the image is
+// scaled to fill and the overflow is cropped by sampling a sub-rectangle. Stretching 4K key art to an
+// arbitrary window shape looks obviously wrong, and letterboxing it would leave bars that read as a
+// rendering bug rather than a choice.
+//
+// The scrim exists because the artwork is arbitrary — some titles' pic1 is bright enough that white
+// UI text on it is unreadable. It darkens toward the app's normal background colour rather than
+// tinting, so the grid keeps the contrast it was designed with whatever is behind it.
+void LibraryUi::draw_backdrop() {
+    const Backdrop bd = media_.backdrop();
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const ImVec2 p0 = vp->Pos;
+    const ImVec2 p1 = ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y);
+
+    if (bd.texture && bd.alpha > 0.0f && bd.width > 0 && bd.height > 0 &&
+        vp->Size.x > 0 && vp->Size.y > 0) {
+        const float imageAspect = static_cast<float>(bd.width) / static_cast<float>(bd.height);
+        const float viewAspect = vp->Size.x / vp->Size.y;
+        ImVec2 uv0(0.0f, 0.0f), uv1(1.0f, 1.0f);
+        if (viewAspect > imageAspect) {
+            // The window is wider than the art: use the full width and crop top and bottom.
+            const float keep = imageAspect / viewAspect;
+            const float margin = (1.0f - keep) * 0.5f;
+            uv0.y = margin; uv1.y = 1.0f - margin;
+        } else if (viewAspect < imageAspect) {
+            const float keep = viewAspect / imageAspect;
+            const float margin = (1.0f - keep) * 0.5f;
+            uv0.x = margin; uv1.x = 1.0f - margin;
+        }
+        const int a = static_cast<int>(bd.alpha * 255.0f + 0.5f);
+        dl->AddImage(reinterpret_cast<ImTextureID>(bd.texture), p0, p1, uv0, uv1,
+                     IM_COL32(255, 255, 255, a < 0 ? 0 : (a > 255 ? 255 : a)));
+        // Scaled with the art so a title with no background does not flash a dark panel over the
+        // app's normal colour partway through a fade.
+        const int scrim = static_cast<int>(bd.alpha * 0.62f * 255.0f + 0.5f);
+        dl->AddRectFilled(p0, p1, IM_COL32(18, 18, 21, scrim));
+    }
+}
+
 LibraryAction LibraryUi::render_frame(const std::string& status) {
     LibraryAction action;
     if (!ready_) return action;
@@ -425,13 +522,46 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 
+    // Drive the media layer before anything is laid out, so the alpha the backdrop draws with and the
+    // gain the music ramped to were both evaluated at the same instant.
+    const uint64_t nowMs = SDL_GetTicks();
+    if (stats_) {
+        const uint64_t ns = SDL_GetTicksNS();
+        if (lastFrameNs_ != 0) {
+            const double ms = static_cast<double>(ns - lastFrameNs_) / 1e6;
+            ++frameCount_;
+            frameTotalMs_ += ms;
+            if (ms > frameMaxMs_) { frameMaxMs_ = ms; frameMaxIndex_ = frameCount_; }
+            if (ms > 16.7) {
+                ++frameOver16_;
+                // Named individually rather than only counted: a stutter is a tail event, and knowing
+                // WHICH frame was slow is what distinguishes one-off startup cost from a load hitch
+                // that would repeat every time the user moves the selection.
+                fprintf(stderr, "[library] slow frame #%llu: %.2f ms\n",
+                        (unsigned long long)frameCount_, ms);
+            }
+            if (ms > 33.3) ++frameOver33_;
+            // Stops recording rather than evicting: percentiles over a bounded prefix are honest
+            // about what they cover, whereas a ring buffer silently redefines the window mid-run.
+            if (frameSamples_.size() < kMaxFrameSamples) frameSamples_.push_back(ms);
+        }
+        lastFrameNs_ = ns;
+    }
+    if (!games_.empty() && selected_ >= 0 && selected_ < static_cast<int>(games_.size()))
+        media_.set_focus(games_[static_cast<size_t>(selected_)].app0_root, nowMs);
+    media_.update(nowMs);
+    draw_backdrop();
+
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
+    // NoBackground so the title's art is visible behind the grid (#1630). With no background loaded
+    // this reveals the render pass's clear colour, which is the same flat dark the window used to
+    // paint, so the view is unchanged for a title with no usable art.
     ImGui::Begin("prosper", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
-                 ImGuiWindowFlags_NoNavFocus);
+                 ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoBackground);
 
     ImGui::TextUnformatted(games_.empty() ? "prosper" : "Choose a game");
     if (!gamesDir_.empty()) {
@@ -481,7 +611,11 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
 
         const float gridHeight = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.0f;
         const int rowsPerPage = static_cast<int>(gridHeight / kCellHeight);
+        const int before = selected_;
         selected_ = library_nav_apply(key, selected_, count, columns, rowsPerPage);
+        if (stats_ && selected_ != before)
+            fprintf(stderr, "[library] selection %d -> %d (key=%d) at frame %llu\n", before, selected_,
+                    (int)key, (unsigned long long)frameCount_);
         firstRow_ = library_scroll_row_for(selected_, columns, rowsPerPage, firstRow_);
 
         if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
@@ -521,12 +655,21 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
                 action.kind = LibraryAction::Kind::open;
                 action.app0_root = game.app0_root;
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", game.title_name.c_str(),
-                                                          game.app0_root.c_str());
+            // The title and its FOLDER NAME, not the absolute path. The folder name is what identifies
+            // the dump (the content id is in it), while the rest of the path is the user's home
+            // directory — which would otherwise end up in every screenshot anyone shares of their
+            // library. The games directory is already shown once in the header for orientation.
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s\n%s", game.title_name.c_str(),
+                                  path_basename(game.app0_root).c_str());
 
+            // Wrapped to the cover's width so a long localized name ("Space Adventure Cobra - The
+            // Awakening") breaks onto further lines instead of running into the next column.
+            if (titleFont_) ImGui::PushFont(titleFont_);
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + kCoverSize);
             ImGui::TextUnformatted(game.title_name.c_str());
             ImGui::PopTextWrapPos();
+            if (titleFont_) ImGui::PopFont();
 
             ImGui::PopID();
             ImGui::EndGroup();
@@ -537,6 +680,14 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         ImGui::Text("%d game%s", count, count == 1 ? "" : "s");
         ImGui::SameLine();
         if (ImGui::Button("Change folder...")) action.kind = LibraryAction::Kind::browse;
+        ImGui::SameLine();
+        // Discoverable rather than env-only: someone who does not want a launcher making noise should
+        // not have to find a variable name to stop it. Reported to the caller so it is persisted.
+        if (ImGui::Checkbox("Music", &musicToggle_)) {
+            media_.set_music_enabled(musicToggle_, nowMs);
+            action.kind = LibraryAction::Kind::set_music;
+            action.music_on = musicToggle_;
+        }
         ImGui::SameLine();
         ImGui::TextDisabled("Enter opens  |  arrows move  |  Esc quits");
     }
