@@ -2764,9 +2764,15 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
     // PROSPER_BINDTRACE (#305): per-top-level-fold census. A stream that issues draws but contains
     // no shader-program bind of its own is running on the register state a PREVIOUS submit left —
     // legitimate on a shared ring, and the exact shape to check when a draw's user-data block does
-    // not match the pipeline it appears to be bound to. Counting the packets the fold APPLIED (not
-    // the ones the guest recorded) is the point: a stream whose leading packets were never decoded
-    // shows up here as draws-without-binds.
+    // not match the pipeline it appears to be bound to. A stream whose leading packets were never
+    // decoded shows up here as draws-without-binds.
+    //
+    // Caveat this census cannot avoid: it walks the DECODED packet list, and the indirect arrays it
+    // dereferences are re-read from guest memory AFTER the fold, not sampled at each packet's own
+    // apply() moment. If the guest mutates an array between the two, the counts describe the later
+    // contents. Every array measured on the reference title applied exactly one distinct
+    // (es_lo, rsrc2) across thousands of folds, so that has not bitten here — but a count from this
+    // census is a census, not a replay.
     static const bool bindtrace_fold = getenv("PROSPER_BINDTRACE") != nullptr;
     if (bindtrace_fold && st.jump_depth == 0) {
         using K = Pm4Command::Kind;
@@ -2774,8 +2780,12 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
         for (const auto& c : ops) {
             if (c.kind == K::SetRegsIndirect && c.reg_class == RegClass::Sh) {
                 ++sh_indirect;
-                if (c.regs_vaddr && c.num_regs &&
-                    guest_readable(c.regs_vaddr, c.num_regs * (uint32_t)sizeof(ShaderReg))) {
+                // Same bound apply() enforces before reading this guest array. Without it the
+                // byte count below overflows uint32 at num_regs >= 0x20000000, guest_readable is
+                // asked for 0 bytes, passes, and the loop walks 4 GiB — re-opening #312/#448.
+                if (c.regs_vaddr && c.num_regs && c.num_regs <= GpuState::kMaxRegsPerPacket &&
+                    guest_readable(c.regs_vaddr,
+                                   c.num_regs * (uint32_t)sizeof(ShaderReg))) {
                     const auto* r = reinterpret_cast<const ShaderReg*>(
                         static_cast<uintptr_t>(c.regs_vaddr));
                     for (uint32_t i = 0; i < c.num_regs; i++)
@@ -2804,15 +2814,19 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
                 sh_lo = std::min(sh_lo, off); sh_hi = std::max(sh_hi, off);
                 namespace P = prosper::agc::Pm4;
                 if ((off >= P::SPI_SHADER_USER_DATA_PS_0 && off < P::SPI_SHADER_USER_DATA_PS_0 + 32) ||
-                    (off >= P::SPI_SHADER_USER_DATA_GS_0 && off < P::SPI_SHADER_USER_DATA_GS_0 + 32))
-                    ++sh_gfx_ud;
+                    (off >= P::SPI_SHADER_USER_DATA_VS_0 && off < P::SPI_SHADER_USER_DATA_VS_0 + 32) ||
+                    (off >= P::SPI_SHADER_USER_DATA_GS_0 && off < P::SPI_SHADER_USER_DATA_GS_0 + 32) ||
+                    (off >= P::SPI_SHADER_USER_DATA_HS_0 && off < P::SPI_SHADER_USER_DATA_HS_0 + 32))
+                    ++sh_gfx_ud;   // all four graphics stages, not just the two this title uses
                 else if (off >= P::COMPUTE_USER_DATA_0 && off < P::COMPUTE_USER_DATA_0 + 16)
                     ++sh_compute_ud;
             };
             if (c.kind == K::SetRegDirect) {
                 for (uint32_t k = 0; k < c.reg_count; k++) note(c.reg_offset + k);
             } else if (c.kind == K::SetRegsIndirect && c.regs_vaddr && c.num_regs &&
-                       guest_readable(c.regs_vaddr, c.num_regs * (uint32_t)sizeof(ShaderReg))) {
+                       c.num_regs <= GpuState::kMaxRegsPerPacket &&
+                       guest_readable(c.regs_vaddr,
+                                      c.num_regs * (uint32_t)sizeof(ShaderReg))) {
                 const auto* r = reinterpret_cast<const ShaderReg*>(
                     static_cast<uintptr_t>(c.regs_vaddr));
                 for (uint32_t i = 0; i < c.num_regs; i++) note(r[i].offset);

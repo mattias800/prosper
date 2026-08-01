@@ -3540,15 +3540,29 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             size_t fits = 0;
             for (size_t si = 0; si < registry; si++) {
                 const auto* sh = static_cast<const AgcShaderHeader*>(prosper_agc_shader_at(si));
-                if (!sh || !sh->user_data || !sh->user_data->direct_resource_offset) continue;
+                // This walks the WHOLE registry (thousands of entries), and every pointer in it is
+                // guest-owned metadata that may point into a blob the guest has since freed. Probe
+                // each hop before dereferencing it — the resolved-header path above only ever
+                // touches one entry, this one touches all of them.
+                if (!sh || !guest_readable((uint64_t)(uintptr_t)sh, sizeof(AgcShaderHeader)))
+                    continue;
+                if (!sh->user_data ||
+                    !guest_readable((uint64_t)(uintptr_t)sh->user_data, sizeof(AgcShaderUserData)))
+                    continue;
+                const uint16_t direct_count = sh->user_data->direct_resource_count;
+                const uint16_t* direct_offsets = sh->user_data->direct_resource_offset;
+                if (!direct_offsets || !direct_count || direct_count > 64 ||
+                    !guest_readable((uint64_t)(uintptr_t)direct_offsets,
+                                    direct_count * (uint32_t)sizeof(uint16_t)))
+                    continue;
                 if (!sh->specials ||
                     !guest_readable((uint64_t)(uintptr_t)sh->specials, sizeof(AgcShaderSpecials)))
                     continue;
                 const uint32_t end = sh->specials->user_data_range_end;
                 if (!fresh || end != fresh) continue;   // must match what this bind actually wrote
                 bool all = true, any = false;
-                for (uint16_t t = 0; all && t < sh->user_data->direct_resource_count && t < 16; t++) {
-                    const uint32_t off = sh->user_data->direct_resource_offset[t];
+                for (uint16_t t = 0; all && t < direct_count && t < 16; t++) {
+                    const uint32_t off = direct_offsets[t];
                     if (off == 0xFFFFu) continue;
                     any = true;
                     if (off + 1 >= kUserSgprs) { all = false; break; }
