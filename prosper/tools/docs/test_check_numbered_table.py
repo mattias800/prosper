@@ -133,6 +133,25 @@ run("--sequential ambiguous between two numbered tables",
 
 print("correct shapes an earlier revision wrongly rejected:")
 
+# N1: backward attribution must be BOUNDED. Without an adjacency rule these produced 3 and 202
+# errors respectively on correct documents -- and two of the three told the author to delete the
+# blank lines that correctly ended the table. Wrong guidance is worse than a false positive,
+# because an agent who follows it damages the file.
+run("a pipe-leading paragraph after prose is not a table fragment",
+    "| # | a |\n|---|---|\n| 1 | x |\n\nSome prose paragraph.\n\n| this line merely starts with a pipe\n",
+    want_problems=False)
+
+run("a delimiter-less table far below an unrelated one is not attributed to it",
+    "| # | a |\n|---|---|\n| 1 | x |\n\n" + "prose line\n" * 20 + "\n| hand | written |\n| 1 | 2 |\n",
+    want_problems=False)
+
+# N2: the 4-space rule is load-bearing -- reverting it leaves a false positive on an indented code
+# block, and without this case the suite stays green while that happens.
+run("a 4-space indented code block after a table is not a fragment",
+    "| # | a |\n|---|---|\n| 1 | x |\n\n    | indented | code |\n    | block | here |\n",
+    want_problems=False)
+
+
 # Two properly delimited tables in one file are not a split table. This was a false positive in
 # the ALWAYS-ON structure class, so it would have fired on correct documents.
 run("two separate tables separated by prose",

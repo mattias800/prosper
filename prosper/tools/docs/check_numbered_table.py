@@ -169,21 +169,37 @@ def check(path: Path, sequential: bool, table_header: str | None) -> list[str]:
             origin = previous
         if current.proper or origin is None:
             continue  # a table of its own, or a fragment with no proper table above it
+
+        # What separates the runs does not decide whether this is a break, but it does decide
+        # whether they are ADJACENT -- and without that bound, backward attribution is unbounded:
+        # a delimiter-less table 200 lines below an unrelated one produced 202 errors, each
+        # accusing a prose line, with the real cause pushed past GitHub's 10-annotation limit.
+        # Two of them told the author to delete the blank lines that correctly ended the table,
+        # and wrong guidance is worse than a false positive: an agent who follows it damages the
+        # file. A fragment continues the table above only if it abuts it -- the whole gap is
+        # blank, or the line immediately above the fragment is itself the interruption.
         gap_start = previous.start + len(previous.lines)
-        for n in range(gap_start, current.start):
-            if n in blanks:
-                problems.append(
-                    f"{path}:{n}: blank line splits the table that starts at line {origin.start} "
-                    f"-- in Markdown a blank line ends a table, so line {current.start} onward "
-                    f"renders as a separate table. Delete the blank line."
-                )
-            else:
-                problems.append(
-                    f"{path}:{n}: line is not a table row but sits inside the table that starts at "
-                    f"line {origin.start}, ending it -- so line {current.start} onward renders as "
-                    f"a separate table and drops out of any sequence check. Did it lose its "
-                    f"leading '|'? Line reads: {lines[n - 1].strip()[:60]!r}"
-                )
+        gap = range(gap_start, current.start)
+        all_blank = all(n in blanks for n in gap)
+        interrupted_at = current.start - 1
+        if not all_blank and interrupted_at in blanks:
+            continue  # separated by prose that ends in a blank line: not this table's continuation
+
+        # One problem per fragment, not one per gap line: the fragment is the defect, and a gap of
+        # N blank lines is one mistake, not N.
+        if all_blank:
+            problems.append(
+                f"{path}:{gap_start}: blank line splits the table that starts at line "
+                f"{origin.start} -- in Markdown a blank line ends a table, so line {current.start} "
+                f"onward renders as a separate table. Delete the blank line."
+            )
+        else:
+            problems.append(
+                f"{path}:{interrupted_at}: line is not a table row but sits inside the table that "
+                f"starts at line {origin.start}, ending it -- so line {current.start} onward "
+                f"renders as a separate table and drops out of any sequence check. Did it lose "
+                f"its leading '|'? Line reads: {lines[interrupted_at - 1].strip()[:60]!r}"
+            )
 
     if not sequential:
         return problems
