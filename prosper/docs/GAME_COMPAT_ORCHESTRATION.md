@@ -287,6 +287,11 @@ The practical form:
 - A document, title, or comment that outlives its reasoning becomes **an assertion nobody is checking**.
   Retitling a falsified issue and correcting a stale PR body are correctness work, not tidying.
 
+Same family as trap #34 (a check of the *answer* read as a check of the *rule*) and the source-comment case
+under the generated-prose trap above: those are claims whose **scope** outran their evidence, this is claims
+whose **moment** outran theirs. In both the grammar is what does the damage — nothing in a confident sentence
+distinguishes the earned version from the unearned one.
+
 ### A test seam that pins a policy makes its env-var A/B silently void
 
 An A/B was run by setting `PROSPER_ULT_RETURN_SUCCESS=1` to force libSceUlt's mutex to a no-op, expecting the
