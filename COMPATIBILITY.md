@@ -34,7 +34,7 @@ Last updated: 2026-08-01
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
-| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 Autosave notice and profile-select menu render after implementing `sceAgcAcbWriteData`; the right portion of the frame is still black |
+| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 **Gameplay** — title screen and the first playable scene render with real GPU draws on a validated route; the profile menu's 3D layer and the gameplay composite are degraded (#1619) |
 | *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🔬 Runs a healthy ~113 fps Unity frame loop with a real post chain, but the guest's own composite is empty |
 
 ¹ Exact retail game name pending confirmation.
@@ -496,6 +496,20 @@ post-processing runs**, so the base pass is where to look. Tracked on #1606.
   <img src="assets/screenshots/syberia-profile.png" alt="Syberia: Remastered — profile-select menu (the right portion of the frame is still black)">
 </p>
 
+<p align="center">
+  <img src="assets/screenshots/syberia-title.png" alt="Syberia: Remastered — title screen, Valadilène (Linux, screenshot frontend, scripts/syberia/reach-gameplay.pad)">
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/syberia-gameplay.png" alt="Syberia: Remastered — first playable scene, the Voralberg factory hall (Linux, screenshot frontend, scripts/syberia/reach-gameplay.pad)">
+</p>
+
+**Rung 3 — gameplay.** `prosper/scripts/syberia/reach-gameplay.pad` drives the profile-select menu
+into the title screen (t≈280 s) and the first playable scene (t≈312 s onward): Kate Walker in the
+Voralberg factory hall, the "Leave" interaction prompt, the "Use the left stick to move" tutorial and
+the pause HUD. The composite is degraded — a translucent ghost of another scene is blended over the
+middle of the frame and the image is over-dark — tracked with the menu defect on #1619.
+
 On unmodified master this title **hard-hung** at boot: 7 submits, 2 flips, one present, frozen
 forever. The cause was `sceAgcAcbWriteData` being unregistered and silently returning 0, so the
 packet that *sets* a fence label was never built and Unity's main thread parked permanently in the
@@ -505,8 +519,11 @@ Registering it against the shared DCB builder — the same treatment the five si
 already had — takes the boot to **523+ submits, 5,028+ draws and 88 flips**, rendering the autosave
 notice with animated gears and then the profile-select menu with its boarding-pass save slots.
 
-The screenshot is captioned honestly: the right ~55% of the frame is still black, and whether that
-is a missing layer or the game's own art direction is not yet established.
+The right ~55% of the frame is black. That is now **established as a defect**, not art direction
+(#1619): the menu renders a full 3D scene — 2048x2048 shadow cascades, `R11G11B10F` HDR targets and a
+960x540 to 15x8 bloom pyramid — and the lit composite is **correct** at draw 465. It is then destroyed
+by an in-place compute pass, so the whole scene layer composites black and only the UI survives. No
+draw is scissored to the left; the animation does settle. Start from `prosper/docs/SYBERIA_STATUS.md`.
 
 ## Tales of Graces f Remastered — `PPSA19991`
 
