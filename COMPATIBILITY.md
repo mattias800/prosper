@@ -34,7 +34,7 @@ Last updated: 2026-07-31
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
-| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 Autosave notice and profile-select menu render after implementing `sceAgcAcbWriteData`; the right portion of the frame is still black |
+| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 Autosave notice and profile-select menu render after implementing `sceAgcAcbWriteData`; the menu's 3D scene layer composites black (#1619) |
 | *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🔬 Runs a healthy ~113 fps Unity frame loop with a real post chain, but the guest's own composite is empty |
 
 ¹ Exact retail game name pending confirmation.
@@ -491,8 +491,11 @@ Registering it against the shared DCB builder — the same treatment the five si
 already had — takes the boot to **523+ submits, 5,028+ draws and 88 flips**, rendering the autosave
 notice with animated gears and then the profile-select menu with its boarding-pass save slots.
 
-The screenshot is captioned honestly: the right ~55% of the frame is still black, and whether that
-is a missing layer or the game's own art direction is not yet established.
+The right ~55% of the frame is black. That is now **established as a defect**, not art direction
+(#1619): the menu renders a full 3D scene — 2048x2048 shadow cascades, `R11G11B10F` HDR targets and a
+960x540 to 15x8 bloom pyramid — and the lit composite is **correct** at draw 465. It is then destroyed
+by an in-place compute pass, so the whole scene layer composites black and only the UI survives. No
+draw is scissored to the left; the animation does settle. Start from `prosper/docs/SYBERIA_STATUS.md`.
 
 ## Tales of Graces f Remastered — `PPSA19991`
 
