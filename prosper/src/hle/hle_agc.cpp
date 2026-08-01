@@ -1615,6 +1615,51 @@ static void report_submit_order(const char* who, const SubmitCallStamp& st, uint
     }
 }
 
+// #1669 A/B ONLY — NOT A FIX, AND MUST NOT BE MADE DEFAULT-ON ON THE STRENGTH OF A NUMBER.
+//
+// #305 established that SubmitDcb (q1) and SubmitDcbFinal (q3) fold into the SAME graphics register
+// file, and that q3 is issued from threads that never issue q1. Whether sharing is correct depends on
+// an unestablished fact: is SubmitDcbFinal the same hardware ring as SubmitDcb — in which case it MUST
+// inherit q1's registers — or a distinct queue with its own register context, in which case merging
+// them is the defect? #1226 found exactly that symptom one queue over and fixed it by splitting the
+// register file, which raises the prior but does not settle it.
+//
+// This switch gives q3 its own GpuState so the question can be MEASURED: if the title's
+// recompile/vertex-reject counts collapse AND its world renders, that is evidence for the distinct-
+// queue answer; if they are unchanged, or draws fail in new ways, that is evidence for inheritance and
+// rules the direction out. Either result advances #1669 for one route.
+//
+// MEASURED (2026-08-01, Nikoderiko PPSA23760, two back-to-back 440 s routes, same binary):
+//
+//     metric                    control    split
+//     recompile-reject              524      529
+//     vertex-recompile-reject       138      135
+//     mubuf-unresolved              126      108
+//
+// No collapse — every delta is far inside the run-to-run variance of this route (an earlier control
+// on the same build measured 310/64/61). The frames are the decisive half and they are IDENTICAL:
+// the title screen renders and the 3D world is black in BOTH arms. The split is not a no-op — it
+// shifts the failure mix ([lazy-commit] 1118 -> 3476, [mimg-unresolved] appearing) — it simply does
+// not fix anything. So the direction is ruled out as a fix, and the switch is retained OFF as a
+// documented negative result, exactly like PROSPER_UD_TAIL_ALIGN.
+//
+// LIMIT OF THIS EXPERIMENT, stated because the pre-registered rule ("unchanged => inheritance") was
+// slightly too strong: a q3 buffer opens with user-data writes and a draw and has NO bind of its own,
+// so a freshly split state has no program bound under EITHER hypothesis. The result therefore rules
+// out the FIX cleanly, but is weaker evidence about ring semantics than the rule assumed. #1669's
+// section 1 still needs the guest-use / contract / disassembly evidence.
+//
+// It stays default-off until the SEMANTICS are established, however good the number looks. A numeric
+// improvement is not evidence of a correct model — that is the failure mode recorded as instrument
+// trap 15, and separating a queue that must inherit would create a new defect shaped exactly like the
+// one it appears to fix.
+static bool split_final_state() {
+    static const bool on = getenv("PROSPER_AGC_SPLIT_FINAL_STATE") != nullptr;
+    return on;
+}
+// Distinct from the Acb per-queue map: keyed by nothing, because there is exactly one Dcb-final
+// stream. Retained process-lifetime like the graphics state it shadows.
+static gpu::GpuState& agc_final_state() { static gpu::GpuState st; return st; }
 static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const char* who,
                                   uint64_t queue_id = 0) {
     if (!addr) return 0;
@@ -1623,7 +1668,17 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     const SubmitCallStamp call_stamp = stamp_submit_call();   // BEFORE the lock: see the note above
     std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
     const bool async_compute = strcmp(who, "SubmitAcb") == 0;
-    gpu::GpuState& state = async_compute ? agc_compute_state(queue_id) : agc_graphics_state();
+    const bool dcb_final = strcmp(who, "SubmitDcbFinal") == 0;
+    gpu::GpuState& state = async_compute            ? agc_compute_state(queue_id)
+                         : (dcb_final && split_final_state()) ? agc_final_state()   // #1669 A/B
+                                                             : agc_graphics_state();
+    if (dcb_final && split_final_state()) {
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true))
+            fprintf(stderr, "[agc] PROSPER_AGC_SPLIT_FINAL_STATE=1: SubmitDcbFinal is folding into its "
+                            "OWN register file (#1669 MEASUREMENT, not a fix — this configuration is "
+                            "not validated and must not be treated as correct behaviour)\n");
+    }
     // #1226: stamp this fold's submit entry point so fence-protocol history can distinguish the
     // graphics Dcb stream from the async-compute Acb stream. The queues share ordered memory
     // effects, but not register files: folding Acb SH writes into graphics state overwrote live
