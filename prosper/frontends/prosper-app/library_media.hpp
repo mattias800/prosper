@@ -51,6 +51,8 @@ class LibraryMedia {
 public:
     ~LibraryMedia();
 
+    // Call once per instance; a second call without an intervening shutdown() leaks this layer's pool
+    // and fence and reassigns the still-joinable worker thread, which terminates the process.
     // `sampler` is borrowed from the library UI (same filtering as the covers). Returns false only if
     // the Vulkan objects this layer owns could not be created. A machine with no audio device is NOT a
     // failure — it yields a silent library, the same outcome as a title with no snd0.at9 — so check

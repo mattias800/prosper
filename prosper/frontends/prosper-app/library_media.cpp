@@ -384,16 +384,30 @@ void LibraryMedia::start_load(const std::string& root, uint64_t now_ms) {
     // out and then in again against itself would dip the picture to black and leave an audible hole,
     // both for an asset that never left the screen. Instead REVERSE the transition — the same
     // back-dating trick applied to the fade-in half, so fade_state_at(now_ms) yields new_alpha equal to
-    // the alpha already showing, and the picture simply rises from where it is.
+    // the millisecond to the alpha already showing, and the picture simply rises from where it is.
+    // (`intoFadeIn` truncates to whole milliseconds, so new_alpha lands in [back - 0.004, back] — the
+    // same magnitude as the back-dating truncation above, and far below a visible step.)
     //
     //   want: new_alpha(now) == visible, i.e. (now - inStart) / kFadeInMs == visible
     //   so:   inStart      = now - visible * kFadeInMs        (and inStart == max(readyMs_, outEnd))
     //         transitionMs_ = inStart - kFadeOutMs            (so outEnd == inStart)
-    if (transitionActive_ && !outgoingRoot_.empty() && outgoingRoot_ == root &&
-        cache_.find(root) != cache_.end()) {
+    // The `now_ms >= kFadeOutMs + kFadeInMs` term is structural, not a live case: a reversal needs a
+    // focus change, its 180 ms debounce, and a running transition, so the earliest one is ~540 ms.
+    // Without the term, a clock starting inside the first 450 ms would clamp `transitionMs_`/`inStart`
+    // to 0 and evaluate a fade that had already elapsed; below 200 ms the fade-out branch would then
+    // read the just-cleared `outgoingRoot_`, hit `root.empty()`, and draw nothing. Falling through to
+    // the general path instead costs one ordinary cross-fade in a window that cannot occur.
+    if (transitionActive_ && now_ms >= kFadeOutMs + kFadeInMs && !outgoingRoot_.empty() &&
+        outgoingRoot_ == root && cache_.find(root) != cache_.end()) {
         const FadeState s = fade_state_at(transitionMs_, now_ms, incomingReady_, readyMs_);
         if (s.old_alpha > 0.0f) {
             const float back = s.old_alpha > 1.0f ? 1.0f : s.old_alpha;
+            // Clear FIRST, then resume: current_ may already hold the track of the title being
+            // transitioned toward, which this reversal abandons. A load started for a silent title
+            // leaves outgoing_ null, so the conditional move alone would leave that abandoned track
+            // in current_ — and because the early return below sees a non-null current_, no request
+            // is posted and nothing ever corrects it: the wrong music plays under this title's art.
+            current_.reset();
             if (musicOn_ && outgoing_ && outgoing_->root == root) current_ = std::move(outgoing_);
             outgoing_.reset();
             const uint64_t intoFadeIn = static_cast<uint64_t>(back * static_cast<float>(kFadeInMs));
