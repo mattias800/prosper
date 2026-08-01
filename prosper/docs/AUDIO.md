@@ -124,12 +124,13 @@ Read the counters, not just presence:
 - **Per-port attribution** locates loss the mixed bed hides: `skip-not-main` (a port with signal
   discarded for not being MAIN), `skip-fmt` (unsupported layout), `no-pcm` (no buffer published),
   `short` (a partial/faulting guest read).
-- **`skip-fmt` now means only "unsupported sample type".** Since #1700 every channel count the
-  decoder reports (1..16) is folded and mixed, so a `skip-fmt` port is one whose `data_format` low
-  bits are neither `0` (f32) nor `1` (s16). Such a port cannot be sized, so it is not read and its
-  signal columns stay zero — but it is no longer silent about it: the mix loop prints
-  `[audio2] portN DISCARDED: …` unconditionally, rate-limited per port. Implement the sample type;
-  do not leave it skipped.
+- **`skip-fmt` now means only "the grain cannot be sized".** Since #1700 every channel count from 1
+  to 16 is folded and mixed, so a `skip-fmt` port is one whose `data_format` low bits are neither
+  `0` (f32) nor `1` (s16), or whose declared width exceeds 16. Such a port is deliberately **not**
+  read — a wider grain read at the fold's stride would walk the guest's buffer and mix garbage — so
+  its signal columns stay zero. It is no longer silent about it: the mix loop prints
+  `[audio2] portN DISCARDED: …` unconditionally, rate-limited per port. Implement the format; do not
+  leave it skipped.
 - **`peak=inf` / `rms=inf` is a correct reading, not a probe bug.** Infinities are deliberately not
   filtered the way NaN is: the output path clamps `+Inf` to `+1.0`, so an Inf-producing guest is
   genuinely, loudly audible and belongs in the signal statistics. Because `LIFE:` never resets, one

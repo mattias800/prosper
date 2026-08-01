@@ -1016,9 +1016,15 @@ A2PortState* audio2_port_locked(uint64_t handle, uint32_t* slot_out = nullptr) {
     return &port;
 }
 
+// The DECLARED channel count, unclamped (an unset field is AudioOut2's stereo default). It used to
+// be clamped to the fold's maximum, which is exactly the disagreement #1700 was about — and a clamp
+// is the more dangerous half of it: silently reading a 20-channel grain as 16 channels would walk
+// the guest's buffer at the wrong stride and mix garbage, where the old over-8 reject at least
+// produced silence. Range is the consumer's decision, and it is made loudly at the one place that
+// sizes a read.
 uint32_t audio2_format_channels(uint32_t data_format) {
     const uint32_t encoded = (data_format >> 8u) & 0xffu;
-    return encoded ? std::min(encoded, (uint32_t)kAudioMaxBedChannels) : 2u;
+    return encoded ? encoded : 2u;
 }
 
 static void audio2_reset() {
@@ -1600,28 +1606,30 @@ HLE(audio2_ctx_push) {
             }
             const uint32_t data_type = ps.data_format & 0x7fu;
             const uint32_t channels = audio2_format_channels(ps.data_format);
-            // Sample TYPE is the only thing that can make a port unreadable here: the channel count
-            // decoder clamps to kAudioMaxBedChannels, and every count in that range is now folded
-            // (#1700). The old `channels > 8` gate discarded a whole MAIN port — 2.31 MB/s of real
-            // 12-channel content in Dragon Quest VII — while the decoder happily reported 12, so the
-            // decoder and its only consumer disagreed about the supported range.
-            static_assert(kAudioMaxBedChannels == 16, "channel-count clamp and fold range must agree");
-            if (data_type != 0 && data_type != 1) {
-                // A sample type we cannot size is the one case left where the buffer genuinely
-                // cannot be read, so this stays a reject — but a LOUD one. It is a fatal gap to
-                // implement, not a skip to live with, and it previously produced no message at all
-                // unless a probe happened to be enabled. Rate-limited per port, not suppressed.
+            // #1700: every channel count the fold can place is now mixed — the old `channels > 8`
+            // gate discarded a whole MAIN port (2.31 MB/s of real 12-channel content in Dragon
+            // Quest VII) while the decoder happily reported 12. What is left is the genuinely
+            // unreadable: a sample type prosper cannot size, and a declared width beyond the fold's
+            // range, which must be REJECTED rather than clamped — reading a wider grain at the
+            // fold's stride would walk the guest's buffer and mix garbage.
+            const bool readable = (data_type == 0 || data_type == 1) &&
+                                  channels >= 1 && channels <= kAudioMaxBedChannels;
+            if (!readable) {
+                // A LOUD reject. It is a fatal gap to implement, not a skip to live with, and it
+                // previously produced no message at all unless a probe happened to be enabled.
+                // Rate-limited per port, not suppressed.
                 static uint64_t reject_log[kA2MaxPorts] = {0};
                 if ((reject_log[this_pidx]++ % 4096) == 0)
-                    fprintf(stderr, "[audio2] port%d DISCARDED: data_format=0x%x has unsupported "
-                                    "sample type %u (0=f32, 1=s16); %u channels of guest PCM are "
-                                    "being dropped every push\n",
-                            this_pidx + 1, ps.data_format, data_type, channels);
+                    fprintf(stderr, "[audio2] port%d DISCARDED: data_format=0x%x is not readable "
+                                    "(sample type %u: 0=f32, 1=s16; %u channels, max %u); its guest "
+                                    "PCM is being dropped every push\n",
+                            this_pidx + 1, ps.data_format, data_type, channels,
+                            (unsigned)kAudioMaxBedChannels);
                 if (probe) fprintf(stderr, "[audio2-probe] port%d skipped: format=0x%x "
                                            "type=%u channels=%u unsupported\n",
                                            this_pidx + 1, ps.data_format, data_type, channels);
                 if (flow) {
-                    // Nothing to measure for a sample type we cannot even size; record the skip.
+                    // Nothing to measure for a grain we cannot even size; record the skip.
                     std::lock_guard<std::mutex> flk(g_flow_mx);
                     FlowPort& fp = g_flow_port[this_pidx];
                     flow_tag_port(fp, context_slot, ps.type, ps.data_format);

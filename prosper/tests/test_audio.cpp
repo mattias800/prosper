@@ -670,13 +670,31 @@ int main() {
     CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
     sink.outs.clear();
 
-    // A sample TYPE prosper cannot size is still a refusal, and it must stay one: the buffer cannot
-    // be read at all, so there is nothing to fold. This is the remaining fail-visible reject path.
-    a2_port_param.data_format = 0xc02;                    // twelve channels, unknown sample type 2
+    // What is left unreadable must stay a refusal: a grain prosper cannot size has nothing to fold.
+    // Both arms matter. A sample type it cannot decode is the obvious one. A declared width beyond
+    // the fold's range is the dangerous one — it must NOT be clamped and read, because reading a
+    // 20-channel grain at a 16-channel stride walks the guest's buffer and mixes garbage, which is
+    // strictly worse than the silence the old over-8 reject produced.
+    const uint32_t unreadable_formats[] = {
+        0xc02,      // twelve channels, unknown sample type 2
+        0x1400,     // twenty channels, f32: wider than kAudioMaxBedChannels
+    };
+    for (uint32_t fmt : unreadable_formats) {
+        a2_port_param.data_format = fmt;
+        CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&a2_port)) == 0);
+        CHECK(call("sceAudioOut2PortSetAttributes", a2_port, PTR(&a2_attr), 1) == 0);
+        CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
+        CHECK(sink.outs.empty());
+        CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
+        sink.outs.clear();
+    }
+    // The count reported back to the guest is the DECLARED one, not a clamp: a state query that
+    // silently reports 16 for a 20-channel port is the same decoder/consumer disagreement #1700 was.
+    a2_port_param.data_format = 0x1400;
     CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&a2_port)) == 0);
-    CHECK(call("sceAudioOut2PortSetAttributes", a2_port, PTR(&a2_attr), 1) == 0);
-    CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
-    CHECK(sink.outs.empty());
+    memset(&a2_state, 0xCC, sizeof a2_state);
+    CHECK(call("sceAudioOut2PortGetState", a2_port, PTR(&a2_state)) == 0);
+    CHECK(a2_state.num_channels == 20);
     CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
     sink.outs.clear();
     a2_port_param.data_format = 0x200;
