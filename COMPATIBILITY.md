@@ -5,7 +5,7 @@ describe specific, user-supplied PS5 dumps tested primarily on Linux. A mileston
 documented route is reproducible; it does **not** mean the entire game is playable or free of bugs.
 Different title revisions may behave differently.
 
-Last updated: 2026-07-31
+Last updated: 2026-08-01
 
 ## Summary
 
@@ -26,7 +26,7 @@ Last updated: 2026-07-31
 | *New Joe &amp; Mac: Caveman Ninja* | `PPSA02801` | Unity / IL2CPP | ✅ Title screen, menus and level 1 gameplay render at native 1920×1080 — reached on the first boot with no code changes |
 | *Asterix &amp; Obelix: Slap Them All!* | `PPSA08576` | Unity / IL2CPP | ✅ Title screen and first forest level render at native 1920×1080 — reached on unmodified master with no code changes |
 | *Summer Sports Games* | `PPSA03416` | Unity / IL2CPP | ✅ Mode select and live 3D athletics render at native 3840×2160 with no code changes |
-| *Worms Armageddon: Anniversary Edition* | `PPSA20052` | Custom (Digital Eclipse) | 🚧 Studio splash and title screen render at native 1920×1080; gameplay blocked because the guest never opens a pad |
+| *Worms Armageddon: Anniversary Edition* | `PPSA20052` | Custom (Digital Eclipse) | ✅ Scripted route reaches a live Quickstart match at native 1920×1080 |
 | *Earthion* | `PPSA28061` | Custom (Ancient) | 🚧 Developer logo, intro story text and CRT bezel render; the 320×224 game picture inside the bezel is still missing |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🔬 Boots deep into the UE4 frame loop with real GPU work; presented frames are still a flat colour |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Audio and sound bank initialise; the game's own code lives in a runtime-loaded PRX that prosper cannot yet load |
@@ -390,19 +390,33 @@ respawn banner appears, so guest logic and input are healthy end to end.
 ## Worms Armageddon: Anniversary Edition — `PPSA20052`
 
 <p align="center">
-  <img src="assets/screenshots/worms-armageddon-title.png" alt="Worms Armageddon: Anniversary Edition — title screen">
+  <img src="assets/screenshots/worms-armageddon-gameplay.png" alt="Worms Armageddon: Anniversary Edition — a Quickstart match in progress">
 </p>
 
-The Digital Eclipse studio splash and the full title screen render at native 1920×1080. Reaching
-them needed one small generic recompiler addition: VOP3 `v_sad_u32`, which this title's PSSL
-compiler emits as its vertex-shader index prologue. Without it the vertex stage was rejected and
-nothing rendered at all.
+A scripted route reaches a live Quickstart match against the AI at native 1920×1080: the terrain,
+water, both teams' named worms with their health tags, the turn timer, the wind gauge and the team
+health bars all render, and over a run worms take damage, turns change, the camera pans and the
+terrain is cratered by explosions.
 
-Gameplay is blocked for an unrelated reason: the guest calls `scePadInit` and then never calls
-`scePadOpen`, so no scripted input can reach it. Tracked on #1592.
+Getting there took two fixes. The title screen needed one small generic recompiler addition —
+VOP3 `v_sad_u32`, which this title's PSSL compiler emits as its vertex-shader index prologue.
+Without it every vertex stage was rejected and nothing rendered at all.
+
+Reaching gameplay then needed a correct `scePadGetHandle` (#1592). The game's pad manager asks it
+whether a handle already exists for each login user and calls `scePadOpen` only when the answer is
+negative, so prosper's old unconditional constant meant no pad was ever opened, every
+`scePadReadState` failed, and the title sat on `PRESS ✕ TO START GAME` forever. `scePadGetHandle`
+now looks up the handle actually opened for a `(userId, portType, index)` triple.
+
+Route: `prosper/scripts/worms-armageddon/reach-gameplay.pad` (Cross through the title screen, the
+main menu and the pre-selected `Quickstart` entry).
 
 This title is also a useful reverse-engineering surface in its own right — it ships its AGC shaders
 as loose `.ags` assets in the dump root, which can be inspected statically without a capture.
+
+<p align="center">
+  <img src="assets/screenshots/worms-armageddon-title.png" alt="Worms Armageddon: Anniversary Edition — title screen">
+</p>
 
 ## Earthion — `PPSA28061`
 
