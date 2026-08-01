@@ -109,6 +109,28 @@ highest-value page in this document.
 - Write `Refs #NN`, not `Fixes #NN`, when a PR only partially addresses an issue — a parenthetical qualifier does
   **not** stop GitHub's auto-close, and #1554 was closed that way despite a comment saying to keep it open.
 
+### Registering a NID with an error return can be worse than leaving it unregistered
+
+A trap of the same family as the list above, but in the HLE surface rather than an instrument. It cost a
+merged defect (#1618, introduced by #1614), so it belongs beside them.
+
+The dispatcher's default for an **unresolved** NID is `return 0` (`hle/dispatch.cpp` `prosper_on_unimpl`).
+That default is safe for a function whose contract returns a **value**, and unsafe for one that returns a
+**status** — which is exactly why fail-visible registration is usually an improvement. The trap is that the
+inverse is equally true, and easy to miss: **an error sentinel is unsafe for a value-returning contract,
+because such a signature has no error channel and the sentinel is read as data.**
+
+`sceUltWaitingQueueResourcePoolGetWorkAreaSize` returns a `size_t` in `rax` which the guest passes straight
+to `malloc`. Registering it to return `SCE_KERNEL_ERROR_ENOSYS` therefore asked for a 2.0 GiB allocation
+where the unregistered default had produced a harmless `malloc(0)` — the #544/#660 class, reintroduced by
+the very change meant to prevent it.
+
+**The rule:** before registering a NID purely to make it visible, establish from the call site whether its
+contract returns a status or a value. If it returns a value and the real one is unknown, the dispatcher's
+`0` — or better, an honest computed value — is correct, and the visibility belongs in the log line, not the
+return. Disassembling one call site is enough: `call …; mov [rbp-N],rax; …; call malloc` settles it in
+seconds, and no amount of reasoning about the function's *name* substitutes for it.
+
 ## The orchestration contract
 
 ### Orchestrator responsibilities
