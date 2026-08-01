@@ -84,9 +84,10 @@ restart any of these without contradictory new evidence** — this is the list `
 | Texture decode / alpha / render-target propagation | **Overturned**, same provenance as the geometry claims above. | #300 |
 
 **The actual root cause**, for contrast: a missing recompiler instruction (`V_CVT_OFF_F32_I4`, VOP1
-`0x0e`) in the LUT producer plus loss of per-target dimensions (`CB_COLOR0_ATTRIB2`), fixed by #528
-(`e5fce22`); then two follow-ups the black frame had been hiding — reversed `VkFrontFace` translation
-(#534) and depth/stencil validity tracked independently in persistent D32S8 surfaces (#541).
+`0x0e`, #526) in the LUT producer plus loss of per-target dimensions (`CB_COLOR0_ATTRIB2`, #527),
+fixed together by #528 (`e5fce22`); then two follow-ups the black frame had been hiding — reversed
+`VkFrontFace` translation (#534) and depth/stencil validity tracked independently in persistent D32S8
+surfaces (#541). The formerly invisible save-game list was #299.
 
 ## Evidence policy
 

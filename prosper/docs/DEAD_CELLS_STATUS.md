@@ -91,6 +91,43 @@ The important fixes already on `master` are:
 The producer-complete post-#626 checkpoint realizes every semantic draw and all eight dispatches. Descriptor
 validation has not identified a missing or undersized binding in the exercised frame.
 
+## Bring-up history (relocated here from `CLAUDE.md`, 2026-08-01)
+
+Retained so the attribution is not lost. Current usage for every tool named here is in
+[`../tools/gpu_replay/README.md`](../tools/gpu_replay/README.md),
+[`../tools/gpu_timeline/README.md`](../tools/gpu_timeline/README.md) and
+[`../tools/AGENTS.md`](../tools/AGENTS.md) — read those, not this section, for how to run anything.
+
+* Startup became reliable once **both** AGC resource-registration output queries were implemented
+  (#544, #660). The old success-only stubs left stack data in the max-name and required-memory
+  outputs, causing intermittent multi-gigabyte stack or texture-pool allocations.
+* The exercised **NGS2** audio lifecycle returns initialized sizes, handles and state, and silent
+  output (#554).
+* Version-4 `.prgcap` captures seeded temporal RTT inputs (#568) and historically isolated the earlier
+  warmup artifact at draw 18: one 642x362 input had no prior colour-target writer.
+* The kernel-derived dispatch thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and
+  compute direct type-1 V# binding (#574) let the real fill kernel execute against guest buffers
+  before submit completion (#576). Range provenance then proved draw 19 consumes one backing,
+  dispatch 5 fills it, and draw 31 consumes it again inside one submit — a future-read that #584 fixed
+  by executing graphics spans and compute in retained PM4 order.
+* Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact-submit selector
+  materializes immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a
+  `.prgcap` (#594/#569). `gpu_replay --graph` / `--graph-json` resolve in-submit versions and temporal
+  read-before-write leaves (#600). Ordered `.prgbundle` windows capture producer-time submits with
+  content-defined cross-submit deduplication and replay them through one persistent renderer (#603);
+  bundle v2 (#606) added fault-safe bulk guest reads plus an exact shared-resource chunk dictionary —
+  a fixed 1,200-submit full-state run folded 122.97 GiB into 301.1 MiB in 169.4 seconds. Semantic
+  endpoints, rolling windows, successful-only exit, final compaction and `--bundle-tail` prevent
+  timing drift and replay holes.
+* Capture v7 (#618) retains a failed stage fault-safely through `s_endpgm` or a 64 KiB cap; capture v8
+  (#569) closes the exact offline boundary and snapshots colour RTT state plus exact valid planes from
+  persistent Vulkan depth/stencil images; capture v13 (#773) tags RTT seeds `rgba8`/`rgba16f`; capture
+  v19 retains the exact bounded raw VS/FS source for every realized draw. Timeline v6 adds compact
+  per-draw target spans for offline scene selection. Standalone replay of the v8 capsule takes about
+  3.3 seconds instead of roughly 24 minutes.
+* `PROSPER_DESCRIPTOR_VALIDATE=strict|poison` and `gpu_replay --validate` are landed capabilities from
+  #515.
+
 ## Ruled out
 
 One line per dead hypothesis, the evidence that killed it, and where that evidence lives. Do not
