@@ -1755,6 +1755,76 @@ HLE(agc_patch_add_registers) {  // (cmd, num_regs): cmd[1] += num_regs
     cmd[1] += (uint32_t)a1; return 0;
 }
 
+// sceAgcSet{Cx,Sh,Uc}RegIndirectPatchSetNumRegisters — SET, not accumulate, the register count of a
+// packet returned by the matching Set*RegistersIndirect call.
+//
+// The record-then-patch idiom reserves the packet BEFORE the register array is known: the builder
+// emits Set*RegistersIndirect(dcb, <placeholder>, <placeholder count>), fills the array as the
+// draw's state is assembled, then patches in the final address and count. `PatchAddRegisters`
+// accumulates while the array grows; `PatchSetNumRegisters` writes the final count outright and is
+// the only member of the family that can LOWER one — so it is the only way an over-counted packet
+// can be corrected, and no amount of AddRegisters can substitute for it.
+//
+// All three were unregistered, so they took the unimplemented-import path (dispatch.cpp
+// prosper_on_unimpl: log once, return 0) and the packet kept its RECORD-TIME count. The failure that
+// leaves is silent in both directions: a packet reserved with count 0 applies NOTHING (the
+// SetRegsIndirect arm of GpuState::apply returns early on num_regs == 0), so a whole register write
+// disappears from the decoded stream; a packet whose count the guest lowered keeps its high-water
+// count and folds whatever follows the real registers in as further register writes.
+//
+// Every UE4 title dumped here imports these NIDs, but no title measured so far CALLS them (a
+// 460 s Nikoderiko/PPSA23760 boot through gameplay logs no unimplemented hit for nCUgItdN2ms), so
+// this is a gap fill against a real ABI, not a fix for any diagnosed defect. In particular it is NOT
+// the cause of the stale user-data block in #305 — that was measured to a different mechanism — and
+// the register-file bloat of #1264 was separately attributed to stale arena slots. Do not infer a
+// causal link to either from this handler's presence.
+//
+// The packet layout is the one the Set*RegsIndirect builder emits (cmd[1] = count,
+// cmd[2..3] = array vaddr), and the header sub-op is verified first, so a pointer that is not the
+// expected packet is refused loudly rather than silently corrupting the stream.
+// CONFIDENCE: HIGH on the count-slot semantics (the packet layout is prosper's own, the SET-vs-ADD
+// distinction is the name, and the sibling patchers in this family already write these same slots).
+// CONFIDENCE: MED that no live title needs it yet — absence of a call in the routes measured is not
+// proof of absence across titles, which is exactly why it should be implemented rather than left to
+// return 0.
+static uint64_t patch_set_num_registers(uint64_t cmd_addr, uint64_t num, uint32_t want_r,
+                                        const char* who) {
+    auto* cmd = (uint32_t*)(uintptr_t)cmd_addr; if (!cmd) return 0;
+    // These NIDs previously reached prosper_on_unimpl and touched nothing, so this is a NEW guest
+    // dereference on a path that used to be inert. Probe the packet header before reading it: a
+    // caller passing a freed or never-built packet must not take the host down (the sibling
+    // patchers predate this guard; see the follow-up issue).
+    if (!gpu::guest_readable(cmd_addr, 2 * sizeof(uint32_t))) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 8)
+            fprintf(stderr, "[agc] %s: packet 0x%llx unmapped — patch skipped\n", who,
+                    (unsigned long long)cmd_addr);
+        return 0;
+    }
+    // Report BEFORE the sub-op check, and report the refusal too: an investigation into a wrong
+    // register count most wants the case where the patch did not land.
+    static const bool regbloat = getenv("PROSPER_REGBLOAT") != nullptr;
+    const bool ok = patch_check(cmd, want_r, who);
+    if (regbloat) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 96)
+            fprintf(stderr, "[regbloat-patch] set_num_registers cmd=%p hdr=0x%08x old_num=%u new=%u%s\n",
+                    (void*)cmd, cmd[0], cmd[1], (uint32_t)num, ok ? "" : " REFUSED");
+    }
+    if (!ok) return 0;
+    cmd[1] = (uint32_t)num;
+    return 0;
+}
+HLE(agc_patch_set_num_registers_cx) {
+    return patch_set_num_registers(a0, a1, R_CX_REGS_INDIRECT, "SetCxRegIndirectPatchSetNumRegisters");
+}
+HLE(agc_patch_set_num_registers_sh) {
+    return patch_set_num_registers(a0, a1, R_SH_REGS_INDIRECT, "SetShRegIndirectPatchSetNumRegisters");
+}
+HLE(agc_patch_set_num_registers_uc) {
+    return patch_set_num_registers(a0, a1, R_UC_REGS_INDIRECT, "SetUcRegIndirectPatchSetNumRegisters");
+}
+
 // --- Sync-packet address patch family (issue #213/#222 — the DOLL per-draw fence cluster). ------
 //
 // RE'd from DOLL's statically-linked AGC fence builder (eboot+0x59a1780, gdb-verified live): the
@@ -2013,6 +2083,10 @@ void register_agc_hle() {
     RN("vcmNN+AAXnY", agc_patch_set_address);   RN("d-6uF9sZDIU", agc_patch_add_registers);   // Cx
     RN("Qrj4c+61z4A", agc_patch_set_address);   RN("z2duB-hHQSM", agc_patch_add_registers);   // Sh
     RN("6lNcCp+fxi4", agc_patch_set_address);   RN("vRoArM9zaIk", agc_patch_add_registers);   // Uc
+    // ...PatchSetNumRegisters: the SET (non-accumulating) count patcher of the same family (#305).
+    RN("whb1RL7K4Ss", agc_patch_set_num_registers_cx);   // sceAgcSetCxRegIndirectPatchSetNumRegisters
+    RN("nCUgItdN2ms", agc_patch_set_num_registers_sh);   // sceAgcSetShRegIndirectPatchSetNumRegisters
+    RN("fRG-JOH5+sI", agc_patch_set_num_registers_uc);   // sceAgcSetUcRegIndirectPatchSetNumRegisters
     RN("LtTouSCZjHM", agc_cb_nop);              // sceAgcCbNop — append padding dwords (#117)
     // Sync-packet address patchers + compute dispatch (issue #213 — the DOLL per-draw fence
     // cluster; RE write-up at each handler). These OVERRIDE the glog no-op thunks (map insert
