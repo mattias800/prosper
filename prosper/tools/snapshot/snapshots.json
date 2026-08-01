@@ -1237,6 +1237,324 @@
         960,
         540
       ]
+    },
+    {
+      "name": "gris-gameplay",
+      "dump": "PPSA09804-app0",
+      "scale": 4,
+      "timeout": 250,
+      "capture_after_seconds": 155,
+      "capture_before_seconds": 235,
+      "pad_script": "scripts/gris/reach-first-gameplay.pad",
+      "savedata_policy": "fresh",
+      "env": {},
+      "min_colors": 1200,
+      "min_qualifying_frames": 60,
+      "min_pixel_changes": 60,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 60,
+      "min_content_match_ratio": 0.75,
+      "min_nonblack_ratio": 0.9,
+      "review": "Approved all 16 composited images from two independent runs on 2026-08-01. Every image is GRIS's opening ink-ground scene at 480x270: the pale textured paper field that fills almost the whole frame, the hand-drawn ink horizon line with its soft grey wash beneath it, and the girl standing on that line slightly right of centre -- teal hair, black cloak, grey underskirt and thin ink legs -- matching the published assets/screenshots/gris.png composition. The frames are not identical stills: her cloak silhouette and hair shift between samples with the idle animation, and consecutive samples differed everywhere, 79 of 79 possible changes in both verify runs. The two runs are closely matched frame for frame at equal timestamps. Progression into this state was checked in the profile rather than the window: she is collapsed on the ground at 133s, rising at 145s, and standing from about 150s, which is the opening sequence the route drives with Right held from 78 to 150s. The window deliberately begins after that input ends, so what is guarded is the settled idle scene rather than a trajectory. No logo, NEW GAME title, menu, cinematic, black or loading frame appears in either run's window, and no frame showed flashing, tearing or a partially composited layer. Observed throughput was roughly 300 presents/s at scale 4 on this route, so GRIS is not frame-time constrained -- recorded because no snapshot guard measures frame time and a title can render correctly while being unplayably slow.",
+      "_note": "Fresh-save guard for GRIS (PPSA09804) opening ink-ground gameplay, using the committed scripts/gris/reach-first-gameplay.pad unchanged. Profiling that route once per second across a 240s boot at scale 4 (480x270) placed the phases at: black and studio logos to 20s, the animated NEW GAME title 21-24s (its 38,183-colour frame is the richest of the entire run), intro and descent sequences 28-130s, the player on the ink-ground scene from 132s, scripted Right held through 150s, and a settled idle scene from 150s to the end of the capture. The evidence window 155-235s opens 5s after the route's last input and 23s after the last pre-gameplay frame, and has no following transition at all -- all 80 samples measure 2,039-2,262 colours at exactly 1.0000 coverage, and every one matched the reviewed references at SSIM 0.9994 or better. This title is the project's strongest case of BOTH numeric floors going blind at once, which is why min_colors is set as a pure gross-collapse floor and SSIM does all the scene discrimination. Colour is blind upward: the title screen reaches 38,183 colours against a 2,262 gameplay ceiling, 17x higher, so no min_colors can separate them. Coverage is blind in both directions: GRIS is a bright paper page with no true black anywhere, so nonblack (strictly rgb != 0) measures exactly 1.0000 for the title, the logos, the intro AND the gameplay -- it cannot separate any two states of this title. min_colors 1200 is 41% below the observed gameplay floor and far above the run's collapse states (black at 1 colour, early logo frames at 85-238). min_nonblack_ratio is set to 0.9 rather than the derived 0.5: every reviewed frame measured exactly 1.0000 with zero variance, so 0.9 keeps a 10% margin while still rejecting blank output, and the derived half-floor would have been needlessly loose on a title that never renders a dark frame. The separation numbers are worst in-window SSIM 0.9994 against closest off-scene 0.5329 (an intro frame at 56.2s); the NEW GAME title screen scores 0.2007-0.2220. These thresholds derive from measured off-scene states within the same route, not from an A/B against an induced renderer defect, which cannot be produced without corrupting the build. The window is deliberately placed after the route's last input so the guarded span is a self-restoring idle scene rather than a trajectory; a window inside the 78-150s movement phase would make the scene at any wall-clock second a function of accumulated progress. min_pixel_changes 60 of a possible 79 rests on Gris's idle animation (cloth and hair), which changed every consecutive sample in the profile. Observed throughput on this route at scale 4 was roughly 300 presents/s (whole-run median 313), so this title is not frame-time constrained.",
+      "structural_references": [
+        {
+          "luma16x9": "f9f8f8f8f9f9f9f9f8f9f9f9f9f9f9f9f9f8f8f9f9f9f9f9f9f9f9f9f9f9f9f9f8f8f8f8f8f8f9f9f9f9f9f9f9f9f9f8f8f8f8f9f9f9f9f1cef9f9f9f9f9f9f9f9f9f9f9f9f9f9dfb8f9f9f9f9f9f9faf9f9f9f9f9f9f99d9ff9f9fafafafafaf9f9f9f9f9f9f75784fafafafafafafaf4f4f3f4f4f4f4d3cdf5f4f4f5f4f5f6f8f9f8f8f9f9f9f6f5f8f9f9f9f9f8f7",
+          "average_hash": "e7e7e7e7efffffff",
+          "difference_hash": "090c0c0888000101"
+        },
+        {
+          "luma16x9": "f9f9f9f9f9f9f9f9f9f9f9f9f8f8f8f9f8f9f9f9f9f8f8f8f9f9f9f8f8f8f8f9f9f9f9f9f9f9f9f9f9f9f9f9f8f8f9f9f9f9f9f9f9f9f9f1d0f9f9f9f9f8f9f9f9f9f9f9f9f9f9dfb8f8f8f8f8f8f8f9f9f9f9f9f9f9f99d9ef8f8f8f8f8f8f9f9f9f9f9f9f9f75b7af9f9f9f8f8f8f9f4f4f4f4f4f3f4d3cbf4f3f3f4f3f4f4f9f9f9f9f9f9f8f6f5f8f9f9f8f8f8f7",
+          "average_hash": "c7e7e7e7efffffff",
+          "difference_hash": "a88e2c0848404440"
+        },
+        {
+          "luma16x9": "f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9faf8f8f8f9f9f9f9f9f9f9f9f9f9fafaf9f9f8f8f8f9f9f9f9f9f9f9f9f9f9f9f9f9f8f8f8f8f8f8f1d0f9f9f9f9f9f9f9f9f8f8f8f8f8f8dfb8f9f9f9f9f9f9f9f9f9f8f9f9f9f99d9ef9f9f9f9f9f9f9f9f9f8f8f9f9f75b7af9f9f9f9f9f9f9f4f3f3f3f3f4f4d3cbf3f3f3f3f4f4f4f8f8f8f8f9f9f8f6f5f8f9f9f9f9f8f8",
+          "average_hash": "c5e7e7e7efffffff",
+          "difference_hash": "290d0d0908008000"
+        },
+        {
+          "luma16x9": "f9f9f9faf9f9f9f9f9f9f9f9f9f9f9f9f9f9f9faf9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9faf9f9f9f9f9f9f9f9f9f9f9f8f9f9f9f9f8f9f0cff8f8f8f8f9f9f9f8f9f9f9f9f8f8deb7f8f8f8f8f9f9f9f8f9f9f9f9f8f89d9ef8f8f8f9f9f9f9f8f9f9f9faf8f65680f8f8f8f9f9f9f9f3f3f3f4f4f4f4d1cbf4f3f3f4f4f4f4f8f9f9f9f9f9f9f6f5f8f8f9f9f9f8f7",
+          "average_hash": "c7e7e7e7efffffff",
+          "difference_hash": "080c0c0c0c000000"
+        },
+        {
+          "luma16x9": "f9f8f8f8f9f9f9f9f9f9f9f9f9f9f9f9f9f8f8f8f8f9f9f9f8f8f8f9f9f9f9f8f9f9f8f8f9f9f9f9f9f9f9f9f9f9f9f9f9f9f8f9f9f9f9f1d0f9f9f9f9f9f9f9f9f8f8f8f8f8f8dfb8f9f9f9f9f9f9f9f9f8f8f8f8f8f89d9ef9f9f9f9f9f9f9f9f8f8f8f9f9f85b7af9f9f9f9f9f9f9f3f3f3f3f4f4f4d5cbf4f3f3f4f4f5f5f8f8f8f8f9f9f8f6f6f8f9f9f9f9f8f8",
+          "average_hash": "e5e7e7e7efffffff",
+          "difference_hash": "098c0c0809011101"
+        },
+        {
+          "luma16x9": "f9f9fafaf9f9f9f9f9f9f9f9f9f9f9f9f9f9fafaf9f9f9f9f9f9f9f9f9f9f9f9f9f9f9faf9f9f9f9f9f9f9f9f8f9f9f9f9f9f9f9f9f9f9f0d0f8f8f8f9f9f9f9f8f8f9f9f9f8f8deb8f8f8f8f8f9f9f9f9f9f9f9f9f8f89c9ef8f8f8f9f9f9f9f9f9f8faf9f8f75b7af8f8f9f9f9f9f9f4f3f4f4f4f4f3d5cbf3f3f3f3f3f4f4f9f9f9f9f9f9f8f6f6f8f8f9f9f9f8f7",
+          "average_hash": "c7e7e7e7efffffff",
+          "difference_hash": "080c0c0c0c000202"
+        },
+        {
+          "luma16x9": "f9f9f9f9f9f9f9f9f9f9f9f9faf9f9f9f9f9f9f9f9f9f9f9f9f9f9f9faf9f9f9f9f9f9f9f9f9f9f9f9f9f9faf9f9f9f9f9f9f9f8f8f8f8f0cff9f8f9f9f9f9f8f9f9f9f8f8f8f8deb7f8f8f9f9f9f9f8f9f9f9f9f8f8f89d9ef8f8f9f9f9f9f8f9f9f9f9f8f8f55680f8f8faf9f9f9f8f3f3f3f3f3f3f3d1ccf4f3f3f4f3f4f4f9f9f9f9f9f8f8f6f5f8f9f9f9f9f8f7",
+          "average_hash": "e7e7e7e7efffffff",
+          "difference_hash": "080c0c0a89000000"
+        },
+        {
+          "luma16x9": "f9f8f8f8f9f9f9f9f9f9f9f9f9f9f9f9f9f8f8f8f8f9f9f9f8f8f8f9f9f9f9f8f9f9f8f8f9f9f9f9f9f9f9f9f9f9f9f9f9f9f8f9f9f9f9f1d0f9f9f9f9f9f9f9f9f8f8f8f8f8f8deb8f9f9f9f9f9f9f9f9f8f8f8f8f8f89c9ef9f9f9f9f9f9f9f9f8f8f8f9f9f85a7bf9f9f9f9f9f9f9f3f3f3f3f4f4f4d5ccf4f3f3f4f4f5f5f8f8f8f8f9f9f8f6f6f8f9f9f9f9f8f8",
+          "average_hash": "e5e7e7e7efffffff",
+          "difference_hash": "098c0c0809011101"
+        },
+        {
+          "luma16x9": "f9f9fafaf9f9f9f9f9f9f9f9f9f9f9f9f9f9fafaf9f9f9f9f9f9f9f9f9f9f9f9f9f9f9faf9f9f9f9f9f9f9f9f8f9f9f9f9f9f9f9f9f9f9f1cef8f8f8f9f9f9f9f8f8f9f9f9f8f8deb7f8f8f8f8f9f9f9f9f9f9f9f9f8f89c9ff8f8f8f9f9f9f9f9f9f8faf9f8f65684f8f8f9f9f9f9f9f4f3f4f4f4f4f3d2ccf4f2f3f3f4f4f5f9f9f9f9f9f9f8f6f5f7f8f9f9f9f8f7",
+          "average_hash": "c7e7e7e7efffffff",
+          "difference_hash": "080c0c0c0c000202"
+        },
+        {
+          "luma16x9": "f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9faf9f9fafafafafafafafafafaf9f9f9f9f9f9faf9fafafafafafafafaf9f9f9f9f9f9f9f1d1f9f9fafafafafaf9f9f9f9f9f9f9dfb8f9f9f9f9f9f9faf8f8f8f9f9f9f99e9ef9f9f9f9f9f9f9f8f8f8f8f8f8f75b7af9f9f9f9f9f9f8f3f3f3f3f3f4f4d3cbf4f3f3f4f4f4f5f8f8f8f8f9f9f8f6f5f8f8f9f9f9f7f7",
+          "average_hash": "c4e7e7e7efffffff",
+          "difference_hash": "280d0c8808000400"
+        },
+        {
+          "luma16x9": "f9f9f9faf9f9f9f9f9f8f9f9f9f9f9f9f9f9f9faf9f9f8f9f9f8f8f9f9f9f9f9f9f9f8faf9f8f8f8f9f8f8f9f9f9f9f9f9f9f9f9f9f8f8f0d1f8f8f8f9f9f9f9f8f8f9f9f9f8f8deb8f8f8f8f8f9f9f9f9f9f9f9f9f9f99d9ef8f8f8f9f9f9f9f9f9f9faf9f9f75b7bf9f9f9f8f9f9f9f3f3f4f4f4f3f4d4cbf4f3f3f3f4f5f5f8f9f9f9f9f9f9f7f5f8f9f8f8f9f8f8",
+          "average_hash": "c7e7e7e7e7ffffff",
+          "difference_hash": "280e0c0c0c041010"
+        },
+        {
+          "luma16x9": "f9f8f8f8f9f9f9f9f8f9f9f9f9f9f9f9f9f8f8f9f9f9f9f9f9f9f9f9f9f9f9f9f8f8f8f8f8f8f9f9f9f9f9f9f9f9f9f8f8f8f8f9f9f9f9f1d0f9f9f9f9f9f9f9f9f9f9f9f9f9f9dfb8f9f9f9f9f9f9faf9f9f9f9f9f9f99e9ff9f9fafafafafaf9f9f9f9f9f9f75781fafafafafafafaf4f4f4f4f4f4f4d2ccf5f4f4f5f4f5f6f8f8f8f8f9f9f8f6f5f8f9f9f9f9f8f7",
+          "average_hash": "e7e7e7e7efffffff",
+          "difference_hash": "090c0c0888000101"
+        },
+        {
+          "luma16x9": "f9f9f9f9f9f9f9f9f9f9f9f9f8f8f8f9f8f9f9f9f9f8f8f8f9f9f9f8f8f8f8f9f9f9f9f9f9f9f9f9f9f9f9f9f8f8f9f9f9f9f9f9f9f9f9f0d1f9f9f9f9f8f9f9f9f9f9f9f9f9f9dfb8f8f8f8f8f8f8f9f9f9f9f9f9f9f99d9ef8f8f8f8f8f8f9f9f9f9f9f9f9f85b7af9f9f9f8f8f8f9f4f4f4f4f4f3f4d5cbf4f3f3f4f3f4f4f9f9f9f9f9f9f8f6f5f8f9f8f8f8f7f7",
+          "average_hash": "c7e7e7e7efffffff",
+          "difference_hash": "a88e2c0848404440"
+        },
+        {
+          "luma16x9": "f9f9fafaf9f9f9f9f9f9f9f9f9f9f9f9f9f9fafaf9f9f9f9f9f9f9f9f9f9f9f9f9f9f9faf9f9f9f9f9f9f9f9f8f9f9f9f9f9f9f9f9f9f9f0d0f8f8f8f9f9f9f9f8f8f9f9f9f8f8deb8f8f8f8f8f9f9f9f9f9f9f9f9f8f89c9ef8f8f8f9f9f9f9f9f9f8faf9f8f75b7af8f8f9f9f9f9f9f4f3f4f4f4f4f3d5cbf4f2f3f3f4f4f5f9f9f9f9f9f9f8f6f5f7f8f9f9f9f8f7",
+          "average_hash": "c7e7e7e7efffffff",
+          "difference_hash": "080c0c0c0c000202"
+        },
+        {
+          "luma16x9": "f9f9f9f9f9f9f9f9f9f9f9f9faf9f9f9f9f9f9f9f9f9f9f9f9f9f9f9faf9f9f9f9f9f9f9f9f9f9f9f9f9f9faf9f9f9f9f9f9f9f8f8f8f8f0d0f9f8f9f9f9f9f8f9f9f9f8f8f8f8dfb7f8f8f9f9f9f9f8f9f9f9f9f8f8f89d9ef8f8f9f9f9f9f8f9f9f9f9f8f8f55780f8f8faf9f9f9f8f4f3f3f4f3f3f3d1cbf4f3f3f4f4f4f4f9f9f9f8f8f8f8f6f5f8f9f9f9f9f8f7",
+          "average_hash": "e7e7e7e7efffffff",
+          "difference_hash": "080c0c0a89000000"
+        },
+        {
+          "luma16x9": "f9f9f9f9f9f9f9f9f9f9f9f9f8f8f8f9f8f9f9f9f9f8f8f8f9f9f9f8f8f8f8f9f9f9f9f9f9f9f9f9f9f9f9f9f8f8f9f9f9f9f9f9f9f9f9f1d1f9f9f9f9f8f9f9f9f9f9f9f9f9f9dfb7f8f8f8f8f8f8f9f9f9f9f9f9f9f99d9ef8f8f8f8f8f8f9f9f9f9f9f9f9f85a7bf9f9f9f8f8f8f9f4f4f4f4f4f3f4d5ccf4f3f3f4f3f4f4f9f9f9f9f9f9f8f6f6f8f9f8f8f8f7f7",
+          "average_hash": "c7e7e7e7efffffff",
+          "difference_hash": "a88e2c0848404440"
+        }
+      ],
+      "dims": [
+        480,
+        270
+      ]
+    },
+    {
+      "name": "cobra-gameplay",
+      "dump": "PPSA17337-app0",
+      "scale": 4,
+      "timeout": 210,
+      "capture_after_seconds": 170,
+      "capture_before_seconds": 198,
+      "pad_script": "scripts/cobra/reach-title-or-gameplay.pad",
+      "savedata_policy": "fresh",
+      "env": {},
+      "min_colors": 14000,
+      "min_qualifying_frames": 21,
+      "min_pixel_changes": 21,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 21,
+      "min_content_match_ratio": 0.75,
+      "min_nonblack_ratio": 0.4,
+      "review": "Approved all 16 composited images from two independent runs on 2026-08-01. Every image is Space Adventure Cobra's opening desert tutorial at 480x270: the lit walkway platform running the full width of the lower frame with its segmented panels, the dark ship hull filling the upper left with a teal-suited figure beneath it and its landing lights, blue-suited enemy soldiers on and beside the walkway firing, flying gunship enemies over the dunes, the pale planet disc on the horizon, layered golden dunes and dark rock outcrops behind, the red player health bar at top left, and the readable 'Press (circle) to drop from a ledge.' tutorial prompt. The frames are live combat rather than a held pose: muzzle flashes, tracer bolts, explosions and enemy positions differ in every sample, and consecutive samples changed everywhere -- 27 of 27 possible changes in both verify runs. The two runs are closely matched frame for frame at equal timestamps, which matters more here than for a static scene because the guarded span is combat. The dark band across the bottom of every frame is the underside of the walkway, not a letterbox bar and not missing output; it is the reason this title's gameplay coverage is lower than its menus and why the coverage floor is deliberately left low. No logo, movie, title, menu, dialogue box, black or loading frame appears in either run's window. Throughput was visibly poor during capture and was measured rather than dismissed: 6-12 presents/s (median 9) at scale 4, against 59.9 for Worms Armageddon and about 300 for GRIS on the same machine and scale. Nothing in this guard tests frame time, so that figure is recorded here as the only frame-time datum this title has. No flashing, tearing or partially composited frame was seen.",
+      "_note": "Fresh-save guard for Space Adventure Cobra -- The Awakening (PPSA17337) opening desert tutorial combat, using the committed scripts/cobra/reach-title-or-gameplay.pad unchanged. Profiling that route once per second across a 200s boot at scale 4 (480x270) placed the phases at: skippable logo and movie screens to about 57s, the title and new-game setup 57-61s, the desert scene from 62s, the Lady dialogue and the readable 'Press R2 to shoot with the Psychogun.' prompt through the 80s, scripted R2 and alternating left/right stick movement 82-124s, and a settled camera from about 166s to the end of the capture. The evidence window is 170-198s. It is placed after the route's last input at 124s so the guarded span is a held camera rather than a trajectory: windows inside the scripted movement phase were measured and rejected, 96-124s matching only 19 of 28 frames and 126-150s only 15 of 24, because the stick input pans the camera and makes the scene at any wall-clock second a function of accumulated progress. All 28 window samples measure 23,047-27,302 colours at 0.8152-0.9037 coverage with 27 of 27 possible pixel changes. This title inverts the usual coverage argument and must not be given a high coverage floor. Its gameplay coverage (0.8152-0.9037) is LOWER than its logo, movie and title screens (0.9908-1.0000), because the bottom of the combat frame is the dark underside of the walkway platform while the menus are full-bleed art. A floor set to protect a bright scene would reject the very state this guard exists for, so min_nonblack_ratio stays at the derived 0.40. Colour is blind here too: the pre-gameplay movies reach 27,195 colours, which overlaps the 23,047 gameplay floor outright, so no min_colors can separate them and 14000 is set purely as a gross-collapse floor 39% below the observed gameplay floor. SSIM therefore does all the scene discrimination, as it does for the other two titles profiled in this batch. The separation numbers are worst in-window SSIM 0.8606 against a closest genuinely off-scene state of 0.3074 (a pre-gameplay movie frame at 57.2s). These derive from measured off-scene states within the same route, not from an A/B against an induced renderer defect, which cannot be produced without corrupting the build. Mid-combat frames from earlier in the same scene score up to 0.8745, which is above the in-window worst; that is deliberate and harmless, because those frames are the same gameplay state seen from a slightly different camera, not a failure state. Run-to-run stability was measured before adoption rather than assumed: frames from a second independent run scored a worst of 0.8602 against references built only from the first run, with 28 of 28 clearing 0.85 where 21 are required, so the window has seven frames of slack in the dimension min_content_match_ratio actually tests. The 0.85 floor has a smaller margin here than for the other two titles because this is live combat with moving enemies and projectiles; the count slack, not the worst-frame margin, is what carries this guard. Observed throughput was only 6-12 presents/s (median 9) at scale 4 on this route, by far the slowest of the three titles profiled in this batch -- Worms Armageddon measured 59.9 and GRIS about 300 on the same machine and scale. That figure is recorded because no snapshot guard measures frame time, and a title can pass every content check while being unplayably slow. It is a throughput observation, not a guarded threshold.",
+      "structural_references": [
+        {
+          "luma16x9": "020f12140f070a14194642413a3029240202010204131410205145454f463e3605030206141f27244b505f67625c58530e0e291a1925282c747d7d755951546c5e572a09280930442e6a67250d2d54574d302e0834094d7b7879670c10425f5d5a59594f594e5765556766594c425652262e353834352d384a483e3a322f292c0604070506070208111b070207030505",
+          "average_hash": "00ffffb9f8f0f060",
+          "difference_hash": "66e4632362c1c1e6"
+        },
+        {
+          "luma16x9": "020f141611080a141845423f3c30292403020102031314132051454c4d463e3606040204101d251f4a505f67625f58530d0d1a0f1e3925306b6467666353526a16142007291154648e84747565614a3f1e1e2707120b7b716c8e808789705e46455162575855555e546667696c5b594f1e23282a2829232a292a2c2b2725212106030905070704070505070306040505",
+          "average_hash": "007efff8f8f0f060",
+          "difference_hash": "22c4c2e3e041c1e6"
+        },
+        {
+          "luma16x9": "030f121410080a15174542403630292403020102031314122051464b4d463e3606040206121d261c48505f67625f58530e0e190c1a1b243169607c786b595448684a4e07280961422c303c343b230d0e7573430c0d0d74924e4337272f161a0c52546069676263745d70766c6759584f0d0e15161211111211141716110f0f0e09060b09090c070c09090b050b070908",
+          "average_hash": "0022ff0b78f0f070",
+          "difference_hash": "32c6f3f3c341c1e6"
+        },
+        {
+          "luma16x9": "020f12130c070b141946423e3630292403020101051414102051434e4d463e36060504071521271e49505f675f5b5853151d341b162c342e696d5d6c6d67515d23212f06230837525a81856c71422b43302219191d196585917264847d857c52535557595d5f59645b665d5c6059555407080b0a0b0809080a0b0c0a0907080706030706060704070506070307030604",
+          "average_hash": "0000fff8f8f0f070",
+          "difference_hash": "22e4b1d3e241c1e6"
+        },
+        {
+          "luma16x9": "020f12130c070a141a46424036302924030201010514140f2152434b4d463e3607040407162128234b505f67625c5853101734383129322a68636e546366706c503a2d08310754744d354f443d51283c7c863207260c6593912f3e807b7773584a585f68666761745c716f6c645a565c0e111616141412141416181613110e1009050c09090b060c080a0b060b060908",
+          "average_hash": "0000fff9faf0f020",
+          "difference_hash": "22c693d334c1c1e6"
+        },
+        {
+          "luma16x9": "020f121410080a14194642403d30292402020102041314102051454d4d463e3605030206141f27244b526067625f58530e0e2006191d302c747d7c67584a606b5c401d062608472f4e7a371d1d4d5c5c276d480d4f0a717582712a183a615e69575d52525c50576657645b4c53585a521a212e32282b242e272d363325211c1f08060a07080a050a07080a0409050707",
+          "average_hash": "007effd9f8f0f060",
+          "difference_hash": "72c6352323c1c0e6"
+        },
+        {
+          "luma16x9": "020f121510080b14184542413b3029240302020203131412205145464f463e3606030206121d251c48505f67625c58530f0e1f0c24262131706279796f5b59456e59330d3b0d544d42263a34352a1b0b8678490a0f09589584473d2b281b16135f5856484d4d576d6675636168635d4d28323e433a3d34415245484538332a3006020805060703261b0d070207030505",
+          "average_hash": "00fffb1970f0f060",
+          "difference_hash": "36e6f3f3c5c1c0e6"
+        },
+        {
+          "luma16x9": "020f12140f080b14184543403d3029240202010204131412205145484d463e3606030206121d261c49505f67625d585310101f24172527305d767e786c45515f565b460a2e0b452a342b4f2d200a20505a3228095a0b414541282c151c09265e3f3f494e704e5b6d5a6c6b6464454146262f3c40373b313e383c45473530292d04020703050502050304050105020304",
+          "average_hash": "00fffd81f8f0f070",
+          "difference_hash": "56c6755762c1c1e6"
+        },
+        {
+          "luma16x9": "020f141611080a14184542413a30292402010102031314112050454a4d463e3604030204111d25214a505f67615a58530d0c15192439242e6165647665496c68151415072c09646b787f6e665a4a2f26394d44093d0b5c98928d8170593e201a53595b5d645f5d6a6b696a60634e4e4e101116171415141615161b191412141006040906070805080606080407050606",
+          "average_hash": "0000ff78f8f0f060",
+          "difference_hash": "26c4f1e2c041c1e6"
+        },
+        {
+          "luma16x9": "020f12140f080a141a464240363029240201010204131410205143494d463e3606030206141f27214a505f67615e5853101115211d19282c616a7f786c5150545c5736082c094c3e283d2e582a160a31715c2011190c62613e3c2f28141a0c35504f575a605e5b695d7263626459504a0c0f121112100f1011221312110e0c0d06040906060805080606080407040706",
+          "average_hash": "0010ff09f8f0f070",
+          "difference_hash": "22e4f15bc141c1e6"
+        },
+        {
+          "luma16x9": "020f12130b070a14194642403630292404020101051414102050444d4d463e36080504071521281f4a505f67625f5853132032151936352d63705776695858511e27130624073d5d6e897771682b3a41201a160a140d6a96766b7e8087857629544b545962575d6b4b646161655f5c5e1214161717161417181818171614121209060c09090c060c08090b060b060908",
+          "average_hash": "0000fff8f8f0f060",
+          "difference_hash": "22e4b1c3c241c1e6"
+        },
+        {
+          "luma16x9": "020f12130e070b141a4542443730292403020102041314112151444a4d463e3606040307141f271f49505f67625c5853121226071f1c1d2e5e807f7a6c5e594476582a072b092e4d365236395b52330a827933091c0a55827d836a6a7868521060595a5157546971627c666164585d561e2633382d3128342d343d382a26202506040906070704070506070407040605",
+          "average_hash": "007eff7970f0f060",
+          "difference_hash": "26e6a3b3e5c1c1e6"
+        },
+        {
+          "luma16x9": "020f12140f080a1419464243393029240201010204131411215044494d463e3606030206131e261f4a4f5f67625c58530f101325131c252f797c7e786a4f51595859420c27093031522b4e6a4d0d1341798227084f0b537e7370786f5f0c22535f645049634c5e6c54805f5f6759433d1f27343a2f322b352f3c3f392b26222607030a06070904090607090309040606",
+          "average_hash": "00fffd39f0f0f060",
+          "difference_hash": "36e6e15341c1c1e6"
+        },
+        {
+          "luma16x9": "020f131611080b14184542403c3029240202010203131412205146484e463e3605030205111d25204a505f67625c58530d0c110a1934262f766b766657566d512b393509280b4f685011224b616e645b71713007090f643414234f687e776c605b62564d5b4c5a663f4d63616a5a5c4028313e43393c323d3a3d464337312c2f06030805060703080505070207030506",
+          "average_hash": "00fffbe9f8f0f060",
+          "difference_hash": "36c68b9390c1c0e6"
+        },
+        {
+          "luma16x9": "020f131611080a14184542403d30292403020102031314121f5245474d463e3605040205111d26214b505f67625c58530d0c1c272530242c60657d695857706b2e3f1e112f0c5f7876606e5a3926313d73883d14280c6d8c806a4a292c633e31434b4d4f564d6869525f52484a4a6052293137383839313a393b3d3c36332c2f04030603050503050304050205020304",
+          "average_hash": "00ffff79f8f0f060",
+          "difference_hash": "16c433f360c1c1e6"
+        },
+        {
+          "luma16x9": "020f12130c070b141946424236302924030201010514140f2151464b4d463e36060404071521271e4a505f67625e58530e1b24242c46272c5777716056506f6c141a2906260b686e7266343f4d3d51324a5a40091c0b608f8a937629427c706851545a5f6562586655656160605555550d0f13141211101112131814110f0e0e06030906070704070506070307040605",
+          "average_hash": "0000fff8fcf0f060",
+          "difference_hash": "36e4a3b360c1c1e6"
+        }
+      ],
+      "dims": [
+        480,
+        270
+      ]
+    },
+    {
+      "name": "worms-armageddon-gameplay",
+      "dump": "PPSA20052-app0",
+      "scale": 4,
+      "timeout": 190,
+      "capture_after_seconds": 78,
+      "capture_before_seconds": 125,
+      "pad_script": "scripts/worms-armageddon/reach-training-gameplay.pad",
+      "savedata_policy": "fresh",
+      "env": {},
+      "min_colors": 400,
+      "min_qualifying_frames": 36,
+      "min_pixel_changes": 36,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 36,
+      "min_content_match_ratio": 0.75,
+      "min_nonblack_ratio": 0.9,
+      "review": "Approved all 16 composited images from two independent runs on 2026-08-01. Every image is the same 'Grenade skills grade 1' Training level at 480x270: the purple and grey rock hills running across the lower third, the animated pale-blue water below them, the dusk sky graded from brown at the horizon to deep blue-grey, drifting cloud sprites along the top, falling particle flecks throughout, the player's worm standing at its start position on the central hill with its team name tag and the red aiming marker beside it, the target structure on the tower at the right, the mission timer at bottom left and the team health bar at bottom centre. The two runs are identical map for map -- same terrain silhouette, same worm position, same target placement -- which is the entire reason this route was chosen over Quickstart, whose terrain differed completely between two runs. They are also in lockstep in time: the eight reviewed timestamps carry the same timer values in both runs (50, 47, 43, 41, 34, 28, 21, 8). That countdown is the clearest evidence in the window that the level is live rather than a frozen frame, and it is visible progression across the whole window; consecutive samples also differed everywhere, 46 of 46 possible changes in both runs, from the water animation, cloud drift and particles. The route sends no directional input inside the level, so the worm does not move and the guarded span is one visual state rather than a trajectory. The first sample of each run still carries the '1-UP: 15 sec' turn banner at the top; it was accepted as part of the live level and appears in both runs. No title screen, main menu, mode grid, Training setup screen, mission brief prompt, black or loading frame appears in either run's window, and the post-mission end state is 7s beyond the window's right edge. Observed throughput was 59.9 presents/s with no drops, and no flashing, tearing or partially composited frame was seen.",
+      "_note": "Fresh-save guard for Worms Armageddon: Anniversary Edition (PPSA20052) reaching a playable Training level, using scripts/worms-armageddon/reach-training-gameplay.pad. It deliberately does NOT use the published Quickstart route, and that choice is a measured result, not a preference. Quickstart generates its terrain randomly per run: two independent fresh-save profiles of scripts/worms-armageddon/reach-gameplay.pad produced a pirate/treasure map and a fairytale/castle map, confirmed by eye, and all 70 frames of the second run's 40-110s window scored at most 0.6567 SSIM against references built from the first run, 0 of 70 clearing the 0.85 floor. That route reaches gameplay correctly and its milestone stands; it simply cannot carry a fixed-reference guard. The trap it sets is specific and worth recording: because verify builds its references from BOTH of its runs, a Quickstart baseline PASSES verify (both runs match the union of their own references, 70 of 70 each) and would then fail on the first check, whose third random map matches neither. Verify passing twice is not evidence a window is stable. Training levels are authored fixed maps. Under the training route two independent runs matched at 0.9612-1.0000 with 47 of 47 frames clearing 0.85 -- the same cross-run test, the opposite answer. Profiling once per second across a 180s boot at scale 4 (480x270) placed the phases at: Digital Eclipse splash 8-13s, title screen from 14s, main menu 21-26s, game-setup grid 27-32s, Single Player screen with the Training tab 39-62s, the 'Grenade skills grade 1' mission brief 63-70s, and the playable level from about 72s until its 60-second mission timer expires around 132s. The evidence window 78-125s sits entirely inside that level, opening 6s after it becomes playable and closing 7s before the timer expires. All 47 samples measure 703-801 colours at 0.9966-0.9975 coverage with 46 of 46 possible pixel changes, and every one matched the reviewed references at SSIM 0.9612 or better. This title is the most extreme case of colour count going blind upward that the project has measured. Worms Armageddon is a faithful palette-era 2D remaster, so its gameplay is an 801-colour scene at scale 4 while its own title screen reaches 75,875 -- a factor of 95, against Rugrats' 3.2x and Joe & Mac's 1.13x. min_colors 400 is therefore a pure gross-collapse floor, 43% below the observed gameplay floor, and is not capable of separating any two real states of this title. Coverage cannot separate them either (title 0.9833, mode grid 0.9880, gameplay 0.9966), so SSIM does all the discrimination and min_nonblack_ratio 0.9 exists only to reject blank output, with a 9% margin under the observed 0.9966 floor. The separation numbers are worst in-window SSIM 0.9612 against a closest genuinely off-scene state of 0.6717 (the mission brief prompt at 71.2s); the title screen scores 0.1124, the main menu and mode grid 0.1779, and the Training setup screen 0.0070. These derive from measured off-scene states within the same route, not from an A/B against an induced renderer defect, which cannot be produced without corrupting the build. The post-mission end state at 132.3s scores 0.9800 because it is the same level under an overlay; that is deliberate tolerance at the window's right edge, not a discrimination failure. The guarded span is self-restoring rather than a trajectory: the route sends no directional input inside the level, so the worm stays at its start position and the frame-to-frame change the guard rests on is the animated water, drifting clouds, falling particles and the counting-down mission timer. Observed throughput was 59.9 presents/s (median) at scale 4 with no drops, recorded because no snapshot guard measures frame time.",
+      "structural_references": [
+        {
+          "luma16x9": "4f45455a484545444c5c4c454d555c45454545454545454545454545454545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c46524c4b3e3e55554c767078777577727678747973737a77783e424142414241414b42414241423d3a",
+          "average_hash": "10ff0000000000d2",
+          "difference_hash": "d0243400000044a4"
+        },
+        {
+          "luma16x9": "644545554e5a52454548674e4545454c454545454545454645454545464545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c45514c4b3e3e55554c756f77787577727676757a73727a797840414241424142404c41424142423d3b",
+          "average_hash": "10ff000000000027",
+          "difference_hash": "b024240000088969"
+        },
+        {
+          "luma16x9": "5c4b5c5a53485c534e59484549484861454546454545454545454545454545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c45514c4b3e3e55554c756f77787577727676757a73727a797840414241424142404c41424142423d3b",
+          "average_hash": "10ff80000000009f",
+          "difference_hash": "b02424000000802a"
+        },
+        {
+          "luma16x9": "465e636445455c615054454c45466346454546454545454545454545454545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c45514c4b3e3e55554c756f77787577727676757a73727a797840414241424142404c41424142423d3b",
+          "average_hash": "10ff00000000009b",
+          "difference_hash": "b024240000000272"
+        },
+        {
+          "luma16x9": "4e455d4d5a45645445454c5d4e454545454545454545454545454545454545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c45514c4b3e3e55554c767078777677727678747973747a787840424142414241414b42414241423d3a",
+          "average_hash": "10ff00000000002e",
+          "difference_hash": "9224240000004058"
+        },
+        {
+          "luma16x9": "4545454c51505e4c46644845454d585b454546464545454545454545454645464646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c46514c4b3e3e55554c767078777677727678747973747b777940424142414241414b42414241423d3a",
+          "average_hash": "10ff00000000009c",
+          "difference_hash": "92a4240000081028"
+        },
+        {
+          "luma16x9": "5a46575145454e55495c4d555a4b4c5a454546454546454545454545454545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c46514c4b3e3e55554c766f787775777276767579747179797840414241424142404c41424142423d3b",
+          "average_hash": "10ff0000000000fb",
+          "difference_hash": "b424240000004a02"
+        },
+        {
+          "luma16x9": "45485b45456052454c564e454b5c5d45454545454545454545454545454545464646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433b4f4d4c483c46524c4b3e3e55554c767078777577717777767974727b77793e424142424242404b42414242413d3a",
+          "average_hash": "10ff0000000000d6",
+          "difference_hash": "92a42400000002aa"
+        },
+        {
+          "luma16x9": "4f45455a484545444c5c4c454d555c45454545454545454545454545454545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c46524c4b3e3e55554c767078777577727778757974737b78783e424142414241414b42414241423d3a",
+          "average_hash": "10ff0000000000d2",
+          "difference_hash": "d0a43400000044a5"
+        },
+        {
+          "luma16x9": "644545564e5a52454548664e4545454c454545454545454645454545464545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c46524c4b3e3e55554c767077797577727776757a74727a797840414241424142404c41424142413d3a",
+          "average_hash": "10ff000000000027",
+          "difference_hash": "d024240000088969"
+        },
+        {
+          "luma16x9": "5c4b5c5a53485b534e59484549494861454546454545454545454545454545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c46524c4b3e3e55554c767077797577727776757a74727a797840414241424142404c41424142413d3a",
+          "average_hash": "10ff80000000009f",
+          "difference_hash": "b02424000000882e"
+        },
+        {
+          "luma16x9": "465e636345455b625055454c45466346454546454545454545454545454545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433b4f4d4c483c46524c4b3e3e55554c767077797577727776757a74727a79783f414241424142404c41424142413d3a",
+          "average_hash": "10ff00000000009b",
+          "difference_hash": "b024240000000272"
+        },
+        {
+          "luma16x9": "4e455d4d5a45655445454c5e4f454545454545454545454545454545464545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c46524c4b3e3e55554c767078777577727678747973737a777840424142414241414b42414241423d3a",
+          "average_hash": "10ff00000000002e",
+          "difference_hash": "d024240000004058"
+        },
+        {
+          "luma16x9": "4545454c51505e4c46644845454c595b454545454545454545454545454645454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c45514c4b3e3e55554c767078777677727678747973747a787840424142414241414b42414241423d3a",
+          "average_hash": "10ff80000000009c",
+          "difference_hash": "9224240000001028"
+        },
+        {
+          "luma16x9": "5a46565245454d56495c4d555a4b4c5a454546454545454545454545454545454646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433a4f4d4c483c46514c4b3e3e55554c766f78787577727676757974727a797840414241424142404c41424142423d3b",
+          "average_hash": "10ff0000000000fb",
+          "difference_hash": "b024240000004a02"
+        },
+        {
+          "luma16x9": "45475c45456051454c564f454a5d5d45454545454545454545454645454545464646464646464646464646464646464647474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474b433b4f4d4c483c46524c4b3e3e55554c767078777677727778757974737b77793e424142414241414b42414241423d3a",
+          "average_hash": "10ff0000000000d6",
+          "difference_hash": "92a42400004022aa"
+        }
+      ],
+      "dims": [
+        480,
+        270
+      ]
     }
   ]
 }

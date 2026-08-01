@@ -104,6 +104,28 @@ The validated Cobra verdict was:
 CLEAN: corr(block 1024f)=-0.049 neighbor-max=+0.032 spike=-0.081 (threshold 0.35) dup-grains=0.0% rms=0.0436 peak=0.1880
 ```
 
+## Snapshot guards (rung 6)
+
+Both titles were taken to rung 6 on 2026-08-01 with reviewed content guards, using the routes
+recorded above unchanged:
+
+- `gris-gameplay` — window 155-235 s, after the route's last input, so the guarded span is the
+  settled ink-ground idle scene rather than the 78-150 s movement phase.
+- `cobra-gameplay` — window 170-198 s, after the route's last input at 124 s, so the camera is held.
+
+Both put the whole discriminating load on SSIM. GRIS is blind on both numeric axes at once (its title
+screen is 17x richer in colour than its gameplay, and non-black coverage is exactly 1.0000 for logos,
+title, intro and gameplay alike, because it is a bright paper page with no true black). Cobra inverts
+the usual coverage argument: its gameplay coverage (0.8152-0.9037) is *lower* than its menus
+(0.9908-1.0000), because the bottom of the combat frame is the dark underside of the walkway, so its
+coverage floor is deliberately left low. Details and thresholds are in each entry's `_note` in
+`tools/snapshot/snapshots.json`.
+
+One throughput observation worth recording, since no snapshot guard measures frame time: on the same
+machine and at the same scale, GRIS runs at roughly 300 presents/s while **Cobra manages only 6-12
+(median 9)**. Cobra renders correctly and passes its guard; it is simply very slow, and nothing in
+the automated suite would say so.
+
 ## Ruled out
 
 One line per dead hypothesis, the evidence that killed it, and where that evidence lives.
