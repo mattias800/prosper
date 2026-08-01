@@ -167,71 +167,106 @@ def main():
           "messages outside any test section are reported as <unattributed>, never dropped")
 
     with tempfile.TemporaryDirectory() as td:
-        good = Path(td) / "ok.txt"
-        good.write_text("# comment\n\nVUID-a | because reasons (#1)\n")
-        allowed = scan.parse_allowlist(good)
-        check(allowed == {"VUID-a": "because reasons (#1)"},
-              "allow-list parses 'id | reason', ignoring comments and blank lines")
+        def allowfile(name, text):
+            p = Path(td) / name
+            p.write_text(text)
+            return str(p)
 
-        bare = Path(td) / "bare.txt"
-        bare.write_text("VUID-a\n")
-        try:
-            scan.parse_allowlist(bare)
-            check(False, "a bare allow-list ID with no reason is rejected")
-        except SystemExit:
-            check(True, "a bare allow-list ID with no reason is rejected")
+        good = allowfile("ok.txt",
+                         "# comment\n\nVUID-a | required | test_x, test_y | because reasons (#1)\n")
+        allowed = scan.parse_allowlist(Path(good))
+        check(set(allowed) == {"VUID-a"} and allowed["VUID-a"].expectation == "required"
+              and allowed["VUID-a"].tests == ["test_x", "test_y"]
+              and allowed["VUID-a"].reason == "because reasons (#1)",
+              "allow-list parses 'id | expectation | tests | reason', skipping comments and blanks")
+        check(allowed["VUID-a"].covers("test_x") and not allowed["VUID-a"].covers("test_z"),
+              "an entry covers only the tests it names")
+        star = scan.parse_allowlist(Path(allowfile("star.txt", "VUID-a | required | * | any (#1)\n")))
+        check(star["VUID-a"].covers("anything at all"), "'*' covers any test")
 
-        empty_reason = Path(td) / "empty.txt"
-        empty_reason.write_text("VUID-a |   \n")
+        # Every malformation is fatal: a line nobody can read is indistinguishable from a filter
+        # somebody added quietly, which is the thing this file exists to make impossible.
+        for name, text, what in [
+                ("bare.txt", "VUID-a\n", "a bare id with no fields"),
+                ("noreason.txt", "VUID-a | required | test_x |   \n", "an empty reason"),
+                ("notests.txt", "VUID-a | required |  | why (#1)\n", "an empty test list"),
+                ("badexp.txt", "VUID-a | maybe | test_x | why (#1)\n", "an unknown expectation"),
+                ("shortform.txt", "VUID-a | why (#1)\n", "the old two-field form")]:
+            try:
+                scan.parse_allowlist(Path(allowfile(name, text)))
+                check(False, f"allow-list entry with {what} is rejected")
+            except SystemExit:
+                check(True, f"allow-list entry with {what} is rejected")
+
         try:
-            scan.parse_allowlist(empty_reason)
-            check(False, "an allow-list entry with an empty reason is rejected")
+            scan.parse_allowlist(Path(td) / "does-not-exist.txt")
+            check(False, "a MISSING allow-list is rejected, not treated as empty")
         except SystemExit:
-            check(True, "an allow-list entry with an empty reason is rejected")
+            check(True, "a MISSING allow-list is rejected, not treated as empty")
 
         # End-to-end gating, driven through main() the way CI drives it.
         log = Path(td) / "LastTest.log"
         log.write_text(SAMPLE_LOG)
 
-        covers_all = Path(td) / "all.txt"
-        covers_all.write_text("VUID-vkCmdDraw-format-07753 | pre-existing (#x)\n"
-                              "VUID-vkCmdDispatch-viewType-07752 | pre-existing (#y)\n")
-        rc = run_main(["--log", str(log), "--allowlist", str(covers_all)])
-        check(rc == 0, "a run whose every message ID is allow-listed passes")
+        covers_all = allowfile("all.txt",
+            "VUID-vkCmdDraw-format-07753 | required | texture_sample_render | pre-existing (#x)\n"
+            "VUID-vkCmdDispatch-viewType-07752 | required | game_compute_exec | pre-existing (#y)\n")
+        rc = run_main(["--log", str(log), "--allowlist", covers_all])
+        check(rc == 0, "a run whose every id AND test is on the ledger passes")
 
-        partial = Path(td) / "partial.txt"
-        partial.write_text("VUID-vkCmdDraw-format-07753 | pre-existing (#x)\n")
-        rc = run_main(["--log", str(log), "--allowlist", str(partial)])
-        check(rc == 1, "a message ID missing from the allow-list fails the scan")
+        partial = allowfile("partial.txt",
+            "VUID-vkCmdDraw-format-07753 | required | texture_sample_render | pre-existing (#x)\n")
+        rc = run_main(["--log", str(log), "--allowlist", partial])
+        check(rc == 1, "a message id missing from the allow-list fails the scan")
 
-        rc = run_main(["--log", str(log), "--allowlist", str(partial), "--report-only"])
+        rc = run_main(["--log", str(log), "--allowlist", partial, "--report-only"])
         check(rc == 0, "--report-only measures without failing")
 
-        stale = Path(td) / "stale.txt"
-        stale.write_text("VUID-vkCmdDraw-format-07753 | pre-existing (#x)\n"
-                         "VUID-vkCmdDispatch-viewType-07752 | pre-existing (#y)\n"
-                         "VUID-never-seen | fixed, entry not yet pruned\n")
-        rc = run_main(["--log", str(log), "--allowlist", str(stale)])
-        check(rc == 0, "an allow-listed ID that no longer fires is reported but does not fail "
-                       "(the observed set is driver-dependent)")
+        # Scoping is the point of the tests column: a catch-all VUID appearing somewhere new is a
+        # new defect wearing an old id, and an id-only ledger would wave it through.
+        wrong_test = allowfile("wrongtest.txt",
+            "VUID-vkCmdDraw-format-07753 | required | texture_sample_render | pre-existing (#x)\n"
+            "VUID-vkCmdDispatch-viewType-07752 | required | some_other_test | pre-existing (#y)\n")
+        rc = run_main(["--log", str(log), "--allowlist", wrong_test])
+        check(rc == 1, "an allow-listed id arriving from an unrecorded test fails the scan")
 
-        # An empty log with a populated allow-list is the "the observation broke" shape — a layer
-        # whose framing the parser does not match, a log read from the wrong place, a build without
-        # the Vulkan tests. All of them print "0 findings", which is indistinguishable from a clean
-        # suite. The scan must refuse it.
+        # A `required` entry that stops firing is either a fix nobody pruned or an observation that
+        # broke. Failing on it is what catches a PARTIAL break — one id going quiet while the rest
+        # still report — which the all-absent check alone lets through.
+        stale_required = allowfile("stale.txt",
+            "VUID-vkCmdDraw-format-07753 | required | texture_sample_render | pre-existing (#x)\n"
+            "VUID-vkCmdDispatch-viewType-07752 | required | game_compute_exec | pre-existing (#y)\n"
+            "VUID-never-seen | required | some_test | fixed, entry not yet pruned\n")
+        rc = run_main(["--log", str(log), "--allowlist", stale_required])
+        check(rc == 1, "a `required` id that produced no messages fails the scan")
+
+        stale_env = allowfile("staleenv.txt",
+            "VUID-vkCmdDraw-format-07753 | required | texture_sample_render | pre-existing (#x)\n"
+            "VUID-vkCmdDispatch-viewType-07752 | required | game_compute_exec | pre-existing (#y)\n"
+            "VUID-never-seen | environment-dependent | some_test | cannot fire on lavapipe (#z)\n")
+        rc = run_main(["--log", str(log), "--allowlist", stale_env])
+        check(rc == 0, "an `environment-dependent` id that produced no messages is reported, not fatal")
+
+        # The total-break shape, still covered: every required id silent at once.
         empty_log = Path(td) / "empty.log"
         empty_log.write_text("Start testing\n1/1 Testing: t\n== PASS ==\n")
         check(scan.parse_log(empty_log.read_text()) == {},
               "a log with no validation messages yields no findings")
-        rc = run_main(["--log", str(empty_log), "--allowlist", str(covers_all)])
+        rc = run_main(["--log", str(empty_log), "--allowlist", covers_all])
         check(rc == 1,
               "zero observed messages against a non-empty allow-list fails as a broken observation")
 
-        # ... and switches itself off once the defects are genuinely fixed and their lines deleted.
-        empty_allow = Path(td) / "none.txt"
-        empty_allow.write_text("# every pre-existing finding has been fixed\n")
-        rc = run_main(["--log", str(empty_log), "--allowlist", str(empty_allow)])
+        # ... and the gate switches itself off once the defects are fixed and their lines deleted.
+        empty_allow = allowfile("none.txt", "# every pre-existing finding has been fixed\n")
+        rc = run_main(["--log", str(empty_log), "--allowlist", empty_allow])
         check(rc == 0, "an empty allow-list plus an empty log is the intended clean end state")
+
+        # The real ledger must itself be well-formed, and must cover what the guard measured.
+        real = scan.parse_allowlist(Path(__file__).resolve().parent / "allowlist.txt")
+        check(len(real) >= 1 and all(a.reason and a.tests for a in real.values()),
+              "the checked-in allowlist.txt parses, and every entry carries tests and a reason")
+        check(sum(1 for a in real.values() if a.expectation == "environment-dependent") == 2,
+              "exactly two checked-in entries claim to be environment-dependent")
 
     # The guard must not read its own tail. ctest captures this test's stdout into the same
     # LastTest.log that vk_validation_scan.py parses, so anything printed here that LOOKS like a

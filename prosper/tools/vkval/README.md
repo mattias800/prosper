@@ -68,37 +68,50 @@ reported a clean suite, and the CI gate would have been permanently green while 
 It was caught only by running the positive control (below) on the CI environment rather than the
 development one.
 
-So the scan has a second, blunter instrument check: **if the allow-list is non-empty and *zero*
-messages were observed, that is a failure.** Nine known defects spread over eight tests do not all
-fall silent at once; a parser that stopped matching, a log read from the wrong place, or a build
-without the Vulkan tests all produce exactly that shape. Deleting the last allow-list entry — the
-intended end state — switches the check off.
+So the scan has a second instrument check, and it is deliberately per-entry rather than
+all-or-nothing: **every allow-list entry marked `required` must still produce messages.** If one
+stops appearing, exactly two things can have happened — the defect was fixed (delete the line, in
+the same change) or the scan stopped seeing what it used to. Both are failures until someone says
+which.
 
-`test_vk_validation_scan.py` pins both layer framings verbatim, and asserts that the test's own
-output contains nothing the scan would read as a validation message (ctest captures it into the
-same log, so a test that prints sample messages makes the guard read its own tail — measured, it
-did).
-
-The same rule applies to changes to the tool itself: `test_vk_validation_scan.py` (ctest
-`vkval_scan_logic`) pins that the parser really matches the layer's message framing, including the
-`VUID-vkCmdDispatch-viewType-07752` line that motivated all of this.
-
-## `allowlist.txt`
-
-Every message id observed when the guard was switched on is listed there with a one-line reason and
-an open issue. A bare id with no reason is a hard error — the point of the file is that pre-existing
-findings are *visibly deferred*, never silently tolerated. Fixing a defect means deleting its line.
-
-An allow-listed id that produces no messages in a run is reported but does not fail, because the
-observed set is driver-dependent in both directions:
+Checking each id separately is what catches a *partial* break. An all-absent check alone passes a
+VUID rename, or a framing change that affects some message shapes and not others, while silently
+halving what the guard can see. The two ids that genuinely cannot appear everywhere are marked
+`environment-dependent` and say why on their reason line, so the exemption is written down rather
+than assumed:
 
 * `VUID-vkCmdDispatch-maintenance4-08602` is a newer check than validation layers 1.3.275, which is
   what Ubuntu 24.04 (the CI runner) carries;
 * `VUID-VkMappedMemoryRange-size-01389` cannot trigger on lavapipe at all, whose
   `nonCoherentAtomSize` is 1 — it was only seen on RADV.
 
-So run the guard on hardware occasionally even though CI runs it on lavapipe; they see different
-subsets of the same set of defects.
+Deleting the last allow-list entry — the intended end state — switches the check off.
+
+`test_vk_validation_scan.py` (ctest `vkval_scan_logic`) pins both layer framings verbatim, pins the
+`VUID-vkCmdDispatch-viewType-07752` line that motivated all of this, and asserts that the test's own
+output contains nothing the scan would read as a validation message. That last one is not paranoia:
+ctest captures this test's stdout into the same log the scan parses, so a test that prints sample
+messages makes the guard read its own tail — measured, it did.
+
+Smaller closures in the same spirit: a **missing** allow-list file is a hard error rather than an
+empty one, and ctest runs with `--no-tests=error`, so "build directory with nothing registered"
+cannot report success either.
+
+## `allowlist.txt`
+
+```
+<message id> | <required|environment-dependent> | <tests, or *> | <reason, with its issue>
+```
+
+Every message id observed when the guard was switched on is listed there. A line the scanner cannot
+fully parse is a hard error — the point of the file is that pre-existing findings are *visibly
+deferred*, never silently tolerated. Fixing a defect means deleting its line.
+
+**The test list is not decoration.** Several VUIDs are catch-alls —
+`VUID-VkShaderModuleCreateInfo-pCode-08737` is VVL's identity for *any* `spirv-val` error at
+`vkCreateShaderModule` — so an id-only ledger would defer every future SPIR-V validity defect
+anywhere in the suite behind one known emitter bug. An allow-listed id arriving from a test the
+ledger does not record fails the scan: a deferral is scoped to where it was measured.
 
 ## Cost
 
@@ -119,3 +132,12 @@ podman run --rm -v "$PWD:/work" ubuntu:24.04     # mesa-vulkan-drivers 25.2.8, v
 
 Both packages come from the Ubuntu archive at job time rather than from a pin, so check
 `apt-cache policy` if the observed set ever shifts under you.
+
+## What this guard does NOT cover
+
+`#1704` also fixed a Vulkan-teardown-from-a-static-destructor defect in
+`frontends/shared/live_compute.cpp` that the layer exposed. **CI would not catch a regression of
+it.** That crash reproduces on validation layers 1.4.341; the runner carries 1.3.275, where the
+suite passes with the defect present. Reverting the lifetime change would leave this step green.
+Running the guard on a recent layer version locally is what covers it — one more reason not to treat
+a green CI run of this step as "no Vulkan misuse anywhere".

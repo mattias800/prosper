@@ -97,25 +97,65 @@ def parse_log(text: str) -> dict[str, Finding]:
     return findings
 
 
-def parse_allowlist(path: Path) -> dict[str, str]:
-    """Read `MESSAGE_ID | reason` lines. Blank lines and `#` comments are ignored."""
-    allowed: dict[str, str] = {}
+EXPECTATIONS = ("required", "environment-dependent")
+
+
+class Allowed:
+    """One deferred finding: which id, where it may appear, and whether it must still appear."""
+
+    def __init__(self, message_id: str, expectation: str, tests: list[str], reason: str) -> None:
+        self.message_id = message_id
+        self.expectation = expectation          # one of EXPECTATIONS
+        self.tests = tests                      # ctest names, or ["*"]
+        self.reason = reason
+
+    def covers(self, test: str) -> bool:
+        return "*" in self.tests or test in self.tests
+
+
+def parse_allowlist(path: Path) -> dict[str, Allowed]:
+    """Read `<message id> | <expectation> | <tests> | <reason>` lines.
+
+    Blank lines and `#` comments are ignored. Every other malformation is fatal: this file is the
+    project's ledger of deferred defects, and a line nobody can read is indistinguishable from a
+    filter somebody added quietly.
+
+    * `<expectation>` is `required` (the id must still be observed — its disappearance means either
+      the defect was fixed and this line should go, or the scan stopped seeing things) or
+      `environment-dependent` (its absence on some drivers/layer versions is understood and the
+      reason says why).
+    * `<tests>` is a comma-separated list of ctest names, or `*`. Scoping matters: several VUIDs are
+      catch-alls — `VUID-VkShaderModuleCreateInfo-pCode-08737` covers *any* spirv-val error at
+      `vkCreateShaderModule` — so an unscoped entry would defer every future occurrence anywhere.
+    """
     if not path.exists():
-        return allowed
+        # Returning {} here would silently disable the all-absent check in main() and hand back a
+        # PASS on an empty observation, which is the compound silent-green this tool must not have.
+        raise SystemExit(f"[vkval] allow-list {path} does not exist — refusing to scan without a "
+                         f"ledger to compare against")
+    allowed: dict[str, Allowed] = {}
     for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        if "|" not in line:
+        fields = [f.strip() for f in line.split("|")]
+        if len(fields) != 4:
             raise SystemExit(
-                f"{path}:{lineno}: every allow-list entry needs '<message id> | <reason>' — "
+                f"{path}:{lineno}: every allow-list entry needs "
+                f"'<message id> | <{'|'.join(EXPECTATIONS)}> | <tests or *> | <reason>' — "
                 f"an unexplained filter is exactly what this file exists to prevent"
             )
-        ident, reason = line.split("|", 1)
-        ident, reason = ident.strip(), reason.strip()
+        ident, expectation, tests, reason = fields
+        if expectation not in EXPECTATIONS:
+            raise SystemExit(f"{path}:{lineno}: allow-list entry '{ident}' has expectation "
+                             f"'{expectation}'; it must be one of {', '.join(EXPECTATIONS)}")
+        if not tests:
+            raise SystemExit(f"{path}:{lineno}: allow-list entry '{ident}' names no tests (use '*' "
+                             f"deliberately if the id really may appear anywhere)")
         if not reason:
             raise SystemExit(f"{path}:{lineno}: allow-list entry '{ident}' has an empty reason")
-        allowed[ident] = reason
+        allowed[ident] = Allowed(ident, expectation,
+                                 [t.strip() for t in tests.split(",") if t.strip()], reason)
     return allowed
 
 
@@ -157,7 +197,10 @@ def prove_layer_loads(build_dir: Path, probe: str) -> str:
 
 
 def run_ctest(build_dir: Path, extra: list[str]) -> tuple[int, str, str]:
-    cmd = ["ctest", "--timeout", "600"] + extra
+    # --no-tests=error closes the "build directory with nothing registered" variant of a silent
+    # green; --output-on-failure means a test that fails only under the layer arrives in the CI log
+    # with its output attached, not just a summary line.
+    cmd = ["ctest", "--timeout", "600", "--no-tests=error", "--output-on-failure"] + extra
     proc = subprocess.run(cmd, cwd=build_dir, env=layer_env(),
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     log = build_dir / "Testing" / "Temporary" / "LastTest.log"
@@ -204,9 +247,18 @@ def main(argv: list[str]) -> int:
     print()
     print(f"[vkval] {len(findings)} distinct message ID(s), {total} message(s) total")
 
+    # An observation is accounted for only if BOTH its id and the test it came from are on the
+    # ledger. Scoping by test is not pedantry: several VUIDs are catch-alls (pCode-08737 is every
+    # spirv-val error at vkCreateShaderModule; format-07753 is the graphics-side sibling of the
+    # exact defect class this guard exists to catch), so an id-only allow-list would defer every
+    # future occurrence of those anywhere in the suite.
     new = sorted(k for k in findings if k not in allowed)
+    misplaced = sorted((k, t) for k in findings if k in allowed
+                       for t in findings[k].tests if not allowed[k].covers(t))
     known = sorted(k for k in findings if k in allowed)
-    stale = sorted(k for k in allowed if k not in findings)
+    absent = sorted(k for k in allowed if k not in findings)
+    absent_required = [k for k in absent if allowed[k].expectation == "required"]
+    absent_env = [k for k in absent if allowed[k].expectation != "required"]
 
     if known:
         print()
@@ -214,13 +266,22 @@ def main(argv: list[str]) -> int:
         for ident in known:
             f = findings[ident]
             print(f"  {ident}  x{f.count}  [{', '.join(sorted(f.tests))}]")
-            print(f"      reason: {allowed[ident]}")
-    if stale:
+            print(f"      reason: {allowed[ident].reason}")
+    if absent_env:
         print()
-        print("[vkval] allow-listed but not observed in this run — prune these entries, or record "
-              "why they are driver-dependent:")
-        for ident in stale:
-            print(f"  {ident}      reason on file: {allowed[ident]}")
+        print("[vkval] allow-listed, environment-dependent, not observed here (expected):")
+        for ident in absent_env:
+            print(f"  {ident}      {allowed[ident].reason}")
+    if absent_required:
+        print()
+        print("[vkval] allow-listed as REQUIRED but not observed:")
+        for ident in absent_required:
+            print(f"  {ident}      reason on file: {allowed[ident].reason}")
+    if misplaced:
+        print()
+        print("[vkval] allow-listed id, but from a test the ledger does not cover:")
+        for ident, test in misplaced:
+            print(f"  {ident}  in {test}  (recorded for: {', '.join(allowed[ident].tests)})")
     if new:
         print()
         print("[vkval] NEW — not on the allow-list:")
@@ -231,31 +292,39 @@ def main(argv: list[str]) -> int:
                 print(f"      {line}")
 
     failed = False
-    # Instrument check, and the one that matters most. Every entry on the allow-list is a defect
-    # that was observed when the guard was switched on, and they are spread over eight different
-    # tests: it is not credible for ALL of them to fall silent at once. If that happens, the far
-    # likelier explanation is that the observation broke — a layer version whose message framing
-    # this parser does not match, a ctest that wrote its log somewhere else, a build without the
-    # Vulkan tests. Every one of those reports "0 findings", which is indistinguishable from a
-    # clean suite unless something asks the question.
+    # Instrument check, and the one that matters most. Every `required` entry was observed when the
+    # guard was switched on. If one stops appearing, exactly two things can have happened: the
+    # defect was fixed (delete the line, in the same change) or the observation broke — a layer
+    # version whose framing this parser does not match, a renamed VUID, a ctest that wrote its log
+    # somewhere else, a build without the Vulkan tests. All of the second kind report "nothing
+    # here", which is indistinguishable from success unless something asks the question.
     #
-    # An empty allow-list means the defects really were fixed and their lines deleted, which is the
-    # intended end state, so the check switches itself off then.
-    if allowed and not findings:
+    # Checking each `required` id separately rather than only the all-absent case is what catches a
+    # PARTIAL break: a rename or a framing change that affects some message shapes and not others
+    # would otherwise pass while silently halving what the guard can see. `environment-dependent`
+    # entries are exempt, and their reason line has to say why (lavapipe's nonCoherentAtomSize, a
+    # check newer than layers 1.3.275) — the exemption is written down, not assumed.
+    if absent_required:
         print()
-        print(f"[vkval] FAIL: the allow-list holds {len(allowed)} pre-existing message id(s) and "
-              f"NONE were observed, while the layer demonstrably loaded.")
-        print("[vkval] That is far more likely to be a broken observation than a clean suite: check "
-              "that this parser matches your layer version's message framing, and that ctest's "
-              "LastTest.log is the log being read.")
-        print("[vkval] If the defects really were all fixed, delete their allow-list entries in the "
-              "same change — an empty allow-list disables this check.")
+        print(f"[vkval] FAIL: {len(absent_required)} allow-listed id(s) marked `required` produced "
+              f"no messages, while the layer demonstrably loaded.")
+        print("[vkval] Either the defect was fixed — in which case delete the entry in the same "
+              "change — or this scan is no longer seeing what it used to. Check that the parser "
+              "matches your layer version's message framing and that the id was not renamed.")
+        print("[vkval] If the absence is a property of this driver or layer version, mark the entry "
+              "`environment-dependent` and say why on its reason line.")
+        failed = True
+    if misplaced:
+        print()
+        print(f"[vkval] FAIL: {len(misplaced)} allow-listed id(s) appeared in a test the ledger does "
+              f"not record. A deferral is scoped to where it was measured; a catch-all VUID from a "
+              f"new site is a new defect, not the old one.")
         failed = True
     if new:
         print()
         print(f"[vkval] FAIL: {len(new)} validation message ID(s) are not on the allow-list.")
-        print("[vkval] Fix the defect, or add the ID to tools/vkval/allowlist.txt WITH a reason "
-              "and (where warranted) an issue. Do not add a bare ID.")
+        print("[vkval] Fix the defect, or add the ID to tools/vkval/allowlist.txt WITH an "
+              "expectation, the tests it comes from, a reason and (where warranted) an issue.")
         failed = True
     if ctest_rc != 0:
         print()
