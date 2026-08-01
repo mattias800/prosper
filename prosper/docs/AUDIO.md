@@ -124,13 +124,21 @@ Read the counters, not just presence:
 - **Per-port attribution** locates loss the mixed bed hides: `skip-not-main` (a port with signal
   discarded for not being MAIN), `skip-fmt` (unsupported layout), `no-pcm` (no buffer published),
   `short` (a partial/faulting guest read).
-- **`skip-fmt` now means only "the grain cannot be sized".** Since #1700 every channel count from 1
-  to 16 is folded and mixed, so a `skip-fmt` port is one whose `data_format` low bits are neither
-  `0` (f32) nor `1` (s16), or whose declared width exceeds 16. Such a port is deliberately **not**
-  read — a wider grain read at the fold's stride would walk the guest's buffer and mix garbage — so
-  its signal columns stay zero. It is no longer silent about it: the mix loop prints
+- **`skip-fmt` now means "prosper will not MIX this port"**, and since #1700 that is a much smaller
+  set: every channel count from 1 to 16 is folded, so a `skip-fmt` port is one whose `data_format`
+  low bits are neither `0` (f32) nor `1` (s16), or whose declared width exceeds 16. A width-rejected
+  port is **not** clamped and mixed — reading a 20-channel grain at a 16-channel stride would walk
+  the guest's buffer and mix garbage — but it **is** still read and measured under this probe,
+  because a rejected port is exactly where lost audio hides and that is how #1700 was found. Its
+  declared count gives a well-defined stride, so the measurement is sound even where the placement
+  is not. Only an unknown sample type is genuinely unsizable; that arm records the skip alone and
+  its signal columns stay zero. Either way the reject is no longer silent: the mix loop prints
   `[audio2] portN DISCARDED: …` unconditionally, rate-limited per port. Implement the format; do not
   leave it skipped.
+- Treat a **rejected** port's measurement as slightly lower confidence than a mixed port's: the read
+  length comes from a layout prosper does not support, so an over-read past the guest's buffer would
+  be attributed to that port. It is fault-safe and cannot invent silence, but it could in principle
+  inflate `nonzero` — confirm a surprising result against the producing code before acting on it.
 - **`peak=inf` / `rms=inf` is a correct reading, not a probe bug.** Infinities are deliberately not
   filtered the way NaN is: the output path clamps `+Inf` to `+1.0`, so an Inf-producing guest is
   genuinely, loudly audible and belongs in the signal statistics. Because `LIFE:` never resets, one
@@ -177,14 +185,16 @@ guest's own PCM instead of assuming an enumeration, reporting every five seconds
   alone, at any index.
 - **`corr`** — the full normalized cross-correlation matrix. A front pair is strongly but not
   perfectly correlated, a duplicated channel reads +1.00, an independent channel reads ~0. This is
-  what assigns each channel a left/right side, which is all a stereo fold needs.
+  what sorts the channels into a left GROUP and a right GROUP, which is most of what a stereo fold
+  needs. It cannot say WHICH group is the left one — correlation is symmetric under a swap — so that
+  last step rests on the index-0 = FrontLeft convention noted below.
 - **`stride`** — the smallest distance between two distinct grain pointers the guest publishes. A
   double-buffering title makes this one grain's byte size, an **independent** measure of the channel
   count rather than a restatement of the `data_format` decode. A single-buffer title reports
   `stride=n/a` with the pointer and publication count, which is a finding, not a missing value.
 
 `PROSPER_AUDIO_LAYOUT_DUMP=PATH` additionally appends each measured port's raw interleaved grain to
-`PATH.portN.f32` as float32 (both sample types converted), so the measurement can be re-derived,
+`PATH.portN.<channels>ch.f32` as float32 (both sample types converted), so the measurement can be re-derived,
 analysed differently, or rendered to something audible offline.
 
 **What this established for *Dragon Quest VII Reimagined* (#1700).** Over 19,962,368 frames of its

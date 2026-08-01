@@ -361,8 +361,9 @@ current build.
   `PROSPER_AUDIO_LAYOUT=1` over 19,962,368 frames: all of the content is in **ch0/ch1**
   (rms 3.1e-2 / 4.3e-2, peak 0.407, correlation +0.46 — a real decorrelated stereo pair). ch2 and
   ch4..ch7 hold only a ~1e-9 residue, and **ch3 and ch8..ch11 are exactly zero**. So the title
-  writes a stereo mix into a 12-channel container, never sends LFE, and never writes the height
-  tier. Within the residue, ch4/ch6 correlate +0.96 and ch5/ch7 +0.95 while ch4/ch5 is -0.04, so
+  writes a stereo mix into a 12-channel container and never writes ch3 or ch8..ch11 at all — the
+  LFE and height positions under the assumed order, so this describes which INDICES are dead
+  without resting on the mapping it is used to support. Within the residue, ch4/ch6 correlate +0.96 and ch5/ch7 +0.95 while ch4/ch5 is -0.04, so
   the surround tier pairs even=left / odd=right; ch2 correlates near-equally with both groups
   (centre-like). Reproduced identically on a second independent 150 s run.
   **The 8-channel port (ctx1/port2) remains exactly zero** — 0 non-zero of 55,175,168 samples —
@@ -398,7 +399,7 @@ current build.
 - **A declared channel count is not a description of the content.** The `0xc00` decode and the
   `2,310,144 B/s` figure above are both *derived from the same channel count*, so neither
   corroborates it, and "12 channels" reads as "a 7.1.4 bed with height" when the measured bed is
-  stereo with nine dead channels. Measure the channels before designing a fold for them; see
+  stereo with ten of its twelve channels carrying nothing audible. Measure the channels before designing a fold for them; see
   instrument-trap 40.
 - **Read the `LIFE:` totals, not a single interval.** This finding was initially called the opposite
   ("the guest submits only silence") from one report line in which port1 showed `nonzero=0/577536`.

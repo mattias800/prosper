@@ -177,8 +177,10 @@ bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth) {
 //            The surround tier therefore pairs as even=left, odd=right, which is what the 6..8
 //            mapping below already assumed. CONFIDENCE: MED — the grouping is unambiguous but the
 //            channels sit at a ~1e-9 residue level, so it corroborates rather than proves.
-//   ch3 and ch8..ch11 are EXACTLY zero for the whole run: the title's panner never writes an LFE
-//            send and never writes the height tier.
+//   ch3 and ch8..ch11 are EXACTLY zero for the whole run — the title's panner writes neither the
+//            LFE nor the height position under the order assumed here. Stated as indices on
+//            purpose: which POSITIONS those are is the mapping this evidence supports, not a
+//            premise it may borrow.
 // Channels 8..15 consequently have no measured side and are deliberately left UNPLACED (see the
 // return value): a fold-down that sounds plausible but images content to the wrong side is worse
 // than one that reports the gap, and no title in evidence puts signal there. The leading hypothesis
@@ -812,7 +814,7 @@ bool audio_layout() {
 }
 
 // PROSPER_AUDIO_LAYOUT_DUMP=PATH additionally appends each measured port's RAW interleaved grain
-// to PATH.portN.f32 as float32 (both sample types converted, so one reader handles either). The
+// to PATH.portN.<channels>ch.f32 as float32 (both sample types converted, so one reader handles either). The
 // in-process statistics answer the layout question, but the raw capture is what lets a later reader
 // re-derive them, run a different analysis, or render a channel to something audible — the same
 // capture-first workflow as PROSPER_SHADER_DUMP.
@@ -871,8 +873,12 @@ void layout_add_grain(uint32_t port_index, uint32_t ctx_slot, uint16_t type, uin
     lp->grain = grain;
     lp->frames += frames_got;
     if (const char* base = audio_layout_dump_path(); base && !lp->dump) {
+        // The channel count is in the NAME, not just the log line. The file is a bare interleaved
+        // stream with no header, and port slots are recycled first-free, so a differently-shaped
+        // port reusing this slot would otherwise append a stream of another width to the same file
+        // and every offline reader would silently de-interleave the tail wrong.
         char path[512];
-        snprintf(path, sizeof path, "%s.port%u.f32", base, port_index + 1);
+        snprintf(path, sizeof path, "%s.port%u.%uch.f32", base, port_index + 1, channels);
         lp->dump = fopen(path, "ab");
         fprintf(stderr, "[audio-layout] port%u: dumping raw guest PCM to %s "
                         "(float32 interleaved, %u channels, 48000 Hz)\n",
@@ -1639,7 +1645,44 @@ HLE(audio2_ctx_push) {
                 if (probe) fprintf(stderr, "[audio2-probe] port%d skipped: format=0x%x "
                                            "type=%u channels=%u unsupported\n",
                                            this_pidx + 1, ps.data_format, data_type, channels);
-                if (flow) {
+                // A rejected port is exactly where lost audio hides — that is how #1700 itself was
+                // found — so under the flow probe, read and MEASURE it anyway without mixing it,
+                // whenever the grain can be sized at all. A width the fold cannot place is still a
+                // width: the declared count gives a well-defined stride, so the measurement is
+                // sound even though the placement is not. Only an unknown sample type is truly
+                // unsizable, and that arm records the skip alone.
+                const bool sizable = (data_type == 0 || data_type == 1) && channels >= 1;
+                if (flow && sizable) {
+                    // Worst case is 255 channels x 4096 frames = 4 MiB per push. That is a lot for
+                    // a hot path, which is why it is behind the probe and behind a reject that no
+                    // title in evidence reaches.
+                    const size_t rej_samples = (size_t)channels * grain;
+                    size_t rej_frames = 0;
+                    if (data_type == 0) {
+                        if (tmp.size() < rej_samples) tmp.resize(rej_samples);
+                        rej_frames = audio_read_bytes_partial(ps.pcm_ptr, tmp.data(),
+                                        sizeof(float) * rej_samples) / (sizeof(float) * channels);
+                    } else {
+                        if (tmp_s16.size() < rej_samples) tmp_s16.resize(rej_samples);
+                        rej_frames = audio_read_bytes_partial(ps.pcm_ptr, tmp_s16.data(),
+                                        sizeof(int16_t) * rej_samples) / (sizeof(int16_t) * channels);
+                    }
+                    // One lock scope covering tag + counters + samples: tagging, unlocking for the
+                    // guest read, then re-locking lets a report land in the window and clear `seen`,
+                    // so the measurement never prints.
+                    std::lock_guard<std::mutex> flk(g_flow_mx);
+                    FlowPort& fp = g_flow_port[this_pidx];
+                    flow_tag_port(fp, context_slot, ps.type, ps.data_format);
+                    ++fp.skip_fmt;
+                    ++fp.reads;
+                    fp.frames += rej_frames;
+                    fp.bytes += rej_frames * channels *
+                                (data_type == 0 ? sizeof(float) : sizeof(int16_t));
+                    if (rej_frames < grain) ++fp.short_read;
+                    for (size_t k = 0, nf = rej_frames * channels; k < nf; ++k)
+                        flow_add_sample(fp, data_type == 0 ? tmp[k]
+                                                          : (float)tmp_s16[k] * (1.0f / 32768.0f));
+                } else if (flow) {
                     // Nothing to measure for a grain we cannot even size; record the skip.
                     std::lock_guard<std::mutex> flk(g_flow_mx);
                     FlowPort& fp = g_flow_port[this_pidx];
@@ -1733,13 +1776,27 @@ HLE(audio2_ctx_push) {
                                     "run with PROSPER_AUDIO_LAYOUT=1 to measure their role\n",
                             this_pidx + 1, unplaced, channels, ps.data_format);
             }
+            // Flatten the matrix into one tap list per side, keeping ONLY the non-zero gains. This
+            // is not an optimization — it is required for correctness. Multiplying every channel by
+            // both gains reads channels the fold does not place, and `Inf * 0.0f` and `NaN * 0.0f`
+            // are both NaN, so one Inf on a surround channel would poison the OPPOSITE side and an
+            // unplaced height channel holding uninitialized guest memory would poison BOTH — the
+            // output path then clamps NaN to zero, silencing a port whose content is fine. The old
+            // inline chain only ever read a channel on the side it contributed to; preserve exactly
+            // that, so a zero-gain channel is never even loaded.
+            struct Tap { uint32_t ch; float gain; };
+            Tap left_taps[kAudioMaxBedChannels], right_taps[kAudioMaxBedChannels];
+            uint32_t left_n = 0, right_n = 0;
+            for (uint32_t c = 0; c < channels; ++c) {
+                if (gains[c].left  != 0.0f) left_taps[left_n++]   = {c, gains[c].left};
+                if (gains[c].right != 0.0f) right_taps[right_n++] = {c, gains[c].right};
+            }
             for (size_t fno = 0; fno < frames_got; fno++) {
                 float left = 0.0f, right = 0.0f;
-                for (uint32_t c = 0; c < channels; ++c) {
-                    const float s = sample_at(fno, c);
-                    left  += s * gains[c].left;
-                    right += s * gains[c].right;
-                }
+                for (uint32_t t = 0; t < left_n; ++t)
+                    left += sample_at(fno, left_taps[t].ch) * left_taps[t].gain;
+                for (uint32_t t = 0; t < right_n; ++t)
+                    right += sample_at(fno, right_taps[t].ch) * right_taps[t].gain;
                 bed[fno * 2 + 0] += left * port_gain;
                 bed[fno * 2 + 1] += right * port_gain;
             }
