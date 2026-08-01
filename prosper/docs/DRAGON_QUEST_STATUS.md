@@ -346,7 +346,7 @@ current build.
   ("the guest submits only silence") from one report line in which port1 showed `nonzero=0/577536`.
   Playback has gaps, so any one interval can land in one; in the same run the port's run total is
   1.78 M non-zero samples at peak 0.38976. Every port and context line now carries a never-reset
-  total for exactly this reason. See instrument-trap 38.
+  total for exactly this reason. See instrument-trap 39.
 
 ## Ruled out — eliminated, do not re-run these
 

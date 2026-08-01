@@ -109,7 +109,7 @@ Read the counters, not just presence:
 - **Judge a port by its `LIFE:` totals, never by one interval.** Per-interval counters reset every
   second and real playback has gaps, so any single line can read `nonzero=0/M` on a port carrying
   strong signal over the run. The never-reset totals are what make one line sufficient — reading
-  only the last interval inverted this investigation's first conclusion (instrument-trap 38).
+  only the last interval inverted this investigation's first conclusion (instrument-trap 39).
 - **`BED LIFE:` and a port's `LIFE:` do not share a denominator.** They start at different moments —
   the context's lifetime begins at ContextCreate, each port's at PortCreate — so the two adjacent
   `nonzero=N/M` values on consecutive lines are *not* directly comparable, and in the example above
