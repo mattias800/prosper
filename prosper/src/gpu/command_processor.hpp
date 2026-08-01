@@ -222,7 +222,16 @@ bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
 void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect);
 
 // Decode `dwords` dwords at `buf` and apply every op to `st`. Returns the number of packets applied.
-size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st);
+// Folds `dwords` of PM4 into `st` and returns the number of PACKETS applied.
+//
+// `consumed_dwords` (optional, #305/#1662) reports how far the DECODE actually walked. It is NOT
+// always `dwords`: decode_pm4 stops early at a non-type-3 dword (pad/garbage) or a packet whose
+// declared length runs past the end. When the guest supplied an explicit count, `*consumed_dwords <
+// dwords` means the tail of that submit — INCLUDING ANY SHADER BIND IN IT — was never applied, and
+// the next submit inherits a register file hardware never had. That is silent without this out-param,
+// which is why it exists; callers that know the count was explicit should report the shortfall.
+size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st,
+                          size_t* consumed_dwords = nullptr);
 
 // WAIT_REG_MEM barrier model, OPT-IN via PROSPER_WAIT_DEFER=1 (issue #312 — see the block
 // comment in command_processor.cpp, including the measured verdict on why it is not default:

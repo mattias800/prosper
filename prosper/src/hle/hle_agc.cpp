@@ -1514,6 +1514,27 @@ static void poolshift_window_probe(uint64_t submit_no) {
         last_found = found;
     }
 }
+// #305/#1662: a fold that decodes fewer dwords than the guest declared has silently dropped the tail
+// of that submit — and if a shader bind was in the dropped tail, the NEXT submit inherits a register
+// file hardware never had, which is exactly the "user-data block larger than the bound pipeline's
+// window" shape #305 is chasing. decode_pm4 stops early at a non-type-3 dword or a packet whose
+// declared length overruns the buffer; neither was visible before. Reported unconditionally (not
+// behind a switch) and rate-limited, because a truncated command stream is never expected.
+static void report_short_fold(const char* who, uint64_t submit_no, const uint32_t* addr,
+                              uint32_t declared, size_t consumed) {
+    if (!declared || consumed >= declared) return;   // 0 = unknown length: self-termination is normal
+    static std::atomic<int> logged{0};
+    const int n = logged.fetch_add(1);
+    if (n >= 32) return;
+    const uint32_t stop = addr && consumed < declared ? addr[consumed] : 0;
+    fprintf(stderr,
+            "[agc] SHORT FOLD %s #%llu: guest declared %u dwords, decode stopped after %zu "
+            "(%.1f%%) at stream dword 0x%08x — the remaining %zu dwords, INCLUDING ANY BIND, were "
+            "never applied%s\n",
+            who, (unsigned long long)submit_no, declared, consumed,
+            100.0 * (double)consumed / (double)declared, stop,
+            (size_t)declared - consumed, n == 31 ? " [further reports suppressed]" : "");
+}
 static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const char* who,
                                   uint64_t queue_id = 0) {
     if (!addr) return 0;
@@ -1536,8 +1557,10 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     state.dma_execution_rejected = false;
     state.ordered_memory_effects.clear();
     gpu::begin_gpu_timeline_submit(g_submit_count + 1);
-    size_t applied = gpu::run_command_buffer(addr, walk, state);
+    size_t consumed = 0;
+    size_t applied = gpu::run_command_buffer(addr, walk, state, &consumed);
     g_submit_count++;
+    report_short_fold(who, g_submit_count, addr, dw_num, consumed);
     gpu::diagnose_compute_dispatches(state, g_submit_count);
     static unsigned draw_submits2 = 0;
     execute_submit_work(state, g_submit_count, draw_submits2);
@@ -1594,11 +1617,40 @@ HLE9(agc_driver_submit_dcb_variant) {
         uint32_t h = *(const volatile uint32_t*)(uintptr_t)p;
         return (h & 0xC0000000u) == 0xC0000000u;
     };
+    auto first_dword = [](uint64_t p) -> uint32_t {
+        return (p >= 0x10000 && !(p & 3)) ? *(const volatile uint32_t*)(uintptr_t)p : 0;
+    };
     uint64_t cand = a7;                                     // arg8 = the Dcb stream address (adapter ABI)
     if (!is_pm4(cand)) {                                    // fallback: scan the register args
+        // #1662: this substitutes a GUESSED stream address for the one the guest passed, on the
+        // strength of a ONE-DWORD type-3 test. It used to do so silently — only the found-nothing
+        // case below logged — so a submit folding a scavenged pointer was indistinguishable in the
+        // log from one folding the guest's. That is unproved provenance that is not fail-visible.
+        //
+        // The guess is unusually dangerous here because the adapter thunks that reach this import do
+        // NOT set the register arguments (verified by disassembly on two UE4 titles): a0..a5 hold
+        // whatever the caller left there, which at Nikoderiko's call site includes a STACK address.
+        // An arbitrary stack dword passes a bits-31:30 test about one time in four, and a fold does
+        // not merely read — WRITE_DATA/RELEASE_MEM packets write into guest memory (#241).
+        //
+        // Reported unconditionally and rate-limited. The policy question (refuse rather than guess)
+        // is deliberately separate from making it visible; see #1662.
         const uint64_t regs[6] = { a0, a1, a2, a3, a4, a5 };
+        const uint64_t rejected = cand;
         cand = 0;
-        for (uint64_t r : regs) if (is_pm4(r)) { cand = r; break; }
+        int winner = -1;
+        for (int i = 0; i < 6; ++i) if (is_pm4(regs[i])) { cand = regs[i]; winner = i; break; }
+        static std::atomic<int> logged_sub{0};
+        const int n = logged_sub.fetch_add(1);
+        if (n < 16)
+            fprintf(stderr,
+                    "[agc] w1KFAHVqpaU SUBSTITUTED STREAM ADDRESS (#1662): arg8=0x%llx rejected "
+                    "(first dword 0x%08x is not a type-3 header); %s a%d=0x%llx (first dword 0x%08x); "
+                    "arg9=0x%llx. The fold below is from a GUESSED pointer, not the guest's%s\n",
+                    (unsigned long long)rejected, first_dword(rejected),
+                    winner < 0 ? "no register qualified —" : "using",
+                    winner, (unsigned long long)cand, first_dword(cand),
+                    (unsigned long long)a8, n == 15 ? " [further reports suppressed]" : "");
     }
     if (!cand) {
         static std::atomic<int> logged{0};
@@ -1638,8 +1690,10 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     agc_gpu_state().dma_execution_rejected = false;
     agc_gpu_state().ordered_memory_effects.clear();
     gpu::begin_gpu_timeline_submit(g_submit_count + 1);
-    size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
+    size_t consumed = 0;
+    size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state(), &consumed);
     g_submit_count++;
+    report_short_fold("SubmitDcb", g_submit_count, p->addr, p->dw_num, consumed);
     gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
     static unsigned draw_submits = 0;
     execute_submit_work(agc_gpu_state(), g_submit_count, draw_submits);
