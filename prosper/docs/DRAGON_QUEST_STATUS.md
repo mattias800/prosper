@@ -265,11 +265,15 @@ current build.
 
 ## Ruled out — eliminated, do not re-run these
 
-- **"The failing draws run with the PREVIOUS pipeline's PGM + user data."** This title's own
-  `[dynfail]`/`[drawpkt]` evidence founded #305 on that mechanism, and it is now **falsified** —
-  measured on the louder Nikoderiko reproduction, the block is written by the *immediately preceding*
-  bind. So are the stale-shader-registry, missing/mis-ordered-bind, user-data-tail-alignment and
-  TYPE-0-data-packet (#140) candidates. The full falsification list with its numbers lives in
+- **"The failing draws run with the previous pipeline's *user data*."** This title's own
+  `[dynfail]`/`[drawpkt]` evidence founded #305 on that mechanism, and the **user-data half is now
+  falsified**: measured on the louder Nikoderiko reproduction, the block is written by the
+  *immediately preceding* bind, a handful of packets before the draw. **The PGM half still holds and
+  is not ruled out** — every sampled failing draw is the first bind-or-draw event of its own `q3`
+  fold and does inherit the previous `q1` submit's program; that inheritance is normal on a shared
+  ring, and the defect is that the inherited state is wrong. Also falsified: the
+  stale-shader-registry, missing/mis-ordered-bind, user-data-tail-alignment and TYPE-0-data-packet
+  (#140) candidates. The full falsification list with its numbers lives in
   [`RESOURCE_BINDING.md`](RESOURCE_BINDING.md) § `Ruled out`; #305 was retitled on 2026-08-01 so its
   title no longer asserts the dead mechanism. The observable condition that *does* hold is that the
   programmed user-data block is **larger** than the bound pipeline's `USER_SGPR` window.

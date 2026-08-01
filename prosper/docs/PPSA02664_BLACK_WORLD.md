@@ -10,19 +10,8 @@
 > levels violated the origin-agreement invariant before the fix, 0 after. Fixed in **#1578**, which also
 > added an origin-agreement invariant to the tile tests; the title now reaches the gameplay rung with a
 > reviewed `alexkidd-gameplay` content guard. Current status is in
-> [`../../COMPATIBILITY.md`](../../COMPATIBILITY.md). Read `## Ruled out` below before reviving any
+> [`../../COMPATIBILITY.md`](../../COMPATIBILITY.md). Read `## Ruled out` below (after the frozen 2026-07-15 front matter) before reviving any
 > hypothesis from the plan that follows.
-
-## Ruled out
-
-One line per dead hypothesis, the evidence that killed it, and where that evidence lives.
-
-| Hypothesis | Verdict and evidence | Source |
-|---|---|---|
-| The world material shader `fs2949` premultiplies its output by a vertex-colour alpha of 0 | **Falsified**, and the capsule that appeared to prove it is the wrong scene. A content-gated alpha-only A/B (§1) rendered **overlapping intro narration text**, not Mt. Eternal: the captured submit is the narration crawl, where alpha 0 per faded-out page is *correct*. That capsule is now a **negative control** — any fix must preserve narration fading and must not make inactive pages overlap. Never use "this group renders `px_nonzero>0`" as a success gate. | §1, #320 |
-| A run-local submit ordinal, draw count, or shader hash identifies the gameplay scene | **Falsified by the same episode.** Those are run-local *selectors*, not scene identity; violating that is exactly how the narration capsule was mistaken for gameplay. Establish scene identity from rendered semantic content first (the governing invariant below). | §1 |
-| The world draws are missing, mis-transformed, or never submitted | **Falsified.** The world renders correctly and is then painted over by a full-frame mask fill. | #1578 |
-| A writer-tracing / empty-RTT-producer investigation is the next step | **Not needed.** The cause was upstream of composition entirely, in shared 4 KiB-tile mip-tail addressing. The watchpoint toolbox in §5 was never evidence-selected and was not required. | #1578 |
 
 **Status:** DRAFT for review (multiple agents). Tracks #755; investigates #320. No writer instrumentation
 is proposed as ready; the watchpoint material is a **conditional toolbox appendix** (§5), not an
@@ -38,6 +27,17 @@ falsified the original premise (below) before any tooling was built.
 > per-target dump; non-RGBA8 targets are skipped with an explicit format/size diagnostic).
 > **Neither constitutes a gameplay root-cause claim or a fix**; the current root cause is unresolved and
 > gated on a live/replay state comparison (see #320).
+
+## Ruled out
+
+One line per dead hypothesis, the evidence that killed it, and where that evidence lives.
+
+| Hypothesis | Verdict and evidence | Source |
+|---|---|---|
+| The world material shader `fs2949` premultiplies its output by a vertex-colour alpha of 0 | **Falsified**, and the capsule that appeared to prove it is the wrong scene. A content-gated alpha-only A/B (§1) rendered **overlapping intro narration text**, not Mt. Eternal: the captured submit is the narration crawl, where alpha 0 per faded-out page is *correct*. That capsule is now a **negative control** — any fix must preserve narration fading and must not make inactive pages overlap. Never use "this group renders `px_nonzero>0`" as a success gate. | §1, #320 |
+| A run-local submit ordinal, draw count, or shader hash identifies the gameplay scene | **Falsified by the same episode.** Those are run-local *selectors*, not scene identity; violating that is exactly how the narration capsule was mistaken for gameplay. Establish scene identity from rendered semantic content first (the governing invariant below). | §1 |
+| The world draws are missing, mis-transformed, or never submitted | **Falsified.** The world renders correctly and is then painted over by a full-frame mask fill. | #1578 |
+| A writer-tracing / empty-RTT-producer investigation is the next step | **Not needed.** The cause was upstream of composition entirely, in shared 4 KiB-tile mip-tail addressing. The watchpoint toolbox in §5 was never evidence-selected and was not required. | #1578 |
 
 ## Governing invariant (adopt this first)
 

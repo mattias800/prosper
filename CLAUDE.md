@@ -95,8 +95,10 @@ shared-GPU policy, the instrument-not-the-subject list, and the dated current ha
 
 ### Before you form a hypothesis, read the `## Ruled out` section
 
-Every per-title status doc in that table carries a **`## Ruled out`** section: one line per
-already-falsified hypothesis, the evidence that killed it, and the issue/PR link. Cross-title
+Every `docs/*_STATUS.md` in that table — and `PPSA02664_BLACK_WORLD.md`, `MESSENGER_BLACK_RENDER.md`
+and `GRIS_SONIC_COBRA_BRINGUP.md` — carries a **`## Ruled out`** section: one line per
+already-falsified hypothesis, the evidence that killed it, and the issue/PR link. (Blasphemous 2's
+row points at a route README, which has none.) Cross-title
 falsifications live in the area doc (`docs/RESOURCE_BINDING.md`, `docs/RECOMPILER_REMAINING.md`).
 These exist so nobody re-derives a dead answer at full cost — they are the most expensive knowledge
 in the repository. Extend them; see the recording rule under *How to work here*.
