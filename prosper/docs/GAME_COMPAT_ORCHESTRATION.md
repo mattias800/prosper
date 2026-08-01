@@ -91,6 +91,7 @@ count, read the last row's number.
 | 28 | A **distinct-colour count quoted across two different render scales** | Triage issue #1593 recorded Joe & Mac gameplay at **444,000-468,000** distinct colours; profiling the same route through `tools/snapshot` measured **at most 79,167**, a 5.6x gap that reads exactly like a severe colour regression. Both are correct. Triage captures run the `screenshot` frontend at native 1920x1080; every snapshot guard runs at `scale: 4`, so the frame is **480x270 = 129,600 pixels** and cannot exceed that many colours by construction. A 3840x2160 title (*Summer Sports Games*) yields 960x540 at the same scale, so even `dims` differs between titles. **Never lift a `min_colors` threshold from a triage issue**, and read `dims` off the profile instead of assuming the 1080p value. |
 | 29 | **Ranking candidate guard windows by metric stability** | Choosing a content-guard window by "tightest colour spread / highest self-SSIM" is the obvious automation, and on *Summer Sports Games* it confidently selects the settled span from 150 s to the end of the route: 48,201-48,489 colours, 1.0000 coverage, **SSIM 1.000 against itself** — the best-scoring window in the entire run by every available metric. It is the static `JAVELIN THROW` **standings overlay**, not gameplay. A guard adopted there would have passed forever while the athletics scene collapsed. Stability is a property of *held* frames, and menus, results screens and pause overlays are the most held frames a title has, so the metric is actively biased toward them. Rank windows to shortlist; **decide by opening the images**. Same family as the earlier note that a diagnostic clear can out-score real content on distinct colours. |
 | 30 | **A wall-clock guard window placed in a route that keeps moving** | A content guard samples by wall-clock seconds, but in a route that drives the player *forward* the scene at second N is a function of ~N seconds of accumulated progress, so ordinary run-to-run variance moves the **scene**, not just the timing. Joe & Mac's movement route passed `verify` twice and a `check` twice, then the third run drifted onto a level transition plus two death fades and failed 19 structural matches against 24 required — no build change, same route. Replacing it with the **stationary** route inverted the problem: the player is killed every ~22 s but respawns to the *same* opening screen, so a 73-frame window spanning three lives is one visual state and tolerates the deaths (69 matches against 55 required, worst-frame SSIM 0.97 instead of 0.81). The more impressive route made the worse guard. Prefer a route whose guarded span is **self-restoring** — an idle screen, a respawn loop, a held camera — over one whose span is a trajectory, and treat two green runs as far too small a sample to call a moving window stable. |
+| 31 | The **first `grep` hit for a register**, when it has more than one consumer | Tracing why Astro's draws resolve `cwm=0`, `CB_COLOR_CONTROL.MODE` is read at `render_state.cpp:143` — where it feeds **only** the gated `PROSPER_MSAA_LOG` diagnostic. Reasoning from that site says MODE does not participate in mask resolution, which **inverts the conclusion**. The site that matters is ~650 lines later, where `MODE == DISABLE` explicitly zeroes `color_write_mask`, `color1_write_mask` and every `color_targets[].write_mask`. Same symbol, two consumers, opposite implications — and nothing at the first site announces that it is not the one. **Find the consumer on the path you are reasoning about**: for a render-state question that is where the pipeline state is built, not where a diagnostic prints. |
 
 **Detecting the generated-prose trap (#27), because it generalises past `.pad` files:**
 
@@ -807,13 +808,21 @@ Do not re-investigate the masks, the MODE decode, or the register fold: decode c
 cross-title (Blue Prince renders through this path at MODE=1; Oregon Trail measured ~12,000 writes with
 zero mismatches across 1,050 suppressed draws).
 
-**The one caveat that bounds this result.** `PROSPER_REGWATCH` observes writes only in streams prosper
-actually *folds*. If a submit is never folded, its register writes are invisible to this measurement as
-well as to the renderer. That is the #305 class one lane over (a cross-thread `SubmitDcbFinal` whose
-state prosper handles differently), so **whether Astro uses the variant submit path, and whether every
-submit is folded, is the next thing to check** before concluding the guest genuinely never enables
-colour. `CONFIDENCE: HIGH` that prosper faithfully reproduces what it observes; `CONFIDENCE: MED` that
-what it observes is everything the guest submits.
+**The bound was checked and closed.** `PROSPER_REGWATCH` observes writes only in streams prosper
+actually *folds*, so a never-folded submit would be invisible to it **and** to the renderer — the #305
+class one lane over. Both halves come back clean:
+
+* **Astro never uses the variant submit path.** Scanning every module in the dump, only `eboot.bin`
+  touches the submit imports at all, and it imports `UglJIZjGssM` (ordinary `sceAgcDriverSubmitDcb`)
+  and **zero** `w1KFAHVqpaU` (`SubmitDcbFinal`). The `UglJIZjGssM` hit is the scan's own control. So
+  the cross-thread mechanism cannot apply here.
+* **Every submit folds completely.** Across two full routed runs: **zero** `SHORT FOLD`, **zero**
+  `SUBSTITUTED STREAM ADDRESS`, **zero** `invalid arg9` / `no PM4 stream` (the #1665 instruments are
+  unconditional, so the existing logs answered this without a new run).
+
+So `CONFIDENCE: HIGH` on both halves: prosper faithfully reproduces what it observes, and what it
+observes is everything the guest submits. **The cause is upstream of GPU state entirely** — the world
+map's render pass is never set up to shade. That is a scene/pipeline question, not a register one.
 
 ### Superseded: "a frame-wide zero colour write mask" (the framing above answers it)
 
