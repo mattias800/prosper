@@ -37,6 +37,7 @@
 // and an injected clock (test_frame_grab_naming.cpp).
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -141,6 +142,10 @@ struct FrameGrabPaths {
     unsigned suffix = 0;      // 0 = the preferred name was free; 2.. = a collision forced this suffix
     unsigned index = 0;       // this session's Nth grab — for the log line, never for the filename
     std::string error;        // why !ok
+    // Non-fatal, but the caller must SAY it: a rollback that could not remove its own half-claim
+    // strands a zero-byte .prgbundle with no matching .bmp — exactly the unexplained orphan this
+    // file exists to prevent, so it cannot be left to be discovered in a directory listing.
+    std::string warning;
 };
 
 // Create `path` only if it does not exist. Returns false with errno set; errno == EEXIST means the
@@ -194,10 +199,13 @@ inline FrameGrabPaths reserve_frame_grab(const std::string& dir, const std::stri
         }
         errno = 0;
         if (!create_file_exclusive(shot)) {
-            const int err = errno;
+            const int err = errno;                    // captured BEFORE remove(), which clobbers errno
             // Release the half-claim. This capture owns both names or neither; leaving the bundle
             // behind would strand an empty file that no capture is going to write.
             std::filesystem::remove(bundle, ec);
+            if (ec)
+                out.warning = "could not remove the released reservation " + bundle + ": " +
+                              ec.message() + " (an empty .prgbundle with no .bmp is stranded there)";
             if (err == EEXIST) continue;
             out.error = "cannot create " + shot + ": " + std::strerror(err);
             return out;
@@ -267,9 +275,16 @@ private:
 // ---------------------------------------------------------------------------------------------
 
 // "[grab] F9 #2: arming a whole-frame capture for PPSA25009 (Blue Prince)"
+//
+// The label carries the title's DISPLAY name, copied out of the dump's param.json without
+// sanitisation, so it can contain anything — including " -> ". An arm line that parses as a write
+// line would hand a log reader a path that never existed, which is this file's whole subject, so the
+// arrow is folded out of the label rather than trusted not to appear.
 inline std::string frame_grab_arm_line(unsigned index, const std::string& title_label) {
-    return "[grab] F9 #" + std::to_string(index) + ": arming a whole-frame capture for " +
-           (title_label.empty() ? std::string("an unidentified title") : title_label);
+    std::string label = title_label.empty() ? std::string("an unidentified title") : title_label;
+    for (size_t k = label.find(" -> "); k != std::string::npos; k = label.find(" -> ", k))
+        label.replace(k, 4, " - ");
+    return "[grab] F9 #" + std::to_string(index) + ": arming a whole-frame capture for " + label;
 }
 
 // "[grab] bundle written (312 submits) [name collision: suffix -2] -> ./frame_grab_....prgbundle"

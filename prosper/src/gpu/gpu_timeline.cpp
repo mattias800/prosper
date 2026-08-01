@@ -1995,7 +1995,7 @@ void observe_guest_log_for_capture(const char* bytes, size_t size,
     }
     std::fprintf(stderr,
                  "[grab] exact guest-log line matched via %s; whole-frame capture armed after "
-                 "one completed present -> %s\n",
+                 "one completed present; target path %s\n",
                  source_names.empty() ? "unknown" : source_names.c_str(), state.path.c_str());
 }
 
@@ -2121,7 +2121,10 @@ void interactive_frame_bundle_on_present() {
             b.arm_delay_presents = 0;
             b.bundle = GpuCaptureBundle{}; b.submits = 0; b.frames_seen = 0; b.failed = false;
             b.pending_failure_error.clear();
-            std::fprintf(stderr, "[grab] frame-bundle: capturing %u frames -> %s\n",
+            // No arrow here, deliberately: " -> <path>" is reserved for a line emitted AFTER the
+            // file exists (see frame_grab_naming.hpp). This one names a TARGET — the capture can
+            // still abort, and a reader scanning for artifacts must not collect it as one.
+            std::fprintf(stderr, "[grab] frame-bundle: capturing %u frames; target path %s\n",
                          b.frames_wanted, b.current_path.c_str());
         }
     }
@@ -2130,7 +2133,9 @@ void interactive_frame_bundle_on_present() {
         const size_t n = write_bundle.submits.size();
         const bool written = write_gpu_capture_bundle(write_path, write_bundle, error);
         if (written)
-            std::fprintf(stderr, "[grab] frame-bundle -> %s (%zu submits)\n", write_path.c_str(), n);
+            // Path LAST. This line reports a file that now exists, so it may carry an arrow — but
+            // anything after the path turns the documented read into a path that does not exist.
+            std::fprintf(stderr, "[grab] frame-bundle written (%zu submits) -> %s\n", n, write_path.c_str());
         else
             std::fprintf(stderr, "[grab] frame-bundle write failed: %s\n", error.c_str());
         InteractiveFrameBundle& b = interactive_frame_bundle();
@@ -2770,7 +2775,7 @@ void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64
         !scheduled_fired.exchange(true, std::memory_order_acq_rel)) {
         request_interactive_capture_bundle(scheduled.path, scheduled.max_mb);
         std::fprintf(stderr,
-                     "[grab] scheduled whole-frame capture at present %llu -> %s\n",
+                     "[grab] scheduled whole-frame capture armed at present %llu; target path %s\n",
                      static_cast<unsigned long long>(present_count), scheduled.path.c_str());
     }
     interactive_frame_bundle_on_present();

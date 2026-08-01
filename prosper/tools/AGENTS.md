@@ -174,14 +174,20 @@ in two states.)
 
 The console tells you the real paths, and only once they exist. The arming line names the title, not a
 file — at arm time the eventual name is not yet a fact — and each artifact is reported by its own line
-after it is written, ending in ` -> <path>` with nothing after the path, so it can be read
-mechanically:
+after it is written:
 
 ```
 [grab] F9 #1: arming a whole-frame capture for PPSA25009 (Blue Prince)
 [grab] screenshot written (armed at guest present 41207, written at guest present 41209) -> ./frame_grab_PPSA25009_20260801-142233-471.bmp
 [grab] bundle written -> ./frame_grab_PPSA25009_20260801-142233-471.prgbundle
 ```
+
+**To collect artifacts from a log mechanically, match the two prefixes `[grab] screenshot written` and
+`[grab] bundle written`, and take everything after the first ` -> `.** Not every `[grab]` line is an
+artifact report: the layer underneath also prints progress, arming and abort lines (`[grab]
+frame-bundle: capturing 1 frames; target path …`, `[grab] frame-bundle written (312 submits) -> …`),
+and the env-driven capture flows print their own. Those name a *target* or a *stage*, and a target is
+not a file that exists. The two prefixes above are emitted only after the file is on disk.
 
 It is purely on-demand — nothing heavy runs until you
 press, so the grab never distorts the very slowdown you are observing (you will see a brief hitch on the

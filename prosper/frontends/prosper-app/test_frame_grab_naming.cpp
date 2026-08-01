@@ -271,6 +271,34 @@ int main() {
         std::filesystem::remove_all(dir, ec); std::filesystem::create_directories(dir, ec);
     }
 
+    // --- the mirror collision: the BUNDLE name is taken, the screenshot name is free -------------
+    // The simpler branch, and the one that must NOT roll anything back: the bundle create fails
+    // before the screenshot name is ever touched, so no orphan can be left at the unsuffixed stem.
+    {
+        const auto t = at_epoch_ms(1'722'517'353'471LL);
+        const std::string stamp = format_frame_grab_stamp(t);
+        const std::string taken = dir + "/frame_grab_PPSA17942_" + stamp + ".prgbundle";
+        write_file(taken, "AN EARLIER CAPTURE");
+        const FrameGrabPaths grab = reserve_frame_grab(dir, "PPSA17942", t);
+        CHECK(grab.ok && grab.suffix == 2, "a taken bundle name moves the whole capture to -2");
+        CHECK(read_file(taken) == "AN EARLIER CAPTURE",
+              "the pre-existing bundle still holds its bytes");
+        CHECK(!std::filesystem::exists(dir + "/frame_grab_PPSA17942_" + stamp + ".bmp"),
+              "the free screenshot name at the taken stem is never created");
+        CHECK(listing(dir).size() == 3, "the pre-existing file plus the new capture's two");
+        std::filesystem::remove_all(dir, ec); std::filesystem::create_directories(dir, ec);
+    }
+
+    // --- the capture directory need not exist yet ------------------------------------------------
+    {
+        const std::string nested = dir + "/made/by/the/reservation";
+        const FrameGrabPaths grab = reserve_frame_grab(nested, "PPSA25009",
+                                                       at_epoch_ms(1'722'517'353'471LL));
+        CHECK(grab.ok, "PROSPER_CAPTURE_DIR is created when it is absent");
+        CHECK(listing(nested).size() == 2, "both files land in the created directory");
+        std::filesystem::remove_all(dir, ec); std::filesystem::create_directories(dir, ec);
+    }
+
     // --- a capture with no title still gets a well-formed name ----------------------------------
     {
         const FrameGrabPaths grab = reserve_frame_grab(dir, "", at_epoch_ms(1'722'517'353'471LL));
@@ -293,6 +321,14 @@ int main() {
               "the arming line names no file and carries no path");
         CHECK(frame_grab_logged_path(arm).empty(),
               "a reader extracting paths from the log finds none in an arming line");
+        // The label carries the title's DISPLAY name, taken from the dump's param.json without
+        // sanitisation. A name containing the artifact arrow would otherwise make the arming line
+        // parse as a write line and hand the reader a path that never existed.
+        const std::string hostile = frame_grab_arm_line(1, "PPSA00000 (Title -> Subtitle)");
+        CHECK(frame_grab_logged_path(hostile).empty(),
+              "an arrow inside the title name cannot turn an arming line into an artifact report");
+        CHECK(hostile.find("Subtitle") != std::string::npos,
+              "...and the name is still shown, not dropped");
         CHECK(frame_grab_logged_path("[grab] bundle written -> /out/x.prgbundle\n") == "/out/x.prgbundle",
               "a write line's path is everything after the arrow, newline excluded");
         // PROSPER_CAPTURE_DIR is an arbitrary directory, so the PATH can contain an arrow while the
