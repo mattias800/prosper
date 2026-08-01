@@ -74,11 +74,13 @@ completely different fixes:
                | LIFE: nonzero=1782048/18456576 peak=0.38976 rms=0.01033 nan=0
 ```
 
-That is a real *Dragon Quest VII* capture, and the port line alone diagnoses the title: the guest is
-handing us 2,310,144 bytes per second of genuine audio (`LIFE:` run peak **0.38976**, 1.78 M non-zero
-samples, `nan=0` ruling out a NaN artifact), and `mixed=0` with `skip-fmt=188` says prosper discards
-every grain of it because the port declares 12 channels. Its context correspondingly shows
-`sink=never-opened` and `BED LIFE: nonzero=0/3944448` — nothing from it ever reaches the device.
+That is a real *Dragon Quest VII* capture from **before #1700**, and the port line alone diagnoses the
+title: the guest is handing us 2,310,144 bytes per second of genuine audio (`LIFE:` run peak
+**0.38976**, 1.78 M non-zero samples, `nan=0` ruling out a NaN artifact), and `mixed=0` with
+`skip-fmt=188` says prosper discards every grain of it because the port declares 12 channels. Its
+context correspondingly shows `sink=never-opened` and `BED LIFE: nonzero=0/3944448` — nothing from it
+ever reaches the device. It is kept here because it is the clearest example of the signature; on
+current master the same route reports `mixed=188 skip-fmt=0 sink=open`.
 
 Note how little the interval columns would tell you on their own: this line's `peak=0.15349` happens
 to be a quiet moment, and other intervals in the same run read `nonzero=0/577536` outright. The
@@ -122,18 +124,80 @@ Read the counters, not just presence:
 - **Per-port attribution** locates loss the mixed bed hides: `skip-not-main` (a port with signal
   discarded for not being MAIN), `skip-fmt` (unsupported layout), `no-pcm` (no buffer published),
   `short` (a partial/faulting guest read).
-- A port **rejected for its format is still read and measured** under this probe, because a rejected
-  port is exactly where lost audio would hide — "nothing there" must be a measurement, not an
-  assumption. Rejection still discards it from the mix; only the diagnostic reads it. Treat such a
-  reading as slightly lower confidence than an accepted port's: the read length is derived from the
-  context grain and a layout prosper does not support, so an over-read past the guest buffer would
-  be attributed to that port. It is fault-safe and cannot invent silence, but it could in principle
-  inflate `nonzero` — confirm a surprising result against the producing code before acting on it.
+- **`skip-fmt` now means only "unsupported sample type".** Since #1700 every channel count the
+  decoder reports (1..16) is folded and mixed, so a `skip-fmt` port is one whose `data_format` low
+  bits are neither `0` (f32) nor `1` (s16). Such a port cannot be sized, so it is not read and its
+  signal columns stay zero — but it is no longer silent about it: the mix loop prints
+  `[audio2] portN DISCARDED: …` unconditionally, rate-limited per port. Implement the sample type;
+  do not leave it skipped.
 - **`peak=inf` / `rms=inf` is a correct reading, not a probe bug.** Infinities are deliberately not
   filtered the way NaN is: the output path clamps `+Inf` to `+1.0`, so an Inf-producing guest is
   genuinely, loudly audible and belongs in the signal statistics. Because `LIFE:` never resets, one
   Inf pins the run peak and rms for the rest of the session — read the per-interval columns to see
   where it came from, and treat it as a guest-side mixing defect worth its own investigation.
+
+## Multichannel MAIN beds and the stereo fold — `PROSPER_AUDIO_LAYOUT=1`
+
+prosper's host sink is stereo, so a MAIN port wider than two channels has to be folded down. The
+fold is a pure function, `audio_stereo_downmix(channels, out, capacity)` in `src/hle/audio.hpp`,
+returning one `{left, right}` gain per **source** channel plus a count of channels it could **not**
+place. The mix loop does nothing but apply it, so the whole correctness surface of multichannel
+output is unit-tested in `test_audio` without a device or a guest.
+
+| channels | placement |
+|---|---|
+| 1 | mono to both sides |
+| 2 | identity |
+| 3 | FL FR FC (centre -3 dB to both) |
+| 4 | quad: FL FR SL SR |
+| 5 | FL FR FC SL SR |
+| 6 | 5.1: FL FR FC LFE(-6 dB, both) SL SR |
+| 7 | 6.1: adds a rear centre, -3 dB halved across both sides |
+| 8 | 7.1: adds a second surround pair |
+| 9..16 | first eight as 7.1; the remaining height tier is **unplaced** and reported |
+
+A fold is only correct if you know each source channel's **side**. `data_format` carries a channel
+count and nothing else, so the order is not derivable from it — and a wrong order sounds plausible,
+which is worse than silence because it reads as working. `PROSPER_AUDIO_LAYOUT=1` measures the
+guest's own PCM instead of assuming an enumeration, reporting every five seconds per port:
+
+```text
+[audio-layout] port1 ctx0 type=0x0 fmt=0xc00 channels=12 grain=256 frames=6856704 \
+               stride=n/a (single grain buffer 0x301e393a88, 26784 publications)
+[audio-layout]   ch0  rms=0.028960 peak=0.389781 nonzero= 89.8% hf=0.1210 corr= +1.00 +0.46 …
+```
+
+- **`rms` / `peak` / `nonzero%`** — which channels carry the bed *at all*. A height channel a title
+  never uses is then measurably absent rather than assumed quiet. Read `nonzero%` alongside `rms`:
+  the two are not the same finding, and a formatted `rms=0.000000` covers both an exactly-zero
+  channel and a ~1e-9 residue.
+- **`hf` = RMS(x[n]−x[n−1]) / RMS(x)** — spectral tilt. An LFE feed is low-passed near 120 Hz, so at
+  48 kHz it reads ~0.016 while full-band content reads ~0.3..1.5. This identifies LFE from content
+  alone, at any index.
+- **`corr`** — the full normalized cross-correlation matrix. A front pair is strongly but not
+  perfectly correlated, a duplicated channel reads +1.00, an independent channel reads ~0. This is
+  what assigns each channel a left/right side, which is all a stereo fold needs.
+- **`stride`** — the smallest distance between two distinct grain pointers the guest publishes. A
+  double-buffering title makes this one grain's byte size, an **independent** measure of the channel
+  count rather than a restatement of the `data_format` decode. A single-buffer title reports
+  `stride=n/a` with the pointer and publication count, which is a finding, not a missing value.
+
+`PROSPER_AUDIO_LAYOUT_DUMP=PATH` additionally appends each measured port's raw interleaved grain to
+`PATH.portN.f32` as float32 (both sample types converted), so the measurement can be re-derived,
+analysed differently, or rendered to something audible offline.
+
+**What this established for *Dragon Quest VII Reimagined* (#1700).** Over 19,962,368 frames of its
+12-channel MAIN port: all content is in ch0/ch1 (rms 3.1e-2 / 4.3e-2, peak 0.407, correlation
++0.46 — a real decorrelated stereo pair); ch2 and ch4..ch7 hold a ~1e-9 residue; **ch3 and
+ch8..ch11 are exactly zero**. The title writes a stereo mix into a 12-channel container, never
+sends LFE, and never writes the height tier. Within the residue, ch4/ch6 correlate +0.96 and
+ch5/ch7 +0.95 while ch4/ch5 is −0.04, so the surround tier pairs even=left / odd=right, and ch2
+correlates near-equally with both groups — corroborating the 6..8 mapping above from live content
+(CONFIDENCE: MED; the level is far below anything audible). **Channels 8..15 have no measured side
+anywhere yet**, so they are deliberately left unplaced and logged rather than folded on a guess;
+`sceAudioOut2PortCreate`'s `portParam` carries no layout field (`{u16 type, u16 pad, u32
+dataFormat, u32 sampleRate, u32 flags, u64 userHandle}` — live-captured), and this title never
+calls `sceAudioOut2GetSpeakerInfo`, so nothing in the guest's own setup names the order.
 
 Related, narrower probes: `PROSPER_AUDIOLOG=1` (legacy `sceAudioOut` path: per-port calls, bytes,
 peak and RMS), `PROSPER_AUDIO_DUMP=PATH` (raw `PATH.portN.raw` PCM for offline inspection),
