@@ -87,6 +87,28 @@ count, read the last row's number.
 | 24 | A log whose **emission gate** is narrower than the population you reason over | `[udmap]` (#305) prints a stage's user-data map **only under failure replay**, so every row it emits is a stage that ALREADY FAILED. Its rows therefore sample failures, not stages — and a row showing readable pointers is a stage that failed for a *different* reason, **not a passing stage**. Building a pass/fail table from it silently answers a question it was never sampling. Same category error as #9 and #13 (a count that answers "did this ever happen?" but not "how often?"), one level up: here the **rows** are the biased sample, not the counts. Before treating any log's rows as a population, read the condition it is emitted under — grep the `if` above the `fprintf`, do not infer it from the message text. |
 | 25 | `gh pr merge --delete-branch` run **from a worktree** | After the server-side merge succeeds, `gh` tries to check out the base branch locally and dies with `fatal: 'master' is already used by worktree at …` — which is unavoidable from a worktree, since master is checked out in the main tree. **The merge lands; the branch survives; the exit status does not cleanly separate the two.** Two lanes hit this in one session, both on their own merge. Read as "the merge failed" it invites a retry against an already-merged PR; read as "it all worked" it leaves a stale remote branch that later reads as an unfinished lane (and doubles as a false claim-lock, per the claim rules). Verify the two halves **separately**: `gh pr view N --json state,mergeCommit` for the merge, `git ls-remote origin 'refs/heads/<branch>'` for the branch, then `git push origin --delete <branch>` explicitly. |
 | 26 | A **commit-SHA-pinned asset URL** in a PR body or issue | Screenshots referenced as `raw.githubusercontent.com/<org>/<repo>/<sha>/…` break silently once that SHA is **orphaned** — which a rebase does immediately and a squash merge does at merge time. The images render perfectly while the PR is open and are dead weeks later, when nobody can reconstruct what they showed. Pin progression evidence to a **branch that survives** (`…/master/assets/screenshots/…`) once the file is on it, and re-point any SHA URL after the final rebase. Cousin of #11: both are the same mistake of treating a SHA as a stable name across a history rewrite. |
+| 27 | **A confident document header with no observation behind it** | Three parked `reach-gameplay.pad` drafts (Joe & Mac, Asterix, Summer Sports) carried three *different* title-specific rationales — "Options is a fallback for a start-button title prompt", "the title screen is reached with no input at all", "Cross confirms the default selector entries" — over **byte-identical input sequences** (`md5` of the non-comment lines matched across all three). Three different findings cannot come from one identical button mash, so the prose was generated, not observed. The genuine routes were in the tracking issues the whole time. |
+
+**Detecting the generated-prose trap (#27), because it generalises past `.pad` files:**
+
+When several artifacts claim *independent* findings, **diff their substance, not their prose**. Identical
+bodies under differing explanations means the explanations were written to sound like observations:
+
+```bash
+# strip the commentary and compare only the load-bearing content
+for d in joe-mac asterix summer-sports; do grep -v '^#' "$d/reach-gameplay.pad" | md5sum; done
+```
+
+Seconds of work invalidated three documents. The same check applies to route scripts, per-title status
+docs, issue comments and PR bodies — anywhere parallel artifacts assert parallel results.
+
+This is **worse than a stale `UNVALIDATED` banner**, and for a specific reason: a banner tells the reader
+to check. A confident, specific, plausible header tells the reader **not to bother**, so it survives every
+subsequent reading. The remedy is not to flip a banner but to **add accurate provenance where a confident
+claim has none** — hold a route header to the `scripts/greak/reach-gameplay.pad` standard, which cites
+*observed* phase timings ("the title screen appears at roughly 112 s on a Linux hardware-Vulkan boot")
+rather than asserted behaviour. A claim marked ✅ on a run nobody can reproduce is the same defect one
+level up.
 
 **Working rules that follow:**
 
@@ -508,6 +530,25 @@ tr '\0' '\n' < /proc/<pid>/environ | grep PROSPER_   # and whose run?
 Before terminating anything, confirm the exact PID **and** that its `cwd`/`environ` identify it as yours. Never
 kill from a pattern count. Note `comm` is truncated to 15 characters by the kernel, so a longer binary name needs
 `pgrep -f` with a **bracketed** pattern (`pgrep -f "prosper[-]app"`) so it cannot match your own shell.
+
+**`pgrep -x screenshot` does not see a snapshot run.** `capture_content` copies the frontend to
+`$TMPDIR/snap_<rand>/screenshot_snap` and executes *that*, so every `snapshot.py` profile, `verify`, and
+`check` runs under the name **`screenshot_snap`**. Checking only the four obvious consumers reports a free
+GPU while a peer is two full boots into a `verify` — the longest-running GPU job in this repo. Include it:
+
+```bash
+for n in prosper-app boot_trace gpu_replay screenshot screenshot_snap; do
+  printf '%s: %s\n' "$n" "$(pgrep -x "$n" | wc -l)"
+done
+```
+
+Observed 2026-08-01: a lane's own live profile showed `screenshot: 0` and `screenshot_snap: 1`. The same
+applies to any harness that runs a copied or renamed binary — resolve the *executed* name, not the built one.
+
+**A clean count is a snapshot, not a lease.** On the same day, a sustained-idle watch confirmed 120 s with
+zero consumers, and a peer lane started a `boot_trace` 60 s later, concurrent with the run that idle check
+had authorized. Sustained idle lowers the odds of landing inside a peer's inter-run gap; it cannot reserve
+anything. If overlap would invalidate your measurement, say so and re-run — do not kill the peer.
 
 ### Fast evidence loop
 
