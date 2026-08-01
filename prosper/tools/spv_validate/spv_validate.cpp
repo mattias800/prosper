@@ -16,12 +16,17 @@
 //      never installed it — so the gate that CLAUDE.md and both READMEs describe as strict had, in
 //      CI, validated nothing at all.
 //
-// Both are closed below: check_emitter_coverage() reads the emitter headers and fails on any entry
-// point this corpus does not call, and an absent spirv-val is a hard failure rather than a pass.
+// Both are closed below: check_emitter_coverage() reads every graphics header and fails on any
+// declared emitter this run did not actually emit a validated module from, and an absent spirv-val
+// is a hard failure rather than a pass.
 #include "../../src/gpu/rdna2_to_spirv.hpp"
 #include "../../src/gpu/shader_resources.hpp"
 #include "../../src/gpu/spirv_builder.hpp"
+#include <algorithm>
 #include <cctype>
+#include <filesystem>
+#include <set>
+#include <system_error>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -62,7 +67,15 @@ static bool run_spirv_val(const std::string& path, std::string& message) {
     return rc == 0;
 }
 
-static void dump(const std::string& dir, const char* name, const std::vector<uint32_t>& spv) {
+// Emitters this run actually produced a module from. Recorded here, at the point of use, rather
+// than inferred from the source text: coverage then means "this emitter ran and its output was
+// validated", which is the property the gate is for. A textual check could be satisfied by a
+// call-shaped string in a comment, a string literal, or a call whose result is thrown away.
+static std::set<std::string> exercised_emitters;
+
+static void dump(const std::string& dir, const char* name, const std::vector<uint32_t>& spv,
+                 const char* emitter = nullptr) {
+    if (emitter) exercised_emitters.insert(emitter);
     if (spv.empty() || spv[0] != 0x07230203u) { printf("  [FAIL] %-26s did not recompile\n", name); fails++; return; }
     std::string path = dir + "/" + name + ".spv";
     FILE* f = fopen(path.c_str(), "wb");
@@ -82,113 +95,121 @@ static void dump(const std::string& dir, const char* name, const std::vector<uin
 
 // --- Emitter coverage -------------------------------------------------------------------------
 // An entry point that emits SPIR-V but has no module here is invisible to this gate, and nothing
-// reports the omission: that is exactly how #1711 survived. So read the two emitter headers, and
-// fail on any declared emitter this file does not call. Gaps are allowed, but only in writing.
-// The list is EMPTY, and that is the intended state: every declared emitter below has a module.
-// A gap belongs here only with the issue that tracks it, never as a silent omission.
-// (#1715 — the generated geometry stage's missing OpExecutionMode Invocations — is deliberately
-// NOT a gap: measured, that module passes spirv-val under both the universal and the vulkan1.1
-// environments. 00715 is a Vulkan pipeline-creation rule that spirv-val does not check, so it is
-// the validation layer's to catch, not this gate's, and the emitter is covered here regardless.)
+// reports the omission: that is exactly how #1711 survived. So read the emitter declarations out of
+// the graphics headers and fail on any that this run did not actually emit a module from.
+//
+// Coverage is a RUNTIME fact (`exercised_emitters`, recorded inside dump()), not a grep of this
+// file. A source-text check would accept a call-shaped string in a comment or a string literal, or
+// a call whose result is discarded — and "a check a comment can pass" is the shape of defect this
+// file exists to stop.
+//
+// The list of gaps is EMPTY, and that is the intended state. A gap belongs here only with the issue
+// that tracks it, never as a silent omission.
+// (#1715 — the generated geometry stage's missing OpExecutionMode Invocations — is deliberately NOT
+// a gap: measured, that module passes spirv-val under both the universal and the vulkan1.1
+// environments. 00715 is a Vulkan pipeline-creation rule that spirv-val does not check, so it is the
+// validation layer's to catch, and the emitter is covered here regardless.)
 struct KnownGap { const char* emitter; const char* reason; };
 static const std::vector<KnownGap> kKnownGaps = {};
 
-// A header declaration of the form "std::vector<uint32_t> name(" at column 0 whose name begins with
-// recompile_ or build_. The column-0 requirement excludes struct members of the same type, and the
-// prefix requirement excludes the RDNA2->RDNA2 stream transforms that share the return type.
+// Names the scan finds that are NOT distinct SPIR-V producers. The default is deliberately
+// inverted: an unclassified name fails, so a new emitter cannot be quietly skipped — only a
+// deliberate entry here can exempt one, and it has to say why.
+struct NotAnEmitter { const char* name; const char* why; };
+static const NotAnEmitter kNotEmitters[] = {
+    {"safe_execz_branches_for_test", "returns a transformed RDNA2 instruction stream, not SPIR-V"},
+    {"mask_test_branches_for_test",  "returns a transformed RDNA2 instruction stream, not SPIR-V"},
+    {"recompile_graphics_shader_cached",
+     "caching wrapper; ctest shader_recompile_cache asserts its words are byte-identical to the "
+     "direct emitter, which is validated here"},
+    {"recompile_compute_shader_cached",
+     "caching wrapper; ctest shader_recompile_cache asserts its words are byte-identical to the "
+     "direct emitter, which is validated here"},
+};
+
+// Every declaration of a function returning std::vector<uint32_t>, whitespace-tolerant and with no
+// name-prefix filter — both of those were false-PASS directions: a differently named emitter, or one
+// written with a leading qualifier or an extra space, would simply not be seen. Struct members of
+// the same type are excluded by requiring the '(' of a parameter list.
 static std::vector<std::string> declared_emitters(const std::string& header_text) {
-    static const std::string kDecl = "std::vector<uint32_t> ";
+    static const std::string kRet = "std::vector<uint32_t>";
     std::vector<std::string> names;
-    size_t line_start = 0;
-    while (line_start <= header_text.size()) {
-        const size_t line_end = header_text.find('\n', line_start);
-        const std::string line = header_text.substr(
-            line_start, line_end == std::string::npos ? std::string::npos : line_end - line_start);
-        if (line.compare(0, kDecl.size(), kDecl) == 0) {
-            size_t i = kDecl.size();
-            std::string name;
-            while (i < line.size() && (std::isalnum((unsigned char)line[i]) || line[i] == '_'))
-                name.push_back(line[i++]);
-            if (i < line.size() && line[i] == '(' &&
-                (name.rfind("recompile_", 0) == 0 || name.rfind("build_", 0) == 0))
-                names.push_back(name);
-        }
-        if (line_end == std::string::npos) break;
-        line_start = line_end + 1;
+    size_t at = 0;
+    while ((at = header_text.find(kRet, at)) != std::string::npos) {
+        size_t i = at + kRet.size();
+        while (i < header_text.size() && std::isspace((unsigned char)header_text[i])) ++i;
+        std::string name;
+        while (i < header_text.size() &&
+               (std::isalnum((unsigned char)header_text[i]) || header_text[i] == '_'))
+            name.push_back(header_text[i++]);
+        while (i < header_text.size() && std::isspace((unsigned char)header_text[i])) ++i;
+        if (!name.empty() && i < header_text.size() && header_text[i] == '(') names.push_back(name);
+        at += kRet.size();
     }
     return names;
 }
 
-// Line comments are removed before searching for a call. Without this, the header comment above
-// naming build_compute_compare_uvec4() would satisfy the coverage check for an emitter this file
-// had stopped calling — a check that a comment can pass is the shape of defect this whole file
-// exists to stop. (Block comments are not stripped; this file uses none, and the failure direction
-// of that gap is a false PASS only for an emitter mentioned inside one.)
-static std::string strip_line_comments(const std::string& text) {
-    std::string out;
-    out.reserve(text.size());
-    size_t line_start = 0;
-    while (line_start <= text.size()) {
-        const size_t line_end = text.find('\n', line_start);
-        const size_t stop = line_end == std::string::npos ? text.size() : line_end;
-        const size_t comment = text.find("//", line_start);
-        out.append(text, line_start, (comment != std::string::npos && comment < stop ? comment
-                                                                                    : stop) - line_start);
-        out.push_back('\n');
-        if (line_end == std::string::npos) break;
-        line_start = line_end + 1;
-    }
-    return out;
-}
-
 static int check_emitter_coverage(const std::string& src_root) {
-    static const char* kHeaders[] = {"src/gpu/rdna2_to_spirv.hpp", "src/gpu/spirv_builder.hpp"};
-    const std::string self_raw = read_text(src_root + "/tools/spv_validate/spv_validate.cpp");
-    if (self_raw.empty()) {
-        printf("  [FAIL] emitter coverage: cannot read %s/tools/spv_validate/spv_validate.cpp\n",
-               src_root.c_str());
+    // Every graphics header, not a hardcoded pair: an emitter declared in a NEW header is precisely
+    // the #1711 shape one level up, and a fixed list cannot see it.
+    const std::string gpu_dir = src_root + "/src/gpu";
+    std::vector<std::string> headers;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(gpu_dir, ec))
+        if (entry.path().extension() == ".hpp") headers.push_back(entry.path().string());
+    if (ec || headers.empty()) {
+        printf("  [FAIL] emitter coverage: cannot enumerate %s (%s)\n", gpu_dir.c_str(),
+               ec ? ec.message().c_str() : "no headers found");
         return 1;
     }
-    const std::string self = strip_line_comments(self_raw);
+    std::sort(headers.begin(), headers.end());
+
     int problems = 0;
-    std::vector<std::string> all;
-    for (const char* header : kHeaders) {
-        const std::string text = read_text(src_root + "/" + header);
-        if (text.empty()) {
-            printf("  [FAIL] emitter coverage: cannot read %s/%s\n", src_root.c_str(), header);
-            ++problems;
-            continue;
+    std::set<std::string> declared;
+    for (const std::string& header : headers)
+        for (const std::string& name : declared_emitters(read_text(header))) {
+            bool excluded = false;
+            for (const NotAnEmitter& n : kNotEmitters) excluded = excluded || name == n.name;
+            if (!excluded) declared.insert(name);
         }
-        for (const std::string& name : declared_emitters(text)) {
-            all.push_back(name);
-            const bool exercised = self.find(name + "(") != std::string::npos;
-            const KnownGap* gap = nullptr;
-            for (const KnownGap& g : kKnownGaps)
-                if (name == g.emitter) gap = &g;
-            if (exercised && gap) {
-                printf("  [FAIL] emitter coverage: %s is now validated, so its known-gap entry is "
-                       "stale — delete it\n", name.c_str());
-                ++problems;
-            } else if (!exercised && !gap) {
-                printf("  [FAIL] emitter coverage: %s (%s) emits SPIR-V that this gate never "
-                       "validates.\n         Add a module for it below, or record it in "
-                       "kKnownGaps with the issue that tracks it.\n", name.c_str(), header);
-                ++problems;
-            } else if (!exercised) {
-                printf("  [gap]  %-26s not validated: %s\n", name.c_str(), gap->reason);
-            }
+
+    for (const std::string& name : declared) {
+        const bool exercised = exercised_emitters.count(name) != 0;
+        const KnownGap* gap = nullptr;
+        for (const KnownGap& g : kKnownGaps)
+            if (name == g.emitter) gap = &g;
+        if (exercised && gap) {
+            printf("  [FAIL] emitter coverage: %s is now validated, so its known-gap entry is "
+                   "stale — delete it\n", name.c_str());
+            ++problems;
+        } else if (!exercised && !gap) {
+            printf("  [FAIL] emitter coverage: %s emits SPIR-V that this gate never validates.\n"
+                   "         Add a module for it, passing \"%s\" as dump()'s emitter argument; or\n"
+                   "         record it in kKnownGaps with the issue that tracks it; or, if it does\n"
+                   "         not emit SPIR-V at all, name it in kNotEmitters with the reason.\n",
+                   name.c_str(), name.c_str());
+            ++problems;
+        } else if (!exercised) {
+            printf("  [gap]  %-26s not validated: %s\n", name.c_str(), gap->reason);
         }
     }
-    for (const KnownGap& g : kKnownGaps) {
-        bool declared = false;
-        for (const std::string& name : all) declared = declared || name == g.emitter;
-        if (!declared) {
+    for (const KnownGap& g : kKnownGaps)
+        if (!declared.count(g.emitter)) {
             printf("  [FAIL] emitter coverage: known-gap entry %s no longer names a declared "
                    "emitter — delete it\n", g.emitter);
             ++problems;
         }
-    }
-    if (!problems) printf("  [ok]   emitter coverage: every declared SPIR-V emitter is accounted for\n");
+    // An emitter exercised below but absent from every header means the scan stopped seeing it.
+    // That is the silent-coverage-loss direction, and it must not read as success.
+    for (const std::string& name : exercised_emitters)
+        if (!declared.count(name)) {
+            printf("  [FAIL] emitter coverage: a module was emitted from %s, but the header scan no "
+                   "longer finds it declared — the scan has stopped working\n", name.c_str());
+            ++problems;
+        }
+    if (!problems)
+        printf("  [ok]   emitter coverage: all %zu declared SPIR-V emitters emitted a validated "
+               "module\n", declared.size());
     return problems;
 }
 
@@ -218,11 +239,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    fails += check_emitter_coverage(src_root);
 
     // Compute ALU (float chain).
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
-      dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0)); }
+      dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0), "recompile_valu"); }
     // Compute + SMEM constant-buffer load (s_buffer_load_dword; routes to binding 2).
     { const uint32_t c[] = {0xf4000000u, 0xfa000004u, 0x7e000200u, 0xbf810000u};
       dump(dir, "compute_smem", recompile_valu(c, sizeof(c)/4, 1, 0)); }
@@ -232,7 +252,7 @@ int main(int argc, char** argv) {
       dump(dir, "compute_private_spill", recompile_valu(c, sizeof(c)/4, 0, 0)); }
     // Fragment: solid green (EXP MRT0).
     { const uint32_t c[] = {0x7E000280u,0x7E0202F2u,0x7E040280u,0x7E0602F2u,0xF800180Fu,0x03020100u,0xBF810000u};
-      dump(dir, "fragment_color", recompile_fragment(c, sizeof(c)/4)); }
+      dump(dir, "fragment_color", recompile_fragment(c, sizeof(c)/4), "recompile_fragment"); }
     // Fragment: Astro's exact wave64 MBCNT + device-global append allocation shape.
     { const uint32_t c[] = {
           0xD7660007u,0x0001007Fu,0xBEFC0380u,0xD8FA0014u,0x06000000u,
@@ -263,7 +283,7 @@ int main(int argc, char** argv) {
     // Vertex: fullscreen triangle from gl_VertexIndex (EXP POS0).
     { const uint32_t c[] = {0x36020081u,0x2C040081u,0x7E020D01u,0x7E040D02u,0x7E0A02F6u,0x7E0C02F2u,0x10020B01u,
                             0x08020D01u,0x10040B02u,0x08040D02u,0x7E060280u,0x7E0802F2u,0xF80008CFu,0x04030201u,0xBF810000u};
-      dump(dir, "vertex_fullscreen", recompile_vertex(c, sizeof(c)/4));
+      dump(dir, "vertex_fullscreen", recompile_vertex(c, sizeof(c)/4), "recompile_vertex");
       // Geometry-probe capture variant: gl_Position decorated for transform-feedback readback. Must
       // still pass spirv-val (Xfb capability + execution mode + member Offset/XfbBuffer/XfbStride).
       dump(dir, "vertex_xfb_capture", recompile_vertex(c, sizeof(c)/4, nullptr, nullptr, true)); }
@@ -330,7 +350,8 @@ int main(int argc, char** argv) {
       bvh.format=DataFormat::Uint32; bvh.num_components=1; bvh.binding=4;
       bvh.size=128; bvh.fetch_pc=0; rt.resources.push_back(bvh);
       ComputeShaderConfig cfg; cfg.local_x=1;
-      dump(dir, "compute_bvh_intersect", recompile_compute(c, sizeof(c)/4, &rt, cfg)); }
+      dump(dir, "compute_bvh_intersect", recompile_compute(c, sizeof(c)/4, &rt, cfg),
+           "recompile_compute"); }
     // Compute EXEC-predicated store (v_cmpx + guard execz + store).
     { const uint32_t c[] = {0x7e040f00u,0x06060100u,0x7e0a0284u,0x7da20b02u,0xbf880002u,0xe0102000u,0x80020302u,0xbf810000u};
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;
@@ -495,28 +516,33 @@ int main(int argc, char** argv) {
     // spirv_builder.cpp hand-assembles compute modules that the live frontend creates at runtime
     // (frontends/shared/live_compute.cpp: prepare_compare_pipeline / the scale-bias probe), so they
     // reach vkCreateShaderModule exactly like a recompiled shader. #1711 lived here.
-    dump(dir, "builder_scale_bias", build_compute_scale_bias(2.0f, 0.5f));
-    dump(dir, "builder_compare_uvec4", build_compute_compare_uvec4());
+    dump(dir, "builder_scale_bias", build_compute_scale_bias(2.0f, 0.5f),
+         "build_compute_scale_bias");
+    dump(dir, "builder_compare_uvec4", build_compute_compare_uvec4(),
+         "build_compute_compare_uvec4");
 
     // --- Recompiler entry points beyond the four main stage functions ---
     // Wave32 fragment lowering (s_wqm_b32 through the low-half EXEC/VCC mask path).
     { const uint32_t c[] = {0xbe80037eu,0xbefe0900u,0xbefe097eu,
                             0x7e000280u,0x7e020280u,0x7e040280u,0x7e0602f2u,
                             0xf800000fu,0x03020100u,0xbf810000u};
-      dump(dir, "fragment_wave32_wqm", recompile_fragment_wave32_for_test(c, sizeof(c)/4)); }
+      dump(dir, "fragment_wave32_wqm", recompile_fragment_wave32_for_test(c, sizeof(c)/4),
+           "recompile_fragment_wave32_for_test"); }
     // Terminal NGG output gate: CMPX + EXECZ around the POS export.
     { const uint32_t c[] = {0xBF900009u,0x34040A81u,0x36060AC2u,0x7E000280u,0x7E0202F2u,
                             0x36040482u,0x4A0606C1u,0x4A0404C1u,0x7E060B03u,0x7E040B02u,
                             0x7E280281u,0x7E2A0280u,0x7C3E2B14u,0xBF880002u,
                             0xF80008CFu,0x01000302u,0xBF810000u};
       dump(dir, "vertex_ngg_terminal_gate",
-           recompile_vertex_terminal_ngg_gate_for_test(c, sizeof(c)/4)); }
+           recompile_vertex_terminal_ngg_gate_for_test(c, sizeof(c)/4),
+           "recompile_vertex_terminal_ngg_gate_for_test"); }
     // One-lane NGG projection: a B64 mask scan reduced against the single live guest lane.
     { const uint32_t c[] = {0xBF900009u,0xBEEA04C1u,0xBE80146Au,0x7E000C00u,
                             0x7E020280u,0x7E040280u,0x7E0602F2u,
                             0xF80008CFu,0x03020100u,0xBF810000u};
       dump(dir, "vertex_ngg_one_lane",
-           recompile_vertex_ngg_one_lane_for_test(c, sizeof(c)/4)); }
+           recompile_vertex_ngg_one_lane_for_test(c, sizeof(c)/4),
+           "recompile_vertex_ngg_one_lane_for_test"); }
     // Split no-GS NGG program: a separately installed producer plus its terminal wrapper, recompiled
     // as one register-preserving module (the chain path the loader installs for real Astro draws).
     { const uint32_t producer[] = {
@@ -536,7 +562,8 @@ int main(int argc, char** argv) {
       ShaderResourceTable rt; rt.vertices_per_instance = 3;
       dump(dir, "vertex_ngg_chain",
            recompile_vertex_chain(producer, sizeof(producer)/4, wrapper, sizeof(wrapper)/4,
-                                  &rt, nullptr, false, 7)); }
+                                  &rt, nullptr, false, 7),
+           "recompile_vertex_chain"); }
     // Generated interpolation geometry stage: AMD's explicit-parameter form publishes P0/P10/P20
     // plus perspective-center I/J from a synthesised Geometry entry point.
     { const uint32_t ps[] = {0xc80e0000u,0xc8120001u,0xc8160002u,
@@ -546,7 +573,10 @@ int main(int argc, char** argv) {
       PixelSystemInputMapping perspective_center{1u << 1, 1u << 1};
       const FragmentInterpolationLayout layout =
           fragment_interpolation_layout(ps, sizeof(ps)/4, &perspective_center);
-      dump(dir, "geometry_interpolation", recompile_interpolation_geometry(layout)); }
+      dump(dir, "geometry_interpolation", recompile_interpolation_geometry(layout),
+           "recompile_interpolation_geometry"); }
+
+    fails += check_emitter_coverage(src_root);
 
     if (fails) { printf("== FAIL: %d emitter(s) failed emission/validation/coverage ==\n", fails); return 1; }
     printf("== PASS (every declared emitter accounted for; all modules pass spirv-val) ==\n");

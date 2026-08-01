@@ -84,9 +84,15 @@ Three failure modes of the gate itself are closed, all of them found by #1711:
   `spirv-tools` on all three test platforms, and removing that breaks the job.
 * **An uncovered emitter is a failure.** The corpus only ever walked `recompile_*`, so the
   hand-assembled compute modules in `spirv_builder.cpp` — created at runtime by the live frontend
-  exactly like a recompiled shader — were never validated. The tool now reads the two headers and
-  fails on any declared emitter it does not call. A gap is permitted only as a written `kKnownGaps`
-  entry naming its issue, and a stale entry (the emitter is covered, or no longer exists) also fails.
+  exactly like a recompiled shader — were never validated. The tool now scans every `src/gpu/*.hpp`
+  for declarations returning `std::vector<uint32_t>` and fails on any that did not produce a
+  validated module. Coverage is measured at **runtime**, where each module is emitted, not by
+  grepping the tool's own source for a call: a textual check is satisfied by a mention in a comment
+  or by a call whose result is discarded, and a check a comment can pass is the defect this gate
+  exists to stop. A name that is not an emitter (an RDNA2→RDNA2 transform, a caching wrapper) must
+  be listed in `kNotEmitters` with a reason, so an unclassified new name fails rather than being
+  skipped. A genuine gap is permitted only as a written `kKnownGaps` entry naming its issue, and a
+  stale entry — the emitter is covered again, or no longer declared — also fails.
 * **`spirv-val`'s diagnostic is printed.** A failure used to say only "REJECTED it".
 
 ## 5. Routed multi-frame guards for real games

@@ -145,11 +145,24 @@ std::vector<uint32_t> build_compute_compare_uvec4() {
     // compare target — see live_compute.cpp's compare_flags descriptor), so it is NOT the uvec4
     // runtime array a[]/b[] use. Declaring it as one carried a type-checking defect for the flag's
     // access chain (#1711) and described a 16-byte-stride array over a 4-byte binding.
+    //
+    // That second half is a correctness bug, not only a conformance one, which is why this is a new
+    // block rather than one more index on the old chain. live_compute.cpp requires and enables
+    // `robustBufferAccess`. Under the old declaration the flag's runtime array had ArrayStride 16
+    // over a 4-byte bound range, so its robust length is floor(4/16) = 0 and element 0 is OUT OF
+    // BOUNDS: a conformant driver is permitted to discard the OpAtomicExchange entirely, leaving
+    // the comparison's "results differ" flag stuck at zero and silently suppressing baseline
+    // updates. Adding a component index would have kept that property. One uint in its own block
+    // removes it.
     const uint32_t t_flag = e.id(), t_ptr_flag = e.id(), v_flag = e.id();
     const uint32_t t_push = e.id(), t_ptr_push = e.id(), v_push = e.id();
     const uint32_t t_ptr_push_u32 = e.id();
-    const uint32_t c_u0 = e.id(), c_u1 = e.id(), c_scope_device = e.id();
-    const uint32_t c_semantics_none = e.id();
+    // SPIR-V requires non-aggregate constants to be unique, so the Device scope (1) and the
+    // "no semantics" mask (0) reuse the same two %uint constants rather than declaring duplicates.
+    // spirv-val does not enforce uniqueness and drivers accept it, which is precisely why a module
+    // this file emits should not rely on that.
+    const uint32_t c_u0 = e.id(), c_u1 = e.id();
+    const uint32_t c_scope_device = c_u1, c_semantics_none = c_u0;
     const uint32_t f_main = e.id(), lbl_entry = e.id(), lbl_compare = e.id();
     const uint32_t lbl_different = e.id(), lbl_equal = e.id(), lbl_done = e.id();
 
@@ -203,8 +216,6 @@ std::vector<uint32_t> build_compute_compare_uvec4() {
     Emitter::put(e.types, Op_TypePointer, {t_ptr_push_u32, SC_PushConstant, t_u32});
     Emitter::put(e.types, Op_Constant, {t_u32, c_u0, 0});
     Emitter::put(e.types, Op_Constant, {t_u32, c_u1, 1});
-    Emitter::put(e.types, Op_Constant, {t_u32, c_scope_device, 1});
-    Emitter::put(e.types, Op_Constant, {t_u32, c_semantics_none, 0});
 
     Emitter::put(e.code, Op_Function, {t_void, f_main, FC_None, t_fn});
     Emitter::put(e.code, Op_Label, {lbl_entry});

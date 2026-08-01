@@ -124,6 +124,10 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ctest --test-dir build          # 99 self-checking tests
 ```
+`ctest` needs `spirv-val` on `PATH` — `spirv-tools` on Fedora/Ubuntu,
+`mingw-w64-ucrt-x86_64-spirv-tools` in MSYS2, `brew install spirv-tools` on macOS. The
+`spv_validate` test is the strict SPIR-V validation gate and **fails** rather than skipping when
+the validator is absent, because silently skipping is how #1711 shipped.
 Add `-DPROSPER_APP=ON` for the windowed `prosper-app` frontend (fetches SDL3). Or a tool directly:
 ```
 g++ -O2 -std=c++20 tools/self_dump/self_dump.cpp -o self_dump
