@@ -148,7 +148,12 @@ private:
     void start_load(const std::string& root, uint64_t now_ms);
     void claim_result(uint64_t now_ms);
     void poll_upload(uint64_t now_ms);
-    bool begin_upload(LoadResult& res);
+
+    // Why an upload did not start. `busy` is transient and MUST be retried — conflating it with
+    // `failed` throws away a decoded image and leaves that title permanently without a background.
+    enum class UploadStart { started, busy, failed };
+    UploadStart begin_upload(LoadResult& res);
+    void        apply_result(std::unique_ptr<LoadResult> res, uint64_t now_ms);
     void install_track(LoadResult& res);
     void pump_audio(uint64_t now_ms);
     float gain_at(uint64_t play_ms, bool outgoing) const;
@@ -230,6 +235,10 @@ private:
 
     std::mutex                  resMutex_;
     std::unique_ptr<LoadResult> result_;      // single slot; a newer result overwrites an unclaimed one
+    // A claimed result whose upload could not start because one was already in flight. Held on the UI
+    // thread and retried on later frames rather than discarded, so a focus change that lands inside the
+    // few-frame window of a previous upload still gets its background.
+    std::unique_ptr<LoadResult> deferred_;
 
     uint64_t generation_     = 0;
     uint64_t loadsStarted_   = 0;

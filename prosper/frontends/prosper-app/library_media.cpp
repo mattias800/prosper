@@ -159,6 +159,7 @@ void LibraryMedia::shutdown() {
         worker_.join();
     }
     { std::lock_guard<std::mutex> lk(resMutex_); result_.reset(); }
+    deferred_.reset();   // plain bytes, no GPU handles, but do not hold it past shutdown
 
     if (stream_) { SDL_DestroyAudioStream(stream_); stream_ = nullptr; }
     if (audioInit_) { SDL_QuitSubSystem(SDL_INIT_AUDIO); audioInit_ = false; }
@@ -366,6 +367,17 @@ void LibraryMedia::claim_result(uint64_t now_ms) {
         std::lock_guard<std::mutex> lk(resMutex_);
         res = std::move(result_);
     }
+    // A result parked by an earlier frame goes first: it is older, and retrying it is what stops a
+    // focus change inside a previous upload's window from silently losing its background.
+    if (deferred_) {
+        std::unique_ptr<LoadResult> d = std::move(deferred_);
+        apply_result(std::move(d), now_ms);
+    }
+    if (!res) return;
+    apply_result(std::move(res), now_ms);
+}
+
+void LibraryMedia::apply_result(std::unique_ptr<LoadResult> res, uint64_t now_ms) {
     if (!res) return;
     if (res->generation != generation_) {
         ++loadsDiscarded_;   // superseded while in flight; never reaches the upload path
@@ -373,22 +385,30 @@ void LibraryMedia::claim_result(uint64_t now_ms) {
     }
     install_track(*res);
     if (res->image_ok && cache_.find(res->root) == cache_.end()) {
-        if (!begin_upload(*res)) {
-            // No background for this title. The transition must still finish, or the view would hold
-            // at nothing forever.
+        const UploadStart r = begin_upload(*res);
+        if (r == UploadStart::busy) {
+            // Transient: an upload is still in flight. Park it and try again on a later frame rather
+            // than dropping a decoded image and leaving this title with no background at all.
+            deferred_ = std::move(res);
+            return;
+        }
+        if (r == UploadStart::failed) {
+            // Genuinely no background for this title. The transition must still finish, or the view
+            // would hold at nothing forever.
             incomingReady_ = true;
             readyMs_ = now_ms;
         }
-    } else {
-        incomingReady_ = true;
-        readyMs_ = now_ms;
+        return;
     }
+    incomingReady_ = true;
+    readyMs_ = now_ms;
 }
 
 // --- upload -----------------------------------------------------------------------------------------
 
-bool LibraryMedia::begin_upload(LoadResult& res) {
-    if (pending_.active) return false;   // one at a time; the next frame retries via the mailbox
+LibraryMedia::UploadStart LibraryMedia::begin_upload(LoadResult& res) {
+    // One upload in flight at a time. This is BUSY, not a failure: the caller must retry it later.
+    if (pending_.active) return UploadStart::busy;
 
     Background bg;
     bg.width = res.image_w;
@@ -404,7 +424,7 @@ bool LibraryMedia::begin_upload(LoadResult& res) {
     ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(device_, &ii, nullptr, &bg.image) != VK_SUCCESS) return false;
+    if (vkCreateImage(device_, &ii, nullptr, &bg.image) != VK_SUCCESS) return UploadStart::failed;
 
     VkMemoryRequirements mr{};
     vkGetImageMemoryRequirements(device_, bg.image, &mr);
@@ -415,7 +435,7 @@ bool LibraryMedia::begin_upload(LoadResult& res) {
         vkAllocateMemory(device_, &ai, nullptr, &bg.memory) != VK_SUCCESS ||
         vkBindImageMemory(device_, bg.image, bg.memory, 0) != VK_SUCCESS) {
         destroy_background(bg);
-        return false;
+        return UploadStart::failed;
     }
 
     VkBuffer staging = VK_NULL_HANDLE;
@@ -483,7 +503,7 @@ bool LibraryMedia::begin_upload(LoadResult& res) {
         if (staging)    vkDestroyBuffer(device_, staging, nullptr);
         if (stagingMem) vkFreeMemory(device_, stagingMem, nullptr);
         destroy_background(bg);
-        return false;
+        return UploadStart::failed;
     }
     pending_.active = true;
     pending_.root = res.root;
@@ -491,7 +511,7 @@ bool LibraryMedia::begin_upload(LoadResult& res) {
     pending_.format = res.image_format;
     pending_.staging = staging;
     pending_.stagingMem = stagingMem;
-    return true;
+    return UploadStart::started;
 }
 
 void LibraryMedia::poll_upload(uint64_t now_ms) {
