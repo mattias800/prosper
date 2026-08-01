@@ -438,10 +438,28 @@ HLE(s_videodec2_query_decoder_memory) {
     // The cpu/gpu/shared workspace sizes stay at the floor: nothing here is evidence for those, and
     // inflating them has broken a title before (see VDEC_MIN_MEMORY's own note on the 16 MiB
     // placeholder exhausting a CRI pool).
+    // The `> 0` guard is load-bearing for more than the auto case: it is what makes the int32 ->
+    // uint64 widening safe. With both dimensions at INT32_MAX the product times 3 reaches about 75%
+    // of UINT64_MAX — so this expression has exactly one factor of headroom left. Anything that adds
+    // another multiplicand here (a DPB count, a bytes-per-sample term for 10-bit) MUST re-check the
+    // bound rather than assume 64 bits is roomy.
     constexpr uint32_t VDEC_FRAME_ALIGN = 0x100;
     uint64_t frame_bytes = 0;
-    if (config->max_width > 0 && config->max_height > 0)
+    if (config->max_width > 0 && config->max_height > 0) {
         frame_bytes = ((uint64_t)config->max_width * (uint64_t)config->max_height * 3u) / 2u;
+    } else {
+        // Auto dimensions: the value below is a FLOOR, not a derivation, and the original
+        // resolution-independent hazard survives on this path. Nothing in the code distinguishes the
+        // two cases at the call site, so say it once rather than let the next reader — or the real
+        // decoder that #1688 adds — treat 64 KiB as a computed answer.
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            fprintf(stderr,
+                    "[vdec] QueryDecoderMemoryInfo: max_width/max_height are auto (%d x %d), so "
+                    "max_frame_size falls back to the 0x%llx FLOOR — this is not a derived size, and "
+                    "a real decoder must not write a picture into it unchecked (#1688)\n",
+                    config->max_width, config->max_height, (unsigned long long)VDEC_MIN_MEMORY);
+    }
     frame_bytes = (frame_bytes + VDEC_FRAME_ALIGN - 1) & ~(uint64_t)(VDEC_FRAME_ALIGN - 1);
 
     info->cpu_size = info->gpu_size = info->shared_size = VDEC_MIN_MEMORY;

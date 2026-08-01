@@ -222,7 +222,9 @@ int main() {
                     uint64_t a[9] = {72};
                     CHECK(query_decoder((uint64_t)(uintptr_t)&autodim, (uint64_t)(uintptr_t)a,
                                         0, 0, 0, 0) == 0 && a[7] == (64ull << 10),
-                          "Videodec2 auto dimensions fall back to the documented floor");
+                          "Videodec2 auto dimensions fall back to the documented FLOOR (not a\n"
+                          "                       derivation - the resolution-independent hazard\n"
+                          "                       survives here and the handler says so once)");
                 }
                 decoder_memory[2] = (uint64_t)(uintptr_t)memory[0];
                 decoder_memory[4] = (uint64_t)(uintptr_t)memory[1];
