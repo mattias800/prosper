@@ -370,8 +370,20 @@ HLE(s_videodec2_delete_decoder) {
     return g_vdec_codecs.erase(a0) ? 0 : VDEC_ERR_DECODER;
 }
 HLE(s_videodec2_decode) {
-    if (svclog()) { static std::atomic<unsigned> n{0}; if (n.fetch_add(1) < 8)
-        svc_log("sceVideodec2Decode", a0, a1, a2, a3, a4, a5, 7); }
+    // This log is CAPPED at 8 access units, and it is the only Videodec2 entry point that caps.
+    // Say so in the log itself: once a title actually feeds this path, "8 decodes in the log" reads
+    // exactly like "the guest decoded 8 frames and stopped", which is a different and much more
+    // alarming finding than "the cap was reached". (Instrument-trap 13 in
+    // docs/GAME_COMPAT_ORCHESTRATION.md — a print cap misread as a frequency. Nearly banked as a
+    // result on the very first boot that reached here, #1658.)
+    if (svclog()) {
+        static std::atomic<unsigned> n{0};
+        unsigned seq = n.fetch_add(1);
+        if (seq < 8) svc_log("sceVideodec2Decode", a0, a1, a2, a3, a4, a5, 7);
+        else if (seq == 8)
+            fprintf(stderr, "[vdec] sceVideodec2Decode: log capped at 8 access units; further "
+                            "calls still execute but are NOT logged (this cap is not a count)\n");
+    }
     uint32_t codec;
     { std::lock_guard<std::mutex> lk(g_vdec_mx); auto it = g_vdec_codecs.find(a0);
       if (it == g_vdec_codecs.end()) return VDEC_ERR_DECODER; codec = it->second; }
