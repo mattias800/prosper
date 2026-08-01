@@ -149,8 +149,11 @@ int main() {
         HleFn open_ext   = Hle::lookup(nid_hash("scePadOpenExt"));
         HleFn close      = Hle::lookup(nid_hash("scePadClose"));
         HleFn is_valid   = Hle::lookup(nid_hash("scePadIsValidHandle"));
-        CHECK(read_state && read && get_info && get_ext_info && open && open_ext && close && is_valid,
-              "pad HLE functions registered");
+        HleFn get_handle = Hle::lookup(nid_hash("scePadGetHandle"));
+        CHECK(read_state && read && get_info && get_ext_info && open && open_ext && close && is_valid
+              && get_handle, "pad HLE functions registered");
+        CHECK(nid_hash("scePadGetHandle") == "u1GRHp+oWoY",
+              "scePadGetHandle hashes to its public NID");
 
         const uint64_t handle = open ? open(1, 0, 0, 0, 0, 0) : 0;
         const uint64_t ext_handle = open_ext ? open_ext(1, 0, 1, 0, 0, 0) : 0;
@@ -171,6 +174,25 @@ int main() {
         if (close)
             CHECK(close(unknown, 0, 0, 0, 0, 0) == invalid_handle,
                   "scePadClose rejects an unknown handle");
+
+        // scePadGetHandle is a LOOKUP of an already-open handle keyed on (userId, portType, index),
+        // never an open. Games ask it precisely to decide whether they still need scePadOpen: Worms
+        // Armageddon: Anniversary Edition (PPSA20052, #1592) opens a pad only when it answers
+        // negative (eboot+0x7fd5c `test eax,eax` / `jns` past the scePadOpen at +0x7fd6d), so a
+        // constant non-negative answer suppresses every open and kills all input for the whole run.
+        // Each check below fails against a constant return: a second open must get its own handle,
+        // a triple that was never opened must be an error, and a closed handle must stop resolving.
+        // These are metadata queries and must not consume a scripted input window.
+        if (get_handle) {
+            CHECK(get_handle(1, 0, 0, 0, 0, 0) == handle,
+                  "scePadGetHandle returns the handle opened for (user 1, type 0, index 0)");
+            CHECK(get_handle(1, 0, 1, 0, 0, 0) == ext_handle,
+                  "scePadGetHandle keys on index: (user 1, type 0, index 1) -> the OpenExt handle");
+            CHECK(get_handle(2, 0, 0, 0, 0, 0) == invalid_handle,
+                  "scePadGetHandle reports no handle for a user that never opened one");
+            CHECK(get_handle(1, 1, 0, 0, 0, 0) == invalid_handle,
+                  "scePadGetHandle reports no handle for a port type that never opened one");
+        }
 
         // Invalid-handle failures happen before polling or touching output. The later valid reads
         // therefore still consume the scripted p0 and p1 windows in order.
@@ -284,6 +306,10 @@ int main() {
                   "scePadIsValidHandle rejects a closed handle");
             CHECK(is_valid(ext_handle, 0, 0, 0, 0, 0) == 0,
                   "scePadIsValidHandle rejects a closed OpenExt handle");
+            if (get_handle)
+                CHECK(get_handle(1, 0, 0, 0, 0, 0) == invalid_handle &&
+                          get_handle(1, 0, 1, 0, 0, 0) == invalid_handle,
+                      "scePadGetHandle stops naming closed handles");
             std::memset(&invalid_data, 0x7c, sizeof invalid_data);
             std::memset(&invalid_ext_info, 0x3e, sizeof invalid_ext_info);
             CHECK(read_state(handle, (uint64_t)(uintptr_t)&invalid_data, 0, 0, 0, 0) ==
