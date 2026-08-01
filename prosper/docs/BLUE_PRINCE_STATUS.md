@@ -54,6 +54,20 @@ The `blue-prince-title` snapshot route guards the title screen.
   reported (`[buffer-truncated]`), and `PROSPER_MAX_BUFFER_UPLOAD_MB=N` lowers the ceiling so one
   build reproduces the collapse and the fix back to back.
 
+- **#1691/#1703** — the decoded-texture identity map was scoped to one graphics span, and this title
+  cuts every frame into 21-22 spans at its interleaved dispatches, so each span re-resolved every
+  identity from scratch. It is now scoped to the submit, with cross-span reuse gated on the ordered
+  in-submit write journal plus a re-check that the entry's source range is still the range the
+  binding resolves. Two reversed-order routed A/B pairs on an otherwise idle box: persistent-cache
+  resolutions **76.7 -> 41.3 per submit (-46 %)**, reproducible to the digit, and heavy-scene frame
+  time **246.6 -> 228.4 ms** and **248.1 -> 228.8 ms** (~4.04 -> ~4.38 submits/s).
+  **The frame-time gain does not come from the texture terms** — `build_resources` and its `texture`
+  component are flat across both pairs, and the whole delta appears in `pass_control`, which nothing
+  in that change touches. Treat the mechanism behind that as open rather than settled; the plausible
+  candidate is allocator behaviour (the span-scoped arm rebuilds the map 16.7x per submit while the
+  same pass loop allocates an 8.3 MiB frame buffer per pass), but it has not been measured. The
+  title remains CPU-bound in the frontend and #1284's `draw_setup.resources` is still the top term.
+
 ## Defect families (#1287) — families 1–3 and 5 RESOLVED 2026-07-26
 
 Families 1–3 and 5 below are **fixed on master**; they are retained as the resolution record so
@@ -137,6 +151,11 @@ were confirmed as legitimate frustum culls.
   (`unique-pos=1 (max-mult=19236) -> COLLAPSED` is the fetch-returns-a-constant signature).
 - `PROSPER_MAX_BUFFER_UPLOAD_MB=N` (1..64) — lower the buffer-upload ceiling to reproduce a
   truncation collapse on the same build; `[buffer-truncated]` reports every short upload.
+- `PROSPER_NO_SUBMIT_TEXTURE_DECODE_SCOPE=1` (#1691) — restore the pre-#1691 span-scoped lifetime of
+  the decoded-texture identity map, so one binary A/Bs that change on a routed run.
+  `PROSPER_RENDER_TIMING=1` then reports
+  `[render-timing] decode_scope decodes=… same_span=… cross_span=… invalidated=… pinned=… scope=…`
+  alongside the existing `texture_cache` line.
 - `gpu_replay --recompile-raw` (#1416) — re-recompile every retained raw VS/FS with the CURRENT
   recompiler and replay: the ~5 s offline A/B that resolved family 1 against a ~8 min live route.
   Pair with `PROSPER_MIPLOG=1` (per-binding mip eligibility) and `PROSPER_BUFLOG=1` (per-binding
