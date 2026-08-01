@@ -6605,9 +6605,12 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     //    the renderer context keep exactly the order they had, which is why nothing observable
     //    outside teardown can move.
     //  * Not tearing down at all — what render_vk_ctx() deliberately does for the sibling device —
-    //    would also remove the hazard, and is NOT what this does. Keeping the teardown is the more
-    //    diagnostic choice: it is what lets a layer report objects still outstanding at
-    //    vkDestroyDevice/vkDestroyInstance instead of losing that check to a deliberate leak.
+    //    would also remove the hazard, and is NOT what this does. Teardown is kept because it
+    //    releases this context's own pipelines, pools, images and memory on a device that outlives
+    //    it, which a deliberate leak would not. It additionally lets a layer report objects still
+    //    outstanding at vkDestroyDevice/vkDestroyInstance, but ONLY on the private-device path:
+    //    when the device is borrowed the destructor returns at `if (borrowed) return;` before
+    //    either call, so that particular benefit does not apply to the live-renderer path.
     static VulkanComputeContext* context_ptr = new VulkanComputeContext();
     static const bool context_ready = [] {
         const bool ok = context_ptr->init();

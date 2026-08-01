@@ -6,7 +6,13 @@
 #     fixed — delete the line, in the same change — or the scan stopped seeing things, and the
 #     second is far more likely. Both are failures until someone says which.
 #   * `environment-dependent` exempts an id from that check, and its reason line must say WHY it
-#     can be absent. Two entries below qualify; nothing else may without an argument.
+#     can be absent. Two entries below qualify; nothing else may without an argument. That is
+#     enforced, not merely asked: ctest `vkval_scan_logic` asserts this file holds exactly TWO
+#     environment-dependent entries, so flipping a `required` id to duck a failure breaks a test in
+#     another file. Adding a genuine third means editing that assertion, deliberately — the friction
+#     is the point.
+#   * The test list must be the UNION across drivers. Attribution varies: an id can reach one extra
+#     test on hardware and never on lavapipe, and a test the ledger does not record is a failure.
 #   * The test list scopes the deferral to where it was measured. This matters most for catch-all
 #     VUIDs: `pCode-08737` is VVL's identity for *any* spirv-val error at vkCreateShaderModule, so
 #     an unscoped entry would defer every future SPIR-V validity defect anywhere in the suite.

@@ -138,7 +138,8 @@ def parse_allowlist(path: Path) -> dict[str, Allowed]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        fields = [f.strip() for f in line.split("|")]
+        # maxsplit=3 so a reason may legitimately contain a pipe; too FEW fields still fails.
+        fields = [f.strip() for f in line.split("|", 3)]
         if len(fields) != 4:
             raise SystemExit(
                 f"{path}:{lineno}: every allow-list entry needs "
@@ -149,13 +150,15 @@ def parse_allowlist(path: Path) -> dict[str, Allowed]:
         if expectation not in EXPECTATIONS:
             raise SystemExit(f"{path}:{lineno}: allow-list entry '{ident}' has expectation "
                              f"'{expectation}'; it must be one of {', '.join(EXPECTATIONS)}")
-        if not tests:
-            raise SystemExit(f"{path}:{lineno}: allow-list entry '{ident}' names no tests (use '*' "
-                             f"deliberately if the id really may appear anywhere)")
         if not reason:
             raise SystemExit(f"{path}:{lineno}: allow-list entry '{ident}' has an empty reason")
-        allowed[ident] = Allowed(ident, expectation,
-                                 [t.strip() for t in tests.split(",") if t.strip()], reason)
+        # Validate the PARSED list, not the raw field: ", ," is a non-empty string that names no
+        # tests, and an entry covering nothing would otherwise fail later, far from the mistake.
+        names = [t.strip() for t in tests.split(",") if t.strip()]
+        if not names:
+            raise SystemExit(f"{path}:{lineno}: allow-list entry '{ident}' names no tests (use '*' "
+                             f"deliberately if the id really may appear anywhere)")
+        allowed[ident] = Allowed(ident, expectation, names, reason)
     return allowed
 
 
@@ -252,6 +255,13 @@ def main(argv: list[str]) -> int:
     # spirv-val error at vkCreateShaderModule; format-07753 is the graphics-side sibling of the
     # exact defect class this guard exists to catch), so an id-only allow-list would defer every
     # future occurrence of those anywhere in the suite.
+    #
+    # Two consequences worth knowing before adding to this ledger. The test list must be the UNION
+    # across drivers, because attribution varies: an id can reach one extra test on hardware that
+    # never appears on lavapipe. And "<unattributed>" — the pseudo-test for a message ctest could
+    # not place, which today only happens if the layer prints outside any test's captured output —
+    # is covered by nothing, so such a message always fails. That is deliberate (a message we cannot
+    # locate is not a message we have deferred), but it is a failure mode scoping created.
     new = sorted(k for k in findings if k not in allowed)
     misplaced = sorted((k, t) for k in findings if k in allowed
                        for t in findings[k].tests if not allowed[k].covers(t))
@@ -317,8 +327,12 @@ def main(argv: list[str]) -> int:
     if misplaced:
         print()
         print(f"[vkval] FAIL: {len(misplaced)} allow-listed id(s) appeared in a test the ledger does "
-              f"not record. A deferral is scoped to where it was measured; a catch-all VUID from a "
-              f"new site is a new defect, not the old one.")
+              f"not record. A deferral is scoped to where it was measured, so this is a new SITE "
+              f"until someone confirms it is the same defect — several of these VUIDs are catch-alls."
+              )
+        print("[vkval] If it is the same defect (a renamed test, a new test exercising the same "
+              "code, another driver attributing it differently), add the test to that entry. If it "
+              "is not, it is a new finding and needs its own line and its own issue.")
         failed = True
     if new:
         print()

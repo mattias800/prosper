@@ -184,12 +184,19 @@ def main():
         star = scan.parse_allowlist(Path(allowfile("star.txt", "VUID-a | required | * | any (#1)\n")))
         check(star["VUID-a"].covers("anything at all"), "'*' covers any test")
 
+        piped = scan.parse_allowlist(Path(allowfile(
+            "piped.txt", "VUID-a | required | t | see A|B, and C|D (#1)\n")))
+        check(piped["VUID-a"].reason == "see A|B, and C|D (#1)",
+              "a reason may contain '|' — only the first three separators are structural")
+
         # Every malformation is fatal: a line nobody can read is indistinguishable from a filter
         # somebody added quietly, which is the thing this file exists to make impossible.
         for name, text, what in [
                 ("bare.txt", "VUID-a\n", "a bare id with no fields"),
                 ("noreason.txt", "VUID-a | required | test_x |   \n", "an empty reason"),
                 ("notests.txt", "VUID-a | required |  | why (#1)\n", "an empty test list"),
+                ("commatests.txt", "VUID-a | required | , , | why (#1)\n",
+                 "a test list that is non-empty text but names nothing"),
                 ("badexp.txt", "VUID-a | maybe | test_x | why (#1)\n", "an unknown expectation"),
                 ("shortform.txt", "VUID-a | why (#1)\n", "the old two-field form")]:
             try:

@@ -561,13 +561,17 @@ inline BackendRenderTimingStats backend_render_timing_stats() {
 // without first giving compute an explicit release-before-teardown handshake.
 //
 // The mechanism on the compute side changed in #1704: that teardown now runs from a std::atexit
-// handler registered after vkCreateInstance, not from a function-local static's destructor, so that
-// it is sequenced before any enabled Vulkan layer's own statics. The invariant here is unchanged,
-// and so is the warning. If anything the ordering is now the *defined* one rather than the merely
-// unspecified one it used to be: borrowing this device requires this context to already exist, so
-// whenever compute borrows it, compute's handler was registered later and therefore runs first —
-// but only its own objects are released there, and a destructor added here would still be racing
-// that. Give compute an explicit handshake before adding one.
+// handler registered after vkCreateInstance, not from a function-local static's destructor, so it is
+// sequenced before any enabled Vulkan layer's own statics. That also makes the ordering against THIS
+// context defined rather than unspecified — borrowing this device requires this context to already
+// exist, so compute's handler is always registered later and therefore always runs first.
+//
+// Which means the specific use-after-free warned about above is now ordered away: a destructor added
+// here would be registered earlier and would run after compute has released its objects. Do not read
+// that as permission. The reasons not to add one are now different, not gone: guest threads can still
+// be dispatching when exit() begins (execute_live_compute_items declines once the handler has run,
+// but the window is not closed), and BorrowedComputeImageLease holds a raw VulkanComputeContext*.
+// Give compute an explicit release-before-teardown handshake before adding a destructor here.
 struct RenderVkCtx {
     VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;

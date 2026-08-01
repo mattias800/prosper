@@ -135,6 +135,15 @@ Both packages come from the Ubuntu archive at job time rather than from a pin, s
 
 ## What this guard does NOT cover
 
+**Its self-validation is borrowed from the defect backlog, and that backlog is meant to shrink.**
+The `required` check proves the parser still reads this layer version's output *because* known
+defects are still firing. As #1710-#1717 are fixed and their lines deleted, that proof weakens; once
+only `environment-dependent` entries remain, a run on the CI driver observes nothing legitimately,
+and a parser that quietly stopped matching would again be invisible. Whoever deletes the last
+`required` entry is switching that off, and should replace it first — the durable form is a positive
+control built into the probe (provoke one known violation and require the scanner to *parse* it),
+which proves the parser rather than only the loader. Tracked in **#1725**.
+
 `#1704` also fixed a Vulkan-teardown-from-a-static-destructor defect in
 `frontends/shared/live_compute.cpp` that the layer exposed. **CI would not catch a regression of
 it.** That crash reproduces on validation layers 1.4.341; the runner carries 1.3.275, where the
