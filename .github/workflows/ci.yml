@@ -52,19 +52,25 @@ jobs:
       - name: Build
         run: cmake --build prosper/build-ci
 
-      # The runner has no GPU, so this is Mesa's lavapipe software rasteriser. Four tests are
-      # driver-divergent: they pass on real hardware (RADV) and fail on lavapipe, reproducibly in both
-      # places. They are EXCLUDED BY NAME rather than by disabling the suite — the defect #1675
-      # documents is a gap nobody can enumerate, and four named exclusions in a workflow file are the
-      # opposite of that. Tracked in #1681; delete from this list as each is resolved.
-      #   game_compute_exec[_no_adaptive_storage_result]  — R11G11B10 pack/unpack exactness
-      #   recompiled_fragment_render / recompiled_shaders_render — rendered-pixel comparisons
-      # Reproduce either way locally:
-      #   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json ctest -R '<name>'
+      # The runner has no GPU, so this is Mesa's lavapipe software rasteriser. Four tests were once
+      # excluded here as "driver-divergent" (#1681). They are no longer: the divergence was measured,
+      # and in both cases it was the ASSERTION that overreached, not prosper and not the driver.
+      #   * recompiled_fragment_render (6) / recompiled_shaders_render (1) asserted rendered pixels
+      #     from draws whose shaders require an exact 64-lane fragment subgroup. lavapipe is fixed at
+      #     8, so the backend correctly skips those draws fail-visibly and the target keeps its clear
+      #     colour. Neighbouring assertions in the same files already gated on that capability; these
+      #     did not. Gating them makes both files assert the right thing on either device.
+      #   * game_compute_exec[_no_adaptive_storage_result] swept all 2048 R11G11B10 codes for bit-exact
+      #     round-tripping, which includes the NaN encodings. Exactly 92 texels differed on lavapipe,
+      #     all 92 carrying a signalling NaN and none all-finite — NaN payload quieting through the
+      #     f16->f32 unpack, which no driver owes us. The sweep now requires bit-exactness for every
+      #     finite and infinite code and NaN-ness (not payload) for the rest.
+      # Run the whole suite. If a test is genuinely device-dependent, it must gate on the device
+      # capability it needs — an exclusion list here would hide the next real defect the same way
+      # #1675 documents. Reproduce the software-rasteriser path locally with:
+      #   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json ctest
       - name: Test
-        run: |
-          ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 \
-            -E '^(game_compute_exec|game_compute_exec_no_adaptive_storage_result|recompiled_fragment_render|recompiled_shaders_render)$'
+        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
 
   linux-app:
     name: Linux App
