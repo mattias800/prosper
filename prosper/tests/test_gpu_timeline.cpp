@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "test_scratch.h"
 #ifndef _WIN32
 #include <sys/wait.h>
 #endif
@@ -93,7 +94,7 @@ static GpuState selector_submit(
 
 static int run_selector_env_child(const std::string& mode) {
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto base = std::filesystem::temp_directory_path() /
+    const auto base = prosper_test::test_scratch_dir() /
         ("prosper-gpu-timeline-selector-" + mode + "-" + std::to_string(nonce));
     const std::string timeline_path = base.string() + ".prgtl";
     const std::string capture_path = base.string() + ".prgcap";
@@ -462,7 +463,7 @@ int main(int argc, char** argv) {
     CHECK(run_self(argv[0], "after-submit-zero") == 0,
           "cross-submit compute gate retains a submit-zero arm for a later submit-one capture");
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto base = std::filesystem::temp_directory_path() /
+    const auto base = prosper_test::test_scratch_dir() /
         ("prosper-gpu-timeline-" + std::to_string(nonce));
     const auto good = base.string() + ".prgtl";
     const auto truncated = base.string() + "-truncated.prgtl";

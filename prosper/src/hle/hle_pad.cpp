@@ -28,7 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -44,7 +44,20 @@ namespace {
 
 std::atomic<int> g_pad_handle{1};
 std::mutex g_pad_handle_mx;
-std::unordered_set<int32_t> g_pad_handles;
+
+// The (userId, portType, index) triple a handle was opened with. scePadGetHandle asks "which handle
+// did THIS process already open for this triple?", so an open handle is only answerable through the
+// arguments that created it -- a bare set of handles cannot answer that question truthfully.
+struct PadOpenKey {
+    int32_t user_id;
+    int32_t type;
+    int32_t index;
+    bool operator==(const PadOpenKey& o) const {
+        return user_id == o.user_id && type == o.type && index == o.index;
+    }
+};
+// handle -> the triple it was opened with. Membership is still "this handle is open".
+std::unordered_map<int32_t, PadOpenKey> g_pad_handles;
 
 constexpr uint64_t kPadErrorInvalidHandle =
     (uint64_t)(int64_t)(int32_t)0x80920003u;
@@ -416,7 +429,7 @@ HLE(pad_open) {
     const int h = g_pad_handle.fetch_add(1);
     {
         std::lock_guard<std::mutex> lock(g_pad_handle_mx);
-        g_pad_handles.insert(h);
+        g_pad_handles.emplace(h, PadOpenKey{(int32_t)a0, (int32_t)a1, (int32_t)a2});
     }
     if (padlog()) fprintf(stderr, "[pad] OPEN userId=%llu type=%llu index=%llu -> handle=%d\n",
                           (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, h);
@@ -432,8 +445,45 @@ HLE(pad_close) {
     return 0;
 }
 
-// scePadGetHandle(userId, type, index) -> handle (games that opened once may re-query it).
-HLE(pad_get_handle) { return 1; }
+// scePadGetHandle(userId, type, index) -> the handle THIS process already opened for that triple,
+// or a negative error when it has opened none.  It is a lookup, not an open: it never creates a
+// handle, so answering it with a constant is answering "a pad is already open" to a caller whose
+// whole reason for asking is to find out.
+//
+// The unconditional `return 1` this replaces did exactly that, and it silently killed all input in
+// Worms Armageddon: Anniversary Edition (PPSA20052, #1592).  Its pad manager (eboot+0x7fa30) opens
+// controllers with, per login user id:
+//
+//     call scePadGetHandle(userId, 0, 0)   ; eboot+0x7fd5c
+//     test eax,eax
+//     jns  <skip open>                     ; eboot+0x7fd63: non-negative == already open
+//     call scePadOpen(userId, 0, 0, 0)     ; eboot+0x7fd6d
+//
+// so the fabricated handle 1 made every boot conclude a pad was already open; scePadOpen was never
+// called, and every later scePadReadState(1) failed with INVALID_HANDLE because nothing was open.
+// The title sat on "PRESS X TO START GAME" forever with `[pad] init/ok call` as its only pad log.
+// The same disassembly fixes the sign convention from the guest side: a usable handle is positive
+// (its close path at eboot+0x7fc7b takes `jle` -- 0 and below are "nothing to close"), and negative
+// means "no handle".
+//
+// CONFIDENCE: HIGH on the lookup semantics and the sign convention (both read directly off the
+// guest's own use above, and Sony pad handles are positive with 0x8092xxxx errors).  MED on the
+// exact errno: prosper cannot establish SCE_PAD_ERROR_NO_HANDLE's value from primary evidence, so
+// this reuses the libScePad error prosper already defends for "no open pad names this" rather than
+// inventing a constant.  Only the sign is load-bearing for the guest.
+HLE(pad_get_handle) {
+    const PadOpenKey key{(int32_t)a0, (int32_t)a1, (int32_t)a2};
+    std::lock_guard<std::mutex> lock(g_pad_handle_mx);
+    for (const auto& [handle, opened] : g_pad_handles) {
+        if (!(opened == key)) continue;
+        if (padlog()) fprintf(stderr, "[pad] GETHANDLE userId=%d type=%d index=%d -> handle=%d\n",
+                              key.user_id, key.type, key.index, handle);
+        return (uint64_t)(int64_t)handle;
+    }
+    if (padlog()) fprintf(stderr, "[pad] GETHANDLE userId=%d type=%d index=%d -> no open handle\n",
+                          key.user_id, key.type, key.index);
+    return kPadErrorInvalidHandle;
+}
 
 // scePadIsValidHandle(handle) -> nonzero only while the handle remains open.
 HLE(pad_is_valid_handle) {

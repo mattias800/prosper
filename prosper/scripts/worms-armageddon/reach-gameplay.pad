@@ -1,0 +1,13 @@
+# Worms Armageddon: Anniversary Edition (PPSA20052): cross the title screen's
+# "PRESS X TO START GAME", the main menu ("PLAY THE GAME"), and the game-mode grid's
+# pre-selected "Quickstart" entry into a live AI match. Seconds are measured from the
+# first pad poll. One-second Cross holds are poll-safe.
+#
+# Observed on a Linux hardware-Vulkan boot: Digital Eclipse splash ~8-12 s, title screen
+# from ~16 s, main menu after the first Cross, the mode grid after the second, and the
+# match rendering by ~40 s. The presses repeat past that point because match load time
+# varies; a Cross that lands in-game is a harmless worm jump.
+20-21:cross
+26-27:cross
+32-33:cross
+38-39:cross

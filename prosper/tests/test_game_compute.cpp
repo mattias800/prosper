@@ -5,6 +5,7 @@
 #include "../src/host/guest_write_watch.hpp"
 #include "live_compute.hpp"
 #include "seed_reprove.hpp"
+#include "test_scratch.h"
 
 #include <algorithm>
 #include <array>
@@ -973,9 +974,13 @@ int main() {
     constexpr uint32_t kGdsPostSubmitSentinel = 0xfedcba98u;
     std::memcpy(gds_initial.data(), &kGdsPreSubmitSentinel,
                 sizeof(kGdsPreSubmitSentinel));
+    // Per-process path: this binary runs as two concurrent ctest cases, so a fixed name made both
+    // read back the other run's bytes (#1613).
+    const std::string deferred_gds_capture_path =
+        prosper_test::test_scratch_file("prosper_deferred_gds_capture.prgcap");
     auto deferred_gds_pending = std::make_unique<PendingGpuCapture>();
     deferred_gds_pending->materialized = false;
-    deferred_gds_pending->path = "/tmp/prosper_deferred_gds_capture.prgcap";
+    deferred_gds_pending->path = deferred_gds_capture_path;
     snapshot_pending_gpu_capture_compute_gds(
         deferred_gds_pending.get(), gds_initial.data(), gds_initial.size());
     std::memcpy(gds_initial.data(), &kGdsPostSubmitSentinel,
@@ -989,7 +994,7 @@ int main() {
     GpuCaptureFile deferred_gds_capture;
     GpuReplayFrame deferred_gds_replay;
     const bool deferred_gds_reopened = read_gpu_capture(
-        "/tmp/prosper_deferred_gds_capture.prgcap", deferred_gds_capture, gds_error) &&
+        deferred_gds_capture_path, deferred_gds_capture, gds_error) &&
         materialize_gpu_replay(deferred_gds_capture, deferred_gds_replay, gds_error);
     const uint32_t* deferred_gds_words = deferred_gds_reopened &&
         !deferred_gds_replay.computes.empty() &&
@@ -1000,7 +1005,7 @@ int main() {
             : nullptr;
     CHECK(deferred_gds_words && deferred_gds_words[0] == kGdsPreSubmitSentinel,
           "deferred capture replay restores pre-submit persistent GDS, not post-submit bytes");
-    std::remove("/tmp/prosper_deferred_gds_capture.prgcap");
+    std::remove(deferred_gds_capture_path.c_str());
     gds_initial.fill(0);
     CHECK(capture_submit_items({}, {gds_first, gds_second}, gds_operations, gds_metadata,
                                [](uint64_t, uint8_t*, size_t) { return size_t{0}; },

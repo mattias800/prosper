@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include "test_scratch.h"
 #ifdef _WIN32
 #include <process.h>
 #else
@@ -69,7 +70,7 @@ int main() {
 #else
         (int)getpid();
 #endif
-    const std::filesystem::path test_root = std::filesystem::temp_directory_path() /
+    const std::filesystem::path test_root = prosper_test::test_scratch_dir() /
         ("prosper-savedata-selftest-" + std::to_string(process_id));
     const std::filesystem::path mount_root = test_root / "mount";
     const std::filesystem::path memory_root = test_root / "memory";

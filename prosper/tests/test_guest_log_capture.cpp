@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "test_scratch.h"
 #ifdef _WIN32
 #include <io.h>
 #else
@@ -50,7 +51,7 @@ static int stream_fd(FILE* stream) {
 int main() {
     std::printf("== test_guest_log_capture ==\n");
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto bundle_path = std::filesystem::temp_directory_path() /
+    const auto bundle_path = prosper_test::test_scratch_dir() /
         ("prosper-guest-log-capture-" + std::to_string(nonce) + ".prgbundle");
 
     clear_test_env("PROSPER_CAPTURE_BUNDLE_AT_PRESENT");

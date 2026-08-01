@@ -16,6 +16,8 @@ eboot.bin
 *.prgtl
 
 # ---- Build output ----
+# tests/test_scratch.h fallback root when a test binary is run by hand outside ctest.
+prosper-test-scratch/
 /prosper/build/
 build/
 build-*/

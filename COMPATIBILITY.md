@@ -5,7 +5,7 @@ describe specific, user-supplied PS5 dumps tested primarily on Linux. A mileston
 documented route is reproducible; it does **not** mean the entire game is playable or free of bugs.
 Different title revisions may behave differently.
 
-Last updated: 2026-07-31
+Last updated: 2026-08-01
 
 ## Summary
 
@@ -26,7 +26,7 @@ Last updated: 2026-07-31
 | *New Joe &amp; Mac: Caveman Ninja* | `PPSA02801` | Unity / IL2CPP | ✅ Title screen, menus and level 1 gameplay render at native 1920×1080 — reached on the first boot with no code changes |
 | *Asterix &amp; Obelix: Slap Them All!* | `PPSA08576` | Unity / IL2CPP | ✅ Title screen and first forest level render at native 1920×1080 — reached on unmodified master with no code changes |
 | *Summer Sports Games* | `PPSA03416` | Unity / IL2CPP | ✅ Mode select and live 3D athletics render at native 3840×2160 with no code changes |
-| *Worms Armageddon: Anniversary Edition* | `PPSA20052` | Custom (Digital Eclipse) | 🚧 Studio splash and title screen render at native 1920×1080; gameplay blocked because the guest never opens a pad |
+| *Worms Armageddon: Anniversary Edition* | `PPSA20052` | Custom (Digital Eclipse) | ✅ Scripted route reaches a live Quickstart match at native 1920×1080 |
 | *Earthion* | `PPSA28061` | Custom (Ancient) | 🚧 Developer logo, intro story text and CRT bezel render; the 320×224 game picture inside the bezel is still missing |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🔬 Boots deep into the UE4 frame loop with real GPU work; presented frames are still a flat colour |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Audio and sound bank initialise; the game's own code lives in a runtime-loaded PRX that prosper cannot yet load |
@@ -34,7 +34,7 @@ Last updated: 2026-07-31
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
-| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 Autosave notice and profile-select menu render after implementing `sceAgcAcbWriteData`; the right portion of the frame is still black |
+| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 **Gameplay** — title screen and the first playable scene render with real GPU draws on a validated route; the profile menu's 3D layer and the gameplay composite are degraded (#1619) |
 | *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🔬 Runs a healthy ~113 fps Unity frame loop with a real post chain, but the guest's own composite is empty |
 
 ¹ Exact retail game name pending confirmation.
@@ -390,19 +390,33 @@ respawn banner appears, so guest logic and input are healthy end to end.
 ## Worms Armageddon: Anniversary Edition — `PPSA20052`
 
 <p align="center">
-  <img src="assets/screenshots/worms-armageddon-title.png" alt="Worms Armageddon: Anniversary Edition — title screen">
+  <img src="assets/screenshots/worms-armageddon-gameplay.png" alt="Worms Armageddon: Anniversary Edition — a Quickstart match in progress">
 </p>
 
-The Digital Eclipse studio splash and the full title screen render at native 1920×1080. Reaching
-them needed one small generic recompiler addition: VOP3 `v_sad_u32`, which this title's PSSL
-compiler emits as its vertex-shader index prologue. Without it the vertex stage was rejected and
-nothing rendered at all.
+A scripted route reaches a live Quickstart match against the AI at native 1920×1080: the terrain,
+water, both teams' named worms with their health tags, the turn timer, the wind gauge and the team
+health bars all render, and over a run worms take damage, turns change, the camera pans and the
+terrain is cratered by explosions.
 
-Gameplay is blocked for an unrelated reason: the guest calls `scePadInit` and then never calls
-`scePadOpen`, so no scripted input can reach it. Tracked on #1592.
+Getting there took two fixes. The title screen needed one small generic recompiler addition —
+VOP3 `v_sad_u32`, which this title's PSSL compiler emits as its vertex-shader index prologue.
+Without it every vertex stage was rejected and nothing rendered at all.
+
+Reaching gameplay then needed a correct `scePadGetHandle` (#1592). The game's pad manager asks it
+whether a handle already exists for each login user and calls `scePadOpen` only when the answer is
+negative, so prosper's old unconditional constant meant no pad was ever opened, every
+`scePadReadState` failed, and the title sat on `PRESS ✕ TO START GAME` forever. `scePadGetHandle`
+now looks up the handle actually opened for a `(userId, portType, index)` triple.
+
+Route: `prosper/scripts/worms-armageddon/reach-gameplay.pad` (Cross through the title screen, the
+main menu and the pre-selected `Quickstart` entry).
 
 This title is also a useful reverse-engineering surface in its own right — it ships its AGC shaders
 as loose `.ags` assets in the dump root, which can be inspected statically without a capture.
+
+<p align="center">
+  <img src="assets/screenshots/worms-armageddon-title.png" alt="Worms Armageddon: Anniversary Edition — title screen">
+</p>
 
 ## Earthion — `PPSA28061`
 
@@ -482,6 +496,20 @@ post-processing runs**, so the base pass is where to look. Tracked on #1606.
   <img src="assets/screenshots/syberia-profile.png" alt="Syberia: Remastered — profile-select menu (the right portion of the frame is still black)">
 </p>
 
+<p align="center">
+  <img src="assets/screenshots/syberia-title.png" alt="Syberia: Remastered — title screen, Valadilène (Linux, screenshot frontend, scripts/syberia/reach-gameplay.pad)">
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/syberia-gameplay.png" alt="Syberia: Remastered — first playable scene, the Voralberg factory hall (Linux, screenshot frontend, scripts/syberia/reach-gameplay.pad)">
+</p>
+
+**Rung 3 — gameplay.** `prosper/scripts/syberia/reach-gameplay.pad` drives the profile-select menu
+into the title screen (t≈280 s) and the first playable scene (t≈312 s onward): Kate Walker in the
+Voralberg factory hall, the "Leave" interaction prompt, the "Use the left stick to move" tutorial and
+the pause HUD. The composite is degraded — a translucent ghost of another scene is blended over the
+middle of the frame and the image is over-dark — tracked with the menu defect on #1619.
+
 On unmodified master this title **hard-hung** at boot: 7 submits, 2 flips, one present, frozen
 forever. The cause was `sceAgcAcbWriteData` being unregistered and silently returning 0, so the
 packet that *sets* a fence label was never built and Unity's main thread parked permanently in the
@@ -491,8 +519,11 @@ Registering it against the shared DCB builder — the same treatment the five si
 already had — takes the boot to **523+ submits, 5,028+ draws and 88 flips**, rendering the autosave
 notice with animated gears and then the profile-select menu with its boarding-pass save slots.
 
-The screenshot is captioned honestly: the right ~55% of the frame is still black, and whether that
-is a missing layer or the game's own art direction is not yet established.
+The right ~55% of the frame is black. That is now **established as a defect**, not art direction
+(#1619): the menu renders a full 3D scene — 2048x2048 shadow cascades, `R11G11B10F` HDR targets and a
+960x540 to 15x8 bloom pyramid — and the lit composite is **correct** at draw 465. It is then destroyed
+by an in-place compute pass, so the whole scene layer composites black and only the UI survives. No
+draw is scissored to the left; the animation does settle. Start from `prosper/docs/SYBERIA_STATUS.md`.
 
 ## Tales of Graces f Remastered — `PPSA19991`
 

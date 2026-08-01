@@ -15,6 +15,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include "test_scratch.h"
 
 using namespace prosper;
 
@@ -42,7 +43,7 @@ static void fake_handler(uint64_t arg, void* ev) {
 int main() {
     printf("== test_ime_input ==\n");
     const std::filesystem::path script_path =
-        std::filesystem::temp_directory_path() / "prosper_test_ime_input.route";
+        prosper_test::test_scratch_dir() / "prosper_test_ime_input.route";
     { std::ofstream route(script_path); route << "# headless keyboard route\nf5-6:0x2c\nf7-7:0x28\n"; }
     const std::string script_source = "@" + script_path.string();
 #ifdef _WIN32

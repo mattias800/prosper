@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <iterator>
 #include <vector>
+#include "test_scratch.h"
 
 using namespace prosper::gpu;
 
@@ -65,7 +66,7 @@ int main() {
 
     const auto direct_vs = recompile_vertex(kVs, std::size(kVs), &table);
     const std::filesystem::path dump_directory =
-        std::filesystem::temp_directory_path() / "prosper-shader-dump-test";
+        prosper_test::test_scratch_dir() / "prosper-shader-dump-test";
     std::error_code dump_ec;
     std::filesystem::remove_all(dump_directory, dump_ec);
     set_test_env("PROSPER_SHADER_DUMP_SUCCESS", dump_directory.string().c_str());

@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <vulkan/vulkan.h>
+#include "test_scratch.h"
 
 using namespace prosper::gpu;
 
@@ -232,7 +233,7 @@ int main() {
 
     {
         const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-        const std::filesystem::path dump_dir = std::filesystem::temp_directory_path() /
+        const std::filesystem::path dump_dir = prosper_test::test_scratch_dir() /
             ("prosper-rtgroup-rgba8-" + std::to_string(nonce));
         std::filesystem::create_directories(dump_dir);
         set_env("PROSPER_FRAME_DIR", dump_dir.string());

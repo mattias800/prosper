@@ -950,8 +950,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             add_stage_diagnostic(ShaderProgramStage::Vertex, rs.es_addr, {}, {});
             add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, {}, {});
         }
-        if (log) fprintf(stderr, "[exec] skip draw: no PGM bound (es=0x%llx ps=0x%llx)\n",
-                         (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
+        if (log) fprintf(stderr, "[exec] skip draw: no PGM bound (es=0x%llx ps=0x%llx "
+                                 "color0=0x%llx/%ux%u)\n",
+                         (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                         (unsigned long long)rs.color0_base, rs.color0_width, rs.color0_height);
         return false;
     }
     const ResolvedPipelineState resolved_pipeline = failure
@@ -975,9 +977,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, {}, {});
         }
         if (log) fprintf(stderr, "[exec] skip draw early: no color/depth/stencil effect "
-                                "cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u\n",
+                                "cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u "
+                                "color0=0x%llx/%ux%u es=0x%llx ps=0x%llx order=%llu\n",
                          rs.cb_target_mask, rs.cb_color_control,
-                         resolved_pipeline.color0_format);
+                         resolved_pipeline.color0_format,
+                         (unsigned long long)rs.color0_base, rs.color0_width, rs.color0_height,
+                         (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                         (unsigned long long)(draw ? draw->command_order : 0));
         return false;
     }
     const auto* fused_back = static_cast<const AgcShaderHeader*>(
