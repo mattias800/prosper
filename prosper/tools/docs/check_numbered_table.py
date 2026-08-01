@@ -50,17 +50,23 @@ Validates structure, never content, so neither class can rot as a table grows.
 WHAT THIS CANNOT SEE, and a real incident. It validates STRUCTURE. It does not read content, so it
 cannot tell that a row still says what its author meant. On 2026-08-01 a rebase silently reverted an
 entry's TEXT to a version asserting a conclusion its author had already retracted, while the
-numbering stayed perfectly contiguous -- this check would have passed it without a word. A green run
-here means the table is well formed, never that it is true. Diff the region for content too.
+numbering stayed perfectly contiguous -- this check would have passed it without a word. The
+boundary is sharp and worth knowing: numbering catches a row that VANISHED (the sequence gaps), and
+nothing here catches a row that CHANGED ITS MIND. A green run means the table is well formed, never
+that it is true. Diff the region for content too.
 
 KNOWN LIMIT, recorded as a decision rather than a defect. The abutment rule keeps the
 `blank line, prose, orphaned rows` shape -- a real table split -- and that shape is structurally
-identical to two correct ones: a pipe-leading line in the middle of a paragraph below an unrelated
-table, and a fence opening immediately after a table. No rule separates them, so this is a choice
-between two errors, not a bug to fix. Abutment is chosen because the shape it keeps is a genuine
-defect while the two it misreads have zero instances across the tracked corpus, and each is bounded
-to a single message rather than one per intervening line. If either starts appearing in real
-documents, narrowing to "gap contains no blank line" trades this the other way at a known cost.
+identical to a correct one: a pipe-leading line in the middle of a paragraph below an unrelated
+table. No rule separates those two, so that half is a choice between two errors rather than a bug to
+fix -- abutment keeps the genuine defect, and the shape it misreads has zero instances across the
+tracked corpus and is bounded to a single message. If it starts appearing, narrowing to "gap
+contains no blank line" trades it the other way at a known cost.
+
+A fence opening immediately after a table is misread the same way, but that half IS separable by a
+rule as principled as the blank-line one -- record fence line numbers and skip a gap containing one.
+It is not implemented here only to keep this change scoped after five review rounds; tracked as
+#1709 so the next reader looks for the rule that exists instead of taking this block as settled.
 """
 
 from __future__ import annotations
