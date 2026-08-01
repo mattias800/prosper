@@ -86,7 +86,21 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
         Program::ModuleExports me; me.path = m.path;
         for (auto& s : m.symbols)
             if (!s.is_import && !s.nid.empty() && s.value != 0) {
-                exports.emplace(s.nid, base + s.value);
+                // emplace() is a NO-OP on an existing key, so first-wins — intended, but it was also
+                // silent (#1635). Record every alias: which NID, who won, who lost, and both
+                // addresses. Behaviour is unchanged; only the reporting is new.
+                const auto [it, inserted] = exports.emplace(s.nid, base + s.value);
+                if (!inserted && it->second != base + s.value) {
+                    const char* winner = "?";
+                    for (const auto& prior : out.mod_exports) {
+                        const auto f = prior.nids.find(s.nid);
+                        if (f != prior.nids.end() && f->second == it->second) {
+                            winner = prior.path.c_str(); break;
+                        }
+                    }
+                    out.aliased_exports.push_back({ s.nid, winner, m.path, it->second,
+                                                    base + s.value });
+                }
                 me.nids.emplace(s.nid, base + s.value);   // per-module view for handle-first dlsym (#147)
             }
         out.mod_exports.push_back(std::move(me));
