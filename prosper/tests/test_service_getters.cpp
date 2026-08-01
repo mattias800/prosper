@@ -221,15 +221,27 @@ int main() {
                     // exact NV12 size so a future "simplification" back to a shorthand fails here
                     // rather than silently under-sizing a guest buffer. (Instrument-trap 34.)
                     //
-                    // DO NOT "tidy" these dimensions to another odd size. The reported value is
-                    // rounded up to frame_alignment (0x100), so a size whose shorthand error is
-                    // smaller than the alignment slack has that error SWALLOWED — the assertion then
-                    // passes against both the exact form and the shorthand it exists to reject, and
-                    // looks exactly as convincing while proving nothing. That is not a rare corner:
-                    // over w,h < 400 there are 60,029 odd-dimension sizes where alignment hides the
-                    // difference (2x3 is the smallest). 1920x1081 works because its 960-byte error
-                    // survives alignment as a 768-byte difference. The discrimination test needed its
-                    // own discrimination check, which is trap 34 applied to itself.
+                    // DO NOT "tidy" these dimensions to another odd size. A shorthand's error can be
+                    // swallowed before it ever reaches this assertion, by TWO separate stages in
+                    // s_videodec2_query_decoder_memory — and a size that hits either one makes this
+                    // test pass against the very shorthand it exists to reject, looking exactly as
+                    // convincing while proving nothing:
+                    //   1. frame_alignment (0x100) rounding, which hides any error smaller than the
+                    //      slack — e.g. 2x3, error 1.
+                    //   2. the VDEC_MIN_MEMORY floor three lines below it, which returns 64 KiB for
+                    //      anything under ~43,690 pixels no matter what stage 1 did — e.g. 390x3,
+                    //      whose 195-byte error DOES clear alignment (1792 vs 2048) and is still
+                    //      reported as 65536 by both forms.
+                    // Over w,h < 400 that is 88,220 odd-dimension sizes, not the 60,029 that
+                    // alignment alone accounts for; the floor adds 28,191 the alignment figure misses.
+                    // Note also that "just make the error exceed the 256-byte slack" does NOT
+                    // generalise — 512x3 has a 256-byte error, clears alignment, and is still vacuous
+                    // via the floor.
+                    // 1920x1081 is chosen because it clears BOTH: a 960-byte error, 768 after
+                    // alignment, at ~3.1 MB it is far above the floor. The discrimination test needed
+                    // its own discrimination check — trap 34 applied to itself, and the first count
+                    // written here was right about alignment while silently narrower than the claim
+                    // it supported, which is why it read as convincing.
                     Config odd = config;
                     odd.width = 1920; odd.height = 1081;
                     uint64_t o[9] = {72};
