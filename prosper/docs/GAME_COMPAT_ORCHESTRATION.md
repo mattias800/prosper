@@ -132,6 +132,32 @@ Two corollaries worth keeping:
   verdict. The defect is using that same variable as the A/B lever. Give the A/B its own lever, or remove the pin
   for the experiment and say so.
 
+### A host function is not a valid stand-in for guest code — and only Windows will tell you
+
+A test for libSceUlt's ulthreads used an ordinary host C++ function as the ulthread entry. It passed on
+Linux and macOS and failed on **Windows MinGW only**, for three hours, on the single assertion that read the
+entry's argument back out.
+
+The guest is **System V AMD64**; prosper enters guest code through `prosper_call_guest_on_stack`, which
+marshals into SysV (first argument in `%rdi`). On Linux and macOS the host ABI *is* System V, so a host
+function is an accurate model and the test is sound by accident. On Windows the host is **Microsoft x64**,
+where the first argument arrives in `%rcx` — so the untagged host function read a garbage argument and
+returned a garbage status **while still executing correctly and touching its stack**, which is what made it
+look like it worked. The product was never wrong; the test was. `win_thread_trampoline` already documents
+this exact hazard for the production path ("a bare `pthread_create(entry, arg)` mis-passes the arg (MS x64
+vs SysV)").
+
+**The rule: any test that supplies a function for prosper to call *as guest code* must tag it with the guest
+convention**, `__attribute__((sysv_abi))` on x86-64, not leave it at the host default. Prefer the tag over an
+`#ifdef` around the body: "this function uses the guest's calling convention" is true on every platform and
+the attribute is simply redundant where the native ABI already matches. Keep such entries plain leaf
+functions — no destructors, no exceptions — because the attribute conflicts with MinGW's SEH-based C++
+unwinding, which is why `PROSPER_SYSV_ABI` is empty for the HLE handlers (see `dispatch.hpp`).
+
+The generalisable half: **a green Linux run says nothing about ABI-boundary code.** Guest entries, callbacks
+the guest invokes, and anything reached through the call-guest shims are the cases where the dev platform
+cannot fail and Windows is the only place the bug is visible.
+
 ### Registering a NID with an error return can be worse than leaving it unregistered
 
 A trap of the same family as the list above, but in the HLE surface rather than an instrument. It cost a

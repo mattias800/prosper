@@ -81,17 +81,44 @@ static uint64_t call9(const char* nid, uint64_t a0, uint64_t a1, uint64_t a2, ui
     return ((HleFn9)fn)(a0, a1, a2, a3, a4, a5, a6, a7, a8);
 }
 
-// Ulthread entries. Earthion gives each ulthread 0x2000 bytes; this test uses a larger context
-// because the entry is host-compiled test code rather than the guest's own tightly-sized worker.
+// An ulthread entry is GUEST code, so it uses the guest's System V AMD64 convention — prosper enters
+// it through prosper_call_guest_on_stack, which marshals into SysV (first argument in %rdi).
+//
+// On Linux and macOS the host ABI IS System V, so an ordinary host function is an accurate stand-in
+// and this attribute is a no-op. On Windows the host is Microsoft x64, where the first argument
+// arrives in %rcx — so an untagged host function reads a garbage argument and returns a garbage
+// status, while still executing and touching its stack, which makes it look like it worked. That is
+// exactly what happened: MinGW CI failed only on "join writes the entry's int32 return into *status"
+// while all 45 other assertions passed. The product was never wrong — real guest code is SysV — the
+// test was modelling guest code with a host-ABI function.
+//
+// Tagged rather than #ifdef'd around the body: the statement "this function uses the guest's calling
+// convention" is true on every platform, and the attribute is simply redundant where the native ABI
+// already matches. Guarded on x86-64 because that is the only architecture the attribute exists for.
+#if defined(__x86_64__) || defined(_M_X64)
+#define ULT_GUEST_ABI __attribute__((sysv_abi))
+#else
+#define ULT_GUEST_ABI
+#endif
+
+// Earthion gives each ulthread 0x2000 bytes; this test uses a larger context because the entry is
+// host-compiled test code rather than the guest's own tightly-sized worker. It stays at or below the
+// 64 KiB stack probe so the high-water figure is exact, which is the shape Earthion's real 8 KiB and
+// 32 KiB contexts have.
 static constexpr uint64_t kContextBytes = 64 * 1024;
 static constexpr uint64_t kTouchBytes   = 24 * 1024;
 static std::atomic<int> g_entry_ran{0};
 static std::atomic<int> g_entry_gate{0};
 static volatile uint64_t g_sink = 0;
 
+// Both entries are deliberately plain leaf functions: no destructors, no exceptions, nothing that
+// needs unwind data. __attribute__((sysv_abi)) conflicts with MinGW's SEH-based C++ unwinding (the
+// reason PROSPER_SYSV_ABI is empty for the HLE handlers — see dispatch.hpp), and keeping these
+// bodies trivial is what makes the tag safe here.
+
 // Touches a known depth of its stack so the context high-water measurement has a floor to clear.
 // `volatile` so the writes survive optimisation — an elided frame would measure nothing.
-static int32_t touch_stack_entry(uint64_t arg) {
+static ULT_GUEST_ABI int32_t touch_stack_entry(uint64_t arg) noexcept {
     volatile unsigned char buf[kTouchBytes];
     for (size_t i = 0; i < kTouchBytes; i += 64) buf[i] = (unsigned char)(i ^ 0x5A);
     for (size_t i = 0; i < kTouchBytes; i += 64) g_sink += buf[i];
@@ -100,9 +127,11 @@ static int32_t touch_stack_entry(uint64_t arg) {
 }
 
 // Announces itself and then spins until released, so several ulthreads are provably running at once.
-static int32_t gated_entry(uint64_t arg) {
+// A bare atomic spin rather than std::this_thread::yield(): a leaf body keeps the SysV tag safe on
+// MinGW. The bound turns a gate that is never released into a test failure instead of a CI timeout.
+static ULT_GUEST_ABI int32_t gated_entry(uint64_t arg) noexcept {
     g_entry_ran.fetch_add(1);
-    while (g_entry_gate.load() == 0) std::this_thread::yield();
+    for (uint64_t spins = 0; g_entry_gate.load() == 0 && spins < 4000000000ull; ++spins) {}
     return (int32_t)arg;
 }
 
