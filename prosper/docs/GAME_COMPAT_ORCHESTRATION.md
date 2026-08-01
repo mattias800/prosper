@@ -50,8 +50,8 @@ session. Prefer breadth when a hard lane stalls — overall library progress mat
 
 ### The instrument-not-the-subject list — read this before believing any surprising measurement
 
-**Thirteen phantom defects came from the measuring apparatus, not the subject** (eleven in one session on
-2026-07-31, two more on 2026-08-01). Several cost hours; one cost two sessions. This is the single
+**Fourteen phantom defects came from the measuring apparatus, not the subject** (eleven in one session on
+2026-07-31, three more on 2026-08-01). Several cost hours; one cost two sessions. This is the single
 highest-value page in this document.
 
 | # | Instrument | How it lied |
@@ -70,8 +70,19 @@ highest-value page in this document.
 | 12 | `PROSPER_REGWATCH` **joined to** `PROSPER_EXECLOG` by stream adjacency | The two timestamp at **different pipeline stages** — REGWATCH at command-processor *decode*, EXECLOG at *realization* — and the phases interleave per submit. Read by log order, #1606 said **1,049 of 1,050** suppressed draws resolved against a *future* register write. Clean, compelling, and entirely false. Fixed by #1633's `order=`. |
 | 13 | A **print-capped** diagnostic read as a frequency | `[agc] WaitRegMem … NOT satisfied` prints the first 40 then every 1024th (`ln < 40 \|\| (ln & 1023) == 0`); `[agc] out-of-range indirect reg write dropped` stops after **4**; `[agc] indexed indirect draw skipped` after 24. #1606 called the `WaitRegMem` volume "the loudest signal, dozens per second"; the true rate is **~1.5/s** (see below). A line count from these is a cap, not a rate. Same trap as #9's dedupe, different mechanism. |
 
+| 14 | A **decoded-draw census read without the render phase** | Draw counts per frame are phase-dependent by two orders of magnitude *within one title*. Blue Prince (rung 3) decodes **7-13 draws/frame on its own menus** and **1,500-3,200 in its 3D scene**. So Nikoderiko's 53/frame on a title/EULA screen looks exactly like #1641's "implausibly few" signature and is simply **normal for a 2D UI screen**. Reporting it would have sent a lane chasing nothing. |
+
 **Working rules that follow:**
 
+- **A decoded-draw census is meaningless without knowing the render phase, and needs a positive control.**
+  Menu, loading, and 2D-UI phases legitimately decode single-digit to low-double-digit draws per frame, so a
+  low count is evidence of nothing on its own. Count **per sample interval**, not per run — a whole-run
+  average describes neither regime (Blue Prince's is 622.7, which is neither its 10 nor its 2,200) — and
+  calibrate against a title **known to render the thing you claim is missing**. Best of all is one control
+  exhibiting *both* regimes in a single run, which rules out per-title decode differences as the
+  explanation for the gap. Then confirm the phase by **opening the frames**: #1641's Nikoderiko row was
+  only interpretable once the images showed samples 10-11 carrying ~160k distinct colours while 3-9 were
+  black, which proved the census was tracking real workload rather than drifting.
 - **Joining two instruments requires an explicit shared ordinal, never stream adjacency.** If two diagnostics
   are emitted at different pipeline stages, their interleaving in the log is an artifact of *when each stage
   ran*, not of when the events happened. Print a common ordinal (`command_order`) on both and join on it. This
