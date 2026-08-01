@@ -3881,6 +3881,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ? (r->format == DataFormat::Float10_11_11
                        ? 4u : data_format_bytes(r->format) * sampled_components)
                 : 0u;
+            // The one bytes call site where 0 does NOT mean decline: zero is already this
+            // expression's sentinel for "not an imported color binding", so an unmapped format would
+            // silently fall through to the guest resource's texel width below rather than refuse.
+            // Safe only because the importer never produces an unmapped format and -Werror=switch
+            // stops a new enumerator from reaching here without a real width. Any future edit that
+            // weakens either of those has to give this site its own explicit decline.
             const uint32_t imported_color_bytes = bi.imported && !bi.imported_depth
                 ? prosper::frontend::live_target_pixel_format_bytes(bi.imported_pixel_format)
                 : 0u;
@@ -4498,6 +4504,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         prosper::frontend::live_target_source_layout(live_target.format);
                     const bool source_unorm8 = source_layout == LiveTargetSourceLayout::Unorm8x4;
                     const bool source_float16 = source_layout == LiveTargetSourceLayout::Float16x4;
+                    // DO NOT DELETE AS DEAD CODE. This never fires for today's three enumerators,
+                    // but it is not redundant: the packed-view check above is written as
+                    // `format == R11G11B10Float && <incompatible view>`, which for any NEW format
+                    // is false and therefore RETAINS ownership. That predicate fails OPEN, so this
+                    // guard and the `!bpp` decline above are what actually keep an unclassified
+                    // layout out of the two-layout conversions below - where "not UNORM8" means
+                    // "read eight bytes per texel" and a four-byte snapshot is read out of bounds.
                     if (!bi.unorm_rtt_value_reuse && !r11g11b10 &&
                         !source_unorm8 && !source_float16) {
                         skip_image(r, "renderer-owned RTT layout has no sampled conversion"); break;

@@ -961,6 +961,15 @@ if(TARGET prosper_core)
       add_executable(gpu_replay tools/gpu_replay/gpu_replay.cpp)
       target_include_directories(gpu_replay PRIVATE src tests)
       target_link_libraries(gpu_replay PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      # gpu_replay maps LiveTargetPixelFormat itself (inspect_live_target), and it is the tool an
+      # investigation reaches for FIRST. An unhandled member there falls through to the
+      # GpuCaptureRttSeed::format default (Rgba8Unorm) and makes --inspect-only mislabel the seed,
+      # sending the next investigation down the wrong path using its own instrument. Same gate as
+      # prosper_live_renderer so the exhaustiveness contract holds at every mapping, not just the
+      # ones inside frontends/shared/live_target_format.hpp.
+      if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(gpu_replay PRIVATE -Werror=switch)
+      endif()
 
       # Capture -> serialize -> owned replay backing -> SAME live renderer -> pixels. This specifically
       # proves replay textures do not dereference the captured guest VA and still sample exact bytes.
