@@ -73,3 +73,45 @@ code at a site does. It complements `xref.py to <slot>`, which lists the *sites*
 `xref.py`, then read each one with `edis.py`. Unlike `tools/dbg/dis.sh`, which disassembles a pre-extracted
 `/tmp/text.bin` for one title, `edis.py` takes any flattened module ELF directly, so the same command works
 for every title. Requires `objdump` (binutils) on PATH.
+
+## `pak_index.py` — turn a UE4 `.pak` byte offset into an asset name
+
+A UE4 title on PS5 streams content through the Ampr/APR async-read path, and `PROSPER_FILELOG=1`
+logs every request:
+
+```text
+[apr] read-submit id=1 …/game-ps5.pak -> dst=0x…(guest) off=0x89a1be4 size=3080 got=3080 OK
+```
+
+That records *how much* was read and *whether it succeeded* — but not **what** was read. In a
+stripped shipping eboot the read stream is often the only readable statement of the engine's
+loading state, and those offsets are raw byte positions in a multi-gigabyte container.
+
+`pak_index.py` parses the pak's own index (footer → encoded entries → full directory index) and
+maps offsets back to asset paths, so the APR stream becomes a load trace:
+
+```bash
+# what is at this offset?
+python3 tools/re/pak_index.py GAME.pak --resolve 0x89a1be4
+
+# decode a whole run into the assets it loaded, in order
+python3 tools/re/pak_index.py GAME.pak --log run.log --distinct
+python3 tools/re/pak_index.py GAME.pak --log run.log --summary
+
+# does the title even ship this map?
+python3 tools/re/pak_index.py GAME.pak --list '*/Maps/*.umap'
+```
+
+It is offline and read-only — no boot, no GPU, and it works against a log captured earlier.
+
+**Why it is worth reaching for.** On PPSA19244 (The Oregon Trail) the open question was why UE4's
+base pass drew nothing. One `--distinct` pass over a retained `PROSPER_FILELOG=1` log answered it
+without another run: of the 481 `.umap` files in the container the title loads exactly one,
+`TheOregonTrail/Content/Maps/L_GameloftSplash.umap` (a 12 KB splash level), and never opens
+`L_Main` or `L_StartMap`. An empty base pass is the *correct* output for that world — so the draw
+count was never the defect. Use this before concluding anything about missing geometry: confirm
+which content is actually resident first.
+
+Limits: unencrypted index only, pak index versions 10-11 (the v10+ encoded-entry + full-directory
+layout). IoStore `.utoc`/`.ucas` containers are a different format and are not handled. Run
+`--self-test` to check the entry decoder, the offset lookup, and the log parser without a pak.
