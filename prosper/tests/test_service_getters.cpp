@@ -167,10 +167,14 @@ int main() {
             CHECK(alloc && query_decoder && create && decode && flush && destroy,
                   "Videodec2 compute/decoder lifecycle registered");
             if (alloc && query_decoder && create && decode && flush && destroy) {
-                alignas(256) static uint8_t memory[3][64u << 10];
+                // memory[3] backs the compute queue and NOTHING else. Sharing it with the decoder's
+                // cpu pointer (as this block used to) makes `compute_queue` alias a valid buffer by
+                // construction, so an implementation that wrongly dereferenced the opaque handle
+                // would find real memory and pass silently.
+                alignas(256) static uint8_t memory[4][64u << 10];
                 struct { uint64_t size; uint16_t pipe, queue; uint8_t check, r0; uint16_t r1; }
                     cq{16, 0, 0, 0, 0, 0};
-                info[2] = (uint64_t)(uintptr_t)memory[0];
+                info[2] = (uint64_t)(uintptr_t)memory[3];
                 uint64_t compute_queue = 0;
                 CHECK(alloc((uint64_t)(uintptr_t)&cq, (uint64_t)(uintptr_t)info,
                             (uint64_t)(uintptr_t)&compute_queue, 0, 0, 0) == 0 &&
@@ -182,11 +186,44 @@ int main() {
                     int32_t width, height, dpb; uint32_t depth; uint64_t queue, affinity;
                     int32_t priority; uint8_t optimize, check, r0, r1; uint64_t extra;
                 } config{72, 1, 7, 0, 0, 1920, 1080, 4, 2, compute_queue, 0, 0, 0, 0, 0, 0, 0};
+                // Without this, a silent divergence from the HLE's VdecConfig would make this whole
+                // block exercise a different struct than the handler reads.
+                static_assert(sizeof(Config) == 72, "test Config must mirror the HLE VdecConfig");
                 uint64_t decoder_memory[9] = {72};
+                // max_frame_size is now DERIVED from the requested dimensions (NV12, 3/2 bytes per
+                // pixel, aligned up to frame_alignment) instead of being a fixed 64 KiB. It is the
+                // buffer the guest allocates and hands back as VdecFrame.data, so reporting a
+                // resolution-independent constant hands a real decoder a ~3 MiB overflow. The
+                // workspace sizes deliberately stay at the floor - nothing is evidence for those.
+                const uint64_t nv12_1080p = (1920ull * 1080ull * 3ull) / 2ull;  // 0x2F7600
                 CHECK(query_decoder((uint64_t)(uintptr_t)&config,
                                     (uint64_t)(uintptr_t)decoder_memory, 0, 0, 0, 0) == 0 &&
-                          decoder_memory[1] == (64ull << 10) && decoder_memory[7] == (64ull << 10),
+                          decoder_memory[1] == (64ull << 10) && decoder_memory[3] == (64ull << 10) &&
+                          decoder_memory[5] == (64ull << 10),
                       "Videodec2 decoder-memory query initializes all size requirements");
+                CHECK(decoder_memory[7] == nv12_1080p &&
+                          (uint32_t)decoder_memory[8] == 0x100 &&
+                          nv12_1080p % 0x100 == 0,
+                      "Videodec2 reports a frame size a 1920x1080 picture actually fits in");
+                {
+                    // A resolution-independent constant would pass the 1080p check above by accident
+                    // if it happened to be large enough, so prove the answer TRACKS the request.
+                    Config small = config;
+                    small.width = 640; small.height = 480;
+                    uint64_t m[9] = {72};
+                    CHECK(query_decoder((uint64_t)(uintptr_t)&small, (uint64_t)(uintptr_t)m,
+                                        0, 0, 0, 0) == 0 &&
+                              m[7] == (640ull * 480ull * 3ull) / 2ull && m[7] < nv12_1080p,
+                          "Videodec2 frame size scales with the requested dimensions");
+                    // Auto dimensions (-1) carry no size prosper can derive; that path keeps the
+                    // documented floor rather than inventing a level-implied maximum.
+                    Config autodim = config;
+                    autodim.width = -1; autodim.height = -1;
+                    uint64_t a[9] = {72};
+                    CHECK(query_decoder((uint64_t)(uintptr_t)&autodim, (uint64_t)(uintptr_t)a,
+                                        0, 0, 0, 0) == 0 && a[7] == (64ull << 10),
+                          "Videodec2 auto dimensions fall back to the documented floor");
+                }
                 decoder_memory[2] = (uint64_t)(uintptr_t)memory[0];
                 decoder_memory[4] = (uint64_t)(uintptr_t)memory[1];
                 decoder_memory[6] = (uint64_t)(uintptr_t)memory[2];
@@ -266,8 +303,24 @@ int main() {
                 // queried sizes have to be the sizes CreateDecoder accepts, or the guest allocates to
                 // a contract nothing downstream keeps.
                 CHECK(probe_memory[1] == (64ull << 10) && probe_memory[3] == (64ull << 10) &&
-                          probe_memory[5] == (64ull << 10) && probe_memory[7] == (64ull << 10),
+                          probe_memory[5] == (64ull << 10) && probe_memory[7] == nv12_1080p,
                       "#1658: a queueless sizing query still writes every size requirement");
+                // The split must not have turned the sizing query into a blanket success. Dropping
+                // vdec_validate_config entirely, or returning early, passes every other assertion
+                // here — this is the only one that fails to that wrong implementation.
+                {
+                    Config bad_resource = no_queue;
+                    bad_resource.resource = 2;
+                    uint64_t m[9] = {72};
+                    CHECK(query_decoder((uint64_t)(uintptr_t)&bad_resource, (uint64_t)(uintptr_t)m,
+                                        0, 0, 0, 0) == 0x811d0203ull,
+                          "#1658: the sizing query still validates every field except the queue");
+                    Config bad_depth = no_queue;
+                    bad_depth.depth = 0;
+                    CHECK(query_decoder((uint64_t)(uintptr_t)&bad_depth, (uint64_t)(uintptr_t)m,
+                                        0, 0, 0, 0) == 0x811d0206ull,
+                          "#1658: the sizing query still rejects a zero input depth");
+                }
                 probe_memory[2] = (uint64_t)(uintptr_t)memory[0];
                 probe_memory[4] = (uint64_t)(uintptr_t)memory[1];
                 probe_memory[6] = (uint64_t)(uintptr_t)memory[2];
@@ -283,7 +336,8 @@ int main() {
                 with_queue.queue = compute_queue;
                 uint64_t sized_decoder = 0;
                 CHECK(create((uint64_t)(uintptr_t)&with_queue, (uint64_t)(uintptr_t)probe_memory,
-                             (uint64_t)(uintptr_t)&sized_decoder, 0, 0, 0) == 0 && sized_decoder != 0,
+                             (uint64_t)(uintptr_t)&sized_decoder, 0, 0, 0) == 0 &&
+                          sized_decoder != 0 && sized_decoder != decoder,
                       "#1658: the sizes returned by the queueless query are honoured by CreateDecoder");
                 if (sized_decoder) CHECK(destroy(sized_decoder, 0, 0, 0, 0, 0) == 0,
                                          "#1658: the queried-size decoder tears down cleanly");

@@ -606,9 +606,17 @@ zero tag as "not really bound", so the completion event was never delivered and 
 
 With both fixed, the title loads 100+ asset bundles including its title-screen textures, and renders
 the Bandai Namco and CRIWARE logos. It then goes black and stays black for the rest of the run
-(58 of 60 sampled frames are byte-identical): the opening movie cannot start, because
-`sceVideodec2QueryDecoderMemoryInfo` fails with `0x811d0200`, so `criMvPly_AllocateWorkBufferWithWork`
-never gets a decoder. The title screen is behind that movie and has not been reached.
+(58 of 60 sampled frames are byte-identical). The title screen is behind the opening movie and has
+not been reached.
+
+The movie was originally blocked at `sceVideodec2QueryDecoderMemoryInfo`, which failed with
+`0x811d0200` so `criMvPly_AllocateWorkBufferWithWork` never got a decoder. **That cause is fixed**
+(#1687): the sizing query no longer demands a compute-queue handle the guest cannot hold until after
+sizing, and the title now creates an AVC decoder and feeds it real access units. It still goes black,
+for a different and expected reason — prosper's `Videodec2` decode is a deliberate no-picture
+implementation and there is no AVC decoder in the tree (#1688), so no video pixels are produced.
+Whether the title advances past a picture-less movie is open and is answered by a rendered run, not
+by the CPU-side trace that established the above.
 
 ### Ruled out
 
