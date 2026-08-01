@@ -3,9 +3,11 @@
 // (Linux/macOS: exec_image_linux.cpp; Windows: exec_image_win.cpp).
 #include "boot_program.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <filesystem>
 #include <system_error>
+#include <vector>
 
 namespace prosper {
 
@@ -48,6 +50,41 @@ std::string resolve_host_path_case(const std::string& want) {
     // (fs::path would otherwise rewrite them to the host-native form, e.g. '\' on Windows).
     if (dir != parent) return (fs::path(dir) / base).string();
     return want;
+}
+
+// See boot_program.hpp. Pure filesystem query so it can be unit-tested without a guest image.
+std::vector<std::string> discover_extra_plugin_modules(
+    const std::string& dump_root, const std::vector<std::string>& listed_basenames) {
+    namespace fs = std::filesystem;
+    std::vector<std::string> found;
+    if (dump_root.empty()) return found;
+    auto lower = [](std::string s) {
+        for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+    };
+    std::vector<std::string> listed;
+    listed.reserve(listed_basenames.size());
+    for (const auto& b : listed_basenames) listed.push_back(lower(b));
+
+    std::error_code ec;
+    const std::string dir = resolve_host_path_case(dump_root + "/Media/Plugins");
+    if (!fs::is_directory(fs::path(dir), ec)) return found;
+    for (const auto& e : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        const std::string name = e.path().filename().string();
+        const std::string lname = lower(name);
+        if (lname.size() < 5 || lname.compare(lname.size() - 4, 4, ".prx") != 0) continue;
+        bool already = false;
+        for (const auto& l : listed) if (l == lname) { already = true; break; }
+        if (!already) found.push_back(e.path().string());
+    }
+    // directory_iterator order is filesystem-defined; sort so a boot is reproducible. DESCENDING by
+    // lowercased basename, because the caller appends this block to a link list whose init functions
+    // run in reverse order — the guest therefore initializes them in ascending name order.
+    std::sort(found.begin(), found.end(), [&](const std::string& a, const std::string& b) {
+        return lower(fs::path(a).filename().string()) > lower(fs::path(b).filename().string());
+    });
+    return found;
 }
 
 } // namespace prosper
@@ -114,6 +151,39 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
         { d + "/sce_module/libSceNpCppWebApi.prx", BOOT_NPCPPWEBAPI },
         { d + "/sce_module/libc.prx", BOOT_LIBC },
     };
+    // #1609: the fixed list above only names plugins some earlier title needed. Link whatever else
+    // this title ships in its own Media/Plugins directory, so a first P/Invoke into it resolves
+    // instead of raising a silent DllNotFoundException (prosper has no runtime PRX loading, #639).
+    // Inserted just before the sce_module entries so these plugins initialize after libc and the
+    // bundled support PRX but before the hard-coded Unity plugins (init runs in reverse list order).
+    if (!getenv("PROSPER_NO_PLUGIN_AUTOLINK")) {
+        std::vector<std::string> listed;
+        for (const auto& e : in) {
+            const size_t slash = e.path.find_last_of("/\\");
+            listed.push_back(slash == std::string::npos ? e.path : e.path.substr(slash + 1));
+        }
+        const std::vector<std::string> extra = discover_extra_plugin_modules(d, listed);
+        size_t insert_at = in.size();
+        for (size_t i = 0; i < in.size(); i++)
+            if (in[i].path.find("/sce_module/") != std::string::npos) { insert_at = i; break; }
+        unsigned slot = 0;
+        for (const auto& path : extra) {
+            if (slot >= BOOT_PLUGIN_AUTO_SLOTS) {
+                printf("plugin auto-link: no free base slot for %s (max %u) — NOT linked\n",
+                       path.c_str(), BOOT_PLUGIN_AUTO_SLOTS);
+                continue;
+            }
+            const uint64_t base = BOOT_PLUGIN_AUTO_BASE + (uint64_t)slot * BOOT_PLUGIN_AUTO_STRIDE;
+            printf("plugin auto-link: %s @ 0x%llx\n", path.c_str(), (unsigned long long)base);
+            // skip_on_export_collision: never introduce a duplicate NID export. A title can ship two
+            // builds of the same library (Evergate's libfmod.prx + libfmodL.prx export identical
+            // NIDs); linking both would run two init_arrays and make dlsym answer differently per
+            // module handle. Deduplicating on exports rather than on a filename suffix also degrades
+            // correctly for a title that ships only the debug variant — nothing collides, so it links.
+            in.insert(in.begin() + (ptrdiff_t)(insert_at + slot), { path, base, true });
+            slot++;
+        }
+    }
     if (getenv("PROSPER_NO_PSN"))
         for (size_t i = in.size(); i-- > 0; )
             if (in[i].path.find("PSN.prx") != std::string::npos ||
@@ -136,6 +206,11 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
 
     std::string e;
     if (!link_program(in, BOOT_STUB, p, &e)) return fail("link failed: " + e);
+    // Loud, self-describing report of every auto-linked plugin the linker refused: which module was
+    // dropped, the exact NID that collided, and which already-linked module owns it.
+    for (const auto& s : p.skipped_modules)
+        printf("plugin auto-link: SKIPPED %s — it exports NID %s, already provided by %s\n",
+               s.path.c_str(), s.nid.c_str(), s.owner_path.c_str());
     printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
            p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(), p.init_fns.size());
 

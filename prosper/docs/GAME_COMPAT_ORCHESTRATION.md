@@ -50,8 +50,8 @@ session. Prefer breadth when a hard lane stalls — overall library progress mat
 
 ### The instrument-not-the-subject list — read this before believing any surprising measurement
 
-**Fourteen phantom defects came from the measuring apparatus, not the subject** (eleven in one session on
-2026-07-31, three more on 2026-08-01). Several cost hours; one cost two sessions. This is the single
+**Twenty phantom defects came from the measuring apparatus, not the subject** (eleven in one session on
+2026-07-31, nine more on 2026-08-01). Several cost hours; one cost two sessions. This is the single
 highest-value page in this document.
 
 | # | Instrument | How it lied |
@@ -74,6 +74,9 @@ highest-value page in this document.
 | 15 | "is this dword pair a mapped pointer?" | The user-data window is 32 dwords and holds many live pointers, so **several** seed offsets satisfy "every declared descriptor is readable". On #305 a shifted seed made all declared pointers land cleanly on **9 of 9** stages — and the hardware field that bounds the window (`SPI_SHADER_PGM_RSRC2_GS.USER_SGPR`) proved the stage cannot see there at all. A live A/B then raised rejects 118-141 -> 521. A numeric fit over a pointer-shaped predicate is weak evidence; find the register that bounds the search space. |
 | 16 | One diagnostic **label** covering two packet kinds | #305's bind trace emitted `[bind] DRAW` from all five per-item snapshot sites in `GpuState::apply` — and **two of those are compute dispatches**. A dispatch never consumes `SPI_SHADER_PGM_LO_ES`, so a bind/draw agreement statistic computed over those lines mixes in events that cannot agree by construction. Graphics-queue dispatches read the *graphics* register file, so they print plausible `es_lo` and are **indistinguishable from draws in the log** — a re-run, not a re-parse. **Re-measured after relabelling** (a fresh boot — the two figures are not the same run: 434,239 bind packets vs 193,397), the contaminated "871,648 of 876,217 (99.5%)" became **300,404 of 300,404 (100%)**, so the residue had been dispatches. Tag every emitter with the kind it actually observed. |
 | 17 | **Asymmetric** exhaustion of per-site caps | A cousin of #13. When one side of a paired trace caps (bind lines, one counter at 4,000) and the other runs on **five independent counters**, the first side dies during the pre-title load while the second keeps emitting; a "does each draw follow a bind?" analysis then reported a 41% mismatch that was pure counter exhaustion. Bound the analysis to the region where **every** stream is still logging. Related: `command_order` is **per-submit and resets**, so ordering events globally by it interleaves submits and manufactures impossible pairs. |
+| 18 | `VAR=1 $unquoted_var cmd` | The shell expands `$unquoted_var` **after** it has decided which word is the command, so an expansion like `PROSPER_NO_PLUGIN_AUTOLINK=1` becomes the **command name**, not an assignment. The arm never runs, exits 127, and — with stdout redirected to a per-arm log — leaves an empty file that reads exactly like a legitimate "no output" result. #1609's founding 14,666-vs-18,167 "20% regression" came from an A/B whose OFF arm had never executed. Build env into the command directly, or use `env VAR=1 cmd`. |
+| 19 | `$HOME` read as private scratch | Every lane on this box shares one `$HOME` (410 files at the time of writing). Generic scratch names — `pr-body.md`, `ab-result.md`, `app.log`, `apr.log` — **already collide across lanes**. Writing one destroys another agent's work in flight, and reading one silently answers your question with someone else's data. Title-scope every scratch file (`tales-pr-body.md`, `tales-rate-*.log`). The tell that saved it here: the Write tool **refused to overwrite a file it had not read**. A tool declining to clobber is a safety net, not an obstacle — an agent that "fixes" it by deleting the file and retrying destroys the thing the guard was protecting. |
+| 20 | An **empty CI rollup** read as "queued" | GitHub does **not run checks on a conflicting branch at all**, so a PR whose base has moved reports `pass=0 fail=0 pending=0` with `mergeStateStatus=DIRTY` — permanently, until it is rebased. That is byte-identical to the "checks have not registered yet" state, and #1656 sat in it while master moved twice. Same shape as #18's empty log: **an absent signal mimicking a pending one**. Read `mergeable`/`mergeStateStatus` before concluding anything from a check count, and never wait on zeros. |
 
 **Working rules that follow:**
 
@@ -86,6 +89,30 @@ highest-value page in this document.
   explanation for the gap. Then confirm the phase by **opening the frames**: #1641's Nikoderiko row was
   only interpretable once the images showed samples 10-11 carrying ~160k distinct colours while 3-9 were
   black, which proved the census was tracking real workload rather than drifting.
+- **Build a timing measurement that cannot lie quietly.** Everything above is "this instrument lied"; this is
+  the counterpart — the shape of a measurement that reports its own invalidity instead of averaging it away.
+  Seven lanes share one GPU, so vigilance does not scale: a run *will* eventually overlap someone else's
+  capture, and a contended sample looks exactly like a real regression. Three properties, all cheap:
+  1. **Self-lock** (`flock` on a lockfile) so a second copy of the driver refuses to start rather than racing
+     the first. Two waiters queued behind the same "GPU free" condition both fire when it clears.
+  2. **Build strictly before measuring, never concurrently.** A `-j8` compile landing on top of a run costs
+     more throughput than whatever is being measured. Put the build inside the driver, ahead of the loop.
+  3. **Discard, don't average.** Sample the foreign-process count **before and after** each run; if either is
+     nonzero, **rename the log to `DISCARD-…`** instead of dropping it. Contention then becomes *visible in
+     the record* rather than invisible in the mean, and the discarded run stays auditable afterwards instead
+     of surviving as an unexplained outlier.
+  4. **Alternate the arms, then check the residuals for cycle correlation** before attributing any
+     difference to the treatment. Running all of arm A then all of arm B lets a *time-varying* confound
+     land entirely on one arm and become a phantom effect. Alternating forces it onto both, which makes it
+     detectable: in #1609's 12-run experiment the slowest run was **cycle 2 in all four title × arm
+     combinations**, so the residual variance tracked *when* a run happened, not *which arm* it was. That is
+     not an argument that the gap is noise — it is a demonstration, from the same data that would otherwise
+     have produced the phantom. If the extremes line up by cycle rather than by arm, the treatment is not
+     the explanation.
+  Report **whole-run and steady-state (tail-window) rates separately**: a one-off boot cost and a per-frame
+  cost are indistinguishable in a whole-run average, because a run that reaches steady state one second later
+  and then performs identically still shows a lower average. Report min/max spread and an explicit
+  **overlap verdict** across arms — if the arms overlap, say so plainly and the question is closed.
 - **Joining two instruments requires an explicit shared ordinal, never stream adjacency.** If two diagnostics
   are emitted at different pipeline stages, their interleaving in the log is an artifact of *when each stage
   ran*, not of when the events happened. Print a common ordinal (`command_order`) on both and join on it. This

@@ -7,6 +7,28 @@
 
 namespace prosper {
 
+// The one definition of "what this module contributes to the export table". The predicate must stay
+// identical to the one used when `out.exports` is built below.
+static bool is_exported_symbol(const Symbol& s) {
+    return !s.is_import && !s.nid.empty() && s.value != 0;
+}
+
+std::vector<std::string> module_export_nids(const Module& m) {
+    std::vector<std::string> nids;
+    for (const auto& s : m.symbols) if (is_exported_symbol(s)) nids.push_back(s.nid);
+    return nids;
+}
+
+ExportCollision find_export_collision(
+    const Module& m, const std::unordered_map<std::string, std::string>& claimed) {
+    for (const auto& s : m.symbols) {
+        if (!is_exported_symbol(s)) continue;
+        const auto it = claimed.find(s.nid);
+        if (it != claimed.end()) return { s.nid, it->second };
+    }
+    return {};
+}
+
 bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
                   Program& out, std::string* err) {
     auto fail = [&](const std::string& s) { if (err) *err = s; return false; };
@@ -14,10 +36,23 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
     out.stub_base = stub_base;
 
     // --- Pass 1: load every module and build its image at its base. ---
+    // NID -> path of the accepted module that exports it, in list order. Mirrors the
+    // first-definition-wins global export table built in the pass below, so an optional input can be
+    // rejected BEFORE its image is built rather than silently aliasing an earlier module's exports.
+    std::unordered_map<std::string, std::string> nid_owner;
     for (auto& in : inputs) {
         std::string e;
         auto mo = Module::load(in.path, &e);
         if (!mo) return fail("load " + in.path + ": " + e);
+        if (in.skip_on_export_collision) {
+            const ExportCollision hit = find_export_collision(*mo, nid_owner);
+            if (!hit.nid.empty()) {
+                out.skipped_modules.push_back({ in.path, hit.nid, hit.owner_path });
+                continue;
+            }
+        }
+        for (const auto& s : mo->symbols)
+            if (is_exported_symbol(s)) nid_owner.emplace(s.nid, in.path);
         auto mod = std::make_unique<Module>(std::move(*mo));
         LoadedImage img;
         if (!build_image(*mod, in.base, img, &e))
@@ -25,6 +60,9 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
         out.mods.push_back(std::move(mod));
         out.imgs.push_back(std::move(img));
     }
+    // Only optional inputs can be dropped above, and the main executable is never optional — but do
+    // not index into an empty vector if a caller ever flags every input.
+    if (out.imgs.empty()) return fail("every module was skipped on an export collision");
     out.entry = out.imgs[0].entry;
 
     // Assign each module with a PT_TLS segment a TLS module id (>=1; 0 = "no TLS"), and record its

@@ -515,6 +515,21 @@ if(TARGET prosper_core)
   target_link_libraries(test_module_path_case PRIVATE prosper_core)
   add_test(NAME module_path_case COMMAND test_module_path_case)
 
+  # Unity native-plugin auto-link (#1609): a title's own Media/Plugins/*.prx that the fixed preload
+  # list never named must still be linked, or its first P/Invoke raises a DllNotFoundException that
+  # IL2CPP captures into a Task and never prints. Also guards the export-collision rule that keeps
+  # auto-linking from introducing a duplicate NID export (Evergate ships libfmod.prx AND libfmodL.prx,
+  # the same library's release and logging builds). The discovery and predicate assertions are pure
+  # std::filesystem/struct work and need no dump; the dump, when configured, additionally exercises
+  # link_program's honouring of the skip flag.
+  add_executable(test_plugin_autolink tests/test_plugin_autolink.cpp)
+  target_link_libraries(test_plugin_autolink PRIVATE prosper_core)
+  if(HAVE_GAME_DUMP)
+    add_test(NAME plugin_autolink COMMAND test_plugin_autolink "${GAME_DUMP}")
+  else()
+    add_test(NAME plugin_autolink COMMAND test_plugin_autolink)
+  endif()
+
   # ATRAC9 decode (vendored LibAtrac9 + prosper glue): an embedded 16-superframe slice of a real PS5
   # snd0.at9 decodes bit-exact vs the LibAtrac9 reference (CRC32). Pure, no game dump; runs in CI.
   add_executable(test_atrac9 tests/test_atrac9.cpp)
