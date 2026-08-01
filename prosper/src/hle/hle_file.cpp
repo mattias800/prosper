@@ -961,8 +961,12 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
     uint64_t cc[8] = {0,0,0,0,0,0,0,0}; int nc = 0; uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
     int maxw = stack_words_above(sp);
     for (int i = 0; i < 1200 && i < maxw && nc < 8; i++) { uint64_t v = sp[i];
-        // #1659: was a stale pre-#825 literal base, so every printed caller was 0x10000000 high.
-        if (prosper::guest_va_in_module(v)) { uint64_t o = prosper::guest_module_offset(v);
+        // #1659: the base was a stale pre-#825 literal, so every printed caller was 0x10000000 high.
+        // Deliberately still EBOOT-ONLY: the format prints one "eboot+" prefix and then eight bare
+        // offsets, so admitting other modules here would label an Il2Cpp caller as an eboot RVA — a
+        // small, plausible, wrong number. Widening this needs a per-entry "name+off" format first.
+        if (v >= prosper::BOOT_EBOOT && v < prosper::BOOT_IL2CPP) {
+            uint64_t o = v - prosper::BOOT_EBOOT;
             if (nc == 0 || cc[nc-1] != o) cc[nc++] = o; } }
     fprintf(stderr, "[preadlog] %-6s %-24s fd=%lld off=0x%llx(blk %lld) cnt=0x%llx tid=%ld callers=eboot+0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx\n",
             fn, base, (long long)fd, (unsigned long long)off, (long long)(off / 0x10000),

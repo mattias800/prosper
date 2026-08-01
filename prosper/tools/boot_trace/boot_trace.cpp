@@ -76,8 +76,13 @@ using namespace prosper;
 // appears in a backtrace; the old local table predated FMOD/Wwise and even retained obsolete eboot
 // and libc bases, misclassifying every address in those later slots as SaveData or libc.
 // Module classification/offset now live in boot_program.hpp so the fault, HWBP and APR diagnostics
-// produce the identical label instead of each carrying its own copy (#1659). These were the correct
+// produce the identical label instead of each carrying its own copy (#1659). This was the correct
 // implementation; the others had a stale literal base.
+//
+// NOT byte-identical to what stood here, in three ways — all deliberate, all changing boot_trace's own
+// output: the shared version adds CommonDialog.prx and the auto-plugin pool (which this copy predated),
+// and it offsets BOOT_STUB addresses from BOOT_STUB, where this copy fell through and printed the raw
+// address. So "STUB +0x600000123" in an archived log is "STUB +0x123" now.
 static const char* cls(uint64_t a) { return prosper::guest_module_name(a); }
 static uint64_t    bof(uint64_t a) { return prosper::guest_module_offset(a); }
 

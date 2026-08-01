@@ -6,6 +6,7 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "sce_errno.hpp"
+#include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "sync_futex.hpp"   // shared futex wake + waiter registration (also used by the GPU's label wake)
 #include "../host/guest_memory_map.hpp"
 #include "../host/guest_write_watch.hpp"
@@ -1116,7 +1117,9 @@ HLE(k_wait_on_address) {
     // NOT the job pool (0xae1af9 / 0x18ab088) — those need real jobs and crash on a phantom. Whitelist:
     // main PreloadManager 0x18a83b5, GfxDevice work-queue 0xb0672a, worker 0x9385d7.
     uint64_t gra = ((uint64_t*)__builtin_frame_address(0))[1];   // guest return address (stub tail-jumped)
-    uint64_t goff = gra - 0x400000000ull;
+    // #1659: this is NOT a label — it feeds the RVA whitelist below, so the stale pre-#825
+    // base made every comparison fail and PROSPER_PUNCH has been silently inert since then.
+    uint64_t goff = prosper::guest_module_offset(gra);
     bool punch_site = (goff == 0x18a83b5 || goff == 0xb0672a || goff == 0x9385d7);
     if (punch_secs > 0 && a2 == 0 && !pts && punch_site) {
         ts.tv_sec = punch_secs; ts.tv_nsec = 0; pts = &ts;   // bound this otherwise-infinite wait
@@ -1146,9 +1149,10 @@ HLE(k_wait_on_address) {
             punch_budget.fetch_sub(1);
             *(volatile uint32_t*)(uintptr_t)a0 = (uint32_t)a1 + 1;
             futex_wake(a0, INT_MAX);
-            fprintf(stderr, "[punch] T%ld addr=0x%llx exp=0x%llx -> fabricated signal (ra=eboot+0x%llx, budget=%d)\n",
+            fprintf(stderr, "[punch] T%ld addr=0x%llx exp=0x%llx -> fabricated signal (ra=%s+0x%llx, budget=%d)\n",
                     (long)prosper_gettid(), (unsigned long long)a0, (unsigned long long)a1,
-                    (unsigned long long)(gra - 0x400000000ull), punch_budget.load());
+                    prosper::guest_module_name(gra),
+                    (unsigned long long)prosper::guest_module_offset(gra), punch_budget.load());
             return 0;
         }
         return prosper::hle::kSceKernelErrorETIMEDOUT;   // 0x8002003c: FreeBSD ETIMEDOUT is 60
@@ -1160,9 +1164,10 @@ HLE(k_wake_by_address) {
     int n = a1 ? (int)a1 : INT_MAX;
     futex_wake(a0, n);
     if (synclog()) {
-        uint64_t wgoff = ((uint64_t*)__builtin_frame_address(0))[1] - 0x400000000ull;
-        fprintf(stderr, "[sync] T%ld WAKE       addr=0x%llx *addr=0x%x n=%d caller=eboot+0x%llx\n",
-                (long)prosper_gettid(), (unsigned long long)a0, *(uint32_t*)a0, n, (unsigned long long)wgoff);
+        const uint64_t wra = ((uint64_t*)__builtin_frame_address(0))[1];
+        fprintf(stderr, "[sync] T%ld WAKE       addr=0x%llx *addr=0x%x n=%d caller=%s+0x%llx\n",
+                (long)prosper_gettid(), (unsigned long long)a0, *(uint32_t*)a0, n,
+                prosper::guest_module_name(wra), (unsigned long long)prosper::guest_module_offset(wra));
     }
     return 0;
 }
