@@ -438,15 +438,28 @@ HLE(s_videodec2_query_decoder_memory) {
     // The cpu/gpu/shared workspace sizes stay at the floor: nothing here is evidence for those, and
     // inflating them has broken a title before (see VDEC_MIN_MEMORY's own note on the 16 MiB
     // placeholder exhausting a CRI pool).
-    // The `> 0` guard is load-bearing for more than the auto case: it is what makes the int32 ->
-    // uint64 widening safe. With both dimensions at INT32_MAX the product times 3 reaches about 75%
-    // of UINT64_MAX — so this expression has exactly one factor of headroom left. Anything that adds
-    // another multiplicand here (a DPB count, a bytes-per-sample term for 10-bit) MUST re-check the
-    // bound rather than assume 64 bits is roomy.
+    // NV12 is 3/2 bytes per pixel, but do NOT compute it as `w*h*3/2`. That form's intermediate
+    // reaches ~75% of UINT64_MAX at INT32_MAX dimensions, which leaves room for no further
+    // multiplicand at all — `INT32_MAX^2 * 3 * 2` already overflows. `wh + (wh+1)/2` peaks at ~25%
+    // of the range instead, so the cliff is removed rather than documented, and anything that later
+    // adds a factor here (a DPB count, a bytes-per-sample term for 10-bit) starts with real room.
+    // The `> 0` guard is what makes the int32 -> uint64 widening itself safe.
+    //
+    // The two forms agree exactly whenever `w*h` is EVEN, which covers every macroblock-aligned
+    // video and all three sizes exercised in tests (1920x1088, 1920x1080, 640x480). They differ by
+    // one byte when `w*h` is odd, where this form rounds UP (1x1 gives 2 rather than 1). That is the
+    // correct direction — true NV12 chroma is 2*ceil(w/2)*ceil(h/2), so an odd-dimensioned picture
+    // needs MORE than `wh*3/2`, not less — and it is not a case any real video stream produces.
     constexpr uint32_t VDEC_FRAME_ALIGN = 0x100;
     uint64_t frame_bytes = 0;
     if (config->max_width > 0 && config->max_height > 0) {
-        frame_bytes = ((uint64_t)config->max_width * (uint64_t)config->max_height * 3u) / 2u;
+        // Use the dimensions the guest ASKED FOR, which are macroblock-rounded (this title requests
+        // 1088 for a 1080-line movie). That is not a safety margin to be trimmed later: H.264 codes
+        // in 16x16 macroblocks, so a 1080-row picture is physically written as 1088 rows and cropped
+        // for display via the SPS frame_cropping fields. Sizing from 1080 would be short by 8 rows
+        // times the pitch — a real overflow, not conservatism.
+        const uint64_t wh = (uint64_t)config->max_width * (uint64_t)config->max_height;
+        frame_bytes = wh + (wh + 1) / 2;
     } else {
         // Auto dimensions: the value below is a FLOOR, not a derivation, and the original
         // resolution-independent hazard survives on this path. Nothing in the code distinguishes the
