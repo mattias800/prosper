@@ -50,8 +50,9 @@ session. Prefer breadth when a hard lane stalls — overall library progress mat
 
 ### The instrument-not-the-subject list — read this before believing any surprising measurement
 
-**Eleven phantom defects in one session (2026-07-31) came from the measuring apparatus, not the subject.**
-Several cost hours; one cost two sessions. This is the single highest-value page in this document.
+**Thirteen phantom defects came from the measuring apparatus, not the subject** (eleven in one session on
+2026-07-31, two more on 2026-08-01). Several cost hours; one cost two sessions. This is the single
+highest-value page in this document.
 
 | # | Instrument | How it lied |
 |---|---|---|
@@ -66,8 +67,22 @@ Several cost hours; one cost two sessions. This is the single highest-value page
 | 9 | `[compute] skip unsupported program` | **Deduped per `code_addr`**: one line means "failed at least once", NOT "always fails". A program running 763 times and failing once looks identical to a permanently blocked one. |
 | 10 | `PROSPER_COMPUTELOG_CODE=<addr>` | Correctly protects a realtime route from ~13k submits of logging, and thereby **suppresses `execute` lines for every other program**. Right for one question, silently wrong for the next asked of the same log. |
 | 11 | SHA reachability after a **squash** merge | `git merge-base --is-ancestor` reports "unmerged" for work that *is* on master. Verify by **content**, not by SHA. |
+| 12 | `PROSPER_REGWATCH` **joined to** `PROSPER_EXECLOG` by stream adjacency | The two timestamp at **different pipeline stages** — REGWATCH at command-processor *decode*, EXECLOG at *realization* — and the phases interleave per submit. Read by log order, #1606 said **1,049 of 1,050** suppressed draws resolved against a *future* register write. Clean, compelling, and entirely false. Fixed by #1633's `order=`. |
+| 13 | A **print-capped** diagnostic read as a frequency | `[agc] WaitRegMem … NOT satisfied` prints the first 40 then every 1024th (`ln < 40 \|\| (ln & 1023) == 0`); `[agc] out-of-range indirect reg write dropped` stops after **4**; `[agc] indexed indirect draw skipped` after 24. #1606 called the `WaitRegMem` volume "the loudest signal, dozens per second"; the true rate is **~1.5/s** (see below). A line count from these is a cap, not a rate. Same trap as #9's dedupe, different mechanism. |
 
 **Working rules that follow:**
+
+- **Joining two instruments requires an explicit shared ordinal, never stream adjacency.** If two diagnostics
+  are emitted at different pipeline stages, their interleaving in the log is an artifact of *when each stage
+  ran*, not of when the events happened. Print a common ordinal (`command_order`) on both and join on it. This
+  is why the `order=` field exists on the `[exec] skip draw early` line — **it is not redundant with the
+  register values on the same line, and removing it silently re-opens the phantom above.**
+- **Before quoting a diagnostic's line count as a rate, grep for its cap.** These sites use a
+  `static std::atomic<int>` counter or a per-key dedupe set; check for one before concluding "this fires N
+  times" or "this is rare". When the site prints its own counter — `WaitRegMem #%d` *is* `ln` — the true
+  total is free: the highest `#N` in the log bounds it, and a run whose maximum stays under the cap has
+  printed *every* occurrence. That read turned #1606's "dozens per second" into 18 and 21 events for two
+  entire runs.
 
 - Prefer experiments that **detect their own invalidity** — e.g. render two adjacent operations and assert both
   return the same resolution, so a surface switch invalidates the comparison instead of producing a phantom.
