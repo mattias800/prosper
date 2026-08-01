@@ -1321,6 +1321,47 @@ int main() {
                 const uint32_t sv = chan(s, c), dv = chan(d, c);
                 return is_nan(sv, c) ? is_nan(dv, c) : sv == dv;
             };
+
+            // Pin the narrowed predicate itself on the CPU, with no GPU involved (#1681). The live
+            // sweep can only demonstrate the cases the driver happens to produce, so it cannot show
+            // that the exemption stops at NaN *payload* — and a narrowing that quietly also accepted
+            // Inf<->NaN or NaN->finite would still pass every run. These assertions fix the contract
+            // in both directions and would fail if a later edit widened it.
+            {
+                bool accepts_payload = true, rejects_everything_else = true;
+                for (int c = 0; c < 3; ++c) {
+                    const uint32_t m = mant_bits(c), sh = fields[c].shift;
+                    auto tex = [&](uint32_t v) { return v << sh; };
+                    const uint32_t inf = 0x1fu << m;                 // exp all ones, mantissa 0
+                    const uint32_t snan = inf | 1u;                  // mantissa MSB clear
+                    const uint32_t qnan = inf | (1u << (m - 1u));    // mantissa MSB set
+                    const uint32_t sub = 1u;                         // exp 0, mantissa 1
+                    const uint32_t norm = (15u << m) | 3u;           // ordinary finite value
+                    // Payload movement between NaNs is permitted, in either direction.
+                    accepts_payload &= channel_round_trips(tex(snan), tex(qnan), c);
+                    accepts_payload &= channel_round_trips(tex(qnan), tex(snan), c);
+                    accepts_payload &= channel_round_trips(tex(snan), tex(snan), c);
+                    accepts_payload &= channel_round_trips(tex(inf), tex(inf), c);
+                    accepts_payload &= channel_round_trips(tex(sub), tex(sub), c);
+                    accepts_payload &= channel_round_trips(tex(norm), tex(norm), c);
+                    // Nothing else is. A NaN may not decay, and a non-NaN may not become one.
+                    rejects_everything_else &= !channel_round_trips(tex(snan), tex(inf), c);
+                    rejects_everything_else &= !channel_round_trips(tex(qnan), tex(inf), c);
+                    rejects_everything_else &= !channel_round_trips(tex(snan), tex(0), c);
+                    rejects_everything_else &= !channel_round_trips(tex(snan), tex(norm), c);
+                    rejects_everything_else &= !channel_round_trips(tex(inf), tex(snan), c);
+                    rejects_everything_else &= !channel_round_trips(tex(inf), tex(norm), c);
+                    rejects_everything_else &= !channel_round_trips(tex(norm), tex(norm + 1u), c);
+                    rejects_everything_else &= !channel_round_trips(tex(sub), tex(0), c);
+                    rejects_everything_else &= !channel_round_trips(tex(0), tex(sub), c);
+                }
+                CHECK(accepts_payload,
+                      "R11G11B10 round-trip contract permits NaN payload movement in both directions");
+                CHECK(rejects_everything_else,
+                      "R11G11B10 round-trip contract still rejects NaN<->Inf, NaN->finite, and any "
+                      "finite or subnormal change in every channel");
+            }
+
             size_t payload_only = 0, real_diffs = 0;
             for (size_t t = 0; t < src.size(); ++t) {
                 if (src[t] == dst[t]) continue;

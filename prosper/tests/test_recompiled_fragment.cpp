@@ -79,6 +79,14 @@ int main() {
     auto is_blue_clear = [](const uint8_t* p) {
         return p && p[2] > 0x80 && p[0] < 0x40 && p[1] < 0x40;
     };
+    // A clear-coloured target on its own only says "no draw landed here", which any pipeline failure
+    // would also produce. Pair it with the module's own declared requirement, so the wave64-less arm
+    // asserts the specific thing that should have happened: this shader demanded an exact 64-lane
+    // subgroup, and the device therefore left the target untouched. Four pre-existing gated fixtures
+    // already assert the required size separately; this applies the same rigour to the rest.
+    auto skipped_wave64_draw = [&](const std::vector<uint32_t>& frag, const uint8_t* p) {
+        return fragment_spirv_required_subgroup_size(frag) == 64 && is_blue_clear(p);
+    };
 
     // A second Sonic loop form has an unconditional back-edge but an interior EXECZ targeting the
     // loop exit. The interior branch must leave the loop directly: going through the back-edge would
@@ -107,7 +115,7 @@ int main() {
     CHECK(direct_break_center &&
               (supports_fragment_wave64_vote
                    ? (direct_break_center[1] > 0x80 && direct_break_center[0] < 0x40)
-                   : is_blue_clear(direct_break_center)),
+                   : skipped_wave64_draw(direct_break_frag, direct_break_center)),
           supports_fragment_wave64_vote
               ? "unconditional-backedge EXECZ break exits directly and preserves loop merge state"
               : "device without fragment wave64 vote skips the backedge-break draw fail-visible");
@@ -537,7 +545,7 @@ int main() {
                 CHECK(supports_fragment_wave64_vote
                           ? (cc[1] > 0xF0 && cc[0] > 0x70 && cc[0] < 0x90 &&
                              cc[2] > 0x70 && cc[2] < 0x90)
-                          : is_blue_clear(cc),
+                          : skipped_wave64_draw(frg, cc),
                       supports_fragment_wave64_vote
                           ? "divergent loop: 4 iterations, nested if 2 -> (0.5, 1.0, 0.5)"
                           : "device without fragment wave64 vote skips the divergent-loop draw");
@@ -567,7 +575,7 @@ int main() {
                 printf("  vccz loop center=(%u,%u,%u,%u) expect white\n", cc[0],cc[1],cc[2],cc[3]);
                 CHECK(supports_fragment_wave64_vote
                           ? (cc[0] > 0xF0 && cc[1] > 0xF0 && cc[2] > 0xF0)
-                          : is_blue_clear(cc),
+                          : skipped_wave64_draw(frg, cc),
                       supports_fragment_wave64_vote
                           ? "VCCZ loop: exactly 4 iterations of 0.25 -> 1.0 white"
                           : "device without fragment wave64 vote skips the VCCZ-loop draw");
@@ -627,7 +635,7 @@ int main() {
                 printf("  execnz loop center=(%u,%u,%u,%u) expect ~(191,191,191,255)\n", cc[0],cc[1],cc[2],cc[3]);
                 CHECK(supports_fragment_wave64_vote
                           ? (cc[0] > 0xA8 && cc[0] < 0xD8 && cc[1] > 0xA8 && cc[1] < 0xD8)
-                          : is_blue_clear(cc),
+                          : skipped_wave64_draw(frg, cc),
                       supports_fragment_wave64_vote
                           ? "execnz loop + break: exactly 3 iterations -> 0.75 gray"
                           : "device without fragment wave64 vote skips the execnz-loop draw");
@@ -678,7 +686,7 @@ int main() {
                 CHECK(supports_fragment_wave64_vote
                           ? (cc[0] > 0xA8 && cc[0] < 0xD8 && cc[1] > 0xA8 && cc[1] < 0xD8 &&
                              cc[2] > 0xA8 && cc[2] < 0xD8)
-                          : is_blue_clear(cc),
+                          : skipped_wave64_draw(frg, cc),
                       supports_fragment_wave64_vote
                           ? "#590: nested loops 3x4: inner 12 x 0.0625 and outer 3 x 0.25 both = 0.75"
                           : "device without fragment wave64 vote skips the nested-loop draw");
@@ -775,7 +783,7 @@ int main() {
             const uint8_t* center = px.empty() ? nullptr
                 : &px[((size_t)(H / 2) * W + W / 2) * 4];
             CHECK(center && (supports_fragment_wave64_vote ? center[0] > 0xC0
-                                                          : is_blue_clear(center)),
+                                                          : skipped_wave64_draw(recycled_readlane, center)),
                   supports_fragment_wave64_vote
                       ? "#652: recycled v10 lane 3 contains the new 1.0 value, not its stale spill"
                       : "device without fragment wave64 vote skips the recycled-lane draw");

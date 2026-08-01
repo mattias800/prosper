@@ -88,9 +88,13 @@ int main() {
             (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
         if (p) printf("  scalar-vcc center=(%u,%u,%u,%u) wave64-vote=%d\n",
                       p[0], p[1], p[2], p[3], static_cast<int>(supports_fragment_wave64_vote));
+        // The skipped arm pairs the clear colour with the module's own declared requirement, so it
+        // asserts "this shader demanded wave64 and the device therefore left the target untouched"
+        // rather than the weaker "no draw landed here", which any pipeline failure would satisfy.
         CHECK(p && (supports_fragment_wave64_vote
                         ? (p[0] > 0x80 && p[1] < 0x40 && p[2] < 0x40)
-                        : (p[2] > 0x80 && p[0] < 0x40 && p[1] < 0x40)),
+                        : (fragment_spirv_required_subgroup_size(scalar_vcc_frag) == 64 &&
+                           p[2] > 0x80 && p[0] < 0x40 && p[1] < 0x40)),
               supports_fragment_wave64_vote
                   ? "fragment scalar VCC_LO dword reaches compare/select exactly"
                   : "device without fragment wave64 vote skips the scalar-VCC draw fail-visible");
