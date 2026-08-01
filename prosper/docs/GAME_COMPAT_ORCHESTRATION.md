@@ -128,6 +128,17 @@ count, read the last row's number.
   ran*, not of when the events happened. Print a common ordinal (`command_order`) on both and join on it. This
   is why the `order=` field exists on the `[exec] skip draw early` line — **it is not redundant with the
   register values on the same line, and removing it silently re-opens the phantom above.**
+- **Before recording that something cannot be measured, check the tools you are claiming cannot measure
+  it.** This is nastier than a wrong fact and it is self-sealing. A wrong claim about the *subject* gets
+  tested by the next measurement; a wrong claim about the *instrument* stops the measurement from
+  happening, so nothing ever contradicts it. #1635 shipped "severity is unknowable — `self_dump` has no
+  import listing" into a PR body. `self_dump` prints `[IMPORTS BY LIBRARY]`, documented in
+  `tools/re/README.md`, and answering the question took ten minutes once someone looked: 21 aliased NIDs,
+  **0** imported by anything. An "unanswerable" is a claim about a tool, and claims about tools are the
+  cheapest of all to verify — run `--help`, grep the README, read the source. The same session produced
+  the mirror image in #1675: CI's green tick was believed to mean "the suite passed" when it meant "the
+  138 tests that got registered passed", and the 32 missing ones — ~1,822 assertions — were invisible
+  because nothing reports a test that was never registered.
 - **A fix that makes an instrument lie more convincingly is worse than the bug.** This one is about
   *repairs*, not measurements, and it is the inverse of everything else on this page. #1659's own fix
   briefly introduced it: the diagnostics were widened to resolve any guest module, but several kept a
