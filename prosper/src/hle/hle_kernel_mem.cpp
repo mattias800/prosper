@@ -1668,6 +1668,15 @@ HLE(k_apr_submit) {   // sceKernelAprSubmitCommandBufferAndGetResult (cb, ring_1
 // system (cri_ware_unity.prx) drives its reads through this one, and the default success stub left the
 // command buffer unconsumed so the guest's read never completed (#1629).
 HLE(k_apr_submit_plain) {
+    // Log the caller's real a2/a3 before discarding them. The firmware database gives this entry
+    // point's NAME but not its signature, so its arity is CONFIDENCE: MED — and these two values are
+    // precisely the evidence that would settle it. If they are ever consistently valid, aligned guest
+    // pointers across a run, the plain form has out-parameters after all and this handler is wrong.
+    if (amprlog())
+        fprintf(stderr, "[amprlog] AprSubmit(plain) eE4Szl8sil8 cb=0x%llx ring1b=%llu "
+                        "unused_a2=0x%llx unused_a3=0x%llx (discarded: no result slots)\n",
+                (unsigned long long)a0, (unsigned long long)a1,
+                (unsigned long long)a2, (unsigned long long)a3);
     return apr_submit_common(a0, a1, /*out1=*/0, /*out2=*/0, /*write_result_outputs=*/false);
 }
 // sceAmprCommandBufferGetCurrentOffset: byte cursor after the commands appended since construction,
@@ -4724,7 +4733,10 @@ void register_kernel_mem_hle() {
                      "sceAmprCommandBufferWriteKernelEventQueueOnCompletion");
     Hle::register_fn("ASoW5WE-UPo", (HleFn)k_ampr_submit,
                      "sceKernelAprSubmitCommandBufferAndGetResult");
-    // The Windows Ampr submit already writes no result slots, so it is the plain form unchanged.
+    // The Windows Ampr submit resets the command buffer and writes nothing, which satisfies the plain
+    // form's contract exactly. It is NOT equivalent to the POSIX handler in general: the token,
+    // binding and equeue-post machinery is POSIX-only, so Windows keeps that pre-existing gap for
+    // BOTH forms. This change does not widen it — it strictly adds a previously-missing entry point.
     // The _TEST-suffixed NIDs are deliberately left unimplemented — see the POSIX block for why.
     Hle::register_fn("eE4Szl8sil8", (HleFn)k_ampr_submit, "sceKernelAprSubmitCommandBuffer");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,

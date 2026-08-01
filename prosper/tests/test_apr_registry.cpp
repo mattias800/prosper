@@ -405,10 +405,16 @@ int main() {
               "#1629: sceKernelAprSubmitCommandBuffer (eE4Szl8sil8) resolves to a real handler");
         CHECK(submit_result_a != nullptr,
               "#1629: sceKernelAprSubmitCommandBufferAndGetResult (ASoW5WE-UPo) still resolves");
+#ifndef _WIN32
+        // POSIX only. On Windows both NIDs share k_ampr_submit, which resets the command buffer and
+        // writes nothing — the token/event machinery this distinction is about is POSIX-only, so the
+        // two forms are legitimately the same handler there and these assertions would fail on the
+        // windows-mingw CI job rather than catching a defect.
         // Both halves required: before #1629 the plain NID resolved to nothing, so a bare "these
         // differ" comparison passed vacuously against nullptr.
         CHECK(submit_plain && submit_result_a && submit_plain != submit_result_a,
               "#1629: the plain submit exists AND is not an alias of the AndGetResult form");
+#endif
         // The _TEST-suffixed exports must stay unimplemented. They are NOT alias NIDs of the two
         // names above — the firmware database resolves them to sceKernelAprSubmitCommandBuffer_TEST
         // and ...AndGetResult_TEST — and binding a debug entry point to a production handler would be
@@ -424,17 +430,21 @@ int main() {
         alignas(64) uint8_t fake_cb[256] = {};
         const uint64_t cb = (uint64_t)(uintptr_t)fake_cb;
 
+#ifndef _WIN32
         if (submit_result_a) {
             out1 = out2 = kResidue;
             submit_result_a(cb, 1, (uint64_t)(uintptr_t)&out1, (uint64_t)(uintptr_t)&out2, 0, 0);
             CHECK(out1 != kResidue && out2 != kResidue && out1 == out2,
                   "#1629: AndGetResult still publishes one completion token through both out slots");
         }
+#endif
         if (submit_plain) {
             out1 = out2 = kResidue;
             // Exactly the call the plain form receives: whatever happens to be in the argument
             // registers. If the handler treated them as out-pointers it would clobber them.
             submit_plain(cb, 1, (uint64_t)(uintptr_t)&out1, (uint64_t)(uintptr_t)&out2, 0, 0);
+            // Holds on BOTH platforms and is the property that actually matters, so it is not
+            // guarded: POSIX suppresses the writes deliberately, Windows never had them.
             CHECK(out1 == kResidue && out2 == kResidue,
                   "#1629: the plain submit writes NO result slots — a2/a3 are residue, not outputs");
         }
