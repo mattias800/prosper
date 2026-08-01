@@ -43,8 +43,19 @@ jobs:
       - name: Build
         run: cmake --build prosper/build-ci
 
+      # The runner has no GPU, so this is Mesa's lavapipe software rasteriser. Four tests are
+      # driver-divergent: they pass on real hardware (RADV) and fail on lavapipe, reproducibly in both
+      # places. They are EXCLUDED BY NAME rather than by disabling the suite — the defect #1675
+      # documents is a gap nobody can enumerate, and four named exclusions in a workflow file are the
+      # opposite of that. Tracked in #1681; delete from this list as each is resolved.
+      #   game_compute_exec[_no_adaptive_storage_result]  — R11G11B10 pack/unpack exactness
+      #   recompiled_fragment_render / recompiled_shaders_render — rendered-pixel comparisons
+      # Reproduce either way locally:
+      #   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json ctest -R '<name>'
       - name: Test
-        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
+        run: |
+          ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 \
+            -E '^(game_compute_exec|game_compute_exec_no_adaptive_storage_result|recompiled_fragment_render|recompiled_shaders_render)$'
 
   linux-app:
     name: Linux App
