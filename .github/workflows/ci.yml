@@ -76,10 +76,31 @@ jobs:
       #
       # Reproduce the software-rasteriser path locally with:
       #   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json ctest
+      # TEMPORARY (#1690 diagnostic, removed before merge): report the runner's exact driver and
+      # Mesa version. The 25.2.8 figure in #1690 was measured from a log; this job installs
+      # mesa-vulkan-drivers from the live archive on every run, so the version is not pinned and may
+      # already have moved. Verify the premise before engineering around it.
+      - name: Runner graphics environment (#1690 diagnostic)
+        run: |
+          . /etc/os-release; echo "OS: $PRETTY_NAME (${VERSION_ID:-?} ${VERSION_CODENAME:-?})"
+          dpkg-query -W -f='${Package} ${Version}\n' mesa-vulkan-drivers libvulkan1 || true
+          apt-cache policy mesa-vulkan-drivers libvulkan1
+          sudo apt-get install -y vulkan-tools >/dev/null 2>&1 || true
+          vulkaninfo --summary 2>&1 | head -40 || true
+
       - name: Test
         run: |
-          ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 \
-            -E '^(game_compute_exec|game_compute_exec_no_adaptive_storage_result)$'
+          ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
+
+      # TEMPORARY (#1690 diagnostic, removed before merge): ctest hides a passing test's stdout, so
+      # run the two formerly-excluded registrations verbosely to capture their executed-assertion
+      # count and any volume-diff report.
+      - name: game_compute_exec assertion census (#1690 diagnostic)
+        if: always()
+        run: |
+          ctest --test-dir prosper/build-ci -V --timeout 600 \
+            -R '^game_compute_exec(_no_adaptive_storage_result)?$' 2>&1 \
+            | grep -E 'assertions executed|volume diff|FAIL:|Test #|tests passed' || true
 
   linux-app:
     name: Linux App

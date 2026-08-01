@@ -24,7 +24,12 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
+// #1690: this binary was excluded from CI for months, and the cost was argued from a *static* grep
+// of CHECK sites because nothing reported how many actually ran. Count the executed ones so the
+// coverage this registration contributes is a measured number in the run's own log, and so a gate
+// that quietly stops executing assertions shows up as a drop rather than as unchanged green.
+static int checks = 0;
+#define CHECK(c, msg) do { ++checks; if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
 
 int main() {
 #ifdef _WIN32
@@ -3341,9 +3346,9 @@ int main() {
     }
 
     if (fails) {
-        std::printf("== FAIL: %d ==\n", fails);
+        std::printf("== FAIL: %d == (%d assertions executed)\n", fails, checks);
         return 1;
     }
-    std::printf("== PASS ==\n");
+    std::printf("== PASS == (%d assertions executed)\n", checks);
     return 0;
 }
