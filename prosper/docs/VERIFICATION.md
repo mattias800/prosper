@@ -82,10 +82,30 @@ See `tools/snapshot/README.md` for the complete approval workflow.
 
 ## CI
 
-A GitHub Actions workflow builds + runs `ctest` on **Linux and Windows/MinGW** for every push/PR
-(Vulkan discovery disabled on the runners, so the GPU-independent layers 1/4b gate CI; the
-Vulkan-execution layers 2–4 run locally under llvmpipe). Dump-backed tests auto-skip when the private
-game dump is absent.
+A GitHub Actions workflow builds + runs `ctest` on **Linux and Windows/MinGW** for every push/PR.
+
+**Linux CI runs the Vulkan-execution layers** on Mesa's lavapipe software rasteriser (#1675). It did not
+until then: no Vulkan package was ever installed on the runner, so `-DCMAKE_DISABLE_FIND_PACKAGE_Vulkan`
+was describing that fact rather than deciding anything — and it silently removed **27 tests / ~1,800
+assertions** from every green run, including the entire shader-recompiler differential and the sole
+coverage for GPU execution, render state and present. An unregistered test is invisible by construction:
+there is no line to read and no count to compare against, so 138/138 looked exactly like full coverage.
+
+Two guards keep that from recurring, and both matter more than the flag itself:
+
+* the Linux job **fails if too few tests register**, so a configure that quietly loses Vulkan is an error
+  rather than a smaller green suite;
+* a test that skips its substantive block returns ctest's `SKIP_RETURN_CODE`, so the summary reads
+  `(Skipped)` instead of counting it as a pass. CI runs `ctest --output-on-failure`, which suppresses
+  test stdout on green runs — so a printed `[skip]` line alone is invisible in the summary *and* in the
+  log body.
+
+**Windows/MinGW and macOS still disable Vulkan**, so layers 2–4 are Linux-and-local only there.
+
+Four tests are excluded by name on lavapipe because they pass on real hardware and fail on the software
+rasteriser; they are listed in `ci.yml` with a reproduction command and tracked in #1681. Dump-backed
+tests cannot run in CI at all — dumps are copyrighted and gitignored — and now report `(Skipped)` rather
+than passing.
 
 ## Rule of thumb
 

@@ -31,14 +31,23 @@ jobs:
 
       # A configuration that quietly loses Vulkan would silently drop those tests again and still
       # report 100% green. Fail the job instead of shrinking the suite.
-      - name: Verify the GPU tests are actually registered
+      # Guard the CLASS, not the instance: a configure that quietly loses Vulkan would drop the GPU
+      # suite again and still report 100% green, which is precisely the defect #1675 documents.
+      #
+      # By NAME, not by count. A "at least N tests" floor rots silently — the suite only grows, so a
+      # threshold that is meaningful today is passed by the non-GPU tests alone once enough are added,
+      # and the guard stops guarding without ever failing. These three cannot exist unless Vulkan was
+      # found, and they stay meaningful however large the suite gets.
+      - name: Verify the Vulkan-gated tests are actually registered
         run: |
-          n=$(ctest --test-dir prosper/build-ci -N | tail -1 | grep -oE '[0-9]+$')
-          echo "registered tests: $n"
-          if [ "$n" -lt 160 ]; then
-            echo "::error::only $n tests registered — the Vulkan-gated suite is missing (see #1675)"
-            exit 1
-          fi
+          for t in rdna2_to_spirv_exec gpu_execute vulkan_triangle_render; do
+            if ! ctest --test-dir prosper/build-ci -N -R "^${t}$" | grep -q "Test *#"; then
+              echo "::error::${t} is not registered — the Vulkan-gated suite is missing (see #1675)"
+              exit 1
+            fi
+          done
+          echo "Vulkan-gated suite present; total registered: \
+            $(ctest --test-dir prosper/build-ci -N | tail -1 | grep -oE '[0-9]+$')"
 
       - name: Build
         run: cmake --build prosper/build-ci

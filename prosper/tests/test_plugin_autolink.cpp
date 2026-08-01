@@ -223,6 +223,7 @@ int main(int argc, char** argv) {
         } else {
             printf("  [skip] %s has no Media/Plugins/PSN.prx — link wiring not exercised\n",
                    dump_root.c_str());
+            skipped_link_wiring = true;   // #1675: 21 of 30 local dumps ship no PSN.prx
         }
     } else {
         printf("  [skip] no game dump argument — link wiring not exercised\n");
