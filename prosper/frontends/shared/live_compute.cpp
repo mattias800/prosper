@@ -1,4 +1,5 @@
 #include "live_compute.hpp"
+#include "live_target_format.hpp"
 #include "rtt_scale.hpp"
 #include "rtt_authority.hpp"
 #include "seed_reprove.hpp"
@@ -116,19 +117,22 @@ bool pack_live_target_r11g11b10(const prosper::gpu::LiveTargetSnapshot& snapshot
                                 uint8_t* packed, size_t packed_size) {
     if (!snapshot.width || !snapshot.height || !snapshot.pixels) return false;
     const uint64_t texels = static_cast<uint64_t>(snapshot.width) * snapshot.height;
-    const uint32_t source_bytes = snapshot.format == prosper::gpu::LiveTargetPixelFormat::Rgba16Float
-        ? 8u : 4u;
+    const uint32_t source_bytes =
+        prosper::frontend::live_target_pixel_format_bytes(snapshot.format);
+    if (!source_bytes) return false;
+    const prosper::frontend::LiveTargetSourceLayout layout =
+        prosper::frontend::live_target_source_layout(snapshot.format);
     if (texels > SIZE_MAX / source_bytes || texels > SIZE_MAX / sizeof(uint32_t) ||
         snapshot.pixels->size() != static_cast<size_t>(texels) * source_bytes ||
         !packed || packed_size != static_cast<size_t>(texels) * sizeof(uint32_t))
         return false;
-    if (snapshot.format == prosper::gpu::LiveTargetPixelFormat::R11G11B10Float) {
+    if (layout == prosper::frontend::LiveTargetSourceLayout::PackedR11G11B10) {
         std::memcpy(packed, snapshot.pixels->data(), packed_size);
         return true;
     }
     for (size_t t = 0; t < static_cast<size_t>(texels); ++t) {
         float rgb[3]{};
-        if (snapshot.format == prosper::gpu::LiveTargetPixelFormat::Rgba16Float) {
+        if (layout == prosper::frontend::LiveTargetSourceLayout::Float16x4) {
             for (uint32_t c = 0; c < 3; ++c) {
                 uint16_t half = 0;
                 std::memcpy(&half, snapshot.pixels->data() + t * 8 + c * 2, sizeof(half));
@@ -3504,10 +3508,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          (unsigned long long)r->gpu_addr,
                                          import.width, import.height,
                                          depth_import ? "depth"
-                                             : import.format == LiveTargetPixelFormat::Rgba16Float
-                                                   ? "rgba16f"
-                                             : import.format == LiveTargetPixelFormat::R11G11B10Float
-                                                   ? "r11g11b10" : "rgba8");
+                                             : prosper::frontend::live_target_pixel_format_name(
+                                                   import.format));
                     } else {
                         // Not our exact contract (a different device or a stale aliased view).
                         release_live_render_target_image(r->gpu_addr);
@@ -3620,8 +3622,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (live_target.width != r->width || live_target.height != r->height) {
                     const bool scaled_extent = prosper::frontend::rtt_scaled_extent_compatible(
                         r->width, r->height, live_target.width, live_target.height, render_scale);
-                    const uint64_t bpp = live_target.format == LiveTargetPixelFormat::Rgba16Float ? 8u : 4u;
-                    if (scaled_extent && live_target.pixels &&
+                    const uint64_t bpp =
+                        prosper::frontend::live_target_pixel_format_bytes(live_target.format);
+                    if (bpp && scaled_extent && live_target.pixels &&
                         live_target.pixels->size() == (uint64_t)live_target.width * live_target.height * bpp) {
                         const uint32_t sw = live_target.width, sh = live_target.height;
                         auto up = std::make_shared<std::vector<uint8_t>>(
@@ -3659,7 +3662,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     }
                 }
                 if (renderer_owned) {
-                    const uint64_t bpp = live_target.format == LiveTargetPixelFormat::Rgba16Float ? 8u : 4u;
+                    const uint64_t bpp =
+                        prosper::frontend::live_target_pixel_format_bytes(live_target.format);
+                    if (!bpp) {
+                        skip_image(r, "renderer-owned RTT snapshot has no mapped texel width"); break;
+                    }
                     const uint64_t texels = static_cast<uint64_t>(r->width) * r->height;
                     if (texels > UINT64_MAX / bpp) {
                         skip_image(r, "renderer-owned RTT snapshot size overflow"); break;
@@ -3689,7 +3696,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     (r->format == DataFormat::Float32 || r->format == DataFormat::Uint16 ||
                      r->format == DataFormat::Uint32)) {
                     const uint64_t cached_bpp =
-                        live_target.format == LiveTargetPixelFormat::Rgba16Float ? 8u : 4u;
+                        prosper::frontend::live_target_pixel_format_bytes(live_target.format);
                     const uint64_t requested_bpp =
                         static_cast<uint64_t>(data_format_bytes(r->format)) *
                         (r->num_components ? r->num_components : 1u);
@@ -3727,11 +3734,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          "[compute]   renderer RTT format miss binding=%u "
                                          "addr=0x%llx cached=%s requested=f%u/c%u -> guest backing\n",
                                          bi.binding, (unsigned long long)r->gpu_addr,
-                                         live_target.format == LiveTargetPixelFormat::Rgba16Float
-                                             ? "rgba16f"
-                                         : live_target.format ==
-                                               LiveTargetPixelFormat::R11G11B10Float
-                                             ? "r11g11b10" : "rgba8",
+                                         prosper::frontend::live_target_pixel_format_name(
+                                             live_target.format),
                                          (unsigned)r->format, nc);
                     }
                 }
@@ -3877,8 +3881,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ? (r->format == DataFormat::Float10_11_11
                        ? 4u : data_format_bytes(r->format) * sampled_components)
                 : 0u;
+            // The one bytes call site where 0 does NOT mean decline: zero is already this
+            // expression's sentinel for "not an imported color binding", so an unmapped format would
+            // silently fall through to the guest resource's texel width below rather than refuse.
+            // Safe only because the importer never produces an unmapped format and -Werror=switch
+            // stops a new enumerator from reaching here without a real width. Any future edit that
+            // weakens either of those has to give this site its own explicit decline.
             const uint32_t imported_color_bytes = bi.imported && !bi.imported_depth
-                ? (bi.imported_pixel_format == LiveTargetPixelFormat::Rgba16Float ? 8u : 4u)
+                ? prosper::frontend::live_target_pixel_format_bytes(bi.imported_pixel_format)
                 : 0u;
             const uint32_t texel_bytes = imported_color_bytes ? imported_color_bytes
                                          : bi.unorm_rtt_value_reuse ? 4u
@@ -3897,11 +3907,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 r->format == DataFormat::Float10_11_11 && sampled_components == 3;
             const VkFormat image_format = bi.imported_depth ? bi.imported_format
                 : bi.imported
-                    ? (bi.imported_pixel_format == LiveTargetPixelFormat::Rgba16Float
-                           ? VK_FORMAT_R16G16B16A16_SFLOAT
-                       : bi.imported_pixel_format == LiveTargetPixelFormat::R11G11B10Float
-                           ? VK_FORMAT_B10G11R11_UFLOAT_PACK32
-                           : VK_FORMAT_R8G8B8A8_UNORM)
+                    ? prosper::frontend::live_target_pixel_format_vk(bi.imported_pixel_format)
                 : bi.unorm_rtt_value_reuse ? VK_FORMAT_R8G8B8A8_UNORM
                 : bi.packed_r11_storage ? VK_FORMAT_R32_UINT
                 : bi.native_float_storage
@@ -4360,11 +4366,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      "addr=0x%llx extent=%ux%u format=%s\n",
                                      bi.binding, (unsigned long long)r->gpu_addr,
                                      r->width, r->height,
-                                     live_target.format == LiveTargetPixelFormat::Rgba16Float
-                                         ? "rgba16f"
-                                     : live_target.format ==
-                                           LiveTargetPixelFormat::R11G11B10Float
-                                         ? "r11g11b10" : "rgba8");
+                                     prosper::frontend::live_target_pixel_format_name(
+                                         live_target.format));
                     }
                 } else if (r->tile_mode && dim_3d && r->depth > 1) {
                     if (trace) bi.before_hash = fnv1a(src, guest_bytes);
@@ -4490,6 +4493,28 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool r11g11b10 = sampled_r11g11b10;
                 if (renderer_owned) {
                     const std::vector<uint8_t>& pixels = *live_target.pixels;
+                    // Classify the snapshot's texel layout once. Every conversion below reads it as
+                    // either UNORM8x4 or FLOAT16x4; the packed R11G11B10 layout is served by the
+                    // byte-copy and reconstruction branches, and a packed renderer target under any
+                    // other view already declined ownership above. Testing the layout instead of
+                    // "is it RGBA8, else assume FP16" keeps a future pixel format from silently
+                    // reading eight bytes out of a four-byte texel.
+                    using prosper::frontend::LiveTargetSourceLayout;
+                    const LiveTargetSourceLayout source_layout =
+                        prosper::frontend::live_target_source_layout(live_target.format);
+                    const bool source_unorm8 = source_layout == LiveTargetSourceLayout::Unorm8x4;
+                    const bool source_float16 = source_layout == LiveTargetSourceLayout::Float16x4;
+                    // DO NOT DELETE AS DEAD CODE. This never fires for today's three enumerators,
+                    // but it is not redundant: the packed-view check above is written as
+                    // `format == R11G11B10Float && <incompatible view>`, which for any NEW format
+                    // is false and therefore RETAINS ownership. That predicate fails OPEN, so this
+                    // guard and the `!bpp` decline above are what actually keep an unclassified
+                    // layout out of the two-layout conversions below - where "not UNORM8" means
+                    // "read eight bytes per texel" and a four-byte snapshot is read out of bounds.
+                    if (!bi.unorm_rtt_value_reuse && !r11g11b10 &&
+                        !source_unorm8 && !source_float16) {
+                        skip_image(r, "renderer-owned RTT layout has no sampled conversion"); break;
+                    }
                     if (bi.unorm_rtt_value_reuse) {
                         std::memcpy(upload, pixels.data(), upload_size);
                     } else if (r11g11b10) {
@@ -4500,13 +4525,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         if (trace)
                             std::fprintf(stderr,
                                          "[compute]   reconstructed renderer RTT binding=%u "
-                                         "addr=0x%llx extent=%ux%u rgba%s -> R11G11B10\n",
+                                         "addr=0x%llx extent=%ux%u %s -> R11G11B10\n",
                                          bi.binding, (unsigned long long)r->gpu_addr,
                                          r->width, r->height,
-                                         live_target.format == LiveTargetPixelFormat::Rgba16Float
-                                             ? "16f"
-                                         : live_target.format == LiveTargetPixelFormat::R11G11B10Float
-                                             ? "11g11b10" : "8");
+                                         prosper::frontend::live_target_pixel_format_name(
+                                             live_target.format));
                     } else if (sampled_float32_native || sampled_uint16_native ||
                                sampled_uint32_native) {
                         // A renderer-owned target is authoritative only when its cached texel is
@@ -4518,7 +4541,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         const size_t texels = static_cast<size_t>(volume_texels);
                         for (size_t t = 0; t < texels; ++t) {
                             for (uint32_t c = 0; c < sampled_components; ++c) {
-                                if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                                if (source_unorm8) {
                                     upload[t * sampled_components + c] = pixels[t * 4 + c];
                                 } else {
                                     uint16_t half = 0;
@@ -4535,7 +4558,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         const size_t texels = static_cast<size_t>(volume_texels);
                         for (size_t t = 0; t < texels; ++t) {
                             for (uint32_t c = 0; c < 2; ++c) {
-                                if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                                if (source_unorm8) {
                                     upload[t * 2 + c] = pixels[t * 4 + c];
                                 } else {
                                     uint16_t half = 0;
@@ -4553,7 +4576,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         for (size_t t = 0; t < texels; ++t) {
                             for (uint32_t c = 0; c < sampled_components; ++c) {
                                 uint16_t value = 0;
-                                if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                                if (source_unorm8) {
                                     value = static_cast<uint16_t>(pixels[t * 4 + c]) * 257u;
                                 } else {
                                     uint16_t half = 0;
@@ -4579,7 +4602,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                 for (size_t t = begin; t < end; ++t) {
                                     for (uint32_t c = 0; c < output_components; ++c) {
                                         float value = 0.0f;
-                                        if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                                        if (source_unorm8) {
                                             value = pixels[t * 4 + c] / 255.0f;
                                         } else {
                                             uint16_t half = 0;
@@ -4594,7 +4617,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                     }
                                 }
                             });
-                    } else if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                    } else if (source_unorm8) {
                         std::memcpy(upload, pixels.data(), upload_size);
                     } else {
                         const size_t texels = static_cast<size_t>(volume_texels);
@@ -4620,8 +4643,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      "[compute]   imported renderer RTT binding=%u addr=0x%llx "
                                      "extent=%ux%u format=%s hash=%016llx nonzero-bytes=%zu\n",
                                      bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
-                                     live_target.format == LiveTargetPixelFormat::Rgba16Float
-                                         ? "rgba16f" : "rgba8",
+                                     prosper::frontend::live_target_pixel_format_name(
+                                         live_target.format),
                                      (unsigned long long)snapshot_hash, nonzero_bytes);
                     }
                     bi.guest_bytes = 0;

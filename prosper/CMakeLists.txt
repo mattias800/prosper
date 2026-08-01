@@ -833,6 +833,13 @@ if(TARGET prosper_core)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
       target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
       target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
+      # A LiveTargetPixelFormat mapping that quietly falls back to RGBA8 has now cost two titles a
+      # whole render layer (#773 Dead Cells, and Syberia's black 3D menu). frontends/shared/
+      # live_target_format.hpp maps the enum with default-less switches; -Werror=switch promotes a
+      # member added without updating them from a silent wrong format to a build failure.
+      if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(prosper_live_renderer PRIVATE -Werror=switch)
+      endif()
       target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
 
       # Keep the production compute backend covered on native Windows too. This catches host- and
@@ -940,6 +947,13 @@ if(TARGET prosper_core)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
       target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
       target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
+      # A LiveTargetPixelFormat mapping that quietly falls back to RGBA8 has now cost two titles a
+      # whole render layer (#773 Dead Cells, and Syberia's black 3D menu). frontends/shared/
+      # live_target_format.hpp maps the enum with default-less switches; -Werror=switch promotes a
+      # member added without updating them from a silent wrong format to a build failure.
+      if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(prosper_live_renderer PRIVATE -Werror=switch)
+      endif()
       target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
 
       # Local-only realized-submit replayer (#514): no guest boot, reads a versioned capture whose game
@@ -947,6 +961,15 @@ if(TARGET prosper_core)
       add_executable(gpu_replay tools/gpu_replay/gpu_replay.cpp)
       target_include_directories(gpu_replay PRIVATE src tests)
       target_link_libraries(gpu_replay PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      # gpu_replay maps LiveTargetPixelFormat itself (inspect_live_target), and it is the tool an
+      # investigation reaches for FIRST. An unhandled member there falls through to the
+      # GpuCaptureRttSeed::format default (Rgba8Unorm) and makes --inspect-only mislabel the seed,
+      # sending the next investigation down the wrong path using its own instrument. Same gate as
+      # prosper_live_renderer so the exhaustiveness contract holds at every mapping, not just the
+      # ones inside frontends/shared/live_target_format.hpp.
+      if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(gpu_replay PRIVATE -Werror=switch)
+      endif()
 
       # Capture -> serialize -> owned replay backing -> SAME live renderer -> pixels. This specifically
       # proves replay textures do not dereference the captured guest VA and still sample exact bytes.
@@ -1421,6 +1444,15 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   add_executable(test_shared_vulkan_device tests/test_shared_vulkan_device.cpp)
   target_link_libraries(test_shared_vulkan_device PRIVATE prosper_live_renderer prosper_core)
   add_test(NAME shared_vulkan_device COMMAND test_shared_vulkan_device)
+
+  # Live-target format round trip: every LiveTargetPixelFormat a compute dispatch can import must
+  # survive the write-back notifier. An unnamed format is reported as RGBA8, fails the mirror
+  # identity check, and silently leaves the renderer's target invalidated (#773's family).
+  add_executable(test_live_target_format tests/test_live_target_format.cpp)
+  target_include_directories(test_live_target_format PRIVATE src tests)
+  target_link_libraries(test_live_target_format PRIVATE prosper_live_renderer prosper_core
+                                                        Vulkan::Vulkan)
+  add_test(NAME live_target_format COMMAND test_live_target_format)
 
   # GPU scanout handoff (#1270): the front-buffer image blits into a scanout slot byte-exactly, and the
   # producer/consumer slot handoff never tears or reuses an image in flight. Headless (no surface).

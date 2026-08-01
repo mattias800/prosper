@@ -8,6 +8,7 @@
 #include "capture_renderer_policy.hpp"
 #include "write_watch_policy.hpp"
 #include "live_compute.hpp"
+#include "live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
 
 #include "gpu/gpu_execute.hpp"          // DrawItem, set_submit_renderer
 #include "gpu/gpu_timeline.hpp"         // phase-gated detailed-capture policy
@@ -691,13 +692,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             if (!surface.rgba || expected != surface.rgba->size()) return false;
             snapshot.width = surface.w;
             snapshot.height = surface.h;
-            if (format == VK_FORMAT_R8G8B8A8_UNORM)
-                snapshot.format = prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm;
-            else if (format == VK_FORMAT_R16G16B16A16_SFLOAT)
-                snapshot.format = prosper::gpu::LiveTargetPixelFormat::Rgba16Float;
-            else if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
-                snapshot.format = prosper::gpu::LiveTargetPixelFormat::R11G11B10Float;
-            else
+            if (!prosper::frontend::live_target_pixel_format_from_vk(format, snapshot.format))
                 return false;
             snapshot.pixels = surface.rgba;
             return true;
@@ -755,13 +750,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             // real VkImage, so an unrecognized format must decline rather than be reported as rgba8:
             // the consumer would then build a mismatched view over the renderer's image.
             prosper::gpu::LiveTargetPixelFormat pixel_format;
-            if (format == VK_FORMAT_R8G8B8A8_UNORM)
-                pixel_format = prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm;
-            else if (format == VK_FORMAT_R16G16B16A16_SFLOAT)
-                pixel_format = prosper::gpu::LiveTargetPixelFormat::Rgba16Float;
-            else if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
-                pixel_format = prosper::gpu::LiveTargetPixelFormat::R11G11B10Float;
-            else
+            if (!prosper::frontend::live_target_pixel_format_from_vk(format, pixel_format))
                 return false;
             const uint32_t bytes_per_pixel = prosper::test::backend_color_bytes_per_pixel(format);
             if (!bytes_per_pixel) return false;
@@ -809,9 +798,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
         [invalidate_ds](const prosper::gpu::LiveTargetImageWrite& write) {
             auto it = g_rtt.find(write.gpu_addr);
             if (it == g_rtt.end()) return;
-            const VkFormat format =
-                write.format == prosper::gpu::LiveTargetPixelFormat::Rgba16Float
-                    ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+            // Name the write's format exhaustively. Reporting an unmapped format as RGBA8 does not
+            // merely mislabel it: the mirror-identity check below then rejects a target the compute
+            // dispatch really did write, the entry stays invalidated by the ordinary guest-write
+            // path, and every later consumer samples guest bytes prosper never wrote. That is the
+            // whole Syberia black-3D-menu defect, and #773 in a different format.
+            const VkFormat format = prosper::frontend::live_target_pixel_format_vk(write.format);
+            if (format == VK_FORMAT_UNDEFINED) return;
             if (!prosper::frontend::live_rtt_mirror_identity_matches(
                     it->first, it->second.w, it->second.h,
                     static_cast<uint32_t>(
