@@ -100,6 +100,7 @@
 //   PROSPER_ULT_RETURN_SUCCESS=1  restore the pre-#1603 fake success (return 0, implement nothing).
 //   PROSPER_ULT_BLOCK_WARN_MS=N   watchdog threshold for a blocked mutex lock (default 5000).
 #include "dispatch.hpp"
+#include "sce_errno.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -136,8 +137,11 @@ namespace {
 // prosper has NO primary evidence for libSceUlt's own SCE_ULT_ERROR_* numbering: no live capture of
 // a real console's return, no published constant, and the firmware symbol database gives names and
 // NIDs only, never values. Rather than fabricate a libSceUlt-shaped constant, these use the
-// documented `0x80020000 | freebsd_errno` libkernel convention prosper already uses across
-// hle_file.cpp. CONFIDENCE: HIGH that non-zero is correct (0 is SCE_OK for this family);
+// documented libkernel `0x80020000 | freebsd_errno` encoding through the shared helper in
+// sce_errno.hpp (#1612), which is the single place that owns the FreeBSD-vs-host numbering — the
+// distinction that makes EDEADLK 11 here and 35 on Linux, exactly transposed with EAGAIN.
+//
+// CONFIDENCE: HIGH that non-zero is correct (0 is SCE_OK for this family);
 // CONFIDENCE: LOW that any specific value matches the real library.
 //
 // That LOW is also cheap, and provably so: Earthion never branches on a libSceUlt return. Scanning
@@ -146,20 +150,14 @@ namespace {
 // ([rbp-0x30], [rbp-0xc], and two rip-relative byte flags), never eax. The exact constant is
 // therefore unobservable to the only title that imports the library.
 // ---------------------------------------------------------------------------------------------
-//
-// The low byte of each is the FREEBSD errno, which is the PS5 kernel's, NOT this Linux host's. They
-// differ where it matters: EDEADLK is 11 on FreeBSD and 35 on Linux, EAGAIN 35 and 11 respectively —
-// exactly transposed, so copying them from the ambient platform's <errno.h> yields a plausible
-// constant that means something else. #1612 tracks existing instances of that mistake; these are
-// written from the FreeBSD values deliberately and must not be "corrected" against the host header.
 constexpr uint64_t kUltOk             = 0ull;
-constexpr uint64_t kUltErrPerm        = 0x80020001ull;   // EPERM   — unlock by a non-owner
-constexpr uint64_t kUltErrSrch        = 0x80020003ull;   // ESRCH   — stale / destroyed / uncreated
-constexpr uint64_t kUltErrDeadlk      = 0x8002000Bull;   // EDEADLK — self-relock of a non-recursive mutex
-constexpr uint64_t kUltErrNoMem       = 0x8002000Cull;   // ENOMEM
-constexpr uint64_t kUltErrInval       = 0x80020016ull;   // EINVAL
-constexpr uint64_t kUltErrAgain       = 0x80020023ull;   // EAGAIN  — runtime is at numMaxUlthread
-constexpr uint64_t kUltNotImplemented = 0x8002004Eull;   // ENOSYS — still-unimplemented entry points
+constexpr uint64_t kUltErrPerm        = hle::kSceKernelErrorEPERM;    // unlock/wait by a non-owner
+constexpr uint64_t kUltErrSrch        = hle::kSceKernelErrorESRCH;    // stale / destroyed / uncreated
+constexpr uint64_t kUltErrDeadlk      = hle::kSceKernelErrorEDEADLK;  // self-relock of a non-recursive mutex
+constexpr uint64_t kUltErrNoMem       = hle::kSceKernelErrorENOMEM;
+constexpr uint64_t kUltErrInval       = hle::kSceKernelErrorEINVAL;
+constexpr uint64_t kUltErrAgain       = hle::kSceKernelErrorEAGAIN;   // runtime is at numMaxUlthread
+constexpr uint64_t kUltNotImplemented = hle::kSceKernelErrorENOSYS;   // the legacy/Phase 1 policy
 
 // A size-returning contract has no error channel (#1618): whatever these return is read as a byte
 // count and handed to malloc. They must therefore never see an error sentinel — the value is always
