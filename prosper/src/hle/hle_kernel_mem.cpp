@@ -1653,9 +1653,21 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     // sceKernelGetEventId(&ev) equals its id. That wait tests the event IDENT and never the tag, so
     // zero is a legitimate payload rather than an absent binding. Gating delivery on `bc.tag` made
     // the submit post nothing and hung the loader thread forever on a read prosper had already
-    // completed. Binding to a real equeue IS the guest asking for completion delivery; the tag is
-    // payload echoed verbatim, zero included. The unbound rule above is unchanged — that is the one
-    // #180 forbids. CONFIDENCE: HIGH (guest disassembly + PS5 3.20 firmware NID database).
+    // completed. Binding to a real equeue IS the guest asking for completion delivery, so the
+    // equeue — not the tag — is what makes a buffer bound. The unbound rule above is unchanged;
+    // that is the one #180 forbids.
+    //
+    // "Echoed verbatim" is true only in the id==0 pointer dialect. prosper_eq_post_apr_token
+    // branches on the binding's id: id==0 delivers this exact token, while id!=0 delivers
+    // (ring<<58) | per-(eq,ring) high-water mark, so a zero tag there arrives as a counter value
+    // that merely happens to be 0 on a fresh queue. Harmless for CRI, whose waiter tests only the
+    // ident, but do not read this call as a guarantee that the tag reaches the guest unmodified.
+    //
+    // The 3.20 sibling names the semantics: o67gODLFpls is
+    // sceAmprCommandBufferWriteKernelEventQueueOnCompletion — the tag is the VALUE WRITTEN on
+    // completion, and zero is a legal value to write. (H896Pt-yB4I itself is not in the 3.20
+    // database; prosper still labels it "AprCbSetEventQueue?".)
+    // CONFIDENCE: HIGH (guest disassembly + live boot A/B; firmware DB for the sibling's name).
     //
     // Deliberately NOT changed: `fallback_pending` in apr_cb_set_equeue still requires a nonzero
     // tag. That deferred path exists only for Pathless's unsent PS5 3.20 tail, no title is known to

@@ -203,6 +203,14 @@ int main() {
                (uint64_t)(uintptr_t)&unbound_out2, 0, 0);
         CHECK(unbound_out1 && unbound_out1 == unbound_out2,
               "reconstructed command buffer is unbound after PS5 3.20 destruction");
+        // #180's rule is what the delivery predicate in apr_submit_common exists to protect: an
+        // UNBOUND submit hands its invented counter through the out slots and must post NO event,
+        // because an invented token would regress the UE4 listener's ctor-seeded last-processed
+        // counter. Pin it directly — the out-slot check above does not, and #1666 loosened exactly
+        // the predicate that separates post from no-post.
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        CHECK(get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
+              "unbound submit posts no completion event (#180 invented-counter rule)");
         delete_eq(replacement_eq, 0, 0, 0, 0, 0);
 
         // CRI ADX2 (cri_ware_unity.prx, Tales of Graces f Remastered PPSA19991) binds its APR
@@ -216,29 +224,41 @@ int main() {
         // The wait matches on the event IDENT only, never on the tag, so a zero tag is a perfectly
         // valid binding rather than an absent one. Treating "tag == 0" as "not really bound" makes
         // the submit post nothing and hangs the guest's loader thread on a read that has already
-        // completed. Binding to a real equeue is the guest asking for completion delivery; the tag
-        // is payload to be echoed verbatim, zero included. Unbound buffers still post nothing
-        // (issue #180's invented-counter regression) — that is asserted above.
-        // CONFIDENCE: HIGH (guest disassembly + PS5 3.20 firmware NID database).
+        // completed. Binding to a real equeue is the guest asking for completion delivery. Unbound
+        // buffers still post nothing (issue #180's invented-counter regression), asserted above.
+        //
+        // Cover BOTH delivery dialects, because a live PPSA19991 boot uses both on one equeue: of
+        // its 20 observed bindings, 9 pass id 0 and the rest ids 1..5. prosper_eq_post_apr_token
+        // branches on exactly that (hle_kernel_time.cpp): id 0 takes the #210 pointer dialect and
+        // delivers the exact token, while id != 0 takes the #208 counter dialect and delivers
+        // (ring << 58) | per-(eq,ring) high-water mark. So this asserts what is actually
+        // contractual for CRI — the event ARRIVES carrying its own ident — and deliberately does not
+        // assert a verbatim tag in the counter branch, where the delivered data is a counter and any
+        // zero would be an artifact of a fresh queue rather than an echo.
+        // CONFIDENCE: HIGH (guest disassembly + firmware NID database + live boot capture).
         if (submit_plain && add_ampr_event) {
-            uint64_t cri_eq = 0;
-            create_eq((uint64_t)(uintptr_t)&cri_eq, 0, 0, 0, 0, 0);
-            constexpr int64_t cri_id = 0x74fe;
-            add_ampr_event(cri_eq, (uint64_t)cri_id, 0, 0, 0, 0);
-            std::array<uint64_t, 8> cri_storage{};
-            const uint64_t cri_cb = (uint64_t)(uintptr_t)cri_storage.data();
-            construct(cri_cb, 0, 0x560, 0, 0, 0);
-            append_equeue(cri_cb, cri_eq, (uint64_t)cri_id, /*tag=*/0, 0, 0);
-            CHECK(submit_plain(cri_cb, 1, 0, 0, 0, 0) == 0,
-                  "CRI two-argument submit reports success");
-            KEvent cri_event{};
-            int32_t cri_out = -1;
-            uint32_t cri_timeout = 100000;
-            wait_eq(cri_eq, (uint64_t)(uintptr_t)&cri_event, 1, (uint64_t)(uintptr_t)&cri_out,
-                    (uint64_t)(uintptr_t)&cri_timeout, 0);
-            CHECK(cri_out == 1 && cri_event.ident == cri_id && cri_event.data == 0,
-                  "zero-tag binding still receives its completion event, tag echoed verbatim");
-            delete_eq(cri_eq, 0, 0, 0, 0, 0);
+            const struct { int64_t id; const char* what; } cri_cases[] = {
+                { 0,      "zero-tag binding delivers its completion event (id 0, pointer dialect)" },
+                { 0x74fe, "zero-tag binding delivers its completion event (id != 0, counter dialect)" },
+            };
+            for (const auto& c : cri_cases) {
+                uint64_t cri_eq = 0;
+                create_eq((uint64_t)(uintptr_t)&cri_eq, 0, 0, 0, 0, 0);
+                add_ampr_event(cri_eq, (uint64_t)c.id, 0, 0, 0, 0);
+                std::array<uint64_t, 8> cri_storage{};
+                const uint64_t cri_cb = (uint64_t)(uintptr_t)cri_storage.data();
+                construct(cri_cb, 0, 0x560, 0, 0, 0);
+                append_equeue(cri_cb, cri_eq, (uint64_t)c.id, /*tag=*/0, 0, 0);
+                CHECK(submit_plain(cri_cb, 1, 0, 0, 0, 0) == 0,
+                      "CRI two-argument submit reports success");
+                KEvent cri_event{};
+                int32_t cri_out = -1;
+                uint32_t cri_timeout = 100000;
+                wait_eq(cri_eq, (uint64_t)(uintptr_t)&cri_event, 1, (uint64_t)(uintptr_t)&cri_out,
+                        (uint64_t)(uintptr_t)&cri_timeout, 0);
+                CHECK(cri_out == 1 && cri_event.ident == c.id, c.what);
+                delete_eq(cri_eq, 0, 0, 0, 0, 0);
+            }
         }
     }
 #endif

@@ -35,7 +35,7 @@ Last updated: 2026-08-01
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
 | *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 **Gameplay** — title screen and the first playable scene render with real GPU draws on a validated route; the profile menu's 3D layer and the gameplay composite are degraded (#1619) |
-| *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🔬 Runs a healthy ~113 fps Unity frame loop with a real post chain, but the guest's own composite is empty |
+| *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Publisher and CRIWARE logos render at native 1920×1080; the opening movie stops it before the title screen |
 
 ¹ Exact retail game name pending confirmation.
 
@@ -540,18 +540,44 @@ draw is scissored to the left; the animation does settle. Start from `prosper/do
 
 ## Tales of Graces f Remastered — `PPSA19991`
 
-Unusually healthy for a title that renders nothing: **20,296 presents in 180 s (~113 fps)**, a full
-Unity thread topology, addressable bundles loading, exactly **one** unimplemented NID in the whole
-log, and zero recompiler rejections, compute skips or faults. A captured steady-state frame replays
-**bit-exactly**, and the replay is a single colour — so prosper is faithfully rendering what the
-guest submits, and **the guest's own composite is empty**.
+<p align="center">
+  <img src="assets/screenshots/tales-graces-f-publisher.png" alt="Tales of Graces f Remastered — publisher logo">
+</p>
+<p align="center">
+  <img src="assets/screenshots/tales-graces-f-criware.png" alt="Tales of Graces f Remastered — CRIWARE middleware logo">
+</p>
 
-A real Unity post chain is running behind it (16 RTT seeds, 960×540 half-res targets sampled back as
-temporal history, LUT-shaped surfaces, reverse-Z). One draw per frame fails to realize with
-`stages=0`, which rules out a shader gap and is the concrete next lead.
+Both logo screens above are direct, unmodified `screenshot` frontend captures at native 1920×1080
+from a plain boot with no scripted input and no render acceleration.
 
-Ruled out and not worth re-running: an intro-movie stall (despite 20 `libSceAvPlayer` imports and
-`Movie/h264/` assets, tracing shows **zero** AvPlayer calls), deadlock, and a slow black asset load.
+Two fixes took this title from rendering nothing to rendering real frames. It first stalled in
+`GameMain.SingletonInitializing`, because prosper linked a hard-coded plugin allowlist and this
+title's `cri_ware_unity.prx` and `GameNative.prx` were not on it; the resulting
+`DllNotFoundException`s were raised inside an async state machine, captured into a Task and never
+printed, so a clean-looking 152-line boot log hid three failed registrations (#1656 now links
+whatever `Media/Plugins/*.prx` a title actually ships). It then stalled on the APR read path:
+CRI ADX2 binds its command buffer with a completion tag of literally **zero**, and prosper treated a
+zero tag as "not really bound", so the completion event was never delivered and CRI's untimed
+`sceKernelWaitEqueue` blocked forever (#1666).
+
+With both fixed, the title loads 100+ asset bundles including its title-screen textures, and renders
+the Bandai Namco and CRIWARE logos. It then goes black and stays black for the rest of the run
+(58 of 60 sampled frames are byte-identical): the opening movie cannot start, because
+`sceVideodec2QueryDecoderMemoryInfo` fails with `0x811d0200`, so `criMvPly_AllocateWorkBufferWithWork`
+never gets a decoder. The title screen is behind that movie and has not been reached.
+
+### Ruled out
+
+- **Empty composite is a renderer fault** — falsified. Offline `gpu_replay --inspect-only` on a
+  retained capture showed all 28 submitted draws were fullscreen post passes with no mesh draw at
+  all, so prosper was faithfully rendering an empty scene (#1609).
+- **Input gating** — falsified. A 200 s route mashing cross/circle/triangle/options left
+  `draws_last=28` across all 99,427 submits.
+- **An intro-movie *stall* at the AvPlayer layer** — falsified for `libSceAvPlayer`: tracing showed
+  zero AvPlayer calls despite 20 imports. The movie path this title actually uses is CRI's own
+  `criMvPly` over `sceVideodec2`, which is a different subsystem (#1658).
+- **DLC / AppContent entitlement** — falsified. `AddContentsManager` is registration 29 and completes
+  normally; it is not one of the three that faulted.
 
 ## Requirements and scope
 
