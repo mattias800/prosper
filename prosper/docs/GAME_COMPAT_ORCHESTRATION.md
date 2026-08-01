@@ -439,6 +439,26 @@ lane's `screenshot_snap` was back **within seconds** — the window had fitted i
 Require **300 s minimum continuously clear** against a lane doing sequential capture runs, reset the
 streak on **any** busy sample, and log what reset it so the wait is auditable rather than a guess.
 
+**A before/after peer count is the right pattern and has a blind spot — know which one you are
+relying on.** Sampling the foreign-process count immediately before and after a run, and marking the
+result `DISCARD` if either is nonzero, makes contention *visible in the record* instead of invisible
+in a mean. But a peer that starts **and finishes entirely inside** your run reads zero at both ends,
+so "0 before, 0 after" is evidence of a clean run, not proof of one. It is strictly weaker the longer
+your run is and the shorter the peer's. The gate width and the before/after check protect different
+things: the **gate** decides whether you started into an inter-run gap, the **before/after** decides
+whether contention was still present at the boundaries. Neither subsumes the other, so use both, and
+for a genuine timing claim add a mid-run sample rather than trusting the endpoints.
+
+**Scope this discipline to the claims it actually protects.** It exists for *timing* results —
+FPS, submits/s, throughput A/Bs — where a contended sample is indistinguishable from a real
+regression. A **qualitative** result is contention-invariant by construction: a contended run cannot
+fabricate a correctly-rendered logo, and it cannot change which field a deterministic CPU-side
+validator rejects. When a gating standard tightens mid-session, re-check *timing* claims made under
+the older, looser gate; do not reflexively withdraw qualitative ones, and do not spend a GPU slot a
+queued lane needs re-confirming a mechanism that already guarantees the answer. Both directions are
+errors: applying it indiscriminately withdraws sound results, ignoring it leaves an
+`UNCONTENDED: admissible` line standing on a window too short to have earned it.
+
 So the honest classification is:
 
 | run | Vulkan? |
