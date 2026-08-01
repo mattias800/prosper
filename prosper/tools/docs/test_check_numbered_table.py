@@ -11,6 +11,7 @@ Run directly, or via ctest as doc_table_checker.
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -49,7 +50,10 @@ def run(name: str, body: str, *, sequential: bool = False, header: str | None = 
         )
         return
     if want_lines is not None:
-        got = sorted({int(p.split(":")[1]) for p in problems if p.split(":")[1].strip().isdigit()})
+        # Match ":<digits>: " rather than splitting on ":" -- a Windows path starts "C:\...", so
+        # field 1 is the path remainder and every line number silently vanished. Found by CI on
+        # Windows MinGW, which is the only job that runs this test.
+        got = sorted({int(m.group(1)) for p in problems if (m := re.search(r":(\d+): ", p))})
         if got != sorted(want_lines):
             FAILURES.append(f"{name}: expected problems at lines {sorted(want_lines)}, got {got}")
             return
@@ -58,6 +62,15 @@ def run(name: str, body: str, *, sequential: bool = False, header: str | None = 
         return
     print(f"  ok  {name}")
 
+
+# The line-number extractor must survive a Windows path. Splitting the message on ":" put the
+# drive letter in field 0 and the path remainder in field 1, so every line number silently vanished
+# and three want_lines cases reported "got []" -- green on Linux, red only on Windows MinGW, the
+# one job that runs this test. Guarded here because the harness itself is not otherwise covered.
+_win = r"C:\Users\runner\Temp\case.md:4: blank line splits the table that starts at line 1"
+_posix = "/tmp/case.md:6: blank line splits the table that starts at line 1"
+assert re.search(r":(\d+): ", _win).group(1) == "4", "extractor broken on Windows-shaped paths"
+assert re.search(r":(\d+): ", _posix).group(1) == "6", "extractor broken on POSIX paths"
 
 TABLE = "| # | What |\n|---|---|\n| 1 | a |\n| 2 | b |\n| 3 | c |\n"
 
