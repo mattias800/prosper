@@ -235,8 +235,9 @@ title-visibility blocker.
 > from hundreds of thousands.
 >
 > **`gpu_replay` cannot demonstrate this fix.** Both `--bundle` and `.prgcap` go through
-> `materialize_gpu_replay`, which binds the **stored** `ResolvedPipelineState` (`gpu_capture.cpp:3428`,
-> `d.ps = x.ps`), so replay never re-runs `resolve_pipeline_state` and a change there is invisible to it.
+> `materialize_gpu_replay`, which binds the **stored** `ResolvedPipelineState` — the `d.ps = x.ps` line in
+> its draw loop (`gpu_capture.cpp`, line 3405 as of `37768edc`; grep the assignment rather than the line
+> number, it drifts) — so replay never re-runs `resolve_pipeline_state` and a change there is invisible to it.
 > That is why #1695's A/B lever had to sit in `gpu_replay`'s `main()`. Verify in a live run or in
 > `tests/test_pipeline_render.cpp`, not by replaying an artifact.
 
