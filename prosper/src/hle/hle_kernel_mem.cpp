@@ -1607,7 +1607,18 @@ HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I: legacy eager path keeps zero us
 HLE(k_apr_cb_set_equeue_320) {   // o67gODLFpls: PS5 3.20 0x20-byte completion command
     return apr_cb_set_equeue(0x20, true, a0, a1, a2, a3, a4, a5);
 }
-HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1, out2)
+// Shared body of the APR submit family. `write_result_outputs` distinguishes the two entry points
+// the 3.20 firmware database actually names (#1629):
+//
+//   sceKernelAprSubmitCommandBufferAndGetResult  ASoW5WE-UPo, 0ers1N4C9CY   (cb, ring, out1, out2)
+//   sceKernelAprSubmitCommandBuffer              eE4Szl8sil8, Omr9X+YmT7I   (cb, ring)
+//
+// The plain form has NO result out-parameters, so a2/a3 hold whatever the caller's registers happened
+// to contain. Writing a token through those would be writing through residue — and this file already
+// documents that a nonzero value landing in a request's completion record marks the read FAILED
+// (eboot+0x22738a5). That is why the plain variant is a separate entry rather than an alias.
+static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                  bool write_result_outputs) {
     unsigned ring = a1 ? (unsigned)(a1 - 1) & 0x3f : 0;
     // Completion-token contract (issues #180/#208 — guest submit path eboot+0x22a02b0, handler
     // +0x229dcb0, listener +0x22740b0, listener-ctx ctor +0x22a0670; full write-up in
@@ -1632,11 +1643,12 @@ HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1
     const bool bound = apr_cb_submit_state(a0, &bc, &should_post);
     const bool tag_echo = bound && bc.tag && bc.eq;
     uint64_t token = tag_echo ? bc.tag : prosper_apr_next_token(ring);
-    if (!bound) {
+    if (!bound && write_result_outputs) {
         if (a2 > 0xffff) *(uint64_t*)(uintptr_t)a2 = token;
         if (a3 > 0xffff) *(uint64_t*)(uintptr_t)a3 = token;
     }
-    if (amprlog()) fprintf(stderr, "[amprlog] ASoW5WE-UPo(Submit) cb=0x%llx ring1b=%llu out1=0x%llx out2=0x%llx -> token=0x%llx%s%s\n",
+    if (amprlog()) fprintf(stderr, "[amprlog] AprSubmit%s cb=0x%llx ring1b=%llu out1=0x%llx out2=0x%llx -> token=0x%llx%s%s\n",
+                           write_result_outputs ? "AndGetResult" : "",
                            (unsigned long long)a0, (unsigned long long)a1,
                            (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)token,
                            bound ? " (bound)" : "", apr_req_eventful(a0) ? " (arg8-async)" : "");
@@ -1647,6 +1659,25 @@ HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1
     // cursor even though the fixed capacity remains attached to the command-buffer object.
     ampr_cb_reset(a0);
     return 0;
+}
+
+HLE(k_apr_submit) {   // sceKernelAprSubmitCommandBufferAndGetResult (cb, ring_1based, out1, out2)
+    return apr_submit_common(a0, a1, a2, a3, /*write_result_outputs=*/true);
+}
+// sceKernelAprSubmitCommandBuffer (cb, ring_1based). Same submit, no result slots — CRI ADX2's file
+// system (cri_ware_unity.prx) drives its reads through this one, and the default success stub left the
+// command buffer unconsumed so the guest's read never completed (#1629).
+HLE(k_apr_submit_plain) {
+    // Log the caller's real a2/a3 before discarding them. The firmware database gives this entry
+    // point's NAME but not its signature, so its arity is CONFIDENCE: MED — and these two values are
+    // precisely the evidence that would settle it. If they are ever consistently valid, aligned guest
+    // pointers across a run, the plain form has out-parameters after all and this handler is wrong.
+    if (amprlog())
+        fprintf(stderr, "[amprlog] AprSubmit(plain) eE4Szl8sil8 cb=0x%llx ring1b=%llu "
+                        "unused_a2=0x%llx unused_a3=0x%llx (discarded: no result slots)\n",
+                (unsigned long long)a0, (unsigned long long)a1,
+                (unsigned long long)a2, (unsigned long long)a3);
+    return apr_submit_common(a0, a1, /*out1=*/0, /*out2=*/0, /*write_result_outputs=*/false);
 }
 // sceAmprCommandBufferGetCurrentOffset: byte cursor after the commands appended since construction,
 // reset, or clear. Pathless uses this with GetSize to decide when an IoStore batch must be submitted.
@@ -1960,7 +1991,20 @@ void register_kernel_mem_hle() {
     Hle::register_fn("H896Pt-yB4I", (HleFn)k_apr_cb_set_equeue, "AprCbSetEventQueue?");
     Hle::register_fn("o67gODLFpls", (HleFn)k_apr_cb_set_equeue_320,
                      "sceAmprCommandBufferWriteKernelEventQueueOnCompletion");
-    Hle::register_fn("ASoW5WE-UPo", (HleFn)k_apr_submit,        "AprSubmitCommandBuffer?");
+    // Names from the PS5 3.20 firmware export database, which corrects a guess: ASoW5WE-UPo is
+    // sceKernelAprSubmitCommandBufferAndGetResult, NOT the plain submit prosper had labelled it (#1629).
+    //
+    // Deliberately NOT registered: Omr9X+YmT7I and 0ers1N4C9CY. They look like alias NIDs of these two
+    // names and are not — the database resolves them to sceKernelAprSubmitCommandBuffer_TEST and
+    // ...AndGetResult_TEST, separate exports whose behaviour is not observable from any title evidence
+    // prosper has. Binding them to the production handlers would be inventing semantics for a debug
+    // entry point. They stay unimplemented, which is fail-visible, rather than silently doing a real
+    // submit. (Caution for the next reader: a `__ptr_sceKernelApr[A-Za-z]*` grep truncates at the
+    // underscore and makes these look like plain aliases. Match [A-Za-z0-9_]* instead.)
+    Hle::register_fn("ASoW5WE-UPo", (HleFn)k_apr_submit,
+                     "sceKernelAprSubmitCommandBufferAndGetResult");
+    Hle::register_fn("eE4Szl8sil8", (HleFn)k_apr_submit_plain,
+                     "sceKernelAprSubmitCommandBuffer");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
                      "sceAmprCommandBufferGetCurrentOffset");
     Hle::register_fn("4fgtGfXDrFc", (HleFn)k_ampr_measure_write_address,
@@ -4687,7 +4731,14 @@ void register_kernel_mem_hle() {
     Hle::register_fn("H896Pt-yB4I", (HleFn)k_ampr_append_equeue_legacy, "AprCbSetEventQueue?");
     Hle::register_fn("o67gODLFpls", (HleFn)k_ampr_append_equeue_320,
                      "sceAmprCommandBufferWriteKernelEventQueueOnCompletion");
-    Hle::register_fn("ASoW5WE-UPo", (HleFn)k_ampr_submit, "AprSubmitCommandBuffer?");
+    Hle::register_fn("ASoW5WE-UPo", (HleFn)k_ampr_submit,
+                     "sceKernelAprSubmitCommandBufferAndGetResult");
+    // The Windows Ampr submit resets the command buffer and writes nothing, which satisfies the plain
+    // form's contract exactly. It is NOT equivalent to the POSIX handler in general: the token,
+    // binding and equeue-post machinery is POSIX-only, so AndGetResult returns success here without
+    // publishing a token. Pre-existing, not widened by this change, and tracked as #1657.
+    // The _TEST-suffixed NIDs are deliberately left unimplemented — see the POSIX block for why.
+    Hle::register_fn("eE4Szl8sil8", (HleFn)k_ampr_submit, "sceKernelAprSubmitCommandBuffer");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
                      "sceAmprCommandBufferGetCurrentOffset");
     Hle::register_fn("4fgtGfXDrFc", (HleFn)k_ampr_measure_write_address,

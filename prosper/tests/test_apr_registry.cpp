@@ -389,6 +389,70 @@ int main() {
 #endif
     }
 
+
+    // #1629: sceKernelAprSubmitCommandBuffer (eE4Szl8sil8) was unimplemented, so the default stub
+    // returned 0 = success without consuming the command buffer and CRI ADX2's reads never completed.
+    //
+    // The 3.20 firmware export database also corrects a name prosper had guessed: ASoW5WE-UPo is
+    // sceKernelAprSubmitCommandBufferAndGetResult (cb, ring, out1, out2), NOT the plain submit. The
+    // plain form takes no result slots, so a2/a3 hold caller residue — writing a token through them
+    // is the specific bug an alias-style "fix" would introduce, and this file already documents that a
+    // nonzero value in a completion record marks the read FAILED.
+    {
+        HleFn submit_plain = Hle::lookup("eE4Szl8sil8");
+        HleFn submit_result_a = Hle::lookup("ASoW5WE-UPo");
+        CHECK(submit_plain != nullptr,
+              "#1629: sceKernelAprSubmitCommandBuffer (eE4Szl8sil8) resolves to a real handler");
+        CHECK(submit_result_a != nullptr,
+              "#1629: sceKernelAprSubmitCommandBufferAndGetResult (ASoW5WE-UPo) still resolves");
+#ifndef _WIN32
+        // POSIX only, and this guard hides a REAL gap rather than an irrelevance: on Windows both NIDs
+        // share k_ampr_submit, which resets the command buffer and writes nothing, so AndGetResult
+        // silently returns success without publishing a completion token. That is pre-existing and is
+        // tracked as #1657 — REMOVE THIS GUARD when it is fixed; the assertions below are already the
+        // proof. They are guarded rather than deleted so the Windows contract is not quietly forgotten.
+        // The plain form's contract IS satisfied on Windows (it has no result slots), which is why its
+        // residue assertion further down stays unguarded.
+        // Both halves required: before #1629 the plain NID resolved to nothing, so a bare "these
+        // differ" comparison passed vacuously against nullptr.
+        CHECK(submit_plain && submit_result_a && submit_plain != submit_result_a,
+              "#1629: the plain submit exists AND is not an alias of the AndGetResult form");
+#endif
+        // The _TEST-suffixed exports must stay unimplemented. They are NOT alias NIDs of the two
+        // names above — the firmware database resolves them to sceKernelAprSubmitCommandBuffer_TEST
+        // and ...AndGetResult_TEST — and binding a debug entry point to a production handler would be
+        // inventing behaviour no title evidence supports.
+        CHECK(Hle::lookup("Omr9X+YmT7I") == nullptr && Hle::lookup("0ers1N4C9CY") == nullptr,
+              "#1629: the _TEST-suffixed submit NIDs are left unimplemented, not aliased");
+
+        // An unbound command buffer is the case that hands a token back through the out slots, so it
+        // is the one that can demonstrate the difference.
+        alignas(8) uint64_t out1 = 0xdeadbeefcafef00dull;
+        alignas(8) uint64_t out2 = 0xdeadbeefcafef00dull;
+        constexpr uint64_t kResidue = 0xdeadbeefcafef00dull;
+        alignas(64) uint8_t fake_cb[256] = {};
+        const uint64_t cb = (uint64_t)(uintptr_t)fake_cb;
+
+#ifndef _WIN32   // see #1657 — Windows publishes no token; remove with that fix
+        if (submit_result_a) {
+            out1 = out2 = kResidue;
+            submit_result_a(cb, 1, (uint64_t)(uintptr_t)&out1, (uint64_t)(uintptr_t)&out2, 0, 0);
+            CHECK(out1 != kResidue && out2 != kResidue && out1 == out2,
+                  "#1629: AndGetResult still publishes one completion token through both out slots");
+        }
+#endif
+        if (submit_plain) {
+            out1 = out2 = kResidue;
+            // Exactly the call the plain form receives: whatever happens to be in the argument
+            // registers. If the handler treated them as out-pointers it would clobber them.
+            submit_plain(cb, 1, (uint64_t)(uintptr_t)&out1, (uint64_t)(uintptr_t)&out2, 0, 0);
+            // Holds on BOTH platforms and is the property that actually matters, so it is not
+            // guarded: POSIX suppresses the writes deliberately, Windows never had them.
+            CHECK(out1 == kResidue && out2 == kResidue,
+                  "#1629: the plain submit writes NO result slots — a2/a3 are residue, not outputs");
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

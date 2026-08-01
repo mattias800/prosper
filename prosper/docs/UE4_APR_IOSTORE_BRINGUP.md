@@ -452,7 +452,9 @@ disassembly (all offsets eboot-relative):
      async read: exactly the GlobalShaderCache region of pakchunk0-ps5.pak (fileId from APR
      resolve). Implemented as `f_apr_read_direct` in hle_file.cpp (pread + lazy-commit dst write +
      completion token/event).
-   - `libkernel::ASoW5WE-UPo (cb, ring_1based, u64* out1, u64* out2)` — the APR **submit**
+   - `libkernel::ASoW5WE-UPo (cb, ring_1based, u64* out1, u64* out2)` —
+     `sceKernelAprSubmitCommandBufferAndGetResult` (name from the 3.20 firmware database, #1629;
+     earlier notes called this "the APR submit", which is the *sibling* `eE4Szl8sil8`) — the APR **submit**
      (wrapper +0x59b6420 → thunk +0x669afd0; the completion handler resubmits queued CBs with
      `ring = (data>>58)+1`, proving 1-based). Nonzero return = error (checked at +0x22a1d55);
      the completion token is returned through the OUT slots. Implemented as `k_apr_submit`.
