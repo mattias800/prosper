@@ -3486,7 +3486,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     is_ps ? "PS" : "VS", (unsigned long long)code_addr, total);
             for (size_t ci = 0; ci < total && ci < std::size(cands); ci++) {
                 const auto* ch = static_cast<const AgcShaderHeader*>(cands[ci]);
-                if (!ch) continue;
+                // This loop exists to enumerate EXTRA registrations at one code address — i.e. the
+                // recycled-allocation case — so its entries are the ones most likely to point into
+                // a blob the guest has already freed. Probe every hop, exactly as the whole-registry
+                // scan below does.
+                if (!ch || !guest_readable((uint64_t)(uintptr_t)ch, sizeof(AgcShaderHeader)))
+                    continue;
                 const bool sp_ok = ch->specials && guest_readable((uint64_t)(uintptr_t)ch->specials,
                                                                   sizeof(AgcShaderSpecials));
                 fprintf(stderr, "[udcand]   #%zu hdr=%p type=%u range=[%u,%u) direct:", ci,
@@ -3495,10 +3500,21 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         sp_ok ? (uint32_t)ch->specials->user_data_range_end : 0u);
                 bool all = true, any = false;
                 const AgcShaderUserData* cud = ch->user_data;
-                if (cud && !cud->direct_resource_offset) cud = nullptr;
+                if (cud && !guest_readable((uint64_t)(uintptr_t)cud, sizeof(AgcShaderUserData)))
+                    cud = nullptr;
+                uint16_t cud_count = 0;
+                const uint16_t* cud_offsets = nullptr;
                 if (cud) {
-                    for (uint16_t t = 0; t < cud->direct_resource_count && t < 16; t++) {
-                        const uint32_t off = cud->direct_resource_offset[t];
+                    cud_count = cud->direct_resource_count;
+                    cud_offsets = cud->direct_resource_offset;
+                    if (!cud_offsets || !cud_count || cud_count > 64 ||
+                        !guest_readable((uint64_t)(uintptr_t)cud_offsets,
+                                        cud_count * (uint32_t)sizeof(uint16_t)))
+                        cud = nullptr;
+                }
+                if (cud) {
+                    for (uint16_t t = 0; t < cud_count && t < 16; t++) {
+                        const uint32_t off = cud_offsets[t];
                         if (off == 0xFFFFu) continue;
                         any = true;
                         if (off + 1 >= kUserSgprs) { all = false; fprintf(stderr, " [%u]@dw%u=OOB", t, off); continue; }
