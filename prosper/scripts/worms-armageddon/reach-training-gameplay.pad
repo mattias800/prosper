@@ -1,0 +1,35 @@
+# Worms Armageddon: Anniversary Edition (PPSA20052): reach a fixed-map playable Training level.
+# Seconds are measured from the first pad poll. One-second holds are poll-safe.
+#
+# Why this route exists alongside reach-gameplay.pad: Quickstart generates its terrain RANDOMLY per
+# run. Two independent fresh-save runs of reach-gameplay.pad produced a pirate/treasure map and a
+# fairytale/castle map, and frames from the second scored at most 0.6567 SSIM against references
+# built from the first, against a 0.85 floor -- so no fixed-reference content guard can be built on
+# that route. Training levels are authored fixed maps. Under this route two independent runs matched
+# at 0.9612-1.0000, so it is the route the snapshot guard uses. reach-gameplay.pad remains the route
+# for the published Quickstart-match milestone.
+#
+# Observed on a Linux hardware-Vulkan boot at scale 4 (480x270), consistent across two runs:
+#   ~8-13 s   Digital Eclipse studio splash
+#   ~14 s     title screen ("PRESS X TO START GAME"), 75,875 distinct colours
+#   21-26 s   main menu after the first Cross ("PLAY THE GAME")
+#   27-32 s   game-setup grid after the second Cross; 3 columns x 2 rows, Quickstart preselected
+#             top-left, Single Player directly below it -- hence one Down rather than any Right
+#   33-38 s   Single Player selected in the grid
+#   39-62 s   Single Player screen, Training tab active, focus on the tab row; the three Downs walk
+#             focus out of the tab row and down the right-hand column to the Start button
+#   63-70 s   "Grenade skills grade 1" mission brief prompt
+#   ~72 s     the training level is loaded and playable; its 60-second mission timer expires ~132 s
+# The Crosses at 78 and 86 land in the level and are harmless; they cover brief-prompt timing
+# variation without changing the level that loads.
+20-21:cross
+26-27:cross
+32-33:down
+38-39:cross
+44-45:down
+50-51:down
+56-57:down
+62-63:cross
+70-71:cross
+78-79:cross
+86-87:cross
