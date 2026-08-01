@@ -128,6 +128,17 @@ count, read the last row's number.
   ran*, not of when the events happened. Print a common ordinal (`command_order`) on both and join on it. This
   is why the `order=` field exists on the `[exec] skip draw early` line — **it is not redundant with the
   register values on the same line, and removing it silently re-opens the phantom above.**
+- **A guard keyed on a threshold has an expiry date and gives no signal at expiry.** Key it on the thing
+  itself. #1675 added a check that CI must register at least 160 tests, so a configure that quietly lost
+  Vulkan would fail instead of reporting a smaller green suite. It read as the careful part of the change
+  and it was decoration with a delay: CI has 138 non-Vulkan tests, the suite only grows, and once ~22 more
+  exist, losing all 27 Vulkan tests still clears 160. The guard would have stopped protecting the thing it
+  was added for, at some unremarkable future commit, silently — the same shape as the defect it was
+  guarding against. Replaced with a check that three **named** Vulkan-gated tests are registered: they
+  cannot exist unless Vulkan was found, and that stays true at any suite size. The general form — **a
+  threshold derived from today's numbers decays as the system grows; assert the property, not a count that
+  happens to imply it today** — and the corollary: verify a guard fires in **both** directions, because
+  one that cannot fail is worse than none.
 - **Before recording that something cannot be measured, check the tools you are claiming cannot measure
   it.** This is nastier than a wrong fact and it is self-sealing. A wrong claim about the *subject* gets
   tested by the next measurement; a wrong claim about the *instrument* stops the measurement from
