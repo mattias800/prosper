@@ -93,6 +93,45 @@ jobs:
         run: |
           ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
 
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Its own job rather than a step of Linux: a false positive here must not cost the build and
+      # test signal from an unrelated job. It needs nothing built and finishes in seconds.
+      #
+      # The instrument-trap table is the page the working guide points agents at first, and several
+      # lanes append to it concurrently. Two defects landed in it on 2026-08-01 that NO other check
+      # in this pipeline could see:
+      #   * A stray blank line between two rows. Markdown ends a table at a blank line, so the rows
+      #     after it silently render as a SEPARATE table. Master carried two at once, rendering 36
+      #     rows as three tables with the newest entry orphaned in a one-row table of its own.
+      #     Nothing is missing from the file, so the diff looks perfect.
+      #   * Two branches claiming the same row number. These merge CLEANLY -- separate lines, no
+      #     textual conflict -- producing a table reading "33, 34, 35, 32" at mergeable=CLEAN with
+      #     every job green. Conflict detection is line-local and has no idea the column is a key,
+      #     and other documents cite these rows BY NUMBER, so a duplicate silently redirects them.
+      #
+      # --sequential is opt-in and belongs only to this table, whose convention is "append, never
+      # renumber". Measured with this checker over the 77 tracked Markdown files: all 77 pass the
+      # structure check, while of the 5 documents holding an all-numeric-first-column table only 2
+      # satisfy sequence -- the rest lead with frame indices, draw ordinals and submit numbers,
+      # where gaps and repeats are the correct content. Applying sequence broadly would report
+      # correct documents as broken, and a check that fires on correct data gets deleted.
+      - name: Verify the numbered doc tables are intact
+        run: |
+          python3 prosper/tools/docs/check_numbered_table.py --github --sequential \
+            --table-header Instrument prosper/docs/GAME_COMPAT_ORCHESTRATION.md
+
+      # Structure only, across every tracked Markdown file: catches the same table-splitting defect
+      # anywhere it appears. Documents with no table at all are ordinary here and are not an error.
+      - name: Verify no Markdown table is split anywhere in docs
+        run: |
+          git ls-files '*.md' -z | xargs -0 python3 prosper/tools/docs/check_numbered_table.py --github
+
   linux-app:
     name: Linux App
     runs-on: ubuntu-latest
