@@ -51,6 +51,34 @@ nothing and reads as success. Both were hit while writing this.
 say `Insert instance layer "VK_LAYER_KHRONOS_validation"` (via `VK_LOADER_DEBUG=layer`) on a probe
 binary. If the layer is missing, the scan fails with an install hint rather than passing.
 
+That check alone was not enough, and the way it failed is worth keeping. **The two layer versions
+in play frame the same message differently:**
+
+```
+layers 1.4.341 (Fedora 44)    Validation Error: [ VUID-x ] | MessageID = 0x...
+                              <message text on following lines>
+
+layers 1.3.275 (Ubuntu 24.04, VUID-x(ERROR / SPEC): msgNum: N - Validation Error: [ VUID-x ] ...
+                the CI runner)  <everything on one line>
+```
+
+The first revision of this parser anchored its pattern to the start of a line. It read all 51
+messages on 1.4.341 and **0 of 187** on 1.3.275 — the layer loaded, the probe passed, the scan
+reported a clean suite, and the CI gate would have been permanently green while observing nothing.
+It was caught only by running the positive control (below) on the CI environment rather than the
+development one.
+
+So the scan has a second, blunter instrument check: **if the allow-list is non-empty and *zero*
+messages were observed, that is a failure.** Nine known defects spread over eight tests do not all
+fall silent at once; a parser that stopped matching, a log read from the wrong place, or a build
+without the Vulkan tests all produce exactly that shape. Deleting the last allow-list entry — the
+intended end state — switches the check off.
+
+`test_vk_validation_scan.py` pins both layer framings verbatim, and asserts that the test's own
+output contains nothing the scan would read as a validation message (ctest captures it into the
+same log, so a test that prints sample messages makes the guard read its own tail — measured, it
+did).
+
 The same rule applies to changes to the tool itself: `test_vk_validation_scan.py` (ctest
 `vkval_scan_logic`) pins that the parser really matches the layer's message framing, including the
 `VUID-vkCmdDispatch-viewType-07752` line that motivated all of this.

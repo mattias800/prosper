@@ -43,8 +43,19 @@ LAYER = "VK_LAYER_KHRONOS_validation"
 
 # ctest writes one of these before each test's captured output in Testing/Temporary/LastTest.log.
 TEST_HEADER = re.compile(r"^\d+/\d+ Testing: (.+)$", re.M)
-# A validation message begins with "Validation Error: [ <id> ]" / "Validation Warning: [ <id> ]".
-MESSAGE = re.compile(r"^Validation (Error|Warning|Performance Warning): \[ ([^\]]*) \]", re.M)
+
+# A validation message carries "Validation Error: [ <id> ]" / "Validation Warning: [ <id> ]" exactly
+# once, but WHERE on the line differs by layer version, and this pattern must not be anchored:
+#
+#   layers 1.4.341 (Fedora 44)   Validation Error: [ VUID-x ] | MessageID = 0x...\n<text>
+#   layers 1.3.275 (Ubuntu 24.04, VUID-x(ERROR / SPEC): msgNum: N - Validation Error: [ VUID-x ] ...
+#                   the CI runner)
+#
+# An earlier revision anchored this to the start of a line. It matched all 51 messages on 1.4.341
+# and 0 of 187 on 1.3.275 — so the guard was green on CI while observing nothing, which is the
+# precise failure this whole tool exists to prevent. The all-absent check in main() is the backstop
+# for the next version whose framing nobody anticipated.
+MESSAGE = re.compile(r"Validation (Error|Warning|Performance Warning): \[ ([^\]]*) \]")
 
 
 class Finding:
@@ -220,6 +231,26 @@ def main(argv: list[str]) -> int:
                 print(f"      {line}")
 
     failed = False
+    # Instrument check, and the one that matters most. Every entry on the allow-list is a defect
+    # that was observed when the guard was switched on, and they are spread over eight different
+    # tests: it is not credible for ALL of them to fall silent at once. If that happens, the far
+    # likelier explanation is that the observation broke — a layer version whose message framing
+    # this parser does not match, a ctest that wrote its log somewhere else, a build without the
+    # Vulkan tests. Every one of those reports "0 findings", which is indistinguishable from a
+    # clean suite unless something asks the question.
+    #
+    # An empty allow-list means the defects really were fixed and their lines deleted, which is the
+    # intended end state, so the check switches itself off then.
+    if allowed and not findings:
+        print()
+        print(f"[vkval] FAIL: the allow-list holds {len(allowed)} pre-existing message id(s) and "
+              f"NONE were observed, while the layer demonstrably loaded.")
+        print("[vkval] That is far more likely to be a broken observation than a clean suite: check "
+              "that this parser matches your layer version's message framing, and that ctest's "
+              "LastTest.log is the log being read.")
+        print("[vkval] If the defects really were all fixed, delete their allow-list entries in the "
+              "same change — an empty allow-list disables this check.")
+        failed = True
     if new:
         print()
         print(f"[vkval] FAIL: {len(new)} validation message ID(s) are not on the allow-list.")
