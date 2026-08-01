@@ -7,8 +7,17 @@
 // blit), then asserts every pixel equals the pattern for that frame. This validates: (a) blit fidelity --
 // the scanout image is a byte-exact copy of the front buffer, so GPU-present == the CPU readback path; and
 // (b) the slot handoff -- with fence-gated publish and release, the consumer never reads a half-written or
-// reused image even while the producer runs ahead. Run it under VK_LAYER_KHRONOS_validation in CI to catch
-// sync/layout hazards. No window/surface is needed, so it runs headlessly.
+// reused image even while the producer runs ahead. No window/surface is needed, so it runs headlessly.
+//
+// This file used to end with "Run it under VK_LAYER_KHRONOS_validation in CI to catch sync/layout
+// hazards." That is now done (#1704: `tools/vkval`, a step on the Linux job), and the first run
+// found a layout hazard here: the fixture's source images carry transfer usage only, yet are
+// transitioned to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL to imitate the layout the renderer hands
+// present_blit_publish. That is VUID-VkImageMemoryBarrier-oldLayout-01211, it accounts for 168 of
+// the suite's 187 validation messages on the CI runner, and it is tracked in #1716. The scanout
+// handoff assertions below are unaffected — the hazard is in this fixture's setup, not in
+// present_blit — but fix #1716 before trusting this test to report a *new* layout hazard, because
+// today's finding would bury one.
 #include "render_runner.h"
 #include "../frontends/shared/live_renderer.hpp"
 #include "../frontends/shared/present_blit.hpp"

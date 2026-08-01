@@ -1,0 +1,57 @@
+# Vulkan validation findings that existed BEFORE the guard was switched on (#1704).
+#
+# Format:  <message id> | <one-line reason, with the issue tracking it>
+#
+# Rules, and they matter more than the list:
+#
+#   * Every entry is a DEFERRED DEFECT, not an accepted one. Each line names an open issue.
+#     Nothing here is "fine"; it is "known, written down, and not fixed in the PR that measured it".
+#   * A bare id with no reason is rejected by the scanner. An unexplained filter reads as
+#     "handled" when it is not, which CLAUDE.md calls out as worse than a loud gap.
+#   * Adding a line is a decision to defer, and it should come with an issue. Deleting a line
+#     is what fixing the defect looks like.
+#   * The scanner reports — but does not fail on — entries that produce no messages in a given
+#     run, because the observed set is genuinely driver-dependent (see the two notes below).
+#
+# Measured baseline, 2026-08-01, on the whole ctest suite:
+#
+#   Ubuntu 24.04 / validation layers 1.3.275.0 / Mesa 25.2.8 lavapipe   (the CI runner's exact
+#     driver, reproduced in `podman run --rm ubuntu:24.04`):  7 ids, 187 messages, 166/166 pass
+#   Fedora 44 / validation layers 1.4.341.0 / Mesa 26.1.4 RADV (STRIX_HALO):  9 ids, 51 messages
+#
+# The two ids the CI environment does not produce are marked below. Neither is absent because it
+# was fixed: `maintenance4-08602` is a newer check than layer 1.3.275, and `size-01389` cannot
+# trigger on lavapipe, whose nonCoherentAtomSize is 1. Both are real on hardware.
+
+# ---- #1710: compute pipeline layout has no push-constant range, and nothing is ever pushed -----
+# game_compute_exec, game_compute_exec_no_adaptive_storage_result.
+VUID-VkComputePipelineCreateInfo-layout-07987 | Compute module declares a PushConstant block while the layout declares no range (#1710)
+VUID-vkCmdDispatch-maintenance4-08602 | Same root cause as 07987: the shader reads push constants that vkCmdPushConstants never wrote (#1710). Not reported by validation layers 1.3.275, so absent on the CI runner.
+
+# ---- #1711: our own emitter produces SPIR-V that spirv-val rejects ------------------------------
+# game_compute_exec.
+VUID-VkShaderModuleCreateInfo-pCode-08737 | OpAccessChain result type disagrees with the OpTypeVector it indexes; the claimed spirv-val gate does not cover this path (#1711)
+
+# ---- #1712: Int64 capability declared, shaderInt64 never enabled on any device ------------------
+# rdna2_to_spirv_exec, texture_sample_render.
+VUID-VkShaderModuleCreateInfo-pCode-08740 | Recompiled 64-bit integer ops force OpCapability Int64, which no device-creation path in the tree requests (#1712)
+
+# ---- #1713: storage-image descriptor numeric type disagrees with the module (the #1690 class) ---
+# texture_sample_render.
+VUID-vkCmdDraw-format-07753 | Module wants a UINT sampled type, the bound view is R8G8B8A8_UNORM (#1713) — same defect class as #1690/#1702
+
+# ---- #1714: MRT blend state differs per attachment without independentBlend ---------------------
+# shadow_compare_render.
+VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605 | Per-target blend state is built from each target's own registers while independentBlend is never enabled (#1714)
+
+# ---- #1715: generated geometry stage declares no invocation count -------------------------------
+# interp_render.
+VUID-VkPipelineShaderStageCreateInfo-stage-00715 | The synthesised geometry entry point has no OpExecutionMode Invocations, so the declared count is 0 (#1715)
+
+# ---- #1716: present_blit fixture transitions a transfer-only image to SHADER_READ_ONLY_OPTIMAL --
+# present_blit. 168 of the CI environment's 187 messages; the test's own header asked for this check.
+VUID-VkImageMemoryBarrier-oldLayout-01211 | Fixture source images lack SAMPLED_BIT but are transitioned to SHADER_READ_ONLY_OPTIMAL (#1716)
+
+# ---- #1717: VK_WHOLE_SIZE invalidate over a non-atom-aligned mapping ----------------------------
+# gpu_capture_render_replay.
+VUID-VkMappedMemoryRange-size-01389 | invalidate_mapped_readback assumes VK_WHOLE_SIZE is exempt from the mapping-end alignment rule; it is not (#1717). Cannot trigger on lavapipe (nonCoherentAtomSize == 1), so absent on the CI runner.

@@ -6581,12 +6581,34 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     // Keep the Vulkan device alive across dispatch spans. Constructing an instance, device, and queue for
     // every callback cost roughly 25 ms/frame on the native Windows frontend before any kernel work ran.
     // Function-local static initialization is thread-safe; AGC submit execution serializes subsequent use.
-    static VulkanComputeContext context;
-    static const bool context_ready = context.init();
+    //
+    // The context is heap-allocated and torn down from a std::atexit handler registered AFTER
+    // vkCreateInstance rather than from a static destructor, because ~VulkanComputeContext() calls
+    // into Vulkan (#1704). Destructors of objects with static storage duration and atexit handlers
+    // run in one list, in reverse order of registration: a static object constructed here would be
+    // registered BEFORE vkCreateInstance dlopens any enabled layer, so it would be destroyed AFTER
+    // that layer's own statics, and the first vkDestroyBuffer would then dereference the layer's
+    // freed dispatch map. That is a deterministic SIGSEGV at exit under VK_LAYER_KHRONOS_validation
+    // (reproduced on layers 1.4.341, inside vvl::dispatch::GetData), and the same hazard applies to
+    // any implicit layer a user has enabled — MangoHud, vkBasalt, an overlay. Registering the
+    // teardown here, once the instance exists, puts it ahead of the layer's in that reverse-order
+    // list, so Vulkan objects are destroyed while the loader and its layers are still alive.
+    static VulkanComputeContext* context_ptr = new VulkanComputeContext();
+    static const bool context_ready = [] {
+        const bool ok = context_ptr->init();
+        std::atexit([] {
+            VulkanComputeContext* doomed = context_ptr;
+            context_ptr = nullptr;
+            g_live_compute_context = nullptr;
+            delete doomed;
+        });
+        return ok;
+    }();
     if (!context_ready) {
         std::fprintf(stderr, "[compute] Vulkan initialization failed\n");
         return false;
     }
+    VulkanComputeContext& context = *context_ptr;
     g_live_compute_context = &context;
     const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled

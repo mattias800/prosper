@@ -99,6 +99,11 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME doc_table_checker
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/docs/test_check_numbered_table.py")
+  # Parsing/gating logic of the Vulkan validation guard (#1704). Pure — it does not create a Vulkan
+  # instance, so it runs everywhere. A parser that stops matching the layer's message framing would
+  # report a clean suite forever, which is the one way this guard can fail silently.
+  add_test(NAME vkval_scan_logic
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/vkval/test_vk_validation_scan.py")
 endif()
 # Path to the (gitignored) local game dump; override with -DGAME_DUMP=...
 set(GAME_DUMP "${CMAKE_SOURCE_DIR}/../PPSA24651-app0" CACHE PATH "Local PS5 game dump root")
