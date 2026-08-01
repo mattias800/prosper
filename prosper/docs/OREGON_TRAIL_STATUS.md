@@ -44,6 +44,16 @@ re-derive these without contradictory new evidence.
 | `~23 draws/frame` is implausibly few (an assertion) | **Now a measurement, against a calibrated control.** Blue Prince — the only title in the comparison that demonstrably renders a 3D world — shows both regimes in one run, same build, same instruments: **7–13 draws/frame on its own menus, 1,500–3,200 in its 3D scene.** Oregon Trail sits flat at 22.4 (peak 23) for an entire run while running a gameplay-scale post chain. Read the trap first: a whole-run average describes neither regime (Blue Prince's is 622.7). | #1641, PR #1645 |
 | The same signature confirms the defect on Nikoderiko or Asterix | **Neither is currently in a phase that can test it.** Nikoderiko's 35.9 draws/frame (peak 53) was measured **parked on the title screen and EULA** — a 2D UI screen — and a working title's own menus measure 7–13, so 53 is *normal*, not a signature; its rise lands exactly when the rich screen appears (samples 10–11 carry 160,300 and 161,248 distinct colours, samples 3–9 are uniformly black). Asterix `PPSA30490` sits at exactly 4.00 draws/frame (3 realized + 1 suppressed), dead flat across 14,472 frames, never reaching any content phase — a title that never starts rendering, a different failure. **Do not widen #1641 to those titles on this evidence.** | #1641 |
 
+**Note on the Asterix figure.** 4.00 is the #1641 census number — *decoded* draws per frame, realized
+plus suppressed, over the whole run. A separate Asterix plugin-link A/B, run while investigating the
+Tales of Graces `DllNotFoundException` family (#1609), reported an unchanged draws-per-frame count on
+both arms using a different instrument at a different phase, and is the basis for "Asterix's black
+frame is **not** a silent `DllNotFoundException`". **That A/B is not in the project record** — it
+exists only in a report to an orchestrator and an unmerged branch — so it is recorded here as an
+outstanding claim, not as a falsification. Whoever lands the plugin-autolink work should re-run it and
+file the numbers on #1599, stating which quantity was counted; do not assume the two figures measure
+the same thing, and do not treat either as superseding the other until that is checked.
+
 ### Corrections to the record
 
 * The two unrealized operations in the retained capture are **draw indices 0 and 1**, not `draw[2]`
