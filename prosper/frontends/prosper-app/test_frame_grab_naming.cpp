@@ -248,6 +248,11 @@ int main() {
               "the path in the log line holds the bytes that capture wrote");
         CHECK(line.find("suffix -2") != std::string::npos,
               "a suffixed capture says so, so a reader need not diff filenames");
+        // "Everything after the first arrow is the path" must not depend on a caller's discretion:
+        // an arrow in the text BEFORE the path would truncate every extracted path on that line.
+        CHECK(frame_grab_logged_path(
+                  frame_grab_write_line("bundle", b.bundle, 0, "detail -> with an arrow")) == b.bundle,
+              "an arrow in the write line's own text cannot displace the path");
         CHECK(frame_grab_write_line("bundle", a.bundle, a.suffix).find("suffix") == std::string::npos,
               "an unsuffixed capture claims no suffix");
         std::filesystem::remove_all(dir, ec); std::filesystem::create_directories(dir, ec);

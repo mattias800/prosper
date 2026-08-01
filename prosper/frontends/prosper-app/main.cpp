@@ -1568,19 +1568,6 @@ int main(int argc, char** argv) {
                 // only — near-zero cost until pressed, so it never distorts the FPS you are observing.
                 if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
                     ev.key.key == SDLK_F9) {
-                    // One capture at a time, so that every capture reports both of its files.
-                    // request_interactive_capture_bundle overwrites an armed-but-not-yet-started
-                    // grab, and a replaced grab produces NO outcome at all — so its reserved
-                    // .prgbundle would sit at zero bytes with nothing in the log explaining it,
-                    // which is precisely the unexplained artifact this change removes. Refusing
-                    // costs one press during the frame a grab is in flight, and says so.
-                    if (prosper::gpu::interactive_capture_bundle_active() ||
-                        (pendingGrabReserved && !pendingGrabScreenshot.empty())) {
-                        std::fprintf(stderr,
-                                     "[grab] F9 ignored: a grab is still in flight; press again once "
-                                     "it reports its files\n");
-                        continue;
-                    }
                     // Claim both output names now, from ONE timestamp, with an exclusive create. Doing
                     // it here rather than at each write is what binds the two artifacts of this
                     // capture together: they are written seconds apart on two different threads, and a
@@ -1607,18 +1594,58 @@ int main(int argc, char** argv) {
                     // the headless/scheduled paths, so the hotkey was pinned to the 2 GiB default with
                     // no way to raise it without editing code — and one 3840x2160 frame of a deferred
                     // renderer exceeds that, which made F9 unusable on 4K UE titles.
-                    prosper::gpu::request_interactive_capture_bundle(grab.bundle, grabBundleMaxMb);
+                    // Supersede and EXPLAIN, rather than refuse. A press that lands before the
+                    // previous arm was promoted replaces it, and a replaced arm never runs and never
+                    // reports — so this frontend is the only thing that can account for the names it
+                    // reserved. Refusing the press instead was considered and rejected: the flag that
+                    // says "a grab is in flight" is cleared only by a guest PRESENT, so a hung title
+                    // would leave F9 dead for the rest of the session — and a hung title is exactly
+                    // when someone reaches for F9.
+                    const std::string replaced =
+                        prosper::gpu::request_interactive_capture_bundle(grab.bundle, grabBundleMaxMb);
                     if (!grab.warning.empty())
                         std::fprintf(stderr, "[grab] %s\n", grab.warning.c_str());
-                    // The in-flight guard above rules out superseding another GRAB's screenshot. A
-                    // pending SCHEDULED shot is a different thing — a configured path this frontend
-                    // never reserved — so it gets its own sentence, claiming nothing about a
-                    // reservation or about a file existing.
-                    if (!pendingGrabScreenshot.empty())
+                    if (!replaced.empty()) {
+                        unsigned dropped = 0;
+                        const bool ours = take_bundle_reservation(replaced, dropped);
+                        std::error_code ec;
+                        // Only our own, and only while still empty: a file with bytes in it belongs
+                        // to whoever wrote them.
+                        const bool removed = ours && std::filesystem::exists(replaced, ec) && !ec &&
+                                             std::filesystem::file_size(replaced, ec) == 0 && !ec &&
+                                             std::filesystem::remove(replaced, ec) && !ec;
                         std::fprintf(stderr,
-                                     "[grab] the pending scheduled screenshot is dropped by this press; "
-                                     "nothing was written to %s\n",
-                                     pendingGrabScreenshot.c_str());
+                                     "[grab] this press replaced an armed capture that had not started; "
+                                     "it will never report. %s: %s\n",
+                                     removed ? "its empty reserved bundle has been removed"
+                                             : (ours ? "its reserved bundle is still on disk"
+                                                     : "its output path was configured, not reserved, "
+                                                       "and was left alone"),
+                                     replaced.c_str());
+                    }
+                    // A pending screenshot is dropped by this press whichever kind it is, but the two
+                    // kinds cannot share a sentence: one is a name this frontend reserved and can
+                    // account for, the other a configured path it never created.
+                    if (!pendingGrabScreenshot.empty()) {
+                        if (pendingGrabReserved) {
+                            std::error_code ec;
+                            const bool removed =
+                                std::filesystem::exists(pendingGrabScreenshot, ec) && !ec &&
+                                std::filesystem::file_size(pendingGrabScreenshot, ec) == 0 && !ec &&
+                                std::filesystem::remove(pendingGrabScreenshot, ec) && !ec;
+                            std::fprintf(stderr,
+                                         "[grab] the previous capture's screenshot was still pending and "
+                                         "is dropped by this press; %s: %s\n",
+                                         removed ? "its empty reserved file has been removed"
+                                                 : "its reserved file is still on disk",
+                                         pendingGrabScreenshot.c_str());
+                        } else {
+                            std::fprintf(stderr,
+                                         "[grab] the pending scheduled screenshot is dropped by this "
+                                         "press; nothing was written to %s\n",
+                                         pendingGrabScreenshot.c_str());
+                        }
+                    }
                     pendingGrabScreenshot = grab.screenshot;
                     pendingGrabGuestPresent = gpu::present_count();
                     pendingGrabSuffix = grab.suffix;
@@ -1940,7 +1967,12 @@ int main(int argc, char** argv) {
                                 "written to it and nothing was removed";
                     } else {
                         std::error_code ec;
-                        if (!std::filesystem::exists(grab.bundle_path, ec) || ec) {
+                        const bool present = std::filesystem::exists(grab.bundle_path, ec);
+                        if (ec) {
+                            // "I could not tell" is not "gone" — an unreadable parent directory
+                            // lands here, and naming the wrong cause is what this logging avoids.
+                            state = "its reserved file could not be checked: " + ec.message();
+                        } else if (!present) {
                             state = "its reserved file is already gone";
                         } else {
                             const uintmax_t bytes = std::filesystem::file_size(grab.bundle_path, ec);
@@ -1951,12 +1983,17 @@ int main(int argc, char** argv) {
                                 // content and is not ours to delete.
                                 state = "its reserved file holds " + std::to_string(bytes) +
                                         " bytes and was left alone";
-                            } else if (std::filesystem::remove(grab.bundle_path, ec) && !ec) {
+                            } else {
                                 // Leaving a zero-byte .prgbundle after saying none was written would
                                 // be the same class of untrue statement this logging exists to avoid.
-                                state = "the empty reservation has been removed";
-                            } else {
-                                state = "the empty reservation could not be removed: " + ec.message();
+                                const bool removed = std::filesystem::remove(grab.bundle_path, ec);
+                                if (removed && !ec) state = "the empty reservation has been removed";
+                                // remove() reports false with NO error when the file was already
+                                // gone — a race with an external deleter. Printing "could not be
+                                // removed: Success" there would assert a failure that did not happen.
+                                else if (!ec)       state = "the empty reservation was already gone";
+                                else                state = "the empty reservation could not be removed: " +
+                                                            ec.message();
                             }
                         }
                     }

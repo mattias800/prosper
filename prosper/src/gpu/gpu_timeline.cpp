@@ -1866,16 +1866,21 @@ bool append_capture_to_frame_bundle(GpuCaptureBundle& bundle, const GpuCaptureFi
 }
 }  // namespace
 
-void request_interactive_capture_bundle(const std::string& path, uint32_t max_mb,
-                                        uint32_t delay_presents) {
+std::string request_interactive_capture_bundle(const std::string& path, uint32_t max_mb,
+                                               uint32_t delay_presents) {
     InteractiveFrameBundle& b = interactive_frame_bundle();
     std::lock_guard<std::mutex> lk(b.mx);
+    // An arm that has not been promoted yet is REPLACED here, and a replaced capture never runs and
+    // never reports an outcome. Report it to the caller under this lock — asking beforehand would
+    // race the render thread promoting it, and the answer would be wrong exactly when it mattered.
+    std::string replaced = std::move(b.armed_path);
     b.armed_path = path;
     b.arm_delay_presents = delay_presents;
     if (max_mb) b.max_unique_bytes = static_cast<uint64_t>(std::clamp<uint32_t>(max_mb, 64u, 3072u)) << 20;
     if (const char* frames = std::getenv("PROSPER_CAPTURE_FRAMES"))
         b.frames_wanted = std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(frames, nullptr, 0)), 1u, 240u);
     g_interactive_frame_active.store(true, std::memory_order_release);
+    return replaced;
 }
 bool interactive_capture_bundle_active() {
     return g_interactive_frame_active.load(std::memory_order_acquire);

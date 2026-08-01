@@ -297,6 +297,11 @@ inline std::string frame_grab_write_line(std::string_view what, const std::strin
     line += " written";
     if (!detail.empty()) { line += " ("; line += detail; line += ")"; }
     if (suffix) line += " [name collision: suffix -" + std::to_string(suffix) + "]";
+    // "Everything after the first arrow is the path" only holds while nothing BEFORE the arrow
+    // contains one. Both callers are safe by construction today; enforce it structurally anyway, so
+    // the invariant does not depend on a future caller having read this comment.
+    for (size_t k = line.find(" -> "); k != std::string::npos; k = line.find(" -> ", k))
+        line.replace(k, 4, " - ");
     line += " -> " + path;
     return line;
 }
