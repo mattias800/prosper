@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <exception>
 
 namespace prosper::frontend {
 namespace {
@@ -193,6 +192,10 @@ void LibraryMedia::shutdown() {
     musicOn_ = false;
     current_.reset();
     outgoing_.reset();
+    // The retained track too: shutdown() runs immediately before a guest boots and LibraryUi outlives
+    // the whole process, so leaving this set would hold a decoded track (up to ~23 MB of PCM) resident
+    // for the entire guest run.
+    recent_.reset();
 
     if (device_) {
         // An upload may still be in flight; its images and staging memory cannot be freed under it.
@@ -233,8 +236,10 @@ void LibraryMedia::worker_main() {
         // title its background and music, nothing more.
         try {
                 load_one(req, bcSupported_, audioRate_, audioChannels_, *res);
-        } catch (const std::exception& e) {
-            fprintf(stderr, "[library] %s: load failed (%s)\n", req.root.c_str(), e.what());
+        } catch (...) {
+            // Catch-all on purpose: anything escaping a thread function is std::terminate, and a bad
+            // asset must never be able to take the launcher down with it.
+            fprintf(stderr, "[library] %s: load failed\n", req.root.c_str());
             *res = LoadResult{};
             res->generation = req.generation;
             res->root = req.root;
@@ -375,6 +380,47 @@ void LibraryMedia::start_load(const std::string& root, uint64_t now_ms) {
     // outgoing asset back to full opacity — a visible flash when the user scrubs. Back-dating makes an
     // interruption continuous by construction, without special-casing which stage it interrupted, and
     // without changing the pure fade function.
+    // Special case first: focus has come back to the very asset that is currently fading OUT. Fading it
+    // out and then in again against itself would dip the picture to black and leave an audible hole,
+    // both for an asset that never left the screen. Instead REVERSE the transition — the same
+    // back-dating trick applied to the fade-in half, so fade_state_at(now_ms) yields new_alpha equal to
+    // the alpha already showing, and the picture simply rises from where it is.
+    //
+    //   want: new_alpha(now) == visible, i.e. (now - inStart) / kFadeInMs == visible
+    //   so:   inStart      = now - visible * kFadeInMs        (and inStart == max(readyMs_, outEnd))
+    //         transitionMs_ = inStart - kFadeOutMs            (so outEnd == inStart)
+    if (transitionActive_ && !outgoingRoot_.empty() && outgoingRoot_ == root &&
+        cache_.find(root) != cache_.end()) {
+        const FadeState s = fade_state_at(transitionMs_, now_ms, incomingReady_, readyMs_);
+        if (s.old_alpha > 0.0f) {
+            const float back = s.old_alpha > 1.0f ? 1.0f : s.old_alpha;
+            if (musicOn_ && outgoing_ && outgoing_->root == root) current_ = std::move(outgoing_);
+            outgoing_.reset();
+            const uint64_t intoFadeIn = static_cast<uint64_t>(back * static_cast<float>(kFadeInMs));
+            const uint64_t inStart = now_ms >= intoFadeIn ? now_ms - intoFadeIn : 0;
+            transitionMs_ = inStart >= kFadeOutMs ? inStart - kFadeOutMs : 0;
+            readyMs_ = transitionMs_ + kFadeOutMs;
+            incomingReady_ = true;
+            transitionActive_ = true;
+            shownRoot_ = root;
+            outgoingRoot_.clear();
+            retire_evicted(lru_touch(lru_, root, kBackgroundCacheCapacity));
+            if (!musicOn_ || current_) return;   // art is resident and the track is in hand
+            LoadRequest req;
+            req.generation = generation_;
+            req.root = root;
+            req.want_music = true;
+            req.want_background = false;
+            {
+                std::lock_guard<std::mutex> lk(reqMutex_);
+                request_ = std::move(req);
+                hasRequest_ = true;
+            }
+            reqCv_.notify_one();
+            return;
+        }
+    }
+
     float visible = 1.0f;
     if (transitionActive_) {
         const FadeState s = fade_state_at(transitionMs_, now_ms, incomingReady_, readyMs_);
@@ -394,11 +440,6 @@ void LibraryMedia::start_load(const std::string& root, uint64_t now_ms) {
     // Returning to a title whose track is still held? Resume it at its own cursor rather than decoding
     // it again and replaying its opening. This is what stops repeated stepping between two titles from
     // sounding like the same short tone over and over.
-    // Returning to the title that is still fading OUT cancels the transition instead of starting a new
-    // one against itself. Without this, arrowing away and straight back within the 200 ms fade-out makes
-    // the same track fade down and then restart from its opening — exactly the repeated-opening artifact
-    // the retained-track mechanism exists to prevent — while its art dips to black and returns without
-    // ever having left the screen.
     bool haveTrack = false;
     if (musicOn_ && outgoing_ && outgoing_->root == root) {
         current_ = std::move(outgoing_);
@@ -803,17 +844,15 @@ void LibraryMedia::update(uint64_t now_ms) {
     // still be displaying the previous title, and a capture taken on that line alone can catch the
     // wrong art. This is the line a screenshot should be synchronized to.
     if (stats_enabled()) {
-        {
-            const Backdrop bd = backdrop();
-            std::string drawn;
-            if (bd.texture) {
-                for (const auto& kv : cache_)
-                    if (kv.second.set == bd.texture) { drawn = kv.first; break; }
-            }
-            if (drawn != lastDrawn_) {
-                lastDrawn_ = drawn;
-                fprintf(stderr, "[library] drawing %s\n", drawn.empty() ? "(nothing)" : drawn.c_str());
-            }
+        const Backdrop bd = backdrop();
+        std::string drawn;
+        if (bd.texture) {
+            for (const auto& kv : cache_)
+                if (kv.second.set == bd.texture) { drawn = kv.first; break; }
+        }
+        if (drawn != lastDrawn_) {
+            lastDrawn_ = drawn;
+            fprintf(stderr, "[library] drawing %s\n", drawn.empty() ? "(nothing)" : drawn.c_str());
         }
     }
 }

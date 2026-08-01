@@ -276,11 +276,20 @@ int main() {
         // where the declared size is honest but the bytes are absent. Without `body + size > end` the
         // extension reads at ext+6 and ext+26 would run past the buffer. The cases above fail earlier,
         // on a missing or short data chunk, so neither demonstrates this one.
+        //
+        // The REASON is what discriminates, and `!ok` alone does not: without the guard these are still
+        // rejected, but by later checks reading memory past the buffer — at 20 the format tag is read
+        // from beyond the end and fails as "not WAVE_FORMAT_EXTENSIBLE", at 40 and 60 the GUID check
+        // fails on whatever bytes happened to follow. Only the guard makes all three stop at the walk,
+        // and there is no sanitizer in CI to catch the over-read otherwise.
         {
             const std::string full = make_at9();
-            for (size_t at : {size_t(20), size_t(40), size_t(60), size_t(72)})
-                CHECK(!parse_at9_riff(full.substr(0, at)).ok,
-                      "a file truncated inside the fmt chunk is rejected, never read past");
+            for (size_t at : {size_t(20), size_t(40), size_t(60)}) {
+                const At9Clip c = parse_at9_riff(full.substr(0, at));
+                CHECK(!c.ok, "a file truncated inside the fmt chunk is rejected");
+                CHECK(std::string(c.reason) == "no fmt chunk",
+                      "and is stopped by the chunk-bounds walk, never read past the buffer");
+            }
         }
     }
 
