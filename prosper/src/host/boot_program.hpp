@@ -7,6 +7,7 @@
 #pragma once
 #include "loader/linker.hpp"   // Program
 #include <string>
+#include <vector>
 #include <functional>
 
 namespace prosper {
@@ -31,6 +32,12 @@ inline constexpr uint64_t BOOT_FMOD       = 0x540000000ull;
 inline constexpr uint64_t BOOT_AKMOTION   = 0x560000000ull; // optional Unity Wwise native plugins
 inline constexpr uint64_t BOOT_AKVORBIS   = 0x580000000ull;
 inline constexpr uint64_t BOOT_AKSOUNDENGINE = 0x5a0000000ull;
+// Base pool for auto-discovered Unity native plugins (see discover_extra_plugin_modules). Placed
+// between libc and the import-stub region: every shipped plugin observed so far is under 8 MiB, so a
+// 64 MiB stride leaves a wide margin, and the last slot ends 128 MiB below BOOT_STUB.
+inline constexpr uint64_t BOOT_PLUGIN_AUTO_BASE  = 0x5d0000000ull;
+inline constexpr uint64_t BOOT_PLUGIN_AUTO_STRIDE = 0x4000000ull;   // 64 MiB
+inline constexpr unsigned BOOT_PLUGIN_AUTO_SLOTS  = 10;
 inline constexpr uint64_t BOOT_STUB     = 0x600000000ull;
 
 // Boot the title rooted at `dump_root` (the app0 directory): link the fixed module set (dropping any
@@ -59,5 +66,23 @@ bool boot_program(const std::string& dump_root, Program& out, std::string* err,
 // already exists or no entry matches (the caller's absence handling then applies as before).
 // Consumers: boot_program's preload loop, hle_file's translate(), and the unit test.
 std::string resolve_host_path_case(const std::string& want);
+
+// Enumerate the title's own Unity native plugins that the fixed preload list does not name (#1609).
+//
+// prosper has no runtime PRX loading (#639), so every native plugin a title P/Invokes must be linked
+// at boot. The preload list above grew one plugin at a time (PSN, PSNCore/PSNCommon, CommonDialog,
+// FMOD, Wwise), which means any title shipping a plugin nobody has hard-coded yet fails its very
+// first P/Invoke with `DllNotFoundException` — and because IL2CPP raises that inside an async state
+// machine, the exception is captured into a Task and never printed, so the title simply stops making
+// progress with no diagnostic at all. Tales of Graces f Remastered (PPSA19991) loses three of the
+// thirty singletons its boot state machine awaits that way and then renders an empty scene forever.
+//
+// `<dump_root>/Media/Plugins/*.prx` is the engine's own plugin directory, so its contents are exactly
+// the set the guest may ask for. Returns the paths of the entries whose basename does not
+// case-insensitively match any of `listed_basenames`, ordered so that the caller (which appends them
+// to a link list whose init functions run in reverse order) initializes them in ascending
+// case-insensitive name order. A missing directory yields an empty vector; never throws.
+std::vector<std::string> discover_extra_plugin_modules(
+    const std::string& dump_root, const std::vector<std::string>& listed_basenames);
 
 } // namespace prosper
