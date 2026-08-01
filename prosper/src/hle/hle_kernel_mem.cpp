@@ -1643,10 +1643,46 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     //     invented-counter event would REGRESS the listener's ctor-seeded last-processed via its
     //     unconditional last:=cnt store (+0x2274143), setting up the fatal +0x229df3e walk (the
     //     #180 residual fault). CONFIDENCE: HIGH (static disassembly + live tag-echo runs).
+    //
+    // What makes a cb "bound" is the EQUEUE, not a nonzero tag. CRI ADX2 (cri_ware_unity.prx, first
+    // seen in Tales of Graces f Remastered PPSA19991) registers its APR id with
+    // sceKernelAddAmprEvent, binds with H896Pt-yB4I(cb, eq, id, tag=0, ...) — the tag argument is a
+    // literal `xor ecx,ecx` at cri+0x11b88f — submits with the two-argument
+    // sceKernelAprSubmitCommandBuffer at cri+0x11b90b, and then blocks in
+    // sceKernelWaitEqueue(eq, &ev, 1, &n, NULL) at cri+0x11ba65 with a NULL timeout, retrying until
+    // sceKernelGetEventId(&ev) equals its id. That wait tests the event IDENT and never the tag, so
+    // zero is a legitimate payload rather than an absent binding. Gating delivery on `bc.tag` made
+    // the submit post nothing and hung the loader thread forever on a read prosper had already
+    // completed. Binding to a real equeue IS the guest asking for completion delivery, so the
+    // equeue — not the tag — is what makes a buffer bound. The unbound rule above is unchanged;
+    // that is the one #180 forbids.
+    //
+    // The surviving `bc.eq` term is defence-in-depth, not load-bearing: a binding recorded with
+    // a1 == 0 gets eq_identity 0, and prosper_eq_post_apr_token already returns early on that, so
+    // dropping the term would produce no observable spurious post. Keep it as a cheap local
+    // statement of intent — do not add a mutation to "prove" it, since no such mutation is
+    // observable.
+    //
+    // "Echoed verbatim" is true only in the id==0 pointer dialect. prosper_eq_post_apr_token
+    // branches on the binding's id: id==0 delivers this exact token, while id!=0 delivers
+    // (ring<<58) | per-(eq,ring) high-water mark, so a zero tag there arrives as a counter value
+    // that merely happens to be 0 on a fresh queue. Harmless for CRI, whose waiter tests only the
+    // ident, but do not read this call as a guarantee that the tag reaches the guest unmodified.
+    //
+    // The 3.20 sibling names the semantics: o67gODLFpls is
+    // sceAmprCommandBufferWriteKernelEventQueueOnCompletion — the tag is the VALUE WRITTEN on
+    // completion, and zero is a legal value to write. (H896Pt-yB4I itself is not in the 3.20
+    // database; prosper still labels it "AprCbSetEventQueue?".)
+    // CONFIDENCE: HIGH (guest disassembly + live boot A/B; firmware DB for the sibling's name).
+    //
+    // Deliberately NOT changed: `fallback_pending` in apr_cb_set_equeue still requires a nonzero
+    // tag. That deferred path exists only for Pathless's unsent PS5 3.20 tail, no title is known to
+    // bind a 3.20 buffer with a zero tag and then never submit it, and firing it without evidence
+    // would post events no guest asked for.
     AprBoundCb bc{};
     bool should_post = false;
     const bool bound = apr_cb_submit_state(a0, &bc, &should_post);
-    const bool tag_echo = bound && bc.tag && bc.eq;
+    const bool tag_echo = bound && bc.eq;
     uint64_t token = tag_echo ? bc.tag : prosper_apr_next_token(ring);
     if (!bound && write_result_outputs) {
         if (a2 > 0xffff) *(uint64_t*)(uintptr_t)a2 = token;

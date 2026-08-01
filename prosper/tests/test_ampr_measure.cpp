@@ -51,6 +51,7 @@ int main() {
     HleFn get_size       = Hle::lookup("tZDDEo2tE5k");
     HleFn get_offset     = Hle::lookup("GnxKOHEawhk");
     HleFn submit         = Hle::lookup("ASoW5WE-UPo");
+    HleFn submit_plain   = Hle::lookup("eE4Szl8sil8");
     HleFn destruct       = Hle::lookup("GuchCTefuZw");
     HleFn add_ampr_event = Hle::lookup("bBfz7kMF2Ho");
     HleFn read_file     = Hle::lookup("vWU-odnS+fU");
@@ -202,7 +203,71 @@ int main() {
                (uint64_t)(uintptr_t)&unbound_out2, 0, 0);
         CHECK(unbound_out1 && unbound_out1 == unbound_out2,
               "reconstructed command buffer is unbound after PS5 3.20 destruction");
+        // #180's rule: an UNBOUND submit hands its invented counter through the out slots and must
+        // post NO event, because an invented token would regress the UE4 listener's ctor-seeded
+        // last-processed counter. Pin it directly — the out-slot check above does not.
+        // Scope note: this pins "an unbound submit posts no event". It does NOT pin the *bound*
+        // predicate that #1666 loosened — the buffer here is genuinely unbound, so this assertion
+        // holds under `bound && bc.tag && bc.eq` and `bound && bc.eq` alike.
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        CHECK(get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
+              "unbound submit posts no completion event (#180 invented-counter rule)");
         delete_eq(replacement_eq, 0, 0, 0, 0, 0);
+
+        // CRI ADX2 (cri_ware_unity.prx, Tales of Graces f Remastered PPSA19991) binds its APR
+        // command buffer with a completion tag of literally ZERO and then blocks on an UNTIMED
+        // sceKernelWaitEqueue. Its read path, from the module's own disassembly:
+        //     0x11b858  sceKernelAddAmprEvent(eq, id, 0)
+        //     0x11b88f  H896Pt-yB4I(cb, eq, id, tag=0, 0, 0)      ; `xor ecx,ecx` -> a3 == 0
+        //     0x11b90b  sceKernelAprSubmitCommandBuffer(cb, 1)    ; two arguments only
+        //     0x11ba65  sceKernelWaitEqueue(eq, &ev, 1, &n, NULL) ; r8d == 0 -> waits forever
+        //               sceKernelGetEventId(&ev) == id ? done : retry
+        // The wait matches on the event IDENT only, never on the tag, so a zero tag is a perfectly
+        // valid binding rather than an absent one. Treating "tag == 0" as "not really bound" makes
+        // the submit post nothing and hangs the guest's loader thread on a read that has already
+        // completed. Binding to a real equeue is the guest asking for completion delivery. Unbound
+        // buffers still post nothing (issue #180's invented-counter regression), asserted above.
+        //
+        // Cover BOTH delivery dialects, because a live PPSA19991 boot uses both on one equeue: of
+        // its 20 observed bindings, 9 pass id 0 and the rest ids 1..5. prosper_eq_post_apr_token
+        // branches on exactly that (hle_kernel_time.cpp): id 0 takes the #210 pointer dialect and
+        // delivers the exact token, while id != 0 takes the #208 counter dialect and delivers
+        // (ring << 58) | per-(eq,ring) high-water mark. So this asserts what is actually
+        // contractual for CRI — the event ARRIVES carrying its own ident — and deliberately does not
+        // assert a verbatim tag in the counter branch, where the delivered data is a counter and any
+        // zero would be an artifact of a fresh queue rather than an echo.
+        // CONFIDENCE: HIGH (guest disassembly + firmware NID database + live boot capture).
+        if (submit_plain && add_ampr_event) {
+            const struct { int64_t id; const char* what; } cri_cases[] = {
+                { 0,      "zero-tag binding delivers its completion event (id 0, pointer dialect)" },
+                { 0x74fe, "zero-tag binding delivers its completion event (id != 0, counter dialect)" },
+            };
+            for (const auto& c : cri_cases) {
+                uint64_t cri_eq = 0;
+                create_eq((uint64_t)(uintptr_t)&cri_eq, 0, 0, 0, 0, 0);
+                add_ampr_event(cri_eq, (uint64_t)c.id, 0, 0, 0, 0);
+                std::array<uint64_t, 8> cri_storage{};
+                const uint64_t cri_cb = (uint64_t)(uintptr_t)cri_storage.data();
+                construct(cri_cb, 0, 0x560, 0, 0, 0);
+                append_equeue(cri_cb, cri_eq, (uint64_t)c.id, /*tag=*/0, 0, 0);
+                CHECK(submit_plain(cri_cb, 1, 0, 0, 0, 0) == 0,
+                      "CRI two-argument submit reports success");
+                KEvent cri_event{};
+                int32_t cri_out = -1;
+                uint32_t cri_timeout = 100000;
+                wait_eq(cri_eq, (uint64_t)(uintptr_t)&cri_event, 1, (uint64_t)(uintptr_t)&cri_out,
+                        (uint64_t)(uintptr_t)&cri_timeout, 0);
+                // `filter` is the load-bearing half of this assertion. KEvent is zero-initialised
+                // and the pointer-dialect case uses id 0, so `ident == c.id` degenerates to 0 == 0
+                // and would hold even if no event ever arrived — vacuous in exactly the branch CRI
+                // uses for 9 of its 20 bindings. EVFILT_AMPR_MODELED (-24) is nonzero and is set by
+                // both apr_post and the id-0 pointer worker, so a zeroed KEvent cannot fake it.
+                CHECK(cri_out == 1 && cri_event.ident == c.id && cri_event.filter == -24, c.what);
+                CHECK(get_count(cri_eq, 0, 0, 0, 0, 0) == 0,
+                      "zero-tag completion is delivered exactly once");
+                delete_eq(cri_eq, 0, 0, 0, 0, 0);
+            }
+        }
     }
 #endif
     if (read_file) {
