@@ -628,14 +628,18 @@ copy path, so a binding-miss run with the same environment is the control for a 
     posted the first way is fully visible on the PR page and invisible to the gate, so the findings
     are right there while the PR reads as unreviewed.
   - **Never gate on `reviewDecision`; it is empty here for TWO independent reasons.** (1) A
-    `COMMENTED` review does not populate it **regardless of who posts** — that is true even for a
-    third-party reviewer, and it is the reason that survives any change to how reviews are authored.
-    (2) Separately, `gh` is normally authenticated **as the PR author**, so `--approve` is not
-    available. Both matter: someone "fixing" the gate by provisioning a second `gh` identity would
-    find `reviewDecision` **still empty** and wrongly conclude this note was wrong. *Provenance:* the
-    identity match was verified directly (`gh api user` against the PR author); `--approve` was
-    deliberately **not executed**, since running it would either fail or register an approval nobody
-    intended. That GitHub rejects self-approval is documented platform behaviour, **not measured here.**
+    `COMMENTED` review does not populate it **regardless of who posts** — true even for a third-party
+    reviewer, and the reason that survives any change to how reviews are authored. (2) Separately,
+    `gh` is normally authenticated **as the PR author**, so `--approve` is not available. Both matter:
+    someone "fixing" the gate by provisioning a second `gh` identity would find `reviewDecision`
+    **still empty** and wrongly conclude this note was wrong.
+    *Provenance, for both halves, because stating it for only one is the asymmetry this page exists to
+    prevent:* **neither** was measured here. What WAS observed is that `reviewDecision` is empty with
+    `COMMENTED` reviews present, and that `gh api user` matches the PR author — consistent with both
+    claims but isolating neither, since every review observed came from the author account. That
+    `COMMENTED` never populates `reviewDecision`, and that GitHub rejects self-approval, are both
+    **documented platform behaviour**. `--approve` was deliberately **not executed**: running it would
+    either fail or register an approval nobody intended.
   - **A rebase detaches every review from head, and the gate cannot see it.** `reviews` stays
     non-empty and still reports `state=COMMENTED`/`APPROVED`, but its `commit_id` points at a SHA no
     longer on the branch. State the consequence precisely: a stale `commit_id` proves the review **no
@@ -647,6 +651,12 @@ copy path, so a binding-miss run with the same environment is the control for a 
     here a rebase makes reviewed content look unreviewed by SHA. Both resolve the same way: verify by
     content, not by SHA. The same applies to CI — re-check bound to the exact current SHA, never to
     the PR number.
+  - **Reviewers: bind your post to head at the write site, rather than relying on the merger to catch
+    a stale one afterwards.** Read `headRefOid` immediately before posting and refuse if it moved:
+    prevention costs one API call, detection costs a round trip and depends on the merger remembering.
+    This is not hypothetical — on #1687 the head moved **twice after the branch was called frozen**,
+    and a reviewer guarding on `headRefOid` correctly refused both times. Posting unconditionally
+    would have left `reviews[]` showing a perfectly healthy row bound to code that had moved on.
 - The orchestrator opens the PR with a self-contained behavioral contract, issue links, evidence, exact tests, risks,
   and known limitations. Wait for all Linux, Windows, and macOS checks before merging.
 - When a game changes from black to visible content, reaches title, reaches gameplay, or materially improves visuals,

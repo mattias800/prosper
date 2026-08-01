@@ -423,10 +423,12 @@ HLE(s_videodec2_query_decoder_memory) {
     // answer that caused it. Report a size the guest can actually decode into, now, while doing so
     // costs nothing and cannot be mistaken for a decoder defect later.
     //
-    // NV12 is the format PS5 video decode delivers (see video_backend.hpp): width * height * 3/2,
-    // rounded up to frame_alignment. The product is computed in 64-bit and cannot overflow for the
-    // int32 inputs the validator admits; an unreasonable request yields an honestly unreasonable
-    // size that the guest's own allocator rejects visibly, which is the behaviour we want.
+    // NV12 is the format PS5 video decode delivers (see video_backend.hpp): a full-resolution luma
+    // plane plus a half-resolution interleaved chroma plane, each chroma dimension rounded UP —
+    // `w*h + 2*ceil(w/2)*ceil(h/2)` — then rounded up to frame_alignment. The exact expression and
+    // why the `*3/2` shorthand is NOT used are below, at the computation. An unreasonable request
+    // yields an honestly unreasonable size that the guest's own allocator rejects visibly, which is
+    // the behaviour we want.
     //
     // Dimensions may legitimately be -1 ("auto"). prosper has no evidence for what a real library
     // reports then, and a level-implied maximum would be invention, so that path keeps the

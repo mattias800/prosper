@@ -220,6 +220,16 @@ int main() {
                     // product rule calls it safe, and both shorthands are 960 bytes short. Pin the
                     // exact NV12 size so a future "simplification" back to a shorthand fails here
                     // rather than silently under-sizing a guest buffer. (Instrument-trap 34.)
+                    //
+                    // DO NOT "tidy" these dimensions to another odd size. The reported value is
+                    // rounded up to frame_alignment (0x100), so a size whose shorthand error is
+                    // smaller than the alignment slack has that error SWALLOWED — the assertion then
+                    // passes against both the exact form and the shorthand it exists to reject, and
+                    // looks exactly as convincing while proving nothing. That is not a rare corner:
+                    // over w,h < 400 there are 60,029 odd-dimension sizes where alignment hides the
+                    // difference (2x3 is the smallest). 1920x1081 works because its 960-byte error
+                    // survives alignment as a 768-byte difference. The discrimination test needed its
+                    // own discrimination check, which is trap 34 applied to itself.
                     Config odd = config;
                     odd.width = 1920; odd.height = 1081;
                     uint64_t o[9] = {72};
