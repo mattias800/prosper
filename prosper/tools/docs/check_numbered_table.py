@@ -47,6 +47,12 @@ TWO CLASSES OF CHECK, deliberately separated:
 
 Validates structure, never content, so neither class can rot as a table grows.
 
+WHAT THIS CANNOT SEE, and a real incident. It validates STRUCTURE. It does not read content, so it
+cannot tell that a row still says what its author meant. On 2026-08-01 a rebase silently reverted an
+entry's TEXT to a version asserting a conclusion its author had already retracted, while the
+numbering stayed perfectly contiguous -- this check would have passed it without a word. A green run
+here means the table is well formed, never that it is true. Diff the region for content too.
+
 KNOWN LIMIT, recorded as a decision rather than a defect. The abutment rule keeps the
 `blank line, prose, orphaned rows` shape -- a real table split -- and that shape is structurally
 identical to two correct ones: a pipe-leading line in the middle of a paragraph below an unrelated
