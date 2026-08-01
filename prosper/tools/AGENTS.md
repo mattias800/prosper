@@ -166,7 +166,10 @@ triaging: two files with the same stem ARE the same capture, and two files with 
 never the same capture, whatever their timestamps say. The optional `-2`, `-3`, … appears only when
 the name was already in use, and it applies to the whole capture rather than to one file. A grab that
 is interrupted leaves its unwritten artifact as a **zero-byte** file: that is a capture that never
-finished, and `gpu_replay` says so in those words rather than reporting a corrupt bundle.
+finished, and `gpu_replay` says so in those words rather than reporting a corrupt bundle. (When the
+app is still running it does better than a placeholder — a superseded or failed capture has its
+reserved file removed and accounted for in the log — so a *missing* sibling is not a corrupt capture
+either. The log distinguishes them.)
 (Before this scheme the name was a per-process counter, `frame_grab_001`, which let a second title
 played in the same directory overwrite the first title's captures, and let an aborted grab's `.bmp`
 sit beside a same-named `.prgbundle` from an earlier boot — a mismatched pair that reads as one frame

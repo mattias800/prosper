@@ -1921,7 +1921,10 @@ int main(int argc, char** argv) {
                 scheduledScreenshotFrame, shown, scheduledScreenshotArmed)) {
             pendingGrabScreenshot = scheduledScreenshotPath;
             pendingGrabGuestPresent = gpu::present_count();
-            pendingGrabSuffix = 0;   // an explicitly configured path, not a claimed frame-grab name
+            // Both halves of "what is pending" are set here: an explicitly configured path is not a
+            // claimed frame-grab name, so it has no suffix and this frontend does not own it.
+            pendingGrabSuffix = 0;
+            pendingGrabReserved = false;
             scheduledScreenshotArmed = true;
             fprintf(stderr,
                     "[grab] scheduled screenshot armed at host frame %llu (guest present %llu)\n",

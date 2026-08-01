@@ -1873,6 +1873,10 @@ std::string request_interactive_capture_bundle(const std::string& path, uint32_t
     // An arm that has not been promoted yet is REPLACED here, and a replaced capture never runs and
     // never reports an outcome. Report it to the caller under this lock — asking beforehand would
     // race the render thread promoting it, and the answer would be wrong exactly when it mattered.
+    //
+    // `path` must not alias b.armed_path, or it would be read after being moved from — the classic
+    // way this pattern breaks. It cannot: InteractiveFrameBundle is file-static with no accessor, so
+    // every caller passes its own storage.
     std::string replaced = std::move(b.armed_path);
     b.armed_path = path;
     b.arm_delay_presents = delay_presents;
@@ -1988,7 +1992,7 @@ void observe_guest_log_for_capture(const char* bytes, size_t size,
     // The marker is a phase gate, not a frame oracle. Skip exactly one completed present so the
     // transition boundary cannot be mistaken for the scene it announced, then use the established
     // F9 whole-frame path to retain every submit and persistent RTT/DS boundary seed.
-    request_interactive_capture_bundle(state.path, state.max_mb, 1);
+    const std::string replaced = request_interactive_capture_bundle(state.path, state.max_mb, 1);
     std::string source_names;
     constexpr const char* names[] = {
         "unknown", "printf", "puts", "putchar", "fputs", "fwrite", "write",
@@ -2002,6 +2006,13 @@ void observe_guest_log_for_capture(const char* bytes, size_t size,
                  "[grab] exact guest-log line matched via %s; whole-frame capture armed after "
                  "one completed present; target path %s\n",
                  source_names.empty() ? "unknown" : source_names.c_str(), state.path.c_str());
+    // This arm may have replaced an interactive one that had not started. That capture never runs and
+    // never reports; whoever reserved its name is the only one who can clean it up, but it must at
+    // least not vanish silently.
+    if (!replaced.empty())
+        std::fprintf(stderr,
+                     "[grab] this arm replaced an armed capture that had not started; it will never "
+                     "report: %s\n", replaced.c_str());
 }
 
 void observe_guest_log_capture_gap() {
@@ -2778,10 +2789,15 @@ void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64
     static std::atomic<bool> scheduled_fired{false};
     if (scheduled.valid && present_count >= scheduled.present &&
         !scheduled_fired.exchange(true, std::memory_order_acq_rel)) {
-        request_interactive_capture_bundle(scheduled.path, scheduled.max_mb);
+        const std::string replaced =
+            request_interactive_capture_bundle(scheduled.path, scheduled.max_mb);
         std::fprintf(stderr,
                      "[grab] scheduled whole-frame capture armed at present %llu; target path %s\n",
                      static_cast<unsigned long long>(present_count), scheduled.path.c_str());
+        if (!replaced.empty())
+            std::fprintf(stderr,
+                         "[grab] this arm replaced an armed capture that had not started; it will "
+                         "never report: %s\n", replaced.c_str());
     }
     interactive_frame_bundle_on_present();
     static const bool requested = [] {

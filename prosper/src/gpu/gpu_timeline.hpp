@@ -273,8 +273,9 @@ void close_gpu_timeline();
 // Returns the path of an arm this call REPLACED, or "" when there was none. A replaced arm had not
 // started capturing yet, so it never runs and never reports an outcome — the caller is the only one
 // who can explain, or clean up, whatever it had already created under that name.
-std::string request_interactive_capture_bundle(const std::string& path, uint32_t max_mb = 0,
-                                               uint32_t delay_presents = 0);
+[[nodiscard]] std::string request_interactive_capture_bundle(const std::string& path,
+                                                             uint32_t max_mb = 0,
+                                                             uint32_t delay_presents = 0);
 bool interactive_capture_bundle_active();
 
 // The outcome of the most recently COMPLETED interactive grab, so a frontend can tell the user what

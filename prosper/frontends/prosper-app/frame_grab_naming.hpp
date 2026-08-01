@@ -33,6 +33,12 @@
 // intended behaviour: it is visibly incomplete and it unambiguously belongs to its own capture,
 // where the old scheme left a file that looked like a matched pair with someone else's.
 //
+// With one qualification, because a reader should not have to discover it: this holds when the app is
+// NOT around to do better. When it is — a grab superseded by another press, or a bundle that failed —
+// the frontend removes the reservation it owns and says so in the log, which is strictly better than
+// a placeholder nobody explains. So a missing sibling is not necessarily an incomplete capture; the
+// log says which happened.
+//
 // No SDL, no Vulkan, no globals: the whole scheme is unit-tested against a real temporary directory
 // and an injected clock (test_frame_grab_naming.cpp).
 
