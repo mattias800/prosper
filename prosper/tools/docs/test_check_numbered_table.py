@@ -76,6 +76,13 @@ run("blank line after the delimiter",
 # TWO breaks in one table. The second lives inside a fragment, not inside a proper table, so a
 # checker that compares each run only against the run immediately above it reports the first and
 # silently misses the second. The file that prompted this check had exactly this shape.
+# N4: a THREE-blank gap. Every other case has a one-line gap, so per-fragment and per-line
+# reporting are indistinguishable across them -- reverting the bound left the suite green while
+# this shape went from 1 problem to 3. That bound is half of what fixed the 202-error explosion.
+run("a multi-line blank gap is one problem, not one per line",
+    "| # | What |\n|---|---|\n| 1 | a |\n\n\n\n| 2 | b |\n",
+    want_problems=True, want_count=1)
+
 run("two blank lines split the same table",
     "| # | What |\n|---|---|\n| 1 | a |\n\n| 2 | b |\n\n| 3 | c |\n",
     want_problems=True, want_count=2, want_lines=[4, 6],
@@ -147,6 +154,10 @@ run("a delimiter-less table far below an unrelated one is not attributed to it",
 
 # N2: the 4-space rule is load-bearing -- reverting it leaves a false positive on an indented code
 # block, and without this case the suite stays green while that happens.
+run("a TAB-indented code block after a table is not a fragment",
+    "| # | a |\n|---|---|\n| 1 | x |\n\n\t| tabbed | code |\n\t| block | here |\n",
+    want_problems=False)
+
 run("a 4-space indented code block after a table is not a fragment",
     "| # | a |\n|---|---|\n| 1 | x |\n\n    | indented | code |\n    | block | here |\n",
     want_problems=False)

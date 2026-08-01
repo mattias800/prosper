@@ -46,6 +46,15 @@ TWO CLASSES OF CHECK, deliberately separated:
       `| Separate | ...` row, which is legitimate content and must not be read as a gap.
 
 Validates structure, never content, so neither class can rot as a table grows.
+
+KNOWN LIMIT, recorded as a decision rather than a defect. The abutment rule keeps the
+`blank line, prose, orphaned rows` shape -- a real table split -- and that shape is structurally
+identical to two correct ones: a pipe-leading line in the middle of a paragraph below an unrelated
+table, and a fence opening immediately after a table. No rule separates them, so this is a choice
+between two errors, not a bug to fix. Abutment is chosen because the shape it keeps is a genuine
+defect while the two it misreads have zero instances across the tracked corpus, and each is bounded
+to a single message rather than one per intervening line. If either starts appearing in real
+documents, narrowing to "gap contains no blank line" trades this the other way at a known cost.
 """
 
 from __future__ import annotations
@@ -113,8 +122,12 @@ def parse_tables(lines: list[str]) -> tuple[list[Table], set[int]]:
             continue
         if fenced:
             continue
-        # 4+ spaces is an indented code block in Markdown, not a table row.
-        if line.startswith("|") or (line[:4].strip() and line.lstrip().startswith("|")):
+        # 4+ columns of indentation is a code block in Markdown, not a table row. Tabs count as
+        # indentation too, so expand them first: a tab-indented pipe block previously read as a
+        # table fragment and drew "Delete the blank line", which would merge a code block into a
+        # table. A wrong message that instructs is worse than one that merely fires.
+        indent = line.expandtabs(4)
+        if line.startswith("|") or (indent[:4].strip() and indent.lstrip().startswith("|")):
             if not run:
                 run_start = i
             run.append(line)
