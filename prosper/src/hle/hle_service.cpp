@@ -232,7 +232,8 @@ std::unordered_map<uint64_t, uint32_t> g_vdec_codecs;
 // bare SCE code — 0x811d0200 covers TWO different conditions here, so "err=0x811d0200" alone cannot tell
 // anyone which. Name the failing field and its observed value, unconditionally but rate-limited: this
 // fires at most a handful of times per boot and is the difference between a one-run diagnosis and a
-// guess. (Tales of Graces f / criMvPly stops exactly here; see #1658.)
+// guess. (Tales of Graces f / criMvPly stopped exactly here, on `compute_queue`, which is the
+// evidence the split below rests on; see #1658.)
 uint64_t vdec_reject(const char* field, uint64_t observed, uint64_t err) {
     // Rate-limit PER FIELD, not globally. One shared counter meant a caller looping on an early
     // condition could burn the whole budget and silence a later, different rejection — including the
@@ -248,7 +249,9 @@ uint64_t vdec_reject(const char* field, uint64_t observed, uint64_t err) {
             field, (unsigned long long)observed, (unsigned long long)err);
     return err;
 }
-uint64_t vdec_validate_config(const VdecConfig* c) {
+// `require_queue` splits the compute-queue requirement between the two callers of this validator.
+// See the long note at the check itself for why the two differ.
+uint64_t vdec_validate_config(const VdecConfig* c, bool require_queue) {
     if (!c) return VDEC_ERR_ARG;
     if (c->size != sizeof(*c)) return vdec_reject("size", c->size, VDEC_ERR_STRUCT);
     if (c->resource != 1) return vdec_reject("resource", c->resource, VDEC_ERR_RESOURCE);
@@ -262,24 +265,30 @@ uint64_t vdec_validate_config(const VdecConfig* c) {
         return vdec_reject("max_width/height",
                            ((uint64_t)(uint32_t)c->max_width << 32) | (uint32_t)c->max_height,
                            VDEC_ERR_DIMS);
-    // This is the condition most likely to reject a caller that queries memory sizes BEFORE it
-    // allocates a compute queue — the natural order for "how much do I need?".
+    // THE SPLIT (#1658). A compute queue is required to CREATE a decoder and is NOT required to ask
+    // how large one would be.
     //
-    // Retained, but the honest state of the evidence is: there is NONE either way. The check arrived
-    // in #1368 (8b37be95) with no comment, no rationale and no test — defensive, not derived. No title
-    // is recorded anywhere in this repo as reaching QueryDecoderMemoryInfo at all; the only live
-    // Videodec2 calls in docs/ are QueryComputeMemoryInfo. An earlier version of this comment claimed
-    // "Sonic Origins' CRI Mana backend passes it" — that was unsupported and is withdrawn.
+    // The check arrived in #1368 (8b37be95) with no comment, no rationale and no test — defensive,
+    // not derived — and applied to both callers. The predecessor comment here predicted exactly how
+    // that would fail ("most likely to reject a caller that queries memory sizes BEFORE it allocates
+    // a compute queue") and pre-registered this split as the evidenced move if a live log ever named
+    // the field. A Tales of Graces f (PPSA19991) boot then named it: 7 calls to
+    // sceVideodec2QueryDecoderMemoryInfo, all 7 rejected on `compute_queue = 0`, zero calls to
+    // sceVideodec2CreateDecoder — so the guest is sizing a decoder it has not built yet, which is
+    // precisely when it cannot hold a queue handle. Everything else in that config validates
+    // (size=0x48, resource=1, AVC High@4.1, 1920x1088, max_dpb=-1 auto, input_depth=4).
     //
-    // So this is retained on the weaker ground that removing an unexplained validation is also a
-    // guess, and a rejection is at least visible. Note it does NOT protect a size contract:
-    // s_videodec2_query_decoder_memory ignores compute_queue entirely and writes fixed VDEC_MIN_MEMORY
-    // constants, so rejecting only fails earlier than succeeding would.
+    // Rejecting the sizing query also protected no size contract: s_videodec2_query_decoder_memory
+    // ignores compute_queue entirely and writes fixed VDEC_MIN_MEMORY constants, so the rejection
+    // only failed EARLIER than succeeding would have.
     //
-    // If a live log names this field, the evidenced narrow move is a SPLIT — keep the requirement on
-    // CreateDecoder, which genuinely needs a queue, and drop it from the pure sizing query — rather
-    // than a blanket relaxation. CONFIDENCE: LOW that requiring it here is right.
-    if (!c->compute_queue) return vdec_reject("compute_queue", c->compute_queue, VDEC_ERR_CONFIG);
+    // The requirement stays on CreateDecoder, which genuinely needs a queue to build a decoder on,
+    // and which is where a caller that truly has none must still fail visibly rather than receive an
+    // invented handle. CONFIDENCE: HIGH that the sizing query must not require it (live title
+    // evidence, and the query cannot use the field). CONFIDENCE: MED that CreateDecoder must — no
+    // title has reached it, so that half remains the #1368 default, deliberately kept fail-visible.
+    if (require_queue && !c->compute_queue)
+        return vdec_reject("compute_queue", c->compute_queue, VDEC_ERR_CONFIG);
     return 0;
 }
 void vdec_no_picture(VdecFrame* frame, VdecOutput* out, uint32_t codec) {
@@ -328,7 +337,9 @@ HLE(s_videodec2_query_decoder_memory) {
     auto* config = (const VdecConfig*)PW(a0); auto* info = (VdecMemory*)PW(a1);
     if (!config || !info) return VDEC_ERR_ARG;
     if (info->size != sizeof(*info)) return VDEC_ERR_STRUCT;
-    uint64_t valid = vdec_validate_config(config); if (valid) return valid;
+    // Pure sizing query: no compute queue required (#1658). The sizes below are the same constants
+    // s_videodec2_create_decoder accepts, so this success is one the create path can honour.
+    uint64_t valid = vdec_validate_config(config, /*require_queue=*/false); if (valid) return valid;
     info->cpu_size = info->gpu_size = info->shared_size = info->max_frame_size = VDEC_MIN_MEMORY;
     info->cpu = info->gpu = info->shared = 0;
     info->frame_alignment = 0x100; info->reserved = 0;
@@ -340,7 +351,9 @@ HLE(s_videodec2_create_decoder) {
     auto* out = (uint64_t*)PW(a2);
     if (!config || !memory || !out) return VDEC_ERR_ARG;
     if (memory->size != sizeof(*memory)) return VDEC_ERR_STRUCT;
-    uint64_t valid = vdec_validate_config(config); if (valid) return valid;
+    // Building a decoder DOES need a queue to build it on, and a caller that reaches here without one
+    // must fail visibly rather than be handed a decoder handle backed by no queue (#1658).
+    uint64_t valid = vdec_validate_config(config, /*require_queue=*/true); if (valid) return valid;
     if (memory->cpu_size < VDEC_MIN_MEMORY || memory->gpu_size < VDEC_MIN_MEMORY ||
         memory->shared_size < VDEC_MIN_MEMORY || memory->max_frame_size < VDEC_MIN_MEMORY)
         return VDEC_ERR_MEMORY_SIZE;

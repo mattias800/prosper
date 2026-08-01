@@ -249,15 +249,44 @@ int main() {
                 CHECK(avc_picture_info((uint64_t)(uintptr_t)pinfo_bad, 0, 0, 0, 0, 0) == 0x811d0101ull,
                       "#1658: an unexpected AVC struct size is rejected, not assumed compatible");
 
-                // The live Tales blocker: QueryDecoderMemoryInfo returns 0x811d0200 for a config with
-                // no compute queue. Pin that it is still rejected (the check is deliberately retained,
-                // not relaxed on a hunch) — the fix is that it now names the field it rejected.
+                // #1658 THE SPLIT. A compute queue is required to CREATE a decoder and is not
+                // required to ask how large one would be. Tales of Graces f (PPSA19991) called
+                // QueryDecoderMemoryInfo 7 times with `compute_queue = 0` and no CreateDecoder call
+                // at all — it was sizing a decoder before building one, which is exactly when it can
+                // hold no queue handle. Both directions are asserted, because each half fails to a
+                // different wrong implementation: requiring the queue everywhere (the #1368 state)
+                // breaks the first, and dropping the check everywhere breaks the second.
                 Config no_queue = config;
                 no_queue.queue = 0;
                 uint64_t probe_memory[9] = {72};
                 CHECK(query_decoder((uint64_t)(uintptr_t)&no_queue,
-                                    (uint64_t)(uintptr_t)probe_memory, 0, 0, 0, 0) == 0x811d0200ull,
-                      "#1658: a decoder config with no compute queue is rejected with VDEC_ERR_CONFIG");
+                                    (uint64_t)(uintptr_t)probe_memory, 0, 0, 0, 0) == 0,
+                      "#1658: the pure sizing query does not require a compute queue");
+                // The success must be one the create path can honour, not merely a zero return: the
+                // queried sizes have to be the sizes CreateDecoder accepts, or the guest allocates to
+                // a contract nothing downstream keeps.
+                CHECK(probe_memory[1] == (64ull << 10) && probe_memory[3] == (64ull << 10) &&
+                          probe_memory[5] == (64ull << 10) && probe_memory[7] == (64ull << 10),
+                      "#1658: a queueless sizing query still writes every size requirement");
+                probe_memory[2] = (uint64_t)(uintptr_t)memory[0];
+                probe_memory[4] = (uint64_t)(uintptr_t)memory[1];
+                probe_memory[6] = (uint64_t)(uintptr_t)memory[2];
+                uint64_t queueless_decoder = 0xDEAD;
+                CHECK(create((uint64_t)(uintptr_t)&no_queue, (uint64_t)(uintptr_t)probe_memory,
+                             (uint64_t)(uintptr_t)&queueless_decoder, 0, 0, 0) == 0x811d0200ull &&
+                          queueless_decoder == 0xDEAD,
+                      "#1658: CreateDecoder still rejects a queueless config instead of inventing "
+                      "a decoder handle");
+                // ...and the same memory sizing, with a real queue, does build a decoder — so the
+                // rejection above is about the queue and not about the sizes the query handed back.
+                Config with_queue = no_queue;
+                with_queue.queue = compute_queue;
+                uint64_t sized_decoder = 0;
+                CHECK(create((uint64_t)(uintptr_t)&with_queue, (uint64_t)(uintptr_t)probe_memory,
+                             (uint64_t)(uintptr_t)&sized_decoder, 0, 0, 0) == 0 && sized_decoder != 0,
+                      "#1658: the sizes returned by the queueless query are honoured by CreateDecoder");
+                if (sized_decoder) CHECK(destroy(sized_decoder, 0, 0, 0, 0, 0) == 0,
+                                         "#1658: the queried-size decoder tears down cleanly");
             }
         }
     }
