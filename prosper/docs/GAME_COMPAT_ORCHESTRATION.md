@@ -50,9 +50,13 @@ session. Prefer breadth when a hard lane stalls — overall library progress mat
 
 ### The instrument-not-the-subject list — read this before believing any surprising measurement
 
-**Twenty phantom defects came from the measuring apparatus, not the subject** (eleven in one session on
-2026-07-31, nine more on 2026-08-01). Several cost hours; one cost two sessions. This is the single
-highest-value page in this document.
+**Every entry below is a phantom defect that came from the measuring apparatus, not the subject.**
+Several cost hours; one cost two sessions. This is the single highest-value page in this document.
+
+*Maintenance:* **append, never renumber** — an existing number may already be cited from an issue or a
+commit message. Deliberately no total is stated here: a restated count goes stale the moment a lane
+appends, and it already had (the header read "Fourteen" against a 17-row table). If you need the
+count, read the last row's number.
 
 | # | Instrument | How it lied |
 |---|---|---|
@@ -77,6 +81,8 @@ highest-value page in this document.
 | 18 | `VAR=1 $unquoted_var cmd` | The shell expands `$unquoted_var` **after** it has decided which word is the command, so an expansion like `PROSPER_NO_PLUGIN_AUTOLINK=1` becomes the **command name**, not an assignment. The arm never runs, exits 127, and — with stdout redirected to a per-arm log — leaves an empty file that reads exactly like a legitimate "no output" result. #1609's founding 14,666-vs-18,167 "20% regression" came from an A/B whose OFF arm had never executed. Build env into the command directly, or use `env VAR=1 cmd`. |
 | 19 | `$HOME` read as private scratch | Every lane on this box shares one `$HOME` (410 files at the time of writing). Generic scratch names — `pr-body.md`, `ab-result.md`, `app.log`, `apr.log` — **already collide across lanes**. Writing one destroys another agent's work in flight, and reading one silently answers your question with someone else's data. Title-scope every scratch file (`tales-pr-body.md`, `tales-rate-*.log`). The tell that saved it here: the Write tool **refused to overwrite a file it had not read**. A tool declining to clobber is a safety net, not an obstacle — an agent that "fixes" it by deleting the file and retrying destroys the thing the guard was protecting. |
 | 20 | An **empty CI rollup** read as "queued" | GitHub does **not run checks on a conflicting branch at all**, so a PR whose base has moved reports `pass=0 fail=0 pending=0` with `mergeStateStatus=DIRTY` — permanently, until it is rebased. That is byte-identical to the "checks have not registered yet" state, and #1656 sat in it while master moved twice. Same shape as #18's empty log: **an absent signal mimicking a pending one**. Read `mergeable`/`mergeStateStatus` before concluding anything from a check count, and never wait on zeros. |
+| 21 | The **same draw census, now read without the resident *content*** — trap 14 firing a second time, on the lane that recorded it | #1641 spent a session treating "~23 draws/frame is implausibly few for a 4K UE4 title" as the anomaly. Decoding the title's own asset reads against its pak index showed it loads **exactly one of the 481 maps** in the container — `L_GameloftSplash.umap`, **7,870 bytes** — and never opens `L_Main` or `L_StartMap`. 23 draws is a **complete and correct** deferred frame over a splash world. Worse, the premise was invalid in *both* directions: `L_Main.uexp` is **616 bytes**, so this title's front end is UMG/Slate and a *working* title screen would also decode few 3D draws. Nothing was ever missing. |
+| 22 | A **runtime `eboot+0x…` offset** | Several diagnostics subtract the literal `0x400000000` while the eboot maps at `BOOT_EBOOT = 0x410000000`, so the printed offset is **`0x10000000` too high** — wrong but entirely plausible, and every downstream `edis.py`/`xref.py`/`PROSPER_BP` lookup then fails in a way that looks like a code problem. `boot_trace.cpp:97` uses the right constant, so two conventions coexist under one label. Filed as **#1659**. Tell: an `eboot+0x1…` offset **past the module image size** is a labelling artifact, not a wild pointer. |
 
 **Working rules that follow:**
 
@@ -125,6 +131,17 @@ highest-value page in this document.
   printed *every* occurrence. That read turned #1606's "dozens per second" into 18 and 21 events for two
   entire runs.
 
+- **Before concluding that geometry is missing, establish what content is actually resident.** A draw
+  count describes the frame; it says nothing about whether the world has anything in it. For a
+  UE4/pak title this is one offline command against a log you already have —
+  `tools/re/pak_index.py GAME.pak --log run.log --distinct` resolves the `[apr] read-submit` byte
+  offsets to asset names, so "which maps/blueprints/widgets did the guest load, and where did
+  loading stop?" is answered with no boot and no GPU. Run it *first*. On #1641 it dissolved a
+  session's worth of GPU investigation in one pass.
+- **A trap you have already recorded is the one most likely to catch you.** Trap 15 is trap 14, hit
+  by the lane that wrote trap 14 down, because the rule had been internalised as "check the render
+  *phase*" when the general form is "check the *denominator* — phase, resident content, and engine
+  architecture — before treating a low count as a defect."
 - Prefer experiments that **detect their own invalidity** — e.g. render two adjacent operations and assert both
   return the same resolution, so a surface switch invalidates the comparison instead of producing a phantom.
 - **Open the image.** Believe neither a metric win nor a metric failure without looking. A diagnostic clear can
@@ -325,6 +342,31 @@ Safe to overlap in normal circumstances:
 - short deterministic correctness replays where timing is irrelevant;
 - game-list or no-game frontend tests that only render light ImGui content;
 - builds and non-Vulkan tests.
+
+**Omitting `PROSPER_RENDER` does NOT make a run GPU-free.** This has been read as "no GPU" in
+briefs and in lane planning, and it is wrong. `tools/boot_trace/boot_trace.cpp:285` gates only the
+**live renderer** on `PROSPER_RENDER`; a few lines earlier, `:277` unconditionally calls
+`prosper::frontend::register_live_compute()`, which executes the title's compute dispatches through
+Vulkan. A "CPU-only" `boot_trace` run of PPSA19244 executed **~135,000 dispatches** over 310 s — a
+real, sustained GPU consumer that any peer measuring frame time would have felt.
+
+The genuinely Vulkan-free path is **`PROSPER_NO_COMPUTE=1`**, which selects the progression-only
+no-op backend at `boot_trace.cpp:270-276` instead. It retains semantic dispatches and mutates no
+guest GPU resources, so it is sound for CPU-side questions — asset/file I/O, pad, HLE call counts,
+guest backtraces, boot progression — but **not** for anything whose result depends on compute
+output. Validate it per investigation rather than assuming: on PPSA19244 the `NO_COMPUTE` arm was
+confirmed to reach the same steady state (same ~23 draws/submit, same asset set, same stall) as the
+compute-enabled arm before any conclusion was drawn from it.
+
+So the honest classification is:
+
+| run | Vulkan? |
+|---|---|
+| `PROSPER_RENDER=1` | yes — renderer **and** compute |
+| no `PROSPER_RENDER` | **yes — compute still runs** |
+| no `PROSPER_RENDER` + `PROSPER_NO_COMPUTE=1` | no |
+| `gpu_replay`, `screenshot`, `prosper-app` | yes |
+| `gpu_timeline`, `self_dump`, `shader_histo`, `tools/re/*`, `tools/il2cpp/*` | no |
 
 Ask the orchestrator for an exclusive lease when:
 
