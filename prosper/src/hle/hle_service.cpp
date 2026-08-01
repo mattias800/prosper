@@ -226,8 +226,8 @@ static_assert(sizeof(VdecConfig) == 72 && sizeof(VdecMemory) == 72);
 static_assert(sizeof(VdecInput) == 48 && sizeof(VdecFrame) == 32 && sizeof(VdecOutput) == 56);
 // LIVE CONFIRMATION of the two structs above, from the first title to reach the decoder lifecycle
 // (Tales of Graces f Remastered PPSA19991, criMvPly, PROSPER_SVCLOG; see #1658). These were written
-// in #1368 without title evidence; a real guest now writes values that are individually meaningful
-// at every offset, which is much stronger than a matching size:
+// in #1368 without title evidence; a real guest now writes values that are meaningful at nearly
+// every offset, which is much stronger than a matching size:
 //
 //   VdecConfig  +0x00 size=0x48  +0x08 resource=1     +0x0c codec=1 (AVC)
 //               +0x10 profile=100 (High)              +0x14 max_level=41 (4.1)
@@ -237,11 +237,21 @@ static_assert(sizeof(VdecInput) == 48 && sizeof(VdecFrame) == 32 && sizeof(VdecO
 //   VdecMemory  +0x00 size=0x48, then the cpu_size/cpu/gpu_size/gpu/shared_size/shared/max_frame_size
 //               order above, each size holding exactly the value this file reported to the guest.
 //
-// A wrong field order could not produce a coherent AVC High@4.1 1080p configuration at every slot,
-// so CONFIDENCE: HIGH on both layouts now. VdecInput's first six fields are likewise confirmed
-// (size=0x30, data, data_size, pts=-1, dts=-1) and VdecFrame's first three (size=0x20, data,
-// data_size). Only the SIZE of VdecOutput is confirmed (0x38) — its interior is written by us, not
-// the guest, and the AVC picture-info form's layout remains open (#1658).
+// Most of those pairings are FORCED, not merely consistent, which is what makes this evidence and
+// not a coincidence: swap profile/max_level and you get profile=41 (not a valid H.264 profile_idc)
+// with level=100 (not a valid level_idc); swap max_dpb/input_depth and input_depth is negative;
+// swapping width/height would make the movie portrait 1088x1920.
+//
+// One pair is NOT discriminated and is called out rather than glossed: `resource` and `codec` are
+// BOTH 1 in this title, so this evidence cannot tell their order apart. It rests on #1368 there, and
+// a title using a non-AVC codec or a different resource selector would settle it in one line of log.
+// So: CONFIDENCE: HIGH on VdecConfig's layout except the resource/codec pair, which stays MED.
+//
+// VdecMemory is confirmed by value rather than by plausibility — the guest echoed back the exact
+// sizes this file had just written into it, at the offsets it was written to. VdecInput's first six
+// fields are likewise confirmed (size=0x30, data, data_size, pts=-1, dts=-1) and VdecFrame's first
+// three (size=0x20, data, data_size). Only the SIZE of VdecOutput is confirmed (0x38) — its interior
+// is written by us, not the guest, and the AVC picture-info form's layout remains open (#1658).
 //
 // One naming caveat, deliberately not "fixed": VdecInput's last field, named `attached` here,
 // carried a clean 0,1,2,...  sequence across consecutive access units rather than a flag or a
