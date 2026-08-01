@@ -146,6 +146,12 @@ namespace {
 // ([rbp-0x30], [rbp-0xc], and two rip-relative byte flags), never eax. The exact constant is
 // therefore unobservable to the only title that imports the library.
 // ---------------------------------------------------------------------------------------------
+//
+// The low byte of each is the FREEBSD errno, which is the PS5 kernel's, NOT this Linux host's. They
+// differ where it matters: EDEADLK is 11 on FreeBSD and 35 on Linux, EAGAIN 35 and 11 respectively —
+// exactly transposed, so copying them from the ambient platform's <errno.h> yields a plausible
+// constant that means something else. #1612 tracks existing instances of that mistake; these are
+// written from the FreeBSD values deliberately and must not be "corrected" against the host header.
 constexpr uint64_t kUltOk             = 0ull;
 constexpr uint64_t kUltErrPerm        = 0x80020001ull;   // EPERM   — unlock by a non-owner
 constexpr uint64_t kUltErrSrch        = 0x80020003ull;   // ESRCH   — stale / destroyed / uncreated
