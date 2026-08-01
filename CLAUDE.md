@@ -368,10 +368,20 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   - **This one needs an explicit check, because the harness fights it.** Several agents run here with a
     default that appends a `Claude-Session: https://claude.ai/code/session_…` trailer to every commit
     message; this rule overrides that default, but the default is silent and re-applies on every commit,
-    so following the rule by intention alone does not work. Measured on 2026-08-01: **29 of the last 100
-    commits on `master`** carry one. Before pushing, run
-    `git log origin/master..HEAD --format=%B | grep -c '^Claude-Session:'` and expect `0` — and note
-    `grep -c` exits 1 on zero matches, so do not put it in an `&&` chain. Keep `Co-Authored-By:`.
+    so following the rule by intention alone does not work. Measured per-commit on 2026-08-01:
+    **29 of the last 100 commits on `master`** carry one.
+    ```bash
+    # Gate before pushing — answers "any?", expect 0. It counts LINES, not commits: a squash merge
+    # can carry the trailer more than once, which is why the same command over that 100-commit
+    # window returns 63 and not the 29 above. As a zero-gate that is exactly right; do not read it
+    # as a commit count. `grep -c` exits 1 on zero matches, so never put it in an `&&` chain.
+    git log origin/master..HEAD --format=%B | grep -c '^Claude-Session:'
+    ```
+    Keep `Co-Authored-By:`. **If the count is non-zero, amending is not enough** — the trailer is on
+    commits you already made and the harness will re-add it to the fixup. Rewrite the whole branch:
+    `git checkout -b <slug>-clean <base>`, then for each commit `git cherry-pick -n <sha>` followed by
+    `git commit -F <message-with-the-line-stripped>`; verify with `git diff <old-head> HEAD` over the
+    paths you touched (expect empty), then `git push --force-with-lease`.
 - **Never publish the developer machine's local paths.** This repository is public. An absolute path
   leaks the account name and the private directory layout of someone's computer, and it is never the
   information a reader needs — the *shape* of the command is. So keep absolute host paths out of commit

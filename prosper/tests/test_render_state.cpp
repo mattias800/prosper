@@ -784,19 +784,45 @@ int main() {
               "counter records every occurrence rather than the printed lines");
 
         // The counter is per-mode, not a single total: a report for one value must not advance
-        // another's count, or a per-title census cannot attribute exposure to a mode.
+        // another's count, or a per-title census cannot attribute exposure to a mode. The second
+        // clause is what makes this discriminating — a single shared counter would still satisfy
+        // the mode-2 delta on its own — so keep the pair together if this is ever edited.
+        //
+        // All four unmodeled values are exercised. The predicate is exclusion-based, so 4 and 5 are
+        // covered by construction, but the block this replaced exercised 2 and 5 and it costs one
+        // loop to keep every value that reaches this path under test rather than reasoned about.
         const uint64_t before2 = unmodeled_cb_color_mode_count(2u);
-        RenderState eliminate_fast_clear = absent;
-        eliminate_fast_clear.has_cb_color_control = true;
-        eliminate_fast_clear.cb_color_control =
-            P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        const uint64_t before4 = unmodeled_cb_color_mode_count(4u);
+        const uint64_t before5 = unmodeled_cb_color_mode_count(5u);
         (void)capture_stderr([&] {
-            (void)resolve_pipeline_state(eliminate_fast_clear);
-            (void)resolve_pipeline_state(eliminate_fast_clear);
+            for (uint32_t mode : {P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR, 4u, 5u}) {
+                RenderState unmodeled = absent;
+                unmodeled.has_cb_color_control = true;
+                unmodeled.cb_color_control = mode << P::CB_COLOR_CONTROL_MODE_SHIFT;
+                (void)resolve_pipeline_state(unmodeled);
+                (void)resolve_pipeline_state(unmodeled);
+            }
         });
         CHECK(unmodeled_cb_color_mode_count(2u) - before2 == 2u &&
+                  unmodeled_cb_color_mode_count(4u) - before4 == 2u &&
+                  unmodeled_cb_color_mode_count(5u) - before5 == 2u &&
                   unmodeled_cb_color_mode_count(7u) == 5u,
               "each unmodeled mode counts independently of the others");
+
+        // The SCHEDULE must be per-mode too, not just the totals — otherwise one mode's traffic
+        // moves another's print points and a busy title silences a rare mode entirely. Mode 7 sat at
+        // 5; three more resolves reach 8 and must print exactly once. Six unmodeled resolves for
+        // other modes happened in between, so a single shared schedule counter would be at 14 here
+        // and print nothing. That is the arm this assertion exists for: without it, a shared
+        // schedule counter passes the whole block, because mode 7 is resolved first and its early
+        // ordinals coincide with the global ones.
+        const std::string mode7_resumed = capture_stderr([&] {
+            for (int i = 0; i < 3; ++i) (void)resolve_pipeline_state(unsupported7);
+        });
+        CHECK(occurrence_count(mode7_resumed, "count=8)") == 1u &&
+                  occurrence_count(mode7_resumed, "MODE=7 ") == 1u &&
+                  unmodeled_cb_color_mode_count(7u) == 8u,
+              "the power-of-two schedule is per-mode, not shared across modes");
 
         // The three modeled modes must never reach the report — a false positive here would make a
         // per-title census unusable, since NORMAL and DISABLE are the overwhelming majority.
@@ -814,7 +840,12 @@ int main() {
                 (void)resolve_pipeline_state(modeled);
             }
         });
-        CHECK(modeled_diagnostics.find("is an unmodeled") == std::string::npos &&
+        // The four counter deltas are the real contract here: they are text-independent, so they
+        // cannot go vacuous. The string clause is a second look at the same fact and deliberately
+        // anchors on "CB_COLOR_CONTROL.MODE=", which the emitter cannot drop without also failing
+        // the schedule assertion above — a rewording that silenced this clause alone would be
+        // caught there rather than passing quietly.
+        CHECK(modeled_diagnostics.find("CB_COLOR_CONTROL.MODE=") == std::string::npos &&
                   unmodeled_cb_color_mode_count(0u) == before0 &&
                   unmodeled_cb_color_mode_count(1u) == before1 &&
                   unmodeled_cb_color_mode_count(3u) == before3 &&

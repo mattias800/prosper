@@ -52,9 +52,11 @@ int32_t scale_scissor_boundary(int32_t value, float scale, bool lower) {
 // NORMAL blends the bound pixel shader's color export into the target. prosper models three of the
 // other values as their own operation: DISABLE suppresses color writes, RESOLVE becomes cb_resolve,
 // and DCC_DECOMPRESS keeps the AGC helper-program handling in gpu_execute.hpp. Every REMAINING
-// value of the 3-bit field — ELIMINATE_FAST_CLEAR(2), and 4/5/7 which no title here exercises — is
-// a color-block metadata/decompression operation that hardware performs INSTEAD of shading, and
-// prosper still runs as an ordinary color draw. That gap is #1588.
+// value of the 3-bit field is reported here. ELIMINATE_FAST_CLEAR(2) is a color-block metadata
+// operation that hardware performs INSTEAD of shading and prosper still runs as an ordinary color
+// draw — that gap is #1588. Values 4, 5 and 7 are grouped with it because they are simply "not one
+// of the four prosper models", NOT because their operation is known: 4 and 5 are decompress modes
+// in the published enum, 7 is not defined there, and no title here exercises any of them.
 bool cb_mode_is_unmodeled_metadata_operation(uint32_t mode) {
     return mode != P::CB_COLOR_CONTROL_MODE_DISABLE &&
            mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
@@ -71,10 +73,13 @@ void report_unmodeled_cb_color_mode(uint32_t mode) {
     // one line per distinct value and "once" was indistinguishable from "hundreds of thousands".
     // #1588 therefore had to be sized from a separate PROSPER_COLORSTATETRACE run — the same
     // under-reporting recorded as instruments #9 and #13 in docs/GAME_COMPAT_ORCHESTRATION.md.
-    // Print at powers of two so the volume stays bounded on a title that does this every frame,
-    // and carry the running count in EVERY line so a printed line is an exact count at print time
-    // rather than an unreadable cap. The exact total is readable via
-    // unmodeled_cb_color_mode_count(), which is what makes per-title exposure measurable for #1706.
+    // Print at powers of two so the volume stays bounded on a title that does this every frame, and
+    // carry the count in EVERY line, so a printed number is that occurrence's exact ordinal rather
+    // than an unreadable cap. It is NOT the total: the highest ordinal printed is a lower bound on
+    // it, and because draws realize on parallel workers the lines can also arrive out of order. Use
+    // unmodeled_cb_color_mode_count() for the total — that is what makes per-title exposure
+    // measurable for #1706. The atomic pre-increment gives every caller a distinct value, so no
+    // power-of-two line is duplicated or lost when threads race here.
     if ((count & (count - 1u)) == 0u)
         fprintf(stderr, "[gpu] resolve_pipeline_state: CB_COLOR_CONTROL.MODE=%u is an unmodeled "
                         "color-block metadata operation -> still executed as an ordinary color "

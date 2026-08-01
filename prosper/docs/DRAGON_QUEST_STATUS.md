@@ -263,9 +263,15 @@ Each submit contains **exactly two `mode=2` draws** — draw-scoped census `mode
 
 `MODE=2` is `CB_ELIMINATE_FAST_CLEAR`, a colour-block metadata operation. `render_state.cpp` models
 DISABLE(0), NORMAL(1), RESOLVE(3) and DCC_DECOMPRESS(6) and lets every other mode **fall through to an
-ordinary draw** after a once-per-mode warning (`[gpu] resolve_pipeline_state: unsupported
-CB_COLOR_CONTROL.MODE=2 -> ordinary draw fallback`, present in the session log). The only downstream
-consumer of `cb_color_mode` is a diagnostic print, so nothing rescues it later.
+ordinary draw**. The only downstream consumer of `cb_color_mode` is a diagnostic print, so nothing
+rescues it later.
+
+> **The log line quoted here is historical.** At the time of this investigation the warning read
+> `[gpu] resolve_pipeline_state: unsupported CB_COLOR_CONTROL.MODE=2 -> ordinary draw fallback` and
+> was deduped once per mode value. **That string no longer exists in the tree** — grepping a fresh
+> run's log for it finds nothing. The current report names the mode, says it is still executed as an
+> ordinary colour draw, and carries a running count; the exact per-mode total is available from
+> `unmodeled_cb_color_mode_count()`. The *behaviour* described above is unchanged.
 
 The draws carry hardware's decompress signature, which is why the fall-through is destructive:
 
