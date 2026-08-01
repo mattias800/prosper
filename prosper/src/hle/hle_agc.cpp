@@ -1827,17 +1827,26 @@ static uint64_t patch_set_num_registers(uint64_t cmd_addr, uint64_t num, uint32_
                                         const char* who) {
     auto* cmd = (uint32_t*)(uintptr_t)cmd_addr; if (!cmd) return 0;
     // These NIDs previously reached prosper_on_unimpl and touched nothing, so this is a NEW guest
-    // dereference on a path that used to be inert. Probe the packet header before reading it: a
-    // caller passing a freed or never-built packet must not take the host down (the sibling
-    // patchers predate this guard; see the follow-up issue).
-    if (!gpu::guest_readable(cmd_addr, 2 * sizeof(uint32_t))) {
+    // dereference AND a new guest STORE on a path that used to be inert. The probe must therefore be
+    // the WRITE predicate: guest_readable would pass a read-only mapping (on Linux/macOS it probes
+    // by having the kernel read the byte, and on Windows it explicitly accepts PAGE_READONLY /
+    // PAGE_WRITECOPY / PAGE_EXECUTE_READ), and the store below would then fault on a page the probe
+    // just called fine — the module's own .text/.rodata are large read-only mappings in this same
+    // address space. guest_writable covers the freed/unmapped case as well.
+    //
+    // COST CAVEAT, do not copy this call verbatim onto a hot path: guest_writable is UNCACHED, and
+    // on Linux it fopen()s and parses /proc/self/maps on every call — unlike guest_readable, which
+    // has a thread-local range cache. That is harmless here because no measured title calls these
+    // NIDs at all, but the sibling patchers (#1650) run per draw on Blue Prince, and tightening
+    // those needs a cached predicate rather than this one.
+    if (!gpu::guest_writable(cmd_addr, 2 * sizeof(uint32_t))) {
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 8)
-            fprintf(stderr, "[agc] %s: packet 0x%llx unmapped — patch skipped\n", who,
+            fprintf(stderr, "[agc] %s: packet 0x%llx not writable — patch skipped\n", who,
                     (unsigned long long)cmd_addr);
         return 0;
     }
-    // Report BEFORE the sub-op check, and report the refusal too: an investigation into a wrong
+    // Report before the early return, and report the refusal too: an investigation into a wrong
     // register count most wants the case where the patch did not land.
     static const bool regbloat = getenv("PROSPER_REGBLOAT") != nullptr;
     const bool ok = patch_check(cmd, want_r, who);
