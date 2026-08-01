@@ -318,6 +318,30 @@ current build.
   strided buffer range that does not overlap draw 95's foreground texture. Historical title evidence
   also reached the title with this dispatch skipped, so it is not the route blocker.
 
+- **Audio: the guest submits PCM at full rate, and every sample of it is exactly zero (#1692).**
+  Measured with `PROSPER_AUDIO_FLOW=1` (see `AUDIO.md`) over a 150 s `reach-title-screen.pad` run of
+  the direct SDL3 frontend. The title creates **two** AudioOut2 contexts, each with one MAIN port:
+
+  | | ctx0 / port1 | ctx1 / port2 |
+  |---|---|---|
+  | `data_format` | `0xc00` (12ch f32) | `0x800` (8ch f32) |
+  | pushes / s | 188 | 188 |
+  | guest PCM read / s | 43,520 frames, 2,088,960 B | 43,264 frames, 1,384,448 B |
+  | mixed to host | **no** — `skip-fmt` (channels > 8) | yes, 188 grains/s, 385,024 B/s to sink port 18 |
+  | peak / rms | 0.00000 / 0.00000 | 0.00000 / 0.00000 |
+  | **non-zero samples** | **0 / 522,240** | **0 / 346,112** |
+
+  So the pump loop is alive (`advance=188 push=188`, `pcm-published` climbing), the host device opens
+  successfully (`prosper-audio: opened port 18 … 48000 Hz/2 channels`), prosper reads all 3.47 MB/s
+  of it and forwards ctx1's mixed bed to the real device — and **0 of 868,352 samples per second are
+  non-zero**. This is not a sink, routing, pacing or volume defect: the silence is already present in
+  the guest's own buffers. The next question is upstream, in the title's audio engine — no AJM/ATRAC9
+  decode activity occurs at all during the route, and no audio-related NID is reported unimplemented.
+- **The 12-channel port is a real gap, but it is not where the audio went.** prosper's push loop
+  rejects `channels > 8`, so ctx0's `0xc00` port is discarded 177x/s and ctx0 never opens a host sink.
+  Instrumenting the reject path shows that port is **also** exactly zero-filled, so implementing the
+  layout would not by itself produce sound. Tracked separately; do not treat it as the #1692 cause.
+
 ## Ruled out — eliminated, do not re-run these
 
 - **"The failing draws run with the previous pipeline's *user data*."** This title's own
@@ -450,6 +474,7 @@ blocker.
 | what the presented frame actually holds | `PROSPER_DUMP_PERSISTENT=1` -> `[persist] present: … scanout=HIT/MISS rgb_nonblack=N` |
 | who writes a surface (colour, compute, DMA, WRITE_DATA) | `PROSPER_PROVENANCE_DIM=WxH` |
 | a successful shader's raw RDNA2 + SPIR-V | `PROSPER_SHADER_DUMP_SUCCESS=DIR` (**create DIR first**) + `shader_inspect` |
+| whether audio is absent, silent, or dropped by us | `PROSPER_AUDIO_FLOW=1` -> `[audio-flow]` (see `AUDIO.md`); read `nonzero=N/M`, not peak/rms |
 
 ## Do not restart
 
