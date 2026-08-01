@@ -26,7 +26,27 @@ AkMotion/AkSoundEngine/AkVorbisHwAccelerator one NID three ways).
 import subprocess, pathlib, collections, sys
 
 SELF_DUMP = str(pathlib.Path(__file__).resolve().parents[2] / "build-linux" / "self_dump")
-ROOT = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parents[3]
+def _default_root():
+    """Walk up looking for a directory that actually contains dumps.
+
+    parents[3] is wrong from a git worktree: the tree lives under .claude/worktrees/<name>/ while the
+    dumps sit in the main checkout. Searching upward finds either. If nothing is found we say so and
+    exit non-zero rather than printing a confident "0 dumps scanned" — a census that reports nothing
+    because it looked in the wrong place is indistinguishable from one that found nothing.
+    """
+    here = pathlib.Path(__file__).resolve()
+    for cand in list(here.parents):
+        if any(cand.glob("PPSA*-app0")): return cand
+    return None
+
+if len(sys.argv) > 1:
+    ROOT = pathlib.Path(sys.argv[1])
+else:
+    ROOT = _default_root()
+    if ROOT is None:
+        sys.exit("dup_exports: no PPSA*-app0 dumps found above this file; pass a dump root explicitly")
+if not any(ROOT.glob("PPSA*-app0")):
+    sys.exit(f"dup_exports: {ROOT} contains no PPSA*-app0 dumps")
 
 # The fixed named list prosper links (boot_program.cpp), plus the eboot itself.
 LINKED = ["eboot.bin",
