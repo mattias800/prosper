@@ -2,7 +2,9 @@
 //
 // The PS5 kernel is FreeBSD-derived. Linux and FreeBSD agree across most of 1..34 and diverge above
 // it, so a constant copied out of the host's <errno.h> looks right in review and reaches the guest
-// meaning something else. 11 is the exception inside the low range, and it is the headline case. The pair that matters most is EAGAIN/EDEADLK, which the two systems *swap*:
+// meaning something else. 11 is the exception inside the low range, and it is the headline case.
+//
+// The pair that matters most is EAGAIN/EDEADLK, which the two systems *swap*:
 // FreeBSD EAGAIN=35 / EDEADLK=11, Linux EAGAIN=11 / EDEADLK=35. Handing back the host number turns
 // "would block, retry" into "deadlock avoided" and vice versa — and a guest that retries on EAGAIN
 // can spin forever on a condition that will never change.
@@ -81,7 +83,11 @@ int main() {
 #endif
             {EFBIG,27},{ENOSPC,28},
             {ESPIPE,29},{EROFS,30},{EMLINK,31},{EPIPE,32},{EAGAIN,35},{ELOOP,62},
-            {ENAMETOOLONG,63},{EDQUOT,69},{EOVERFLOW,84},
+            {ENAMETOOLONG,63},
+#ifdef EDQUOT
+            {EDQUOT,69},
+#endif
+            {EOVERFLOW,84},
         };
         bool all = true;
         for (const Row& r : rows)
