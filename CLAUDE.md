@@ -121,8 +121,9 @@ The standing warnings that are **not** title-specific:
 - **`PROSPER_UD_TAIL_ALIGN` must stay off.** It exists only so the A/B that falsified the
   user-data-tail hypothesis stays reproducible (`docs/RESOURCE_BINDING.md` § Ruled out).
 - **Read `GAME_COMPAT_ORCHESTRATION.md`'s instrument-not-the-subject list before believing any
-  surprising measurement** — fourteen phantom defects have come from the apparatus rather than the
-  subject, and several cost hours. Two of its positive rules bind on any graphics investigation, not
+  surprising measurement** — every entry on it is a phantom defect that came from the apparatus
+  rather than the subject, and several cost hours. (Deliberately no count here: the list is appended
+  to by concurrent lanes, so a restated total is stale as soon as it is written.) Two of its positive rules bind on any graphics investigation, not
   just orchestrated ones: **a decoded-draw census is meaningless without the render phase and a
   positive control** (draw counts vary by two orders of magnitude *within one title* — count per
   sample interval, calibrate against a title known to render the thing you claim is missing, and

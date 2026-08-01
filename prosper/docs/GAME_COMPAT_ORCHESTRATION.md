@@ -83,6 +83,7 @@ count, read the last row's number.
 | 20 | An **empty CI rollup** read as "queued" | GitHub does **not run checks on a conflicting branch at all**, so a PR whose base has moved reports `pass=0 fail=0 pending=0` with `mergeStateStatus=DIRTY` — permanently, until it is rebased. That is byte-identical to the "checks have not registered yet" state, and #1656 sat in it while master moved twice. Same shape as #18's empty log: **an absent signal mimicking a pending one**. Read `mergeable`/`mergeStateStatus` before concluding anything from a check count, and never wait on zeros. |
 | 21 | The **same draw census, now read without the resident *content*** — trap 14 firing a second time, on the lane that recorded it | #1641 spent a session treating "~23 draws/frame is implausibly few for a 4K UE4 title" as the anomaly. Decoding the title's own asset reads against its pak index showed it loads **exactly one of the 481 maps** in the container — `L_GameloftSplash.umap`, **7,870 bytes** — and never opens `L_Main` or `L_StartMap`. 23 draws is a **complete and correct** deferred frame over a splash world. Worse, the premise was invalid in *both* directions: `L_Main.uexp` is **616 bytes**, so this title's front end is UMG/Slate and a *working* title screen would also decode few 3D draws. Nothing was ever missing. |
 | 22 | A **runtime `eboot+0x…` offset** | Several diagnostics subtract the literal `0x400000000` while the eboot maps at `BOOT_EBOOT = 0x410000000`, so the printed offset is **`0x10000000` too high** — wrong but entirely plausible, and every downstream `edis.py`/`xref.py`/`PROSPER_BP` lookup then fails in a way that looks like a code problem. `boot_trace.cpp:97` uses the right constant, so two conventions coexist under one label. Filed as **#1659**. Tell: an `eboot+0x1…` offset **past the module image size** is a labelling artifact, not a wild pointer. |
+| 23 | A **call-count table read as evidence of *what* is being waited on** | `PROSPER_PROGRESS_UNIMPL`'s per-NID counts showed **1,300,185,430 `select()` calls in 144 s** on PPSA19244 while every other socket call stayed a frozen singleton — a real, liveness-controlled measurement. It was then read as "the guest is blocked polling a socket", and a shared-substrate design decision (implement a loopback socket backing) was nearly escalated on it. Reading the **arguments** took one `PROSPER_STUBDUMP` lookup plus one gdb breakpoint and showed `select(nfds=0, NULL, NULL, NULL, {3,0})` — the portable **`sleep()`** idiom, no descriptor involved. The thread was trying to sleep 3 s; the 0-returning stub made it a no-op. Not a socket poll, not the stall — a CPU tax. A count answers *"is something spinning?"*; it can **never** answer *"on what?"*, and the function's name is not evidence. |
 
 **Working rules that follow:**
 
@@ -138,7 +139,23 @@ count, read the last row's number.
   offsets to asset names, so "which maps/blueprints/widgets did the guest load, and where did
   loading stop?" is answered with no boot and no GPU. Run it *first*. On #1641 it dissolved a
   session's worth of GPU investigation in one pass.
-- **A trap you have already recorded is the one most likely to catch you.** Trap 15 is trap 14, hit
+- **Read an unimplemented call's *arguments* before inferring what it is doing.** This is cheap and
+  almost never done. `PROSPER_STUBDUMP=1` prints one line per import — `[stub] #877 off=0x148e0
+  libScePosix::T8fER+tIGgk` — and each stub lives at `0x600000000 + off`, so a gdb breakpoint at the
+  **stub entry** catches the guest's argument registers fully intact (the stub has not clobbered
+  anything yet; note the generic unimplemented path *does* overwrite `rdi`/`rsi`/`rdx` by the time it
+  reaches `prosper_on_unimpl`, so break on the stub, not the C++ handler):
+
+  ```bash
+  PROSPER_STUBDUMP=1 … boot_trace <dump> 2>&1 | grep '<NID>'      # -> off=0x148e0
+  gdb -p $(pgrep -x boot_trace) -batch -ex 'set pagination off' \
+      -ex 'break *0x6000148e0' -ex continue -ex 'info registers rdi rsi rdx rcx r8'
+  ```
+
+  The stub table is per-run — re-read it, never reuse an address. On PPSA19244 this converted
+  "1.3 billion socket polls" into "a 3-second sleep that returns instantly", and stopped a
+  substantial piece of shared work from being scoped against a wrong premise.
+- **A trap you have already recorded is the one most likely to catch you.** Trap 21 is trap 14, hit
   by the lane that wrote trap 14 down, because the rule had been internalised as "check the render
   *phase*" when the general form is "check the *denominator* — phase, resident content, and engine
   architecture — before treating a low count as a defect."
