@@ -210,16 +210,27 @@ anywhere yet**, so they are deliberately left unplaced and logged rather than fo
 dataFormat, u32 sampleRate, u32 flags, u64 userHandle}` — live-captured), and this title never
 calls `sceAudioOut2GetSpeakerInfo`, so nothing in the guest's own setup names the order.
 
-**What no amount of this evidence can settle, and what would.** Correlation is symmetric, so the
-probe proves ch0/ch1 are a genuine front pair but cannot distinguish a left/right **swap**; that ch0
-is the left one rests on the universal index-0 = FrontLeft convention (CRI Atom's `EAtomSpeakerID`
-enum, present in this eboot, orders FrontLeft first), not on a measurement. **A listening test does
+**What no amount of this evidence can settle, and what would.** The probe **groups** channels by
+side; it does not **orient** the groups, and those are different claims. Correlation is symmetric,
+so it proves ch0/ch1 are a genuine front pair — and that {ch4,ch6} and {ch5,ch7} are the two
+surround groups — but it cannot distinguish any of those from a left/right **swap**.
+
+> **`CONFIDENCE: MED` for the left/right orientation of every pair in the fold table above, and its
+> basis is convention, not evidence.** Index 0 = FrontLeft is universal across published
+> multichannel bed layouts, CRI Atom's `EAtomSpeakerID` enum (present in this eboot) orders
+> FrontLeft first, and prosper's own v1 `sceAudioOut` path assumes the same. Three converging
+> conventions earn MED rather than LOW — but a convention is not a measurement, and this one has
+> never been tested against a PS5 title. A mono or stereo bed has no orientation to get wrong, so
+> 1..2 channels remain `CONFIDENCE: HIGH`. **A listening test does
 not settle a fold-down either** — and for this title it cannot settle anything about the layout,
 because ten of its twelve channels are empty, so *every* mapping that routes ch0 and ch1 to the two
 sides produces a bit-identical host bed. A human confirming "it sounds right" therefore establishes
 that real audio reaches the sink at sane levels through the guest's own path (bring-up rung 4), and
-nothing about the channel order. The discriminating evidence is content with **distinct per-channel
-placement** — a hard-panned effect, or centre-channel dialogue — measured with this probe. That is
+nothing about the channel order. Broadly stereo music folds down plausibly under a swap, which is
+exactly why it cannot arbitrate one. **Do not cite a listening confirmation as evidence for the
+mapping.** The discriminating evidence is content with **distinct per-channel placement** — a
+hard-panned effect whose true side is known from the game, or centre-channel dialogue — measured
+with this probe; it settles orientation in one run. That is
 the experiment #1720 asks for, and it is why a plausible-sounding wrong order is more dangerous than
 a reported gap.
 

@@ -53,6 +53,16 @@ struct AudioStereoGain { float left = 0.0f, right = 0.0f; };
 // a rounding detail: those channels contribute nothing and the caller must report them.
 // `channels` above kAudioMaxBedChannels, or an out_capacity too small, places nothing and returns
 // `channels`.
+//
+// A channel given a zero gain on a side must NOT be read on that side: `Inf * 0.0f` and
+// `NaN * 0.0f` are both NaN, and the output path clamps NaN to zero, so multiplying every channel
+// by both gains lets one non-finite sample destroy a side whose own content is fine.
+//
+// CONFIDENCE: HIGH that the bed's first two channels are the front pair; **MED for which of a pair
+// is the LEFT one** — prosper's live measurement groups channels by side but cannot orient the
+// groups (correlation is symmetric under a swap), so orientation rests on the index-0 = FrontLeft
+// convention rather than on evidence. See hle_audio.cpp for the measurement and the experiment that
+// would settle it. MED for the 3..8 placements; 9..16 places only its first eight.
 constexpr unsigned kAudioMaxBedChannels = 16;
 unsigned audio_stereo_downmix(unsigned channels, AudioStereoGain* out, unsigned out_capacity);
 

@@ -186,18 +186,30 @@ bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth) {
 // than one that reports the gap, and no title in evidence puts signal there. The leading hypothesis
 // is that the same even=left/odd=right pairing continues, but that is inference from the tiers
 // below it, not a measurement, so it is tracked as an issue instead of shipped.
-// What the measurement CANNOT settle, stated so nobody reads more into it than it carries:
+// What the measurement CANNOT settle, stated so nobody reads more into it than it carries. The
+// probe GROUPS channels by side; it does not ORIENT the groups, and those are different claims:
 //   - Correlation is symmetric, so it proves ch0/ch1 are a genuine front pair but cannot tell a
-//     left/right SWAP from the correct assignment. That ch0 is the left one rests on the universal
-//     index-0 = FrontLeft convention (CRI Atom's own `EAtomSpeakerID` enum, whose names are present
-//     in this title's eboot, orders FrontLeft before FrontRight), not on a measurement here.
+//     left/right SWAP from the correct assignment. The same is true of the {ch4,ch6} / {ch5,ch7}
+//     grouping: which group is the left one is not measured anywhere here.
+//     **CONFIDENCE: MED for the left/right ORIENTATION of every pair in this table, and the basis is
+//     convention, not evidence** — index 0 = FrontLeft is universal across published multichannel
+//     bed layouts, CRI Atom's own `EAtomSpeakerID` enum (whose names are present in this title's
+//     eboot) orders FrontLeft before FrontRight, and prosper's own v1 sceAudioOut path assumes it.
+//     Three converging conventions are worth MED rather than LOW, but a convention is not a
+//     measurement, and this one has never been tested against a PS5 title.
 //   - A listening test cannot settle it either, and specifically cannot settle this title's layout
 //     at all: ten of its twelve channels are measured empty, so every mapping that routes ch0 and
-//     ch1 to the two sides produces an identical host bed. Only content with distinct per-channel
-//     placement — a hard-panned effect, or centre-channel dialogue — discriminates a fold-down, and
-//     no title in evidence yet submits any.
-// CONFIDENCE: HIGH that ch0/ch1 are the front pair and that 1..2-channel beds are right; MED for
-// which of the pair is left, and for 3..8; 9..16 places only its first eight.
+//     ch1 to the two sides produces a bit-identical host bed. Broadly stereo music also folds down
+//     plausibly under a swap. A human confirming "it sounds right" is real rung-4 evidence that
+//     audio reaches the device through the guest's own path, and is NOT evidence for this mapping.
+//   - THE DISCRIMINATING EXPERIMENT, for whoever gets a title that supports it: content with
+//     distinct per-channel placement — a hard-panned effect whose true side is known from the game,
+//     or centre-channel dialogue — measured with PROSPER_AUDIO_LAYOUT. It settles orientation in
+//     one run, where any amount of music cannot. Tracked with the height tier on #1720, since one
+//     capture answers both.
+// CONFIDENCE: HIGH that ch0/ch1 are the front pair and that 1..2-channel beds are right (a mono or
+// stereo bed has no orientation to get wrong); MED for which channel of a pair is the left one, and
+// for the 3..8 placements; 9..16 places only its first eight and reports the rest.
 unsigned audio_stereo_downmix(unsigned channels, AudioStereoGain* out, unsigned out_capacity) {
     if (!out || !channels || channels > kAudioMaxBedChannels || out_capacity < channels)
         return channels;
