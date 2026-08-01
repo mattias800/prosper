@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -68,9 +69,30 @@ struct ScratchDirectory {
         path = root / ("pid-" + std::to_string(scratch_process_id()));
         std::error_code error;
         std::filesystem::remove_all(path, error);   // debris from a recycled pid
+        error.clear();
         std::filesystem::create_directories(path, error);
+        // Fail LOUDLY and immediately. If the directory does not exist, every test below writes to a
+        // path that cannot be opened and then fails on a *content* assertion — which is precisely the
+        // mystifying failure class this header exists to remove (#1613). A read-only or full build
+        // directory must not masquerade as a capture defect.
+        if (error || !std::filesystem::is_directory(path)) {
+            std::fprintf(stderr,
+                         "FATAL: cannot create the test scratch directory '%s': %s\n"
+                         "       (root came from %s)\n",
+                         path.string().c_str(), error.message().c_str(),
+                         std::getenv("PROSPER_TEST_SCRATCH_DIR") != nullptr
+                             ? "PROSPER_TEST_SCRATCH_DIR"
+                             : "the current working directory");
+            std::fflush(stderr);
+            std::abort();
+        }
     }
 
+    // NOTE for a future forking test: `path` is captured at construction, not re-derived from the
+    // live pid, so a forked child that returns from main (or calls exit()) would delete its
+    // *parent's* directory. Call test_scratch_dir() only after the fork, or have the child leave via
+    // _exit(). Nothing in the suite forks today; both remove_all calls below are bounded to a
+    // `pid-<n>` leaf, so even a mis-set PROSPER_TEST_SCRATCH_DIR cannot widen the deletion.
     ~ScratchDirectory() {
         std::error_code error;
         std::filesystem::remove_all(path, error);

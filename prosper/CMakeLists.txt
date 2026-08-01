@@ -1444,7 +1444,11 @@ endif()
 # header for why that matters on this machine.
 #
 # This must stay at the very end of the file: it snapshots the DIRECTORY TESTS
-# property, so any add_test() below it would not be covered.
+# property, so any add_test() below it would not be covered. A test that did get
+# missed still fails safe rather than silently — test_scratch.h falls back to
+# <cwd>/prosper-test-scratch/, and ctest's working directory is this same build
+# directory, so it lands off the tmpfs either way; it merely loses the per-case
+# split (the pid component still separates concurrent processes).
 get_property(prosper_registered_tests DIRECTORY PROPERTY TESTS)
 foreach(prosper_test_case IN LISTS prosper_registered_tests)
   set_property(TEST ${prosper_test_case} APPEND PROPERTY ENVIRONMENT
