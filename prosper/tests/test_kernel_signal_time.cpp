@@ -70,7 +70,12 @@ int main() {
     uint64_t c2b = setcancel(1 /*DISABLE*/, 0 /*NULL old*/, 0, 0, 0, 0);
     CHECK(c2b == 0, "setcancelstate with NULL old_state -> OK (no write)");
     uint64_t c3 = setcancel(7 /*invalid*/, 0, 0, 0, 0, 0);
-    CHECK(c3 == 0x80020016ull, "setcancelstate(invalid) -> EINVAL");
+    // Plain errno 22, not the 0x80020016 SCE encoding (#1612). This handler is registered ONLY as the
+    // POSIX `pthread_setcancelstate`, whose contract returns an errno directly — and every other
+    // pthread entry point in the emulator (mutex, rwlock, key, cond, sem) already returns a bare
+    // FreeBSD errno from the same shared handlers. A guest comparing the result against EINVAL could
+    // never match the encoded form.
+    CHECK(c3 == 22ull, "setcancelstate(invalid) -> EINVAL (POSIX contract: a plain errno)");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

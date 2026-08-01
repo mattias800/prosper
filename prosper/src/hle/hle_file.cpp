@@ -6,6 +6,7 @@
 #endif
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
 #include "../gpu/gpu_timeline.hpp" // optional exact guest-stdout capture gate
 #include "../host/guest_write_watch.hpp"   // #1144 B5: disarm texture watches before reading into guest mem
@@ -1022,52 +1023,12 @@ static int host_open_flags(uint64_t f) {
 // the values after ERANGE diverge on Linux (for example ELOOP and ENAMETOOLONG), so translate
 // host errors instead of copying their numbers into an SCE result.
 static uint32_t file_sce_error(int error) {
-    int guest_error = 5;  // EIO is the conservative fallback for an unmapped host failure.
-    if (error == EPERM) guest_error = 1;
-    else if (error == ENOENT) guest_error = 2;
-    else if (error == EINTR) guest_error = 4;
-    else if (error == EIO) guest_error = 5;
-    else if (error == ENXIO) guest_error = 6;
-    else if (error == EBADF) guest_error = 9;
-    else if (error == ENOMEM) guest_error = 12;
-    else if (error == EACCES) guest_error = 13;
-    else if (error == EFAULT) guest_error = 14;
-    else if (error == EBUSY) guest_error = 16;
-    else if (error == EEXIST) guest_error = 17;
-    else if (error == EXDEV) guest_error = 18;
-    else if (error == ENODEV) guest_error = 19;
-    else if (error == ENOTDIR) guest_error = 20;
-    else if (error == EISDIR) guest_error = 21;
-    else if (error == EINVAL) guest_error = 22;
-    else if (error == ENFILE) guest_error = 23;
-    else if (error == EMFILE) guest_error = 24;
-    else if (error == ENOTTY) guest_error = 25;
-#ifdef ETXTBSY
-    else if (error == ETXTBSY) guest_error = 26;
-#endif
-    else if (error == EFBIG) guest_error = 27;
-    else if (error == ENOSPC) guest_error = 28;
-    else if (error == ESPIPE) guest_error = 29;
-    else if (error == EROFS) guest_error = 30;
-    else if (error == EMLINK) guest_error = 31;
-    else if (error == EPIPE) guest_error = 32;
-    else if (error == EAGAIN) guest_error = 35;
-#ifdef EWOULDBLOCK
-    else if (error == EWOULDBLOCK) guest_error = 35;
-#endif
-#ifdef ELOOP
-    else if (error == ELOOP) guest_error = 62;
-#endif
-#ifdef ENAMETOOLONG
-    else if (error == ENAMETOOLONG) guest_error = 63;
-#endif
-#ifdef EDQUOT
-    else if (error == EDQUOT) guest_error = 69;
-#endif
-#ifdef EOVERFLOW
-    else if (error == EOVERFLOW) guest_error = 84;
-#endif
-    return 0x80020000u | (uint32_t)guest_error;
+    // This used to be a 45-line if/else ladder mapping host errnos to FreeBSD numbers by hand — the
+    // third independent copy of that mapping in the HLE, alongside fbsd_errno() in hle_kernel.cpp
+    // and a scattering of `rc == ETIMEDOUT ? 60 : ...` special cases. #1612 folded all of them onto
+    // one table in sce_errno.hpp; the values here are unchanged (the test asserts that explicitly),
+    // including the deliberate EIO fallback for a host failure with no FreeBSD counterpart.
+    return (uint32_t)prosper::hle::sce_error_from_host_errno(error, prosper::hle::FreeBsdErrno::EIo);
 }
 
 HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_flags(a1);
@@ -1852,8 +1813,13 @@ HLE(k_rmdir) { uint64_t r = f_rmdir(a0, a1, a2, a3, a4, a5); int e = errno; retu
 // getdents64 on the SAME fd so the kernel keeps the directory cursor; Linux and BSD DT_* type
 // values match. Returns bytes written (0 = end of directory), or an SCE error. UE4 (PPSA17942)
 // enumerates its pak directory with this during IO-stack init.
+// `error` is a HOST errno (from opendir/fdopendir/... or a literal EINVAL). The guest reads the low
+// byte with FreeBSD numbering, so it must be translated rather than poured in raw (#1612). The
+// errnos these calls actually produce today — ENOENT, EBADF, ENOMEM, EACCES, ENOTDIR, EMFILE — all
+// happen to be below 35, where Linux and FreeBSD agree, so this was latent rather than broken; the
+// translation makes it stay correct when a new caller reaches a divergent value.
 static uint64_t directory_sce_error(int error) {
-    return 0x80020000ull | (uint64_t)(error & 0xff);
+    return prosper::hle::sce_error_from_host_errno(error);
 }
 
 static bool directory_result_is_error(uint64_t result) {
@@ -1865,7 +1831,11 @@ static bool directory_result_is_error(uint64_t result) {
 // large positive byte count on failure and could walk an untouched directory buffer as valid data.
 static uint64_t directory_result_to_posix(uint64_t result) {
     if (!directory_result_is_error(result)) return result;
-    errno = (int)(result & 0xff);
+    // The encoded byte is a FreeBSD errno; host libc's `errno` must receive the HOST number, so this
+    // is the exact inverse of directory_sce_error(). Assigning the raw byte would corrupt the round
+    // trip on any value where the two numberings differ (#1612).
+    errno = prosper::hle::host_errno_from_freebsd(
+        static_cast<prosper::hle::FreeBsdErrno>(result & 0xff));
     return (uint64_t)(int64_t)-1;
 }
 

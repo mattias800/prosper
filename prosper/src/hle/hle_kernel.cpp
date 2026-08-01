@@ -14,6 +14,7 @@
 #endif
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "sce_errno.hpp"
 #include "sync_futex.hpp"
 #include "../gpu/mb3_freelist.hpp"
 #include "../host/exec_image.hpp"
@@ -454,14 +455,19 @@ HLE(k_mutex_init) {
     guest_mutex_register(m, host_type);
     return 0;
 }
-// The guest sees FreeBSD errno values; EBUSY(16)/EPERM(1)/EINVAL(22) coincide with both Linux and
-// MinGW, but EDEADLK differs on every host (FreeBSD 11, Linux 35, MinGW/winpthreads 36) — an
-// ERRORCHECK relock must report the FreeBSD value. `EDEADLK` is the HOST's own constant, so the
-// comparison remaps whatever the host returns on ALL platforms (the Windows CI build hit exactly
-// this: winpthreads returned its EDEADLK=36 and the old __linux__-only guard left it unremapped).
+// The guest sees FreeBSD errno values. EBUSY(16)/EPERM(1)/EINVAL(22) coincide with Linux and MinGW,
+// which is why this went unnoticed for so long — but the values that differ are the ones these
+// wrappers actually return on their interesting paths: EDEADLK is FreeBSD 11 / Linux 35 /
+// MinGW-winpthreads 36, and EAGAIN is the mirror image (FreeBSD 35 / Linux 11). Handing back the
+// host number swaps those two, so "would block, try again" arrives as "deadlock" and vice versa.
+//
+// This used to special-case EDEADLK alone and leave every other divergent value raw, which is why
+// callers below had to bolt on their own `rc == ETIMEDOUT ? 60 : ...` (Linux ETIMEDOUT is 110,
+// FreeBSD's is 60). The complete host->FreeBSD table now lives in sce_errno.hpp; keep this thin
+// alias so existing call sites read the same, and never return a bare host errno to a guest (#1612).
 namespace { inline uint64_t fbsd_errno(int host) {
-    if (host == EDEADLK) return 11;
-    return (uint64_t)(unsigned)host;
+    if (host == 0) return 0;
+    return (uint64_t)static_cast<uint32_t>(prosper::hle::freebsd_errno_from_host(host));
 } }
 HLE(k_mutex_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { auto* m = (pthread_mutex_t*)*(void**)a0; guest_mutex_unregister(m); pthread_mutex_destroy(m); free(m); } if (a0) *(void**)a0 = nullptr; return 0; }
 // PROSPER_MUTEX_FAILLOG: report any mutex op that returns a non-zero (EINVAL/EDEADLK/...) result,
@@ -585,7 +591,7 @@ namespace {
         return 0;
 #else
         rusage usage{};
-        if (getrusage(RUSAGE_SELF, &usage) != 0) return errno ? errno : EINVAL;
+        if (getrusage(RUSAGE_SELF, &usage) != 0) return fbsd_errno(errno ? errno : EINVAL);
         int64_t sec = usage.ru_utime.tv_sec;
         int64_t usec = usage.ru_utime.tv_usec;
         if (clock_id == kSonyClockProf) {
@@ -732,7 +738,7 @@ HLE(k_cond_timedwait) {
     if (!a2) {
         int rc = interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
                                          nullptr, kGuestMutexCondWaitBookkeeping);
-        return (uint64_t)rc;
+        return fbsd_errno(rc);
     }
     const int64_t* gts = (const int64_t*)(uintptr_t)a2;
     if (gts[0] < 0 || gts[1] < 0 || gts[1] >= 1'000'000'000ll) return 22;
@@ -740,8 +746,7 @@ HLE(k_cond_timedwait) {
     const int32_t clock_id = guest_cond_snapshot(c).clock_id;
     int rc = interruptible_cond_clock_timedwait(
         c, m, dl, clock_id, nullptr, kGuestMutexCondWaitBookkeeping);
-    if (rc == ETIMEDOUT) return 60;                            // FreeBSD ETIMEDOUT
-    return (uint64_t)rc;
+    return fbsd_errno(rc);   // host ETIMEDOUT (Linux 110) -> FreeBSD 60
 }
 
 // --- read/write locks (opaque handle -> host pthread_rwlock_t). Real libc.prx uses these for its
@@ -765,7 +770,7 @@ HLE(k_rwlockattr_init) {
     auto* attr = (pthread_rwlockattr_t*)calloc(1, sizeof(pthread_rwlockattr_t));
     if (!attr) return 12;
     const int rc = pthread_rwlockattr_init(attr);
-    if (rc) { free(attr); return (uint64_t)(unsigned)rc; }
+    if (rc) { free(attr); return fbsd_errno(rc); }
     *(void**)(uintptr_t)a0 = attr;
     return 0;
 }
@@ -864,7 +869,7 @@ HLE(k_attr_setstack) {
     auto* at = (GuestPthreadAttr*)*(void**)(uintptr_t)a0;
     int rc = pthread_attr_setstacksize(&at->host, (size_t)a2);
     if (!rc) { at->supplied_stack = (void*)(uintptr_t)a1; at->supplied_stack_size = (size_t)a2; }
-    return (uint64_t)(unsigned)rc;
+    return fbsd_errno(rc);
 #else
     auto* at = (GuestPthreadAttr*)*(void**)(uintptr_t)a0;
     int rc = pthread_attr_setstack(&at->host, (void*)(uintptr_t)a1, (size_t)a2);
@@ -872,7 +877,7 @@ HLE(k_attr_setstack) {
         fprintf(stderr, "[thread] attr setstack attr=%p base=%p size=0x%llx rc=%d\n",
                 (void*)at, (void*)(uintptr_t)a1, (unsigned long long)a2, rc);
     if (!rc) { at->supplied_stack = (void*)(uintptr_t)a1; at->supplied_stack_size = (size_t)a2; }
-    return (uint64_t)(unsigned)rc;
+    return fbsd_errno(rc);
 #endif
 }
 HLE(k_attr_setguardsize) {
@@ -887,7 +892,7 @@ HLE(k_attr_setguardsize) {
     return 0;
 #else
     int rc = pthread_attr_setguardsize(&at->host, (size_t)a1);
-    return (uint64_t)(unsigned)rc;
+    return fbsd_errno(rc);
 #endif
 }
 HLE(k_attr_noop)        { return 0; }
@@ -1457,7 +1462,7 @@ HLE(k_pthread_create) {
     int r = pthread_create(&tid, &la, thread_trampoline, ts);   // trampoline registers the stack first
     if (getenv("PROSPER_SYNCLOG")) fprintf(stderr, "[thread] pthread_create rc=%d\n", r);
     pthread_attr_destroy(&la);
-    if (r) { delete ts; return (uint64_t)r; }
+    if (r) { delete ts; return fbsd_errno(r); }   // EAGAIN (out of threads) is 11 here, 35 on the PS5
     (void)publish_guest_thread_name((uint64_t)(uintptr_t)tid, ts->name_generation, ts->name);
     ts->name_published.store(true, std::memory_order_release);
 #else
@@ -1493,7 +1498,7 @@ HLE(k_pthread_create) {
     if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, &la, win_thread_trampoline, ts);
     pthread_attr_destroy(&la);
-    if (r) { delete ts; return (uint64_t)r; }
+    if (r) { delete ts; return fbsd_errno(r); }   // EAGAIN (out of threads) is 11 here, 35 on the PS5
     (void)publish_guest_thread_name((uint64_t)(uintptr_t)tid, ts->name_generation, ts->name);
     ts->name_published.store(true, std::memory_order_release);
 #endif
@@ -1625,11 +1630,11 @@ HLE(k_key_create) {
     }
     if (r) {
         if (thunk) VirtualFree(thunk, 0, MEM_RELEASE);
-        return (uint64_t)r;
+        return fbsd_errno(r);
     }
 #else
     int r = pthread_key_create(&k, (void (*)(void*))(uintptr_t)a1);
-    if (r) return (uint64_t)r;
+    if (r) return fbsd_errno(r);   // EAGAIN (keys exhausted) is 11 here, 35 on the PS5
 #endif
     *(uint32_t*)(uintptr_t)a0 = (uint32_t)k;   // hand the guest our host key
     return 0;
@@ -1734,7 +1739,7 @@ HLE(k_mutex_timedlock) {
     timespec dl = abs_deadline_us(a1);
     int rc = pthread_mutex_timedlock(m, &dl);
     if (rc == 0) guest_mutex_acquired(m);
-    return rc == ETIMEDOUT ? 60u : fbsd_errno(rc);
+    return fbsd_errno(rc);   // the table maps host ETIMEDOUT -> FreeBSD 60
 }
 // scePthreadCondTimedwait(cond, mutex, SceKernelUseconds usec): the Sony 3rd arg is a RELATIVE µs scalar,
 // NOT an abstime pointer -> it must NOT be aliased to the POSIX k_cond_timedwait (which reads a2 as a
@@ -1748,7 +1753,7 @@ HLE(k_cond_timedwait_sce) {
     timespec dl = abs_deadline_us(a2);
     int rc = interruptible_cond_timedwait(c, m, &dl, GuestWaitKind::ConditionSequence, 0,
                                           nullptr, kGuestMutexCondWaitBookkeeping);
-    return rc == ETIMEDOUT ? 0x8002003cu : (uint64_t)rc;
+    return rc == ETIMEDOUT ? prosper::hle::kSceKernelErrorETIMEDOUT : fbsd_errno(rc);
 }
 // scePthreadRwlockTimedrd/wrlock(rwlock, SceKernelUseconds usec): acquire with a RELATIVE µs timeout.
 // Were MISSING -> the generic stub returned 0 (= "lock held") without taking the lock, so the guest ran
@@ -1757,13 +1762,15 @@ HLE(k_rwlock_timedrdlock) {
     auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;   // EINVAL
     timespec dl = abs_deadline_us(a1);
     int rc = pthread_rwlock_timedrdlock(rw, &dl);
-    return rc == ETIMEDOUT ? 60u : (uint64_t)rc;
+    // EAGAIN here means "too many concurrent readers"; unmapped it reached the guest as
+    // FreeBSD EDEADLK, turning a retryable condition into a deadlock report (#1612).
+    return fbsd_errno(rc);
 }
 HLE(k_rwlock_timedwrlock) {
     auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;   // EINVAL
     timespec dl = abs_deadline_us(a1);
     int rc = pthread_rwlock_timedwrlock(rw, &dl);
-    return rc == ETIMEDOUT ? 60u : (uint64_t)rc;
+    return fbsd_errno(rc);
 }
 // scePthreadSem* -- POSIX-style counting semaphores (DISTINCT from sceKernelCreateSema). Were MISSING ->
 // the generic stub returned 0: SemInit created nothing, SemWait returned immediately (never blocked),
@@ -1771,10 +1778,10 @@ HLE(k_rwlock_timedwrlock) {
 // synchronization (the silent-unsync / UAF class). Back them with host sem_t.
 namespace { bool semlog() { static const bool on = getenv("PROSPER_SEMLOG") != nullptr; return on; } }
 HLE(k_sem_init)      { if (!a0) return 0x16; auto* s = (sem_t*)calloc(1, sizeof(sem_t)); sem_init(s, 0, (unsigned)a2); *(void**)(uintptr_t)a0 = s; if (semlog()) fprintf(stderr, "[sem] init slot=%p value=%u\n", (void*)(uintptr_t)a0, (unsigned)a2); return 0; }
-HLE(k_sem_wait)      { auto* s = ensure_sem(a0); if (!s) return 0x16; if (semlog()) fprintf(stderr, "[sem] wait slot=%p enter\n", (void*)(uintptr_t)a0); int rc = sem_wait(s); if (semlog()) fprintf(stderr, "[sem] wait slot=%p exit rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : (uint64_t)(unsigned)errno; }
-HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem_trywait(s) == 0 ? 0 : (uint64_t)(unsigned)errno; }
-HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return 0x16; timespec dl = abs_deadline_us(a1); int rc = sem_timedwait(s, &dl); return rc == 0 ? 0 : (errno == ETIMEDOUT ? 60u : (uint64_t)(unsigned)errno); }
-HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; int rc = sem_post(s); if (semlog()) fprintf(stderr, "[sem] post slot=%p rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : (uint64_t)(unsigned)errno; }
+HLE(k_sem_wait)      { auto* s = ensure_sem(a0); if (!s) return 0x16; if (semlog()) fprintf(stderr, "[sem] wait slot=%p enter\n", (void*)(uintptr_t)a0); int rc = sem_wait(s); if (semlog()) fprintf(stderr, "[sem] wait slot=%p exit rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : fbsd_errno(errno); }
+HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem_trywait(s) == 0 ? 0 : fbsd_errno(errno); }   // EAGAIN (would block) is 11 here, 35 on the PS5
+HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return 0x16; timespec dl = abs_deadline_us(a1); int rc = sem_timedwait(s, &dl); return rc == 0 ? 0 : fbsd_errno(errno); }
+HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; int rc = sem_post(s); if (semlog()) fprintf(stderr, "[sem] post slot=%p rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : fbsd_errno(errno); }
 HLE(k_sem_getvalue)  { auto* s = ensure_sem(a0); if (!s) return 0x16; int v = 0; sem_getvalue(s, &v); if (a1) *(int*)(uintptr_t)a1 = v; return 0; }
 HLE(k_sem_destroy)   { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { sem_destroy((sem_t*)*slot); free(*slot); *slot = nullptr; } } return 0; }
 // scePthreadBarrier* -- were MISSING -> the generic stub returned 0, so BarrierWait let every thread sail
@@ -1782,7 +1789,7 @@ HLE(k_sem_destroy)   { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_st
 // reads of not-yet-produced data (the async-load race class). Back with host pthread_barrier_t; the serial
 // thread gets -1 (PTHREAD_BARRIER_SERIAL_THREAD, FreeBSD's value), the rest 0. Barrierattr are no-ops.
 HLE(k_barrier_init)    { if (!a0 || a2 == 0) return 0x16; auto* b = (pthread_barrier_t*)calloc(1, sizeof(pthread_barrier_t)); pthread_barrier_init(b, nullptr, (unsigned)a2); *(void**)(uintptr_t)a0 = b; return 0; }
-HLE(k_barrier_wait)    { auto* b = ensure_barrier(a0); if (!b) return 0x16; int rc = pthread_barrier_wait(b); return rc == PTHREAD_BARRIER_SERIAL_THREAD ? (uint64_t)(int64_t)-1 : (uint64_t)(unsigned)rc; }
+HLE(k_barrier_wait)    { auto* b = ensure_barrier(a0); if (!b) return 0x16; int rc = pthread_barrier_wait(b); return rc == PTHREAD_BARRIER_SERIAL_THREAD ? (uint64_t)(int64_t)-1 : fbsd_errno(rc); }
 HLE(k_barrier_destroy) { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { pthread_barrier_destroy((pthread_barrier_t*)*slot); free(*slot); *slot = nullptr; } } return 0; }
 HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* timeout)
     // The timeout arg (a4) was previously IGNORED — a bounded guest wait blocked forever (the
@@ -2511,8 +2518,13 @@ void prosper_win_exc_delivery(WinExcDelivery* delivery) {
 
 uint64_t win_raise_exception(uint64_t target, uint64_t type) {
     if (!target || type >= 128 || !g_exc_handlers[type]) return 0;
-    if (pthread_equal((pthread_t)target, pthread_self())) return 0x80020023ull; // EDEADLK-ish
-    if (!g_rtl_restore_context) return 0x80020026ull;                         // ENOSYS-ish
+    // FreeBSD numbering, not this host's: 0x...23 (35) is EAGAIN on the PS5, and EAGAIN is a RETRY
+    // hint, so a guest told "try again" for "you raised an exception on yourself" can spin on a
+    // condition that can never change. 0x...26 (38) is likewise ENOTSOCK, not ENOSYS (#1612).
+    if (pthread_equal((pthread_t)target, pthread_self()))
+        return prosper::hle::kSceKernelErrorEDEADLK;   // FreeBSD EDEADLK = 11
+    if (!g_rtl_restore_context)
+        return prosper::hle::kSceKernelErrorENOSYS;    // FreeBSD ENOSYS = 78
 
     // Hold a real duplicate for the complete queue/fallback transaction. This both validates the
     // pthread before publishing cooperative state and keeps a detached target's kernel object alive
@@ -2564,7 +2576,7 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
         if (previous_suspend == (DWORD)-1) {
             DWORD e = GetLastError();
             VirtualFree(delivery, 0, MEM_RELEASE);
-            return 0x80020000ull | (e & 0xffff);
+            return prosper::hle::sce_error_from_win32(e);
         }
         if (previous_suspend != 0) {
             ResumeThread(thread);
@@ -2579,7 +2591,7 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
             DWORD e = GetLastError();
             ResumeThread(thread);
             VirtualFree(delivery, 0, MEM_RELEASE);
-            return 0x80020000ull | (e & 0xffff);
+            return prosper::hle::sce_error_from_win32(e);
         }
         const uintptr_t rsp = static_cast<uintptr_t>(captured.Rsp);
         if (rsp >= exception_stack && rsp < exception_stack + kWinExcStackSize) {
@@ -2596,7 +2608,7 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
     }
 
     DWORD previous_suspend = target_suspended ? 0 : SuspendThread(thread);
-    if (previous_suspend == (DWORD)-1) { DWORD e = GetLastError(); stack_slot->active.store(0, std::memory_order_release); VirtualFree(delivery, 0, MEM_RELEASE); return 0x80020000ull | (e & 0xffff); }
+    if (previous_suspend == (DWORD)-1) { DWORD e = GetLastError(); stack_slot->active.store(0, std::memory_order_release); VirtualFree(delivery, 0, MEM_RELEASE); return prosper::hle::sce_error_from_win32(e); }
     if (previous_suspend != 0) {
         ResumeThread(thread);
         win_exc_log_rejected("already-suspended", g_win_exc_suspended_busy,
@@ -2615,7 +2627,7 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
     }
     if (!GetThreadContext(thread, delivery->saved)) {
         DWORD e = GetLastError(); ResumeThread(thread); stack_slot->active.store(0, std::memory_order_release); VirtualFree(delivery, 0, MEM_RELEASE);
-        return 0x80020000ull | (e & 0xffff);
+        return prosper::hle::sce_error_from_win32(e);
     }
     win_exc_trace(WinExcTraceKind::Redirect, target, GetThreadId(thread),
                   delivery->saved->Rip, delivery->saved->Rsp);
@@ -2633,11 +2645,11 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
                             &delivery_ptr, sizeof(delivery_ptr), &written) ||
         written != sizeof(delivery_ptr)) {
         DWORD e = GetLastError(); ResumeThread(thread); stack_slot->active.store(0, std::memory_order_release); VirtualFree(delivery, 0, MEM_RELEASE);
-        return 0x80020000ull | (e & 0xffff);
+        return prosper::hle::sce_error_from_win32(e);
     }
     if (!SetThreadContext(thread, &injected)) {
         DWORD e = GetLastError(); ResumeThread(thread); stack_slot->active.store(0, std::memory_order_release); VirtualFree(delivery, 0, MEM_RELEASE);
-        return 0x80020000ull | (e & 0xffff);
+        return prosper::hle::sce_error_from_win32(e);
     }
     // Wake while the target is still suspended. Its registration is stable until resume, and the
     // wait will be ready to return as soon as Windows restores the redirected context. This avoids
@@ -2650,7 +2662,7 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
             stack_slot->active.store(0, std::memory_order_release);
             VirtualFree(delivery, 0, MEM_RELEASE);
         }
-        return 0x80020000ull | (e & 0xffff);
+        return prosper::hle::sce_error_from_win32(e);
     }
     // A redirected Windows CONTEXT is not dispatched until a blocking syscall returns. Current
     // IL2CPP targets commonly sit in a condition-variable or WaitOnAddress HLE; waking its registered
@@ -3038,7 +3050,9 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
         if (g_exc_log2)
             fprintf(stderr, "[exc2] RAISE by tid=%ld target=0x%llx type=0x%llx sigqueue=%d\n",
                     sctid(), (unsigned long long)a0, (unsigned long long)a1, qr);
-        if (qr != 0) return 0x80020000u | (uint32_t)qr;   // deliverance FAILED — report, don't lie
+        // qr is a HOST errno from pthread_sigqueue/pthread_kill; the guest reads FreeBSD numbering,
+        // where EAGAIN and EDEADLK are swapped relative to Linux (#1612).
+        if (qr != 0) return prosper::hle::sce_error_from_host_errno(qr);   // FAILED — report, don't lie
     } else if (g_exc_log2) {
         fprintf(stderr, "[exc2] RAISE-NOOP by tid=%ld target=0x%llx type=0x%llx (no handler)\n",
                 sctid(), (unsigned long long)a0, (unsigned long long)a1);

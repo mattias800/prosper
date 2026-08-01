@@ -5,6 +5,7 @@
 // log/debug the guest's address-space construction.
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "sce_errno.hpp"
 #include "sync_futex.hpp"   // shared futex wake + waiter registration (also used by the GPU's label wake)
 #include "../host/guest_memory_map.hpp"
 #include "../host/guest_write_watch.hpp"
@@ -1135,7 +1136,10 @@ HLE(k_wait_on_address) {
     // produced → phantom item → crash in the exception unwinder. On a futex timeout, report the Sony
     // timeout error so the guest's bounded wait re-loops / handles it instead of proceeding on garbage.
     // CONFIDENCE: HIGH on the semantics (must distinguish timeout from wake).
-    // CONFIDENCE: MED on the exact code value 0x80020060 (SCE_KERNEL_ERROR_ETIMEDOUT).
+    // The value was 0x80020060, which is the decimal 60 written as if it were hex: 0x60 is 96, and
+    // FreeBSD 96 is EOWNERDEAD ("the mutex owner died"), not ETIMEDOUT. Every other timeout in the
+    // emulator already encodes the correct 0x8002003c, so this one site disagreed with the rest of
+    // the codebase and told the guest something unrelated had gone wrong (#1612).
     if (r < 0 && e == ETIMEDOUT) {
         if (punch_secs > 0 && punch_site && punch_budget.load() > 0 && *(volatile uint32_t*)(uintptr_t)a0 == (uint32_t)a1) {
             // Fabricate the awaited signal: bump the count so the guest's loop acquires and proceeds.
@@ -1147,7 +1151,7 @@ HLE(k_wait_on_address) {
                     (unsigned long long)(gra - 0x400000000ull), punch_budget.load());
             return 0;
         }
-        return 0x80020060ull;   // SCE_KERNEL_ERROR_ETIMEDOUT
+        return prosper::hle::kSceKernelErrorETIMEDOUT;   // 0x8002003c: FreeBSD ETIMEDOUT is 60
     }
     return 0;   // woken, or EAGAIN (value already changed) — treat as success; guest re-checks the count
 }
@@ -4599,7 +4603,7 @@ HLE(k_wait_on_address) {
             ULONGLONG now = GetTickCount64();
             if (now >= deadline) {
                 if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx TIMEOUT\n", (unsigned long long)a0);
-                return 0x80020060ull;   // SCE_KERNEL_ERROR_ETIMEDOUT
+                return prosper::hle::kSceKernelErrorETIMEDOUT;   // 0x8002003c: FreeBSD ETIMEDOUT is 60
             }
             wait_ms = (DWORD)(deadline - now);
         }
@@ -4613,7 +4617,7 @@ HLE(k_wait_on_address) {
         if (!woke && wait_error == ERROR_TIMEOUT) {
             if (*wa == expected) {
                 if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx TIMEOUT\n", (unsigned long long)a0);
-                return 0x80020060ull;
+                return prosper::hle::kSceKernelErrorETIMEDOUT;   // 0x8002003c: FreeBSD ETIMEDOUT is 60
             }
         }
         // else: woken or spurious — loop re-checks *addr
