@@ -19,16 +19,52 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config libavformat-dev libavcodec-dev \
-            libavutil-dev libswresample-dev libswscale-dev libva-dev
+            libavutil-dev libswresample-dev libswscale-dev libva-dev \
+            libvulkan-dev mesa-vulkan-drivers
 
+      # #1675: Vulkan was disabled here because it was never installed, not by choice — and that
+      # silently removed 27 tests (~1,700 assertions) from every "green" CI run, including every
+      # shader-recompiler and GPU-execution differential. They are designed for a software device
+      # (llvmpipe/lavapipe) and run in seconds locally, so CI can run them too.
       - name: Configure
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      # A configuration that quietly loses Vulkan would silently drop those tests again and still
+      # report 100% green. Fail the job instead of shrinking the suite.
+      # Guard the CLASS, not the instance: a configure that quietly loses Vulkan would drop the GPU
+      # suite again and still report 100% green, which is precisely the defect #1675 documents.
+      #
+      # By NAME, not by count. A "at least N tests" floor rots silently — the suite only grows, so a
+      # threshold that is meaningful today is passed by the non-GPU tests alone once enough are added,
+      # and the guard stops guarding without ever failing. These three cannot exist unless Vulkan was
+      # found, and they stay meaningful however large the suite gets.
+      - name: Verify the Vulkan-gated tests are actually registered
+        run: |
+          for t in rdna2_to_spirv_exec gpu_execute vulkan_triangle_render; do
+            if ! ctest --test-dir prosper/build-ci -N -R "^${t}$" | grep -q "Test *#"; then
+              echo "::error::${t} is not registered — the Vulkan-gated suite is missing (see #1675)"
+              exit 1
+            fi
+          done
+          echo "Vulkan-gated suite present; total registered: \
+            $(ctest --test-dir prosper/build-ci -N | tail -1 | grep -oE '[0-9]+$')"
 
       - name: Build
         run: cmake --build prosper/build-ci
 
+      # The runner has no GPU, so this is Mesa's lavapipe software rasteriser. Four tests are
+      # driver-divergent: they pass on real hardware (RADV) and fail on lavapipe, reproducibly in both
+      # places. They are EXCLUDED BY NAME rather than by disabling the suite — the defect #1675
+      # documents is a gap nobody can enumerate, and four named exclusions in a workflow file are the
+      # opposite of that. Tracked in #1681; delete from this list as each is resolved.
+      #   game_compute_exec[_no_adaptive_storage_result]  — R11G11B10 pack/unpack exactness
+      #   recompiled_fragment_render / recompiled_shaders_render — rendered-pixel comparisons
+      # Reproduce either way locally:
+      #   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json ctest -R '<name>'
       - name: Test
-        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
+        run: |
+          ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 \
+            -E '^(game_compute_exec|game_compute_exec_no_adaptive_storage_result|recompiled_fragment_render|recompiled_shaders_render)$'
 
   linux-app:
     name: Linux App

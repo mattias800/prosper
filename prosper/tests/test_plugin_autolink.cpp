@@ -40,6 +40,7 @@ static bool has(const std::vector<std::string>& v, const std::string& s) {
 }
 
 int main(int argc, char** argv) {
+    bool skipped_link_wiring = false;   // #1675: report a skipped block as SKIP, not as a pass
     std::error_code ec;
     const fs::path root = prosper_test::test_scratch_dir() / "prosper_test_plugin_autolink";
     fs::remove_all(root, ec);
@@ -222,11 +223,18 @@ int main(int argc, char** argv) {
         } else {
             printf("  [skip] %s has no Media/Plugins/PSN.prx — link wiring not exercised\n",
                    dump_root.c_str());
+            skipped_link_wiring = true;   // #1675: 21 of 30 local dumps ship no PSN.prx
         }
     } else {
         printf("  [skip] no game dump argument — link wiring not exercised\n");
+        skipped_link_wiring = true;
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    if (fails) return 1;
+    // #1675: exit 77 (ctest SKIP_RETURN_CODE) when the substantive block never ran. Without this the
+    // run reports "passed" for assertions that did not execute, and under CI's `--output-on-failure`
+    // the "[skip]" line is suppressed entirely — so the skip was invisible in the summary AND in the
+    // log body. A reader could not discover it at all.
+    return skipped_link_wiring ? 77 : 0;
 }
