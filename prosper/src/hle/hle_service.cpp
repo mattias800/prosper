@@ -224,6 +224,29 @@ struct VdecOutput {
 static_assert(sizeof(VdecComputeMemory) == 24 && sizeof(VdecComputeConfig) == 16);
 static_assert(sizeof(VdecConfig) == 72 && sizeof(VdecMemory) == 72);
 static_assert(sizeof(VdecInput) == 48 && sizeof(VdecFrame) == 32 && sizeof(VdecOutput) == 56);
+// LIVE CONFIRMATION of the two structs above, from the first title to reach the decoder lifecycle
+// (Tales of Graces f Remastered PPSA19991, criMvPly, PROSPER_SVCLOG; see #1658). These were written
+// in #1368 without title evidence; a real guest now writes values that are individually meaningful
+// at every offset, which is much stronger than a matching size:
+//
+//   VdecConfig  +0x00 size=0x48  +0x08 resource=1     +0x0c codec=1 (AVC)
+//               +0x10 profile=100 (High)              +0x14 max_level=41 (4.1)
+//               +0x18 max_width=1920                  +0x1c max_height=1088 (1080 -> macroblocks)
+//               +0x20 max_dpb=-1 (auto)               +0x24 input_depth=4
+//               +0x28 compute_queue                   +0x30 affinity=0x1fff  +0x38 priority=700
+//   VdecMemory  +0x00 size=0x48, then the cpu_size/cpu/gpu_size/gpu/shared_size/shared/max_frame_size
+//               order above, each size holding exactly the value this file reported to the guest.
+//
+// A wrong field order could not produce a coherent AVC High@4.1 1080p configuration at every slot,
+// so CONFIDENCE: HIGH on both layouts now. VdecInput's first six fields are likewise confirmed
+// (size=0x30, data, data_size, pts=-1, dts=-1) and VdecFrame's first three (size=0x20, data,
+// data_size). Only the SIZE of VdecOutput is confirmed (0x38) — its interior is written by us, not
+// the guest, and the AVC picture-info form's layout remains open (#1658).
+//
+// One naming caveat, deliberately not "fixed": VdecInput's last field, named `attached` here,
+// carried a clean 0,1,2,...  sequence across consecutive access units rather than a flag or a
+// pointer. That is evidence it may be an access-unit index, not an attachment. Nothing depends on
+// the name today and no title evidence settles it, so it is recorded rather than renamed.
 
 std::mutex g_vdec_mx;
 std::unordered_map<uint64_t, uint32_t> g_vdec_codecs;
