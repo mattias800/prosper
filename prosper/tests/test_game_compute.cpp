@@ -24,7 +24,12 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
+// #1690: this binary was excluded from CI for months, and the cost was argued from a *static* grep
+// of CHECK sites because nothing reported how many actually ran. Count the executed ones so the
+// coverage this registration contributes is a measured number in the run's own log, and so a gate
+// that quietly stops executing assertions shows up as a drop rather than as unchanged green.
+static int checks = 0;
+#define CHECK(c, msg) do { ++checks; if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
 
 int main() {
 #ifdef _WIN32
@@ -1053,8 +1058,14 @@ int main() {
         0x7E080300u,             // v4 = x from the shell input
         0x7E0A0280u,             // v5 = y = 0
         0x7E0C0280u,             // v6 = z = 0
-        0xF0000F08u, 0x00000004u, 0xBF8C3F70u,
-        0xF0200F08u, 0x00020004u, 0xBF810000u,
+        // MIMG.DIM lives in bits [5:3] (rdna2_decode.cpp: `(w >> 3) & 0x7`), so DIM=3D is 0x10 —
+        // 0x08 is DIM=2D, exactly what image_copy_2d above encodes. This fixture prepares a third
+        // address register and calls itself 3D, so the DIM field has to agree: with 0x08 the
+        // recompiler faithfully emitted a 2D SPIR-V image addressed by two coordinates while the
+        // backend bound the 3D view its 3D resource descriptor calls for, and a 3D view bound to a
+        // descriptor whose shader declares Dim 2D is undefined in Vulkan (#1690).
+        0xF0000F10u, 0x00000004u, 0xBF8C3F70u,
+        0xF0200F10u, 0x00020004u, 0xBF810000u,
     };
     static const uint32_t image_copy_2d_array[] = {
         0x7E080300u,             // v4 = x from the shell input
@@ -3341,9 +3352,9 @@ int main() {
     }
 
     if (fails) {
-        std::printf("== FAIL: %d ==\n", fails);
+        std::printf("== FAIL: %d == (%d assertions executed)\n", fails, checks);
         return 1;
     }
-    std::printf("== PASS ==\n");
+    std::printf("== PASS == (%d assertions executed)\n", checks);
     return 0;
 }

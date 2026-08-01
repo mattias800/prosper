@@ -40,7 +40,7 @@ jobs:
       # found, and they stay meaningful however large the suite gets.
       - name: Verify the Vulkan-gated tests are actually registered
         run: |
-          for t in rdna2_to_spirv_exec gpu_execute vulkan_triangle_render; do
+          for t in rdna2_to_spirv_exec gpu_execute vulkan_triangle_render game_compute_exec; do
             if ! ctest --test-dir prosper/build-ci -N -R "^${t}$" | grep -q "Test *#"; then
               echo "::error::${t} is not registered — the Vulkan-gated suite is missing (see #1675)"
               exit 1
@@ -53,8 +53,8 @@ jobs:
         run: cmake --build prosper/build-ci
 
       # The runner has no GPU, so this is Mesa's lavapipe software rasteriser. Four tests were once
-      # excluded here as "driver-divergent" (#1681). Two are no longer: the divergence was measured,
-      # and for those it was the ASSERTION that overreached, not prosper and not the driver.
+      # excluded here as "driver-divergent" (#1681). NONE of them were: every divergence was
+      # measured, and each time it was prosper's own assertion or fixture that overreached.
       #   * recompiled_fragment_render (6) / recompiled_shaders_render (1) asserted rendered pixels
       #     from draws whose shaders require an exact 64-lane fragment subgroup. lavapipe is fixed at
       #     8, so the backend correctly skips those draws fail-visibly and the target keeps its clear
@@ -65,21 +65,33 @@ jobs:
       #     signalling NaN and none all-finite: NaN payload quieting through the f16->f32 unpack,
       #     which no driver owes us. Narrowed to bit-exactness for every finite and infinite code
       #     plus NaN-ness for the rest; this runner now reports `nan-payload-only=92 real=0`.
+      #   * game_compute_exec's last two failures (#1690) looked version-specific — they failed only
+      #     on Mesa 25.2.8 and passed on Mesa 26.1.4 lavapipe and on RADV — but no driver was at
+      #     fault. The test's `image_copy_3d` fixture prepared a third address register and called
+      #     itself 3D while leaving MIMG.DIM at 2D, so the recompiler faithfully emitted a 2D SPIR-V
+      #     image addressed by two coordinates while the backend bound the 3D view its 3D resource
+      #     descriptor calls for. A 3D view bound to a descriptor whose shader declares Dim 2D is
+      #     undefined in Vulkan: Mesa 26.1.4 and RADV returned the data anyway, Mesa 25.2.8 returned
+      #     zero. Encoding DIM=3D makes the fixture exercise the 3D path it always claimed to, and it
+      #     passes on all three. A standalone Vulkan probe — a 3D storage image seeded from a host
+      #     buffer, partially written by a compute dispatch, read back, with no prosper code in the
+      #     path — passes on Mesa 25.2.8, which is what ruled the driver out.
       #
-      # game_compute_exec stays excluded for a DIFFERENT and still-open reason — #1690, not #1681.
-      # Two 3D storage-volume assertions fail only on this runner's older Mesa (25.2.8) and pass on
-      # both Mesa 26.1.4 lavapipe and RADV. The volume diagnostic shows the write landing NOWHERE
-      # rather than landing wrongly:
-      #   volume diff [S3 writeback]: bytes=510/524288 in-written-row=510 untouched=0 first=2
-      # i.e. every untouched voxel is preserved perfectly and the 512-byte written row is absent.
-      # Remove this exclusion when #1690 is resolved; it costs ~496 assertions.
+      # The exclusion list is now EMPTY, and it should stay that way. Excluding a test by name here
+      # drops it from every future green run and the loss is invisible in the result — #1675 lost 27
+      # tests to exactly that for months. If a GPU test fails here, diagnose it: all four exclusions
+      # that ever existed turned out to be an assertion or a fixture that overreached, and not one of
+      # them turned out to be the driver.
       #
       # Reproduce the software-rasteriser path locally with:
       #   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json ctest
+      # To reproduce THIS runner's exact driver, note that the Mesa here comes from the Ubuntu
+      # archive at run time rather than from a pin. It is currently 25.2.8, which both Ubuntu 24.04
+      # and 25.10 carry, so a CPU-only container reproduces it without a GPU:
+      #   podman run --rm -v "$PWD:/work" ubuntu:25.10   # mesa-vulkan-drivers 25.2.8
       - name: Test
         run: |
-          ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 \
-            -E '^(game_compute_exec|game_compute_exec_no_adaptive_storage_result)$'
+          ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
 
   linux-app:
     name: Linux App
