@@ -6581,12 +6581,72 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     // Keep the Vulkan device alive across dispatch spans. Constructing an instance, device, and queue for
     // every callback cost roughly 25 ms/frame on the native Windows frontend before any kernel work ran.
     // Function-local static initialization is thread-safe; AGC submit execution serializes subsequent use.
-    static VulkanComputeContext context;
-    static const bool context_ready = context.init();
+    //
+    // The context is heap-allocated and torn down from a std::atexit handler registered AFTER
+    // vkCreateInstance rather than from a static destructor, because ~VulkanComputeContext() calls
+    // into Vulkan (#1704). Destructors of objects with static storage duration and atexit handlers
+    // run in one list, in reverse order of registration ([basic.start.term]/3): a static object
+    // constructed here would be registered BEFORE vkCreateInstance dlopens any enabled layer, so it
+    // would be destroyed AFTER that layer's own statics, and the first vkDestroyBuffer would then
+    // dereference the layer's freed dispatch map. That is a deterministic SIGSEGV at exit under
+    // VK_LAYER_KHRONOS_validation (reproduced on layers 1.4.341, inside vvl::dispatch::GetData), and
+    // the same hazard applies to any implicit layer a user has enabled — MangoHud, vkBasalt, an
+    // overlay. Registering the teardown once the instance exists puts it ahead of the layer's in
+    // that same reverse-order list.
+    //
+    // Three things this deliberately does NOT claim:
+    //  * The guarantee covers layer state initialized up to and including init(). A layer static
+    //    first constructed later — at a first vkCmdDispatch, say — would register after this handler
+    //    and be destroyed before it. For VVL the dispatch map is built during instance/device
+    //    creation, so that is theoretical, but it is where the argument stops.
+    //  * Only statics constructed between the old registration point (completion of this object's
+    //    constructor) and the new one (return from init()) change position relative to compute
+    //    teardown — in practice the loader, the ICD and any layer. g_rtt, the executor caches and
+    //    the renderer context keep exactly the order they had, which is why nothing observable
+    //    outside teardown can move.
+    //  * Not tearing down at all — what render_vk_ctx() deliberately does for the sibling device —
+    //    would also remove the hazard, and is NOT what this does. Teardown is kept because it
+    //    releases this context's own pipelines, pools, images and memory on a device that outlives
+    //    it, which a deliberate leak would not. It additionally lets a layer report objects still
+    //    outstanding at vkDestroyDevice/vkDestroyInstance, but ONLY on the private-device path:
+    //    when the device is borrowed the destructor returns at `if (borrowed) return;` before
+    //    either call, so that particular benefit does not apply to the live-renderer path.
+    static VulkanComputeContext* context_ptr = new VulkanComputeContext();
+    static const bool context_ready = [] {
+        const bool ok = context_ptr->init();
+        // Registered even when init() failed: partially constructed Vulkan state still has to be
+        // released while the loader is alive. If std::atexit itself fails there is nothing useful
+        // to do but say so — the context then simply outlives the process, as RenderVkCtx does.
+        if (std::atexit([] {
+                VulkanComputeContext* doomed = context_ptr;
+                context_ptr = nullptr;
+                g_live_compute_context = nullptr;
+                delete doomed;
+            }) != 0) {
+            std::fprintf(stderr, "[compute] std::atexit refused the Vulkan teardown handler — "
+                                 "the compute device will not be destroyed at exit\n");
+        }
+        return ok;
+    }();
     if (!context_ready) {
         std::fprintf(stderr, "[compute] Vulkan initialization failed\n");
         return false;
     }
+    // The teardown handler nulls context_ptr, so a dispatch submitted from another thread once
+    // exit() has begun must decline instead of dereferencing it. Read once: the handler writes this
+    // pointer without synchronization, and the narrow race it leaves (teardown landing between this
+    // load and the first Vulkan call below) is not closable cheaply — but declining loudly in the
+    // common case is strictly better than the old static, which left destroyed-but-addressable
+    // memory here and simply used it.
+    VulkanComputeContext* const live_context = context_ptr;
+    if (!live_context) {
+        static std::once_flag teardown_logged;
+        std::call_once(teardown_logged, [] {
+            std::fprintf(stderr, "[compute] dispatch after Vulkan teardown — declining\n");
+        });
+        return false;
+    }
+    VulkanComputeContext& context = *live_context;
     g_live_compute_context = &context;
     const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled

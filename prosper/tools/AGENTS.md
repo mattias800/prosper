@@ -20,6 +20,15 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   an intentional cross-title tradeoff. Release review
   decides whether to fix or explicitly accept and document it. New or changed
   baselines require two-run image inspection; see `snapshot/AGENTS.md`.
+- **`vkval/`** — runs the ctest suite under `VK_LAYER_KHRONOS_validation` and **fails on any
+  validation message id that is not itemised in `vkval/allowlist.txt`** (#1704). This is the guard
+  for the whole class #1690 belongs to: a descriptor bound to a module that declares something
+  different is undefined behaviour, so it produces per-driver disagreement rather than a failure,
+  and reads as a driver-version bug. `python3 tools/vkval/vk_validation_scan.py --build-dir <dir>`
+  to gate, `--report-only` to measure. It refuses to report "clean" until it has watched the loader
+  insert the layer — an absent layer and a clean suite print exactly the same nothing. Every
+  pre-existing finding is deferred *visibly*, with a reason and an open issue; fixing one means
+  deleting its line. See `vkval/README.md`.
 - **`boot_trace/`** — boots a SELF/ELF game image through the loader + HLE and
   runs it, with the fault handler, GPU executor, and (under `PROSPER_RENDER`) the
   live Vulkan renderer. The main harness for exercising a real title headlessly.

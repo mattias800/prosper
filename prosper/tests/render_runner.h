@@ -555,11 +555,23 @@ inline BackendRenderTimingStats backend_render_timing_stats() {
 // call. Per-call Vulkan resources are created independently and are retained until their direct call
 // or explicit ordered submission batch completes. The context intentionally leaks at process exit.
 // LIFETIME INVARIANT: this context is intentionally never destroyed (no destructor; the device and
-// instance leak at process exit). The compute backend BORROWS this device (#1091) and its static
-// destructor calls vkDestroyPipeline/vkFreeMemory on it at exit, with unspecified cross-TU
-// destruction order. Adding a destructor here that destroys the device would therefore create an
-// immediate use-after-free in ~VulkanComputeContext. Do not add one without first giving compute an
-// explicit release-before-teardown handshake.
+// instance leak at process exit). The compute backend BORROWS this device (#1091) and calls
+// vkDestroyPipeline/vkFreeMemory on it at exit. Adding a destructor here that destroys the device
+// would therefore create an immediate use-after-free in ~VulkanComputeContext. Do not add one
+// without first giving compute an explicit release-before-teardown handshake.
+//
+// The mechanism on the compute side changed in #1704: that teardown now runs from a std::atexit
+// handler registered after vkCreateInstance, not from a function-local static's destructor, so it is
+// sequenced before any enabled Vulkan layer's own statics. That also makes the ordering against THIS
+// context defined rather than unspecified — borrowing this device requires this context to already
+// exist, so compute's handler is always registered later and therefore always runs first.
+//
+// Which means the specific use-after-free warned about above is now ordered away: a destructor added
+// here would be registered earlier and would run after compute has released its objects. Do not read
+// that as permission. The reasons not to add one are now different, not gone: guest threads can still
+// be dispatching when exit() begins (execute_live_compute_items declines once the handler has run,
+// but the window is not closed), and BorrowedComputeImageLease holds a raw VulkanComputeContext*.
+// Give compute an explicit release-before-teardown handshake before adding a destructor here.
 struct RenderVkCtx {
     VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;

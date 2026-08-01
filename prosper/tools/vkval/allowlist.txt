@@ -1,0 +1,65 @@
+# Vulkan validation findings that existed BEFORE the guard was switched on (#1704).
+#
+# Format:  <message id> | <required|environment-dependent> | <tests, or *> | <reason, with its issue>
+#
+#   * `required` means the id must still be observed. If it stops appearing, either the defect was
+#     fixed — delete the line, in the same change — or the scan stopped seeing things, and the
+#     second is far more likely. Both are failures until someone says which.
+#   * `environment-dependent` exempts an id from that check, and its reason line must say WHY it
+#     can be absent. Two entries below qualify; nothing else may without an argument. That is
+#     enforced, not merely asked: ctest `vkval_scan_logic` asserts this file holds exactly TWO
+#     environment-dependent entries, so flipping a `required` id to duck a failure breaks a test in
+#     another file. Adding a genuine third means editing that assertion, deliberately — the friction
+#     is the point.
+#   * The test list must be the UNION across drivers. Attribution varies: an id can reach one extra
+#     test on hardware and never on lavapipe, and a test the ledger does not record is a failure.
+#   * The test list scopes the deferral to where it was measured. This matters most for catch-all
+#     VUIDs: `pCode-08737` is VVL's identity for *any* spirv-val error at vkCreateShaderModule, so
+#     an unscoped entry would defer every future SPIR-V validity defect anywhere in the suite.
+#     `*` exists for an id that genuinely may appear anywhere; use it deliberately, not by default.
+#
+# Rules, and they matter more than the list:
+#
+#   * Every entry is a DEFERRED DEFECT, not an accepted one. Each line names an open issue.
+#     Nothing here is "fine"; it is "known, written down, and not fixed in the PR that measured it".
+#   * A line the scanner cannot fully parse is a hard error. An unexplained filter reads as
+#     "handled" when it is not, which CLAUDE.md calls out as worse than a loud gap.
+#   * Adding a line is a decision to defer, and it should come with an issue. Deleting a line
+#     is what fixing the defect looks like.
+#
+# Measured baseline, 2026-08-01, on the whole ctest suite:
+#
+#   Ubuntu 24.04 / validation layers 1.3.275.0 / Mesa 25.2.8 lavapipe   (the CI runner's exact
+#     driver, reproduced in `podman run --rm ubuntu:24.04`):  7 ids, 187 messages, 168/168 pass
+#   Fedora 44 / validation layers 1.4.341.0 / Mesa 26.1.4 RADV (STRIX_HALO):  9 ids, 51 messages
+#
+# The two ids the CI environment does not produce are the two marked environment-dependent. Neither
+# is absent because it was fixed: `maintenance4-08602` is a newer check than layers 1.3.275, and
+# `size-01389` cannot trigger on lavapipe, whose nonCoherentAtomSize is 1. Both are real on hardware.
+
+# ---- #1710: compute pipeline layout has no push-constant range, and nothing is ever pushed -----
+VUID-VkComputePipelineCreateInfo-layout-07987 | required | game_compute_exec, game_compute_exec_no_adaptive_storage_result | Compute module declares a PushConstant block while the layout declares no range (#1710)
+VUID-vkCmdDispatch-maintenance4-08602 | environment-dependent | game_compute_exec, game_compute_exec_no_adaptive_storage_result | Same root cause as 07987: the shader reads push constants that vkCmdPushConstants never wrote (#1710). Absent on the CI runner because validation layers 1.3.275 do not implement this check.
+
+# ---- #1711: our own emitter produces SPIR-V that spirv-val rejects ------------------------------
+# Scoped deliberately: this VUID is VVL's identity for EVERY spirv-val error, in every stage.
+VUID-VkShaderModuleCreateInfo-pCode-08737 | required | game_compute_exec, game_compute_exec_no_adaptive_storage_result | OpAccessChain result type disagrees with the OpTypeVector it indexes; the claimed spirv-val gate does not cover this path (#1711)
+
+# ---- #1712: Int64 capability declared, shaderInt64 never enabled on any device ------------------
+VUID-VkShaderModuleCreateInfo-pCode-08740 | required | rdna2_to_spirv_exec, texture_sample_render | Recompiled 64-bit integer ops force OpCapability Int64, which no device-creation path in the tree requests (#1712)
+
+# ---- #1713: storage-image descriptor numeric type disagrees with the module (the #1690 class) ---
+VUID-vkCmdDraw-format-07753 | required | texture_sample_render | Module wants a UINT sampled type, the bound view is R8G8B8A8_UNORM (#1713) — same defect class as #1690/#1702
+
+# ---- #1714: MRT blend state differs per attachment without independentBlend ---------------------
+VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605 | required | shadow_compare_render | Per-target blend state is built from each target's own registers while independentBlend is never enabled (#1714)
+
+# ---- #1715: generated geometry stage declares no invocation count -------------------------------
+VUID-VkPipelineShaderStageCreateInfo-stage-00715 | required | interp_render | The synthesised geometry entry point has no OpExecutionMode Invocations, so the declared count is 0 (#1715)
+
+# ---- #1716: present_blit fixture transitions a transfer-only image to SHADER_READ_ONLY_OPTIMAL --
+# 168 of the CI environment's 187 messages; the test's own header asked for this check.
+VUID-VkImageMemoryBarrier-oldLayout-01211 | required | present_blit | Fixture source images lack SAMPLED_BIT but are transitioned to SHADER_READ_ONLY_OPTIMAL (#1716)
+
+# ---- #1717: VK_WHOLE_SIZE invalidate over a non-atom-aligned mapping ----------------------------
+VUID-VkMappedMemoryRange-size-01389 | environment-dependent | gpu_capture_render_replay | invalidate_mapped_readback assumes VK_WHOLE_SIZE is exempt from the mapping-end alignment rule; it is not (#1717). Cannot trigger on lavapipe, whose nonCoherentAtomSize is 1, so every range is trivially aligned there.

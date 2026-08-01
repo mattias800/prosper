@@ -20,7 +20,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config libavformat-dev libavcodec-dev \
             libavutil-dev libswresample-dev libswscale-dev libva-dev \
-            libvulkan-dev mesa-vulkan-drivers
+            libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
 
       # #1675: Vulkan was disabled here because it was never installed, not by choice — and that
       # silently removed 27 tests (~1,700 assertions) from every "green" CI run, including every
@@ -92,6 +92,30 @@ jobs:
       - name: Test
         run: |
           ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
+
+      # #1704: until this step existed, no Vulkan validation layer ran anywhere in the project.
+      # #1690 was an invalid descriptor binding — a VK_IMAGE_VIEW_TYPE_3D view on a descriptor whose
+      # module declared Dim 2D — which is undefined behaviour that three conformant drivers resolved
+      # three different ways. It read as a Mesa version regression, cost a session of bisection and
+      # 484 executed assertions' place on this job, and the layer names it in one line at the
+      # dispatch (VUID-vkCmdDispatch-viewType-07752). Verified against that exact defect: reverting
+      # image_copy_3d's MIMG.DIM to 2D on a scratch branch makes this step fail with that VUID.
+      #
+      # It is a GATE, not an advisory collector. Every message id that existed when it was switched
+      # on is itemised in tools/vkval/allowlist.txt with a reason and an open issue (#1710-#1717);
+      # anything else fails the job, as does any test that fails under the layer but passes without
+      # it. The scanner refuses to report "clean" until it has watched the loader insert the layer,
+      # because a layer that did not load produces exactly the same empty output as a clean run —
+      # and it also fails if the allow-list is non-empty while ZERO messages were observed, which is
+      # what a parser that no longer matches this runner's layer version looks like. That is not
+      # hypothetical: the first revision of the parser read 0 of the 187 messages produced here,
+      # because layers 1.3.275 frame a message differently from 1.4.341.
+      #
+      # Measured cost on this runner: ctest reports 30.46 s without the layer and 31.08 s with it,
+      # so this step is ~31 s of wall clock. The layer package lives in noble/universe.
+      - name: Vulkan validation scan
+        run: |
+          python3 prosper/tools/vkval/vk_validation_scan.py --build-dir prosper/build-ci
 
   docs:
     name: Docs
