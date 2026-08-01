@@ -415,10 +415,12 @@ blocker.
    large artefactual 1920x1080/1519-draw-vs-3840x2160/97-draw "difference" in exactly the comparison that
    was believed to be the highest-value evidence available. **`stat` the artifacts and confirm sub-second
    pairing before treating a screenshot as evidence about a bundle.** Recorded as trap #35 in
-   `GAME_COMPAT_ORCHESTRATION.md`. **Fixed at the source by #1693 / #1694**: a grab now claims both output
-   names when it is armed, from one timestamp, so the two files of one press share a stem no other capture
-   can take — a mismatched pair can no longer be constructed by accident. The `stat` habit still applies to
-   artifacts captured before that landed, and to anything else named by ordinal.
+   `GAME_COMPAT_ORCHESTRATION.md`. **Fixed at the source by #1693 / #1694**: a grab claims both output names
+   when it is armed, from one timestamp and at one collision suffix, so the two artifacts of one press
+   always carry the **identical full stem, suffix included**. Pair on the whole stem, never on the
+   timestamp — `…-210000-123.bmp` and `…-210000-123-2.prgbundle` are two different grabs despite an
+   identical title and millisecond. The `stat` habit still applies to artifacts captured before that
+   landed (`captures/frame_grab_001.*` is exactly that shape) and to anything else named by ordinal.
 
 ## What has been fixed
 
