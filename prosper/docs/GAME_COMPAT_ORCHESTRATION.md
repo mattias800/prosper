@@ -136,6 +136,100 @@ highest-value page in this document.
 - Write `Refs #NN`, not `Fixes #NN`, when a PR only partially addresses an issue — a parenthetical qualifier does
   **not** stop GitHub's auto-close, and #1554 was closed that way despite a comment saying to keep it open.
 
+### Trap #18 — a test seam that pins a policy makes its env-var A/B silently void
+
+An A/B was run by setting `PROSPER_ULT_RETURN_SUCCESS=1` to force libSceUlt's mutex to a no-op, expecting the
+mutual-exclusion test to fail. **It passed**, which read as "the test is too weak to detect a broken lock" — a
+believable and entirely wrong conclusion. The test calls `ult_set_return_success_for_test(false)` in its own
+`main()`, deliberately, so that the environment cannot decide whether it passes. That seam overrode the variable,
+so the "no-op" arm was never a no-op; both arms ran the same real mutex. Re-run with the pin removed, the
+original test caught the broken lock immediately (27,984 of 40,000 increments surviving).
+
+**The rule: any A/B driven by an environment variable is void until you prove the variable actually took effect.**
+Have the run print the policy it is operating under, or assert the arm's expected *behaviour* before trusting its
+result. This is the same shape as trap #10 (a switch that is right for one question and silently wrong for the
+next) and trap #7 (a stale label read as state): a control that legitimately exists for one purpose silently
+neutralises a measurement made for another.
+
+Two corollaries worth keeping:
+
+- The tell is an A/B where **the arms agree when they must differ**. Treat that as an instrument failure first,
+  not a finding. A negative control that cannot fail is not a control.
+- A test that pins its own configuration is still the right design — it stops the environment deciding the
+  verdict. The defect is using that same variable as the A/B lever. Give the A/B its own lever, or remove the pin
+  for the experiment and say so.
+
+### A host function is not a valid stand-in for guest code — and only Windows will tell you
+
+A test for libSceUlt's ulthreads used an ordinary host C++ function as the ulthread entry. It passed on
+Linux and macOS and failed on **Windows MinGW only**, for three hours, on the single assertion that read the
+entry's argument back out.
+
+The guest is **System V AMD64**; prosper enters guest code through `prosper_call_guest_on_stack`, which
+marshals into SysV (first argument in `%rdi`). On Linux and macOS the host ABI *is* System V, so a host
+function is an accurate model and the test is sound by accident. On Windows the host is **Microsoft x64**,
+where the first argument arrives in `%rcx` — so the untagged host function read a garbage argument and
+returned a garbage status **while still executing correctly and touching its stack**, which is what made it
+look like it worked. The product was never wrong; the test was. `win_thread_trampoline` already documents
+this exact hazard for the production path ("a bare `pthread_create(entry, arg)` mis-passes the arg (MS x64
+vs SysV)").
+
+**The rule: any test that supplies a function for prosper to call *as guest code* must tag it with the guest
+convention**, `__attribute__((sysv_abi))` on x86-64, not leave it at the host default. Prefer the tag over an
+`#ifdef` around the body: "this function uses the guest's calling convention" is true on every platform and
+the attribute is simply redundant where the native ABI already matches. Keep such entries plain leaf
+functions — no destructors, no exceptions — because the attribute conflicts with MinGW's SEH-based C++
+unwinding, which is why `PROSPER_SYSV_ABI` is empty for the HLE handlers (see `dispatch.hpp`).
+
+The generalisable half: **a green Linux run says nothing about ABI-boundary code.** Guest entries, callbacks
+the guest invokes, and anything reached through the call-guest shims are the cases where the dev platform
+cannot fail and Windows is the only place the bug is visible.
+
+### Registering a NID with an error return can be worse than leaving it unregistered
+
+A trap of the same family as the list above, but in the HLE surface rather than an instrument. It cost a
+merged defect (#1618, introduced by #1614), so it belongs beside them.
+
+The dispatcher's default for an **unresolved** NID is `return 0` (`hle/dispatch.cpp` `prosper_on_unimpl`).
+That default is safe for a function whose contract returns a **value**, and unsafe for one that returns a
+**status** — which is exactly why fail-visible registration is usually an improvement. The trap is that the
+inverse is equally true, and easy to miss: **an error sentinel is unsafe for a value-returning contract,
+because such a signature has no error channel and the sentinel is read as data.**
+
+`sceUltWaitingQueueResourcePoolGetWorkAreaSize` returns a `size_t` in `rax` which the guest passes straight
+to `malloc`. Registering it to return `SCE_KERNEL_ERROR_ENOSYS` therefore asked for a 2.0 GiB allocation
+where the unregistered default had produced a harmless `malloc(0)` — the #544/#660 class, reintroduced by
+the very change meant to prevent it.
+
+**The rule:** before registering a NID purely to make it visible, establish from the call site whether its
+contract returns a status or a value. If it returns a value and the real one is unknown, the dispatcher's
+`0` — or better, an honest computed value — is correct, and the visibility belongs in the log line, not the
+return. Disassembling one call site is enough: `call …; mov [rbp-N],rax; …; call malloc` settles it in
+seconds, and no amount of reasoning about the function's *name* substitutes for it.
+
+### Proving "the guest never touches X" — pick the exhaustive instrument, not the plausible one
+
+Recurring question when deciding whether prosper may write bookkeeping into a guest-owned struct: *does guest
+code ever read inside it?* Answering it for libSceUlt (#1603) produced one sound instrument and one tempting
+unsound one; the difference is worth reusing.
+
+**Unsound:** identify the functions that operate on the owning C++ class by the displacements they use
+(`[reg+0x398]`, `[reg+0x410]`, …), then look for accesses inside the member's range. Displacement sets are not
+identities — `memcpy`'s bulk AVX stores and every function's own `[rsp+0x...]` stack frame match them. This
+reported **1,361** then **707** hits, all false, and tightening the heuristic eventually matched *nothing*,
+which is equally uninformative. A heuristic that can be tuned from "everything" to "nothing" is measuring the
+tuning, not the subject.
+
+**Sound:** enumerate the objects' actual addresses, then scan **every** RIP-relative reference in the whole
+executable segment and ask which land at a non-zero offset from one. That is exhaustive over the only
+addressing mode that can reach a static object, so zero hits is a proof rather than an absence of evidence. It
+found 16 static Ult objects and **zero** interior references — every reference a `lea` of the base feeding an
+Ult call.
+
+Generalising: prefer the instrument whose **negative result is exhaustive over a closed set** (all
+RIP-relative references) to one that pattern-matches an **open set** (all functions that might alias a
+pointer). When only the open-set instrument exists, its negative result is a hypothesis, not a finding.
+
 ## The orchestration contract
 
 ### Orchestrator responsibilities

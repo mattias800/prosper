@@ -290,6 +290,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_ult_fail_visible PRIVATE prosper_core)
   add_test(NAME ult_fail_visible COMMAND test_ult_fail_visible)
 
+  # #1603 Phase 2: the implemented libSceUlt semantics. Mutual exclusion is DEMONSTRATED with real
+  # concurrent threads over a non-atomic counter and an exact expected total — a no-op mutex produces
+  # a wrong-but-plausible number rather than a crash, so only the exact total is a real check.
+  # Pure, no game dump.
+  add_executable(test_ult_semantics tests/test_ult_semantics.cpp)
+  target_link_libraries(test_ult_semantics PRIVATE prosper_core Threads::Threads)
+  add_test(NAME ult_semantics COMMAND test_ult_semantics)
+
   add_executable(test_posix_sem tests/test_posix_sem.cpp)
   target_link_libraries(test_posix_sem PRIVATE prosper_core)
   add_test(NAME posix_sem_hle COMMAND test_posix_sem)

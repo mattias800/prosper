@@ -1173,6 +1173,15 @@ HLE(k_pthread_rename) {
 // 8 MiB per exited thread. The trampoline still TRACKS the bounds (via pthread_getattr_np, keyed
 // by our tid) so GC/thread-stack queries stay accurate, and unregisters them on exit — pthread
 // ids are recycled, so a stale entry would serve the next thread the dead thread's bounds.
+
+// Host-side hooks for the NEXT guest_thread_spawn on this thread. Deliberately a thread-local
+// rather than an argument: k_pthread_create also serves scePthreadCreate, whose 5-argument form
+// leaves a5 (r9) caller-indeterminate, so reading hooks out of a guest register would dereference
+// garbage on every ordinary thread creation (the same class as the a4 name-pointer hazard that
+// k_pthread_create_noname exists to avoid). Creation is serialised per calling thread, so a
+// thread-local is exactly the right scope.
+namespace { thread_local const GuestThreadHooks* t_pending_guest_thread_hooks = nullptr; }
+
 #if defined(__linux__) || defined(__APPLE__)
 namespace {
 extern "C" uint64_t prosper_call_guest_on_stack(uintptr_t stack_top, uint64_t fn,
@@ -1185,6 +1194,11 @@ struct ThreadStart {
     char name[kGuestThreadNameSize];
     uint64_t name_generation;
     std::atomic<bool> name_published{false};
+    // Optional host-side hooks, both invoked on the HOST %fs — on_enter as the last host action
+    // before the guest entry, on_exit as the first after it returns. Null for every existing caller,
+    // so this changes nothing for scePthreadCreate. libSceUlt uses them to count RUNNING ulthreads at
+    // the real guest-code boundary and to measure guest stack usage (#1603).
+    GuestThreadHooks hooks{};
 };
 // Runs first on the new thread: register our own stack (keyed by our tid) BEFORE any guest code,
 // so an early GC_register_my_thread / stack-base query from this thread finds it. Closes a race
@@ -1226,6 +1240,7 @@ void* thread_trampoline(void* p) {
 #endif
     auto entry = ts->entry; void* arg = ts->arg;
     void* guest_stack = ts->guest_stack; size_t guest_stack_size = ts->guest_stack_size;
+    const GuestThreadHooks hooks = ts->hooks;
     delete ts;   // all host libc; MUST run on the host %fs
     // gated (PROSPER_GUEST_FS): give this guest worker its own guest TCB + static TLS and switch %fs to it
     // as the LAST host action before entering guest code (so guest initial-exec TLS — incl. libc.prx's
@@ -1233,6 +1248,7 @@ void* thread_trampoline(void* p) {
     // stubs swap back to host %fs per HLE call. No-op when the gate is off. Order matters: the free() above
     // is host glibc (host-TLS tcache) — running it under the guest %fs corrupts the host heap.
     arm_hwbp_this_thread();   // no-op unless PROSPER_HWBP_ALLTHREADS; MUST run on host %fs (host libc calls)
+    if (hooks.on_enter) hooks.on_enter(hooks.opaque);   // host %fs; see ThreadStart::hooks
     guest_tls_activate_thread();
     void* rv = nullptr;
     if (entry) {
@@ -1254,6 +1270,7 @@ void* thread_trampoline(void* p) {
     // exit via scePthreadExit never get here — its import gate already restored host %fs and
     // k_pthread_exit purges before host pthread_exit.
     (void)guest_fs_to_host_scoped();
+    if (hooks.on_exit) hooks.on_exit(hooks.opaque, (uint64_t)(uintptr_t)rv);   // back on host %fs
     tls_dtv_purge_current_thread();
     unregister_thread_stack((uint64_t)pthread_self());   // ids recycle; stale bounds = wrong bounds (#138)
     retire_guest_thread_name((uint64_t)(uintptr_t)pthread_self(), name_generation);
@@ -1276,6 +1293,7 @@ struct WinThreadStart {
     char name[kGuestThreadNameSize];
     uint64_t name_generation;
     std::atomic<bool> name_published{false};
+    GuestThreadHooks hooks{};   // see ThreadStart::hooks
 };
 extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a1);
 extern "C" uint64_t prosper_call_guest_on_stack(uintptr_t stack_top, uint64_t fn,
@@ -1351,6 +1369,7 @@ void* win_thread_trampoline(void* p) {
     uint64_t entry = ts->entry; void* arg = ts->arg;
     void* guest_stack = ts->guest_stack; size_t guest_stack_size = ts->guest_stack_size;
     char name[sizeof(ts->name)]; memcpy(name, ts->name, sizeof(name));
+    const GuestThreadHooks hooks = ts->hooks;
     delete ts;   // host libc: run on host %fs (before activate)
     if (name[0]) {
         wchar_t wname[sizeof(name)]{};
@@ -1375,6 +1394,7 @@ void* win_thread_trampoline(void* p) {
     }
     trace_guest_thread_lifecycle(true, (uint64_t)pthread_self(),
                                  (uint64_t)GetCurrentThreadId(), registered_base, registered_size);
+    if (hooks.on_enter) hooks.on_enter(hooks.opaque);   // host %fs; see ThreadStart::hooks
     guest_tls_activate_thread();   // this worker's guest %fs TCB (FSGSBASE); no-op if the gate is off
     void* rv = nullptr;
     if (entry) {
@@ -1407,6 +1427,7 @@ void* win_thread_trampoline(void* p) {
             }
         }
     }
+    if (hooks.on_exit) hooks.on_exit(hooks.opaque, (uint64_t)(uintptr_t)rv);   // back on host %fs
     tls_dtv_purge_current_thread();
     trace_guest_thread_lifecycle(false, (uint64_t)pthread_self(),
                                  (uint64_t)GetCurrentThreadId(), registered_base, registered_size);
@@ -1462,6 +1483,7 @@ HLE(k_pthread_create) {
     ts->guest_stack = supplied_stack; ts->guest_stack_size = supplied_stack_size;
     ts->name_generation = next_guest_thread_name_generation();
     ts->name[0] = 0;
+    if (t_pending_guest_thread_hooks) ts->hooks = *t_pending_guest_thread_hooks;
     if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, &la, thread_trampoline, ts);   // trampoline registers the stack first
     if (getenv("PROSPER_SYNCLOG")) fprintf(stderr, "[thread] pthread_create rc=%d\n", r);
@@ -1499,6 +1521,7 @@ HLE(k_pthread_create) {
     ts->guest_stack = supplied_stack; ts->guest_stack_size = supplied_stack_size;
     ts->name_generation = next_guest_thread_name_generation();
     ts->name[0] = 0;
+    if (t_pending_guest_thread_hooks) ts->hooks = *t_pending_guest_thread_hooks;
     if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, &la, win_thread_trampoline, ts);
     pthread_attr_destroy(&la);
@@ -1509,6 +1532,36 @@ HLE(k_pthread_create) {
     if (a0) *(uint64_t*)a0 = (uint64_t)tid;
     return 0;
 }
+// Spawn a guest-code thread through the EXACT path scePthreadCreate uses, with an explicit
+// caller-supplied guest stack and optional host-side entry/exit hooks.
+//
+// This exists so libSceUlt's ulthreads (#1603) reuse the trampoline rather than reimplementing it.
+// That trampoline carries a lot of hard-won behaviour a second copy would silently lose: the guest
+// %fs TCB activation and its terminal restore before glibc's thread cleanup (#644), stack-bounds
+// registration keyed by tid and its removal on exit because pthread ids recycle (#138), the
+// __tls_get_addr DTV purge (#68), sigaltstack for a catchable guest stack overflow, and host thread
+// naming. `guest_stack` is honoured exactly: the host pthread keeps a glibc-owned stack for its own
+// static TLS and bookkeeping, and the guest entry is called on the caller's range — which is what
+// _sceUltUlthreadCreate's `context`/`sizeContext` pair is.
+int guest_thread_spawn(uint64_t entry, uint64_t arg, const char* name,
+                       void* guest_stack, size_t guest_stack_size,
+                       const GuestThreadHooks* hooks, uint64_t* out_thread) {
+    GuestPthreadAttr attr{};
+    pthread_attr_init(&attr.host);
+    pthread_attr_setdetachstate(&attr.host, PTHREAD_CREATE_JOINABLE);
+    attr.supplied_stack = guest_stack;
+    attr.supplied_stack_size = guest_stack_size;
+    void* attr_ptr = &attr;
+    uint64_t tid = 0;
+    t_pending_guest_thread_hooks = hooks;
+    const uint64_t rc = k_pthread_create((uint64_t)(uintptr_t)&tid, (uint64_t)(uintptr_t)&attr_ptr,
+                                         entry, arg, (uint64_t)(uintptr_t)name, 0);
+    t_pending_guest_thread_hooks = nullptr;
+    pthread_attr_destroy(&attr.host);
+    if (rc == 0 && out_thread) *out_thread = tid;
+    return (int)rc;
+}
+
 // Plain POSIX pthread_create(thread, attr, start, arg) has only 4 args, so a4 (r8) is caller-indeterminate
 // scratch. k_pthread_create reads a4 as a thread-name pointer -- legitimate for scePthreadCreate /
 // pthread_create_name_np (5-arg), but for the 4-arg POSIX form a non-zero garbage a4 makes it strncpy from
