@@ -471,7 +471,23 @@ uint64_t cond_note_ms() {
     return v;
 }
 
-uint64_t self_thread() { return (uint64_t)(uintptr_t)pthread_self(); }
+// Thread identity for mutex ownership. Deliberately NOT `pthread_self()` cast to an integer:
+// pthread_t is opaque by specification — which is exactly why pthread_equal() exists — and on an
+// implementation where it is a struct pointer rather than an id, an integer comparison would be
+// UNRELIABLE rather than loudly broken. Ownership is what makes the condvar's release/reacquire and
+// the self-deadlock diagnosis correct, so it must not rest on a representation assumption.
+//
+// Each thread instead takes a unique non-zero token from a monotonic counter on first use. That is
+// portable by construction, exact, and cheaper on a path the guest hits a million times per boot
+// than a pthread_self() call. The token is an identity, never a handle: pthread_join still needs a
+// real pthread_t, which UltObject::host_thread carries under the project-wide convention that
+// k_pthread_create/k_pthread_join already use.
+std::atomic<uint64_t> g_next_thread_token{1};
+thread_local uint64_t t_thread_token = 0;
+uint64_t self_thread() {
+    if (!t_thread_token) t_thread_token = g_next_thread_token.fetch_add(1, std::memory_order_relaxed);
+    return t_thread_token;
+}
 
 void abstime_in_ms(struct timespec& ts, uint64_t ms) {
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -825,7 +841,7 @@ uint64_t mutex_lock_impl(UltObject* o, const char* fn) {
         if (rc == ETIMEDOUT || rc == EBUSY) {
             if (!o->warned_block.exchange(true))
                 log_line("BLOCKED >%llums: sceUltMutexLock on \"%s\" (0x%llx) — holder thread 0x%llx, "
-                         "waiter thread 0x%llx. Still waiting. If the title appears hung, this is "
+                         "waiter thread token 0x%llx. Still waiting. If the title appears hung, this is "
                          "where. (PROSPER_ULT_BLOCK_WARN_MS)",
                          (unsigned long long)warn_ms, o->name.c_str(),
                          (unsigned long long)o->guest_addr,
