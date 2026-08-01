@@ -2741,7 +2741,8 @@ void GpuState::apply(const Pm4Command& c) {
 // Dcb/DcbFinal ordered independently from Acb.
 extern "C" void prosper_gpu_set_fold_origin(uint8_t origin) { g_fold_origin = origin; }
 
-size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
+size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st,
+                          size_t* consumed_dwords) {
     // Each TOP-LEVEL stream starts a fresh fold state (#312: the pause flag and the lazily-opened
     // deferred stream are per-fold). A Jump recursion must NOT reset them: the jump target
     // executes INSIDE the paused stream, and resetting mid-stream both un-gated the parent's
@@ -2755,7 +2756,8 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
         g_fold_seq.fetch_add(1, std::memory_order_relaxed);   // #312 label-history fold id
     }
     std::vector<Pm4Command> ops;
-    decode_pm4(buf, dwords, ops);
+    const size_t consumed = decode_pm4(buf, dwords, ops);
+    if (consumed_dwords) *consumed_dwords = consumed;
     for (auto& c : ops) {
         c.stream_order = st.command_order + 1;
         c.queue_origin = g_fold_origin;   // #1226: retained by deferred/pended effects
