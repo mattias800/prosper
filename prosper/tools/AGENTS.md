@@ -153,12 +153,50 @@ gitdir links, so the build-time fallback revision is `unknown` there.
 graphical bug or an FPS drop, press **F9** to capture that moment for offline debugging — no need to
 predict a submit index with `PROSPER_GPU_CAPTURE_AT`. F9 arms a one-shot capture of the next frame
 (default 1, `PROSPER_CAPTURE_FRAMES=1..240` to grab an animation over several frames) and writes two
-files (to `PROSPER_CAPTURE_DIR`, default cwd): `frame_grab_NNN.prgbundle` (a replayable capture) and
-`frame_grab_NNN.bmp` (a convenience screenshot). It is purely on-demand — nothing heavy runs until you
+files (to `PROSPER_CAPTURE_DIR`, default cwd):
+
+```
+frame_grab_<titleId>_<YYYYMMDD>-<HHMMSS>-<mmm>[-<N>].prgbundle   a replayable capture
+frame_grab_<titleId>_<YYYYMMDD>-<HHMMSS>-<mmm>[-<N>].bmp         a convenience screenshot
+```
+
+**Both files of one grab share one stem**, and that stem is claimed — with an exclusive create, so it
+cannot be taken twice — at the moment F9 is pressed. Read that as a guarantee you can rely on when
+triaging: two files with the same stem ARE the same capture, and two files with different stems are
+never the same capture, whatever their timestamps say. The optional `-2`, `-3`, … appears only when
+the name was already in use, and it applies to the whole capture rather than to one file. A grab that
+is interrupted leaves its unwritten artifact as a **zero-byte** file: that is a capture that never
+finished, and `gpu_replay` says so in those words rather than reporting a corrupt bundle. (When the
+app is still running it does better than a placeholder — a superseded or failed capture has its
+reserved file removed and accounted for in the log — so a *missing* sibling is not a corrupt capture
+either. The log distinguishes them.)
+(Before this scheme the name was a per-process counter, `frame_grab_001`, which let a second title
+played in the same directory overwrite the first title's captures, and let an aborted grab's `.bmp`
+sit beside a same-named `.prgbundle` from an earlier boot — a mismatched pair that reads as one frame
+in two states.)
+
+The console tells you the real paths, and only once they exist. The arming line names the title, not a
+file — at arm time the eventual name is not yet a fact — and each artifact is reported by its own line
+after it is written:
+
+```
+[grab] F9 #1: arming a whole-frame capture for PPSA25009 (Blue Prince)
+[grab] screenshot written (armed at guest present 41207, written at guest present 41209) -> ./frame_grab_PPSA25009_20260801-142233-471.bmp
+[grab] bundle written -> ./frame_grab_PPSA25009_20260801-142233-471.prgbundle
+```
+
+**To collect artifacts from a log mechanically, match the two prefixes `[grab] screenshot written` and
+`[grab] bundle written`, and take everything after the first ` -> `.** Not every `[grab]` line is an
+artifact report: the layer underneath also prints progress, arming and abort lines (`[grab]
+frame-bundle: capturing 1 frames; target path …`, `[grab] frame-bundle written (312 submits) -> …`),
+and the env-driven capture flows print their own. Those name a *target* or a *stage*, and a target is
+not a file that exists. The two prefixes above are emitted only after the file is on disk.
+
+It is purely on-demand — nothing heavy runs until you
 press, so the grab never distorts the very slowdown you are observing (you will see a brief hitch on the
 press). It captures the frame *right after* the press, so it is faithful for persistent glitches and
 slowdowns (a single-frame transient could slip by a frame). Replay/debug with
-`gpu_replay --bundle frame_grab_NNN.prgbundle out.bmp` — it reproduces the real image even for a deferred
+`gpu_replay --bundle <that path> out.bmp` — it reproduces the real image even for a deferred
 renderer: the capture **seeds** the renderer-owned RTTs the frame *samples* (deferred G-buffer /
 temporal-AA history) with their live pixels (#1291), so a single submit no longer replays black. Drill
 into one submit with `--bundle-extract-submit K sub.prgcap`, then `--draw-steps` / `--inspect-only` /

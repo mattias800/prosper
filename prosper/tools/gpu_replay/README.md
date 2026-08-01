@@ -3,8 +3,11 @@
 **Getting a capture:** either the env-driven `PROSPER_GPU_CAPTURE`/timeline flows below, or — the fastest
 for a graphical bug or FPS drop you can *see* — press **F9** while a title runs in `prosper-app` to grab
 the current frame into a replayable `.prgbundle` + screenshot (`PROSPER_CAPTURE_DIR`, default cwd; it seeds
-the renderer-owned RTTs the frame samples, so deferred titles replay for real). Replay it with
-`--bundle <file>`; see `tools/AGENTS.md` (interactive frame grab).
+the renderer-owned RTTs the frame samples, so deferred titles replay for real). Both files are named
+`frame_grab_<titleId>_<YYYYMMDD>-<HHMMSS>-<mmm>[-<N>]`, sharing one stem claimed when F9 was pressed —
+same stem means same capture, different stem means different capture — and the app logs each real path
+once that file exists. Replay it with `--bundle <file>`; see `tools/AGENTS.md` (interactive frame grab).
+A zero-byte `.prgbundle` is a grab that was interrupted, and `--bundle` rejects it saying exactly that.
 
 `gpu_replay` inspects, validates, graphs, and renders a local `.prgcap` without booting the guest.
 Capsules contain title-derived shaders, resource bytes, addresses, ordered DMA endpoints, optional rendered RTT
