@@ -252,6 +252,58 @@ int main() {
     record_gpu_timeline_present(5, 0, 0, 1920, 1080);
     CHECK(!interactive_capture_bundle_active(), "the re-armed grab completes and disarms");
 
+    // #1587: the user pressed a key, so every completed grab must leave a collectable outcome. When
+    // the only report was a line on stderr among tens of thousands, a failed grab was
+    // indistinguishable from a keystroke that never registered — several agents on a 4K title read it
+    // that way. Assert the SPECIFIC outcome, not merely that one exists.
+    {
+        InteractiveGrabOutcome outcome;
+        // Both grabs above ended with an empty window (no submits recorded between the presents).
+        // That is a failure the user needs told, not silence.
+        CHECK(take_interactive_grab_outcome(outcome),
+              "#1587: a completed grab leaves an outcome for the frontend to report");
+        CHECK(!outcome.ok && !outcome.error.empty(),
+              "#1587: an empty-window grab reports failure with a reason, not silence");
+        CHECK(outcome.bundle_path.find("prosper_frame_grab_unit2") != std::string::npos,
+              "#1587: the outcome names the exact grab it belongs to");
+        CHECK(outcome.max_unique_bytes > 0,
+              "#1587: the outcome carries the budget in force, so the frontend can name the remedy");
+        // Take-once: a second poll must not re-report the same grab, or the frontend would re-raise
+        // the same notice on every frame.
+        InteractiveGrabOutcome again;
+        CHECK(!take_interactive_grab_outcome(again),
+              "#1587: an outcome is reported exactly once");
+    }
+
+    // The budget is settable per grab, which is the whole point of #1587: the F9 path was pinned to
+    // the default with no way to raise it, and one 3840x2160 deferred frame exceeds 2 GiB.
+    {
+        request_interactive_capture_bundle(
+            prosper_test::test_scratch_file("prosper_frame_grab_budget.prgbundle"), 3072);
+        record_gpu_timeline_present(6, 0, 0, 3840, 2160);
+        record_gpu_timeline_present(7, 0, 0, 3840, 2160);
+        InteractiveGrabOutcome budget;
+        CHECK(take_interactive_grab_outcome(budget) && budget.max_unique_bytes == (3072ull << 20),
+              "#1587: a requested budget of 3072 MiB is the budget actually in force");
+        // And the clamp still holds at the top end.
+        request_interactive_capture_bundle(
+            prosper_test::test_scratch_file("prosper_frame_grab_clamp.prgbundle"), 99999);
+        record_gpu_timeline_present(8, 0, 0, 3840, 2160);
+        record_gpu_timeline_present(9, 0, 0, 3840, 2160);
+        InteractiveGrabOutcome clamped;
+        CHECK(take_interactive_grab_outcome(clamped) && clamped.max_unique_bytes == (3072ull << 20),
+              "#1587: an over-large request clamps to the 3072 MiB ceiling rather than overflowing");
+        // Restore the default budget: this state is global, and leaving it at 3072 would silently
+        // change the ceiling every later grab in this binary runs under.
+        request_interactive_capture_bundle(
+            prosper_test::test_scratch_file("prosper_frame_grab_restore.prgbundle"), 2048);
+        record_gpu_timeline_present(10, 0, 0, 1920, 1080);
+        record_gpu_timeline_present(11, 0, 0, 1920, 1080);
+        InteractiveGrabOutcome restored;
+        CHECK(take_interactive_grab_outcome(restored) && restored.max_unique_bytes == (2048ull << 20),
+              "#1587: the budget is restored to the default for later grabs");
+    }
+
     // Persistent depth/stencil images can predate the captured frame (for example a shadow-atlas
     // cascade retained from the previous frame). F9 must snapshot them at the capture boundary and
     // attach them to the first submit so bundle replay does not start those planes at zero (#1307).
@@ -277,6 +329,18 @@ int main() {
           ds_first.ds_seeds.size() == 1 && ds_first.ds_seeds[0].depth == ds_seed.depth &&
           ds_second.ds_seeds.empty(),
           "F9 bundle seeds only its first submit with capture-boundary depth/stencil state");
+    // #1587: this is the only grab in the file that SUCCEEDS, so it is the only place the ok-path
+    // publish can be covered. Every other new assertion exercises a failure outcome; without this one
+    // a regression that reported success as a failure — or published nothing at all on success —
+    // would pass the suite. It also restores the consume-once invariant: leaving this grab's outcome
+    // uncollected would hand it to whichever later test polls next.
+    {
+        InteractiveGrabOutcome ok_outcome;
+        CHECK(take_interactive_grab_outcome(ok_outcome) && ok_outcome.ok &&
+              ok_outcome.error.empty() &&
+              ok_outcome.bundle_path == ds_bundle_path.string(),
+              "#1587: a grab that writes its bundle publishes ok with no error and the exact path");
+    }
     set_gpu_capture_ds_seed_snapshot_reader({});
     std::filesystem::remove(ds_bundle_path, ec);
 

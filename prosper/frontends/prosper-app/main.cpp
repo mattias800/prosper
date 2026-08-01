@@ -67,6 +67,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>     // strict PROSPER_CAPTURE_BUNDLE_MAX_MB parse (#1587)
+#include <climits>
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -1280,6 +1282,24 @@ int main(int argc, char** argv) {
     // also snapshot the next presented CPU frame to a BMP next to its .prgcap.
     const std::string grabDir = getenv("PROSPER_CAPTURE_DIR") ? getenv("PROSPER_CAPTURE_DIR") : ".";
     unsigned grabCounter = 0;
+    // 0 = keep the built-in default; the timeline clamps whatever is supplied to 64..3072 MiB.
+    // Parse strictly, matching the two checked parses of this same variable in gpu_timeline.cpp. An
+    // unchecked strtoul truncates into uint32_t, so 4294967360 would arrive as 64 — silently the
+    // MINIMUM budget when the user asked for the largest, which is the opposite of the intent and
+    // would look like the fix not working.
+    uint32_t grabBundleMaxMb = 0u;
+    if (const char* mb = getenv("PROSPER_CAPTURE_BUNDLE_MAX_MB")) {
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long parsed = strtoul(mb, &end, 0);
+        if (!errno && end != mb && end && !*end && parsed <= UINT32_MAX)
+            grabBundleMaxMb = static_cast<uint32_t>(parsed);
+        else
+            fprintf(stderr, "[grab] ignoring malformed PROSPER_CAPTURE_BUNDLE_MAX_MB=\"%s\" "
+                            "(expected 64..3072)\n", mb);
+    }
+    std::string grabNotice;   // transient window-title notice for the last completed F9 grab (#1587)
+    std::chrono::steady_clock::time_point grabNoticeUntil{};
     std::string pendingGrabScreenshot;   // non-empty => write the next presented CPU frame to this path
     uint64_t pendingGrabGuestPresent = 0;
     auto flushGrabScreenshot = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
@@ -1476,7 +1496,12 @@ int main(int argc, char** argv) {
                     ev.key.key == SDLK_F9) {
                     char base[512];
                     std::snprintf(base, sizeof base, "%s/frame_grab_%03u", grabDir.c_str(), ++grabCounter);
-                    prosper::gpu::request_interactive_capture_bundle(std::string(base) + ".prgbundle");
+                    // Honour PROSPER_CAPTURE_BUNDLE_MAX_MB here too (#1587). It was consulted only on
+                    // the headless/scheduled paths, so the hotkey was pinned to the 2 GiB default with
+                    // no way to raise it without editing code — and one 3840x2160 frame of a deferred
+                    // renderer exceeds that, which made F9 unusable on 4K UE titles.
+                    prosper::gpu::request_interactive_capture_bundle(
+                        std::string(base) + ".prgbundle", grabBundleMaxMb);
                     pendingGrabScreenshot = std::string(base) + ".bmp";
                     pendingGrabGuestPresent = gpu::present_count();
                     std::fprintf(stderr,
@@ -1763,6 +1788,40 @@ int main(int argc, char** argv) {
         // test-pattern mode there is no guest, so use the dims we feed (present_width/height report
         // the VideoOut registry, which is empty without a guest). Either way, readback needs a
         // buffer sized to the frame it holds — guard zero dims so we never present a 0-extent image.
+        // #1587: the user pressed a key. Report what the grab actually did, in the window title as
+        // well as stderr — a silent failure is indistinguishable from a keystroke that never
+        // registered, which is the conclusion several agents reached on a 4K title. The title notice
+        // is deliberately non-modal: F9 can be pressed during a routed run, and a message box would
+        // block the render loop mid-capture.
+        {
+            prosper::gpu::InteractiveGrabOutcome grab;
+            if (prosper::gpu::take_interactive_grab_outcome(grab)) {
+                if (grab.ok) {
+                    std::fprintf(stderr, "[grab] OK -> %s\n", grab.bundle_path.c_str());
+                    grabNotice = "F9: captured " +
+                        std::filesystem::path(grab.bundle_path).filename().string();
+                } else {
+                    std::fprintf(stderr,
+                        "\n=========================== F9 FRAME GRAB FAILED ===========================\n"
+                        "  %s\n"
+                        "  no .prgbundle was written: %s\n"
+                        "  the .bmp screenshot for this press was written separately and is unaffected\n"
+                        "  budget in force: %llu MiB — raise it with "
+                        "PROSPER_CAPTURE_BUNDLE_MAX_MB=<64..3072> and press F9 again\n"
+                        "============================================================================\n\n",
+                        grab.error.c_str(), grab.bundle_path.c_str(),
+                        static_cast<unsigned long long>(grab.max_unique_bytes >> 20));
+                    grabNotice = "F9 GRAB FAILED — see console (raise PROSPER_CAPTURE_BUNDLE_MAX_MB)";
+                }
+                grabNoticeUntil = std::chrono::steady_clock::now() + std::chrono::seconds(grab.ok ? 4 : 12);
+                if (win) SDL_SetWindowTitle(win, (title + " — " + grabNotice).c_str());
+            }
+            if (!grabNotice.empty() && std::chrono::steady_clock::now() >= grabNoticeUntil) {
+                grabNotice.clear();
+                if (win) SDL_SetWindowTitle(win, title.c_str());
+            }
+        }
+
         // Render completion and guest flips are separate clocks: the command stream can flip before
         // the renderer publishes its CPU frame. Key this loop to the completed-frame sequence so a
         // late renderer publication is not missed or marked handled while only the previous frame exists.
