@@ -1429,3 +1429,28 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   target_link_libraries(test_present_blit PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
   add_test(NAME present_blit COMMAND test_present_blit)
 endif()
+
+# ---------------------------------------------------------------------------
+# Per-case scratch directory for every registered test (#1613).
+#
+# Tests that must touch the real filesystem take their paths from
+# tests/test_scratch.h, which reads PROSPER_TEST_SCRATCH_DIR. Giving each ctest
+# *case* its own root is what makes `ctest -j` safe: one test binary is
+# sometimes registered as several cases (game_compute_exec and
+# game_compute_exec_no_adaptive_storage_result are the same executable), so
+# per-binary uniqueness is not enough. The helper adds a pid component
+# underneath, which separates concurrent ctest invocations from different
+# worktrees. The root is inside the build directory, never /tmp — see the
+# header for why that matters on this machine.
+#
+# This must stay at the very end of the file: it snapshots the DIRECTORY TESTS
+# property, so any add_test() below it would not be covered. A test that did get
+# missed still fails safe rather than silently — test_scratch.h falls back to
+# <cwd>/prosper-test-scratch/, and ctest's working directory is this same build
+# directory, so it lands off the tmpfs either way; it merely loses the per-case
+# split (the pid component still separates concurrent processes).
+get_property(prosper_registered_tests DIRECTORY PROPERTY TESTS)
+foreach(prosper_test_case IN LISTS prosper_registered_tests)
+  set_property(TEST ${prosper_test_case} APPEND PROPERTY ENVIRONMENT
+    "PROSPER_TEST_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-scratch/${prosper_test_case}")
+endforeach()

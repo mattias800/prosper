@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include "test_scratch.h"
 
 using namespace prosper;
 
@@ -46,7 +47,7 @@ int main() {
     // waiting to become available (#1373).
     {
         namespace fs = std::filesystem;
-        const fs::path app0 = fs::temp_directory_path() /
+        const fs::path app0 = prosper_test::test_scratch_dir() /
             ("prosper-playgo-" + std::to_string((uintptr_t)&fails));
         std::error_code ec;
         fs::remove_all(app0, ec);

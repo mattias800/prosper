@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include "test_scratch.h"
 
 using namespace prosper;
 using namespace prosper::input;
@@ -497,7 +498,7 @@ int main() {
               (SCE_PAD_BUTTON_UP | SCE_PAD_BUTTON_CROSS), "route: time range active");
 
         const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
-        const auto route_path = std::filesystem::temp_directory_path() /
+        const auto route_path = prosper_test::test_scratch_dir() /
                                 ("prosper_test_pad_route_" + std::to_string(unique) + ".pad");
         { std::ofstream route(route_path); route << "# loaded route\nf7-12:options\np20-24:cross\n"; }
         std::string route_error;

@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include "test_scratch.h"
 
 namespace fs = std::filesystem;
 using namespace prosper;
@@ -32,7 +33,7 @@ static bool denied(const std::string& r) { return r.rfind("/prosper-denied", 0) 
 int main() {
     std::printf("== test_translate_sandbox ==\n");
     std::error_code ec;
-    const fs::path root = fs::temp_directory_path() / "prosper_test_translate_sandbox";
+    const fs::path root = prosper_test::test_scratch_dir() / "prosper_test_translate_sandbox";
     fs::remove_all(root, ec);                       // stale run debris
     fs::create_directories(root / "data");
     fs::create_directories(root / "arcrunner" / "content" / "movies");   // dump-style lowercase

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include "test_scratch.h"
 
 using namespace prosper::gpu;
 namespace P = prosper::agc::Pm4;
@@ -852,7 +853,7 @@ int main() {
     captured.ds_seeds.push_back(ds_seed);
     captured.draws[0].vrt.resources[0].resource.depth = 7;
 
-    auto path = std::filesystem::temp_directory_path() / "prosper_gpu_capture_test.prgcap";
+    auto path = prosper_test::test_scratch_dir() / "prosper_gpu_capture_test.prgcap";
     GpuCaptureFile duplicate_seed = captured; duplicate_seed.rtt_seeds.push_back(captured.rtt_seeds[0]);
     CHECK(!write_gpu_capture(path.string(), duplicate_seed, error) && error == "duplicate RTT seed address",
           "writer rejects duplicate temporal RTT seed addresses");
@@ -1168,7 +1169,7 @@ int main() {
           "replay resources point into shared owned backing at captured offsets");
     CHECK(replay.expected_output_valid && replay.expected_output_hash == captured.expected_output_hash,
           "expected render oracle round-trips");
-    const auto no_oracle_path = std::filesystem::temp_directory_path() /
+    const auto no_oracle_path = prosper_test::test_scratch_dir() /
         "prosper_gpu_capture_no_oracle_test.prgcap";
     auto no_oracle_pending = std::make_unique<PendingGpuCapture>();
     no_oracle_pending->path = no_oracle_path.string();
@@ -1257,7 +1258,7 @@ int main() {
     CHECK(mixed.failure_diagnostics_available && mixed.failure_diagnostics.size() == 1 &&
           mixed.failure_diagnostics[0].reason == RealizationFailureReason::Unknown,
           "pre-realized capture inputs label an unexplained omission explicitly");
-    const auto mixed_path = std::filesystem::temp_directory_path() / "prosper_gpu_capture_mixed_test.prgcap";
+    const auto mixed_path = prosper_test::test_scratch_dir() / "prosper_gpu_capture_mixed_test.prgcap";
     CHECK(write_gpu_capture(mixed_path.string(), mixed, error), "mixed versioned capture writes");
     GpuCaptureFile mixed_loaded;
     CHECK(read_gpu_capture(mixed_path.string(), mixed_loaded, error) &&
@@ -1563,7 +1564,7 @@ int main() {
     // Live one-shot capture receives the already-realized backend list as well as the original
     // semantic state. A failed operation is necessarily absent from that backend list, but must not
     // lose the exact reason/program/pipeline that the semantic realization can still diagnose.
-    request_interactive_gpu_capture("/tmp/prosper_semantic_failure_diagnostic.prgcap");
+    request_interactive_gpu_capture(prosper_test::test_scratch_file("prosper_semantic_failure_diagnostic.prgcap"));
     auto semantic_failure_pending = begin_requested_gpu_capture(
         {}, {}, plan_submit_operations(failed_state), 640, 360, &failed_state, 101,
         failed_state.draws.size());
@@ -1647,7 +1648,7 @@ int main() {
     set_test_env("PROSPER_GPU_CAPTURE_AT", nullptr);
     set_test_env("PROSPER_GPU_CAPTURE", nullptr);
 
-    const auto failed_path = std::filesystem::temp_directory_path() /
+    const auto failed_path = prosper_test::test_scratch_dir() /
         "prosper_gpu_capture_failed_diagnostic_test.prgcap";
     failed_capture.failure_diagnostics[0].pipeline.cb_resolve = true;
     // NGG draws can have a separately allocated vertex prolog and vertex main.  A failed capture
@@ -2039,7 +2040,7 @@ int main() {
     one_shot_ds_draw.ps.stencil_read_base = ds_seed.stencil_read_base;
     one_shot_ds_draw.ps.stencil_write_base = ds_seed.stencil_write_base;
     one_shot_ds_draw.ps.htile_data_base = ds_seed.htile_data_base;
-    request_interactive_gpu_capture("/tmp/prosper_interactive_ds_checkpoint.prgcap");
+    request_interactive_gpu_capture(prosper_test::test_scratch_file("prosper_interactive_ds_checkpoint.prgcap"));
     auto one_shot_ds_pending = begin_requested_gpu_capture(
         {one_shot_ds_draw}, {}, {{SubmitOperationKind::Draw, 0, 0}}, 2, 2);
     CHECK(one_shot_ds_pending && one_shot_ds_pending->capture.ds_seeds.size() == 1 &&
@@ -2077,7 +2078,7 @@ int main() {
     // Not armed + no env => begin_requested is inert, even with drawing work present.
     { DrawItem d; CHECK(begin_requested_gpu_capture({d}, {}, {}, 64, 64) == nullptr,
                         "no capture when neither env nor interactive is set"); }
-    request_interactive_gpu_capture("/tmp/prosper_interactive_grab.prgcap");
+    request_interactive_gpu_capture(prosper_test::test_scratch_file("prosper_interactive_grab.prgcap"));
     CHECK(interactive_gpu_capture_armed(), "request_interactive_gpu_capture arms a one-shot grab");
     // A ZERO-draw invocation must NOT consume the arm (the grab should land on real frame content).
     (void)begin_requested_gpu_capture({}, {}, {}, 64, 64);
@@ -2087,7 +2088,7 @@ int main() {
     { DrawItem d; (void)begin_requested_gpu_capture({d}, {}, {}, 64, 64); }
     CHECK(!interactive_gpu_capture_armed(), "a drawing invocation consumes the armed grab (one-shot)");
     // Re-arming and re-disarming works (a second press).
-    request_interactive_gpu_capture("/tmp/prosper_interactive_grab2.prgcap");
+    request_interactive_gpu_capture(prosper_test::test_scratch_file("prosper_interactive_grab2.prgcap"));
     CHECK(interactive_gpu_capture_armed(), "the grab can be re-armed for a subsequent press");
     { DrawItem d; (void)begin_requested_gpu_capture({d}, {}, {}, 64, 64); }
     CHECK(!interactive_gpu_capture_armed(), "the re-armed grab is consumed by the next drawing invocation");

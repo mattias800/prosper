@@ -10,6 +10,7 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/host/guest_write_watch.hpp"
 #include "render_runner.h"
+#include "test_scratch.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
@@ -660,7 +661,7 @@ int main() {
             reinterpret_cast<uint64_t>(consumed_args),
             reinterpret_cast<uint64_t>(generated_args), sizeof(consumed_args), 0, 100, 0});
         const std::filesystem::path capture_path =
-            std::filesystem::temp_directory_path() /
+            prosper_test::test_scratch_dir() /
             "prosper_dma_indirect_draw_capture.prgcap";
         std::error_code capture_filesystem_error;
         std::filesystem::remove(capture_path, capture_filesystem_error);
@@ -802,7 +803,7 @@ int main() {
         unresolved_dispatch.command_order = 19;
         nonrender.dispatches.push_back(unresolved_dispatch);
         const std::filesystem::path path =
-            std::filesystem::temp_directory_path() / "prosper_nonrender_submit_capture.prgcap";
+            prosper_test::test_scratch_dir() / "prosper_nonrender_submit_capture.prgcap";
         std::error_code filesystem_error;
         std::filesystem::remove(path, filesystem_error);
 #ifdef _WIN32
