@@ -136,6 +136,18 @@ inspection unless they fail.
 - `alexkidd-gameplay`: reviewed fresh-save guard for Alex Kidd in Miracle World
   DX's first level. Its window opens after the route's last pad press, so it
   samples a settled scene whose only motion is cloud drift and enemy animation.
+- `gris-gameplay`: reviewed fresh-save guard for GRIS's opening ink-ground scene.
+  Both numeric floors are blind on this title at once — its title screen is 17x
+  richer in colour than its gameplay, and non-black coverage is exactly 1.0000 for
+  logos, title, intro and gameplay alike — so SSIM does all the discrimination.
+- `cobra-gameplay`: reviewed fresh-save guard for Space Adventure Cobra's opening
+  desert tutorial combat. Its coverage floor is deliberately low: gameplay coverage
+  (0.82-0.90) is *lower* than its menus (0.99-1.00), because the bottom of the frame
+  is the dark underside of a walkway, so a high floor would reject the guarded state.
+- `worms-armageddon-gameplay`: reviewed fresh-save guard for a fixed-map Training
+  level. It uses `reach-training-gameplay.pad` rather than the published Quickstart
+  route because Quickstart regenerates its terrain every run; see that entry's
+  `_note` and trap 36 in `docs/GAME_COMPAT_ORCHESTRATION.md`.
 
 ## Choosing A Window And Thresholds
 
