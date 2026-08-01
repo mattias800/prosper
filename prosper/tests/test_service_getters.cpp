@@ -215,6 +215,19 @@ int main() {
                                         0, 0, 0, 0) == 0 &&
                               m[7] == (640ull * 480ull * 3ull) / 2ull && m[7] < nv12_1080p,
                           "Videodec2 frame size scales with the requested dimensions");
+                    // An ODD dimension is where the shorthand forms (w*h*3/2, or wh+(wh+1)/2) go
+                    // wrong while looking right: 1920x1081 has an EVEN product, so a parity-of-the-
+                    // product rule calls it safe, and both shorthands are 960 bytes short. Pin the
+                    // exact NV12 size so a future "simplification" back to a shorthand fails here
+                    // rather than silently under-sizing a guest buffer. (Instrument-trap 34.)
+                    Config odd = config;
+                    odd.width = 1920; odd.height = 1081;
+                    uint64_t o[9] = {72};
+                    const uint64_t nv12_odd = 1920ull * 1081ull + 2ull * 960ull * 541ull;
+                    CHECK(query_decoder((uint64_t)(uintptr_t)&odd, (uint64_t)(uintptr_t)o,
+                                        0, 0, 0, 0) == 0 && o[7] == nv12_odd &&
+                              nv12_odd > (1920ull * 1081ull * 3ull) / 2ull,
+                          "Videodec2 frame size is exact for an odd dimension, not the 3/2 shorthand");
                     // Auto dimensions (-1) carry no size prosper can derive; that path keeps the
                     // documented floor rather than inventing a level-implied maximum.
                     Config autodim = config;

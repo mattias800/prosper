@@ -438,26 +438,24 @@ HLE(s_videodec2_query_decoder_memory) {
     // The cpu/gpu/shared workspace sizes stay at the floor: nothing here is evidence for those, and
     // inflating them has broken a title before (see VDEC_MIN_MEMORY's own note on the 16 MiB
     // placeholder exhausting a CRI pool).
-    // NV12 is 3/2 bytes per pixel, but do NOT compute it as `w*h*3/2`. That form's intermediate
-    // reaches ~75% of UINT64_MAX at INT32_MAX dimensions, which leaves room for no further
-    // multiplicand at all — `INT32_MAX^2 * 3 * 2` already overflows. `wh + (wh+1)/2` peaks at ~25%
-    // of the range instead, so the cliff is removed rather than documented, and anything that later
-    // adds a factor here (a DPB count, a bytes-per-sample term for 10-bit) starts with real room.
-    // The `> 0` guard is what makes the int32 -> uint64 widening itself safe.
+    // Compute the EXACT NV12 size — luma plus a half-resolution interleaved chroma plane, each
+    // chroma dimension rounded UP: `w*h + 2*ceil(w/2)*ceil(h/2)`.
     //
-    // EXACTNESS BOUNDARY, and it is per-dimension parity — NOT the parity of the product. `w*h*3/2`
-    // and `wh + (wh+1)/2` both equal true NV12 (`w*h + 2*ceil(w/2)*ceil(h/2)`) if and only if BOTH
-    // dimensions are even; verified exhaustively over a 40x40 grid. The product being even is not
-    // enough and is a trap: 1920x1081 has an even product and this derivation is **960 bytes short**.
-    // Where a dimension is odd the shortfall is h/2, w/2, or (w+h)/2, and the `+1` does NOT rescue it
-    // (1921x1081 is 1501 bytes short either way).
+    // The obvious shorthand `w*h*3/2` is deliberately not used, and neither is `wh + (wh+1)/2`. Both
+    // are exact only when BOTH dimensions are even, and that rule is unusually easy to state wrongly:
+    // it was stated wrongly three times on this change, by an author under review, because every size
+    // anyone checked (1920x1088, 1920x1080, 640x480) happens to be both-even and so confirmed the
+    // true rule and the wrong one equally. "Even product" is not sufficient and is the seductive
+    // version — 1920x1081 has an even product and `wh + (wh+1)/2` is 960 bytes short there. The exact
+    // form removes the need to state the rule at all, which is worth more than the two divisions it
+    // costs on a path called 7-8 times per boot. (Instrument-trap 34.)
     //
-    // Odd dimensions are treated as UNREACHABLE, not as handled: H.264 codes in 16x16 macroblocks,
-    // so a conformant AVC stream's coded dimensions are multiples of 16 and both are even. Saying
-    // odd sizes are "handled by rounding up" would be worse than saying they cannot occur, because
-    // it invites someone to rely on a result that is still short. If a codec is ever added whose
-    // coded dimensions can be odd, this expression must be replaced with the exact chroma formula
-    // rather than adjusted.
+    // WIDEN BEFORE ARITHMETIC — this is the trap in the "simpler" version. Written as
+    // `2*((config->max_width+1)/2)*...` the `+1` is evaluated in `int32_t`, so `max_width ==
+    // INT32_MAX` is signed overflow and undefined behaviour BEFORE any cast. Widening first makes
+    // every operation unsigned 64-bit; peak intermediate is then 37.5% of UINT64_MAX at INT32_MAX
+    // dimensions, so a future factor (a DPB count, a 10-bit bytes-per-sample term) still has room,
+    // though less than it looks — re-check the bound rather than assuming.
     constexpr uint32_t VDEC_FRAME_ALIGN = 0x100;
     uint64_t frame_bytes = 0;
     if (config->max_width > 0 && config->max_height > 0) {
@@ -466,8 +464,9 @@ HLE(s_videodec2_query_decoder_memory) {
         // in 16x16 macroblocks, so a 1080-row picture is physically written as 1088 rows and cropped
         // for display via the SPS frame_cropping fields. Sizing from 1080 would be short by 8 rows
         // times the pitch — a real overflow, not conservatism.
-        const uint64_t wh = (uint64_t)config->max_width * (uint64_t)config->max_height;
-        frame_bytes = wh + (wh + 1) / 2;
+        const uint64_t w = (uint64_t)config->max_width;
+        const uint64_t h = (uint64_t)config->max_height;
+        frame_bytes = w * h + 2 * ((w + 1) / 2) * ((h + 1) / 2);
     } else {
         // Auto dimensions: the value below is a FLOOR, not a derivation, and the original
         // resolution-independent hazard survives on this path. Nothing in the code distinguishes the
