@@ -67,6 +67,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>     // strict PROSPER_CAPTURE_BUNDLE_MAX_MB parse (#1587)
+#include <climits>
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -1281,8 +1283,21 @@ int main(int argc, char** argv) {
     const std::string grabDir = getenv("PROSPER_CAPTURE_DIR") ? getenv("PROSPER_CAPTURE_DIR") : ".";
     unsigned grabCounter = 0;
     // 0 = keep the built-in default; the timeline clamps whatever is supplied to 64..3072 MiB.
-    const uint32_t grabBundleMaxMb = getenv("PROSPER_CAPTURE_BUNDLE_MAX_MB")
-        ? static_cast<uint32_t>(strtoul(getenv("PROSPER_CAPTURE_BUNDLE_MAX_MB"), nullptr, 0)) : 0u;
+    // Parse strictly, matching the two checked parses of this same variable in gpu_timeline.cpp. An
+    // unchecked strtoul truncates into uint32_t, so 4294967360 would arrive as 64 — silently the
+    // MINIMUM budget when the user asked for the largest, which is the opposite of the intent and
+    // would look like the fix not working.
+    uint32_t grabBundleMaxMb = 0u;
+    if (const char* mb = getenv("PROSPER_CAPTURE_BUNDLE_MAX_MB")) {
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long parsed = strtoul(mb, &end, 0);
+        if (!errno && end != mb && end && !*end && parsed <= UINT32_MAX)
+            grabBundleMaxMb = static_cast<uint32_t>(parsed);
+        else
+            fprintf(stderr, "[grab] ignoring malformed PROSPER_CAPTURE_BUNDLE_MAX_MB=\"%s\" "
+                            "(expected 64..3072)\n", mb);
+    }
     std::string grabNotice;   // transient window-title notice for the last completed F9 grab (#1587)
     std::chrono::steady_clock::time_point grabNoticeUntil{};
     std::string pendingGrabScreenshot;   // non-empty => write the next presented CPU frame to this path

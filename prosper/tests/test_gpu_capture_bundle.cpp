@@ -293,6 +293,15 @@ int main() {
         InteractiveGrabOutcome clamped;
         CHECK(take_interactive_grab_outcome(clamped) && clamped.max_unique_bytes == (3072ull << 20),
               "#1587: an over-large request clamps to the 3072 MiB ceiling rather than overflowing");
+        // Restore the default budget: this state is global, and leaving it at 3072 would silently
+        // change the ceiling every later grab in this binary runs under.
+        request_interactive_capture_bundle(
+            prosper_test::test_scratch_file("prosper_frame_grab_restore.prgbundle"), 2048);
+        record_gpu_timeline_present(10, 0, 0, 1920, 1080);
+        record_gpu_timeline_present(11, 0, 0, 1920, 1080);
+        InteractiveGrabOutcome restored;
+        CHECK(take_interactive_grab_outcome(restored) && restored.max_unique_bytes == (2048ull << 20),
+              "#1587: the budget is restored to the default for later grabs");
     }
 
     // Persistent depth/stencil images can predate the captured frame (for example a shadow-atlas
@@ -320,6 +329,18 @@ int main() {
           ds_first.ds_seeds.size() == 1 && ds_first.ds_seeds[0].depth == ds_seed.depth &&
           ds_second.ds_seeds.empty(),
           "F9 bundle seeds only its first submit with capture-boundary depth/stencil state");
+    // #1587: this is the only grab in the file that SUCCEEDS, so it is the only place the ok-path
+    // publish can be covered. Every other new assertion exercises a failure outcome; without this one
+    // a regression that reported success as a failure — or published nothing at all on success —
+    // would pass the suite. It also restores the consume-once invariant: leaving this grab's outcome
+    // uncollected would hand it to whichever later test polls next.
+    {
+        InteractiveGrabOutcome ok_outcome;
+        CHECK(take_interactive_grab_outcome(ok_outcome) && ok_outcome.ok &&
+              ok_outcome.error.empty() &&
+              ok_outcome.bundle_path == ds_bundle_path.string(),
+              "#1587: a grab that writes its bundle publishes ok with no error and the exact path");
+    }
     set_gpu_capture_ds_seed_snapshot_reader({});
     std::filesystem::remove(ds_bundle_path, ec);
 

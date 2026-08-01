@@ -1826,6 +1826,10 @@ struct InteractiveFrameBundle {
     bool capturing = false;
     bool failed = false;
     uint64_t max_unique_bytes = 2048ull << 20;
+    // Why the CURRENT grab aborted, recorded as it happens. Distinct from the published outcome
+    // below: sharing one field let a completed grab's {ok, path} be collected next to a LATER grab's
+    // error string, because this one is written while that one is still awaiting collection.
+    std::string pending_failure_error;
     // Outcome of the last completed grab, awaiting collection by the frontend (#1587).
     bool outcome_pending = false;
     bool outcome_ok = false;
@@ -2021,7 +2025,7 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     if (!capture_gpustate_submit(state, submit_no, meta.width, meta.height, meta, capture, error,
                                  b.max_unique_bytes)) {
         b.failed = true;
-        b.outcome_error = error;
+        b.pending_failure_error = error;
         std::fprintf(stderr, "[grab] frame-bundle: submit %llu failed (%s); grab aborted\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
         return;
@@ -2034,7 +2038,7 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     if (!b.submits && gpu_capture_ds_seed_snapshot_available() &&
         !read_all_gpu_capture_ds_seeds(capture.ds_seeds, error)) {
         b.failed = true;
-        b.outcome_error = error;
+        b.pending_failure_error = error;
         std::fprintf(stderr, "[grab] frame-bundle: initial DS snapshot failed (%s); grab aborted\n",
                      error.c_str());
         return;
@@ -2069,7 +2073,7 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     }
     if (!append_capture_to_frame_bundle(b.bundle, capture, b.max_unique_bytes, error)) {
         b.failed = true;
-        b.outcome_error = error;
+        b.pending_failure_error = error;
         std::fprintf(stderr, "[grab] frame-bundle: submit %llu failed (%s); grab aborted\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
         return;
@@ -2098,7 +2102,8 @@ void interactive_frame_bundle_on_present() {
                 else if (b.failed) {
                     std::fprintf(stderr, "[grab] frame-bundle aborted (see error above); not written\n");
                     b.outcome_pending = true; b.outcome_ok = false; b.outcome_path = b.current_path;
-                    if (b.outcome_error.empty()) b.outcome_error = "grab aborted";
+                    b.outcome_error = b.pending_failure_error.empty() ? std::string("grab aborted")
+                                                                     : b.pending_failure_error;
                 } else {
                     std::fprintf(stderr, "[grab] frame-bundle: window had no submits; press F9 again\n");
                     b.outcome_pending = true; b.outcome_ok = false; b.outcome_path = b.current_path;
@@ -2106,6 +2111,7 @@ void interactive_frame_bundle_on_present() {
                 }
                 b.capturing = false; b.current_path.clear(); b.bundle = GpuCaptureBundle{};
                 b.submits = 0; b.frames_seen = 0; b.failed = false;
+                b.pending_failure_error.clear();
                 if (b.armed_path.empty()) g_interactive_frame_active.store(false, std::memory_order_release);
             }
         } else if (!b.armed_path.empty() && b.arm_delay_presents) {
@@ -2114,6 +2120,7 @@ void interactive_frame_bundle_on_present() {
             b.capturing = true; b.current_path = std::move(b.armed_path); b.armed_path.clear();
             b.arm_delay_presents = 0;
             b.bundle = GpuCaptureBundle{}; b.submits = 0; b.frames_seen = 0; b.failed = false;
+            b.pending_failure_error.clear();
             std::fprintf(stderr, "[grab] frame-bundle: capturing %u frames -> %s\n",
                          b.frames_wanted, b.current_path.c_str());
         }
