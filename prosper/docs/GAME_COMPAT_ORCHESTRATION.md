@@ -101,6 +101,14 @@ highest-value page in this document.
      nonzero, **rename the log to `DISCARD-…`** instead of dropping it. Contention then becomes *visible in
      the record* rather than invisible in the mean, and the discarded run stays auditable afterwards instead
      of surviving as an unexplained outlier.
+  4. **Alternate the arms, then check the residuals for cycle correlation** before attributing any
+     difference to the treatment. Running all of arm A then all of arm B lets a *time-varying* confound
+     land entirely on one arm and become a phantom effect. Alternating forces it onto both, which makes it
+     detectable: in #1609's 12-run experiment the slowest run was **cycle 2 in all four title × arm
+     combinations**, so the residual variance tracked *when* a run happened, not *which arm* it was. That is
+     not an argument that the gap is noise — it is a demonstration, from the same data that would otherwise
+     have produced the phantom. If the extremes line up by cycle rather than by arm, the treatment is not
+     the explanation.
   Report **whole-run and steady-state (tail-window) rates separately**: a one-off boot cost and a per-frame
   cost are indistinguishable in a whole-run average, because a run that reaches steady state one second later
   and then performs identically still shows a lower average. Report min/max spread and an explicit
