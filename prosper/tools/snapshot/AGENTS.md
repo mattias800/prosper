@@ -87,6 +87,45 @@ threshold this way needs the same evidence as lowering one — here, every
 reviewed gameplay frame measured exactly 1.0000 with zero variance across
 independent runs, leaving a 10% margin.
 
+### Three later titles each break a different one of the three checks
+
+The Rugrats/Greak pair above shows colour and coverage each going blind on its
+own. Three titles guarded on 2026-08-01 sharpen that: in each, **SSIM ends up
+carrying the whole discriminating load**, for a different reason.
+
+| title | what goes blind | measured |
+|---|---|---|
+| **Worms Armageddon** (`PPSA20052`) | colour, catastrophically | gameplay is an **801-colour** scene at scale 4; its own title screen is **75,875** — a factor of **95** (Rugrats' is 3.2x) |
+| **GRIS** (`PPSA09804`) | **both**, at once | title is 17x richer in colour than gameplay, *and* coverage is exactly **1.0000** for logos, title, intro and gameplay alike — a bright paper page with no true black anywhere |
+| **Space Adventure Cobra** (`PPSA17337`) | coverage, **inverted** | gameplay coverage **0.8152-0.9037** is *lower* than its menus' **0.9908-1.0000**, because the frame's bottom is a dark walkway underside |
+
+Two rules follow that the earlier pair does not give you:
+
+- **A high coverage floor is not the safe direction.** Greak needed 0.9 because
+  coverage had to separate a letterboxed cinematic. Cobra is the mirror image: the
+  same reflex would have rejected the very state its guard exists to protect. Set
+  the floor from *this* title's measured range and direction, never from a habit.
+- **When both floors are blind, say so in the `_note` and set them as pure
+  gross-collapse floors** rather than tuning them to separate two valid scenes.
+  GRIS's `min_colors` is 1200 against a 2,039 gameplay floor and a 38,183 title;
+  it is there to catch black output, and nothing else.
+
+### Score one run against the *other* run's references before adopting a window
+
+`verify` builds its references from **both** of its own runs, so a scene the title
+**regenerates randomly** still passes: each run matches the half of the reference set
+it contributed. Worms Armageddon's Quickstart does exactly this — two fresh-save runs
+produced two different maps, each scoring 70/70 against the combined set and looking
+like a healthy `CONTENT-STABLE` baseline. Scored **across** runs (run B against run A's
+references only) the same window reaches at most **0.6567**, with **0 of 70** clearing
+0.85. Such a guard is adopted green and fails on the first `check`.
+
+So `verify` cannot answer "is this window stable"; it is not asking that question. Run
+the profile twice and score one against the other. The same test on a route into a
+fixed Training map returned **0.9612-1.0000, 47/47** — same test, opposite answer, and
+the reason `worms-armageddon-gameplay` guards a Training level rather than the
+published Quickstart match. Recorded as trap 36 in `docs/GAME_COMPAT_ORCHESTRATION.md`.
+
 ## New Or Changed Baselines
 
 Baseline evidence requires visual review even though routine regression runs do

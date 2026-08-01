@@ -219,7 +219,22 @@ int main() {
           error.find("checksum") != std::string::npos,
           "bundle rejects manifest corruption");
 
+    // An interactive frame grab claims its output names when it is ARMED, so a grab that never
+    // completes (the app was killed mid-capture) leaves a zero-byte .prgbundle on disk. That file must
+    // be unmistakable to the tool: an empty capture is "this never finished", not "this frame had no
+    // work" and not a corruption to go hunting for.
+    const auto empty_path = path.string() + ".empty";
+    { std::ofstream empty(empty_path, std::ios::binary); }
+    GpuCaptureBundle from_empty;
+    CHECK(!read_gpu_capture_bundle(empty_path, from_empty, error) &&
+          error.find("empty bundle file") != std::string::npos &&
+          error.find("never completed") != std::string::npos,
+          "an empty bundle is rejected as an unfinished capture, by name");
+    CHECK(from_empty.submits.empty(),
+          "an empty bundle never loads as a capture that simply contained no submits");
+
     std::error_code ec; std::filesystem::remove(path, ec); std::filesystem::remove(corrupt_path, ec);
+    std::filesystem::remove(empty_path, ec);
     std::filesystem::remove(v1_path, ec);
 
     // Interactive F9 whole-frame grab (prosper-app): the present-boundary state machine. A grab is armed
@@ -239,14 +254,14 @@ int main() {
     CHECK(!interactive_capture_bundle_active(), "frame-bundle grab is inert by default");
     record_gpu_timeline_present(1, 0, 0, 1920, 1080);
     CHECK(!interactive_capture_bundle_active(), "a present with no armed grab stays inert");
-    request_interactive_capture_bundle(prosper_test::test_scratch_file("prosper_frame_grab_unit.prgbundle"));
+    (void)request_interactive_capture_bundle(prosper_test::test_scratch_file("prosper_frame_grab_unit.prgbundle"));
     CHECK(interactive_capture_bundle_active(), "F9 arms a whole-frame grab");
     record_gpu_timeline_present(2, 0, 0, 1920, 1080);   // start capturing the next frame
     CHECK(interactive_capture_bundle_active(), "the next present starts the frame (still active)");
     record_gpu_timeline_present(3, 0, 0, 1920, 1080);   // end the frame (no submits captured here)
     CHECK(!interactive_capture_bundle_active(),
           "the following present ends the frame and disarms (no re-arm)");
-    request_interactive_capture_bundle(prosper_test::test_scratch_file("prosper_frame_grab_unit2.prgbundle"));
+    (void)request_interactive_capture_bundle(prosper_test::test_scratch_file("prosper_frame_grab_unit2.prgbundle"));
     CHECK(interactive_capture_bundle_active(), "the grab can be re-armed for another press");
     record_gpu_timeline_present(4, 0, 0, 1920, 1080);
     record_gpu_timeline_present(5, 0, 0, 1920, 1080);
@@ -278,7 +293,7 @@ int main() {
     // The budget is settable per grab, which is the whole point of #1587: the F9 path was pinned to
     // the default with no way to raise it, and one 3840x2160 deferred frame exceeds 2 GiB.
     {
-        request_interactive_capture_bundle(
+        (void)request_interactive_capture_bundle(
             prosper_test::test_scratch_file("prosper_frame_grab_budget.prgbundle"), 3072);
         record_gpu_timeline_present(6, 0, 0, 3840, 2160);
         record_gpu_timeline_present(7, 0, 0, 3840, 2160);
@@ -286,7 +301,7 @@ int main() {
         CHECK(take_interactive_grab_outcome(budget) && budget.max_unique_bytes == (3072ull << 20),
               "#1587: a requested budget of 3072 MiB is the budget actually in force");
         // And the clamp still holds at the top end.
-        request_interactive_capture_bundle(
+        (void)request_interactive_capture_bundle(
             prosper_test::test_scratch_file("prosper_frame_grab_clamp.prgbundle"), 99999);
         record_gpu_timeline_present(8, 0, 0, 3840, 2160);
         record_gpu_timeline_present(9, 0, 0, 3840, 2160);
@@ -295,7 +310,7 @@ int main() {
               "#1587: an over-large request clamps to the 3072 MiB ceiling rather than overflowing");
         // Restore the default budget: this state is global, and leaving it at 3072 would silently
         // change the ceiling every later grab in this binary runs under.
-        request_interactive_capture_bundle(
+        (void)request_interactive_capture_bundle(
             prosper_test::test_scratch_file("prosper_frame_grab_restore.prgbundle"), 2048);
         record_gpu_timeline_present(10, 0, 0, 1920, 1080);
         record_gpu_timeline_present(11, 0, 0, 1920, 1080);
@@ -314,7 +329,7 @@ int main() {
         [&](std::vector<GpuCaptureDsSeed>& seeds, std::string&) {
             ++ds_snapshots; seeds = {ds_seed}; return true;
         });
-    request_interactive_capture_bundle(ds_bundle_path.string());
+    (void)request_interactive_capture_bundle(ds_bundle_path.string());
     record_gpu_timeline_present(6, 0, 0, 1920, 1080);
     GpuState empty_submit;
     record_gpu_timeline_submit(empty_submit, 77);

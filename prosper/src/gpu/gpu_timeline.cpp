@@ -1866,16 +1866,25 @@ bool append_capture_to_frame_bundle(GpuCaptureBundle& bundle, const GpuCaptureFi
 }
 }  // namespace
 
-void request_interactive_capture_bundle(const std::string& path, uint32_t max_mb,
-                                        uint32_t delay_presents) {
+std::string request_interactive_capture_bundle(const std::string& path, uint32_t max_mb,
+                                               uint32_t delay_presents) {
     InteractiveFrameBundle& b = interactive_frame_bundle();
     std::lock_guard<std::mutex> lk(b.mx);
+    // An arm that has not been promoted yet is REPLACED here, and a replaced capture never runs and
+    // never reports an outcome. Report it to the caller under this lock — asking beforehand would
+    // race the render thread promoting it, and the answer would be wrong exactly when it mattered.
+    //
+    // `path` must not alias b.armed_path, or it would be read after being moved from — the classic
+    // way this pattern breaks. It cannot: InteractiveFrameBundle is file-static with no accessor, so
+    // every caller passes its own storage.
+    std::string replaced = std::move(b.armed_path);
     b.armed_path = path;
     b.arm_delay_presents = delay_presents;
     if (max_mb) b.max_unique_bytes = static_cast<uint64_t>(std::clamp<uint32_t>(max_mb, 64u, 3072u)) << 20;
     if (const char* frames = std::getenv("PROSPER_CAPTURE_FRAMES"))
         b.frames_wanted = std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(frames, nullptr, 0)), 1u, 240u);
     g_interactive_frame_active.store(true, std::memory_order_release);
+    return replaced;
 }
 bool interactive_capture_bundle_active() {
     return g_interactive_frame_active.load(std::memory_order_acquire);
@@ -1983,7 +1992,7 @@ void observe_guest_log_for_capture(const char* bytes, size_t size,
     // The marker is a phase gate, not a frame oracle. Skip exactly one completed present so the
     // transition boundary cannot be mistaken for the scene it announced, then use the established
     // F9 whole-frame path to retain every submit and persistent RTT/DS boundary seed.
-    request_interactive_capture_bundle(state.path, state.max_mb, 1);
+    const std::string replaced = request_interactive_capture_bundle(state.path, state.max_mb, 1);
     std::string source_names;
     constexpr const char* names[] = {
         "unknown", "printf", "puts", "putchar", "fputs", "fwrite", "write",
@@ -1995,8 +2004,15 @@ void observe_guest_log_for_capture(const char* bytes, size_t size,
     }
     std::fprintf(stderr,
                  "[grab] exact guest-log line matched via %s; whole-frame capture armed after "
-                 "one completed present -> %s\n",
+                 "one completed present; target path %s\n",
                  source_names.empty() ? "unknown" : source_names.c_str(), state.path.c_str());
+    // This arm may have replaced an interactive one that had not started. That capture never runs and
+    // never reports; whoever reserved its name is the only one who can clean it up, but it must at
+    // least not vanish silently.
+    if (!replaced.empty())
+        std::fprintf(stderr,
+                     "[grab] this arm replaced an armed capture that had not started; it will never "
+                     "report: %s\n", replaced.c_str());
 }
 
 void observe_guest_log_capture_gap() {
@@ -2121,7 +2137,10 @@ void interactive_frame_bundle_on_present() {
             b.arm_delay_presents = 0;
             b.bundle = GpuCaptureBundle{}; b.submits = 0; b.frames_seen = 0; b.failed = false;
             b.pending_failure_error.clear();
-            std::fprintf(stderr, "[grab] frame-bundle: capturing %u frames -> %s\n",
+            // No arrow here, deliberately: " -> <path>" is reserved for a line emitted AFTER the
+            // file exists (see frame_grab_naming.hpp). This one names a TARGET — the capture can
+            // still abort, and a reader scanning for artifacts must not collect it as one.
+            std::fprintf(stderr, "[grab] frame-bundle: capturing %u frames; target path %s\n",
                          b.frames_wanted, b.current_path.c_str());
         }
     }
@@ -2130,7 +2149,9 @@ void interactive_frame_bundle_on_present() {
         const size_t n = write_bundle.submits.size();
         const bool written = write_gpu_capture_bundle(write_path, write_bundle, error);
         if (written)
-            std::fprintf(stderr, "[grab] frame-bundle -> %s (%zu submits)\n", write_path.c_str(), n);
+            // Path LAST. This line reports a file that now exists, so it may carry an arrow — but
+            // anything after the path turns the documented read into a path that does not exist.
+            std::fprintf(stderr, "[grab] frame-bundle written (%zu submits) -> %s\n", n, write_path.c_str());
         else
             std::fprintf(stderr, "[grab] frame-bundle write failed: %s\n", error.c_str());
         InteractiveFrameBundle& b = interactive_frame_bundle();
@@ -2768,10 +2789,15 @@ void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64
     static std::atomic<bool> scheduled_fired{false};
     if (scheduled.valid && present_count >= scheduled.present &&
         !scheduled_fired.exchange(true, std::memory_order_acq_rel)) {
-        request_interactive_capture_bundle(scheduled.path, scheduled.max_mb);
+        const std::string replaced =
+            request_interactive_capture_bundle(scheduled.path, scheduled.max_mb);
         std::fprintf(stderr,
-                     "[grab] scheduled whole-frame capture at present %llu -> %s\n",
+                     "[grab] scheduled whole-frame capture armed at present %llu; target path %s\n",
                      static_cast<unsigned long long>(present_count), scheduled.path.c_str());
+        if (!replaced.empty())
+            std::fprintf(stderr,
+                         "[grab] this arm replaced an armed capture that had not started; it will "
+                         "never report: %s\n", replaced.c_str());
     }
     interactive_frame_bundle_on_present();
     static const bool requested = [] {
