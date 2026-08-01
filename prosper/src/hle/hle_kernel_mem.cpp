@@ -1657,6 +1657,12 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     // equeue — not the tag — is what makes a buffer bound. The unbound rule above is unchanged;
     // that is the one #180 forbids.
     //
+    // The surviving `bc.eq` term is defence-in-depth, not load-bearing: a binding recorded with
+    // a1 == 0 gets eq_identity 0, and prosper_eq_post_apr_token already returns early on that, so
+    // dropping the term would produce no observable spurious post. Keep it as a cheap local
+    // statement of intent — do not add a mutation to "prove" it, since no such mutation is
+    // observable.
+    //
     // "Echoed verbatim" is true only in the id==0 pointer dialect. prosper_eq_post_apr_token
     // branches on the binding's id: id==0 delivers this exact token, while id!=0 delivers
     // (ring<<58) | per-(eq,ring) high-water mark, so a zero tag there arrives as a counter value

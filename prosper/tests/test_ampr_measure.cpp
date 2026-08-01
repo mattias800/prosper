@@ -203,11 +203,12 @@ int main() {
                (uint64_t)(uintptr_t)&unbound_out2, 0, 0);
         CHECK(unbound_out1 && unbound_out1 == unbound_out2,
               "reconstructed command buffer is unbound after PS5 3.20 destruction");
-        // #180's rule is what the delivery predicate in apr_submit_common exists to protect: an
-        // UNBOUND submit hands its invented counter through the out slots and must post NO event,
-        // because an invented token would regress the UE4 listener's ctor-seeded last-processed
-        // counter. Pin it directly — the out-slot check above does not, and #1666 loosened exactly
-        // the predicate that separates post from no-post.
+        // #180's rule: an UNBOUND submit hands its invented counter through the out slots and must
+        // post NO event, because an invented token would regress the UE4 listener's ctor-seeded
+        // last-processed counter. Pin it directly — the out-slot check above does not.
+        // Scope note: this pins "an unbound submit posts no event". It does NOT pin the *bound*
+        // predicate that #1666 loosened — the buffer here is genuinely unbound, so this assertion
+        // holds under `bound && bc.tag && bc.eq` and `bound && bc.eq` alike.
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
         CHECK(get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
               "unbound submit posts no completion event (#180 invented-counter rule)");
@@ -256,7 +257,14 @@ int main() {
                 uint32_t cri_timeout = 100000;
                 wait_eq(cri_eq, (uint64_t)(uintptr_t)&cri_event, 1, (uint64_t)(uintptr_t)&cri_out,
                         (uint64_t)(uintptr_t)&cri_timeout, 0);
-                CHECK(cri_out == 1 && cri_event.ident == c.id, c.what);
+                // `filter` is the load-bearing half of this assertion. KEvent is zero-initialised
+                // and the pointer-dialect case uses id 0, so `ident == c.id` degenerates to 0 == 0
+                // and would hold even if no event ever arrived — vacuous in exactly the branch CRI
+                // uses for 9 of its 20 bindings. EVFILT_AMPR_MODELED (-24) is nonzero and is set by
+                // both apr_post and the id-0 pointer worker, so a zeroed KEvent cannot fake it.
+                CHECK(cri_out == 1 && cri_event.ident == c.id && cri_event.filter == -24, c.what);
+                CHECK(get_count(cri_eq, 0, 0, 0, 0, 0) == 0,
+                      "zero-tag completion is delivered exactly once");
                 delete_eq(cri_eq, 0, 0, 0, 0, 0);
             }
         }
