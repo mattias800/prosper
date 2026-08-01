@@ -294,7 +294,13 @@ int main() {
         CHECK(frame_grab_logged_path(arm).empty(),
               "a reader extracting paths from the log finds none in an arming line");
         CHECK(frame_grab_logged_path("[grab] bundle written -> /out/x.prgbundle\n") == "/out/x.prgbundle",
-              "a write line's path is everything after the last arrow, newline excluded");
+              "a write line's path is everything after the arrow, newline excluded");
+        // PROSPER_CAPTURE_DIR is an arbitrary directory, so the PATH can contain an arrow while the
+        // text before it never does. Reading the last arrow instead of the first would hand back a
+        // truncated path that does not exist.
+        CHECK(frame_grab_logged_path(
+                  frame_grab_write_line("bundle", "/out/a -> b/x.prgbundle")) == "/out/a -> b/x.prgbundle",
+              "a path that itself contains an arrow survives the round trip");
     }
 
     std::filesystem::remove_all(dir, ec);

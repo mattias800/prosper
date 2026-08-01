@@ -286,13 +286,17 @@ inline std::string frame_grab_write_line(std::string_view what, const std::strin
     return line;
 }
 
-// The path a write line points at, or "" when the line carries none. Everything after the last
+// The path a write line points at, or "" when the line carries none. Everything after the FIRST
 // " -> " is the path — the same mechanical read an agent scanning a run log performs, which is why
 // tests parse it back out of the formatted line and stat the result instead of trusting the string
 // they formatted.
+//
+// First rather than last, deliberately: the text before the arrow is ours and never contains one,
+// while the path is the user's (PROSPER_CAPTURE_DIR is an arbitrary directory) and could. Taking the
+// last arrow would silently truncate such a path into one that does not exist.
 inline std::string frame_grab_logged_path(std::string_view line) {
     while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.remove_suffix(1);
-    const size_t arrow = line.rfind(" -> ");
+    const size_t arrow = line.find(" -> ");
     if (arrow == std::string_view::npos) return "";
     return std::string(line.substr(arrow + 4));
 }
