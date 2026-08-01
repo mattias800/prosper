@@ -193,13 +193,21 @@ bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth) {
 //     grouping: which group is the left one is not measured anywhere here.
 //     **CONFIDENCE: MED for the left/right ORIENTATION of every pair in this table, and the basis is
 //     convention, not evidence** — index 0 = FrontLeft is universal across published multichannel
-//     bed layouts, CRI Atom's own `EAtomSpeakerID` enum (whose names are present in this title's
-//     eboot) orders FrontLeft before FrontRight, and prosper's own v1 sceAudioOut path assumes it.
-//     Three converging conventions are worth MED rather than LOW, but a convention is not a
-//     measurement, and this one has never been tested against a PS5 title.
+//     bed layouts, and prosper's own v1 sceAudioOut path assumes it. TWO conventions, not three: a
+//     third was checked and REJECTED. CRI Atom's `EAtomSpeakerID` names are present in this title's
+//     eboot and order FrontLeft first, which looked like a property of the code producing these
+//     samples rather than an inherited assumption — but `tools/re/xref.py` finds ZERO code
+//     references to that string and one data-pointer relocation into a UE reflection table. The
+//     names are Blueprint metadata that survived into the image; nothing calls them, so their
+//     presence says nothing about the bed's order. Conventions can share one ancestor, and a symbol
+//     in a binary is not a code path. prosper's own test suite does pin index -> side for widths
+//     6..8, so a self-inconsistent fold fails in CI; what is unconfirmed is the match to hardware.
 //   - A listening test cannot settle it either, and specifically cannot settle this title's layout
 //     at all: ten of its twelve channels are measured empty, so every mapping that routes ch0 and
-//     ch1 to the two sides produces a bit-identical host bed. Broadly stereo music also folds down
+//     ch1 to the two sides produces a host bed differing only by the ~1e-9 residue on ch2 and
+//     ch4..ch7, some 150 dB below the content — not "bit-identical", because that wording would
+//     re-merge "exactly zero" with "1e-9 residue", the very distinction this table draws.
+//     Broadly stereo music also folds down
 //     plausibly under a swap. A human confirming "it sounds right" is real rung-4 evidence that
 //     audio reaches the device through the guest's own path, and is NOT evidence for this mapping.
 //   - THE DISCRIMINATING EXPERIMENT, for whoever gets a title that supports it: content with
@@ -889,9 +897,13 @@ void layout_add_grain(uint32_t port_index, uint32_t ctx_slot, uint16_t type, uin
         // stream with no header, and port slots are recycled first-free, so a differently-shaped
         // port reusing this slot would otherwise append a stream of another width to the same file
         // and every offline reader would silently de-interleave the tail wrong.
+        // "wb", not "ab", for the SPAN half of the same problem: the statistics reset per port
+        // lifetime while an appending file does not, so a recycled slot of the SAME width would
+        // leave the printed `frames=N` and the file describing different spans — and an offline
+        // reader has no way to see the seam. One file per port lifetime keeps them the same span.
         char path[512];
         snprintf(path, sizeof path, "%s.port%u.%uch.f32", base, port_index + 1, channels);
-        lp->dump = fopen(path, "ab");
+        lp->dump = fopen(path, "wb");
         fprintf(stderr, "[audio-layout] port%u: dumping raw guest PCM to %s "
                         "(float32 interleaved, %u channels, 48000 Hz)\n",
                 port_index + 1, path, channels);
@@ -1665,19 +1677,33 @@ HLE(audio2_ctx_push) {
                 // unsizable, and that arm records the skip alone.
                 const bool sizable = (data_type == 0 || data_type == 1) && channels >= 1;
                 if (flow && sizable) {
-                    // Worst case is 255 channels x 4096 frames = 4 MiB per push. That is a lot for
-                    // a hot path, which is why it is behind the probe and behind a reject that no
-                    // title in evidence reaches.
-                    const size_t rej_samples = (size_t)channels * grain;
+                    // SAMPLED, not exhaustive, and the cap is load-bearing rather than tidiness.
+                    // A FAILING read is the EXPECTED case on this arm — a 20-channel declaration
+                    // over a narrower real buffer is exactly what it exists to detect — and
+                    // audio_read_bytes_partial binary-searches the readable prefix when the full
+                    // range faults. Uncapped, one 255-channel port costs a 4 MiB request, ~22
+                    // probe syscalls copying ~2 MiB on average, ~45 MiB of copying per push, at
+                    // 188 Hz, WITH g_a2_mx HELD. The pre-#1700 16-channel bound hid that; removing
+                    // the bound without a cap would have turned a diagnostic that is meant to be
+                    // cheap enough to leave on into one that changes the timing it measures.
+                    // A signal statistic does not need the whole grain, so bound the span and say
+                    // so: `frames`/`bytes` on this port's line then describe what was MEASURED.
+                    constexpr size_t kRejectProbeBytes = 64u * 1024u;
+                    const size_t sample_bytes = data_type == 0 ? sizeof(float) : sizeof(int16_t);
+                    const size_t frame_bytes = sample_bytes * channels;
+                    size_t rej_frames_req = kRejectProbeBytes / frame_bytes;
+                    if (rej_frames_req == 0) rej_frames_req = 1;      // one frame minimum, always
+                    if (rej_frames_req > grain) rej_frames_req = grain;
+                    const size_t rej_samples = rej_frames_req * channels;
                     size_t rej_frames = 0;
                     if (data_type == 0) {
                         if (tmp.size() < rej_samples) tmp.resize(rej_samples);
                         rej_frames = audio_read_bytes_partial(ps.pcm_ptr, tmp.data(),
-                                        sizeof(float) * rej_samples) / (sizeof(float) * channels);
+                                        sizeof(float) * rej_samples) / frame_bytes;
                     } else {
                         if (tmp_s16.size() < rej_samples) tmp_s16.resize(rej_samples);
                         rej_frames = audio_read_bytes_partial(ps.pcm_ptr, tmp_s16.data(),
-                                        sizeof(int16_t) * rej_samples) / (sizeof(int16_t) * channels);
+                                        sizeof(int16_t) * rej_samples) / frame_bytes;
                     }
                     // One lock scope covering tag + counters + samples: tagging, unlocking for the
                     // guest read, then re-locking lets a report land in the window and clear `seen`,
@@ -1688,9 +1714,10 @@ HLE(audio2_ctx_push) {
                     ++fp.skip_fmt;
                     ++fp.reads;
                     fp.frames += rej_frames;
-                    fp.bytes += rej_frames * channels *
-                                (data_type == 0 ? sizeof(float) : sizeof(int16_t));
-                    if (rej_frames < grain) ++fp.short_read;
+                    fp.bytes += rej_frames * frame_bytes;
+                    // Short against what was REQUESTED, not against the grain: the cap is our own
+                    // choice, so counting it as a short guest read would report a guest defect.
+                    if (rej_frames < rej_frames_req) ++fp.short_read;
                     for (size_t k = 0, nf = rej_frames * channels; k < nf; ++k)
                         flow_add_sample(fp, data_type == 0 ? tmp[k]
                                                           : (float)tmp_s16[k] * (1.0f / 32768.0f));

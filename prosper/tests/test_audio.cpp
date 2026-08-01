@@ -243,6 +243,13 @@ static void test_stereo_downmix() {
     // on both — never left half-placed. The pairwise check is what a summed one would miss: two
     // channels swapped between sides sum identically, and a total is also blind to a channel that
     // reaches one side only by accident.
+    //
+    // Note what this file DOES pin, because it is easy to undersell: the explicit per-index
+    // assertions above fix index -> side for widths 6, 7 and 8, so a build that swapped the fold's
+    // left and right fails here. What no test in this repo can settle is whether that mapping is
+    // RIGHT AGAINST HARDWARE — prosper's live probe groups a bed's channels by side but cannot
+    // orient the groups, so the orientation rests on the index-0 = FrontLeft convention. That is a
+    // narrower and more useful claim than "nothing here can see a swap", and #1720 owns it.
     for (unsigned ch = 1; ch <= kAudioMaxBedChannels; ++ch) {
         AudioStereoGain m[kAudioMaxBedChannels];
         CHECK(audio_stereo_downmix(ch, m, kAudioMaxBedChannels) == (ch > 8 ? ch - 8 : 0));
@@ -726,6 +733,13 @@ int main() {
     // The same rule on the OPPOSITE side of a placed channel: 7.1's ch7 is right-only, so an Inf
     // there must not reach the left side at all. This is the 1..8 path, i.e. behaviour that existed
     // before wide beds and must not have regressed when the fold became a matrix.
+    //
+    // THIS CASE IS NOT REDUNDANT WITH THE ONE ABOVE — do not delete either as a duplicate. They
+    // discriminate different wrong fixes. A fix that skips only channels whose gain pair is {0, 0}
+    // passes the 12-channel test (its poison sits in the unplaced tier) and FAILS here, because
+    // ch7 is placed — just not on this side. Only a fix that skips a zero gain PER SIDE passes
+    // both. Deleting the narrower-looking one is exactly how a discriminating case quietly becomes
+    // a vacuous one.
     a2_port_param.data_format = 0x800;
     CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&a2_port)) == 0);
     std::vector<float> a2_side(64 * 8, 0.0f);

@@ -197,6 +197,15 @@ guest's own PCM instead of assuming an enumeration, reporting every five seconds
 `PATH.portN.<channels>ch.f32` as float32 (both sample types converted), so the measurement can be re-derived,
 analysed differently, or rendered to something audible offline.
 
+**The channel count is confirmed from the guest's own code, independently of prosper's decode.**
+`data_format` bits 8..15 being a channel count is not just prosper's reading of it: Dragon Quest
+VII's own format selector (eboot `0x605b02a` in a flattened image, adjacent to the CRIWARE wrapper
+that owns the `E2020070207:sceAudioOut2PortCreate() is failed` string) is a four-armed switch that
+writes `data_format` and a channel count into parallel fields — `0x100`/1, `0x200`/2, `0x800`/8,
+and `0xc00`/**12**. That is the cross-check instrument-trap 40 asks for: a measurement whose value
+does not come from the decode being tested. Note what it does NOT establish — the *order* of those
+12 channels appears nowhere in it.
+
 **What this established for *Dragon Quest VII Reimagined* (#1700).** Over 19,962,368 frames of its
 12-channel MAIN port: all content is in ch0/ch1 (rms 3.1e-2 / 4.3e-2, peak 0.407, correlation
 +0.46 — a real decorrelated stereo pair); ch2 and ch4..ch7 hold a ~1e-9 residue; **ch3 and
@@ -217,14 +226,30 @@ surround groups — but it cannot distinguish any of those from a left/right **s
 
 > **`CONFIDENCE: MED` for the left/right orientation of every pair in the fold table above, and its
 > basis is convention, not evidence.** Index 0 = FrontLeft is universal across published
-> multichannel bed layouts, CRI Atom's `EAtomSpeakerID` enum (present in this eboot) orders
-> FrontLeft first, and prosper's own v1 `sceAudioOut` path assumes the same. Three converging
+> multichannel bed layouts, and prosper's own v1 `sceAudioOut` path assumes the same. **Two**
+> converging
 > conventions earn MED rather than LOW — but a convention is not a measurement, and this one has
-> never been tested against a PS5 title. A mono or stereo bed has no orientation to get wrong, so
+> never been tested against a PS5 title. Note precisely where the gap is: `test_audio` DOES pin
+> index -> side for widths 6, 7 and 8, so a build that swapped prosper's own fold fails in CI.
+> What is unconfirmed is whether that mapping matches hardware.
+>
+> **A third convention was checked and rejected, and the rejection is the useful part.** CRI
+> Atom's `EAtomSpeakerID` names are present in this eboot and order FrontLeft first, which is
+> a different kind of claim from "the wider world does this": if the title mixed its bed
+> through Atom, the bed's order would be Atom's order, and that is a property of the code
+> path rather than an inherited assumption. It does not hold. `tools/re/xref.py` reports
+> **zero code references** to that string and one data-pointer relocation into a UE
+> reflection table — the names are Blueprint metadata that survived into the image, and
+> nothing calls them. A symbol in a binary is not a code path, and three conventions
+> agreeing is not corroboration when they may share one ancestor. A mono or stereo bed has no orientation to get wrong, so
 > 1..2 channels remain `CONFIDENCE: HIGH`. **A listening test does
 not settle a fold-down either** — and for this title it cannot settle anything about the layout,
 because ten of its twelve channels are empty, so *every* mapping that routes ch0 and ch1 to the two
-sides produces a bit-identical host bed. A human confirming "it sounds right" therefore establishes
+sides produces a host bed differing only by the ~1e-9 residue on ch2 and ch4..ch7 — roughly 150 dB
+below the content. Deliberately not called "bit-identical": ch3 and ch8..ch11 are exactly zero and
+the others are a residue, and this page's whole point is that those are different findings, so the
+strongest claim on it must not be the one place they get re-merged. A human confirming "it sounds
+right" therefore establishes
 that real audio reaches the sink at sane levels through the guest's own path (bring-up rung 4), and
 nothing about the channel order. Broadly stereo music folds down plausibly under a swap, which is
 exactly why it cannot arbitrate one. **Do not cite a listening confirmation as evidence for the
