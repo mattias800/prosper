@@ -200,6 +200,19 @@ anywhere yet**, so they are deliberately left unplaced and logged rather than fo
 dataFormat, u32 sampleRate, u32 flags, u64 userHandle}` — live-captured), and this title never
 calls `sceAudioOut2GetSpeakerInfo`, so nothing in the guest's own setup names the order.
 
+**What no amount of this evidence can settle, and what would.** Correlation is symmetric, so the
+probe proves ch0/ch1 are a genuine front pair but cannot distinguish a left/right **swap**; that ch0
+is the left one rests on the universal index-0 = FrontLeft convention (CRI Atom's `EAtomSpeakerID`
+enum, present in this eboot, orders FrontLeft first), not on a measurement. **A listening test does
+not settle a fold-down either** — and for this title it cannot settle anything about the layout,
+because ten of its twelve channels are empty, so *every* mapping that routes ch0 and ch1 to the two
+sides produces a bit-identical host bed. A human confirming "it sounds right" therefore establishes
+that real audio reaches the sink at sane levels through the guest's own path (bring-up rung 4), and
+nothing about the channel order. The discriminating evidence is content with **distinct per-channel
+placement** — a hard-panned effect, or centre-channel dialogue — measured with this probe. That is
+the experiment #1720 asks for, and it is why a plausible-sounding wrong order is more dangerous than
+a reported gap.
+
 Related, narrower probes: `PROSPER_AUDIOLOG=1` (legacy `sceAudioOut` path: per-port calls, bytes,
 peak and RMS), `PROSPER_AUDIO_DUMP=PATH` (raw `PATH.portN.raw` PCM for offline inspection),
 `PROSPER_AUDIO2LOG=1` (full AudioOut2 call trace with hexdumps), `PROSPER_AUDIO2_PROBE=1` (per-port

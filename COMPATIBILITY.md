@@ -238,7 +238,11 @@ full-speed performance remain open.
 **Audio plays.** The title drives `sceAudioOut2` with a 12-channel MAIN bed; prosper used to discard
 any port wider than 7.1, so a whole audio context never opened a host device (#1692/#1700). The bed
 is now folded to the host's stereo sink, and a 147-second routed capture carries continuous
-music-like content (peak 0.390, 90 % non-zero samples, no repeated grains).
+music-like content (peak 0.390, 90 % non-zero samples, no repeated grains). The project owner has
+confirmed by ear that the title's music plays and sounds right — bring-up rung 4 for audio. That
+confirms real audio reaches the device at sane levels through the guest's own path; it does **not**
+confirm the multichannel fold's channel order, because ten of this bed's twelve channels are
+measured empty, so every mapping that routes the front pair to the two sides sounds identical.
 
 The apparently permanent black frame in no-input runs is authored UI state, not a lost final composite:
 the complete sky/ocean scene exists underneath an opaque-black Slate background, and the routed input

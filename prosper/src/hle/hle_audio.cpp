@@ -184,7 +184,18 @@ bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth) {
 // than one that reports the gap, and no title in evidence puts signal there. The leading hypothesis
 // is that the same even=left/odd=right pairing continues, but that is inference from the tiers
 // below it, not a measurement, so it is tracked as an issue instead of shipped.
-// CONFIDENCE: HIGH for 1..2 channels, MED for 3..8, and 9..16 places only its first eight.
+// What the measurement CANNOT settle, stated so nobody reads more into it than it carries:
+//   - Correlation is symmetric, so it proves ch0/ch1 are a genuine front pair but cannot tell a
+//     left/right SWAP from the correct assignment. That ch0 is the left one rests on the universal
+//     index-0 = FrontLeft convention (CRI Atom's own `EAtomSpeakerID` enum, whose names are present
+//     in this title's eboot, orders FrontLeft before FrontRight), not on a measurement here.
+//   - A listening test cannot settle it either, and specifically cannot settle this title's layout
+//     at all: ten of its twelve channels are measured empty, so every mapping that routes ch0 and
+//     ch1 to the two sides produces an identical host bed. Only content with distinct per-channel
+//     placement — a hard-panned effect, or centre-channel dialogue — discriminates a fold-down, and
+//     no title in evidence yet submits any.
+// CONFIDENCE: HIGH that ch0/ch1 are the front pair and that 1..2-channel beds are right; MED for
+// which of the pair is left, and for 3..8; 9..16 places only its first eight.
 unsigned audio_stereo_downmix(unsigned channels, AudioStereoGain* out, unsigned out_capacity) {
     if (!out || !channels || channels > kAudioMaxBedChannels || out_capacity < channels)
         return channels;

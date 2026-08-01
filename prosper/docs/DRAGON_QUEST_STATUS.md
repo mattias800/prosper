@@ -366,7 +366,12 @@ current build.
   the surround tier pairs even=left / odd=right; ch2 correlates near-equally with both groups
   (centre-like). Reproduced identically on a second independent 150 s run.
   **The 8-channel port (ctx1/port2) remains exactly zero** — 0 non-zero of 55,175,168 samples —
-  even though prosper forwards it. That is a separate open question, not this fix.
+  even though prosper forwards it. That is a separate open question (#1721), not this fix.
+  **Rung 4 for audio: the project owner confirmed by ear that the music plays and sounds right.**
+  That establishes real audio reaching the device at sane levels through the guest's own path. It
+  establishes **nothing about the channel order** — with ten of the twelve channels empty, every
+  mapping that routes ch0/ch1 to the two sides produces a bit-identical bed, and a left/right swap
+  is inaudible without a reference in any case. Do not cite the listening test as layout evidence.
 - **Historical pre-fix measurement**, with `PROSPER_AUDIO_FLOW=1` (see `AUDIO.md`) on a
   `reach-title-screen.pad` run of the direct SDL3 frontend. The title creates **two** AudioOut2 contexts, each with one MAIN
   (`type=0x0`) port, and they carry opposite content. All figures below are the never-reset `LIFE:`
