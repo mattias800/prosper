@@ -455,7 +455,7 @@ static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint
         (is_poolinfo_ptr(payload) && kind[0] != 'D');
     if (payload_suspicious) {
         if (n_payload.fetch_add(1) < 128)
-            fprintf(stderr, "[agc] POOLSHIFT-PAYLOAD kind=%s dst=0x%llx bytes=%llu payload=0x%llx pkt=eboot+0x%llx t=%llums\n",
+            fprintf(stderr, "[agc] POOLSHIFT-PAYLOAD kind=%s dst=0x%llx bytes=%llu payload=0x%llx pkt=0x%llx t=%llums\n",
                     kind, (unsigned long long)dst, (unsigned long long)bytes,
                     (unsigned long long)payload, (unsigned long long)pkt, (unsigned long long)now_ms());
     }
@@ -477,7 +477,7 @@ static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint
             last_a.store(a, std::memory_order_relaxed); last_q.store(q, std::memory_order_relaxed);
             bool inspan = (a + 7 >= dst) && (a < dst + bytes);   // did THIS write touch these bytes?
             if (n.fetch_add(1) < 128)
-                fprintf(stderr, "[agc] POOLSHIFT-STOMP kind=%s @0x%llx=0x%llx (<<8=0x%llx) dst=0x%llx bytes=%llu inspan=%d payload=0x%llx pkt=eboot+0x%llx t=%llums\n",
+                fprintf(stderr, "[agc] POOLSHIFT-STOMP kind=%s @0x%llx=0x%llx (<<8=0x%llx) dst=0x%llx bytes=%llu inspan=%d payload=0x%llx pkt=0x%llx t=%llums\n",
                         kind, (unsigned long long)a, (unsigned long long)q, (unsigned long long)(q << 8),
                         (unsigned long long)dst, (unsigned long long)bytes, inspan,
                         (unsigned long long)payload, (unsigned long long)pkt, (unsigned long long)now_ms());
@@ -507,7 +507,7 @@ static void forge_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t va
     if (!on || !forges_freelist_ptr(pre, width, value)) return;
     static std::atomic<int> n{0};
     if (n.fetch_add(1) < 64)
-        fprintf(stderr, "[agc] FORGE-STOMP kind=%s dst=0x%llx pre=0x%llx val=0x%llx -> 0x%llx pkt=eboot+0x%llx t=%llums\n",
+        fprintf(stderr, "[agc] FORGE-STOMP kind=%s dst=0x%llx pre=0x%llx val=0x%llx -> 0x%llx pkt=0x%llx t=%llums\n",
                 kind, (unsigned long long)dst, (unsigned long long)pre, (unsigned long long)value,
                 (unsigned long long)(pre | (value & 0xffffffffull)), (unsigned long long)pkt,
                 (unsigned long long)now_ms());

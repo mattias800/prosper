@@ -315,6 +315,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_sce_errno PRIVATE prosper_core)
   add_test(NAME sce_errno_freebsd COMMAND test_sce_errno)
 
+  # #1659: every diagnostic that prints "<module>+0x<rva>" agrees with the loader's mapped base, and a
+  # printed offset round-trips back through PROSPER_BP. Header-only; no dump, no device.
+  add_executable(test_guest_module_label tests/test_guest_module_label.cpp)
+  target_link_libraries(test_guest_module_label PRIVATE prosper_core)
+  add_test(NAME guest_module_label COMMAND test_guest_module_label)
+
   # PlatformUi hook (#347): the app frontend can service the guest's ImeDialog with real UI; with no
   # backend registered the headless auto-complete default is unchanged. Pure, no game dump.
   add_executable(test_platform_ui tests/test_platform_ui.cpp)

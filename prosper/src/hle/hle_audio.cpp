@@ -5,6 +5,7 @@
 // prosper_core stays dependency-free; a concrete output frontend (SDL3, ...) installs itself via
 // audio_set_sink() from outside the core.
 #include "dispatch.hpp"
+#include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "nid.hpp"
 #include "audio.hpp"
 #include "ajm_decoder.hpp"     // optional host codecs (MP3); core retains AJM ABI + guest copies
@@ -418,7 +419,8 @@ void a2_log(const char* name, uint64_t a0, uint64_t a1, uint64_t a2,
     fprintf(stderr, "[audio2] %s(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) ra=eboot+0x%llx\n",
             name, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
             (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5,
-            (unsigned long long)((uint64_t)ra - 0x400000000ull));
+            prosper::guest_module_name((uint64_t)ra),
+            (unsigned long long)prosper::guest_module_offset((uint64_t)ra));
 }
 
 } // namespace

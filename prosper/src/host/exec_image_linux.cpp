@@ -5,6 +5,7 @@
 #include "guest_write_watch.hpp"
 #include "fs_emu.hpp"
 #include "raw_syscall.hpp"
+#include "boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
 #include "../hle/nid.hpp"
 #include "../hle/dispatch.hpp"
 
@@ -56,6 +57,13 @@ namespace prosper {
 
 namespace {
     uint64_t g_base = 0, g_stub_base = 0, g_stub_size = 0, g_nstubs = 0;
+    // #1659: label guest addresses through the shared, module-aware helpers instead of subtracting a
+    // literal base. These sites hard-coded 0x400000000 — the eboot's address BEFORE #825 relocated it
+    // to 0x410000000 — so every printed offset was 0x10000000 too high and did not round-trip through
+    // PROSPER_BP, which adds the real mapped base. Async-signal-safe: pure comparisons and arithmetic.
+    inline const char* gmod(uint64_t a) { return prosper::guest_module_name(a); }
+    inline uint64_t    goff(uint64_t a) { return prosper::guest_module_offset(a); }
+    inline bool        gin(uint64_t a)  { return prosper::guest_va_in_module(a); }
     // Real per-thread stack registry (keyed by pthread id). Each guest thread runs on a
     // stack we allocate (the main thread's mmap'd stack; workers' stacks from
     // k_pthread_create), so the GC/thread code gets accurate bounds without the fragile
@@ -115,8 +123,10 @@ namespace {
     // never processed — log the object state and redirect RIP to the reader's own skip label
     // (eboot+0xba6e40, where its type/flag-check branches already land) so processing continues as if
     // the companion weren't needed. This is a *probe* to reveal whether the null companion is the sole
-    // blocker or one of a cascade — NOT a fix (the companions are still not real). eboot base is the
-    // fixed 0x400000000 in this project; overridable via PROSPER_SKIP_RIP / PROSPER_SKIP_TARGET.
+    // blocker or one of a cascade — NOT a fix (the companions are still not real). Overridable via
+    // PROSPER_SKIP_RIP / PROSPER_SKIP_TARGET. NOTE: the two defaults below are absolute guest VAs
+    // computed against the PRE-#825 eboot base (0x400000000) and are stale for that reason (#1659);
+    // they are Messenger-specific probe addresses and are only meaningful when explicitly overridden.
     bool     g_skip_null_companion = false;
     uint64_t g_skip_rip    = 0x400ba6e08ull;   // reader companion deref (mov 0x8(%rsi),%rax; rsi=null)
     uint64_t g_skip_target = 0x400ba6e40ull;   // reader skip label (continues via [obj+0x520/0x530])
@@ -171,7 +181,7 @@ namespace {
     // function (e.g. the GfxDevice ctor 0x95c700) concurrent execution during the byte-restored window
     // corrupts control flow (observed: wild jump). For those, read fault-time state instead of stepping.
     bool     g_bp_on = false;
-    uint64_t g_bp_addr = 0;                    // guest VA of the breakpoint (0x400000000 + offset)
+    uint64_t g_bp_addr = 0;                    // guest VA of the breakpoint (mapped base + offset)
     uint8_t  g_bp_orig = 0;                    // original byte replaced by 0xCC
     bool     g_bp_stepping = false;            // mid single-step (orig byte restored, TF set)
     volatile sig_atomic_t g_bp_count = 0;
@@ -267,7 +277,7 @@ namespace {
     // without needing to know the dynamic buffer base or isolate the crash shader up front.
     uint64_t g_hwbp_anom = 0; bool g_hwbp_anom_on = false;
     static const int HWBP_RING = 256;
-    struct HwbpRingEnt { unsigned long long rip_off, cur, rax; unsigned val;
+    struct HwbpRingEnt { const char* rip_mod; unsigned long long rip_off, cur, rax; unsigned val;
                          unsigned long long r8, f8, f10, r14, rcx; };
     HwbpRingEnt g_hwbp_ring[HWBP_RING];
     volatile int g_hwbp_ring_pos = 0;
@@ -287,7 +297,7 @@ namespace {
     uint64_t g_stepwin_base = 0, g_stepwin_end = 0;
     unsigned long long g_stepwin_prevcur = 0; long g_stepwin_steps = 0; long g_stepwin_max = 4000000;
     static const int STEPWIN_RING = 512;
-    struct StepEnt { unsigned long long rip_off, cur; };
+    struct StepEnt { const char* rip_mod; unsigned long long rip_off, cur; };
     StepEnt g_stepwin_ring[STEPWIN_RING]; int g_stepwin_pos = 0;
     // PROSPER_HWBP_BUFDUMP=1: at the driver bp (rbx = reader), write the reader window [rbx+0x40 .. rbx+0x48]
     // to /tmp/prosper_buf_<hit>.bin per hit — captures the EXACT decompressed object buffer the deserializer
@@ -400,8 +410,8 @@ namespace {
             long long dcur = prev_cur ? (long long)(e.cur - prev_cur) : 0;
             char lb[220];
             int ln = snprintf(lb, sizeof lb,
-                "  [%3d] rip=eboot+0x%llx req/cur=0x%llx cacher/rax=0x%llx | s50/r8=0x%llx s68/f8=0x%llx f10=0x%llx r14=0x%llx  %s\n",
-                i, e.rip_off, e.cur, e.rax, e.r8, e.f8, e.f10, e.r14,
+                "  [%3d] rip=%s+0x%llx req/cur=0x%llx cacher/rax=0x%llx | s50/r8=0x%llx s68/f8=0x%llx f10=0x%llx r14=0x%llx  %s\n",
+                i, e.rip_mod ? e.rip_mod : "?", e.rip_off, e.cur, e.rax, e.r8, e.f8, e.f10, e.r14,
                 (e.cur == e.r8 || e.cur == e.f8) ? "<<< MATCH (skip fetch)" : "");
             (void)dcur;
             raw_write(2,lb, ln);
@@ -422,8 +432,8 @@ namespace {
             const StepEnt& e = g_stepwin_ring[(start + i) % STEPWIN_RING];
             long long d = prev ? (long long)(e.cur - prev) : 0;
             char lb[160];
-            int ln = snprintf(lb, sizeof lb, "  [%3d] rip=eboot+0x%llx cur=0x%llx (off 0x%llx) delta=%+lld\n",
-                i, e.rip_off, e.cur, (unsigned long long)(e.cur - g_stepwin_base), d);
+            int ln = snprintf(lb, sizeof lb, "  [%3d] rip=%s+0x%llx cur=0x%llx (off 0x%llx) delta=%+lld\n",
+                i, e.rip_mod ? e.rip_mod : "?", e.rip_off, e.cur, (unsigned long long)(e.cur - g_stepwin_base), d);
             raw_write(2,lb, ln);
             prev = e.cur;
         }
@@ -1068,7 +1078,7 @@ namespace {
                 uint64_t addr = g_mb3w[mi].addr;
                 unsigned long long v = *(volatile uint64_t*)addr;
                 uint64_t wr = (uint64_t)gr2[REG_RIP];
-                bool in_eboot = (wr >= 0x400000000ull && wr < 0x420000000ull);
+                bool in_eboot = (gin(wr));
                 bool shifted = lwatch_is_pool_shift(v);
                 // base+0x20 is a HOT free-list head (every idx-1 malloc/free touches it), so logging
                 // every benign write floods I/O and stalls the run before the t~60s corruption burst.
@@ -1079,9 +1089,9 @@ namespace {
                     g_mb3w_seen[mi]++;
                 }
                 char b[256]; int n = snprintf(b, sizeof b,
-                    "[mb3watch] WRITE [0x%llx]=0x%llx by rip=%s0x%llx tid=%ld%s\n",
-                    (unsigned long long)addr, v, in_eboot ? "eboot+" : "host:",
-                    (unsigned long long)(in_eboot ? wr - 0x400000000ull : wr), cur_tid(),
+                    "[mb3watch] WRITE [0x%llx]=0x%llx by rip=%s%s0x%llx tid=%ld%s\n",
+                    (unsigned long long)addr, v, in_eboot ? gmod(wr) : "host:", in_eboot ? "+" : "",
+                    (unsigned long long)(in_eboot ? goff(wr) : wr), cur_tid(),
                     shifted ? "  <<<<< POOLSHIFT CORRUPTOR" : "");
                 raw_write(2, b, (size_t)n);
                 if (!in_eboot) classify_addr(wr);
@@ -1103,9 +1113,9 @@ namespace {
                     for (uint64_t p = rsp; p < rsp + 0x200 && found < 10; p += 8) {
                         if (!probe_readable(p)) break;
                         uint64_t ra = *(const uint64_t*)p;
-                        if (ra >= 0x400000000ull && ra < 0x420000000ull) {
-                            sn += snprintf(sb + sn, sizeof sb - sn, " eboot+0x%llx",
-                                           (unsigned long long)(ra - 0x400000000ull));
+                        if (gin(ra)) {
+                            sn += snprintf(sb + sn, sizeof sb - sn, " %s+0x%llx",
+                                           gmod(ra), (unsigned long long)goff(ra));
                             found++;
                         }
                     }
@@ -1136,7 +1146,7 @@ namespace {
                     if (v >= g_stepwin_base && v < g_stepwin_end) { cur = v; break; } }
                 if (cur && cur != g_stepwin_prevcur) {
                     g_stepwin_ring[g_stepwin_pos % STEPWIN_RING] =
-                        { (unsigned long long)(rip - 0x400000000ull), cur };
+                        { gmod(rip), (unsigned long long)goff(rip), cur };
                     g_stepwin_pos++; g_stepwin_prevcur = cur;
                 }
                 bool at_driver = (rip == g_hwbp_addr);
@@ -1177,10 +1187,10 @@ namespace {
                     g_hwwatch_count = g_hwwatch_count + 1;
                     char b[200];
                     uint64_t wr = (uint64_t)gr2[REG_RIP];
-                    bool in_eboot = (wr >= 0x400000000ull && wr < 0x420000000ull);
-                    int n = snprintf(b, sizeof b, "[hwwatch] #%d WRITE [0x%llx]=0x%llx by rip=%s0x%llx tid=%ld\n",
+                    bool in_eboot = (gin(wr));
+                    int n = snprintf(b, sizeof b, "[hwwatch] #%d WRITE [0x%llx]=0x%llx by rip=%s%s0x%llx tid=%ld\n",
                         (int)g_hwwatch_count, (unsigned long long)g_hwwatch_addr, v,
-                        in_eboot ? "eboot+" : "", (unsigned long long)(in_eboot ? wr - 0x400000000ull : wr), cur_tid());
+                        in_eboot ? gmod(wr) : "", in_eboot ? "+" : "", (unsigned long long)(in_eboot ? goff(wr) : wr), cur_tid());
                     raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
                     if (!in_eboot) classify_addr(wr);
                 }
@@ -1203,7 +1213,7 @@ namespace {
                 unsigned val = probe_readable(rax) ? *(const uint32_t*)rax : 0xBADBADu;
                 unsigned long long cur = probe_readable(rbxr + 0x38) ? *(const uint64_t*)(rbxr + 0x38) : 0;
                 int p = g_hwbp_ring_pos % HWBP_RING;
-                g_hwbp_ring[p] = { (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
+                g_hwbp_ring[p] = { gmod((uint64_t)gr[REG_RIP]), (unsigned long long)goff((uint64_t)gr[REG_RIP]),
                                    cur, (unsigned long long)rax, val, 0, 0, 0, (unsigned long long)r14, 0 };
                 g_hwbp_ring_pos = g_hwbp_ring_pos + 1;
                 if ((uint64_t)val >= g_hwbp_anom) hwbp_dump_ring("anom");
@@ -1221,7 +1231,7 @@ namespace {
                 unsigned long long s68 = probe_readable(cacher + 0x68)? *(const uint64_t*)(cacher + 0x68): 0xBADBADull;
                 unsigned long long f160= probe_readable(cacher + 0x160)?*(const uint64_t*)(cacher + 0x160):0xBADBADull;
                 int p = g_hwbp_ring_pos % HWBP_RING;
-                g_hwbp_ring[p] = { (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
+                g_hwbp_ring[p] = { gmod((uint64_t)gr[REG_RIP]), (unsigned long long)goff((uint64_t)gr[REG_RIP]),
                                    req/*cur=requested block*/, (unsigned long long)cacher, 0,
                                    s50/*[+0x50]*/, s68/*[+0x68]*/, f160/*[+0x160]*/, 0, 0 };
                 g_hwbp_ring_pos = g_hwbp_ring_pos + 1;
@@ -1239,8 +1249,9 @@ namespace {
                     s[k] = 0;
                     if (k >= 2) { char b[128]; int n = snprintf(b, sizeof b, "[hwbp-str] %s=0x%llx -> \"%s\"\n", rn, (unsigned long long)p, s); raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */ }
                 };
-                char hdr[64]; int hn = snprintf(hdr, sizeof hdr, "[hwbp-str] hit @eboot+0x%llx:\n",
-                    (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull)); raw_write(2,hdr, hn);
+                char hdr[80]; int hn = snprintf(hdr, sizeof hdr, "[hwbp-str] hit @%s+0x%llx:\n",
+                    gmod((uint64_t)gr[REG_RIP]),
+                    (unsigned long long)goff((uint64_t)gr[REG_RIP])); raw_write(2,hdr, hn);
                 pstr("rdi", (uint64_t)gr[REG_RDI]); pstr("rsi", (uint64_t)gr[REG_RSI]);
                 pstr("rdx", (uint64_t)gr[REG_RDX]); pstr("rcx", (uint64_t)gr[REG_RCX]);
                 pstr("r8",  (uint64_t)gr[REG_R8]);  pstr("r9",  (uint64_t)gr[REG_R9]);
@@ -1323,7 +1334,7 @@ namespace {
                     return probe_readable(p + 0x17) ? *(const uint64_t*)(p + 0x10) : 0;
                 };
                 char b[256]; int n = snprintf(b, sizeof b,
-                    "[hwbp-args] rdi=0x%llx [+10]=0x%llx rsi=0x%llx rdx=0x%llx [+10]=0x%llx rcx=0x%llx r8=0x%llx r9=0x%llx ret=eboot+0x%llx\n",
+                    "[hwbp-args] rdi=0x%llx [+10]=0x%llx rsi=0x%llx rdx=0x%llx [+10]=0x%llx rcx=0x%llx r8=0x%llx r9=0x%llx ret=%s+0x%llx\n",
                     (unsigned long long)gr[REG_RDI],
                     (unsigned long long)arg_field((uint64_t)gr[REG_RDI]),
                     (unsigned long long)gr[REG_RSI],
@@ -1331,7 +1342,9 @@ namespace {
                     (unsigned long long)arg_field((uint64_t)gr[REG_RDX]),
                     (unsigned long long)gr[REG_RCX],
                     (unsigned long long)gr[REG_R8], (unsigned long long)gr[REG_R9],
-                    (unsigned long long)(probe_readable((uint64_t)gr[REG_RSP]) ? (*(const uint64_t*)(uint64_t)gr[REG_RSP] - 0x400000000ull) : 0));
+                    probe_readable((uint64_t)gr[REG_RSP])
+                        ? gmod(*(const uint64_t*)(uint64_t)gr[REG_RSP]) : "?",
+                    (unsigned long long)(probe_readable((uint64_t)gr[REG_RSP]) ? goff(*(const uint64_t*)(uint64_t)gr[REG_RSP]) : 0));
                 raw_write(2, b, (size_t)n);
             }
             // PROSPER_HWBP_OBJ=1: treat rdi as an il2cpp object (at a method-entry bp); print its class
@@ -1373,7 +1386,11 @@ namespace {
                     return probe_readable(a) ? (unsigned long long)*(const uint64_t*)a : 0xBADBADull; };
                 uint64_t rbp = (uint64_t)gr[REG_RBP], rsp = (uint64_t)gr[REG_RSP];
                 auto off = [](unsigned long long v) -> unsigned long long {
-                    return (v >= 0x400000000ull && v < 0x420000000ull) ? v - 0x400000000ull : v; };
+                    return (gin(v)) ? goff(v) : v; };
+                // Companion namer: a widened filter must not keep a hard-coded "eboot+" label, or an
+                // Il2Cpp frame prints a small in-range offset under the wrong module name — worse than
+                // the old out-of-range value, which at least announced itself (#1659 review).
+                auto nm = [](unsigned long long v) -> const char* { return gin(v) ? gmod(v) : "host"; };
                 // Also surface rax + the u32 at [rax] — at the deserializer length-read site (0x7e40d9/e1)
                 // rax is the stream cursor and [rax] the value being read, so a trace shows the parse walk.
                 unsigned rax_u32 = probe_readable(rax) ? *(const uint32_t*)rax : 0xBADBADu;
@@ -1383,10 +1400,12 @@ namespace {
                 uint64_t rbx = (uint64_t)gr[REG_RBX];
                 char b[512];
                 int n = snprintf(b, sizeof b,
-                    "[hwbp] #%d rip=eboot+0x%llx rax=0x%llx [rax]=0x%08x r14=0x%llx rbx=0x%llx cur=0x%llx base=0x%llx end=0x%llx ret=eboot+0x%llx caller_rbp=eboot+0x%llx tid=%ld\n",
-                    (int)g_hwbp_count, (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
+                    "[hwbp] #%d rip=%s+0x%llx rax=0x%llx [rax]=0x%08x r14=0x%llx rbx=0x%llx cur=0x%llx base=0x%llx end=0x%llx ret=%s+0x%llx caller_rbp=%s+0x%llx tid=%ld\n",
+                    (int)g_hwbp_count, gmod((uint64_t)gr[REG_RIP]),
+                    (unsigned long long)goff((uint64_t)gr[REG_RIP]),
                     (unsigned long long)rax, rax_u32, (unsigned long long)r14, (unsigned long long)rbx,
-                    rd(rbx+0x38), rd(rbx+0x40), rd(rbx+0x48), off(rd(rsp)), off(rd(rbp + 8)), cur_tid());
+                    rd(rbx+0x38), rd(rbx+0x40), rd(rbx+0x48), nm(rd(rsp)), off(rd(rsp)),
+                    nm(rd(rbp + 8)), off(rd(rbp + 8)), cur_tid());
                 (void)r15; (void)rdi; (void)rsi;
                 raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
                 // PROSPER_HWBP_DIVCAP: log the typetree-vector transfer's elemSize/byteSize/count from the
@@ -1523,9 +1542,9 @@ namespace {
                     for (uint64_t o = 0; o < 0x200 && found < 8 && n < (int)sizeof b - 24; o += 8) {
                         if (!probe_readable(rsp + o)) break;
                         uint64_t v = *(const uint64_t*)(rsp + o);
-                        if (v >= 0x400000000ull && v < 0x40a000000ull) {
+                        if (gin(v)) {
                             n += snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
-                                          (unsigned long long)(v - 0x400000000ull));
+                                          (unsigned long long)goff(v));
                             found++;
                         }
                     }
@@ -1575,16 +1594,16 @@ namespace {
                 if (lwatch_is_pool_shift(v)) {
                     g_lwatch_hits = g_lwatch_hits + 1;
                     char b[512];
-                    bool guest = g_lwatch_step_rip >= 0x400000000ull && g_lwatch_step_rip < 0x4c0000000ull;
+                    bool guest = gin(g_lwatch_step_rip);
                     int n = snprintf(b, sizeof b,
                         "[lwatch] SHIFT-STOMP fa=0x%llx val=0x%llx (<<8=0x%llx) rip=%s0x%llx tid=%ld",
                         (unsigned long long)g_lwatch_fa, (unsigned long long)v,
                         (unsigned long long)(v << 8), guest ? "eboot+" : "host:",
-                        (unsigned long long)(guest ? g_lwatch_step_rip - 0x400000000ull : g_lwatch_step_rip),
+                        (unsigned long long)(guest ? goff(g_lwatch_step_rip) : g_lwatch_step_rip),
                         cur_tid());
                     for (int i = 0; i < g_lwatch_stkn && n < (int)sizeof b - 24; i++)
                         n += snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
-                                      (unsigned long long)(g_lwatch_stk[i] - 0x400000000ull));
+                                      (unsigned long long)goff(g_lwatch_stk[i]));
                     if (n < (int)sizeof b - 1) b[n++] = '\n';
                     raw_write(2, b, (size_t)n);
                     if (g_lwatch_hits >= g_lwatch_max) {   // caught enough — disarm, leave page RW
@@ -1629,7 +1648,7 @@ namespace {
                     for (uint64_t o = 0; o < 0x400 && g_lwatch_stkn < 8; o += 8) {
                         if (!probe_readable(rsp + o)) break;
                         uint64_t v = *(const uint64_t*)(rsp + o);
-                        if (v >= 0x400000000ull && v < 0x40a000000ull) g_lwatch_stk[g_lwatch_stkn++] = v;
+                        if (gin(v)) g_lwatch_stk[g_lwatch_stkn++] = v;
                     }
                     mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
                     PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;   // TF -> single-step the write
@@ -1639,12 +1658,12 @@ namespace {
                 if (fa >= g_lwatch_slot - 0x18 && fa < g_lwatch_slot + 0x20) {
                     g_lwatch_hits = g_lwatch_hits + 1;
                     char b[512];
-                    bool guest = rip >= 0x400000000ull && rip < 0x4c0000000ull;
+                    bool guest = gin(rip);
                     int n = snprintf(b, sizeof b,
                         "[lwatch] #%d write fa=0x%llx rip=%s0x%llx tid=%ld pre[0]=0x%llx pre[8]=0x%llx",
                         (int)g_lwatch_hits, (unsigned long long)fa,
                         guest ? "eboot+" : "host:",
-                        (unsigned long long)(guest ? rip - 0x400000000ull : rip), cur_tid(),
+                        (unsigned long long)(guest ? goff(rip) : rip), cur_tid(),
                         (unsigned long long)*(const uint64_t*)g_lwatch_slot,
                         (unsigned long long)*(const uint64_t*)(g_lwatch_slot + 8));
                     // #312: call-stack capture — scan the writer's stack for eboot-text return
@@ -1656,9 +1675,9 @@ namespace {
                     for (uint64_t o = 0; o < 0x400 && found < 8 && n < (int)sizeof b - 24; o += 8) {
                         if (!probe_readable(rsp + o)) break;
                         uint64_t v = *(const uint64_t*)(rsp + o);
-                        if (v >= 0x400000000ull && v < 0x40a000000ull) {
+                        if (gin(v)) {
                             n += snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
-                                          (unsigned long long)(v - 0x400000000ull));
+                                          (unsigned long long)goff(v));
                             found++;
                         }
                     }
@@ -2756,7 +2775,7 @@ void arm_hwbp_this_thread() {
     }
     ioctl(t_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
     char b[128]; int n = snprintf(b, sizeof b, "[hwbp] armed on worker tid=%ld (fd=%d) for eboot+0x%llx\n",
-        (long)prosper_gettid(), t_hwbp_fd, (unsigned long long)(g_hwbp_addr - 0x400000000ull));
+        (long)prosper_gettid(), t_hwbp_fd, (unsigned long long)goff(g_hwbp_addr));
     raw_write(2,b, n);
 }
 

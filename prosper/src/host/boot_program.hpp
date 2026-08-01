@@ -40,6 +40,71 @@ inline constexpr uint64_t BOOT_PLUGIN_AUTO_STRIDE = 0x4000000ull;   // 64 MiB
 inline constexpr unsigned BOOT_PLUGIN_AUTO_SLOTS  = 10;
 inline constexpr uint64_t BOOT_STUB     = 0x600000000ull;
 
+// --- Guest-address labelling, shared by every diagnostic that prints "<module>+0x<rva>" ----------
+//
+// These exist because the same label was being produced three different ways (#1659). The eboot base
+// MOVED in #825 (0x400000000 -> 0x410000000, so Astro Bot's direct-memory mapping at
+// [0x400000000,0x40b800000) would stop aliasing code), and the diagnostics that had hard-coded the old
+// literal were never updated. They kept printing "eboot+0x…" against 0x400000000, so every offset was
+// the real RVA plus 0x10000000 — a plausible-looking number that lands nowhere, and one that no longer
+// round-trips through PROSPER_BP (which correctly adds the *mapped* base).
+//
+// Two further defects the literal caused, beyond the shift:
+//   * [0x400000000,0x410000000) is now a direct-memory aperture, not code — a data pointer there was
+//     classified as "eboot" and printed as a code offset.
+//   * Sites testing a single wide range (e.g. [0x400000000,0x4c0000000)) labelled EVERY module in it
+//     "eboot+", so an IL2CPP return address was reported as an eboot RVA. Wrong binary, not just wrong
+//     offset.
+//
+// Use these instead of subtracting any literal. `guest_module_name` returns a stable short name, and
+// `guest_module_offset` the offset within that module; for an address outside every fixed module the
+// name is "mapped/host" and the offset is the address itself, so a caller can print it verbatim.
+inline const char* guest_module_name(uint64_t a) {
+    if (a >= BOOT_EBOOT         && a < BOOT_IL2CPP)        return "eboot";
+    if (a >= BOOT_IL2CPP        && a < BOOT_PSNCORE)       return "Il2cpp";
+    if (a >= BOOT_PSNCORE       && a < BOOT_PSNCOMMON)     return "PSNCore.prx";
+    if (a >= BOOT_PSNCOMMON     && a < BOOT_COMMONDIALOG)  return "PSNCommon.prx";
+    if (a >= BOOT_COMMONDIALOG  && a < BOOT_PS5UTIL)       return "CommonDialog.prx";
+    if (a >= BOOT_PS5UTIL       && a < BOOT_NPCPPWEBAPI)   return "PS5Util";
+    if (a >= BOOT_NPCPPWEBAPI   && a < BOOT_PSN)           return "libSceNpCppWebApi.prx";
+    if (a >= BOOT_PSN           && a < BOOT_SAVEDATA)      return "PSN.prx";
+    if (a >= BOOT_SAVEDATA      && a < BOOT_FMODSTUDIO)    return "SaveData.prx";
+    if (a >= BOOT_FMODSTUDIO    && a < BOOT_FMOD)          return "libfmodstudio.prx";
+    if (a >= BOOT_FMOD          && a < BOOT_AKMOTION)      return "libfmod.prx";
+    if (a >= BOOT_AKMOTION      && a < BOOT_AKVORBIS)      return "AkMotion.prx";
+    if (a >= BOOT_AKVORBIS      && a < BOOT_AKSOUNDENGINE) return "AkVorbisHwAccelerator.prx";
+    if (a >= BOOT_AKSOUNDENGINE && a < BOOT_LIBC)          return "AkSoundEngine.prx";
+    if (a >= BOOT_LIBC          && a < BOOT_PLUGIN_AUTO_BASE) return "libc.prx";
+    if (a >= BOOT_PLUGIN_AUTO_BASE && a < BOOT_STUB)       return "plugin";
+    if (a >= BOOT_STUB          && a < 0x610000000ull)     return "STUB";
+    return "mapped/host";
+}
+inline uint64_t guest_module_offset(uint64_t a) {
+    if (a >= BOOT_EBOOT         && a < BOOT_IL2CPP)        return a - BOOT_EBOOT;
+    if (a >= BOOT_IL2CPP        && a < BOOT_PSNCORE)       return a - BOOT_IL2CPP;
+    if (a >= BOOT_PSNCORE       && a < BOOT_PSNCOMMON)     return a - BOOT_PSNCORE;
+    if (a >= BOOT_PSNCOMMON     && a < BOOT_COMMONDIALOG)  return a - BOOT_PSNCOMMON;
+    if (a >= BOOT_COMMONDIALOG  && a < BOOT_PS5UTIL)       return a - BOOT_COMMONDIALOG;
+    if (a >= BOOT_PS5UTIL       && a < BOOT_NPCPPWEBAPI)   return a - BOOT_PS5UTIL;
+    if (a >= BOOT_NPCPPWEBAPI   && a < BOOT_PSN)           return a - BOOT_NPCPPWEBAPI;
+    if (a >= BOOT_PSN           && a < BOOT_SAVEDATA)      return a - BOOT_PSN;
+    if (a >= BOOT_SAVEDATA      && a < BOOT_FMODSTUDIO)    return a - BOOT_SAVEDATA;
+    if (a >= BOOT_FMODSTUDIO    && a < BOOT_FMOD)          return a - BOOT_FMODSTUDIO;
+    if (a >= BOOT_FMOD          && a < BOOT_AKMOTION)      return a - BOOT_FMOD;
+    if (a >= BOOT_AKMOTION      && a < BOOT_AKVORBIS)      return a - BOOT_AKMOTION;
+    if (a >= BOOT_AKVORBIS      && a < BOOT_AKSOUNDENGINE) return a - BOOT_AKVORBIS;
+    if (a >= BOOT_AKSOUNDENGINE && a < BOOT_LIBC)          return a - BOOT_AKSOUNDENGINE;
+    if (a >= BOOT_LIBC          && a < BOOT_PLUGIN_AUTO_BASE) return a - BOOT_LIBC;
+    if (a >= BOOT_PLUGIN_AUTO_BASE && a < BOOT_STUB)
+        return (a - BOOT_PLUGIN_AUTO_BASE) % BOOT_PLUGIN_AUTO_STRIDE;
+    if (a >= BOOT_STUB          && a < 0x610000000ull)     return a - BOOT_STUB;
+    return a;
+}
+// True when `a` lies inside some fixed guest module, i.e. "<name>+0x<offset>" is meaningful.
+inline bool guest_va_in_module(uint64_t a) {
+    return a >= BOOT_EBOOT && a < 0x610000000ull;
+}
+
 // Boot the title rooted at `dump_root` (the app0 directory): link the fixed module set (dropping any
 // absent dependent module — cross-title tolerance; honors PROSPER_NO_PSN), register the built-in
 // HLE, map the images, set up TLS / unwind / procparam, install the import stubs + trap handler,

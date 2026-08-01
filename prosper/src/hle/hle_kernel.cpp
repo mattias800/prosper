@@ -15,6 +15,7 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "sce_errno.hpp"
+#include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "sync_futex.hpp"
 #include "../gpu/mb3_freelist.hpp"
 #include "../host/exec_image.hpp"
@@ -2128,18 +2129,14 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
         uint64_t sfs = guest_fs_to_host_scoped();
         const char* fss = sfs ? "guest" : "host";
         char b[160]; int n;
-        if (irip >= 0x400000000ull && irip < 0x420000000ull)
-            n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=eboot+0x%llx\n",
-                         (long)prosper_gettid(), type, fss, (unsigned long long)(irip - 0x400000000ull));
-        else if (irip >= 0x440000000ull && irip < 0x443000000ull)
-            n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=il2cpp+0x%llx\n",
-                         (long)prosper_gettid(), type, fss, (unsigned long long)(irip - 0x440000000ull));
-        else if (irip >= 0x500000000ull && irip < 0x501000000ull)
-            n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=libc+0x%llx\n",
-                         (long)prosper_gettid(), type, fss, (unsigned long long)(irip - 0x500000000ull));
-        else
-            n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=host:0x%llx\n",
-                         (long)prosper_gettid(), type, fss, (unsigned long long)irip);
+        // #1659: was a hand-rolled three-branch dispatcher whose eboot (0x400000000) and libc
+        // (0x500000000) bases were both stale; only the il2cpp one was current. One shared,
+        // module-aware call replaces all three and cannot drift again.
+        n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=%s+0x%llx\n",
+                     (long)prosper_gettid(), type, fss, prosper::guest_module_name(irip),
+                     (unsigned long long)prosper::guest_module_offset(irip));
+        // guest_module_name/offset already degrade to "mapped/host" + the verbatim address, so the
+        // former host: fallback branch is folded into the single call above.
         (void)!write(2, b, n);
         guest_fs_restore_scoped(sfs);
     }
@@ -2912,7 +2909,8 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         unsigned guest_return_count = 0;
         for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && guest_return_count < 8; ++i) {
             const uint64_t candidate = stack_words[i];
-            if (candidate < 0x400000000ull || candidate >= 0x600000000ull) continue;
+            // #1659: module range, not the pre-#825 literal.
+            if (!prosper::guest_va_in_module(candidate) || candidate >= prosper::BOOT_STUB) continue;
             bool in_guest_module = false;
             for (const UnwindModuleDesc& guest_module : modules)
                 in_guest_module |= candidate >= guest_module.lo && candidate < guest_module.hi;

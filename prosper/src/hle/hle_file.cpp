@@ -961,7 +961,12 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
     uint64_t cc[8] = {0,0,0,0,0,0,0,0}; int nc = 0; uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
     int maxw = stack_words_above(sp);
     for (int i = 0; i < 1200 && i < maxw && nc < 8; i++) { uint64_t v = sp[i];
-        if (v >= 0x400000000ull && v < 0x420000000ull) { uint64_t o = v - 0x400000000ull;
+        // #1659: the base was a stale pre-#825 literal, so every printed caller was 0x10000000 high.
+        // Deliberately still EBOOT-ONLY: the format prints one "eboot+" prefix and then eight bare
+        // offsets, so admitting other modules here would label an Il2Cpp caller as an eboot RVA — a
+        // small, plausible, wrong number. Widening this needs a per-entry "name+off" format first.
+        if (v >= prosper::BOOT_EBOOT && v < prosper::BOOT_IL2CPP) {
+            uint64_t o = v - prosper::BOOT_EBOOT;
             if (nc == 0 || cc[nc-1] != o) cc[nc++] = o; } }
     fprintf(stderr, "[preadlog] %-6s %-24s fd=%lld off=0x%llx(blk %lld) cnt=0x%llx tid=%ld callers=eboot+0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx\n",
             fn, base, (long long)fd, (unsigned long long)off, (long long)(off / 0x10000),
@@ -975,9 +980,13 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
         int nf = 0; uint64_t last = 0;
         for (int i = 0; i < 1600 && i < maxw && nf < 20 && p < (int)sizeof line - 24; i++) {
             uint64_t v = sp[i];
+            // #1659: was a two-branch dispatcher whose eboot base was the stale pre-#825 literal
+            // (the il2cpp one was current). This formatter already carried a per-entry module tag, so
+            // unlike [preadlog] above it can name every module correctly.
             const char* m = nullptr; uint64_t o = 0;
-            if (v >= 0x400000000ull && v < 0x420000000ull) { m = "eb"; o = v - 0x400000000ull; }
-            else if (v >= 0x440000000ull && v < 0x4c0000000ull) { m = "il"; o = v - 0x440000000ull; }
+            if (prosper::guest_va_in_module(v)) {
+                m = prosper::guest_module_name(v); o = prosper::guest_module_offset(v);
+            }
             if (m && o != last) { p += snprintf(line + p, sizeof line - p, " %s+%llx", m, (unsigned long long)o); last = o; nf++; }
         }
         fprintf(stderr, "%s\n", line);
@@ -2397,9 +2406,13 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
             int shown = 0;
             for (int i = 0; i < 160 && shown < 6; i++) {
                 uint64_t v = sp[i];
-                if (v < 0x400000000ull || v >= 0x4c0000000ull) continue;
-                fprintf(stderr, "[apr]   guest-ra[%d] = eboot+0x%llx\n", i,
-                        (unsigned long long)(v - 0x400000000ull));
+                // Was `>= 0x400000000` with an "eboot+" label subtracting the same literal (#1659):
+                // that base is the PRE-#825 eboot address, so every offset was 0x10000000 too high,
+                // and the range covered IL2CPP/PSN modules too — all labelled "eboot".
+                if (!prosper::guest_va_in_module(v)) continue;
+                fprintf(stderr, "[apr]   guest-ra[%d] = %s+0x%llx\n", i,
+                        prosper::guest_module_name(v),
+                        (unsigned long long)prosper::guest_module_offset(v));
                 shown++;
             }
         }

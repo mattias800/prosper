@@ -75,41 +75,16 @@ using namespace prosper;
 // Fixed module slots from the shared boot path. Keep diagnostics honest when optional plugin code
 // appears in a backtrace; the old local table predated FMOD/Wwise and even retained obsolete eboot
 // and libc bases, misclassifying every address in those later slots as SaveData or libc.
-static const char* cls(uint64_t a) {
-    if (a >= BOOT_EBOOT         && a < BOOT_IL2CPP)       return "eboot";
-    if (a >= BOOT_IL2CPP        && a < BOOT_PSNCORE)      return "Il2cpp";
-    if (a >= BOOT_PSNCORE       && a < BOOT_PSNCOMMON)    return "PSNCore.prx";
-    if (a >= BOOT_PSNCOMMON     && a < BOOT_PS5UTIL)      return "PSNCommon.prx";
-    if (a >= BOOT_PS5UTIL       && a < BOOT_NPCPPWEBAPI)  return "PS5Util";
-    if (a >= BOOT_NPCPPWEBAPI   && a < BOOT_PSN)          return "libSceNpCppWebApi.prx";
-    if (a >= BOOT_PSN           && a < BOOT_SAVEDATA)     return "PSN.prx";
-    if (a >= BOOT_SAVEDATA      && a < BOOT_FMODSTUDIO)   return "SaveData.prx";
-    if (a >= BOOT_FMODSTUDIO    && a < BOOT_FMOD)         return "libfmodstudio.prx";
-    if (a >= BOOT_FMOD          && a < BOOT_AKMOTION)     return "libfmod.prx";
-    if (a >= BOOT_AKMOTION      && a < BOOT_AKVORBIS)     return "AkMotion.prx";
-    if (a >= BOOT_AKVORBIS      && a < BOOT_AKSOUNDENGINE)return "AkVorbisHwAccelerator.prx";
-    if (a >= BOOT_AKSOUNDENGINE && a < BOOT_LIBC)         return "AkSoundEngine.prx";
-    if (a >= BOOT_LIBC          && a < BOOT_STUB)         return "libc.prx";
-    if (a >= BOOT_STUB          && a < 0x610000000ull)    return "STUB";
-    return "mapped/host";
-}
-static uint64_t bof(uint64_t a) {
-    if (a >= BOOT_EBOOT         && a < BOOT_IL2CPP)        return a - BOOT_EBOOT;
-    if (a >= BOOT_IL2CPP        && a < BOOT_PSNCORE)       return a - BOOT_IL2CPP;
-    if (a >= BOOT_PSNCORE       && a < BOOT_PSNCOMMON)     return a - BOOT_PSNCORE;
-    if (a >= BOOT_PSNCOMMON     && a < BOOT_PS5UTIL)       return a - BOOT_PSNCOMMON;
-    if (a >= BOOT_PS5UTIL       && a < BOOT_NPCPPWEBAPI)   return a - BOOT_PS5UTIL;
-    if (a >= BOOT_NPCPPWEBAPI   && a < BOOT_PSN)           return a - BOOT_NPCPPWEBAPI;
-    if (a >= BOOT_PSN           && a < BOOT_SAVEDATA)      return a - BOOT_PSN;
-    if (a >= BOOT_SAVEDATA      && a < BOOT_FMODSTUDIO)    return a - BOOT_SAVEDATA;
-    if (a >= BOOT_FMODSTUDIO    && a < BOOT_FMOD)          return a - BOOT_FMODSTUDIO;
-    if (a >= BOOT_FMOD          && a < BOOT_AKMOTION)      return a - BOOT_FMOD;
-    if (a >= BOOT_AKMOTION      && a < BOOT_AKVORBIS)      return a - BOOT_AKMOTION;
-    if (a >= BOOT_AKVORBIS      && a < BOOT_AKSOUNDENGINE) return a - BOOT_AKVORBIS;
-    if (a >= BOOT_AKSOUNDENGINE && a < BOOT_LIBC)          return a - BOOT_AKSOUNDENGINE;
-    if (a >= BOOT_LIBC          && a < BOOT_STUB)          return a - BOOT_LIBC;
-    return a;
-}
+// Module classification/offset now live in boot_program.hpp so the fault, HWBP and APR diagnostics
+// produce the identical label instead of each carrying its own copy (#1659). This was the correct
+// implementation; the others had a stale literal base.
+//
+// NOT byte-identical to what stood here, in three ways — all deliberate, all changing boot_trace's own
+// output: the shared version adds CommonDialog.prx and the auto-plugin pool (which this copy predated),
+// and it offsets BOOT_STUB addresses from BOOT_STUB, where this copy fell through and printed the raw
+// address. So "STUB +0x600000123" in an archived log is "STUB +0x123" now.
+static const char* cls(uint64_t a) { return prosper::guest_module_name(a); }
+static uint64_t    bof(uint64_t a) { return prosper::guest_module_offset(a); }
 
 int main(int argc, char** argv) {
     // PROSPER_TERM_BT: install a std::terminate handler that dumps the HOST backtrace + exception

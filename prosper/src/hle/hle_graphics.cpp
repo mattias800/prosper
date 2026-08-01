@@ -12,6 +12,7 @@
 // Sony libs, so they're registered by raw NID with a note on the observed role.
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "host/exec_image.hpp"
 #include "gpu/videoout_present.hpp"
 #include "gpu/gpu_execute.hpp"      // guest_readable (safe pointer probe for the diagnostic dumps)
@@ -823,8 +824,9 @@ uint64_t glog_impl(const char* nid, void* ra,
                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     gfx_tick();
     if (getenv("PROSPER_GFXLOG"))
-        fprintf(stderr, "[gfx] libSceAgc::%s  from eboot+0x%llx  a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
-                nid, (unsigned long long)((uint64_t)ra - 0x400000000ull),
+        fprintf(stderr, "[gfx] libSceAgc::%s  from %s+0x%llx  a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+                nid, prosper::guest_module_name((uint64_t)ra),
+                (unsigned long long)prosper::guest_module_offset((uint64_t)ra),
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
     // PROSPER_CTXDUMP: dump the register-context per-stage sub-objects' {source, user_data} pair at
