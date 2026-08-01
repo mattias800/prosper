@@ -44,24 +44,26 @@ namespace {
 // title (Earthion / PPSA28061). Any other Ult NID a future title imports still falls through to the
 // generic unimplemented-import path, which logs it — add it here when that happens.
 // CONFIDENCE: HIGH (two independent instruments agree on the NID<->name mapping and the import set).
-struct UltEntry { const char* nid; const char* name; };
+// `returns_size` marks the entry points whose contract returns a VALUE (a byte count) rather than a
+// STATUS. Those must never be handed an error sentinel — see kUltSizeUnknown below (#1618).
+struct UltEntry { const char* nid; const char* name; bool returns_size; };
 constexpr UltEntry kUlt[] = {
-    { "jw9FkZBXo-g", "_sceUltUlthreadRuntimeCreate" },
-    { "grs2pbc2awM", "sceUltUlthreadRuntimeGetWorkAreaSize" },
-    { "znI3q8S7KQ4", "_sceUltUlthreadCreate" },
-    { "gCeAI57LGgI", "sceUltUlthreadJoin" },
-    { "mmt8Sa6tL6c", "_sceUltMutexCreate" },
-    { "8hEGkR1pfr8", "sceUltMutexLock" },
-    { "h0XebKiMBtk", "sceUltMutexUnlock" },
-    { "jW+HnafeS3Y", "sceUltMutexDestroy" },
-    { "jnKaHGkrxZ4", "_sceUltConditionVariableCreate" },
-    { "5xGAHCxA8M0", "sceUltConditionVariableWait" },
-    { "JTw1cAVkuc0", "sceUltConditionVariableSignal" },
-    { "xrmmI832R4U", "sceUltConditionVariableDestroy" },
-    { "YiHujOG9vXY", "_sceUltWaitingQueueResourcePoolCreate" },
-    { "WIWV1Qd7PFU", "sceUltWaitingQueueResourcePoolGetWorkAreaSize" },
-    { "hZIg1EWGsHM", "sceUltInitialize" },
-    { "d-kSG2fLrvI", "sceUltFinalize" },
+    { "jw9FkZBXo-g", "_sceUltUlthreadRuntimeCreate",                  false },
+    { "grs2pbc2awM", "sceUltUlthreadRuntimeGetWorkAreaSize",          true  },
+    { "znI3q8S7KQ4", "_sceUltUlthreadCreate",                         false },
+    { "gCeAI57LGgI", "sceUltUlthreadJoin",                            false },
+    { "mmt8Sa6tL6c", "_sceUltMutexCreate",                            false },
+    { "8hEGkR1pfr8", "sceUltMutexLock",                               false },
+    { "h0XebKiMBtk", "sceUltMutexUnlock",                             false },
+    { "jW+HnafeS3Y", "sceUltMutexDestroy",                            false },
+    { "jnKaHGkrxZ4", "_sceUltConditionVariableCreate",                false },
+    { "5xGAHCxA8M0", "sceUltConditionVariableWait",                   false },
+    { "JTw1cAVkuc0", "sceUltConditionVariableSignal",                 false },
+    { "xrmmI832R4U", "sceUltConditionVariableDestroy",                false },
+    { "YiHujOG9vXY", "_sceUltWaitingQueueResourcePoolCreate",         false },
+    { "WIWV1Qd7PFU", "sceUltWaitingQueueResourcePoolGetWorkAreaSize", true  },
+    { "hZIg1EWGsHM", "sceUltInitialize",                              false },
+    { "d-kSG2fLrvI", "sceUltFinalize",                                false },
 };
 constexpr size_t kUltCount = sizeof(kUlt) / sizeof(kUlt[0]);
 
@@ -82,6 +84,32 @@ constexpr size_t kUltCount = sizeof(kUlt) / sizeof(kUlt[0]);
 //             should fall into its generic error path. That is still the correct outcome: the call
 //             genuinely failed.
 constexpr uint64_t kUltNotImplemented = 0x8002004Eull;   // SCE_KERNEL_ERROR_ENOSYS
+
+// ...but ONLY for entry points whose contract returns a STATUS. Two of the sixteen do not (#1618).
+//
+// `sceUltUlthreadRuntimeGetWorkAreaSize` and `sceUltWaitingQueueResourcePoolGetWorkAreaSize` return a
+// `size_t` AS THEIR RETURN VALUE. #1603 asserted they were size queries with an out-parameter; the
+// guest's own call site disproves that — there is no out-param, and the returned value is handed
+// straight to malloc:
+//
+//   9c55:  call sceUltWaitingQueueResourcePoolGetWorkAreaSize
+//   9c5a:  mov  QWORD PTR [rbp-0x10],rax     <- the size IS the return value
+//   9c62:  call malloc                       <- fed directly to malloc
+//
+// A signature whose return type is a size HAS NO ERROR CHANNEL, so any value returned is read as data.
+// Returning SCE_KERNEL_ERROR_ENOSYS from them therefore asked the guest for a 0x8002004E-byte
+// (2.0 GiB) allocation — twice — which is the #544/#660 failure class this file was written to prevent.
+//
+// It was also strictly worse than not registering the NIDs at all: the dispatcher's unresolved-import
+// default is `return 0` (dispatch.cpp prosper_on_unimpl), so before registration the guest got 0,
+// called malloc(0), received a valid small pointer and carried on harmlessly.
+//
+// The rule this file now follows: an unimplemented entry point may only return an error sentinel when
+// its contract returns a STATUS. When the contract returns a VALUE, the visibility belongs in the log
+// line — never in the return. prosper consumes no work area yet, so its own requirement is genuinely
+// zero bytes and 0 is the honest answer as well as the safe one.
+// CONFIDENCE: HIGH (the call site is unambiguous, and 0 restores the pre-registration behaviour).
+constexpr uint64_t kUltSizeUnknown = 0ull;
 
 std::atomic<uint64_t> g_calls[kUltCount];
 std::atomic<uint64_t> g_next_report[kUltCount];   // 0 = "report the next call" (i.e. the first)
@@ -116,7 +144,11 @@ void print_banner() {
 uint64_t ult_report(size_t index) {
     const uint64_t n = g_calls[index].fetch_add(1, std::memory_order_relaxed) + 1;
     const bool success = g_return_success.load(std::memory_order_relaxed);
-    const uint64_t ret = success ? 0ull : kUltNotImplemented;
+    // A size-returning contract has no error channel: the sentinel would be read as a byte count and
+    // handed to malloc (#1618). Such an entry point reports through the log line only.
+    const uint64_t ret = kUlt[index].returns_size ? kUltSizeUnknown
+                       : success                  ? 0ull
+                                                  : kUltNotImplemented;
     // Log at 1, 10, 100, 1e3, ... — bounded (a 1e6-call spin costs 7 lines) but never silent.
     // The threshold is a plain load/store rather than a CAS: guest threads racing here can at worst
     // emit the SAME milestone line twice, never suppress one. A duplicate diagnostic line is
@@ -134,29 +166,29 @@ uint64_t ult_report(size_t index) {
                                            "unimplemented user-level lock ***"
                           : n >= 1000    ? "  *** >=1,000 CALLS — hot path, not a one-off ***"
                                          : "";
+        const char* policy = kUlt[index].returns_size
+                                 ? " (a SIZE, not a status — this contract has no error channel, #1618)"
+                             : success
+                                 ? "  [PROSPER_ULT_RETURN_SUCCESS: FAKE SUCCESS, guest is being lied to]"
+                                 : " (SCE_KERNEL_ERROR_ENOSYS)";
         fprintf(stderr, "[prosper] libSceUlt UNIMPLEMENTED: %s (%s) call #%llu -> returning 0x%llx%s%s\n",
                 kUlt[index].name, kUlt[index].nid, (unsigned long long)n,
-                (unsigned long long)ret,
-                success ? "  [PROSPER_ULT_RETURN_SUCCESS: FAKE SUCCESS, guest is being lied to]"
-                        : " (SCE_KERNEL_ERROR_ENOSYS)",
-                scale);
+                (unsigned long long)ret, policy, scale);
     }
     return ret;
 }
 
 // One distinct host function per NID so the handler knows which entry point was called.
 //
-// The guest arguments are read by NOTHING here, and — the deliberate part — no guest out-param is
-// ever written. That decision is load-bearing for the two size queries in the table,
-// `sceUltUlthreadRuntimeGetWorkAreaSize` and `sceUltWaitingQueueResourcePoolGetWorkAreaSize`, which
-// exist to fill a `size_t*` the guest then allocates from. prosper has no evidence of what those
-// sizes should be, and writing a plausible-looking number would be exactly the #544/#660 defect in
-// a new costume: an AGC "success" stub that left its required-memory output unwritten made Dead
-// Cells allocate multiple gigabytes. Returning a real error and touching nothing is the honest
-// pairing — a guest that checks the return sees failure and must not read the buffer; a guest that
-// ignores the failure and consumes uninitialised memory is now displaying ITS OWN bug, on a call
-// that also just logged loudly, instead of silently inheriting a fabricated value from us.
-// CONFIDENCE: HIGH (writing an invented size is strictly worse than writing nothing).
+// No guest memory is read or written here. #1603 justified that partly on the belief that the two
+// size queries fill a `size_t*` out-parameter; they do not — they return the size in rax and the
+// guest passes it straight to malloc, which is what made an error sentinel actively harmful (#1618).
+// The remaining reason still holds and is the real one: prosper has no evidence of what those sizes
+// should be, and writing (or returning) a plausible-looking number would be the #544/#660 defect in a
+// new costume — an AGC "success" stub whose unwritten required-memory output made Dead Cells allocate
+// multiple gigabytes. Zero is the honest answer for as long as prosper consumes no work area, and it
+// is also the value the dispatcher's unresolved-import path would have produced.
+// CONFIDENCE: HIGH (inventing a size is strictly worse than reporting the one prosper actually needs).
 template <size_t Index>
 PROSPER_SYSV_ABI uint64_t ult_stub(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
     return ult_report(Index);
