@@ -99,6 +99,12 @@ void reg_watch_report(RegClass reg_class, uint32_t offset, uint32_t value, uint3
 }
 }  // namespace
 
+// PROSPER_UDPROV=1 (#305 instrument): enable per-SH-register write provenance recording.
+bool udprov_enabled() {
+    static const bool on = std::getenv("PROSPER_UDPROV") != nullptr;
+    return on;
+}
+
 // Readability probe (gpu_executor.cpp, declared in gpu_execute.hpp): page-granular check that a
 // guest range is mapped, so the Jump fold below never walks an unmapped segment address.
 bool guest_readable(uint64_t addr, uint32_t bytes);
@@ -2041,6 +2047,31 @@ void GpuState::apply(const Pm4Command& c) {
                     fprintf(stderr, " (off=0x%x val=0x%x)", regs[i].offset, regs[i].value);
                 fprintf(stderr, "\n");
             }
+            // PROSPER_BINDTRACE=1 (#305 instrument): the pipeline's shader-program registers arrive
+            // through this path as a POINTER to a guest array that prosper reads at FOLD time, while
+            // the stage's user data arrives inline through SET_SH_REG. If a title recycles the array
+            // between recording the packet and submitting the buffer, several binds fold to the same
+            // final contents and a draw runs with another pipeline's program while holding its own
+            // user data. Report each Sh bind's array identity plus the program/RSRC2 values it
+            // carries, so repeated `vaddr` with differing draws is directly observable.
+            static const bool bindtrace = getenv("PROSPER_BINDTRACE") != nullptr;
+            if (bindtrace && c.reg_class == RegClass::Sh) {
+                uint32_t es_lo = 0, rsrc2 = 0, pgm_ps = 0;
+                bool has = false;
+                for (uint32_t i = 0; i < c.num_regs; i++) {
+                    if (regs[i].offset == prosper::agc::Pm4::SPI_SHADER_PGM_LO_ES) { es_lo = regs[i].value; has = true; }
+                    else if (regs[i].offset == prosper::agc::Pm4::SPI_SHADER_PGM_RSRC2_GS) rsrc2 = regs[i].value;
+                    else if (regs[i].offset == prosper::agc::Pm4::SPI_SHADER_PGM_LO_PS) pgm_ps = regs[i].value;
+                }
+                if (has) {
+                    static std::atomic<int> n{0};
+                    if (n.fetch_add(1) < 2000000)
+                        fprintf(stderr,
+                                "[bind] order=%llu vaddr=0x%llx num=%u es_lo=0x%x rsrc2=0x%x ps_lo=0x%x\n",
+                                (unsigned long long)command_order,
+                                (unsigned long long)c.regs_vaddr, c.num_regs, es_lo, rsrc2, pgm_ps);
+                }
+            }
             // PROSPER_REGBLOAT (#1264 investigation): Blue Prince's cx register file was observed live
             // with ~94,000 entries whose keys span the full 32-bit space (real register offsets are a
             // few hundred), making the per-draw snapshot copy in the Draw case below take seconds per
@@ -2088,6 +2119,8 @@ void GpuState::apply(const Pm4Command& c) {
                     continue;
                 }
                 file[offset] = regs[i].value;
+                if (udprov_enabled() && c.reg_class == RegClass::Sh)
+                    sh_prov[offset] = command_order | kProvIndirect;
                 // PROSPER_DBBASETRACE (#1353): log every cx write to the DB Z/STENCIL base
                 // registers (LO 0x12..0x15, HI 0x1A..0x1D) with its source path, to attribute
                 // which packet family programs (or clobbers) a base half — this trace found the
@@ -2202,6 +2235,9 @@ void GpuState::apply(const Pm4Command& c) {
             }
             for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++)
                 file[c.reg_offset + k] = c.reg_data[k];
+            if (udprov_enabled() && c.reg_class == RegClass::Sh)
+                for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++)
+                    sh_prov[c.reg_offset + k] = command_order;
             // PROSPER_DBBASETRACE (#1353): direct-span sibling of the indirect-path trace above.
             {
                 static const bool dbbase_trace = getenv("PROSPER_DBBASETRACE") != nullptr;
@@ -2263,10 +2299,23 @@ void GpuState::apply(const Pm4Command& c) {
                         draws.size(), rd(0xc8), c.index_count ? c.index_count : index_num, (int)state_dirty_,
                         rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f), rd(0x90), rd(0x91), rd(0x92), rd(0x93));
             }
+            // #305: bind-vs-draw sequence in stream order. Cached — this runs per draw, and a
+            // per-draw environ scan is measurable at this title's ~876k draws per route.
+            static const bool bindtrace_draw = getenv("PROSPER_BINDTRACE") != nullptr;
+            if (bindtrace_draw) {
+                auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
+                static std::atomic<int> nd{0};
+                if (nd.fetch_add(1) < 2000000)
+                    fprintf(stderr, "[bind] DRAW order=%llu es_lo=0x%x rsrc2=0x%x ud0..3=%08x %08x %08x %08x\n",
+                            (unsigned long long)command_order, rd(0xc8), rd(0x8b),
+                            rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
+            }
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
+                snap->command_order = command_order;   // #305 instrument: order at snapshot
+                if (udprov_enabled()) snap->sh_prov = sh_prov;
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -2294,10 +2343,23 @@ void GpuState::apply(const Pm4Command& c) {
             // write dirties it), so a future per-draw executor can render each draw under its own
             // shaders/mask/blend instead of the end-of-submit fold. Inert for the current renderer.
             // The snapshot also carries index_type — the index element size a DrawIndex needs (#64).
+            // #305: bind-vs-draw sequence in stream order. Cached — this runs per draw, and a
+            // per-draw environ scan is measurable at this title's ~876k draws per route.
+            static const bool bindtrace_draw = getenv("PROSPER_BINDTRACE") != nullptr;
+            if (bindtrace_draw) {
+                auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
+                static std::atomic<int> nd{0};
+                if (nd.fetch_add(1) < 2000000)
+                    fprintf(stderr, "[bind] DRAW order=%llu es_lo=0x%x rsrc2=0x%x ud0..3=%08x %08x %08x %08x\n",
+                            (unsigned long long)command_order, rd(0xc8), rd(0x8b),
+                            rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
+            }
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
+                snap->command_order = command_order;   // #305 instrument: order at snapshot
+                if (udprov_enabled()) snap->sh_prov = sh_prov;
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -2317,10 +2379,23 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         }
         case K::DrawIndexIndirect: {
+            // #305: bind-vs-draw sequence in stream order. Cached — this runs per draw, and a
+            // per-draw environ scan is measurable at this title's ~876k draws per route.
+            static const bool bindtrace_draw = getenv("PROSPER_BINDTRACE") != nullptr;
+            if (bindtrace_draw) {
+                auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
+                static std::atomic<int> nd{0};
+                if (nd.fetch_add(1) < 2000000)
+                    fprintf(stderr, "[bind] DRAW order=%llu es_lo=0x%x rsrc2=0x%x ud0..3=%08x %08x %08x %08x\n",
+                            (unsigned long long)command_order, rd(0xc8), rd(0x8b),
+                            rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
+            }
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
+                snap->command_order = command_order;   // #305 instrument: order at snapshot
+                if (udprov_enabled()) snap->sh_prov = sh_prov;
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -2480,10 +2555,23 @@ void GpuState::apply(const Pm4Command& c) {
             // Retain the dispatch and its exact register snapshot. The submit executor recompiles
             // supported compute programs and runs them in this vector's stream order before exposing
             // completion; unsupported programs remain visible in diagnostics (#576).
+            // #305: bind-vs-draw sequence in stream order. Cached — this runs per draw, and a
+            // per-draw environ scan is measurable at this title's ~876k draws per route.
+            static const bool bindtrace_draw = getenv("PROSPER_BINDTRACE") != nullptr;
+            if (bindtrace_draw) {
+                auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
+                static std::atomic<int> nd{0};
+                if (nd.fetch_add(1) < 2000000)
+                    fprintf(stderr, "[bind] DRAW order=%llu es_lo=0x%x rsrc2=0x%x ud0..3=%08x %08x %08x %08x\n",
+                            (unsigned long long)command_order, rd(0xc8), rd(0x8b),
+                            rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
+            }
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
+                snap->command_order = command_order;   // #305 instrument: order at snapshot
+                if (udprov_enabled()) snap->sh_prov = sh_prov;
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -2492,10 +2580,23 @@ void GpuState::apply(const Pm4Command& c) {
             dispatch_count++;
             break;
         case K::DispatchIndirect: {
+            // #305: bind-vs-draw sequence in stream order. Cached — this runs per draw, and a
+            // per-draw environ scan is measurable at this title's ~876k draws per route.
+            static const bool bindtrace_draw = getenv("PROSPER_BINDTRACE") != nullptr;
+            if (bindtrace_draw) {
+                auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
+                static std::atomic<int> nd{0};
+                if (nd.fetch_add(1) < 2000000)
+                    fprintf(stderr, "[bind] DRAW order=%llu es_lo=0x%x rsrc2=0x%x ud0..3=%08x %08x %08x %08x\n",
+                            (unsigned long long)command_order, rd(0xc8), rd(0x8b),
+                            rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
+            }
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
+                snap->command_order = command_order;   // #305 instrument: order at snapshot
+                if (udprov_enabled()) snap->sh_prov = sh_prov;
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
