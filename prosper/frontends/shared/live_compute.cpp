@@ -6608,6 +6608,13 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
         std::fprintf(stderr, "[compute] Vulkan initialization failed\n");
         return false;
     }
+    // The teardown handler nulls context_ptr, so a dispatch submitted from another thread once
+    // exit() has begun must decline instead of dereferencing it. The previous function-local static
+    // left destroyed-but-addressable memory at that point, which is not safer — only quieter.
+    if (!context_ptr) {
+        std::fprintf(stderr, "[compute] dispatch after Vulkan teardown — declining\n");
+        return false;
+    }
     VulkanComputeContext& context = *context_ptr;
     g_live_compute_context = &context;
     const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
