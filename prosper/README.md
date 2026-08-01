@@ -22,7 +22,8 @@ possible without console keys. Dumps are user-supplied and gitignored.
   processor → register-state fold; EOP/DMA/fence writes on the guest timeline). **RDNA2→SPIR-V
   recompiler:** full ALU + `SCC`; divergent control flow (EXEC predication, saveexec/restore, `execz`
   if-then + loop exits); `SMEM`, `MUBUF` vertex-fetch/load/store, `MIMG` sample/load, `LDS`+barriers,
-  `EXP`/`VINTRP`; EUD-resident descriptor resolution; every shader `spirv-val`-gated. Texture decode:
+  `EXP`/`VINTRP`; EUD-resident descriptor resolution; every SPIR-V emitter `spirv-val`-gated in CI
+  (`tools/spv_validate`). Texture decode:
   GFX10 `SW_4KB_S`/`SW_64KB_S` de-swizzle for all element sizes + BC1–7/BC6H, T# format + `DST_SEL`
   swizzle + paired S# sampler. Frame spine → `resolve_pipeline_state` → real `VkGraphicsPipeline`s
   with blend (incl. separate-alpha)/depth/stencil/write-mask/fast-clear + a render-to-texture cache.

@@ -108,7 +108,9 @@ audio, and graphics stack. See [Game compatibility](COMPATIBILITY.md) for exact 
   constant/descriptor loads, `MUBUF` vertex-fetch + load/store, `MIMG` `image_sample`/`_l`/`_lz`/
   `image_load`, `LDS` + barriers, `EXP` render-target/position/param exports, and `VINTRP`
   interpolation. Descriptors that spill into the **Extended User Data (EUD)** area are resolved. Every
-  emitted shader is strictly `spirv-val`-gated.
+  SPIR-V-emitting entry point in the tree — the recompiler stages and the hand-assembled compute
+  modules alike — is `spirv-val`-gated in CI by `tools/spv_validate`, which fails both when a module
+  is invalid and when a new emitter is added without one.
 - ✅ **Texture decode:** GFX10 `SW_4KB_S` / `SW_64KB_S` de-swizzle for all element sizes (1/2/4/8/16 B,
   derived from the authoritative addrlib table) plus BC1–BC7 and BC6H block decompression, honoring
   the T# format, `DST_SEL` channel swizzle, and the paired S# sampler (filter / wrap / anisotropy /

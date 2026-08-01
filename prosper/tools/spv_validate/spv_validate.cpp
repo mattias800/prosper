@@ -1,10 +1,27 @@
-// spv_validate — recompile a representative shader from every path the RDNA2->SPIR-V recompiler
-// supports and write each module as a .spv to argv[1] (a directory). A wrapper then runs spirv-val on
-// them: the render tests only prove llvmpipe *accepts* the modules, but llvmpipe is lenient — strict
-// validation catches latent invalid SPIR-V (bad decorations, ill-formed control flow, type mismatches)
-// that would break on a real driver. Pure recompile + file write; no Vulkan.
+// spv_validate — emit a representative module from EVERY SPIR-V-producing entry point in the tree
+// and write each as a .spv to argv[1] (a directory), then run spirv-val on it: the render tests only
+// prove llvmpipe *accepts* the modules, but llvmpipe is lenient — strict validation catches latent
+// invalid SPIR-V (bad decorations, ill-formed control flow, type mismatches) that would break on a
+// real driver. Pure emit + file write; no Vulkan.
+//
+// This gate has two failure modes of its own, and #1711 is what both of them cost. That defect —
+// an OpAccessChain in build_compute_compare_uvec4() whose result type disagreed with the type it
+// walked — shipped to real devices through frontends/shared/live_compute.cpp and was found by a
+// Vulkan validation LAYER, not here, because:
+//
+//   1. the corpus only ever walked recompile_*, so spirv_builder.cpp's hand-assembled modules were
+//      never validated even though they are created at runtime exactly like recompiled shaders; and
+//   2. a missing spirv-val was reported as "== PASS (recompiled; spirv-val not found) ==" with exit
+//      status 0. spirv-val is on neither the GitHub runner image nor a plain Fedora host, and CI
+//      never installed it — so the gate that CLAUDE.md and both READMEs describe as strict had, in
+//      CI, validated nothing at all.
+//
+// Both are closed below: check_emitter_coverage() reads the emitter headers and fails on any entry
+// point this corpus does not call, and an absent spirv-val is a hard failure rather than a pass.
 #include "../../src/gpu/rdna2_to_spirv.hpp"
 #include "../../src/gpu/shader_resources.hpp"
+#include "../../src/gpu/spirv_builder.hpp"
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,26 +32,193 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-static bool have_val = false;   // is spirv-val on PATH?
+
+static std::string read_text(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return {};
+    std::string out;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    fclose(f);
+    return out;
+}
+
+// spirv-val's diagnostic IS the value of this gate, so capture it rather than discarding it: a bare
+// "REJECTED it" tells the next reader nothing about which instruction is wrong. Redirecting to a
+// file (not /dev/null) also keeps the invocation portable — cmd.exe has no /dev/null, so the old
+// probe could never find the validator on Windows even when it was installed.
+static bool run_spirv_val(const std::string& path, std::string& message) {
+    const std::string log = path + ".val.txt";
+    // --target-env vulkan1.1: these modules are consumed by a Vulkan instance, and the universal
+    // default environment does not apply the Vulkan-specific rules a driver's validation layer
+    // would. Measured over the whole corpus before adopting it: identical results, so it only
+    // tightens what can pass here.
+    const std::string cmd =
+        "spirv-val --target-env vulkan1.1 \"" + path + "\" > \"" + log + "\" 2>&1";
+    const int rc = system(cmd.c_str());
+    message = read_text(log);
+    std::remove(log.c_str());
+    return rc == 0;
+}
 
 static void dump(const std::string& dir, const char* name, const std::vector<uint32_t>& spv) {
-    if (spv.empty() || spv[0] != 0x07230203u) { printf("  [FAIL] %-22s did not recompile\n", name); fails++; return; }
+    if (spv.empty() || spv[0] != 0x07230203u) { printf("  [FAIL] %-26s did not recompile\n", name); fails++; return; }
     std::string path = dir + "/" + name + ".spv";
     FILE* f = fopen(path.c_str(), "wb");
-    if (!f) { printf("  [FAIL] %-22s cannot write %s\n", name, path.c_str()); fails++; return; }
+    if (!f) { printf("  [FAIL] %-26s cannot write %s\n", name, path.c_str()); fails++; return; }
     fwrite(spv.data(), 4, spv.size(), f); fclose(f);
-    if (have_val) {
-        std::string cmd = "spirv-val \"" + path + "\" > /dev/null 2>&1";
-        if (system(cmd.c_str()) != 0) { printf("  [FAIL] %-22s spirv-val REJECTED it\n", name); fails++; return; }
-        printf("  [ok]   %-22s (%zu words) valid\n", name, spv.size());
-    } else {
-        printf("  wrote  %-22s (%zu words) [spirv-val absent — recompile-only]\n", name, spv.size());
+    std::string message;
+    if (!run_spirv_val(path, message)) {
+        printf("  [FAIL] %-26s spirv-val REJECTED it:\n", name);
+        if (message.empty()) message = "(spirv-val produced no output)\n";
+        printf("%s", message.c_str());
+        if (message.back() != '\n') printf("\n");
+        fails++;
+        return;
     }
+    printf("  [ok]   %-26s (%zu words) valid\n", name, spv.size());
+}
+
+// --- Emitter coverage -------------------------------------------------------------------------
+// An entry point that emits SPIR-V but has no module here is invisible to this gate, and nothing
+// reports the omission: that is exactly how #1711 survived. So read the two emitter headers, and
+// fail on any declared emitter this file does not call. Gaps are allowed, but only in writing.
+// The list is EMPTY, and that is the intended state: every declared emitter below has a module.
+// A gap belongs here only with the issue that tracks it, never as a silent omission.
+// (#1715 — the generated geometry stage's missing OpExecutionMode Invocations — is deliberately
+// NOT a gap: measured, that module passes spirv-val under both the universal and the vulkan1.1
+// environments. 00715 is a Vulkan pipeline-creation rule that spirv-val does not check, so it is
+// the validation layer's to catch, not this gate's, and the emitter is covered here regardless.)
+struct KnownGap { const char* emitter; const char* reason; };
+static const std::vector<KnownGap> kKnownGaps = {};
+
+// A header declaration of the form "std::vector<uint32_t> name(" at column 0 whose name begins with
+// recompile_ or build_. The column-0 requirement excludes struct members of the same type, and the
+// prefix requirement excludes the RDNA2->RDNA2 stream transforms that share the return type.
+static std::vector<std::string> declared_emitters(const std::string& header_text) {
+    static const std::string kDecl = "std::vector<uint32_t> ";
+    std::vector<std::string> names;
+    size_t line_start = 0;
+    while (line_start <= header_text.size()) {
+        const size_t line_end = header_text.find('\n', line_start);
+        const std::string line = header_text.substr(
+            line_start, line_end == std::string::npos ? std::string::npos : line_end - line_start);
+        if (line.compare(0, kDecl.size(), kDecl) == 0) {
+            size_t i = kDecl.size();
+            std::string name;
+            while (i < line.size() && (std::isalnum((unsigned char)line[i]) || line[i] == '_'))
+                name.push_back(line[i++]);
+            if (i < line.size() && line[i] == '(' &&
+                (name.rfind("recompile_", 0) == 0 || name.rfind("build_", 0) == 0))
+                names.push_back(name);
+        }
+        if (line_end == std::string::npos) break;
+        line_start = line_end + 1;
+    }
+    return names;
+}
+
+// Line comments are removed before searching for a call. Without this, the header comment above
+// naming build_compute_compare_uvec4() would satisfy the coverage check for an emitter this file
+// had stopped calling — a check that a comment can pass is the shape of defect this whole file
+// exists to stop. (Block comments are not stripped; this file uses none, and the failure direction
+// of that gap is a false PASS only for an emitter mentioned inside one.)
+static std::string strip_line_comments(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    size_t line_start = 0;
+    while (line_start <= text.size()) {
+        const size_t line_end = text.find('\n', line_start);
+        const size_t stop = line_end == std::string::npos ? text.size() : line_end;
+        const size_t comment = text.find("//", line_start);
+        out.append(text, line_start, (comment != std::string::npos && comment < stop ? comment
+                                                                                    : stop) - line_start);
+        out.push_back('\n');
+        if (line_end == std::string::npos) break;
+        line_start = line_end + 1;
+    }
+    return out;
+}
+
+static int check_emitter_coverage(const std::string& src_root) {
+    static const char* kHeaders[] = {"src/gpu/rdna2_to_spirv.hpp", "src/gpu/spirv_builder.hpp"};
+    const std::string self_raw = read_text(src_root + "/tools/spv_validate/spv_validate.cpp");
+    if (self_raw.empty()) {
+        printf("  [FAIL] emitter coverage: cannot read %s/tools/spv_validate/spv_validate.cpp\n",
+               src_root.c_str());
+        return 1;
+    }
+    const std::string self = strip_line_comments(self_raw);
+    int problems = 0;
+    std::vector<std::string> all;
+    for (const char* header : kHeaders) {
+        const std::string text = read_text(src_root + "/" + header);
+        if (text.empty()) {
+            printf("  [FAIL] emitter coverage: cannot read %s/%s\n", src_root.c_str(), header);
+            ++problems;
+            continue;
+        }
+        for (const std::string& name : declared_emitters(text)) {
+            all.push_back(name);
+            const bool exercised = self.find(name + "(") != std::string::npos;
+            const KnownGap* gap = nullptr;
+            for (const KnownGap& g : kKnownGaps)
+                if (name == g.emitter) gap = &g;
+            if (exercised && gap) {
+                printf("  [FAIL] emitter coverage: %s is now validated, so its known-gap entry is "
+                       "stale — delete it\n", name.c_str());
+                ++problems;
+            } else if (!exercised && !gap) {
+                printf("  [FAIL] emitter coverage: %s (%s) emits SPIR-V that this gate never "
+                       "validates.\n         Add a module for it below, or record it in "
+                       "kKnownGaps with the issue that tracks it.\n", name.c_str(), header);
+                ++problems;
+            } else if (!exercised) {
+                printf("  [gap]  %-26s not validated: %s\n", name.c_str(), gap->reason);
+            }
+        }
+    }
+    for (const KnownGap& g : kKnownGaps) {
+        bool declared = false;
+        for (const std::string& name : all) declared = declared || name == g.emitter;
+        if (!declared) {
+            printf("  [FAIL] emitter coverage: known-gap entry %s no longer names a declared "
+                   "emitter — delete it\n", g.emitter);
+            ++problems;
+        }
+    }
+    if (!problems) printf("  [ok]   emitter coverage: every declared SPIR-V emitter is accounted for\n");
+    return problems;
 }
 
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : ".";
-    have_val = (system("spirv-val --version > /dev/null 2>&1") == 0);
+    // The source root is required, not optional: the coverage check is the half of this gate that
+    // survives the next emitter being added, and a check that silently skips itself is the defect
+    // this tool exists to stop.
+    if (argc <= 2) {
+        printf("== FAIL: usage: spv_validate <output-dir> <source-root> ==\n"
+               "  <source-root> is prosper/ — the emitter-coverage check reads its headers.\n");
+        return 1;
+    }
+    const std::string src_root = argv[2];
+
+    const std::string probe = dir + "/spv_validate-probe.txt";
+    const bool have_val = (system(("spirv-val --version > \"" + probe + "\" 2>&1").c_str()) == 0);
+    std::remove(probe.c_str());
+    if (!have_val) {
+        // Previously this printed "PASS (recompiled; spirv-val not found)" and exited 0, which is
+        // how a gate documented as strict validation ran in CI for its whole life without ever
+        // validating a module. Install spirv-tools (Fedora/Ubuntu: spirv-tools; macOS:
+        // brew install spirv-tools; MSYS2: mingw-w64-ucrt-x86_64-spirv-tools).
+        printf("== FAIL: spirv-val is not on PATH ==\n"
+               "  This test IS the strict SPIR-V validation gate; without the validator it proves\n"
+               "  only that the emitters returned bytes. Install spirv-tools and re-run.\n");
+        return 1;
+    }
+
+    fails += check_emitter_coverage(src_root);
 
     // Compute ALU (float chain).
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
@@ -307,7 +491,64 @@ int main(int argc, char** argv) {
                             0xF800180Fu,0x05020302u,0xBF810000u};
       dump(dir, "fragment_nested_exec_loops", recompile_fragment(c, sizeof(c)/4, nullptr)); }
 
-    if (fails) { printf("== FAIL: %d shader(s) failed recompile/validation ==\n", fails); return 1; }
-    printf("== PASS%s ==\n", have_val ? " (all modules pass spirv-val)" : " (recompiled; spirv-val not found)");
+    // --- Emitters that are NOT the RDNA2 recompiler ---
+    // spirv_builder.cpp hand-assembles compute modules that the live frontend creates at runtime
+    // (frontends/shared/live_compute.cpp: prepare_compare_pipeline / the scale-bias probe), so they
+    // reach vkCreateShaderModule exactly like a recompiled shader. #1711 lived here.
+    dump(dir, "builder_scale_bias", build_compute_scale_bias(2.0f, 0.5f));
+    dump(dir, "builder_compare_uvec4", build_compute_compare_uvec4());
+
+    // --- Recompiler entry points beyond the four main stage functions ---
+    // Wave32 fragment lowering (s_wqm_b32 through the low-half EXEC/VCC mask path).
+    { const uint32_t c[] = {0xbe80037eu,0xbefe0900u,0xbefe097eu,
+                            0x7e000280u,0x7e020280u,0x7e040280u,0x7e0602f2u,
+                            0xf800000fu,0x03020100u,0xbf810000u};
+      dump(dir, "fragment_wave32_wqm", recompile_fragment_wave32_for_test(c, sizeof(c)/4)); }
+    // Terminal NGG output gate: CMPX + EXECZ around the POS export.
+    { const uint32_t c[] = {0xBF900009u,0x34040A81u,0x36060AC2u,0x7E000280u,0x7E0202F2u,
+                            0x36040482u,0x4A0606C1u,0x4A0404C1u,0x7E060B03u,0x7E040B02u,
+                            0x7E280281u,0x7E2A0280u,0x7C3E2B14u,0xBF880002u,
+                            0xF80008CFu,0x01000302u,0xBF810000u};
+      dump(dir, "vertex_ngg_terminal_gate",
+           recompile_vertex_terminal_ngg_gate_for_test(c, sizeof(c)/4)); }
+    // One-lane NGG projection: a B64 mask scan reduced against the single live guest lane.
+    { const uint32_t c[] = {0xBF900009u,0xBEEA04C1u,0xBE80146Au,0x7E000C00u,
+                            0x7E020280u,0x7E040280u,0x7E0602F2u,
+                            0xF80008CFu,0x03020100u,0xBF810000u};
+      dump(dir, "vertex_ngg_one_lane",
+           recompile_vertex_ngg_one_lane_for_test(c, sizeof(c)/4)); }
+    // Split no-GS NGG program: a separately installed producer plus its terminal wrapper, recompiled
+    // as one register-preserving module (the chain path the loader installs for real Astro draws).
+    { const uint32_t producer[] = {
+          0xD765000Au,0x000100C1u,0xD766000Au,0x000214C1u,
+          0x34040A81u,0x36060AC2u,0x7E000280u,0x7E0202F2u,
+          0x36040482u,0x4A0606C1u,0x4A0404C1u,0x7E060B03u,0x7E040B02u,
+          0x7E0C0280u,0x7E0E0280u,0x7E1002F2u,
+          0xD8380100u,0x00080706u,0xD8380302u,0x00030206u,0xD8380504u,0x00010006u,
+          0x7E12030Au,0xD8340018u,0x00000906u,0xBF8A0000u,0xBE802006u};
+      const uint32_t wrapper[] = {
+          0xBF900009u,0xF8000941u,0x00000000u,
+          0xD5430000u,0x03FE249Cu,0x00000728u,0xD5430002u,0x03FE249Cu,0x00000730u,
+          0xD8DC0100u,0x00000000u,0xD8DC0100u,0x02000002u,0xF80000CFu,0x03020100u,
+          0xD5430000u,0x03FE249Cu,0x00000720u,0xD8DC0100u,0x00000000u,
+          0xF8000203u,0x00000100u,0x1608249Cu,0xD8D80738u,0x04000004u,
+          0xF8000211u,0x00000004u,0xBF810000u};
+      ShaderResourceTable rt; rt.vertices_per_instance = 3;
+      dump(dir, "vertex_ngg_chain",
+           recompile_vertex_chain(producer, sizeof(producer)/4, wrapper, sizeof(wrapper)/4,
+                                  &rt, nullptr, false, 7)); }
+    // Generated interpolation geometry stage: AMD's explicit-parameter form publishes P0/P10/P20
+    // plus perspective-center I/J from a synthesised Geometry entry point.
+    { const uint32_t ps[] = {0xc80e0000u,0xc8120001u,0xc8160002u,
+                             0xd54b0003u,0x04160103u,0xd54b0003u,0x040e0304u,
+                             0x7e080280u,0x7e0a0280u,0x7e0c02f2u,
+                             0xf800000fu,0x06050403u,0xbf810000u};
+      PixelSystemInputMapping perspective_center{1u << 1, 1u << 1};
+      const FragmentInterpolationLayout layout =
+          fragment_interpolation_layout(ps, sizeof(ps)/4, &perspective_center);
+      dump(dir, "geometry_interpolation", recompile_interpolation_geometry(layout)); }
+
+    if (fails) { printf("== FAIL: %d emitter(s) failed emission/validation/coverage ==\n", fails); return 1; }
+    printf("== PASS (every declared emitter accounted for; all modules pass spirv-val) ==\n");
     return 0;
 }

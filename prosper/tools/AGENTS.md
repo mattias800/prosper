@@ -83,7 +83,13 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   on Plucky the suppressed fraction is *higher* while the world renders correctly (88-95%) than while the
   screen is black (83%), because `CB_DISABLE` is the depth/shadow prepass. Reading one phase alone yields a
   confident wrong answer. `--selftest` needs no capture. See `tools/colorstate/README.md`.
-- **`spv_validate/`** — `spirv-val` wrapper for recompiled SPIR-V.
+- **`spv_validate/`** — the strict SPIR-V validation gate (ctest `spv_validate`). It emits one
+  representative module from **every** SPIR-V-producing entry point declared in
+  `src/gpu/rdna2_to_spirv.hpp` and `src/gpu/spirv_builder.hpp`, and runs
+  `spirv-val --target-env vulkan1.1` on each. It fails when a module is invalid, when `spirv-val` is
+  not installed (it used to report PASS — see #1711), and when a header declares an emitter that has
+  no module here. Adding an emitter therefore means adding a module, or recording the gap in
+  `kKnownGaps` with the issue that tracks it; that list is meant to stay empty.
 - **`docs/check_numbered_table.py`** — validate Markdown tables that other documents cite by row
   number. Two classes: **structure** (always on) rejects a blank line that splits a table, which
   in Markdown silently renders everything after it as a *separate* table; **`--sequential`**

@@ -61,6 +61,34 @@ coverage % + the top first-unsupported opcodes. This turns "what to build next" 
 ~67% of instructions; the dominant remaining blocker is `SMEM`), and is regression-tested pure
 (`test_recompile_coverage`).
 
+## 4c. Strict SPIR-V validation of every emitter (`spv_validate`)
+
+Drivers are not required to validate SPIR-V, and the two prosper is developed against do not: llvmpipe
+and RADV both accepted a module whose `OpAccessChain` result type disagreed with the type it walked.
+So acceptance by a driver proves nothing about validity, and `tools/spv_validate` is the gate that
+does. It emits one representative module from **every** SPIR-V-producing entry point declared in
+`src/gpu/rdna2_to_spirv.hpp` and `src/gpu/spirv_builder.hpp`, and runs
+`spirv-val --target-env vulkan1.1` on each.
+
+Scope, stated precisely because it was previously overstated: this is *per emitter path*, not per
+shader a title submits. A game's shader is covered to the extent that it exercises paths the corpus
+exercises; the recompiler's execution-differential tests (§4) and the Vulkan validation layer are what
+cover the rest.
+
+Three failure modes of the gate itself are closed, all of them found by #1711:
+
+* **A missing validator is a failure, not a pass.** It used to print
+  `== PASS (recompiled; spirv-val not found) ==` and exit 0. `spirv-val` is on no GitHub runner image
+  and the workflow never installed it, so the gate had validated nothing in CI for its entire life
+  while three documents described prosper's shaders as strictly `spirv-val`-gated. CI now installs
+  `spirv-tools` on all three test platforms, and removing that breaks the job.
+* **An uncovered emitter is a failure.** The corpus only ever walked `recompile_*`, so the
+  hand-assembled compute modules in `spirv_builder.cpp` — created at runtime by the live frontend
+  exactly like a recompiled shader — were never validated. The tool now reads the two headers and
+  fails on any declared emitter it does not call. A gap is permitted only as a written `kKnownGaps`
+  entry naming its issue, and a stale entry (the emitter is covered, or no longer exists) also fails.
+* **`spirv-val`'s diagnostic is printed.** A failure used to say only "REJECTED it".
+
 ## 5. Routed multi-frame guards for real games
 
 `tools/snapshot/snapshot.py` boots local game dumps through the normal presented-screenshot frontend,
