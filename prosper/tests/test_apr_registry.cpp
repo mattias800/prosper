@@ -406,10 +406,13 @@ int main() {
         CHECK(submit_result_a != nullptr,
               "#1629: sceKernelAprSubmitCommandBufferAndGetResult (ASoW5WE-UPo) still resolves");
 #ifndef _WIN32
-        // POSIX only. On Windows both NIDs share k_ampr_submit, which resets the command buffer and
-        // writes nothing — the token/event machinery this distinction is about is POSIX-only, so the
-        // two forms are legitimately the same handler there and these assertions would fail on the
-        // windows-mingw CI job rather than catching a defect.
+        // POSIX only, and this guard hides a REAL gap rather than an irrelevance: on Windows both NIDs
+        // share k_ampr_submit, which resets the command buffer and writes nothing, so AndGetResult
+        // silently returns success without publishing a completion token. That is pre-existing and is
+        // tracked as #1657 — REMOVE THIS GUARD when it is fixed; the assertions below are already the
+        // proof. They are guarded rather than deleted so the Windows contract is not quietly forgotten.
+        // The plain form's contract IS satisfied on Windows (it has no result slots), which is why its
+        // residue assertion further down stays unguarded.
         // Both halves required: before #1629 the plain NID resolved to nothing, so a bare "these
         // differ" comparison passed vacuously against nullptr.
         CHECK(submit_plain && submit_result_a && submit_plain != submit_result_a,
@@ -430,7 +433,7 @@ int main() {
         alignas(64) uint8_t fake_cb[256] = {};
         const uint64_t cb = (uint64_t)(uintptr_t)fake_cb;
 
-#ifndef _WIN32
+#ifndef _WIN32   // see #1657 — Windows publishes no token; remove with that fix
         if (submit_result_a) {
             out1 = out2 = kResidue;
             submit_result_a(cb, 1, (uint64_t)(uintptr_t)&out1, (uint64_t)(uintptr_t)&out2, 0, 0);

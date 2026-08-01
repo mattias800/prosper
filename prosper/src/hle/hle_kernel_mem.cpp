@@ -4735,8 +4735,8 @@ void register_kernel_mem_hle() {
                      "sceKernelAprSubmitCommandBufferAndGetResult");
     // The Windows Ampr submit resets the command buffer and writes nothing, which satisfies the plain
     // form's contract exactly. It is NOT equivalent to the POSIX handler in general: the token,
-    // binding and equeue-post machinery is POSIX-only, so Windows keeps that pre-existing gap for
-    // BOTH forms. This change does not widen it — it strictly adds a previously-missing entry point.
+    // binding and equeue-post machinery is POSIX-only, so AndGetResult returns success here without
+    // publishing a token. Pre-existing, not widened by this change, and tracked as #1657.
     // The _TEST-suffixed NIDs are deliberately left unimplemented — see the POSIX block for why.
     Hle::register_fn("eE4Szl8sil8", (HleFn)k_ampr_submit, "sceKernelAprSubmitCommandBuffer");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
