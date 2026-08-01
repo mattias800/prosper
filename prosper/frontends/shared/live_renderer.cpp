@@ -2074,8 +2074,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // per texture reference.
                         if (reused != decoded_textures.end()) {
                             const bool same_span = reused->second.span == decode_span_ordinal;
+                            // Unknown, not Unchanged: the predicate ignores this on a same-span
+                            // hit, so the value is unobservable today — but Unchanged is the
+                            // PERMISSIVE verdict, and if the two same-span tests ever drift apart
+                            // the placeholder would silently authorise reuse. Unknown fails closed
+                            // at identical cost.
                             const prosper::gpu::GuestGpuWriteQuery journal_query = same_span
-                                ? prosper::gpu::GuestGpuWriteQuery::Unchanged
+                                ? prosper::gpu::GuestGpuWriteQuery::Unknown
                                 : prosper::gpu::guest_gpu_writes_since(
                                       reused->second.snapshot, reused->second.source_addr,
                                       reused->second.source_size);
@@ -3492,28 +3497,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 cached.source_watch = std::move(inherited_source_watch);
                                 auto [inserted, ok] = persistent_decoded_textures.emplace(
                                     decode_key, std::move(cached));
-                                if (ok) {
+                                // `ok == false` is unreachable: the erase above leaves this key
+                                // absent, so the insert cannot collide. It matters anyway, because
+                                // the move has already emptied `texture_pixels` by this point — so
+                                // bind the map's pixels either way (a collision is the same key,
+                                // hence the same decode) and let only the byte accounting depend on
+                                // whether an insertion actually happened. The scratch slot no longer
+                                // owns these bytes in either case.
+                                if (ok)
                                     persistent_decoded_texture_bytes += inserted->second.bytes();
-                                    fr.tex_rgba = inserted->second.pixels.data();
-                                    fr.persistent_texture_id = inserted->second.persistent_id;
-                                    fr.persistent_texture_version =
-                                        inserted->second.persistent_version;
-                                    // The scratch slot no longer owns these bytes; the entry the
-                                    // persistent cache just took is their stable home.
-                                    decoded_pixels_in_texstore = false;
-                                } else {
-                                    // Unreachable: the erase above leaves this key absent, so the
-                                    // insert cannot collide. Were it ever reachable, the move has
-                                    // already emptied `texture_pixels` and `fr.tex_rgba` would point
-                                    // at released bytes — which THIS draw would sample, not only the
-                                    // identity map. Bind the colliding entry's pixels instead; it is
-                                    // the same key, so it is the same decode.
-                                    fr.tex_rgba = inserted->second.pixels.data();
-                                    fr.persistent_texture_id = inserted->second.persistent_id;
-                                    fr.persistent_texture_version =
-                                        inserted->second.persistent_version;
-                                    decoded_pixels_in_texstore = false;
-                                }
+                                fr.tex_rgba = inserted->second.pixels.data();
+                                fr.persistent_texture_id = inserted->second.persistent_id;
+                                fr.persistent_texture_version = inserted->second.persistent_version;
+                                decoded_pixels_in_texstore = false;
                             }
                         }
                         if (!resource_rtt_hit && !resource_compute_image_hit && !has_live_rtt) {
@@ -3529,7 +3525,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             const bool pin_scratch =
                                 decoded_pixels_in_texstore && cross_span_source_size != 0;
                             const size_t pinned_slot = pin_scratch ? texture_slot : SIZE_MAX;
-                            if (pin_scratch) texstore_pinned[texture_slot] = true;
+                            if (pin_scratch) {
+                                texstore_pinned[texture_slot] = true;
+                                ++g_texture_decode_scope.scratch_pins;
+                            }
                             decoded_textures.emplace(
                                 decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
                                                           fr.persistent_texture_id,
@@ -5575,11 +5574,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     // journal refused to carry across a span boundary.
                     fprintf(stderr,
                             "[render-timing] decode_scope decodes=%llu same_span=%llu "
-                            "cross_span=%llu invalidated=%llu scope=%s\n",
+                            "cross_span=%llu invalidated=%llu pinned=%llu scope=%s\n",
                             (unsigned long long)g_texture_decode_scope.decodes,
                             (unsigned long long)g_texture_decode_scope.same_span_reuses,
                             (unsigned long long)g_texture_decode_scope.cross_span_reuses,
                             (unsigned long long)g_texture_decode_scope.invalidations,
+                            (unsigned long long)g_texture_decode_scope.scratch_pins,
                             submit_decode_scope_disabled ? "span" : "submit");
                     size_t rtt_bytes = 0;
                     for (const auto& [addr, surface] : g_rtt) {

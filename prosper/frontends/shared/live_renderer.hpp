@@ -56,6 +56,12 @@ struct TextureDecodeScopeStats {
     uint64_t same_span_reuses = 0;
     uint64_t cross_span_reuses = 0;
     uint64_t invalidations = 0;
+    // Retained entries whose pixels the persistent cache did NOT take, so the scratch slot is their
+    // only storage and had to be pinned against a later span's decode. Exported because it is the
+    // only observable that distinguishes "the pin path ran" from "the pin path was never reached":
+    // a test can otherwise pass while covering nothing, since an entry backed by persistent storage
+    // survives a span boundary whether or not pinning works.
+    uint64_t scratch_pins = 0;
 };
 TextureDecodeScopeStats texture_decode_scope_stats();
 void reset_texture_decode_scope_stats();

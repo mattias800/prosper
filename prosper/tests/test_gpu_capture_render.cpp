@@ -1495,8 +1495,16 @@ int main() {
             std::vector<uint8_t> pin_second, pin_last;
             const uint8_t* pin_span2 = target_center(pin_targets[1], pin_second);
             const uint8_t* pin_span3 = target_center(pin_targets[3], pin_last);
-            CHECK(pinned.cross_span_reuses >= 1 && pinned.invalidations == 1,
-                  "the twice-decoded identity is retained again and served across the next boundary");
+            // `scratch_pins == 1` is what makes this case self-validating rather than merely true.
+            // The pin is only reached because `decode_generation` is per SUBMIT, which is what makes
+            // `can_replace` false for span 2's re-decode. Revert that to a per-span bump and the
+            // pixels move into the persistent cache instead, no pin is taken, and both green
+            // assertions below still pass while covering nothing — so assert the mechanism, not only
+            // its consequence. It doubles as the guard on the per-submit generation, which is
+            // otherwise untestable without provoking a use-after-free.
+            CHECK(pinned.scratch_pins == 1 && pinned.cross_span_reuses == 1 &&
+                      pinned.invalidations == 1 && pinned.decodes == 3,
+                  "the twice-decoded identity is pinned in scratch and served across the next span");
             CHECK(pin_span2 && pin_span3 &&
                       pin_span2[1] > 0xC0 && pin_span2[0] < 0x40 &&
                       pin_span3[1] > 0xC0 && pin_span3[0] < 0x40,
