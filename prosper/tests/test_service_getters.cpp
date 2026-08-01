@@ -229,15 +229,23 @@ int main() {
                       "#1658: both Videodec2 picture-info entry points resolve");
                 CHECK(picture_info != avc_picture_info,
                       "#1658: the AVC form is a distinct handler, not an alias of the generic one");
+                // The NAME is what #1658 is about, and nothing above asserts it: binding the AVC NID
+                // to a distinct handler under the WRONG name passes every other assertion here. That
+                // is the original defect in a new costume — exactly the corollary this PR adds to the
+                // instrument doc (a test of the helper is not a test of the behaviour).
+                CHECK(std::string(Hle::name_of("kjrLbcyhEiw")) == "sceVideodec2GetAvcPictureInfo",
+                      "#1658: kjrLbcyhEiw is registered as sceVideodec2GetAvcPictureInfo");
+                CHECK(std::string(Hle::name_of("NtXRa3dRzU0")) == "sceVideodec2GetPictureInfo",
+                      "#1658: NtXRa3dRzU0 keeps the generic name");
                 // Both accept the known 56-byte output ABI today. The AVC layout is NOT established
                 // from title evidence, so this pins current behaviour rather than a guessed struct.
-                uint8_t pinfo[56]{}; *(uint64_t*)pinfo = 56;
+                alignas(8) uint8_t pinfo[56]{}; *(uint64_t*)pinfo = 56;
                 CHECK(picture_info((uint64_t)(uintptr_t)pinfo, 0, 0, 0, 0, 0) == 0 &&
                       avc_picture_info((uint64_t)(uintptr_t)pinfo, 0, 0, 0, 0, 0) == 0,
                       "#1658: both picture-info forms accept the 56-byte VdecOutput ABI");
                 // A mismatched size must be REJECTED, not silently accepted — that rejection is what
                 // captures an AVC-specific layout the first time a title passes one.
-                uint8_t pinfo_bad[64]{}; *(uint64_t*)pinfo_bad = 64;
+                alignas(8) uint8_t pinfo_bad[64]{}; *(uint64_t*)pinfo_bad = 64;
                 CHECK(avc_picture_info((uint64_t)(uintptr_t)pinfo_bad, 0, 0, 0, 0, 0) == 0x811d0101ull,
                       "#1658: an unexpected AVC struct size is rejected, not assumed compatible");
 

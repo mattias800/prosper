@@ -234,10 +234,18 @@ std::unordered_map<uint64_t, uint32_t> g_vdec_codecs;
 // fires at most a handful of times per boot and is the difference between a one-run diagnosis and a
 // guess. (Tales of Graces f / criMvPly stops exactly here; see #1658.)
 uint64_t vdec_reject(const char* field, uint64_t observed, uint64_t err) {
-    static std::atomic<int> shown{0};
-    if (shown.fetch_add(1) < 8)
-        fprintf(stderr, "[vdec] decoder config REJECTED: %s = 0x%llx -> err=0x%llx\n",
-                field, (unsigned long long)observed, (unsigned long long)err);
+    // Rate-limit PER FIELD, not globally. One shared counter meant a caller looping on an early
+    // condition could burn the whole budget and silence a later, different rejection — including the
+    // one a run was started to capture. `field` is always a string literal, so the pointer is a stable
+    // key and the map stays bounded by the number of call sites.
+    static std::mutex mx;
+    static std::unordered_map<const char*, int> shown;
+    {
+        std::lock_guard<std::mutex> lk(mx);
+        if (shown[field]++ >= 4) return err;
+    }
+    fprintf(stderr, "[vdec] decoder config REJECTED: %s = 0x%llx -> err=0x%llx\n",
+            field, (unsigned long long)observed, (unsigned long long)err);
     return err;
 }
 uint64_t vdec_validate_config(const VdecConfig* c) {
@@ -254,11 +262,23 @@ uint64_t vdec_validate_config(const VdecConfig* c) {
         return vdec_reject("max_width/height",
                            ((uint64_t)(uint32_t)c->max_width << 32) | (uint32_t)c->max_height,
                            VDEC_ERR_DIMS);
-    // NOTE: this is the condition most likely to reject a caller that queries memory sizes BEFORE it
-    // allocates a compute queue — the natural order for "how much do I need?". Whether the real
-    // libSceVideodec2 requires a live queue at QueryDecoderMemoryInfo time is NOT established from
-    // title evidence, so the check is retained (Sonic Origins' CRI Mana backend passes it) and made
-    // self-identifying rather than relaxed on a hunch. CONFIDENCE: LOW that requiring it here is right.
+    // This is the condition most likely to reject a caller that queries memory sizes BEFORE it
+    // allocates a compute queue — the natural order for "how much do I need?".
+    //
+    // Retained, but the honest state of the evidence is: there is NONE either way. The check arrived
+    // in #1368 (8b37be95) with no comment, no rationale and no test — defensive, not derived. No title
+    // is recorded anywhere in this repo as reaching QueryDecoderMemoryInfo at all; the only live
+    // Videodec2 calls in docs/ are QueryComputeMemoryInfo. An earlier version of this comment claimed
+    // "Sonic Origins' CRI Mana backend passes it" — that was unsupported and is withdrawn.
+    //
+    // So this is retained on the weaker ground that removing an unexplained validation is also a
+    // guess, and a rejection is at least visible. Note it does NOT protect a size contract:
+    // s_videodec2_query_decoder_memory ignores compute_queue entirely and writes fixed VDEC_MIN_MEMORY
+    // constants, so rejecting only fails earlier than succeeding would.
+    //
+    // If a live log names this field, the evidenced narrow move is a SPLIT — keep the requirement on
+    // CreateDecoder, which genuinely needs a queue, and drop it from the pure sizing query — rather
+    // than a blanket relaxation. CONFIDENCE: LOW that requiring it here is right.
     if (!c->compute_queue) return vdec_reject("compute_queue", c->compute_queue, VDEC_ERR_CONFIG);
     return 0;
 }
@@ -286,11 +306,17 @@ HLE(s_videodec2_allocate_compute_queue) {
     auto* out = (uint64_t*)PW(a2);
     if (!config || !memory || !out) return VDEC_ERR_ARG;
     if (config->size != sizeof(*config) || memory->size != sizeof(*memory)) return VDEC_ERR_STRUCT;
-    if (config->reserved0 || config->reserved1) return VDEC_ERR_CONFIG;
-    if (config->pipe > 4) return VDEC_ERR_PIPE;
-    if (config->queue > 7) return VDEC_ERR_QUEUE;
-    if (memory->shared_size < VDEC_MIN_MEMORY) return VDEC_ERR_MEMORY_SIZE;
-    if (!memory->shared) return VDEC_ERR_MEMORY_PTR;
+    // These share 0x811d0200/0x811d02xx with the decoder-config validator, so a bare guest error code
+    // cannot say which call produced it. Name them too, or a run that fails HERE prints nothing.
+    if (config->reserved0 || config->reserved1)
+        return vdec_reject("computeQueue.reserved0/1",
+                           ((uint64_t)config->reserved0 << 8) | config->reserved1, VDEC_ERR_CONFIG);
+    if (config->pipe > 4) return vdec_reject("computeQueue.pipe", config->pipe, VDEC_ERR_PIPE);
+    if (config->queue > 7) return vdec_reject("computeQueue.queue", config->queue, VDEC_ERR_QUEUE);
+    if (memory->shared_size < VDEC_MIN_MEMORY)
+        return vdec_reject("computeQueue.shared_size", memory->shared_size, VDEC_ERR_MEMORY_SIZE);
+    if (!memory->shared)
+        return vdec_reject("computeQueue.shared", memory->shared, VDEC_ERR_MEMORY_PTR);
     *out = memory->shared;
     if (svclog()) fprintf(stderr, "[svc]   Videodec2 compute queue -> 0x%llx (%llu bytes)\n",
                           (unsigned long long)*out, (unsigned long long)memory->shared_size);
@@ -370,21 +396,40 @@ HLE(s_videodec2_reset) {
 // mismatch path reports the size the guest actually passed, which IS the evidence needed: the first
 // title to call it prints `sizeof` its own struct, and the layout can then be derived rather than guessed.
 // CONFIDENCE: LOW that a shared layout is correct; HIGH that guessing one would be worse.
-uint64_t vdec_picture_info(const char* which, uint64_t a0) {
+static uint64_t vdec_picture_info(const char* which, uint64_t a0, uint64_t a1, uint64_t a2,
+                                  uint64_t a3) {
+    // Report the FIRST call to each entry point unconditionally, with the later arguments.
+    //
+    // Relying on a size mismatch alone would have been a weak plan: both forms take the same
+    // OutputInfo in a0, so if what distinguishes them is what they WRITE to a later out-param, a0
+    // matches, the mismatch branch never fires, and a run set up to capture the AVC layout captures
+    // nothing while appearing to work. Printing a1..a3 once costs two lines a boot and cannot miss.
+    static std::mutex mx;
+    static std::unordered_map<const char*, int> seen;   // `which` is a literal: stable key
+    bool first = false;
+    { std::lock_guard<std::mutex> lk(mx); first = (seen[which]++ == 0); }
+    if (first)
+        fprintf(stderr, "[vdec] %s FIRST CALL: a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx (#1658 — the "
+                        "AVC layout is unestablished; these arguments are the evidence)\n",
+                which, (unsigned long long)a0, (unsigned long long)a1,
+                (unsigned long long)a2, (unsigned long long)a3);
     auto* out = (const VdecOutput*)PW(a0); if (!out) return VDEC_ERR_ARG;
     if (out->size == sizeof(*out)) return 0;
-    static std::atomic<int> shown{0};
-    if (shown.fetch_add(1) < 8)
+    static std::mutex bad_mx;
+    static std::unordered_map<const char*, int> bad;
+    bool report = false;
+    { std::lock_guard<std::mutex> lk(bad_mx); report = (bad[which]++ < 4); }
+    if (report)
         fprintf(stderr, "[vdec] %s: caller struct size 0x%llx != VdecOutput 0x%zx — rejected. If this "
                         "is the AVC form, that size IS its layout evidence (#1658).\n",
                 which, (unsigned long long)out->size, sizeof(*out));
     return VDEC_ERR_STRUCT;
 }
 HLE(s_videodec2_picture_info) {
-    return vdec_picture_info("sceVideodec2GetPictureInfo", a0);
+    return vdec_picture_info("sceVideodec2GetPictureInfo", a0, a1, a2, a3);
 }
 HLE(s_videodec2_avc_picture_info) {
-    return vdec_picture_info("sceVideodec2GetAvcPictureInfo", a0);
+    return vdec_picture_info("sceVideodec2GetAvcPictureInfo", a0, a1, a2, a3);
 }
 // sceUserServiceGetEvent(SceUserServiceEvent* ev): the event stream. A real system delivers the initial
 // user's LOGIN event once at startup, then reports "no more events" so the game's drain loop terminates.
