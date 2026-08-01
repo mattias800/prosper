@@ -445,11 +445,19 @@ HLE(s_videodec2_query_decoder_memory) {
     // adds a factor here (a DPB count, a bytes-per-sample term for 10-bit) starts with real room.
     // The `> 0` guard is what makes the int32 -> uint64 widening itself safe.
     //
-    // The two forms agree exactly whenever `w*h` is EVEN, which covers every macroblock-aligned
-    // video and all three sizes exercised in tests (1920x1088, 1920x1080, 640x480). They differ by
-    // one byte when `w*h` is odd, where this form rounds UP (1x1 gives 2 rather than 1). That is the
-    // correct direction — true NV12 chroma is 2*ceil(w/2)*ceil(h/2), so an odd-dimensioned picture
-    // needs MORE than `wh*3/2`, not less — and it is not a case any real video stream produces.
+    // EXACTNESS BOUNDARY, and it is per-dimension parity — NOT the parity of the product. `w*h*3/2`
+    // and `wh + (wh+1)/2` both equal true NV12 (`w*h + 2*ceil(w/2)*ceil(h/2)`) if and only if BOTH
+    // dimensions are even; verified exhaustively over a 40x40 grid. The product being even is not
+    // enough and is a trap: 1920x1081 has an even product and this derivation is **960 bytes short**.
+    // Where a dimension is odd the shortfall is h/2, w/2, or (w+h)/2, and the `+1` does NOT rescue it
+    // (1921x1081 is 1501 bytes short either way).
+    //
+    // Odd dimensions are treated as UNREACHABLE, not as handled: H.264 codes in 16x16 macroblocks,
+    // so a conformant AVC stream's coded dimensions are multiples of 16 and both are even. Saying
+    // odd sizes are "handled by rounding up" would be worse than saying they cannot occur, because
+    // it invites someone to rely on a result that is still short. If a codec is ever added whose
+    // coded dimensions can be odd, this expression must be replaced with the exact chroma formula
+    // rather than adjusted.
     constexpr uint32_t VDEC_FRAME_ALIGN = 0x100;
     uint64_t frame_bytes = 0;
     if (config->max_width > 0 && config->max_height > 0) {
