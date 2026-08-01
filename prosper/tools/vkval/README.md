@@ -103,9 +103,10 @@ subsets of the same set of defects.
 ## Cost
 
 Measured on the CI runner's exact configuration (Ubuntu 24.04, Mesa 25.2.8 lavapipe, reproduced with
-`podman run --rm ubuntu:24.04`): the full ctest suite takes **24.0 s** without the layer and
-**33.2 s** with it, 166/166 passing either way. The guard adds roughly nine seconds to a job that
-spends minutes compiling, so it runs on every PR rather than on a schedule.
+`podman run --rm ubuntu:24.04`), over two runs of the same image: the full ctest suite takes
+**17.0-24.0 s** without the layer and **33.2-34.0 s** with it, everything passing either way. So the
+guard roughly doubles a test phase that is already a small fraction of a job spending minutes
+compiling — cheap enough to run on every PR rather than on a schedule.
 
 ## Reproducing the CI environment locally
 
