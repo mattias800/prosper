@@ -95,11 +95,11 @@ shared-GPU policy, the instrument-not-the-subject list, and the dated current ha
 
 ### Before you form a hypothesis, read the `## Ruled out` section
 
-Every doc in that table carries a **`## Ruled out`** section: one line per already-falsified
-hypothesis, the evidence that killed it, and the issue/PR link. Cross-title falsifications live in
-the area doc (`docs/RESOURCE_BINDING.md`, `docs/RECOMPILER_REMAINING.md`). These exist so nobody
-re-derives a dead answer at full cost — they are the most expensive knowledge in the repository.
-Extend them; see the recording rule under *How to work here*.
+Every per-title status doc in that table carries a **`## Ruled out`** section: one line per
+already-falsified hypothesis, the evidence that killed it, and the issue/PR link. Cross-title
+falsifications live in the area doc (`docs/RESOURCE_BINDING.md`, `docs/RECOMPILER_REMAINING.md`).
+These exist so nobody re-derives a dead answer at full cost — they are the most expensive knowledge
+in the repository. Extend them; see the recording rule under *How to work here*.
 
 The standing warnings that are **not** title-specific:
 
@@ -132,8 +132,9 @@ The standing warnings that are **not** title-specific:
 
 `docs/NEXT_STEP_VERTEX_FETCH.md` (bindless-dynamic vertex fetch, superseded 2026-07-11) and
 `docs/RENDER_LOOP.md` (the render bring-up log) are historical records. Both frontiers are complete:
-both shader stages recompile and dynamic V#/T#/S# resources resolve on current master. Each carries
-its own superseded banner — do not start work from either.
+both shader stages recompile and dynamic V#/T#/S# resources resolve on current master, and the
+render-loop frontier is complete. Each carries its own superseded banner — do not start work from
+either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
 
 ## How to work here
 

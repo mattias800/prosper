@@ -104,6 +104,15 @@ The validated Cobra verdict was:
 CLEAN: corr(block 1024f)=-0.049 neighbor-max=+0.032 spike=-0.081 (threshold 0.35) dup-grains=0.0% rms=0.0436 peak=0.1880
 ```
 
+## Ruled out
+
+One line per dead hypothesis, the evidence that killed it, and where that evidence lives.
+
+| Hypothesis | Verdict and evidence | Source |
+|---|---|---|
+| Sonic Origins' black startup loop is a prosper defect | **Falsified — it is an incomplete dump.** The supplied 02.002.000 directory is an *update* image targeting 02.001.000, not a merged base+update app. Live file tracing shows the only unresolved startup requests are `raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/ui_title_nocopy.dds`, both absent. Everything else initializes — renderer, connected pad, CRI sound banks, AudioOut2 pump, 300+ flips in 100 s with no guest fault. Correct behaviour without those assets is a black loop and silence. **No compatibility milestone is claimed until a complete dump exists.** | this doc, `COMPATIBILITY.md` |
+| A PS5 `launchActivity` Game Intent routes around the missing UI assets | **Falsified.** The update does declare `launchActivity` support and ship the classic RSDK files, and the guest genuinely receives and consumes an exact `TITLE_SONIC_1_CLASSIC` intent — its `activityId` property is read and recognized. It still requests both missing UI files before it will open `raw/retro/Sonic1u.rsdk`. The activity experiment narrows the blocker; it does not bypass it. Truthful default no-intent behaviour is preserved. | this doc |
+
 ## Sonic Origins dump audit
 
 Sonic reaches a stable frontend frame loop with all decoded GPU operations realized, a connected
