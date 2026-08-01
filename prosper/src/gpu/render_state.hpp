@@ -384,6 +384,19 @@ inline bool has_depth_stencil_side_effect(const ResolvedPipelineState& ps) {
 // Translate a RenderState's RDNA2 register semantics into Vulkan-ready pipeline state (pure).
 ResolvedPipelineState resolve_pipeline_state(const RenderState& rs);
 
+// Process-wide running total of draws whose CB_COLOR_CONTROL.MODE named a color-block metadata
+// operation prosper does not model as its own pass, and which it therefore still executed as an
+// ordinary color draw (#1588). The stderr report prints at powers of two to bound its volume on a
+// title that does this every frame; this is the EXACT count, so per-title exposure can be measured
+// rather than inferred from a deduped or capped log line (instruments #9/#13 in
+// docs/GAME_COMPAT_ORCHESTRATION.md). `mode` is masked to the 3-bit field.
+//
+// Measuring that exposure is the immediate use: #1706 established that prosper's decoded MODE is
+// not per-draw-trustworthy — a utility sequence's operation bits stay latched onto later ordinary
+// draws — so knowing WHICH titles decode an unmodeled mode, and how often, is a precondition for
+// acting on the value at all.
+uint64_t unmodeled_cb_color_mode_count(uint32_t mode);
+
 // Apply the renderer's reduced-resolution scale to both viewport and scissor state. Scissor outer
 // bounds round outward so resolution scaling never discards a guest-covered sample.
 void scale_resolved_render_area(ResolvedPipelineState& ps, float scale_x, float scale_y);
