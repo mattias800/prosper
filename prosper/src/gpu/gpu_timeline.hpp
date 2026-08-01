@@ -273,6 +273,21 @@ void request_interactive_capture_bundle(const std::string& path, uint32_t max_mb
                                         uint32_t delay_presents = 0);
 bool interactive_capture_bundle_active();
 
+// The outcome of the most recently COMPLETED interactive grab, so a frontend can tell the user what
+// happened instead of leaving the answer in stderr among tens of thousands of lines (#1587). The user
+// pressed a key; a keystroke that silently produces nothing is indistinguishable from one that never
+// registered, and several agents on a 4K title concluded exactly that.
+//
+// Take-once: returns true and clears the pending outcome, false when nothing has completed since the
+// last call. Poll it from the app loop.
+struct InteractiveGrabOutcome {
+    bool ok = false;              // the bundle was written
+    std::string bundle_path;      // the .prgbundle that was, or would have been, written
+    std::string error;            // empty when ok; otherwise the exact failure, budget numbers included
+    uint64_t max_unique_bytes = 0;   // the budget in force, so a frontend can name the remedy
+};
+bool take_interactive_grab_outcome(InteractiveGrabOutcome& out);
+
 // Optional guest-stdout phase gate for the same whole-frame bundle. When
 // PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG is configured together with the existing
 // PROSPER_CAPTURE_BUNDLE path, an exact completed guest-log line arms one capture after skipping one

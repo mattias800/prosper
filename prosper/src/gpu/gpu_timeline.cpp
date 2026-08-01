@@ -1826,6 +1826,11 @@ struct InteractiveFrameBundle {
     bool capturing = false;
     bool failed = false;
     uint64_t max_unique_bytes = 2048ull << 20;
+    // Outcome of the last completed grab, awaiting collection by the frontend (#1587).
+    bool outcome_pending = false;
+    bool outcome_ok = false;
+    std::string outcome_path;
+    std::string outcome_error;
     uint32_t frames_wanted = 1;  // one frame suffices: the capture seeds the sampled renderer-owned RTTs
                                  // with their live pixels (#1291), so a deferred/temporal-AA frame replays
                                  // faithfully from a single submit — no need to re-run producers across a
@@ -2016,6 +2021,7 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     if (!capture_gpustate_submit(state, submit_no, meta.width, meta.height, meta, capture, error,
                                  b.max_unique_bytes)) {
         b.failed = true;
+        b.outcome_error = error;
         std::fprintf(stderr, "[grab] frame-bundle: submit %llu failed (%s); grab aborted\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
         return;
@@ -2028,6 +2034,7 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     if (!b.submits && gpu_capture_ds_seed_snapshot_available() &&
         !read_all_gpu_capture_ds_seeds(capture.ds_seeds, error)) {
         b.failed = true;
+        b.outcome_error = error;
         std::fprintf(stderr, "[grab] frame-bundle: initial DS snapshot failed (%s); grab aborted\n",
                      error.c_str());
         return;
@@ -2062,6 +2069,7 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     }
     if (!append_capture_to_frame_bundle(b.bundle, capture, b.max_unique_bytes, error)) {
         b.failed = true;
+        b.outcome_error = error;
         std::fprintf(stderr, "[grab] frame-bundle: submit %llu failed (%s); grab aborted\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
         return;
@@ -2087,10 +2095,15 @@ void interactive_frame_bundle_on_present() {
                                  b.bundle.submits.back().submit_index));
             if (b.failed || b.frames_seen >= b.frames_wanted) {   // window complete (or aborted)
                 if (!b.failed && b.submits > 0) { write_path = b.current_path; write_bundle = std::move(b.bundle); }
-                else if (b.failed)
+                else if (b.failed) {
                     std::fprintf(stderr, "[grab] frame-bundle aborted (see error above); not written\n");
-                else
+                    b.outcome_pending = true; b.outcome_ok = false; b.outcome_path = b.current_path;
+                    if (b.outcome_error.empty()) b.outcome_error = "grab aborted";
+                } else {
                     std::fprintf(stderr, "[grab] frame-bundle: window had no submits; press F9 again\n");
+                    b.outcome_pending = true; b.outcome_ok = false; b.outcome_path = b.current_path;
+                    b.outcome_error = "the capture window contained no GPU submits";
+                }
                 b.capturing = false; b.current_path.clear(); b.bundle = GpuCaptureBundle{};
                 b.submits = 0; b.frames_seen = 0; b.failed = false;
                 if (b.armed_path.empty()) g_interactive_frame_active.store(false, std::memory_order_release);
@@ -2108,11 +2121,29 @@ void interactive_frame_bundle_on_present() {
     if (!write_path.empty()) {
         std::string error;
         const size_t n = write_bundle.submits.size();
-        if (write_gpu_capture_bundle(write_path, write_bundle, error))
+        const bool written = write_gpu_capture_bundle(write_path, write_bundle, error);
+        if (written)
             std::fprintf(stderr, "[grab] frame-bundle -> %s (%zu submits)\n", write_path.c_str(), n);
         else
             std::fprintf(stderr, "[grab] frame-bundle write failed: %s\n", error.c_str());
+        InteractiveFrameBundle& b = interactive_frame_bundle();
+        std::lock_guard<std::mutex> lk(b.mx);
+        b.outcome_pending = true; b.outcome_ok = written; b.outcome_path = write_path;
+        b.outcome_error = written ? std::string() : error;
     }
+}
+
+bool take_interactive_grab_outcome(InteractiveGrabOutcome& out) {
+    InteractiveFrameBundle& b = interactive_frame_bundle();
+    std::lock_guard<std::mutex> lk(b.mx);
+    if (!b.outcome_pending) return false;
+    out.ok = b.outcome_ok;
+    out.bundle_path = b.outcome_path;
+    out.error = b.outcome_error;
+    out.max_unique_bytes = b.max_unique_bytes;
+    b.outcome_pending = false; b.outcome_ok = false;
+    b.outcome_path.clear(); b.outcome_error.clear();
+    return true;
 }
 
 void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
