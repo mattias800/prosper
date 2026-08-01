@@ -622,6 +622,18 @@ never gets a decoder. The title screen is behind that movie and has not been rea
   `criMvPly` over `sceVideodec2`, which is a different subsystem (#1658).
 - **DLC / AppContent entitlement** — falsified. `AddContentsManager` is registration 29 and completes
   normally; it is not one of the three that faulted.
+- **The `sceVideodec2` block is a missing or unimplemented entry point** — falsified. Every entry
+  point `criMvPly` uses was implemented; the block was a single over-strict validation.
+  `sceVideodec2QueryDecoderMemoryInfo` is a *pure sizing query* — the guest asks how large a decoder
+  would be **before** building one — and prosper required a compute-queue handle the guest cannot
+  possess until after sizing. The guest draws the line in exactly the same place prosper now does: it
+  passes an identical codec config to both entry points, `compute_queue = 0` to the sizing query and
+  the real allocated handle to `CreateDecoder` (#1687). With the requirement split, the title creates
+  an AVC decoder and is fed real access units.
+- **Reaching `sceVideodec2Decode` will produce a movie** — false by construction, and stated here so
+  a black movie is not re-investigated as a defect. prosper's `Videodec2` decode is a deliberate
+  no-picture implementation and there is no H.264 decoder in the tree; #705's `VideoBackend` is
+  file/demux shaped and does not fit an access-unit interface. Scoped in #1688.
 
 ## Requirements and scope
 
