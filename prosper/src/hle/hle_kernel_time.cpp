@@ -3,6 +3,7 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "hle_kernel_time.hpp"
+#include "sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "heap_mutex.hpp"   // #707: keep hot equeue/APR mutexes off macOS __DATA
 #include "sync_futex.hpp"
 #include <pthread.h>
@@ -1263,7 +1264,11 @@ HLE(k_convert_local_to_utc) {
 // nothing is ever cancelled.) CONFIDENCE: HIGH.
 HLE(k_pthread_setcancelstate) {
     int state = (int)a0;
-    if (state != 0 && state != 1) return 0x80020016ull;   // EINVAL
+    // This is registered ONLY as the POSIX `pthread_setcancelstate`, whose contract returns a plain
+    // errno — not the 0x80020000-encoded libkernel form its sceKernel siblings use. It returned
+    // 0x80020016, so a guest comparing the result against EINVAL never matched (#1612).
+    if (state != 0 && state != 1)
+        return (uint64_t)static_cast<uint32_t>(prosper::hle::FreeBsdErrno::EInval);   // 22
     if (a1) *(int*)P(a1) = 0;                              // previous state = ENABLE (default)
     return 0;
 }

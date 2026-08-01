@@ -294,6 +294,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_posix_sem PRIVATE prosper_core)
   add_test(NAME posix_sem_hle COMMAND test_posix_sem)
 
+  # FreeBSD errno numbering across the libkernel 0x80020000|errno family (#1612). Pins the encoding
+  # vocabulary, the host->FreeBSD table, and the guest-observable values on the paths a Linux/macOS
+  # host can actually reach (sem trywait, timed mutex, wait-on-address, POSIX setcancelstate).
+  add_executable(test_sce_errno tests/test_sce_errno.cpp)
+  target_link_libraries(test_sce_errno PRIVATE prosper_core)
+  add_test(NAME sce_errno_freebsd COMMAND test_sce_errno)
+
   # PlatformUi hook (#347): the app frontend can service the guest's ImeDialog with real UI; with no
   # backend registered the headless auto-complete default is unchanged. Pure, no game dump.
   add_executable(test_platform_ui tests/test_platform_ui.cpp)

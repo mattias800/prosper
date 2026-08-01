@@ -48,7 +48,7 @@ int main() {
     waiter.join();
 
     // Timed wait honors the timeout by DEFAULT (#139): a wait on a still-matching value with a short
-    // timeout must return the Sony ETIMEDOUT (0x80020060) after ~the timeout — not block forever and
+    // timeout must return the Sony ETIMEDOUT (0x8002003c) after ~the timeout — not block forever and
     // return 0 (=signaled). Previously this was gated off (PROSPER_WAIT_TIMEOUT) so it blocked forever.
     {
         alignas(4) uint32_t tw = 5;
@@ -58,7 +58,14 @@ int main() {
                            (uint64_t)(uintptr_t)&timeout_us, 0, 0, 0);
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - t0).count();
-        CHECK(rc == 0x80020060ull, "timed wait returns SCE ETIMEDOUT (0x80020060), not 0/blocked-forever");
+        // The expected value changed in #1612. It was 0x80020060, which is the decimal 60 written as
+        // if it were hex: the libkernel encoding is 0x80020000|errno with a FreeBSD errno, and 0x60
+        // is 96 = EOWNERDEAD, not a timeout. FreeBSD ETIMEDOUT is 60 = 0x3c, which is what every
+        // other timeout in the emulator already encodes (event flags, semaphores, cond timedwait) —
+        // so this one site was telling a guest that a mutex owner had died. The old assertion pinned
+        // the emulator's own output rather than the contract; it was introduced alongside an explicit
+        // "CONFIDENCE: MED on the exact code value".
+        CHECK(rc == 0x8002003cull, "timed wait returns SCE ETIMEDOUT (0x8002003c), not 0/blocked-forever");
         CHECK(elapsed >= 20 && elapsed < 2000, "timed wait actually waited ~the timeout (not the old 5 s cap / forever)");
     }
 
