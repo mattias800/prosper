@@ -25,15 +25,6 @@
 
 using namespace prosper::gpu;
 
-// Set or clear an environment variable (nullptr clears), so a test can arm a capture and disarm it
-// again without leaking the setting into the rest of the run.
-static void set_test_env(const char* name, const char* value) {
-#ifdef _WIN32
-    _putenv_s(name, value ? value : "");
-#else
-    if (value) setenv(name, value, 1); else unsetenv(name);
-#endif
-}
 namespace P = prosper::agc::Pm4;
 
 static int fails = 0;
@@ -1211,14 +1202,19 @@ int main() {
             // An ordered DMA both routes the submit through the ordered path AND disables eager
             // pre-realization (can_eagerly_realize_draws = !has_ordered_dma && !has_indirect), so
             // the draw is realized by realize_retained_draw — the function this issue is about.
-            // With eager realization active the reason is lost in a DIFFERENT pass that has no
-            // failure channel at all; that is tracked separately and is NOT what this asserts.
+            // With eager realization active the reason is lost in a DIFFERENT pass, whose call
+            // site passes no failures out-parameter; that is tracked separately (#1643) and is NOT
+            // what this asserts.
             no_program.dma_copies.push_back({
                 (uint64_t)(uintptr_t)dma_destination, (uint64_t)(uintptr_t)dma_source,
                 sizeof(dma_destination), 0, 305, 0});
             GpuCaptureFile captured;
             const bool read = run_and_read(no_program, 2102, captured);
             const auto reason = reason_for_draw(captured, 310);
+            // DELIBERATELY WEAK, and it PASSES against the unfixed code: gpu_capture synthesizes an
+            // empty Unknown for any unrealized operation, so "a record exists" proves nothing. Kept
+            // next to the specific assertion below as a standing demonstration of that trap — do not
+            // "tighten" it, and do not treat it as coverage.
             CHECK(read && reason != RealizationFailureReason::None,
                   "#1636: a draw that fails inside realize_draw_item records a failure at all");
             CHECK(read && reason != RealizationFailureReason::Unknown,
@@ -1227,8 +1223,10 @@ int main() {
                   "#1636: an unbound shader program records reason=missing-program");
         }
 
-        // (c) The reason names must round-trip through the capture format. A new enum value that the
-        // validator or the reader still bounds at Filtered would fail the whole capture write.
+        // (c) The new reasons must have names, or gpu_replay --inspect-only prints "unknown" for them
+        // and the fix is invisible exactly where it pays off. (That a new reason survives the capture
+        // validator and reader — which both bounded at Filtered — is proven by case (a) above, which
+        // round-trips IndirectArguments through a real written .prgcap.)
         CHECK(std::string(realization_failure_reason_name(
                   RealizationFailureReason::IndirectArguments)) == "indirect-arguments" &&
               std::string(realization_failure_reason_name(

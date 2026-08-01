@@ -490,7 +490,9 @@ enum class RealizationFailureReason : uint8_t {
     // Unknown because "nothing was attempted, and here is why" is the answer an investigation needs
     // (#1636) — collapsing them to Unknown is indistinguishable from the reason being lost.
     RetainedDrawNotSelected,   // the retained-submit policy did not select this draw index
-    IndirectArguments,         // indirect draw/dispatch arguments could not be resolved
+    IndirectArguments,         // indirect DRAW arguments could not be resolved. Dispatches
+                               // have the same failure but realize_retained_compute still
+                               // returns a bare false for it, so they remain Unknown.
     IndirectDependencies,      // an indirect operation's producer had not landed for this submit
 };
 inline constexpr RealizationFailureReason kMaxRealizationFailureReason =

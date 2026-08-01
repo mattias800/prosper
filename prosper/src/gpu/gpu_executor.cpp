@@ -5518,12 +5518,14 @@ bool resolve_indirect_dispatch_arguments(const GpuState::Dispatch& source,
 bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, float scale_y,
                            DrawItem& item, OperationRealizationFailure* failure = nullptr) {
     const auto note = [&](RealizationFailureReason reason) {
-        if (!failure) return false;
+        // An out-of-range index has no planned operation to attach to, and a record whose identity
+        // matches nothing fails validate_failure_diagnostics for the WHOLE capture. Report nothing
+        // rather than poison the capture; the caller still sees false.
+        if (!failure || index >= st.draws.size()) return false;
         *failure = {};
         failure->kind = SubmitOperationKind::Draw;
         failure->index = index;
-        failure->command_order =
-            index < st.draws.size() ? st.draws[index].command_order : 0;
+        failure->command_order = st.draws[index].command_order;
         failure->reason = reason;
         return false;
     };
@@ -5695,9 +5697,13 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         failure.command_order = operation.command_order;
                         capture_trace->failures.push_back(std::move(failure));
                     } else {
-                        // Eager path: the draw was realized (or dropped) in an earlier pass whose
-                        // reason is genuinely not available here, so Unknown is the honest answer
-                        // rather than a guess.
+                        // Eager path: realize_gpustate_draws DOES have a failures out-parameter,
+                        // but this submit's call site (:6023) passes nullptr, so the reason was
+                        // dropped in that earlier pass and Unknown is the honest answer here rather
+                        // than a guess. Not a simple plumb-through to fix: requesting failures also
+                        // takes the serial path (gpu_execute.hpp:1650 gates parallel realization on
+                        // `!failures`), so it trades draw-realization throughput for diagnostics.
+                        // Tracked in #1643.
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Draw, operation.index,
                             operation.command_order, RealizationFailureReason::Unknown});
