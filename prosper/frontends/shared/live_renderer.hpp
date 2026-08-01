@@ -10,7 +10,45 @@
 #include <cstdint>
 #include <string>
 
+#include "gpu/gpu_execute.hpp"          // GuestGpuWriteQuery — the in-submit mutation proof
+
 namespace prosper::frontend {
+
+// The decoded-texture identity map lives for one SUBMIT (#1691). A submit is cut into a new graphics
+// span at every interleaved compute/DMA operation, and that split is exactly what could rewrite guest
+// texture bytes mid-submit, so an entry crossing a span boundary must carry proof that nothing wrote
+// the range it decoded.
+//
+// Reuse inside the span that produced the entry keeps the historical span-local guarantee and needs
+// no proof. Crossing a span boundary needs both halves:
+//
+//   * `source_size` != 0 — a known validated source range. It is the persistent decode cache's own
+//     range for this identity, so the fast path asserts exactly what that cache asserts, and it is
+//     deliberately zero for resources the persistent cache does not validate (captured replay
+//     backing, storage images, unsupported DCC states). Those keep the pre-#1691 span lifetime rather
+//     than being retained against a range nobody established.
+//   * `journal_query` == Unchanged — the ordered in-submit journal proves no retained GPU operation
+//     wrote that range since the entry was established. Overlap means the guest GPU did write it
+//     (the #780 stale-copy shape); Unknown (journal inactive, overflowed, or from a different submit)
+//     is not evidence of anything. Both force a fresh resolve through the persistent cache's exact
+//     validation, which is the pre-#1691 behavior.
+bool submit_local_texture_decode_reusable(uint64_t entry_span, uint64_t current_span,
+                                          uint64_t source_size,
+                                          prosper::gpu::GuestGpuWriteQuery journal_query);
+
+// Identity-scope accounting for the decoded-texture map, maintained unconditionally so a routed run
+// and a regression test can both assert on it. `decodes` counts full CPU resolves (the work #1691
+// removes), `same_span_reuses` is what the old span-scoped map already served, `cross_span_reuses` is
+// what submit scope adds, and `invalidations` counts entries dropped because the journal could not
+// prove their backing unchanged. Per-thread, like the renderer's other submit-scoped state.
+struct TextureDecodeScopeStats {
+    uint64_t decodes = 0;
+    uint64_t same_span_reuses = 0;
+    uint64_t cross_span_reuses = 0;
+    uint64_t invalidations = 0;
+};
+TextureDecodeScopeStats texture_decode_scope_stats();
+void reset_texture_decode_scope_stats();
 
 // Bytes actually uploaded for one non-texture (vertex/index/storage/constant) buffer binding whose
 // descriptor declares `declared_bytes`. A vertex fetch may index anywhere inside the declared range,

@@ -1226,6 +1226,220 @@ int main() {
 
     }
 
+    // #1691 — the decoded-texture identity map is SUBMIT-scoped, not span-scoped. A submit is cut
+    // into a new graphics span at every interleaved compute/DMA operation, so a span-scoped map
+    // re-resolved every identity once per span (Blue Prince: 56 identities, 853 resolves, 15.2x).
+    // Widening the lifetime is only sound while an entry that crosses a span boundary carries proof
+    // that nothing rewrote the bytes it decoded — the failure this guards is #780's shape, where a
+    // compute reset of a backing invalidated one cached view and not another.
+    {
+        using prosper::frontend::reset_texture_decode_scope_stats;
+        using prosper::frontend::submit_local_texture_decode_reusable;
+        using prosper::frontend::texture_decode_scope_stats;
+
+        CHECK(submit_local_texture_decode_reusable(9, 9, 0, GuestGpuWriteQuery::Unknown),
+              "reuse inside the span that decoded the pixels keeps the historical guarantee");
+        CHECK(submit_local_texture_decode_reusable(9, 10, 64, GuestGpuWriteQuery::Unchanged),
+              "a proven-unchanged source range carries one decode across a span boundary");
+        CHECK(!submit_local_texture_decode_reusable(9, 10, 64, GuestGpuWriteQuery::Overlap),
+              "a guest GPU write over the decoded range forces a fresh cross-span resolve");
+        CHECK(!submit_local_texture_decode_reusable(9, 10, 64, GuestGpuWriteQuery::Unknown),
+              "an unusable journal never counts as proof that a decode survived a span boundary");
+        CHECK(!submit_local_texture_decode_reusable(9, 10, 0, GuestGpuWriteQuery::Unchanged),
+              "a resource with no validated source range keeps the span-local lifetime");
+
+        // The end-to-end half needs a LIVE texture: captured replay backing sets host_data, which
+        // excludes the resource from the persistent cache and therefore from cross-span retention.
+        // Map a real committed guest range and decode out of it, exactly as a booted title does.
+        auto map_flexible = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapFlexibleMemory"));
+        uint64_t guest_base = 0;
+        const bool guest_mapped = map_flexible &&
+            map_flexible(reinterpret_cast<uint64_t>(&guest_base), 0x10000u, 0x2u, 0u, 0u, 0u) == 0 &&
+            guest_base != 0;
+        CHECK(guest_mapped,
+              "the decode-scope test maps a committed guest range for a live-decoded texture");
+
+        if (guest_mapped) {
+            constexpr uint32_t TW = 16, TH = 16;                 // color target extent per span
+            auto* guest = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(guest_base));
+            const std::vector<uint8_t> red_2x2 = {
+                255, 0, 0, 255,   255, 0, 0, 255,
+                255, 0, 0, 255,   255, 0, 0, 255,
+            };
+            const std::vector<uint8_t> green_2x2 = {
+                0, 255, 0, 255,   0, 255, 0, 255,
+                0, 255, 0, 255,   0, 255, 0, 255,
+            };
+
+            // One submit: draw -> dispatch -> draw. The dispatch is what splits the submit into two
+            // graphics spans, and it is also the operation that can rewrite a texture backing.
+            // Each draw gets its own retained color target so both spans stay separately readable:
+            // an intermediate span publishes no frame, so the assertions read the renderer's target
+            // history instead of the callback return.
+            uint64_t next_target = 0x100700000ull;
+            uint64_t span_targets[2] = {0, 0};
+            auto texture_draw = [&](uint64_t texture_addr, uint32_t tw, uint32_t th,
+                                    uint32_t pitch, uint64_t draw_index, uint64_t order) {
+                DrawItem draw = replay.items[0];
+                draw.color0_base = next_target;
+                if (draw_index < 2) span_targets[draw_index] = next_target;
+                next_target += 0x100000ull;
+                draw.color0_width = TW;
+                draw.color0_height = TH;
+                draw.draw_index = draw_index;
+                draw.command_order = order;
+                auto table = std::make_shared<ShaderResourceTable>(compile_rt);
+                table->resources[0].gpu_addr = texture_addr;
+                table->resources[0].width = tw;
+                table->resources[0].height = th;
+                table->resources[0].size = tw * th * 4u;
+                table->resources[0].linear_row_pitch_bytes = pitch;
+                table->resources[0].host_data = nullptr;      // live guest memory, not capture bytes
+                table->resources[0].host_data_size = 0;
+                draw.prt = std::move(table);
+                return draw;
+            };
+
+            // `dispatch_writes` is the range the interleaved operation rewrites and reports through
+            // the ordered guest-write journal. Pointing it AT the sampled backing is the invalidation
+            // case; pointing it elsewhere is the control that must still reuse.
+            uint64_t dispatch_writes = 0;
+            const std::vector<uint8_t>* dispatch_bytes = nullptr;
+            LiveComputeFn interleaved_write = [&](const std::vector<ComputeItem>&) {
+                if (!dispatch_writes || !dispatch_bytes) return true;
+                std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(dispatch_writes)),
+                            dispatch_bytes->data(), dispatch_bytes->size());
+                notify_guest_gpu_write(dispatch_writes, dispatch_bytes->size());
+                return true;
+            };
+
+            size_t rendered_spans = 0;
+            LiveRenderFn counting_render = [&](const std::vector<DrawItem>& items, uint32_t width,
+                                               uint32_t height) {
+                ++rendered_spans;
+                return RenderedFrame(render_submit_items(items, width, height));
+            };
+            // Center texel of a retained 16x16 color target, or nullptr if it is not readable at the
+            // declared extent. Reading through the renderer's own target history keeps the assertion
+            // on the pixels a later pass would actually sample.
+            auto target_center = [&](uint64_t target, std::vector<uint8_t>& keep) -> const uint8_t* {
+                LiveTargetSnapshot snapshot;
+                if (!target || !read_live_render_target(target, snapshot) || !snapshot.pixels ||
+                    snapshot.width != TW || snapshot.height != TH ||
+                    snapshot.pixels->size() != static_cast<size_t>(TW) * TH * 4u)
+                    return nullptr;
+                keep = *snapshot.pixels;
+                return &keep[(static_cast<size_t>(TH / 2) * TW + TW / 2) * 4];
+            };
+
+            std::vector<ComputeItem> dispatches(1);
+            dispatches[0].dispatch_index = 0;
+            const std::vector<SubmitOperation> two_spans = {
+                {SubmitOperationKind::Draw, 0, 100},
+                {SubmitOperationKind::Dispatch, 0, 150},
+                {SubmitOperationKind::Draw, 1, 200},
+            };
+
+            // (1) CONTROL — the dispatch writes an unrelated range. Both spans sample the same
+            // identity, so the submit-scoped map must serve the second one without decoding again.
+            const uint64_t control_texture = guest_base + 0x1000;
+            uint64_t unrelated = guest_base + 0x8000;
+            std::memcpy(guest + 0x1000, red_2x2.data(), red_2x2.size());
+            dispatch_writes = unrelated;
+            dispatch_bytes = &green_2x2;
+            rendered_spans = 0;
+            reset_texture_decode_scope_stats();
+            execute_ordered_items(
+                two_spans,
+                {texture_draw(control_texture, 2, 2, 8, 0, 100),
+                 texture_draw(control_texture, 2, 2, 8, 1, 200)},
+                dispatches, counting_render, interleaved_write, W, H);
+            auto control = texture_decode_scope_stats();
+            CHECK(rendered_spans == 2,
+                  "an interleaved dispatch splits one submit into two graphics spans");
+            CHECK(control.decodes == 1 && control.cross_span_reuses == 1 &&
+                      control.invalidations == 0,
+                  "one identity sampled in two spans of one submit decodes exactly once");
+            std::vector<uint8_t> control_a, control_b;
+            const uint8_t* control_first = target_center(span_targets[0], control_a);
+            const uint8_t* control_second = target_center(span_targets[1], control_b);
+            CHECK(control_first && control_second &&
+                      control_first[0] > 0xC0 && control_first[1] < 0x40 &&
+                      control_second[0] > 0xC0 && control_second[1] < 0x40,
+                  "both spans sample the unchanged red guest texture");
+
+            // (2) INVALIDATION — the same shape, except the dispatch rewrites the sampled backing
+            // and reports it. Serving the retained entry here would publish pixels the guest has
+            // already replaced; the second span must observe the new bytes. This assertion fails if
+            // the widened map skips the in-submit journal check.
+            const uint64_t written_texture = guest_base + 0x2000;
+            std::memcpy(guest + 0x2000, red_2x2.data(), red_2x2.size());
+            dispatch_writes = written_texture;
+            dispatch_bytes = &green_2x2;
+            rendered_spans = 0;
+            reset_texture_decode_scope_stats();
+            execute_ordered_items(
+                two_spans,
+                {texture_draw(written_texture, 2, 2, 8, 0, 100),
+                 texture_draw(written_texture, 2, 2, 8, 1, 200)},
+                dispatches, counting_render, interleaved_write, W, H);
+            auto invalidated = texture_decode_scope_stats();
+            CHECK(invalidated.decodes == 2 && invalidated.cross_span_reuses == 0 &&
+                      invalidated.invalidations == 1,
+                  "a guest GPU write to the backing between spans forces a second decode");
+            std::vector<uint8_t> written_a, written_b;
+            const uint8_t* written_first = target_center(span_targets[0], written_a);
+            const uint8_t* written_second = target_center(span_targets[1], written_b);
+            CHECK(written_first && written_second &&
+                      written_first[0] > 0xC0 && written_first[1] < 0x40 &&
+                      written_second[1] > 0xC0 && written_second[0] < 0x40,
+                  "the span after the write samples the rewritten green texture, not the red cache");
+
+            // (3) KEY COMPLETENESS — two descriptors at the same address and the same extent whose
+            // decoded bytes differ. `linear_row_pitch_bytes` 8 reads 16 contiguous bytes; 16 reads
+            // row 0 at +0 and row 1 at +16. The reuse path re-derives extent and format from the
+            // descriptor and takes only the PIXELS from the map, so an under-specified key shows up
+            // exactly here: dropping the pitch field would serve the first decode to the second draw
+            // and collapse this to one decode with a cross-span reuse.
+            const uint64_t pitch_texture = guest_base + 0x3000;
+            std::memcpy(guest + 0x3000, red_2x2.data(), red_2x2.size());
+            std::memcpy(guest + 0x3010, green_2x2.data(), green_2x2.size());
+            dispatch_writes = unrelated;
+            dispatch_bytes = &green_2x2;
+            rendered_spans = 0;
+            reset_texture_decode_scope_stats();
+            execute_ordered_items(
+                two_spans,
+                {texture_draw(pitch_texture, 2, 2, 8, 0, 100),
+                 texture_draw(pitch_texture, 2, 2, 16, 1, 200)},
+                dispatches, counting_render, interleaved_write, W, H);
+            auto distinct_keys = texture_decode_scope_stats();
+            CHECK(distinct_keys.decodes == 2 && distinct_keys.cross_span_reuses == 0 &&
+                      distinct_keys.invalidations == 0,
+                  "two identities differing only in source row pitch decode separately");
+
+            // (4) The identity map does not outlive its submit: an entry established in one submit
+            // must never serve the next, whose indirect descriptor memory may have moved on.
+            const uint64_t across_texture = guest_base + 0x4000;
+            std::memcpy(guest + 0x4000, red_2x2.data(), red_2x2.size());
+            dispatch_writes = 0;
+            dispatch_bytes = nullptr;
+            reset_texture_decode_scope_stats();
+            execute_ordered_items({{SubmitOperationKind::Draw, 0, 100}},
+                                  {texture_draw(across_texture, 2, 2, 8, 0, 100)},
+                                  {}, counting_render, interleaved_write, W, H);
+            const auto first_submit = texture_decode_scope_stats();
+            execute_ordered_items({{SubmitOperationKind::Draw, 0, 100}},
+                                  {texture_draw(across_texture, 2, 2, 8, 0, 100)},
+                                  {}, counting_render, interleaved_write, W, H);
+            const auto second_submit = texture_decode_scope_stats();
+            CHECK(first_submit.decodes == 1 && first_submit.cross_span_reuses == 0 &&
+                      second_submit.cross_span_reuses == 0 &&
+                      second_submit.same_span_reuses == first_submit.same_span_reuses,
+                  "a new submit rebuilds the identity map instead of inheriting the previous one");
+        }
+    }
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
 }
