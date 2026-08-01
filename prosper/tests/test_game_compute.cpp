@@ -1819,6 +1819,27 @@ int main() {
         std::vector<uint8_t> volume_expected = volume_dst_initial;
         std::copy_n(volume_src_linear.begin(), VOLUME_W * volume_bpe,
                     volume_expected.begin());
+        // #1681: this pair failed on the CI runner's Mesa 25.2.8 lavapipe while passing on Mesa
+        // 26.1.4 lavapipe and on RADV, and a bare vector compare cannot say why. Report whether the
+        // difference lands in the one row the dispatch writes or in the voxels it must preserve —
+        // "wrote the wrong data" and "failed to preserve untouched data" are different defects.
+        const size_t volume_written_bytes = VOLUME_W * volume_bpe;
+        auto report_volume_diff = [&](const char* tag) {
+            if (volume_result == volume_expected) return;
+            size_t diff = 0, in_written = 0, first = volume_result.size();
+            for (size_t i = 0; i < volume_result.size() && i < volume_expected.size(); ++i) {
+                if (volume_result[i] == volume_expected[i]) continue;
+                ++diff;
+                if (i < volume_written_bytes) ++in_written;
+                if (first == volume_result.size()) first = i;
+            }
+            std::printf("  volume diff [%s]: bytes=%zu/%zu in-written-row=%zu untouched=%zu "
+                        "first=%zu got=%02x want=%02x\n",
+                        tag, diff, volume_result.size(), in_written, diff - in_written, first,
+                        first < volume_result.size() ? volume_result[first] : 0,
+                        first < volume_expected.size() ? volume_expected[first] : 0);
+        };
+        report_volume_diff("S3 writeback");
         CHECK(volume_result == volume_expected,
               "S3 writeback updates one row and preserves all untouched 3D voxels");
 
@@ -1841,6 +1862,7 @@ int main() {
         std::fill(volume_result.begin(), volume_result.end(), 0);
         detile_volume(volume_result.data(), volume_dst.data(), volume_dst.size(),
                       VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+        report_volume_diff("3D descriptor");
         CHECK(!layered_reader_called && volume_result == volume_expected,
               "3D descriptor rejects address-only 2D ownership and preserves guest-backed voxels");
         set_live_target_reader({});
