@@ -2741,6 +2741,74 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
         c.queue_origin = g_fold_origin;   // #1226: retained by deferred/pended effects
         st.apply(c);
     }
+    // PROSPER_BINDTRACE (#305): per-top-level-fold census. A stream that issues draws but contains
+    // no shader-program bind of its own is running on the register state a PREVIOUS submit left —
+    // legitimate on a shared ring, and the exact shape to check when a draw's user-data block does
+    // not match the pipeline it appears to be bound to. Counting the packets the fold APPLIED (not
+    // the ones the guest recorded) is the point: a stream whose leading packets were never decoded
+    // shows up here as draws-without-binds.
+    static const bool bindtrace_fold = getenv("PROSPER_BINDTRACE") != nullptr;
+    if (bindtrace_fold && st.jump_depth == 0) {
+        using K = Pm4Command::Kind;
+        uint32_t sh_indirect = 0, sh_direct = 0, pgm_writes = 0, draws = 0;
+        for (const auto& c : ops) {
+            if (c.kind == K::SetRegsIndirect && c.reg_class == RegClass::Sh) {
+                ++sh_indirect;
+                if (c.regs_vaddr && c.num_regs &&
+                    guest_readable(c.regs_vaddr, c.num_regs * (uint32_t)sizeof(ShaderReg))) {
+                    const auto* r = reinterpret_cast<const ShaderReg*>(
+                        static_cast<uintptr_t>(c.regs_vaddr));
+                    for (uint32_t i = 0; i < c.num_regs; i++)
+                        if (r[i].offset == prosper::agc::Pm4::SPI_SHADER_PGM_LO_ES) ++pgm_writes;
+                }
+            } else if (c.kind == K::SetRegDirect && c.reg_class == RegClass::Sh) {
+                ++sh_direct;
+                if (c.reg_offset <= prosper::agc::Pm4::SPI_SHADER_PGM_LO_ES &&
+                    c.reg_offset + c.reg_count > prosper::agc::Pm4::SPI_SHADER_PGM_LO_ES)
+                    ++pgm_writes;
+            } else if (c.kind == K::DrawIndex || c.kind == K::DrawIndexAuto ||
+                       c.kind == K::DrawIndexOffset || c.kind == K::DrawIndexIndirect) {
+                ++draws;
+            }
+        }
+        // Which SH registers a stream touches matters as much as how many: #1226 gave the async
+        // compute (Acb) queue its own register file because its SH writes were clobbering live
+        // graphics user data. If an Acb stream writes GRAPHICS user-data offsets rather than
+        // COMPUTE_USER_DATA, that split now DROPS writes hardware would apply, and the next
+        // graphics submit inherits a register file the hardware would never have had. Report the
+        // touched offset range so the two cases are distinguishable.
+        uint32_t sh_lo = UINT32_MAX, sh_hi = 0, sh_gfx_ud = 0, sh_compute_ud = 0;
+        for (const auto& c : ops) {
+            if (c.reg_class != RegClass::Sh) continue;
+            auto note = [&](uint32_t off) {
+                sh_lo = std::min(sh_lo, off); sh_hi = std::max(sh_hi, off);
+                namespace P = prosper::agc::Pm4;
+                if ((off >= P::SPI_SHADER_USER_DATA_PS_0 && off < P::SPI_SHADER_USER_DATA_PS_0 + 32) ||
+                    (off >= P::SPI_SHADER_USER_DATA_GS_0 && off < P::SPI_SHADER_USER_DATA_GS_0 + 32))
+                    ++sh_gfx_ud;
+                else if (off >= P::COMPUTE_USER_DATA_0 && off < P::COMPUTE_USER_DATA_0 + 16)
+                    ++sh_compute_ud;
+            };
+            if (c.kind == K::SetRegDirect) {
+                for (uint32_t k = 0; k < c.reg_count; k++) note(c.reg_offset + k);
+            } else if (c.kind == K::SetRegsIndirect && c.regs_vaddr && c.num_regs &&
+                       guest_readable(c.regs_vaddr, c.num_regs * (uint32_t)sizeof(ShaderReg))) {
+                const auto* r = reinterpret_cast<const ShaderReg*>(
+                    static_cast<uintptr_t>(c.regs_vaddr));
+                for (uint32_t i = 0; i < c.num_regs; i++) note(r[i].offset);
+            }
+        }
+        if (draws || sh_direct || sh_indirect) {
+            static std::atomic<int> n{0};
+            if (n.fetch_add(1) < 200000)
+                fprintf(stderr,
+                        "[bind] FOLD f=%u q=%u dwords=%zu packets=%zu sh_indirect=%u sh_direct=%u "
+                        "es_pgm_writes=%u draws=%u sh_off=[0x%x,0x%x] gfx_ud=%u compute_ud=%u\n",
+                        g_fold_seq.load(std::memory_order_relaxed), (unsigned)g_fold_origin,
+                        dwords, ops.size(), sh_indirect, sh_direct, pgm_writes, draws,
+                        sh_lo == UINT32_MAX ? 0u : sh_lo, sh_hi, sh_gfx_ud, sh_compute_ud);
+        }
+    }
     return ops.size();
 }
 
