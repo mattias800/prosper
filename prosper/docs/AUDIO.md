@@ -106,6 +106,15 @@ Read the counters, not just presence:
   sample and RMS needs a threshold that will call some genuinely-mixed quiet passage silent; only an
   exact `nonzero=0/M` proves the guest submitted a cleared buffer. The rule lives in
   `AudioSignalStats` (`src/hle/audio.hpp`) and is unit-tested against both alternatives.
+- **Judge a port by its `LIFE:` totals, never by one interval.** Per-interval counters reset every
+  second and real playback has gaps, so any single line can read `nonzero=0/M` on a port carrying
+  strong signal over the run. The never-reset totals are what make one line sufficient — reading
+  only the last interval inverted this investigation's first conclusion (instrument-trap 38).
+- **`BED LIFE:` and a port's `LIFE:` do not share a denominator.** They start at different moments —
+  the context's lifetime begins at ContextCreate, each port's at PortCreate — so the two adjacent
+  `nonzero=N/M` values on consecutive lines are *not* directly comparable, and in the example above
+  they cover roughly 41 and 32 seconds respectively. Compare each against itself over time, or
+  against its own `samples`; never read one as a fraction of the other.
 - **`nan=N` names the one remaining input class.** NaN is neither silence nor signal: the sink
   clamps it to zero, so a NaN-producing guest is audibly silent while its buffers are "full". The
   probe counts NaN separately on both port and bed lines and then treats it as the silence it
@@ -120,6 +129,11 @@ Read the counters, not just presence:
   context grain and a layout prosper does not support, so an over-read past the guest buffer would
   be attributed to that port. It is fault-safe and cannot invent silence, but it could in principle
   inflate `nonzero` — confirm a surprising result against the producing code before acting on it.
+- **`peak=inf` / `rms=inf` is a correct reading, not a probe bug.** Infinities are deliberately not
+  filtered the way NaN is: the output path clamps `+Inf` to `+1.0`, so an Inf-producing guest is
+  genuinely, loudly audible and belongs in the signal statistics. Because `LIFE:` never resets, one
+  Inf pins the run peak and rms for the rest of the session — read the per-interval columns to see
+  where it came from, and treat it as a guest-side mixing defect worth its own investigation.
 
 Related, narrower probes: `PROSPER_AUDIOLOG=1` (legacy `sceAudioOut` path: per-port calls, bytes,
 peak and RMS), `PROSPER_AUDIO_DUMP=PATH` (raw `PATH.portN.raw` PCM for offline inspection),
