@@ -1323,23 +1323,23 @@ HLE(audio2_ctx_push) {
                 if (probe) fprintf(stderr, "[audio2-probe] port%d skipped: format=0x%x "
                                            "type=%u channels=%u unsupported\n",
                                            this_pidx + 1, ps.data_format, data_type, channels);
-                bool flow_tagged = false;
-                if (flow && !((data_type == 0 || data_type == 1) && channels >= 1 && channels <= 16)) {
-                    // Nothing further to measure for a layout we cannot even size; record it now.
-                    std::lock_guard<std::mutex> flk(g_flow_mx);
-                    FlowPort& fp = g_flow_port[this_pidx];
-                    flow_tag_port(fp, context_slot, ps.type, ps.data_format);
-                    ++fp.skip_fmt;
-                    flow_tagged = true;
-                }
-                (void)flow_tagged;
                 // A port rejected for its LAYOUT is never read, so "no signal here" would otherwise
                 // be an assumption rather than a measurement — and a rejected port is precisely
                 // where lost audio would hide. Under the probe only (so the default hot path is
                 // unchanged), read and measure it anyway, fault-safely, without mixing it.
-                // channels is audio2_format_channels()'s own clamp (<= 16); stating it here keeps the
-                // buffer sizing reasoned about above true if that clamp ever changes.
-                if (flow && (data_type == 0 || data_type == 1) && channels >= 1 && channels <= 16) {
+                // The bound is audio2_format_channels()'s own clamp, so the buffer sizing reasoned
+                // about below stays true if that clamp ever changes. One flag, used by both arms,
+                // so `skip_fmt` is counted exactly once per push either way.
+                const bool rej_sizable = (data_type == 0 || data_type == 1) &&
+                                         channels >= 1 && channels <= 16;
+                if (flow && !rej_sizable) {
+                    // Nothing to measure for a layout we cannot even size; just record the skip.
+                    std::lock_guard<std::mutex> flk(g_flow_mx);
+                    FlowPort& fp = g_flow_port[this_pidx];
+                    flow_tag_port(fp, context_slot, ps.type, ps.data_format);
+                    ++fp.skip_fmt;
+                }
+                if (flow && rej_sizable) {
                     const uint32_t rej_samples = channels * grain;
                     size_t rej_frames = 0;
                     if (data_type == 0) {
