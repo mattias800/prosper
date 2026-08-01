@@ -52,19 +52,34 @@ jobs:
       - name: Build
         run: cmake --build prosper/build-ci
 
-      # The runner has no GPU, so this is Mesa's lavapipe software rasteriser. Four tests are
-      # driver-divergent: they pass on real hardware (RADV) and fail on lavapipe, reproducibly in both
-      # places. They are EXCLUDED BY NAME rather than by disabling the suite — the defect #1675
-      # documents is a gap nobody can enumerate, and four named exclusions in a workflow file are the
-      # opposite of that. Tracked in #1681; delete from this list as each is resolved.
-      #   game_compute_exec[_no_adaptive_storage_result]  — R11G11B10 pack/unpack exactness
-      #   recompiled_fragment_render / recompiled_shaders_render — rendered-pixel comparisons
-      # Reproduce either way locally:
-      #   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json ctest -R '<name>'
+      # The runner has no GPU, so this is Mesa's lavapipe software rasteriser. Four tests were once
+      # excluded here as "driver-divergent" (#1681). Two are no longer: the divergence was measured,
+      # and for those it was the ASSERTION that overreached, not prosper and not the driver.
+      #   * recompiled_fragment_render (6) / recompiled_shaders_render (1) asserted rendered pixels
+      #     from draws whose shaders require an exact 64-lane fragment subgroup. lavapipe is fixed at
+      #     8, so the backend correctly skips those draws fail-visibly and the target keeps its clear
+      #     colour. Neighbouring assertions in the same files already gated on that capability; these
+      #     did not. Now gated — both run and pass here.
+      #   * game_compute_exec's R11G11B10 sweep required bit-exact round-tripping over all 2048 f11
+      #     codes, which includes the NaN encodings. Exactly 92 texels differ, all 92 carrying a
+      #     signalling NaN and none all-finite: NaN payload quieting through the f16->f32 unpack,
+      #     which no driver owes us. Narrowed to bit-exactness for every finite and infinite code
+      #     plus NaN-ness for the rest; this runner now reports `nan-payload-only=92 real=0`.
+      #
+      # game_compute_exec stays excluded for a DIFFERENT and still-open reason — #1690, not #1681.
+      # Two 3D storage-volume assertions fail only on this runner's older Mesa (25.2.8) and pass on
+      # both Mesa 26.1.4 lavapipe and RADV. The volume diagnostic shows the write landing NOWHERE
+      # rather than landing wrongly:
+      #   volume diff [S3 writeback]: bytes=510/524288 in-written-row=510 untouched=0 first=2
+      # i.e. every untouched voxel is preserved perfectly and the 512-byte written row is absent.
+      # Remove this exclusion when #1690 is resolved; it costs ~496 assertions.
+      #
+      # Reproduce the software-rasteriser path locally with:
+      #   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json ctest
       - name: Test
         run: |
           ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 \
-            -E '^(game_compute_exec|game_compute_exec_no_adaptive_storage_result|recompiled_fragment_render|recompiled_shaders_render)$'
+            -E '^(game_compute_exec|game_compute_exec_no_adaptive_storage_result)$'
 
   linux-app:
     name: Linux App

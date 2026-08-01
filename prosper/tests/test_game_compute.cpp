@@ -1281,14 +1281,140 @@ int main() {
             packed_item.code_addr = 0x590b10;
             const bool packed_executed =
                 prosper::frontend::execute_live_compute_items({packed_item});
-            if (packed_executed && dst != src) {
-                const auto mismatch = std::mismatch(src.begin(), src.end(), dst.begin());
-                const size_t index = static_cast<size_t>(mismatch.first - src.begin());
-                std::printf("  packed R11 mismatch texel=%zu src=%08x dst=%08x\n",
-                            index, src[index], dst[index]);
+
+            // #1681. Two separate corrections live here.
+            //
+            // The INSTRUMENT: the old report used std::mismatch, which returns only the FIRST
+            // differing element while the assertion compared the whole vector — so its printout was
+            // byte-identical whether 1 texel differed or 92, and a breadth claim read off it had no
+            // evidence behind it. The census below counts and classifies every differing texel.
+            //
+            // The CONTRACT: the sweep covers all 2048 f11 codes, which necessarily includes the NaN
+            // encodings, and it required bit-exact equality over them. NaN *payload* propagation is
+            // not something any driver owes us — IEEE 754 leaves it unspecified and SPIR-V/Vulkan
+            // follow suit — and prosper's unpack routes each code through GLSL UnpackHalf2x16, a
+            // genuine f16->f32 conversion. RADV preserves the payload; lavapipe quiets signalling
+            // NaNs (x86 VCVTPH2PS sets the quiet bit), and both are conformant. So require
+            // bit-exactness for every finite and infinite code — the values that actually carry
+            // rendered colour — and require only that a NaN stays a NaN. This keeps all 2048 codes
+            // under test and drops only the bits no implementation guarantees.
+            struct Field { uint32_t shift, width; };
+            const Field fields[3] = {{0, 11}, {11, 11}, {22, 10}};  // R f11, G f11, B f10
+            auto chan = [&](uint32_t texel, int c) {
+                return (texel >> fields[c].shift) & ((1u << fields[c].width) - 1u);
+            };
+            auto mant_bits = [&](int c) { return fields[c].width - 5u; };
+            auto is_nan = [&](uint32_t v, int c) {
+                const uint32_t m = mant_bits(c);
+                return (v >> m) == 0x1fu && (v & ((1u << m) - 1u)) != 0u;
+            };
+            auto is_inf = [&](uint32_t v, int c) {
+                const uint32_t m = mant_bits(c);
+                return (v >> m) == 0x1fu && (v & ((1u << m) - 1u)) == 0u;
+            };
+            auto is_snan = [&](uint32_t v, int c) {
+                const uint32_t m = mant_bits(c);
+                return is_nan(v, c) && (v & (1u << (m - 1u))) == 0u;
+            };
+            // A channel round-trips when it is bit-exact, or when a NaN source stayed some NaN.
+            auto channel_round_trips = [&](uint32_t s, uint32_t d, int c) {
+                const uint32_t sv = chan(s, c), dv = chan(d, c);
+                return is_nan(sv, c) ? is_nan(dv, c) : sv == dv;
+            };
+
+            // Pin the narrowed predicate itself on the CPU, with no GPU involved (#1681). The live
+            // sweep can only demonstrate the cases the driver happens to produce, so it cannot show
+            // that the exemption stops at NaN *payload* — and a narrowing that quietly also accepted
+            // Inf<->NaN or NaN->finite would still pass every run. These assertions fix the contract
+            // in both directions and would fail if a later edit widened it.
+            {
+                bool accepts_payload = true, rejects_everything_else = true;
+                for (int c = 0; c < 3; ++c) {
+                    const uint32_t m = mant_bits(c), sh = fields[c].shift;
+                    auto tex = [&](uint32_t v) { return v << sh; };
+                    const uint32_t inf = 0x1fu << m;                 // exp all ones, mantissa 0
+                    const uint32_t snan = inf | 1u;                  // mantissa MSB clear
+                    const uint32_t qnan = inf | (1u << (m - 1u));    // mantissa MSB set
+                    const uint32_t sub = 1u;                         // exp 0, mantissa 1
+                    const uint32_t norm = (15u << m) | 3u;           // ordinary finite value
+                    // Payload movement between NaNs is permitted, in either direction.
+                    accepts_payload &= channel_round_trips(tex(snan), tex(qnan), c);
+                    accepts_payload &= channel_round_trips(tex(qnan), tex(snan), c);
+                    accepts_payload &= channel_round_trips(tex(snan), tex(snan), c);
+                    accepts_payload &= channel_round_trips(tex(inf), tex(inf), c);
+                    accepts_payload &= channel_round_trips(tex(sub), tex(sub), c);
+                    accepts_payload &= channel_round_trips(tex(norm), tex(norm), c);
+                    // Nothing else is. A NaN may not decay, and a non-NaN may not become one.
+                    rejects_everything_else &= !channel_round_trips(tex(snan), tex(inf), c);
+                    rejects_everything_else &= !channel_round_trips(tex(qnan), tex(inf), c);
+                    rejects_everything_else &= !channel_round_trips(tex(snan), tex(0), c);
+                    rejects_everything_else &= !channel_round_trips(tex(snan), tex(norm), c);
+                    rejects_everything_else &= !channel_round_trips(tex(inf), tex(snan), c);
+                    rejects_everything_else &= !channel_round_trips(tex(inf), tex(norm), c);
+                    rejects_everything_else &= !channel_round_trips(tex(norm), tex(norm + 1u), c);
+                    rejects_everything_else &= !channel_round_trips(tex(sub), tex(0), c);
+                    rejects_everything_else &= !channel_round_trips(tex(0), tex(sub), c);
+                }
+                CHECK(accepts_payload,
+                      "R11G11B10 round-trip contract permits NaN payload movement in both directions");
+                CHECK(rejects_everything_else,
+                      "R11G11B10 round-trip contract still rejects NaN<->Inf, NaN->finite, and any "
+                      "finite or subnormal change in every channel");
             }
-            CHECK(packed_executed && dst == src,
-                  "shader-side R11G11B10 pack/unpack round-trips every encoded f11 value exactly");
+
+            size_t payload_only = 0, real_diffs = 0;
+            for (size_t t = 0; t < src.size(); ++t) {
+                if (src[t] == dst[t]) continue;
+                bool ok = true;
+                for (int c = 0; c < 3; ++c)
+                    if (!channel_round_trips(src[t], dst[t], c)) ok = false;
+                if (ok) ++payload_only; else ++real_diffs;
+            }
+            if (packed_executed && dst != src) {
+                size_t total = 0, all_finite = 0, any_snan = 0, any_nan = 0, any_inf = 0;
+                size_t quiet_exact = 0, canon_exact = 0;
+                long long first_finite = -1, first_any = -1;
+                for (size_t t = 0; t < src.size(); ++t) {
+                    if (src[t] == dst[t]) continue;
+                    ++total;
+                    if (first_any < 0) first_any = static_cast<long long>(t);
+                    bool finite = true, snan = false, nan = false, inf = false;
+                    uint32_t quieted = 0, canonical = 0;
+                    for (int c = 0; c < 3; ++c) {
+                        const uint32_t v = chan(src[t], c), m = mant_bits(c);
+                        if (is_nan(v, c)) { nan = true; finite = false; }
+                        if (is_inf(v, c)) { inf = true; finite = false; }
+                        if (is_snan(v, c)) snan = true;
+                        // Quieting model: an sNaN gains the mantissa MSB; everything else is kept.
+                        const uint32_t q = is_snan(v, c) ? (v | (1u << (m - 1u))) : v;
+                        // Canonicalisation model: every NaN collapses to exp=31, mantissa MSB only.
+                        const uint32_t k = is_nan(v, c) ? ((0x1fu << m) | (1u << (m - 1u))) : v;
+                        quieted |= q << fields[c].shift;
+                        canonical |= k << fields[c].shift;
+                    }
+                    if (finite) {
+                        ++all_finite;
+                        if (first_finite < 0) first_finite = static_cast<long long>(t);
+                    }
+                    if (snan) ++any_snan;
+                    if (nan) ++any_nan;
+                    if (inf && !nan) ++any_inf;
+                    if (dst[t] == quieted) ++quiet_exact;
+                    if (dst[t] == canonical) ++canon_exact;
+                    if (total <= 8 || finite)
+                        std::printf("  packed R11 diff texel=%zu src=%08x dst=%08x xor=%08x%s\n",
+                                    t, src[t], dst[t], src[t] ^ dst[t],
+                                    finite ? "  ALL-FINITE" : "");
+                }
+                std::printf("  packed R11 census: total=%zu all-finite=%zu any-sNaN=%zu "
+                            "any-NaN=%zu inf-only=%zu quiet-model-exact=%zu canon-model-exact=%zu "
+                            "first=%lld first-finite=%lld nan-payload-only=%zu real=%zu\n",
+                            total, all_finite, any_snan, any_nan, any_inf, quiet_exact,
+                            canon_exact, first_any, first_finite, payload_only, real_diffs);
+            }
+            CHECK(packed_executed && real_diffs == 0,
+                  "shader-side R11G11B10 pack/unpack round-trips every finite and infinite f11 "
+                  "code exactly, and preserves NaN-ness (payload is implementation-defined)");
         }
 
         // Also compare arbitrary raw f32 channel bits against the CPU's exact RNE oracle. The
@@ -1734,6 +1860,27 @@ int main() {
         std::vector<uint8_t> volume_expected = volume_dst_initial;
         std::copy_n(volume_src_linear.begin(), VOLUME_W * volume_bpe,
                     volume_expected.begin());
+        // #1681: this pair failed on the CI runner's Mesa 25.2.8 lavapipe while passing on Mesa
+        // 26.1.4 lavapipe and on RADV, and a bare vector compare cannot say why. Report whether the
+        // difference lands in the one row the dispatch writes or in the voxels it must preserve —
+        // "wrote the wrong data" and "failed to preserve untouched data" are different defects.
+        const size_t volume_written_bytes = VOLUME_W * volume_bpe;
+        auto report_volume_diff = [&](const char* tag) {
+            if (volume_result == volume_expected) return;
+            size_t diff = 0, in_written = 0, first = volume_result.size();
+            for (size_t i = 0; i < volume_result.size() && i < volume_expected.size(); ++i) {
+                if (volume_result[i] == volume_expected[i]) continue;
+                ++diff;
+                if (i < volume_written_bytes) ++in_written;
+                if (first == volume_result.size()) first = i;
+            }
+            std::printf("  volume diff [%s]: bytes=%zu/%zu in-written-row=%zu untouched=%zu "
+                        "first=%zu got=%02x want=%02x\n",
+                        tag, diff, volume_result.size(), in_written, diff - in_written, first,
+                        first < volume_result.size() ? volume_result[first] : 0,
+                        first < volume_expected.size() ? volume_expected[first] : 0);
+        };
+        report_volume_diff("S3 writeback");
         CHECK(volume_result == volume_expected,
               "S3 writeback updates one row and preserves all untouched 3D voxels");
 
@@ -1756,6 +1903,7 @@ int main() {
         std::fill(volume_result.begin(), volume_result.end(), 0);
         detile_volume(volume_result.data(), volume_dst.data(), volume_dst.size(),
                       VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+        report_volume_diff("3D descriptor");
         CHECK(!layered_reader_called && volume_result == volume_expected,
               "3D descriptor rejects address-only 2D ownership and preserves guest-backed voxels");
         set_live_target_reader({});

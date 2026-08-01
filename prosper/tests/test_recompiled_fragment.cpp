@@ -58,6 +58,36 @@ int main() {
     CHECK(indexed_center && indexed_center[1] > 0x80 && indexed_center[0] < 0x40,
           "RDNA2 v_movreld_b32 writes the M0-indexed VGPR destination");
 
+    // Wave64 device capability, needed from the first EXECZ/VCCZ draw onward (#1681). The recompiler
+    // lowers a wave-wide EXECZ/VCCZ test to a native subgroup vote and marks the module as requiring
+    // an exact 64-lane subgroup; RADV can enforce that, while llvmpipe is fixed at 8 and the backend
+    // must reject the draw rather than execute silently wrong wave semantics. Every assertion over a
+    // rendered pixel from such a draw is therefore conditional on this capability — the target keeps
+    // its clear colour when the device cannot supply wave64, which is correct fail-visible behaviour
+    // and not a rendering difference.
+    const auto& wave_ctx = prosper::test::render_vk_ctx();
+    const bool supports_fragment_wave64 = wave_ctx.subgroup_size_control &&
+        wave_ctx.min_subgroup_size <= 64 && wave_ctx.max_subgroup_size >= 64 &&
+        (wave_ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+        (wave_ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+        (wave_ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
+    const bool supports_fragment_wave64_vote = supports_fragment_wave64 &&
+        (wave_ctx.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+    const bool supports_fragment_gds =
+        supports_fragment_wave64 && wave_ctx.fragment_stores_atomics;
+    // The BLUE clear the fixtures render against; a skipped draw must leave exactly this.
+    auto is_blue_clear = [](const uint8_t* p) {
+        return p && p[2] > 0x80 && p[0] < 0x40 && p[1] < 0x40;
+    };
+    // A clear-coloured target on its own only says "no draw landed here", which any pipeline failure
+    // would also produce. Pair it with the module's own declared requirement, so the wave64-less arm
+    // asserts the specific thing that should have happened: this shader demanded an exact 64-lane
+    // subgroup, and the device therefore left the target untouched. Four pre-existing gated fixtures
+    // already assert the required size separately; this applies the same rigour to the rest.
+    auto skipped_wave64_draw = [&](const std::vector<uint32_t>& frag, const uint8_t* p) {
+        return fragment_spirv_required_subgroup_size(frag) == 64 && is_blue_clear(p);
+    };
+
     // A second Sonic loop form has an unconditional back-edge but an interior EXECZ targeting the
     // loop exit. The interior branch must leave the loop directly: going through the back-edge would
     // restore EXEC and re-enter forever. This one-iteration fixture clears EXEC in the body, takes the
@@ -82,8 +112,13 @@ int main() {
     const uint8_t* direct_break_center =
         direct_break_px.size() == static_cast<size_t>(W) * H * 4
             ? &direct_break_px[((static_cast<size_t>(H) / 2) * W + W / 2) * 4] : nullptr;
-    CHECK(direct_break_center && direct_break_center[1] > 0x80 && direct_break_center[0] < 0x40,
-          "unconditional-backedge EXECZ break exits directly and preserves loop merge state");
+    CHECK(direct_break_center &&
+              (supports_fragment_wave64_vote
+                   ? (direct_break_center[1] > 0x80 && direct_break_center[0] < 0x40)
+                   : skipped_wave64_draw(direct_break_frag, direct_break_center)),
+          supports_fragment_wave64_vote
+              ? "unconditional-backedge EXECZ break exits directly and preserves loop merge state"
+              : "device without fragment wave64 vote skips the backedge-break draw fail-visible");
 
     // Fragment MBCNT is a real cross-lane operation. The lowering uses a native subgroup exclusive
     // sum and marks the module as requiring an exact 64-lane subgroup. RADV can
@@ -99,16 +134,6 @@ int main() {
     CHECK(!wave_frag.empty(), "recompiled fragment MBCNT through native subgroup exclusive sum");
     CHECK(fragment_spirv_required_subgroup_size(wave_frag) == 64,
           "fragment MBCNT module advertises its exact wave64 pipeline requirement");
-    const auto& wave_ctx = prosper::test::render_vk_ctx();
-    const bool supports_fragment_wave64 = wave_ctx.subgroup_size_control &&
-        wave_ctx.min_subgroup_size <= 64 && wave_ctx.max_subgroup_size >= 64 &&
-        (wave_ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
-        (wave_ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
-        (wave_ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
-    const bool supports_fragment_wave64_vote = supports_fragment_wave64 &&
-        (wave_ctx.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
-    const bool supports_fragment_gds =
-        supports_fragment_wave64 && wave_ctx.fragment_stores_atomics;
     std::vector<uint8_t> wave_px = prosper::test::render_triangle_rgba(vert, wave_frag, W, H);
     const bool wave_rendered = wave_px.size() == static_cast<size_t>(W) * H * 4;
     const uint8_t* wave_center = wave_rendered
@@ -517,8 +542,13 @@ int main() {
             if (px2.size() == (size_t)W*H*4) {
                 const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
                 printf("  divloop center=(%u,%u,%u,%u) expect ~(128,255,128,255)\n", cc[0],cc[1],cc[2],cc[3]);
-                CHECK(cc[1] > 0xF0 && cc[0] > 0x70 && cc[0] < 0x90 && cc[2] > 0x70 && cc[2] < 0x90,
-                      "divergent loop: 4 iterations, nested if 2 -> (0.5, 1.0, 0.5)");
+                CHECK(supports_fragment_wave64_vote
+                          ? (cc[1] > 0xF0 && cc[0] > 0x70 && cc[0] < 0x90 &&
+                             cc[2] > 0x70 && cc[2] < 0x90)
+                          : skipped_wave64_draw(frg, cc),
+                      supports_fragment_wave64_vote
+                          ? "divergent loop: 4 iterations, nested if 2 -> (0.5, 1.0, 0.5)"
+                          : "device without fragment wave64 vote skips the divergent-loop draw");
             }
         }
     }
@@ -543,8 +573,12 @@ int main() {
             if (px2.size() == (size_t)W*H*4) {
                 const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
                 printf("  vccz loop center=(%u,%u,%u,%u) expect white\n", cc[0],cc[1],cc[2],cc[3]);
-                CHECK(cc[0] > 0xF0 && cc[1] > 0xF0 && cc[2] > 0xF0,
-                      "VCCZ loop: exactly 4 iterations of 0.25 -> 1.0 white");
+                CHECK(supports_fragment_wave64_vote
+                          ? (cc[0] > 0xF0 && cc[1] > 0xF0 && cc[2] > 0xF0)
+                          : skipped_wave64_draw(frg, cc),
+                      supports_fragment_wave64_vote
+                          ? "VCCZ loop: exactly 4 iterations of 0.25 -> 1.0 white"
+                          : "device without fragment wave64 vote skips the VCCZ-loop draw");
             }
         }
 
@@ -599,8 +633,12 @@ int main() {
             if (px2.size() == (size_t)W*H*4) {
                 const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
                 printf("  execnz loop center=(%u,%u,%u,%u) expect ~(191,191,191,255)\n", cc[0],cc[1],cc[2],cc[3]);
-                CHECK(cc[0] > 0xA8 && cc[0] < 0xD8 && cc[1] > 0xA8 && cc[1] < 0xD8,
-                      "execnz loop + break: exactly 3 iterations -> 0.75 gray");
+                CHECK(supports_fragment_wave64_vote
+                          ? (cc[0] > 0xA8 && cc[0] < 0xD8 && cc[1] > 0xA8 && cc[1] < 0xD8)
+                          : skipped_wave64_draw(frg, cc),
+                      supports_fragment_wave64_vote
+                          ? "execnz loop + break: exactly 3 iterations -> 0.75 gray"
+                          : "device without fragment wave64 vote skips the execnz-loop draw");
             }
         }
     }
@@ -645,9 +683,13 @@ int main() {
                 const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
                 printf("  nested loops center=(%u,%u,%u,%u) expect ~(191,191,191,255)\n",
                        cc[0],cc[1],cc[2],cc[3]);
-                CHECK(cc[0] > 0xA8 && cc[0] < 0xD8 && cc[1] > 0xA8 && cc[1] < 0xD8 &&
-                      cc[2] > 0xA8 && cc[2] < 0xD8,
-                      "#590: nested loops 3x4: inner 12 x 0.0625 and outer 3 x 0.25 both = 0.75");
+                CHECK(supports_fragment_wave64_vote
+                          ? (cc[0] > 0xA8 && cc[0] < 0xD8 && cc[1] > 0xA8 && cc[1] < 0xD8 &&
+                             cc[2] > 0xA8 && cc[2] < 0xD8)
+                          : skipped_wave64_draw(frg, cc),
+                      supports_fragment_wave64_vote
+                          ? "#590: nested loops 3x4: inner 12 x 0.0625 and outer 3 x 0.25 both = 0.75"
+                          : "device without fragment wave64 vote skips the nested-loop draw");
             }
         }
 
@@ -740,8 +782,11 @@ int main() {
                 vert, recycled_readlane, W, H);
             const uint8_t* center = px.empty() ? nullptr
                 : &px[((size_t)(H / 2) * W + W / 2) * 4];
-            CHECK(center && center[0] > 0xC0,
-                  "#652: recycled v10 lane 3 contains the new 1.0 value, not its stale spill");
+            CHECK(center && (supports_fragment_wave64_vote ? center[0] > 0xC0
+                                                          : skipped_wave64_draw(recycled_readlane, center)),
+                  supports_fragment_wave64_vote
+                      ? "#652: recycled v10 lane 3 contains the new 1.0 value, not its stale spill"
+                      : "device without fragment wave64 vote skips the recycled-lane draw");
         }
     }
 
