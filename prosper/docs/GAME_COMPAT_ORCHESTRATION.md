@@ -763,7 +763,59 @@ Also falsified: seed-skip/poison corruption (`PROSPER_NO_SKIP_SEED=1` gives an i
 (it writes zeros, but from a genuinely empty upstream); and the b49 1x1 control (draw 206's only real image input
 is `0x5420f0000`).
 
-### Current Astro frontier: a frame-wide zero colour write mask
+### ANSWERED: the zero colour write mask is `CB_COLOR_CONTROL.MODE=DISABLE`, and prosper is faithful
+
+Measured 2026-08-01 on exact master `f7831d8a` with a fresh **v43** world-map capture (the v42 bundle
+reported `color-state unavailable`, which is why this could not be settled before) plus a
+`PROSPER_REGWATCH` write-event count. Both halves agree and the chain is now complete.
+
+**The masks are exonerated.** Across all 207 colour-state records in the captured frame, **no** register
+is absent (`present=0`: zero records) and only 5 have a zero mask. Typical records are
+`target-mask=1:00000737 shader-mask=1:0000000f effective=07` — healthy, non-zero.
+
+**The disable is the MODE field.** 201 of 207 records hold `CB_COLOR_CONTROL = 0x00cc0000`
+(**MODE=0, CB_DISABLE**), 6 hold `0x00cc0060` (MODE=6, DCC_DECOMPRESS), and **none** holds MODE=1
+(CB_NORMAL). On the G-buffer `0x520440000` specifically: **136 draws at `cwm=0`, every one `mode=0`**
+(the earlier "28 draws" figure understated it ~5x). `0x00cc0000` is the standard GFX10 hardware reset
+for this register — ROP3 `0xCC` SRCCOPY, MODE=0 — and is not a literal anywhere in `src/`.
+
+**The guest never enables normal colour writes.** `PROSPER_REGWATCH=Cx:0x202` over the routed run
+observed **17,533 `CB_COLOR_CONTROL` writes, all on the indirect path**, with exactly three distinct
+values differing *only* in the MODE field:
+
+| value | MODE | count |
+|---|---|---|
+| `0x00cc0000` | 0 — CB_DISABLE | 7,859 |
+| `0x00cc0020` | 2 — CB_ELIMINATE_FAST_CLEAR | 6,109 |
+| `0x00cc0060` | 6 — CB_DCC_DECOMPRESS | 3,565 |
+| — | **1 — CB_NORMAL** | **0** |
+
+`CB_TARGET_MASK` (32,134 writes) and `CB_SHADER_MASK` (67,018) are written heavily, so the register
+stream is alive and being decoded; the three coherent MODE values argue the same. This is DISABLE plus
+two *decompression/maintenance* modes — a frame doing colour-buffer maintenance and never ordinary
+shading.
+
+**prosper's handling is correct and deliberate.** `render_state.cpp` computes
+`color_write_mask = CB_TARGET_MASK & CB_SHADER_MASK`, then zeroes it when `MODE == DISABLE`
+(`ps.color_write_mask = 0; ... for (auto& target : ps.color_targets) target.write_mask = 0;`), with a
+comment stating that DISABLE suppresses colour writes but not the draw. Guest writes MODE=0 -> prosper
+zeroes the mask -> `cwm=0` -> black. Every step is faithful.
+
+**So the frontier moves upstream, off the colour state entirely.** The question is no longer "who wrote
+the zero" — the guest did, 7,859 times — but **why Astro's world map never issues a CB_NORMAL pass**.
+Do not re-investigate the masks, the MODE decode, or the register fold: decode correctness is settled
+cross-title (Blue Prince renders through this path at MODE=1; Oregon Trail measured ~12,000 writes with
+zero mismatches across 1,050 suppressed draws).
+
+**The one caveat that bounds this result.** `PROSPER_REGWATCH` observes writes only in streams prosper
+actually *folds*. If a submit is never folded, its register writes are invisible to this measurement as
+well as to the renderer. That is the #305 class one lane over (a cross-thread `SubmitDcbFinal` whose
+state prosper handles differently), so **whether Astro uses the variant submit path, and whether every
+submit is folded, is the next thing to check** before concluding the guest genuinely never enables
+colour. `CONFIDENCE: HIGH` that prosper faithfully reproduces what it observes; `CONFIDENCE: MED` that
+what it observes is everything the guest submits.
+
+### Superseded: "a frame-wide zero colour write mask" (the framing above answers it)
 
 The world map is **not** a "dark grayscale pattern" — contrast-stretching the output shows a uniform diagonal
 sawtooth with **zero scene content**. The prior "min 0 / max 13 / mean 5.97" reading is a content-free ramp.
