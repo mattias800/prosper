@@ -149,6 +149,9 @@ static const NotAnEmitter kNotEmitters[] = {
 // Note this scan has no comment handling, deliberately. The hazard runs the safe way now: a
 // declaration-shaped line inside a header comment invents a phantom REQUIRED emitter and fails
 // loudly, where the previous, textual coverage check could be silently SATISFIED by a comment.
+// The same fail-loud direction covers a parenthesised local in inline header code
+// (`std::vector<uint32_t> words(n);` reads as a declaration of an emitter named `words`). None
+// exists today; if you write one and this gate goes red, that is why — use `=` or brace init.
 static std::vector<std::string> declared_emitters(const std::string& header_text) {
     static const char* const kReturnTypes[] = {"std::vector<uint32_t>", "SharedShaderWords"};
     std::vector<std::string> names;
@@ -172,20 +175,31 @@ static std::vector<std::string> declared_emitters(const std::string& header_text
 }
 
 static int check_emitter_coverage(const std::string& src_root) {
-    // Every graphics header, not a hardcoded pair: an emitter declared in a NEW header is precisely
-    // the #1711 shape one level up, and a fixed list cannot see it.
-    const std::string gpu_dir = src_root + "/src/gpu";
-    // src/gpu is flat (no subdirectories), so a non-recursive walk is complete. The iterator is
-    // advanced explicitly with an error_code: the range-for's operator++ is the THROWING overload,
-    // so an error arising mid-iteration would terminate instead of reaching the report below.
+    // Every header under these roots, not a hardcoded pair: an emitter declared in a NEW header is
+    // precisely the #1711 shape one level up, and a fixed list cannot see it. RECURSIVE, and both
+    // the GPU code and the frontend that drives it, so neither a new subdirectory nor a producer
+    // that grows in the frontend re-creates that blind spot at the level of LOCATION rather than
+    // filename. Nothing outside these roots emits SPIR-V today (`git grep 0x07230203` finds only
+    // rdna2_to_spirv.cpp and spirv_builder.cpp); if that changes, add the root here rather than
+    // discovering it the way #1711 was discovered.
+    static const char* const kSearchRoots[] = {"/src/gpu", "/frontends/shared"};
     std::vector<std::string> headers;
-    std::error_code ec;
-    std::filesystem::directory_iterator it(gpu_dir, ec), done;
-    for (; !ec && it != done; it.increment(ec))
-        if (it->path().extension() == ".hpp") headers.push_back(it->path().string());
-    if (ec || headers.empty()) {
-        printf("  [FAIL] emitter coverage: cannot enumerate %s (%s)\n", gpu_dir.c_str(),
-               ec ? ec.message().c_str() : "no headers found");
+    for (const char* root : kSearchRoots) {
+        const std::string dir = src_root + root;
+        std::error_code ec;
+        // Advanced explicitly with an error_code: the range-for's operator++ is the THROWING
+        // overload, so an error arising mid-iteration would terminate instead of being reported.
+        std::filesystem::recursive_directory_iterator it(dir, ec), done;
+        for (; !ec && it != done; it.increment(ec))
+            if (it->path().extension() == ".hpp") headers.push_back(it->path().string());
+        if (ec) {
+            printf("  [FAIL] emitter coverage: cannot enumerate %s (%s)\n", dir.c_str(),
+                   ec.message().c_str());
+            return 1;
+        }
+    }
+    if (headers.empty()) {
+        printf("  [FAIL] emitter coverage: no headers found under %s\n", src_root.c_str());
         return 1;
     }
     std::sort(headers.begin(), headers.end());
@@ -234,9 +248,9 @@ static int check_emitter_coverage(const std::string& src_root) {
             ++problems;
         }
     if (!problems)
-        printf("  [ok]   emitter coverage: all %zu declared SPIR-V emitters emitted a module%s\n",
+        printf("  [ok]   emitter coverage: all %zu declared SPIR-V emitters were exercised%s\n",
                declared.size(),
-               fails ? " (one or more of which FAILED validation, above)" : ", and all validated");
+               fails ? " (one or more of which FAILED above)" : ", and every module validated");
     return problems;
 }
 
@@ -252,19 +266,21 @@ int main(int argc, char** argv) {
     }
     const std::string src_root = argv[2];
 
+    // Ask the directory directly rather than inferring writability from whether the validator probe
+    // left anything behind: a spirv-val that exists but exits non-zero while printing nothing would
+    // otherwise be diagnosed as an unwritable directory, sending the reader to the wrong place.
     const std::string probe = dir + "/spv_validate-probe.txt";
-    const bool have_val = (system(("spirv-val --version > \"" + probe + "\" 2>&1").c_str()) == 0);
-    // Distinguish "no validator" from "cannot write here": the probe redirects into <output-dir>,
-    // so an unwritable or missing argv[1] would otherwise be reported as a missing spirv-val.
-    const bool probe_written = !read_text(probe).empty();
-    std::remove(probe.c_str());
-    if (!have_val && !probe_written) {
+    if (FILE* w = fopen(probe.c_str(), "wb")) {
+        fclose(w);
+    } else {
         printf("== FAIL: cannot write into the output directory %s ==\n"
-               "  The spirv-val probe could not be redirected there, so this run cannot tell\n"
-               "  whether the validator is present. Check <output-dir> before reading this as\n"
-               "  a missing spirv-tools install.\n", dir.c_str());
+               "  Every module and the spirv-val probe are written there, so this run cannot\n"
+               "  proceed. Check <output-dir>; this is NOT a missing spirv-tools install.\n",
+               dir.c_str());
         return 1;
     }
+    const bool have_val = (system(("spirv-val --version > \"" + probe + "\" 2>&1").c_str()) == 0);
+    std::remove(probe.c_str());
     if (!have_val) {
         // Previously this printed "PASS (recompiled; spirv-val not found)" and exited 0, which is
         // how a gate documented as strict validation ran in CI for its whole life without ever
