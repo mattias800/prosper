@@ -51,9 +51,10 @@ class LibraryMedia {
 public:
     ~LibraryMedia();
 
-    // `sampler` is borrowed from the library UI (same filtering as the covers). Returns false if the
-    // worker or the audio device could not be brought up; the library then simply has no backgrounds
-    // and no music, which is the same outcome as a title with no assets.
+    // `sampler` is borrowed from the library UI (same filtering as the covers). Returns false only if
+    // the Vulkan objects this layer owns could not be created. A machine with no audio device is NOT a
+    // failure — it yields a silent library, the same outcome as a title with no snd0.at9 — so check
+    // music_enabled() afterwards for the effective audio state rather than this return value.
     bool init(VkPhysicalDevice phys, VkDevice device, VkQueue queue, uint32_t queue_family,
               VkSampler sampler, bool music_enabled, float music_gain);
 
@@ -143,7 +144,9 @@ private:
     };
 
     void worker_main();
-    static void load_one(const LoadRequest& req, bool bc, LoadResult& out);
+    // `rate`/`channels` are the opened stream's format, so a track that disagrees is refused
+    // rather than played through the wrong interleave or at the wrong pitch.
+    static void load_one(const LoadRequest& req, bool bc, int rate, int channels, LoadResult& out);
 
     void start_load(const std::string& root, uint64_t now_ms);
     void claim_result(uint64_t now_ms);
@@ -159,6 +162,8 @@ private:
     float gain_at(uint64_t play_ms, bool outgoing) const;
     bool ensure_audio();
 
+    void mark_incoming_ready(uint64_t now_ms);
+    void retire_evicted(const std::vector<std::string>& gone);
     void insert_background(const std::string& root, const Background& bg);
     void collect_retired(bool force);
     void destroy_background(Background& bg);

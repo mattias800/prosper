@@ -190,9 +190,15 @@ int main() {
         CHECK(!parse_dds_bc7(make_dds(z)).ok, "a zero width is rejected");
         // A header claiming an enormous image must be rejected on the dimension, before any size
         // arithmetic could overflow or any allocation could be attempted.
+        // Assert the REASON, not merely that it failed. With kDdsMaxDimension removed this input is
+        // still rejected by the later payload-size check, so `!ok` alone proves nothing about the
+        // dimension guard that is supposed to run first.
         std::string huge = make_dds();
         put32(huge, 16, 0xFFFFFFFFu);
-        CHECK(!parse_dds_bc7(huge).ok, "an implausible width is rejected without overflowing");
+        const DdsBc7Image hugeImg = parse_dds_bc7(huge);
+        CHECK(!hugeImg.ok, "an implausible width is rejected without overflowing");
+        CHECK(std::string(hugeImg.reason) == "implausible dimensions",
+              "and is rejected on the dimension itself, before any size arithmetic");
     }
     CHECK(!parse_dds_bc7("").ok, "an empty file is rejected");
     CHECK(!parse_dds_bc7(std::string(147, '\0')).ok, "a file shorter than the headers is rejected");
@@ -266,6 +272,16 @@ int main() {
         std::string cut = make_at9();
         cut.resize(cut.size() - 100);
         CHECK(!parse_at9_riff(cut).ok, "a truncated data chunk is rejected");
+        // The case that actually exercises the chunk-bounds guard: a file cut off INSIDE the fmt chunk,
+        // where the declared size is honest but the bytes are absent. Without `body + size > end` the
+        // extension reads at ext+6 and ext+26 would run past the buffer. The cases above fail earlier,
+        // on a missing or short data chunk, so neither demonstrates this one.
+        {
+            const std::string full = make_at9();
+            for (size_t at : {size_t(20), size_t(40), size_t(60), size_t(72)})
+                CHECK(!parse_at9_riff(full.substr(0, at)).ok,
+                      "a file truncated inside the fmt chunk is rejected, never read past");
+        }
     }
 
     // --- AT9: smpl loop points ----------------------------------------------------------------------

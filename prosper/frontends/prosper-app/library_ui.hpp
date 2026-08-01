@@ -155,7 +155,10 @@ private:
     uint64_t               frameMaxIndex_ = 0;   // which frame was the worst — startup or a load?
     uint64_t               lastFrameNs_  = 0;
     bool                   statsReported_ = false;
-    std::vector<double>    frameSamples_;   // for percentiles; bounded, oldest dropped
+    // For percentiles. Bounded, and recording simply STOPS at the cap: the reported percentiles
+    // then describe the first kMaxFrameSamples frames, which is stated rather than disguised.
+    static constexpr size_t kMaxFrameSamples = 200000;
+    std::vector<double>    frameSamples_;
 
     std::vector<GameEntry> games_;
     std::vector<Cover>     covers_;

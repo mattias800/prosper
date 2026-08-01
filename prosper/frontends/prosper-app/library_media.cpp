@@ -15,9 +15,20 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 
 namespace prosper::frontend {
 namespace {
+
+// Read once. update() consults this twice per frame, and SDL_getenv on every frame of a UI loop is
+// needless work in the hot path.
+bool stats_enabled() {
+    static const bool on = [] {
+        const char* s = SDL_getenv("PROSPER_LIBRARY_STATS");
+        return s && *s && s[0] != '0';
+    }();
+    return on;
+}
 
 // How much audio to keep queued. Deliberately short: audio already handed to SDL cannot be re-gained,
 // so the queue depth is the worst-case lag between a focus change and the music starting to duck. At
@@ -37,12 +48,21 @@ uint32_t find_memory_type(VkPhysicalDevice phys, uint32_t bits, VkMemoryProperty
     return UINT32_MAX;
 }
 
+// Refuses anything absurd before allocating: the size comes from a file in a user-chosen directory, and
+// the largest asset this reads legitimately is a 4K BC7 background at about 8 MB.
+constexpr long kMaxAssetBytes = 256L * 1024 * 1024;
+
 std::string read_file_bytes(const std::string& path) {
     std::string out;
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return out;
     std::fseek(f, 0, SEEK_END);
     const long size = std::ftell(f);
+    if (size > kMaxAssetBytes) {
+        fprintf(stderr, "[library] %s: %ld bytes is implausibly large; skipped\n", path.c_str(), size);
+        std::fclose(f);
+        return out;
+    }
     if (size > 0) {
         out.resize(static_cast<size_t>(size));
         std::fseek(f, 0, SEEK_SET);
@@ -158,6 +178,13 @@ void LibraryMedia::shutdown() {
         reqCv_.notify_all();
         worker_.join();
     }
+    {
+        // Reset the worker flags too: a later init() would otherwise spawn a thread that sees quit_ and
+        // returns immediately, leaving every load unanswered and every transition stuck at "nothing".
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        quit_ = false;
+        hasRequest_ = false;
+    }
     { std::lock_guard<std::mutex> lk(resMutex_); result_.reset(); }
     deferred_.reset();   // plain bytes, no GPU handles, but do not hold it past shutdown
 
@@ -201,7 +228,17 @@ void LibraryMedia::worker_main() {
         auto res = std::make_unique<LoadResult>();
         res->generation = req.generation;
         res->root = req.root;
-        load_one(req, bcSupported_, *res);
+        // An exception escaping a thread function is std::terminate — the whole launcher would vanish
+        // with no message because one asset was too large to allocate. A failed load must cost that
+        // title its background and music, nothing more.
+        try {
+                load_one(req, bcSupported_, audioRate_, audioChannels_, *res);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[library] %s: load failed (%s)\n", req.root.c_str(), e.what());
+            *res = LoadResult{};
+            res->generation = req.generation;
+            res->root = req.root;
+        }
         {
             // Overwrite any result the UI has not claimed: generations only increase, so an unclaimed
             // older one is already superseded and dropping it here saves the UI the work of doing so.
@@ -211,7 +248,8 @@ void LibraryMedia::worker_main() {
     }
 }
 
-void LibraryMedia::load_one(const LoadRequest& req, bool bc, LoadResult& out) {
+void LibraryMedia::load_one(const LoadRequest& req, bool bc, int rate, int channels,
+                            LoadResult& out) {
     const std::string& root = req.root;
     for (const BackgroundCandidate& cand : req.want_background ? background_candidates(root, bc)
                                                                : std::vector<BackgroundCandidate>{}) {
@@ -227,7 +265,14 @@ void LibraryMedia::load_one(const LoadRequest& req, bool bc, LoadResult& out) {
                                    bytes.begin() + static_cast<ptrdiff_t>(img.data_offset + img.data_size));
             out.image_w = img.width;
             out.image_h = img.height;
-            out.image_format = img.srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+            // UNORM for both dxgiFormat 98 and 99. The block encoding is identical; the tag only says
+            // how the bytes should be interpreted. This pipeline has no sRGB framebuffer — the swapchain
+            // is B8G8R8A8_UNORM and neither ImGui nor the render pass re-encodes on write — and cover
+            // art already goes through R8G8B8A8_UNORM unmodified. Using BC7_SRGB_BLOCK would have the
+            // sampler decode sRGB->linear with nothing encoding it back, rendering an sRGB-tagged
+            // background visibly darker than a UNORM one and than the pic0.png fallback. init() also
+            // only probes the UNORM variant for support. CONFIDENCE: HIGH (pipeline is sRGB-free).
+            out.image_format = VK_FORMAT_BC7_UNORM_BLOCK;
             out.image_ok = true;
             break;
         }
@@ -259,6 +304,16 @@ void LibraryMedia::load_one(const LoadRequest& req, bool bc, LoadResult& out) {
     }
     // The container and the codec must agree about the superframe, or the cursor arithmetic below is
     // built on a number the decoder does not share. This has held on all 13 local tracks.
+    // The stream is opened once at a fixed rate and channel count, so a track that disagrees would be
+    // played through the wrong interleave or at the wrong pitch — plausible-sounding garbage rather than
+    // a clean failure, which is exactly what this file exists to avoid. All 13 local tracks are
+    // 48000 Hz stereo; anything else is refused loudly rather than mangled quietly.
+    if (dec.channels() != channels || static_cast<int>(clip.sample_rate) != rate ||
+        dec.sample_rate() != rate) {
+        fprintf(stderr, "[library] %s: %d Hz/%d ch does not match the launcher stream (%d Hz/%d ch)\n",
+                root.c_str(), dec.sample_rate(), dec.channels(), rate, channels);
+        return;
+    }
     if (dec.superframe_bytes() != static_cast<int>(clip.block_align) ||
         dec.superframe_samples() != static_cast<int>(clip.samples_per_block)) {
         fprintf(stderr, "[library] %s: superframe mismatch (%d/%u bytes, %d/%u samples)\n", root.c_str(),
@@ -266,6 +321,7 @@ void LibraryMedia::load_one(const LoadRequest& req, bool bc, LoadResult& out) {
         return;
     }
 
+    out.clip = clip;   // the truncation path below narrows this to what actually decoded
     const size_t blocks = clip.data_size / clip.block_align;
     const size_t perBlock = static_cast<size_t>(dec.superframe_samples()) * dec.channels();
     out.pcm.resize(blocks * perBlock);
@@ -281,11 +337,17 @@ void LibraryMedia::load_one(const LoadRequest& req, bool bc, LoadResult& out) {
             fprintf(stderr, "[library] %s: ATRAC9 decode stopped at superframe %zu/%zu\n",
                     root.c_str(), b, blocks);
             out.pcm.resize(b * perBlock);
+            // The clip still describes the whole file, so its loop points and total_frames() would walk
+            // over frames that were never decoded — silence on every pass, or permanent silence if the
+            // loop starts beyond what survived. Bound both to what actually decoded.
+            const uint64_t have = static_cast<uint64_t>(b) * dec.superframe_samples();
+            out.clip.data_size = b * clip.block_align;
+            if (out.clip.loop.ok && (out.clip.loop.start >= have || out.clip.loop.end >= have))
+                out.clip.loop = At9Loop{};
             break;
         }
     }
     if (out.pcm.empty()) return;
-    out.clip = clip;
     out.music_ok = true;
 }
 
@@ -301,10 +363,9 @@ void LibraryMedia::set_focus(const std::string& app0_root, uint64_t now_ms) {
 void LibraryMedia::start_load(const std::string& root, uint64_t now_ms) {
     ++generation_;
     ++loadsStarted_;
-    if (const char* s = SDL_getenv("PROSPER_LIBRARY_STATS"))
-        if (*s && s[0] != '0')
-            fprintf(stderr, "[library] load #%llu gen=%llu %s\n", (unsigned long long)loadsStarted_,
-                    (unsigned long long)generation_, root.c_str());
+    if (stats_enabled())
+        fprintf(stderr, "[library] load #%llu gen=%llu %s\n", (unsigned long long)loadsStarted_,
+                (unsigned long long)generation_, root.c_str());
 
     // Begin the transition NOW, in parallel with the load, so the load latency hides behind the
     // fade-out instead of adding to it. Worst measured decode is ~103 ms against a 200 ms fade.
@@ -320,7 +381,11 @@ void LibraryMedia::start_load(const std::string& root, uint64_t now_ms) {
         visible = s.old_alpha > 0.0f ? s.old_alpha : s.new_alpha;
         // Whatever is on screen becomes the thing that fades out.
         outgoingRoot_ = s.old_alpha > 0.0f ? outgoingRoot_ : shownRoot_;
-        if (outgoing_ == nullptr || s.old_alpha <= 0.0f) outgoing_ = std::move(current_);
+        // Only the AUDIBLE track becomes the outgoing one. During a fade-out, new_alpha is zero by the
+        // sequential-fade invariant, so current_ has never been heard; promoting it (which the old
+        // `outgoing_ == nullptr` case did when the previous title was silent) would back-date it to the
+        // current visible alpha and play a ~100 ms burst of a track that was never meant to sound.
+        if (s.old_alpha <= 0.0f) outgoing_ = std::move(current_);
     } else {
         outgoingRoot_ = shownRoot_;
         outgoing_ = std::move(current_);
@@ -329,8 +394,16 @@ void LibraryMedia::start_load(const std::string& root, uint64_t now_ms) {
     // Returning to a title whose track is still held? Resume it at its own cursor rather than decoding
     // it again and replaying its opening. This is what stops repeated stepping between two titles from
     // sounding like the same short tone over and over.
+    // Returning to the title that is still fading OUT cancels the transition instead of starting a new
+    // one against itself. Without this, arrowing away and straight back within the 200 ms fade-out makes
+    // the same track fade down and then restart from its opening — exactly the repeated-opening artifact
+    // the retained-track mechanism exists to prevent — while its art dips to black and returns without
+    // ever having left the screen.
     bool haveTrack = false;
-    if (musicOn_ && recent_ && recent_->root == root) {
+    if (musicOn_ && outgoing_ && outgoing_->root == root) {
+        current_ = std::move(outgoing_);
+        haveTrack = true;
+    } else if (musicOn_ && recent_ && recent_->root == root) {
         current_ = std::move(recent_);
         haveTrack = true;
     }
@@ -344,7 +417,15 @@ void LibraryMedia::start_load(const std::string& root, uint64_t now_ms) {
 
     // A cached background is available immediately; only the music still has to be fetched.
     const bool cached = cache_.find(root) != cache_.end();
-    if (cached) { incomingReady_ = true; readyMs_ = transitionMs_ + kFadeOutMs; }
+    if (cached) {
+        incomingReady_ = true;
+        readyMs_ = transitionMs_ + kFadeOutMs;
+        // Renew its LRU position. insert_background is the only other caller of lru_touch, so without
+        // this a re-focused title never moves and lru_ degrades into insertion order: focusing A,B,C
+        // then returning to A and moving to D evicts A — the background currently fading out — and the
+        // outgoing art pops instead of fading.
+        retire_evicted(lru_touch(lru_, root, kBackgroundCacheCapacity));
+    }
 
     LoadRequest req;
     req.generation = generation_;
@@ -395,11 +476,20 @@ void LibraryMedia::apply_result(std::unique_ptr<LoadResult> res, uint64_t now_ms
         if (r == UploadStart::failed) {
             // Genuinely no background for this title. The transition must still finish, or the view
             // would hold at nothing forever.
-            incomingReady_ = true;
-            readyMs_ = now_ms;
+            mark_incoming_ready(now_ms);
         }
         return;
     }
+    mark_incoming_ready(now_ms);
+}
+
+// Edge-triggered on purpose. fade_state_at derives the fade-in start from readyMs_, so re-stamping it
+// after the fade-in has already begun snaps the incoming background back to invisible and restarts the
+// ramp — and, because the music reads the same FadeState, ducks the track to silence and brings it up a
+// second time. That is reachable whenever a title's art is already cached but its music still has to be
+// decoded, which can outlast the 200 ms fade-out.
+void LibraryMedia::mark_incoming_ready(uint64_t now_ms) {
+    if (incomingReady_) return;
     incomingReady_ = true;
     readyMs_ = now_ms;
 }
@@ -545,21 +635,29 @@ void LibraryMedia::poll_upload(uint64_t now_ms) {
     const std::string root = pending_.root;
     pending_ = PendingUpload{};
 
-    if (root == shownRoot_) { incomingReady_ = true; readyMs_ = now_ms; }
-    if (const char* s = SDL_getenv("PROSPER_LIBRARY_STATS"))
-        if (*s && s[0] != '0')
-            // "the background for X is now on screen" — the only line that means a capture taken after
-            // it will actually contain that title's art.
-            fprintf(stderr, "[library] showing %s\n", root.c_str());
+    if (root == shownRoot_) mark_incoming_ready(now_ms);
+    // "X's upload finished" — NOT the same as X being on screen, which is the "drawing" line below.
+    if (stats_enabled()) fprintf(stderr, "[library] showing %s\n", root.c_str());
 }
 
 void LibraryMedia::insert_background(const std::string& root, const Background& bg) {
+    // Retire anything already under this key rather than overwriting it: unreachable on today's paths,
+    // which both check for a miss first, but an overwrite would silently leak an image and a descriptor.
+    auto existing = cache_.find(root);
+    if (existing != cache_.end()) {
+        retired_.push_back({existing->second, frameCounter_});
+        cache_.erase(existing);
+    }
     cache_[root] = bg;
-    for (const std::string& gone : lru_touch(lru_, root, kBackgroundCacheCapacity)) {
-        auto it = cache_.find(gone);
+    retire_evicted(lru_touch(lru_, root, kBackgroundCacheCapacity));
+}
+
+// Retired, not destroyed: an in-flight frame may still sample these. Freeing them here would need a
+// device wait, which is a measurable stall on exactly the frame the user moved the selection.
+void LibraryMedia::retire_evicted(const std::vector<std::string>& gone) {
+    for (const std::string& root : gone) {
+        auto it = cache_.find(root);
         if (it == cache_.end()) continue;
-        // Retired, not destroyed: an in-flight frame may still sample it. Freeing it here would need a
-        // device wait, which is a measurable stall on exactly the frame the user moved the selection.
         retired_.push_back({it->second, frameCounter_});
         cache_.erase(it);
     }
@@ -681,8 +779,10 @@ void LibraryMedia::update(uint64_t now_ms) {
         if (focusRoot_ != shownRoot_) start_load(focusRoot_, now_ms);
     }
 
-    claim_result(now_ms);
+    // Retire a finished upload BEFORE claiming a new result: otherwise a result arriving on the frame
+    // after the fence signalled still sees pending_.active and is deferred for no reason.
     poll_upload(now_ms);
+    claim_result(now_ms);
 
     if (transitionActive_) {
         const FadeState s = fade_state_at(transitionMs_, now_ms, incomingReady_, readyMs_);
@@ -702,8 +802,8 @@ void LibraryMedia::update(uint64_t now_ms) {
     // The "showing" line above only says an upload finished, which is not the same thing — the fade may
     // still be displaying the previous title, and a capture taken on that line alone can catch the
     // wrong art. This is the line a screenshot should be synchronized to.
-    if (const char* s = SDL_getenv("PROSPER_LIBRARY_STATS")) {
-        if (*s && s[0] != '0') {
+    if (stats_enabled()) {
+        {
             const Backdrop bd = backdrop();
             std::string drawn;
             if (bd.texture) {

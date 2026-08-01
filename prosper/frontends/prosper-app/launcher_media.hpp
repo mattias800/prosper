@@ -292,6 +292,10 @@ inline At9Clip parse_at9_riff(const std::string& bytes) {
     if (clip.channels == 0)    return fail("zero channels");
     if (clip.sample_rate == 0) return fail("zero sample rate");
     if (clip.block_align == 0) return fail("zero block align");
+    // A zero superframe would make total_frames() zero and every cursor computation meaningless. The
+    // runtime cross-checks this against the decoder anyway, but a parsed clip must never escape this
+    // function in a state where its own arithmetic is undefined.
+    if (clip.samples_per_block == 0) return fail("zero samples per superframe");
 
     dataSize -= dataSize % clip.block_align;          // whole superframes only
     if (dataSize == 0) return fail("no complete superframe in data");

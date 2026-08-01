@@ -161,6 +161,9 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     const float gain = resolve_launcher_music_gain(SDL_getenv("PROSPER_LAUNCHER_MUSIC_VOLUME"));
     if (!media_.init(phys_, device_, queue_, qfamily_, sampler_, musicToggle_, gain))
         fprintf(stderr, "[library] background art and music unavailable\n");
+    // Mirror the EFFECTIVE state, not the request: if the audio device could not be opened the checkbox
+    // must show unticked, or set_music_enabled() sees no change on the first click and swallows it.
+    musicToggle_ = media_.music_enabled();
     return true;
 }
 
@@ -538,7 +541,9 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
                         (unsigned long long)frameCount_, ms);
             }
             if (ms > 33.3) ++frameOver33_;
-            if (frameSamples_.size() < 200000) frameSamples_.push_back(ms);
+            // Stops recording rather than evicting: percentiles over a bounded prefix are honest
+            // about what they cover, whereas a ring buffer silently redefines the window mid-run.
+            if (frameSamples_.size() < kMaxFrameSamples) frameSamples_.push_back(ms);
         }
         lastFrameNs_ = ns;
     }
