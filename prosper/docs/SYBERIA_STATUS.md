@@ -6,7 +6,8 @@ on #1619.
 
 Read **`## Ruled out`** below before repeating any experiment on the "right side of the frame is
 black" question. Seven hypotheses about that frame — including the one this document originally
-narrowed to — are dead: five falsified with evidence, two rejected as not-the-cause.
+narrowed to — are dead: four falsified with evidence, three rejected as not-the-cause or not
+established.
 
 ## Ruled out
 
