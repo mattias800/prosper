@@ -16,17 +16,34 @@ in the pipeline could see either one:
     has no notion that a column is a unique key. Other documents cite these rows BY NUMBER, so
     a duplicate silently redirects every such citation to an unrelated entry.
 
-TWO CLASSES OF CHECK, deliberately separated, because conflating them is a mistake this file
-was written with and corrected:
+HOW A BREAK IS TOLD FROM TWO LEGITIMATE TABLES. A proper Markdown table opens with a header
+row followed by a delimiter row (`|---|---|`). A fragment left behind by a stray blank line has
+no delimiter -- it is a continuation, not a table. So an all-pipe run WITHOUT a delimiter that
+directly follows a proper table, separated only by blank lines, is a break; two properly
+delimited tables in one file are not. This also catches a blank line between the delimiter and
+the first data row, which orphans the entire body.
 
-  STRUCTURE (always on) -- no blank or non-table line may interrupt a table. This is a fact
-  about Markdown and holds for every table in the repository.
+Fenced code blocks are skipped: this repository's docs paste tool output containing pipe
+characters, and this file's own defect example would otherwise fail the check that documents it.
 
-  SEQUENCE (--sequential, opt-in) -- the first column is a unique, ascending, gapless sequence
-  from 1. This is a CONVENTION of the trap table ("append, never renumber"), NOT a property of
-  numbered tables in general. Most numbered tables here lead with frame indices, draw ordinals
-  or submit numbers, where gaps and repeats are the correct content. Applying the sequence
-  rules to those would report hundreds of failures that are not defects.
+TWO CLASSES OF CHECK, deliberately separated:
+
+  STRUCTURE (always on) -- no blank line may split a table. A fact about Markdown, true of
+  every table in the repository.
+
+  SEQUENCE (--sequential, opt-in) -- the numbered column is unique, strictly ascending and
+  gapless. This is a CONVENTION of the trap table ("append, never renumber"), NOT a property of
+  numbered tables in general. Measured over the 77 tracked Markdown files: all 77 satisfy
+  structure, while of the 5 documents holding an all-numeric-first-column table only 2 satisfy
+  sequence -- the rest lead with frame indices, draw ordinals and submit numbers, where gaps and
+  repeats are the correct content. Applying sequence everywhere would report correct documents
+  as broken, and a check that fires on correct data gets deleted rather than heeded.
+
+  Two selector details, both from real documents here rather than from theory:
+    * The sequence is checked from its own first value, not from 1, because a genuine numbered
+      work list in this repo starts at 0 (EVERGATE_PERFORMANCE_HANDOFF_2026_07.md).
+    * A table qualifies only if EVERY body row is numbered. That same work list ends with a
+      `| Separate | ...` row, which is legitimate content and must not be read as a gap.
 
 Validates structure, never content, so neither class can rot as a table grows.
 """
@@ -38,47 +55,150 @@ import re
 import sys
 from pathlib import Path
 
-ROW = re.compile(r"^\|\s*(\d+)\s*\|")
-SEPARATOR = re.compile(r"^\|[\s:|-]+\|?\s*$")
+FENCE = re.compile(r"^\s*(```|~~~)")
+DELIMITER = re.compile(r"^\s*\|[\s:|-]+\|?\s*$")
+LEADING_NUMBER = re.compile(r"^\s*\|\s*(\d+)\s*\|")
 
 
-def check(path: Path, sequential: bool) -> list[str]:
-    """Return a list of problems; empty means the table is sound."""
+class Table:
+    """A maximal run of consecutive table lines, with 1-based source line numbers."""
+
+    def __init__(self, start: int, lines: list[str]) -> None:
+        self.start = start
+        self.lines = lines
+
+    @property
+    def proper(self) -> bool:
+        """True if this opens with a header + delimiter, i.e. it is a table rather than a fragment."""
+        return len(self.lines) >= 2 and bool(DELIMITER.match(self.lines[1]))
+
+    @property
+    def body(self) -> list[tuple[int, str]]:
+        """(line_no, text) for rows after the header and delimiter."""
+        skip = 2 if self.proper else 0
+        return [(self.start + i, l) for i, l in enumerate(self.lines)][skip:]
+
+    def numbered_rows(self) -> list[tuple[int, int]]:
+        out = []
+        for line_no, text in self.body:
+            m = LEADING_NUMBER.match(text)
+            if m:
+                out.append((line_no, int(m.group(1))))
+        return out
+
+    @property
+    def all_rows_numbered(self) -> bool:
+        rows = self.body
+        return bool(rows) and len(self.numbered_rows()) == len(rows)
+
+    @property
+    def header(self) -> str:
+        return self.lines[0].strip() if self.lines else ""
+
+
+def parse_tables(lines: list[str]) -> tuple[list[Table], set[int]]:
+    """Split into table runs, ignoring fenced code. Returns (tables, blank_line_numbers)."""
+    tables: list[Table] = []
+    blanks: set[int] = set()
+    fenced = False
+    run: list[str] = []
+    run_start = 0
+
+    for i, line in enumerate(lines, start=1):
+        if FENCE.match(line):
+            fenced = not fenced
+            if run:
+                tables.append(Table(run_start, run))
+                run = []
+            continue
+        if fenced:
+            continue
+        if line.lstrip().startswith("|"):
+            if not run:
+                run_start = i
+            run.append(line)
+            continue
+        if not line.strip():
+            blanks.add(i)
+        if run:
+            tables.append(Table(run_start, run))
+            run = []
+    if run:
+        tables.append(Table(run_start, run))
+    return tables, blanks
+
+
+def check(path: Path, sequential: bool, table_header: str | None) -> list[str]:
+    """Return a list of problems; empty means the tables are sound."""
     try:
-        lines = path.read_text(encoding="utf-8").split("\n")
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
         return [f"{path}: cannot read: {exc}"]
+    except UnicodeDecodeError as exc:
+        return [f"{path}: is not valid UTF-8: {exc}"]
 
-    numbered = [(i + 1, int(m.group(1))) for i, line in enumerate(lines) if (m := ROW.match(line))]
-    if not numbered:
-        # Not "the table is fine" -- the file we were pointed at has no numbered table at all,
-        # so the path is wrong or the format changed under us. Failing here is what stops this
-        # check from passing forever on a file it can no longer see.
-        return [f"{path}: no numbered table rows found -- wrong path, or the table format changed"]
+    lines = text.split("\n")
+    tables, blanks = parse_tables(lines)
+    if not tables:
+        # Under --sequential we were pointed at ONE specific table, so its absence means the path
+        # is wrong or the format changed, and failing here is what stops this check passing
+        # forever on a file it can no longer see. In a plain structure sweep across many
+        # documents, a file with no table is ordinary and must not be an error -- 35 of this
+        # repo's 77 Markdown files have none.
+        if sequential:
+            return [f"{path}: no Markdown tables found -- wrong path, or the table format changed"]
+        return []
 
     problems: list[str] = []
 
-    for (prev_line, prev_num), (this_line, this_num) in zip(numbered, numbered[1:]):
-        for k in range(prev_line, this_line - 1):
-            text = lines[k]
-            if not text.strip():
-                problems.append(
-                    f"{path}:{k + 1}: blank line between rows {prev_num} and {this_num} terminates "
-                    f"the Markdown table -- row {this_num} onward renders as a separate table. "
-                    f"Delete the blank line."
-                )
-            elif not text.startswith("|") and not SEPARATOR.match(text):
-                problems.append(
-                    f"{path}:{k + 1}: non-table line between rows {prev_num} and {this_num} "
-                    f"breaks the table: {text[:60]!r}"
-                )
+    # `origin` is the proper table the current run of fragments descends from. It must survive a
+    # fragment, because a table broken twice yields fragment-after-fragment: comparing only
+    # against the immediately preceding run would report the first break and silently miss every
+    # later one. The file that prompted this check had exactly that shape -- two breaks, and a
+    # first draft found one.
+    origin: Table | None = None
+    for previous, current in zip(tables, tables[1:]):
+        if previous.proper:
+            origin = previous
+        gap_start = previous.start + len(previous.lines)
+        contiguous = all(n in blanks for n in range(gap_start, current.start))
+        if current.proper or not contiguous:
+            if not contiguous:
+                origin = None  # separated by prose: whatever follows starts fresh
+            continue
+        if origin is None:
+            continue  # a fragment with no properly delimited table above it
+        for n in range(gap_start, current.start):
+            problems.append(
+                f"{path}:{n}: blank line splits the table that starts at line {origin.start} -- "
+                f"in Markdown a blank line ends a table, so line {current.start} onward renders "
+                f"as a separate table. Delete the blank line."
+            )
 
     if not sequential:
         return problems
 
+    candidates = [t for t in tables if t.proper and t.all_rows_numbered]
+    if table_header:
+        candidates = [t for t in candidates if table_header in t.header]
+    if not candidates:
+        return problems + [
+            f"{path}: --sequential found no numbered table"
+            + (f" whose header contains {table_header!r}" if table_header else "")
+        ]
+    if len(candidates) > 1:
+        # Ambiguous rather than guessed: checking the wrong table would report correct data as
+        # broken, and a check that fires on correct data gets deleted rather than heeded.
+        where = ", ".join(f"line {t.start}" for t in candidates)
+        return problems + [
+            f"{path}: --sequential is ambiguous -- {len(candidates)} numbered tables ({where}). "
+            f"Select one with --table-header."
+        ]
+
+    rows = candidates[0].numbered_rows()
     seen: dict[int, int] = {}
-    highest = 0
-    for line_no, num in numbered:
+    expected = rows[0][1]
+    for line_no, num in rows:
         if num in seen:
             problems.append(
                 f"{path}:{line_no}: duplicate row number {num} (first used at line {seen[num]}). "
@@ -88,27 +208,32 @@ def check(path: Path, sequential: bool) -> list[str]:
             )
             continue
         seen[num] = line_no
-        if num > highest + 1:
-            missing = ", ".join(str(n) for n in range(highest + 1, num))
+        if num > expected:
+            missing = ", ".join(str(n) for n in range(expected, num))
             problems.append(f"{path}:{line_no}: row numbers skip {missing} before reaching {num}")
-        elif num <= highest:
+        elif num < expected:
             problems.append(
                 f"{path}:{line_no}: row number {num} is out of ascending order "
-                f"(previous row was {highest})"
+                f"(previous row was {expected - 1})"
             )
-        highest = max(highest, num)
+        expected = max(expected, num + 1)
 
     return problems
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("paths", nargs="+", type=Path, help="Markdown files containing a numbered table")
+    ap.add_argument("paths", nargs="+", type=Path, help="Markdown files to check")
     ap.add_argument(
         "--sequential",
         action="store_true",
-        help="also require the first column to be unique, ascending and gapless from 1 "
-        "(a convention of the instrument-trap table, not of numbered tables generally)",
+        help="also require the numbered column to be unique, ascending and gapless (a convention "
+        "of the instrument-trap table, not of numbered tables generally)",
+    )
+    ap.add_argument(
+        "--table-header",
+        metavar="TEXT",
+        help="with --sequential, select the table whose header row contains TEXT",
     )
     ap.add_argument(
         "--github",
@@ -119,19 +244,26 @@ def main() -> int:
 
     problems: list[str] = []
     for path in args.paths:
-        problems.extend(check(path, args.sequential))
+        problems.extend(check(path, args.sequential, args.table_header))
 
     for problem in problems:
-        print(f"::error::{problem}" if args.github else f"error: {problem}", file=sys.stderr)
+        if args.github:
+            # GitHub decodes these three in annotation text; leaving them raw truncates messages.
+            escaped = problem.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print(f"::error::{escaped}")
+        else:
+            print(f"error: {problem}", file=sys.stderr)
 
     if problems:
         print(f"\n{len(problems)} problem(s) found.", file=sys.stderr)
         return 1
 
-    mode = "contiguous and unbroken" if args.sequential else "unbroken"
     for path in args.paths:
-        rows = sum(1 for line in path.read_text(encoding="utf-8").split("\n") if ROW.match(line))
-        print(f"{path}: {rows} rows, {mode}")
+        tables, _ = parse_tables(path.read_text(encoding="utf-8").split("\n"))
+        proper = [t for t in tables if t.proper]
+        rows = sum(len(t.body) for t in proper)
+        detail = "contiguous and unbroken" if args.sequential else "unbroken"
+        print(f"{path}: {len(proper)} table(s), {rows} rows, {detail}")
     return 0
 
 

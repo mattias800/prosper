@@ -75,6 +75,15 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   screen is black (83%), because `CB_DISABLE` is the depth/shadow prepass. Reading one phase alone yields a
   confident wrong answer. `--selftest` needs no capture. See `tools/colorstate/README.md`.
 - **`spv_validate/`** — `spirv-val` wrapper for recompiled SPIR-V.
+- **`docs/check_numbered_table.py`** — validate Markdown tables that other documents cite by row
+  number. Two classes: **structure** (always on) rejects a blank line that splits a table, which
+  in Markdown silently renders everything after it as a *separate* table; **`--sequential`**
+  (opt-in, plus `--table-header` to select one table) additionally requires the numbered column
+  to be unique, ascending and gapless. Sequence is a convention of the instrument-trap table
+  ("append, never renumber"), not a property of numbered tables — most here lead with frame or
+  draw ordinals where gaps are correct — so do not apply it broadly. Catches the case where two
+  branches append the same row number, which merges textually clean and green. Run by the CI
+  `Docs` job; `ctest -R doc_table_checker` covers the checker itself.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`hostprof/hostprof.py`** — poor-man's **native sampling profiler**: attach to a running process
   (pid or name), sample its threads via repeated `gdb` backtraces, and rank the hot leaf functions —

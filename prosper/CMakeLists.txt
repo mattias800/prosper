@@ -93,6 +93,12 @@ if(Python3_Interpreter_FOUND)
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/snapshot/test_snapshot.py")
   add_test(NAME gpu_replay_regress_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gpu_replay/test_regress.py")
+  # Half its cases are CORRECT shapes an earlier revision of the checker wrongly rejected. A doc
+  # check that fires on valid input gets deleted rather than heeded, so the false-positive cases
+  # are what keep it alive.
+  add_test(NAME doc_table_checker
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/docs/test_check_numbered_table.py")
 endif()
 # Path to the (gitignored) local game dump; override with -DGAME_DUMP=...
 set(GAME_DUMP "${CMAKE_SOURCE_DIR}/../PPSA24651-app0" CACHE PATH "Local PS5 game dump root")
