@@ -34,7 +34,7 @@ Last updated: 2026-07-31
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
-| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 Autosave notice and profile-select menu render after implementing `sceAgcAcbWriteData`; the menu's 3D scene layer composites black (#1619) |
+| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 **Gameplay** — title screen and the first playable scene render with real GPU draws on a validated route; the profile menu's 3D layer and the gameplay composite are degraded (#1619) |
 | *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🔬 Runs a healthy ~113 fps Unity frame loop with a real post chain, but the guest's own composite is empty |
 
 ¹ Exact retail game name pending confirmation.
@@ -481,6 +481,20 @@ post-processing runs**, so the base pass is where to look. Tracked on #1606.
 <p align="center">
   <img src="assets/screenshots/syberia-profile.png" alt="Syberia: Remastered — profile-select menu (the right portion of the frame is still black)">
 </p>
+
+<p align="center">
+  <img src="assets/screenshots/syberia-title.png" alt="Syberia: Remastered — title screen, Valadilène (Linux, screenshot frontend, scripts/syberia/reach-gameplay.pad)">
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/syberia-gameplay.png" alt="Syberia: Remastered — first playable scene, the Voralberg factory hall (Linux, screenshot frontend, scripts/syberia/reach-gameplay.pad)">
+</p>
+
+**Rung 3 — gameplay.** `prosper/scripts/syberia/reach-gameplay.pad` drives the profile-select menu
+into the title screen (t≈280 s) and the first playable scene (t≈312 s onward): Kate Walker in the
+Voralberg factory hall, the "Leave" interaction prompt, the "Use the left stick to move" tutorial and
+the pause HUD. The composite is degraded — a translucent ghost of another scene is blended over the
+middle of the frame and the image is over-dark — tracked with the menu defect on #1619.
 
 On unmodified master this title **hard-hung** at boot: 7 submits, 2 flips, one present, frozen
 forever. The cause was `sceAgcAcbWriteData` being unregistered and silently returning 0, so the

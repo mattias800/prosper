@@ -1,6 +1,8 @@
 # Syberia: Remastered (`PPSA30140`) — status and evidence
 
-Unity / IL2CPP, Microids / Virtuallyz Gaming. Rung 2 (title/profile-select menu rendered).
+Unity / IL2CPP, Microids / Virtuallyz Gaming. **Rung 3 — gameplay reached** with real GPU draws on a
+validated route (`scripts/syberia/reach-gameplay.pad`). Two composition defects remain, both tracked
+on #1619.
 
 Read this before repeating any experiment on the "right side of the frame is black" question. Three
 hypotheses about that frame are **falsified** below; do not re-run them.
@@ -19,6 +21,22 @@ PROSPER_RENDER=1`. No input is needed to reach the menu.
 | **183 s onward** | **settled.** Byte-identical for the next 57 s (`crc32=453d400c`, 107,936 distinct colours, 670,815 non-black px). |
 
 The settled frame is the one in `assets/screenshots/syberia-profile.png`.
+
+`scripts/syberia/reach-gameplay.pad` continues from there. It is **validated by the run that produced
+`assets/screenshots/syberia-title.png` and `assets/screenshots/syberia-gameplay.png`** — do not change
+it without re-running:
+
+| t | state |
+|---|---|
+| 186 s | first Cross; the profile-select menu accepts it |
+| 192–232 s | profile confirmation / transition |
+| ~280–292 s | **title screen** — Valadilène, the Voralberg factory exterior, "B. Sokal / Syberia Remastered" (85,652 colours, 1,734,739 non-black px) |
+| ~312 s onward | **gameplay** — Kate Walker in the factory hall, the "Leave" interaction prompt, the "Use the left stick to move" tutorial, the pause HUD (≈46,000–48,000 colours, 2,068,000+ non-black px, i.e. 99.7% of the frame) |
+
+Gameplay composition is **degraded**: a translucent ghost of another scene is blended over the middle
+of the frame and the image is over-dark. That is a second symptom on #1619 and is probably the same
+post-process/RTT family as the menu, but it has **not** been localized — treat it as a separate
+question until a capture says otherwise.
 
 ## The "right ~55% is black" question — answered
 
@@ -91,7 +109,46 @@ cache entry on a `color_plane` overlap.
 
 Draw 469 (order `1455541`) is the next consumer and reads black.
 
-### Candidate generic contract (next step — not yet proven)
+### Narrowed: `R11G11B10F` is missing from the compute write-back notifier
+
+`0x2110310000` is `fmt=122` = `R11G11B10_FLOAT` (`VK_FORMAT_B10G11R11_UFLOAT_PACK32`).
+`LiveTargetPixelFormat` (`src/gpu/gpu_execute.hpp:566`) has three members, and `R11G11B10Float` is
+plumbed through the snapshot reader (`live_renderer.cpp:699`), the direct GPU importer
+(`live_renderer.cpp:763`) and 16 sites in `frontends/shared/live_compute.cpp`.
+
+**One path was missed** — `set_live_target_image_written_notifier`, `live_renderer.cpp:811`:
+
+```cpp
+const VkFormat format =
+    write.format == prosper::gpu::LiveTargetPixelFormat::Rgba16Float
+        ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+```
+
+An `R11G11B10Float` write falls into the `else`, is reported as `VK_FORMAT_R8G8B8A8_UNORM`, fails
+`live_rtt_mirror_identity_matches` against the surface's real
+`VK_FORMAT_B10G11R11_UFLOAT_PACK32`, and returns early — so
+`restore_persistent_color_target_after_mirrored_write` never runs and `g_rtt[write.gpu_addr]` is never
+republished. The ordinary guest-write invalidation for the same storage write still erases the entry,
+which is the `cache_size` 19 -> 18 above.
+
+> **Contract.** Every `LiveTargetPixelFormat` a compute dispatch may import must round-trip through the
+> write-back notifier. A format the importer accepts but the notifier cannot name is reported as RGBA8,
+> fails the mirror-identity check, and silently leaves the target invalidated — the renderer's pixels
+> are then lost for every later consumer.
+
+Same class as Dead Cells #773 (native-format loss): RGBA16F was plumbed through this path, R11G11B10F
+was not. Map all three enumerators and fail closed on an unknown one, the way the importer at
+`live_renderer.cpp:757-764` already does; prefer a shared helper over a third inline ternary.
+
+`tests/test_game_compute.cpp` already drives `LiveTargetPixelFormat::R11G11B10Float` (lines 301, 358,
+2156). A regression should assert that a mirrored compute write to an R11G11B10F live target
+republishes the RTT entry and that the following sample reads the written pixels — and that it **fails**
+on current master while the RGBA8/RGBA16F equivalents pass, so the test proves the format gap rather
+than the general path.
+
+**Not yet done:** an A/B proving the frame composites correctly with the notifier fixed.
+
+### Earlier, broader framing (now the less likely of the two)
 
 > A renderer-owned colour target that a **compute** dispatch reads must be materialized from the
 > renderer's own copy before the dispatch runs. Today the graphics pass leaves the pixels only in the

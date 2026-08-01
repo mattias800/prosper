@@ -1,0 +1,25 @@
+# Syberia: Remastered (PPSA30140) - UNVALIDATED DRAFT, do not trust until a run proves it.
+# The profile-select menu settles at ~183 s on a Linux hardware-Vulkan boot (RADV, 1920x1080,
+# PROSPER_RENDER=1). Profile No.1 is preselected and shows the Cross prompt, so repeated
+# one-second Cross holds confirm it and advance any following prompt.
+186-187:cross
+192-193:cross
+198-199:cross
+204-205:cross
+210-211:cross
+216-217:cross
+222-223:cross
+228-229:cross
+234-235:cross
+240-241:cross
+248-249:cross
+256-257:cross
+264-265:cross
+272-273:cross
+280-281:cross
+290-291:cross
+300-301:cross
+310-311:cross
+320-321:cross
+330-331:cross
+340-341:cross
