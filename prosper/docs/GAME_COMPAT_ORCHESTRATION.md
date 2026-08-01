@@ -288,6 +288,33 @@ Generalising: prefer the instrument whose **negative result is exhaustive over a
 RIP-relative references) to one that pattern-matches an **open set** (all functions that might alias a
 pointer). When only the open-set instrument exists, its negative result is a hypothesis, not a finding.
 
+### Cross-title: the colour-state registers are decoded correctly — start elsewhere
+
+Two lanes independently established this, and both results killed a live hypothesis in a *different*
+lane. Recorded here rather than in either lane because the next agent to see a zero colour write mask
+will reach for the same explanation.
+
+**`MODE` decode is not remapped.** A tempting hypothesis on Astro Bot (#1459) was that prosper mis-maps
+the `CB_COLOR_CONTROL` `MODE` enum — its live trace never once observed `MODE=1 (CB_NORMAL)`, only modes
+0 and 6, which is not what an ordinary renderer looks like. **Blue Prince falsifies it**: that title
+writes `MODE=1 CB_NORMAL` and renders correctly through the same decode. Any remapping hypothesis now
+has to explain Blue Prince too, which no simple remap does.
+
+**`CB_COLOR_CONTROL` tracking is not lossy.** An Oregon Trail investigation measured the indirect
+register path directly: **~12,000 observed `CB_COLOR_CONTROL` writes**, `MODE=1` dominant at roughly
+**7:1**, and — joined on **each draw's own `command_order`** — **zero mismatches across all 1,050
+suppressed draws**. The register prosper believes is in force at a draw is the register the guest wrote.
+
+**So "prosper is misreading MODE" starts from a losing position.** When a draw resolves `cwm=0`, the
+productive question is **who wrote the zero and when**, not whether the decode is right.
+
+**The join is the trap in that second result, and it is worth its own line.** The same measurement read
+the *other* way — joining `PROSPER_REGWATCH` against `PROSPER_EXECLOG` by **stream adjacency** rather
+than by `command_order` — reported that 1,049 of 1,050 suppressed draws resolved against a **future**
+register write. Clean, compelling, and entirely false: the two instruments timestamp at different
+pipeline stages (REGWATCH at command-processor *decode*, EXECLOG at *realization*) and the phases
+interleave per submit. See instrument-trap 12; #1633's `order=` is what makes the honest join possible.
+
 ## The orchestration contract
 
 ### Orchestrator responsibilities
@@ -398,6 +425,17 @@ guest backtraces, boot progression — but **not** for anything whose result dep
 output. Validate it per investigation rather than assuming: on PPSA19244 the `NO_COMPUTE` arm was
 confirmed to reach the same steady state (same ~23 draws/submit, same asset set, same stall) as the
 compute-enabled arm before any conclusion was drawn from it.
+
+**A "sustained all-clear" needs a NUMBER, and 120 s is too short.** Waiting for a peer's GPU work to
+finish by checking that all five process names (`prosper-app boot_trace gpu_replay screenshot
+screenshot_snap`, plus `/proc/<pid>/cwd` to attribute them) are clear is correct, but a *point-in-time*
+check is worthless and a short window is nearly as bad: a lane running back-to-back captures has gaps
+between its runs, and a window that fits inside one reports a false all-clear. Measured 2026-08-01: a
+waiter requiring **120 s continuously clear** declared SUSTAINED ALL-CLEAR at 12:18:33 and the routes
+lane's `screenshot_snap` was back **within seconds** — the window had fitted inside one inter-run gap.
+
+Require **300 s minimum continuously clear** against a lane doing sequential capture runs, reset the
+streak on **any** busy sample, and log what reset it so the wait is auditable rather than a guess.
 
 So the honest classification is:
 

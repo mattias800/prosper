@@ -1,0 +1,20 @@
+# Astro Bot (PPSA21564): flip-anchored route to the WORLD MAP under headless boot_trace.
+#
+# reach-first-level.pad is calibrated for a frontend that flips far more slowly per wall-second than
+# headless boot_trace does: its wall-time pulses are all spent by 96 s while the run is only near
+# frame 1100, so its f3800+ anchors are never reached and the guest stalls at title_controller_ship.
+# This route uses the f730-960 pacing the retained world-map captures were produced with, and stops
+# at the world map rather than continuing into a level.
+#
+# Verify against PROSPER_PAD_SCRIPT_LOG=1 and the observed flip counter before reusing on another
+# frontend — pacing, not button order, is what makes a route frontend-specific.
+f730-760:cross
+f780-810:cross
+f830-860:options
+f880-910:cross
+f930-960:cross
+f980-1010:options
+f1030-1060:cross
+f1080-1110:cross
+f1130-1160:options
+f1180-1210:cross
