@@ -409,8 +409,17 @@ constexpr uint32_t CB_COLOR_CONTROL_MODE_SHIFT = 4;
 constexpr uint32_t CB_COLOR_CONTROL_MODE_MASK  = 0x7;
 constexpr uint32_t CB_COLOR_CONTROL_MODE_DISABLE = 0;
 constexpr uint32_t CB_COLOR_CONTROL_MODE_NORMAL = 1;
+// Decompression/expansion pass over an already-rendered surface: hardware expands the stored
+// fast-clear color into real texels and IGNORES the bound pixel shader's export. prosper still
+// executes it as an ordinary color draw; that gap is #1588, blocked on #1706.
+constexpr uint32_t CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR = 2;
 constexpr uint32_t CB_COLOR_CONTROL_MODE_RESOLVE = 3;   // hardware MSAA resolve (color0 MSAA -> color1)
 constexpr uint32_t CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS = 6;
+// Values 4 and 5 of the same 3-bit field are further decompress operations in the published enum;
+// 7 is not defined there at all. prosper has no title exercising any of the three, so they are
+// deliberately left unnamed rather than guessed at — and for the same reason this comment does not
+// assert what they do. CONFIDENCE: MED that 4 and 5 are decompress modes (published enum, no title
+// evidence here); LOW for 7, which may be reserved.
 constexpr uint32_t CB_COLOR_CONTROL_ROP3_SHIFT = 16;
 constexpr uint32_t CB_COLOR_CONTROL_ROP3_MASK  = 0xFF;
 constexpr uint32_t PA_CL_CLIP_CNTL                                 = 0x204;

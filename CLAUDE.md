@@ -365,6 +365,37 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   **Do NOT add "Generated with Claude Code" attribution lines** (the 🤖 badge, "Generated with
   [Claude Code](...)" footers, session links) to PR bodies, commit messages, issue text, or
   comments — anywhere. They are noise in the project record; the co-author trailer alone is enough.
+  - **This one needs an explicit check, because the harness fights it.** Several agents run here with a
+    default that appends a `Claude-Session: https://claude.ai/code/session_…` trailer to every commit
+    message; this rule overrides that default, but the default is silent and re-applies on every commit,
+    so following the rule by intention alone does not work. Measured per-commit on 2026-08-01:
+    **29 of the last 100 commits on `master`** carry one.
+    ```bash
+    # Gate before pushing — answers "any?", expect 0. `grep -c` exits 1 on zero matches, so never
+    # put it in an `&&` chain.
+    git log origin/master..HEAD --format=%B | grep -c '^Claude-Session:'
+
+    # How many COMMITS carry one — a different question, and the one to quote as a statistic.
+    git log origin/master -100 --format=%H | while read h; do
+        git log -1 --format=%B "$h" | grep -q '^Claude-Session:' && echo "$h"; done | wc -l
+    ```
+    **The two commands disagree, systematically and always in the same direction.** Over the same
+    100-commit window the first returns **63** and the second **29**. `%B` is the *body*, and a
+    **squash merge concatenates the bodies of every commit it absorbs**, so one squashed commit
+    routinely carries several trailers — `grep -c` over `%B` counts trailers, not commits, and
+    over-reports on any squash-merged history. The distribution proves the mechanism rather than
+    merely fitting it: of the 29, sixteen carry one trailer, four carry two, five carry three, and
+    one each carry four, five, seven and eight — which sums to exactly the 63 lines. The first form
+    is still exactly right as a zero-gate; it is only wrong when read as a commit count. The gap
+    widens on shorter windows, where a single large squash dominates: over the last **20** commits
+    the line form reads **25** against a true **11**. All figures measured 2026-08-01.
+    Keep `Co-Authored-By:`. **If the count is non-zero, amending is not enough** — the trailer is on
+    commits you already made and the harness re-adds it to the fixup. `git filter-branch` is not
+    available here. Two recipes that do work: `git rebase <base> --exec '<amend with a cleaned
+    message>'` (the exec runs outside the harness), or rebuild the branch —
+    `git checkout -b <slug>-clean <base>`, then per commit `git cherry-pick -n <sha>` followed by
+    `git commit -F <message-with-the-line-stripped>`. Verify with `git diff <old-head> HEAD` over the
+    paths you touched (expect empty), then `git push --force-with-lease`.
 - **Never publish the developer machine's local paths.** This repository is public. An absolute path
   leaks the account name and the private directory layout of someone's computer, and it is never the
   information a reader needs — the *shape* of the command is. So keep absolute host paths out of commit

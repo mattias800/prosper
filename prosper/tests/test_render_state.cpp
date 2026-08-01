@@ -753,19 +753,113 @@ int main() {
         CHECK(resolve_pipeline_state(dcc).color_write_mask == 0xFu,
               "DCC decompress keeps its helper-program handling outside state resolution");
 
-        RenderState unsupported2 = absent;
-        unsupported2.has_cb_color_control = true;
-        unsupported2.cb_color_control = 2u << P::CB_COLOR_CONTROL_MODE_SHIFT;  // ELIMINATE_FAST_CLEAR
-        RenderState unsupported5 = unsupported2;
-        unsupported5.cb_color_control = 5u << P::CB_COLOR_CONTROL_MODE_SHIFT;  // still unmodeled
+        // #1588 item 2: the unmodeled-mode report is COUNTABLE, not deduped per mode value. The old
+        // assertion here checked `occurrence_count(..., "MODE=2 ") == 1` — i.e. the dedupe itself —
+        // so a run in which one draw hit the path was indistinguishable from one in which hundreds
+        // of thousands did, and #1588 had to be sized from a separate PROSPER_COLORSTATETRACE run.
+        //
+        // Deliberately NOT asserted here: what these modes do to the draw. prosper still executes
+        // them as ordinary colour draws, that is the open defect (#1588, blocked on #1706), and
+        // pinning it would make the eventual fix read as a regression. The old assertion's message
+        // claimed "while retaining fallback behavior" while testing only the log, which is exactly
+        // the vacuous half this replaces; the behavioural contract belongs with the fix.
+        //
+        // Mode 7 is untouched by every other check in this file, so its counter starts at zero and
+        // pins the print schedule exactly: reports land at counts 1, 2 and 4, each carrying its own
+        // running count, while the counter records all five occurrences.
+        CHECK(unmodeled_cb_color_mode_count(7u) == 0u,
+              "mode 7 is unused earlier in this process (precondition for the schedule assertion)");
+        RenderState unsupported7 = absent;
+        unsupported7.has_cb_color_control = true;
+        unsupported7.cb_color_control = 7u << P::CB_COLOR_CONTROL_MODE_SHIFT;
         const std::string mode_diagnostics = capture_stderr([&] {
-            (void)resolve_pipeline_state(unsupported2);
-            (void)resolve_pipeline_state(unsupported2);
-            (void)resolve_pipeline_state(unsupported5);
+            for (int i = 0; i < 5; ++i) (void)resolve_pipeline_state(unsupported7);
         });
-        CHECK(occurrence_count(mode_diagnostics, "MODE=2 ") == 1u &&
-                  occurrence_count(mode_diagnostics, "MODE=5 ") == 1u,
-              "unmodeled CB modes log once per distinct value while retaining fallback behavior");
+        CHECK(occurrence_count(mode_diagnostics, "MODE=7 ") == 3u &&
+                  occurrence_count(mode_diagnostics, "count=1)") == 1u &&
+                  occurrence_count(mode_diagnostics, "count=2)") == 1u &&
+                  occurrence_count(mode_diagnostics, "count=4)") == 1u &&
+                  unmodeled_cb_color_mode_count(7u) == 5u,
+              "unmodeled-mode reports are power-of-two spaced with an exact running count, and the "
+              "counter records every occurrence rather than the printed lines");
+
+        // The counter is per-mode, not a single total: a report for one value must not advance
+        // another's count, or a per-title census cannot attribute exposure to a mode. The second
+        // clause is what makes this discriminating — a single shared counter would still satisfy
+        // the mode-2 delta on its own — so keep the pair together if this is ever edited.
+        //
+        // All four unmodeled values are exercised. The predicate is exclusion-based, so 4 and 5 are
+        // covered by construction, but the block this replaced exercised 2 and 5 and it costs one
+        // loop to keep every value that reaches this path under test rather than reasoned about.
+        const uint64_t before2 = unmodeled_cb_color_mode_count(2u);
+        const uint64_t before4 = unmodeled_cb_color_mode_count(4u);
+        const uint64_t before5 = unmodeled_cb_color_mode_count(5u);
+        (void)capture_stderr([&] {
+            for (uint32_t mode : {P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR, 4u, 5u}) {
+                RenderState unmodeled = absent;
+                unmodeled.has_cb_color_control = true;
+                unmodeled.cb_color_control = mode << P::CB_COLOR_CONTROL_MODE_SHIFT;
+                (void)resolve_pipeline_state(unmodeled);
+                (void)resolve_pipeline_state(unmodeled);
+            }
+        });
+        CHECK(unmodeled_cb_color_mode_count(2u) - before2 == 2u &&
+                  unmodeled_cb_color_mode_count(4u) - before4 == 2u &&
+                  unmodeled_cb_color_mode_count(5u) - before5 == 2u &&
+                  unmodeled_cb_color_mode_count(7u) == 5u,
+              "each unmodeled mode counts independently of the others");
+
+        // The SCHEDULE must be per-mode too, not just the totals — otherwise one mode's traffic
+        // moves another's print points and a busy title silences a rare mode entirely. Mode 7 sat at
+        // 5; three more resolves reach 8 and must print exactly once. Six unmodeled resolves for
+        // other modes happened in between, so a single shared schedule counter would be at 14 here
+        // and print nothing. That is the arm this assertion exists for: without it, a shared
+        // schedule counter passes the whole block, because mode 7 is resolved first and its early
+        // ordinals coincide with the global ones.
+        //
+        // The `>= 6u` clause is the load-bearing one and is NOT redundant with the comment above it.
+        // Moving the mode-2/4/5 block below this one is the single edit that would let a shared
+        // counter run 5 -> 6, 7, 8, print `count=8)`, and leave this assertion **passing while no
+        // longer discriminating** — every other edit class fails loudly. Prose does not survive a
+        // reorder, so the dependency is asserted mechanically rather than described.
+        const std::string mode7_resumed = capture_stderr([&] {
+            for (int i = 0; i < 3; ++i) (void)resolve_pipeline_state(unsupported7);
+        });
+        CHECK(unmodeled_cb_color_mode_count(2u) + unmodeled_cb_color_mode_count(4u) +
+                      unmodeled_cb_color_mode_count(5u) >= 6u &&
+                  occurrence_count(mode7_resumed, "count=8)") == 1u &&
+                  occurrence_count(mode7_resumed, "MODE=7 ") == 1u &&
+                  unmodeled_cb_color_mode_count(7u) == 8u,
+              "the power-of-two schedule is per-mode, not shared across modes");
+
+        // The three modeled modes must never reach the report — a false positive here would make a
+        // per-title census unusable, since NORMAL and DISABLE are the overwhelming majority.
+        const uint64_t before0 = unmodeled_cb_color_mode_count(0u);
+        const uint64_t before1 = unmodeled_cb_color_mode_count(1u);
+        const uint64_t before3 = unmodeled_cb_color_mode_count(3u);
+        const uint64_t before6 = unmodeled_cb_color_mode_count(6u);
+        const std::string modeled_diagnostics = capture_stderr([&] {
+            for (uint32_t mode : {P::CB_COLOR_CONTROL_MODE_DISABLE, P::CB_COLOR_CONTROL_MODE_NORMAL,
+                                  P::CB_COLOR_CONTROL_MODE_RESOLVE,
+                                  P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS}) {
+                RenderState modeled = absent;
+                modeled.has_cb_color_control = true;
+                modeled.cb_color_control = mode << P::CB_COLOR_CONTROL_MODE_SHIFT;
+                (void)resolve_pipeline_state(modeled);
+            }
+        });
+        // The four counter deltas are the real contract here: they are text-independent, so they
+        // cannot go vacuous. The string clause is a second look at the same fact, and it CAN go
+        // vacuous on its own — a message reworded to, say, "COLOR_MODE=%u" would keep the schedule
+        // assertion's "MODE=7 " passing while silently dropping this anchor. That is acceptable only
+        // because the deltas beside it do not depend on any text; do not let the string clause stand
+        // alone if this CHECK is ever split.
+        CHECK(modeled_diagnostics.find("CB_COLOR_CONTROL.MODE=") == std::string::npos &&
+                  unmodeled_cb_color_mode_count(0u) == before0 &&
+                  unmodeled_cb_color_mode_count(1u) == before1 &&
+                  unmodeled_cb_color_mode_count(3u) == before3 &&
+                  unmodeled_cb_color_mode_count(6u) == before6,
+              "DISABLE, NORMAL, RESOLVE and DCC_DECOMPRESS are never reported or counted");
 
         // MODE=RESOLVE(3) is a modeled hardware MSAA resolve: resolve_pipeline_state flags cb_resolve so
         // the live backend copies color0->color1, and it is NOT warned as unmodeled. Would fail before the

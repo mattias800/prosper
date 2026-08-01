@@ -48,19 +48,43 @@ int32_t scale_scissor_boundary(int32_t value, float scale, bool lower) {
         static_cast<double>(std::numeric_limits<int32_t>::max())));
 }
 
-void warn_unsupported_cb_color_mode(uint32_t mode) {
-    static std::mutex mutex;
-    static uint32_t seen_modes = 0;
-    bool first = false;
-    {
-        std::lock_guard lock(mutex);
-        const uint32_t bit = 1u << (mode & P::CB_COLOR_CONTROL_MODE_MASK);
-        first = (seen_modes & bit) == 0;
-        seen_modes |= bit;
-    }
-    if (first)
-        fprintf(stderr, "[gpu] resolve_pipeline_state: unsupported CB_COLOR_CONTROL.MODE=%u "
-                        "-> ordinary draw fallback\n", mode);
+// CB_COLOR_CONTROL.MODE selects what the color block DOES with a rasterized primitive, and only
+// NORMAL blends the bound pixel shader's color export into the target. prosper models three of the
+// other values as their own operation: DISABLE suppresses color writes, RESOLVE becomes cb_resolve,
+// and DCC_DECOMPRESS keeps the AGC helper-program handling in gpu_execute.hpp. Every REMAINING
+// value of the 3-bit field is reported here. ELIMINATE_FAST_CLEAR(2) is a color-block metadata
+// operation that hardware performs INSTEAD of shading and prosper still runs as an ordinary color
+// draw — that gap is #1588. Values 4, 5 and 7 are grouped with it because they are simply "not one
+// of the four prosper models", NOT because their operation is known: 4 and 5 are decompress modes
+// in the published enum, 7 is not defined there, and no title here exercises any of them.
+bool cb_mode_is_unmodeled_metadata_operation(uint32_t mode) {
+    return mode != P::CB_COLOR_CONTROL_MODE_DISABLE &&
+           mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
+           mode != P::CB_COLOR_CONTROL_MODE_RESOLVE &&
+           mode != P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS;
+}
+
+std::atomic<uint64_t> g_unmodeled_cb_mode_counts[P::CB_COLOR_CONTROL_MODE_MASK + 1u];
+
+void report_unmodeled_cb_color_mode(uint32_t mode) {
+    const uint64_t count =
+        ++g_unmodeled_cb_mode_counts[mode & P::CB_COLOR_CONTROL_MODE_MASK];
+    // This line used to dedupe on a bitmask of modes already seen, so a whole run emitted exactly
+    // one line per distinct value and "once" was indistinguishable from "hundreds of thousands".
+    // #1588 therefore had to be sized from a separate PROSPER_COLORSTATETRACE run — the same
+    // under-reporting recorded as instruments #9 and #13 in docs/GAME_COMPAT_ORCHESTRATION.md.
+    // Print at powers of two so the volume stays bounded on a title that does this every frame, and
+    // carry the count in EVERY line, so a printed number is that occurrence's exact ordinal rather
+    // than an unreadable cap. It is NOT the total: the highest ordinal printed is a lower bound on
+    // it, and because draws realize on parallel workers the lines can also arrive out of order. Use
+    // unmodeled_cb_color_mode_count() for the total — that is what makes per-title exposure
+    // measurable for #1706. The atomic pre-increment gives every caller a distinct value, so no
+    // power-of-two line is duplicated or lost when threads race here.
+    if ((count & (count - 1u)) == 0u)
+        fprintf(stderr, "[gpu] resolve_pipeline_state: CB_COLOR_CONTROL.MODE=%u is an unmodeled "
+                        "color-block metadata operation -> still executed as an ordinary color "
+                        "draw (#1588; count=%llu)\n",
+                mode, static_cast<unsigned long long>(count));
 }
 
 // sRGB (gamma-encoded) 8-bit sample -> linear [0,1]. VkClearColorValue's float channels are LINEAR
@@ -94,6 +118,10 @@ bool decode_clear_color(uint32_t format, uint32_t number_type, uint32_t comp_swa
     return false;  // unmapped format -> caller uses opaque-black fallback
 }
 }  // namespace
+
+uint64_t unmodeled_cb_color_mode_count(uint32_t mode) {
+    return g_unmodeled_cb_mode_counts[mode & P::CB_COLOR_CONTROL_MODE_MASK].load();
+}
 
 RenderState extract_render_state(const GpuState& st) {
     RenderState rs;
@@ -799,9 +827,8 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
             // MSAA resolve: color0 (MSAA source) -> color1 (single-sample dest). The live backend copies
             // the already-rendered color0 surface into color1 instead of running these as ordinary draws.
             ps.cb_resolve = true;
-        } else if (cb_mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
-                   cb_mode != P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS) {
-            warn_unsupported_cb_color_mode(cb_mode);
+        } else if (cb_mode_is_unmodeled_metadata_operation(cb_mode)) {
+            report_unmodeled_cb_color_mode(cb_mode);
         }
     }
 

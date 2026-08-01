@@ -219,6 +219,28 @@ title-visibility blocker.
 
 ## The flashing white screen and the UI noise block are one defect: `CB_COLOR_CONTROL.MODE=2` (#1588)
 
+> **Diagnosed and NOT yet fixed. Blocked on #1706 — read that before attempting the fix.**
+>
+> The obvious fix is to stop the bound pixel shader's export reaching the target for `MODE=2`, and an
+> offline A/B (#1695) confirms it restores the correct frame. It is **not safe to key on `MODE` alone**:
+> #1706 established that prosper's decoded `CB_COLOR_CONTROL.MODE` is not per-draw-trustworthy. Astro Bot
+> submit 6174 has four draws all reporting `mode=2`, of which **two are ordinary shaded draws** — one
+> blended into two MRTs with a 3,107-dword VS and a vertex buffer — so suppressing on the mode drops real
+> geometry from another title. `gpu_execute.hpp` already works around the same latch for `MODE=6` by
+> matching helper-program content. Fix the tracking (#1706), then this fix is correct as written.
+>
+> Landed meanwhile: `MODE=2` is now named in `pm4_registers.hpp`, and the once-per-mode warning is a
+> counted report (powers of two, exact running count, `unmodeled_cb_color_mode_count()`), so per-title
+> exposure is measurable instead of being inferred from a line that could not distinguish one occurrence
+> from hundreds of thousands.
+>
+> **`gpu_replay` cannot demonstrate this fix.** Both `--bundle` and `.prgcap` go through
+> `materialize_gpu_replay`, which binds the **stored** `ResolvedPipelineState` — the `d.ps = x.ps` line in
+> its draw loop (`gpu_capture.cpp`, line 3405 as of `37768edc`; grep the assignment rather than the line
+> number, it drifts) — so replay never re-runs `resolve_pipeline_state` and a change there is invisible to it.
+> That is why #1695's A/B lever had to sit in `gpu_replay`'s `main()`. Verify in a live run or in
+> `tests/test_pipeline_render.cpp`, not by replaying an artifact.
+
 **Read this before any further work on this title's composition.** It supersedes the "final Slate quad"
 line of investigation below, which was chasing an ordinary draw that is not ordinary.
 
@@ -241,9 +263,15 @@ Each submit contains **exactly two `mode=2` draws** — draw-scoped census `mode
 
 `MODE=2` is `CB_ELIMINATE_FAST_CLEAR`, a colour-block metadata operation. `render_state.cpp` models
 DISABLE(0), NORMAL(1), RESOLVE(3) and DCC_DECOMPRESS(6) and lets every other mode **fall through to an
-ordinary draw** after a once-per-mode warning (`[gpu] resolve_pipeline_state: unsupported
-CB_COLOR_CONTROL.MODE=2 -> ordinary draw fallback`, present in the session log). The only downstream
-consumer of `cb_color_mode` is a diagnostic print, so nothing rescues it later.
+ordinary draw**. The only downstream consumer of `cb_color_mode` is a diagnostic print, so nothing
+rescues it later.
+
+> **The log line quoted here is historical.** At the time of this investigation the warning read
+> `[gpu] resolve_pipeline_state: unsupported CB_COLOR_CONTROL.MODE=2 -> ordinary draw fallback` and
+> was deduped once per mode value. **That string no longer exists in the tree** — grepping a fresh
+> run's log for it finds nothing. The current report names the mode, says it is still executed as an
+> ordinary colour draw, and carries a running count; the exact per-mode total is available from
+> `unmodeled_cb_color_mode_count()`. The *behaviour* described above is unchanged.
 
 The draws carry hardware's decompress signature, which is why the fall-through is destructive:
 
@@ -267,10 +295,14 @@ frame — and the title double-buffers its scanout. In the white grab the two bu
 are one correct System Settings screen (7,410 distinct colours) and one **single-colour pure white** plane,
 which is the buffer that submit renders into. That is the flashing.
 
-`tests/test_render_state.cpp` currently **asserts the fall-through** for MODE=2 and MODE=5 ("unmodeled CB
-modes log once per distinct value while retaining fallback behavior"). A correct fix must update that
-block, and it is the natural home for the regression — state this in the PR, because a test that pins the
-buggy behaviour makes a correct fix look like a regression to anyone who does not read it.
+`tests/test_render_state.cpp` used to assert `occurrence_count(..., "MODE=2 ") == 1` under the message
+"unmodeled CB modes log once per distinct value while retaining fallback behavior". That asserted the
+**log-dedupe mechanism**, never the draw behaviour, and its "retaining fallback behavior" clause was not
+tested at all. The history settles the intent: #919 introduced the block over modes **2 and 3** as
+stand-ins for "not implemented yet", and #1238 then implemented MODE=3, moved the placeholder to **5**,
+and gave 3 its own behavioural assertion. So it was an accidental pin, not a contract — the same
+migration is due for 2. The block now asserts the counted-report contract and deliberately does **not**
+pin what these modes do to the draw, so the eventual fix will not read as a regression.
 
 ## Superseded analysis — read this before trusting the sections above
 
