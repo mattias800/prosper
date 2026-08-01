@@ -111,8 +111,8 @@ jobs:
       # hypothetical: the first revision of the parser read 0 of the 187 messages produced here,
       # because layers 1.3.275 frame a message differently from 1.4.341.
       #
-      # Measured cost on this runner's configuration, over two container runs: 17.0-24.0 s without
-      # the layer, 33.2-34.0 s with it. The layer package lives in noble/universe.
+      # Measured cost on this runner: ctest reports 30.46 s without the layer and 31.08 s with it,
+      # so this step is ~31 s of wall clock. The layer package lives in noble/universe.
       - name: Vulkan validation scan
         run: |
           python3 prosper/tools/vkval/vk_validation_scan.py --build-dir prosper/build-ci

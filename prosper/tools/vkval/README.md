@@ -102,11 +102,14 @@ subsets of the same set of defects.
 
 ## Cost
 
-Measured on the CI runner's exact configuration (Ubuntu 24.04, Mesa 25.2.8 lavapipe, reproduced with
-`podman run --rm ubuntu:24.04`), over two runs of the same image: the full ctest suite takes
-**17.0-24.0 s** without the layer and **33.2-34.0 s** with it, everything passing either way. So the
-guard roughly doubles a test phase that is already a small fraction of a job spending minutes
-compiling — cheap enough to run on every PR rather than on a schedule.
+Measured on the real GitHub runner (`actions/runs/30719139452`, Linux job): ctest reports
+**30.46 s** without the layer and **31.08 s** with it, 168/168 passing either way, so the scan step
+costs **31 s** of wall clock on a job that spends minutes compiling. Cheap enough to run on every PR
+rather than on a schedule.
+
+The same suite in `podman run --rm ubuntu:24.04` on a faster machine takes 17.0-24.0 s plain and
+33.2-34.0 s under the layer, i.e. the layer's *relative* cost is larger the faster the box. Neither
+figure is close to needing a dedicated job.
 
 ## Reproducing the CI environment locally
 
