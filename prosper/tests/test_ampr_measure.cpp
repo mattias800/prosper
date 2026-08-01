@@ -51,6 +51,7 @@ int main() {
     HleFn get_size       = Hle::lookup("tZDDEo2tE5k");
     HleFn get_offset     = Hle::lookup("GnxKOHEawhk");
     HleFn submit         = Hle::lookup("ASoW5WE-UPo");
+    HleFn submit_plain   = Hle::lookup("eE4Szl8sil8");
     HleFn destruct       = Hle::lookup("GuchCTefuZw");
     HleFn add_ampr_event = Hle::lookup("bBfz7kMF2Ho");
     HleFn read_file     = Hle::lookup("vWU-odnS+fU");
@@ -203,6 +204,42 @@ int main() {
         CHECK(unbound_out1 && unbound_out1 == unbound_out2,
               "reconstructed command buffer is unbound after PS5 3.20 destruction");
         delete_eq(replacement_eq, 0, 0, 0, 0, 0);
+
+        // CRI ADX2 (cri_ware_unity.prx, Tales of Graces f Remastered PPSA19991) binds its APR
+        // command buffer with a completion tag of literally ZERO and then blocks on an UNTIMED
+        // sceKernelWaitEqueue. Its read path, from the module's own disassembly:
+        //     0x11b858  sceKernelAddAmprEvent(eq, id, 0)
+        //     0x11b88f  H896Pt-yB4I(cb, eq, id, tag=0, 0, 0)      ; `xor ecx,ecx` -> a3 == 0
+        //     0x11b90b  sceKernelAprSubmitCommandBuffer(cb, 1)    ; two arguments only
+        //     0x11ba65  sceKernelWaitEqueue(eq, &ev, 1, &n, NULL) ; r8d == 0 -> waits forever
+        //               sceKernelGetEventId(&ev) == id ? done : retry
+        // The wait matches on the event IDENT only, never on the tag, so a zero tag is a perfectly
+        // valid binding rather than an absent one. Treating "tag == 0" as "not really bound" makes
+        // the submit post nothing and hangs the guest's loader thread on a read that has already
+        // completed. Binding to a real equeue is the guest asking for completion delivery; the tag
+        // is payload to be echoed verbatim, zero included. Unbound buffers still post nothing
+        // (issue #180's invented-counter regression) — that is asserted above.
+        // CONFIDENCE: HIGH (guest disassembly + PS5 3.20 firmware NID database).
+        if (submit_plain && add_ampr_event) {
+            uint64_t cri_eq = 0;
+            create_eq((uint64_t)(uintptr_t)&cri_eq, 0, 0, 0, 0, 0);
+            constexpr int64_t cri_id = 0x74fe;
+            add_ampr_event(cri_eq, (uint64_t)cri_id, 0, 0, 0, 0);
+            std::array<uint64_t, 8> cri_storage{};
+            const uint64_t cri_cb = (uint64_t)(uintptr_t)cri_storage.data();
+            construct(cri_cb, 0, 0x560, 0, 0, 0);
+            append_equeue(cri_cb, cri_eq, (uint64_t)cri_id, /*tag=*/0, 0, 0);
+            CHECK(submit_plain(cri_cb, 1, 0, 0, 0, 0) == 0,
+                  "CRI two-argument submit reports success");
+            KEvent cri_event{};
+            int32_t cri_out = -1;
+            uint32_t cri_timeout = 100000;
+            wait_eq(cri_eq, (uint64_t)(uintptr_t)&cri_event, 1, (uint64_t)(uintptr_t)&cri_out,
+                    (uint64_t)(uintptr_t)&cri_timeout, 0);
+            CHECK(cri_out == 1 && cri_event.ident == cri_id && cri_event.data == 0,
+                  "zero-tag binding still receives its completion event, tag echoed verbatim");
+            delete_eq(cri_eq, 0, 0, 0, 0, 0);
+        }
     }
 #endif
     if (read_file) {
