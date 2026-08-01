@@ -16,7 +16,7 @@
 //      never installed it — so the gate that CLAUDE.md and both READMEs describe as strict had, in
 //      CI, validated nothing at all.
 //
-// Both are closed below: check_emitter_coverage() reads every graphics header and fails on any
+// Both are closed below: check_emitter_coverage() reads every `src/gpu/*.hpp` and fails on any
 // declared emitter this run did not actually emit a validated module from, and an absent spirv-val
 // is a hard failure rather than a pass.
 #include "../../src/gpu/rdna2_to_spirv.hpp"
@@ -125,26 +125,48 @@ static const NotAnEmitter kNotEmitters[] = {
     {"recompile_compute_shader_cached",
      "caching wrapper; ctest shader_recompile_cache asserts its words are byte-identical to the "
      "direct emitter, which is validated here"},
+    {"recompile_graphics_shader_cached_shared",
+     "caching wrapper returning shared immutable words; ctest shader_recompile_cache asserts "
+     "*shared == recompile_vertex(...), i.e. byte-identical to the direct emitter"},
+    {"recompile_vertex_chain_cached_shared",
+     "caching wrapper over recompile_vertex_chain, which IS validated here. Note the difference "
+     "from its siblings: shader_recompile_cache pins its cache identity and reuse, but does NOT "
+     "compare its words against the direct emitter, so this entry rests on the wrapper adding no "
+     "emission of its own"},
 };
 
-// Every declaration of a function returning std::vector<uint32_t>, whitespace-tolerant and with no
+// Every declaration of a function returning SPIR-V words, whitespace-tolerant and with no
 // name-prefix filter — both of those were false-PASS directions: a differently named emitter, or one
-// written with a leading qualifier or an extra space, would simply not be seen. Struct members of
-// the same type are excluded by requiring the '(' of a parameter list.
+// written with a leading qualifier or an extra space, would simply not be seen. Struct members and
+// parameters of the same type are excluded by requiring the '(' of a parameter list.
+//
+// BOTH spellings, and that is not cosmetic: gpu_execute.hpp's live draw path declares entry points
+// as `SharedShaderWords` (an alias for shared_ptr<const vector<uint32_t>>), so keying only on the
+// literal vector type left two of them neither covered NOR classifiable — a producer written in the
+// idiom the live path already uses could be added with no failure and no mention, which is exactly
+// the #1711 shape one level up.
+//
+// Note this scan has no comment handling, deliberately. The hazard runs the safe way now: a
+// declaration-shaped line inside a header comment invents a phantom REQUIRED emitter and fails
+// loudly, where the previous, textual coverage check could be silently SATISFIED by a comment.
 static std::vector<std::string> declared_emitters(const std::string& header_text) {
-    static const std::string kRet = "std::vector<uint32_t>";
+    static const char* const kReturnTypes[] = {"std::vector<uint32_t>", "SharedShaderWords"};
     std::vector<std::string> names;
-    size_t at = 0;
-    while ((at = header_text.find(kRet, at)) != std::string::npos) {
-        size_t i = at + kRet.size();
-        while (i < header_text.size() && std::isspace((unsigned char)header_text[i])) ++i;
-        std::string name;
-        while (i < header_text.size() &&
-               (std::isalnum((unsigned char)header_text[i]) || header_text[i] == '_'))
-            name.push_back(header_text[i++]);
-        while (i < header_text.size() && std::isspace((unsigned char)header_text[i])) ++i;
-        if (!name.empty() && i < header_text.size() && header_text[i] == '(') names.push_back(name);
-        at += kRet.size();
+    for (const char* ret_type : kReturnTypes) {
+        const std::string kRet = ret_type;
+        size_t at = 0;
+        while ((at = header_text.find(kRet, at)) != std::string::npos) {
+            size_t i = at + kRet.size();
+            while (i < header_text.size() && std::isspace((unsigned char)header_text[i])) ++i;
+            std::string name;
+            while (i < header_text.size() &&
+                   (std::isalnum((unsigned char)header_text[i]) || header_text[i] == '_'))
+                name.push_back(header_text[i++]);
+            while (i < header_text.size() && std::isspace((unsigned char)header_text[i])) ++i;
+            if (!name.empty() && i < header_text.size() && header_text[i] == '(')
+                names.push_back(name);
+            at += kRet.size();
+        }
     }
     return names;
 }
@@ -153,10 +175,14 @@ static int check_emitter_coverage(const std::string& src_root) {
     // Every graphics header, not a hardcoded pair: an emitter declared in a NEW header is precisely
     // the #1711 shape one level up, and a fixed list cannot see it.
     const std::string gpu_dir = src_root + "/src/gpu";
+    // src/gpu is flat (no subdirectories), so a non-recursive walk is complete. The iterator is
+    // advanced explicitly with an error_code: the range-for's operator++ is the THROWING overload,
+    // so an error arising mid-iteration would terminate instead of reaching the report below.
     std::vector<std::string> headers;
     std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(gpu_dir, ec))
-        if (entry.path().extension() == ".hpp") headers.push_back(entry.path().string());
+    std::filesystem::directory_iterator it(gpu_dir, ec), done;
+    for (; !ec && it != done; it.increment(ec))
+        if (it->path().extension() == ".hpp") headers.push_back(it->path().string());
     if (ec || headers.empty()) {
         printf("  [FAIL] emitter coverage: cannot enumerate %s (%s)\n", gpu_dir.c_str(),
                ec ? ec.message().c_str() : "no headers found");
@@ -208,8 +234,9 @@ static int check_emitter_coverage(const std::string& src_root) {
             ++problems;
         }
     if (!problems)
-        printf("  [ok]   emitter coverage: all %zu declared SPIR-V emitters emitted a validated "
-               "module\n", declared.size());
+        printf("  [ok]   emitter coverage: all %zu declared SPIR-V emitters emitted a module%s\n",
+               declared.size(),
+               fails ? " (one or more of which FAILED validation, above)" : ", and all validated");
     return problems;
 }
 
@@ -227,7 +254,17 @@ int main(int argc, char** argv) {
 
     const std::string probe = dir + "/spv_validate-probe.txt";
     const bool have_val = (system(("spirv-val --version > \"" + probe + "\" 2>&1").c_str()) == 0);
+    // Distinguish "no validator" from "cannot write here": the probe redirects into <output-dir>,
+    // so an unwritable or missing argv[1] would otherwise be reported as a missing spirv-val.
+    const bool probe_written = !read_text(probe).empty();
     std::remove(probe.c_str());
+    if (!have_val && !probe_written) {
+        printf("== FAIL: cannot write into the output directory %s ==\n"
+               "  The spirv-val probe could not be redirected there, so this run cannot tell\n"
+               "  whether the validator is present. Check <output-dir> before reading this as\n"
+               "  a missing spirv-tools install.\n", dir.c_str());
+        return 1;
+    }
     if (!have_val) {
         // Previously this printed "PASS (recompiled; spirv-val not found)" and exited 0, which is
         // how a gate documented as strict validation ran in CI for its whole life without ever

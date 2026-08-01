@@ -67,8 +67,8 @@ Drivers are not required to validate SPIR-V, and the two prosper is developed ag
 and RADV both accepted a module whose `OpAccessChain` result type disagreed with the type it walked.
 So acceptance by a driver proves nothing about validity, and `tools/spv_validate` is the gate that
 does. It emits one representative module from **every** SPIR-V-producing entry point declared in
-`src/gpu/rdna2_to_spirv.hpp` and `src/gpu/spirv_builder.hpp`, and runs
-`spirv-val --target-env vulkan1.1` on each.
+`src/gpu/*.hpp` — under either return-type spelling the tree uses, `std::vector<uint32_t>` and the
+live path's `SharedShaderWords` — and runs `spirv-val --target-env vulkan1.1` on each.
 
 Scope, stated precisely because it was previously overstated: this is *per emitter path*, not per
 shader a title submits. A game's shader is covered to the extent that it exercises paths the corpus

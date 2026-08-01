@@ -151,9 +151,10 @@ std::vector<uint32_t> build_compute_compare_uvec4() {
     // `robustBufferAccess`. Under the old declaration the flag's runtime array had ArrayStride 16
     // over a 4-byte bound range, so its robust length is floor(4/16) = 0 and element 0 is OUT OF
     // BOUNDS: a conformant driver is permitted to discard the OpAtomicExchange entirely, leaving
-    // the comparison's "results differ" flag stuck at zero and silently suppressing baseline
-    // updates. Adding a component index would have kept that property. One uint in its own block
-    // removes it.
+    // the comparison's "results differ" flag stuck at zero. That flag is what live_compute.cpp
+    // reads back as `gpu_result_unchanged`, and a false "unchanged" makes it SKIP writing the
+    // dispatch's result back to guest memory altogether — not merely skip a baseline update.
+    // Adding a component index would have kept that property. One uint in its own block removes it.
     const uint32_t t_flag = e.id(), t_ptr_flag = e.id(), v_flag = e.id();
     const uint32_t t_push = e.id(), t_ptr_push = e.id(), v_push = e.id();
     const uint32_t t_ptr_push_u32 = e.id();

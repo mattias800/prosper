@@ -122,7 +122,7 @@ prosper/
 ```
 cmake -S . -B build -G Ninja
 cmake --build build
-ctest --test-dir build          # 99 self-checking tests
+ctest --test-dir build          # the self-checking suite (count varies by platform)
 ```
 `ctest` needs `spirv-val` on `PATH` — `spirv-tools` on Fedora/Ubuntu,
 `mingw-w64-ucrt-x86_64-spirv-tools` in MSYS2, `brew install spirv-tools` on macOS. The
