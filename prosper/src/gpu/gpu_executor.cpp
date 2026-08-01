@@ -3570,13 +3570,21 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         // write (i = indirect path, d = direct), the orders of the PGM registers that selected this
         // shader, and the draw's own order.
         if (prosper::gpu::udprov_enabled()) {
+            // order + path + SOURCE. `q` is the queue origin the packet folded under
+            // (0=unknown/graphics, 1=Dcb, 2=Acb, 3=DcbFinal), `f` the top-level fold (submit
+            // stream) id, `j` the sceAgcDcbJump recursion depth. A write whose q/f differs from
+            // the draw's own is one that did not arrive in this submit's inline position.
             const auto prov = [&](uint32_t reg) -> std::string {
                 const auto it = st.sh_prov.find(reg);
                 if (it == st.sh_prov.end()) return "never";
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%c%llu",
+                char buf[64];
+                const auto sit = st.sh_prov_src.find(reg);
+                const uint64_t src = sit == st.sh_prov_src.end() ? 0 : sit->second;
+                snprintf(buf, sizeof(buf), "%c%llu/q%u,f%llu,j%u",
                          (it->second & GpuState::kProvIndirect) ? 'i' : 'd',
-                         (unsigned long long)(it->second & ~GpuState::kProvIndirect));
+                         (unsigned long long)(it->second & ~GpuState::kProvIndirect),
+                         (unsigned)(src & 0xFFu), (unsigned long long)(src >> 16),
+                         (unsigned)((src >> 8) & 0xFFu));
                 return buf;
             };
             const auto shv = [&](uint32_t reg) {

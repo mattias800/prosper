@@ -32,6 +32,16 @@ struct GpuState {
     // nothing and the per-draw snapshot copy is unchanged.
     std::unordered_map<uint32_t, uint64_t> sh_prov;
     static constexpr uint64_t kProvIndirect = uint64_t{1} << 63;
+    // Companion map for the same writes: WHERE the packet came from, which `command_order` alone
+    // cannot say. A submit stream's orders are contiguous, so a write that arrives from another
+    // command buffer, another queue entry point, or inside a sceAgcDcbJump segment is
+    // indistinguishable from an in-line one once folded. Packs the queue origin
+    // (0=unknown/graphics, 1=Dcb, 2=Acb async compute, 3=DcbFinal), the jump recursion depth at
+    // apply time, and the top-level fold id.
+    std::unordered_map<uint32_t, uint64_t> sh_prov_src;
+    static uint64_t pack_prov_src(uint8_t origin, uint32_t jump_depth, uint32_t fold) {
+        return (uint64_t)origin | ((uint64_t)(jump_depth & 0xFFu) << 8) | ((uint64_t)fold << 16);
+    }
     uint32_t index_type = 0;                             // last SetIndexType
     uint32_t num_instances = 1;                          // default before SetNumInstances; zero discards
     // Gen5 indexed-draw binding state (issue #232, DOLL/UE4 geometry). SetIndexBuffer/SetIndexCount

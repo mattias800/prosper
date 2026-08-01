@@ -2067,8 +2067,10 @@ void GpuState::apply(const Pm4Command& c) {
                     static std::atomic<int> n{0};
                     if (n.fetch_add(1) < 2000000)
                         fprintf(stderr,
-                                "[bind] order=%llu vaddr=0x%llx num=%u es_lo=0x%x rsrc2=0x%x ps_lo=0x%x\n",
-                                (unsigned long long)command_order,
+                                "[bind] order=%llu q%u f%u j%u vaddr=0x%llx num=%u es_lo=0x%x "
+                                "rsrc2=0x%x ps_lo=0x%x\n",
+                                (unsigned long long)command_order, (unsigned)c.queue_origin,
+                                g_fold_seq.load(std::memory_order_relaxed), jump_depth,
                                 (unsigned long long)c.regs_vaddr, c.num_regs, es_lo, rsrc2, pgm_ps);
                 }
             }
@@ -2119,8 +2121,12 @@ void GpuState::apply(const Pm4Command& c) {
                     continue;
                 }
                 file[offset] = regs[i].value;
-                if (udprov_enabled() && c.reg_class == RegClass::Sh)
+                if (udprov_enabled() && c.reg_class == RegClass::Sh) {
                     sh_prov[offset] = command_order | kProvIndirect;
+                    sh_prov_src[offset] = pack_prov_src(
+                        c.queue_origin, jump_depth,
+                        g_fold_seq.load(std::memory_order_relaxed));
+                }
                 // PROSPER_DBBASETRACE (#1353): log every cx write to the DB Z/STENCIL base
                 // registers (LO 0x12..0x15, HI 0x1A..0x1D) with its source path, to attribute
                 // which packet family programs (or clobbers) a base half — this trace found the
@@ -2235,9 +2241,14 @@ void GpuState::apply(const Pm4Command& c) {
             }
             for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++)
                 file[c.reg_offset + k] = c.reg_data[k];
-            if (udprov_enabled() && c.reg_class == RegClass::Sh)
-                for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++)
+            if (udprov_enabled() && c.reg_class == RegClass::Sh) {
+                const uint64_t src = pack_prov_src(c.queue_origin, jump_depth,
+                                                   g_fold_seq.load(std::memory_order_relaxed));
+                for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++) {
                     sh_prov[c.reg_offset + k] = command_order;
+                    sh_prov_src[c.reg_offset + k] = src;
+                }
+            }
             // PROSPER_DBBASETRACE (#1353): direct-span sibling of the indirect-path trace above.
             {
                 static const bool dbbase_trace = getenv("PROSPER_DBBASETRACE") != nullptr;
@@ -2306,16 +2317,19 @@ void GpuState::apply(const Pm4Command& c) {
                 auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
                 static std::atomic<int> nd{0};
                 if (nd.fetch_add(1) < 2000000)
-                    fprintf(stderr, "[bind] DRAW order=%llu es_lo=0x%x rsrc2=0x%x ud0..3=%08x %08x %08x %08x\n",
-                            (unsigned long long)command_order, rd(0xc8), rd(0x8b),
-                            rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
+                    fprintf(stderr,
+                            "[bind] DRAW order=%llu q%u f%u j%u es_lo=0x%x rsrc2=0x%x "
+                            "ud0..3=%08x %08x %08x %08x\n",
+                            (unsigned long long)command_order, (unsigned)c.queue_origin,
+                            g_fold_seq.load(std::memory_order_relaxed), jump_depth,
+                            rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_enabled()) snap->sh_prov = sh_prov;
+                if (udprov_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -2350,16 +2364,19 @@ void GpuState::apply(const Pm4Command& c) {
                 auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
                 static std::atomic<int> nd{0};
                 if (nd.fetch_add(1) < 2000000)
-                    fprintf(stderr, "[bind] DRAW order=%llu es_lo=0x%x rsrc2=0x%x ud0..3=%08x %08x %08x %08x\n",
-                            (unsigned long long)command_order, rd(0xc8), rd(0x8b),
-                            rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
+                    fprintf(stderr,
+                            "[bind] DRAW order=%llu q%u f%u j%u es_lo=0x%x rsrc2=0x%x "
+                            "ud0..3=%08x %08x %08x %08x\n",
+                            (unsigned long long)command_order, (unsigned)c.queue_origin,
+                            g_fold_seq.load(std::memory_order_relaxed), jump_depth,
+                            rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_enabled()) snap->sh_prov = sh_prov;
+                if (udprov_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -2386,16 +2403,19 @@ void GpuState::apply(const Pm4Command& c) {
                 auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
                 static std::atomic<int> nd{0};
                 if (nd.fetch_add(1) < 2000000)
-                    fprintf(stderr, "[bind] DRAW order=%llu es_lo=0x%x rsrc2=0x%x ud0..3=%08x %08x %08x %08x\n",
-                            (unsigned long long)command_order, rd(0xc8), rd(0x8b),
-                            rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
+                    fprintf(stderr,
+                            "[bind] DRAW order=%llu q%u f%u j%u es_lo=0x%x rsrc2=0x%x "
+                            "ud0..3=%08x %08x %08x %08x\n",
+                            (unsigned long long)command_order, (unsigned)c.queue_origin,
+                            g_fold_seq.load(std::memory_order_relaxed), jump_depth,
+                            rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_enabled()) snap->sh_prov = sh_prov;
+                if (udprov_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -2562,16 +2582,19 @@ void GpuState::apply(const Pm4Command& c) {
                 auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
                 static std::atomic<int> nd{0};
                 if (nd.fetch_add(1) < 2000000)
-                    fprintf(stderr, "[bind] DRAW order=%llu es_lo=0x%x rsrc2=0x%x ud0..3=%08x %08x %08x %08x\n",
-                            (unsigned long long)command_order, rd(0xc8), rd(0x8b),
-                            rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
+                    fprintf(stderr,
+                            "[bind] DRAW order=%llu q%u f%u j%u es_lo=0x%x rsrc2=0x%x "
+                            "ud0..3=%08x %08x %08x %08x\n",
+                            (unsigned long long)command_order, (unsigned)c.queue_origin,
+                            g_fold_seq.load(std::memory_order_relaxed), jump_depth,
+                            rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_enabled()) snap->sh_prov = sh_prov;
+                if (udprov_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -2587,16 +2610,19 @@ void GpuState::apply(const Pm4Command& c) {
                 auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
                 static std::atomic<int> nd{0};
                 if (nd.fetch_add(1) < 2000000)
-                    fprintf(stderr, "[bind] DRAW order=%llu es_lo=0x%x rsrc2=0x%x ud0..3=%08x %08x %08x %08x\n",
-                            (unsigned long long)command_order, rd(0xc8), rd(0x8b),
-                            rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
+                    fprintf(stderr,
+                            "[bind] DRAW order=%llu q%u f%u j%u es_lo=0x%x rsrc2=0x%x "
+                            "ud0..3=%08x %08x %08x %08x\n",
+                            (unsigned long long)command_order, (unsigned)c.queue_origin,
+                            g_fold_seq.load(std::memory_order_relaxed), jump_depth,
+                            rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_enabled()) snap->sh_prov = sh_prov;
+                if (udprov_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
