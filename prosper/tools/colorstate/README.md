@@ -4,8 +4,9 @@ When a title presents black, four explanations compete:
 
 1. **No graphics draws at all** — the render path never submits.
 2. **Draws exist but only target offscreen surfaces**, never composited to scanout.
-3. **Draws write scanout with colour suppressed** — `CB_COLOR_CONTROL.MODE=DISABLE`,
-   or a zero `CB_TARGET_MASK` / `CB_SHADER_MASK`.
+3. **Draws write scanout with colour suppressed** — a `CB_COLOR_CONTROL.MODE` whose
+   colour writes prosper suppresses (`DISABLE`, or a colour-block metadata operation
+   such as `ELIMINATE_FAST_CLEAR`), or a zero `CB_TARGET_MASK` / `CB_SHADER_MASK`.
 4. **Content is produced and the present path drops it.**
 
 `PROSPER_COLORSTATETRACE` emits the raw register evidence that separates 1–3, but on a

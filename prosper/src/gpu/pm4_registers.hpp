@@ -411,7 +411,7 @@ constexpr uint32_t CB_COLOR_CONTROL_MODE_DISABLE = 0;
 constexpr uint32_t CB_COLOR_CONTROL_MODE_NORMAL = 1;
 // Decompression/expansion pass over an already-rendered surface: hardware expands the stored
 // fast-clear color into real texels and IGNORES the bound pixel shader's export. prosper still
-// executes it as an ordinary color draw; that gap is #1588, blocked on #1706.
+// ignores the bound pixel shader's export, so prosper suppresses the color write (#1588).
 constexpr uint32_t CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR = 2;
 constexpr uint32_t CB_COLOR_CONTROL_MODE_RESOLVE = 3;   // hardware MSAA resolve (color0 MSAA -> color1)
 constexpr uint32_t CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS = 6;

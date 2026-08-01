@@ -65,6 +65,60 @@ int main() {
         CHECK(b > 128 && r < 128, "zero mask: center pixel stays blue clear (write mask honored)");
     }
 
+    // #1588: CB_COLOR_CONTROL.MODE is honored all the way to pixels. MODE=2 (ELIMINATE_FAST_CLEAR)
+    // is a color-block metadata operation — hardware expands the surface's stored fast clear and
+    // ignores the bound pixel shader — so the shader's export must not reach the target, exactly as
+    // for MODE=DISABLE. Running it as an ordinary draw is what splatted a leftover pixel shader over
+    // Dragon Quest VII's 4K scanout and painted it white.
+    //
+    // The two arms differ in NOTHING but the MODE field: same registers, same write-all
+    // CB_TARGET_MASK, same shaders, same harness. So MODE=NORMAL must render the red triangle and
+    // MODE=2 must leave the blue clear untouched. Without the NORMAL arm a blue center would be
+    // consistent with the draw never running for an unrelated reason (trap #33 in
+    // docs/GAME_COMPAT_ORCHESTRATION.md); with it, blue can only come from the mode.
+    {
+        namespace P = prosper::agc::Pm4;
+        // ROP3 = 0xCC (SRC copy) is the hardware default AGC programs alongside the mode
+        // (agc_reg_defaults.cpp's 0x00cc0010). It matters: ROP3 0x00 is the CLEAR truth table, which
+        // resolves to VK_LOGIC_OP_CLEAR and renders black — the first draft of this test wrote a zero
+        // ROP3 and its MODE=NORMAL control came out (0,0,0), which would have made the MODE=2 arm's
+        // blue center meaningless.
+        auto resolve_mode = [](uint32_t mode) {
+            GpuState st;
+            st.uc[P::VGT_PRIMITIVE_TYPE] = 4;                 // triangle list
+            st.cx[P::CB_TARGET_MASK] = 0xFu;                  // write RGBA
+            st.cx[P::CB_SHADER_MASK] = 0xFu;
+            st.cx[P::CB_COLOR_CONTROL] = (mode << P::CB_COLOR_CONTROL_MODE_SHIFT) |
+                                         (0xCCu << P::CB_COLOR_CONTROL_ROP3_SHIFT);
+            return resolve_pipeline_state(extract_render_state(st));
+        };
+
+        ResolvedPipelineState shading = resolve_mode(P::CB_COLOR_CONTROL_MODE_NORMAL);
+        CHECK(shading.color_write_mask == 0xFu,
+              "CB MODE=NORMAL with a write-all target mask resolves to an RGBA write mask");
+        std::vector<uint8_t> img_normal = render_triangle_rgba(vert, frag, W, H, &shading);
+        if (img_normal.size() == (size_t)W * H * 4) {
+            uint8_t r = img_normal[center], g = img_normal[center + 1], b = img_normal[center + 2];
+            printf("  center (mode normal) = (%u,%u,%u)\n", r, g, b);
+            CHECK(r > 128 && b < 128,
+                  "MODE=NORMAL: center pixel is the red triangle (control for the MODE=2 arm)");
+        } else { CHECK(false, "MODE=NORMAL render produced a frame"); }
+
+        ResolvedPipelineState eliminate =
+            resolve_mode(P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR);
+        CHECK(eliminate.color_write_mask == 0u,
+              "CB MODE=ELIMINATE_FAST_CLEAR resolves to an empty write mask despite a write-all "
+              "CB_TARGET_MASK");
+        std::vector<uint8_t> img_eliminate = render_triangle_rgba(vert, frag, W, H, &eliminate);
+        if (img_eliminate.size() == (size_t)W * H * 4) {
+            uint8_t r = img_eliminate[center], g = img_eliminate[center + 1],
+                    b = img_eliminate[center + 2];
+            printf("  center (mode fce)    = (%u,%u,%u)\n", r, g, b);
+            CHECK(b > 128 && r < 128,
+                  "MODE=ELIMINATE_FAST_CLEAR: the pixel shader's export never reaches the target");
+        } else { CHECK(false, "MODE=ELIMINATE_FAST_CLEAR render produced a frame"); }
+    }
+
     // Blend honored: additive blend (src=One, dst=One, Add) of the red triangle over the blue clear
     // must produce magenta at the center. The blend fields come from resolve_pipeline_state (RenderState
     // blend enums -> Vk blend enums), so this proves the resolved blend state drives real output.

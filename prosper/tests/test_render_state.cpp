@@ -758,11 +758,9 @@ int main() {
         // so a run in which one draw hit the path was indistinguishable from one in which hundreds
         // of thousands did, and #1588 had to be sized from a separate PROSPER_COLORSTATETRACE run.
         //
-        // Deliberately NOT asserted here: what these modes do to the draw. prosper still executes
-        // them as ordinary colour draws, that is the open defect (#1588, blocked on #1706), and
-        // pinning it would make the eventual fix read as a regression. The old assertion's message
-        // claimed "while retaining fallback behavior" while testing only the log, which is exactly
-        // the vacuous half this replaces; the behavioural contract belongs with the fix.
+        // The behavioural contract arrives with the fix and is asserted immediately below. The old
+        // assertion's message claimed "while retaining fallback behavior" while testing only the
+        // log — the vacuous half — so the two are now separate, explicit checks.
         //
         // Mode 7 is untouched by every other check in this file, so its counter starts at zero and
         // pins the print schedule exactly: reports land at counts 1, 2 and 4, each carrying its own
@@ -860,6 +858,43 @@ int main() {
                   unmodeled_cb_color_mode_count(3u) == before3 &&
                   unmodeled_cb_color_mode_count(6u) == before6,
               "DISABLE, NORMAL, RESOLVE and DCC_DECOMPRESS are never reported or counted");
+
+        // #1588: MODE=2 (ELIMINATE_FAST_CLEAR) is a colour-block metadata operation — hardware
+        // expands the surface's stored fast clear and ignores the bound pixel shader — so its
+        // export must not reach the target. It previously fell through to an ordinary draw, which
+        // splatted the preceding draw's leftover shader over the rect and painted Dragon Quest
+        // VII's 4K scanout white. prosper stores no compressed colour target on either path, so
+        // suppressing the write IS the whole operation.
+        //
+        // This and the MODE=NORMAL assertion above are a matched pair: NORMAL keeps 0xF from the
+        // identical base state, so a zero here cannot come from anything but the mode.
+        RenderState eliminate_fast_clear = absent;
+        eliminate_fast_clear.has_cb_color_control = true;
+        eliminate_fast_clear.cb_color_control =
+            P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        eliminate_fast_clear.z_write_enable = true;
+        ResolvedPipelineState eliminate_ps;
+        (void)capture_stderr([&] { eliminate_ps = resolve_pipeline_state(eliminate_fast_clear); });
+        bool every_target_suppressed = true;
+        for (const auto& target : eliminate_ps.color_targets)
+            every_target_suppressed &= target.write_mask == 0;
+        CHECK(eliminate_ps.color_write_mask == 0 && eliminate_ps.color1_write_mask == 0 &&
+                  every_target_suppressed,
+              "CB MODE=ELIMINATE_FAST_CLEAR suppresses every MRT colour-write mask");
+        CHECK(eliminate_ps.depth_write_enable && has_depth_stencil_side_effect(eliminate_ps),
+              "CB MODE=ELIMINATE_FAST_CLEAR keeps depth/stencil side effects, like MODE=DISABLE");
+        CHECK(!eliminate_ps.cb_resolve,
+              "CB MODE=ELIMINATE_FAST_CLEAR is not misreported as a hardware MSAA resolve");
+
+        // The suppression is a property of the FIELD, not of the one value a title exercised.
+        // DCC_DECOMPRESS(6) is excluded (asserted above) because its bits are observed latched on
+        // ordinary Astro Bot draws, so gpu_execute.hpp discriminates it by helper-program content.
+        RenderState unmodeled5 = eliminate_fast_clear;
+        unmodeled5.cb_color_control = 5u << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        ResolvedPipelineState unmodeled5_ps;
+        (void)capture_stderr([&] { unmodeled5_ps = resolve_pipeline_state(unmodeled5); });
+        CHECK(unmodeled5_ps.color_write_mask == 0,
+              "an unmodeled CB metadata mode with no title evidence is suppressed the same way");
 
         // MODE=RESOLVE(3) is a modeled hardware MSAA resolve: resolve_pipeline_state flags cb_resolve so
         // the live backend copies color0->color1, and it is NOT warned as unmodeled. Would fail before the

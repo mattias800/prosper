@@ -69,21 +69,13 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   windows before making an expensive realized `.prgcap`. Timeline files are gitignored and local-only.
 - **`colorstate/colorstate_report.py`** — reduce a `PROSPER_COLORSTATETRACE` log to a verdict on the
   "why is it black?" question: do draws reach the **scanout** (vs offscreen only), and are their colour
-  writes enabled or suppressed by `CB_COLOR_CONTROL.MODE=DISABLE` / a zero target/shader mask? Prints a
+  writes enabled or suppressed by the draw's `CB_COLOR_CONTROL.MODE` (`DISABLE`, or a colour-block
+  metadata operation such as `ELIMINATE_FAST_CLEAR`) / a zero target/shader mask? Prints a
   per-guest-minute suppressed-percentage series. **Always compare a known-good phase against the bad one** —
   on Plucky the suppressed fraction is *higher* while the world renders correctly (88-95%) than while the
   screen is black (83%), because `CB_DISABLE` is the depth/shadow prepass. Reading one phase alone yields a
   confident wrong answer. `--selftest` needs no capture. See `tools/colorstate/README.md`.
 - **`spv_validate/`** — `spirv-val` wrapper for recompiled SPIR-V.
-- **`docs/check_numbered_table.py`** — validate Markdown tables that other documents cite by row
-  number. Two classes: **structure** (always on) rejects a blank line that splits a table, which
-  in Markdown silently renders everything after it as a *separate* table; **`--sequential`**
-  (opt-in, plus `--table-header` to select one table) additionally requires the numbered column
-  to be unique, ascending and gapless. Sequence is a convention of the instrument-trap table
-  ("append, never renumber"), not a property of numbered tables — most here lead with frame or
-  draw ordinals where gaps are correct — so do not apply it broadly. Catches the case where two
-  branches append the same row number, which merges textually clean and green. Run by the CI
-  `Docs` job; `ctest -R doc_table_checker` covers the checker itself.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`hostprof/hostprof.py`** — poor-man's **native sampling profiler**: attach to a running process
   (pid or name), sample its threads via repeated `gdb` backtraces, and rank the hot leaf functions —

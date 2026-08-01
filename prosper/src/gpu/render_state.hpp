@@ -388,8 +388,8 @@ inline bool has_depth_stencil_side_effect(const ResolvedPipelineState& ps) {
 ResolvedPipelineState resolve_pipeline_state(const RenderState& rs);
 
 // Process-wide running total of draws whose CB_COLOR_CONTROL.MODE named a color-block metadata
-// operation prosper does not model as its own pass, and which it therefore still executed as an
-// ordinary color draw (#1588). The stderr report prints at powers of two to bound its volume on a
+// operation prosper does not model as its own pass, and whose color write was therefore suppressed
+// (#1588). The stderr report prints at powers of two to bound its volume on a
 // title that does this every frame, so the highest ordinal it printed is only a LOWER BOUND on the
 // total; this accessor is the exact count, so per-title exposure can be measured rather than
 // inferred from a deduped or capped log line (instruments #9/#13 in

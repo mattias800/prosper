@@ -8,8 +8,8 @@ colour/depth record per matching draw (see `prosper/src/gpu/gpu_execute.hpp`). O
 the questions those lines exist to answer:
 
   1. Do graphics draws write the *scanout* surface at all, or only offscreen targets?
-  2. Are their colour writes enabled, or suppressed by CB_COLOR_CONTROL.MODE=DISABLE
-     or by a zero CB_TARGET_MASK / CB_SHADER_MASK?
+  2. Are their colour writes enabled, or suppressed by the CB_COLOR_CONTROL.MODE the
+     draw carries, or by a zero CB_TARGET_MASK / CB_SHADER_MASK?
   3. How does that change over the run -- e.g. between a phase that renders correctly
      and a phase that presents black?
 
@@ -48,6 +48,13 @@ RE_TS = re.compile(r"^\[\d{4}\.\d\d\.\d\d-(\d\d)\.(\d\d)\.(\d\d)")
 
 MODE_NAMES = {0: "DISABLE", 1: "NORMAL", 2: "ELIM_FAST_CLEAR", 3: "RESOLVE",
               6: "DCC_DECOMPRESS"}
+
+# Modes whose colour writes resolve_pipeline_state suppresses (#1588): DISABLE, plus every
+# colour-block metadata operation prosper does not model as its own pass. Only NORMAL blends
+# the pixel shader's export; RESOLVE becomes a backend color0->color1 copy and DCC_DECOMPRESS
+# keeps its helper-program handling, so neither is an ordinary shaded write either but both
+# retain a non-zero mask here. Keep this in step with render_state.cpp.
+SUPPRESSED_MODES = {0, 2, 4, 5, 7}
 
 
 def parse(lines):
@@ -101,7 +108,7 @@ def report(records, scanout_prefix, top, out=sys.stdout):
         eff = effective_mask(rec)
         cwms = {t["cwm"] for t in rec["targets"]
                 if t["addr"].startswith(scanout_prefix)}
-        writes_colour = rec["mode"] != 0 and eff != 0 and any(cwms)
+        writes_colour = (rec["mode"] not in SUPPRESSED_MODES and eff != 0 and any(cwms))
         combos[(rec["mode"], eff, tuple(sorted(cwms)))] += 1
         per_minute[rec["ts"] or "??:??"][rec["mode"]] += 1
         for t in rec["targets"]:
@@ -123,10 +130,10 @@ def report(records, scanout_prefix, top, out=sys.stdout):
         name = MODE_NAMES.get(mode, "UNKNOWN")
         cwm = ",".join(f"{c:x}" for c in cwms)
         note = ""
-        if mode == 0 or eff == 0 or not any(cwms):
+        if mode in SUPPRESSED_MODES and mode != 0:
+            note = "   [colour-block metadata op -- colour writes suppressed]"
+        elif mode == 0 or eff == 0 or not any(cwms):
             note = "   [colour writes suppressed]"
-        elif mode not in (1, 3, 6):
-            note = "   [mode not implemented -- runs as an ordinary draw]"
         print(f"  mode={mode} ({name:15s}) effective={eff:02x} cwm={cwm:<6s} "
               f"draws={n}{note}", file=out)
     print("\nscanout draws per guest-clock minute (compare a good phase against a "
@@ -134,7 +141,7 @@ def report(records, scanout_prefix, top, out=sys.stdout):
     for minute in sorted(per_minute):
         c = per_minute[minute]
         tot = sum(c.values())
-        supp = c.get(0, 0)
+        supp = sum(n for m, n in c.items() if m in SUPPRESSED_MODES)
         modes = " ".join(f"mode{m}={n}" for m, n in sorted(c.items()))
         print(f"  {minute}  total={tot:7d}  suppressed={100.0 * supp / tot:5.1f}%  "
               f"{modes}", file=out)
@@ -149,28 +156,47 @@ SELFTEST = """\
 [color-state]   color0=0x9fc2000000 3840x2160 raw-format=10 resolved-format=44 resolved-cwm=0
 [color-state] es=0x1 ps=0x4 cb-control=1:00cc0010 mode=1 target-mask=1:0000000f shader-mask=1:0000000f
 [color-state]   color0=0x3005120000 1920x1080 raw-format=10 resolved-format=44 resolved-cwm=f
+[color-state] es=0x1 ps=0x2 cb-control=1:00cc0020 mode=2 target-mask=1:0000000f shader-mask=1:0000000f
+[color-state]   color0=0x9fc2000000 3840x2160 raw-format=10 resolved-format=44 resolved-cwm=f
 """
 
 
 def selftest():
     import io
     recs = list(parse(SELFTEST.splitlines()))
-    assert len(recs) == 3, recs
+    assert len(recs) == 4, recs
     assert recs[0]["mode"] == 1 and effective_mask(recs[0]) == 0x0F
     assert recs[1]["mode"] == 0 and effective_mask(recs[1]) == 0x00
     assert recs[2]["targets"][0]["addr"] == "0x3005120000"
     assert recs[0]["ts"] == "16:09"
+    # #1588: a metadata mode writes no colour even when BOTH the effective mask and the
+    # per-target resolved cwm say write-all. The record deliberately carries `resolved-cwm=f`,
+    # which is the shape of a log captured BEFORE the suppression landed: that is the only input
+    # on which the mode term of the verdict can matter, because a post-fix log already prints
+    # cwm=0 and would be classified correctly by the old mask-only rule too. A record with
+    # cwm=0 here would make the assertions below pass identically with or without the change.
+    assert recs[3]["mode"] == 2 and effective_mask(recs[3]) == 0x0F
+    assert {t["cwm"] for t in recs[3]["targets"]} == {0x0F}
     # An absent mask must mean write-all, not write-nothing.
     assert effective_mask({"tmask_present": 0, "tmask": 0,
                            "smask_present": 0, "smask": 0}) == 0xFF
     buf = io.StringIO()
     report(list(parse(SELFTEST.splitlines())), "0x9fc", 10, out=buf)
     text = buf.getvalue()
-    assert "writing scanout (0x9fc...): 2" in text, text
+    assert "writing scanout (0x9fc...): 3" in text, text
     assert "offscreen only:                       1" in text, text
     assert "colour writes suppressed" in text, text
+    assert "colour-block metadata op" in text, text
     # The offscreen-only draw must not be counted as reaching the scanout.
     assert "0x3005120000" not in text, text
+    # Two of the three scanout draws (MODE=DISABLE and MODE=2) are suppressed; a report that
+    # still counted only MODE=DISABLE would print 33.3%.
+    assert "suppressed= 66.7%" in text, text
+    # The writes-colour verdict itself, which is the term the mode set exists for. The MODE=2
+    # record has a write-all cwm, so a mask-only rule calls it a colour writer and splits the
+    # scanout surface 2-writing / 1-suppressed. Reading the mode instead gives 1 / 2.
+    assert "writes-colour=False draws=2" in text, text
+    assert "writes-colour=True  draws=1" in text, text
     print("selftest OK")
 
 

@@ -219,27 +219,22 @@ title-visibility blocker.
 
 ## The flashing white screen and the UI noise block are one defect: `CB_COLOR_CONTROL.MODE=2` (#1588)
 
-> **Diagnosed and NOT yet fixed. Blocked on #1706 — read that before attempting the fix.**
+> **Fix written and PARKED, blocked on #1706.** The suppression on this branch is correct about
+> hardware and restores the frame, but keying it on `MODE` alone is unsafe while prosper's decoded
+> `CB_COLOR_CONTROL.MODE` is not per-draw-trustworthy: Astro Bot submit 6174 has four draws all
+> reporting `mode=2`, of which **two are ordinary shaded draws** — one blended into two MRTs with a
+> 3,107-dword VS and a vertex buffer — so this change drops real geometry from that title.
+> `gpu_execute.hpp` already works around the same latch for `MODE=6` by matching helper-program
+> content. **Fix #1706 first; then this is correct exactly as written and needs no guard.**
 >
-> The obvious fix is to stop the bound pixel shader's export reaching the target for `MODE=2`, and an
-> offline A/B (#1695) confirms it restores the correct frame. It is **not safe to key on `MODE` alone**:
-> #1706 established that prosper's decoded `CB_COLOR_CONTROL.MODE` is not per-draw-trustworthy. Astro Bot
-> submit 6174 has four draws all reporting `mode=2`, of which **two are ordinary shaded draws** — one
-> blended into two MRTs with a 3,107-dword VS and a vertex buffer — so suppressing on the mode drops real
-> geometry from another title. `gpu_execute.hpp` already works around the same latch for `MODE=6` by
-> matching helper-program content. Fix the tracking (#1706), then this fix is correct as written.
->
-> Landed meanwhile: `MODE=2` is now named in `pm4_registers.hpp`, and the once-per-mode warning is a
-> counted report (powers of two, exact running count, `unmodeled_cb_color_mode_count()`), so per-title
-> exposure is measurable instead of being inferred from a line that could not distinguish one occurrence
-> from hundreds of thousands.
+> Already on master (#1708): `MODE=2` is named, and the report is counted rather than deduped per
+> mode, so per-title exposure is measurable.
 >
 > **`gpu_replay` cannot demonstrate this fix.** Both `--bundle` and `.prgcap` go through
-> `materialize_gpu_replay`, which binds the **stored** `ResolvedPipelineState` — the `d.ps = x.ps` line in
-> its draw loop (`gpu_capture.cpp`, line 3405 as of `37768edc`; grep the assignment rather than the line
-> number, it drifts) — so replay never re-runs `resolve_pipeline_state` and a change there is invisible to it.
-> That is why #1695's A/B lever had to sit in `gpu_replay`'s `main()`. Verify in a live run or in
-> `tests/test_pipeline_render.cpp`, not by replaying an artifact.
+> `materialize_gpu_replay`, which binds the **stored** `ResolvedPipelineState` — the `d.ps = x.ps`
+> line in its draw loop (grep the assignment; the line number drifts) — so replay never re-runs
+> `resolve_pipeline_state` and a change there is invisible to it. That is why #1695's A/B lever had
+> to sit in `gpu_replay`'s `main()`. Verify in a live run or in `tests/test_pipeline_render.cpp`.
 
 **Read this before any further work on this title's composition.** It supersedes the "final Slate quad"
 line of investigation below, which was chasing an ordinary draw that is not ordinary.
@@ -269,9 +264,10 @@ rescues it later.
 > **The log line quoted here is historical.** At the time of this investigation the warning read
 > `[gpu] resolve_pipeline_state: unsupported CB_COLOR_CONTROL.MODE=2 -> ordinary draw fallback` and
 > was deduped once per mode value. **That string no longer exists in the tree** — grepping a fresh
-> run's log for it finds nothing. The current report names the mode, says it is still executed as an
-> ordinary colour draw, and carries a running count; the exact per-mode total is available from
-> `unmodeled_cb_color_mode_count()`. The *behaviour* described above is unchanged.
+> run's log for it finds nothing. The current report names the mode, says its colour writes are
+> suppressed, and carries a running count; the exact per-mode total is available from
+> `unmodeled_cb_color_mode_count()`. The *fall-through behaviour* described above is what this
+> branch changes — see the parked note at the top of the section.
 
 The draws carry hardware's decompress signature, which is why the fall-through is destructive:
 

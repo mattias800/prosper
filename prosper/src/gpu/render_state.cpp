@@ -53,8 +53,8 @@ int32_t scale_scissor_boundary(int32_t value, float scale, bool lower) {
 // other values as their own operation: DISABLE suppresses color writes, RESOLVE becomes cb_resolve,
 // and DCC_DECOMPRESS keeps the AGC helper-program handling in gpu_execute.hpp. Every REMAINING
 // value of the 3-bit field is reported here. ELIMINATE_FAST_CLEAR(2) is a color-block metadata
-// operation that hardware performs INSTEAD of shading and prosper still runs as an ordinary color
-// draw — that gap is #1588. Values 4, 5 and 7 are grouped with it because they are simply "not one
+// operation that hardware performs INSTEAD of shading, so its color write is suppressed below
+// (#1588). Values 4, 5 and 7 are grouped with it because they are simply "not one
 // of the four prosper models", NOT because their operation is known: 4 and 5 are decompress modes
 // in the published enum, 7 is not defined there, and no title here exercises any of them.
 bool cb_mode_is_unmodeled_metadata_operation(uint32_t mode) {
@@ -82,8 +82,8 @@ void report_unmodeled_cb_color_mode(uint32_t mode) {
     // power-of-two line is duplicated or lost when threads race here.
     if ((count & (count - 1u)) == 0u)
         fprintf(stderr, "[gpu] resolve_pipeline_state: CB_COLOR_CONTROL.MODE=%u is an unmodeled "
-                        "color-block metadata operation -> still executed as an ordinary color "
-                        "draw (#1588; count=%llu)\n",
+                        "color-block metadata operation -> color writes suppressed, depth/stencil "
+                        "retained (#1588; count=%llu)\n",
                 mode, static_cast<unsigned long long>(count));
 }
 
@@ -815,11 +815,38 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     // MODE=DISABLE suppresses color-buffer writes, not the whole draw: depth/stencil tests and
     // updates still execute. An absent CB_COLOR_CONTROL retains the legacy normal-draw behavior;
     // otherwise a zero-initialized synthetic RenderState would unexpectedly lose every color draw.
-    // DCC_DECOMPRESS is handled by the AGC helper-program path in gpu_execute.hpp. Other hardware
-    // metadata modes remain ordinary draws for compatibility, but are now visible instead of silent.
+    // DCC_DECOMPRESS is handled by the AGC helper-program path in gpu_execute.hpp.
+    //
+    // #1588: an unmodeled color-block metadata operation gets the SAME color-write treatment as
+    // DISABLE, because the destructive part of running one as an ordinary draw is that the bound
+    // pixel shader's export reaches the target. Hardware would instead expand the surface's stored
+    // fast-clear/compression metadata, and prosper has no expansion left to perform: renderer-owned
+    // targets are ordinary uncompressed Vulkan images whose fast clear was already materialized by
+    // the attachment clear (has_clear_color/clear_color, decoded above by decode_clear_color from
+    // CB_COLOR0_CLEAR_WORD0/1), and the guest-memory path expands the DCC clear code into explicit
+    // texels at read time (gfx10_dcc_fast_clear_rgba8, tile.cpp). So suppressing the write is the
+    // whole operation here, not a partial implementation of it.
+    //
+    // Observed failure this fixes: Dragon Quest VII Reimagined (PPSA17942) submits exactly two
+    // MODE=2 (ELIMINATE_FAST_CLEAR) rects per 4K composite submit — one scissored to the dialogue
+    // box, one full-screen and the LAST operation in the submit, writing the scanout. Each inherits
+    // the preceding draw's pixel shader (hardware ignores it, so the guest never rebinds one), and
+    // running them as ordinary draws splatted that leftover shader over the rect: a saturated-white
+    // scanout and a block of glyph-atlas noise where the dialogue box belongs. An offline A/B on the
+    // captured composite submit (#1695) reproduced the white plane exactly and restored the correct
+    // frame to within a mean 0.061/255 of the title's own healthy buffer.
+    //
+    // !! BLOCKED — DO NOT SHIP AS-IS. Keying this on MODE alone is unsafe until #1706 is fixed:
+    // prosper's decoded CB_COLOR_CONTROL.MODE is not per-draw-trustworthy. Astro Bot submit 6174
+    // has four draws all reporting mode=2, of which TWO are ordinary shaded draws (one blended into
+    // two MRTs with a 3107-dword VS and a vertex buffer), so this suppression drops real geometry
+    // from that title. gpu_execute.hpp already works around the same latch for MODE=6 by matching
+    // helper-program content. Fix #1706, then this is correct exactly as written.
     const uint32_t cb_mode = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE);
     if (rs.has_cb_color_control) {
-        if (cb_mode == P::CB_COLOR_CONTROL_MODE_DISABLE) {
+        if (cb_mode == P::CB_COLOR_CONTROL_MODE_DISABLE ||
+            cb_mode_is_unmodeled_metadata_operation(cb_mode)) {
+            if (cb_mode != P::CB_COLOR_CONTROL_MODE_DISABLE) report_unmodeled_cb_color_mode(cb_mode);
             ps.color_write_mask = 0;
             ps.color1_write_mask = 0;
             for (auto& target : ps.color_targets) target.write_mask = 0;
@@ -827,8 +854,6 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
             // MSAA resolve: color0 (MSAA source) -> color1 (single-sample dest). The live backend copies
             // the already-rendered color0 surface into color1 instead of running these as ordinary draws.
             ps.cb_resolve = true;
-        } else if (cb_mode_is_unmodeled_metadata_operation(cb_mode)) {
-            report_unmodeled_cb_color_mode(cb_mode);
         }
     }
 
