@@ -124,7 +124,7 @@ So `verify` cannot answer "is this window stable"; it is not asking that questio
 the profile twice and score one against the other. The same test on a route into a
 fixed Training map returned **0.9612-1.0000, 47/47** — same test, opposite answer, and
 the reason `worms-armageddon-gameplay` guards a Training level rather than the
-published Quickstart match. Recorded as trap 32 in `docs/GAME_COMPAT_ORCHESTRATION.md`.
+published Quickstart match. Recorded as trap 36 in `docs/GAME_COMPAT_ORCHESTRATION.md`.
 
 ## New Or Changed Baselines
 
