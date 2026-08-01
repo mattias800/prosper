@@ -396,6 +396,18 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     `git checkout -b <slug>-clean <base>`, then per commit `git cherry-pick -n <sha>` followed by
     `git commit -F <message-with-the-line-stripped>`. Verify with `git diff <old-head> HEAD` over the
     paths you touched (expect empty), then `git push --force-with-lease`.
+- **Rebuilding a branch onto a moved master: never take a whole file from the old branch.** The obvious
+  move — `git checkout <old-branch> -- <file>` — reverts that file to its old state wherever ANOTHER
+  lane has since edited it, with no conflict, no failing check, and a diff that reads as your own edit.
+  It cost #1701 ten lines of documentation this way, caught only because `--stat` showed deletions in a
+  file believed touched once. Re-apply your own hunks onto master's version instead; when you do take a
+  file whole, **diff it against `master` and read the `-` lines**. The `Docs` CI gate does not cover
+  this: it validates table structure and numbering, never prose. See instrument-trap 41.
+- **A pipeline's exit status is its LAST stage's.** `cmd | tail`, `cmd | head` and `cmd | grep` all
+  discard `cmd`'s failure, so `build && test | tail -3 && commit` commits through a red test. Capture
+  the status (`cmd > log; rc=$?`), use `set -o pipefail`, or read `${PIPESTATUS[0]}`. Separately,
+  `grep -c` **exits 1 on zero matches**, so a legitimate "none found" aborts an `&&` chain — separate it
+  with `;`. Four people lost time to these in one session. See instrument-trap 40.
 - **Never publish the developer machine's local paths.** This repository is public. An absolute path
   leaks the account name and the private directory layout of someone's computer, and it is never the
   information a reader needs — the *shape* of the command is. So keep absolute host paths out of commit
