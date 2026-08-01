@@ -30,6 +30,19 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   counts alone do not prove that the image changed; see `screenshot/README.md`.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map, import NIDs, and
   export RVAs. Use `--find-symbol NID` for a focused import/export query.
+- **`guest_bt/`** — symbolicated **guest**-thread backtraces for a live or frozen prosper process:
+  "what is this thread doing / waiting for?". Answers it for **any** title, not just IL2CPP/Unity —
+  the managed-symbol step is optional, and on a stripped native C++ UE4 title it still walks every
+  guest thread under its **real engine thread name** (`RenderThread 1`, `TaskGraphThread`,
+  `FAPREventQueueL`, …) with the prosper-side wait frame attached, which is usually enough to say
+  which subsystem is stuck. See `guest_bt/README.md`.
+- **`re/pak_index.py`** — resolve UE4 `.pak` byte offsets to asset names, and decode a
+  `PROSPER_FILELOG=1` run's `[apr] read-submit` stream into an ordered asset load trace. Answers
+  "which map/blueprint/texture did the guest actually load, and where did loading stop?" offline,
+  from a log captured earlier — no boot and no GPU. Check what content is resident *before*
+  concluding that geometry is missing: on PPSA19244 it showed the title loads exactly one of 481
+  maps (a splash level), which made its empty base pass correct rather than a defect. See
+  `re/README.md`.
 - **`re/xref.py`** — find relative data pointers, direct references, runtime function-table
   writers, and indirect callers in a flattened guest module. See `re/README.md`.
 - **`shader_histo/`** — histogram RDNA2 opcodes across a title's shaders.

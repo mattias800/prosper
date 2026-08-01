@@ -3,6 +3,17 @@
 Answer *"what is this guest thread actually doing / waiting for?"* with a real call stack — including
 **managed C# method names** for IL2CPP/Unity titles — for any live or frozen prosper process.
 
+**It is not IL2CPP-only.** The managed-symbol step is optional; everything else — the re-sectioned
+`.eh_frame` unwind, the HLE stub bridge, and per-thread reporting — works on any title. On a
+**stripped native C++ UE4** title (PPSA19244, no `script.json`, no symbols at all) it walked all
+**68** guest threads and reported them under their **real engine thread names**, because the guest's
+own `pthread_setname` values survive: `RenderThread 1`, `RTHeartBeat 1`, `FAsyncPurge`,
+`FAPREventQueueL`, `TaskGraphThread` ×21, `PoolThread 0..8`, `HttpManagerThre`, `OnlineAsyncTask`.
+Guest frames show as bare `eboot+offset`, but the thread name plus the prosper-side wait function
+(`k_cond_wait` / `k_cond_timedwait` / `k_usleep` / `k_eq_wait`) is usually enough to answer "which
+subsystem is stuck": on that title it isolated the **two** threads of 68 still executing guest code
+in a boot that had otherwise gone completely quiet. Reach for it on native titles, not just Unity.
+
 ## Why gdb alone can't do this
 
 Two things defeat gdb's native unwinder on a prosper guest thread:
@@ -80,6 +91,8 @@ in `guest_bt_gdb.py._StubUnwinder` (and this note) together.
 
 - Managed (IL2CPP, `0x440000000..`) frames get method names; the Unity **player** eboot
   (`0x410000000`) and system PRXs are stripped C++, so those frames show as bare `module+offset`.
+  The same is true of an entirely native title — no managed frames means no method names, but the
+  walk, the thread names, and the prosper-side wait frames are all still there (see above).
 - The unwind is only as good as the modules' `.eh_frame`; a frame whose module ships no CFI ends the
   walk. `mk_sym_elf.py` reports which modules had CFI.
 - Linux/`%fs`-swap stubs only. The Windows/macOS stub shapes differ; the rule would need porting.
