@@ -816,10 +816,18 @@ int main() {
         // and print nothing. That is the arm this assertion exists for: without it, a shared
         // schedule counter passes the whole block, because mode 7 is resolved first and its early
         // ordinals coincide with the global ones.
+        //
+        // The `>= 6u` clause is the load-bearing one and is NOT redundant with the comment above it.
+        // Moving the mode-2/4/5 block below this one is the single edit that would let a shared
+        // counter run 5 -> 6, 7, 8, print `count=8)`, and leave this assertion **passing while no
+        // longer discriminating** — every other edit class fails loudly. Prose does not survive a
+        // reorder, so the dependency is asserted mechanically rather than described.
         const std::string mode7_resumed = capture_stderr([&] {
             for (int i = 0; i < 3; ++i) (void)resolve_pipeline_state(unsupported7);
         });
-        CHECK(occurrence_count(mode7_resumed, "count=8)") == 1u &&
+        CHECK(unmodeled_cb_color_mode_count(2u) + unmodeled_cb_color_mode_count(4u) +
+                      unmodeled_cb_color_mode_count(5u) >= 6u &&
+                  occurrence_count(mode7_resumed, "count=8)") == 1u &&
                   occurrence_count(mode7_resumed, "MODE=7 ") == 1u &&
                   unmodeled_cb_color_mode_count(7u) == 8u,
               "the power-of-two schedule is per-mode, not shared across modes");
@@ -841,10 +849,11 @@ int main() {
             }
         });
         // The four counter deltas are the real contract here: they are text-independent, so they
-        // cannot go vacuous. The string clause is a second look at the same fact and deliberately
-        // anchors on "CB_COLOR_CONTROL.MODE=", which the emitter cannot drop without also failing
-        // the schedule assertion above — a rewording that silenced this clause alone would be
-        // caught there rather than passing quietly.
+        // cannot go vacuous. The string clause is a second look at the same fact, and it CAN go
+        // vacuous on its own — a message reworded to, say, "COLOR_MODE=%u" would keep the schedule
+        // assertion's "MODE=7 " passing while silently dropping this anchor. That is acceptable only
+        // because the deltas beside it do not depend on any text; do not let the string clause stand
+        // alone if this CHECK is ever split.
         CHECK(modeled_diagnostics.find("CB_COLOR_CONTROL.MODE=") == std::string::npos &&
                   unmodeled_cb_color_mode_count(0u) == before0 &&
                   unmodeled_cb_color_mode_count(1u) == before1 &&
