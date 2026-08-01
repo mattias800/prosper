@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <cerrno>       // select/pselect fail-visible path sets errno for __error() (#1660)
 #include <ctime>
 #include <deque>
 #include <mutex>
@@ -398,6 +399,100 @@ HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), 
 // infinite busy-sleep. We always sleep the full duration, so return 0 (Kyty KernelSleep returns OK/0).
 HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return 0; }
 HLE(k_nanosleep){ if (a0) nanosleep((const struct timespec*)P(a0), a1 ? (struct timespec*)P(a1) : nullptr); return 0; }
+
+// --- select / pselect: the PURE-SLEEP shape only (#1660) --------------------------------------
+//
+// `select(0, NULL, NULL, NULL, &tv)` — nfds <= 0 with all three descriptor sets NULL — is the
+// canonical portable sleep idiom. No descriptor is involved, so it needs no socket backing at all:
+// wait out the timeout and return 0. **0 is the CORRECT return here** ("timed out, nothing became
+// ready"); returning it *immediately* is the defect. What has to be honoured is the timeout.
+//
+// Evidence: on PPSA19244 (The Oregon Trail) the Gameloft SDK's `OLD_HTTPClient` service thread uses
+// exactly this call as its 3-second inter-pass sleep — arguments captured live at the import stub
+// (`PROSPER_STUBDUMP` -> 0x600000000+off -> breakpoint at stub entry), six consecutive hits, all
+// `select(nfds=0, NULL, NULL, NULL, {tv_sec=3, tv_usec=0})`. Falling through to the generic
+// unimplemented stub returned 0 in ~111 ns, collapsing a 3 s sleep into a no-op: the loop ran
+// **9.0 million times per second — 1,300,185,430 calls in 144 s**, saturating a core through the
+// dispatch path. That is both a performance cost and a measurement hazard, because the burn
+// attributes itself to prosper's dispatch rather than to the guest and distorts any CPU profile of
+// a title in this state. `select`-as-sleep is a portable idiom, so this is not title-specific.
+//
+// A query with an actual descriptor set is NOT implemented and deliberately stays fail-visible:
+// prosper has no socket backing, so replying "0 = nothing ready" would be precisely the
+// success-shaped answer-we-cannot-honour that caused this bug. Log it loudly and fail.
+// CONFIDENCE: HIGH on the sleep shape (arguments observed live); the descriptor shape is
+// intentionally unimplemented, not unknown.
+namespace {
+// True for the pure-sleep shape: no descriptor may be examined.
+bool select_is_pure_sleep(uint64_t nfds, uint64_t readfds, uint64_t writefds, uint64_t exceptfds) {
+    return (int64_t)nfds <= 0 && readfds == 0 && writefds == 0 && exceptfds == 0;
+}
+
+// Sleep the FULL duration. A bare nanosleep returns early on a signal, and prosper delivers signals
+// on its own (the SIGSEGV fault handler), so a short sleep would reintroduce a faster spin.
+void sleep_full(struct timespec want) {
+    while (want.tv_sec > 0 || want.tv_nsec > 0) {
+        struct timespec rem{0, 0};
+        if (nanosleep(&want, &rem) == 0) return;
+        if (errno != EINTR) return;
+        want = rem;
+    }
+}
+
+// A NULL timeout in the pure-sleep shape means "block forever". Sleep in bounded chunks rather than
+// one unbounded call so the process still responds to termination.
+void sleep_forever() { for (;;) sleep_full(timespec{1, 0}); }
+
+uint64_t select_unsupported(const char* fn, uint64_t nfds,
+                            uint64_t readfds, uint64_t writefds, uint64_t exceptfds) {
+    static std::atomic<int> logged{0};
+    const int n = logged.fetch_add(1);
+    // Distinguish the two ways a call can miss the implemented shape, because they mean very
+    // different things. A real descriptor set genuinely cannot be answered without socket backing.
+    // `nfds > 0` with every set NULL examines no descriptor either, so it is *probably* also a
+    // sleep — but no title has been observed doing it, so it is refused rather than assumed, and
+    // called out here so the first title that does hit it is immediately visible instead of
+    // silently inheriting a widened contract. See #1660 before extending the shape.
+    const bool no_sets = (readfds == 0 && writefds == 0 && exceptfds == 0);
+    if (n < 8)
+        fprintf(stderr, "[posix] %s: %s is UNIMPLEMENTED (no socket backing) "
+                        "nfds=%lld readfds=%#llx writefds=%#llx exceptfds=%#llx -> -1 ENOSYS "
+                        "(#%d; only the nfds<=0 + all-NULL pure-sleep shape is supported, see #1660)%s\n",
+                fn, no_sets ? "descriptor-free call with nfds>0" : "descriptor-set query",
+                (long long)(int64_t)nfds, (unsigned long long)readfds,
+                (unsigned long long)writefds, (unsigned long long)exceptfds, n,
+                no_sets ? "  <- examines no descriptor; likely a sleep, but unobserved: report it"
+                        : "");
+    // Follows the existing libScePosix wrapper convention in hle_file.cpp: set the host errno that
+    // __error()/h_errno_location hands back and return -1. Whether that number should be translated
+    // to FreeBSD's is the separate concern tracked by #1612, not something to diverge on here.
+    errno = ENOSYS;
+    return (uint64_t)(int64_t)-1;
+}
+} // namespace
+
+// select(int nfds, fd_set* r, fd_set* w, fd_set* e, struct timeval* timeout)
+HLE(k_select) {
+    if (!select_is_pure_sleep(a0, a1, a2, a3)) return select_unsupported("select", a0, a1, a2, a3);
+    if (!a4) sleep_forever();
+    else {
+        const int64_t* tv = (const int64_t*)P(a4);   // struct timeval { time_t sec; suseconds_t usec; }
+        sleep_full(timespec{ (time_t)tv[0], (long)(tv[1] * 1000) });
+    }
+    return 0;   // timed out with nothing ready — the correct answer for a descriptor-free wait
+}
+
+// pselect(int nfds, fd_set* r, fd_set* w, fd_set* e, const struct timespec* timeout,
+//         const sigset_t* sigmask). Same rule; the timeout is a timespec, not a timeval.
+HLE(k_pselect) {
+    if (!select_is_pure_sleep(a0, a1, a2, a3)) return select_unsupported("pselect", a0, a1, a2, a3);
+    if (!a4) sleep_forever();
+    else {
+        const int64_t* ts = (const int64_t*)P(a4);
+        sleep_full(timespec{ (time_t)ts[0], (long)ts[1] });
+    }
+    return 0;
+}
 // Guest-visible process id. Keep it stable across host runs and distinct from the kernel's
 // special pid 0; shadPS4 uses the same 0xBAD1 compatibility pid. Returning generic-stub success
 // (zero) violates POSIX and can collapse per-process paths/ownership keys. CONFIDENCE: HIGH.
@@ -1347,6 +1442,11 @@ void register_kernel_time_hle() {
     R("pthread_setcancelstate", k_pthread_setcancelstate);
     R("_sigprocmask", k_sigprocmask_noop);
     R("_is_signal_return", k_is_signal_return);
+    // select/pselect — pure-sleep shape only (#1660). nid_hash("select") == "T8fER+tIGgk" and
+    // nid_hash("pselect") == "ZO2nWoTAv60", matching the PS5 3.20 libkernel/libkernel_web/
+    // libkernel_sys export tables and the import PPSA19244 actually binds.
+    R("select", k_select);
+    R("pselect", k_pselect);
     #undef R
 }
 

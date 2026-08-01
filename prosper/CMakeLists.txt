@@ -247,6 +247,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_wall_clock PRIVATE prosper_core)
   add_test(NAME wall_clock COMMAND test_wall_clock)
 
+  # select/pselect pure-sleep shape honours its timeout; a descriptor-set query stays fail-visible
+  # (#1660). Asserts elapsed time, not the return value -- the stub this replaces also returned 0.
+  add_executable(test_select_sleep tests/test_select_sleep.cpp)
+  target_link_libraries(test_select_sleep PRIVATE prosper_core)
+  add_test(NAME select_sleep COMMAND test_select_sleep)
+
   # Opt-in flip-paced monotonic clock (#240): exact frame steps, thread-safe first-flip anchor,
   # and no coupling into CLOCK_REALTIME while virtual time is paused between flips.
   add_executable(test_det_clock tests/test_det_clock.cpp)
