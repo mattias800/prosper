@@ -64,25 +64,37 @@ completely different fixes:
 ```text
 [audio-flow] ctx0 created: grain=256 queue_depth=2 (host sink port 17)
 [audio-flow] port1 created: type=0x0 data_format=0xc00 flags=0x0 (MAIN -> mixed to host)
-[audio-flow] ctx0 advance=189 push=189 (with-pcm=0 silent-paced=189 not-ready=0) sink=never-opened \
-             port=17 grains=0 bytes=0 bed-peak=0.00000 bed-rms=0.00000 bed-nonzero=0/96768 \
-             | lifetime: ctx=2 ports=2 pcm-published=747
-[audio-flow]   port1 type=0x0 fmt=0xc00 reads=189 mixed=0 frames=48384 bytes=2322432 \
-               peak=0.00000 rms=0.00000 nonzero=0/580608 no-pcm=0 skip-fmt=189 skip-not-main=0 \
-               short=0 | life: nonzero=594272/1714176 peak=0.00000
+[audio-flow] ctx0 advance=188 push=188 (with-pcm=0 silent-paced=188 not-ready=0) sink=never-opened \
+             port=17 grains=0 bytes=0 bed-peak=0.00000 bed-rms=0.00000 bed-nonzero=0/96256 \
+             bed-nan=0 | BED LIFE: nonzero=0/3944448 peak=0.00000 rms=0.00000 nan=0 \
+             | lifetime: ctx=2 ports=2 pcm-published=15039
+[audio-flow]   port1 type=0x0 fmt=0xc00 reads=188 mixed=0 frames=48128 bytes=2310144 \
+               peak=0.15349 rms=0.01289 nonzero=86528/577536 nan=0 no-pcm=0 skip-fmt=188 \
+               skip-not-main=0 short=0 \
+               | LIFE: nonzero=1782048/18456576 peak=0.38976 rms=0.01033 nan=0
 ```
 
-That real example is worth reading closely: this interval reports `nonzero=0/580608`, yet the same
-line's `life:` total is `594272/1714176`. The port is **not** silent — the interval simply landed in
-a gap between cues, and `mixed=0 … skip-fmt=189` shows prosper discarding it 189 times a second.
+That is a real *Dragon Quest VII* capture, and the port line alone diagnoses the title: the guest is
+handing us 2,310,144 bytes per second of genuine audio (`LIFE:` run peak **0.38976**, 1.78 M non-zero
+samples, `nan=0` ruling out a NaN artifact), and `mixed=0` with `skip-fmt=188` says prosper discards
+every grain of it because the port declares 12 channels. Its context correspondingly shows
+`sink=never-opened` and `BED LIFE: nonzero=0/3944448` — nothing from it ever reaches the device.
+
+Note how little the interval columns would tell you on their own: this line's `peak=0.15349` happens
+to be a quiet moment, and other intervals in the same run read `nonzero=0/577536` outright. The
+verdict is in `LIFE:`.
 
 | Observation | Meaning |
 |---|---|
 | no `[audio-flow]` lines at all | the guest never created an AudioOut2 context |
 | `ctx…created` but no interval lines | a context exists, but the pump loop never runs |
 | `advance=N push=0` | the pump runs but never submits — **case 1** |
-| `push=N` with `bed-nonzero=0/…` | real submissions carrying exact silence — **case 2** |
-| `push=N` with `bed-nonzero>0` | signal reaches the host sink — **case 3**, look at the sink/volume |
+| `push=N`, **`BED LIFE: nonzero=0/M`** | real submissions carrying exact silence — **case 2** |
+| `push=N`, **`BED LIFE: nonzero>0`** | signal reaches the host sink — **case 3**, look at the sink/volume |
+| any port with `LIFE: nonzero>0` but `mixed=0` | **prosper is discarding real audio** — read `skip-fmt` / `skip-not-main` to see why |
+
+The last row is the one that matters most and is invisible in the bed alone: a port can carry the
+title's entire soundtrack and never reach the mix. That is what *Dragon Quest VII* does (#1692).
 
 Read the counters, not just presence:
 
@@ -90,20 +102,24 @@ Read the counters, not just presence:
   submissions means something different when the guest never built an audio graph
   (`ports=0`), built one but never handed over a buffer (`pcm-published=0`), or wired everything up
   and still never pushed.
-- **`nonzero=N/M` is the measure that decides silent vs quiet.** Peak and RMS both print `0.00000`
-  for a correctly-mixed quiet passage; only an exact `nonzero=0/M` proves the guest submitted a
-  cleared buffer. The rule lives in `AudioSignalStats` (`src/hle/audio.hpp`) and is unit-tested.
-- **Judge a port by its `life:` totals, never by one interval.** Per-interval counters reset every
-  second, and real playback has gaps, so any single line can read `nonzero=0/M` on a port that
-  carries strong signal over the run. The never-reset `life: nonzero=N/M peak=P` on every port line
-  is what makes one line sufficient — reading only the last interval inverted this investigation's
-  first conclusion (instrument-trap 38).
+- **`nonzero=N/M` is the measure that decides silent vs quiet.** Peak is raised by a single stray
+  sample and RMS needs a threshold that will call some genuinely-mixed quiet passage silent; only an
+  exact `nonzero=0/M` proves the guest submitted a cleared buffer. The rule lives in
+  `AudioSignalStats` (`src/hle/audio.hpp`) and is unit-tested against both alternatives.
+- **`nan=N` names the one remaining input class.** NaN is neither silence nor signal: the sink
+  clamps it to zero, so a NaN-producing guest is audibly silent while its buffers are "full". The
+  probe counts NaN separately on both port and bed lines and then treats it as the silence it
+  becomes, so `nonzero>0 nan>0` is a decode bug, not a working mix.
 - **Per-port attribution** locates loss the mixed bed hides: `skip-not-main` (a port with signal
   discarded for not being MAIN), `skip-fmt` (unsupported layout), `no-pcm` (no buffer published),
   `short` (a partial/faulting guest read).
 - A port **rejected for its format is still read and measured** under this probe, because a rejected
   port is exactly where lost audio would hide — "nothing there" must be a measurement, not an
-  assumption. Rejection still discards it from the mix; only the diagnostic reads it.
+  assumption. Rejection still discards it from the mix; only the diagnostic reads it. Treat such a
+  reading as slightly lower confidence than an accepted port's: the read length is derived from the
+  context grain and a layout prosper does not support, so an over-read past the guest buffer would
+  be attributed to that port. It is fault-safe and cannot invent silence, but it could in principle
+  inflate `nonzero` — confirm a surprising result against the producing code before acting on it.
 
 Related, narrower probes: `PROSPER_AUDIOLOG=1` (legacy `sceAudioOut` path: per-port calls, bytes,
 peak and RMS), `PROSPER_AUDIO_DUMP=PATH` (raw `PATH.portN.raw` PCM for offline inspection),

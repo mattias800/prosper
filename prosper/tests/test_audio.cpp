@@ -132,16 +132,29 @@ static void test_signal_stats() {
     CHECK(zero.peak == 0.0);
     CHECK(zero.rms() == 0.0);
 
-    // A genuinely QUIET but real mix. Its peak and RMS both round to 0.0000 at the four decimals
-    // a log line prints, so only the nonzero count separates it from the all-zero case above —
-    // this is the assertion that would fail if the measure were peak/RMS alone.
+    // A genuinely QUIET but real mix, far below any threshold one would pick for "audible".
+    // This is the case an RMS-threshold rule gets wrong, and the assertion that fails if the
+    // measure is changed to one.
     AudioSignalStats quiet;
-    for (int i = 0; i < 512; i++) quiet.add(i % 2 ? 3.0e-5f : -3.0e-5f);
+    for (int i = 0; i < 512; i++) quiet.add(i % 2 ? 3.0e-7f : -3.0e-7f);
     CHECK(quiet.nonzero == 512);
     CHECK(!quiet.silent());
-    CHECK(quiet.peak < 1.0e-4);            // would print as 0.00000
-    CHECK(quiet.rms() < 1.0e-4);           // would print as 0.00000
-    CHECK(quiet.rms() > 0.0);              // but is measurably non-zero
+    CHECK(quiet.peak < 1.0e-6);
+    CHECK(quiet.rms() < 1.0e-6);
+    CHECK(quiet.rms() > 0.0);              // but exactly, measurably non-zero
+
+    // NaN is the one input class where "non-zero" and "non-zero peak" disagree: `a > peak` is false
+    // for NaN, so a peak-based rule reports an all-NaN buffer as silent while the nonzero count
+    // reports it as full. Pins the semantics against a peak==0.0 implementation, which satisfies
+    // every other case here. The probe counts NaN separately and then treats it as the silence the
+    // sink's clamp turns it into, so this distinction must stay visible at the accumulator.
+    AudioSignalStats nans;
+    const float nan_v = std::nan("");
+    for (int i = 0; i < 64; i++) nans.add(nan_v);
+    CHECK(nans.samples == 64);
+    CHECK(nans.nonzero == 64);             // a peak-based rule would say 0 here
+    CHECK(!nans.silent());
+    CHECK(nans.peak == 0.0);               // NaN never raises the running peak
 
     // Real programme material: peak and RMS both meaningful, nonzero tracks the samples.
     AudioSignalStats loud;

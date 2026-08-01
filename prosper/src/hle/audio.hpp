@@ -43,12 +43,15 @@ bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth);
 // Non-silence measure for submitted PCM (see PROSPER_AUDIO_FLOW in hle_audio.cpp). Diagnosing a
 // silent title requires separating "the guest submitted nothing", "the guest submitted zeros" and
 // "the guest submitted real signal we then lost", and no single statistic does that:
-//   peak    catches a lone transient but not how much signal is present;
-//   rms()   separates an audible mix from a denormal noise floor, but a correctly-mixed QUIET
-//           passage and all-zero PCM both round to 0.0000 at the precision a log line shows;
-//   nonzero counts samples differing from exactly zero — the only one of the three that makes
-//           "genuinely silent" distinguishable from "quiet", since a memset buffer has nonzero==0
-//           exactly while real programme material has nonzero close to samples.
+//   peak    catches a lone transient but says nothing about how much signal is present — one stray
+//           sample in an otherwise empty buffer reports the same peak as a full mix;
+//   rms()   separates an audible mix from a denormal noise floor, but is a threshold judgement: any
+//           cutoff you pick calls some genuinely-mixed quiet passage "silent";
+//   nonzero counts samples differing from exactly zero. It is the only EXACT member of the three,
+//           and the only one that separates the two cases the caller must not confuse: a buffer the
+//           guest cleared has nonzero==0 exactly, whereas real programme material — however quiet —
+//           has nonzero close to samples. Note it is exactness, not print precision, that matters:
+//           a level low enough to print as 0.00000 can still be unambiguously non-silent here.
 // Kept as a pure accumulator so the decision rule the diagnostic rests on is unit-testable
 // without a device, a guest, or a live boot.
 struct AudioSignalStats {
