@@ -5511,16 +5511,45 @@ bool resolve_indirect_dispatch_arguments(const GpuState::Dispatch& source,
     return true;
 }
 
+// `failure`, when supplied, is filled on every false return — mirroring realize_retained_compute.
+// The two exits above realize_draw_item name themselves, because nothing was attempted there and a
+// shader/pipeline diagnostic cannot exist; the third forwards whatever realize_draw_item determined
+// (#1636). Callers that do not want a diagnostic keep passing nothing.
 bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, float scale_y,
-                           DrawItem& item) {
-    if (index >= st.draws.size() || !retained_draw_selected(st, index)) return false;
+                           DrawItem& item, OperationRealizationFailure* failure = nullptr) {
+    const auto note = [&](RealizationFailureReason reason) {
+        // An out-of-range index has no planned operation to attach to, and a record whose identity
+        // matches nothing fails validate_failure_diagnostics for the WHOLE capture. Report nothing
+        // rather than poison the capture; the caller still sees false.
+        if (!failure || index >= st.draws.size()) return false;
+        *failure = {};
+        failure->kind = SubmitOperationKind::Draw;
+        failure->index = index;
+        failure->command_order = st.draws[index].command_order;
+        failure->reason = reason;
+        return false;
+    };
+    if (index >= st.draws.size() || !retained_draw_selected(st, index))
+        return note(RealizationFailureReason::RetainedDrawNotSelected);
     const bool per_draw = use_per_draw_policy(st);
     const GpuState& draw_state = per_draw ? st.state_at_draw(index) : st;
     GpuState::Draw draw;
-    if (!resolve_indirect_draw_arguments(st, st.draws[index], draw)) return false;
+    if (!resolve_indirect_draw_arguments(st, st.draws[index], draw))
+        return note(RealizationFailureReason::IndirectArguments);
     const bool log = getenv("PROSPER_GFXLOG") != nullptr || getenv("PROSPER_EXECLOG") != nullptr;
     if (!realize_draw_item(draw_state, &draw, draw.index_count, 0x10000, log, item,
-                           nullptr, true)) return false;
+                           failure, true)) {
+        // realize_draw_item resets and fills the record, including pipeline/targets/extent, but has
+        // no notion of which retained operation it belongs to.
+        if (failure) {
+            failure->kind = SubmitOperationKind::Draw;
+            failure->index = index;
+            failure->command_order = draw.command_order;
+            if (failure->reason == RealizationFailureReason::None)
+                failure->reason = RealizationFailureReason::Unknown;
+        }
+        return false;
+    }
     item.draw_index = index;
     item.command_order = draw.command_order;
     if (scale_x != 1.0f || scale_y != 1.0f)
@@ -5637,12 +5666,15 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     if (capture_trace) {
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Draw, operation.index,
-                            operation.command_order, RealizationFailureReason::Unknown});
+                            operation.command_order,
+                            RealizationFailureReason::IndirectDependencies});
                     }
                     break;
                 }
                 DrawItem item;
                 bool realized = false;
+                OperationRealizationFailure failure;
+                bool failure_known = false;
                 if (eager_draws) {
                     const auto found = eager_draw_by_index.find(operation.index);
                     if (found != eager_draw_by_index.end()) {
@@ -5651,11 +5683,31 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     }
                 } else {
                     realized = realize_retained_draw(
-                        st, operation.index, scale_x, scale_y, item);
+                        st, operation.index, scale_x, scale_y, item,
+                        capture_trace ? &failure : nullptr);
+                    failure_known = capture_trace != nullptr;
                 }
                 if (realized) {
                     if (capture_trace) capture_trace->draws.push_back(item);
                     span.push_back(std::move(item));
+                } else if (capture_trace) {
+                    // The reason used to die here: this path simply broke, and gpu_capture later
+                    // synthesized an empty Unknown record for the unrealized operation (#1636).
+                    if (failure_known) {
+                        failure.command_order = operation.command_order;
+                        capture_trace->failures.push_back(std::move(failure));
+                    } else {
+                        // Eager path: realize_gpustate_draws DOES have a failures out-parameter,
+                        // but this submit's call site (:6023) passes nullptr, so the reason was
+                        // dropped in that earlier pass and Unknown is the honest answer here rather
+                        // than a guess. Not a simple plumb-through to fix: requesting failures also
+                        // takes the serial path (gpu_execute.hpp:1650 gates parallel realization on
+                        // `!failures`), so it trades draw-realization throughput for diagnostics.
+                        // Tracked in #1643.
+                        capture_trace->failures.push_back({
+                            SubmitOperationKind::Draw, operation.index,
+                            operation.command_order, RealizationFailureReason::Unknown});
+                    }
                 }
                 break;
             }
@@ -5666,7 +5718,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     if (capture_trace) {
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Dispatch, operation.index,
-                            operation.command_order, RealizationFailureReason::Unknown});
+                            operation.command_order,
+                            RealizationFailureReason::IndirectDependencies});
                     }
                     producer_epoch_ok = false;
                     break;
