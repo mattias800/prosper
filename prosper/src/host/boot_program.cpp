@@ -175,7 +175,12 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
             }
             const uint64_t base = BOOT_PLUGIN_AUTO_BASE + (uint64_t)slot * BOOT_PLUGIN_AUTO_STRIDE;
             printf("plugin auto-link: %s @ 0x%llx\n", path.c_str(), (unsigned long long)base);
-            in.insert(in.begin() + (ptrdiff_t)(insert_at + slot), { path, base });
+            // skip_on_export_collision: never introduce a duplicate NID export. A title can ship two
+            // builds of the same library (Evergate's libfmod.prx + libfmodL.prx export identical
+            // NIDs); linking both would run two init_arrays and make dlsym answer differently per
+            // module handle. Deduplicating on exports rather than on a filename suffix also degrades
+            // correctly for a title that ships only the debug variant — nothing collides, so it links.
+            in.insert(in.begin() + (ptrdiff_t)(insert_at + slot), { path, base, true });
             slot++;
         }
     }
@@ -201,6 +206,11 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
 
     std::string e;
     if (!link_program(in, BOOT_STUB, p, &e)) return fail("link failed: " + e);
+    // Loud, self-describing report of every auto-linked plugin the linker refused: which module was
+    // dropped, the exact NID that collided, and which already-linked module owns it.
+    for (const auto& s : p.skipped_modules)
+        printf("plugin auto-link: SKIPPED %s — it exports NID %s, already provided by %s\n",
+               s.path.c_str(), s.nid.c_str(), s.owner_path.c_str());
     printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
            p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(), p.init_fns.size());
 

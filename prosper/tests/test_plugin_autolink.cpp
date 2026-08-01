@@ -12,11 +12,13 @@
 // The contract under test: everything in <dump>/Media/Plugins/*.prx that the caller did not already
 // name (case-insensitively) is returned, in a deterministic order, and nothing else is.
 #include "../src/host/boot_program.hpp"
+#include "../src/loader/linker.hpp"
 #include "test_scratch.h"
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -37,7 +39,7 @@ static bool has(const std::vector<std::string>& v, const std::string& s) {
     return false;
 }
 
-int main() {
+int main(int argc, char** argv) {
     std::error_code ec;
     const fs::path root = prosper_test::test_scratch_dir() / "prosper_test_plugin_autolink";
     fs::remove_all(root, ec);
@@ -104,6 +106,93 @@ int main() {
     CHECK(has(lcnames, "Extra.prx"), "lower-cased Media/Plugins directory is still discovered");
 
     fs::remove_all(root, ec);
+
+    // ---- export-collision predicate ------------------------------------------------------------
+    // Discovery alone is not enough: a title can ship two builds of the SAME library under different
+    // filenames. Evergate (PPSA01885) ships `libfmod.prx` AND `libfmodL.prx` — FMOD's release and
+    // logging builds, exporting identical NIDs. The global export table is first-definition-wins and
+    // silent, so linking both would run two init_arrays and make sceKernelDlsym answer differently
+    // depending on which module handle it is asked through. Basename dedup cannot see that; the
+    // linker therefore refuses an optional module whose exports collide.
+    //
+    // Module is a plain struct, so the predicate is exercised here on synthetic symbol tables with no
+    // ELF fixture and no game dump — this part runs in CI.
+    auto sym = [](const char* nid, bool is_import, uint64_t value) {
+        prosper::Symbol s; s.nid = nid; s.is_import = is_import; s.value = value; return s;
+    };
+    prosper::Module release;                        // stands in for libfmod.prx
+    release.path = "libfmod.prx";
+    release.symbols = { sym("AAAAAAAAAAA", false, 0x1000), sym("BBBBBBBBBBB", false, 0x2000) };
+    prosper::Module logging;                        // stands in for libfmodL.prx: same NIDs
+    logging.path = "libfmodL.prx";
+    logging.symbols = { sym("AAAAAAAAAAA", false, 0x8000), sym("BBBBBBBBBBB", false, 0x9000) };
+    prosper::Module distinct;                       // stands in for libresonanceaudio.prx
+    distinct.path = "libresonanceaudio.prx";
+    distinct.symbols = { sym("CCCCCCCCCCC", false, 0x1000) };
+
+    CHECK(prosper::module_export_nids(release).size() == 2, "module_export_nids counts real exports");
+
+    std::unordered_map<std::string, std::string> claimed;
+    for (const auto& n : prosper::module_export_nids(release)) claimed.emplace(n, release.path);
+
+    const prosper::ExportCollision dup = prosper::find_export_collision(logging, claimed);
+    CHECK(dup.nid == "AAAAAAAAAAA", "duplicate-export module reports the first colliding NID");
+    CHECK(dup.owner_path == "libfmod.prx", "collision names the module that already owns the NID");
+    CHECK(prosper::find_export_collision(distinct, claimed).nid.empty(),
+          "a module with disjoint exports does not collide");
+    CHECK(prosper::find_export_collision(logging, {}).nid.empty(),
+          "the debug build alone does not collide (a title shipping only it still links it)");
+
+    // The collision predicate must match the export-table predicate exactly, or a module could be
+    // accepted as collision-free and then still alias someone else's NID: imports, empty NIDs and
+    // zero-valued symbols contribute nothing and must never trigger a skip.
+    prosper::Module noise;
+    noise.path = "noise.prx";
+    noise.symbols = { sym("AAAAAAAAAAA", true, 0x1000),    // import of the same NID
+                      sym("BBBBBBBBBBB", false, 0),        // defined but value 0
+                      sym("", false, 0x4000) };            // no NID
+    CHECK(prosper::module_export_nids(noise).empty(),
+          "imports, zero-valued and NID-less symbols are not exports");
+    CHECK(prosper::find_export_collision(noise, claimed).nid.empty(),
+          "importing a claimed NID is not a collision");
+
+    // ---- dump-backed wiring (only when a game dump is configured) ------------------------------
+    // Proves the flag is actually honoured by link_program: the same PRX listed twice is a guaranteed
+    // self-collision, so the flagged second copy must be dropped, and the unflagged control must not.
+    if (argc >= 2) {
+        const std::string dump_root = argv[1];
+        const std::string plugin = dump_root + "/Media/Plugins/PSN.prx";
+        if (fs::exists(fs::path(plugin))) {
+            const std::vector<prosper::LinkInput> control = {
+                { dump_root + "/eboot.bin", 0x410000000ull },
+                { plugin, 0x5d0000000ull },
+                { plugin, 0x5d4000000ull },                 // no flag: linked twice, as before
+            };
+            std::vector<prosper::LinkInput> guarded = control;
+            guarded[2].skip_on_export_collision = true;
+
+            prosper::Program pc, pg;
+            std::string lerr;
+            const bool okc = prosper::link_program(control, 0x600000000ull, pc, &lerr);
+            const bool okg = prosper::link_program(guarded, 0x600000000ull, pg, &lerr);
+            CHECK(okc && okg, "both link runs succeed");
+            CHECK(pc.skipped_modules.empty(), "control: an unflagged duplicate is still linked");
+            CHECK(pc.mods.size() == 3, "control: three modules linked");
+            CHECK(pg.skipped_modules.size() == 1, "guarded: the colliding duplicate is skipped");
+            CHECK(pg.mods.size() == 2, "guarded: only two modules linked");
+            if (pg.skipped_modules.size() == 1) {
+                CHECK(pg.skipped_modules[0].path == plugin, "skip record names the dropped module");
+                CHECK(pg.skipped_modules[0].owner_path == plugin, "skip record names the owner");
+                CHECK(!pg.skipped_modules[0].nid.empty(), "skip record carries the colliding NID");
+            }
+        } else {
+            printf("  [skip] %s has no Media/Plugins/PSN.prx — link wiring not exercised\n",
+                   dump_root.c_str());
+        }
+    } else {
+        printf("  [skip] no game dump argument — link wiring not exercised\n");
+    }
+
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
     return fails ? 1 : 0;
 }
