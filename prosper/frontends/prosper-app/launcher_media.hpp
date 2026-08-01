@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -160,6 +161,21 @@ inline const uint8_t* atrac9_subformat_guid() {
     return kGuid;
 }
 
+// A forward loop from the RIFF `smpl` chunk, in decoded sample-frames (per channel). `end` is the last
+// frame played, per the RIFF spec, so playback covers [start, end] and then jumps back to start.
+//
+// Worth honouring rather than restarting the file: of the 9 local tracks that carry smpl, 5 declare a
+// loop that begins well into the track (up to 1,234,542 frames — 25 s of intro), and one ends 607,162
+// frames before the data does, so it has a tail that must NOT be heard when looping. Ignoring these
+// would play the intro on every repeat and let a track run into its own ending.
+struct At9Loop {
+    bool     ok    = false;
+    uint32_t start = 0;
+    uint32_t end   = 0;   // inclusive
+};
+
+inline constexpr uint32_t kSmplLoopForward = 0;
+
 struct At9Clip {
     bool     ok                = false;
     uint16_t channels          = 0;
@@ -169,8 +185,30 @@ struct At9Clip {
     uint8_t  config[4]         = {0, 0, 0, 0};
     size_t   data_offset       = 0;
     size_t   data_size         = 0;   // truncated to whole superframes
+    At9Loop  loop;                    // absent (ok == false) on the 4 local tracks with no smpl chunk
     const char* reason         = "";
+
+    // Decoded sample-frames per channel in the whole clip.
+    uint64_t total_frames() const {
+        if (block_align == 0) return 0;
+        return static_cast<uint64_t>(data_size / block_align) * samples_per_block;
+    }
 };
+
+// Where playback resumes after `frame`, given the clip's loop. Returns the next frame to play.
+//
+// Whole-file looping is the fallback, used when the track has no smpl chunk or its loop did not
+// validate — a seam at the join, but a track that keeps playing, which is what a launcher needs.
+inline uint64_t at9_next_frame(const At9Clip& clip, uint64_t frame) {
+    const uint64_t total = clip.total_frames();
+    if (total == 0) return 0;
+    const uint64_t next = frame + 1;
+    if (clip.loop.ok) {
+        if (next > clip.loop.end) return clip.loop.start;
+        return next;
+    }
+    return next >= total ? 0 : next;
+}
 
 // Validate a .at9 and locate its config word and compressed data.
 //
@@ -193,6 +231,10 @@ inline At9Clip parse_at9_riff(const std::string& bytes) {
     bool   haveFmt = false, haveData = false;
     size_t dataOff = 0;
     uint64_t dataSize = 0;
+    // Held aside until the walk finishes: smpl precedes data in every local file, so the total frame
+    // count needed to range-check the loop is not known yet at the point the chunk is read.
+    bool     sawLoop = false;
+    uint32_t loopStart = 0, loopEnd = 0;
 
     for (size_t off = 12; off + 8 <= end;) {
         const uint32_t size = le32_at(bytes, off + 4);
@@ -222,6 +264,21 @@ inline At9Clip parse_at9_riff(const std::string& bytes) {
             dataOff  = body;
             dataSize = size;
             haveData = true;
+        } else if (fourcc_at(bytes, off, "smpl")) {
+            // 36-byte header then 24 bytes per loop; numSampleLoops at 28. Only the first forward loop
+            // is used — every local file declares exactly one, and a second would have no meaning for
+            // a single looping bed.
+            if (size >= 36) {
+                const uint32_t loops = le32_at(bytes, body + 28);
+                if (loops >= 1 && size >= 36 + 24) {
+                    const size_t l = body + 36;
+                    if (le32_at(bytes, l + 4) == kSmplLoopForward) {
+                        loopStart = le32_at(bytes, l + 8);
+                        loopEnd   = le32_at(bytes, l + 12);
+                        sawLoop   = true;
+                    }
+                }
+            }
         }
 
         // Chunks are word-aligned: an odd size is followed by a pad byte that is not part of it.
@@ -243,6 +300,18 @@ inline At9Clip parse_at9_riff(const std::string& bytes) {
     clip.data_offset = dataOff;
     clip.data_size   = static_cast<size_t>(dataSize);
     clip.reason      = "";
+
+    // Range-check the loop against what the file actually decodes to. A loop that points past the end
+    // is dropped rather than clamped: a clamp invents an edit the author did not ask for, whereas
+    // falling back to whole-file looping is a behaviour we already support and can describe.
+    if (sawLoop) {
+        const uint64_t total = clip.total_frames();
+        if (loopStart < loopEnd && static_cast<uint64_t>(loopEnd) < total) {
+            clip.loop.ok    = true;
+            clip.loop.start = loopStart;
+            clip.loop.end   = loopEnd;
+        }
+    }
     return clip;
 }
 
@@ -400,17 +469,49 @@ inline std::vector<std::string> lru_touch(std::vector<std::string>& order, const
 // (see app_config.hpp): an explicit environment variable beats the persisted file, which beats the
 // default. `env` is the raw PROSPER_LAUNCHER_MUSIC value, or nullptr when unset.
 //
-// Default on: the point of the feature is the console-like presentation the user asked for, and it is
-// one keypress to turn off and stays off once persisted.
-inline bool resolve_launcher_music(const char* env, bool from_config, bool default_on = true) {
+// Default on for a person browsing their library: the console-like presentation is the point of the
+// feature, and it is one click to turn off and stays off once persisted.
+//
+// Default OFF for a measurement run, which is what `automated` selects. A screenshot capture or a
+// frame-time sweep changes focus far faster than a person does, so the only thing it can produce is a
+// burst of half-second fragments of thirty different themes — noise on the developer's desktop that
+// demonstrates nothing. Silence is therefore the default there and sound is opt-in
+// (PROSPER_LAUNCHER_MUSIC=1) for the one run that actually demonstrates the feature.
+//
+// Unit tests never reach this code at all: the test binary includes only this pure header, so no test
+// can open an audio device however it is configured.
+inline bool resolve_launcher_music(const char* env, bool from_config, bool automated = false) {
     if (env && *env) {
-        // Same spellings the rest of the app's PROSPER_* switches accept.
+        // An explicit setting always wins, so a deliberate demonstration run can still have sound.
         const std::string v(env);
         if (v == "0" || v == "false" || v == "off" || v == "no") return false;
         if (v == "1" || v == "true" || v == "on" || v == "yes") return true;
     }
-    (void)default_on;
+    if (automated) return false;
     return from_config;
+}
+
+// Playback gain for launcher music, as a linear multiplier.
+//
+// Not full scale: these are mastered game themes, and a launcher that opens at 100% is startling and
+// louder than the desktop around it. 0.55 (about -5 dB) sits under a typical desktop mix while staying
+// clearly audible. It is a presentation default, not a correctness claim. CONFIDENCE: MED — chosen by
+// ear against several of the local tracks rather than derived from anything.
+inline constexpr float kDefaultMusicGain = 0.55f;
+
+// PROSPER_LAUNCHER_MUSIC_VOLUME overrides it, clamped to [0,1]. Anything unparseable leaves the default
+// alone rather than silencing the music, so a typo is not mistaken for a missing asset.
+inline float resolve_launcher_music_gain(const char* env, float fallback = kDefaultMusicGain) {
+    if (!env || !*env) return fallback;
+    char* end = nullptr;
+    const double v = std::strtod(env, &end);
+    if (end == env || !end) return fallback;
+    while (*end == ' ' || *end == '\t') ++end;
+    if (*end != '\0') return fallback;          // trailing junk: not a number we understand
+    if (v != v) return fallback;                // NaN
+    if (v < 0.0) return 0.0f;
+    if (v > 1.0) return 1.0f;
+    return static_cast<float>(v);
 }
 
 } // namespace prosper::frontend

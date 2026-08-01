@@ -19,6 +19,11 @@ namespace prosper::frontend {
 struct AppConfig {
     std::string games_dir;   // "" = not set
 
+    // Whether the library plays the focused title's music (#1630). On by default — the console-like
+    // presentation is the point of the feature — and PROSPER_LAUNCHER_MUSIC still overrides this the
+    // way every other host setting here is overridden.
+    bool launcher_music = true;
+
     // Settings this build does not understand, kept verbatim so a round trip does not destroy them.
     // Reading tolerating unknown keys is not enough on its own: --set-games-dir rewrites the whole
     // file, so without this a release build would silently delete whatever a newer build had stored.
@@ -50,6 +55,9 @@ inline AppConfig parse_app_config(const std::string& text) {
         const std::string key = config_trim(line.substr(0, eq));
         const std::string value = config_trim(line.substr(eq + 1));
         if (key == "games_dir") cfg.games_dir = value;
+        else if (key == "launcher_music")
+            // Anything other than an explicit off is on, so a hand-edited "yes" or "1" behaves.
+            cfg.launcher_music = !(value == "0" || value == "false" || value == "off" || value == "no");
         else cfg.unknown_lines.push_back(line);   // preserved across a rewrite
         if (nl == text.size()) break;
     }
@@ -62,6 +70,9 @@ inline std::string serialize_app_config(const AppConfig& cfg) {
         "# A --games-dir argument or PROSPER_GAMES_DIR in the environment overrides games_dir.\n"
         "# Editing by hand is fine; the app rewrites this file, so comments are not preserved.\n";
     if (!cfg.games_dir.empty()) out += "games_dir = " + cfg.games_dir + "\n";
+    // Written unconditionally, unlike games_dir: "off" is a real choice and must survive a rewrite,
+    // whereas an absent games_dir simply means nothing was chosen.
+    out += std::string("launcher_music = ") + (cfg.launcher_music ? "1" : "0") + "\n";
     for (const std::string& line : cfg.unknown_lines) out += line + "\n";
     return out;
 }

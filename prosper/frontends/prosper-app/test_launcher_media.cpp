@@ -69,6 +69,10 @@ struct At9Opts {
     uint16_t cb_size = 34;
     uint8_t  config[4] = {0xFE, 0x74, 0x0B, 0xF0};
     bool     smpl_chunk = false;    // the fmt/fact/smpl/data ordering some dumps use
+    uint32_t loop_start = 256;
+    uint32_t loop_end = 4000;
+    uint32_t loop_type = 0;         // 0 = forward
+    uint32_t loop_count = 1;
     bool     with_data = true;
     bool     good_guid = true;
     uint32_t data_blocks = 4;
@@ -107,7 +111,15 @@ static std::string make_at9(const At9Opts& o = At9Opts{}) {
     std::string body;
     append_chunk(body, "fmt ", fmt);
     append_chunk(body, "fact", std::string(12, '\0'));
-    if (o.smpl_chunk) append_chunk(body, "smpl", std::string(60, '\0'));
+    if (o.smpl_chunk) {
+        // 36-byte header + one 24-byte loop, the shape all 9 local files with an smpl chunk have.
+        std::string smpl(60, '\0');
+        put32(smpl, 28, o.loop_count);          // numSampleLoops
+        put32(smpl, 36 + 4, o.loop_type);
+        put32(smpl, 36 + 8, o.loop_start);
+        put32(smpl, 36 + 12, o.loop_end);
+        append_chunk(body, "smpl", smpl);
+    }
     if (o.with_data)
         append_chunk(body, "data",
                      std::string(static_cast<size_t>(o.block_align) * o.data_blocks + o.data_extra, '\x5A'));
@@ -256,6 +268,44 @@ int main() {
         CHECK(!parse_at9_riff(cut).ok, "a truncated data chunk is rejected");
     }
 
+    // --- AT9: smpl loop points ----------------------------------------------------------------------
+    {
+        const At9Clip none = parse_at9_riff(make_at9());
+        CHECK(!none.loop.ok, "a track with no smpl chunk declares no loop");
+        CHECK(none.total_frames() == 4u * 1024, "the frame count comes from whole superframes");
+        At9Opts o; o.smpl_chunk = true;                 // 4 blocks * 1024 = 4096 frames
+        const At9Clip c = parse_at9_riff(make_at9(o));
+        CHECK(c.loop.ok, "a forward smpl loop is honoured");
+        CHECK(c.loop.start == 256 && c.loop.end == 4000, "with the declared start and end");
+        // Playback walks forward and jumps back to loop_start after the inclusive end, so the intro
+        // before loop_start plays once and the tail after loop_end is never heard.
+        CHECK(at9_next_frame(c, 3999) == 4000, "the loop end itself is played");
+        CHECK(at9_next_frame(c, 4000) == 256, "and playback then returns to the loop start");
+        CHECK(at9_next_frame(c, 100) == 101, "the intro before the loop plays normally the first time");
+    }
+    {
+        // Whole-file looping is the fallback: a seam, but the music keeps going.
+        const At9Clip c = parse_at9_riff(make_at9());
+        CHECK(at9_next_frame(c, 4094) == 4095, "without a loop, playback runs to the end");
+        CHECK(at9_next_frame(c, 4095) == 0, "and wraps to the beginning");
+    }
+    {
+        // A loop that does not fit the decoded audio is dropped rather than clamped: clamping would
+        // invent an edit, whereas whole-file looping is a behaviour we can describe.
+        At9Opts past; past.smpl_chunk = true; past.loop_end = 999999;
+        CHECK(!parse_at9_riff(make_at9(past)).loop.ok, "a loop ending past the audio is ignored");
+        At9Opts inv; inv.smpl_chunk = true; inv.loop_start = 3000; inv.loop_end = 1000;
+        CHECK(!parse_at9_riff(make_at9(inv)).loop.ok, "an inverted loop is ignored");
+        At9Opts eq; eq.smpl_chunk = true; eq.loop_start = 1000; eq.loop_end = 1000;
+        CHECK(!parse_at9_riff(make_at9(eq)).loop.ok, "a zero-length loop is ignored");
+        At9Opts none; none.smpl_chunk = true; none.loop_count = 0;
+        CHECK(!parse_at9_riff(make_at9(none)).loop.ok, "an smpl chunk declaring no loops is ignored");
+        At9Opts back; back.smpl_chunk = true; back.loop_type = 1;   // alternating
+        CHECK(!parse_at9_riff(make_at9(back)).loop.ok, "a non-forward loop type is ignored");
+        // Dropping the loop must never drop the track.
+        CHECK(parse_at9_riff(make_at9(past)).ok, "a bad loop still leaves a playable clip");
+    }
+
     // --- asset locations ---------------------------------------------------------------------------
     {
         const auto with_bc = background_candidates("/games/PPSA24651-app0", true);
@@ -393,6 +443,32 @@ int main() {
         CHECK(resolve_launcher_music("true", false) && resolve_launcher_music("on", false) &&
               resolve_launcher_music("yes", false), "and the usual true ones");
         CHECK(resolve_launcher_music("", true), "an empty value is not a setting; the file still applies");
+    }
+    {
+        // An automated run — a screenshot capture, a timing sweep, a scripted route — must not play
+        // audio on the developer's desktop. Silence is the DEFAULT there and sound is opt-in, so a
+        // harness cannot make noise by forgetting to mute; it can only make noise by asking.
+        CHECK(!resolve_launcher_music(nullptr, true, /*automated=*/true),
+              "an automated run is silent even when the persisted setting says music is on");
+        CHECK(!resolve_launcher_music("", true, true), "and an empty value does not re-enable it");
+        CHECK(resolve_launcher_music("1", false, true),
+              "an explicit PROSPER_LAUNCHER_MUSIC=1 still enables sound for a demonstration run");
+        CHECK(!resolve_launcher_music("0", true, true), "and an explicit off stays off");
+        CHECK(resolve_launcher_music(nullptr, true, /*automated=*/false),
+              "while an ordinary interactive run still plays music");
+    }
+    {
+        CHECK(resolve_launcher_music_gain(nullptr) == kDefaultMusicGain,
+              "launcher music plays below full scale by default");
+        CHECK(kDefaultMusicGain > 0.0f && kDefaultMusicGain < 1.0f, "and that default really is reduced");
+        CHECK(resolve_launcher_music_gain("0.25") == 0.25f, "the volume can be set explicitly");
+        CHECK(resolve_launcher_music_gain("0") == 0.0f, "including to silence");
+        CHECK(resolve_launcher_music_gain("5") == 1.0f, "an over-range value clamps rather than clipping");
+        CHECK(resolve_launcher_music_gain("-1") == 0.0f, "and a negative one clamps to silence");
+        // A typo must not be mistaken for "off" — that would look exactly like a missing asset.
+        CHECK(resolve_launcher_music_gain("loud") == kDefaultMusicGain, "unparseable input keeps the default");
+        CHECK(resolve_launcher_music_gain("0.5x") == kDefaultMusicGain, "so does trailing junk");
+        CHECK(resolve_launcher_music_gain("") == kDefaultMusicGain, "so does an empty value");
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }

@@ -1311,7 +1311,8 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
       target_compile_options(prosper_imgui PRIVATE -w)
     endif()
 
-    add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp)
+    add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp
+                               frontends/prosper-app/library_media.cpp)
     target_include_directories(prosper-app PRIVATE src third_party/stb)
     target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan prosper_imgui)
     target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_LIBRARY_UI=1)
