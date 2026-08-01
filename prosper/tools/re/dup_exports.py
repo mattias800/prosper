@@ -96,7 +96,13 @@ for dump in sorted(ROOT.glob("PPSA*-app0")):
         if key in seen_files: continue
         seen_files.add(key)
         e = exports(f)
-        if e: mods[rel] = e
+        if e is None:
+            print(f"  !! {dump.name}: self_dump FAILED on {rel} — census incomplete for this title",
+                  file=sys.stderr)
+            continue
+        # An empty set is a real answer (18 eboots export nothing); None is a tool failure. Conflating
+        # them would let a broken self_dump report a title as clean.
+        mods[rel] = e
     if not mods: continue
     total_dumps += 1
     owners = collections.defaultdict(list)

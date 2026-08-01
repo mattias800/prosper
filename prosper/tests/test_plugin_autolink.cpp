@@ -206,8 +206,18 @@ int main(int argc, char** argv) {
                 // a different address — proof this is an alias, not a duplicate of one address.
                 CHECK(a.winner != a.loser,
                       "#1635: the discarded definition is a genuinely different address");
-                CHECK(a.winner < a.loser,
-                      "#1635: first-wins is preserved — the earlier-linked module keeps the NID");
+                // first-wins means the winner lies inside the image of the EARLIER-linked module.
+                // Comparing the two addresses directly would only assert this fixture's base ordering
+                // (0x5d0000000 < 0x5d4000000) — both records share one RVA, so that comparison is a
+                // statement about the test's own setup, not about the loader's policy.
+                bool winner_in_first = false, loser_in_second = false;
+                if (pc.imgs.size() >= 3) {
+                    const uint64_t b1 = pc.imgs[1].base, b2 = pc.imgs[2].base;
+                    winner_in_first  = a.winner >= b1 && a.winner < b2;
+                    loser_in_second  = a.loser  >= b2;
+                }
+                CHECK(winner_in_first && loser_in_second,
+                      "#1635: first-wins — the winner is in the earlier image, the loser in the later");
             }
         } else {
             printf("  [skip] %s has no Media/Plugins/PSN.prx — link wiring not exercised\n",

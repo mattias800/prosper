@@ -216,9 +216,10 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     // handle's own table first (#147) — so a NID listed here resolves to DIFFERENT addresses
     // depending on which handle asks. Bounded print, full count, so a busy pair cannot bury the line.
     if (!p.aliased_exports.empty()) {
-        size_t shown = 0;
-        for (const auto& a : p.aliased_exports) {
-            if (shown++ >= 8) break;
+        constexpr size_t kMaxShown = 8;
+        const size_t shown = std::min(p.aliased_exports.size(), kMaxShown);
+        for (size_t i = 0; i < shown; i++) {
+            const auto& a = p.aliased_exports[i];
             printf("export alias: NID %s -> %s (0x%llx); %s also exports it (0x%llx), discarded\n",
                    a.nid.c_str(), a.winner_path.c_str(), (unsigned long long)a.winner,
                    a.loser_path.c_str(), (unsigned long long)a.loser);

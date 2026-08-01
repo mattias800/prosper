@@ -69,6 +69,14 @@ struct Program {
     // all among modules linked BY NAME — PSNCommon.prx + PSNCore.prx share 4 on six titles,
     // libfmod.prx + libfmodstudio.prx share 16, and AkMotion/AkSoundEngine/AkVorbisHwAccelerator
     // share one three ways. See tools/re/dup_exports.py.
+    //
+    // MEASURED SEVERITY TODAY: nil. Cross-referencing self_dump's [IMPORTS BY LIBRARY] for every
+    // linked module of those 7 titles, NONE of the 21 distinct aliased NIDs is imported by anything —
+    // so no import currently resolves through an alias, and no title's behaviour depends on which
+    // module won. That is why this is a diagnostic and not a policy change. It is also why the
+    // diagnostic matters: the moment a title does import one, the winner becomes load-order-dependent
+    // and this is the only thing that would say so. Re-check with tools/re/dup_exports.py before
+    // assuming it still holds for a newly added dump.
     struct AliasedExport { std::string nid, winner_path, loser_path; uint64_t winner, loser; };
     std::vector<AliasedExport> aliased_exports;
 
