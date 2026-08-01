@@ -659,10 +659,14 @@ int main() {
               "color-state trace dimension filter matches programmed color targets only");
 
         // #1459: a resolved pipeline must carry WHY its color write mask is zero, not merely that it
-        // is. These three states all resolve to color_write_mask == 0 for entirely different reasons
-        // — a present zero target mask, a present zero shader mask, and MODE=DISABLE with both masks
-        // write-all. Each demands a different fix, so a capsule that records only the resolved mask
-        // makes them indistinguishable offline. Assert the retained triple separates all three.
+        // is. A present zero target mask and a present zero shader mask both resolve to
+        // color_write_mask == 0 for different reasons, each demanding a different fix, so a capsule
+        // that records only the resolved mask makes them indistinguishable offline. Assert the
+        // retained triple separates them.
+        //
+        // #1724 removed the third case: MODE=DISABLE no longer zeroes an explicitly programmed mask,
+        // so that state now resolves to write-all and is asserted as such below. The raw triple is
+        // still retained for it, which is what keeps the offline question answerable.
         GpuState zero_target_state;
         zero_target_state.cx[P::CB_TARGET_MASK] = 0u;
         zero_target_state.cx[P::CB_SHADER_MASK] = 0xFFu;
@@ -684,9 +688,13 @@ int main() {
         const ResolvedPipelineState disabled =
             resolve_pipeline_state(extract_render_state(disabled_state));
 
-        CHECK(zero_target.color_write_mask == 0 && zero_shader.color_write_mask == 0 &&
-              disabled.color_write_mask == 0,
-              "all three suppression causes resolve to the same zero color write mask");
+        CHECK(zero_target.color_write_mask == 0 && zero_shader.color_write_mask == 0,
+              "both mask-derived suppression causes resolve to the same zero color write mask");
+        // #1724: the guest's explicit write-all mask survives MODE=DISABLE. Astro Bot programs
+        // exactly this combination on 30 of 36 draws in submit 6179 — including a 140,825-dword
+        // fragment shader across three MRTs — and the old override dropped every one of them.
+        CHECK(disabled.color_write_mask == 0xFu && disabled.color1_write_mask == 0xFu,
+              "MODE=DISABLE does not override an explicitly programmed CB_TARGET_MASK");
         CHECK(zero_target.has_cb_target_mask && zero_target.cb_target_mask == 0u &&
               zero_target.has_cb_shader_mask && zero_target.cb_shader_mask == 0xFFu,
               "a present zero CB_TARGET_MASK is retained as present-and-zero");
@@ -697,7 +705,7 @@ int main() {
               ((disabled.cb_color_control >> P::CB_COLOR_CONTROL_MODE_SHIFT) &
                P::CB_COLOR_CONTROL_MODE_MASK) == P::CB_COLOR_CONTROL_MODE_DISABLE &&
               disabled.cb_target_mask == 0xFFu && disabled.cb_shader_mask == 0xFFu,
-              "MODE=DISABLE is distinguishable from either mask being zero");
+              "the raw triple still records MODE=DISABLE alongside the write-all masks");
 
         // The absent case must stay distinct from all of them: no register programmed at all
         // resolves to write-all, which is the opposite outcome of a present zero.
@@ -715,9 +723,11 @@ int main() {
               "color-state snapshot distinguishes absent registers from effective write-all fallbacks");
     }
 
-    // #919: an explicit MODE=DISABLE suppresses MRT writes but must not suppress depth/stencil.
-    // Presence matters because zero is also the historical value of an absent register in direct
-    // RenderState users. DCC_DECOMPRESS remains owned by the helper-program path in gpu_execute.hpp.
+    // #919's real contract, preserved by #1724: a COLOR-DISABLED draw must still execute for its
+    // depth/stencil side effect. #1724 changed only WHERE "color-disabled" comes from — the guest's
+    // explicit CB_TARGET_MASK, never CB_COLOR_CONTROL.MODE. Presence still matters because zero is
+    // also the historical value of an absent register in direct RenderState users. DCC_DECOMPRESS
+    // remains owned by the helper-program path in gpu_execute.hpp.
     {
         GpuState absent_state;
         absent_state.cx[P::CB_TARGET_MASK] = 0xFFu;
@@ -728,16 +738,40 @@ int main() {
                   absent_ps.color1_write_mask == 0xFu,
               "absent CB_COLOR_CONTROL retains legacy color-write behavior");
 
+        // A genuine color-disabled pass programs CB_TARGET_MASK=0. It must resolve to no color
+        // write AND still carry its depth/stencil side effect — that is the contract #919 existed
+        // for, and it is honored by the mask derivation with no MODE involvement at all.
+        GpuState prepass_state;
+        prepass_state.cx[P::CB_TARGET_MASK] = 0u;
+        prepass_state.cx[P::CB_SHADER_MASK] = 0xFFu;
+        prepass_state.cx[P::CB_COLOR_CONTROL] = 0x00CC0010u;   // MODE = NORMAL
+        RenderState prepass = extract_render_state(prepass_state);
+        prepass.z_write_enable = true;
+        ResolvedPipelineState prepass_ps = resolve_pipeline_state(prepass);
+        CHECK(prepass_ps.color_write_mask == 0 && prepass_ps.color1_write_mask == 0,
+              "a zero CB_TARGET_MASK suppresses every MRT color-write mask");
+        CHECK(prepass_ps.depth_write_enable && has_depth_stencil_side_effect(prepass_ps),
+              "a color-disabled prepass still carries its depth/stencil side effect");
+
+        // #1724: MODE=DISABLE must NOT override an explicit mask. Astro Bot programs exactly this
+        // on 30 of 36 draws in submit 6179 — draw[70] carries target-mask=0x737 across three MRTs
+        // with a 140,825-dword fragment shader at 4K — and the old override resolved all of them to
+        // cwm=0, after which the executor's no-effect path dropped them. The MODE=NORMAL case above
+        // uses the identical base state, so this pair discriminates the mode from the mask.
         RenderState disabled = absent;
         disabled.has_cb_color_control = true;
         disabled.cb_color_control =
             P::CB_COLOR_CONTROL_MODE_DISABLE << P::CB_COLOR_CONTROL_MODE_SHIFT;
         disabled.z_write_enable = true;
         ResolvedPipelineState disabled_ps = resolve_pipeline_state(disabled);
-        CHECK(disabled_ps.color_write_mask == 0 && disabled_ps.color1_write_mask == 0,
-              "explicit CB MODE=DISABLE suppresses every MRT color-write mask");
+        // CB_TARGET_MASK/CB_SHADER_MASK are 8 bits here, so they describe MRT0 and MRT1 only;
+        // slots 2..7 are legitimately zero and are not part of this contract.
+        CHECK(disabled_ps.color_write_mask == 0xFu && disabled_ps.color1_write_mask == 0xFu &&
+                  disabled_ps.color_targets[0].write_mask == 0xFu &&
+                  disabled_ps.color_targets[1].write_mask == 0xFu,
+              "CB MODE=DISABLE does not override an explicitly programmed write-all mask");
         CHECK(disabled_ps.depth_write_enable && has_depth_stencil_side_effect(disabled_ps),
-              "explicit CB MODE=DISABLE preserves depth/stencil side effects");
+              "a MODE=DISABLE draw still carries its depth/stencil side effect");
 
         RenderState normal = absent;
         normal.has_cb_color_control = true;

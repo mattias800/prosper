@@ -812,18 +812,41 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     out1.alpha_blend_op = ps.alpha_blend_op1;
     out1.write_mask = ps.color1_write_mask; out1.disable_rop3 = rs.disable_rop3_1;
 
-    // MODE=DISABLE suppresses color-buffer writes, not the whole draw: depth/stencil tests and
-    // updates still execute. An absent CB_COLOR_CONTROL retains the legacy normal-draw behavior;
-    // otherwise a zero-initialized synthetic RenderState would unexpectedly lose every color draw.
-    // DCC_DECOMPRESS is handled by the AGC helper-program path in gpu_execute.hpp. Other hardware
-    // metadata modes remain ordinary draws for compatibility, but are now visible instead of silent.
+    // #1724: the color write mask comes from CB_TARGET_MASK & CB_SHADER_MASK ABOVE, and nothing
+    // here may override it. CB_COLOR_CONTROL.MODE selects a color-block OPERATION; it is not a
+    // second write-mask gate, and letting it veto an explicit guest mask is measurably destructive.
+    //
+    // #919 added a `MODE == DISABLE -> zero every mask` override. That issue says in its own text
+    // that neither of its two items was "exercised by the currently-booting titles", calling them
+    // "latent incompleteness, not active bugs" — so the override was written from the AMD enum NAME,
+    // never from observed title behavior, and it has never had a case that required it.
+    //
+    // Measured against it, per draw, from prosper's own capsules:
+    //
+    //   Astro Bot submit 6179   mode=0  30 draws, ALL with a non-zero guest mask
+    //   Dragon Quest VII        mode=0   7 draws, ALL with a zero guest mask
+    //
+    // DQ7 programs both signals consistently, so the override is redundant there and the defect is
+    // invisible — which is why this survived. Astro contradicts it on every one, including
+    // draw[70]/[71]: target-mask=0x737 (three MRTs), shader-mask=0xff, and a 140,825-dword fragment
+    // shader at 3840x2160 — the title's main world/lighting shader, which is not a depth prepass by
+    // any reading. The override resolved those to cwm=0, and the executor's no-effect path then
+    // dropped 30 of that submit's 36 draws.
+    //
+    // Note what this deliberately does NOT claim: that hardware's CB_DISABLE writes color. prosper
+    // cannot presently make a claim about this field at all — the offsets and field shifts in
+    // pm4_registers.hpp are vendored verbatim from one secondary implementation, which CLAUDE.md's
+    // evidence hierarchy rates tier 4 (hypothesis only), and whether MODE is even at [6:4] on Gen5
+    // is open (#1706). The argument here is narrower and survives either answer: CB_TARGET_MASK and
+    // CB_SHADER_MASK are unambiguous, already correctly modeled, and explicitly programmed per draw,
+    // so a field prosper cannot yet decode with confidence must not be allowed to veto them.
+    //
+    // A genuine color-disabled pass is unaffected: it programs CB_TARGET_MASK=0, which the
+    // derivation above already honors without consulting MODE at all. That is #919's real contract
+    // (a depth/stencil-only draw still executes for its DS side effect) and it is preserved.
     const uint32_t cb_mode = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE);
     if (rs.has_cb_color_control) {
-        if (cb_mode == P::CB_COLOR_CONTROL_MODE_DISABLE) {
-            ps.color_write_mask = 0;
-            ps.color1_write_mask = 0;
-            for (auto& target : ps.color_targets) target.write_mask = 0;
-        } else if (cb_mode == P::CB_COLOR_CONTROL_MODE_RESOLVE) {
+        if (cb_mode == P::CB_COLOR_CONTROL_MODE_RESOLVE) {
             // MSAA resolve: color0 (MSAA source) -> color1 (single-sample dest). The live backend copies
             // the already-rendered color0 surface into color1 instead of running these as ordinary draws.
             ps.cb_resolve = true;
