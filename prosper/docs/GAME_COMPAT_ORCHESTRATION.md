@@ -94,6 +94,7 @@ count, read the last row's number.
 | 31 | The **first `grep` hit for a register**, when it has more than one consumer | Tracing why Astro's draws resolve `cwm=0`, `CB_COLOR_CONTROL.MODE` is read at `render_state.cpp:143` — where it feeds **only** the gated `PROSPER_MSAA_LOG` diagnostic. Reasoning from that site says MODE does not participate in mask resolution, which **inverts the conclusion**. The site that matters is ~650 lines later, where `MODE == DISABLE` explicitly zeroes `color_write_mask`, `color1_write_mask` and every `color_targets[].write_mask`. Same symbol, two consumers, opposite implications — and nothing at the first site announces that it is not the one. **Find the consumer on the path you are reasoning about**: for a render-state question that is where the pipeline state is built, not where a diagnostic prints. |
 | 32 | **`std::mismatch` read as a failure count** | The R11G11B10 exactness sweep (#1681) printed its first difference with `std::mismatch`, which returns only the **first** differing element, while the assertion compared the **whole vector**. The printout is byte-identical whether 1 texel differs or 92 — so "the same single texel fails on both machines" was a number the instrument never produced, and the supporting argument built on it ("a genuinely wrong encoding would fail broadly rather than at a single value") had no evidence behind it. The real count was **92**. Cousin of #9/#13/#24: an instrument that answers *"did this happen?"* being read as *"how often?"* — here at the level of a single printed element rather than a rate. **When an assertion compares a collection, the diagnostic must summarise the collection**: count the differences, classify them, and report the classification, because the breadth of a failure is usually the thing that selects between explanations. |
 | 33 | **A skipped draw's clear colour read as a rendered pixel** | Six assertions in `test_recompiled_fragment` and one in `test_recompiled_shaders` "failed a rendered-pixel comparison" on lavapipe (#1681). No comparison happened: the shaders require an exact 64-lane fragment subgroup, lavapipe is fixed at 8, and prosper **correctly refused the draw** (`[render] skip draw: fragment shader requires subgroup size 64 (device range 8..8)`, 15 times). The target simply kept its BLUE clear, and a clear colour is a perfectly plausible-looking pixel value — nothing about `center=(0,0,255,255)` announces that no draw ran. The neighbouring assertions in the *same files* already gated on `supports_fragment_wave64_vote`; these did not. **A pixel assertion is only evidence if the draw executed** — assert the capability, or assert the clear, but never read back a target without knowing which of the two you are looking at. Note the failure direction: a fail-visible skip is designed to be loud, and it was — on **stderr**, while the assertions printed to stdout, so the two never appeared together in the ctest summary. |
+| 34 | **A check of the ANSWER read as a check of the RULE** — and a shape shared by several entries here | Deriving an NV12 frame size (#1687), the rule "`w*h*3/2` and `wh + (wh+1)/2` agree" took three attempts: "identical for every reachable input", then "agree whenever `w*h` is even", then the correct one. **Two** were wrong, each in a smaller way; the third was right. The truth is **exact iff BOTH dimensions are even** — independently re-derived three times, most widely at 200x200 (40,000 pairs), never over-reporting — an even *product* is not sufficient and is actively a trap, since `1920x1081` has an even product and the derivation is **960 bytes short**. The error survived three rounds of competent review because every size anyone checked (`1920x1088`, `1920x1080`, `640x480`) is **both-even**, so each spot check confirmed the true rule *and* the wrong one equally. **The cases in front of you are not a sample; they are a coincidence until you show they discriminate.** An exhaustive grid settled it in one command and could have been run first. The general form: verifying the *answer* on the examples you already have tells you nothing about the *rule* — you must ask what input would distinguish your rule from its near-miss, and check that one. Named instances rather than a fraction: an A/B whose arms agree when they must differ (the tell under #10), a pre-registered decision rule that cannot separate its two hypotheses, a vacuous assertion that holds whether or not the event occurred, #33's pixel assertion on a draw that never ran, and this one. **Every one of those PASSED**, and that is the mechanism of concealment, not a coincidence: a green result is **self-authenticating**, so a check that *could not have failed* is indistinguishable from a check that genuinely passed, and both get filed as confirmation. A failing check gets investigated; a vacuous one gets believed. **So the question to ask of your own test before you write down what it showed is not "did it pass?" but "what result would have falsified it?"** — if there is no answer, the test established nothing, however green. Note where it bit: this is normally reached for around *instruments*, and here it was plain arithmetic — nobody thinks to apply the discipline to a formula. |
 
 **Detecting the generated-prose trap (#27), because it generalises past `.pad` files:**
 
@@ -107,6 +108,23 @@ for d in joe-mac asterix summer-sports; do grep -v '^#' "$d/reach-gameplay.pad" 
 
 Seconds of work invalidated three documents. The same check applies to route scripts, per-title status
 docs, issue comments and PR bodies — anywhere parallel artifacts assert parallel results.
+
+**It also happens in source comments, which is where it does the most damage.** "It happens in `.pad`
+files" understates the trap; a second lane hit it the same day in `hle_service.cpp`. Recording the
+first live confirmation of `VdecConfig` (#1687), the comment claimed the guest's values were
+"individually meaningful at **every** offset" and that a wrong field order "**could not**" produce
+them. Checking the pairs one at a time instead of asserting the general claim: `profile=100` /
+`max_level=41` cannot swap (41 is not a `profile_idc`, 100 is not a `level_idc`), `max_dpb` /
+`input_depth` cannot (depth would go negative), width/height cannot (the movie would be portrait) —
+and `resource` / `codec` are **both `1`** in that title, so that one pair is not discriminated at all
+and still rests on the commit that introduced it. The sweeping version was written first and read as
+established fact.
+
+A doc carries a `docs/` path and some ambient suspicion; a source comment sitting above a
+`static_assert` reads as verified by construction, nothing marks it as inference, and every future
+reader inherits it. So when a comment records evidence, **enumerate what the evidence forces and name
+what it does not** — "HIGH except this pair, which is MED, and a non-AVC title settles it in one line
+of log" is a comment the next reader can act on. A general confidence claim is one they cannot check.
 
 This is **worse than a stale `UNVALIDATED` banner**, and for a specific reason: a banner tells the reader
 to check. A confident, specific, plausible header tells the reader **not to bother**, so it survives every
@@ -604,6 +622,41 @@ copy path, so a binding-miss run with the same environment is the control for a 
 - Artifacts are uploaded only for a release. A release is created only for a Git release tag. Ordinary PR CI must show
   the release-publication job skipped.
 - Keep PRs short-lived so other agents inherit generic improvements quickly.
+- **Two mechanical holes in the merge gate, both of which let a PR read as satisfied when it is not.**
+  - **A registered review is not the same as a comment.** `gh pr comment` creates an *issue* comment;
+    only `gh pr review --comment` appears in `gh pr view --json reviews` / `pulls/N/reviews`. A review
+    posted the first way is fully visible on the PR page and invisible to the gate, so the findings
+    are right there while the PR reads as unreviewed.
+  - **Never gate on `reviewDecision`; it is empty here for TWO independent reasons.** (1) A
+    `COMMENTED` review does not populate it **regardless of who posts** — true even for a third-party
+    reviewer, and the reason that survives any change to how reviews are authored. (2) Separately,
+    `gh` is normally authenticated **as the PR author**, so `--approve` is not available. Both matter:
+    someone "fixing" the gate by provisioning a second `gh` identity would find `reviewDecision`
+    **still empty** and wrongly conclude this note was wrong.
+    *Provenance, for both halves, because stating it for only one is the asymmetry this page exists to
+    prevent:* **neither** was measured here. What WAS observed is that `reviewDecision` is empty with
+    `COMMENTED` reviews present, and that `gh api user` matches the PR author — consistent with both
+    claims but isolating neither, since every review observed came from the author account. That
+    `COMMENTED` never populates `reviewDecision`, and that GitHub rejects self-approval, are both
+    **documented platform behaviour**. `--approve` was deliberately **not executed**: running it would
+    either fail or register an approval nobody intended.
+  - **A rebase detaches every review from head, and the gate cannot see it.** `reviews` stays
+    non-empty and still reports `state=COMMENTED`/`APPROVED`, but its `commit_id` points at a SHA no
+    longer on the branch. State the consequence precisely: a stale `commit_id` proves the review **no
+    longer binds to head** — it does *not* prove the content changed, and for a clean rebase the tree
+    is usually byte-identical. The remedy is the same either way: compare each review's `commit_id`
+    against the current head, and if it is stale, establish by **content** whether the approval still
+    applies (`git diff <reviewed-sha> <head>`) rather than assuming in either direction. This is
+    **trap 11 in the other direction** — there a squash made merged content look unmerged by SHA;
+    here a rebase makes reviewed content look unreviewed by SHA. Both resolve the same way: verify by
+    content, not by SHA. The same applies to CI — re-check bound to the exact current SHA, never to
+    the PR number.
+  - **Reviewers: bind your post to head at the write site, rather than relying on the merger to catch
+    a stale one afterwards.** Read `headRefOid` immediately before posting and refuse if it moved:
+    prevention costs one API call, detection costs a round trip and depends on the merger remembering.
+    This is not hypothetical — on #1687 the head moved **twice after the branch was called frozen**,
+    and a reviewer guarding on `headRefOid` correctly refused both times. Posting unconditionally
+    would have left `reviews[]` showing a perfectly healthy row bound to code that had moved on.
 - The orchestrator opens the PR with a self-contained behavioral contract, issue links, evidence, exact tests, risks,
   and known limitations. Wait for all Linux, Windows, and macOS checks before merging.
 - When a game changes from black to visible content, reaches title, reaches gameplay, or materially improves visuals,
