@@ -919,6 +919,324 @@
           "difference_hash": "5777f377a7afaaa6"
         }
       ]
+    },
+    {
+      "name": "joe-mac-gameplay",
+      "dump": "PPSA02801-app0",
+      "scale": 4,
+      "timeout": 190,
+      "capture_after_seconds": 52,
+      "capture_before_seconds": 125,
+      "pad_script": "scripts/joe-mac/reach-gameplay.pad",
+      "savedata_policy": "fresh",
+      "env": {},
+      "min_colors": 30000,
+      "min_qualifying_frames": 50,
+      "min_pixel_changes": 50,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 50,
+      "min_content_match_ratio": 0.75,
+      "review": "Approved all 16 composited images from two independent runs on 2026-08-01. Every image is New Joe & Mac: Caveman Ninja level 1 at 480x270, at the level's opening screen: the twin palms, the cracked volcano and cloud sky, the boulder ledge at the left, the pink flowering shrubs and grass bank, ground enemies (snails and snapping plants), and the full HUD -- player name and score, the segmented health bar, and the lives counter. The route holds no direction, so Joe stays at the level entrance and cycles through idle behaviour (the '1PL' player marker, and the 'I'M HUNGRY' idle taunt), and consecutive samples still differ everywhere: 72 of 72 possible pixel changes in the window on both runs. Progression across the window is the lives counter stepping x3 -> x2 -> x1 -> x0 as he is killed and respawns, with the 'Ready?' respawn banner drawn over the same fully rendered level; that banner was accepted as gameplay, and both runs show it. Because every respawn returns to this one screen, the 52-125s window is a single visual state rather than a progression, which is exactly why it tolerates the deaths. No menu, no GAME OVER and no loading screen appears in either run's window. The window does contain the brief death fades by design -- none was selected among the 16 reviewed images, and they are what the 0.75 match ratio absorbs.",
+      "_note": "Fresh-save guard for New Joe & Mac: Caveman Ninja (PPSA02801) level 1, using exactly the Cross anchors recorded in issue #1593 with no directional input. Profiling that route once per second across a 200s boot at scale 4 (480x270) placed the phases at: black to 5s, logos 6-17s, title and arcade menu 20-37s, a letterboxed transition 39-45s, black at 46s, level 1 from 47.1s. The route does not move Joe, so he is killed roughly every 22s (68s, 91s, 114s) and respawns at the same level-1 opening. The evidence window 52-125s deliberately spans three of those lives rather than trying to fit between them: because every respawn returns to one visual state, 71 of the 73 window samples clear min_colors and all 73 clear the coverage floor in the profile, and across check runs 70-72 of 73 clear coverage; the failures are the brief death fades (2,194 and 5,521 colours in the profile). The window opens about 6s after the last pre-gameplay frame (black at 46s) and ends 13s before GAME OVER. A movement-based variant of this route was tried first and rejected: holding left-stick-right sustains real play, but then Joe's position at any wall-clock second depends on 100s of accumulated progress, and a window placed in it drifted onto a level transition and two death fades on the third run, failing 19 matches against 24 required. A stationary route is the more deterministic guard subject here even though it is the less impressive play. min_colors 30000 is a gross-collapse floor only, never a scene discriminator: the richest frame of the whole run is the arcade MENU at 79,167 colours, 13.2% above the window's best frame (69,963), so colour is blind upward. Coverage is blind too, and this was measured rather than assumed -- the GAME OVER screen at 138.2-154.3s measures 46,494-46,739 colours at 0.9756-0.9758 coverage, so all 17 of its frames clear both floors, and only SSIM excludes them (at most 0.5775, 0 of 17 reaching the 0.85 floor). The window ends 13s before that screen appears.",
+      "structural_references": [
+        {
+          "luma16x9": "a8b1a8ae9a98afa9b6ada4abbea8708178707e91788d9dc099dfb1b09b865c6a274fb38e717fa1a482b8dadce66b556326277271768398907f9ba5b8d99466762c5986897db7b68996a1a1a6a5977a7a416c867d736862585c62676e6459775c4954868e6e946f697f776659575c715f42546f846f9376747e7c7481736f618659454d3b213249424933314d5a4e5050",
+          "average_hash": "0016027e7e7a7e7f",
+          "difference_hash": "925c2ecac8c2e2d3"
+        },
+        {
+          "luma16x9": "a6a8a4a793a3c4bfb1a7b1a5a6916e807564748f77888ea3a6c8c5be9d7f5c682853da8a717c9e9b85a5a5a5a369556126268072768ba5937f9ba5a4a27a66702c59868978a0b88a96a1a1a6a4947a7b416c867d736461585c62676e6459775c4954868e6f886f697f776659575c715e42546f846f947e747e7c7481736f618659454d3b213249424933314d5a4e5050",
+          "average_hash": "0036027e7e7a7e7f",
+          "difference_hash": "92582ecac8cae2fb"
+        },
+        {
+          "luma16x9": "aaababa8969aa7ada4bba7aaada7728f7b6e8191789097b690e1dabda67f5c69294ec68b717fc9a282b1c6cee26a5564262778717686a2957f9ba5a4ac8b66782c59868979b8ba8996a1a1a6a4947a7b416c867d776760585c62676e6459775c4954868e7b8f6f697f77665a575d715f42546f846f8a76747e7c7481736f618659454d3b213249424933314d5a4e5050",
+          "average_hash": "0016027e7e7a7eff",
+          "difference_hash": "925c2ecac8cae2e3"
+        },
+        {
+          "luma16x9": "a5a9a4a7939ab9c3c0aea7b1a6936e808971788777888da199b5cac5a5815c682853d98b7187d3a683a3a8a5a269556126267071768dc2a67f9ba5a4a27a666f2c59868978a0a38996a1a1a6a4947a7b416c867d798d6c585c62676e6459775c4954868e6f8a6f697f77665a575d715f42546f846f947e747e7c7481736f618659454d3b213249424933314d5a4e5050",
+          "average_hash": "0016027e7e7a7e7f",
+          "difference_hash": "92582ec8c8cac2d3"
+        },
+        {
+          "luma16x9": "a9ada8a8979cbaa9aba9a4b2ad9a6e91857f8a8f789499b094b5b8dbbc8f5c68294db58c7182b0d282aba5b2bc6a556326277b727681a49d7f9ca5a4a27a66752c5b89897cafaf8a96a1a1b6ae947a7b416c867d736863585c62676e6559775c4954868e6e946f697f77665a575c715f42546f846f9376747e7c7481736f618657454d3b213249424933314d5a4e5050",
+          "average_hash": "0016027e7e7a7eff",
+          "difference_hash": "925c2ecac8c2c2db"
+        },
+        {
+          "luma16x9": "a6b5afb19397a4afc1bdbfa6a99c6e80857c868b77878cb490abadb8ae825d6b274db78a7183d2d982a6a4a6a469556126266c717588c2ad7f9ca8afa27a666e2c5d8a89789fa28996a1a1a9a7947a7a416c867d73635f585c62676e6559775c4954868e6e946f697f77665a575c715f42546f846f9376747e7c7481736f618658454d3b213249424933314d5a4e5050",
+          "average_hash": "001602767e7a7e7f",
+          "difference_hash": "925c2ecac8dac2e2"
+        },
+        {
+          "luma16x9": "a8adaaa99f989f919499a8aca4916f8586798b96788f90a381b0c6bd97845d72295bcb8f7183d2b982a8d5d2d1685562262785727686b2a47f9eb4b6b27b666e2c5d8d897ba3a68996a1a1adad947a7b416c867d73645f585c62676e6659775c4954868e6e956f697f77665a575c715f42546f846f9376747e7c7481736f61865a454d3b213249424933314d5a4e5050",
+          "average_hash": "0016027e7e7a7e7f",
+          "difference_hash": "925c2ecacacacacb"
+        },
+        {
+          "luma16x9": "a5aca8af9397a4a4afc1bdc0a4956e817f6d8493788a8e9e8eb7afac9d855d6d2847a68a7184d6cf82cde0a8a269556126266e717580a1a27f9ec5c0ae7e666e2c5c8c8978a0a28996a1a1acba947a7a416c867d73665f585c62676e6559775c4954868e6e946f697f77665a575d715f42546f846f9376747e7c7481736f61865a454d3b213249424933314d5a4e5050",
+          "average_hash": "001602767e7a7e7f",
+          "difference_hash": "925c2ecac8eae2e3"
+        },
+        {
+          "luma16x9": "abadaaa99399aabaa8aca8a4a5a66f837f729197798f9eb893c9b4abb08e5d692952bd8f717fc3a382bad8a6a8695563262778727686aa957f9db3a7a27a666e2c5d8c897ab0b28996a1a1a8b2977a7a416c867d736461585c62676e6659775c4954868e6e946f697f77665a575d715f42546f846f9376747e7c7481736f618659454d3b213249424933314d5a4e5050",
+          "average_hash": "0016027e7e7a7e7f",
+          "difference_hash": "925c2ecac8eae2f3"
+        },
+        {
+          "luma16x9": "a6aca7af9397a4a4aec1bdc1a4956e817f6d8394788b8f9d8eb7afac9d855d6d2947a58a7183d9cc82cfe1aaa269556126266e717580a0a07f9ec5c3ae7e666e2c5c8c8978a0a28996a1a1adba947a7a416c867d73665f585c62676e6659775c4954868e6e946f697f77665a575d715f42546f846f9376747e7c7481736f618658454d3b213249424933314d5a4e5050",
+          "average_hash": "001602767e7a7e7f",
+          "difference_hash": "925c2ecac8eae2e3"
+        },
+        {
+          "luma16x9": "a9adaaaa9d9badabbaa7ada7a4916f8286778a9c799699c196becab1988a5d752958c4917183c5bf82b0eacbb8685562262781727687aea77f9eb3b7ac7a666e2c5c8d89759ca68996a1a1afa8957a7a416c867d74705a585c62676e6659775c4954868e6e946f697f77665a575c715f42546f846f9376747e7c7481736f618659454d3b213249424933314d5a4e5050",
+          "average_hash": "001602767e7a7e7f",
+          "difference_hash": "925c2ecacacae2f3"
+        },
+        {
+          "luma16x9": "a3b2adad9797ada4a4aec1bdc0916e8183707a8f79929ea98fa8beb39d815d712953be8a7180bfcf82c9ebe8c169556126277871758097907f9ecbead680666e2c598a897eaba38996a1a2aea7957a7a416c867d736662585c62676e6459775c4954868e6e946f697f77665a575c715f42546f846f9376747e7c7481736f61865a454d3b213249424933314d5a4e5050",
+          "average_hash": "001602767e7a7e7f",
+          "difference_hash": "925c2ecac8cac2cb"
+        },
+        {
+          "luma16x9": "a5adacae9e9eaeaea7b1b8a5af916e807f76909d7989a5cb98d3c6c0b1825c692a54df907183a1a384b3bbabce70556126277b72769abc96859db9b4b481666e2c5b89897fab8b88858da2b8bb957a7b416c867d736562575a61676e6859775b4954868e6f8a7f69777b665a575d715e42546f846f7f8b74888a7481736f618657454d3b213249424933314d5a4e5050",
+          "average_hash": "001e02667e7a7e7f",
+          "difference_hash": "92682ecac8cae2e2"
+        },
+        {
+          "luma16x9": "a7adaba99f98b1a6b6b1a7ada4916e82867a8e96788e95b596c3c4c097825d74295bce8f7190ae9682a5cddad0695562262786727693a4918a99b4b6b37c666e2c5d8d897ca5937f8b96a1adaf947a7b416c867d73645f585c62676e6659775c4954868e6e946f697f77665a575c715f42546f846f9376747e7c7481736f618657454d3b213249424933314d5a4e5050",
+          "average_hash": "001602767e7e7e7f",
+          "difference_hash": "925c2ecacacae2e3"
+        },
+        {
+          "luma16x9": "a6aea7ac949caabba7aba5b1c4a47180786e849078919ec997c2b4a5a18f5c70284dc591717da4ad82bbe9ded670556126267571768197907f9baad2e29466712c5987897db9ba8996a1a1a6aa967a7b416c867d736862585c62676e6459775b4954868e6e946f697f77665a575d715e42546f846f9376747e7c7481736f618657454d3b213249424933314d5a4e5050",
+          "average_hash": "0016027e7e7a7e7f",
+          "difference_hash": "925c2ecac8c2e2d3"
+        },
+        {
+          "luma16x9": "ababadac9998aaaaacb3ada5b1ab718c7a6e7f92788d99b695d7e1af9f7f5c692952c08b717ebe9d82b6c8ddd46f5564262772717685a0907f9ba5a5b99266772c5986897bb8ba8996a1a1a6a4947a7b416c867d736662585c62676e6459775c4954868e6e946f697f77665a575c715f42546f846f9376747e7c7481736f61865b454d3b213249424933314d5a4e5050",
+          "average_hash": "0016027e7e7a7eff",
+          "difference_hash": "925c2ecac8cae2e3"
+        }
+      ],
+      "min_nonblack_ratio": 0.498981,
+      "dims": [
+        480,
+        270
+      ]
+    },
+    {
+      "name": "asterix-gameplay",
+      "dump": "PPSA08576-app0",
+      "scale": 4,
+      "timeout": 190,
+      "capture_after_seconds": 70,
+      "capture_before_seconds": 130,
+      "pad_script": "scripts/asterix/reach-gameplay.pad",
+      "savedata_policy": "fresh",
+      "env": {},
+      "min_colors": 45000,
+      "min_qualifying_frames": 40,
+      "min_pixel_changes": 40,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 40,
+      "min_content_match_ratio": 0.75,
+      "review": "Approved all 16 composited images from two independent runs on 2026-08-01. Every image is Asterix & Obelix: Slap Them All! first forest level at 480x270: Asterix idling mid-path with his weapon raised, the layered parallax forest (large foreground trunk at the left edge, the sunlit orange tree behind him, dark canopy above, menhirs and boulders on the far bank), red mushrooms, the dirt path and grass banks, and the complete HUD -- both character portraits with their health and rage gauges, the score and the TOP score. The frames are not identical stills: the rabbit crossing the upper right changes position from frame to frame and the 'GO!' arrow prompt is present in some samples and absent in others as it blinks, which is what the guard's pixel-change requirement rests on. The score stays at zero because this route deliberately uses no directional input, so Asterix never engages an enemy; the milestone being guarded is that the first forest level renders, which both runs show identically. No logo, title, menu, black or loading frame appears in either window.",
+      "_note": "Fresh-save guard for Asterix & Obelix: Slap Them All! (PPSA08576) first forest level. Profiling the committed route once per second across a 210s boot at scale 4 (480x270) placed the phases at: black to 6s, logos 7-17s, an intro screen 20-23s, title and menus 25-39s, a black load 40-44s, then the first forest level from 45.1s, fading in over 45-48s (40,234 colours at 45.1s, then about 70,900) and settling from 49.1s; all 161 samples from 49.1s to the end of the capture measure 74,569-75,235 colours at 0.9975-0.9991 coverage with no black frame, fade or transition. The evidence window 70-130s is 25s clear of the last sub-threshold frame and has no following one at all. All 60 window samples measured 74,825-75,215 colours at 0.9975-0.9991 coverage, a 0.5% colour spread, and every one matched the reviewed references at SSIM 0.997 or better. min_colors 45000 is a gross-collapse floor 40% below the observed gameplay floor; it deliberately does not separate the title screen (which reaches 58,046 colours), because that is SSIM's job. Asterix idles rather than walking under this route, so the guard's min_pixel_changes of 40 rests on the idle animation, the wandering rabbit and the blinking GO! prompt; the 60-frame window measured 59 changes, the maximum possible, in both verify runs and in every check.",
+      "structural_references": [
+        {
+          "luma16x9": "677f6c5e4c692d43484971493b492a20428564615c6b5364462f4a4b392e5445265b5d3b656c59665f424e48515f4d3b386750516f89895c423c3b394b696a6442776d8795949187766b628d8ea2777e449a9b9a969191929b9d959191909192429bb8b7b0acb6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffe4c000001",
+          "difference_hash": "009862d6989a5ae7"
+        },
+        {
+          "luma16x9": "677f6c5e394b2e43484971493b492a204285646144705364462f4a4b392e5445265b5d3b678859665f414d47515f4d3b38675051708c895c423d3b394b696a6442776d879c999187766b628d9b7b7c80449a9b9a949791929b9d959194959592429bb8b79697b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffe0c000001",
+          "difference_hash": "0090625c18985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e39492e43484971493b492a20428564614470536345304a4b392e5445265b5d3b678859665f414e48515e4d3b38675051718c895c423c3b394c6a706442776d879b979187766b628d9b7b7c80449a9b9a9f9791929b9d959194959592429bb8b79897b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffe0c000001",
+          "difference_hash": "0090625418985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e394a2d43484971493b492a20428564614470536446304a4b392d5545265b5d3b678859665f424d47515f4d3b38675051708c895c423d3b394b656d6442776d899f979187766b628d9b7b7c80449a9b9aa18a91929b9d959194959592429bb8b69a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffe8c000001",
+          "difference_hash": "0090625418985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e394a2d43474971493b492a20428564614470536446304a4b392e5445265b5d3b678859665f424d48515f4e3b38675051708c895c423d3b394b686c6442776d899f989187766b628d8ea2777e449a9b9aa08c91929b9d959191909192429bb8b79a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffecc000001",
+          "difference_hash": "009062d498985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e394a2d43484971493a492a20428564614470536446304a4b392d5545265b5d3b678859665f424d4751604d3b38675051708c895c423d3b394b6a686442776d899f989187766b628d9b7b7c80449a9b9aa08c91929b9d959194959592429bb8b79a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffe0c000001",
+          "difference_hash": "0090625418985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e39492d43484971493b492a204285646144705363462f4a4b392e5445265b5d3b678859665f414d47515f4c3b38675051708c895c433d3b394b6b686442776d899f979187776b618d9b7b7c80449a9b9aa18a91929b9d959194959592429bb8b69a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffe0c000001",
+          "difference_hash": "0090625418985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e394a2e43484971483b492a20428564614470536445304a4b392e5446265b5d3b678859665f414d47515f4d3b38675051708c895c423c3b394b69696442776d899f979187766b628d9b7b7c80449a9b9aa18a91929b9d959194959592429bb8b69a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffe0c000001",
+          "difference_hash": "0090625418985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e48722e43484971493b492a20428564614b855364462f4a4b392e5445265b5d3b5e6e59665f424e48515f4c3b38675051718b895c423c3b394b686a6442776d8795949187766b628d8ea2777e449a9b9a969191929b9d959191909192429bb8b7b1aab6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffecc000001",
+          "difference_hash": "009862d6989a5aef"
+        },
+        {
+          "luma16x9": "677f6c5e394b2e43484971493b492a204285646144705364462f4a4b392e5446265b5d3b678859665f414d47515e4d3b38675051708c895c423d3b394b656d6442776d899f989187766b628d9b7b7c80449a9b9aa08c91929b9d959194959592429bb8b79a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffe8c000001",
+          "difference_hash": "0090625418985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e39492e43474971493b492a20428564614470536345304a4b392e5445265b5d3b678859665f414e48505f4d3b38675051708c895c423c3b394c656e6442776d899f989187766b628d8ea2777e449a9b9aa08c91929b9d959191909192429bb8b79a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffecc000001",
+          "difference_hash": "009062d498985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e394a2d43484971493b492a20428564614470536446304a4b392d5545265b5d3b678859665f424d47515f4d3b38675051708c895c423d3b394b6b686442776d899f979187766b628d9b7b7c80449a9b9aa18a91929b9d959194959592429bb8b69a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffe0c000001",
+          "difference_hash": "0090625418985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e394a2d43484971493a492a20428564614470536446304a4b392d5445265b5d3b678859665f424d48515f4d3b38675051708c895c423d3b394b696b6442776d899f989187766b628d8ea2777e449a9b9aa08c91929b9d959191909192429bb8b79a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffecc000001",
+          "difference_hash": "009062d498985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e39492d43484971493b492a204285646144705363462f4a4b392e5445265b5d3b678859665f414d4751604c3b38675051708c895c433d3b394b68696442776d899f979187776b618d9b7b7c80449a9b9aa18a91929b9d959194959592429bb8b69a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffe0c000001",
+          "difference_hash": "0090625418985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e39492e43484971493b492a204285646144705363462f4a4b392e5445265b5d3b678859665f424e4850604d3b38675051708c895c423d3b394c686b6442776d899f989187766b628d8ea2777e449a9b9aa08c91929b9d959191909192429bb8b79a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffecc000001",
+          "difference_hash": "009062d498985ae7"
+        },
+        {
+          "luma16x9": "677f6c5e394a2e43484971493b492a20428564614470536445304a4b392e5445265b5d3b678859665f414d47515f4d3b38675051708c895c423c3b394b686a6442776d8a9e979187766b628d9b7b7c80449a9b9aa18b91929b9d959194959592429bb8b79a93b6b9b9b6b5b4b2b3b2b3336a8b919aa5aaaba9a8a6a6a7a6a5a63c3e4d4d53586069706c86857a879a87",
+          "average_hash": "f0fefffe0c000001",
+          "difference_hash": "0090625418985ae7"
+        }
+      ],
+      "min_nonblack_ratio": 0.498985,
+      "dims": [
+        480,
+        270
+      ]
+    },
+    {
+      "name": "summer-sports-gameplay",
+      "dump": "PPSA03416-app0",
+      "scale": 4,
+      "timeout": 140,
+      "capture_after_seconds": 55,
+      "capture_before_seconds": 80,
+      "pad_script": "scripts/summer-sports/reach-gameplay.pad",
+      "savedata_policy": "fresh",
+      "env": {},
+      "min_colors": 25000,
+      "min_qualifying_frames": 20,
+      "min_pixel_changes": 20,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 20,
+      "min_content_match_ratio": 0.75,
+      "review": "Approved all 16 composited images from two independent runs on 2026-08-01. Every image is Summer Sports Games' javelin throw event at 960x540 (the title renders at 3840x2160, so scale 4 gives a larger frame than the 1080p titles): the athlete running up the track carrying the javelin, the ATTEMPT 1/3 counter with its three attempt pips, the SPEED power meter, the circular throw reticle, and a full 3D stadium behind -- banked stands packed with animated spectators, the 'Summer Sports Games' hoarding, trackside camera operators and chairs, lane markings, cones, the yellow and purple takeoff zone and the green infield. The camera tracks the run-up, so both runs show the athlete progressing along the track across the window rather than a held pose, and the two runs are closely matched frame for frame. The mid-attempt 'SPEED SAVED!' and 'POOR' callouts appear in both and are small overlays on the same live scene. No image contains the large end-of-attempt FOUL! banner, which the window was deliberately shortened to exclude, and none is the JAVELIN THROW standings overlay the same route settles onto later.",
+      "_note": "Fresh-save guard for Summer Sports Games (PPSA03416) first live athletics event, using exactly the Cross anchors recorded in issue #1597. This title renders at 3840x2160, so scale 4 yields 960x540 frames rather than the 480x270 the 1080p titles produce; dims were taken from the profile, not assumed. Profiling once per second across a 210s boot placed the phases at: black and boot logos to 19s, mode selector and event menus 21-47s, a black load at 48s, then the javelin throw event from 49.1s. The evidence window is 55-80s, inside the first live attempt, 6.9s after the preceding black frame. The right edge was pulled in from 85s after measurement: the end-of-attempt FOUL!/POOR banner at 85.2-86.2s is drawn over the same stadium but is not the same visual state: it scored 0.7313 and 0.6948 against the reference set built from the original 55-85s window, and scores at most 0.6558 against the adopted 55-80s references, below the 0.85 floor either way. It also carries 96,000-102,000 colours against the attempt's 57,000-68,000. With 85s as the edge that banner drifted in and out between runs, which both ate match margin and made the window's richest frame swing by 1.5x; at 80s the window is a single visual state. Two independent blind spots make this guard a judgement call rather than a metric choice. Coverage is exactly 1.0000 for every frame of the run, gameplay and menus alike, so it discriminates nothing here and is retained only as a collapse floor. And the most metrically stable span of the entire run is the static JAVELIN THROW standings screen, settled from 150s onward (48,201-48,489 colours, 1.0000 coverage, SSIM 1.000), which any stability-ranked window search selects first; it is a results overlay, not gameplay, and was rejected by opening the frames. min_colors 25000 is a collapse floor above every observed non-gameplay state (black 1, logos at most 7,080, transitions 11,942, 12,036 and 21,899).",
+      "structural_references": [
+        {
+          "luma16x9": "9baba26c73514848507085826d4e4f62a4a4a06f515c545f818e6b7191816a8d897a826860544f4b5051505558606269989c97948d7e564e79796e6f6f73807a6f726f75747773635c7279787b6e666f7b7a777b7782806f65757878787878777c7c797a89807f7379807575747575757a7a7a8e847c7e7d7e888183b9b2a6a47a7a8e897d7e7e7c7e7e949784727284",
+          "average_hash": "ffffef00e703d323",
+          "difference_hash": "4a8c2ce84f17a347"
+        },
+        {
+          "luma16x9": "a2aea37374514848507085826d4e4f63a5a1997461625960818e6b7191816a8d86836b6254564d4b54525254586262639799928d7a6735727a766c726e79807d6f7575767776685e657377716c8e6e6c7f767c757774746761757878757576777c797979797979716778747575757575757575757575747474747483b9b2a6a479848d8d8d8c8b8b8a8a8a8884727283",
+          "average_hash": "ffe0e704f303d123",
+          "difference_hash": "4c8c09ac8717a347"
+        },
+        {
+          "luma16x9": "abb0a47674514848507085826d4e4f62a2999a7f756a5c63818e6b7191816a8d826d655b52534e505652535555655e6295938d787524627a7a6f6e70727f7e7e767679747462625d5d626f6f6e605b5e767574747474746a616e71737375777d7a7979797979796c66787474747474757575757575746c5e5e667ca29f9f9d9479848d8d8d8c8b8b8a8a77796c6a6a77",
+          "average_hash": "3fe7e706f303d323",
+          "difference_hash": "7c8c0c48c717a747"
+        },
+        {
+          "luma16x9": "adb0a47674514848507085826d4e4f629f9a9a847b6f5e63818e6b7191816a8d8065655852534d555451535458625e6297937f835d246e7a786f717073807d7e7778797076565863636e6e6e61615c5f75747474747473655a6d7173747e888c7a797979797979756778747474788fa67475757575747474747474747781888879848d8d8d8c8b8b8a8a8a8a867b7474",
+          "average_hash": "ffe7ef06f303d323",
+          "difference_hash": "e40c084cc717a747"
+        },
+        {
+          "luma16x9": "b0b1a573775748484e6a8384774e4f549b9a9a86887d645f7a946b708b84797d73666054554f4a56554f5550575b5d5b978b77862c39777a776a73707683807e78786867534c6964606f505f6e8a636b747472716d696960596d757475736b62797979797979798ab7cecfc4a683757a7575747475747495c8ead6d7dcdab384838c8d8d8d8c8b9a8e9493908d857f7e",
+          "average_hash": "fff87800e101d123",
+          "difference_hash": "e4e5e48b831ba7c7"
+        },
+        {
+          "luma16x9": "b0b1a573775748484e6a8384774e4f549b9a9b898680655f7a946b708b84797d6c665f54544f4f54564f544f575b5e5995807f7d1f45787b776a73717781807e7769666351586a665d555b5d708e616b7472716c696869635e7271726f6a5f59797979797ba5dea6acd6b69e7b797a7a7475757597cfeeced6dce1cfa4838c8c838c8d9d9eb3b3abaaa6a09c94847a74",
+          "average_hash": "fffc3c00c100d123",
+          "difference_hash": "f8e8e99ba31ba7c7"
+        },
+        {
+          "luma16x9": "b0b1a573775748484e6a8384774e4f549a9a9c8b8883665f7a946b708b84797d67685d53534f4e55554e544e595b5f57987a8373184f7b7b766b72717982807d736c5d5d5b556d645e505c5e718e626a73726c696868695b5b6c716f6760585979797991c7c7c6bb90928f757b7c7969757ea0dae4ced3d8e0949e868979839298a3c8cfc2bfbcb6b2ab938489867b8a",
+          "average_hash": "ffbe3e00c100d123",
+          "difference_hash": "3c74e889939ba7c7"
+        },
+        {
+          "luma16x9": "b0b1a573775748484e6a8384774e4f549a9b9b8c8e88665f7a946b708b84797c62685b5152534c5652515250585a5d57916f904f1866797a746e706e7c827f7c6d586d734a59735659595c686a8d676a706966666768685e5a6f635a595a5a59b7bdbbc3c8bd9a7a6a847c7366585053cecfd6dbbab4898b7474838674746f61e2e5e7c0b08b8e998a8a8a8fa5878788",
+          "average_hash": "ff2f0f00e000d723",
+          "difference_hash": "dfce6cac929ba7c7"
+        },
+        {
+          "luma16x9": "9baba26c73514848507085826d4e4f63a4a4a06f535c545f818e6b7191816a8d887a836860544f4a505251555860626a989b97948d7d554e7a7a6d6f6f74807a6f726f75747773635e7279797c77666d7b7a777b7782816d64747878787878777b7c797b8b7e7e757a7c7575747575757a7a7b927f7d7d7e7e8c7a83b9b2a6a47a7b96827b7f7c7d7e7f9f8f84727284",
+          "average_hash": "ffffef00e703d323",
+          "difference_hash": "428c2ce8cf37a347"
+        },
+        {
+          "luma16x9": "a3afa37374514848507085826d4e4f63a5a1997561625960818e6b7191816a8e85826a6254554d4b54515354586262639799928d7b65357379766c726f79807c6f7475767776675e6272777462706c6d787c7c737674746a62757878747576777b797979797979716878747575757575757575757574747474747483b9b2a6a479848d8d8d8c8b8b8a8a8a8884727283",
+          "average_hash": "ffe0e704f303d123",
+          "difference_hash": "448c096c8717a347"
+        },
+        {
+          "luma16x9": "a8b0a47574514848507085826d4e4f62a39b9a7c71665a62818e6b7191816a8d8673665d54546c697171595655655e619993917c7e3252787b706c70707e7e7e74777879736f5c645a6b61716d725d5d78767574747474655c727273747576777a797979797979766b787475747474747575757575746f5d5b6e7593c0b3aaa879848d8d8d8c8b8b8a8a898880727385",
+          "average_hash": "ffe0e704f303d123",
+          "difference_hash": "4c8c8c8c8733a747"
+        },
+        {
+          "luma16x9": "adb0a47674514848507085826d4e4f629e9a9a857c705e63818e6b7191816a8d7f64665752524c555452525458625e6196957e8457266f79786f717073807e7e78787870755459615e6d716f5b655b637474747474737264596d717375828c857a79797979797a716678747475819cb37575757575747474747474747781888879848d8d8d8c8b8b8a8a8a8a867a7474",
+          "average_hash": "ff87e700f303d323",
+          "difference_hash": "ec0c086cc713a747"
+        },
+        {
+          "luma16x9": "b0b1a573775748484e6a8384774e4f549b9a9a86877d645f7a946b708b84797d72656154554f4b5755505550575b5d5b988978862b3a777b776a73717682807e77786666534e69646070505d6e8a636b747471716d6969615a6d777275736a627979797979797992b8ccd0c1a484767a7575747475747497dae7d5d8dcd7ac80838c8d8d8d8c8b9b919694918d86807e",
+          "average_hash": "fff87800e101d123",
+          "difference_hash": "e4e5e48b831ba7c7"
+        },
+        {
+          "luma16x9": "b0b1a573775748484e6a8384774e4f549b9a9c8a8680655f7a946b708b84797d6d655f53534f4f54564e544f575b5e59957f7f7c1f467a7b776a73717782807d776866634f5a69635e555a5d718e606b7471716c686869625c7073716f695f587979797981aedaa9b0d4b79e797a7a7a747575779ddfe7cfd5dce1caa9848f89838c8da99eb5b4acaba6a09e91837b74",
+          "average_hash": "fffc3c00c100d123",
+          "difference_hash": "f8e8e98ba31ba7c7"
+        },
+        {
+          "luma16x9": "b0b1a573775748484e6a8384774e4f54999a9c8b8984665f7a946b708b84797d67695c52524f4e54564e544e585b5f5797798472184f7b7b766b727079817f7c6e6f5b6059576c615d545b5e718e626a73716c696868695c5a6f706e665f585979797b98ccc3c7b2868f7f767b7d77687483ade2ddcfd4d9dd818281867785939faacfd0c2c1bdb7b49c88818a857b96",
+          "average_hash": "ffbe1e00c100d123",
+          "difference_hash": "3e54e889939ba7c7"
+        },
+        {
+          "luma16x9": "b0b1a573775748484e6a8384774e4f54999b9b8c8e88665f7a946b708b84797c62675b5152524d555250524f585a5d579170904c18677979746e706f7c827f7d6b5672754a5b705559565d686a8d676a6f6966666768685c5a6c6159595a5a59bbbbbcc5b6b791766b8a767163545153ccd1d8cba3a8947474748e7b74756a5ce2e5d9b89d8c9e8b8a8a8a9f96878889",
+          "average_hash": "ff2f0f00e100d723",
+          "difference_hash": "4fee6cac929ba7c7"
+        }
+      ],
+      "min_nonblack_ratio": 0.499998,
+      "dims": [
+        960,
+        540
+      ]
     }
   ]
 }

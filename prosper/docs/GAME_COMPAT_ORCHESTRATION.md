@@ -87,6 +87,31 @@ count, read the last row's number.
 | 24 | A log whose **emission gate** is narrower than the population you reason over | `[udmap]` (#305) prints a stage's user-data map **only under failure replay**, so every row it emits is a stage that ALREADY FAILED. Its rows therefore sample failures, not stages — and a row showing readable pointers is a stage that failed for a *different* reason, **not a passing stage**. Building a pass/fail table from it silently answers a question it was never sampling. Same category error as #9 and #13 (a count that answers "did this ever happen?" but not "how often?"), one level up: here the **rows** are the biased sample, not the counts. Before treating any log's rows as a population, read the condition it is emitted under — grep the `if` above the `fprintf`, do not infer it from the message text. |
 | 25 | `gh pr merge --delete-branch` run **from a worktree** | After the server-side merge succeeds, `gh` tries to check out the base branch locally and dies with `fatal: 'master' is already used by worktree at …` — which is unavoidable from a worktree, since master is checked out in the main tree. **The merge lands; the branch survives; the exit status does not cleanly separate the two.** Two lanes hit this in one session, both on their own merge. Read as "the merge failed" it invites a retry against an already-merged PR; read as "it all worked" it leaves a stale remote branch that later reads as an unfinished lane (and doubles as a false claim-lock, per the claim rules). Verify the two halves **separately**: `gh pr view N --json state,mergeCommit` for the merge, `git ls-remote origin 'refs/heads/<branch>'` for the branch, then `git push origin --delete <branch>` explicitly. |
 | 26 | A **commit-SHA-pinned asset URL** in a PR body or issue | Screenshots referenced as `raw.githubusercontent.com/<org>/<repo>/<sha>/…` break silently once that SHA is **orphaned** — which a rebase does immediately and a squash merge does at merge time. The images render perfectly while the PR is open and are dead weeks later, when nobody can reconstruct what they showed. Pin progression evidence to a **branch that survives** (`…/master/assets/screenshots/…`) once the file is on it, and re-point any SHA URL after the final rebase. Cousin of #11: both are the same mistake of treating a SHA as a stable name across a history rewrite. |
+| 27 | **A confident document header with no observation behind it** | Three parked `reach-gameplay.pad` drafts (Joe & Mac, Asterix, Summer Sports) carried three *different* title-specific rationales — "Options is a fallback for a start-button title prompt", "the title screen is reached with no input at all", "Cross confirms the default selector entries" — over **byte-identical input sequences** (`md5` of the non-comment lines matched across all three). Three different findings cannot come from one identical button mash, so the prose was generated, not observed. The genuine routes were in the tracking issues the whole time. |
+| 28 | A **distinct-colour count quoted across two different render scales** | Triage issue #1593 recorded Joe & Mac gameplay at **444,000-468,000** distinct colours; profiling the same route through `tools/snapshot` measured **at most 79,167**, a 5.6x gap that reads exactly like a severe colour regression. Both are correct. Triage captures run the `screenshot` frontend at native 1920x1080; every snapshot guard runs at `scale: 4`, so the frame is **480x270 = 129,600 pixels** and cannot exceed that many colours by construction. A 3840x2160 title (*Summer Sports Games*) yields 960x540 at the same scale, so even `dims` differs between titles. **Never lift a `min_colors` threshold from a triage issue**, and read `dims` off the profile instead of assuming the 1080p value. |
+| 29 | **Ranking candidate guard windows by metric stability** | Choosing a content-guard window by "tightest colour spread / highest self-SSIM" is the obvious automation, and on *Summer Sports Games* it confidently selects the settled span from 150 s to the end of the route: 48,201-48,489 colours, 1.0000 coverage, **SSIM 1.000 against itself** — the best-scoring window in the entire run by every available metric. It is the static `JAVELIN THROW` **standings overlay**, not gameplay. A guard adopted there would have passed forever while the athletics scene collapsed. Stability is a property of *held* frames, and menus, results screens and pause overlays are the most held frames a title has, so the metric is actively biased toward them. Rank windows to shortlist; **decide by opening the images**. Same family as the earlier note that a diagnostic clear can out-score real content on distinct colours. |
+| 30 | **A wall-clock guard window placed in a route that keeps moving** | A content guard samples by wall-clock seconds, but in a route that drives the player *forward* the scene at second N is a function of ~N seconds of accumulated progress, so ordinary run-to-run variance moves the **scene**, not just the timing. Joe & Mac's movement route passed `verify` twice and a `check` twice, then the third run drifted onto a level transition plus two death fades and failed 19 structural matches against 24 required — no build change, same route. Replacing it with the **stationary** route inverted the problem: the player is killed every ~22 s but respawns to the *same* opening screen, so a 73-frame window spanning three lives is one visual state and tolerates the deaths (69 matches against 55 required, worst-frame SSIM 0.97 instead of 0.81). The more impressive route made the worse guard. Prefer a route whose guarded span is **self-restoring** — an idle screen, a respawn loop, a held camera — over one whose span is a trajectory, and treat two green runs as far too small a sample to call a moving window stable. |
+
+**Detecting the generated-prose trap (#27), because it generalises past `.pad` files:**
+
+When several artifacts claim *independent* findings, **diff their substance, not their prose**. Identical
+bodies under differing explanations means the explanations were written to sound like observations:
+
+```bash
+# strip the commentary and compare only the load-bearing content
+for d in joe-mac asterix summer-sports; do grep -v '^#' "$d/reach-gameplay.pad" | md5sum; done
+```
+
+Seconds of work invalidated three documents. The same check applies to route scripts, per-title status
+docs, issue comments and PR bodies — anywhere parallel artifacts assert parallel results.
+
+This is **worse than a stale `UNVALIDATED` banner**, and for a specific reason: a banner tells the reader
+to check. A confident, specific, plausible header tells the reader **not to bother**, so it survives every
+subsequent reading. The remedy is not to flip a banner but to **add accurate provenance where a confident
+claim has none** — hold a route header to the `scripts/greak/reach-gameplay.pad` standard, which cites
+*observed* phase timings ("the title screen appears at roughly 112 s on a Linux hardware-Vulkan boot")
+rather than asserted behaviour. A claim marked ✅ on a run nobody can reproduce is the same defect one
+level up.
 
 **Working rules that follow:**
 
@@ -530,6 +555,25 @@ tr '\0' '\n' < /proc/<pid>/environ | grep PROSPER_   # and whose run?
 Before terminating anything, confirm the exact PID **and** that its `cwd`/`environ` identify it as yours. Never
 kill from a pattern count. Note `comm` is truncated to 15 characters by the kernel, so a longer binary name needs
 `pgrep -f` with a **bracketed** pattern (`pgrep -f "prosper[-]app"`) so it cannot match your own shell.
+
+**`pgrep -x screenshot` does not see a snapshot run.** `capture_content` copies the frontend to
+`$TMPDIR/snap_<rand>/screenshot_snap` and executes *that*, so every `snapshot.py` profile, `verify`, and
+`check` runs under the name **`screenshot_snap`**. Checking only the four obvious consumers reports a free
+GPU while a peer is two full boots into a `verify` — the longest-running GPU job in this repo. Include it:
+
+```bash
+for n in prosper-app boot_trace gpu_replay screenshot screenshot_snap; do
+  printf '%s: %s\n' "$n" "$(pgrep -x "$n" | wc -l)"
+done
+```
+
+Observed 2026-08-01: a lane's own live profile showed `screenshot: 0` and `screenshot_snap: 1`. The same
+applies to any harness that runs a copied or renamed binary — resolve the *executed* name, not the built one.
+
+**A clean count is a snapshot, not a lease.** On the same day, a sustained-idle watch confirmed 120 s with
+zero consumers, and a peer lane started a `boot_trace` 60 s later, concurrent with the run that idle check
+had authorized. Sustained idle lowers the odds of landing inside a peer's inter-run gap; it cannot reserve
+anything. If overlap would invalidate your measurement, say so and re-run — do not kill the peer.
 
 ### Fast evidence loop
 

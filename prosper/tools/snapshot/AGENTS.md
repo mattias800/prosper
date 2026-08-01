@@ -138,6 +138,11 @@ follow the order above rather than the obvious one.
   straddles a load, a fade, or a transition will fail on a perfectly healthy run.
   Place the window entirely inside the settled state and confirm the margin with
   `profile_route.py` instead of assuming it.
+  The rule is enforced at **two independent sites**, so raising
+  `min_structural_matches` alone does not escape it: `content_result` derives
+  `required_matches` from `len(summary["records"])` for SSIM, and derives
+  `required_nonblack` the same way from `min_nonblack_matches` for coverage. A
+  window sized for one is automatically sized for the other.
 
 ## Environment
 
