@@ -193,6 +193,40 @@ int main() {
           "DmaData source patch leaves the destination untouched (historical 9-dword packet)");
     CHECK(dma[3] == 0x00112233u && dma[4] == 0xAABBCCDDu,
           "DmaData source patch writes the full 64-bit source (historical 9-dword packet)");
+    // #1124's clobbered-header recovery, and the ONLY guard on it (#1756). Alex Kidd (PPSA02664,
+    // rung 6) zeroes a DMA_DATA header before patching it; dma_patch_recover_header rebuilds the
+    // header from scratch, which means it STAMPS A LENGTH. That length must equal what the builder
+    // emits, and nothing enforced it: a full ctest is green with the recovery's literal desynced from
+    // the builder, while a live boot shows 32 SHORT FOLDs from the first submit because the command
+    // processor then walks two dwords into the following packet.
+    //
+    // Both sides are MEASURED here, so this needs no hardware number and cannot go stale: build a
+    // real packet through the real builder to learn its size, clobber the header the way the guest
+    // does, patch it, and require the restored header to declare exactly that size.
+    {
+        auto dma_build = Hle::lookup("WmAc2MEj6Io");   // sceAgcDcbDmaData
+        CHECK(dma_build != nullptr, "sceAgcDcbDmaData registered");
+        if (dma_build) {
+            uint32_t buf[32] = {};
+            Dcb d{}; d.bottom = buf; d.top = buf + 32; d.cursor_up = buf; d.cursor_down = buf + 32;
+            uint64_t dst = 0x2010000040ull;   // plausible to the recovery's own body check
+            ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))
+             dma_build)((uint64_t)(uintptr_t)&d, 0, 0, 0, dst, 0, 0, 0, 64);
+            const uint32_t built_dw = (uint32_t)(d.cursor_up - buf);
+            CHECK(built_dw >= 2, "DmaData builder emitted a packet");
+
+            buf[0] = 0;                        // the guest's clobber: header zeroed, body intact
+            p_dma_src((uint64_t)(uintptr_t)buf, 0xCAFEBABE0BADF00Dull, 0, 0, 0, 0);
+            const uint32_t restored_dw = ((buf[0] >> 16) & 0x3fffu) + 2u;
+            CHECK(buf[0] != 0, "recovery restored a clobbered DMA_DATA header");
+            CHECK(restored_dw == built_dw,
+                  "the recovered header declares exactly the length the builder emits "
+                  "(desyncing them walks the command processor into the next packet)");
+            CHECK(buf[3] == 0x0BADF00Du && buf[4] == 0xCAFEBABEu,
+                  "recovery is followed by the source patch it was performed for");
+        }
+    }
+
     uint32_t wrong_packet[5] = {PM4(5, IT_NOP, R_CX_REGS_INDIRECT), 1, 2, 3, 4};
     p_dma_src((uint64_t)(uintptr_t)wrong_packet, 0xDEADBEEFCAFEBABEull, 0, 0, 0, 0);
     CHECK(wrong_packet[1] == 1 && wrong_packet[2] == 2 && wrong_packet[3] == 3 && wrong_packet[4] == 4,
