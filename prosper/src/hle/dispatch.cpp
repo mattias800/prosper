@@ -135,6 +135,22 @@ void dispatch_init(const std::vector<ImportSlot>* slots, NidDb* db) {
     // Pre-size the call-count vector to the import table so prosper_on_unimpl never allocates.
     if (slots) { std::lock_guard<std::mutex> lk(g_unimpl_mx); g_count.assign(slots->size(), 0); }
 }
+void dispatch_grow_slots(const std::vector<ImportSlot>* slots) {
+    g_slots = slots;
+    if (!slots) return;
+    // resize(), not assign(): the run is already under way and the counts of the pre-linked slots
+    // are live census data. New slots start at zero like every other slot did.
+    std::lock_guard<std::mutex> lk(g_unimpl_mx);
+    if (g_count.size() < slots->size()) g_count.resize(slots->size(), 0);
+}
+size_t dispatch_append_slots(std::vector<ImportSlot>* slots, const std::vector<ImportSlot>& add) {
+    std::lock_guard<std::mutex> lk(g_unimpl_mx);
+    const size_t first = slots->size();
+    slots->insert(slots->end(), add.begin(), add.end());
+    g_slots = slots;
+    if (g_count.size() < slots->size()) g_count.resize(slots->size(), 0);
+    return first;
+}
 void reset_call_log() { std::lock_guard<std::mutex> lk(g_unimpl_mx); g_order.clear();
                         for (auto& c : g_count) c = 0; }
 const std::vector<uint32_t>& call_order() { return g_order; }

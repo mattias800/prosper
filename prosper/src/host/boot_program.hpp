@@ -39,6 +39,18 @@ inline constexpr uint64_t BOOT_PLUGIN_AUTO_BASE  = 0x5d0000000ull;
 inline constexpr uint64_t BOOT_PLUGIN_AUTO_STRIDE = 0x4000000ull;   // 64 MiB
 inline constexpr unsigned BOOT_PLUGIN_AUTO_SLOTS  = 10;
 inline constexpr uint64_t BOOT_STUB     = 0x600000000ull;
+// Base pool for PRXs the guest loads at RUNTIME via sceKernelLoadStartModule (#639) — modules that
+// are NOT in the fixed preload list above, because the path is only known while the title runs
+// (R-Type Delta ships 24 per-stage modules under /app0/prx/). Placed ABOVE the import-stub
+// aperture: callback_fs.hpp recognises a guest import-stub frame by a return address in
+// [0x600000000,0x700000000), so nothing else may be mapped inside that window. 128 MiB per slot
+// bounds each module (the whole local corpus's largest module image is ~251 MiB, and the loader
+// refuses anything that does not fit rather than overlapping its neighbour).
+inline constexpr uint64_t BOOT_RUNTIME_MODULE_BASE   = 0x700000000ull;
+inline constexpr uint64_t BOOT_RUNTIME_MODULE_STRIDE = 0x8000000ull;   // 128 MiB
+inline constexpr unsigned BOOT_RUNTIME_MODULE_SLOTS  = 48;
+inline constexpr uint64_t BOOT_RUNTIME_MODULE_END =
+    BOOT_RUNTIME_MODULE_BASE + (uint64_t)BOOT_RUNTIME_MODULE_SLOTS * BOOT_RUNTIME_MODULE_STRIDE;
 
 // --- Guest-address labelling, shared by every diagnostic that prints "<module>+0x<rva>" ----------
 //
@@ -77,6 +89,10 @@ inline const char* guest_module_name(uint64_t a) {
     if (a >= BOOT_LIBC          && a < BOOT_PLUGIN_AUTO_BASE) return "libc.prx";
     if (a >= BOOT_PLUGIN_AUTO_BASE && a < BOOT_STUB)       return "plugin";
     if (a >= BOOT_STUB          && a < 0x610000000ull)     return "STUB";
+    // Runtime-loaded PRX (#639). Like the plugin pool this is one label for the whole aperture:
+    // which slot holds which module is a run-local fact, so the offset is reported modulo the
+    // stride and the exact module comes from the loader's own [loadmod] line.
+    if (a >= BOOT_RUNTIME_MODULE_BASE && a < BOOT_RUNTIME_MODULE_END) return "runtime-prx";
     return "mapped/host";
 }
 inline uint64_t guest_module_offset(uint64_t a) {
@@ -98,11 +114,14 @@ inline uint64_t guest_module_offset(uint64_t a) {
     if (a >= BOOT_PLUGIN_AUTO_BASE && a < BOOT_STUB)
         return (a - BOOT_PLUGIN_AUTO_BASE) % BOOT_PLUGIN_AUTO_STRIDE;
     if (a >= BOOT_STUB          && a < 0x610000000ull)     return a - BOOT_STUB;
+    if (a >= BOOT_RUNTIME_MODULE_BASE && a < BOOT_RUNTIME_MODULE_END)
+        return (a - BOOT_RUNTIME_MODULE_BASE) % BOOT_RUNTIME_MODULE_STRIDE;
     return a;
 }
 // True when `a` lies inside some fixed guest module, i.e. "<name>+0x<offset>" is meaningful.
 inline bool guest_va_in_module(uint64_t a) {
-    return a >= BOOT_EBOOT && a < 0x610000000ull;
+    return (a >= BOOT_EBOOT && a < 0x610000000ull) ||
+           (a >= BOOT_RUNTIME_MODULE_BASE && a < BOOT_RUNTIME_MODULE_END);
 }
 
 // Boot the title rooted at `dump_root` (the app0 directory): link the fixed module set (dropping any

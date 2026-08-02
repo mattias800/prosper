@@ -22,6 +22,14 @@ bool map_image(const LoadedImage& img, std::string* err);
 bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                    uint64_t stub_size, std::string* err);
 
+// Extend the stub region in place for slots appended AFTER install_stubs ran (#639: a runtime
+// sceKernelLoadStartModule adds a slot for each import no already-loaded module satisfies).
+// `slots` must be the SAME vector install_stubs was given, grown at the back; `first_new` is the
+// old size. Only the pages the new slots need are mapped — the pages already handed out to
+// relocated guest code are never remapped, so a thread executing a stub cannot have it torn away.
+// Publishes the grown table to the dispatcher after the last new stub is written.
+bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::string* err);
+
 // Install the fault handler for genuine guest faults during a run.
 void install_trap_handler();
 

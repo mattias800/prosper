@@ -68,6 +68,18 @@ public:
 // Wire the unimplemented-call logger to the global stub-slot table + name DB.
 void dispatch_init(const std::vector<ImportSlot>* slots, NidDb* db);
 
+// Re-point the logger at a stub-slot table that GREW after dispatch_init (#639: a runtime-loaded
+// PRX appends slots for imports no already-linked module satisfies). Unlike dispatch_init this
+// only extends the per-slot call-count vector — it must not reset the counts of slots the guest
+// has already called, or the unimplemented-call census silently restarts mid-run.
+void dispatch_grow_slots(const std::vector<ImportSlot>* slots);
+
+// Append import slots to the live table under the SAME lock prosper_on_unimpl takes (#639).
+// The runtime loader appends from a guest thread while other guest threads may be calling an
+// unimplemented import, and an unsynchronised push_back would move the vector's buffer out from
+// under `(*g_slots)[idx]`. Returns the index the first appended slot landed on.
+size_t dispatch_append_slots(std::vector<ImportSlot>* slots, const std::vector<ImportSlot>& add);
+
 // Register the built-in HLE implementations (libc thunks, CRT no-ops, libkernel
 // primitives). Call before install_stubs.
 void register_builtin_hle();
@@ -239,6 +251,11 @@ struct UnwindModuleDesc {
 };
 // Install module unwind descriptors (call after images are mapped). Enables sceKernelGetModuleInfoForUnwind.
 void set_unwind_modules(const UnwindModuleDesc* descs, size_t count);
+// Append one module's unwind descriptor after boot (#639), returning the index it landed on.
+// `d.name` must outlive the run. The caller must append the same module's export table
+// (add_module_export_table) so the two orders stay parallel — sceKernelGetModuleInfoFromAddr
+// derives a handle from the unwind order and sceKernelDlsym consumes it against the export order.
+size_t add_unwind_module(const UnwindModuleDesc& d);
 
 // Windows-only fatal-fault diagnostics. Other hosts provide empty implementations.
 void trace_guest_stack_query(uint64_t target, bool found, void* base, size_t size);
@@ -279,7 +296,19 @@ void set_module_exports(const std::unordered_map<std::string, uint64_t>* exports
 // when the requested path names one of these (basename match), and sceKernelDlsym consults the
 // handle's module before the global first-definition-wins table. Table pointers must outlive the run.
 struct ModuleExportTable { std::string path; const std::unordered_map<std::string, uint64_t>* nids; };
+// Base of the handles sceKernelLoadStartModule and sceKernelGetModuleInfoFromAddr hand out.
+// SceKernelModule is a 32-bit int on PS5 (R-Type Delta stores it in an int array and tests it
+// against zero), so the handle space must stay small and positive.
+inline constexpr uint64_t kSceModuleHandleBase = 0x10000;
 void set_module_export_tables(std::vector<ModuleExportTable> tables);
+// Append ONE module's export table after boot (#639: real runtime PRX loading). Additive
+// counterpart of set_module_export_tables — the pre-linked set keeps its handles and its
+// first-definition-wins precedence, and the new module is appended after it. Safe to call while
+// the guest runs; `nids` must outlive the run and must not be mutated afterwards. Returns the
+// handle sceKernelLoadStartModule reports for the module (the same value module_handle_for_path
+// answers for its path from then on).
+uint64_t add_module_export_table(std::string path,
+                                 const std::unordered_map<std::string, uint64_t>* nids);
 // Handle for a guest load path naming a registered module (basename match), or 0 if unknown —
 // the caller (k_load_start_mod) then falls back to its synthetic success handle.
 uint64_t module_handle_for_path(const char* path);
