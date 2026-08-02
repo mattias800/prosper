@@ -54,14 +54,16 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     ```text
     [dcbwin]  window=16 dw : AcquireMem n=8 op=0x10 at +0 (avail 16)
     [dcbwin]  window=16 dw : ReleaseMem/EopAction n=9 op=0x10 at +8 (avail 8)
-    [dcbfull] #0 ReleaseMem/EopAction op=0x10 need=9 avail=8 reserved=0 window=16 dw at +8
+    [dcbfull] #0 ReleaseMem/EopAction op=0x10 need=9 avail=8 reserved=0 window=16 dw at +8   <- the signature
     ```
-    **Read `avail`, not the window size** — for a segmented Dcb the window is the current segment,
-    not a reservation, and reading it as one produces false positives. `avail=0` is an exhausted
-    buffer (ordinary growth); `avail>0` means space was deliberately left and prosper asked for more
-    than fits, with `need - avail` the overrun. A real defect repeats one `(sub-op, need, avail)`
-    triple; scattered one-offs are ring wraps. Full contract and the per-builder table:
-    `docs/AGC_PACKET_SIZES.md`.
+    The signature is **`avail>0` AND `reserved=0` AND the same triple repeating** — all three. Two
+    ways to read it wrong, both measured on the corpus: the *window* is the current segment of a
+    segmented Dcb rather than a reservation (58 false positives on The Pathless), and `avail>0` on
+    its own is the ordinary end-of-buffer condition whenever the guest holds a `reserved_dw` back
+    (every repeated `avail>0` triple in the corpus carries `reserved=18`, with `avail` tracking each
+    packet's own size). Under the full rule the corpus is clean, and re-introducing the #1748 defect
+    makes it fire 256 times — it was checked in both directions. Full contract, the per-builder table
+    and the census: `docs/AGC_PACKET_SIZES.md`.
   - **Does a PM4 write path store *this value* into guest memory?**
     **`PROSPER_WRITE_TRAP=0xV[,0xV…]`** (up to 8 values) checks every guest-memory store the command
     processor performs — `RELEASE_MEM` data_sel 1/2/3, `EVENT_WRITE`, `WRITE_DATA`, and both
