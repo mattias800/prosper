@@ -29,18 +29,21 @@ same tree with `./prosper-linux-x86_64.AppImage --appimage-extract`, run it once
   on the oldest runner that is still supported and that build's glibc is the floor. Older
   distributions must build from source. `BUILD.txt` inside the archive records the floor actually
   measured for that build, which is often a little lower than the 2.39 stated here.
-- A Vulkan 1.1-capable driver and a working loader (`libvulkan.so.1` plus your GPU's ICD — the
-  `mesa-vulkan-drivers`, `vulkan-radeon`, `vulkan-intel`, or proprietary NVIDIA package for your
-  distribution). The loader is deliberately **not** bundled, because it has to match the driver
-  installed on your machine.
-- The usual desktop libraries: X11 or Wayland, `libfontconfig`, `libfreetype`, `glib`, `libdrm`.
-  These are excluded from the bundle on purpose — they must match your display stack.
+- A Vulkan 1.1-capable **driver** for your GPU — the `mesa-vulkan-drivers`, `vulkan-radeon`,
+  `vulkan-intel`, or proprietary NVIDIA package for your distribution. The archive carries the Vulkan
+  *loader* (`libvulkan.so.1`), but a loader has nothing to load without your driver's ICD, which is
+  installed system-wide and cannot be bundled.
+- A graphical session: X11 or Wayland, plus the usual desktop libraries (`libX11`, `libwayland-*`,
+  `libfontconfig`, `libfreetype`, `libdrm`). These are host-provided on purpose — they must match
+  your display stack — and every mainstream desktop install already has them.
 - An unpacked title directory conventionally named `<TITLE_ID>-app0`, containing `eboot.bin` and the
   title's other files.
 
-FFmpeg and libva **are** bundled, in `usr/lib` inside the archive. Their sonames differ on every
-distribution (Ubuntu 24.04 ships `libavcodec.so.60`, Fedora 43 ships `libavcodec.so.62`), so a build
-that relied on yours would not start anywhere else. SDL3 is statically linked into the binary.
+What the archive **does** carry, in `usr/lib`: FFmpeg, libva, the Vulkan loader, and their
+dependencies — 116 libraries in the current build. FFmpeg and libva are the reason the archive exists
+in this shape: their sonames differ on every distribution (Ubuntu 24.04 ships `libavcodec.so.60`,
+Fedora 43 ships `libavcodec.so.62`), so a build that relied on yours would not start anywhere else.
+SDL3 is not in that list at all — it is statically linked into the binary.
 
 ## Start a title
 
@@ -69,6 +72,11 @@ Use a separate save location when testing a fresh save or keeping titles isolate
 
 `-force-gfx-direct` is the current Unity default. For a title that must not receive it, launch with
 `--guest-args ''`.
+
+**Launching from a desktop icon does not supply it.** The `.desktop` entry inside the AppImage runs
+`prosper-app` with no added environment, so a title started from the library picker after clicking
+the icon never receives `-force-gfx-direct`. Use one of the command-line forms above for any title
+that needs it.
 
 Presentation defaults to FIFO vsync. Pass `--present-mode mailbox` for low-latency vsync or
 `--present-mode immediate` to permit tearing; either optional mode falls back to FIFO when

@@ -50,14 +50,21 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --savedata-dir)  savedata_dir="$2"; shift 2 ;;
         --guest-args)    guest_args="$2";   shift 2 ;;
-        --present-mode)  present_mode="$2"; shift 2 ;;
+        # Lower-cased to match start-prosper.ps1, whose [ValidateSet] is case-insensitive and
+        # which passes .ToLowerInvariant() to the app: `--present-mode FIFO` must not be an error
+        # on Linux when `-PresentMode FIFO` works on Windows.
+        --present-mode)  present_mode="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
         --frames)        frames="$2";       shift 2 ;;
         --record)        record="$2";       shift 2 ;;
-        --record-axis)   record_axis="$2";  shift 2 ;;
+        --record-axis)   record_axis="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
         --test-pattern)  test_pattern=1;    shift ;;
         -h|--help)       usage; exit 0 ;;
         -*) echo "start-prosper.sh: unknown option: $1" >&2; usage; exit 2 ;;
-        *)  dump="$1"; shift ;;
+        *)  if [ -n "$dump" ]; then
+                echo "start-prosper.sh: pass one app0 directory, not several ('$dump' then '$1')" >&2
+                exit 2
+            fi
+            dump="$1"; shift ;;
     esac
 done
 

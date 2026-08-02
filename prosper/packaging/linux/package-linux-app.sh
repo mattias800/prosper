@@ -37,6 +37,7 @@ build_info=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --*) [ $# -ge 2 ] || { echo "package-linux-app.sh: $1 needs a value" >&2; exit 2; } ;;&
         --build-dir)  build_dir="$2"; shift 2 ;;
         --out-dir)    out_dir="$2";   shift 2 ;;
         --tools-dir)  tools_dir="$2"; shift 2 ;;
@@ -116,10 +117,14 @@ echo "package: bundling the shared-library closure"
 cp "$repo_root/prosper/docs/LINUX_RELEASE.md" "$appdir/README.md"
 cp "$repo_root/prosper/scripts/start-prosper.sh" "$appdir/start-prosper.sh"
 chmod +x "$appdir/start-prosper.sh"
+# Computed into a variable first: inside `echo "... $(...)"` the substitution's failure is masked by
+# echo's own zero status, and BUILD.txt would silently record an empty floor.
+floor="$("$here/glibc-floor.sh" "$appdir")" \
+    || { echo "package-linux-app.sh: could not measure the glibc floor" >&2; exit 1; }
 {
     echo "prosper Linux x86_64"
     if [ -n "$build_info" ]; then printf '%s\n' "$build_info"; fi
-    echo "glibc floor: $("$here/glibc-floor.sh" "$appdir")"
+    echo "glibc floor: $floor"
 } > "$appdir/BUILD.txt"
 
 echo "package: building the AppImage"

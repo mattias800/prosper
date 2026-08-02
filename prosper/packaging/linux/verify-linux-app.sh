@@ -35,6 +35,13 @@ done
 [ -n "$out_dir" ] || { echo "verify-linux-app.sh: --out-dir is required" >&2; exit 2; }
 out_dir="$(cd "$out_dir" && pwd)"
 
+# A non-version value would pass the comparison below VACUOUSLY: `sort -V` puts "abc" above "2.39",
+# so `highest` equals the bogus maximum and the floor goes unchecked. Reject it up front.
+case "$max_glibc" in
+    [0-9]*.[0-9]*) ;;
+    *) echo "verify-linux-app.sh: --max-glibc must look like N.NN, got '$max_glibc'" >&2; exit 2 ;;
+esac
+
 fail() { echo "verify: FAIL: $*" >&2; exit 1; }
 ok()   { echo "verify: ok: $*"; }
 
@@ -53,7 +60,10 @@ ok "all four artifacts present"
     || fail "AppImage sha256 does not match"
 ok "both sha256 files verify against their archives"
 
-work="$(mktemp -d)"
+# Beside the artifacts, NOT in /tmp. This extracts the whole bundled tree and then unpacks the
+# AppImage once per arm; on the developer box /tmp is a RAM-backed tmpfs with a per-user quota
+# shared by every concurrent agent, and filling it breaks far more than this script.
+work="$(mktemp -d -p "$out_dir")"
 trap 'rm -rf "$work"' EXIT
 
 # --- fixtures for the runtime arms -----------------------------------------------------------
@@ -73,11 +83,11 @@ smoke() {
 
     rc=0; out="$("$@" --list-games --games-dir "$work/games-empty" 2>&1)" || rc=$?
     [ "$rc" -eq 1 ] || fail "$label: empty games dir should exit 1, got $rc ($out)"
-    grep -q '0 title(s)' <<<"$out" || fail "$label: empty games dir did not report 0 titles: $out"
+    grep -q ' 0 title(s)' <<<"$out" || fail "$label: empty games dir did not report 0 titles: $out"
 
     rc=0; out="$("$@" --list-games --games-dir "$work/games-one" 2>&1)" || rc=$?
     [ "$rc" -eq 0 ] || fail "$label: one-title games dir should exit 0, got $rc ($out)"
-    grep -q '1 title(s)' <<<"$out" || fail "$label: one-title games dir did not report 1 title: $out"
+    grep -q ' 1 title(s)' <<<"$out" || fail "$label: one-title games dir did not report 1 title: $out"
     grep -q 'FAKE00001-app0' <<<"$out" || fail "$label: the title record is missing: $out"
 
     ok "$label: ran headless and distinguished all three library states (exit 2 / 1 / 0)"
@@ -98,7 +108,9 @@ ok "tarball extracts with the binary, launcher, README, BUILD.txt and AppRun"
 
 # The binary must find its bundled libraries by RUNPATH alone. Anything else means the tree only
 # works where it was built.
-runpath="$(objdump -p "$bin" | awk '/RUNPATH|RPATH/ {print $2; exit}')"
+# No `exit` in the awk: closing the pipe early can SIGPIPE objdump, and under `pipefail` that would
+# abort the script with no message instead of reporting a bad RUNPATH.
+runpath="$(objdump -p "$bin" | awk '/RUNPATH|RPATH/ && !seen {seen=1; v=$2} END {print v}')"
 [ "$runpath" = '$ORIGIN/../lib' ] || fail "RUNPATH is '$runpath', expected \$ORIGIN/../lib"
 ok "RUNPATH is \$ORIGIN/../lib"
 
@@ -120,7 +132,7 @@ for soname in libavcodec libavformat libavutil libswresample libswscale libva; d
     # Match the extracted tree, not a `usr/lib` spelling: RUNPATH is $ORIGIN/../lib, so ldd prints
     # the path it actually walked -- `.../usr/bin/../lib/libavcodec.so.NN`. What matters is only
     # that the resolved file lies inside the archive rather than on the host.
-    grep -q "$tree/" <<<"$line" \
+    grep -qF "$tree/" <<<"$line" \
         || fail "$soname resolves outside the archive, so it was not bundled: $line"
 done
 ok "FFmpeg and libva resolve to the bundled copies in usr/lib"
@@ -146,19 +158,32 @@ highest="$(printf '%s\n%s\n' "$floor" "$max_glibc" | sort -V | tail -1)"
         --max-glibc deliberately."
 if [ -s "$floor_err" ]; then
     cat "$floor_err" >&2
-    fail "the tree requires non-numeric glibc ABI tags, which raise the floor beyond $floor"
+    # Deliberately fatal and deliberately NOT quantified. A GLIBC_ABI_* tag states a requirement the
+    # numeric scan cannot express, and the mapping from tag to glibc version is not something this
+    # script can derive -- so guessing one would be worse than stopping. Refuse, and let a human
+    # decide what the tag means for the floor. The shipped ubuntu-24.04 artifact carries none; a
+    # Fedora 43 build carries GLIBC_ABI_GNU2_TLS, which is what this is here to catch.
+    fail "the tree requires non-numeric glibc ABI tags (above). They raise the floor by an amount
+        this check cannot quantify, so the measured $floor cannot be trusted. Investigate the tag
+        before publishing."
 fi
 ok "glibc floor is $floor (declared maximum $max_glibc)"
 
 # --- runtime ------------------------------------------------------------------------------------
-smoke "tarball" "$bin"
+# LD_BIND_NOW so a bundled library that resolves as a FILE but is missing a symbol prosper-app calls
+# fails here rather than at some later call site: --list-games returns before any FFmpeg entry point,
+# so lazy binding would let that through all three arms. LD_LIBRARY_PATH is scrubbed for the same
+# reason the ldd check above scrubs it -- the run must depend only on the archive's own RUNPATH.
+smoke "tarball" env -u LD_LIBRARY_PATH LD_BIND_NOW=1 "$bin"
 
 # --- AppImage -----------------------------------------------------------------------------------
 [ -x "$appimage" ] || fail "the AppImage is not executable"
 file "$appimage" | grep -q 'ELF 64-bit' || fail "the AppImage is not an ELF image"
-# CI containers have no FUSE; this is the supported way to run an AppImage without it.
+# CI containers have no FUSE; this is the supported way to run an AppImage without it. TMPDIR is
+# redirected for the same reason as `work` above: each run extracts the whole image.
 export APPIMAGE_EXTRACT_AND_RUN=1
-smoke "AppImage" "$appimage"
+export TMPDIR="$work"
+smoke "AppImage" env -u LD_LIBRARY_PATH LD_BIND_NOW=1 "$appimage"
 
 echo
 echo "verify: all Linux release artifact checks passed"
