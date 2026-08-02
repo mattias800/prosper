@@ -18,6 +18,66 @@ namespace prosper::gpu {
 // PROSPER_DUMP_TILERAW diagnostic to avoid a SIGSEGV on a mis-decoded texture base.
 bool guest_readable(uint64_t addr, uint32_t bytes);
 
+// PROSPER_SHARPLOG residue classification (#1590).
+//
+// A descriptor that decodes as nonsense has two very different causes that produce identical
+// register dumps: guest data prosper mis-parsed, or memory nobody ever initialised. The evidence
+// that separates them is already sitting in the rejected dwords — whether they hold a MAPPED
+// ADDRESS, and which mapping. A guest-module address is real guest data. An address a few hundred
+// bytes below the top of a large anonymous read/write mapping is a THREAD STACK, so the descriptor
+// is an uninitialised local and the question becomes "which call was supposed to fill it".
+//
+// This exists because that step was skipped once already and cost a lane its conclusion: #1590's
+// `0x00007f88c71ffeb0` was read as "host stack residue" and therefore blamed on an HLE that
+// returned success without writing an out-parameter. prosper runs GUEST threads on host pthread
+// stacks, so a `0x7f…` value says nothing about whose stack it is until the mapping is named — and
+// naming it showed the residue was the guest's own uninitialised local, with no HLE involved.
+//
+// Linux-only (reads /proc/self/maps); elsewhere it reports nothing rather than guessing. Bounded:
+// the map is re-read only for a value never classified before, at most kMapsReadBudget times per
+// run, so an every-draw reject path cannot turn a diagnostic into a syscall storm. A value that
+// resolves to no mapping still consumes its slot — "not mapped" is an answer, and re-asking it
+// every draw is exactly the storm this budget exists to prevent.
+static std::string describe_mapped_address(uint64_t value) {
+#ifdef __linux__
+    if (value < 0x10000ull || value >= (1ull << 48)) return {};   // too small / above the 48-bit VA space
+    static constexpr int kMapsReadBudget = 32;
+    static std::mutex mx;
+    static std::set<uint64_t> classified;
+    static int reads_left = kMapsReadBudget;
+    std::lock_guard<std::mutex> lk(mx);
+    if (!classified.insert(value).second || reads_left <= 0) return {};
+    --reads_left;
+    FILE* f = fopen("/proc/self/maps", "re");
+    if (!f) return {};
+    char line[512];
+    std::string out;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long lo = 0, hi = 0;
+        char perms[8] = {};
+        char path[256] = {};
+        // "<lo>-<hi> <perms> <off> <dev> <inode> [path]". The path is optional; the leading space in
+        // the conversion skips the column padding, so an anonymous mapping yields n == 3 rather than
+        // a path made of spaces.
+        const int n = sscanf(line, "%llx-%llx %7s %*s %*s %*s %255[^\n]", &lo, &hi, perms, path);
+        if (n < 3 || value < lo || value >= hi) continue;
+        char buf[384];
+        snprintf(buf, sizeof buf,
+                 "0x%llx-0x%llx %s %.2f MiB, +0x%llx from base, -0x%llx from top%s%s",
+                 lo, hi, perms, (double)(hi - lo) / (1024.0 * 1024.0),
+                 (unsigned long long)(value - lo), (unsigned long long)(hi - value),
+                 (n >= 4 && path[0]) ? " " : "", (n >= 4 && path[0]) ? path : "");
+        out = buf;
+        break;
+    }
+    fclose(f);
+    return out;
+#else
+    (void)value;
+    return {};
+#endif
+}
+
 AgcPixelInputControls derive_agc_pixel_input_controls(const AgcShaderHeader* producer,
                                                       const AgcShaderHeader* pixel) {
     AgcPixelInputControls out;
@@ -721,13 +781,27 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 d.base_array != 0 ||
                 d.width > 16384 || d.height > 16384) {          // skip a garbage/degenerate T#
                 if (sharplog_on) {
-                    char buf[192];
+                    char buf[256];
                     snprintf(buf, sizeof buf,
                              "degenerate T# base=0x%llx %ux%ux%u type=%u base_array=%u fmt=%u "
-                             "raw %08x %08x %08x %08x", (unsigned long long)d.base,
+                             "raw %08x %08x %08x %08x %08x %08x %08x %08x", (unsigned long long)d.base,
                              d.width, d.height, d.depth, d.type, d.base_array, d.format,
-                             tv[0], tv[1], tv[2], tv[3]);
-                    tex_drop(slot, off, buf);
+                             tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]);
+                    std::string why = buf;
+                    // Name every dword pair that is a live mapping. See describe_mapped_address:
+                    // this is what tells "guest data we mis-parsed" from "memory nobody filled".
+                    for (uint32_t w = 0; w + 1 < 8; ++w) {
+                        const uint64_t candidate =
+                            (uint64_t)tv[w] | ((uint64_t)tv[w + 1] << 32);
+                        const std::string where = describe_mapped_address(candidate);
+                        if (where.empty()) continue;
+                        char note[512];
+                        snprintf(note, sizeof note,
+                                 "\n[sharp]     residue dw%u|dw%u = 0x%llx is MAPPED: %s",
+                                 w, w + 1, (unsigned long long)candidate, where.c_str());
+                        why += note;
+                    }
+                    tex_drop(slot, off, why.c_str());
                 }
                 continue;
             }
