@@ -196,6 +196,12 @@ void live_compute_zero_next_cold_storage_snapshot_minimum_for_test();
 void live_compute_force_next_image_result_host_fallback_for_test();
 void live_compute_fail_next_image_result_buffer_retain_for_test();
 
+// Deterministically model the permanent failure observed in Astro Bot without asking the driver to
+// lose a real device. The attempt count proves both the current batch and later callbacks stop before
+// another vkQueueSubmit after the injected failure.
+void live_compute_force_next_queue_submit_device_lost_for_test();
+uint64_t live_compute_queue_submit_attempts();
+
 // Register the synchronous Vulkan compute backend used by AGC submit processing.
 void register_live_compute();
 
