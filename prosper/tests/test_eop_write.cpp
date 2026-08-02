@@ -574,6 +574,9 @@ int main() {
         reused.value = 0x1020304050607080ull;
         uint64_t addr = (uint64_t)(uintptr_t)&reused;
         prosper_label_hist_dma_built(addr, 0x3000, 0, 1);
+        // The HISTORICAL 9-dword packet, deliberately: the generation check reads a build snapshot
+        // that only that shape carries. Every capture recorded before #1756 contains it, so this is
+        // the compatibility leg — the live shape is exercised immediately below.
         uint32_t dma[9] = {};
         dma[0] = PM4(9, IT_NOP, R_DMA_DATA);
         dma[1] = (uint32_t)addr; dma[2] = (uint32_t)(addr >> 32);

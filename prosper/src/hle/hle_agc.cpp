@@ -71,11 +71,115 @@ constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET =
                    R_SET_BASE_INDIRECT_ARGS = 0x20, R_STALL_COMMAND_BUFFER_PARSER = 0x21,
                    R_DRAW_INDEX_INDIRECT = 0x22, R_DISPATCH_INDIRECT = 0x23;
 constexpr uint32_t R_NUM = 0x40;
+
+// --- Packet sizes, in DWORDS, shared by each builder and its sceAgc*GetSize (#1143, #1748, #1756) ---
+//
+// These are ONE definition used twice on purpose. A guest reserves command-buffer space by calling
+// GetSize and then calls the builder, so the two must agree exactly; a GetSize that under-reports
+// makes the builder overrun the reservation, which does not look like a size bug when it fails (on
+// #1748 it looked like a 210 MiB/s heap leak). test_agc_getsize MEASURES every builder's real cursor
+// advance and asserts its GetSize equals it, so a literal typed here twice could not drift silently
+// — but a single constant cannot drift at all.
+//
+// Where prosper's encoding differs from the hardware packet (the register-indirect forms carry a
+// pointer + count instead of the register values; ReleaseMem carries a #312 build snapshot in its
+// spare slot), the constant is still what makes the guest self-consistent: it reserves exactly what
+// prosper writes. Emitting FEWER dwords than hardware is safe — it only wastes reserved space.
+// Emitting MORE is the fatal direction, and is what #1748 was.
+constexpr uint32_t kDwDrawIndex          = 7;
+constexpr uint32_t kDwDrawIndexAuto      = 7;
+constexpr uint32_t kDwDrawIndexOffset    = 3;
+constexpr uint32_t kDwDrawIndexIndirect  = 4;
+constexpr uint32_t kDwDispatch           = 6;
+constexpr uint32_t kDwDispatchIndirect   = 4;
+// DMA_DATA is 7: header + dst lo/hi, srcOrImm lo/hi, numBytes, selectors — exactly the RDNA2
+// `DMA_DATA` field list, with no slot to spare. It was 9 because it also carried the #312 build-time
+// snapshot of the destination qword: prosper's own invention, not a decoded guest field, so removing
+// it needs no title evidence about the size and 9 -> 7 is the safe direction for the guest (a
+// reservation can only gain room). All of the risk is internal, and it is a REMOVAL, not a
+// relocation — the #312 label-history event survives via prosper_label_hist_dma_built, but the
+// pre-image value dma_build_pre_changed compares does not.
+//
+// Anything that stamps or validates a DMA_DATA header MUST use this constant. #1124's
+// dma_patch_recover_header rebuilds a clobbered header from scratch, and a hard-coded 9 there would
+// write a 9-dword header over a 7-dword allocation — the CP walk would step two dwords into the next
+// packet and desync the rest of the submit, on Alex Kidd (PPSA02664, rung 6) specifically, and no
+// draw-count A/B can see that.
+constexpr uint32_t kDwDmaData            = 7;
+constexpr uint32_t kDwEventWrite         = 4;
+constexpr uint32_t kDwSetIndexBuffer     = 3;
+constexpr uint32_t kDwSetIndexCount      = 2;
+constexpr uint32_t kDwSetIndexSize       = 2;
+constexpr uint32_t kDwSetNumInstances    = 2;
+constexpr uint32_t kDwStallCbParser      = 2;
+constexpr uint32_t kDwSetRegisterDirect  = 3;
+constexpr uint32_t kDwSetRegsIndirect    = 4;
+constexpr uint32_t kDwAcquireMem         = 8;
+constexpr uint32_t kDwReleaseMem         = 8;
+constexpr uint32_t kDwJump               = 5;
 constexpr uint64_t kAgcErrInvalidArg = 0x8a6c000aull;
 constexpr uint64_t kAgcErrInvalidShaderHalves = 0x8a6c0008ull;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
 }
+
+// --- #1756: is prosper about to overrun a reservation the guest sized from the REAL AGC packet? ---
+//
+// prosper's builders append into the GUEST's command buffer, and a guest reserves that buffer from
+// the packet sizes it was compiled against. A builder that emits more dwords than the hardware
+// packet it stands for therefore overruns the reservation — and the failure does not look like a
+// packet-size problem. On Asterix & Obelix - Babylon Mission (#1748) it looked like a 210 MiB/s heap
+// leak: the append did not fit, the Dcb's "buffer full" callback fired, and the guest's chunk
+// allocator handed over a fresh ~600 KiB command-buffer chunk for every submit until direct memory
+// was gone.
+//
+// The defect is invisible in most titles, and that asymmetry is why it needs a probe rather than a
+// crash to find it: a guest that calls `sceAgc*GetSize` is TOLD prosper's size and reserves exactly
+// what prosper will write, so it stays self-consistent at any size. Only a guest with the sizes
+// inlined from the AGC headers — which cannot be told — is exposed. The bug is therefore silent in
+// every title that asks and fatal in the one that does not, and the next affected title may not
+// crash at all: it may simply churn command-buffer chunks and run slowly.
+//
+// Two gated reports, both off by default and neither able to gate or alter a single write:
+//
+//   PROSPER_DCBFULL=1  every buffer-full callback, with the sub-op that triggered it and the dwords
+//                      needed vs available. A SMALL window is the signature: a multi-hundred-KiB
+//                      buffer filling up is ordinary growth, while a window of a few dozen dwords is
+//                      a guest reservation prosper has just overrun.
+//   PROSPER_DCBWIN=N   every packet appended into a window of N dwords or fewer (N=1 means the
+//                      default 64). A tightly sized window states the guest's own per-packet budget
+//                      in hardware sizes, so its contents ARE the reference for the packets in it.
+struct AgcDcb;
+const char* dcb_subop_name(uint32_t r);
+void dcb_report_full(const AgcDcb* dcb, uint32_t need);
+void dcb_report_window(const AgcDcb* dcb, uint32_t n, uint32_t op, uint32_t r);
+void dcb_diag_tick(bool was_full);
+inline bool dcb_diag_full() {
+    static const bool v = getenv("PROSPER_DCBFULL") != nullptr;
+    return v;
+}
+inline uint32_t dcb_diag_win() {
+    static const uint32_t v = [] {
+        const char* e = getenv("PROSPER_DCBWIN");
+        if (!e) return 0u;
+        const long n = strtol(e, nullptr, 0);
+        if (n <= 0) return 0u;                 // explicit 0 (or junk) means OFF, not "the default"
+        return n > 1 ? (uint32_t)n : 64u;      // PROSPER_DCBWIN=1 selects the default 64
+    }();
+    return v;
+}
+// Which builder is inside allocate_dw right now, so the buffer-full report can name it. Per-thread:
+// several guest threads build into their own Dcbs concurrently, and a shared global would attribute
+// one thread's overrun to another's packet. 0xffffffff = a raw allocate_dw with no sub-op (CbNop,
+// the type-2 filler).
+//
+// `thread_local` is safe here even though guest threads run with the guest's `%fs` (see the aliasing
+// warning in hle_kernel.cpp): an HLE only ever runs behind an import stub, and the stub swaps back to
+// the HOST `%fs` for the duration of the call. Both writer and reader are inside that window, in the
+// same call, on the same thread.
+constexpr uint32_t kDcbDiagRaw = 0xffffffffu;
+inline thread_local uint32_t g_dcb_diag_r = kDcbDiagRaw;
+inline thread_local uint32_t g_dcb_diag_op = 0;
 
 // --- The Draw Command Buffer (the game's own struct; we cast the guest pointer). Kyty layout
 // (Graphics.cpp:777): a dword ring [bottom,top) with a write cursor and a "buffer full" callback. ---
@@ -95,6 +199,7 @@ struct AgcDcb {
     uint32_t* allocate_dw(uint32_t n) {
         if (n == 0) return nullptr;
         if (n > available_dw()) {
+            dcb_report_full(this, n);          // #1756 probe; no-op unless PROSPER_DCBFULL
             if (!callback || !callback(this, n + reserved_dw, user_data)) return nullptr;
             if (available_dw() < n) return nullptr;
         }
@@ -103,6 +208,114 @@ struct AgcDcb {
         return r;
     }
 };
+
+const char* dcb_subop_name(uint32_t r) {
+    switch (r) {
+        case R_DRAW_INDEX:                 return "DrawIndex";
+        case R_DRAW_INDEX_AUTO:            return "DrawIndexAuto";
+        case R_DRAW_RESET:                 return "ResetQueue";
+        case R_WAIT_FLIP_DONE:             return "WaitUntilSafeForRendering";
+        case R_PUSH_MARKER:                return "PushMarker";
+        case R_POP_MARKER:                 return "PopMarker";
+        case R_SH_REGS_INDIRECT:           return "SetShRegsIndirect";
+        case R_CX_REGS_INDIRECT:           return "SetCxRegsIndirect";
+        case R_UC_REGS_INDIRECT:           return "SetUcRegsIndirect";
+        case R_ACQUIRE_MEM:                return "AcquireMem";
+        case R_WRITE_DATA:                 return "WriteData";
+        case R_WAIT_MEM_64:                return "WaitRegMem";
+        case R_FLIP:                       return "SetFlip";
+        case R_RELEASE_MEM:                return "ReleaseMem/EopAction";
+        case R_DMA_DATA:                   return "DmaData";
+        case R_DISPATCH_DIRECT:            return "Dispatch";
+        case R_INDEX_BASE:                 return "SetIndexBuffer";
+        case R_INDEX_COUNT:                return "SetIndexCount";
+        case R_DRAW_INDEX_OFFSET:          return "DrawIndexOffset";
+        case R_JUMP:                       return "Jump";
+        case R_SET_PRED:                   return "SetPredication";
+        case R_SET_BASE_INDIRECT_ARGS:     return "SetBaseIndirectArgs";
+        case R_STALL_COMMAND_BUFFER_PARSER: return "StallCommandBufferParser";
+        case R_DRAW_INDEX_INDIRECT:        return "DrawIndexIndirect";
+        case R_DISPATCH_INDIRECT:          return "DispatchIndirect";
+        // A raw allocate_dw with no sub-op (CbNop's 1-dword form, the type-2 filler). Without its own
+        // case it would print as "(op-carried)" and be indistinguishable from a real op-carried packet.
+        case kDcbDiagRaw:                  return "raw-allocate";
+        // Everything else is named by its PM4 opcode, not a custom sub-op; both reports print `op=0x..`
+        // alongside, which is what identifies it (0x76 SET_SH_REG, 0x46 EVENT_WRITE, 0x2f NUM_INSTANCES…).
+        default:                           return "(op-carried)";
+    }
+}
+// A ZERO FROM A GATED PROBE MUST PROVE IT WAS ARMED. #1756's corpus census concluded that Syberia
+// issues no buffer-full callbacks at all, and that negative went into a permanent `## Ruled out`
+// row — but an unarmed run produces exactly the same empty log as a clean one, so the conclusion
+// rested on the operator having set the variable correctly. It now rests on the log: when either
+// probe is armed the first packet emits a banner, and every 2^20 packets a tally reports how many
+// were observed and how many buffer-full events fired. A run whose log contains
+// `[dcbdiag] armed` and `full=0` measured zero; a run containing neither measured nothing, and the
+// difference is visible without re-running anything.
+std::atomic<uint64_t> g_dcb_diag_packets{0}, g_dcb_diag_fulls{0};
+// Totals at exit as well, for a clean shutdown. Do not rely on it: a `timeout`-bounded diagnostic
+// run dies on SIGTERM and never runs static destructors, which is why the periodic tally above is
+// the primary evidence and its interval is small.
+struct DcbDiagSummary {
+    ~DcbDiagSummary() {
+        const uint64_t n = g_dcb_diag_packets.load(std::memory_order_relaxed);
+        if (!n) return;
+        fprintf(stderr, "[dcbdiag] TOTAL seen=%llu packets, full=%llu buffer-full events\n",
+                (unsigned long long)n,
+                (unsigned long long)g_dcb_diag_fulls.load(std::memory_order_relaxed));
+    }
+};
+DcbDiagSummary g_dcb_diag_summary;
+void dcb_diag_tick(bool was_full) {
+    if (was_full) { g_dcb_diag_fulls.fetch_add(1, std::memory_order_relaxed); return; }
+    const uint64_t n = g_dcb_diag_packets.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1)
+        fprintf(stderr, "[dcbdiag] armed: DCBFULL=%d DCBWIN=%u — this line proves the probe is live; "
+                        "a run without it measured nothing\n",
+                dcb_diag_full() ? 1 : 0, dcb_diag_win());
+    // Every 2^14 packets, not 2^20: these runs are `timeout`-bounded, so SIGTERM skips the exit
+    // summary below, and a low-volume title (Syberia emits well under 2^20 in 45 s) would otherwise
+    // produce no tally at all — leaving "measured zero" and "never armed" looking identical, which
+    // is the whole failure this reporting exists to prevent.
+    if ((n & 0x3fffu) == 0)
+        fprintf(stderr, "[dcbdiag] seen=%llu packets, full=%llu buffer-full events\n",
+                (unsigned long long)n, (unsigned long long)g_dcb_diag_fulls.load(std::memory_order_relaxed));
+}
+void dcb_report_full(const AgcDcb* dcb, uint32_t need) {
+    if (!dcb_diag_full() || !dcb) return;
+    dcb_diag_tick(true);
+    const uint32_t window = dcb->bottom && dcb->cursor_down
+                          ? (uint32_t)(dcb->cursor_down - dcb->bottom) : 0;
+    // Bound the report. A title whose command buffer simply grows produces one of these per chunk
+    // for its whole run; the interesting population is the first few hundred, and the per-window-size
+    // census the reader wants survives truncation because tight windows repeat.
+    static std::atomic<uint32_t> n{0};
+    const uint32_t i = n.fetch_add(1, std::memory_order_relaxed);
+    if (i >= 512 && (i & 8191u) != 0) return;
+    fprintf(stderr, "[dcbfull] #%u %s op=0x%x need=%u avail=%u reserved=%u window=%u dw at +%u cb=%p\n",
+            i, dcb_subop_name(g_dcb_diag_r), g_dcb_diag_op, need, dcb->available_dw(), dcb->reserved_dw, window,
+            dcb->bottom && dcb->cursor_up ? (unsigned)(dcb->cursor_up - dcb->bottom) : 0,
+            (void*)(uintptr_t)dcb->callback);
+}
+void dcb_report_window(const AgcDcb* dcb, uint32_t n, uint32_t op, uint32_t r) {
+    // begin_packet is the hottest path in the HLE (millions of packets per minute), so do nothing at
+    // all — not even the two thread-local stores that name the builder for the buffer-full report —
+    // unless one of the probes is armed. One relaxed load of a function-local static guard is the
+    // entire cost of an unarmed run.
+    static const bool armed = dcb_diag_full() || dcb_diag_win() != 0;
+    if (!armed) return;
+    dcb_diag_tick(false);                   // banner + periodic tally, so a zero is self-evidencing
+    g_dcb_diag_r = r; g_dcb_diag_op = op;   // remembered for the buffer-full report just below
+    const uint32_t limit = dcb_diag_win();
+    if (!limit || !dcb || !dcb->bottom || !dcb->cursor_down) return;
+    const uint32_t window = (uint32_t)(dcb->cursor_down - dcb->bottom);
+    if (!window || window > limit) return;
+    static std::atomic<uint32_t> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) >= 4096) return;
+    fprintf(stderr, "[dcbwin] window=%u dw : %s n=%u op=0x%x at +%u (avail %u)\n",
+            window, dcb_subop_name(r), n, op,
+            (unsigned)(dcb->cursor_up - dcb->bottom), dcb->available_dw());
+}
 
 // Helper: allocate `n` dwords and set the header; returns cmd (or nullptr).
 inline uint32_t* begin_packet(uint64_t buf, uint32_t n, uint32_t op, uint32_t r, uint32_t** out) {
@@ -114,6 +327,7 @@ inline uint32_t* begin_packet(uint64_t buf, uint32_t n, uint32_t op, uint32_t r,
     // choke point for every builder, so guarding it here covers WriteData, CbNop and the SetShReg range
     // at once (#450, the overflow sibling of #401's num==1 underflow). Reject rather than corrupt.
     if (n < 2u || n > 0x4001u) { *out = nullptr; return nullptr; }
+    dcb_report_window(dcb, n, op, r);          // #1756 probe; no-op unless PROSPER_DCBWIN
     uint32_t* cmd = dcb->allocate_dw(n);
     if (cmd) cmd[0] = PM4(n, op, r);
     *out = cmd;
@@ -167,6 +381,7 @@ HLE(agc_dcb_pop_marker) {  // (buf)
 HLE(agc_dcb_type2_nop) {  // (buf)
     auto* dcb = reinterpret_cast<AgcDcb*>(static_cast<uintptr_t>(a0));
     if (!dcb) return 0;
+    g_dcb_diag_r = kDcbDiagRaw; g_dcb_diag_op = 0;       // #1756: not routed through begin_packet
     uint32_t* cmd = dcb->allocate_dw(1);
     if (!cmd) return 0;
     *cmd = 0x80000000u;
@@ -195,7 +410,7 @@ HLE(agc_build_interpolant_mapping) {  // (uint64_t out[32], opaque descriptor, o
     return 0;
 }
 HLE(agc_dcb_set_num_instances) {  // (buf, num_instances)
-    uint32_t* cmd; if (!begin_packet(a0, 2, IT_NUM_INSTANCES, 0, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwSetNumInstances, IT_NUM_INSTANCES, 0, &cmd)) return 0;
     cmd[1] = (uint32_t)a1;
     return (uint64_t)(uintptr_t)cmd;
 }
@@ -205,7 +420,7 @@ HLE(agc_dcb_wait_safe_for_rendering) {  // (buf, video_out_handle, display_buffe
     return (uint64_t)(uintptr_t)cmd;
 }
 static uint64_t set_register_direct(uint64_t buf, uint64_t packed_reg, uint32_t opcode) {
-    uint32_t* cmd; if (!begin_packet(buf, 3, opcode, 0, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(buf, kDwSetRegisterDirect, opcode, 0, &cmd)) return 0;
     cmd[1] = (uint32_t)(packed_reg & 0xffffffffu);
     cmd[2] = (uint32_t)(packed_reg >> 32u);
     return (uint64_t)(uintptr_t)cmd;
@@ -217,7 +432,7 @@ HLE(agc_dcb_set_cx_register_direct) { return set_register_direct(a0, a1, IT_SET_
 HLE(agc_dcb_set_sh_register_direct) { return set_register_direct(a0, a1, IT_SET_SH_REG); }
 HLE(agc_dcb_set_uc_register_direct) { return set_register_direct(a0, a1, IT_SET_UCONFIG_REG); }
 static uint64_t set_regs_indirect(uint64_t buf, uint64_t regs, uint64_t num_regs, uint32_t r) {
-    uint32_t* cmd; if (!begin_packet(buf, 4, IT_NOP, r, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(buf, kDwSetRegsIndirect, IT_NOP, r, &cmd)) return 0;
     cmd[1] = (uint32_t)num_regs; cmd[2] = (uint32_t)(regs & 0xffffffffu); cmd[3] = (uint32_t)(regs >> 32u);
     // PROSPER_REGBLOAT (#1264): record-time provenance for the register-array bloat investigation —
     // correlate each packet's ORIGINAL count with later PatchAddRegisters growth and the fold-time
@@ -235,11 +450,11 @@ HLE(agc_dcb_set_cx_regs_indirect) { return set_regs_indirect(a0, a1, a2, R_CX_RE
 HLE(agc_dcb_set_sh_regs_indirect) { return set_regs_indirect(a0, a1, a2, R_SH_REGS_INDIRECT); }
 HLE(agc_dcb_set_uc_regs_indirect) { return set_regs_indirect(a0, a1, a2, R_UC_REGS_INDIRECT); }
 HLE(agc_dcb_set_index_size) {  // (buf, index_size, cache_policy)
-    uint32_t* cmd; if (!begin_packet(a0, 2, IT_INDEX_TYPE, 0, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwSetIndexSize, IT_INDEX_TYPE, 0, &cmd)) return 0;
     cmd[1] = (uint32_t)a1; return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_draw_index_auto) {  // (buf, index_count, modifier)
-    uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DRAW_INDEX_AUTO, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwDrawIndexAuto, IT_NOP, R_DRAW_INDEX_AUTO, &cmd)) return 0;
     cmd[1] = (uint32_t)a1;
     // Store the draw modifier (ShaderDrawModifier bits) instead of dropping it, and zero the
     // packet tail — cmd[3..6] previously carried stale ring-buffer memory inside a packet whose
@@ -259,7 +474,7 @@ HLE(agc_dcb_draw_index_auto) {  // (buf, index_count, modifier)
 // 32-bit flags+type instead — CONFIDENCE: MED, stored raw. pm4_decode decodes this packet as
 // Kind::DrawIndex (issue #63); the index ELEMENT SIZE comes from the preceding SetIndexSize packet.
 HLE(agc_dcb_draw_index) {
-    uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DRAW_INDEX, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwDrawIndex, IT_NOP, R_DRAW_INDEX, &cmd)) return 0;
     cmd[1] = (uint32_t)a1;
     cmd[2] = (uint32_t)(a2 & 0xffffffffu); cmd[3] = (uint32_t)(a2 >> 32u);
     cmd[4] = (uint32_t)(a3 & 0xffffffffu); cmd[5] = (uint32_t)(a3 >> 32u);
@@ -283,7 +498,7 @@ HLE(agc_dcb_set_index_buffer) {  // (dcb, indexBufferAddr)
     if (getenv("PROSPER_GFXLOG") && g_ib_log.fetch_add(1) < 24)
         fprintf(stderr, "[agc] SetIndexBuffer dcb=0x%llx addr=0x%llx a2=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
-    uint32_t* cmd; if (!begin_packet(a0, 3, IT_NOP, R_INDEX_BASE, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwSetIndexBuffer, IT_NOP, R_INDEX_BASE, &cmd)) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
     return (uint64_t)(uintptr_t)cmd;
 }
@@ -292,7 +507,7 @@ HLE(agc_dcb_set_index_count) {  // (dcb, indexCount)
     if (getenv("PROSPER_GFXLOG") && g_ic_log.fetch_add(1) < 24)
         fprintf(stderr, "[agc] SetIndexCount dcb=0x%llx count=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1);
-    uint32_t* cmd; if (!begin_packet(a0, 2, IT_NOP, R_INDEX_COUNT, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwSetIndexCount, IT_NOP, R_INDEX_COUNT, &cmd)) return 0;
     cmd[1] = (uint32_t)a1;
     return (uint64_t)(uintptr_t)cmd;
 }
@@ -302,7 +517,7 @@ HLE(agc_dcb_draw_index_offset) {  // (dcb, startIndex[, indexCount])
         fprintf(stderr, "[agc] DrawIndexOffset dcb=0x%llx off=0x%llx a2=0x%llx a3=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1,
                 (unsigned long long)a2, (unsigned long long)a3);
-    uint32_t* cmd; if (!begin_packet(a0, 3, IT_NOP, R_DRAW_INDEX_OFFSET, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwDrawIndexOffset, IT_NOP, R_DRAW_INDEX_OFFSET, &cmd)) return 0;
     cmd[1] = (uint32_t)a1;
     cmd[2] = (uint32_t)a2;   // explicit draw count if the builder passes one; 0 => use SetIndexCount
     return (uint64_t)(uintptr_t)cmd;
@@ -342,7 +557,7 @@ HLE(agc_dcb_jump) {  // sceAgcDcbJump(dcb, ?, ?, target_addr, num_dw)
                     (unsigned long long)k, (unsigned long long)a0, (unsigned long long)a3,
                     (unsigned long long)a4, (unsigned long long)a1, (unsigned long long)a2);
     }
-    uint32_t* cmd; if (!begin_packet(a0, 5, IT_NOP, R_JUMP, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwJump, IT_NOP, R_JUMP, &cmd)) return 0;
     cmd[1] = (uint32_t)(a3 & 0xffffffffu); cmd[2] = (uint32_t)(a3 >> 32u);
     cmd[3] = (uint32_t)a4;
     cmd[4] = 0;   // predicated flag — set by sceAgcSetPacketPredication on this returned packet
@@ -389,6 +604,7 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
     // CP / our decoder now skips as a single dword — emit that instead of a malformed type-3 header.
     if (num == 1) {
         auto* dcb = (AgcDcb*)(uintptr_t)a0;
+        g_dcb_diag_r = kDcbDiagRaw; g_dcb_diag_op = 0;   // #1756: not routed through begin_packet
         uint32_t* cmd = dcb->allocate_dw(1);
         if (!cmd) return 0;
         cmd[0] = 0x80000000u;   // PM4 type-2 single-dword NOP filler
@@ -433,7 +649,7 @@ static uint64_t label_build_pre(uint64_t dst, uint64_t num_bytes) {
 HLE9(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, ..., stack9=numBytes)
     uint64_t num_bytes = a8 <= 0x10000000ull ? a8 : 0;
     static std::atomic<uint64_t> g_dma_n{0};
-    uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_DMA_DATA, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwDmaData, IT_NOP, R_DMA_DATA, &cmd)) return 0;
     if (getenv("PROSPER_PREDLOG") || getenv("PROSPER_GFXLOG")) {
         uint64_t k = g_dma_n.fetch_add(1);
         if (k < 48 || (k % 4096) == 0)
@@ -445,8 +661,6 @@ HLE9(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, 
     cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
     cmd[5] = (uint32_t)num_bytes;
     cmd[6] = (uint32_t)((a2 & 0xffu) | ((a3 & 0xffu) << 8));
-    uint64_t build_pre = label_build_pre(a4, num_bytes);
-    cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
     if (num_bytes <= 8) {
         prosper_label_hist_dma_built(a4, a0, (uint32_t)a1, 1);                  // #312 label-init form
     }
@@ -460,13 +674,11 @@ HLE9(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, 
 HLE9(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm, stack8=numBytes)
     uint64_t src_imm = a6, num_bytes = a7;
     if (num_bytes > 0x10000000ull) num_bytes = 0;
-    uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_DMA_DATA, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwDmaData, IT_NOP, R_DMA_DATA, &cmd)) return 0;
     cmd[1] = (uint32_t)(a3 & 0xffffffffu); cmd[2] = (uint32_t)(a3 >> 32u);
     cmd[3] = (uint32_t)(src_imm & 0xffffffffu); cmd[4] = (uint32_t)(src_imm >> 32u);
     cmd[5] = (uint32_t)num_bytes;
     cmd[6] = (uint32_t)((a1 & 0xffu) | ((a2 & 0xffu) << 8));
-    uint64_t build_pre = label_build_pre(a3, num_bytes);
-    cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
     if (num_bytes <= 8) {
         prosper_label_hist_dma_built(a3, a0, (uint32_t)src_imm, 2);              // #312
     }
@@ -490,12 +702,14 @@ HLE9(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm,
 // executes. Guarded to the exact observed clobber (header == 0 AND a plausible DMA body: mapped
 // dst, sane byte count), so a genuine non-DMA target still refuses loudly. CONFIDENCE: MED-HIGH.
 static bool dma_patch_recover_header(uint32_t* cmd, const char* who) {
-    if (!gpu::guest_readable((uint64_t)(uintptr_t)cmd, 9 * sizeof(uint32_t))) return false;
+    if (!gpu::guest_readable((uint64_t)(uintptr_t)cmd, kDwDmaData * sizeof(uint32_t))) return false;
     if (cmd[0] != 0) return false;                                   // not the zero-clobber shape
     const uint64_t dst   = (uint64_t)cmd[1] | ((uint64_t)cmd[2] << 32);
     const uint32_t bytes = cmd[5];
     if (dst < 0x10000 || bytes == 0 || bytes > 0x10000000u) return false;  // implausible DMA body
-    cmd[0] = PM4(9, IT_NOP, R_DMA_DATA);                             // prosper's 9-dword form
+    cmd[0] = PM4(kDwDmaData, IT_NOP, R_DMA_DATA);   // MUST match the builder: a stale literal here
+                                                    // stamps a longer header over a shorter
+                                                    // allocation and desyncs the submit (#1756)
     static std::atomic<int> n{0};
     if (n.fetch_add(1) < 8)
         fprintf(stderr, "[agc] %s: restored clobbered DMA header (dst=0x%llx bytes=%u) — #1124\n",
@@ -514,6 +728,8 @@ HLE(agc_patch_dma_data_dst) {  // (cmd, address)
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     if (!dma_patch_ready(cmd, "DmaDataPatchSetDst")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    // Defensive tolerance for the historical 9-dword shape, not a live path: with #1756 every packet
+    // reachable here at runtime is a 7-dword one this file just built.
     uint32_t len = ((cmd[0] >> 16) & 0x3fffu) + 2;
     if (len >= 9) {
         uint64_t build_pre = label_build_pre(a1, cmd[5]);
@@ -533,13 +749,13 @@ HLE(agc_dcb_event_write) {  // (buf, event_type, address)
     // left a guest waiting on that label blocked forever. cmd[1]=event_type, cmd[2..3]=address lo/hi.
     // An address-less event (a2=0, the pipeline-sync variants: partial-flush, cache-inval) stays a
     // no-op in the CommandProcessor (event_addr==0), exactly as before.
-    uint32_t* cmd; if (!begin_packet(a0, 4, IT_EVENT_WRITE, 0, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwEventWrite, IT_EVENT_WRITE, 0, &cmd)) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffu);
     cmd[2] = (uint32_t)(a2 & 0xffffffffu); cmd[3] = (uint32_t)(a2 >> 32u);
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_acquire_mem) {  // (buf, engine, cb_db_op, gcr_cntl, ...) — 8 dw
-    uint32_t* cmd; if (!begin_packet(a0, 8, IT_NOP, R_ACQUIRE_MEM, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwAcquireMem, IT_NOP, R_ACQUIRE_MEM, &cmd)) return 0;
     cmd[1] = (uint32_t)a2; cmd[2] = cmd[3] = cmd[4] = cmd[5] = cmd[6] = 0; cmd[7] = (uint32_t)a3;
     return (uint64_t)(uintptr_t)cmd;
 }
@@ -630,7 +846,7 @@ HLE9(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, ca
     // so only its HIGH half is retained — which is the only half `stale_release_generation` reads
     // (it masks with 0xffffffff00000000). Keep this at 8; if a future field is needed, drop the
     // snapshot rather than growing the packet.
-    uint32_t* cmd; if (!begin_packet(a0, 8, IT_NOP, R_RELEASE_MEM, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwReleaseMem, IT_NOP, R_RELEASE_MEM, &cmd)) return 0;
     cmd[1] = (uint32_t)(a5 & 0xffffffffu); cmd[2] = (uint32_t)(a5 >> 32u);
     cmd[3] = (uint32_t)data_sel;
     cmd[4] = (uint32_t)(data & 0xffffffffu); cmd[5] = (uint32_t)(data >> 32u);
@@ -2215,7 +2431,7 @@ HLE(agc_driver_register_resource) {
 // the packet keeps the stream faithful; the CommandProcessor retains it for ordered submit execution.
 // CONFIDENCE: HIGH (PS5 symbol table + live kernels, register state, modifier, and descriptor sizes).
 HLE(agc_cb_dispatch) {  // (buf, dimension_x, dimension_y, dimension_z, dispatch_modifier)
-    uint32_t* cmd; if (!begin_packet(a0, 6, IT_NOP, R_DISPATCH_DIRECT, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwDispatch, IT_NOP, R_DISPATCH_DIRECT, &cmd)) return 0;
     cmd[1] = (uint32_t)a1; cmd[2] = (uint32_t)a2; cmd[3] = (uint32_t)a3;
     cmd[4] = (uint32_t)(a4 & 0xffffffffu); cmd[5] = (uint32_t)(a4 >> 32u);
     return (uint64_t)(uintptr_t)cmd;
@@ -2236,19 +2452,19 @@ HLE(agc_dcb_set_base_indirect_args) {
     return reinterpret_cast<uint64_t>(cmd);
 }
 HLE(agc_dcb_stall_command_buffer_parser) {
-    uint32_t* cmd; if (!begin_packet(a0, 2, IT_NOP, R_STALL_COMMAND_BUFFER_PARSER, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwStallCbParser, IT_NOP, R_STALL_COMMAND_BUFFER_PARSER, &cmd)) return 0;
     cmd[1] = 0;
     return reinterpret_cast<uint64_t>(cmd);
 }
 HLE(agc_dcb_draw_index_indirect) {
-    uint32_t* cmd; if (!begin_packet(a0, 4, IT_NOP, R_DRAW_INDEX_INDIRECT, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwDrawIndexIndirect, IT_NOP, R_DRAW_INDEX_INDIRECT, &cmd)) return 0;
     cmd[1] = static_cast<uint32_t>(a1);
     cmd[2] = static_cast<uint32_t>(a2);
     cmd[3] = static_cast<uint32_t>(a2 >> 32u);
     return reinterpret_cast<uint64_t>(cmd);
 }
 HLE(agc_cb_dispatch_indirect) {
-    uint32_t* cmd; if (!begin_packet(a0, 4, IT_NOP, R_DISPATCH_INDIRECT, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, kDwDispatchIndirect, IT_NOP, R_DISPATCH_INDIRECT, &cmd)) return 0;
     cmd[1] = static_cast<uint32_t>(a1);
     cmd[2] = static_cast<uint32_t>(a2);
     cmd[3] = static_cast<uint32_t>(a2 >> 32u);
@@ -2265,10 +2481,47 @@ HLE(agc_cb_dispatch_indirect) {
 // only that reserved >= written, so a builder prosper hasn't implemented (Rewind) still reserves safely.
 // CONFIDENCE: MED — units (bytes) and the sum/allocate contract are pinned from live render-thread
 // disassembly; exact per-command dword counts mirror prosper's own builders.
-HLE(agc_dcb_jump_get_size)        { (void)a0; return 5u * 4u; }   // sceAgcDcbJump builds 5 dwords
-HLE(agc_dcb_acquire_mem_get_size) { (void)a0; return 8u * 4u; }   // sceAgc(Dcb|Acb)AcquireMem builds 8
-HLE(agc_dcb_rewind_get_size)      { (void)a0; return 2u * 4u; }   // PM4 REWIND, 2 dwords
-HLE(agc_cb_eop_action_get_size)   { (void)a0; return 8u * 4u; }   // sceAgcCbReleaseMem (EOP) builds 8
+HLE(agc_dcb_jump_get_size)        { (void)a0; return kDwJump * 4u; }
+HLE(agc_dcb_acquire_mem_get_size) { (void)a0; return kDwAcquireMem * 4u; }
+HLE(agc_dcb_rewind_get_size)      { (void)a0; return 2u * 4u; }   // PM4 REWIND, 2 dwords (reserve-only)
+HLE(agc_cb_eop_action_get_size)   { (void)a0; return kDwReleaseMem * 4u; }
+
+// #1756: the rest of the GetSize family whose builder prosper HAS. libSceAgc 3.20 exports 65
+// GetSize functions; prosper implemented 4 of them (plus Rewind and Nop) and left the other 59 to
+// the generic unimplemented path, which returns **0**. Zero is the worst possible answer here: a
+// guest that sizes its command buffer from GetSize reserves NOTHING and the matching builder then
+// overruns it. That is the same failure #1748 hit with an off-by-one, and #1137 hit before that
+// ("Stubbed to 0 the guest allocates a 128-byte buffer and the builders overflow it -> corrupt
+// submit -> RAGE fatal") — each time found by a crash in one title and fixed one NID at a time.
+//
+// Each of these returns the DWORD COUNT PROSPER'S OWN BUILDER EMITS, which is correct by
+// construction and needs no hardware size: the guest reserves exactly what prosper will write, so
+// the pair is self-consistent even where prosper's encoding differs from the real packet. That is
+// also why this is the safe half of the audit — the unsafe half (a guest with the sizes INLINED,
+// which cannot be told anything) is what PROSPER_DCBFULL exists to detect.
+//
+// Deliberately NOT here: the size-carrying builders whose GetSize argument position is unknown
+// (WriteData, SetShRegisterRangeDirect, SetShRegistersDirect — see the issue), and the 33 GetSize
+// functions whose builder prosper does not implement either, where a size would be a guess and the
+// builder call would fail anyway.
+// CONFIDENCE: HIGH on the contract (GetSize == builder emission) and on each NID (3.20 firmware
+// export table); the dword counts are prosper's own and are asserted against the builders by
+// test_agc_getsize.
+HLE(agc_draw_index_get_size)          { (void)a0; return kDwDrawIndex * 4u; }
+HLE(agc_draw_index_auto_get_size)     { (void)a0; return kDwDrawIndexAuto * 4u; }
+HLE(agc_draw_index_offset_get_size)   { (void)a0; return kDwDrawIndexOffset * 4u; }
+HLE(agc_draw_index_indirect_get_size) { (void)a0; return kDwDrawIndexIndirect * 4u; }
+HLE(agc_dispatch_get_size)            { (void)a0; return kDwDispatch * 4u; }
+HLE(agc_dispatch_indirect_get_size)   { (void)a0; return kDwDispatchIndirect * 4u; }
+HLE(agc_dma_data_get_size)            { (void)a0; return kDwDmaData * 4u; }
+HLE(agc_event_write_get_size)         { (void)a0; return kDwEventWrite * 4u; }
+HLE(agc_set_index_buffer_get_size)    { (void)a0; return kDwSetIndexBuffer * 4u; }
+HLE(agc_set_index_count_get_size)     { (void)a0; return kDwSetIndexCount * 4u; }
+HLE(agc_set_index_size_get_size)      { (void)a0; return kDwSetIndexSize * 4u; }
+HLE(agc_set_num_instances_get_size)   { (void)a0; return kDwSetNumInstances * 4u; }
+HLE(agc_stall_cb_parser_get_size)     { (void)a0; return kDwStallCbParser * 4u; }
+HLE(agc_set_register_direct_get_size) { (void)a0; return kDwSetRegisterDirect * 4u; }
+HLE(agc_set_regs_indirect_get_size)   { (void)a0; return kDwSetRegsIndirect * 4u; }
 // sceAgcCbNopGetSize(numDwords): the NOP is exactly the requested dword count (min 1). arg in a0.
 HLE(agc_cb_nop_get_size)          { uint32_t n = (uint32_t)a0; if (n == 0) n = 1; return (uint64_t)n * 4u; }
 
@@ -2280,6 +2533,29 @@ void register_agc_hle() {
     RN("ewobAQeMo5k", agc_dcb_acquire_mem_get_size); // sceAgcAcbAcquireMemGetSize (same size)
     RN("QIXCsbipds0", agc_dcb_rewind_get_size);      // sceAgcDcbRewindGetSize
     RN("hL7C0IRpWZI", agc_cb_eop_action_get_size);   // sceAgcCbQueueEndOfPipeActionGetSize
+    // #1756: GetSize for every builder prosper has. NIDs from the PS5 3.20 libSceAgc export table.
+    RN("6ee9Hd3EWXQ", agc_draw_index_get_size);          // sceAgcDcbDrawIndexGetSize
+    RN("WrdP9Zxx3lQ", agc_draw_index_auto_get_size);     // sceAgcDcbDrawIndexAutoGetSize
+    RN("qMlfB1ZhMDc", agc_draw_index_offset_get_size);   // sceAgcDcbDrawIndexOffsetGetSize
+    RN("mStuvI0zOtc", agc_draw_index_indirect_get_size); // sceAgcDcbDrawIndexIndirectGetSize
+    RN("Abendgtz+3o", agc_dispatch_get_size);            // sceAgcCbDispatchGetSize
+    RN("w8HVkEeXPv8", agc_dispatch_indirect_get_size);   // sceAgcDcbDispatchIndirectGetSize
+    RN("PxKWV2fVAps", agc_dispatch_indirect_get_size);   // sceAgcAcbDispatchIndirectGetSize
+    RN("2ccJz9LQI+w", agc_dma_data_get_size);            // sceAgcDcbDmaDataGetSize
+    RN("M0ttm8h7SKA", agc_dma_data_get_size);            // sceAgcAcbDmaDataGetSize
+    RN("C4l9fB17t8w", agc_event_write_get_size);         // sceAgcDcbEventWriteGetSize
+    RN("Y-5vneiBtzk", agc_event_write_get_size);         // sceAgcAcbEventWriteGetSize
+    RN("j4emHHndCPY", agc_set_index_buffer_get_size);    // sceAgcDcbSetIndexBufferGetSize
+    RN("mljzuGDZRQ4", agc_set_index_count_get_size);     // sceAgcDcbSetIndexCountGetSize
+    RN("ca4KPvp0qLQ", agc_set_index_size_get_size);      // sceAgcDcbSetIndexSizeGetSize
+    RN("6DFuRKT4C9w", agc_set_num_instances_get_size);   // sceAgcDcbSetNumInstancesGetSize
+    RN("+u6dKSLWM2o", agc_stall_cb_parser_get_size);     // sceAgcDcbStallCommandBufferParserGetSize
+    RN("QhPDD513V0w", agc_set_register_direct_get_size); // sceAgcDcbSetShRegisterDirectGetSize
+    RN("1DeUNpRIDDA", agc_set_register_direct_get_size); // sceAgcDcbSetCxRegisterDirectGetSize
+    RN("aP1Ki9G3++4", agc_set_register_direct_get_size); // sceAgcDcbSetUcRegisterDirectGetSize
+    RN("nNlUtdDDvZ0", agc_set_regs_indirect_get_size);   // sceAgcDcbSetShRegistersIndirectGetSize
+    RN("GBCh3zCihoU", agc_set_regs_indirect_get_size);   // sceAgcDcbSetCxRegistersIndirectGetSize
+    RN("UQGTw4xRlcM", agc_set_regs_indirect_get_size);   // sceAgcDcbSetUcRegistersIndirectGetSize
     RN("t7PlZ9nt5Lc", agc_cb_nop_get_size);          // sceAgcCbNopGetSize
     RN("f3dg2CSgRKY", agc_create_shader);   // sceAgcCreateShader — populates the shader registry
     RN("dolOmWH+huQ", agc_get_fused_shader_size); // sceAgcGetFusedShaderSize (Pathless SDK)

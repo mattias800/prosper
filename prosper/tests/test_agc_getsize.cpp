@@ -33,10 +33,17 @@ static Dcb fresh() {
     return d;
 }
 
+// Some builders are 9-argument HLEs (DmaData reads a8, ReleaseMem reads a6/a7). Calling them through
+// the 6-argument HleFn leaves those reading whatever the stack held, which does not change the
+// emitted size for any of them but is still uninitialised-read UB and would trip a sanitiser. Call
+// every builder through the wide signature with explicit zeros instead.
+using HleFn9 = PROSPER_SYSV_ABI uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                             uint64_t, uint64_t, uint64_t, uint64_t);
+
 // Call a builder, return the dwords it emitted (cursor advance).
-template <class Fn> static uint64_t emitted(Fn builder, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+static uint64_t emitted(HleFn builder, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     Dcb d = fresh();
-    builder((uint64_t)(uintptr_t)&d, a1, a2, a3, a4, a5);
+    ((HleFn9)builder)((uint64_t)(uintptr_t)&d, a1, a2, a3, a4, a5, 0, 0, 0);
     return (uint64_t)(d.cursor_up - g_buf);
 }
 
@@ -44,13 +51,50 @@ int main() {
     std::printf("== test_agc_getsize (#1143 builder/GetSize drift guard) ==\n");
     register_builtin_hle();
 
-    // (getsize NID, builder NID, builder args) — GetSize must equal builder-emitted-dwords * 4.
-    struct Case { const char* name; const char* gs_nid; const char* build_nid; uint64_t a1,a2,a3,a4,a5; };
+    // (getsize NID, builder NID, EXPECTED dwords, builder args).
+    //
+    // `exp_dw` is the point of this table, not decoration. Asserting only "GetSize == builder" is a
+    // DRIFT guard: both sides read the same `kDw*` constant, so it stays green at any value and
+    // cannot see a builder whose size is simply wrong. #1756 shipped exactly that failure — a commit
+    // whose doc claimed DMA_DATA was 7 while the code emitted 9, with the suite green — and a full
+    // ctest is still green today with `kDwDmaData` reverted to 9 unless this column exists. Pinning
+    // the absolute count makes it a VALUE guard: changing a builder's size now fails here and must be
+    // changed deliberately, in the one place, with the reason.
+    struct Case { const char* name; const char* gs_nid; const char* build_nid; uint64_t exp_dw;
+                  uint64_t a1,a2,a3,a4,a5; };
     const Case cases[] = {
-        { "Jump",           "VEGu4dixjUg", "xSAR0LTcRKM", 0, 0, 0x1000, 0, 0 },  // sceAgcDcbJump -> 5 dw
-        { "AcquireMem/Dcb", "-vnlTPPXPrw", "57labkp+rSQ", 0, 0, 0,      0, 0 },  // sceAgcDcbAcquireMem -> 8 dw
-        { "AcquireMem/Acb", "ewobAQeMo5k", "KT-hTp-Ch14", 0, 0, 0,      0, 0 },  // sceAgcAcbAcquireMem -> 8 dw
-        { "ReleaseMem/EOP", "hL7C0IRpWZI", "wr23dPKyWc0", 0, 0, 0,      0, 0 },  // sceAgcCbReleaseMem -> 8 dw
+        { "Jump",           "VEGu4dixjUg", "xSAR0LTcRKM", 5, 0, 0, 0x1000, 0, 0 },  // sceAgcDcbJump -> 5 dw
+        { "AcquireMem/Dcb", "-vnlTPPXPrw", "57labkp+rSQ", 8, 0, 0, 0,      0, 0 },  // sceAgcDcbAcquireMem -> 8 dw
+        { "AcquireMem/Acb", "ewobAQeMo5k", "KT-hTp-Ch14", 8, 0, 0, 0,      0, 0 },  // sceAgcAcbAcquireMem -> 8 dw
+        { "ReleaseMem/EOP", "hL7C0IRpWZI", "wr23dPKyWc0", 8, 0, 0, 0,      0, 0 },  // sceAgcCbReleaseMem -> 8 dw
+        // #1756: the rest of the family. libSceAgc 3.20 exports 65 GetSize functions and prosper
+        // answered 6; the other 59 fell through to the unimplemented path and returned 0, which
+        // makes a guest that sizes its buffer from GetSize reserve NOTHING. Every pair below is
+        // asserted the same way — the GetSize must equal what the builder actually writes — so the
+        // fix cannot drift back apart. (The three size-carrying builders are excluded: their
+        // GetSize argument position is unknown. See #1756.)
+        { "DrawIndex",          "6ee9Hd3EWXQ", "q88lQ+GP5Yk", 7, 0, 0, 0, 0, 0 },
+        { "DrawIndexAuto",      "WrdP9Zxx3lQ", "Yw0jKSqop+E", 7, 0, 0, 0, 0, 0 },
+        { "DrawIndexOffset",    "qMlfB1ZhMDc", "B+aG9DUnTKA", 3, 0, 0, 0, 0, 0 },
+        { "DrawIndexIndirect",  "mStuvI0zOtc", "t1vNu082-jM", 4, 0, 0, 0, 0, 0 },
+        { "Dispatch",           "Abendgtz+3o", "k3GhuSNmBLU", 6, 0, 0, 0, 0, 0 },
+        { "DispatchIndirect/D", "w8HVkEeXPv8", "CtB+A9-VxO0", 4, 0, 0, 0, 0, 0 },
+        { "DispatchIndirect/A", "PxKWV2fVAps", "j3EtxFkSIhQ", 4, 0, 0, 0, 0, 0 },
+        { "DmaData/Dcb",        "2ccJz9LQI+w", "WmAc2MEj6Io", 7, 0, 0, 0, 0, 0 },
+        { "DmaData/Acb",        "M0ttm8h7SKA", "-RnpfpxIhec", 7, 0, 0, 0, 0, 0 },
+        { "EventWrite/Dcb",     "C4l9fB17t8w", "aJf+j5yntiU", 4, 0, 0, 0, 0, 0 },
+        { "EventWrite/Acb",     "Y-5vneiBtzk", "cFazmnXpJOE", 4, 0, 0, 0, 0, 0 },
+        { "SetIndexBuffer",     "j4emHHndCPY", "l4fM9K-Lyks", 3, 0, 0, 0, 0, 0 },
+        { "SetIndexCount",      "mljzuGDZRQ4", "8N2tmT3jmC8", 2, 0, 0, 0, 0, 0 },
+        { "SetIndexSize",       "ca4KPvp0qLQ", "GIIW2J37e70", 2, 0, 0, 0, 0, 0 },
+        { "SetNumInstances",    "6DFuRKT4C9w", "tSBxhAPyytQ", 2, 0, 0, 0, 0, 0 },
+        { "StallCbParser",      "+u6dKSLWM2o", "u2T2DiA5hRI", 2, 0, 0, 0, 0, 0 },
+        { "SetShRegDirect",     "QhPDD513V0w", "pFLArOT53+w", 3, 0, 0, 0, 0, 0 },
+        { "SetCxRegDirect",     "1DeUNpRIDDA", "LHFXRrlTPD8", 3, 0, 0, 0, 0, 0 },
+        { "SetUcRegDirect",     "aP1Ki9G3++4", "w4-d0n60hdo", 3, 0, 0, 0, 0, 0 },
+        { "SetShRegsIndirect",  "nNlUtdDDvZ0", "-HOOCn0JY48", 4, 0, 0, 0, 0, 0 },
+        { "SetCxRegsIndirect",  "GBCh3zCihoU", "ZvwO9euwYzc", 4, 0, 0, 0, 0, 0 },
+        { "SetUcRegsIndirect",  "UQGTw4xRlcM", "hvUfkUIQcOE", 4, 0, 0, 0, 0, 0 },
     };
     for (const auto& c : cases) {
         HleFn gs = Hle::lookup(c.gs_nid), build = Hle::lookup(c.build_nid);
@@ -58,9 +102,9 @@ int main() {
         if (!gs || !build) continue;
         uint64_t dw = emitted(build, c.a1, c.a2, c.a3, c.a4, c.a5);
         uint64_t sz = gs(0, 0, 0, 0, 0, 0);
-        CHECK(dw > 0 && sz == dw * 4,
-              "%s: GetSize=%llu == builder %llu dwords * 4", c.name,
-              (unsigned long long)sz, (unsigned long long)dw);
+        CHECK(dw == c.exp_dw && sz == c.exp_dw * 4,
+              "%s: builder emits %llu dwords and GetSize says %llu bytes; both must be the pinned %llu",
+              c.name, (unsigned long long)dw, (unsigned long long)sz, (unsigned long long)c.exp_dw);
     }
 
     // Nop: GetSize(n) must equal the builder's n-dword emission for several counts (the builder floors at 1).

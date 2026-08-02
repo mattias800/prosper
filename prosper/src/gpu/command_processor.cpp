@@ -949,6 +949,21 @@ static bool mb3_freelist_guard() {
 // freed and reused before this old packet executed. Content alone cannot do that: a reused block may
 // also begin with 0/1, while a live uninitialized label may contain an arbitrary pointer residue.
 static bool dma_build_pre_changed(const Pm4Command& c, uint64_t pre, uint64_t* build_pre) {
+    // #1756: DMA_DATA is now 7 dwords — the hardware size, with no slot for the build snapshot this
+    // check reads. It therefore only ever fires on a pre-#1756 capture. Say so ONCE when the guard is
+    // enabled and the snapshot is absent, rather than returning a quiet false: an opt-in check that
+    // has silently become inert is indistinguishable from one that ran and found nothing, and that
+    // mistake has been made in this repository before. `prosper_label_hist_dma_built` still records
+    // the same init event out-of-band, so the label-history legs of #312 are unaffected.
+    // (Reached only with the guard enabled — its sole caller tests generation_guard() first.)
+    if (!c.dd_build_pre_valid) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            fprintf(stderr, "[agc] PROSPER_GENERATION_GUARD: the DMA-init leg needs the pre-#1756 "
+                            "9-dword DMA_DATA packet and is INERT on this build (#1756). The "
+                            "RELEASE_MEM leg is unaffected.\n");
+        return false;
+    }
     if (!c.dd_build_pre_valid || c.dd_build_pre == pre) return false;
     if (build_pre) *build_pre = c.dd_build_pre;
     return true;

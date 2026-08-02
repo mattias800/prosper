@@ -207,8 +207,15 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     }
                     break;
                 case R_DMA_DATA:
-                    // sceAgcDcbDmaData / sceAgcAcbDmaData (#312): CP-DMA. payload: [0..1]=dst lo/hi,
-                    // [2..3]=srcOrImm lo/hi, [4]=numBytes, [5]=sels, [6..7]=build-time dst qword.
+                    // sceAgcDcbDmaData / sceAgcAcbDmaData (#312): CP-DMA. TWO packet shapes exist and
+                    // the payload length is the discriminator, exactly as for R_RELEASE_MEM above:
+                    //   npl == 6 — current 7-dword packet (#1756, sized to hardware DMA_DATA):
+                    //              [0..1]=dst lo/hi, [2..3]=srcOrImm lo/hi, [4]=numBytes, [5]=sels.
+                    //              The #312 build snapshot is NOT carried; there is no spare slot at
+                    //              the hardware size, so dd_build_pre_valid stays false.
+                    //   npl >= 8 — historical 9-dword packet, in every capture recorded before #1756:
+                    //              the same six fields plus [6..7] = the destination qword as it read
+                    //              when the packet was built.
                     c.kind = K::DmaData;
                     if (npl >= 6) {
                         c.dd_dst   = lo_hi(pl);
