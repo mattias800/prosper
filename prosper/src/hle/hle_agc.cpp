@@ -2094,7 +2094,13 @@ HLE(agc_patch_set_num_registers_uc) {
 // three imports (call order fPS->3KD->0fW; the per-draw burst passes each packet at exactly our
 // builders' emitted offsets: WriteData at +0x1c(6dw), ReleaseMem at +0x34(7dw), WaitRegMem at
 // +0x50(9dw) after the 7-dword NOP label packet — the offset arithmetic pins which patch targets
-// which packet kind). Signature is (cmd, address) — the fence-builder disassembly passes exactly
+// which packet kind). Those offsets are a RECORD OF prosper's builder sizes at the time of the RE,
+// not constants the guest computes: the guest patches the pointers the builders returned, so they
+// move with the builders. ReleaseMem has been 9 dwords (#750) and is now 8 (#1748) with no effect
+// here — measured live on DOLL (PPSA17942) after #1748: 1333/1334/1333 calls to the three patchers
+// and ZERO `patch refused`, with the patched header reading 0xc0061060 (IT_NOP, R_RELEASE_MEM,
+// len 8). `patch_check` is what makes that safe; keep it. Signature is (cmd, address) — the
+// fence-builder disassembly passes exactly
 // two args; the varying a2..a4 seen under GFXLOG are deterministic register residue from the PLT
 // thunks. Leaving these as no-ops was the RenderThread stall: the GPU-side label writes all
 // targeted address 0 (skipped), so the engine's CPU-side poll of the label never completed and
@@ -2121,9 +2127,10 @@ HLE(agc_patch_release_mem_addr) {  // 0fWWK5uG9rQ (cmd, address): ReleaseMem pay
     if (!patch_check(cmd, R_RELEASE_MEM, "ReleaseMemPatchAddress")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
     uint32_t len = ((cmd[0] >> 16) & 0x3fffu) + 2;
-    // Re-snapshot the destination for the #312 generation identity. The 8-dword packet keeps only
-    // the high half (see agc_cb_release_mem); tolerate the historical 9-dword form so a packet
-    // replayed out of a pre-#1748 capture still round-trips.
+    // Re-snapshot the destination for the #312 generation identity. Every packet this can be handed
+    // at runtime is one agc_cb_release_mem just built, i.e. 8 dwords, keeping only the high half;
+    // the >= 9 arm is defensive tolerance for the historical shape, not a live path (a replayed
+    // capture never re-enters the HLE — gpu_replay executes recorded dwords directly).
     if (len >= 9) {
         uint64_t build_pre = label_build_pre(a1, cmd[3] == 1 ? 4 : 8);
         cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);

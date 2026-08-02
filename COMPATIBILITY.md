@@ -844,6 +844,15 @@ The general rule the case establishes: **a prosper AGC builder must emit exactly
 hardware packet it stands for.** The builders write into the *guest's* command buffer, and the guest
 reserves that buffer from the real AGC sizes it was compiled against — a title that never calls
 `sceAgc*GetSize` cannot be told about a larger packet.
+
+### Ruled out
+
+| Hypothesis | Evidence that killed it | Where |
+| --- | --- | --- |
+| The direct-memory budget is too small — raise `PROSPER_DMEM_BUDGET_MB` | A 12 GiB pool dies with the identical fault and backtrace, only sooner; growth is demand-driven | #1748 |
+| prosper denies the guest memory it should have granted, or hands back a pool handle it then rejects | The pool is genuinely empty and the guest genuinely asked for all of it: 1053 × 16 MiB with 8 releases | #1748 |
+| The intro movie leaks its decode buffers | The 16 MiB stream is already at full rate ~280 allocations before the six `AgcAvPlayerResource FreeDirectMemory 3112960` lines, and all six are released; the video allocations are a separate 0x2f8000 population | #1748 |
+| A Unity per-frame reclaim finds nothing retired (the shape was right) | Correct in shape, wrong in subject: the pool that never reclaims is the **AGC command-buffer chunk** pool, and it stalls because a prosper packet was one dword too large | #1748 / #1760 |
 ## Astro Bot — `PPSA21564`
 
 <p align="center">

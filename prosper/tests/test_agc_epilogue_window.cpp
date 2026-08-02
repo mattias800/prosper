@@ -119,6 +119,20 @@ int main() {
             CHECK(ops[0].rel_data_sel == 2, "decoded data_sel %u", ops[0].rel_data_sel);
             CHECK(ops[0].rel_value_valid && ops[0].rel_value == 1, "decoded fence value 0x%llx",
                   (unsigned long long)ops[0].rel_value);
+            // The build snapshot survives as its HIGH half in the single spare payload dword. Assert
+            // the value, not merely that the branch ran: a wrong shift decodes to something and would
+            // silently change what stale_release_generation compares against. `label_build_pre` reads
+            // the destination qword, and 0x1122334455667788 is not mapped, so the snapshot is 0 —
+            // check the shift with a hand-built packet instead.
+            uint32_t pkt[8] = {};
+            std::memcpy(pkt, g_window, sizeof pkt);
+            pkt[7] = 0xDEADBEEFu;                       // build_pre high dword
+            std::vector<gpu::Pm4Command> hi;
+            gpu::decode_pm4(pkt, 8, hi);
+            CHECK(hi.size() == 1 && hi[0].rel_build_pre_valid &&
+                  hi[0].rel_build_pre == 0xDEADBEEF00000000ull,
+                  "8-dword build snapshot decodes to 0x%llx (high half, low half zero)",
+                  (unsigned long long)(hi.empty() ? 0 : hi[0].rel_build_pre));
         }
     }
     {
