@@ -106,6 +106,14 @@ which also builds every texture upload and every storage-buffer upload. The sub-
 | `res.descriptor` | 2.25 | 2.0 % |
 | `res.texture` (upload 0.75 / bind 0.18 / lookup 1.15) | 2.01 | 1.8 % |
 
+`res_buffer` splits 4:1 into **bandwidth over object churn** (median of five consecutive heavy
+windows): `copy` (the staging `memcpy`) **83.80 ms**, `acquire` (pool/arena acquisition, which on a
+pool miss is create + allocate + bind + map) **13.64 ms**, remainder 7.64 ms — the transient fallback
+path, which allocates and copies together and is attributed to neither, plus key building and
+lookups. **The staging copy alone is ~42 % of the whole backend submit.** So the term is bandwidth:
+fixing the buffer pool is worth roughly 7 % of the submit and is worth doing, but it is not the
+frontier; removing the copy is.
+
 Mechanism, from two independent counters in the same run. **Volume:** the frontend resolves every
 binding to a zero-copy direct guest view and reports `buffers=34,747 logical=1,764.4 MiB
 materialized=0.0 MiB` per submit — and the *backend* then `memcpy`s the deduplicated set into
@@ -114,6 +122,23 @@ frontend side of that boundary. **Churn:** `backend_buffer_pool` sits pegged at 
 ceiling with evictions exactly equal to misses (+7,960 / +7,960 over 9 s, 45 % miss rate) — a capacity
 thrash in which one buffer is destroyed for every one created, with the eviction victim taken as
 `available.begin()` on an `unordered_map`, i.e. an arbitrary bucket rather than an LRU.
+
+### Where the fix has to go
+
+The term is **bandwidth**, so the two candidate directions rank very differently. Removing the copy is
+the fix, and it is structural: either import guest pages as Vulkan memory
+(`VK_EXT_external_memory_host` — prosper uses it nowhere today, there is no
+`vkGetMemoryHostPointerPropertiesEXT` / `VkImportMemoryHostPointerInfoEXT` in the tree), or add a
+persistent versioned buffer cache keyed on guest identity so unchanged buffers are not re-copied. The
+second reuses the #1703 machinery but carries the #611/#780 stale-data risk; the first does not,
+because the GPU reads the guest bytes rather than a snapshot of them. Raising
+`PROSPER_BACKEND_BUFFER_POOL_MB` and giving the pool an LRU victim is cheap, safe and real, and is
+worth about 7 % of the submit — take it, but do not mistake it for the frontier.
+
+Frame math, so nobody expects one term to finish the job: at the clean 165.18 ms submit, removing
+100 % of `copy` gives ~95 ms (10.5 submits/s); removing `copy` **and** `acquire` **and** `fixed`
+still leaves ~60 ms (16/s). `readback` + `cleanup` + `gpu_wait` + `record_upload` are 37 ms combined
+and `gpu_device` is 4.31 ms, so **no single term reaches 30 fps on this title.**
 
 ### Ruled out
 
