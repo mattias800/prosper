@@ -190,6 +190,9 @@ def main():
     # --csv and --program must survive the same records.
     code, out, err = run(phase(setup_ms=1, dispatch_ms=1), "--csv")
     check("--csv emits a header", out.startswith("phase,key,ms"), out)
+    # CSV is the most-redirected output of all; a stale model must be visible in the file itself.
+    code, out, err = run(phase(setup_ms=1, total_ms=99), "--csv")
+    check("--csv carries the stale-model banner", "NOT TRUSTWORTHY" in out, out)
     code, out, err = run(phase(code=0xAA, dispatch_ms=1), "--program", "0xbb")
     check("--program miss names the filter", "--program 0xbb" in err, err)
 

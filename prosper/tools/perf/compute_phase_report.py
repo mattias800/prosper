@@ -233,6 +233,10 @@ def main():
         print(f"WARNING: {warning}", file=sys.stderr)
 
     if args.csv:
+        # CSV is the output MOST likely to be redirected, so the model warning must ride along here
+        # too -- a spreadsheet built from a table whose model is stale carries no trace of it.
+        for warning in model_warnings:
+            print(f"# NOT TRUSTWORTHY,{warning}")
         print("phase,key,ms,pct,ms_per_dispatch")
         for label, key, _ in PHASES:
             print(f"{label.strip()},{key},{totals[key]:.3f},"

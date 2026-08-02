@@ -5,7 +5,7 @@
 # --------------------------------------------------
 # `test_compute_phase_report.py` passing proves the checks ran. Mutating a mechanism away and watching
 # the suite go red proves the suite is not blind. Neither proves that *the check you wrote for that
-# mechanism* works — a survivor masked by two red siblings is invisible at suite granularity.
+# mechanism* works — a survivor masked by three red siblings is invisible at suite granularity.
 #
 #   A mutation that turns the suite red proves the suite is not blind.
 #   It does NOT prove the check you wrote for that mutation works.
@@ -15,6 +15,11 @@
 # in its own first run: a fixture whose two records cancelled (so the negative-time check proved
 # nothing) and a mutation aimed at the reporting filter rather than the exclusion filter. Both read as
 # healthy coverage at suite granularity.
+#
+# It does NOT close the ladder, and this file shipped with the next rung in it: a mutation BROADER than
+# the defect it stood for (returning on any alias where the original returned only on all) let an
+# unrelated check claim the kill. So a row is only as good as the fidelity of its mutation, and a
+# reviewer should read the mutation text, not just the green line.
 #
 # Safe by construction: it copies the tool and its test to a scratch directory and mutates the COPY,
 # so a crash cannot leave the tracked file modified.
@@ -44,10 +49,13 @@ PY
   failed=$(echo "$out" | grep '^  FAIL' | sed 's/^  FAIL //' | awk '{$NF=""; print}' | cut -c1-55)
   # "aborted" means the SUITE stopped, not that a tool traceback appears inside a FAIL detail — a
   # check whose job is to catch a traceback necessarily quotes one when it fails.
-  if [ -z "$failed" ] && ! echo "$out" | grep -q 'all cases passed'; then
+  if ! echo "$out" | grep -qE 'all cases passed|case\(s\) failed'; then
     printf '  %-38s SUITE ABORTED (masks later checks)\n' "$1"; return 1
   fi
-  if echo "$failed" | grep -qF "$2"; then
+  # `--` before the pattern: a check name may legitimately start with "--" (e.g. "--csv carries the
+  # stale-model banner"), which grep would otherwise parse as options and reject, printing a usage
+  # error and reporting a SURVIVED that is really a harness fault.
+  if echo "$failed" | grep -qF -- "$2"; then
     printf '  %-38s killed by: %s\n' "$1" "$2"
   else
     printf '  %-38s *** SURVIVED *** expected "%s", got: %s\n' \
@@ -67,11 +75,13 @@ run_mutation "exclude alias bindings" "alias ms does not land in image unattribu
 run_mutation "alias per-binding denominator" "ms/binding uses the real-binding denominator" \
   '    images = [i for i in images if not i.get("alias", 0.0)]' \
   '    images = list(images)' || bad=1
+# The mutation must have the DEFECT'S SHAPE. The historical bug returned only when EVERY record was
+# an alias; a broader "return on any alias" mutation kills five checks, so the per-check assertion is
+# then satisfied by a check that could not have caught the original defect.
 run_mutation "no early return on all-alias" "all-alias log still prints top programs" \
-  '    if not images and aliases:' '    if aliases:
-        print("  setup image bindings: aliased folds only")
-        return 0
-    if False:' || bad=1
+  '              f"(no work, no sub-timers); nothing to decompose.")' \
+  '              f"(no work, no sub-timers); nothing to decompose.")
+        return 0' || bad=1
 run_mutation "parent-relative unattributed" "small parent keeps its unattributed remainder" \
   '            if parent_ms and abs(rest) / parent_ms > 0.01:' \
   '            if grand and abs(rest) / grand > 0.005:' || bad=1
@@ -88,6 +98,8 @@ run_mutation "stale-model banner on stdout" "stale model banner survives redirec
   '        pass' || bad=1
 run_mutation "missing-file message" "missing file is a message, not a traceback" \
   '        except OSError as error:' '        except ZeroDivisionError as error:' || bad=1
+run_mutation "stale-model banner in --csv" "--csv carries the stale-model banner" \
+  '            print(f"# NOT TRUSTWORTHY,{warning}")' '            pass' || bad=1
 
 cp "$PRISTINE" "$TOOL"
 if python3 "$WORK/test_compute_phase_report.py" >/dev/null 2>&1; then
