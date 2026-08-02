@@ -40,6 +40,7 @@ int main() {
     auto close  = Hle::lookup(nid_hash("sceVideoOutClose"));
     auto res    = Hle::lookup(nid_hash("sceVideoOutGetResolutionStatus"));
     auto vbl    = Hle::lookup(nid_hash("sceVideoOutGetVblankStatus"));
+    auto waitvbl = Hle::lookup(nid_hash("sceVideoOutWaitVblank"));   // j6RaAUlaLv0 (#1746)
     auto cap    = Hle::lookup(nid_hash("sceVideoOutGetDeviceCapabilityInfo"));
     auto issup  = Hle::lookup("Nv8c-Kb+DUM");   // IsOutputSupported
     auto setba  = Hle::lookup(nid_hash("sceVideoOutSetBufferAttribute"));
@@ -253,6 +254,31 @@ int main() {
     vbl(handle, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0); uint64_t c2 = *(uint64_t*)vb;
     CHECK(c2 > c1, "vblank counter advances across a >1-period sleep");
     CHECK(*(uint64_t*)(vb + 0x08) > 0, "vblank processTime filled (Kyty layout @0x08)");
+
+    // WaitVblank must BLOCK to the next ~16.68 ms boundary and land on the tick it waited for
+    // (#1746). Unregistered it fell to the return-0 stub and came back instantly, turning a
+    // title's `for(;;) WaitVblank(port)` display thread into a spin loop with no pacing.
+    CHECK(waitvbl != nullptr, "sceVideoOutWaitVblank is registered (j6RaAUlaLv0)");
+    if (waitvbl) {
+        CHECK((uint32_t)waitvbl(invalid_handle, 0, 0, 0, 0, 0) == kInvalidHandle,
+              "WaitVblank rejects an invalid handle");
+        // Five waits must consume at least four full vblank periods of real time. A stub that
+        // returns immediately finishes in microseconds and fails this outright.
+        vbl(handle, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0);
+        const uint64_t wait_c0 = *(uint64_t*)vb;
+        const auto wait_t0 = std::chrono::steady_clock::now();
+        bool wait_ok = true;
+        for (int i = 0; i < 5; ++i) wait_ok &= waitvbl(handle, 0, 0, 0, 0, 0) == 0;
+        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - wait_t0).count();
+        vbl(handle, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0);
+        const uint64_t wait_c1 = *(uint64_t*)vb;
+        CHECK(wait_ok, "WaitVblank returns 0 on a live handle");
+        CHECK(elapsed_us >= 4 * 16683,
+              "five WaitVblank calls block for at least four vblank periods");
+        CHECK(wait_c1 >= wait_c0 + 4,
+              "WaitVblank shares GetVblankStatus's timebase (counter advanced by the waits)");
+    }
 
     // Device capability: plain SDR display (capability 0).
     uint64_t dc = 0xDEAD;
