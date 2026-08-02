@@ -738,9 +738,11 @@ int main() {
                   absent_ps.color1_write_mask == 0xFu,
               "absent CB_COLOR_CONTROL retains legacy color-write behavior");
 
-        // A genuine color-disabled pass programs CB_TARGET_MASK=0. It must resolve to no color
-        // write AND still carry its depth/stencil side effect — that is the contract #919 existed
-        // for, and it is honored by the mask derivation with no MODE involvement at all.
+        // The colour-disabled idiom this suite covers is CB_TARGET_MASK=0. It must resolve to no
+        // colour write AND still carry its depth/stencil side effect — that is the contract #919
+        // existed for, honoured by the mask derivation with no MODE involvement. It is the idiom
+        // measured titles use for a prepass; it is not the only idiom hardware allows (see the
+        // affected-draw counts in render_state.cpp).
         GpuState prepass_state;
         prepass_state.cx[P::CB_TARGET_MASK] = 0u;
         prepass_state.cx[P::CB_SHADER_MASK] = 0xFFu;

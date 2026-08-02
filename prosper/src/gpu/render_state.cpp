@@ -1,5 +1,7 @@
 // render_state.cpp — see render_state.hpp.
 #include "render_state.hpp"
+
+#include <cstdlib>
 #include "pm4_registers.hpp"
 #include "vk_translate.hpp"
 #include <algorithm>
@@ -63,7 +65,7 @@ int32_t scale_scissor_boundary(int32_t value, float scale, bool lower) {
 // counter exists to size. Keeping it excluded would have made #1708's instrument silent in the one
 // branch #1706 needs measured. Live populations are large — 36,613 of 268,899 traced Plucky Squire
 // draws — so this is a per-mode aggregate, not a per-draw log.
-bool cb_mode_is_unmodeled_metadata_operation(uint32_t mode) {
+bool cb_mode_is_unmodeled_operation(uint32_t mode) {
     return mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
            mode != P::CB_COLOR_CONTROL_MODE_RESOLVE &&
            mode != P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS;
@@ -841,7 +843,8 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     //
     //   Dragon Quest VII         mode=0      7 draws, ALL effective == 0
     //   Astro Bot submit 6179    mode=0     30 draws, ALL effective != 0
-    //   The Plucky Squire        mode=0 36,613 draws, 28,287 == 0 and 8,326 != 0
+    //   The Plucky Squire        mode=0 (menu-phase trace) 36,613 draws, 8,326 != 0
+    //   The Plucky Squire        mode=0 (full run)        200,113 draws, 9,580 != 0 (4.79%)
     //
     // DQ7 programs both signals consistently, so the override is redundant there and the defect is
     // invisible — which is why it survived. Astro contradicts it on every one, including
@@ -857,11 +860,15 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     // programs CB_DISABLE deliberately. The narrower and correct statement is that a settled DECODE
     // was never evidence of a settled RESPONSE to the decoded value.
     //
-    // Nor is this cost-free. Plucky's 8,326 mode=0 draws that DO carry a mask now write where they
-    // previously did not; its reachable phases A/B at 0.08-0.24% differing pixels with no visible
-    // corruption, but its 87.6-95.3% mode=0 world phase is not covered by that measurement. If a
-    // title is ever shown to depend on MODE=DISABLE suppressing an explicitly programmed mask, this
-    // is the code that must become per-draw attribution (#1706) rather than an unconditional read.
+    // Nor is this cost-free: Plucky's mode=0 draws that DO carry a mask now write where they
+    // previously did not. Sized on a retained full run (533,964 records), that is 9,580 draws,
+    // 4.79% of its mode=0 population, front-loaded in the menu/loading minutes -- the phases the
+    // live A/B covers, at 0.08-0.24% differing pixels with no visible corruption. Its 87.6-95.3%
+    // mode=0 world phase contains 63 of them (0.35%), because the depth/shadow prepass there
+    // programs CB_TARGET_MASK=0 as well as MODE=DISABLE. Per-minute table and the two ways to get
+    // this wrong: tools/colorstate/README.md. If a title is ever shown to depend on MODE=DISABLE
+    // suppressing an explicitly programmed mask, this is the code that must become per-draw
+    // attribution (#1706) rather than an unconditional read.
     //
     // #919's real contract is preserved: a colour-disabled pass that programs CB_TARGET_MASK=0 still
     // resolves to no colour write, via the derivation above, and still executes for its DS side
@@ -881,7 +888,7 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
             // MSAA resolve: color0 (MSAA source) -> color1 (single-sample dest). The live backend copies
             // the already-rendered color0 surface into color1 instead of running these as ordinary draws.
             ps.cb_resolve = true;
-        } else if (cb_mode_is_unmodeled_metadata_operation(cb_mode)) {
+        } else if (cb_mode_is_unmodeled_operation(cb_mode)) {
             report_unmodeled_cb_color_mode(cb_mode);
         }
     }

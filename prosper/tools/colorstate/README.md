@@ -58,6 +58,37 @@ The `suppressed=` column above is therefore mask-derived, not `mode`-derived; th
 breakdown beside it is the raw mode census and is no longer a suppression count. The table
 above predates that change, so its percentages are `mode=0` fractions — read them as such.
 
+### What the world phase actually contains (#1724)
+
+The table above is the phase that made `MODE=DISABLE` look load-bearing. Joining `mode`
+against the guest's own `effective` mask (`CB_TARGET_MASK & CB_SHADER_MASK`) over the same
+run, **all records**, shows the two signals almost always agree — so #1724's removal of the
+`MODE`-keyed override changes very little of it:
+
+```
+minute   records   mode=0   mode=0 with effective!=0
+16:07     ~8,000    1,652 aff   16:10   179,621   2,755 aff
+16:08    ~15,000    2,293 aff   16:13     6,692      33 aff   <- world VISIBLE
+16:09    ~40,000    2,817 aff   16:14     7,799      30 aff   <- world VISIBLE
+                                16:15       564       0 aff
+TOTAL   533,964   200,113 mode=0   9,580 affected (4.79%)
+```
+
+**The affected draws are front-loaded in the menu/loading minutes and stop before the world
+phase**: 63 of them across 16:13-16:15, or 0.35% of that phase's `mode=0` draws. The engine's
+depth and shadow prepass programs `CB_TARGET_MASK=0` **as well as** `MODE=DISABLE`.
+
+Two cautions for anyone re-deriving this:
+
+- **Judge it on all records, not scanout-only.** Restricting to the scanout prefix gives 854
+  affected, which understates by 11.2x: 8,105 of the hidden draws are a single pixel shader
+  (`ps=0x3015320000`) writing MRT0 of a 3840x2160 **offscreen** G-buffer that later composites.
+- **`snap1/snap2/snap3/guest.log` in one run directory are not independent samples.** They are
+  nested byte-prefixes of the same run (`cmp -n` confirms), so their differing `mode=0`
+  fractions are the log growing, not four observations. An earlier revision of #1724 cited them
+  as four independent logs showing a "flat" affected count; that reasoning was circular and has
+  been withdrawn. The per-minute decomposition above is the load-bearing evidence.
+
 ## Caveats
 
 - Records are attributed to the **most recent guest log timestamp**, so a minute in
