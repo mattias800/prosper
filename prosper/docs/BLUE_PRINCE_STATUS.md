@@ -80,12 +80,14 @@ The `blue-prince-title` snapshot route guards the title screen.
   promote it to an explanation. Host cache footprint is byte-identical between arms (16 scratch
   slots, 111 persistent entries, 574.3 MiB), so it is not a working-set effect.
 
-  **This does not address the reported ~2 fps.** #1284 still decomposes the same title's 263.33 ms
-  submit as `draw_setup.resources` 95.42 + `readback` 79.16 + `gpu_wait` 29.29 + `record_upload`
-  22.58 ms; this change moves a ~7.5 % term and leaves all four intact. The title remains CPU-bound
-  in the frontend. Note also that the issue's headline **15.2x is a replay figure** — the persistent
-  decode cache is disabled by construction in replay — and live only ~77 of ~5,500 texture
-  references per submit ever reached it.
+  **This does not address the reported ~2 fps.** At the time this landed, #1284 decomposed the same
+  title's submit as 263.33 ms = `draw_setup.resources` 95.42 + `readback` 79.16 + `gpu_wait` 29.29 +
+  `record_upload` 22.58; this change moved a ~7.5 % term and left all four intact. Note also that the
+  issue's headline **15.2x is a replay figure** — the persistent decode cache is disabled by
+  construction in replay — and live only ~77 of ~5,500 texture references per submit ever reached it.
+  **Those four numbers are now superseded**: re-measured 2026-08-02 (see the #1284 bullet below), three
+  of the four have collapsed and only `draw_setup` remains. The title is still CPU-bound in the
+  frontend, which is the part of this paragraph that held.
 
 - **#1284 (open) — the frame-time term is backend storage-buffer upload, not textures or
   descriptors.** Re-measured on `3a473bca` (post-#1292, post-#1703), 35 peer-free heavy windows:
