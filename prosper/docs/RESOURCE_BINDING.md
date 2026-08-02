@@ -158,3 +158,12 @@ fold *N+1*, and every sampled failing draw is the first bind-or-draw event of it
 
 **Instruments** (`PROSPER_UDPROV`, `PROSPER_BINDTRACE`, `[udcand]`, `PROSPER_SHADER_HEADER_NEWEST`,
 `PROSPER_UD_TAIL_ALIGN`) are on PR #1639 — reuse them rather than rebuilding this measurement.
+
+`PROSPER_SHARPLOG=1` is the fourth one and answers a different question from the rest. They all
+describe what the front half *produced*; this one prints what the shader **declared** — the stage's
+raw sharp table (per-category counts, each slot's `bits`/`offset_dw`/`size`/EUD residency, and the
+direct slots) — and then names the exact reason a declared texture slot was dropped. Between the two
+sits a chain of about ten `continue`s, and without the input side "the front half never saw this
+resource" and "it saw it and rejected it" produce identical evidence while pointing at different
+files. Reach for it before concluding anything about descriptor *recovery*: on Earthion (#1590) it
+overturned exactly that conclusion in one run.
