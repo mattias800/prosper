@@ -33,10 +33,17 @@ static Dcb fresh() {
     return d;
 }
 
+// Some builders are 9-argument HLEs (DmaData reads a8, ReleaseMem reads a6/a7). Calling them through
+// the 6-argument HleFn leaves those reading whatever the stack held, which does not change the
+// emitted size for any of them but is still uninitialised-read UB and would trip a sanitiser. Call
+// every builder through the wide signature with explicit zeros instead.
+using HleFn9 = PROSPER_SYSV_ABI uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                             uint64_t, uint64_t, uint64_t, uint64_t);
+
 // Call a builder, return the dwords it emitted (cursor advance).
-template <class Fn> static uint64_t emitted(Fn builder, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+static uint64_t emitted(HleFn builder, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     Dcb d = fresh();
-    builder((uint64_t)(uintptr_t)&d, a1, a2, a3, a4, a5);
+    ((HleFn9)builder)((uint64_t)(uintptr_t)&d, a1, a2, a3, a4, a5, 0, 0, 0);
     return (uint64_t)(d.cursor_up - g_buf);
 }
 

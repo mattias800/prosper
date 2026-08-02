@@ -120,7 +120,8 @@ differ and have no title evidence are recorded as open, not fixed; see *Open* be
 ## `GetSize` coverage — the half that can be fixed without hardware knowledge
 
 libSceAgc 3.20 exports **65** `sceAgc*GetSize` functions. Before #1756 prosper answered **6**; the
-other 59 fell through to the generic unimplemented path, which returns **0**.
+other 59 fell through to the generic unimplemented path, which returns **0**. This change adds **22**,
+bringing the answered total to **28**.
 
 Zero is the worst possible answer. A guest that sizes its buffer from `GetSize` reserves *nothing*
 and the matching builder then overruns it — the same failure as #1748 but guaranteed rather than
@@ -131,9 +132,15 @@ that title happened to call.
 | | count | disposition |
 | --- | --- | --- |
 | `GetSize` exports in libSceAgc 3.20 | 65 | |
-| answered by prosper before #1756 | 6 | Jump, AcquireMem ×2, EopAction, Rewind, Nop |
-| **builder present, `GetSize` missing** | **26** | **fixed by #1756** — each returns the dword count prosper's own builder emits |
-| builder absent as well | 33 | left alone: a size would be a guess, and the builder call fails anyway |
+| answered by prosper **before** #1756 | 6 | Jump, AcquireMem ×2, EopAction, Rewind, Nop |
+| **added by #1756** | **22** | each returns the dword count prosper's own builder emits |
+| answered by prosper **after** #1756 | 28 | 6 + 22 |
+| builder present but still unanswered | 3 | the size-carrying trio below — argument position unknown |
+| builder absent as well | 34 | left alone: a size would be a guess, and the builder call fails anyway |
+
+(Count the delta and the total separately: **22 NIDs are added**, bringing the answered total from 6
+to 28. `git diff 928b21f5..HEAD -- prosper/src/hle/hle_agc.cpp | grep -c '^+ *RN(".*get_size'` is 22,
+and the counter-arm — reverting only those registrations — fails exactly 22 assertions.)
 
 The fix needs no hardware size and cannot be wrong in the dangerous direction: the guest reserves
 exactly what prosper will write. `test_agc_getsize` measures every builder and asserts its `GetSize`
@@ -159,13 +166,30 @@ not imports, are what `PROSPER_PROGRESS=N PROSPER_PROGRESS_UNIMPL=1` measures.
 
 Run with the shipping build and the corrected signature above.
 
-**No title in the corpus has a reservation overrun.** Zero events with `avail>0, reserved=0`, in any
-of the 30 dumps.
+**No title in the corpus produced the signature.** Zero events with `avail>0, reserved=0` in any of
+the 30 dumps.
 
-That silence is only worth something because the rule was shown to speak: reintroducing the #1748
+That silence is worth something only because the rule was shown to speak: reintroducing the #1748
 defect (`RELEASE_MEM` back to 9 dwords) and re-running Asterix & Obelix - Babylon Mission produces
-**256** events (the report's own cap) on one triple — `ReleaseMem/EopAction need=9 avail=8
-reserved=0`. The rule fires on the known defect and is silent everywhere else.
+**256** signature events among the first 512 reported (the report caps at 512 and then samples), all
+on one triple — `ReleaseMem/EopAction need=9 avail=8 reserved=0`. The rule fires on the known defect
+and is silent everywhere else.
+
+**Do not read that as "no title has an overrun".** The signature is *sufficient, not necessary*, and
+it has two known blind spots:
+
+* **A reserve masks it.** An overrun that happens while `reserved_dw > 0` is classified as the
+  ordinary end-of-buffer condition — and the corpus is dominated by titles that hold `reserved=18`
+  permanently, for which this rule can never fire at all. Those titles are unmeasured, not cleared.
+* **Only reservations that end at `cursor_down` are visible.** The probe hangs off `allocate_dw`'s
+  failure path, so it sees an overrun only when the packet does not fit the Dcb. A guest that
+  pre-computes offsets *inside* a large buffer and expects each packet at a known position is
+  corrupted silently, with no event of any kind.
+
+Both are why the per-builder table keeps its open rows rather than treating this census as closure.
+
+The runs are also 45 s headless boots on one implicit route with no renderer, so they cover each
+title's startup and whatever it reaches unattended — not its gameplay.
 
 **Command-buffer churn** — the quiet cost, measured as buffer-full callbacks per second. Babylon
 pre-#1748 ran at **~466/s**. The three titles whose frame rate made them suspects are not paying it:
@@ -186,21 +210,29 @@ for the current corpus rather than left open.
 
 ## Called and unimplemented
 
-Measured with `PROSPER_PROGRESS_UNIMPL` (call counts, not imports) over the same runs — the whole AGC
-surface the corpus actually calls and prosper does not implement:
+Measured with `PROSPER_PROGRESS_UNIMPL` (call counts, not imports) over the same runs — the whole
+`libSceAgc` **and** `libSceAgcDriver` surface the corpus actually calls and prosper does not
+implement. Callers completed once all 29 bootable dumps had run:
 
 | NID | function | called by |
 | --- | --- | --- |
 | `MlEw1feXcjg` | `sceAgcQueueEndOfPipeActionPatchData` | `PPSA04263` |
 | `vuSXe69VILM` | `sceAgcDcbGetLodStats` | `PPSA21564` |
 | `Ikfdt-rIqCE` | *(not in the 3.20 export table)* | `PPSA04263` |
-| `F0Y42t-3e18` | `sceAgcDriverInitResourceRegistration` | — |
-| `pWLG7WOpVcw` | `sceAgcDriverUnregisterResource` | — |
-| `F0ZXt5q0ZTA`, `U9ueyEhSkF4` | *(not in the 3.20 export table)* | — |
+| `F0Y42t-3e18` | `sceAgcDriverInitResourceRegistration` | `PPSA15552`, `PPSA26414`, `PPSA28061` |
+| `pWLG7WOpVcw` | `sceAgcDriverUnregisterResource` | `PPSA15552` |
+| `F0ZXt5q0ZTA` | *(not in the 3.20 export table)* | `PPSA15552`, `PPSA28061` |
+| `U9ueyEhSkF4` | *(not in the 3.20 export table)* | `PPSA15552`, `PPSA26414`, `PPSA28061` |
+| `JQc0956gCf0` | *(not in the 3.20 export table)* | `PPSA28061` |
 
 `sceAgcQueueEndOfPipeActionPatchData` is the notable one: prosper implements its sibling
 `…PatchAddress` (`0fWWK5uG9rQ`) and not this, so GTA V builds an end-of-pipe action, patches its
-address, and has its **value** patch silently dropped.
+address, and has its **value** patch silently dropped. Second: `sceAgcDriverInitResourceRegistration`
+and `sceAgcDriverUnregisterResource` are called by **Dead Cells**, a rung-6 title with a snapshot
+guard — prosper answers the *query* half of resource registration (#539, #660, both real defects
+when they returned stack residue) but not `Init` or `Unregister`. All tracked on #1768. Four of the
+eight are absent from the 3.20 export table, as `T6xuVw0KUJo` was on #1748: the corpus contains
+titles built against SDK versions that dump does not cover, so "not in the DB" is not "not real".
 
 **None of the 26 `GetSize` functions this change implements is called by any title in the corpus.**
 That fix is therefore *preventive*, not the repair of an observed failure — stated plainly because
@@ -224,6 +256,15 @@ happened to ask, and each time fixed for that title's NIDs alone.
   7), `WaitRegMem` (9 vs 7), `Jump` (5 vs 4), `WriteData` (5+n vs 4+n), `SetPredication` (4 vs 3),
   `CbDispatch` (6 vs 5), `DrawIndex`/`DrawIndexAuto`. Each needs a title that reserves tightly around
   it before it can be changed. `PROSPER_DCBWIN` over a new title is the cheapest way to get that.
+* **Two rows are larger than the reference only for small `n`, and the table's "safe direction" note
+  hides it.** `SetXxRegistersIndirect` is a fixed 4 dwords against `2 + n`, so it is *larger* at
+  **n ≤ 1** and smaller from n = 3 up — and n = 1 is exactly the arithmetic of the `need=4 avail=3`
+  events three titles produce on that same builder. Those events are classified as artefacts because
+  all three carry `reserved=18` (see *Ruled out*), which settles the classification but **not** the
+  size question. `CbSetShRegisterRangeDirect` is `n + 4` against `2 + n` — larger by 2 for **every**
+  n, because of the 2-dword NOP marker prosper prepends on a secondary implementation's claim that
+  the real library does the same. Both want a tight-window title, and the register path is where
+  Nikoderiko's #305 already lives.
 * `sceAgcQueueEndOfPipeActionPatchData` and `sceAgcDcbGetLodStats` are called and unimplemented
   (see the table above).
 * `w1KFAHVqpaU` is `sceAgcCbBranch` in the 3.20 export table, but prosper registers it as the DOLL

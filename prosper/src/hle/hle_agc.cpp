@@ -149,6 +149,7 @@ inline uint32_t dcb_diag_win() {
         const char* e = getenv("PROSPER_DCBWIN");
         if (!e) return 0u;
         const long n = strtol(e, nullptr, 0);
+        if (n <= 0) return 0u;                 // explicit 0 (or junk) means OFF, not "the default"
         return n > 1 ? (uint32_t)n : 64u;      // PROSPER_DCBWIN=1 selects the default 64
     }();
     return v;
@@ -157,6 +158,11 @@ inline uint32_t dcb_diag_win() {
 // several guest threads build into their own Dcbs concurrently, and a shared global would attribute
 // one thread's overrun to another's packet. 0xffffffff = a raw allocate_dw with no sub-op (CbNop,
 // the type-2 filler).
+//
+// `thread_local` is safe here even though guest threads run with the guest's `%fs` (see the aliasing
+// warning in hle_kernel.cpp): an HLE only ever runs behind an import stub, and the stub swaps back to
+// the HOST `%fs` for the duration of the call. Both writer and reader are inside that window, in the
+// same call, on the same thread.
 constexpr uint32_t kDcbDiagRaw = 0xffffffffu;
 inline thread_local uint32_t g_dcb_diag_r = kDcbDiagRaw;
 inline thread_local uint32_t g_dcb_diag_op = 0;
@@ -216,6 +222,11 @@ const char* dcb_subop_name(uint32_t r) {
         case R_STALL_COMMAND_BUFFER_PARSER: return "StallCommandBufferParser";
         case R_DRAW_INDEX_INDIRECT:        return "DrawIndexIndirect";
         case R_DISPATCH_INDIRECT:          return "DispatchIndirect";
+        // A raw allocate_dw with no sub-op (CbNop's 1-dword form, the type-2 filler). Without its own
+        // case it would print as "(op-carried)" and be indistinguishable from a real op-carried packet.
+        case kDcbDiagRaw:                  return "raw-allocate";
+        // Everything else is named by its PM4 opcode, not a custom sub-op; both reports print `op=0x..`
+        // alongside, which is what identifies it (0x76 SET_SH_REG, 0x46 EVENT_WRITE, 0x2f NUM_INSTANCES…).
         default:                           return "(op-carried)";
     }
 }
@@ -540,7 +551,7 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
     // CP / our decoder now skips as a single dword — emit that instead of a malformed type-3 header.
     if (num == 1) {
         auto* dcb = (AgcDcb*)(uintptr_t)a0;
-        g_dcb_diag_r = kDcbDiagRaw;         // #1756: not routed through begin_packet
+        g_dcb_diag_r = kDcbDiagRaw; g_dcb_diag_op = 0;   // #1756: not routed through begin_packet
         uint32_t* cmd = dcb->allocate_dw(1);
         if (!cmd) return 0;
         cmd[0] = 0x80000000u;   // PM4 type-2 single-dword NOP filler
