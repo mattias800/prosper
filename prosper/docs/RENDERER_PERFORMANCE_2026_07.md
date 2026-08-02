@@ -106,13 +106,16 @@ which also builds every texture upload and every storage-buffer upload. The sub-
 | `res.descriptor` | 2.25 | 2.0 % |
 | `res.texture` (upload 0.75 / bind 0.18 / lookup 1.15) | 2.01 | 1.8 % |
 
-`res_buffer` splits 4:1 into **bandwidth over object churn** (median of five consecutive heavy
-windows): `copy` (the staging `memcpy`) **83.80 ms**, `acquire` (pool/arena acquisition, which on a
-pool miss is create + allocate + bind + map) **13.64 ms**, remainder 7.64 ms — the transient fallback
-path, which allocates and copies together and is attributed to neither, plus key building and
-lookups. **The staging copy alone is ~42 % of the whole backend submit.** So the term is bandwidth:
-fixing the buffer pool is worth roughly 7 % of the submit and is worth doing, but it is not the
-frontier; removing the copy is.
+`res_buffer` splits 4:1 into `copy` (the staging `memcpy`) **83.80 ms** over `acquire` (pool/arena
+acquisition, which on a pool miss is create + allocate + bind + map) **13.64 ms**, remainder 7.64 ms
+— the transient fallback path, which allocates and copies together and is attributed to neither, plus
+key building and lookups.
+
+**Do not read that split as "allocation churn is the small half".** `acquire` measures only the
+allocation *calls*; most of the churn cost lands in `copy`, because a freshly `vkAllocateMemory`'d
+and `vkMapMemory`'d staging buffer has non-resident pages and the memcpy into it faults, while a
+recycled pool buffer is already resident. The sub-attribution draws its boundary at the API call, and
+reading that boundary as the mechanism produced a wrong conclusion here once already.
 
 Mechanism, from two independent counters in the same run. **Volume:** the frontend resolves every
 binding to a zero-copy direct guest view and reports `buffers=34,747 logical=1,764.4 MiB
@@ -123,17 +126,48 @@ ceiling with evictions exactly equal to misses (+7,960 / +7,960 over 9 s, 45 % m
 thrash in which one buffer is destroyed for every one created, with the eviction victim taken as
 `available.begin()` on an `unordered_map`, i.e. an arbitrary bucket rather than an LRU.
 
-### Where the fix has to go
+### The buffer pool's 256 MiB default is 37.7 % of the frame
 
-The term is **bandwidth**, so the two candidate directions rank very differently. Removing the copy is
-the fix, and it is structural: either import guest pages as Vulkan memory
-(`VK_EXT_external_memory_host` — prosper uses it nowhere today, there is no
-`vkGetMemoryHostPointerPropertiesEXT` / `VkImportMemoryHostPointerInfoEXT` in the tree), or add a
-persistent versioned buffer cache keyed on guest identity so unchanged buffers are not re-copied. The
-second reuses the #1703 machinery but carries the #611/#780 stale-data risk; the first does not,
-because the GPU reads the guest bytes rather than a snapshot of them. Raising
-`PROSPER_BACKEND_BUFFER_POOL_MB` and giving the pool an LRU victim is cheap, safe and real, and is
-worth about 7 % of the submit — take it, but do not mistake it for the frontier.
+`render_host_buffer_pool_limit()` defaults to a **fixed 256 MiB**. Blue Prince's real host-staging
+working set is **974 MiB**, so on a 3D title the pool degenerates into an allocator: evictions equal
+misses (~216k each per arm) and one buffer is destroyed for every one created.
+
+Four alternating arms, one binary, `PROSPER_BACKEND_BUFFER_POOL_MB` the only lever (256 / 2048 /
+256 / 2048). Witness: the 256 arms peak at 256.0 MiB with 215,366 and 217,205 misses; the 2048 arms
+settle at 974.0 MiB / 503 buffers with **503 misses and zero evictions**.
+
+| term | 256 MiB | 2048 MiB | delta | within-treatment | between |
+|---|---:|---:|---:|---:|---:|
+| `measured` | 203.06 | 126.58 | **-37.7 %** | 10.62 | 76.48 |
+| `res_buffer` | 113.10 | 41.62 | -63.2 % | 16.76 | 71.48 |
+| `copy` | 92.54 | 33.44 | -63.9 % | 18.19 | 59.10 |
+| `acquire` | 13.65 | 1.46 | -89.3 % | 0.95 | 12.20 |
+| `cleanup` | 14.77 | 3.04 | -79.4 % | 0.21 | 11.72 |
+| draws | 2218.15 | 2145.00 | +3.3 % | 71.10 | 73.15 |
+
+Every timing term separates far beyond its within-treatment spread, while `draws` — the quantity the
+lever cannot touch — has within (71.10) equal to between (73.15), so the 3.3 % scene-weight
+difference is cycle noise and not the explanation. Per draw: 0.0915 -> 0.0590 ms, **-35.6 %**.
+Controls: per-submit byte volume is identical between arms (`logical=1,644.0 / 1,764.4 MiB`,
+`materialized=0.0 MiB`), and minor faults sampled from `/proc/<pid>/stat` fall from 123,079/s to
+52,106/s. The per-fault cost that would be needed to explain the whole `copy` delta (~3.1 us) is
+above a generic anonymous-page fault, so the mechanism is recorded as leading, not settled.
+
+**Caveat: all four arms ran contended (one peer throughout).** Absolute milliseconds are inflated;
+the comparison is internally controlled but the magnitude needs a clean-box confirmation.
+
+The fix is bounded and **cannot change rendered output** — the same bytes are uploaded from the same
+sources, only host staging recycling changes: make the default memory-aware (mirroring
+`texture_decode_cache_limit_bytes`, with the `*_MB` override winning) and give eviction an LRU victim
+instead of `available.begin()` on an `unordered_map`. The risk is memory footprint, not correctness.
+
+This does **not** retire the copy. Even at 2048 MiB, `copy` is 33.44 ms and `res_buffer` 41.62 ms of
+a 126.58 ms submit, so removing the copy entirely — importing guest pages as Vulkan memory
+(`VK_EXT_external_memory_host`; prosper uses it nowhere today, there is no
+`vkGetMemoryHostPointerPropertiesEXT` / `VkImportMemoryHostPointerInfoEXT` in the tree), or a
+versioned guest-identity buffer cache — remains the structural follow-up. The second reuses the #1703
+machinery but carries the #611/#780 stale-data risk; the first does not, because the GPU would read
+the guest bytes rather than a snapshot of them.
 
 Frame math, so nobody expects one term to finish the job: at the clean 165.18 ms submit, removing
 100 % of `copy` gives ~95 ms (10.5 submits/s); removing `copy` **and** `acquire` **and** `fixed`
