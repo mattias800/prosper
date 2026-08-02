@@ -460,12 +460,16 @@ HLE(g_vo_resstatus)   {
 // sceVideoOutWaitVblank's wake-up boundary MUST come from the same clock: a game that waits for a
 // vblank and then reads the count has to observe the count it just waited for. Anchored on the
 // first use so both are process-relative, exactly as the previous status-only anchor was.
+// Internal linkage on purpose: the "epoch before now" ordering invariant below is only
+// enforceable by reading this one file, so nothing outside it may reach these.
+namespace {
 constexpr uint64_t kVblankNs = 16683350;             // 59.94 Hz period
 uint64_t vblank_now_ns() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 uint64_t vblank_epoch_ns() { static const uint64_t t0 = vblank_now_ns(); return t0; }
+}  // namespace
 
 // sceVideoOutGetVblankStatus (SceVideoOutVblankStatus, 0x28 bytes — Kyty VideoOut.cpp:94:
 // u64 count @0, u64 processTime @8, u64 tsc @0x10, u64 reserved @0x18, u8 flags @0x20).
@@ -506,19 +510,34 @@ HLE(g_vo_vblankstatus) {
 // status observes the tick it waited for, not a disagreeing second clock. The handle is validated
 // under g_vo_handle_mx and the guard is released BEFORE sleeping: holding it across a ~16 ms sleep
 // would serialize every other VideoOut call in the process behind one waiter.
-// CONFIDENCE: HIGH on the contract (single handle argument, blocking, 0 on success — the guest's
-// call site passes exactly one register and ignores nothing else); HIGH that returning instantly
-// is wrong.
+// CONFIDENCE: HIGH that blocking is the behaviour and that returning instantly is wrong, and HIGH
+// on the shape (one argument, 0 on success). MED that the argument is an sceVideoOutOpen handle
+// rather than a port index: the guest's call site passes exactly one register, but no title has yet
+// been observed reaching this call with a handle we can compare against. That matters because the
+// reject arm is NEW behaviour — the previous stub returned 0 for everything — so it is made
+// fail-visible rather than silent: a title passing something we do not recognise would otherwise
+// turn a paced loop into an error spin with nothing printed, which is worse than the original spin.
 HLE(g_vo_wait_vblank) {
     { VideoOutHandleGuard handle(a0);
-      if (!handle.valid()) return kVoErrorInvalidHandle; }
+      if (!handle.valid()) {
+          static std::atomic<bool> warned{false};
+          if (!warned.exchange(true))
+              fprintf(stderr, "[vo] sceVideoOutWaitVblank: unknown handle 0x%llx — returning "
+                              "INVALID_HANDLE and NOT waiting. If this repeats, the argument is "
+                              "probably not an sceVideoOutOpen handle (see the CONFIDENCE note).\n",
+                      (unsigned long long)a0);
+          return kVoErrorInvalidHandle;
+      } }
     const uint64_t t0 = vblank_epoch_ns();
     const uint64_t now = vblank_now_ns();
     // Next strictly-future boundary: a caller that is already exactly on one still waits a full
     // period, which is what "wait for the NEXT vblank" means.
     const uint64_t next = t0 + ((now - t0) / kVblankNs + 1) * kVblankNs;
+    // F5: duration_cast rather than a nanoseconds->time_point construction, which only compiles
+    // because steady_clock::duration happens to be nanoseconds on every toolchain we build with.
     std::this_thread::sleep_until(std::chrono::steady_clock::time_point(
-        std::chrono::nanoseconds(next)));
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::nanoseconds(next))));
     return 0;
 }
 
