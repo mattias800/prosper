@@ -522,6 +522,20 @@ struct BackendRenderTimingStats {
     double setup_fixed_ms = 0;
     double setup_resources_ms = 0;
     double setup_pipeline_ms = 0;
+    // Sub-attribution of setup_resources_ms (#1284). `resources` is not descriptor bookkeeping alone:
+    // the same interval also builds every texture upload (image/memory creation plus the staging
+    // memcpy) and every storage-buffer upload, so a term that reads as "descriptor setup" can be
+    // dominated by pixel and vertex bytes. These split it so the dominant sub-term is named rather
+    // than assumed. res_texture_ms and res_buffer_ms cover the whole per-resource branch;
+    // res_texture_upload_ms and res_texture_bind_ms are nested INSIDE res_texture_ms and cover only
+    // the cache-miss work (image+staging build, view/sampler creation), so
+    // res_texture_ms - res_texture_upload_ms - res_texture_bind_ms is the per-reference key/lookup
+    // cost that a cache HIT still pays. res_descriptor_ms is the per-draw set layout/alloc/update.
+    double res_texture_ms = 0;
+    double res_texture_upload_ms = 0;
+    double res_texture_bind_ms = 0;
+    double res_buffer_ms = 0;
+    double res_descriptor_ms = 0;
 
     double total_ms() const {
         return target_ms + draw_setup_ms + record_upload_ms + gpu_wait_ms + readback_ms + cleanup_ms;
@@ -3618,8 +3632,32 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     double setup_fixed_ms = 0.0;
     double setup_resources_ms = 0.0;
     double setup_pipeline_ms = 0.0;
+    // #1284 sub-attribution of setup_resources_ms; see BackendRenderTimingStats for what each covers.
+    double res_texture_ms = 0.0;
+    double res_texture_upload_ms = 0.0;
+    double res_texture_bind_ms = 0.0;
+    double res_buffer_ms = 0.0;
+    double res_descriptor_ms = 0.0;
     auto setup_elapsed_ms = [](auto begin, auto end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
+    // Scope-guard timer, so a bucket stays correct across the `continue`/`break` exits the resource
+    // loop already uses. Reads the clock only when timing is enabled; the whole sub-attribution is
+    // inert (two predictable branches per resource) on a default run.
+    struct ResourcePhaseTimer {
+        bool enabled;
+        double* sink;
+        TimingClock::time_point begin;
+        ResourcePhaseTimer(bool en, double* s)
+            : enabled(en), sink(s),
+              begin(en ? TimingClock::now() : TimingClock::time_point{}) {}
+        ResourcePhaseTimer(const ResourcePhaseTimer&) = delete;
+        ResourcePhaseTimer& operator=(const ResourcePhaseTimer&) = delete;
+        ~ResourcePhaseTimer() {
+            if (enabled)
+                *sink += std::chrono::duration<double, std::milli>(TimingClock::now() - begin)
+                             .count();
+        }
     };
     BackendPipelineCacheStats& pipeline_stats = backend_pipeline_cache_stats_storage();
     pipeline_stats = {};
@@ -4012,6 +4050,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 const FrameResource& r = R[i];
                 lb[i] = {}; lb[i].binding = r.binding; lb[i].descriptorCount = 1;
                 if (r.is_texture()) {
+                    const ResourcePhaseTimer phase_texture(timing_enabled, &res_texture_ms);
                     lb[i].descriptorType = r.is_storage_image
                         ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                         : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -4076,6 +4115,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         if (found != texture_upload_indices.end()) upload_index = found->second;
                     }
                     if (upload_index == SIZE_MAX) {
+                        const ResourcePhaseTimer phase_upload(timing_enabled,
+                                                              &res_texture_upload_ms);
                         upload_index = texture_uploads.size();
                         texture_uploads.push_back({});
                         SharedTextureUpload& upload = texture_uploads.back();
@@ -4414,6 +4455,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     if (binding_found != shared_texture_binding_indices.end()) {
                         binding_index = binding_found->second;
                     } else {
+                        const ResourcePhaseTimer phase_bind(timing_enabled, &res_texture_bind_ms);
                         binding_index = shared_texture_bindings.size();
                         SharedTextureBinding binding;
                         const bool persistent_bindings_enabled = share_backend_resources &&
@@ -4489,6 +4531,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
                     wr[i].descriptorType = lb[i].descriptorType; wr[i].pImageInfo = &dii[i];
                 } else {
+                    const ResourcePhaseTimer phase_buffer(timing_enabled, &res_buffer_ms);
                     lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
                     if (r.is_internal_gds) {
                         const RenderHostBuffer& gds = render_internal_gds_buffer();
@@ -4642,6 +4685,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 }
             }
             if (!buffer_resources_ready) continue;
+            const ResourcePhaseTimer phase_descriptor(timing_enabled, &res_descriptor_ms);
             for (uint32_t s = 0; s < v.n_sets; s++) {
                 std::vector<VkDescriptorSetLayoutBinding> slb;
                 for (size_t i = 0; i < R.size(); i++) if (R[i].set == s) slb.push_back(lb[i]);
@@ -6188,6 +6232,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.setup_shader_ms = setup_shader_ms;
         call_timing.setup_fixed_ms = setup_fixed_ms;
         call_timing.setup_resources_ms = setup_resources_ms;
+        call_timing.res_texture_ms = res_texture_ms;
+        call_timing.res_texture_upload_ms = res_texture_upload_ms;
+        call_timing.res_texture_bind_ms = res_texture_bind_ms;
+        call_timing.res_buffer_ms = res_buffer_ms;
+        call_timing.res_descriptor_ms = res_descriptor_ms;
         call_timing.setup_pipeline_ms = setup_pipeline_ms;
         struct TimingTotals {
             uint64_t calls = 0, draws = 0;
@@ -6506,6 +6555,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(setup_shader_ms);
             PROSPER_SUM_TIMING_STAT(setup_fixed_ms);
             PROSPER_SUM_TIMING_STAT(setup_resources_ms);
+            PROSPER_SUM_TIMING_STAT(res_texture_ms);
+            PROSPER_SUM_TIMING_STAT(res_texture_upload_ms);
+            PROSPER_SUM_TIMING_STAT(res_texture_bind_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_ms);
+            PROSPER_SUM_TIMING_STAT(res_descriptor_ms);
             PROSPER_SUM_TIMING_STAT(setup_pipeline_ms);
 #undef PROSPER_SUM_TIMING_STAT
         }
