@@ -51,6 +51,34 @@ int main() {
         { "AcquireMem/Dcb", "-vnlTPPXPrw", "57labkp+rSQ", 0, 0, 0,      0, 0 },  // sceAgcDcbAcquireMem -> 8 dw
         { "AcquireMem/Acb", "ewobAQeMo5k", "KT-hTp-Ch14", 0, 0, 0,      0, 0 },  // sceAgcAcbAcquireMem -> 8 dw
         { "ReleaseMem/EOP", "hL7C0IRpWZI", "wr23dPKyWc0", 0, 0, 0,      0, 0 },  // sceAgcCbReleaseMem -> 8 dw
+        // #1756: the rest of the family. libSceAgc 3.20 exports 65 GetSize functions and prosper
+        // answered 6; the other 59 fell through to the unimplemented path and returned 0, which
+        // makes a guest that sizes its buffer from GetSize reserve NOTHING. Every pair below is
+        // asserted the same way — the GetSize must equal what the builder actually writes — so the
+        // fix cannot drift back apart. (The three size-carrying builders are excluded: their
+        // GetSize argument position is unknown. See #1756.)
+        { "DrawIndex",          "6ee9Hd3EWXQ", "q88lQ+GP5Yk", 0, 0, 0, 0, 0 },
+        { "DrawIndexAuto",      "WrdP9Zxx3lQ", "Yw0jKSqop+E", 0, 0, 0, 0, 0 },
+        { "DrawIndexOffset",    "qMlfB1ZhMDc", "B+aG9DUnTKA", 0, 0, 0, 0, 0 },
+        { "DrawIndexIndirect",  "mStuvI0zOtc", "t1vNu082-jM", 0, 0, 0, 0, 0 },
+        { "Dispatch",           "Abendgtz+3o", "k3GhuSNmBLU", 0, 0, 0, 0, 0 },
+        { "DispatchIndirect/D", "w8HVkEeXPv8", "CtB+A9-VxO0", 0, 0, 0, 0, 0 },
+        { "DispatchIndirect/A", "PxKWV2fVAps", "j3EtxFkSIhQ", 0, 0, 0, 0, 0 },
+        { "DmaData/Dcb",        "2ccJz9LQI+w", "WmAc2MEj6Io", 0, 0, 0, 0, 0 },
+        { "DmaData/Acb",        "M0ttm8h7SKA", "-RnpfpxIhec", 0, 0, 0, 0, 0 },
+        { "EventWrite/Dcb",     "C4l9fB17t8w", "aJf+j5yntiU", 0, 0, 0, 0, 0 },
+        { "EventWrite/Acb",     "Y-5vneiBtzk", "cFazmnXpJOE", 0, 0, 0, 0, 0 },
+        { "SetIndexBuffer",     "j4emHHndCPY", "l4fM9K-Lyks", 0, 0, 0, 0, 0 },
+        { "SetIndexCount",      "mljzuGDZRQ4", "8N2tmT3jmC8", 0, 0, 0, 0, 0 },
+        { "SetIndexSize",       "ca4KPvp0qLQ", "GIIW2J37e70", 0, 0, 0, 0, 0 },
+        { "SetNumInstances",    "6DFuRKT4C9w", "tSBxhAPyytQ", 0, 0, 0, 0, 0 },
+        { "StallCbParser",      "+u6dKSLWM2o", "u2T2DiA5hRI", 0, 0, 0, 0, 0 },
+        { "SetShRegDirect",     "QhPDD513V0w", "pFLArOT53+w", 0, 0, 0, 0, 0 },
+        { "SetCxRegDirect",     "1DeUNpRIDDA", "LHFXRrlTPD8", 0, 0, 0, 0, 0 },
+        { "SetUcRegDirect",     "aP1Ki9G3++4", "w4-d0n60hdo", 0, 0, 0, 0, 0 },
+        { "SetShRegsIndirect",  "nNlUtdDDvZ0", "-HOOCn0JY48", 0, 0, 0, 0, 0 },
+        { "SetCxRegsIndirect",  "GBCh3zCihoU", "ZvwO9euwYzc", 0, 0, 0, 0, 0 },
+        { "SetUcRegsIndirect",  "UQGTw4xRlcM", "hvUfkUIQcOE", 0, 0, 0, 0, 0 },
     };
     for (const auto& c : cases) {
         HleFn gs = Hle::lookup(c.gs_nid), build = Hle::lookup(c.build_nid);

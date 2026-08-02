@@ -93,6 +93,7 @@ shared-GPU policy, the instrument-not-the-subject list, and the dated current ha
 | Windows port / release | native SDL3+Vulkan frontend, screenshots, release path | `docs/WINDOWS_PORT_HANDOFF.md`, `docs/WINDOWS_RELEASE.md` |
 | GPU capture / replay / timeline tooling | F9 frame grab → offline `.prgbundle` / `.prgcap` workflow, and every `PROSPER_*` graphics diagnostic | `tools/gpu_replay/README.md`, `tools/gpu_timeline/README.md`, `tools/AGENTS.md` |
 | Graphics architecture, resource binding, recompiler | — | `docs/GRAPHICS.md`, `docs/RESOURCE_BINDING.md`, `docs/RECOMPILER_REMAINING.md` |
+| AGC command-packet sizes (a builder's dword count is an ABI contract with the guest's own reservations) | — | `docs/AGC_PACKET_SIZES.md` |
 
 ### Before you form a hypothesis, read the `## Ruled out` section
 

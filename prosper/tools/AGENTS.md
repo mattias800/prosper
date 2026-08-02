@@ -44,6 +44,24 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     a heuristic stack scan (a stale spill slot looks exactly like a return address), so treat the
     result as a callsite **hint** to confirm against the module's disassembly — never as proof on its
     own. Bounded to 64 distinct chains so an allocation-heavy boot cannot bury the log.
+  - **Is prosper overrunning a command-buffer reservation the guest made?** prosper's AGC builders
+    append into the *guest's* buffer, and the guest reserves that buffer from the packet sizes it was
+    compiled against — so a builder that emits more dwords than the real AGC function overruns it.
+    The failure does not look like a size bug: on #1748 it looked like a 210 MiB/s heap leak, and in
+    a title with memory to spare it looks like nothing but command-buffer churn and low frame rate.
+    **`PROSPER_DCBFULL=1`** reports every Dcb "buffer full" callback and
+    **`PROSPER_DCBWIN=N`** every packet appended into a window of ≤ N dwords (N=1 selects 64):
+    ```text
+    [dcbwin]  window=16 dw : AcquireMem n=8 op=0x10 at +0 (avail 16)
+    [dcbwin]  window=16 dw : ReleaseMem/EopAction n=9 op=0x10 at +8 (avail 8)
+    [dcbfull] #0 ReleaseMem/EopAction op=0x10 need=9 avail=8 reserved=0 window=16 dw at +8
+    ```
+    **Read `avail`, not the window size** — for a segmented Dcb the window is the current segment,
+    not a reservation, and reading it as one produces false positives. `avail=0` is an exhausted
+    buffer (ordinary growth); `avail>0` means space was deliberately left and prosper asked for more
+    than fits, with `need - avail` the overrun. A real defect repeats one `(sub-op, need, avail)`
+    triple; scattered one-offs are ring wraps. Full contract and the per-builder table:
+    `docs/AGC_PACKET_SIZES.md`.
   - **Does a PM4 write path store *this value* into guest memory?**
     **`PROSPER_WRITE_TRAP=0xV[,0xV…]`** (up to 8 values) checks every guest-memory store the command
     processor performs — `RELEASE_MEM` data_sel 1/2/3, `EVENT_WRITE`, `WRITE_DATA`, and both
