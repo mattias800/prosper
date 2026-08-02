@@ -126,6 +126,13 @@ void pad_fill_extended_controller_info(ScePadExtendedControllerInformation* out,
 // --- Scripted input (PROSPER_PAD_SCRIPT) pure helpers — see pad.hpp -----------------------------
 uint32_t pad_button_by_name(const std::string& n) {
     if (n == "start" || n == "options") return SCE_PAD_BUTTON_OPTIONS;
+    // The DualSense touch-pad CLICK. Titles bind it as an ordinary button, and
+    // SCE_PAD_BUTTON_TOUCH_PAD has always been in the mask that scePadRead reports — it simply
+    // had no name in either direction, so no PROSPER_PAD_SCRIPT route could press it and no
+    // PROSPER_PAD_RECORD capture could round-trip it. A screen gated on it is unreachable by
+    // any scripted run, and the failure is silent: pad_button_by_name returns 0 for an unknown
+    // name, which parses as "neutral" rather than as an error.
+    if (n == "touchpad")                return SCE_PAD_BUTTON_TOUCH_PAD;
     if (n == "cross" || n == "x")       return SCE_PAD_BUTTON_CROSS;
     if (n == "circle" || n == "o")      return SCE_PAD_BUTTON_CIRCLE;
     if (n == "square")                  return SCE_PAD_BUTTON_SQUARE;
@@ -149,7 +156,7 @@ std::string pad_button_names(uint32_t mask) {
         {SCE_PAD_BUTTON_L1, "l1"}, {SCE_PAD_BUTTON_R1, "r1"},
         {SCE_PAD_BUTTON_L2, "l2"}, {SCE_PAD_BUTTON_R2, "r2"},
         {SCE_PAD_BUTTON_L3, "l3"}, {SCE_PAD_BUTTON_R3, "r3"},
-        {SCE_PAD_BUTTON_OPTIONS, "options"},
+        {SCE_PAD_BUTTON_OPTIONS, "options"}, {SCE_PAD_BUTTON_TOUCH_PAD, "touchpad"},
     };
     std::string result;
     for (const auto& name : names) {
