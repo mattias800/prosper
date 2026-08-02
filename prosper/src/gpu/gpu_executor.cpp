@@ -6072,6 +6072,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
 
 void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }
 bool have_submit_renderer()               { return static_cast<bool>(g_live); }
+uint8_t* compute_gds_backing()            { return g_compute_gds.data(); }
+size_t   compute_gds_size()               { return g_compute_gds.size(); }
 void set_submit_compute(LiveComputeFn fn) { g_compute = std::move(fn); }
 bool have_submit_compute()                { return static_cast<bool>(g_compute); }
 

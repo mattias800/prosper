@@ -1827,4 +1827,12 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height,
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
                                  uint64_t submit_no = 0, bool publish = true);
 
+// The 64 KiB Global Data Share. Compute shaders reach it through the internal binding installed when
+// a kernel decodes a `ds_*` instruction with the GDS flag; the command processor reaches it here,
+// because DMA_DATA can name a GDS OFFSET rather than a guest address as its endpoint (Sony's own
+// parameter is `dstAddressOrOffset`, and `sceAgcDcbAtomicGds` is part of the same API surface).
+// Returns the backing and its size so a caller can bounds-check an offset without assuming 64 KiB.
+uint8_t* compute_gds_backing();
+size_t compute_gds_size();
+
 } // namespace prosper::gpu
