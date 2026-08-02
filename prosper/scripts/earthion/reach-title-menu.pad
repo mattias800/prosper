@@ -1,0 +1,74 @@
+# Earthion (PPSA28061): leave the intro and reach the title screen / main menu.
+#
+# Timing is anchored to the game's FIRST PAD POLL, not process start.
+#
+# Why it alternates Cross and Options rather than pressing one at a fixed offset: the intro is a
+# story-text sequence whose page timing moves with the rendering policy, and which button leaves it
+# was not known when this route was written. Alternating covers both and costs nothing -- surplus
+# presses land in the menu as selection/back and the route returns to it, so every arm of an A/B
+# sees the same states. Verify with PROSPER_PAD_SCRIPT_LOG=1, which prints the states the guest
+# actually read.
+#
+# Reaches, under full-resolution `screenshot` capture on Linux/RADV: the title screen and main menu
+# (logo, 'How to Play / Game Version / Reset / Audio / Visuals / Language / Extras'), and the HOW TO
+# PLAY page. See README.md for the measured interior content metrics.
+4-6:cross
+9-11:options
+14-16:cross
+19-21:options
+24-26:cross
+29-31:options
+34-36:cross
+39-41:options
+44-46:cross
+49-51:options
+54-56:cross
+59-61:options
+64-66:cross
+69-71:options
+74-76:cross
+79-81:options
+84-86:cross
+89-91:options
+94-96:cross
+99-101:options
+104-106:cross
+109-111:options
+114-116:cross
+119-121:options
+124-126:cross
+129-131:options
+134-136:cross
+139-141:options
+144-146:cross
+149-151:options
+154-156:cross
+159-161:options
+164-166:cross
+169-171:options
+174-176:cross
+179-181:options
+184-186:cross
+189-191:options
+194-196:cross
+199-201:options
+204-206:cross
+209-211:options
+214-216:cross
+219-221:options
+224-226:cross
+229-231:options
+234-236:cross
+239-241:options
+244-246:cross
+249-251:options
+254-256:cross
+259-261:options
+264-266:cross
+269-271:options
+274-276:cross
+279-281:options
+284-286:cross
+289-291:options
+294-296:cross
+299-301:options
