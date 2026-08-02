@@ -1549,6 +1549,116 @@ the studio/publisher intro; intrusive output clearly worsened cadence, but the f
 confirmed or disproved in a clean capture. Treat that visual report as an open correctness item, not as a
 known timing artifact.
 
+## Astro Bot compute decomposition (#1732) — the 3D workload this document asked for
+
+This document's July stop decision deferred "the remaining synchronous graphics/compute boundaries"
+until they could be evaluated against a **3D** workload. Astro Bot (`PPSA21564`) is that workload, and
+it is a far sharper instrument than the 2D titles the earlier passes used: here the compute boundary is
+worth roughly 20x rather than a few percent.
+
+Measured on `6d7b69e9`, headless `boot_trace`, route
+`scripts/astrobot/reach-worldmap-boot-trace.pad`, RADV STRIX_HALO, no other GPU consumer at either
+boundary, no render acceleration.
+
+### Compute execution is ~93 % of headless wall time
+
+`PROSPER_RENDER_TIMING=1` reports the backend's own cumulative cost inside the compute-on run:
+**41,625 dispatches at ~10.1 ms = 419 s of a 448 s run (93.7 %)**, and on a second run
+**139,150 dispatches at ~5.70 ms = 793 s of 850 s (93.3 %)**, stable across every sample of both. This
+is a *single-arm* attribution, so unlike the `PROSPER_NO_COMPUTE=1` ratio it cannot be confounded by a
+guest-path change. The backend is invoked **once per dispatch** (`calls == dispatches`), each invocation
+one `vkQueueSubmit` + `vkWaitForFences` on the guest's own submit thread.
+
+The `PROSPER_NO_COMPUTE=1` comparison is fair on the axis that matters, but its **multiplier is not a
+constant**. That switch installs a no-op success backend that never mutates guest GPU resources, so the
+guest could in principle take a cheaper path; it does not. `PROSPER_PROGRESS=5` reads guest
+submits/draws/flips from the HLE AGC layer, upstream of any backend, and at matched flip numbers
+cumulative **submits/flip converges to identical values in the two arms** (7.29 vs 7.29 at flip 1767).
+The route being *flip-anchored* is what makes the arms comparable at all — a wall-time route presses its
+buttons at different game states in the two arms.
+
+Two things the ratio does **not** establish, both of which it has been read as:
+
+- **It varies from 92x to 30x across one route** (92x at flip 323, 38x at flip 1200, 30x at flip 1767
+  and still falling). A multiplier quoted without naming the flip means nothing.
+- **draws/flip diverges at matched flips** — 138.6 with compute on versus 68.0 with it off at flip
+  1636. Both arms reach the same content, but the content ramp is *wall-clock*-anchored, so the fast arm
+  has simply not streamed the scene in yet. The wall-time ratio therefore mixes our compute cost with
+  "the fast arm is rendering less"; prefer the single-arm number above.
+
+And 67 flips/s is the rate with the work deleted. It bounds the cost, not the achievable ceiling.
+
+### The decomposition
+
+`tools/perf/compute_phase_report.py` aggregates the existing `[compute-phase]` and `[compute-image]`
+records. 18,933 **succeeded** dispatches, 1,581 guest submits, 421.8 s:
+
+| phase | share | contents |
+|---|---:|---|
+| dispatch | 75.4 % | command recording, `vkCmdCopyBufferToImage` per image binding, kernel, readback, submit/fence wait |
+| setup | 17.4 % | image bindings 17.0 %; descriptor validation 0.1 %, buffer binding 0.3 % |
+| writeback | 6.8 % | pack 2.4 %, retile 2.4 % |
+| pipeline + cleanup | 0.5 % | |
+
+Three instrumentation properties that generalise past this title, each of which produced a wrong table
+before it was handled:
+
+- **`setup_ms` spans the image-binding loop, which has no sub-timer on the `[compute-phase]` line.**
+  With `PROSPER_COMPUTE_PHASE_TIMING` alone, setup's named children explain 0.4 % of a 17.4 % phase; the
+  rest only becomes visible with `PROSPER_COMPUTE_IMAGE_TIMING` as well. The report prints an explicit
+  `unattributed` row under every parent rather than dropping the gap.
+- **A failed dispatch leaves `execute_item` early, so `phase_dispatch`/`phase_writeback` are never
+  advanced.** Its `dispatch_ms` is then computed backwards and prints **negative**, while `cleanup_ms`
+  absorbs the whole record. Summing failed records into the phase table produced
+  `dispatch (GPU) = -20,532 ms` and moved 46 % of the run into `cleanup`. They are excluded and counted
+  separately.
+- **`[compute-image]` records carry no ok flag**, so they span failed dispatches too and must be
+  denominated against all-dispatch wall time rather than the succeeded-only total.
+
+The switches are cheap enough to trust: `avg_ms` at five matched dispatch ordinals against a run with
+neither gives **+1.5 % to +1.9 %**, measured rather than assumed.
+
+### Root cause: `0x500571000`'s dispatch size never resets
+
+One program is **75.2 % of succeeded-dispatch time** at 982 ms mean, 93 % of it in the submit-and-wait.
+`PROSPER_COMPUTELOG_CODE=0x500571000` prints the derived geometry: `local` is a constant 16x16x1 and
+`groups_x` grows by **exactly 3,345 every dispatch, monotonically, without bound** — 1 at dispatch 1,
+3,366 at 23, 327,831 at 120, **752,646 (192.7 M invocations) at 247 and still climbing**. A per-frame
+quantity is being **accumulated rather than consumed**: the count derived is a running total where the
+guest means a per-frame value. This is a correctness defect in the dispatch-size derivation (the #580
+thread/local/group contract), not a tuning problem, and it explains the shape of everything else — this
+program cost 235 ms, then 562, 982, 1,492 ms across one run, and the title becomes monotonically slower
+the longer it runs.
+
+### Ruled out
+
+- **"The dominant dispatch cost is image upload volume."** False. `0x500571000` spent 123,762 ms of
+  dispatch time for 107.19 GiB staged (0.87 GiB/s) while `0x50059cd00`, `0x5005cc100` and `0x5005fdb00`
+  staged 107-112 GiB each in 1,573-1,583 ms (67-71 GiB/s). Three sibling programs move the same volume
+  80x faster, so the per-dispatch image round-trip — a real and large cost elsewhere in the same
+  decomposition — does not explain the dominant term. Ranking phases by size selects uploads; asking
+  what predicts the *outlier* rejects them (#1732).
+- **"The geometry is fine, the 128,005-word SPIR-V module is the problem."** False, and the way it was
+  nearly believed is the lesson: the first three traced dispatches genuinely read `groups=1x1x1`,
+  because the growth only begins at dispatch 23. **Three samples of a monotonic series are not a sample
+  of it** — when a value is suspected of drifting, plot the series before quoting any element of it
+  (#1732).
+
+### Separately: 82 % of dispatches fail, silently
+
+Of 106,484 dispatches in the routed run, **87,551 fail** — every one from submit 2299 (the world-map
+load) onward — consuming **353 s, 46 % of all compute wall time, on work that is then discarded**. At
+default verbosity they emit **nothing**: every failure path in `execute_item` returns false behind an
+`if (trace)` guard, so a run log shows only the two registration lines. This is a fatal-gap class under
+`CLAUDE.md` and a likely mechanism for #1459 (Astro Bot's world map renders only its backdrop). Any
+future compute-performance number for this title is measuring two different things until it is split by
+`ok=`, which `compute_phase_report.py` now does.
+
+`CONFIDENCE: HIGH` on the decomposition, the ~93 % attribution, the fairness verdict, the unbounded
+`groups_x` growth, the failure census and both falsifications. `CONFIDENCE: MED` on the accumulation
+being a derivation defect rather than something the guest itself drives; the guest-side source of the
+count is unread.
+
 ## Next renderer step
 
 First reproduce the reported white intro flashes with lightweight capture or a clean live run. Heavy
