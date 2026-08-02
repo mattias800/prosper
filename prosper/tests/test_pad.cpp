@@ -340,6 +340,15 @@ int main() {
         CHECK(pad_button_by_name("r2")      == SCE_PAD_BUTTON_R2,      "name: r2 -> R2");
         CHECK(pad_button_by_name("up")      == SCE_PAD_BUTTON_UP,      "name: up -> UP");
         CHECK(pad_button_by_name("nonsense")== 0,                      "name: unknown -> 0");
+        // The touch-pad CLICK is a real button in the reported mask that had no name in either
+        // direction, so no route could press it and no recording could round-trip it.
+        CHECK(pad_button_by_name("touchpad")== SCE_PAD_BUTTON_TOUCH_PAD,
+              "name: touchpad -> TOUCH_PAD");
+        CHECK(pad_button_names(SCE_PAD_BUTTON_TOUCH_PAD) == "touchpad",
+              "names: touchpad is canonical");
+        CHECK(pad_button_by_name(pad_button_names(SCE_PAD_BUTTON_TOUCH_PAD)) ==
+                  SCE_PAD_BUTTON_TOUCH_PAD,
+              "names: touchpad round-trips through the parser");
         CHECK(pad_button_names(SCE_PAD_BUTTON_OPTIONS) == "options", "names: options is canonical");
         CHECK(pad_button_names(SCE_PAD_BUTTON_UP | SCE_PAD_BUTTON_CROSS) == "up+cross",
               "names: stable combined-button order");
