@@ -22,7 +22,8 @@ possible without console keys. Dumps are user-supplied and gitignored.
   processor → register-state fold; EOP/DMA/fence writes on the guest timeline). **RDNA2→SPIR-V
   recompiler:** full ALU + `SCC`; divergent control flow (EXEC predication, saveexec/restore, `execz`
   if-then + loop exits); `SMEM`, `MUBUF` vertex-fetch/load/store, `MIMG` sample/load, `LDS`+barriers,
-  `EXP`/`VINTRP`; EUD-resident descriptor resolution; every shader `spirv-val`-gated. Texture decode:
+  `EXP`/`VINTRP`; EUD-resident descriptor resolution; every SPIR-V emitter `spirv-val`-gated in CI
+  (`tools/spv_validate`). Texture decode:
   GFX10 `SW_4KB_S`/`SW_64KB_S` de-swizzle for all element sizes + BC1–7/BC6H, T# format + `DST_SEL`
   swizzle + paired S# sampler. Frame spine → `resolve_pipeline_state` → real `VkGraphicsPipeline`s
   with blend (incl. separate-alpha)/depth/stencil/write-mask/fast-clear + a render-to-texture cache.
@@ -121,8 +122,12 @@ prosper/
 ```
 cmake -S . -B build -G Ninja
 cmake --build build
-ctest --test-dir build          # 99 self-checking tests
+ctest --test-dir build          # the self-checking suite (count varies by platform)
 ```
+`ctest` needs `spirv-val` on `PATH` — `spirv-tools` on Fedora/Ubuntu,
+`mingw-w64-ucrt-x86_64-spirv-tools` in MSYS2, `brew install spirv-tools` on macOS. The
+`spv_validate` test is the strict SPIR-V validation gate and **fails** rather than skipping when
+the validator is absent, because silently skipping is how #1711 shipped.
 Add `-DPROSPER_APP=ON` for the windowed `prosper-app` frontend (fetches SDL3). Or a tool directly:
 ```
 g++ -O2 -std=c++20 tools/self_dump/self_dump.cpp -o self_dump

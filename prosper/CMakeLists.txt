@@ -755,12 +755,16 @@ if(TARGET prosper_core)
                      "$<TARGET_FILE:shader_inspect>")
   endif()
 
-  # spv_validate: recompile one shader from every path and run spirv-val on each — a strict-validation
-  # gate (the render tests only prove llvmpipe accepts them; llvmpipe is lenient). No Vulkan needed;
-  # skips validation gracefully if spirv-val is not on PATH (still checks recompilation succeeds).
+  # spv_validate: emit a module from EVERY SPIR-V-producing entry point and run spirv-val on each —
+  # a strict-validation gate (the render tests only prove llvmpipe accepts them; llvmpipe is
+  # lenient). No Vulkan needed, but spirv-val (spirv-tools) IS required: it used to report PASS when
+  # the validator was absent, which is how #1711 shipped invalid SPIR-V past a gate CLAUDE.md and
+  # both READMEs describe as strict. The source root is passed so the tool can read the emitter
+  # headers and fail when a new emitter is added without a module here.
   add_executable(spv_validate tools/spv_validate/spv_validate.cpp)
   target_link_libraries(spv_validate PRIVATE prosper_core)
-  add_test(NAME spv_validate COMMAND spv_validate ${CMAKE_CURRENT_BINARY_DIR})
+  add_test(NAME spv_validate
+           COMMAND spv_validate ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 
   # AGC→Vulkan resource layer: the front-half↔back-half contract (gpu_resources.hpp). Registry
   # behavior is fixed here so both halves integrate against a stable API. Pure/cross-platform.

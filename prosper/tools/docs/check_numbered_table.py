@@ -55,6 +55,23 @@ boundary is sharp and worth knowing: numbering catches a row that VANISHED (the 
 nothing here catches a row that CHANGED ITS MIND. A green run means the table is well formed, never
 that it is true. Diff the region for content too.
 
+A RED `Docs` JOB THAT IS THE GATE WORKING, not a defect -- read this before "fixing" it. Two
+concurrent PRs appending to a gapless table create a MERGE-ORDER DEPENDENCY. Master ends at 42;
+both branches append; the earlier claimant keeps 43 and the later one renumbers to 44. The later
+branch's table then reads `42, 44`, and --sequential correctly rejects the gap, so ITS `Docs` job is
+red BY CONSTRUCTION until the earlier PR lands -- and merging it first would put that gap on master.
+Neither PR is broken. Rebase after the earlier one merges: the gap closes itself, and nothing else
+about either change is involved.
+
+The temptation at that point is to weaken the gapless rule, and that would cost the one thing
+numbering can see which content checking cannot. Gaplessness is what catches a DELETED row.
+Uniqueness catches a duplicate and structure catches a split, but a row that simply vanishes -- in a
+bad merge, a wholesale `git checkout` of the file, a careless rebase -- leaves a file that is
+perfectly well formed and silently redirects nothing, because the citations to it still resolve to
+"no such row". The sequence is the only signal. So the correct response to `42, 44` is to wait, not
+to relax the check. First hit on 2026-08-02 (#1711/#1722, the fourth row-number collision that day);
+#1729 tracks pre-empting the collision at claim time, which is what would remove the wait.
+
 KNOWN LIMIT, recorded as a decision rather than a defect. The abutment rule keeps the
 `blank line, prose, orphaned rows` shape -- a real table split -- and that shape is structurally
 identical to a correct one: a pipe-leading line in the middle of a paragraph below an unrelated

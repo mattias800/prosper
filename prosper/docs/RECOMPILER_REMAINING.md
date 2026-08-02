@@ -20,6 +20,14 @@ integer divide/modulo), plus the big structural features: counted-loop reconstru
 64-bit scalar (`s_bfe_u64` via Int64), and NGG vertex shaders. All paths are `spirv-val`-gated
 (`tools/spv_validate`, permanent ctest) and, where a Vulkan harness exists, execution-differential-tested.
 
+What that gate does and does not prove (corrected by #1711): it emits **one representative module per
+SPIR-V-emitting entry point** — every `recompile_*` stage plus `spirv_builder.cpp`'s hand-assembled
+compute modules — and runs `spirv-val --target-env vulkan1.1` on each. It is not a per-title guarantee:
+a shader a game submits at runtime is covered only insofar as it exercises the same emitter paths. Two
+things it now refuses to do quietly, both of which it used to: pass when `spirv-val` is missing (it was
+absent on every CI runner, so the gate had never validated anything there), and stay silent when a new
+emitter is declared with no module here.
+
 **Recompiling end-to-end (spirv-val VALID):** the textured/interpolated/image-copy families; the full
 MSAA-resolve family **031/032/033/034** (counted loop + 2D_MSAA[_ARRAY]); 3D-sample **028**; compressed-
 export **029**; the **NGG family 004/025/040** (position-only + indexed-fetch cull); the bloom/downsample

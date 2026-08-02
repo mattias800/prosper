@@ -219,6 +219,20 @@ anywhere yet**, so they are deliberately left unplaced and logged rather than fo
 dataFormat, u32 sampleRate, u32 flags, u64 userHandle}` — live-captured), and this title never
 calls `sceAudioOut2GetSpeakerInfo`, so nothing in the guest's own setup names the order.
 
+**The wide-bed fold has NOT yet been shown to generalise past Dragon Quest VII — one first-party
+cross-check came back negative.** *Astro Bot* (`PPSA21564`) was the obvious candidate: a Sony
+first-party title, and audible, so if it depended on #1700 that would be the first evidence the fix
+matters beyond the title it was found on. `PROSPER_AUDIO_FLOW=1` over a routed boot says it does
+not. Astro creates one context with 23 ports, exactly one of them MAIN, and that port is
+`data_format=0x800` — **8** channels, not 12. The pre-#1700 gate rejected `channels > 8`, so an
+8-channel bed was always accepted and **Astro Bot was already audible before `75e4417f`**. Its
+lifetime counters confirm nothing is being lost on the way: `skip-fmt=0 skip-not-main=0 no-pcm=0
+short=0`, port1 lifetime peak 0.27977 / rms 0.02749 with 63.6 M of 76.1 M samples non-zero, and the
+mixed bed reaching the host sink at peak 0.30449 / rms 0.0545. The 22 non-MAIN ports are `0x100`
+(1 ch) apart from one `0x200` and one `0x800`, and are correctly not mixed. So the 12-channel
+container remains a Dragon Quest VII observation; do not assume the next silent title has one, and
+read its `data_format` before designing for it.
+
 **A sustained left/right level imbalance in the output is CONTENT, not the fold — measured, so it
 does not have to be re-investigated.** Dragon Quest VII's mixed bed runs about 38 % louder on the
 right across a whole capture, which is large enough for a music bed to look like an unequal gain or
