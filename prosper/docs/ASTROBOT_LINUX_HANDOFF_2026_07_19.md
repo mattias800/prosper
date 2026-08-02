@@ -597,11 +597,18 @@ than re-deriving a dead answer at full cost.
 - **"The count is something prosper derives or inflates."** False. `0x500571000` is an *indirect*
   dispatch; `resolve_indirect_dispatch_arguments` reads the value verbatim from guest memory at
   `0x5074063c0` (an address stable across runs), and that memory already holds the growing series.
-- **"A CP-DMA / WRITE_DATA writes the count."** False. `PROSPER_DMA_WATCH_DST=0x5074063c0` over a
-  routed run reports **zero** hits. `PROSPER_PROVENANCE_ADDR=0x5074063c0:12` names the sole writer:
-  compute program `0x5006eac00`, every write `compute-buffer`, nothing else.
+- **"A CP-DMA / WRITE_DATA writes the count."** False. `PROSPER_DMA_WATCH_DST=0x5074063c0` (on master)
+  over a routed run reports **zero** hits. The sole writer is compute program `0x5006eac00` — every
+  write `compute-buffer`, nothing else — established with `PROSPER_PROVENANCE_ADDR`, which is **added
+  in PR #1752 and is not on master**; until that lands, reproduce this with that branch.
 - **"#1743's 87,551 failing dispatches are 87,551 independent failures."** False. They are one
   `VK_ERROR_DEVICE_LOST` and its casualties: for `0x5006eac00`, 329 successes at submits 1..2341 and
   249 failures at 2349..4333, with **zero successes after the first failure**. The device is lost once
-  and never recovers. `CONFIDENCE: MED` that #1742's ~1.5 s / 192 M-invocation dispatch is what trips
-  the watchdog; falsifiable with `PROSPER_MAX_DISPATCH_GROUPS=N`.
+  and never recovers. Reproduce the failure reason on master with
+  `PROSPER_COMPUTELOG_CODE=0x5006eac00`, which un-gags the `if (trace)` failure paths.
+- **"The device loss has some cause other than the dispatch size."** False, and this is what makes
+  #1742 upstream of #1743. Capping the workgroup count prevents it outright: unclamped, the device is
+  lost at ~submit 2345 after 329 successes; with the cap the same route reaches submit 3373 with
+  **458 successes and zero device losses**. The cap is `PROSPER_MAX_DISPATCH_GROUPS=N`, also **added in
+  PR #1752 and not on master** — it is a diagnostic that computes wrong results and must never be used
+  as a fix.

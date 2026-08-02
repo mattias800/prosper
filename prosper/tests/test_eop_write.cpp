@@ -375,6 +375,39 @@ int main() {
               "a GDS source is rejected, not written as immediate data");
     }
 
+    // The alignment guards were both deletable with every case green. The byte-count one matters:
+    // without it a 6-byte fill writes 4 and silently drops a 2-byte tail — the same truncation this
+    // change argues against elsewhere. A partial span must be REJECTED, not written short.
+    {
+        uint8_t* gds = compute_gds_backing();
+        const uint32_t offset = 0x80;
+        memset(gds + offset, 0x22, 8);
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = offset; dma[2] = 0;
+        dma[3] = 0;      dma[4] = 0;
+        dma[5] = 6;                      // not a whole number of dwords
+        dma[6] = 1;
+        GpuState st; run_cb(dma, 7, st);
+        CHECK(gds[offset] == 0x22 && gds[offset + 4] == 0x22,
+              "a GDS fill whose byte count is not dword-aligned is rejected, not truncated");
+    }
+
+    // A misaligned GDS offset is equally a decode error: the share is addressed in dwords.
+    {
+        uint8_t* gds = compute_gds_backing();
+        const uint32_t offset = 0x92;    // not dword-aligned
+        memset(gds + offset, 0x33, 4);
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = offset; dma[2] = 0;
+        dma[3] = 0;      dma[4] = 0;
+        dma[5] = 4;
+        dma[6] = 1;
+        GpuState st; run_cb(dma, 7, st);
+        CHECK(gds[offset] == 0x33, "a misaligned GDS offset is rejected");
+    }
+
     // The replication loop is only ever exercised at 4 bytes by the title, so cover a multi-dword
     // non-zero fill here: every dword must carry the value and the span must stop exactly.
     {
