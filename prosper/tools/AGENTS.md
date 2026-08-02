@@ -69,7 +69,7 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   windows before making an expensive realized `.prgcap`. Timeline files are gitignored and local-only.
 - **`colorstate/colorstate_report.py`** — reduce a `PROSPER_COLORSTATETRACE` log to a verdict on the
   "why is it black?" question: do draws reach the **scanout** (vs offscreen only), and are their colour
-  writes enabled or suppressed by `CB_COLOR_CONTROL.MODE=DISABLE` / a zero target/shader mask? Prints a
+  writes enabled or suppressed by a zero target/shader mask (since #1724, `MODE` does not gate them)? Prints a
   per-guest-minute suppressed-percentage series. **Always compare a known-good phase against the bad one** —
   on Plucky the suppressed fraction is *higher* while the world renders correctly (88-95%) than while the
   screen is black (83%), because `CB_DISABLE` is the depth/shadow prepass. Reading one phase alone yields a

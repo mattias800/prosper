@@ -770,8 +770,10 @@ int main() {
                   disabled_ps.color_targets[0].write_mask == 0xFu &&
                   disabled_ps.color_targets[1].write_mask == 0xFu,
               "CB MODE=DISABLE does not override an explicitly programmed write-all mask");
-        CHECK(disabled_ps.depth_write_enable && has_depth_stencil_side_effect(disabled_ps),
-              "a MODE=DISABLE draw still carries its depth/stencil side effect");
+        // (No DS assertion here: depth_write_enable is set directly on this state and nothing in
+        // the MODE path could clear it, so it would pass in both arms. The load-bearing DS contract
+        // is the zero-target-mask prepass above, which is the state a real colour-disabled pass
+        // programs.)
 
         RenderState normal = absent;
         normal.has_cb_color_control = true;
@@ -866,14 +868,28 @@ int main() {
                   unmodeled_cb_color_mode_count(7u) == 8u,
               "the power-of-two schedule is per-mode, not shared across modes");
 
-        // The three modeled modes must never reach the report — a false positive here would make a
-        // per-title census unusable, since NORMAL and DISABLE are the overwhelming majority.
+        // The modeled modes must never reach the report — a false positive here would make a
+        // per-title census unusable, since NORMAL is the overwhelming majority.
+        //
+        // #1724 moved DISABLE OUT of this set. prosper no longer models it as anything, so it is now
+        // an unmodeled color-block operation and must be counted like one; the assertion below is
+        // what keeps #1708's instrument honest in the branch #1706 needs measured.
         const uint64_t before0 = unmodeled_cb_color_mode_count(0u);
         const uint64_t before1 = unmodeled_cb_color_mode_count(1u);
         const uint64_t before3 = unmodeled_cb_color_mode_count(3u);
         const uint64_t before6 = unmodeled_cb_color_mode_count(6u);
+        const std::string disable_diagnostics = capture_stderr([&] {
+            RenderState disabled_mode = absent;
+            disabled_mode.has_cb_color_control = true;
+            disabled_mode.cb_color_control =
+                P::CB_COLOR_CONTROL_MODE_DISABLE << P::CB_COLOR_CONTROL_MODE_SHIFT;
+            (void)resolve_pipeline_state(disabled_mode);
+        });
+        CHECK(unmodeled_cb_color_mode_count(0u) == before0 + 1u,
+              "#1724: DISABLE is counted as an unmodeled color-block operation");
+        (void)disable_diagnostics;
         const std::string modeled_diagnostics = capture_stderr([&] {
-            for (uint32_t mode : {P::CB_COLOR_CONTROL_MODE_DISABLE, P::CB_COLOR_CONTROL_MODE_NORMAL,
+            for (uint32_t mode : {P::CB_COLOR_CONTROL_MODE_NORMAL,
                                   P::CB_COLOR_CONTROL_MODE_RESOLVE,
                                   P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS}) {
                 RenderState modeled = absent;
@@ -889,11 +905,10 @@ int main() {
         // because the deltas beside it do not depend on any text; do not let the string clause stand
         // alone if this CHECK is ever split.
         CHECK(modeled_diagnostics.find("CB_COLOR_CONTROL.MODE=") == std::string::npos &&
-                  unmodeled_cb_color_mode_count(0u) == before0 &&
                   unmodeled_cb_color_mode_count(1u) == before1 &&
                   unmodeled_cb_color_mode_count(3u) == before3 &&
                   unmodeled_cb_color_mode_count(6u) == before6,
-              "DISABLE, NORMAL, RESOLVE and DCC_DECOMPRESS are never reported or counted");
+              "NORMAL, RESOLVE and DCC_DECOMPRESS are never reported or counted");
 
         // MODE=RESOLVE(3) is a modeled hardware MSAA resolve: resolve_pipeline_state flags cb_resolve so
         // the live backend copies color0->color1, and it is NOT warned as unmodeled. Would fail before the

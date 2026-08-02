@@ -35,9 +35,8 @@ suppressed-percentage series.
 known good against the phase under investigation, using screenshots to label them.
 
 The Plucky Squire is the cautionary case. When its screen goes black, scanout draws
-flip to 83% `mode=0` — which looks exactly like explanation 3 and is the same shape
-that explains Astro Bot's black world map. It is not the cause. While the world is
-*visibly rendering*, the suppressed fraction is **higher still**:
+flip to 83% `mode=0`, which looks like a colour-suppression explanation. It is not the
+cause. While the world is *visibly rendering*, the `mode=0` fraction is **higher still**:
 
 ```
 16:08  total=  15072  suppressed=  7.3%   <- menu, renders correctly
@@ -49,6 +48,12 @@ that explains Astro Bot's black world map. It is not the cause. While the world 
 
 `CB_DISABLE` here is the engine's depth and shadow prepass, which scales with scene
 geometry. Reading only the black phase would have produced a confident wrong answer.
+
+**Since #1724, `mode` alone is not a suppression signal at all** — the renderer derives the
+colour write mask from `CB_TARGET_MASK & CB_SHADER_MASK` and ignores `MODE`. Read the
+`effective` column, not `mode`. The two genuinely disagree in the field: of 268,899 traced
+Plucky Squire draws, 36,613 are `mode=0`, and **8,326 of those carry a non-zero mask** —
+so a `mode`-keyed count would have called 8,326 writing draws suppressed.
 
 ## Caveats
 

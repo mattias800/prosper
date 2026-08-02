@@ -101,7 +101,10 @@ def report(records, scanout_prefix, top, out=sys.stdout):
         eff = effective_mask(rec)
         cwms = {t["cwm"] for t in rec["targets"]
                 if t["addr"].startswith(scanout_prefix)}
-        writes_colour = rec["mode"] != 0 and eff != 0 and any(cwms)
+        # #1724: MODE does NOT gate colour writes. The renderer derives the write mask from
+        # CB_TARGET_MASK & CB_SHADER_MASK alone, so a mode=0 draw with a non-zero mask DOES write.
+        # Keying this on mode would make the tool contradict the renderer it exists to triage.
+        writes_colour = eff != 0 and any(cwms)
         combos[(rec["mode"], eff, tuple(sorted(cwms)))] += 1
         per_minute[rec["ts"] or "??:??"][rec["mode"]] += 1
         for t in rec["targets"]:
@@ -123,10 +126,10 @@ def report(records, scanout_prefix, top, out=sys.stdout):
         name = MODE_NAMES.get(mode, "UNKNOWN")
         cwm = ",".join(f"{c:x}" for c in cwms)
         note = ""
-        if mode == 0 or eff == 0 or not any(cwms):
-            note = "   [colour writes suppressed]"
+        if eff == 0 or not any(cwms):
+            note = "   [colour writes suppressed by the guest's mask]"
         elif mode not in (1, 3, 6):
-            note = "   [mode not implemented -- runs as an ordinary draw]"
+            note = "   [mode not modelled -- runs as an ordinary colour draw]"
         print(f"  mode={mode} ({name:15s}) effective={eff:02x} cwm={cwm:<6s} "
               f"draws={n}{note}", file=out)
     print("\nscanout draws per guest-clock minute (compare a good phase against a "

@@ -134,11 +134,12 @@ int main() {
         const std::vector<uint8_t> consumed = prosper::test::render_draws_rgba({w, r}, W, H);
         const uint8_t* cc = center(consumed);
         CHECK(cc && cc[1] > 0xC0 && cc[0] < 0x40 && cc[2] < 0x40,
-              "CB MODE=DISABLE draw still writes stencil consumed by a later color pass");
+              "a colour-disabled draw still writes stencil consumed by a later colour pass");
 
-        // #1724, at pixel level: MODE=DISABLE with an explicit write-all mask must RENDER. The two
-        // arms differ only in CB_TARGET_MASK, so a red centre here cannot come from anything else,
-        // and the zero-mask arm above is the control proving the harness can suppress at all.
+        // #1724, at pixel level: MODE=DISABLE with an explicit write-all mask must RENDER.
+        // The control above is what makes this non-vacuous: it renders the SAME red fragment through
+        // the SAME harness with CB_TARGET_MASK=0 and gets blue, proving the harness honours a zero
+        // write mask. So a red centre here can only come from the mask being kept.
         RenderState mode_disabled{};
         mode_disabled.prim_type = 4;
         mode_disabled.cb_target_mask = mode_disabled.cb_shader_mask = 0xFu;

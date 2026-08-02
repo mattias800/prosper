@@ -49,17 +49,22 @@ int32_t scale_scissor_boundary(int32_t value, float scale, bool lower) {
 }
 
 // CB_COLOR_CONTROL.MODE selects what the color block DOES with a rasterized primitive, and only
-// NORMAL blends the bound pixel shader's color export into the target. prosper models three of the
-// other values as their own operation: DISABLE suppresses color writes, RESOLVE becomes cb_resolve,
-// and DCC_DECOMPRESS keeps the AGC helper-program handling in gpu_execute.hpp. Every REMAINING
-// value of the 3-bit field is reported here. ELIMINATE_FAST_CLEAR(2) is a color-block metadata
-// operation that hardware performs INSTEAD of shading and prosper still runs as an ordinary color
-// draw — that gap is #1588. Values 4, 5 and 7 are grouped with it because they are simply "not one
-// of the four prosper models", NOT because their operation is known: 4 and 5 are decompress modes
-// in the published enum, 7 is not defined there, and no title here exercises any of them.
+// NORMAL blends the bound pixel shader's color export into the target. prosper models two of the
+// other values as their own operation: RESOLVE becomes cb_resolve, and DCC_DECOMPRESS keeps the
+// AGC helper-program handling in gpu_execute.hpp. Every REMAINING value of the 3-bit field is
+// reported here. ELIMINATE_FAST_CLEAR(2) is a color-block metadata operation that hardware performs
+// INSTEAD of shading and prosper still runs as an ordinary color draw — that gap is #1588. Values
+// 4, 5 and 7 are grouped with it because they are simply "not one of the values prosper models",
+// NOT because their operation is known: 4 and 5 are decompress modes in the published enum, 7 is
+// not defined there, and no title here exercises any of them.
+//
+// #1724 added DISABLE to that reported population. prosper no longer models it as anything: it is
+// now an unmodeled color-block operation run as an ordinary draw, which is exactly what this
+// counter exists to size. Keeping it excluded would have made #1708's instrument silent in the one
+// branch #1706 needs measured. Live populations are large — 36,613 of 268,899 traced Plucky Squire
+// draws — so this is a per-mode aggregate, not a per-draw log.
 bool cb_mode_is_unmodeled_metadata_operation(uint32_t mode) {
-    return mode != P::CB_COLOR_CONTROL_MODE_DISABLE &&
-           mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
+    return mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
            mode != P::CB_COLOR_CONTROL_MODE_RESOLVE &&
            mode != P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS;
 }
@@ -860,6 +865,13 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     // COPY would suppress ordinary blending, while disabled COPY preserves the hardware's normal
     // blend-then-copy path. CB_BLENDn_CONTROL.DISABLE_ROP3 can opt an attachment out; Vulkan's logic
     // op is global, so a mixed two-target enable cannot be represented and falls back visibly to COPY.
+    //
+    // The MODE == NORMAL gate is deliberately NOT relaxed by #1724. That change stops MODE vetoing
+    // the WRITE MASK; it makes no claim that a non-NORMAL mode should acquire a logic op it does not
+    // have today. Astro's affected draws are unaffected either way (ROP3=0xCC is COPY, excluded
+    // here), so relaxing it would be an untested behavior change with no evidence behind it. A title
+    // that programs a non-COPY ROP3 alongside a non-NORMAL mode would silently lose the logic op:
+    // that gap is real, is not new, and is tracked rather than guessed at here.
     const uint32_t rop3 = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, ROP3);
     uint32_t logic_op = 3;
     if (cb_mode == P::CB_COLOR_CONTROL_MODE_NORMAL && vk_logic_op(rop3, logic_op) && logic_op != 3u) {
