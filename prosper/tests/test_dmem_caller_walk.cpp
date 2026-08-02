@@ -29,16 +29,43 @@ static void check(bool ok, const char* name) {
     if (!ok) failures++;
 }
 
-int main() {
-    constexpr int kScan = 160;   // the walk's own scan width
+constexpr int kScan = 160;   // the walk's own scan width
 
-    // 1. A frame deep in the real thread stack must permit the FULL scan. This is what proves the
-    //    platform stack-bounds query returned a usable top: if it ever fails to identify the stack,
-    //    the helper falls back to the end of the current page and this count drops below 160.
+// A frame in main() is NOT deep: argv, env and auxv sit above it, so it lands roughly 1 KB below
+// the top of the stack and ASLR varies that gap run to run. Measuring there asserted headroom the
+// platform does not guarantee and flaked 2 runs in 10, reporting e.g. "got 149 of 160" — the clamp
+// was right and the assertion was wrong. Recurse a few padded frames so the measuring frame is
+// unambiguously deep. noinline + volatile keep the frames from being merged away.
+__attribute__((noinline))
+static int deep_scan(int depth, int want) {
+    volatile uint64_t pad[64];          // 512 B of frame, per level
+    pad[0] = (uint64_t)depth;
+    if (depth > 0) {
+        const int r = deep_scan(depth - 1, want);
+        pad[63] = (uint64_t)r;          // keep pad live across the call
+        return r;
+    }
     volatile uint64_t here = 0;
-    const int deep = prosper::dmem_caller_scan_slots_for_test(&here, kScan);
+    return prosper::dmem_caller_scan_slots_for_test(&here, want);
+}
+
+int main() {
+    // 1. A frame deep in the real thread stack permits the caller's full scan width.
+    const int deep = deep_scan(32, kScan);     // ~16 KB below main's frame
     check(deep == kScan, "deep thread-stack frame permits the full 160-slot scan");
     if (deep != kScan) printf("       got %d of %d slots\n", deep, kScan);
+
+    // 1b. The above does NOT by itself prove the platform stack-bounds query ran: the page
+    //     fallback also clears 160 slots (1,280 B) whenever the frame happens to sit early in its
+    //     page, which is most of the time. Asking for MORE THAN A PAGE separates them for certain —
+    //     the fallback tops out at 512 slots (4,096 / 8) and can never satisfy 1,024, while a real
+    //     stack top tens of KB above trivially can. Without this, losing the query is a coin flip
+    //     the suite would pass roughly two runs in three.
+    constexpr int kOverPage = 1024;            // 8 KB > any 4 KB page fallback
+    const int wide = deep_scan(32, kOverPage);
+    check(wide == kOverPage, "a scan wider than a page proves the stack-bounds query ran");
+    if (wide != kOverPage) printf("       got %d of %d slots (<=512 means the page fallback)\n",
+                                  wide, kOverPage);
 
     // 2. A frame 4 slots below a PROT_NONE page must clamp to those 4 rather than read the guard.
     const long pg = sysconf(_SC_PAGESIZE);
