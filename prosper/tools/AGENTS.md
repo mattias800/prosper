@@ -74,18 +74,23 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   - **Does the guest still own this block when we write to it?** **`PROSPER_INIT_TRIP=1`** reports,
     for every 4-byte immediate-zero `DMA_DATA` init to a consumed-marker fence label, whether the
     destination currently holds pointer-shaped content (`overptr`) and whether it is reachable from
-    the guest allocator's own idx=1 free chains (`member`), with running totals:
+    the guest allocator's own idx=1 free chains (`member`). Detail and totals are separate lines:
     ```text
-    [agc] INIT-TRIP-SELFTEST #512 pools=25 probes=9 positives=9 first_head=0x2020f44c60
-    [agc] INIT-TRIP #512 dst=0x… pre=0x… overptr=1 member=0(list=0 …) | totals n=512 overptr=465 member=0 both=0
+    [agc] INIT-TRIP-SELFTEST #512 pools=25 probes=9 positives=9 deep=8 deep_positives=8 first_head=0x…
+    [agc] INIT-TRIP #512 dst=0x… pre=0x… overptr=1 aligned=1 member=0(list=0 pool=0x0 hops=0) t=…ms
+    [agc] INIT-TRIP-TOTALS n=1024 overptr=926 member=10 both=1 t=…ms
     ```
     `overptr` alone decides nothing — a label the guest legitimately *popped* from its pool free list
     still carries the stale link, so the content is identical either way. `member` is the
-    discriminator. **Read `INIT-TRIP-TOTALS`, never a detail line**: the detail schedule is sparse
-    and front-loaded, and on ArcRunner the `member` population appears only after ordinal ~512, so
-    every early sample reads `member=0` while the run total is not. Totals print every 256 for
-    exactly that reason. `aligned=0` marks a destination membership could never match anyway
-    (`plausible_node` wants a 0x20-aligned block base), so it is a structural zero, not a finding.
+    discriminator.
+
+    **Read `INIT-TRIP-TOTALS`, never a detail line**, and note that the sample above shows why: the
+    detail line at #512 reads `member=0` while the run total is `member=10`. The detail schedule is
+    sparse and front-loaded, and on this title the `member` population does not appear until after
+    ordinal ~512, so every early sample reads zero. Quoting one of them is exactly how #1767's first
+    draft reached a conclusion its own totals contradict. Totals print every 256 for that reason.
+    `aligned=0` marks a destination membership could never match anyway (`plausible_node` wants a
+    0x20-aligned block base), so it is a structural zero rather than a finding.
 
     **The `SELFTEST` line is not optional decoration**: a learned bin *head* is by
     construction the first node of its own chain, so a walk that answers "no" to a head is blind
