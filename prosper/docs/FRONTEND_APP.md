@@ -345,6 +345,31 @@ Compute phase/image timing can likewise be restricted to one exact program addre
 so use it for a representative long-running dispatch A/B rather than flooding every compute program's
 per-image records.
 
+#### Reading the compute side at run scale
+
+`PROSPER_COMPUTE_PHASE_TIMING=1` emits one `[compute-phase]` line per dispatch and
+`PROSPER_COMPUTE_IMAGE_TIMING=1` one `[compute-image]` line per image binding. A routed title produces
+tens of thousands of each, so pipe the run log through **`tools/perf/compute_phase_report.py`**, which
+rolls both record types into one table: ms, share of total, and mean per dispatch, nested so each
+sub-timer sits under the phase whose interval contains it, plus the programs that cost the most and the
+dominant leaf inside each. `--program 0xADDR` restricts to one kernel and `--csv` emits the table for
+further processing. `--since-submit N` skips boot/warmup, but **it suppresses the image section**:
+`[compute-image]` records carry no submit ordinal, so they cannot be filtered to match, and showing
+them would divide a whole-log numerator by a filtered denominator. Drop the flag for the image
+decomposition.
+
+Counts from this tool cover **backend-executed dispatches only** — CPU-fast-path fills return before
+`execute_item` and emit no record, nearly a quarter of Astro Bot's dispatches. Add
+`[render-timing] compute_cpu_fast fills=N` to the denominator before quoting any rate.
+
+**Run both switches together whenever `setup` is the dominant phase.** `setup_ms` spans the whole
+image-binding loop as well as descriptor validation and buffer binding, and that loop has *no* sub-timer
+on the `[compute-phase]` line — so on an image-heavy title `[compute-phase]` alone reports a large
+`setup` whose named children explain almost none of it. The report prints that gap as an explicit
+`unattributed` row under every parent rather than dropping it, and `[compute-image]` is what decomposes
+this particular one. Overhead of both switches together, measured on Astro Bot at five matched dispatch
+ordinals, is 1.5-1.9 %.
+
 Ordered graphics/compute submits retain a bounded journal of exact guest-memory ranges written by the
 compute backend. A persistent texture validated in an earlier graphics span can therefore skip its repeated
 full-byte scan when no later write overlaps it. Across submits, exact byte comparison is the initial

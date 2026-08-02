@@ -124,6 +124,25 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   `--thread REGEX` isolates one thread, `--mode folded` emits flamegraph stacks. Complements
   `guest_bt` (which does the GUEST/managed-C# side). `--self-test` checks the symbol parser.
   See `hostprof/README.md`.
+- **`perf/compute_phase_report.py`** — roll up the **compute** side of a run, the way
+  `PROSPER_RENDER_TIMING` already rolls up graphics. `PROSPER_COMPUTE_PHASE_TIMING=1` and
+  `PROSPER_COMPUTE_IMAGE_TIMING=1` emit a 17-timer decomposition *per dispatch*, which is unreadable
+  at run scale; this aggregates both record types offline into ms / share / mean-per-dispatch, nested
+  so each sub-timer sits under the phase containing it, plus the costliest programs and each one's
+  dominant leaf. **Run both switches together** — `setup_ms` spans the image-binding loop, which has
+  no sub-timer of its own, so phase timing alone reports a large `setup` its named children do not
+  explain. It prints an `unattributed` row under every parent, excludes failed dispatches (their
+  sub-timers are meaningless, see trap 47 in `docs/GAME_COMPAT_ORCHESTRATION.md`), and warns if its
+  model of `execute_item` stops matching the emitter. Counts here cover backend-executed dispatches
+  only — CPU-fast-path fills emit no record, so add
+  `[render-timing] compute_cpu_fast fills=N` before quoting a rate.
+  `test_compute_phase_report.py` self-tests it (ctest `compute_phase_report_logic`), and
+  `mutate_compute_phase_report.sh` checks that suite at **per-check granularity** — each mutation must
+  be killed by the check written for it, because a survivor masked by red siblings is invisible when
+  you only watch the suite's colour (trap 48). It mutates a scratch copy, never the tracked file.
+  First result: `docs/RENDERER_PERFORMANCE_2026_07.md` § Astro Bot compute decomposition.
+- **`perf/ab_compute.sh`** — A/B one `PROSPER_*` switch against a routed live run, refusing to
+  measure while another `prosper-app` holds the GPU and stamping commit/route/reps onto the result.
 
 Verification here is agentic-first (see `docs/VERIFICATION.md`): prefer a
 programmatic check (ctest exit code, `spirv-val`, a snapshot hash) over eyeballing.

@@ -104,6 +104,15 @@ if(Python3_Interpreter_FOUND)
   # report a clean suite forever, which is the one way this guard can fail silently.
   add_test(NAME vkval_scan_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/vkval/test_vk_validation_scan.py")
+  # Most cases here assert on what must NOT appear (negative time, failed dispatches summed in, an
+  # image share computed against a filtered denominator, a per-binding mean over aliased folds),
+  # because each is a table this tool has already produced once. Note what this gate does NOT do: it
+  # feeds the tool SYNTHETIC records, so it pins the tool against its own model and can never notice
+  # that model drifting from live_compute.cpp. Only the tool's runtime broken_sum/broken_nest warning
+  # detects real drift, and only when someone reads stderr.
+  add_test(NAME compute_phase_report_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_phase_report.py")
 endif()
 # Path to the (gitignored) local game dump; override with -DGAME_DUMP=...
 set(GAME_DUMP "${CMAKE_SOURCE_DIR}/../PPSA24651-app0" CACHE PATH "Local PS5 game dump root")
