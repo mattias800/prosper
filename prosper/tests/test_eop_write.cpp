@@ -508,11 +508,16 @@ int main() {
     // matters because ArcRunner's whole init/fence conclusion rests on `member=0` readings, and an
     // unarmed walk produces exactly the same zero.
     {
-        char self[192] = {};
-        const int positives = mb3_freelist_selftest(self, sizeof self);
-        CHECK(positives == 2 && strstr(self, "probes=2") && strstr(self, "positives=2"),
+        char self[256] = {};
+        const int deep_positives = mb3_freelist_selftest(self, sizeof self);
+        CHECK(strstr(self, "probes=2") && strstr(self, "positives=2"),
               "MB3 self-test finds every learned bin head in its own chain");
-        CHECK(!strstr(self, "BLIND") && !strstr(self, "NO HEADS"),
+        // The primary chain is head -> free_tail, so exactly one interior node is reachable; the
+        // secondary head has no successor. A head matches at hop 0, so without this the control
+        // would pass on a walk that cannot traverse at all.
+        CHECK(deep_positives == 1 && strstr(self, "deep=1") && strstr(self, "deep_positives=1"),
+              "MB3 self-test reaches an interior node, not just the head");
+        CHECK(!strstr(self, "BLIND") && !strstr(self, "NO HEADS") && !strstr(self, "SHALLOW"),
               "MB3 self-test reports no blindness while the walk is working");
         mb3_reset_pool_candidates_for_test();
         char empty[192] = {};

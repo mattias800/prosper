@@ -84,8 +84,11 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     discriminator. **The `SELFTEST` line is not optional decoration**: a learned bin *head* is by
     construction the first node of its own chain, so a walk that answers "no" to a head is blind
     rather than truthful, and `positives < probes` (or `probes=0`) means every `member=0` beside it
-    is an unarmed instrument, not evidence. `mb3_freelist_selftest()` is available to any caller that
-    wants to qualify a membership null the same way.
+    is an unarmed instrument, not evidence. A head matches at hop 0, though, which proves only that
+    the walk is *armed* — so the probe also follows each head's successor (`deep`/`deep_positives`),
+    an interior node reachable only by traversing a link. The three failure modes are named in the
+    line itself: `NO HEADS`, `BLIND`, `SHALLOW`. `mb3_freelist_selftest()` is available to any caller
+    that wants to qualify a membership null the same way.
     **`PROSPER_INIT_SUPPRESS=ptr|member`** is the matching A/B arm, not a candidate fix: `ptr`
     suppresses on content, which #1245 proved cannot separate a live label from a freed block, so it
     will also drop legitimate inits. It exists so "is this write load-bearing for the corruption?"
