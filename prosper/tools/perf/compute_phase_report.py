@@ -294,17 +294,17 @@ def main():
     # PROSPER_COMPUTE_IMAGE_TIMING; say so explicitly when it did not, because a missing section
     # here reads far too easily as "there was nothing there".
     print()
-    if images:
-        # An aliased binding is emitted with only `ms` -- no sub-timers and no byte counts -- because
-        # it folded into an earlier binding and did no work. Counting those in `len(images)` divides
-        # every ms/binding by the wrong denominator (they are 64 % of Astro Bot's records) and dumps
-        # their whole `ms` into `unattributed`. Report them, do not average over them.
-        aliases = [i for i in images if i.get("alias", 0.0)]
-        images = [i for i in images if not i.get("alias", 0.0)]
-        if not images:
-            print(f"  setup image bindings: all {len(aliases)} records are aliased folds "
-                  f"(no work, no sub-timers); nothing to decompose.")
-            return 0
+    # An aliased binding is emitted with only `ms` -- no sub-timers and no byte counts -- because it
+    # folded into an earlier binding and did no work. Counting those in `len(images)` divides every
+    # ms/binding by the wrong denominator (they are 64 % of Astro Bot's records) and dumps their whole
+    # `ms` into `unattributed`. Report them, do not average over them. Note this section must never
+    # `return`: the top-programs table below is independent of it, and an all-alias log is ordinary.
+    aliases = [i for i in images if i.get("alias", 0.0)]
+    images = [i for i in images if not i.get("alias", 0.0)]
+    if not images and aliases:
+        print(f"  setup image bindings: all {len(aliases)} records are aliased folds "
+              f"(no work, no sub-timers); nothing to decompose.")
+    elif images:
         image_total = sum(i["ms"] for i in images)
         # `[compute-image]` carries no ok flag, so these records span FAILED dispatches as well --
         # a dispatch that fails has usually already bound its images. Denominating them against the

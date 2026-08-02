@@ -1605,8 +1605,9 @@ records. 18,933 **succeeded** dispatches, 1,581 guest submits, 421.8 s:
 figure is setup's `unattributed` row, i.e. the image-binding loop, on the same base. Do not compare it
 against the tool's `setup image bindings` line: `[compute-image]` records carry no ok flag, so that
 line covers **all** dispatches (388,600 ms, 50.2 % of the 774,834 ms every dispatch consumed including
-the failures below) and is a strictly larger population. Mixing the two makes the child look 1.8x its
-parent — exactly what trap 47 in `GAME_COMPAT_ORCHESTRATION.md` says an aggregator must never allow.
+the failures below) and is a strictly larger population. Mixing the two makes the child look **5.3x**
+its parent (388,600 / 73,287) — exactly what trap 47 in `GAME_COMPAT_ORCHESTRATION.md` says an
+aggregator must never allow.
 
 Three instrumentation properties that generalise past this title, each of which produced a wrong table
 before it was handled:
@@ -1646,22 +1647,30 @@ from is **not yet located**, and it may be a guest-side count we are reading at 
 than a derivation defect. What is certain is the shape: this program cost 235 ms, then 562, 982,
 1,492 ms across one run, and the title becomes monotonically slower the longer it runs.
 
-**Every aggregate for this program is a function of route duration**, precisely because its cost grows;
-the 317,271 ms above is from the 853 s decomposition run, and the 123,762 ms quoted below is from the
-shorter 500 s window of the same route. Name the run whenever quoting either.
+**Every aggregate for this program is a function of route duration**, precisely because its cost grows.
+Every figure in this section comes from the one 852.95 s decomposition run described above; an earlier
+partial read of the same log, at 13,195 dispatches, gave 123,762 ms for the same program. Name the run
+and the point in it whenever quoting an absolute cost here.
 
 ### Ruled out
 
-- **"The dominant dispatch cost is image upload volume."** False. In the 500 s window, `0x500571000`
-  spent 123,762 ms of dispatch time for 107.19 GiB staged (0.87 GiB/s) while `0x50059cd00`,
-  `0x5005cc100` and `0x5005fdb00` staged 107-112 GiB each in 1,573-1,583 ms (67-71 GiB/s). Three
-  sibling programs move the same volume 80x faster, so the per-dispatch image round-trip — a real and
-  large cost elsewhere in the same decomposition — does not explain the dominant term. Ranking phases
-  by size selects uploads; asking what predicts the *outlier* rejects them (#1732). Caveat on the exact
-  ratio, not on the conclusion: the staged bytes come from `[compute-image]` (all dispatches of that
-  program) while the ms come from the succeeded-only phase table, so if these four programs fail at
-  different rates the 80x is distorted — it would survive a 5x correction with an order of magnitude
-  to spare.
+- **"The dominant dispatch cost is image upload volume."** False, and one matched pair settles it.
+  Over the full 853 s run, counting only succeeded dispatches and non-alias bindings:
+
+  | program | dispatches | dispatch_ms | staged | GiB/s |
+  |---|---:|---:|---:|---:|
+  | `0x500571000` | 323 | **295,879** | 160.40 GiB | **0.54** |
+  | `0x50059cd00` | 322 | 2,364 | 160.40 GiB | 67.84 |
+  | `0x5005cc100` | 322 | 2,354 | 166.60 GiB | 70.79 |
+  | `0x5005fdb00` | 322 | 2,347 | 166.60 GiB | 70.98 |
+
+  `0x500571000` and `0x50059cd00` stage the **identical 160.40 GiB** across the same number of
+  dispatches, and one takes **125x** longer. The per-dispatch image round-trip is a real and large
+  cost elsewhere in this decomposition, but it does not explain the dominant term. The two columns are
+  drawn from different record types, so the populations were checked rather than assumed: these four
+  programs fail **once in 1,290 dispatches**, so their `[compute-phase]` and `[compute-image]` records
+  cover the same work. Ranking phases by size selects uploads; asking what predicts the *outlier*
+  rejects them (#1732).
 - **"The geometry is fine, the 128,005-word SPIR-V module is the problem."** False, and the way it was
   nearly believed is the lesson: the first three traced dispatches genuinely read `groups=1x1x1`,
   because the growth only begins at dispatch 23. **Three samples of a monotonic series are not a sample
@@ -1674,8 +1683,9 @@ shorter 500 s window of the same route. Name the run whenever quoting either.
 **353 s, 46 % of all compute wall time, on work that is then discarded**. Mind the denominator:
 106,484 dispatches reach `execute_item` and emit a `[compute-phase]` record, so the failure rate
 *there* is 82 %, but a further **32,667 take the CPU fast path and return before `execute_item`**,
-emitting no record. Against every dispatch the backend saw (139,151, which matches
-`[render-timing] compute calls=139,150` exactly) the rate is **62.9 %**. Read
+emitting no record. Against every dispatch the backend saw (106,484 + 32,667 = 139,151, consistent with
+`[render-timing] compute calls=139,150`, which is printed only every 25 calls) the rate is
+**62.9 %**. Read
 `[render-timing] compute_cpu_fast fills=N` before quoting any rate from `[compute-phase]` counts.
 
 At default verbosity the failures emit **nothing**: every failure path inside the dispatch body of

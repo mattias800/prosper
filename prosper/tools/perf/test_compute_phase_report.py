@@ -92,18 +92,47 @@ def main():
            + phase(submit=500, dispatch_ms=1) + image(ms=1))
     code, out, err = run(log, "--since-submit", "400")
     check("image section suppressed under --since-submit", "SUPPRESSED" in out, out)
-    check("no impossible image share printed", "%" not in out.split("SUPPRESSED")[1][:200]
-          or "of ALL dispatch wall" not in out, out)
+    # Assert the *number* cannot appear, not a phrasing. The earlier form here was vacuous: its second
+    # disjunct was implied by suppression working, so it was True whenever the feature worked AND
+    # crashed with IndexError when it did not -- a check that could not fail, inside the PR that adds
+    # trap 47. Mutation-checked: deleting the suppression makes this line fail, not error.
+    check("no image share survives the filter", "of ALL dispatch wall" not in out, out)
     code, out, err = run(log)
     check("image section shown without the filter", "of ALL dispatch wall" in out, out)
 
-    # Aliased bindings did no work and carry no sub-timers; averaging over them divides ms/binding
-    # by the wrong denominator (they are 64% of Astro Bot's image records).
+    # Aliased bindings did no work and carry no sub-timers; averaging over them divides ms/binding by
+    # the wrong denominator (they are 64% of Astro Bot's image records). Assert the ARITHMETIC, not
+    # the label: with one real 9 ms binding and 99 aliases, prepare upload is 9.000 ms/binding if they
+    # are excluded and 0.090 if they are not. A refactor that keeps the wording and restores the wrong
+    # denominator must fail here.
     log = phase(setup_ms=10, dispatch_ms=1) + image(ms=9, prepare_ms=9) + "".join(
         image(alias=True, ms=0.001) for _ in range(99))
     code, out, err = run(log)
     check("aliases excluded from binding count", "1 real bindings" in out, out)
     check("aliases still reported", "99 further records were aliased folds" in out, out)
+    prepare = next((l for l in out.splitlines() if "prepare upload" in l), "")
+    check("ms/binding uses the real-binding denominator",
+          prepare.split()[-1] == "9.000", prepare)
+    unattributed = next((l for l in out.splitlines()
+                         if "unattributed" in l and "%" in l and "0.00" not in l.split()[-1]), None)
+    check("alias ms does not land in image unattributed", unattributed is None, unattributed)
+
+    # An all-alias log is ordinary input (e.g. --program on a kernel whose bindings all fold). The
+    # image section must say so and STILL print the top-programs table below it -- an early return
+    # here silently truncated the report.
+    code, out, err = run(phase(dispatch_ms=1) + image(alias=True, ms=0.5))
+    check("all-alias log reports the folds", "all 1 records are aliased folds" in out, out)
+    check("all-alias log still prints top programs", "top 1 programs by total cost" in out, out)
+
+    # `unattributed` is thresholded against its own PARENT, not the grand total: a small parent must
+    # not lose its remainder just because the run is large. Here writeback_images_ms is 4 ms of a
+    # 1004 ms run (0.4 % of grand, so the old grand-relative rule dropped it) while its own children
+    # explain none of it. Mutation-checked: restoring the grand-relative rule makes this line fail.
+    log = phase(dispatch_ms=1000, writeback_ms=4, writeback_images_ms=4)
+    code, out, err = run(log)
+    images_unattr = [l for l in out.splitlines()
+                     if "unattributed" in l and l.startswith("      ")]
+    check("small parent keeps its unattributed remainder", images_unattr, out)
 
     # The tool encodes a model of execute_item's phase structure; if that model stops matching, it
     # must say so rather than print a confident wrong table.
