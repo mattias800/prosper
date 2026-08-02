@@ -1,5 +1,6 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "command_processor.hpp"
+#include "diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
 #include "mb3_freelist.hpp"
 #include "pm4_registers.hpp"
 #include "writer_provenance.hpp"
@@ -264,7 +265,7 @@ void write_trap_report(const char* kind, uint64_t dst, uint64_t pre, uint32_t v,
     // the value actually under investigation ever gets a line — which would turn this instrument's
     // own recommended workflow into a silent false negative. And a bare cap makes "64 hits" or
     // "256 hits" read as a count: that is the #1226 trap this file exists to stop repeating.
-    if (ord <= 64 || (ord & (ord - 1)) == 0)
+    if (diag_should_print(ord))
         fprintf(stderr,
                 "[agc] WRITE-TRAP #%llu[val=0x%x] kind=%s dst=0x%llx+%u pre=0x%llx pkt=0x%llx t=%llums\n",
                 (unsigned long long)ord, v, kind, (unsigned long long)dst, byte_off,
@@ -724,7 +725,7 @@ static void forge_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t va
     // reports a population must never let its own limit masquerade as the measurement.
     static std::atomic<uint64_t> n{0};
     const uint64_t ord = n.fetch_add(1) + 1;
-    if (ord <= 64 || (ord & (ord - 1)) == 0) {
+    if (diag_should_print(ord)) {
         // #1226: report WHY the paired guard did or did not decline, in the same line. The guard is
         // `forge_guard() && label_is_consumed_marker(dst) && !live_pair`, and a bare hit count could
         // not distinguish "the label has no tracked init protocol at all" (cm=0 — every #312 guard is
@@ -863,7 +864,7 @@ static void init_trip(const Pm4Command& c, uint64_t pre, uint32_t v32) {
     // schedule front-loads its samples: a population that only appears late — which is exactly what
     // `member` does here — is absent from every early line, and quoting one of those as the run's
     // answer is the cap-as-count trap wearing a different hat.
-    const bool detail = ord <= 64 || (ord & (ord - 1)) == 0;
+    const bool detail = diag_should_print(ord);
     if (detail) {
         char self[256]; mb3_freelist_selftest(self, sizeof self);
         fprintf(stderr, "[agc] INIT-TRIP-SELFTEST #%llu %s\n", (unsigned long long)ord, self);
@@ -912,7 +913,7 @@ static bool init_suppress(const Pm4Command& c, uint64_t pre, uint32_t v32) {
     if (mode == 2 && !mb3_freelist_contains_stable(c.dd_dst)) return false;
     static std::atomic<uint64_t> n{0};
     const uint64_t ord = n.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (ord <= 64 || (ord & (ord - 1)) == 0)
+    if (diag_should_print(ord))
         fprintf(stderr, "[agc] INIT-SUPPRESS #%llu mode=%s dst=0x%llx pre=0x%llx t=%llums\n",
                 (unsigned long long)ord, mode == 1 ? "ptr" : "member",
                 (unsigned long long)c.dd_dst, (unsigned long long)pre,
@@ -973,11 +974,14 @@ static bool dma_build_pre_changed(const Pm4Command& c, uint64_t pre, uint64_t* b
     return true;
 }
 static void stale_dma_change_report(uint64_t addr, uint64_t build_pre, uint64_t pre, uint64_t pkt) {
-    static std::atomic<uint32_t> n{0};
-    if (n.fetch_add(1, std::memory_order_relaxed) < 256)
-        fprintf(stderr, "[agc] DMA-GENERATION-CHANGED-STALE-SUPPRESS [0x%llx] build-pre=0x%llx "
+    // #1761: same class as the tripwires above — a suppression reporter whose line count is read as
+    // "how many writes were suppressed". Ordinal on every line, sparse tail past the cap.
+    static std::atomic<uint64_t> n{0};
+    const uint64_t ord = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (diag_should_print(ord, 256))
+        fprintf(stderr, "[agc] DMA-GENERATION-CHANGED-STALE-SUPPRESS #%llu [0x%llx] build-pre=0x%llx "
                         "exec-pre=0x%llx pkt=0x%llx t=%llums\n",
-                (unsigned long long)addr, (unsigned long long)build_pre,
+                (unsigned long long)ord, (unsigned long long)addr, (unsigned long long)build_pre,
                 (unsigned long long)pre, (unsigned long long)pkt,
                 (unsigned long long)now_ms());
 }
@@ -1015,12 +1019,15 @@ static bool stale_release_generation(const Pm4Command& c, uint64_t pre) {
     uint64_t initialized = c.rel_build_pre & 0xffffffff00000000ull;
     uint64_t signaled = initialized | 1ull;
     if (pre == initialized || pre == signaled) return false;
-    static std::atomic<uint32_t> n{0};
-    if (n.fetch_add(1, std::memory_order_relaxed) < 256)
-        fprintf(stderr, "[agc] REL-GENERATION-CHANGED-STALE-SUPPRESS [0x%llx] "
+    // #1761: as above — the count of this line is read as the suppressed-write population.
+    static std::atomic<uint64_t> n{0};
+    const uint64_t ord = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (diag_should_print(ord, 256))
+        fprintf(stderr, "[agc] REL-GENERATION-CHANGED-STALE-SUPPRESS #%llu [0x%llx] "
                         "build-pre-hi=0x%08x expected-init=0x%llx exec-pre=0x%llx "
                         "pkt=0x%llx t=%llums\n",
-                (unsigned long long)c.rel_addr, (unsigned)(c.rel_build_pre >> 32),
+                (unsigned long long)ord, (unsigned long long)c.rel_addr,
+                (unsigned)(c.rel_build_pre >> 32),
                 (unsigned long long)initialized, (unsigned long long)pre,
                 (unsigned long long)pkt_addr(c), (unsigned long long)now_ms());
     label_hist_rel_free(c.rel_addr, 0);
@@ -1028,12 +1035,15 @@ static bool stale_release_generation(const Pm4Command& c, uint64_t pre) {
 }
 static void mb3_freelist_report(const char* kind, uint64_t addr, uint64_t pre,
                                 const Mb3FreelistMatch* match, bool debt) {
-    static std::atomic<uint32_t> n{0};
-    uint32_t i = n.fetch_add(1, std::memory_order_relaxed);
-    if (i < 64 || (i & 4095u) == 0)
-        fprintf(stderr, "[agc] MB3-FREE-SUPPRESS kind=%s [0x%llx] pre=0x%llx via=%s "
+    // #1761: the old rule (i < 64 || (i & 4095) == 0) put the 65th line on the 4,097th event and
+    // carried no ordinal, so "64 suppressed live-protocol writes per ArcRunner run" — quoted on
+    // #1226 — bounded the population only below 4,096 rather than measuring it.
+    static std::atomic<uint64_t> n{0};
+    const uint64_t ord = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (diag_should_print(ord))
+        fprintf(stderr, "[agc] MB3-FREE-SUPPRESS #%llu kind=%s [0x%llx] pre=0x%llx via=%s "
                         "pool=0x%llx list=%u head=0x%llx hops=%u t=%llums\n",
-                kind, (unsigned long long)addr, (unsigned long long)pre,
+                (unsigned long long)ord, kind, (unsigned long long)addr, (unsigned long long)pre,
                 debt ? "dma-debt" : "membership",
                 (unsigned long long)(match ? match->pool_base : 0), match ? match->list : 0,
                 (unsigned long long)(match ? match->head : 0), match ? match->hops : 0,
@@ -1072,14 +1082,24 @@ static void report_suspect_write(const char* kindtag, uint64_t addr, uint64_t va
                                  uint64_t pkt) {
     // Skip the first 2 s (module-load churn); the protocol is steady-state by then.
     if (now_ms() < 2000) return;
-    static std::atomic<int> n{0};
-    if (n.fetch_add(1) >= 192) return;
+    // #1761: ordinal on every line, budget PER KIND, sparse tail past the cap. The old form printed
+    // at most 192 lines shared across ALL kinds and carried no ordinal, so (a) "192 suspect writes"
+    // read as a census when it was the ceiling, and (b) a noisy REL1-LIVE could exhaust the budget
+    // before REL1-FORGE — the kind under investigation — ever got a line.
+    static const char* const kKinds[] = {"REL1-LIVE", "REL1-NOINIT", "REL1-FORGE", "REL2-LIVE",
+                                         "WDATA"};
+    static constexpr size_t kNKinds = sizeof(kKinds) / sizeof(kKinds[0]);
+    static std::atomic<uint64_t> per_kind[kNKinds + 1];
+    const uint64_t ord =
+        per_kind[diag_key_slot(kindtag, kKinds, kNKinds)].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!diag_should_print(ord, 192)) return;
     uint64_t baddr = 0, bpre = 0, bt = 0;
     int have = prosper_fence_journal_lookup(pkt, &baddr, &bpre, &bt);
     char hist[512]; label_hist_report(addr, hist, sizeof hist);
-    fprintf(stderr, "[agc] SUSPECT-%s [0x%llx] pre=0x%llx value=0x%llx pkt=0x%llx t=%llums | "
+    fprintf(stderr, "[agc] SUSPECT-%s #%llu [0x%llx] pre=0x%llx value=0x%llx pkt=0x%llx t=%llums | "
                     "journal:%s built@%llums(age=%lldms) built-addr=0x%llx%s pre@build=0x%llx%s | %s\n",
-            kindtag, (unsigned long long)addr, (unsigned long long)pre, (unsigned long long)value,
+            kindtag, (unsigned long long)ord, (unsigned long long)addr, (unsigned long long)pre,
+            (unsigned long long)value,
             (unsigned long long)pkt, (unsigned long long)now_ms(),
             have ? "" : " MISS", (unsigned long long)bt,
             have ? (long long)(now_ms() - bt) : -1,
@@ -1157,12 +1177,17 @@ void clockfence_record(uint64_t addr, uint64_t pre, uint64_t value, uint64_t pkt
         // The durable form of #1226's one-off REL3 diagnostic: a clock fence overwriting memory
         // that currently holds a pointer — a recycled label, or a live allocator/RHI structure
         // (the crash class). Bounded and off by default (PROSPER_CLOCKFENCE_LOG=1).
-        static std::atomic<int> n{0};
-        if (clockfence_log() && n.fetch_add(1) < 64)
-            fprintf(stderr,
-                    "[agc] CLOCKFENCE-OVER-PTR kind=%u [0x%llx] pre=0x%llx clock=0x%llx pkt=0x%llx t=%llums\n",
-                    kind, (unsigned long long)addr, (unsigned long long)pre,
+        // #1761: its count is quoted the same way the forge tripwire's was, so it carries an
+        // ordinal on every line and keeps printing sparsely past the cap.
+        static std::atomic<uint64_t> n{0};
+        if (clockfence_log()) {
+            const uint64_t ord = n.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (diag_should_print(ord))
+                fprintf(stderr,
+                    "[agc] CLOCKFENCE-OVER-PTR #%llu kind=%u [0x%llx] pre=0x%llx clock=0x%llx pkt=0x%llx t=%llums\n",
+                    (unsigned long long)ord, kind, (unsigned long long)addr, (unsigned long long)pre,
                     (unsigned long long)value, (unsigned long long)pkt, (unsigned long long)t);
+        }
     }
 }
 }
@@ -1348,12 +1373,17 @@ static void honor_eop_write(const Pm4Command& c) {
                   // not executed — two fence generations in the pipe together (see label_rel_overlap).
                   // Content-independent: catches the late-pair stomp class even when pre reads 0.
                   if (int ov = label_rel_overlap(c.rel_addr); ov >= 1) {
-                      static std::atomic<int> novl{0};
-                      if (now_ms() >= 2000 && novl.fetch_add(1) < 64) {
-                          char hist[512]; label_hist_report(c.rel_addr, hist, sizeof hist);
-                          fprintf(stderr, "[agc] SUSPECT-REL1-OVERLAP [0x%llx] pending-inits=%d pre=0x%llx t=%llums | %s\n",
-                                  (unsigned long long)c.rel_addr, ov, (unsigned long long)pre,
-                                  (unsigned long long)now_ms(), hist);
+                      static std::atomic<uint64_t> novl{0};
+                      if (now_ms() >= 2000) {
+                          // #1761: ordinal on every line and a sparse tail — a bare 64-line cap made
+                          // this tripwire's ceiling indistinguishable from its population.
+                          const uint64_t ord = novl.fetch_add(1, std::memory_order_relaxed) + 1;
+                          if (diag_should_print(ord)) {
+                              char hist[512]; label_hist_report(c.rel_addr, hist, sizeof hist);
+                              fprintf(stderr, "[agc] SUSPECT-REL1-OVERLAP #%llu [0x%llx] pending-inits=%d pre=0x%llx t=%llums | %s\n",
+                                      (unsigned long long)ord, (unsigned long long)c.rel_addr, ov,
+                                      (unsigned long long)pre, (unsigned long long)now_ms(), hist);
+                          }
                       }
                   }
                   uint32_t v = (uint32_t)c.rel_value;

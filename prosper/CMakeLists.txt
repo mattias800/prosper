@@ -623,6 +623,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_dmem_caller_walk PRIVATE prosper_core)
   add_test(NAME dmem_caller_walk COMMAND test_dmem_caller_walk)
 
+  # Capped-diagnostic rate limit (issue #1761): a print budget must never be readable as a
+  # population. Pins the sparse tail and the per-key budget; header-only, no GPU state.
+  add_executable(test_diag_ratelimit tests/test_diag_ratelimit.cpp)
+  add_test(NAME diag_ratelimit COMMAND test_diag_ratelimit)
+
   # IME keyboard event delivery (issue #1093): sceImeUpdate must invoke the guest handler
   # per queued key event; the old stub delivered none.
   add_executable(test_ime_input tests/test_ime_input.cpp)
