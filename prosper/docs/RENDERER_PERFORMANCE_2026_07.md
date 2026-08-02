@@ -1594,12 +1594,19 @@ And 67 flips/s is the rate with the work deleted. It bounds the cost, not the ac
 `tools/perf/compute_phase_report.py` aggregates the existing `[compute-phase]` and `[compute-image]`
 records. 18,933 **succeeded** dispatches, 1,581 guest submits, 421.8 s:
 
-| phase | share | contents |
-|---|---:|---|
-| dispatch | 75.4 % | command recording, `vkCmdCopyBufferToImage` per image binding, kernel, readback, submit/fence wait |
-| setup | 17.4 % | image bindings 17.0 %; descriptor validation 0.1 %, buffer binding 0.3 % |
-| writeback | 6.8 % | pack 2.4 %, retile 2.4 % |
-| pipeline + cleanup | 0.5 % | |
+| phase | share | ms | contents |
+|---|---:|---:|---|
+| dispatch | 75.4 % | 317,908 | command recording, `vkCmdCopyBufferToImage` per image binding, kernel, readback, submit/fence wait |
+| setup | 17.4 % | 73,287 | descriptor validation 484 ms, buffer binding 1,264 ms, **image binding 71,539 ms** |
+| writeback | 6.8 % | 28,509 | pack 10,139 ms, retile (`layout_ms`) 10,112 ms |
+| pipeline + cleanup | 0.5 % | 2,112 | |
+
+**Every percentage in that table is a share of succeeded-dispatch time (421,827 ms).** The image
+figure is setup's `unattributed` row, i.e. the image-binding loop, on the same base. Do not compare it
+against the tool's `setup image bindings` line: `[compute-image]` records carry no ok flag, so that
+line covers **all** dispatches (388,600 ms, 50.2 % of the 774,834 ms every dispatch consumed including
+the failures below) and is a strictly larger population. Mixing the two makes the child look 1.8x its
+parent — exactly what trap 47 in `GAME_COMPAT_ORCHESTRATION.md` says an aggregator must never allow.
 
 Three instrumentation properties that generalise past this title, each of which produced a wrong table
 before it was handled:
@@ -1609,7 +1616,9 @@ before it was handled:
   rest only becomes visible with `PROSPER_COMPUTE_IMAGE_TIMING` as well. The report prints an explicit
   `unattributed` row under every parent rather than dropping the gap.
 - **A failed dispatch leaves `execute_item` early, so `phase_dispatch`/`phase_writeback` are never
-  advanced.** Its `dispatch_ms` is then computed backwards and prints **negative**, while `cleanup_ms`
+  advanced.** The phase spanning the break is then computed backwards and prints **negative** —
+  `dispatch_ms` for a break inside the dispatch window, `pipeline_ms` or `writeback_ms` for one either
+  side, and no negative at all for a break before setup ends — while `cleanup_ms`
   absorbs the whole record. Summing failed records into the phase table produced
   `dispatch (GPU) = -20,532 ms` and moved 46 % of the run into `cleanup`. They are excluded and counted
   separately.
@@ -1621,44 +1630,66 @@ neither gives **+1.5 % to +1.9 %**, measured rather than assumed.
 
 ### Root cause: `0x500571000`'s dispatch size never resets
 
-One program is **75.2 % of succeeded-dispatch time** at 982 ms mean, 93 % of it in the submit-and-wait.
+One program is **75.2 % of succeeded-dispatch time** (317,271 ms of 421,827 ms, 323 dispatches, 982 ms
+mean, 93 % of it in the submit-and-wait) in the 853 s routed run.
 `PROSPER_COMPUTELOG_CODE=0x500571000` prints the derived geometry: `local` is a constant 16x16x1 and
-`groups_x` grows by **exactly 3,345 every dispatch, monotonically, without bound** — 1 at dispatch 1,
-3,366 at 23, 327,831 at 120, **752,646 (192.7 M invocations) at 247 and still climbing**. A per-frame
-quantity is being **accumulated rather than consumed**: the count derived is a running total where the
-guest means a per-frame value. This is a correctness defect in the dispatch-size derivation (the #580
-thread/local/group contract), not a tuning problem, and it explains the shape of everything else — this
-program cost 235 ms, then 562, 982, 1,492 ms across one run, and the title becomes monotonically slower
-the longer it runs.
+`groups_x` grows by **exactly 3,345 every dispatch, monotonically, and never decreases across the whole
+observed route** — 1 at dispatch 1, 3,366 at 23, 327,831 at 120, **752,646 (192.7 M invocations) at 247,
+still climbing when tracing stopped**. A per-frame quantity is being **accumulated rather than
+consumed**: the count reaching the backend is a running total where the guest plausibly means a
+per-frame value.
+
+That last sentence is the *hypothesis*, not the observation. `gpu_executor.cpp` copies
+`groups_x = d.threads_x` verbatim from the packet when `USE_THREAD_DIMENSIONS` is clear, and neither
+that path nor the deriving branch beside it accumulates anything — so where the running total comes
+from is **not yet located**, and it may be a guest-side count we are reading at the wrong time rather
+than a derivation defect. What is certain is the shape: this program cost 235 ms, then 562, 982,
+1,492 ms across one run, and the title becomes monotonically slower the longer it runs.
+
+**Every aggregate for this program is a function of route duration**, precisely because its cost grows;
+the 317,271 ms above is from the 853 s decomposition run, and the 123,762 ms quoted below is from the
+shorter 500 s window of the same route. Name the run whenever quoting either.
 
 ### Ruled out
 
-- **"The dominant dispatch cost is image upload volume."** False. `0x500571000` spent 123,762 ms of
-  dispatch time for 107.19 GiB staged (0.87 GiB/s) while `0x50059cd00`, `0x5005cc100` and `0x5005fdb00`
-  staged 107-112 GiB each in 1,573-1,583 ms (67-71 GiB/s). Three sibling programs move the same volume
-  80x faster, so the per-dispatch image round-trip — a real and large cost elsewhere in the same
-  decomposition — does not explain the dominant term. Ranking phases by size selects uploads; asking
-  what predicts the *outlier* rejects them (#1732).
+- **"The dominant dispatch cost is image upload volume."** False. In the 500 s window, `0x500571000`
+  spent 123,762 ms of dispatch time for 107.19 GiB staged (0.87 GiB/s) while `0x50059cd00`,
+  `0x5005cc100` and `0x5005fdb00` staged 107-112 GiB each in 1,573-1,583 ms (67-71 GiB/s). Three
+  sibling programs move the same volume 80x faster, so the per-dispatch image round-trip — a real and
+  large cost elsewhere in the same decomposition — does not explain the dominant term. Ranking phases
+  by size selects uploads; asking what predicts the *outlier* rejects them (#1732). Caveat on the exact
+  ratio, not on the conclusion: the staged bytes come from `[compute-image]` (all dispatches of that
+  program) while the ms come from the succeeded-only phase table, so if these four programs fail at
+  different rates the 80x is distorted — it would survive a 5x correction with an order of magnitude
+  to spare.
 - **"The geometry is fine, the 128,005-word SPIR-V module is the problem."** False, and the way it was
   nearly believed is the lesson: the first three traced dispatches genuinely read `groups=1x1x1`,
   because the growth only begins at dispatch 23. **Three samples of a monotonic series are not a sample
   of it** — when a value is suspected of drifting, plot the series before quoting any element of it
   (#1732).
 
-### Separately: 82 % of dispatches fail, silently
+### Separately: 63 % of dispatches fail, silently
 
-Of 106,484 dispatches in the routed run, **87,551 fail** — every one from submit 2299 (the world-map
-load) onward — consuming **353 s, 46 % of all compute wall time, on work that is then discarded**. At
-default verbosity they emit **nothing**: every failure path in `execute_item` returns false behind an
-`if (trace)` guard, so a run log shows only the two registration lines. This is a fatal-gap class under
+**87,551 dispatches fail** — every one from submit 2299 (the world-map load) onward — consuming
+**353 s, 46 % of all compute wall time, on work that is then discarded**. Mind the denominator:
+106,484 dispatches reach `execute_item` and emit a `[compute-phase]` record, so the failure rate
+*there* is 82 %, but a further **32,667 take the CPU fast path and return before `execute_item`**,
+emitting no record. Against every dispatch the backend saw (139,151, which matches
+`[render-timing] compute calls=139,150` exactly) the rate is **62.9 %**. Read
+`[render-timing] compute_cpu_fast fills=N` before quoting any rate from `[compute-phase]` counts.
+
+At default verbosity the failures emit **nothing**: every failure path inside the dispatch body of
+`execute_item` returns false behind an `if (trace)` guard, so a run log shows only the two registration
+lines. (Two rejects before that body — an unsupported descriptor kind and a missing storage-image
+device feature — do print unconditionally, and neither fires here.) This is a fatal-gap class under
 `CLAUDE.md` and a likely mechanism for #1459 (Astro Bot's world map renders only its backdrop). Any
-future compute-performance number for this title is measuring two different things until it is split by
-`ok=`, which `compute_phase_report.py` now does.
+future compute-performance number for this title is measuring two different populations until it is
+split by `ok=`, which `compute_phase_report.py` now does.
 
-`CONFIDENCE: HIGH` on the decomposition, the ~93 % attribution, the fairness verdict, the unbounded
-`groups_x` growth, the failure census and both falsifications. `CONFIDENCE: MED` on the accumulation
-being a derivation defect rather than something the guest itself drives; the guest-side source of the
-count is unread.
+`CONFIDENCE: HIGH` on the decomposition, the ~93 % attribution, the fairness verdict, the monotonic
+`groups_x` growth across the observed route, the failure census and both falsifications.
+`CONFIDENCE: LOW` on *where* the accumulation happens — the obvious derivation paths do not accumulate,
+so it is not yet localised and may be a guest-side count read at the wrong time.
 
 ## Next renderer step
 

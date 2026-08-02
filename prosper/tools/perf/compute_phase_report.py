@@ -23,6 +23,15 @@ most of `setup` lands in its "unattributed" row. Add `PROSPER_COMPUTE_IMAGE_TIMI
 this tool will also roll up the resulting `[compute-image]` records, which decompose exactly that
 interval. Run both switches together whenever setup is the dominant phase.
 
+WHAT THIS TOOL DOES NOT SEE
+---------------------------
+`[compute-phase]` is emitted from `execute_item`, so it covers **backend-executed dispatches only**.
+Dispatches that match the CPU fast path return before `execute_item` and emit no record at all -- on
+Astro Bot that is 32,667 of 139,151, nearly a quarter. Any "N % of dispatches" statement derived from
+this tool is therefore a share of backend-executed dispatches, not of the guest's dispatches. Read the
+run log's `[render-timing] compute_cpu_fast fills=N` line and add it to the denominator before quoting
+a rate.
+
 Usage:
     compute_phase_report.py [LOG ...] [--top N] [--since-submit N] [--program 0xADDR] [--csv]
 """
@@ -66,7 +75,7 @@ PHASES = [
     ("    prepare",        "prepare_ms",            "writeback_images_ms"),
     ("    watch",          "watch_ms",              "writeback_images_ms"),
     ("    pack",           "pack_ms",               "writeback_images_ms"),
-    ("    layout",         "layout_ms",             "writeback_images_ms"),
+    ("    layout(retile)",  "layout_ms",            "writeback_images_ms"),
     ("    notify",         "notify_ms",             "writeback_images_ms"),
     ("    cache",          "cache_ms",              "writeback_images_ms"),
     ("  publish",          "writeback_publish_ms",  "writeback_ms"),
@@ -106,6 +115,9 @@ def parse(streams, since_submit, program):
                     continue
                 if program is not None and fields.get("code") != program:
                     continue
+                # NOTE: `[compute-image]` carries no `submit=` field, so --since-submit CANNOT be
+                # applied here. main() suppresses the image section rather than mixing a filtered
+                # dispatch denominator with an unfiltered image numerator.
                 images.append(fields)
     return records, images
 
@@ -124,10 +136,20 @@ def main():
 
     streams = []
     if args.logs:
-        streams = [open(p, "r", errors="replace") for p in args.logs]
+        try:
+            streams = [open(p, "r", errors="replace") for p in args.logs]
+        except OSError as error:
+            print(f"cannot read log: {error}", file=sys.stderr)
+            return 2
     else:
         streams = [sys.stdin]
     records, images = parse(streams, args.since_submit, args.program)
+    # `[compute-image]` has no submit ordinal, so it cannot honour --since-submit. Keeping it would
+    # divide a whole-log image numerator by a filtered dispatch denominator: with a filter that
+    # skips 10 % of a route every image row inflates ~11 % and still looks entirely plausible.
+    images_suppressed_by_filter = bool(images) and args.since_submit is not None
+    if images_suppressed_by_filter:
+        images = []
 
     if not records:
         # Name the filters when they are set. "No records" reads as "the switch was off", and
@@ -151,8 +173,11 @@ def main():
     # backwards (and prints NEGATIVE) while `cleanup_ms` swallows the whole dispatch. Those records
     # carry a valid `total_ms` and nothing else, so they are reported separately and never summed
     # into the phase table -- mixing them in silently inverts it. See #1732.
-    failed = [r for r in records if r.get("ok", 1) == 0]
-    records = [r for r in records if r.get("ok", 1) != 0]
+    # A record with no `ok` field at all is a truncated or interleaved line. Default it to FAILED,
+    # not succeeded: the whole point of this split is that mixing a broken record into the phase
+    # table inverts it, so the unsafe default must be the one that keeps it out.
+    failed = [r for r in records if r.get("ok", 1) == 0 or "ok" not in r]
+    records = [r for r in records if r.get("ok", 1) != 0 and "ok" in r]
     if not records:
         print(f"all {len(failed)} dispatches in this log failed; no phase decomposition is "
               f"available (their sub-timers are not meaningful)", file=sys.stderr)
@@ -215,10 +240,13 @@ def main():
     if failed:
         failed_ms = sum(r["total_ms"] for r in failed)
         share = 100.0 * len(failed) / (len(failed) + n)
-        print(f"  EXCLUDED: {len(failed)} FAILED dispatches ({share:.0f}% of all), "
-              f"{failed_ms:.0f} ms wall. Their phase split is not recoverable -- a failed dispatch "
-              f"leaves execute_item early, so its dispatch_ms prints negative and cleanup_ms "
-              f"absorbs the whole record. Only the totals above are decomposed.")
+        print(f"  EXCLUDED: {len(failed)} FAILED dispatches ({share:.0f}% of the "
+              f"{len(failed) + n} that reached execute_item), {failed_ms:.0f} ms wall. Their phase "
+              f"split is not recoverable -- a failed dispatch leaves execute_item early, so the "
+              f"phase spanning the break prints NEGATIVE and cleanup_ms absorbs the whole record.")
+        print("  That share is NOT the fraction of all guest dispatches: CPU-fast-path fills return "
+              "before execute_item and emit no record here. Take their count from the run log's "
+              "'[render-timing] compute_cpu_fast fills=N' line and add it to the denominator.")
         by_program = defaultdict(int)
         for r in failed:
             by_program[int(r.get("code", 0))] += 1
@@ -250,7 +278,10 @@ def main():
         kids = children.get(key)
         if kids:
             rest = totals[key] - sum(totals[k] for k in kids)
-            if grand and abs(rest) / grand > 0.005:
+            # Relative to the PARENT, not to the grand total: a small parent (writeback_images_ms)
+            # would otherwise lose its remainder silently, which is the failure this row exists for.
+            parent_ms = totals[key]
+            if parent_ms and abs(rest) / parent_ms > 0.01:
                 row("unattributed", rest, depth)
 
     walk("total_ms", 0)
@@ -264,6 +295,16 @@ def main():
     # here reads far too easily as "there was nothing there".
     print()
     if images:
+        # An aliased binding is emitted with only `ms` -- no sub-timers and no byte counts -- because
+        # it folded into an earlier binding and did no work. Counting those in `len(images)` divides
+        # every ms/binding by the wrong denominator (they are 64 % of Astro Bot's records) and dumps
+        # their whole `ms` into `unattributed`. Report them, do not average over them.
+        aliases = [i for i in images if i.get("alias", 0.0)]
+        images = [i for i in images if not i.get("alias", 0.0)]
+        if not images:
+            print(f"  setup image bindings: all {len(aliases)} records are aliased folds "
+                  f"(no work, no sub-timers); nothing to decompose.")
+            return 0
         image_total = sum(i["ms"] for i in images)
         # `[compute-image]` carries no ok flag, so these records span FAILED dispatches as well --
         # a dispatch that fails has usually already bound its images. Denominating them against the
@@ -272,8 +313,10 @@ def main():
         # different bases.
         base = grand + sum(r["total_ms"] for r in failed)
         pct = lambda ms: (100.0 * ms / base) if base else 0.0
-        print(f"  setup image bindings: {len(images)} bindings, {image_total:.0f} ms "
-              f"({pct(image_total):.1f}% of ALL dispatch wall, succeeded + failed)")
+        print(f"  setup image bindings: {len(images)} real bindings, {image_total:.0f} ms "
+              f"({pct(image_total):.1f}% of ALL dispatch wall, succeeded + failed)"
+              + (f"; {len(aliases)} further records were aliased folds "
+                 f"({sum(i['ms'] for i in aliases):.0f} ms), excluded" if aliases else ""))
         print(f"  {'sub-phase':<26}{'ms':>12}{'% all':>10}{'ms/binding':>13}")
         print("  " + "-" * 61)
         attributed = 0.0
@@ -290,6 +333,11 @@ def main():
         print(f"  guest bytes bound {guest_bytes / (1 << 30):.2f} GiB, "
               f"staged {staging_bytes / (1 << 30):.2f} GiB, "
               f"{imported} bindings imported from the renderer")
+    elif images_suppressed_by_filter:
+        print("  setup image bindings: SUPPRESSED because --since-submit is set.")
+        print("  [compute-image] records carry no submit ordinal, so they cannot be filtered to")
+        print("  match; showing them would divide a whole-log numerator by a filtered denominator.")
+        print("  Re-run without --since-submit for the image decomposition.")
     else:
         print("  setup image bindings: no [compute-image] records in this log.")
         print("  Re-run with PROSPER_COMPUTE_IMAGE_TIMING=1 to decompose setup's unattributed row;")

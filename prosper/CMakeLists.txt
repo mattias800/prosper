@@ -104,6 +104,14 @@ if(Python3_Interpreter_FOUND)
   # report a clean suite forever, which is the one way this guard can fail silently.
   add_test(NAME vkval_scan_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/vkval/test_vk_validation_scan.py")
+  # The compute decomposition rollup encodes a model of execute_item()'s phase structure. When that
+  # model drifts from live_compute.cpp the tool does not crash -- it prints a plausible, wrong table,
+  # which is the failure mode the whole tool exists to prevent. Most cases here assert on what must
+  # NOT appear (negative time, failed dispatches summed in, an image share computed against a
+  # filtered denominator), because each is a table this tool has already produced once.
+  add_test(NAME compute_phase_report_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_phase_report.py")
 endif()
 # Path to the (gitignored) local game dump; override with -DGAME_DUMP=...
 set(GAME_DUMP "${CMAKE_SOURCE_DIR}/../PPSA24651-app0" CACHE PATH "Local PS5 game dump root")
