@@ -15,7 +15,14 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -30,6 +37,38 @@ static int fails = 0;
 // that quietly stops executing assertions shows up as a drop rather than as unchanged green.
 static int checks = 0;
 #define CHECK(c, msg) do { ++checks; if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
+
+static int file_descriptor(FILE* file) {
+#ifdef _WIN32
+    return _fileno(file);
+#else
+    return fileno(file);
+#endif
+}
+
+static int duplicate_descriptor(int fd) {
+#ifdef _WIN32
+    return _dup(fd);
+#else
+    return dup(fd);
+#endif
+}
+
+static int replace_descriptor(int from, int to) {
+#ifdef _WIN32
+    return _dup2(from, to);
+#else
+    return dup2(from, to);
+#endif
+}
+
+static void close_descriptor(int fd) {
+#ifdef _WIN32
+    _close(fd);
+#else
+    close(fd);
+#endif
+}
 
 int main() {
 #ifdef _WIN32
@@ -3349,6 +3388,64 @@ int main() {
                 CHECK(row0_written, "partial store did write the covered row (kernel ran)");
             }
         }
+    }
+
+    // Keep this last: the production contract deliberately latches a lost VkDevice for the rest of
+    // the process. Inject one queue-submit loss into a two-item batch, then call the backend again.
+    // Both checks measure the lever directly: disabling either the in-batch break or the persistent
+    // short-circuit causes another queue-submit attempt and makes a named assertion fail.
+    {
+        FILE* diagnostic_file = std::tmpfile();
+        int saved_stderr = -1;
+        bool capturing = false;
+        if (diagnostic_file) {
+            std::fflush(stderr);
+            saved_stderr = duplicate_descriptor(file_descriptor(stderr));
+            capturing = saved_stderr >= 0 &&
+                        replace_descriptor(file_descriptor(diagnostic_file),
+                                           file_descriptor(stderr)) >= 0;
+        }
+        CHECK(capturing, "device-loss diagnostic capture initialized");
+
+        const uint64_t attempts_before =
+            prosper::frontend::live_compute_queue_submit_attempts();
+        prosper::frontend::live_compute_force_next_queue_submit_device_lost_for_test();
+        const bool batch_result =
+            prosper::frontend::execute_live_compute_items({item, item});
+        const uint64_t attempts_after_loss =
+            prosper::frontend::live_compute_queue_submit_attempts();
+        const bool later_result = prosper::frontend::execute_live_compute_items({item});
+        const uint64_t attempts_after_later_call =
+            prosper::frontend::live_compute_queue_submit_attempts();
+
+        std::string diagnostic;
+        if (capturing) {
+            std::fflush(stderr);
+            if (replace_descriptor(saved_stderr, file_descriptor(stderr)) < 0)
+                capturing = false;
+            close_descriptor(saved_stderr);
+            saved_stderr = -1;
+            std::rewind(diagnostic_file);
+            char buffer[512];
+            while (const size_t bytes = std::fread(buffer, 1, sizeof(buffer), diagnostic_file))
+                diagnostic.append(buffer, bytes);
+        } else if (saved_stderr >= 0) {
+            close_descriptor(saved_stderr);
+        }
+        if (diagnostic_file) std::fclose(diagnostic_file);
+
+        CHECK(!batch_result && attempts_after_loss == attempts_before + 1,
+              "device loss aborts the current batch before another queue submit");
+        CHECK(!later_result && attempts_after_later_call == attempts_after_loss,
+              "latched device loss rejects later callbacks before queue submission");
+        CHECK(capturing &&
+                  diagnostic.find("result=VK_ERROR_DEVICE_LOST(-4)") != std::string::npos &&
+                  diagnostic.find("program=0x401aec200 submit=11 dispatch=7 order=70") !=
+                      std::string::npos &&
+                  diagnostic.find("result=VK_ERROR_DEVICE_LOST(-4)",
+                                  diagnostic.find("result=VK_ERROR_DEVICE_LOST(-4)") + 1) ==
+                      std::string::npos,
+              "device loss is unconditional and identifies the first observed guest dispatch");
     }
 
     if (fails) {

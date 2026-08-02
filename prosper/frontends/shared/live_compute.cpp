@@ -207,6 +207,8 @@ std::atomic<bool> g_fail_next_storage_readback_for_test{false};
 std::atomic<bool> g_zero_next_cold_storage_snapshot_minimum_for_test{false};
 std::atomic<bool> g_force_next_image_result_host_fallback_for_test{false};
 std::atomic<bool> g_fail_next_image_result_buffer_retain_for_test{false};
+std::atomic<bool> g_force_next_queue_submit_device_lost_for_test{false};
+std::atomic<uint64_t> g_live_compute_queue_submit_attempts{0};
 
 VkFormat native_storage_vk_format(prosper::gpu::DataFormat format, uint32_t components) {
     using prosper::gpu::DataFormat;
@@ -977,6 +979,13 @@ struct VulkanComputeContext {
     // True when instance/device/queue were ADOPTED from the live renderer (#1091). A borrowed
     // context is owned by the renderer: destroy our own pipelines/pools/memory, never its device.
     bool borrowed = false;
+    // VK_ERROR_DEVICE_LOST is permanent for a VkDevice. Keep the first failure latched so later
+    // PM4 dispatches cannot spend minutes rebuilding resources and submitting work that Vulkan is
+    // required to reject. AGC submit execution serializes access to this context.
+    bool device_lost = false;
+    // A queue API was entered and no fence or queue-idle result proved completion. The current item
+    // and this context then retain objects that Vulkan may still own; neither may be destroyed.
+    bool completion_unproven = false;
 
     ~VulkanComputeContext() {
         release_cached_buffers();
@@ -2928,8 +2937,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     bool pipeline_cached = false;
     std::string pipeline_key;
     bool ok = false;
+    bool submission_entered = false;
+    bool completion_proven = false;
     auto vk_ok = [&](VkResult result, const char* stage) {
         if (result == VK_SUCCESS) return true;
+        if (result == VK_ERROR_DEVICE_LOST && !ctx.device_lost) {
+            ctx.device_lost = true;
+            std::fprintf(stderr,
+                         "[compute] fatal Vulkan device loss stage=%s "
+                         "result=VK_ERROR_DEVICE_LOST(%d) program=0x%llx submit=%llu "
+                         "dispatch=%llu order=%llu; disabling live compute for this process\n",
+                         stage, static_cast<int>(result),
+                         static_cast<unsigned long long>(item.code_addr),
+                         static_cast<unsigned long long>(item.submit_no),
+                         static_cast<unsigned long long>(item.dispatch_index),
+                         static_cast<unsigned long long>(item.command_order));
+        }
         if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=%s result=%d\n",
                                 stage, static_cast<int>(result));
         return false;
@@ -5689,24 +5712,37 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         {
             std::unique_lock<std::mutex> lk(prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
             if (prosper::gpu::shared_present_active()) lk.lock();
-            compute_submit_rc = vkQueueSubmit(ctx.queue, 1, &submit, ctx.dispatch_fence);
+            g_live_compute_queue_submit_attempts.fetch_add(1, std::memory_order_relaxed);
+            submission_entered = true;
+            compute_submit_rc = g_force_next_queue_submit_device_lost_for_test.exchange(
+                                    false, std::memory_order_acq_rel)
+                ? VK_ERROR_DEVICE_LOST
+                : vkQueueSubmit(ctx.queue, 1, &submit, ctx.dispatch_fence);
         }
         if (!vk_ok(compute_submit_rc, "queue-submit")) break;
         if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
-        if (!vk_ok(vkWaitForFences(ctx.device, 1, &ctx.dispatch_fence, VK_TRUE,
-                                   30ull * 1000 * 1000 * 1000), "queue-wait")) {
-            // cleanup() destroys the command buffer and releases the borrowed image's pin. With a
-            // renderer-owned image bound, in-flight work still references it and its layout
-            // transitions, so drain the queue first rather than freeing it underneath the GPU.
+        const VkResult wait_result = vkWaitForFences(
+            ctx.device, 1, &ctx.dispatch_fence, VK_TRUE, 30ull * 1000 * 1000 * 1000);
+        if (!vk_ok(wait_result, "queue-wait")) {
+            // cleanup() releases resources referenced by the command buffer, including a borrowed
+            // renderer image's pin. With that image bound, in-flight work still references it and
+            // its layout transitions, so drain the queue first rather than freeing it underneath
+            // the GPU.
             // readback_persistent_color_target uses the same drain but PROMOTES a successful drain
             // to success; this item stays failed either way, which is the conservative choice for a
             // dispatch whose results we can no longer trust.
-            std::unique_lock<std::mutex> qlk(prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
-            if (prosper::gpu::shared_present_active()) qlk.lock();
-            if (vkQueueWaitIdle(ctx.queue) != VK_SUCCESS && trace)
-                std::fprintf(stderr, "[compute]   queue drain after fence timeout failed\n");
+            if (!ctx.device_lost) {
+                std::unique_lock<std::mutex> qlk(
+                    prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
+                if (prosper::gpu::shared_present_active()) qlk.lock();
+                const VkResult drain_result = vkQueueWaitIdle(ctx.queue);
+                completion_proven = drain_result == VK_SUCCESS;
+                if (!vk_ok(drain_result, "queue-drain") && trace)
+                    std::fprintf(stderr, "[compute]   queue drain after fence timeout failed\n");
+            }
             break;
         }
+        completion_proven = true;
         if (trace) std::fprintf(stderr, "[compute]   dispatch complete\n");
         phase_dispatch = ComputeClock::now();
         const auto writeback_prepare_start = phase_dispatch;
@@ -6334,7 +6370,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          image.guest_bytes >= 16 ? reinterpret_cast<const uint32_t*>(bytes)[3] : 0);
         }
     }
-    cleanup();
+    if (ctx.device_lost && submission_entered && !completion_proven)
+        ctx.completion_unproven = true;
+    // VK_ERROR_DEVICE_LOST from a queue call gives no completion proof for the affected submission.
+    // cleanup() would destroy/recycle command resources and release borrowed renderer-image pins
+    // that the GPU may still own. Deliberately retain this raw-handle closure; the sticky entry
+    // check prevents reuse and the atexit handler retains the context itself.
+    if (!ctx.completion_unproven) cleanup();
     if (phase_timing) {
         const auto phase_cleanup = ComputeClock::now();
         auto milliseconds = [](auto begin, auto end) {
@@ -6466,6 +6508,14 @@ void live_compute_force_next_image_result_host_fallback_for_test() {
 
 void live_compute_fail_next_image_result_buffer_retain_for_test() {
     g_fail_next_image_result_buffer_retain_for_test.store(true, std::memory_order_release);
+}
+
+void live_compute_force_next_queue_submit_device_lost_for_test() {
+    g_force_next_queue_submit_device_lost_for_test.store(true, std::memory_order_release);
+}
+
+uint64_t live_compute_queue_submit_attempts() {
+    return g_live_compute_queue_submit_attempts.load(std::memory_order_relaxed);
 }
 
 void storage_pack_unorm8_range(const uint32_t* channels, uint32_t components,
@@ -6621,7 +6671,10 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
                 VulkanComputeContext* doomed = context_ptr;
                 context_ptr = nullptr;
                 g_live_compute_context = nullptr;
-                delete doomed;
+                // Returning early from ~VulkanComputeContext would still destroy all of its member
+                // caches after the destructor body. When a lost-device submission has no completion
+                // proof, retain the object itself so no GPU-facing member ownership is released.
+                if (doomed && !doomed->completion_unproven) delete doomed;
             }) != 0) {
             std::fprintf(stderr, "[compute] std::atexit refused the Vulkan teardown handler — "
                                  "the compute device will not be destroyed at exit\n");
@@ -6648,6 +6701,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     }
     VulkanComputeContext& context = *live_context;
     g_live_compute_context = &context;
+    if (context.device_lost) return false;
     const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -6661,6 +6715,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
             all_ok &= *cpu_result;
         else
             all_ok &= execute_item(context, item);
+        if (context.device_lost) break;
     }
     if (timing_enabled) {
         struct TimingTotals { uint64_t calls = 0, dispatches = 0; double milliseconds = 0; };
