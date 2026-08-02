@@ -7,9 +7,9 @@
 # that BUILT the artifact sets the floor for everyone who runs it. Reported as a plain `2.NN` on
 # stdout so BUILD.txt can state it and verify-linux-app.sh can gate on it.
 #
-# Non-numeric GLIBC_ABI_* tags (e.g. GLIBC_ABI_GNU2_TLS) are printed to stderr. They are a floor too,
-# but not one that sorts against `2.NN`, so callers gate on them separately rather than folding them
-# into the number.
+# Non-numeric GLIBC_ABI_* tags (e.g. GLIBC_ABI_DT_RELR, GLIBC_ABI_GNU2_TLS) are printed to stderr.
+# They are a floor too, but not one that sorts against `2.NN`, so callers gate on them separately
+# rather than folding them into the number.
 #
 # Usage: glibc-floor.sh <dir-or-file>
 set -euo pipefail
@@ -18,8 +18,13 @@ target="${1:-}"
 [ -n "$target" ] || { echo "glibc-floor.sh: pass a directory or file" >&2; exit 2; }
 
 scan() {
-    # `objdump -T` on a non-ELF file is an error, not a finding: ignore it rather than abort the scan.
-    objdump -T "$1" 2>/dev/null || true
+    # `objdump -p`, NOT `-T`. The dynamic symbol table only carries versions that some symbol is
+    # bound to, which misses two things: the GLIBC_ABI_* tags (they hang off .gnu.version_r with no
+    # symbol attached, so `-T` never shows one and a gate built on it can never fire), and plain
+    # version references no local symbol happens to use. Measured on the shipped artifact, `-T` sees
+    # {2.4, 2.9, 2.34, 2.35, 2.38} while `-p` also sees {2.3.4, 2.32, 2.33}. The maximum agreed here,
+    # but only by luck -- `-p` is the section that actually states what the loader must provide.
+    objdump -p "$1" 2>/dev/null || true
 }
 
 files=()

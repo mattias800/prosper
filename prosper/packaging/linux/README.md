@@ -85,7 +85,8 @@ upload is conditional:
   downloaded and opened by hand without giving every PR a release-sized artifact.
 
 Adding the label does not re-run the workflow on its own (`labeled` is not among the default
-`pull_request` event types); push a commit, or re-run the job, after applying it.
+`pull_request` event types), and re-running the job does not help either — a re-run replays the
+**original** event payload, which still does not carry the label. Push a commit after applying it.
 
 ## Pinned tooling
 

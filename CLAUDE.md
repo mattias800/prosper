@@ -91,6 +91,7 @@ shared-GPU policy, the instrument-not-the-subject list, and the dated current ha
 | UE4 / IoStore bring-up (shared) | — | `docs/UE4_APR_IOSTORE_BRINGUP.md`, `docs/CROSS_ENGINE_UE4.md` |
 | Renderer performance | July pass complete; the stop decision is recorded | `docs/RENDERER_PERFORMANCE_2026_07.md` |
 | Windows port / release | native SDL3+Vulkan frontend, screenshots, release path | `docs/WINDOWS_PORT_HANDOFF.md`, `docs/WINDOWS_RELEASE.md` |
+| Linux desktop release (AppImage + tarball) | published on `v*` tags; packaging is built and verified on every PR | `docs/LINUX_RELEASE.md` (users), `packaging/linux/README.md` (how, and its `## Ruled out`) |
 | GPU capture / replay / timeline tooling | F9 frame grab → offline `.prgbundle` / `.prgcap` workflow, and every `PROSPER_*` graphics diagnostic | `tools/gpu_replay/README.md`, `tools/gpu_timeline/README.md`, `tools/AGENTS.md` |
 | Graphics architecture, resource binding, recompiler | — | `docs/GRAPHICS.md`, `docs/RESOURCE_BINDING.md`, `docs/RECOMPILER_REMAINING.md` |
 | AGC command-packet sizes (a builder's dword count is an ABI contract with the guest's own reservations) | — | `docs/AGC_PACKET_SIZES.md` |

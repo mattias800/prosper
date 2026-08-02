@@ -216,7 +216,7 @@ The detailed native build, screenshot, and diagnostic recipe is in
 ## Windows download and use
 
 A `v*` tag publishes `prosper-windows-x64.zip` and its `.sha256` on the repository's
-[GitHub Releases page](https://github.com/mattias800/ps5ys/releases). The archive contains
+[GitHub Releases page](https://github.com/mattias800/prosper/releases). The archive contains
 `prosper-app.exe`, a one-command PowerShell launcher, and its usage guide; it never contains games,
 firmware, or keys.
 
@@ -235,7 +235,7 @@ save-data selection, the complete keyboard mapping, recordings, and troubleshoot
 ## Linux download and use
 
 A `v*` tag publishes `prosper-linux-x86_64.AppImage` and `prosper-linux-x86_64.tar.gz`, each with a
-`.sha256`, on the same [GitHub Releases page](https://github.com/mattias800/ps5ys/releases). Take the
+`.sha256`, on the same [GitHub Releases page](https://github.com/mattias800/prosper/releases). Take the
 AppImage for normal desktop use and the tarball when the AppImage runtime cannot start (it needs
 FUSE). Like the Windows archive, neither contains games, firmware, or keys.
 
@@ -253,9 +253,9 @@ tar -xzf prosper-linux-x86_64.tar.gz && cd prosper-linux-x86_64
 ./start-prosper.sh ~/ps5/PPSA24651-app0
 ```
 
-FFmpeg and libva travel inside the archive because their sonames differ on every distribution; SDL3
-is statically linked. What you must supply is **glibc 2.39 or newer** and a working Vulkan driver —
-no archive can carry either. `./prosper-linux-x86_64.AppImage --list-games --games-dir ~/ps5` prints
+FFmpeg, libva and the Vulkan loader travel inside the archive because their sonames differ on every
+distribution; SDL3 is statically linked. What you must supply is **glibc 2.39 or newer** and your
+GPU's Vulkan driver — no archive can carry either. `./prosper-linux-x86_64.AppImage --list-games --games-dir ~/ps5` prints
 the titles it can see and exits without opening a window, which is the quickest way to confirm a
 download runs. See [`LINUX_RELEASE.md`](prosper/docs/LINUX_RELEASE.md) for the full requirements,
 keyboard mapping, recordings, and troubleshooting, and
