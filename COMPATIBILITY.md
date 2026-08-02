@@ -33,7 +33,7 @@ Last updated: 2026-08-02
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🚧 Title screen (`NEW GAME` / `OPTIONS`) renders at native 2560×1440; gameplay not reached |
 | *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🔬 Boots into the UE4 render bring-up and submits real GPU work, then the render thread faults after about 10 s with no frame composited |
 | *Asterix &amp; Obelix - Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🔬 Boots and submits real GPU work, but every presented frame is black and a guest thread dies at about 125 s, after which the renderer publishes nothing |
-| *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Audio and sound bank initialise; the game's own code lives in a runtime-loaded PRX that prosper cannot yet load |
+| *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Loads and starts its runtime PRX and recompiles both first graphics stages, then null-derefs its own empty logged-in-user list — a startup race inside the title, not a missing API (#1746) |
 | *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Warning screen, publisher logo, title screen and EULA render at native 3840×2160 with no code changes; the 3D world is dropped because the programmed user-data block is larger than the bound pipeline's user-SGPR window (#305) |
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
@@ -74,7 +74,7 @@ is guest flips per second — the rate the game itself advances — averaged ove
 | *Asterix &amp; Obelix - Babylon Mission* `PPSA30490` | 0 | ~124 @ 1080p until 125 s | All frames black, then a guest thread dies and the renderer stops (#1599) |
 | *Sonic Origins* `PPSA05325` | 0 | ~5 @ 4K | One rendered frame; the supplied dump is update-only |
 | *ArcRunner* `PPSA21406` | 0 | — | Guest render thread faults after about 10 s, before any composited frame (#1226) |
-| *R-Type Delta: HD Boosted* `PPSA26414` | 0 | — | `GetProcAddress error 80020003`, then a guest fault at `rip=0` (#1591) |
+| *R-Type Delta: HD Boosted* `PPSA26414` | 0 | — | Guest fault at `eboot+0x24055`: `users.front()` on an empty vector, ~260 ms into the title's own 400 ms input-thread delay (#1746) |
 
 Six titles that render real content are below the 30 fps bar: Syberia (~2), Bendy in level (~8),
 Dragon Quest VII (~12), Nikoderiko (~14), The Pathless (~14) and The Plucky Squire (~21).
