@@ -5,7 +5,7 @@ describe specific, user-supplied PS5 dumps tested primarily on Linux. A mileston
 documented route is reproducible; it does **not** mean the entire game is playable or free of bugs.
 Different title revisions may behave differently.
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 ## Summary
 
@@ -36,6 +36,7 @@ Last updated: 2026-08-01
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
 | *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 **Gameplay** — title screen and the first playable scene render with real GPU draws on a validated route; the profile menu's 3D layer and the gameplay composite are degraded (#1619) |
 | *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Publisher and CRIWARE logos render at native 1920×1080; the opening movie stops it before the title screen |
+| *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and the ASTRO BOT title screen render at native 3840×2160; the title is over-exposed, the world-map hub shows only its backdrop, and guest compute costs ~21× throughput (#1732) |
 
 ¹ Exact retail game name pending confirmation.
 
@@ -677,6 +678,83 @@ not established and would need a denser capture.
   this title, not an effect of the change, and a one-draw difference is all that separates them. The
   hypothesis came from reading a `boot_trace` run against #1609's `screenshot`-frontend numbers —
   two different apparatus — and did not survive running both arms through one.
+
+## Astro Bot — `PPSA21564`
+
+<p align="center">
+  <img src="assets/screenshots/astro-bot-title.png" alt="Astro Bot — title screen">
+</p>
+<p align="center">
+  <img src="assets/screenshots/astro-bot-opening-cinematic.png" alt="Astro Bot — opening sequence">
+</p>
+<p align="center">
+  <img src="assets/screenshots/astro-bot-worldmap-background.png" alt="Astro Bot — world-map backdrop, with none of the hub's own content">
+</p>
+
+All three images are direct, unmodified `screenshot` frontend captures at native 3840×2160 (downscaled for
+this page) on Linux / Vulkan / RADV, with no render acceleration. The first is from a run with a
+flip-anchored route whose first pulse had not yet fired when the frame was taken; the other two are from a
+plain boot with no scripted input at all.
+
+The whole opening sequence renders: the *Sony Interactive Entertainment presents* card, the Astro cinematic
+above, the PlayStation logo animation and the PlayStation Studios card. All 300 samples of that run came
+from the live Vulkan renderer's composited output rather than the raw-scanout fallback, and none of them is
+black. The blue mottling visible behind the foreground in the first image is a real composition defect and
+is not corrected here. How much of this sequence is in-engine geometry versus decoded video is **not**
+settled by these runs — prosper's AvPlayer logging is behind `PROSPER_AVPLOG`, so its silence is not
+evidence either way, and `docs/screenshots/issue-825-astrobot-linux-sony-presents.png` records the opening
+having been served by the video path before.
+
+**The rung is 2.** The ASTRO BOT title card renders at 4K over the world-map nebula, with the wordmark and
+its ringed-planet *O* legible. It is not correct: the logo is washed out towards white instead of its solid
+metallic gradient, a grey rectangular panel sits behind and to the right of it, and the phase alternates
+roughly every other published frame between this image and a near-black one. It is a real, unmodified
+frontend capture of the title screen, and it is the milestone claimed here — nothing beyond it is.
+
+Reaching it takes patience rather than a route: the card first appears about **380 seconds** into a rendered
+run, at guest flip ~1214, and every previously committed route for this title finishes its input before flip
+1210. That is why it had not been seen. The separate `title_controller_ship` level is *not* this screen —
+the guest passes through that one in about 33 rendered frames on its way to the world map, publishing only
+fully saturated white (#1731).
+
+The world map is Astro Bot's hub — it is where levels are chosen — and it is where a rendered session
+currently stops. In every rendered run it composites its nebula backdrop at 4K and nothing else: no planets,
+no level nodes, no ship, no Astro, no HUD. Two checks designed to find hidden content came back empty —
+auto-levelling the dark half of the frame recovers only more nebula, and differencing frames 92 seconds
+apart with 20× amplification puts every changed pixel inside the slowly drifting nebula and leaves the rest
+exactly zero.
+
+That backdrop is itself recent progress. Before #1728 the world map published the same empty frame the run
+shows during early boot, with 14 distinct colours; #1728 stopped `CB_COLOR_CONTROL.MODE=DISABLE` from
+discarding the guest's explicit `CB_TARGET_MASK & CB_SHADER_MASK`, and the same rendered frame now carries
+735k. The A/B is exact — one commit, one build, `PROSPER_LEGACY_CB_DISABLE_MASK=1` restoring the old
+behaviour in place — and it is recorded on #1459.
+
+**The hub is not broken; it is out of reach.** With `PROSPER_NO_COMPUTE=1` the guest runs the world map,
+accepts a confirm, selects a level and loads `hub_crashsite_tutorial` — but the confirm that selects a level
+only lands at guest flip **2705**, and the world map itself arrives at flip ~810. Every route in the tree
+anchors in the `f730`–`f1210` window, where the hub has just appeared and is not yet interactive, so every
+rendered arm spent its input before the hub was ready.
+
+What makes flip 2705 unreachable in a rendered session is throughput, and it is **not** the renderer:
+removing the live renderer entirely leaves the guest at ~3 flips/s, while `PROSPER_NO_COMPUTE=1` takes it to
+~67. Guest compute is worth about **21×** on this title, which puts the level-select confirm ~17 minutes into
+a normal run and the first level ~28 minutes in. That ratio, not world-map composition, is Astro Bot's real
+frontier and is tracked on #1732. The world map's rendered content should be re-judged from a run that
+actually reaches flip 2700+.
+
+One instrument note worth carrying: **`GAME: Level has started: worldmap` never fires, even on a run that
+provably passes through the world map into the first level.** Its absence is not a progression signal. Gate
+on `Level has started: intro_next` and `SubLevelLocator … [hub_crashsite_tutorial]` instead.
+
+Also open: from roughly 110 s into the world map the composite starts alternating between the real image and
+a near-black publication, and by the title-card phase it is doing so on nearly every other frame (#1459).
+And every long run so far has ended in a host SIGFPE inside the Vulkan driver on the guest's `DrawThread`,
+three times, at guest flip ~1180–1320 — including once with no pad input having fired at all, so it is not
+input-triggered (#1730).
+
+Reusable input routes are documented in
+[`prosper/scripts/astrobot/README.md`](prosper/scripts/astrobot/README.md).
 
 ## Requirements and scope
 
