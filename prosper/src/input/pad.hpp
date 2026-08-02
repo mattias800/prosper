@@ -187,8 +187,10 @@ struct PadScriptState {
     uint8_t axis_mask = 0;
 };
 
-// Map a button name ("start"/"options"/"cross"/"x"/"up"/... case as written) to its SCE_PAD_BUTTON_*
-// bit; 0 if unknown. "start" and "options" both mean the PS5 Options button (the "Start" equivalent).
+// Map a button name ("start"/"options"/"cross"/"x"/"up"/"touchpad"/... case as written) to its
+// SCE_PAD_BUTTON_* bit; 0 if unknown. "start" and "options" both mean the PS5 Options button (the
+// "Start" equivalent); "touchpad" is the DualSense touch-pad click, which titles bind as an
+// ordinary button.
 uint32_t pad_button_by_name(const std::string& name);
 
 // Canonical '+'-joined names for a button mask. The output round-trips through the parser and uses a
