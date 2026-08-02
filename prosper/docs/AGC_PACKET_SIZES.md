@@ -68,6 +68,39 @@ probe manufactures defects:
 guest's own size table for the packets in it: Babylon's 16-dword epilogue holding `AcquireMem` +
 `EopAction` is what proved `RELEASE_MEM` must be 8 and not 9.
 
+## What the probe got wrong before it got anything right
+
+The most reusable result in this document is not a packet size. It is that **the first reading rule
+this probe shipped with would have reported seven builders as oversized, and every one was an
+artefact** — including one carrying the *exact arithmetic* of the real defect:
+
+| sub-op | reported as | why it was noise |
+| --- | --- | --- |
+| `SetCxRegsIndirect` / `SetShRegsIndirect` | `need=4 avail=3` → over by 1 | **The same shape as #1748's genuine off-by-one.** Three titles produce it |
+| `SetIndexBuffer` | `need=3 avail=2` | |
+| `EventWrite` | `need=4 avail=2` | |
+| `WaitRegMem` | `need=9 avail=7` | |
+| `WriteData` | `need=69 avail=25` | |
+| `SET_SH_REG` (op-carried) | `need=18 avail=2`, `need=30 avail=1` | |
+
+All of them carry `reserved=18`. `available_dw()` subtracts the guest's own `reserved_dw`, so a title
+holding a reserve reaches *space left, but not enough* at the end of **every** buffer, for whatever
+packet arrives next — and the leftover tracks each packet's own size, which is why the "overrun"
+appeared to be a different amount on every builder. Read naively that says prosper is oversized on
+seven builders by seven different amounts, which is not credible; the buffer is simply ending.
+
+Two further corrections the same instrument forced on its own operator, both recorded as instrument
+traps 55 and 56 in `GAME_COMPAT_ORCHESTRATION.md`:
+
+* a **window** is the current segment of a segmented Dcb, not a reservation — The Pathless produces
+  58 buffer-full events on windows of 1–7 dwords, every one with the cursor exactly at the limit;
+* the census's per-title counts were `[dcbfull]` **log lines**, which cap at 512 and then sample, so
+  four titles reporting "512–514" were reporting the cap. Every rate derived from them was void.
+
+The rule that survives is narrow: **`avail>0` AND `reserved=0` AND the same triple repeating**, and
+it is *sufficient, not necessary* (see the census). A probe whose first three readings were all wrong
+is worth more documented than deleted — the failure modes are the transferable part.
+
 ## The builder table
 
 `dw` is what prosper emits, **measured** (not read off the source) by `test_agc_getsize`, which
