@@ -41,6 +41,24 @@ bool mb3_freelist_contains_stable(uint64_t block, Mb3FreelistMatch* match = null
 // returns the hit count and formats up to `cap` bytes into `out` (NUL-terminated) when out non-null.
 int mb3_poolshift_window_scan(char* out, unsigned cap);
 
+// #1226 POSITIVE CONTROL for mb3_freelist_contains_stable(). A `false` from that walk is only
+// evidence if the walk can return `true` at all in this run — and it silently cannot when the
+// pool-candidate registry is empty, when the recycler bin was never discovered, or when the
+// allocator layout has drifted. A learned bin HEAD is by construction the first node of its own
+// chain, so asking membership about a head must answer yes; and because a head matches at hop 0,
+// each head's SUCCESSOR is probed too, since only traversal can reach an interior node.
+// Reports `pools/probes/positives/deep/deep_positives` into `out` and names the three failure
+// modes inline: `NO HEADS` (nothing to answer about), `BLIND` (a head is not in its own chain),
+// `SHALLOW` (heads found, no interior node reached).
+// RETURNS the interior-node count when traversal was testable (deep > 0), else the head count —
+// i.e. the strongest property actually demonstrated. Zero always means "do not trust a null from
+// this walk right now". Fault-safe and read-only.
+//
+// LIMIT: this controls the WALK, not the CALL SITE. A caller that early-returns before its own
+// probe for exactly the member==true population (as honor_dma_data does under
+// PROSPER_MB3_FREELIST_GUARD) will still see 100% member=0 beside a green self-test.
+int mb3_freelist_selftest(char* out, unsigned cap);
+
 // Test isolation for the process-global candidate registry.
 void mb3_reset_pool_candidates_for_test();
 

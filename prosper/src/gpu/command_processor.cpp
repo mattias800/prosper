@@ -670,9 +670,39 @@ static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint
 // is the first; guarding the fence alone cannot help, and the discriminator has to be the guest's
 // actual freelist MEMBERSHIP at write time (mb3_freelist_guard) rather than either write's content.
 // Do not "fix" this by widening a value-shape predicate; tests/test_eop_write.cpp pins both arms.
-// CONFIDENCE: HIGH that the two signatures are one chain (arithmetic + guest fatal + disassembly);
-// MED that the init is the first half (inferred from the suppressed arm; suppressing the INIT
-// directly is the experiment that would settle it, and has not been run).
+//
+// #1226 UPDATE — the init experiment was run. It does NOT support the paragraph above's second
+// half, and it does not support the opposite either. Whole-run totals (PROSPER_INIT_TRIP=1, one
+// 90 s run, n = every 4-byte zero init to a consumed-marker label):
+//
+//     n=1024  overptr=926  member=10  both=1
+//
+// So 90% of these inits do overwrite pointer-shaped content, but only ~1% of the destinations are
+// on an idx=1 free chain the walk models, and exactly ONE init in the run is both. The init is
+// therefore NOT systematically destroying live FFreeBlock links — the pointer it overwrites is
+// almost always the label pool's own stale link in a block the guest holds. `overptr` alone never
+// could have shown this, which is why #1754 left it at MED.
+//
+// READ THE TOTALS, NOT A LINE. The `member` population appears LATE: every sample before ordinal
+// ~512 reads member=0, and quoting one of those as the run's answer is how the first version of
+// this comment claimed "member=0 every time". That is the trap-51 cap-as-count error in a second
+// costume, which is why init_trip now prints INIT-TRIP-TOTALS every 256 as well as on the sparse
+// schedule. Scope: "not on the idx=1 chains this walk models" (per-thread bundles, the eight
+// recycler slots, central runs) — NOT "on no list anywhere". The label pool may keep its own.
+//
+// The suppression arm does NOT show what an earlier draft of this comment claimed. Recorded so it
+// is not re-derived: PROSPER_INIT_SUPPRESS=ptr drops 2,048+ inits, collapses the forge population
+// from ~4,096 to 21, additionally costs 192 fences through the REL1-LIVE guard — and the same
+// 0x30016000 still appears. That is NOT "neither write is necessary": one poisoned node is all the
+// pop needs, so a 200x rate reduction is not a necessity test, and the arm one paragraph above
+// (fence fully suppressed, landed forges = 0) DID remove 0x30016000. Across the three arms the
+// series reads 4096 -> poison, 21 -> poison, 0 -> no poison, which points at the fence being
+// SUFFICIENT, the opposite of the withdrawn claim.
+//
+// CONFIDENCE: HIGH on the read-artifact mechanism (arithmetic + guest fatal + disassembly).
+// LOW on any causal statement about the init: measured as a ~1-in-1000 event, mechanism unproven.
+// The decisive arm still unrun is landed-forges-zero AND init-suppressed together; if 0x30016000
+// survives that, prosper's label writes are excluded, and if it does not, the fence is the author.
 static inline bool forges_freelist_ptr(uint64_t pre, uint64_t width, uint64_t value) {
     if (!ptr_like(pre)) return false;        // dst must currently hold a heap/pool pointer
     if ((uint32_t)pre != 0) return false;    // low dword already nonzero -> the REL1-LIVE guard covers it
@@ -707,6 +737,13 @@ static void forge_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t va
         uint32_t rb = h ? h->rel_built_n.load(std::memory_order_relaxed) : 0;
         uint32_t rx = h ? h->rel_exec_n.load(std::memory_order_relaxed) : 0;
         char hist[640]; label_hist_report(dst, hist, sizeof hist);
+        // #1226: the same membership question init_trip asks, at the OTHER write. `live_pair` is our
+        // own bookkeeping and cannot arbitrate whether the guest still owns this block; the guest's
+        // free chains can. Only on printed lines, so the walk's cost stays bounded, and always with
+        // the self-test beside it so a `member=0` is never read from an unarmed walk.
+        Mb3FreelistMatch fmatch{};
+        const bool fmember = mb3_freelist_contains_stable(dst, &fmatch);
+        char fself[192]; mb3_freelist_selftest(fself, sizeof fself);
         // The forged qword is a POINTER WITH ITS LOW BIT SET. Should the guest allocator ever
         // dereference it as a free-block next-pointer, that read is MISALIGNED by one byte and
         // returns the target qword shifted right 8 bits — which is exactly the shape of the
@@ -722,12 +759,14 @@ static void forge_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t va
         else        snprintf(mis, sizeof mis, "unmapped");
         fprintf(stderr,
                 "[agc] FORGE-STOMP #%llu kind=%s dst=0x%llx pre=0x%llx val=0x%llx -> 0x%llx pkt=0x%llx "
-                "t=%llums cm=%d live=%d dmaB=%u dmaX=%u relB=%u relX=%u misread(*forged)=%s | %s\n",
+                "t=%llums cm=%d live=%d member=%d(list=%u) dmaB=%u dmaX=%u relB=%u relX=%u "
+                "misread(*forged)=%s | selftest %s | %s\n",
                 (unsigned long long)ord,
                 kind, (unsigned long long)dst, (unsigned long long)pre, (unsigned long long)value,
                 (unsigned long long)forged, (unsigned long long)pkt,
-                (unsigned long long)now_ms(), db > 0 ? 1 : 0, dx > rx ? 1 : 0, db, dx, rb, rx,
-                mis, hist);
+                (unsigned long long)now_ms(), db > 0 ? 1 : 0, dx > rx ? 1 : 0,
+                (int)fmember, fmatch.list, db, dx, rb, rx,
+                mis, fself, hist);
     }
 }
 // #312 ROOT fix gate (default ON; PROSPER_REL1_FORGE_GUARD=0 for A/B baseline). Suppress a fence
@@ -756,6 +795,125 @@ static bool waf_guard() {
     static const bool v = [] { const char* e = getenv("PROSPER_REL1_WAF_GUARD");
                                return e && strtol(e, nullptr, 0) != 0; }();   // default OFF
     return v;
+}
+// --- #1226 INIT-side measurement and A/B arm. ----------------------------------------------------
+// Reuses the existing wide "looks like a heap pointer" predicate (defined below with the clock-fence
+// records) rather than adding a fourth window: ArcRunner's arena and RHI objects sit in the
+// 0x2400000000..0x3200000000 range that the DOLL-era ptr_like() cannot see.
+namespace { bool clockfence_heapish(uint64_t v); }
+static bool mb3_freelist_guard();   // defined below; init_trip refuses to be read as a control under it
+// #1754 established the fence write is the SECOND half of ArcRunner's free-list corruption and left
+// the first half at CONFIDENCE: MED — the paired 4-byte DMA_DATA immediate-zero init is inferred to
+// be destroying the low dword of a live `FFreeBlock::NextFreeBlock`, but that was never measured
+// directly. This is the measurement. On every 4-byte immediate-zero init to a consumed-marker label
+// it reports, at the instant before the write lands:
+//   overptr=1  the destination currently holds a heap-pointer-shaped qword with a NONZERO low dword,
+//              i.e. this write is about to destroy a pointer rather than initialise a scratch label;
+//   member=1   the destination is, right now, reachable from the guest allocator's own idx=1 free
+//              chains (mb3_freelist_contains_stable).
+// `overptr` alone cannot decide anything — a label the guest legitimately POPPED from its pool free
+// list still carries the stale link, so the content is identical either way; that ambiguity is what
+// left the claim at MED. `member` is the discriminator, because a popped block is off the chain.
+// Log-only, default OFF, and it never gates a write.
+//
+// Printing follows trap 51 — ordinal on every line, first 64 then powers of two — but the TOTALS
+// ride a separate, denser schedule (every 256) on their own `INIT-TRIP-TOTALS` line. That split is
+// deliberate and was learned the hard way: the sparse schedule front-loads its samples, `member`
+// positives here appear only after ordinal ~512, and quoting a detail line as the run's answer is
+// what produced this comment's first, wrong version. The fractions are the result; a line is not.
+// There is no flush at exit (the repro is killed by a timeout or a SIGSEGV, so atexit would not
+// run) — up to 255 inits after the last multiple of 256 go unreported. The counters are cumulative,
+// so that bounds the last figure's staleness rather than corrupting it.
+static std::atomic<uint64_t> g_init_n{0}, g_init_overptr{0}, g_init_member{0}, g_init_both{0};
+static void init_trip(const Pm4Command& c, uint64_t pre, uint32_t v32) {
+    static const bool on = getenv("PROSPER_INIT_TRIP") != nullptr;
+    if (!on || c.dd_bytes != 4 || v32 != 0) return;
+    if (!label_is_consumed_marker(c.dd_dst)) return;
+    // A membership null is only evidence if the CALL SITE can observe a positive. With
+    // PROSPER_MB3_FREELIST_GUARD=1, honor_dma_data returns for exactly the member==true inits BEFORE
+    // reaching here, so this would report member=0 for 100% of what it sees — with a green self-test
+    // printed beside it. Refuse to be read that way.
+    static const bool not_a_control = mb3_freelist_guard();
+    if (not_a_control) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            fprintf(stderr, "[agc] INIT-TRIP NOT A CONTROL — PROSPER_MB3_FREELIST_GUARD is on. It "
+                            "returns before this probe for exactly the member=1 population (and, "
+                            "with PROSPER_GENERATION_GUARD, for the drifted-generation one too), "
+                            "so member=0 here is structural, not a measurement.\n");
+    }
+    const bool overptr = clockfence_heapish(pre) && (uint32_t)pre != 0;
+    // Membership can only ever be TRUE for a 0x20-aligned block base, so a misaligned label is a
+    // STRUCTURAL member=0, indistinguishable from walked-and-not-found unless it is reported. Same
+    // class of trap as the one above, one level down. This duplicates mb3_freelist.cpp's
+    // plausible_node(), which is in that file's anonymous namespace and so cannot be called here;
+    // if that gate changes, this must follow or the field silently starts lying.
+    const bool aligned = c.dd_dst >= 0x10000 && !(c.dd_dst & 0x1full);
+    Mb3FreelistMatch match{};
+    const bool member = mb3_freelist_contains_stable(c.dd_dst, &match);
+    const uint64_t ord = g_init_n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (overptr) g_init_overptr.fetch_add(1, std::memory_order_relaxed);
+    if (member)  g_init_member.fetch_add(1, std::memory_order_relaxed);
+    if (overptr && member) g_init_both.fetch_add(1, std::memory_order_relaxed);
+    // Detail lines are sparse (trap 51). TOTALS are printed every 256 as well, because the sparse
+    // schedule front-loads its samples: a population that only appears late — which is exactly what
+    // `member` does here — is absent from every early line, and quoting one of those as the run's
+    // answer is the cap-as-count trap wearing a different hat.
+    const bool detail = ord <= 64 || (ord & (ord - 1)) == 0;
+    if (detail) {
+        char self[256]; mb3_freelist_selftest(self, sizeof self);
+        fprintf(stderr, "[agc] INIT-TRIP-SELFTEST #%llu %s\n", (unsigned long long)ord, self);
+        fprintf(stderr,
+                "[agc] INIT-TRIP #%llu dst=0x%llx pre=0x%llx overptr=%d aligned=%d "
+                "member=%d(list=%u pool=0x%llx hops=%u) t=%llums\n",
+                (unsigned long long)ord, (unsigned long long)c.dd_dst, (unsigned long long)pre,
+                (int)overptr, (int)aligned,
+                (int)member, match.list, (unsigned long long)match.pool_base, match.hops,
+                (unsigned long long)now_ms());
+    }
+    if (detail || (ord % 256) == 0)
+        fprintf(stderr, "[agc] INIT-TRIP-TOTALS n=%llu overptr=%llu member=%llu both=%llu t=%llums\n",
+                (unsigned long long)g_init_n.load(std::memory_order_relaxed),
+                (unsigned long long)g_init_overptr.load(std::memory_order_relaxed),
+                (unsigned long long)g_init_member.load(std::memory_order_relaxed),
+                (unsigned long long)g_init_both.load(std::memory_order_relaxed),
+                (unsigned long long)now_ms());
+}
+// A/B arm for the same claim (PROSPER_INIT_SUPPRESS=off|ptr|member, default off). NOT a candidate
+// fix — `ptr` deliberately suppresses on CONTENT, which #1245 proved cannot distinguish a live
+// label from a freed block, so arming it will also drop legitimate inits. It exists so the
+// counter-arm can be run: if prosper's own init is the first half of the damage, removing it must
+// change the corruption, and if it does not, the first half is somewhere else entirely.
+//   ptr    — suppress whenever this write would destroy a pointer-shaped qword (upper bound: every
+//            init that could possibly be the first half, including the legitimate ones).
+//   member — suppress only when the block is on the guest's free list right now (the honest form,
+//            equivalent to the existing PROSPER_MB3_FREELIST_GUARD init leg without its other legs).
+static int init_suppress_mode() {
+    static const int v = [] {
+        const char* e = getenv("PROSPER_INIT_SUPPRESS");
+        if (!e || !*e) return 0;
+        if (!strcmp(e, "ptr")) return 1;
+        if (!strcmp(e, "member")) return 2;
+        if (!strcmp(e, "off") || !strcmp(e, "0")) return 0;
+        fprintf(stderr, "[agc] PROSPER_INIT_SUPPRESS='%s' unrecognized (want off|ptr|member) — OFF\n", e);
+        return 0;
+    }();
+    return v;
+}
+static bool init_suppress(const Pm4Command& c, uint64_t pre, uint32_t v32) {
+    const int mode = init_suppress_mode();
+    if (!mode || c.dd_bytes != 4 || v32 != 0) return false;
+    if (!label_is_consumed_marker(c.dd_dst)) return false;
+    if (!(clockfence_heapish(pre) && (uint32_t)pre != 0)) return false;
+    if (mode == 2 && !mb3_freelist_contains_stable(c.dd_dst)) return false;
+    static std::atomic<uint64_t> n{0};
+    const uint64_t ord = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (ord <= 64 || (ord & (ord - 1)) == 0)
+        fprintf(stderr, "[agc] INIT-SUPPRESS #%llu mode=%s dst=0x%llx pre=0x%llx t=%llums\n",
+                (unsigned long long)ord, mode == 1 ? "ptr" : "member",
+                (unsigned long long)c.dd_dst, (unsigned long long)pre,
+                (unsigned long long)now_ms());
+    return true;
 }
 // #312 CLOSE: bounded log of a suppressed write-after-free. PER-CATEGORY caps so a rare non-pointer
 // (canary-residual) or Case-B suppression is always visible even after the common pointer case fills.
@@ -1355,6 +1513,13 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
             }
         }
         forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, packet_addr);
+        init_trip(c, pre_dma, v32);   // #1226: is THIS write the first half of the corruption?
+        if (init_suppress(c, pre_dma, v32)) {   // #1226 A/B arm; default OFF
+            label_hist_dma_skip(c.dd_dst);
+            return;
+        }
+        // After the suppression decision: the value trap answers "which prosper write STORED this
+        // dword", so counting a write that never lands would make its hits unusable as provenance.
         write_trap_scan("DMA-imm", c.dd_dst, pre_dma, &v32, sizeof v32, packet_addr);
         if (v32 == 0) {
             memset(dst, 0, c.dd_bytes);

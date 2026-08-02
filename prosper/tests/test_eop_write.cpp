@@ -502,6 +502,31 @@ int main() {
     CHECK(!mb3_freelist_contains_stable((uint64_t)(uintptr_t)&live_label, nullptr),
           "an allocated block absent from both freelists is not classified free");
 
+    // #1226: the self-test that licenses reading that `false` as evidence. Both heads above are, by
+    // construction, the first node of their own chain, so the walk must find both — and when the
+    // registry is empty it must report probes=0 rather than a confident-looking positives=0. This
+    // matters because ArcRunner's whole init/fence conclusion rests on `member=0` readings, and an
+    // unarmed walk produces exactly the same zero.
+    {
+        char self[256] = {};
+        const int deep_positives = mb3_freelist_selftest(self, sizeof self);
+        CHECK(strstr(self, "probes=2") && strstr(self, "positives=2"),
+              "MB3 self-test finds every learned bin head in its own chain");
+        // The primary chain is head -> free_tail, so exactly one interior node is reachable; the
+        // secondary head has no successor. A head matches at hop 0, so without this the control
+        // would pass on a walk that cannot traverse at all.
+        CHECK(deep_positives == 1 && strstr(self, "deep=1") && strstr(self, "deep_positives=1"),
+              "MB3 self-test reaches an interior node, not just the head");
+        CHECK(!strstr(self, "BLIND") && !strstr(self, "NO HEADS") && !strstr(self, "SHALLOW"),
+              "MB3 self-test reports no blindness while the walk is working");
+        mb3_reset_pool_candidates_for_test();
+        char empty[192] = {};
+        CHECK(mb3_freelist_selftest(empty, sizeof empty) == 0 && strstr(empty, "probes=0") &&
+              strstr(empty, "NO HEADS"),
+              "MB3 self-test flags an empty registry instead of reporting a clean zero");
+        mb3_note_tls_pool_candidate((uint64_t)(uintptr_t)mb3_pool);   // restore for the tests below
+    }
+
     // Full bundles leave the per-thread secondary root and move into one of eight lock-free global
     // recycler slots. Membership must continue to see those nodes until the slot is popped.
     static uint64_t global_slots[8] = {};

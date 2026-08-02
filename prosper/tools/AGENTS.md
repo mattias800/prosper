@@ -71,6 +71,44 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 
     Malformed input is refused **loudly** (`[write-trap] NOT ARMED …`, `REFUSED …`) rather than
     silently disarming, because a silent disarm is indistinguishable from a hard negative.
+  - **Does the guest still own this block when we write to it?** **`PROSPER_INIT_TRIP=1`** reports,
+    for every 4-byte immediate-zero `DMA_DATA` init to a consumed-marker fence label, whether the
+    destination currently holds pointer-shaped content (`overptr`) and whether it is reachable from
+    the guest allocator's own idx=1 free chains (`member`). Detail and totals are separate lines:
+    ```text
+    [agc] INIT-TRIP-SELFTEST #512 pools=25 probes=9 positives=9 deep=8 deep_positives=8 first_head=0x…
+    [agc] INIT-TRIP #512 dst=0x… pre=0x… overptr=1 aligned=1 member=0(list=0 pool=0x0 hops=0) t=…ms
+    [agc] INIT-TRIP-TOTALS n=1024 overptr=926 member=10 both=1 t=…ms
+    ```
+    `overptr` alone decides nothing — a label the guest legitimately *popped* from its pool free list
+    still carries the stale link, so the content is identical either way. `member` is the
+    discriminator.
+
+    **Read `INIT-TRIP-TOTALS`, never a detail line**, and note that the sample above shows why: the
+    detail line at #512 reads `member=0` while the run total is `member=10`. The detail schedule is
+    sparse and front-loaded, and on this title the `member` population does not appear until after
+    ordinal ~512, so every early sample reads zero. Quoting one of them is exactly how #1767's first
+    draft reached a conclusion its own totals contradict. Totals print every 256 for that reason.
+    `aligned=0` marks a destination membership could never match anyway (`plausible_node` wants a
+    0x20-aligned block base), so it is a structural zero rather than a finding.
+
+    **The `SELFTEST` line is not optional decoration**: a learned bin *head* is by
+    construction the first node of its own chain, so a walk that answers "no" to a head is blind
+    rather than truthful, and `positives < probes` (or `probes=0`) means every `member=0` beside it
+    is an unarmed instrument, not evidence. A head matches at hop 0, though, which proves only that
+    the walk is *armed* — so the probe also follows each head's successor (`deep`/`deep_positives`),
+    an interior node reachable only by traversing a link. The three failure modes are named in the
+    line itself: `NO HEADS`, `BLIND`, `SHALLOW`.
+
+    `mb3_freelist_selftest()` is available to any caller that wants to qualify a membership null the
+    same way. It controls the **walk**, not the **call site**: a caller that early-returns for the
+    `member==true` population before reaching its own probe will still see 100% `member=0` beside a
+    green self-test. `PROSPER_INIT_TRIP` prints a `NOT A CONTROL` banner when
+    `PROSPER_MB3_FREELIST_GUARD` is armed alongside it for exactly that reason.
+    **`PROSPER_INIT_SUPPRESS=ptr|member`** is the matching A/B arm, not a candidate fix: `ptr`
+    suppresses on content, which #1245 proved cannot separate a live label from a freed block, so it
+    will also drop legitimate inits. It exists so "is this write load-bearing for the corruption?"
+    can be answered by removing it.
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
   `--seconds 1` for wall-clock sampling, warmup or `--render-every N --render-every-for-seconds S`
   for slow software rendering,
