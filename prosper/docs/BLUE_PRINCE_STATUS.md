@@ -87,6 +87,22 @@ The `blue-prince-title` snapshot route guards the title screen.
   decode cache is disabled by construction in replay — and live only ~77 of ~5,500 texture
   references per submit ever reached it.
 
+- **#1284 (open) — the frame-time term is backend storage-buffer upload, not textures or
+  descriptors.** Re-measured on `3a473bca` (post-#1292, post-#1703), 35 peer-free heavy windows:
+  the backend submit is **165.18 ms** (was 263.33 in the issue body), and **every term that
+  decomposition named has collapsed except `draw_setup`** — `readback` 79.16 -> 14.71,
+  `record_upload` 22.58 -> 2.73, `gpu_wait` 29.29 -> 6.71, fence waits 61 -> 16.3, while
+  `draw_setup` is 119.87 -> 126.81 at 1.39x the draws. `gpu_device` is **4.31 ms inside 165 ms**, so
+  the GPU is 2.6 % busy and this title is bound in prosper's own per-draw CPU path.
+  Sub-attributing `draw_setup.resources` (89.66 ms, 54 % of the submit) live gives
+  **`res.buffer` 93.7 %**, `res.descriptor` 2.0 %, `res.texture` 1.8 %. The frontend resolves every
+  binding to a zero-copy direct guest view (`logical=1,764.4 MiB materialized=0.0 MiB` per submit)
+  and the backend copies the deduplicated set into host-visible staging anyway, while
+  `backend_buffer_pool` sits pegged at its 256 MiB ceiling with evictions exactly equal to misses.
+  Full numbers, method and the four falsified sub-hypotheses (descriptor setup, live texture cost,
+  per-draw `getenv`, the #1268 content hash) are in
+  `docs/RENDERER_PERFORMANCE_2026_07.md` § *Blue Prince 3D submit decomposition, re-measured*.
+
 ## Defect families (#1287) — families 1–3 and 5 RESOLVED 2026-07-26
 
 Families 1–3 and 5 below are **fixed on master**; they are retained as the resolution record so
