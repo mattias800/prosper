@@ -65,6 +65,77 @@ in-place mutation invalidate the entry. Its memory-aware default is one eighth o
 memory, clamped to 1-2 GiB. Disable it with `PROSPER_NO_TEXTURE_DECODE_CACHE=1`; the budget is controlled by
 `PROSPER_TEXTURE_DECODE_CACHE_MB`.
 
+## Blue Prince 3D submit decomposition, re-measured (2026-08-02, #1284)
+
+Re-measured on `3a473bca` — i.e. **after** #1292 (demand-driven readbacks) and #1703 (submit-scoped
+decode identity) — with `PROSPER_RENDER_TIMING=1` on the scripted Blue Prince fresh-save route into
+the manor, RADV / Radeon 8060S (STRIX_HALO, integrated), native 1920x1080, no snapshot acceleration.
+35 peer-free heavy `[render-window]` samples, median:
+
+| term | med ms | share | July (#1284 body) |
+|---|---:|---:|---:|
+| `measured` (whole backend submit) | 165.18 | 100 % | 263.33 |
+| `draw_setup` | 126.81 | **76.8 %** | 119.87 |
+| — `resources` | **89.66** | **54.3 %** | 95.42 |
+| — `fixed` | 24.40 | 14.8 % | 16.43 |
+| — unattributed inside `draw_setup` | 6.17 | 3.7 % | — |
+| — `pipeline` | 1.43 | 0.9 % | 1.22 |
+| `readback` | 14.71 | 8.9 % | 79.16 |
+| `cleanup` | 13.19 | 8.0 % | 11.03 |
+| `gpu_wait` | 6.71 | 4.1 % | 29.29 |
+| — `gpu_device` (real GPU time) | **4.31** | **2.6 %** | — |
+| `record_upload` | 2.73 | 1.7 % | 22.58 |
+| `fence_waits` per submit | 16.3 | — | 61 |
+
+The scene is now **2,109 draws/submit**, not July's 1,516, so `resources` improved more per draw than
+the totals show. **Every term the original decomposition named has collapsed except `draw_setup`,**
+which is unchanged and is now 77 % of the submit. `gpu_device` 4.31 ms inside a 165 ms submit means
+**2.6 % GPU utilisation**: this title is not GPU-, driver-, or shader-bound, it is bound in prosper's
+own per-draw CPU path.
+
+### `draw_setup.resources` is 93.7 % storage-buffer upload
+
+`resources` never measured descriptor setup. The interval spans the whole per-draw resource block,
+which also builds every texture upload and every storage-buffer upload. The sub-attribution added in
+#1284 (`[render-window] backend-submit resources avg_ms: …`) splits it live:
+
+| sub-term | med ms | share of `resources` |
+|---|---:|---:|
+| **`res.buffer`** | **103.51** | **93.7 %** |
+| `res.other` | 3.01 | 2.7 % |
+| `res.descriptor` | 2.25 | 2.0 % |
+| `res.texture` (upload 0.75 / bind 0.18 / lookup 1.15) | 2.01 | 1.8 % |
+
+Mechanism, from two independent counters in the same run. **Volume:** the frontend resolves every
+binding to a zero-copy direct guest view and reports `buffers=34,747 logical=1,764.4 MiB
+materialized=0.0 MiB` per submit — and the *backend* then `memcpy`s the deduplicated set into
+host-visible staging anyway. The Evergate "direct guest backing" win was only ever realised on the
+frontend side of that boundary. **Churn:** `backend_buffer_pool` sits pegged at its 256 MiB default
+ceiling with evictions exactly equal to misses (+7,960 / +7,960 over 9 s, 45 % miss rate) — a capacity
+thrash in which one buffer is destroyed for every one created, with the eviction victim taken as
+`available.begin()` on an `unordered_map`, i.e. an arbitrary bucket rather than an LRU.
+
+### Ruled out
+
+- **Per-draw descriptor setup is not the term.** `res.descriptor` — layout lookup,
+  `vkAllocateDescriptorSets`, `vkUpdateDescriptorSets` — is 2.25 ms across 2,152 draws (~1 µs/draw),
+  2.0 % of `resources`. This is the measured reason #1284 round 1's descriptor-set-reuse experiment
+  came back neutral: it was optimising 2 % of the term. Do not re-open it.
+- **Texture handling is not the term live.** `res.texture` is 2.01 ms; #1691/#1703's caches work.
+  Note the trap: the *identical instrument* on an offline `.prgcap` replay of the same title reports
+  `res.texture` = 762.72 ms, because replay disables the persistent decode cache by construction
+  (`texture_decode_cache_candidate()` requires `!has_captured_host_data`). **A replay texture number
+  is not evidence about live texture cost, in either direction.**
+- **Un-cached `getenv` in the per-draw loop is not a term.** The loop makes 11 un-cached `getenv`
+  calls (`PROSPER_NO_CULL`, `NO_BLEND` x3, `DSLOG`, `STENCILLOG`, `STENCIL_MIRROR`,
+  `STENCIL_REPLACE`, `NO_DEPTH_BIAS`, `FLIP_FRONT_FACE`, and `NO_SWIZZLE` which is per *texture
+  reference*), sitting next to three neighbours that already cache into `static const`. Measured
+  directly: glibc `getenv` on a miss costs 19.7 ns (10-var environment) to 25.6 ns (94-var), so the
+  whole per-submit volume is **≈0.5 ms of 165 ms — 0.3 %**. Tidy if touched for other reasons; not a
+  performance fix.
+- **The #1268 small-buffer content hash is not the term.** Live `hash-stats`: 414,633 hash calls over
+  168.1 MiB against 3.5 M references — ~1 % of the buffer term.
+
 ## Plucky Squire maximum-size atlas retention (2026-07-29)
 
 Plucky Squire exposed a capacity cliff rather than a decode-kernel regression. The title first holds
