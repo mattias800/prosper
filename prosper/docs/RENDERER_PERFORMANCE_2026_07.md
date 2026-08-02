@@ -169,13 +169,15 @@ sources, only host staging recycling changes: make the default memory-aware (mir
 `texture_decode_cache_limit_bytes`, with the `*_MB` override winning) and give eviction an LRU victim
 instead of `available.begin()` on an `unordered_map`. The risk is memory footprint, not correctness.
 
-This does **not** retire the copy. Even at 2048 MiB, `copy` is 33.44 ms and `res_buffer` 41.62 ms of
-a 126.58 ms submit, so removing the copy entirely — importing guest pages as Vulkan memory
-(`VK_EXT_external_memory_host`; prosper uses it nowhere today, there is no
-`vkGetMemoryHostPointerPropertiesEXT` / `VkImportMemoryHostPointerInfoEXT` in the tree), or a
-versioned guest-identity buffer cache — remains the structural follow-up. The second reuses the #1703
-machinery but carries the #611/#780 stale-data risk; the first does not, because the GPU would read
-the guest bytes rather than a snapshot of them.
+This does **not** retire the copy, and the difference matters for what anyone expects next: the fix
+stops the pool *thrashing while it copies*, it does not stop the copying. Even at 2048 MiB, `copy` is
+33.27 ms and `res_buffer` 41.50 ms of a 125.98 ms submit — about **8 backend submits per second
+against a bar of 30.** Removing the copy entirely is tracked as **#1733**: import guest pages as
+Vulkan memory (`VK_EXT_external_memory_host`; prosper uses it nowhere today, there is no
+`vkGetMemoryHostPointerPropertiesEXT` / `VkImportMemoryHostPointerInfoEXT` in the tree), or add a
+versioned guest-identity buffer cache. The second reuses the #1703 machinery but carries the
+#611/#780 stale-data risk; the first does not, because the GPU would read the guest bytes rather than
+a snapshot of them.
 
 Frame math, so nobody expects one term to finish the job: at the clean 165.18 ms submit, removing
 100 % of `copy` gives ~95 ms (10.5 submits/s); removing `copy` **and** `acquire` **and** `fixed`
