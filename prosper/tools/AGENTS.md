@@ -71,6 +71,25 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 
     Malformed input is refused **loudly** (`[write-trap] NOT ARMED …`, `REFUSED …`) rather than
     silently disarming, because a silent disarm is indistinguishable from a hard negative.
+  - **Does the guest still own this block when we write to it?** **`PROSPER_INIT_TRIP=1`** reports,
+    for every 4-byte immediate-zero `DMA_DATA` init to a consumed-marker fence label, whether the
+    destination currently holds pointer-shaped content (`overptr`) and whether it is reachable from
+    the guest allocator's own idx=1 free chains (`member`), with running totals:
+    ```text
+    [agc] INIT-TRIP-SELFTEST #512 pools=25 probes=9 positives=9 first_head=0x2020f44c60
+    [agc] INIT-TRIP #512 dst=0x… pre=0x… overptr=1 member=0(list=0 …) | totals n=512 overptr=465 member=0 both=0
+    ```
+    `overptr` alone decides nothing — a label the guest legitimately *popped* from its pool free list
+    still carries the stale link, so the content is identical either way. `member` is the
+    discriminator. **The `SELFTEST` line is not optional decoration**: a learned bin *head* is by
+    construction the first node of its own chain, so a walk that answers "no" to a head is blind
+    rather than truthful, and `positives < probes` (or `probes=0`) means every `member=0` beside it
+    is an unarmed instrument, not evidence. `mb3_freelist_selftest()` is available to any caller that
+    wants to qualify a membership null the same way.
+    **`PROSPER_INIT_SUPPRESS=ptr|member`** is the matching A/B arm, not a candidate fix: `ptr`
+    suppresses on content, which #1245 proved cannot separate a live label from a freed block, so it
+    will also drop legitimate inits. It exists so "is this write load-bearing for the corruption?"
+    can be answered by removing it.
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
   `--seconds 1` for wall-clock sampling, warmup or `--render-every N --render-every-for-seconds S`
   for slow software rendering,

@@ -41,6 +41,15 @@ bool mb3_freelist_contains_stable(uint64_t block, Mb3FreelistMatch* match = null
 // returns the hit count and formats up to `cap` bytes into `out` (NUL-terminated) when out non-null.
 int mb3_poolshift_window_scan(char* out, unsigned cap);
 
+// #1226 POSITIVE CONTROL for mb3_freelist_contains_stable(). A `false` from that walk is only
+// evidence if the walk can return `true` at all in this run — and it silently cannot when the
+// pool-candidate registry is empty, when the recycler bin was never discovered, or when the
+// allocator layout has drifted. A learned bin HEAD is by construction the first node of its own
+// chain, so asking membership about a head must answer yes. This probes every learned idx=1 head
+// and reports pools/probes/positives, so a negative result elsewhere can be read as a negative
+// rather than as an unarmed instrument. Fault-safe; formats into `out` and returns the positives.
+int mb3_freelist_selftest(char* out, unsigned cap);
+
 // Test isolation for the process-global candidate registry.
 void mb3_reset_pool_candidates_for_test();
 

@@ -222,6 +222,35 @@ void mb3_note_global_recycler_bin(uint64_t base) {
     g_global_recycler_bin.store(base, std::memory_order_release);
 }
 
+// See mb3_freelist.hpp. Probes the learned idx=1 bin heads — each is trivially a member of its own
+// chain, so a walk that answers "no" to one of those is blind rather than truthful.
+int mb3_freelist_selftest(char* out, unsigned cap) {
+    uint32_t pools = g_pool_candidate_count.load(std::memory_order_acquire);
+    if (pools > kMaxPoolCandidates) pools = kMaxPoolCandidates;
+    int probes = 0, positives = 0;
+    uint64_t first_head = 0;
+    for (uint32_t i = 0; i < pools; ++i) {
+        const uint64_t base = g_pool_candidates[i].load(std::memory_order_acquire);
+        if (!base) continue;
+        uint64_t bin[4] = {};
+        if (!safe_read(base + 0x20, bin, sizeof bin)) continue;
+        for (const uint64_t head : {bin[0], bin[2]}) {
+            if (!plausible_node(head)) continue;
+            if (!first_head) first_head = head;
+            probes++;
+            Mb3FreelistMatch m{};
+            if (scan_once(head, &m)) positives++;
+        }
+    }
+    if (out && cap)
+        snprintf(out, cap, "pools=%u probes=%d positives=%d first_head=0x%llx%s",
+                 pools, probes, positives, (unsigned long long)first_head,
+                 probes == 0        ? "  [NO HEADS — walk has nothing to answer about]"
+                 : positives == 0   ? "  [BLIND — a head is not found in its own chain]"
+                                    : "");
+    return positives;
+}
+
 bool mb3_freelist_contains_stable(uint64_t block, Mb3FreelistMatch* match) {
     Mb3FreelistMatch first{};
     if (!scan_once(block, &first)) return false;
