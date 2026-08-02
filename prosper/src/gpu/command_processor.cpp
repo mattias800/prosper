@@ -816,8 +816,14 @@ static bool mb3_freelist_guard();   // defined below; init_trip refuses to be re
 // left the claim at MED. `member` is the discriminator, because a popped block is off the chain.
 // Log-only, default OFF, and it never gates a write.
 //
-// Running totals are on every line, and the printing follows trap 51: ordinal on each line, first 64
-// then powers of two, totals uncapped. The fractions are the result here, not the samples.
+// Printing follows trap 51 — ordinal on every line, first 64 then powers of two — but the TOTALS
+// ride a separate, denser schedule (every 256) on their own `INIT-TRIP-TOTALS` line. That split is
+// deliberate and was learned the hard way: the sparse schedule front-loads its samples, `member`
+// positives here appear only after ordinal ~512, and quoting a detail line as the run's answer is
+// what produced this comment's first, wrong version. The fractions are the result; a line is not.
+// There is no flush at exit (the repro is killed by a timeout or a SIGSEGV, so atexit would not
+// run) — up to 255 inits after the last multiple of 256 go unreported. The counters are cumulative,
+// so that bounds the last figure's staleness rather than corrupting it.
 static std::atomic<uint64_t> g_init_n{0}, g_init_overptr{0}, g_init_member{0}, g_init_both{0};
 static void init_trip(const Pm4Command& c, uint64_t pre, uint32_t v32) {
     static const bool on = getenv("PROSPER_INIT_TRIP") != nullptr;
@@ -831,14 +837,17 @@ static void init_trip(const Pm4Command& c, uint64_t pre, uint32_t v32) {
     if (not_a_control) {
         static std::atomic<bool> said{false};
         if (!said.exchange(true))
-            fprintf(stderr, "[agc] INIT-TRIP NOT A CONTROL — PROSPER_MB3_FREELIST_GUARD is on, which "
-                            "returns before this probe for exactly the member=1 population. "
-                            "member=0 here is structural, not a measurement.\n");
+            fprintf(stderr, "[agc] INIT-TRIP NOT A CONTROL — PROSPER_MB3_FREELIST_GUARD is on. It "
+                            "returns before this probe for exactly the member=1 population (and, "
+                            "with PROSPER_GENERATION_GUARD, for the drifted-generation one too), "
+                            "so member=0 here is structural, not a measurement.\n");
     }
     const bool overptr = clockfence_heapish(pre) && (uint32_t)pre != 0;
-    // Membership can only ever be TRUE for a 0x20-aligned block base (plausible_node), so a
-    // misaligned label is a STRUCTURAL member=0, indistinguishable from walked-and-not-found unless
-    // it is reported. Same class of trap as the one above, one level down.
+    // Membership can only ever be TRUE for a 0x20-aligned block base, so a misaligned label is a
+    // STRUCTURAL member=0, indistinguishable from walked-and-not-found unless it is reported. Same
+    // class of trap as the one above, one level down. This duplicates mb3_freelist.cpp's
+    // plausible_node(), which is in that file's anonymous namespace and so cannot be called here;
+    // if that gate changes, this must follow or the field silently starts lying.
     const bool aligned = c.dd_dst >= 0x10000 && !(c.dd_dst & 0x1full);
     Mb3FreelistMatch match{};
     const bool member = mb3_freelist_contains_stable(c.dd_dst, &match);
