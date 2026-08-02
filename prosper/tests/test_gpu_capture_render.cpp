@@ -1146,6 +1146,88 @@ int main() {
         CHECK(prosper::test::persistent_texture_cache_budget_for_heap(128ull * GiB) == 4ull * GiB,
               "sampled-image auto sizing remains capped at 4 GiB");
 
+        // #1284: the host-buffer staging pool was a flat 256 MiB against a measured 974 MiB working
+        // set on Blue Prince, so it evicted one buffer for every one it created. Size it from host
+        // RAM instead. The floor is the historical default, so no host is given LESS than before.
+        {
+            constexpr uint64_t MiB = 1024ull * 1024ull;
+            using prosper::test::render_host_buffer_pool_limit_bytes;
+            CHECK(render_host_buffer_pool_limit_bytes(nullptr, 0) == 256ull * MiB,
+                  "an unknown host size falls back to the historical 256 MiB pool floor");
+            CHECK(render_host_buffer_pool_limit_bytes(nullptr, 1ull * GiB) == 256ull * MiB,
+                  "a small host is clamped up to the 256 MiB pool floor, never below it");
+            CHECK(render_host_buffer_pool_limit_bytes(nullptr, 8ull * GiB) == 1024ull * MiB,
+                  "an 8 GiB host admits a 1 GiB pool, which covers the measured 974 MiB set");
+            CHECK(render_host_buffer_pool_limit_bytes(nullptr, 16ull * GiB) == 2048ull * MiB,
+                  "a 16 GiB host reaches the 2 GiB pool ceiling");
+            CHECK(render_host_buffer_pool_limit_bytes(nullptr, 128ull * GiB) == 2048ull * MiB,
+                  "pool auto sizing remains capped at 2 GiB");
+            CHECK(render_host_buffer_pool_limit_bytes("256", 128ull * GiB) == 256ull * MiB,
+                  "the pool MiB override takes precedence over host memory");
+            CHECK(render_host_buffer_pool_limit_bytes("64", 128ull * GiB) == 64ull * MiB,
+                  "the override may go BELOW the floor — it is the constrained-host escape hatch "
+                  "and the A/B lever, so it must be exact");
+            CHECK(render_host_buffer_pool_limit_bytes("0", 8ull * GiB) == 0,
+                  "an explicit zero disables pool retention rather than being clamped up");
+        }
+
+        // #1284: eviction must pick the least-recently-released buffer, not an arbitrary hash
+        // bucket. Below any budget smaller than the working set the old policy discarded whichever
+        // capacity class the map happened to order first — very often the one about to be reused —
+        // so raising the budget alone would leave the same failure waiting for a larger title.
+        //
+        // Populated so that the oldest entry is deliberately NOT in the first-inserted class and NOT
+        // in the smallest or largest class: an arbitrary-bucket policy has no reason to select 8192,
+        // so this fails without the fix rather than passing by construction.
+        {
+            using prosper::test::RenderHostBuffer;
+            using prosper::test::RenderHostBufferPool;
+            using prosper::test::render_host_buffer_pool_lru_key;
+
+            RenderHostBufferPool pool;
+            auto add = [&pool](VkDeviceSize capacity, uint64_t stamp) {
+                RenderHostBuffer entry;
+                entry.bytes = capacity;
+                entry.allocation_bytes = capacity;
+                entry.last_use = stamp;
+                pool.available[capacity].push_back(entry);
+            };
+            add(4096, 40);
+            add(8192, 10);          // oldest overall, middle capacity class
+            add(65536, 25);
+            add(1024, 33);
+
+            VkDeviceSize victim = 0;
+            CHECK(render_host_buffer_pool_lru_key(pool, victim),
+                  "a populated pool yields an eviction victim");
+            CHECK(victim == 8192,
+                  "eviction selects the least-recently-released capacity class (8192)");
+
+            // Within a class the front is the oldest, so a newer release must not shadow it.
+            RenderHostBuffer newer;
+            newer.bytes = 8192;
+            newer.allocation_bytes = 8192;
+            newer.last_use = 99;
+            pool.available[8192].push_back(newer);
+            CHECK(render_host_buffer_pool_lru_key(pool, victim) && victim == 8192,
+                  "a later release into the same class does not hide that class's oldest entry");
+
+            // Draining the oldest class hands the victim to the next-oldest, not back to the front
+            // of the map.
+            pool.available.erase(8192);
+            CHECK(render_host_buffer_pool_lru_key(pool, victim) && victim == 65536,
+                  "with the oldest class drained the next-oldest (65536) is selected");
+
+            // Empty classes are skipped rather than selected with a stale zero stamp.
+            pool.available[16384] = {};
+            CHECK(render_host_buffer_pool_lru_key(pool, victim) && victim == 65536,
+                  "an empty capacity class is not a victim despite its zero-valued front");
+
+            RenderHostBufferPool empty;
+            CHECK(!render_host_buffer_pool_lru_key(empty, victim),
+                  "an empty pool reports no victim instead of dereferencing a front");
+        }
+
         // Live exact-extent RTT consumers borrow an immutable snapshot instead of copying it
         // through frontend scratch. FrameResource copies retain that backing through upload setup.
         constexpr uint32_t retained_width = 2;
