@@ -151,6 +151,25 @@ near a buffer end, silently disabling the recovery and restoring #1124's "0 DMA 
 Both literals now follow the constant. The lesson generalises: **a packet size is not local to its
 builder** — anything that stamps, probes or validates that packet must read the same constant.
 
+The hazard is **measured, not predicted**. Building exactly that broken intermediate — builder at 7,
+`dma_patch_recover_header` still stamping 9 — and booting Alex Kidd:
+
+| build | `#1124` recovery fires | `SHORT FOLD` | draws/submit at t=45 s |
+| --- | --- | --- | --- |
+| 9-dword builder (before) | 8 (the report's cap) | **0** | 30 |
+| 7-dword builder, literals moved (**this change**) | 8 | **0** | 30 |
+| 7-dword builder, `#1124` left at 9 (**the hazard**) | 8 | **32** (the report's cap) | 30 |
+
+```text
+[agc] SHORT FOLD SubmitDcb #1: guest declared 126 dwords, decode stopped after 120 (95.2%) at stream
+      dword 0x00000020 — the remaining 6 dwords, INCLUDING ANY BIND, were never applied
+```
+
+From the very first submit, and on nearly every submit after it. Note the last column: **the draw
+count is 30 in all three builds**, so a draw-count A/B — the check I had been running — cannot see
+this at all. It also doubles as the positive control for the `SHORT FOLD` grep: silent on the two
+correct builds *because* it fires 32 times on the broken one, not because it cannot fire.
+
 ### What the `DmaData` shrink was checked against
 
 There was no failure to make return — no title in the corpus was observably harmed by the 2 extra
@@ -159,6 +178,7 @@ routes, only `kDwDmaData` and its two payload writes differing, `PROSPER_PROGRES
 
 | title | 9-dword | 7-dword |
 | --- | --- | --- |
+| *Alex Kidd* `PPSA02664` (rung 6, exercises #1124) | 30 draws/submit, 0 short folds, recovery at its cap | 30, 0, at its cap |
 | *Dragon Quest VII* `PPSA17942` | 96, 96, 91, 87, 94, 91 draws/submit | **identical series** |
 | *The Messenger* `PPSA24651` | 11 | 11 |
 | *Dead Cells* `PPSA15552` | 173 | 170 (its own frame-to-frame band is 169–173) |
