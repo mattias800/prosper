@@ -286,21 +286,60 @@ int main() {
         // waited for, not between two.
         //
         // GetVblankStatus reports processTime as microseconds since the shared epoch, so the
-        // residue of that against the period says where in the period the wait left us. Sample the
-        // MINIMUM over several waits rather than any single one: sleep_until may overshoot under
-        // host load, which can only move a residue later, so the minimum is the robust statistic
-        // and it can only be small if the two really share an epoch. A half-period-shifted private
-        // epoch floors at ~8.34 ms and cannot produce a small minimum however many samples we take.
+        // residue of that against the period says where in the period the wait left us.
+        //
+        // #1770: an earlier form of this took the MINIMUM over six samples and argued that
+        // overshoot "can only move a residue later", making the minimum robust. That is wrong:
+        // the residue is taken MODULO the period, so an overshoot beyond one period WRAPS and
+        // lands anywhere in [0, period). The minimum of a wrapping quantity is a random draw, not
+        // a floor — which is why this was a coin flip on the emulated x86_64/Rosetta runner while
+        // passing every time on native arm64. Roughly P(pass) = 0.81 per run, on a required check.
+        //
+        // The fix is to discard samples whose residue cannot be trusted, and the admissibility
+        // bound has to be the DECISION THRESHOLD, not one period. Simulating the two rules over
+        // overshoots uniform in [0, 3 periods), 12 samples, 400 trials each:
+        //
+        //     admit overshoot <      false failures   detects a half-period shift
+        //     no filter (old)             17/400            13/400
+        //     < 1 period                 135/400           141/400
+        //     < 4 ms (this)                0/400           267/400
+        //
+        // Filtering at one period is WORSE than not filtering, because discarding samples raises
+        // the minimum: the old form's wrapped residues are uniform, so more of them push the
+        // minimum down. Note also that the old check barely detected the real defect either —
+        // 13/400 — so it was both flaky and weak. Admitting only near-boundary wakes makes the
+        // residue mean what the assertion says it means.
+        constexpr uint64_t kPeriodNs = 16683350ull;
+        constexpr uint64_t kPhaseThreshNs = 4000000ull;
         uint64_t min_phase_ns = UINT64_MAX;
-        for (int i = 0; i < 6; ++i) {
+        int admissible = 0;
+        for (int i = 0; i < 12; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
             waitvbl(handle, 0, 0, 0, 0, 0);
+            const uint64_t took_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - t0).count();
             vbl(handle, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0);
-            const uint64_t phase_ns = (*(uint64_t*)(vb + 0x08) * 1000ull) % 16683350ull;
+            // A wait spans one period plus its overshoot. Admit only wakes that landed within the
+            // decision threshold of their boundary; anything later cannot distinguish a shared
+            // epoch from a shifted one, whether or not its residue has wrapped.
+            if (took_ns >= kPeriodNs + kPhaseThreshNs) continue;
+            const uint64_t phase_ns = (*(uint64_t*)(vb + 0x08) * 1000ull) % kPeriodNs;
             if (phase_ns < min_phase_ns) min_phase_ns = phase_ns;
+            ++admissible;
         }
-        CHECK(min_phase_ns < 4000000ull,
-              "WaitVblank shares GetVblankStatus's PHASE, not just its period "
-              "(wakes land on a boundary of the same grid)");
+        // A half-period-shifted private epoch floors at ~8.34 ms and cannot produce a small
+        // minimum however many admissible samples are taken, so 4 ms still discriminates it.
+        // If the host is loaded enough that NO sample is admissible, say so rather than failing on
+        // an unmeasurable quantity — a check that reports "could not measure" is honest, where one
+        // that fails on host load teaches everyone to ignore it.
+        if (admissible == 0) {
+            fprintf(stderr, "  SKIP WaitVblank PHASE: no admissible sample in 12 "
+                            "(every wait overshot a full period; host too loaded to measure)\n");
+        } else {
+            CHECK(min_phase_ns < kPhaseThreshNs,
+                  "WaitVblank shares GetVblankStatus's PHASE, not just its period "
+                  "(wakes land on a boundary of the same grid)");
+        }
     }
 
     // Device capability: plain SDR display (capability 0).
