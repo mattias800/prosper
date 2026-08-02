@@ -135,6 +135,50 @@ namespace {
     bool memlog() { static int v = getenv("PROSPER_MEMLOG") ? 1 : 0; return v; }
     #define MLOG(...) do { if (memlog()) fprintf(stderr, "[memhle] " __VA_ARGS__); } while (0)
 
+    // PROSPER_DMEM_CALLER=1: attribute each direct-memory allocation to the guest code that asked
+    // for it. `[memhle] alloc_main_dmem len=…` answers "how much" but never "who", and a title whose
+    // heap grows without bound cannot be diagnosed from the sizes — the same allocator serves every
+    // subsystem, so only the callers above it separate a legitimate load from a leak. Asterix &
+    // Obelix - Babylon Mission (#1748) is the motivating case: ~13 × 16 MiB blocks per second, eight
+    // releases in the whole run, the direct-memory pool empty in ~125 s, and nothing in `[memhle]`
+    // to say which subsystem was responsible.
+    //
+    // The walk is a DIAGNOSTIC-ONLY stack scan, the same technique hle_agc.cpp's fence1-builder
+    // attribution uses: from this frame, report every value that lies inside a loaded guest module.
+    // It is a heuristic — a stale spill slot looks exactly like a return address — so treat the
+    // result as a callsite HINT to confirm against the module's disassembly, never as an ABI input
+    // and never as proof on its own. Off by default, and rate-limited per distinct call chain so an
+    // allocation-heavy boot cannot bury the log in duplicates of one site.
+    bool dmem_caller_log() { static int v = getenv("PROSPER_DMEM_CALLER") ? 1 : 0; return v != 0; }
+    void log_dmem_caller(const char* what, uint64_t len, const volatile uint64_t* frame) {
+        if (!dmem_caller_log()) return;
+        constexpr int kWant = 6;          // return addresses to report
+        constexpr int kScan = 160;        // stack slots to walk
+        uint64_t ra[kWant] = {};
+        int n = 0;
+        for (int i = 1; i < kScan && n < kWant; i++) {
+            const uint64_t v = frame[i];
+            if (!guest_va_in_module(v)) continue;
+            if (n && ra[n - 1] == v) continue;      // collapse an adjacent duplicate spill
+            ra[n++] = v;
+        }
+        // Rate-limit on the chain itself: one line per distinct (first two frames) pair.
+        static std::mutex mx;
+        static std::vector<std::pair<uint64_t, uint64_t>> seen;
+        const std::pair<uint64_t, uint64_t> key{ n > 0 ? ra[0] : 0, n > 1 ? ra[1] : 0 };
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            for (const auto& s : seen) if (s == key) return;
+            if (seen.size() >= 64) return;          // bounded: 64 distinct chains is plenty
+            seen.push_back(key);
+        }
+        fprintf(stderr, "[dmem-caller] %s len=0x%llx from", what, (unsigned long long)len);
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, " %s+0x%llx", guest_module_name(ra[i]),
+                    (unsigned long long)guest_module_offset(ra[i]));
+        fprintf(stderr, "\n");
+    }
+
     constexpr uint32_t kVirtualQueryFlexible = 0x01;
     constexpr uint32_t kVirtualQueryDirect   = 0x02;
     constexpr uint32_t kVirtualQueryCommitted = 0x10;
@@ -936,6 +980,7 @@ HLE(k_alloc_main_dmem) {
     dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
     *(uint64_t*)a3 = off;
     MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
+    log_dmem_caller("alloc_main_dmem", a0, (const volatile uint64_t*)__builtin_frame_address(0));
     return 0;
 }
 
@@ -2112,6 +2157,50 @@ namespace prosper {
 namespace {
     bool memlog() { static int v = getenv("PROSPER_MEMLOG") ? 1 : 0; return v; }
     #define MLOG(...) do { if (memlog()) fprintf(stderr, "[memhle] " __VA_ARGS__); } while (0)
+
+    // PROSPER_DMEM_CALLER=1: attribute each direct-memory allocation to the guest code that asked
+    // for it. `[memhle] alloc_main_dmem len=…` answers "how much" but never "who", and a title whose
+    // heap grows without bound cannot be diagnosed from the sizes — the same allocator serves every
+    // subsystem, so only the callers above it separate a legitimate load from a leak. Asterix &
+    // Obelix - Babylon Mission (#1748) is the motivating case: ~13 × 16 MiB blocks per second, eight
+    // releases in the whole run, the direct-memory pool empty in ~125 s, and nothing in `[memhle]`
+    // to say which subsystem was responsible.
+    //
+    // The walk is a DIAGNOSTIC-ONLY stack scan, the same technique hle_agc.cpp's fence1-builder
+    // attribution uses: from this frame, report every value that lies inside a loaded guest module.
+    // It is a heuristic — a stale spill slot looks exactly like a return address — so treat the
+    // result as a callsite HINT to confirm against the module's disassembly, never as an ABI input
+    // and never as proof on its own. Off by default, and rate-limited per distinct call chain so an
+    // allocation-heavy boot cannot bury the log in duplicates of one site.
+    bool dmem_caller_log() { static int v = getenv("PROSPER_DMEM_CALLER") ? 1 : 0; return v != 0; }
+    void log_dmem_caller(const char* what, uint64_t len, const volatile uint64_t* frame) {
+        if (!dmem_caller_log()) return;
+        constexpr int kWant = 6;          // return addresses to report
+        constexpr int kScan = 160;        // stack slots to walk
+        uint64_t ra[kWant] = {};
+        int n = 0;
+        for (int i = 1; i < kScan && n < kWant; i++) {
+            const uint64_t v = frame[i];
+            if (!guest_va_in_module(v)) continue;
+            if (n && ra[n - 1] == v) continue;      // collapse an adjacent duplicate spill
+            ra[n++] = v;
+        }
+        // Rate-limit on the chain itself: one line per distinct (first two frames) pair.
+        static std::mutex mx;
+        static std::vector<std::pair<uint64_t, uint64_t>> seen;
+        const std::pair<uint64_t, uint64_t> key{ n > 0 ? ra[0] : 0, n > 1 ? ra[1] : 0 };
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            for (const auto& s : seen) if (s == key) return;
+            if (seen.size() >= 64) return;          // bounded: 64 distinct chains is plenty
+            seen.push_back(key);
+        }
+        fprintf(stderr, "[dmem-caller] %s len=0x%llx from", what, (unsigned long long)len);
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, " %s+0x%llx", guest_module_name(ra[i]),
+                    (unsigned long long)guest_module_offset(ra[i]));
+        fprintf(stderr, "\n");
+    }
 
     // --- VA tracker + direct-memory pool: PURE logic, copied verbatim from the Linux path -----
     constexpr uint32_t kVirtualQueryFlexible = 0x01;
@@ -4314,6 +4403,7 @@ HLE(k_alloc_main_dmem) {
     dmem_prepare_allocation(off, sz);
     *(uint64_t*)a3 = off;
     MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
+    log_dmem_caller("alloc_main_dmem", a0, (const volatile uint64_t*)__builtin_frame_address(0));
     return 0;
 }
 
