@@ -81,14 +81,21 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     ```
     `overptr` alone decides nothing — a label the guest legitimately *popped* from its pool free list
     still carries the stale link, so the content is identical either way. `member` is the
-    discriminator. **The `SELFTEST` line is not optional decoration**: a learned bin *head* is by
+    discriminator. **Read `INIT-TRIP-TOTALS`, never a detail line**: the detail schedule is sparse
+    and front-loaded, and on ArcRunner the `member` population appears only after ordinal ~512, so
+    every early sample reads `member=0` while the run total is not. Totals print every 256 for
+    exactly that reason. `aligned=0` marks a destination membership could never match anyway
+    (`plausible_node` wants a 0x20-aligned block base), so it is a structural zero, not a finding. **The `SELFTEST` line is not optional decoration**: a learned bin *head* is by
     construction the first node of its own chain, so a walk that answers "no" to a head is blind
     rather than truthful, and `positives < probes` (or `probes=0`) means every `member=0` beside it
     is an unarmed instrument, not evidence. A head matches at hop 0, though, which proves only that
     the walk is *armed* — so the probe also follows each head's successor (`deep`/`deep_positives`),
     an interior node reachable only by traversing a link. The three failure modes are named in the
     line itself: `NO HEADS`, `BLIND`, `SHALLOW`. `mb3_freelist_selftest()` is available to any caller
-    that wants to qualify a membership null the same way.
+    that wants to qualify a membership null the same way. It controls the **walk**, not the **call
+    site** — a caller that early-returns for the `member==true` population before its own probe will
+    still see 100% `member=0` beside a green self-test, which is why `PROSPER_INIT_TRIP` prints a
+    `NOT A CONTROL` banner when `PROSPER_MB3_FREELIST_GUARD` is armed alongside it.
     **`PROSPER_INIT_SUPPRESS=ptr|member`** is the matching A/B arm, not a candidate fix: `ptr`
     suppresses on content, which #1245 proved cannot separate a live label from a freed block, so it
     will also drop legitimate inits. It exists so "is this write load-bearing for the corruption?"
