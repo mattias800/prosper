@@ -92,7 +92,20 @@ constexpr uint32_t kDwDrawIndexOffset    = 3;
 constexpr uint32_t kDwDrawIndexIndirect  = 4;
 constexpr uint32_t kDwDispatch           = 6;
 constexpr uint32_t kDwDispatchIndirect   = 4;
-constexpr uint32_t kDwDmaData            = 9;
+// DMA_DATA is 7: header + dst lo/hi, srcOrImm lo/hi, numBytes, selectors — exactly the RDNA2
+// `DMA_DATA` field list, with no slot to spare. It was 9 because it also carried the #312 build-time
+// snapshot of the destination qword: prosper's own invention, not a decoded guest field, so removing
+// it needs no title evidence about the size and 9 -> 7 is the safe direction for the guest (a
+// reservation can only gain room). All of the risk is internal, and it is a REMOVAL, not a
+// relocation — the #312 label-history event survives via prosper_label_hist_dma_built, but the
+// pre-image value dma_build_pre_changed compares does not.
+//
+// Anything that stamps or validates a DMA_DATA header MUST use this constant. #1124's
+// dma_patch_recover_header rebuilds a clobbered header from scratch, and a hard-coded 9 there would
+// write a 9-dword header over a 7-dword allocation — the CP walk would step two dwords into the next
+// packet and desync the rest of the submit, on Alex Kidd (PPSA02664, rung 6) specifically, and no
+// draw-count A/B can see that.
+constexpr uint32_t kDwDmaData            = 7;
 constexpr uint32_t kDwEventWrite         = 4;
 constexpr uint32_t kDwSetIndexBuffer     = 3;
 constexpr uint32_t kDwSetIndexCount      = 2;
@@ -608,8 +621,6 @@ HLE9(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, 
     cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
     cmd[5] = (uint32_t)num_bytes;
     cmd[6] = (uint32_t)((a2 & 0xffu) | ((a3 & 0xffu) << 8));
-    uint64_t build_pre = label_build_pre(a4, num_bytes);
-    cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
     if (num_bytes <= 8) {
         prosper_label_hist_dma_built(a4, a0, (uint32_t)a1, 1);                  // #312 label-init form
     }
@@ -628,8 +639,6 @@ HLE9(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm,
     cmd[3] = (uint32_t)(src_imm & 0xffffffffu); cmd[4] = (uint32_t)(src_imm >> 32u);
     cmd[5] = (uint32_t)num_bytes;
     cmd[6] = (uint32_t)((a1 & 0xffu) | ((a2 & 0xffu) << 8));
-    uint64_t build_pre = label_build_pre(a3, num_bytes);
-    cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
     if (num_bytes <= 8) {
         prosper_label_hist_dma_built(a3, a0, (uint32_t)src_imm, 2);              // #312
     }
@@ -653,12 +662,14 @@ HLE9(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm,
 // executes. Guarded to the exact observed clobber (header == 0 AND a plausible DMA body: mapped
 // dst, sane byte count), so a genuine non-DMA target still refuses loudly. CONFIDENCE: MED-HIGH.
 static bool dma_patch_recover_header(uint32_t* cmd, const char* who) {
-    if (!gpu::guest_readable((uint64_t)(uintptr_t)cmd, 9 * sizeof(uint32_t))) return false;
+    if (!gpu::guest_readable((uint64_t)(uintptr_t)cmd, kDwDmaData * sizeof(uint32_t))) return false;
     if (cmd[0] != 0) return false;                                   // not the zero-clobber shape
     const uint64_t dst   = (uint64_t)cmd[1] | ((uint64_t)cmd[2] << 32);
     const uint32_t bytes = cmd[5];
     if (dst < 0x10000 || bytes == 0 || bytes > 0x10000000u) return false;  // implausible DMA body
-    cmd[0] = PM4(9, IT_NOP, R_DMA_DATA);                             // prosper's 9-dword form
+    cmd[0] = PM4(kDwDmaData, IT_NOP, R_DMA_DATA);   // MUST match the builder: a stale literal here
+                                                    // stamps a longer header over a shorter
+                                                    // allocation and desyncs the submit (#1756)
     static std::atomic<int> n{0};
     if (n.fetch_add(1) < 8)
         fprintf(stderr, "[agc] %s: restored clobbered DMA header (dst=0x%llx bytes=%u) — #1124\n",
@@ -677,6 +688,8 @@ HLE(agc_patch_dma_data_dst) {  // (cmd, address)
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     if (!dma_patch_ready(cmd, "DmaDataPatchSetDst")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    // Defensive tolerance for the historical 9-dword shape, not a live path: with #1756 every packet
+    // reachable here at runtime is a 7-dword one this file just built.
     uint32_t len = ((cmd[0] >> 16) & 0x3fffu) + 2;
     if (len >= 9) {
         uint64_t build_pre = label_build_pre(a1, cmd[5]);

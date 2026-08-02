@@ -86,7 +86,7 @@ alone** — that is how a working title gets broken to satisfy a table. Only a g
 | `DcbAcquireMem` / `AcbAcquireMem` | 8 | `ACQUIRE_MEM` (GFX10, with `GCR_CNTL`) | 8 | HIGH | all 7 payload slots are hardware fields; Babylon's 16-dword epilogue |
 | `CbReleaseMem` (end-of-pipe action) | 8 | `RELEASE_MEM` | 8 | HIGH | Babylon's 16-dword epilogue (#1748), fixed from 9 |
 | `DcbDmaData` / `AcbDmaData` | **7** | `DMA_DATA` | 7 | HIGH | was 9; the 2 extra were the `#312` build snapshot, and the remaining 6 payload dwords are exactly the hardware field list. **Shrunk by #1756** |
-| `DcbWaitRegMem` / `AcbWaitRegMem` | 9 | `WAIT_REG_MEM64` | 8 | MED | **the 7 in an earlier draft of this table was the wrong comparison** — the sub-op is `R_WAIT_MEM_64` and the guest passes a 64-bit mask and reference, so the 32-bit `WAIT_REG_MEM` is not what it stands for. The residual +1 is an unpacked `compare_function` dword, not private payload |
+| `DcbWaitRegMem` / `AcbWaitRegMem` | 9 | `WAIT_REG_MEM64` | 9 | HIGH | **not oversized — this row was published wrong twice.** Enumerating fields on both sides: hardware is header + `ENGINE/FUNCTION`, `POLL_ADDRESS_LO/HI`, `REFERENCE` (2), `MASK` (2), `POLL_INTERVAL` = 9; prosper is header + addr (2), mask (2), reference (2), compare_function, interval = 9. Delta **0** |
 | `DcbJump` | 5 | `INDIRECT_BUFFER` | 4 | MED | +1 is a **predication flag slot** that `sceAgcSetPacketPredication` writes into this packet afterwards (#319) — live per-packet state, not a snapshot, so it needs a home before the packet can shrink |
 | `DcbDrawIndex` | 7 | `DRAW_INDEX_2` | 6 | LOW | payload carries a 64-bit AGC draw modifier |
 | `DcbDrawIndexAuto` | 7 | `DRAW_INDEX_AUTO` | 3 | LOW | same modifier; not a bare PM4 draw |
@@ -132,10 +132,24 @@ other than prosper's own payload. They are not one class:
 | `WaitRegMem` (Dcb + Acb) | 9 | 9 | **My flag was wrong, and the table said so wrongly.** "9 vs 7" compared it against the 32-bit `WAIT_REG_MEM`; the sub-op is `R_WAIT_MEM_64` and the guest supplies a 64-bit mask and reference, so the right comparison is `WAIT_REG_MEM64` = 8. The residual +1 is a `compare_function` the hardware packs into its `ENGINE/FUNCTION` dword and prosper spends a whole dword on — a repacking, not a payload removal, and no title evidence to validate it against. **Open.** |
 | `Jump` | 5 | 5 | **Oversized by 1, but the extra dword is load-bearing.** `cmd[4]` is a predication flag that `sceAgcSetPacketPredication` writes into this packet *after* it is built (#319) — live per-packet state, not a diagnostic snapshot. Shrinking to the hardware `INDIRECT_BUFFER` size needs that state rehoused (a side table keyed by packet address, as the fence journal already does), which is a design change wanting its own evidence. **Open.** |
 
-So: **one of the three was a latent Babylon and is now closed; one was my own mis-comparison; one is
-real but cannot be fixed by deletion.** The remaining table rows where prosper is larger
+So: **one of the three was a latent Babylon and is now closed; one is not oversized at all and my
+flag was wrong twice; one is real but cannot be fixed by deletion.** Both wrong flags came from
+comparing packet *names* rather than enumerating fields — enumerate them. The remaining table rows where prosper is larger
 (`WriteData` +1, `SetPredication` +1, `CbDispatch` +1, the two draws) have neither an identifiable
 private payload nor title evidence, and stay open.
+
+### The hazard the `DmaData` shrink carries, and why a draw-count A/B cannot see it
+
+`kDwDmaData` is not only the builder's size. `dma_patch_recover_header` — the #1124 fix that rebuilds
+a DMA header Alex Kidd (`PPSA02664`, rung 6) clobbers to zero — **stamps a header and probes
+readability** with it. A hard-coded 9 left there while the builder emits 7 writes a 9-dword header
+over a 7-dword allocation: the command-processor walk steps two dwords into the *next* packet and
+desyncs the remainder of the submit, and `decode_pm4`'s historical `npl >= 8` arm then reads
+`dd_build_pre` out of whatever follows. The `guest_readable(cmd, 9*4)` probe would also start failing
+near a buffer end, silently disabling the recovery and restoring #1124's "0 DMA copies".
+
+Both literals now follow the constant. The lesson generalises: **a packet size is not local to its
+builder** — anything that stamps, probes or validates that packet must read the same constant.
 
 ### What the `DmaData` shrink was checked against
 
@@ -292,8 +306,8 @@ happened to ask, and each time fixed for that title's NIDs alone.
 
 ## Open
 
-* The rows still larger than the reference after the `DmaData` shrink — `WaitRegMem` (+1, an
-  unpacked compare-function dword), `Jump` (+1, the predication slot that needs rehousing),
+* The rows still larger than the reference after the `DmaData` shrink — `Jump` (+1, the predication
+  slot that needs rehousing),
   `WriteData` (5+n vs 4+n), `SetPredication` (4 vs 3), `CbDispatch` (6 vs 5),
   `DrawIndex`/`DrawIndexAuto`. None has an identifiable private payload to delete, so each needs a
   title that reserves tightly around it before it can be changed. `PROSPER_DCBWIN` over a new title
