@@ -165,6 +165,119 @@ void ring_record(uint64_t addr, uint64_t value, uint8_t size, uint8_t kind, uint
     r.addr = addr; r.value = value; r.pkt = pkt; r.seq = s; r.size = size; r.kind = kind;
 }
 uint64_t pkt_addr(const Pm4Command& c) { return c.payload ? (uint64_t)(uintptr_t)(c.payload - 1) : 0; }
+
+// --- #1226 GPU-write VALUE trap (PROSPER_WRITE_TRAP=0xV[,0xV...]; default OFF). ------------------
+// The address-keyed instruments (PROSPER_PROVENANCE_ADDR, PROSPER_HWWATCH, the poolshift span scan)
+// all need the destination up front. A corruption whose POISON VALUE is invariant across runs while
+// its address is not — ArcRunner's free-list head reads a constant 0x30016000 at three different
+// per-thread pool pages — has no such handle, so the question "does a prosper PM4 write path store
+// this dword into guest memory?" was unanswerable. This traps on the payload instead: every
+// completion/label/DMA/WRITE_DATA store THIS COMMAND PROCESSOR performs is checked against the
+// listed dwords and reported with its destination, the destination's pre-content and the packet
+// builder address.
+//
+// SCOPE, because a null result is the point: this sees the PM4 write paths only. Compute-dispatch
+// writeback, the Vulkan backend's target readback, and every HLE that writes guest memory are
+// INVISIBLE to it, so zero hits means "no PM4 write path created that value", never "prosper did
+// not". The scan is also 4-byte-strided from each payload's base — correct for REL/EVENT/WDATA/
+// DMA-immediate payloads, which are dword-aligned by construction, but a DMA COPY is a raw byte
+// move, so a poison lying at a source offset that is not a multiple of 4 is not seen. That is
+// exactly the shape of an off-by-one store, so a null DMA-copy result does not refute one.
+constexpr unsigned kWriteTrapMax = 8;
+struct WriteTrap { uint32_t v[kWriteTrapMax]; unsigned n = 0; };
+const WriteTrap& write_trap() {
+    static const WriteTrap t = [] {
+        WriteTrap w;
+        const char* e = getenv("PROSPER_WRITE_TRAP");
+        if (!e) return w;                              // unset: the trap is simply not in use
+        // Parse loudly. This instrument's headline result is "zero hits", so a silently disarmed
+        // trap reads exactly like a hard negative — the worst possible failure mode for it. An
+        // EMPTY value is the likeliest way to get there by accident (PROSPER_WRITE_TRAP=$UNSET),
+        // so it is reported rather than treated like "unset".
+        if (!*e) {
+            fprintf(stderr, "[write-trap] NOT ARMED — PROSPER_WRITE_TRAP is set but empty\n");
+            return w;
+        }
+        const char* p = e;
+        bool bad = false;
+        while (*p) {
+            char* end = nullptr;
+            // Reject a bare sign or a stray radix prefix before strtoull's lenient reading of them
+            // turns `0x` (a truncated paste) into the value 0 — the noisiest possible trap value.
+            if (!(*p >= '0' && *p <= '9')) { bad = true; break; }
+            const unsigned long long v = strtoull(p, &end, 0);
+            if (end == p || (end[0] && end[0] != ',')) { bad = true; break; }
+            if (v > 0xffffffffull) {
+                fprintf(stderr, "[write-trap] REFUSED 0x%llx: values are 32-bit dwords\n",
+                        (unsigned long long)v);
+                bad = true;
+            } else if (w.n == kWriteTrapMax) {
+                fprintf(stderr, "[write-trap] REFUSED 0x%llx: at most %u values\n",
+                        (unsigned long long)v, kWriteTrapMax);
+                bad = true;
+            } else {
+                // A duplicate would silently never advance its own counter (write_trap_index
+                // returns the first match), so drop it visibly rather than arming a dead slot.
+                bool dup = false;
+                for (unsigned i = 0; i < w.n; i++) dup = dup || w.v[i] == (uint32_t)v;
+                if (dup) fprintf(stderr, "[write-trap] IGNORED duplicate 0x%llx\n",
+                                 (unsigned long long)v);
+                else     w.v[w.n++] = (uint32_t)v;
+            }
+            if (*end != ',') { p = end; break; }
+            p = end + 1;
+        }
+        if (*p) { fprintf(stderr, "[write-trap] REFUSED trailing '%s'\n", p); bad = true; }
+        if (!w.n) {
+            fprintf(stderr, "[write-trap] NOT ARMED — PROSPER_WRITE_TRAP='%s' parsed to no values\n", e);
+            return w;
+        }
+        fprintf(stderr, "[write-trap] armed on %u value(s):", w.n);
+        for (unsigned i = 0; i < w.n; i++) fprintf(stderr, " 0x%x", w.v[i]);
+        fprintf(stderr, "%s\n", bad ? "  (SOME INPUT REFUSED — see above)" : "");
+        return w;
+    }();
+    return t;
+}
+inline bool write_trap_armed() { return write_trap().n != 0; }
+// Index of `v` in the armed set, or -1. Per-VALUE identity, because the counters and the print
+// budget below are per value.
+inline int write_trap_index(uint32_t v) {
+    const WriteTrap& t = write_trap();
+    for (unsigned i = 0; i < t.n; i++) if (t.v[i] == v) return (int)i;
+    return -1;
+}
+// Per-value match totals, and one grand total for the test hook. UNCAPPED — the printing is not.
+std::atomic<uint64_t> g_write_trap_matches{0};
+std::atomic<uint64_t> g_write_trap_per_value[kWriteTrapMax];
+void write_trap_report(const char* kind, uint64_t dst, uint64_t pre, uint32_t v, int idx,
+                       uint32_t byte_off, uint64_t pkt) {
+    g_write_trap_matches.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t ord = g_write_trap_per_value[idx & (kWriteTrapMax - 1)]
+                             .fetch_add(1, std::memory_order_relaxed) + 1;
+    // Budget PER VALUE, ordinal on every line, and keep printing at powers of two past the cap.
+    // A shared budget lets a common positive-control value (a fence `0x1`) exhaust the log before
+    // the value actually under investigation ever gets a line — which would turn this instrument's
+    // own recommended workflow into a silent false negative. And a bare cap makes "64 hits" or
+    // "256 hits" read as a count: that is the #1226 trap this file exists to stop repeating.
+    if (ord <= 64 || (ord & (ord - 1)) == 0)
+        fprintf(stderr,
+                "[agc] WRITE-TRAP #%llu[val=0x%x] kind=%s dst=0x%llx+%u pre=0x%llx pkt=0x%llx t=%llums\n",
+                (unsigned long long)ord, v, kind, (unsigned long long)dst, byte_off,
+                (unsigned long long)pre, (unsigned long long)pkt, (unsigned long long)now_ms());
+}
+// Scan a payload the command processor is about to store. `pre` is the destination's current qword
+// (0 when the caller has not read it); `bytes` is bounded by the caller.
+void write_trap_scan(const char* kind, uint64_t dst, uint64_t pre, const void* payload,
+                     uint64_t bytes, uint64_t pkt) {
+    if (!write_trap_armed() || !payload) return;
+    const uint8_t* p = (const uint8_t*)payload;
+    for (uint64_t off = 0; off + 4 <= bytes; off += 4) {
+        uint32_t v; memcpy(&v, p + off, 4);
+        if (const int idx = write_trap_index(v); idx >= 0)
+            write_trap_report(kind, dst, pre, v, idx, (uint32_t)off, pkt);
+    }
+}
 }
 // Scan the ring for writes intersecting [lo, hi); format up to `max` matches into out (NUL-
 // terminated). Async-signal-safe: no locks, no allocation, tolerates racy ring slots. kind:
@@ -247,8 +360,20 @@ struct LabelHist {
 constexpr uint32_t kLabelHistSize = 16384;            // power of two
 LabelHist g_label_hist[kLabelHistSize];
 std::atomic<uint32_t> g_fold_seq{0};                  // top-level fold counter (submit streams)
+inline uint32_t label_hist_index(uint64_t addr) {
+    return (uint32_t)((addr >> 2) * 2654435761u) & (kLabelHistSize - 1);
+}
+// #1226: read-only lookup — nullptr when this address does not currently own its slot. REPORTING
+// paths must use this, never label_hist_slot(): the slot getter RESETS a colliding entry, so a
+// diagnostic that merely prints a label's history would evict a DIFFERENT label's protocol state,
+// silently turning label_is_consumed_marker() false for it and making every #312 guard inert on
+// that label's next write. A tripwire must not be able to change what the guards decide.
+inline const LabelHist* label_hist_find(uint64_t addr) {
+    const LabelHist& h = g_label_hist[label_hist_index(addr)];
+    return h.addr == addr ? &h : nullptr;
+}
 inline LabelHist& label_hist_slot(uint64_t addr) {
-    LabelHist& h = g_label_hist[(uint32_t)((addr >> 2) * 2654435761u) & (kLabelHistSize - 1)];
+    LabelHist& h = g_label_hist[label_hist_index(addr)];
     if (h.addr != addr) {                              // collision/new: reset (diagnostic-grade)
         h.addr = addr; h.n.store(0, std::memory_order_relaxed);
         h.dma_built_n = h.dma_exec_n = h.rel_built_n = h.rel_exec_n = 0;
@@ -383,10 +508,14 @@ int label_freed_marker_kind(uint64_t addr, uint64_t pre, uint64_t value) {
     return 0;
 }
 // Format the event ring for a suspect report, oldest first. b=built x=exec, aux in hex.
+// Read-only (label_hist_find, not label_hist_slot): printing a label's history must never evict a
+// colliding label's protocol state — see label_hist_find.
 void label_hist_report(uint64_t addr, char* out, size_t cap) {
     static const char* nm[] = {"?", "dmaB", "relB", "waitB", "dmaX", "relX", "dmaSKIP",
                                "dmaFREE", "relFREE"};
-    const LabelHist& h = label_hist_slot(addr);
+    const LabelHist* hp = label_hist_find(addr);
+    if (!hp) { snprintf(out, cap, "events(total=0, no-history)"); return; }
+    const LabelHist& h = *hp;
     uint32_t n = h.n.load(std::memory_order_relaxed);
     uint32_t first = n > 16 ? n - 16 : 0;
     size_t off = (size_t)snprintf(out, cap, "events(total=%u):", n);
@@ -404,6 +533,12 @@ void label_hist_report(uint64_t addr, char* out, size_t cap) {
 }
 extern "C" void prosper_label_hist_dump(uint64_t addr, char* out, unsigned cap) {
     label_hist_report(addr, out, cap);
+}
+// #1226: total PROSPER_WRITE_TRAP matches, uncapped (the printed lines are capped). Exposed so a
+// test can assert both arms of the trap without parsing stderr — a value the guest's stream writes
+// must be counted, an adjacent value must not.
+extern "C" uint64_t prosper_gpu_write_trap_matches() {
+    return g_write_trap_matches.load(std::memory_order_relaxed);
 }
 
 // #312: "pointer-like" pre-content — a freed MallocBinned3 block header holds heap pointers into
@@ -494,6 +629,50 @@ static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint
 // session-8 theory and unifies all three fatal signatures into ONE root write). The existing
 // REL1-LIVE guard (case 1) MISSES this because it requires pre_low != 0; a 0x1000000000-shaped
 // pointer has pre_low == 0. forges_freelist_ptr() detects that missed case.
+//
+// #1226 — what this shape is on ArcRunner (PPSA21406), and why the guard below cannot fix it.
+// SAMPLING NOTE, because the numbers below are the point: forge_trip prints the first 64 hits and
+// then powers of two, so "every hit" here means every REPORTED hit — ~68 lines out of a population
+// exceeding 1,024 per run, which is a biased sample (it is front-loaded). Read the figures as
+// "unanimous across every hit that was reported", never as a census.
+//
+// Every reported hit carries an identical `pre=0x2000000000 val=0x1 -> 0x2000000001` and an
+// executed-but-unsignalled init outstanding (`dma_exec_n > rel_exec_n`), so `!live_pair` declines
+// them. Read `live_pair` carefully: it is prosper's OWN bookkeeping. It is NECESSARY for the
+// live-paired-fence story (a label with no outstanding init is definitely not mid-protocol) but not
+// SUFFICIENT, and in particular it cannot see the case waf_guard() documents — the guest freeing
+// the 0x20 label while BOTH our writes are in flight produces exactly these counters on an
+// already-freed block.
+//
+// The forged qword is a POINTER WITH ITS LOW BIT SET, so a guest free-list walk that dereferences
+// it reads from ONE BYTE HIGHER and gets the target qword shifted DOWN by 8 (little-endian; the
+// top byte comes from the following byte, which is 0 here). On every reported hit
+// `*(0x2000000001) = 0x30016000`, byte-for-byte the value the terminal free-list fault at
+// eboot+0x127e751 dereferences. Note what the probe does and does not show: it measures the
+// CONTENT of the target, which reads the same whether or not any forge happened. What establishes
+// that the guest actually dereferenced `0x2000000001` is the disassembled pop plus the guest's own
+// `FMallocBinned3 Attempt to free/realloc an unrecognized block 2000000001` fatal — one pop both
+// RETURNS that node (the fatal) and stores `[node]` as the new head (the next pop's SIGSEGV).
+// Together: **the "POOLSHIFT byte-shifted pool pointer" signature this issue family has chased
+// since #1249 is the READ ARTIFACT of this forge, not an independent defect** — the session-10
+// read-artifact note below, now with a direct measurement behind it. This supersedes the #1252
+// reading that the poison "provably enters via the guest's own free()" with the push path's count
+// ADVANCING; the pop at eboot+0x127e751 DECREMENTS its count, so that observation needs re-checking
+// before it is relied on again.
+//
+// A one-run-per-arm A/B that suppresses every forging fence removes `0x30016000` and moves the
+// fault to `0x2400100024001`: with no fence value the qword stays `0x2000000000`, and the walk then
+// reads it ALIGNED as `0x3001600000` and steps into that buffer's `0x00024001` fill (two pops
+// further, not one). The load-bearing half of that result is not the changed value — the fault site
+// is the free-list pop, where ANY heap corruption lands — but that the head is still
+// `0x2000000000`, which only the 4-byte DMA_DATA immediate-zero init can produce by zeroing the low
+// dword of a live `0x20xxxxxxxx` link. So the fence is the SECOND half of the damage and the init
+// is the first; guarding the fence alone cannot help, and the discriminator has to be the guest's
+// actual freelist MEMBERSHIP at write time (mb3_freelist_guard) rather than either write's content.
+// Do not "fix" this by widening a value-shape predicate; tests/test_eop_write.cpp pins both arms.
+// CONFIDENCE: HIGH that the two signatures are one chain (arithmetic + guest fatal + disassembly);
+// MED that the init is the first half (inferred from the suppressed arm; suppressing the INIT
+// directly is the experiment that would settle it, and has not been run).
 static inline bool forges_freelist_ptr(uint64_t pre, uint64_t width, uint64_t value) {
     if (!ptr_like(pre)) return false;        // dst must currently hold a heap/pool pointer
     if ((uint32_t)pre != 0) return false;    // low dword already nonzero -> the REL1-LIVE guard covers it
@@ -505,12 +684,51 @@ static inline bool forges_freelist_ptr(uint64_t pre, uint64_t width, uint64_t va
 static void forge_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t value, uint64_t width, uint64_t pkt) {
     static const bool on = getenv("PROSPER_FORGE_TRIP") != nullptr;
     if (!on || !forges_freelist_ptr(pre, width, value)) return;
-    static std::atomic<int> n{0};
-    if (n.fetch_add(1) < 64)
-        fprintf(stderr, "[agc] FORGE-STOMP kind=%s dst=0x%llx pre=0x%llx val=0x%llx -> 0x%llx pkt=0x%llx t=%llums\n",
+    // #1226: print the first 64, then keep printing at every power of two, and carry the ordinal on
+    // every line. The old form printed exactly 64 lines and nothing else, so "64 hits" — quoted as a
+    // count on this issue — was the CAP, indistinguishable from a run with 64,000. A tripwire that
+    // reports a population must never let its own limit masquerade as the measurement.
+    static std::atomic<uint64_t> n{0};
+    const uint64_t ord = n.fetch_add(1) + 1;
+    if (ord <= 64 || (ord & (ord - 1)) == 0) {
+        // #1226: report WHY the paired guard did or did not decline, in the same line. The guard is
+        // `forge_guard() && label_is_consumed_marker(dst) && !live_pair`, and a bare hit count could
+        // not distinguish "the label has no tracked init protocol at all" (cm=0 — every #312 guard is
+        // then inert on it) from "a live init is outstanding, so the write is the guest's own paired
+        // fence" (live=1 — suppressing would repeat the #1245 regression). The event ring carries the
+        // per-generation PRE-CONTENT at each exec, which is what shows the two-write composition of
+        // the forged qword (init zeroes the low dword of a pointer, the fence then sets it to 1).
+        // label_hist_FIND, not label_hist_slot: the slot getter evicts a colliding label's protocol
+        // state, which would make the #312 guards inert on it — a tripwire must never change what
+        // the guards decide.
+        const LabelHist* h = label_hist_find(dst);
+        uint32_t db = h ? h->dma_built_n.load(std::memory_order_relaxed) : 0;
+        uint32_t dx = h ? h->dma_exec_n.load(std::memory_order_relaxed) : 0;
+        uint32_t rb = h ? h->rel_built_n.load(std::memory_order_relaxed) : 0;
+        uint32_t rx = h ? h->rel_exec_n.load(std::memory_order_relaxed) : 0;
+        char hist[640]; label_hist_report(dst, hist, sizeof hist);
+        // The forged qword is a POINTER WITH ITS LOW BIT SET. Should the guest allocator ever
+        // dereference it as a free-block next-pointer, that read is MISALIGNED by one byte and
+        // returns the target qword shifted right 8 bits — which is exactly the shape of the
+        // constant `0x30016000` / `0x30015f00` / `0x20015f00` poisons this issue family chases.
+        // Report what the misread would yield so "forged pointer -> misaligned read -> byte-shifted
+        // pool address" can be confirmed or refuted from one line rather than inferred.
+        const uint64_t forged = pre | (value & 0xffffffffull);
+        uint64_t misread = 0;
+        const bool mis_ok = guest_readable(forged, 8);
+        if (mis_ok) memcpy(&misread, (const void*)(uintptr_t)forged, sizeof misread);
+        char mis[40];
+        if (mis_ok) snprintf(mis, sizeof mis, "0x%llx", (unsigned long long)misread);
+        else        snprintf(mis, sizeof mis, "unmapped");
+        fprintf(stderr,
+                "[agc] FORGE-STOMP #%llu kind=%s dst=0x%llx pre=0x%llx val=0x%llx -> 0x%llx pkt=0x%llx "
+                "t=%llums cm=%d live=%d dmaB=%u dmaX=%u relB=%u relX=%u misread(*forged)=%s | %s\n",
+                (unsigned long long)ord,
                 kind, (unsigned long long)dst, (unsigned long long)pre, (unsigned long long)value,
-                (unsigned long long)(pre | (value & 0xffffffffull)), (unsigned long long)pkt,
-                (unsigned long long)now_ms());
+                (unsigned long long)forged, (unsigned long long)pkt,
+                (unsigned long long)now_ms(), db > 0 ? 1 : 0, dx > rx ? 1 : 0, db, dx, rb, rx,
+                mis, hist);
+    }
 }
 // #312 ROOT fix gate (default ON; PROSPER_REL1_FORGE_GUARD=0 for A/B baseline). Suppress a fence
 // write that would forge a freelist next-pointer (see forges_freelist_ptr), gated to the consumed-
@@ -958,7 +1176,9 @@ static void honor_eop_write(const Pm4Command& c) {
                                   (unsigned long long)now_ms(), hist);
                       }
                   }
-                  uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v);
+                  uint32_t v = (uint32_t)c.rel_value;
+                  write_trap_scan("REL1", c.rel_addr, pre, &v, sizeof v, pkt_addr(c));
+                  memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 4, 1, pkt_addr(c));
                   poolshift_check("REL1", c.rel_addr, 4, c.rel_value, pkt_addr(c));
                   label_hist_rel_exec(c.rel_addr, pre, c.queue_origin); break; }
@@ -984,11 +1204,15 @@ static void honor_eop_write(const Pm4Command& c) {
                       label_hist_event(c.rel_addr, LE_REL_EXEC, pre, c.queue_origin);
                       return;
                   }
-                  uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v);
+                  uint64_t v = c.rel_value;
+                  write_trap_scan("REL2", c.rel_addr, pre, &v, sizeof v, pkt_addr(c));
+                  memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 8, 1, pkt_addr(c));
                   poolshift_check("REL2", c.rel_addr, 8, c.rel_value, pkt_addr(c)); break; }
         case 3: { uint64_t pre = 0; memcpy(&pre, dst, sizeof pre);   // #1226 provenance pre-read
-                  uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v);
+                  uint64_t v = gpu_clock64();
+                  write_trap_scan("REL3", c.rel_addr, pre, &v, sizeof v, pkt_addr(c));
+                  memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 8, 1, pkt_addr(c));
                   clockfence_record(c.rel_addr, pre, v, pkt_addr(c), 1); break; }
         // Unknown selector: LOG AND SKIP. The old default wrote the 64-bit value for ANY
@@ -1029,6 +1253,7 @@ static void honor_event_write(const Pm4Command& c) {
     }
     uint64_t pre = 0; memcpy(&pre, (void*)(uintptr_t)c.event_addr, sizeof pre);   // #1226 provenance
     uint64_t v = gpu_clock64();
+    write_trap_scan("EVENT", c.event_addr, pre, &v, sizeof v, pkt_addr(c));
     memcpy((void*)(uintptr_t)c.event_addr, &v, sizeof v);
     notify_guest_gpu_write(c.event_addr, sizeof v);
     ring_record(c.event_addr, v, 8, 2, pkt_addr(c));
@@ -1127,6 +1352,7 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
             }
         }
         forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, packet_addr);
+        write_trap_scan("DMA-imm", c.dd_dst, pre_dma, &v32, sizeof v32, packet_addr);
         if (v32 == 0) {
             memset(dst, 0, c.dd_bytes);
         } else {
@@ -1142,9 +1368,16 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     } else {
         // memmove is byte-for-byte memcpy behavior for the normal non-overlapping GPU-buffer case,
         // while remaining deterministic if an unusual packet overlaps its endpoints.
-        memmove(dst, authoritative_source ? authoritative_source
-                                          : (const uint8_t*)(uintptr_t)c.dd_src,
-                c.dd_bytes);
+        const uint8_t* copy_src = authoritative_source ? authoritative_source
+                                                       : (const uint8_t*)(uintptr_t)c.dd_src;
+        // #1226 value trap: bound the scan — a copy DMA can move megabytes and this is diagnostic.
+        // `pre` is passed as 0 rather than peeked: dma_data_form only established that dd_bytes are
+        // writable, so an 8-byte pre-read at the destination of a short copy could reach past it,
+        // and a bulk copy's destination pre-content is not meaningful anyway.
+        if (write_trap_armed())
+            write_trap_scan("DMA-copy", c.dd_dst, 0, copy_src,
+                            c.dd_bytes > 4096 ? 4096 : c.dd_bytes, packet_addr);
+        memmove(dst, copy_src, c.dd_bytes);
         if (getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc]   DmaData copy [0x%llx] <- [0x%llx] (%u bytes)\n",
                     (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes);
@@ -1195,6 +1428,9 @@ static void honor_write_data(const Pm4Command& c) {
             report_suspect_write("WDATA", c.wd_addr, c.wd_data[0], pre, pkt_addr(c));
         forge_trip("WDATA", c.wd_addr, pre, c.wd_data[0], 4, pkt_addr(c));   // #312 session-10 tripwire
     }
+    if (write_trap_armed())
+        write_trap_scan("WDATA", c.wd_addr, peek_qword(c.wd_addr), c.wd_data,
+                        (uint64_t)c.wd_num * 4, pkt_addr(c));
     memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
     notify_guest_gpu_write(c.wd_addr, static_cast<uint64_t>(c.wd_num) * 4);
     ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));

@@ -44,6 +44,33 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     a heuristic stack scan (a stale spill slot looks exactly like a return address), so treat the
     result as a callsite **hint** to confirm against the module's disassembly — never as proof on its
     own. Bounded to 64 distinct chains so an allocation-heavy boot cannot bury the log.
+  - **Does a PM4 write path store *this value* into guest memory?**
+    **`PROSPER_WRITE_TRAP=0xV[,0xV…]`** (up to 8 values) checks every guest-memory store the command
+    processor performs — `RELEASE_MEM` data_sel 1/2/3, `EVENT_WRITE`, `WRITE_DATA`, and both
+    `DMA_DATA` forms (a copy is scanned to its first 4 KiB) — against the listed 32-bit values, and
+    reports each match with a per-value ordinal, the destination, the destination's current qword
+    and the packet builder:
+    ```text
+    [agc] WRITE-TRAP #1[val=0x5a5a0001] kind=REL1 dst=0x2020f3d580+0 pre=0x5a5a0000 pkt=0x30030c2f58 t=4857ms
+    ```
+    This is the complement of `PROSPER_PROVENANCE_ADDR`, which keys on the *destination*: use the
+    value trap when a corruption's poison is **constant across runs but its address is not**, so
+    there is no stable address to watch. Read a null result with all three of its limits in mind:
+    - **Scope.** It sees the PM4 write paths only. Compute-dispatch writeback, the Vulkan backend's
+      readback, and every HLE that writes guest memory are invisible to it, so zero hits means "no
+      PM4 write path created that value", never "prosper did not".
+    - **Stride.** The scan is 4-byte-strided from each payload's base. `REL*`/`EVENT`/`WDATA`/
+      `DMA`-immediate payloads are dword-aligned by construction, but a `DMA` *copy* is a raw byte
+      move, so a poison at a source offset that is not a multiple of 4 is not seen — which is
+      exactly the shape of an off-by-one store.
+    - **Positive control.** Prove a hit can appear before believing that none did: arm a value the
+      title is known to write (a fence `0x1`) *alongside* the value under investigation. Counters
+      and the print budget are **per value**, so a noisy control cannot starve the log of the value
+      you care about; each line carries its own value's ordinal, and printing continues sparsely
+      (at powers of two) past the first 64, so a capped report can never be mistaken for a count.
+
+    Malformed input is refused **loudly** (`[write-trap] NOT ARMED …`, `REFUSED …`) rather than
+    silently disarming, because a silent disarm is indistinguishable from a hard negative.
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
   `--seconds 1` for wall-clock sampling, warmup or `--render-every N --render-every-for-seconds S`
   for slow software rendering,

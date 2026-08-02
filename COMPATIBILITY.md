@@ -841,6 +841,16 @@ combinations. Note one apparatus detail: with `PROSPER_GUEST_ARGS=-force-gfx-dir
 killed by the signal (exit 139) and prints **no** fault report at all, while the same fault is fully
 reported with `PROSPER_GUEST_ARGS=` empty, or under `gdb` with `SIGSEGV` passed through.
 
+### Ruled out (do not re-derive)
+
+| Hypothesis | Evidence that killed it | Ref |
+| --- | --- | --- |
+| The `0x30016000` "POOLSHIFT byte-shifted pool pointer" is a **defect independent of** the `0x2000000001` REL1 fence forge — the two legs this issue tracked separately since #1249 | They are one chain, one dereference apart. The forged qword is a pointer with its low bit set, so a free-list walk that dereferences it reads from one byte higher and gets the target qword shifted down by 8: `*(0x2000000001) = 0x30016000` on every reported hit, byte-for-byte the value the terminal fault dereferences. The pop at `eboot+0x127e751` both **returns** that node — the guest's own `FMallocBinned3 Attempt to free/realloc an unrecognized block 2000000001` fatal — and **stores** the misread as the next head, which is the SIGSEGV. Confirms the session-10 "the byte-shift is a READ ARTIFACT" note with a measurement. | #1226, #1754 |
+| A prosper **PM4 write path** stores `0x30016000` into guest memory | `PROSPER_WRITE_TRAP=0x30016000` (checks `RELEASE_MEM` sel 1/2/3, `EVENT_WRITE`, `WRITE_DATA`, both `DMA_DATA` forms): **0 hits** across a full faulting run, positive-controlled by arming `0x1` alongside it (that control reaches ordinal 2,048 in the same run). The value is produced by the guest's own misaligned read, above. Three limits on how far this negative reaches: PM4 paths only (compute writeback, the Vulkan backend and the HLEs are outside it); the scan is 4-byte-strided from each payload base, so an *unaligned* poison inside a `DMA_DATA` **copy** is not seen; and a copy is scanned only to its first 4 KiB. | #1226, #1754 |
+| A prosper GPU write targets the `0x3001600000` page the poison decodes to | `PROSPER_PROVENANCE_ADDR=0x3001600000:0x10000` reports zero overlapping writes across a full faulting run; `PROSPER_POOLSHIFT=1` is also 0. The page is an ordinary 64 KiB guest `sceKernelBatchMap` mapping, consecutive in the same series as the earlier-reported `0x30015f0000`. | #1226, #1754 |
+| The renderer's fold latency (the guest outrunning our deferred label writes) is causal | `PROSPER_RENDER=0` faults at the same site with the same value, ~6 s in instead of ~21 s. | #1226, #1754 |
+| Suppressing the forging fence fixes it | One run per arm: suppression removes `0x30016000` and moves the fault to `0x2400100024001`, two pops further along the same walk. The head is still `0x2000000000`, which only the paired 4-byte `DMA_DATA` immediate-zero init can produce. The fence is the second half of the damage. `CONFIDENCE: MED` — suppressing the **init** directly has not been run. | #1226, #1754 |
+
 ## Asterix &amp; Obelix - Babylon Mission — `PPSA30490`
 
 **Rung 0**, unchanged from #1599 and reproduced exactly: every presented frame over 200 s is a single
