@@ -770,6 +770,13 @@ int main() {
                   disabled_ps.color_targets[0].write_mask == 0xFu &&
                   disabled_ps.color_targets[1].write_mask == 0xFu,
               "CB MODE=DISABLE does not override an explicitly programmed write-all mask");
+        // The escape hatch must actually restore the old behaviour, or it is worse than useless:
+        // an agent would A/B it, see no change, and wrongly clear #1724 as the cause. The env var
+        // is read once into a static, so this asserts the predicate the draw path consults rather
+        // than re-entering resolve_pipeline_state with a changed environment.
+        CHECK(!legacy_cb_disable_mask_enabled(),
+              "the legacy CB_DISABLE override is OFF unless explicitly requested");
+
         // (No DS assertion here: depth_write_enable is set directly on this state and nothing in
         // the MODE path could clear it, so it would pass in both arms. The prepass DS check above
         // is a general invariant guard and passes in both arms too — neither is load-bearing for

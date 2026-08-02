@@ -124,6 +124,16 @@ bool decode_clear_color(uint32_t format, uint32_t number_type, uint32_t comp_swa
 }
 }  // namespace
 
+// #1724 diagnostic-only escape hatch; see render_state.hpp. Read once: resolve_pipeline_state is
+// on the per-draw path.
+bool legacy_cb_disable_mask_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PROSPER_LEGACY_CB_DISABLE_MASK");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
+
 uint64_t unmodeled_cb_color_mode_count(uint32_t mode) {
     return g_unmodeled_cb_mode_counts[mode & P::CB_COLOR_CONTROL_MODE_MASK].load();
 }
@@ -858,7 +868,16 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     // effect. That is the idiom the tests cover; it is not the only idiom hardware allows.
     const uint32_t cb_mode = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE);
     if (rs.has_cb_color_control) {
-        if (cb_mode == P::CB_COLOR_CONTROL_MODE_RESOLVE) {
+        // Diagnostic-only escape hatch for the blast radius above: PROSPER_LEGACY_CB_DISABLE_MASK=1
+        // restores #919's override so a suspected regression can be A/B'd in place, without a
+        // rebuild or a revert. It is NOT a supported rendering mode and nothing should ship
+        // depending on it; it exists because this change alters colour writes in every title and
+        // the next agent to find a broken frame should be able to rule this out in one run.
+        if (cb_mode == P::CB_COLOR_CONTROL_MODE_DISABLE && legacy_cb_disable_mask_enabled()) {
+            ps.color_write_mask = 0;
+            ps.color1_write_mask = 0;
+            for (auto& target : ps.color_targets) target.write_mask = 0;
+        } else if (cb_mode == P::CB_COLOR_CONTROL_MODE_RESOLVE) {
             // MSAA resolve: color0 (MSAA source) -> color1 (single-sample dest). The live backend copies
             // the already-rendered color0 surface into color1 instead of running these as ordinary draws.
             ps.cb_resolve = true;
