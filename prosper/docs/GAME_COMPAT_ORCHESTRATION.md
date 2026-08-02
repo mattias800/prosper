@@ -855,7 +855,21 @@ Also falsified: seed-skip/poison corruption (`PROSPER_NO_SKIP_SEED=1` gives an i
 (it writes zeros, but from a genuinely empty upstream); and the b49 1x1 control (draw 206's only real image input
 is `0x5420f0000`).
 
-### ANSWERED: the zero colour write mask is `CB_COLOR_CONTROL.MODE=DISABLE`, and prosper is faithful
+### SUPERSEDED by #1724: the zero colour write mask was `CB_COLOR_CONTROL.MODE=DISABLE`, and prosper was NOT faithful
+
+> **Correction, 2026-08-02 (#1724).** The measurement below is sound and its conclusion is wrong. It
+> established that the guest writes `MODE=DISABLE` and that prosper's decode of that field is exact,
+> then inferred that prosper's *response* to it was faithful. It never asked the discriminating
+> question: **does anything else in the same state already answer what MODE is supposed to answer?**
+> It does. Every one of Astro's 30 affected draws in submit 6179 also carries an explicit non-zero
+> `CB_TARGET_MASK & CB_SHADER_MASK` — including a 140,825-dword fragment shader across three MRTs at
+> 4K. prosper honoured `MODE` and discarded the mask, dropping most of the frame. #1724 removes that
+> override; the write mask now comes from the masks alone.
+>
+> The instruction below not to re-investigate "the masks, the MODE decode, or the register fold" was
+> correct about the **decode** and wrong to extend that to the **response**. Decode correctness and
+> response correctness are separate claims, and the cross-title controls cited (Blue Prince, Oregon
+> Trail) only ever established the first. Do not read a settled decode as a settled behaviour again.
 
 Measured 2026-08-01 on exact master `f7831d8a` with a fresh **v43** world-map capture (the v42 bundle
 reported `color-state unavailable`, which is why this could not be settled before) plus a
@@ -895,9 +909,10 @@ zeroes the mask -> `cwm=0` -> black. Every step is faithful.
 
 **So the frontier moves upstream, off the colour state entirely.** The question is no longer "who wrote
 the zero" — the guest did, 7,859 times — but **why Astro's world map never issues a CB_NORMAL pass**.
-Do not re-investigate the masks, the MODE decode, or the register fold: decode correctness is settled
-cross-title (Blue Prince renders through this path at MODE=1; Oregon Trail measured ~12,000 writes with
-zero mismatches across 1,050 suppressed draws).
+The MODE **decode** is settled cross-title (Blue Prince renders through this path at MODE=1; Oregon
+Trail measured ~12,000 writes with zero mismatches across 1,050 suppressed draws) — but per the #1724
+correction above, that never established that prosper's **response** to the decoded value was right,
+and it was not.
 
 **The bound was checked and closed.** `PROSPER_REGWATCH` observes writes only in streams prosper
 actually *folds*, so a never-folded submit would be invisible to it **and** to the renderer — the #305

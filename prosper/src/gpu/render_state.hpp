@@ -401,6 +401,11 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs);
 // acting on the value at all.
 uint64_t unmodeled_cb_color_mode_count(uint32_t mode);
 
+// #1724 diagnostic-only: true when PROSPER_LEGACY_CB_DISABLE_MASK=1 restores #919's
+// `MODE == DISABLE -> zero every colour write mask` override, for A/B-ing a suspected regression
+// without a revert. Read once into a static; not a supported rendering mode.
+bool legacy_cb_disable_mask_enabled();
+
 // Apply the renderer's reduced-resolution scale to both viewport and scissor state. Scissor outer
 // bounds round outward so resolution scaling never discards a guest-covered sample.
 void scale_resolved_render_area(ResolvedPipelineState& ps, float scale_x, float scale_y);

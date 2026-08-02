@@ -1,5 +1,7 @@
 // render_state.cpp — see render_state.hpp.
 #include "render_state.hpp"
+
+#include <cstdlib>
 #include "pm4_registers.hpp"
 #include "vk_translate.hpp"
 #include <algorithm>
@@ -49,17 +51,22 @@ int32_t scale_scissor_boundary(int32_t value, float scale, bool lower) {
 }
 
 // CB_COLOR_CONTROL.MODE selects what the color block DOES with a rasterized primitive, and only
-// NORMAL blends the bound pixel shader's color export into the target. prosper models three of the
-// other values as their own operation: DISABLE suppresses color writes, RESOLVE becomes cb_resolve,
-// and DCC_DECOMPRESS keeps the AGC helper-program handling in gpu_execute.hpp. Every REMAINING
-// value of the 3-bit field is reported here. ELIMINATE_FAST_CLEAR(2) is a color-block metadata
-// operation that hardware performs INSTEAD of shading and prosper still runs as an ordinary color
-// draw — that gap is #1588. Values 4, 5 and 7 are grouped with it because they are simply "not one
-// of the four prosper models", NOT because their operation is known: 4 and 5 are decompress modes
-// in the published enum, 7 is not defined there, and no title here exercises any of them.
-bool cb_mode_is_unmodeled_metadata_operation(uint32_t mode) {
-    return mode != P::CB_COLOR_CONTROL_MODE_DISABLE &&
-           mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
+// NORMAL blends the bound pixel shader's color export into the target. prosper models two of the
+// other values as their own operation: RESOLVE becomes cb_resolve, and DCC_DECOMPRESS keeps the
+// AGC helper-program handling in gpu_execute.hpp. Every REMAINING value of the 3-bit field is
+// reported here. ELIMINATE_FAST_CLEAR(2) is a color-block metadata operation that hardware performs
+// INSTEAD of shading and prosper still runs as an ordinary color draw — that gap is #1588. Values
+// 4, 5 and 7 are grouped with it because they are simply "not one of the values prosper models",
+// NOT because their operation is known: 4 and 5 are decompress modes in the published enum, 7 is
+// not defined there, and no title here exercises any of them.
+//
+// #1724 added DISABLE to that reported population. prosper no longer models it as anything: it is
+// now an unmodeled color-block operation run as an ordinary draw, which is exactly what this
+// counter exists to size. Keeping it excluded would have made #1708's instrument silent in the one
+// branch #1706 needs measured. Live populations are large — 36,613 of 268,899 traced Plucky Squire
+// draws — so this is a per-mode aggregate, not a per-draw log.
+bool cb_mode_is_unmodeled_operation(uint32_t mode) {
+    return mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
            mode != P::CB_COLOR_CONTROL_MODE_RESOLVE &&
            mode != P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS;
 }
@@ -82,8 +89,8 @@ void report_unmodeled_cb_color_mode(uint32_t mode) {
     // power-of-two line is duplicated or lost when threads race here.
     if ((count & (count - 1u)) == 0u)
         fprintf(stderr, "[gpu] resolve_pipeline_state: CB_COLOR_CONTROL.MODE=%u is an unmodeled "
-                        "color-block metadata operation -> still executed as an ordinary color "
-                        "draw (#1588; count=%llu)\n",
+                        "color-block operation -> still executed as an ordinary color "
+                        "draw (count=%llu)\n",
                 mode, static_cast<unsigned long long>(count));
 }
 
@@ -118,6 +125,16 @@ bool decode_clear_color(uint32_t format, uint32_t number_type, uint32_t comp_swa
     return false;  // unmapped format -> caller uses opaque-black fallback
 }
 }  // namespace
+
+// #1724 diagnostic-only escape hatch; see render_state.hpp. Read once: resolve_pipeline_state is
+// on the per-draw path.
+bool legacy_cb_disable_mask_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PROSPER_LEGACY_CB_DISABLE_MASK");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
 
 uint64_t unmodeled_cb_color_mode_count(uint32_t mode) {
     return g_unmodeled_cb_mode_counts[mode & P::CB_COLOR_CONTROL_MODE_MASK].load();
@@ -812,14 +829,58 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     out1.alpha_blend_op = ps.alpha_blend_op1;
     out1.write_mask = ps.color1_write_mask; out1.disable_rop3 = rs.disable_rop3_1;
 
-    // MODE=DISABLE suppresses color-buffer writes, not the whole draw: depth/stencil tests and
-    // updates still execute. An absent CB_COLOR_CONTROL retains the legacy normal-draw behavior;
-    // otherwise a zero-initialized synthetic RenderState would unexpectedly lose every color draw.
-    // DCC_DECOMPRESS is handled by the AGC helper-program path in gpu_execute.hpp. Other hardware
-    // metadata modes remain ordinary draws for compatibility, but are now visible instead of silent.
+    // #1724: the color write mask comes from CB_TARGET_MASK & CB_SHADER_MASK above.
+    // CB_COLOR_CONTROL.MODE selects a color-block OPERATION and is not consulted for the mask.
+    // (RESOLVE below is a separate matter: it replaces the draw outright, which is a stronger
+    // MODE-keyed decision than the one removed here. It is left exactly as it was.)
+    //
+    // #919 added a `MODE == DISABLE -> zero every mask` override. That issue says in its own text
+    // that neither of its two items was "exercised by the currently-booting titles", calling them
+    // "latent incompleteness, not active bugs" — so the override was written from the AMD enum NAME
+    // rather than from observed title behavior.
+    //
+    // Measured per draw, joining mode against the guest's own effective mask:
+    //
+    //   Dragon Quest VII         mode=0      7 draws, ALL effective == 0
+    //   Astro Bot submit 6179    mode=0     30 draws, ALL effective != 0
+    //   The Plucky Squire        mode=0 (menu-phase trace) 36,613 draws, 8,326 != 0
+    //   The Plucky Squire        mode=0 (full run)        200,113 draws, 9,580 != 0 (4.79%)
+    //
+    // DQ7 programs both signals consistently, so the override is redundant there and the defect is
+    // invisible — which is why it survived. Astro contradicts it on every one, including
+    // draw[70]/[71]: target-mask=0x737 (three MRTs), shader-mask=0xff, and a 140,825-dword fragment
+    // shader at 3840x2160 — the title's main world/lighting shader, not a depth prepass by any
+    // reading. Those resolved to cwm=0 and the executor's existing no-effect path then dropped 30 of
+    // that submit's 36 draws.
+    //
+    // What this does NOT claim, and an earlier revision of this comment wrongly did: that prosper's
+    // MODE decode is untrustworthy. It is not. OREGON_TRAIL_STATUS.md records 12,390 CB_COLOR_CONTROL
+    // writes with MODE=1 dominant 7:1 and all 1,050 of 1,050 suppressed draws joining exactly to a
+    // CB_DISABLE the guest wrote immediately before them. The decode is exact, and that title's guest
+    // programs CB_DISABLE deliberately. The narrower and correct statement is that a settled DECODE
+    // was never evidence of a settled RESPONSE to the decoded value.
+    //
+    // Nor is this cost-free: Plucky's mode=0 draws that DO carry a mask now write where they
+    // previously did not. Sized on a retained full run (533,964 records), that is 9,580 draws,
+    // 4.79% of its mode=0 population, front-loaded in the menu/loading minutes -- the phases the
+    // live A/B covers, at 0.08-0.24% differing pixels with no visible corruption. Its 87.6-95.3%
+    // mode=0 world phase contains 63 of them (0.35%), because the depth/shadow prepass there
+    // programs CB_TARGET_MASK=0 as well as MODE=DISABLE. Per-minute table and the two ways to get
+    // this wrong: tools/colorstate/README.md. If a title is ever shown to depend on MODE=DISABLE
+    // suppressing an explicitly programmed mask, this is the code that must become per-draw
+    // attribution (#1706) rather than an unconditional read.
+    //
+    // #919's real contract is preserved: a colour-disabled pass that programs CB_TARGET_MASK=0 still
+    // resolves to no colour write, via the derivation above, and still executes for its DS side
+    // effect. That is the idiom the tests cover; it is not the only idiom hardware allows.
     const uint32_t cb_mode = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE);
     if (rs.has_cb_color_control) {
-        if (cb_mode == P::CB_COLOR_CONTROL_MODE_DISABLE) {
+        // Diagnostic-only escape hatch for the blast radius above: PROSPER_LEGACY_CB_DISABLE_MASK=1
+        // restores #919's override so a suspected regression can be A/B'd in place, without a
+        // rebuild or a revert. It is NOT a supported rendering mode and nothing should ship
+        // depending on it; it exists because this change alters colour writes in every title and
+        // the next agent to find a broken frame should be able to rule this out in one run.
+        if (cb_mode == P::CB_COLOR_CONTROL_MODE_DISABLE && legacy_cb_disable_mask_enabled()) {
             ps.color_write_mask = 0;
             ps.color1_write_mask = 0;
             for (auto& target : ps.color_targets) target.write_mask = 0;
@@ -827,7 +888,7 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
             // MSAA resolve: color0 (MSAA source) -> color1 (single-sample dest). The live backend copies
             // the already-rendered color0 surface into color1 instead of running these as ordinary draws.
             ps.cb_resolve = true;
-        } else if (cb_mode_is_unmodeled_metadata_operation(cb_mode)) {
+        } else if (cb_mode_is_unmodeled_operation(cb_mode)) {
             report_unmodeled_cb_color_mode(cb_mode);
         }
     }
@@ -837,6 +898,13 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     // COPY would suppress ordinary blending, while disabled COPY preserves the hardware's normal
     // blend-then-copy path. CB_BLENDn_CONTROL.DISABLE_ROP3 can opt an attachment out; Vulkan's logic
     // op is global, so a mixed two-target enable cannot be represented and falls back visibly to COPY.
+    //
+    // The MODE == NORMAL gate is deliberately NOT relaxed by #1724. That change stops MODE vetoing
+    // the WRITE MASK; it makes no claim that a non-NORMAL mode should acquire a logic op it does not
+    // have today. Astro's affected draws are unaffected either way (ROP3=0xCC is COPY, excluded
+    // here), so relaxing it would be an untested behavior change with no evidence behind it. A title
+    // that programs a non-COPY ROP3 alongside a non-NORMAL mode would silently lose the logic op:
+    // that gap is real, is not new, and is tracked rather than guessed at here.
     const uint32_t rop3 = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, ROP3);
     uint32_t logic_op = 3;
     if (cb_mode == P::CB_COLOR_CONTROL_MODE_NORMAL && vk_logic_op(rop3, logic_op) && logic_op != 3u) {

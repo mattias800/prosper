@@ -96,17 +96,21 @@ int main() {
         if (c) CHECK(c[0] > 0xC0 && c[1] < 0x40 && c[2] < 0x40, "one opaque red draw -> RED center");
     }
 
-    // #919: an explicitly programmed CB_COLOR_CONTROL.MODE=DISABLE reaches Vulkan as zero color
-    // write masks, while the same draw can still populate stencil for a later color pass.
+    // #919's contract, re-based on the right register by #1724: a colour-disabled draw reaches
+    // Vulkan with zero write masks and can still populate stencil for a later colour pass. The
+    // disabling now comes from the guest's explicit CB_TARGET_MASK, never from
+    // CB_COLOR_CONTROL.MODE — see the block below, which asserts MODE=DISABLE alone does NOT
+    // suppress, and render_state.cpp for the Astro Bot measurement behind that change.
     {
         RenderState raw{};
         raw.prim_type = 4; // triangle list
-        raw.cb_target_mask = raw.cb_shader_mask = 0xFu;
+        raw.cb_target_mask = 0x0u;          // the real colour-disable signal
+        raw.cb_shader_mask = 0xFu;
         raw.has_cb_color_control = true;
-        raw.cb_color_control = 0; // MODE=DISABLE
+        raw.cb_color_control = 0x00CC0010u; // MODE=NORMAL — irrelevant to the mask
         ResolvedPipelineState disabled = resolve_pipeline_state(raw);
         CHECK(disabled.color_write_mask == 0,
-              "explicit CB MODE=DISABLE reaches Vulkan with color writes disabled");
+              "a zero CB_TARGET_MASK reaches Vulkan with colour writes disabled");
 
         ResolvedPipelineState writer = disabled;
         writer.stencil_enable = true;
@@ -119,7 +123,7 @@ int main() {
         const std::vector<uint8_t> suppressed = prosper::test::render_draws_rgba({w}, W, H);
         const uint8_t* sc = center(suppressed);
         CHECK(sc && sc[2] > 0xC0 && sc[0] < 0x40 && sc[1] < 0x40,
-              "CB MODE=DISABLE red fragment preserves the blue color attachment");
+              "zero-target-mask red fragment preserves the blue colour attachment");
 
         ResolvedPipelineState reader = opaque;
         reader.stencil_enable = true;
@@ -130,7 +134,25 @@ int main() {
         const std::vector<uint8_t> consumed = prosper::test::render_draws_rgba({w, r}, W, H);
         const uint8_t* cc = center(consumed);
         CHECK(cc && cc[1] > 0xC0 && cc[0] < 0x40 && cc[2] < 0x40,
-              "CB MODE=DISABLE draw still writes stencil consumed by a later color pass");
+              "a colour-disabled draw still writes stencil consumed by a later colour pass");
+
+        // #1724, at pixel level: MODE=DISABLE with an explicit write-all mask must RENDER.
+        // The control above is what makes this non-vacuous: it renders the SAME red fragment through
+        // the SAME harness with CB_TARGET_MASK=0 and gets blue, proving the harness honours a zero
+        // write mask. So a red centre here can only come from the mask being kept.
+        RenderState mode_disabled{};
+        mode_disabled.prim_type = 4;
+        mode_disabled.cb_target_mask = mode_disabled.cb_shader_mask = 0xFu;
+        mode_disabled.has_cb_color_control = true;
+        mode_disabled.cb_color_control = 0x00CC0000u;   // MODE=DISABLE, write-all masks
+        ResolvedPipelineState mode_disabled_ps = resolve_pipeline_state(mode_disabled);
+        CHECK(mode_disabled_ps.color_write_mask == 0xFu,
+              "MODE=DISABLE with a write-all CB_TARGET_MASK resolves to an RGBA write mask");
+        prosper::test::BackendDraw m; m.vs = vs; m.fs = red; m.ps = &mode_disabled_ps; m.vcount = 3;
+        const std::vector<uint8_t> rendered = prosper::test::render_draws_rgba({m}, W, H);
+        const uint8_t* mc = center(rendered);
+        CHECK(mc && mc[0] > 0xC0 && mc[1] < 0x40 && mc[2] < 0x40,
+              "MODE=DISABLE draw with an explicit mask reaches the colour attachment");
     }
 
     // Hardware instance count reaches both Vulkan submission paths. Additive quarter-red makes the
