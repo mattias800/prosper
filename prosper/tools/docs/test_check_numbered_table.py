@@ -193,6 +193,14 @@ run("table-like lines inside a fenced block",
     TABLE + "\n```\n| 33 | 34 | 35 | 32 |\n| 9 | more output |\n```\n",
     want_problems=False)
 
+# #1709: a fence opening IMMEDIATELY after a table — no blank line between. Before the
+# fence-gap rule this reported a split, because the fence delimiter is a non-blank line
+# between two pipe runs, which is exactly the lost-leading-pipe shape. Discriminating:
+# reverting the rule makes this case, and only this case, fail.
+run("a fenced block between a table and more rows is not a split",
+    "| # | What |\n|---|---|\n| 1 | a |\n```\nsome output\n```\n| 2 | b |\n",
+    want_problems=False)
+
 run("fenced block between two tables",
     "| # | a |\n|---|---|\n| 1 | x |\n\n```\n| 9 | z |\n```\n\n| # | b |\n|---|---|\n| 1 | y |\n",
     want_problems=False)

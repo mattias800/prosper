@@ -80,10 +80,8 @@ fix -- abutment keeps the genuine defect, and the shape it misreads has zero ins
 tracked corpus and is bounded to a single message. If it starts appearing, narrowing to "gap
 contains no blank line" trades it the other way at a known cost.
 
-A fence opening immediately after a table is misread the same way, but that half IS separable by a
-rule as principled as the blank-line one -- record fence line numbers and skip a gap containing one.
-It is not implemented here only to keep this change scoped after five review rounds; tracked as
-#1709 so the next reader looks for the rule that exists instead of taking this block as settled.
+(A fence between a table and further rows was misread the same way. That half was separable and is
+now fixed -- #1709: fence line numbers are recorded and a gap containing one is not a split.)
 """
 
 from __future__ import annotations
@@ -134,16 +132,25 @@ class Table:
         return self.lines[0].strip() if self.lines else ""
 
 
-def parse_tables(lines: list[str]) -> tuple[list[Table], set[int]]:
-    """Split into table runs, ignoring fenced code. Returns (tables, blank_line_numbers)."""
+def parse_tables(lines: list[str]) -> tuple[list[Table], set[int], set[int]]:
+    """Split into table runs, ignoring fenced code.
+
+    Returns (tables, blank_line_numbers, fence_line_numbers). The fence lines are needed
+    because a fence opening straight after a table looks exactly like the interruption of
+    a split table (#1709) -- it is a non-blank line between two pipe runs -- but it is a
+    correct document. It is separable by a rule as principled as the blank-line one, which
+    is why this is a fix rather than another entry in KNOWN LIMIT.
+    """
     tables: list[Table] = []
     blanks: set[int] = set()
+    fences: set[int] = set()
     fenced = False
     run: list[str] = []
     run_start = 0
 
     for i, line in enumerate(lines, start=1):
         if FENCE.match(line):
+            fences.add(i)
             fenced = not fenced
             if run:
                 tables.append(Table(run_start, run))
@@ -168,7 +175,7 @@ def parse_tables(lines: list[str]) -> tuple[list[Table], set[int]]:
             run = []
     if run:
         tables.append(Table(run_start, run))
-    return tables, blanks
+    return tables, blanks, fences
 
 
 def check(path: Path, sequential: bool, table_header: str | None) -> list[str]:
@@ -181,7 +188,7 @@ def check(path: Path, sequential: bool, table_header: str | None) -> list[str]:
         return [f"{path}: is not valid UTF-8: {exc}"]
 
     lines = text.split("\n")
-    tables, blanks = parse_tables(lines)
+    tables, blanks, fences = parse_tables(lines)
     if not tables:
         # Under --sequential we were pointed at ONE specific table, so its absence means the path
         # is wrong or the format changed, and failing here is what stops this check passing
@@ -222,6 +229,13 @@ def check(path: Path, sequential: bool, table_header: str | None) -> list[str]:
         # blank, or the line immediately above the fragment is itself the interruption.
         gap_start = previous.start + len(previous.lines)
         gap = range(gap_start, current.start)
+        # #1709: a fence opening immediately after a table is a correct document, not an
+        # interruption. It is separable from a genuine split because a genuine one never
+        # contains a fence delimiter -- the fenced content is skipped entirely, so the run
+        # below it is code, not orphaned rows.
+        if any(n in fences for n in gap):
+            origin = None
+            continue
         all_blank = all(n in blanks for n in gap)
         interrupted_at = current.start - 1
         if not all_blank and interrupted_at in blanks:
@@ -329,7 +343,7 @@ def main() -> int:
         return 1
 
     for path in args.paths:
-        tables, _ = parse_tables(path.read_text(encoding="utf-8").split("\n"))
+        tables, _, _ = parse_tables(path.read_text(encoding="utf-8").split("\n"))
         proper = [t for t in tables if t.proper]
         rows = sum(len(t.body) for t in proper)
         detail = "contiguous and unbroken" if args.sequential else "unbroken"
