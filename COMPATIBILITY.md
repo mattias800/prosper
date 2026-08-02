@@ -33,13 +33,13 @@ Last updated: 2026-08-02
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🚧 Title screen (`NEW GAME` / `OPTIONS`) renders at native 2560×1440; gameplay not reached |
 | *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🔬 Boots into the UE4 render bring-up and submits real GPU work, then the render thread faults after about 10 s with no frame composited |
 | *Asterix &amp; Obelix - Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🔬 Boots and submits real GPU work, but every presented frame is black and a guest thread dies at about 125 s, after which the renderer publishes nothing |
-| *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Audio and sound bank initialise; the game's own code lives in a runtime-loaded PRX that prosper cannot yet load |
+| *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Loads and starts its runtime PRX and recompiles both first graphics stages, then null-derefs its own empty logged-in-user list — a startup race inside the title, not a missing API (#1746) |
 | *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Warning screen, publisher logo, title screen and EULA render at native 3840×2160 with no code changes; the 3D world is dropped because the programmed user-data block is larger than the bound pipeline's user-SGPR window (#305) |
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
 | *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 **Gameplay** — title screen and the first playable scene render with real GPU draws on a validated route; the profile menu's 3D layer and the gameplay composite are degraded (#1619) |
-| *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Publisher and CRIWARE logos render at native 1920×1080; the opening movie stops it before the title screen |
+| *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Scripted routes reach the title screen, EULA, main menu and new-game Options screen at native 1920×1080; the boot's modal confirmation dialog needs input |
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and the ASTRO BOT title screen render at native 3840×2160; the title is over-exposed, the world-map hub shows only its backdrop, and guest compute costs ~21× throughput (#1732) |
 
 ¹ Exact retail game name pending confirmation.
@@ -69,12 +69,12 @@ is guest flips per second — the rate the game itself advances — averaged ove
 | *Syberia: Remastered* `PPSA30140` | 3 | ~2 @ 1080p | Routed factory hall renders; composite degraded (#1619 / #1627) |
 | *Dragon Quest VII Reimagined* `PPSA17942` | 1 without input | ~12 @ 4K | Ocean/sky pass and the save-created notice; the title needs the route |
 | *Earthion* `PPSA28061` | 1 | ~139 @ 4K | Bezel and intro text; the picture area inside the bezel is missing (#1590) |
-| *Tales of Graces f Remastered* `PPSA19991` | 1 | ~85 @ 1080p | Logos and the `Checking add-on…` dialog, then black (#1609 / #1688) |
+| *Tales of Graces f Remastered* `PPSA19991` | 2 with the route | ~37 @ 1080p on the title screen | Title screen, EULA, main menu and new-game Options; gameplay not reached (#1609) |
 | *The Oregon Trail* `PPSA19244` | 0 | ~42 @ 4K | Frame loop advances, every frame black (#1606 / #1641) |
 | *Asterix &amp; Obelix - Babylon Mission* `PPSA30490` | 0 | ~124 @ 1080p until 125 s | All frames black, then a guest thread dies and the renderer stops (#1599) |
 | *Sonic Origins* `PPSA05325` | 0 | ~5 @ 4K | One rendered frame; the supplied dump is update-only |
 | *ArcRunner* `PPSA21406` | 0 | — | Guest render thread faults after about 10 s, before any composited frame (#1226) |
-| *R-Type Delta: HD Boosted* `PPSA26414` | 0 | — | `GetProcAddress error 80020003`, then a guest fault at `rip=0` (#1591) |
+| *R-Type Delta: HD Boosted* `PPSA26414` | 0 | — | Guest fault at `eboot+0x24055`: `users.front()` on an empty vector, ~260 ms into the title's own 400 ms input-thread delay (#1746) |
 
 Six titles that render real content are below the 30 fps bar: Syberia (~2), Bendy in level (~8),
 Dragon Quest VII (~12), Nikoderiko (~14), The Pathless (~14) and The Plucky Squire (~21).
@@ -651,9 +651,43 @@ draw is scissored to the left; the animation does settle. Start from `prosper/do
 <p align="center">
   <img src="assets/screenshots/tales-graces-f-criware.png" alt="Tales of Graces f Remastered — CRIWARE middleware logo">
 </p>
+<p align="center">
+  <img src="assets/screenshots/tales-graces-f-title.png" alt="Tales of Graces f Remastered — title screen (Linux, screenshot frontend, prosper/scripts/talesgraces/reach-title.pad)">
+</p>
+<p align="center">
+  <img src="assets/screenshots/tales-graces-f-options.png" alt="Tales of Graces f Remastered — new-game Options screen (Linux, screenshot frontend, prosper/scripts/talesgraces/reach-options.pad)">
+</p>
 
-Both logo screens above are direct, unmodified `screenshot` frontend captures at native 1920×1080
-from a plain boot with no scripted input and no render acceleration.
+All four captures above are direct, unmodified `screenshot` frontend captures at native 1920×1080
+with no render acceleration. The two logo screens come from a plain boot with no scripted input; the
+title screen comes from `prosper/scripts/talesgraces/reach-title.pad` and the Options screen from
+`prosper/scripts/talesgraces/reach-options.pad`.
+
+**Rung 2 — the title screen.** What held this title at rung 1 was neither the opening movie nor a
+missing API: after the CRIWARE logo the title renders a **modal dialog** — *"This game uses an
+autosave feature. Please do not close the game while the save icon is displayed."* — carrying an
+✕ / ◯ **Close** prompt, and nothing dismisses it without a button press. With no input the guest sits
+behind it and presents a black frame for the rest of the run, which is the byte-identical-black
+signature recorded further down this section. The route's alternating Cross/Circle presses also skip
+the two logo screens, so the title screen is up by t≈8 s and holds, animating, to the end of a 300 s
+run.
+
+The A/B is unambiguous and is the reason the older reading is corrected rather than merely extended.
+Two runs in one session, identical parameters, differing only in `PROSPER_PAD_SCRIPT`: without input
+every sample from t=12 s on measures **1 distinct colour over 0 non-black pixels** with
+`draws_last=8`; with the route every sample measures **407,942–409,335 distinct colours** with
+`draws_last=132`. A guest drawing 8 things per frame is not rendering a scene at all.
+
+`reach-options.pad` goes further, and the difference between the two routes is instructive: the EULA
+that follows the title screen maps Circle to **Disagree**, so a route that alternates Cross and
+Circle bounces off it and oscillates back to the title screen. Cross alone agrees, and the run then
+passes the main menu and settles on the **new-game Options screen** (Battle Difficulty, Battle
+Camera, Message Speed, Text Auto-Advance, Vibration, Encounters) for the rest of a 300 s run at
+35,020–39,396 distinct colours per sample. Every menu layer this title has before gameplay renders
+correctly; none of them were reachable without input.
+
+`sceVideodec2` still has no AVC decoder (#1688), so whatever movie plays after the Options screen
+will have no picture — but that is behind these menus, not in front of them.
 
 Two fixes took this title from rendering nothing to rendering real frames. It first stalled in
 `GameMain.SingletonInitializing`, because prosper linked a hard-coded plugin allowlist and this
@@ -666,9 +700,11 @@ zero tag as "not really bound", so the completion event was never delivered and 
 `sceKernelWaitEqueue` blocked forever (#1666).
 
 With both fixed, the title loads 100+ asset bundles including its title-screen textures, and renders
-the Bandai Namco and CRIWARE logos. It then goes black and stays black for the rest of the run
-(58 of 60 sampled frames are byte-identical). The title screen is behind the opening movie and has
-not been reached.
+the Bandai Namco and CRIWARE logos. **On a plain no-input boot** it then goes black and stays black
+for the rest of the run (58 of 60 sampled frames are byte-identical) — the modal dialog above is
+why, and the paragraphs below were written before that was known, when the opening movie was the
+standing explanation. They are retained because the `sceVideodec2` work they record is real and
+independent of it.
 
 The movie was originally blocked at `sceVideodec2QueryDecoderMemoryInfo`, which failed with
 `0x811d0200` so `criMvPly_AllocateWorkBufferWithWork` never got a decoder. **That cause is fixed**
@@ -701,8 +737,14 @@ not established and would need a denser capture.
 - **Empty composite is a renderer fault** — falsified. Offline `gpu_replay --inspect-only` on a
   retained capture showed all 28 submitted draws were fullscreen post passes with no mesh draw at
   all, so prosper was faithfully rendering an empty scene (#1609).
-- **Input gating** — falsified. A 200 s route mashing cross/circle/triangle/options left
-  `draws_last=28` across all 99,427 submits.
+- **Input gating** — this falsification is itself **withdrawn**, and the entry is kept as the
+  correction rather than deleted. It read: *"falsified — a 200 s route mashing
+  cross/circle/triangle/options left `draws_last=28` across all 99,427 submits"*. That measurement
+  was taken on a boot that no longer exists; after #1656 and #1666 the guest reaches a **modal
+  confirmation dialog** it did not previously reach, and an identical mashing route now takes
+  `draws_last` from 8 to 132 and renders the title screen. **Input gating was the answer.** The
+  general lesson is the transferable part: a negative input result is only valid for the boot state
+  it was measured on, and must be re-run after any fix that changes how far the title gets (#1609).
 - **An intro-movie *stall* at the AvPlayer layer** — falsified for `libSceAvPlayer`: tracing showed
   zero AvPlayer calls despite 20 imports. The movie path this title actually uses is CRI's own
   `criMvPly` over `sceVideodec2`, which is a different subsystem (#1658).

@@ -1,0 +1,35 @@
+# Tales of Graces f Remastered (PPSA19991) — past the title screen to the new-game Options screen.
+#
+# VALIDATED on Linux with hardware Vulkan (RADV), native 1920x1080, headless `screenshot`
+# frontend, PROSPER_RENDER=1, no render acceleration, 300 s / 30 samples. Observed phases:
+#   t~10 s  title screen (474,726 distinct colours)
+#   t~30 s  End-User License Agreement, "X Agree / O Disagree / [] Change Language"
+#   t~60 s  main menu
+#   t~80 s onward  the new-game Options screen (Battle Difficulty / Battle Camera / Message Speed /
+#                  Text Auto-Advance / Vibration / Encounters), stable to the end of the run at
+#                  35,020-39,396 distinct colours per sample
+#
+# Cross ONLY. This is the difference from reach-title.pad: the EULA maps Circle to "Disagree", so
+# any route that alternates Cross and Circle bounces off the EULA and oscillates back to the title
+# screen. Cross alone agrees and proceeds.
+#
+# Presses are sparse and spread out on purpose — each screen needs one confirmation and then time
+# to load, and mashing re-enters submenus.
+4-5:cross
+6-7:cross
+8-9:cross
+10-11:cross
+12-13:cross
+20-21:cross
+30-31:cross
+40-41:cross
+50-51:cross
+60-61:cross
+80-81:cross
+100-101:cross
+120-121:cross
+150-151:cross
+180-181:cross
+210-211:cross
+240-241:cross
+270-271:cross
