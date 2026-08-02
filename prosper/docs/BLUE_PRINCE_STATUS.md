@@ -54,6 +54,39 @@ The `blue-prince-title` snapshot route guards the title screen.
   reported (`[buffer-truncated]`), and `PROSPER_MAX_BUFFER_UPLOAD_MB=N` lowers the ceiling so one
   build reproduces the collapse and the fix back to back.
 
+- **#1691/#1703** — the decoded-texture identity map was scoped to one graphics span, and this title
+  cuts every frame into 21-22 spans at its interleaved dispatches, so each span re-resolved every
+  identity from scratch. It is now scoped to the submit, with cross-span reuse gated on the ordered
+  in-submit write journal plus a re-check that the entry's source range is still the range the
+  binding resolves. Two reversed-order routed A/B pairs on an otherwise idle box: persistent-cache
+  resolutions **76.7 -> 41.3 per submit (-46 %)**, reproducible to the digit, and heavy-scene frame
+  time **246.6 -> 228.4 ms** and **248.1 -> 228.8 ms** (~4.04 -> ~4.38 submits/s).
+  **The frame-time gain does not come from the texture terms.** Per-submit, across the two pairs:
+
+  | term | pair 1 (span -> submit) | pair 2 (span -> submit) |
+  |---|---|---|
+  | `build_resources` | 47.60 -> 47.32 ms (**-1.0 %**) | 47.28 -> 48.31 ms (**+0.9 %**) |
+  | `texture` (within it) | 7.31 -> 7.17 ms | 7.15 -> 7.34 ms |
+  | `backend` | 165.91 -> 165.50 ms | 170.3 -> 167.3 ms |
+  | **`pass_control`** | **35.20 -> 15.78 ms (-19.4)** | **28.76 -> 14.82 ms (-13.9)** |
+
+  The sign **flips** between pairs in the term the change touches while the magnitude stays
+  consistent in a term it does not — that pattern is why the mechanism is recorded as open rather
+  than settled, and why the numbers are here instead of the word "unexplained". Either it is a real
+  second-order effect or `pass_control` is misattributing; both are worth knowing, and the next
+  person should be able to tell them apart without re-running the route. The plausible candidate is
+  allocator behaviour (the span-scoped arm rebuilds the identity map 16.7x per submit while the same
+  pass loop allocates an 8.3 MiB frame buffer per pass), but it has **not** been measured — do not
+  promote it to an explanation. Host cache footprint is byte-identical between arms (16 scratch
+  slots, 111 persistent entries, 574.3 MiB), so it is not a working-set effect.
+
+  **This does not address the reported ~2 fps.** #1284 still decomposes the same title's 263.33 ms
+  submit as `draw_setup.resources` 95.42 + `readback` 79.16 + `gpu_wait` 29.29 + `record_upload`
+  22.58 ms; this change moves a ~7.5 % term and leaves all four intact. The title remains CPU-bound
+  in the frontend. Note also that the issue's headline **15.2x is a replay figure** — the persistent
+  decode cache is disabled by construction in replay — and live only ~77 of ~5,500 texture
+  references per submit ever reached it.
+
 ## Defect families (#1287) — families 1–3 and 5 RESOLVED 2026-07-26
 
 Families 1–3 and 5 below are **fixed on master**; they are retained as the resolution record so
@@ -137,6 +170,11 @@ were confirmed as legitimate frustum culls.
   (`unique-pos=1 (max-mult=19236) -> COLLAPSED` is the fetch-returns-a-constant signature).
 - `PROSPER_MAX_BUFFER_UPLOAD_MB=N` (1..64) — lower the buffer-upload ceiling to reproduce a
   truncation collapse on the same build; `[buffer-truncated]` reports every short upload.
+- `PROSPER_NO_SUBMIT_TEXTURE_DECODE_SCOPE=1` (#1691) — restore the pre-#1691 span-scoped lifetime of
+  the decoded-texture identity map, so one binary A/Bs that change on a routed run.
+  `PROSPER_RENDER_TIMING=1` then reports
+  `[render-timing] decode_scope decodes=… same_span=… cross_span=… invalidated=… pinned=… scope=…`
+  alongside the existing `texture_cache` line.
 - `gpu_replay --recompile-raw` (#1416) — re-recompile every retained raw VS/FS with the CURRENT
   recompiler and replay: the ~5 s offline A/B that resolved family 1 against a ~8 min live route.
   Pair with `PROSPER_MIPLOG=1` (per-binding mip eligibility) and `PROSPER_BUFLOG=1` (per-binding
