@@ -111,6 +111,10 @@ bool guest_readable(uint64_t addr, uint32_t bytes);
 bool guest_writable(uint64_t addr, uint32_t bytes);
 // Guest GPU writes invalidate renderer-owned copies of overlapping resources.
 void notify_guest_gpu_write(uint64_t addr, uint64_t size);
+// The 64 KiB Global Data Share (gpu_executor.cpp, declared in gpu_execute.hpp). DMA_DATA can name a
+// GDS offset rather than a guest address as its destination, and shaders reach the same backing.
+uint8_t* compute_gds_backing();
+size_t compute_gds_size();
 
 // Wake any thread blocked in sync_on_address (a futex) on `addr`. A GPU completion label write only
 // changes memory; a futex waiter does NOT wake on a value change — it needs an explicit FUTEX_WAKE. The
@@ -1053,13 +1057,37 @@ static void honor_event_write(const Pm4Command& c) {
 // vocabulary. Source mappedness plus the established 32-bit immediate ABI is the safe discriminator;
 // GDS offsets and malformed/unmapped endpoints remain fail-closed.
 // CONFIDENCE: HIGH on immediate fill and mapped address-copy behavior; MED on the large-fill form.
-enum class DmaDataForm { Invalid, Immediate, Copy };
+enum class DmaDataForm { Invalid, Immediate, Copy, GdsImmediate };
+
+// The destination selector occupies the LOW byte of the packed `dd_sels` word: the HLE builder writes
+// `(a2 & 0xff) | ((a3 & 0xff) << 8)`, and a2 is the argument that tracks the destination DOMAIN.
+// Evidence (Astro Bot, #1742): across a routed run every DMA_DATA with a2==1 carries a tiny
+// destination (0x4, 0xc68, 0xc70, 0xc74) while every a2==3 carries a full 64-bit guest address —
+// so a2 selects where the destination lives, and 1 is the PM4 GDS encoding. This also resolves the
+// `srcSel?`/`dstSel?` question the HLE prototype left open at CONFIDENCE: MED; the two names were
+// transposed. Corroboration: Sony's own parameter is `dstAddressOrOffset` (from the patcher export
+// `sceAgcDmaDataPatchSetDstAddressOrOffset`), an offset domain that in DMA_DATA is GDS, and
+// `sceAgcDcbAtomicGds` / `sceAgcDriverRegisterGdsResource` are part of the same published surface.
+// CONFIDENCE: MED-HIGH on dst_sel==1 meaning GDS; the guard below keeps every other form unchanged.
+static constexpr uint32_t kDmaDstSelGds = 1;
+static uint32_t dma_data_dst_sel(const Pm4Command& c) { return c.dd_sels & 0xffu; }
 
 static DmaDataForm dma_data_form(const Pm4Command& c, bool source_materialized = false) {
     constexpr uint32_t kMaxImmediateBytes = 0x1000000;   // existing 16 MiB fill safety bound
     constexpr uint32_t kMaxCopyBytes = 0x10000000;      // HLE builder's 256 MiB API bound
-    if (!c.dd_valid || !c.dd_bytes || c.dd_bytes > kMaxCopyBytes || c.dd_dst < 0x10000)
-        return DmaDataForm::Invalid;
+    if (!c.dd_valid || !c.dd_bytes || c.dd_bytes > kMaxCopyBytes) return DmaDataForm::Invalid;
+    // A GDS destination is an OFFSET into the 64 KiB share, not a guest address, so it is legitimately
+    // below the 0x10000 floor that rejects malformed guest pointers — which is exactly why every one
+    // of these was being discarded. Only the immediate (<=32-bit source) form is accepted here: a
+    // GDS-to-memory or memory-to-GDS copy has no title evidence yet and stays fail-closed.
+    if (dma_data_dst_sel(c) == kDmaDstSelGds) {
+        const size_t gds_size = compute_gds_size();
+        const bool in_range = c.dd_dst < gds_size && c.dd_bytes <= gds_size - c.dd_dst;
+        return (c.dd_src <= UINT32_MAX && in_range && !(c.dd_dst & 3) && !(c.dd_bytes & 3))
+                   ? DmaDataForm::GdsImmediate
+                   : DmaDataForm::Invalid;
+    }
+    if (c.dd_dst < 0x10000) return DmaDataForm::Invalid;
     // Preserve the established ABI discriminator: every <=32-bit source is immediate data. Guest
     // image/heap addresses in prosper are 64-bit, so address copies occupy the other domain.
     if (c.dd_src <= UINT32_MAX) {
@@ -1102,6 +1130,20 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     }
     if (form == DmaDataForm::Invalid) {
         report_invalid_dma_data(c);
+        return;
+    }
+    if (form == DmaDataForm::GdsImmediate) {
+        // A GDS counter reset. The guest zeroes its append/consume counters here every frame; the
+        // shaders that increment them reach the same 64 KiB backing through the internal binding.
+        // Dropping this write is what made Astro Bot's indirect dispatch grow without bound (#1742):
+        // the counter accumulated by a constant per frame and was consumed as a workgroup count.
+        uint8_t* gds = compute_gds_backing();
+        const uint32_t v32 = (uint32_t)c.dd_src;
+        for (uint32_t i = 0; i + 4 <= c.dd_bytes; i += 4)
+            memcpy(gds + c.dd_dst + i, &v32, 4);
+        if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_GDSLOG"))
+            fprintf(stderr, "[agc]   DmaData GDS fill [gds+0x%llx] := 0x%x (%u bytes)\n",
+                    (unsigned long long)c.dd_dst, v32, c.dd_bytes);
         return;
     }
     uint8_t* dst = (uint8_t*)(uintptr_t)c.dd_dst;

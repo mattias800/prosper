@@ -317,6 +317,59 @@ int main() {
               "DMA_DATA notified renderer caches about the guest-memory write");
     }
 
+    // #1742: a DMA_DATA whose destination selector is GDS names an OFFSET into the 64 KiB Global
+    // Data Share, not a guest address. Such a destination is legitimately below the 0x10000 floor
+    // that rejects malformed guest pointers, so every one of these writes used to be discarded as
+    // "invalid/unmapped form" — silently, since the report is capped at 24 lines per run. Astro Bot
+    // resets its GDS append counters this way, and the drop is a real loss of guest state.
+    {
+        uint8_t* gds = compute_gds_backing();
+        const uint32_t offset = 0xc68;   // an offset this title actually uses
+        memset(gds + offset, 0xAB, 8);
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = offset; dma[2] = 0;     // destination is a GDS offset, well below 0x10000
+        dma[3] = 0;      dma[4] = 0;     // 32-bit immediate source: zero the counter
+        dma[5] = 4;
+        dma[6] = 1;                      // dst_sel (low byte) == 1 == GDS
+        GpuState st; run_cb(dma, 7, st);
+        uint32_t written = 0xFFFFFFFFu;
+        memcpy(&written, gds + offset, sizeof written);
+        CHECK(written == 0, "DMA_DATA with a GDS destination selector zeroes the GDS counter");
+        CHECK(gds[offset + 4] == 0xAB, "GDS fill wrote exactly the requested byte span");
+    }
+
+    // ...and the guard that made it fail-closed still rejects a genuinely malformed guest pointer:
+    // a sub-0x10000 destination WITHOUT the GDS selector must remain unwritten, or the fix above
+    // would have turned every malformed packet into a wild write at a low address.
+    {
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = 0xc68; dma[2] = 0;
+        dma[3] = 0;     dma[4] = 0;
+        dma[5] = 4;
+        dma[6] = 3;                      // dst_sel == 3 == memory: 0xc68 is not a valid address
+        GpuState st; run_cb(dma, 7, st);
+        CHECK(true, "a low destination without the GDS selector is still rejected (no crash)");
+    }
+
+    // A GDS offset that would run past the 64 KiB share must be rejected rather than clamped —
+    // an out-of-range offset is a decode error, and writing a truncated span would corrupt state
+    // the shaders read.
+    {
+        uint8_t* gds = compute_gds_backing();
+        const uint32_t offset = (uint32_t)compute_gds_size() - 4;
+        memset(gds + offset, 0x5A, 4);
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = offset; dma[2] = 0;
+        dma[3] = 0;      dma[4] = 0;
+        dma[5] = 16;                     // 16 bytes from 4 bytes before the end: out of range
+        dma[6] = 1;
+        GpuState st; run_cb(dma, 7, st);
+        CHECK(gds[offset] == 0x5A, "an out-of-range GDS span is rejected, not clamped");
+    }
+
     // A queued upload before an address copy is the copy's ordered prefix. The first retained copy
     // must drain it before execution; otherwise a compute-only/non-render submit can copy stale bytes.
     {
