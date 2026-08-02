@@ -114,6 +114,7 @@ void prosper_ampr_advance(uint64_t cb, uint64_t bytes) {
 #include <ctime>
 #include <cstdint>
 #include <cstdio>
+#include <pthread.h>   // #1755: thread-stack bounds for the PROSPER_DMEM_CALLER walk
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
@@ -150,13 +151,69 @@ namespace {
     // and never as proof on its own. Off by default, and rate-limited per distinct call chain so an
     // allocation-heavy boot cannot bury the log in duplicates of one site.
     bool dmem_caller_log() { static int v = getenv("PROSPER_DMEM_CALLER") ? 1 : 0; return v != 0; }
+    // #1755: how many slots above `frame` we may actually read. The walk scans UP the stack, so a
+    // frame sitting near the top of its thread stack runs off the last mapped page and takes a
+    // SIGSEGV — which presents as a guest fault and sends the reader hunting a phantom bug in the
+    // title. Prefer the real thread-stack top. Guest fibers swap stacks (hle_fiber.cpp), so the
+    // frame is NOT always inside the stack the OS reports for this thread; treat "outside the
+    // reported range" as unknown rather than trusting it. The fallback is the end of the page this
+    // frame sits in, which is mapped by construction because we are executing on it.
+    // Cached per thread: on glibc pthread_getattr_np reads /proc/self/maps for the main thread, and
+    // this runs on EVERY direct-memory allocation while the diagnostic is on. An instrument that
+    // perturbs the timing it exists to observe is a worse instrument. A thread's stack does not
+    // move, so one query per thread is enough.
+    struct DmemStackRange { uintptr_t lo = 0, hi = 0; bool queried = false; };
+    thread_local DmemStackRange t_dmem_stack;
+
+    int dmem_caller_scan_slots(const volatile uint64_t* frame, int want) {
+        const uintptr_t base = (uintptr_t)frame;
+        DmemStackRange& sr = t_dmem_stack;
+        if (!sr.queried) {
+            sr.queried = true;
+#if defined(__linux__)
+            pthread_attr_t at;
+            if (pthread_getattr_np(pthread_self(), &at) == 0) {
+                void* lo = nullptr;
+                size_t sz = 0;
+                if (pthread_attr_getstack(&at, &lo, &sz) == 0 && lo && sz) {
+                    sr.lo = (uintptr_t)lo;
+                    sr.hi = sr.lo + sz;
+                }
+                pthread_attr_destroy(&at);
+            }
+#elif defined(__APPLE__)
+            // macOS reports the stack BASE (highest address), not the lowest.
+            const uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+            const size_t sz = pthread_get_stacksize_np(pthread_self());
+            if (top && sz) { sr.hi = top; sr.lo = top - sz; }
+#elif defined(_WIN32)
+            ULONG_PTR wlo = 0, whi = 0;
+            GetCurrentThreadStackLimits(&wlo, &whi);
+            sr.lo = (uintptr_t)wlo;
+            sr.hi = (uintptr_t)whi;
+#endif
+        }
+        // Containment is re-checked per call, NOT cached: a guest fiber swaps stacks, so the same
+        // thread can present frames inside and outside its reported stack at different times.
+        uintptr_t hi = 0;
+        if (sr.hi && base >= sr.lo && base < sr.hi) hi = sr.hi;
+        if (!hi) {
+            constexpr uintptr_t kPage = 4096;
+            hi = (base + kPage) & ~(kPage - 1);
+        }
+        if (hi <= base) return 0;
+        const uintptr_t slots = (hi - base) / sizeof(uint64_t);
+        return slots < (uintptr_t)want ? (int)slots : want;
+    }
     void log_dmem_caller(const char* what, uint64_t len, const volatile uint64_t* frame) {
         if (!dmem_caller_log()) return;
         constexpr int kWant = 6;          // return addresses to report
         constexpr int kScan = 160;        // stack slots to walk
+        // Never read past the mapped end of this stack (#1755).
+        const int scan = dmem_caller_scan_slots(frame, kScan);
         uint64_t ra[kWant] = {};
         int n = 0;
-        for (int i = 1; i < kScan && n < kWant; i++) {
+        for (int i = 1; i < scan && n < kWant; i++) {
             const uint64_t v = frame[i];
             if (!guest_va_in_module(v)) continue;
             if (n && ra[n - 1] == v) continue;      // collapse an adjacent duplicate spill
@@ -165,17 +222,31 @@ namespace {
         // Rate-limit on the chain itself: one line per distinct (first two frames) pair.
         static std::mutex mx;
         static std::vector<std::pair<uint64_t, uint64_t>> seen;
+        static bool announced_cap = false;
         const std::pair<uint64_t, uint64_t> key{ n > 0 ? ra[0] : 0, n > 1 ? ra[1] : 0 };
         {
             std::lock_guard<std::mutex> lk(mx);
             for (const auto& s : seen) if (s == key) return;
-            if (seen.size() >= 64) return;          // bounded: 64 distinct chains is plenty
+            if (seen.size() >= 64) {
+                // #1755: announce the ceiling once. A silent cap makes the log read as "64 distinct
+                // call sites exist" when it means "we stopped counting" — a limit reported as a
+                // census (instrument-trap 49).
+                if (!announced_cap) {
+                    announced_cap = true;
+                    fprintf(stderr, "[dmem-caller] chain limit 64 reached;"
+                                    " further distinct call chains are NOT shown\n");
+                }
+                return;
+            }
             seen.push_back(key);
         }
         fprintf(stderr, "[dmem-caller] %s len=0x%llx from", what, (unsigned long long)len);
         for (int i = 0; i < n; i++)
             fprintf(stderr, " %s+0x%llx", guest_module_name(ra[i]),
                     (unsigned long long)guest_module_offset(ra[i]));
+        // A clamped scan reports a SHORTER chain, not a shallower one — say which it was (#1755).
+        if (scan < kScan)
+            fprintf(stderr, " [scan clamped to %d/%d slots by stack top]", scan, kScan);
         fprintf(stderr, "\n");
     }
 
@@ -2101,6 +2172,12 @@ void register_kernel_mem_hle() {
     Hle::register_fn("j0+3uJMxYJY", (HleFn)k_ampr_write_address, "sceAmprCommandBufferWriteAddress?");
 }
 
+// #1755 test hook: exposes the internal scan clamp so a unit test can prove the walk stays inside
+// mapped memory. The emulator itself never calls this.
+int dmem_caller_scan_slots_for_test(const volatile uint64_t* frame, int want) {
+    return dmem_caller_scan_slots(frame, want);
+}
+
 } // namespace prosper
 
 #else
@@ -2173,13 +2250,69 @@ namespace {
     // and never as proof on its own. Off by default, and rate-limited per distinct call chain so an
     // allocation-heavy boot cannot bury the log in duplicates of one site.
     bool dmem_caller_log() { static int v = getenv("PROSPER_DMEM_CALLER") ? 1 : 0; return v != 0; }
+    // #1755: how many slots above `frame` we may actually read. The walk scans UP the stack, so a
+    // frame sitting near the top of its thread stack runs off the last mapped page and takes a
+    // SIGSEGV — which presents as a guest fault and sends the reader hunting a phantom bug in the
+    // title. Prefer the real thread-stack top. Guest fibers swap stacks (hle_fiber.cpp), so the
+    // frame is NOT always inside the stack the OS reports for this thread; treat "outside the
+    // reported range" as unknown rather than trusting it. The fallback is the end of the page this
+    // frame sits in, which is mapped by construction because we are executing on it.
+    // Cached per thread: on glibc pthread_getattr_np reads /proc/self/maps for the main thread, and
+    // this runs on EVERY direct-memory allocation while the diagnostic is on. An instrument that
+    // perturbs the timing it exists to observe is a worse instrument. A thread's stack does not
+    // move, so one query per thread is enough.
+    struct DmemStackRange { uintptr_t lo = 0, hi = 0; bool queried = false; };
+    thread_local DmemStackRange t_dmem_stack;
+
+    int dmem_caller_scan_slots(const volatile uint64_t* frame, int want) {
+        const uintptr_t base = (uintptr_t)frame;
+        DmemStackRange& sr = t_dmem_stack;
+        if (!sr.queried) {
+            sr.queried = true;
+#if defined(__linux__)
+            pthread_attr_t at;
+            if (pthread_getattr_np(pthread_self(), &at) == 0) {
+                void* lo = nullptr;
+                size_t sz = 0;
+                if (pthread_attr_getstack(&at, &lo, &sz) == 0 && lo && sz) {
+                    sr.lo = (uintptr_t)lo;
+                    sr.hi = sr.lo + sz;
+                }
+                pthread_attr_destroy(&at);
+            }
+#elif defined(__APPLE__)
+            // macOS reports the stack BASE (highest address), not the lowest.
+            const uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+            const size_t sz = pthread_get_stacksize_np(pthread_self());
+            if (top && sz) { sr.hi = top; sr.lo = top - sz; }
+#elif defined(_WIN32)
+            ULONG_PTR wlo = 0, whi = 0;
+            GetCurrentThreadStackLimits(&wlo, &whi);
+            sr.lo = (uintptr_t)wlo;
+            sr.hi = (uintptr_t)whi;
+#endif
+        }
+        // Containment is re-checked per call, NOT cached: a guest fiber swaps stacks, so the same
+        // thread can present frames inside and outside its reported stack at different times.
+        uintptr_t hi = 0;
+        if (sr.hi && base >= sr.lo && base < sr.hi) hi = sr.hi;
+        if (!hi) {
+            constexpr uintptr_t kPage = 4096;
+            hi = (base + kPage) & ~(kPage - 1);
+        }
+        if (hi <= base) return 0;
+        const uintptr_t slots = (hi - base) / sizeof(uint64_t);
+        return slots < (uintptr_t)want ? (int)slots : want;
+    }
     void log_dmem_caller(const char* what, uint64_t len, const volatile uint64_t* frame) {
         if (!dmem_caller_log()) return;
         constexpr int kWant = 6;          // return addresses to report
         constexpr int kScan = 160;        // stack slots to walk
+        // Never read past the mapped end of this stack (#1755).
+        const int scan = dmem_caller_scan_slots(frame, kScan);
         uint64_t ra[kWant] = {};
         int n = 0;
-        for (int i = 1; i < kScan && n < kWant; i++) {
+        for (int i = 1; i < scan && n < kWant; i++) {
             const uint64_t v = frame[i];
             if (!guest_va_in_module(v)) continue;
             if (n && ra[n - 1] == v) continue;      // collapse an adjacent duplicate spill
@@ -2188,17 +2321,31 @@ namespace {
         // Rate-limit on the chain itself: one line per distinct (first two frames) pair.
         static std::mutex mx;
         static std::vector<std::pair<uint64_t, uint64_t>> seen;
+        static bool announced_cap = false;
         const std::pair<uint64_t, uint64_t> key{ n > 0 ? ra[0] : 0, n > 1 ? ra[1] : 0 };
         {
             std::lock_guard<std::mutex> lk(mx);
             for (const auto& s : seen) if (s == key) return;
-            if (seen.size() >= 64) return;          // bounded: 64 distinct chains is plenty
+            if (seen.size() >= 64) {
+                // #1755: announce the ceiling once. A silent cap makes the log read as "64 distinct
+                // call sites exist" when it means "we stopped counting" — a limit reported as a
+                // census (instrument-trap 49).
+                if (!announced_cap) {
+                    announced_cap = true;
+                    fprintf(stderr, "[dmem-caller] chain limit 64 reached;"
+                                    " further distinct call chains are NOT shown\n");
+                }
+                return;
+            }
             seen.push_back(key);
         }
         fprintf(stderr, "[dmem-caller] %s len=0x%llx from", what, (unsigned long long)len);
         for (int i = 0; i < n; i++)
             fprintf(stderr, " %s+0x%llx", guest_module_name(ra[i]),
                     (unsigned long long)guest_module_offset(ra[i]));
+        // A clamped scan reports a SHORTER chain, not a shallower one — say which it was (#1755).
+        if (scan < kScan)
+            fprintf(stderr, " [scan clamped to %d/%d slots by stack top]", scan, kScan);
         fprintf(stderr, "\n");
     }
 
@@ -4878,6 +5025,12 @@ void register_kernel_mem_hle() {
                      "sceAmprMeasureCommandSizeWriteAddress_04_00");
     // APR completion-notification write (#1149) — real behavior on Windows too (see handler above).
     Hle::register_fn("j0+3uJMxYJY", (HleFn)k_ampr_write_address, "sceAmprCommandBufferWriteAddress?");
+}
+
+// #1755 test hook: exposes the internal scan clamp so a unit test can prove the walk stays inside
+// mapped memory. The emulator itself never calls this.
+int dmem_caller_scan_slots_for_test(const volatile uint64_t* frame, int want) {
+    return dmem_caller_scan_slots(frame, want);
 }
 
 } // namespace prosper
