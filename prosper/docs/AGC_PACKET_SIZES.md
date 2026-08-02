@@ -43,15 +43,27 @@ PROSPER_DCBFULL=1   # every Dcb "buffer full" callback: sub-op, dwords needed, d
 PROSPER_DCBWIN=N    # every packet appended into a window of <= N dwords (N=1 selects the default 64)
 ```
 
-**Read `avail`, not the window size.** For a segmented Dcb, `cursor_down - bottom` is the current
-segment, not a reservation, and reading it as one produces false positives:
+**Reading it correctly took two corrections, both forced by the corpus.** Get these wrong and the
+probe manufactures defects:
+
+1. **Read `avail`, not the window size.** For a segmented Dcb, `cursor_down - bottom` is the current
+   segment, not a reservation. The Pathless produces 58 buffer-full events on windows of 1-7 dwords
+   — every one with `avail=0` and the cursor exactly at the limit, i.e. an exhausted segment.
+2. **`avail>0` is only meaningful when `reserved=0`.** `available_dw()` subtracts the guest's own
+   `reserved_dw`, so a title holding a reserve back reaches `avail>0, need>avail` at the end of
+   *every* buffer, for whatever packet arrives next. Corpus-wide, **every** repeated `avail>0` triple
+   carries `reserved=18`, and the `avail` value tracks the packet's own size rather than any
+   per-packet budget — `SetIndexBuffer need=3 avail=2`, `EventWrite need=4 avail=2`,
+   `WaitRegMem need=9 avail=7`, `WriteData need=69 avail=25`. prosper is not over on every builder by
+   a different amount; the buffer is simply ending.
 
 | `[dcbfull]` shape | meaning |
 | --- | --- |
-| `avail=0` | the buffer is genuinely exhausted — ordinary growth or a segment refill. Not a defect. |
-| `avail>0` | space was deliberately left and prosper asked for **more than fits**. `need - avail` is the overrun, in dwords. |
+| `avail=0` | buffer exhausted — ordinary growth or a segment refill. Not a defect. |
+| `avail>0`, `reserved>0` | the unreserved remainder ran out. Ordinary. Not a defect. |
+| `avail>0`, `reserved=0`, **same triple repeating** | space was deliberately left and prosper asked for **more than fits**. `need - avail` is the overrun. **This is the signature.** |
 
-#1748's signature was `need=9 avail=8` — overrun of exactly 1 — repeated once per submit.
+#1748's signature was `need=9 avail=8 reserved=0` — overrun of exactly 1 — once per submit.
 `PROSPER_DCBWIN` then names the packets sharing that window, and a tightly sized window *is* the
 guest's own size table for the packets in it: Babylon's 16-dword epilogue holding `AcquireMem` +
 `EopAction` is what proved `RELEASE_MEM` must be 8 and not 9.
@@ -143,12 +155,68 @@ static link looks like. **Do not read an import as a call.** The one asymmetry t
 including the Unity titles that import only a handful of AGC NIDs — a selective import. Call counts,
 not imports, are what `PROSPER_PROGRESS=N PROSPER_PROGRESS_UNIMPL=1` measures.
 
+## Corpus census (30 titles, 45 s headless boot each)
+
+Run with the shipping build and the corrected signature above.
+
+**No title in the corpus has a reservation overrun.** Zero events with `avail>0, reserved=0`, in any
+of the 30 dumps.
+
+That silence is only worth something because the rule was shown to speak: reintroducing the #1748
+defect (`RELEASE_MEM` back to 9 dwords) and re-running Asterix & Obelix - Babylon Mission produces
+**256** events (the report's own cap) on one triple — `ReleaseMem/EopAction need=9 avail=8
+reserved=0`. The rule fires on the known defect and is silent everywhere else.
+
+**Command-buffer churn** — the quiet cost, measured as buffer-full callbacks per second. Babylon
+pre-#1748 ran at **~466/s**. The three titles whose frame rate made them suspects are not paying it:
+
+| title | fps | buffer-full /s | `avail>0, reserved=0` |
+| --- | --- | --- | --- |
+| *Syberia: Remastered* `PPSA30140` | ~1.9 | **0.0** | 0 |
+| *Bendy and the Ink Machine* `PPSA27616` | ~8 | 11.4 | 0 |
+| *Dragon Quest VII* `PPSA17942` | ~12 | 2.5 | 0 |
+| *GTA V* `PPSA04263` | — | 11.4 | 0 |
+| *Terminator 2D* `PPSA25872` | — | 11.4 | 0 |
+| every other title | — | 0.0–2.5 | 0 |
+
+Syberia's 1.9 fps is not command-buffer churn — it issues no buffer-full callbacks at all. Bendy's
+and GTA V's ~11/s are ordinary buffer growth (`avail=0` throughout), 40× below the rate that killed
+Babylon. **Nothing here explains a slow title**, and that is a result: the hypothesis is eliminated
+for the current corpus rather than left open.
+
+## Called and unimplemented
+
+Measured with `PROSPER_PROGRESS_UNIMPL` (call counts, not imports) over the same runs — the whole AGC
+surface the corpus actually calls and prosper does not implement:
+
+| NID | function | called by |
+| --- | --- | --- |
+| `MlEw1feXcjg` | `sceAgcQueueEndOfPipeActionPatchData` | `PPSA04263` |
+| `vuSXe69VILM` | `sceAgcDcbGetLodStats` | `PPSA21564` |
+| `Ikfdt-rIqCE` | *(not in the 3.20 export table)* | `PPSA04263` |
+| `F0Y42t-3e18` | `sceAgcDriverInitResourceRegistration` | — |
+| `pWLG7WOpVcw` | `sceAgcDriverUnregisterResource` | — |
+| `F0ZXt5q0ZTA`, `U9ueyEhSkF4` | *(not in the 3.20 export table)* | — |
+
+`sceAgcQueueEndOfPipeActionPatchData` is the notable one: prosper implements its sibling
+`…PatchAddress` (`0fWWK5uG9rQ`) and not this, so GTA V builds an end-of-pipe action, patches its
+address, and has its **value** patch silently dropped.
+
+**None of the 26 `GetSize` functions this change implements is called by any title in the corpus.**
+That fix is therefore *preventive*, not the repair of an observed failure — stated plainly because
+the distinction matters. Its justification is that the same zero-answer has already been fatal twice
+(#1137's RAGE buffer overflow, #1748's leak), each time found by a crash in the one title that
+happened to ask, and each time fixed for that title's NIDs alone.
+
 ## Ruled out
 
 | Hypothesis | Evidence that killed it | Where |
 | --- | --- | --- |
-| A small `cursor_down - bottom` window at a buffer-full event means prosper overran a reservation | False positive on segmented Dcbs: The Pathless shows 58 such events, all with `avail=0` and `cursor_up == cursor_down` — the segment was simply exhausted. `avail > 0` is the real discriminator | #1756 |
-| The 59 unimplemented `GetSize` NIDs are all live defects because 11 titles import them | Import is not call; those 11 titles import the whole stub table | #1756 |
+| A small `cursor_down - bottom` window at a buffer-full event means prosper overran a reservation | False positive on segmented Dcbs: The Pathless shows 58 such events, all with `avail=0` and `cursor_up == cursor_down` — the segment was simply exhausted | #1756 |
+| `avail>0` at a buffer-full event means prosper overran a reservation | False positive whenever the guest holds a reserve: every repeated `avail>0` triple in the corpus carries `reserved=18`, across sub-ops whose `avail` tracks their own size (`need=3 avail=2` … `need=69 avail=25`). `reserved=0` is required | #1756 |
+| `SetShRegsIndirect` / `SetCxRegsIndirect` are one dword too large — three titles reach `need=4 avail=3` | Same artefact: all three carry `reserved=18`, and prosper's 4-dword encoding (count + 64-bit pointer) cannot fit in 3 anyway, so a shrink would need a different encoding and its own evidence | #1756 |
+| Syberia / Bendy / Dragon Quest VII are slow because of #1748-style command-buffer churn | 0.0 / 11.4 / 2.5 buffer-full callbacks per second and zero overruns, against Babylon's ~466/s | #1756 |
+| The 59 unimplemented `GetSize` NIDs are all live defects because 11 titles import them | Import is not call; those 11 titles import the whole libSceAgc stub table, and no corpus title calls any of them | #1756 |
 
 ## Open
 
@@ -156,6 +224,8 @@ not imports, are what `PROSPER_PROGRESS=N PROSPER_PROGRESS_UNIMPL=1` measures.
   7), `WaitRegMem` (9 vs 7), `Jump` (5 vs 4), `WriteData` (5+n vs 4+n), `SetPredication` (4 vs 3),
   `CbDispatch` (6 vs 5), `DrawIndex`/`DrawIndexAuto`. Each needs a title that reserves tightly around
   it before it can be changed. `PROSPER_DCBWIN` over a new title is the cheapest way to get that.
+* `sceAgcQueueEndOfPipeActionPatchData` and `sceAgcDcbGetLodStats` are called and unimplemented
+  (see the table above).
 * `w1KFAHVqpaU` is `sceAgcCbBranch` in the 3.20 export table, but prosper registers it as the DOLL
   "final buffer" submit variant (#232), derived from live disassembly and load-bearing. `CbBranch`
   also has a `GetSize`, which implies it is a *builder*. Recorded, not changed — a title calling it
