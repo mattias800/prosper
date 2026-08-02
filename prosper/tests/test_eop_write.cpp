@@ -693,52 +693,85 @@ int main() {
     // outstanding the fence MUST land, and with no init outstanding the same packet MUST be
     // suppressed. Both arms are asserted here so that widening any guard to make the ArcRunner
     // FORGE-STOMP tripwire fall silent breaks this test rather than the title.
-    for (int live : {1, 0}) {
+    // The two packets run as SEPARATE folds with an assertion in between. Submitting them together
+    // and checking only the end state would accept the wrong path: 0x2020f3d5a0 with its low dword
+    // replaced by 1 is ALSO 0x2000000001, so "the init never ran and the fence landed anyway"
+    // produces the same final value. Asserting the intermediate 0x2000000000 pins the composition.
+    {
         struct alignas(0x20) PoolLabel { uint64_t link; uint64_t pad[3]; } label{};
         const uint64_t addr = (uint64_t)(uintptr_t)&label;
+        label.link = 0x2020f3d5a0ull;   // a pool link to a neighbouring label, as the rings record it
+        prosper_label_hist_dma_built(addr, 0x7000, 0, 1);
         GpuState st;
-        // A pool link to a neighbouring label, exactly as ArcRunner's rings record it.
-        label.link = 0x2020f3d5a0ull;
-        prosper_label_hist_dma_built(addr, 0x7000 + (uint64_t)live, 0, 1);
-        std::vector<uint32_t> stream;
-        if (live) {   // the guest's paired DmaData(label := 0), 4 bytes -> {stale_high, low = 0}
-            stream = {PM4(7, IT_NOP, R_DMA_DATA), (uint32_t)addr, (uint32_t)(addr >> 32),
-                      0, 0, 4, 0x303};
-        } else {      // no executed init outstanding: emulate the post-init state without one
-            label.link = 0x2000000000ull;
-        }
-        const size_t rel_at = stream.size();
-        stream.insert(stream.end(), {PM4(7, IT_NOP, R_RELEASE_MEM), (uint32_t)addr,
-                                     (uint32_t)(addr >> 32), 1, 1, 0, 4});
-        (void)rel_at;
-        run_cb(stream.data(), stream.size(), st);
-        if (live)
-            CHECK(label.link == 0x2000000001ull,
-                  "ArcRunner shape: a live paired fence still writes over a pool-link residue");
-        else
-            CHECK(label.link == 0x2000000000ull,
-                  "ArcRunner shape: the same fence with no outstanding init is suppressed");
+        uint32_t init[7] = {PM4(7, IT_NOP, R_DMA_DATA), (uint32_t)addr, (uint32_t)(addr >> 32),
+                            0, 0, 4, 0x303};
+        run_cb(init, 7, st);
+        CHECK(label.link == 0x2000000000ull,
+              "ArcRunner shape: the 4-byte init zeroes only the low dword of the pool link");
+        uint32_t rel[7] = {PM4(7, IT_NOP, R_RELEASE_MEM), (uint32_t)addr, (uint32_t)(addr >> 32),
+                           1, 1, 0, 4};
+        run_cb(rel, 7, st);
+        CHECK(label.link == 0x2000000001ull,
+              "ArcRunner shape: a live paired fence still writes over a pool-link residue");
+    }
+    {
+        // The counter arm. A fresh label reaches the same post-init CONTENT with no executed init
+        // behind it, so dma_exec_n == rel_exec_n == 0 and `live_pair` is false. (The built-but-never-
+        // executed init is one of the two shapes that gives !live_pair; the other is "the previous
+        // generation completed". Both must suppress, and the assertion holds for either.)
+        struct alignas(0x20) PoolLabel { uint64_t link; uint64_t pad[3]; } label{};
+        const uint64_t addr = (uint64_t)(uintptr_t)&label;
+        label.link = 0x2000000000ull;
+        prosper_label_hist_dma_built(addr, 0x7008, 0, 1);
+        GpuState st;
+        uint32_t rel[7] = {PM4(7, IT_NOP, R_RELEASE_MEM), (uint32_t)addr, (uint32_t)(addr >> 32),
+                           1, 1, 0, 4};
+        run_cb(rel, 7, st);
+        CHECK(label.link == 0x2000000000ull,
+              "ArcRunner shape: the same fence with no outstanding init is suppressed");
     }
 
-    // #1226 PROSPER_WRITE_TRAP, both arms. The trap answers "does prosper itself ever store this
-    // dword into guest memory" — a hard negative is only meaningful if a match would have counted,
-    // so assert that the armed value counts and an adjacent value does not.
+    // #1226 PROSPER_WRITE_TRAP, both arms and every scanned packet kind. A hard negative from this
+    // instrument is only meaningful if a match would have counted, so assert that the armed value
+    // counts on each path and that an adjacent value does not — a refactor that drops one call site
+    // otherwise leaves the documented coverage silently false.
     {
         struct alignas(0x20) TrapLabel { uint64_t value; uint64_t pad[3]; } label{};
         const uint64_t addr = (uint64_t)(uintptr_t)&label;
-        auto fence = [&](uint32_t value) {
+        // The scanned payload is the same 4 bytes each path stores, so a hit also pins the store.
+        auto rel1 = [&](uint32_t v) {
             GpuState st;
-            uint32_t rel[7] = {PM4(7, IT_NOP, R_RELEASE_MEM), (uint32_t)addr,
-                               (uint32_t)(addr >> 32), 1, value, 0, 4};
-            run_cb(rel, 7, st);
+            uint32_t p[7] = {PM4(7, IT_NOP, R_RELEASE_MEM), (uint32_t)addr, (uint32_t)(addr >> 32),
+                             1, v, 0, 4};
+            run_cb(p, 7, st);
         };
-        const uint64_t before = prosper_gpu_write_trap_matches();
-        fence(0x5a5a0000u);
-        CHECK(prosper_gpu_write_trap_matches() == before,
-              "PROSPER_WRITE_TRAP ignores a value adjacent to the armed one");
-        fence(0x5a5a0001u);
-        CHECK(prosper_gpu_write_trap_matches() == before + 1,
-              "PROSPER_WRITE_TRAP counts the armed value written by a RELEASE_MEM");
+        auto dma_imm = [&](uint32_t v) {
+            GpuState st;
+            uint32_t p[7] = {PM4(7, IT_NOP, R_DMA_DATA), (uint32_t)addr, (uint32_t)(addr >> 32),
+                             v, 0, 4, 0x303};
+            run_cb(p, 7, st);
+        };
+        auto wdata = [&](uint32_t v) {
+            GpuState st;
+            uint32_t p[6] = {PM4(6, IT_NOP, R_WRITE_DATA), 0, (uint32_t)addr,
+                             (uint32_t)(addr >> 32), 1, v};
+            run_cb(p, 6, st);
+        };
+        auto both_arms = [&](const char* ignores, const char* counts, auto&& emit) {
+            label.value = 0;
+            const uint64_t before = prosper_gpu_write_trap_matches();
+            emit(0x5a5a0000u);                                     // adjacent value: must not match
+            CHECK(prosper_gpu_write_trap_matches() == before, ignores);
+            emit(0x5a5a0001u);                                     // armed value: must match once
+            CHECK(prosper_gpu_write_trap_matches() == before + 1 &&
+                  (uint32_t)label.value == 0x5a5a0001u, counts);
+        };
+        both_arms("PROSPER_WRITE_TRAP/RELEASE_MEM ignores a value adjacent to the armed one",
+                  "PROSPER_WRITE_TRAP/RELEASE_MEM counts the armed value, and the store lands", rel1);
+        both_arms("PROSPER_WRITE_TRAP/DMA_DATA ignores a value adjacent to the armed one",
+                  "PROSPER_WRITE_TRAP/DMA_DATA counts the armed value, and the store lands", dma_imm);
+        both_arms("PROSPER_WRITE_TRAP/WRITE_DATA ignores a value adjacent to the armed one",
+                  "PROSPER_WRITE_TRAP/WRITE_DATA counts the armed value, and the store lands", wdata);
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
