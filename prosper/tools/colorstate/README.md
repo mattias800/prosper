@@ -4,8 +4,8 @@ When a title presents black, four explanations compete:
 
 1. **No graphics draws at all** — the render path never submits.
 2. **Draws exist but only target offscreen surfaces**, never composited to scanout.
-3. **Draws write scanout with colour suppressed** — `CB_COLOR_CONTROL.MODE=DISABLE`,
-   or a zero `CB_TARGET_MASK` / `CB_SHADER_MASK`.
+3. **Draws write scanout with colour suppressed** — a zero `CB_TARGET_MASK` /
+   `CB_SHADER_MASK`. (`CB_COLOR_CONTROL.MODE` does **not** suppress; see #1724.)
 4. **Content is produced and the present path drops it.**
 
 `PROSPER_COLORSTATETRACE` emits the raw register evidence that separates 1–3, but on a
@@ -50,10 +50,13 @@ cause. While the world is *visibly rendering*, the `mode=0` fraction is **higher
 geometry. Reading only the black phase would have produced a confident wrong answer.
 
 **Since #1724, `mode` alone is not a suppression signal at all** — the renderer derives the
-colour write mask from `CB_TARGET_MASK & CB_SHADER_MASK` and ignores `MODE`. Read the
-`effective` column, not `mode`. The two genuinely disagree in the field: of 268,899 traced
-Plucky Squire draws, 36,613 are `mode=0`, and **8,326 of those carry a non-zero mask** —
-so a `mode`-keyed count would have called 8,326 writing draws suppressed.
+colour write mask from `CB_TARGET_MASK & CB_SHADER_MASK` and ignores `MODE`. The two
+genuinely disagree in the field: of 268,899 traced Plucky Squire draws, 36,613 are `mode=0`,
+and **8,326 of those carry a non-zero mask**.
+
+The `suppressed=` column above is therefore mask-derived, not `mode`-derived; the `modeN=`
+breakdown beside it is the raw mode census and is no longer a suppression count. The table
+above predates that change, so its percentages are `mode=0` fractions — read them as such.
 
 ## Caveats
 

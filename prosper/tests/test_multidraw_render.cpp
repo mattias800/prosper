@@ -153,7 +153,7 @@ int main() {
         const uint8_t* mc = center(rendered);
         CHECK(mc && mc[0] > 0xC0 && mc[1] < 0x40 && mc[2] < 0x40,
               "MODE=DISABLE draw with an explicit mask reaches the colour attachment");
-}
+    }
 
     // Hardware instance count reaches both Vulkan submission paths. Additive quarter-red makes the
     // number of identical instances directly observable: one instance contributes ~64 red, while

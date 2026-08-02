@@ -91,6 +91,7 @@ def report(records, scanout_prefix, top, out=sys.stdout):
     total = scan = 0
     combos = Counter()
     per_minute = defaultdict(Counter)
+    per_minute_suppressed = Counter()
     addrs = Counter()
 
     for rec in records:
@@ -107,6 +108,8 @@ def report(records, scanout_prefix, top, out=sys.stdout):
         writes_colour = eff != 0 and any(cwms)
         combos[(rec["mode"], eff, tuple(sorted(cwms)))] += 1
         per_minute[rec["ts"] or "??:??"][rec["mode"]] += 1
+        if not writes_colour:
+            per_minute_suppressed[rec["ts"] or "??:??"] += 1
         for t in rec["targets"]:
             if t["addr"].startswith(scanout_prefix):
                 addrs[(t["addr"], t["w"], t["h"], writes_colour)] += 1
@@ -137,7 +140,10 @@ def report(records, scanout_prefix, top, out=sys.stdout):
     for minute in sorted(per_minute):
         c = per_minute[minute]
         tot = sum(c.values())
-        supp = c.get(0, 0)
+        # #1724: suppression is the guest's mask, NOT mode. Keying this on mode over-reported by
+        # 8,326 draws on one measured Plucky Squire run. `mode0=` stays in the breakdown because
+        # it is still worth seeing, but it is no longer labelled as suppression.
+        supp = per_minute_suppressed.get(minute, 0)
         modes = " ".join(f"mode{m}={n}" for m, n in sorted(c.items()))
         print(f"  {minute}  total={tot:7d}  suppressed={100.0 * supp / tot:5.1f}%  "
               f"{modes}", file=out)

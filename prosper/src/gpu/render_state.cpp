@@ -87,8 +87,8 @@ void report_unmodeled_cb_color_mode(uint32_t mode) {
     // power-of-two line is duplicated or lost when threads race here.
     if ((count & (count - 1u)) == 0u)
         fprintf(stderr, "[gpu] resolve_pipeline_state: CB_COLOR_CONTROL.MODE=%u is an unmodeled "
-                        "color-block metadata operation -> still executed as an ordinary color "
-                        "draw (#1588; count=%llu)\n",
+                        "color-block operation -> still executed as an ordinary color "
+                        "draw (count=%llu)\n",
                 mode, static_cast<unsigned long long>(count));
 }
 
@@ -817,38 +817,45 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     out1.alpha_blend_op = ps.alpha_blend_op1;
     out1.write_mask = ps.color1_write_mask; out1.disable_rop3 = rs.disable_rop3_1;
 
-    // #1724: the color write mask comes from CB_TARGET_MASK & CB_SHADER_MASK ABOVE, and nothing
-    // here may override it. CB_COLOR_CONTROL.MODE selects a color-block OPERATION; it is not a
-    // second write-mask gate, and letting it veto an explicit guest mask is measurably destructive.
+    // #1724: the color write mask comes from CB_TARGET_MASK & CB_SHADER_MASK above.
+    // CB_COLOR_CONTROL.MODE selects a color-block OPERATION and is not consulted for the mask.
+    // (RESOLVE below is a separate matter: it replaces the draw outright, which is a stronger
+    // MODE-keyed decision than the one removed here. It is left exactly as it was.)
     //
     // #919 added a `MODE == DISABLE -> zero every mask` override. That issue says in its own text
     // that neither of its two items was "exercised by the currently-booting titles", calling them
-    // "latent incompleteness, not active bugs" — so the override was written from the AMD enum NAME,
-    // never from observed title behavior, and it has never had a case that required it.
+    // "latent incompleteness, not active bugs" — so the override was written from the AMD enum NAME
+    // rather than from observed title behavior.
     //
-    // Measured against it, per draw, from prosper's own capsules:
+    // Measured per draw, joining mode against the guest's own effective mask:
     //
-    //   Astro Bot submit 6179   mode=0  30 draws, ALL with a non-zero guest mask
-    //   Dragon Quest VII        mode=0   7 draws, ALL with a zero guest mask
+    //   Dragon Quest VII         mode=0      7 draws, ALL effective == 0
+    //   Astro Bot submit 6179    mode=0     30 draws, ALL effective != 0
+    //   The Plucky Squire        mode=0 36,613 draws, 28,287 == 0 and 8,326 != 0
     //
     // DQ7 programs both signals consistently, so the override is redundant there and the defect is
-    // invisible — which is why this survived. Astro contradicts it on every one, including
+    // invisible — which is why it survived. Astro contradicts it on every one, including
     // draw[70]/[71]: target-mask=0x737 (three MRTs), shader-mask=0xff, and a 140,825-dword fragment
-    // shader at 3840x2160 — the title's main world/lighting shader, which is not a depth prepass by
-    // any reading. The override resolved those to cwm=0, and the executor's no-effect path then
-    // dropped 30 of that submit's 36 draws.
+    // shader at 3840x2160 — the title's main world/lighting shader, not a depth prepass by any
+    // reading. Those resolved to cwm=0 and the executor's existing no-effect path then dropped 30 of
+    // that submit's 36 draws.
     //
-    // Note what this deliberately does NOT claim: that hardware's CB_DISABLE writes color. prosper
-    // cannot presently make a claim about this field at all — the offsets and field shifts in
-    // pm4_registers.hpp are vendored verbatim from one secondary implementation, which CLAUDE.md's
-    // evidence hierarchy rates tier 4 (hypothesis only), and whether MODE is even at [6:4] on Gen5
-    // is open (#1706). The argument here is narrower and survives either answer: CB_TARGET_MASK and
-    // CB_SHADER_MASK are unambiguous, already correctly modeled, and explicitly programmed per draw,
-    // so a field prosper cannot yet decode with confidence must not be allowed to veto them.
+    // What this does NOT claim, and an earlier revision of this comment wrongly did: that prosper's
+    // MODE decode is untrustworthy. It is not. OREGON_TRAIL_STATUS.md records 12,390 CB_COLOR_CONTROL
+    // writes with MODE=1 dominant 7:1 and all 1,050 of 1,050 suppressed draws joining exactly to a
+    // CB_DISABLE the guest wrote immediately before them. The decode is exact, and that title's guest
+    // programs CB_DISABLE deliberately. The narrower and correct statement is that a settled DECODE
+    // was never evidence of a settled RESPONSE to the decoded value.
     //
-    // A genuine color-disabled pass is unaffected: it programs CB_TARGET_MASK=0, which the
-    // derivation above already honors without consulting MODE at all. That is #919's real contract
-    // (a depth/stencil-only draw still executes for its DS side effect) and it is preserved.
+    // Nor is this cost-free. Plucky's 8,326 mode=0 draws that DO carry a mask now write where they
+    // previously did not; its reachable phases A/B at 0.08-0.24% differing pixels with no visible
+    // corruption, but its 87.6-95.3% mode=0 world phase is not covered by that measurement. If a
+    // title is ever shown to depend on MODE=DISABLE suppressing an explicitly programmed mask, this
+    // is the code that must become per-draw attribution (#1706) rather than an unconditional read.
+    //
+    // #919's real contract is preserved: a colour-disabled pass that programs CB_TARGET_MASK=0 still
+    // resolves to no colour write, via the derivation above, and still executes for its DS side
+    // effect. That is the idiom the tests cover; it is not the only idiom hardware allows.
     const uint32_t cb_mode = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE);
     if (rs.has_cb_color_control) {
         if (cb_mode == P::CB_COLOR_CONTROL_MODE_RESOLVE) {

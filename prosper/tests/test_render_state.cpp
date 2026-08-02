@@ -771,9 +771,10 @@ int main() {
                   disabled_ps.color_targets[1].write_mask == 0xFu,
               "CB MODE=DISABLE does not override an explicitly programmed write-all mask");
         // (No DS assertion here: depth_write_enable is set directly on this state and nothing in
-        // the MODE path could clear it, so it would pass in both arms. The load-bearing DS contract
-        // is the zero-target-mask prepass above, which is the state a real colour-disabled pass
-        // programs.)
+        // the MODE path could clear it, so it would pass in both arms. The prepass DS check above
+        // is a general invariant guard and passes in both arms too — neither is load-bearing for
+        // #1724. What discriminates this fix is the write-mask CHECK immediately above and the
+        // pixel-level pair in test_multidraw_render.cpp.)
 
         RenderState normal = absent;
         normal.has_cb_color_control = true;
