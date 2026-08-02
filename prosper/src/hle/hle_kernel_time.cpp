@@ -4,6 +4,9 @@
 #include "nid.hpp"
 #include "hle_kernel_time.hpp"
 #include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
+#include "../host/posix_shim.hpp"     // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
+#include "../host/runtime_module_load.hpp"   // #639: real runtime PRX loading
+#include "callback_fs.hpp"            // recover the caller's guest %fs from the import-stub frame
 #include "sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "heap_mutex.hpp"   // #707: keep hot equeue/APR mutexes off macOS __DATA
 #include "sync_futex.hpp"
@@ -509,20 +512,56 @@ HLE(k_clock_getres) { if (a1) { int64_t* r = (int64_t*)P(a1); r[0] = 0; r[1] = 1
 
 // --- assorted libkernel stubs ---
 HLE(k_ok)              { return 0; }                       // generic success no-op
-// sceKernelLoadStartModule(path, ...): the PRX are pre-linked into our address space, so "loading"
-// resolves the path to its linked module and returns a REAL handle — dlsym then consults that
-// module's own exports first (#147). A path NOT in the linked set previously got a fake
-// monotonically-increasing success handle while loading nothing (#146): the guest then believed the
-// load succeeded and called exports that resolved to ESRCH fallbacks / the wrong module instead of
-// getting the honest ENOENT. Return SCE_KERNEL_ERROR_ENOENT for a miss so the guest takes its
-// module-not-found path. Both current titles preload every PRX they use, so no real load misses.
-HLE(k_load_start_mod)  {
-    if (uint64_t h = module_handle_for_path(a0 ? (const char*)P(a0) : nullptr)) return h;
+// sceKernelLoadStartModule: a PRX already in the linked set resolves to its REAL handle, and dlsym
+// then consults that module's own exports first (#147). A path NOT in the linked set used to get a
+// fake monotonically-increasing success handle while loading nothing (#146) — the guest believed
+// the load succeeded and called exports that resolved to ESRCH fallbacks — and then, once that was
+// removed, an honest ENOENT for a capability prosper did not have. Since #639 it is a real load:
+// only a genuinely absent or unloadable file is an error. See host/runtime_module_load.hpp.
+// sceKernelLoadStartModule(const char* name, size_t args, const void* argp, uint32_t flags,
+//                          const SceKernelLoadModuleOpt* opt, int* pRes)
+static uint64_t load_start_mod_run(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a5,
+                                   uint64_t guest_fs) {
+    const char* path = a0 ? (const char*)P(a0) : nullptr;
+    // A pre-linked module (the fixed set plus the Media/Plugins auto-link, #1609) already has a
+    // handle; hand back the same one rather than mapping a second copy. This is also what makes a
+    // repeat load of a runtime-loaded module idempotent — it is registered here too, by basename,
+    // which is the PS5's own module identity.
+    if (uint64_t h = module_handle_for_path(path)) {
+        if (a5) *(int32_t*)P(a5) = 0;
+        return h;
+    }
+    // Not pre-linked: load it for real (#639). Only an absent/unloadable file is an error now.
+    uint64_t handle = 0; int32_t res = 0;
+    const uint64_t rc = runtime_load_start_module(path, a1, a2, guest_fs, &res, &handle);
+    if (rc == 0) {
+        if (a5) *(int32_t*)P(a5) = res;
+        return handle;
+    }
     if (getenv("PROSPER_MODLOG"))
-        fprintf(stderr, "[loadmod] '%s' not in the linked module set -> ENOENT\n",
-                a0 ? (const char*)P(a0) : "(null)");
-    return 0x80020002ull;   // SCE_KERNEL_ERROR_ENOENT (a non-preloaded PRX isn't present)
+        fprintf(stderr, "[loadmod] '%s' could not be loaded -> 0x%llx\n",
+                path ? path : "(null)", (unsigned long long)rc);
+    return rc;
 }
+#ifndef _WIN32
+// The module's own module_start / init_array is GUEST code. Under the guest-%fs gate this handler
+// runs on the host %fs (the import stub swapped), so recover the caller's guest thread pointer from
+// the import-stub frame and start the module on it — the same entry-rsp trampoline the AvPlayer and
+// IME callbacks use (#1286). callback_guest_fs_from_entry_stack returns 0 for a non-guest frame, so
+// a plain tail-jump boot is an unchanged direct call.
+extern "C" uint64_t k_load_start_mod_c(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                       uint64_t a4, uint64_t a5, uint64_t entry_rsp) {
+    (void)a3; (void)a4;
+    return load_start_mod_run(a0, a1, a2, a5, callback_guest_fs_from_entry_stack(entry_rsp));
+}
+PROSPER_ASM_TRAMPOLINE(k_load_start_mod_entry, k_load_start_mod_c)
+extern "C" void k_load_start_mod_entry();
+#else
+HLE(k_load_start_mod) {   // Windows/MinGW: no import-boundary %fs swap -> guest_fs = 0
+    (void)a3; (void)a4;
+    return load_start_mod_run(a0, a1, a2, a5, 0);
+}
+#endif
 
 // _exit(status): terminate the process. Previously an unimplemented stub RETURNED 0, so libc's
 // exit path fell through into its deliberate ud2 (SIGILL) — terminate for real, loudly.
@@ -1421,7 +1460,11 @@ void register_kernel_time_hle() {
     R("sceSysmoduleLoadModule", k_ok);
     R("sceSysmoduleUnloadModule", k_ok);
     R("sceSysmoduleIsLoaded", k_ok);
+#ifndef _WIN32
+    R("sceKernelLoadStartModule", k_load_start_mod_entry);   // entry-rsp trampoline (#639)
+#else
     R("sceKernelLoadStartModule", k_load_start_mod);
+#endif
     R("sceKernelStopUnloadModule", k_ok);
     // Thread scheduling: Set*/Get* are registered in hle_kernel.cpp, where the Get* handlers FILL
     // their out-params (affinity mask 0xff, priority 700) — a Get* that returns success without

@@ -91,6 +91,7 @@ std::vector<std::string> discover_extra_plugin_modules(
 
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 #include "host/exec_image.hpp"
+#include "host/runtime_module_load.hpp"
 #include "hle/dispatch.hpp"
 #include "self/module.hpp"     // PT_SCE_PROCPARAM
 #include <cstdio>
@@ -268,8 +269,14 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     for (auto& s : p.mods[0]->segments)
         if (s.type == PT_SCE_PROCPARAM) { set_proc_param(BOOT_EBOOT + s.vaddr); break; }
 
+    // A runtime sceKernelLoadStartModule appends import slots to this same vector (#639). Reserve
+    // headroom so the common case never reallocates the buffer the dispatcher indexes; the append
+    // is synchronised either way (dispatch_append_slots), this just avoids the copy.
+    p.slots.reserve(p.slots.size() + 1024);
     if (!install_stubs(p.slots, p.stub_base, p.stub_size, &e)) return fail("stubs failed: " + e);
     install_trap_handler();
+    // Enable real runtime PRX loading now that the fixed set is linked, mapped and stubbed (#639).
+    runtime_module_loader_init(&p);
 
     // PSN.prx / SaveData.prx native plugins validate a module-param descriptor and null-fault if
     // started with (argc=0, argp=NULL). Register their guest ranges so run_guest_inits starts them

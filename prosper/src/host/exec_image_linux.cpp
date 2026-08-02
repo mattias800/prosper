@@ -2454,6 +2454,32 @@ bool map_image(const LoadedImage& img, std::string* err) {
     return true;
 }
 
+// The one place a slot's stub bytes are chosen. install_stubs and append_stubs (#639) must emit
+// byte-identical stubs for the same slot, or a runtime-loaded module's imports would take a
+// different path into the HLE than the pre-linked ones.
+static size_t emit_one_stub(uint8_t* slot, const ImportSlot& s, uint32_t idx, bool swap) {
+    HleFn fn = Hle::lookup(s.nid);
+    HleReturnHook return_hook = Hle::return_hook_of(s.nid);
+    if (fn) {
+        if (return_hook) return emit_impl_hook(slot, (uint64_t)fn, (uint64_t)return_hook, swap);
+        return swap ? emit_impl_swap(slot, (uint64_t)fn) : emit_impl(slot, (uint64_t)fn);
+    }
+    return swap ? emit_unimpl_swap(slot, idx, (uint64_t)&prosper_on_unimpl)
+                : emit_unimpl(slot, idx, (uint64_t)&prosper_on_unimpl);
+}
+
+// Whether the emitted stubs must swap %fs (see install_stubs' original comment).
+static bool stub_swap_mode() {
+#ifdef __APPLE__
+    // macOS trap mode NEVER swaps %fs: the CPU fs base stays 0 and HLE handlers run on the host's own
+    // (%gs) TLS, so the plain tail-jump stub is correct. (The swap stub uses rdfsbase/wrfsbase, which
+    // SIGILL on Rosetta — emitting it here made every guest import call trap.)
+    return false;
+#else
+    return guest_tls_enabled();   // gated: emit the %fs swap stubs so HLE handlers run on the host TCB
+#endif
+}
+
 bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                    uint64_t stub_size, std::string* err) {
     auto fail = [&](const char* s){ if (err) *err = s; return false; };
@@ -2467,32 +2493,17 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     // the empty table and succeed.
     if (n == 0) { g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = 0; return true; }
     uint64_t region = page_up(n * stub_size);
+    if (region > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");
     void* want = (void*)stub_base;
     void* got = prosper_mmap_noreplace(want, region, PROT_READ | PROT_WRITE | PROT_EXEC,
                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (got == MAP_FAILED || got != want) return fail("mmap stub region failed");
 
-#ifdef __APPLE__
-    // macOS trap mode NEVER swaps %fs: the CPU fs base stays 0 and HLE handlers run on the host's own
-    // (%gs) TLS, so the plain tail-jump stub is correct. (The swap stub uses rdfsbase/wrfsbase, which
-    // SIGILL on Rosetta — emitting it here made every guest import call trap.)
-    bool swap = false;
-#else
-    bool swap = guest_tls_enabled();   // gated: emit the %fs swap stubs so HLE handlers run on the host TCB
-#endif
+    const bool swap = stub_swap_mode();
     if (swap && stub_size < 96) return fail("stub_size too small for guest-%fs swap stub (need >= 96)");
     uint8_t* base = (uint8_t*)got;
     for (uint64_t i = 0; i < n; i++) {
-        uint8_t* slot = base + i * stub_size;
-        HleFn fn = Hle::lookup(slots[i].nid);
-        HleReturnHook return_hook = Hle::return_hook_of(slots[i].nid);
-        size_t emitted = 0;
-        if (fn) { if (return_hook) emitted = emit_impl_hook(slot, (uint64_t)fn,
-                                                            (uint64_t)return_hook, swap);
-                  else if (swap) emitted = emit_impl_swap(slot, (uint64_t)fn);
-                  else emitted = emit_impl(slot, (uint64_t)fn); }
-        else    { if (swap) emitted = emit_unimpl_swap(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl);
-                  else      emitted = emit_unimpl(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl); }
+        const size_t emitted = emit_one_stub(base + i * stub_size, slots[i], (uint32_t)i, swap);
         if (emitted > stub_size) return fail("generated import stub exceeds stub_size");
     }
     g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
@@ -2505,6 +2516,46 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                     (unsigned long long)(i * stub_size), slots[i].lib.c_str(), slots[i].nid.c_str(), nm.c_str());
         }
     }
+    return true;
+}
+
+bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::string* err) {
+    auto fail = [&](const char* s){ if (err) *err = s; return false; };
+    if (!g_stub_size) return fail("append_stubs before install_stubs");
+    const uint64_t n = slots.size();
+    if (first_new > n || first_new != g_nstubs) return fail("append_stubs: slot table is not an extension");
+    if (first_new == n) return true;                    // nothing new to emit
+    const bool swap = stub_swap_mode();
+    if (swap && g_stub_size < 96) return fail("stub_size too small for guest-%fs swap stub (need >= 96)");
+    // Grow the region only by the pages the new slots need. The already-mapped pages are NEVER
+    // remapped: relocated guest code already holds addresses inside them, and a fresh MAP_FIXED
+    // would tear a stub out from under a thread executing it.
+    const uint64_t mapped_end = page_up(g_nstubs * g_stub_size);
+    const uint64_t need_end   = page_up(n * g_stub_size);
+    if (need_end > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");
+    if (need_end > mapped_end) {
+        void* want = (void*)(g_stub_base + mapped_end);
+        void* got = prosper_mmap_noreplace(want, need_end - mapped_end,
+                                           PROT_READ | PROT_WRITE | PROT_EXEC,
+                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (got == MAP_FAILED || got != want) return fail("mmap stub region extension failed");
+    }
+    for (uint64_t i = first_new; i < n; i++) {
+        const size_t emitted =
+            emit_one_stub((uint8_t*)(uintptr_t)(g_stub_base + i * g_stub_size), slots[i],
+                          (uint32_t)i, swap);
+        if (emitted > g_stub_size) return fail("generated import stub exceeds stub_size");
+    }
+    g_nstubs = n;
+    // Publish the grown table only after every new stub is written: prosper_on_unimpl indexes it.
+    dispatch_grow_slots(&slots);
+    if (getenv("PROSPER_STUBDUMP"))
+        for (uint64_t i = first_new; i < n; i++) {
+            const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
+            fprintf(stderr, "[stub] +#%llu off=0x%llx %s::%s %s\n", (unsigned long long)i,
+                    (unsigned long long)(i * g_stub_size), slots[i].lib.c_str(),
+                    slots[i].nid.c_str(), nm.c_str());
+        }
     return true;
 }
 

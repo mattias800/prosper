@@ -1131,6 +1131,16 @@ bool map_image(const LoadedImage& img, std::string* err) {
     return true;
 }
 
+// The one place a slot's stub bytes are chosen. install_stubs and append_stubs (#639) must emit
+// byte-identical stubs for the same slot, or a runtime-loaded module's imports would take a
+// different path into the HLE than the pre-linked ones.
+static size_t emit_one_stub(uint8_t* slot, const ImportSlot& s, uint32_t idx) {
+    HleFn fn = Hle::lookup(s.nid);
+    const uint64_t return_hook = (uint64_t)(uintptr_t)Hle::return_hook_of(s.nid);
+    return fn ? emit_impl(slot, (uint64_t)fn, return_hook)
+              : emit_unimpl(slot, idx, (uint64_t)&prosper_on_unimpl);
+}
+
 bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                    uint64_t stub_size, std::string* err) {
     auto fail = [&](const char* s){ if (err) *err = s; return false; };
@@ -1139,20 +1149,24 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     dispatch_init(&slots, g_nid_db);
 
     uint64_t n = slots.size();
+    // RESERVE the whole stub aperture up front, then COMMIT only the pages the current slots need.
+    // Windows places a MEM_RESERVE at 64 KiB allocation granularity (lpAddress rounds DOWN), so a
+    // later reservation starting at the 4 KiB-aligned end of this one would round back INTO it and
+    // fail with ERROR_INVALID_ADDRESS — append_stubs (#639) could then never extend the table.
+    // MEM_COMMIT is page-granular inside an existing reservation, so growth is committing, not
+    // reserving. The aperture is the same [BOOT_STUB, BOOT_STUB_END) window guest_module_name
+    // already labels STUB and callback_fs.hpp already treats as stubs-only.
+    if (!VirtualAlloc((void*)(uintptr_t)stub_base, kStubApertureBytes, MEM_RESERVE, PAGE_NOACCESS))
+        return fail("VirtualAlloc stub aperture reservation failed");
     if (n == 0) { g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = 0; return true; }
     uint64_t region = page_up(n * stub_size);
-    void* got = VirtualAlloc((void*)(uintptr_t)stub_base, region, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (region > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");
+    void* got = VirtualAlloc((void*)(uintptr_t)stub_base, region, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!got || got != (void*)(uintptr_t)stub_base) return fail("VirtualAlloc stub region failed");
 
     uint8_t* base = (uint8_t*)got;
     for (uint64_t i = 0; i < n; i++) {
-        uint8_t* slot = base + i * stub_size;
-        HleFn fn = Hle::lookup(slots[i].nid);
-        const uint64_t return_hook =
-            (uint64_t)(uintptr_t)Hle::return_hook_of(slots[i].nid);
-        const size_t emitted = fn ? emit_impl(slot, (uint64_t)fn, return_hook)
-                                  : emit_unimpl(slot, (uint32_t)i,
-                                                (uint64_t)&prosper_on_unimpl);
+        const size_t emitted = emit_one_stub(base + i * stub_size, slots[i], (uint32_t)i);
         if (emitted > stub_size) return fail("generated Windows ABI bridge exceeds stub_size");
     }
     g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
@@ -1166,6 +1180,40 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                     (unsigned long long)(i * stub_size), slots[i].lib.c_str(), slots[i].nid.c_str(), nm.c_str());
         }
     }
+    return true;
+}
+
+bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::string* err) {
+    auto fail = [&](const char* s){ if (err) *err = s; return false; };
+    if (!g_stub_size) return fail("append_stubs before install_stubs");
+    const uint64_t n = slots.size();
+    if (first_new > n || first_new != g_nstubs) return fail("append_stubs: slot table is not an extension");
+    if (first_new == n) return true;
+    // Commit only the pages the new slots need, inside the aperture install_stubs reserved. The
+    // already-committed pages are never re-committed with different protection: relocated guest
+    // code holds addresses inside them.
+    const uint64_t mapped_end = page_up(g_nstubs * g_stub_size);
+    const uint64_t need_end   = page_up(n * g_stub_size);
+    if (need_end > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");
+    if (need_end > mapped_end) {
+        void* want = (void*)(uintptr_t)(g_stub_base + mapped_end);
+        void* got = VirtualAlloc(want, need_end - mapped_end, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (!got || got != want) return fail("VirtualAlloc stub region extension failed");
+    }
+    for (uint64_t i = first_new; i < n; i++) {
+        const size_t emitted =
+            emit_one_stub((uint8_t*)(uintptr_t)(g_stub_base + i * g_stub_size), slots[i], (uint32_t)i);
+        if (emitted > g_stub_size) return fail("generated Windows ABI bridge exceeds stub_size");
+    }
+    g_nstubs = n;
+    dispatch_grow_slots(&slots);   // publish only after every new stub is written
+    if (getenv("PROSPER_STUBDUMP"))
+        for (uint64_t i = first_new; i < n; i++) {
+            const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
+            fprintf(stderr, "[stub] +#%llu off=0x%llx %s::%s %s\n", (unsigned long long)i,
+                    (unsigned long long)(i * g_stub_size), slots[i].lib.c_str(),
+                    slots[i].nid.c_str(), nm.c_str());
+        }
     return true;
 }
 

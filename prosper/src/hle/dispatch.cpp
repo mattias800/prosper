@@ -41,7 +41,7 @@ namespace {
 #ifdef _WIN32
     bool executable_guest_address(uint64_t address) {
         // #1659: module range, not the pre-#825 literal (which admitted the DMEM aperture).
-        if (!prosper::guest_va_in_module(address) || address >= prosper::BOOT_STUB) return false;
+        if (!prosper::guest_va_in_module_code(address)) return false;
         MEMORY_BASIC_INFORMATION memory{};
         if (!VirtualQuery((const void*)(uintptr_t)address, &memory, sizeof(memory)) ||
             memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD)) return false;
@@ -134,6 +134,23 @@ void dispatch_init(const std::vector<ImportSlot>* slots, NidDb* db) {
     g_slots = slots; g_db = db;
     // Pre-size the call-count vector to the import table so prosper_on_unimpl never allocates.
     if (slots) { std::lock_guard<std::mutex> lk(g_unimpl_mx); g_count.assign(slots->size(), 0); }
+}
+void dispatch_grow_slots(const std::vector<ImportSlot>* slots) {
+    if (!slots) { std::lock_guard<std::mutex> lk(g_unimpl_mx); g_slots = nullptr; return; }
+    // resize(), not assign(): the run is already under way and the counts of the pre-linked slots
+    // are live census data. New slots start at zero like every other slot did. Both the pointer and
+    // the count vector are published UNDER the lock prosper_on_unimpl reads them under.
+    std::lock_guard<std::mutex> lk(g_unimpl_mx);
+    g_slots = slots;
+    if (g_count.size() < slots->size()) g_count.resize(slots->size(), 0);
+}
+size_t dispatch_append_slots(std::vector<ImportSlot>* slots, const std::vector<ImportSlot>& add) {
+    std::lock_guard<std::mutex> lk(g_unimpl_mx);
+    const size_t first = slots->size();
+    slots->insert(slots->end(), add.begin(), add.end());
+    g_slots = slots;
+    if (g_count.size() < slots->size()) g_count.resize(slots->size(), 0);
+    return first;
 }
 void reset_call_log() { std::lock_guard<std::mutex> lk(g_unimpl_mx); g_order.clear();
                         for (auto& c : g_count) c = 0; }

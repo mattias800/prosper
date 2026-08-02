@@ -1991,7 +1991,7 @@ namespace {
     // Real linked-module handles are stable by load order. The unwind descriptors and per-module
     // export tables are built from that same order, so address lookup can publish the handle expected
     // by sceKernelGetModuleInfoFromAddr and later consume it in sceKernelDlsym.
-    constexpr uint64_t kModuleHandleBase = 0x10000;
+    constexpr uint64_t kModuleHandleBase = kSceModuleHandleBase;
     // Decode the eh_frame pointer out of an .eh_frame_hdr. Layout: [0]=version(1), [1]=eh_frame_ptr_enc,
     // [2]=fde_count_enc, [3]=table_enc, [4..]=eh_frame_ptr (encoded). The common encoding is 0x1B
     // (DW_EH_PE_pcrel|sdata4): a signed 32-bit offset from the field's own address.
@@ -2062,6 +2062,16 @@ HLE(k_get_module_info_from_addr) {   // (VAddr addr, int n, ModuleInfo* info)
 }
 void set_unwind_modules(const UnwindModuleDesc* d, size_t c) {
     std::lock_guard<std::mutex> lk(g_unwind_mx); g_unwind_mods.assign(d, d + c);
+}
+// #639: a runtime-loaded module appends here. The index it lands on is the same index the module's
+// export table lands on in g_mod_exports below, because k_get_module_info_from_addr derives a
+// handle from THIS vector while sceKernelDlsym consumes it against THAT one — the two must stay
+// parallel or an address-derived handle names a different module than it resolves through. The
+// runtime loader appends to both, once per module, and checks the two indices agree.
+size_t add_unwind_module(const UnwindModuleDesc& d) {
+    std::lock_guard<std::mutex> lk(g_unwind_mx);
+    g_unwind_mods.push_back(d);
+    return g_unwind_mods.size() - 1;
 }
 
 // ---- Async exception delivery = the IL2CPP GC's stop-the-world thread suspension ----
@@ -2910,7 +2920,7 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && guest_return_count < 8; ++i) {
             const uint64_t candidate = stack_words[i];
             // #1659: module range, not the pre-#825 literal.
-            if (!prosper::guest_va_in_module(candidate) || candidate >= prosper::BOOT_STUB) continue;
+            if (!prosper::guest_va_in_module_code(candidate)) continue;
             bool in_guest_module = false;
             for (const UnwindModuleDesc& guest_module : modules)
                 in_guest_module |= candidate >= guest_module.lo && candidate < guest_module.hi;
@@ -3157,6 +3167,11 @@ HLE(k_is_stack) {   // sceKernelIsStack(void* addr): is addr within the current 
 namespace {
     const std::unordered_map<std::string, uint64_t>* g_exports = nullptr;
     std::vector<ModuleExportTable> g_mod_exports;   // per-module tables (#147)
+    // Guards g_mod_exports only. Before #639 the vector was written once, before the guest ran;
+    // real runtime PRX loading appends to it from a guest thread while other guest threads are
+    // inside sceKernelDlsym / sceKernelLoadStartModule. The registered maps themselves are never
+    // mutated after publication, so the lock covers the vector and the lookup that borrows into it.
+    std::mutex g_mod_exports_mx;
     const char* path_basename(const char* p) {
         const char* b = p;
         for (const char* c = p; *c; c++) if (*c == '/' || *c == '\\') b = c + 1;
@@ -3173,10 +3188,20 @@ namespace {
     }
 }
 void set_module_exports(const std::unordered_map<std::string, uint64_t>* exports) { g_exports = exports; }
-void set_module_export_tables(std::vector<ModuleExportTable> tables) { g_mod_exports = std::move(tables); }
+void set_module_export_tables(std::vector<ModuleExportTable> tables) {
+    std::lock_guard<std::mutex> lk(g_mod_exports_mx);
+    g_mod_exports = std::move(tables);
+}
+uint64_t add_module_export_table(std::string path,
+                                 const std::unordered_map<std::string, uint64_t>* nids) {
+    std::lock_guard<std::mutex> lk(g_mod_exports_mx);
+    g_mod_exports.push_back({ std::move(path), nids });
+    return kModuleHandleBase + (g_mod_exports.size() - 1);
+}
 uint64_t module_handle_for_path(const char* path) {
     if (!path || !*path) return 0;
     const char* want = path_basename(path);
+    std::lock_guard<std::mutex> lk(g_mod_exports_mx);
     for (size_t i = 0; i < g_mod_exports.size(); i++)
         if (ieq(path_basename(g_mod_exports[i].path.c_str()), want))
             return kModuleHandleBase + i;
@@ -3191,24 +3216,55 @@ HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, voi
     // name; synthetic handles for unknown paths land here). We hash the name to its Sony NID
     // (nid_hash); a hit is written through *funcAddr and reported as success.
     const char* name = a1 ? (const char*)(uintptr_t)a1 : nullptr;
-    if (name && a0 >= kModuleHandleBase && a0 - kModuleHandleBase < g_mod_exports.size()) {
-        if (const auto* nids = g_mod_exports[a0 - kModuleHandleBase].nids) {
-            auto it = nids->find(nid_hash(name));
-            if (it != nids->end()) {
-                if (a2) *(uint64_t*)(uintptr_t)a2 = it->second;
-                if (getenv("PROSPER_SYNCLOG"))
-                    fprintf(stderr, "[dlsym] '%s' (module handle 0x%llx) -> 0x%llx\n",
-                            name, (unsigned long long)a0, (unsigned long long)it->second);
-                return 0;
-            }
+    const std::string want = name ? nid_hash(name) : std::string();
+    if (name) {
+        uint64_t hit = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_mod_exports_mx);
+            if (a0 >= kModuleHandleBase && a0 - kModuleHandleBase < g_mod_exports.size())
+                if (const auto* nids = g_mod_exports[a0 - kModuleHandleBase].nids) {
+                    auto it = nids->find(want);
+                    if (it != nids->end()) hit = it->second;
+                }
+        }
+        if (hit) {
+            if (a2) *(uint64_t*)(uintptr_t)a2 = hit;
+            if (getenv("PROSPER_SYNCLOG"))
+                fprintf(stderr, "[dlsym] '%s' (module handle 0x%llx) -> 0x%llx\n",
+                        name, (unsigned long long)a0, (unsigned long long)hit);
+            return 0;
         }
     }
     if (name && g_exports) {
-        auto it = g_exports->find(nid_hash(name));
+        auto it = g_exports->find(want);
         if (it != g_exports->end()) {
             if (a2) *(uint64_t*)(uintptr_t)a2 = it->second;   // *funcAddr = export
             if (getenv("PROSPER_SYNCLOG"))
                 fprintf(stderr, "[dlsym] '%s' -> 0x%llx\n", name, (unsigned long long)it->second);
+            return 0;
+        }
+    }
+    // #639: g_exports covers only the pre-linked program, so a name-only dlsym (no handle, or a
+    // handle the caller never obtained from LoadStartModule) would miss a module the guest loaded
+    // at runtime. Scan the registered per-module tables in registration order — for a pre-linked
+    // module this can only reproduce what g_exports already answered above, so the pre-linked
+    // first-definition-wins order is preserved and only runtime modules are added, last.
+    if (name) {
+        uint64_t hit = 0;
+        std::string from;   // COPY, not c_str(): a concurrent add_module_export_table can realloc
+        {                   // g_mod_exports and free the string buffer the moment the lock drops.
+            std::lock_guard<std::mutex> lk(g_mod_exports_mx);
+            for (const auto& me : g_mod_exports) {
+                if (!me.nids) continue;
+                auto it = me.nids->find(want);
+                if (it != me.nids->end()) { hit = it->second; from = me.path; break; }
+            }
+        }
+        if (hit) {
+            if (a2) *(uint64_t*)(uintptr_t)a2 = hit;
+            if (getenv("PROSPER_SYNCLOG"))
+                fprintf(stderr, "[dlsym] '%s' -> 0x%llx (runtime-loaded %s)\n", name,
+                        (unsigned long long)hit, from.c_str());
             return 0;
         }
     }

@@ -13,6 +13,12 @@
 
 namespace prosper {
 
+// The address aperture the import-stub table lives in. install_stubs claims exactly this much from
+// stub_base and append_stubs (#639) grows inside it, so no stub address ever moves and nothing else
+// may be mapped in the window. For the production base this is [BOOT_STUB, BOOT_STUB_END), the same
+// range guest_module_name labels STUB and callback_fs.hpp treats as an import-stub return address.
+inline constexpr uint64_t kStubApertureBytes = 0x10000000ull;   // 256 MiB
+
 // Map the (already relocated) image at img.base as executable. `false`+*err on failure.
 // Call once per module in a linked program.
 bool map_image(const LoadedImage& img, std::string* err);
@@ -21,6 +27,14 @@ bool map_image(const LoadedImage& img, std::string* err);
 // implemented imports tail-jump to their C handler, unimplemented ones log + return 0.
 bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                    uint64_t stub_size, std::string* err);
+
+// Extend the stub region in place for slots appended AFTER install_stubs ran (#639: a runtime
+// sceKernelLoadStartModule adds a slot for each import no already-loaded module satisfies).
+// `slots` must be the SAME vector install_stubs was given, grown at the back; `first_new` is the
+// old size. Only the pages the new slots need are mapped — the pages already handed out to
+// relocated guest code are never remapped, so a thread executing a stub cannot have it torn away.
+// Publishes the grown table to the dispatcher after the last new stub is written.
+bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::string* err);
 
 // Install the fault handler for genuine guest faults during a run.
 void install_trap_handler();
