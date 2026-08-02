@@ -27,7 +27,7 @@ Last updated: 2026-08-02
 | *Asterix &amp; Obelix: Slap Them All!* | `PPSA08576` | Unity / IL2CPP | ✅ Title screen and first forest level render at native 1920×1080 — reached on unmodified master with no code changes |
 | *Summer Sports Games* | `PPSA03416` | Unity / IL2CPP | ✅ Mode select and live 3D athletics render at native 3840×2160 with no code changes |
 | *Worms Armageddon: Anniversary Edition* | `PPSA20052` | Custom (Digital Eclipse) | ✅ Scripted route reaches a live Quickstart match at native 1920×1080; `worms-armageddon-gameplay` guard |
-| *Earthion* | `PPSA28061` | Custom (Ancient) | 🚧 Developer logo, intro story text and CRT bezel render; the 320×224 game picture inside the bezel is still missing |
+| *Earthion* | `PPSA28061` | Custom (Ancient) | 🚧 A scripted route leaves the intro and reaches the title screen, main menu and HOW TO PLAY page in full colour at native 3840×2160; gameplay not routed yet |
 | *Bendy and the Ink Machine* | `PPSA27616` | Unity / IL2CPP | 🚧 Main menu renders and a scripted route reaches first-person Chapter 1 gameplay at native 3840×2160; about 8 fps in the level |
 | *The Plucky Squire* | `PPSA15319` | Unreal Engine 4 | 🚧 Title screen and the save-file/play-style menus render at native 3840×2160; the route then holds a black loading screen and does not reach chapter one |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🚧 Title screen (`NEW GAME` / `OPTIONS`) renders at native 2560×1440; gameplay not reached |
@@ -68,7 +68,7 @@ is guest flips per second — the rate the game itself advances — averaged ove
 | *Nikoderiko: The Magical World* `PPSA23760` | 2 | ~14 @ 4K | Title screen; the 3D world is dropped (#305 / #1607) |
 | *Syberia: Remastered* `PPSA30140` | 3 | ~2 @ 1080p | Routed factory hall renders; composite degraded (#1619 / #1627) |
 | *Dragon Quest VII Reimagined* `PPSA17942` | 1 without input | ~12 @ 4K | Ocean/sky pass and the save-created notice; the title needs the route |
-| *Earthion* `PPSA28061` | 1 | ~139 @ 4K | Bezel and intro text; the picture area inside the bezel is missing (#1590) |
+| *Earthion* `PPSA28061` | 2 with the route | ~139 @ 4K | Title screen and menus render; the earlier "missing picture" was the intro's own black text page (#1590) |
 | *Tales of Graces f Remastered* `PPSA19991` | 2 with the route | ~37 @ 1080p on the title screen | Title screen, EULA, main menu and new-game Options; gameplay not reached (#1609) |
 | *The Oregon Trail* `PPSA19244` | 0 | ~42 @ 4K | Frame loop advances, every frame black (#1606 / #1641) |
 | *Asterix &amp; Obelix - Babylon Mission* `PPSA30490` | 0 | ~124 @ 1080p | All frames black (#1599); the run no longer dies at 125 s (#1748) |
@@ -501,14 +501,32 @@ initialises audio, reaches its frame loop, and renders its developer logo, its l
 text, and the retro CRT-TV bezel that frames the whole game. The intro advances normally through
 several pages, so guest logic, input timing and presentation are healthy.
 
-What is missing is the picture inside the bezel: a single MIMG descriptor-provenance gap drops the
-320×224 game-picture composite. Tracked on #1590. No screenshot is published here because the game
-area itself is not yet rendering.
+<p align="center">
+  <img src="assets/screenshots/earthion-title-menu.png" alt="Earthion — title screen and main menu inside the CRT bezel">
+</p>
 
-On current master that area composites **white**, not the black #1590 records, and the intro story
-text is drawn light-on-white and is barely legible as a result. This is not a consequence of #1728:
-an A/B in the 2026-08-02 boot sweep with `PROSPER_LEGACY_CB_DISABLE_MASK=1` produces the same white
-picture area, so the colour-write-mask change is excluded.
+**The bezel interior was never missing a picture.** Every capture taken of this title until
+2026-08-02 was of the intro story-text sequence, which is white text on black, and no route had ever
+pressed a button — so a rectangle that is black on purpose was recorded as a missing game image and
+explained for several sessions. `scripts/earthion/reach-title-menu.pad` presses through it and
+reaches, with no code changes, the **title screen and main menu** (logo over a wireframe globe;
+`How to Play`, `Game Version`, `Reset`, `Audio`, `Visuals`, `Language`, `Extras`) and the **HOW TO
+PLAY** page, whose annotated HUD callouts, sprite icons and two-column `Controls` list with
+PlayStation glyphs all render correctly. Interior content metrics and the pad-read evidence are in
+`prosper/scripts/earthion/README.md`.
+
+Two earlier records here were wrong and are withdrawn. The area does **not** composite white — the
+intro is black with legible white text on current master, and the menus are full colour; and the
+rejected `ps=0x4101c1f00` draw is **not** why anything is black, since it is still rejected
+throughout this route (`occurrence=32768`) while the menu renders.
+
+That draw remains rejected, and #1590 traces it to a **guest** defect: Earthion binds render-target
+index 1 of a group its own code creates with one render target, ignores the resulting `0x8A6C0010`,
+and hands the descriptor slot 32 bytes of uninitialised stack. #1773 is the separate, generic
+recompiler gap that would drop the same draw even with a valid descriptor. Neither blocks the rung.
+
+Gameplay is not routed yet: the menu above is the options/extras list, and starting a game needs
+Up/Down navigation rather than the flat Cross/Options alternation this route uses.
 
 ## Asterix & Obelix: Slap Them All! — `PPSA08576`
 
