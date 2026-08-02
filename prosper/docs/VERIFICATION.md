@@ -67,8 +67,9 @@ Drivers are not required to validate SPIR-V, and the two prosper is developed ag
 and RADV both accepted a module whose `OpAccessChain` result type disagreed with the type it walked.
 So acceptance by a driver proves nothing about validity, and `tools/spv_validate` is the gate that
 does. It emits one representative module from **every** SPIR-V-producing entry point declared in
-`src/gpu/*.hpp` — under either return-type spelling the tree uses, `std::vector<uint32_t>` and the
-live path's `SharedShaderWords` — and runs `spirv-val --target-env vulkan1.1` on each.
+any header under `src/gpu/` or `frontends/shared/`, recursively, under either return-type spelling
+the tree uses (`std::vector<uint32_t>` and the live path's `SharedShaderWords`), and runs
+`spirv-val --target-env vulkan1.1` on each.
 
 Scope, stated precisely because it was previously overstated: this is *per emitter path*, not per
 shader a title submits. A game's shader is covered to the extent that it exercises paths the corpus
@@ -84,9 +85,8 @@ Three failure modes of the gate itself are closed, all of them found by #1711:
   `spirv-tools` on all three test platforms, and removing that breaks the job.
 * **An uncovered emitter is a failure.** The corpus only ever walked `recompile_*`, so the
   hand-assembled compute modules in `spirv_builder.cpp` — created at runtime by the live frontend
-  exactly like a recompiled shader — were never validated. The tool now scans every header under
-  `src/gpu/` and `frontends/shared/`, recursively, for declarations returning SPIR-V words under
-  either spelling the tree uses, and fails on any that did not produce a validated module. Coverage is measured at **runtime**, where each module is emitted, not by
+  exactly like a recompiled shader — were never validated. The tool now scans those headers for
+  declarations returning SPIR-V words and fails on any that did not produce a validated module. Coverage is measured at **runtime**, where each module is emitted, not by
   grepping the tool's own source for a call: a textual check is satisfied by a mention in a comment
   or by a call whose result is discarded, and a check a comment can pass is the defect this gate
   exists to stop. A name that is not an emitter (an RDNA2→RDNA2 transform, a caching wrapper) must

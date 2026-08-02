@@ -179,8 +179,11 @@ static int check_emitter_coverage(const std::string& src_root) {
     // precisely the #1711 shape one level up, and a fixed list cannot see it. RECURSIVE, and both
     // the GPU code and the frontend that drives it, so neither a new subdirectory nor a producer
     // that grows in the frontend re-creates that blind spot at the level of LOCATION rather than
-    // filename. Nothing outside these roots emits SPIR-V today (`git grep 0x07230203` finds only
-    // rdna2_to_spirv.cpp and spirv_builder.cpp); if that changes, add the root here rather than
+    // filename. Nothing outside these roots emits SPIR-V today. The command that SHOWS that is
+    // `git grep -l 0x07230203 -- prosper/src prosper/frontends`: three files, of which
+    // rdna2_to_spirv.cpp and spirv_builder.cpp emit and shader_resources.cpp only PARSES. Grepping
+    // the whole tree instead returns 29 files — test fixtures, gpu_replay reading a module back,
+    // vendored imgui — and demonstrates nothing. If that changes, add the root here rather than
     // discovering it the way #1711 was discovered.
     static const char* const kSearchRoots[] = {"/src/gpu", "/frontends/shared"};
     std::vector<std::string> headers;
@@ -247,10 +250,15 @@ static int check_emitter_coverage(const std::string& src_root) {
                    "longer finds it declared — the scan has stopped working\n", name.c_str());
             ++problems;
         }
-    if (!problems)
-        printf("  [ok]   emitter coverage: all %zu declared SPIR-V emitters were exercised%s\n",
-               declared.size(),
+    if (!problems) {
+        // Count, rather than say "all": a kKnownGaps entry takes the [gap] branch without adding a
+        // problem, so "all N were exercised" would be false the moment that list is non-empty.
+        size_t gaps = 0;
+        for (const KnownGap& g : kKnownGaps) gaps += declared.count(g.emitter);
+        printf("  [ok]   emitter coverage: %zu of %zu declared SPIR-V emitters were exercised%s\n",
+               declared.size() - gaps, declared.size(),
                fails ? " (one or more of which FAILED above)" : ", and every module validated");
+    }
     return problems;
 }
 

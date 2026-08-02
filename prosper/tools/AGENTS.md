@@ -84,8 +84,9 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   screen is black (83%), because `CB_DISABLE` is the depth/shadow prepass. Reading one phase alone yields a
   confident wrong answer. `--selftest` needs no capture. See `tools/colorstate/README.md`.
 - **`spv_validate/`** — the strict SPIR-V validation gate (ctest `spv_validate`). It emits one
-  representative module from **every** SPIR-V-producing entry point declared in `src/gpu/*.hpp` and
-  runs `spirv-val --target-env vulkan1.1` on each. It fails when a module is invalid, when
+  representative module from **every** SPIR-V-producing entry point declared in any header under
+  `src/gpu/` or `frontends/shared/` (recursively, under either return-type spelling the tree uses)
+  and runs `spirv-val --target-env vulkan1.1` on each. It fails when a module is invalid, when
   `spirv-val` is not installed (it used to report PASS — see #1711), and when a declared emitter did
   not produce a validated module. Coverage is recorded at runtime by passing the emitter's name to
   `dump()`, so a call whose result is discarded does not count. Adding an emitter therefore means
