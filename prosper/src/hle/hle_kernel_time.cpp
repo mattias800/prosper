@@ -512,13 +512,12 @@ HLE(k_clock_getres) { if (a1) { int64_t* r = (int64_t*)P(a1); r[0] = 0; r[1] = 1
 
 // --- assorted libkernel stubs ---
 HLE(k_ok)              { return 0; }                       // generic success no-op
-// sceKernelLoadStartModule(path, ...): the PRX are pre-linked into our address space, so "loading"
-// resolves the path to its linked module and returns a REAL handle — dlsym then consults that
-// module's own exports first (#147). A path NOT in the linked set previously got a fake
-// monotonically-increasing success handle while loading nothing (#146): the guest then believed the
-// load succeeded and called exports that resolved to ESRCH fallbacks / the wrong module instead of
-// getting the honest ENOENT. Return SCE_KERNEL_ERROR_ENOENT for a miss so the guest takes its
-// module-not-found path. Both current titles preload every PRX they use, so no real load misses.
+// sceKernelLoadStartModule: a PRX already in the linked set resolves to its REAL handle, and dlsym
+// then consults that module's own exports first (#147). A path NOT in the linked set used to get a
+// fake monotonically-increasing success handle while loading nothing (#146) — the guest believed
+// the load succeeded and called exports that resolved to ESRCH fallbacks — and then, once that was
+// removed, an honest ENOENT for a capability prosper did not have. Since #639 it is a real load:
+// only a genuinely absent or unloadable file is an error. See host/runtime_module_load.hpp.
 // sceKernelLoadStartModule(const char* name, size_t args, const void* argp, uint32_t flags,
 //                          const SceKernelLoadModuleOpt* opt, int* pRes)
 static uint64_t load_start_mod_run(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a5,

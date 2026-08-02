@@ -961,11 +961,11 @@ if(TARGET prosper_core)
                COMMAND test_boot_linux "${GAME_DUMP}")
     endif()
 
-    if(NOT APPLE)
+    if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
       # Real runtime PRX loading (#639). Hermetic: the test writes its own synthetic PRX outside
       # Media/Plugins, so it needs no game dump — but it maps that module at the fixed runtime-module
-      # base and EXECUTES its module_start, so it is host-x86-64 only (the same constraint every
-      # guest-execution test here has). Its scratch root goes in the build tree, never /tmp.
+      # base and EXECUTES its module_start, whose bytes the test emits by hand, so it is host-x86-64
+      # only. Its scratch root goes in the build tree, never /tmp.
       add_executable(test_runtime_prx_load tests/test_runtime_prx_load.cpp)
       target_link_libraries(test_runtime_prx_load PRIVATE prosper_core)
       add_test(NAME runtime_prx_load

@@ -57,6 +57,9 @@ enum : uint64_t {
     kFileSize    = 0x1000,
 };
 
+// memcpy, never a type-punned store: the buffer is std::vector<uint8_t> and a uint16_t*/uint32_t*
+// write through it is a strict-aliasing violation even where the alignment happens to work out.
+static void put16(std::vector<uint8_t>& f, uint64_t off, uint16_t v) { memcpy(&f[off], &v, 2); }
 static void put32(std::vector<uint8_t>& f, uint64_t off, uint32_t v) { memcpy(&f[off], &v, 4); }
 static void put64(std::vector<uint8_t>& f, uint64_t off, uint64_t v) { memcpy(&f[off], &v, 8); }
 
@@ -75,17 +78,15 @@ static std::vector<uint8_t> build_module(const std::string& export_nid,
     // --- ELF header (ET_SCE_DYNAMIC PRX, x86-64, FreeBSD ABI, program headers only) ---
     memcpy(&f[0], "\x7f" "ELF", 4);
     f[4] = 2; f[5] = 1; f[6] = 1; f[7] = 9;          // ELF64, LSB, version 1, ELFOSABI_FREEBSD
-    put32(f, 0x10, 0xfe18);                           // e_type = ET_SCE_DYNAMIC (16-bit field)
-    put32(f, 0x12, 0x3e);                             // e_machine = x86-64 (16-bit field)
+    put16(f, 0x10, 0xfe18);                           // e_type = ET_SCE_DYNAMIC
+    put16(f, 0x12, 0x3e);                             // e_machine = x86-64
     put32(f, 0x14, 1);                                // e_version
     put64(f, 0x18, 0);                                // e_entry
     put64(f, 0x20, 0x40);                             // e_phoff
-    put32(f, 0x34, 64);                               // e_ehsize
-    put32(f, 0x36, 56);                               // e_phentsize (16-bit)
-    put32(f, 0x38, 2);                                // e_phnum (16-bit)
-    // e_phentsize/e_phnum share dwords with neighbours; rewrite them as the 16-bit fields they are.
-    *(uint16_t*)&f[0x36] = 56; *(uint16_t*)&f[0x38] = 2;
-    *(uint16_t*)&f[0x3a] = 0;  *(uint16_t*)&f[0x3c] = 0; *(uint16_t*)&f[0x3e] = 0;
+    put16(f, 0x34, 64);                               // e_ehsize
+    put16(f, 0x36, 56);                               // e_phentsize
+    put16(f, 0x38, 2);                                // e_phnum
+    // e_shentsize / e_shnum / e_shstrndx stay zero: this module has no section header table.
 
     // --- program headers: one RWX PT_LOAD covering the file, plus PT_DYNAMIC ---
     auto phdr = [&](int i, uint32_t type, uint32_t flags, uint64_t off, uint64_t va,
@@ -133,7 +134,7 @@ static std::vector<uint8_t> build_module(const std::string& export_nid,
         const uint64_t p = kSymtab + (uint64_t)i * 24;
         put32(f, p + 0, (uint32_t)name_off);
         f[p + 4] = 0x12;                       // STB_GLOBAL | STT_FUNC
-        *(uint16_t*)&f[p + 6] = shndx;
+        put16(f, p + 6, shndx);
         put64(f, p + 8, value);
         put64(f, p + 16, 8);
     };
@@ -179,11 +180,14 @@ int main(int argc, char** argv) {
     const std::string root = (argc >= 2) ? argv[1] : std::string("./runtime-prx-test-root");
     const std::string prx_dir = root + "/prx";          // deliberately NOT Media/Plugins
     const std::string prx_path = prx_dir + "/prosper_runtime_test.prx";
+    {
 #ifdef _WIN32
-    system(("mkdir \"" + prx_dir + "\" 2>nul").c_str());
+        const int rc = system(("mkdir \"" + prx_dir + "\" 2>nul").c_str());
 #else
-    system(("mkdir -p '" + prx_dir + "'").c_str());
+        const int rc = system(("mkdir -p '" + prx_dir + "'").c_str());
 #endif
+        (void)rc;   // an already-existing directory is fine; the fopen below is the real check
+    }
 
     const std::string export_nid = nid_hash("prosperRuntimeTestExport");
     const std::string import_nid = nid_hash("prosperRuntimeTestImport");
@@ -237,6 +241,12 @@ int main(int argc, char** argv) {
           "dlsym through the returned handle resolves the module's export");
     const uint64_t base = addr - kExportFn;
     CHECK(base == BOOT_RUNTIME_MODULE_BASE, "the module is mapped in the runtime-module aperture");
+    // Every stack-scan diagnostic that recovers a guest callsite filters on these two predicates.
+    // Before #639 they stopped at the stub aperture, which now sits BELOW the runtime modules — a
+    // runtime module's return addresses would have been invisible to every one of them.
+    CHECK(guest_va_in_module(addr) && guest_va_in_module_code(addr) &&
+          !guest_va_in_module_code(BOOT_STUB),
+          "a runtime-module address classifies as guest module code, and a stub address does not");
     CHECK(addr && ((uint32_t (*)())(uintptr_t)addr)() == 0x5eed,
           "the resolved export is executable code with the expected behaviour");
 

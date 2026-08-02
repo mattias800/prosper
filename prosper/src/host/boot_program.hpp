@@ -46,7 +46,10 @@ inline constexpr uint64_t BOOT_STUB     = 0x600000000ull;
 // [0x600000000,0x700000000), so nothing else may be mapped inside that window. 128 MiB per slot
 // bounds each module (the whole local corpus's largest module image is ~251 MiB, and the loader
 // refuses anything that does not fit rather than overlapping its neighbour).
-inline constexpr uint64_t BOOT_RUNTIME_MODULE_BASE   = 0x700000000ull;
+// (Kept clear of the ad-hoc stub bases a few unit tests pass to install_stubs — 0x680000000,
+// 0x710000000, 0x720000000, 0x730000000 — so a future test that boots a program and loads a module
+// in one process cannot alias them.)
+inline constexpr uint64_t BOOT_RUNTIME_MODULE_BASE   = 0x800000000ull;
 inline constexpr uint64_t BOOT_RUNTIME_MODULE_STRIDE = 0x8000000ull;   // 128 MiB
 inline constexpr unsigned BOOT_RUNTIME_MODULE_SLOTS  = 48;
 inline constexpr uint64_t BOOT_RUNTIME_MODULE_END =
@@ -118,10 +121,23 @@ inline uint64_t guest_module_offset(uint64_t a) {
         return (a - BOOT_RUNTIME_MODULE_BASE) % BOOT_RUNTIME_MODULE_STRIDE;
     return a;
 }
+// End of the import-stub aperture. install_stubs reserves this whole window (never more), so a stub
+// address is exactly [BOOT_STUB, BOOT_STUB_END) and nothing else may be mapped inside it —
+// callback_fs.hpp identifies a guest import-stub frame by a return address in this range.
+inline constexpr uint64_t BOOT_STUB_END = 0x610000000ull;
+
 // True when `a` lies inside some fixed guest module, i.e. "<name>+0x<offset>" is meaningful.
 inline bool guest_va_in_module(uint64_t a) {
-    return (a >= BOOT_EBOOT && a < 0x610000000ull) ||
+    return (a >= BOOT_EBOOT && a < BOOT_STUB_END) ||
            (a >= BOOT_RUNTIME_MODULE_BASE && a < BOOT_RUNTIME_MODULE_END);
+}
+// True when `a` is guest MODULE CODE — in a module but not in the import-stub aperture. Stack scans
+// that recover a guest callsite want this, not guest_va_in_module: a stub address is a real guest
+// address but names prosper's own trampoline, not the caller. Written as one helper because the
+// three sites that used to spell it `guest_va_in_module(a) && a < BOOT_STUB` silently stopped
+// covering the runtime-module aperture the moment it was placed ABOVE the stubs (#639).
+inline bool guest_va_in_module_code(uint64_t a) {
+    return guest_va_in_module(a) && !(a >= BOOT_STUB && a < BOOT_STUB_END);
 }
 
 // Boot the title rooted at `dump_root` (the app0 directory): link the fixed module set (dropping any

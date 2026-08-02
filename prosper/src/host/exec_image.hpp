@@ -13,6 +13,12 @@
 
 namespace prosper {
 
+// The address aperture the import-stub table lives in. install_stubs claims exactly this much from
+// stub_base and append_stubs (#639) grows inside it, so no stub address ever moves and nothing else
+// may be mapped in the window. For the production base this is [BOOT_STUB, BOOT_STUB_END), the same
+// range guest_module_name labels STUB and callback_fs.hpp treats as an import-stub return address.
+inline constexpr uint64_t kStubApertureBytes = 0x10000000ull;   // 256 MiB
+
 // Map the (already relocated) image at img.base as executable. `false`+*err on failure.
 // Call once per module in a linked program.
 bool map_image(const LoadedImage& img, std::string* err);

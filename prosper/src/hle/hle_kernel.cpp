@@ -2920,7 +2920,7 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && guest_return_count < 8; ++i) {
             const uint64_t candidate = stack_words[i];
             // #1659: module range, not the pre-#825 literal.
-            if (!prosper::guest_va_in_module(candidate) || candidate >= prosper::BOOT_STUB) continue;
+            if (!prosper::guest_va_in_module_code(candidate)) continue;
             bool in_guest_module = false;
             for (const UnwindModuleDesc& guest_module : modules)
                 in_guest_module |= candidate >= guest_module.lo && candidate < guest_module.hi;
@@ -3250,20 +3250,21 @@ HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, voi
     // module this can only reproduce what g_exports already answered above, so the pre-linked
     // first-definition-wins order is preserved and only runtime modules are added, last.
     if (name) {
-        uint64_t hit = 0; const char* from = nullptr;
-        {
+        uint64_t hit = 0;
+        std::string from;   // COPY, not c_str(): a concurrent add_module_export_table can realloc
+        {                   // g_mod_exports and free the string buffer the moment the lock drops.
             std::lock_guard<std::mutex> lk(g_mod_exports_mx);
             for (const auto& me : g_mod_exports) {
                 if (!me.nids) continue;
                 auto it = me.nids->find(want);
-                if (it != me.nids->end()) { hit = it->second; from = me.path.c_str(); break; }
+                if (it != me.nids->end()) { hit = it->second; from = me.path; break; }
             }
         }
         if (hit) {
             if (a2) *(uint64_t*)(uintptr_t)a2 = hit;
             if (getenv("PROSPER_SYNCLOG"))
                 fprintf(stderr, "[dlsym] '%s' -> 0x%llx (runtime-loaded %s)\n", name,
-                        (unsigned long long)hit, from ? from : "?");
+                        (unsigned long long)hit, from.c_str());
             return 0;
         }
     }

@@ -2493,6 +2493,7 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     // the empty table and succeed.
     if (n == 0) { g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = 0; return true; }
     uint64_t region = page_up(n * stub_size);
+    if (region > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");
     void* want = (void*)stub_base;
     void* got = prosper_mmap_noreplace(want, region, PROT_READ | PROT_WRITE | PROT_EXEC,
                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -2531,6 +2532,7 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
     // would tear a stub out from under a thread executing it.
     const uint64_t mapped_end = page_up(g_nstubs * g_stub_size);
     const uint64_t need_end   = page_up(n * g_stub_size);
+    if (need_end > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");
     if (need_end > mapped_end) {
         void* want = (void*)(g_stub_base + mapped_end);
         void* got = prosper_mmap_noreplace(want, need_end - mapped_end,

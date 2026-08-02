@@ -20,6 +20,11 @@
 //   * A module needing INITIAL-EXEC TLS (R_X86_64_TPOFF64) cannot be given static TLS space after
 //     threads exist. Those relocations are left unapplied by apply_relocations and reported here,
 //     loudly, rather than silently baked to a wrong offset. General-dynamic TLS works.
+//   * Module identity is the BASENAME, because that is what the PS5's own namespace uses and what
+//     sceKernelLoadStartModule's caller checks first (module_handle_for_path, #147). Two modules
+//     with the same basename in different directories therefore alias to one handle, and a runtime
+//     path whose basename matches a pre-linked module resolves to that module instead of loading.
+//     Pre-existing semantics; #639 only makes them reachable for guest-composed paths.
 #pragma once
 #include <cstdint>
 #include <string>

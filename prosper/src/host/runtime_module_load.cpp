@@ -36,7 +36,14 @@ struct RuntimeModule {
     std::unordered_map<std::string, uint64_t> nids;   // this module's own exports (#147)
 };
 
-std::mutex g_mx;                 // serialises the whole load; also guards everything below
+// RECURSIVE, and that is load-bearing: the lock is held across the module's own module_start /
+// init_array, which is guest code, and a module's module_start calling sceKernelLoadStartModule for
+// a dependency is both legal on PS5 and exactly what a "shell eboot + per-stage PRX" title invites.
+// A plain std::mutex would self-deadlock there — silently, which is strictly worse than the ENOENT
+// this replaced. Re-entrancy is safe because every published pointer stays valid across a nested
+// load: g_loaded is a std::deque (push_back never invalidates a reference to an existing element),
+// so the outer frame's `rm` survives, and a nested load can only ever pop its OWN element.
+std::recursive_mutex g_mx;       // serialises the whole load; also guards everything below
 Program* g_prog = nullptr;
 std::deque<RuntimeModule> g_loaded;
 std::unordered_map<std::string, uint32_t> g_nid_to_slot;   // NID -> import stub-slot index
@@ -80,8 +87,13 @@ uint64_t call_module_entry(uint64_t fn, uint64_t args, uint64_t argp, uint64_t g
 } // namespace
 
 void runtime_module_loader_init(Program* p) {
-    std::lock_guard<std::mutex> lk(g_mx);
+    std::lock_guard<std::recursive_mutex> lk(g_mx);
+    // Reset EVERY piece of loader state, not just the tables rebuilt below: a second boot_program in
+    // one process would otherwise inherit the previous program's loaded modules and hand out their
+    // stale handles. (No caller does that today; making the reset total is cheaper than the note.)
     g_prog = p;
+    g_loaded.clear();
+    g_next_base_slot = 0;
     g_nid_to_slot.clear();
     g_tls_symbols.clear();
     if (!p) return;
@@ -101,14 +113,14 @@ void runtime_module_loader_init(Program* p) {
 }
 
 size_t runtime_loaded_module_count() {
-    std::lock_guard<std::mutex> lk(g_mx);
+    std::lock_guard<std::recursive_mutex> lk(g_mx);
     return g_loaded.size();
 }
 
 uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64_t argp,
                                    uint64_t guest_fs, int32_t* out_res, uint64_t* out_handle) {
     if (!guest_path || !*guest_path) return kEinval;
-    std::lock_guard<std::mutex> lk(g_mx);
+    std::lock_guard<std::recursive_mutex> lk(g_mx);
     if (!g_prog) {
         // No booted program to load against (a unit test, or a caller that never ran
         // boot_program). Keep #146's honest answer for a path that is not in the linked set rather
@@ -154,13 +166,30 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
                 guest_path, BOOT_RUNTIME_MODULE_SLOTS);
         return kEnomem;
     }
+    // Claim the base slot NOW, before anything below can fail. A failure path that left the slot
+    // free would let the next module map at the same base while this one's rolled-back-but-not-
+    // reverted state (a TLS template whose init_va points into that memory) still named it.
+    // Burning a slot on a failed load is the cheap, safe side of that trade.
     const uint64_t base =
         BOOT_RUNTIME_MODULE_BASE + (uint64_t)g_next_base_slot * BOOT_RUNTIME_MODULE_STRIDE;
+    g_next_base_slot++;
 
     g_loaded.emplace_back();
     RuntimeModule& rm = g_loaded.back();
-    // Publish nothing until the module is fully live; on any failure below, pop it back off.
-    auto abandon = [&](uint64_t err) { g_loaded.pop_back(); return err; };
+    // Publish nothing until the module is fully live. On any failure below, undo in reverse order:
+    // pop the module, drop any TLS template it appended (re-publishing the shorter list is safe —
+    // nothing was relocated against that module id), and forget any NID it claimed a stub slot for.
+    const size_t tls_templates_before = g_prog->tls_templates.size();
+    std::vector<std::string> claimed_nids;
+    auto abandon = [&](uint64_t err) {
+        g_loaded.pop_back();
+        if (g_prog->tls_templates.size() > tls_templates_before) {
+            g_prog->tls_templates.resize(tls_templates_before);
+            set_tls_modules(g_prog->tls_templates.data(), g_prog->tls_templates.size());
+        }
+        for (const auto& nid : claimed_nids) g_nid_to_slot.erase(nid);
+        return err;
+    };
 
     rm.host_path = host_path;
     rm.guest_path = guest_path;
@@ -173,10 +202,13 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
         fprintf(stderr, "[loadmod] '%s': %s -> ENOEXEC\n", guest_path, e.c_str());
         return abandon(kEnoexec);
     }
-    if (img.mem.size() > BOOT_RUNTIME_MODULE_STRIDE) {
+    // The module occupies [base + min_vaddr, base + max_vaddr), so max_vaddr — not the image byte
+    // count — is what has to fit the slot: a nonzero min_vaddr would otherwise pass this and still
+    // run into the next slot.
+    if (img.max_vaddr > BOOT_RUNTIME_MODULE_STRIDE) {
         fprintf(stderr,
-                "[loadmod] '%s': image is 0x%llx bytes, larger than the 0x%llx runtime module slot "
-                "(#639) -> ENOMEM\n", guest_path, (unsigned long long)img.mem.size(),
+                "[loadmod] '%s': image spans 0x%llx bytes of VA, larger than the 0x%llx runtime "
+                "module slot (#639) -> ENOMEM\n", guest_path, (unsigned long long)img.max_vaddr,
                 (unsigned long long)BOOT_RUNTIME_MODULE_STRIDE);
         return abandon(kEnomem);
     }
@@ -224,6 +256,7 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
             const uint32_t idx = (uint32_t)(first_new_slot + new_slots.size());
             new_slots.push_back({ imp.lib_name, imp.nid });
             slot = g_nid_to_slot.emplace(imp.nid, idx).first;
+            claimed_nids.push_back(imp.nid);   // rolled back by abandon() if the load fails
         }
         img.import_addr[imp.sym_index] = g_prog->stub_base + (uint64_t)slot->second * g_prog->stub_size;
         stubbed++;
@@ -245,7 +278,6 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
         fprintf(stderr, "[loadmod] '%s': %s -> ENOMEM\n", guest_path, e.c_str());
         return abandon(kEnomem);
     }
-    g_next_base_slot++;
     rm.lo = base + img.min_vaddr;
     rm.hi = base + img.max_vaddr;
 
@@ -267,11 +299,16 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
     ud.name = rm.name.c_str();
     const size_t unwind_index = add_unwind_module(ud);
     rm.handle = add_module_export_table(rm.host_path, &rm.nids);
-    if (rm.handle - kSceModuleHandleBase != unwind_index)
+    if (rm.handle - kSceModuleHandleBase != unwind_index) {
+        // Cannot happen while both appends are serialised by g_mx and nothing else appends after
+        // boot — but if it ever did, every address-derived handle from here on would resolve
+        // against a different module than it names. Refuse the load rather than continue with one.
         fprintf(stderr,
                 "[loadmod] '%s': INTERNAL — unwind index %zu != export index %llu; an "
-                "address-derived module handle now names a different module (#639)\n",
+                "address-derived module handle would name a different module (#639) -> ENOEXEC\n",
                 guest_path, unwind_index, (unsigned long long)(rm.handle - kSceModuleHandleBase));
+        return abandon(kEnoexec);
+    }
 
     fprintf(stderr,
             "[loadmod] loaded '%s' -> %s @ 0x%llx (%zu exports, %zu imports: %zu cross-module, "

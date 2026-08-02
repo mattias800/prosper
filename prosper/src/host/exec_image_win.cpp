@@ -1149,9 +1149,19 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     dispatch_init(&slots, g_nid_db);
 
     uint64_t n = slots.size();
+    // RESERVE the whole stub aperture up front, then COMMIT only the pages the current slots need.
+    // Windows places a MEM_RESERVE at 64 KiB allocation granularity (lpAddress rounds DOWN), so a
+    // later reservation starting at the 4 KiB-aligned end of this one would round back INTO it and
+    // fail with ERROR_INVALID_ADDRESS — append_stubs (#639) could then never extend the table.
+    // MEM_COMMIT is page-granular inside an existing reservation, so growth is committing, not
+    // reserving. The aperture is the same [BOOT_STUB, BOOT_STUB_END) window guest_module_name
+    // already labels STUB and callback_fs.hpp already treats as stubs-only.
+    if (!VirtualAlloc((void*)(uintptr_t)stub_base, kStubApertureBytes, MEM_RESERVE, PAGE_NOACCESS))
+        return fail("VirtualAlloc stub aperture reservation failed");
     if (n == 0) { g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = 0; return true; }
     uint64_t region = page_up(n * stub_size);
-    void* got = VirtualAlloc((void*)(uintptr_t)stub_base, region, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (region > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");
+    void* got = VirtualAlloc((void*)(uintptr_t)stub_base, region, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!got || got != (void*)(uintptr_t)stub_base) return fail("VirtualAlloc stub region failed");
 
     uint8_t* base = (uint8_t*)got;
@@ -1179,14 +1189,15 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
     const uint64_t n = slots.size();
     if (first_new > n || first_new != g_nstubs) return fail("append_stubs: slot table is not an extension");
     if (first_new == n) return true;
-    // Commit only the pages the new slots need. The already-committed pages are never re-reserved:
-    // relocated guest code holds addresses inside them.
+    // Commit only the pages the new slots need, inside the aperture install_stubs reserved. The
+    // already-committed pages are never re-committed with different protection: relocated guest
+    // code holds addresses inside them.
     const uint64_t mapped_end = page_up(g_nstubs * g_stub_size);
     const uint64_t need_end   = page_up(n * g_stub_size);
+    if (need_end > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");
     if (need_end > mapped_end) {
         void* want = (void*)(uintptr_t)(g_stub_base + mapped_end);
-        void* got = VirtualAlloc(want, need_end - mapped_end, MEM_RESERVE | MEM_COMMIT,
-                                 PAGE_EXECUTE_READWRITE);
+        void* got = VirtualAlloc(want, need_end - mapped_end, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (!got || got != want) return fail("VirtualAlloc stub region extension failed");
     }
     for (uint64_t i = first_new; i < n; i++) {
