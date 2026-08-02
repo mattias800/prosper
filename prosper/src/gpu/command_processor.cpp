@@ -189,15 +189,24 @@ const WriteTrap& write_trap() {
     static const WriteTrap t = [] {
         WriteTrap w;
         const char* e = getenv("PROSPER_WRITE_TRAP");
-        if (!e || !*e) return w;
+        if (!e) return w;                              // unset: the trap is simply not in use
         // Parse loudly. This instrument's headline result is "zero hits", so a silently disarmed
-        // trap reads exactly like a hard negative — the worst possible failure mode for it.
+        // trap reads exactly like a hard negative — the worst possible failure mode for it. An
+        // EMPTY value is the likeliest way to get there by accident (PROSPER_WRITE_TRAP=$UNSET),
+        // so it is reported rather than treated like "unset".
+        if (!*e) {
+            fprintf(stderr, "[write-trap] NOT ARMED — PROSPER_WRITE_TRAP is set but empty\n");
+            return w;
+        }
         const char* p = e;
         bool bad = false;
         while (*p) {
             char* end = nullptr;
+            // Reject a bare sign or a stray radix prefix before strtoull's lenient reading of them
+            // turns `0x` (a truncated paste) into the value 0 — the noisiest possible trap value.
+            if (!(*p >= '0' && *p <= '9')) { bad = true; break; }
             const unsigned long long v = strtoull(p, &end, 0);
-            if (end == p) { bad = true; break; }
+            if (end == p || (end[0] && end[0] != ',')) { bad = true; break; }
             if (v > 0xffffffffull) {
                 fprintf(stderr, "[write-trap] REFUSED 0x%llx: values are 32-bit dwords\n",
                         (unsigned long long)v);
@@ -207,7 +216,13 @@ const WriteTrap& write_trap() {
                         (unsigned long long)v, kWriteTrapMax);
                 bad = true;
             } else {
-                w.v[w.n++] = (uint32_t)v;
+                // A duplicate would silently never advance its own counter (write_trap_index
+                // returns the first match), so drop it visibly rather than arming a dead slot.
+                bool dup = false;
+                for (unsigned i = 0; i < w.n; i++) dup = dup || w.v[i] == (uint32_t)v;
+                if (dup) fprintf(stderr, "[write-trap] IGNORED duplicate 0x%llx\n",
+                                 (unsigned long long)v);
+                else     w.v[w.n++] = (uint32_t)v;
             }
             if (*end != ',') { p = end; break; }
             p = end + 1;

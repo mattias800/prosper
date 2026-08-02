@@ -731,24 +731,40 @@ int main() {
               "ArcRunner shape: the same fence with no outstanding init is suppressed");
     }
 
-    // #1226 PROSPER_WRITE_TRAP, both arms and every scanned packet kind. A hard negative from this
-    // instrument is only meaningful if a match would have counted, so assert that the armed value
-    // counts on each path and that an adjacent value does not — a refactor that drops one call site
-    // otherwise leaves the documented coverage silently false.
+    // #1226 PROSPER_WRITE_TRAP, both arms on every payload-carrying scan site. A hard negative from
+    // this instrument is only meaningful if a match would have counted, so assert that the armed
+    // value counts on each path and that an adjacent value does not — a refactor that drops one call
+    // site otherwise leaves the documented coverage silently false. REL3 and EVENT_WRITE are the two
+    // sites deliberately not covered: both store gpu_clock64(), so a test cannot choose their value.
     {
         struct alignas(0x20) TrapLabel { uint64_t value; uint64_t pad[3]; } label{};
         const uint64_t addr = (uint64_t)(uintptr_t)&label;
-        // The scanned payload is the same 4 bytes each path stores, so a hit also pins the store.
+        uint64_t copy_source = 0;
+        const uint64_t src = (uint64_t)(uintptr_t)&copy_source;
+        // The scanned payload is the same low dword each path stores, so a hit also pins the store.
         auto rel1 = [&](uint32_t v) {
             GpuState st;
             uint32_t p[7] = {PM4(7, IT_NOP, R_RELEASE_MEM), (uint32_t)addr, (uint32_t)(addr >> 32),
                              1, v, 0, 4};
             run_cb(p, 7, st);
         };
+        auto rel2 = [&](uint32_t v) {   // data_sel 2: the 64-bit fence leg
+            GpuState st;
+            uint32_t p[7] = {PM4(7, IT_NOP, R_RELEASE_MEM), (uint32_t)addr, (uint32_t)(addr >> 32),
+                             2, v, 0, 4};
+            run_cb(p, 7, st);
+        };
         auto dma_imm = [&](uint32_t v) {
             GpuState st;
             uint32_t p[7] = {PM4(7, IT_NOP, R_DMA_DATA), (uint32_t)addr, (uint32_t)(addr >> 32),
                              v, 0, 4, 0x303};
+            run_cb(p, 7, st);
+        };
+        auto dma_copy = [&](uint32_t v) {   // a 64-bit source address selects the copy form
+            copy_source = v;
+            GpuState st;
+            uint32_t p[7] = {PM4(7, IT_NOP, R_DMA_DATA), (uint32_t)addr, (uint32_t)(addr >> 32),
+                             (uint32_t)src, (uint32_t)(src >> 32), 4, 0};
             run_cb(p, 7, st);
         };
         auto wdata = [&](uint32_t v) {
@@ -766,12 +782,16 @@ int main() {
             CHECK(prosper_gpu_write_trap_matches() == before + 1 &&
                   (uint32_t)label.value == 0x5a5a0001u, counts);
         };
-        both_arms("PROSPER_WRITE_TRAP/RELEASE_MEM ignores a value adjacent to the armed one",
-                  "PROSPER_WRITE_TRAP/RELEASE_MEM counts the armed value, and the store lands", rel1);
-        both_arms("PROSPER_WRITE_TRAP/DMA_DATA ignores a value adjacent to the armed one",
-                  "PROSPER_WRITE_TRAP/DMA_DATA counts the armed value, and the store lands", dma_imm);
-        both_arms("PROSPER_WRITE_TRAP/WRITE_DATA ignores a value adjacent to the armed one",
-                  "PROSPER_WRITE_TRAP/WRITE_DATA counts the armed value, and the store lands", wdata);
+        both_arms("PROSPER_WRITE_TRAP/REL1 ignores a value adjacent to the armed one",
+                  "PROSPER_WRITE_TRAP/REL1 counts the armed value, and the store lands", rel1);
+        both_arms("PROSPER_WRITE_TRAP/REL2 ignores a value adjacent to the armed one",
+                  "PROSPER_WRITE_TRAP/REL2 counts the armed value, and the store lands", rel2);
+        both_arms("PROSPER_WRITE_TRAP/DMA-imm ignores a value adjacent to the armed one",
+                  "PROSPER_WRITE_TRAP/DMA-imm counts the armed value, and the store lands", dma_imm);
+        both_arms("PROSPER_WRITE_TRAP/DMA-copy ignores a value adjacent to the armed one",
+                  "PROSPER_WRITE_TRAP/DMA-copy counts the armed value, and the store lands", dma_copy);
+        both_arms("PROSPER_WRITE_TRAP/WDATA ignores a value adjacent to the armed one",
+                  "PROSPER_WRITE_TRAP/WDATA counts the armed value, and the store lands", wdata);
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
