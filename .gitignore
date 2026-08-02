@@ -54,3 +54,6 @@ frame_*.png
 # Python bytecode from tools/ scripts (e.g. tools/hostprof, tools/snapshot)
 __pycache__/
 *.pyc
+
+# Local per-game launch scripts (prosper/scripts/play/) — convenience only, not project state.
+prosper/scripts/play/
