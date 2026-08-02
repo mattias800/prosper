@@ -84,7 +84,17 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   on Plucky the `mode=0` fraction is *higher* while the world renders correctly (88-95%) than while the
   screen is black (83%), because `CB_DISABLE` is the depth/shadow prepass. Reading one phase alone yields a
   confident wrong answer. `--selftest` needs no capture. See `tools/colorstate/README.md`.
-- **`spv_validate/`** — `spirv-val` wrapper for recompiled SPIR-V.
+- **`spv_validate/`** — the strict SPIR-V validation gate (ctest `spv_validate`). It emits one
+  representative module from **every** SPIR-V-producing entry point declared in any header under
+  `src/gpu/` or `frontends/shared/` (recursively, under either return-type spelling the tree uses)
+  and runs `spirv-val --target-env vulkan1.1` on each. It fails when a module is invalid, when
+  `spirv-val` is not installed (it used to report PASS — see #1711), and when a declared emitter did
+  not produce a validated module. Coverage is recorded at runtime by passing the emitter's name to
+  `dump()`, so a call whose result is discarded does not count. Adding an emitter therefore means
+  adding a module; a name that emits no SPIR-V goes in `kNotEmitters` with a reason, and a genuine
+  gap goes in `kKnownGaps` with its issue — that list is meant to stay empty.
+  **`spirv-val` must be on `PATH`** (`spirv-tools`, `mingw-w64-ucrt-x86_64-spirv-tools`, or
+  `brew install spirv-tools`); its absence fails the suite rather than skipping the gate.
 - **`docs/check_numbered_table.py`** — validate Markdown tables that other documents cite by row
   number. Two classes: **structure** (always on) rejects a blank line that splits a table, which
   in Markdown silently renders everything after it as a *separate* table; **`--sequential`**

@@ -108,7 +108,11 @@ audio, and graphics stack. See [Game compatibility](COMPATIBILITY.md) for exact 
   constant/descriptor loads, `MUBUF` vertex-fetch + load/store, `MIMG` `image_sample`/`_l`/`_lz`/
   `image_load`, `LDS` + barriers, `EXP` render-target/position/param exports, and `VINTRP`
   interpolation. Descriptors that spill into the **Extended User Data (EUD)** area are resolved. Every
-  emitted shader is strictly `spirv-val`-gated.
+  SPIR-V-emitting entry point declared in the graphics headers — the recompiler stages and the
+  hand-assembled compute modules alike — is `spirv-val`-gated in CI by `tools/spv_validate`, which
+  fails both when a module is invalid and when a new emitter is added without one. (The pre-baked
+  glslang modules in `tests/` are fixtures, not emitters, and are covered by the Vulkan validation
+  layer instead.)
 - ✅ **Texture decode:** GFX10 `SW_4KB_S` / `SW_64KB_S` de-swizzle for all element sizes (1/2/4/8/16 B,
   derived from the authoritative addrlib table) plus BC1–BC7 and BC6H block decompression, honoring
   the T# format, `DST_SEL` channel swizzle, and the paired S# sampler (filter / wrap / anisotropy /
@@ -144,12 +148,14 @@ Windows/MinGW), structured logs, and purpose-built tracing tooling — never by 
 ### Linux
 
 Requires a C++20 compiler, CMake, and Ninja. A Vulkan loader is needed for the graphics tests
-(the CI/headless path uses the `llvmpipe` software ICD). The native AvPlayer backend uses FFmpeg
-for MP4 demux/audio conversion and VA-API for hardware video decode. On Ubuntu/Debian:
+(the CI/headless path uses the `llvmpipe` software ICD). `spirv-tools` provides `spirv-val`, which
+the `spv_validate` test requires — it is the strict SPIR-V validation gate and fails rather than
+skipping when the validator is missing. The native AvPlayer backend uses FFmpeg for MP4
+demux/audio conversion and VA-API for hardware video decode. On Ubuntu/Debian:
 
 ```sh
 sudo apt install ninja-build pkg-config libvulkan-dev libavformat-dev libavcodec-dev \
-  libavutil-dev libswresample-dev libswscale-dev libva-dev
+  libavutil-dev libswresample-dev libswscale-dev libva-dev spirv-tools
 ```
 
 ```sh
@@ -171,7 +177,8 @@ The supported Windows toolchain is 64-bit MinGW-w64 UCRT. In an MSYS2 UCRT64 she
 
 ```sh
 pacman -S --needed git mingw-w64-ucrt-x86_64-gcc \
-  mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+  mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja \
+  mingw-w64-ucrt-x86_64-spirv-tools
 cmake -S prosper -B prosper/build-windows-core -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE
 cmake --build prosper/build-windows-core

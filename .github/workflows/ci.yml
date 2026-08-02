@@ -15,12 +15,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # spirv-tools is what makes the `spv_validate` test a validation gate rather than a
+      # recompile smoke test. It is on no GitHub runner image, and this workflow never installed
+      # it, so that test reported "PASS (recompiled; spirv-val not found)" with status 0 on every
+      # CI run it has ever had — while CLAUDE.md and both READMEs described prosper's shaders as
+      # strictly spirv-val-gated. #1711 is what shipped through the gap. spv_validate now fails
+      # when the validator is absent, so removing this line breaks the job instead of silently
+      # switching the gate off again.
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config libavformat-dev libavcodec-dev \
             libavutil-dev libswresample-dev libswscale-dev libva-dev \
-            libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
+            libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers spirv-tools
 
       # #1675: Vulkan was disabled here because it was never installed, not by choice — and that
       # silently removed 27 tests (~1,700 assertions) from every "green" CI run, including every
@@ -200,11 +207,14 @@ jobs:
         with:
           msystem: UCRT64
           update: true
+          # spirv-tools: the `spv_validate` test runs on every platform and requires spirv-val
+          # (see the Linux job's dependency note).
           install: >-
             git
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-spirv-tools
 
       - name: Configure
         shell: msys2 {0}
@@ -317,8 +327,11 @@ jobs:
       - name: Install dependencies
         # Rosetta 2 is not preinstalled on arm64 runners; it's needed to RUN the x86_64 ctest binaries
         # (building them is a normal cross-arch target and needs no translation).
+        # spirv-tools: the `spv_validate` test runs on every platform and requires spirv-val (see
+        # the Linux job's dependency note). The validator is invoked as a subprocess, so the
+        # native arm64 build serves the x86_64 test binaries fine.
         run: |
-          brew install ninja
+          brew install ninja spirv-tools
           softwareupdate --install-rosetta --agree-to-license
 
       - name: Configure

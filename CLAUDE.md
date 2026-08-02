@@ -210,7 +210,8 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   read that file, and `rm -rf` scratch that is a day or more old. Leave `/tmp/claude-*` and anything
   touched in the last few hours alone — other agents are live.
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth;
-  shaders are `spirv-val`-gated; rendered frames are asserted by pixels, hashes, or routed content
+  every SPIR-V emitter is `spirv-val`-gated in CI (`tools/spv_validate`, §4c — one representative
+  module per emitter path, not per game shader); rendered frames are asserted by pixels, hashes, or routed content
   metrics. Snapshots are a **release-time regression inventory**, not a day-to-day development or merge
   gate. Before every release, run the full local-only matrix with
   `python3 tools/snapshot/snapshot.py check` against the release candidate and review every result.

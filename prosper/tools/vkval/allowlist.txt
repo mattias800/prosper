@@ -36,14 +36,15 @@
 # The two ids the CI environment does not produce are the two marked environment-dependent. Neither
 # is absent because it was fixed: `maintenance4-08602` is a newer check than layers 1.3.275, and
 # `size-01389` cannot trigger on lavapipe, whose nonCoherentAtomSize is 1. Both are real on hardware.
+#
+# Amended by #1726, which FIXED `VUID-VkShaderModuleCreateInfo-pCode-08737` and deleted its entry:
+# the baseline is now 6 ids on the CI runner and 8 on Fedora/RADV (measured there at 49 messages).
+# Recorded because this header is what a future scan is compared against, and the rules below call
+# an unexplained id-count drop far more likely to be the scan breaking than a defect being fixed.
 
 # ---- #1710: compute pipeline layout has no push-constant range, and nothing is ever pushed -----
 VUID-VkComputePipelineCreateInfo-layout-07987 | required | game_compute_exec, game_compute_exec_no_adaptive_storage_result | Compute module declares a PushConstant block while the layout declares no range (#1710)
 VUID-vkCmdDispatch-maintenance4-08602 | environment-dependent | game_compute_exec, game_compute_exec_no_adaptive_storage_result | Same root cause as 07987: the shader reads push constants that vkCmdPushConstants never wrote (#1710). Absent on the CI runner because validation layers 1.3.275 do not implement this check.
-
-# ---- #1711: our own emitter produces SPIR-V that spirv-val rejects ------------------------------
-# Scoped deliberately: this VUID is VVL's identity for EVERY spirv-val error, in every stage.
-VUID-VkShaderModuleCreateInfo-pCode-08737 | required | game_compute_exec, game_compute_exec_no_adaptive_storage_result | OpAccessChain result type disagrees with the OpTypeVector it indexes; the claimed spirv-val gate does not cover this path (#1711)
 
 # ---- #1712: Int64 capability declared, shaderInt64 never enabled on any device ------------------
 VUID-VkShaderModuleCreateInfo-pCode-08740 | required | rdna2_to_spirv_exec, texture_sample_render | Recompiled 64-bit integer ops force OpCapability Int64, which no device-creation path in the tree requests (#1712)

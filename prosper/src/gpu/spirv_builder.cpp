@@ -139,12 +139,31 @@ std::vector<uint32_t> build_compute_compare_uvec4() {
     const uint32_t t_v3u = e.id(), t_v4u = e.id(), t_v4bool = e.id();
     const uint32_t t_ptr_in_v3u = e.id(), v_gid = e.id();
     const uint32_t t_rta = e.id(), t_buffer = e.id(), t_ptr_buffer = e.id();
-    const uint32_t v_a = e.id(), v_b = e.id(), v_flag = e.id();
+    const uint32_t v_a = e.id(), v_b = e.id();
     const uint32_t t_ptr_buffer_u32 = e.id(), t_ptr_buffer_v4u = e.id();
+    // The changed-flag buffer is its own block. It is bound as a single 4-byte range (one dword per
+    // compare target — see live_compute.cpp's compare_flags descriptor), so it is NOT the uvec4
+    // runtime array a[]/b[] use. Declaring it as one carried a type-checking defect for the flag's
+    // access chain (#1711) and described a 16-byte-stride array over a 4-byte binding.
+    //
+    // That second half is a correctness bug, not only a conformance one, which is why this is a new
+    // block rather than one more index on the old chain. live_compute.cpp requires and enables
+    // `robustBufferAccess`. Under the old declaration the flag's runtime array had ArrayStride 16
+    // over a 4-byte bound range, so its robust length is floor(4/16) = 0 and element 0 is OUT OF
+    // BOUNDS: a conformant driver is permitted to discard the OpAtomicExchange entirely, leaving
+    // the comparison's "results differ" flag stuck at zero. That flag is what live_compute.cpp
+    // reads back as `gpu_result_unchanged`, and a false "unchanged" makes it SKIP writing the
+    // dispatch's result back to guest memory altogether — not merely skip a baseline update.
+    // Adding a component index would have kept that property. One uint in its own block removes it.
+    const uint32_t t_flag = e.id(), t_ptr_flag = e.id(), v_flag = e.id();
     const uint32_t t_push = e.id(), t_ptr_push = e.id(), v_push = e.id();
     const uint32_t t_ptr_push_u32 = e.id();
-    const uint32_t c_u0 = e.id(), c_u1 = e.id(), c_scope_device = e.id();
-    const uint32_t c_semantics_none = e.id();
+    // SPIR-V requires non-aggregate constants to be unique, so the Device scope (1) and the
+    // "no semantics" mask (0) reuse the same two %uint constants rather than declaring duplicates.
+    // spirv-val does not enforce uniqueness and drivers accept it, which is precisely why a module
+    // this file emits should not rely on that.
+    const uint32_t c_u0 = e.id(), c_u1 = e.id();
+    const uint32_t c_scope_device = c_u1, c_semantics_none = c_u0;
     const uint32_t f_main = e.id(), lbl_entry = e.id(), lbl_compare = e.id();
     const uint32_t lbl_different = e.id(), lbl_equal = e.id(), lbl_done = e.id();
 
@@ -162,6 +181,8 @@ std::vector<uint32_t> build_compute_compare_uvec4() {
     Emitter::put(e.deco, Op_Decorate, {t_rta, Dec_ArrayStride, 16});
     Emitter::put(e.deco, Op_MemberDecorate, {t_buffer, 0, Dec_Offset, 0});
     Emitter::put(e.deco, Op_Decorate, {t_buffer, Dec_Block});
+    Emitter::put(e.deco, Op_MemberDecorate, {t_flag, 0, Dec_Offset, 0});
+    Emitter::put(e.deco, Op_Decorate, {t_flag, Dec_Block});
     for (const auto [variable, binding] :
          {std::pair{v_a, 0u}, std::pair{v_b, 1u}, std::pair{v_flag, 2u}}) {
         Emitter::put(e.deco, Op_Decorate, {variable, Dec_DescriptorSet, 0});
@@ -185,17 +206,17 @@ std::vector<uint32_t> build_compute_compare_uvec4() {
     Emitter::put(e.types, Op_TypePointer, {t_ptr_buffer, SC_StorageBuffer, t_buffer});
     Emitter::put(e.types, Op_Variable, {t_ptr_buffer, v_a, SC_StorageBuffer});
     Emitter::put(e.types, Op_Variable, {t_ptr_buffer, v_b, SC_StorageBuffer});
-    Emitter::put(e.types, Op_Variable, {t_ptr_buffer, v_flag, SC_StorageBuffer});
     Emitter::put(e.types, Op_TypePointer, {t_ptr_buffer_u32, SC_StorageBuffer, t_u32});
     Emitter::put(e.types, Op_TypePointer, {t_ptr_buffer_v4u, SC_StorageBuffer, t_v4u});
+    Emitter::put(e.types, Op_TypeStruct, {t_flag, t_u32});
+    Emitter::put(e.types, Op_TypePointer, {t_ptr_flag, SC_StorageBuffer, t_flag});
+    Emitter::put(e.types, Op_Variable, {t_ptr_flag, v_flag, SC_StorageBuffer});
     Emitter::put(e.types, Op_TypeStruct, {t_push, t_u32});
     Emitter::put(e.types, Op_TypePointer, {t_ptr_push, SC_PushConstant, t_push});
     Emitter::put(e.types, Op_Variable, {t_ptr_push, v_push, SC_PushConstant});
     Emitter::put(e.types, Op_TypePointer, {t_ptr_push_u32, SC_PushConstant, t_u32});
     Emitter::put(e.types, Op_Constant, {t_u32, c_u0, 0});
     Emitter::put(e.types, Op_Constant, {t_u32, c_u1, 1});
-    Emitter::put(e.types, Op_Constant, {t_u32, c_scope_device, 1});
-    Emitter::put(e.types, Op_Constant, {t_u32, c_semantics_none, 0});
 
     Emitter::put(e.code, Op_Function, {t_void, f_main, FC_None, t_fn});
     Emitter::put(e.code, Op_Label, {lbl_entry});
@@ -233,8 +254,10 @@ std::vector<uint32_t> build_compute_compare_uvec4() {
     // changed words update themselves while the flag preserves the CPU-visible reduction.
     Emitter::put(e.code, Op_Store, {p_b, a});
     const uint32_t p_flag = e.id();
-    Emitter::putv(e.code, Op_AccessChain,
-                  {t_ptr_buffer_u32, p_flag, v_flag, c_u0, c_u0});
+    // One index: member 0 of the flag block, which IS the uint the atomic exchanges. Indexing
+    // v_flag as if it were the uvec4 array walked struct -> runtime array -> uvec4 and then claimed
+    // a uint pointer for the result, which spirv-val rejects (#1711).
+    Emitter::putv(e.code, Op_AccessChain, {t_ptr_buffer_u32, p_flag, v_flag, c_u0});
     const uint32_t old_flag = e.id();
     Emitter::put(e.code, Op_AtomicExchange,
                  {t_u32, old_flag, p_flag, c_scope_device, c_semantics_none, c_u1});

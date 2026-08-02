@@ -68,8 +68,10 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
     NSA split-address coords), `LDS`+`s_barrier`, `VINTRP`; and trivial (all-DWORD) `SDWA`. **~86%
     instruction coverage; 30 of 41 real game shaders fully recompile in-context** — every bring-up-
     critical class (position/blit/clear, textured, interpolated, image-copy, integer-divide). All
-    strictly `spirv-val`-validated and, where a harness exists, execution-differential-tested on real
-    Vulkan (`recompile_coverage`/`shader_histo`/`test_rdna2_to_spirv`). Remaining 11 shaders need deep
+    `spirv-val`-validated when measured, and, where a harness exists, execution-differential-tested
+    on real Vulkan (`recompile_coverage`/`shader_histo`/`test_rdna2_to_spirv`). That was a measurement
+    of those shaders, not a standing gate: the standing gate is `tools/spv_validate`, which validates
+    one representative module per emitter path (`docs/VERIFICATION.md` §4c). Remaining 11 shaders need deep
     features only: **structured control-flow reconstruction** (uniform branches + loops → SPIR-V
     if/else + `OpPhi`), **NGG** primitive-shader preambles (`s_sendmsg`/`exp prim`), and cube/MSAA
     image dims — none needed for the initial frame.
