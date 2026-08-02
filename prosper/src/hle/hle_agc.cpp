@@ -235,6 +235,12 @@ void dcb_report_full(const AgcDcb* dcb, uint32_t need) {
             (void*)(uintptr_t)dcb->callback);
 }
 void dcb_report_window(const AgcDcb* dcb, uint32_t n, uint32_t op, uint32_t r) {
+    // begin_packet is the hottest path in the HLE (millions of packets per minute), so do nothing at
+    // all — not even the two thread-local stores that name the builder for the buffer-full report —
+    // unless one of the probes is armed. One relaxed load of a function-local static guard is the
+    // entire cost of an unarmed run.
+    static const bool armed = dcb_diag_full() || dcb_diag_win() != 0;
+    if (!armed) return;
     g_dcb_diag_r = r; g_dcb_diag_op = op;   // remembered for the buffer-full report just below
     const uint32_t limit = dcb_diag_win();
     if (!limit || !dcb || !dcb->bottom || !dcb->cursor_down) return;
