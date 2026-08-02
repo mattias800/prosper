@@ -126,7 +126,7 @@ ceiling with evictions exactly equal to misses (+7,960 / +7,960 over 9 s, 45 % m
 thrash in which one buffer is destroyed for every one created, with the eviction victim taken as
 `available.begin()` on an `unordered_map`, i.e. an arbitrary bucket rather than an LRU.
 
-### The buffer pool's 256 MiB default is 37.7 % of the frame
+### The buffer pool's 256 MiB default is ~35 % of the frame
 
 `render_host_buffer_pool_limit()` defaults to a **fixed 256 MiB**. Blue Prince's real host-staging
 working set is **974 MiB**, so on a 3D title the pool degenerates into an allocator: evictions equal
@@ -138,20 +138,28 @@ settle at 974.0 MiB / 503 buffers with **503 misses and zero evictions**.
 
 | term | 256 MiB | 2048 MiB | delta | within-treatment | between |
 |---|---:|---:|---:|---:|---:|
-| `measured` | 203.06 | 126.58 | **-37.7 %** | 10.62 | 76.48 |
-| `res_buffer` | 113.10 | 41.62 | -63.2 % | 16.76 | 71.48 |
-| `copy` | 92.54 | 33.44 | -63.9 % | 18.19 | 59.10 |
-| `acquire` | 13.65 | 1.46 | -89.3 % | 0.95 | 12.20 |
-| `cleanup` | 14.77 | 3.04 | -79.4 % | 0.21 | 11.72 |
-| draws | 2218.15 | 2145.00 | +3.3 % | 71.10 | 73.15 |
+| `measured` | 203.06 | 125.98 | -38.0 % raw | 10.62 | 77.09 |
+| `res_buffer` | 113.10 | 41.50 | -63.3 % | 16.76 | 71.60 |
+| `copy` | 92.54 | 33.27 | -64.0 % | 18.19 | 59.27 |
+| `acquire` | 13.65 | 1.44 | -89.5 % | 0.95 | 12.22 |
+| `cleanup` | 14.77 | 2.95 | -80.1 % | 0.14 | 11.82 |
+| draws | 2218.15 | 2109.47 | +4.9 % | 35.10 | 108.67 |
 
-Every timing term separates far beyond its within-treatment spread, while `draws` — the quantity the
-lever cannot touch — has within (71.10) equal to between (73.15), so the 3.3 % scene-weight
-difference is cycle noise and not the explanation. Per draw: 0.0915 -> 0.0590 ms, **-35.6 %**.
+Every timing term separates far beyond its within-treatment spread. **The draws row does not**: the
+2048 arms sat at 2109/2110 draws against the 256 arms' 2201/2236, a systematic ~4.9 % lighter scene
+(an expected selection effect — the faster arm covers more of a fixed-duration route and samples
+different moments). So the raw -38.0 % overstates it. **Normalised per draw, 0.0915 -> 0.0597 ms,
+the honest figure is -34.8 %** — quote that one.
+
 Controls: per-submit byte volume is identical between arms (`logical=1,644.0 / 1,764.4 MiB`,
-`materialized=0.0 MiB`), and minor faults sampled from `/proc/<pid>/stat` fall from 123,079/s to
-52,106/s. The per-fault cost that would be needed to explain the whole `copy` delta (~3.1 us) is
-above a generic anonymous-page fault, so the mechanism is recorded as leading, not settled.
+`materialized=0.0 MiB`), so the 2048 arm copies the same bytes faster. Minor faults sampled from
+`/proc/<pid>/stat` (no ptrace, no perturbation) run at 150,911/s for the 256 arm against 48,827/s
+and 97,398/s for the two 2048 arms — roughly 31,400 versus 6,200 and 12,200 per submit. The direction
+holds, but **the two 2048 arms differ from each other by 2x**, nearly the size of the gap being
+attributed, and explaining the whole `copy` delta by faults alone would need ~3 us per fault, well
+above a generic anonymous-page fault. First-touch faulting on freshly mapped staging memory is
+therefore recorded as the **leading hypothesis, not a finding**; page-table/TLB churn from ~216k
+map/unmap pairs per run is the other candidate. The fix does not depend on which it is.
 
 **Caveat: all four arms ran contended (one peer throughout).** Absolute milliseconds are inflated;
 the comparison is internally controlled but the magnitude needs a clean-box confirmation.
