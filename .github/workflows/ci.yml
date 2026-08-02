@@ -194,6 +194,90 @@ jobs:
         # the prosper_audio_sdl3 / prosper_pad_sdl3 frontends.
         run: cmake --build prosper/build-app --target prosper-app
 
+  linux-app-package:
+    name: Linux App Package
+    # PINNED, deliberately not ubuntu-latest. No AppImage bundles libc, so this runner's glibc is
+    # the minimum every user of the published artifact must have, and `ubuntu-latest` silently
+    # follows the newest image -- it would raise that floor on some future Tuesday with no diff and
+    # no failing check. ubuntu-22.04 would give a lower floor (2.35), but the Ubuntu 22 images begin
+    # brownout-based deprecation on 2026-09-17 and are unsupported from 2027-04-17, so pinning them
+    # buys six weeks and then starts failing builds. 24.04 is the oldest runner that is not about to
+    # break; verify-linux-app.sh asserts the resulting floor (2.39) so it cannot drift silently.
+    runs-on: ubuntu-24.04
+
+    # Separate from `Linux App` on purpose. That job stays Debug and build-only, which is the cheap
+    # compile signal for the frontends; this one is the release path -- Release build, real
+    # packaging, and the artifact checks. Losing either would be invisible in the other's result.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # The build set is identical to the Linux App job: the packaged binary must be the one that
+        # job compiles, not a differently-configured build that happens to be easier to bundle.
+        # The last line is the packaging set -- desktop-file-utils because appimagetool validates the
+        # .desktop entry, file and binutils because the verification reads the artifacts back.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libvulkan-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libx11-dev \
+            libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxfixes-dev \
+            libpulse-dev libasound2-dev libavformat-dev libavcodec-dev libavutil-dev \
+            libswresample-dev libswscale-dev libva-dev \
+            desktop-file-utils file binutils
+
+      - name: Configure
+        run: >-
+          cmake -S prosper -B prosper/build-release-app -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DPROSPER_APP=ON
+          -DPROSPER_AUDIO_SDL3=ON
+          -DPROSPER_PAD_SDL3=ON
+
+      - name: Build prosper-app
+        run: cmake --build prosper/build-release-app --target prosper-app
+
+      # Packaging runs on EVERY pull request, not only on tags. #1462 removed the Windows
+      # package+upload from PRs because `actions/upload-artifact` hung and blocked a merge; the
+      # problem there was the upload, not the packaging. Only the upload below is gated, so the
+      # release path is exercised continuously while ordinary PRs still produce no artifacts.
+      - name: Package Linux app
+        # A block scalar, not a folded one: the two BUILD.txt lines must stay two lines.
+        run: |
+          info="commit: ${{ github.sha }}
+          workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          prosper/packaging/linux/package-linux-app.sh \
+            --build-dir prosper/build-release-app \
+            --out-dir "$RUNNER_TEMP/linux-release" \
+            --build-info "$info"
+
+      # The gate that makes the step above worth running on PRs: the archives are extracted and the
+      # packaged binary is executed, so "the release archive does not start" fails here instead of
+      # in a user's download.
+      - name: Verify Linux release artifacts
+        run: >-
+          prosper/packaging/linux/verify-linux-app.sh
+          --out-dir "$RUNNER_TEMP/linux-release"
+          --max-glibc 2.39
+
+      # Tag pushes always. On a pull request only when it carries the `ci:artifacts` label, so a
+      # build of a branch can be downloaded and opened by hand without giving every PR a
+      # release-sized artifact (#1462).
+      - name: Upload Linux archives
+        if: >-
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+          contains(github.event.pull_request.labels.*.name, 'ci:artifacts')
+        uses: actions/upload-artifact@v4
+        with:
+          name: prosper-linux-x86_64
+          path: |
+            ${{ runner.temp }}/linux-release/prosper-linux-x86_64.AppImage
+            ${{ runner.temp }}/linux-release/prosper-linux-x86_64.AppImage.sha256
+            ${{ runner.temp }}/linux-release/prosper-linux-x86_64.tar.gz
+            ${{ runner.temp }}/linux-release/prosper-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
   windows-mingw:
     name: Windows MinGW
     runs-on: windows-latest
@@ -376,7 +460,7 @@ jobs:
   release:
     name: Publish Release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, linux-app, windows-mingw, windows-app, macos, macos-app]
+    needs: [linux, linux-app, linux-app-package, windows-mingw, windows-app, macos, macos-app]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -386,6 +470,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: prosper-windows-x64
+          path: release-assets
+
+      # Same directory as the Windows assets: the publish step below uploads release-assets/*, so a
+      # platform is released exactly when its archives land here.
+      - name: Download Linux archives
+        uses: actions/download-artifact@v4
+        with:
+          name: prosper-linux-x86_64
           path: release-assets
 
       - name: Create or update GitHub release

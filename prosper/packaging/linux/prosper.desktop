@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=prosper
+GenericName=PS5 compatibility layer
+Comment=Run a legally owned PS5 title on Linux
+Exec=prosper-app
+Icon=prosper
+Categories=Game;
+Terminal=false
+StartupNotify=true
