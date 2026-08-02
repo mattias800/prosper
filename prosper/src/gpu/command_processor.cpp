@@ -1060,17 +1060,31 @@ static void honor_event_write(const Pm4Command& c) {
 enum class DmaDataForm { Invalid, Immediate, Copy, GdsImmediate };
 
 // The destination selector occupies the LOW byte of the packed `dd_sels` word: the HLE builder writes
-// `(a2 & 0xff) | ((a3 & 0xff) << 8)`, and a2 is the argument that tracks the destination DOMAIN.
-// Evidence (Astro Bot, #1742): across a routed run every DMA_DATA with a2==1 carries a tiny
-// destination (0x4, 0xc68, 0xc70, 0xc74) while every a2==3 carries a full 64-bit guest address —
-// so a2 selects where the destination lives, and 1 is the PM4 GDS encoding. This also resolves the
-// `srcSel?`/`dstSel?` question the HLE prototype left open at CONFIDENCE: MED; the two names were
-// transposed. Corroboration: Sony's own parameter is `dstAddressOrOffset` (from the patcher export
-// `sceAgcDmaDataPatchSetDstAddressOrOffset`), an offset domain that in DMA_DATA is GDS, and
-// `sceAgcDcbAtomicGds` / `sceAgcDriverRegisterGdsResource` are part of the same published surface.
-// CONFIDENCE: MED-HIGH on dst_sel==1 meaning GDS; the guard below keeps every other form unchanged.
-static constexpr uint32_t kDmaDstSelGds = 1;
+// `(a2 & 0xff) | ((a3 & 0xff) << 8)`, and a2 is the argument that tracks the destination DOMAIN. This
+// resolves the `srcSel?`/`dstSel?` question the HLE prototype left open at CONFIDENCE: MED — the two
+// names are transposed. `agc_acb_dma_data` packs the FIRST of its two selector arguments into the low
+// byte as well, so one rule covers both builders; `Pm4Command::queue_origin` can split them if a title
+// ever forces it.
+//
+// Evidence, all of it title evidence rather than a hardware table:
+//  - Across a routed Astro Bot run the low byte partitions destinations with no overlap: 1 appears
+//    only with GDS-sized offsets (0x4, 0x24, 0xc64, 0xc68, 0xc6c, 0xc70, 0xc74, 0xc78, 0xc7c) and 3
+//    only with full 64-bit guest addresses.
+//  - Sony's parameter is `dstAddressOrOffset` (export `sceAgcDmaDataPatchSetDstAddressOrOffset`), so
+//    an offset domain exists; GDS is the only offset domain DMA_DATA has, and `sceAgcDcbAtomicGds` /
+//    `sceAgcAcbAtomicGds` / `sceAgcDriverRegisterGdsResource` are published exports.
+//  - DOLL's #312 packet (immediate zero into a memory label) passes 3 in the low byte, consistent
+//    with 3 meaning a memory destination.
+//
+// Do NOT read these values as PM4's: that same DOLL packet passes 3 in the HIGH byte for a source
+// that is demonstrably an immediate, where PM4 encodes DATA as 2. The AGC enum is its own vocabulary,
+// so the specific value 1 is pinned by prosper's title evidence above and by nothing else.
+// CONFIDENCE: MED on dst_sel==1 meaning GDS — the partition is clean and the API naming corroborates
+// it, but the sample is a handful of call sites, and no shader has yet been shown to READ these
+// offsets. The guards below keep every unrecognised form fail-closed.
+static constexpr uint32_t kDmaSelGds = 1;
 static uint32_t dma_data_dst_sel(const Pm4Command& c) { return c.dd_sels & 0xffu; }
+static uint32_t dma_data_src_sel(const Pm4Command& c) { return (c.dd_sels >> 8) & 0xffu; }
 
 static DmaDataForm dma_data_form(const Pm4Command& c, bool source_materialized = false) {
     constexpr uint32_t kMaxImmediateBytes = 0x1000000;   // existing 16 MiB fill safety bound
@@ -1079,8 +1093,14 @@ static DmaDataForm dma_data_form(const Pm4Command& c, bool source_materialized =
     // A GDS destination is an OFFSET into the 64 KiB share, not a guest address, so it is legitimately
     // below the 0x10000 floor that rejects malformed guest pointers — which is exactly why every one
     // of these was being discarded. Only the immediate (<=32-bit source) form is accepted here: a
-    // GDS-to-memory or memory-to-GDS copy has no title evidence yet and stays fail-closed.
-    if (dma_data_dst_sel(c) == kDmaDstSelGds) {
+    // GDS-to-memory or memory-to-GDS copy has no title evidence yet and stays fail-closed
+    // (the source guard above is what makes that true of the GDS-to-memory direction).
+    // A GDS SOURCE would make `dd_src` a small offset, which the immediate path below cannot tell from
+    // a 32-bit fill value — it would write the offset itself into guest memory. There is no title
+    // evidence for that form, so reject it rather than mis-execute it. (This is a behaviour change
+    // only for a packet whose high selector byte is 1, which no observed title emits.)
+    if (dma_data_src_sel(c) == kDmaSelGds) return DmaDataForm::Invalid;
+    if (dma_data_dst_sel(c) == kDmaSelGds) {
         const size_t gds_size = compute_gds_size();
         const bool in_range = c.dd_dst < gds_size && c.dd_bytes <= gds_size - c.dd_dst;
         return (c.dd_src <= UINT32_MAX && in_range && !(c.dd_dst & 3) && !(c.dd_bytes & 3))
@@ -1133,10 +1153,14 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         return;
     }
     if (form == DmaDataForm::GdsImmediate) {
-        // A GDS counter reset. The guest zeroes its append/consume counters here every frame; the
-        // shaders that increment them reach the same 64 KiB backing through the internal binding.
-        // Dropping this write is what made Astro Bot's indirect dispatch grow without bound (#1742):
-        // the counter accumulated by a constant per frame and was consumed as a workgroup count.
+        // A GDS counter reset: the guest zeroes these offsets every frame, and the shaders that use
+        // GDS reach the same 64 KiB backing through the internal binding. Dropping the write loses
+        // guest state outright.
+        //
+        // NOT the cause of #1742 — this was the hypothesis that motivated the fix and it was tested
+        // and FALSIFIED. With these writes restored (343 per routed run, against 0 before), Astro
+        // Bot's indirect dispatch still grows 1, 1, 2, 3, 4, 5, 7, 15, 6711, 26783, 40167, 66927.
+        // Whatever accumulates that count is elsewhere; do not re-derive this.
         uint8_t* gds = compute_gds_backing();
         const uint32_t v32 = (uint32_t)c.dd_src;
         for (uint32_t i = 0; i + 4 <= c.dd_bytes; i += 4)

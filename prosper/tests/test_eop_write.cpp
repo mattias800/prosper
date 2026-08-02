@@ -341,8 +341,12 @@ int main() {
 
     // ...and the guard that made it fail-closed still rejects a genuinely malformed guest pointer:
     // a sub-0x10000 destination WITHOUT the GDS selector must remain unwritten, or the fix above
-    // would have turned every malformed packet into a wild write at a low address.
+    // would have turned every malformed packet into a wild write at a low address. Assert on GDS
+    // CONTENT, not on survival: if the selector test were dropped and the range check alone routed
+    // the packet, it would land in GDS and a non-crash assertion would still pass.
     {
+        uint8_t* gds = compute_gds_backing();
+        gds[0xc68] = 0x77;
         uint32_t dma[7] = {};
         dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
         dma[1] = 0xc68; dma[2] = 0;
@@ -350,7 +354,45 @@ int main() {
         dma[5] = 4;
         dma[6] = 3;                      // dst_sel == 3 == memory: 0xc68 is not a valid address
         GpuState st; run_cb(dma, 7, st);
-        CHECK(true, "a low destination without the GDS selector is still rejected (no crash)");
+        CHECK(gds[0xc68] == 0x77,
+              "a low destination without the GDS selector is not routed into GDS");
+    }
+
+    // A GDS SOURCE (high selector byte) makes dd_src a small offset, which the immediate path cannot
+    // distinguish from a 32-bit fill value — it would write the offset itself into guest memory.
+    // No title emits this form, so it must be rejected rather than mis-executed.
+    {
+        alignas(4) uint32_t target = 0xDEADBEEFu;
+        const uint64_t dst = (uint64_t)(uintptr_t)&target;
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = (uint32_t)dst; dma[2] = (uint32_t)(dst >> 32);
+        dma[3] = 0xc68;         dma[4] = 0;     // a GDS offset masquerading as a 32-bit immediate
+        dma[5] = 4;
+        dma[6] = 3 | (1u << 8);                 // dst_sel = memory, src_sel = GDS
+        GpuState st; run_cb(dma, 7, st);
+        CHECK(target == 0xDEADBEEFu,
+              "a GDS source is rejected, not written as immediate data");
+    }
+
+    // The replication loop is only ever exercised at 4 bytes by the title, so cover a multi-dword
+    // non-zero fill here: every dword must carry the value and the span must stop exactly.
+    {
+        uint8_t* gds = compute_gds_backing();
+        const uint32_t offset = 0x40;
+        memset(gds + offset, 0x11, 20);
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = offset; dma[2] = 0;
+        dma[3] = 0xA5A5A5A5u; dma[4] = 0;
+        dma[5] = 12;
+        dma[6] = 1;
+        GpuState st; run_cb(dma, 7, st);
+        uint32_t words[3] = {};
+        memcpy(words, gds + offset, sizeof words);
+        CHECK(words[0] == 0xA5A5A5A5u && words[1] == 0xA5A5A5A5u && words[2] == 0xA5A5A5A5u,
+              "a multi-dword non-zero GDS fill replicates the value across the span");
+        CHECK(gds[offset + 12] == 0x11, "a multi-dword GDS fill stops exactly at its span");
     }
 
     // A GDS offset that would run past the 64 KiB share must be rejected rather than clamped —
