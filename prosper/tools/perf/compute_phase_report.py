@@ -130,8 +130,20 @@ def main():
     records, images = parse(streams, args.since_submit, args.program)
 
     if not records:
-        print("no [compute-phase] records found "
-              "(run with PROSPER_COMPUTE_PHASE_TIMING=1)", file=sys.stderr)
+        # Name the filters when they are set. "No records" reads as "the switch was off", and
+        # sending someone to re-run a 10-minute route because --since-submit was too high is exactly
+        # the kind of misdirection this tool exists to avoid.
+        filters = []
+        if args.since_submit is not None:
+            filters.append(f"--since-submit {args.since_submit}")
+        if args.program is not None:
+            filters.append(f"--program 0x{args.program:x}")
+        if filters:
+            print(f"no [compute-phase] records matched {' and '.join(filters)} "
+                  f"(records may exist outside that filter)", file=sys.stderr)
+        else:
+            print("no [compute-phase] records found "
+                  "(run with PROSPER_COMPUTE_PHASE_TIMING=1)", file=sys.stderr)
         return 1
 
     # A dispatch that fails leaves execute_item() through an early break, so phase_dispatch and
