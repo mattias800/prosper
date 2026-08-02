@@ -85,9 +85,9 @@ alone** — that is how a working title gets broken to satisfy a table. Only a g
 | --- | --- | --- | --- | --- | --- |
 | `DcbAcquireMem` / `AcbAcquireMem` | 8 | `ACQUIRE_MEM` (GFX10, with `GCR_CNTL`) | 8 | HIGH | all 7 payload slots are hardware fields; Babylon's 16-dword epilogue |
 | `CbReleaseMem` (end-of-pipe action) | 8 | `RELEASE_MEM` | 8 | HIGH | Babylon's 16-dword epilogue (#1748), fixed from 9 |
-| `DcbDmaData` / `AcbDmaData` | 9 | `DMA_DATA` | 7 | LOW | carries a 2-dword `#312` build snapshot; **no title evidence** |
-| `DcbWaitRegMem` / `AcbWaitRegMem` | 9 | `WAIT_REG_MEM` | 7 | LOW | payload holds a poll interval + compare fn; **no title evidence** |
-| `DcbJump` | 5 | `INDIRECT_BUFFER` | 4 | LOW | call-with-length, carries an explicit dword count (#319) |
+| `DcbDmaData` / `AcbDmaData` | **7** | `DMA_DATA` | 7 | HIGH | was 9; the 2 extra were the `#312` build snapshot, and the remaining 6 payload dwords are exactly the hardware field list. **Shrunk by #1756** |
+| `DcbWaitRegMem` / `AcbWaitRegMem` | 9 | `WAIT_REG_MEM64` | 8 | MED | **the 7 in an earlier draft of this table was the wrong comparison** — the sub-op is `R_WAIT_MEM_64` and the guest passes a 64-bit mask and reference, so the 32-bit `WAIT_REG_MEM` is not what it stands for. The residual +1 is an unpacked `compare_function` dword, not private payload |
+| `DcbJump` | 5 | `INDIRECT_BUFFER` | 4 | MED | +1 is a **predication flag slot** that `sceAgcSetPacketPredication` writes into this packet afterwards (#319) — live per-packet state, not a snapshot, so it needs a home before the packet can shrink |
 | `DcbDrawIndex` | 7 | `DRAW_INDEX_2` | 6 | LOW | payload carries a 64-bit AGC draw modifier |
 | `DcbDrawIndexAuto` | 7 | `DRAW_INDEX_AUTO` | 3 | LOW | same modifier; not a bare PM4 draw |
 | `DcbDrawIndexOffset` | 3 | `DRAW_INDEX_OFFSET_2` | 5 | LOW | prosper emits **fewer** — safe direction |
@@ -116,6 +116,46 @@ alone** — that is how a working title gets broken to satisfy a table. Only a g
 
 **Nothing in this table was changed on the strength of the "published dw" column.** The rows that
 differ and have no title evidence are recorded as open, not fixed; see *Open* below.
+
+## Which builders are genuinely oversized
+
+The question this audit exists to answer, and the one implementing `GetSize` does **not** answer:
+`GetSize` makes a guest that *asks* agree with prosper's version of the packet; only shrinking the
+builder makes prosper agree with the hardware. Babylon died of the second problem.
+
+Of the 30 builders, three emitted more dwords than the packet they stand for with no explanation
+other than prosper's own payload. They are not one class:
+
+| builder | was | is | verdict |
+| --- | --- | --- | --- |
+| `DmaData` (Dcb + Acb) | 9 | **7** | **Genuinely oversized, and fixed.** Identical to `RELEASE_MEM`: 2 of the 9 were the `#312` build-time snapshot of the destination qword, and the remaining 6 payload dwords are *exactly* the hardware `DMA_DATA` field list (dst lo/hi, srcOrImm lo/hi, numBytes, selectors). Unlike `RELEASE_MEM` there is no spare slot at the hardware size, so the snapshot leaves the packet entirely. |
+| `WaitRegMem` (Dcb + Acb) | 9 | 9 | **My flag was wrong, and the table said so wrongly.** "9 vs 7" compared it against the 32-bit `WAIT_REG_MEM`; the sub-op is `R_WAIT_MEM_64` and the guest supplies a 64-bit mask and reference, so the right comparison is `WAIT_REG_MEM64` = 8. The residual +1 is a `compare_function` the hardware packs into its `ENGINE/FUNCTION` dword and prosper spends a whole dword on — a repacking, not a payload removal, and no title evidence to validate it against. **Open.** |
+| `Jump` | 5 | 5 | **Oversized by 1, but the extra dword is load-bearing.** `cmd[4]` is a predication flag that `sceAgcSetPacketPredication` writes into this packet *after* it is built (#319) — live per-packet state, not a diagnostic snapshot. Shrinking to the hardware `INDIRECT_BUFFER` size needs that state rehoused (a side table keyed by packet address, as the fence journal already does), which is a design change wanting its own evidence. **Open.** |
+
+So: **one of the three was a latent Babylon and is now closed; one was my own mis-comparison; one is
+real but cannot be fixed by deletion.** The remaining table rows where prosper is larger
+(`WriteData` +1, `SetPredication` +1, `CbDispatch` +1, the two draws) have neither an identifiable
+private payload nor title evidence, and stay open.
+
+### What the `DmaData` shrink was checked against
+
+There was no failure to make return — no title in the corpus was observably harmed by the 2 extra
+dwords — so the check is that the change is **null**, not that a defect reappears. Same build, same
+routes, only `kDwDmaData` and its two payload writes differing, `PROSPER_PROGRESS` series at 45–65 s:
+
+| title | 9-dword | 7-dword |
+| --- | --- | --- |
+| *Dragon Quest VII* `PPSA17942` | 96, 96, 91, 87, 94, 91 draws/submit | **identical series** |
+| *The Messenger* `PPSA24651` | 11 | 11 |
+| *Dead Cells* `PPSA15552` | 173 | 170 (its own frame-to-frame band is 169–173) |
+| *GTA V* `PPSA04263` | 8 | 8 |
+
+That is the expected result: the removed dwords were read by exactly one consumer,
+`dma_build_pre_changed`, behind the default-off `PROSPER_GENERATION_GUARD`. That leg now **announces
+itself as inert** rather than returning a quiet `false`, because an opt-in check that has silently
+stopped running is indistinguishable from one that ran and found nothing. `prosper_label_hist_dma_built`
+still records the same init event out-of-band, so #312's label-history legs are untouched, and
+`decode_pm4` still reads the 9-dword form in captures recorded before this change.
 
 ## `GetSize` coverage — the half that can be fixed without hardware knowledge
 
@@ -234,7 +274,7 @@ when they returned stack residue) but not `Init` or `Unregister`. All tracked on
 eight are absent from the 3.20 export table, as `T6xuVw0KUJo` was on #1748: the corpus contains
 titles built against SDK versions that dump does not cover, so "not in the DB" is not "not real".
 
-**None of the 26 `GetSize` functions this change implements is called by any title in the corpus.**
+**None of the 22 `GetSize` functions this change implements is called by any title in the corpus.**
 That fix is therefore *preventive*, not the repair of an observed failure — stated plainly because
 the distinction matters. Its justification is that the same zero-answer has already been fatal twice
 (#1137's RAGE buffer overflow, #1748's leak), each time found by a crash in the one title that
@@ -252,10 +292,12 @@ happened to ask, and each time fixed for that title's NIDs alone.
 
 ## Open
 
-* The `LOW`-confidence rows above where prosper is **larger** than the reference — `DmaData` (9 vs
-  7), `WaitRegMem` (9 vs 7), `Jump` (5 vs 4), `WriteData` (5+n vs 4+n), `SetPredication` (4 vs 3),
-  `CbDispatch` (6 vs 5), `DrawIndex`/`DrawIndexAuto`. Each needs a title that reserves tightly around
-  it before it can be changed. `PROSPER_DCBWIN` over a new title is the cheapest way to get that.
+* The rows still larger than the reference after the `DmaData` shrink — `WaitRegMem` (+1, an
+  unpacked compare-function dword), `Jump` (+1, the predication slot that needs rehousing),
+  `WriteData` (5+n vs 4+n), `SetPredication` (4 vs 3), `CbDispatch` (6 vs 5),
+  `DrawIndex`/`DrawIndexAuto`. None has an identifiable private payload to delete, so each needs a
+  title that reserves tightly around it before it can be changed. `PROSPER_DCBWIN` over a new title
+  is the cheapest way to get that.
 * **Two rows are larger than the reference only for small `n`, and the table's "safe direction" note
   hides it.** `SetXxRegistersIndirect` is a fixed 4 dwords against `2 + n`, so it is *larger* at
   **n ≤ 1** and smaller from n = 3 up — and n = 1 is exactly the arithmetic of the `need=4 avail=3`
