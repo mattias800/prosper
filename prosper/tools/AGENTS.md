@@ -124,8 +124,11 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   model of `execute_item` stops matching the emitter. Counts here cover backend-executed dispatches
   only — CPU-fast-path fills emit no record, so add
   `[render-timing] compute_cpu_fast fills=N` before quoting a rate.
-  `test_compute_phase_report.py` self-tests it. First result: `docs/RENDERER_PERFORMANCE_2026_07.md`
-  § Astro Bot compute decomposition.
+  `test_compute_phase_report.py` self-tests it (ctest `compute_phase_report_logic`), and
+  `mutate_compute_phase_report.sh` checks that suite at **per-check granularity** — each mutation must
+  be killed by the check written for it, because a survivor masked by red siblings is invisible when
+  you only watch the suite's colour (trap 48). It mutates a scratch copy, never the tracked file.
+  First result: `docs/RENDERER_PERFORMANCE_2026_07.md` § Astro Bot compute decomposition.
 - **`perf/ab_compute.sh`** — A/B one `PROSPER_*` switch against a routed live run, refusing to
   measure while another `prosper-app` holds the GPU and stamping commit/route/reps onto the result.
 

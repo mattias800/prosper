@@ -201,11 +201,16 @@ def main():
     # decomposition with an impossible row is worse than no decomposition.
     #
     # 1. Every phase of a successful dispatch is a forward interval.
+    # Collected, not just printed: these also become a banner INSIDE the table. stderr alone is not
+    # enough -- `report.py run.log > table.txt`, or pasting stdout into a PR body, discards exactly
+    # the warning while keeping a table that still looks authoritative, and the durable artifact is
+    # where the damage lands (trap 45's shape).
+    model_warnings = []
     negative = [k for (_, k, _) in PHASES if totals[k] < -1e-6]
     if negative:
-        print(f"WARNING: negative time in {', '.join(negative)} on ok=1 records. "
-              f"The phase boundaries are not all being set; this table is NOT trustworthy.",
-              file=sys.stderr)
+        model_warnings.append(
+            f"negative time in {', '.join(negative)} on ok=1 records; the phase boundaries are "
+            f"not all being set")
     # 2. The top-level phases partition total_ms, and no child exceeds its parent. Checked per
     #    record against the printed 2-decimal precision, then reported as a count.
     tolerance = 0.06
@@ -220,11 +225,12 @@ def main():
             1 for r in records
             if sum(r.get(k, 0.0) for k in kids) > r.get(parent, 0.0) + tolerance)
     if broken_sum or broken_nest:
-        print(f"WARNING: this tool's phase model does not match these records "
-              f"({broken_sum} where the top-level phases do not sum to total_ms, "
-              f"{broken_nest} where children exceed their parent). The emitter in "
-              f"live_compute.cpp has probably changed; update PHASES before trusting the table.",
-              file=sys.stderr)
+        model_warnings.append(
+            f"this tool's phase model does not match these records ({broken_sum} where the "
+            f"top-level phases do not sum to total_ms, {broken_nest} where children exceed their "
+            f"parent); the emitter in live_compute.cpp has probably changed")
+    for warning in model_warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
 
     if args.csv:
         print("phase,key,ms,pct,ms_per_dispatch")
@@ -288,6 +294,8 @@ def main():
 
     print("  " + "-" * 54)
     print(f"  {'total':<20}{grand:>12.1f}{100.0:>9.1f}%{grand / n:>12.3f}")
+    for warning in model_warnings:
+        print(f"  !! NOT TRUSTWORTHY: {warning}. Update PHASES before using this table.")
 
     # The image-binding loop sits inside setup_ms and has no `[compute-phase]` sub-timer, so on an
     # image-heavy title it IS setup's unattributed row. Break it out when the run carried

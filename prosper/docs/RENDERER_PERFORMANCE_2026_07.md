@@ -1657,15 +1657,18 @@ and the point in it whenever quoting an absolute cost here.
 - **"The dominant dispatch cost is image upload volume."** False, and one matched pair settles it.
   Over the full 853 s run, counting only succeeded dispatches and non-alias bindings:
 
-  | program | dispatches | dispatch_ms | staged | GiB/s |
-  |---|---:|---:|---:|---:|
-  | `0x500571000` | 323 | **295,879** | 160.40 GiB | **0.54** |
-  | `0x50059cd00` | 322 | 2,364 | 160.40 GiB | 67.84 |
-  | `0x5005cc100` | 322 | 2,354 | 166.60 GiB | 70.79 |
-  | `0x5005fdb00` | 322 | 2,347 | 166.60 GiB | 70.98 |
+  | program | dispatches | staged | dispatch_ms |
+  |---|---:|---:|---:|
+  | `0x500571000` | 323 | 160.40 GiB | **295,879** |
+  | `0x50059cd00` | 322 | 160.40 GiB | 2,364 |
+  | `0x5005cc100` | 322 | 166.60 GiB | 2,354 |
+  | `0x5005fdb00` | 322 | 166.60 GiB | 2,347 |
 
   `0x500571000` and `0x50059cd00` stage the **identical 160.40 GiB** across the same number of
-  dispatches, and one takes **125x** longer. The per-dispatch image round-trip is a real and large
+  dispatches, and one takes **125x** longer. (A GiB/s column is deliberately omitted: dividing the
+  outlier's bytes by its time yields "0.54 GiB/s", which reads as *its uploads are slow* — the exact
+  conclusion this bullet exists to falsify. Its time is dominated by a 192 M-invocation kernel, and
+  the bytes are incidental to it.) The per-dispatch image round-trip is a real and large
   cost elsewhere in this decomposition, but it does not explain the dominant term. The two columns are
   drawn from different record types, so the populations were checked rather than assumed: these four
   programs fail **once in 1,290 dispatches**, so their `[compute-phase]` and `[compute-image]` records

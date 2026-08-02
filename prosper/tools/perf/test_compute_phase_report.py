@@ -54,6 +54,24 @@ def run(log_text, *args):
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def image_row(out, label):
+    """(ms, ms_per_binding) for one row of the IMAGE table only.
+
+    Scoped deliberately: `unattributed` also appears in the phase table above, so a whole-output scan
+    reads the wrong row and then fails or passes for reasons unrelated to the image arithmetic.
+    Returns parsed floats -- a substring test on the formatted number is true of its own prefixes.
+    """
+    section = out.split("setup image bindings:")
+    if len(section) < 2:
+        return (float("nan"), float("nan"))
+    for line in section[1].splitlines():
+        if line.strip().startswith(label):
+            numbers = re.findall(r"-?\d+\.\d+", line)
+            if len(numbers) >= 2:
+                return (float(numbers[0]), float(numbers[-1]))
+    return (float("nan"), float("nan"))
+
+
 FAILURES = []
 
 
@@ -70,8 +88,11 @@ def main():
 
     # A failed dispatch's sub-timers are garbage (dispatch_ms negative, cleanup_ms == total_ms).
     # Summing them inverted the real Astro Bot table, so they must never reach the phase table.
+    # The failed record's negative dispatch_ms must OUTWEIGH the succeeded one, or the two cancel and
+    # the aggregate stays positive -- which is how this fixture first passed while proving nothing.
+    # Per-check mutation coverage caught that: deleting the ok=0 exclusion left this check green.
     log = (phase(ok=1, setup_ms=1, dispatch_ms=8, writeback_ms=1)
-           + phase(ok=0, setup_ms=5, dispatch_ms=-5, cleanup_ms=6, total_ms=6))
+           + phase(ok=0, setup_ms=50, dispatch_ms=-50, cleanup_ms=51, total_ms=51))
     code, out, err = run(log)
     check("failed dispatch excluded from the table", "1 succeeded dispatches" in out, out)
     check("failed dispatch still reported", "1 FAILED" in out, out)
@@ -106,16 +127,18 @@ def main():
     # are excluded and 0.090 if they are not. A refactor that keeps the wording and restores the wrong
     # denominator must fail here.
     log = phase(setup_ms=10, dispatch_ms=1) + image(ms=9, prepare_ms=9) + "".join(
-        image(alias=True, ms=0.001) for _ in range(99))
+        image(alias=True, ms=0.01) for _ in range(99))
     code, out, err = run(log)
     check("aliases excluded from binding count", "1 real bindings" in out, out)
     check("aliases still reported", "99 further records were aliased folds" in out, out)
-    prepare = next((l for l in out.splitlines() if "prepare upload" in l), "")
     check("ms/binding uses the real-binding denominator",
-          prepare.split()[-1] == "9.000", prepare)
-    unattributed = next((l for l in out.splitlines()
-                         if "unattributed" in l and "%" in l and "0.00" not in l.split()[-1]), None)
-    check("alias ms does not land in image unattributed", unattributed is None, unattributed)
+          image_row(out, "prepare upload")[1] == 9.000, image_row(out, "prepare upload"))
+    # The alias records contribute 0.99 ms with no sub-timers, so if they are counted that whole
+    # amount lands here. Parse the number and compare it; a substring test for "0.00" is true of
+    # "0.001" as well and so passes with the bug in place, which is how the previous form of this
+    # check survived its own mutation.
+    check("alias ms does not land in image unattributed",
+          abs(image_row(out, "unattributed")[0]) < 0.05, image_row(out, "unattributed"))
 
     # An all-alias log is ordinary input (e.g. --program on a kernel whose bindings all fold). The
     # image section must say so and STILL print the top-programs table below it -- an early return
@@ -138,8 +161,14 @@ def main():
     # must say so rather than print a confident wrong table.
     code, out, err = run(phase(setup_ms=1, total_ms=99))
     check("stale phase model warns", "does not match these records" in err, err)
+    # ...and warns on STDOUT too. The ctest gate feeds synthetic records, so it pins the tool against
+    # its own model and can never notice the emitter drifting; this runtime check is the only real
+    # drift detector, and `report.py run.log > table.txt` discards stderr while keeping a table that
+    # still looks authoritative. The banner must travel with the table.
+    check("stale model banner survives redirection", "NOT TRUSTWORTHY" in out, out)
     code, out, err = run(phase(setup_ms=1, dispatch_ms=8, writeback_ms=1))
     check("consistent records warn about nothing", "does not match" not in err, err)
+    check("no banner on consistent records", "NOT TRUSTWORTHY" not in out, out)
 
     # "No records" must not blame the env switch when a filter is what excluded them.
     code, out, err = run(phase(submit=1), "--since-submit", "999")
