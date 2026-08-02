@@ -32,7 +32,7 @@ Last updated: 2026-08-02
 | *The Plucky Squire* | `PPSA15319` | Unreal Engine 4 | 🚧 Title screen and the save-file/play-style menus render at native 3840×2160; the route then holds a black loading screen and does not reach chapter one |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🚧 Title screen (`NEW GAME` / `OPTIONS`) renders at native 2560×1440; gameplay not reached |
 | *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🔬 Boots into the UE4 render bring-up and submits real GPU work, then the render thread faults after about 10 s with no frame composited |
-| *Asterix &amp; Obelix - Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🔬 Boots and submits real GPU work, but every presented frame is black and a guest thread dies at about 125 s, after which the renderer publishes nothing |
+| *Asterix &amp; Obelix - Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🔬 Boots and submits real GPU work indefinitely; every presented frame is still black. The 125 s death is fixed (#1748) |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Loads and starts its runtime PRX and recompiles both first graphics stages, then null-derefs its own empty logged-in-user list — a startup race inside the title, not a missing API (#1746) |
 | *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Warning screen, publisher logo, title screen and EULA render at native 3840×2160 with no code changes; the 3D world is dropped because the programmed user-data block is larger than the bound pipeline's user-SGPR window (#305) |
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
@@ -71,7 +71,7 @@ is guest flips per second — the rate the game itself advances — averaged ove
 | *Earthion* `PPSA28061` | 1 | ~139 @ 4K | Bezel and intro text; the picture area inside the bezel is missing (#1590) |
 | *Tales of Graces f Remastered* `PPSA19991` | 2 with the route | ~37 @ 1080p on the title screen | Title screen, EULA, main menu and new-game Options; gameplay not reached (#1609) |
 | *The Oregon Trail* `PPSA19244` | 0 | ~42 @ 4K | Frame loop advances, every frame black (#1606 / #1641) |
-| *Asterix &amp; Obelix - Babylon Mission* `PPSA30490` | 0 | ~124 @ 1080p until 125 s | All frames black, then a guest thread dies and the renderer stops (#1599) |
+| *Asterix &amp; Obelix - Babylon Mission* `PPSA30490` | 0 | ~124 @ 1080p | All frames black (#1599); the run no longer dies at 125 s (#1748) |
 | *Sonic Origins* `PPSA05325` | 0 | ~5 @ 4K | One rendered frame; the supplied dump is update-only |
 | *ArcRunner* `PPSA21406` | 0 | — | Guest render thread faults after about 10 s, before any composited frame (#1226) |
 | *R-Type Delta: HD Boosted* `PPSA26414` | 0 | — | Guest fault at `eboot+0x24055`: `users.front()` on an empty vector, ~260 ms into the title's own 400 ms input-thread delay (#1746) |
@@ -870,6 +870,41 @@ a lazily committed page from one `rip`, and a thread then faults at `0x28` — t
 read from a null pool handle. So the black frames and the stall are two findings, not one: the stall
 is an allocation failure, upstream of the MSAA `image_load` recompiler gap that #1599 identifies as
 the reason the frames are black.
+
+**The allocation failure is fixed (#1748).** It was prosper's, not the title's. Every 16 MiB block came
+through the guest's AGC draw-command-buffer chunk allocator, invoked from `AgcDcb::allocate_dw`'s
+"buffer full" callback. The title's submit epilogue is a Dcb window of exactly **16 dwords** holding
+`sceAgcDcbAcquireMem` (8, the RDNA2 `ACQUIRE_MEM` size) followed by the end-of-pipe action (8, the
+RDNA2 `RELEASE_MEM` size). prosper's `agc_cb_release_mem` emitted **9** dwords — seven for the packet
+plus two carrying a `#312` build-time diagnostic snapshot — so the append did not fit, the callback
+fired, and the guest handed over a fresh ~600 KiB command-buffer chunk **for every submit**. Those
+chunks are recycled only when the GPU writes `1` to a completion label at `chunk+0x18`, and that
+fence packet is written at exactly `submit_addr + dw_num*4`, i.e. into the *next* chunk, which is
+never submitted — so the guest's free list stayed permanently empty and its in-flight list grew
+without bound at ~210 MiB/s.
+
+Shrinking the packet to its hardware size closes it. Headless `boot_trace` A/B on one build, only the
+packet size differing:
+
+| | 9-dword `RELEASE_MEM` | 8-dword `RELEASE_MEM` |
+| --- | --- | --- |
+| 16 MiB direct-memory blocks | 1053 | 23 |
+| `alloc_main_dmem -> ENOMEM` | 79 | 0 |
+| outcome | `SIGSEGV addr=0x28` at ~125 s | still running at 300 s |
+
+The general rule the case establishes: **a prosper AGC builder must emit exactly as many dwords as the
+hardware packet it stands for.** The builders write into the *guest's* command buffer, and the guest
+reserves that buffer from the real AGC sizes it was compiled against — a title that never calls
+`sceAgc*GetSize` cannot be told about a larger packet.
+
+### Ruled out
+
+| Hypothesis | Evidence that killed it | Where |
+| --- | --- | --- |
+| The direct-memory budget is too small — raise `PROSPER_DMEM_BUDGET_MB` | A 12 GiB pool dies with the identical fault and backtrace, only sooner; growth is demand-driven | #1748 |
+| prosper denies the guest memory it should have granted, or hands back a pool handle it then rejects | The pool is genuinely empty and the guest genuinely asked for all of it: 1053 × 16 MiB with 8 releases. (prosper caused the *demand* — see above — but it never denied or mis-handed a request) | #1748 |
+| The intro movie leaks its decode buffers | The 16 MiB stream is already at full rate ~280 allocations before the six `AgcAvPlayerResource FreeDirectMemory 3112960` lines, and all six are released; the video allocations are a separate 0x2f8000 population | #1748 / #1760 |
+| A Unity per-frame reclaim finds nothing retired (the shape was right) | Correct in shape, wrong in subject: the pool that never reclaims is the **AGC command-buffer chunk** pool, and it stalls because a prosper packet was one dword too large | #1748 / #1760 |
 ## Astro Bot — `PPSA21564`
 
 <p align="center">

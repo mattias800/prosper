@@ -2,7 +2,7 @@
 //
 // The guest reserves command-buffer space with sceAgc*GetSize BEFORE calling the matching builder,
 // so GetSize must equal the exact dword count the builder emits. Today the constants (Jump=5, AcquireMem
-// =8, ReleaseMem/EOP=9, Rewind=2, Nop=n dwords) are correct but were untested — a future change to a
+// =8, ReleaseMem/EOP=8, Rewind=2, Nop=n dwords) are correct but were untested — a future change to a
 // builder's `begin_packet(a0, N, ...)` size would silently desync the reservation and corrupt the stream.
 //
 // This test MEASURES each builder's actual cursor advance (the real emitted size) and asserts its GetSize
@@ -50,7 +50,7 @@ int main() {
         { "Jump",           "VEGu4dixjUg", "xSAR0LTcRKM", 0, 0, 0x1000, 0, 0 },  // sceAgcDcbJump -> 5 dw
         { "AcquireMem/Dcb", "-vnlTPPXPrw", "57labkp+rSQ", 0, 0, 0,      0, 0 },  // sceAgcDcbAcquireMem -> 8 dw
         { "AcquireMem/Acb", "ewobAQeMo5k", "KT-hTp-Ch14", 0, 0, 0,      0, 0 },  // sceAgcAcbAcquireMem -> 8 dw
-        { "ReleaseMem/EOP", "hL7C0IRpWZI", "wr23dPKyWc0", 0, 0, 0,      0, 0 },  // sceAgcCbReleaseMem -> 9 dw
+        { "ReleaseMem/EOP", "hL7C0IRpWZI", "wr23dPKyWc0", 0, 0, 0,      0, 0 },  // sceAgcCbReleaseMem -> 8 dw
     };
     for (const auto& c : cases) {
         HleFn gs = Hle::lookup(c.gs_nid), build = Hle::lookup(c.build_nid);

@@ -832,15 +832,18 @@ static bool stale_release_generation(const Pm4Command& c, uint64_t pre) {
     if (!generation_guard()) return false;
     if (!c.rel_build_pre_valid || c.rel_data_sel != 1 || c.rel_value != 1 ||
         !label_is_consumed_marker(c.rel_addr)) return false;
+    // Only the HIGH half of the build snapshot is used, which is also the only half the 8-dword
+    // ReleaseMem packet retains (#1748) — so print that half rather than `rel_build_pre` itself,
+    // whose zero low dword would read as a measured value.
     uint64_t initialized = c.rel_build_pre & 0xffffffff00000000ull;
     uint64_t signaled = initialized | 1ull;
     if (pre == initialized || pre == signaled) return false;
     static std::atomic<uint32_t> n{0};
     if (n.fetch_add(1, std::memory_order_relaxed) < 256)
         fprintf(stderr, "[agc] REL-GENERATION-CHANGED-STALE-SUPPRESS [0x%llx] "
-                        "build-pre=0x%llx expected-init=0x%llx exec-pre=0x%llx "
+                        "build-pre-hi=0x%08x expected-init=0x%llx exec-pre=0x%llx "
                         "pkt=0x%llx t=%llums\n",
-                (unsigned long long)c.rel_addr, (unsigned long long)c.rel_build_pre,
+                (unsigned long long)c.rel_addr, (unsigned)(c.rel_build_pre >> 32),
                 (unsigned long long)initialized, (unsigned long long)pre,
                 (unsigned long long)pkt_addr(c), (unsigned long long)now_ms());
     label_hist_rel_free(c.rel_addr, 0);
