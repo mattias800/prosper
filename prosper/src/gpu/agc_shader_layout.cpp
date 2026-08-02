@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <string>
+#include <tuple>
 #include <unordered_set>
 #include <set>
 #include <vector>
@@ -471,12 +473,19 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
     // tell "the front half never saw a second texture" from "it saw one and rejected it", and those
     // point at completely different code. Printing the raw declaration separates them in one line
     // (#1590: Earthion's rejected 320x224 composite samples two T#s and the table holds one).
-    if (getenv("PROSPER_SHARPLOG")) {
+    static const bool sharplog_on = getenv("PROSPER_SHARPLOG") != nullptr;
+    if (sharplog_on) {
         static std::mutex mx;
         static std::unordered_set<const void*> seen;
-        bool first = false;
-        { std::lock_guard<std::mutex> lk(mx); first = seen.insert((const void*)ud).second; }
-        if (first) {
+        // Hold the lock across the WHOLE dump, not just the dedupe test. Stage builds run
+        // concurrently, and only the header line carries `ud=`, so interleaved line groups would
+        // let a reader attribute a slot to the wrong stage — the exact ambiguity this instrument
+        // exists to remove. Serializing a once-per-stage diagnostic costs nothing.
+        // NOTE: `ud` is a guest pointer, so a freed-and-reused user-data block is deduped as the
+        // same stage. The ABSENCE of a `[sharp]` line therefore does not prove a stage was never
+        // built.
+        std::lock_guard<std::mutex> lk(mx);
+        if (seen.insert((const void*)ud).second) {
             fprintf(stderr, "[sharp] ud=%p nsgpr=%u base=%u eud_size_dw=%u srt_size_dw=%u "
                             "counts: ro=%u rw=%u samp=%u cbuf=%u direct=%u\n",
                     (const void*)ud, num_user_sgprs, user_sgpr_base, ud->eud_size_dw, ud->srt_size_dw,
@@ -484,6 +493,11 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                     ud->sharp_resource_count[2], ud->sharp_resource_count[3],
                     ud->direct_resource_count);
             static const char* kCat[4] = { "ro", "rw", "samp", "cbuf" };
+            // load_sharp's EUD test is `off + n > num_user_sgprs`, and n is the descriptor width:
+            // a sharp[0] slot may be an 8-dword T# or a 4-dword V#, so its residency is reported
+            // as a range rather than claimed. Using `off >= num_user_sgprs` here would mislabel
+            // every descriptor that straddles the boundary — the exact case a reader of this log
+            // would be trying to resolve.
             for (int cat = 0; cat < 4; cat++) {
                 const AgcShaderSharp* arr = ud->sharp_resource_offset[cat];
                 if (!arr_ok(arr, ud->sharp_resource_count[cat], sizeof(AgcShaderSharp))) {
@@ -494,10 +508,16 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 }
                 for (uint16_t slot = 0; slot < ud->sharp_resource_count[cat]; slot++) {
                     const AgcShaderSharp& s = arr[slot];
+                    const uint32_t off = s.offset_dw();
+                    const char* eud = "";
+                    if (!s.empty()) {
+                        const bool eud_at_4 = (uint64_t)off + 4 > num_user_sgprs;   // V#/S#/cbuf
+                        const bool eud_at_8 = (uint64_t)off + 8 > num_user_sgprs;   // T#
+                        eud = eud_at_4 ? " (EUD)" : (eud_at_8 ? " (EUD if 8dw)" : "");
+                    }
                     fprintf(stderr, "[sharp]   %s[%u]: bits=0x%04x offset_dw=%u size=%u%s%s\n",
-                            kCat[cat], slot, s.bits, s.offset_dw(), s.size(),
-                            s.empty() ? " EMPTY" : "",
-                            (!s.empty() && s.offset_dw() >= num_user_sgprs) ? " (EUD)" : "");
+                            kCat[cat], slot, s.bits, off, s.size(),
+                            s.empty() ? " EMPTY" : "", eud);
                 }
             }
             if (const uint16_t* dro = ud->direct_resource_offset)
@@ -665,14 +685,21 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
         // identical to "the shader never declared it" — which is a completely different bug in a
         // completely different file (#1590). Deduped per (user-data block, slot) so it costs one
         // line per stage, not one per draw.
-        const bool sharplog = getenv("PROSPER_SHARPLOG") != nullptr;
         auto tex_drop = [&](uint16_t slot, uint32_t off, const char* why) {
-            if (!sharplog) return;
+            if (!sharplog_on) return;
             static std::mutex mx;
-            static std::set<std::pair<const void*, uint32_t>> seen;
+            static std::set<std::tuple<const void*, uint32_t, std::string>> seen;
             std::lock_guard<std::mutex> lk(mx);
-            if (!seen.insert({(const void*)ud, slot}).second) return;
-            fprintf(stderr, "[sharp]   ro[%u] offset_dw=%u DROPPED as texture: %s\n", slot, off, why);
+            // Key on the REASON as well as the slot. The T# dwords come from per-draw SGPR
+            // contents, so one slot can decode cleanly on one draw and as residue on the next —
+            // which is exactly the #1590 case. Deduping on (block, slot) alone would print the
+            // first reason only and read as "always dropped for this reason" when the truth is
+            // "dropped for this reason on the first draw that reached here".
+            if (!seen.insert({(const void*)ud, slot, std::string(why)}).second) return;
+            // `ud=` on every line: the header is emitted once and concurrent stages interleave,
+            // so a drop line reached on a later draw can appear with no header in front of it.
+            fprintf(stderr, "[sharp]   ud=%p ro[%u] offset_dw=%u DROPPED as texture: %s\n",
+                    (const void*)ud, slot, off, why);
         };
         for (uint16_t slot = 0; slot < ud->sharp_resource_count[0]; slot++) {
             const AgcShaderSharp& s = texs[slot];
@@ -693,7 +720,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 !valid_image_type(d.type) ||
                 d.base_array != 0 ||
                 d.width > 16384 || d.height > 16384) {          // skip a garbage/degenerate T#
-                if (sharplog) {
+                if (sharplog_on) {
                     char buf[192];
                     snprintf(buf, sizeof buf,
                              "degenerate T# base=0x%llx %ux%ux%u type=%u base_array=%u fmt=%u "
