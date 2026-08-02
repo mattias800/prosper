@@ -200,6 +200,15 @@ and `gpu_device` is 4.31 ms, so **no single term reaches 30 fps on this title.**
   directly: glibc `getenv` on a miss costs 19.7 ns (10-var environment) to 25.6 ns (94-var), so the
   whole per-submit volume is **≈0.5 ms of 165 ms — 0.3 %**. Tidy if touched for other reasons; not a
   performance fix.
+
+  Recorded at length because of how it *looked*: 11 uncached environment lookups in the hottest loop
+  in the renderer, one of them per texture reference, sitting beside three neighbours that already
+  cache into `static const` — an obvious oversight with an obvious fix, and it was minutes from being
+  "fixed". A two-minute microbenchmark priced it at nothing. glibc's `getenv` compares the first
+  character before `strncmp`, so it is tens of nanoseconds, not the microseconds the shape of the
+  code suggests. **A plausible optimisation that measures to nothing is worth writing down precisely
+  because the next reader will find the same 11 calls and draw the same conclusion.** Price a hot-loop
+  call before removing it, not after.
 - **The #1268 small-buffer content hash is not the term.** Live `hash-stats`: 414,633 hash calls over
   168.1 MiB against 3.5 M references — ~1 % of the buffer term.
 
