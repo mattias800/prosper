@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <unordered_set>
 #include <set>
 #include <vector>
 
@@ -463,6 +464,50 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
 
     uint32_t binding = 0;
 
+    // PROSPER_SHARPLOG=1: report the stage's DECLARED resource-usage table before any of it is
+    // decoded, deduped per user-data block. Every existing diagnostic here describes what came OUT
+    // of this function (`[t#]`, `[mimg-unresolved]`'s table dump), so a slot that is declared by the
+    // shader and then dropped by one of the ~10 `continue`s below is invisible: the reader cannot
+    // tell "the front half never saw a second texture" from "it saw one and rejected it", and those
+    // point at completely different code. Printing the raw declaration separates them in one line
+    // (#1590: Earthion's rejected 320x224 composite samples two T#s and the table holds one).
+    if (getenv("PROSPER_SHARPLOG")) {
+        static std::mutex mx;
+        static std::unordered_set<const void*> seen;
+        bool first = false;
+        { std::lock_guard<std::mutex> lk(mx); first = seen.insert((const void*)ud).second; }
+        if (first) {
+            fprintf(stderr, "[sharp] ud=%p nsgpr=%u base=%u eud_size_dw=%u srt_size_dw=%u "
+                            "counts: ro=%u rw=%u samp=%u cbuf=%u direct=%u\n",
+                    (const void*)ud, num_user_sgprs, user_sgpr_base, ud->eud_size_dw, ud->srt_size_dw,
+                    ud->sharp_resource_count[0], ud->sharp_resource_count[1],
+                    ud->sharp_resource_count[2], ud->sharp_resource_count[3],
+                    ud->direct_resource_count);
+            static const char* kCat[4] = { "ro", "rw", "samp", "cbuf" };
+            for (int cat = 0; cat < 4; cat++) {
+                const AgcShaderSharp* arr = ud->sharp_resource_offset[cat];
+                if (!arr_ok(arr, ud->sharp_resource_count[cat], sizeof(AgcShaderSharp))) {
+                    if (ud->sharp_resource_count[cat])
+                        fprintf(stderr, "[sharp]   %s[]: %u declared but the array is unreadable\n",
+                                kCat[cat], ud->sharp_resource_count[cat]);
+                    continue;
+                }
+                for (uint16_t slot = 0; slot < ud->sharp_resource_count[cat]; slot++) {
+                    const AgcShaderSharp& s = arr[slot];
+                    fprintf(stderr, "[sharp]   %s[%u]: bits=0x%04x offset_dw=%u size=%u%s%s\n",
+                            kCat[cat], slot, s.bits, s.offset_dw(), s.size(),
+                            s.empty() ? " EMPTY" : "",
+                            (!s.empty() && s.offset_dw() >= num_user_sgprs) ? " (EUD)" : "");
+                }
+            }
+            if (const uint16_t* dro = ud->direct_resource_offset)
+                if (arr_ok(dro, ud->direct_resource_count, sizeof(uint16_t)))
+                    for (uint16_t i = 0; i < ud->direct_resource_count; i++)
+                        if (dro[i] != 0xffff)
+                            fprintf(stderr, "[sharp]   direct[%u]: sgpr=%u\n", i, dro[i]);
+        }
+    }
+
     // Extended User Data (EUD): descriptors whose offset_dw is beyond the user-SGPR block live in a guest
     // memory spill area. Its base pointer sits in the user SGPR named by direct_resource_offset[5] (usage
     // type 5) — confirmed against the shader's own `s_load_dwordx4 sX, s[EUD:EUD+1], <off>`. A sharp at
@@ -615,9 +660,24 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
     // image-sampler at the same binding by the backend, so we don't emit a separate Sampler resource.
     const AgcShaderSharp* texs = ud->sharp_resource_offset[0];
     if (arr_ok(texs, ud->sharp_resource_count[0], sizeof(AgcShaderSharp))) {
+        // PROSPER_SHARPLOG: name the exact reason a DECLARED texture slot is dropped. Ten different
+        // `continue`s below can silently remove one, and from the outside every one of them looks
+        // identical to "the shader never declared it" — which is a completely different bug in a
+        // completely different file (#1590). Deduped per (user-data block, slot) so it costs one
+        // line per stage, not one per draw.
+        const bool sharplog = getenv("PROSPER_SHARPLOG") != nullptr;
+        auto tex_drop = [&](uint16_t slot, uint32_t off, const char* why) {
+            if (!sharplog) return;
+            static std::mutex mx;
+            static std::set<std::pair<const void*, uint32_t>> seen;
+            std::lock_guard<std::mutex> lk(mx);
+            if (!seen.insert({(const void*)ud, slot}).second) return;
+            fprintf(stderr, "[sharp]   ro[%u] offset_dw=%u DROPPED as texture: %s\n", slot, off, why);
+        };
         for (uint16_t slot = 0; slot < ud->sharp_resource_count[0]; slot++) {
             const AgcShaderSharp& s = texs[slot];
-            if (s.empty() || readonly_buffer_slots[slot]) continue;
+            if (s.empty()) continue;
+            if (readonly_buffer_slots[slot]) { tex_drop(slot, s.offset_dw(), "claimed by the V# path"); continue; }
             uint32_t off = s.offset_dw();
             // A T# may live in the user-SGPR block OR spill into the EUD, exactly like the cbuf path
             // (#257/#382) — the old hard `continue` for off+8 > num_user_sgprs silently DROPPED any
@@ -625,13 +685,25 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // load_sharp (bounds-checked; copies verbatim from the SGPR block for the in-block case, so
             // that path stays byte-identical) and decode from that buffer.
             uint32_t tv[8]; uint32_t tsrt = load_sharp(off, 8, tv);
-            if (tsrt == 0xFFFFFFFFu) continue;                  // out of block / EUD absent / unreadable
+            if (tsrt == 0xFFFFFFFFu) {                          // out of block / EUD absent / unreadable
+                tex_drop(slot, off, "load_sharp failed (out of block / EUD absent / unreadable)"); continue; }
             const bool tex_in_eud = (uint64_t)off + 8 > num_user_sgprs;
             DecodedImageDescriptor d = decode_image_descriptor(tv);
             if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
                 !valid_image_type(d.type) ||
                 d.base_array != 0 ||
-                d.width > 16384 || d.height > 16384) continue;  // skip a garbage/degenerate T#
+                d.width > 16384 || d.height > 16384) {          // skip a garbage/degenerate T#
+                if (sharplog) {
+                    char buf[192];
+                    snprintf(buf, sizeof buf,
+                             "degenerate T# base=0x%llx %ux%ux%u type=%u base_array=%u fmt=%u "
+                             "raw %08x %08x %08x %08x", (unsigned long long)d.base,
+                             d.width, d.height, d.depth, d.type, d.base_array, d.format,
+                             tv[0], tv[1], tv[2], tv[3]);
+                    tex_drop(slot, off, buf);
+                }
+                continue;
+            }
             // PROSPER_DUMP_TILERAW (issue #282 derivation): dump the raw guest texel bytes of a tiled
             // texture once per address, so its GPU tile swizzle can be reversed offline (coherence
             // scoring). Fires at T#-decode time (every draw's stage build), so it captures textures even
@@ -703,6 +775,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                     if (!warned[d.format & 511u]) { warned[d.format & 511u] = true;
                         fprintf(stderr, "[t#] UNMAPPED Gen5 IMG_FMT %u (%ux%u T#) -> skipping texture binding "
                                         "(extend gen5_image_format)\n", d.format, d.width, d.height); }
+                    tex_drop(slot, off, "unmapped Gen5 IMG_FMT");
                     continue;
                 }
                 fi.format = DataFormat::Unorm8; fi.num_components = 4; fi.bytes_per_block = 4;
@@ -719,12 +792,14 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                                     "wired; skipping texture binding\n", d.format,
                             fi.format == DataFormat::Bc6 ? "BC6H SF16" : "SNORM BCn",
                             d.width, d.height); }
+                tex_drop(slot, off, "signed block-compressed format (decode not wired)");
                 continue;
             }
             ShaderResource r;
             const DecodedImageView view = image_base_level_view(d, fi);
             if (!view.supported) {
                 warn_unsupported_image_view(d);
+                tex_drop(slot, off, "unsupported image view (mip/array layout)");
                 continue;
             }
             r.cls           = ResourceClass::Texture;
@@ -771,7 +846,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             const uint64_t backing_bytes = is_bcn
                 ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
                 : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
-            if (!backing_bytes || backing_bytes > UINT32_MAX) continue;
+            if (!backing_bytes || backing_bytes > UINT32_MAX) {
+                tex_drop(slot, off, "implausible backing byte size"); continue; }
             r.size = static_cast<uint32_t>(backing_bytes);
             // SGPR-resident T#: DIRECT provenance (image_sample SRSRC SGPR). EUD-resident T#: INDIRECT
             // (the s_load immediate = tsrt), and sgpr_base must be invalid so a stray by_sgpr_base for an

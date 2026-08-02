@@ -1,0 +1,37 @@
+# Tales of Graces f Remastered (PPSA19991) — reach the title screen.
+#
+# VALIDATED on Linux with hardware Vulkan (RADV), native 1920x1080, headless `screenshot`
+# frontend, PROSPER_RENDER=1, no render acceleration. The title screen is up by t~8 s and holds
+# for the rest of the run (13 of 14 samples over 110 s measure 407,942-409,335 distinct colours).
+#
+# Why input is needed at all: after the Bandai Namco and CRIWARE logos the title renders a modal
+# dialog — "This game uses an autosave feature. Please do not close the game while the save icon
+# is displayed." — carrying an X / O "Close" prompt. Nothing dismisses it on its own, so with no
+# input the title sits behind it and presents a black frame indefinitely. That, not the opening
+# movie, is what held this title at rung 1 (#1609).
+#
+# Cross also skips the two logo screens, so the early presses do double duty. Circle is alternated
+# because the dialog's prompt shows both glyphs and the confirm button is region/state dependent.
+# The presses continue past the title screen deliberately: they are harmless there (the title
+# screen holds unchanged under them) and they keep the route robust to a slower host reaching the
+# dialog later.
+4-5:cross
+5-6:circle
+6-7:cross
+7-8:circle
+8-9:cross
+9-10:circle
+10-11:cross
+11-12:circle
+12-13:cross
+13-14:circle
+14-15:cross
+15-16:circle
+16-17:cross
+17-18:circle
+18-19:cross
+19-20:circle
+20-21:cross
+21-22:circle
+22-23:cross
+23-24:circle
