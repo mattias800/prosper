@@ -4180,6 +4180,31 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
         out.threads_y = total_threads(out.groups_y, out.local_y);
         out.threads_z = total_threads(out.groups_z, out.local_z);
     }
+    // PROSPER_MAX_DISPATCH_GROUPS=N — DIAGNOSTIC ONLY, default off. Caps the workgroup count of every
+    // dispatch. This deliberately computes WRONG results (a clamped kernel processes part of its
+    // domain), so it is never a correctness or progression mode; it exists to test whether an
+    // enormous dispatch is what loses the Vulkan device (#1742 -> #1743). Without it, Astro Bot
+    // reaches 752,646 workgroups in one dispatch and the device is lost permanently a few submits
+    // later; with it, the same route can be run to the same point with the size bounded.
+    static const uint32_t group_cap = [] {
+        const char* value = std::getenv("PROSPER_MAX_DISPATCH_GROUPS");
+        return value && *value ? static_cast<uint32_t>(strtoul(value, nullptr, 0)) : 0u;
+    }();
+    if (group_cap) {
+        auto clamp_groups = [&](uint32_t& groups, uint32_t& threads, uint32_t local) {
+            if (groups <= group_cap) return;
+            static std::atomic<int> reported{0};
+            if (reported.fetch_add(1) < 16)
+                std::fprintf(stderr, "[dispatch-cap] clamping %u workgroups to %u\n",
+                             groups, group_cap);
+            groups = group_cap;
+            threads = static_cast<uint32_t>(std::min<uint64_t>(
+                static_cast<uint64_t>(groups) * local, UINT32_MAX));
+        };
+        clamp_groups(out.groups_x, out.threads_x, out.local_x);
+        clamp_groups(out.groups_y, out.threads_y, out.local_y);
+        clamp_groups(out.groups_z, out.threads_z, out.local_z);
+    }
     return out;
 }
 
