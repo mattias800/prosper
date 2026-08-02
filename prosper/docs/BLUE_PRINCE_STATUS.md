@@ -80,12 +80,39 @@ The `blue-prince-title` snapshot route guards the title screen.
   promote it to an explanation. Host cache footprint is byte-identical between arms (16 scratch
   slots, 111 persistent entries, 574.3 MiB), so it is not a working-set effect.
 
-  **This does not address the reported ~2 fps.** #1284 still decomposes the same title's 263.33 ms
-  submit as `draw_setup.resources` 95.42 + `readback` 79.16 + `gpu_wait` 29.29 + `record_upload`
-  22.58 ms; this change moves a ~7.5 % term and leaves all four intact. The title remains CPU-bound
-  in the frontend. Note also that the issue's headline **15.2x is a replay figure** — the persistent
-  decode cache is disabled by construction in replay — and live only ~77 of ~5,500 texture
-  references per submit ever reached it.
+  **This does not address the reported ~2 fps.** At the time this landed, #1284 decomposed the same
+  title's submit as 263.33 ms = `draw_setup.resources` 95.42 + `readback` 79.16 + `gpu_wait` 29.29 +
+  `record_upload` 22.58; this change moved a ~7.5 % term and left all four intact. Note also that the
+  issue's headline **15.2x is a replay figure** — the persistent decode cache is disabled by
+  construction in replay — and live only ~77 of ~5,500 texture references per submit ever reached it.
+  **Those four numbers are now superseded**: re-measured 2026-08-02 (see the #1284 bullet below), three
+  of the four have collapsed and only `draw_setup` remains. The title is still CPU-bound in the
+  frontend, which is the part of this paragraph that held.
+
+- **#1284 (open) — the frame-time term is backend storage-buffer upload, not textures or
+  descriptors.** Re-measured on `3a473bca` (post-#1292, post-#1703), 35 peer-free heavy windows:
+  the backend submit is **165.18 ms** (was 263.33 in the issue body), and **every term that
+  decomposition named has collapsed except `draw_setup`** — `readback` 79.16 -> 14.71,
+  `record_upload` 22.58 -> 2.73, `gpu_wait` 29.29 -> 6.71, fence waits 61 -> 16.3, while
+  `draw_setup` is 119.87 -> 126.81 at 1.39x the draws. `gpu_device` is **4.31 ms inside 165 ms**, so
+  the GPU is 2.6 % busy and this title is bound in prosper's own per-draw CPU path.
+  Sub-attributing `draw_setup.resources` (89.66 ms, 54 % of the submit) live gives
+  **`res.buffer` 93.7 %**, `res.descriptor` 2.0 %, `res.texture` 1.8 %. The frontend resolves every
+  binding to a zero-copy direct guest view (`logical=1,764.4 MiB materialized=0.0 MiB` per submit)
+  and the backend copies the deduplicated set into host-visible staging anyway, while
+  `backend_buffer_pool` sits pegged at its 256 MiB ceiling with evictions exactly equal to misses.
+  Full numbers, method and the four falsified sub-hypotheses (descriptor setup, live texture cost,
+  per-draw `getenv`, the #1268 content hash) are in
+  `docs/RENDERER_PERFORMANCE_2026_07.md` § *Blue Prince 3D submit decomposition, re-measured*.
+
+  **The immediately actionable part: `PROSPER_BACKEND_BUFFER_POOL_MB` defaults to 256 MiB and this
+  title's host-staging working set is 974 MiB**, so the pool thrashes — evictions exactly equal
+  misses (~216k each) and one buffer is destroyed for every one created. A four-arm alternating A/B
+  (256/2048/256/2048, one binary) takes the submit from 203.06 to 125.98 ms, **−34.8 % normalised
+  per draw**, with `res_buffer` −63 % and `cleanup` −80 %; at 2048 MiB the pool settles at 974 MiB /
+  503 buffers with **zero** evictions. All arms were contended, so confirm the magnitude on a clean
+  box before quoting it. The fix (memory-aware default + LRU eviction) cannot change rendered
+  output — the same bytes are uploaded from the same sources; only host staging recycling changes.
 
 ## Defect families (#1287) — families 1–3 and 5 RESOLVED 2026-07-26
 

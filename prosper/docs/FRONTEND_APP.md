@@ -316,6 +316,33 @@ lines show only the latest 25 submits/calls so a scene transition is immediately
 an independent 25-call backend window across submit boundaries. Compare `measured` with `detail` and
 its `other` remainder to verify that the subphase attribution covers the frontend's backend wall time.
 The core window also reports graphics-shader cache hits, misses, bypasses, and actual miss compilation time.
+
+`backend-submit draw_setup.resources` is sub-attributed on its own line:
+
+```text
+[render-window] backend-submit resources avg_ms: texture=.. (upload=.. bind=.. lookup=..)
+                buffer=.. (acquire=.. copy=..) descriptor=.. other=..
+```
+
+Read it before treating `resources` as descriptor cost. The interval it measures spans the whole
+per-draw resource block, which also builds every **texture upload** (image and memory creation plus
+the staging memcpy) and every **storage-buffer upload**, so the term can be dominated by pixel and
+vertex bytes while its name suggests descriptor bookkeeping. `texture` and `buffer` cover the whole
+per-resource branch. `upload` and `bind` are nested *inside* `texture` and cover only cache-**miss**
+work, so `lookup` (= `texture - upload - bind`) is what a cache **hit** still pays per reference.
+`descriptor` is the per-draw set layout allocation and update. `other` is the remainder against the
+`resources` total on the preceding line, so the split states its own completeness — a large `other`
+means the attribution is incomplete and should not be trusted.
+
+`acquire` and `copy` are nested inside `buffer` and separate the two mechanisms that live in it:
+`acquire` is pool/arena acquisition, which on a pool miss is
+`vkCreateBuffer` + `vkAllocateMemory` + `vkBindBufferMemory` + `vkMapMemory`, and `copy` is the
+staging `memcpy`. Read them together with the `backend_buffer_pool hits/misses/cached/evictions`
+line: evictions approaching misses means the pool is at its capacity ceiling and destroying one
+buffer for every one it creates, which `PROSPER_BACKEND_BUFFER_POOL_MB` raises. `buffer - acquire -
+copy` is the transient fallback path, which allocates and copies together and is deliberately
+attributed to neither.
+
 The older independent 25-backend-call timing windows are disabled by default because their multi-line logging
 can materially perturb the target call charged for printing them on Windows. Set
 `PROSPER_BACKEND_TIMING_WINDOWS=1` only when that cross-submit legacy view or its memory-pool line is needed.

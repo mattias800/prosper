@@ -1068,6 +1068,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 double backend_readback_ms = 0, backend_cleanup_ms = 0;
                 double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
                 double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
+                // #1284: sub-attribution of backend_setup_resources_ms. res_texture/res_buffer
+                // cover the whole per-resource branch; the upload/bind pair is nested inside
+                // res_texture and covers only cache-MISS work, so the remainder is what a cache
+                // hit still pays per reference. res_descriptor is the per-draw set alloc/update.
+                double backend_res_texture_ms = 0, backend_res_texture_upload_ms = 0;
+                double backend_res_texture_bind_ms = 0, backend_res_buffer_ms = 0;
+                double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
+                double backend_res_descriptor_ms = 0;
                 uint64_t backend_pipeline_refs = 0, backend_pipeline_hits = 0;
                 uint64_t backend_pipeline_misses = 0, backend_pipeline_bypasses = 0;
                 uint64_t backend_pipeline_entries = 0, backend_pipeline_evictions = 0;
@@ -1125,6 +1133,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 pending_timing.backend_setup_shader_ms += backend.setup_shader_ms;
                 pending_timing.backend_setup_fixed_ms += backend.setup_fixed_ms;
                 pending_timing.backend_setup_resources_ms += backend.setup_resources_ms;
+                pending_timing.backend_res_texture_ms += backend.res_texture_ms;
+                pending_timing.backend_res_texture_upload_ms += backend.res_texture_upload_ms;
+                pending_timing.backend_res_texture_bind_ms += backend.res_texture_bind_ms;
+                pending_timing.backend_res_buffer_ms += backend.res_buffer_ms;
+                pending_timing.backend_res_buffer_acquire_ms += backend.res_buffer_acquire_ms;
+                pending_timing.backend_res_buffer_copy_ms += backend.res_buffer_copy_ms;
+                pending_timing.backend_res_descriptor_ms += backend.res_descriptor_ms;
                 pending_timing.backend_setup_pipeline_ms += backend.setup_pipeline_ms;
                 pending_timing.backend_pipeline_refs += pipelines.references;
                 pending_timing.backend_pipeline_hits += pipelines.hits;
@@ -5364,6 +5379,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     double backend_readback_ms = 0, backend_cleanup_ms = 0;
                     double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
                     double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
+                    double backend_res_texture_ms = 0, backend_res_texture_upload_ms = 0;
+                    double backend_res_texture_bind_ms = 0, backend_res_buffer_ms = 0;
+                    double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
+                    double backend_res_descriptor_ms = 0;
                     uint64_t backend_pipeline_refs = 0, backend_pipeline_hits = 0;
                     uint64_t backend_pipeline_misses = 0, backend_pipeline_bypasses = 0;
                     uint64_t backend_pipeline_entries = 0, backend_pipeline_evictions = 0;
@@ -5409,6 +5428,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     timing.backend_setup_shader_ms += pending_timing.backend_setup_shader_ms;
                     timing.backend_setup_fixed_ms += pending_timing.backend_setup_fixed_ms;
                     timing.backend_setup_resources_ms += pending_timing.backend_setup_resources_ms;
+                    timing.backend_res_texture_ms += pending_timing.backend_res_texture_ms;
+                    timing.backend_res_texture_upload_ms += pending_timing.backend_res_texture_upload_ms;
+                    timing.backend_res_texture_bind_ms += pending_timing.backend_res_texture_bind_ms;
+                    timing.backend_res_buffer_ms += pending_timing.backend_res_buffer_ms;
+                    timing.backend_res_buffer_acquire_ms += pending_timing.backend_res_buffer_acquire_ms;
+                    timing.backend_res_buffer_copy_ms += pending_timing.backend_res_buffer_copy_ms;
+                    timing.backend_res_descriptor_ms += pending_timing.backend_res_descriptor_ms;
                     timing.backend_setup_pipeline_ms += pending_timing.backend_setup_pipeline_ms;
                     timing.backend_pipeline_refs += pending_timing.backend_pipeline_refs;
                     timing.backend_pipeline_hits += pending_timing.backend_pipeline_hits;
@@ -5492,6 +5518,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             totals.backend_setup_fixed_ms / nsub,
                             totals.backend_setup_resources_ms / nsub,
                             totals.backend_setup_pipeline_ms / nsub);
+                    fprintf(stderr,
+                            "[render-timing] backend-submit resources avg_ms: texture=%.2f "
+                            "(upload=%.2f bind=%.2f lookup=%.2f) buffer=%.2f "
+                            "(acquire=%.2f copy=%.2f) descriptor=%.2f other=%.2f\n",
+                            totals.backend_res_texture_ms / nsub,
+                            totals.backend_res_texture_upload_ms / nsub,
+                            totals.backend_res_texture_bind_ms / nsub,
+                            (totals.backend_res_texture_ms - totals.backend_res_texture_upload_ms -
+                             totals.backend_res_texture_bind_ms) / nsub,
+                            totals.backend_res_buffer_ms / nsub,
+                            totals.backend_res_buffer_acquire_ms / nsub,
+                            totals.backend_res_buffer_copy_ms / nsub,
+                            totals.backend_res_descriptor_ms / nsub,
+                            (totals.backend_setup_resources_ms - totals.backend_res_texture_ms -
+                             totals.backend_res_buffer_ms - totals.backend_res_descriptor_ms) / nsub);
                     fprintf(stderr,
                             "[render-timing] backend-submit pipelines refs=%.1f hits=%.1f misses=%.1f "
                             "bypass=%.1f entries=%llu evictions=%.1f\n",
@@ -5677,6 +5718,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             window.backend_setup_fixed_ms / wn,
                             window.backend_setup_resources_ms / wn,
                             window.backend_setup_pipeline_ms / wn);
+                    fprintf(stderr,
+                            "[render-window] backend-submit resources avg_ms: texture=%.2f "
+                            "(upload=%.2f bind=%.2f lookup=%.2f) buffer=%.2f "
+                            "(acquire=%.2f copy=%.2f) descriptor=%.2f other=%.2f\n",
+                            window.backend_res_texture_ms / wn,
+                            window.backend_res_texture_upload_ms / wn,
+                            window.backend_res_texture_bind_ms / wn,
+                            (window.backend_res_texture_ms - window.backend_res_texture_upload_ms -
+                             window.backend_res_texture_bind_ms) / wn,
+                            window.backend_res_buffer_ms / wn,
+                            window.backend_res_buffer_acquire_ms / wn,
+                            window.backend_res_buffer_copy_ms / wn,
+                            window.backend_res_descriptor_ms / wn,
+                            (window.backend_setup_resources_ms - window.backend_res_texture_ms -
+                             window.backend_res_buffer_ms - window.backend_res_descriptor_ms) / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit pipelines refs=%.1f hits=%.1f misses=%.1f "
                             "bypass=%.1f entries=%llu evictions=%.1f\n",

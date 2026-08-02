@@ -141,6 +141,22 @@ rasteriser; they are listed in `ci.yml` with a reproduction command and tracked 
 tests cannot run in CI at all — dumps are copyrighted and gitignored — and now report `(Skipped)` rather
 than passing.
 
+**Two dump-backed tests are pinned to *The Messenger* specifically, not to "some dump".** If you
+configure with `-DGAME_DUMP=` pointing at any other title, `module_loads_eboot` and
+`boot_reaches_first_syscall` fail locally while everything else passes, and the failure looks like a
+regression in the loader:
+
+```text
+module_loads_eboot        imports=610 expected 612 / distinct import libs=34 expected 35
+boot_reaches_first_syscall  link: load .../Media/Modules/Il2cppUserAssemblies.prx: cannot open file
+```
+
+`612` imports and `35` import libraries are `PPSA24651-app0`'s numbers (`tests/test_module.cpp`), and
+that dump is the `GAME_DUMP` default in `CMakeLists.txt`. The second test wants The Messenger's IL2CPP
+module layout. So a build configured against, say, Blue Prince for renderer work reports **171/173
+with those two red**, and that result is expected rather than a regression — confirm it by running the
+same two tests on unmodified master with the same `-DGAME_DUMP`, which is the cheap discriminator.
+
 ## Rule of thumb
 
 Prefer the cheapest layer that can catch a given bug: pure structural asserts for translation logic,

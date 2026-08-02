@@ -65,6 +65,155 @@ in-place mutation invalidate the entry. Its memory-aware default is one eighth o
 memory, clamped to 1-2 GiB. Disable it with `PROSPER_NO_TEXTURE_DECODE_CACHE=1`; the budget is controlled by
 `PROSPER_TEXTURE_DECODE_CACHE_MB`.
 
+## Blue Prince 3D submit decomposition, re-measured (2026-08-02, #1284)
+
+Re-measured on `3a473bca` — i.e. **after** #1292 (demand-driven readbacks) and #1703 (submit-scoped
+decode identity) — with `PROSPER_RENDER_TIMING=1` on the scripted Blue Prince fresh-save route into
+the manor, RADV / Radeon 8060S (STRIX_HALO, integrated), native 1920x1080, no snapshot acceleration.
+35 peer-free heavy `[render-window]` samples, median:
+
+| term | med ms | share | July (#1284 body) |
+|---|---:|---:|---:|
+| `measured` (whole backend submit) | 165.18 | 100 % | 263.33 |
+| `draw_setup` | 126.81 | **76.8 %** | 119.87 |
+| — `resources` | **89.66** | **54.3 %** | 95.42 |
+| — `fixed` | 24.40 | 14.8 % | 16.43 |
+| — unattributed inside `draw_setup` | 6.17 | 3.7 % | — |
+| — `pipeline` | 1.43 | 0.9 % | 1.22 |
+| `readback` | 14.71 | 8.9 % | 79.16 |
+| `cleanup` | 13.19 | 8.0 % | 11.03 |
+| `gpu_wait` | 6.71 | 4.1 % | 29.29 |
+| — `gpu_device` (real GPU time) | **4.31** | **2.6 %** | — |
+| `record_upload` | 2.73 | 1.7 % | 22.58 |
+| `fence_waits` per submit | 16.3 | — | 61 |
+
+The scene is now **2,109 draws/submit**, not July's 1,516, so `resources` improved more per draw than
+the totals show. **Every term the original decomposition named has collapsed except `draw_setup`,**
+which is unchanged and is now 77 % of the submit. `gpu_device` 4.31 ms inside a 165 ms submit means
+**2.6 % GPU utilisation**: this title is not GPU-, driver-, or shader-bound, it is bound in prosper's
+own per-draw CPU path.
+
+### `draw_setup.resources` is 93.7 % storage-buffer upload
+
+`resources` never measured descriptor setup. The interval spans the whole per-draw resource block,
+which also builds every texture upload and every storage-buffer upload. The sub-attribution added in
+#1284 (`[render-window] backend-submit resources avg_ms: …`) splits it live:
+
+| sub-term | med ms | share of `resources` |
+|---|---:|---:|
+| **`res.buffer`** | **103.51** | **93.7 %** |
+| `res.other` | 3.01 | 2.7 % |
+| `res.descriptor` | 2.25 | 2.0 % |
+| `res.texture` (upload 0.75 / bind 0.18 / lookup 1.15) | 2.01 | 1.8 % |
+
+`res_buffer` splits 4:1 into `copy` (the staging `memcpy`) **83.80 ms** over `acquire` (pool/arena
+acquisition, which on a pool miss is create + allocate + bind + map) **13.64 ms**, remainder 7.64 ms
+— the transient fallback path, which allocates and copies together and is attributed to neither, plus
+key building and lookups.
+
+**Do not read that split as "allocation churn is the small half".** `acquire` measures only the
+allocation *calls*; most of the churn cost lands in `copy`, because a freshly `vkAllocateMemory`'d
+and `vkMapMemory`'d staging buffer has non-resident pages and the memcpy into it faults, while a
+recycled pool buffer is already resident. The sub-attribution draws its boundary at the API call, and
+reading that boundary as the mechanism produced a wrong conclusion here once already.
+
+Mechanism, from two independent counters in the same run. **Volume:** the frontend resolves every
+binding to a zero-copy direct guest view and reports `buffers=34,747 logical=1,764.4 MiB
+materialized=0.0 MiB` per submit — and the *backend* then `memcpy`s the deduplicated set into
+host-visible staging anyway. The Evergate "direct guest backing" win was only ever realised on the
+frontend side of that boundary. **Churn:** `backend_buffer_pool` sits pegged at its 256 MiB default
+ceiling with evictions exactly equal to misses (+7,960 / +7,960 over 9 s, 45 % miss rate) — a capacity
+thrash in which one buffer is destroyed for every one created, with the eviction victim taken as
+`available.begin()` on an `unordered_map`, i.e. an arbitrary bucket rather than an LRU.
+
+### The buffer pool's 256 MiB default is ~35 % of the frame
+
+`render_host_buffer_pool_limit()` defaults to a **fixed 256 MiB**. Blue Prince's real host-staging
+working set is **974 MiB**, so on a 3D title the pool degenerates into an allocator: evictions equal
+misses (~216k each per arm) and one buffer is destroyed for every one created.
+
+Four alternating arms, one binary, `PROSPER_BACKEND_BUFFER_POOL_MB` the only lever (256 / 2048 /
+256 / 2048). Witness: the 256 arms peak at 256.0 MiB with 215,366 and 217,205 misses; the 2048 arms
+settle at 974.0 MiB / 503 buffers with **503 misses and zero evictions**.
+
+| term | 256 MiB | 2048 MiB | delta | within-treatment | between |
+|---|---:|---:|---:|---:|---:|
+| `measured` | 203.06 | 125.98 | -38.0 % raw | 10.62 | 77.09 |
+| `res_buffer` | 113.10 | 41.50 | -63.3 % | 16.76 | 71.60 |
+| `copy` | 92.54 | 33.27 | -64.0 % | 18.19 | 59.27 |
+| `acquire` | 13.65 | 1.44 | -89.5 % | 0.95 | 12.22 |
+| `cleanup` | 14.77 | 2.95 | -80.1 % | 0.14 | 11.82 |
+| draws | 2218.15 | 2109.47 | +4.9 % | 35.10 | 108.67 |
+
+Every timing term separates far beyond its within-treatment spread. **The draws row does not**: the
+2048 arms sat at 2109/2110 draws against the 256 arms' 2201/2236, a systematic ~4.9 % lighter scene
+(an expected selection effect — the faster arm covers more of a fixed-duration route and samples
+different moments). So the raw -38.0 % overstates it. **Normalised per draw, 0.0915 -> 0.0597 ms,
+the honest figure is -34.8 %** — quote that one.
+
+Controls: per-submit byte volume is identical between arms (`logical=1,644.0 / 1,764.4 MiB`,
+`materialized=0.0 MiB`), so the 2048 arm copies the same bytes faster. Minor faults sampled from
+`/proc/<pid>/stat` (no ptrace, no perturbation) run at 150,911/s for the 256 arm against 48,827/s
+and 97,398/s for the two 2048 arms — roughly 31,400 versus 6,200 and 12,200 per submit. The direction
+holds, but **the two 2048 arms differ from each other by 2x**, nearly the size of the gap being
+attributed, and explaining the whole `copy` delta by faults alone would need ~3 us per fault, well
+above a generic anonymous-page fault. First-touch faulting on freshly mapped staging memory is
+therefore recorded as the **leading hypothesis, not a finding**; page-table/TLB churn from ~216k
+map/unmap pairs per run is the other candidate. The fix does not depend on which it is.
+
+**Caveat: all four arms ran contended (one peer throughout).** Absolute milliseconds are inflated;
+the comparison is internally controlled but the magnitude needs a clean-box confirmation.
+
+The fix is bounded and **cannot change rendered output** — the same bytes are uploaded from the same
+sources, only host staging recycling changes: make the default memory-aware (mirroring
+`texture_decode_cache_limit_bytes`, with the `*_MB` override winning) and give eviction an LRU victim
+instead of `available.begin()` on an `unordered_map`. The risk is memory footprint, not correctness.
+
+This does **not** retire the copy, and the difference matters for what anyone expects next: the fix
+stops the pool *thrashing while it copies*, it does not stop the copying. Even at 2048 MiB, `copy` is
+33.27 ms and `res_buffer` 41.50 ms of a 125.98 ms submit — about **8 backend submits per second
+against a bar of 30.** Removing the copy entirely is tracked as **#1733**: import guest pages as
+Vulkan memory (`VK_EXT_external_memory_host`; prosper uses it nowhere today, there is no
+`vkGetMemoryHostPointerPropertiesEXT` / `VkImportMemoryHostPointerInfoEXT` in the tree), or add a
+versioned guest-identity buffer cache. The second reuses the #1703 machinery but carries the
+#611/#780 stale-data risk; the first does not, because the GPU would read the guest bytes rather than
+a snapshot of them.
+
+Frame math, so nobody expects one term to finish the job: at the clean 165.18 ms submit, removing
+100 % of `copy` gives ~95 ms (10.5 submits/s); removing `copy` **and** `acquire` **and** `fixed`
+still leaves ~60 ms (16/s). `readback` + `cleanup` + `gpu_wait` + `record_upload` are 37 ms combined
+and `gpu_device` is 4.31 ms, so **no single term reaches 30 fps on this title.**
+
+### Ruled out
+
+- **Per-draw descriptor setup is not the term.** `res.descriptor` — layout lookup,
+  `vkAllocateDescriptorSets`, `vkUpdateDescriptorSets` — is 2.25 ms across 2,152 draws (~1 µs/draw),
+  2.0 % of `resources`. This is the measured reason #1284 round 1's descriptor-set-reuse experiment
+  came back neutral: it was optimising 2 % of the term. Do not re-open it.
+- **Texture handling is not the term live.** `res.texture` is 2.01 ms; #1691/#1703's caches work.
+  Note the trap: the *identical instrument* on an offline `.prgcap` replay of the same title reports
+  `res.texture` = 762.72 ms, because replay disables the persistent decode cache by construction
+  (`texture_decode_cache_candidate()` requires `!has_captured_host_data`). **A replay texture number
+  is not evidence about live texture cost, in either direction.**
+- **Un-cached `getenv` in the per-draw loop is not a term.** The loop makes 11 un-cached `getenv`
+  calls (`PROSPER_NO_CULL`, `NO_BLEND` x3, `DSLOG`, `STENCILLOG`, `STENCIL_MIRROR`,
+  `STENCIL_REPLACE`, `NO_DEPTH_BIAS`, `FLIP_FRONT_FACE`, and `NO_SWIZZLE` which is per *texture
+  reference*), sitting next to three neighbours that already cache into `static const`. Measured
+  directly: glibc `getenv` on a miss costs 19.7 ns (10-var environment) to 25.6 ns (94-var), so the
+  whole per-submit volume is **≈0.5 ms of 165 ms — 0.3 %**. Tidy if touched for other reasons; not a
+  performance fix.
+
+  Recorded at length because of how it *looked*: 11 uncached environment lookups in the hottest loop
+  in the renderer, one of them per texture reference, sitting beside three neighbours that already
+  cache into `static const` — an obvious oversight with an obvious fix, and it was minutes from being
+  "fixed". A two-minute microbenchmark priced it at nothing. glibc's `getenv` compares the first
+  character before `strncmp`, so it is tens of nanoseconds, not the microseconds the shape of the
+  code suggests. **A plausible optimisation that measures to nothing is worth writing down precisely
+  because the next reader will find the same 11 calls and draw the same conclusion.** Price a hot-loop
+  call before removing it, not after.
+- **The #1268 small-buffer content hash is not the term.** Live `hash-stats`: 414,633 hash calls over
+  168.1 MiB against 3.5 M references — ~1 % of the buffer term.
+
 ## Plucky Squire maximum-size atlas retention (2026-07-29)
 
 Plucky Squire exposed a capacity cliff rather than a decode-kernel regression. The title first holds

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <span>
@@ -26,6 +27,16 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+// For the memory-aware host-buffer pool budget (render_host_physical_memory_bytes).
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace prosper::test {
 
@@ -522,6 +533,22 @@ struct BackendRenderTimingStats {
     double setup_fixed_ms = 0;
     double setup_resources_ms = 0;
     double setup_pipeline_ms = 0;
+    // Sub-attribution of setup_resources_ms (#1284). `resources` is not descriptor bookkeeping alone:
+    // the same interval also builds every texture upload (image/memory creation plus the staging
+    // memcpy) and every storage-buffer upload, so a term that reads as "descriptor setup" can be
+    // dominated by pixel and vertex bytes. These split it so the dominant sub-term is named rather
+    // than assumed. res_texture_ms and res_buffer_ms cover the whole per-resource branch;
+    // res_texture_upload_ms and res_texture_bind_ms are nested INSIDE res_texture_ms and cover only
+    // the cache-miss work (image+staging build, view/sampler creation), so
+    // res_texture_ms - res_texture_upload_ms - res_texture_bind_ms is the per-reference key/lookup
+    // cost that a cache HIT still pays. res_descriptor_ms is the per-draw set layout/alloc/update.
+    double res_texture_ms = 0;
+    double res_texture_upload_ms = 0;
+    double res_texture_bind_ms = 0;
+    double res_buffer_ms = 0;
+    double res_buffer_acquire_ms = 0;
+    double res_buffer_copy_ms = 0;
+    double res_descriptor_ms = 0;
 
     double total_ms() const {
         return target_ms + draw_setup_ms + record_upload_ms + gpu_wait_ms + readback_ms + cleanup_ms;
@@ -1622,15 +1649,23 @@ struct RenderHostBuffer {
     void* mapped = nullptr;
     VkDeviceSize bytes = 0;
     VkDeviceSize allocation_bytes = 0;
+    // Release order, stamped when the buffer enters the cache. Only meaningful for cached entries;
+    // it is what makes eviction least-recently-used rather than arbitrary (#1284).
+    uint64_t last_use = 0;
 };
 
 struct RenderHostBufferPool {
-    std::unordered_map<VkDeviceSize, std::vector<RenderHostBuffer>> available;
+    // A deque per capacity class, ordered oldest-release at the front. Acquire takes the BACK (the
+    // most recently released buffer of that class, so the hottest pages come back first) and
+    // eviction takes the FRONT (the least recently released). A vector cannot do both in O(1).
+    std::unordered_map<VkDeviceSize, std::deque<RenderHostBuffer>> available;
     VkDeviceSize cached_bytes = 0;
     size_t cached_buffers = 0;
     uint64_t hits = 0;
     uint64_t misses = 0;
     uint64_t evictions = 0;
+    // Monotonic release counter; see RenderHostBuffer::last_use.
+    uint64_t release_clock = 0;
 };
 
 struct RenderHostBufferPoolStats {
@@ -1650,12 +1685,86 @@ inline bool render_host_buffer_pool_enabled() {
     return getenv("PROSPER_NO_BACKEND_BUFFER_POOL") == nullptr;
 }
 
+// Which capacity class holds the least-recently-released cached buffer.
+//
+// Eviction used to take `pool.available.begin()` — an arbitrary `unordered_map` bucket — so under
+// pressure the pool discarded whichever class the hash happened to order first, which is very often
+// the class about to be needed again. That is the failure mode that survives any budget smaller than
+// the working set, so it is fixed independently of the budget (#1284).
+//
+// Each deque is ordered oldest-release at the front, so only the fronts can be the global oldest and
+// the scan is over the number of capacity classes (~20-30 power-of-two sizes), not cached entries.
+// Pure over pool state so the policy is unit-testable without a Vulkan device.
+inline bool render_host_buffer_pool_lru_key(const RenderHostBufferPool& pool,
+                                            VkDeviceSize& key_out) {
+    bool found = false;
+    uint64_t oldest = 0;
+    for (const auto& [capacity, entries] : pool.available) {
+        if (entries.empty()) continue;
+        const uint64_t stamp = entries.front().last_use;
+        if (!found || stamp < oldest) {
+            found = true;
+            oldest = stamp;
+            key_out = capacity;
+        }
+    }
+    return found;
+}
+
+// Host physical memory, for the memory-aware pool budget below. Duplicated rather than shared with
+// the frontend's identical helper because this header is included BY the frontend, so taking the
+// dependency the other way would invert the include order.
+inline uint64_t render_host_physical_memory_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages <= 0 || page_size <= 0) return 0;
+    return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+#endif
+}
+
+// Budget for retained host-visible staging buffers.
+//
+// This was a flat 256 MiB, which is not a cache for a 3D title: Blue Prince's per-submit staging
+// working set measures 974 MiB across 503 buffers, so the pool ran permanently at its ceiling with
+// evictions EXACTLY equal to misses (~216k of each) — one buffer destroyed for every one created.
+// Raising it to 2 GiB on that title took the backend submit from 203.06 to 125.98 ms, -34.8 %
+// normalised per draw, and dropped evictions to zero (#1284).
+//
+// Sized as a fraction of host RAM rather than a bigger constant, mirroring
+// `texture_decode_cache_limit_bytes`. The floor is the historical 256 MiB, so no host is given LESS
+// than before; the ceiling bounds the worst case. An explicit `PROSPER_BACKEND_BUFFER_POOL_MB` wins
+// outright, including values below the floor, because it is also the A/B lever and a constrained-host
+// escape hatch. Pure and separated from `getenv` so it can be unit-tested across host sizes.
+inline VkDeviceSize render_host_buffer_pool_limit_bytes(const char* override_mib,
+                                                        uint64_t physical_memory_bytes) {
+    constexpr uint64_t kMiB = 1024ull * 1024ull;
+    constexpr uint64_t kMinBytes = 256ull * kMiB;
+    constexpr uint64_t kMaxBytes = 2048ull * kMiB;
+    if (override_mib) {
+        const uint64_t mib = strtoull(override_mib, nullptr, 10);
+        if (mib > UINT64_MAX / kMiB) return VkDeviceSize{UINT64_MAX};
+        return static_cast<VkDeviceSize>(mib * kMiB);
+    }
+    if (!physical_memory_bytes) return static_cast<VkDeviceSize>(kMinBytes);
+    uint64_t bytes = std::clamp(physical_memory_bytes / 8u, kMinBytes, kMaxBytes);
+    bytes -= bytes % kMiB;
+    return static_cast<VkDeviceSize>(bytes);
+}
+
 inline VkDeviceSize render_host_buffer_pool_limit() {
     static const VkDeviceSize limit = []() -> VkDeviceSize {
-        const char* value = getenv("PROSPER_BACKEND_BUFFER_POOL_MB");
-        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 256ull;
-        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
-        return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
+        const uint64_t physical = render_host_physical_memory_bytes();
+        const VkDeviceSize bytes = render_host_buffer_pool_limit_bytes(
+            getenv("PROSPER_BACKEND_BUFFER_POOL_MB"), physical);
+        fprintf(stderr,
+                "[render] backend host-buffer pool budget = %.1f MiB (host physical %.1f GiB)\n",
+                bytes / (1024.0 * 1024.0), physical / (1024.0 * 1024.0 * 1024.0));
+        return bytes;
     }();
     return limit;
 }
@@ -1738,9 +1847,12 @@ inline void release_render_host_buffer(VkDevice device, RenderHostBuffer buffer)
     while ((pool.cached_buffers >= max_cached_buffers ||
             pool.cached_bytes > limit - buffer.allocation_bytes) &&
            !pool.available.empty()) {
-        auto victim = pool.available.begin();
-        RenderHostBuffer old = victim->second.back();
-        victim->second.pop_back();
+        VkDeviceSize victim_key = 0;
+        if (!render_host_buffer_pool_lru_key(pool, victim_key)) break;
+        auto victim = pool.available.find(victim_key);
+        if (victim == pool.available.end() || victim->second.empty()) break;
+        RenderHostBuffer old = victim->second.front();
+        victim->second.pop_front();
         if (victim->second.empty()) pool.available.erase(victim);
         pool.cached_bytes -= old.allocation_bytes;
         --pool.cached_buffers;
@@ -1749,6 +1861,7 @@ inline void release_render_host_buffer(VkDevice device, RenderHostBuffer buffer)
     }
     if (pool.cached_buffers < max_cached_buffers &&
         pool.cached_bytes <= limit - buffer.allocation_bytes) {
+        buffer.last_use = ++pool.release_clock;
         pool.available[buffer.bytes].push_back(buffer);
         pool.cached_bytes += buffer.allocation_bytes;
         ++pool.cached_buffers;
@@ -3618,8 +3731,37 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     double setup_fixed_ms = 0.0;
     double setup_resources_ms = 0.0;
     double setup_pipeline_ms = 0.0;
+    // #1284 sub-attribution of setup_resources_ms; see BackendRenderTimingStats for what each covers.
+    double res_texture_ms = 0.0;
+    double res_texture_upload_ms = 0.0;
+    double res_texture_bind_ms = 0.0;
+    double res_buffer_ms = 0.0;
+    // Nested INSIDE res_buffer_ms, splitting the two candidate mechanisms apart: Vulkan object churn
+    // (pool/arena acquisition, which on a miss is create+allocate+bind+map) versus staging memcpy
+    // bandwidth. They imply completely different fixes, so the split is what selects between them.
+    double res_buffer_acquire_ms = 0.0;
+    double res_buffer_copy_ms = 0.0;
+    double res_descriptor_ms = 0.0;
     auto setup_elapsed_ms = [](auto begin, auto end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
+    // Scope-guard timer, so a bucket stays correct across the `continue`/`break` exits the resource
+    // loop already uses. Reads the clock only when timing is enabled; the whole sub-attribution is
+    // inert (two predictable branches per resource) on a default run.
+    struct ResourcePhaseTimer {
+        bool enabled;
+        double* sink;
+        TimingClock::time_point begin;
+        ResourcePhaseTimer(bool en, double* s)
+            : enabled(en), sink(s),
+              begin(en ? TimingClock::now() : TimingClock::time_point{}) {}
+        ResourcePhaseTimer(const ResourcePhaseTimer&) = delete;
+        ResourcePhaseTimer& operator=(const ResourcePhaseTimer&) = delete;
+        ~ResourcePhaseTimer() {
+            if (enabled)
+                *sink += std::chrono::duration<double, std::milli>(TimingClock::now() - begin)
+                             .count();
+        }
     };
     BackendPipelineCacheStats& pipeline_stats = backend_pipeline_cache_stats_storage();
     pipeline_stats = {};
@@ -4012,6 +4154,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 const FrameResource& r = R[i];
                 lb[i] = {}; lb[i].binding = r.binding; lb[i].descriptorCount = 1;
                 if (r.is_texture()) {
+                    const ResourcePhaseTimer phase_texture(timing_enabled, &res_texture_ms);
                     lb[i].descriptorType = r.is_storage_image
                         ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                         : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -4076,6 +4219,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         if (found != texture_upload_indices.end()) upload_index = found->second;
                     }
                     if (upload_index == SIZE_MAX) {
+                        const ResourcePhaseTimer phase_upload(timing_enabled,
+                                                              &res_texture_upload_ms);
                         upload_index = texture_uploads.size();
                         texture_uploads.push_back({});
                         SharedTextureUpload& upload = texture_uploads.back();
@@ -4414,6 +4559,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     if (binding_found != shared_texture_binding_indices.end()) {
                         binding_index = binding_found->second;
                     } else {
+                        const ResourcePhaseTimer phase_bind(timing_enabled, &res_texture_bind_ms);
                         binding_index = shared_texture_bindings.size();
                         SharedTextureBinding binding;
                         const bool persistent_bindings_enabled = share_backend_resources &&
@@ -4489,6 +4635,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
                     wr[i].descriptorType = lb[i].descriptorType; wr[i].pImageInfo = &dii[i];
                 } else {
+                    const ResourcePhaseTimer phase_buffer(timing_enabled, &res_buffer_ms);
                     lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
                     if (r.is_internal_gds) {
                         const RenderHostBuffer& gds = render_internal_gds_buffer();
@@ -4578,9 +4725,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         buffer_index = shared_buffers.size();
                         SharedBufferUpload upload;
                         const VkDeviceSize bytes = static_cast<VkDeviceSize>(word_count) * 4;
-                        if (use_buffer_arena)
+                        if (use_buffer_arena) {
+                            const ResourcePhaseTimer phase_acquire(timing_enabled,
+                                                                   &res_buffer_acquire_ms);
                             acquire_buffer_arena_slice(bytes, upload);
+                        }
                         if (!upload.arena && reuse_host_buffers) {
+                            const ResourcePhaseTimer phase_acquire(timing_enabled,
+                                                                   &res_buffer_acquire_ms);
                             RenderHostBuffer pooled = acquire_render_host_buffer(ctx, bytes);
                             upload.buffer = pooled.buffer;
                             upload.memory = pooled.memory;
@@ -4623,6 +4775,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 upload.range = bytes;
                             }
                         } else {
+                            const ResourcePhaseTimer phase_copy(timing_enabled,
+                                                                &res_buffer_copy_ms);
                             std::memcpy(static_cast<uint8_t*>(upload.mapped) + upload.offset,
                                         words, static_cast<size_t>(bytes));
                             upload.range = bytes;
@@ -4642,6 +4796,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 }
             }
             if (!buffer_resources_ready) continue;
+            const ResourcePhaseTimer phase_descriptor(timing_enabled, &res_descriptor_ms);
             for (uint32_t s = 0; s < v.n_sets; s++) {
                 std::vector<VkDescriptorSetLayoutBinding> slb;
                 for (size_t i = 0; i < R.size(); i++) if (R[i].set == s) slb.push_back(lb[i]);
@@ -6188,6 +6343,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.setup_shader_ms = setup_shader_ms;
         call_timing.setup_fixed_ms = setup_fixed_ms;
         call_timing.setup_resources_ms = setup_resources_ms;
+        call_timing.res_texture_ms = res_texture_ms;
+        call_timing.res_texture_upload_ms = res_texture_upload_ms;
+        call_timing.res_texture_bind_ms = res_texture_bind_ms;
+        call_timing.res_buffer_ms = res_buffer_ms;
+        call_timing.res_buffer_acquire_ms = res_buffer_acquire_ms;
+        call_timing.res_buffer_copy_ms = res_buffer_copy_ms;
+        call_timing.res_descriptor_ms = res_descriptor_ms;
         call_timing.setup_pipeline_ms = setup_pipeline_ms;
         struct TimingTotals {
             uint64_t calls = 0, draws = 0;
@@ -6506,6 +6668,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(setup_shader_ms);
             PROSPER_SUM_TIMING_STAT(setup_fixed_ms);
             PROSPER_SUM_TIMING_STAT(setup_resources_ms);
+            PROSPER_SUM_TIMING_STAT(res_texture_ms);
+            PROSPER_SUM_TIMING_STAT(res_texture_upload_ms);
+            PROSPER_SUM_TIMING_STAT(res_texture_bind_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_acquire_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_copy_ms);
+            PROSPER_SUM_TIMING_STAT(res_descriptor_ms);
             PROSPER_SUM_TIMING_STAT(setup_pipeline_ms);
 #undef PROSPER_SUM_TIMING_STAT
         }
