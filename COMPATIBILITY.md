@@ -21,7 +21,7 @@ Last updated: 2026-08-01
 | Terminator (2D)&nbsp;¹ | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay reached (user-verified) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Day One gameplay renders; the manor entrance hall matches the hardware reference |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
-| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 title, name entry, name confirmation, and first-run `System Settings 1/4` onboarding reached; gameplay is not yet validated |
+| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Native 3840×2160 title, name entry, name confirmation, and first-run `System Settings 1/4` onboarding reached, with audio; gameplay is not yet validated |
 | *Alex Kidd in Miracle World DX* | `PPSA02664` | Unity / IL2CPP | ✅ First level reached and rendered at native 1920×1080; colour matches the hardware reference, with a minor title-overlay contrast defect |
 | *New Joe &amp; Mac: Caveman Ninja* | `PPSA02801` | Unity / IL2CPP | ✅ Title screen, menus and level 1 gameplay render at native 1920×1080 — reached on the first boot with no code changes |
 | *Asterix &amp; Obelix: Slap Them All!* | `PPSA08576` | Unity / IL2CPP | ✅ Title screen and first forest level render at native 1920×1080 — reached on unmodified master with no code changes |
@@ -234,6 +234,15 @@ ordinary Cross pulses; the first image above is an unmodified native frontend ca
 same validated title state. Title performance remains below full speed and varies with concurrent GPU work. Some
 animation samples still show a dark/purple background behind the stable logo, so visual correctness and
 full-speed performance remain open.
+
+**Audio plays.** The title drives `sceAudioOut2` with a 12-channel MAIN bed; prosper used to discard
+any port wider than 7.1, so a whole audio context never opened a host device (#1692/#1700). The bed
+is now folded to the host's stereo sink, and a 147-second routed capture carries continuous
+music-like content (peak 0.390, 90 % non-zero samples, no repeated grains). The project owner has
+confirmed by ear that the title's music plays and sounds right — bring-up rung 4 for audio. That
+confirms real audio reaches the device at sane levels through the guest's own path; it does **not**
+confirm the multichannel fold's channel order, because ten of this bed's twelve channels are
+measured empty, so every mapping that routes the front pair to the two sides sounds identical.
 
 The apparently permanent black frame in no-input runs is authored UI state, not a lost final composite:
 the complete sky/ocean scene exists underneath an opaque-black Slate background, and the routed input

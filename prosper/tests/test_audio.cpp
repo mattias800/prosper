@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -184,10 +185,112 @@ static void test_signal_stats() {
     CHECK(loud.samples == 0 && loud.nonzero == 0 && loud.peak == 0.0 && loud.rms() == 0.0);
 }
 
+// audio_stereo_downmix is the whole correctness surface of multichannel MAIN output: the mix loop
+// does nothing but apply it. It is a pure function of the channel count, so pin the layout contract
+// here rather than only through a live boot.
+static void test_stereo_downmix() {
+    constexpr float kC = 0.70710678f;   // -3 dB, used for centre and surround
+    constexpr float kL = 0.5f;          // -6 dB, LFE
+    AudioStereoGain g[kAudioMaxBedChannels];
+    auto near = [](float a, float b) { return std::fabs(a - b) < 1e-6f; };
+
+    // Mono feeds both sides; stereo is identity. Nothing is unplaced in either.
+    CHECK(audio_stereo_downmix(1, g, kAudioMaxBedChannels) == 0);
+    CHECK(near(g[0].left, 1.0f) && near(g[0].right, 1.0f));
+    CHECK(audio_stereo_downmix(2, g, kAudioMaxBedChannels) == 0);
+    CHECK(near(g[0].left, 1.0f) && near(g[0].right, 0.0f));
+    CHECK(near(g[1].left, 0.0f) && near(g[1].right, 1.0f));
+
+    // 3ch adds FC (both sides), 4ch is quad (a second L/R pair), 5ch is FL/FR/FC/SL/SR.
+    CHECK(audio_stereo_downmix(3, g, kAudioMaxBedChannels) == 0);
+    CHECK(near(g[2].left, kC) && near(g[2].right, kC));
+    CHECK(audio_stereo_downmix(4, g, kAudioMaxBedChannels) == 0);
+    CHECK(near(g[2].left, kC) && near(g[2].right, 0.0f));
+    CHECK(near(g[3].left, 0.0f) && near(g[3].right, kC));
+    CHECK(audio_stereo_downmix(5, g, kAudioMaxBedChannels) == 0);
+    CHECK(near(g[2].left, kC) && near(g[2].right, kC));
+    CHECK(near(g[3].left, kC) && near(g[3].right, 0.0f));
+    CHECK(near(g[4].left, 0.0f) && near(g[4].right, kC));
+
+    // 6..8: FL FR FC LFE then surround pairs. 7ch's single rear-centre splits across both sides.
+    CHECK(audio_stereo_downmix(6, g, kAudioMaxBedChannels) == 0);
+    CHECK(near(g[2].left, kC) && near(g[2].right, kC));
+    CHECK(near(g[3].left, kL) && near(g[3].right, kL));
+    CHECK(near(g[4].left, kC) && near(g[4].right, 0.0f));
+    CHECK(near(g[5].left, 0.0f) && near(g[5].right, kC));
+    CHECK(audio_stereo_downmix(7, g, kAudioMaxBedChannels) == 0);
+    CHECK(near(g[6].left, kC * 0.5f) && near(g[6].right, kC * 0.5f));
+    CHECK(audio_stereo_downmix(8, g, kAudioMaxBedChannels) == 0);
+    CHECK(near(g[6].left, kC) && near(g[6].right, 0.0f));
+    CHECK(near(g[7].left, 0.0f) && near(g[7].right, kC));
+
+    // 9..16 (#1700): the bed is no longer DISCARDED — its first eight channels fold exactly as an
+    // 8-channel bed does, which is where every measured title puts its content. The remaining
+    // channels have no measured side, so they are reported as unplaced and contribute nothing;
+    // that count is the fail-visible signal, and it must not silently become zero.
+    for (unsigned ch = 9; ch <= kAudioMaxBedChannels; ++ch) {
+        AudioStereoGain wide[kAudioMaxBedChannels];
+        CHECK(audio_stereo_downmix(ch, wide, kAudioMaxBedChannels) == ch - 8);
+        AudioStereoGain eight[kAudioMaxBedChannels];
+        CHECK(audio_stereo_downmix(8, eight, kAudioMaxBedChannels) == 0);
+        for (unsigned c = 0; c < 8; ++c)
+            CHECK(near(wide[c].left, eight[c].left) && near(wide[c].right, eight[c].right));
+        for (unsigned c = 8; c < ch; ++c)
+            CHECK(wide[c].left == 0.0f && wide[c].right == 0.0f);
+    }
+
+    // Every placed bed keeps left/right balanced, and every channel is placed on exactly one side or
+    // on both — never left half-placed. The pairwise check is what a summed one would miss: two
+    // channels swapped between sides sum identically, and a total is also blind to a channel that
+    // reaches one side only by accident.
+    //
+    // Note what this file DOES pin, because it is easy to undersell: the explicit per-index
+    // assertions above fix index -> side for widths 6, 7 and 8, so a build that swapped the fold's
+    // left and right fails here. What no test in this repo can settle is whether that mapping is
+    // RIGHT AGAINST HARDWARE — prosper's live probe groups a bed's channels by side but cannot
+    // orient the groups, so the orientation rests on the index-0 = FrontLeft convention. That is a
+    // narrower and more useful claim than "nothing here can see a swap", and #1720 owns it.
+    for (unsigned ch = 1; ch <= kAudioMaxBedChannels; ++ch) {
+        AudioStereoGain m[kAudioMaxBedChannels];
+        CHECK(audio_stereo_downmix(ch, m, kAudioMaxBedChannels) == (ch > 8 ? ch - 8 : 0));
+        float sum_l = 0.0f, sum_r = 0.0f;
+        unsigned left_only = 0, right_only = 0, both = 0, neither = 0;
+        for (unsigned c = 0; c < ch; ++c) {
+            sum_l += m[c].left;
+            sum_r += m[c].right;
+            const bool l = m[c].left != 0.0f, r = m[c].right != 0.0f;
+            if (l && r) ++both; else if (l) ++left_only; else if (r) ++right_only; else ++neither;
+            // Both-sided channels are centre-like and must be centred, not merely non-zero.
+            if (l && r) CHECK(near(m[c].left, m[c].right));
+        }
+        CHECK(near(sum_l, sum_r));
+        CHECK(left_only == right_only);                       // side-exclusive channels come in pairs
+        CHECK(neither == (ch > 8 ? ch - 8 : 0));               // exactly the unplaced ones
+        CHECK(both + left_only + right_only + neither == ch);  // no channel counted twice
+    }
+    // Mono is the one layout where a single channel is legitimately both-sided at full gain, and
+    // 2ch the one where neither channel is: pin both so the classification above cannot drift.
+    CHECK(audio_stereo_downmix(1, g, kAudioMaxBedChannels) == 0);
+    CHECK(g[0].left != 0.0f && g[0].right != 0.0f);
+    CHECK(audio_stereo_downmix(2, g, kAudioMaxBedChannels) == 0);
+    CHECK(g[0].right == 0.0f && g[1].left == 0.0f);
+
+    // Refusals: an unrepresentable width or an undersized output must place nothing and say so.
+    AudioStereoGain guard[kAudioMaxBedChannels];
+    for (auto& e : guard) e = AudioStereoGain{7.0f, 7.0f};
+    CHECK(audio_stereo_downmix(0, guard, kAudioMaxBedChannels) == 0);
+    CHECK(audio_stereo_downmix(kAudioMaxBedChannels + 1, guard, kAudioMaxBedChannels)
+          == kAudioMaxBedChannels + 1);
+    CHECK(audio_stereo_downmix(8, guard, 4) == 8);
+    CHECK(audio_stereo_downmix(8, nullptr, kAudioMaxBedChannels) == 8);
+    for (auto& e : guard) CHECK(e.left == 7.0f && e.right == 7.0f);   // untouched by every refusal
+}
+
 int main() {
     printf("== test_audio ==\n");
     register_builtin_hle();
     test_signal_stats();
+    test_stereo_downmix();
 
     // --- 1. format decoding (all 8 SceAudioOutParamFormat values + an unknown) ---------------
     struct { uint32_t param; int ch; AudioFmt fmt; } fmts[] = {
@@ -554,6 +657,149 @@ int main() {
     CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
     sink.outs.clear();
 
+    // #1700: a MAIN port wider than 7.1 must reach the host sink. Dragon Quest VII Reimagined
+    // declares data_format 0xc00 — 12-channel float — and pushes 2.31 MB/s of real content into it;
+    // the old `channels > 8` gate discarded the port, and because it is that context's ONLY port
+    // the context never opened a host sink at all. This grain reproduces the measured shape of that
+    // title's bed: content in the front pair, and exactly zero in the LFE and height channels.
+    a2_port_param.data_format = 0xc00;                    // float32, twelve channels
+    CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&a2_port)) == 0);
+    memset(&a2_state, 0xCC, sizeof a2_state);
+    CHECK(call("sceAudioOut2PortGetState", a2_port, PTR(&a2_state)) == 0);
+    CHECK(a2_state.output == 1 && a2_state.num_channels == 12 && a2_state.volume == 127);
+    std::vector<float> a2_wide(64 * 12, 0.0f);
+    for (size_t frame = 0; frame < 64; frame++) {
+        float* sample = a2_wide.data() + frame * 12;
+        sample[0] = 0.30f;   // FL
+        sample[1] = 0.10f;   // FR
+        sample[2] = 0.08f;   // FC  -> both sides
+        sample[6] = 0.04f;   // second surround pair, left
+        sample[7] = 0.02f;   // second surround pair, right
+        sample[9] = 0.90f;   // height tier: no measured stereo position, must NOT reach the bed
+    }
+    a2_pcm_ptr = PTR(a2_wide.data());
+    CHECK(call("sceAudioOut2PortSetAttributes", a2_port, PTR(&a2_attr), 1) == 0);
+    CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
+    CHECK(sink.outs.size() == 1);          // the whole point: not discarded
+    if (!sink.outs.empty()) {
+        const float* stereo = reinterpret_cast<const float*>(sink.outs[0].pcm.data());
+        constexpr float kMinus3Db = 0.70710678f;
+        const float expected_l = 0.30f + 0.08f * kMinus3Db + 0.04f * kMinus3Db;
+        const float expected_r = 0.10f + 0.08f * kMinus3Db + 0.02f * kMinus3Db;
+        for (size_t frame = 0; frame < 64; frame++) {
+            CHECK(std::abs(stereo[frame * 2 + 0] - expected_l) < 1e-6f);
+            CHECK(std::abs(stereo[frame * 2 + 1] - expected_r) < 1e-6f);
+        }
+        // The unplaced height channel is loud enough that any accidental contribution — to either
+        // side, at any gain above 1e-6 — fails the two assertions above. That is deliberate: the
+        // fold must be a stated placement, never an incidental one.
+    }
+    CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
+    sink.outs.clear();
+
+    // A channel the fold does not place must never be READ, not merely scaled by zero. `Inf * 0.0f`
+    // and `NaN * 0.0f` are both NaN, and the output path clamps NaN to zero — so a mix loop that
+    // multiplies every channel by both gains lets one non-finite sample on an unplaced or
+    // opposite-side channel silence a side whose own content is perfectly good. An unwritten height
+    // tier sitting on recycled guest memory is exactly where such a value comes from.
+    const float inf_v = std::numeric_limits<float>::infinity();
+    const float nan_v2 = std::nan("");
+    a2_port_param.data_format = 0xc00;
+    CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&a2_port)) == 0);
+    std::vector<float> a2_poison(64 * 12, 0.0f);
+    for (size_t frame = 0; frame < 64; frame++) {
+        float* sample = a2_poison.data() + frame * 12;
+        sample[0] = 0.25f;      // FL: the value that must survive
+        sample[1] = 0.125f;     // FR
+        sample[8] = nan_v2;     // unplaced height tier: uninitialized-memory shapes
+        sample[9] = inf_v;
+        sample[10] = -inf_v;
+        sample[11] = nan_v2;
+    }
+    a2_pcm_ptr = PTR(a2_poison.data());
+    CHECK(call("sceAudioOut2PortSetAttributes", a2_port, PTR(&a2_attr), 1) == 0);
+    CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
+    CHECK(sink.outs.size() == 1);
+    if (!sink.outs.empty()) {
+        const float* stereo = reinterpret_cast<const float*>(sink.outs[0].pcm.data());
+        for (size_t frame = 0; frame < 64; frame++) {
+            CHECK(std::abs(stereo[frame * 2 + 0] - 0.25f) < 1e-6f);
+            CHECK(std::abs(stereo[frame * 2 + 1] - 0.125f) < 1e-6f);
+        }
+    }
+    CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
+    sink.outs.clear();
+
+    // The same rule on the OPPOSITE side of a placed channel: 7.1's ch7 is right-only, so an Inf
+    // there must not reach the left side at all. This is the 1..8 path, i.e. behaviour that existed
+    // before wide beds and must not have regressed when the fold became a matrix.
+    //
+    // THIS CASE IS NOT REDUNDANT WITH THE ONE ABOVE — do not delete either as a duplicate. They
+    // discriminate different wrong fixes. A fix that skips only channels whose gain pair is {0, 0}
+    // passes the 12-channel test (its poison sits in the unplaced tier) and FAILS here, because
+    // ch7 is placed — just not on this side. Only a fix that skips a zero gain PER SIDE passes
+    // both. Deleting the narrower-looking one is exactly how a discriminating case quietly becomes
+    // a vacuous one.
+    a2_port_param.data_format = 0x800;
+    CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&a2_port)) == 0);
+    std::vector<float> a2_side(64 * 8, 0.0f);
+    for (size_t frame = 0; frame < 64; frame++) {
+        float* sample = a2_side.data() + frame * 8;
+        sample[0] = 0.30f;      // FL
+        sample[7] = inf_v;      // second surround pair, RIGHT only
+    }
+    a2_pcm_ptr = PTR(a2_side.data());
+    CHECK(call("sceAudioOut2PortSetAttributes", a2_port, PTR(&a2_attr), 1) == 0);
+    CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
+    CHECK(sink.outs.size() == 1);
+    if (!sink.outs.empty()) {
+        const float* stereo = reinterpret_cast<const float*>(sink.outs[0].pcm.data());
+        for (size_t frame = 0; frame < 64; frame++) {
+            CHECK(std::abs(stereo[frame * 2 + 0] - 0.30f) < 1e-6f);   // left is untouched
+            CHECK(stereo[frame * 2 + 1] == 1.0f);                     // right saturates, as documented
+        }
+    }
+    CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
+    sink.outs.clear();
+    a2_port_param.data_format = 0xc00;
+
+    // What is left unreadable must stay a refusal: a grain prosper cannot size has nothing to fold.
+    // Both arms matter. A sample type it cannot decode is the obvious one. A declared width beyond
+    // the fold's range is the dangerous one — it must NOT be clamped and read, because reading a
+    // 20-channel grain at a 16-channel stride walks the guest's buffer and mixes garbage, which is
+    // strictly worse than the silence the old over-8 reject produced.
+    // The buffer is sized for the widest declaration below and filled with signal, so a build that
+    // wrongly ACCEPTS one of these mixes real, in-bounds data and fails loudly. Sizing it for the
+    // declared width matters: if the refusal only held because the accepting build read past the
+    // end of a shorter buffer, this test would be proving the allocator's behaviour, not prosper's.
+    std::vector<float> a2_wide_src(64 * 20, 0.25f);
+    a2_pcm_ptr = PTR(a2_wide_src.data());
+    const uint32_t unreadable_formats[] = {
+        0xc02,      // twelve channels, unknown sample type 2
+        0x1400,     // twenty channels, f32: wider than kAudioMaxBedChannels
+    };
+    for (uint32_t fmt : unreadable_formats) {
+        a2_port_param.data_format = fmt;
+        CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&a2_port)) == 0);
+        CHECK(call("sceAudioOut2PortSetAttributes", a2_port, PTR(&a2_attr), 1) == 0);
+        CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
+        CHECK(sink.outs.empty());
+        CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
+        sink.outs.clear();
+    }
+    // The count reported back to the guest is the DECLARED one, not a clamp. This pins prosper's own
+    // no-clamp contract — a state query that silently reports 16 for a 20-channel port is the same
+    // decoder/consumer disagreement #1700 was — and NOT a claim about what hardware returns for an
+    // out-of-range declaration, which no evidence covers (PortCreate validates the field nowhere).
+    a2_port_param.data_format = 0x1400;
+    CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&a2_port)) == 0);
+    memset(&a2_state, 0xCC, sizeof a2_state);
+    CHECK(call("sceAudioOut2PortGetState", a2_port, PTR(&a2_state)) == 0);
+    CHECK(a2_state.num_channels == 20);
+    CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
+    sink.outs.clear();
+
+
     // Signed-16 AudioOut2 is a first-class port format, not an unsupported codec path. Exercise it
     // on a second simultaneous context: each context must get an independently paced host stream so
     // SDL can mix their grains on the same timeline instead of serializing them. The two-attribute
@@ -587,6 +833,33 @@ int main() {
     }
     CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
     CHECK(call("sceAudioOut2ContextDestroy", a2_context2) == 0);
+
+    // The half of #1700 that made the title inaudible rather than merely quieter: a context whose
+    // ONLY port is a wide bed. `have_pcm` gated the sink open, so discarding that port meant the
+    // context never opened a host device at all — no amount of correct folding elsewhere recovers
+    // it. Exercise that exact shape on its own fresh context.
+    sink.outs.clear();
+    uint64_t a2_wide_ctx = 0;
+    CHECK(call("sceAudioOut2ContextCreate", PTR(a2_context_param), 0, 0, PTR(&a2_wide_ctx)) == 0);
+    CHECK(a2_wide_ctx != 0 && a2_wide_ctx != a2_context);
+    const size_t opens_before_wide = sink.opens.size();
+    a2_port_param.data_format = 0xc00;
+    CHECK(call("sceAudioOut2PortCreate", a2_wide_ctx, PTR(&a2_port_param), PTR(&a2_port)) == 0);
+    a2_pcm_ptr = PTR(a2_wide.data());
+    CHECK(call("sceAudioOut2PortSetAttributes", a2_port, PTR(&a2_attr), 1) == 0);
+    CHECK(call("sceAudioOut2ContextPush", a2_wide_ctx, 1) == 0);
+    CHECK(sink.opens.size() == opens_before_wide + 1);      // the sink this context never used to open
+    CHECK(sink.outs.size() == 1);
+    if (!sink.outs.empty() && sink.opens.size() > opens_before_wide) {
+        CHECK(sink.outs[0].port == sink.opens[opens_before_wide].port);
+        const float* stereo = reinterpret_cast<const float*>(sink.outs[0].pcm.data());
+        CHECK(std::abs(stereo[0]) > 0.1f && std::abs(stereo[1]) > 0.1f);
+    }
+    CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
+    CHECK(call("sceAudioOut2ContextDestroy", a2_wide_ctx) == 0);
+    sink.outs.clear();
+    a2_pcm_ptr = PTR(a2_pcm.data());
+    a2_port_param.data_format = 0x200;
 
     // Object-audio ports share the same context but do not route directly to the speaker sink.
     // GTA V reserves 72 of them; exercise the full SDK maximum so a 16-slot regression cannot

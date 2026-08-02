@@ -161,6 +161,106 @@ bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth) {
     return true;
 }
 
+// Stereo fold-down for a MAIN speaker bed. See audio.hpp for the contract.
+//
+// The bed order for 1..8 channels is FL, FR, FC, LFE, then surround pairs, with the small layouts
+// kept useful (3ch adds FC, 4ch is quad, 5ch is FL/FR/FC/SL/SR, 6ch is 5.1).
+//
+// A stereo fold only needs each source channel's SIDE (left, right, or both) — the front/back and
+// height identity within a side does not change the result — and that is what prosper can measure
+// with PROSPER_AUDIO_LAYOUT (see the probe below and docs/AUDIO.md). Measured on Dragon Quest VII
+// Reimagined's 12-channel MAIN port over 19,962,368 frames (#1700):
+//   ch0/ch1  carry all of the content (rms 3.1e-2 / 4.3e-2, peak 0.407) and correlate +0.46 — a
+//            real decorrelated stereo pair, not a duplicated mono feed.
+//   ch2      correlates near-equally with both side groups below (0.49/0.46/0.41/0.40): centre-like.
+//   ch4,ch6  correlate +0.96 with each other and ch5,ch7 correlate +0.95, while ch4-ch5 is -0.04.
+//            The surround tier therefore pairs as even=left, odd=right, which is what the 6..8
+//            mapping below already assumed. CONFIDENCE: MED — the grouping is unambiguous but the
+//            channels sit at a ~1e-9 residue level, so it corroborates rather than proves.
+//   ch3 and ch8..ch11 are EXACTLY zero for the whole run — the title's panner writes neither the
+//            LFE nor the height position under the order assumed here. Stated as indices on
+//            purpose: which POSITIONS those are is the mapping this evidence supports, not a
+//            premise it may borrow.
+// Channels 8..15 consequently have no measured side and are deliberately left UNPLACED (see the
+// return value): a fold-down that sounds plausible but images content to the wrong side is worse
+// than one that reports the gap, and no title in evidence puts signal there. The leading hypothesis
+// is that the same even=left/odd=right pairing continues, but that is inference from the tiers
+// below it, not a measurement, so it is tracked as an issue instead of shipped.
+// What the measurement CANNOT settle, stated so nobody reads more into it than it carries. The
+// probe GROUPS channels by side; it does not ORIENT the groups, and those are different claims:
+//   - Correlation is symmetric, so it proves ch0/ch1 are a genuine front pair but cannot tell a
+//     left/right SWAP from the correct assignment. The same is true of the {ch4,ch6} / {ch5,ch7}
+//     grouping: which group is the left one is not measured anywhere here.
+//     **CONFIDENCE: MED for the left/right ORIENTATION of every pair in this table, and the basis is
+//     convention, not evidence** — index 0 = FrontLeft is universal across published multichannel
+//     bed layouts, and prosper's own v1 sceAudioOut path assumes it. TWO conventions, not three: a
+//     third was checked and REJECTED. CRI Atom's `EAtomSpeakerID` names are present in this title's
+//     eboot and order FrontLeft first, which looked like a property of the code producing these
+//     samples rather than an inherited assumption — but `tools/re/xref.py` finds ZERO code
+//     references to that string and one data-pointer relocation into a UE reflection table. The
+//     names are Blueprint metadata that survived into the image; nothing calls them, so their
+//     presence says nothing about the bed's order. Conventions can share one ancestor, and a symbol
+//     in a binary is not a code path. prosper's own test suite does pin index -> side for widths
+//     6..8, so a self-inconsistent fold fails in CI; what is unconfirmed is the match to hardware.
+//   - A listening test cannot settle it either, and specifically cannot settle this title's layout
+//     at all: ten of its twelve channels are measured empty, so every mapping that routes ch0 and
+//     ch1 to the two sides produces a host bed differing only by the ~1e-9 residue on ch2 and
+//     ch4..ch7, some 150 dB below the content — not "bit-identical", because that wording would
+//     re-merge "exactly zero" with "1e-9 residue", the very distinction this table draws.
+//     Broadly stereo music also folds down
+//     plausibly under a swap. A human confirming "it sounds right" is real rung-4 evidence that
+//     audio reaches the device through the guest's own path, and is NOT evidence for this mapping.
+//   - THE DISCRIMINATING EXPERIMENT, for whoever gets a title that supports it: content with
+//     distinct per-channel placement — a hard-panned effect whose true side is known from the game,
+//     or centre-channel dialogue — measured with PROSPER_AUDIO_LAYOUT. It settles orientation in
+//     one run, where any amount of music cannot. Tracked with the height tier on #1720, since one
+//     capture answers both.
+// CONFIDENCE: HIGH that ch0/ch1 are the front pair and that 1..2-channel beds are right (a mono or
+// stereo bed has no orientation to get wrong); MED for which channel of a pair is the left one, and
+// for the 3..8 placements; 9..16 places only its first eight and reports the rest.
+unsigned audio_stereo_downmix(unsigned channels, AudioStereoGain* out, unsigned out_capacity) {
+    if (!out || !channels || channels > kAudioMaxBedChannels || out_capacity < channels)
+        return channels;
+    for (unsigned c = 0; c < channels; ++c) out[c] = AudioStereoGain{};
+
+    constexpr float kUnity    = 1.0f;
+    constexpr float kCenter   = 0.70710678f;   // -3 dB, centre split equally across the pair
+    constexpr float kLfe      = 0.5f;          // -6 dB
+    constexpr float kSurround = 0.70710678f;   // -3 dB
+
+    if (channels == 1) { out[0] = {kUnity, kUnity}; return 0; }   // mono feeds both sides
+    out[0] = {kUnity, 0.0f};                                      // FL
+    out[1] = {0.0f, kUnity};                                      // FR
+    if (channels == 2) return 0;
+    if (channels == 3) { out[2] = {kCenter, kCenter}; return 0; }
+    if (channels == 4) {                                          // quad: FL FR SL SR
+        out[2] = {kSurround, 0.0f};
+        out[3] = {0.0f, kSurround};
+        return 0;
+    }
+    if (channels == 5) {                                          // FL FR FC SL SR
+        out[2] = {kCenter, kCenter};
+        out[3] = {kSurround, 0.0f};
+        out[4] = {0.0f, kSurround};
+        return 0;
+    }
+    // 6..16: FL FR FC LFE then surround pairs.
+    out[2] = {kCenter, kCenter};
+    out[3] = {kLfe, kLfe};
+    out[4] = {kSurround, 0.0f};
+    out[5] = {0.0f, kSurround};
+    if (channels == 6) return 0;
+    if (channels == 7) {                                          // 6.1: one rear-centre channel
+        out[6] = {kSurround * 0.5f, kSurround * 0.5f};
+        return 0;
+    }
+    out[6] = {kSurround, 0.0f};                                   // 7.1 second surround pair
+    out[7] = {0.0f, kSurround};
+    unsigned unplaced = 0;
+    for (unsigned c = 8; c < channels; ++c) ++unplaced;            // height tier: not yet placed
+    return unplaced;
+}
+
 void audio_reset() {
     AudioSink* s = audio_sink();
     {
@@ -702,6 +802,218 @@ void audio_flow_note_port_create(uint32_t port_index, uint16_t type, uint32_t da
             type == 0 ? " (MAIN -> mixed to host)" : " (non-MAIN -> NOT mixed to host)");
 }
 
+// --- PROSPER_AUDIO_LAYOUT: per-channel bed-layout probe -----------------------------------
+// A multichannel MAIN port has to be folded into the host's stereo bed, and a fold-down is only
+// correct if we know which source channel is left, right, centre or LFE. `data_format` carries a
+// channel COUNT and nothing else, so the ORDER is not derivable from it — and a wrong order sounds
+// plausible, which is worse than silence because it reads as working.
+//
+// This probe measures the guest's own PCM and reports the properties that identify each channel's
+// role without assuming any ordering:
+//   rms/peak/nonzero — which channels carry the bed at all. A height channel a title never uses is
+//                      then measurably ABSENT rather than merely assumed quiet.
+//   hf  = RMS(x[n]-x[n-1]) / RMS(x[n]) — a spectral-tilt measure. An LFE feed is low-passed (about
+//                      120 Hz), so at 48 kHz its value is ~0.016, while full-band content sits
+//                      around 0.3..1.5. This identifies LFE from content alone, at any index.
+//   corr(c,d) — normalized cross-correlation. A front stereo pair is strongly but not perfectly
+//                      correlated, a duplicated channel reads 1.00, an independent height channel
+//                      reads near 0. This is what assigns each channel a LEFT/RIGHT side, which is
+//                      all a stereo fold-down actually needs to be correct.
+//   stride    — the smallest non-zero distance between two distinct PCM grain pointers the guest
+//                      publishes for the port. Titles double-buffer the grain, so this is one
+//                      grain's byte size and therefore an INDEPENDENT measure of the channel count
+//                      (channels = stride / (grain * bytes-per-sample)) — a cross-check on the
+//                      whole data_format decode rather than a restatement of it.
+// One name for the clamp: audio2_format_channels(), the fold matrix and this probe must agree.
+constexpr uint32_t kA2MaxChannels = kAudioMaxBedChannels;
+
+bool audio_layout() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PROSPER_AUDIO_LAYOUT"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v == 1;
+}
+
+// PROSPER_AUDIO_LAYOUT_DUMP=PATH additionally appends each measured port's RAW interleaved grain
+// to PATH.portN.<channels>ch.f32 as float32 (both sample types converted, so one reader handles either). The
+// in-process statistics answer the layout question, but the raw capture is what lets a later reader
+// re-derive them, run a different analysis, or render a channel to something audible — the same
+// capture-first workflow as PROSPER_SHADER_DUMP.
+const char* audio_layout_dump_path() {
+    static const char* p = getenv("PROSPER_AUDIO_LAYOUT_DUMP");
+    return (p && *p) ? p : nullptr;
+}
+
+struct LayoutPort {
+    bool     seen = false;
+    uint32_t ctx_slot = 0;
+    uint16_t type = 0;
+    uint32_t data_format = 0;
+    uint32_t channels = 0;
+    uint32_t grain = 0;
+    uint64_t frames = 0;
+    double   sumsq[kA2MaxChannels]{};
+    double   diff_sumsq[kA2MaxChannels]{};
+    double   cross[kA2MaxChannels][kA2MaxChannels]{};
+    double   peak[kA2MaxChannels]{};
+    uint64_t nonzero[kA2MaxChannels]{};
+    float    prev[kA2MaxChannels]{};
+    bool     have_prev = false;
+    // Grain-pointer stride (published by PortSetAttributes, not by the mix loop).
+    uint64_t last_ptr = 0;
+    uint64_t min_stride = 0;
+    uint64_t ptr_updates = 0;
+    FILE*    dump = nullptr;      // PROSPER_AUDIO_LAYOUT_DUMP, opened once per port
+};
+
+// Allocated only when the probe is enabled: 256 ports x a 16x16 correlation matrix is ~700 KiB
+// that a default run must not carry.
+std::mutex g_layout_mx;
+std::unique_ptr<LayoutPort[]> g_layout_port;
+
+LayoutPort* layout_port_locked(uint32_t index) {
+    if (!audio_layout() || index >= kA2MaxPorts) return nullptr;
+    if (!g_layout_port) g_layout_port.reset(new LayoutPort[kA2MaxPorts]());
+    return &g_layout_port[index];
+}
+
+// One grain of interleaved PCM from one port. `frame(f, c)` reads the already-converted float, so
+// S16 and F32 ports are measured identically.
+template <typename Sample>
+void layout_add_grain(uint32_t port_index, uint32_t ctx_slot, uint16_t type, uint32_t data_format,
+                      uint32_t channels, uint32_t grain, uint64_t frames_got, Sample&& frame) {
+    std::lock_guard<std::mutex> lk(g_layout_mx);
+    LayoutPort* lp = layout_port_locked(port_index);
+    if (!lp || !channels || channels > kA2MaxChannels) return;
+    if (lp->channels && lp->channels != channels) lp->have_prev = false;  // reconfigured mid-run
+    lp->seen = true;
+    lp->ctx_slot = ctx_slot;
+    lp->type = type;
+    lp->data_format = data_format;
+    lp->channels = channels;
+    lp->grain = grain;
+    lp->frames += frames_got;
+    if (const char* base = audio_layout_dump_path(); base && !lp->dump) {
+        // The channel count is in the NAME, not just the log line. The file is a bare interleaved
+        // stream with no header, and port slots are recycled first-free, so a differently-shaped
+        // port reusing this slot would otherwise append a stream of another width to the same file
+        // and every offline reader would silently de-interleave the tail wrong.
+        // "wb", not "ab", for the SPAN half of the same problem: the statistics reset per port
+        // lifetime while an appending file does not, so a recycled slot of the SAME width would
+        // leave the printed `frames=N` and the file describing different spans — and an offline
+        // reader has no way to see the seam. One file per port lifetime keeps them the same span.
+        char path[512];
+        snprintf(path, sizeof path, "%s.port%u.%uch.f32", base, port_index + 1, channels);
+        lp->dump = fopen(path, "wb");
+        fprintf(stderr, "[audio-layout] port%u: dumping raw guest PCM to %s "
+                        "(float32 interleaved, %u channels, 48000 Hz)\n",
+                port_index + 1, path, channels);
+    }
+    FILE* const dump = lp->dump;
+    for (uint64_t f = 0; f < frames_got; ++f) {
+        float v[kA2MaxChannels];
+        for (uint32_t c = 0; c < channels; ++c) {
+            float s = frame(f, c);
+            if (s != s) s = 0.0f;                        // NaN measured as the silence the sink emits
+            v[c] = s;
+        }
+        if (dump) fwrite(v, sizeof(float), channels, dump);
+        for (uint32_t c = 0; c < channels; ++c) {
+            const double d = (double)v[c];
+            const double a = d < 0 ? -d : d;
+            if (a > lp->peak[c]) lp->peak[c] = a;
+            lp->sumsq[c] += d * d;
+            if (v[c] != 0.0f) ++lp->nonzero[c];
+            if (lp->have_prev) {
+                const double delta = d - (double)lp->prev[c];
+                lp->diff_sumsq[c] += delta * delta;
+            }
+            for (uint32_t e = c; e < channels; ++e) lp->cross[c][e] += d * (double)v[e];
+        }
+        for (uint32_t c = 0; c < channels; ++c) lp->prev[c] = v[c];
+        lp->have_prev = true;
+    }
+    if (dump) fflush(dump);   // a run killed by its route timeout must still leave a readable capture
+}
+
+// A recycled port slot starts a fresh layout history, exactly as the flow probe's LIFE totals do:
+// merging a destroyed port's channel statistics into the unrelated port that reuses the slot would
+// corrupt the very correlations the layout verdict is drawn from.
+void layout_note_port_create(uint32_t port_index) {
+    if (!audio_layout()) return;
+    std::lock_guard<std::mutex> lk(g_layout_mx);
+    if (LayoutPort* lp = layout_port_locked(port_index)) {
+        if (lp->dump) fclose(lp->dump);
+        *lp = LayoutPort{};
+    }
+}
+
+void layout_note_pcm_ptr(uint32_t port_index, uint64_t pcm) {
+    if (!audio_layout() || !pcm) return;
+    std::lock_guard<std::mutex> lk(g_layout_mx);
+    LayoutPort* lp = layout_port_locked(port_index);
+    if (!lp) return;
+    ++lp->ptr_updates;
+    if (lp->last_ptr && pcm != lp->last_ptr) {
+        const uint64_t stride = pcm > lp->last_ptr ? pcm - lp->last_ptr : lp->last_ptr - pcm;
+        if (!lp->min_stride || stride < lp->min_stride) lp->min_stride = stride;
+    }
+    lp->last_ptr = pcm;
+}
+
+void audio_layout_report() {
+    if (!audio_layout()) return;
+    static std::chrono::steady_clock::time_point last{};
+    const auto now = std::chrono::steady_clock::now();
+    {
+        static std::mutex clock_mx;
+        std::lock_guard<std::mutex> lk(clock_mx);
+        if (last.time_since_epoch().count() == 0) { last = now; return; }
+        if (now - last < std::chrono::seconds(5)) return;
+        last = now;
+    }
+    std::lock_guard<std::mutex> lk(g_layout_mx);
+    if (!g_layout_port) return;
+    for (uint32_t i = 0; i < kA2MaxPorts; ++i) {
+        LayoutPort& lp = g_layout_port[i];
+        if (!lp.seen || !lp.frames || !lp.channels) continue;
+        const double n = (double)lp.frames;
+        double rms[kA2MaxChannels]{};
+        for (uint32_t c = 0; c < lp.channels; ++c) rms[c] = std::sqrt(lp.sumsq[c] / n);
+        // Stride is only meaningful against a known sample width; report the implied channel count
+        // so the reader does not have to redo the arithmetic (and can see a disagreement at once).
+        const uint32_t bytes_per_sample = (lp.data_format & 0x7fu) == 1 ? 2u : 4u;
+        const uint64_t frame_bytes = lp.grain ? (uint64_t)lp.grain * bytes_per_sample : 0;
+        char stride_note[128];
+        if (lp.min_stride && frame_bytes)
+            snprintf(stride_note, sizeof stride_note, "stride=%lluB (implies %.2f channels)",
+                     (unsigned long long)lp.min_stride, (double)lp.min_stride / (double)frame_bytes);
+        else if (lp.ptr_updates)
+            // A positive finding, not a missing measurement: the guest republished the SAME grain
+            // address every time, so there is no second buffer to measure a stride against.
+            snprintf(stride_note, sizeof stride_note,
+                     "stride=n/a (single grain buffer 0x%llx, %llu publications)",
+                     (unsigned long long)lp.last_ptr, (unsigned long long)lp.ptr_updates);
+        else
+            snprintf(stride_note, sizeof stride_note, "stride=n/a (no PCM pointer observed)");
+        fprintf(stderr,
+                "[audio-layout] port%u ctx%u type=0x%x fmt=0x%x channels=%u grain=%u frames=%llu %s\n",
+                i + 1, lp.ctx_slot, lp.type, lp.data_format, lp.channels, lp.grain,
+                (unsigned long long)lp.frames, stride_note);
+        for (uint32_t c = 0; c < lp.channels; ++c) {
+            const double hf = rms[c] > 0.0 ? std::sqrt(lp.diff_sumsq[c] / n) / rms[c] : 0.0;
+            fprintf(stderr, "[audio-layout]   ch%-2u rms=%.6f peak=%.6f nonzero=%5.1f%% hf=%.4f corr=",
+                    c, rms[c], lp.peak[c], 100.0 * (double)lp.nonzero[c] / n, hf);
+            for (uint32_t e = 0; e < lp.channels; ++e) {
+                const uint32_t lo = c < e ? c : e, hi = c < e ? e : c;
+                const double denom = rms[lo] * rms[hi] * n;
+                const double corr = denom > 0.0 ? lp.cross[lo][hi] / denom : 0.0;
+                fprintf(stderr, " %+.2f", corr);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+}
+
 } // namespace
 
 
@@ -745,9 +1057,15 @@ A2PortState* audio2_port_locked(uint64_t handle, uint32_t* slot_out = nullptr) {
     return &port;
 }
 
+// The DECLARED channel count, unclamped (an unset field is AudioOut2's stereo default). It used to
+// be clamped to the fold's maximum, which is exactly the disagreement #1700 was about — and a clamp
+// is the more dangerous half of it: silently reading a 20-channel grain as 16 channels would walk
+// the guest's buffer at the wrong stride and mix garbage, where the old over-8 reject at least
+// produced silence. Range is the consumer's decision, and it is made loudly at the one place that
+// sizes a read.
 uint32_t audio2_format_channels(uint32_t data_format) {
     const uint32_t encoded = (data_format >> 8u) & 0xffu;
-    return encoded ? std::min(encoded, 16u) : 2u;
+    return encoded ? encoded : 2u;
 }
 
 static void audio2_reset() {
@@ -773,6 +1091,13 @@ static void audio2_reset() {
         g_flow_ctx_created = 0;
         g_flow_ports_created = 0;
         g_flow_pcm_published = 0;
+    }
+    if (audio_layout()) {
+        std::lock_guard<std::mutex> lk(g_layout_mx);
+        if (g_layout_port)
+            for (uint32_t i = 0; i < kA2MaxPorts; ++i)
+                if (g_layout_port[i].dump) fclose(g_layout_port[i].dump);
+        g_layout_port.reset();
     }
     if (AudioSink* sink = audio_sink())
         for (size_t i = 0; i < 4; ++i)
@@ -1126,6 +1451,7 @@ HLE(audio2_port_create) {
         port.data_format = data_format;
         port.flags = flags;
         audio_flow_note_port_create(id - 1, ptype, data_format, flags);
+        layout_note_port_create(id - 1);
         return 0;
     }
     return kA2ErrPortFull;
@@ -1192,6 +1518,7 @@ HLE(audio2_port_set_attr) {
                 // Reached-ness: the guest handing us a PCM buffer address is the last step before
                 // submission, so this separates "never wired up audio" from "wired up, never pushed".
                 if (pcm && audio_flow()) ++g_flow_pcm_published;
+                layout_note_pcm_ptr(port_slot, pcm);
             }
             if (getenv("PROSPER_AUDIO2_PROBE")) {
                 // Keep probe history per AudioOut2 port. Object-heavy titles routinely create
@@ -1299,6 +1626,7 @@ HLE(audio2_ctx_push) {
         std::memset(bed.data(), 0, sizeof(float) * grain * 2);
         const bool probe = getenv("PROSPER_AUDIO2_PROBE") != nullptr;
         const bool flow = audio_flow();
+        const bool layout = audio_layout();
         uint32_t object_ports_with_pcm = 0;
         float object_peak = 0.0f;
         int object_peak_port = 0;
@@ -1319,55 +1647,86 @@ HLE(audio2_ctx_push) {
             }
             const uint32_t data_type = ps.data_format & 0x7fu;
             const uint32_t channels = audio2_format_channels(ps.data_format);
-            if ((data_type != 0 && data_type != 1) || channels < 1 || channels > 8) {
+            // #1700: every channel count the fold can place is now mixed — the old `channels > 8`
+            // gate discarded a whole MAIN port (2.31 MB/s of real 12-channel content in Dragon
+            // Quest VII) while the decoder happily reported 12. What is left is the genuinely
+            // unreadable: a sample type prosper cannot size, and a declared width beyond the fold's
+            // range, which must be REJECTED rather than clamped — reading a wider grain at the
+            // fold's stride would walk the guest's buffer and mix garbage.
+            const bool readable = (data_type == 0 || data_type == 1) &&
+                                  channels >= 1 && channels <= kAudioMaxBedChannels;
+            if (!readable) {
+                // A LOUD reject. It is a fatal gap to implement, not a skip to live with, and it
+                // previously produced no message at all unless a probe happened to be enabled.
+                // Rate-limited per port, not suppressed.
+                static uint64_t reject_log[kA2MaxPorts] = {0};
+                if ((reject_log[this_pidx]++ % 4096) == 0)
+                    fprintf(stderr, "[audio2] port%d DISCARDED: data_format=0x%x is not readable "
+                                    "(sample type %u: 0=f32, 1=s16; %u channels, max %u); its guest "
+                                    "PCM is being dropped every push\n",
+                            this_pidx + 1, ps.data_format, data_type, channels,
+                            (unsigned)kAudioMaxBedChannels);
                 if (probe) fprintf(stderr, "[audio2-probe] port%d skipped: format=0x%x "
                                            "type=%u channels=%u unsupported\n",
                                            this_pidx + 1, ps.data_format, data_type, channels);
-                // A port rejected for its LAYOUT is never read, so "no signal here" would otherwise
-                // be an assumption rather than a measurement — and a rejected port is precisely
-                // where lost audio would hide. Under the probe only (so the default hot path is
-                // unchanged), read and measure it anyway, fault-safely, without mixing it.
-                // The bound is audio2_format_channels()'s own clamp, so the buffer sizing reasoned
-                // about below stays true if that clamp ever changes. One flag, used by both arms,
-                // so `skip_fmt` is counted exactly once per push either way.
-                const bool rej_sizable = (data_type == 0 || data_type == 1) &&
-                                         channels >= 1 && channels <= 16;
-                if (flow && !rej_sizable) {
-                    // Nothing to measure for a layout we cannot even size; just record the skip.
-                    std::lock_guard<std::mutex> flk(g_flow_mx);
-                    FlowPort& fp = g_flow_port[this_pidx];
-                    flow_tag_port(fp, context_slot, ps.type, ps.data_format);
-                    ++fp.skip_fmt;
-                }
-                if (flow && rej_sizable) {
-                    const uint32_t rej_samples = channels * grain;
+                // A rejected port is exactly where lost audio hides — that is how #1700 itself was
+                // found — so under the flow probe, read and MEASURE it anyway without mixing it,
+                // whenever the grain can be sized at all. A width the fold cannot place is still a
+                // width: the declared count gives a well-defined stride, so the measurement is
+                // sound even though the placement is not. Only an unknown sample type is truly
+                // unsizable, and that arm records the skip alone.
+                const bool sizable = (data_type == 0 || data_type == 1) && channels >= 1;
+                if (flow && sizable) {
+                    // SAMPLED, not exhaustive, and the cap is load-bearing rather than tidiness.
+                    // A FAILING read is the EXPECTED case on this arm — a 20-channel declaration
+                    // over a narrower real buffer is exactly what it exists to detect — and
+                    // audio_read_bytes_partial binary-searches the readable prefix when the full
+                    // range faults. Uncapped, one 255-channel port costs a 4 MiB request, ~22
+                    // probe syscalls copying ~2 MiB on average, ~45 MiB of copying per push, at
+                    // 188 Hz, WITH g_a2_mx HELD. The pre-#1700 16-channel bound hid that; removing
+                    // the bound without a cap would have turned a diagnostic that is meant to be
+                    // cheap enough to leave on into one that changes the timing it measures.
+                    // A signal statistic does not need the whole grain, so bound the span and say
+                    // so: `frames`/`bytes` on this port's line then describe what was MEASURED.
+                    constexpr size_t kRejectProbeBytes = 64u * 1024u;
+                    const size_t sample_bytes = data_type == 0 ? sizeof(float) : sizeof(int16_t);
+                    const size_t frame_bytes = sample_bytes * channels;
+                    size_t rej_frames_req = kRejectProbeBytes / frame_bytes;
+                    if (rej_frames_req == 0) rej_frames_req = 1;      // one frame minimum, always
+                    if (rej_frames_req > grain) rej_frames_req = grain;
+                    const size_t rej_samples = rej_frames_req * channels;
                     size_t rej_frames = 0;
                     if (data_type == 0) {
                         if (tmp.size() < rej_samples) tmp.resize(rej_samples);
                         rej_frames = audio_read_bytes_partial(ps.pcm_ptr, tmp.data(),
-                                        sizeof(float) * rej_samples) / (sizeof(float) * channels);
+                                        sizeof(float) * rej_samples) / frame_bytes;
                     } else {
                         if (tmp_s16.size() < rej_samples) tmp_s16.resize(rej_samples);
                         rej_frames = audio_read_bytes_partial(ps.pcm_ptr, tmp_s16.data(),
-                                        sizeof(int16_t) * rej_samples) / (sizeof(int16_t) * channels);
+                                        sizeof(int16_t) * rej_samples) / frame_bytes;
                     }
-                    // Single lock scope covering tag + counters + samples: an earlier version
-                    // tagged the port, released the lock for the guest read, then re-locked — and a
-                    // report landing in that window cleared `seen`, so the measurement never printed.
+                    // One lock scope covering tag + counters + samples: tagging, unlocking for the
+                    // guest read, then re-locking lets a report land in the window and clear `seen`,
+                    // so the measurement never prints.
                     std::lock_guard<std::mutex> flk(g_flow_mx);
                     FlowPort& fp = g_flow_port[this_pidx];
                     flow_tag_port(fp, context_slot, ps.type, ps.data_format);
                     ++fp.skip_fmt;
                     ++fp.reads;
                     fp.frames += rej_frames;
-                    fp.bytes += rej_frames * channels *
-                                (data_type == 0 ? sizeof(float) : sizeof(int16_t));
-                    if (rej_frames < grain) ++fp.short_read;
-                    for (size_t k = 0, nf = rej_frames * channels; k < nf; ++k) {
-                        const float v = data_type == 0 ? tmp[k]
-                                                       : (float)tmp_s16[k] * (1.0f / 32768.0f);
-                        flow_add_sample(fp, v);
-                    }
+                    fp.bytes += rej_frames * frame_bytes;
+                    // Short against what was REQUESTED, not against the grain: the cap is our own
+                    // choice, so counting it as a short guest read would report a guest defect.
+                    if (rej_frames < rej_frames_req) ++fp.short_read;
+                    for (size_t k = 0, nf = rej_frames * channels; k < nf; ++k)
+                        flow_add_sample(fp, data_type == 0 ? tmp[k]
+                                                          : (float)tmp_s16[k] * (1.0f / 32768.0f));
+                } else if (flow) {
+                    // Nothing to measure for a grain we cannot even size; record the skip.
+                    std::lock_guard<std::mutex> flk(g_flow_mx);
+                    FlowPort& fp = g_flow_port[this_pidx];
+                    flow_tag_port(fp, context_slot, ps.type, ps.data_format);
+                    ++fp.skip_fmt;
                 }
                 continue;
             }
@@ -1389,6 +1748,11 @@ HLE(audio2_ctx_push) {
                 return data_type == 0 ? tmp[sample]
                                       : (float)tmp_s16[sample] * (1.0f / 32768.0f);
             };
+            // Per-channel layout measurement, before any routing decision, so the fold-down for a
+            // wide bed rests on the guest's measured content rather than on an assumed enumeration.
+            if (layout)
+                layout_add_grain(this_pidx, context_slot, ps.type, ps.data_format, channels, grain,
+                                 frames_got, sample_at);
             // Measure EVERY port that yielded bytes, before the MAIN-only routing filter, so signal
             // that prosper discards is attributable to the discard rather than to a silent guest.
             if (flow) {
@@ -1438,38 +1802,40 @@ HLE(audio2_ctx_push) {
                 continue;
             }
             const float port_gain = (ps.flags & kA2PortFlag20DbHeadroom) ? kA2HeadroomGain : 1.0f;
+            // One gain pair per source channel, from the pure (unit-tested) layout function. A
+            // channel prosper cannot place gets {0,0}; that is a real gap, so say so out loud
+            // rather than letting it look like a quiet channel.
+            AudioStereoGain gains[kAudioMaxBedChannels];
+            const unsigned unplaced = audio_stereo_downmix(channels, gains, kAudioMaxBedChannels);
+            if (unplaced) {
+                static uint64_t unplaced_log[kA2MaxPorts] = {0};
+                if ((unplaced_log[this_pidx]++ % 4096) == 0)
+                    fprintf(stderr, "[audio2] port%d: %u of %u MAIN bed channels have no known "
+                                    "stereo position (data_format=0x%x) and contribute nothing; "
+                                    "run with PROSPER_AUDIO_LAYOUT=1 to measure their role\n",
+                            this_pidx + 1, unplaced, channels, ps.data_format);
+            }
+            // Flatten the matrix into one tap list per side, keeping ONLY the non-zero gains. This
+            // is not an optimization — it is required for correctness. Multiplying every channel by
+            // both gains reads channels the fold does not place, and `Inf * 0.0f` and `NaN * 0.0f`
+            // are both NaN, so one Inf on a surround channel would poison the OPPOSITE side and an
+            // unplaced height channel holding uninitialized guest memory would poison BOTH — the
+            // output path then clamps NaN to zero, silencing a port whose content is fine. The old
+            // inline chain only ever read a channel on the side it contributed to; preserve exactly
+            // that, so a zero-gain channel is never even loaded.
+            struct Tap { uint32_t ch; float gain; };
+            Tap left_taps[kAudioMaxBedChannels], right_taps[kAudioMaxBedChannels];
+            uint32_t left_n = 0, right_n = 0;
+            for (uint32_t c = 0; c < channels; ++c) {
+                if (gains[c].left  != 0.0f) left_taps[left_n++]   = {c, gains[c].left};
+                if (gains[c].right != 0.0f) right_taps[right_n++] = {c, gains[c].right};
+            }
             for (size_t fno = 0; fno < frames_got; fno++) {
-                float left = sample_at(fno, 0);
-                float right = channels >= 2 ? sample_at(fno, 1) : left;  // mono duplicates ch0
-                constexpr float kCenter = 0.70710678f;        // -3 dB
-                constexpr float kLfe = 0.5f;                  // -6 dB
-                constexpr float kSurround = 0.70710678f;      // -3 dB
-
-                // Sony's MAIN speaker beds use the conventional order FL, FR, FC, LFE, followed
-                // by rear/side pairs. Keep the smaller layouts useful too: 3ch adds FC, 4ch is
-                // quad, 5ch is FL/FR/FC/SL/SR, and 6ch is standard 5.1.
-                if (channels == 3) {
-                    left += sample_at(fno, 2) * kCenter;
-                    right += sample_at(fno, 2) * kCenter;
-                } else if (channels == 4) {
-                    left += sample_at(fno, 2) * kSurround;
-                    right += sample_at(fno, 3) * kSurround;
-                } else if (channels == 5) {
-                    left += sample_at(fno, 2) * kCenter + sample_at(fno, 3) * kSurround;
-                    right += sample_at(fno, 2) * kCenter + sample_at(fno, 4) * kSurround;
-                } else if (channels >= 6) {
-                    left += sample_at(fno, 2) * kCenter + sample_at(fno, 3) * kLfe
-                          + sample_at(fno, 4) * kSurround;
-                    right += sample_at(fno, 2) * kCenter + sample_at(fno, 3) * kLfe
-                           + sample_at(fno, 5) * kSurround;
-                    if (channels == 7) {
-                        left += sample_at(fno, 6) * (kSurround * 0.5f);
-                        right += sample_at(fno, 6) * (kSurround * 0.5f);
-                    } else if (channels == 8) {
-                        left += sample_at(fno, 6) * kSurround;
-                        right += sample_at(fno, 7) * kSurround;
-                    }
-                }
+                float left = 0.0f, right = 0.0f;
+                for (uint32_t t = 0; t < left_n; ++t)
+                    left += sample_at(fno, left_taps[t].ch) * left_taps[t].gain;
+                for (uint32_t t = 0; t < right_n; ++t)
+                    right += sample_at(fno, right_taps[t].ch) * right_taps[t].gain;
                 bed[fno * 2 + 0] += left * port_gain;
                 bed[fno * 2 + 1] += right * port_gain;
             }
@@ -1492,6 +1858,7 @@ HLE(audio2_ctx_push) {
             for (uint32_t i = 0; i < grain * 2; ++i) flow_add_bed_sample(f, bed[i]);
         }
     }
+    audio_layout_report();   // no locks held here; g_layout_mx is a leaf
     // From this point through host output or silent pacing, serialize with Destroy for this exact
     // sink slot. Revalidate the full generation under g_a2_mx after acquiring the slot mutex.
     std::unique_lock<std::mutex> sink_lk(g_a2_sink_mx[context_slot]);
