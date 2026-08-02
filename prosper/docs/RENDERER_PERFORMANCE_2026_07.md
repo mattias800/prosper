@@ -1562,9 +1562,10 @@ boundary, no render acceleration.
 
 ### Compute execution is ~93 % of headless wall time
 
-`PROSPER_RENDER_TIMING=1` reports the backend's own cumulative cost inside the compute-on run:
-**41,625 dispatches at ~10.1 ms = 419 s of a 448 s run (93.7 %)**, and on a second run
-**139,150 dispatches at ~5.70 ms = 793 s of 850 s (93.3 %)**, stable across every sample of both. This
+`PROSPER_RENDER_TIMING=1` reports the backend's own cumulative cost inside the compute-on run, divided
+by the process's own `/usr/bin/time` wall clock: **45,900 dispatches at 9.39 ms = 431.0 s of 461.62 s
+(93.4 %)**, and on a second run **139,150 dispatches at 5.70 ms = 793.2 s of 852.95 s (93.0 %)**, stable
+across every sample of both. This
 is a *single-arm* attribution, so unlike the `PROSPER_NO_COMPUTE=1` ratio it cannot be confounded by a
 guest-path change. The backend is invoked **once per dispatch** (`calls == dispatches`), each invocation
 one `vkQueueSubmit` + `vkWaitForFences` on the guest's own submit thread.
