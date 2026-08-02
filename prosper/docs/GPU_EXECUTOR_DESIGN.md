@@ -69,7 +69,15 @@ synchronously (GPU "done" the instant SubmitDcb returns → this IS the end-of-p
   live stack-argument capture pin the ABI as
   `GraphicsCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …)` — this
   resolved the earlier LOW-confidence "which arg is the value" (a5=address, stack arg 7=data_sel, stack arg
-  8=the 64-bit value). `agc_cb_release_mem` now lays out `[0..1]=addr [2]=data_sel [3..4]=value [5]=action`.
+  8=the 64-bit value). `agc_cb_release_mem` now lays out `[0..1]=addr [2]=data_sel [3..4]=value [5]=action
+  [6]=#312 build snapshot (high half)`, in a packet of exactly **8 dwords** — the size of the hardware
+  `RELEASE_MEM`. That size is an ABI contract, not a detail: the builders append into the *guest's*
+  command buffer, and a guest reserves that buffer from the real AGC packet sizes it was compiled
+  against, so a builder emitting one dword more than hardware overruns the reservation. Asterix &amp;
+  Obelix - Babylon Mission (`PPSA30490`, #1748) proved it — its 16-dword submit epilogue could not hold
+  `AcquireMem` (8) plus a 9-dword end-of-pipe action, the guest's Dcb "buffer full" callback fired on
+  every submit, and its command-buffer chunk allocator drained the direct-memory pool in ~125 s.
+  Captures recorded before that change carry the historical 9-dword form; `decode_pm4` accepts both.
 - `WRITE_DATA` (`honor_write_data`): copy the inline dwords to the destination; `agc_dcb_write_data` now
   copies the real `data*`/`num_dwords` observed at `GraphicsDcbWriteData` call sites into the packet.
   `WAIT_REG_MEM`: no-op

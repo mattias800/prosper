@@ -1009,6 +1009,12 @@ if(TARGET prosper_core)
     target_link_libraries(test_agc_getsize PRIVATE prosper_core)
     add_test(NAME agc_getsize_drift COMMAND test_agc_getsize)
 
+    # #1748: a builder must not emit MORE dwords than the hardware packet it stands for — the guest
+    # reserves its command buffer from the real AGC sizes, so an oversized packet overruns it.
+    add_executable(test_agc_epilogue_window tests/test_agc_epilogue_window.cpp)
+    target_link_libraries(test_agc_epilogue_window PRIVATE prosper_core)
+    add_test(NAME agc_epilogue_window COMMAND test_agc_epilogue_window)
+
     # libSceVideoOut: query/config functions return real 1080p60 values + swapchain-scaffolding
     # display-buffer registry records the game's registered framebuffers.
     add_executable(test_videoout tests/test_videoout.cpp)

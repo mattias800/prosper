@@ -613,13 +613,30 @@ HLE9(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, ca
     // into the packet so the CommandProcessor performs the completion write at SUBMIT time (correct
     // end-of-pipe timing — our GPU folds synchronously, so submit == pipe drain). CONFIDENCE: HIGH — the
     // arg positions are fixed by the AGC ABI; a5-as-label was independently confirmed (WaitRegMem polls it).
-    uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_RELEASE_MEM, &cmd)) return 0;
+    //
+    // The packet is EXACTLY 8 DWORDS, the size of the RDNA2 PM4 RELEASE_MEM it stands for (header +
+    // EVENT_CNTL, DATA_CNTL, ADDRESS_LO/HI, DATA_LO/HI, INT_CTXID). This is a hard constraint, not a
+    // preference: prosper's builders write into the GUEST's command buffer, and the guest reserves
+    // that buffer from the REAL AGC packet sizes it was compiled against. Emitting one dword more
+    // than hardware overruns the reservation. Asterix & Obelix - Babylon Mission (PPSA30490, #1748)
+    // is the case that proved it: its submit epilogue is a 16-dword window holding exactly
+    // sceAgcDcbAcquireMem (8) + this end-of-pipe action (8). At 9 dwords the append did not fit, the
+    // DCB "buffer full" callback fired, and the guest's chunk allocator handed over a fresh ~600 KiB
+    // command-buffer chunk for EVERY submit — ~210 MiB/s of direct memory, never reclaimed (the
+    // chunk's own completion fence ends up in the next chunk, which is never submitted), emptying
+    // the direct-memory pool in ~125 s.
+    //
+    // That leaves ONE spare payload dword for the #312 build-time snapshot of the destination qword,
+    // so only its HIGH half is retained — which is the only half `stale_release_generation` reads
+    // (it masks with 0xffffffff00000000). Keep this at 8; if a future field is needed, drop the
+    // snapshot rather than growing the packet.
+    uint32_t* cmd; if (!begin_packet(a0, 8, IT_NOP, R_RELEASE_MEM, &cmd)) return 0;
     cmd[1] = (uint32_t)(a5 & 0xffffffffu); cmd[2] = (uint32_t)(a5 >> 32u);
     cmd[3] = (uint32_t)data_sel;
     cmd[4] = (uint32_t)(data & 0xffffffffu); cmd[5] = (uint32_t)(data >> 32u);
     cmd[6] = (uint32_t)a1;
     uint64_t build_pre = label_build_pre(a5, data_sel == 1 ? 4 : 8);
-    cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
+    cmd[7] = (uint32_t)(build_pre >> 32);
     if (data_sel == 1) {
         prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a5);   // #312 discriminator
         prosper_label_hist_rel_built(a5, a0);                         // #312 protocol history
@@ -2104,9 +2121,14 @@ HLE(agc_patch_release_mem_addr) {  // 0fWWK5uG9rQ (cmd, address): ReleaseMem pay
     if (!patch_check(cmd, R_RELEASE_MEM, "ReleaseMemPatchAddress")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
     uint32_t len = ((cmd[0] >> 16) & 0x3fffu) + 2;
+    // Re-snapshot the destination for the #312 generation identity. The 8-dword packet keeps only
+    // the high half (see agc_cb_release_mem); tolerate the historical 9-dword form so a packet
+    // replayed out of a pre-#1748 capture still round-trips.
     if (len >= 9) {
         uint64_t build_pre = label_build_pre(a1, cmd[3] == 1 ? 4 : 8);
         cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
+    } else if (len >= 8) {
+        cmd[7] = (uint32_t)(label_build_pre(a1, cmd[3] == 1 ? 4 : 8) >> 32);
     }
     prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a1);   // #312: target set post-build
     return 0;
@@ -2239,7 +2261,7 @@ HLE(agc_cb_dispatch_indirect) {
 HLE(agc_dcb_jump_get_size)        { (void)a0; return 5u * 4u; }   // sceAgcDcbJump builds 5 dwords
 HLE(agc_dcb_acquire_mem_get_size) { (void)a0; return 8u * 4u; }   // sceAgc(Dcb|Acb)AcquireMem builds 8
 HLE(agc_dcb_rewind_get_size)      { (void)a0; return 2u * 4u; }   // PM4 REWIND, 2 dwords
-HLE(agc_cb_eop_action_get_size)   { (void)a0; return 9u * 4u; }   // sceAgcCbReleaseMem (EOP) builds 9
+HLE(agc_cb_eop_action_get_size)   { (void)a0; return 8u * 4u; }   // sceAgcCbReleaseMem (EOP) builds 8
 // sceAgcCbNopGetSize(numDwords): the NOP is exactly the requested dword count (min 1). arg in a0.
 HLE(agc_cb_nop_get_size)          { uint32_t n = (uint32_t)a0; if (n == 0) n = 1; return (uint64_t)n * 4u; }
 

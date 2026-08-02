@@ -107,8 +107,18 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     if (npl >= 2) c.rel_addr = lo_hi(pl);
                     if (npl >= 3) c.rel_data_sel = pl[2];
                     if (npl >= 5) { c.rel_value = (uint64_t)pl[3] | ((uint64_t)pl[4] << 32); c.rel_value_valid = true; }
+                    // #312 build-time snapshot of the destination qword. TWO packet shapes exist and
+                    // the payload length is the discriminator:
+                    //   npl == 7 — current 8-dword packet (#1748, sized to hardware RELEASE_MEM):
+                    //              pl[6] holds only the HIGH half, the only half the generation guard
+                    //              reads (it masks with 0xffffffff00000000).
+                    //   npl >= 8 — historical 9-dword packet, still present in every capture recorded
+                    //              before #1748: pl[6..7] hold the full qword.
                     if (npl >= 8) {
                         c.rel_build_pre = lo_hi(pl + 6);
+                        c.rel_build_pre_valid = true;
+                    } else if (npl >= 7) {
+                        c.rel_build_pre = (uint64_t)pl[6] << 32;
                         c.rel_build_pre_valid = true;
                     }
                     break;

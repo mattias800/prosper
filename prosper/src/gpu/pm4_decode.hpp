@@ -126,15 +126,21 @@ struct Pm4Command {
     // ReleaseMem (EOP fence) — laid out by hle_agc.cpp agc_cb_release_mem, whose args are now pinned to the
     // AGC ABI sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …)
     // (Kyty GraphicsCbReleaseMem, Graphics.cpp:1763). Packet payload: [0..1]=label address (lo/hi),
-    // [2]=data_sel, [3..4]=64-bit fence value (lo/hi), [5]=event action. data_sel (Kyty allows {2,3};
+    // [2]=data_sel, [3..4]=64-bit fence value (lo/hi), [5]=event action, [6]=#312 build snapshot.
+    // data_sel (Kyty allows {2,3};
     // shadPS4 DataSelect): 1=write 32-bit value, 2=write 64-bit value, 3=write 64-bit GPU clock.
+    // The packet is 8 dwords — the size of the hardware RELEASE_MEM it stands for, because the guest
+    // reserves its command buffer from the real AGC sizes (#1748). Captures recorded before that
+    // change carry a 9-dword form whose [6..7] hold the full build snapshot; the decoder accepts both.
     // CONFIDENCE: HIGH — every field decoded straight from the packet the builder wrote.
     uint64_t rel_addr = 0;               // ReleaseMem: destination label address
     uint32_t rel_data_sel = 0;           // ReleaseMem: DATA_SEL (1/2/3)
     uint64_t rel_value = 0;              // ReleaseMem: 64-bit fence value (for data_sel 1/2)
     bool rel_value_valid = false;        // ReleaseMem: packet was long enough to carry rel_value
-    uint64_t rel_build_pre = 0;          // ReleaseMem: destination qword when this packet was built
-    bool rel_build_pre_valid = false;    // ReleaseMem: extended packet carried the build snapshot
+    // ReleaseMem: destination qword when this packet was built. In the 8-dword packet only the HIGH
+    // half is retained (low half reads 0) — that is the only half stale_release_generation uses.
+    uint64_t rel_build_pre = 0;
+    bool rel_build_pre_valid = false;    // ReleaseMem: packet carried the build snapshot
 
     // WaitRegMem — laid out by hle_agc.cpp agc_dcb_wait_reg_mem per sceAgcDcbWaitRegMem(buf, size,
     // compare_func, op, cache_policy, address, reference, mask, poll_cycles) (Kyty
