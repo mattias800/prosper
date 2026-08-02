@@ -169,13 +169,36 @@ def main():
     submits = {int(r["submit"]) for r in records if "submit" in r}
     programs = {int(r["code"]) for r in records if "code" in r}
 
-    # Self-check: every phase of a successful dispatch is a forward interval, so a negative total
-    # means the records are not what this tool assumes. Say so loudly rather than printing a table
-    # that looks authoritative -- a decomposition with an impossible row in it is worse than none.
+    # Self-checks. This tool encodes a model of execute_item()'s phase structure, and that model can
+    # silently stop matching the emitter -- a new phase, a moved boundary, a renamed field. Both
+    # checks below hold by construction today (verified across 18,933 real records), so a violation
+    # means the model is stale and the table is fiction. Warn rather than print it silently: a
+    # decomposition with an impossible row is worse than no decomposition.
+    #
+    # 1. Every phase of a successful dispatch is a forward interval.
     negative = [k for (_, k, _) in PHASES if totals[k] < -1e-6]
     if negative:
         print(f"WARNING: negative time in {', '.join(negative)} on ok=1 records. "
               f"The phase boundaries are not all being set; this table is NOT trustworthy.",
+              file=sys.stderr)
+    # 2. The top-level phases partition total_ms, and no child exceeds its parent. Checked per
+    #    record against the printed 2-decimal precision, then reported as a count.
+    tolerance = 0.06
+    top = [k for (_, k, parent) in PHASES if parent == "total_ms"]
+    broken_sum = sum(
+        1 for r in records
+        if abs(sum(r.get(k, 0.0) for k in top) - r["total_ms"]) > tolerance)
+    broken_nest = 0
+    for parent in {p for (_, _, p) in PHASES} - {"total_ms"}:
+        kids = [k for (_, k, p) in PHASES if p == parent]
+        broken_nest += sum(
+            1 for r in records
+            if sum(r.get(k, 0.0) for k in kids) > r.get(parent, 0.0) + tolerance)
+    if broken_sum or broken_nest:
+        print(f"WARNING: this tool's phase model does not match these records "
+              f"({broken_sum} where the top-level phases do not sum to total_ms, "
+              f"{broken_nest} where children exceed their parent). The emitter in "
+              f"live_compute.cpp has probably changed; update PHASES before trusting the table.",
               file=sys.stderr)
 
     if args.csv:
