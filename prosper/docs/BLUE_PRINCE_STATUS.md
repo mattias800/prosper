@@ -105,6 +105,15 @@ The `blue-prince-title` snapshot route guards the title screen.
   per-draw `getenv`, the #1268 content hash) are in
   `docs/RENDERER_PERFORMANCE_2026_07.md` § *Blue Prince 3D submit decomposition, re-measured*.
 
+  **The immediately actionable part: `PROSPER_BACKEND_BUFFER_POOL_MB` defaults to 256 MiB and this
+  title's host-staging working set is 974 MiB**, so the pool thrashes — evictions exactly equal
+  misses (~216k each) and one buffer is destroyed for every one created. A four-arm alternating A/B
+  (256/2048/256/2048, one binary) takes the submit from 203.06 to 125.98 ms, **−34.8 % normalised
+  per draw**, with `res_buffer` −63 % and `cleanup` −80 %; at 2048 MiB the pool settles at 974 MiB /
+  503 buffers with **zero** evictions. All arms were contended, so confirm the magnitude on a clean
+  box before quoting it. The fix (memory-aware default + LRU eviction) cannot change rendered
+  output — the same bytes are uploaded from the same sources; only host staging recycling changes.
+
 ## Defect families (#1287) — families 1–3 and 5 RESOLVED 2026-07-26
 
 Families 1–3 and 5 below are **fixed on master**; they are retained as the resolution record so
