@@ -157,6 +157,43 @@ int main() {
         }
     }
 
+    // 4. #1756 gave DMA_DATA the same two-shape treatment as ReleaseMem: 7 dwords live (the hardware
+    //    size, no room for the #312 build snapshot) and 9 in every capture recorded before it. The
+    //    property that matters is which shape sets `dd_build_pre_valid`, because that flag alone
+    //    decides whether the generation check can fire — assert it at the DECODER, where no executor
+    //    guard (MB3 membership, freelist debt) can mask the answer.
+    {
+        uint32_t live7[7] = {};
+        live7[0] = 0xC0000000u | ((7u - 2u) << 16) | (0x10u << 8) | (0x19u << 2);  // PM4(7, IT_NOP, R_DMA_DATA)
+        live7[1] = 0x55667788u; live7[2] = 0x11223344u;   // dst
+        live7[3] = 0x99aabbccu; live7[4] = 0x0ddeeff0u;   // srcOrImm
+        live7[5] = 64;                                    // numBytes
+        live7[6] = 0x0303u;                               // selectors
+        std::vector<gpu::Pm4Command> ops;
+        gpu::decode_pm4(live7, 7, ops);
+        CHECK(ops.size() == 1 && ops[0].kind == gpu::Pm4Command::Kind::DmaData,
+              "7-dword DMA_DATA decodes as one DmaData (%zu ops)", ops.size());
+        if (ops.size() == 1) {
+            CHECK(ops[0].dd_valid && ops[0].dd_dst == 0x1122334455667788ull,
+                  "live DmaData destination 0x%llx", (unsigned long long)ops[0].dd_dst);
+            CHECK(ops[0].dd_bytes == 64, "live DmaData byte count %u", ops[0].dd_bytes);
+            CHECK(!ops[0].dd_build_pre_valid,
+                  "live 7-dword DmaData carries NO #312 build snapshot, so the generation check "
+                  "cannot fire on it");
+        }
+
+        uint32_t old9[9] = {};
+        std::memcpy(old9, live7, sizeof live7);
+        old9[0] = 0xC0000000u | ((9u - 2u) << 16) | (0x10u << 8) | (0x19u << 2);
+        old9[7] = 0xAAAAAAAAu; old9[8] = 0xBBBBBBBBu;     // build_pre lo/hi
+        std::vector<gpu::Pm4Command> old_ops;
+        gpu::decode_pm4(old9, 9, old_ops);
+        CHECK(old_ops.size() == 1 && old_ops[0].dd_build_pre_valid &&
+              old_ops[0].dd_build_pre == 0xBBBBBBBBAAAAAAAAull,
+              "historical 9-dword DmaData still yields its full build snapshot 0x%llx",
+              (unsigned long long)(old_ops.empty() ? 0 : old_ops[0].dd_build_pre));
+    }
+
     std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
     return fails ? 1 : 0;
 }

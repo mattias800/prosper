@@ -172,14 +172,27 @@ int main() {
 
     // sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate (#189): patch only the source qword of
     // a verified DMA_DATA packet. A wrong packet kind must remain untouched.
+    // BOTH packet shapes: the live 7-dword one (#1756, the hardware DMA_DATA size, what the builder
+    // emits today) and the historical 9-dword one still present in pre-#1756 captures. The patcher
+    // must be shape-independent — it writes payload [2..3] either way — and testing only the shape
+    // prosper no longer emits would leave the live path unasserted.
+    uint32_t dma7[7] = {};
+    dma7[0] = PM4(7, IT_NOP, R_DMA_DATA);
+    dma7[1] = 0x11111111u; dma7[2] = 0x22222222u;  // destination must survive the source patch
+    p_dma_src((uint64_t)(uintptr_t)dma7, 0xAABBCCDD00112233ull, 0, 0, 0, 0);
+    CHECK(dma7[1] == 0x11111111u && dma7[2] == 0x22222222u,
+          "DmaData source patch leaves the destination untouched (live 7-dword packet)");
+    CHECK(dma7[3] == 0x00112233u && dma7[4] == 0xAABBCCDDu,
+          "DmaData source patch writes the full 64-bit source (live 7-dword packet)");
+
     uint32_t dma[9] = {};
     dma[0] = PM4(9, IT_NOP, R_DMA_DATA);
-    dma[1] = 0x11111111u; dma[2] = 0x22222222u; // destination must survive the source patch
+    dma[1] = 0x11111111u; dma[2] = 0x22222222u;
     p_dma_src((uint64_t)(uintptr_t)dma, 0xAABBCCDD00112233ull, 0, 0, 0, 0);
     CHECK(dma[1] == 0x11111111u && dma[2] == 0x22222222u,
-          "DmaData source patch leaves the destination address untouched");
+          "DmaData source patch leaves the destination untouched (historical 9-dword packet)");
     CHECK(dma[3] == 0x00112233u && dma[4] == 0xAABBCCDDu,
-          "DmaData source patch writes the complete 64-bit source address");
+          "DmaData source patch writes the full 64-bit source (historical 9-dword packet)");
     uint32_t wrong_packet[5] = {PM4(5, IT_NOP, R_CX_REGS_INDIRECT), 1, 2, 3, 4};
     p_dma_src((uint64_t)(uintptr_t)wrong_packet, 0xDEADBEEFCAFEBABEull, 0, 0, 0, 0);
     CHECK(wrong_packet[1] == 1 && wrong_packet[2] == 2 && wrong_packet[3] == 3 && wrong_packet[4] == 4,
