@@ -165,6 +165,67 @@ void ring_record(uint64_t addr, uint64_t value, uint8_t size, uint8_t kind, uint
     r.addr = addr; r.value = value; r.pkt = pkt; r.seq = s; r.size = size; r.kind = kind;
 }
 uint64_t pkt_addr(const Pm4Command& c) { return c.payload ? (uint64_t)(uintptr_t)(c.payload - 1) : 0; }
+
+// --- #1226 GPU-write VALUE trap (PROSPER_WRITE_TRAP=0xV[,0xV...]; default OFF). ------------------
+// The address-keyed instruments (PROSPER_PROVENANCE_ADDR, PROSPER_HWWATCH, the poolshift span scan)
+// all need the destination up front. A corruption whose POISON VALUE is invariant across runs while
+// its address is not — ArcRunner's free-list head reads a constant 0x30016000 at three different
+// per-thread pool pages — has no such handle, so the question "does prosper itself ever store this
+// dword into guest memory?" was unanswerable. This traps on the payload instead of the destination:
+// every completion/label/DMA/WRITE_DATA store the command processor performs is checked against the
+// listed dwords and reported with its destination, the destination's pre-content and the packet
+// builder address. A run with zero hits is a hard negative for "a prosper GPU write created it".
+constexpr unsigned kWriteTrapMax = 8;
+struct WriteTrap { uint32_t v[kWriteTrapMax]; unsigned n = 0; };
+const WriteTrap& write_trap() {
+    static const WriteTrap t = [] {
+        WriteTrap w;
+        const char* e = getenv("PROSPER_WRITE_TRAP");
+        if (!e || !*e) return w;
+        for (const char* p = e; *p && w.n < kWriteTrapMax; ) {
+            char* end = nullptr;
+            unsigned long long v = strtoull(p, &end, 0);
+            if (end == p) break;
+            w.v[w.n++] = (uint32_t)v;
+            p = (*end == ',') ? end + 1 : end;
+        }
+        if (w.n)
+            fprintf(stderr, "[write-trap] armed on %u value(s), first=0x%x\n", w.n, w.v[0]);
+        return w;
+    }();
+    return t;
+}
+inline bool write_trap_armed() { return write_trap().n != 0; }
+inline bool write_trap_hit(uint32_t v) {
+    const WriteTrap& t = write_trap();
+    for (unsigned i = 0; i < t.n; i++) if (t.v[i] == v) return true;
+    return false;
+}
+std::atomic<uint64_t> g_write_trap_reports{0};
+void write_trap_report(const char* kind, uint64_t dst, uint64_t pre, uint32_t v,
+                       uint32_t byte_off, uint64_t pkt) {
+    // The total is unbounded even though the printing is capped: a reader must be able to tell
+    // "the trap never matched" (a hard negative about prosper's own stores) from "the trap matched
+    // more often than it printed". Reporting only capped lines makes those two indistinguishable,
+    // which is exactly the silence-proves-nothing failure this instrument exists to avoid.
+    const uint64_t seen = g_write_trap_reports.fetch_add(1) + 1;
+    if (seen > 256) return;
+    fprintf(stderr,
+            "[agc] WRITE-TRAP kind=%s dst=0x%llx+%u val=0x%x pre=0x%llx pkt=0x%llx t=%llums\n",
+            kind, (unsigned long long)dst, byte_off, v, (unsigned long long)pre,
+            (unsigned long long)pkt, (unsigned long long)now_ms());
+}
+// Scan a payload the command processor is about to store. `pre` is the destination's current qword
+// (0 when the caller has not read it); `bytes` is bounded by the caller.
+void write_trap_scan(const char* kind, uint64_t dst, uint64_t pre, const void* payload,
+                     uint64_t bytes, uint64_t pkt) {
+    if (!write_trap_armed() || !payload) return;
+    const uint8_t* p = (const uint8_t*)payload;
+    for (uint64_t off = 0; off + 4 <= bytes; off += 4) {
+        uint32_t v; memcpy(&v, p + off, 4);
+        if (write_trap_hit(v)) write_trap_report(kind, dst, pre, v, (uint32_t)off, pkt);
+    }
+}
 }
 // Scan the ring for writes intersecting [lo, hi); format up to `max` matches into out (NUL-
 // terminated). Async-signal-safe: no locks, no allocation, tolerates racy ring slots. kind:
@@ -405,6 +466,12 @@ void label_hist_report(uint64_t addr, char* out, size_t cap) {
 extern "C" void prosper_label_hist_dump(uint64_t addr, char* out, unsigned cap) {
     label_hist_report(addr, out, cap);
 }
+// #1226: total PROSPER_WRITE_TRAP matches, uncapped (the printed lines are capped). Exposed so a
+// test can assert both arms of the trap without parsing stderr — a value the guest's stream writes
+// must be counted, an adjacent value must not.
+extern "C" uint64_t prosper_gpu_write_trap_matches() {
+    return g_write_trap_reports.load(std::memory_order_relaxed);
+}
 
 // #312: "pointer-like" pre-content — a freed MallocBinned3 block header holds heap pointers into
 // the 512 GiB arena (0x1000000000) or the allocator-metadata pools (0x2000000000 region, where the
@@ -494,6 +561,30 @@ static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint
 // session-8 theory and unifies all three fatal signatures into ONE root write). The existing
 // REL1-LIVE guard (case 1) MISSES this because it requires pre_low != 0; a 0x1000000000-shaped
 // pointer has pre_low == 0. forges_freelist_ptr() detects that missed case.
+//
+// #1226 — what this shape is on ArcRunner (PPSA21406), and why the guard below cannot fix it.
+// Measured: the predicate matches with an identical `pre=0x2000000000 val=0x1 -> 0x2000000001` on
+// every hit, and EVERY hit has an executed-but-unsignalled init outstanding (`dma_exec_n >
+// rel_exec_n`), so `!live_pair` declines all of them. Read `live_pair` carefully: it is prosper's
+// OWN bookkeeping, not proof the guest still owns the block — waf_guard() documents the case where
+// the guest frees the 0x20 label while BOTH our writes are in flight, and that case produces
+// exactly these counters.
+//
+// The forged qword is a POINTER WITH ITS LOW BIT SET, so a guest free-list walk that dereferences
+// it reads ONE BYTE LOW and gets the target qword shifted right 8. Measured on every hit:
+// `*(0x2000000001) = 0x30016000`, which is byte-for-byte the value the terminal free-list fault at
+// eboot+0x127e751 dereferences. **The "POOLSHIFT byte-shifted pool pointer" signature this issue
+// family has chased since #1249 is the READ ARTIFACT of this forge, not an independent defect** —
+// confirming the session-10 read-artifact note below with a direct measurement.
+//
+// An A/B that suppresses every forging fence removes `0x30016000` and moves the SAME fault to
+// `0x2400100024001`: with no fence value the qword stays `0x2000000000`, the walk reads it ALIGNED
+// as `0x3001600000` and steps into that buffer's `0x00024001` fill. So the fence is the second half
+// of the damage; the first half is the paired 4-byte DMA_DATA immediate-zero init, which has
+// already destroyed the low dword of a live `FFreeBlock::NextFreeBlock`. Guarding the fence alone
+// cannot help, and the discriminator has to be the guest's actual freelist MEMBERSHIP at write time
+// (mb3_freelist_guard) rather than either write's content. Do not "fix" this by widening a
+// value-shape predicate; tests/test_eop_write.cpp pins both arms.
 static inline bool forges_freelist_ptr(uint64_t pre, uint64_t width, uint64_t value) {
     if (!ptr_like(pre)) return false;        // dst must currently hold a heap/pool pointer
     if ((uint32_t)pre != 0) return false;    // low dword already nonzero -> the REL1-LIVE guard covers it
@@ -505,12 +596,48 @@ static inline bool forges_freelist_ptr(uint64_t pre, uint64_t width, uint64_t va
 static void forge_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t value, uint64_t width, uint64_t pkt) {
     static const bool on = getenv("PROSPER_FORGE_TRIP") != nullptr;
     if (!on || !forges_freelist_ptr(pre, width, value)) return;
-    static std::atomic<int> n{0};
-    if (n.fetch_add(1) < 64)
-        fprintf(stderr, "[agc] FORGE-STOMP kind=%s dst=0x%llx pre=0x%llx val=0x%llx -> 0x%llx pkt=0x%llx t=%llums\n",
+    // #1226: print the first 64, then keep printing at every power of two, and carry the ordinal on
+    // every line. The old form printed exactly 64 lines and nothing else, so "64 hits" — quoted as a
+    // count on this issue — was the CAP, indistinguishable from a run with 64,000. A tripwire that
+    // reports a population must never let its own limit masquerade as the measurement.
+    static std::atomic<uint64_t> n{0};
+    const uint64_t ord = n.fetch_add(1) + 1;
+    if (ord <= 64 || (ord & (ord - 1)) == 0) {
+        // #1226: report WHY the paired guard did or did not decline, in the same line. The guard is
+        // `forge_guard() && label_is_consumed_marker(dst) && !live_pair`, and a bare hit count could
+        // not distinguish "the label has no tracked init protocol at all" (cm=0 — every #312 guard is
+        // then inert on it) from "a live init is outstanding, so the write is the guest's own paired
+        // fence" (live=1 — suppressing would repeat the #1245 regression). The event ring carries the
+        // per-generation PRE-CONTENT at each exec, which is what shows the two-write composition of
+        // the forged qword (init zeroes the low dword of a pointer, the fence then sets it to 1).
+        LabelHist& h = label_hist_slot(dst);
+        uint32_t db = h.dma_built_n.load(std::memory_order_relaxed);
+        uint32_t dx = h.dma_exec_n.load(std::memory_order_relaxed);
+        uint32_t rb = h.rel_built_n.load(std::memory_order_relaxed);
+        uint32_t rx = h.rel_exec_n.load(std::memory_order_relaxed);
+        char hist[640]; label_hist_report(dst, hist, sizeof hist);
+        // The forged qword is a POINTER WITH ITS LOW BIT SET. Should the guest allocator ever
+        // dereference it as a free-block next-pointer, that read is MISALIGNED by one byte and
+        // returns the target qword shifted right 8 bits — which is exactly the shape of the
+        // constant `0x30016000` / `0x30015f00` / `0x20015f00` poisons this issue family chases.
+        // Report what the misread would yield so "forged pointer -> misaligned read -> byte-shifted
+        // pool address" can be confirmed or refuted from one line rather than inferred.
+        const uint64_t forged = pre | (value & 0xffffffffull);
+        uint64_t misread = 0;
+        const bool mis_ok = guest_readable(forged, 8);
+        if (mis_ok) memcpy(&misread, (const void*)(uintptr_t)forged, sizeof misread);
+        char mis[40];
+        if (mis_ok) snprintf(mis, sizeof mis, "0x%llx", (unsigned long long)misread);
+        else        snprintf(mis, sizeof mis, "unmapped");
+        fprintf(stderr,
+                "[agc] FORGE-STOMP #%llu kind=%s dst=0x%llx pre=0x%llx val=0x%llx -> 0x%llx pkt=0x%llx "
+                "t=%llums cm=%d live=%d dmaB=%u dmaX=%u relB=%u relX=%u misread(*forged)=%s | %s\n",
+                (unsigned long long)ord,
                 kind, (unsigned long long)dst, (unsigned long long)pre, (unsigned long long)value,
-                (unsigned long long)(pre | (value & 0xffffffffull)), (unsigned long long)pkt,
-                (unsigned long long)now_ms());
+                (unsigned long long)forged, (unsigned long long)pkt,
+                (unsigned long long)now_ms(), db > 0 ? 1 : 0, dx > rx ? 1 : 0, db, dx, rb, rx,
+                mis, hist);
+    }
 }
 // #312 ROOT fix gate (default ON; PROSPER_REL1_FORGE_GUARD=0 for A/B baseline). Suppress a fence
 // write that would forge a freelist next-pointer (see forges_freelist_ptr), gated to the consumed-
@@ -958,7 +1085,9 @@ static void honor_eop_write(const Pm4Command& c) {
                                   (unsigned long long)now_ms(), hist);
                       }
                   }
-                  uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v);
+                  uint32_t v = (uint32_t)c.rel_value;
+                  write_trap_scan("REL1", c.rel_addr, pre, &v, sizeof v, pkt_addr(c));
+                  memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 4, 1, pkt_addr(c));
                   poolshift_check("REL1", c.rel_addr, 4, c.rel_value, pkt_addr(c));
                   label_hist_rel_exec(c.rel_addr, pre, c.queue_origin); break; }
@@ -984,11 +1113,15 @@ static void honor_eop_write(const Pm4Command& c) {
                       label_hist_event(c.rel_addr, LE_REL_EXEC, pre, c.queue_origin);
                       return;
                   }
-                  uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v);
+                  uint64_t v = c.rel_value;
+                  write_trap_scan("REL2", c.rel_addr, pre, &v, sizeof v, pkt_addr(c));
+                  memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 8, 1, pkt_addr(c));
                   poolshift_check("REL2", c.rel_addr, 8, c.rel_value, pkt_addr(c)); break; }
         case 3: { uint64_t pre = 0; memcpy(&pre, dst, sizeof pre);   // #1226 provenance pre-read
-                  uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v);
+                  uint64_t v = gpu_clock64();
+                  write_trap_scan("REL3", c.rel_addr, pre, &v, sizeof v, pkt_addr(c));
+                  memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 8, 1, pkt_addr(c));
                   clockfence_record(c.rel_addr, pre, v, pkt_addr(c), 1); break; }
         // Unknown selector: LOG AND SKIP. The old default wrote the 64-bit value for ANY
@@ -1029,6 +1162,7 @@ static void honor_event_write(const Pm4Command& c) {
     }
     uint64_t pre = 0; memcpy(&pre, (void*)(uintptr_t)c.event_addr, sizeof pre);   // #1226 provenance
     uint64_t v = gpu_clock64();
+    write_trap_scan("EVENT", c.event_addr, pre, &v, sizeof v, pkt_addr(c));
     memcpy((void*)(uintptr_t)c.event_addr, &v, sizeof v);
     notify_guest_gpu_write(c.event_addr, sizeof v);
     ring_record(c.event_addr, v, 8, 2, pkt_addr(c));
@@ -1127,6 +1261,7 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
             }
         }
         forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, packet_addr);
+        write_trap_scan("DMA-imm", c.dd_dst, pre_dma, &v32, sizeof v32, packet_addr);
         if (v32 == 0) {
             memset(dst, 0, c.dd_bytes);
         } else {
@@ -1142,9 +1277,13 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     } else {
         // memmove is byte-for-byte memcpy behavior for the normal non-overlapping GPU-buffer case,
         // while remaining deterministic if an unusual packet overlaps its endpoints.
-        memmove(dst, authoritative_source ? authoritative_source
-                                          : (const uint8_t*)(uintptr_t)c.dd_src,
-                c.dd_bytes);
+        const uint8_t* copy_src = authoritative_source ? authoritative_source
+                                                       : (const uint8_t*)(uintptr_t)c.dd_src;
+        // #1226 value trap: bound the scan — a copy DMA can move megabytes and this is diagnostic.
+        if (write_trap_armed())
+            write_trap_scan("DMA-copy", c.dd_dst, peek_qword(c.dd_dst), copy_src,
+                            c.dd_bytes > 4096 ? 4096 : c.dd_bytes, packet_addr);
+        memmove(dst, copy_src, c.dd_bytes);
         if (getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc]   DmaData copy [0x%llx] <- [0x%llx] (%u bytes)\n",
                     (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes);
@@ -1195,6 +1334,9 @@ static void honor_write_data(const Pm4Command& c) {
             report_suspect_write("WDATA", c.wd_addr, c.wd_data[0], pre, pkt_addr(c));
         forge_trip("WDATA", c.wd_addr, pre, c.wd_data[0], 4, pkt_addr(c));   // #312 session-10 tripwire
     }
+    if (write_trap_armed())
+        write_trap_scan("WDATA", c.wd_addr, peek_qword(c.wd_addr), c.wd_data,
+                        (uint64_t)c.wd_num * 4, pkt_addr(c));
     memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
     notify_guest_gpu_write(c.wd_addr, static_cast<uint64_t>(c.wd_num) * 4);
     ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));

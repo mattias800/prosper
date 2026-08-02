@@ -44,6 +44,21 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     a heuristic stack scan (a stale spill slot looks exactly like a return address), so treat the
     result as a callsite **hint** to confirm against the module's disassembly — never as proof on its
     own. Bounded to 64 distinct chains so an allocation-heavy boot cannot bury the log.
+  - **Does prosper itself ever store *this value* into guest memory?**
+    **`PROSPER_WRITE_TRAP=0xV[,0xV…]`** (up to 8 values) checks every guest-memory store the command
+    processor performs — `RELEASE_MEM` data_sel 1/2/3, `EVENT_WRITE`, `WRITE_DATA`, and both
+    `DMA_DATA` forms (a copy is scanned to its first 4 KiB) — against the listed 32-bit values, and
+    reports each match with the destination, the destination's current qword and the packet builder:
+    ```text
+    [agc] WRITE-TRAP kind=REL1 dst=0x2020f3d580+0 val=0x1 pre=0x2000000000 pkt=0x30030c2f58 t=4857ms
+    ```
+    This is the complement of `PROSPER_PROVENANCE_ADDR`, which keys on the *destination*: use the
+    value trap when a corruption's poison is **constant across runs but its address is not**, so
+    there is no stable address to watch. A run with zero hits is then a hard negative for "a prosper
+    PM4 write path created that value" — but only for those paths, and only if you have shown a hit
+    can appear: arm a value the title is known to write (a fence `0x1`) as a positive control in the
+    same configuration. The printed lines are capped at 256; the match **total** is not, so a capped
+    report still tells you the trap fired more often than it printed.
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
   `--seconds 1` for wall-clock sampling, warmup or `--render-every N --render-every-for-seconds S`
   for slow software rendering,
