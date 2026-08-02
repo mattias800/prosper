@@ -535,6 +535,8 @@ struct BackendRenderTimingStats {
     double res_texture_upload_ms = 0;
     double res_texture_bind_ms = 0;
     double res_buffer_ms = 0;
+    double res_buffer_acquire_ms = 0;
+    double res_buffer_copy_ms = 0;
     double res_descriptor_ms = 0;
 
     double total_ms() const {
@@ -3637,6 +3639,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     double res_texture_upload_ms = 0.0;
     double res_texture_bind_ms = 0.0;
     double res_buffer_ms = 0.0;
+    // Nested INSIDE res_buffer_ms, splitting the two candidate mechanisms apart: Vulkan object churn
+    // (pool/arena acquisition, which on a miss is create+allocate+bind+map) versus staging memcpy
+    // bandwidth. They imply completely different fixes, so the split is what selects between them.
+    double res_buffer_acquire_ms = 0.0;
+    double res_buffer_copy_ms = 0.0;
     double res_descriptor_ms = 0.0;
     auto setup_elapsed_ms = [](auto begin, auto end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
@@ -4621,9 +4628,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         buffer_index = shared_buffers.size();
                         SharedBufferUpload upload;
                         const VkDeviceSize bytes = static_cast<VkDeviceSize>(word_count) * 4;
-                        if (use_buffer_arena)
+                        if (use_buffer_arena) {
+                            const ResourcePhaseTimer phase_acquire(timing_enabled,
+                                                                   &res_buffer_acquire_ms);
                             acquire_buffer_arena_slice(bytes, upload);
+                        }
                         if (!upload.arena && reuse_host_buffers) {
+                            const ResourcePhaseTimer phase_acquire(timing_enabled,
+                                                                   &res_buffer_acquire_ms);
                             RenderHostBuffer pooled = acquire_render_host_buffer(ctx, bytes);
                             upload.buffer = pooled.buffer;
                             upload.memory = pooled.memory;
@@ -4666,6 +4678,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 upload.range = bytes;
                             }
                         } else {
+                            const ResourcePhaseTimer phase_copy(timing_enabled,
+                                                                &res_buffer_copy_ms);
                             std::memcpy(static_cast<uint8_t*>(upload.mapped) + upload.offset,
                                         words, static_cast<size_t>(bytes));
                             upload.range = bytes;
@@ -6236,6 +6250,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.res_texture_upload_ms = res_texture_upload_ms;
         call_timing.res_texture_bind_ms = res_texture_bind_ms;
         call_timing.res_buffer_ms = res_buffer_ms;
+        call_timing.res_buffer_acquire_ms = res_buffer_acquire_ms;
+        call_timing.res_buffer_copy_ms = res_buffer_copy_ms;
         call_timing.res_descriptor_ms = res_descriptor_ms;
         call_timing.setup_pipeline_ms = setup_pipeline_ms;
         struct TimingTotals {
@@ -6559,6 +6575,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(res_texture_upload_ms);
             PROSPER_SUM_TIMING_STAT(res_texture_bind_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_acquire_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_copy_ms);
             PROSPER_SUM_TIMING_STAT(res_descriptor_ms);
             PROSPER_SUM_TIMING_STAT(setup_pipeline_ms);
 #undef PROSPER_SUM_TIMING_STAT
