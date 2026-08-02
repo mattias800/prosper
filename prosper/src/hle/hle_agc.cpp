@@ -153,6 +153,7 @@ struct AgcDcb;
 const char* dcb_subop_name(uint32_t r);
 void dcb_report_full(const AgcDcb* dcb, uint32_t need);
 void dcb_report_window(const AgcDcb* dcb, uint32_t n, uint32_t op, uint32_t r);
+void dcb_diag_tick(bool was_full);
 inline bool dcb_diag_full() {
     static const bool v = getenv("PROSPER_DCBFULL") != nullptr;
     return v;
@@ -243,8 +244,46 @@ const char* dcb_subop_name(uint32_t r) {
         default:                           return "(op-carried)";
     }
 }
+// A ZERO FROM A GATED PROBE MUST PROVE IT WAS ARMED. #1756's corpus census concluded that Syberia
+// issues no buffer-full callbacks at all, and that negative went into a permanent `## Ruled out`
+// row — but an unarmed run produces exactly the same empty log as a clean one, so the conclusion
+// rested on the operator having set the variable correctly. It now rests on the log: when either
+// probe is armed the first packet emits a banner, and every 2^20 packets a tally reports how many
+// were observed and how many buffer-full events fired. A run whose log contains
+// `[dcbdiag] armed` and `full=0` measured zero; a run containing neither measured nothing, and the
+// difference is visible without re-running anything.
+std::atomic<uint64_t> g_dcb_diag_packets{0}, g_dcb_diag_fulls{0};
+// Totals at exit as well, for a clean shutdown. Do not rely on it: a `timeout`-bounded diagnostic
+// run dies on SIGTERM and never runs static destructors, which is why the periodic tally above is
+// the primary evidence and its interval is small.
+struct DcbDiagSummary {
+    ~DcbDiagSummary() {
+        const uint64_t n = g_dcb_diag_packets.load(std::memory_order_relaxed);
+        if (!n) return;
+        fprintf(stderr, "[dcbdiag] TOTAL seen=%llu packets, full=%llu buffer-full events\n",
+                (unsigned long long)n,
+                (unsigned long long)g_dcb_diag_fulls.load(std::memory_order_relaxed));
+    }
+};
+DcbDiagSummary g_dcb_diag_summary;
+void dcb_diag_tick(bool was_full) {
+    if (was_full) { g_dcb_diag_fulls.fetch_add(1, std::memory_order_relaxed); return; }
+    const uint64_t n = g_dcb_diag_packets.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1)
+        fprintf(stderr, "[dcbdiag] armed: DCBFULL=%d DCBWIN=%u — this line proves the probe is live; "
+                        "a run without it measured nothing\n",
+                dcb_diag_full() ? 1 : 0, dcb_diag_win());
+    // Every 2^14 packets, not 2^20: these runs are `timeout`-bounded, so SIGTERM skips the exit
+    // summary below, and a low-volume title (Syberia emits well under 2^20 in 45 s) would otherwise
+    // produce no tally at all — leaving "measured zero" and "never armed" looking identical, which
+    // is the whole failure this reporting exists to prevent.
+    if ((n & 0x3fffu) == 0)
+        fprintf(stderr, "[dcbdiag] seen=%llu packets, full=%llu buffer-full events\n",
+                (unsigned long long)n, (unsigned long long)g_dcb_diag_fulls.load(std::memory_order_relaxed));
+}
 void dcb_report_full(const AgcDcb* dcb, uint32_t need) {
     if (!dcb_diag_full() || !dcb) return;
+    dcb_diag_tick(true);
     const uint32_t window = dcb->bottom && dcb->cursor_down
                           ? (uint32_t)(dcb->cursor_down - dcb->bottom) : 0;
     // Bound the report. A title whose command buffer simply grows produces one of these per chunk
@@ -265,6 +304,7 @@ void dcb_report_window(const AgcDcb* dcb, uint32_t n, uint32_t op, uint32_t r) {
     // entire cost of an unarmed run.
     static const bool armed = dcb_diag_full() || dcb_diag_win() != 0;
     if (!armed) return;
+    dcb_diag_tick(false);                   // banner + periodic tally, so a zero is self-evidencing
     g_dcb_diag_r = r; g_dcb_diag_op = op;   // remembered for the buffer-full report just below
     const uint32_t limit = dcb_diag_win();
     if (!limit || !dcb || !dcb->bottom || !dcb->cursor_down) return;

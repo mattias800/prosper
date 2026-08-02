@@ -265,22 +265,38 @@ Both are why the per-builder table keeps its open rows rather than treating this
 The runs are also 45 s headless boots on one implicit route with no renderer, so they cover each
 title's startup and whatever it reaches unattended — not its gameplay.
 
-**Command-buffer churn** — the quiet cost, measured as buffer-full callbacks per second. Babylon
-pre-#1748 ran at **~466/s**. The three titles whose frame rate made them suspects are not paying it:
+**Command-buffer churn** — and a correction to how it was first reported here. The original figures
+came from counting `[dcbfull]` **log lines**, which the report caps at 512 and then samples. Bendy,
+GTA V, Terminator and Babylon all sat at 512-514 lines: that was **the cap, not a count**, and the
+"11.4/s" rates derived from it were meaningless (instrument trap 51, in this project's own list).
 
-| title | fps | buffer-full /s | `avail>0, reserved=0` |
-| --- | --- | --- | --- |
-| *Syberia: Remastered* `PPSA30140` | ~1.9 | **0.0** | 0 |
-| *Bendy and the Ink Machine* `PPSA27616` | ~8 | 11.4 | 0 |
-| *Dragon Quest VII* `PPSA17942` | ~12 | 2.5 | 0 |
-| *GTA V* `PPSA04263` | — | 11.4 | 0 |
-| *Terminator 2D* `PPSA25872` | — | 11.4 | 0 |
-| every other title | — | 0.0–2.5 | 0 |
+The probe now keeps an exact tally and prints an `armed` banner plus a running
+`seen=<packets> full=<events>` line every 2^14 packets, so a zero is self-evidencing and a rate is a
+rate. Re-measured, 45 s headless boot each:
 
-Syberia's 1.9 fps is not command-buffer churn — it issues no buffer-full callbacks at all. Bendy's
-and GTA V's ~11/s are ordinary buffer growth (`avail=0` throughout), 40× below the rate that killed
-Babylon. **Nothing here explains a slow title**, and that is a result: the hypothesis is eliminated
-for the current corpus rather than left open.
+| title | fps | packets built | buffer-full events | rate |
+| --- | --- | --- | --- | --- |
+| *Syberia: Remastered* `PPSA30140` | ~1.9 | 311,296 | **0** | **0.0/s** |
+| *Dragon Quest VII* `PPSA17942` | ~12 | 2,326,528 | 74 | 1.6/s |
+| *GTA V* `PPSA04263` | — | 81,920 | 588 | 13.1/s |
+| *Bendy and the Ink Machine* `PPSA27616` | ~8 | 4,472,832 | 13,368 | **297/s** |
+| *Asterix & Obelix* `PPSA30490`, **after** #1748 | ~124 | 3,375,104 | 16,545 | 368/s |
+
+What this does and does not establish:
+
+* **Syberia's zero is established.** The banner proves the probe was armed, and 311,296 packets
+  produced no buffer-full event at all. Its 1.9 fps is not command-buffer churn.
+* **"No slow title pays this cost" was wrong**, and the capped numbers hid it. Bendy runs at 297/s —
+  the same order as Babylon *after* its fix (368/s). High buffer-full traffic is therefore **not**
+  the defect signature: Babylon at 368/s reclaims its chunks and allocates 23 blocks in a run, while
+  the same title before #1748 allocated 1053 and died. What distinguishes them is whether the chunks
+  come back, which `[memhle] alloc_main_dmem` measures directly and this probe does not.
+* Whether **Bendy** reclaims is unmeasured and worth one `PROSPER_MEMLOG` run.
+
+The same cap limits the overrun census below: a title whose log hit 512 `[dcbfull]` lines had the
+remainder truncated, so "no signature events" is established only for titles that stayed under the
+cap — Syberia among them. For Bendy, GTA V, Terminator and Babylon it is **not established**, and
+re-running them against the exact tally is the cheap way to close it.
 
 ## Called and unimplemented
 
@@ -321,7 +337,7 @@ happened to ask, and each time fixed for that title's NIDs alone.
 | A small `cursor_down - bottom` window at a buffer-full event means prosper overran a reservation | False positive on segmented Dcbs: The Pathless shows 58 such events, all with `avail=0` and `cursor_up == cursor_down` — the segment was simply exhausted | #1756 |
 | `avail>0` at a buffer-full event means prosper overran a reservation | False positive whenever the guest holds a reserve: every repeated `avail>0` triple in the corpus carries `reserved=18`, across sub-ops whose `avail` tracks their own size (`need=3 avail=2` … `need=69 avail=25`). `reserved=0` is required | #1756 |
 | `SetShRegsIndirect` / `SetCxRegsIndirect` are one dword too large — three titles reach `need=4 avail=3` | Same artefact: all three carry `reserved=18`, and prosper's 4-dword encoding (count + 64-bit pointer) cannot fit in 3 anyway, so a shrink would need a different encoding and its own evidence | #1756 |
-| Syberia / Bendy / Dragon Quest VII are slow because of #1748-style command-buffer churn | 0.0 / 11.4 / 2.5 buffer-full callbacks per second and zero overruns, against Babylon's ~466/s | #1756 |
+| Syberia is slow because of #1748-style command-buffer churn | **Falsified for Syberia**, whose probe was armed (banner in the log) and saw **0** buffer-full events in 311,296 packets. **Not established for Bendy**, which the corrected tally puts at **297/s** — the same order as Babylon *after* its fix (368/s), so buffer-full rate is not itself the defect signature; whether Bendy reclaims its chunks is unmeasured | #1756 |
 | The 59 unimplemented `GetSize` NIDs are all live defects because 11 titles import them | Import is not call; those 11 titles import the whole libSceAgc stub table, and no corpus title calls any of them | #1756 |
 
 ## Open
