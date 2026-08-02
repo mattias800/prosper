@@ -215,9 +215,8 @@ The detailed native build, screenshot, and diagnostic recipe is in
 
 ## Windows download and use
 
-Every CI run publishes a `prosper-windows-x64` artifact. A `v*` tag publishes the same
-`prosper-windows-x64.zip` on the repository's [GitHub Releases page](https://github.com/mattias800/ps5ys/releases).
-The archive contains
+A `v*` tag publishes `prosper-windows-x64.zip` and its `.sha256` on the repository's
+[GitHub Releases page](https://github.com/mattias800/ps5ys/releases). The archive contains
 `prosper-app.exe`, a one-command PowerShell launcher, and its usage guide; it never contains games,
 firmware, or keys.
 
@@ -232,6 +231,35 @@ creates local save data, and enables the Vulkan window, audio, physical controll
 overlay. Use `./start-prosper.ps1 -TestPattern -Frames 120` to test the frontend without a game.
 See [`WINDOWS_RELEASE.md`](prosper/docs/WINDOWS_RELEASE.md) for requirements, direct-executable use,
 save-data selection, the complete keyboard mapping, recordings, and troubleshooting.
+
+## Linux download and use
+
+A `v*` tag publishes `prosper-linux-x86_64.AppImage` and `prosper-linux-x86_64.tar.gz`, each with a
+`.sha256`, on the same [GitHub Releases page](https://github.com/mattias800/ps5ys/releases). Take the
+AppImage for normal desktop use and the tarball when the AppImage runtime cannot start (it needs
+FUSE). Like the Windows archive, neither contains games, firmware, or keys.
+
+```bash
+chmod +x prosper-linux-x86_64.AppImage
+PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+  ./prosper-linux-x86_64.AppImage --dump ~/ps5/PPSA24651-app0
+```
+
+The tarball ships `start-prosper.sh`, the counterpart of the Windows launcher, which supplies that
+environment for you:
+
+```bash
+tar -xzf prosper-linux-x86_64.tar.gz && cd prosper-linux-x86_64
+./start-prosper.sh ~/ps5/PPSA24651-app0
+```
+
+FFmpeg and libva travel inside the archive because their sonames differ on every distribution; SDL3
+is statically linked. What you must supply is **glibc 2.39 or newer** and a working Vulkan driver —
+no archive can carry either. `./prosper-linux-x86_64.AppImage --list-games --games-dir ~/ps5` prints
+the titles it can see and exits without opening a window, which is the quickest way to confirm a
+download runs. See [`LINUX_RELEASE.md`](prosper/docs/LINUX_RELEASE.md) for the full requirements,
+keyboard mapping, recordings, and troubleshooting, and
+[`prosper/packaging/linux/`](prosper/packaging/linux/README.md) for how the archives are built.
 
 ## Repository layout
 
