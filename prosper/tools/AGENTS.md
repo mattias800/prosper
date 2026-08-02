@@ -32,6 +32,18 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`boot_trace/`** — boots a SELF/ELF game image through the loader + HLE and
   runs it, with the fault handler, GPU executor, and (under `PROSPER_RENDER`) the
   live Vulkan renderer. The main harness for exercising a real title headlessly.
+  - **Who allocated this memory?** `PROSPER_MEMLOG=1` reports every direct-memory reserve / allocate
+    / map with its size, which answers *how much* but never *who* — and the same guest allocator
+    serves every subsystem, so a title whose heap grows without bound looks identical to one that is
+    legitimately loading. Add **`PROSPER_DMEM_CALLER=1`** to print, once per distinct call chain, the
+    guest return addresses above each `sceKernelAllocateMainDirectMemory`:
+    ```text
+    [dmem-caller] alloc_main_dmem len=0x1000000 from eboot+0x1b2454f eboot+0x7d0a00 eboot+0x22b1e80 …
+    ```
+    Feed the first address to `tools/re/edis.py` / `tools/re/xref.py` to name the caller. The walk is
+    a heuristic stack scan (a stale spill slot looks exactly like a return address), so treat the
+    result as a callsite **hint** to confirm against the module's disassembly — never as proof on its
+    own. Bounded to 64 distinct chains so an allocation-heavy boot cannot bury the log.
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
   `--seconds 1` for wall-clock sampling, warmup or `--render-every N --render-every-for-seconds S`
   for slow software rendering,
