@@ -64,9 +64,11 @@ value is recorded per build in `BUILD.txt`.
 - **Bundling the closure of a fully-featured distribution FFmpeg, on any host.** Bundling Fedora 43's
   closure (231 libraries — Samba, Kerberos, ICU, glib, OpenCL, rsvg) produces a binary that
   segfaults in `call_init` before `main`, inside a bundled system-integration library's ELF
-  initializer. Three separate libraries were confirmed to do this (`libcrypt.so.2`, then
-  `libsystemd.so.0`, then a third after both were excluded), so excluding them one at a time is
-  unbounded — and the excluded ones cannot be assumed present on every user's machine either. What
+  initializer. Three separate libraries were confirmed to do this, each found by gdb after excluding
+  the previous one: `libcrypt.so.2`, then `libsystemd.so.0`, then `libtalloc.so.2` (Samba). So
+  excluding them one at a time is unbounded — and the excluded ones cannot be assumed present on
+  every user's machine either, which is what makes the exclusion route a dead end rather than a
+  longer list. What
   makes the shipped configuration work is the *runner*, not an exclusion list: Ubuntu 24.04's FFmpeg
   pulls 116 libraries and none of that family. Packaging on a different host may well hit this
   again; `verify-linux-app.sh` executes the packaged binary precisely so it fails loudly rather than
