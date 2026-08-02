@@ -277,7 +277,30 @@ int main() {
         CHECK(elapsed_us >= 4 * 16683,
               "five WaitVblank calls block for at least four vblank periods");
         CHECK(wait_c1 >= wait_c0 + 4,
-              "WaitVblank shares GetVblankStatus's timebase (counter advanced by the waits)");
+              "WaitVblank advances GetVblankStatus's counter by one tick per wait");
+
+        // PHASE, which the counter assertion above does NOT test. A WaitVblank with its own epoch
+        // shifted half a period — same period, different phase — advances the counter by exactly
+        // the same amount and passes everything above, and phase is the entire content of the
+        // "shared timebase" claim: a game that waits and then reads must land ON the tick it
+        // waited for, not between two.
+        //
+        // GetVblankStatus reports processTime as microseconds since the shared epoch, so the
+        // residue of that against the period says where in the period the wait left us. Sample the
+        // MINIMUM over several waits rather than any single one: sleep_until may overshoot under
+        // host load, which can only move a residue later, so the minimum is the robust statistic
+        // and it can only be small if the two really share an epoch. A half-period-shifted private
+        // epoch floors at ~8.34 ms and cannot produce a small minimum however many samples we take.
+        uint64_t min_phase_ns = UINT64_MAX;
+        for (int i = 0; i < 6; ++i) {
+            waitvbl(handle, 0, 0, 0, 0, 0);
+            vbl(handle, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0);
+            const uint64_t phase_ns = (*(uint64_t*)(vb + 0x08) * 1000ull) % 16683350ull;
+            if (phase_ns < min_phase_ns) min_phase_ns = phase_ns;
+        }
+        CHECK(min_phase_ns < 4000000ull,
+              "WaitVblank shares GetVblankStatus's PHASE, not just its period "
+              "(wakes land on a boundary of the same grid)");
     }
 
     // Device capability: plain SDR display (capability 0).

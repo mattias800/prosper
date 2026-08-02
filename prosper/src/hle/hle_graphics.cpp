@@ -456,10 +456,18 @@ HLE(g_vo_resstatus)   {
     return 0;
 }
 
-// The one monotonic ~59.94 Hz vblank timebase. sceVideoOutGetVblankStatus's `count` and
-// sceVideoOutWaitVblank's wake-up boundary MUST come from the same clock: a game that waits for a
-// vblank and then reads the count has to observe the count it just waited for. Anchored on the
-// first use so both are process-relative, exactly as the previous status-only anchor was.
+// The monotonic ~59.94 Hz timebase shared by sceVideoOutGetVblankStatus's `count` and
+// sceVideoOutWaitVblank's wake-up boundary. They MUST share it in PHASE, not merely in period: a
+// game that waits for a vblank and then reads the count has to observe the tick it just waited for,
+// which is a statement about where the boundaries fall, not about how far apart they are. Anchored
+// on first use so both are process-relative, exactly as the previous status-only anchor was.
+//
+// It is NOT the only vblank clock in the process, and this comment previously claimed it was.
+// hle_kernel_time.cpp's `vblank_pump` (:731) posts the VideoOut vblank kevent from its own
+// `nanosleep(16666667)` loop — 60.000 Hz, its own phase, started when the first equeue source is
+// registered. So the kevent stream and this grid drift by roughly one tick per second and their
+// boundaries do not coincide. Aligning them is a real follow-up; asserting they are aligned is
+// wrong, and a title that cross-checks the two would see the disagreement.
 // Internal linkage on purpose: the "epoch before now" ordering invariant below is only
 // enforceable by reading this one file, so nothing outside it may reach these.
 namespace {
