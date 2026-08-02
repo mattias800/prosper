@@ -616,6 +616,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_dmem PRIVATE prosper_core)
   add_test(NAME dmem_available COMMAND test_dmem)
 
+  # PROSPER_DMEM_CALLER stack walk (issue #1755): the diagnostic scans up to 160 slots above its
+  # frame and used to read straight off the top of a thread stack, dying with a SIGSEGV that reads
+  # as a guest fault.
+  add_executable(test_dmem_caller_walk tests/test_dmem_caller_walk.cpp)
+  target_link_libraries(test_dmem_caller_walk PRIVATE prosper_core)
+  add_test(NAME dmem_caller_walk COMMAND test_dmem_caller_walk)
+
   # IME keyboard event delivery (issue #1093): sceImeUpdate must invoke the guest handler
   # per queued key event; the old stub delivered none.
   add_executable(test_ime_input tests/test_ime_input.cpp)
