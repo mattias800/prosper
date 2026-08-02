@@ -350,9 +350,34 @@ current build.
   strided buffer range that does not overlap draw 95's foreground texture. Historical title evidence
   also reached the title with this dispatch skipped, so it is not the route blocker.
 
-- **Audio: the guest submits REAL audio and prosper discards all of it (#1692, fix tracked as #1700).**
-  Measured with `PROSPER_AUDIO_FLOW=1` (see `AUDIO.md`) on a `reach-title-screen.pad` run of the
-  direct SDL3 frontend. The title creates **two** AudioOut2 contexts, each with one MAIN
+- **Audio is now audible (#1700 fixed the discard; the measurement below is the historical
+  pre-fix state).** The 12-channel MAIN port is folded to the host bed and its context opens a
+  sink. On the same `reach-title-screen.pad` route, ctx0 now reports
+  `mixed=188 skip-fmt=0 sink=open port=17`, `BED LIFE: nonzero=12,636,416/14,041,088 peak=0.38978
+  rms=0.03533`, and the captured stereo bed is 147 s of music-like content (55.8 % of its energy
+  below 200 Hz, 38.6 % from 200 Hz–2 kHz, 5.4 % from 2–8 kHz, 0.2 % above; `audio_analyze.py`
+  reports `CLEAN`, `dup-grains=0.0%`).
+  **What the bed actually contains — measured, and it is not what a 12-channel count suggests.**
+  `PROSPER_AUDIO_LAYOUT=1` over 19,962,368 frames: all of the content is in **ch0/ch1**
+  (rms 3.1e-2 / 4.3e-2, peak 0.407, correlation +0.46 — a real decorrelated stereo pair). ch2 and
+  ch4..ch7 hold only a ~1e-9 residue, and **ch3 and ch8..ch11 are exactly zero**. So the title
+  writes a stereo mix into a 12-channel container and never writes ch3 or ch8..ch11 at all — the
+  LFE and height positions under the assumed order, so this describes which INDICES are dead
+  without resting on the mapping it is used to support. Within the residue, ch4/ch6 correlate +0.96 and ch5/ch7 +0.95 while ch4/ch5 is -0.04, so
+  the surround tier pairs even=left / odd=right; ch2 correlates near-equally with both groups
+  (centre-like). Reproduced identically on a second independent 150 s run.
+  **The 8-channel port (ctx1/port2) remains exactly zero** — 0 non-zero of 55,175,168 samples —
+  even though prosper forwards it. That is a separate open question (#1721), not this fix.
+  **Rung 4 for audio: the project owner confirmed by ear that the music plays and sounds right.**
+  That establishes real audio reaching the device at sane levels through the guest's own path. It
+  establishes **nothing about the channel order** — with ten of the twelve channels empty, every
+  mapping that routes ch0/ch1 to the two sides produces a bed that differs only by the ~1e-9 residue
+  on ch2 and ch4..ch7 — about 150 dB below the content, and inaudible by any measure. Not
+  "bit-identical": those channels are a residue, not exactly zero, and this document insists
+  elsewhere that those are different findings. A left/right swap
+  is inaudible without a reference in any case. Do not cite the listening test as layout evidence.
+- **Historical pre-fix measurement**, with `PROSPER_AUDIO_FLOW=1` (see `AUDIO.md`) on a
+  `reach-title-screen.pad` run of the direct SDL3 frontend. The title creates **two** AudioOut2 contexts, each with one MAIN
   (`type=0x0`) port, and they carry opposite content. All figures below are the never-reset `LIFE:`
   run totals from the **final report line of a single run**, not summed interval samples:
 
@@ -372,8 +397,13 @@ current build.
   second. Because port1 is ctx0's only port, `have_pcm` is never true for that context, so it
   **never opens a host sink at all**. The 8-channel port that prosper *does* mix and forward to the
   real device is the one that is exactly zero-filled — which is why the device opens, plays, and is
-  silent. `nan=0` on both ports rules out a NaN/decode artifact. This is a defect in prosper, not
-  upstream in the title.
+  silent. `nan=0` on both ports rules out a NaN/decode artifact. This was a defect in prosper, not
+  upstream in the title, and #1700 fixed it.
+- **A declared channel count is not a description of the content.** The `0xc00` decode and the
+  `2,310,144 B/s` figure above are both *derived from the same channel count*, so neither
+  corroborates it, and "12 channels" reads as "a 7.1.4 bed with height" when the measured bed is
+  stereo with ten of its twelve channels carrying nothing audible. Measure the channels before designing a fold for them; see
+  instrument-trap 43.
 - **Read the `LIFE:` totals, not a single interval.** This finding was initially called the opposite
   ("the guest submits only silence") from one report line in which port1 showed `nonzero=0/577536`.
   Playback has gaps, so any one interval can land in one; in the same run the port's run total is
@@ -513,6 +543,7 @@ blocker.
 | who writes a surface (colour, compute, DMA, WRITE_DATA) | `PROSPER_PROVENANCE_DIM=WxH` |
 | a successful shader's raw RDNA2 + SPIR-V | `PROSPER_SHADER_DUMP_SUCCESS=DIR` (**create DIR first**) + `shader_inspect` |
 | whether audio is absent, silent, or dropped by us | `PROSPER_AUDIO_FLOW=1` -> `[audio-flow]` (see `AUDIO.md`); read `nonzero=N/M`, not peak/rms |
+| what a multichannel MAIN bed actually carries per channel | `PROSPER_AUDIO_LAYOUT=1` -> `[audio-layout]` (rms/peak/nonzero%/spectral tilt/correlation); `PROSPER_AUDIO_LAYOUT_DUMP=PATH` for the raw capture |
 
 ## Do not restart
 

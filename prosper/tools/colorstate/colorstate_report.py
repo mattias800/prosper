@@ -2,6 +2,7 @@
 """Summarise a PROSPER_COLORSTATETRACE log: do draws reach the scanout, and with
 what colour state?
 
+(Suppression is the guest mask, not CB_COLOR_CONTROL.MODE -- see #1724.)
 `PROSPER_COLORSTATETRACE=1|all|WxH` makes the live backend emit one raw-to-resolved
 colour/depth record per matching draw (see `prosper/src/gpu/gpu_execute.hpp`). On a
 4K title that is millions of lines, which is unreadable by hand. This tool answers
@@ -91,6 +92,7 @@ def report(records, scanout_prefix, top, out=sys.stdout):
     total = scan = 0
     combos = Counter()
     per_minute = defaultdict(Counter)
+    per_minute_suppressed = Counter()
     addrs = Counter()
 
     for rec in records:
@@ -101,9 +103,14 @@ def report(records, scanout_prefix, top, out=sys.stdout):
         eff = effective_mask(rec)
         cwms = {t["cwm"] for t in rec["targets"]
                 if t["addr"].startswith(scanout_prefix)}
-        writes_colour = rec["mode"] != 0 and eff != 0 and any(cwms)
+        # #1724: MODE does NOT gate colour writes. The renderer derives the write mask from
+        # CB_TARGET_MASK & CB_SHADER_MASK alone, so a mode=0 draw with a non-zero mask DOES write.
+        # Keying this on mode would make the tool contradict the renderer it exists to triage.
+        writes_colour = eff != 0 and any(cwms)
         combos[(rec["mode"], eff, tuple(sorted(cwms)))] += 1
         per_minute[rec["ts"] or "??:??"][rec["mode"]] += 1
+        if not writes_colour:
+            per_minute_suppressed[rec["ts"] or "??:??"] += 1
         for t in rec["targets"]:
             if t["addr"].startswith(scanout_prefix):
                 addrs[(t["addr"], t["w"], t["h"], writes_colour)] += 1
@@ -123,10 +130,10 @@ def report(records, scanout_prefix, top, out=sys.stdout):
         name = MODE_NAMES.get(mode, "UNKNOWN")
         cwm = ",".join(f"{c:x}" for c in cwms)
         note = ""
-        if mode == 0 or eff == 0 or not any(cwms):
-            note = "   [colour writes suppressed]"
+        if eff == 0 or not any(cwms):
+            note = "   [colour writes suppressed by the guest's mask]"
         elif mode not in (1, 3, 6):
-            note = "   [mode not implemented -- runs as an ordinary draw]"
+            note = "   [mode not modelled -- runs as an ordinary colour draw]"
         print(f"  mode={mode} ({name:15s}) effective={eff:02x} cwm={cwm:<6s} "
               f"draws={n}{note}", file=out)
     print("\nscanout draws per guest-clock minute (compare a good phase against a "
@@ -134,7 +141,10 @@ def report(records, scanout_prefix, top, out=sys.stdout):
     for minute in sorted(per_minute):
         c = per_minute[minute]
         tot = sum(c.values())
-        supp = c.get(0, 0)
+        # #1724: suppression is the guest's mask, NOT mode. Keying this on mode over-reported by
+        # 8,326 draws on one measured Plucky Squire run. `mode0=` stays in the breakdown because
+        # it is still worth seeing, but it is no longer labelled as suppression.
+        supp = per_minute_suppressed.get(minute, 0)
         modes = " ".join(f"mode{m}={n}" for m, n in sorted(c.items()))
         print(f"  {minute}  total={tot:7d}  suppressed={100.0 * supp / tot:5.1f}%  "
               f"{modes}", file=out)
