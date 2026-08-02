@@ -62,11 +62,12 @@ prosper/
 Key docs to orient: `prosper/README.md` (status) and `prosper/docs/ROADMAP.md` (what is planned).
 For anything title- or subsystem-specific, use the table in the next section rather than guessing.
 
-## Where the project stands (2026-08-01)
+## Where the project stands (2026-08-02)
 
-`COMPATIBILITY.md` is authoritative for **per-title milestones** — 25 titles, 14 at gameplay. Do not
+`COMPATIBILITY.md` is authoritative for **per-title milestones** — 29 titles, 16 at gameplay. Do not
 duplicate it here; read it, then open the one doc named below for whatever you are about to touch.
-This section is a map, not a status report.
+This section is a map, not a status report. Its **Boot sweep — 2026-08-02** section is the current
+rung-and-frame-rate census across the titles that are not yet at rung 6.
 
 **Concurrent game work starts with `prosper/docs/GAME_COMPAT_ORCHESTRATION.md`** — lane ownership,
 shared-GPU policy, the instrument-not-the-subject list, and the dated current handoff.

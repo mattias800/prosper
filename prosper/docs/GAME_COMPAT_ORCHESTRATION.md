@@ -1368,6 +1368,16 @@ alpha" factor as the live hypothesis. Re-verify any tiling-related claim with a 
 
 ## Lane E: The Pathless (PPSA01826)
 
+> **Superseded 2026-08-02 by a boot sweep on `3a473bca`: this title is at rung 2, not rung 0.** A plain
+> no-input boot renders the **title screen** (`NEW GAME` / `OPTIONS`) at 2560x1440 and holds it for a full
+> 200 s run with `max_stale_seconds=0.0`, so neither "every presented frame is a flat colour" nor "progression
+> freezes at ~18 s" reproduces. Evidence and manifest numbers are in #1570; the screenshot is
+> `assets/screenshots/pathless-title.png`. **Do not start this lane from the packed-FP16 MRT0 export lead
+> below** — it was derived from a capture taken in the flat-colour state that no longer occurs, so re-take a
+> capture before trusting any address, submit ordinal or hash in the rest of this section. The remaining real
+> gap is that no input route has been tried and gameplay has not been reached. The section is retained
+> unedited below as the 2026-07-31 record.
+
 First triage 2026-07-31. **Not greenfield** — #1213 exists with prior work, was closed apparently by accident,
 and has been reopened. Current state is tracked in **#1570**.
 
@@ -1528,13 +1538,14 @@ tiling re-verification needs a fresh capture.
 
 ```text
 Read CLAUDE.md, docs/GAME_COMPAT_ORCHESTRATION.md (Lane E), #1570, and #1213 (reopened).
-The title is at rung 0: it boots deep into the UE4 frame loop with real GPU work but presents flat
-colour and freezes at ~18 s. The #1213 SIGSEGV does not reproduce. Survey the .prgtl timeline
-across all ~6,150 submits to find whether the real composite lives in another submit — this is
-CPU-only. The current lead is the packed-FP16 MRT0 export path: a tint constant of
-(1.0, 0.4545, 0.0, 1.0) (orange) is presenting as white through a COMPR V_PACK_B32_F16 export.
-Generic gaps worth fixing for all UE titles: DCC tile=27 sampled images, the per-queue WaitRegMem
-barrier model (shared with ArcRunner #1226), and the 512 MiB backend image bound.
+The title is at rung 2 as of 2026-08-02: a plain no-input boot renders the title screen
+(NEW GAME / OPTIONS) at 2560x1440 and holds it for 200 s. The earlier "flat colour, freezes at
+~18 s" state does NOT reproduce, so the packed-FP16 MRT0 export lead and every address, submit
+ordinal and hash in Lane E come from a state the title no longer enters — re-capture before
+using any of them. The #1213 SIGSEGV also does not reproduce. The open work is the next rung:
+drive an input route past NEW GAME and find where gameplay stops. Generic gaps still worth
+fixing for all UE titles: DCC tile=27 sampled images, the per-queue WaitRegMem barrier model
+(shared with ArcRunner #1226), and the 512 MiB backend image bound.
 ```
 
 ## Orchestrator cadence and reporting

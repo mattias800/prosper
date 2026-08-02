@@ -28,7 +28,11 @@ Last updated: 2026-08-02
 | *Summer Sports Games* | `PPSA03416` | Unity / IL2CPP | ✅ Mode select and live 3D athletics render at native 3840×2160 with no code changes |
 | *Worms Armageddon: Anniversary Edition* | `PPSA20052` | Custom (Digital Eclipse) | ✅ Scripted route reaches a live Quickstart match at native 1920×1080; `worms-armageddon-gameplay` guard |
 | *Earthion* | `PPSA28061` | Custom (Ancient) | 🚧 Developer logo, intro story text and CRT bezel render; the 320×224 game picture inside the bezel is still missing |
-| *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🔬 Boots deep into the UE4 frame loop with real GPU work; presented frames are still a flat colour |
+| *Bendy and the Ink Machine* | `PPSA27616` | Unity / IL2CPP | 🚧 Main menu renders and a scripted route reaches first-person Chapter 1 gameplay at native 3840×2160; about 8 fps in the level |
+| *The Plucky Squire* | `PPSA15319` | Unreal Engine 4 | 🚧 Title screen and the save-file/play-style menus render at native 3840×2160; the route then holds a black loading screen and does not reach chapter one |
+| *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🚧 Title screen (`NEW GAME` / `OPTIONS`) renders at native 2560×1440; gameplay not reached |
+| *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🔬 Boots into the UE4 render bring-up and submits real GPU work, then the render thread faults after about 10 s with no frame composited |
+| *Asterix &amp; Obelix - Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🔬 Boots and submits real GPU work, but every presented frame is black and a guest thread dies at about 125 s, after which the renderer publishes nothing |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Audio and sound bank initialise; the game's own code lives in a runtime-loaded PRX that prosper cannot yet load |
 | *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Warning screen, publisher logo, title screen and EULA render at native 3840×2160 with no code changes; the 3D world is dropped because the programmed user-data block is larger than the bound pipeline's user-SGPR window (#305) |
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
@@ -43,6 +47,37 @@ Last updated: 2026-08-02
 ² No compatibility milestone is claimed for the incomplete Sonic dump. A merged base+update image is
 required before its title, gameplay, or audio can be evaluated. The guest also consumes an authentic
 Sonic 1 activity launch, but still needs the same base UI assets before entering the classic runtime.
+
+## Boot sweep — 2026-08-02
+
+Fourteen titles were booted on one build (`3a473bca`) through the headless `screenshot` frontend with
+no render acceleration (`PROSPER_RENDER_SCALE=1`, `PROSPER_RENDER_EVERY=1`, no sampling window), to
+establish where each one actually stops today rather than where its last write-up left it. Rungs are
+the ladder in `CLAUDE.md`: 0 nothing, 1 any real graphics, 2 title screen, 3 gameplay.
+
+**Read the frame rates as lower bounds, not as benchmarks.** Another lane held the same GPU for most
+of the sweep, so every number below was measured under concurrent load of an unknown size. The figure
+is guest flips per second — the rate the game itself advances — averaged over the sampled window.
+
+| Title | Rung reached | Frames/s | Where it stops |
+| --- | --- | --- | --- |
+| *Grand Theft Auto V* `PPSA04263` | 2 | ~132 @ 4K | Title with the `Continue ✕` prompt; the menu needs input |
+| *Bendy and the Ink Machine* `PPSA27616` | 3 | ~30 @ 4K menu, ~8 @ 4K in level | Routed Chapter 1 interior renders and the camera moves |
+| *The Plucky Squire* `PPSA15319` | 2 | ~21 @ 4K | Menus render; after the play-style choice the route holds a black loading screen for 260 s |
+| *The Pathless* `PPSA01826` | 2 | ~14 @ 1440p | Title screen holds; no input route tried |
+| *Nikoderiko: The Magical World* `PPSA23760` | 2 | ~14 @ 4K | Title screen; the 3D world is dropped (#305 / #1607) |
+| *Syberia: Remastered* `PPSA30140` | 3 | ~2 @ 1080p | Routed factory hall renders; composite degraded (#1619 / #1627) |
+| *Dragon Quest VII Reimagined* `PPSA17942` | 1 without input | ~12 @ 4K | Ocean/sky pass and the save-created notice; the title needs the route |
+| *Earthion* `PPSA28061` | 1 | ~139 @ 4K | Bezel and intro text; the picture area inside the bezel is missing (#1590) |
+| *Tales of Graces f Remastered* `PPSA19991` | 1 | ~85 @ 1080p | Logos and the `Checking add-on…` dialog, then black (#1609 / #1688) |
+| *The Oregon Trail* `PPSA19244` | 0 | ~42 @ 4K | Frame loop advances, every frame black (#1606 / #1641) |
+| *Asterix &amp; Obelix - Babylon Mission* `PPSA30490` | 0 | ~124 @ 1080p until 125 s | All frames black, then a guest thread dies and the renderer stops (#1599) |
+| *Sonic Origins* `PPSA05325` | 0 | ~5 @ 4K | One rendered frame; the supplied dump is update-only |
+| *ArcRunner* `PPSA21406` | 0 | — | Guest render thread faults after about 10 s, before any composited frame (#1226) |
+| *R-Type Delta: HD Boosted* `PPSA26414` | 0 | — | `GetProcAddress error 80020003`, then a guest fault at `rip=0` (#1591) |
+
+Six titles that render real content are below the 30 fps bar: Syberia (~2), Bendy in level (~8),
+Dragon Quest VII (~12), Nikoderiko (~14), The Pathless (~14) and The Plucky Squire (~21).
 
 ## The Messenger — `PPSA24651`
 
@@ -293,9 +328,12 @@ Rockstar's RAGE engine boots through the intro and reaches the title and the fir
 menus, then continues to the STORY/ONLINE main menu. Reaching this required a series of service and ABI
 fixes spanning the async-compute submit contract, the APR file/write primitives, and guest-`%fs`
 restoration on fault-skip. These direct Linux `prosper-app` captures document the current renderer state,
-not visual correctness: the title omits the X button icon beside **Continue**, and the main menu has
-substantial UI and composition glitches. The later in-game loading path remains blocked at the legal-notice
-text pass, so no gameplay milestone is claimed.
+not visual correctness: the main menu has substantial UI and composition glitches. The later in-game
+loading path remains blocked at the legal-notice text pass, so no gameplay milestone is claimed.
+
+The screenshot above still shows the title without the ✕ button icon beside **Continue**. That defect
+is **fixed on current master**: in the 2026-08-02 boot sweep the same no-input state renders
+`Continue ✕` with the glyph present, so only the caption's historical wording is preserved here.
 
 ## Terminator (2D) — `PPSA25872`
 
@@ -464,8 +502,13 @@ text, and the retro CRT-TV bezel that frames the whole game. The intro advances 
 several pages, so guest logic, input timing and presentation are healthy.
 
 What is missing is the picture inside the bezel: a single MIMG descriptor-provenance gap drops the
-320×224 game-picture composite, leaving the TV screen black. Tracked on #1590. No screenshot is
-published here because the game area itself is not yet rendering.
+320×224 game-picture composite. Tracked on #1590. No screenshot is published here because the game
+area itself is not yet rendering.
+
+On current master that area composites **white**, not the black #1590 records, and the intro story
+text is drawn light-on-white and is barely legible as a result. This is not a consequence of #1728:
+an A/B in the 2026-08-02 boot sweep with `PROSPER_LEGACY_CB_DISABLE_MASK=1` produces the same white
+picture area, so the colour-write-mask change is excluded.
 
 ## Asterix & Obelix: Slap Them All! — `PPSA08576`
 
@@ -641,6 +684,12 @@ that held frame: the base commit holds **black**, #1687 holds **white**. Neither
 neither is the title screen. This is the expected outcome — decode produces no pictures (#1688) — and
 it is recorded because "the gate opened and nothing behind it moved" is the result, not a gap in it.
 
+**The held frame is black again on `3a473bca`**, which contains #1687: every sample from t=15 s to
+t=200 s of the 2026-08-02 boot sweep measures one distinct colour over zero non-black pixels. Either
+something merged after #1687 moved it back, or the colour was never as stable as one A/B could show;
+one run cannot separate those. The usable conclusion is the narrow one — **do not use the held frame's
+colour as the check for whether a change to this title's movie path did anything** (#1609).
+
 One observation about the **base commit**, unrelated to this change and beyond what the logo
 description above implies: master transiently renders the game's own **"Checking add-on…" dialog** —
 real in-game UI in the title's art style, not a logo — at `t≈6 s`, before settling. Both arms sample
@@ -679,6 +728,96 @@ not established and would need a denser capture.
   hypothesis came from reading a `boot_trace` run against #1609's `screenshot`-frontend numbers —
   two different apparatus — and did not survive running both arms through one.
 
+## The Pathless — `PPSA01826`
+
+<p align="center">
+  <img src="assets/screenshots/pathless-title.png" alt="The Pathless — title screen (Linux, screenshot frontend, plain boot with no input)">
+</p>
+
+**Rung 2.** A plain boot with no input renders the title screen — the wordmark plus `NEW GAME` and
+`OPTIONS` — at native 2560×1440, and holds it for the rest of a 200-second run without stalling.
+
+This supersedes the previous entry for this title. #1570 recorded rung 0 on 2026-07-31: every
+presented frame a flat colour, with progression frozen at about 18 s. Neither symptom reproduces on
+`3a473bca`. The frame is composited (not raw scanout), the front buffer changes resolution from
+3840×2160 to 2560×1440 at t≈30 s as the menu comes up, and rendered frames keep advancing to the end
+of the run. No fix was identified for this; it is reported as an observed change of state, and #1570
+should be re-scoped from "flat colour" to "gameplay not reached" rather than closed on this evidence
+alone.
+
+## The Plucky Squire — `PPSA15319`
+
+<p align="center">
+  <img src="assets/screenshots/plucky-squire-title.png" alt="The Plucky Squire — title screen (Linux, screenshot frontend, plain boot with no input)">
+</p>
+
+**Rung 2.** A plain boot renders the All Possible Futures and Devolver Digital logos and then the
+title screen (`PRESS ANY BUTTON`) at native 3840×2160, with no input and no code changes.
+
+`prosper/scripts/plucky-squire/reach-first-gameplay.pad` continues past it: the `SAVE FILES` list and
+the `PLAY STYLE` chooser both render legibly and in full colour. After the play-style selection the
+composite collapses to a black loading screen carrying only the small book icon, and a 420-second run
+never leaves it — 260 s of it holding the same near-empty frame. That loading phase is the frontier
+for this title, not the menus. See #1390 and #1554.
+
+## Bendy and the Ink Machine — `PPSA27616`
+
+<p align="center">
+  <img src="assets/screenshots/bendy-title.png" alt="Bendy and the Ink Machine — main menu (Linux, screenshot frontend, plain boot with no input)">
+</p>
+<p align="center">
+  <img src="assets/screenshots/bendy-gameplay.png" alt="Bendy and the Ink Machine — first-person Chapter 1 interior (Linux, screenshot frontend, scripts/bendy/reach-gameplay.pad)">
+</p>
+
+**Rung 3.** A plain boot reaches the loading screen and then the main menu (`BEGIN` / `OPTIONS`) at
+native 3840×2160 in about 20 s. `prosper/scripts/bendy/reach-gameplay.pad` continues into first-person
+Chapter 1: the workshop interior, its wooden structure, props, ink stains and lighting all render, and
+the camera moves through the level over the run, so guest logic and input are healthy end to end.
+
+The black in-game world recorded in #1164 does not reproduce. Neither does the throughput in #1177:
+that issue reports about **0.75 fps**, while the 2026-08-02 sweep measured about **30 fps** on the
+menu and about **8 fps** in the level, both at native 3840×2160 on RADV — a shared-GPU measurement, so
+those are lower bounds. #1177 needs re-measuring before any work is planned from its number.
+Boot remains intermittent (#1178).
+
+## ArcRunner — `PPSA21406`
+
+**Rung 0.** The title boots through UE4 initialisation and its `.pak` load, installs the renderer,
+and submits real GPU work — but no frame is ever composited. Between about 8 and 14 s the guest's
+`RenderThread 1` faults:
+
+```text
+WORKER-THREAD FAULT: sig=11 addr=0x30016000 rip=eboot+0x127e751
+insn @rip: 48 8b 01            (mov rax,[rcx])   rcx=0x30016000
+[fault] thread='RenderThread 1' on-guest-TCB=NO(host-%fs leak?)
+```
+
+`0x30016000` is far below the guest arena (`0x2000000000`–`0x9fc0000000`) and is read out of a
+structure whose neighbouring fields are ordinary guest pointers, which matches the pool-pointer
+corruption already tracked on #1226. The same fault site reproduces under three guest-argument
+combinations. Note one apparatus detail: with `PROSPER_GUEST_ARGS=-force-gfx-direct` the process is
+killed by the signal (exit 139) and prints **no** fault report at all, while the same fault is fully
+reported with `PROSPER_GUEST_ARGS=` empty, or under `gdb` with `SIGSEGV` passed through.
+
+## Asterix &amp; Obelix - Babylon Mission — `PPSA30490`
+
+**Rung 0**, unchanged from #1599 and reproduced exactly: every presented frame over 200 s is a single
+colour with the identical `crc=064567f8`, and renderer publication stops for good at frame 25122.
+
+The sweep adds the cause of that stall, which #1599 recorded as not investigated. Publication stops in
+the same second that a guest thread dies:
+
+```text
+[lazy-commit] mapped page=0x24030f0000 rip=0x4107cd844
+tlsf_add_pool: Memory size must be between 0x28 and 0x100000000 bytes.      (×40)
+guest thread ended: kind=2 detail=SIGSEGV at addr=0x28 rip=0x645ea4
+```
+
+The guest's own TLSF allocator rejects 40 consecutive pool additions as out-of-range, each preceded by
+a lazily committed page from one `rip`, and a thread then faults at `0x28` — the offset a caller would
+read from a null pool handle. So the black frames and the stall are two findings, not one: the stall
+is an allocation failure, upstream of the MSAA `image_load` recompiler gap that #1599 identifies as
+the reason the frames are black.
 ## Astro Bot — `PPSA21564`
 
 <p align="center">
