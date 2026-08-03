@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>
+#include <optional>
+
 #include <vulkan/vulkan_core.h>
 
 // Present policy for prosper-app (#1182). Real game boots normally share the renderer's Vulkan device;
@@ -18,6 +21,15 @@ namespace prosper::frontend {
 constexpr bool request_gpu_present(const char* setting, bool test_pattern, bool has_game) {
     const bool explicitly_disabled = setting && setting[0] == '0' && setting[1] == '\0';
     return has_game && !test_pattern && !explicitly_disabled;
+}
+
+// F8's rendered-frame population is the CPU frame handoff count, not the number of successful
+// swapchain presents. Shared-device GPU present deliberately skips that handoff. Until that producer
+// exposes its own coherent completion counter, report the population as unavailable; substituting the
+// app's host-present count would manufacture equality between two different clocks.
+constexpr std::optional<uint64_t> rendered_frame_counter(bool gpu_present,
+                                                         uint64_t cpu_frame_seq) {
+    return gpu_present ? std::nullopt : std::optional<uint64_t>{cpu_frame_seq};
 }
 
 // Outcome of one present_frame attempt.

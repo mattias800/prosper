@@ -30,6 +30,13 @@ int main() {
     CHECK(!request_gpu_present(nullptr, true, true));
     CHECK(!request_gpu_present(nullptr, false, false));
 
+    // `present_frame_seq()` belongs only to the CPU handoff path. A direct-present app must not
+    // serialize its flat CPU counter as a real zero-rate population, while the CPU path retains the
+    // exact counter value (including a legitimate zero).
+    CHECK(!rendered_frame_counter(true, 73).has_value());
+    CHECK(rendered_frame_counter(false, 0) == 0);
+    CHECK(rendered_frame_counter(false, 73) == 73);
+
     // Acquire: a usable image (SUCCESS or SUBOPTIMAL) → proceed to blit+present.
     CHECK(classify_acquire(VK_SUCCESS) == AcquireAction::proceed);
     CHECK(classify_acquire(VK_SUBOPTIMAL_KHR) == AcquireAction::proceed);

@@ -229,7 +229,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   preceding 5 seconds and enables the existing structured renderer/compute timers for the following
   5 seconds. It then atomically publishes one bounded
   `perf_capture_<titleId>_<timestamp>.prperf` under `PROSPER_CAPTURE_DIR` (default cwd). No GPU command
-  capture, screenshot, or ordinary frame dump is enabled by F8. Detailed renderer and compute records
+  capture, screenshot, or ordinary frame dump is enabled by F8. The rendered-frame counter is the
+  CPU frame-handoff population; shared-device direct GPU present skips that handoff and serializes
+  the field as unavailable (`null`), so the report must not infer a zero-rate pacing gap from it. Detailed
+  renderer and compute records
   are capped at 4096 each, and the footer reports exact retained and dropped counts — never read the
   cap as the population. Missing Vulkan timestamp samples are explicit: the report leaves GPU device
   time unavailable and reports total GPU wait without inventing a device/host-overhead split. F8

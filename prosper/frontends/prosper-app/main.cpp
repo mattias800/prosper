@@ -1547,7 +1547,10 @@ int main(int argc, char** argv) {
         const uint64_t perfNow = prosper::perf::monotonic_now_ns();
         if (perfCapture.sample_due(perfNow)) {
             perfCapture.observe_sample(prosper::perf::collect_process_sample(
-                perfNow, gpu::present_count(), gpu::present_frame_seq(), shown));
+                perfNow, gpu::present_count(),
+                prosper::frontend::rendered_frame_counter(
+                    vk.gpu_present, gpu::present_frame_seq()),
+                shown));
         }
         prosper::perf::CaptureOutcome perfOutcome;
         if (perfCapture.take_outcome(perfOutcome)) {
@@ -1595,7 +1598,10 @@ int main(int argc, char** argv) {
                     const uint64_t armedAt = prosper::perf::monotonic_now_ns();
                     if (perfCapture.sample_due(armedAt)) {
                         perfCapture.observe_sample(prosper::perf::collect_process_sample(
-                            armedAt, gpu::present_count(), gpu::present_frame_seq(), shown));
+                            armedAt, gpu::present_count(),
+                            prosper::frontend::rendered_frame_counter(
+                                vk.gpu_present, gpu::present_frame_seq()),
+                            shown));
                     }
                     const prosper::perf::CaptureArmResult armed = perfCapture.arm(
                         grabDir, activeCaptureTitle.id, activeCaptureTitle.label,
