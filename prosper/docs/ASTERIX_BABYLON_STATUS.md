@@ -248,6 +248,23 @@ Thus caller-chain plus allocation size is not unique, while two source-distinct 
 resource as occurrence 2 of that run-relative allocation family. Capsule SHA-256 was
 `b4adcf7e1c81032246a03408fd2c469cef12bb0c559741e039730a29237d5391`. #1902.
 
+The exact occurrence-2 arm at commit `1da4d471` then validated that new lever but was also **VOID as a
+selected-byte writer result**. It completed 220 presents naturally. The selector reported requested
+occurrence 2, selected occurrence 2 at physical `0x21500000`, and armed `0x20122d32f0`; the terminal
+census observed all 23 family members. The independent v46 positive control named that exact same VA for
+draw 0 PS binding 32, again with 128/128 bytes at both samples, `full-equal`, raw descriptor `full-match`,
+and all bytes zero. Thus the run-relative allocation identity is accepted. However, the selected bytes
+share a page with heavy earlier activity: all 64 retained events were outside the selected range, spanning
+39 addresses from `0x20122d30b8` through `0x20122d3220`, below the selected start at `0x20122d32f0`.
+Event 1 had complete pre-fault coverage and was a real guest store at `eboot+0x1a5402e` to
+`0x20122d30c0`; independent disassembly confirms `mov QWORD PTR [r8+rdx+0x10],r10`. That first unrelated
+page write consumed trap 68's only complete interval. Event 65 then caused explicit overflow before any
+selected event. The terminal summary was `status=overflow`, with 23 observed allocations, occurrence 2
+selected, 65 page faults, zero selected faults, 64 steps/rearms, 65 coverage gaps, and 64/64 events.
+Therefore there is **no selected-byte CPU-writer conclusion** from this arm; merely raising the history
+cap could at most produce a later writer hint, not restore process-wide first-writer coverage. Capsule
+SHA-256 was `e358535fe2b864394a24df0a0d8735fcbfa1b18a79f57b67a13f0745a3b51f6d`. #1902.
+
 ## Ruled out
 
 - **Unresolved T#/S# lookup:** the title-live descriptor resolves; the rejection is the sampled MIMG
@@ -325,17 +342,16 @@ resource as occurrence 2 of that run-relative allocation family. Capsule SHA-256
 
 ## Next discriminators
 
-1. Do not rerun the four-field selector: the live arm falsified its uniqueness. After the optional-occurrence
-   implementation is reviewed, use `PROSPER_DMEM_WRITE_TRACE=1:0x1000000:2:0xdd32f0:128`. Require the
-   configuration and terminal summary to report requested occurrence 2, selected occurrence 2, and the
-   full observed family count. It remains run-relative and must never accept a prior VA.
-2. In that bounded v46 arm, require the occurrence-selected mapping address to equal the independently
-   captured draw 0 PS binding 32 address, plus the same raw full-match/complete-byte positive control and a
-   terminal trace summary. Any mismatch, invalidity, overflow before a selected event, or missing summary
-   makes the arm void rather than an allocation-identity result.
-3. If event 1 is selected and names guest code, confirm its module+offset in disassembly and follow that
-   producer. If an unrelated same-page write is event 1, later selected events remain useful writer hints but
-   cannot be called the process-wide first writer because trap 68's RW step window has opened.
+1. Treat occurrence 2 as accepted allocation identity: its dynamically selected VA exactly matched the
+   independent v46 resource address while the full family census remained 23. Do not return to a fixed VA or
+   the ambiguous four-field selector.
+2. The first same-page writer is now identified, but it is outside the selected bytes and consumes complete
+   coverage. Build the next generic instrument only if it can distinguish selected-range writes without
+   silently losing process-wide coverage; a larger history alone can provide a later writer hint, not the
+   first selected writer. Keep total faults/history bounded and every coverage gap explicit.
+3. If a later diagnostic observes a selected writer, confirm its module+offset in independent disassembly
+   before following that producer; do not promote it to process-wide first writer unless the new mechanism
+   independently closes trap 68's RW interval.
 4. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
    dispatch ran and reproduces its device loss; two failures in six runs are not a stable cause.
 5. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
