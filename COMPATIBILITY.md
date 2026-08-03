@@ -48,7 +48,7 @@ closing bugs. Every title in the tested inventory has a long-lived tracker in th
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and the ASTRO BOT title screen render at native 3840×2160; the title is over-exposed, the world-map hub shows only its backdrop, and guest compute costs ~21× throughput (#1732) |
 | *The Forgotten City* | `PPSA03026` | Unreal Engine 4 | 🔬 Intermittent bring-up: one exact-master run rendered advancing native-4K logos and an autosave notice, while an immediate repeat stayed black; no title screen yet |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine | 🔬 Reaches the frame loop, but live rendering fails and fallback output is mostly black with corrupted horizontal bands |
-| *Tactics Ogre: Reborn* | `PPSA03839` | Custom | 🚧 Clean native-1080p title menu renders with codec-enabled FFmpeg; title/prologue movies decode but present as flat gray/green, and gameplay is not yet tested |
+| *Tactics Ogre: Reborn* | `PPSA03839` | Custom | 🚧 Clean native-1080p title and opening in-engine story scene render; HEVC movies remain flat gray/green, and interactive gameplay is not yet reached |
 | *Little Nightmares III* | `PPSA05143` | Unreal Engine | 🔬 Starts graphics setup, then faults on a low-address read before presenting a frame |
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Boots and remains alive for the bounded test, but publishes no rendered frame |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 Loads the runtime and EOS module, then times out during initialization without presenting a frame |
@@ -981,13 +981,22 @@ Reusable input routes are documented in
   <img src="assets/screenshots/tactics-ogre-title.png" alt="Tactics Ogre: Reborn — title menu">
 </p>
 
+<p align="center">
+  <img src="assets/screenshots/tactics-ogre-reborn-opening-scene.png" alt="Tactics Ogre: Reborn — opening in-engine story scene with a known bright, outlined central character sprite">
+</p>
+
 With a codec-enabled FFmpeg build, the custom-engine title decodes its HEVC startup movie and reaches
-a clean, legible title menu at native 1920×1080 without scripted input. The title and subsequent
-prologue movies still present as uniform gray or dark green fields while their subtitles advance,
-so movie colour/layout remains incorrect and gameplay has not been tested. The image above is a
-direct, unmodified frontend capture from the normal full-cadence Vulkan renderer. Current evidence
-is tracked in [#1892](https://github.com/mattias800/prosper/issues/1892), and the remaining movie
-presentation defect in [#1903](https://github.com/mattias800/prosper/issues/1903).
+a clean, legible title menu at native 1920×1080. A scripted fresh-save route enters New Game, completes
+the birthdate, tarot and patron setup, and outlasts the 117.8-second Chapter 1 movie. Its natural end at
+roughly 325 seconds continues into the opening in-engine story scene from roughly 330 seconds onward.
+
+This remains a rung-2 milestone: the post-movie scene is an event sequence, not verified interactive
+tactical gameplay. The room, lighting, character sprites, portraits and dialogue render, but the central
+sprite is unusually bright/outlined and develops obvious horizontal banding in later frames. The HEVC
+movies themselves still present as uniform gray or dark green fields while their overlays advance. Both
+images are direct, unmodified frontend captures from the normal full-cadence Vulkan renderer. Current
+route evidence is tracked in [#1892](https://github.com/mattias800/prosper/issues/1892), and the remaining
+movie-presentation defect in [#1903](https://github.com/mattias800/prosper/issues/1903).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
 
