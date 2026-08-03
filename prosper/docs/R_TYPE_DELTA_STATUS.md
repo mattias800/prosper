@@ -76,6 +76,41 @@ Nomada/Devolver opening logos and title screen have no 128-pixel right strip, ho
 corruption, or U/V colour cast. This verifies that the padded-pitch/crop contract does not regress
 the known consumer that exposed the earlier half-fix.
 
+## Movie sampler-coordinate recovery
+
+An F9 capture of present 1740 retained the next submit as a replayable two-draw frame. The first
+draw uses fragment program `0x2011c0d700` and samples the staged movie planes at the exact AvPlayer
+addresses: an R8 2048x1080 luma plane and an RG8 1024x540 chroma plane. Both resources are complete
+and non-flat. Converting those captured bytes as padded NV12 on the CPU produces a sharp,
+full-colour movie frame, while replaying the same submit on unmodified `dad8f518` produces the
+purple diagonal gradient (`c87261d44cd4426b`). That separates decoder/staging correctness from the
+downstream sampling failure without another title boot.
+
+Both direct S# descriptors set `FORCE_UNNORMALIZED`, and the vertex shader supplies pixel/texel
+coordinates rather than normalized UVs. The descriptor decoder already preserved that bit, but no
+renderer consumer applied it. Treating coordinates such as 1920 as ordinary normalized values made
+the sampler wrap or clamp almost the whole quad onto a few edge texels; the triangle-strip primitive
+boundary made the resulting alias appear as a hard diagonal.
+
+The generic lowering keeps the ordinary Vulkan sampler, preserving the guest's wrap modes and LOD
+state, and scales only spatial sample coordinates and explicit gradients by the corresponding
+resource extent in the shader recompiler. Array layers, DREF, LOD/bias, packed texel offsets and
+integer image loads keep their established meanings. Because the reciprocal extents are embedded in
+SPIR-V, the compiled-shader cache key includes the unnormalized contract and its dimensions.
+
+Recompiling every retained raw shader on `4dfcaa94` changes the exact replay hash to
+`51d9511c303d9182` and recovers recognizable, detailed movie content. Disabling only the coordinate
+lowering returns byte-for-byte to `c87261d44cd4426b`; the focused live-renderer mutation likewise
+keeps its named pixel check executing and makes only that check fail. This is real visual progress,
+but it is not yet visually correct: the replay has a strong green/purple chroma cast and scales the
+movie into top/bottom black bars. It also does not bypass the default-launch startup race (#1746),
+so the compatibility rung is unchanged.
+
+<p align="center">
+  <img src="../../assets/screenshots/rtype-delta-movie-coordinate-progress.png" alt="R-Type Delta movie replay after texel-coordinate recovery; detailed content is visible but chroma and vertical scaling remain incorrect"><br>
+  <sub>Retained-frame replay after the coordinate fix. Detail is recovered; the green/purple cast and top/bottom bars remain known defects.</sub>
+</p>
+
 ## Ruled out
 
 | Hypothesis | Verdict and evidence | Source |
@@ -86,11 +121,15 @@ the known consumer that exposed the earlier half-fix.
 | AvPlayer output must remain tight because padded output caused GRIS's right-edge strip | **Falsified.** GRIS subtracts the ABI crop offsets from pitch. The prior padded experiment left crop right zero; the missing crop, not the physical padding, exposed the strip. | #1393, GRIS `eboot+0xf6d5ab`, this doc |
 | Reporting pitch 2048 while retaining tight rows is sufficient | **Falsified by construction.** The title advances plane addresses by the published physical extent. The CPU fixture verifies row-by-row storage and both plane bases, not metadata alone. | `test_avplayer` |
 | The pc-52 resource rejection was the only movie-visual blocker | **Falsified live.** The size mismatch and all shader/resource rejects are gone, but retained frames contain only flat clears and low-colour gradients. The downstream frontier is #1807. | bounded `4114391c` run, #1807 |
+| The decoded/staged movie planes contain the low-colour gradient | **Falsified.** The exact captured R8/RG8 bytes produce a sharp full-colour frame through an independent CPU NV12 conversion; only Prosper's replay of the same bytes collapses to the gradient. | present 1740 capture, #1807 |
+| Vulkan's native unnormalized-coordinate sampler can apply `FORCE_UNNORMALIZED` directly | **Falsified against the live S#.** R-Type combines the bit with wrap addressing (`CLAMP_X/Y=0`) and `maxLod=15.9961`; Vulkan requires clamp addressing and zero LOD for an unnormalized sampler. The native candidate correctly became fail-visible but could not represent the guest contract. | retained submit 1741, #1807 |
+| The diagonal proves the fullscreen strip's topology or interpolation is wrong | **Falsified by the coordinate-only A/B.** Recompiling the same raw VS/FS and changing only texel-to-normalized lowering recovers detailed content and removes the diagonal; disabling only that lowering reproduces the exact old hash. | hashes `51d9511c303d9182` / `c87261d44cd4426b`, #1807 |
 
 ## Next frontier
 
-#1807 owns the remaining flat/gradient movie output. Capture one gradient frame as a replayable GPU
-bundle, identify the draw using fragment program `0x2011c0d700`, and prove which AvPlayer buffer and
-timestamp fed it. Dump both resolved planes and their T# metadata, then compare source texels with a
-CPU NV12-to-RGB conversion to separate resource decode/upload, sampler-coordinate, and shader-output
-faults. A changing gradient is still not a visual milestone and does not warrant a screenshot.
+The coordinate failure in #1807 is isolated and mutation-proven. The next movie-rendering frontier
+is the green/purple chroma cast: compare the raw shader's sampled component/swizzle flow and YUV
+conversion constants with the captured RG plane before changing upload order. The vertical bars are
+separate: compare the movie VS constant buffer and generated strip positions with the full-height CPU
+frame. Default launch still stops earlier on #1746; neither replay improvement changes that product
+route or the compatibility rung.

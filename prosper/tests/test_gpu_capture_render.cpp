@@ -145,6 +145,44 @@ int main() {
               "replay samples captured red texel from owned backing");
     }
 
+    // R-Type Delta's movie shader passes pixel coordinates and sets S# FORCE_UNNORMALIZED. Vulkan's
+    // native unnormalized sampler cannot preserve the title's wrap/LOD state, so the recompiler
+    // divides only spatial coordinates by their resource extents. At texel-space (1.5,0.5) the 2x2
+    // source is green; dropping that transform makes the ordinary normalized sampler clamp to the
+    // bottom-right white texel. The named check therefore pins rendered behavior, not metadata.
+    {
+        const uint32_t unnormalized_ps_rdna[] = {
+            0x7e0002ffu, 0x3fc00000u, // v0 = 1.5 texels
+            0x7e0202ffu, 0x3f000000u, // v1 = 0.5 texels
+            0xf0800f08u, 0x00820000u, // image_sample v[0:3], v[0:1], s8, s16
+            0xf800000fu, 0x03020100u, 0xbf810000u,
+        };
+        DrawItem unnormalized_draw = replay.items[0];
+        auto unnormalized_table =
+            std::make_shared<ShaderResourceTable>(*unnormalized_draw.prt);
+        ShaderResource& unnormalized_texture = unnormalized_table->resources[0];
+        unnormalized_texture.unnormalized = 1;
+        unnormalized_texture.mag_filter = unnormalized_texture.min_filter = 0;
+        unnormalized_texture.mip_filter = 0;
+        unnormalized_texture.addr_uvw[0] = unnormalized_texture.addr_uvw[1] = 2;
+        unnormalized_texture.min_lod = unnormalized_texture.max_lod =
+            unnormalized_texture.lod_bias = 0.0f;
+        unnormalized_texture.max_aniso_ratio = 0;
+        unnormalized_draw.fs = recompile_fragment(
+            unnormalized_ps_rdna, std::size(unnormalized_ps_rdna),
+            unnormalized_table.get());
+        unnormalized_draw.prt = std::move(unnormalized_table);
+        const std::vector<uint8_t> unnormalized_pixels =
+            render_submit_items({unnormalized_draw}, W, H);
+        const uint8_t* center =
+            unnormalized_pixels.size() == static_cast<size_t>(W) * H * 4
+                ? &unnormalized_pixels[
+                    (static_cast<size_t>(H / 2) * W + W / 2) * 4]
+                : nullptr;
+        CHECK(center && center[1] > 0xC0 && center[0] < 0x40 && center[2] < 0x40,
+              "unnormalized sampler preserves texel-space coordinates through the live renderer");
+    }
+
     // NV12 chroma arrives as an RG8 sampled texture. The narrow upload path used to broadcast only
     // its first byte, turning (U,V) into (U,U) and giving every decoded movie a green/purple cast.
     {

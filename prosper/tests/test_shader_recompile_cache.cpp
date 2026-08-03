@@ -177,6 +177,59 @@ int main() {
               stats.misses == pcrel_stats.misses + 1,
           "embedded table contents participate in the shader cache key");
 
+    // S# FORCE_UNNORMALIZED bakes reciprocal spatial extents into sampled-image instructions. The
+    // cache must separate normalized and texel-space modules, and two texel-space resources with
+    // different extents, while the diagnostic disable arm must reuse the normalized module.
+    const auto unnormalized_cache_stats = shader_recompile_cache_stats();
+    static const uint32_t kSamplePs[] = {
+        0x7e0002ffu, 0x3fc00000u, 0x7e0202ffu, 0x3f000000u,
+        0xf0800f08u, 0x00820000u, 0xf800000fu, 0x03020100u, 0xbf810000u,
+    };
+    ShaderResource sampled_texture;
+    sampled_texture.cls = ResourceClass::Texture;
+    sampled_texture.format = DataFormat::Unorm8;
+    sampled_texture.num_components = 4;
+    sampled_texture.binding = 4;
+    sampled_texture.sgpr_base = 8;
+    sampled_texture.img_dim = 1;
+    sampled_texture.width = sampled_texture.height = 2;
+    sampled_texture.depth = 1;
+    ShaderResourceTable sampled_table;
+    sampled_table.resources.push_back(sampled_texture);
+    uint64_t normalized_identity = 0, texel2_identity = 0, texel4_identity = 0,
+             texel2_repeat_identity = 0, disabled_sample_identity = 0;
+    const auto normalized_sample = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kSamplePs, std::size(kSamplePs), &sampled_table,
+        nullptr, nullptr, &normalized_identity);
+    sampled_table.resources[0].unnormalized = 1;
+    const auto texel2_sample = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kSamplePs, std::size(kSamplePs), &sampled_table,
+        nullptr, nullptr, &texel2_identity);
+    sampled_table.resources[0].width = 4;
+    const auto texel4_sample = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kSamplePs, std::size(kSamplePs), &sampled_table,
+        nullptr, nullptr, &texel4_identity);
+    sampled_table.resources[0].width = 2;
+    const auto texel2_repeat = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kSamplePs, std::size(kSamplePs), &sampled_table,
+        nullptr, nullptr, &texel2_repeat_identity);
+    set_test_env("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE", "1");
+    const auto disabled_sample = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kSamplePs, std::size(kSamplePs), &sampled_table,
+        nullptr, nullptr, &disabled_sample_identity);
+    set_test_env("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE", nullptr);
+    stats = shader_recompile_cache_stats();
+    CHECK(!normalized_sample.empty() && !texel2_sample.empty() && !texel4_sample.empty() &&
+              normalized_sample != texel2_sample && texel2_sample != texel4_sample &&
+              texel2_repeat == texel2_sample && disabled_sample == normalized_sample &&
+              normalized_identity != texel2_identity && texel2_identity != texel4_identity &&
+              texel2_repeat_identity == texel2_identity &&
+              disabled_sample_identity == normalized_identity &&
+              stats.misses == unnormalized_cache_stats.misses + 3 &&
+              stats.hits == unnormalized_cache_stats.hits + 2 &&
+              stats.entries == unnormalized_cache_stats.entries + 3,
+          "shader cache separates normalized and extent-specific texel-coordinate lowering");
+
     // Astro Bot's title PS uses SMEM rather than MUBUF to consume its getpc-built scalar table.
     // The post-ENDPGM payload must be owned and hashed by the graphics cache in this form as well.
     std::vector<uint32_t> pcrel_smem_ps = {

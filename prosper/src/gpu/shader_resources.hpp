@@ -260,8 +260,9 @@ struct ShaderResource {
     // Remaining SQ_IMG_SAMP fields (#262). Defaults reproduce the current Vulkan sampler exactly, so a
     // texture whose S# we cannot resolve — and every render test that fills a ShaderResource directly —
     // is byte-identical. Applied where valid on the current color combined-image-sampler path; the three
-    // that need extra machinery (depth-compare, unnormalized, anisotropy) are decoded but NOT applied yet
-    // (see the render-runner sampler site for why each is gated).
+    // that need extra machinery are gated separately: depth compare is lowered manually,
+    // unnormalized coordinates are scaled in the recompiler while retaining the ordinary sampler,
+    // and anisotropy requires the device feature.
     //   border_color_type:  WORD3[31:30] SQ_TEX_BORDER_COLOR (0=transparent-black,1=opaque-black,
     //                       2=opaque-white,3=register/custom). Only affects CLAMP_TO_BORDER wrap.
     //   min_lod/max_lod:    WORD1 [11:0]/[23:12], unsigned u4.8 (raw/256.0). LOD clamp.
@@ -272,8 +273,9 @@ struct ShaderResource {
     //                       APPLIED in-shader by the recompiler's manual-dref c_lz lowering (#1271);
     //                       the hardware compareEnable-sampler path still needs a depth-format view
     //                       (see the render-runner sampler note).
-    //   unnormalized:       WORD0 [15] FORCE_UNNORMALIZED. NEEDS strict validity (no mips, equal filters,
-    //                       clamp addressing, minLod=maxLod=0) — decoded only.
+    //   unnormalized:       WORD0 [15] FORCE_UNNORMALIZED. The recompiler converts only spatial
+    //                       texel coordinates/gradients to normalized coordinates so wrap, LOD and
+    //                       array-layer semantics remain unchanged.
     uint32_t      border_color_type = 0;
     float         min_lod           = 0.0f;
     float         max_lod           = 0.0f;

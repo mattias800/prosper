@@ -9630,6 +9630,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 res->sample_count == 4u && res->depth == 1u &&
                 res->declared_mip_levels == 1u && !res->depth_compare;
             if (dim_msaa && !msaa_array_fetch) { ok = false; return true; }
+            // S# FORCE_UNNORMALIZED makes only the spatial sample coordinates texel-space. Vulkan's
+            // native unnormalized sampler cannot represent the guest contract in general (R-Type's
+            // live S# combines it with wrap addressing and a nonzero max LOD), so retain the ordinary
+            // sampler and convert texels to normalized coordinates in the shader. Array layers, cube
+            // faces, explicit LOD/bias, DREF and packed offsets are not spatial coordinates. Explicit
+            // gradients receive the same per-axis scale so mip selection remains identical.
+            const bool normalize_sampler_coordinates = res->unnormalized &&
+                !getenv("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE");
+            auto normalized_spatial = [&](uint32_t coordinate, uint32_t extent) {
+                if (!normalize_sampler_coordinates) return coordinate;
+                if (!extent) { ok = false; return b.uconst(0); }
+                return b.fbin(Op_FMul, coordinate,
+                              b.uconst(fbits(1.0f / static_cast<float>(extent))));
+            };
             // UNRM=1 supplies unnormalized (texel-space) coordinates (Table 100). Compilers set it
             // only on loads/stores/atomics — and our fetch paths are already texel-space — but a
             // SAMPLER op with UNRM set would treat texel coords as normalized and sample a wildly
@@ -9643,6 +9657,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t j = k - 1; return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu); };
             uint32_t out[4];
             if (dimcube) {
+                // Cube-processed coordinates encode face selection and a normalized in-face pair;
+                // no axis is a plain texel coordinate. FORCE_UNNORMALIZED on this combination has no
+                // representable generic meaning, so keep it fail-visible instead of scaling a face.
+                if (normalize_sampler_coordinates) { ok = false; return true; }
                 // CUBE sample (#273 — DOLL's title post PSes sample their reflection probes /
                 // skybox with `image_sample_l ..., dim:CUBE`). The compiled coords are the standard
                 // AMD cube-processed form (Mesa ac_prepare_cube_coords): vaddr = { sc*rcp(|ma|)+1.5,
@@ -9690,9 +9708,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!b.declare_texture(res->binding, Dim_3D, uint_texture)) {
                     ok = false; return true;
                 }
-                if (is_sample)      b.image_sample_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
-                else if (is_load)   b.image_fetch_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
-                else                b.image_sample_lod_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)),
+                uint32_t cu = vread(cvg(0)), cv = vread(cvg(1)), cw = vread(cvg(2));
+                if (!is_load) {
+                    cu = normalized_spatial(cu, res->width);
+                    cv = normalized_spatial(cv, res->height);
+                    cw = normalized_spatial(cw, res->depth);
+                }
+                if (is_sample)      b.image_sample_3d(res->binding, cu, cv, cw, out);
+                else if (is_load)   b.image_fetch_3d(res->binding, cu, cv, cw, out);
+                else                b.image_sample_lod_3d(res->binding, cu, cv, cw,
                                                           b.uconst(0), out);   // _lz: base level
             } else if (is_sample_c_lz) {
                 // Astro Bot shadow/visibility packet (opcode 0x2f, dim 2D_ARRAY, NSA). ISA 8.2.5
@@ -9723,7 +9747,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             ok = false; return true;
                         }
                         b.image_sample_dref_manual_2d(
-                            res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)),
+                            res->binding,
+                            normalized_spatial(vread(cvg(1)), res->width),
+                            normalized_spatial(vread(cvg(2)), res->height),
+                            vread(cvg(0)),
                             res->depth_compare_func, res->mag_filter != 0u,
                             res->addr_uvw[0], res->addr_uvw[1], res->border_color_type,
                             out, true, vread(cvg(3)));
@@ -9735,7 +9762,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             ok = false; return true;
                         }
                         b.image_sample_dref_manual_2d(
-                            res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)),
+                            res->binding,
+                            normalized_spatial(vread(cvg(1)), res->width),
+                            normalized_spatial(vread(cvg(2)), res->height),
+                            vread(cvg(0)),
                             res->depth_compare_func, res->mag_filter != 0u,
                             res->addr_uvw[0], res->addr_uvw[1], res->border_color_type, out);
                     }
@@ -9748,10 +9778,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (!b.declare_texture(res->binding, Dim_2D, false)) {
                         ok = false; return true;
                     }
-                    b.image_sample_dref_manual_2d(res->binding, vread(cvg(1)), vread(cvg(2)),
-                                                  vread(cvg(0)), res->depth_compare_func,
-                                                  res->mag_filter != 0u, res->addr_uvw[0],
-                                                  res->addr_uvw[1], res->border_color_type, out);
+                    b.image_sample_dref_manual_2d(
+                        res->binding,
+                        normalized_spatial(vread(cvg(1)), res->width),
+                        normalized_spatial(vread(cvg(2)), res->height),
+                        vread(cvg(0)), res->depth_compare_func,
+                        res->mag_filter != 0u, res->addr_uvw[0],
+                        res->addr_uvw[1], res->border_color_type, out);
                 } else { ok = false; return true; }
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
@@ -9763,9 +9796,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ok = false; return true;
                 }
                 if (is_gather_lz_o)   // vaddr order for _o: [packed offset, u, v]
-                    b.image_gather_offset_2d(res->binding, vread(cvg(1)), vread(cvg(2)), comp, vread(cvg(0)), out);
+                    b.image_gather_offset_2d(
+                        res->binding,
+                        normalized_spatial(vread(cvg(1)), res->width),
+                        normalized_spatial(vread(cvg(2)), res->height),
+                        comp, vread(cvg(0)), out);
                 else
-                    b.image_gather_2d(res->binding, vread(cvg(0)), vread(cvg(1)), comp, out);
+                    b.image_gather_2d(
+                        res->binding,
+                        normalized_spatial(vread(cvg(0)), res->width),
+                        normalized_spatial(vread(cvg(1)), res->height), comp, out);
                 int vd = in.dst.value;
                 for (uint32_t c = 0; c < 4; c++) {
                     uint32_t old = vreg_old(b, rs, vd + (int)c);
@@ -9787,19 +9827,38 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // Compute SAMPLE and SAMPLE_LZ both resolve level zero; SAMPLE_L supplies its
                     // explicit LOD. All retain the 2D-array slice in the SPIR-V coordinate.
                     b.image_sample_lod_2d_array(
-                        res->binding, vread(cvg(0)), vread(cvg(1)),
+                        res->binding,
+                        normalized_spatial(vread(cvg(0)), res->width),
+                        normalized_spatial(vread(cvg(1)), res->height),
                         vread(cvg(2)),
                         is_sample_l ? vread(cvg(3)) : b.uconst(fbits(0.0f)), out);
                 } else if (is_sample_b) {      // vaddr order for _b: [bias, u, v]
-                    b.image_sample_bias_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
+                    b.image_sample_bias_2d(
+                        res->binding,
+                        normalized_spatial(vread(cvg(1)), res->width),
+                        normalized_spatial(vread(cvg(2)), res->height),
+                        vread(cvg(0)), out);
                 } else if (is_sample_lz_o) {   // vaddr order for _o: [packed offset, u, v]
-                    b.image_sample_lz_offset_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
+                    b.image_sample_lz_offset_2d(
+                        res->binding,
+                        normalized_spatial(vread(cvg(1)), res->width),
+                        normalized_spatial(vread(cvg(2)), res->height),
+                        vread(cvg(0)), out);
                 } else if (is_sample_d) {   // vaddr order for _d: [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy, u, v]
                     b.image_sample_grad_2d(
-                        res->binding, vread(cvg(4)), vread(cvg(5)),
-                        vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), out);
+                        res->binding,
+                        normalized_spatial(vread(cvg(4)), res->width),
+                        normalized_spatial(vread(cvg(5)), res->height),
+                        normalized_spatial(vread(cvg(0)), res->width),
+                        normalized_spatial(vread(cvg(1)), res->height),
+                        normalized_spatial(vread(cvg(2)), res->width),
+                        normalized_spatial(vread(cvg(3)), res->height), out);
                 } else {
                     uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
+                    if (!is_load) {
+                        cu = normalized_spatial(cu, res->width);
+                        cv = normalized_spatial(cv, res->height);
+                    }
                     if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
                     else if (is_sample_lz) b.image_sample_lod_2d(res->binding, cu, cv, b.uconst(0), out);      // LOD 0
                     // Explicit-LOD plain 2D uses [u,v,lod]. Graphics keeps the established
