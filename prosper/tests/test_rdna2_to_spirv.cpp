@@ -2451,6 +2451,26 @@ int main() {
     CHECK(got32o2.size()==1 && bits_of(got32o2[0])==0x1234ca48u,
           "kernel 32o2 applies VOP3 output scaling before f16 packing");
 
+    // Kernel 32o3: Syberia's exact source-87 v_max3_f16 pair selects different low/high source
+    // halves and independently writes both destination halves. This is the first-reject shape in a
+    // nonzero 960x544 gameplay dispatch; checking the packed word catches a decoder that accepts the
+    // opcode but silently drops OPSEL or opposite-half preservation.
+    const uint32_t code32o3[] = {
+        0x7e2c02ffu, 0x40003c00u,            // v22={2.0h,1.0h}
+        0x7e2e02ffu, 0x38004200u,            // v23={0.5h,3.0h}
+        0x7e1202ffu, 0x12345678u,            // v9=old packed destination
+        0xd7542009u, 0x045a2d17u,            // v9.lo=max(v23.lo,v22.lo,v22.hi)=3
+        0xd7545809u, 0x045e2d17u,            // v9.hi=max(v23.hi,v22.hi,v23.lo)=3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o3 = recompile_valu(
+        code32o3, std::size(code32o3), 0, 9);
+    CHECK(!spv32o3.empty(), "recompiled kernel 32o3 (Syberia v_max3_f16 OPSEL pair) -> SPIR-V");
+    std::vector<float> got32o3 = prosper::test::run_compute(
+        spv32o3, std::vector<float>(1), 1, 1);
+    CHECK(got32o3.size()==1 && bits_of(got32o3[0])==0x42004200u,
+          "kernel 32o3 selects and preserves packed f16 halves exactly");
+
     // Kernel 32p: exact live v_cndmask_b32_sdwa selects src1 WORD_0 through VCC, writes WORD_1,
     // and preserves the destination's low half.
     const uint32_t code32p[] = {

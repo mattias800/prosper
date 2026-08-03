@@ -359,9 +359,10 @@ void decode_operands(Rdna2Inst& i) {
                     break;
                 default: break;
             }
-            // v_fma_f16 VOP3: OPSEL[2:0] selects each packed source half and OPSEL[3]
+            // Scalar-f16 VOP3 operations: OPSEL[2:0] selects each packed source half and OPSEL[3]
             // selects the destination half. Reuse the packed-op selector field for this family.
-            if (i.opcode == 0x34Bu)
+            // VERIFIED(llvm-mc gfx1030): 0x354 is v_max3_f16.
+            if (i.opcode == 0x34Bu || i.opcode == 0x354u)
                 i.vop3p_opsel = static_cast<uint8_t>((w >> 11) & 0xFu);
             // V_PERMLANE16_B32 / V_PERMLANEX16_B32 overload OPSEL[0] as FI and OPSEL[1] as
             // BOUND_CTRL. OPSEL[2:3], ABS, NEG, CLAMP and OMOD remain reserved/unsupported and are
