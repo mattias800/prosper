@@ -886,6 +886,12 @@ bool native_3d_transfer_enabled() {
     return enabled;
 }
 
+bool native_2d_transfer_enabled() {
+    static const bool enabled =
+        std::getenv("PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER") == nullptr;
+    return enabled;
+}
+
 size_t cold_storage_result_snapshot_defer_min_bytes() {
     if (g_zero_next_cold_storage_snapshot_minimum_for_test.exchange(
             false, std::memory_order_acq_rel))
@@ -1697,14 +1703,17 @@ struct VulkanComputeContext {
                                                   VkImage& image, bool trace = false) {
         const auto found = image_cache.find(key);
         if (found == image_cache.end()) {
-            if (trace) std::fprintf(stderr, "[compute]   native 3D transfer miss: no storage cache\n");
+            if (trace)
+                std::fprintf(stderr,
+                             "[compute]   native storage transfer miss: no storage cache\n");
             return false;
         }
         CachedComputeImage& cached = found->second;
         if (!cached.compute_transfer_valid || !cached.content_valid || !cached.image) {
             if (trace)
                 std::fprintf(stderr,
-                             "[compute]   native 3D transfer miss: export=%u content=%u image=%u\n",
+                             "[compute]   native storage transfer miss: "
+                             "export=%u content=%u image=%u\n",
                              cached.compute_transfer_valid ? 1u : 0u,
                              cached.content_valid ? 1u : 0u, cached.image ? 1u : 0u);
             return false;
@@ -1719,7 +1728,8 @@ struct VulkanComputeContext {
         if (!submit_unchanged && !watch_unchanged) {
             if (trace)
                 std::fprintf(stderr,
-                             "[compute]   native 3D transfer miss: submit-query=%u watch=%u\n",
+                             "[compute]   native storage transfer miss: "
+                             "submit-query=%u watch=%u\n",
                              static_cast<unsigned>(submit_query),
                              cached.write_watch ? 1u : 0u);
             return false;
@@ -3417,8 +3427,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 !image_descriptors[i].atomic_access &&
                 image_descriptors[i].storage_image_format == kSpirvImageFormatR32ui &&
                 r->format == DataFormat::Float10_11_11 && descriptor_components == 3;
-            const bool ordinary_2d_storage = r->img_dim == 1 && r->depth == 1 &&
-                                             !r->depth_compare;
+            const bool ordinary_2d_view = shader_resource_uses_ordinary_2d_image(
+                *r, image_descriptors[i].image_dim == 1u,
+                image_descriptors[i].image_arrayed,
+                image_descriptors[i].image_multisampled);
+            const bool ordinary_2d_storage = ordinary_2d_view;
             const bool ordinary_3d_storage = r->img_dim == 2 && r->depth &&
                                              !r->depth_compare;
             const VkImageType native_storage_type = ordinary_3d_storage
@@ -3486,8 +3499,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // A SINGLE-LAYER 2D array (img_dim==5, depth==1, no depth-compare) is byte-identical to a
             // plain 2D image (one layer, same tiling), so it flows through the 2D path below unchanged.
             // Reflection distinguishes that fallback from a shader which retains the layer coordinate.
-            const bool dim_2d_single = r->img_dim == 5 && !image_descriptors[i].image_arrayed &&
-                                       r->depth == 1;
+            const bool dim_2d_single = r->img_dim == 5 && ordinary_2d_view;
             if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array &&
                 !dim_2d_single && !dim_cube_stacked && !cube_face_as_2d) {
                 skip_image(r, "layered image deferred to #657"); break;
@@ -4293,15 +4305,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         r->mip_tail_x, r->mip_tail_y,
                         static_cast<uint32_t>(image_format), bi.storage, r->in_mip_tail,
                         r->srgb, r->depth_compare};
-                    // A native typed 3D storage result is byte- and format-identical to the sampled
-                    // upload that follows it. Borrow that retained result only as a TRANSFER source:
-                    // the sampled cache remains a separate image so a read/modify/write dispatch can
-                    // sample the old volume while producing its replacement at the same guest address.
+                    // An ordinary native typed 2D image or native typed 3D volume is byte- and
+                    // format-identical to the sampled upload that follows it. Borrow that retained
+                    // result only as a TRANSFER source: the sampled cache remains a separate image so
+                    // a read/modify/write dispatch can sample the old image while producing its
+                    // replacement at the same guest address. Exact key lookup plus the ordered-submit
+                    // journal (or an independently clean write watch) makes an intervening guest write
+                    // fail closed to the existing upload path.
                     const VkFormat native_format =
                         native_storage_vk_format(r->format, sampled_components);
-                    if (dim_3d && !r->host_data && native_format == image_format &&
+                    const bool native_transfer_dimension =
+                        (dim_3d && native_3d_transfer_enabled()) ||
+                        (ordinary_2d_view &&
+                         native_2d_transfer_enabled() &&
+                         compute_native_2d_transfer_format_compatible(
+                             r->format, sampled_components));
+                    if (native_transfer_dimension && !r->host_data &&
+                        native_format == image_format &&
                         adaptive_storage_result_validation_enabled() &&
-                        native_3d_transfer_enabled()) {
+                        native_format != VK_FORMAT_UNDEFINED) {
                         const ComputeImageCacheKey storage_key = storage_image_cache_key(
                             *r, static_cast<uint32_t>(sampled_guest_need), native_format);
                         if (ctx.borrow_cached_image_for_compute_transfer(
@@ -4312,9 +4334,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                 1, std::memory_order_relaxed);
                             if (trace)
                                 std::fprintf(stderr,
-                                             "[compute]   sampled 3D binding=%u addr=0x%llx "
+                                             "[compute]   sampled %s binding=%u addr=0x%llx "
                                              "seeded from retained native storage image\n",
-                                             bi.binding,
+                                             dim_3d ? "3D" : "2D", bi.binding,
                                              (unsigned long long)r->gpu_addr);
                         }
                     }
@@ -6530,6 +6552,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 }
 
 } // namespace
+
+bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat format,
+                                                  uint32_t components) {
+    // Keep this intentionally narrower than every format the sampled uploader can materialize.
+    // Ordinary 2D FP16 is deliberately converted to RGBA8 on the sampled side, and packed R11 uses
+    // its exact R32_UINT recovery representation on the storage side. Only formats whose current
+    // ordinary-2D sampled and typed-storage paths select the same native VkFormat may transfer.
+    using prosper::gpu::DataFormat;
+    if (format != DataFormat::Float32 && format != DataFormat::Unorm8) return false;
+    if (components != 1 && components != 2 && components != 4) return false;
+    return native_storage_vk_format(format, components) != VK_FORMAT_UNDEFINED;
+}
 
 void report_live_compute_timing_selector_summary() {
     runtime_compute_timing_selector().report_summary();

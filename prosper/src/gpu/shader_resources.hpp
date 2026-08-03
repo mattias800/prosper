@@ -318,6 +318,21 @@ struct ShaderResource {
     uint64_t       host_data_size   = 0;
 };
 
+// A one-layer guest 2D-array descriptor is byte-identical to an ordinary 2D image, and some guest
+// shaders deliberately address it with a non-arrayed DIM=2D instruction. Keep that established
+// base-slice contract explicit and shared between recompilation and the live backend: native typed
+// storage is safe only when the shader's actual image type is ordinary, non-MSAA 2D. The resource's
+// descriptor shape remains part of cache identity, so this does not alias unrelated 2D/array views.
+constexpr bool shader_resource_uses_ordinary_2d_image(
+    const ShaderResource& resource,
+    bool shader_2d,
+    bool shader_arrayed,
+    bool shader_multisampled) {
+    return shader_2d && !shader_arrayed && !shader_multisampled &&
+           resource.depth == 1 && !resource.depth_compare &&
+           (resource.img_dim == 1 || resource.img_dim == 5);
+}
+
 // A null BVH is represented by a bounded host-owned marker. The front-half creates this only after
 // proving that a mapped zero pointer feeds the complete descriptor inside an EXEC-guarded region.
 // The exact shape survives capture/replay without adding a capture-format field and cannot alias a

@@ -9450,8 +9450,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ok = false;
                     return true;
                 }
-                const bool ordinary_2d = res->img_dim == 1 && res->depth == 1 &&
-                                         !res->depth_compare;
+                const bool ordinary_2d = shader_resource_uses_ordinary_2d_image(
+                    *res, dim == Dim_2D, arrayed, ms);
                 const bool ordinary_3d = in.mimg_dim == SQ_DIM_3D && res->img_dim == 2 &&
                                          res->depth && !arrayed && !ms &&
                                          !res->depth_compare;

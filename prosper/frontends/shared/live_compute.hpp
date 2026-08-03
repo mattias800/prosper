@@ -159,7 +159,12 @@ uint64_t live_compute_buffer_gpu_result_skips();
 // Monotonic diagnostic count of retained sampled-image hits whose validated source omitted upload.
 // Capture/replay tests use this to prove residency without relying on timing-sensitive assertions.
 uint64_t live_compute_sampled_image_upload_skips();
-// Monotonic count of sampled 3D images seeded from an exact retained native storage result with a
+// True only when an ordinary guest-backed 2D sampled image uses the same native Vulkan texel
+// representation as its typed storage counterpart. This is the format half of the retained-image
+// transfer contract; resource identity and write authority are checked separately at runtime.
+bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat format,
+                                                  uint32_t components);
+// Monotonic count of sampled 2D/3D images seeded from an exact retained native storage result with a
 // device-local image copy instead of a guest-memory conversion/upload.
 uint64_t live_compute_storage_transfer_seeds();
 // Query the initialized live backend for the exact typed 3D storage+transfer image contract. Tests
