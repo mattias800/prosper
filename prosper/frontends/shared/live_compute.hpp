@@ -205,4 +205,8 @@ uint64_t live_compute_queue_submit_attempts();
 // Register the synchronous Vulkan compute backend used by AGC submit processing.
 void register_live_compute();
 
+// Publish the stable timing selector's final seen/matched verdict. Idempotent with the ordinary
+// destructor fallback; prosper-app calls this before its deliberate _Exit teardown path.
+void report_live_compute_timing_selector_summary();
+
 } // namespace prosper::frontend

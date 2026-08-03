@@ -42,6 +42,7 @@
 #endif
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
+#include "live_compute.hpp"            // flush compute-timing selector summary before _Exit
 #endif
 #ifdef PROSPER_AUDIO_SDL3
 #include "audio_sdl3.hpp"              // install_sdl3_audio_sink (route sceAudioOut to the host)
@@ -2290,6 +2291,11 @@ int main(int argc, char** argv) {
     // let the OS reclaim process state without running destructors under the live guest.
     if (g_guest_thread.joinable()) {
         g_guest_thread.detach();
+#ifdef PROSPER_HAVE_LIVE_RENDERER
+        // _Exit skips RuntimeComputeTimingSelector's destructor. Publish its validity verdict here;
+        // the report is idempotent so a future cooperative teardown cannot duplicate it.
+        prosper::frontend::report_live_compute_timing_selector_summary();
+#endif
         fflush(nullptr);
         std::_Exit(exitCode);
     }

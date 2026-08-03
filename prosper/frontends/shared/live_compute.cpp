@@ -2693,8 +2693,13 @@ public:
     }
 
     ~RuntimeComputeTimingSelector() {
+        report_summary();
+    }
+
+    void report_summary() {
         if (!hash_requested_) return;
         std::lock_guard lock(mutex_);
+        if (!claim_compute_timing_selector_summary(counters_)) return;
         if (!selector_.hash_valid) {
             std::fprintf(stderr,
                          "[compute-timing-filter] summary status=ignored reason=%s "
@@ -6525,6 +6530,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 }
 
 } // namespace
+
+void report_live_compute_timing_selector_summary() {
+    runtime_compute_timing_selector().report_summary();
+}
 
 bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampled_resource,
                                        uint64_t guest_bytes,

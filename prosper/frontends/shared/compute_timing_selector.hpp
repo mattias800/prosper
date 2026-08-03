@@ -101,6 +101,7 @@ constexpr bool compute_timing_selector_matches(const ComputeTimingSelector& sele
 struct ComputeTimingSelectorCounters {
     uint64_t seen = 0;
     uint64_t matched = 0;
+    bool summary_reported = false;
 };
 
 struct ComputeTimingSelectorObservation {
@@ -127,6 +128,16 @@ inline ComputeTimingSelectorObservation observe_compute_timing_selector(
 constexpr bool compute_timing_zero_match_is_invalid(
     const ComputeTimingSelectorCounters& counters) {
     return counters.matched == 0;
+}
+
+// Runtime frontends do not all reach static destruction: prosper-app deliberately uses _Exit while
+// its detached guest thread is still alive. Keep the exactly-once decision in this pure policy seam
+// so an explicit frontend report and the ordinary destructor fallback cannot both publish a verdict.
+inline bool claim_compute_timing_selector_summary(
+    ComputeTimingSelectorCounters& counters) {
+    if (counters.summary_reported) return false;
+    counters.summary_reported = true;
+    return true;
 }
 
 } // namespace prosper::frontend
