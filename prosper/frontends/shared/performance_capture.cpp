@@ -1,4 +1,5 @@
 #include "performance_capture.hpp"
+#include "build_revision.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -30,10 +31,6 @@
 
 #if defined(__linux__)
 #include <unistd.h>
-#endif
-
-#ifndef PROSPER_GIT_REVISION
-#define PROSPER_GIT_REVISION "unknown"
 #endif
 
 namespace prosper::perf {
@@ -484,7 +481,7 @@ ProcessSample collect_process_sample(uint64_t monotonic_ns, uint64_t guest_prese
 }
 
 const char* build_revision() {
-    return PROSPER_GIT_REVISION;
+    return ::prosper::embedded_build_revision();
 }
 
 } // namespace prosper::perf

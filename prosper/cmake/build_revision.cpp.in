@@ -1,0 +1,9 @@
+#include "build_revision.hpp"
+
+namespace prosper {
+
+const char* embedded_build_revision() noexcept {
+    return "@PROSPER_GENERATED_REVISION@";
+}
+
+} // namespace prosper

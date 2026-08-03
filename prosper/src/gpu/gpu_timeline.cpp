@@ -1,5 +1,6 @@
 #include "gpu_timeline.hpp"
 
+#include "build_revision.hpp"
 #include "gpu_capture.hpp"
 #include "gpu_capture_bundle.hpp"
 #include "gpu_dependency_graph.hpp"
@@ -198,11 +199,7 @@ struct RuntimeRecorder {
             return nullptr;
         }
         GpuTimelineMetadata metadata;
-#ifdef PROSPER_GIT_REVISION
-        metadata.revision = PROSPER_GIT_REVISION;
-#else
-        metadata.revision = "unknown";
-#endif
+        metadata.revision = embedded_build_revision();
         if (const char* revision = std::getenv("PROSPER_CAPTURE_REVISION")) metadata.revision = revision;
         metadata.title_id = env_or_empty("PROSPER_CAPTURE_TITLE");
         metadata.input_route = env_or_empty("PROSPER_PAD_SCRIPT");
@@ -1078,11 +1075,7 @@ GpuCaptureMetadata runtime_capture_metadata(uint64_t submit_no) {
     metadata.width = present_width();
     metadata.height = present_height();
     metadata.submit_index = submit_no;
-#ifdef PROSPER_GIT_REVISION
-    metadata.revision = PROSPER_GIT_REVISION;
-#else
-    metadata.revision = "unknown";
-#endif
+    metadata.revision = embedded_build_revision();
     if (const char* revision = std::getenv("PROSPER_CAPTURE_REVISION")) metadata.revision = revision;
     metadata.title_id = env_or_empty("PROSPER_CAPTURE_TITLE");
     metadata.input_route = env_or_empty("PROSPER_PAD_SCRIPT");
