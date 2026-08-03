@@ -98,17 +98,25 @@ resource extent in the shader recompiler. Array layers, DREF, LOD/bias, packed t
 integer image loads keep their established meanings. Because the reciprocal extents are embedded in
 SPIR-V, the compiled-shader cache key includes the unnormalized contract and its dimensions.
 
-Recompiling every retained raw shader on `4dfcaa94` changes the exact replay hash to
+Recompiling every retained raw shader on `2240551d` changes the exact replay hash to
 `51d9511c303d9182` and recovers recognizable, detailed movie content. Disabling only the coordinate
 lowering returns byte-for-byte to `c87261d44cd4426b`; the focused live-renderer mutation likewise
-keeps its named pixel check executing and makes only that check fail. This is real visual progress,
-but it is not yet visually correct: the replay has a strong green/purple chroma cast and scales the
-movie into top/bottom black bars. It also does not bypass the default-launch startup race (#1746),
-so the compatibility rung is unchanged.
+keeps its named pixel check executing and makes only that check fail. This is real detail recovery,
+but the replay is not a live visual oracle. Its strong green/purple cast is an apparatus artifact:
+the capture stores both plane payloads but records `linear_row_pitch_bytes=0`, and replay has no
+process-local AvPlayer pitch registry. The renderer therefore cannot recognize the two-channel
+chroma contract and deliberately takes its legacy narrow-texture coverage path, broadcasting U as
+both U and V. An independent BT.709 model with `(U,U)` matches the replay at 42.17 dB / 0.9816 SSIM;
+the correct `(U,V)` model does not. Live chroma correctness remains unverified, not known broken.
+
+The replay also preserves the captured movie quad's 1920x608 placement with top/bottom bars. No
+hardware or live-product oracle establishes whether that placement is intended, so it is recorded
+without calling it a defect. The coordinate fix does not bypass the default-launch startup race
+(#1746), and retained replay evidence does not change the compatibility rung.
 
 <p align="center">
-  <img src="../../assets/screenshots/rtype-delta-movie-coordinate-progress.png" alt="R-Type Delta movie replay after texel-coordinate recovery; detailed content is visible but chroma and vertical scaling remain incorrect"><br>
-  <sub>Retained-frame replay after the coordinate fix. Detail is recovered; the green/purple cast and top/bottom bars remain known defects.</sub>
+  <img src="../../assets/screenshots/rtype-delta-movie-coordinate-progress.png" alt="Intermediate R-Type Delta retained-frame replay after texel-coordinate recovery; recognizable detail is visible, while replay's missing row-pitch provenance causes a green-purple cast"><br>
+  <sub>Intermediate retained-frame replay: detail recovery is real; the green/purple cast is a replay-provenance artifact, and live chroma/placement correctness remains unverified.</sub>
 </p>
 
 ## Ruled out
@@ -124,12 +132,12 @@ so the compatibility rung is unchanged.
 | The decoded/staged movie planes contain the low-colour gradient | **Falsified.** The exact captured R8/RG8 bytes produce a sharp full-colour frame through an independent CPU NV12 conversion; only Prosper's replay of the same bytes collapses to the gradient. | present 1740 capture, #1807 |
 | Vulkan's native unnormalized-coordinate sampler can apply `FORCE_UNNORMALIZED` directly | **Falsified against the live S#.** R-Type combines the bit with wrap addressing (`CLAMP_X/Y=0`) and `maxLod=15.9961`; Vulkan requires clamp addressing and zero LOD for an unnormalized sampler. The native candidate correctly became fail-visible but could not represent the guest contract. | retained submit 1741, #1807 |
 | The diagonal proves the fullscreen strip's topology or interpolation is wrong | **Falsified by the coordinate-only A/B.** Recompiling the same raw VS/FS and changing only texel-to-normalized lowering recovers detailed content and removes the diagonal; disabling only that lowering reproduces the exact old hash. | hashes `51d9511c303d9182` / `c87261d44cd4426b`, #1807 |
+| The corrected replay's green/purple cast proves live chroma upload or shader conversion is wrong | **Falsified as a replay claim.** Captured U/V bytes are distinct in 494,043/552,960 pairs, T# swizzle `(X,Y,0,1)` and the shader's BT.709 component flow are correct, and a forced `(U,U)` CPU model matches replay at 42.17 dB / 0.9816 SSIM. Capture reports row pitch zero, so replay misses the AvPlayer contract and intentionally broadcasts the first narrow channel. Live output has not passed the startup race and remains unverified. | submit 1741 capture metadata, #1807 |
 
 ## Next frontier
 
-The coordinate failure in #1807 is isolated and mutation-proven. The next movie-rendering frontier
-is the green/purple chroma cast: compare the raw shader's sampled component/swizzle flow and YUV
-conversion constants with the captured RG plane before changing upload order. The vertical bars are
-separate: compare the movie VS constant buffer and generated strip positions with the full-height CPU
-frame. Default launch still stops earlier on #1746; neither replay improvement changes that product
-route or the compatibility rung.
+The coordinate failure in #1807 is isolated and mutation-proven. The next product frontier remains
+#1746: reach the same frame on an unmodified launch and verify live chroma and movie placement by eye
+before assigning either a renderer bug. Separately, capture/replay should serialize or reconstruct
+the AvPlayer row-pitch provenance so future retained frames take the same narrow-RG path as live
+rendering; until then the screenshot is evidence for detail/coordinate recovery only.
