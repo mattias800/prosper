@@ -39,6 +39,10 @@ in [Game compatibility](COMPATIBILITY.md).
   <em><strong>GRIS</strong> — opening gameplay, native 1920×1080</em>
 </p>
 <p align="center">
+  <img src="assets/screenshots/syberia-profile.png" alt="Syberia: Remastered — profile menu with its full-width 3D scene restored; exposure remains incorrect"><br>
+  <em><strong>Syberia: Remastered</strong> — profile menu and restored 3D scene, still overexposed, native 1920×1080</em>
+</p>
+<p align="center">
   <img src="assets/screenshots/space-adventure-cobra.png" alt="Space Adventure Cobra — tutorial combat"><br>
   <em><strong>Space Adventure Cobra — The Awakening</strong> — tutorial combat, native 1920×1080</em>
 </p>

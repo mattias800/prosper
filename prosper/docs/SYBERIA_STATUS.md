@@ -1,13 +1,13 @@
 # Syberia: Remastered (`PPSA30140`) — status and evidence
 
 Unity / IL2CPP, Microids / Virtuallyz Gaming. **Rung 3 — gameplay reached** with real GPU draws on a
-validated route (`scripts/syberia/reach-gameplay.pad`). Two composition defects remain, both tracked
-on #1619.
+validated route (`scripts/syberia/reach-gameplay.pad`). Two visual defects remain: the profile
+menu's formerly missing 3D layer is restored but overexposed (#1790), and the routed gameplay
+composite remains degraded (#1627).
 
 Read **`## Ruled out`** below before repeating any experiment on the "right side of the frame is
-black" question. Seven hypotheses about that frame — including the one this document originally
-narrowed to — are dead: four falsified with evidence, three rejected as not-the-cause or not
-established.
+black" question. Several hypotheses about that frame — including the one this document originally
+narrowed to — are dead or restricted to the diagnostic CPU-readback path.
 
 ## Ruled out
 
@@ -20,27 +20,18 @@ re-derive these without contradictory new evidence.
 | A scissor or viewport clips draws to the left of the frame | **Falsified.** Every realized draw's `viewport=` and `scissor=` covers its **full** target (1920x1080, or the 2048² / 1024² / 512² shadow-atlas extents). | #1619 |
 | The menu is a flat 2D screen with nothing to draw on the right | **Falsified.** The frame is 472 draws + 81 dispatches with 2048² shadow cascades, 512² spot shadows, `R11G11B10F` HDR targets and a 960x540→15x8 bloom pyramid. It renders a real lit interior. | #1619 |
 | The `R11G11B10F` gap in `set_live_target_image_written_notifier` is what blacks this frame | **Falsified as the mechanism for this frame** (the *defect* is real and is fixed by #1626). A routed live A/B — same route, same timings, no diagnostics in either arm, differing only in the notifier line — produced a **byte-identical** settled menu (`md5 1fc612606b4e32adc89db9bfd35c92b2`, `crc=bdf7a33a` for every capture from t=165 s to t=220 s), and the right ~55% is still pure black. The verdict rests on that A/B alone and does not need the mechanism. The mechanism, offered as the explanation: the notifier is called from exactly one site (`live_compute.cpp`, guarded by `bi.mirror_result_to_imported`) which the seed-skip path excludes, so it provably cannot fire for a write-only binding proved to cover every texel. That implication is verified by code; its **premise** — that this dispatch's binding 23 took the seed-skip path — rests on a `[seed-skip-verify]` line **recorded once in this issue's body and never re-observed**, which independent review could not confirm either. Treat the premise as a recorded observation, not re-derived fact. | #1619 comments, PR #1626 |
-| The offline localization transfers to the default render path | **Not established — do not assume it does.** `PROSPER_RTTLOG` and `PROSPER_RESOURCE_HASH_DIM` both clear `live_gpu_targets` (`live_renderer.cpp:933`) and force the **CPU readback** RTT path. The frame is black on both paths, but reproducing on both does **not** make it the same mechanism on both; the issue's own wording is "black on both, by (at least partly) different code". The chain in `## Where the scene dies, exactly` is sound about the CPU-readback path only. | #1619 comments |
-| The ten `reason=shader-recompile` dispatches black the scene | **Not the cause.** The lit composite is already correct at draw 465, after all ten have been skipped. They are real FATAL gaps per `CLAUDE.md` and are tracked separately on #1628. | #1619, #1628 |
+| The offline RTT-cache localization transfers to the default render path | **Not established — do not assume it does.** `PROSPER_RTTLOG` and `PROSPER_RESOURCE_HASH_DIM` both clear `live_gpu_targets` (`live_renderer.cpp:933`) and force the **CPU readback** RTT path. The frame is black on both paths, but reproducing on both does **not** make the cache-miss mechanism common to both; retain those logs only as endpoint/localization evidence for that diagnostic route. The source/capsule producer chain below is separate evidence. | #1619 comments |
+| The ten `reason=shader-recompile` dispatches are unrelated to the black scene | **Falsified.** One of them, operation 570 / source 101 (`0x2111a3af00`, raw hash `abef7b52fb82e741`), is the missing producer of the post-process input at `0x21159d0000`. It samples the correct lit target `0x2110310000`, but rejection at `s_cmp_lg_u64 exec,s[16:17]` prevents that output; downstream source 102 and the final source-119 composite therefore consume zero. Supporting the compare recompiles the exact captured shader and a clean live run restores the full-width scene layer: 2,063,996 non-black pixels and 139,946–144,452 colours across t=190–223 s, versus 670,815 non-black pixels in the old settled black-layer baseline. | #1619, #1628 |
 | Syberia's ~1.9 fps is #1748-style AGC command-buffer churn | **Falsified.** Over a 45 s headless boot with `PROSPER_DCBFULL=1` the title builds 311,296 command packets and issues **zero** Dcb buffer-full callbacks — it never asks the guest for more command-buffer space at all. The probe prints an `armed` banner and a running `seen=/full=` tally, so this zero is the probe reporting zero rather than a silent log (it was measured once before *without* that banner, and that earlier reading proved nothing). Note the comparison titles are **not** cleared: Bendy runs at 297 callbacks/s, the same order as Asterix *after* #1748 (368/s), so a high rate is not itself the defect — what mattered on Asterix was that the chunks never came back. | #1756, `docs/AGC_PACKET_SIZES.md` |
 | The `[agc] WaitRegMem … dependency violated` burst at t≈129 s is a finding | **Not a measurement.** The diagnostic is capped at 40 printed lines (`command_processor.cpp:2450`) and the counter in the message is the true total; an unsatisfied wait is documented in the code as normal handled state. The same over-read was recorded independently on Oregon Trail (#1606) and as instrument trap #13 in `GAME_COMPAT_ORCHESTRATION.md`. | #1619, #1606 |
 
-**Still open:** what blacks this frame on the **default** path. Establish first whether the mirrored
-write path is taken for that dispatch at all — `PROSPER_COMPUTELOG_CODE=<code_addr>` is outside the
-`live_gpu_targets` exclusion list and therefore observes the real path, but guest code addresses are
-run-local, so the recorded `0x2134c14100` cannot be pre-seeded from an older run (a fresh run confirms
-it does not appear); filter by `PROSPER_COMPUTELOG_SIZE` or take the full trace.
-
-**The leading unverified hypothesis for the default path**, stated so the next agent has a start, not
-as a finding: a seed-skipped write-only storage binding still runs the ordinary writeback — it reads
-the storage image back, packs the guest bytes, and calls `notify_guest_gpu_write`. That guest write
-invalidates every overlapping renderer-owned target and erases the CPU RTT entry, and because the
-mirrored-write path was skipped, **nothing republishes it** — the same end state the notifier bug
-produced, reached by a different route. If that is right the contract is broader than the one #1619
-states: *a compute dispatch that fully overwrites a renderer-owned target must leave the renderer
-owning the result, whether it got there through a seeded mirrored write **or** through a proven
-full-coverage write-only store.* To confirm or kill it, check whether `bi.imported` is true for that
-storage binding on the default path, and whether the target is re-established for draw 469.
+**Still open:** what causes the restored menu layer's substantial overexposure (#1790). Recompiling
+source 101 restores the visible 3D layer on the **default** path, but does not make it visually
+correct. The degraded gameplay composite is separate and unlocalized (#1627); do not merge the two
+hypotheses without capture evidence. The earlier seed-skip/invalidation theory depended on treating
+source 119 as an in-place pass over one address; exact resource inspection disproved that premise:
+its sampled binding 14 and write-only storage binding 23 are different surfaces, and binding 23 was
+already zero before guest packing/writeback.
 
 ## Route and timing (Linux, hardware Vulkan, RADV, 1920x1080)
 
@@ -55,7 +46,26 @@ PROSPER_RENDER=1`. No input is needed to reach the menu.
 | 159–180 s | profile-select menu slides in from the left at ~75 px/s |
 | **183 s onward** | **settled.** Byte-identical for the next 57 s (`crc32=453d400c`, 107,936 distinct colours, 670,815 non-black px). |
 
-The settled frame is the one in `assets/screenshots/syberia-profile.png`.
+That table records the pre-fix black-layer baseline. The current profile screenshot and live
+validation are below.
+
+## Live validation of source-101 recovery — 2026-08-03
+
+A bounded Linux `screenshot` run used the default render path with no RTT, resource-hash, capture or
+shader-debug diagnostics. It rendered every submit, suppressed ordinary frame dumps, used a 180 s
+capture warmup, then retained nine samples five seconds apart. The first two raw-scanout samples at
+t=180/185 s were black; every composited sample from t=190.0 through 222.7 s contained the full-width
+3D scene behind the profile UI:
+
+- all seven composited samples contain exactly **2,063,996 non-black pixels** of 2,073,600;
+- distinct colours stay between **139,946 and 144,452** while `frame_seq` advances 1 → 43;
+- every composited CRC differs, consistent with the scene's animated light/fog rather than a stale
+  plateau; and
+- the direct t=201.1 s frontend capture is `assets/screenshots/syberia-profile.png`.
+
+This is a visible improvement over the recorded unmodified baseline (670,815 non-black pixels and a
+black right ~55%), but not correctness: the restored HDR scene is substantially overexposed. The
+title therefore remains rung 3 and the exposure/gameplay-composite work remains open.
 
 `scripts/syberia/reach-gameplay.pad` continues from there. It is **validated by the run that produced
 `assets/screenshots/syberia-title.png` and `assets/screenshots/syberia-gameplay.png`** — do not change
@@ -69,19 +79,18 @@ it without re-running:
 | ~312 s onward | **gameplay** — Kate Walker in the factory hall, the "Leave" interaction prompt, the "Use the left stick to move" tutorial, the pause HUD (≈46,000–48,000 colours, 2,068,000+ non-black px, i.e. 99.7% of the frame) |
 
 Gameplay composition is **degraded**: a translucent ghost of another scene is blended over the middle
-of the frame and the image is over-dark. That is a second symptom on #1619 and is probably the same
-post-process/RTT family as the menu, but it has **not** been localized — treat it as a separate
-question until a capture says otherwise.
+of the frame and the image is over-dark. It is tracked separately on #1627 and has **not** been
+localized; there is no evidence yet that it shares the profile menu's exposure mechanism.
 
-## The "right ~55% is black" question — answered
+## The former "right ~55% is black" question — localized and fixed
 
-**It is a defect, not art direction, and it is not a scissor/viewport clip.** The whole **3D scene
-layer** of the menu is black; the UI layer (leather panel, boarding passes, copyright) survives and
-happens to occupy only the left 45%.
+Before source-101 support, this was **a defect, not art direction, and not a scissor/viewport clip.**
+The whole **3D scene layer** of the menu was black; the UI layer (leather panel, boarding passes,
+copyright) survived and happened to occupy only the left 45%.
 
 The hypotheses falsified along the way are listed in `## Ruled out` above.
 
-### The pass chain in one settled frame
+### The pass chain in one pre-fix settled frame
 
 Recorded as one 1920x1080 submit (`submit=2611`, 472 draws, 81 computes, 607 operations, 54
 unrealized):
@@ -94,19 +103,45 @@ draws 208..408  more shadow/depth   (target=0)
 draw  409       clear               -> 0x2110310000
 draws 415..462  lighting/HDR        -> 0x210fa50000  (+ bloom pyramid 0x2139520000/0x2110bd0000/0x210d710000)
 draws 464..465  lit composite       -> 0x2110310000   <-- SCENE IS CORRECT HERE
-compute[79]     code=0x2134c14100   -> 0x2110310000   <-- CONTENT LOST HERE
-draw  469       tonemap             -> 0x2112bd0000   (uniform black)
+operation 570   source 101          -> 0x21159d0000   <-- UNREALIZED: REQUIRED POST-PROCESS INPUT
+operation 571   source 102          reads missing input and produces zero bloom/downsample data
+...
+operation 588   source 119          samples 0x21159d0000 + bloom, writes 0x2110310000 (zero)
+operation 589   draw 469            -> 0x2112bd0000   (uniform black)
 draw  470       full-screen composite of 0x2112bd0000 -> 0x2117810000 (scanout) — black
 draws 472..485  UI: leather panel, boarding passes, copyright — the only visible layer
 ```
 
-### Where the scene dies, exactly
+### Where the scene died, exactly
 
 `gpu_replay --through-operation 558` renders `target=0000002110310000` and shows the **complete lit
 interior with volumetric light shafts** — 2,066,070 non-black pixels of 2,073,600. The scene is
 produced correctly.
 
-Then, in `PROSPER_RTTLOG=1` order:
+The decisive missing link occurs earlier. Operation 570 is source 101, raw program
+`0x2111a3af00` (hash `abef7b52fb82e741`), launched as 1920x1088 threads. Its inputs include the
+correct lit `0x2110310000` target and an earlier nonzero post-process surface; its storage output is
+binding 14/15 at `0x21159d0000`. Recompilation rejects at pc 73:
+
+```
+pc 67  v_cmp_ge_f32 s[16:17], s26, v12
+pc 69  v_cmp_lt_f32 s[18:19], v12, v13
+pc 71  v_cmp_gt_f32 vcc, v11, v14
+pc 72  s_and_b64 s[20:21], s[18:19], vcc
+pc 73  s_cmp_lg_u64 exec, s[16:17]       <-- first reject
+pc 74  s_cbranch_scc0 344
+...
+pc 96  s_cmp_lg_u64 exec, s[20:21]
+```
+
+Operation 571/source 102 immediately consumes binding 14 and produces zero bloom/downsample data.
+Operation 588/source 119 (`f32339c9098f6b4a`) then samples binding 14 plus those downstream inputs
+and has one storage output, binding 23 at `0x2110310000`. Exact SPIR-V dataflow reaches the sole
+`OpImageWrite` from binding 14 and the other samples. Binding 23's raw output is already all-zero
+before packing, so guest conversion/writeback is not what creates the black pixels.
+
+The older `PROSPER_RTTLOG=1` trace remains useful as localization for the diagnostic CPU-readback
+path:
 
 ```
 [rtt] pass target=0x2110310000 extent=1920x1080 (2 draws) px_nonzero=8279562 rgb_nonblack=2066070 cache_size=19
@@ -125,18 +160,11 @@ and with `PROSPER_RESOURCE_HASH_DIM=1920x1080`:
 [target-version]   target=0x2112bd0000 draws=469-469 hash=0f7752776a1bc383          (uniform black)
 ```
 
-Between the producing pass and the consuming draw, the RTT cache **loses the entry**
-(`cache_size` 19 -> 18) and the consumer falls back to the guest backing, which prosper never wrote.
-
-The operation in between is **`compute[79]`, `code=0x2134c14100`, order `1455519`, groups
-240x135x1 local 8x8x1 (= 1920x1080)**. It binds `0x2110310000` both as a sampled texture
-(`CS TEX b=5/9/11/12/14`) and as a **writable storage image** (`CS STORAGE b=23`), and
-`[seed-skip-verify] code=0x2134c14100 binding=23 texels=2073600 … full-coverage` proves it
-rewrites every texel. That storage write is reported as a guest GPU write, and
-`invalidate_cpu_rtt_guest_write` (`frontends/shared/live_renderer.cpp:152`) **erases** the RTT
-cache entry on a `color_plane` overlap.
-
-Draw 469 (order `1455541`) is the next consumer and reads black.
+That trace proves content exists before the post-process chain and draw 469 receives black on the
+CPU-readback route. Its cache miss is real for that route, but it does not identify the default-path
+cause. In particular, source 119 does **not** sample and store the same `0x2110310000` surface: the
+old report conflated sampled binding 14 (`0x21159d0000`) with storage binding 23
+(`0x2110310000`).
 
 ### Narrowed: `R11G11B10F` is missing from the compute write-back notifier — real defect, **not this frame's mechanism**
 
@@ -181,9 +209,10 @@ republishes the RTT entry and that the following sample reads the written pixels
 on current master while the RGBA8/RGBA16F equivalents pass, so the test proves the format gap rather
 than the general path.
 
-**Not yet done:** an A/B proving the frame composites correctly with the notifier fixed.
+The routed notifier-only A/B was later run and left the frame byte-identical; that falsification is
+recorded in `## Ruled out` above.
 
-### Earlier, broader framing (now the less likely of the two)
+### Earlier CPU-readback framing (historical, not the default-path diagnosis)
 
 > A renderer-owned colour target that a **compute** dispatch reads must be materialized from the
 > renderer's own copy before the dispatch runs. Today the graphics pass leaves the pixels only in the
@@ -192,15 +221,12 @@ than the general path.
 > storage-write notification then erases the renderer's good copy, so every later consumer is black
 > too.
 
-What is proven: the surface has content before `compute[79]`, and is black for the draw after it.
-What is **not** proven: that `compute[79]`'s *read* of `0x2110310000` resolves to guest bytes rather
-than the renderer's copy. Confirm that first — a wrongly-scoped invalidation and a missing
-graphics->compute handoff produce the same symptom and need different fixes.
+The CPU-readback trace did establish its endpoints, but exact source-119 resources disprove the
+in-place premise above: source 119 samples `0x21159d0000` and writes a distinct `0x2110310000`
+surface. Keep this section only as history for why the RTT cache was investigated; do not use it as
+the current default-path diagnosis.
 
-Note that a `graphics -> compute -> graphics` in-place post-process on one surface is a common
-engine pattern, so whichever of the two it is, the fix is shared infrastructure, not title-specific.
-
-## Separately: real recompiler gaps in the same frame
+## Causal and remaining recompiler gaps in the same frame
 
 Ten dispatches fail with `reason=shader-recompile` (`gpu_replay --inspect-only`). Per `CLAUDE.md`
 these are FATAL gaps, not acceptable skips. First-reject sites:
@@ -218,8 +244,14 @@ these are FATAL gaps, not acceptable skips. First-reject sites:
 A full boot also logs 13 distinct `[compute] skip unsupported program` addresses. Remember that line
 is deduped per `code_addr`: one line means "failed at least once", not "always fails".
 
-These are **not** the cause of the black scene — the composite is already correct at draw 465, after
-all of them have been skipped — but they are real work.
+The last row is causally connected to the former black scene. Operation 570/source 101 is the only
+intended producer of binding 14 at `0x21159d0000` in this chain: it samples the correct lit
+`0x2110310000` target, but rejecting pc 73 leaves binding 14 absent/zero. Operation 571/source 102
+immediately consumes that missing input, and operation 588/source 119 later consumes binding 14 and
+the derived bloom inputs before writing a zero binding 23 for draw 469. Supporting the exact
+Wave64 mask comparison recompiles the exact retained source with all 14 captured resources and an
+accepted descriptor contract, and the live run restores the layer. The remaining overexposure and
+other recompiler gaps remain real but are not localized here.
 
 ## Other observations
 
@@ -256,6 +288,6 @@ report different surfaces (see the instrument list in `GAME_COMPAT_ORCHESTRATION
 
 **Instrument warning.** `PROSPER_RESOURCE_HASH_DIM`, `PROSPER_RTTLOG`, `PROSPER_GPU_CAPTURE` and
 several other diagnostics all clear `live_gpu_targets` (`live_renderer.cpp:933`), forcing the CPU
-readback RTT path. The black scene reproduces both with and without them — the settled frame is black
-in an ordinary `screenshot` run with no capture environment at all — but never compare a diagnostic
-run against a default run without accounting for this.
+readback RTT path. The former black scene reproduced both with and without them — the pre-fix settled
+frame was black in an ordinary `screenshot` run with no capture environment at all — but never
+compare a diagnostic run against a default run without accounting for this.

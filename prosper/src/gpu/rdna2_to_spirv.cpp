@@ -11125,6 +11125,30 @@ bool emit_cfg_state_machine(
                           : in.opcode == 0x09;                // 0 >= mask
     };
 
+    // Syberia's fullscreen compute pass compares EXEC with a mask written by an explicit Wave64
+    // VOPC destination (`s_cmp_lg_u64 exec,s[16:17]`).  Both values live only in the per-lane Bool
+    // domain, so their scalar inequality is exactly ANY(EXEC xor saved_mask) over the guest wave.
+    // Keep this deliberately narrower than a general B64 comparison: one operand must be the
+    // architectural EXEC pair and the other an ordinary saved-mask SGPR pair whose live RegState
+    // value is checked while emitting the dispatcher case.
+    auto exec_saved_mask_compare_source = [&](const Rdna2Inst& in) -> int {
+        if (!b.is_compute || b.wave_size != 64 || in.fmt != Rdna2Format::SOPC ||
+            (in.opcode != 0x12 && in.opcode != 0x13))
+            return -1;
+        auto is_exec = [](const Operand& operand) {
+            return (operand.kind == OperandKind::SGPR ||
+                    operand.kind == OperandKind::Special) &&
+                   operand.value == 126;
+        };
+        auto saved_mask = [](const Operand& operand) {
+            return operand.kind == OperandKind::SGPR &&
+                   operand.value >= 0 && operand.value <= 105;
+        };
+        if (is_exec(in.src[0]) && saved_mask(in.src[1])) return in.src[1].value;
+        if (saved_mask(in.src[0]) && is_exec(in.src[1])) return in.src[0].value;
+        return -1;
+    };
+
     // VOPC e64 can compare a complete 64-bit scalar mask as integer data. Generated Wave64 code
     // uses `v_cmp_gt_u64 vcc,vcc,0` to broadcast (old VCC != 0) back into every active VCC lane.
     // The per-invocation mask representation has no 64-bit scalar payload, but the comparison is
@@ -11279,6 +11303,11 @@ bool emit_cfg_state_machine(
                 start_set.insert(ins[i + 1].pc);
         }
         if (mask_zero_compare_candidate_source(in) >= 0) {
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (exec_saved_mask_compare_source(in) >= 0) {
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -11715,6 +11744,121 @@ bool emit_cfg_state_machine(
                 if (reg <= 105) static_mask_keys.insert(reg);
     }
 
+    // Wave64 dispatcher Bool variables hold values, not lifetime tags. A scalar overwrite stores
+    // false for a dead mask, and an unfiltered load at a later case can therefore make mere map
+    // membership look like a valid saved mask. Prove the B64 mask domain separately at every
+    // EXEC-vs-saved-mask comparison: mask producers generate the fact, every overlapping half/pair
+    // scalar write kills it, and joins retain it only when all reachable predecessors agree.
+    std::unordered_set<uint32_t> proven_exec_saved_mask_compare_pcs;
+    if (b.is_compute && b.wave_size == 64 && !starts.empty()) {
+        std::vector<std::set<int>> wave64_b64_mask_in(starts.size());
+        std::vector<bool> wave64_b64_reachable(starts.size(), false);
+        for (const auto& mask : initial.sreg_bool)
+            if (!initial.sreg_bool_b32.contains(mask.first) && mask.first <= 105)
+                wave64_b64_mask_in.front().insert(mask.first);
+        if (initial.vcc) wave64_b64_mask_in.front().insert(106);
+        wave64_b64_reachable.front() = true;
+
+        auto advance_wave64_b64_masks = [&](std::set<int>& masks, const Rdna2Inst& in,
+                                            bool record_compare) {
+            const int compare_source = exec_saved_mask_compare_source(in);
+            if (record_compare && compare_source >= 0 && masks.contains(compare_source))
+                proven_exec_saved_mask_compare_pcs.insert(in.pc);
+
+            auto source_is_mask = [&](const Operand& source) {
+                if (source.kind == OperandKind::InlineInt) return true;
+                if (source.kind != OperandKind::SGPR &&
+                    source.kind != OperandKind::Special)
+                    return false;
+                if (source.value == 126 || source.value == 127) return true;
+                return masks.contains(source.value);
+            };
+
+            int mask_write = -1;
+            if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) {
+                mask_write = in.dst.kind == OperandKind::SGPR && in.dst.value <= 105
+                    ? in.dst.value : 106;
+            } else if (in.fmt == Rdna2Format::SOP1 && in.dst.value <= 107) {
+                if ((in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a) &&
+                    source_is_mask(in.src[0]))
+                    mask_write = in.dst.value;
+                else if ((in.opcode >= 0x24 && in.opcode <= 0x2b) ||
+                         in.opcode == 0x37 || in.opcode == 0x38)
+                    mask_write = in.dst.value;
+            } else if (in.fmt == Rdna2Format::SOP2 && in.dst.value <= 107) {
+                if (in.opcode == 0x25)
+                    mask_write = in.dst.value;
+                else if ((in.opcode == 0x0b ||
+                          (in.opcode >= 0x0f && in.opcode <= 0x1d &&
+                           (in.opcode & 1u) == 1)) &&
+                         source_is_mask(in.src[0]) && source_is_mask(in.src[1]))
+                    mask_write = in.dst.value;
+            } else if (in.fmt == Rdna2Format::VOP3 &&
+                       in.sdst.kind == OperandKind::SGPR && in.sdst.value <= 107) {
+                mask_write = in.sdst.value;
+            }
+
+            auto erase_overlapping = [&](int base, uint32_t width) {
+                for (auto it = masks.begin(); it != masks.end();) {
+                    const int mask_base = *it;
+                    if (base < mask_base + 2 &&
+                        mask_base < base + static_cast<int>(width))
+                        it = masks.erase(it);
+                    else
+                        ++it;
+                }
+            };
+            for_each_scalar_write(in, erase_overlapping, /*wave32_one_word_masks*/false);
+            // An implicit VOPC destination is architectural VCC and is absent from the explicit
+            // scalar-writer inventory.
+            if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+                !(in.dst.kind == OperandKind::SGPR && in.dst.value <= 105))
+                erase_overlapping(106, 2);
+            if (mask_write >= 0) masks.insert(mask_write);
+        };
+
+        std::vector<uint32_t> pending{0};
+        while (!pending.empty()) {
+            const uint32_t block = pending.back();
+            pending.pop_back();
+            std::set<int> masks = wave64_b64_mask_in[block];
+            const uint32_t lo = starts[block];
+            const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
+            for (const auto& in : ins) {
+                if (in.pc < lo || in.pc >= hi || in.is_end) continue;
+                advance_wave64_b64_masks(masks, in, /*record_compare*/false);
+            }
+            for (uint32_t successor : successors[block]) {
+                if (!wave64_b64_reachable[successor]) {
+                    wave64_b64_reachable[successor] = true;
+                    wave64_b64_mask_in[successor] = masks;
+                    pending.push_back(successor);
+                    continue;
+                }
+                std::set<int> joined;
+                std::set_intersection(
+                    wave64_b64_mask_in[successor].begin(),
+                    wave64_b64_mask_in[successor].end(),
+                    masks.begin(), masks.end(),
+                    std::inserter(joined, joined.end()));
+                if (joined != wave64_b64_mask_in[successor]) {
+                    wave64_b64_mask_in[successor] = std::move(joined);
+                    pending.push_back(successor);
+                }
+            }
+        }
+        for (uint32_t block = 0; block < starts.size(); ++block) {
+            if (!wave64_b64_reachable[block]) continue;
+            std::set<int> masks = wave64_b64_mask_in[block];
+            const uint32_t lo = starts[block];
+            const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
+            for (const auto& in : ins) {
+                if (in.pc < lo || in.pc >= hi || in.is_end) continue;
+                advance_wave64_b64_masks(masks, in, /*record_compare*/true);
+            }
+        }
+    }
+
     std::vector<std::unordered_set<int>> scalar_may_write_in(starts.size());
     std::vector<bool> scalar_reachable(starts.size(), false);
     if (!scalar_may_write_in.empty()) {
@@ -11763,6 +11907,7 @@ bool emit_cfg_state_machine(
                 mbcnt_event_for_pc.contains(in.pc) || append_event_for_pc.contains(in.pc) ||
                 swizzle_pcs.contains(in.pc) ||
                 mask_zero_compare_candidate_source(in) >= 0 ||
+                exec_saved_mask_compare_source(in) >= 0 ||
                 vopc_mask_zero_compare_source(in) >= 0 ||
                 b64_mask_scc_vote_pcs.contains(in.pc);
             conditional_block[block] = conditional_block[block] ||
@@ -12157,6 +12302,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* append = nullptr;
         const Rdna2Inst* swizzle = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
+        const Rdna2Inst* exec_saved_mask_compare = nullptr;
         const Rdna2Inst* vopc_mask_compare = nullptr;
         const Rdna2Inst* b64_mask_scc_vote = nullptr;
         const uint32_t final_block = dispatch_blocks[dispatch].back();
@@ -12171,6 +12317,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_append = nullptr;
             const Rdna2Inst* block_swizzle = nullptr;
             const Rdna2Inst* block_mask_compare = nullptr;
+            const Rdna2Inst* block_exec_saved_mask_compare = nullptr;
             const Rdna2Inst* block_vopc_mask_compare = nullptr;
             const Rdna2Inst* block_b64_mask_scc_vote = nullptr;
             for (const auto& in : ins) {
@@ -12201,6 +12348,19 @@ bool emit_cfg_state_machine(
                                      "[compute-mask-compare] pc=%u source=s%d op=0x%x\n",
                                      in.pc, mask_compare_source, in.opcode);
                     block_mask_compare = &in;
+                    break;
+                }
+                const int exec_saved_mask_source =
+                    exec_saved_mask_compare_source(in);
+                if (exec_saved_mask_source >= 0 &&
+                    proven_exec_saved_mask_compare_pcs.contains(in.pc) &&
+                    state.sreg_bool.contains(exec_saved_mask_source)) {
+                    if (getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[compute-exec-saved-mask-compare] "
+                                     "pc=%u source=s%d op=0x%x\n",
+                                     in.pc, exec_saved_mask_source, in.opcode);
+                    block_exec_saved_mask_compare = &in;
                     break;
                 }
                 const int vopc_mask_compare_source =
@@ -12247,7 +12407,8 @@ bool emit_cfg_state_machine(
             if (!last) {
                 // Group construction admits only one-successor plain blocks before the tail.
                 if (block_mbcnt || block_append || block_swizzle || block_mask_compare ||
-                    block_vopc_mask_compare || block_b64_mask_scc_vote ||
+                    block_exec_saved_mask_compare || block_vopc_mask_compare ||
+                    block_b64_mask_scc_vote ||
                     (block_terminator && (block_terminator->is_end ||
                                           block_terminator->opcode != 0x02)))
                     return reject_cfg(starts[block], "invalid-fused-block");
@@ -12258,6 +12419,7 @@ bool emit_cfg_state_machine(
             append = block_append;
             swizzle = block_swizzle;
             mask_compare = block_mask_compare;
+            exec_saved_mask_compare = block_exec_saved_mask_compare;
             vopc_mask_compare = block_vopc_mask_compare;
             b64_mask_scc_vote = block_b64_mask_scc_vote;
         }
@@ -12381,6 +12543,30 @@ bool emit_cfg_state_machine(
                 b.store_function(vote_to_scc_var, yes);
             }
         }
+        if (exec_saved_mask_compare) {
+            const int source =
+                exec_saved_mask_compare_source(*exec_saved_mask_compare);
+            const auto saved_mask = state.sreg_bool.find(source);
+            if (saved_mask == state.sreg_bool.end())
+                return reject_cfg(exec_saved_mask_compare->pc,
+                                  "missing-exec-saved-mask-compare-source");
+            const uint32_t mismatch = b.bsel(
+                state.exec, b.logical_not(saved_mask->second), saved_mask->second);
+            if (b.native_subgroup_size) {
+                const uint32_t different = b.native_wave_any(mismatch);
+                if (!different)
+                    return reject_cfg(exec_saved_mask_compare->pc,
+                                      "exec-saved-mask-vote");
+                state.scc = exec_saved_mask_compare->opcode == 0x12
+                    ? b.logical_not(different) : different;
+            } else {
+                b.store_function(vote_pending_var, yes);
+                b.store_function(vote_value_var, mismatch);
+                b.store_function(vote_invert_var,
+                    exec_saved_mask_compare->opcode == 0x12 ? yes : no);
+                b.store_function(vote_to_scc_var, yes);
+            }
+        }
         if (vopc_mask_compare) {
             if (b.is_vertex) {
                 if (getenv("PROSPER_DBG"))
@@ -12458,6 +12644,11 @@ bool emit_cfg_state_machine(
         } else if (mask_compare) {
             if (!set_next(mask_compare->pc + mask_compare->len_dwords))
                 return reject_cfg(mask_compare->pc, "mask-compare-successor");
+        } else if (exec_saved_mask_compare) {
+            if (!set_next(exec_saved_mask_compare->pc +
+                          exec_saved_mask_compare->len_dwords))
+                return reject_cfg(exec_saved_mask_compare->pc,
+                                  "exec-saved-mask-compare-successor");
         } else if (vopc_mask_compare) {
             if (!set_next(vopc_mask_compare->pc + vopc_mask_compare->len_dwords))
                 return reject_cfg(vopc_mask_compare->pc,
