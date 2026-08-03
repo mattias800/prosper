@@ -238,16 +238,33 @@ instrument trap 63 in `GAME_COMPAT_ORCHESTRATION.md`.
   180 operation 4 as the last semantic writer of submit 181 operation 4's same run-local `0x2033b10000`
   target; later `MODE=RESOLVE` operations read that color0 surface and write color1 rather than overwriting
   it. Submit 181's exact temporal seed is uniformly black and byte-identical to submit 180's pre-submit
-  seed, so the included previous frame introduced no useful color. This does not yet distinguish operation
-  4 actively writing black from producing no fragments and preserving an already-black target. #1599.
+  seed, so the included previous frame introduced no useful color. #1599.
+- **Operation 4 preserves an old black target because it produces no fragments:** a query-capped prefix
+  replay retained both primitives after clipping, counted 519,120 fragment invocations, and counted exactly
+  2,073,600 passed samples, one for every target pixel. Replacing only draw 0 PS binding 32 with a finite
+  color made all 2,073,600 output pixels that color while leaving the same draw counts. The draw actively
+  shades and writes the complete target from that constant. #1599.
+- **Draw 0's zero PS binding 32 is introduced after the draw, omitted by capture, or written by earlier
+  work in the same submit:** capture v45 sampled the exact 128-byte resource both at draw 0's ordered
+  realization point and after submit 181. Both reads were complete and all zero, with the same
+  `306c537b2ff38983` content hash (`verdict=full-equal`); the ordinary resource blob independently reports
+  `declared=128`, `footprint=128`, `captured=128`, and `nz=0`. Operations 0-3 are the only preceding work
+  and are compute dispatches. Their reflected writable ranges are disjoint from
+  `[0x20122d32f0,0x20122d3370)`; the nearest preceding descriptor is instead a read-only 16-byte constant
+  ending 32 bytes before it. The submit contains no DMA operation, and the resolve-aware dependency graph
+  independently reports the selected range as `first=4 future-writer=-1`. The zero therefore exists before
+  any captured GPU work can produce the composite and remains unchanged for the rest of the submit. The
+  run-local address must be re-derived in future runs. #1599, #1850.
 - **A renderer-disabled title boot as a GPU-free experiment:** live compute remains active without
   `PROSPER_RENDER` and initializes Vulkan when the title dispatches supported compute.
 
 ## Next discriminators
 
-1. Separate operation 4 actively writing black from producing no fragments and preserving its black
-   input. The consecutive-frame capture includes its previous semantic writer and exact boundary pixels,
-   but pixel equality alone cannot distinguish those two mechanisms.
+1. Distinguish a guest-programmed zero constant from a wrong resource identity: retain the raw PS user-data
+   dwords and descriptor provenance that select draw 0 binding 32, then prove whether the run-local address
+   matches what the guest programmed. If it does, trace the last guest CPU writer before submit 181 with a
+   cross-thread-capable watch and a positive control; the captured GPU operation graph has already closed
+   every in-submit writer.
 2. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
    dispatch ran and reproduces its device loss; two failures in six runs are not a stable cause.
 3. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
