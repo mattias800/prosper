@@ -43,6 +43,38 @@ guest pitch while retaining their historical tight byte span.
 The `vs=` and `fs=` summaries identify whether each recompiled shader is retained as `owned` or
 `shared`; their size and hash always describe the accessor-selected words the renderer consumes.
 
+## Draw-time resource provenance
+
+Set `PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE=DRAW:vs|ps:BINDING` while taking a capsule with
+`PROSPER_GPU_CAPTURE` or F9 to retain one resource at two independently observed times. `DRAW` is
+the semantic draw ID printed as `draw[ID]` by `--inspect-only`, `vs`/`ps` selects the stage, and
+`BINDING` is the binding printed in that stage's resource table. Numbers use the same strict base-0
+syntax as the other diagnostic selectors, so decimal and `0x` hexadecimal are accepted but signs,
+trailing text, and values outside their field widths are rejected.
+
+The selector must match exactly one realized resource. A zero match, duplicate draw identity, or
+duplicate binding fails the capture visibly instead of producing ambiguous evidence. With the
+variable unset, capture performs no extra resource-table walk, allocation, or byte copy.
+
+The first sample is taken at the selected draw's ordered realization point: earlier in-submit
+producers have completed, while the renderer and later work have not run. The ordinary resource
+blob is read independently after submit execution. Capture v45 records the descriptor identity,
+requested span, each sample's readable byte count, payload, and content hash. This distinguishes
+guest-authored zero bytes from an unreadable zero-filled suffix and answers whether a buffer was
+already zero when the draw consumed it or changed later in the submit.
+
+`--inspect-only` prints one `resource-provenance` line with `realization-read`, `post-read`, both
+hashes, and one of these verdicts:
+
+- `short-read`: at least one sample did not read the complete requested span; do not compare its
+  zero-filled suffix as guest data.
+- `full-equal`: both complete samples have the same content hash.
+- `full-changed`: both complete samples differ between draw realization and post-submit capture.
+
+For example, `PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE=77:ps:32` audits fragment binding 32 of
+semantic draw 77. The selector is observational: it never substitutes resource bytes or changes
+what replay binds.
+
 Build from `prosper/`, using the worktree-local Linux build:
 
 ```bash

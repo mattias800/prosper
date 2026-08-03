@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace prosper::gpu {
@@ -27,6 +28,8 @@ inline constexpr const char* kGpuReplayScanoutAddressEnv =
     "PROSPER_GPU_REPLAY_SCANOUT_ADDR";
 inline constexpr const char* kGpuCaptureSave0Env = "PROSPER_SAVE0";
 inline constexpr const char* kGpuCaptureDefaultSave0Root = "/tmp/prosper-savedata0";
+inline constexpr const char* kGpuCaptureResourceProvenanceEnv =
+    "PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE";
 
 // Preserve the exact registered front-buffer identity as replay metadata. The replay process has no
 // live VideoOut registry, so extent alone cannot distinguish scanout from same-sized intermediates.
@@ -45,6 +48,32 @@ struct GpuCaptureBlob {
     uint64_t bytes_read = 0;
     uint64_t content_hash = 0;
     std::vector<uint8_t> bytes;
+};
+
+// An opt-in temporal audit for one realized graphics resource. The decoded identity is fixed when
+// the draw is realized; the two blob references retain bytes sampled at that point and by ordinary
+// deferred capture materialization after the submit. Keeping both reads makes a zero-filled short
+// read distinguishable from guest-visible zero data and exposes resource reuse after realization.
+struct GpuCaptureResourceSelector {
+    uint64_t draw_index = 0;
+    ShaderProgramStage stage = ShaderProgramStage::Vertex;
+    uint32_t binding = 0;
+};
+
+struct GpuCaptureResourceProvenance {
+    uint64_t draw_index = 0;
+    ShaderProgramStage stage = ShaderProgramStage::Vertex;
+    uint32_t binding = 0;
+    ResourceClass resource_class = ResourceClass::ConstantBuffer;
+    uint64_t guest_addr = 0;
+    uint64_t requested_bytes = 0;
+    uint32_t srt_offset = 0xFFFFFFFFu;
+    uint32_t sgpr_base = 0xFFFFFFFFu;
+    uint32_t realization_blob_index = 0xFFFFFFFFu;
+    uint32_t post_blob_index = 0xFFFFFFFFu;
+    uint64_t post_blob_offset = 0;
+    uint64_t realization_content_hash = 0;
+    uint64_t post_content_hash = 0;
 };
 
 struct GpuCaptureShaderVersion {
@@ -259,6 +288,7 @@ struct GpuCaptureFile {
     std::vector<GpuCapturedDmaCopy> dma_copies;
     std::vector<GpuCapturedOperation> operations;
     std::vector<GpuCapturedOperationFailure> failure_diagnostics;
+    std::vector<GpuCaptureResourceProvenance> resource_provenance;
     bool failure_diagnostics_available = false;
     bool expected_output_valid = false;
     uint64_t expected_output_hash = 0;
@@ -320,6 +350,7 @@ struct GpuReplayFrame {
     std::vector<GpuCapturedOperation> operations;
     std::vector<GpuCaptureRawShaderVersion> raw_shader_versions;
     std::vector<GpuCapturedOperationFailure> failure_diagnostics;
+    std::vector<GpuCaptureResourceProvenance> resource_provenance;
     bool failure_diagnostics_available = false;
     bool expected_output_valid = false;
     uint64_t expected_output_hash = 0;
@@ -389,7 +420,18 @@ struct PendingGpuCapture {
     // post-producer operation realization during finish.
     std::vector<MemorySnapshot> pre_submit_memory;
     std::vector<uint8_t> pre_submit_compute_gds;
+    bool resource_provenance_armed = false;
+    GpuCaptureResourceSelector resource_provenance_selector;
+    uint32_t resource_provenance_matches = 0;
+    std::string resource_provenance_error;
+    GpuCaptureResourceProvenance resource_provenance;
+    GpuCaptureBlob resource_provenance_realization_blob;
 };
+bool parse_gpu_capture_resource_selector(std::string_view text,
+                                         GpuCaptureResourceSelector& selector);
+void snapshot_pending_gpu_capture_draw_resource(
+    PendingGpuCapture* pending, const DrawItem& draw,
+    const CaptureMemoryReader& reader = {});
 void snapshot_pending_gpu_capture_compute_gds(PendingGpuCapture* pending,
                                               const uint8_t* data, size_t bytes);
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(

@@ -8,6 +8,7 @@
 
 #include <mutex>
 #include "bc_decode.hpp"
+#include "diagnostic_selectors.hpp"
 #include "build_revision.hpp"
 #include "guest_texture_layout.hpp"
 #include "rdna2_decode.hpp"
@@ -103,7 +104,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v44: retain each resource's guest sample count. 2D_MSAA image_load is materialized as host array
 // layers, so replay must not collapse four guest sample planes to the historical single-layer default.
 // The append-only tail covers realized draw/compute and failed-stage tables; v1-v43 default to one.
-constexpr uint32_t kVersion = 44;
+// v45 (#1849): retain one opt-in draw-time resource sample and its independently captured post-submit
+// span. The append-only record references ordinary blobs so both read counts, bytes, and hashes remain
+// auditable offline; captures without the selector append only a zero count and copy no extra bytes.
+constexpr uint32_t kVersion = 45;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -965,6 +969,66 @@ bool validate_dma_copies(const GpuCaptureFile& capture, std::string& error) {
         referenced.end()) {
         error = "ordered DMA record must have exactly one operation";
         return false;
+    }
+    return true;
+}
+
+bool validate_resource_provenance(const GpuCaptureFile& capture, std::string& error) {
+    if (capture.resource_provenance.size() > 1) {
+        error = "invalid resource provenance record count";
+        return false;
+    }
+    for (const auto& provenance : capture.resource_provenance) {
+        if ((provenance.stage != ShaderProgramStage::Vertex &&
+             provenance.stage != ShaderProgramStage::Fragment) ||
+            static_cast<uint32_t>(provenance.resource_class) >
+                static_cast<uint32_t>(ResourceClass::StorageImage) ||
+            !provenance.guest_addr || !provenance.requested_bytes ||
+            provenance.requested_bytes > kMaxBlobBytes ||
+            provenance.realization_blob_index >= capture.blobs.size() ||
+            provenance.post_blob_index >= capture.blobs.size()) {
+            error = "invalid resource provenance identity";
+            return false;
+        }
+        const auto& realization = capture.blobs[provenance.realization_blob_index];
+        const auto& post = capture.blobs[provenance.post_blob_index];
+        if (realization.guest_addr != provenance.guest_addr ||
+            realization.bytes.size() != provenance.requested_bytes ||
+            realization.content_hash != provenance.realization_content_hash ||
+            provenance.post_blob_offset > post.bytes.size() ||
+            provenance.requested_bytes > post.bytes.size() - provenance.post_blob_offset ||
+            gpu_capture_hash(post.bytes.data() + provenance.post_blob_offset,
+                             static_cast<size_t>(provenance.requested_bytes)) !=
+                provenance.post_content_hash) {
+            error = "invalid resource provenance blob reference";
+            return false;
+        }
+
+        const GpuCapturedResource* captured_resource = nullptr;
+        for (const auto& draw : capture.draws) {
+            if (draw.draw_index != provenance.draw_index) continue;
+            const auto& table = provenance.stage == ShaderProgramStage::Vertex
+                ? draw.vrt : draw.prt;
+            for (const auto& resource : table.resources) {
+                if (resource.resource.binding != provenance.binding) continue;
+                if (captured_resource) {
+                    error = "ambiguous resource provenance identity";
+                    return false;
+                }
+                captured_resource = &resource;
+            }
+        }
+        if (!captured_resource ||
+            captured_resource->resource.cls != provenance.resource_class ||
+            captured_resource->resource.gpu_addr != provenance.guest_addr ||
+            captured_resource->captured_size != provenance.requested_bytes ||
+            captured_resource->resource.srt_offset != provenance.srt_offset ||
+            captured_resource->resource.sgpr_base != provenance.sgpr_base ||
+            captured_resource->blob_index != provenance.post_blob_index ||
+            captured_resource->blob_offset != provenance.post_blob_offset) {
+            error = "resource provenance does not match its captured descriptor";
+            return false;
+        }
     }
     return true;
 }
@@ -2356,6 +2420,25 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             if (!write_sample_counts(stage.resource_table)) {
                 error = "invalid resource sample count"; return false;
             }
+    // v45 appends at most one explicitly selected temporal resource audit. Both samples are ordinary
+    // capture blobs, so their independent bytes_read fields and payload hashes remain self-contained.
+    if (!validate_resource_provenance(c, error)) return false;
+    w.u32(static_cast<uint32_t>(c.resource_provenance.size()));
+    for (const auto& provenance : c.resource_provenance) {
+        w.u64(provenance.draw_index);
+        w.u8(static_cast<uint8_t>(provenance.stage));
+        w.u32(provenance.binding);
+        w.u32(static_cast<uint32_t>(provenance.resource_class));
+        w.u64(provenance.guest_addr);
+        w.u64(provenance.requested_bytes);
+        w.u32(provenance.srt_offset);
+        w.u32(provenance.sgpr_base);
+        w.u32(provenance.realization_blob_index);
+        w.u32(provenance.post_blob_index);
+        w.u64(provenance.post_blob_offset);
+        w.u64(provenance.realization_content_hash);
+        w.u64(provenance.post_content_hash);
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -3409,6 +3492,31 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 error = "invalid resource DCC metadata reference"; return false;
             }
     }
+    if (version >= 45) {
+        uint32_t count = 0;
+        if (!r.u32(count) || count > 1) {
+            error = "invalid resource provenance record count";
+            return false;
+        }
+        c.resource_provenance.resize(count);
+        for (auto& provenance : c.resource_provenance) {
+            uint8_t stage = 0;
+            uint32_t resource_class = 0;
+            if (!r.u64(provenance.draw_index) || !r.u8(stage) ||
+                !r.u32(provenance.binding) || !r.u32(resource_class) ||
+                !r.u64(provenance.guest_addr) || !r.u64(provenance.requested_bytes) ||
+                !r.u32(provenance.srt_offset) || !r.u32(provenance.sgpr_base) ||
+                !r.u32(provenance.realization_blob_index) ||
+                !r.u32(provenance.post_blob_index) ||
+                !r.u64(provenance.post_blob_offset) ||
+                !r.u64(provenance.realization_content_hash) ||
+                !r.u64(provenance.post_content_hash))
+                return false;
+            provenance.stage = static_cast<ShaderProgramStage>(stage);
+            provenance.resource_class = static_cast<ResourceClass>(resource_class);
+        }
+        if (!validate_resource_provenance(c, error)) return false;
+    }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)
         restore_legacy_color_target_aliases(diagnostic);
@@ -3424,6 +3532,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     out.rtt_seeds = c.rtt_seeds; out.ds_seeds = c.ds_seeds;
     out.raw_shader_versions = c.raw_shader_versions;
     out.failure_diagnostics = c.failure_diagnostics;
+    out.resource_provenance = c.resource_provenance;
     out.failure_diagnostics_available = c.failure_diagnostics_available;
     out.expected_output_valid = c.expected_output_valid;
     out.expected_output_hash = c.expected_output_hash; out.expected_output_bytes = c.expected_output_bytes;
@@ -3758,6 +3867,90 @@ bool gpu_capture_output_nonzero_matches(const std::vector<uint8_t>& output, size
            (!max_nonzero || nonzero <= max_nonzero);
 }
 
+bool parse_gpu_capture_resource_selector(std::string_view text,
+                                         GpuCaptureResourceSelector& selector) {
+    const size_t first_colon = text.find(':');
+    const size_t second_colon = first_colon == std::string_view::npos
+        ? std::string_view::npos : text.find(':', first_colon + 1);
+    if (first_colon == std::string_view::npos || second_colon == std::string_view::npos ||
+        text.find(':', second_colon + 1) != std::string_view::npos)
+        return false;
+    uint64_t draw_index = 0, binding = 0;
+    if (!parse_diagnostic_draw_id(text.substr(0, first_colon), draw_index) ||
+        !parse_diagnostic_uint64(text.substr(second_colon + 1), binding) ||
+        binding > std::numeric_limits<uint32_t>::max())
+        return false;
+    const std::string_view stage = text.substr(first_colon + 1,
+                                               second_colon - first_colon - 1);
+    if (stage != "vs" && stage != "ps") return false;
+    selector.draw_index = draw_index;
+    selector.stage = stage == "vs" ? ShaderProgramStage::Vertex
+                                    : ShaderProgramStage::Fragment;
+    selector.binding = static_cast<uint32_t>(binding);
+    return true;
+}
+
+void snapshot_pending_gpu_capture_draw_resource(PendingGpuCapture* pending,
+                                                const DrawItem& draw,
+                                                const CaptureMemoryReader& reader) {
+    // This check is the normal-path cost: no table walk, allocation, or guest-memory read occurs
+    // unless a capture explicitly requests one semantic resource.
+    if (!pending || !pending->resource_provenance_armed ||
+        !pending->resource_provenance_error.empty() ||
+        draw.draw_index != pending->resource_provenance_selector.draw_index)
+        return;
+    const auto& selector = pending->resource_provenance_selector;
+    const auto& table = selector.stage == ShaderProgramStage::Vertex ? draw.vrt : draw.prt;
+    if (!table) return;
+
+    const ShaderResource* selected = nullptr;
+    for (const auto& resource : table->resources) {
+        if (resource.binding != selector.binding) continue;
+        if (selected) {
+            pending->resource_provenance_error =
+                "selected draw resource binding is ambiguous";
+            return;
+        }
+        selected = &resource;
+    }
+    if (!selected) return;
+    if (++pending->resource_provenance_matches != 1) {
+        pending->resource_provenance_error =
+            "selected draw resource matched more than once";
+        return;
+    }
+
+    const uint64_t bytes = gpu_capture_resource_footprint(*selected);
+    if (!selected->gpu_addr || !bytes || bytes > kMaxBlobBytes ||
+        bytes > std::numeric_limits<size_t>::max()) {
+        pending->resource_provenance_error =
+            "selected draw resource has no bounded guest byte span";
+        return;
+    }
+    GpuCaptureBlob blob;
+    blob.guest_addr = selected->gpu_addr;
+    blob.bytes.resize(static_cast<size_t>(bytes), 0);
+    const CaptureMemoryReader exact_reader = reader ? reader : CaptureMemoryReader(
+        [](uint64_t addr, uint8_t* destination, size_t size) {
+            return read_capture_guest_memory(addr, destination, size);
+        });
+    blob.bytes_read = std::min<uint64_t>(
+        exact_reader(blob.guest_addr, blob.bytes.data(), blob.bytes.size()), blob.bytes.size());
+    blob.content_hash = gpu_capture_hash(blob.bytes);
+
+    auto& provenance = pending->resource_provenance;
+    provenance.draw_index = draw.draw_index;
+    provenance.stage = selector.stage;
+    provenance.binding = selector.binding;
+    provenance.resource_class = selected->cls;
+    provenance.guest_addr = selected->gpu_addr;
+    provenance.requested_bytes = bytes;
+    provenance.srt_offset = selected->srt_offset;
+    provenance.sgpr_base = selected->sgpr_base;
+    provenance.realization_content_hash = blob.content_hash;
+    pending->resource_provenance_realization_blob = std::move(blob);
+}
+
 namespace {
 CaptureMemoryReader pending_capture_reader(const PendingGpuCapture& pending) {
     return [&pending](uint64_t addr, uint8_t* destination, size_t bytes) -> size_t {
@@ -3783,6 +3976,97 @@ CaptureMemoryReader pending_capture_reader(const PendingGpuCapture& pending) {
         }
         return copied;
     };
+}
+
+const char* resource_provenance_stage_name(ShaderProgramStage stage) {
+    return stage == ShaderProgramStage::Vertex ? "vs" : "ps";
+}
+
+bool validate_pending_resource_provenance(const PendingGpuCapture& pending,
+                                          std::string& error) {
+    if (!pending.resource_provenance_armed) return true;
+    if (!pending.resource_provenance_error.empty()) {
+        error = "resource provenance selector failed: " +
+                pending.resource_provenance_error;
+        return false;
+    }
+    if (pending.resource_provenance_matches != 1) {
+        const auto& selector = pending.resource_provenance_selector;
+        error = "resource provenance selector " + std::to_string(selector.draw_index) + ":" +
+                resource_provenance_stage_name(selector.stage) + ":" +
+                std::to_string(selector.binding) + " matched " +
+                std::to_string(pending.resource_provenance_matches) + " resources";
+        return false;
+    }
+    return true;
+}
+
+bool finalize_pending_resource_provenance(PendingGpuCapture& pending,
+                                          std::string& error) {
+    if (!pending.resource_provenance_armed) return true;
+    if (!validate_pending_resource_provenance(pending, error)) return false;
+    auto& provenance = pending.resource_provenance;
+    const GpuCapturedDraw* selected_draw = nullptr;
+    for (const auto& draw : pending.capture.draws) {
+        if (draw.draw_index != provenance.draw_index) continue;
+        if (selected_draw) {
+            error = "captured provenance draw identity is ambiguous";
+            return false;
+        }
+        selected_draw = &draw;
+    }
+    if (!selected_draw) {
+        error = "captured provenance draw is absent after materialization";
+        return false;
+    }
+    const auto& table = provenance.stage == ShaderProgramStage::Vertex
+        ? selected_draw->vrt : selected_draw->prt;
+    const GpuCapturedResource* selected_resource = nullptr;
+    for (const auto& resource : table.resources) {
+        if (resource.resource.binding != provenance.binding) continue;
+        if (selected_resource) {
+            error = "captured provenance resource identity is ambiguous";
+            return false;
+        }
+        selected_resource = &resource;
+    }
+    if (!selected_resource ||
+        selected_resource->resource.cls != provenance.resource_class ||
+        selected_resource->resource.gpu_addr != provenance.guest_addr ||
+        selected_resource->captured_size != provenance.requested_bytes ||
+        selected_resource->resource.srt_offset != provenance.srt_offset ||
+        selected_resource->resource.sgpr_base != provenance.sgpr_base) {
+        error = "captured provenance descriptor changed after draw realization";
+        return false;
+    }
+    if (selected_resource->blob_index >= pending.capture.blobs.size()) {
+        error = "captured provenance resource has no post-submit blob";
+        return false;
+    }
+    const auto& post_blob = pending.capture.blobs[selected_resource->blob_index];
+    if (selected_resource->blob_offset > post_blob.bytes.size() ||
+        provenance.requested_bytes > post_blob.bytes.size() - selected_resource->blob_offset) {
+        error = "captured provenance post-submit span exceeds its blob";
+        return false;
+    }
+    const auto& realization_blob = pending.resource_provenance_realization_blob;
+    if (realization_blob.guest_addr != provenance.guest_addr ||
+        realization_blob.bytes.size() != provenance.requested_bytes ||
+        realization_blob.content_hash != gpu_capture_hash(realization_blob.bytes)) {
+        error = "captured provenance realization sample is inconsistent";
+        return false;
+    }
+
+    provenance.post_blob_index = selected_resource->blob_index;
+    provenance.post_blob_offset = selected_resource->blob_offset;
+    provenance.post_content_hash = gpu_capture_hash(
+        post_blob.bytes.data() + selected_resource->blob_offset,
+        static_cast<size_t>(provenance.requested_bytes));
+    provenance.realization_blob_index =
+        static_cast<uint32_t>(pending.capture.blobs.size());
+    pending.capture.blobs.push_back(std::move(pending.resource_provenance_realization_blob));
+    pending.capture.resource_provenance.push_back(provenance);
+    return true;
 }
 
 std::vector<ComputeItem> with_pending_gds_snapshot(
@@ -4039,6 +4323,24 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     auto pending = std::make_unique<PendingGpuCapture>();
     pending->materialized = false;
     pending->path = interactive ? interactive_path : std::string(env_path);
+    if (const char* selector = std::getenv(kGpuCaptureResourceProvenanceEnv);
+        selector && *selector) {
+        if (!parse_gpu_capture_resource_selector(
+                selector, pending->resource_provenance_selector)) {
+            std::fprintf(stderr,
+                         "[gpucap] resource provenance NOT ARMED: invalid selector %s\n",
+                         selector);
+            return {};
+        }
+        pending->resource_provenance_armed = true;
+        // A submit may prepare graphics eagerly yet still execute through the ordered path because
+        // it contains compute. In that shape the eager DrawItem is only a realization cache: sampling
+        // it here both double-matches the later ordered hook and observes bytes before an earlier
+        // producer. Deferred capture therefore has exactly one temporal owner, the ordered executor.
+        if (!defer_materialization)
+            for (const auto& draw : draws)
+                snapshot_pending_gpu_capture_draw_resource(pending.get(), draw);
+    }
     pending->output_triggered = output_triggered;
     if (output_triggered) {
         pending->output_min_nonzero = static_cast<size_t>(std::strtoull(output_min_env, nullptr, 0));
@@ -4096,7 +4398,8 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     // pre-submit snapshots above are the deliberate exception: known DMA endpoints cannot be
     // recovered after execution, while every unrelated guest resource and renderer cache remains
     // untouched for rejected candidates.
-    if (output_triggered || defer_materialization) return pending;
+    if (output_triggered || defer_materialization || pending->resource_provenance_armed)
+        return pending;
     std::string error;
     if (!materialize_pending_gpu_capture(*pending, draws, computes, operations,
                                          semantic_state, exact_failures, error)) {
@@ -4147,11 +4450,13 @@ bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
             error = "output-triggered capture is missing its synchronous submit state";
             return false;
         }
+        if (!validate_pending_resource_provenance(*pending, error)) return false;
         static const std::vector<ComputeItem> no_computes;
         if (!materialize_pending_gpu_capture(*pending, *draws,
                                              computes ? *computes : no_computes,
                                              *operations, semantic_state, exact_failures, error))
             return false;
+        if (!finalize_pending_resource_provenance(*pending, error)) return false;
         if (g_output_capture_claimed.exchange(true, std::memory_order_acq_rel)) return true;
         std::fprintf(stderr,
                      "[gpucap] captured output match submit %llu: %zu draws, %zu computes, "
@@ -4167,11 +4472,13 @@ bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
             error = "deferred capture is missing its exact submit realization";
             return false;
         }
+        if (!validate_pending_resource_provenance(*pending, error)) return false;
         static const std::vector<ComputeItem> no_computes;
         if (!materialize_pending_gpu_capture(*pending, *draws,
                                              computes ? *computes : no_computes,
                                              *operations, semantic_state, exact_failures, error))
             return false;
+        if (!finalize_pending_resource_provenance(*pending, error)) return false;
         std::fprintf(stderr,
                      "[gpucap] captured deferred submit %llu: %zu draws, %zu computes, "
                      "%zu operations, %zu failures -> %s\n",
