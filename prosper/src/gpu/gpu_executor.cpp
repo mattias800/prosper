@@ -122,6 +122,29 @@ void notify_compute_authority_unknown(ComputeAuthorityBoundaryKind kind,
         {kind, submit_no, command_order, 0, 0, false});
 }
 
+void notify_compute_authority_draw_resources(const DrawItem& item, uint64_t submit_no) {
+    if (!g_compute_authority_boundary_enabled.load(std::memory_order_relaxed)) return;
+    for (const ComputeAuthorityBoundary& boundary :
+         compute_authority_draw_resource_boundaries(item, submit_no))
+        dispatch_compute_authority_boundary(boundary);
+}
+
+void notify_compute_authority_draw_unrealized(uint64_t submit_no,
+                                              uint64_t command_order) {
+    if (!g_compute_authority_boundary_enabled.load(std::memory_order_relaxed)) return;
+    dispatch_compute_authority_boundary({
+        ComputeAuthorityBoundaryKind::DrawResourceEnd,
+        submit_no,
+        command_order,
+        0,
+        0,
+        false,
+        UINT32_MAX,
+        UINT32_MAX,
+        false,
+    });
+}
+
 bool ranges_overlap(uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
     if (!a_size || !b_size) return false;
     return a <= b ? b - a < a_size : a - b < b_size;
@@ -5951,6 +5974,68 @@ bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_
 }
 } // namespace
 
+std::vector<ComputeAuthorityBoundary> compute_authority_draw_resource_boundaries(
+        const DrawItem& item, uint64_t submit_no) {
+    std::vector<ComputeAuthorityBoundary> boundaries;
+    const size_t vertex_resources = item.vrt ? item.vrt->resources.size() : 0;
+    const size_t fragment_resources = item.prt ? item.prt->resources.size() : 0;
+    boundaries.reserve((vertex_resources + fragment_resources) * 2 + 1);
+    const auto append_table = [&](const ShaderResourceTable* table) {
+        if (!table) return;
+        for (const ShaderResource& resource : table->resources) {
+            // Replay-owned bytes do not read the live guest address. Ordinary live resources have
+            // no host_data and are reported with the same conservative footprint capture uses.
+            if (resource.host_data || !resource.gpu_addr) continue;
+            const uint64_t bytes = gpu_capture_resource_footprint(resource);
+            const bool known = bytes != 0 &&
+                resource.gpu_addr <= UINT64_MAX - (bytes - 1);
+            boundaries.push_back({
+                ComputeAuthorityBoundaryKind::DrawResource,
+                submit_no,
+                item.command_order,
+                resource.gpu_addr,
+                bytes,
+                known,
+                resource.binding,
+                static_cast<uint32_t>(resource.cls),
+                false,
+            });
+            const uint64_t metadata_bytes =
+                gpu_capture_dcc_metadata_footprint(resource);
+            if (resource.dcc_metadata_host_data || !resource.metadata_addr ||
+                !metadata_bytes)
+                continue;
+            const bool metadata_known =
+                resource.metadata_addr <= UINT64_MAX - (metadata_bytes - 1);
+            boundaries.push_back({
+                ComputeAuthorityBoundaryKind::DrawResource,
+                submit_no,
+                item.command_order,
+                resource.metadata_addr,
+                metadata_bytes,
+                metadata_known,
+                resource.binding,
+                static_cast<uint32_t>(resource.cls),
+                false,
+            });
+        }
+    };
+    append_table(item.vrt.get());
+    append_table(item.prt.get());
+    boundaries.push_back({
+        ComputeAuthorityBoundaryKind::DrawResourceEnd,
+        submit_no,
+        item.command_order,
+        0,
+        0,
+        false,
+        UINT32_MAX,
+        UINT32_MAX,
+        true,
+    });
+    return boundaries;
+}
+
 static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t width,
                                                      uint32_t height, uint64_t submit_no,
                                                      const LiveRenderFn& render,
@@ -6064,13 +6149,17 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     failure_known = capture_trace != nullptr;
                 }
                 if (realized) {
+                    notify_compute_authority_draw_resources(item, submit_no);
                     if (capture_trace) {
                         snapshot_pending_gpu_capture_draw_resource(
                             capture_trace->pending_capture, item, {}, &st);
                         capture_trace->draws.push_back(item);
                     }
                     span.push_back(std::move(item));
-                } else if (capture_trace) {
+                } else {
+                    notify_compute_authority_draw_unrealized(
+                        submit_no, operation.command_order);
+                    if (!capture_trace) break;
                     // The reason used to die here: this path simply broke, and gpu_capture later
                     // synthesized an empty Unknown record for the unrealized operation (#1636).
                     if (failure_known) {

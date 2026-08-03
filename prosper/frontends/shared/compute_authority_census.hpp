@@ -158,6 +158,109 @@ constexpr uint64_t shadow_compute_authority_increment(uint64_t value) {
     return value == std::numeric_limits<uint64_t>::max() ? value : value + 1;
 }
 
+// Post-realization audit for the conservative unknown-range Draw boundary. The authority census
+// still fails closed before draw realization; this companion only asks whether the subsequently
+// realized shader-resource tables name the pending result that forced that materialization. Keeping
+// the audit separate is intentional: an exact resource-table match is evidence about the draw, not
+// yet proof that descriptor/index/shader reads made realization itself safe to cross.
+enum class ShadowComputeAuthorityDrawProbeAction : uint8_t {
+    Ignored,
+    InvalidRange,
+    UnrelatedRange,
+    OverlappingRange,
+    Completed,
+};
+
+struct ShadowComputeAuthorityDrawProbeCounters {
+    uint64_t armed = 0;
+    uint64_t superseded = 0;
+    uint64_t resource_observations = 0;
+    uint64_t invalid_ranges = 0;
+    uint64_t unrelated_ranges = 0;
+    uint64_t overlapping_ranges = 0;
+    uint64_t completed = 0;
+    uint64_t completed_with_overlap = 0;
+    uint64_t completed_without_overlap = 0;
+    uint64_t unrealized = 0;
+};
+
+class ShadowComputeAuthorityDrawProbe {
+public:
+    constexpr const ShadowComputeAuthorityDrawProbeCounters& counters() const {
+        return counters_;
+    }
+
+    constexpr bool active() const { return active_; }
+    constexpr bool saw_overlap() const { return saw_overlap_; }
+
+    constexpr void arm(uint64_t submit_no, uint64_t command_order,
+                       const ShadowComputeAuthorityRange& pending_range) {
+        if (active_)
+            counters_.superseded = shadow_compute_authority_increment(
+                counters_.superseded);
+        active_ = pending_range.valid();
+        submit_no_ = submit_no;
+        command_order_ = command_order;
+        pending_range_ = active_ ? pending_range : ShadowComputeAuthorityRange::unknown();
+        saw_overlap_ = false;
+        if (active_)
+            counters_.armed = shadow_compute_authority_increment(counters_.armed);
+    }
+
+    constexpr ShadowComputeAuthorityDrawProbeAction observe_resource(
+            uint64_t submit_no, uint64_t command_order,
+            const ShadowComputeAuthorityRange& resource_range) {
+        if (!matches(submit_no, command_order))
+            return ShadowComputeAuthorityDrawProbeAction::Ignored;
+        counters_.resource_observations = shadow_compute_authority_increment(
+            counters_.resource_observations);
+        if (!resource_range.valid()) {
+            counters_.invalid_ranges = shadow_compute_authority_increment(
+                counters_.invalid_ranges);
+            return ShadowComputeAuthorityDrawProbeAction::InvalidRange;
+        }
+        if (!shadow_compute_authority_ranges_overlap(pending_range_, resource_range)) {
+            counters_.unrelated_ranges = shadow_compute_authority_increment(
+                counters_.unrelated_ranges);
+            return ShadowComputeAuthorityDrawProbeAction::UnrelatedRange;
+        }
+        saw_overlap_ = true;
+        counters_.overlapping_ranges = shadow_compute_authority_increment(
+            counters_.overlapping_ranges);
+        return ShadowComputeAuthorityDrawProbeAction::OverlappingRange;
+    }
+
+    constexpr ShadowComputeAuthorityDrawProbeAction complete(
+            uint64_t submit_no, uint64_t command_order, bool realized) {
+        if (!matches(submit_no, command_order))
+            return ShadowComputeAuthorityDrawProbeAction::Ignored;
+        counters_.completed = shadow_compute_authority_increment(counters_.completed);
+        if (!realized) {
+            counters_.unrealized = shadow_compute_authority_increment(counters_.unrealized);
+        } else if (saw_overlap_) {
+            counters_.completed_with_overlap = shadow_compute_authority_increment(
+                counters_.completed_with_overlap);
+        } else {
+            counters_.completed_without_overlap = shadow_compute_authority_increment(
+                counters_.completed_without_overlap);
+        }
+        active_ = false;
+        return ShadowComputeAuthorityDrawProbeAction::Completed;
+    }
+
+private:
+    constexpr bool matches(uint64_t submit_no, uint64_t command_order) const {
+        return active_ && submit_no == submit_no_ && command_order == command_order_;
+    }
+
+    ShadowComputeAuthorityDrawProbeCounters counters_;
+    ShadowComputeAuthorityRange pending_range_;
+    uint64_t submit_no_ = 0;
+    uint64_t command_order_ = 0;
+    bool active_ = false;
+    bool saw_overlap_ = false;
+};
+
 class ShadowComputeAuthorityCensus {
 public:
     constexpr const ShadowComputeAuthorityState& state() const { return state_; }
