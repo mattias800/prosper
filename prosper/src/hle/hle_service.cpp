@@ -821,15 +821,21 @@ bool avp_stage_video(AvpPlayer& player, const prosper::video::VideoFrame& frame,
         dst = avp_frame_storage(player, bytes, pitch);
     }
     if (!dst) return false;
-    // The crop offsets keep padding invisible, but clearing it also prevents stale decoder bytes
-    // from becoming observable if a title deliberately samples outside the valid image extent.
-    memset(dst, 0, bytes);
-    for (uint32_t row = 0; row < frame.height; ++row)
+    // Copy visible pixels and clear only the padded tail. Clearing the entire frame before copying
+    // it would double memory traffic on every decoded frame; the crop still must not expose stale
+    // decoder bytes if a title deliberately samples beyond the valid image extent.
+    const size_t padding = static_cast<size_t>(pitch) - frame.width;
+    for (uint32_t row = 0; row < frame.height; ++row) {
         memcpy(dst + static_cast<size_t>(row) * pitch,
                frame.y + static_cast<size_t>(row) * y_stride, frame.width);
+        if (padding)
+            memset(dst + static_cast<size_t>(row) * pitch + frame.width, 0, padding);
+    }
     uint8_t* dst_uv = dst + static_cast<size_t>(pitch) * frame.height;
-    for (size_t row = 0; row < uv_rows; ++row)
+    for (size_t row = 0; row < uv_rows; ++row) {
         memcpy(dst_uv + row * pitch, frame.uv + row * uv_stride, frame.width);
+        if (padding) memset(dst_uv + row * pitch + frame.width, 0, padding);
+    }
     // Callback storage is registered before the first pull. Refresh it here because the basic API
     // retains its historical tight layout while GetVideoDataEx publishes the padded physical pitch.
     avp_register_frame_layout(dst, bytes, pitch);
