@@ -54,6 +54,28 @@ Two mutations prove the checks exercise both failure mechanisms. Restoring `pitc
 named R-Type footprint check fail. Keeping pitch 2048 but forcing crop right to zero leaves the
 R-Type footprint check green and makes the named GRIS right-edge-strip check fail.
 
+## Live validation
+
+Candidate `4114391c` was run for 60 seconds through the bounded #1746 startup diagnostic. The three
+byte patches applied at the expected addresses, AvPlayer opened `CRG.mp4`, allocated two 3,317,760
+byte guest texture buffers, returned those buffers alternately, and advanced timestamps. All #1753
+failure signals were absent: no `unexpected y_texture size`, no pc-52 `mimg-unresolved` from SGPR 8,
+no pc-52 `recompile-reject` for `f080030a`, and no execution reject for fragment program
+`0x2011c0d700`. No other shader/resource rejection appeared. This proves the upstream descriptor
+construction and shader-resolution defect is fixed.
+
+It does **not** establish a visual milestone. All 49 retained 1920x1080 frames were inspected. Early
+and late samples were solid clears; the only non-flat interval contained 2--75 colours per frame and
+showed broad diagonal purple/grey gradients rather than recognizable movie imagery. There is no
+screenshot because incorrect diagnostic output is not progression evidence. The remaining movie
+sampling/content frontier is tracked separately in #1807.
+
+The same candidate completed the GRIS cross-title route with 45 source-distinct and 42 pixel-distinct
+frames, maximum pixel staleness 1.0 seconds, and status `ok`. All 45 frames were inspected. The
+Nomada/Devolver opening logos and title screen have no 128-pixel right strip, horizontal stride
+corruption, or U/V colour cast. This verifies that the padded-pitch/crop contract does not regress
+the known consumer that exposed the earlier half-fix.
+
 ## Ruled out
 
 | Hypothesis | Verdict and evidence | Source |
@@ -63,10 +85,12 @@ R-Type footprint check green and makes the named GRIS right-edge-strip check fai
 | The chroma bind packet is lost by Prosper | **Falsified.** The title returns before constructing the chroma descriptor, then later binds that uninitialized slot itself. There is no valid descriptor for a packet decoder to recover. | guest `eboot+0x19d10`, this doc |
 | AvPlayer output must remain tight because padded output caused GRIS's right-edge strip | **Falsified.** GRIS subtracts the ABI crop offsets from pitch. The prior padded experiment left crop right zero; the missing crop, not the physical padding, exposed the strip. | #1393, GRIS `eboot+0xf6d5ab`, this doc |
 | Reporting pitch 2048 while retaining tight rows is sufficient | **Falsified by construction.** The title advances plane addresses by the published physical extent. The CPU fixture verifies row-by-row storage and both plane bases, not metadata alone. | `test_avplayer` |
+| The pc-52 resource rejection was the only movie-visual blocker | **Falsified live.** The size mismatch and all shader/resource rejects are gone, but retained frames contain only flat clears and low-colour gradients. The downstream frontier is #1807. | bounded `4114391c` run, #1807 |
 
-## Next live discriminator
+## Next frontier
 
-After #1746 is bypassed diagnostically, a valid run must show all of these together before claiming
-visual progress: no `unexpected y_texture size`, a constructed/bound chroma T# in slot 1, both pc 52
-and pc 57 resolving, and source-distinct non-flat movie frames. A black or flat frame is not a visual
-milestone and does not warrant a screenshot.
+#1807 owns the remaining flat/gradient movie output. Capture one gradient frame as a replayable GPU
+bundle, identify the draw using fragment program `0x2011c0d700`, and prove which AvPlayer buffer and
+timestamp fed it. Dump both resolved planes and their T# metadata, then compare source texels with a
+CPU NV12-to-RGB conversion to separate resource decode/upload, sampler-coordinate, and shader-output
+faults. A changing gradient is still not a visual milestone and does not warrant a screenshot.
