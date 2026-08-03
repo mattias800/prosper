@@ -480,6 +480,10 @@ int main(int argc, char** argv) {
     first.dma_copy_count = 2;
     first.dma_copies.push_back({0x500000, 0x600000, 64, 0, 395, 0x1000});
     first.dma_copies.push_back({0x500040, 0x600040, 32, 3, 398, 0x1100});
+    first.dma_data_count = 3;
+    first.dma_data_records.push_back({0x500000, 0x600000, 64, 0, 395, 0x1000});
+    first.dma_data_records.push_back({0xc70, 0, 4, 1, 397, 0x1080});
+    first.dma_data_records.push_back({0x500040, 0x600040, 32, 3, 398, 0x1100});
     first.capture_incomplete = false;
     first.target_spans.push_back({0, 1, 642, 362});
     first.target_spans.push_back({1, 2, 738, 420});
@@ -488,6 +492,12 @@ int main(int argc, char** argv) {
     CHECK(!writer.append_submit(invalid_spans, error) &&
           error.find("invalid target spans") != std::string::npos,
           "writer rejects noncontiguous target-span coverage");
+    error.clear();
+    GpuTimelineSubmit invalid_dma_journal = first;
+    invalid_dma_journal.dma_data_count = 4;
+    CHECK(!writer.append_submit(invalid_dma_journal, error) &&
+          error.find("invalid raw DMA_DATA journal") != std::string::npos,
+          "writer rejects an uncapped DMA_DATA count without explicit truncation");
     error.clear();
     GpuTimelineDepthSurface first_depth;
     first_depth.depth_read_base = first_depth.depth_write_base = 0x700000;
@@ -548,6 +558,8 @@ int main(int argc, char** argv) {
     GpuTimelineSubmit second = first;
     second.submit_no = 11; second.draw_count = 4; second.dispatch_count = 0;
     second.target_spans[1].draw_count = 3;
+    second.dma_data_count = 4;
+    second.dma_data_records_truncated = true;
     CHECK(writer.append_submit(second, error), "writer appends a second submit record");
     CHECK(writer.flush(error), "writer flushes explicitly");
     writer.close();
@@ -558,7 +570,7 @@ int main(int argc, char** argv) {
           timeline.metadata.title_id == metadata.title_id &&
           timeline.metadata.input_route == metadata.input_route,
           "metadata round-trips");
-    CHECK(timeline.version == 9 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
+    CHECK(timeline.version == 10 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
           timeline.details.size() == 1 && timeline.producers.size() == 2,
           "version and record counts round-trip");
     CHECK(timeline.submits[0].sequence == 1 && timeline.presents[0].sequence == 2 &&
@@ -575,6 +587,20 @@ int main(int argc, char** argv) {
           timeline.submits[0].dma_copies[1].dst == 0x500040 &&
           timeline.submits[0].dma_copies[1].command_order == 398,
           "ordered-DMA identities and exact command order round-trip");
+    CHECK(timeline.submits[0].dma_data_count == 3 &&
+          !timeline.submits[0].dma_data_records_truncated &&
+          timeline.submits[0].dma_data_records.size() == 3 &&
+          timeline.submits[0].dma_data_records[1].src == 0 &&
+          timeline.submits[0].dma_data_records[1].dst == 0xc70 &&
+          timeline.submits[0].dma_data_records[1].bytes == 4 &&
+          timeline.submits[0].dma_data_records[1].sels == 1 &&
+          timeline.submits[0].dma_data_records[1].command_order == 397 &&
+          timeline.submits[0].dma_data_records[1].packet_addr == 0x1080,
+          "raw GDS-immediate DMA_DATA identity and PM4 order round-trip without an execution claim");
+    CHECK(timeline.submits[1].dma_data_count == 4 &&
+          timeline.submits[1].dma_data_records.size() == 3 &&
+          timeline.submits[1].dma_data_records_truncated,
+          "raw DMA_DATA original count survives a bounded, explicitly truncated journal");
     CHECK(timeline.submits[0].depth_surfaces.size() == 1 &&
           timeline.submits[0].depth_surfaces[0].htile_data_base == 0x820000 &&
           timeline.submits[0].depth_surfaces[0].db_depth_size_xy == 0x01690281 &&
@@ -688,6 +714,10 @@ int main(int argc, char** argv) {
     prestart_state.draws.back().command_order = 104;
     prestart_state.command_order = 105;
     prestart_state.dma_copies.push_back({0x200000, 0x100000000ull, 16, 0, 104, 0});
+    prestart_state.dma_data_record_count = 2;
+    prestart_state.dma_data_records.push_back(
+        {0x200000, 0x100000000ull, 16, 0, 104, 0});
+    prestart_state.dma_data_records.push_back({0xc70, 0, 4, 1, 105, 0x2220});
     begin_gpu_timeline_submit(40);
     record_gpu_timeline_submit(prestart_state, 40);
     GpuState predecessor_state;
@@ -727,8 +757,15 @@ int main(int argc, char** argv) {
           runtime_timeline.submits[0].dma_copies[0].src == 0x100000000ull &&
           runtime_timeline.submits[0].dma_copies[0].dst == 0x200000 &&
           runtime_timeline.submits[0].first_command_order == 104 &&
-          runtime_timeline.submits[0].last_command_order == 104,
+          runtime_timeline.submits[0].last_command_order == 105,
           "runtime compact timeline exposes replayable ordered DMA identities");
+    CHECK(runtime_timeline.submits[0].dma_data_count == 2 &&
+          runtime_timeline.submits[0].dma_data_records.size() == 2 &&
+          runtime_timeline.submits[0].dma_data_records[1].dst == 0xc70 &&
+          runtime_timeline.submits[0].dma_data_records[1].src == 0 &&
+          runtime_timeline.submits[0].dma_data_records[1].sels == 1 &&
+          runtime_timeline.submits[0].dma_data_records[1].command_order == 105,
+          "runtime compact timeline retains a raw GDS reset beside address-backed DMA");
     CHECK(runtime_timeline.submits[1].depth_surfaces.size() == 1 &&
           runtime_timeline.submits[1].depth_surfaces[0].depth_read_base == 0x700000 &&
           runtime_timeline.submits[1].depth_surfaces[0].htile_data_base == 0x820000 &&
@@ -761,6 +798,8 @@ int main(int argc, char** argv) {
     legacy_first.depth_surfaces.clear(); legacy_first.target_spans.clear();
     legacy_first.dma_copies.clear();
     legacy_first.dma_copy_count = 0; legacy_first.capture_incomplete = false;
+    legacy_first.dma_data_records.clear(); legacy_first.dma_data_count = 0;
+    legacy_first.dma_data_records_truncated = false;
     CHECK(compat_writer.open(compat_v2, metadata, error) && compat_writer.append_submit(legacy_first, error),
           "created a detail-free compatibility timeline");
     compat_writer.close();

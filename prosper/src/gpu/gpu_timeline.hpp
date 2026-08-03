@@ -57,6 +57,15 @@ struct GpuTimelineDmaCopy {
     uint64_t packet_addr = 0;
 };
 
+// Raw DMA_DATA packet identity. Unlike GpuTimelineDmaCopy, this is an observation rather than an
+// execution claim: it includes immediate fills, GDS-offset destinations, and rejected forms.
+struct GpuTimelineDmaData {
+    uint64_t dst = 0, src = 0;
+    uint32_t bytes = 0, sels = 0;
+    uint64_t command_order = 0;
+    uint64_t packet_addr = 0;
+};
+
 struct GpuTimelineSubmit {
     uint64_t sequence = 0;
     uint64_t elapsed_ns = 0;
@@ -68,11 +77,14 @@ struct GpuTimelineSubmit {
     uint32_t draw_count = 0;
     uint32_t dispatch_count = 0;
     uint32_t dma_copy_count = 0;
+    uint64_t dma_data_count = 0;
     uint32_t color0_width = 0;
     uint32_t color0_height = 0;
     std::vector<GpuTimelineDepthSurface> depth_surfaces;
     std::vector<GpuTimelineTargetSpan> target_spans;
     std::vector<GpuTimelineDmaCopy> dma_copies;
+    std::vector<GpuTimelineDmaData> dma_data_records;
+    bool dma_data_records_truncated = false;
     bool target_spans_truncated = false;
     // Older timeline versions can report an operation count without the exact records required for
     // replay. New v8 writers retain this flag only when some other capture limitation is discovered.
