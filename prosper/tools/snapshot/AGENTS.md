@@ -182,6 +182,16 @@ follow the order above rather than the obvious one.
   `required_matches` from `len(summary["records"])` for SSIM, and derives
   `required_nonblack` the same way from `min_nonblack_matches` for coverage. A
   window sized for one is automatically sized for the other.
+- A phase-variable checkpoint may opt into `min_consecutive_content_matches`
+  instead of the whole-window ratio; configuring both is an error. This is not
+  permission to count scattered matches: every adjacent sampler index in the
+  required run must jointly clear colour, SSIM, non-black coverage, and
+  dimensions, and an omitted index breaks the run. Existing reviewed structural
+  references are required to seed plateau identification. `verify` then
+  cross-scores each run using only the other run's identified plateau references
+  before saving plateau-only evidence and a candidate. Inspect the whole profile
+  and score explicit off-scene negatives anyway; a long stable menu, logo, or
+  results screen can otherwise become the wrong plateau.
 
 ## Environment
 

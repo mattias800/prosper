@@ -581,8 +581,8 @@
       "dump": "PPSA25872-app0",
       "scale": 4,
       "timeout": 62,
-      "capture_after_seconds": 25,
-      "capture_before_seconds": 49,
+      "capture_after_seconds": 0,
+      "capture_before_seconds": 62,
       "pad_script": null,
       "savedata_policy": "fresh",
       "env": {},
@@ -591,38 +591,53 @@
       "min_pixel_changes": 1,
       "min_structural_similarity": 0.85,
       "min_structural_matches": 10,
-      "min_content_match_ratio": 0.65,
+      "min_consecutive_content_matches": 15,
       "dims": [
         480,
         270
       ],
-      "review": "Approved 16 composited images from two independent runs on 2026-07-22; intended scene, layers, and progression visually confirmed.",
-      "_note": "Menu-reach guard for Terminator 2D: NO FATE (PPSA25872, Unity/IL2CPP). A headless boot from a fresh save renders the T2 chrome logo and the Terminator-in-flames intro, then reaches the main menu (\"TERMINATOR 2D / NO FATE / START / OPTIONS / HIGH SCORES\") at ~30s. The menu is a static 335-color screen: 19 consecutive frames are byte-identical and match the reference at SSIM 1.0. Window 25-49s captures the boot intro plus the menu plateau (boot->menu transition gives the required pixel changes). The attract character-bio cutscene and demo gameplay after ~49s reproduce but are intentionally excluded: their animation drifts run-to-run and cannot SSIM-match static references. Captured via capture_content at scale=4 with the tool-default PROSPER_FAULT_ONSTACK=1 (Linux write-watch armed); the boot reaches the menu with the write-watch active, so #1147 is NOT the cause of the separate scale=1 headless slowdown tracked in #1181. Scope matches the user-verified checkpoint: reach the main menu.",
+      "review": "Approved all 16 composited images from two independent fresh-save runs on 2026-08-03: every retained 42-61s frame is the fully visible, correctly layered animated main menu; final verify found 20/20 local and 20/20 cross-run consecutive matches (15 required).",
+      "_note": "Phase-self-identifying menu-reach guard for Terminator 2D: NO FATE (PPSA25872, Unity/IL2CPP). A fresh-save boot renders the Reef and Bitmap Bureau logos, the T2 chrome/logo and character/flames intro, then reaches the animated main menu (\"TERMINATOR 2D / NO FATE / START / OPTIONS / HIGH SCORES\"). The former 25-49s window was unsound: the menu appeared at ~30s when adopted but at ~42-43s on current profiling, leaving healthy intro frames inside the supposed menu window and only 10 structural matches against 16 required. This guard profiles the bounded 0-62s boot instead and requires 15 CONSECUTIVE frames to jointly clear min_colors=300, SSIM>=0.85 against menu-only references, non-black coverage>=0.85 and 480x270 dimensions. Two initial discriminating profiles produced 20/20 seed-identified frames and 20/19 opposite-run-validated menu frames; final rebased verification produced 20/20 in both local and cross-run directions (five frames of margin). The worst initial cross-run menu SSIM was 0.9972. Explicit pre-menu negatives scored 0/41 and 0/42 matches (best SSIM 0.3082/0.3284), and the published unmodified attract-gameplay capture scored -0.0099/-0.0118 against the two menu reference sets. min_pixel_changes=1 is retained only as a broad-boot liveness check; the menu milestone itself is carried by the sustained conjoined plateau and no longer depends on straddling the intro-to-menu transition. Captured at scale=4 with the tool-default PROSPER_FAULT_ONSTACK=1 (Linux write-watch armed); scope remains the user-verified main-menu checkpoint.",
       "structural_references": [
-        {
-          "luma16x9": "607c7584775d7d7782755c797f7e755f7476968b7178737a9c7c72758a947d6e6876938e6d6b6d5e5e6767738798706661848b9e6b5a787b575c517b8aa37750747185876c71737955646f767c87776a6781786e6c686675597b6774836a72664c886e6564494e5e4531477878675e4b5b6c5e7387533040534e19306c685d535c8178a36576493a3f34495079907c56",
-          "average_hash": "470043ebeb4bff5b",
-          "difference_hash": "9e94d68e9e9a9296"
-        },
-        {
-          "luma16x9": "34373c3d3b3c3e3b3b3e42525c4f3e34364b3f44453a36453c34393f3f5f836c3a83866b423d3f3e54505c6d7e68867c3d7093a049728392a69b878c868737593c607dbd6da1b8bcb09c8f75583d29444e8aadd793aaa38a75525451514b4f466fadaaa16d675b533d302f303028303f415348454f3e3a3a414344464744382c2f2f3235434a40373436353635342f2a",
-          "average_hash": "00030f3e7ef38000",
-          "difference_hash": "c8c75ef8f2c6158a"
-        },
-        {
-          "luma16x9": "3d2d1e262d32373a3f434134271e2e3d3738222a2f35393e4245453b2c1f35313c322930353a4144474848413324414d8875676460545b676d5d594c405485a8bb834c47525b5f6b645055483d4484a19b653b424d61635e5852574a40355f5556493e42484c5957524b44403d3a3c303a3c434a544f54514f4d48413c3e3e433d3d4d5d6165685659524d49424d3f37",
-          "average_hash": "3e1c19bdff900000",
-          "difference_hash": "b870717937616161"
-        },
         {
           "luma16x9": "15171e262d32373a3f434134271e1c1b171b222a2f35393e4245453b2c1f1c1b191e2930353a41444748484133241c1b2a50676460545b676d5d594c4054532b22364c47525b5f6b655055493d44392328333b424e62645e5852594b403528202d393d42474c5754524a45403c3a2d23363f4348525052504e4f44413d3c3c304f5152575c6a675c605251504a4b464a",
           "average_hash": "ff3e3c3cfe381010",
           "difference_hash": "f8f0f0f8b6e0e0e0"
         },
         {
-          "luma16x9": "6a7b878379697d85847a687c858679666f7592856e766f86b4896f6f8790796c6378949a6c5e6e78607257768aa46f57688185976f6577815a50617985987a607075847a6b6d7377705069787b7e77665a82766b6a626c6c688e5a7681696b5d4f8061616c4c6c6559415f7d725c5a4b6471708278522845433b1e34787b715b57817280726e2a261f2a4f69738b7954",
-          "average_hash": "4642286bef4bffff",
-          "difference_hash": "8e96d29e969ab292"
+          "luma16x9": "15171e262d32373a3f434134271e1c1b171b222a2f35393e4245453b2c1f1c1b191e2930353a41444748484133241c1b2a50676460545b676d5d594c4054532b22374b48525c606c655156493d453a2328333b424e62645e5853594a403528202c383e42484b5855534a45403d3a2d23373f4349535054504e4f47413d3d3d304b4f505b5f6968595d524f4e464d4a4c",
+          "average_hash": "ff3e3c3cfe381010",
+          "difference_hash": "f8f0f0f8b6e0e0e0"
+        },
+        {
+          "luma16x9": "15171e262d32373a3f434134271e1c1b171b222a2f35393e4245453b2c1f1c1b191e2930353a41444748484133241c1b2a50676460545b676d5d594c4054532b22364c47525b5f6b655055493d44392328333b424e62635d5852594b4035282030393e42484c5956514a45413e3a2d233b3e454c544f55534f4f48433e403d30514d58626861655a5b5654504d515747",
+          "average_hash": "ff3e3c3cfe381000",
+          "difference_hash": "bcf0f0f8b6e0e0e0"
+        },
+        {
+          "luma16x9": "15171e262d32373a3f434134271e1c1b171b222a2f35393e4245453b2c1f1c1b191e2930353a41444748484133241c1b2a50676460545b676d5d594c4054532b22374b48525c606c655156493d453a2327333b424e62635d5853594a4036282030393e42484c5955514a45413e3a2d223a3f454d504f56544f4e47433f413b31514e5b63695f655f5d55554d52525745",
+          "average_hash": "ff3e3c3cfe381000",
+          "difference_hash": "bcf0f0f8b6e0e0e0"
+        },
+        {
+          "luma16x9": "15171e262d32373a3f434134271e1c1b171b222a2f35393e4245453b2c1f1c1b191e2930353a41444748484133241c1b2a50676460545b676d5d594c4054532b22364c47525b5f6b645055483d44392327333b424d61635d5852584a4035282030393e42484c5756514a45403d3a2e213940464d4f5057534f4d464340413a31504f5d656a5e66605f55515053565844",
+          "average_hash": "ff3e3c3cfe381000",
+          "difference_hash": "bcf0f0f8b6e0e0e0"
+        },
+        {
+          "luma16x9": "15171e262d32373a3f434134271e1c1b171b222a2f35393e4245453b2c1f1c1b191e2930353a41444748484133241c1b2a50676461545b676d5d594b4054532b22364c47525b5f6a644f54483d42382327333b424e61635d5752584a403528202e383e42484c5655514944403d3a2d22374143484f505550504d45433e3c3a30545959575c6a666262535359534b4848",
+          "average_hash": "ff3e3c3cfe381000",
+          "difference_hash": "d8f0f0f8b6e0e0e0"
+        },
+        {
+          "luma16x9": "15171e262d32373a3f434134271e1c1b171b222a2f35393e4245453b2c1f1c1b191e2930353a41444748484133241c1b2a50676460545b676d5d594c4054532b22364c47525b5f6b645055483d44392329333b424d61635e5852574a403528202d393e42484c5957524b44403d3a2c23393e434a544f5451504e48413c3e3e3048494d5d6165685659524d49424d4e49",
+          "average_hash": "ff3e3c3cfe381010",
+          "difference_hash": "b8f0f0f8b6e0e0e0"
+        },
+        {
+          "luma16x9": "15171e262d32373a3f434134271e1c1b171b222a2f35393e4245453b2c1f1c1b191e2930353a41444748484133241c1b2a50676461545b676d5d594b4054532b22364c47525b5f6a644f54483d42382328333b424e61635d5752584a403528202e393e42484b5956534b45413d3a2c233b3d444b534f5452514e49413c403e304d49535f656466585954534b484e5249",
+          "average_hash": "ff3e3c3cfe381010",
+          "difference_hash": "bcf0f0f8b6e0e0e0"
         }
       ],
       "min_nonblack_ratio": 0.85

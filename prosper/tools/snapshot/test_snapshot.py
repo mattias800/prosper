@@ -227,6 +227,178 @@ while True:
         self.assertFalse(ok)
         self.assertEqual(3, len(failures))
 
+    def test_consecutive_mode_rejects_enough_total_but_interspersed_matches(self):
+        entry = {
+            "min_qualifying_frames": 3,
+            "min_structural_matches": 3,
+            "min_nonblack_ratio": 0.5,
+            "min_nonblack_matches": 3,
+            "min_consecutive_content_matches": 3,
+            "structural_references": [{"luma16x9": "00" * (16 * 9)}],
+        }
+        summary = {
+            # Every aggregate floor passes. Only adjacency distinguishes the defect shape:
+            # three intended frames separated by intro/attract frames are not one plateau.
+            "records": [{}, {}, {}, {}, {}, {}],
+            "qualifying": [{}, {}, {}],
+            "pixel_changes": 5,
+            "dimensions_consistent": True,
+            "dims": (2, 1),
+            "structural_matches": 3,
+            "nonblack_matches": 6,
+            "longest_content_run": [{}],
+        }
+        ok, failures = SNAPSHOT.content_result(entry, summary)
+        self.assertFalse(ok)
+        self.assertEqual(["consecutive content matches 1 < 3"], failures)
+
+        summary["longest_content_run"] = [{}, {}, {}]
+        ok, failures = SNAPSHOT.content_result(entry, summary)
+        self.assertTrue(ok, failures)
+
+    def test_consecutive_mode_and_ratio_are_mutually_exclusive(self):
+        entry = {
+            "min_content_match_ratio": 0.75,
+            "min_consecutive_content_matches": 3,
+            "structural_references": [{"luma16x9": "00" * (16 * 9)}],
+        }
+        expected = (
+            "min_content_match_ratio and min_consecutive_content_matches are mutually exclusive")
+        with self.assertRaisesRegex(ValueError, expected):
+            SNAPSHOT.validate_content_entry(entry)
+        ok, failures = SNAPSHOT.content_result(entry, {})
+        self.assertFalse(ok)
+        self.assertEqual([expected], failures)
+
+    def test_consecutive_mode_requires_existing_reference_seed(self):
+        entry = {"min_consecutive_content_matches": 3}
+        with self.assertRaisesRegex(
+                ValueError, "requires existing structural_references to seed plateau"):
+            SNAPSHOT.validate_content_entry(entry)
+
+    def test_missing_sample_breaks_consecutive_content_run(self):
+        signature = tuple([0] * (16 * 9))
+        entry = {
+            "min_colors": 300,
+            "dims": [2, 1],
+            "min_nonblack_ratio": 0.5,
+            "min_structural_similarity": 0.85,
+            "structural_references": [{"luma16x9": "00" * (16 * 9)}],
+        }
+        records = [
+            {
+                "index": index, "colors": 335, "dims": (2, 1),
+                "nonblack_ratio": 1.0, "luma16x9": signature,
+            }
+            for index in (4, 5, 7, 8)
+        ]
+        self.assertEqual(2, len(SNAPSHOT.longest_content_run(entry, records)))
+
+    def test_default_ratio_mode_still_uses_the_whole_window(self):
+        entry = {
+            "min_qualifying_frames": 2,
+            "min_structural_matches": 2,
+            "min_nonblack_ratio": 0.5,
+            "min_nonblack_matches": 2,
+            "min_content_match_ratio": 0.75,
+            "structural_references": [{"luma16x9": "00" * (16 * 9)}],
+        }
+        summary = {
+            "records": [{} for _ in range(8)],
+            "qualifying": [{}, {}],
+            "pixel_changes": 0,
+            "dimensions_consistent": True,
+            "dims": (2, 1),
+            "structural_matches": 5,
+            "nonblack_matches": 5,
+        }
+        ok, failures = SNAPSHOT.content_result(entry, summary)
+        self.assertFalse(ok)
+        self.assertEqual([
+            "structural matches 5 < 6 (minimum SSIM 0.85)",
+            "non-black coverage matches 5 < 6 (minimum ratio 0.5)",
+        ], failures)
+
+    def test_cross_run_streak_uses_source_only_references_and_preserves_order(self):
+        menu = tuple([0] * 72 + [255] * 72)
+        negative = tuple([255] * 72 + [0] * 72)
+        entry = {
+            "min_colors": 300,
+            "dims": [2, 1],
+            "min_nonblack_ratio": 0.5,
+            "min_structural_similarity": 0.85,
+        }
+
+        def record(index, signature):
+            return {
+                "index": index,
+                "path": f"frame-{index}.png", "filename": f"frame-{index}.png",
+                "elapsed": float(index), "colors": 335, "dims": (2, 1),
+                "nonblack_ratio": 1.0, "luma16x9": signature,
+            }
+
+        source_run = [record(index, menu) for index in range(3)]
+        source = {
+            "records": source_run, "longest_content_run": source_run,
+            "richest": source_run[0],
+        }
+        target_run = [record(10, negative)] + [record(index, menu) for index in range(11, 14)]
+        target = {"records": target_run}
+        self.assertEqual(3, SNAPSHOT.cross_run_content_streak(entry, source, target))
+        self.assertEqual(
+            [11, 12, 13],
+            [item["index"] for item in SNAPSHOT.cross_run_content_run(entry, source, target)],
+        )
+
+        interspersed = [
+            record(20, menu), record(21, negative), record(22, menu),
+            record(23, negative), record(24, menu),
+        ]
+        self.assertEqual(
+            1, SNAPSHOT.cross_run_content_streak(entry, source, {"records": interspersed}))
+
+    def test_cross_run_plateau_excludes_transition_admitted_by_seed(self):
+        menu = tuple([0] * 72 + [255] * 72)
+        transition = tuple([255] * 72 + [0] * 72)
+        entry = {
+            "min_colors": 300,
+            "dims": [2, 1],
+            "min_nonblack_ratio": 0.5,
+            "min_structural_similarity": 0.85,
+            # The old reviewed seed contains both phases, so it alone admits the transition.
+            "structural_references": [
+                {"luma16x9": bytes(menu).hex()},
+                {"luma16x9": bytes(transition).hex()},
+            ],
+        }
+
+        def record(index, signature):
+            return {
+                "index": index,
+                "path": f"frame-{index}.png", "filename": f"frame-{index}.png",
+                "elapsed": float(index), "colors": 335, "dims": (2, 1),
+                "nonblack_ratio": 1.0, "luma16x9": signature,
+            }
+
+        run_a_records = [record(index, menu) for index in range(4)]
+        run_b_records = [record(10, transition)] + [
+            record(index, menu) for index in range(11, 14)
+        ]
+        run_a = {
+            "records": run_a_records,
+            "longest_content_run": SNAPSHOT.longest_content_run(entry, run_a_records),
+            "richest": run_a_records[0],
+        }
+        run_b = {
+            "records": run_b_records,
+            "longest_content_run": SNAPSHOT.longest_content_run(entry, run_b_records),
+            "richest": run_b_records[0],
+        }
+        self.assertEqual([10, 11, 12, 13], [
+            item["index"] for item in run_b["longest_content_run"]])
+        self.assertEqual([11, 12, 13], [
+            item["index"] for item in SNAPSHOT.cross_run_content_run(entry, run_a, run_b)])
+
     def test_entry_env_resolves_route_and_uses_fresh_save(self):
         with tempfile.TemporaryDirectory() as tmp:
             route = os.path.join(tmp, "route.pad")
