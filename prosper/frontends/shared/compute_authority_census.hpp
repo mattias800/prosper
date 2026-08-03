@@ -23,13 +23,18 @@ struct ShadowComputeAuthorityRange {
         return {};
     }
 
+    constexpr bool valid() const {
+        return known && bytes != 0 &&
+               address <= std::numeric_limits<uint64_t>::max() - (bytes - 1);
+    }
+
     constexpr bool operator==(const ShadowComputeAuthorityRange&) const = default;
 };
 
 constexpr bool shadow_compute_authority_ranges_overlap(
     const ShadowComputeAuthorityRange& first,
     const ShadowComputeAuthorityRange& second) {
-    if (!first.known || !second.known) return false;
+    if (!first.valid() || !second.valid()) return false;
     return first.address <= second.address
         ? second.address - first.address < first.bytes
         : first.address - second.address < second.bytes;
@@ -72,8 +77,9 @@ constexpr ShadowComputeAuthorityAccess shadow_compute_authority_access(
         case ShadowComputeAuthorityConsumerKind::Unknown:
         case ShadowComputeAuthorityConsumerKind::SubmitEnd:
             return ShadowComputeAuthorityAccess::AlwaysMaterialize;
+        default:
+            return ShadowComputeAuthorityAccess::AlwaysMaterialize;
     }
-    return ShadowComputeAuthorityAccess::AlwaysMaterialize;
 }
 
 enum class ShadowComputeAuthorityAction : uint8_t {
@@ -92,8 +98,12 @@ enum class ShadowComputeAuthorityReason : uint8_t {
     ResultReplaced,
     ProvenGpuConsumer,
     UnrelatedConsumer,
-    OverlappingGuestConsumer,
+    OverlappingGuestImageConsumer,
     OverlappingRawBufferConsumer,
+    OverlappingDrawConsumer,
+    OverlappingDmaConsumer,
+    OverlappingOrderedMemoryEffectConsumer,
+    CaptureConsumer,
     UnknownConsumerRange,
     UnknownConsumer,
     SubmitEnd,
@@ -116,7 +126,7 @@ struct ShadowComputeAuthorityState {
     bool guest_mirror_current = true;
 
     constexpr bool pending() const {
-        return range.known && vulkan_result_valid && !guest_mirror_current;
+        return range.valid() && vulkan_result_valid && !guest_mirror_current;
     }
 };
 
@@ -130,9 +140,17 @@ struct ShadowComputeAuthorityCounters {
     uint64_t unrelated_keeps = 0;
     uint64_t materializations = 0;
     uint64_t overlap_materializations = 0;
+    uint64_t proven_gpu_image_materializations = 0;
+    uint64_t guest_image_materializations = 0;
     uint64_t raw_buffer_materializations = 0;
-    uint64_t unknown_materializations = 0;
+    uint64_t draw_materializations = 0;
+    uint64_t dma_materializations = 0;
+    uint64_t ordered_memory_effect_materializations = 0;
+    uint64_t capture_materializations = 0;
+    uint64_t unknown_consumer_materializations = 0;
     uint64_t submit_end_materializations = 0;
+    uint64_t unknown_range_materializations = 0;
+    uint64_t invalid_result_materializations = 0;
     uint64_t range_change_materializations = 0;
 };
 
@@ -150,7 +168,7 @@ public:
         counters_.result_candidates =
             shadow_compute_authority_increment(counters_.result_candidates);
         const bool pending_before = state_.pending();
-        if (!range.known) {
+        if (!range.valid()) {
             counters_.rejected_results =
                 shadow_compute_authority_increment(counters_.rejected_results);
             if (pending_before) {
@@ -198,14 +216,20 @@ public:
                     ShadowComputeAuthorityReason::NoPendingResult, false, false};
 
         if (kind == ShadowComputeAuthorityConsumerKind::SubmitEnd)
-            return materialize(ShadowComputeAuthorityReason::SubmitEnd);
+            return materialize_consumer(kind, ShadowComputeAuthorityReason::SubmitEnd);
 
         const ShadowComputeAuthorityAccess access =
             shadow_compute_authority_access(kind);
-        if (access == ShadowComputeAuthorityAccess::AlwaysMaterialize)
-            return materialize(ShadowComputeAuthorityReason::UnknownConsumer);
-        if (!range.known)
-            return materialize(ShadowComputeAuthorityReason::UnknownConsumerRange);
+        if (access == ShadowComputeAuthorityAccess::AlwaysMaterialize) {
+            const ShadowComputeAuthorityReason reason =
+                kind == ShadowComputeAuthorityConsumerKind::Capture
+                    ? ShadowComputeAuthorityReason::CaptureConsumer
+                    : ShadowComputeAuthorityReason::UnknownConsumer;
+            return materialize_consumer(kind, reason);
+        }
+        if (!range.valid())
+            return materialize_consumer(
+                kind, ShadowComputeAuthorityReason::UnknownConsumerRange);
 
         if (!shadow_compute_authority_ranges_overlap(state_.range, range)) {
             counters_.unrelated_keeps =
@@ -221,11 +245,32 @@ public:
                     ShadowComputeAuthorityReason::ProvenGpuConsumer, true, true};
         }
 
-        const ShadowComputeAuthorityReason reason =
-            kind == ShadowComputeAuthorityConsumerKind::RawBuffer
-                ? ShadowComputeAuthorityReason::OverlappingRawBufferConsumer
-                : ShadowComputeAuthorityReason::OverlappingGuestConsumer;
-        return materialize(reason);
+        ShadowComputeAuthorityReason reason =
+            ShadowComputeAuthorityReason::UnknownConsumer;
+        switch (kind) {
+            case ShadowComputeAuthorityConsumerKind::GuestImage:
+                reason = ShadowComputeAuthorityReason::OverlappingGuestImageConsumer;
+                break;
+            case ShadowComputeAuthorityConsumerKind::RawBuffer:
+                reason = ShadowComputeAuthorityReason::OverlappingRawBufferConsumer;
+                break;
+            case ShadowComputeAuthorityConsumerKind::Draw:
+                reason = ShadowComputeAuthorityReason::OverlappingDrawConsumer;
+                break;
+            case ShadowComputeAuthorityConsumerKind::Dma:
+                reason = ShadowComputeAuthorityReason::OverlappingDmaConsumer;
+                break;
+            case ShadowComputeAuthorityConsumerKind::OrderedMemoryEffect:
+                reason =
+                    ShadowComputeAuthorityReason::OverlappingOrderedMemoryEffectConsumer;
+                break;
+            case ShadowComputeAuthorityConsumerKind::ProvenGpuImage:
+            case ShadowComputeAuthorityConsumerKind::Capture:
+            case ShadowComputeAuthorityConsumerKind::Unknown:
+            case ShadowComputeAuthorityConsumerKind::SubmitEnd:
+                break;
+        }
+        return materialize_consumer(kind, reason);
     }
 
 private:
@@ -233,25 +278,22 @@ private:
         counters_.materializations =
             shadow_compute_authority_increment(counters_.materializations);
         switch (reason) {
-            case ShadowComputeAuthorityReason::OverlappingGuestConsumer:
-                counters_.overlap_materializations = shadow_compute_authority_increment(
-                    counters_.overlap_materializations);
-                break;
+            case ShadowComputeAuthorityReason::OverlappingGuestImageConsumer:
             case ShadowComputeAuthorityReason::OverlappingRawBufferConsumer:
+            case ShadowComputeAuthorityReason::OverlappingDrawConsumer:
+            case ShadowComputeAuthorityReason::OverlappingDmaConsumer:
+            case ShadowComputeAuthorityReason::OverlappingOrderedMemoryEffectConsumer:
                 counters_.overlap_materializations = shadow_compute_authority_increment(
                     counters_.overlap_materializations);
-                counters_.raw_buffer_materializations = shadow_compute_authority_increment(
-                    counters_.raw_buffer_materializations);
                 break;
             case ShadowComputeAuthorityReason::UnknownConsumerRange:
-            case ShadowComputeAuthorityReason::UnknownConsumer:
-            case ShadowComputeAuthorityReason::InvalidResultRange:
-                counters_.unknown_materializations = shadow_compute_authority_increment(
-                    counters_.unknown_materializations);
+                counters_.unknown_range_materializations = shadow_compute_authority_increment(
+                    counters_.unknown_range_materializations);
                 break;
-            case ShadowComputeAuthorityReason::SubmitEnd:
-                counters_.submit_end_materializations = shadow_compute_authority_increment(
-                    counters_.submit_end_materializations);
+            case ShadowComputeAuthorityReason::InvalidResultRange:
+                counters_.invalid_result_materializations =
+                    shadow_compute_authority_increment(
+                        counters_.invalid_result_materializations);
                 break;
             case ShadowComputeAuthorityReason::ResultRangeChanged:
                 counters_.range_change_materializations = shadow_compute_authority_increment(
@@ -262,14 +304,64 @@ private:
             case ShadowComputeAuthorityReason::ResultReplaced:
             case ShadowComputeAuthorityReason::ProvenGpuConsumer:
             case ShadowComputeAuthorityReason::UnrelatedConsumer:
+            case ShadowComputeAuthorityReason::CaptureConsumer:
+            case ShadowComputeAuthorityReason::UnknownConsumer:
+            case ShadowComputeAuthorityReason::SubmitEnd:
                 break;
         }
         state_.guest_mirror_current = true;
     }
 
-    constexpr ShadowComputeAuthorityTransition materialize(
+    constexpr ShadowComputeAuthorityTransition materialize_consumer(
+        ShadowComputeAuthorityConsumerKind kind,
         ShadowComputeAuthorityReason reason) {
         record_materialization(reason);
+        switch (kind) {
+            case ShadowComputeAuthorityConsumerKind::GuestImage:
+                counters_.guest_image_materializations = shadow_compute_authority_increment(
+                    counters_.guest_image_materializations);
+                break;
+            case ShadowComputeAuthorityConsumerKind::RawBuffer:
+                counters_.raw_buffer_materializations = shadow_compute_authority_increment(
+                    counters_.raw_buffer_materializations);
+                break;
+            case ShadowComputeAuthorityConsumerKind::Draw:
+                counters_.draw_materializations = shadow_compute_authority_increment(
+                    counters_.draw_materializations);
+                break;
+            case ShadowComputeAuthorityConsumerKind::Dma:
+                counters_.dma_materializations = shadow_compute_authority_increment(
+                    counters_.dma_materializations);
+                break;
+            case ShadowComputeAuthorityConsumerKind::OrderedMemoryEffect:
+                counters_.ordered_memory_effect_materializations =
+                    shadow_compute_authority_increment(
+                        counters_.ordered_memory_effect_materializations);
+                break;
+            case ShadowComputeAuthorityConsumerKind::Capture:
+                counters_.capture_materializations = shadow_compute_authority_increment(
+                    counters_.capture_materializations);
+                break;
+            case ShadowComputeAuthorityConsumerKind::Unknown:
+                counters_.unknown_consumer_materializations =
+                    shadow_compute_authority_increment(
+                        counters_.unknown_consumer_materializations);
+                break;
+            case ShadowComputeAuthorityConsumerKind::SubmitEnd:
+                counters_.submit_end_materializations = shadow_compute_authority_increment(
+                    counters_.submit_end_materializations);
+                break;
+            case ShadowComputeAuthorityConsumerKind::ProvenGpuImage:
+                counters_.proven_gpu_image_materializations =
+                    shadow_compute_authority_increment(
+                        counters_.proven_gpu_image_materializations);
+                break;
+            default:
+                counters_.unknown_consumer_materializations =
+                    shadow_compute_authority_increment(
+                        counters_.unknown_consumer_materializations);
+                break;
+        }
         return {ShadowComputeAuthorityAction::MaterializeGuestMirror,
                 reason, true, false};
     }

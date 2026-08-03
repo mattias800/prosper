@@ -1,6 +1,5 @@
 #include "compute_authority_census.hpp"
 
-#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -13,6 +12,19 @@ static int failures = 0;
     else { std::printf("  FAIL %s\n", name); ++failures; } \
 } while (0)
 
+static uint64_t attributed_materializations(
+    const ShadowComputeAuthorityCounters& counters) {
+    return counters.proven_gpu_image_materializations +
+           counters.guest_image_materializations +
+           counters.raw_buffer_materializations +
+           counters.draw_materializations +
+           counters.dma_materializations +
+           counters.ordered_memory_effect_materializations +
+           counters.capture_materializations +
+           counters.unknown_consumer_materializations +
+           counters.submit_end_materializations;
+}
+
 int main() {
     std::printf("shadow compute authority census policy\n");
 
@@ -23,13 +35,27 @@ int main() {
     constexpr auto zero = ShadowComputeAuthorityRange::from(0x200000, 0);
     constexpr auto wrapped = ShadowComputeAuthorityRange::from(
         std::numeric_limits<uint64_t>::max() - 3, 8);
-    CHECK(atlas.known && atlas_tail.known && adjacent.known && unrelated.known &&
-              !zero.known && !wrapped.known &&
+    constexpr ShadowComputeAuthorityRange forged_wrapped{
+        std::numeric_limits<uint64_t>::max() - 3, 8, true};
+    CHECK(atlas.valid() && atlas_tail.valid() && adjacent.valid() &&
+              unrelated.valid() && !zero.valid() && !wrapped.valid() &&
               shadow_compute_authority_ranges_overlap(atlas, atlas_tail) &&
               !shadow_compute_authority_ranges_overlap(atlas, adjacent) &&
               !shadow_compute_authority_ranges_overlap(
                   atlas, ShadowComputeAuthorityRange::unknown()),
           "half-open authority ranges reject zero/wrap and distinguish overlap from adjacency");
+    CHECK(forged_wrapped.known && !forged_wrapped.valid() &&
+              !shadow_compute_authority_ranges_overlap(atlas, forged_wrapped),
+          "a caller-forged known overflowing range is still rejected");
+
+    CHECK(shadow_compute_authority_increment(0) == 1 &&
+              shadow_compute_authority_increment(
+                  std::numeric_limits<uint64_t>::max() - 1) ==
+                  std::numeric_limits<uint64_t>::max() &&
+              shadow_compute_authority_increment(
+                  std::numeric_limits<uint64_t>::max()) ==
+                  std::numeric_limits<uint64_t>::max(),
+          "authority counters saturate at UINT64_MAX instead of wrapping");
 
     ShadowComputeAuthorityCensus chain;
     const auto admitted = chain.note_retained_result(atlas);
@@ -66,6 +92,8 @@ int main() {
     (void)raw_overlap.note_retained_result(atlas);
     const auto raw_read = raw_overlap.observe(
         ShadowComputeAuthorityConsumerKind::RawBuffer, atlas_tail);
+    const auto after_raw = raw_overlap.observe(
+        ShadowComputeAuthorityConsumerKind::Draw, atlas_tail);
     CHECK(raw_read.action == ShadowComputeAuthorityAction::MaterializeGuestMirror &&
               raw_read.reason ==
                   ShadowComputeAuthorityReason::OverlappingRawBufferConsumer &&
@@ -75,28 +103,63 @@ int main() {
               raw_overlap.state().guest_mirror_current &&
               raw_overlap.counters().materializations == 1 &&
               raw_overlap.counters().overlap_materializations == 1 &&
-              raw_overlap.counters().raw_buffer_materializations == 1,
+              raw_overlap.counters().raw_buffer_materializations == 1 &&
+              raw_overlap.counters().draw_materializations == 0 &&
+              attributed_materializations(raw_overlap.counters()) == 1 &&
+              after_raw.action == ShadowComputeAuthorityAction::NoPendingResult,
           "overlapping raw-buffer consumer forces guest materialization");
 
-    bool all_known_guest_observers_materialize = true;
-    constexpr std::array guest_observers{
-        ShadowComputeAuthorityConsumerKind::GuestImage,
-        ShadowComputeAuthorityConsumerKind::Draw,
-        ShadowComputeAuthorityConsumerKind::Dma,
-        ShadowComputeAuthorityConsumerKind::OrderedMemoryEffect,
-    };
-    for (const auto kind : guest_observers) {
-        ShadowComputeAuthorityCensus observer;
-        (void)observer.note_retained_result(atlas);
-        const auto transition = observer.observe(kind, atlas_tail);
-        all_known_guest_observers_materialize &=
-            transition.action == ShadowComputeAuthorityAction::MaterializeGuestMirror &&
-            transition.reason == ShadowComputeAuthorityReason::OverlappingGuestConsumer &&
-            observer.counters().overlap_materializations == 1 &&
-            observer.counters().materializations == 1 && !observer.state().pending();
-    }
-    CHECK(all_known_guest_observers_materialize,
-          "known guest-image draw DMA and memory-effect overlaps fail closed");
+    ShadowComputeAuthorityCensus guest_image;
+    (void)guest_image.note_retained_result(atlas);
+    const auto guest_image_read = guest_image.observe(
+        ShadowComputeAuthorityConsumerKind::GuestImage, atlas_tail);
+    CHECK(guest_image_read.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              guest_image_read.reason ==
+                  ShadowComputeAuthorityReason::OverlappingGuestImageConsumer &&
+              guest_image.counters().guest_image_materializations == 1 &&
+              guest_image.counters().overlap_materializations == 1 &&
+              guest_image.counters().materializations == 1 &&
+              attributed_materializations(guest_image.counters()) == 1,
+          "overlapping guest-image consumer is attributed exactly");
+
+    ShadowComputeAuthorityCensus draw;
+    (void)draw.note_retained_result(atlas);
+    const auto draw_read = draw.observe(
+        ShadowComputeAuthorityConsumerKind::Draw, atlas_tail);
+    CHECK(draw_read.action == ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              draw_read.reason == ShadowComputeAuthorityReason::OverlappingDrawConsumer &&
+              draw.counters().draw_materializations == 1 &&
+              draw.counters().overlap_materializations == 1 &&
+              draw.counters().materializations == 1 &&
+              attributed_materializations(draw.counters()) == 1,
+          "overlapping draw consumer is attributed exactly");
+
+    ShadowComputeAuthorityCensus dma;
+    (void)dma.note_retained_result(atlas);
+    const auto dma_read = dma.observe(
+        ShadowComputeAuthorityConsumerKind::Dma, atlas_tail);
+    CHECK(dma_read.action == ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              dma_read.reason == ShadowComputeAuthorityReason::OverlappingDmaConsumer &&
+              dma.counters().dma_materializations == 1 &&
+              dma.counters().overlap_materializations == 1 &&
+              dma.counters().materializations == 1 &&
+              attributed_materializations(dma.counters()) == 1,
+          "overlapping DMA consumer is attributed exactly");
+
+    ShadowComputeAuthorityCensus memory_effect;
+    (void)memory_effect.note_retained_result(atlas);
+    const auto memory_effect_write = memory_effect.observe(
+        ShadowComputeAuthorityConsumerKind::OrderedMemoryEffect, atlas_tail);
+    CHECK(memory_effect_write.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              memory_effect_write.reason ==
+                  ShadowComputeAuthorityReason::OverlappingOrderedMemoryEffectConsumer &&
+              memory_effect.counters().ordered_memory_effect_materializations == 1 &&
+              memory_effect.counters().overlap_materializations == 1 &&
+              memory_effect.counters().materializations == 1 &&
+              attributed_materializations(memory_effect.counters()) == 1,
+          "overlapping ordered memory effect is attributed exactly");
 
     ShadowComputeAuthorityCensus unknown_kind;
     (void)unknown_kind.note_retained_result(atlas);
@@ -106,15 +169,20 @@ int main() {
     (void)capture.note_retained_result(atlas);
     const auto capture_consumer = capture.observe(
         ShadowComputeAuthorityConsumerKind::Capture, unrelated);
+    CHECK(capture_consumer.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              capture_consumer.reason == ShadowComputeAuthorityReason::CaptureConsumer &&
+              capture.counters().capture_materializations == 1 &&
+              capture.counters().materializations == 1 &&
+              attributed_materializations(capture.counters()) == 1,
+          "capture consumer is attributed exactly even with a claimed disjoint range");
     CHECK(unknown_consumer.action ==
                   ShadowComputeAuthorityAction::MaterializeGuestMirror &&
               unknown_consumer.reason == ShadowComputeAuthorityReason::UnknownConsumer &&
-              capture_consumer.action ==
-                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
-              capture_consumer.reason == ShadowComputeAuthorityReason::UnknownConsumer &&
-              unknown_kind.counters().unknown_materializations == 1 &&
-              capture.counters().unknown_materializations == 1,
-          "unknown and capture consumers materialize even with a disjoint claimed range");
+              unknown_kind.counters().unknown_consumer_materializations == 1 &&
+              unknown_kind.counters().materializations == 1 &&
+              attributed_materializations(unknown_kind.counters()) == 1,
+          "unknown consumer is attributed exactly even with a claimed disjoint range");
 
     ShadowComputeAuthorityCensus unknown_range;
     (void)unknown_range.note_retained_result(atlas);
@@ -125,8 +193,34 @@ int main() {
                   ShadowComputeAuthorityAction::MaterializeGuestMirror &&
               unbounded_draw.reason ==
                   ShadowComputeAuthorityReason::UnknownConsumerRange &&
-              unknown_range.counters().unknown_materializations == 1,
-          "a guest consumer without an exact range fails closed");
+              unknown_range.counters().draw_materializations == 1 &&
+              unknown_range.counters().unknown_range_materializations == 1,
+          "an unbounded draw remains attributed while failing closed on its range");
+
+    ShadowComputeAuthorityCensus unbounded_gpu;
+    (void)unbounded_gpu.note_retained_result(atlas);
+    const auto unknown_gpu_range = unbounded_gpu.observe(
+        ShadowComputeAuthorityConsumerKind::ProvenGpuImage,
+        ShadowComputeAuthorityRange::unknown());
+    CHECK(unknown_gpu_range.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              unknown_gpu_range.reason ==
+                  ShadowComputeAuthorityReason::UnknownConsumerRange &&
+              unbounded_gpu.counters().proven_gpu_image_materializations == 1 &&
+              unbounded_gpu.counters().unknown_range_materializations == 1 &&
+              attributed_materializations(unbounded_gpu.counters()) == 1,
+          "an unbounded proven-GPU consumer retains exact kind attribution");
+
+    ShadowComputeAuthorityCensus invalid_kind;
+    (void)invalid_kind.note_retained_result(atlas);
+    const auto invalid_consumer = invalid_kind.observe(
+        static_cast<ShadowComputeAuthorityConsumerKind>(0xff), unrelated);
+    CHECK(invalid_consumer.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              invalid_consumer.reason == ShadowComputeAuthorityReason::UnknownConsumer &&
+              invalid_kind.counters().unknown_consumer_materializations == 1 &&
+              attributed_materializations(invalid_kind.counters()) == 1,
+          "an invalid consumer enum is attributed as unknown and fails closed");
 
     ShadowComputeAuthorityCensus submit;
     (void)submit.note_retained_result(atlas);
@@ -140,6 +234,7 @@ int main() {
               submit_end.pending_before && !submit_end.pending_after &&
               submit.counters().submit_end_materializations == 1 &&
               submit.counters().materializations == 1 &&
+              attributed_materializations(submit.counters()) == 1 &&
               after_submit.action == ShadowComputeAuthorityAction::NoPendingResult,
           "submit end materializes each pending result exactly once");
 
@@ -165,6 +260,20 @@ int main() {
               !rejected.state().pending() && rejected.counters().result_candidates == 1 &&
               rejected.counters().rejected_results == 1,
           "an invalid result range cannot create shadow authority");
+
+    ShadowComputeAuthorityCensus rejected_pending;
+    (void)rejected_pending.note_retained_result(atlas);
+    const auto invalid_pending = rejected_pending.note_retained_result(forged_wrapped);
+    CHECK(invalid_pending.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              invalid_pending.reason == ShadowComputeAuthorityReason::InvalidResultRange &&
+              invalid_pending.pending_before && !invalid_pending.pending_after &&
+              !rejected_pending.state().pending() &&
+              rejected_pending.counters().result_candidates == 2 &&
+              rejected_pending.counters().rejected_results == 1 &&
+              rejected_pending.counters().invalid_result_materializations == 1 &&
+              rejected_pending.counters().materializations == 1,
+          "a forged invalid result flushes an existing pending authority");
 
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
