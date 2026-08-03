@@ -256,6 +256,40 @@ while True:
         ok, failures = SNAPSHOT.content_result(entry, summary)
         self.assertTrue(ok, failures)
 
+    def test_consecutive_mode_scopes_pixel_progression_to_the_content_run(self):
+        entry = {
+            "min_qualifying_frames": 3,
+            "min_pixel_changes": 2,
+            "min_structural_matches": 3,
+            "min_nonblack_ratio": 0.5,
+            "min_nonblack_matches": 3,
+            "min_consecutive_content_matches": 3,
+            "structural_references": [{"luma16x9": "00" * (16 * 9)}],
+        }
+        summary = {
+            # Intro animation satisfies the aggregate progression count, but the intended
+            # content plateau is frozen. The unrelated phase must not make this guard pass.
+            "records": [{}, {}, {}, {}, {}, {}],
+            "qualifying": [{}, {}, {}],
+            "pixel_changes": 5,
+            "dimensions_consistent": True,
+            "dims": (2, 1),
+            "structural_matches": 3,
+            "nonblack_matches": 3,
+            "longest_content_run": [
+                {"hash": "frozen"}, {"hash": "frozen"}, {"hash": "frozen"},
+            ],
+        }
+        ok, failures = SNAPSHOT.content_result(entry, summary)
+        self.assertFalse(ok)
+        self.assertEqual(["consecutive content pixel changes 0 < 2"], failures)
+
+        summary["longest_content_run"] = [
+            {"hash": "a"}, {"hash": "b"}, {"hash": "c"},
+        ]
+        ok, failures = SNAPSHOT.content_result(entry, summary)
+        self.assertTrue(ok, failures)
+
     def test_consecutive_mode_and_ratio_are_mutually_exclusive(self):
         entry = {
             "min_content_match_ratio": 0.75,

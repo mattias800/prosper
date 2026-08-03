@@ -31,6 +31,12 @@ python3 tools/snapshot/snapshot.py check blasphemous2-gameplay
 - Do not lower a threshold merely to pass. Explain intentional contract changes
   and repeat the baseline-review workflow below.
 
+`screenshot` normalizes alpha only for rendered captures because `prosper-app`
+presents them through an opaque Vulkan swapchain. Do not re-premultiply those
+pixels or calibrate a threshold from a transparency-aware image viewer: neither
+matches the user's desktop. Raw scanout is different evidence and keeps guest
+alpha unchanged.
+
 ### Why the content contract is conjoined, measured on real titles
 
 "Colour count must never be the contract on its own" is not a precaution; it is
@@ -186,8 +192,10 @@ follow the order above rather than the obvious one.
   instead of the whole-window ratio; configuring both is an error. This is not
   permission to count scattered matches: every adjacent sampler index in the
   required run must jointly clear colour, SSIM, non-black coverage, and
-  dimensions, and an omitted index breaks the run. Existing reviewed structural
-  references are required to seed plateau identification. `verify` then
+  dimensions, and an omitted index breaks the run. `min_pixel_changes` is scoped
+  to that identified run, so unrelated boot animation cannot hide a frozen
+  checkpoint. Existing reviewed structural references are required to seed
+  plateau identification. `verify` then
   cross-scores each run using only the other run's identified plateau references
   before saving plateau-only evidence and a candidate. Inspect the whole profile
   and score explicit off-scene negatives anyway; a long stable menu, logo, or

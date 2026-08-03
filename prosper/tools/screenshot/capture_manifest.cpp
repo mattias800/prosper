@@ -4,8 +4,31 @@
 #include <cstdio>
 #include <iomanip>
 #include <sstream>
+#include <unordered_set>
 
 namespace prosper::screenshot {
+
+void normalize_capture_rgba(CaptureSource source, std::vector<uint8_t>& pixels) {
+    if (source != CaptureSource::Rendered) return;
+    for (size_t offset = 3; offset < pixels.size(); offset += 4)
+        pixels[offset] = 255;
+}
+
+PixelContentMetrics measure_pixel_content_rgba(const std::vector<uint8_t>& pixels) {
+    std::unordered_set<uint32_t> colors;
+    colors.reserve(std::min<size_t>(pixels.size() / 4, 65536));
+    uint64_t nonblack = 0;
+    for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+        const uint32_t alpha = pixels[i + 3];
+        const uint32_t red = (static_cast<uint32_t>(pixels[i]) * alpha + 127) / 255;
+        const uint32_t green = (static_cast<uint32_t>(pixels[i + 1]) * alpha + 127) / 255;
+        const uint32_t blue = (static_cast<uint32_t>(pixels[i + 2]) * alpha + 127) / 255;
+        const uint32_t rgb = (red << 16) | (green << 8) | blue;
+        colors.insert(rgb);
+        nonblack += rgb != 0;
+    }
+    return {static_cast<uint32_t>(colors.size()), nonblack};
+}
 
 namespace {
 uint8_t cell_luma(const std::vector<uint8_t>& pixels, uint32_t width, uint32_t height,

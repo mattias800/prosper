@@ -47,8 +47,8 @@ in [Game compatibility](COMPATIBILITY.md).
   <em><strong>Space Adventure Cobra — The Awakening</strong> — tutorial combat, native 1920×1080</em>
 </p>
 <p align="center">
-  <img src="assets/screenshots/blue-prince-title.png" alt="Blue Prince — title screen"><br>
-  <em><strong>Blue Prince</strong> — title screen</em>
+  <img src="assets/screenshots/blue-prince-hall.png" alt="Blue Prince — Day One entrance hall"><br>
+  <em><strong>Blue Prince</strong> — Day One entrance hall, native 1920×1080</em>
 </p>
 <p align="center">
   <img src="assets/screenshots/terminator.png" alt="Terminator 2D: NO FATE — attract-mode gameplay"><br>

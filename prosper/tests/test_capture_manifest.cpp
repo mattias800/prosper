@@ -82,6 +82,27 @@ int main() {
     const auto transparent_luma = perceptual_luma16x9_rgba(gradient, 9, 8);
     CHECK(transparent_luma.front() == 0 && transparent_luma.back() == 0,
           "structural signature ignores invisible RGB beneath zero alpha");
+
+    // Renderer output is presented by prosper-app through an explicitly opaque swapchain. A render
+    // target may therefore carry near-zero alpha while its RGB is fully visible on the desktop. The
+    // screenshot persistence boundary must match the viewer, while raw guest scanout stays literal.
+    std::vector<uint8_t> low_alpha_rendered = {
+        220, 30, 10, 0,  20, 180, 40, 1,
+        220, 30, 10, 0,  20, 180, 40, 1,
+    };
+    auto opaque_expected = low_alpha_rendered;
+    for (size_t i = 3; i < opaque_expected.size(); i += 4) opaque_expected[i] = 255;
+    auto raw_scanout = low_alpha_rendered;
+    normalize_capture_rgba(CaptureSource::Rendered, low_alpha_rendered);
+    normalize_capture_rgba(CaptureSource::RawScanout, raw_scanout);
+    const auto visible_content = measure_pixel_content_rgba(low_alpha_rendered);
+    CHECK(low_alpha_rendered == opaque_expected && visible_content.distinct_colors == 2 &&
+          visible_content.nonblack_pixels == 4 &&
+          perceptual_luma16x9_rgba(low_alpha_rendered, 2, 2) ==
+              perceptual_luma16x9_rgba(opaque_expected, 2, 2),
+          "opaque rendered capture preserves viewer-visible colors and structure despite low alpha");
+    CHECK(raw_scanout[3] == 0 && raw_scanout[7] == 1,
+          "raw scanout capture preserves guest alpha bytes");
     const std::string long_route(4096, 'x');
     const std::string long_line = manifest_sample_json(3, "long.png", c, cc, long_route);
     CHECK(long_line.size() > long_route.size() && long_line.find(long_route) != std::string::npos,

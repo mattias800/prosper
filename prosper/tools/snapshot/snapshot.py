@@ -476,6 +476,11 @@ def choose_review_records(summary, count=8):
     return sorted({r["path"]: r for r in selected}.values(), key=lambda r: r["elapsed"])
 
 
+def content_run_pixel_changes(records):
+    """Count visible progression inside one adjacent content run."""
+    return sum(a.get("hash") != b.get("hash") for a, b in zip(records, records[1:]))
+
+
 def longest_content_run(entry, records, reference_signatures=None, include_structural=True):
     """Return the longest adjacent run satisfying the complete content contract.
 
@@ -561,8 +566,13 @@ def content_result(entry, summary, include_structural=True):
             failures.append("min_consecutive_content_matches must be positive")
     if len(summary["qualifying"]) < required_frames:
         failures.append(f"qualifying frames {len(summary['qualifying'])} < {required_frames}")
-    if summary["pixel_changes"] < required_changes:
-        failures.append(f"pixel changes {summary['pixel_changes']} < {required_changes}")
+    observed_changes = summary["pixel_changes"]
+    if consecutive_required is not None:
+        observed_changes = content_run_pixel_changes(summary.get("longest_content_run", []))
+    if observed_changes < required_changes:
+        scope = ("consecutive content pixel changes"
+                 if consecutive_required is not None else "pixel changes")
+        failures.append(f"{scope} {observed_changes} < {required_changes}")
     if not summary["dimensions_consistent"]:
         failures.append("frame dimensions changed within evidence window")
     if expected_dims and summary["dims"] != expected_dims:
@@ -644,11 +654,16 @@ def save_content_metadata(path, summary, review_names=None):
         "qualifying_frames": len(summary["qualifying"]),
         "pixel_changes": summary["pixel_changes"],
     }
-    if "verified_content_run" in summary:
+    if "longest_content_run" in summary:
         metadata["longest_consecutive_content_matches"] = len(
             summary.get("longest_content_run", []))
+        metadata["longest_consecutive_content_pixel_changes"] = (
+            content_run_pixel_changes(summary.get("longest_content_run", [])))
+    if "verified_content_run" in summary:
         metadata["cross_verified_consecutive_content_matches"] = len(
             summary["verified_content_run"])
+        metadata["cross_verified_consecutive_content_pixel_changes"] = (
+            content_run_pixel_changes(summary["verified_content_run"]))
     with open(path, "w") as f:
         json.dump(metadata, f, indent=2)
         f.write("\n")
@@ -1023,6 +1038,11 @@ def cmd_verify(m, names):
                           len(summary1["longest_content_run"]) >= consecutive_required and
                           len(summary2["longest_content_run"]) >= consecutive_required and
                           cross_ab >= consecutive_required and cross_ba >= consecutive_required)
+                    if int(s.get("min_pixel_changes", 0)) > 0:
+                        required_changes = int(s["min_pixel_changes"])
+                        ok = (ok and
+                              content_run_pixel_changes(cross_run1) >= required_changes and
+                              content_run_pixel_changes(cross_run2) >= required_changes)
                 saved1 = save_content_evidence(s["name"], 1, summary1, s)
                 saved2 = save_content_evidence(s["name"], 2, summary2, s)
                 _cleanup(t1)
@@ -1039,6 +1059,12 @@ def cmd_verify(m, names):
                     print(f"         consecutive={len(summary1['longest_content_run'])}/"
                           f"{len(summary2['longest_content_run'])}; cross-run A->B={cross_ab} "
                           f"B->A={cross_ba}; required={consecutive_required}")
+                    print(f"         plateau pixel changes="
+                          f"{content_run_pixel_changes(summary1['longest_content_run'])}/"
+                          f"{content_run_pixel_changes(summary2['longest_content_run'])}; "
+                          f"cross-run A->B={content_run_pixel_changes(cross_run2)} "
+                          f"B->A={content_run_pixel_changes(cross_run1)}; "
+                          f"required={int(s.get('min_pixel_changes', 0))}")
                 if why1 or why2:
                     print(f"         failures: run1={why1 or 'none'} run2={why2 or 'none'}")
                 print(f"         REVIEW REQUIRED: inspect {len(saved1) + len(saved2)} images in {out_dir}")
@@ -1093,7 +1119,9 @@ def cmd_check(m, names):
                     consecutive_detail = ""
                     if s.get("min_consecutive_content_matches") is not None:
                         consecutive_detail = (
-                            f", consecutive_matches={len(summary['longest_content_run'])}")
+                            f", consecutive_matches={len(summary['longest_content_run'])}, "
+                            f"consecutive_pixel_changes="
+                            f"{content_run_pixel_changes(summary['longest_content_run'])}")
                     print(f"[check] {s['name']}: OK ({summary['dims'][0]}x{summary['dims'][1]}, "
                           f"frames={len(summary['records'])}, qualifying={len(summary['qualifying'])}, "
                           f"richest={summary['richest']['colors']} colors, "

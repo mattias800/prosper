@@ -34,6 +34,18 @@ struct PerceptualHashes {
     uint64_t difference = 0;
 };
 
+struct PixelContentMetrics {
+    uint32_t distinct_colors = 0;
+    uint64_t nonblack_pixels = 0;
+};
+
+// The desktop frontend presents renderer output through an OPAQUE Vulkan swapchain. Preserve that
+// exact visible contract in persisted screenshots and their metrics: render-target alpha is not
+// blended into the desktop image. Raw scanout remains byte-for-byte guest evidence and is untouched.
+void normalize_capture_rgba(CaptureSource source, std::vector<uint8_t>& pixels);
+
+PixelContentMetrics measure_pixel_content_rgba(const std::vector<uint8_t>& pixels);
+
 // Standard 8x8 average hash plus 9x8 horizontal difference hash. These intentionally discard
 // fine pixel detail so small raster changes remain close while missing layers alter the signature.
 PerceptualHashes perceptual_hashes_rgba(const std::vector<uint8_t>& pixels,

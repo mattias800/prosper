@@ -38,6 +38,12 @@ Snapshot rendering uses the shared renderer's hardware-first Vulkan selection: d
 and virtual GPUs are preferred over CPU devices, with llvmpipe used only when no usable GPU is exposed.
 The selected device is printed in each retained run log.
 
+Rendered captures follow `prosper-app`'s opaque-swapchain contract: the screenshot
+export boundary normalizes alpha to 255 before writing the PNG, CRC, colour and
+coverage metrics, perceptual signatures, or stale-pixel classification. A render
+target's alpha channel is not desktop transparency. Raw scanout captures remain
+byte-for-byte guest evidence, including alpha.
+
 ## Guard Modes
 
 ### Routed content guard
@@ -75,7 +81,9 @@ entry can define:
   plateau identification. `verify` first finds each run's plateau against that
   seed, then requires A-plateau-only references to pass run B and B-plateau-only
   references to pass run A before it can produce an adoptable candidate. Saved
-  review and candidate references come only from those identified plateaus.
+  review and candidate references come only from those identified plateaus. When
+  `min_pixel_changes` is set, those changes must occur inside the identified
+  plateau; animation in an unrelated intro cannot hide a frozen checkpoint.
 - `min_nonblack_ratio`: conservative coverage floor generated during baseline
   approval at half the lowest reviewed coverage. It rejects blank output
   without requiring a normally dark game to be bright.

@@ -1,6 +1,6 @@
 # Blue Prince (PPSA25009, Unity/IL2CPP) — status & investigation map
 
-Last revised: 2026-07-26 (materials fixed and residual vanished draws triaged; see below). Prior history:
+Last revised: 2026-08-03 (snapshot route/reference triage; see Ruled out). Prior history:
 #1216 (closed — boot/blank-frame era), #1264 (Day One hold investigation), #1287 (visuals umbrella,
 open).
 
@@ -21,7 +21,9 @@ PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_IME_AUTOKEY=1 PR
 `PROSPER_IME_AUTOKEY=1` answers the save-name IME; the route needs no pad script. Timing:
 intro cinematic ≈ shots 20–70, Day One yard ≈ 90–115, front door/vestibule ≈ 115+ (plain run);
 capture-armed runs pace 2.4–4× slower — budget `--count 730` to pass renderer submit 3300.
-The `blue-prince-title` snapshot route guards the title screen.
+The `blue-prince-title` snapshot route guards the title screen. The `blue-prince-hall` route guards
+the native 1920×1080 entrance hall with a progressing, cross-run-validated content plateau; its
+reviewed live capture is published as `assets/screenshots/blue-prince-hall.png`.
 
 ## Landed fixes this arc (evidence on the linked issues/PRs)
 
@@ -228,3 +230,33 @@ Also closed: the **27 draws that still vanish at clip in the entrance hall are n
 was individually probed and confirmed as a legitimate frustum cull, and the transparent passes
 reproduced the same off-screen bounds as their opaque passes (#1435/#1443). Do not re-open a
 vanished-draw triage for that room without a *new* symptom.
+
+Snapshot-guard triage (#1433/#1697) ruled out three tempting repairs and one misleading instrument:
+
+- The `blue-prince-hall` failure is not evidence of a renderer regression and must not be repaired
+  by lowering its thresholds. The current evaluator rejects three complete retained healthy runs;
+  all eight inspected images from the newest run are the will/phonograph intro, not the hall.
+- Neither the old 345--388 second window nor guest present count identifies the intended phase.
+  Retained intro and hall evidence overlap around present counts 2900--3300. Use a content-identified
+  consecutive plateau across a re-profiled bounded route, not another absolute-time/present window.
+- The stored reference really is the pre-#1429 collapsed hall: the exact guard luma/SSIM algorithm
+  scores the committed post-#1429 restored-hall image only 0.273488 against it (0.85 is required).
+  Conversely, 45 retained intro frames score at most 0.072428 against the restored image. Do not use
+  `issue-1287-hall-live-fixed.png` as a replacement seed: it predates the corrected screenshot
+  persistence boundary and has transparent pixels with ambiguous provenance. Re-baseline only from
+  fresh, composited, cross-run-verified hall evidence.
+- Before #1433, `screenshot` premultiplied renderer RGB by render-target alpha for every content
+  metric and persisted that alpha in its PNG, even though `prosper-app` blits the same target into a
+  `VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR` swapchain. That made visible hall frames look mostly black to
+  the evaluator: the 685--755 second hall tail measured 95,949--118,923 visible RGB colours but only
+  hundreds to thousands after the erroneous alpha multiplication. Normalize alpha only at the
+  rendered screenshot export boundary; raw guest scanout remains literal. Do not calibrate a guard
+  against the old alpha-premultiplied numbers.
+
+The repaired guard was then verified from two independent fresh-save runs. All 16 retained opaque
+captures were individually inspected: both runs show the reflective checkered floor, round table
+and bouquet, both busts, chandelier, lamps and console props, with no alpha holes or checkerboard
+artifact. Their hall plateaus contain 8/11 consecutive matches and 7/10 local pixel changes;
+opposite-run references validate 11 and 8 matches respectively. Fresh hall frames score only
+0.271575--0.356440 against the obsolete collapsed reference, while the two retained intro
+negatives score at most 0.082887 against the fresh references (0.85 is required).
