@@ -368,9 +368,19 @@ Dead Cells post-parse workload while excluding its 54-56-draw loading loop.
 Selected lightweight records are formatted together and written to stderr in one batch at submit completion;
 this preserves one parseable line per target without paying a Windows console write for every target.
 Compute phase/image timing can likewise be restricted to one exact program address with
-`PROSPER_COMPUTE_TIMING_CODE=0x...`. This filter does not enable the heavier compute trace or its hashing,
-so use it for a representative long-running dispatch A/B rather than flooding every compute program's
-per-image records.
+`PROSPER_COMPUTE_TIMING_CODE=0x...`. This filter does not enable the heavier compute trace; only the
+selected timing records pay the stable-identity hash used in their output. Use it for a representative
+long-running dispatch A/B rather than flooding every compute program's per-image records. Because guest
+program addresses can move across runs,
+`PROSPER_COMPUTE_TIMING_HASH=0x...` instead selects the stable FNV-1a hash of the translated SPIR-V
+module (the same identity printed by an F8 performance-capture report). When both selectors are set,
+they are an **AND**: the current address and stable hash must both match. The hash parser accepts only a
+complete unsigned decimal or `0x` hexadecimal `uint64_t`; signs, whitespace, overflow, and trailing
+characters fail closed with an explicit `ignored` banner. An accepted selector prints one bounded
+`first-match` proof and a termination summary with `seen`/`matched`; `matched=0` is labelled
+`INVALID-zero-matches`, not evidence that the shader did not run. Selected `[compute-phase]`,
+`[compute-image]`, and `[compute-image-writeback]` lines carry both `code=` and `hash=` so copied logs
+retain their own identity.
 
 #### Reading the compute side at run scale
 

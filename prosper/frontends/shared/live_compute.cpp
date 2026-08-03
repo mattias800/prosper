@@ -1,4 +1,5 @@
 #include "live_compute.hpp"
+#include "compute_timing_selector.hpp"
 #include "live_target_format.hpp"
 #include "rtt_scale.hpp"
 #include "rtt_authority.hpp"
@@ -2654,13 +2655,105 @@ bool trace_compute_item(const prosper::gpu::ComputeItem& item) {
     return true;
 }
 
-bool time_compute_item(const prosper::gpu::ComputeItem& item) {
+bool time_compute_address_matches(const prosper::gpu::ComputeItem& item) {
     const char* code_env = std::getenv("PROSPER_COMPUTE_TIMING_CODE");
     if (!code_env || !*code_env) return true;
     char* end = nullptr;
     errno = 0;
     const uint64_t wanted = std::strtoull(code_env, &end, 0);
     return !errno && end != code_env && end && !*end && item.code_addr == wanted;
+}
+
+class RuntimeComputeTimingSelector {
+public:
+    RuntimeComputeTimingSelector() {
+        const char* hash_env = std::getenv("PROSPER_COMPUTE_TIMING_HASH");
+        if (!hash_env) return;
+        hash_requested_ = true;
+        const ComputeTimingSelectorParseResult parsed =
+            parse_compute_timing_selector_u64(hash_env);
+        hash_error_ = parsed.error;
+        selector_.hash_requested = true;
+        selector_.hash_valid = parsed.accepted();
+        selector_.hash = parsed.value;
+        const char* address_env = std::getenv("PROSPER_COMPUTE_TIMING_CODE");
+        const bool address_requested = address_env && *address_env;
+        if (parsed.accepted()) {
+            std::fprintf(stderr,
+                         "[compute-timing-filter] PROSPER_COMPUTE_TIMING_HASH accepted "
+                         "value=0x%016llx mode=%s\n",
+                         static_cast<unsigned long long>(parsed.value),
+                         address_requested ? "address+hash-AND" : "hash-only");
+        } else {
+            std::fprintf(stderr,
+                         "[compute-timing-filter] PROSPER_COMPUTE_TIMING_HASH ignored "
+                         "reason=%s; selector fails closed\n",
+                         compute_timing_selector_parse_error_name(parsed.error));
+        }
+    }
+
+    ~RuntimeComputeTimingSelector() {
+        if (!hash_requested_) return;
+        std::lock_guard lock(mutex_);
+        if (!selector_.hash_valid) {
+            std::fprintf(stderr,
+                         "[compute-timing-filter] summary status=ignored reason=%s "
+                         "seen=%llu matched=%llu verdict=INVALID-selector-not-armed\n",
+                         compute_timing_selector_parse_error_name(hash_error_),
+                         static_cast<unsigned long long>(counters_.seen),
+                         static_cast<unsigned long long>(counters_.matched));
+            return;
+        }
+        std::fprintf(stderr,
+                     "[compute-timing-filter] summary status=accepted hash=0x%016llx "
+                     "seen=%llu matched=%llu verdict=%s\n",
+                     static_cast<unsigned long long>(selector_.hash),
+                     static_cast<unsigned long long>(counters_.seen),
+                     static_cast<unsigned long long>(counters_.matched),
+                     compute_timing_zero_match_is_invalid(counters_)
+                         ? "INVALID-zero-matches" : "matched");
+    }
+
+    bool matches(const prosper::gpu::ComputeItem& item, uint64_t program_hash) {
+        if (!hash_requested_) return time_compute_address_matches(item);
+
+        ComputeTimingSelector current = selector_;
+        const char* code_env = std::getenv("PROSPER_COMPUTE_TIMING_CODE");
+        if (code_env && *code_env) {
+            current.address_enabled = true;
+            char* end = nullptr;
+            errno = 0;
+            current.address = std::strtoull(code_env, &end, 0);
+            current.address_valid = !errno && end != code_env && end && !*end;
+        }
+        std::lock_guard lock(mutex_);
+        const ComputeTimingSelectorObservation observation =
+            observe_compute_timing_selector(
+                current, counters_, item.code_addr, program_hash);
+        if (observation.first_match) {
+            std::fprintf(stderr,
+                         "[compute-timing-filter] first-match hash=0x%016llx "
+                         "code=0x%llx seen=%llu matched=%llu\n",
+                         static_cast<unsigned long long>(program_hash),
+                         static_cast<unsigned long long>(item.code_addr),
+                         static_cast<unsigned long long>(counters_.seen),
+                         static_cast<unsigned long long>(counters_.matched));
+        }
+        return observation.matched;
+    }
+
+private:
+    bool hash_requested_ = false;
+    ComputeTimingSelectorParseError hash_error_ =
+        ComputeTimingSelectorParseError::Unset;
+    ComputeTimingSelector selector_;
+    ComputeTimingSelectorCounters counters_;
+    std::mutex mutex_;
+};
+
+RuntimeComputeTimingSelector& runtime_compute_timing_selector() {
+    static RuntimeComputeTimingSelector selector;
+    return selector;
 }
 
 void maybe_dump_traced_compute_spirv(const prosper::gpu::ComputeItem& item, bool trace) {
@@ -2898,13 +2991,29 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         image_descriptors.begin(), image_descriptors.end(), [](const auto& descriptor) {
             return descriptor.kind == SpirvDescriptorKind::StorageImage;
         });
+    const bool phase_timing_requested =
+        std::getenv("PROSPER_COMPUTE_PHASE_TIMING") != nullptr;
+    const bool image_timing_requested =
+        std::getenv("PROSPER_COMPUTE_IMAGE_TIMING") != nullptr;
+    // Preserve the cheap address pre-filter: an address-mismatched item never needs a stable hash.
+    // Hash-only selection has no address constraint and therefore hashes each timing candidate, as
+    // required; timing-disabled execution reaches neither this branch nor the hash walk.
+    uint64_t timing_program_hash = 0;
+    bool timing_item_selected = false;
+    if ((phase_timing_requested || image_timing_requested) &&
+        time_compute_address_matches(item)) {
+        timing_program_hash = gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(spirv.data()),
+            spirv.size() * sizeof(uint32_t));
+        timing_item_selected =
+            runtime_compute_timing_selector().matches(item, timing_program_hash);
+    }
     // The phase timer is also useful for buffer-only kernels. Astro Bot's heaviest dispatcher writes
     // buffers exclusively, so the historical storage-image gate hid the actual frame bottleneck.
     const bool timing_trace_only =
         std::getenv("PROSPER_COMPUTE_TIMING_TRACE_ONLY") != nullptr;
     const bool phase_timing =
-        std::getenv("PROSPER_COMPUTE_PHASE_TIMING") != nullptr &&
-        time_compute_item(item) &&
+        phase_timing_requested && timing_item_selected &&
         (!timing_trace_only || trace);
     if (has_storage_images && !ctx.image_support) {
         static bool warned = false;
@@ -3275,8 +3384,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             images_ready = false;
         };
         const bool image_timing =
-            std::getenv("PROSPER_COMPUTE_IMAGE_TIMING") != nullptr &&
-            time_compute_item(item) &&
+            image_timing_requested && timing_item_selected &&
             (!timing_trace_only || trace);
         for (size_t i = 0; i < image_descriptors.size() && images_ready; i++) {
             const auto image_start = ComputeClock::now();
@@ -3846,9 +3954,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (bi.alias_of != SIZE_MAX) {
                 if (image_timing)
                     std::fprintf(stderr,
-                                 "[compute-image] code=0x%llx binding=%u class=%s alias=1 "
+                                 "[compute-image] code=0x%llx hash=0x%016llx "
+                                 "binding=%u class=%s alias=1 "
                                  "extent=%ux%ux%u ms=%.3f\n",
-                                 (unsigned long long)item.code_addr, bi.binding,
+                                 (unsigned long long)item.code_addr,
+                                 (unsigned long long)timing_program_hash, bi.binding,
                                  bi.storage ? "storage" : "sampled", r->width, r->height, r->depth,
                                  std::chrono::duration<double, std::milli>(
                                      ComputeClock::now() - image_start).count());
@@ -4976,13 +5086,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             if (image_timing)
                 std::fprintf(stderr,
-                             "[compute-image] code=0x%llx binding=%u class=%s imported=%u "
+                             "[compute-image] code=0x%llx hash=0x%016llx "
+                             "binding=%u class=%s imported=%u "
                              "extent=%ux%ux%u guest=%zu staging=%llu "
                              "normalized=%u texel=%u sampled-float=%u rgba8-reuse=%u "
                              "query_ms=%.3f import_ms=%.3f cache_ms=%.3f "
                              "staging_ms=%.3f prepare_ms=%.3f allocation_ms=%.3f "
                              "view_ms=%.3f sampler_ms=%.3f ms=%.3f\n",
-                             (unsigned long long)item.code_addr, bi.binding,
+                             (unsigned long long)item.code_addr,
+                             (unsigned long long)timing_program_hash, bi.binding,
                              bi.storage ? "storage" : "sampled", bi.imported ? 1u : 0u,
                              r->width, r->height, r->depth, bi.guest_bytes,
                              (unsigned long long)sbytes,
@@ -6283,12 +6395,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             image_cache_ms += image_milliseconds(notify_done, cache_done);
             if (image_timing)
                 std::fprintf(stderr,
-                             "[compute-image-writeback] code=0x%llx binding=%u addr=0x%llx "
+                             "[compute-image-writeback] code=0x%llx hash=0x%016llx "
+                             "binding=%u addr=0x%llx "
                              "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u seed-skip=%u "
                              "poison=%u map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
                              "pack_ms=%.3f layout_ms=%.3f notify_ms=%.3f cache_ms=%.3f "
                              "total_ms=%.3f\n",
-                             (unsigned long long)item.code_addr, bi.binding,
+                             (unsigned long long)item.code_addr,
+                             (unsigned long long)timing_program_hash, bi.binding,
                              (unsigned long long)r->gpu_addr, (unsigned)r->format, nc,
                              r->tile_mode, bi.guest_bytes, image_cache_hit ? 1u : 0u,
                              bi.seed_skip ? 1u : 0u, bi.poison_verify ? 1u : 0u,
@@ -6385,7 +6499,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             return std::chrono::duration<double, std::milli>(end - begin).count();
         };
         std::fprintf(stderr,
-                     "[compute-phase] submit=%llu code=0x%llx ok=%u "
+                     "[compute-phase] submit=%llu code=0x%llx hash=0x%016llx ok=%u "
                      "setup_ms=%.2f setup_validate_ms=%.2f setup_buffers_ms=%.2f "
                      "pipeline_ms=%.2f dispatch_ms=%.2f "
                      "writeback_ms=%.2f writeback_prepare_ms=%.2f "
@@ -6394,7 +6508,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "pack_ms=%.2f layout_ms=%.2f notify_ms=%.2f cache_ms=%.2f "
                      "cleanup_ms=%.2f total_ms=%.2f subgroup=%u\n",
                      (unsigned long long)item.submit_no, (unsigned long long)item.code_addr,
-                     ok ? 1u : 0u, milliseconds(phase_start, phase_setup),
+                     (unsigned long long)timing_program_hash, ok ? 1u : 0u,
+                     milliseconds(phase_start, phase_setup),
                      setup_validate_ms, setup_buffers_ms,
                      milliseconds(phase_setup, phase_pipeline),
                      milliseconds(phase_pipeline, phase_dispatch),
@@ -6807,6 +6922,9 @@ void register_live_compute() {
     static bool attempted = false;
     if (attempted) return;
     attempted = true;
+    // Parse and announce a stable timing selector at backend registration, not at the first matching
+    // dispatch. A title that never reaches compute must still prove whether the instrument armed.
+    (void)runtime_compute_timing_selector();
     const char* enabled = std::getenv("PROSPER_COMPUTE");
     if (enabled && (!std::strcmp(enabled, "0") || !std::strcmp(enabled, "off"))) {
         std::fprintf(stderr, "[compute] live execution disabled by PROSPER_COMPUTE=%s\n", enabled);
