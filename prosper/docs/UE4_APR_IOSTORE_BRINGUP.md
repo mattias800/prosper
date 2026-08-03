@@ -8,6 +8,15 @@ Boot recipe: `PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 ./boot_trace <PPSA17942-app
 (GUEST_FS: UE MallocBinned TLS caches read `%fs`; NULL_PAGE: UE's FP-chain backtrace walker
 derefs the null chain terminator).
 
+## Ruled out
+
+- **Two registered containers sharing a total byte size makes either normal APR read ambiguous —
+  false after #78.** `sceAmprAprCommandBufferReadFile` resolves the real `a3` file id first; total
+  byte size is only a legacy fallback when that id is unknown. A collision can therefore refuse
+  only the fallback, not an ID-resolved read. The stale unconditional diagnostic that led tracker
+  #1895 to treat registration warnings as read failures is corrected and regression-tested by
+  [#1901](https://github.com/mattias800/prosper/issues/1901).
+
 ## Frame loop reached; 0 draws = early-load present loop (issue #213, 2026-07-09)
 
 DOLL now boots fully and runs a **stable frame loop**. Two blockers cleared this session:

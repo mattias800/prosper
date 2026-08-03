@@ -651,11 +651,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_ajm2_gapless PRIVATE prosper_core)
   add_test(NAME ajm2_gapless COMMAND test_ajm2_gapless)
 
-  # APR container registry + size-keyed read matching (issue #62): stable ids, path dedup, and
-  # the ambiguity/chunk-read refusal the read-submit path relies on. Pure, no game dump needed.
+  # APR container registry + read-source resolution (#62/#1901): stable ids, path dedup, ID-first
+  # reads, unique-size fallback, ambiguous fallback refusal, and method diagnostics. Pure; no dump.
   add_executable(test_apr_registry tests/test_apr_registry.cpp)
   target_link_libraries(test_apr_registry PRIVATE prosper_core)
-  add_test(NAME apr_registry_size_keying COMMAND test_apr_registry)
+  add_test(NAME apr_registry_resolution COMMAND test_apr_registry)
 
   # GTA V (#1139/#1142) net-new HLE regression guards: sceKernelAprGetFileStat fills the real stat
   # (#1133) and sceAudioOut2GetSpeakerArrayMemorySize returns a non-zero allocation size (#1134). The
