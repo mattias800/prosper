@@ -118,6 +118,9 @@ raw selectors, PM4 command order, and packet address. This closes the v8 blind s
 address-backed copies appeared, so a submit containing only an immediate GDS counter reset reported
 `dmas=0`. Journal entries are observations, not success claims; compare them with execution logs or
 the ordered backend before concluding that a packet landed.
+Collection is gated at submit/decode time by `PROSPER_GPU_TIMELINE`; without it, ordinary gameplay
+performs no raw-journal count, allocation, or record writes. The journal is not collected retroactively,
+so a run started without compact timeline recording cannot acquire these records later.
 
 Version 8 reads version-1 through version-7 indexes. It appends exact ordered `DMA_DATA` records to each
 submit for the address-backed copy form: source and destination guest identities, byte count,

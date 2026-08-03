@@ -131,6 +131,9 @@ struct GpuState {
     // At 40 bytes each, 8192 records leave room in the timeline's 1 MiB submit payload for the
     // existing maximum address-copy journal. The original count remains uncapped below.
     static constexpr size_t kMaxDmaDataRecords = 8192;
+    // Set once per submit from begin_gpu_timeline_submit(). Ordinary gameplay leaves this false,
+    // so DMA_DATA decode performs no count, allocation, or record writes for the diagnostic.
+    bool capture_dma_data_records = false;
     std::vector<DmaDataRecord> dma_data_records;
     uint64_t dma_data_record_count = 0;
     bool dma_data_records_truncated = false;

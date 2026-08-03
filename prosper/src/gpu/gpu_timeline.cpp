@@ -162,6 +162,14 @@ const char* env_or_empty(const char* name) {
 
 std::atomic<uint64_t> g_active_submit_no{0};
 
+bool gpu_timeline_requested() {
+    static const bool requested = [] {
+        const char* path = std::getenv("PROSPER_GPU_TIMELINE");
+        return path && *path;
+    }();
+    return requested;
+}
+
 struct RuntimeRecorder {
     std::mutex mutex;
     std::unique_ptr<GpuTimelineWriter> writer;
@@ -1847,12 +1855,10 @@ void log_timeline_mrt_draw(const GpuState& draw_state, uint64_t submit_no,
     std::fputc('\n', stderr);
 }
 
-void begin_gpu_timeline_submit(uint64_t submit_no) {
-    static const bool requested = [] {
-        const char* path = std::getenv("PROSPER_GPU_TIMELINE");
-        return path && *path;
-    }();
+bool begin_gpu_timeline_submit(uint64_t submit_no) {
+    const bool requested = gpu_timeline_requested();
     if (requested) g_active_submit_no.store(submit_no, std::memory_order_release);
+    return requested;
 }
 
 // ---- Interactive frame-bundle capture (prosper-app F9) ---------------------------------------------
@@ -2221,11 +2227,7 @@ bool take_interactive_grab_outcome(InteractiveGrabOutcome& out) {
 
 void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     interactive_frame_bundle_on_submit(state, submit_no);
-    static const bool requested = [] {
-        const char* path = std::getenv("PROSPER_GPU_TIMELINE");
-        return path && *path;
-    }();
-    if (!requested) return;
+    if (!gpu_timeline_requested()) return;
     GpuTimelineWriter* writer = runtime_recorder().get();
     if (!writer) return;
     GpuTimelineSubmit submit;

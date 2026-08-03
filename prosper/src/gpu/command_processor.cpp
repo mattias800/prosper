@@ -2993,16 +2993,18 @@ void GpuState::apply(const Pm4Command& c) {
             // immediate fills (including Astro Bot's GDS resets) disappear from timelines entirely.
             // This record is observation-only: the existing completion/ordered execution paths below
             // are deliberately unchanged.
-            if (dma_data_record_count != UINT64_MAX) {
-                ++dma_data_record_count;
-            } else {
-                dma_data_records_truncated = true;
-            }
-            if (dma_data_records.size() < kMaxDmaDataRecords) {
-                dma_data_records.push_back({c.dd_dst, c.dd_src, c.dd_bytes, c.dd_sels,
-                                            command_order, pkt_addr(c)});
-            } else {
-                dma_data_records_truncated = true;
+            if (capture_dma_data_records) {
+                if (dma_data_record_count != UINT64_MAX) {
+                    ++dma_data_record_count;
+                } else {
+                    dma_data_records_truncated = true;
+                }
+                if (dma_data_records.size() < kMaxDmaDataRecords) {
+                    dma_data_records.push_back({c.dd_dst, c.dd_src, c.dd_bytes, c.dd_sels,
+                                                command_order, pkt_addr(c)});
+                } else {
+                    dma_data_records_truncated = true;
+                }
             }
             // Address-backed copies are ordinary in-stream producers: retain them beside draws and
             // dispatches so the ordered executor exposes old bytes to earlier consumers and copied

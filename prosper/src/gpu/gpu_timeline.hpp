@@ -266,8 +266,10 @@ bool gpu_timeline_capture_is_after_compute_gated();
 bool gpu_timeline_capture_after_compute_gate_armed();
 
 // Runtime hooks. Inert unless PROSPER_GPU_TIMELINE=<path> is set. They record folded semantic state
-// before renderer sampling and never realize shaders, copy resources, or invoke Vulkan.
-void begin_gpu_timeline_submit(uint64_t submit_no);
+// before renderer sampling and never realize shaders, copy resources, or invoke Vulkan. The begin
+// hook returns whether compact recording was requested so callers can gate decode-time journals;
+// when false, those journals must perform no count, allocation, or record writes.
+bool begin_gpu_timeline_submit(uint64_t submit_no);
 void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no);
 void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64_t flip_arg,
                                  uint32_t width, uint32_t height);

@@ -7,9 +7,11 @@
 #include "../src/hle/nid.hpp"
 #include "../src/gpu/command_processor.hpp"
 #include "../src/gpu/gpu_execute.hpp"
+#include "../src/gpu/gpu_timeline.hpp"
 #include "../src/gpu/pm4_decode.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 
@@ -456,10 +458,9 @@ int main() {
     }
 
     // A raw DMA_DATA census must not be inferred from `dma_copies`: that execution vector contains
-    // address-backed copies only. Journal the GDS immediate reset between two dispatches and a later
-    // rejected low-address memory fill exactly where they appeared in PM4. Removing the journal hook
-    // reproduces the real instrument defect (`gpu_timeline --records` reported dmas=0) and makes both
-    // named checks fail rather than skip.
+    // address-backed copies only. The journal is diagnostic work and must also remain completely
+    // dormant in ordinary gameplay. These two arms prove both halves independently: forcing the gate
+    // open makes the disabled check fail, while forcing it closed makes the enabled checks fail.
     {
         uint32_t stream[26] = {};
         stream[0] = PM4(6, IT_NOP, R_DISPATCH_DIRECT);
@@ -475,12 +476,28 @@ int main() {
         stream[22] = 0;    stream[23] = 0;
         stream[24] = 4;    stream[25] = 3;      // ordinary memory selector
 
+        // PROSPER_GPU_TIMELINE is intentionally absent in this executable. Feed the runtime gate to
+        // a normal submit state exactly as hle_agc does, then prove decode performs no record work.
+#ifdef _WIN32
+        _putenv_s("PROSPER_GPU_TIMELINE", "");
+#else
+        unsetenv("PROSPER_GPU_TIMELINE");
+#endif
+        GpuState ordinary;
+        ordinary.capture_dma_data_records = begin_gpu_timeline_submit(1);
+        const size_t ordinary_applied = run_command_buffer(stream, 26, ordinary);
+        CHECK(ordinary_applied == 4 && !ordinary.capture_dma_data_records &&
+                  ordinary.dma_data_record_count == 0 && ordinary.dma_data_records.empty() &&
+                  !ordinary.dma_data_records_truncated,
+              "absent PROSPER_GPU_TIMELINE performs zero raw DMA_DATA journal writes");
+
         GpuState journal;
+        journal.capture_dma_data_records = true;
         const size_t applied = run_command_buffer(stream, 26, journal);
         CHECK(applied == 4 && journal.dma_data_record_count == 2 &&
                   journal.dma_data_records.size() == 2 &&
                   !journal.dma_data_records_truncated,
-              "raw DMA_DATA journal includes GDS-immediate and rejected packets before execution");
+              "enabled raw DMA_DATA journal includes GDS-immediate and rejected packets before execution");
         CHECK(journal.dispatches.size() == 2 && journal.dma_data_records.size() == 2 &&
                   journal.dispatches[0].command_order <
                       journal.dma_data_records[0].command_order &&
