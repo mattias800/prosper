@@ -81,14 +81,17 @@ inline ComputeTransferGateSelectorObservation observe_compute_transfer_gate_sele
     return {role, first_match};
 }
 
-inline void record_compute_transfer_storage_gate_observation(
+inline bool record_compute_transfer_storage_gate_observation(
     ComputeTransferGateRole role,
     ComputeTransferGateSelectorCounters& counters) {
     uint64_t* observations = role == ComputeTransferGateRole::Producer
         ? &counters.producer_storage_gate_observations
         : role == ComputeTransferGateRole::Consumer
             ? &counters.consumer_storage_gate_observations : nullptr;
-    if (observations) *observations = saturating_increment(*observations);
+    if (!observations) return false;
+    const bool first_observation = *observations == 0;
+    *observations = saturating_increment(*observations);
+    return first_observation;
 }
 
 constexpr bool compute_transfer_gate_selector_is_invalid(

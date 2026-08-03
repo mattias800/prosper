@@ -5,7 +5,8 @@
 # below detect the dangerous failure shapes: accepting the wrong stable program, calling a
 # zero-match run valid, publishing both the explicit and destructor summaries, ignoring a raw
 # cache-eligibility gate, or declaring a transfer comparison valid when its gate was never
-# observed. The tracked source is never edited; each mutation builds a scratch copy.
+# observed, or disarming storage detail at the hash match rather than the real gate. The tracked
+# source is never edited; each mutation builds a scratch copy.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -90,6 +91,11 @@ run_mutation "accept unobserved storage gates" \
   "$TRANSFER_HEADER" \
   '            counters.consumer_storage_gate_observations == 0);' \
   '            false);' || bad=1
+run_mutation "lose delayed storage detail" \
+  "storage detail survives an earlier hash-only match and emits exactly once" \
+  "$TRANSFER_HEADER" \
+  '    const bool first_observation = *observations == 0;' \
+  '    const bool first_observation = false;' || bad=1
 
 restore_headers
 if build_and_run >/dev/null; then

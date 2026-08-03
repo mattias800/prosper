@@ -3012,10 +3012,11 @@ public:
                               uint32_t binding,
                               const ComputeStorageCacheGateInputs& inputs,
                               bool cache_candidate,
-                              bool persistent_setup, bool detail) {
+                              bool persistent_setup) {
         if (role == ComputeTransferGateRole::None) return;
         std::lock_guard lock(mutex_);
-        record_compute_transfer_storage_gate_observation(role, counters_);
+        const bool detail =
+            record_compute_transfer_storage_gate_observation(role, counters_);
         ComputeTransferGateStats& stats = stats_for(role);
         increment_gate_counter(stats.storage_cache_evaluated);
         increment_gate_counter(stats.storage_renderer_owned, inputs.renderer_owned);
@@ -5285,8 +5286,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 transfer_gate_census.record_storage_cache(
                     transfer_gate_observation.role, *r, bi.binding,
                     storage_cache_gates,
-                    bi.cache_candidate, bi.persistent,
-                    transfer_gate_observation.first_match);
+                    bi.cache_candidate, bi.persistent);
                 if (!(bi.persistent && bi.upload_skipped)) {
                 const size_t linear_size = (bi.seed_skip || bi.seed_from_imported != SIZE_MAX)
                     ? size_t{0} : static_cast<size_t>(linear_guest_bytes);

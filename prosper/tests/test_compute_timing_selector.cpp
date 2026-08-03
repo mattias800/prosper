@@ -169,11 +169,20 @@ int main() {
           "dual transfer selectors prove each exact hash and first match independently");
     CHECK(compute_transfer_gate_selector_is_invalid(gate_selector, gate_counters),
           "hash matches without storage gate observations are apparatus-invalid");
-    record_compute_transfer_storage_gate_observation(
-        ComputeTransferGateRole::Producer, gate_counters);
+    const bool delayed_producer_detail =
+        record_compute_transfer_storage_gate_observation(
+            ComputeTransferGateRole::Producer, gate_counters);
+    (void)observe_compute_transfer_gate_selector(
+        gate_selector, gate_counters, gate_selector.producer_hash);
+    const bool repeated_producer_detail =
+        record_compute_transfer_storage_gate_observation(
+            ComputeTransferGateRole::Producer, gate_counters);
+    CHECK(delayed_producer_detail && !repeated_producer_detail &&
+              gate_counters.producer_storage_gate_observations == 2,
+          "storage detail survives an earlier hash-only match and emits exactly once");
     CHECK(compute_transfer_gate_selector_is_invalid(gate_selector, gate_counters),
           "one-sided storage gate observation is apparatus-invalid");
-    record_compute_transfer_storage_gate_observation(
+    (void)record_compute_transfer_storage_gate_observation(
         ComputeTransferGateRole::Consumer, gate_counters);
     CHECK(!compute_transfer_gate_selector_is_invalid(gate_selector, gate_counters),
           "dual transfer selector requires both hashes and storage gate observations");
