@@ -2018,9 +2018,13 @@ HLE(s_ime_kbd_info) {
 // --- app content ---
 namespace {
 constexpr uint64_t APP_CONTENT_ERROR_PARAMETER = 0x80D90002ull;
+constexpr uint64_t APP_CONTENT_ERROR_BUSY = 0x80D90003ull;
+constexpr uint64_t APP_CONTENT_ERROR_NOT_FOUND = 0x80D90005ull;
 constexpr uint64_t APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT = 0x80D90007ull;
 constexpr uint64_t NP_ENTITLEMENT_ERROR_PARAMETER = 0x817D0002ull;
 constexpr uint64_t NP_ENTITLEMENT_ERROR_NO_ENTITLEMENT = 0x817D0007ull;
+// dlc_emu 0.3's NP list export compares listNum against 0x9c4 before touching either output.
+constexpr uint32_t NP_ENTITLEMENT_ADDCONT_LIST_MAX = 2500;
 
 // Direct PS5 guest evidence pins these boundaries. Sonic allocates exactly 0x1c bytes per
 // NpEntitlementAccess list entry and passes a 20-byte label to AddcontMount; Crisis Core independently
@@ -2063,7 +2067,8 @@ bool appcontent_read_label(uint64_t address, std::string& label) {
     if (!svc_copy_bytes(address, raw, sizeof(raw))) return false;
     size_t size = 0;
     while (size < 17 && raw[size]) ++size;
-    if (size == 17 || !appcontent_valid_label_text(raw, size)) return false;
+    if (size == 17 || raw[17] || raw[18] || raw[19] ||
+        !appcontent_valid_label_text(raw, size)) return false;
     label.assign(raw, size);
     return true;
 }
@@ -2100,8 +2105,8 @@ template <typename GuestInfo, typename MakeInfo>
 uint64_t addcontent_info_list(uint64_t list_address, uint64_t list_num,
                               uint64_t hit_num_address, uint32_t service_label,
                               uint64_t parameter_error, uint64_t inventory_error,
-                              MakeInfo make_info) {
-    if (list_num > UINT32_MAX) return parameter_error;
+                              uint64_t max_list_num, MakeInfo make_info) {
+    if (list_num > max_list_num) return parameter_error;
     const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
     if (inventory.state == AddcontentInventoryState::Invalid) return inventory_error;
 
@@ -2254,7 +2259,7 @@ HLE(s_appcontent_addcont_list) {
     if (a0 > UINT32_MAX) return APP_CONTENT_ERROR_PARAMETER;
     return addcontent_info_list<AppContentAddcontInfo>(
         a1, a2, a3, static_cast<uint32_t>(a0), APP_CONTENT_ERROR_PARAMETER,
-        APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT, appcontent_info);
+        APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT, UINT32_MAX, appcontent_info);
 }
 
 HLE(s_appcontent_addcont_info) {
@@ -2264,7 +2269,7 @@ HLE(s_appcontent_addcont_info) {
     const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
     if (inventory.state == AddcontentInventoryState::Invalid)
         return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
-    const InstalledAddcontent* entry = find_addcontent(inventory, static_cast<int32_t>(a0), label);
+    const InstalledAddcontent* entry = find_addcontent(inventory, static_cast<uint32_t>(a0), label);
     if (!entry) return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
     const AppContentAddcontInfo info = appcontent_info(*entry);
     return svc_write_bytes(a2, &info, sizeof(info)) ? 0 : APP_CONTENT_ERROR_PARAMETER;
@@ -2276,8 +2281,8 @@ HLE(s_appcontent_entitlement_key) {
         return APP_CONTENT_ERROR_PARAMETER;
     const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
     const InstalledAddcontent* entry = inventory.state == AddcontentInventoryState::Ready
-        ? find_addcontent(inventory, static_cast<int32_t>(a0), label) : nullptr;
-    if (!entry || !entry->has_entitlement_key) return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
+        ? find_addcontent(inventory, static_cast<uint32_t>(a0), label) : nullptr;
+    if (!entry) return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
     return svc_write_bytes(a2, entry->entitlement_key.data(), entry->entitlement_key.size())
         ? 0 : APP_CONTENT_ERROR_PARAMETER;
 }
@@ -2286,12 +2291,13 @@ HLE(s_appcontent_addcont_mount) {
     std::string label;
     if (a0 > UINT32_MAX || !appcontent_read_label(a1, label) || !svc_ptrish(a2))
         return APP_CONTENT_ERROR_PARAMETER;
-    const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
-    const InstalledAddcontent* entry = inventory.state == AddcontentInventoryState::Ready
-        ? find_addcontent(inventory, static_cast<int32_t>(a0), label) : nullptr;
-    if (!entry || entry->guest_mount_point.empty()) return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
-    return svc_write_bytes(a2, entry->guest_mount_point.c_str(), entry->guest_mount_point.size() + 1)
-        ? 0 : APP_CONTENT_ERROR_PARAMETER;
+    switch (addcontent_mount(static_cast<uint32_t>(a0), label, a2, svc_write_bytes)) {
+    case AddcontentMountResult::NotFound: return APP_CONTENT_ERROR_NOT_FOUND;
+    case AddcontentMountResult::Busy: return APP_CONTENT_ERROR_BUSY;
+    case AddcontentMountResult::OutputError: return APP_CONTENT_ERROR_PARAMETER;
+    case AddcontentMountResult::Mounted: return 0;
+    }
+    return APP_CONTENT_ERROR_NOT_FOUND;
 }
 
 // sceSystemServiceParamGetString(paramId, char* buf, size_t bufSize): fetch a system string parameter
@@ -3181,7 +3187,7 @@ HLE(s_npent_addcont_info) {
         return NP_ENTITLEMENT_ERROR_PARAMETER;
     const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
     const InstalledAddcontent* entry = inventory.state == AddcontentInventoryState::Ready
-        ? find_addcontent(inventory, static_cast<int32_t>(a0), label) : nullptr;
+        ? find_addcontent(inventory, static_cast<uint32_t>(a0), label) : nullptr;
     if (!entry) return NP_ENTITLEMENT_ERROR_NO_ENTITLEMENT;
     const NpAddcontEntitlementInfo info = npent_info(*entry);
     return svc_write_bytes(a2, &info, sizeof(info)) ? 0 : NP_ENTITLEMENT_ERROR_PARAMETER;
@@ -3389,12 +3395,12 @@ HLE(s_npent_addcont_list) {
     if (a0 > UINT32_MAX) return NP_ENTITLEMENT_ERROR_PARAMETER;
     return addcontent_info_list<NpAddcontEntitlementInfo>(
         a1, a2, a3, static_cast<uint32_t>(a0), NP_ENTITLEMENT_ERROR_PARAMETER,
-        NP_ENTITLEMENT_ERROR_NO_ENTITLEMENT, npent_info);
+        NP_ENTITLEMENT_ERROR_NO_ENTITLEMENT, NP_ENTITLEMENT_ADDCONT_LIST_MAX, npent_info);
 }
 // GetEntitlementKey(serviceLabel, const Label* label, Key* out) — live capture: retried 4x with
 // identical args (the garbage-consuming retry signature). Crisis Core independently consumes
-// exactly 16 bytes from the successful output. Only a validated, installed record with a declared
-// key succeeds; unknown labels and licence records without a key retain honest failure.
+// exactly 16 bytes from the successful output. Validated installed records use either their explicit
+// key or the producer's deterministic default; unknown labels retain honest failure.
 HLE(s_npent_getkey) {
     svc_log("sceNpEntitlementAccessGetEntitlementKey", a0,a1,a2,a3,a4,a5);
     std::string label;
@@ -3402,8 +3408,8 @@ HLE(s_npent_getkey) {
         return NP_ENTITLEMENT_ERROR_PARAMETER;
     const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
     const InstalledAddcontent* entry = inventory.state == AddcontentInventoryState::Ready
-        ? find_addcontent(inventory, static_cast<int32_t>(a0), label) : nullptr;
-    if (!entry || !entry->has_entitlement_key) return NP_ENTITLEMENT_ERROR_NO_ENTITLEMENT;
+        ? find_addcontent(inventory, static_cast<uint32_t>(a0), label) : nullptr;
+    if (!entry) return NP_ENTITLEMENT_ERROR_NO_ENTITLEMENT;
     return svc_write_bytes(a2, entry->entitlement_key.data(), entry->entitlement_key.size())
         ? 0 : NP_ENTITLEMENT_ERROR_PARAMETER;
 }

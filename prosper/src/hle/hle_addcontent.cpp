@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -20,6 +22,17 @@ constexpr size_t kMaxEntries = 1024;             // dlc_emu producer limit
 
 std::mutex g_inventory_mutex;
 AddcontentInventorySnapshot g_inventory;
+
+enum class BoundedFileState {
+    Missing,
+    Ready,
+    Invalid,
+};
+
+struct BoundedFile {
+    BoundedFileState state = BoundedFileState::Invalid;
+    std::string data;
+};
 
 struct PendingRecord {
     std::string section;
@@ -47,21 +60,60 @@ bool valid_entitlement_label(std::string_view value) {
     });
 }
 
-std::optional<std::string> read_bounded_file(const std::filesystem::path& path, size_t limit,
-                                             bool& exists) {
-    exists = false;
+bool is_missing_error(const std::error_code& ec) {
+    return ec == std::make_error_code(std::errc::no_such_file_or_directory);
+}
+
+bool path_is_strict_descendant(const std::filesystem::path& root,
+                               const std::filesystem::path& child) {
+    auto root_it = root.begin();
+    auto child_it = child.begin();
+    for (; root_it != root.end(); ++root_it, ++child_it) {
+        if (child_it == child.end() || *root_it != *child_it) return false;
+    }
+    return child_it != child.end();
+}
+
+// The identity-bearing files must be real regular files below /app0. Walk every relative component
+// without following symlinks, then canonicalize as a second containment check. Only a genuine ENOENT
+// is Missing; dangling symlinks, wrong types, lookup errors, escapes, and read errors are Invalid.
+BoundedFile read_bounded_file(const std::filesystem::path& root,
+                              const std::filesystem::path& relative, size_t limit) {
+    BoundedFile result;
+    std::filesystem::path current = root;
     std::error_code ec;
-    if (!std::filesystem::exists(path, ec) || ec) return std::nullopt;
-    exists = true;
-    if (!std::filesystem::is_regular_file(path, ec) || ec) return std::nullopt;
-    const uintmax_t size = std::filesystem::file_size(path, ec);
-    if (ec || size > limit || size > std::numeric_limits<size_t>::max()) return std::nullopt;
-    std::ifstream input(path, std::ios::binary);
-    if (!input) return std::nullopt;
-    std::string data(static_cast<size_t>(size), '\0');
-    if (!data.empty() && !input.read(data.data(), static_cast<std::streamsize>(data.size())))
-        return std::nullopt;
-    return data;
+    for (auto it = relative.begin(); it != relative.end(); ++it) {
+        current /= *it;
+        ec.clear();
+        const std::filesystem::file_status status = std::filesystem::symlink_status(current, ec);
+        if (status.type() == std::filesystem::file_type::not_found || is_missing_error(ec)) {
+            result.state = BoundedFileState::Missing;
+            return result;
+        }
+        if (ec || std::filesystem::is_symlink(status)) return result;
+        const bool last = std::next(it) == relative.end();
+        if ((last && !std::filesystem::is_regular_file(status)) ||
+            (!last && !std::filesystem::is_directory(status))) return result;
+    }
+
+    ec.clear();
+    const std::filesystem::path canonical_root = std::filesystem::canonical(root, ec);
+    if (ec) return result;
+    const std::filesystem::path canonical_file = std::filesystem::canonical(current, ec);
+    if (ec || !path_is_strict_descendant(canonical_root, canonical_file)) return result;
+
+    const uintmax_t size = std::filesystem::file_size(current, ec);
+    if (ec || size > limit || size > std::numeric_limits<size_t>::max()) return result;
+    std::ifstream input(current, std::ios::binary);
+    if (!input) return result;
+    result.data.assign(static_cast<size_t>(size), '\0');
+    if (!result.data.empty() &&
+        !input.read(result.data.data(), static_cast<std::streamsize>(result.data.size()))) {
+        result.data.clear();
+        return result;
+    }
+    result.state = BoundedFileState::Ready;
+    return result;
 }
 
 // Small bounded JSON reader for one authorization-bearing metadata field. It validates the document
@@ -256,6 +308,13 @@ bool parse_hex_key(std::string_view text, std::array<uint8_t, 16>& out) {
     return true;
 }
 
+void make_default_key(size_t accepted_index, std::array<uint8_t, 16>& out) {
+    const uint64_t value = 1024u + static_cast<uint64_t>(accepted_index);
+    out.fill(0);
+    for (size_t i = 0; i < sizeof(value); ++i)
+        out[i] = static_cast<uint8_t>(value >> (i * 8u));
+}
+
 bool parse_np_service_label(std::string_view text, int64_t& out) {
     if (text.empty()) return true; // dlc_emu's documented default: wildcard
     if (text == "-1") {
@@ -429,13 +488,13 @@ ParseResult parse_inventory(const std::filesystem::path& root, std::string_view 
             }
             output.guest_mount_point = input.mount_point;
         }
+        output.mountable = output.package_type == 2u && !output.guest_mount_point.empty();
         if (!input.entitlement_key.empty()) {
             if (!parse_hex_key(input.entitlement_key, output.entitlement_key)) {
                 result.error = record + " has a malformed entitlement key";
                 return result;
             }
-            output.has_entitlement_key = true;
-        }
+        } else make_default_key(result.inventory.entries.size(), output.entitlement_key);
         result.inventory.entries.push_back(std::move(output));
     }
     result.inventory.state = AddcontentInventoryState::Ready;
@@ -452,26 +511,23 @@ void addcontent_configure_for_app0(const std::string& app0_root) {
         return;
     }
     const std::filesystem::path root(app0_root);
-    bool manifest_exists = false;
-    const std::optional<std::string> manifest =
-        read_bounded_file(root / "dlc_emu.ini", kMaxManifestBytes, manifest_exists);
-    if (!manifest_exists) {
+    const BoundedFile manifest = read_bounded_file(root, "dlc_emu.ini", kMaxManifestBytes);
+    if (manifest.state == BoundedFileState::Missing) {
         next.state = AddcontentInventoryState::None;
-    } else if (!manifest) {
+    } else if (manifest.state != BoundedFileState::Ready) {
         next.state = AddcontentInventoryState::Invalid;
         std::fprintf(stderr, "[addcontent] invalid install manifest: unreadable or oversized\n");
     } else {
-        bool param_exists = false;
-        const std::optional<std::string> param =
-            read_bounded_file(root / "sce_sys" / "param.json", kMaxParamBytes, param_exists);
-        const std::optional<std::string> title_id =
-            param ? ParamJsonReader(*param).top_level_title_id() : std::nullopt;
-        if (!param_exists || !param || !title_id || !valid_title_id(*title_id)) {
+        const BoundedFile param = read_bounded_file(root, std::filesystem::path("sce_sys") /
+                                                   "param.json", kMaxParamBytes);
+        const std::optional<std::string> title_id = param.state == BoundedFileState::Ready
+            ? ParamJsonReader(param.data).top_level_title_id() : std::nullopt;
+        if (!title_id || !valid_title_id(*title_id)) {
             next.state = AddcontentInventoryState::Invalid;
             std::fprintf(stderr,
                          "[addcontent] invalid install manifest: app metadata has no valid titleId\n");
         } else {
-            ParseResult parsed = parse_inventory(root, *manifest, *title_id);
+            ParseResult parsed = parse_inventory(root, manifest.data, *title_id);
             next = std::move(parsed.inventory);
             if (next.state == AddcontentInventoryState::Invalid)
                 std::fprintf(stderr, "[addcontent] invalid install manifest: %s\n",
@@ -485,6 +541,39 @@ void addcontent_configure_for_app0(const std::string& app0_root) {
 AddcontentInventorySnapshot addcontent_inventory_snapshot() {
     std::lock_guard<std::mutex> lock(g_inventory_mutex);
     return g_inventory;
+}
+
+AddcontentMountResult addcontent_mount(uint32_t service_label, std::string_view entitlement_label,
+                                       uint64_t output_address, AddcontentMountWriter writer) {
+    std::lock_guard<std::mutex> lock(g_inventory_mutex);
+    if (g_inventory.state != AddcontentInventoryState::Ready)
+        return AddcontentMountResult::NotFound;
+    size_t index = g_inventory.entries.size();
+    for (size_t i = 0; i < g_inventory.entries.size(); ++i) {
+        const InstalledAddcontent& entry = g_inventory.entries[i];
+        if ((entry.service_label == -1 ||
+             static_cast<uint32_t>(entry.service_label) == service_label) &&
+            entry.entitlement_label == entitlement_label) {
+            index = i;
+            break;
+        }
+    }
+    if (index == g_inventory.entries.size()) return AddcontentMountResult::NotFound;
+    InstalledAddcontent& entry = g_inventory.entries[index];
+    if (!entry.mountable || entry.guest_mount_point.empty() || entry.download_status != 4)
+        return AddcontentMountResult::NotFound;
+    if (entry.mounted) return AddcontentMountResult::Busy;
+    for (const InstalledAddcontent& other : g_inventory.entries) {
+        if (other.mounted && other.guest_mount_point == entry.guest_mount_point)
+            return AddcontentMountResult::Busy;
+    }
+    std::array<char, 16> mount_point{};
+    std::memcpy(mount_point.data(), entry.guest_mount_point.data(),
+                entry.guest_mount_point.size());
+    if (!writer || !writer(output_address, mount_point.data(), mount_point.size()))
+        return AddcontentMountResult::OutputError;
+    entry.mounted = true;
+    return AddcontentMountResult::Mounted;
 }
 
 } // namespace prosper

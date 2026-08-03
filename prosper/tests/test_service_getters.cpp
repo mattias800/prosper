@@ -586,6 +586,7 @@ int main() {
         fs::remove_all(scratch, ec);
         fs::create_directories(app0 / "sce_sys", ec);
         fs::create_directories(app0 / "dlc1", ec);
+        fs::create_directories(app0 / "dlc2", ec);
         fs::create_directories(outside, ec);
         {
             std::ofstream param(app0 / "sce_sys" / "param.json", std::ios::binary);
@@ -600,15 +601,15 @@ int main() {
             "content_id=UP0000-PPSA00001_00-00000000000DLC01\n"
             "download_status=INSTALLED\n"
             "mount_point=/app0/dlc1\n"
-            "entitlement_key=000102030405060708090A0B0C0D0E0F\n"
             "[PSAL]\n"
             "content_id=UP0000-PPSA00001_00-00000000000DLC02\n"
             "download_status=INSTALLED\n"
-            "entitlement_key=F0E0D0C0B0A090807060504030201000\n"
+            "mount_point=/app0/dlc2\n"
             "[PSAC]\n"
             "content_id=UP0000-PPSA00001_00-00000000000DLC03\n"
             "download_status=INSTALLED\n"
-            "np_service_label=7\n");
+            "np_service_label=7\n"
+            "entitlement_key=000102030405060708090A0B0C0D0E0F\n");
         set_app0_root(app0.string());
 
         HleFn np_list = Hle::lookup("TFyU+KFBv54");
@@ -638,6 +639,9 @@ int main() {
             CHECK(strcmp((char*)np_short, "00000000000DLC01") == 0 &&
                   *(uint32_t*)(np_short + 20) == 2 && *(uint32_t*)(np_short + 24) == 4,
                   "NP list entry carries the PSAC type and INSTALLED status at the guest offsets");
+            CHECK(np_short[16] == 0 && np_short[17] == 0 && np_short[18] == 0 &&
+                  np_short[19] == 0,
+                  "NP list zero-pads the complete 20-byte entitlement-label object");
             bool np_short_canary = true;
             for (size_t i = 28; i < sizeof(np_short); ++i) np_short_canary &= np_short[i] == 0xAB;
             CHECK(np_short_canary, "NP short-capacity list writes exactly its 28-byte entry");
@@ -666,6 +670,10 @@ int main() {
                   strcmp((char*)app_exact + 24, "00000000000DLC02") == 0 &&
                   *(uint32_t*)(app_exact + 44) == 4,
                   "AppContent list writes two 24-byte label/status entries");
+            CHECK(app_exact[16] == 0 && app_exact[17] == 0 && app_exact[18] == 0 &&
+                  app_exact[19] == 0 && app_exact[40] == 0 && app_exact[41] == 0 &&
+                  app_exact[42] == 0 && app_exact[43] == 0,
+                  "AppContent list zero-pads both complete 20-byte label objects");
             bool app_exact_canary = true;
             for (size_t i = 48; i < sizeof(app_exact); ++i) app_exact_canary &= app_exact[i] == 0xAB;
             CHECK(app_exact_canary, "AppContent exact-capacity list preserves its tail canary");
@@ -689,43 +697,73 @@ int main() {
             for (size_t i = 24; i < sizeof(one_app); ++i) one_app_canary &= one_app[i] == 0xAB;
             CHECK(one_app_canary, "AppContent individual info writes exactly 24 bytes");
 
-            uint8_t expected_key[16];
-            for (uint8_t i = 0; i < 16; ++i) expected_key[i] = i;
+            const uint8_t default_key_0[16] = {0x00, 0x04};
             uint8_t key_out[24]; memset(key_out, 0xAB, sizeof(key_out));
             CHECK(np_key(0, (uint64_t)(uintptr_t)known_label,
                          (uint64_t)(uintptr_t)key_out, 0, 0, 0) == 0 &&
-                  memcmp(key_out, expected_key, sizeof(expected_key)) == 0,
-                  "NP entitlement key returns the declared 16 key bytes");
+                  memcmp(key_out, default_key_0, sizeof(default_key_0)) == 0,
+                  "NP entitlement key synthesizes producer default 1024 for accepted record zero");
             bool key_canary = true;
             for (size_t i = 16; i < sizeof(key_out); ++i) key_canary &= key_out[i] == 0xAB;
             CHECK(key_canary, "NP entitlement key preserves bytes after its 16-byte output");
             memset(key_out, 0xAB, sizeof(key_out));
             CHECK(app_key(0, (uint64_t)(uintptr_t)known_label,
                           (uint64_t)(uintptr_t)key_out, 0, 0, 0) == 0 &&
-                  memcmp(key_out, expected_key, sizeof(expected_key)) == 0,
-                  "AppContent entitlement key returns the same declared key");
+                  memcmp(key_out, default_key_0, sizeof(default_key_0)) == 0,
+                  "AppContent entitlement key returns the same producer-default key");
             key_canary = true;
             for (size_t i = 16; i < sizeof(key_out); ++i) key_canary &= key_out[i] == 0xAB;
             CHECK(key_canary, "AppContent entitlement key writes exactly 16 bytes");
 
-            char mount[24]; memset(mount, 0xAB, sizeof(mount));
+            const char second_label[20] = "00000000000DLC02";
+            const uint8_t default_key_1[16] = {0x01, 0x04};
+            memset(key_out, 0xAB, sizeof(key_out));
+            CHECK(np_key(0, (uint64_t)(uintptr_t)second_label,
+                         (uint64_t)(uintptr_t)key_out, 0, 0, 0) == 0 &&
+                  memcmp(key_out, default_key_1, sizeof(default_key_1)) == 0,
+                  "default entitlement keys advance by accepted inventory-record index");
+
+            const char explicit_label[20] = "00000000000DLC03";
+            uint8_t explicit_key[16];
+            for (uint8_t i = 0; i < 16; ++i) explicit_key[i] = i;
+            memset(key_out, 0xAB, sizeof(key_out));
+            CHECK(np_key(7, (uint64_t)(uintptr_t)explicit_label,
+                         (uint64_t)(uintptr_t)key_out, 0, 0, 0) == 0 &&
+                  memcmp(key_out, explicit_key, sizeof(explicit_key)) == 0,
+                  "an explicit manifest entitlement key overrides the producer default");
+
+            uint8_t mount[24]; memset(mount, 0xAB, sizeof(mount));
+            CHECK(app_mount(0, (uint64_t)(uintptr_t)known_label, 0x10000, 0, 0, 0) ==
+                  0x80D90002ull,
+                  "an unwritable mount output is rejected without consuming the mount state");
             CHECK(app_mount(0, (uint64_t)(uintptr_t)known_label,
                             (uint64_t)(uintptr_t)mount, 0, 0, 0) == 0 &&
-                  strcmp(mount, "/app0/dlc1") == 0,
-                  "AddcontMount returns only the declared guest mount point");
+                  strcmp((char*)mount, "/app0/dlc1") == 0,
+                  "AddcontMount returns the declared PSAC guest mount point");
+            bool mount_object_zero = true;
+            for (size_t i = sizeof("/app0/dlc1") - 1; i < 16; ++i)
+                mount_object_zero &= mount[i] == 0;
+            CHECK(mount_object_zero,
+                  "AddcontMount writes a complete zero-padded 16-byte mount-point object");
             bool mount_canary = true;
-            for (size_t i = sizeof("/app0/dlc1"); i < sizeof(mount); ++i)
-                mount_canary &= (uint8_t)mount[i] == 0xAB;
-            CHECK(mount_canary, "AddcontMount writes only its NUL-terminated path");
+            for (size_t i = 16; i < sizeof(mount); ++i) mount_canary &= mount[i] == 0xAB;
+            CHECK(mount_canary, "AddcontMount preserves bytes beyond its 16-byte output");
 
-            const char licence_label[20] = "00000000000DLC02";
             memset(mount, 0xAB, sizeof(mount));
-            CHECK(app_mount(0, (uint64_t)(uintptr_t)licence_label,
-                            (uint64_t)(uintptr_t)mount, 0, 0, 0) != 0,
-                  "licence-only add-content cannot invent an undeclared mount point");
+            CHECK(app_mount(0, (uint64_t)(uintptr_t)known_label,
+                            (uint64_t)(uintptr_t)mount, 0, 0, 0) == 0x80D90003ull,
+                  "a repeated mount of the same PSAC returns AppContent BUSY");
+            bool repeat_untouched = true;
+            for (uint8_t byte : mount) repeat_untouched &= byte == 0xAB;
+            CHECK(repeat_untouched, "a BUSY mount leaves the output object untouched");
+
+            memset(mount, 0xAB, sizeof(mount));
+            CHECK(app_mount(0, (uint64_t)(uintptr_t)second_label,
+                            (uint64_t)(uintptr_t)mount, 0, 0, 0) == 0x80D90005ull,
+                  "PSAL remains non-mountable even when its manifest declares a path");
             bool mount_untouched = true;
-            for (char byte : mount) mount_untouched &= (uint8_t)byte == 0xAB;
-            CHECK(mount_untouched, "failed licence-only mount leaves output untouched");
+            for (uint8_t byte : mount) mount_untouched &= byte == 0xAB;
+            CHECK(mount_untouched, "a non-mountable PSAL leaves mount output untouched");
 
             const char unknown_label[20] = "UNKNOWNADDCONT01";
             memset(one_np, 0xAB, sizeof(one_np));
@@ -735,10 +773,48 @@ int main() {
             bool unknown_untouched = true;
             for (uint8_t byte : one_np) unknown_untouched &= byte == 0xAB;
             CHECK(unknown_untouched, "unknown entitlement leaves info output untouched");
+            memset(mount, 0xAB, sizeof(mount));
+            CHECK(app_mount(0, (uint64_t)(uintptr_t)unknown_label,
+                            (uint64_t)(uintptr_t)mount, 0, 0, 0) == 0x80D90005ull,
+                  "unknown well-formed AddcontMount labels return AppContent NOT_FOUND");
+            bool unknown_mount_untouched = true;
+            for (uint8_t byte : mount) unknown_mount_untouched &= byte == 0xAB;
+            CHECK(unknown_mount_untouched, "unknown mount leaves its output object untouched");
             char malformed_label[20]; memset(malformed_label, 'A', sizeof(malformed_label));
             CHECK(np_info(0, (uint64_t)(uintptr_t)malformed_label,
                   (uint64_t)(uintptr_t)one_np, 0, 0, 0) == 0x817D0002ull,
                   "unterminated entitlement label is rejected as an invalid argument");
+
+            char padded_label[20]{};
+            memcpy(padded_label, known_label, sizeof(padded_label));
+            padded_label[17] = 1;
+            memset(one_np, 0xAB, sizeof(one_np));
+            CHECK(np_info(0, (uint64_t)(uintptr_t)padded_label,
+                          (uint64_t)(uintptr_t)one_np, 0, 0, 0) == 0x817D0002ull,
+                  "nonzero entitlement-label tail padding is rejected as an invalid argument");
+            bool padded_info_untouched = true;
+            for (uint8_t byte : one_np) padded_info_untouched &= byte == 0xAB;
+            CHECK(padded_info_untouched, "invalid label padding leaves info output untouched");
+            memset(mount, 0xAB, sizeof(mount));
+            CHECK(app_mount(0, (uint64_t)(uintptr_t)padded_label,
+                            (uint64_t)(uintptr_t)mount, 0, 0, 0) == 0x80D90002ull,
+                  "AddcontMount also validates all 20 bytes of the input label object");
+            bool padded_mount_untouched = true;
+            for (uint8_t byte : mount) padded_mount_untouched &= byte == 0xAB;
+            CHECK(padded_mount_untouched, "invalid label padding leaves mount output untouched");
+
+            memset(np_exact, 0xAB, sizeof(np_exact));
+            hits = 0xdeadbeef;
+            CHECK(np_list(0, (uint64_t)(uintptr_t)np_exact, 2501,
+                          (uint64_t)(uintptr_t)&hits, 0, 0) == 0x817D0002ull,
+                  "NP add-content list rejects capacities above its exact 2500-entry ABI maximum");
+            bool over_max_untouched = hits == 0xdeadbeef;
+            for (uint8_t byte : np_exact) over_max_untouched &= byte == 0xAB;
+            CHECK(over_max_untouched,
+                  "NP over-maximum rejection occurs before either guest output is written");
+            hits = 0xdeadbeef;
+            CHECK(np_list(0, 0, 2500, (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 2,
+                  "NP add-content list accepts its exact 2500-entry boundary");
 
             hits = 0xdeadbeef;
             CHECK(np_list(42, 0, 0, (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 2,
@@ -748,8 +824,37 @@ int main() {
                   "an explicitly scoped entry is visible only to its declared service label");
         }
 
-        auto invalid_manifest = [&](const char* text, const char* what) {
-            write_manifest(text);
+        // Sonic's real producer manifest has four installed PSAC records and omits every key.
+        // Pin that exact shape so a future parser cannot make missing keys read as no entitlement.
+        write_manifest(
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\n"
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC02\n"
+            "download_status=INSTALLED\n"
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC03\n"
+            "download_status=INSTALLED\n"
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC04\n"
+            "download_status=INSTALLED\n");
+        set_app0_root(app0.string());
+        if (np_list && np_key) {
+            uint32_t hits = 0xdeadbeef;
+            CHECK(np_list(0, 0, 0, (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 4,
+                  "Sonic-shaped keyless PSAC inventory enumerates all four accepted records");
+            bool all_default_keys = true;
+            for (uint8_t index = 0; index < 4; ++index) {
+                char label[20] = "00000000000DLC01";
+                label[15] = static_cast<char>('1' + index);
+                uint8_t key[16]; memset(key, 0xAB, sizeof(key));
+                const uint8_t expected[16] = {index, 0x04};
+                all_default_keys &= np_key(0, (uint64_t)(uintptr_t)label,
+                                           (uint64_t)(uintptr_t)key, 0, 0, 0) == 0;
+                all_default_keys &= memcmp(key, expected, sizeof(expected)) == 0;
+            }
+            CHECK(all_default_keys,
+                  "Sonic-shaped keyless records receive producer defaults 1024 through 1027");
+        }
+
+        auto inventory_rejected = [&](const char* what) {
             set_app0_root(app0.string());
             uint32_t np_hits = 0xdeadbeef, app_hits = 0xdeadbeef;
             const bool rejected = np_list && app_list &&
@@ -757,6 +862,10 @@ int main() {
                 app_list(0, 0, 0, (uint64_t)(uintptr_t)&app_hits, 0, 0) != 0 &&
                 np_hits == 0xdeadbeef && app_hits == 0xdeadbeef;
             CHECK(rejected, what);
+        };
+        auto invalid_manifest = [&](const char* text, const char* what) {
+            write_manifest(text);
+            inventory_rejected(what);
         };
         const char* one_record_manifest =
             "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
@@ -829,6 +938,49 @@ int main() {
                            "malformed trailing param.json content invalidates inventory");
         invalid_param_json(R"({"titleId":"PPSA\u003000001"})",
                            "escaped titleId values are rejected as ambiguous identity input");
+
+        // Restore real metadata before probing filesystem identity failures.
+        {
+            std::ofstream param(app0 / "sce_sys" / "param.json",
+                                std::ios::binary | std::ios::trunc);
+            param << R"({"titleId":"PPSA00001"})";
+        }
+        fs::remove(app0 / "dlc_emu.ini", ec);
+        ec.clear();
+        fs::create_directory(app0 / "dlc_emu.ini", ec);
+        if (!ec) {
+            inventory_rejected(
+                "a wrong-type manifest path fails visibly instead of becoming an empty inventory");
+            fs::remove(app0 / "dlc_emu.ini", ec);
+        }
+
+        ec.clear();
+        fs::create_symlink("missing-manifest-target", app0 / "dlc_emu.ini", ec);
+        if (!ec) {
+            inventory_rejected(
+                "a dangling manifest symlink fails visibly instead of becoming no manifest");
+            fs::remove(app0 / "dlc_emu.ini", ec);
+        }
+
+        write_manifest(one_record_manifest);
+        {
+            std::ofstream external_param(outside / "param.json",
+                                         std::ios::binary | std::ios::trunc);
+            external_param << R"({"titleId":"PPSA00001"})";
+        }
+        fs::remove(app0 / "sce_sys" / "param.json", ec);
+        ec.clear();
+        fs::create_symlink(outside / "param.json", app0 / "sce_sys" / "param.json", ec);
+        if (!ec) {
+            inventory_rejected(
+                "param.json symlinked outside app0 fails visibly despite valid target contents");
+            fs::remove(app0 / "sce_sys" / "param.json", ec);
+        }
+        {
+            std::ofstream param(app0 / "sce_sys" / "param.json",
+                                std::ios::binary | std::ios::trunc);
+            param << R"({"titleId":"PPSA00001"})";
+        }
 
         fs::remove(app0 / "dlc_emu.ini", ec);
         set_app0_root(app0.string());
