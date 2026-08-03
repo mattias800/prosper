@@ -3720,6 +3720,10 @@ int main() {
                   native_capability_present
                       ? "native-capability 3D consumer overwrites every output channel"
                       : "portable 3D consumer overwrites every output channel");
+            CHECK(packed_mismatches == 0,
+                  native_capability_present
+                      ? "native-capability producer matches every packed R11 voxel"
+                      : "portable producer matches every packed R11 voxel");
             CHECK(mismatches == 0,
                   native_capability_present
                       ? "native-capability exact R11 handoff matches every CPU f11/f10 voxel"
