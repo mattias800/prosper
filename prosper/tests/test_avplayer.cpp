@@ -10,6 +10,7 @@
 #include "../src/hle/nid.hpp"
 #include "../src/hle/video_backend.hpp"
 #include "../src/gpu/guest_texture_layout.hpp"
+#include "../src/gpu/tile.hpp"
 #include <cstdio>
 #include <algorithm>
 #include <cstdint>
@@ -34,6 +35,9 @@ struct AvpInitData {
 struct AvpFrameInfoEx {
     void* data = nullptr; uint8_t reserved[4]{}; uint64_t timestamp = 0; uint8_t details[80]{};
 };
+struct AvpFrameInfo {
+    void* data = nullptr; uint8_t reserved[4]{}; uint64_t timestamp = 0; uint32_t details[4]{};
+};
 struct AvpStreamInfoEx {
     uint64_t size = 0; uint32_t type = 0; uint8_t reserved[4]{};
     uint8_t details[80]{}; uint64_t duration = 0;
@@ -42,18 +46,29 @@ static_assert(offsetof(AvpFrameInfoEx, details) == 24, "AvPlayerFrameInfoEx ABI"
 
 class FakeVideoBackend final : public video::VideoBackend {
 public:
-    static constexpr uint32_t kWidth = 640;
-    static constexpr uint32_t kHeight = 360;
+    // R-Type Delta's 1920x1080 movie is the discriminating case: PS5 AvPlayer exposes a
+    // 2048-byte physical pitch and crops the 128 padded pixels from the valid image extent.
+    static constexpr uint32_t kWidth = 1920;
+    static constexpr uint32_t kHeight = 1080;
+    static constexpr uint32_t kStride = 2048;
+    static constexpr size_t kUvRows = (kHeight + 1u) / 2u;
     bool fail_open = false;
     bool delivered = false;
     bool audio_delivered = false;
     int close_count = 0;
     std::string opened_path;
-    std::vector<uint8_t> nv12 = std::vector<uint8_t>(kWidth * kHeight * 3 / 2, 0x40);
+    std::vector<uint8_t> nv12 =
+        std::vector<uint8_t>(static_cast<size_t>(kStride) * (kHeight + kUvRows), 0xa5);
     std::vector<int16_t> pcm = std::vector<int16_t>(2 * 128, 0x20);
 
     FakeVideoBackend() {
-        std::fill(nv12.begin() + kWidth * kHeight, nv12.end(), 0x80);
+        for (uint32_t row = 0; row < kHeight; ++row)
+            std::fill_n(nv12.data() + static_cast<size_t>(row) * kStride, kWidth,
+                        static_cast<uint8_t>(0x40u + (row & 0x0fu)));
+        uint8_t* uv = nv12.data() + static_cast<size_t>(kStride) * kHeight;
+        for (size_t row = 0; row < kUvRows; ++row)
+            std::fill_n(uv + row * kStride, kWidth,
+                        static_cast<uint8_t>(0x80u + (row & 0x0fu)));
     }
 
     int open(const std::string& host_path) override {
@@ -69,8 +84,9 @@ public:
     }
     bool next_video(int id, video::VideoFrame& out) override {
         if (id != 17 || delivered) return false;
-        out.y = nv12.data(); out.uv = nv12.data() + kWidth * kHeight;
-        out.width = kWidth; out.height = kHeight; out.y_stride = kWidth; out.uv_stride = kWidth;
+        out.y = nv12.data();
+        out.uv = nv12.data() + static_cast<size_t>(kStride) * kHeight;
+        out.width = kWidth; out.height = kHeight; out.y_stride = kStride; out.uv_stride = kStride;
         out.pts_us = 16'667; delivered = true;
         return true;
     }
@@ -185,6 +201,7 @@ int main() {
     HleFn active = Hle::lookup(nid_hash("sceAvPlayerIsActive"));
     HleFn add    = Hle::lookup(nid_hash("sceAvPlayerAddSource"));
     HleFn start  = Hle::lookup(nid_hash("sceAvPlayerStart"));
+    HleFn video_basic = Hle::lookup(nid_hash("sceAvPlayerGetVideoData"));
     HleFn video  = Hle::lookup(nid_hash("sceAvPlayerGetVideoDataEx"));
     HleFn audio  = Hle::lookup(nid_hash("sceAvPlayerGetAudioData"));
     HleFn streams = Hle::lookup("hdTyRzCXQeQ");
@@ -192,9 +209,11 @@ int main() {
     HleFn pause   = Hle::lookup("9y5v+fGN4Wk");
     HleFn resume  = Hle::lookup("w5moABNwnRY");
     HleFn close   = Hle::lookup(nid_hash("sceAvPlayerClose"));
-    CHECK(init && initex && active && add && start && video && audio && streams && infoex && pause && resume && close,
+    CHECK(init && initex && active && add && start && video_basic && video && audio && streams &&
+              infoex && pause && resume && close,
           "AvPlayer lifecycle and stream functions registered");
-    if (!(init && initex && active && add && start && video && audio && streams && infoex && pause && resume && close)) {
+    if (!(init && initex && active && add && start && video_basic && video && audio && streams &&
+          infoex && pause && resume && close)) {
         printf("== FAIL ==\n"); return 1;
     }
 
@@ -270,21 +289,34 @@ int main() {
     const char native_source[] = "movie.mp4";
     CHECK(add(native_handle, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0,
           "native source opens through the registered backend");
+    constexpr size_t native_y_bytes =
+        static_cast<size_t>(FakeVideoBackend::kStride) * FakeVideoBackend::kHeight;
+    constexpr size_t native_frame_bytes = native_y_bytes +
+        static_cast<size_t>(FakeVideoBackend::kStride) * FakeVideoBackend::kUvRows;
     CHECK(texture_alloc_count == 3 && texture_last_align == 0x100 &&
-              texture_last_size == fake.nv12.size(),
-          "native source allocates the requested tight guest NV12 texture ring");
+              texture_last_size == native_frame_bytes,
+          "native source allocates the requested pitch-preserving guest NV12 texture ring");
     CHECK(fake.opened_path == "C:/prosper-test-app0/movie.mp4",
           "native backend receives the resolved host path, not the raw relative guest path");
     CHECK(streams(native_handle, 0, 0, 0, 0, 0) == 2,
           "native audio-bearing source enumerates video and audio streams");
     AvpStreamInfoEx native_info{}; native_info.size = sizeof(native_info);
-    uint32_t native_info_pitch = 0;
+    uint32_t native_info_width = 0, native_info_crop_left = 0, native_info_crop_right = 0;
+    uint32_t native_info_crop_top = 0, native_info_crop_bottom = 0, native_info_pitch = 0;
     CHECK(infoex(native_handle, 0, (uint64_t)(uintptr_t)&native_info, 0, 0, 0) == 0 &&
               native_info.type == 1 && native_info.duration == 2000,
           "native stream metadata and duration come from the backend");
+    memcpy(&native_info_width, native_info.details + 0, sizeof(native_info_width));
+    memcpy(&native_info_crop_left, native_info.details + 20, sizeof(native_info_crop_left));
+    memcpy(&native_info_crop_right, native_info.details + 24, sizeof(native_info_crop_right));
+    memcpy(&native_info_crop_top, native_info.details + 28, sizeof(native_info_crop_top));
+    memcpy(&native_info_crop_bottom, native_info.details + 32, sizeof(native_info_crop_bottom));
     memcpy(&native_info_pitch, native_info.details + 36, sizeof(native_info_pitch));
-    CHECK(native_info_pitch == FakeVideoBackend::kWidth,
-          "native stream metadata reports the AvPlayer tight row pitch");
+    CHECK(native_info_width == FakeVideoBackend::kWidth &&
+              native_info_pitch == FakeVideoBackend::kStride &&
+              native_info_crop_left == 0 && native_info_crop_right == 128 &&
+              native_info_crop_top == 0 && native_info_crop_bottom == 0,
+          "native stream metadata separates the 2048 physical pitch from 1920 visible pixels");
     native_info = {}; native_info.size = sizeof(native_info);
     CHECK(infoex(native_handle, 1, (uint64_t)(uintptr_t)&native_info, 0, 0, 0) == 0 &&
               native_info.type == 2,
@@ -297,28 +329,47 @@ int main() {
               native_frame.data && native_frame.data != fake.nv12.data() &&
               std::find(texture_allocations.begin(), texture_allocations.end(), native_frame.data) !=
                   texture_allocations.end() &&
-              native_frame.timestamp == 16 &&
-              memcmp(native_frame.data, fake.nv12.data(), fake.nv12.size()) == 0,
+              native_frame.timestamp == 16,
           "native decoded NV12 frame is copied into caller-owned guest texture staging");
     const auto* staged = static_cast<const uint8_t*>(native_frame.data);
     const uint64_t staged_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(staged));
-    CHECK(gpu::guest_linear_texture_row_pitch(staged_address, FakeVideoBackend::kWidth) ==
-              FakeVideoBackend::kWidth &&
+    CHECK(staged[0] == 0x40 && staged[FakeVideoBackend::kWidth - 1] == 0x40 &&
+              staged[FakeVideoBackend::kWidth] == 0 &&
+              staged[FakeVideoBackend::kStride] == 0x41 &&
+              staged[native_y_bytes] == 0x80 &&
+              staged[native_y_bytes + FakeVideoBackend::kWidth] == 0 &&
+              staged[native_y_bytes + FakeVideoBackend::kStride] == 0x81,
+          "1920 visible bytes are copied row-by-row while luma/chroma padding remains cleared");
+    CHECK(gpu::guest_linear_texture_row_pitch(staged_address, FakeVideoBackend::kStride) ==
+              FakeVideoBackend::kStride &&
           gpu::guest_linear_texture_row_pitch(
-              staged_address + FakeVideoBackend::kWidth * FakeVideoBackend::kHeight,
-              FakeVideoBackend::kWidth) == FakeVideoBackend::kWidth,
-          "native luma and chroma addresses retain exact tight-layout provenance for GPU sampling");
+              staged_address + native_y_bytes,
+              FakeVideoBackend::kStride) == FakeVideoBackend::kStride,
+          "native luma and chroma addresses retain exact padded-layout provenance for GPU sampling");
     fake.nv12[0] = 0x7f;
     CHECK(static_cast<const uint8_t*>(native_frame.data)[0] == 0x40,
           "guest frame storage remains independent when the backend recycles its packet");
-    uint32_t native_width = 0, native_height = 0, native_pitch = 0; double native_fps = 0.0;
+    uint32_t native_width = 0, native_height = 0, native_crop_left = 0, native_crop_right = 0;
+    uint32_t native_crop_top = 0, native_crop_bottom = 0, native_pitch = 0;
+    double native_fps = 0.0;
     memcpy(&native_width, native_frame.details + 0, sizeof(native_width));
     memcpy(&native_height, native_frame.details + 4, sizeof(native_height));
+    memcpy(&native_crop_left, native_frame.details + 20, sizeof(native_crop_left));
+    memcpy(&native_crop_right, native_frame.details + 24, sizeof(native_crop_right));
+    memcpy(&native_crop_top, native_frame.details + 28, sizeof(native_crop_top));
+    memcpy(&native_crop_bottom, native_frame.details + 32, sizeof(native_crop_bottom));
     memcpy(&native_pitch, native_frame.details + 36, sizeof(native_pitch));
     memcpy(&native_fps, native_frame.details + 48, sizeof(native_fps));
     CHECK(native_width == FakeVideoBackend::kWidth && native_height == FakeVideoBackend::kHeight &&
-              native_pitch == FakeVideoBackend::kWidth && native_fps == 60.0,
-          "native frame details preserve dimensions, tight row pitch, and frame rate");
+              native_pitch == FakeVideoBackend::kStride && native_crop_left == 0 &&
+              native_crop_right == 128 && native_crop_top == 0 && native_crop_bottom == 0 &&
+              native_fps == 60.0,
+          "native frame details preserve visible dimensions, physical pitch, crop, and frame rate");
+    CHECK(gpu::linear_sampled_surface_bytes(native_pitch, native_height, 1) ==
+              static_cast<size_t>(native_pitch) * native_height,
+          "R-Type movie luma descriptor footprint matches the published pitch extent");
+    CHECK(native_pitch - native_crop_left - native_crop_right == native_width,
+          "GRIS crop offsets hide the padded tail instead of exposing a right-edge strip");
     CHECK(video(native_handle, (uint64_t)(uintptr_t)&native_frame, 0, 0, 0, 0) == 0 &&
               event_count == 3 && events[2] == 1 && !fake.audio_delivered,
           "video-only consumption of an audio-bearing source reaches EOF and fires one STOP");
@@ -329,8 +380,28 @@ int main() {
     close(native_handle, 0, 0, 0, 0, 0);
     CHECK(fake.close_count == 1 && texture_free_count == 3,
           "Close releases the native decode session and every guest texture");
-    CHECK(gpu::guest_linear_texture_row_pitch(staged_address, FakeVideoBackend::kWidth) == 0,
+    CHECK(gpu::guest_linear_texture_row_pitch(staged_address, FakeVideoBackend::kStride) == 0,
           "Close removes the released AvPlayer texture layout provenance");
+
+    // The basic API has no pitch/crop fields. Keep its historical tight fallback contract while
+    // GetVideoDataEx exposes the PS5 physical layout above.
+    uint64_t basic_handle = init((uint64_t)(uintptr_t)&data, 0, 0, 0, 0, 0);
+    CHECK(add(basic_handle, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0 &&
+              start(basic_handle, 0, 0, 0, 0, 0) == 0,
+          "basic AvPlayer source starts through the same padded-stride backend");
+    AvpFrameInfo basic_frame{};
+    CHECK(video_basic(basic_handle, (uint64_t)(uintptr_t)&basic_frame, 0, 0, 0, 0) == 1 &&
+              basic_frame.data && basic_frame.details[0] == FakeVideoBackend::kWidth &&
+              basic_frame.details[1] == FakeVideoBackend::kHeight,
+          "basic AvPlayer frame preserves its width/height-only ABI");
+    const uint64_t basic_address =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(basic_frame.data));
+    CHECK(gpu::guest_linear_texture_row_pitch(basic_address, FakeVideoBackend::kWidth) ==
+              FakeVideoBackend::kWidth,
+          "basic AvPlayer storage remains tight because that ABI cannot publish padding crops");
+    close(basic_handle, 0, 0, 0, 0, 0);
+    CHECK(gpu::guest_linear_texture_row_pitch(basic_address, FakeVideoBackend::kWidth) == 0,
+          "Close removes the basic AvPlayer fallback layout provenance");
     prosper::video::set_backend(nullptr);
 
     // One delivered synthetic frame, then EOF on the next pull. Astro Bot follows this path and does
@@ -360,15 +431,22 @@ int main() {
     CHECK(frame.data != nullptr, "synthetic frame has stable storage");
     const uint64_t synthetic_frame_address =
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(frame.data));
-    uint32_t width = 0, height = 0, pitch = 0; double fps = 0.0;
+    uint32_t width = 0, height = 0, crop_left = 0, crop_right = 0;
+    uint32_t crop_top = 0, crop_bottom = 0, pitch = 0;
+    double fps = 0.0;
     memcpy(&width, frame.details + 0, sizeof(width));
     memcpy(&height, frame.details + 4, sizeof(height));
+    memcpy(&crop_left, frame.details + 20, sizeof(crop_left));
+    memcpy(&crop_right, frame.details + 24, sizeof(crop_right));
+    memcpy(&crop_top, frame.details + 28, sizeof(crop_top));
+    memcpy(&crop_bottom, frame.details + 32, sizeof(crop_bottom));
     memcpy(&pitch, frame.details + 36, sizeof(pitch));
     memcpy(&fps, frame.details + 48, sizeof(fps));
-    CHECK(width == 1920 && height == 1080 && pitch == 1920 && fps == 30.0,
-          "AvPlayerVideoEx uses the published 80-byte layout");
+    CHECK(width == 1920 && height == 1080 && pitch == 2048 && crop_left == 0 &&
+              crop_right == 128 && crop_top == 0 && crop_bottom == 0 && fps == 30.0,
+          "AvPlayerVideoEx uses the published 80-byte padded-pitch/crop layout");
     CHECK(gpu::guest_linear_texture_row_pitch(synthetic_frame_address, pitch) == pitch,
-          "fallback AvPlayer storage also publishes its exact tight layout");
+          "fallback AvPlayer storage also publishes its exact physical layout");
     CHECK(pause(h2, 0, 0, 0, 0, 0) == 0 && event_count == 3 && events[2] == 4,
           "Pause reports success and fires PAUSE without deadlocking the callback");
     CHECK(video(h2, (uint64_t)(uintptr_t)&frame, 0, 0, 0, 0) == 0 && event_count == 3,

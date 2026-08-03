@@ -6,9 +6,9 @@
 
 namespace prosper::gpu {
 
-// Register a guest-visible allocation whose sampled-linear rows are intentionally tightly packed.
-// The ordinary GFX10 fallback remains 256-byte aligned; this provenance is for HLE producers such as
-// AvPlayer that return CPU-staged pixels and an explicit row pitch to the title.
+// Register a guest-visible allocation whose sampled-linear rows have an exact HLE-owned pitch.
+// The ordinary GFX10 fallback remains 256-byte aligned; this provenance is for producers such as
+// AvPlayer that return CPU-staged pixels and explicitly publish their physical pitch to the title.
 void register_guest_linear_texture_layout(uint64_t base, size_t bytes,
                                           uint32_t row_pitch_bytes);
 void unregister_guest_linear_texture_layout(uint64_t base);

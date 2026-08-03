@@ -691,11 +691,16 @@ struct AvpFrameInfo {                // sceAvPlayerGetVideoData / GetAudioData o
 };
 struct AvpVideoEx {                  // AvPlayerVideoEx (in the 80B details union)
     uint32_t width, height; float aspect; uint8_t lang[4]; uint8_t reserved0[4];
-    uint32_t crop_l, crop_r, crop_t, crop_b, pitch;
+    uint32_t crop_left_offset, crop_right_offset, crop_top_offset, crop_bottom_offset, pitch;
     uint8_t luma_bd, chroma_bd, full_range, reserved1[5];
     double framerate; uint32_t colour_primaries, transfer_characteristics; uint8_t reserved2[16];
 };
-static_assert(sizeof(AvpVideoEx) == 80 && offsetof(AvpVideoEx, pitch) == 36 &&
+static_assert(sizeof(AvpVideoEx) == 80 &&
+              offsetof(AvpVideoEx, crop_left_offset) == 20 &&
+              offsetof(AvpVideoEx, crop_right_offset) == 24 &&
+              offsetof(AvpVideoEx, crop_top_offset) == 28 &&
+              offsetof(AvpVideoEx, crop_bottom_offset) == 32 &&
+              offsetof(AvpVideoEx, pitch) == 36 &&
               offsetof(AvpVideoEx, framerate) == 48, "AvPlayerVideoEx ABI");
 struct AvpFrameInfoEx {              // sceAvPlayerGetVideoDataEx out-param (larger details union)
     void* p_data; uint8_t reserved[4]; uint64_t timestamp;
@@ -750,12 +755,22 @@ struct AvpPlayer {
 std::mutex g_avp_mx;
 std::unordered_map<uint64_t, AvpPlayer> g_avp;
 
-bool avp_nv12_bytes(uint32_t width, uint32_t height, size_t& bytes) {
-    if (!width || !height || width > SIZE_MAX / height) return false;
-    const size_t y_bytes = static_cast<size_t>(width) * height;
+// PS5 AvPlayer exposes decoded NV12 as a sampled-linear surface. Its physical row pitch is aligned
+// to 256 bytes; the valid image width remains separate and the padded pixels are reported through
+// AvPlayerVideoEx::crop_right_offset. Keeping those two extents distinct is required by consumers
+// that validate an AGC texture footprint before binding its second plane.
+bool avp_video_pitch(uint32_t width, uint32_t& pitch) {
+    if (!width || width > UINT32_MAX - 255u) return false;
+    pitch = (width + 255u) & ~255u;
+    return true;
+}
+
+bool avp_nv12_bytes(uint32_t pitch, uint32_t height, size_t& bytes) {
+    if (!pitch || !height || pitch > SIZE_MAX / height) return false;
+    const size_t y_bytes = static_cast<size_t>(pitch) * height;
     const size_t uv_rows = (static_cast<size_t>(height) + 1) / 2;
-    if (width > SIZE_MAX / uv_rows) return false;
-    const size_t uv_bytes = static_cast<size_t>(width) * uv_rows;
+    if (pitch > SIZE_MAX / uv_rows) return false;
+    const size_t uv_bytes = static_cast<size_t>(pitch) * uv_rows;
     if (uv_bytes > SIZE_MAX - y_bytes) return false;
     bytes = y_bytes + uv_bytes;
     return true;
@@ -787,46 +802,63 @@ uint8_t* avp_frame_storage(AvpPlayer& player, size_t bytes, uint32_t pitch) {
 // visible NV12 rows into a guest texture buffer when one exists.  The host-vector fallback preserves
 // the old lifetime guarantee for native tests and titles that omit the replacement callbacks.
 bool avp_stage_video(AvpPlayer& player, const prosper::video::VideoFrame& frame,
-                     uint8_t*& data, uint32_t& pitch) {
+                     bool extended_layout, uint8_t*& data, uint32_t& pitch) {
     if (!frame.y || !frame.uv || frame.width == 0 || frame.height == 0) return false;
     const size_t y_stride = frame.y_stride ? frame.y_stride : frame.width;
     const size_t uv_stride = frame.uv_stride ? frame.uv_stride : frame.width;
     if (y_stride < frame.width || uv_stride < frame.width) return false;
     const size_t uv_rows = (static_cast<size_t>(frame.height) + 1) / 2;
     if (y_stride > SIZE_MAX / frame.height || uv_stride > SIZE_MAX / uv_rows) return false;
+    pitch = frame.width;
+    if (extended_layout && !avp_video_pitch(frame.width, pitch)) return false;
     size_t bytes = 0;
-    if (!avp_nv12_bytes(frame.width, frame.height, bytes)) return false;
+    if (!avp_nv12_bytes(pitch, frame.height, bytes)) return false;
     uint8_t* dst = nullptr;
     if (!player.texture_frames.empty()) {
         if (bytes > player.texture_frame_bytes) return false;
         dst = player.texture_frames[player.next_texture_frame++ % player.texture_frames.size()];
     } else {
-        dst = avp_frame_storage(player, bytes, frame.width);
+        dst = avp_frame_storage(player, bytes, pitch);
     }
     if (!dst) return false;
-    for (uint32_t row = 0; row < frame.height; ++row)
-        memcpy(dst + static_cast<size_t>(row) * frame.width,
+    // Copy visible pixels and clear only the padded tail. Clearing the entire frame before copying
+    // it would double memory traffic on every decoded frame; the crop still must not expose stale
+    // decoder bytes if a title deliberately samples beyond the valid image extent.
+    const size_t padding = static_cast<size_t>(pitch) - frame.width;
+    for (uint32_t row = 0; row < frame.height; ++row) {
+        memcpy(dst + static_cast<size_t>(row) * pitch,
                frame.y + static_cast<size_t>(row) * y_stride, frame.width);
-    uint8_t* dst_uv = dst + static_cast<size_t>(frame.width) * frame.height;
-    for (size_t row = 0; row < uv_rows; ++row)
-        memcpy(dst_uv + row * frame.width, frame.uv + row * uv_stride, frame.width);
+        if (padding)
+            memset(dst + static_cast<size_t>(row) * pitch + frame.width, 0, padding);
+    }
+    uint8_t* dst_uv = dst + static_cast<size_t>(pitch) * frame.height;
+    for (size_t row = 0; row < uv_rows; ++row) {
+        memcpy(dst_uv + row * pitch, frame.uv + row * uv_stride, frame.width);
+        if (padding) memset(dst_uv + row * pitch + frame.width, 0, padding);
+    }
+    // Callback storage is registered before the first pull. Refresh it here because the basic API
+    // retains its historical tight layout while GetVideoDataEx publishes the padded physical pitch.
+    avp_register_frame_layout(dst, bytes, pitch);
     data = dst;
-    pitch = frame.width;
     return true;
 }
 
-bool avp_stage_synthetic(AvpPlayer& player, uint8_t*& data) {
+bool avp_stage_synthetic(AvpPlayer& player, bool extended_layout,
+                         uint8_t*& data, uint32_t& pitch) {
+    pitch = player.width;
+    if (extended_layout && !avp_video_pitch(player.width, pitch)) return false;
     size_t need = 0;
-    if (!avp_nv12_bytes(player.width, player.height, need)) return false;
+    if (!avp_nv12_bytes(pitch, player.height, need)) return false;
     if (!player.texture_frames.empty()) {
         if (need > player.texture_frame_bytes) return false;
         data = player.texture_frames[player.next_texture_frame++ % player.texture_frames.size()];
         if (!data) return false;
     } else {
-        data = avp_frame_storage(player, need, player.width);
+        data = avp_frame_storage(player, need, pitch);
         if (!data) return false;
     }
     memset(data, 0, need);
+    avp_register_frame_layout(data, need, pitch);
     return true;
 }
 
@@ -912,8 +944,9 @@ bool avp_build_textures(const AvpMemAllocator& memory, int32_t requested,
     const bool have_allocate = memory.allocate_texture != nullptr;
     const bool have_deallocate = memory.deallocate_texture != nullptr;
     if (!have_allocate && !have_deallocate) return true; // legacy/test fallback
-    if (!have_allocate || !have_deallocate ||
-        !avp_nv12_bytes(width, height, texture_bytes) || texture_bytes > UINT32_MAX)
+    uint32_t pitch = 0;
+    if (!have_allocate || !have_deallocate || !avp_video_pitch(width, pitch) ||
+        !avp_nv12_bytes(pitch, height, texture_bytes) || texture_bytes > UINT32_MAX)
         return false;
 
     // The public API permits a caller-selected framebuffer count.  Zero requests the normal double
@@ -932,7 +965,7 @@ bool avp_build_textures(const AvpMemAllocator& memory, int32_t requested,
         }
         auto* texture = static_cast<uint8_t*>(allocation);
         textures.push_back(texture);
-        avp_register_frame_layout(texture, texture_bytes, width);
+        avp_register_frame_layout(texture, texture_bytes, pitch);
     }
     if (avp_log()) {
         fprintf(stderr,
@@ -1059,8 +1092,12 @@ HLE(s_avp_getstreaminfoex) { // s32 sceAvPlayerGetStreamInfoEx(handle, stream_id
     if (a1 >= (p.has_audio ? 2u : 1u)) return 0x806a0001ull;
     *out = {}; out->this_size = caller_size; out->type = a1 == 0 ? 1u : 2u;
     if (a1 == 0) {
+        uint32_t pitch = 0;
+        if (!avp_video_pitch(p.width, pitch)) return 0x806a0001ull;
         out->details.video.width = p.width; out->details.video.height = p.height;
-        out->details.video.aspect = (float)p.width / (float)p.height; out->details.video.pitch = p.width;
+        out->details.video.aspect = (float)p.width / (float)p.height;
+        out->details.video.crop_right_offset = pitch - p.width;
+        out->details.video.pitch = pitch;
         out->details.video.luma_bd = 8; out->details.video.chroma_bd = 8;
         out->details.video.framerate = p.fps;
     } else {
@@ -1286,7 +1323,7 @@ HLE(s_avp_getvideodata) {
             if (b->next_video(p.backend_id, vf)) {
                 uint8_t* staged = nullptr;
                 uint32_t pitch = 0;
-                if (avp_stage_video(p, vf, staged, pitch)) {
+                if (avp_stage_video(p, vf, false, staged, pitch)) {
                     fi->p_data = staged;
                     fi->timestamp = vf.pts_us / 1000;
                     p.last_ts_ms = fi->timestamp;
@@ -1301,7 +1338,8 @@ HLE(s_avp_getvideodata) {
             // frame delivery: Astro Bot never polls IsActive, so an IsActive-only counter made EOF
             // and the STOP event unreachable even though it continuously pulled video frames.
             uint8_t* staged = nullptr;
-            if (avp_stage_synthetic(p, staged)) {
+            uint32_t pitch = 0;
+            if (avp_stage_synthetic(p, false, staged, pitch)) {
                 fi->p_data = staged; fi->timestamp = p.poll * 33ull; // ~30fps PTS (ms)
                 p.last_ts_ms = fi->timestamp;
                 fi->d0 = p.width; fi->d1 = p.height; fi->d2 = 0; fi->d3 = 0;
@@ -1332,12 +1370,13 @@ HLE(s_avp_getvideodataex) {
             if (b->next_video(p.backend_id, vf)) {
                 uint8_t* staged = nullptr;
                 uint32_t pitch = 0;
-                if (avp_stage_video(p, vf, staged, pitch)) {
+                if (avp_stage_video(p, vf, true, staged, pitch)) {
                     fi->p_data = staged;
                     fi->timestamp = vf.pts_us / 1000;
                     p.last_ts_ms = fi->timestamp;
                     fi->details.video = {}; fi->details.video.width = vf.width; fi->details.video.height = vf.height;
                     fi->details.video.aspect = vf.height ? (float)vf.width / (float)vf.height : 0.0f;
+                    fi->details.video.crop_right_offset = pitch - vf.width;
                     fi->details.video.pitch = pitch;
                     fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
                     fi->details.video.framerate = p.fps;
@@ -1348,11 +1387,14 @@ HLE(s_avp_getvideodataex) {
             }
         } else if (p.synthetic && p.poll < avp_synth_frames()) {
             uint8_t* staged = nullptr;
-            if (avp_stage_synthetic(p, staged)) {
+            uint32_t pitch = 0;
+            if (avp_stage_synthetic(p, true, staged, pitch)) {
                 fi->p_data = staged; fi->timestamp = p.poll * 33ull;
                 p.last_ts_ms = fi->timestamp;
                 fi->details.video = {}; fi->details.video.width = p.width; fi->details.video.height = p.height;
-                fi->details.video.aspect = (float)p.width / (float)p.height; fi->details.video.pitch = p.width;
+                fi->details.video.aspect = (float)p.width / (float)p.height;
+                fi->details.video.crop_right_offset = pitch - p.width;
+                fi->details.video.pitch = pitch;
                 fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
                 fi->details.video.framerate = p.fps;
                 p.poll++; result = 1;
