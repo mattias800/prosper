@@ -34,6 +34,7 @@ extern "C" void prosper_rel1_forge_suppress_all_override_for_test(int value);
 extern "C" void prosper_rel1_forge_decision_reset_for_test();
 extern "C" void prosper_rel1_forge_decision_totals(uint64_t* candidates, uint64_t* suppressed,
                                                      uint64_t* landed);
+extern "C" bool prosper_rel1_forge_report_due_for_test(uint64_t candidates);
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -899,6 +900,14 @@ int main() {
         prosper_rel1_forge_decision_totals(&candidates, &suppressed, &landed);
         CHECK(candidates == 0 && suppressed == 0 && landed == 0,
               "ArcRunner diagnostic: default-off mode records no suppression decisions");
+        CHECK(prosper_rel1_forge_report_due_for_test(1) &&
+              prosper_rel1_forge_report_due_for_test(64) &&
+              prosper_rel1_forge_report_due_for_test(127) &&
+              prosper_rel1_forge_report_due_for_test(256),
+              "ArcRunner diagnostic: dense census reports every possible sub-256 terminal total");
+        CHECK(!prosper_rel1_forge_report_due_for_test(257) &&
+              prosper_rel1_forge_report_due_for_test(512),
+              "ArcRunner diagnostic: census tail remains bounded to each 256th candidate");
 
         // Positive-control every reported number through the real store site. Observe-only mode is
         // test-private: it counts the candidate but deliberately lets it land, proving `landed` can

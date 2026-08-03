@@ -137,8 +137,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     suppresses every 32-bit ReleaseMem write that would turn a pointer-shaped qword with a zero low
     dword into `pointer|value`, including live paired fences that real hardware must execute. It is
     therefore diagnostic-only and unsuitable for normal play. A valid run must print
-    `FORGE-DECISION-TOTALS` with `candidates == suppressed` and `landed == 0`; the first candidate
-    and every 256th print so an early fault still proves the lever moved. Combine it with
+    `FORGE-DECISION-TOTALS` with `candidates == suppressed` and `landed == 0`. Every candidate
+    through 256 prints, then every 256th: the worker-fault path uses `_exit(90)` and cannot run an
+    atexit summary, while #1226's combined arm has a measured sub-128 population and therefore gets
+    an exact terminal census from this bounded dense prefix. Combine it with
     `PROSPER_INIT_SUPPRESS=ptr` for the decisive landed-forges-zero plus init-suppressed arm. A
     malformed selector prints `NOT ARMED` rather than silently becoming a negative result.
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use

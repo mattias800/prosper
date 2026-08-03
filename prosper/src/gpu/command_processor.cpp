@@ -790,9 +790,10 @@ static bool forge_guard() {
 // ArcRunner's observed 0x2000000001 composition.
 //
 // The counters are part of the experiment, not decoration. A run is a valid all-forge-suppressed arm
-// only when FORGE-DECISION-TOTALS says candidates == suppressed and landed == 0. The first candidate
-// and every 256th candidate print a dense total, because ArcRunner can fault before a process-exit
-// summary and a capped detail log has repeatedly been mistaken for a population on this issue.
+// only when FORGE-DECISION-TOTALS says candidates == suppressed and landed == 0. Every one of the
+// first 256 candidates prints, then every 256th. ArcRunner's worker-fault path calls `_exit(90)`, so
+// a normal atexit summary cannot run; the dense prefix guarantees a terminal census for the combined
+// arm's measured sub-128 population without making the diagnostic unbounded on other workloads.
 namespace {
 struct Rel1ForgeDecisionCounters {
     uint64_t candidates = 0;
@@ -833,6 +834,10 @@ void rel1_forge_report_totals_locked(const char* suffix = "") {
             (unsigned long long)g_rel1_forge_decisions.landed, suffix);
 }
 
+bool rel1_forge_report_due(uint64_t candidates) {
+    return candidates > 0 && (candidates <= 256 || (candidates % 256) == 0);
+}
+
 bool rel1_forge_suppress_candidate() {
     const int mode = rel1_forge_decision_mode();
     if (!mode) return false;
@@ -840,8 +845,7 @@ bool rel1_forge_suppress_candidate() {
     ++g_rel1_forge_decisions.candidates;
     if (mode != 1) return false;   // test-only observe mode positive-controls the landed counter
     ++g_rel1_forge_decisions.suppressed;
-    if (g_rel1_forge_decisions.candidates == 1 ||
-        (g_rel1_forge_decisions.candidates % 256) == 0)
+    if (rel1_forge_report_due(g_rel1_forge_decisions.candidates))
         rel1_forge_report_totals_locked();
     return true;
 }
@@ -869,6 +873,9 @@ extern "C" void prosper_rel1_forge_decision_totals(uint64_t* candidates, uint64_
     if (candidates) *candidates = g_rel1_forge_decisions.candidates;
     if (suppressed) *suppressed = g_rel1_forge_decisions.suppressed;
     if (landed) *landed = g_rel1_forge_decisions.landed;
+}
+extern "C" bool prosper_rel1_forge_report_due_for_test(uint64_t candidates) {
+    return rel1_forge_report_due(candidates);
 }
 // #312 label free-state write-after-free guard — see label_freed_marker_kind. Default OFF
 // (PROSPER_REL1_WAF_GUARD=1 to arm). RATIONALE (session-11 A/B, ~30 menu-drive runs): this guard is
