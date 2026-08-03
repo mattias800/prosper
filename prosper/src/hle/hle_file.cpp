@@ -2026,7 +2026,7 @@ std::string prosper_apr_path_for_id(uint32_t id) {
 }
 // Register a resolved container and return its stable 1-based id. Re-resolving the same host path
 // returns the existing id (updated size) instead of a duplicate entry — a duplicate would make
-// every size-keyed read of that file look ambiguous. Exposed (not static) for the unit test.
+// unresolved-id size fallback for that file look ambiguous. Exposed (not static) for the unit test.
 uint32_t prosper_apr_register(const std::string& path, uint64_t size) {
     std::lock_guard lk(g_apr_mx);
     for (size_t i = 0; i < g_apr_files.size(); i++)
@@ -2040,10 +2040,9 @@ void prosper_apr_reset_for_test() {
     g_apr_files.clear();
 }
 // Find resolved host paths whose TOTAL size equals `size`. Returns the match count and sets
-// *out_path to the first match. The read path may only act on an unambiguous (count==1) match:
-// the APR read-request object carries the total byte count at obj+0x30 but the file id is NOT
-// legible in the captured request layout (docs/UE4_APR_IOSTORE_BRINGUP.md field map, +0x00..+0x40),
-// so size is the only correlation currently available. Exposed (not static) for the unit test.
+// *out_path to the first match. The read path resolves the real APR file id first; it may use this
+// legacy fallback only when the id is unknown and the size is unambiguous (count==1). Exposed (not
+// static) for the unit test.
 int prosper_apr_match_by_size(uint64_t size, std::string* out_path) {
     std::lock_guard lk(g_apr_mx);
     int n = 0;
@@ -2107,13 +2106,14 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
                                    guest.empty() ? "(null)" : guest.c_str());
             return 0x80020002ull;   // ENOENT
         }
-        // Warn loudly (unconditionally) when a DIFFERENT container shares this size: the read
-        // path is size-keyed (see f_apr_read_submit) and will refuse such reads as ambiguous.
+        // A collision does not affect normal reads, which resolve by APR file id. Keep it visible
+        // because the legacy size fallback cannot choose safely if an unknown id reaches it.
         std::string clash; int same_size = prosper_apr_match_by_size(size, &clash);
         id = prosper_apr_register(host, size);
         if (same_size > 0 && clash != host)
-            fprintf(stderr, "[apr] WARNING: %s and %s share byte size %llu — size-keyed reads of "
-                    "either will be refused as ambiguous (issue #62)\n",
+            fprintf(stderr, "[apr] WARNING: %s and %s share byte size %llu — ID-resolved reads "
+                    "remain valid; unresolved-id size fallback will be refused as ambiguous "
+                    "(issue #1901)\n",
                     host.c_str(), clash.c_str(), (unsigned long long)size);
         if (out_ids)   out_ids[i]   = id;
         if (out_sizes) out_sizes[i] = size;
@@ -2465,6 +2465,16 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     // container.
     uint64_t id   = a3;
     uint64_t dest = *(uint64_t*)(req + 0x20);   // begin staging / residue; diagnostics only
+    uint64_t offset = 0;
+#ifndef _WIN32
+    offset = apr_stack_arg(entry_rsp, 0);
+#else
+    offset = a6;
+    (void)a7;
+#endif
+    const uint64_t requested_size = a5;
+    const uint64_t fallback_size = *(uint64_t*)(req + 0x30);
+    const char* resolution_method = "id";
     std::string host = prosper_apr_path_for_id((uint32_t)id);
     // Fallback when the id (a3) doesn't resolve: key by the request's total byte count, but ONLY on
     // an unambiguous match — exactly one resolved container of that size (prosper_apr_match_by_size,
@@ -2472,12 +2482,20 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     // fails loudly below, rather than serving the wrong file's bytes.
     if (host.empty()) {
         std::string m;
-        if (prosper_apr_match_by_size(*(uint64_t*)(req + 0x30), &m) == 1) host = m;
-    }
-    if (host.empty()) {
-        if (filelog()) fprintf(stderr, "[apr] read-submit: no file for id=%llu\n",
-                               (unsigned long long)id);
-        return 0x80020016ull;    // record stays incomplete -> the engine reports this read as failed
+        int matches = prosper_apr_match_by_size(fallback_size, &m);
+        if (matches == 1) {
+            host = std::move(m);
+            resolution_method = "size-fallback";
+        } else {
+            if (filelog())
+                fprintf(stderr,
+                        "[apr] read-submit method=refused id=%llu offset=0x%llx "
+                        "requested=%llu fallback-size=%llu matches=%d\n",
+                        (unsigned long long)id, (unsigned long long)offset,
+                        (unsigned long long)requested_size,
+                        (unsigned long long)fallback_size, matches);
+            return 0x80020016ull;  // record stays incomplete -> the engine reports this read as failed
+        }
     }
     // Read range: a5 = byte count, and the FILE OFFSET is the 7th argument (on the guest stack).
     // Verified live with exact footer math (2026-07-08): utoc header reads pass (offset=0,
@@ -2489,9 +2507,7 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     // accepted). CONFIDENCE: HIGH (offset+size confirmed on 8 live reads across 3 file kinds).
     uint64_t fsize = 0;
     { struct stat st {}; if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size; }
-    uint64_t offset = 0;
 #ifndef _WIN32
-    offset = apr_stack_arg(entry_rsp, 0);
     uint64_t arg8 = apr_stack_arg(entry_rsp, 1);
     // arg8 discriminates the engine's ASYNC streaming reads from its sync (record-polled) reads —
     // the ONLY ReadFile-level difference found across 90-read boots (identical guest-RA chains):
@@ -2517,11 +2533,8 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
                             (unsigned long long)*(uint64_t*)(uintptr_t)(arg8 + o));
         }
     }
-#else
-    offset = a6;
-    (void)a7;
 #endif
-    uint64_t size = a5;
+    uint64_t size = requested_size;
     if (offset > fsize) {
         if (filelog()) fprintf(stderr, "[apr] read-submit: offset 0x%llx past EOF (file %llu) — clamped\n",
                                (unsigned long long)offset, (unsigned long long)fsize);
@@ -2633,12 +2646,14 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
         munmap(slot, rounded);   // failure: record stays -> guest reports it; success-into-dst: staging no longer needed
     }
     if (ok) prosper_ampr_advance(a0, (offset >> 32) ? 24 : 20);
-    if (filelog()) fprintf(stderr, "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu got=%lld %s\n",
+    if (filelog()) fprintf(stderr, "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) "
+                   "off=0x%llx size=%llu got=%lld %s method=%s requested=%llu\n",
                    (unsigned long long)id, host.c_str(),
                    in_dst ? (unsigned long long)a4 : (unsigned long long)(uintptr_t)slot,
                    in_dst ? "guest" : "staging",
                    (unsigned long long)offset, (unsigned long long)size, (long long)got,
-                   ok ? "OK" : "SHORT");
+                   ok ? "OK" : "SHORT", resolution_method,
+                   (unsigned long long)requested_size);
     return ok ? 0 : 0x80020016ull;
 #else
     (void)dest;
@@ -2670,11 +2685,13 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     if (in_dst) ::free(slot);
     prosper_ampr_advance(a0, (offset >> 32) ? 24 : 20);
     if (filelog()) fprintf(stderr,
-        "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu got=%llu OK\n",
+        "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu "
+        "got=%llu OK method=%s requested=%llu\n",
         (unsigned long long)id, host.c_str(),
         in_dst ? (unsigned long long)a4 : (unsigned long long)(uintptr_t)slot,
         in_dst ? "guest" : "staging", (unsigned long long)offset,
-        (unsigned long long)size, (unsigned long long)got);
+        (unsigned long long)size, (unsigned long long)got, resolution_method,
+        (unsigned long long)requested_size);
     return 0;
 #endif
 }

@@ -1,16 +1,20 @@
-// test_apr_registry — guards the APR container registry and its size-keyed read matching
-// (issue #62). The APR read-submit handler identifies WHICH file to read by total byte size,
-// because the captured read-request object carries no legible file id. That key is only sound
-// when unambiguous, so this locks in: stable 1-based id assignment, path-dedup on re-resolve
-// (a duplicate entry would make every read of that file look ambiguous), and the match counts
-// the read path uses to refuse ambiguous / unplaceable (chunk) reads instead of guessing.
+// test_apr_registry — guards APR container registration and read-source resolution (#62/#1901).
+// The read path uses the real APR file id first and consults total byte size only as a legacy
+// fallback for an unresolved id. This locks in stable ids, path dedup, valid colliding-id reads,
+// unique-size fallback, ambiguous fallback refusal, and truthful resolution-method diagnostics.
 #include <cstdio>
 #include <cstdint>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #ifndef _WIN32
 #include <sys/mman.h>   // mmap/munmap — WriteAddress fault-safety check (#1149/#1154)
 #endif
@@ -31,8 +35,73 @@ static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
                               else        { printf("  [ok]   %s\n", msg); } } while (0)
 
+static bool set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    return _putenv_s(name, value) == 0;
+#else
+    return setenv(name, value, 1) == 0;
+#endif
+}
+
+static int file_descriptor(FILE* file) {
+#ifdef _WIN32
+    return _fileno(file);
+#else
+    return fileno(file);
+#endif
+}
+
+static int duplicate_descriptor(int fd) {
+#ifdef _WIN32
+    return _dup(fd);
+#else
+    return dup(fd);
+#endif
+}
+
+static int replace_descriptor(int from, int to) {
+#ifdef _WIN32
+    return _dup2(from, to);
+#else
+    return dup2(from, to);
+#endif
+}
+
+static void close_descriptor(int fd) {
+#ifdef _WIN32
+    _close(fd);
+#else
+    close(fd);
+#endif
+}
+
+template <typename Fn>
+static std::string capture_stderr(Fn&& fn) {
+    FILE* capture = std::tmpfile();
+    if (!capture) return {};
+    std::fflush(stderr);
+    const int saved_stderr = duplicate_descriptor(file_descriptor(stderr));
+    if (saved_stderr < 0 || replace_descriptor(file_descriptor(capture), file_descriptor(stderr)) < 0) {
+        if (saved_stderr >= 0) close_descriptor(saved_stderr);
+        std::fclose(capture);
+        return {};
+    }
+    fn();
+    std::fflush(stderr);
+    replace_descriptor(saved_stderr, file_descriptor(stderr));
+    close_descriptor(saved_stderr);
+    std::rewind(capture);
+    std::string output;
+    char buffer[512];
+    while (size_t n = std::fread(buffer, 1, sizeof buffer, capture))
+        output.append(buffer, n);
+    std::fclose(capture);
+    return output;
+}
+
 int main() {
     printf("== test_apr_registry ==\n");
+    CHECK(set_test_env("PROSPER_FILELOG", "1"), "APR read diagnostics enabled for regression");
     prosper_apr_reset_for_test();
 
     // Stable 1-based ids in resolve order.
@@ -87,7 +156,9 @@ int main() {
     }
     register_file_hle();
     HleFn read_file = Hle::lookup("mQ16-QdKv7k");
-    CHECK(read_file != nullptr, "AMPR read-file HLE registered");
+    HleFn resolve_plain = Hle::lookup(nid_hash("sceKernelAprResolveFilepathsToIdsAndFileSizes"));
+    CHECK(read_file != nullptr && resolve_plain != nullptr,
+          "AMPR read-file and APR resolve HLEs registered");
     std::string stub_error;
     const std::vector<ImportSlot> slots = {{"libSceAmpr", "mQ16-QdKv7k"}};
     CHECK(install_stubs(slots, 0x720000000ull, 96, &stub_error),
@@ -103,11 +174,11 @@ int main() {
     std::array<uint64_t, 3> completion{};
     constexpr size_t read_offset = 41;
     constexpr size_t read_size = 73;
-    std::array<uint8_t, read_size> destination{};
+    std::array<uint8_t, 0x90> destination{};
     uint64_t result = read_file && stub_error.empty()
         ? read_file_guest((uint64_t)(uintptr_t)request.data(), 0,
                           (uint64_t)(uintptr_t)completion.data(), fixture_id,
-                          (uint64_t)(uintptr_t)destination.data(), destination.size(),
+                          (uint64_t)(uintptr_t)destination.data(), read_size,
                           read_offset, 0, 0)
         : ~uint64_t{0};
     CHECK(result == 0, "AMPR read-file completes successfully");
@@ -116,6 +187,118 @@ int main() {
     CHECK(completion[0] == (uint64_t)(uintptr_t)destination.data() &&
               completion[1] == 0 && completion[2] == read_size,
           "AMPR completion publishes destination, success, and byte count");
+
+    // #1901: equal total sizes do not make real ID-resolved reads ambiguous. Register a second,
+    // byte-distinct fixture through the public resolve HLE so this also proves its warning describes
+    // only the unresolved-id fallback rather than falsely declaring both files unreadable.
+    const char* collision_path = "prosper-test-apr-read-collision.tmp";
+    std::array<uint8_t, expected.size()> collision_bytes{};
+    for (size_t i = 0; i < collision_bytes.size(); ++i)
+        collision_bytes[i] = (uint8_t)(i * 17u + 11u);
+    if (FILE* collision = std::fopen(collision_path, "wb")) {
+        CHECK(std::fwrite(collision_bytes.data(), 1, collision_bytes.size(), collision) ==
+                  collision_bytes.size(),
+              "write equal-size APR collision fixture");
+        std::fclose(collision);
+    } else {
+        CHECK(false, "create equal-size APR collision fixture");
+    }
+    const char* collision_paths[2] = { fixture_path, collision_path };
+    uint32_t collision_ids[2]{};
+    uint64_t collision_sizes[2]{};
+    uint32_t collision_error = ~uint32_t{0};
+    uint64_t collision_resolve_result = ~uint64_t{0};
+    const std::string collision_warning = capture_stderr([&] {
+        collision_resolve_result = resolve_plain(
+            (uint64_t)(uintptr_t)collision_paths, 2,
+            (uint64_t)(uintptr_t)collision_ids,
+            (uint64_t)(uintptr_t)collision_sizes,
+            (uint64_t)(uintptr_t)&collision_error, 0);
+    });
+    CHECK(collision_resolve_result == 0 && collision_error == 0 &&
+              collision_ids[0] == fixture_id && collision_ids[1] != collision_ids[0] &&
+              collision_sizes[0] == expected.size() && collision_sizes[1] == expected.size(),
+          "equal-size containers resolve to distinct usable ids");
+    CHECK(collision_warning.find("ID-resolved reads remain valid") != std::string::npos &&
+              collision_warning.find("unresolved-id size fallback will be refused") != std::string::npos &&
+              collision_warning.find("reads of either will be refused") == std::string::npos,
+          "collision warning describes only the conditional size fallback");
+
+    constexpr size_t method_offset = 7;
+    constexpr size_t method_size = 31;
+    auto read_with_method = [&](uint32_t id, uint64_t total_size,
+                                std::array<uint8_t, 0x90>& out,
+                                std::array<uint64_t, 3>& out_completion,
+                                uint64_t& out_result) {
+        std::array<uint8_t, 0x48> method_request{};
+        std::memcpy(method_request.data() + 0x30, &total_size, sizeof total_size);
+        return capture_stderr([&] {
+            out_result = read_file_guest(
+                (uint64_t)(uintptr_t)method_request.data(), 0,
+                (uint64_t)(uintptr_t)out_completion.data(), id,
+                (uint64_t)(uintptr_t)out.data(), method_size,
+                method_offset, 0, 0);
+        });
+    };
+
+    std::array<uint8_t, 0x90> first_id_bytes{}, second_id_bytes{};
+    std::array<uint64_t, 3> first_id_completion{}, second_id_completion{};
+    uint64_t first_id_result = ~uint64_t{0}, second_id_result = ~uint64_t{0};
+    const std::string first_id_log = read_with_method(
+        collision_ids[0], expected.size(), first_id_bytes, first_id_completion, first_id_result);
+    const std::string second_id_log = read_with_method(
+        collision_ids[1], collision_bytes.size(), second_id_bytes,
+        second_id_completion, second_id_result);
+    CHECK(first_id_result == 0 && second_id_result == 0 &&
+              std::memcmp(first_id_bytes.data(), expected.data() + method_offset, method_size) == 0 &&
+              std::memcmp(second_id_bytes.data(), collision_bytes.data() + method_offset, method_size) == 0,
+          "valid ids read the correct byte-distinct files despite a size collision");
+    CHECK(first_id_log.find("method=id") != std::string::npos &&
+              second_id_log.find("method=id") != std::string::npos,
+          "colliding valid-id reads report method=id");
+
+    // An unknown id may use total-size correlation only when exactly one registered file matches.
+    const char* unique_path = "prosper-test-apr-read-fallback.tmp";
+    std::array<uint8_t, 263> unique_bytes{};
+    for (size_t i = 0; i < unique_bytes.size(); ++i)
+        unique_bytes[i] = (uint8_t)(i * 23u + 19u);
+    if (FILE* unique = std::fopen(unique_path, "wb")) {
+        CHECK(std::fwrite(unique_bytes.data(), 1, unique_bytes.size(), unique) == unique_bytes.size(),
+              "write unique-size APR fallback fixture");
+        std::fclose(unique);
+    } else {
+        CHECK(false, "create unique-size APR fallback fixture");
+    }
+    prosper_apr_register(unique_path, unique_bytes.size());
+    constexpr uint32_t unknown_id = 0xf00dcafeu;
+    std::array<uint8_t, 0x90> fallback_bytes{};
+    std::array<uint64_t, 3> fallback_completion{};
+    uint64_t fallback_result = ~uint64_t{0};
+    const std::string fallback_log = read_with_method(
+        unknown_id, unique_bytes.size(), fallback_bytes, fallback_completion, fallback_result);
+    CHECK(fallback_result == 0 &&
+              std::memcmp(fallback_bytes.data(), unique_bytes.data() + method_offset, method_size) == 0,
+          "unknown id uses an unambiguous total-size fallback");
+    CHECK(fallback_log.find("method=size-fallback") != std::string::npos &&
+              fallback_log.find("requested=31") != std::string::npos,
+          "unique-size fallback reports its method and requested size");
+
+    std::array<uint8_t, 0x90> refused_bytes{};
+    refused_bytes.fill(0xa5);
+    std::array<uint64_t, 3> refused_completion{
+        0x1111111111111111ull, 0x2222222222222222ull, 0x3333333333333333ull};
+    uint64_t refused_result = 0;
+    const std::string refused_log = read_with_method(
+        unknown_id, expected.size(), refused_bytes, refused_completion, refused_result);
+    CHECK((uint32_t)refused_result == 0x80020016u &&
+              refused_completion[0] == 0x1111111111111111ull &&
+              refused_completion[1] == 0x2222222222222222ull &&
+              refused_completion[2] == 0x3333333333333333ull && refused_bytes[0] == 0xa5,
+          "ambiguous size fallback refuses without completing or writing the read");
+    CHECK(refused_log.find("method=refused") != std::string::npos &&
+              refused_log.find("matches=2") != std::string::npos &&
+              refused_log.find("offset=0x7") != std::string::npos,
+          "ambiguous fallback reports refusal, match count, and requested offset");
 
 #ifndef _WIN32
     // APR writes are performed by the host kernel, so they do not enter the guest SIGSEGV handler
@@ -172,11 +355,11 @@ int main() {
     std::memcpy(req_overlap.data() + 0x30, &live_ptr, 8);
     uint64_t* record = reinterpret_cast<uint64_t*>(req_overlap.data() + 0x20);  // a2 == req+0x20
     uint32_t overlap_id = prosper_apr_register(fixture_path, expected.size());
-    std::array<uint8_t, read_size> overlap_dst{};
+    std::array<uint8_t, 0x90> overlap_dst{};
     uint64_t overlap_result = read_file && stub_error.empty()
         ? read_file_guest((uint64_t)(uintptr_t)req_overlap.data(), 0,
                           (uint64_t)(uintptr_t)record, overlap_id,
-                          (uint64_t)(uintptr_t)overlap_dst.data(), overlap_dst.size(),
+                          (uint64_t)(uintptr_t)overlap_dst.data(), read_size,
                           read_offset, 0, 0)
         : ~uint64_t{0};
     uint64_t survived = 0; std::memcpy(&survived, req_overlap.data() + 0x30, 8);
@@ -191,17 +374,19 @@ int main() {
     // passes as a0; a2 remains the authority for that output record.
     std::array<uint64_t, 9> embedded_request{};
     uint64_t* embedded_record = embedded_request.data();
-    std::array<uint8_t, read_size> embedded_dst{};
+    std::array<uint8_t, 0x90> embedded_dst{};
     uint64_t embedded_result = read_file && stub_error.empty()
         ? read_file_guest((uint64_t)(uintptr_t)embedded_request.data(), 0,
                           (uint64_t)(uintptr_t)embedded_record, overlap_id,
-                          (uint64_t)(uintptr_t)embedded_dst.data(), embedded_dst.size(),
+                          (uint64_t)(uintptr_t)embedded_dst.data(), read_size,
                           read_offset, 0, 0)
         : ~uint64_t{0};
     CHECK(embedded_result == 0 && embedded_record[2] == read_size,
           "ordinary embedded completion record still publishes byte count");
 
     std::remove(fixture_path);
+    std::remove(collision_path);
+    std::remove(unique_path);
     prosper_apr_reset_for_test();
 
     // sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes (GTA V / PPSA04263, RAGE, issue #1130):
@@ -211,7 +396,6 @@ int main() {
     // observed live at the next GetFileStat) and wild-write over its allocator. translate() passes a
     // non-mount path through unchanged, so a relative fixture path exercises the real handler.
     auto resolve_prefix = Hle::lookup(nid_hash("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes"));
-    auto resolve_plain  = Hle::lookup(nid_hash("sceKernelAprResolveFilepathsToIdsAndFileSizes"));
     auto resolve_ids    = Hle::lookup("WT-5NKy42fw");
     auto wait_cb        = Hle::lookup("rqwFKI4PAiM");
     CHECK(nid_hash("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes") == "w5fcCG+t31g",
