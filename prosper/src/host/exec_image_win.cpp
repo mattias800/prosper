@@ -36,6 +36,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <atomic>
 #include <limits>
 #include <string>
 #include <vector>
@@ -143,6 +144,11 @@ __asm__(
 );
 
 namespace prosper {
+
+namespace {
+std::atomic<GuestExecutionThreadEnterTestHook> g_guest_execution_enter_test_hook{nullptr};
+std::atomic<void*> g_guest_execution_enter_test_opaque{nullptr};
+}
 
 // A guest function pointer: called by host code (init arrays, entry) but obeys the guest's SysV ABI.
 using GuestInitFn = PROSPER_SYSV_ABI void (*)(uint64_t argc, uint64_t argp);
@@ -1238,6 +1244,24 @@ uint64_t sse4a_fastpath_patch_count() {
 // Diagnostics that need Linux perf_event / int3 patching are unavailable on Windows.
 void arm_hwbp_this_thread() {}
 
+void guest_execution_thread_enter(bool primary) {
+    // Windows has no perf_event HWBP backend. Keep that platform contract unchanged while exposing
+    // the same guest-entry boundary to CPU-only tests and future Windows diagnostics.
+    if (auto hook = g_guest_execution_enter_test_hook.load(std::memory_order_acquire))
+        hook(primary, g_guest_execution_enter_test_opaque.load(std::memory_order_acquire));
+}
+
+void set_guest_execution_thread_enter_test_hook(GuestExecutionThreadEnterTestHook hook,
+                                                void* opaque) {
+    if (!hook) {
+        g_guest_execution_enter_test_hook.store(nullptr, std::memory_order_release);
+        g_guest_execution_enter_test_opaque.store(nullptr, std::memory_order_release);
+        return;
+    }
+    g_guest_execution_enter_test_opaque.store(opaque, std::memory_order_release);
+    g_guest_execution_enter_test_hook.store(hook, std::memory_order_release);
+}
+
 uint64_t stub_addr(uint64_t idx) { return g_stub_base + idx * g_stub_size; }
 uint64_t hle_guest_return_address(uint64_t entry_rsp) {
     if (!entry_rsp) return 0;
@@ -1293,6 +1317,7 @@ void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_
 }
 
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
+    if (!fns.empty()) guest_execution_thread_enter(/*primary=*/true);
     ULONG_PTR stack_lo = 0, stack_hi = 0;
     GetCurrentThreadStackLimits(&stack_lo, &stack_hi);
     if (stack_lo && stack_hi > stack_lo) {
@@ -1337,6 +1362,7 @@ BootResult run_entry(const LoadedImage& img) {
     BootResult r;
     if (!stk) { r.kind = 2; r.detail = "guest stack VirtualAlloc failed"; return r; }
     register_thread_stack(cur_tid(), stk, STK);
+    guest_execution_thread_enter(/*primary=*/true);
     arm_diag_breakpoints();
     trace_guest_thread_lifecycle(true, (uint64_t)pthread_self(), cur_tid(), stk, STK);
 

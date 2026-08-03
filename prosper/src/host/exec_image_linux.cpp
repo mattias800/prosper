@@ -231,6 +231,8 @@ namespace {
     // (e.g. an async-loader worker) which a main-thread-only bp misses. Per-thread fd + stepping state.
     bool                 g_hwbp_allthreads = false;
     thread_local int     t_hwbp_fd = -1;       // this thread's own bp fd (main thread mirrors g_hwbp_fd)
+    std::atomic<GuestExecutionThreadEnterTestHook> g_guest_execution_enter_test_hook{nullptr};
+    std::atomic<void*> g_guest_execution_enter_test_opaque{nullptr};
     // Signal handlers can run while the guest owns %fs, so C++ thread_local state is not usable there.
     // Publish perf fds by kernel tid before enabling them; the handler then finds its own step state
     // without touching host TLS. Fixed storage also keeps lookup allocation/lock-free in the handler.
@@ -2774,32 +2776,51 @@ void arm_bp() {
     raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
 }
 
-// Open + enable the PROSPER_HWBP hardware breakpoint (must run on the main/guest thread — the perf
-// event monitors the calling thread). Call after the image is mapped, before jumping to the entry.
+// Open + enable the PROSPER_HWBP hardware breakpoint on a primary guest-execution thread — the perf
+// event monitors the calling thread. Call after the image is mapped, before its first guest code.
 void arm_hwbp() {
-    if (!g_hwbp_on || !g_hwbp_addr) return;
+    // run_guest_inits and run_entry commonly execute on the same host thread. The init boundary
+    // must arm before the first guest instruction, while the later entry boundary must not consume
+    // a second perf slot or split that thread's single-step ownership across two fds.
+    if (!g_hwbp_on || !g_hwbp_addr || t_hwbp_fd >= 0) return;
+    const bool already_anchored = g_hwbp_fd >= 0;
     long fd = perf_bp_open(g_hwbp_addr, HW_BREAKPOINT_X);
     char b[160];
     if (fd < 0) {
-        int n = snprintf(b, sizeof b, "[hwbp] perf_event_open FAILED for eboot+0x%llx (errno=%d) — HW bp disabled\n",
-                         (unsigned long long)(g_hwbp_addr - g_base), errno);
-        raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */ g_hwbp_on = false; return;
+        int n = snprintf(b, sizeof b,
+                         "[hwbp] perf_event_open FAILED for eboot+0x%llx (errno=%d) — %s\n",
+                         (unsigned long long)(g_hwbp_addr - g_base), errno,
+                         already_anchored ? "this primary thread not armed"
+                                          : "HW bp disabled");
+        raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+        // A frontend may run module init on the process thread, then run_entry on a distinct
+        // std::thread. A failure on that second primary must not disable the first valid per-TID fd.
+        if (!already_anchored) g_hwbp_on = false;
+        return;
     }
-    g_hwbp_fd = (int)fd;
-    fcntl(g_hwbp_fd, F_SETFL, O_ASYNC);
-    fcntl(g_hwbp_fd, F_SETSIG, SIGTRAP);
+    const int thread_fd = (int)fd;
+    fcntl(thread_fd, F_SETFL, O_ASYNC);
+    fcntl(thread_fd, F_SETSIG, SIGTRAP);
     struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)prosper_gettid();
-    fcntl(g_hwbp_fd, F_SETOWN_EX, &ow);
-    if (!hwbp_register_thread(ow.pid, g_hwbp_fd)) {
-        int n = snprintf(b, sizeof b, "[hwbp] thread-state table full for tid=%ld - HW bp disabled\n",
-                         (long)ow.pid);
+    fcntl(thread_fd, F_SETOWN_EX, &ow);
+    if (!hwbp_register_thread(ow.pid, thread_fd)) {
+        int n = snprintf(b, sizeof b, "[hwbp] thread-state table full for tid=%ld - %s\n",
+                         (long)ow.pid, already_anchored ? "this primary thread not armed"
+                                                        : "HW bp disabled");
         raw_write(2, b, (size_t)n);
-        close(g_hwbp_fd); g_hwbp_fd = -1; g_hwbp_on = false; return;
+        close(thread_fd);
+        if (!already_anchored) g_hwbp_on = false;
+        return;
     }
-    ioctl(g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
-    t_hwbp_fd = g_hwbp_fd;   // main thread uses the same fd for its per-thread stepping state
+    // g_hwbp_fd is an always-live anchor/fallback for the signal handler, not "the latest primary".
+    // Every hit normally resolves its exact fd/step state through the per-TID table above. Retaining
+    // the first anchor makes init-thread + later frontend-thread ownership safe and keeps a failed
+    // second arm from invalidating the first.
+    if (g_hwbp_fd < 0) g_hwbp_fd = thread_fd;
+    t_hwbp_fd = thread_fd;
+    ioctl(thread_fd, PERF_EVENT_IOC_ENABLE, 0);
     int n = snprintf(b, sizeof b, "[hwbp] armed HW execute bp at eboot+0x%llx (fd=%d tid=%ld)\n",
-                     (unsigned long long)(g_hwbp_addr - g_base), g_hwbp_fd, (long)prosper_gettid());
+                     (unsigned long long)(g_hwbp_addr - g_base), thread_fd, (long)prosper_gettid());
     raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
 }
 
@@ -2828,6 +2849,27 @@ void arm_hwbp_this_thread() {
     char b[128]; int n = snprintf(b, sizeof b, "[hwbp] armed on worker tid=%ld (fd=%d) for eboot+0x%llx\n",
         (long)prosper_gettid(), t_hwbp_fd, (unsigned long long)goff(g_hwbp_addr));
     raw_write(2,b, n);
+}
+
+void guest_execution_thread_enter(bool primary) {
+    if (primary) arm_hwbp();
+    else arm_hwbp_this_thread();
+    // Observe completion of the real arm boundary, not merely a helper called by the test. This
+    // stays useful on machines where perf_event is unavailable: the seam proves ordering and the
+    // production arm path remains responsible for its existing fail-visible error.
+    if (auto hook = g_guest_execution_enter_test_hook.load(std::memory_order_acquire))
+        hook(primary, g_guest_execution_enter_test_opaque.load(std::memory_order_acquire));
+}
+
+void set_guest_execution_thread_enter_test_hook(GuestExecutionThreadEnterTestHook hook,
+                                                void* opaque) {
+    if (!hook) {
+        g_guest_execution_enter_test_hook.store(nullptr, std::memory_order_release);
+        g_guest_execution_enter_test_opaque.store(nullptr, std::memory_order_release);
+        return;
+    }
+    g_guest_execution_enter_test_opaque.store(opaque, std::memory_order_release);
+    g_guest_execution_enter_test_hook.store(hook, std::memory_order_release);
 }
 
 uint64_t stub_addr(uint64_t idx) { return g_stub_base + idx * g_stub_size; }
@@ -2958,6 +3000,9 @@ static void dump_fault_bytes(uint64_t start, int n) {
 }
 
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
+    // boot_program runs module init code before run_entry. This is already guest execution and can
+    // create more guest threads, so waiting for run_entry to arm leaves the earliest code invisible.
+    if (!fns.empty()) guest_execution_thread_enter(/*primary=*/true);
 #ifdef __APPLE__
     // macOS only: the module .init_array ctors touch guest %fs TLS and run on this (main) thread BEFORE
     // run_entry, so activate the guest TCB now to give the %fs emulator its per-thread guest_TP
@@ -3078,7 +3123,7 @@ BootResult run_entry(const LoadedImage& img) {
 
     g_trap_kind = 0; g_fault_addr = nullptr; g_fault_rip = 0; g_armed_tid = cur_tid();
     arm_bp();     // write the PROSPER_BP int3 now that the guest image is fully mapped
-    arm_hwbp();   // open the PROSPER_HWBP hardware breakpoint on this (guest main) thread
+    guest_execution_thread_enter(/*primary=*/true);
     if (sigsetjmp(g_jb, 1) == 0) {
         // Switch %fs to a guest TCB as the LAST host action before entering the
         // guest — any host C++ after this point would run on the guest TCB. Import stubs swap back per-call.

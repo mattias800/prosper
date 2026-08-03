@@ -80,9 +80,15 @@ void register_thread_stack(uint64_t tid, void* base, uint64_t size);
 // Remove a dead thread's entry. pthread ids are RECYCLED — a stale entry would serve the next
 // thread on the same id the old thread's bounds (#138). Called on every HLE thread-exit path.
 void unregister_thread_stack(uint64_t tid);
-// Arm the PROSPER_HWBP execute breakpoint on the calling (worker) thread (no-op unless
-// PROSPER_HWBP_ALLTHREADS is set). Lets off-main-thread execution of the target be observed.
-void arm_hwbp_this_thread();
+// Mark the calling host thread as about to execute guest code. Primary entry paths
+// (module init + run_entry) always arm PROSPER_HWBP; worker entry paths do so only when
+// PROSPER_HWBP_ALLTHREADS is set. Call while host TLS is active, before guest TLS/entry.
+void guest_execution_thread_enter(bool primary);
+// CPU-only observer for the real entry boundary above. Tests use this instead of requiring
+// perf_event permissions; production leaves it null.
+using GuestExecutionThreadEnterTestHook = void (*)(bool primary, void* opaque);
+void set_guest_execution_thread_enter_test_hook(GuestExecutionThreadEnterTestHook hook,
+                                                void* opaque = nullptr);
 // Report the calling guest thread's registered stack bounds (false if not registered).
 bool guest_stack_for_current_thread(void** base, size_t* size);
 bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size);
