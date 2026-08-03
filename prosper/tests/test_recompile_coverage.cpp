@@ -845,6 +845,40 @@ int main() {
     CHECK(f.unsupported == 0 && f.table_dependent >= 1 && f.first_bad_fmt < 0,
           "#325: a 2D_ARRAY image_sample is recompilable-in-context (base slice), not unsupported");
 
+    // Asterix's resolve PS mixes the ordinary and exact one-extra-word NSA 2D_MSAA IMAGE_LOAD
+    // encodings. Coverage is table-less, but it can still distinguish the address shapes the real
+    // resource-aware emitter accepts from superficially similar, deliberately unsupported packets.
+    const uint32_t msaa_load_consecutive[] = {
+        0xf0000130u, 0x00000305u, 0xbf810000u,
+    };
+    const uint32_t msaa_load_nsa[] = {
+        0xf0000132u, 0x00000205u, 0x00000206u, 0xbf810000u,
+    };
+    const RecompileCoverage msaa_consecutive = recompile_coverage(
+        msaa_load_consecutive, std::size(msaa_load_consecutive));
+    const RecompileCoverage msaa_nsa = recompile_coverage(
+        msaa_load_nsa, std::size(msaa_load_nsa));
+    CHECK(msaa_consecutive.total == 1 && msaa_consecutive.table_dependent == 1 &&
+              msaa_consecutive.unsupported == 0 && msaa_nsa.total == 1 &&
+              msaa_nsa.table_dependent == 1 && msaa_nsa.unsupported == 0,
+          "exact consecutive and NSA 2D_MSAA loads report recompilable-in-context");
+
+    uint32_t msaa_load_nsa_unused[std::size(msaa_load_nsa)];
+    std::copy(std::begin(msaa_load_nsa), std::end(msaa_load_nsa),
+              msaa_load_nsa_unused);
+    msaa_load_nsa_unused[2] |= 0x00010000u;
+    const uint32_t msaa_array_load[] = {
+        0xf0000138u, 0x00000305u, 0xbf810000u, // DIM=2D_MSAA_ARRAY remains unsupported
+    };
+    const RecompileCoverage msaa_unused = recompile_coverage(
+        msaa_load_nsa_unused, std::size(msaa_load_nsa_unused));
+    const RecompileCoverage msaa_array = recompile_coverage(
+        msaa_array_load, std::size(msaa_array_load));
+    CHECK(msaa_unused.total == 1 && msaa_unused.table_dependent == 0 &&
+              msaa_unused.unsupported == 1 && msaa_array.total == 1 &&
+              msaa_array.table_dependent == 0 && msaa_array.unsupported == 1,
+          "unused NSA address bytes and 2D_MSAA_ARRAY remain honestly unsupported");
+
     const uint32_t cvt_i4[] = { 0x7e001d00u, 0xBF810000u }; // v_cvt_off_f32_i4 v0,v0
     RecompileCoverage g = recompile_coverage(cvt_i4, sizeof(cvt_i4)/sizeof(cvt_i4[0]));
     CHECK(g.total == 1 && g.alu == 1 && g.unsupported == 0,

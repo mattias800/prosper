@@ -790,6 +790,45 @@ int main() {
               stats.misses == 6 && stats.hits == 1 && stats.entries == 6,
           "shader cache separates every manual shadow-comparison codegen field");
 
+    // The exact Asterix NSA 2D_MSAA IMAGE_LOAD lowers four guest samples to four host array layers.
+    // sample_count is therefore codegen state, not upload-only descriptor state: a cached 4x module
+    // must never satisfy the deliberately unsupported 2x table, while an identical 4x table must hit.
+    clear_shader_recompile_cache();
+    static const uint32_t kMsaaLoadPs[] = {
+        0x7e0a0280u,                       // v_mov_b32 v5, 0 (x)
+        0x7e0c0280u,                       // v_mov_b32 v6, 0 (y)
+        0x7e040281u,                       // v_mov_b32 v2, 1 (sample)
+        0xf0000132u, 0x00000205u, 0x00000206u, // image_load v2, [v5,v6,v2], s[0:7]
+        0xbf8c0f70u,                       // s_waitcnt vmcnt(0)
+        0xf800180fu, 0x02020202u,         // exp mrt0 v2,v2,v2,v2
+        0xbf810000u,
+    };
+    ShaderResource msaa_texture;
+    msaa_texture.cls = ResourceClass::Texture;
+    msaa_texture.format = DataFormat::Float32;
+    msaa_texture.num_components = 1;
+    msaa_texture.binding = 4;
+    msaa_texture.sgpr_base = 0;
+    msaa_texture.img_dim = 6;
+    msaa_texture.width = 1;
+    msaa_texture.height = 1;
+    msaa_texture.depth = 1;
+    msaa_texture.sample_count = 4;
+    msaa_texture.declared_mip_levels = 1;
+    ShaderResourceTable msaa_table;
+    msaa_table.resources.push_back(msaa_texture);
+    const auto msaa_4x = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kMsaaLoadPs, std::size(kMsaaLoadPs), &msaa_table);
+    const auto msaa_4x_again = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kMsaaLoadPs, std::size(kMsaaLoadPs), &msaa_table);
+    msaa_table.resources[0].sample_count = 2;
+    const auto msaa_2x = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kMsaaLoadPs, std::size(kMsaaLoadPs), &msaa_table);
+    stats = shader_recompile_cache_stats();
+    CHECK(!msaa_4x.empty() && msaa_4x_again == msaa_4x && msaa_2x.empty() &&
+              stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
+          "shader cache separates the supported 4x MSAA fetch from unsupported sample counts");
+
     // A FLAT-window's base push-constant index is embedded in the module. Keep it in the key even
     // though both variants use the same binding and exact fetch PC.
     clear_shader_recompile_cache();

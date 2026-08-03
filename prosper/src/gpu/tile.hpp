@@ -60,6 +60,52 @@ std::vector<uint8_t> detile_surface(const std::vector<uint8_t>& src, uint32_t wi
 void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
                   uint32_t tile_mode, uint32_t pitch = 0, uint32_t bytes_per_texel = 4);
 
+// Exact GFX10 2D-MSAA materialization. The guest swizzle includes sample-coordinate bits in every
+// 64 KiB block; treating it as an ordinary surface both under-reads the allocation and scrambles
+// every texel. The linear representation is Vulkan-2D-array ready: complete sample planes are
+// contiguous (`sample * width * height + y * width + x`). This first implementation is deliberately
+// fail-closed outside the observed/published SW_64KB_Z_X 4xaa contract; zero/false means unsupported.
+size_t tiled_msaa_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode,
+                                uint32_t bytes_per_texel, uint32_t sample_count);
+bool detile_msaa_surface(uint8_t* dst, const uint8_t* src, size_t src_bytes,
+                         uint32_t width, uint32_t height, uint32_t tile_mode,
+                         uint32_t bytes_per_texel, uint32_t sample_count);
+bool tile_msaa_surface(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
+                       uint32_t width, uint32_t height, uint32_t tile_mode,
+                       uint32_t bytes_per_texel, uint32_t sample_count);
+
+// Exact GFX10 16-pipe HTILE contract for the observed 2D_MSAA SW_64KB_Z_X surface. AMD AddrLib
+// computes one 32 KiB metadata block per 1024x512 pixels; PAL documents the only two uniform HTILE
+// initialization values that disable Z compression and make ordinary base texels authoritative.
+// The helpers stay fail-closed outside 4xaa, pipe-aligned mode 24. The classifier requires the
+// complete expected plane so a short or mixed metadata read cannot authorize base decoding.
+size_t gfx10_htile_msaa_metadata_bytes(uint32_t width, uint32_t height,
+                                       uint32_t tile_mode, uint32_t sample_count,
+                                       bool pipe_aligned);
+bool gfx10_htile_metadata_is_decompressed(const uint8_t* metadata, size_t metadata_bytes,
+                                           size_t expected_bytes,
+                                           uint32_t* uniform_value = nullptr);
+
+// A complete, uniform zero HTILE plane is PAL's exact depth-only fast-clear encoding for +0.0:
+// ZMin=ZMax=0 and ZMask=0. It does NOT authorize reading the stale base allocation. The source
+// classifier and materializer keep that case distinct from the two ordinary-base initial values.
+enum class Gfx10HtileMsaaSource : uint8_t {
+    Unsupported,
+    UncompressedBase,
+    DepthZeroFastClear,
+};
+Gfx10HtileMsaaSource gfx10_htile_msaa_source(
+    const uint8_t* metadata, size_t metadata_bytes,
+    uint32_t width, uint32_t height, uint32_t tile_mode,
+    uint32_t bytes_per_texel, uint32_t sample_count, bool pipe_aligned);
+bool materialize_gfx10_htile_msaa_surface(
+    uint8_t* dst, size_t dst_bytes,
+    const uint8_t* tiled_base, size_t tiled_base_bytes,
+    const uint8_t* metadata, size_t metadata_bytes,
+    uint32_t width, uint32_t height, uint32_t tile_mode,
+    uint32_t bytes_per_texel, uint32_t sample_count, bool pipe_aligned,
+    Gfx10HtileMsaaSource* source = nullptr);
+
 // General SW_4KB_S de-swizzle for `bpe`-byte ELEMENTS. The 4KB micro-tile holds 4096/bpe elements;
 // its dimensions derive from bpe (wide-before-tall: 16 B -> 16x16, 8 B -> 32x16, ...) — previously
 // a caller-supplied SQUARE tile_side, which could not represent the non-square 8 B geometry (#119).

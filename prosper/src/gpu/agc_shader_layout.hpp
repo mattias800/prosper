@@ -153,6 +153,10 @@ struct DecodedImageDescriptor {
     uint8_t  type = 0;        // SQ_RSRC_IMG dim (GFX10: 8=1D, 9=2D, 10=3D, 11=CUBE, 12=1D_ARRAY, 13=2D_ARRAY).
                               // NB: 9 = plain 2D (already handled); 2D_ARRAY is 13 — the decode code in
                               // agc_shader_layout.cpp / gpu_executor.cpp uses these correct values (#378).
+    // For TYPE 14/15 (2D_MSAA[/ARRAY]), LAST_LEVEL is log2(fragment/sample count), not a mip index.
+    // Keeping the decoded count explicit prevents the ordinary mip-chain logic from interpreting the
+    // observed LAST_LEVEL=2 descriptor as three mips instead of four samples.
+    uint32_t sample_count = 1;
     // DST_SEL_X/Y/Z/W channel swizzle (WORD3 [2:0]/[5:3]/[8:6]/[11:9]); SQ_SEL enum:
     // 0=0, 1=1, 4=X(R), 5=Y(G), 6=Z(B), 7=W(A). Default = identity (R,G,B,A).
     uint8_t  dst_sel[4] = {4, 5, 6, 7};

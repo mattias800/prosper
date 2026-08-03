@@ -99,7 +99,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // registers is PRESENT with value zero, or MODE is DISABLE. Those causes demand different fixes and
 // only the raw registers separate them. Append-only tail; v1-v42 prefixes stay byte-exact and older
 // captures report the state as unavailable rather than inventing write-all defaults.
-constexpr uint32_t kVersion = 43;
+// v44: retain each resource's guest sample count. 2D_MSAA image_load is materialized as host array
+// layers, so replay must not collapse four guest sample planes to the historical single-layer default.
+// The append-only tail covers realized draw/compute and failed-stage tables; v1-v43 default to one.
+constexpr uint32_t kVersion = 44;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -481,6 +484,7 @@ bool read_resource(Reader& rd, GpuCapturedResource& c, uint32_t version) {
         !rd.u32(r.stride) || !rd.u32(r.srt_offset) || !rd.u32(r.sgpr_base) || !rd.u32(r.fetch_pc) ||
         !rd.u32(r.img_dim) || !rd.u32(r.width) || !rd.u32(r.height)) return false;
     r.depth = 1;
+    r.sample_count = 1;
     r.depth_compare = false;
     if (!rd.u32(r.tile_mode) || !rd.u8(b)) return false;
     r.srgb = b != 0;
@@ -551,11 +555,15 @@ uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tig
             (r.format == DataFormat::Float32 && (bpt == 4 || bpt == 8 || bpt == 16));
         if (bpt == 0 || (bpt > 4 && !native_wide)) bpt = 4;
         if (tile_mode_is_tiled(r.tile_mode)) {
-            if (r.img_dim == 2u && r.depth > 1u) {
+            const bool tiled_msaa = r.img_dim == 6u && r.sample_count > 1u;
+            if (tiled_msaa) {
+                decoded = tiled_msaa_surface_bytes(
+                    w, h, r.tile_mode, bpt, r.sample_count);
+            } else if (r.img_dim == 2u && r.depth > 1u) {
                 decoded = tiled_volume_bytes(w, h, r.depth, r.tile_mode, bpt);
                 decoded_is_volume = decoded != 0;
             }
-            if (!decoded_is_volume)
+            if (!tiled_msaa && !decoded_is_volume)
                 decoded = tiled_surface_bytes(w, h, r.tile_mode, 0, bpt);
         } else if (r.tile_mode == static_cast<uint32_t>(TileMode::Linear) &&
                    ((r.cls == ResourceClass::Texture && r.img_dim == 1u) ||
@@ -568,6 +576,8 @@ uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tig
             decoded = checked_mul(row_pitch, h);
         } else {
             decoded = checked_mul(checked_mul(w, h), bpt);
+            if (r.img_dim == 6u && r.sample_count > 1u)
+                decoded = checked_mul(decoded, r.sample_count);
         }
     }
     if (r.layer_stride_bytes && layers > 1) {
@@ -597,6 +607,12 @@ uint64_t dcc_metadata_footprint(const ShaderResource& r) {
         (r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage) ||
         bc_block_bytes(r.format))
         return 0;
+    // A compressed 2D_MSAA Z_X descriptor names HTILE, not color DCC. Retain the exact published
+    // 16-pipe metadata span so offline replay can independently prove whether the base allocation
+    // was decompressed. Other Z_X shapes remain unavailable instead of borrowing DCC sizing.
+    if (r.img_dim == 6u && r.format == DataFormat::Float32 && r.num_components == 1u)
+        return gfx10_htile_msaa_metadata_bytes(
+            r.width, r.height, r.tile_mode, r.sample_count, r.meta_pipe_aligned);
     uint32_t bytes_per_texel = data_format_bytes(r.format) * (r.num_components ? r.num_components : 1u);
     if (!bytes_per_texel &&
         (r.format == DataFormat::Float10_11_11 || r.format == DataFormat::Unorm2_10_10_10))
@@ -2310,6 +2326,35 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
     for (const auto& diagnostic : c.failure_diagnostics)
         if (diagnostic.pipeline_present) write_color_state(w, diagnostic.pipeline);
+    // v44 appends guest sample counts in deterministic resource-table order. Failed-stage tables are
+    // included because offline raw retry consumes their descriptor identity just like realized tables.
+    const uint64_t sample_resource_count = resource_depth_count + failed_resource_count;
+    if (sample_resource_count > UINT32_MAX) {
+        error = "invalid resource sample-count count";
+        return false;
+    }
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_sample_counts = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            const uint32_t samples = captured.resource.sample_count;
+            if (!samples || samples > 32768u || (samples & (samples - 1u)) != 0) return false;
+            w.u32(samples);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_sample_counts(draw.vrt) || !write_sample_counts(draw.prt)) {
+            error = "invalid resource sample count"; return false;
+        }
+    for (const auto& compute : c.computes)
+        if (!write_sample_counts(compute.resources)) {
+            error = "invalid resource sample count"; return false;
+        }
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (!write_sample_counts(stage.resource_table)) {
+                error = "invalid resource sample count"; return false;
+            }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2653,10 +2698,17 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         }
         auto read_dcc_metadata = [&](GpuCapturedTable& table) {
             for (auto& captured : table.resources) {
+                // v44 kept append-only compatibility, so a 2D_MSAA sample count is serialized
+                // after this v12 metadata-reference tail. Defer only its footprint equality until
+                // that authoritative count has been read; blob bounds and all other invariants are
+                // still checked here. Older versions cannot represent the multi-sample span.
+                const bool defer_msaa_footprint = version >= 44 &&
+                    captured.resource.img_dim == 6u;
                 if (!r.u64(captured.metadata_size) ||
                     !r.u32(captured.metadata_blob_index) ||
                     !r.u64(captured.metadata_blob_offset) ||
-                    captured.metadata_size != dcc_metadata_footprint(captured.resource) ||
+                    (!defer_msaa_footprint &&
+                     captured.metadata_size != dcc_metadata_footprint(captured.resource)) ||
                     (!captured.metadata_size &&
                      (captured.metadata_blob_index != 0xFFFFFFFFu ||
                       captured.metadata_blob_offset != 0)) ||
@@ -3298,6 +3350,62 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         for (auto& diagnostic : c.failure_diagnostics) if (diagnostic.pipeline_present)
             if (!read_color_state(r, diagnostic.pipeline)) {
                 error = "invalid color-state failure record"; return false;
+            }
+    }
+    if (version >= 44) {   // guest sample count; v1-v43 retain ShaderResource's default of one
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid resource sample-count count"; return false;
+        }
+        auto read_sample_counts = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                uint32_t samples = 0;
+                if (!r.u32(samples) || !samples || samples > 32768u ||
+                    (samples & (samples - 1u)) != 0) return false;
+                captured.resource.sample_count = samples;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_sample_counts(draw.vrt) || !read_sample_counts(draw.prt)) {
+                error = "invalid resource sample count"; return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_sample_counts(compute.resources)) {
+                error = "invalid resource sample count"; return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_sample_counts(stage.resource_table)) {
+                    error = "invalid resource sample count"; return false;
+                }
+        // Only realized draw/compute tables have v12 metadata blob references. Failed-stage tables
+        // retain descriptor/DCC state through v41 and sample identity through v44, but deliberately
+        // carry no resource or metadata blobs; there is therefore no deferred reference to validate
+        // for those diagnostic tables.
+        auto validate_deferred_msaa_metadata = [&](const GpuCapturedTable& table) {
+            for (const auto& captured : table.resources)
+                if (captured.resource.img_dim == 6u &&
+                    captured.metadata_size != dcc_metadata_footprint(captured.resource))
+                    return false;
+            return true;
+        };
+        for (const auto& draw : c.draws)
+            if (!validate_deferred_msaa_metadata(draw.vrt) ||
+                !validate_deferred_msaa_metadata(draw.prt)) {
+                error = "invalid resource DCC metadata reference"; return false;
+            }
+        for (const auto& compute : c.computes)
+            if (!validate_deferred_msaa_metadata(compute.resources)) {
+                error = "invalid resource DCC metadata reference"; return false;
             }
     }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);

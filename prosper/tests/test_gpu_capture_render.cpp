@@ -1267,6 +1267,38 @@ int main() {
         CHECK(!texture_decode_cache_candidate(true, false, false, 1u, true, true),
               "a retained color image bypasses guest-byte decode-cache work");
 
+        using prosper::frontend::sampled_msaa_fetch_shape_supported;
+        ShaderResource exact_msaa{};
+        exact_msaa.cls = ResourceClass::Texture;
+        exact_msaa.img_dim = 6;
+        exact_msaa.sample_count = 4;
+        exact_msaa.tile_mode = 24;
+        exact_msaa.format = DataFormat::Float32;
+        exact_msaa.num_components = 1;
+        exact_msaa.depth = 1;
+        exact_msaa.declared_mip_levels = 1;
+        CHECK(sampled_msaa_fetch_shape_supported(
+                  exact_msaa, /*is_storage_image=*/false,
+                  /*reflected_msaa_fetch=*/true),
+              "the exact reflected 4x R32F 2D_MSAA shape reaches materialization");
+        ShaderResource wrong_msaa_format = exact_msaa;
+        wrong_msaa_format.format = DataFormat::Uint32;
+        ShaderResource wrong_msaa_count = exact_msaa;
+        wrong_msaa_count.sample_count = 2;
+        ShaderResource wrong_msaa_layout = exact_msaa;
+        wrong_msaa_layout.tile_mode = 27;
+        CHECK(!sampled_msaa_fetch_shape_supported(
+                   wrong_msaa_format, false, true) &&
+                  !sampled_msaa_fetch_shape_supported(
+                   wrong_msaa_count, false, true) &&
+                  !sampled_msaa_fetch_shape_supported(
+                   wrong_msaa_layout, false, true) &&
+                  !sampled_msaa_fetch_shape_supported(
+                   exact_msaa, true, true) &&
+                  !sampled_msaa_fetch_shape_supported(
+                   exact_msaa, false, false),
+              "wrong MSAA format, count, layout, storage class, and reflection remain fail-visible");
+
         using prosper::frontend::persistent_texture_decode_cache_eligible;
         CHECK(persistent_texture_decode_cache_eligible(
                   /*guest_decode_candidate=*/true, /*compute_image_hit=*/false,

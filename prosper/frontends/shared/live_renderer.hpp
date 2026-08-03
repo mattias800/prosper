@@ -96,6 +96,12 @@ bool texture_decode_cache_candidate(bool has_live_color_target,
                                     bool is_sampled_texture,
                                     bool format_supported);
 
+// Exact frontend shape for guest 2D_MSAA IMAGE_LOAD represented as four R32F array layers.
+// Exposed so a regression can prove nearby counts/formats/layouts remain fail-visible before upload.
+bool sampled_msaa_fetch_shape_supported(const prosper::gpu::ShaderResource& resource,
+                                        bool is_storage_image,
+                                        bool reflected_msaa_fetch);
+
 // Apply the remaining runtime gates to a texture_decode_cache_candidate(). Keeping the candidate
 // explicit is important: DCC metadata can provide a nonzero source span even when renderer-owned
 // color is authoritative, but that metadata must never make guest decode-cache state eligible.

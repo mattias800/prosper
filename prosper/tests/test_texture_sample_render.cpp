@@ -856,6 +856,71 @@ int main() {
     printf("  image_load(1,1) center=(%u,%u,%u)\n", okL1?rgb[0]:0, okL1?rgb[1]:0, okL1?rgb[2]:0);
     CHECK(okL1 && rgb[0] > 0x80 && rgb[1] > 0x80 && rgb[2] > 0x80, "image_load texel (1,1) yields WHITE (proves integer coords)");
 
+    // Guest 2D_MSAA IMAGE_LOAD uses an explicit integer sample coordinate. Prosper materializes the
+    // four exact guest sample planes as a single-sample 2D-array and lowers that coordinate to the
+    // host layer. Four distinct R32F values prove upload order, view shape, and shader routing together.
+    {
+        const uint32_t msaa_ps_template[] = {
+            0x7e0a0280u,                       // v5 = x = 0
+            0x7e0c0280u,                       // v6 = y = 0
+            0x7e0e0280u,                       // v7 = sample (patched below)
+            0xf0000130u, 0x00000305u,         // exact image_load v3,v[5:7],s[0:7] dmask:x 2D_MSAA
+            0x7e000303u,                       // v0 = loaded R32F bits
+            0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+            0xf800000fu, 0x03020100u, 0xbf810000u,
+        };
+        ShaderResourceTable msaa_rt;
+        { ShaderResource image{}; image.cls = ResourceClass::Texture;
+          image.format = DataFormat::Float32; image.num_components = 1;
+          image.binding = 4; image.sgpr_base = 0; image.img_dim = 6;
+          image.width = 1; image.height = 1; image.depth = 1;
+          image.sample_count = 4; image.declared_mip_levels = 1;
+          msaa_rt.resources.push_back(image); }
+        const float sample_planes[4] = {0.125f, 0.375f, 0.625f, 0.875f};
+        prosper::test::FrameResource resource;
+        resource.binding = 4; resource.set = 1;
+        resource.tex_rgba = reinterpret_cast<const uint8_t*>(sample_planes);
+        resource.tex_byte_size = sizeof(sample_planes);
+        resource.tw = 1; resource.th = 1; resource.td = 1;
+        resource.img_dim = 6; resource.sample_count = 4;
+        resource.texture_format = VK_FORMAT_R32_SFLOAT;
+        resource.mag_filter = resource.min_filter = 0;
+        bool distinct_samples = true;
+        const uint8_t expected_red[4] = {32, 96, 159, 223};
+        for (uint32_t sample = 0; sample < 4; ++sample) {
+            std::vector<uint32_t> ps(std::begin(msaa_ps_template),
+                                     std::end(msaa_ps_template));
+            ps[2] = 0x7e0e0200u | (128u + sample);
+            const std::vector<uint32_t> frag = recompile_fragment(
+                ps.data(), ps.size(), &msaa_rt);
+            prosper::test::BackendDraw draw;
+            draw.vs = vert; draw.fs = frag; draw.R = {resource}; draw.vcount = 3;
+            const std::vector<uint8_t> pixels = prosper::test::render_draws_rgba(
+                {draw}, W, H);
+            const uint8_t* center = pixels.size() == static_cast<size_t>(W) * H * 4
+                ? &pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4] : nullptr;
+            distinct_samples &= center &&
+                std::abs(static_cast<int>(center[0]) - expected_red[sample]) <= 2 &&
+                center[1] < 4 && center[2] < 4;
+        }
+        CHECK(distinct_samples,
+              "2D_MSAA IMAGE_LOAD selects four distinct host array layers by guest sample index");
+        prosper::test::FrameResource short_resource = resource;
+        short_resource.tex_byte_size = sizeof(sample_planes) - sizeof(float);
+        prosper::test::BackendDraw short_draw;
+        short_draw.vs = vert;
+        short_draw.fs = recompile_fragment(
+            msaa_ps_template, std::size(msaa_ps_template), &msaa_rt);
+        short_draw.R = {short_resource}; short_draw.vcount = 3;
+        CHECK(!prosper::test::backend_texture_plane_span_valid(short_resource) &&
+                  prosper::test::render_draws_rgba({short_draw}, W, H).empty(),
+              "2D_MSAA upload rejects a short sample-plane span before Vulkan access");
+        prosper::test::FrameResource wrong_count = resource;
+        wrong_count.sample_count = 2;
+        CHECK(!prosper::test::backend_texture_plane_span_valid(wrong_count),
+              "unsupported host sample-plane counts remain fail-visible at the backend boundary");
+    }
+
     // The same image_load instruction becomes OpImageRead when its resource class is StorageImage.
     // That SPIR-V interface must be backed by a STORAGE_IMAGE descriptor over an image with STORAGE
     // usage in GENERAL layout, not the sampled texture's combined-image-sampler contract (#374).

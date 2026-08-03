@@ -646,6 +646,173 @@ int main() {
         CHECK(std::memcmp(&tiled[18432],  at(0, 64), bpe) == 0, "64KB_Z_X 4B golden: element (0,64) at byte 18432");
     }
 
+    // AMD AddrLib GFX10_SW_64K_Z_X_4xaa golden, 16 pipes, 4 B/sample. S0/S1 occupy
+    // byte-offset bits 2/3, followed by x0/y0 at bits 4/5. The four values of one pixel therefore
+    // occupy bytes 0,4,8,12, while the next x/y texels begin at 16/32. This independently pins the
+    // sample lever; an ordinary 1xaa detiler aliases sample 0 and cannot satisfy these positions.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw64KbZX;
+        const uint32_t w = 64, h = 64, bpe = 4, samples = 4;
+        const size_t plane = static_cast<size_t>(w) * h;
+        std::vector<uint32_t> linear(plane * samples);
+        for (uint32_t s = 0; s < samples; ++s)
+            for (uint32_t y = 0; y < h; ++y)
+                for (uint32_t x = 0; x < w; ++x)
+                    linear[static_cast<size_t>(s) * plane + static_cast<size_t>(y) * w + x] =
+                        0xa5000000u | (s << 20) | (y << 10) | x;
+        const size_t bytes = tiled_msaa_surface_bytes(w, h, M, bpe, samples);
+        CHECK(bytes == 65536u, "64KB_Z_X 4xaa 4B: one 64x64x4 block is exactly 64 KiB");
+        std::vector<uint8_t> tiled(bytes, 0);
+        CHECK(tile_msaa_surface(tiled.data(), tiled.size(),
+                                  reinterpret_cast<const uint8_t*>(linear.data()),
+                                  w, h, M, bpe, samples),
+              "64KB_Z_X 4xaa surface tiles through the explicit sample-bit pattern");
+        auto word_at = [&](size_t byte) {
+            uint32_t value = 0; std::memcpy(&value, tiled.data() + byte, sizeof(value)); return value;
+        };
+        CHECK(word_at(0) == linear[0 * plane] && word_at(4) == linear[1 * plane] &&
+                  word_at(8) == linear[2 * plane] && word_at(12) == linear[3 * plane],
+              "64KB_Z_X 4xaa golden: sample 0/1/2/3 map to byte 0/4/8/12");
+        CHECK(word_at(16) == linear[1] && word_at(32) == linear[w],
+              "64KB_Z_X 4xaa golden: x1/y1 follow the two sample bits at byte 16/32");
+        CHECK(word_at(256) == linear[8] && word_at(4352) == linear[8 * w],
+              "64KB_Z_X 4xaa golden: pipe-rotated x8/y8 positions match AddrLib");
+        std::vector<uint32_t> back(linear.size(), 0);
+        CHECK(detile_msaa_surface(reinterpret_cast<uint8_t*>(back.data()), tiled.data(),
+                                    tiled.size(), w, h, M, bpe, samples) && back == linear,
+              "64KB_Z_X 4xaa detile restores four distinct sample planes exactly");
+    }
+
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw64KbZX;
+        bool all_sizes_round_trip = true;
+        for (uint32_t bpe : {1u, 2u, 4u, 8u, 16u}) {
+            const uint32_t w = 137, h = 73, samples = 4;
+            const size_t linear_bytes = static_cast<size_t>(w) * h * samples * bpe;
+            std::vector<uint8_t> linear(linear_bytes), back(linear_bytes, 0);
+            for (size_t i = 0; i < linear.size(); ++i)
+                linear[i] = static_cast<uint8_t>(i * 109u + bpe * 17u);
+            const size_t bytes = tiled_msaa_surface_bytes(w, h, M, bpe, samples);
+            std::vector<uint8_t> tiled(bytes, 0);
+            all_sizes_round_trip &= bytes != 0 &&
+                tile_msaa_surface(tiled.data(), tiled.size(), linear.data(),
+                                  w, h, M, bpe, samples) &&
+                detile_msaa_surface(back.data(), tiled.data(), tiled.size(),
+                                    w, h, M, bpe, samples) && back == linear;
+        }
+        CHECK(all_sizes_round_trip,
+              "64KB_Z_X 4xaa round-trip is exact at every supported element size and across blocks");
+        std::vector<uint8_t> short_src(
+            tiled_msaa_surface_bytes(64, 64, M, 4, 4) - 1u, 0);
+        std::vector<uint8_t> untouched(64u * 64u * 4u * 4u, 0x5au);
+        CHECK(!detile_msaa_surface(untouched.data(), short_src.data(), short_src.size(),
+                                     64, 64, M, 4, 4) &&
+                  std::all_of(untouched.begin(), untouched.end(), [](uint8_t v) { return v == 0x5au; }),
+              "truncated MSAA allocation is rejected before any sample plane is detiled");
+        CHECK(tiled_msaa_surface_bytes(64, 64, M, 4, 2) == 0 &&
+                  tiled_msaa_surface_bytes(64, 64, (uint32_t)TileMode::Sw64KbS, 4, 4) == 0,
+              "unsupported MSAA counts and swizzle modes remain fail-visible");
+    }
+
+    // AMD AddrLib's 16-pipe GFX10 HTILE shape and PAL's exact decompressed initialization
+    // constants. This is the metadata contract that can authorize reading an ordinary R32_FLOAT
+    // base allocation for Asterix's 2D_MSAA IMAGE_LOAD; a uniform-but-nearby value is not evidence.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw64KbZX;
+        const size_t expected = gfx10_htile_msaa_metadata_bytes(1920, 1080, M, 4, true);
+        CHECK(expected == 196608u,
+              "1920x1080 16-pipe SW_64KB_Z_X HTILE occupies six 32 KiB metadata blocks");
+        CHECK(gfx10_htile_msaa_metadata_bytes(1920, 1080, M, 2, true) == 0 &&
+                  gfx10_htile_msaa_metadata_bytes(1920, 1080, M, 4, false) == 0 &&
+                  gfx10_htile_msaa_metadata_bytes(
+                      1920, 1080, (uint32_t)TileMode::Sw64KbRX, 4, true) == 0,
+              "HTILE sizing remains fail-closed outside the exact 4xaa pipe-aligned Z_X contract");
+
+        std::vector<uint32_t> htile(expected / sizeof(uint32_t), 0xfffc000fu);
+        uint32_t uniform = 0;
+        CHECK(gfx10_htile_metadata_is_decompressed(
+                  reinterpret_cast<const uint8_t*>(htile.data()), expected, expected, &uniform) &&
+                  uniform == 0xfffc000fu,
+              "uniform depth-only PAL HTILE initialization proves an uncompressed base");
+        std::fill(htile.begin(), htile.end(), 0xfffff3ffu);
+        CHECK(gfx10_htile_metadata_is_decompressed(
+                  reinterpret_cast<const uint8_t*>(htile.data()), expected, expected, &uniform) &&
+                  uniform == 0xfffff3ffu,
+              "uniform depth+stencil PAL HTILE initialization proves an uncompressed base");
+
+        std::fill(htile.begin(), htile.end(), 0xfffc000eu);
+        CHECK(!gfx10_htile_metadata_is_decompressed(
+                  reinterpret_cast<const uint8_t*>(htile.data()), expected, expected),
+              "one-bit-near PAL HTILE state cannot authorize reading base texels");
+        std::fill(htile.begin(), htile.end(), 0xfffc000fu);
+        htile[17] = 0xfffff3ffu;
+        CHECK(!gfx10_htile_metadata_is_decompressed(
+                  reinterpret_cast<const uint8_t*>(htile.data()), expected, expected),
+              "nonuniform HTILE remains compressed or ambiguous and is rejected");
+        htile[17] = 0xfffc000fu;
+        CHECK(!gfx10_htile_metadata_is_decompressed(
+                  reinterpret_cast<const uint8_t*>(htile.data()), expected - 4u, expected),
+              "short HTILE metadata cannot prove the complete surface decompressed");
+
+        // PAL GetClearValue(+0.0), depth-only, is exactly a uniform zero dword. Metadata owns the
+        // result in that state: poison/NaN base bytes must never leak into any of the four layers.
+        const uint32_t clear_w = 64, clear_h = 64;
+        const size_t clear_meta_bytes = gfx10_htile_msaa_metadata_bytes(
+            clear_w, clear_h, M, 4, true);
+        const size_t clear_base_bytes = tiled_msaa_surface_bytes(
+            clear_w, clear_h, M, 4, 4);
+        std::vector<uint32_t> zero_htile(clear_meta_bytes / sizeof(uint32_t), 0u);
+        std::vector<uint32_t> poison_base(clear_base_bytes / sizeof(uint32_t), 0x7fc00001u);
+        std::vector<uint32_t> clear_planes(
+            static_cast<size_t>(clear_w) * clear_h * 4u, 0x7fc00001u);
+        Gfx10HtileMsaaSource clear_source = Gfx10HtileMsaaSource::Unsupported;
+        CHECK(materialize_gfx10_htile_msaa_surface(
+                  reinterpret_cast<uint8_t*>(clear_planes.data()),
+                  clear_planes.size() * sizeof(uint32_t),
+                  reinterpret_cast<const uint8_t*>(poison_base.data()),
+                  poison_base.size() * sizeof(uint32_t),
+                  reinterpret_cast<const uint8_t*>(zero_htile.data()),
+                  zero_htile.size() * sizeof(uint32_t),
+                  clear_w, clear_h, M, 4, 4, true, &clear_source) &&
+                  clear_source == Gfx10HtileMsaaSource::DepthZeroFastClear &&
+                  std::all_of(clear_planes.begin(), clear_planes.end(),
+                              [](uint32_t bits) { return bits == 0u; }),
+              "uniform zero HTILE materializes exact +0.0 in every texel and all four layers "
+              "without reading poison base data");
+
+        auto rejects_zero_clear = [&](const std::vector<uint32_t>& metadata,
+                                      size_t metadata_bytes, uint32_t tile_mode,
+                                      uint32_t bytes_per_texel, uint32_t samples) {
+            std::fill(clear_planes.begin(), clear_planes.end(), 0x5a5a5a5au);
+            clear_source = Gfx10HtileMsaaSource::UncompressedBase;
+            return !materialize_gfx10_htile_msaa_surface(
+                       reinterpret_cast<uint8_t*>(clear_planes.data()),
+                       clear_planes.size() * sizeof(uint32_t),
+                       reinterpret_cast<const uint8_t*>(poison_base.data()),
+                       poison_base.size() * sizeof(uint32_t),
+                       reinterpret_cast<const uint8_t*>(metadata.data()), metadata_bytes,
+                       clear_w, clear_h, tile_mode, bytes_per_texel, samples, true,
+                       &clear_source) &&
+                   clear_source == Gfx10HtileMsaaSource::Unsupported &&
+                   std::all_of(clear_planes.begin(), clear_planes.end(),
+                               [](uint32_t bits) { return bits == 0x5a5a5a5au; });
+        };
+        std::vector<uint32_t> nonuniform_zero_htile = zero_htile;
+        nonuniform_zero_htile[17] = 1u;
+        CHECK(rejects_zero_clear(nonuniform_zero_htile, clear_meta_bytes, M, 4, 4),
+              "one nonzero HTILE dword rejects without touching output");
+        std::vector<uint32_t> unsupported_uniform_htile = zero_htile;
+        std::fill(unsupported_uniform_htile.begin(), unsupported_uniform_htile.end(), 1u);
+        CHECK(rejects_zero_clear(unsupported_uniform_htile, clear_meta_bytes, M, 4, 4),
+              "unsupported nonzero uniform HTILE remains fail-visible");
+        CHECK(rejects_zero_clear(zero_htile, clear_meta_bytes - 4u, M, 4, 4) &&
+                  rejects_zero_clear(zero_htile, clear_meta_bytes, M, 4, 2) &&
+                  rejects_zero_clear(zero_htile, clear_meta_bytes,
+                                     (uint32_t)TileMode::Sw64KbS, 4, 4) &&
+                  rejects_zero_clear(zero_htile, clear_meta_bytes, M, 8, 4),
+              "zero-clear materialization rejects short footprint, count, swizzle, and element size");
+    }
+
     // Golden positions from the addrlib GFX10_SW_64K_S pattern (gfx10SwizzlePattern.h). At 8 bpe the
     // 16 offset bits are [x0 | y0 y1 x1 x2 | y2 x3 y3 x4 | y4 x5 y5 x6] above the 3 byte bits, i.e.
     // element (1,0) -> byte 8, (0,1) -> 16, (0,2) -> 32, (2,0) -> 64... — the SW_4KB_S order continued

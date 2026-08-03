@@ -110,6 +110,9 @@ struct FrameResource {
     // zero-initialized 64 KiB allocation shared across ordered render calls.
     bool is_internal_gds = false;
     const uint8_t* tex_rgba = nullptr;   // non-null => a texture; then tw/th are its dimensions
+    // Readable byte span behind tex_rgba. Zero preserves the historical single-sample fixture
+    // contract; multisample plane uploads require an explicit full span and reject before Vulkan.
+    size_t tex_byte_size = 0;
     // Optional immutable owner for borrowed frontend pixels. Keeping this beside the raw pointer
     // makes FrameResource copies/moves retain the source through synchronous backend upload setup.
     std::shared_ptr<const std::vector<uint8_t>> tex_rgba_owner;
@@ -119,6 +122,9 @@ struct FrameResource {
     bool has_uniform_color = false;
     std::array<float, 4> uniform_color{};
     uint32_t tw = 0, th = 0, td = 1;
+    // Guest sample count. 2D_MSAA is uploaded as a single-sample 2D-array with one plane/layer per
+    // sample; the Vulkan image itself always keeps VK_SAMPLE_COUNT_1_BIT.
+    uint32_t sample_count = 1;
     // T#-declared mip-chain length (#1272). 1 (default) = single-level upload, the historical
     // behavior. >1 lets the backend generate a box-filtered chain — bounded by this declared count —
     // for plain-2D RGBA8 sampled textures, so minification stops point-sampling through dense art.
@@ -226,6 +232,8 @@ inline VkFormat backend_color_format(VkFormat format) {
         return VK_FORMAT_R8G8_UNORM;
     if (format == VK_FORMAT_R32_UINT)
         return VK_FORMAT_R32_UINT;
+    if (format == VK_FORMAT_R32_SFLOAT)
+        return VK_FORMAT_R32_SFLOAT;
     return VK_FORMAT_R8G8B8A8_UNORM;
 }
 
@@ -235,6 +243,26 @@ inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
     if (format == VK_FORMAT_R8_UNORM) return 1u;
     if (format == VK_FORMAT_R8G8_UNORM) return 2u;
     return 4u;
+}
+
+// The first exact guest-MSAA contract is intentionally narrow. Ordinary resources retain their
+// historical implicit byte-span behavior; a 2D_MSAA plane array must prove all four complete R32F
+// planes are readable before any Vulkan object or memcpy is attempted.
+inline bool backend_texture_plane_span_valid(const FrameResource& resource) {
+    if (resource.sample_count == 1u) return true;
+    if (resource.sample_count != 4u || resource.img_dim != 6u || resource.td != 1u ||
+        resource.declared_mip_levels != 1u || resource.is_storage_image ||
+        backend_color_format(resource.texture_format) != VK_FORMAT_R32_SFLOAT ||
+        !resource.tex_rgba || !resource.tw || !resource.th)
+        return false;
+    const size_t row_bytes = static_cast<size_t>(resource.tw) * sizeof(float);
+    if (resource.tw && row_bytes / resource.tw != sizeof(float) ||
+        resource.th > SIZE_MAX / row_bytes)
+        return false;
+    const size_t plane_bytes = row_bytes * resource.th;
+    if (resource.sample_count > SIZE_MAX / plane_bytes) return false;
+    const size_t required = plane_bytes * resource.sample_count;
+    return resource.tex_byte_size >= required;
 }
 
 struct BackendColorTargetStats {
@@ -2817,6 +2845,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (mrt_outputs)
         for (auto& color : mrt_outputs->colors) color.clear();
     if (draws.empty()) return out;
+    for (const BackendDraw& draw : draws)
+        for (const FrameResource& resource : draw.R)
+            if (!backend_texture_plane_span_valid(resource)) return out;
     if (backend_has_unproven_submission()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) return out;
@@ -3468,6 +3499,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         void* borrowed_compute_image = nullptr;
         uint32_t width = 0, height = 0, depth = 1;
         uint32_t img_dim = 1;
+        uint32_t sample_count = 1;
         uint32_t mip_levels = 1;   // effective uploaded chain length (#1272)
         VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
         bool storage_image = false;
@@ -3476,7 +3508,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             return pixels == other.pixels && render_target_id == other.render_target_id &&
                    borrowed_compute_image == other.borrowed_compute_image &&
                    width == other.width && height == other.height && depth == other.depth &&
-                   img_dim == other.img_dim && mip_levels == other.mip_levels &&
+                   img_dim == other.img_dim && sample_count == other.sample_count &&
+                   mip_levels == other.mip_levels &&
                    format == other.format && storage_image == other.storage_image &&
                    uniform_color_bits == other.uniform_color_bits;
         }
@@ -3491,6 +3524,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             h ^= static_cast<size_t>(key.height) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.depth) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.img_dim) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.sample_count) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.mip_levels) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.format) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.storage_image) + 0x9e3779b9u + (h << 6) + (h >> 2);
@@ -3527,7 +3561,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     };
     struct PersistentTextureKey {
         uint64_t id = 0;
-        uint32_t width = 0, height = 0, depth = 1, img_dim = 1;
+        uint32_t width = 0, height = 0, depth = 1, img_dim = 1, sample_count = 1;
         uint32_t mip_levels = 1;   // a cached image must match the requested chain length (#1272)
         VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
         bool operator==(const PersistentTextureKey&) const = default;
@@ -3539,6 +3573,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 h ^= static_cast<size_t>(value) + 0x9e3779b9u + (h << 6) + (h >> 2);
             };
             mix(key.width); mix(key.height); mix(key.depth); mix(key.img_dim);
+            mix(key.sample_count);
             mix(key.mip_levels);
             mix(static_cast<uint32_t>(key.format));
             return h;
@@ -4210,7 +4245,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         r.persistent_render_target_id ? r.persistent_render_target_id
                                                       : r.persistent_depth_target_id,
                         r.borrowed_compute_image,
-                        r.tw, r.th, r.td, r.img_dim,
+                        r.tw, r.th, r.td, r.img_dim, r.sample_count,
                         tex_mip_levels, backend_color_format(r.texture_format), r.is_storage_image,
                         uniform_color_bits};
                     size_t upload_index = SIZE_MAX;
@@ -4282,7 +4317,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         upload.persistent_version = r.persistent_texture_version;
                         const PersistentTextureKey persistent_key{
                             r.persistent_texture_id, r.tw, r.th, r.td, r.img_dim,
-                            texture_key.mip_levels, backend_color_format(r.texture_format)};
+                            r.sample_count, texture_key.mip_levels,
+                            backend_color_format(r.texture_format)};
                         if (!r.is_storage_image && !upload.borrowed_target &&
                             !upload.borrowed_compute && !upload.borrowed_ds &&
                             persistent_textures_enabled &&
@@ -4348,7 +4384,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 tci.format = backend_color_format(r.texture_format);
                                 tci.extent = {r.tw, r.th, r.td};
                                 tci.mipLevels = upload.key.mip_levels;
-                                tci.arrayLayers = 1;
+                                tci.arrayLayers = r.sample_count;
                                 tci.samples = VK_SAMPLE_COUNT_1_BIT;
                                 tci.tiling = VK_IMAGE_TILING_OPTIMAL;
                                 tci.usage = (r.is_storage_image ? VK_IMAGE_USAGE_STORAGE_BIT
@@ -4392,6 +4428,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             } else {
                                 const VkDeviceSize tbytes =
                                     static_cast<VkDeviceSize>(r.tw) * r.th * r.td *
+                                    r.sample_count *
                                     backend_color_bytes_per_pixel(r.texture_format);
                                 VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                                 stci.size = tbytes;
@@ -4449,7 +4486,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     // correct sRGB fix is a coordinated linear-working-space + output-encode change (see the
                     // #263 discussion), NOT a per-view format flip. r.srgb is decoded now as groundwork.
                     tvci.image = upload.image;
-                    tvci.viewType = r.img_dim == 2 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
+                    tvci.viewType = r.img_dim == 2 ? VK_IMAGE_VIEW_TYPE_3D
+                        : r.sample_count > 1u ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                             : VK_IMAGE_VIEW_TYPE_2D;
                     tvci.format = backend_color_format(r.texture_format);
                     // T# DST_SEL channel remap (#261): map each SQ_SEL to a VkComponentSwizzle. Identity
                     // (the default, and the narrow/font path) yields IDENTITY == a no-op. PROSPER_NO_SWIZZLE
@@ -4469,7 +4508,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     if (!r.is_storage_image && !getenv("PROSPER_NO_SWIZZLE"))
                         tvci.components = {vkswz(r.swizzle[0]), vkswz(r.swizzle[1]), vkswz(r.swizzle[2]), vkswz(r.swizzle[3])};
                     tvci.subresourceRange =
-                        {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels, 0, 1};
+                        {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
+                         0, r.sample_count};
                     // Sampled depth bridge (#1275): a borrowed DS image is viewed through its own
                     // depth format's DEPTH aspect (one level — DS surfaces have no mip chains here);
                     // the sampled value arrives in R. The T# swizzle above still applies.
@@ -4550,7 +4590,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         static_cast<uint64_t>(float_bits(sci.mipLodBias)),
                         static_cast<uint64_t>(sci.anisotropyEnable),
                         static_cast<uint64_t>(float_bits(sci.maxAnisotropy)),
-                        0,
+                        static_cast<uint64_t>(r.sample_count),
                         share_backend_resources ? 0 : ++resource_unique_tag,
                     };
                     ++resource_reuse_stats.texture_binding_references;
@@ -4572,7 +4612,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             persistent_image = persistent_texture_images.find(
                                 {upload.persistent_id, upload.key.width, upload.key.height,
                                  upload.key.depth, upload.key.img_dim,
-                                 upload.key.mip_levels, upload.key.format});
+                                 upload.key.sample_count, upload.key.mip_levels,
+                                 upload.key.format});
                         }
                         if (persistent_image != persistent_texture_images.end()) {
                             auto cached_binding = persistent_image->second.bindings.find(binding_key);
@@ -5083,7 +5124,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (!upload.staging && !upload.uniform_clear) continue;
         ++texture_stats.unique_uploads;
         texture_stats.upload_bytes += static_cast<uint64_t>(upload.key.width) * upload.key.height *
-                                      upload.key.depth * backend_color_bytes_per_pixel(upload.key.format);
+                                      upload.key.depth * upload.key.sample_count *
+                                      backend_color_bytes_per_pixel(upload.key.format);
     }
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -5247,7 +5289,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
         b0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         b0.image = upload.image;
-        b0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels, 0, 1};
+        b0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
+                               0, upload.key.sample_count};
         b0.srcAccessMask = upload.persistent_refresh ? VK_ACCESS_SHADER_READ_BIT : 0;
         b0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(
@@ -5258,11 +5301,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b0);
         if (upload.uniform_clear) {
             const VkImageSubresourceRange range{
-                VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels, 0, 1};
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
+                0, upload.key.sample_count};
             vkCmdClearColorImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  &upload.uniform_color, 1, &range);
         } else {
-            VkBufferImageCopy tc{}; tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            VkBufferImageCopy tc{};
+            tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                                   upload.key.sample_count};
             tc.imageExtent = {upload.key.width, upload.key.height, upload.key.depth};
             vkCmdCopyBufferToImage(cmd, upload.staging, upload.image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
@@ -5276,7 +5322,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             bs.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             bs.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             bs.image = upload.image;
-            bs.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, l - 1, 1, 0, 1};
+            bs.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, l - 1, 1,
+                                   0, upload.key.sample_count};
             bs.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             bs.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -5286,9 +5333,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             const int32_t dw = (int32_t)(upload.key.width >> l ? upload.key.width >> l : 1u);
             const int32_t dh = (int32_t)(upload.key.height >> l ? upload.key.height >> l : 1u);
             VkImageBlit blit{};
-            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l - 1, 0, 1};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l - 1, 0,
+                                   upload.key.sample_count};
             blit.srcOffsets[1] = {sw, sh, 1};
-            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0,
+                                   upload.key.sample_count};
             blit.dstOffsets[1] = {dw, dh, 1};
             vkCmdBlitImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
@@ -5301,7 +5350,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             br.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             br.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             br.image = upload.image;
-            br.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels - 1, 0, 1};
+            br.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                   upload.key.mip_levels - 1, 0,
+                                   upload.key.sample_count};
             br.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             br.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -5312,7 +5363,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         b1.newLayout = upload.key.storage_image
             ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         b1.image = upload.image;
-        b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels, 0, 1};
+        b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
+                               0, upload.key.sample_count};
         b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
             (upload.key.storage_image ? VK_ACCESS_SHADER_WRITE_BIT : 0);
@@ -5780,7 +5832,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             upload.persistent_refresh) continue;
         const PersistentTextureKey key{upload.persistent_id, upload.key.width, upload.key.height,
                                        upload.key.depth, upload.key.img_dim,
-                                       upload.key.mip_levels, upload.key.format};
+                                       upload.key.sample_count, upload.key.mip_levels,
+                                       upload.key.format};
         while (!avoid_cache_eviction &&
                (persistent_texture_images.size() >= persistent_texture_max_entries ||
                 (upload.image_bytes <= persistent_texture_limit &&
@@ -6052,7 +6105,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 !upload.staging_memory)
                 continue;
             const size_t storage_bytes = static_cast<size_t>(upload.key.width) *
-                upload.key.height * upload.key.depth *
+                upload.key.height * upload.key.depth * upload.key.sample_count *
                 backend_color_bytes_per_pixel(upload.key.format);
             void* mapped = nullptr;
             if (!storage_bytes ||

@@ -356,6 +356,7 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.last_level = (t[3] >> 16) & 0xFu;
     d.max_mip    = (t[5] >> 4) & 0xFu;
     d.type      = (uint8_t)((t[3] >> 28) & 0xFu);                                                  // Type
+    d.sample_count = (d.type == 14 || d.type == 15) ? (1u << d.last_level) : 1u;
     // WORD4.DEPTH is depth-1 for 3D, but the LAST_ARRAY slice for array resources.  BASE_ARRAY is
     // the first selected slice, so an array view contains last-first+1 layers (not last+1).
     const uint32_t depth_or_last = t[4] & 0x1FFFu;
@@ -911,8 +912,9 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.width         = view.width;
             r.height        = view.height;
             r.depth         = d.depth;
-            r.declared_mip_levels =
-                d.last_level >= d.base_level ? (uint32_t)(d.last_level - d.base_level) + 1u : 1u;
+            r.sample_count  = d.sample_count;
+            r.declared_mip_levels = d.sample_count > 1u ? 1u :
+                (d.last_level >= d.base_level ? (uint32_t)(d.last_level - d.base_level) + 1u : 1u);
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.in_mip_tail   = view.in_mip_tail;
             r.mip_tail_offset = view.in_mip_tail
@@ -944,9 +946,12 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 fprintf(stderr, "[t#] SRGB texture fmt=%u %ux%u (binding %u)\n", d.format, d.width, d.height, r.binding);
             // Backing byte size: block-compressed surfaces store one bytes_per_block unit per 4x4 block
             // (ceil dims); uncompressed store bytes_per_block per texel (fmt=56 -> *4).
-            const uint64_t backing_bytes = is_bcn
+            const uint64_t backing_bytes_per_sample = is_bcn
                 ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
                 : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
+            if (!d.sample_count || backing_bytes_per_sample > UINT32_MAX / d.sample_count) {
+                tex_drop(slot, off, "implausible multisample backing byte size"); continue; }
+            const uint64_t backing_bytes = backing_bytes_per_sample * d.sample_count;
             if (!backing_bytes || backing_bytes > UINT32_MAX) {
                 tex_drop(slot, off, "implausible backing byte size"); continue; }
             r.size = static_cast<uint32_t>(backing_bytes);
