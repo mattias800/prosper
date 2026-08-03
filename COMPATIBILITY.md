@@ -826,42 +826,15 @@ Boot remains intermittent (#1178).
 
 ## ArcRunner — `PPSA21406`
 
-**Rung 0.** The title boots through UE4 initialisation and its `.pak` load, installs the renderer,
-and submits real GPU work — but no frame is ever composited. Between about 8 and 14 s the guest's
-`RenderThread 1` faults:
+**Rung 0.** ArcRunner boots through UE4 initialisation and submits real GPU work, but the render
+thread faults before a title screen or gameplay appears. The only inspected non-alpha diagnostic
+frames were uniform solid-colour clears, so there is no screenshot or visible-progress claim yet.
 
-```text
-WORKER-THREAD FAULT: sig=11 addr=0x30016000 rip=eboot+0x127e751
-insn @rip: 48 8b 01            (mov rax,[rcx])   rcx=0x30016000
-[fault] thread='RenderThread 1' on-guest-TCB=NO(host-%fs leak?)
-```
-
-`0x30016000` is far below the guest arena (`0x2000000000`–`0x9fc0000000`) and is read out of a
-structure whose neighbouring fields are ordinary guest pointers, which matches the pool-pointer
-corruption already tracked on #1226. The same fault site reproduces under three guest-argument
-combinations. Note one apparatus detail: with `PROSPER_GUEST_ARGS=-force-gfx-direct` the process is
-killed by the signal (exit 139) and prints **no** fault report at all, while the same fault is fully
-reported with `PROSPER_GUEST_ARGS=` empty, or under `gdb` with `SIGSEGV` passed through.
-
-### Ruled out (do not re-derive)
-
-| Hypothesis | Evidence that killed it | Ref |
-| --- | --- | --- |
-| The `0x30016000` "POOLSHIFT byte-shifted pool pointer" is a **structurally different artifact** from the `0x2000000001` free-list value — the two shapes this issue tracked as separate legs since #1249 | They are the same shape one dereference apart. A qword that is a pointer with its **low bit set** misreads, when dereferenced, to the target qword shifted down by 8: `*(0x2000000001) = 0x30016000`, byte-for-byte the value the terminal fault dereferences. The pop at `eboot+0x127e751` both **returns** that node — the guest's own `FMallocBinned3 Attempt to free/realloc an unrecognized block 2000000001` fatal — and **stores** the misread as the next head, which is the SIGSEGV. Confirms the session-10 "the byte-shift is a READ ARTIFACT" note with a measurement. **This is about the shape, not the author** — see the next row. | #1226, #1754 |
-| **The paired 4-byte `DMA_DATA` immediate-zero init is the "first half" of the damage**, systematically destroying live `FFreeBlock::NextFreeBlock` links (#1754 left this at `CONFIDENCE: MED`) | Not systematic. Whole-run totals with `PROSPER_INIT_TRIP=1`: **n=1024, overptr=926, member=10, both=1** — 90% of these inits do overwrite pointer-shaped content, but only ~1% of destinations are on an idx=1 chain the walk models, and exactly **one** init in the run is both. The overwritten pointer is almost always the label pool's own stale link in a block the guest holds. Two cautions: `member` positives appear **late**, so any single sample before ordinal ~512 reads 0 and must not be quoted as the run (this is how the first draft of this row got it wrong); and the scope is *not on the idx=1 chains the walk models*, not *on no list anywhere*. The walk is positive-controlled per sample by `mb3_freelist_selftest()` for both arming and traversal. `CONFIDENCE: LOW` on any causal role for the init. | #1226 |
-| A prosper **PM4 write path** stores `0x30016000` into guest memory | `PROSPER_WRITE_TRAP=0x30016000` (checks `RELEASE_MEM` sel 1/2/3, `EVENT_WRITE`, `WRITE_DATA`, both `DMA_DATA` forms): **0 hits** across a full faulting run, positive-controlled by arming `0x1` alongside it (that control reaches ordinal 2,048 in the same run). The value is produced by the guest's own misaligned read, above. Three limits on how far this negative reaches: PM4 paths only (compute writeback, the Vulkan backend and the HLEs are outside it); the scan is 4-byte-strided from each payload base, so an *unaligned* poison inside a `DMA_DATA` **copy** is not seen; and a copy is scanned only to its first 4 KiB. | #1226, #1754 |
-| A prosper GPU write targets the `0x3001600000` page the poison decodes to | `PROSPER_PROVENANCE_ADDR=0x3001600000:0x10000` reports zero overlapping writes across a full faulting run; `PROSPER_POOLSHIFT=1` is also 0. The page is an ordinary 64 KiB guest `sceKernelBatchMap` mapping, consecutive in the same series as the earlier-reported `0x30015f0000`. | #1226, #1754 |
-| The renderer's fold latency (the guest outrunning our deferred label writes) is causal | `PROSPER_RENDER=0` faults at the same site with the same value, ~6 s in instead of ~21 s. | #1226, #1754 |
-| Suppressing the forging fence fixes it | One run per arm: suppression removes `0x30016000` and moves the fault to `0x2400100024001`, two pops further along the same walk. The head is still `0x2000000000`, which only the paired 4-byte `DMA_DATA` immediate-zero init can produce. The fence is the second half of the damage. `CONFIDENCE: MED` — suppressing the **init** directly has not been run. | #1226, #1754 |
-
-### Attempted and inconclusive (do not repeat these arms)
-
-Hypotheses a measurement was aimed at and **failed to settle**. They are not ruled out; the
-arm that failed is recorded so the next agent spends its run on a better one.
-
-| Hypothesis | Why the attempt did not settle it | Ref |
-| --- | --- | --- |
-| **Prosper's REL1 fence forge is what creates the dereferenced `0x2000000001`** — #1754's causal reading | `PROSPER_INIT_SUPPRESS=ptr` collapses the forge population ~200x (to 21) and the same `0x30016000` still appears — but one poisoned node is all the pop needs, so a rate reduction is not a necessity test. Read with the other two arms it points the other way: **4,096 forges -> poison, 21 -> poison, 0 -> no poison** (the fence-suppressed arm removed it). The decisive arm is landed-forges-zero **and** init-suppressed together, and has not been run. | #1226 |
+Follow the long-lived [game tracker #1817](https://github.com/mattias800/prosper/issues/1817) for the
+current milestone and blockers. The fault chain, exact experiments, reproduction route, and
+falsified hypotheses live in
+[`prosper/docs/ARCRUNNER_STATUS.md`](prosper/docs/ARCRUNNER_STATUS.md); the primary bug is
+[#1226](https://github.com/mattias800/prosper/issues/1226).
 
 ## Asterix &amp; Obelix - Babylon Mission — `PPSA30490`
 

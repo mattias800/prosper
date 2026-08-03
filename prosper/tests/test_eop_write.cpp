@@ -30,6 +30,11 @@ extern "C" uint64_t prosper_guest_tsc_ns();
 extern "C" void prosper_label_hist_dma_built(uint64_t addr, uint64_t cb, uint32_t src, uint8_t builder);
 // #1226: uncapped total of PROSPER_WRITE_TRAP payload matches (see command_processor.cpp).
 extern "C" uint64_t prosper_gpu_write_trap_matches();
+extern "C" void prosper_rel1_forge_suppress_all_override_for_test(int value);
+extern "C" void prosper_rel1_forge_decision_reset_for_test();
+extern "C" void prosper_rel1_forge_decision_totals(uint64_t* candidates, uint64_t* suppressed,
+                                                     uint64_t* landed);
+extern "C" bool prosper_rel1_forge_report_due_for_test(uint64_t candidates);
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -52,6 +57,10 @@ static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
 int main() {
     // Exercise the SDK-13 post-submit queue policy; older callers use the eager compatibility path.
     prosper_gpu_enable_post_submit_visibility();
+    // Keep an inherited developer environment from turning this unit test into the destructive
+    // #1226 all-forge-suppressed arm. Individual checks opt into that arm below.
+    prosper_rel1_forge_suppress_all_override_for_test(0);
+    prosper_rel1_forge_decision_reset_for_test();
     printf("== test_eop_write ==\n");
     // #1226: the generation and MB3-freelist suppression families are OFF by default (their
     // content/membership premises misfire on live protocols — see generation_guard() /
@@ -885,6 +894,78 @@ int main() {
         run_cb(rel, 7, st);
         CHECK(label.link == 0x2000000000ull,
               "ArcRunner shape: the same fence with no outstanding init is suppressed");
+    }
+    {
+        uint64_t candidates = 99, suppressed = 99, landed = 99;
+        prosper_rel1_forge_decision_totals(&candidates, &suppressed, &landed);
+        CHECK(candidates == 0 && suppressed == 0 && landed == 0,
+              "ArcRunner diagnostic: default-off mode records no suppression decisions");
+        CHECK(prosper_rel1_forge_report_due_for_test(1) &&
+              prosper_rel1_forge_report_due_for_test(64) &&
+              prosper_rel1_forge_report_due_for_test(127) &&
+              prosper_rel1_forge_report_due_for_test(256),
+              "ArcRunner diagnostic: dense census reports every possible sub-256 terminal total");
+        CHECK(!prosper_rel1_forge_report_due_for_test(257) &&
+              prosper_rel1_forge_report_due_for_test(512),
+              "ArcRunner diagnostic: census tail remains bounded to each 256th candidate");
+
+        // Positive-control every reported number through the real store site. Observe-only mode is
+        // test-private: it counts the candidate but deliberately lets it land, proving `landed` can
+        // become nonzero before the experiment relies on zero.
+        static struct alignas(0x20) PoolLabel { uint64_t link; uint64_t pad[3]; } label{};
+        const uint64_t addr = (uint64_t)(uintptr_t)&label;
+        label.link = 0x2020f3d5a0ull;
+        prosper_label_hist_dma_built(addr, 0x7010, 0, 1);
+        GpuState st;
+        uint32_t init[7] = {PM4(7, IT_NOP, R_DMA_DATA), (uint32_t)addr, (uint32_t)(addr >> 32),
+                            0, 0, 4, 0x303};
+        run_cb(init, 7, st);
+        CHECK(label.link == 0x2000000000ull,
+              "ArcRunner diagnostic: observed candidate begins from the real post-init shape");
+
+        prosper_rel1_forge_decision_reset_for_test();
+        prosper_rel1_forge_suppress_all_override_for_test(2);
+        uint32_t rel[7] = {PM4(7, IT_NOP, R_RELEASE_MEM), (uint32_t)addr, (uint32_t)(addr >> 32),
+                           1, 1, 0, 4};
+        run_cb(rel, 7, st);
+        prosper_rel1_forge_decision_totals(&candidates, &suppressed, &landed);
+        CHECK(label.link == 0x2000000001ull,
+              "ArcRunner diagnostic: observe-only positive control reaches the real store");
+        CHECK(candidates == 1 && suppressed == 0 && landed == 1,
+              "ArcRunner diagnostic: candidate and landed totals have a positive control");
+
+        // The decisive experiment's first half: repeat the SAME live paired candidate and require
+        // all mode to stop it. Re-init the next generation while the destructive mode is off.
+        prosper_rel1_forge_suppress_all_override_for_test(0);
+        label.link = 0x2020f3d5a0ull;
+        prosper_label_hist_dma_built(addr, 0x7018, 0, 1);
+        run_cb(init, 7, st);
+        CHECK(label.link == 0x2000000000ull,
+              "ArcRunner diagnostic: all-suppress candidate repeats the real post-init shape");
+
+        prosper_rel1_forge_decision_reset_for_test();
+        prosper_rel1_forge_suppress_all_override_for_test(1);
+        run_cb(rel, 7, st);
+        prosper_rel1_forge_decision_totals(&candidates, &suppressed, &landed);
+        CHECK(label.link == 0x2000000000ull,
+              "ArcRunner diagnostic: all mode suppresses the live paired forge candidate");
+        CHECK(candidates == 1 && suppressed == 1 && landed == 0,
+              "ArcRunner diagnostic: all-mode totals prove one candidate suppressed and none landed");
+
+        // Scope the lever to the exact forge predicate: an ordinary non-forging REL1 completion
+        // must still land, and it must not change the experiment's candidate totals.
+        static struct alignas(0x20) PlainLabel { uint64_t value; uint64_t pad[3]; } plain{};
+        const uint64_t plain_addr = (uint64_t)(uintptr_t)&plain;
+        plain.value = 0;
+        uint32_t plain_rel[7] = {PM4(7, IT_NOP, R_RELEASE_MEM), (uint32_t)plain_addr,
+                                 (uint32_t)(plain_addr >> 32), 1, 7, 0, 4};
+        run_cb(plain_rel, 7, st);
+        prosper_rel1_forge_decision_totals(&candidates, &suppressed, &landed);
+        CHECK((uint32_t)plain.value == 7,
+              "ArcRunner diagnostic: all mode leaves a non-forging REL1 completion intact");
+        CHECK(candidates == 1 && suppressed == 1 && landed == 0,
+              "ArcRunner diagnostic: non-forging writes do not enter all-mode totals");
+        prosper_rel1_forge_suppress_all_override_for_test(0);
     }
 
     // #1226 PROSPER_WRITE_TRAP, both arms on every payload-carrying scan site. A hard negative from
