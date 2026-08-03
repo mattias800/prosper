@@ -3802,7 +3802,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 *r, image_descriptors[i].image_dim == 1u,
                 image_descriptors[i].image_arrayed,
                 image_descriptors[i].image_multisampled);
-            const bool ordinary_2d_storage = ordinary_2d_view;
+            const bool native_2d_storage = bi.storage &&
+                shader_resource_uses_native_2d_storage_image(
+                    *r, image_descriptors[i].image_dim == 1u,
+                    image_descriptors[i].image_arrayed,
+                    image_descriptors[i].image_multisampled);
             const bool ordinary_3d_storage = r->img_dim == 2 && r->depth &&
                                              !r->depth_compare;
             const VkImageType native_storage_type = ordinary_3d_storage
@@ -3813,11 +3817,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // lookup. Sampled and raw-uvec4 descriptors cannot take this typed-storage path, so do
             // not repeat that query for every one of their per-frame bindings.
             const bool native_storage_device = spirv_native_storage &&
-                (ordinary_2d_storage || ordinary_3d_storage) &&
+                (native_2d_storage || ordinary_3d_storage) &&
                 native_storage_image_create_supported(
                     ctx.physical, native_storage_format, native_storage_type,
                     r->width, r->height,
-                    ordinary_3d_storage ? r->depth : 1u, 1u);
+                    ordinary_3d_storage ? r->depth : 1u,
+                    native_2d_storage && image_descriptors[i].image_arrayed
+                        ? r->depth : 1u);
             const bool native_storage_supported = spirv_native_storage &&
                 native_float_storage_image_supported(
                     r->format, descriptor_components, r->srgb,
@@ -3835,7 +3841,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // emitted as float after the frontend's physical-device feature query.
             bi.native_float_storage = spirv_native_storage;
             bi.graphics_sampled_usage = bi.native_float_storage &&
-                (ordinary_2d_storage || ordinary_3d_storage) &&
+                (ordinary_2d_view || ordinary_3d_storage) &&
                 native_storage_image_create_supported(
                     ctx.physical, native_storage_format, native_storage_type,
                     r->width, r->height, ordinary_3d_storage ? r->depth : 1u, 1u,

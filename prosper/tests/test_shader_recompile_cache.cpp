@@ -579,8 +579,9 @@ int main() {
     // uint-channel fallback, even when the guest code and every binding/provenance field are equal.
     clear_shader_recompile_cache();
     static const uint32_t kStorageCompute[] = {
-        0x7e080300u, 0xf0000f00u, 0x00000004u, 0xbf8c3f70u,
-        0xf0200f00u, 0x00020004u, 0xbf810000u,
+        0x7e080300u, 0x7e0a0280u,
+        0xf0000f08u, 0x00000004u, 0xbf8c3f70u,
+        0xf0200f08u, 0x00020004u, 0xbf810000u,
     };
     ShaderResourceTable storage_table;
     for (uint32_t i = 0; i < 2; ++i) {
@@ -590,6 +591,8 @@ int main() {
         image.num_components = 4;
         image.binding = 4 + i;
         image.sgpr_base = i * 8;
+        image.img_dim = 1;
+        image.width = image.height = image.depth = 1;
         storage_table.resources.push_back(image);
     }
     ComputeShaderConfig storage_config;
