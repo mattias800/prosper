@@ -2707,6 +2707,52 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             narrow_done = decoded_reuse->narrow;
                             fr.persistent_texture_id = decoded_reuse->persistent_id;
                             fr.persistent_texture_version = decoded_reuse->persistent_version;
+                            if (getenv("PROSPER_DETILE_STATS") && resource_persistent_hit) {
+                                static uint64_t bc_cube_hit_total = 0;
+                                static std::unordered_map<uint64_t, uint64_t> bc_cube_hits;
+                                const uint64_t hit_footprint =
+                                    prosper::gpu::gpu_capture_resource_footprint(r);
+                                const bool expensive_bc_cube = r.img_dim == 3u &&
+                                    texture_decode_miss_is_expensive_block(
+                                        r.format == prosper::gpu::DataFormat::Bc6,
+                                        persistent_source_size,
+                                        static_cast<size_t>(std::min<uint64_t>(
+                                            hit_footprint, SIZE_MAX)));
+                                if (expensive_bc_cube) {
+                                    const uint64_t address_hit_ordinal = ++bc_cube_hits[r.gpu_addr];
+                                    const uint64_t global_hit_ordinal = address_hit_ordinal == 1u
+                                        ? ++bc_cube_hit_total : bc_cube_hit_total;
+                                    if (should_report_texture_decode_hit(
+                                            global_hit_ordinal, address_hit_ordinal,
+                                            expensive_bc_cube)) {
+                                        fprintf(stderr,
+                                                "[detile-hit] ordinal=%llu address-ordinal=%llu "
+                                                "addr=0x%llx key=0x%zx %ux%ux%u dim=%u fmt=%u/%u "
+                                                "tile=%u footprint=%llu source=%zu "
+                                                "cache=persistent-hit id=%llu version=%llu "
+                                                "validation=%s validated=%zu submit-query=%d "
+                                                "watch-query=%d watch-active=%d watch-only=%d\n",
+                                                (unsigned long long)global_hit_ordinal,
+                                                (unsigned long long)address_hit_ordinal,
+                                                (unsigned long long)r.gpu_addr,
+                                                TextureDecodeKeyHash{}(decode_key),
+                                                tw, th, r.depth, r.img_dim,
+                                                static_cast<unsigned>(r.format), r.num_components,
+                                                r.tile_mode,
+                                                (unsigned long long)hit_footprint,
+                                                persistent_source_size,
+                                                (unsigned long long)fr.persistent_texture_id,
+                                                (unsigned long long)fr.persistent_texture_version,
+                                                resource_texture_exact_validation ? "exact" : "skip",
+                                                resource_texture_validated_bytes,
+                                                resource_texture_submit_query,
+                                                resource_texture_watch_query,
+                                                static_cast<int>(resource_texture_watch_active),
+                                                static_cast<int>(resource_texture_watch_only));
+                                        fflush(stderr);
+                                    }
+                                }
+                            }
                             // Only a persistent-cache hit needs to be recorded here; a submit-local
                             // hit is already in the map under this key, and emplacing over it would
                             // build and discard a node on every repeat reference. Persistent-hit

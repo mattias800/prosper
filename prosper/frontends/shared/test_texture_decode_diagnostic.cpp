@@ -5,6 +5,7 @@
 #include <cstdio>
 
 using prosper::frontend::should_report_texture_decode_miss;
+using prosper::frontend::should_report_texture_decode_hit;
 using prosper::frontend::block_compressed_cube_source_size;
 using prosper::frontend::texture_decode_cache_candidate;
 using prosper::frontend::texture_decode_miss_reason;
@@ -91,6 +92,15 @@ int main() {
     CHECK(!should_report_texture_decode_miss(4010, 9, true));
     CHECK(!should_report_texture_decode_miss(4001, 1, false));
     CHECK(should_report_texture_decode_miss(6000, 125, false));
+
+    CHECK_NAMED("syberia_bc6_cube_persistent_hit_witness",
+                should_report_texture_decode_hit(
+                    /*global_ordinal=*/2, /*address_ordinal=*/1,
+                    /*expensive_block_cube=*/true));
+    CHECK(!should_report_texture_decode_hit(2, 2, true));
+    CHECK(!should_report_texture_decode_hit(2, 1, false));
+    CHECK(should_report_texture_decode_hit(64, 1, true));
+    CHECK(!should_report_texture_decode_hit(65, 1, true));
 
     if (!failures) std::printf("texture_decode_diagnostic: OK\n");
     return failures ? 1 : 0;

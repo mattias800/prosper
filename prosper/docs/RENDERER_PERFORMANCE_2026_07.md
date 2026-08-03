@@ -309,7 +309,24 @@ zero, host-size-overflowing and address-overflowing ranges stay ineligible. Reus
 existing exact comparison, ordered GPU-write journal, deferred write-watch promotion and memory-aware
 LRU. This is intentionally not the rejected Plucky Float16 experiment: non-BC cubes remain excluded.
 CPU regression coverage asserts the exact Syberia candidate/range shape and the nearby exclusions.
-Post-fix live throughput and visual equivalence are pending a separately coordinated GPU run.
+
+One post-fix full-resolution diagnostic reached the same profile-screen phase. The 2048 cube emitted
+one `cold-or-evicted` miss with `candidate=1`, `eligible=1` and the exact 33,570,816-byte source, then
+no later miss through t=225.1 s / frame 611. This removes the old observed repeated-miss signature,
+but the arm did not independently prove a same-identity hit: aggregate cache hits are not identity
+evidence, the detail logger suppresses resources below 0.5 ms, and an approved debugger breakpoint
+raced process exit. A new `PROSPER_DETILE_STATS` witness therefore reports only the first persistent
+hit for each of at most 64 expensive BC cube addresses, including key, source span and persistent
+ID/version; it is CPU-policy tested and awaits a coordinated live confirmation.
+
+The profile output retained the expected full-width, overexposed scene without new cube corruption.
+Through the post-cube t=125.057→225.102 s window, presents advanced 419→614: **1.949 fps**, no
+measurable improvement over the earlier ~2.0 fps observation. This is not a clean negative A/B because
+the post arm additionally enabled verbose render timing. It does show that removing the repeated miss
+does not by itself make Syberia fast under that diagnostic load; the remaining renderer/compute costs
+still dominate. The screenshot command's exit 1 was self-inflicted apparatus failure — a 48×5 s
+schedule cannot complete under `--timeout 230` — after 45 source- and pixel-distinct samples, not a
+game stall.
 
 ## Plucky Squire unused descriptor materialization (2026-07-29)
 

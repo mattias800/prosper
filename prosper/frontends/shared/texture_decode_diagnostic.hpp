@@ -54,6 +54,18 @@ constexpr bool should_report_texture_decode_miss(uint64_t global_ordinal,
         (address_ordinal & (address_ordinal - 1u)) == 0u;
 }
 
+// A successful persistent hit is normally too fast for PROSPER_RENDER_TIMING=detail's 0.5 ms
+// resource threshold. Give PROSPER_DETILE_STATS one identity-specific witness without turning every
+// cache reuse into a trace: at most the first hit for each of the first 64 expensive BC cube
+// identities is printed. Both ordinals are included in the record so a capped stream cannot be
+// mistaken for a population count.
+constexpr bool should_report_texture_decode_hit(uint64_t global_ordinal,
+                                                uint64_t address_ordinal,
+                                                bool expensive_block_cube) {
+    return expensive_block_cube && global_ordinal >= 1u && global_ordinal <= 64u &&
+        address_ordinal == 1u;
+}
+
 // An unsupported candidate has no validated persistent source size by construction. Do not let
 // that zero hide the exact expensive event this diagnostic exists to expose: a separately derived
 // descriptor footprint is still an observable source-size signal. The threshold is diagnostic-only;

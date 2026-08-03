@@ -104,9 +104,33 @@ The cache now admits only supported **block-compressed** cubes and validates tha
 descriptor footprint before reuse. The existing exact-byte comparison, GPU-write journal,
 write-watch, ID/version, LRU and memory-budget rules remain unchanged. Non-BC cubes remain excluded:
 a broader Float16 cube experiment on Plucky Squire churned the cache and write watches and reduced
-performance, so this change deliberately does not revive it. Post-fix live performance and visual
-validation still require a separately coordinated GPU run; the CPU regression fixes the exact
-candidate/range contract and keeps non-BC, empty and overflowing ranges fail-visible.
+performance, so this change deliberately does not revive it.
+
+A single post-fix diagnostic run reached the same profile-screen phase. The large cube produced
+exactly one observed miss: `cold-or-evicted`, `candidate=1`, `eligible=1`, with source and footprint
+both 33,570,816 bytes. There was no later miss for that address through t=225.1 s / frame 611. This
+proves the old unconditional candidate rejection is gone and the repeated-decode symptom was not
+observed again; it does **not** by itself prove that the identity was referenced again or served as a
+cache hit. Aggregate hit counters rose, but they cover every texture. The planned identity-specific
+`PROSPER_RENDER_TIMING=detail` witness did not print because successful hits stayed below its 0.5 ms
+detail threshold, and a subsequently approved debugger breakpoint raced the process exit. The exact
+hit remains unproved in this arm. `PROSPER_DETILE_STATS` now has a separately bounded, one-line-per-
+address `[detile-hit]` witness for the next coordinated run so this apparatus gap cannot recur.
+
+The post-fix frame is visually unchanged in the useful sense: a 1920x1080 composited profile screen
+contains the expected full-width scene and UI, with no new cube seam, corruption or missing layer.
+It still has the already tracked severe overexposure. The t=225.1 s sample has 177,717 distinct
+colours and 2,063,887 non-black pixels. Performance did **not** measurably improve in this diagnostic:
+present count rose 419→614 from t=125.057→225.102 s, or 1.949 fps. Do not treat that as a controlled
+negative A/B: unlike the pre-fix miss trace, this arm also enabled verbose render timing, and the
+scene has other large measured costs. It does establish that removing repeated BC6H misses alone did
+not make the title fast under this instrumentation.
+
+The screenshot tool exited 1 after saving 45/48 fresh, pixel-distinct samples because the requested
+48×5 s schedule cannot finish inside its 230 s internal timeout; the timeout status was therefore an
+apparatus error, not a stale-frame or title-progress failure. All 45 saved samples advanced source and
+pixel content with zero stale seconds. The final image is retained only as local evidence; the existing
+public profile screenshot remains representative and no compatibility rung changed.
 
 ## The former "right ~55% is black" question — localized and fixed
 
