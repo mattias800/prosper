@@ -27,6 +27,7 @@ namespace prosper { void prosper_eq_trigger_eop(); }
 #include <atomic>
 #include <array>
 #include <deque>
+#include <mutex>
 #include <unordered_set>
 #include <condition_variable>
 #include <thread>
@@ -782,6 +783,93 @@ static bool forge_guard() {
                                return !e || strtol(e, nullptr, 0) != 0; }();   // default ON
     return v;
 }
+// #1226 decisive A/B arm: suppress EVERY REL1 write matching forges_freelist_ptr(), including the
+// live-paired population the correctness guard above intentionally lets through. This is diagnostic
+// only, default OFF, and deliberately unsafe for normal play: those live consumers will never see
+// their fence. Combine it with PROSPER_INIT_SUPPRESS=ptr to remove both prosper-authored halves of
+// ArcRunner's observed 0x2000000001 composition.
+//
+// The counters are part of the experiment, not decoration. A run is a valid all-forge-suppressed arm
+// only when FORGE-DECISION-TOTALS says candidates == suppressed and landed == 0. The first candidate
+// and every 256th candidate print a dense total, because ArcRunner can fault before a process-exit
+// summary and a capped detail log has repeatedly been mistaken for a population on this issue.
+namespace {
+struct Rel1ForgeDecisionCounters {
+    uint64_t candidates = 0;
+    uint64_t suppressed = 0;
+    uint64_t landed = 0;
+};
+Rel1ForgeDecisionCounters g_rel1_forge_decisions;
+std::mutex g_rel1_forge_decisions_mu;
+// -1 selects the real environment. Tests use 0=off, 1=suppress-all, and 2=observe-only so each
+// counter is positive-controlled through the real store site in the same process.
+std::atomic<int> g_rel1_forge_suppress_all_test_override{-1};
+
+int rel1_forge_decision_mode() {
+    const int test_override = g_rel1_forge_suppress_all_test_override.load(std::memory_order_relaxed);
+    if (test_override >= 0) return test_override;
+    static const int mode = [] {
+        const char* e = getenv("PROSPER_REL1_FORGE_SUPPRESS_ALL");
+        if (!e || !*e || !strcmp(e, "0") || !strcmp(e, "off")) return 0;
+        if (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "all")) {
+            fprintf(stderr,
+                    "[agc] PROSPER_REL1_FORGE_SUPPRESS_ALL=1 ARMED — diagnostic only; "
+                    "valid arm requires candidates=suppressed and landed=0\n");
+            return 1;
+        }
+        fprintf(stderr,
+                "[agc] PROSPER_REL1_FORGE_SUPPRESS_ALL='%s' NOT ARMED "
+                "(want 0|off|1|on|all)\n", e);
+        return 0;
+    }();
+    return mode;
+}
+
+void rel1_forge_report_totals_locked(const char* suffix = "") {
+    fprintf(stderr,
+            "[agc] FORGE-DECISION-TOTALS candidates=%llu suppressed=%llu landed=%llu mode=all%s\n",
+            (unsigned long long)g_rel1_forge_decisions.candidates,
+            (unsigned long long)g_rel1_forge_decisions.suppressed,
+            (unsigned long long)g_rel1_forge_decisions.landed, suffix);
+}
+
+bool rel1_forge_suppress_candidate() {
+    const int mode = rel1_forge_decision_mode();
+    if (!mode) return false;
+    std::lock_guard<std::mutex> lock(g_rel1_forge_decisions_mu);
+    ++g_rel1_forge_decisions.candidates;
+    if (mode != 1) return false;   // test-only observe mode positive-controls the landed counter
+    ++g_rel1_forge_decisions.suppressed;
+    if (g_rel1_forge_decisions.candidates == 1 ||
+        (g_rel1_forge_decisions.candidates % 256) == 0)
+        rel1_forge_report_totals_locked();
+    return true;
+}
+
+void rel1_forge_note_landed() {
+    const int mode = rel1_forge_decision_mode();
+    if (!mode) return;
+    std::lock_guard<std::mutex> lock(g_rel1_forge_decisions_mu);
+    ++g_rel1_forge_decisions.landed;
+    // Any hit is a broken discriminator: fail visibly even when it is not on the periodic schedule.
+    if (mode == 1) rel1_forge_report_totals_locked(" VIOLATION=FORGE_LANDED");
+}
+}  // namespace
+
+extern "C" void prosper_rel1_forge_suppress_all_override_for_test(int value) {
+    g_rel1_forge_suppress_all_test_override.store(value, std::memory_order_relaxed);
+}
+extern "C" void prosper_rel1_forge_decision_reset_for_test() {
+    std::lock_guard<std::mutex> lock(g_rel1_forge_decisions_mu);
+    g_rel1_forge_decisions = {};
+}
+extern "C" void prosper_rel1_forge_decision_totals(uint64_t* candidates, uint64_t* suppressed,
+                                                     uint64_t* landed) {
+    std::lock_guard<std::mutex> lock(g_rel1_forge_decisions_mu);
+    if (candidates) *candidates = g_rel1_forge_decisions.candidates;
+    if (suppressed) *suppressed = g_rel1_forge_decisions.suppressed;
+    if (landed) *landed = g_rel1_forge_decisions.landed;
+}
 // #312 label free-state write-after-free guard — see label_freed_marker_kind. Default OFF
 // (PROSPER_REL1_WAF_GUARD=1 to arm). RATIONALE (session-11 A/B, ~30 menu-drive runs): this guard is
 // STRICTLY-CORRECT — every write it suppresses is a genuine write-after-free into an MB3
@@ -1312,6 +1400,7 @@ static void honor_eop_write(const Pm4Command& c) {
                   //   ptr_like, low!=0  -> REL1-LIVE: a real pointer at write time (stomp-in-the-act).
                   //   low==1 && high!=0 -> REL1-NOINIT: recycled label re-fenced without its DmaData.
                   uint32_t pre_low = (uint32_t)pre;
+                  bool rel1_forge_candidate = false;
                   if (pre_low != 0) {
                       if (ptr_like(pre) && pre_low != 1) {
                           report_suspect_write("REL1-LIVE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
@@ -1355,7 +1444,13 @@ static void honor_eop_write(const Pm4Command& c) {
                   // executed init is outstanding (the true stale/WAF fence). CONFIDENCE: MED-HIGH
                   // (live ArcRunner protocol trace + the WAF model's documented lifecycle).
                   else if (forges_freelist_ptr(pre, 4, c.rel_value)) {
+                      rel1_forge_candidate = true;
                       forge_trip("REL1", c.rel_addr, pre, c.rel_value, 4, pkt_addr(c));
+                      if (rel1_forge_suppress_candidate()) {
+                          // Preserve diagnostic history without claiming a completed generation.
+                          label_hist_event(c.rel_addr, LE_REL_EXEC, pre, c.queue_origin);
+                          return;
+                      }
                       LabelHist& fh = label_hist_slot(c.rel_addr);
                       const bool live_pair =
                           fh.dma_exec_n.load(std::memory_order_relaxed) >
@@ -1388,6 +1483,7 @@ static void honor_eop_write(const Pm4Command& c) {
                   }
                   uint32_t v = (uint32_t)c.rel_value;
                   write_trap_scan("REL1", c.rel_addr, pre, &v, sizeof v, pkt_addr(c));
+                  if (rel1_forge_candidate) rel1_forge_note_landed();
                   memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 4, 1, pkt_addr(c));
                   poolshift_check("REL1", c.rel_addr, 4, c.rel_value, pkt_addr(c));

@@ -133,6 +133,14 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     suppresses on content, which #1245 proved cannot separate a live label from a freed block, so it
     will also drop legitimate inits. It exists so "is this write load-bearing for the corruption?"
     can be answered by removing it.
+    **`PROSPER_REL1_FORGE_SUPPRESS_ALL=1`** is the matching fence-side A/B arm for #1226. It
+    suppresses every 32-bit ReleaseMem write that would turn a pointer-shaped qword with a zero low
+    dword into `pointer|value`, including live paired fences that real hardware must execute. It is
+    therefore diagnostic-only and unsuitable for normal play. A valid run must print
+    `FORGE-DECISION-TOTALS` with `candidates == suppressed` and `landed == 0`; the first candidate
+    and every 256th print so an early fault still proves the lever moved. Combine it with
+    `PROSPER_INIT_SUPPRESS=ptr` for the decisive landed-forges-zero plus init-suppressed arm. A
+    malformed selector prints `NOT ARMED` rather than silently becoming a negative result.
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
   `--seconds 1` for wall-clock sampling, warmup or `--render-every N --render-every-for-seconds S`
   for slow software rendering,
