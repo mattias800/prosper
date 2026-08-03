@@ -472,12 +472,32 @@ HLE(g_vo_resstatus)   {
 // enforceable by reading this one file, so nothing outside it may reach these.
 namespace {
 constexpr uint64_t kVblankNs = 16683350;             // 59.94 Hz period
+// Deterministic clock used only by test_videoout's phase-integration check. Zero leaves the
+// production steady clock and sleep path untouched. Keeping the seam here, underneath both public
+// HLE calls, lets the test prove their shared grid without making host scheduler latency part of
+// the assertion.
+std::atomic<uint64_t> g_vblank_test_now_ns{0};
 uint64_t vblank_now_ns() {
+    const uint64_t test_now = g_vblank_test_now_ns.load(std::memory_order_relaxed);
+    if (test_now) return test_now;
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 uint64_t vblank_epoch_ns() { static const uint64_t t0 = vblank_now_ns(); return t0; }
+void vblank_sleep_until_ns(uint64_t deadline_ns) {
+    if (g_vblank_test_now_ns.load(std::memory_order_relaxed)) {
+        g_vblank_test_now_ns.store(deadline_ns, std::memory_order_relaxed);
+        return;
+    }
+    std::this_thread::sleep_until(std::chrono::steady_clock::time_point(
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::nanoseconds(deadline_ns))));
+}
 }  // namespace
+
+extern "C" void prosper_vo_set_vblank_now_for_test(uint64_t now_ns) {
+    g_vblank_test_now_ns.store(now_ns, std::memory_order_relaxed);
+}
 
 // sceVideoOutGetVblankStatus (SceVideoOutVblankStatus, 0x28 bytes — Kyty VideoOut.cpp:94:
 // u64 count @0, u64 processTime @8, u64 tsc @0x10, u64 reserved @0x18, u8 flags @0x20).
@@ -541,11 +561,10 @@ HLE(g_vo_wait_vblank) {
     // Next strictly-future boundary: a caller that is already exactly on one still waits a full
     // period, which is what "wait for the NEXT vblank" means.
     const uint64_t next = t0 + ((now - t0) / kVblankNs + 1) * kVblankNs;
-    // F5: duration_cast rather than a nanoseconds->time_point construction, which only compiles
-    // because steady_clock::duration happens to be nanoseconds on every toolchain we build with.
-    std::this_thread::sleep_until(std::chrono::steady_clock::time_point(
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::nanoseconds(next))));
+    // F5: vblank_sleep_until_ns uses duration_cast rather than a nanoseconds->time_point
+    // construction, which only compiles because steady_clock::duration happens to be nanoseconds
+    // on every toolchain we build with.
+    vblank_sleep_until_ns(next);
     return 0;
 }
 

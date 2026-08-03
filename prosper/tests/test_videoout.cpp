@@ -20,6 +20,7 @@ extern "C" uint64_t prosper_vo_display_format();
 extern "C" uint64_t prosper_vo_buffer_addr(int i);
 extern "C" uint64_t prosper_vo_flip_count();
 extern "C" int prosper_vo_flip_rate();
+extern "C" void prosper_vo_set_vblank_now_for_test(uint64_t now_ns);
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx,
                                            uint32_t flip_mode, int64_t flip_arg);
 
@@ -285,61 +286,47 @@ int main() {
         // "shared timebase" claim: a game that waits and then reads must land ON the tick it
         // waited for, not between two.
         //
-        // GetVblankStatus reports processTime as microseconds since the shared epoch, so the
-        // residue of that against the period says where in the period the wait left us.
+        // This must not depend on host scheduling. #1770's minimum-residue sampler wrapped after
+        // long overshoots; #1793 found that its replacement's admission rule was also invalid. A
+        // wait between consecutive late wakes takes approximately
         //
-        // #1770: an earlier form of this took the MINIMUM over six samples and argued that
-        // overshoot "can only move a residue later", making the minimum robust. That is wrong:
-        // the residue is taken MODULO the period, so an overshoot beyond one period WRAPS and
-        // lands anywhere in [0, period). The minimum of a wrapping quantity is a random draw, not
-        // a floor — which is why this was a coin flip on the emulated x86_64/Rosetta runner while
-        // passing every time on native arm64. Roughly P(pass) = 0.81 per run, on a required check.
+        //     period - previous_lateness + current_lateness
         //
-        // The fix is to discard samples whose residue cannot be trusted, and the admissibility
-        // bound has to be the DECISION THRESHOLD, not one period. Simulating the two rules over
-        // overshoots uniform in [0, 3 periods), 12 samples, 400 trials each:
-        //
-        //     admit overshoot <      false failures   detects a half-period shift
-        //     no filter (old)             17/400            13/400
-        //     < 1 period                 135/400           141/400
-        //     < 4 ms (this)                0/400           267/400
-        //
-        // Filtering at one period is WORSE than not filtering, because discarding samples raises
-        // the minimum: the old form's wrapped residues are uniform, so more of them push the
-        // minimum down. Note also that the old check barely detected the real defect either —
-        // 13/400 — so it was both flaky and weak. Admitting only near-boundary wakes makes the
-        // residue mean what the assertion says it means.
+        // rather than `period + current_lateness`, so consistent Rosetta lateness cancels and an
+        // out-of-phase sample is incorrectly admitted. Drive the real HLE calls with deterministic
+        // time instead: WaitVblank's test sleeper advances the same clock GetVblankStatus reads.
         constexpr uint64_t kPeriodNs = 16683350ull;
-        constexpr uint64_t kPhaseThreshNs = 4000000ull;
-        uint64_t min_phase_ns = UINT64_MAX;
-        int admissible = 0;
-        for (int i = 0; i < 12; ++i) {
-            const auto t0 = std::chrono::steady_clock::now();
-            waitvbl(handle, 0, 0, 0, 0, 0);
-            const uint64_t took_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                         std::chrono::steady_clock::now() - t0).count();
-            vbl(handle, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0);
-            // A wait spans one period plus its overshoot. Admit only wakes that landed within the
-            // decision threshold of their boundary; anything later cannot distinguish a shared
-            // epoch from a shifted one, whether or not its residue has wrapped.
-            if (took_ns >= kPeriodNs + kPhaseThreshNs) continue;
-            const uint64_t phase_ns = (*(uint64_t*)(vb + 0x08) * 1000ull) % kPeriodNs;
-            if (phase_ns < min_phase_ns) min_phase_ns = phase_ns;
-            ++admissible;
-        }
-        // A half-period-shifted private epoch floors at ~8.34 ms and cannot produce a small
-        // minimum however many admissible samples are taken, so 4 ms still discriminates it.
-        // If the host is loaded enough that NO sample is admissible, say so rather than failing on
-        // an unmeasurable quantity — a check that reports "could not measure" is honest, where one
-        // that fails on host load teaches everyone to ignore it.
-        if (admissible == 0) {
-            fprintf(stderr, "  SKIP WaitVblank PHASE: no admissible sample in 12 "
-                            "(every wait overshot a full period; host too loaded to measure)\n");
-        } else {
-            CHECK(min_phase_ns < kPhaseThreshNs,
-                  "WaitVblank shares GetVblankStatus's PHASE, not just its period "
-                  "(wakes land on a boundary of the same grid)");
-        }
+        vbl(handle, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0);
+        const uint64_t live_tsc = *(uint64_t*)(vb + 0x10);
+        const uint64_t live_process_ns = *(uint64_t*)(vb + 0x08) * 1000ull;
+        constexpr uint64_t kStartPhaseNs = 3 * kPeriodNs / 4;
+        const uint64_t advance_ns =
+            (kStartPhaseNs + kPeriodNs - live_process_ns % kPeriodNs) % kPeriodNs;
+        const uint64_t fake_start_ns = live_tsc + advance_ns;
+        prosper_vo_set_vblank_now_for_test(fake_start_ns);
+
+        vbl(handle, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0);
+        const uint64_t fake_c0 = *(uint64_t*)vb;
+        CHECK(*(uint64_t*)(vb + 0x10) == fake_start_ns,
+              "WaitVblank PHASE test clock is active through GetVblankStatus");
+        CHECK(waitvbl(handle, 0, 0, 0, 0, 0) == 0,
+              "WaitVblank accepts a live handle under deterministic time");
+        vbl(handle, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0);
+        const uint64_t fake_end_ns = *(uint64_t*)(vb + 0x10);
+        CHECK(fake_end_ns > fake_start_ns && fake_end_ns <= fake_start_ns + kPeriodNs &&
+                  *(uint64_t*)vb == fake_c0 + 1,
+              "WaitVblank advances deterministic time to exactly the next status tick");
+
+        const uint64_t phase_ns = (*(uint64_t*)(vb + 0x08) * 1000ull) % kPeriodNs;
+        const uint64_t phase_distance_ns =
+            phase_ns < kPeriodNs - phase_ns ? phase_ns : kPeriodNs - phase_ns;
+        // processTime is reported in whole microseconds, so an exact boundary can reconstruct up
+        // to 999 ns below zero. Circular distance keeps that ABI quantisation from looking like a
+        // nearly-full-period phase error. A half-period private epoch remains ~8.34 ms away.
+        CHECK(phase_distance_ns < 1000,
+              "WaitVblank shares GetVblankStatus's PHASE, not just its period "
+              "(wakes land on a boundary of the same grid)");
+        prosper_vo_set_vblank_now_for_test(0);
     }
 
     // Device capability: plain SDR display (capability 0).
