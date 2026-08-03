@@ -233,19 +233,21 @@ instrument trap 63 in `GAME_COMPAT_ORCHESTRATION.md`.
   readback. It returned the same `792bed5a3f02a383` uniformly-black pixels and byte-identical BMP as
   operation 4 and the op6 destination. Both resolves therefore copy black to black in this capture;
   neither loses useful color. This is localization evidence only; rung remains 0.
+- **An omitted immediately preceding submit as operation 4's black temporal input:** a bounded two-frame
+  whole-frame capture contains consecutive submits 180 and 181. Resolve-aware scanning identifies submit
+  180 operation 4 as the last semantic writer of submit 181 operation 4's same run-local `0x2033b10000`
+  target; later `MODE=RESOLVE` operations read that color0 surface and write color1 rather than overwriting
+  it. Submit 181's exact temporal seed is uniformly black and byte-identical to submit 180's pre-submit
+  seed, so the included previous frame introduced no useful color. This does not yet distinguish operation
+  4 actively writing black from producing no fragments and preserving an already-black target. #1599.
 - **A renderer-disabled title boot as a GPU-free experiment:** live compute remains active without
   `PROSPER_RENDER` and initializes Vulkan when the title dispatches supported compute.
 
 ## Next discriminators
 
-1. Operation 11 is the final graphics operation: it consumes op10's now-proven-black
-   `0x2011800000` and writes the already-observed black 1920x1080 target `0x2018490000`. Operations
-   12 and 13 are later compute dispatches with no render target, so none of 11–13 can be the missing
-   producer for this present. The next single target is therefore cross-submit history: locate the
-   most recent pre-submit writer of operation 4's `0x2033b10000`, then retain its exact post-write
-   pixels or prove that the temporal chain was already zero. This one-submit bundle cannot answer
-   that question, and another cutoff inside operations 11–13 cannot add information. The address is
-   valid only for this retained run; any fresh capture must re-derive its own target identity.
+1. Separate operation 4 actively writing black from producing no fragments and preserving its black
+   input. The consecutive-frame capture includes its previous semantic writer and exact boundary pixels,
+   but pixel equality alone cannot distinguish those two mechanisms.
 2. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
    dispatch ran and reproduces its device loss; two failures in six runs are not a stable cause.
 3. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
