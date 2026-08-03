@@ -9,6 +9,8 @@
 #include "../src/gpu/render_state.hpp"
 #include "../frontends/shared/rtt_scale.hpp"
 #include "../frontends/shared/vulkan_device_select.hpp"
+#include "../frontends/shared/performance_timing_gate.hpp"
+#include "../frontends/shared/performance_timing_policy.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -2832,7 +2834,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                   std::span<const BackendDraw> logical_ds_draws = {},
                                                   BackendMrtOutputs* mrt_outputs = nullptr) {
     using TimingClock = std::chrono::steady_clock;
-    const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const bool timing_log_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const prosper::frontend::PerformanceTimingMode timing_mode =
+        prosper::frontend::performance_timing_mode(
+            timing_log_enabled, prosper::frontend::interactive_performance_timing());
+    const bool timing_enabled = timing_mode.measure;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     if (timing_enabled) backend_render_timing_stats_storage() = {};
     BackendColorTargetStats& color_target_stats = backend_color_target_stats_storage();
@@ -6404,6 +6410,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.res_buffer_copy_ms = res_buffer_copy_ms;
         call_timing.res_descriptor_ms = res_descriptor_ms;
         call_timing.setup_pipeline_ms = setup_pipeline_ms;
+        // The live F8 caller consumes call_timing above. Only the explicit environment switch owns
+        // the backend lifetime aggregates and optional periodic stderr windows below.
+        if (!timing_mode.log) return out;
         struct TimingTotals {
             uint64_t calls = 0, draws = 0;
             uint64_t command_buffers = 0, queue_submits = 0, fence_waits = 0;

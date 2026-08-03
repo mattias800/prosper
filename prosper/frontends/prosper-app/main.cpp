@@ -34,6 +34,7 @@
 #include "game_path.hpp"                 // dropped/picked path -> app0 root + open action, pure seam
 #include "game_library.hpp"              // scan a games dir -> titles + metadata, pure seam
 #include "frame_grab_naming.hpp"         // one stamp + one exclusively claimed name pair per F9 grab
+#include "performance_capture.hpp"        // bounded F8 pre/post performance artifact
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
 #ifdef PROSPER_HAVE_LIBRARY_UI
 #include "library_ui.hpp"                // the ImGui library grid drawn while no game is running
@@ -1283,6 +1284,8 @@ int main(int argc, char** argv) {
                     "screenshot named frame_grab_<titleId>_<date>-<time>-<ms>.* (to "
                     "PROSPER_CAPTURE_DIR, default cwd) for gpu_replay debugging "
                     "(brief hitch on press; PROSPER_CAPTURE_FRAMES>1 grabs an animation).\n");
+    fprintf(stderr, "[app] F8 = capture 5 seconds before + 5 seconds after the press into a bounded "
+                    ".prperf performance report (to PROSPER_CAPTURE_DIR, default cwd).\n");
 
     const bool frameTrace = getenv("PROSPER_APP_FRAME_TRACE") != nullptr;
     const char* stallDumpEnv = getenv("PROSPER_APP_STALL_DUMP_MS");
@@ -1311,10 +1314,12 @@ int main(int argc, char** argv) {
     const std::string grabDir = getenv("PROSPER_CAPTURE_DIR") ? getenv("PROSPER_CAPTURE_DIR") : ".";
     prosper::frontend::FrameGrabNamer grabNamer;
     grabNamer.set_directory(grabDir);
+    CaptureTitle activeCaptureTitle = capture_title_for(dump);
     {
-        const CaptureTitle ct = capture_title_for(dump);
-        grabNamer.set_title(ct.id, ct.label);
+        grabNamer.set_title(activeCaptureTitle.id, activeCaptureTitle.label);
     }
+    prosper::perf::InteractivePerformanceCapture& perfCapture =
+        prosper::perf::interactive_performance_capture();
     // 0 = keep the built-in default; the timeline clamps whatever is supplied to 64..3072 MiB.
     // Parse strictly, matching the two checked parses of this same variable in gpu_timeline.cpp. An
     // unchecked strtoul truncates into uint32_t, so 4294967360 would arrive as 64 — silently the
@@ -1503,8 +1508,8 @@ int main(int argc, char** argv) {
             // A title opened after startup owns the captures from here on: name them after IT, not
             // after the empty window this process started as.
             {
-                const CaptureTitle ct = capture_title_for(root);
-                grabNamer.set_title(ct.id, ct.label);
+                activeCaptureTitle = capture_title_for(root);
+                grabNamer.set_title(activeCaptureTitle.id, activeCaptureTitle.label);
             }
 #ifdef PROSPER_HAVE_LIBRARY_UI
             // Hand the swapchain back before the guest's first frame: from here the game present path
@@ -1537,6 +1542,27 @@ int main(int argc, char** argv) {
     }
 
     while (running && !prosper_stop_requested()) {
+        // F8's only always-on work is this 4 Hz sample. `sample_due` is one atomic read, so the
+        // process CPU/RSS query is not paid on every UI-loop iteration.
+        const uint64_t perfNow = prosper::perf::monotonic_now_ns();
+        if (perfCapture.sample_due(perfNow)) {
+            perfCapture.observe_sample(prosper::perf::collect_process_sample(
+                perfNow, gpu::present_count(), gpu::present_frame_seq(), shown));
+        }
+        prosper::perf::CaptureOutcome perfOutcome;
+        if (perfCapture.take_outcome(perfOutcome)) {
+            if (perfOutcome.ok) {
+                std::fprintf(stderr,
+                    "[perf] capture written (pre=%zu post=%zu renderer=%zu compute=%zu "
+                    "dropped=%zu/%zu) -> %s\n",
+                    perfOutcome.pre_samples, perfOutcome.post_samples,
+                    perfOutcome.renderer_records, perfOutcome.compute_records,
+                    perfOutcome.renderer_dropped, perfOutcome.compute_dropped,
+                    perfOutcome.path.c_str());
+            } else {
+                std::fprintf(stderr, "[perf] F8 capture FAILED: %s\n", perfOutcome.error.c_str());
+            }
+        }
         openedThisBatch = rejectedThisBatch = false;
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -1560,6 +1586,35 @@ int main(int argc, char** argv) {
                 key.f11 = ev.key.key == SDLK_F11;
                 key.enter = ev.key.key == SDLK_RETURN || ev.key.key == SDLK_KP_ENTER;
                 key.alt = (ev.key.mod & SDL_KMOD_ALT) != 0;
+                // Interactive performance capture: unlike F9 this retains no GPU commands, pixels,
+                // or ordinary frame dumps. It freezes the cheap rolling counter ring and enables
+                // structured renderer/compute timing only for the five seconds after this press.
+                // F8 is host-owned and is not forwarded to the guest IME/pad path.
+                if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
+                    ev.key.key == SDLK_F8) {
+                    const uint64_t armedAt = prosper::perf::monotonic_now_ns();
+                    if (perfCapture.sample_due(armedAt)) {
+                        perfCapture.observe_sample(prosper::perf::collect_process_sample(
+                            armedAt, gpu::present_count(), gpu::present_frame_seq(), shown));
+                    }
+                    const prosper::perf::CaptureArmResult armed = perfCapture.arm(
+                        grabDir, activeCaptureTitle.id, activeCaptureTitle.label,
+                        prosper::perf::build_revision(), armedAt,
+                        std::chrono::system_clock::now());
+                    if (armed.ok) {
+                        std::fprintf(stderr,
+                            "[perf] F8 #%u armed for %s: retained %zu pre-trigger samples; "
+                            "collecting %.1f seconds after the press\n",
+                            armed.index,
+                            activeCaptureTitle.label.empty() ? "the current process"
+                                                             : activeCaptureTitle.label.c_str(),
+                            armed.pre_samples, armed.post_seconds);
+                    } else {
+                        std::fprintf(stderr, "[perf] F8 #%u not armed: %s\n",
+                                     armed.index, armed.error.c_str());
+                    }
+                    continue;
+                }
                 // Interactive frame grab: F9 arms a one-shot capture of the next COMPLETE frame (every
                 // submit between the next two presents) into a replayable .prgbundle, plus a screenshot.
                 // The whole-frame bundle re-runs the frame's producer submits on replay, so renderer-owned
@@ -2165,6 +2220,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    perfCapture.cancel();     // never publish a short/incomplete .prperf on a graceful early exit
     prosper_request_stop();   // signal the guest run-loop to wind down at its next boundary
     fprintf(stderr, "[app] shutting down after %llu presented frame(s)\n", (unsigned long long)shown);
     const int exitCode = (exitAfter && (int)shown < exitAfter) ? 1 : 0;

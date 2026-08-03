@@ -81,6 +81,16 @@ if(PROSPER_SRC)
   endif()
 endif()
 
+# Bounded interactive performance capture (F8): pure host-side state + serialization shared by the
+# SDL app and the live graphics/compute backends. It deliberately has no SDL/Vulkan dependency, so
+# its ring, bounds, and atomic file contract run in ordinary headless CI.
+add_library(prosper_performance_capture STATIC frontends/shared/performance_capture.cpp)
+target_include_directories(prosper_performance_capture PUBLIC frontends/shared)
+if(PROSPER_GIT_REVISION)
+  target_compile_definitions(prosper_performance_capture
+    PRIVATE PROSPER_GIT_REVISION="${PROSPER_GIT_REVISION}")
+endif()
+
 # --- tests (agentic-first: self-checking, exit-code = truth) -------------
 enable_testing()
 find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -420,6 +430,17 @@ if(TARGET prosper_core)
   add_executable(test_prosper_app_frame_grab_naming frontends/prosper-app/test_frame_grab_naming.cpp)
   target_include_directories(test_prosper_app_frame_grab_naming PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_frame_grab_naming COMMAND test_prosper_app_frame_grab_naming)
+
+  # F8's pre-trigger ring and post-trigger timing artifact: pure state machine + filesystem test,
+  # including bounded overflow accounting and temporary-to-final atomic publication.
+  add_executable(test_performance_capture frontends/shared/test_performance_capture.cpp)
+  target_link_libraries(test_performance_capture PRIVATE prosper_performance_capture)
+  add_test(NAME performance_capture COMMAND test_performance_capture)
+
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME performance_capture_report_logic
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_performance_capture_report.py")
+  endif()
 
   # Library grid selection movement (#1471): arithmetic only, so the navigation rules are covered in
   # normal CI rather than by someone pressing arrow keys. No ImGui, no SDL, no window.
@@ -949,7 +970,8 @@ if(TARGET prosper_core)
                                                frontends/shared/live_compute.cpp
                                                frontends/shared/present_blit.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
-      target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
+      target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan
+                                                   prosper_performance_capture)
       target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
       # A LiveTargetPixelFormat mapping that quietly falls back to RGBA8 has now cost two titles a
       # whole render layer (#773 Dead Cells, and Syberia's black 3D menu). frontends/shared/
@@ -1080,7 +1102,8 @@ if(TARGET prosper_core)
                                                frontends/shared/live_compute.cpp
                                                frontends/shared/present_blit.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
-      target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
+      target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan
+                                                   prosper_performance_capture)
       target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
       # A LiveTargetPixelFormat mapping that quietly falls back to RGBA8 has now cost two titles a
       # whole render layer (#773 Dead Cells, and Syberia's black 3D menu). frontends/shared/
@@ -1473,7 +1496,8 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp
                                frontends/prosper-app/library_media.cpp)
     target_include_directories(prosper-app PRIVATE src third_party/stb)
-    target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan prosper_imgui)
+    target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan prosper_imgui
+                                              prosper_performance_capture)
     target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_LIBRARY_UI=1)
     # Share the live renderer with boot_trace so the window shows composited game frames (not blank).
     if(TARGET prosper_live_renderer)

@@ -223,6 +223,32 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   `--thread REGEX` isolates one thread, `--mode folded` emits flamegraph stacks. Complements
   `guest_bt` (which does the GUEST/managed-C# side). `--self-test` checks the symbol parser.
   See `hostprof/README.md`.
+- **F8 interactive performance capture / `perf/performance_capture_report.py`** — while playing in
+  `prosper-app`, press **F8** when performance is bad. The app keeps a cheap 4 Hz rolling ring of
+  process CPU/RSS plus guest-flip, rendered-frame, and host-present counts; the press freezes the
+  preceding 5 seconds and enables the existing structured renderer/compute timers for the following
+  5 seconds. It then atomically publishes one bounded
+  `perf_capture_<titleId>_<timestamp>.prperf` under `PROSPER_CAPTURE_DIR` (default cwd). No GPU command
+  capture, screenshot, or ordinary frame dump is enabled by F8. Detailed renderer and compute records
+  are capped at 4096 each, and the footer reports exact retained and dropped counts — never read the
+  cap as the population. Missing Vulkan timestamp samples are explicit: the report leaves GPU device
+  time unavailable and reports total GPU wait without inventing a device/host-overhead split. F8
+  enables structured timing clocks but not the existing high-volume periodic stderr timing logs. A
+  graceful exit before the window completes removes the private `.part` rather than publishing a
+  short final file.
+
+  Inspect it offline with:
+
+  ```bash
+  python3 tools/perf/performance_capture_report.py capture.prperf
+  ```
+
+  The report separates evidence for CPU work outside the timed renderer, renderer resource work,
+  GPU device/wait/readback cost, compute batches, and frame-pacing gaps. It deliberately reports
+  unavailable/inconclusive fields instead of inventing a verdict. This is a broad localizer, not a
+  stack sampler: after it points at host CPU, use `hostprof`; after it points at a graphics phase,
+  use the existing focused timing/capture tools. The always-on pre-trigger cost is one atomic due
+  check per app loop and one process sample every 250 ms; detailed clocks run only post-trigger.
 - **`perf/compute_phase_report.py`** — roll up the **compute** side of a run, the way
   `PROSPER_RENDER_TIMING` already rolls up graphics. `PROSPER_COMPUTE_PHASE_TIMING=1` and
   `PROSPER_COMPUTE_IMAGE_TIMING=1` emit a 17-timer decomposition *per dispatch*, which is unreadable
