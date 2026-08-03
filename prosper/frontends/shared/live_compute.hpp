@@ -196,10 +196,10 @@ void live_compute_fail_next_storage_readback_for_test();
 
 // Deterministic controls for post-DCC cache-promotion regressions.  The first leaves the next
 // writable metadata plane unresolved, exercising the final all-0xff recheck.  The second models a
-// cache-capacity refusal after successful writeback; both must keep the transient fallback owned by
-// the caller and publish no cache/export authority.
+// real replacement cache-capacity preflight after successful writeback; both must keep the
+// transient fallback owned by the caller and publish no cache/export authority.
 void live_compute_leave_next_dcc_metadata_compressed_for_test();
-void live_compute_fail_next_dcc_promotion_admission_for_test();
+void live_compute_limit_next_image_replacement_for_test();
 
 // Deterministically lower the next eligible cold storage admission crossover to zero. This lets a
 // compact production-backend fixture execute the real deferral predicate and retention branch.

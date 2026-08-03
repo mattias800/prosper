@@ -211,7 +211,7 @@ std::atomic<uint64_t> g_compute_storage_transfer_seeds{0};
 std::atomic<uint64_t> g_dcc_post_writeback_promotions{0};
 std::atomic<bool> g_fail_next_storage_readback_for_test{false};
 std::atomic<bool> g_leave_next_dcc_metadata_compressed_for_test{false};
-std::atomic<bool> g_fail_next_dcc_promotion_admission_for_test{false};
+std::atomic<bool> g_limit_next_image_replacement_for_test{false};
 std::atomic<bool> g_zero_next_cold_storage_snapshot_minimum_for_test{false};
 std::atomic<bool> g_force_next_image_result_host_fallback_for_test{false};
 std::atomic<bool> g_fail_next_image_result_buffer_retain_for_test{false};
@@ -1826,7 +1826,12 @@ struct VulkanComputeContext {
             return retain_image(key, image, memory, allocation_bytes, source);
         if (exact->second.pins) return false;
 
-        const VkDeviceSize limit = persistent_compute_image_limit(this->memory);
+        VkDeviceSize limit = persistent_compute_image_limit(this->memory);
+        // Exercise the real capacity preflight, rather than bypassing this function at its caller.
+        // The exact entry must remain untouched when the incoming allocation cannot fit.
+        if (g_limit_next_image_replacement_for_test.exchange(
+                false, std::memory_order_acq_rel))
+            limit = allocation_bytes ? allocation_bytes - 1u : 0u;
         if (allocation_bytes > limit || exact->second.allocation_bytes > image_cache_bytes)
             return false;
         const VkDeviceSize retained_without_exact =
@@ -5137,6 +5142,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     adaptive_storage_result_validation_enabled();
                 const bool transfer_native_defined =
                     transfer_native_format != VK_FORMAT_UNDEFINED;
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[compute]   native transfer gate binding=%u dimension=%u "
+                                 "hostless=%u format-match=%u validation=%u defined=%u "
+                                 "storage-format=%u sampled-format=%u\n",
+                                 bi.binding, native_transfer_dimension ? 1u : 0u,
+                                 transfer_hostless ? 1u : 0u,
+                                 transfer_format_match ? 1u : 0u,
+                                 transfer_validation_enabled ? 1u : 0u,
+                                 transfer_native_defined ? 1u : 0u,
+                                 static_cast<unsigned>(transfer_native_format),
+                                 static_cast<unsigned>(image_format));
                 ComputeTransferBorrowResult transfer_borrow_result =
                     ComputeTransferBorrowResult::NotAttempted;
                 if (bi.cache_candidate) {
@@ -5350,7 +5367,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         storage_cache_gates,
                         bi.dcc_metadata && bi.dcc_metadata_bytes,
                         bi.alias_of == SIZE_MAX,
-                        true,
                     });
                 if (bi.cache_candidate) {
                     const auto cache_lookup_start = ComputeClock::now();
@@ -7288,9 +7304,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool final_dcc_cache_safe = bi.dcc_metadata && bi.dcc_metadata_bytes &&
                 std::all_of(bi.dcc_metadata, bi.dcc_metadata + bi.dcc_metadata_bytes,
                             [](uint8_t value) { return value == 0xff; });
-            if (bi.post_writeback_promotion_candidate && final_dcc_cache_safe &&
-                !g_fail_next_dcc_promotion_admission_for_test.exchange(
-                    false, std::memory_order_acq_rel)) {
+            if (bi.post_writeback_promotion_candidate && final_dcc_cache_safe) {
                 const uint8_t* retained_source =
                     (adaptive_storage_result_validation_enabled() &&
                      cold_storage_result_snapshot_can_defer(
@@ -7641,8 +7655,8 @@ void live_compute_leave_next_dcc_metadata_compressed_for_test() {
         true, std::memory_order_release);
 }
 
-void live_compute_fail_next_dcc_promotion_admission_for_test() {
-    g_fail_next_dcc_promotion_admission_for_test.store(
+void live_compute_limit_next_image_replacement_for_test() {
+    g_limit_next_image_replacement_for_test.store(
         true, std::memory_order_release);
 }
 

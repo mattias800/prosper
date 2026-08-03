@@ -41,16 +41,15 @@ struct ComputeStoragePostWritebackPromotionInputs {
     ComputeStorageCacheGateInputs pre_dispatch{};
     bool writable_dcc_metadata = false;
     bool unique_alias_owner = false;
-    bool exact_cache_key = false;
 };
 
 constexpr bool compute_storage_post_writeback_promotion_candidate(
     const ComputeStoragePostWritebackPromotionInputs& inputs) {
     const ComputeStorageCacheGateInputs& gates = inputs.pre_dispatch;
     return !gates.renderer_owned && !gates.dcc_cache_safe &&
-           !gates.poison_verify && (gates.exact_storage || gates.seed_skip) &&
+           !gates.poison_verify && gates.exact_storage &&
            gates.persistent_enabled && inputs.writable_dcc_metadata &&
-           inputs.unique_alias_owner && inputs.exact_cache_key;
+           inputs.unique_alias_owner;
 }
 
 struct ComputeTransferGateSelector {

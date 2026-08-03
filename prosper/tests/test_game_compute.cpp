@@ -1709,23 +1709,50 @@ int main() {
             resource.dcc_metadata_host_data_size = dcc_metadata.size();
         }
     }
-    std::vector<uint32_t> dcc_spirv = recompile_valu(
-        image_copy_2d, sizeof(image_copy_2d) / sizeof(image_copy_2d[0]), 1, 0, &dcc_rt);
-    CHECK(!dcc_spirv.empty(), "2D storage copy recompiles for a DCC-enabled tiled destination");
+    ComputeShaderConfig dcc_config;
+    dcc_config.user_sgprs.resize(16);
+    dcc_config.local_x = W;
+    dcc_config.local_y = dcc_config.local_z = 1;
+    dcc_config.threads_x = W;
+    dcc_config.threads_y = dcc_config.threads_z = 1;
+    dcc_config.native_storage_format_support =
+        native_storage_format_support_bit(DataFormat::Unorm8, 4);
+    std::vector<uint32_t> dcc_spirv = recompile_compute(
+        image_copy_2d, std::size(image_copy_2d), &dcc_rt, dcc_config);
+    const DescriptorValidationReport dcc_report = validate_spirv_descriptor_interface(
+        dcc_spirv, &dcc_rt, 0, SpirvShaderStage::Compute, false);
+    const SpirvDescriptorBinding* dcc_output_binding =
+        find_spirv_descriptor_binding(dcc_report, 0, 5);
+    const bool dcc_shape_ok = !dcc_spirv.empty() && dcc_report.ok() &&
+        dcc_output_binding && dcc_output_binding->storage_float &&
+        dcc_output_binding->writable;
+    CHECK(dcc_shape_ok,
+          "DCC producer recompiles to exact typed writable storage for sampled export");
     ComputeItem dcc_item;
     dcc_item.spirv = dcc_spirv;
     dcc_item.resources = std::make_shared<ShaderResourceTable>(dcc_rt);
     dcc_item.launch.threads_x = W;
+    dcc_item.launch.threads_y = dcc_item.launch.threads_z = 1;
     dcc_item.launch.local_x = 64;
     dcc_item.launch.groups_x = 1;
     dcc_item.launch.local_y = dcc_item.launch.local_z = 1;
     dcc_item.launch.groups_y = dcc_item.launch.groups_z = 1;
     dcc_item.code_addr = 0x719dcc;
-    if (!dcc_spirv.empty()) {
+    if (dcc_shape_ok) {
+        // The first sighting of a write-only storage kernel is deliberately a poison proving
+        // frame.  Promotion must stay fail-closed until that execution proves full coverage; then
+        // restore a compressed metadata state and require the proven seed-skip execution to publish
+        // the exact post-writeback image.
         const uint64_t promotions_before =
             prosper::frontend::live_compute_dcc_post_writeback_promotions();
         CHECK(prosper::frontend::execute_live_compute_items({dcc_item}),
-              "live backend writes the tiled DCC storage image");
+              "live backend proves coverage while writing the tiled DCC storage image");
+        CHECK(prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
+                  promotions_before,
+              "poison-proving DCC writeback publishes no cache authority");
+        std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x40);
+        CHECK(prosper::frontend::execute_live_compute_items({dcc_item}),
+              "proven full-coverage backend rewrites the tiled DCC storage image");
         CHECK(prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
                   promotions_before + 1,
               "successful exact DCC writeback promotes its transient storage image");
@@ -1780,6 +1807,8 @@ int main() {
         dcc_consumer_item.resources =
             std::make_shared<ShaderResourceTable>(dcc_consumer_rt);
         dcc_consumer_item.code_addr = 0x719dce;
+        ShaderResource sampled_dcc_output = dcc_output ? *dcc_output : ShaderResource{};
+        sampled_dcc_output.cls = ResourceClass::Texture;
         const auto run_dcc_consumer = [&]() {
             std::fill(dcc_copy_dst.begin(), dcc_copy_dst.end(), 0x6d);
             const uint64_t seeds_before =
@@ -1793,22 +1822,66 @@ int main() {
                            W, 1, dcc_tile, 0, 4);
             return std::tuple{executed, copied_linear, seeds_before, seeds_after};
         };
+        const auto run_dcc_ordered_handoff =
+            [&](prosper::frontend::LiveComputeImageImport* graphics_import) {
+                std::fill(dcc_copy_dst.begin(), dcc_copy_dst.end(), 0x6d);
+                ComputeItem ordered_producer = dcc_item;
+                ordered_producer.dispatch_index = 701;
+                ordered_producer.command_order = 10;
+                ComputeItem ordered_consumer = dcc_consumer_item;
+                ordered_consumer.dispatch_index = 702;
+                ordered_consumer.command_order = 20;
+                DrawItem ordered_draw;
+                ordered_draw.draw_index = 703;
+                ordered_draw.command_order = 30;
+                const uint64_t promotions_before =
+                    prosper::frontend::live_compute_dcc_post_writeback_promotions();
+                const uint64_t seeds_before =
+                    prosper::frontend::live_compute_storage_transfer_seeds();
+                const OrderedSubmitResult ordered = execute_ordered_items(
+                    {{SubmitOperationKind::Dispatch, ordered_producer.dispatch_index,
+                      ordered_producer.command_order},
+                     {SubmitOperationKind::Dispatch, ordered_consumer.dispatch_index,
+                      ordered_consumer.command_order},
+                     {SubmitOperationKind::Draw, ordered_draw.draw_index,
+                      ordered_draw.command_order}},
+                    {ordered_draw}, {ordered_producer, ordered_consumer},
+                    [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                        if (graphics_import)
+                            (void)prosper::frontend::import_live_compute_storage_image(
+                                sampled_dcc_output, tiled_bytes, *graphics_import);
+                        return RenderedFrame{};
+                    },
+                    [&](const std::vector<ComputeItem>& items) {
+                        return prosper::frontend::execute_live_compute_items(items);
+                    },
+                    1, 1);
+                const uint64_t promotions_after =
+                    prosper::frontend::live_compute_dcc_post_writeback_promotions();
+                const uint64_t seeds_after =
+                    prosper::frontend::live_compute_storage_transfer_seeds();
+                std::vector<uint8_t> copied_linear(W * 4, 0);
+                detile_surface(copied_linear.data(), dcc_copy_dst.data(),
+                               W, 1, dcc_tile, 0, 4);
+                return std::tuple{ordered.compute_executed, copied_linear,
+                                  promotions_before, promotions_after,
+                                  seeds_before, seeds_after};
+            };
         if (!dcc_consumer_spirv.empty()) {
-            auto [consumer_ok, copied_linear, seeds_before, seeds_after] =
-                run_dcc_consumer();
-            CHECK(consumer_ok && copied_linear == img_src,
+            std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x40);
+            prosper::frontend::LiveComputeImageImport pinned_import;
+            auto [consumer_ok, copied_linear, ordered_promotions_before,
+                  ordered_promotions_after, seeds_before, seeds_after] =
+                run_dcc_ordered_handoff(&pinned_import);
+            CHECK(consumer_ok && copied_linear == img_src &&
+                      ordered_promotions_after == ordered_promotions_before + 1,
                   "post-DCC sampled consumer receives every exact producer byte");
             CHECK(!native_2d_compute_transfer_available || seeds_after > seeds_before,
                   "post-DCC producer seeds its sampled consumer on-GPU");
             CHECK(native_2d_compute_transfer_available || seeds_after == seeds_before,
                   "disabled native transfer keeps the post-DCC sampled guest fallback");
 
-            ShaderResource sampled_dcc_output = *dcc_output;
-            sampled_dcc_output.cls = ResourceClass::Texture;
-            prosper::frontend::LiveComputeImageImport pinned_import;
-            CHECK(prosper::frontend::import_live_compute_storage_image(
-                      sampled_dcc_output, tiled_bytes, pinned_import) &&
-                      pinned_import.valid(),
+            CHECK(pinned_import.valid(),
                   "post-DCC graphics import pins the exact promoted cache entry");
             if (pinned_import.valid()) {
                 std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x40);
@@ -1840,12 +1913,17 @@ int main() {
             tile_surface(tiled_src.data(), img_src.data(), W, 1, dcc_tile, 0, 4);
             const uint64_t replacement_promotions_before =
                 prosper::frontend::live_compute_dcc_post_writeback_promotions();
-            CHECK(prosper::frontend::execute_live_compute_items({dcc_item}) &&
-                      prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
+            auto [replacement_ok, replacement_linear,
+                  ordered_replacement_promotions_before,
+                  ordered_replacement_promotions_after,
+                  replacement_seeds_before, replacement_seeds_after] =
+                run_dcc_ordered_handoff(nullptr);
+            CHECK(replacement_ok &&
+                      replacement_promotions_before ==
+                          ordered_replacement_promotions_before &&
+                      ordered_replacement_promotions_after ==
                           replacement_promotions_before + 1,
                   "unpinned exact-key collision is replaced after successful DCC writeback");
-            auto [replacement_ok, replacement_linear,
-                  replacement_seeds_before, replacement_seeds_after] = run_dcc_consumer();
             CHECK(replacement_ok && replacement_linear == img_src,
                   "replacement promotion preserves changed producer bytes exactly");
             CHECK(!native_2d_compute_transfer_available ||
@@ -1859,20 +1937,21 @@ int main() {
                       mismatched_dcc_output, tiled_bytes, mismatched_import),
                   "post-DCC graphics reuse requires the exact promoted cache key");
 
-            // A capacity refusal happens after exact writeback and DCC publication.  It must leave
-            // this dispatch transient, so the next sampled use reads the correct guest fallback
-            // without inheriting the older exact-key entry's transfer authority.
+            // Force the real replacement cache-limit preflight below this allocation after exact
+            // writeback and DCC publication. It must leave this dispatch transient, so the next
+            // sampled use reads the correct guest fallback without inheriting the older exact-key
+            // entry's transfer authority.
             std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x40);
             for (size_t index = 0; index < img_src.size(); ++index)
                 img_src[index] = static_cast<uint8_t>(index * 7u + 0x23u);
             tile_surface(tiled_src.data(), img_src.data(), W, 1, dcc_tile, 0, 4);
-            prosper::frontend::live_compute_fail_next_dcc_promotion_admission_for_test();
+            prosper::frontend::live_compute_limit_next_image_replacement_for_test();
             const uint64_t refused_promotions_before =
                 prosper::frontend::live_compute_dcc_post_writeback_promotions();
             CHECK(prosper::frontend::execute_live_compute_items({dcc_item}) &&
                       prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
                           refused_promotions_before,
-                  "post-DCC cache admission failure preserves the transient fallback");
+                  "post-DCC capacity preflight preserves the transient fallback");
             auto [refused_ok, refused_linear,
                   refused_seeds_before, refused_seeds_after] = run_dcc_consumer();
             CHECK(refused_ok && refused_linear == img_src,
@@ -1940,7 +2019,6 @@ int main() {
                   failed_sampled_output, tiled_bytes, failed_import),
               "failed DCC readback publishes no graphics cache authority");
     }
-
     // Two storage views may share base texels while only one carries DCC state. They are not safe
     // Vulkan-image aliases: collapsing the compressed view onto an uncompressed owner drops its
     // separate metadata writeback obligation and leaves later sampled users reading stale DCC.
