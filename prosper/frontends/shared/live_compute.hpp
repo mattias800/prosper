@@ -103,6 +103,16 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
 // available and preserves float_to_half's exact NaN payload/rounding contract.
 void storage_pack_float16x4_range(const uint32_t* channels, size_t texels, uint8_t* rgba16f);
 
+// Portable storage-image ABI shared by compute and graphics: guest texels are expanded into four
+// raw 32-bit VGPR channel values and bound through an unsigned-integer Vulkan image. The helpers
+// reject unknown formats, invalid component counts, and short spans instead of guessing a layout.
+uint32_t storage_image_guest_texel_bytes(prosper::gpu::DataFormat format,
+                                         uint32_t components);
+bool storage_image_unpack_raw_uvec4(const uint8_t* source, size_t source_bytes,
+                                    prosper::gpu::DataFormat format, uint32_t components,
+                                    size_t texels, uint32_t* channels,
+                                    size_t channel_dwords);
+
 // A typed Vulkan storage image already exposes the guest format as exact row-major bytes. For a
 // tiled guest surface the tiler can therefore read the mapped staging image directly, unless a
 // poison-proving dispatch still needs a mutable linear copy to restore untouched texels.

@@ -143,14 +143,18 @@ static std::vector<uint32_t> image_query_test_spirv() {
     return s;
 }
 
-static std::vector<uint32_t> storage_image_access_test_spirv(bool float_sampled_type = false) {
+static std::vector<uint32_t> storage_image_access_test_spirv(
+    SpirvImageNumericClass numeric_class = SpirvImageNumericClass::Uint) {
     // Two storage-image descriptors: binding 5 is read, binding 6 is independently write-only.
     // This is the shape that permits the compute backend to skip seeding binding 6 even though the
     // shader has an OpImageRead for binding 5.
     std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 24, 0};
     emit(s, 15, {5, 20, 0x6e69616d, 0});                    // OpEntryPoint Compute %20 "main"
-    if (float_sampled_type) emit(s, 22, {1, 32});           // %1 = f32
-    else emit(s, 21, {1, 32, 0});                          // %1 = u32
+    if (numeric_class == SpirvImageNumericClass::Float)
+        emit(s, 22, {1, 32});                              // %1 = f32
+    else
+        emit(s, 21, {1, 32,
+                     numeric_class == SpirvImageNumericClass::Sint ? 1u : 0u}); // %1 = i32/u32
     emit(s, 25, {2, 1, 1, 0, 0, 0, 2, 0});                // %2 = storage 2D image
     emit(s, 32, {3, 0, 2});                                // %3 = UniformConstant pointer
     emit(s, 59, {3, 4, 0}); emit(s, 59, {3, 5, 0});        // %4 source, %5 destination
@@ -619,15 +623,28 @@ int main() {
               storage_report.descriptors[0].texel_access &&
               !storage_report.descriptors[0].normalized_sampling &&
               !storage_report.descriptors[0].sampled_float &&
-              !storage_report.descriptors[0].storage_float,
+              !storage_report.descriptors[0].storage_float &&
+              storage_report.descriptors[0].image_numeric_class ==
+                  SpirvImageNumericClass::Uint,
           "storage-image texel access is classified per binding");
     const auto float_storage_report = validate_spirv_descriptor_interface(
-        storage_image_access_test_spirv(true), &storage_table, 0, SpirvShaderStage::Compute);
+        storage_image_access_test_spirv(SpirvImageNumericClass::Float),
+        &storage_table, 0, SpirvShaderStage::Compute);
     CHECK(float_storage_report.ok() && float_storage_report.descriptors.size() == 2 &&
               float_storage_report.descriptors[0].storage_float &&
               !float_storage_report.descriptors[0].sampled_float &&
-              float_storage_report.descriptors[1].storage_float,
+              float_storage_report.descriptors[1].storage_float &&
+              float_storage_report.descriptors[0].image_numeric_class ==
+                  SpirvImageNumericClass::Float,
           "storage-image reflection preserves the SPIR-V float sampled-type contract");
+    const auto sint_storage_report = validate_spirv_descriptor_interface(
+        storage_image_access_test_spirv(SpirvImageNumericClass::Sint),
+        &storage_table, 0, SpirvShaderStage::Compute);
+    CHECK(sint_storage_report.ok() && sint_storage_report.descriptors.size() == 2 &&
+              !sint_storage_report.descriptors[0].storage_float &&
+              sint_storage_report.descriptors[0].image_numeric_class ==
+                  SpirvImageNumericClass::Sint,
+          "storage-image reflection keeps signed and unsigned integer sampled types distinct");
     ShaderResource atomic_image = storage_src;
     atomic_image.binding = 7;
     atomic_image.format = DataFormat::Uint32;

@@ -7,6 +7,7 @@
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/diagnostic_selectors.hpp"
 #include "../src/gpu/render_state.hpp"
+#include "../src/gpu/shader_resources.hpp"
 #include "../frontends/shared/rtt_scale.hpp"
 #include "../frontends/shared/vulkan_device_select.hpp"
 #include "../frontends/shared/performance_timing_gate.hpp"
@@ -139,6 +140,12 @@ struct FrameResource {
     // layout. Keep the flag independent of tex_rgba because both sampled and storage images upload
     // decoded pixels through that pointer.
     bool is_storage_image = false;
+    // Reflected OpTypeImage Sampled Type versus the materialized Vulkan view. Storage descriptors
+    // without a proven class, or whose frontend could not produce the requested representation,
+    // fail before Vulkan command recording instead of relying on undefined format compatibility.
+    prosper::gpu::SpirvImageNumericClass storage_image_numeric_class =
+        prosper::gpu::SpirvImageNumericClass::Unknown;
+    bool storage_image_contract_valid = true;
     // Writable graphics storage images must publish their final linear texels before this backend call
     // returns. The live frontend uses this to restore the guest's linear/tiled layout and notify the
     // normal guest-write invalidation path, so later graphics, sampled aliases, compute, DMA, and CPU
@@ -234,6 +241,8 @@ inline VkFormat backend_color_format(VkFormat format) {
         return VK_FORMAT_R8G8_UNORM;
     if (format == VK_FORMAT_R32_UINT)
         return VK_FORMAT_R32_UINT;
+    if (format == VK_FORMAT_R32G32B32A32_UINT)
+        return VK_FORMAT_R32G32B32A32_UINT;
     if (format == VK_FORMAT_R32_SFLOAT)
         return VK_FORMAT_R32_SFLOAT;
     return VK_FORMAT_R8G8B8A8_UNORM;
@@ -241,10 +250,38 @@ inline VkFormat backend_color_format(VkFormat format) {
 
 inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
     format = backend_color_format(format);
+    if (format == VK_FORMAT_R32G32B32A32_UINT) return 16u;
     if (format == VK_FORMAT_R16G16B16A16_SFLOAT) return 8u;
     if (format == VK_FORMAT_R8_UNORM) return 1u;
     if (format == VK_FORMAT_R8G8_UNORM) return 2u;
     return 4u;
+}
+
+inline prosper::gpu::SpirvImageNumericClass backend_image_numeric_class(VkFormat format) {
+    using NumericClass = prosper::gpu::SpirvImageNumericClass;
+    switch (backend_color_format(format)) {
+        case VK_FORMAT_R32_UINT:
+        case VK_FORMAT_R32G32B32A32_UINT:
+            return NumericClass::Uint;
+        case VK_FORMAT_R8_UNORM:
+        case VK_FORMAT_R8G8_UNORM:
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R16G16B16A16_SFLOAT:
+        case VK_FORMAT_R32_SFLOAT:
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+            return NumericClass::Float;
+        default:
+            return NumericClass::Unknown;
+    }
+}
+
+inline bool backend_storage_image_numeric_contract_valid(const FrameResource& resource) {
+    if (!resource.is_storage_image) return true;
+    return resource.storage_image_contract_valid &&
+           resource.storage_image_numeric_class !=
+               prosper::gpu::SpirvImageNumericClass::Unknown &&
+           resource.storage_image_numeric_class ==
+               backend_image_numeric_class(resource.texture_format);
 }
 
 // The first exact guest-MSAA contract is intentionally narrow. Ordinary resources retain their
@@ -2871,7 +2908,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (draws.empty()) return out;
     for (const BackendDraw& draw : draws)
         for (const FrameResource& resource : draw.R)
-            if (!backend_texture_plane_span_valid(resource)) return out;
+            if (!backend_texture_plane_span_valid(resource) ||
+                !backend_storage_image_numeric_contract_valid(resource)) {
+                if (resource.is_storage_image) {
+                    static uint32_t storage_contract_warnings = 0;
+                    if (storage_contract_warnings++ < 32u)
+                        std::fprintf(
+                            stderr,
+                            "[render] storage image set=%u binding=%u sampled-type=%u "
+                            "view-format=%d materialized=%u rejected before Vulkan\n",
+                            resource.set, resource.binding,
+                            static_cast<unsigned>(resource.storage_image_numeric_class),
+                            static_cast<int>(backend_color_format(resource.texture_format)),
+                            resource.storage_image_contract_valid ? 1u : 0u);
+                }
+                return out;
+            }
     if (backend_has_unproven_submission()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) return out;

@@ -4393,12 +4393,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             bi.resource = r;
             bi.binding = image_descriptors[i].binding;
             bi.storage = image_descriptors[i].kind == SpirvDescriptorKind::StorageImage;
+            if (bi.storage &&
+                image_descriptors[i].image_numeric_class != SpirvImageNumericClass::Float &&
+                image_descriptors[i].image_numeric_class != SpirvImageNumericClass::Uint) {
+                skip_image(r, "storage image has unknown or unsupported signed numeric class");
+                break;
+            }
             const uint32_t descriptor_components =
                 r->num_components ? r->num_components : 1;
             const VkFormat native_storage_format =
                 native_storage_vk_format(r->format, descriptor_components);
-            const bool spirv_native_storage =
-                bi.storage && image_descriptors[i].storage_float;
+            const bool spirv_native_storage = bi.storage &&
+                image_descriptors[i].image_numeric_class == SpirvImageNumericClass::Float;
             bi.packed_r11_storage = bi.storage && !spirv_native_storage &&
                 !image_descriptors[i].atomic_access &&
                 image_descriptors[i].storage_image_format == kSpirvImageFormatR32ui &&
@@ -7706,6 +7712,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 }
 
 } // namespace
+
+uint32_t storage_image_guest_texel_bytes(prosper::gpu::DataFormat format,
+                                         uint32_t components) {
+    using prosper::gpu::DataFormat;
+    if (components < 1u || components > 4u || !storage_unpack_supported(format)) return 0;
+    if (format == DataFormat::Float10_11_11 ||
+        format == DataFormat::Unorm2_10_10_10)
+        return 4u;
+    const uint32_t component_bytes = prosper::gpu::data_format_bytes(format);
+    if (!component_bytes || component_bytes > UINT32_MAX / components) return 0;
+    return component_bytes * components;
+}
+
+bool storage_image_unpack_raw_uvec4(const uint8_t* source, size_t source_bytes,
+                                    prosper::gpu::DataFormat format, uint32_t components,
+                                    size_t texels, uint32_t* channels,
+                                    size_t channel_dwords) {
+    const uint32_t guest_texel = storage_image_guest_texel_bytes(format, components);
+    if (!source || !channels || !guest_texel || texels > SIZE_MAX / guest_texel ||
+        texels > SIZE_MAX / 4u || source_bytes < texels * guest_texel ||
+        channel_dwords < texels * 4u)
+        return false;
+    storage_unpack_range(source, guest_texel, format, components, texels, channels);
+    return true;
+}
 
 bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat format,
                                                   uint32_t components) {

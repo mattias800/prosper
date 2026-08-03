@@ -134,6 +134,11 @@ int main() {
         CHECK(prosper::test::backend_color_format(VK_FORMAT_R32_UINT) == VK_FORMAT_R32_UINT &&
                   prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R32_UINT) == 4,
               "R32_UINT storage images retain their typed four-byte Vulkan format");
+        CHECK(prosper::test::backend_color_format(VK_FORMAT_R32G32B32A32_UINT) ==
+                  VK_FORMAT_R32G32B32A32_UINT &&
+                  prosper::test::backend_color_bytes_per_pixel(
+                      VK_FORMAT_R32G32B32A32_UINT) == 16,
+              "portable raw-uvec4 storage images retain all four dword channels");
     }
 
     // A uniform DCC clear reaches the sampled image without a full CPU-sized pixel allocation or
@@ -927,6 +932,7 @@ int main() {
     {
         ShaderResourceTable storage_rt;
         { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+          image.format = DataFormat::Unorm8; image.num_components = 4;
           image.binding = 4; image.img_dim = 1; image.width = 2; image.height = 2;
           image.sgpr_base = 8; storage_rt.resources.push_back(image); }
         std::vector<uint32_t> storage_frag = recompile_fragment(
@@ -934,15 +940,45 @@ int main() {
         CHECK(!storage_frag.empty() && storage_frag[0] == 0x07230203u,
               "recompiled graphics image_load as a storage-image OpImageRead");
         if (!storage_frag.empty()) {
+            const DescriptorValidationReport storage_interface =
+                validate_spirv_descriptor_interface(
+                    storage_frag, &storage_rt, 1, SpirvShaderStage::Fragment, false);
+            const SpirvDescriptorBinding* storage_binding =
+                find_spirv_descriptor_binding(storage_interface, 1, 4);
+            CHECK(storage_binding && storage_binding->image_numeric_class ==
+                      SpirvImageNumericClass::Uint &&
+                      storage_binding->storage_image_format == 0u,
+                  "graphics storage image reflects the portable unsigned-integer ABI");
+            uint32_t storage_texels[2 * 2 * 4];
+            for (size_t i = 0; i < std::size(storage_texels); ++i) {
+                const float normalized = texels[i] / 255.0f;
+                std::memcpy(&storage_texels[i], &normalized, sizeof(normalized));
+            }
             prosper::test::FrameResource storage_resource;
             storage_resource.binding = 4; storage_resource.set = 1;
-            storage_resource.tex_rgba = texels; storage_resource.tw = 2; storage_resource.th = 2;
+            storage_resource.tex_rgba = reinterpret_cast<const uint8_t*>(storage_texels);
+            storage_resource.tw = 2; storage_resource.th = 2;
+            storage_resource.texture_format = VK_FORMAT_R32G32B32A32_UINT;
             storage_resource.is_storage_image = true;
+            storage_resource.storage_image_numeric_class =
+                storage_binding ? storage_binding->image_numeric_class
+                                : SpirvImageNumericClass::Unknown;
             prosper::test::BackendDraw storage_draw;
             storage_draw.vs = vert; storage_draw.fs = storage_frag;
             storage_draw.R = {storage_resource}; storage_draw.vcount = 3;
+            prosper::test::FrameResource mismatched_storage = storage_resource;
+            mismatched_storage.tex_rgba = texels;
+            mismatched_storage.texture_format = VK_FORMAT_R8G8B8A8_UNORM;
+            prosper::test::BackendDraw mismatched_draw = storage_draw;
+            mismatched_draw.R = {mismatched_storage};
+            CHECK(!prosper::test::backend_storage_image_numeric_contract_valid(
+                      mismatched_storage) &&
+                      prosper::test::render_draws_rgba({mismatched_draw}, W, H).empty(),
+                  "UINT storage shader plus UNORM view is rejected before Vulkan (#1713)");
             prosper::test::FrameResource sampled_resource = storage_resource;
             sampled_resource.is_storage_image = false;
+            sampled_resource.tex_rgba = texels;
+            sampled_resource.texture_format = VK_FORMAT_R8G8B8A8_UNORM;
             prosper::test::BackendDraw sampled_draw = storage_draw;
             sampled_draw.fs = recompile_fragment(
                 il_template, sizeof(il_template) / sizeof(il_template[0]), &rt);
@@ -996,6 +1032,7 @@ int main() {
             resource.tw = 1; resource.th = 1;
             resource.texture_format = VK_FORMAT_R32_UINT;
             resource.is_storage_image = true;
+            resource.storage_image_numeric_class = SpirvImageNumericClass::Uint;
             prosper::test::BackendDraw draw;
             draw.vs = vert; draw.fs = atomic_frag; draw.R = {resource}; draw.vcount = 3;
             const std::vector<uint8_t> returned =

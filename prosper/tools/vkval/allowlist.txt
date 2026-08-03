@@ -44,6 +44,11 @@
 # Amended by #1717, which FIXED `VUID-VkMappedMemoryRange-size-01389` and deleted its hardware-only
 # entry. The exact 60-byte mapping mutation reproduced one finding on RADV; the fixed whole-allocation
 # mapping produced none. The ledger is therefore now 6 ids on the CI runner and 7 on Fedora/RADV.
+#
+# Amended by #1713, which FIXED `VUID-vkCmdDraw-format-07753` and deleted its required entry. The
+# UINT-module/UNORM-view mutation reproduces the exact finding on RADV; the reflected numeric-class
+# contract plus raw-uvec4 materialization produces none. The ledger is now 5 ids on the CI runner
+# and 6 on Fedora/RADV.
 
 # ---- #1710: compute pipeline layout has no push-constant range, and nothing is ever pushed -----
 VUID-VkComputePipelineCreateInfo-layout-07987 | required | game_compute_exec, game_compute_exec_no_adaptive_storage_result | Compute module declares a PushConstant block while the layout declares no range (#1710)
@@ -51,9 +56,6 @@ VUID-vkCmdDispatch-maintenance4-08602 | environment-dependent | game_compute_exe
 
 # ---- #1712: Int64 capability declared, shaderInt64 never enabled on any device ------------------
 VUID-VkShaderModuleCreateInfo-pCode-08740 | required | rdna2_to_spirv_exec, texture_sample_render | Recompiled 64-bit integer ops force OpCapability Int64, which no device-creation path in the tree requests (#1712)
-
-# ---- #1713: storage-image descriptor numeric type disagrees with the module (the #1690 class) ---
-VUID-vkCmdDraw-format-07753 | required | texture_sample_render | Module wants a UINT sampled type, the bound view is R8G8B8A8_UNORM (#1713) — same defect class as #1690/#1702
 
 # ---- #1714: MRT blend state differs per attachment without independentBlend ---------------------
 VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605 | required | shadow_compare_render | Per-target blend state is built from each target's own registers while independentBlend is never enabled (#1714)
