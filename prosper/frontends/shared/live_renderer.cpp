@@ -4079,7 +4079,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         fr.addr_uvw[0] = r.addr_uvw[0]; fr.addr_uvw[1] = r.addr_uvw[1]; fr.addr_uvw[2] = r.addr_uvw[2];
                         // Remaining S# sampler fields (#262): border color + LOD clamp/bias (applied where
-                        // valid; the decode-only compare/unnorm stay on ShaderResource).
+                        // valid; compare/unnorm stay on ShaderResource for shader-side lowering).
                         fr.border_color_type = r.border_color_type;
                         fr.min_lod = r.min_lod; fr.max_lod = r.max_lod; fr.lod_bias = r.lod_bias;
                         // Anisotropy ratio (#275): applied in render_runner.h when the device supports the

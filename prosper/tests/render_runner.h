@@ -4566,8 +4566,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         sci.maxAnisotropy = want < max_aniso_limit ? want : max_aniso_limit;
                     }
                     // NOT applied here (need machinery the current path lacks — decoded under GFXLOG only):
-                    //   depth_compare_func (needs a depth/shadow sampler over a depth image),
-                    //   unnormalized coords (strict validity rules + recompiler coord semantics).
+                    //   depth_compare_func (needs a depth/shadow sampler over a depth image).
+                    // FORCE_UNNORMALIZED is handled in the recompiler by scaling only the spatial
+                    // sample coordinates; keeping this sampler normalized preserves wrap and LOD.
                     switch (r.border_color_type) {
                         case 1:  sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; break;
                         case 2:  sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; break;

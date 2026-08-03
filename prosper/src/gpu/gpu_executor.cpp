@@ -178,6 +178,7 @@ struct ShaderResourceCompileKey {
     uint32_t addr_u = 0;
     uint32_t addr_v = 0;
     uint32_t border_color_type = 0;
+    bool normalize_unnormalized_coordinates = false;
 
     bool operator==(const ShaderResourceCompileKey&) const = default;
 };
@@ -359,6 +360,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.addr_u);
             hash = hash_mix(hash, resource.addr_v);
             hash = hash_mix(hash, resource.border_color_type);
+            hash = hash_mix(hash, resource.normalize_unnormalized_coordinates);
         }
         return static_cast<size_t>(hash);
     }
@@ -1007,15 +1009,17 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             const bool texture = resource.cls == ResourceClass::Texture;
             const bool storage_image = resource.cls == ResourceClass::StorageImage;
             const bool manual_compare = texture && resource.depth_compare;
+            const bool normalize_unnormalized = texture && resource.unnormalized &&
+                !std::getenv("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE");
             const bool atomic_extent = storage_image &&
                 resource.format == DataFormat::Uint32 && resource.num_components == 1;
             ShaderResourceCompileKey compiled;
             compiled.cls = static_cast<uint32_t>(resource.cls);
             compiled.format = static_cast<uint32_t>(resource.format);
             compiled.num_components = resource.num_components;
-            compiled.width = atomic_extent ? resource.width : 0u;
-            compiled.height = atomic_extent ? resource.height : 0u;
-            compiled.depth = storage_image ? resource.depth : 0u;
+            compiled.width = (atomic_extent || normalize_unnormalized) ? resource.width : 0u;
+            compiled.height = (atomic_extent || normalize_unnormalized) ? resource.height : 0u;
+            compiled.depth = (storage_image || normalize_unnormalized) ? resource.depth : 0u;
             compiled.img_dim = (texture || storage_image) ? resource.img_dim : 0u;
             compiled.sample_count = (texture || storage_image) ? resource.sample_count : 1u;
             compiled.in_mip_tail = storage_image && resource.in_mip_tail;
@@ -1044,6 +1048,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.addr_u = manual_compare ? resource.addr_uvw[0] : 0u;
             compiled.addr_v = manual_compare ? resource.addr_uvw[1] : 0u;
             compiled.border_color_type = manual_compare ? resource.border_color_type : 0u;
+            compiled.normalize_unnormalized_coordinates = normalize_unnormalized;
             key.resources.push_back(compiled);
         }
     }

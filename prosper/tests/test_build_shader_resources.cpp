@@ -795,7 +795,7 @@ int main() {
         // #451: the paired S# also spills to the EUD. Program POINT filter + addr (wrap,mirror,clamp) so
         // it is distinguishable from the struct defaults (LINEAR + clamp). SQ_IMG_SAMP WORD0: CLAMP_X[2:0],
         // CLAMP_Y[5:3], CLAMP_Z[8:6]; WORD2 filter bits are 0 -> point.
-        eud[8] = (0u << 0) | (1u << 3) | (2u << 6);   // addr_uvw = {0 wrap, 1 mirror, 2 clamp}
+        eud[8] = (0u << 0) | (1u << 3) | (2u << 6) | (1u << 15);
         uint64_t ep = (uint64_t)(uintptr_t)eud;
         uint16_t dro5[16]; for (auto& x : dro5) x = 0xffff;
         dro5[5] = 24; sg[24] = (uint32_t)ep; sg[25] = (uint32_t)(ep >> 32);   // EUD base pointer
@@ -819,6 +819,8 @@ int main() {
               "#451: EUD-resident sampler decoded -> POINT filter (not the default LINEAR)");
         CHECK(etr && etr->addr_uvw[0] == 0u && etr->addr_uvw[1] == 1u && etr->addr_uvw[2] == 2u,
               "#451: EUD-resident sampler addr modes decoded from the spill (not default clamp)");
+        CHECK(etr && etr->unnormalized == 1u,
+              "S# FORCE_UNNORMALIZED survives paired-sampler decode");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
