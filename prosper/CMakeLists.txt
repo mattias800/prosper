@@ -93,6 +93,14 @@ endif()
 
 # --- tests (agentic-first: self-checking, exit-code = truth) -------------
 enable_testing()
+
+# Pure selection/accounting policy behind the stable compute-timing hash filter. This must remain
+# runnable without prosper_core, a game dump, or Vulkan so a broken diagnostic cannot hide behind a
+# skipped execution test on a host without graphics support.
+add_executable(test_compute_timing_selector tests/test_compute_timing_selector.cpp)
+target_include_directories(test_compute_timing_selector PRIVATE frontends/shared)
+add_test(NAME compute_timing_selector_policy COMMAND test_compute_timing_selector)
+
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
   add_test(NAME re_xref_decoder
