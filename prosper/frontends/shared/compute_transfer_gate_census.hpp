@@ -31,6 +31,28 @@ constexpr bool compute_storage_cache_gate_candidate(
            inputs.persistent_enabled;
 }
 
+// A compressed writable target cannot enter the persistent cache before dispatch because its base
+// bytes are not yet authoritative.  A successful ordinary writeback changes that fact: it publishes
+// exact base bytes and marks the complete DCC plane uncompressed.  Admit that result only when DCC
+// was the sole failed normal gate, the metadata plane is writable, and this binding owns the image's
+// writeback obligation.  The caller still has to prove fence completion, exact data/metadata
+// publication, and a final all-0xff metadata state before retaining the image.
+struct ComputeStoragePostWritebackPromotionInputs {
+    ComputeStorageCacheGateInputs pre_dispatch{};
+    bool writable_dcc_metadata = false;
+    bool unique_alias_owner = false;
+    bool exact_cache_key = false;
+};
+
+constexpr bool compute_storage_post_writeback_promotion_candidate(
+    const ComputeStoragePostWritebackPromotionInputs& inputs) {
+    const ComputeStorageCacheGateInputs& gates = inputs.pre_dispatch;
+    return !gates.renderer_owned && !gates.dcc_cache_safe &&
+           !gates.poison_verify && (gates.exact_storage || gates.seed_skip) &&
+           gates.persistent_enabled && inputs.writable_dcc_metadata &&
+           inputs.unique_alias_owner && inputs.exact_cache_key;
+}
+
 struct ComputeTransferGateSelector {
     bool requested = false;
     bool valid = false;

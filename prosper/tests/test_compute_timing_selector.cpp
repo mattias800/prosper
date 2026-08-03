@@ -146,6 +146,46 @@ int main() {
     CHECK(!compute_storage_cache_gate_candidate(cache_gates),
           "persistent cache disable blocks storage cache candidate");
 
+    const ComputeStoragePostWritebackPromotionInputs promotion_eligible{
+        {false, false, false, true, false, true}, true, true, true};
+    CHECK(compute_storage_post_writeback_promotion_candidate(promotion_eligible),
+          "post-writeback promotion accepts DCC as the sole failed normal cache gate");
+    ComputeStoragePostWritebackPromotionInputs promotion_gates = promotion_eligible;
+    promotion_gates.pre_dispatch.renderer_owned = true;
+    CHECK(!compute_storage_post_writeback_promotion_candidate(promotion_gates),
+          "renderer ownership blocks post-writeback promotion");
+    promotion_gates = promotion_eligible;
+    promotion_gates.pre_dispatch.dcc_cache_safe = true;
+    CHECK(!compute_storage_post_writeback_promotion_candidate(promotion_gates),
+          "an already-safe DCC target uses the normal cache path instead of promotion");
+    promotion_gates = promotion_eligible;
+    promotion_gates.pre_dispatch.poison_verify = true;
+    CHECK(!compute_storage_post_writeback_promotion_candidate(promotion_gates),
+          "poison verification blocks post-writeback promotion");
+    promotion_gates = promotion_eligible;
+    promotion_gates.pre_dispatch.exact_storage = false;
+    CHECK(!compute_storage_post_writeback_promotion_candidate(promotion_gates),
+          "nonexact storage without a seed-skip proof blocks post-writeback promotion");
+    promotion_gates.pre_dispatch.seed_skip = true;
+    CHECK(compute_storage_post_writeback_promotion_candidate(promotion_gates),
+          "seed skip satisfies the post-writeback representation gate");
+    promotion_gates = promotion_eligible;
+    promotion_gates.pre_dispatch.persistent_enabled = false;
+    CHECK(!compute_storage_post_writeback_promotion_candidate(promotion_gates),
+          "disabled persistence blocks post-writeback promotion");
+    promotion_gates = promotion_eligible;
+    promotion_gates.writable_dcc_metadata = false;
+    CHECK(!compute_storage_post_writeback_promotion_candidate(promotion_gates),
+          "missing writable DCC metadata blocks post-writeback promotion");
+    promotion_gates = promotion_eligible;
+    promotion_gates.unique_alias_owner = false;
+    CHECK(!compute_storage_post_writeback_promotion_candidate(promotion_gates),
+          "a folded alias cannot take the owner's post-writeback obligation");
+    promotion_gates = promotion_eligible;
+    promotion_gates.exact_cache_key = false;
+    CHECK(!compute_storage_post_writeback_promotion_candidate(promotion_gates),
+          "a mismatched cache identity blocks post-writeback promotion");
+
     ComputeTransferGateSelector gate_selector{
         true, true, 0x2c595d5aada78398ull, 0xa57c763ae4d70d1dull};
     ComputeTransferGateSelectorCounters gate_counters;

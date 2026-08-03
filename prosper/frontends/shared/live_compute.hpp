@@ -167,6 +167,9 @@ bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat forma
 // Monotonic count of sampled 2D/3D images seeded from an exact retained native storage result with a
 // device-local image copy instead of a guest-memory conversion/upload.
 uint64_t live_compute_storage_transfer_seeds();
+// Monotonic count of compressed storage results admitted only after an exact successful writeback
+// published both ordinary base bytes and an all-uncompressed DCC metadata plane.
+uint64_t live_compute_dcc_post_writeback_promotions();
 // Query the initialized live backend for the exact typed 3D storage+transfer image contract. Tests
 // use this to exercise native-volume execution only on devices that can create the Vulkan image.
 bool live_compute_native_storage_3d_supported(prosper::gpu::DataFormat format,
@@ -190,6 +193,13 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
 void live_compute_fail_next_storage_readback_for_test();
+
+// Deterministic controls for post-DCC cache-promotion regressions.  The first leaves the next
+// writable metadata plane unresolved, exercising the final all-0xff recheck.  The second models a
+// cache-capacity refusal after successful writeback; both must keep the transient fallback owned by
+// the caller and publish no cache/export authority.
+void live_compute_leave_next_dcc_metadata_compressed_for_test();
+void live_compute_fail_next_dcc_promotion_admission_for_test();
 
 // Deterministically lower the next eligible cold storage admission crossover to zero. This lets a
 // compact production-backend fixture execute the real deferral predicate and retention branch.
