@@ -64,10 +64,11 @@ For anything title- or subsystem-specific, use the table in the next section rat
 
 ## Where the project stands (2026-08-02)
 
-`COMPATIBILITY.md` is authoritative for **per-title milestones** — 29 titles, 16 at gameplay. Do not
-duplicate it here; read it, then open the one doc named below for whatever you are about to touch.
-This section is a map, not a status report. Its **Boot sweep — 2026-08-02** section is the current
-rung-and-frame-rate census across the titles that are not yet at rung 6.
+`COMPATIBILITY.md` is authoritative for the **user-facing per-title milestones** — 29 titles, 16 at
+gameplay. Do not duplicate it here; read it, then open the one doc named below for whatever you are
+about to touch. This section is a map, not a status report. Long-lived `tracker:game` issues carry
+each active title's current development rung, route, blockers and evidence; dated cross-title
+performance measurements live in their own ordinary issues (the 2026-08-02 census is #1739).
 
 **Concurrent game work starts with `prosper/docs/GAME_COMPAT_ORCHESTRATION.md`** — lane ownership,
 shared-GPU policy, the instrument-not-the-subject list, and the dated current handoff.
@@ -445,6 +446,14 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     sessions — issues are the durable queue; `docs/` files explain *how*, issues track *what
     remains*. The umbrella issue for the history-review backlog is #72
     (full annotated list: `prosper/docs/BUG_HUNT_BACKLOG.md`).
+  - **Long-lived game trackers are progress indices, not bug reports.** Create one as
+    `[Game tracker] <Title> (<TITLE_ID>)`, label it `tracker:game` plus the title's existing
+    `game:<slug>` label, and keep it open through the compatibility ladder. Its compact body records
+    the current rung and latest verified master where known, the best checked-in screenshot, what
+    works, links to ordinary blocker issues, the reproduction/input/snapshot route, technical status
+    docs, and the six-rung checklist. Ordinary bugs remain separate and close independently. PRs
+    update a game tracker with `Refs #NN`, never `Fixes #NN`; do not give the tracker `bug` or
+    `in-progress` unless work on the tracker issue itself is actually claimed.
   - **Claiming an issue (multi-agent lock).** Several agents work this repo concurrently; claim
     before you code so two agents never fix the same issue:
     1. Check it's free: no `in-progress` label, no unexpired claim comment, and no remote fix

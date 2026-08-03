@@ -7,6 +7,14 @@ Different title revisions may behave differently.
 
 Last updated: 2026-08-03
 
+This page is the user-facing overview. Day-to-day compatibility progress lives in the
+[`tracker:game` issue list](https://github.com/mattias800/prosper/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22tracker%3Agame%22),
+where each active title keeps its current rung, route, visual evidence and links to independently
+closing bugs. The initial trackers are [Blue Prince (#1808)](https://github.com/mattias800/prosper/issues/1808),
+[Astro Bot (#1809)](https://github.com/mattias800/prosper/issues/1809),
+[R-Type Delta: HD Boosted (#1810)](https://github.com/mattias800/prosper/issues/1810), and
+[Syberia: Remastered (#1811)](https://github.com/mattias800/prosper/issues/1811).
+
 ## Summary
 
 | Title | Title ID | Engine | Tested milestone |
@@ -48,36 +56,8 @@ Last updated: 2026-08-03
 required before its title, gameplay, or audio can be evaluated. The guest also consumes an authentic
 Sonic 1 activity launch, but still needs the same base UI assets before entering the classic runtime.
 
-## Boot sweep — 2026-08-02
-
-Fourteen titles were booted on one build (`3a473bca`) through the headless `screenshot` frontend with
-no render acceleration (`PROSPER_RENDER_SCALE=1`, `PROSPER_RENDER_EVERY=1`, no sampling window), to
-establish where each one actually stops today rather than where its last write-up left it. Rungs are
-the ladder in `CLAUDE.md`: 0 nothing, 1 any real graphics, 2 title screen, 3 gameplay.
-
-**Read the frame rates as lower bounds, not as benchmarks.** Another lane held the same GPU for most
-of the sweep, so every number below was measured under concurrent load of an unknown size. The figure
-is guest flips per second — the rate the game itself advances — averaged over the sampled window.
-
-| Title | Rung reached | Frames/s | Where it stops |
-| --- | --- | --- | --- |
-| *Grand Theft Auto V* `PPSA04263` | 2 | ~132 @ 4K | Title with the `Continue ✕` prompt; the menu needs input |
-| *Bendy and the Ink Machine* `PPSA27616` | 3 | ~30 @ 4K menu, ~8 @ 4K in level | Routed Chapter 1 interior renders and the camera moves |
-| *The Plucky Squire* `PPSA15319` | 2 | ~21 @ 4K | Menus render; after the play-style choice the route holds a black loading screen for 260 s |
-| *The Pathless* `PPSA01826` | 2 | ~14 @ 1440p | Title screen holds; no input route tried |
-| *Nikoderiko: The Magical World* `PPSA23760` | 2 | ~14 @ 4K | Title screen; the 3D world is dropped (#305 / #1607) |
-| *Syberia: Remastered* `PPSA30140` | 3 | ~2 @ 1080p | Profile menu 3D renders but is overexposed (#1790); routed factory-hall composite is degraded (#1627) |
-| *Dragon Quest VII Reimagined* `PPSA17942` | 1 without input | ~12 @ 4K | Ocean/sky pass and the save-created notice; the title needs the route |
-| *Earthion* `PPSA28061` | 2 with the route | ~139 @ 4K | Title screen and menus render; the earlier "missing picture" was the intro's own black text page (#1590) |
-| *Tales of Graces f Remastered* `PPSA19991` | 2 with the route | ~37 @ 1080p on the title screen | Title screen, EULA, main menu and new-game Options; gameplay not reached (#1609) |
-| *The Oregon Trail* `PPSA19244` | 0 | ~42 @ 4K | Frame loop advances, every frame black (#1606 / #1641) |
-| *Asterix &amp; Obelix - Babylon Mission* `PPSA30490` | 0 | ~124 @ 1080p | All frames black (#1599); the run no longer dies at 125 s (#1748) |
-| *Sonic Origins* `PPSA05325` | 0 | ~5 @ 4K | One rendered frame; the supplied dump is update-only |
-| *ArcRunner* `PPSA21406` | 0 | — | Guest render thread faults after about 10 s, before any composited frame (#1226) |
-| *R-Type Delta: HD Boosted* `PPSA26414` | 0 | — | Guest fault at `eboot+0x24055`: `users.front()` on an empty vector, ~260 ms into the title's own 400 ms input-thread delay (#1746) |
-
-Six titles that render real content are below the 30 fps bar: Syberia (~2), Bendy in level (~8),
-Dragon Quest VII (~12), Nikoderiko (~14), The Pathless (~14) and The Plucky Squire (~21).
+The dated 2026-08-02 frame-rate sweep and its measurement caveats are retained in
+[#1739](https://github.com/mattias800/prosper/issues/1739), rather than duplicated in this overview.
 
 ## The Messenger — `PPSA24651`
 
