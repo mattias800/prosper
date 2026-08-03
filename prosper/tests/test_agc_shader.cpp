@@ -1,5 +1,6 @@
 // test_agc_shader -- focused guards for sceAgcCreateShader's guest-visible side effects.
 #include "../src/hle/dispatch.hpp"
+#include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include <atomic>
@@ -306,8 +307,84 @@ int main() {
     const prosper::gpu::ShaderResource* pixel_buffer = pixel_table
         ? pixel_table->by_fetch_pc(6) : nullptr;
     CHECK(pixel_buffer && pixel_buffer->cls == prosper::gpu::ResourceClass::ConstantBuffer &&
-          pixel_buffer->gpu_addr == 0x20000u && pixel_buffer->stride == 16u,
-          "pixel-stage buffer_load_format keeps its exact structured-buffer V# resource");
+          pixel_buffer->gpu_addr == 0x20000u && pixel_buffer->stride == 16u &&
+          pixel_buffer->direct_vsharp_sh_register_base ==
+              prosper::gpu::ShaderResource::kDirectVSharpOriginAmbiguous,
+          "shader-constructed pixel V# keeps its resource but no fabricated raw SH origin");
+
+    const uint32_t direct_seed_fetch[] = {
+        0xE0002000u, 0x80020100u,   // pc=0: buffer_load_format_x v1, v0, s[8:11], 0 idxen
+        0xBF810000u,
+    };
+    Shader direct_seed{};
+    direct_seed.file_header = 0x34333231u;
+    direct_seed.version = 0x18u;
+    direct_seed.shader_size = sizeof(direct_seed_fetch);
+    direct_seed.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&direct_seed),
+                       reinterpret_cast<uint64_t>(direct_seed_fetch), 0, 0, 0);
+    CHECK(rc == 0 && dst == &direct_seed,
+          "direct-seed pixel shader enters the AGC registry");
+    prosper::gpu::GpuState direct_seed_state;
+    constexpr uint32_t kPsUser = prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0;
+    direct_seed_state.sh[kPsUser + 8] = 0x00020000u;
+    direct_seed_state.sh[kPsUser + 9] = 0x00100000u;
+    direct_seed_state.sh[kPsUser + 10] = 4u;
+    direct_seed_state.sh[kPsUser + 11] = (22u << 12u) | 0xFACu;
+    auto direct_seed_table = prosper::gpu::build_stage_table(
+        direct_seed_state, reinterpret_cast<uint64_t>(direct_seed_fetch), true, 4);
+    const prosper::gpu::ShaderResource* direct_seed_buffer = direct_seed_table
+        ? direct_seed_table->by_fetch_pc(0) : nullptr;
+    CHECK(direct_seed_buffer &&
+          direct_seed_buffer->direct_vsharp_sh_register_base == kPsUser + 8,
+          "front-half direct seed carries its exact absolute SH origin into the runtime table");
+
+    // A nonzero MUBUF instruction offset is a legal address transform after the raw V# seed.  The
+    // normalized resource base is shifted, so treating the unchanged seed as byte-identical raw
+    // identity would make the resource-input verdict falsely say mismatch.  Keep the resource, but
+    // make the absence of one exact raw descriptor explicit through the capture path.
+    const uint32_t offset_seed_fetch[] = {
+        0xE0002004u, 0x80020100u,   // pc=0: same direct V#, plus instruction OFFSET=4
+        0xBF810000u,
+    };
+    Shader offset_seed{};
+    offset_seed.file_header = 0x34333231u;
+    offset_seed.version = 0x18u;
+    offset_seed.shader_size = sizeof(offset_seed_fetch);
+    offset_seed.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&offset_seed),
+                       reinterpret_cast<uint64_t>(offset_seed_fetch), 0, 0, 0);
+    auto offset_seed_table = prosper::gpu::build_stage_table(
+        direct_seed_state, reinterpret_cast<uint64_t>(offset_seed_fetch), true, 4);
+    const prosper::gpu::ShaderResource* offset_seed_buffer = offset_seed_table
+        ? offset_seed_table->by_fetch_pc(0) : nullptr;
+    prosper::gpu::DrawItem offset_seed_draw;
+    offset_seed_draw.draw_index = 9;
+    offset_seed_draw.prt = offset_seed_table;
+    prosper::gpu::PendingGpuCapture offset_seed_pending;
+    offset_seed_pending.resource_provenance_armed = true;
+    offset_seed_pending.resource_provenance_selector = {
+        9, prosper::gpu::ShaderProgramStage::Fragment,
+        offset_seed_buffer ? offset_seed_buffer->binding : 0};
+    prosper::gpu::snapshot_pending_gpu_capture_draw_resource(
+        &offset_seed_pending, offset_seed_draw,
+        [](uint64_t, uint8_t*, size_t) { return size_t{0}; });
+    CHECK(rc == 0 && dst == &offset_seed && offset_seed_buffer &&
+              offset_seed_buffer->gpu_addr == 0x00020004u &&
+              offset_seed_buffer->direct_vsharp_sh_register_base ==
+                  prosper::gpu::ShaderResource::kDirectVSharpOriginAmbiguous &&
+              offset_seed_pending.resource_provenance.input_mode ==
+                  prosper::gpu::GpuCaptureResourceInputMode::Unavailable &&
+              offset_seed_pending.resource_provenance.input_unavailable_reason ==
+                  prosper::gpu::GpuCaptureResourceInputUnavailableReason::AmbiguousRawOrigin &&
+              prosper::gpu::gpu_capture_resource_input_verdict(
+                  offset_seed_pending.resource_provenance, *offset_seed_buffer) ==
+                  prosper::gpu::GpuCaptureResourceInputVerdict::Unavailable,
+          "nonzero fetch offset stays explicitly unavailable instead of a false raw-input mismatch");
 
     // #158: the dynamic fold must use the registered header's byte size, not a fixed 64 KiB walk.
     // The valid-looking descriptor setup and fetch deliberately sit beyond the declared one-dword

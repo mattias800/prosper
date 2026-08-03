@@ -63,6 +63,18 @@ requested span, each sample's readable byte count, payload, and content hash. Th
 guest-authored zero bytes from an unreadable zero-filled suffix and answers whether a buffer was
 already zero when the draw consumed it or changed later in the submit.
 
+Capture v46 additionally retains the four raw stage USER_DATA dwords for an exactly attributable
+direct V# plus each dword's last PM4 write order, direct/indirect path, queue, fold, and Jump depth.
+The front half carries the exact SH origin it selected into the runtime resource table; capture does
+not search other registers for a descriptor that happens to match the normalized output.
+`--inspect-only` decodes the raw dwords independently and prints `raw-identity=full-match` when every
+architecturally encoded field matches, or `raw-identity=mismatch` when it does not. Both outcomes are
+valid captured evidence. Older capsules and indirect, transformed, ambiguous, or missing-provenance
+paths print `raw-identity=unavailable reason=...`; they are never silently reconstructed from the
+normalized output. A zero-record V# does not encode a byte size, and FORMAT=INVALID does not encode
+the shader instruction's effective format, so compatibility/shader-derived values also remain
+explicitly unavailable rather than being reported as raw proof.
+
 `--inspect-only` prints one `resource-provenance` line with `realization-read`, `post-read`, both
 hashes, and one of these verdicts:
 

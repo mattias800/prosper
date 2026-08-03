@@ -11,6 +11,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <string>
+#include <utility>
 #include "test_scratch.h"
 
 using namespace prosper::gpu;
@@ -76,8 +79,20 @@ static void set_test_env(const char* name, const char* value) {
 #endif
 }
 
-int main() {
+static std::string shell_quote(const std::filesystem::path& path) {
+    return "\"" + path.string() + "\"";
+}
+
+static std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+}
+
+int main(int argc, char** argv) {
     std::printf("== test_gpu_capture ==\n");
+    const char* inspect_tool = argc == 3 &&
+            std::strcmp(argv[1], "--inspect-resource-input") == 0
+        ? argv[2] : nullptr;
     const char* original_save0_value = std::getenv(kGpuCaptureSave0Env);
     const bool had_original_save0 = original_save0_value != nullptr;
     const std::string original_save0 = original_save0_value ? original_save0_value : "";
@@ -262,6 +277,8 @@ int main() {
     provenance_resource.size = provenance_memory.size();
     provenance_resource.stride = 16;
     provenance_resource.sgpr_base = 0;
+    provenance_resource.direct_vsharp_sh_register_base =
+        P::SPI_SHADER_USER_DATA_PS_0;
     provenance_table->resources = {provenance_resource};
     DrawItem provenance_draw = draw;
     provenance_draw.draw_index = 77;
@@ -285,6 +302,23 @@ int main() {
         "prosper_gpu_capture_resource_provenance.prgcap";
     auto provenance_pending = make_provenance_pending(provenance_path);
     snapshot_pending_gpu_capture_draw_resource(provenance_pending.get(), provenance_draw);
+    auto& input_witness = provenance_pending->resource_provenance;
+    input_witness.input_mode = GpuCaptureResourceInputMode::DirectVSharp;
+    input_witness.input_unavailable_reason =
+        GpuCaptureResourceInputUnavailableReason::None;
+    input_witness.input_write_provenance_mask = 0x0f;
+    input_witness.input_sh_register_base = P::SPI_SHADER_USER_DATA_PS_0;
+    const uint64_t provenance_addr = reinterpret_cast<uint64_t>(provenance_memory.data());
+    input_witness.input_dwords = {
+        static_cast<uint32_t>(provenance_addr),
+        static_cast<uint32_t>((provenance_addr >> 32u) & 0xffffu) | (16u << 16u),
+        1u,
+        (22u << 12u) | 0xFACu,
+    };
+    for (uint32_t i = 0; i < 4; ++i) {
+        input_witness.input_last_writes[i] = 700u + i;
+        input_witness.input_write_sources[i] = GpuState::pack_prov_src(1, 0, 91);
+    }
     for (size_t i = 0; i < provenance_memory.size(); ++i)
         provenance_memory[i] = static_cast<uint8_t>(0xa0 + i);
     const std::array<uint8_t, 16> post_bytes = provenance_memory;
@@ -322,8 +356,171 @@ int main() {
               provenance->resource_class == ResourceClass::ConstantBuffer &&
               provenance->guest_addr == reinterpret_cast<uint64_t>(provenance_memory.data()) &&
               provenance->requested_bytes == provenance_memory.size() &&
-              provenance->srt_offset == 0xFFFFFFFFu && provenance->sgpr_base == 0,
-          "resource provenance retains auditable semantic and decoded descriptor identity");
+              provenance->srt_offset == 0xFFFFFFFFu && provenance->sgpr_base == 0 &&
+              provenance->input_sh_register_base == P::SPI_SHADER_USER_DATA_PS_0 &&
+              provenance->input_write_provenance_mask == 0x0f &&
+              gpu_capture_resource_input_verdict(*provenance, provenance_resource) ==
+                  GpuCaptureResourceInputVerdict::FullMatch,
+          "resource provenance round-trips an independently decodable direct-V# input witness");
+
+    GpuCaptureFile mutated_input = provenance_loaded;
+    std::vector<uint8_t> mismatch_bytes;
+    GpuCaptureFile mismatch_loaded;
+    mutated_input.resource_provenance[0].input_dwords[0] ^= 0x100u;
+    CHECK(serialize_gpu_capture(mutated_input, mismatch_bytes, error) &&
+              deserialize_gpu_capture(mismatch_bytes, mismatch_loaded, error) &&
+              gpu_capture_resource_input_verdict(
+                  mismatch_loaded.resource_provenance[0], provenance_resource) ==
+                  GpuCaptureResourceInputVerdict::Mismatch,
+          "a raw address/output disagreement round-trips as an explicit mismatch");
+
+    GpuCaptureResourceProvenance zero_record = *provenance;
+    zero_record.input_dwords[2] = 0;
+    zero_record.input_unavailable_reason =
+        GpuCaptureResourceInputUnavailableReason::RawSizeUnavailable;
+    ShaderResource compatibility_sized = provenance_resource;
+    compatibility_sized.size = compatibility_sized.stride * 4u;
+    CHECK(gpu_capture_resource_input_verdict(zero_record, compatibility_sized) ==
+              GpuCaptureResourceInputVerdict::Unavailable,
+          "zero-record V# does not manufacture the PS compatibility allocation as raw proof");
+    ShaderResource zero_record_wrong_format = compatibility_sized;
+    zero_record_wrong_format.format = DataFormat::Uint32;
+    CHECK(gpu_capture_resource_input_verdict(zero_record, zero_record_wrong_format) ==
+              GpuCaptureResourceInputVerdict::Mismatch,
+          "zero-record V# still rejects a normalized format disagreement");
+
+    GpuCaptureResourceProvenance unknown_format = *provenance;
+    unknown_format.input_dwords[3] &= ~(0x7fu << 12u);
+    unknown_format.input_unavailable_reason =
+        GpuCaptureResourceInputUnavailableReason::RawFormatUnavailable;
+    ShaderResource shader_formatted = provenance_resource;
+    shader_formatted.format = DataFormat::Float32;
+    shader_formatted.num_components = 4;
+    CHECK(gpu_capture_resource_input_verdict(unknown_format, shader_formatted) ==
+              GpuCaptureResourceInputVerdict::Unavailable,
+          "FORMAT=INVALID V# does not manufacture shader-derived Float32x4 as raw proof");
+    ShaderResource unknown_format_wrong_size = shader_formatted;
+    unknown_format_wrong_size.size += unknown_format_wrong_size.stride;
+    CHECK(gpu_capture_resource_input_verdict(unknown_format, unknown_format_wrong_size) ==
+              GpuCaptureResourceInputVerdict::Mismatch,
+          "FORMAT=INVALID V# still rejects a normalized byte-size disagreement");
+
+    // The fixed v46 tail is 4 bytes of count plus 100 bytes per selected witness.  Mutate the
+    // serialized tail, rather than merely constructing invalid in-memory objects, so the reader's
+    // hostile-input boundary proves the exact pack contract it accepts.
+    std::vector<uint8_t> valid_v46_bytes;
+    CHECK(serialize_gpu_capture(provenance_loaded, valid_v46_bytes, error) &&
+              valid_v46_bytes.size() >= 104u,
+          "v46 resource input witness has a complete validation tail");
+    const size_t v46_tail_base = valid_v46_bytes.size() >= 104u
+        ? valid_v46_bytes.size() - 104u : 0u;
+    auto malformed_tail_rejected = [&](size_t offset,
+                                       std::initializer_list<uint8_t> replacement,
+                                       const char* wanted_error) {
+        if (valid_v46_bytes.size() < 104u ||
+            offset > valid_v46_bytes.size() - replacement.size())
+            return false;
+        std::vector<uint8_t> bytes = valid_v46_bytes;
+        std::copy(replacement.begin(), replacement.end(), bytes.begin() + offset);
+        GpuCaptureFile rejected;
+        error.clear();
+        return !deserialize_gpu_capture(bytes, rejected, error) && error == wanted_error;
+    };
+    constexpr size_t kV46BaseOffset = 20u;
+    constexpr size_t kV46SourcesOffset = 72u;
+    CHECK(malformed_tail_rejected(
+              v46_tail_base + kV46SourcesOffset,
+              {0, 0, 0, 0, 0, 0, 0, 0},
+              "invalid resource input write source"),
+          "v46 tail rejects a zero source/fold provenance word");
+    CHECK(malformed_tail_rejected(
+              v46_tail_base + kV46SourcesOffset,
+              {0xff, 0, 91, 0, 0, 0, 0, 0},
+              "invalid resource input write source"),
+          "v46 tail rejects an out-of-contract queue origin");
+    CHECK(malformed_tail_rejected(
+              v46_tail_base + kV46SourcesOffset,
+              {1, 9, 91, 0, 0, 0, 0, 0},
+              "invalid resource input write source"),
+          "v46 tail rejects a Jump depth beyond the fold recursion bound");
+    CHECK(malformed_tail_rejected(
+              v46_tail_base + kV46SourcesOffset,
+              {1, 0, 91, 0, 0, 0, 0, 0x80},
+              "invalid resource input write source"),
+          "v46 tail rejects high bits outside pack_prov_src");
+    CHECK(malformed_tail_rejected(
+              v46_tail_base + kV46BaseOffset,
+              {0xfd, 0xff, 0, 0},
+              "invalid direct resource input witness"),
+          "v46 tail rejects a four-dword SH origin outside the bounded register file");
+
+    if (inspect_tool) {
+        GpuCaptureFile inspect_mismatch = provenance_loaded;
+        inspect_mismatch.draws[0].prt.resources[0].resource.format = DataFormat::Uint32;
+        const auto inspect_mismatch_path = prosper_test::test_scratch_path(
+            "resource-input-inspect-mismatch.prgcap");
+        GpuCaptureFile inspect_unavailable = provenance_loaded;
+        inspect_unavailable.resource_provenance[0] = zero_record;
+        const auto inspect_unavailable_path = prosper_test::test_scratch_path(
+            "resource-input-inspect-unavailable.prgcap");
+        CHECK(write_gpu_capture(inspect_mismatch_path.string(), inspect_mismatch, error) &&
+                  write_gpu_capture(inspect_unavailable_path.string(), inspect_unavailable, error),
+              "gpu_replay resource-input inspect fixtures serialize");
+
+        const auto run_inspect = [&](const std::filesystem::path& capture_path,
+                                     const char* log_name) {
+            const auto log_path = prosper_test::test_scratch_path(log_name);
+            const std::string command = shell_quote(inspect_tool) + " --inspect-only " +
+                shell_quote(capture_path) + " > " + shell_quote(log_path) + " 2>&1";
+            const int status = std::system(command.c_str());
+            return std::pair<int, std::string>{status, read_text_file(log_path)};
+        };
+        const auto full = run_inspect(provenance_path, "resource-input-inspect-full.log");
+        const auto mismatch = run_inspect(
+            inspect_mismatch_path, "resource-input-inspect-mismatch.log");
+        const auto unavailable = run_inspect(
+            inspect_unavailable_path, "resource-input-inspect-unavailable.log");
+        CHECK(full.first == 0 &&
+                  full.second.find(
+                      "resource-input draw=77 stage=ps binding=32 raw-identity=full-match") !=
+                      std::string::npos &&
+                  full.second.find("writes=d700/q1,f91,j0") != std::string::npos,
+              "gpu_replay --inspect-only prints the full-match raw-input witness");
+        CHECK(mismatch.first == 0 &&
+                  mismatch.second.find(
+                      "resource-input draw=77 stage=ps binding=32 raw-identity=mismatch") !=
+                      std::string::npos,
+              "gpu_replay --inspect-only prints a raw-input mismatch");
+        CHECK(unavailable.first == 0 &&
+                  unavailable.second.find(
+                      "resource-input draw=77 stage=ps binding=32 raw-identity=unavailable "
+                      "reason=raw-size-not-architecturally-available") != std::string::npos,
+              "gpu_replay --inspect-only prints partial raw-input unavailability");
+        std::printf("== %s ==\n", fails ? "FAIL" : "PASS");
+        return fails ? 1 : 0;
+    }
+
+    std::vector<uint8_t> v45_provenance_bytes;
+    GpuCaptureFile v45_provenance_loaded;
+    CHECK(serialize_gpu_capture(provenance_loaded, v45_provenance_bytes, error) &&
+              v45_provenance_bytes.size() >=
+                  4u + 100u * provenance_loaded.resource_provenance.size(),
+          "v46 resource input tail is removable for a v45 compatibility fixture");
+    if (v45_provenance_bytes.size() >=
+            4u + 100u * provenance_loaded.resource_provenance.size()) {
+        v45_provenance_bytes.resize(
+            v45_provenance_bytes.size() -
+            (4u + 100u * provenance_loaded.resource_provenance.size()));
+        v45_provenance_bytes[8] = 45;
+        CHECK(deserialize_gpu_capture(v45_provenance_bytes, v45_provenance_loaded, error) &&
+                  v45_provenance_loaded.format_version == 45 &&
+                  v45_provenance_loaded.resource_provenance.size() == 1 &&
+                  v45_provenance_loaded.resource_provenance[0].input_mode ==
+                      GpuCaptureResourceInputMode::Unavailable &&
+                  v45_provenance_loaded.resource_provenance[0].input_unavailable_reason ==
+                      GpuCaptureResourceInputUnavailableReason::CapturePredatesWitness,
+              "v45 selected-resource capture reads with explicit raw-input unavailability");
+    }
 
     size_t default_reader_calls = 0;
     PendingGpuCapture default_pending;
@@ -357,8 +554,49 @@ int main() {
               partial_loaded.blobs[
                   partial_loaded.resource_provenance[0].post_blob_index].bytes_read >=
                   partial_loaded.resource_provenance[0].post_blob_offset +
-                      provenance_memory.size(),
-          "partial realization read remains distinguishable from guest-authored zero bytes");
+                      provenance_memory.size() &&
+              partial_loaded.resource_provenance[0].input_mode ==
+                  GpuCaptureResourceInputMode::Unavailable &&
+              partial_loaded.resource_provenance[0].input_unavailable_reason ==
+                  GpuCaptureResourceInputUnavailableReason::NoSemanticState,
+          "partial read and missing semantic input state remain independently fail-visible");
+
+    DrawItem srt_draw = provenance_draw;
+    srt_draw.prt = std::make_shared<ShaderResourceTable>();
+    ShaderResource srt_resource = provenance_resource;
+    srt_resource.srt_offset = 0;
+    srt_resource.sgpr_base = 0xFFFFFFFFu;
+    srt_resource.direct_vsharp_sh_register_base =
+        ShaderResource::kDirectVSharpOriginUnavailable;
+    srt_draw.prt->resources = {srt_resource};
+    PendingGpuCapture srt_pending;
+    srt_pending.resource_provenance_armed = true;
+    srt_pending.resource_provenance_selector = {
+        77, ShaderProgramStage::Fragment, 32};
+    snapshot_pending_gpu_capture_draw_resource(&srt_pending, srt_draw);
+    CHECK(srt_pending.resource_provenance.input_mode ==
+              GpuCaptureResourceInputMode::Unavailable &&
+              srt_pending.resource_provenance.input_unavailable_reason ==
+                  GpuCaptureResourceInputUnavailableReason::NonDirectResource,
+          "SRT-loaded V# remains explicitly unavailable to the direct-SH witness");
+
+    DrawItem ambiguous_origin_draw = provenance_draw;
+    ambiguous_origin_draw.prt = std::make_shared<ShaderResourceTable>();
+    ShaderResource ambiguous_origin_resource = provenance_resource;
+    ambiguous_origin_resource.direct_vsharp_sh_register_base =
+        ShaderResource::kDirectVSharpOriginAmbiguous;
+    ambiguous_origin_draw.prt->resources = {ambiguous_origin_resource};
+    PendingGpuCapture ambiguous_origin_pending;
+    ambiguous_origin_pending.resource_provenance_armed = true;
+    ambiguous_origin_pending.resource_provenance_selector = {
+        77, ShaderProgramStage::Fragment, 32};
+    snapshot_pending_gpu_capture_draw_resource(
+        &ambiguous_origin_pending, ambiguous_origin_draw);
+    CHECK(ambiguous_origin_pending.resource_provenance.input_mode ==
+              GpuCaptureResourceInputMode::Unavailable &&
+              ambiguous_origin_pending.resource_provenance.input_unavailable_reason ==
+                  GpuCaptureResourceInputUnavailableReason::AmbiguousRawOrigin,
+          "shader-derived or ambiguous V# origin remains explicitly unavailable");
 
     auto zero_match_pending = make_provenance_pending(
         prosper_test::test_scratch_dir() / "prosper_gpu_capture_resource_provenance_zero.prgcap");
@@ -607,6 +845,11 @@ int main() {
         return 4 + 73 * f.resource_provenance.size();
     };
 
+    // v46: count plus one 100-byte raw input/provenance witness per selected v45 record.
+    auto v46_tail = [](const GpuCaptureFile& f) -> size_t {
+        return 4 + 100 * f.resource_provenance.size();
+    };
+
     // v25 (#1240): byte length of the trailing resolve-state block.
     auto v25_tail = [](const GpuCaptureFile& f) -> size_t {
         size_t present_failures = 0;
@@ -638,6 +881,7 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - v46_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v45_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v44_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v43_tail(v16_scissor_source));
@@ -755,7 +999,7 @@ int main() {
         deserialize_gpu_capture(msaa_bytes, msaa_loaded, error);
     if (!msaa_deserialized) std::printf("  [diag] MSAA capture deserialization: %s\n", error.c_str());
     CHECK(msaa_deserialized &&
-              msaa_loaded.format_version == 45 &&
+              msaa_loaded.format_version == 46 &&
               msaa_loaded.draws[0].vrt.resources[0].resource.sample_count == 4 &&
               msaa_loaded.blobs.size() == 2 &&
               msaa_loaded.blobs[1].bytes.size() == 32768u &&
@@ -782,7 +1026,7 @@ int main() {
     std::vector<uint8_t> mismatched_msaa_metadata = msaa_bytes;
     const uint32_t two_samples = 2;
     std::memcpy(mismatched_msaa_metadata.data() + mismatched_msaa_metadata.size() -
-                    v45_tail(msaa_capture) - 4u,
+                    v46_tail(msaa_capture) - v45_tail(msaa_capture) - 4u,
                 &two_samples, sizeof(two_samples));
     GpuCaptureFile mismatched_msaa_loaded;
     CHECK(!deserialize_gpu_capture(
@@ -805,6 +1049,7 @@ int main() {
     std::vector<uint8_t> v43_msaa_bytes;
     CHECK(serialize_gpu_capture(v43_msaa_source, v43_msaa_bytes, error),
           "current writer prepares an uncompressed v43 MSAA compatibility fixture");
+    v43_msaa_bytes.resize(v43_msaa_bytes.size() - v46_tail(v43_msaa_source));
     v43_msaa_bytes.resize(v43_msaa_bytes.size() - v45_tail(v43_msaa_source));
     v43_msaa_bytes.resize(v43_msaa_bytes.size() - v44_tail(v43_msaa_source));
     v43_msaa_bytes[8] = 43;
@@ -861,7 +1106,7 @@ int main() {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 45 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 46 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -871,7 +1116,7 @@ int main() {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 45 &&
+              video_loaded.format_version == 46 &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(video_loaded, video_replay, error) &&
@@ -894,7 +1139,7 @@ int main() {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 45 &&
+              upgraded_video.format_version == 46 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -976,7 +1221,7 @@ int main() {
           "Plucky RGBA16 32-cubed S3 capture uses its four true 3D macroblocks");
     CHECK(serialize_gpu_capture(array_layout_capture, array_layout_bytes, error) &&
               deserialize_gpu_capture(array_layout_bytes, array_layout_loaded, error) &&
-              array_layout_loaded.format_version == 45 &&
+              array_layout_loaded.format_version == 46 &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
           "v32 capture round-trips thin-array slice stride and selected-mip offset");
@@ -1075,6 +1320,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - v46_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v45_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v44_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v43_tail(volume_capture));
@@ -1178,6 +1424,7 @@ int main() {
     CHECK(serialize_gpu_capture(pre_v31_source, v20_bytes, error) && v20_bytes.size() >= 21,
           "v21 capture serializes the logic-op extension");
     if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - v46_tail(pre_v31_source));
         v20_bytes.resize(v20_bytes.size() - v45_tail(pre_v31_source));
         v20_bytes.resize(v20_bytes.size() - v44_tail(pre_v31_source));
         v20_bytes.resize(v20_bytes.size() - v43_tail(pre_v31_source));
@@ -1256,6 +1503,7 @@ int main() {
         std::vector<uint8_t> v42_bytes;
         CHECK(serialize_gpu_capture(captured, v42_bytes, error),
               "v43 capture serializes before the color-state downgrade");
+        v42_bytes.resize(v42_bytes.size() - v46_tail(captured));
         v42_bytes.resize(v42_bytes.size() - v45_tail(captured));
         v42_bytes.resize(v42_bytes.size() - v44_tail(captured));
         v42_bytes.resize(v42_bytes.size() - v43_tail(captured));
@@ -1278,7 +1526,8 @@ int main() {
     std::vector<uint8_t> v24_resolve_bytes;
     GpuCaptureFile v24_resolve_loaded;
     CHECK(serialize_gpu_capture(pre_v31_source, v24_resolve_bytes, error) &&
-              v24_resolve_bytes.size() >= v45_tail(pre_v31_source) +
+              v24_resolve_bytes.size() >= v46_tail(pre_v31_source) +
+              v45_tail(pre_v31_source) +
               v44_tail(pre_v31_source) +
               v43_tail(pre_v31_source) + v42_tail(pre_v31_source) +
               v41_tail(pre_v31_source) +
@@ -1293,7 +1542,8 @@ int main() {
               v27_tail(pre_v31_source) + v26_tail(pre_v31_source) +
               v25_tail(pre_v31_source),
           "v25 capture exposes a removable trailing resolve-state block");
-    if (v24_resolve_bytes.size() >= v45_tail(pre_v31_source) +
+    if (v24_resolve_bytes.size() >= v46_tail(pre_v31_source) +
+            v45_tail(pre_v31_source) +
             v44_tail(pre_v31_source) +
             v43_tail(pre_v31_source) + v42_tail(pre_v31_source) +
             v41_tail(pre_v31_source) +
@@ -1307,6 +1557,7 @@ int main() {
             v29_tail(pre_v31_source) + v28_tail(pre_v31_source) +
             v27_tail(pre_v31_source) + v26_tail(pre_v31_source) +
             v25_tail(pre_v31_source)) {
+        v24_resolve_bytes.resize(v24_resolve_bytes.size() - v46_tail(pre_v31_source));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v45_tail(pre_v31_source));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v44_tail(pre_v31_source));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v43_tail(pre_v31_source));
@@ -1406,9 +1657,10 @@ int main() {
               v37_compatible_bytes.size() >= 12,
           "current capture prepares the layout-compatible v37 fixture");
     if (v37_compatible_bytes.size() >=
-        v45_tail(captured) + v44_tail(captured) + v43_tail(captured) +
+        v46_tail(captured) + v45_tail(captured) + v44_tail(captured) + v43_tail(captured) +
             v42_tail(captured) + v41_tail(captured) +
             v40_tail(captured) + v39_tail(captured)) {
+        v37_compatible_bytes.resize(v37_compatible_bytes.size() - v46_tail(captured));
         v37_compatible_bytes.resize(v37_compatible_bytes.size() - v45_tail(captured));
         v37_compatible_bytes.resize(v37_compatible_bytes.size() - v44_tail(captured));
         v37_compatible_bytes.resize(v37_compatible_bytes.size() - v43_tail(captured));
@@ -1601,7 +1853,8 @@ int main() {
     v36_compute_source.raw_shader_versions.clear();
     CHECK(serialize_gpu_capture(v36_compute_source, v36_compute_bytes, error) &&
               v36_compute_bytes.size() >=
-                  v45_tail(v36_compute_source) + v44_tail(v36_compute_source) +
+                  v46_tail(v36_compute_source) + v45_tail(v36_compute_source) +
+                      v44_tail(v36_compute_source) +
                       v43_tail(v36_compute_source) +
                       v42_tail(v36_compute_source) + v41_tail(v36_compute_source) +
                       v40_tail(v36_compute_source) +
@@ -1609,12 +1862,14 @@ int main() {
                       v37_tail(v36_compute_source),
           "v37 capture exposes a removable compute subgroup-contract tail");
     if (v36_compute_bytes.size() >=
-        v45_tail(v36_compute_source) + v44_tail(v36_compute_source) +
+        v46_tail(v36_compute_source) + v45_tail(v36_compute_source) +
+            v44_tail(v36_compute_source) +
             v43_tail(v36_compute_source) +
             v42_tail(v36_compute_source) + v41_tail(v36_compute_source) +
             v40_tail(v36_compute_source) +
             v39_tail(v36_compute_source) +
             v37_tail(v36_compute_source)) {
+        v36_compute_bytes.resize(v36_compute_bytes.size() - v46_tail(v36_compute_source));
         v36_compute_bytes.resize(v36_compute_bytes.size() - v45_tail(v36_compute_source));
         v36_compute_bytes.resize(v36_compute_bytes.size() - v44_tail(v36_compute_source));
         v36_compute_bytes.resize(v36_compute_bytes.size() - v43_tail(v36_compute_source));
@@ -1823,7 +2078,7 @@ int main() {
     GpuCaptureFile failed_compute_loaded;
     CHECK(serialize_gpu_capture(failed_compute_capture, failed_compute_bytes, error) &&
               deserialize_gpu_capture(failed_compute_bytes, failed_compute_loaded, error) &&
-              failed_compute_loaded.format_version == 45 &&
+              failed_compute_loaded.format_version == 46 &&
               failed_compute_loaded.failure_diagnostics[0].compute_launch.threads_x == 37 &&
               failed_compute_loaded.failure_diagnostics[0].stages[0]
                       .recompile_config.user_sgprs ==
@@ -1836,7 +2091,8 @@ int main() {
 
     std::vector<uint8_t> v41_failed_compute_bytes = failed_compute_bytes;
     v41_failed_compute_bytes.resize(
-        v41_failed_compute_bytes.size() - v45_tail(failed_compute_capture) -
+        v41_failed_compute_bytes.size() - v46_tail(failed_compute_capture) -
+            v45_tail(failed_compute_capture) -
             v44_tail(failed_compute_capture) -
             v43_tail(failed_compute_capture) -
             v42_tail(failed_compute_capture));
@@ -2055,7 +2311,7 @@ int main() {
                 loaded_failed_msaa = &resource;
         }
     }
-    CHECK(failed_loaded.format_version == 45 && loaded_shadow &&
+    CHECK(failed_loaded.format_version == 46 && loaded_shadow &&
           loaded_shadow->resource.depth == 4 &&
           loaded_shadow->resource.max_uncompressed_block_size == 2 &&
           loaded_shadow->resource.max_compressed_block_size == 1 &&
@@ -2093,7 +2349,8 @@ int main() {
         // Fragment is the final stage with resources, and its MSAA descriptor is the final resource,
         // so this is exactly its v44 sample-count record rather than a preceding extension field.
         std::memcpy(malformed_failed_sample_bytes.data() +
-                        malformed_failed_sample_bytes.size() - v45_tail(failed_capture) -
+                        malformed_failed_sample_bytes.size() - v46_tail(failed_capture) -
+                            v45_tail(failed_capture) -
                             sizeof(uint32_t),
                     &invalid_samples, sizeof(invalid_samples));
     }
@@ -2107,14 +2364,17 @@ int main() {
     GpuCaptureFile v40_failed_loaded;
     CHECK(serialize_gpu_capture(failed_capture, v40_failed_bytes, error) &&
               v40_failed_bytes.size() >=
-                  v45_tail(failed_capture) + v44_tail(failed_capture) +
+                  v46_tail(failed_capture) + v45_tail(failed_capture) +
+                      v44_tail(failed_capture) +
                       v43_tail(failed_capture) +
                       v42_tail(failed_capture) + v41_tail(failed_capture),
           "v41 failed-stage resource tail is removable for a v40 compatibility fixture");
     if (v40_failed_bytes.size() >=
-        v45_tail(failed_capture) + v44_tail(failed_capture) +
+        v46_tail(failed_capture) + v45_tail(failed_capture) +
+            v44_tail(failed_capture) +
             v43_tail(failed_capture) +
             v42_tail(failed_capture) + v41_tail(failed_capture)) {
+        v40_failed_bytes.resize(v40_failed_bytes.size() - v46_tail(failed_capture));
         v40_failed_bytes.resize(v40_failed_bytes.size() - v45_tail(failed_capture));
         v40_failed_bytes.resize(v40_failed_bytes.size() - v44_tail(failed_capture));
         v40_failed_bytes.resize(v40_failed_bytes.size() - v43_tail(failed_capture));
@@ -2199,6 +2459,7 @@ int main() {
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - v46_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v45_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v44_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v43_tail(legacy_source));
@@ -2242,6 +2503,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - v46_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v45_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v44_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v43_tail(legacy_source));
@@ -2311,9 +2573,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 46;   // kVersion + 1: a future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 47;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 46",
+          error == "unsupported capture version 47",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

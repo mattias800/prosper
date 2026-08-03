@@ -5,12 +5,19 @@
 // not evidence of where it came from, so this test drives the real AGC packet builders and PM4
 // decoder, then checks the maps retained by the draw snapshots.
 #include "../src/gpu/command_processor.hpp"
+#include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include "../src/hle/dispatch.hpp"
+#include <algorithm>
+#include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 using namespace prosper;
 using namespace prosper::gpu;
@@ -61,14 +68,31 @@ static uint64_t pack_reg(uint32_t offset, uint32_t value) {
     return static_cast<uint64_t>(offset) | (static_cast<uint64_t>(value) << 32u);
 }
 
+static void set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
+
 int main() {
     std::printf("== test_command_provenance ==\n");
 #ifdef _WIN32
-    _putenv_s("PROSPER_UDPROV", "1");
+    _putenv_s("PROSPER_UDPROV", "");
+    _putenv_s("PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE", "0:ps:32");
 #else
-    setenv("PROSPER_UDPROV", "1", 1);
+    unsetenv("PROSPER_UDPROV");
+    setenv("PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE", "0:ps:32", 1);
 #endif
-    CHECK(udprov_enabled(), "PROSPER_UDPROV positive control is armed");
+    const bool selector_only_provenance =
+        std::getenv("PROSPER_UDPROV") == nullptr && udprov_enabled();
+    CHECK(selector_only_provenance,
+          "resource-provenance selector alone arms SH write provenance");
+    if (!selector_only_provenance) {
+        std::printf("== FAIL ==\n");
+        return 1;
+    }
 
     register_builtin_hle();
     auto setsh = Hle::lookup("-HOOCn0JY48");       // sceAgcDcbSetShRegistersIndirect
@@ -187,6 +211,175 @@ int main() {
                   q2_snapshot->sh.count(kUser + 0) == 0,
               "q2 state does not inherit q1/q3 graphics registers");
     }
+
+    // #1853 cross-thread positive control. A Dcb submitter writes the raw PS V#; only after an
+    // explicit hand-off does a distinct DcbFinal submitter emit the draw. The selected capture must
+    // attach the raw input to the draw's immutable semantic snapshot and name q1 as the last writer,
+    // not the host thread/q3 path that happened to issue the draw.
+    std::array<uint8_t, 32> cross_thread_bytes{};
+    const uint64_t cross_thread_addr =
+        reinterpret_cast<uint64_t>(cross_thread_bytes.data());
+    const std::array<uint32_t, 4> cross_thread_vsharp = {
+        static_cast<uint32_t>(cross_thread_addr),
+        static_cast<uint32_t>((cross_thread_addr >> 32u) & 0xffffu) | (16u << 16u),
+        1u,
+        (22u << 12u) | 0xFACu,
+    };
+    uint32_t writer_words[64]{};
+    Dcb writer_dcb = make_dcb(writer_words, std::size(writer_words));
+    for (uint32_t i = 0; i < cross_thread_vsharp.size(); ++i)
+        setsh_direct(reinterpret_cast<uint64_t>(&writer_dcb),
+                     pack_reg(P::SPI_SHADER_USER_DATA_PS_0 + i,
+                              cross_thread_vsharp[i]),
+                     0, 0, 0, 0);
+    uint32_t consumer_words[64]{};
+    Dcb consumer_dcb = make_dcb(consumer_words, std::size(consumer_words));
+    draw(reinterpret_cast<uint64_t>(&consumer_dcb), 3, 0, 0, 0, 0);
+
+    // Defect-shaped mutation: leave the selector and capture path armed, but disable the collector
+    // only for this fixture.  Earlier .at()-based provenance checks therefore remain safe, and the
+    // exact selected-witness assertion below—not the activation predicate—must be the named red.
+    const bool mutate_collection =
+        std::getenv("PROSPER_TEST_MUTATE_RESOURCE_INPUT_COLLECTION") != nullptr;
+    if (mutate_collection)
+        set_test_env("PROSPER_TEST_DISABLE_UDPROV_COLLECTION", "1");
+
+    GpuState cross_thread_state;
+    std::mutex handoff_mutex;
+    std::condition_variable handoff_cv;
+    bool writer_finished = false;
+    std::thread writer_thread([&] {
+        prosper_gpu_set_fold_origin(1);
+        run_command_buffer(writer_words, used_dwords(writer_dcb), cross_thread_state);
+        {
+            std::lock_guard<std::mutex> lock(handoff_mutex);
+            writer_finished = true;
+        }
+        handoff_cv.notify_one();
+    });
+    std::thread draw_thread([&] {
+        std::unique_lock<std::mutex> lock(handoff_mutex);
+        handoff_cv.wait(lock, [&] { return writer_finished; });
+        lock.unlock();
+        prosper_gpu_set_fold_origin(3);
+        run_command_buffer(consumer_words, used_dwords(consumer_dcb), cross_thread_state);
+    });
+    writer_thread.join();
+    draw_thread.join();
+
+    uint32_t overwrite_words[64]{};
+    Dcb overwrite_dcb = make_dcb(overwrite_words, std::size(overwrite_words));
+    for (uint32_t i = 0; i < cross_thread_vsharp.size(); ++i)
+        setsh_direct(reinterpret_cast<uint64_t>(&overwrite_dcb),
+                     pack_reg(P::SPI_SHADER_USER_DATA_PS_0 + i,
+                              cross_thread_vsharp[i] ^ 0x01010101u),
+                     0, 0, 0, 0);
+    prosper_gpu_set_fold_origin(2);
+    run_command_buffer(overwrite_words, used_dwords(overwrite_dcb), cross_thread_state);
+    const bool folded_end_was_overwritten =
+        cross_thread_state.sh.at(P::SPI_SHADER_USER_DATA_PS_0) !=
+            cross_thread_vsharp[0];
+
+    DrawItem cross_thread_draw;
+    cross_thread_draw.draw_index = 0;
+    if (!cross_thread_state.draws.empty())
+        cross_thread_draw.command_order = cross_thread_state.draws[0].command_order;
+    auto cross_thread_table = std::make_shared<ShaderResourceTable>();
+    ShaderResource cross_thread_resource;
+    cross_thread_resource.cls = ResourceClass::ConstantBuffer;
+    cross_thread_resource.format = DataFormat::Float32;
+    cross_thread_resource.num_components = 1;
+    cross_thread_resource.binding = 32;
+    cross_thread_resource.gpu_addr = cross_thread_addr;
+    cross_thread_resource.size = 16;
+    cross_thread_resource.stride = 16;
+    cross_thread_resource.sgpr_base = 0;
+    cross_thread_resource.direct_vsharp_sh_register_base =
+        P::SPI_SHADER_USER_DATA_PS_0;
+    cross_thread_draw.prt = cross_thread_table;
+    cross_thread_table->resources.push_back(cross_thread_resource);
+    PendingGpuCapture cross_thread_pending;
+    cross_thread_pending.resource_provenance_armed = true;
+    cross_thread_pending.resource_provenance_selector = {
+        0, ShaderProgramStage::Fragment, 32};
+    snapshot_pending_gpu_capture_draw_resource(
+        &cross_thread_pending, cross_thread_draw, {}, &cross_thread_state);
+
+    const auto& cross_thread_witness = cross_thread_pending.resource_provenance;
+    bool all_q1_direct_before_draw = cross_thread_witness.input_write_provenance_mask == 0x0f;
+    uint64_t writer_fold = 0;
+    for (uint32_t i = 0; all_q1_direct_before_draw && i < 4; ++i) {
+        const uint64_t write = cross_thread_witness.input_last_writes[i];
+        const Source source = unpack_source(cross_thread_witness.input_write_sources[i]);
+        if (!i) writer_fold = source.fold;
+        all_q1_direct_before_draw =
+            (write & GpuState::kProvIndirect) == 0 &&
+            (write & ~GpuState::kProvIndirect) < cross_thread_draw.command_order &&
+            source.origin == 1 && source.jump_depth == 0 && source.fold == writer_fold;
+    }
+    CHECK(cross_thread_state.draws.size() == 1 &&
+              cross_thread_witness.input_mode ==
+                  GpuCaptureResourceInputMode::DirectVSharp &&
+              cross_thread_witness.input_dwords == cross_thread_vsharp &&
+              gpu_capture_resource_input_verdict(cross_thread_witness,
+                                                 cross_thread_resource) ==
+                  GpuCaptureResourceInputVerdict::FullMatch &&
+              writer_fold != 0 && all_q1_direct_before_draw &&
+              folded_end_was_overwritten,
+          "selected draw uses immutable pre-overwrite q1 V# state and full-match identity");
+
+    if (mutate_collection) {
+        set_test_env("PROSPER_TEST_DISABLE_UDPROV_COLLECTION", nullptr);
+        prosper_gpu_set_fold_origin(0);
+        std::printf("== %s ==\n", fails ? "FAIL" : "PASS");
+        return fails ? 1 : 0;
+    }
+
+    DrawItem mismatched_draw = cross_thread_draw;
+    mismatched_draw.prt = std::make_shared<ShaderResourceTable>(*cross_thread_table);
+    auto& mismatched_resource = mismatched_draw.prt->resources[0];
+    mismatched_resource.gpu_addr += 16;
+    PendingGpuCapture mismatched_pending;
+    mismatched_pending.resource_provenance_armed = true;
+    mismatched_pending.resource_provenance_selector = {
+        0, ShaderProgramStage::Fragment, 32};
+    snapshot_pending_gpu_capture_draw_resource(
+        &mismatched_pending, mismatched_draw, {}, &cross_thread_state);
+    CHECK(mismatched_pending.resource_provenance.input_dwords ==
+              cross_thread_vsharp &&
+              gpu_capture_resource_input_verdict(
+                  mismatched_pending.resource_provenance,
+                  mismatched_resource) ==
+                  GpuCaptureResourceInputVerdict::Mismatch,
+          "raw SH origin is selected independently when normalized output mismatches");
+
+    GpuState missing_provenance_state = cross_thread_state;
+    if (!missing_provenance_state.draws.empty() &&
+        missing_provenance_state.draws[0].state) {
+        auto incomplete = std::make_shared<GpuState>(
+            *missing_provenance_state.draws[0].state);
+        incomplete->sh_prov.erase(P::SPI_SHADER_USER_DATA_PS_0 + 3);
+        missing_provenance_state.draws[0].state = std::move(incomplete);
+    }
+    PendingGpuCapture missing_provenance_pending;
+    missing_provenance_pending.resource_provenance_armed = true;
+    missing_provenance_pending.resource_provenance_selector = {
+        0, ShaderProgramStage::Fragment, 32};
+    snapshot_pending_gpu_capture_draw_resource(
+        &missing_provenance_pending, cross_thread_draw, {},
+        &missing_provenance_state);
+    const auto& missing_provenance =
+        missing_provenance_pending.resource_provenance;
+    CHECK(missing_provenance.input_mode ==
+              GpuCaptureResourceInputMode::Unavailable &&
+              missing_provenance.input_unavailable_reason ==
+                  GpuCaptureResourceInputUnavailableReason::MissingWriteProvenance &&
+              missing_provenance.input_write_provenance_mask == 0 &&
+              missing_provenance.input_sh_register_base == 0xFFFFFFFFu &&
+              std::all_of(missing_provenance.input_dwords.begin(),
+                          missing_provenance.input_dwords.end(),
+                          [](uint32_t value) { return value == 0; }),
+          "partial SH provenance stays explicitly unavailable and inert");
 
     prosper_gpu_set_fold_origin(0);
     std::printf("== %s ==\n", fails ? "FAIL" : "PASS");

@@ -549,6 +549,68 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
             static_cast<unsigned long long>(post_read),
             static_cast<unsigned long long>(provenance.post_content_hash),
             provenance.srt_offset, provenance.sgpr_base, verdict);
+
+        const prosper::gpu::ShaderResource* normalized = nullptr;
+        bool ambiguous = false;
+        for (const auto& draw : replay.items) {
+            if (draw.draw_index != provenance.draw_index) continue;
+            const auto& table = provenance.stage == prosper::gpu::ShaderProgramStage::Vertex
+                ? draw.vrt : draw.prt;
+            if (!table) continue;
+            for (const auto& resource : table->resources) {
+                if (resource.binding != provenance.binding) continue;
+                if (normalized) { ambiguous = true; break; }
+                normalized = &resource;
+            }
+            if (ambiguous) break;
+        }
+        const auto input_verdict = normalized && !ambiguous
+            ? prosper::gpu::gpu_capture_resource_input_verdict(provenance, *normalized)
+            : prosper::gpu::GpuCaptureResourceInputVerdict::Mismatch;
+        if (input_verdict == prosper::gpu::GpuCaptureResourceInputVerdict::Unavailable &&
+            provenance.input_mode ==
+                prosper::gpu::GpuCaptureResourceInputMode::Unavailable) {
+            std::printf(
+                "resource-input draw=%llu stage=%s binding=%u raw-identity=unavailable reason=%s\n",
+                static_cast<unsigned long long>(provenance.draw_index),
+                provenance.stage == prosper::gpu::ShaderProgramStage::Vertex ? "vs" : "ps",
+                provenance.binding,
+                prosper::gpu::gpu_capture_resource_input_unavailable_reason_name(
+                    provenance.input_unavailable_reason));
+        } else {
+            const char* input_name =
+                input_verdict == prosper::gpu::GpuCaptureResourceInputVerdict::FullMatch
+                    ? "full-match"
+                    : input_verdict == prosper::gpu::GpuCaptureResourceInputVerdict::Unavailable
+                        ? "unavailable" : "mismatch";
+            std::printf(
+                "resource-input draw=%llu stage=%s binding=%u raw-identity=%s%s%s sh-reg=%08x "
+                "dwords=%08x,%08x,%08x,%08x writes=",
+                static_cast<unsigned long long>(provenance.draw_index),
+                provenance.stage == prosper::gpu::ShaderProgramStage::Vertex ? "vs" : "ps",
+                provenance.binding, input_name,
+                input_verdict == prosper::gpu::GpuCaptureResourceInputVerdict::Unavailable
+                    ? " reason=" : "",
+                input_verdict == prosper::gpu::GpuCaptureResourceInputVerdict::Unavailable
+                    ? prosper::gpu::gpu_capture_resource_input_unavailable_reason_name(
+                          provenance.input_unavailable_reason)
+                    : "",
+                provenance.input_sh_register_base,
+                provenance.input_dwords[0], provenance.input_dwords[1],
+                provenance.input_dwords[2], provenance.input_dwords[3]);
+            for (size_t i = 0; i < provenance.input_last_writes.size(); ++i) {
+                const uint64_t write = provenance.input_last_writes[i];
+                const uint64_t source = provenance.input_write_sources[i];
+                std::printf("%s%c%llu/q%u,f%llu,j%u", i ? "," : "",
+                            (write & prosper::gpu::GpuState::kProvIndirect) ? 'i' : 'd',
+                            static_cast<unsigned long long>(
+                                write & ~prosper::gpu::GpuState::kProvIndirect),
+                            static_cast<unsigned>(source & 0xffu),
+                            static_cast<unsigned long long>(source >> 16u),
+                            static_cast<unsigned>((source >> 8u) & 0xffu));
+            }
+            std::printf("\n");
+        }
     }
     for (const auto& seed : replay.rtt_seeds) {
         const uint64_t hash = prosper::gpu::gpu_capture_hash(seed.rgba);
