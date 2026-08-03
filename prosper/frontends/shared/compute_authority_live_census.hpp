@@ -47,6 +47,84 @@ struct ComputeAuthorityLiveCounters {
     bool summary_reported = false;
 };
 
+// Source provenance for one reflected readable image binding.  Exact descriptor aliases bind the
+// owner's concrete Vulkan image/view but do not repeat the owner's cache/transfer setup, so their
+// per-binding flags are intentionally empty.  The shadow census must therefore distinguish direct
+// provenance from the provenance of the source that is actually bound.
+struct ComputeAuthorityImageSourceFacts {
+    uint32_t binding = 0;
+    uint32_t owner_binding = 0;
+    bool readable = false;
+    bool storage = false;
+    bool alias = false;
+    bool direct_transfer_borrowed = false;
+    bool owner_transfer_borrowed = false;
+    bool direct_persistent = false;
+    bool owner_persistent = false;
+    bool direct_upload_skipped = false;
+    bool owner_upload_skipped = false;
+    bool same_image = false;
+    bool same_view = false;
+};
+
+struct ComputeAuthorityImageSourceDecision {
+    bool observe = false;
+    bool proven_gpu = false;
+
+    constexpr ShadowComputeAuthorityConsumerKind consumer_kind() const {
+        return proven_gpu ? ShadowComputeAuthorityConsumerKind::ProvenGpuImage
+                          : ShadowComputeAuthorityConsumerKind::GuestImage;
+    }
+};
+
+constexpr ComputeAuthorityImageSourceDecision classify_compute_authority_image_source(
+    const ComputeAuthorityImageSourceFacts& facts) {
+    if (!facts.readable) return {};
+    const bool direct_proven = facts.direct_transfer_borrowed ||
+        (facts.storage && facts.direct_persistent && facts.direct_upload_skipped);
+    const bool exact_alias_source = facts.alias && facts.same_image && facts.same_view;
+    const bool owner_proven = facts.owner_transfer_borrowed ||
+        (facts.storage && facts.owner_persistent && facts.owner_upload_skipped);
+    return {true, direct_proven || (exact_alias_source && owner_proven)};
+}
+
+struct ComputeAuthorityImageSourceCounters {
+    uint64_t observations = 0;
+    uint64_t aliases = 0;
+    uint64_t direct_transfer_borrows = 0;
+    uint64_t owner_transfer_borrows = 0;
+    uint64_t direct_persistent = 0;
+    uint64_t owner_persistent = 0;
+    uint64_t direct_upload_skips = 0;
+    uint64_t owner_upload_skips = 0;
+    uint64_t same_images = 0;
+    uint64_t same_views = 0;
+    uint64_t proven_gpu = 0;
+    uint64_t guest = 0;
+};
+
+inline void record_compute_authority_image_source(
+    ComputeAuthorityImageSourceCounters& counters,
+    const ComputeAuthorityImageSourceFacts& facts,
+    const ComputeAuthorityImageSourceDecision& decision) {
+    if (!decision.observe) return;
+    const auto increment_if = [](uint64_t& counter, bool condition) {
+        if (condition) counter = shadow_compute_authority_increment(counter);
+    };
+    counters.observations = shadow_compute_authority_increment(counters.observations);
+    increment_if(counters.aliases, facts.alias);
+    increment_if(counters.direct_transfer_borrows, facts.direct_transfer_borrowed);
+    increment_if(counters.owner_transfer_borrows, facts.owner_transfer_borrowed);
+    increment_if(counters.direct_persistent, facts.direct_persistent);
+    increment_if(counters.owner_persistent, facts.owner_persistent);
+    increment_if(counters.direct_upload_skips, facts.direct_upload_skipped);
+    increment_if(counters.owner_upload_skips, facts.owner_upload_skipped);
+    increment_if(counters.same_images, facts.same_image);
+    increment_if(counters.same_views, facts.same_view);
+    increment_if(counters.proven_gpu, decision.proven_gpu);
+    increment_if(counters.guest, !decision.proven_gpu);
+}
+
 constexpr uint64_t compute_authority_saturating_add(uint64_t first, uint64_t second) {
     return second > std::numeric_limits<uint64_t>::max() - first
         ? std::numeric_limits<uint64_t>::max() : first + second;

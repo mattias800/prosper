@@ -58,6 +58,51 @@ int main() {
                   std::numeric_limits<uint64_t>::max(),
           "authority counters saturate at UINT64_MAX instead of wrapping");
 
+    ComputeAuthorityImageSourceFacts alias_source;
+    alias_source.binding = 5;
+    alias_source.owner_binding = 4;
+    alias_source.readable = true;
+    alias_source.alias = true;
+    alias_source.owner_transfer_borrowed = true;
+    alias_source.owner_persistent = true;
+    alias_source.same_image = true;
+    alias_source.same_view = true;
+    const ComputeAuthorityImageSourceDecision alias_decision =
+        classify_compute_authority_image_source(alias_source);
+    ComputeAuthorityImageSourceCounters alias_counters;
+    record_compute_authority_image_source(
+        alias_counters, alias_source, alias_decision);
+    ShadowComputeAuthorityCensus alias_chain;
+    (void)alias_chain.note_retained_result(atlas);
+    const ShadowComputeAuthorityTransition alias_read = alias_chain.observe(
+        alias_decision.consumer_kind(), atlas);
+    CHECK(alias_decision.observe && alias_decision.proven_gpu &&
+              alias_decision.consumer_kind() ==
+                  ShadowComputeAuthorityConsumerKind::ProvenGpuImage &&
+              alias_read.action == ShadowComputeAuthorityAction::KeepGpuAuthority &&
+              alias_read.reason == ShadowComputeAuthorityReason::ProvenGpuConsumer &&
+              alias_chain.state().pending() &&
+              alias_counters.observations == 1 && alias_counters.aliases == 1 &&
+              alias_counters.direct_transfer_borrows == 0 &&
+              alias_counters.owner_transfer_borrows == 1 &&
+              alias_counters.same_images == 1 && alias_counters.same_views == 1 &&
+              alias_counters.proven_gpu == 1 && alias_counters.guest == 0,
+          "readable exact image alias inherits its owner GPU authority proof");
+
+    ComputeAuthorityImageSourceFacts unreadable_alias = alias_source;
+    unreadable_alias.readable = false;
+    const ComputeAuthorityImageSourceDecision unreadable_decision =
+        classify_compute_authority_image_source(unreadable_alias);
+    ComputeAuthorityImageSourceFacts mismatched_alias = alias_source;
+    mismatched_alias.same_view = false;
+    const ComputeAuthorityImageSourceDecision mismatch_decision =
+        classify_compute_authority_image_source(mismatched_alias);
+    CHECK(!unreadable_decision.observe && mismatch_decision.observe &&
+              !mismatch_decision.proven_gpu &&
+              mismatch_decision.consumer_kind() ==
+                  ShadowComputeAuthorityConsumerKind::GuestImage,
+          "image authority keeps reflection readability and exact source identity fail-closed");
+
     ShadowComputeAuthorityCensus chain;
     const auto admitted = chain.note_retained_result(atlas);
     const auto first_gpu = chain.observe(
