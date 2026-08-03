@@ -181,6 +181,8 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
   /tmp/submit.prgcap                              # visual bisection filmstrip (see below)
 ./build-linux/gpu_replay --warmup-repeats 2 /tmp/submit.prgcap /tmp/converged.bmp
 ./build-linux/gpu_replay --dump-resource 18:ps:34 /tmp/texture.bin /tmp/submit.prgcap
+./build-linux/gpu_replay --override-resource 18:ps:34 ~/captures/texture.bin \
+  --inspect-only ~/captures/submit.prgcap
 ./build-linux/gpu_replay --dump-rtt-seed 0x7f9f504b0000 /tmp/history.bmp \
   --inspect-only /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-shader 18:fs /tmp/fragment.spv /tmp/submit.prgcap
@@ -456,13 +458,24 @@ These environment variables are localization probes, not fixes, and their output
 regression oracle.
 
 Every user-facing `DRAW` selector (`--draw`, `--dump-resource`, `--dump-shader`,
-`--dump-realized-shader`, `PROSPER_GEOM_PROBE`, and `PROSPER_FS_TAP`) uses the stable semantic draw ID
+`--override-resource`, `--dump-realized-shader`, `PROSPER_GEOM_PROBE`, and `PROSPER_FS_TAP`) uses
+the stable semantic draw ID
 printed as `draw[ID]` by `--inspect-only`. The adjacent `item=I` is only the compact realized-vector offset;
 it can differ after an unrealized draw and is never a selector. Mixed `operation[N]` ordinals remain a separate,
 explicit namespace used by `--through-operation`. Replay restores serialized render-target seeds before
 operation zero and uses owned resource memory; it must not dereference original guest mappings. Bundle
 operation sources are semantic draw IDs and may contain holes; tooling resolves them through each realized
 item's `draw_index`, never as offsets into the compact draw vector.
+
+`--override-resource DRAW:vs|ps:BINDING PATH` replaces exactly one realized draw's captured
+resource span in memory. The file must have exactly the selected resource's captured byte count.
+The tool clones the selected stage table and owns the replacement separately, so other draws that
+share a table or content-deduplicated backing remain unchanged. It prints the draw, stage, binding,
+guest address, size, and stable original/replacement hashes. Combine it with `--inspect-only` to
+prove the replacement was installed without initializing Vulkan; the selected table's normal
+`hash=` field will equal the reported `new-hash`. A rendering replay still enforces the capture's
+output oracle, so add the explicit `--allow-mismatch` diagnostic option when an intentional input
+change is expected to alter the final image.
 
 `--draw-with-compute-prefix` retains every compute operation before the selected draw while discarding the
 other graphics draws. This isolates geometry whose vertex/indirect buffers are produced earlier in the same
