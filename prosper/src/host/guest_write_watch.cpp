@@ -813,6 +813,8 @@ const char* trace_reason_name(GuestDmemWriteTraceInvalidReason reason) {
     case GuestDmemWriteTraceInvalidReason::PhysicalWrite: return "physical-write";
     case GuestDmemWriteTraceInvalidReason::ProtectFailed: return "protect-failed";
     case GuestDmemWriteTraceInvalidReason::RearmFailed: return "rearm-failed";
+    case GuestDmemWriteTraceInvalidReason::SingleStepUnavailable:
+        return "single-step-unavailable";
     case GuestDmemWriteTraceInvalidReason::TrapFlagAlreadyOwned:
         return "trap-flag-already-owned";
     }
@@ -1692,9 +1694,9 @@ void guest_write_watch_invalidate_all() {
 // Unified page-fault path for the production dirty bit and the opt-in dmem provenance overlay. The
 // latter single-steps exactly one faulting store so it can retain before/after bytes; all vectors are
 // built before arming, so this signal path performs no allocation.
-GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint64_t writer_rip,
-                                                             int64_t tid,
-                                                             bool trap_flag_already_owned) {
+static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
+        uint64_t addr, uint64_t writer_rip, int64_t tid, bool trap_flag_already_owned,
+        bool single_step_available) {
     WatchState& w = state();
     if (!w.fault_onstack.load(std::memory_order_acquire))
         return GuestWriteWatchFaultAction::NotHandled;
@@ -1771,6 +1773,22 @@ GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint
         return GuestWriteWatchFaultAction::Resume;
     }
 
+    if (trace_page && !single_step_available) {
+        // The retained bool interface predates the provenance overlay and gives its caller no way to
+        // set TF or route the completion trap. It may still be the installed handler for production
+        // dirty watches. Open and invalidate the diagnostic without publishing a fictitious TID 0
+        // owner, while preserving the ordinary production fault's Dirty/Resume behavior.
+        for (const DmemTracePage& trace_page_entry : w.trace.pages) {
+            const auto found = w.pages_by_phys.find(trace_page_entry.phys);
+            if (found != w.pages_by_phys.end()) disarm_production_page(found->second.get());
+        }
+        if (production_handled) bump(stats().faults);
+        ++w.trace.page_faults;
+        ++w.trace.coverage_gaps;
+        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::SingleStepUnavailable, true);
+        return GuestWriteWatchFaultAction::Resume;
+    }
+
     if (trace_page && trap_flag_already_owned) {
         // TF already belongs to a breakpoint/step-window owner. Claiming this write and consuming its
         // TRAP_TRACE would strand that owner's disabled breakpoint or unfinished step. Mark every
@@ -1825,17 +1843,27 @@ GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint
     pending.writer_rip = writer_rip;
     pending.tid = tid;
     pending.size = w.trace.config.size;
-    pending.decoded_write_size = guest_dmem_write_trace_decode_contiguous_store_size(
-        reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(writer_rip)));
-    if (pending.decoded_write_size &&
-        trace_fault_phys <= UINT64_MAX - pending.decoded_write_size) {
+    pending.decoded_write_size = writer_rip
+        ? guest_dmem_write_trace_decode_contiguous_store_size(
+              reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(writer_rip)))
+        : 0;
+    const bool fault_byte_selected = trace_fault_phys >= w.trace.target_phys &&
+                                     trace_fault_phys < w.trace.target_end_phys;
+    if (fault_byte_selected) {
+        // CR2 itself is an observed write byte, regardless of where the operand began.
+        pending.selected = true;
+    } else if (pending.decoded_write_size &&
+               (pending.decoded_write_size == 1 || (addr & (kPage - 1)) != 0) &&
+               trace_fault_phys <= UINT64_MAX - pending.decoded_write_size) {
+        // Away from a page boundary, the first byte on our protected page is the operand start. A
+        // boundary CR2 can instead be the first inaccessible byte of a store that began on the prior
+        // writable page, so adding width to it would invent an operand span.
         pending.selected = trace_fault_phys < w.trace.target_end_phys &&
-                           trace_fault_phys + pending.decoded_write_size >
-                               w.trace.target_phys;
+                           trace_fault_phys + pending.decoded_write_size > w.trace.target_phys;
+    } else if (pending.decoded_write_size) {
+        pending.selection_uncertain = true;
     } else {
         pending.decoded_write_size = 0;
-        pending.selected = trace_fault_phys >= w.trace.target_phys &&
-                           trace_fault_phys < w.trace.target_end_phys;
     }
     pending.coverage_valid_before = w.trace.coverage_gaps == 0;
     if (!trace_copy_target_locked(w.trace, pending.before)) {
@@ -1878,8 +1906,15 @@ GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint
     return GuestWriteWatchFaultAction::SingleStep;
 }
 
+GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint64_t writer_rip,
+                                                             int64_t tid,
+                                                             bool trap_flag_already_owned) {
+    return guest_write_watch_handle_fault_impl(
+        addr, writer_rip, tid, trap_flag_already_owned, true);
+}
+
 bool guest_write_watch_handle_fault(uint64_t addr) {
-    return guest_write_watch_handle_fault_ex(addr, 0, 0) !=
+    return guest_write_watch_handle_fault_impl(addr, 0, 0, false, false) !=
            GuestWriteWatchFaultAction::NotHandled;
 }
 

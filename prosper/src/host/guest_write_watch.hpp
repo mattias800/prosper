@@ -77,6 +77,7 @@ enum class GuestDmemWriteTraceInvalidReason : uint8_t {
     PhysicalWrite,
     ProtectFailed,
     RearmFailed,
+    SingleStepUnavailable,
     TrapFlagAlreadyOwned,
 };
 
@@ -94,8 +95,10 @@ struct GuestDmemWriteTraceEvent {
     uint64_t next_rip = 0;
     int64_t tid = 0;
     uint32_t size = 0;
-    // Nonzero only when the signal-safe decoder proves one contiguous memory-write span for the
-    // faulting instruction. This makes before-range crossing and definitely-disjoint writes exact.
+    // Nonzero only when the signal-safe decoder proves one contiguous memory-write width for the
+    // faulting instruction. CR2 identifies the first inaccessible byte, not necessarily the operand
+    // start: a multi-byte store faulting exactly at a page boundary therefore remains uncertain when
+    // that fault byte is outside the selected interval.
     uint32_t decoded_write_size = 0;
     bool selected = false;
     // A page fault reports the first faulting byte, not the memory operand's full write extent. When
@@ -201,7 +204,9 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size);
 // need not create a false dirty result.
 void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size);
 
-// Retained for the platform-neutral VEH interface; Windows currently returns false because
+// Retained for callers that can only resume a handled fault and cannot own a TF completion. On Linux
+// it preserves production dirty-watch behavior but fail-visibly invalidates/opens an overlapping dmem
+// diagnostic rather than publishing a step nobody can complete. Windows returns false because
 // page-fault write watches are unsafe for SysV guest code.
 bool guest_write_watch_handle_fault(uint64_t addr);
 

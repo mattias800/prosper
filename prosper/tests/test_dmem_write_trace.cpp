@@ -44,6 +44,7 @@ std::atomic<bool> release_unknown_step{false};
 std::atomic<bool> preowned_tf_active{false};
 std::atomic<bool> preowned_tf_started{false};
 std::atomic<uint32_t> preowned_tf_completed{0};
+std::atomic<bool> legacy_bool_fault_active{false};
 std::atomic<int> last_step_action{-1};
 std::atomic<uint32_t> trap_count{0};
 volatile sig_atomic_t post_store_marker = 0;
@@ -73,6 +74,10 @@ void trace_signal_handler(int sig, siginfo_t* info, void* raw_context) {
     }
     if (sig == SIGSEGV && info && info->si_addr &&
         (context->uc_mcontext.gregs[REG_ERR] & 2)) {
+        if (legacy_bool_fault_active.load(std::memory_order_acquire) &&
+            prosper::host::guest_write_watch_handle_fault(
+                reinterpret_cast<uint64_t>(info->si_addr)))
+            return;
         const auto action = prosper::host::guest_write_watch_handle_fault_ex(
             reinterpret_cast<uint64_t>(info->si_addr),
             static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RIP]), tid,
@@ -616,6 +621,67 @@ int main() {
               crossing.events[0].fault_addr == reinterpret_cast<uint64_t>(mapping + offset - 4) &&
               std::memcmp(crossing.events[0].before.data(), crossing.events[0].after.data(), bytes) != 0,
           "qword beginning before the range is selected when its completed store changes selected bytes");
+
+    // A decoded width does not turn CR2 into an operand start. Begin a qword four bytes before a page
+    // boundary while selecting P+4 onward. The fault reports P (the first inaccessible byte), and
+    // inventing [P,P+8) would falsely overlap the selection even though the real store ends at P+3.
+    auto split_page_config = config;
+    split_page_config.offset = page + 4;
+    CHECK(prosper::host::guest_dmem_write_trace_configure(split_page_config),
+          "selector can be reset for split-page CR2 control");
+    std::memset(mapping + split_page_config.offset, 0x31, bytes);
+    prosper::host::guest_dmem_write_trace_notify_allocation(
+        physical, allocation_size, chain);
+    volatile sig_atomic_t split_page_marker = 0;
+    store_qword_then_mark(mapping + page - 4, 0x8877665544332211ull,
+                          &split_page_marker);
+    const auto split_page = prosper::host::guest_dmem_write_trace_snapshot();
+    CHECK(split_page_marker == 1 &&
+              split_page.status == prosper::host::GuestDmemWriteTraceStatus::Armed &&
+              split_page.result == prosper::host::GuestDmemWriteTraceResult::Undetermined &&
+              split_page.event_count == 1 && split_page.selected_faults == 0 &&
+              split_page.selection_uncertain_faults == 1 &&
+              !split_page.events[0].selected &&
+              split_page.events[0].selection_uncertain &&
+              split_page.events[0].decoded_write_size == 8 &&
+              split_page.events[0].fault_addr ==
+                  reinterpret_cast<uint64_t>(mapping + page) &&
+              std::memcmp(split_page.events[0].before.data(),
+                          split_page.events[0].after.data(), bytes) == 0,
+          "split-page store cannot attribute CR2-plus-width as the selected writer span");
+
+    // The retained bool handler cannot set TF or route TRAP_TRACE. Exercise a real write through that
+    // interface while a production watch overlaps the diagnostic: it must preserve Dirty/Resume, but
+    // invalidate and open the trace without publishing sentinel TID 0 as a step owner. complete_step(0)
+    // is called only as mutant cleanup; it must be NotHandled in the real implementation.
+    CHECK(prosper::host::guest_dmem_write_trace_configure(config),
+          "selector can be reset for legacy bool fault-interface control");
+    prosper::host::guest_dmem_write_trace_notify_allocation(
+        physical, allocation_size, chain);
+    auto legacy_production_watch = prosper::host::GuestWriteWatch::create(
+        reinterpret_cast<uint64_t>(mapping + offset), bytes);
+    CHECK(static_cast<bool>(legacy_production_watch),
+          "production watch overlaps the legacy bool trace control");
+    volatile sig_atomic_t legacy_bool_marker = 0;
+    legacy_bool_fault_active.store(true, std::memory_order_release);
+    store_byte_then_mark(mapping + offset + 8, 0xd8, &legacy_bool_marker);
+    legacy_bool_fault_active.store(false, std::memory_order_release);
+    const auto legacy_bool = prosper::host::guest_dmem_write_trace_snapshot();
+    prosper::host::GuestDmemWriteTraceEvent legacy_mutant_cleanup_event{};
+    const auto legacy_mutant_cleanup = prosper::host::guest_dmem_write_trace_complete_step(
+        0, 0, legacy_mutant_cleanup_event);
+    CHECK(legacy_bool_marker == 1 && mapping[offset + 8] == 0xd8 &&
+              legacy_production_watch.query() ==
+                  prosper::host::GuestWriteWatchQuery::Dirty &&
+              legacy_bool.status == prosper::host::GuestDmemWriteTraceStatus::Invalid &&
+              legacy_bool.invalid_reason ==
+                  prosper::host::GuestDmemWriteTraceInvalidReason::SingleStepUnavailable &&
+              legacy_bool.page_faults == 1 && legacy_bool.coverage_gaps == 1 &&
+              legacy_bool.event_count == 0 && legacy_bool.selected_faults == 0 &&
+              legacy_mutant_cleanup ==
+                  prosper::host::GuestDmemWriteTraceStepAction::NotHandled,
+          "legacy bool fault path completes the store without stranding a zero-TID trace step");
+    legacy_production_watch.reset();
 
     CHECK(prosper::host::guest_dmem_write_trace_configure(config),
           "selector can be reset for mapping-topology control");

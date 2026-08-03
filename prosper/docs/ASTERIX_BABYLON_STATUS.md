@@ -263,6 +263,16 @@ paused-step reconfiguration, unavailable post formatting, a sibling write during
 window, and a real `int3`-owned step through the protected store. These are apparatus corrections only and
 produce no new title-live conclusion.
 
+A third exact-head review closed two remaining capability/addressing holes in the apparatus. The
+retained boolean fault handler cannot request TF or route its completion, so it now preserves an
+overlapping production watch's Dirty/Resume behavior while invalidating the diagnostic as
+`single-step-unavailable`; it never publishes sentinel TID 0 or leaves selected pages stranded RW.
+Separately, a decoded store width is no longer added to page-boundary CR2 as if the first inaccessible
+byte were the operand start. A real qword beginning at `P-4`, faulting at P, and ending before a
+selection at `P+4` now remains selection-uncertain rather than becoming a false writer. Both real-fault
+canaries have defect-shaped mutations that fail only their named checks. These remain reusable
+instrument corrections; no new Asterix live run or writer conclusion was produced.
+
 The first exact live arm at commit `d181953e` was **VOID, by a useful self-invalidating result**. It
 completed 220 presents and captured submit 181 with the same exact positive control: 8 draws, 6 computes,
 14 operations, zero failures, and draw 0 PS binding 32 at `0x20122d32f0`, with 128/128 bytes at both
