@@ -5,6 +5,7 @@
 #define _GNU_SOURCE   // pthread_getattr_np (bound the PREADLOG/DEEPTRACE stack walk to the real stack)
 #endif
 #include "dispatch.hpp"
+#include "hle_addcontent.hpp"
 #include "nid.hpp"
 #include "sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
@@ -747,7 +748,10 @@ namespace {
 #endif
 }
 
-void set_app0_root(const std::string& root) { g_app0 = root; }
+void set_app0_root(const std::string& root) {
+    g_app0 = root;
+    addcontent_configure_for_app0(root);
+}
 std::string resolve_guest_path(const char* guest_path) {
     if (!guest_path || !*guest_path) return {};
     std::string p = guest_path;

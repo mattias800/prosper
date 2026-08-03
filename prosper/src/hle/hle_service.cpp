@@ -4,6 +4,7 @@
 // game gets consistent values instead of uninitialized memory.
 // (Game-controller input — libScePad — moved to hle_pad.cpp with a real host backend.)
 #include "dispatch.hpp"
+#include "hle_addcontent.hpp"
 #include "hle_json2.hpp"
 #include "nid.hpp"
 #include "callback_fs.hpp"
@@ -2015,6 +2016,127 @@ HLE(s_ime_kbd_info) {
 }
 
 // --- app content ---
+namespace {
+constexpr uint64_t APP_CONTENT_ERROR_PARAMETER = 0x80D90002ull;
+constexpr uint64_t APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT = 0x80D90007ull;
+constexpr uint64_t NP_ENTITLEMENT_ERROR_PARAMETER = 0x817D0002ull;
+constexpr uint64_t NP_ENTITLEMENT_ERROR_NO_ENTITLEMENT = 0x817D0007ull;
+
+// Direct PS5 guest evidence pins these boundaries. Sonic allocates exactly 0x1c bytes per
+// NpEntitlementAccess list entry and passes a 20-byte label to AddcontMount; Crisis Core independently
+// allocates the same stride and consumes exactly 16 key bytes. AppContent's inherited info is the
+// label+download-status prefix. Sonic directly
+// reads `download_status` at +0x18 and accepts INSTALLED=4. Package types PSAC=2 / PSAL=3 and the
+// NP entitlement errno space are pinned to the dlc_emu producer at 43ae9aa (CONFIDENCE: HIGH).
+struct AppContentAddcontInfo {
+    char entitlement_label[20];
+    uint32_t download_status;
+};
+struct NpAddcontEntitlementInfo {
+    char entitlement_label[20];
+    uint32_t package_type;
+    uint32_t download_status;
+};
+static_assert(sizeof(AppContentAddcontInfo) == 24, "SceAppContentAddcontInfo ABI");
+static_assert(offsetof(AppContentAddcontInfo, download_status) == 20,
+              "SceAppContentAddcontInfo status offset");
+static_assert(sizeof(NpAddcontEntitlementInfo) == 28,
+              "SceNpEntitlementAccessAddcontEntitlementInfo ABI");
+static_assert(offsetof(NpAddcontEntitlementInfo, package_type) == 20 &&
+              offsetof(NpAddcontEntitlementInfo, download_status) == 24,
+              "Np add-content info field offsets");
+
+bool appcontent_valid_label_text(const char* text, size_t size) {
+    if (!size || size > 16) return false;
+    for (size_t i = 0; i < size; ++i) {
+        const char ch = text[i];
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+              (ch >= '0' && ch <= '9')))
+            return false;
+    }
+    return true;
+}
+
+bool appcontent_read_label(uint64_t address, std::string& label) {
+    if (!svc_ptrish(address)) return false;
+    char raw[20];
+    if (!svc_copy_bytes(address, raw, sizeof(raw))) return false;
+    size_t size = 0;
+    while (size < 17 && raw[size]) ++size;
+    if (size == 17 || !appcontent_valid_label_text(raw, size)) return false;
+    label.assign(raw, size);
+    return true;
+}
+
+AppContentAddcontInfo appcontent_info(const InstalledAddcontent& entry) {
+    AppContentAddcontInfo info{};
+    std::memcpy(info.entitlement_label, entry.entitlement_label.c_str(),
+                entry.entitlement_label.size() + 1);
+    info.download_status = entry.download_status;
+    return info;
+}
+
+NpAddcontEntitlementInfo npent_info(const InstalledAddcontent& entry) {
+    NpAddcontEntitlementInfo info{};
+    std::memcpy(info.entitlement_label, entry.entitlement_label.c_str(),
+                entry.entitlement_label.size() + 1);
+    info.package_type = entry.package_type;
+    info.download_status = entry.download_status;
+    return info;
+}
+
+const InstalledAddcontent* find_addcontent(const AddcontentInventorySnapshot& inventory,
+                                           uint32_t service_label,
+                                           const std::string& entitlement_label) {
+    for (const InstalledAddcontent& entry : inventory.entries) {
+        if ((entry.service_label == -1 ||
+             static_cast<uint32_t>(entry.service_label) == service_label) &&
+            entry.entitlement_label == entitlement_label) return &entry;
+    }
+    return nullptr;
+}
+
+template <typename GuestInfo, typename MakeInfo>
+uint64_t addcontent_info_list(uint64_t list_address, uint64_t list_num,
+                              uint64_t hit_num_address, uint32_t service_label,
+                              uint64_t parameter_error, uint64_t inventory_error,
+                              MakeInfo make_info) {
+    if (list_num > UINT32_MAX) return parameter_error;
+    const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
+    if (inventory.state == AddcontentInventoryState::Invalid) return inventory_error;
+
+    std::vector<const InstalledAddcontent*> matching;
+    for (const InstalledAddcontent& entry : inventory.entries)
+        if (entry.service_label == -1 ||
+            static_cast<uint32_t>(entry.service_label) == service_label)
+            matching.push_back(&entry);
+
+    const uint32_t capacity = static_cast<uint32_t>(list_num);
+    const uint32_t total = static_cast<uint32_t>(matching.size());
+    // Both producer list APIs define NULL-list or zero-capacity as a count query, where hitNum is
+    // mandatory. On a real list call hitNum is optional.
+    if (list_address == 0 || capacity == 0) {
+        if (!svc_ptrish(hit_num_address) ||
+            !svc_write_bytes(hit_num_address, &total, sizeof(total))) return parameter_error;
+        return 0;
+    }
+    const uint32_t written = static_cast<uint32_t>(std::min<size_t>(capacity, matching.size()));
+    if (!svc_ptrish(list_address) ||
+        written > (UINT64_MAX - list_address) / sizeof(GuestInfo)) return parameter_error;
+    for (uint32_t i = 0; i < written; ++i) {
+        const GuestInfo info = make_info(*matching[i]);
+        if (!svc_write_bytes(list_address + uint64_t{i} * sizeof(GuestInfo),
+                             &info, sizeof(info))) return parameter_error;
+    }
+    // The dlc_emu producer/reference writes min(listNum,total) entries but reports the full total in
+    // hitNum for both AppContent and NpEntitlementAccess. Pin: drakmor/dlc_emu@43ae9aa,
+    // dlc_content.cpp:1941-1965 and 2357-2385. This lets a short caller discover and retry the count.
+    if (hit_num_address && !svc_write_bytes(hit_num_address, &total, sizeof(total)))
+        return parameter_error;
+    return 0;
+}
+} // namespace
+
 // sceAppContentAppParamGetInt(paramId, int32_t* value): paramId 0 = SKU_FLAG, whose only valid values are
 // TRIAL=1 / FULL=3 (there is NO 0). Writing 0 for it made the SKU check indeterminate -> a game testing
 // `sku == FULL` drops into trial/demo mode (locked content, "buy full game" gating). Report FULL for a
@@ -2124,19 +2246,53 @@ HLE(s_appcontent_tmpmount2) {
 // value games use to size caches/allocations.
 HLE(s_appcontent_tmpspace) { if (a1) *(uint64_t*)PW(a1) = 1048576ull; return 0; }
 
-// sceAppContentGetAddcontInfoList(serviceLabel, Info* list, u32 listNum, u32* hitNum): the add-content
-// (DLC) enumeration. The game first count-queries with list=NULL/num=0 and an out pointer in a3, then
-// grows a hitNum-sized array. Was MISSING -> the return-0 stub reported success while leaving *hitNum
-// (a3) uninitialized -> the engine sized an array from heap garbage = the 34 GB OOM / heap-overflow
-// class (cf. #213). This dump has no DLC, so the truthful answer is SUCCESS with hitNum=0 (matches the
-// sibling s_npent_addcont_list). CONFIDENCE: MED (no-DLC hitNum=0 is the retail answer; import inferred).
+// sceAppContentGetAddcontInfoList(serviceLabel, Info* list, u32 listNum, u32* hitNum). A zero-capacity
+// call is the count query; a shorter caller buffer receives only its capacity while hitNum reports the
+// full matching count. With no manifest the retail no-DLC answer remains SUCCESS/hitNum=0. A malformed host
+// inventory fails rather than masquerading as a valid empty install.
 HLE(s_appcontent_addcont_list) {
-    if (!svc_ptrish(a3)) return 0x80D90002ull;   // APP_CONTENT_ERROR_PARAMETER
-    *(uint32_t*)PW(a3) = 0;                       // hitNum = 0: no add-content installed
-    return 0;
+    if (a0 > UINT32_MAX) return APP_CONTENT_ERROR_PARAMETER;
+    return addcontent_info_list<AppContentAddcontInfo>(
+        a1, a2, a3, static_cast<uint32_t>(a0), APP_CONTENT_ERROR_PARAMETER,
+        APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT, appcontent_info);
 }
-// GetAddcontInfo / GetEntitlementKey / AddcontMount for an unknown label: no entitlement (offline, no DLC).
-HLE(s_appcontent_no_entitlement) { return 0x80D90007ull; }   // APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT
+
+HLE(s_appcontent_addcont_info) {
+    std::string label;
+    if (a0 > UINT32_MAX || !appcontent_read_label(a1, label) || !svc_ptrish(a2))
+        return APP_CONTENT_ERROR_PARAMETER;
+    const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
+    if (inventory.state == AddcontentInventoryState::Invalid)
+        return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
+    const InstalledAddcontent* entry = find_addcontent(inventory, static_cast<int32_t>(a0), label);
+    if (!entry) return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
+    const AppContentAddcontInfo info = appcontent_info(*entry);
+    return svc_write_bytes(a2, &info, sizeof(info)) ? 0 : APP_CONTENT_ERROR_PARAMETER;
+}
+
+HLE(s_appcontent_entitlement_key) {
+    std::string label;
+    if (a0 > UINT32_MAX || !appcontent_read_label(a1, label) || !svc_ptrish(a2))
+        return APP_CONTENT_ERROR_PARAMETER;
+    const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
+    const InstalledAddcontent* entry = inventory.state == AddcontentInventoryState::Ready
+        ? find_addcontent(inventory, static_cast<int32_t>(a0), label) : nullptr;
+    if (!entry || !entry->has_entitlement_key) return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
+    return svc_write_bytes(a2, entry->entitlement_key.data(), entry->entitlement_key.size())
+        ? 0 : APP_CONTENT_ERROR_PARAMETER;
+}
+
+HLE(s_appcontent_addcont_mount) {
+    std::string label;
+    if (a0 > UINT32_MAX || !appcontent_read_label(a1, label) || !svc_ptrish(a2))
+        return APP_CONTENT_ERROR_PARAMETER;
+    const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
+    const InstalledAddcontent* entry = inventory.state == AddcontentInventoryState::Ready
+        ? find_addcontent(inventory, static_cast<int32_t>(a0), label) : nullptr;
+    if (!entry || entry->guest_mount_point.empty()) return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
+    return svc_write_bytes(a2, entry->guest_mount_point.c_str(), entry->guest_mount_point.size() + 1)
+        ? 0 : APP_CONTENT_ERROR_PARAMETER;
+}
 
 // sceSystemServiceParamGetString(paramId, char* buf, size_t bufSize): fetch a system string parameter
 // (e.g. the console/user nickname). The default unimplemented stub returned 0 (SUCCESS) but never wrote
@@ -3020,7 +3176,15 @@ HLE(s_gameintent_get_property_string) {
 }
 HLE(s_npent_addcont_info) {
     svc_log("sceNpEntitlementAccessGetAddcontEntitlementInfo", a0,a1,a2,a3,a4,a5);
-    return NP_ERR_SIGNED_OUT;
+    std::string label;
+    if (a0 > UINT32_MAX || !appcontent_read_label(a1, label) || !svc_ptrish(a2))
+        return NP_ENTITLEMENT_ERROR_PARAMETER;
+    const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
+    const InstalledAddcontent* entry = inventory.state == AddcontentInventoryState::Ready
+        ? find_addcontent(inventory, static_cast<int32_t>(a0), label) : nullptr;
+    if (!entry) return NP_ENTITLEMENT_ERROR_NO_ENTITLEMENT;
+    const NpAddcontEntitlementInfo info = npent_info(*entry);
+    return svc_write_bytes(a2, &info, sizeof(info)) ? 0 : NP_ENTITLEMENT_ERROR_PARAMETER;
 }
 
 // ===== Issue #306: honest OFFLINE console for the online/update/entitlement boot chain. =========
@@ -3216,24 +3380,32 @@ HLE(s_gameupdate_term) { svc_log("sceGameUpdateTerminate",           a0,a1,a2,a3
 //                                 u32* hitNum)
 // — the game first count-queries with list=NULL/num=0 and an out pointer in a3, then calls again
 // with a 4-entry buffer (its four addcont slots). Matches the documented PS4 signature 1:1.
-// This dump has NO additional content installed and no signed-in user, so the truthful console
-// answer is SUCCESS with hitNum=0 (DLC entitlement lookups work offline from local state; there
-// simply are none). CONFIDENCE: HIGH on the shape (live-pinned + PS4 doc agree), MED on hitNum=0
-// being the exact retail no-DLC answer.
+// Entries come only from the validated local installation inventory. A title with no dlc_emu.ini
+// retains the retail no-DLC answer SUCCESS/hitNum=0; a present but invalid manifest fails visibly.
+// CONFIDENCE: HIGH on the shape (two independent PS5 guests allocate 0x1c bytes per entry and Sonic
+// directly consumes status at +0x18). Package enum values and errno behavior are producer-pinned.
 HLE(s_npent_addcont_list) {
     svc_log("sceNpEntitlementAccessGetAddcontEntitlementInfoList", a0,a1,a2,a3,a4,a5);
-    if (svc_ptrish(a3)) *(uint32_t*)PW(a3) = 0;   // hitNum = 0: no addcont entitlements
-    return 0;
+    if (a0 > UINT32_MAX) return NP_ENTITLEMENT_ERROR_PARAMETER;
+    return addcontent_info_list<NpAddcontEntitlementInfo>(
+        a1, a2, a3, static_cast<uint32_t>(a0), NP_ENTITLEMENT_ERROR_PARAMETER,
+        NP_ENTITLEMENT_ERROR_NO_ENTITLEMENT, npent_info);
 }
 // GetEntitlementKey(serviceLabel, const Label* label, Key* out) — live capture: retried 4x with
-// identical args (the garbage-consuming retry signature). With no entitlement to derive a key
-// from, honest FAILURE beats success+garbage-key; the exact NpEntitlementAccess errno space is
-// unreferenced, so the generic Np signed-out error is used (only the sign is consumed by a clean
-// caller). With hitNum=0 above the game should no longer ask at all. CONFIDENCE: LOW on the
-// error constant, HIGH that failure is the truthful state.
+// identical args (the garbage-consuming retry signature). Crisis Core independently consumes
+// exactly 16 bytes from the successful output. Only a validated, installed record with a declared
+// key succeeds; unknown labels and licence records without a key retain honest failure.
 HLE(s_npent_getkey) {
     svc_log("sceNpEntitlementAccessGetEntitlementKey", a0,a1,a2,a3,a4,a5);
-    return NP_ERR_SIGNED_OUT;
+    std::string label;
+    if (a0 > UINT32_MAX || !appcontent_read_label(a1, label) || !svc_ptrish(a2))
+        return NP_ENTITLEMENT_ERROR_PARAMETER;
+    const AddcontentInventorySnapshot inventory = addcontent_inventory_snapshot();
+    const InstalledAddcontent* entry = inventory.state == AddcontentInventoryState::Ready
+        ? find_addcontent(inventory, static_cast<int32_t>(a0), label) : nullptr;
+    if (!entry || !entry->has_entitlement_key) return NP_ENTITLEMENT_ERROR_NO_ENTITLEMENT;
+    return svc_write_bytes(a2, entry->entitlement_key.data(), entry->entitlement_key.size())
+        ? 0 : NP_ENTITLEMENT_ERROR_PARAMETER;
 }
 
 // sceSaveDataTransferringMount (PS5-only, live-captured x4 in DOLL's save-slot menu): mount a
@@ -3367,11 +3539,12 @@ void register_service_hle() {
     Hle::register_fn("SaKib2Ug0yI", (HleFn)s_appcontent_tmpspace, "sceAppContentTemporaryDataGetAvailableSpaceKb");
     Hle::register_fn("Gl6w5i0JokY", (HleFn)s_appcontent_tmpspace, "sceAppContentDownloadDataGetAvailableSpaceKb");  // was MISSING -> garbage KB
     Hle::register_fn("bcolXMmp6qQ", (HleFn)s_ok,                  "sceAppContentTemporaryDataUnmount");
-    // add-content (DLC) enumeration — no-DLC truth (hitNum=0 / no-entitlement), NOT garbage-count OOM (#213 class)
+    // Add-content (DLC) enumeration/mount comes only from the validated installed inventory.
+    // No manifest retains no-DLC truth (hitNum=0 / no entitlement), not garbage-count OOM (#213).
     Hle::register_fn("xnd8BJzAxmk", (HleFn)s_appcontent_addcont_list,   "sceAppContentGetAddcontInfoList");
-    Hle::register_fn("m47juOmH0VE", (HleFn)s_appcontent_no_entitlement, "sceAppContentGetAddcontInfo");
-    Hle::register_fn("XTWR0UXvcgs", (HleFn)s_appcontent_no_entitlement, "sceAppContentGetEntitlementKey");
-    Hle::register_fn("VANhIWcqYak", (HleFn)s_appcontent_no_entitlement, "sceAppContentAddcontMount");
+    Hle::register_fn("m47juOmH0VE", (HleFn)s_appcontent_addcont_info,   "sceAppContentGetAddcontInfo");
+    Hle::register_fn("XTWR0UXvcgs", (HleFn)s_appcontent_entitlement_key, "sceAppContentGetEntitlementKey");
+    Hle::register_fn("VANhIWcqYak", (HleFn)s_appcontent_addcont_mount, "sceAppContentAddcontMount");
     R("sceCommonDialogInitialize", s_ok);
     R("sceCommonDialogIsUsed", s_ok);   // 0 = not in use (our dialogs auto-dismiss) - intentional, not an unimpl log
     R("sceSystemServiceParamGetInt", s_syss_param_int);   // language-aware (US English default), not blanket 0

@@ -572,6 +572,282 @@ int main() {
         }
     }
 
+    // Installed add-content (#1909): dlc_emu.ini is the dump tool's local inventory. Enumerate only
+    // its validated records, preserve the exact PS5 guest ABI boundaries, and retain the old empty
+    // answer for titles with no manifest. A bad manifest must fail visibly instead of becoming a
+    // believable "no DLC" response.
+    {
+        namespace fs = std::filesystem;
+        const fs::path scratch = prosper_test::test_scratch_dir() /
+            ("prosper-addcontent-" + std::to_string((uintptr_t)&fails));
+        const fs::path app0 = scratch / "app0";
+        const fs::path outside = scratch / "outside";
+        std::error_code ec;
+        fs::remove_all(scratch, ec);
+        fs::create_directories(app0 / "sce_sys", ec);
+        fs::create_directories(app0 / "dlc1", ec);
+        fs::create_directories(outside, ec);
+        {
+            std::ofstream param(app0 / "sce_sys" / "param.json", std::ios::binary);
+            param << R"({"titleId":"PPSA00001"})";
+        }
+        auto write_manifest = [&](const char* text) {
+            std::ofstream manifest(app0 / "dlc_emu.ini", std::ios::binary | std::ios::trunc);
+            manifest << text;
+        };
+        write_manifest(
+            "[PSAC]\n"
+            "content_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\n"
+            "mount_point=/app0/dlc1\n"
+            "entitlement_key=000102030405060708090A0B0C0D0E0F\n"
+            "[PSAL]\n"
+            "content_id=UP0000-PPSA00001_00-00000000000DLC02\n"
+            "download_status=INSTALLED\n"
+            "entitlement_key=F0E0D0C0B0A090807060504030201000\n"
+            "[PSAC]\n"
+            "content_id=UP0000-PPSA00001_00-00000000000DLC03\n"
+            "download_status=INSTALLED\n"
+            "np_service_label=7\n");
+        set_app0_root(app0.string());
+
+        HleFn np_list = Hle::lookup("TFyU+KFBv54");
+        HleFn np_info = Hle::lookup("xddD23+8TfQ");
+        HleFn np_key = Hle::lookup("5LiMEPuW0DQ");
+        HleFn app_list = Hle::lookup("xnd8BJzAxmk");
+        HleFn app_info = Hle::lookup("m47juOmH0VE");
+        HleFn app_key = Hle::lookup("XTWR0UXvcgs");
+        HleFn app_mount = Hle::lookup("VANhIWcqYak");
+        CHECK(np_list && np_info && np_key && app_list && app_info && app_key && app_mount,
+              "NP/AppContent installed-addcontent functions registered");
+        if (np_list && np_info && np_key && app_list && app_info && app_key && app_mount) {
+            uint32_t hits = 0xdeadbeef;
+            CHECK(np_list(0, 0, 0, (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 2,
+                  "NP add-content zero-capacity query reports the installed count");
+            CHECK(np_list(0, 0, 0, 0, 0, 0) == 0x817D0002ull,
+                  "NP count query requires its hitNum output");
+            hits = 0xdeadbeef;
+            CHECK(app_list(0, 0, 0, (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 2,
+                  "AppContent zero-capacity query reports the installed count");
+
+            alignas(8) uint8_t np_short[36]; memset(np_short, 0xAB, sizeof(np_short));
+            hits = 0xdeadbeef;
+            CHECK(np_list(0, (uint64_t)(uintptr_t)np_short, 1,
+                          (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 2,
+                  "NP short-capacity list writes one entry but reports the full matching count");
+            CHECK(strcmp((char*)np_short, "00000000000DLC01") == 0 &&
+                  *(uint32_t*)(np_short + 20) == 2 && *(uint32_t*)(np_short + 24) == 4,
+                  "NP list entry carries the PSAC type and INSTALLED status at the guest offsets");
+            bool np_short_canary = true;
+            for (size_t i = 28; i < sizeof(np_short); ++i) np_short_canary &= np_short[i] == 0xAB;
+            CHECK(np_short_canary, "NP short-capacity list writes exactly its 28-byte entry");
+
+            alignas(8) uint8_t np_exact[64]; memset(np_exact, 0xAB, sizeof(np_exact));
+            hits = 0;
+            CHECK(np_list(0, (uint64_t)(uintptr_t)np_exact, 2,
+                          (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 2 &&
+                  strcmp((char*)np_exact + 28, "00000000000DLC02") == 0 &&
+                  *(uint32_t*)(np_exact + 48) == 3 && *(uint32_t*)(np_exact + 52) == 4,
+                  "NP exact-capacity list preserves order and the PSAL entry ABI");
+            bool np_exact_canary = true;
+            for (size_t i = 56; i < sizeof(np_exact); ++i) np_exact_canary &= np_exact[i] == 0xAB;
+            CHECK(np_exact_canary, "NP exact-capacity list does not overwrite its tail canary");
+            memset(np_exact, 0xAB, sizeof(np_exact));
+            CHECK(np_list(0, (uint64_t)(uintptr_t)np_exact, 2, 0, 0, 0) == 0 &&
+                  strcmp((char*)np_exact, "00000000000DLC01") == 0,
+                  "NP populated-list call permits the producer-defined optional hitNum");
+
+            alignas(8) uint8_t app_exact[56]; memset(app_exact, 0xAB, sizeof(app_exact));
+            hits = 0;
+            CHECK(app_list(0, (uint64_t)(uintptr_t)app_exact, 2,
+                           (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 2 &&
+                  strcmp((char*)app_exact, "00000000000DLC01") == 0 &&
+                  *(uint32_t*)(app_exact + 20) == 4 &&
+                  strcmp((char*)app_exact + 24, "00000000000DLC02") == 0 &&
+                  *(uint32_t*)(app_exact + 44) == 4,
+                  "AppContent list writes two 24-byte label/status entries");
+            bool app_exact_canary = true;
+            for (size_t i = 48; i < sizeof(app_exact); ++i) app_exact_canary &= app_exact[i] == 0xAB;
+            CHECK(app_exact_canary, "AppContent exact-capacity list preserves its tail canary");
+
+            const char known_label[20] = "00000000000DLC01";
+            alignas(8) uint8_t one_np[36]; memset(one_np, 0xAB, sizeof(one_np));
+            CHECK(np_info(0, (uint64_t)(uintptr_t)known_label,
+                          (uint64_t)(uintptr_t)one_np, 0, 0, 0) == 0 &&
+                  *(uint32_t*)(one_np + 20) == 2 && *(uint32_t*)(one_np + 24) == 4,
+                  "NP individual info resolves a declared installed label");
+            bool one_np_canary = true;
+            for (size_t i = 28; i < sizeof(one_np); ++i) one_np_canary &= one_np[i] == 0xAB;
+            CHECK(one_np_canary, "NP individual info writes exactly 28 bytes");
+
+            alignas(8) uint8_t one_app[32]; memset(one_app, 0xAB, sizeof(one_app));
+            CHECK(app_info(0, (uint64_t)(uintptr_t)known_label,
+                           (uint64_t)(uintptr_t)one_app, 0, 0, 0) == 0 &&
+                  *(uint32_t*)(one_app + 20) == 4,
+                  "AppContent individual info resolves a declared installed label");
+            bool one_app_canary = true;
+            for (size_t i = 24; i < sizeof(one_app); ++i) one_app_canary &= one_app[i] == 0xAB;
+            CHECK(one_app_canary, "AppContent individual info writes exactly 24 bytes");
+
+            uint8_t expected_key[16];
+            for (uint8_t i = 0; i < 16; ++i) expected_key[i] = i;
+            uint8_t key_out[24]; memset(key_out, 0xAB, sizeof(key_out));
+            CHECK(np_key(0, (uint64_t)(uintptr_t)known_label,
+                         (uint64_t)(uintptr_t)key_out, 0, 0, 0) == 0 &&
+                  memcmp(key_out, expected_key, sizeof(expected_key)) == 0,
+                  "NP entitlement key returns the declared 16 key bytes");
+            bool key_canary = true;
+            for (size_t i = 16; i < sizeof(key_out); ++i) key_canary &= key_out[i] == 0xAB;
+            CHECK(key_canary, "NP entitlement key preserves bytes after its 16-byte output");
+            memset(key_out, 0xAB, sizeof(key_out));
+            CHECK(app_key(0, (uint64_t)(uintptr_t)known_label,
+                          (uint64_t)(uintptr_t)key_out, 0, 0, 0) == 0 &&
+                  memcmp(key_out, expected_key, sizeof(expected_key)) == 0,
+                  "AppContent entitlement key returns the same declared key");
+            key_canary = true;
+            for (size_t i = 16; i < sizeof(key_out); ++i) key_canary &= key_out[i] == 0xAB;
+            CHECK(key_canary, "AppContent entitlement key writes exactly 16 bytes");
+
+            char mount[24]; memset(mount, 0xAB, sizeof(mount));
+            CHECK(app_mount(0, (uint64_t)(uintptr_t)known_label,
+                            (uint64_t)(uintptr_t)mount, 0, 0, 0) == 0 &&
+                  strcmp(mount, "/app0/dlc1") == 0,
+                  "AddcontMount returns only the declared guest mount point");
+            bool mount_canary = true;
+            for (size_t i = sizeof("/app0/dlc1"); i < sizeof(mount); ++i)
+                mount_canary &= (uint8_t)mount[i] == 0xAB;
+            CHECK(mount_canary, "AddcontMount writes only its NUL-terminated path");
+
+            const char licence_label[20] = "00000000000DLC02";
+            memset(mount, 0xAB, sizeof(mount));
+            CHECK(app_mount(0, (uint64_t)(uintptr_t)licence_label,
+                            (uint64_t)(uintptr_t)mount, 0, 0, 0) != 0,
+                  "licence-only add-content cannot invent an undeclared mount point");
+            bool mount_untouched = true;
+            for (char byte : mount) mount_untouched &= (uint8_t)byte == 0xAB;
+            CHECK(mount_untouched, "failed licence-only mount leaves output untouched");
+
+            const char unknown_label[20] = "UNKNOWNADDCONT01";
+            memset(one_np, 0xAB, sizeof(one_np));
+            CHECK(np_info(0, (uint64_t)(uintptr_t)unknown_label,
+                          (uint64_t)(uintptr_t)one_np, 0, 0, 0) == 0x817D0007ull,
+                  "unknown well-formed entitlement label returns NP no-entitlement");
+            bool unknown_untouched = true;
+            for (uint8_t byte : one_np) unknown_untouched &= byte == 0xAB;
+            CHECK(unknown_untouched, "unknown entitlement leaves info output untouched");
+            char malformed_label[20]; memset(malformed_label, 'A', sizeof(malformed_label));
+            CHECK(np_info(0, (uint64_t)(uintptr_t)malformed_label,
+                  (uint64_t)(uintptr_t)one_np, 0, 0, 0) == 0x817D0002ull,
+                  "unterminated entitlement label is rejected as an invalid argument");
+
+            hits = 0xdeadbeef;
+            CHECK(np_list(42, 0, 0, (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 2,
+                  "wildcard inventory entries are visible to an arbitrary caller service label");
+            hits = 0xdeadbeef;
+            CHECK(np_list(7, 0, 0, (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 3,
+                  "an explicitly scoped entry is visible only to its declared service label");
+        }
+
+        auto invalid_manifest = [&](const char* text, const char* what) {
+            write_manifest(text);
+            set_app0_root(app0.string());
+            uint32_t np_hits = 0xdeadbeef, app_hits = 0xdeadbeef;
+            const bool rejected = np_list && app_list &&
+                np_list(0, 0, 0, (uint64_t)(uintptr_t)&np_hits, 0, 0) != 0 &&
+                app_list(0, 0, 0, (uint64_t)(uintptr_t)&app_hits, 0, 0) != 0 &&
+                np_hits == 0xdeadbeef && app_hits == 0xdeadbeef;
+            CHECK(rejected, what);
+        };
+        const char* one_record_manifest =
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\n";
+        invalid_manifest(
+            "[PSAC]\ncontent_id=not-a-content-id\ndownload_status=INSTALLED\n",
+            "malformed content identity invalidates the whole inventory");
+        const std::string oversized_manifest =
+            std::string(one_record_manifest) + "#" + std::string(33 * 1024, 'x');
+        invalid_manifest(oversized_manifest.c_str(),
+                         "manifest beyond the producer size limit is rejected");
+        invalid_manifest(
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\nmount_point=/app0/../outside\n",
+            "traversal mount point invalidates the whole inventory");
+        invalid_manifest(
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\nmount_point=/download0/dlc1\n",
+            "non-app0 mount point invalidates the whole inventory");
+        invalid_manifest(
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\n"
+            "[PSAC]\ncontent_id=JP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\n",
+            "duplicate service/entitlement identity invalidates the whole inventory");
+        invalid_manifest(
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\ndownload_status=INSTALLED\n",
+            "duplicate manifest property invalidates the whole inventory");
+        invalid_manifest(
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\nunknown_property=value\n",
+            "unknown manifest property invalidates the whole inventory");
+        invalid_manifest(
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\nnp_service_label=-2\n",
+            "malformed explicit service label invalidates the whole inventory");
+        invalid_manifest(
+            "[UNKNOWN]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\n",
+            "unknown manifest section invalidates the whole inventory");
+        invalid_manifest(
+            "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+            "download_status=INSTALLED\nmount_point=/app0/absent\n",
+            "absent declared mount directory invalidates the whole inventory");
+        const fs::path escaped = app0 / "escaped";
+        fs::create_directory_symlink(outside, escaped, ec);
+        if (!ec) {
+            invalid_manifest(
+                "[PSAC]\ncontent_id=UP0000-PPSA00001_00-00000000000DLC01\n"
+                "download_status=INSTALLED\nmount_point=/app0/escaped\n",
+                "symlinked out-of-root mount directory invalidates the whole inventory");
+        }
+
+        auto invalid_param_json = [&](const char* json, const char* what) {
+            {
+                std::ofstream param(app0 / "sce_sys" / "param.json",
+                                    std::ios::binary | std::ios::trunc);
+                param << json;
+            }
+            invalid_manifest(one_record_manifest, what);
+        };
+        invalid_param_json(R"({"nested":{"titleId":"PPSA00001"}})",
+                           "a nested titleId cannot authorize add-content inventory");
+        invalid_param_json(R"({"titleId":"PPSA00001","\u0074itleId":"PPSA00001"})",
+                           "duplicate top-level titleId spellings invalidate app metadata");
+        invalid_param_json(R"({"note":"\"titleId\":\"PPSA00001\""})",
+                           "titleId text inside a JSON string cannot authorize inventory");
+        invalid_param_json(R"({"titleId":"PPSA00001"} trailing)",
+                           "malformed trailing param.json content invalidates inventory");
+        invalid_param_json(R"({"titleId":"PPSA\u003000001"})",
+                           "escaped titleId values are rejected as ambiguous identity input");
+
+        fs::remove(app0 / "dlc_emu.ini", ec);
+        set_app0_root(app0.string());
+        if (np_list && app_list && app_mount) {
+            const char absent_label[20] = "00000000000DLC01";
+            uint32_t hits = 0xdeadbeef;
+            CHECK(np_list(0, 0, 0, (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 0,
+                  "title without a manifest retains the NP no-DLC count");
+            hits = 0xdeadbeef;
+            CHECK(app_list(0, 0, 0, (uint64_t)(uintptr_t)&hits, 0, 0) == 0 && hits == 0,
+                  "title without a manifest retains the AppContent no-DLC count");
+            char mount[16]; memset(mount, 0xAB, sizeof(mount));
+            CHECK(app_mount(0, (uint64_t)(uintptr_t)absent_label,
+                            (uint64_t)(uintptr_t)mount, 0, 0, 0) != 0,
+                  "title without a manifest has no mount entitlement");
+        }
+        fs::remove_all(scratch, ec);
+    }
+
     // SystemService / AppContent / NP getters: each must WRITE its out-param with the CORRECT value —
     // returning success with an unfilled (or wrong-valued) out is the harmful-stub class whose downstream
     // effects are hard to trace (a 0.0 safe-area ratio collapses the viewport; lang 0 localizes to
