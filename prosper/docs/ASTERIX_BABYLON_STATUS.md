@@ -77,19 +77,19 @@ edge producer=10 consumer=11 stage=ps binding=34 addr=0000002011800000
 ```
 
 The corrected graph reports six edges and no external image leaf for the final composite source.
-The proposed bounded replay has now run through operations 4/6/8/10/11. All five outputs were the
-same pure-black image (`hash=792bed5a3f02a383`; RGB min/max/mean zero), although they do not all name
-the same surface. Inspect and graph output map them respectively to draws 0/2/4/6/7. Operation 4 is
-the first graphics operation and directly renders color0 `0x2033b10000` black; its fragment shader's
-only captured input is a zero-filled 128-byte constant buffer, and the temporal seeds in this chain
-are also zero. The capture therefore contains no useful-color-to-black transition and does not
-justify a product-code fix.
+The bounded prefix replay ran through operations 4/6/8/10/11. All five outputs were the same
+pure-black image (`hash=792bed5a3f02a383`; RGB min/max/mean zero), although they do not all name the
+same surface. Inspect and graph output map them respectively to draws 0/2/4/6/7. Operation 4 is the
+first graphics operation and directly renders color0 `0x2033b10000` black; its fragment shader's only
+captured input is a zero-filled 128-byte constant buffer, and the temporal seeds in this chain are
+also zero.
 
-The run also exposed the remaining instrument limit. For fixed resolves 6 and 10,
-`--through-operation` selects the draw's color0 source (`0x2033b10000`) as its output, not raw color1
-destination `0x2011800000`. Their black BMPs therefore do not directly observe the resolve
-destination. The former prior-frame conclusion remains ruled out, but exact destination pixels need
-a target-address selector rather than another title boot.
+Ordinary prefix output could not directly observe raw color1 `0x2011800000` for fixed resolves 6 and
+10 because it selects their color0 source. #1825's exact post-operation selector has now closed that
+apparatus gap for both operations. Each readback proved semantic draw, attachment slot, address,
+1920x1080 extent, and raw/backend format 122; both destinations were uniformly black with the same
+`792bed5a3f02a383` replay hash and the same BMP SHA-256 as operation 4. Neither fixed resolve is a
+useful-color-to-black transition, so this capture still does not justify a product-code fix.
 
 A separate 64.7-second semantic timeline recorded 31,982 complete submits before a recoverable
 truncated tail. Submit 1 had 8 draws/10 dispatches; every later submit had 8 draws/6 dispatches, and
@@ -184,6 +184,14 @@ not, including the 30-second run, and every run remained black. That event is th
 intermittent and non-causal for the stable black output, not promoted to the next blocker without a
 self-validating reproduction.
 
+During the CPU follow-up after the exact operation-10 readback, two commands were incorrectly treated
+as extraction-only: `gpu_replay --dump-realized-shader` and `--dump-resource`. Each wrote its requested
+artifact and then fell through to a complete Vulkan replay; both completed with the same black
+`792bed5a3f02a383` output and no error, rejection, device loss, or mismatch. They were disclosed as
+unintended runs and add no independent title discriminator. In the same observed path,
+`--dump-shader` returned before Vulkan initialization. This apparatus finding is recorded as
+instrument trap 63 in `GAME_COMPAT_ORCHESTRATION.md`.
+
 ## Ruled out
 
 - **Unresolved T#/S# lookup:** the title-live descriptor resolves; the rejection is the sampled MIMG
@@ -220,14 +228,24 @@ self-validating reproduction.
   hash `792bed5a3f02a383`; an independent pixel census found one opaque color with RGB mean/min/max zero.
   That matches the earlier exact op4 color0 cutoff (the same hash and pixel census), so this capture
   contains no nonblack-to-black resolve transition. This is localization evidence only; rung remains 0.
+- **The op10 fixed-function resolve is a later loss boundary:** the exact selector proved operation 10,
+  semantic draw 6, raw color1 slot 1, address `0x2011800000`, 1920x1080 extent, and format 122/122 before
+  readback. It returned the same `792bed5a3f02a383` uniformly-black pixels and byte-identical BMP as
+  operation 4 and the op6 destination. Both resolves therefore copy black to black in this capture;
+  neither loses useful color. This is localization evidence only; rung remains 0.
 - **A renderer-disabled title boot as a GPU-free experiment:** live compute remains active without
   `PROSPER_RENDER` and initializes Vulkan when the title dispatches supported compute.
 
 ## Next discriminators
 
-1. If this retained chain is pursued further, use #1825's exact selector on `0x2011800000` after op10.
-   Op6's raw color1 destination is now proven uniformly black; ordinary prefix output still cannot
-   answer op10 because it selects color0 for a fixed resolve. No new title boot is needed.
+1. Operation 11 is the final graphics operation: it consumes op10's now-proven-black
+   `0x2011800000` and writes the already-observed black 1920x1080 target `0x2018490000`. Operations
+   12 and 13 are later compute dispatches with no render target, so none of 11–13 can be the missing
+   producer for this present. The next single target is therefore cross-submit history: locate the
+   most recent pre-submit writer of operation 4's `0x2033b10000`, then retain its exact post-write
+   pixels or prove that the temporal chain was already zero. This one-submit bundle cannot answer
+   that question, and another cutoff inside operations 11–13 cannot add information. The address is
+   valid only for this retained run; any fresh capture must re-derive its own target identity.
 2. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
    dispatch ran and reproduces its device loss; two failures in six runs are not a stable cause.
 3. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
