@@ -407,6 +407,13 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_capture_schedule PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_capture_schedule COMMAND test_prosper_app_capture_schedule)
 
+  add_executable(test_prosper_app_performance_capture_schedule
+    frontends/prosper-app/test_performance_capture_schedule.cpp)
+  target_include_directories(test_prosper_app_performance_capture_schedule
+    PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_performance_capture_schedule
+    COMMAND test_prosper_app_performance_capture_schedule)
+
   add_executable(test_prosper_app_present_mode frontends/prosper-app/test_present_mode.cpp)
   target_include_directories(test_prosper_app_present_mode PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_present_mode COMMAND test_prosper_app_present_mode)

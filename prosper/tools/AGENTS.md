@@ -243,6 +243,13 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   total/mean/max time, and bounded address list. Mixed batches and older v1 captures report their
   compute time as explicitly unknown identity rather than inventing a program attribution.
 
+  For unattended agent runs, set `PROSPER_PERF_CAPTURE_AFTER_MS=N` to make one automatic arm
+  attempt after `N` milliseconds from entry into the app loop. This uses the exact F8 artifact path
+  and five-second pre/post windows without desktop focus, synthetic input, screenshots, frame dumps,
+  or GPU command capture. The value must be a positive decimal integer whose nanosecond conversion
+  fits in 64 bits. Startup logs whether the setting was accepted or ignored, and the trigger line
+  proves when the one-shot attempt fired. A failed arm is not retried at a later phase.
+
   Inspect it offline with:
 
   ```bash
