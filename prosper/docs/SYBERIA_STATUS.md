@@ -28,6 +28,7 @@ re-derive these without contradictory new evidence.
 | Vulkan's native typed `B10G11R11_UFLOAT_PACK32` storage conversion is bit-equivalent to the guest's round-to-nearest-even R11G11B10 contract | **Falsified on RADV.** A reduced live-Vulkan 4×4×4 producer→sampled-consumer handoff held tiling (`SW_64KB_R_X`), normalized voxel-centre `SAMPLE_LZ`, dispatch order, cache priming, and all 64 voxels constant while changing only the producer representation. Shader-side `R32ui` packing matched all 64 packed words and 256 sampled channels. Native typed storage differed in **54/64 packed voxels and 92 RGB channel values** (`R=34, G=34, B=24`); all 92 native codes were lower than the CPU f11/f10 oracle, none higher, and the sampled output carried the same 92 differences. The exact packed path now remains authoritative even when native support is advertised. This proves a real conversion defect, **not** that its mostly one-ULP bias causes the visible menu overexposure; the coordinated live A/B in the next row separately tests that causal claim. | #1790 |
 | The native R11 storage rounding bias is the primary cause of the profile menu's severe overexposure | **Falsified at the restored profile-menu boot depth on the pre-#1800 branch state recorded in #1790 (the R11 change was rebased unchanged here).** Two bounded default-renderer runs changed only the exact-packed recovery switch and each retained ten five-second samples from t=170–215 s; neither used capture/RTT/resource-hash diagnostics. Source 118's exact arm directly reported the real 32³ tiled R11 LUT as `native-storage=0`, `R32_UINT`, module hash `7e01d14b7e21d0b2`; the same configuration lever's CPU-only reflection A/B produced distinct exact/native-recovery module hashes `d3509f259a1baa99` / `a7bcc1ec7d05db52`, asserted `R32ui` versus typed-float storage, and the live native run independently proved the device's typed 3D storage capability before source 118 executed. At identical rendered frame sequences 15 and 22, exact versus native-recovery images differed by normalized RMSE 0.00920 / 0.00940 (PSNR 40.73 / 40.54 dB), but both showed the same full-width, severely blown-out scene. Exact packing was slightly brighter, not corrective: mean luma was 0.80285 versus 0.80160 at frame 15 and 0.79367 versus 0.79276 at frame 22. This rules out the conversion bias as the **primary visible mechanism at this boot depth**; it does not erase the deterministic precision defect above, and it does not localize the remaining source-101→bloom→source-119 error. The runs are not a performance A/B: exact carried much broader compute tracing, and both stayed near the known ~1.4 composited fps in the sampled window. | #1790 |
 | Replay uses a stale/no-op source-101 or source-119 writeback, or source 119 numerically explodes the whole HDR frame | **Falsified for the current captured host-renderer path; this is not a PS5 hardware oracle.** Two bounded `--recompile-raw --dump-post-compute-resource` runs executed the retained mixed-operation prefix and required both descriptor-visible change and the independently recorded live raw hash. Realized compute `62:14` (source 101, operation 566) executed once after 62 earlier successful computes: its captured seed equalled its immediate-before state (`raw=89a341fece902e2e`, `linear=4313b6f00a038092`), then changed to raw `e00d49942f888cad` (**exact live-hash match**) / linear `8aeefa2a7bc15ef9`. Its 2,073,600 R11 texels contained 6,220,800 finite channels, 2,839,736 zero, 1,234,144 greater than one, no Inf/NaN, maximum 12.375, mean 0.683273. Realized compute `80:23` (source 119, operation 584) likewise executed once after 80 earlier successful computes: captured/immediate-before `15af296b7f257522` / `cdbfc7204d266c16` changed to raw `2974a84058d4feb5` (**exact live-hash match**) / linear `7ba80885c5585b55`. Its output had no zero, Inf, or NaN channels, only 2,412 greater than one, maximum 1.03125, mean 0.35676. Thus source 119 strongly compresses the source-101 HDR population instead of causing a frame-wide numeric blow-up. The source-101 distribution itself remains **unverified against PS5 hardware** and may still enter the chain incorrectly; these runs prove the host live/replay boundary and falsify the stale/no-op and whole-output-explosion mechanisms, not visual correctness. | #1790 |
+| The source-90/source-92 shader-recompile failures cause missing gameplay pixels | **Falsified.** Both captured packets are direct dispatches with `threads=0x0x0` and `groups=0x0x0`; they are hardware no-ops regardless of whether their shader bodies compile. A temporary diagnostic arm independently moved the lever by admitting both shaders as realized zero-group computes, while the routed gameplay image remained visually unchanged. Their unsupported instructions remain legitimate recompiler coverage work, but cannot repair this frame. | #1627 |
 
 **Still open:** what causes the restored menu layer's substantial overexposure (#1790). Recompiling
 source 101 restores the visible 3D layer on the **default** path, but does not make it visually
@@ -136,7 +137,28 @@ The screenshot tool exited 1 after saving 45/48 fresh, pixel-distinct samples be
 apparatus error, not a stale-frame or title-progress failure. All 45 saved samples advanced source and
 pixel content with zero stale seconds. The final image is retained only as local evidence; the existing
 public profile screenshot remains representative and no compatibility rung changed.
+## Live validation of gameplay `v_max3_f16` recovery — 2026-08-03
 
+A current-master gameplay capture rejected source 87 at VOP3 opcode `0x354`. `llvm-mc` identifies
+the eight exact packets as `v_max3_f16`; the first two select complementary packed-f16 source and
+destination halves (`op_sel:[0,0,1,0]` and `[1,1,0,1]`). The recompiler now decodes those selectors,
+computes a three-input numeric maximum, applies output modifiers, and preserves the unselected half
+of the destination VGPR. Exact packet, structural SPIR-V, and live-Vulkan numeric tests cover the
+two-packet pair; disabling only the emitter makes the named structural regression fail.
+
+One bounded default-renderer run followed the validated gameplay route with ordinary frame dumps
+disabled and captured exactly one live frame. Source 87 changed from an unrealized 120x68-group
+dispatch to realized compute 85 (`shader=3052/cec569003c55c45b`). The operation graph records the
+consequential dependency: operation 2057 writes a 960x540 R8 resource and operation 2059/source 89
+immediately samples that same address at binding 6. The adjacent current-master frame had 108
+realized computes and 25 failures; the fixed live frame had 109 and 23. Total draw/operation counts
+differ slightly between animated frames, so the named source and dependency edge—not the aggregate
+delta—are the decisive evidence.
+
+The fixed screenshot is visually equivalent to the baseline: the same dark, overexposed ghosted
+gameplay composite remains. This closes a real, consumed shader gap but does **not** localize or fix
+the visible #1627 defect, and it is not a reason to advance the compatibility rung or replace the
+published screenshot.
 ## The former "right ~55% is black" question — localized and fixed
 
 Before source-101 support, this was **a defect, not art direction, and not a scissor/viewport clip.**
@@ -283,14 +305,15 @@ the current default-path diagnosis.
 
 ## Causal and remaining recompiler gaps in the same frame
 
-Ten dispatches fail with `reason=shader-recompile` (`gpu_replay --inspect-only`). Per `CLAUDE.md`
-these are FATAL gaps, not acceptable skips. First-reject sites:
+The retained pre-fix profile capture reports ten dispatches with `reason=shader-recompile`
+(`gpu_replay --inspect-only`). Per `CLAUDE.md` these are FATAL gaps, not acceptable skips.
+First-reject sites (including gaps since repaired) are:
 
 | program | launch | first reject |
 |---|---|---|
 | `0x211197ea00` | 1920x1080 | pc=24 fmt=0 op=0xf |
 | `0x211197ef00` | 30720x68 | pc=4 fmt=4 op=0x8 |
-| `0x21341b1a00` (x3) | 960x544 | pc=55 fmt=9 op=0x354 |
+| `0x21341b1a00` (x3) | 960x544 | pc=55 fmt=9 op=0x354 — now supported as `v_max3_f16` |
 | `0x2111a39700` | 1920x1080 | pc=51 fmt=8 op=0xf5 |
 | `0x2111a39e00` | 1920x1088 | pc=6 fmt=0 op=0x1 |
 | `0x2111a3a400` | 120x72 | pc=36 fmt=4 op=0x8 |
@@ -307,6 +330,10 @@ the derived bloom inputs before writing a zero binding 23 for draw 469. Supporti
 Wave64 mask comparison recompiles the exact retained source with all 14 captured resources and an
 accepted descriptor contract, and the live run restores the layer. The remaining overexposure and
 other recompiler gaps remain real but are not localized here.
+
+The `0x354` row is the same instruction family recovered and validated in the routed gameplay
+capture above. Its live output is consumed, but the gameplay image remains degraded; do not infer
+that every consumed recompiler gap is the visible composite cause.
 
 ## Other observations
 

@@ -938,6 +938,30 @@ int main() {
     portable_wave64_compute_config.local_x = 128;
     portable_wave64_compute_config.wave_size = 64;
 
+    // Syberia source 87 is a real 960x544 dispatch whose only generic-coverage rejects are eight
+    // v_max3_f16 instructions. Keep the first exact low/high pair: OPSEL chooses different source
+    // halves for each result and the second instruction writes the high destination half. The decode
+    // test pins those bitmasks; require both exact packet shapes here, and let the Vulkan test
+    // independently check their packed result.
+    const uint32_t syberia_max3_f16_pair[] = {
+        0x7e2c02ffu, 0x40003c00u,            // v_mov_b32 v22,{2.0h,1.0h}
+        0x7e2e02ffu, 0x38004200u,            // v_mov_b32 v23,{0.5h,3.0h}
+        0x7e1202ffu, 0x12345678u,            // v_mov_b32 v9,old packed destination
+        0xd7542009u, 0x045a2d17u,            // max3_f16 v9,v23.lo,v22.lo,v22.hi -> v9.lo
+        0xd7545809u, 0x045e2d17u,            // max3_f16 v9,v23.hi,v22.hi,v23.lo -> v9.hi
+        0xbf810000u,
+    };
+    const auto syberia_max3_f16_spv = recompile_compute(
+        syberia_max3_f16_pair, std::size(syberia_max3_f16_pair), nullptr,
+        portable_wave64_compute_config);
+    if (syberia_max3_f16_spv.empty() ||
+        !type_result_ids_are_nonzero(syberia_max3_f16_spv, nullptr) ||
+        !phi_ids_are_nonzero(syberia_max3_f16_spv)) {
+        printf("  [FAIL] Syberia v_max3_f16 OPSEL pair did not emit valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   Syberia v_max3_f16 OPSEL pair emits valid SPIR-V\n");
+
     // Exercise the ordinary integer-B64 emitter separately from the mask-domain vote below.
     // Exact llvm-mc gfx1010 encoding: v_cmp_gt_u64_e64 vcc_lo,s[0:1],0.
     const uint32_t wave64_u64_compare[] = {

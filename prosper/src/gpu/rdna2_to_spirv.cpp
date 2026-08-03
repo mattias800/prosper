@@ -7790,7 +7790,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.clamp) bits = b.clamp01(bits);
                 return bits;
             };
-            if (in.opcode == 0x34B) {                                // v_fma_f16: one selected packed half
+            if (in.opcode == 0x34B || in.opcode == 0x354) {
+                // Scalar f16 VOP3: one selected half from each packed source and one independently
+                // selected destination half. The opposite destination half is preserved. The
+                // `v_max3_f16` occurs eight times in Syberia's nonzero 960x544 gameplay composite
+                // dispatch; llvm-mc gfx1030 identifies opcode 0x354 exactly.
                 auto f16src = [&](int k) {
                     const Operand& operand = in.src[k];
                     uint32_t raw = val(operand);
@@ -7805,8 +7809,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (in.src_neg[k]) value = b.fneg(value);
                     return value;
                 };
-                uint32_t result = fresult(
-                    b.fbin(Op_FAdd, b.fbin(Op_FMul, f16src(0), f16src(1)), f16src(2)));
+                uint32_t result = 0;
+                if (in.opcode == 0x34B) {                            // v_fma_f16
+                    result = b.fbin(Op_FAdd, b.fbin(Op_FMul, f16src(0), f16src(1)), f16src(2));
+                } else {                                             // v_max3_f16
+                    result = b.fext2(Glsl_NMax,
+                                     b.fext2(Glsl_NMax, f16src(0), f16src(1)), f16src(2));
+                }
+                result = fresult(result);
                 uint32_t r16 = b.pack_half_lo(result);
                 vreg[in.dst.value] = (in.vop3p_opsel & 8u)
                     ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),

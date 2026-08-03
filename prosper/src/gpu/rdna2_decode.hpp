@@ -148,7 +148,8 @@ struct Rdna2Inst {
 
     // Packed/mixed f16 selector bitmasks. For VOP3P mix ops, bit k of vop3p_opsel_hi means source k
     // reads as an f16 half selected by vop3p_opsel[k]; packed add/mul use the two masks for the low
-    // and high results. VOP3 v_fma_f16 reuses vop3p_opsel[2:0] for its sources and bit 3 for dst.
+    // and high results. VOP3 scalar-f16 operations reuse vop3p_opsel[2:0] for their sources and bit
+    // 3 for dst (currently v_fma_f16 and v_max3_f16).
     // NEG lands in src_neg[], NEG_HI (abs for mix ops) in src_abs[], and CLAMP in clamp.
     uint8_t vop3p_opsel = 0, vop3p_opsel_hi = 0;
     uint8_t vop3p_neg_hi = 0;   // packed add/mul: per-source negate for the HIGH f16 result

@@ -286,6 +286,17 @@ int main() {
     Rdna2Inst v3n = rdna2_decode_one(vop3_nolit, 2);
     CHECK(v3n.fmt == Rdna2Format::VOP3 && v3n.len_dwords == 2 && !v3n.has_literal,
           "VOP3 without a literal src is 2 dwords");
+    // Exact Syberia source-87 low/high pair. llvm-mc gfx1030 prints OPSEL [0,0,1,0] and
+    // [1,1,0,1]; the fourth bit selects which packed destination half is replaced.
+    const uint32_t max3_f16_lo[] = { 0xd7542009u, 0x045a2d17u };
+    const uint32_t max3_f16_hi[] = { 0xd7545809u, 0x045e2d17u };
+    const Rdna2Inst max3_lo = rdna2_decode_one(max3_f16_lo, 2);
+    const Rdna2Inst max3_hi = rdna2_decode_one(max3_f16_hi, 2);
+    CHECK(max3_lo.fmt == Rdna2Format::VOP3 && max3_lo.opcode == 0x354u &&
+              max3_lo.vop3p_opsel == 0x4u &&
+              max3_hi.fmt == Rdna2Format::VOP3 && max3_hi.opcode == 0x354u &&
+              max3_hi.vop3p_opsel == 0xbu,
+          "Syberia v_max3_f16 retains all source and destination OPSEL bits");
     // VOPC-as-VOP3 uses the same 64-bit packet prefix but its low dword0 field is an SGPR-mask
     // destination, never a VGPR. Exact Astro world-map encoding, round-tripped with llvm-mc gfx1010.
     const uint32_t vopc_e64_u64[] = { 0xd4e4006au, 0x0001006au };
