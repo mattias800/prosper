@@ -1678,6 +1678,25 @@ int main(int argc, char** argv) {
     if (!prosper::gpu::materialize_gpu_replay(capture, replay, error)) {
         std::fprintf(stderr, "gpu_replay: cannot materialize: %s\n", error.c_str()); return 2;
     }
+    prosper::gpu::GpuCaptureFile prepend_capture;
+    prosper::gpu::GpuReplayFrame prepend;
+    if (!prepend_path.empty() &&
+        (!prosper::gpu::read_gpu_capture(prepend_path, prepend_capture, error) ||
+         !prosper::gpu::materialize_gpu_replay(prepend_capture, prepend, error))) {
+        std::fprintf(stderr, "gpu_replay: cannot load predecessor %s: %s\n",
+                     prepend_path.c_str(), error.c_str()); return 2;
+    }
+    if (!prepend_path.empty() && prepend.metadata.submit_index >= replay.metadata.submit_index) {
+        std::fprintf(stderr, "gpu_replay: predecessor submit must be earlier than consumer submit\n");
+        return 2;
+    }
+    // Seed-writer registration is decided when the renderer is installed. Raw compute replay may
+    // install it early to query this device's capabilities, so publish every consumer/predecessor
+    // seed-presence flag before that path (or any later path) can register the renderer.
+    if (!replay.rtt_seeds.empty() || !prepend.rtt_seeds.empty())
+        set_environment("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
+    if (!replay.ds_seeds.empty() || !prepend.ds_seeds.empty())
+        set_environment("PROSPER_GPU_REPLAY_DS_SEEDS", "1");
     const bool metadata_only = std::any_of(
         replay.metadata.renderer_env.begin(), replay.metadata.renderer_env.end(),
         [](const auto& entry) {
@@ -1956,18 +1975,6 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[fs-tap] unrealized semantic draw %llu\n", draw_label);
             return 2;
         }
-    }
-    prosper::gpu::GpuCaptureFile prepend_capture;
-    prosper::gpu::GpuReplayFrame prepend;
-    if (!prepend_path.empty() &&
-        (!prosper::gpu::read_gpu_capture(prepend_path, prepend_capture, error) ||
-         !prosper::gpu::materialize_gpu_replay(prepend_capture, prepend, error))) {
-        std::fprintf(stderr, "gpu_replay: cannot load predecessor %s: %s\n",
-                     prepend_path.c_str(), error.c_str()); return 2;
-    }
-    if (!prepend_path.empty() && prepend.metadata.submit_index >= replay.metadata.submit_index) {
-        std::fprintf(stderr, "gpu_replay: predecessor submit must be earlier than consumer submit\n");
-        return 2;
     }
     if (!compute_override_spec.empty()) {
         char* end = nullptr;
@@ -2433,10 +2440,6 @@ int main(int argc, char** argv) {
                              "--validate, or --graph\n");
         return 2;
     }
-    if (!replay.rtt_seeds.empty() || !prepend.rtt_seeds.empty())
-        set_environment("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
-    if (!replay.ds_seeds.empty() || !prepend.ds_seeds.empty())
-        set_environment("PROSPER_GPU_REPLAY_DS_SEEDS", "1");
     if (!renderer_registered)
         prosper::frontend::register_live_renderer(".", false);
     std::unordered_set<uint64_t> predecessor_targets;

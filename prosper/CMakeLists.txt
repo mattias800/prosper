@@ -1093,6 +1093,14 @@ if(TARGET prosper_core)
         target_compile_options(gpu_replay PRIVATE -Werror=switch)
       endif()
 
+      # Seed flags are renderer-registration inputs. Exercise the real gpu_replay process so an
+      # early --recompile-raw registration cannot pass by proving substitution but failing restore.
+      add_executable(test_gpu_replay_seed_order tests/test_gpu_replay_seed_order.cpp)
+      target_include_directories(test_gpu_replay_seed_order PRIVATE src tests)
+      target_link_libraries(test_gpu_replay_seed_order PRIVATE prosper_core)
+      add_test(NAME gpu_replay_seeded_raw_execution
+        COMMAND test_gpu_replay_seed_order $<TARGET_FILE:gpu_replay>)
+
       # Capture -> serialize -> owned replay backing -> SAME live renderer -> pixels. This specifically
       # proves replay textures do not dereference the captured guest VA and still sample exact bytes.
       add_executable(test_gpu_capture_render tests/test_gpu_capture_render.cpp)
