@@ -109,6 +109,27 @@ int main() {
     install_altstack();
     prosper::host::guest_write_watch_set_fault_onstack(true);
 
+    CHECK(setenv("PROSPER_DMEM_CALLER", "1", 1) == 0 &&
+              setenv("PROSPER_DMEM_WRITE_TRACE", "7:0x3000:2:0x1120:16", 1) == 0 &&
+              setenv("PROSPER_DMEM_WRITE_TRACE_MAX_EVENTS", "3", 1) == 0,
+          "set five-field occurrence-selector environment");
+    prosper::host::guest_dmem_write_trace_init_from_environment();
+    auto parsed = prosper::host::guest_dmem_write_trace_snapshot();
+    CHECK(parsed.status == prosper::host::GuestDmemWriteTraceStatus::WaitingAllocation &&
+              parsed.config.allocation_occurrence == 2 && parsed.config.offset == offset &&
+              parsed.config.size == bytes && parsed.config.max_events == 3,
+          "five-field environment syntax retains explicit occurrence and bounds");
+    CHECK(setenv("PROSPER_DMEM_WRITE_TRACE", "7:0x3000:0x1120:16", 1) == 0,
+          "set legacy four-field unique-selector environment");
+    prosper::host::guest_dmem_write_trace_init_from_environment();
+    parsed = prosper::host::guest_dmem_write_trace_snapshot();
+    CHECK(parsed.status == prosper::host::GuestDmemWriteTraceStatus::WaitingAllocation &&
+              parsed.config.allocation_occurrence == 0 && parsed.config.offset == offset,
+          "four-field environment syntax preserves strict-uniqueness mode");
+    unsetenv("PROSPER_DMEM_WRITE_TRACE");
+    unsetenv("PROSPER_DMEM_WRITE_TRACE_MAX_EVENTS");
+    unsetenv("PROSPER_DMEM_CALLER");
+
     const prosper::host::GuestDmemWriteTraceConfig invalid_config{
         chain, allocation_size, offset,
         static_cast<uint32_t>(prosper::host::kGuestDmemWriteTraceMaxBytes + 1), 3};
@@ -116,6 +137,15 @@ int main() {
               prosper::host::guest_dmem_write_trace_snapshot().invalid_reason ==
                   prosper::host::GuestDmemWriteTraceInvalidReason::InvalidConfig,
           "invalid selector is fail-visible before any mapping is touched");
+
+    auto invalid_occurrence_config = invalid_config;
+    invalid_occurrence_config.size = bytes;
+    invalid_occurrence_config.allocation_occurrence =
+        prosper::host::kGuestDmemWriteTraceMaxAllocationOccurrence + 1;
+    CHECK(!prosper::host::guest_dmem_write_trace_configure(invalid_occurrence_config) &&
+              prosper::host::guest_dmem_write_trace_snapshot().invalid_reason ==
+                  prosper::host::GuestDmemWriteTraceInvalidReason::InvalidConfig,
+          "allocation occurrence above the explicit bound is fail-visible");
 
     const prosper::host::GuestDmemWriteTraceConfig config{
         chain, allocation_size, offset, bytes, 3};
@@ -246,12 +276,52 @@ int main() {
         physical, allocation_size, chain);
     prosper::host::guest_dmem_write_trace_notify_allocation(
         physical + allocation_size, allocation_size, chain);
+    prosper::host::guest_dmem_write_trace_notify_allocation(
+        physical + allocation_size * 2, allocation_size, chain);
     const auto ambiguous = prosper::host::guest_dmem_write_trace_snapshot();
     CHECK(ambiguous.status == prosper::host::GuestDmemWriteTraceStatus::Invalid &&
               ambiguous.invalid_reason ==
                   prosper::host::GuestDmemWriteTraceInvalidReason::AmbiguousAllocation &&
-              ambiguous.allocation_matches == 2,
-          "a second dynamic allocation match invalidates the selector instead of silently picking one");
+              ambiguous.allocation_matches == 3 && ambiguous.selected_occurrence == 1,
+          "default selector invalidates on occurrence 2 but keeps an honest observed census");
+
+    auto occurrence_config = config;
+    occurrence_config.allocation_occurrence = 2;
+    CHECK(prosper::host::guest_dmem_write_trace_configure(occurrence_config),
+          "explicit bounded occurrence selector is accepted");
+    prosper::host::guest_dmem_write_trace_notify_allocation(
+        physical, allocation_size, chain);
+    const auto insufficient = prosper::host::guest_dmem_write_trace_snapshot();
+    CHECK(insufficient.status == prosper::host::GuestDmemWriteTraceStatus::WaitingAllocation &&
+              insufficient.config.allocation_occurrence == 2 &&
+              insufficient.allocation_matches == 1 && insufficient.selected_occurrence == 0 &&
+              insufficient.target_phys == 0,
+          "insufficient occurrence stays waiting and proves requested/observed/selected state");
+
+    auto* occurrence_two_mapping = static_cast<uint8_t*>(
+        mmap(nullptr, allocation_size, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    CHECK(occurrence_two_mapping != MAP_FAILED, "map occurrence-2 selection control");
+    if (occurrence_two_mapping != MAP_FAILED) {
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(occurrence_two_mapping), allocation_size,
+            physical + allocation_size, 0x3);
+        prosper::host::guest_dmem_write_trace_notify_allocation(
+            physical + allocation_size, allocation_size, chain);
+        prosper::host::guest_dmem_write_trace_notify_allocation(
+            physical + allocation_size * 2, allocation_size, chain);
+        const auto selected_two = prosper::host::guest_dmem_write_trace_snapshot();
+        CHECK(selected_two.status == prosper::host::GuestDmemWriteTraceStatus::Armed &&
+                  selected_two.config.allocation_occurrence == 2 &&
+                  selected_two.allocation_matches == 3 && selected_two.selected_occurrence == 2 &&
+                  selected_two.target_phys == physical + allocation_size + offset &&
+                  selected_two.target_addr ==
+                      reinterpret_cast<uint64_t>(occurrence_two_mapping + offset),
+              "occurrence 2 moves the lever to the second allocation while observing later matches");
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(occurrence_two_mapping), allocation_size);
+        munmap(occurrence_two_mapping, allocation_size);
+    }
     prosper::host::guest_write_watch_set_fault_onstack(false);
 
     if (failures) return 1;

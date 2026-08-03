@@ -40,6 +40,7 @@ struct GuestWriteWatchStats {
 // Fixed guest virtual addresses are deliberately not accepted.
 inline constexpr size_t kGuestDmemWriteTraceMaxBytes = 128;
 inline constexpr size_t kGuestDmemWriteTraceMaxEvents = 64;
+inline constexpr uint32_t kGuestDmemWriteTraceMaxAllocationOccurrence = 4096;
 
 struct GuestDmemWriteTraceConfig {
     uint32_t caller_chain = 0;
@@ -47,6 +48,9 @@ struct GuestDmemWriteTraceConfig {
     uint64_t offset = 0;
     uint32_t size = 0;
     uint32_t max_events = 0;
+    // Zero preserves the four-field selector's strict-uniqueness contract. A nonzero value selects
+    // that one-based occurrence within the exact caller-chain/allocation-size family.
+    uint32_t allocation_occurrence = 0;
 };
 
 enum class GuestDmemWriteTraceStatus : uint8_t {
@@ -102,6 +106,7 @@ struct GuestDmemWriteTraceSnapshot {
     uint64_t rearms = 0;
     uint64_t coverage_gaps = 0;
     uint64_t overflow_events = 0;
+    uint64_t selected_occurrence = 0;
     uint64_t target_phys = 0;
     uint64_t target_addr = 0;
     std::array<uint8_t, kGuestDmemWriteTraceMaxBytes> initial{};
@@ -181,8 +186,11 @@ GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
 
 // Normal-context setup/inspection. Production uses init_from_environment; configure is also the
 // deterministic test seam. Environment syntax is
-// PROSPER_DMEM_WRITE_TRACE=<caller-chain>:<allocation-size>:<offset>:<bytes>, with an optional
-// PROSPER_DMEM_WRITE_TRACE_MAX_EVENTS (1..64). PROSPER_DMEM_CALLER must also be enabled.
+// Four fields preserve strict uniqueness:
+//   PROSPER_DMEM_WRITE_TRACE=<caller-chain>:<allocation-size>:<offset>:<bytes>
+// An explicit run-relative occurrence (1..4096) can disambiguate one exact allocation family:
+//   PROSPER_DMEM_WRITE_TRACE=<caller-chain>:<allocation-size>:<occurrence>:<offset>:<bytes>
+// PROSPER_DMEM_WRITE_TRACE_MAX_EVENTS is optional (1..64). PROSPER_DMEM_CALLER must also be enabled.
 void guest_dmem_write_trace_init_from_environment();
 bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig& config);
 bool guest_dmem_write_trace_enabled();

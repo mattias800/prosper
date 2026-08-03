@@ -213,14 +213,16 @@ Exactly one full definition existed for chain 1. Its first guest frame, `eboot+0
 whose PLT relocation resolves to `sceKernelAllocateMainDirectMemory`, independently confirming that the
 heuristic stack value is a real return site. Capsule SHA-256 was
 `cedf5d7bea196efa58fb90a0d69c1b03359084b90e5ae8cc8cda5ff5b57ca4de`. The earlier caller arm remains
-VOID as an apparatus result; the corrected arm establishes the dynamic allocation identity. #1599, #1859,
+VOID as an apparatus result; the corrected arm establishes the dynamic allocation family and target
+membership, not uniqueness within that family. #1599, #1859,
 #1863.
 
-#1902 adds the next generic diagnostic contract. `PROSPER_DMEM_WRITE_TRACE` accepts only
-`<caller-chain>:<exact-allocation-size>:<offset>:<bytes>`; for this subject the selector is
-`1:0x1000000:0xdd32f0:128`, never a prior run's absolute VA. It waits for the correlated allocation,
-rejects a second matching allocation as ambiguous, arms every known writable alias when the selected
-physical bytes are mapped, and records initial plus bounded faulting RIP/thread/before/after history.
+#1902 adds the next generic diagnostic contract. Four-field `PROSPER_DMEM_WRITE_TRACE` syntax,
+`<caller-chain>:<exact-allocation-size>:<offset>:<bytes>`, requires a unique allocation and rejects a
+second match as ambiguous. The optional five-field form inserts a one-based, bounded occurrence before
+the offset; it reports requested, observed, and selected occurrences and never accepts a prior run's VA.
+It waits for the correlated allocation, arms every known writable alias when the selected physical bytes
+are mapped, and records initial plus bounded faulting RIP/thread/before/after history.
 Any writable alias added after the initial arm invalidates the trace: that alias existed RW before its
 mapping notification, so retroactively protecting it could not prove continuous process-wide coverage.
 The Linux canary performs the first selected write from a different thread, an unrelated same-page write,
@@ -232,6 +234,19 @@ check fail. Lock-acquisition exhaustion terminates with explicit `step-lock-time
 claimed single-step window. Because one instruction executes while the page is RW, only an event whose
 `coverage-valid-before=yes` has complete process-wide pre-fault coverage; after any step, later negative
 coverage is explicitly undetermined (or invalid/overflow), per orchestration trap 68.
+
+The first exact live arm at commit `d181953e` was **VOID, by a useful self-invalidating result**. It
+completed 220 presents and captured submit 181 with the same exact positive control: 8 draws, 6 computes,
+14 operations, zero failures, and draw 0 PS binding 32 at `0x20122d32f0`, with 128/128 bytes at both
+samples, `full-equal`, raw descriptor `full-match`, and all bytes zero. The allocation census was again
+102 records (97 chain 1, five chain 2, none unknown/overflow), but **23** records were chain-1 16 MiB
+allocations. The trace selected occurrence 1, physical `0x20500000`, mapped at `0x2010500000`, and armed
+`0x20112d32f0`. Occurrence 2 was physical `0x21500000`, mapped at `0x2011500000`, and its offset resolves
+to the capture-selected `0x20122d32f0`; its arrival correctly invalidated the trace as
+`ambiguous-allocation` before any fault. The terminal summary reported two matches and zero events.
+Thus caller-chain plus allocation size is not unique, while two source-distinct runs now identify the
+resource as occurrence 2 of that run-relative allocation family. Capsule SHA-256 was
+`b4adcf7e1c81032246a03408fd2c469cef12bb0c559741e039730a29237d5391`. #1902.
 
 ## Ruled out
 
@@ -310,17 +325,20 @@ coverage is explicitly undetermined (or invalid/overflow), per orchestration tra
 
 ## Next discriminators
 
-1. After #1902 lands, run one bounded v46 live arm with `PROSPER_MEMLOG=1`, `PROSPER_DMEM_CALLER=1`, and
-   `PROSPER_DMEM_WRITE_TRACE=1:0x1000000:0xdd32f0:128`. Require exactly one allocation match, at least one
-   complete mapping match, an `armed` line with initial bytes, the existing exact resource selector's own
-   full-match positive control, and a terminal trace summary. Use 64 events initially; `waiting-*`,
-   ambiguity, invalid, overflow before a selected event, or a missing terminal summary makes the arm void.
-2. If event 1 is selected and names guest code, confirm its module+offset in disassembly and follow that
+1. Do not rerun the four-field selector: the live arm falsified its uniqueness. After the optional-occurrence
+   implementation is reviewed, use `PROSPER_DMEM_WRITE_TRACE=1:0x1000000:2:0xdd32f0:128`. Require the
+   configuration and terminal summary to report requested occurrence 2, selected occurrence 2, and the
+   full observed family count. It remains run-relative and must never accept a prior VA.
+2. In that bounded v46 arm, require the occurrence-selected mapping address to equal the independently
+   captured draw 0 PS binding 32 address, plus the same raw full-match/complete-byte positive control and a
+   terminal trace summary. Any mismatch, invalidity, overflow before a selected event, or missing summary
+   makes the arm void rather than an allocation-identity result.
+3. If event 1 is selected and names guest code, confirm its module+offset in disassembly and follow that
    producer. If an unrelated same-page write is event 1, later selected events remain useful writer hints but
    cannot be called the process-wide first writer because trap 68's RW step window has opened.
-3. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
+4. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
    dispatch ran and reproduces its device loss; two failures in six runs are not a stable cause.
-4. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
+5. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
    Until then, do not update `COMPATIBILITY.md` or claim rung progress.
-5. Once output is useful, route beyond 125 seconds as a regression check for #1748; do not reopen the
+6. Once output is useful, route beyond 125 seconds as a regression check for #1748; do not reopen the
    old allocator diagnosis without a newly reproduced failure.

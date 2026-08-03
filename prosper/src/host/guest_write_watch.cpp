@@ -517,6 +517,7 @@ struct DmemTraceState {
     uint64_t rearms = 0;
     uint64_t coverage_gaps = 0;
     uint64_t overflow_events = 0;
+    uint64_t selected_occurrence = 0;
     uint64_t allocation_phys = 0;
     uint64_t target_phys = 0;
     uint64_t target_end_phys = 0;
@@ -723,7 +724,8 @@ const char* trace_reason_name(GuestDmemWriteTraceInvalidReason reason) {
 bool trace_config_valid(const GuestDmemWriteTraceConfig& config) {
     if (!config.caller_chain || !config.allocation_size || !config.size ||
         config.size > kGuestDmemWriteTraceMaxBytes || !config.max_events ||
-        config.max_events > kGuestDmemWriteTraceMaxEvents)
+        config.max_events > kGuestDmemWriteTraceMaxEvents ||
+        config.allocation_occurrence > kGuestDmemWriteTraceMaxAllocationOccurrence)
         return false;
     return config.offset <= config.allocation_size &&
            config.size <= config.allocation_size - config.offset;
@@ -1118,8 +1120,11 @@ bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig& config) {
     w.trace.status = GuestDmemWriteTraceStatus::WaitingAllocation;
     std::fprintf(stderr,
                  "[dmem-write-trace] configured caller-chain=%u allocation=0x%llx"
-                 " offset=0x%llx bytes=%u max-events=%u\n",
+                 " occurrence-mode=%s requested-occurrence=%u offset=0x%llx"
+                 " bytes=%u max-events=%u\n",
                  config.caller_chain, static_cast<unsigned long long>(config.allocation_size),
+                 config.allocation_occurrence ? "ordinal" : "unique",
+                 config.allocation_occurrence,
                  static_cast<unsigned long long>(config.offset), config.size, config.max_events);
     return true;
 #endif
@@ -1130,22 +1135,39 @@ void guest_dmem_write_trace_init_from_environment() {
     if (!value || !*value) return;
 
     GuestDmemWriteTraceConfig config{};
-    uint64_t parsed[4] = {};
+    uint64_t parsed[5] = {};
     const char* cursor = value;
     bool valid = true;
-    for (int i = 0; i < 4; ++i) {
+    bool terminated = false;
+    int fields = 0;
+    while (valid && fields < 5) {
         char* end = nullptr;
-        parsed[i] = std::strtoull(cursor, &end, 0);
-        if (end == cursor || (i < 3 ? *end != ':' : *end != '\0')) {
+        parsed[fields++] = std::strtoull(cursor, &end, 0);
+        if (end == cursor || (*end != ':' && *end != '\0')) {
             valid = false;
             break;
         }
-        cursor = end + (i < 3 ? 1 : 0);
+        if (*end == '\0') {
+            terminated = true;
+            break;
+        }
+        cursor = end + 1;
     }
+    if (!terminated) valid = false; // a sixth field or trailing separator
+    if (fields != 4 && fields != 5) valid = false;
     config.caller_chain = parsed[0] <= UINT32_MAX ? static_cast<uint32_t>(parsed[0]) : 0;
     config.allocation_size = parsed[1];
-    config.offset = parsed[2];
-    config.size = parsed[3] <= UINT32_MAX ? static_cast<uint32_t>(parsed[3]) : 0;
+    const int offset_field = fields == 5 ? 3 : 2;
+    const int size_field = fields == 5 ? 4 : 3;
+    config.offset = parsed[offset_field];
+    config.size = parsed[size_field] <= UINT32_MAX
+                      ? static_cast<uint32_t>(parsed[size_field]) : 0;
+    if (fields == 5) {
+        if (!parsed[2] || parsed[2] > kGuestDmemWriteTraceMaxAllocationOccurrence)
+            valid = false;
+        else
+            config.allocation_occurrence = static_cast<uint32_t>(parsed[2]);
+    }
     config.max_events = 32;
     if (const char* max_value = std::getenv("PROSPER_DMEM_WRITE_TRACE_MAX_EVENTS")) {
         char* end = nullptr;
@@ -1167,7 +1189,8 @@ void guest_dmem_write_trace_init_from_environment() {
     } else if (!configured) {
         std::fprintf(stderr,
                      "[dmem-write-trace] invalid reason=invalid-config"
-                     " expected=<chain>:<allocation-size>:<offset>:<bytes>\n");
+                     " expected=<chain>:<allocation-size>:<offset>:<bytes>"
+                     " or <chain>:<allocation-size>:<occurrence>:<offset>:<bytes>\n");
     }
     static const bool report_registered = [] {
         return std::atexit(guest_dmem_write_trace_report) == 0;
@@ -1197,6 +1220,7 @@ GuestDmemWriteTraceSnapshot guest_dmem_write_trace_snapshot() {
     out.rearms = trace.rearms;
     out.coverage_gaps = trace.coverage_gaps;
     out.overflow_events = trace.overflow_events;
+    out.selected_occurrence = trace.selected_occurrence;
     out.target_phys = trace.target_phys;
     out.target_addr = trace.target_addr;
     out.initial = trace.initial;
@@ -1220,7 +1244,8 @@ void guest_dmem_write_trace_report() {
                  "[dmem-write-trace] summary status=%s reason=%s result=%s"
                  " allocation-matches=%llu mapping-matches=%llu page-faults=%llu"
                  " selected-faults=%llu steps=%llu rearms=%llu coverage-gaps=%llu"
-                 " overflow=%llu events=%u/%u\n",
+                 " overflow=%llu occurrence-mode=%s requested-occurrence=%u"
+                 " observed-occurrences=%llu selected-occurrence=%llu events=%u/%u\n",
                  trace_status_name(trace.status), trace_reason_name(trace.invalid_reason), result,
                  static_cast<unsigned long long>(trace.allocation_matches),
                  static_cast<unsigned long long>(trace.mapping_matches),
@@ -1229,7 +1254,11 @@ void guest_dmem_write_trace_report() {
                  static_cast<unsigned long long>(trace.completed_steps),
                  static_cast<unsigned long long>(trace.rearms),
                  static_cast<unsigned long long>(trace.coverage_gaps),
-                 static_cast<unsigned long long>(trace.overflow_events), trace.event_count,
+                 static_cast<unsigned long long>(trace.overflow_events),
+                 trace.config.allocation_occurrence ? "ordinal" : "unique",
+                 trace.config.allocation_occurrence,
+                 static_cast<unsigned long long>(trace.allocation_matches),
+                 static_cast<unsigned long long>(trace.selected_occurrence), trace.event_count,
                  trace.config.max_events);
 }
 
@@ -1237,37 +1266,54 @@ void guest_dmem_write_trace_notify_allocation(uint64_t phys, uint64_t size, uint
     WatchState& w = state();
     std::lock_guard lock(w.mutex);
     DmemTraceState& trace = w.trace;
-    if (trace.status != GuestDmemWriteTraceStatus::WaitingAllocation &&
+    const bool observing_default_ambiguity =
+        trace.status == GuestDmemWriteTraceStatus::Invalid &&
+        trace.invalid_reason == GuestDmemWriteTraceInvalidReason::AmbiguousAllocation &&
+        trace.config.allocation_occurrence == 0;
+    if (!observing_default_ambiguity &&
+        trace.status != GuestDmemWriteTraceStatus::WaitingAllocation &&
         trace.status != GuestDmemWriteTraceStatus::WaitingMapping &&
         trace.status != GuestDmemWriteTraceStatus::Armed &&
         trace.status != GuestDmemWriteTraceStatus::Stepping)
         return;
     if (chain_id != trace.config.caller_chain || size != trace.config.allocation_size) return;
     ++trace.allocation_matches;
-    if (trace.allocation_matches != 1) {
+    if (observing_default_ambiguity) return;
+    if (!trace.config.allocation_occurrence && trace.allocation_matches != 1) {
         trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::AmbiguousAllocation,
                                 trace.status == GuestDmemWriteTraceStatus::Stepping);
         std::fprintf(stderr,
                      "[dmem-write-trace] invalid reason=ambiguous-allocation"
-                     " caller-chain=%u allocation=0x%llx matches=%llu\n",
+                     " caller-chain=%u allocation=0x%llx occurrence-mode=unique"
+                     " observed-occurrences=%llu selected-occurrence=%llu\n",
                      chain_id, static_cast<unsigned long long>(size),
-                     static_cast<unsigned long long>(trace.allocation_matches));
+                     static_cast<unsigned long long>(trace.allocation_matches),
+                     static_cast<unsigned long long>(trace.selected_occurrence));
         return;
     }
+    if (trace.config.allocation_occurrence &&
+        trace.allocation_matches != trace.config.allocation_occurrence)
+        return;
     if (phys > UINT64_MAX - trace.config.offset ||
         phys + trace.config.offset > UINT64_MAX - trace.config.size) {
         trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::AddressOverflow);
         return;
     }
     trace.allocation_phys = phys;
+    trace.selected_occurrence = trace.allocation_matches;
     trace.target_phys = phys + trace.config.offset;
     trace.target_end_phys = trace.target_phys + trace.config.size;
     trace.status = GuestDmemWriteTraceStatus::WaitingMapping;
     std::fprintf(stderr,
                  "[dmem-write-trace] allocation-match caller-chain=%u phys=0x%llx"
-                 " allocation=0x%llx target-phys=0x%llx\n",
+                 " allocation=0x%llx occurrence-mode=%s requested-occurrence=%u"
+                 " observed-occurrences=%llu selected-occurrence=%llu target-phys=0x%llx\n",
                  chain_id, static_cast<unsigned long long>(phys),
                  static_cast<unsigned long long>(size),
+                 trace.config.allocation_occurrence ? "ordinal" : "unique",
+                 trace.config.allocation_occurrence,
+                 static_cast<unsigned long long>(trace.allocation_matches),
+                 static_cast<unsigned long long>(trace.selected_occurrence),
                  static_cast<unsigned long long>(trace.target_phys));
     trace_maybe_arm_locked(w);
 }
