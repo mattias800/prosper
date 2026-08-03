@@ -887,6 +887,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_replay_shader_dump PRIVATE prosper_core)
   add_test(NAME gpu_replay_shader_dump COMMAND test_gpu_replay_shader_dump)
 
+  # Draw-scoped captured-resource replacement: strict semantic selector, exact span validation,
+  # and copy-on-write isolation when draws share tables/backing. Pure/cross-platform; no Vulkan.
+  add_executable(test_gpu_replay_resource_override
+                 tests/test_gpu_replay_resource_override.cpp)
+  target_link_libraries(test_gpu_replay_resource_override PRIVATE prosper_core)
+  add_test(NAME gpu_replay_resource_override COMMAND test_gpu_replay_resource_override)
+
   # Selected-prefix compute output inspection must distinguish captured seed bytes from the
   # descriptor-visible post-dispatch image, including tiled 2D and true 3D storage layouts.
   add_executable(test_gpu_replay_post_compute_resource

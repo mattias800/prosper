@@ -11,6 +11,7 @@
 #include "realized_shader_dump.hpp"
 #include "pixel_input_linkage.hpp"
 #include "post_compute_resource.hpp"
+#include "resource_override.hpp"
 #include "render_runner.h"
 
 #include <algorithm>
@@ -65,6 +66,7 @@ void usage(const char* argv0) {
                          "[--recompile-raw] "
                          "[--prepend producer.prgcap] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
+                         "[--override-resource DRAW:vs|ps:BINDING PATH] "
                          "[--dump-rtt-seed ADDR PATH] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
                          "[--dump-realized-shader DRAW:vs|vs-main|fs PATH] "
@@ -1695,6 +1697,9 @@ int main(int argc, char** argv) {
     std::string dump_spec, dump_path, shader_spec, shader_path;
     std::string compute_shader_spec, compute_shader_path;
     std::string compute_override_spec, compute_override_path;
+    bool resource_override_requested = false;
+    prosper::tools::ResourceOverrideSelector resource_override_selector;
+    std::string resource_override_path;
     std::string compute_resource_spec, compute_resource_path;
     std::string post_compute_resource_spec, post_compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
@@ -1827,6 +1832,21 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-resource" && i + 2 < argc) {
             dump_spec = argv[++i]; dump_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--override-resource" && i + 2 < argc) {
+            if (resource_override_requested) {
+                std::fprintf(stderr, "gpu_replay: duplicate --override-resource\n");
+                return 2;
+            }
+            const char* selector = argv[++i];
+            if (!prosper::tools::parse_resource_override_selector(
+                    selector, resource_override_selector)) {
+                std::fprintf(stderr, "gpu_replay: invalid resource override selector %s\n",
+                             selector);
+                return 2;
+            }
+            resource_override_path = argv[++i];
+            resource_override_requested = true;
+        }
         else if (std::string(argv[i]) == "--dump-rtt-seed" && i + 2 < argc) {
             char* end = nullptr;
             rtt_seed_addr = std::strtoull(argv[++i], &end, 0);
@@ -1891,6 +1911,7 @@ int main(int argc, char** argv) {
             !shader_spec.empty() || !compute_shader_spec.empty() ||
             !realized_shader_spec.empty() ||
             !compute_override_spec.empty() ||
+            resource_override_requested ||
             !compute_resource_spec.empty() || !post_compute_resource_spec.empty() ||
             require_post_change || expected_post_hash_set || !failed_shader_spec.empty() ||
             !retry_failed_chain_spec.empty() ||
@@ -1971,6 +1992,26 @@ int main(int argc, char** argv) {
     prosper::gpu::GpuReplayFrame replay;
     if (!prosper::gpu::materialize_gpu_replay(capture, replay, error)) {
         std::fprintf(stderr, "gpu_replay: cannot materialize: %s\n", error.c_str()); return 2;
+    }
+    prosper::tools::AppliedResourceOverride applied_resource_override;
+    if (resource_override_requested) {
+        if (!prosper::tools::apply_resource_override_file(
+                replay, resource_override_selector, resource_override_path,
+                applied_resource_override, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot override resource: %s\n", error.c_str());
+            return 2;
+        }
+        const auto& selector = applied_resource_override.selector;
+        const auto& target = applied_resource_override.target;
+        std::fprintf(stderr,
+                     "[resource-override] draw=%llu stage=%s binding=%u addr=%016llx "
+                     "size=%llu original-hash=%016llx new-hash=%016llx\n",
+                     static_cast<unsigned long long>(selector.draw_index),
+                     prosper::tools::resource_override_stage_name(selector.stage),
+                     selector.binding, static_cast<unsigned long long>(target.gpu_addr),
+                     static_cast<unsigned long long>(target.captured_size),
+                     static_cast<unsigned long long>(applied_resource_override.original_hash),
+                     static_cast<unsigned long long>(applied_resource_override.replacement_hash));
     }
     prosper::gpu::GpuCaptureFile prepend_capture;
     prosper::gpu::GpuReplayFrame prepend;
