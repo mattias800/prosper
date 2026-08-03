@@ -312,12 +312,19 @@ CPU regression coverage asserts the exact Syberia candidate/range shape and the 
 
 One post-fix full-resolution diagnostic reached the same profile-screen phase. The 2048 cube emitted
 one `cold-or-evicted` miss with `candidate=1`, `eligible=1` and the exact 33,570,816-byte source, then
-no later miss through t=225.1 s / frame 611. This removes the old observed repeated-miss signature,
-but the arm did not independently prove a same-identity hit: aggregate cache hits are not identity
-evidence, the detail logger suppresses resources below 0.5 ms, and an approved debugger breakpoint
-raced process exit. A new `PROSPER_DETILE_STATS` witness therefore reports only the first persistent
-hit for each of at most 64 expensive BC cube addresses, including key, source span and persistent
-ID/version; it is CPU-policy tested and awaits a coordinated live confirmation.
+no later miss through t=225.1 s / frame 611. That arm removed the old repeated-miss signature but did
+not independently prove a same-identity hit: aggregate cache hits are not identity evidence, the
+detail logger suppresses resources below 0.5 ms, and an approved debugger breakpoint raced process
+exit. `PROSPER_DETILE_STATS` therefore gained a bounded first-hit witness carrying the key, source span
+and persistent ID/version.
+
+A subsequent short run proved the missing identity link. The run-local 2048x2048x6 BC6H resource at
+key `0x9dc5b36201047cea` first reported one exact 33,570,816-byte `cold-or-evicted` miss, then reported
+`cache=persistent-hit` with the same key, footprint and source span, persistent ID 195/version 1, and
+`validation=exact validated=33570816`. Both the submit journal and write-watch query returned clean
+result 2. The process was stopped immediately after this witness. The expensive decoded cube is thus
+being reused from the persistent cache; the earlier absence of repeated misses was not merely the
+texture disappearing from the workload.
 
 The profile output retained the expected full-width, overexposed scene without new cube corruption.
 Through the post-cube t=125.057→225.102 s window, presents advanced 419→614: **1.949 fps**, no

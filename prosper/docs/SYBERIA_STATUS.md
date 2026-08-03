@@ -109,13 +109,18 @@ performance, so this change deliberately does not revive it.
 A single post-fix diagnostic run reached the same profile-screen phase. The large cube produced
 exactly one observed miss: `cold-or-evicted`, `candidate=1`, `eligible=1`, with source and footprint
 both 33,570,816 bytes. There was no later miss for that address through t=225.1 s / frame 611. This
-proves the old unconditional candidate rejection is gone and the repeated-decode symptom was not
-observed again; it does **not** by itself prove that the identity was referenced again or served as a
-cache hit. Aggregate hit counters rose, but they cover every texture. The planned identity-specific
-`PROSPER_RENDER_TIMING=detail` witness did not print because successful hits stayed below its 0.5 ms
-detail threshold, and a subsequently approved debugger breakpoint raced the process exit. The exact
-hit remains unproved in this arm. `PROSPER_DETILE_STATS` now has a separately bounded, one-line-per-
-address `[detile-hit]` witness for the next coordinated run so this apparatus gap cannot recur.
+proved the old unconditional candidate rejection was gone, but not that the identity was referenced
+again: aggregate hit counters cover every texture, the detail logger suppresses resources below
+0.5 ms, and an approved debugger breakpoint raced process exit. `PROSPER_DETILE_STATS` therefore
+gained a separately bounded, one-line-per-address `[detile-hit]` witness.
+
+The follow-up run closed that apparatus gap. Its run-local 2048x2048x6 resource used key
+`0x9dc5b36201047cea`; it first emitted one exact 33,570,816-byte cold miss, then an identity-matched
+`cache=persistent-hit` with the same key, footprint and source span, persistent ID 195/version 1, and
+`validation=exact validated=33570816`. Submit-journal and write-watch queries both returned the clean
+result 2. The process was stopped immediately after the witness. The decoded cube is therefore
+actually reused; its disappearance from the miss stream was not caused by the texture disappearing
+from the workload.
 
 The post-fix frame is visually unchanged in the useful sense: a 1920x1080 composited profile screen
 contains the expected full-width scene and UI, with no new cube seam, corruption or missing layer.
