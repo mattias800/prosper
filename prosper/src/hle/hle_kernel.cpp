@@ -1248,7 +1248,7 @@ void* thread_trampoline(void* p) {
     // allocator arena/tcache — resolves to real guest storage, not the aliased host glibc TCB). The import
     // stubs swap back to host %fs per HLE call. No-op when the gate is off. Order matters: the free() above
     // is host glibc (host-TLS tcache) — running it under the guest %fs corrupts the host heap.
-    arm_hwbp_this_thread();   // no-op unless PROSPER_HWBP_ALLTHREADS; MUST run on host %fs (host libc calls)
+    guest_execution_thread_enter(/*primary=*/false); // ALLTHREADS-gated; MUST run on host %fs
     if (hooks.on_enter) hooks.on_enter(hooks.opaque);   // host %fs; see ThreadStart::hooks
     guest_tls_activate_thread();
     void* rv = nullptr;
@@ -1395,6 +1395,7 @@ void* win_thread_trampoline(void* p) {
     }
     trace_guest_thread_lifecycle(true, (uint64_t)pthread_self(),
                                  (uint64_t)GetCurrentThreadId(), registered_base, registered_size);
+    guest_execution_thread_enter(/*primary=*/false); // Windows boundary; HWBP backend unavailable
     if (hooks.on_enter) hooks.on_enter(hooks.opaque);   // host %fs; see ThreadStart::hooks
     guest_tls_activate_thread();   // this worker's guest %fs TCB (FSGSBASE); no-op if the gate is off
     void* rv = nullptr;

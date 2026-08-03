@@ -7,6 +7,10 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
 #ifdef __linux__
 #include <sys/mman.h>
 #include <unistd.h>
@@ -17,6 +21,49 @@ using namespace prosper;
 static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
                               else        { printf("  [ok]   %s\n", msg); } } while (0)
+
+namespace {
+struct LateGuestEntryProbe {
+    std::atomic<int> sequence{0};
+    std::atomic<int> boundary_order{0};
+    std::atomic<int> guest_order{0};
+    std::atomic<int> entry_boundary_order{0};
+    std::atomic<int> entry_guest_order{0};
+    std::atomic<int> boundary_calls{0};
+    std::atomic<int> primary_calls{0};
+    std::atomic<bool> release_init{false};
+    std::thread::id init_boundary_thread{};
+    std::thread::id init_guest_thread{};
+    std::thread::id entry_boundary_thread{};
+    std::thread::id entry_guest_thread{};
+};
+
+LateGuestEntryProbe* g_late_guest_entry_probe = nullptr;
+
+void observe_guest_entry(bool primary, void* opaque) {
+    auto* probe = static_cast<LateGuestEntryProbe*>(opaque);
+    const int call = probe->boundary_calls.fetch_add(1) + 1;
+    if (primary) probe->primary_calls.fetch_add(1);
+    const int order = probe->sequence.fetch_add(1) + 1;
+    if (call == 1) {
+        probe->init_boundary_thread = std::this_thread::get_id();
+        probe->boundary_order.store(order, std::memory_order_release);
+    } else if (call == 2) {
+        probe->entry_boundary_thread = std::this_thread::get_id();
+        probe->entry_boundary_order.store(order, std::memory_order_release);
+    }
+}
+
+void late_guest_init(uint64_t, uint64_t) {
+    // Filled in by main through this single-test-process pointer; run_guest_inits requires a plain
+    // guest function address, so a capturing lambda is not an option.
+    g_late_guest_entry_probe->init_guest_thread = std::this_thread::get_id();
+    g_late_guest_entry_probe->guest_order.store(
+        g_late_guest_entry_probe->sequence.fetch_add(1) + 1, std::memory_order_release);
+    while (!g_late_guest_entry_probe->release_init.load(std::memory_order_acquire))
+        std::this_thread::yield();
+}
+}
 
 int main() {
     printf("== test_stack_registry ==\n");
@@ -121,6 +168,57 @@ int main() {
         }
     }
 #endif
+
+    // boot_program completes setup on one thread, then frontends can enter guest code from a later
+    // std::thread. Drive the real pre-run_entry guest path: module init is itself guest execution and
+    // must pass the HWBP boundary before its first instruction. The guest-order assertion executes
+    // independently, so deleting the boundary call makes the exact named check red instead of making
+    // the rest of this experiment skip. Keep this after the stack-size cases: glibc may reuse a prior
+    // std::thread's default-size cached stack for a later pthread and obscure what those cases measure.
+    LateGuestEntryProbe late_probe;
+    g_late_guest_entry_probe = &late_probe;
+    set_guest_execution_thread_enter_test_hook(&observe_guest_entry, &late_probe);
+    std::atomic<size_t> late_init_count{0};
+    const std::thread::id test_main_thread = std::this_thread::get_id();
+    std::thread init_execution_thread([&] {
+        late_init_count.store(run_guest_inits(
+            {reinterpret_cast<uint64_t>(&late_guest_init)}), std::memory_order_release);
+    });
+    const auto init_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (late_probe.guest_order.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < init_deadline)
+        std::this_thread::yield();
+    // prosper-app/screenshot use this exact topology: boot_program's init executes on their caller,
+    // then run_entry crosses the primary boundary from a different, simultaneously-live std::thread.
+    const bool init_started = late_probe.guest_order.load(std::memory_order_acquire) != 0;
+    if (init_started) {
+        std::thread entry_execution_thread([&] {
+            guest_execution_thread_enter(/*primary=*/true);
+            late_probe.entry_guest_thread = std::this_thread::get_id();
+            late_probe.entry_guest_order.store(
+                late_probe.sequence.fetch_add(1) + 1, std::memory_order_release);
+        });
+        entry_execution_thread.join();
+    }
+    late_probe.release_init.store(true, std::memory_order_release);
+    init_execution_thread.join();
+    set_guest_execution_thread_enter_test_hook(nullptr);
+    CHECK(late_probe.guest_order.load(std::memory_order_acquire) != 0 &&
+          late_init_count.load(std::memory_order_acquire) == 1,
+          "late module-init guest function still executes");
+    CHECK(late_probe.boundary_calls.load(std::memory_order_acquire) == 2 &&
+          late_probe.primary_calls.load(std::memory_order_acquire) == 2 &&
+          late_probe.boundary_order.load(std::memory_order_acquire) == 1 &&
+          late_probe.guest_order.load(std::memory_order_acquire) == 2 &&
+          late_probe.entry_boundary_order.load(std::memory_order_acquire) == 3 &&
+          late_probe.entry_guest_order.load(std::memory_order_acquire) == 4 &&
+          late_probe.init_boundary_thread == late_probe.init_guest_thread &&
+          late_probe.entry_boundary_thread == late_probe.entry_guest_thread &&
+          late_probe.init_boundary_thread != late_probe.entry_boundary_thread &&
+          late_probe.init_boundary_thread != test_main_thread &&
+          late_probe.entry_boundary_thread != test_main_thread,
+          "distinct init and frontend threads each reach the primary HWBP boundary before guest code");
+    g_late_guest_entry_probe = nullptr;
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
