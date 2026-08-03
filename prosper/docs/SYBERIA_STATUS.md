@@ -1,9 +1,9 @@
 # Syberia: Remastered (`PPSA30140`) — status and evidence
 
 Unity / IL2CPP, Microids / Virtuallyz Gaming. **Rung 3 — gameplay reached** with real GPU draws on a
-validated route (`scripts/syberia/reach-gameplay.pad`). Two composition defects remain, both tracked
-on #1619: the profile menu's formerly missing 3D layer is restored but overexposed, and the routed
-gameplay composite remains degraded.
+validated route (`scripts/syberia/reach-gameplay.pad`). Two visual defects remain: the profile
+menu's formerly missing 3D layer is restored but overexposed (#1790), and the routed gameplay
+composite remains degraded (#1627).
 
 Read **`## Ruled out`** below before repeating any experiment on the "right side of the frame is
 black" question. Several hypotheses about that frame — including the one this document originally
@@ -25,12 +25,13 @@ re-derive these without contradictory new evidence.
 | Syberia's ~1.9 fps is #1748-style AGC command-buffer churn | **Falsified.** Over a 45 s headless boot with `PROSPER_DCBFULL=1` the title builds 311,296 command packets and issues **zero** Dcb buffer-full callbacks — it never asks the guest for more command-buffer space at all. The probe prints an `armed` banner and a running `seen=/full=` tally, so this zero is the probe reporting zero rather than a silent log (it was measured once before *without* that banner, and that earlier reading proved nothing). Note the comparison titles are **not** cleared: Bendy runs at 297 callbacks/s, the same order as Asterix *after* #1748 (368/s), so a high rate is not itself the defect — what mattered on Asterix was that the chunks never came back. | #1756, `docs/AGC_PACKET_SIZES.md` |
 | The `[agc] WaitRegMem … dependency violated` burst at t≈129 s is a finding | **Not a measurement.** The diagnostic is capped at 40 printed lines (`command_processor.cpp:2450`) and the counter in the message is the true total; an unsatisfied wait is documented in the code as normal handled state. The same over-read was recorded independently on Oregon Trail (#1606) and as instrument trap #13 in `GAME_COMPAT_ORCHESTRATION.md`. | #1619, #1606 |
 
-**Still open:** what causes the restored menu layer's substantial overexposure, and whether it is
-related to the degraded gameplay composite. Recompiling source 101 restores the visible 3D layer on
-the **default** path, but does not make it visually correct. The earlier seed-skip/invalidation
-theory depended on treating source 119 as an in-place pass over one address; exact resource
-inspection disproved that premise: its sampled binding 14 and write-only storage binding 23 are
-different surfaces, and binding 23 was already zero before guest packing/writeback.
+**Still open:** what causes the restored menu layer's substantial overexposure (#1790). Recompiling
+source 101 restores the visible 3D layer on the **default** path, but does not make it visually
+correct. The degraded gameplay composite is separate and unlocalized (#1627); do not merge the two
+hypotheses without capture evidence. The earlier seed-skip/invalidation theory depended on treating
+source 119 as an in-place pass over one address; exact resource inspection disproved that premise:
+its sampled binding 14 and write-only storage binding 23 are different surfaces, and binding 23 was
+already zero before guest packing/writeback.
 
 ## Route and timing (Linux, hardware Vulkan, RADV, 1920x1080)
 
@@ -78,9 +79,8 @@ it without re-running:
 | ~312 s onward | **gameplay** — Kate Walker in the factory hall, the "Leave" interaction prompt, the "Use the left stick to move" tutorial, the pause HUD (≈46,000–48,000 colours, 2,068,000+ non-black px, i.e. 99.7% of the frame) |
 
 Gameplay composition is **degraded**: a translucent ghost of another scene is blended over the middle
-of the frame and the image is over-dark. That is a second symptom on #1619 and is probably the same
-post-process/RTT family as the menu, but it has **not** been localized — treat it as a separate
-question until a capture says otherwise.
+of the frame and the image is over-dark. It is tracked separately on #1627 and has **not** been
+localized; there is no evidence yet that it shares the profile menu's exposure mechanism.
 
 ## The former "right ~55% is black" question — localized and fixed
 
