@@ -34,7 +34,7 @@ exact operands. In the NSA form, the fixed VADDR byte names X and the extra addr
 bytes name Y/sample. Its descriptor resolves exactly as 1920x1080 `R32_FLOAT`, four samples,
 `SW_64KB_Z_X` (mode 24), one guest mip.
 
-On this branch all four instructions compile and the live renderer consumes their bindings; no
+On current master all four instructions compile and the live renderer consumes their bindings; no
 `[recompile-reject]` or `[render-msaa-reject]` occurs. A 30-second run published six source-distinct
 sampled frames while all six remained pure black (`crc=064567f8`). This is generic capability progress,
 not visible title progress, and the compatibility rung remains 0.
@@ -42,6 +42,61 @@ not visible title progress, and the compatibility rung remains 0.
 The historical renderer-publication stop at roughly 125-138 seconds was a separate guest allocation
 failure and was fixed by #1748. Bounded current runs no longer reproduce that failure; it is not part
 of this MSAA work.
+
+## Current whole-frame discriminator
+
+A current post-MSAA whole-frame bundle at present 180 contains one complete submit: 8 draws, 6
+dispatches, 14 ordered operations, and no realization failures. The final two composite draws both
+sample the same 1920x1080 R11G11B10 surface, whose captured pre-frame temporal seed is all zero. The
+first reading of the dependency graph called that surface an external prior-frame leaf because no
+ordinary color write targeted it.
+
+That reading was an instrument defect. Four draws in the submit have
+`CB_COLOR_CONTROL.MODE=RESOLVE`: they are fixed-function copies from color0 to raw color1, not shader
+draws. Color1 is the composite's sampled surface, and its shader write mask is correctly zero because
+the pixel shader does not execute for a resolve. The live backend already implements this contract,
+but `gpu_replay --graph` modeled each resolve as an ordinary shader draw: it invented a color0 write,
+ignored the color1 destination, and included shader resources that never execute. With resolve-aware
+graphing, the retained bundle changes from this false result:
+
+```text
+dependency-graph operations=14 edges=0 external-leaves=15
+external consumers=2 first=8 future-writer=-1 stage=ps binding=34
+         addr=0000002011800000 bytes=8847360 dims=1920x1080
+```
+
+to the complete six-edge in-submit chain:
+
+```text
+edge producer=4 consumer=5  stage=resolve-src addr=0000002033b10000
+edge producer=4 consumer=6  stage=resolve-src addr=0000002033b10000
+edge producer=6 consumer=8  stage=ps binding=34 addr=0000002011800000
+edge producer=4 consumer=9  stage=resolve-src addr=0000002033b10000
+edge producer=4 consumer=10 stage=resolve-src addr=0000002033b10000
+edge producer=10 consumer=11 stage=ps binding=34 addr=0000002011800000
+```
+
+The corrected graph reports six edges and no external image leaf for the final composite source.
+The proposed bounded replay has now run through operations 4/6/8/10/11. All five outputs were the
+same pure-black image (`hash=792bed5a3f02a383`; RGB min/max/mean zero), although they do not all name
+the same surface. Inspect and graph output map them respectively to draws 0/2/4/6/7. Operation 4 is
+the first graphics operation and directly renders color0 `0x2033b10000` black; its fragment shader's
+only captured input is a zero-filled 128-byte constant buffer, and the temporal seeds in this chain
+are also zero. The capture therefore contains no useful-color-to-black transition and does not
+justify a product-code fix.
+
+The run also exposed the remaining instrument limit. For fixed resolves 6 and 10,
+`--through-operation` selects the draw's color0 source (`0x2033b10000`) as its output, not raw color1
+destination `0x2011800000`. Their black BMPs therefore do not directly observe the resolve
+destination. The former prior-frame conclusion remains ruled out, but exact destination pixels need
+a target-address selector rather than another title boot.
+
+A separate 64.7-second semantic timeline recorded 31,982 complete submits before a recoverable
+truncated tail. Submit 1 had 8 draws/10 dispatches; every later submit had 8 draws/6 dispatches, and
+all target spans remained 1920x1080. This proves the folded workload did not change its coarse
+draw/dispatch/target signature during that run. It does not prove the underlying resources or pixels
+were constant. The run also established an apparatus boundary: omitting `PROSPER_RENDER` disables
+graphics rendering, but supported compute still initializes and uses the Vulkan device.
 
 ## Implemented contract under test
 
@@ -153,13 +208,22 @@ self-validating reproduction.
 - **A visible-progress claim from reduced tests:** none has been made. A patched live run and human
   screenshot are still required.
 - **The historical ~125-second publication stall as the current blocker:** its command-packet/allocation
-  failure was fixed by #1748. The current reproduced blocker is black output from the MSAA shader gap.
+  failure was fixed by #1748. The current reproduced blocker is the post-MSAA black output above.
+- **The final composite source as an unresolved prior-frame producer:** the old graph omitted
+  fixed-function `MODE=RESOLVE` edges. Its `edges=0` result falsely listed `0x2011800000` as an
+  external leaf consumed by operations 8/11. The corrected six edges are 4→5, 4→6, 6→8, 4→9,
+  4→10, and 10→11, closing that source through four color0-to-color1 copies in the same submit. The
+  bounded prefix replay subsequently found the first graphics producer already black; it did not
+  reveal a useful-color-to-black boundary or justify a renderer change.
+- **A renderer-disabled title boot as a GPU-free experiment:** live compute remains active without
+  `PROSPER_RENDER` and initializes Vulkan when the title dispatches supported compute.
 
 ## Next discriminators
 
-1. Capture one current black live frame into a replayable bundle and use draw-step/resource inspection
-   to identify which final composite draw writes black. The MSAA stage now executes, so another rejected
-   or semantically wrong producer/composite is downstream.
+1. Add a generic replay selector that snapshots an exact target address after an exact operation.
+   Use it on `0x2011800000` after operations 6 and 10, and print both selectors beside the output so
+   the experiment proves its own lever moved. Prefix output cannot answer this because it selects
+   color0 for a fixed resolve. This is a tool gap; no new title boot is needed.
 2. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
    dispatch ran and reproduces its device loss; two failures in six runs are not a stable cause.
 3. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.

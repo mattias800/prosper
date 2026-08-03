@@ -1,4 +1,5 @@
 #include "gpu_dependency_graph.hpp"
+#include "vk_translate.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -15,6 +16,36 @@ struct Writer {
     uint32_t height = 0;
     bool image = false;
 };
+
+struct DependencyImageFormat {
+    DataFormat format = DataFormat::Unknown;
+    uint32_t components = 0;
+    uint32_t bytes_per_pixel = 4;
+    bool srgb = false;
+};
+
+DependencyImageFormat dependency_image_format(uint32_t raw_format) {
+    switch (static_cast<VkFormat>(raw_format)) {
+        case VkFormat::R8_UNORM:
+            return {DataFormat::Unorm8, 1, 1, false};
+        case VkFormat::R8G8B8A8_UNORM:
+        case VkFormat::B8G8R8A8_UNORM:
+            return {DataFormat::Unorm8, 4, 4, false};
+        case VkFormat::R8G8B8A8_SRGB:
+        case VkFormat::B8G8R8A8_SRGB:
+            return {DataFormat::Unorm8, 4, 4, true};
+        case VkFormat::R16G16B16A16_SFLOAT:
+            return {DataFormat::Float16, 4, 8, false};
+        case VkFormat::B10G11R11_UFLOAT_PACK32:
+            return {DataFormat::Float10_11_11, 3, 4, false};
+        case VkFormat::R32_UINT:
+            return {DataFormat::Uint32, 1, 4, false};
+        default:
+            // Preserve the graph's historical four-byte conservative span while leaving an
+            // unrecognised view ineligible for exact-format RTT seed closure.
+            return {};
+    }
+}
 
 uint64_t span_end(uint64_t addr, uint64_t size) {
     return size > std::numeric_limits<uint64_t>::max() - addr
@@ -138,8 +169,6 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
                 return false;
             }
             const DrawItem& draw = *it->second;
-            append_accesses(draw.vrt.get(), "vs", reads);
-            append_accesses(draw.prt.get(), "ps", reads);
             auto append_target = [&](uint64_t base, uint32_t width, uint32_t height,
                                      uint32_t write_mask) {
                 if (!write_mask || !base || !width || !height ||
@@ -148,16 +177,51 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
                 writes.push_back({0, base, static_cast<uint64_t>(width) * height * 4,
                                   width, height, true});
             };
-            for (size_t slot = 0; slot < draw.color_targets.size(); ++slot) {
-                const auto& target = draw.color_targets[slot];
-                append_target(target.base, target.width, target.height,
-                              draw.ps.color_targets[slot].write_mask);
+            auto color_binding = [&](size_t slot) {
+                DrawItem::ColorTargetBinding binding = draw.color_targets[slot];
+                // Direct graph callers and captures through v33 may populate only the named aliases.
+                if (!binding.base && !binding.width && !binding.height && slot == 0)
+                    binding = {draw.color0_base, draw.color0_width, draw.color0_height};
+                else if (!binding.base && !binding.width && !binding.height && slot == 1)
+                    binding = {draw.color1_base, draw.color1_width, draw.color1_height};
+                return binding;
+            };
+            auto color_format = [&](size_t slot) {
+                const uint32_t format = draw.ps.color_targets[slot].format;
+                if (format || slot > 1) return format;
+                return slot == 0 ? draw.ps.color0_format : draw.ps.color1_format;
+            };
+            if (draw.ps.cb_resolve) {
+                // CB_COLOR_CONTROL.MODE=RESOLVE is fixed-function work, not a shader draw. The live
+                // backend copies color0 into the raw color1 identity even though the pixel shader
+                // exports nothing and color1_write_mask is therefore zero. Reading this as an
+                // ordinary draw makes the graph claim that color0 was written, leaves color1
+                // external, and reports the resolve's never-executed VS/PS resources as inputs.
+                const auto source = color_binding(0);
+                const auto destination = color_binding(1);
+                if (source.base && source.width && source.height) {
+                    const auto source_format = dependency_image_format(color_format(0));
+                    reads.push_back({source.base,
+                                     static_cast<uint64_t>(source.width) * source.height *
+                                         source_format.bytes_per_pixel,
+                                     source.width, source.height, 0, ResourceClass::Texture,
+                                     "resolve-src", source_format.format,
+                                     source_format.components, source_format.srgb});
+                }
+                append_target(destination.base, destination.width, destination.height, 0xf);
+            } else {
+                append_accesses(draw.vrt.get(), "vs", reads);
+                append_accesses(draw.prt.get(), "ps", reads);
+                for (size_t slot = 0; slot < draw.color_targets.size(); ++slot) {
+                    const auto target = color_binding(slot);
+                    append_target(target.base, target.width, target.height,
+                                  draw.ps.color_targets[slot].write_mask);
+                }
+                append_target(draw.color0_base, draw.color0_width, draw.color0_height,
+                              draw.ps.color_write_mask);
+                append_target(draw.color1_base, draw.color1_width, draw.color1_height,
+                              draw.ps.color1_write_mask);
             }
-            // Direct graph callers and captures through v33 may populate only the named aliases.
-            append_target(draw.color0_base, draw.color0_width, draw.color0_height,
-                          draw.ps.color_write_mask);
-            append_target(draw.color1_base, draw.color1_width, draw.color1_height,
-                          draw.ps.color1_write_mask);
         } else if (operation.kind == SubmitOperationKind::Dispatch) {
             auto it = computes.find(operation.source_index);
             if (it == computes.end()) {

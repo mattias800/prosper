@@ -1,5 +1,6 @@
 #include "../src/gpu/agc_shader_layout.hpp"
 #include "../src/gpu/gpu_dependency_graph.hpp"
+#include "../src/gpu/vk_translate.hpp"
 
 #include <cstdio>
 #include <initializer_list>
@@ -240,6 +241,85 @@ int main() {
               masked_target_graph.external_leaves.size() == 1 &&
               masked_target_graph.external_leaves[0].access.addr == masked_writer.color0_base,
           "a programmed color target with a zero write mask is not a dependency producer");
+
+    // A fixed-function MODE=RESOLVE consumes color0 and writes color1 even though color1 has no
+    // shader export/write mask. Asterix's final composite samples that destination in the same
+    // submit; treating the resolve as an ordinary draw made the graph call it an external leaf.
+    DrawItem resolve_source;
+    resolve_source.draw_index = 80;
+    resolve_source.command_order = 80;
+    resolve_source.color0_base = 0xa000;
+    resolve_source.color0_width = resolve_source.color0_height = 8;
+    resolve_source.ps.color_write_mask = 0xf;
+    DrawItem resolve;
+    resolve.draw_index = 81;
+    resolve.command_order = 81;
+    resolve.color0_base = resolve_source.color0_base;
+    resolve.color0_width = resolve.color0_height = 8;
+    resolve.color1_base = 0xb000;
+    resolve.color1_width = resolve.color1_height = 8;
+    resolve.ps.cb_resolve = true;
+    resolve.ps.color0_format = static_cast<uint32_t>(VkFormat::R16G16B16A16_SFLOAT);
+    resolve.ps.color_write_mask = 0xf;
+    resolve.ps.color1_write_mask = 0;
+    resolve.prt = std::make_shared<ShaderResourceTable>();
+    resolve.prt->resources.push_back(resource(0xc000, 0x100, 34));
+    DrawItem resolve_consumer;
+    resolve_consumer.draw_index = 82;
+    resolve_consumer.command_order = 82;
+    resolve_consumer.prt = std::make_shared<ShaderResourceTable>();
+    resolve_consumer.prt->resources.push_back(resource(resolve.color1_base, 0x100, 34));
+    resolve_consumer.prt->resources[0].width = 8;
+    resolve_consumer.prt->resources[0].height = 8;
+    GpuReplayFrame resolve_replay;
+    resolve_replay.items = {resolve_source, resolve, resolve_consumer};
+    resolve_replay.operations = {
+        {SubmitOperationKind::Draw, 80, 80, true},
+        {SubmitOperationKind::Draw, 81, 81, true},
+        {SubmitOperationKind::Draw, 82, 82, true},
+    };
+    GpuDependencyGraph resolve_graph;
+    CHECK(build_gpu_dependency_graph(resolve_replay, resolve_graph, error) &&
+              resolve_graph.edges.size() == 2 &&
+              resolve_graph.edges[0].producer_operation == 0 &&
+              resolve_graph.edges[0].consumer_operation == 1 &&
+              resolve_graph.edges[0].access.addr == resolve.color0_base &&
+              resolve_graph.edges[0].access.stage == "resolve-src" &&
+              resolve_graph.edges[1].producer_operation == 1 &&
+              resolve_graph.edges[1].consumer_operation == 2 &&
+              resolve_graph.edges[1].access.addr == resolve.color1_base &&
+              resolve_graph.external_leaves.empty(),
+          "fixed-function resolve reads color0, writes color1, and ignores shader resources");
+
+    GpuReplayFrame external_resolve_replay;
+    external_resolve_replay.items = {resolve};
+    external_resolve_replay.operations = {
+        {SubmitOperationKind::Draw, 81, 81, true},
+    };
+    GpuDependencyGraph external_resolve_graph;
+    GpuCaptureRttSeed resolve_seed;
+    resolve_seed.guest_addr = resolve.color0_base;
+    resolve_seed.width = resolve.color0_width;
+    resolve_seed.height = resolve.color0_height;
+    resolve_seed.format = GpuCaptureColorFormat::Rgba16Float;
+    CHECK(build_gpu_dependency_graph(external_resolve_replay, external_resolve_graph, error) &&
+              external_resolve_graph.external_leaves.size() == 1 &&
+              external_resolve_graph.external_leaves[0].access.addr == resolve.color0_base &&
+              external_resolve_graph.external_leaves[0].access.size == 8u * 8u * 8u &&
+              external_resolve_graph.external_leaves[0].access.format == DataFormat::Float16 &&
+              external_resolve_graph.external_leaves[0].access.num_components == 4 &&
+              gpu_dependency_rtt_seed_matches(
+                  external_resolve_graph.external_leaves[0].access, resolve_seed),
+          "an external resolve source retains exact extent and format for RTT seed closure");
+
+    GpuReplayFrame ordinary_replay = resolve_replay;
+    ordinary_replay.items[1].ps.cb_resolve = false;
+    GpuDependencyGraph ordinary_graph;
+    CHECK(build_gpu_dependency_graph(ordinary_replay, ordinary_graph, error) &&
+              ordinary_graph.external_leaves.size() == 2 &&
+              ordinary_graph.external_leaves[0].access.addr == 0xc000 &&
+              ordinary_graph.external_leaves[1].access.addr == resolve.color1_base,
+          "the same zero-MRT1 state without MODE=RESOLVE does not invent a destination write");
 
     replay.operations[4].realized = true;
     CHECK(!build_gpu_dependency_graph(replay, graph, error) &&
