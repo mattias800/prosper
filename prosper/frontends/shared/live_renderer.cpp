@@ -504,18 +504,6 @@ bool submit_local_texture_decode_reusable(uint64_t entry_span, uint64_t current_
 TextureDecodeScopeStats texture_decode_scope_stats() { return g_texture_decode_scope; }
 void reset_texture_decode_scope_stats() { g_texture_decode_scope = {}; }
 
-bool texture_decode_cache_candidate(bool has_live_color_target,
-                                    bool has_live_depth_target,
-                                    bool has_captured_host_data,
-                                    uint32_t image_dimension,
-                                    bool is_sampled_texture,
-                                    bool format_supported) {
-    return !has_live_color_target && !has_live_depth_target &&
-        !has_captured_host_data &&
-        (image_dimension == 1u || image_dimension == 2u || image_dimension == 5u) &&
-        is_sampled_texture && format_supported;
-}
-
 bool sampled_msaa_fetch_shape_supported(const prosper::gpu::ShaderResource& resource,
                                         bool is_storage_image,
                                         bool reflected_msaa_fetch) {
@@ -2103,7 +2091,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (persistent_bc_block_bytes != 0 && !is_volume);
                         const bool persistent_sampled_texture = texture_decode_cache_candidate(
                             has_live_rtt_authority, has_ds_live, r.host_data != nullptr, r.img_dim,
-                            r.cls == RC::Texture, persistent_format_supported);
+                            r.cls == RC::Texture, persistent_format_supported,
+                            persistent_bc_block_bytes != 0);
                         resource_persistent_candidate = persistent_sampled_texture;
                         const bool persistent_source_is_tiled =
                             persistent_sampled_texture && !getenv("PROSPER_NODETILE") &&
@@ -2180,6 +2169,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const size_t persistent_base_source_size = [&] {
                             if (!persistent_sampled_texture) return size_t{0};
                             if (persistent_bc_block_bytes) {
+                                if (is_cube)
+                                    return block_compressed_cube_source_size(
+                                        true, sampled_source_addr,
+                                        prosper::gpu::gpu_capture_resource_footprint(r));
                                 const uint32_t bw = (tw + 3) / 4;
                                 const uint32_t bh = (th + 3) / 4;
                                 return persistent_source_is_tiled
@@ -2452,10 +2445,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                 persistent_validation_scratch.data(),
                                                 cached->second.source_prefix.data(), validated_bytes));
                                     }
+                                    resource_texture_validated_bytes += validated_bytes;
                                     if (timing_enabled) {
                                         pending_timing.persistent_validations++;
                                         pending_timing.persistent_validation_bytes += validated_bytes;
-                                        resource_texture_validated_bytes += validated_bytes;
                                         resource_texture_validation_ms +=
                                             std::chrono::duration<double, std::milli>(
                                                 RenderClock::now() - validation_start).count();
@@ -2590,9 +2583,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     decoded_reuse = &persistent_reuse;
                                     resource_persistent_hit = true;
                                     if (timing_enabled) pending_timing.persistent_hits++;
-                                } else if (timing_enabled) {
+                                } else {
                                     resource_persistent_invalidation = true;
-                                    pending_timing.persistent_invalidations++;
+                                    if (timing_enabled)
+                                        pending_timing.persistent_invalidations++;
                                 }
                             } else {
                                 // Establish the mutation boundary before the initial source read/decode.
@@ -2605,8 +2599,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         cross_submit_watch_promotion_validations))
                                     pending_source_watch = prosper::host::GuestWriteWatch::create(
                                         persistent_source_addr, persistent_source_size);
+                                resource_persistent_miss = true;
                                 if (timing_enabled) {
-                                    resource_persistent_miss = true;
                                     pending_timing.persistent_misses++;
                                 }
                             }
@@ -2743,13 +2737,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 uint32_t image_dimension = 0, format = 0, components = 0;
                                 uint32_t tile_mode = 0, declared_bytes = 0;
                             };
+                            struct DecodeAddressState {
+                                size_t last_key_hash = 0;
+                                uint64_t key_changes = 0;
+                                bool has_key = false;
+                            };
                             static std::unordered_map<uint64_t, uint64_t> ds_count;  // guest addr -> times decoded
                             static std::unordered_map<uint64_t, DecodeShape> ds_shape;
+                            static std::unordered_map<uint64_t, DecodeAddressState> ds_address_state;
                             static uint64_t ds_total = 0;
                             // Classify WHY this decode reached the miss path (so the redundancy is actionable):
                             // rtt          - a renderer-owned RTT decoded on the CPU (has_live_rtt)
-                            // notsampled   - not a persistent-cache candidate class (host_data / fmt / volume/cube)
-                            // compression  - DCC-compressed source, excluded by persistent_cache_eligible
+                            // notsampled   - not a candidate class (host data / format / unsupported dim)
+                            // compression  - DCC-compressed source whose metadata is unsupported
                             // size0        - persistent_source_size==0 (force-detiled Unorm8x4)
                             // invalidated  - eligible AND a cache entry exists, but validate_exact() rejected it
                             // cold         - eligible but no cache entry (first use / LRU-evicted)
@@ -2761,17 +2761,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             static uint64_t rtt_storage = 0, rtt_notvalid = 0, rtt_dimmismatch = 0,
                                             rtt_self = 0, rtt_noptarget = 0, rtt_unknown = 0;
                             // For the notsampled bucket, record WHY the guest texture is not a persistent-
-                            // cache candidate (host_data / img_dim!=1 / cls!=Texture / format not
-                            // unorm8|bc) plus a (format<<4|components) histogram of the format-excluded
+                            // cache candidate (host data / unsupported dimension / class / format) plus a
+                            // (format<<4|components) histogram of the format-excluded
                             // ones, to see whether FP16/HDR art dominates (a cache-eligibility gap, #1177).
                             static uint64_t ns_hostdata = 0, ns_notdim1 = 0, ns_notclass = 0, ns_fmt = 0;
                             static std::unordered_map<uint32_t, uint64_t> ns_fmt_hist;
-                            ds_count[r.gpu_addr]++;
+                            const uint64_t address_ordinal = ++ds_count[r.gpu_addr];
                             ds_shape[r.gpu_addr] = {
                                 tw, th, r.depth, r.img_dim, static_cast<uint32_t>(r.format),
                                 r.num_components, r.tile_mode, r.size};
-                            ds_total++;
-                            if (has_live_rtt) {
+                            const uint64_t global_ordinal = ++ds_total;
+                            const size_t key_hash = TextureDecodeKeyHash{}(decode_key);
+                            DecodeAddressState& address_state = ds_address_state[r.gpu_addr];
+                            const bool key_changed = address_state.has_key &&
+                                address_state.last_key_hash != key_hash;
+                            if (key_changed) ++address_state.key_changes;
+                            const size_t previous_key_hash = address_state.last_key_hash;
+                            address_state.last_key_hash = key_hash;
+                            address_state.has_key = true;
+
+                            const auto matching_entry = persistent_decoded_textures.find(decode_key);
+                            const bool matching_cache_entry =
+                                matching_entry != persistent_decoded_textures.end() &&
+                                matching_entry->second.source_addr == persistent_source_addr &&
+                                matching_entry->second.source_size == persistent_source_size;
+                            const bool compression_supported = !r.compression_enabled ||
+                                persistent_dcc_uncompressed || persistent_dcc_fast_clear;
+                            const bool cache_disabled =
+                                getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") != nullptr;
+                            const TextureDecodeMissReason miss_reason = texture_decode_miss_reason(
+                                has_live_rtt, persistent_sampled_texture, compression_supported,
+                                persistent_source_size, cache_disabled, persistent_decode_limit,
+                                matching_cache_entry, persistent_cache_eligible);
+                            if (miss_reason == TextureDecodeMissReason::LiveRenderTarget) {
                                 r_rtt++;
                                 if (fr.is_storage_image) rtt_storage++;
                                 else if (!live_rtt->second.gpu_valid) rtt_notvalid++;
@@ -2784,7 +2806,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     rtt_noptarget++;   // evicted from / absent in the backend target cache
                                 else rtt_unknown++;
                             }
-                            else if (!persistent_sampled_texture) {
+                            else if (miss_reason == TextureDecodeMissReason::UnsupportedCandidate) {
                                 r_notsampled++;
                                 if (r.host_data) ns_hostdata++;
                                 else if (r.img_dim != 1u) ns_notdim1++;
@@ -2793,19 +2815,78 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     ns_fmt_hist[((uint32_t)r.format << 4) |
                                                 (r.num_components & 0xFu)]++; }
                             }
-                            else if (r.compression_enabled) r_compression++;
-                            else if (persistent_source_size == 0) r_size0++;
-                            else if ([&] {
-                                         auto it = persistent_decoded_textures.find(decode_key);
-                                         // Only a same-size entry actually entered validate_exact() and was
-                                         // rejected; a size mismatch never reaches validation, so treat it
-                                         // as cold rather than an invalidation.
-                                         return it != persistent_decoded_textures.end() &&
-                                                it->second.source_addr == persistent_source_addr &&
-                                                it->second.source_size == persistent_source_size;
-                                     }()) r_inval++;
-                            else if (persistent_cache_eligible) r_cold++;
-                            else r_other++;
+                            else if (miss_reason == TextureDecodeMissReason::UnsupportedCompression)
+                                r_compression++;
+                            else if (miss_reason == TextureDecodeMissReason::EmptySource)
+                                r_size0++;
+                            else if (miss_reason == TextureDecodeMissReason::ContentInvalidated)
+                                r_inval++;
+                            else if (miss_reason == TextureDecodeMissReason::ColdOrEvicted)
+                                r_cold++;
+                            else
+                                r_other++;
+
+                            const uint64_t diagnostic_footprint =
+                                prosper::gpu::gpu_capture_resource_footprint(r);
+                            const size_t diagnostic_footprint_size = static_cast<size_t>(
+                                std::min<uint64_t>(diagnostic_footprint, SIZE_MAX));
+                            const bool expensive_bc6 = texture_decode_miss_is_expensive_block(
+                                r.format == prosper::gpu::DataFormat::Bc6,
+                                persistent_source_size, diagnostic_footprint_size);
+                            if (should_report_texture_decode_miss(
+                                    global_ordinal, address_ordinal, expensive_bc6)) {
+                                auto reason_name = [](TextureDecodeMissReason reason) {
+                                    switch (reason) {
+                                        case TextureDecodeMissReason::LiveRenderTarget: return "rtt";
+                                        case TextureDecodeMissReason::UnsupportedCandidate:
+                                            return "unsupported-candidate";
+                                        case TextureDecodeMissReason::UnsupportedCompression:
+                                            return "unsupported-compression";
+                                        case TextureDecodeMissReason::EmptySource: return "empty-source";
+                                        case TextureDecodeMissReason::CacheDisabled:
+                                            return "cache-disabled";
+                                        case TextureDecodeMissReason::CacheLimitZero:
+                                            return "cache-limit-zero";
+                                        case TextureDecodeMissReason::ContentInvalidated:
+                                            return "content-invalidated";
+                                        case TextureDecodeMissReason::ColdOrEvicted:
+                                            return "cold-or-evicted";
+                                        case TextureDecodeMissReason::Other: return "other";
+                                    }
+                                    return "unknown";
+                                };
+                                fprintf(stderr,
+                                        "[detile-miss] ordinal=%llu address-ordinal=%llu "
+                                        "addr=0x%llx key=0x%zx previous-key=0x%zx "
+                                        "key-changes=%llu reason=%s %ux%ux%u dim=%u fmt=%u/%u "
+                                        "tile=%u declared=%u footprint=%llu source=%zu "
+                                        "candidate=%d eligible=%d entry=%d "
+                                        "validation=%s validated=%zu submit-query=%d "
+                                        "watch-query=%d watch-active=%d watch-disabled=%d "
+                                        "watch-only=%d watch-stable=%u\n",
+                                        (unsigned long long)global_ordinal,
+                                        (unsigned long long)address_ordinal,
+                                        (unsigned long long)r.gpu_addr, key_hash,
+                                        previous_key_hash,
+                                        (unsigned long long)address_state.key_changes,
+                                        reason_name(miss_reason), tw, th, r.depth, r.img_dim,
+                                        static_cast<unsigned>(r.format), r.num_components,
+                                        r.tile_mode, r.size,
+                                        (unsigned long long)diagnostic_footprint,
+                                        persistent_source_size,
+                                        static_cast<int>(persistent_sampled_texture),
+                                        static_cast<int>(persistent_cache_eligible),
+                                        static_cast<int>(matching_cache_entry),
+                                        resource_texture_exact_validation ? "exact" : "skip",
+                                        resource_texture_validated_bytes,
+                                        resource_texture_submit_query,
+                                        resource_texture_watch_query,
+                                        static_cast<int>(resource_texture_watch_active),
+                                        static_cast<int>(resource_texture_watch_disabled),
+                                        static_cast<int>(resource_texture_watch_only),
+                                        resource_texture_watch_stability);
+                                fflush(stderr);
+                            }
                             if ((ds_total % 3000) == 0) {
                                 std::vector<std::pair<uint64_t, uint64_t>> v(ds_count.begin(), ds_count.end());
                                 std::sort(v.begin(), v.end(),

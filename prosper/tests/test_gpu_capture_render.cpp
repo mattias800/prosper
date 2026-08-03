@@ -1254,18 +1254,35 @@ int main() {
               "a copied FrameResource retains the borrowed RTT lifetime, extent, and FP16 format");
 
         using prosper::frontend::texture_decode_cache_candidate;
-        CHECK(texture_decode_cache_candidate(false, false, false, 1u, true, true),
+        CHECK(texture_decode_cache_candidate(false, false, false, 1u, true, true, false),
               "an ordinary supported guest 2D texture uses the decoded-texture cache");
-        CHECK(texture_decode_cache_candidate(false, false, false, 2u, true, true),
+        CHECK(texture_decode_cache_candidate(false, false, false, 2u, true, true, false),
               "a supported guest 3D volume uses the decoded-texture cache");
-        CHECK(texture_decode_cache_candidate(false, false, false, 5u, true, true),
+        CHECK(texture_decode_cache_candidate(false, false, false, 5u, true, true, false),
               "a supported guest 2D-array base slice uses the decoded-texture cache");
-        CHECK(!texture_decode_cache_candidate(false, false, false, 3u, true, true),
-              "a cube texture stays on its layer-aware decode path");
-        CHECK(!texture_decode_cache_candidate(false, true, false, 1u, true, true),
+        CHECK(texture_decode_cache_candidate(false, false, false, 3u, true, true, true),
+              "a block-compressed cube uses the exact decoded-texture cache");
+        CHECK(!texture_decode_cache_candidate(false, false, false, 3u, true, true, false),
+              "a non-block-compressed cube stays on its layer-aware uncached path");
+        CHECK(!texture_decode_cache_candidate(false, true, false, 1u, true, true, false),
               "a retained sampled-depth image bypasses guest-byte decode-cache work");
-        CHECK(!texture_decode_cache_candidate(true, false, false, 1u, true, true),
+        CHECK(!texture_decode_cache_candidate(true, false, false, 1u, true, true, false),
               "a retained color image bypasses guest-byte decode-cache work");
+
+        using prosper::frontend::block_compressed_cube_source_size;
+        constexpr uint64_t syberia_cube_address = 0x212bd41000ull;
+        constexpr uint64_t syberia_cube_footprint = 33570816ull;
+        CHECK(block_compressed_cube_source_size(
+                  true, syberia_cube_address, syberia_cube_footprint) ==
+                  syberia_cube_footprint,
+              "Syberia's six-face BC6H footprint becomes the exact persistent source span");
+        CHECK(block_compressed_cube_source_size(
+                  false, syberia_cube_address, syberia_cube_footprint) == 0 &&
+                  block_compressed_cube_source_size(true, syberia_cube_address, 0) == 0 &&
+                  block_compressed_cube_source_size(
+                      true, UINT64_MAX - syberia_cube_footprint + 1u,
+                      syberia_cube_footprint) == 0,
+              "non-BC, empty, and overflowing cube source ranges remain cache-ineligible");
 
         using prosper::frontend::sampled_msaa_fetch_shape_supported;
         ShaderResource exact_msaa{};
@@ -1310,7 +1327,8 @@ int main() {
                    texture_decode_cache_candidate(
                        /*has_live_color_target=*/true, /*has_live_depth_target=*/false,
                        /*has_captured_host_data=*/false, /*image_dimension=*/1u,
-                       /*is_sampled_texture=*/true, /*format_supported=*/true),
+                       /*is_sampled_texture=*/true, /*format_supported=*/true,
+                       /*block_compressed=*/false),
                    /*compute_image_hit=*/false, /*is_storage_image=*/false,
                    /*cache_disabled=*/false, /*compression_supported=*/true,
                    /*cache_limit=*/1u << 30,

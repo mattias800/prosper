@@ -474,6 +474,12 @@ if(TARGET prosper_core)
   target_include_directories(test_write_watch_policy PRIVATE frontends/shared)
   add_test(NAME write_watch_policy COMMAND test_write_watch_policy)
 
+  add_executable(test_texture_decode_diagnostic
+                 frontends/shared/test_texture_decode_diagnostic.cpp)
+  target_include_directories(test_texture_decode_diagnostic PRIVATE frontends/shared src)
+  target_link_libraries(test_texture_decode_diagnostic PRIVATE prosper_core)
+  add_test(NAME texture_decode_diagnostic COMMAND test_texture_decode_diagnostic)
+
   # Bounded-acquire present classification (#1182). Needs Vulkan HEADERS only (VkResult enum), no loader
   # call — link Vulkan::Vulkan purely for its include dirs. Guarded so a headers-less host skips it
   # gracefully; every platform that builds prosper-app has Vulkan available.
