@@ -1,4 +1,5 @@
 #include "compute_timing_selector.hpp"
+#include "compute_transfer_gate_census.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -116,6 +117,43 @@ int main() {
               compute_timing_zero_match_is_invalid(zero_matches) &&
               !compute_timing_zero_match_is_invalid(one_match),
           "zero-match summary is apparatus-invalid");
+
+    ComputeTransferGateSelector gate_selector{
+        true, true, 0x2c595d5aada78398ull, 0xa57c763ae4d70d1dull};
+    ComputeTransferGateSelectorCounters gate_counters;
+    const auto gate_miss = observe_compute_transfer_gate_selector(
+        gate_selector, gate_counters, 0x1234);
+    const auto producer_first = observe_compute_transfer_gate_selector(
+        gate_selector, gate_counters, gate_selector.producer_hash);
+    const auto producer_later = observe_compute_transfer_gate_selector(
+        gate_selector, gate_counters, gate_selector.producer_hash);
+    const auto consumer_first = observe_compute_transfer_gate_selector(
+        gate_selector, gate_counters, gate_selector.consumer_hash);
+    CHECK(gate_miss.role == ComputeTransferGateRole::None && !gate_miss.first_match &&
+              producer_first.role == ComputeTransferGateRole::Producer &&
+              producer_first.first_match &&
+              producer_later.role == ComputeTransferGateRole::Producer &&
+              !producer_later.first_match &&
+              consumer_first.role == ComputeTransferGateRole::Consumer &&
+              consumer_first.first_match && gate_counters.seen == 4 &&
+              gate_counters.producer_matches == 2 &&
+              gate_counters.consumer_matches == 1,
+          "dual transfer selectors prove each exact hash and first match independently");
+    CHECK(!compute_transfer_gate_selector_is_invalid(gate_selector, gate_counters),
+          "dual transfer selector accepts only when both hashes matched");
+
+    ComputeTransferGateSelectorCounters missing_consumer;
+    (void)observe_compute_transfer_gate_selector(
+        gate_selector, missing_consumer, gate_selector.producer_hash);
+    ComputeTransferGateSelector duplicate_selector{
+        true, true, gate_selector.producer_hash, gate_selector.producer_hash};
+    CHECK(compute_transfer_gate_selector_is_invalid(gate_selector, missing_consumer) &&
+              compute_transfer_gate_selector_is_invalid(
+                  duplicate_selector, missing_consumer),
+          "zero-match and duplicate transfer selectors fail visibly");
+    CHECK(claim_compute_transfer_gate_selector_summary(missing_consumer) &&
+              !claim_compute_transfer_gate_selector_summary(missing_consumer),
+          "transfer selector summary is claimed exactly once");
 
     if (failures) {
         std::printf("%d check(s) failed\n", failures);

@@ -80,6 +80,11 @@ int main() {
 #endif
     const bool adaptive_storage_result_validation_enabled =
         std::getenv("PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION") == nullptr;
+    const bool native_2d_compute_transfer_enabled =
+        std::getenv("PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER") == nullptr;
+    const bool native_2d_compute_transfer_available =
+        native_2d_compute_transfer_enabled &&
+        adaptive_storage_result_validation_enabled;
     const bool cold_storage_snapshot_deferral_enabled =
         adaptive_storage_result_validation_enabled;
     using prosper::frontend::ComputeImageCacheClass;
@@ -2757,6 +2762,186 @@ int main() {
             CHECK(journal_result.compute_executed && journal_result.render_spans == 1 &&
                       journal_imported,
                   "same-submit journal authorizes the first retained compute-image consumer");
+
+            // Syberia's save-warning pass dispatches eleven shrinking rectangles over one native
+            // Float32x1 atlas in a single ordered guest submit. Its producer uses a real one-layer
+            // DIM=2D_ARRAY storage image while the next dispatch samples an ordinary DIM=2D view of
+            // the same guest allocation. Keep the sampled and writable images distinct
+            // (read-old/write-new), but seed the sampled image with a device-local copy of the
+            // retained arrayed storage result instead of detiling and uploading the complete guest
+            // mirror. This fixture uses the submit journal, rather than a cross-submit page watch,
+            // as authority. Pin format equality separately so a future sampled-format policy change
+            // cannot silently turn the production check into the guest fallback.
+            CHECK(prosper::frontend::compute_native_2d_transfer_format_compatible(
+                      DataFormat::Float32, 1) &&
+                      !prosper::frontend::compute_native_2d_transfer_format_compatible(
+                          DataFormat::Float16, 1),
+                  "native 2D transfer candidate requires exact sampled/storage format equality");
+            static const uint32_t transfer_fill_2d_array[] = {
+                0x7E080300u,             // v4 = x coordinate
+                0x7E0A0280u,             // v5 = y = 0
+                0x7E0C0280u,             // v6 = array layer 0
+                0x7E0002F2u,             // v0 = 1.0f
+                0x7E020280u,             // v1 = 0.0f
+                0x7E0402F2u,             // v2 = 1.0f
+                0x7E060280u,             // v3 = 0.0f
+                0xF0200F28u, 0x00020004u,// IMAGE_STORE RGBA at (v4,v5,v6), DIM=2D_ARRAY
+                0xBF810000u,
+            };
+            const size_t transfer_guest_bytes = W * sizeof(float);
+            std::vector<uint8_t> transfer_proof_guest(transfer_guest_bytes, 0x37);
+            std::vector<uint8_t> transfer_source_guest(transfer_guest_bytes, 0x52);
+            std::vector<uint8_t> transfer_copy_guest(transfer_guest_bytes, 0xa9);
+            ShaderResource transfer_producer_dst{};
+            transfer_producer_dst.cls = ResourceClass::StorageImage;
+            // Syberia's producer uses a real one-layer DIM=2D_ARRAY storage instruction, while
+            // the consumer reads the byte-identical base slice through an ordinary non-arrayed
+            // DIM=2D sampled instruction.
+            transfer_producer_dst.img_dim = 5;
+            transfer_producer_dst.binding = 5;
+            transfer_producer_dst.sgpr_base = 8;
+            transfer_producer_dst.format = DataFormat::Float32;
+            transfer_producer_dst.num_components = 1;
+            transfer_producer_dst.width = W;
+            transfer_producer_dst.height = transfer_producer_dst.depth = 1;
+            transfer_producer_dst.gpu_addr =
+                reinterpret_cast<uint64_t>(transfer_proof_guest.data());
+            transfer_producer_dst.size = static_cast<uint32_t>(transfer_guest_bytes);
+            ShaderResource transfer_multilayer = transfer_producer_dst;
+            transfer_multilayer.depth = 2;
+            CHECK(shader_resource_uses_ordinary_2d_image(
+                      transfer_producer_dst, true, false, false) &&
+                      !shader_resource_uses_ordinary_2d_image(
+                          transfer_producer_dst, true, true, false) &&
+                      shader_resource_uses_native_2d_storage_image(
+                          transfer_producer_dst, true, true, false) &&
+                      !shader_resource_uses_ordinary_2d_image(
+                          transfer_producer_dst, true, false, true) &&
+                      !shader_resource_uses_native_2d_storage_image(
+                          transfer_producer_dst, true, true, true) &&
+                      !shader_resource_uses_native_2d_storage_image(
+                          transfer_multilayer, true, true, false),
+                  "single-layer 2D-array native storage requires one reflected array layer");
+            ShaderResourceTable transfer_producer_rt;
+            transfer_producer_rt.resources.push_back(transfer_producer_dst);
+            ComputeShaderConfig transfer_config;
+            transfer_config.user_sgprs.resize(16);
+            transfer_config.local_x = W;
+            transfer_config.local_y = transfer_config.local_z = 1;
+            transfer_config.tidig_comp_cnt = 1;
+            transfer_config.native_storage_format_support =
+                native_storage_format_support_bit(DataFormat::Float32, 1);
+            const std::vector<uint32_t> transfer_producer_spirv = recompile_compute(
+                transfer_fill_2d_array, std::size(transfer_fill_2d_array),
+                &transfer_producer_rt, transfer_config);
+            const DescriptorValidationReport transfer_producer_report =
+                validate_spirv_descriptor_interface(
+                    transfer_producer_spirv, &transfer_producer_rt, 0,
+                    SpirvShaderStage::Compute, false);
+            const SpirvDescriptorBinding* transfer_producer_binding =
+                find_spirv_descriptor_binding(
+                    transfer_producer_report, 0, transfer_producer_dst.binding);
+            CHECK(!transfer_producer_spirv.empty() && transfer_producer_report.ok() &&
+                      transfer_producer_binding && transfer_producer_binding->storage_float &&
+                      transfer_producer_binding->image_dim == 1 &&
+                      transfer_producer_binding->image_arrayed &&
+                      !transfer_producer_binding->image_multisampled,
+                  "single-layer 2D-array producer reflects arrayed exact typed storage");
+            if (!transfer_producer_spirv.empty() && transfer_producer_report.ok() &&
+                transfer_producer_binding && transfer_producer_binding->storage_float) {
+                ComputeItem transfer_proof = it;
+                transfer_proof.spirv = transfer_producer_spirv;
+                transfer_proof.resources =
+                    std::make_shared<ShaderResourceTable>(transfer_producer_rt);
+                transfer_proof.code_addr = 0x1122f13du;
+                CHECK(prosper::frontend::execute_live_compute_items({transfer_proof}),
+                      "native Float32x1 arrayed producer proves complete storage coverage");
+
+                transfer_producer_dst.gpu_addr =
+                    reinterpret_cast<uint64_t>(transfer_source_guest.data());
+                transfer_producer_rt.resources.back() = transfer_producer_dst;
+                ComputeItem transfer_producer = transfer_proof;
+                transfer_producer.resources =
+                    std::make_shared<ShaderResourceTable>(transfer_producer_rt);
+                transfer_producer.dispatch_index = 41;
+                transfer_producer.command_order = 10;
+
+                ShaderResourceTable transfer_consumer_rt;
+                ShaderResource transfer_sampled = transfer_producer_dst;
+                transfer_sampled.cls = ResourceClass::Texture;
+                transfer_sampled.binding = 4;
+                transfer_sampled.sgpr_base = 0;
+                transfer_sampled.swizzle[0] = 4;
+                transfer_sampled.swizzle[1] = 5;
+                transfer_sampled.swizzle[2] = 6;
+                transfer_sampled.swizzle[3] = 7;
+                transfer_consumer_rt.resources.push_back(transfer_sampled);
+                ShaderResource transfer_copy_dst = transfer_producer_dst;
+                transfer_copy_dst.gpu_addr =
+                    reinterpret_cast<uint64_t>(transfer_copy_guest.data());
+                transfer_consumer_rt.resources.push_back(transfer_copy_dst);
+                const std::vector<uint32_t> transfer_consumer_spirv = recompile_compute(
+                    image_copy_2d, std::size(image_copy_2d),
+                    &transfer_consumer_rt, transfer_config);
+                const DescriptorValidationReport transfer_consumer_report =
+                    validate_spirv_descriptor_interface(
+                        transfer_consumer_spirv, &transfer_consumer_rt, 0,
+                        SpirvShaderStage::Compute, false);
+                const SpirvDescriptorBinding* transfer_sampled_binding =
+                    find_spirv_descriptor_binding(
+                        transfer_consumer_report, 0, transfer_sampled.binding);
+                const SpirvDescriptorBinding* transfer_copy_binding =
+                    find_spirv_descriptor_binding(
+                        transfer_consumer_report, 0, transfer_copy_dst.binding);
+                CHECK(!transfer_consumer_spirv.empty() && transfer_consumer_report.ok() &&
+                          transfer_sampled_binding && transfer_copy_binding &&
+                          transfer_sampled_binding->image_dim == 1 &&
+                          !transfer_sampled_binding->image_arrayed &&
+                          !transfer_sampled_binding->image_multisampled &&
+                          transfer_copy_binding->storage_float &&
+                          transfer_copy_binding->image_dim == 1 &&
+                          !transfer_copy_binding->image_arrayed &&
+                          !transfer_copy_binding->image_multisampled,
+                      "single-layer 2D-array consumer reflects ordinary sampled/storage views");
+                if (!transfer_consumer_spirv.empty() && transfer_consumer_report.ok() &&
+                    transfer_sampled_binding && transfer_copy_binding) {
+                    ComputeItem transfer_consumer = transfer_proof;
+                    transfer_consumer.spirv = transfer_consumer_spirv;
+                    transfer_consumer.resources =
+                        std::make_shared<ShaderResourceTable>(transfer_consumer_rt);
+                    transfer_consumer.code_addr = 0x1122f14du;
+                    transfer_consumer.dispatch_index = 42;
+                    transfer_consumer.command_order = 20;
+                    const uint64_t transfer_seeds_before =
+                        prosper::frontend::live_compute_storage_transfer_seeds();
+                    const OrderedSubmitResult transfer_result = execute_ordered_items(
+                        {{SubmitOperationKind::Dispatch, transfer_producer.dispatch_index,
+                          transfer_producer.command_order},
+                         {SubmitOperationKind::Dispatch, transfer_consumer.dispatch_index,
+                          transfer_consumer.command_order}},
+                        {}, {transfer_producer, transfer_consumer},
+                        [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                            return RenderedFrame{};
+                        },
+                        [&](const std::vector<ComputeItem>& items) {
+                            return prosper::frontend::execute_live_compute_items(items);
+                        },
+                        1, 1);
+                    const uint64_t transfer_seeds_after =
+                        prosper::frontend::live_compute_storage_transfer_seeds();
+                    CHECK(transfer_result.compute_executed &&
+                              transfer_copy_guest == transfer_source_guest,
+                          "arrayed producer to ordinary sampled consumer preserves every Float32 texel");
+                    CHECK(!native_2d_compute_transfer_available ||
+                              transfer_seeds_after > transfer_seeds_before,
+                          "single-layer arrayed native storage producer seeds ordinary 2D "
+                          "sampled consumer on-GPU");
+                    CHECK(native_2d_compute_transfer_available ||
+                              transfer_seeds_after == transfer_seeds_before,
+                          "disabled native 2D transfer or authority validation keeps the exact "
+                          "guest fallback");
+                }
+            }
 
 #if defined(__linux__)
             // Use a dedicated mapping so page protection cannot alias unrelated malloc metadata.

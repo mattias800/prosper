@@ -23,6 +23,9 @@ re-derive these without contradictory new evidence.
 | The offline RTT-cache localization transfers to the default render path | **Not established — do not assume it does.** `PROSPER_RTTLOG` and `PROSPER_RESOURCE_HASH_DIM` both clear `live_gpu_targets` (`live_renderer.cpp:933`) and force the **CPU readback** RTT path. The frame is black on both paths, but reproducing on both does **not** make the cache-miss mechanism common to both; retain those logs only as endpoint/localization evidence for that diagnostic route. The source/capsule producer chain below is separate evidence. | #1619 comments |
 | The ten `reason=shader-recompile` dispatches are unrelated to the black scene | **Falsified.** One of them, operation 570 / source 101 (`0x2111a3af00`, raw hash `abef7b52fb82e741`), is the missing producer of the post-process input at `0x21159d0000`. It samples the correct lit target `0x2110310000`, but rejection at `s_cmp_lg_u64 exec,s[16:17]` prevents that output; downstream source 102 and the final source-119 composite therefore consume zero. Supporting the compare recompiles the exact captured shader and a clean live run restores the full-width scene layer: 2,063,996 non-black pixels and 139,946–144,452 colours across t=190–223 s, versus 670,815 non-black pixels in the old settled black-layer baseline. | #1619, #1628 |
 | Syberia's ~1.9 fps is #1748-style AGC command-buffer churn | **Falsified.** Over a 45 s headless boot with `PROSPER_DCBFULL=1` the title builds 311,296 command packets and issues **zero** Dcb buffer-full callbacks — it never asks the guest for more command-buffer space at all. The probe prints an `armed` banner and a running `seen=/full=` tally, so this zero is the probe reporting zero rather than a silent log (it was measured once before *without* that banner, and that earlier reading proved nothing). Note the comparison titles are **not** cleared: Bendy runs at 297 callbacks/s, the same order as Asterix *after* #1748 (368/s), so a high rate is not itself the defect — what mattered on Asterix was that the chunks never came back. | #1756, `docs/AGC_PACKET_SIZES.md` |
+| The dominant save-warning compute program spends its flat ~10.5 ms in repeated pipeline compilation or shader arithmetic | **Falsified.** An exact-revision, stable-hash-selected phase capture on `cb7602b7` recorded 1,760 successful executions as 160 complete 11-dispatch atlas chains. Pipeline work averaged 0.010 ms (0.1%). The launch shrank from 8,160 workgroups to one while dispatch stayed flat at 1.607–1.671 ms and total stayed 10.394–10.629 ms. Fixed whole-atlas image setup averaged 5.109 ms (48.4%); writeback averaged 3.798 ms (36.0%), including 1.845 ms pack and 1.672 ms retile. Both offline phase checks passed with no dropped records or model warnings. | #1737 |
+| Either native-2D transfer candidate exercised Syberia's save-warning atlas | **Falsified; both live measurements were self-invalidating.** On exact candidate `85d26879`, 45 s arms differing only by `PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER` both rendered 3.79 fps and both left the monotonic transfer counter at zero. Retained live evidence identifies the hot allocation as `img_dim=5`, depth 1, while that candidate and its fixture required `img_dim==1`. Candidate `7454407d` shared the established one-layer/non-arrayed-2D predicate between recompilation and transfer and passed its decisive fixture, but its first clean live ON arm again left the counter at zero; the run stopped before a control as required. Resource `dim=5` does **not** prove the producer or consumer's reflected SPIR-V view is non-arrayed, nor that a retained cache entry reached the borrow gate. No timing from either attempt is performance evidence. | #1737 |
+| The corrected native-2D candidate reaches Syberia's consumer and fails on format, authority, or cache invalidation | **Falsified by an exact-hash gate census on `c5bf9152`.** The clean 140-frame run matched the producer 140 times and the consumer 1,540 times. Every evaluated consumer gate passed 1,540/1,540, but every borrow returned `no-cache`. The first failing gate is upstream: the producer storage binding reflects `Dim2D arrayed=1` over a depth-one `img_dim=5` resource, so the ordinary-2D predicate is false, typed native storage is not emitted (`storage-float=0/140`), and storage cache admission is zero. The consumer independently reflects ordinary non-arrayed 2D and passes candidate, format, extent/dimension, hostless, validation, and native-format gates. The arm exited normally at 3.9–4.0 fps with exact process census 0/1/0 and no device/display error. Evidence: `<ARTIFACT_ROOT>/syberia-1737-transfer-gates-c5bf-NERpg9`. | #1737 |
 | The repeated save-screen BC6H work is cache-key churn or guest mutation | **Falsified.** A bounded live `PROSPER_DETILE_STATS=1` run observed the same 2048x2048x6 cube at one address through address ordinals 1–8, 16 and 32. Its key stayed `0xfead9ae2753c7cea` with `key-changes=0`; every miss was classified `unsupported-candidate`, with a 33,570,816-byte six-face footprint and no cache entry or validation attempt. An independent 128x128x6 BC6H cube repeated through ordinal 256 with the same signature, proving the instrument's per-address counter moved. The cache excluded every cube by policy before content validation; this was not an invalidation. | #1737 |
 | The `[agc] WaitRegMem … dependency violated` burst at t≈129 s is a finding | **Not a measurement.** The diagnostic is capped at 40 printed lines (`command_processor.cpp:2450`) and the counter in the message is the true total; an unsatisfied wait is documented in the code as normal handled state. The same over-read was recorded independently on Oregon Trail (#1606) and as instrument trap #13 in `GAME_COMPAT_ORCHESTRATION.md`. | #1619, #1606 |
 | Vulkan's native typed `B10G11R11_UFLOAT_PACK32` storage conversion is bit-equivalent to the guest's round-to-nearest-even R11G11B10 contract | **Falsified on RADV.** A reduced live-Vulkan 4×4×4 producer→sampled-consumer handoff held tiling (`SW_64KB_R_X`), normalized voxel-centre `SAMPLE_LZ`, dispatch order, cache priming, and all 64 voxels constant while changing only the producer representation. Shader-side `R32ui` packing matched all 64 packed words and 256 sampled channels. Native typed storage differed in **54/64 packed voxels and 92 RGB channel values** (`R=34, G=34, B=24`); all 92 native codes were lower than the CPU f11/f10 oracle, none higher, and the sampled output carried the same 92 differences. The exact packed path now remains authoritative even when native support is advertised. This proves a real conversion defect, **not** that its mostly one-ULP bias causes the visible menu overexposure; the coordinated live A/B in the next row separately tests that causal claim. | #1790 |
@@ -137,6 +140,65 @@ The screenshot tool exited 1 after saving 45/48 fresh, pixel-distinct samples be
 apparatus error, not a stale-frame or title-progress failure. All 45 saved samples advanced source and
 pixel content with zero stale seconds. The final image is retained only as local evidence; the existing
 public profile screenshot remains representative and no compatibility rung changed.
+
+## Initial save-warning atlas cost — 2026-08-03
+
+An input-free automatic F8 capture on exact revision `cb7602b7` isolates the severe slowdown while
+the initial animated “do not turn off” billboard is still on screen. The run used the default
+full-resolution renderer and selected only stable SPIR-V hash `0xa57c763ae4d70d1d` for phase timing.
+Its completeness checks found one accepted selector, one first match, one final matched summary,
+1,760 selected phase records, and exactly 160 submits × 11 dispatches. The `.prperf` footer retained
+20 pre-trigger samples, 21 post-trigger samples, 20 renderer records and 829 compute records with
+zero drops. Both offline reporters exited cleanly.
+
+The selected program constructs a 1920×1620 Float32 atlas as eleven successively smaller rectangles,
+from 8,160 workgroups down to four one-workgroup tail dispatches. Every step samples and writes the
+same tile-27 guest allocation. The phase clocks — which end before their diagnostic line is printed —
+average 5.109 ms setup, 0.010 ms pipeline, 1.626 ms GPU dispatch, 3.798 ms writeback and 0.009 ms
+cleanup, or 10.549 ms total. Position means remain flat across the 8,160× change in workgroup count.
+The outer F8 interval reports 3.79 presents/s, but that throughput is explicitly
+**instrument-perturbed** by one phase line per dispatch and is not an uninstrumented FPS baseline.
+
+Source inspection accounts for the fixed shape. Each step reads back 12,441,600 row-major bytes,
+retiles and publishes the complete 12,779,520-byte guest allocation, and thereby invalidates the
+sampled cache used by the next step. That is 130.518 MiB of storage readback plus 134.062 MiB of
+guest retile per rendered frame before sampled re-upload is counted. The completed storage result is
+already the correct partial-write seed; the remaining setup repeats full guest validation,
+snapshot/detile and upload for the distinct sampled image.
+
+The exact-hash census on `c5bf9152` resolved the missing shape evidence (see `## Ruled out`). The
+producer really uses a depth-one `Dim2D arrayed=1` storage image; each following consumer samples an
+ordinary `Dim2D arrayed=0` view of the same allocation. The consumer passes every transfer gate but
+finds no cache because the arrayed producer was not eligible for typed storage. The narrow generic
+candidate therefore preserves the producer's one-layer array view while retaining its exact native
+image, then seeds the distinct ordinary sampled image through the existing one-layer device copy and
+authority checks. General arrays remain unsupported by this path. The production-backend fixture
+proves this exact arrayed-producer/non-arrayed-consumer shape on llvmpipe. A causal mutation that
+forced the sampled-transfer gate false made exactly the named `single-layer arrayed native storage
+producer seeds ordinary 2D sampled consumer on-GPU` check fail while the pixel-fallback siblings
+remained green; the test therefore witnesses the mechanism instead of merely surviving it.
+
+A paired live A/B on exact rebased candidate `2dcaa194` then moved the independently observable
+lever. Both arms used the same full-resolution app, exact producer hash `0x45e5d145e1a35af9`, exact
+consumer hash `0xee8584cf839a5b44`, 140-frame / 60-second bound, and clean 0/1/0 process census. Both
+exited normally after frame 140 with no device or display error. The only configuration difference
+was `PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER=1` in the OFF arm. ON retained 140/140 eligible producer
+results and attempted and hit the device copy for all 1,540/1,540 consumer dispatches. OFF still
+matched the same 140 producers and 1,540 consumers, but transfer eligibility, attempts, and hits each
+moved to zero. ON measured 7.3 fps at frame 60 and 7.1 at frame 120 (midpoint 7.2); OFF measured 5.9
+and 5.7 fps (midpoint 5.8), a 1.4 fps / 24.1% improvement. Evidence:
+`<ARTIFACT_ROOT>/syberia-1737-arrayed-native-on-rebased-IIKd8r` and
+`<ARTIFACT_ROOT>/syberia-1737-arrayed-native-off-rebased-rPIGU6`.
+
+The shared ON-oriented validator labels the OFF evidence `RUN INVALID` solely because its expected
+hit assertions correctly observe zero after the switch disables the mechanism. The app exit,
+process census, selector match, and zero-error checks all pass, so this is an acceptance-policy
+mismatch in the apparatus rather than a title failure. This handoff removes the repeated full
+sampled-image detile/upload between atlas steps, but storage-image readback, guest packing and
+retile/writeback remain synchronous after every dispatch. At 7.2 fps the save warning is materially
+faster but still far short of the 30 fps target; that synchronous writeback is the next measured
+frontier and must not be deferred without a separately proven guest-visibility policy.
+
 ## Live validation of gameplay `v_max3_f16` recovery — 2026-08-03
 
 A current-master gameplay capture rejected source 87 at VOP3 opcode `0x354`. `llvm-mc` identifies

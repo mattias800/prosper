@@ -9450,8 +9450,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ok = false;
                     return true;
                 }
-                const bool ordinary_2d = res->img_dim == 1 && res->depth == 1 &&
-                                         !res->depth_compare;
+                const bool native_2d_storage =
+                    shader_resource_uses_native_2d_storage_image(
+                        *res, dim == Dim_2D, arrayed, ms);
                 const bool ordinary_3d = in.mimg_dim == SQ_DIM_3D && res->img_dim == 2 &&
                                          res->depth && !arrayed && !ms &&
                                          !res->depth_compare;
@@ -9460,13 +9461,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     : native_storage_format_support_bit(res->format, components);
                 // Vulkan permits B10G11R11 storage conversion, but RADV stores finite values with
                 // a systematic downward bias while the guest conversion is round-to-nearest-even
-                // (#1790). Keep the exact shader-side R32ui pack authoritative in both ordinary 2D
-                // and 3D, even when the device advertises native typed storage. Other float formats
-                // retain the device-gated native path below.
+                // (#1790). Keep the exact shader-side R32ui pack authoritative in ordinary/single-
+                // layer-arrayed 2D and 3D, even when the device advertises native typed storage.
+                // Other float formats retain the device-gated native path below.
                 const bool packed_r11 = b.packed_r11_storage &&
-                    (ordinary_2d || ordinary_3d) && !arrayed && !ms && !is_atomic &&
+                    (native_2d_storage || ordinary_3d) && !ms && !is_atomic &&
                     res->format == DataFormat::Float10_11_11 && components == 3;
-                const bool native_float = !packed_r11 && (ordinary_2d || ordinary_3d) &&
+                const bool native_float = !packed_r11 &&
+                    (native_2d_storage || ordinary_3d) &&
                     native_float_storage_image_supported(
                         res->format, components, res->srgb,
                         (b.native_storage_format_support & native_support_bit) != 0);
