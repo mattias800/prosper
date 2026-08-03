@@ -9,7 +9,7 @@ and GPU captures are local diagnostics and are intentionally not committed.
 | Title | Revision | Visual milestone | Audio evidence |
 | --- | --- | --- | --- |
 | GRIS (`PPSA09804`) | 01.001.000 | Native 1920×1080 opening gameplay with scripted movement | CLEAN on current master over the first 35 seconds: `rms=0.0082`, `peak=0.1173`, duplicated grains 0.0% |
-| Sonic Origins (`PPSA05325`) | 02.002.000 update targeting 02.001.000 | Blocked: update-only dump is missing two base title assets | AudioOut2 port 17 runs, but guest PCM is zero while startup is blocked |
+| Sonic Origins (`PPSA05325`) | Complete Sonic Origins Plus 02.002.000 base+update, four DLC mounts | Black startup loop after two unresolved UI paths (#1905) | AudioOut2 port 17 runs, but guest PCM is zero while startup is blocked |
 | Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | Native 1920×1080 tutorial combat with scripted progression | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
 
 ## Visual evidence
@@ -132,23 +132,27 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 
 | Hypothesis | Verdict and evidence | Source |
 |---|---|---|
-| Sonic Origins' black startup loop is a prosper defect | **Falsified — it is an incomplete dump.** The supplied 02.002.000 directory is an *update* image targeting 02.001.000, not a merged base+update app. Live file tracing shows the only unresolved startup requests are `raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/ui_title_nocopy.dds`, both absent. Everything else initializes — renderer, connected pad, CRI sound banks, AudioOut2 pump, 300+ flips in 100 s with no guest fault. Correct behaviour without those assets is a black loop and silence. **No compatibility milestone is claimed until a complete dump exists.** | this doc, `COMPATIBILITY.md` |
+| `targetContentVersion: 02.001.000` proves the supplied directory is update-only or incomplete | **Falsified.** The assembled 02.002.000 directory identifies itself as Sonic Origins Plus, contains the base executable/content and all four classic RSDK games, and mounts four installed DLC packs. The target version is update lineage, not a directory-completeness flag. The two unresolved loose UI requests remain real, but they are a Prosper archive/update-overlay/path-resolution question (#1905), not grounds for rejecting the game dump. | #1905, tracker #1871, this doc |
 | A PS5 `launchActivity` Game Intent routes around the missing UI assets | **Falsified.** The update does declare `launchActivity` support and ship the classic RSDK files, and the guest genuinely receives and consumes an exact `TITLE_SONIC_1_CLASSIC` intent — its `activityId` property is read and recognized. It still requests both missing UI files before it will open `raw/retro/Sonic1u.rsdk`. The activity experiment narrows the blocker; it does not bypass it. Truthful default no-intent behaviour is preserved. | this doc |
 
 ## Sonic Origins dump audit
 
 Sonic reaches a stable frontend frame loop with all decoded GPU operations realized, a connected
 scripted controller, CRI Atom banks loaded, and AudioOut2 advancing. A 100-second `boot_trace` run
-observed more than 300 flips and exercised the full route without a guest fault. It cannot reach an
-authentic title screen with the supplied files.
+observed more than 300 flips and exercised the full route without a guest fault. Prosper does not yet
+reach an authentic title screen from this complete application.
 
-The dump identifies itself as:
+The application metadata records:
 
 ```text
 contentVersion:       02.002.000
 targetContentVersion: 02.001.000
 originContentVersion: 01.000.000
 ```
+
+`targetContentVersion` describes the installed update's lineage. It must not be read as proof that
+the merged application directory contains no base title. The inventory contains Sonic 1, Sonic 2,
+Sonic 3 & Knuckles, and Sonic CD payloads plus four installed DLC mounts.
 
 With `PROSPER_FILELOG=1`, the complete unresolved-path set is:
 
@@ -157,15 +161,15 @@ With `PROSPER_FILELOG=1`, the complete unresolved-path set is:
 3 /app0/raw/ui/rpl_texture/ui_title_nocopy.dds
 ```
 
-Neither file exists anywhere under `PPSA05325-app0`. After those failures the game publishes black
-scanouts and its correctly initialized AudioOut2 buffers remain zero. This is a content-integrity
-blocker, not evidence of title compatibility. Resume the visual and audio validation with a merged
-base+02.002.000 dump containing both files; do not alias another PAC/DDS or use a black frame as a
-success screenshot.
+Neither path exists as a loose file under `PPSA05325-app0`. After those failures the game publishes
+black scanouts and its correctly initialized AudioOut2 buffers remain zero. Because the full game,
+update, and DLC are present, the next step is to identify whether Prosper is missing an archive lookup,
+update overlay, mount fallback, or path transformation. Do not alias another PAC/DDS or use a black
+frame as a success screenshot.
 
 ### Game Intent activity audit
 
-The update does contain the four classic RSDK data files, so an authentic PS5 activity launch was
+The complete app contains the four classic RSDK data files, so an authentic PS5 activity launch was
 also tested rather than assuming the normal menu was the only route. `sce_sys/param.json` permits the
 standard `launchActivity` intent. Guest disassembly independently shows that Sonic reads its
 `activityId` property and recognizes `TITLE_SONIC_1_CLASSIC` as its Sonic 1 Classic boot selection.
@@ -184,7 +188,7 @@ sceNpGameIntentGetPropertyValueString(..., "activityId", ..., 0x21)
 That route still requests `ui_startup.pac` and `ui_title_nocopy.dds` before it can transfer control to
 the classic runtime. A 30-second filtered trace never opens `raw/retro/Sonic1u.rsdk`; a 44-second
 native capture remains black after frame 1, and the active stereo float32 48 kHz port 17 capture is
-silent (`rms=0`). The activity experiment therefore narrows the blocker but does not change the
+silent (`rms=0`). The activity experiment therefore narrows the unresolved-path blocker but does not change the
 compatibility result. Reproduce it with:
 
 ```bash
