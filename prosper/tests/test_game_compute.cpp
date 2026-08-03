@@ -82,6 +82,9 @@ int main() {
         std::getenv("PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION") == nullptr;
     const bool native_2d_compute_transfer_enabled =
         std::getenv("PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER") == nullptr;
+    const bool native_2d_compute_transfer_available =
+        native_2d_compute_transfer_enabled &&
+        adaptive_storage_result_validation_enabled;
     const bool cold_storage_snapshot_deferral_enabled =
         adaptive_storage_result_validation_enabled;
     using prosper::frontend::ComputeImageCacheClass;
@@ -2929,13 +2932,14 @@ int main() {
                     CHECK(transfer_result.compute_executed &&
                               transfer_copy_guest == transfer_source_guest,
                           "arrayed producer to ordinary sampled consumer preserves every Float32 texel");
-                    CHECK(!native_2d_compute_transfer_enabled ||
+                    CHECK(!native_2d_compute_transfer_available ||
                               transfer_seeds_after > transfer_seeds_before,
                           "single-layer arrayed native storage producer seeds ordinary 2D "
                           "sampled consumer on-GPU");
-                    CHECK(native_2d_compute_transfer_enabled ||
+                    CHECK(native_2d_compute_transfer_available ||
                               transfer_seeds_after == transfer_seeds_before,
-                          "disabled native 2D transfer keeps the exact guest fallback");
+                          "disabled native 2D transfer or authority validation keeps the exact "
+                          "guest fallback");
                 }
             }
 
