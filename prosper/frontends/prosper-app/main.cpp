@@ -35,6 +35,7 @@
 #include "game_library.hpp"              // scan a games dir -> titles + metadata, pure seam
 #include "frame_grab_naming.hpp"         // one stamp + one exclusively claimed name pair per F9 grab
 #include "performance_capture.hpp"        // bounded F8 pre/post performance artifact
+#include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
 #ifdef PROSPER_HAVE_LIBRARY_UI
 #include "library_ui.hpp"                // the ImGui library grid drawn while no game is running
@@ -1320,6 +1321,66 @@ int main(int argc, char** argv) {
     }
     prosper::perf::InteractivePerformanceCapture& perfCapture =
         prosper::perf::interactive_performance_capture();
+    const char* automaticPerfEnv = getenv("PROSPER_PERF_CAPTURE_AFTER_MS");
+    prosper::frontend::ElapsedPerformanceCaptureTrigger automaticPerfCapture(
+        prosper::frontend::parse_performance_capture_delay_ns(automaticPerfEnv));
+    if (automaticPerfEnv) {
+        if (automaticPerfCapture.delay_ns()) {
+            std::fprintf(stderr,
+                "[perf] automatic capture scheduled by PROSPER_PERF_CAPTURE_AFTER_MS=%s "
+                "(one attempt after %llu ms of app-loop time)\n",
+                automaticPerfEnv,
+                static_cast<unsigned long long>(automaticPerfCapture.delay_ns() / 1'000'000));
+        } else {
+            std::fprintf(stderr,
+                "[perf] ignoring malformed PROSPER_PERF_CAPTURE_AFTER_MS=\"%s\" "
+                "(expected positive decimal milliseconds without overflow)\n",
+                automaticPerfEnv);
+        }
+    }
+    bool perfCaptureWasAutomatic = false;
+    auto arm_performance_capture = [&](bool automatic, uint64_t armedAt,
+                                       uint64_t automaticElapsedMs = 0) {
+        if (perfCapture.sample_due(armedAt)) {
+            perfCapture.observe_sample(prosper::perf::collect_process_sample(
+                armedAt, gpu::present_count(),
+                prosper::frontend::rendered_frame_counter(
+                    vk.gpu_present, gpu::present_frame_seq()),
+                shown));
+        }
+        const prosper::perf::CaptureArmResult armed = perfCapture.arm(
+            grabDir, activeCaptureTitle.id, activeCaptureTitle.label,
+            prosper::perf::build_revision(), armedAt,
+            std::chrono::system_clock::now());
+        if (armed.ok) perfCaptureWasAutomatic = automatic;
+        if (automatic) {
+            if (armed.ok) {
+                std::fprintf(stderr,
+                    "[perf] automatic trigger #%u fired at %llu ms for %s: retained %zu "
+                    "pre-trigger samples; collecting %.1f seconds after the trigger\n",
+                    armed.index, static_cast<unsigned long long>(automaticElapsedMs),
+                    activeCaptureTitle.label.empty() ? "the current process"
+                                                     : activeCaptureTitle.label.c_str(),
+                    armed.pre_samples, armed.post_seconds);
+            } else {
+                std::fprintf(stderr,
+                    "[perf] automatic trigger #%u fired at %llu ms but was not armed: %s\n",
+                    armed.index, static_cast<unsigned long long>(automaticElapsedMs),
+                    armed.error.c_str());
+            }
+        } else if (armed.ok) {
+            std::fprintf(stderr,
+                "[perf] F8 #%u armed for %s: retained %zu pre-trigger samples; "
+                "collecting %.1f seconds after the press\n",
+                armed.index,
+                activeCaptureTitle.label.empty() ? "the current process"
+                                                 : activeCaptureTitle.label.c_str(),
+                armed.pre_samples, armed.post_seconds);
+        } else {
+            std::fprintf(stderr, "[perf] F8 #%u not armed: %s\n",
+                         armed.index, armed.error.c_str());
+        }
+    };
     // 0 = keep the built-in default; the timeline clamps whatever is supplied to 64..3072 MiB.
     // Parse strictly, matching the two checked parses of this same variable in gpu_timeline.cpp. An
     // unchecked strtoul truncates into uint32_t, so 4294967360 would arrive as 64 — silently the
@@ -1541,6 +1602,9 @@ int main(int argc, char** argv) {
         open_folder_picker(win);
     }
 
+    // The automatic capture delay starts at app-loop entry, not process start or guest boot. This
+    // gives unattended routes one explicit, repeatable host-time origin without desktop input.
+    const uint64_t perfLoopStartNs = prosper::perf::monotonic_now_ns();
     while (running && !prosper_stop_requested()) {
         // F8's only always-on work is this 4 Hz sample. `sample_due` is one atomic read, so the
         // process CPU/RSS query is not paid on every UI-loop iteration.
@@ -1563,8 +1627,18 @@ int main(int argc, char** argv) {
                     perfOutcome.renderer_dropped, perfOutcome.compute_dropped,
                     perfOutcome.path.c_str());
             } else {
-                std::fprintf(stderr, "[perf] F8 capture FAILED: %s\n", perfOutcome.error.c_str());
+                std::fprintf(stderr, "[perf] %s capture FAILED: %s\n",
+                             perfCaptureWasAutomatic ? "automatic" : "F8",
+                             perfOutcome.error.c_str());
             }
+            perfCaptureWasAutomatic = false;
+        }
+        // Consume a completion before starting a new automatic capture. Otherwise a user-triggered
+        // F8 outcome that completed on this same sample could be mislabeled as automatic after the
+        // new arm replaces the trigger-provenance flag.
+        if (automaticPerfCapture.take_if_due(perfLoopStartNs, perfNow)) {
+            arm_performance_capture(
+                true, perfNow, (perfNow - perfLoopStartNs) / 1'000'000);
         }
         openedThisBatch = rejectedThisBatch = false;
         SDL_Event ev;
@@ -1596,29 +1670,7 @@ int main(int argc, char** argv) {
                 if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
                     ev.key.key == SDLK_F8) {
                     const uint64_t armedAt = prosper::perf::monotonic_now_ns();
-                    if (perfCapture.sample_due(armedAt)) {
-                        perfCapture.observe_sample(prosper::perf::collect_process_sample(
-                            armedAt, gpu::present_count(),
-                            prosper::frontend::rendered_frame_counter(
-                                vk.gpu_present, gpu::present_frame_seq()),
-                            shown));
-                    }
-                    const prosper::perf::CaptureArmResult armed = perfCapture.arm(
-                        grabDir, activeCaptureTitle.id, activeCaptureTitle.label,
-                        prosper::perf::build_revision(), armedAt,
-                        std::chrono::system_clock::now());
-                    if (armed.ok) {
-                        std::fprintf(stderr,
-                            "[perf] F8 #%u armed for %s: retained %zu pre-trigger samples; "
-                            "collecting %.1f seconds after the press\n",
-                            armed.index,
-                            activeCaptureTitle.label.empty() ? "the current process"
-                                                             : activeCaptureTitle.label.c_str(),
-                            armed.pre_samples, armed.post_seconds);
-                    } else {
-                        std::fprintf(stderr, "[perf] F8 #%u not armed: %s\n",
-                                     armed.index, armed.error.c_str());
-                    }
+                    arm_performance_capture(false, armedAt);
                     continue;
                 }
                 // Interactive frame grab: F9 arms a one-shot capture of the next COMPLETE frame (every
