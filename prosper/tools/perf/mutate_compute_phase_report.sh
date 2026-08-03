@@ -94,12 +94,37 @@ run_mutation "exclude ok=0 from phase table" "no negative time reaches the table
   '    records = [r for r in records if r.get("ok", 1) != 0 and "ok" in r]' \
   '    records = list(records)' || bad=1
 run_mutation "stale-model banner on stdout" "stale model banner survives redirection" \
-  '        print(f"  !! NOT TRUSTWORTHY: {warning}. Update PHASES before using this table.")' \
+  '        print(f"  !! NOT TRUSTWORTHY: {warning}. Update the report model before using this table.")' \
   '        pass' || bad=1
 run_mutation "missing-file message" "missing file is a message, not a traceback" \
   '        except OSError as error:' '        except ZeroDivisionError as error:' || bad=1
 run_mutation "stale-model banner in --csv" "--csv carries the stale-model banner" \
   '            print(f"# NOT TRUSTWORTHY,{warning}")' '            pass' || bad=1
+run_mutation "nest storage cache in prepare" \
+  "storage cache nested without negative residual" \
+  '    if not _storage_image(image):' '    if True:' || bad=1
+run_mutation "prefer stable shader hash" \
+  "binding rollup prefers stable hash over run-local code" \
+  '            if "hash" in image:' '            if False and "hash" in image:' || bad=1
+run_mutation "retain binding in rollup key" \
+  "binding rollup keeps distinct bindings separate" \
+  '            key = (identity, binding, image_class)' \
+  '            key = (identity, None, image_class)' || bad=1
+run_mutation "retain class in rollup key" \
+  "binding rollup keeps image classes separate" \
+  '            key = (identity, binding, image_class)' \
+  '            key = (identity, binding, None)' || bad=1
+run_mutation "tally upload-skipped independently" \
+  "persistent and upload-skipped tallies are independent" \
+  '                group["upload_yes"] += bool(image["upload_skipped"])' \
+  '                group["upload_yes"] += bool(image["persistent"])' || bad=1
+run_mutation "retain bounded address variants" \
+  "binding rollup retains a bounded address set" \
+  '            if "addr" in image:' '            if False and "addr" in image:' || bad=1
+run_mutation "warn on impossible image model" \
+  "impossible image model warns on stdout and stderr" \
+  '    if broken_storage_nest or broken_image_root or negative_image_timers:' \
+  '    if False:' || bad=1
 
 cp "$PRISTINE" "$TOOL"
 if python3 "$WORK/test_compute_phase_report.py" >/dev/null 2>&1; then

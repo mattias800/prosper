@@ -382,7 +382,9 @@ characters fail closed with an explicit `ignored` banner. An accepted selector p
 uses `_Exit` while its detached guest thread is still alive, it reports the summary explicitly just
 before that exit; the ordinary destructor remains an idempotent fallback. Selected `[compute-phase]`,
 `[compute-image]`, and `[compute-image-writeback]` lines carry both `code=` and `hash=` so copied logs
-retain their own identity.
+retain their own identity. A selected image record additionally carries its guest `addr=`, whether it
+resolved to a `persistent=` image, and whether validation made the upload `upload-skipped=`. Alias
+records name `alias_of=` and copy those two state bits from the real owner; they remain no-work records.
 
 #### Reading the compute side at run scale
 
@@ -391,8 +393,11 @@ retain their own identity.
 tens of thousands of each, so pipe the run log through **`tools/perf/compute_phase_report.py`**, which
 rolls both record types into one table: ms, share of total, and mean per dispatch, nested so each
 sub-timer sits under the phase whose interval contains it, plus the programs that cost the most and the
-dominant leaf inside each. `--program 0xADDR` restricts to one kernel and `--csv` emits the table for
-further processing. `--since-submit N` skips boot/warmup, but **it suppresses the image section**:
+dominant leaf inside each. Its text output also ranks real image bindings by stable shader hash,
+binding, and sampled/storage class, with persistence/upload-skip counts and a bounded address list;
+older records without those fields stay explicitly unknown. `--program 0xADDR` restricts to one kernel
+and `--csv` emits the phase table for further processing. `--since-submit N` skips boot/warmup, but
+**it suppresses the image section**:
 `[compute-image]` records carry no submit ordinal, so they cannot be filtered to match, and showing
 them would divide a whole-log numerator by a filtered denominator. Drop the flag for the image
 decomposition.
@@ -406,7 +411,10 @@ image-binding loop as well as descriptor validation and buffer binding, and that
 on the `[compute-phase]` line — so on an image-heavy title `[compute-phase]` alone reports a large
 `setup` whose named children explain almost none of it. The report prints that gap as an explicit
 `unattributed` row under every parent rather than dropping it, and `[compute-image]` is what decomposes
-this particular one. Overhead of both switches together, measured on Astro Bot at five matched dispatch
+this particular one. The sampled-image cache timer completes before upload preparation begins, but the
+storage-image cache timer is nested inside `prepare_ms`; the report prints storage cache as an included
+child and warns in both redirected output and stderr if a record violates that hierarchy. Overhead of
+both switches together, measured on Astro Bot at five matched dispatch
 ordinals, is 1.5-1.9 %.
 
 Ordered graphics/compute submits retain a bounded journal of exact guest-memory ranges written by the

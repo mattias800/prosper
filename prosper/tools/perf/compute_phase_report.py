@@ -15,13 +15,17 @@ Reads a run log (stdin or a path), parses `[compute-phase]` records, and prints:
     the parent whose interval contains it;
   * "unattributed" rows, i.e. parent time its own children do not explain (this is where an
     unmeasured cost hides, so it is printed rather than silently dropped);
+  * real image bindings ranked by stable shader hash + binding + class, with persistence/upload-skip
+    state and a bounded list of observed guest addresses;
   * the programs that cost the most, each with its dominant leaf phase.
 
 `setup_ms` deliberately spans the image-binding loop as well as descriptor validation and buffer
 binding, and that loop has no sub-timer on the `[compute-phase]` line -- so on an image-heavy title
 most of `setup` lands in its "unattributed" row. Add `PROSPER_COMPUTE_IMAGE_TIMING=1` to the run and
 this tool will also roll up the resulting `[compute-image]` records, which decompose exactly that
-interval. Run both switches together whenever setup is the dominant phase.
+interval. Sampled cache lookup is a sibling of upload preparation, while storage cache validation is
+nested inside `prepare_ms`; the report preserves that hierarchy and warns when a record violates it.
+Run both switches together whenever setup is the dominant phase.
 
 WHAT THIS TOOL DOES NOT SEE
 ---------------------------
@@ -43,21 +47,23 @@ from collections import defaultdict
 
 RECORD = re.compile(r"\[compute-phase\]\s+(.*)")
 IMAGE_RECORD = re.compile(r"\[compute-image\]\s+(.*)")
-FIELD = re.compile(r"(\w+)=(0x[0-9a-fA-F]+|[-\d.]+)")
+FIELD = re.compile(r"([A-Za-z_][\w-]*)=([^\s]+)")
+HEX_VALUE = re.compile(r"0x[0-9a-fA-F]+$")
+DECIMAL_VALUE = re.compile(r"-?(?:\d+(?:\.\d*)?|\.\d+)$")
+MAX_BINDING_ADDRESSES = 4
 
 # `[compute-image]` decomposes one image binding inside the setup_ms interval. Several of its field
 # names (cache_ms, prepare_ms) collide with `[compute-phase]` fields that mean something else
 # entirely, so the two record types are parsed separately and never merged into one dictionary.
-IMAGE_PHASES = [
+IMAGE_TOP_LEVEL_PHASES = [
     ("query (driver caps)", "query_ms"),
     ("import (renderer RTT)", "import_ms"),
-    ("cache lookup + validate", "cache_ms"),
     ("staging alloc", "staging_ms"),
-    ("prepare upload", "prepare_ms"),
     ("image allocation", "allocation_ms"),
     ("view", "view_ms"),
     ("sampler", "sampler_ms"),
 ]
+IMAGE_TIMER_KEYS = [key for _, key in IMAGE_TOP_LEVEL_PHASES] + ["cache_ms", "prepare_ms"]
 
 # (label, key, parent) -- parent is the phase whose measured interval contains this one.
 # `total_ms` is the root; the top-level five partition it by construction in execute_item().
@@ -88,8 +94,48 @@ LEAVES = [k for (_, k, _) in PHASES if k not in {p for (_, _, p) in PHASES}]
 def _fields(text):
     out = {}
     for key, value in FIELD.findall(text):
-        out[key] = int(value, 16) if value.startswith("0x") else float(value)
+        key = key.replace("-", "_")
+        if HEX_VALUE.fullmatch(value):
+            out[key] = int(value, 16)
+        elif DECIMAL_VALUE.fullmatch(value):
+            out[key] = float(value)
+        else:
+            # `[compute-image]` uses text fields for the binding class and extent. Retain unknown
+            # future tokens too: silently dropping a discriminator is the unsafe compatibility mode.
+            out[key] = value
     return out
+
+
+def _storage_image(image):
+    return image.get("class") == "storage"
+
+
+def _image_root_time(image):
+    """Sum only siblings inside one image's `ms` interval.
+
+    Sampled-image cache lookup finishes before prepare starts. Storage-image cache lookup starts after
+    prepare starts, so adding both `cache_ms` and `prepare_ms` double-counts storage bindings.
+    """
+    total = sum(image.get(key, 0.0) for _, key in IMAGE_TOP_LEVEL_PHASES)
+    total += image.get("prepare_ms", 0.0)
+    if not _storage_image(image):
+        total += image.get("cache_ms", 0.0)
+    return total
+
+
+def _known_tally(yes, known, total):
+    if not known:
+        return "-"
+    if known == total:
+        return str(yes)
+    return f"{yes}+?{total - known}"
+
+
+def _known_gib(byte_total, known, total):
+    if not known:
+        return "-"
+    suffix = "" if known == total else "+?"
+    return f"{byte_total / (1 << 30):.2f}{suffix}"
 
 
 def parse(streams, since_submit, program):
@@ -229,6 +275,29 @@ def main():
             f"this tool's phase model does not match these records ({broken_sum} where the "
             f"top-level phases do not sum to total_ms, {broken_nest} where children exceed their "
             f"parent); the emitter in live_compute.cpp has probably changed")
+
+    # `[compute-image]` prints at three-decimal precision. Check its hierarchy per record before
+    # aggregating: a negative residual in the final table must be visibly identified as an invalid
+    # model, not presented as a meaningful performance result. Aliases have no sub-timers and are
+    # intentionally outside this model.
+    image_tolerance = 0.006
+    model_images = [image for image in images if not image.get("alias", 0.0)]
+    broken_storage_nest = sum(
+        1 for image in model_images
+        if _storage_image(image) and
+        image.get("cache_ms", 0.0) > image.get("prepare_ms", 0.0) + image_tolerance)
+    broken_image_root = sum(
+        1 for image in model_images
+        if _image_root_time(image) > image["ms"] + image_tolerance)
+    negative_image_timers = sum(
+        1 for image in model_images
+        if any(image.get(key, 0.0) < -image_tolerance for key in IMAGE_TIMER_KEYS))
+    if broken_storage_nest or broken_image_root or negative_image_timers:
+        model_warnings.append(
+            f"this tool's image model does not match these records ({broken_storage_nest} storage "
+            f"cache intervals exceed prepare_ms, {broken_image_root} where top-level image children "
+            f"exceed ms, {negative_image_timers} with a negative image timer); storage cache must "
+            f"remain nested inside prepare upload")
     for warning in model_warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
 
@@ -299,7 +368,7 @@ def main():
     print("  " + "-" * 54)
     print(f"  {'total':<20}{grand:>12.1f}{100.0:>9.1f}%{grand / n:>12.3f}")
     for warning in model_warnings:
-        print(f"  !! NOT TRUSTWORTHY: {warning}. Update PHASES before using this table.")
+        print(f"  !! NOT TRUSTWORTHY: {warning}. Update the report model before using this table.")
 
     # The image-binding loop sits inside setup_ms and has no `[compute-phase]` sub-timer, so on an
     # image-heavy title it IS setup's unattributed row. Break it out when the run carried
@@ -331,13 +400,34 @@ def main():
                  f"({sum(i['ms'] for i in aliases):.0f} ms), excluded" if aliases else ""))
         print(f"  {'sub-phase':<26}{'ms':>12}{'% all':>10}{'ms/binding':>13}")
         print("  " + "-" * 61)
-        attributed = 0.0
-        for label, key in IMAGE_PHASES:
-            ms = sum(i.get(key, 0.0) for i in images)
-            attributed += ms
-            print(f"  {label:<26}{ms:>12.1f}{pct(ms):>9.1f}%{ms / len(images):>13.3f}")
+        def image_row(label, ms, depth=0):
+            print(f"  {'  ' * depth + label:<26}{ms:>12.1f}{pct(ms):>9.1f}%"
+                  f"{ms / len(images):>13.3f}")
+
+        image_totals = {
+            key: sum(image.get(key, 0.0) for image in images)
+            for key in IMAGE_TIMER_KEYS
+        }
+        storage_cache = sum(
+            image.get("cache_ms", 0.0) for image in images if _storage_image(image))
+        sampled_cache = image_totals["cache_ms"] - storage_cache
+
+        image_row("query (driver caps)", image_totals["query_ms"])
+        image_row("import (renderer RTT)", image_totals["import_ms"])
+        image_row("cache lookup (sampled)", sampled_cache)
+        image_row("staging alloc", image_totals["staging_ms"])
+        image_row("prepare upload (inclusive)", image_totals["prepare_ms"])
+        image_row("storage cache (included)", storage_cache, 1)
+        image_row("prepare exclusive", image_totals["prepare_ms"] - storage_cache, 1)
+        image_row("image allocation", image_totals["allocation_ms"])
+        image_row("view", image_totals["view_ms"])
+        image_row("sampler", image_totals["sampler_ms"])
+
+        # Only top-level siblings are attributed against the binding interval. Storage cache is a
+        # child of prepare and is printed for attribution without being added a second time.
+        attributed = sum(_image_root_time(image) for image in images)
         rest = image_total - attributed
-        print(f"  {'unattributed':<26}{rest:>12.1f}{pct(rest):>9.1f}%{rest / len(images):>13.3f}")
+        image_row("unattributed", rest)
         print("  " + "-" * 61)
         guest_bytes = sum(i.get("guest", 0.0) for i in images)
         staging_bytes = sum(i.get("staging", 0.0) for i in images)
@@ -354,6 +444,80 @@ def main():
         print("  setup image bindings: no [compute-image] records in this log.")
         print("  Re-run with PROSPER_COMPUTE_IMAGE_TIMING=1 to decompose setup's unattributed row;")
         print("  its absence here does NOT mean image binding was free.")
+
+    # Aggregate real bindings by the cross-run shader identity when available. A run-local code
+    # address remains the compatibility fallback for old logs. Addresses are evidence about variants,
+    # not part of the group key: Astro's storage binding alternates backing addresses while remaining
+    # one shader/binding cost centre. Keep only a bounded set so a hostile or corrupt log cannot make
+    # this diagnostic allocate without limit.
+    if images:
+        binding_groups = {}
+        for image in images:
+            if "hash" in image:
+                identity = ("hash", int(image["hash"]))
+            else:
+                identity = ("code", int(image.get("code", 0)))
+            binding = int(image["binding"]) if "binding" in image else None
+            image_class = str(image.get("class", "unknown"))
+            key = (identity, binding, image_class)
+            group = binding_groups.setdefault(key, {
+                "binding": binding, "class": image_class,
+                "n": 0, "ms": 0.0,
+                "persistent_yes": 0, "persistent_known": 0,
+                "upload_yes": 0, "upload_known": 0,
+                "guest": 0.0, "guest_known": 0,
+                "staging": 0.0, "staging_known": 0,
+                "addresses": set(), "addresses_known": 0, "addresses_overflow": False,
+            })
+            group["n"] += 1
+            group["ms"] += image["ms"]
+            if "persistent" in image:
+                group["persistent_known"] += 1
+                group["persistent_yes"] += bool(image["persistent"])
+            if "upload_skipped" in image:
+                group["upload_known"] += 1
+                group["upload_yes"] += bool(image["upload_skipped"])
+            if "guest" in image:
+                group["guest_known"] += 1
+                group["guest"] += image["guest"]
+            if "staging" in image:
+                group["staging_known"] += 1
+                group["staging"] += image["staging"]
+            if "addr" in image:
+                group["addresses_known"] += 1
+                address = int(image["addr"])
+                if address not in group["addresses"]:
+                    if len(group["addresses"]) < MAX_BINDING_ADDRESSES:
+                        group["addresses"].add(address)
+                    else:
+                        group["addresses_overflow"] = True
+
+        ranked_bindings = sorted(
+            binding_groups.items(), key=lambda item: -item[1]["ms"])[:args.top]
+        print()
+        print(f"  top {len(ranked_bindings)} real image binding groups by setup cost")
+        print(f"  {'shader':<23}{'bind':>6} {'class':<8}{'n':>7}{'ms':>11}{'mean':>9}"
+              f"{'persist':>11}{'skip':>9}{'guestGiB':>11}{'stageGiB':>11}  addresses")
+        print("  " + "-" * 126)
+        for (identity, _, _), group in ranked_bindings:
+            identity_kind, identity_value = identity
+            shader = (f"hash:0x{identity_value:016x}" if identity_kind == "hash"
+                      else f"code:0x{identity_value:x}")
+            address_text = ",".join(f"0x{address:x}" for address in sorted(group["addresses"]))
+            if group["addresses_overflow"]:
+                address_text += ("," if address_text else "") + "+more"
+            if group["addresses_known"] and group["addresses_known"] != group["n"]:
+                address_text += ("," if address_text else "") + "+?"
+            if not address_text:
+                address_text = "-"
+            binding_text = str(group["binding"]) if group["binding"] is not None else "-"
+            print(f"  {shader:<23}{binding_text:>6} {group['class']:<8}{group['n']:>7}"
+                  f"{group['ms']:>11.1f}{group['ms'] / group['n']:>9.3f}"
+                  f"{_known_tally(group['persistent_yes'], group['persistent_known'], group['n']):>11}"
+                  f"{_known_tally(group['upload_yes'], group['upload_known'], group['n']):>9}"
+                  f"{_known_gib(group['guest'], group['guest_known'], group['n']):>11}"
+                  f"{_known_gib(group['staging'], group['staging_known'], group['n']):>11}  "
+                  f"{address_text}")
 
     # Which program to attack, and which leaf inside it. Ranking programs by *total* cost (not mean)
     # is deliberate: a cheap kernel dispatched thousands of times outranks an expensive rare one.

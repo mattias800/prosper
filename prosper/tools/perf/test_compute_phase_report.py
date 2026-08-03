@@ -35,15 +35,22 @@ def phase(submit=1, code=0x1, ok=1, **over):
             f"total_ms={total:.2f} subgroup=0\n")
 
 
-def image(code=0x1, alias=False, ms=1.0, **over):
+def image(code=0x1, shader_hash=0xA, binding=1, image_class="sampled", alias=False,
+          ms=1.0, addr=0x1000, persistent=0, upload_skipped=0, legacy=False, **over):
+    identity = f"code=0x{code:x}"
+    if shader_hash is not None:
+        identity += f" hash=0x{shader_hash:016x}"
+    state = "" if legacy else (
+        f"addr=0x{addr:x} persistent={persistent} upload-skipped={upload_skipped} ")
     if alias:
-        return (f"[compute-image] code=0x{code:x} binding=1 class=sampled alias=1 "
-                f"extent=8x8x1 ms={ms:.3f}\n")
+        return (f"[compute-image] {identity} binding={binding} class={image_class} alias=1 "
+                f"{state}extent=8x8x1 ms={ms:.3f}\n")
     fields = {"query_ms": 0, "import_ms": 0, "cache_ms": 0, "staging_ms": 0, "prepare_ms": 0,
               "allocation_ms": 0, "view_ms": 0, "sampler_ms": 0}
     fields.update(over)
     body = " ".join(f"{k}={v:.3f}" for k, v in fields.items())
-    return (f"[compute-image] code=0x{code:x} binding=1 class=sampled imported=0 extent=8x8x1 "
+    return (f"[compute-image] {identity} binding={binding} class={image_class} imported=0 "
+            f"{state}extent=8x8x1 "
             f"guest=1024 staging=1024 normalized=0 texel=0 sampled-float=0 rgba8-reuse=0 "
             f"{body} ms={ms:.3f}\n")
 
@@ -70,6 +77,37 @@ def image_row(out, label):
             if len(numbers) >= 2:
                 return (float(numbers[0]), float(numbers[-1]))
     return (float("nan"), float("nan"))
+
+
+def binding_rows(out):
+    """Parse the human binding-rollup table into keyed dictionaries.
+
+    Numeric parsing is deliberate: substring checks such as `skip=1` also match 10 and repeat the
+    exact self-test weakness documented by instrument trap 48.
+    """
+    rows = []
+    pattern = re.compile(
+        r"^\s+(hash:0x[0-9a-f]+|code:0x[0-9a-f]+)\s+(\S+)\s+(\S+)\s+"
+        r"(\d+)\s+([\d.]+)\s+([\d.]+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$")
+    for line in out.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        shader, binding, image_class, n, total_ms, mean_ms, persistent, skipped, guest, staged, addresses = match.groups()
+        rows.append({
+            "shader": shader,
+            "binding": None if binding == "-" else int(binding),
+            "class": image_class,
+            "n": int(n),
+            "ms": float(total_ms),
+            "mean": float(mean_ms),
+            "persistent": persistent,
+            "skip": skipped,
+            "guest": guest,
+            "staged": staged,
+            "addresses": addresses,
+        })
+    return rows
 
 
 FAILURES = []
@@ -146,6 +184,106 @@ def main():
     code, out, err = run(phase(dispatch_ms=1) + image(alias=True, ms=0.5))
     check("all-alias log reports the folds", "all 1 records are aliased folds" in out, out)
     check("all-alias log still prints top programs", "top 1 programs by total cost" in out, out)
+
+    # Storage cache validation happens after prepare_upload_start, unlike the sampled cache lookup.
+    # It is therefore a CHILD of prepare_ms. Treating both as root siblings double-counts four ms and
+    # prints a plausible-looking negative residual -- the exact defect found in Astro's valid arm.
+    code, out, err = run(
+        phase(setup_ms=10) +
+        image(image_class="storage", ms=10, prepare_ms=9, cache_ms=4))
+    check("storage cache nested without negative residual",
+          image_row(out, "storage cache (included)")[0] == 4.0 and
+          image_row(out, "prepare exclusive")[0] == 5.0 and
+          image_row(out, "unattributed")[0] == 1.0 and
+          "image model does not match" not in out + err,
+          out + err)
+
+    # Stable shader identity wins over the run-local code address. The two hash AA/code variants
+    # aggregate while another stable hash remains a separate group.
+    log = (phase(setup_ms=6) +
+           image(code=0x10, shader_hash=0xAA, binding=7, ms=1) +
+           image(code=0x20, shader_hash=0xAA, binding=7, ms=2) +
+           image(code=0x30, shader_hash=0xBB, binding=7, ms=3))
+    code, out, err = run(log)
+    rows = binding_rows(out)
+    aa7 = [row for row in rows if row["shader"] == "hash:0x00000000000000aa" and
+           row["binding"] == 7 and row["class"] == "sampled"]
+    check("binding rollup prefers stable hash over run-local code",
+          len(rows) == 2 and len(aa7) == 1 and aa7[0]["n"] == 2 and aa7[0]["ms"] == 3.0 and
+          any(row["shader"] == "hash:0x00000000000000bb" for row in rows), rows)
+
+    log = (phase(setup_ms=3) +
+           image(shader_hash=0xAC, binding=7, ms=1) +
+           image(shader_hash=0xAC, binding=8, ms=2))
+    code, out, err = run(log)
+    rows = binding_rows(out)
+    check("binding rollup keeps distinct bindings separate",
+          len(rows) == 2 and {row["binding"] for row in rows} == {7, 8}, rows)
+
+    log = (phase(setup_ms=3) +
+           image(shader_hash=0xAD, binding=7, image_class="sampled", ms=1) +
+           image(shader_hash=0xAD, binding=7, image_class="storage", ms=2))
+    code, out, err = run(log)
+    rows = binding_rows(out)
+    check("binding rollup keeps image classes separate",
+          len(rows) == 2 and {row["class"] for row in rows} == {"sampled", "storage"}, rows)
+
+    # Address variants are detail within one cost centre, not a grouping dimension. The retained set
+    # is bounded: five unique addresses show the first four plus an explicit overflow marker.
+    log = phase(setup_ms=5) + "".join(
+        image(shader_hash=0xCC, binding=73, image_class="storage", ms=1,
+              addr=0x1000 * index)
+        for index in range(1, 6))
+    code, out, err = run(log)
+    rows = binding_rows(out)
+    addresses = rows[0]["addresses"] if len(rows) == 1 else ""
+    check("binding rollup retains a bounded address set",
+          len(rows) == 1 and rows[0]["n"] == 5 and
+          addresses == "0x1000,0x2000,0x3000,0x4000,+more", rows)
+
+    # The two state fields answer different questions. Use unequal populations so accidentally
+    # tallying persistent twice cannot survive behind coincidentally equal counts.
+    log = (phase(setup_ms=3) +
+           image(shader_hash=0xDD, persistent=1, upload_skipped=0) +
+           image(shader_hash=0xDD, persistent=1, upload_skipped=1) +
+           image(shader_hash=0xDD, persistent=0, upload_skipped=0))
+    code, out, err = run(log)
+    rows = binding_rows(out)
+    check("persistent and upload-skipped tallies are independent",
+          len(rows) == 1 and rows[0]["persistent"] == "2" and rows[0]["skip"] == "1", rows)
+
+    # Old logs predate addr/persistent/upload-skipped. Missing means unavailable, not zero: zero is a
+    # valid observed state and would make a legacy record look like a negative discriminator result.
+    code, out, err = run(phase(setup_ms=1) + image(shader_hash=0xEE, legacy=True))
+    rows = binding_rows(out)
+    check("legacy binding state remains explicitly unknown",
+          len(rows) == 1 and rows[0]["persistent"] == "-" and
+          rows[0]["skip"] == "-" and rows[0]["addresses"] == "-", rows)
+    code, out, err = run(
+        phase(setup_ms=2) +
+        image(shader_hash=0xEF, persistent=1, upload_skipped=0) +
+        image(shader_hash=0xEF, legacy=True))
+    rows = binding_rows(out)
+    check("mixed legacy binding state marks partial knowledge",
+          len(rows) == 1 and rows[0]["persistent"] == "1+?1" and
+          rows[0]["skip"] == "0+?1" and rows[0]["addresses"] == "0x1000,+?", rows)
+
+    # Alias records carry owner state for direct log inspection but did no setup work. They must not
+    # acquire their own binding rollup row.
+    log = (phase(setup_ms=1) + image(shader_hash=0xF0, binding=1) +
+           image(shader_hash=0xF1, binding=2, alias=True, ms=0.1))
+    code, out, err = run(log)
+    rows = binding_rows(out)
+    check("aliases are excluded from the per-binding rollup",
+          len(rows) == 1 and rows[0]["shader"] == "hash:0x00000000000000f0", rows)
+
+    # Impossible image timing must mark both the terminal and redirected table. Here storage cache
+    # cannot be six ms inside a four-ms prepare interval, even though every value is non-negative.
+    code, out, err = run(
+        phase(setup_ms=6) +
+        image(image_class="storage", ms=6, prepare_ms=4, cache_ms=6))
+    check("impossible image model warns on stdout and stderr",
+          "image model does not match" in err and "NOT TRUSTWORTHY" in out, out + err)
 
     # `unattributed` is thresholded against its own PARENT, not the grand total: a small parent must
     # not lose its remainder just because the run is large. Here writeback_images_ms is 4 ms of a
