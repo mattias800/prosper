@@ -4,6 +4,7 @@
 // native VM primitives and TRACK every mapping so VirtualQuery is truthful and so we can
 // log/debug the guest's address-space construction.
 #include "dispatch.hpp"
+#include "dmem_caller_chain.hpp"
 #include "nid.hpp"
 #include "sce_errno.hpp"
 #include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
@@ -205,8 +206,15 @@ namespace {
         const uintptr_t slots = (hi - base) / sizeof(uint64_t);
         return slots < (uintptr_t)want ? (int)slots : want;
     }
-    void log_dmem_caller(const char* what, uint64_t len, const volatile uint64_t* frame) {
-        if (!dmem_caller_log()) return;
+    void log_main_dmem_allocation(uint64_t len, uint64_t phys,
+                                  const volatile uint64_t* frame) {
+        // Preserve the unarmed path: no stack query, interner construction, or extra formatting unless
+        // PROSPER_DMEM_CALLER was explicitly requested. MEMLOG alone keeps its historical line byte-for-byte.
+        if (!dmem_caller_log()) {
+            MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n",
+                 (unsigned long long)len, (unsigned long long)phys);
+            return;
+        }
         constexpr int kWant = 6;          // return addresses to report
         constexpr int kScan = 160;        // stack slots to walk
         // Never read past the mapped end of this stack (#1755).
@@ -219,35 +227,56 @@ namespace {
             if (n && ra[n - 1] == v) continue;      // collapse an adjacent duplicate spill
             ra[n++] = v;
         }
-        // Rate-limit on the chain itself: one line per distinct (first two frames) pair.
-        static std::mutex mx;
-        static std::vector<std::pair<uint64_t, uint64_t>> seen;
-        static bool announced_cap = false;
-        const std::pair<uint64_t, uint64_t> key{ n > 0 ? ra[0] : 0, n > 1 ? ra[1] : 0 };
-        {
-            std::lock_guard<std::mutex> lk(mx);
-            for (const auto& s : seen) if (s == key) return;
-            if (seen.size() >= 64) {
-                // #1755: announce the ceiling once. A silent cap makes the log read as "64 distinct
-                // call sites exist" when it means "we stopped counting" — a limit reported as a
-                // census (instrument-trap 49).
-                if (!announced_cap) {
-                    announced_cap = true;
-                    fprintf(stderr, "[dmem-caller] chain limit 64 reached;"
-                                    " further distinct call chains are NOT shown\n");
-                }
-                return;
+        static DmemCallerChainInterner<> chains;
+        const DmemCallerChainResult correlation = chains.intern(
+            n > 0 ? ra[0] : 0, n > 1 ? ra[1] : 0);
+
+        // MEMLOG is the per-allocation census. Give every one of its allocation records a correlation
+        // token; the full stack remains one line per distinct bounded ID below.
+        if (!dmem_caller_chain_correlates_allocation(correlation)) {
+            MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n",
+                 (unsigned long long)len, (unsigned long long)phys);
+        } else {
+            switch (correlation.state) {
+            case DmemCallerChainState::Known:
+                MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx caller-chain=%u\n",
+                     (unsigned long long)len, (unsigned long long)phys, correlation.id);
+                break;
+            case DmemCallerChainState::Unknown:
+                MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx caller-chain=unknown\n",
+                     (unsigned long long)len, (unsigned long long)phys);
+                break;
+            case DmemCallerChainState::Overflow:
+                MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx caller-chain=overflow\n",
+                     (unsigned long long)len, (unsigned long long)phys);
+                break;
+            case DmemCallerChainState::Disabled:
+                break;
             }
-            seen.push_back(key);
         }
-        fprintf(stderr, "[dmem-caller] %s len=0x%llx from", what, (unsigned long long)len);
-        for (int i = 0; i < n; i++)
-            fprintf(stderr, " %s+0x%llx", guest_module_name(ra[i]),
-                    (unsigned long long)guest_module_offset(ra[i]));
-        // A clamped scan reports a SHORTER chain, not a shallower one — say which it was (#1755).
-        if (scan < kScan)
-            fprintf(stderr, " [scan clamped to %d/%d slots by stack top]", scan, kScan);
-        fprintf(stderr, "\n");
+
+        if (!correlation.first) return;
+        if (correlation.state == DmemCallerChainState::Overflow) {
+            // The cap is a state, not a population: every later MEMLOG record says `overflow`.
+            fprintf(stderr, "[dmem-caller] caller-chain=overflow: chain limit %zu reached;"
+                            " further distinct call chains are NOT retained\n",
+                    DmemCallerChainInterner<>::capacity());
+            return;
+        }
+        if (correlation.state == DmemCallerChainState::Unknown) {
+            fprintf(stderr,
+                    "[dmem-caller] caller-chain=unknown alloc_main_dmem len=0x%llx"
+                    " from <no guest return addresses>\n",
+                    (unsigned long long)len);
+            return;
+        }
+        DmemCallerChainFrame frames[kWant] = {};
+        for (int i = 0; i < n; ++i) {
+            frames[i].module = guest_module_name(ra[i]);
+            frames[i].offset = guest_module_offset(ra[i]);
+        }
+        write_dmem_caller_chain_definition(
+            stderr, correlation.id, len, frames, static_cast<size_t>(n), scan, kScan);
     }
 
     constexpr uint32_t kVirtualQueryFlexible = 0x01;
@@ -1050,8 +1079,8 @@ HLE(k_alloc_main_dmem) {
     }
     dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
     *(uint64_t*)a3 = off;
-    MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
-    log_dmem_caller("alloc_main_dmem", a0, (const volatile uint64_t*)__builtin_frame_address(0));
+    log_main_dmem_allocation(a0, off,
+                             (const volatile uint64_t*)__builtin_frame_address(0));
     return 0;
 }
 
@@ -2304,8 +2333,15 @@ namespace {
         const uintptr_t slots = (hi - base) / sizeof(uint64_t);
         return slots < (uintptr_t)want ? (int)slots : want;
     }
-    void log_dmem_caller(const char* what, uint64_t len, const volatile uint64_t* frame) {
-        if (!dmem_caller_log()) return;
+    void log_main_dmem_allocation(uint64_t len, uint64_t phys,
+                                  const volatile uint64_t* frame) {
+        // Preserve the unarmed path: no stack query, interner construction, or extra formatting unless
+        // PROSPER_DMEM_CALLER was explicitly requested. MEMLOG alone keeps its historical line byte-for-byte.
+        if (!dmem_caller_log()) {
+            MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n",
+                 (unsigned long long)len, (unsigned long long)phys);
+            return;
+        }
         constexpr int kWant = 6;          // return addresses to report
         constexpr int kScan = 160;        // stack slots to walk
         // Never read past the mapped end of this stack (#1755).
@@ -2318,35 +2354,56 @@ namespace {
             if (n && ra[n - 1] == v) continue;      // collapse an adjacent duplicate spill
             ra[n++] = v;
         }
-        // Rate-limit on the chain itself: one line per distinct (first two frames) pair.
-        static std::mutex mx;
-        static std::vector<std::pair<uint64_t, uint64_t>> seen;
-        static bool announced_cap = false;
-        const std::pair<uint64_t, uint64_t> key{ n > 0 ? ra[0] : 0, n > 1 ? ra[1] : 0 };
-        {
-            std::lock_guard<std::mutex> lk(mx);
-            for (const auto& s : seen) if (s == key) return;
-            if (seen.size() >= 64) {
-                // #1755: announce the ceiling once. A silent cap makes the log read as "64 distinct
-                // call sites exist" when it means "we stopped counting" — a limit reported as a
-                // census (instrument-trap 49).
-                if (!announced_cap) {
-                    announced_cap = true;
-                    fprintf(stderr, "[dmem-caller] chain limit 64 reached;"
-                                    " further distinct call chains are NOT shown\n");
-                }
-                return;
+        static DmemCallerChainInterner<> chains;
+        const DmemCallerChainResult correlation = chains.intern(
+            n > 0 ? ra[0] : 0, n > 1 ? ra[1] : 0);
+
+        // MEMLOG is the per-allocation census. Give every one of its allocation records a correlation
+        // token; the full stack remains one line per distinct bounded ID below.
+        if (!dmem_caller_chain_correlates_allocation(correlation)) {
+            MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n",
+                 (unsigned long long)len, (unsigned long long)phys);
+        } else {
+            switch (correlation.state) {
+            case DmemCallerChainState::Known:
+                MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx caller-chain=%u\n",
+                     (unsigned long long)len, (unsigned long long)phys, correlation.id);
+                break;
+            case DmemCallerChainState::Unknown:
+                MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx caller-chain=unknown\n",
+                     (unsigned long long)len, (unsigned long long)phys);
+                break;
+            case DmemCallerChainState::Overflow:
+                MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx caller-chain=overflow\n",
+                     (unsigned long long)len, (unsigned long long)phys);
+                break;
+            case DmemCallerChainState::Disabled:
+                break;
             }
-            seen.push_back(key);
         }
-        fprintf(stderr, "[dmem-caller] %s len=0x%llx from", what, (unsigned long long)len);
-        for (int i = 0; i < n; i++)
-            fprintf(stderr, " %s+0x%llx", guest_module_name(ra[i]),
-                    (unsigned long long)guest_module_offset(ra[i]));
-        // A clamped scan reports a SHORTER chain, not a shallower one — say which it was (#1755).
-        if (scan < kScan)
-            fprintf(stderr, " [scan clamped to %d/%d slots by stack top]", scan, kScan);
-        fprintf(stderr, "\n");
+
+        if (!correlation.first) return;
+        if (correlation.state == DmemCallerChainState::Overflow) {
+            // The cap is a state, not a population: every later MEMLOG record says `overflow`.
+            fprintf(stderr, "[dmem-caller] caller-chain=overflow: chain limit %zu reached;"
+                            " further distinct call chains are NOT retained\n",
+                    DmemCallerChainInterner<>::capacity());
+            return;
+        }
+        if (correlation.state == DmemCallerChainState::Unknown) {
+            fprintf(stderr,
+                    "[dmem-caller] caller-chain=unknown alloc_main_dmem len=0x%llx"
+                    " from <no guest return addresses>\n",
+                    (unsigned long long)len);
+            return;
+        }
+        DmemCallerChainFrame frames[kWant] = {};
+        for (int i = 0; i < n; ++i) {
+            frames[i].module = guest_module_name(ra[i]);
+            frames[i].offset = guest_module_offset(ra[i]);
+        }
+        write_dmem_caller_chain_definition(
+            stderr, correlation.id, len, frames, static_cast<size_t>(n), scan, kScan);
     }
 
     // --- VA tracker + direct-memory pool: PURE logic, copied verbatim from the Linux path -----
@@ -4549,8 +4606,8 @@ HLE(k_alloc_main_dmem) {
     }
     dmem_prepare_allocation(off, sz);
     *(uint64_t*)a3 = off;
-    MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
-    log_dmem_caller("alloc_main_dmem", a0, (const volatile uint64_t*)__builtin_frame_address(0));
+    log_main_dmem_allocation(a0, off,
+                             (const volatile uint64_t*)__builtin_frame_address(0));
     return 0;
 }
 
