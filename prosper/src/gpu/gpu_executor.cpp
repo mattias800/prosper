@@ -4839,6 +4839,7 @@ struct OrderedGpustateCaptureTrace {
     std::vector<DrawItem> draws;
     std::vector<ComputeItem> computes;
     std::vector<OperationRealizationFailure> failures;
+    PendingGpuCapture* pending_capture = nullptr;
 };
 
 static OrderedSubmitResult execute_ordered_gpustate(
@@ -4874,6 +4875,7 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     snapshot_pending_gpu_capture_compute_gds(
         pending_capture.get(), g_compute_gds.data(), g_compute_gds.size());
     OrderedGpustateCaptureTrace capture_trace;
+    capture_trace.pending_capture = pending_capture.get();
     const OrderedSubmitResult result = execute_ordered_gpustate(
         st, 0, 0, submit_no, {}, g_compute,
         pending_capture && can_defer_capture ? &capture_trace : nullptr);
@@ -5976,7 +5978,11 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     failure_known = capture_trace != nullptr;
                 }
                 if (realized) {
-                    if (capture_trace) capture_trace->draws.push_back(item);
+                    if (capture_trace) {
+                        snapshot_pending_gpu_capture_draw_resource(
+                            capture_trace->pending_capture, item);
+                        capture_trace->draws.push_back(item);
+                    }
                     span.push_back(std::move(item));
                 } else if (capture_trace) {
                     // The reason used to die here: this path simply broke, and gpu_capture later
@@ -6344,6 +6350,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     snapshot_pending_gpu_capture_compute_gds(
         pending_capture.get(), g_compute_gds.data(), g_compute_gds.size());
     OrderedGpustateCaptureTrace capture_trace;
+    capture_trace.pending_capture = pending_capture.get();
     OrderedSubmitResult result = needs_ordered_realization
         ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute,
                                    pending_capture ? &capture_trace : nullptr,

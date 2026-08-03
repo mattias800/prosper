@@ -521,6 +521,35 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
 }
 
 void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_version) {
+    for (const auto& provenance : replay.resource_provenance) {
+        const auto& realization = replay.blobs[provenance.realization_blob_index];
+        const auto& post = replay.blobs[provenance.post_blob_index];
+        const uint64_t realization_read = std::min<uint64_t>(
+            provenance.requested_bytes, realization.bytes_read);
+        const uint64_t post_read = post.bytes_read > provenance.post_blob_offset
+            ? std::min<uint64_t>(provenance.requested_bytes,
+                                 post.bytes_read - provenance.post_blob_offset)
+            : 0;
+        const char* verdict = realization_read != provenance.requested_bytes ||
+                              post_read != provenance.requested_bytes
+            ? "short-read"
+            : provenance.realization_content_hash == provenance.post_content_hash
+                ? "full-equal" : "full-changed";
+        std::printf(
+            "resource-provenance draw=%llu stage=%s binding=%u class=%s addr=%016llx "
+            "bytes=%llu realization-read=%llu hash=%016llx post-read=%llu hash=%016llx "
+            "srt=%08x sgpr=%08x verdict=%s\n",
+            static_cast<unsigned long long>(provenance.draw_index),
+            provenance.stage == prosper::gpu::ShaderProgramStage::Vertex ? "vs" : "ps",
+            provenance.binding, class_name(provenance.resource_class),
+            static_cast<unsigned long long>(provenance.guest_addr),
+            static_cast<unsigned long long>(provenance.requested_bytes),
+            static_cast<unsigned long long>(realization_read),
+            static_cast<unsigned long long>(provenance.realization_content_hash),
+            static_cast<unsigned long long>(post_read),
+            static_cast<unsigned long long>(provenance.post_content_hash),
+            provenance.srt_offset, provenance.sgpr_base, verdict);
+    }
     for (const auto& seed : replay.rtt_seeds) {
         const uint64_t hash = prosper::gpu::gpu_capture_hash(seed.rgba);
         const char* format = seed.format == prosper::gpu::GpuCaptureColorFormat::Rgba16Float

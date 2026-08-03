@@ -12,9 +12,11 @@
 #include "render_runner.h"
 #include "test_scratch.h"
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -40,6 +42,14 @@ alignas(256) static const uint32_t kVs[] = {
 alignas(256) static const uint32_t kPs[] = {
     0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
 };
+// Byte-identical shader at a distinct program address. The test renderer registers kPs with a
+// descriptor-free header during setup, and the production registry intentionally resolves the
+// oldest header for a recycled address. A distinct identity lets the provenance integration test
+// exercise its one-cbuffer declaration instead of accidentally reusing that earlier header.
+alignas(256) static uint32_t kResourcePs[] = {
+    0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
+};
+alignas(256) static uint32_t kResourceNoopCs[] = {0xBF810000u};
 // Descriptor-free clear-RG helper emitted by AGC for CB_COLOR_CONTROL.DCC_DECOMPRESS. Hardware
 // interprets its export as a metadata operation; it must not run as an ordinary Vulkan color shader.
 alignas(256) static const uint32_t kDccPs[] = {
@@ -51,6 +61,14 @@ static void set_pgm(GpuState& st, uint32_t lo_off, uint32_t hi_off, const void* 
     uint64_t a = (uint64_t)(uintptr_t)p;
     st.sh[lo_off] = (uint32_t)((a >> 8) & 0xFFFFFFFFu);
     st.sh[hi_off] = (uint32_t)((a >> 40) & 0xFFu);
+}
+
+static void set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
 }
 
 int main() {
@@ -1236,6 +1254,154 @@ int main() {
               "#1636: the new reasons have names, so gpu_replay --inspect-only can print them");
         std::error_code cleanup;
         std::filesystem::remove(capture_path, cleanup);
+    }
+
+    // #1849: a submit with direct draws plus compute prepares its draws eagerly, but executes them
+    // through the ordered path. The selected temporal resource must be sampled exactly once at that
+    // ordered draw position—not during eager preparation and not after the renderer mutates it.
+    // Keeping this registration last lets these stack-backed synthetic AGC headers remain valid for
+    // the process-lifetime registry through every subsequent lookup.
+    {
+        auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+        ShaderReg pixel_registers[2] = {
+            {P::SPI_SHADER_PGM_LO_PS, 0}, {P::SPI_SHADER_PGM_HI_PS, 0},
+        };
+        AgcShaderSharp cbuffer_sharp[1];
+        cbuffer_sharp[0].bits = 0;  // one four-dword V# at PS user SGPR 0
+        AgcShaderUserData pixel_user_data{};
+        pixel_user_data.sharp_resource_offset[3] = cbuffer_sharp;
+        pixel_user_data.sharp_resource_count[3] = 1;
+        AgcShaderHeader pixel_header{};
+        pixel_header.file_header = 0x34333231u;
+        pixel_header.version = 0x18;
+        pixel_header.user_data = &pixel_user_data;
+        pixel_header.sh_registers = pixel_registers;
+        pixel_header.shader_size = sizeof(kResourcePs);
+        pixel_header.type = 1;
+        pixel_header.num_sh_registers = 2;
+
+        ShaderReg compute_registers[2] = {
+            {P::COMPUTE_PGM_LO, 0}, {P::COMPUTE_PGM_HI, 0},
+        };
+        AgcShaderHeader compute_header{};
+        compute_header.file_header = 0x34333231u;
+        compute_header.version = 0x18;
+        compute_header.sh_registers = compute_registers;
+        compute_header.shader_size = sizeof(kResourceNoopCs);
+        compute_header.type = 0;
+        compute_header.num_sh_registers = 2;
+
+        void* registered_pixel = nullptr;
+        void* registered_compute = nullptr;
+        CHECK(create_shader &&
+                  create_shader(reinterpret_cast<uint64_t>(&registered_pixel),
+                                reinterpret_cast<uint64_t>(&pixel_header),
+                                reinterpret_cast<uint64_t>(kResourcePs), 0, 0, 0) == 0 &&
+                  registered_pixel == &pixel_header &&
+                  create_shader(reinterpret_cast<uint64_t>(&registered_compute),
+                                reinterpret_cast<uint64_t>(&compute_header),
+                                reinterpret_cast<uint64_t>(kResourceNoopCs), 0, 0, 0) == 0 &&
+                  registered_compute == &compute_header,
+              "register draw and compute programs for ordered temporal capture");
+
+        std::array<uint8_t, 16> cbuffer{};
+        for (size_t i = 0; i < cbuffer.size(); ++i)
+            cbuffer[i] = static_cast<uint8_t>(0x20 + i);
+        const auto realization_bytes = cbuffer;
+        std::array<uint8_t, 16> post_bytes{};
+        for (size_t i = 0; i < post_bytes.size(); ++i)
+            post_bytes[i] = static_cast<uint8_t>(0xb0 + i);
+
+        GpuState ordered = st;
+        ordered.draws.clear();
+        ordered.dispatches.clear();
+        ordered.dma_copies.clear();
+        ordered.ordered_memory_effects.clear();
+        ordered.sh[P::SPI_SHADER_PGM_LO_PS] = pixel_registers[0].value;
+        ordered.sh[P::SPI_SHADER_PGM_HI_PS] = pixel_registers[1].value;
+        const uint64_t cbuffer_addr = reinterpret_cast<uint64_t>(cbuffer.data());
+        ordered.sh[P::SPI_SHADER_USER_DATA_PS_0 + 0] =
+            static_cast<uint32_t>(cbuffer_addr);
+        ordered.sh[P::SPI_SHADER_USER_DATA_PS_0 + 1] =
+            static_cast<uint32_t>((cbuffer_addr >> 32) & 0xffffu);
+        ordered.sh[P::SPI_SHADER_USER_DATA_PS_0 + 2] =
+            static_cast<uint32_t>(cbuffer.size());
+        ordered.sh[P::SPI_SHADER_USER_DATA_PS_0 + 3] = (22u << 12) | 0xFACu;
+        GpuState::Draw draw;
+        draw.index_count = 3;
+        draw.command_order = 100;
+        ordered.draws.push_back(draw);
+        auto dispatch_state = std::make_shared<GpuState>();
+        dispatch_state->sh[P::COMPUTE_PGM_LO] = compute_registers[0].value;
+        dispatch_state->sh[P::COMPUTE_PGM_HI] = compute_registers[1].value;
+        GpuState::Dispatch dispatch;
+        dispatch.threads_x = dispatch.threads_y = dispatch.threads_z = 1;
+        dispatch.command_order = 200;
+        dispatch.state = dispatch_state;
+        ordered.dispatches.push_back(dispatch);
+
+        const auto capture_path = prosper_test::test_scratch_dir() /
+            "prosper_ordered_resource_provenance.prgcap";
+        std::error_code filesystem_error;
+        std::filesystem::remove(capture_path, filesystem_error);
+        const char* original_selector_value =
+            std::getenv(kGpuCaptureResourceProvenanceEnv);
+        const bool had_original_selector = original_selector_value != nullptr;
+        const std::string original_selector =
+            original_selector_value ? original_selector_value : "";
+        set_test_env(kGpuCaptureResourceProvenanceEnv, "0:ps:32");
+        request_interactive_gpu_capture(capture_path.string());
+        bool renderer_saw_resource = false;
+        bool compute_executed = false;
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            renderer_saw_resource = !items.empty() && items.front().prt &&
+                items.front().prt->by_binding(32) != nullptr;
+            cbuffer = post_bytes;
+            return RenderedFrame{};
+        });
+        set_submit_compute([&](const std::vector<ComputeItem>& items) {
+            compute_executed = !items.empty();
+            return compute_executed;
+        });
+        execute_ordered_and_present(ordered, W, H, 781, /*publish=*/false);
+        set_submit_renderer({});
+        set_submit_compute({});
+        set_test_env(kGpuCaptureResourceProvenanceEnv,
+                     had_original_selector ? original_selector.c_str() : nullptr);
+
+        GpuCaptureFile captured;
+        std::string capture_error;
+        const bool read = read_gpu_capture(capture_path.string(), captured, capture_error);
+        const auto* provenance = read && captured.resource_provenance.size() == 1
+            ? &captured.resource_provenance.front() : nullptr;
+        const auto* realization_blob = provenance &&
+                provenance->realization_blob_index < captured.blobs.size()
+            ? &captured.blobs[provenance->realization_blob_index] : nullptr;
+        const auto* post_blob = provenance &&
+                provenance->post_blob_index < captured.blobs.size()
+            ? &captured.blobs[provenance->post_blob_index] : nullptr;
+        const bool exact_temporal_samples = provenance && realization_blob && post_blob &&
+            provenance->draw_index == 0 &&
+            provenance->stage == ShaderProgramStage::Fragment &&
+            provenance->binding == 32 &&
+            provenance->resource_class == ResourceClass::ConstantBuffer &&
+            provenance->guest_addr == cbuffer_addr &&
+            provenance->requested_bytes == cbuffer.size() &&
+            realization_blob->bytes_read == cbuffer.size() &&
+            post_blob->bytes_read >= provenance->post_blob_offset + cbuffer.size() &&
+            std::equal(realization_bytes.begin(), realization_bytes.end(),
+                       realization_blob->bytes.begin()) &&
+            std::equal(post_bytes.begin(), post_bytes.end(),
+                       post_blob->bytes.begin() + provenance->post_blob_offset);
+        if (!renderer_saw_resource || !compute_executed || !exact_temporal_samples)
+            std::printf("  [diag] ordered resource provenance: renderer=%d compute=%d read=%d "
+                        "error=%s records=%zu\n",
+                        renderer_saw_resource ? 1 : 0, compute_executed ? 1 : 0,
+                        read ? 1 : 0, capture_error.c_str(),
+                        captured.resource_provenance.size());
+        CHECK(renderer_saw_resource && compute_executed && exact_temporal_samples,
+              "eager draw snapshots its selected resource once at ordered execution before mutation");
+        std::filesystem::remove(capture_path, filesystem_error);
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
