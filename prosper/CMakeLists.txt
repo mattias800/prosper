@@ -95,6 +95,12 @@ add_executable(test_compute_timing_selector tests/test_compute_timing_selector.c
 target_include_directories(test_compute_timing_selector PRIVATE frontends/shared)
 add_test(NAME compute_timing_selector_policy COMMAND test_compute_timing_selector)
 
+# Pure fail-closed policy for a behavior-neutral census of hypothetical deferred compute results.
+# It has no Vulkan dependency and does not change the live backend's synchronous writeback.
+add_executable(test_compute_authority_census tests/test_compute_authority_census.cpp)
+target_include_directories(test_compute_authority_census PRIVATE frontends/shared)
+add_test(NAME compute_authority_census_policy COMMAND test_compute_authority_census)
+
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
   add_test(NAME re_xref_decoder
