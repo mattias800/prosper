@@ -252,6 +252,11 @@ void guest_dmem_write_trace_notify_allocation(uint64_t phys, uint64_t size, uint
 using GuestDmemWriteTraceContentionHookForTest = void (*)();
 void guest_dmem_write_trace_set_contention_hook_for_test(
     GuestDmemWriteTraceContentionHookForTest hook);
+// Fires on entry to the normal-context protection helper that builds a dynamic rollback vector. A
+// SIGSEGV invalidation must use its allocation-free precomputed-alias path and never invoke this hook.
+using GuestDmemWriteTraceDynamicProtectionHookForTest = void (*)();
+void guest_dmem_write_trace_set_dynamic_protection_hook_for_test(
+    GuestDmemWriteTraceDynamicProtectionHookForTest hook);
 void guest_dmem_write_trace_lock_state_for_test();
 void guest_dmem_write_trace_unlock_state_for_test();
 

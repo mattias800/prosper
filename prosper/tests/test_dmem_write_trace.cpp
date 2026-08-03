@@ -45,6 +45,7 @@ std::atomic<bool> preowned_tf_active{false};
 std::atomic<bool> preowned_tf_started{false};
 std::atomic<uint32_t> preowned_tf_completed{0};
 std::atomic<bool> legacy_bool_fault_active{false};
+std::atomic<uint32_t> dynamic_protection_helper_entries{0};
 std::atomic<int> last_step_action{-1};
 std::atomic<uint32_t> trap_count{0};
 volatile sig_atomic_t post_store_marker = 0;
@@ -60,6 +61,10 @@ void unrelated_contention_hook() {
     // Let a mutant that enters the lock path terminate deterministically instead of exhausting the
     // full retry bound. The named assertion below still proves that production never invoked us.
     release_unrelated_lock.store(true, std::memory_order_release);
+}
+
+void dynamic_protection_hook() {
+    dynamic_protection_helper_entries.fetch_add(1, std::memory_order_relaxed);
 }
 
 void trace_signal_handler(int sig, siginfo_t* info, void* raw_context) {
@@ -564,7 +569,11 @@ int main() {
     preowned_tf_started.store(false, std::memory_order_release);
     preowned_tf_completed.store(0, std::memory_order_release);
     preowned_tf_active.store(true, std::memory_order_release);
+    dynamic_protection_helper_entries.store(0, std::memory_order_release);
+    prosper::host::guest_dmem_write_trace_set_dynamic_protection_hook_for_test(
+        &dynamic_protection_hook);
     breakpoint_then_store_byte(mapping + offset + 6, 0xb6, &preowned_marker);
+    prosper::host::guest_dmem_write_trace_set_dynamic_protection_hook_for_test(nullptr);
     preowned_tf_active.store(false, std::memory_order_release);
     const auto preowned = prosper::host::guest_dmem_write_trace_snapshot();
     CHECK(preowned_tf_started.load(std::memory_order_acquire) &&
@@ -576,6 +585,8 @@ int main() {
               preowned.event_count == 0 && preowned.selected_faults == 0 &&
               preowned.page_faults == 1 && preowned.coverage_gaps == 1,
           "pre-existing TF owner receives its completion and is never stolen or stranded");
+    CHECK(dynamic_protection_helper_entries.load(std::memory_order_acquire) == 0,
+          "pre-owned TF signal invalidation bypasses the dynamic protection helper");
 
     // Strict-unique mode may observe a selected event from occurrence 1 before occurrence 2 arrives.
     // Retain that history, but the terminal result must become undetermined for the ambiguous family.
@@ -664,7 +675,11 @@ int main() {
           "production watch overlaps the legacy bool trace control");
     volatile sig_atomic_t legacy_bool_marker = 0;
     legacy_bool_fault_active.store(true, std::memory_order_release);
+    dynamic_protection_helper_entries.store(0, std::memory_order_release);
+    prosper::host::guest_dmem_write_trace_set_dynamic_protection_hook_for_test(
+        &dynamic_protection_hook);
     store_byte_then_mark(mapping + offset + 8, 0xd8, &legacy_bool_marker);
+    prosper::host::guest_dmem_write_trace_set_dynamic_protection_hook_for_test(nullptr);
     legacy_bool_fault_active.store(false, std::memory_order_release);
     const auto legacy_bool = prosper::host::guest_dmem_write_trace_snapshot();
     prosper::host::GuestDmemWriteTraceEvent legacy_mutant_cleanup_event{};
@@ -681,6 +696,8 @@ int main() {
               legacy_mutant_cleanup ==
                   prosper::host::GuestDmemWriteTraceStepAction::NotHandled,
           "legacy bool fault path completes the store without stranding a zero-TID trace step");
+    CHECK(dynamic_protection_helper_entries.load(std::memory_order_acquire) == 0,
+          "legacy bool signal invalidation bypasses the dynamic protection helper");
     legacy_production_watch.reset();
 
     CHECK(prosper::host::guest_dmem_write_trace_configure(config),

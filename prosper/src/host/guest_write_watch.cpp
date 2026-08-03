@@ -508,6 +508,8 @@ void guest_dmem_write_trace_report() {}
 void guest_dmem_write_trace_notify_allocation(uint64_t, uint64_t, uint32_t) {}
 void guest_dmem_write_trace_set_contention_hook_for_test(
         GuestDmemWriteTraceContentionHookForTest) {}
+void guest_dmem_write_trace_set_dynamic_protection_hook_for_test(
+        GuestDmemWriteTraceDynamicProtectionHookForTest) {}
 void guest_dmem_write_trace_lock_state_for_test() {}
 void guest_dmem_write_trace_unlock_state_for_test() {}
 
@@ -615,6 +617,8 @@ static_assert(std::atomic<int64_t>::is_always_lock_free,
               "the signal-path pending-step discriminator must be lock-free");
 WatchState& state() { static WatchState* value = new WatchState; return *value; }
 std::atomic<GuestDmemWriteTraceContentionHookForTest> trace_contention_hook_for_test{nullptr};
+std::atomic<GuestDmemWriteTraceDynamicProtectionHookForTest>
+    trace_dynamic_protection_hook_for_test{nullptr};
 
 struct AtomicStats {
     std::atomic<uint64_t> create_attempts{0}, registrations{0}, registered_pages{0},
@@ -867,6 +871,7 @@ bool trace_page_production_armed(const WatchState& w, uint64_t phys) {
 // force_writable=true only after it has marked that production page Dirty/disarmed.
 bool set_trace_armed_locked(WatchState& w, bool armed, bool force_writable) {
     DmemTraceState& trace = w.trace;
+    if (auto hook = trace_dynamic_protection_hook_for_test.load(std::memory_order_acquire)) hook();
     struct Changed { PageAlias alias; int from = 0; };
     std::vector<Changed> changed;
     for (const DmemTracePage& page : trace.pages) {
@@ -916,6 +921,40 @@ void trace_invalidate_locked(WatchState& w, GuestDmemWriteTraceInvalidReason rea
     trace.stepping_tid = 0;
     trace.status = GuestDmemWriteTraceStatus::Invalid;
     trace.invalid_reason = reason;
+}
+
+// SIGSEGV-only invalidation. `trace.pages` and each alias vector were completed before arming; walk
+// them in place and keep trying after an mprotect failure so no dynamic rollback storage is needed.
+// The first invalid reason remains authoritative. One coverage gap records abandoning the watch, and
+// a second makes a partial open fail-visible. False means the faulting VA itself was not restored and
+// the signal caller must not claim that retrying the instruction is safe.
+bool trace_invalidate_from_signal_locked(WatchState& w,
+                                         GuestDmemWriteTraceInvalidReason reason,
+                                         uint64_t fault_page) {
+    DmemTraceState& trace = w.trace;
+    bool all_restored = true;
+    bool faulting_alias_restored = false;
+    for (const DmemTracePage& page : trace.pages) {
+        for (const PageAlias& alias : page.aliases) {
+            if (!cpu_writable(alias.prot)) continue;
+            const bool restored = mprotect(
+                reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)), kPage,
+                host_prot(alias.prot)) == 0;
+            if (!restored) all_restored = false;
+            if ((alias.addr & ~(kPage - 1)) == fault_page && restored)
+                faulting_alias_restored = true;
+        }
+    }
+    w.pending_trace_step_tid.store(0, std::memory_order_release);
+    trace.armed = false;
+    trace.step_invalidated = false;
+    trace.stepping_tid = 0;
+    trace.status = GuestDmemWriteTraceStatus::Invalid;
+    if (trace.invalid_reason == GuestDmemWriteTraceInvalidReason::None)
+        trace.invalid_reason = reason;
+    ++trace.coverage_gaps;
+    if (!all_restored) ++trace.coverage_gaps;
+    return faulting_alias_restored;
 }
 
 bool trace_copy_target_locked(const DmemTraceState& trace,
@@ -1724,10 +1763,11 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
     if (!production_page && !trace_page) return GuestWriteWatchFaultAction::NotHandled;
 
     bool production_handled = false;
+    bool production_faulting_alias_restored = false;
     auto disarm_production_page = [&](WatchedPage* page) {
         if (!page || !page->armed) return;
         bool restored = true;
-        bool faulting_alias_restored = page != production_page;
+        bool page_faulting_alias_restored = page != production_page;
         for (const PageAlias& alias : page->aliases) {
             if (!cpu_writable(alias.prot)) continue;
             const bool ok = mprotect(
@@ -1736,13 +1776,15 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
             if (!ok)
                 restored = false;
             if ((alias.addr & ~(kPage - 1)) == fault_page && ok)
-                faulting_alias_restored = true;
+                page_faulting_alias_restored = true;
         }
         page->generation++;
         // Preserve #1144's stale-alias contract: a failure on a non-faulting alias must not leave the
         // successfully restored faulting VA logically armed. For diagnostic-only sibling pages there
         // is no faulting VA, so require the complete restore instead.
-        if (page == production_page ? faulting_alias_restored : restored) page->armed = false;
+        if (page == production_page ? page_faulting_alias_restored : restored) page->armed = false;
+        if (page == production_page && page_faulting_alias_restored)
+            production_faulting_alias_restored = true;
         production_handled = true;
     };
 
@@ -1784,9 +1826,11 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
         }
         if (production_handled) bump(stats().faults);
         ++w.trace.page_faults;
-        ++w.trace.coverage_gaps;
-        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::SingleStepUnavailable, true);
-        return GuestWriteWatchFaultAction::Resume;
+        const bool trace_faulting_alias_restored = trace_invalidate_from_signal_locked(
+            w, GuestDmemWriteTraceInvalidReason::SingleStepUnavailable, fault_page);
+        return trace_faulting_alias_restored || production_faulting_alias_restored
+                   ? GuestWriteWatchFaultAction::Resume
+                   : GuestWriteWatchFaultAction::NotHandled;
     }
 
     if (trace_page && trap_flag_already_owned) {
@@ -1800,9 +1844,11 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
         }
         if (production_handled) bump(stats().faults);
         ++w.trace.page_faults;
-        ++w.trace.coverage_gaps;
-        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::TrapFlagAlreadyOwned, true);
-        return GuestWriteWatchFaultAction::Resume;
+        const bool trace_faulting_alias_restored = trace_invalidate_from_signal_locked(
+            w, GuestDmemWriteTraceInvalidReason::TrapFlagAlreadyOwned, fault_page);
+        return trace_faulting_alias_restored || production_faulting_alias_restored
+                   ? GuestWriteWatchFaultAction::Resume
+                   : GuestWriteWatchFaultAction::NotHandled;
     }
 
     if (!trace_page) {
@@ -1867,9 +1913,11 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
     }
     pending.coverage_valid_before = w.trace.coverage_gaps == 0;
     if (!trace_copy_target_locked(w.trace, pending.before)) {
-        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::MappingTopologyChanged, true);
-        return production_handled ? GuestWriteWatchFaultAction::Resume
-                                  : GuestWriteWatchFaultAction::NotHandled;
+        const bool trace_faulting_alias_restored = trace_invalidate_from_signal_locked(
+            w, GuestDmemWriteTraceInvalidReason::MappingTopologyChanged, fault_page);
+        return trace_faulting_alias_restored || production_faulting_alias_restored
+                   ? GuestWriteWatchFaultAction::Resume
+                   : GuestWriteWatchFaultAction::NotHandled;
     }
 
     bool faulting_alias_restored = false;
@@ -2015,6 +2063,10 @@ GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
 void guest_dmem_write_trace_set_contention_hook_for_test(
         GuestDmemWriteTraceContentionHookForTest hook) {
     trace_contention_hook_for_test.store(hook, std::memory_order_release);
+}
+void guest_dmem_write_trace_set_dynamic_protection_hook_for_test(
+        GuestDmemWriteTraceDynamicProtectionHookForTest hook) {
+    trace_dynamic_protection_hook_for_test.store(hook, std::memory_order_release);
 }
 
 void guest_dmem_write_trace_lock_state_for_test() { state().mutex.lock(); }

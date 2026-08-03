@@ -273,6 +273,17 @@ selection at `P+4` now remains selection-uncertain rather than becoming a false 
 canaries have defect-shaped mutations that fail only their named checks. These remain reusable
 instrument corrections; no new Asterix live run or writer conclusion was produced.
 
+A fourth exact-head review found that three fail-visible SIGSEGV exits still reached the
+normal-context protection helper. Although trace pages and aliases were precomputed, that helper built
+a dynamic rollback vector, making bool-capability, pre-owned-TF, and target-copy-failure invalidation
+unsafe if the signal interrupted allocator internals. Signal invalidation now walks only the existing
+page/alias storage, attempts every alias without rollback allocation, preserves the first invalid
+reason, records partial opening as an additional coverage gap, and resumes only when the faulting alias
+was actually restored by the trace or overlapping production path. A deterministic hook proves both
+real bool and pre-owned-TF signal controls never enter the allocating helper; a common-path mutation
+makes exactly those two named checks fail. This is an apparatus correction only, with no new Asterix
+live run or writer conclusion.
+
 The first exact live arm at commit `d181953e` was **VOID, by a useful self-invalidating result**. It
 completed 220 presents and captured submit 181 with the same exact positive control: 8 draws, 6 computes,
 14 operations, zero failures, and draw 0 PS binding 32 at `0x20122d32f0`, with 128/128 bytes at both
