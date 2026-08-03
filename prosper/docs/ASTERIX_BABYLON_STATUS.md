@@ -215,15 +215,19 @@ self-validating reproduction.
   4→10, and 10→11, closing that source through four color0-to-color1 copies in the same submit. The
   bounded prefix replay subsequently found the first graphics producer already black; it did not
   reveal a useful-color-to-black boundary or justify a renderer change.
+- **The op6 fixed-function resolve turns a nonblack op4 producer black:** #1825's exact post-operation
+  selector read raw color1 destination `0x2011800000` immediately after op6 as 1920x1080 R11G11B10,
+  hash `792bed5a3f02a383`; an independent pixel census found one opaque color with RGB mean/min/max zero.
+  That matches the earlier exact op4 color0 cutoff (the same hash and pixel census), so this capture
+  contains no nonblack-to-black resolve transition. This is localization evidence only; rung remains 0.
 - **A renderer-disabled title boot as a GPU-free experiment:** live compute remains active without
   `PROSPER_RENDER` and initializes Vulkan when the title dispatches supported compute.
 
 ## Next discriminators
 
-1. Add a generic replay selector that snapshots an exact target address after an exact operation.
-   Use it on `0x2011800000` after operations 6 and 10, and print both selectors beside the output so
-   the experiment proves its own lever moved. Prefix output cannot answer this because it selects
-   color0 for a fixed resolve. This is a tool gap; no new title boot is needed.
+1. If this retained chain is pursued further, use #1825's exact selector on `0x2011800000` after op10.
+   Op6's raw color1 destination is now proven uniformly black; ordinary prefix output still cannot
+   answer op10 because it selects color0 for a fixed resolve. No new title boot is needed.
 2. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
    dispatch ran and reproduces its device loss; two failures in six runs are not a stable cause.
 3. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.

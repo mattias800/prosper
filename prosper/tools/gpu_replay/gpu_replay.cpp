@@ -5,6 +5,7 @@
 #include "gpu/gpu_execute.hpp"
 #include "gpu/shader_resources.hpp"
 #include "live_renderer.hpp"
+#include "live_target_format.hpp"
 #include "replay_output_extent.hpp"
 #include "compute_recompile.hpp"
 #include "realized_shader_dump.hpp"
@@ -50,6 +51,7 @@ void usage(const char* argv0) {
     std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate|--graph] "
                          "[--graph-json PATH] [--draw N[:M]] [--draw-with-compute-prefix] "
                          "[--through-operation N] [--compute-only N] [--warmup-repeats N] "
+                         "[--output-target-after OP:ADDR] "
                          "[--bundle capture.prgbundle] [--bundle-tail N] "
                          "[--bundle-through-submit N] [--bundle-compact PATH] "
                          "[--bundle-intermediate-through-target WxH] "
@@ -158,6 +160,131 @@ std::vector<uint8_t> inspect_live_target(const prosper::gpu::LiveTargetSnapshot&
             break;
     }
     return inspect_rtt_seed(seed);
+}
+
+bool plan_exact_output_target(
+    const prosper::gpu::GpuReplayFrame& replay, size_t operation_index, uint64_t guest_addr,
+    prosper::gpu::replay_tool::OutputTargetAfterOperation& target,
+    uint64_t bundle_submit = UINT64_MAX) {
+    const auto selected = prosper::gpu::replay_tool::replay_output_target_after_operation(
+        replay, operation_index, guest_addr);
+    using Status = prosper::gpu::replay_tool::OutputTargetAfterStatus;
+    if (selected.status != Status::Selected) {
+        switch (selected.status) {
+            case Status::InvalidOperation:
+                std::fprintf(stderr, "gpu_replay: output-target operation %zu is out of range\n",
+                             operation_index);
+                break;
+            case Status::NonDrawOperation:
+                std::fprintf(stderr,
+                             "gpu_replay: output-target operation %zu is %s, not a draw\n",
+                             operation_index,
+                             operation_kind_name(replay.operations[operation_index].kind));
+                break;
+            case Status::UnrealizedOperation:
+                std::fprintf(stderr,
+                             "gpu_replay: output-target operation %zu is an unrealized draw\n",
+                             operation_index);
+                break;
+            case Status::DrawUnavailable:
+                std::fprintf(stderr,
+                             "gpu_replay: output-target operation %zu names unavailable "
+                             "realized draw=%llu\n",
+                             operation_index,
+                             static_cast<unsigned long long>(
+                                 replay.operations[operation_index].source_index));
+                break;
+            case Status::NotWrittenByOperation:
+                std::fprintf(stderr,
+                             "gpu_replay: output-target operation %zu draw=%llu does not "
+                             "write addr=%016llx\n",
+                             operation_index,
+                             static_cast<unsigned long long>(
+                                 replay.operations[operation_index].source_index),
+                             static_cast<unsigned long long>(guest_addr));
+                break;
+            case Status::TargetIdentityUnavailable:
+                std::fprintf(stderr,
+                             "gpu_replay: output-target operation %zu writes addr=%016llx "
+                             "but its exact extent/format identity is unavailable\n",
+                             operation_index, static_cast<unsigned long long>(guest_addr));
+                break;
+            case Status::Selected:
+                break;
+        }
+        return false;
+    }
+    target = selected.target;
+    char submit_tag[64] = {};
+    if (bundle_submit != UINT64_MAX)
+        std::snprintf(submit_tag, sizeof submit_tag, " submit=%llu",
+                      static_cast<unsigned long long>(bundle_submit));
+    std::fprintf(stderr,
+                 "[gpureplay] armed exact output%s op=%zu draw=%llu slot=%u addr=%016llx "
+                 "extent=%ux%u format=%u resolve=%s\n",
+                 submit_tag, target.operation_index,
+                 static_cast<unsigned long long>(target.draw_index),
+                 target.slot, static_cast<unsigned long long>(target.guest_addr), target.width,
+                 target.height, target.format, target.fixed_function_resolve ? "yes" : "no");
+    return true;
+}
+
+bool read_exact_output_target(
+    const prosper::gpu::replay_tool::OutputTargetAfterOperation& target,
+    std::vector<uint8_t>& pixels, uint64_t bundle_submit = UINT64_MAX) {
+    prosper::gpu::LiveTargetSnapshot snapshot;
+    const VkFormat requested_raw_format = static_cast<VkFormat>(target.format);
+    const VkFormat requested_backend_format =
+        prosper::test::backend_color_format(requested_raw_format);
+    if (!prosper::gpu::read_live_render_target(target.guest_addr, snapshot)) {
+        std::fprintf(stderr,
+                     "gpu_replay: exact output readback unavailable op=%zu draw=%llu slot=%u "
+                     "addr=%016llx extent=%ux%u format=%u/%u\n",
+                     target.operation_index, static_cast<unsigned long long>(target.draw_index),
+                     target.slot, static_cast<unsigned long long>(target.guest_addr), target.width,
+                     target.height, target.format,
+                     static_cast<unsigned>(requested_backend_format));
+        return false;
+    }
+    const VkFormat readback_format =
+        prosper::frontend::live_target_pixel_format_vk(snapshot.format);
+    if (snapshot.width != target.width || snapshot.height != target.height ||
+        readback_format != requested_backend_format) {
+        std::fprintf(stderr,
+                     "gpu_replay: exact output readback identity mismatch op=%zu draw=%llu "
+                     "slot=%u addr=%016llx requested=%ux%u/%u/%u actual=%ux%u/%u\n",
+                     target.operation_index, static_cast<unsigned long long>(target.draw_index),
+                     target.slot, static_cast<unsigned long long>(target.guest_addr), target.width,
+                     target.height, target.format,
+                     static_cast<unsigned>(requested_backend_format), snapshot.width,
+                     snapshot.height, static_cast<unsigned>(readback_format));
+        return false;
+    }
+    pixels = inspect_live_target(snapshot);
+    const uint64_t expected_bytes =
+        static_cast<uint64_t>(target.width) * target.height * 4u;
+    if (expected_bytes > SIZE_MAX || pixels.size() != static_cast<size_t>(expected_bytes)) {
+        std::fprintf(stderr,
+                     "gpu_replay: exact output conversion unavailable op=%zu addr=%016llx "
+                     "expected=%llu actual=%zu\n",
+                     target.operation_index, static_cast<unsigned long long>(target.guest_addr),
+                     static_cast<unsigned long long>(expected_bytes), pixels.size());
+        return false;
+    }
+    char submit_tag[64] = {};
+    if (bundle_submit != UINT64_MAX)
+        std::snprintf(submit_tag, sizeof submit_tag, " submit=%llu",
+                      static_cast<unsigned long long>(bundle_submit));
+    std::fprintf(stderr,
+                 "[gpureplay] exact output%s op=%zu draw=%llu slot=%u addr=%016llx "
+                 "extent=%ux%u format=%u/%u bytes=%zu hash=%016llx\n",
+                 submit_tag, target.operation_index,
+                 static_cast<unsigned long long>(target.draw_index),
+                 target.slot, static_cast<unsigned long long>(target.guest_addr), target.width,
+                 target.height, target.format, static_cast<unsigned>(requested_backend_format),
+                 pixels.size(),
+                 static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(pixels)));
+    return true;
 }
 
 struct PostComputeDumpRequest {
@@ -1017,6 +1144,7 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                   const std::string& compact_path,
                   uint32_t intermediate_target_width, uint32_t intermediate_target_height,
                   uint32_t output_target_width, uint32_t output_target_height,
+                  size_t output_target_after_operation, uint64_t output_target_after_addr,
                   const std::string& final_capsule_path,
                   uint64_t extract_submit_no, const std::string& extract_submit_path,
                   uint64_t find_ds_addr, bool ds_summary) {
@@ -1154,6 +1282,29 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     const bool expected_output_valid = final_capture.expected_output_valid;
     const uint64_t expected_output_bytes = final_capture.expected_output_bytes;
     const uint64_t expected_output_hash = final_capture.expected_output_hash;
+    prosper::gpu::replay_tool::OutputTargetAfterOperation exact_bundle_output_target;
+    if (output_target_after_operation != SIZE_MAX) {
+        prosper::gpu::GpuReplayFrame final_replay;
+        if (!prosper::gpu::materialize_gpu_replay(final_capture, final_replay, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot materialize final bundle submit: %s\n",
+                         error.c_str());
+            return 2;
+        }
+        const size_t final_submit_index = bundle.submits.size() - 1;
+        const auto selected =
+            prosper::gpu::replay_tool::replay_bundle_output_target_after_operation(
+                final_replay, final_submit_index, final_submit_index,
+                output_target_after_operation, output_target_after_addr);
+        if (!selected.applies_to_submit) {
+            std::fprintf(stderr,
+                         "gpu_replay: exact output selector did not apply to final bundle submit\n");
+            return 2;
+        }
+        if (!plan_exact_output_target(final_replay, output_target_after_operation,
+                                      output_target_after_addr, exact_bundle_output_target,
+                                      final_metadata.submit_index))
+            return 2;
+    }
     for (const auto& [name, value] : final_capture.metadata.renderer_env)
         if (!set_environment(name, value)) {
             std::fprintf(stderr, "gpu_replay: cannot set %s\n", name.c_str()); return 2;
@@ -1206,7 +1357,21 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
         for (size_t item_index = 0; item_index < replay.items.size(); ++item_index)
             draw_item_by_index[replay.items[item_index].draw_index] = item_index;
         size_t operation_limit = replay.operations.size();
-        if (i + 1 < bundle.submits.size() && intermediate_target_width) {
+        const auto exact_for_submit = output_target_after_operation != SIZE_MAX
+            ? prosper::gpu::replay_tool::replay_bundle_output_target_after_operation(
+                  replay, i, bundle.submits.size() - 1,
+                  output_target_after_operation, output_target_after_addr)
+            : prosper::gpu::replay_tool::BundleOutputTargetAfterSelection{};
+        if (exact_for_submit.applies_to_submit) {
+            if (exact_for_submit.selection.status !=
+                prosper::gpu::replay_tool::OutputTargetAfterStatus::Selected) {
+                std::fprintf(stderr,
+                             "gpu_replay: final bundle submit exact output plan changed after "
+                             "preflight validation\n");
+                return 2;
+            }
+            operation_limit = exact_for_submit.selection.target.operation_index + 1;
+        } else if (i + 1 < bundle.submits.size() && intermediate_target_width) {
             operation_limit = 0;
             for (size_t operation_index = 0; operation_index < replay.operations.size(); ++operation_index) {
                 const auto& operation = replay.operations[operation_index];
@@ -1393,6 +1558,10 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
             return 2;
         }
         final_pixels = execute_frame(replay, false, operation_limit);
+        if (exact_for_submit.applies_to_submit &&
+            !read_exact_output_target(exact_bundle_output_target, final_pixels,
+                                      capture.metadata.submit_index))
+            return 2;
         if (output_target_width) {
             const auto target = prosper::gpu::replay_tool::replay_last_target_matching_extent(
                 replay, output_target_width, output_target_height, operation_limit);
@@ -1481,13 +1650,18 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                      final_pixels.size(),
                      static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(final_pixels)));
     }
+    const uint32_t dump_width = exact_bundle_output_target
+        ? exact_bundle_output_target.width
+        : output_target_width ? output_target_width : final_metadata.width;
+    const uint32_t dump_height = exact_bundle_output_target
+        ? exact_bundle_output_target.height
+        : output_target_height ? output_target_height : final_metadata.height;
     if (output_path && !final_pixels.empty() &&
         !prosper::test::dump_bmp(output_path, final_pixels,
-                                 output_target_width ? output_target_width : final_metadata.width,
-                                 output_target_height ? output_target_height : final_metadata.height)) {
+                                 dump_width, dump_height)) {
         std::fprintf(stderr, "gpu_replay: cannot write %s\n", output_path); return 2;
     }
-    if (!output_target_width && expected_output_valid &&
+    if (!output_target_width && !exact_bundle_output_target && expected_output_valid &&
         (final_pixels.size() != expected_output_bytes ||
          prosper::gpu::gpu_capture_hash(final_pixels) != expected_output_hash)) {
         std::fprintf(stderr, "gpu_replay: bundle output mismatch\n"); return 1;
@@ -1511,6 +1685,8 @@ int main(int argc, char** argv) {
     bool draw_selected = false;
     uint64_t draw_first = 0, draw_last = 0;
     int through_operation = -1;
+    size_t output_target_after_operation = SIZE_MAX;
+    uint64_t output_target_after_addr = 0;
     int compute_only = -1;
     std::string draw_steps_prefix;     // --draw-steps PREFIX: filmstrip of the composite per operation-step
     int draw_steps_every = 0;          // --draw-steps-every N (0 = auto ~30 frames)
@@ -1614,6 +1790,28 @@ int main(int argc, char** argv) {
             if (!end || *end || value < 0 || value > INT_MAX) { usage(argv[0]); return 2; }
             through_operation = static_cast<int>(value);
         }
+        else if (std::string(argv[i]) == "--output-target-after" && i + 1 < argc) {
+            const char* spec = argv[++i];
+            char* operation_end = nullptr;
+            errno = 0;
+            const unsigned long long operation = std::strtoull(spec, &operation_end, 0);
+            if (*spec == '-' || errno == ERANGE || !operation_end || operation_end == spec ||
+                *operation_end != ':' || operation >= SIZE_MAX) {
+                usage(argv[0]); return 2;
+            }
+            const char* address_begin = operation_end + 1;
+            char* address_end = nullptr;
+            errno = 0;
+            const unsigned long long address =
+                std::strtoull(address_begin, &address_end, 0);
+            if (*address_begin == '-' || errno == ERANGE || !address_end ||
+                address_end == address_begin ||
+                *address_end || !address) {
+                usage(argv[0]); return 2;
+            }
+            output_target_after_operation = static_cast<size_t>(operation);
+            output_target_after_addr = static_cast<uint64_t>(address);
+        }
         else if (std::string(argv[i]) == "--compute-only" && i + 1 < argc) {
             char* end = nullptr;
             const long value = std::strtol(argv[++i], &end, 0);
@@ -1680,6 +1878,12 @@ int main(int argc, char** argv) {
         set_environment("PROSPER_GPU_REPLAY_LEGACY_HTILE_BEFORE_STENCIL", "1");
     if (!bundle_path.empty()) {
         if (bundle_ds_summary && bundle_find_ds_addr) { usage(argv[0]); return 2; }
+        if (output_target_after_operation != SIZE_MAX &&
+            (bundle_intermediate_target_width || bundle_output_target_width ||
+             !bundle_compact_path.empty() || !bundle_final_capsule_path.empty() ||
+             !bundle_extract_submit_path.empty() || bundle_find_ds_addr || bundle_ds_summary)) {
+            usage(argv[0]); return 2;
+        }
         if (positional.size() > 1 || inspect || inspect_only || validate_only || graph_only ||
             draw_selected || draw_with_compute_prefix || through_operation >= 0 ||
             compute_only >= 0 ||
@@ -1693,6 +1897,10 @@ int main(int argc, char** argv) {
             !prepend_path.empty() || !draw_steps_prefix.empty()) {
             usage(argv[0]); return 2;
         }
+        if (output_target_after_operation != SIZE_MAX &&
+            !set_environment("PROSPER_PREFIX_INSPECT", "1")) {
+            std::fprintf(stderr, "gpu_replay: cannot set PROSPER_PREFIX_INSPECT\n"); return 2;
+        }
         return replay_bundle(bundle_path, positional.empty() ? nullptr : positional[0],
                              bundle_zero_boundary, bundle_tail, bundle_through_submit_no,
                              bundle_compact_path,
@@ -1700,6 +1908,8 @@ int main(int argc, char** argv) {
                              bundle_intermediate_target_height,
                              bundle_output_target_width,
                              bundle_output_target_height,
+                             output_target_after_operation,
+                             output_target_after_addr,
                              bundle_final_capsule_path,
                              bundle_extract_submit_no,
                              bundle_extract_submit_path,
@@ -1715,6 +1925,10 @@ int main(int argc, char** argv) {
     }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
     if ((draw_selected && through_operation >= 0) ||
+        (output_target_after_operation != SIZE_MAX &&
+         (draw_selected || through_operation >= 0 || compute_only >= 0 ||
+          inspect_only || validate_only || graph_only || warmup_repeats ||
+          !draw_steps_prefix.empty())) ||
         (compute_only >= 0 && (draw_selected || through_operation >= 0))) {
         usage(argv[0]); return 2;
     }
@@ -1724,7 +1938,8 @@ int main(int argc, char** argv) {
     }
     if (!post_compute_resource_spec.empty() &&
         (inspect_only || validate_only || graph_only || draw_selected ||
-         through_operation >= 0 || compute_only >= 0 || warmup_repeats ||
+         through_operation >= 0 || output_target_after_operation != SIZE_MAX ||
+         compute_only >= 0 || warmup_repeats ||
          !prepend_path.empty() || !draw_steps_prefix.empty())) {
         usage(argv[0]); return 2;
     }
@@ -1736,7 +1951,8 @@ int main(int argc, char** argv) {
     // #1330: ordered-prefix inspection modes must see the pass a prefix actually ends on, even when
     // that pass renders a non-RGBA8 target (an FP16 HDR scene). The shared live renderer publishes an
     // inspection-converted fallback only under this env, so full replays and live runs are unchanged.
-    if ((draw_selected || through_operation >= 0 || !draw_steps_prefix.empty() ||
+    if ((draw_selected || through_operation >= 0 ||
+         output_target_after_operation != SIZE_MAX || !draw_steps_prefix.empty() ||
          !post_compute_resource_spec.empty()) &&
         !set_environment("PROSPER_PREFIX_INSPECT", "1")) {
         std::fprintf(stderr, "gpu_replay: cannot set PROSPER_PREFIX_INSPECT\n"); return 2;
@@ -2550,6 +2766,13 @@ int main(int argc, char** argv) {
         allow_mismatch = true;
         std::fprintf(stderr, "[gpureplay] executing through mixed operation %d\n", through_operation);
     }
+    prosper::gpu::replay_tool::OutputTargetAfterOperation exact_output_target;
+    if (output_target_after_operation != SIZE_MAX) {
+        if (!plan_exact_output_target(replay, output_target_after_operation,
+                                      output_target_after_addr, exact_output_target))
+            return 2;
+        allow_mismatch = true;
+    }
     const auto& m = replay.metadata;
     std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
                          "operations=%zu shaders=%zu failed=%zu raw-shaders=%zu blobs=%zu "
@@ -2677,11 +2900,14 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
-    const size_t operation_limit = through_operation >= 0
-        ? static_cast<size_t>(through_operation) + 1 : selected_operation_limit;
+    const size_t operation_limit = exact_output_target
+        ? exact_output_target.operation_index + 1
+        : through_operation >= 0
+            ? static_cast<size_t>(through_operation) + 1 : selected_operation_limit;
     const bool selected_draws_only = draw_selected && !draw_with_compute_prefix;
     std::vector<uint8_t> pixels = execute_frame(
         replay, selected_draws_only, operation_limit, post_compute_dump_ptr);
+    if (exact_output_target && !read_exact_output_target(exact_output_target, pixels)) return 2;
     if (post_compute_dump_ptr) {
         if (post_compute_dump.execution_count != 1) {
             std::fprintf(stderr,
@@ -2846,19 +3072,31 @@ int main(int argc, char** argv) {
     }
     const auto extent_mode = selected_draws_only
         ? prosper::gpu::replay_tool::OutputExtentMode::SelectedDraws
-        : (through_operation >= 0 || (draw_selected && draw_with_compute_prefix))
+        : (through_operation >= 0 || exact_output_target ||
+           (draw_selected && draw_with_compute_prefix))
             ? prosper::gpu::replay_tool::OutputExtentMode::OrderedPrefix
             : prosper::gpu::replay_tool::OutputExtentMode::Capture;
-    const auto output_extent = prosper::gpu::replay_tool::replay_output_extent(
-        replay, extent_mode, pixels.size(), operation_limit);
+    const auto output_extent = exact_output_target
+        ? prosper::gpu::replay_tool::OutputExtent{
+              exact_output_target.width, exact_output_target.height,
+              exact_output_target.guest_addr, exact_output_target.draw_index}
+        : prosper::gpu::replay_tool::replay_output_extent(
+              replay, extent_mode, pixels.size(), operation_limit);
     const uint32_t output_width = output_extent.width;
     const uint32_t output_height = output_extent.height;
     uint64_t hash = prosper::gpu::gpu_capture_hash(pixels);
     // Name the surface, not just its size. A prefix replay renders the LAST EXECUTED DRAW TARGET, so
     // adjacent `--through-operation` cutoffs can report two different buffers; without the address that
     // reads as one surface changing. `target=` makes such a comparison self-invalidating.
-    char target_tag[64] = " target=capture";
-    if (output_extent.target_addr)
+    char target_tag[192] = " target=capture";
+    if (exact_output_target)
+        std::snprintf(target_tag, sizeof target_tag,
+                      " target=%016llx op=%zu draw=%llu slot=%u format=%u",
+                      static_cast<unsigned long long>(exact_output_target.guest_addr),
+                      exact_output_target.operation_index,
+                      static_cast<unsigned long long>(exact_output_target.draw_index),
+                      exact_output_target.slot, exact_output_target.format);
+    else if (output_extent.target_addr)
         std::snprintf(target_tag, sizeof target_tag, " target=%016llx draw=%llu",
                       static_cast<unsigned long long>(output_extent.target_addr),
                       static_cast<unsigned long long>(output_extent.target_draw_index));

@@ -473,6 +473,27 @@ order and all earlier work. Prefix output uses the last executed draw target's n
 a hash-verified seeded final capsule for fast composition bisection; unlike `--draw`, it does not discard
 DMA copies, compute dispatches, or earlier draws.
 
+`--output-target-after OP:ADDR` executes that same inclusive prefix, then reads back exactly the
+render target written at guest address `ADDR` by semantic operation `OP`:
+
+```bash
+tools/gpu_replay --output-target-after 6:0x2011800000 capture.prgcap resolved.bmp
+```
+
+Selection is a write proof, not an address lookup. Ordinary draw attachments require a nonzero
+effective write mask. A fixed-function `CB_COLOR_CONTROL.MODE=RESOLVE` instead names raw color1 as
+its destination despite its zero shader mask; raw color0 is the resolve source and is rejected as
+an output. The selector retains and verifies operation, semantic draw, attachment slot, address,
+extent, and exact raw/backend Vulkan format at readback. It fails visibly and distinctly for an
+invalid operation, a non-draw or unrealized operation, an address that operation did not write, an
+incomplete target identity, or an unavailable/mismatched retained version. This is the appropriate
+probe when `--through-operation` publishes a different last draw target than the intermediate
+surface being investigated. With `--bundle`, the operation/address selector applies only to the
+final submit left after `--bundle-tail` / `--bundle-through-submit`; retained predecessor submits
+execute completely, while that final submit stops at the requested inclusive prefix. Existing
+bundle intermediate/output selectors are mutually exclusive because they name a different output
+policy.
+
 **Always read `target=` before comparing two cutoffs.** Because prefix output follows the *last executed draw
 target*, adjacent cutoffs can render two completely different buffers, and comparing them then looks like one
 surface changing. The render summary names the surface it selected:
