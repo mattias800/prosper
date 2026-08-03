@@ -118,6 +118,34 @@ int main() {
               !compute_timing_zero_match_is_invalid(one_match),
           "zero-match summary is apparatus-invalid");
 
+    const ComputeStorageCacheGateInputs cache_eligible{
+        false, true, false, true, false, true};
+    CHECK(compute_storage_cache_gate_candidate(cache_eligible),
+          "storage cache candidate accepts all gates with exact storage");
+    ComputeStorageCacheGateInputs cache_gates = cache_eligible;
+    cache_gates.renderer_owned = true;
+    CHECK(!compute_storage_cache_gate_candidate(cache_gates),
+          "renderer ownership blocks storage cache candidate");
+    cache_gates = cache_eligible;
+    cache_gates.dcc_cache_safe = false;
+    CHECK(!compute_storage_cache_gate_candidate(cache_gates),
+          "DCC unsafety blocks storage cache candidate");
+    cache_gates = cache_eligible;
+    cache_gates.poison_verify = true;
+    CHECK(!compute_storage_cache_gate_candidate(cache_gates),
+          "poison verification blocks storage cache candidate");
+    cache_gates = cache_eligible;
+    cache_gates.exact_storage = false;
+    CHECK(!compute_storage_cache_gate_candidate(cache_gates),
+          "neither exact storage nor seed skip blocks storage cache candidate");
+    cache_gates.seed_skip = true;
+    CHECK(compute_storage_cache_gate_candidate(cache_gates),
+          "seed skip satisfies the storage representation gate");
+    cache_gates = cache_eligible;
+    cache_gates.persistent_enabled = false;
+    CHECK(!compute_storage_cache_gate_candidate(cache_gates),
+          "persistent cache disable blocks storage cache candidate");
+
     ComputeTransferGateSelector gate_selector{
         true, true, 0x2c595d5aada78398ull, 0xa57c763ae4d70d1dull};
     ComputeTransferGateSelectorCounters gate_counters;
@@ -139,8 +167,25 @@ int main() {
               gate_counters.producer_matches == 2 &&
               gate_counters.consumer_matches == 1,
           "dual transfer selectors prove each exact hash and first match independently");
+    CHECK(compute_transfer_gate_selector_is_invalid(gate_selector, gate_counters),
+          "hash matches without storage gate observations are apparatus-invalid");
+    const bool delayed_producer_detail =
+        record_compute_transfer_storage_gate_observation(
+            ComputeTransferGateRole::Producer, gate_counters);
+    (void)observe_compute_transfer_gate_selector(
+        gate_selector, gate_counters, gate_selector.producer_hash);
+    const bool repeated_producer_detail =
+        record_compute_transfer_storage_gate_observation(
+            ComputeTransferGateRole::Producer, gate_counters);
+    CHECK(delayed_producer_detail && !repeated_producer_detail &&
+              gate_counters.producer_storage_gate_observations == 2,
+          "storage detail survives an earlier hash-only match and emits exactly once");
+    CHECK(compute_transfer_gate_selector_is_invalid(gate_selector, gate_counters),
+          "one-sided storage gate observation is apparatus-invalid");
+    (void)record_compute_transfer_storage_gate_observation(
+        ComputeTransferGateRole::Consumer, gate_counters);
     CHECK(!compute_transfer_gate_selector_is_invalid(gate_selector, gate_counters),
-          "dual transfer selector accepts only when both hashes matched");
+          "dual transfer selector requires both hashes and storage gate observations");
 
     ComputeTransferGateSelectorCounters missing_consumer;
     (void)observe_compute_transfer_gate_selector(

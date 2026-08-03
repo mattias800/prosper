@@ -12,6 +12,25 @@ enum class ComputeTransferGateRole : uint8_t {
     Consumer,
 };
 
+// Keep the storage-image cache decision and its diagnostic inputs together.  A transfer-gate
+// census must expose every input to this policy: reporting only the derived candidate bit cannot
+// distinguish a real eligibility difference from an instrument that never observed the gate.
+struct ComputeStorageCacheGateInputs {
+    bool renderer_owned = false;
+    bool dcc_cache_safe = false;
+    bool poison_verify = false;
+    bool exact_storage = false;
+    bool seed_skip = false;
+    bool persistent_enabled = false;
+};
+
+constexpr bool compute_storage_cache_gate_candidate(
+    const ComputeStorageCacheGateInputs& inputs) {
+    return !inputs.renderer_owned && inputs.dcc_cache_safe &&
+           !inputs.poison_verify && (inputs.exact_storage || inputs.seed_skip) &&
+           inputs.persistent_enabled;
+}
+
 struct ComputeTransferGateSelector {
     bool requested = false;
     bool valid = false;
@@ -36,6 +55,8 @@ struct ComputeTransferGateSelectorCounters {
     uint64_t seen = 0;
     uint64_t producer_matches = 0;
     uint64_t consumer_matches = 0;
+    uint64_t producer_storage_gate_observations = 0;
+    uint64_t consumer_storage_gate_observations = 0;
     bool summary_reported = false;
 };
 
@@ -60,12 +81,27 @@ inline ComputeTransferGateSelectorObservation observe_compute_transfer_gate_sele
     return {role, first_match};
 }
 
+inline bool record_compute_transfer_storage_gate_observation(
+    ComputeTransferGateRole role,
+    ComputeTransferGateSelectorCounters& counters) {
+    uint64_t* observations = role == ComputeTransferGateRole::Producer
+        ? &counters.producer_storage_gate_observations
+        : role == ComputeTransferGateRole::Consumer
+            ? &counters.consumer_storage_gate_observations : nullptr;
+    if (!observations) return false;
+    const bool first_observation = *observations == 0;
+    *observations = saturating_increment(*observations);
+    return first_observation;
+}
+
 constexpr bool compute_transfer_gate_selector_is_invalid(
     const ComputeTransferGateSelector& selector,
     const ComputeTransferGateSelectorCounters& counters) {
     return selector.requested &&
            (!selector.valid || selector.producer_hash == selector.consumer_hash ||
-            counters.producer_matches == 0 || counters.consumer_matches == 0);
+            counters.producer_matches == 0 || counters.consumer_matches == 0 ||
+            counters.producer_storage_gate_observations == 0 ||
+            counters.consumer_storage_gate_observations == 0);
 }
 
 inline bool claim_compute_transfer_gate_selector_summary(

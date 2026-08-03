@@ -2820,6 +2820,12 @@ struct ComputeTransferGateStats {
     uint64_t storage_native_semantic = 0;
     uint64_t storage_native_device = 0;
     uint64_t storage_cache_evaluated = 0;
+    uint64_t storage_renderer_owned = 0;
+    uint64_t storage_dcc_cache_safe = 0;
+    uint64_t storage_poison_verify = 0;
+    uint64_t storage_exact = 0;
+    uint64_t storage_seed_skip = 0;
+    uint64_t storage_persistent_enabled = 0;
     uint64_t storage_cache_candidate = 0;
     uint64_t storage_persistent_setup = 0;
     uint64_t storage_publish_evaluated = 0;
@@ -3003,20 +3009,39 @@ public:
 
     void record_storage_cache(ComputeTransferGateRole role,
                               const prosper::gpu::ShaderResource& resource,
-                              uint32_t binding, bool cache_candidate,
-                              bool persistent_setup, bool detail) {
+                              uint32_t binding,
+                              const ComputeStorageCacheGateInputs& inputs,
+                              bool cache_candidate,
+                              bool persistent_setup) {
         if (role == ComputeTransferGateRole::None) return;
         std::lock_guard lock(mutex_);
+        const bool detail =
+            record_compute_transfer_storage_gate_observation(role, counters_);
         ComputeTransferGateStats& stats = stats_for(role);
         increment_gate_counter(stats.storage_cache_evaluated);
+        increment_gate_counter(stats.storage_renderer_owned, inputs.renderer_owned);
+        increment_gate_counter(stats.storage_dcc_cache_safe, inputs.dcc_cache_safe);
+        increment_gate_counter(stats.storage_poison_verify, inputs.poison_verify);
+        increment_gate_counter(stats.storage_exact, inputs.exact_storage);
+        increment_gate_counter(stats.storage_seed_skip, inputs.seed_skip);
+        increment_gate_counter(stats.storage_persistent_enabled,
+                               inputs.persistent_enabled);
         increment_gate_counter(stats.storage_cache_candidate, cache_candidate);
         increment_gate_counter(stats.storage_persistent_setup, persistent_setup);
         if (detail) {
             std::fprintf(stderr,
                          "[compute-transfer-gates] detail role=%s stage=storage-cache "
-                         "binding=%u addr=0x%llx cache-candidate=%u persistent=%u\n",
+                         "binding=%u addr=0x%llx renderer-owned=%u dcc-cache-safe=%u "
+                         "poison-verify=%u exact-storage=%u seed-skip=%u "
+                         "persistent-enabled=%u cache-candidate=%u persistent=%u\n",
                          compute_transfer_gate_role_name(role), binding,
                          static_cast<unsigned long long>(resource.gpu_addr),
+                         inputs.renderer_owned ? 1u : 0u,
+                         inputs.dcc_cache_safe ? 1u : 0u,
+                         inputs.poison_verify ? 1u : 0u,
+                         inputs.exact_storage ? 1u : 0u,
+                         inputs.seed_skip ? 1u : 0u,
+                         inputs.persistent_enabled ? 1u : 0u,
                          cache_candidate ? 1u : 0u, persistent_setup ? 1u : 0u);
         }
     }
@@ -3043,13 +3068,18 @@ public:
         std::fprintf(stderr,
                      "[compute-transfer-gates] summary producer=0x%016llx "
                      "consumer=0x%016llx seen=%llu producer-matched=%llu "
-                     "consumer-matched=%llu verdict=%s producer-reason=%s "
+                     "consumer-matched=%llu producer-storage-gates=%llu "
+                     "consumer-storage-gates=%llu verdict=%s producer-reason=%s "
                      "consumer-reason=%s\n",
                      static_cast<unsigned long long>(selector_.producer_hash),
                      static_cast<unsigned long long>(selector_.consumer_hash),
                      static_cast<unsigned long long>(counters_.seen),
                      static_cast<unsigned long long>(counters_.producer_matches),
                      static_cast<unsigned long long>(counters_.consumer_matches),
+                     static_cast<unsigned long long>(
+                         counters_.producer_storage_gate_observations),
+                     static_cast<unsigned long long>(
+                         counters_.consumer_storage_gate_observations),
                      invalid ? "INVALID" : "matched",
                      compute_timing_selector_parse_error_name(producer_error_),
                      compute_timing_selector_parse_error_name(consumer_error_));
@@ -3069,7 +3099,9 @@ private:
                      "[compute-transfer-gates] summary role=%s reflected=%llu storage=%llu "
                      "sampled=%llu dim2d=%llu nonarrayed=%llu nonmsaa=%llu ordinary2d=%llu "
                      "storage-float=%llu native-semantic=%llu native-device=%llu "
-                     "storage-cache-eval=%llu storage-candidate=%llu "
+                     "storage-cache-eval=%llu renderer-owned=%llu "
+                     "dcc-cache-safe=%llu poison-verify=%llu exact-storage=%llu "
+                     "seed-skip=%llu persistent-enabled=%llu storage-candidate=%llu "
                      "storage-persistent-setup=%llu publish-eval=%llu publish-native=%llu "
                      "publish-unique=%llu publish-candidate=%llu publish-persistent=%llu "
                      "publish-authorized=%llu\n",
@@ -3085,6 +3117,12 @@ private:
                      static_cast<unsigned long long>(s.storage_native_semantic),
                      static_cast<unsigned long long>(s.storage_native_device),
                      static_cast<unsigned long long>(s.storage_cache_evaluated),
+                     static_cast<unsigned long long>(s.storage_renderer_owned),
+                     static_cast<unsigned long long>(s.storage_dcc_cache_safe),
+                     static_cast<unsigned long long>(s.storage_poison_verify),
+                     static_cast<unsigned long long>(s.storage_exact),
+                     static_cast<unsigned long long>(s.storage_seed_skip),
+                     static_cast<unsigned long long>(s.storage_persistent_enabled),
                      static_cast<unsigned long long>(s.storage_cache_candidate),
                      static_cast<unsigned long long>(s.storage_persistent_setup),
                      static_cast<unsigned long long>(s.storage_publish_evaluated),
@@ -5214,9 +5252,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     (bi.dcc_metadata && bi.dcc_metadata_bytes &&
                      std::all_of(bi.dcc_metadata, bi.dcc_metadata + bi.dcc_metadata_bytes,
                                  [](uint8_t value) { return value == 0xff; }));
-                bi.cache_candidate = !renderer_owned && dcc_cache_safe &&
-                    !bi.poison_verify && (bi.exact_storage_bytes() || bi.seed_skip) &&
-                    persistent_compute_image_enabled(sbytes, ComputeImageCacheClass::storage);
+                const ComputeStorageCacheGateInputs storage_cache_gates{
+                    renderer_owned,
+                    dcc_cache_safe,
+                    bi.poison_verify,
+                    bi.exact_storage_bytes(),
+                    bi.seed_skip,
+                    persistent_compute_image_enabled(
+                        sbytes, ComputeImageCacheClass::storage),
+                };
+                bi.cache_candidate =
+                    compute_storage_cache_gate_candidate(storage_cache_gates);
                 if (bi.cache_candidate) {
                     const auto cache_lookup_start = ComputeClock::now();
                     bi.cache_key = storage_image_cache_key(
@@ -5239,8 +5285,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 transfer_gate_census.record_storage_cache(
                     transfer_gate_observation.role, *r, bi.binding,
-                    bi.cache_candidate, bi.persistent,
-                    transfer_gate_observation.first_match);
+                    storage_cache_gates,
+                    bi.cache_candidate, bi.persistent);
                 if (!(bi.persistent && bi.upload_skipped)) {
                 const size_t linear_size = (bi.seed_skip || bi.seed_from_imported != SIZE_MAX)
                     ? size_t{0} : static_cast<size_t>(linear_guest_bytes);
