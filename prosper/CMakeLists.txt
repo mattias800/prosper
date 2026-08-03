@@ -681,6 +681,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_dmem_caller_walk PRIVATE prosper_core)
   add_test(NAME dmem_caller_walk COMMAND test_dmem_caller_walk)
 
+  # PROSPER_DMEM_CALLER correlation (issue #1859): the full stack remains one bounded line per
+  # caller identity while every MEMLOG allocation can carry the same stable run-local ID. Pure,
+  # including explicit unknown/overflow states and concurrent interning.
+  add_executable(test_dmem_caller_chain tests/test_dmem_caller_chain.cpp)
+  add_test(NAME dmem_caller_chain COMMAND test_dmem_caller_chain)
+
   # Capped-diagnostic rate limit (issue #1761): a print budget must never be readable as a
   # population. Pins the sparse tail and the per-key budget; header-only, no GPU state.
   add_executable(test_diag_ratelimit tests/test_diag_ratelimit.cpp)

@@ -40,14 +40,20 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     / map with its size, which answers *how much* but never *who* — and the same guest allocator
     serves every subsystem, so a title whose heap grows without bound looks identical to one that is
     legitimately loading. Add **`PROSPER_DMEM_CALLER=1`** to print, once per distinct call chain, the
-    guest return addresses above each `sceKernelAllocateMainDirectMemory`:
+    guest return addresses above each `sceKernelAllocateMainDirectMemory`. The first two return
+    addresses are interned as a bounded run-local `caller-chain=N`; the full bounded chain prints
+    once, while every allocation in the `PROSPER_MEMLOG=1` census carries the same correlation ID:
     ```text
-    [dmem-caller] alloc_main_dmem len=0x1000000 from eboot+0x1b2454f eboot+0x7d0a00 eboot+0x22b1e80 …
+    [memhle] alloc_main_dmem len=0x1000000 -> phys=0x21500000 caller-chain=1
+    [dmem-caller] caller-chain=1 alloc_main_dmem len=0x1000000 from eboot+0x1b2454f eboot+0x7d0a00 eboot+0x22b1e80 …
     ```
     Feed the first address to `tools/re/edis.py` / `tools/re/xref.py` to name the caller. The walk is
     a heuristic stack scan (a stale spill slot looks exactly like a return address), so treat the
     result as a callsite **hint** to confirm against the module's disassembly — never as proof on its
-    own. Bounded to 64 distinct chains so an allocation-heavy boot cannot bury the log.
+    own. IDs are stable only within one process and the full-chain table is bounded to 64 entries so
+    an allocation-heavy boot cannot bury the log. A walk with no guest return address is recorded as
+    `caller-chain=unknown`; allocations beyond the distinct-chain limit say `caller-chain=overflow`,
+    and the ceiling is announced once. Neither state is a negative caller result.
   - **Is prosper overrunning a command-buffer reservation the guest made?** prosper's AGC builders
     append into the *guest's* buffer, and the guest reserves that buffer from the packet sizes it was
     compiled against — so a builder that emits more dwords than the real AGC function overruns it.

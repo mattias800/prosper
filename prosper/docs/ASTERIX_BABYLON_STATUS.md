@@ -192,6 +192,16 @@ unintended runs and add no independent title discriminator. In the same observed
 `--dump-shader` returned before Vulkan initialization. This apparatus finding is recorded as
 instrument trap 63 in `GAME_COMPAT_ORCHESTRATION.md`.
 
+Two independent fresh-save v46 runs on `09be7beccc93c6e2d414657c3570f877271fdcdf`
+then retained draw 0 PS binding 32's raw descriptor input. Both selected the same natural submit shape,
+reported `raw-identity=full-match`, and retained the same complete zero 128-byte span at realization and
+post-submit. A follow-up allocation-census arm again reproduced that exact v46 subject and found one unique
+containing direct mapping: `[0x2011500000,0x2012500000)`, physical allocation `0x21500000`, selected offset
+`0xdd32f0`. Caller attribution from that arm is **VOID**, not negative: 102 allocation records produced only
+two `[dmem-caller]` lines because the diagnostic silently suppresses repeated first-two-frame keys and the
+ordinary allocation line carries no correlation token. The target allocation therefore cannot safely be
+assigned either retained chain. #1599, #1859.
+
 ## Ruled out
 
 - **Unresolved T#/S# lookup:** the title-live descriptor resolves; the rejection is the sampled MIMG
@@ -255,19 +265,32 @@ instrument trap 63 in `GAME_COMPAT_ORCHESTRATION.md`.
   independently reports the selected range as `first=4 future-writer=-1`. The zero therefore exists before
   any captured GPU work can produce the composite and remains unchanged for the rest of the submit. The
   run-local address must be re-derived in future runs. #1599, #1850.
+- **A wrong descriptor decode/normalization selects a zero buffer instead of the guest-programmed input:**
+  the two independent v46 runs each reported `raw-identity=full-match` for draw 0 PS binding 32. Raw dwords
+  `122d32f0,00100020,00000008,0004dfac` independently encode the same run-local address, 16-byte stride,
+  eight records (128 bytes), format, and component count as the normalized CB. Both temporal samples and
+  the ordinary resource read all 128 bytes, found `nz=0`, and agreed on hash `306c537b2ff38983` with
+  `verdict=full-equal`; each submit had 8 draws, 6 computes, 14 operations, and no realization failures.
+  Descriptor translation preserves what the guest programmed. The missing content is upstream: either
+  the guest CPU intentionally leaves this allocation zero or an expected CPU producer does not populate
+  it. The address remains run-local even though deterministic fresh boots reused it. #1599, #1853, #1857.
 - **A renderer-disabled title boot as a GPU-free experiment:** live compute remains active without
   `PROSPER_RENDER` and initializes Vulkan when the title dispatches supported compute.
 
 ## Next discriminators
 
-1. Distinguish a guest-programmed zero constant from a wrong resource identity: retain the raw PS user-data
-   dwords and descriptor provenance that select draw 0 binding 32, then prove whether the run-local address
-   matches what the guest programmed. If it does, trace the last guest CPU writer before submit 181 with a
-   cross-thread-capable watch and a positive control; the captured GPU operation graph has already closed
-   every in-submit writer.
-2. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
+1. After #1859 lands, repeat the exact v46 selector with `PROSPER_MEMLOG=1` and
+   `PROSPER_DMEM_CALLER=1`. Accept allocation ownership only when the selected address lies in one unique
+   map, its physical allocation record carries a nonzero `caller-chain=N`, and exactly one bounded full
+   chain defines that ID. Confirm the heuristic callsite in disassembly before using it as a mapping-relative
+   selector; `unknown`, `overflow`, or a missing ID makes the arm void.
+2. With that mapping identity, build a generic process-wide CPU write watch that arms at mapping creation,
+   records initial bytes plus bounded writer RIP/thread/post-store history, proves its fault/re-arm path with
+   a cross-thread canary, and requires the later v46 selector to match its dynamically derived address. Do
+   not reuse an absolute address from another process.
+3. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
    dispatch ran and reproduces its device loss; two failures in six runs are not a stable cause.
-3. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
+4. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
    Until then, do not update `COMPATIBILITY.md` or claim rung progress.
-4. Once output is useful, route beyond 125 seconds as a regression check for #1748; do not reopen the
+5. Once output is useful, route beyond 125 seconds as a regression check for #1748; do not reopen the
    old allocator diagnosis without a newly reproduced failure.
