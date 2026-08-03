@@ -845,6 +845,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_replay_shader_dump PRIVATE prosper_core)
   add_test(NAME gpu_replay_shader_dump COMMAND test_gpu_replay_shader_dump)
 
+  # Selected-prefix compute output inspection must distinguish captured seed bytes from the
+  # descriptor-visible post-dispatch image, including tiled 2D and true 3D storage layouts.
+  add_executable(test_gpu_replay_post_compute_resource
+                 tests/test_gpu_replay_post_compute_resource.cpp)
+  target_link_libraries(test_gpu_replay_post_compute_resource PRIVATE prosper_core)
+  add_test(NAME gpu_replay_post_compute_resource COMMAND test_gpu_replay_post_compute_resource)
+
   # Offline SPI_PS_INPUT_CNTL linkage classification: a pixel-shader input wired to the constant
   # form consumes no producer export, and must never be reported as a PARAM consumer.
   add_executable(test_gpu_replay_pixel_inputs tests/test_gpu_replay_pixel_inputs.cpp)

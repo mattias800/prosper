@@ -190,6 +190,8 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
 ./build-linux/gpu_replay --compute-only 0 --override-compute-spv 0 /tmp/reduced.spv \
   /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute-resource 0:2 /tmp/storage.bin /tmp/submit.prgcap
+./build-linux/gpu_replay --dump-post-compute-resource 12:14 ~/captures/storage-linear.bin \
+  --require-post-change ~/captures/submit.prgcap
 ./build-linux/gpu_replay --dump-failed-shader 0:1 /tmp/failed-fragment.bin /tmp/submit.prgcap
 ```
 
@@ -413,6 +415,17 @@ Compute selectors use the realized compute index printed by `--inspect-only`; v3
 that dispatch has complete current-translator replay state. The resource selector is
 `COMPUTE:BINDING`; it writes the captured pre-dispatch storage-buffer bytes, while `--dump-compute` writes
 the exact specialized SPIR-V executed by replay (the rebuilt module when combined with `--recompile-raw`).
+`--dump-post-compute-resource COMPUTE:BINDING PATH` instead executes the retained mixed-operation prefix
+through exactly one selected realized dispatch, waits for its Vulkan writeback, and writes the selected
+storage image in descriptor-visible linear texel order. It rejects an ambiguous operation selector, a failed
+prefix dispatch, or a selected dispatch that did not execute exactly once. The diagnostic keeps the captured
+seed separate, snapshots the selected binding immediately before its dispatch, and prints immediate-before to
+synchronous-after raw/backing and linear hashes; R11G11B10F images also report finite, zero,
+greater-than-one, infinity, NaN, range, and mean counts. `--require-post-change` makes an unchanged
+descriptor-visible linear hash fail, while `--expect-post-hash HASH` requires an exact post-dispatch
+raw/backing hash. Those gates prove the requested execution and observation lever moved; the output file
+itself is always linearized, not tiled.
+This mode initializes Vulkan and is not an inspect-only command.
 `--compute-only N` retains just that realized dispatch and
 its captured resources, making a driver or recompiler failure deterministic without running unrelated draws
 or dispatches. `--override-compute-spv N PATH` replaces that dispatch's module after capture materialization;

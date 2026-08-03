@@ -514,6 +514,14 @@ Capture v19+ also supports `--dump-realized-shader DRAW:vs|fs PATH`, which write
 RDNA2 source for a successfully realized graphics stage; use that output with `shader_inspect`.
 `--dump-compute N PATH` writes one realized compute SPIR-V module, and
 `--dump-compute-resource N:BINDING PATH` writes its exact pre-dispatch storage-buffer bytes.
+`--dump-post-compute-resource N:BINDING PATH` is the execution-side counterpart for storage images: it
+runs the retained mixed-operation prefix through that exact realized dispatch, waits for synchronous Vulkan
+writeback, and writes descriptor-linear texels. Its log distinguishes the captured seed from the selected
+dispatch's immediate-before and synchronous-after raw/linear hashes, and reports R11G11B10F numerical
+populations. Prefer `--require-post-change` (which requires descriptor-visible linear content to move), and add
+`--expect-post-hash HASH` when an independent raw/backing oracle exists; an ambiguous selector, any failed
+prefix dispatch, a selected dispatch that does not execute exactly once, or a failed gate exits nonzero. This
+mode executes Vulkan, unlike `--inspect-only` and the captured pre-dispatch dump.
 `--compute-only N` executes one realized dispatch in isolation; combine it with
 `--override-compute-spv N PATH` to minimize or hardware-A/B a captured shader without changing its exact
 resource descriptors. The override disables the pixel oracle. Validated tiled 1D/2D compute storage executes
