@@ -626,6 +626,20 @@ it is meaningful. Continue the wider title-screen/gameplay investigation indepen
 One line per falsified hypothesis, the evidence that killed it, and the issue/PR. Extend this rather
 than re-deriving a dead answer at full cost.
 
+- **"The 4K consumer keeps rebuilding a stable image because unrelated GPU-write notifications
+  falsely invalidate its cache entry."** False on exact master `04c43b15` in the natural 720-present
+  exact-hash arms for #1732. Consumer `0x5005a8100` / `0x05975892ababe69f` used the 3840x2160 target
+  at `0x520440000` 172 times: its first use skipped the upload even though producer
+  `0x50057b800` / `0xa5e27ec0def1a807` had just published an ordinary full-range GPU write in the
+  same submit, proving that the notification alone does not force a rebuild. Every one of the later
+  171 changed uses had a real intervening write from that producer, and the provenance positive
+  control attributed all 171 watched ordinary writebacks to the consumer itself with no missing
+  intervals. A second uncapped gate census matched both programs 249 times and found identical
+  public 3840x2160 RGBA typed-storage/device gates at that address, but the producer's binding 65 was
+  never a cache candidate or persistent while the consumer's binding 73 always was. The remaining
+  question is therefore the producer's cache-eligibility predicate (renderer ownership versus DCC
+  safety with the current diagnostics), not spurious invalidation of unchanged bytes. See #1732.
+
 - **"A timeline submit with `dmas=0` contains no GDS counter reset."** False for timeline versions
   through v9. The timeline derived its DMA census exclusively from `GpuState::dma_copies`, the
   ordered-execution vector for address-backed copies. Immediate fills, rejected packets, and GDS
