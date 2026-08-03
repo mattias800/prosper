@@ -9418,13 +9418,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t native_support_bit = ordinary_3d
                     ? native_storage_3d_format_support_bit(res->format, components)
                     : native_storage_format_support_bit(res->format, components);
-                const bool native_float = (ordinary_2d || ordinary_3d) &&
+                // Vulkan permits B10G11R11 storage conversion, but RADV stores finite values with
+                // a systematic downward bias while the guest conversion is round-to-nearest-even
+                // (#1790). Keep the exact shader-side R32ui pack authoritative in both ordinary 2D
+                // and 3D, even when the device advertises native typed storage. Other float formats
+                // retain the device-gated native path below.
+                const bool packed_r11 = b.packed_r11_storage &&
+                    (ordinary_2d || ordinary_3d) && !arrayed && !ms && !is_atomic &&
+                    res->format == DataFormat::Float10_11_11 && components == 3;
+                const bool native_float = !packed_r11 && (ordinary_2d || ordinary_3d) &&
                     native_float_storage_image_supported(
                         res->format, components, res->srgb,
                         (b.native_storage_format_support & native_support_bit) != 0);
-                const bool packed_r11 = !native_float && b.packed_r11_storage && ordinary_2d &&
-                    !arrayed && !ms && !is_atomic &&
-                    res->format == DataFormat::Float10_11_11 && components == 3;
                 // Existing load/store-only uint images retain the raw uvec4/Format=Unknown contract
                 // used by the compute backend. The atomic's exact R32_UINT gate above is the only path
                 // that opts into a typed R32ui image.

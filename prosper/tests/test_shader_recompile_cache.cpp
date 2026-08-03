@@ -585,8 +585,10 @@ int main() {
               stats.misses == 3 && stats.hits == 1 && stats.entries == 3,
           "compute cache separates device-gated typed storage from the raw fallback and sRGB state");
 
-    // The device-independent R11G11B10 path is an explicit A/B contract: enabled modules use one
-    // typed R32ui word per texel, while the recovery switch restores formatless uvec4 conversion.
+    // The exact R11G11B10 path is an explicit A/B contract: enabled modules use one typed R32ui
+    // word per texel even when native typed storage is available. The recovery switch still
+    // exposes the device-gated typed-float path, making both the specialization and cache lever
+    // independently observable.
     clear_shader_recompile_cache();
     static const uint32_t kPackedStorageCompute[] = {
         0x7e080300u, 0x7e0a0280u,
@@ -610,6 +612,8 @@ int main() {
     ComputeShaderConfig packed_storage_config;
     packed_storage_config.user_sgprs.resize(16);
     packed_storage_config.local_x = 64;
+    packed_storage_config.native_storage_format_support =
+        native_storage_format_support_bit(DataFormat::Float10_11_11, 3);
     uint64_t packed_storage_identity = 0;
     const auto packed_storage = recompile_compute_shader_cached(
         kPackedStorageCompute, std::size(kPackedStorageCompute), &packed_storage_table,
@@ -635,11 +639,13 @@ int main() {
               packed_storage_identity != converted_storage_identity &&
               repeated_packed_storage_identity == packed_storage_identity &&
               packed_storage_report.descriptors.size() == 2 &&
+              !packed_storage_report.descriptors[0].storage_float &&
               packed_storage_report.descriptors[0].storage_image_format == kSpirvImageFormatR32ui &&
               converted_storage_report.descriptors.size() == 2 &&
+              converted_storage_report.descriptors[0].storage_float &&
               converted_storage_report.descriptors[0].storage_image_format == 0 &&
               stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
-          "compute cache separates exact packed R11 storage from its raw conversion recovery path");
+          "compute cache keeps exact packed R11 authoritative over native typed storage");
 
     // Compute image atomics embed the runtime R32_UINT extent in the linearized SSBO index and
     // bounds guard. Reusing a module across extents would retain a stale row stride or bounds.
