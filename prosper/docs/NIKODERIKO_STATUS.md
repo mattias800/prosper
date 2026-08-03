@@ -18,11 +18,22 @@ a mapped guest address, under every canonicalization the scalar fold tries. The 
 V# `num_records`/`dword3` tail as a pointer — the `0x0004dfac…` / `0x0001d22c…` constant family — the
 const-fold correctly refuses to invent a descriptor, and the draw is skipped fail-visibly.
 
-The condition that discriminates every failure: **a vertex stage fails exactly when the user-data
-block the guest most recently programmed is LARGER than the bound pipeline's user-SGPR window**
-(`SPI_SHADER_PGM_RSRC2_GS.USER_SGPR`, which equals the shader's own `user_data_range_end`). Full
-measurement, instruments and the complete falsification list are in
-[`RESOURCE_BINDING.md`](RESOURCE_BINDING.md) § `Ruled out`.
+The condition that discriminates the #305 signature is stage-agnostic: **the required user-data
+block is larger than the bound pipeline's user-SGPR window** (`SPI_SHADER_PGM_RSRC2_{GS,PS}.USER_SGPR`,
+which equals the shader's own `user_data_range_end`). The early sample looked vertex/GS-specific
+because every sampled pixel stage with declared pointers had a 30-dword window, equal to the largest
+observed write. The later failure-replay inventory contains vertex stages with 30/32-dword windows
+whose pointers remain readable and smaller 8/12/28-dword vertex windows that show the signature.
+Window fit, not stage identity, predicts it. Full measurement, instruments and the complete
+falsification list are in [`RESOURCE_BINDING.md`](RESOURCE_BINDING.md) § `Ruled out`.
+
+Submit provenance is no longer the missing instrument. `PROSPER_UDPROV` records order, direct versus
+indirect path, submit origin, fold and Jump depth for every SH write and carries them into draw
+snapshots; `PROSPER_SUBMITORDER` separately records pre-mutex call order and submit-thread identity.
+The trace localizes the mismatch (the bound program came from a q1/Dcb fold and the larger write from
+the following q3/DcbFinal fold), but does not by itself establish a cross-queue root cause. Giving
+DcbFinal a separate register file was tested as a default-off A/B and did not restore the world or
+collapse rejects. The underlying ordering/ring contract remains unproven.
 
 **Nikoderiko is the loud reproduction #305 has been missing.** On DOLL / Dragon Quest VII
 (`PPSA17942`) the same defect costs 0–33 UI draws per 7-minute run; here it costs the world — 25
@@ -44,7 +55,7 @@ re-derive these without contradictory new evidence.
 | The 8-SGPR `SRSRC` range is **computed inside the shader**, so `sreg_range_written` is set, the user-data fallback is skipped, and descriptor provenance is defeated | **Falsified — this was #1607's founding premise and its original title.** Of the 27 failing stages dumped, replayed with `PROSPER_DYNTRACE_FAIL=1` and disassembled with `shader_inspect`, **every failing *vertex* stage** uses the **canonical bindless-dynamic vertex fetch** (the pixel-stage failures in this title are a separate matter — see the pixel-stage row below): an ordinary descriptor-table read whose index is wave-uniform (`(s18 << 4) & 0x1f0`) and whose base is a user-data pointer — the exact shape `resolve_dynamic_fetch` was written for, plus the AGC format-patch tail. `sreg_range_written` is the *symptom* of that legitimate reload. **The recompiler's three-step ladder is not the defect.** | #1607 |
 | A wrong **seeding origin** for the user-data window | **Falsified.** `user_data_range_start` is `0` for every shader and `user_data_range_end` equals (last declared direct offset + 2), so the metadata is self-consistent with seeding at `SPI_SHADER_USER_DATA_GS_0 + 0`, which is what the executor does. The hypothesis that Nikoderiko was the first live `range_start != 0` shader was falsified by printing the raw field — that was the point of printing it. | #1607 |
 | **Header decode** is wrong | **Falsified.** The shader's own `SBASE` register equals the header's declared direct offset in all ten stages disassembled (e.g. `0x300e710000` reads `s[14:15]` = dword 6; the header says `[10]=6`). | #1607 |
-| **Pixel stages** are affected too | **No.** Every traced PS has its declared direct pointer readable. Only the vertex/GS user-data block loses. Any proposed mechanism for #305 **must explain this asymmetry** — that is the acceptance test. PS failures in this title are separate (an all-zero T# loaded from descriptor-table offset `0x80`, and MIMG sites whose eight `SRSRC` SGPRs the fold cannot determine). | #1607 |
+| The defect is specific to **vertex/GS**, so GS-versus-PS asymmetry is an acceptance test | **Falsified as a stage property.** The original #1607 sample did find every traced PS direct pointer readable, but all such PS windows were 30 dwords, equal to the largest observed write. A later failure-replay inventory found the #305 signature in 8/12/28-dword vertex windows and not in 30/32-dword vertex windows. Pixel stages were unaffected in that run because their windows fit, not because they were pixel stages. Their separate all-zero T# / unresolved-MIMG failures remain separate. | #305 |
 | This is a general **UE4** defect | **Does not hold as stated.** Same build, same recipe: The Pathless `PPSA01826` has **13 of 13** declared direct pointers readable with `implied=0` everywhere, 0 `mubuf-unresolved` and 2 `mimg-unresolved`; its own rejects are missing opcodes (`fmt=14 op=0x68` ×6, `op=0x47`, `fmt=0 op=0x25`, `fmt=7 op=0x1`) — a different problem. The Plucky Squire `PPSA15319` shows 0 failed stage builds. **ArcRunner `PPSA21406` is inconclusive, not negative** — 175 s produced one presented frame and a 153-line log, so it never reached content that could exercise the path; do not read that row either way. The confirmed set is **Nikoderiko + DOLL**. | #1607 |
 | Its 35.9 decoded draws/frame (peak 53) is #1641's "implausibly few" signature | **Falsified — that run was parked on a 2D UI screen.** A working title's *own menus* decode 7–13 draws/frame, so 53 for a title/EULA screen is normal. The 31→53 rise lands exactly when the rich screen appears: samples 10–11 carry 160,300 and 161,248 distinct colours while samples 3–9 are uniformly black. Testing this title against that signature needs a route into a 3D scene. | #1641, PR #1645 |
 | The EULA route is a prosper defect | **No — it is route work.** `left-stick-down` reaches the guest and the document visibly advances (distinct-colour counts move 24,765 → 23,258 → 23,328 → 23,361 → 23,344; t=186 s shows a different paragraph than t=120 s), but ~20 presses at the default `PROSPER_PAD_HOLD` (300 ms) advance only about two paragraphs, `Apply` stays greyed out, and `cross` does nothing while it is disabled (byte-identical samples across the press window). A working route needs a much longer scroll phase or a raised `PROSPER_PAD_HOLD`. | #1607 |
@@ -58,6 +69,9 @@ re-derive these without contradictory new evidence.
 * The first `[udmap]` probe tested only the raw 64-bit pointer value, so tagged-but-valid pointers read
   as `UNMAPPED`. It was corrected to use the fold's own 48-/40-bit canonicalization **before any number
   from it was trusted**. `UNMAPPED` now means the fold could not reach that address either.
+* `[udmap]` is emitted only during failure replay. Every row therefore describes a stage that already
+  failed; a readable pointer means that stage failed for another reason, not that it is a passing
+  population sample. See instrument trap 24 in `GAME_COMPAT_ORCHESTRATION.md`.
 * `PROSPER_PAD_SCRIPT` timings anchor to the **first pad poll**, not process start. Nikoderiko polls
   the pad during its logo sequence, so script time ≈ wall time here — do not assume that on another
   title.

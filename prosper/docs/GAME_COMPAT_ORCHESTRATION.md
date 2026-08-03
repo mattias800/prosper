@@ -1450,24 +1450,32 @@ The same measurement **confirms** two assumptions previously taken on faith: the
 `USER_DATA_<stage>_0 + user_data_range_start`, and the merged-stage convention that user data begins
 at shader SGPR `s8`.
 
-**Remaining candidate:** cross-queue / multi-buffer submit ordering — a larger, later `SET_SH_REG`
-whose ordered position prosper places differently from the guest's intent (another command buffer, a
-`sceAgcDcbJump` segment, or a second submit entry point).
+**Current frontier:** submit identity is already measured, not missing. For every sampled misfit the
+program bind came from a `q1` (Dcb) fold and the larger user-data write from the following `q3`
+(DcbFinal) fold; the diagnostic retains order, path, origin, fold and Jump depth in each draw
+snapshot. A separate pre-mutex instrument also records call order and thread identity. This localizes
+the mismatch but does not prove a cross-queue root cause: the default-off A/B that gave DcbFinal its
+own register file left reject counts within variance and the 3D world identically black.
 
-**Acceptance test for any proposed mechanism: it must explain the GS-versus-PS asymmetry.** Every
-traced pixel stage in this title has its declared direct pointer readable; only the vertex/GS block
-loses. A submit-ordering story that does not say why the PS block survives is incomplete.
+The earlier GS-versus-PS acceptance test is retired. The signature follows window size across the
+measured failure population: vertex windows 8/12/28 lose, vertex windows 30/32 do not, and every
+pixel stage with a declared pointer also has a 30-dword window. The open question is the hardware
+ordering/ring contract that prevents a larger required block from being paired with a smaller bound
+pipeline window; neither provenance nor stage identity answers it.
 
 **Instruments** (`PROSPER_UDPROV`, `PROSPER_BINDTRACE`, `[udcand]`, `PROSPER_SHADER_HEADER_NEWEST`,
 and the deliberately-off `PROSPER_UD_TAIL_ALIGN`) are on PR #1639, with queue/fold/jump-depth write
-provenance following. Use them rather than rebuilding the measurement.
+provenance following; `PROSPER_SUBMITORDER` adds pre-mutex call/thread identity. The synthetic
+`test_command_provenance` contract pins q1/q2/q3, fold, Jump depth, path and order propagation. Use
+them rather than rebuilding the measurement.
 
 **Instrument warning:** the diagnostics serialize draw realization, so the title screen arrives at
 ~112 s rather than ~90 s. A 200 s window times out in the pre-title load with **zero rejects** and
 looks deceptively like the issue is fixed. Budget ~440 s per run.
 
-Estimated cost: **rung 3 ≈ one to two focused sessions** if submit ordering is confirmed; the
-condition is now cheap to detect, so the remaining work is attribution and a generic contract.
+Estimated cost is **not currently bounded**: the condition and its provenance are cheap to detect,
+but the hardware ordering/ring contract is still unknown. Do not turn the negative DcbFinal split A/B
+into a default fix or claim rung 3 from this diagnostic hardening.
 
 ## Suggested allocation for a new orchestrator
 

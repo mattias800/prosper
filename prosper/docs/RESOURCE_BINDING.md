@@ -140,7 +140,7 @@ is skipped fail-visibly. Confirmed on Nikoderiko (`PPSA23760`, #1607) and DOLL /
 
 | Hypothesis | Verdict and evidence | Source |
 |---|---|---|
-| The **user-data block** is a previous pipeline's leftover (from the founding premise, "first draws run with the previous pipeline's PGM + user data" — the *user-data* half; the PGM half still holds, see **Still open** below) | **Falsified.** This was #305's founding premise and its original title; the issue was **retitled on 2026-08-01** so nobody starts from it. `PROSPER_UDPROV=1` records each SH register's last-write `command_order` and path and carries it into the per-draw snapshot: at **every** failing draw the dwords the shader dereferences were written by the **immediately preceding bind**, a handful of packets before the draw. Identical across 21 measured stages. | #305 |
+| The **user-data block** is a previous pipeline's leftover (from the founding premise, "first draws run with the previous pipeline's PGM + user data" — the *user-data* half; current q1/q3 provenance is summarized under **Current frontier** below) | **Falsified.** This was #305's founding premise and its original title; the issue was **retitled on 2026-08-01** so nobody starts from it. `PROSPER_UDPROV=1` records each SH register's last-write `command_order` and path and carries it into the per-draw snapshot: at **every** failing draw the dwords the shader dereferences were written by the **immediately preceding bind**, a handful of packets before the draw. Identical across 21 measured stages. | #305 |
 | The **shader-header registry lookup is stale** (a recycled code allocation resolves an old layout) | **Falsified.** Real hazard in shape — `prosper_agc_shader_header_for_code` returns the *first* match in an append-only registry — but measured `registrations=1` for every failing address across a 2,725-entry registry. | #305 |
 | A **bind packet is missing, dropped or mis-ordered** in the decoded stream | **Falsified.** `PROSPER_BINDTRACE=1` logs every Sh `Set*RegsIndirect` packet carrying a program register, in stream order, interleaved with draws: **0 of 141** register arrays apply more than one distinct `(es_lo, rsrc2)` over 193,397 packets, and **300,404 of 300,404** draws fold with the immediately preceding bind. Zero `SetRegsIndirect array unmapped`, zero out-of-range Sh writes. *(Use these corrected figures: the numbers first posted — 434,239 packets, 871,648 of 876,217 — were contaminated by compute dispatches mislabelled `DRAW` by the instrument itself, and the issue body still quotes them. The correction tightens the conclusion.)* | #305 correction comment |
 | The stage's user data is the **tail** of the programmed block (a constant seed shift) | **Falsified despite a 9-of-9 numeric fit.** Declared descriptors do land on clean guest pointers exactly `programmed − user_data_range_end` dwords above `USER_DATA_GS_0` — but `USER_SGPR == user_data_range_end` for every stage measured (12/12, 8/8, 24/24, 20/20, 30/30, 32/32), so the hardware loads only that many registers and the stage physically **cannot see** anything above them. A live A/B with the shifted seed raised `exec-recompile-reject` from a 118–141 baseline to **521**. Retained, **off**, as `PROSPER_UD_TAIL_ALIGN`; it must stay off. | #305 |
@@ -149,12 +149,25 @@ is skipped fail-visibly. Confirmed on Nikoderiko (`PPSA23760`, #1607) and DOLL /
 | **#1226's Acb register-file split** is dropping graphics user-data writes | **Falsified.** Measured 1,747 Acb folds with SH offsets confined to `[0x207,0x249]` and **zero** graphics user-data writes, so the split discards nothing hardware would have applied. Candidate closed. | #305 |
 | A **wrong seeding origin** or **header decode** explains the unmapped pointers | **Falsified**, and the same measurement *confirms* two assumptions previously taken on faith: the seeding base `USER_DATA_<stage>_0 + user_data_range_start` (`range_start` is 0 for every shader, `range_end` = last declared direct offset + 2), and the merged-stage convention that user data begins at shader SGPR `s8`. The shader's own `SBASE` equals the header's declared offset in all ten stages disassembled. | #1607, #305 |
 
-**Still open**, and the acceptance test for any proposed mechanism: **it must explain the
-GS-versus-PS asymmetry.** Every traced pixel stage in these titles has its declared direct pointer
-readable; only the vertex/GS block loses. The remaining candidate is cross-queue / multi-buffer
-submit ordering — for every misfitting vertex stage the pipeline was bound in a `q1` (Dcb) stream at
-fold *N* while the user-data block was written by a `q3` (`w1KFAHVqpaU` variant submit) stream at
-fold *N+1*, and every sampled failing draw is the first bind-or-draw event of its own `q3` fold.
+**Current frontier.** The source of each write is already observable: for every sampled misfit the
+pipeline was bound in a `q1` (Dcb) fold *N*, while the larger user-data block was written in the
+following `q3` (`w1KFAHVqpaU` / DcbFinal) fold *N+1*. `PROSPER_UDPROV` retains order, direct/indirect
+path, submit origin, fold and Jump depth in the draw snapshot, and `PROSPER_SUBMITORDER` independently
+records call order and thread identity before the submit mutex. Submit identity is therefore not a
+missing instrument.
+
+That provenance does **not** establish cross-queue ordering as the root cause. Giving DcbFinal a
+separate `GpuState` was tested as a default-off A/B: reject counts stayed within route variance and
+the 3D world remained identically black, so that split is ruled out as a fix. The earlier GS-versus-PS
+acceptance test is retired too. The signature appears in 8/12/28-dword vertex windows and not in
+30/32-dword vertex windows; every pixel stage with a declared pointer in the measured run also had a
+30-dword window. Window fit, not stage identity, predicts the result. What remains open is the
+hardware ordering/ring contract that prevents a larger required block from being paired with the
+smaller bound pipeline window.
+
+`test_command_provenance` pins the diagnostic contract synthetically across q1/q2/q3 origins,
+top-level folds, an inner Jump, direct/indirect paths and retained write/draw order. It protects the
+instrument; it does not fix #305 or assert the still-unknown hardware contract.
 
 **Instruments** (`PROSPER_UDPROV`, `PROSPER_BINDTRACE`, `[udcand]`, `PROSPER_SHADER_HEADER_NEWEST`,
 `PROSPER_UD_TAIL_ALIGN`) are on PR #1639 — reuse them rather than rebuilding this measurement.

@@ -671,6 +671,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_command_processor PRIVATE prosper_core)
   add_test(NAME command_processor_apply COMMAND test_command_processor)
 
+  add_executable(test_command_provenance tests/test_command_provenance.cpp)
+  target_link_libraries(test_command_provenance PRIVATE prosper_core)
+  add_test(NAME command_provenance COMMAND test_command_provenance)
+
   # Stage B: CommandProcessor honors RELEASE_MEM/WRITE_DATA memory writes (synchronous end-of-pipe).
   add_executable(test_eop_write tests/test_eop_write.cpp)
   target_link_libraries(test_eop_write PRIVATE prosper_core)
