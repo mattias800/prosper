@@ -235,7 +235,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   time unavailable and reports total GPU wait without inventing a device/host-overhead split. F8
   enables structured timing clocks but not the existing high-volume periodic stderr timing logs. A
   graceful exit before the window completes removes the private `.part` rather than publishing a
-  short final file.
+  short final file. A homogeneous compute batch also retains its run-local program address and a
+  stable SPIR-V hash; the report groups at most the ten costliest hashes by record/dispatch count,
+  total/mean/max time, and bounded address list. Mixed batches and older v1 captures report their
+  compute time as explicitly unknown identity rather than inventing a program attribution.
 
   Inspect it offline with:
 

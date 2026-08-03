@@ -6731,6 +6731,19 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
             prosper::perf::ComputeTimingRecord record;
             record.dispatches = items.size();
             record.cpu_fast_total = g_cpu_fill_dispatches.load(std::memory_order_relaxed);
+            if (!items.empty() && items.front().code_addr && !items.front().spirv.empty()) {
+                const auto& first = items.front();
+                const bool homogeneous = std::all_of(
+                    items.begin() + 1, items.end(), [&](const auto& item) {
+                        return item.code_addr == first.code_addr && item.spirv == first.spirv;
+                    });
+                if (homogeneous) {
+                    record.program_addr = first.code_addr;
+                    record.program_hash = prosper::gpu::gpu_capture_hash(
+                        reinterpret_cast<const uint8_t*>(first.spirv.data()),
+                        first.spirv.size() * sizeof(uint32_t));
+                }
+            }
             record.total_ms = elapsed;
             prosper::perf::interactive_performance_capture().record_compute(record);
         }

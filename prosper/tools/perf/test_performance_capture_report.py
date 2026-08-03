@@ -68,6 +68,32 @@ class PerformanceCaptureReportTests(unittest.TestCase):
             renderer=[{"total_ms": 20}], compute=[{"total_ms": 80}]))
         self.assertEqual(summary["classification"], "compute")
 
+    def test_compute_programs_group_by_stable_hash_and_keep_unknown_explicit(self):
+        summary = summarize(capture(SAMPLES, compute=[
+            {"total_ms": 10, "dispatches": 1, "program_addr": 0x1000,
+             "program_hash": 0xABC},
+            {"total_ms": 20, "dispatches": 2, "program_addr": 0x2000,
+             "program_hash": 0xABC},
+            {"total_ms": 5, "dispatches": 1, "program_addr": 0x3000,
+             "program_hash": 0xDEF},
+            {"total_ms": 7, "dispatches": 3, "program_addr": None,
+             "program_hash": None},
+        ]))
+        programs = summary["compute_programs"]
+        self.assertEqual(programs["group_count"], 2)
+        self.assertEqual(programs["unknown_records"], 1)
+        self.assertEqual(programs["unknown_dispatches"], 3)
+        self.assertEqual(programs["unknown_total_ms"], 7)
+        dominant = programs["groups"][0]
+        self.assertEqual(dominant["program_hash"], "0x0000000000000abc")
+        self.assertEqual(dominant["addresses"], [
+            "0x0000000000001000", "0x0000000000002000"])
+        self.assertEqual(dominant["records"], 2)
+        self.assertEqual(dominant["dispatches"], 3)
+        self.assertEqual(dominant["total_ms"], 30)
+        self.assertEqual(dominant["mean_ms"], 15)
+        self.assertEqual(dominant["max_ms"], 20)
+
     def test_cpu_outside_renderer_classification(self):
         summary = summarize(capture(SAMPLES, renderer=[{"total_ms": 100}]))
         self.assertEqual(summary["classification"], "cpu-outside-renderer")

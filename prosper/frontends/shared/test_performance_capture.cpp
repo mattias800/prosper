@@ -138,6 +138,10 @@ int main() {
         prosper::perf::ComputeTimingRecord record;
         record.monotonic_ns = 504 + i;
         record.dispatches = 7 + i;
+        if (i == 0) {
+            record.program_addr = 0x1234567800ull;
+            record.program_hash = 0xfedcba9876543210ull;
+        }
         record.total_ms = 3 + i;
         capture.record_compute(record);
     }
@@ -177,6 +181,9 @@ int main() {
           "serialized detail counts match the bounded retained records");
     check(text.find("\"gpu_timestamp_samples\":2") != std::string::npos,
           "renderer records serialize the GPU timestamp availability discriminator");
+    check(text.find("\"program_addr\":78187493376") != std::string::npos &&
+          text.find("\"program_hash\":18364758544493064720") != std::string::npos,
+          "compute records serialize the bounded program identity");
     check(text.find("\"renderer_dropped\":1,\"compute_dropped\":1") != std::string::npos,
           "footer makes detail truncation fail-visible");
     check(text.find("\"type\":\"footer\",\"complete\":true") != std::string::npos,
