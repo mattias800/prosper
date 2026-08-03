@@ -230,6 +230,9 @@ namespace {
         static DmemCallerChainInterner<> chains;
         const DmemCallerChainResult correlation = chains.intern(
             n > 0 ? ra[0] : 0, n > 1 ? ra[1] : 0);
+        host::guest_dmem_write_trace_notify_allocation(
+            phys, len,
+            correlation.state == DmemCallerChainState::Known ? correlation.id : 0);
 
         // MEMLOG is the per-allocation census. Give every one of its allocation records a correlation
         // token; the full stack remains one line per distinct bounded ID below.
@@ -2357,6 +2360,9 @@ namespace {
         static DmemCallerChainInterner<> chains;
         const DmemCallerChainResult correlation = chains.intern(
             n > 0 ? ra[0] : 0, n > 1 ? ra[1] : 0);
+        host::guest_dmem_write_trace_notify_allocation(
+            phys, len,
+            correlation.state == DmemCallerChainState::Known ? correlation.id : 0);
 
         // MEMLOG is the per-allocation census. Give every one of its allocation records a correlation
         // token; the full stack remains one line per distinct bounded ID below.

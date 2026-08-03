@@ -6,6 +6,7 @@
 #include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "../host/posix_shim.hpp"     // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
 #include "../host/runtime_module_load.hpp"   // #639: real runtime PRX loading
+#include "../host/guest_write_watch.hpp"     // flush dmem writer diagnostic before guest _Exit
 #include "callback_fs.hpp"            // recover the caller's guest %fs from the import-stub frame
 #include "sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "heap_mutex.hpp"   // #707: keep hot equeue/APR mutexes off macOS __DATA
@@ -567,6 +568,7 @@ HLE(k_load_start_mod) {   // Windows/MinGW: no import-boundary %fs swap -> guest
 // exit path fell through into its deliberate ud2 (SIGILL) — terminate for real, loudly.
 HLE(k_exit) {
     fprintf(stderr, "[prosper] guest _exit(%d) — terminating\n", (int)a0);
+    host::guest_dmem_write_trace_report();
     fflush(nullptr);
     _Exit((int)a0);
 }
@@ -576,6 +578,7 @@ HLE(k_exit) {
 HLE(k_debug_raise_release) {
     fprintf(stderr, "[prosper] guest sceKernelDebugRaiseExceptionOnReleaseMode(code=0x%llx, arg=0x%llx) — terminating\n",
             (unsigned long long)a0, (unsigned long long)a1);
+    host::guest_dmem_write_trace_report();
     fflush(nullptr);
     _Exit(0x66);
 }

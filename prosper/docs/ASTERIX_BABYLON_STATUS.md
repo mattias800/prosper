@@ -202,6 +202,37 @@ two `[dmem-caller]` lines because the diagnostic silently suppresses repeated fi
 ordinary allocation line carries no correlation token. The target allocation therefore cannot safely be
 assigned either retained chain. #1599, #1859.
 
+The corrected caller-chain instrument was then rerun on master `1ccb88da` with the same exact v46
+submit/draw/stage/binding selector. The run completed 220 presents and captured submit 181 with the same
+8 draws, 6 computes, 14 operations, zero realization failures, raw descriptor full match, and uniformly
+zero 128-byte binding. This time every one of 102 main-direct-memory allocations carried correlation:
+97 were `caller-chain=1`, five were `caller-chain=2`, and none were unknown or overflow. The selected
+address was contained by exactly one map, `[0x2011500000,0x2012500000)`, whose unique allocation record
+was `len=0x1000000`, physical `0x21500000`, `caller-chain=1`; the selected offset remained `0xdd32f0`.
+Exactly one full definition existed for chain 1. Its first guest frame, `eboot+0x1b2454f`, follows a call
+whose PLT relocation resolves to `sceKernelAllocateMainDirectMemory`, independently confirming that the
+heuristic stack value is a real return site. Capsule SHA-256 was
+`cedf5d7bea196efa58fb90a0d69c1b03359084b90e5ae8cc8cda5ff5b57ca4de`. The earlier caller arm remains
+VOID as an apparatus result; the corrected arm establishes the dynamic allocation identity. #1599, #1859,
+#1863.
+
+#1902 adds the next generic diagnostic contract. `PROSPER_DMEM_WRITE_TRACE` accepts only
+`<caller-chain>:<exact-allocation-size>:<offset>:<bytes>`; for this subject the selector is
+`1:0x1000000:0xdd32f0:128`, never a prior run's absolute VA. It waits for the correlated allocation,
+rejects a second matching allocation as ambiguous, arms every known writable alias when the selected
+physical bytes are mapped, and records initial plus bounded faulting RIP/thread/before/after history.
+Any writable alias added after the initial arm invalidates the trace: that alias existed RW before its
+mapping notification, so retroactively protecting it could not prove continuous process-wide coverage.
+The Linux canary performs the first selected write from a different thread, an unrelated same-page write,
+a second selected write after re-arm, and one event beyond the history cap. A re-arm-bypass mutation fails
+the named history checks. It also holds the trace mutex across the first post-store trap and places a marker
+store as the exact following instruction: bounded acquisition must snapshot/re-arm while still in that first
+trap, with the marker unchanged. Reintroducing the old return-to-guest retry makes that named contention
+check fail. Lock-acquisition exhaustion terminates with explicit `step-lock-timeout`; it cannot widen the
+claimed single-step window. Because one instruction executes while the page is RW, only an event whose
+`coverage-valid-before=yes` has complete process-wide pre-fault coverage; after any step, later negative
+coverage is explicitly undetermined (or invalid/overflow), per orchestration trap 68.
+
 ## Ruled out
 
 - **Unresolved T#/S# lookup:** the title-live descriptor resolves; the rejection is the sampled MIMG
@@ -279,15 +310,14 @@ assigned either retained chain. #1599, #1859.
 
 ## Next discriminators
 
-1. After #1859 lands, repeat the exact v46 selector with `PROSPER_MEMLOG=1` and
-   `PROSPER_DMEM_CALLER=1`. Accept allocation ownership only when the selected address lies in one unique
-   map, its physical allocation record carries a nonzero `caller-chain=N`, and exactly one bounded full
-   chain defines that ID. Confirm the heuristic callsite in disassembly before using it as a mapping-relative
-   selector; `unknown`, `overflow`, or a missing ID makes the arm void.
-2. With that mapping identity, build a generic process-wide CPU write watch that arms at mapping creation,
-   records initial bytes plus bounded writer RIP/thread/post-store history, proves its fault/re-arm path with
-   a cross-thread canary, and requires the later v46 selector to match its dynamically derived address. Do
-   not reuse an absolute address from another process.
+1. After #1902 lands, run one bounded v46 live arm with `PROSPER_MEMLOG=1`, `PROSPER_DMEM_CALLER=1`, and
+   `PROSPER_DMEM_WRITE_TRACE=1:0x1000000:0xdd32f0:128`. Require exactly one allocation match, at least one
+   complete mapping match, an `armed` line with initial bytes, the existing exact resource selector's own
+   full-match positive control, and a terminal trace summary. Use 64 events initially; `waiting-*`,
+   ambiguity, invalid, overflow before a selected event, or a missing terminal summary makes the arm void.
+2. If event 1 is selected and names guest code, confirm its module+offset in disassembly and follow that
+   producer. If an unrelated same-page write is event 1, later selected events remain useful writer hints but
+   cannot be called the process-wide first writer because trap 68's RW step window has opened.
 3. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
    dispatch ran and reproduces its device loss; two failures in six runs are not a stable cause.
 4. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.

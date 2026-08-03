@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -429,6 +430,24 @@ bool guest_write_watch_handle_fault(uint64_t addr) {
     return false;
 }
 
+GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t, uint64_t, int64_t) {
+    return GuestWriteWatchFaultAction::NotHandled;
+}
+GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
+        int64_t, uint64_t, GuestDmemWriteTraceEvent&) {
+    return GuestDmemWriteTraceStepAction::NotHandled;
+}
+void guest_dmem_write_trace_init_from_environment() {}
+bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig&) { return false; }
+bool guest_dmem_write_trace_enabled() { return false; }
+GuestDmemWriteTraceSnapshot guest_dmem_write_trace_snapshot() { return {}; }
+void guest_dmem_write_trace_report() {}
+void guest_dmem_write_trace_notify_allocation(uint64_t, uint64_t, uint32_t) {}
+void guest_dmem_write_trace_set_contention_hook_for_test(
+        GuestDmemWriteTraceContentionHookForTest) {}
+void guest_dmem_write_trace_lock_state_for_test() {}
+void guest_dmem_write_trace_unlock_state_for_test() {}
+
 void guest_write_watch_set_fault_onstack(bool) {}   // Windows never arms page-protection watches
 
 } // namespace prosper::host
@@ -441,6 +460,7 @@ void guest_write_watch_set_fault_onstack(bool) {}   // Windows never arms page-p
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -480,6 +500,37 @@ struct Registration {
     bool gpu_dirty = false;
 };
 
+struct DmemTracePage {
+    uint64_t phys = 0;
+    std::vector<PageAlias> aliases;
+};
+
+struct DmemTraceState {
+    GuestDmemWriteTraceConfig config{};
+    GuestDmemWriteTraceStatus status = GuestDmemWriteTraceStatus::Disabled;
+    GuestDmemWriteTraceInvalidReason invalid_reason = GuestDmemWriteTraceInvalidReason::None;
+    uint64_t allocation_matches = 0;
+    uint64_t mapping_matches = 0;
+    uint64_t page_faults = 0;
+    uint64_t selected_faults = 0;
+    uint64_t completed_steps = 0;
+    uint64_t rearms = 0;
+    uint64_t coverage_gaps = 0;
+    uint64_t overflow_events = 0;
+    uint64_t allocation_phys = 0;
+    uint64_t target_phys = 0;
+    uint64_t target_end_phys = 0;
+    uint64_t target_addr = 0;       // canonical VA from the first complete covering mapping
+    bool armed = false;
+    bool report_emitted = false;
+    int64_t stepping_tid = 0;       // one global RW single-step window at a time
+    GuestDmemWriteTraceEvent pending{};
+    std::array<uint8_t, kGuestDmemWriteTraceMaxBytes> initial{};
+    uint32_t event_count = 0;
+    std::array<GuestDmemWriteTraceEvent, kGuestDmemWriteTraceMaxEvents> events{};
+    std::vector<DmemTracePage> pages;   // at most two: selected byte count is <= 128
+};
+
 struct WatchState {
     std::mutex mutex;
     uint64_t next_id = 0;
@@ -488,8 +539,10 @@ struct WatchState {
     std::unordered_map<uint64_t, WatchedPage*> pages_by_addr;              // page-aligned VA -> page
     std::unordered_map<uint64_t, Registration> registrations;
     std::atomic<bool> fault_onstack{false};                               // red-zone-safe gate
+    DmemTraceState trace;
 };
 WatchState& state() { static WatchState* value = new WatchState; return *value; }
+std::atomic<GuestDmemWriteTraceContentionHookForTest> trace_contention_hook_for_test{nullptr};
 
 struct AtomicStats {
     std::atomic<uint64_t> create_attempts{0}, registrations{0}, registered_pages{0},
@@ -631,6 +684,204 @@ void purge_va_range_locked(WatchState& w, uint64_t begin, uint64_t end, bool rem
                                            return a.addr < end && a.addr + a.size > begin;
                                        }),
                         w.aliases.end());
+}
+
+const char* trace_status_name(GuestDmemWriteTraceStatus status) {
+    switch (status) {
+    case GuestDmemWriteTraceStatus::Disabled: return "disabled";
+    case GuestDmemWriteTraceStatus::WaitingAllocation: return "waiting-allocation";
+    case GuestDmemWriteTraceStatus::WaitingMapping: return "waiting-mapping";
+    case GuestDmemWriteTraceStatus::Armed: return "armed";
+    case GuestDmemWriteTraceStatus::Stepping: return "stepping";
+    case GuestDmemWriteTraceStatus::Invalid: return "invalid";
+    case GuestDmemWriteTraceStatus::Overflow: return "overflow";
+    }
+    return "invalid-enum";
+}
+
+const char* trace_reason_name(GuestDmemWriteTraceInvalidReason reason) {
+    switch (reason) {
+    case GuestDmemWriteTraceInvalidReason::None: return "none";
+    case GuestDmemWriteTraceInvalidReason::InvalidConfig: return "invalid-config";
+    case GuestDmemWriteTraceInvalidReason::CallerDiagnosticDisabled:
+        return "PROSPER_DMEM_CALLER-disabled";
+    case GuestDmemWriteTraceInvalidReason::UnsupportedPlatform: return "unsupported-platform";
+    case GuestDmemWriteTraceInvalidReason::NoAlternateSignalStack: return "no-alt-signal-stack";
+    case GuestDmemWriteTraceInvalidReason::AmbiguousAllocation: return "ambiguous-allocation";
+    case GuestDmemWriteTraceInvalidReason::AddressOverflow: return "address-overflow";
+    case GuestDmemWriteTraceInvalidReason::MappingTopologyChanged: return "mapping-topology-changed";
+    case GuestDmemWriteTraceInvalidReason::MappingProtectionChanged:
+        return "mapping-protection-changed";
+    case GuestDmemWriteTraceInvalidReason::HostWrite: return "host-write";
+    case GuestDmemWriteTraceInvalidReason::PhysicalWrite: return "physical-write";
+    case GuestDmemWriteTraceInvalidReason::ProtectFailed: return "protect-failed";
+    case GuestDmemWriteTraceInvalidReason::RearmFailed: return "rearm-failed";
+    }
+    return "invalid-enum";
+}
+
+bool trace_config_valid(const GuestDmemWriteTraceConfig& config) {
+    if (!config.caller_chain || !config.allocation_size || !config.size ||
+        config.size > kGuestDmemWriteTraceMaxBytes || !config.max_events ||
+        config.max_events > kGuestDmemWriteTraceMaxEvents)
+        return false;
+    return config.offset <= config.allocation_size &&
+           config.size <= config.allocation_size - config.offset;
+}
+
+bool trace_page_production_armed(const WatchState& w, uint64_t phys) {
+    const auto found = w.pages_by_phys.find(phys);
+    return found != w.pages_by_phys.end() && found->second && found->second->armed;
+}
+
+// Change the diagnostic page protections without lying to the production dirty tracker. A normal
+// diagnostic reset leaves a page read-only if GuestWriteWatch still owns it. A fault path passes
+// force_writable=true only after it has marked that production page Dirty/disarmed.
+bool set_trace_armed_locked(WatchState& w, bool armed, bool force_writable) {
+    DmemTraceState& trace = w.trace;
+    struct Changed { PageAlias alias; int from = 0; };
+    std::vector<Changed> changed;
+    for (const DmemTracePage& page : trace.pages) {
+        const bool production_armed = trace_page_production_armed(w, page.phys);
+        for (const PageAlias& alias : page.aliases) {
+            if (!cpu_writable(alias.prot)) continue;
+            const int full = host_prot(alias.prot);
+            const int prior = (trace.armed || production_armed) ? (full & ~PROT_WRITE) : full;
+            const int wanted = armed || (!force_writable && production_armed)
+                                   ? (full & ~PROT_WRITE)
+                                   : full;
+            if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)), kPage,
+                         wanted) != 0) {
+                while (!changed.empty()) {
+                    const Changed rollback = changed.back();
+                    changed.pop_back();
+                    (void)mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(rollback.alias.addr)),
+                                   kPage, rollback.from);
+                }
+                return false;
+            }
+            changed.push_back({alias, prior});
+        }
+    }
+    trace.armed = armed;
+    return true;
+}
+
+void trace_invalidate_locked(WatchState& w, GuestDmemWriteTraceInvalidReason reason,
+                             bool force_writable = false) {
+    DmemTraceState& trace = w.trace;
+    if (trace.status == GuestDmemWriteTraceStatus::Disabled ||
+        trace.status == GuestDmemWriteTraceStatus::Invalid ||
+        trace.status == GuestDmemWriteTraceStatus::Overflow)
+        return;
+    if (trace.armed) (void)set_trace_armed_locked(w, false, force_writable);
+    trace.stepping_tid = 0;
+    trace.status = GuestDmemWriteTraceStatus::Invalid;
+    trace.invalid_reason = reason;
+}
+
+bool trace_copy_target_locked(const DmemTraceState& trace,
+                              std::array<uint8_t, kGuestDmemWriteTraceMaxBytes>& out) {
+    if (!trace.config.size || trace.pages.empty()) return false;
+    uint64_t phys = trace.target_phys;
+    size_t copied = 0;
+    while (copied < trace.config.size) {
+        const uint64_t page_phys = phys & ~(kPage - 1);
+        const auto page = std::find_if(trace.pages.begin(), trace.pages.end(),
+                                       [&](const DmemTracePage& p) { return p.phys == page_phys; });
+        if (page == trace.pages.end() || page->aliases.empty()) return false;
+        const uint64_t in_page = phys - page_phys;
+        const size_t chunk = std::min<size_t>(trace.config.size - copied, kPage - in_page);
+        const uint64_t source = page->aliases.front().addr + in_page;
+        std::memcpy(out.data() + copied,
+                    reinterpret_cast<const void*>(static_cast<uintptr_t>(source)), chunk);
+        phys += chunk;
+        copied += chunk;
+    }
+    return true;
+}
+
+// Rebuild every writable VA alias for the selected physical pages. This runs only in mapping/allocation
+// normal context; the signal path consumes the already-complete bounded vectors without allocating.
+bool trace_collect_pages_locked(WatchState& w) {
+    DmemTraceState& trace = w.trace;
+    std::vector<DmemTracePage> pages;
+    for (uint64_t phys = trace.target_phys & ~(kPage - 1);
+         phys < trace.target_end_phys; phys += kPage) {
+        DmemTracePage page;
+        page.phys = phys;
+        for (const AliasRange& alias : w.aliases) {
+            if (!cpu_writable(alias.prot) || phys < alias.phys ||
+                phys > UINT64_MAX - kPage || phys + kPage > alias.phys + alias.size)
+                continue;
+            page.aliases.push_back({alias.addr + (phys - alias.phys), alias.prot});
+        }
+        if (page.aliases.empty()) return false;
+        pages.push_back(std::move(page));
+    }
+
+    uint64_t canonical = 0;
+    for (const AliasRange& alias : w.aliases) {
+        if (!cpu_writable(alias.prot) || trace.target_phys < alias.phys ||
+            trace.target_end_phys > alias.phys + alias.size)
+            continue;
+        canonical = alias.addr + (trace.target_phys - alias.phys);
+        break;
+    }
+    if (!canonical) return false;
+    trace.pages = std::move(pages);
+    trace.target_addr = canonical;
+    return true;
+}
+
+void trace_maybe_arm_locked(WatchState& w) {
+    DmemTraceState& trace = w.trace;
+    if (trace.status != GuestDmemWriteTraceStatus::WaitingMapping) return;
+    if (!w.fault_onstack.load(std::memory_order_acquire)) {
+        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::NoAlternateSignalStack);
+        return;
+    }
+    if (!trace_collect_pages_locked(w)) return;
+    if (!set_trace_armed_locked(w, true, false)) {
+        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::ProtectFailed);
+        return;
+    }
+    trace.status = GuestDmemWriteTraceStatus::Armed;
+    if (!trace_copy_target_locked(trace, trace.initial)) {
+        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::MappingTopologyChanged);
+        return;
+    }
+    std::fprintf(stderr,
+                 "[dmem-write-trace] armed caller-chain=%u allocation=0x%llx offset=0x%llx"
+                 " bytes=%u target=0x%llx target-phys=0x%llx pages=%zu\n",
+                 trace.config.caller_chain,
+                 static_cast<unsigned long long>(trace.config.allocation_size),
+                 static_cast<unsigned long long>(trace.config.offset), trace.config.size,
+                 static_cast<unsigned long long>(trace.target_addr),
+                 static_cast<unsigned long long>(trace.target_phys), trace.pages.size());
+    constexpr char hex[] = "0123456789abcdef";
+    char line[64 + kGuestDmemWriteTraceMaxBytes * 2] = {};
+    const char prefix[] = "[dmem-write-trace] initial=";
+    size_t used = sizeof(prefix) - 1;
+    std::memcpy(line, prefix, used);
+    for (uint32_t i = 0; i < trace.config.size; ++i) {
+        line[used++] = hex[trace.initial[i] >> 4];
+        line[used++] = hex[trace.initial[i] & 0xf];
+    }
+    line[used++] = '\n';
+    (void)std::fwrite(line, 1, used, stderr);
+}
+
+bool trace_va_to_phys_locked(const DmemTraceState& trace, uint64_t addr, uint64_t& phys) {
+    const uint64_t page_addr = addr & ~(kPage - 1);
+    for (const DmemTracePage& page : trace.pages) {
+        for (const PageAlias& alias : page.aliases) {
+            if ((alias.addr & ~(kPage - 1)) != page_addr) continue;
+            phys = page.phys + (addr - page_addr);
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -848,9 +1099,187 @@ GuestWriteWatchStats guest_write_watch_stats() {
             v.physical_writes.load(), v.rearms.load()};
 }
 
+bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig& config) {
+    WatchState& w = state();
+    std::lock_guard lock(w.mutex);
+    if (w.trace.armed) (void)set_trace_armed_locked(w, false, false);
+    w.trace = {};
+    w.trace.config = config;
+    if (!trace_config_valid(config)) {
+        w.trace.status = GuestDmemWriteTraceStatus::Invalid;
+        w.trace.invalid_reason = GuestDmemWriteTraceInvalidReason::InvalidConfig;
+        return false;
+    }
+#if !defined(__linux__)
+    w.trace.status = GuestDmemWriteTraceStatus::Invalid;
+    w.trace.invalid_reason = GuestDmemWriteTraceInvalidReason::UnsupportedPlatform;
+    return false;
+#else
+    w.trace.status = GuestDmemWriteTraceStatus::WaitingAllocation;
+    std::fprintf(stderr,
+                 "[dmem-write-trace] configured caller-chain=%u allocation=0x%llx"
+                 " offset=0x%llx bytes=%u max-events=%u\n",
+                 config.caller_chain, static_cast<unsigned long long>(config.allocation_size),
+                 static_cast<unsigned long long>(config.offset), config.size, config.max_events);
+    return true;
+#endif
+}
+
+void guest_dmem_write_trace_init_from_environment() {
+    const char* value = std::getenv("PROSPER_DMEM_WRITE_TRACE");
+    if (!value || !*value) return;
+
+    GuestDmemWriteTraceConfig config{};
+    uint64_t parsed[4] = {};
+    const char* cursor = value;
+    bool valid = true;
+    for (int i = 0; i < 4; ++i) {
+        char* end = nullptr;
+        parsed[i] = std::strtoull(cursor, &end, 0);
+        if (end == cursor || (i < 3 ? *end != ':' : *end != '\0')) {
+            valid = false;
+            break;
+        }
+        cursor = end + (i < 3 ? 1 : 0);
+    }
+    config.caller_chain = parsed[0] <= UINT32_MAX ? static_cast<uint32_t>(parsed[0]) : 0;
+    config.allocation_size = parsed[1];
+    config.offset = parsed[2];
+    config.size = parsed[3] <= UINT32_MAX ? static_cast<uint32_t>(parsed[3]) : 0;
+    config.max_events = 32;
+    if (const char* max_value = std::getenv("PROSPER_DMEM_WRITE_TRACE_MAX_EVENTS")) {
+        char* end = nullptr;
+        const unsigned long parsed_max = std::strtoul(max_value, &end, 0);
+        if (end == max_value || *end != '\0' || parsed_max > UINT32_MAX)
+            valid = false;
+        else
+            config.max_events = static_cast<uint32_t>(parsed_max);
+    }
+    if (!valid) config = {};
+    const bool configured = guest_dmem_write_trace_configure(config);
+    if (configured && !std::getenv("PROSPER_DMEM_CALLER")) {
+        WatchState& w = state();
+        std::lock_guard lock(w.mutex);
+        w.trace.status = GuestDmemWriteTraceStatus::Invalid;
+        w.trace.invalid_reason = GuestDmemWriteTraceInvalidReason::CallerDiagnosticDisabled;
+        std::fprintf(stderr,
+                     "[dmem-write-trace] invalid reason=PROSPER_DMEM_CALLER-disabled\n");
+    } else if (!configured) {
+        std::fprintf(stderr,
+                     "[dmem-write-trace] invalid reason=invalid-config"
+                     " expected=<chain>:<allocation-size>:<offset>:<bytes>\n");
+    }
+    static const bool report_registered = [] {
+        return std::atexit(guest_dmem_write_trace_report) == 0;
+    }();
+    (void)report_registered;
+}
+
+bool guest_dmem_write_trace_enabled() {
+    WatchState& w = state();
+    std::lock_guard lock(w.mutex);
+    return w.trace.status != GuestDmemWriteTraceStatus::Disabled;
+}
+
+GuestDmemWriteTraceSnapshot guest_dmem_write_trace_snapshot() {
+    WatchState& w = state();
+    std::lock_guard lock(w.mutex);
+    const DmemTraceState& trace = w.trace;
+    GuestDmemWriteTraceSnapshot out;
+    out.config = trace.config;
+    out.status = trace.status;
+    out.invalid_reason = trace.invalid_reason;
+    out.allocation_matches = trace.allocation_matches;
+    out.mapping_matches = trace.mapping_matches;
+    out.page_faults = trace.page_faults;
+    out.selected_faults = trace.selected_faults;
+    out.completed_steps = trace.completed_steps;
+    out.rearms = trace.rearms;
+    out.coverage_gaps = trace.coverage_gaps;
+    out.overflow_events = trace.overflow_events;
+    out.target_phys = trace.target_phys;
+    out.target_addr = trace.target_addr;
+    out.initial = trace.initial;
+    out.event_count = trace.event_count;
+    out.events = trace.events;
+    return out;
+}
+
+void guest_dmem_write_trace_report() {
+    WatchState& w = state();
+    std::lock_guard lock(w.mutex);
+    DmemTraceState& trace = w.trace;
+    if (trace.status == GuestDmemWriteTraceStatus::Disabled || trace.report_emitted) return;
+    trace.report_emitted = true;
+    const bool valid_negative = trace.status == GuestDmemWriteTraceStatus::Armed &&
+                                trace.selected_faults == 0 && trace.coverage_gaps == 0;
+    const char* result = trace.selected_faults ? "writer-observed"
+                         : valid_negative ? "no-selected-write-observed"
+                                          : "undetermined";
+    std::fprintf(stderr,
+                 "[dmem-write-trace] summary status=%s reason=%s result=%s"
+                 " allocation-matches=%llu mapping-matches=%llu page-faults=%llu"
+                 " selected-faults=%llu steps=%llu rearms=%llu coverage-gaps=%llu"
+                 " overflow=%llu events=%u/%u\n",
+                 trace_status_name(trace.status), trace_reason_name(trace.invalid_reason), result,
+                 static_cast<unsigned long long>(trace.allocation_matches),
+                 static_cast<unsigned long long>(trace.mapping_matches),
+                 static_cast<unsigned long long>(trace.page_faults),
+                 static_cast<unsigned long long>(trace.selected_faults),
+                 static_cast<unsigned long long>(trace.completed_steps),
+                 static_cast<unsigned long long>(trace.rearms),
+                 static_cast<unsigned long long>(trace.coverage_gaps),
+                 static_cast<unsigned long long>(trace.overflow_events), trace.event_count,
+                 trace.config.max_events);
+}
+
+void guest_dmem_write_trace_notify_allocation(uint64_t phys, uint64_t size, uint32_t chain_id) {
+    WatchState& w = state();
+    std::lock_guard lock(w.mutex);
+    DmemTraceState& trace = w.trace;
+    if (trace.status != GuestDmemWriteTraceStatus::WaitingAllocation &&
+        trace.status != GuestDmemWriteTraceStatus::WaitingMapping &&
+        trace.status != GuestDmemWriteTraceStatus::Armed &&
+        trace.status != GuestDmemWriteTraceStatus::Stepping)
+        return;
+    if (chain_id != trace.config.caller_chain || size != trace.config.allocation_size) return;
+    ++trace.allocation_matches;
+    if (trace.allocation_matches != 1) {
+        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::AmbiguousAllocation,
+                                trace.status == GuestDmemWriteTraceStatus::Stepping);
+        std::fprintf(stderr,
+                     "[dmem-write-trace] invalid reason=ambiguous-allocation"
+                     " caller-chain=%u allocation=0x%llx matches=%llu\n",
+                     chain_id, static_cast<unsigned long long>(size),
+                     static_cast<unsigned long long>(trace.allocation_matches));
+        return;
+    }
+    if (phys > UINT64_MAX - trace.config.offset ||
+        phys + trace.config.offset > UINT64_MAX - trace.config.size) {
+        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::AddressOverflow);
+        return;
+    }
+    trace.allocation_phys = phys;
+    trace.target_phys = phys + trace.config.offset;
+    trace.target_end_phys = trace.target_phys + trace.config.size;
+    trace.status = GuestDmemWriteTraceStatus::WaitingMapping;
+    std::fprintf(stderr,
+                 "[dmem-write-trace] allocation-match caller-chain=%u phys=0x%llx"
+                 " allocation=0x%llx target-phys=0x%llx\n",
+                 chain_id, static_cast<unsigned long long>(phys),
+                 static_cast<unsigned long long>(size),
+                 static_cast<unsigned long long>(trace.target_phys));
+    trace_maybe_arm_locked(w);
+}
+
 void guest_write_watch_set_fault_onstack(bool on_altstack) {
 #if defined(__linux__)
-    state().fault_onstack.store(on_altstack, std::memory_order_release);
+    WatchState& w = state();
+    w.fault_onstack.store(on_altstack, std::memory_order_release);
+    if (!on_altstack) {
+        std::lock_guard lock(w.mutex);
+        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::NoAlternateSignalStack);
+    }
 #else
     // Only Linux wires handle_fault to the write-protect fault (SIGSEGV). Darwin delivers a
     // write-to-read-only-page fault as SIGBUS, which this handler is NOT hooked for, so an armed page's
@@ -875,6 +1304,27 @@ void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size,
     // cannot resolve to the old phys. The common fresh-VA path skips the O(watched pages) scan.
     if (va_range_has_alias(w, begin, end)) purge_va_range_locked(w, begin, end, /*remove_topology=*/true);
     w.aliases.push_back({addr, size, phys, protection});
+
+    DmemTraceState& trace = w.trace;
+    const bool trace_overlap =
+        (trace.status == GuestDmemWriteTraceStatus::WaitingMapping ||
+         trace.status == GuestDmemWriteTraceStatus::Armed ||
+         trace.status == GuestDmemWriteTraceStatus::Stepping) &&
+        phys < trace.target_end_phys && phys + size > trace.target_phys;
+    if (trace_overlap) {
+        ++trace.mapping_matches;
+        if (trace.status == GuestDmemWriteTraceStatus::Stepping) {
+            trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::MappingTopologyChanged,
+                                    true);
+        } else if (trace.status == GuestDmemWriteTraceStatus::Armed) {
+            // The new alias was writable between mmap and this notification. Even if we protect it
+            // now, another thread could already have written through that process-wide coverage gap.
+            // Invalidate instead of pretending the original arm remained complete.
+            trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::MappingTopologyChanged);
+        } else {
+            trace_maybe_arm_locked(w);
+        }
+    }
 
     // A new alias to an already-watched physical page must be armed too, or a write through it would not
     // fault and the renderer would trust a stale texture (review B2). Same-phys aliasing does not change
@@ -901,6 +1351,16 @@ void guest_write_watch_notify_direct_mapping_removed(uint64_t addr, uint64_t siz
     std::lock_guard lock(w.mutex);
     const uint64_t begin = addr & ~(kPage - 1);
     const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);
+    if (w.trace.status == GuestDmemWriteTraceStatus::Armed ||
+        w.trace.status == GuestDmemWriteTraceStatus::Stepping) {
+        bool overlap = false;
+        for (const DmemTracePage& page : w.trace.pages)
+            for (const PageAlias& alias : page.aliases)
+                if (alias.addr < end && alias.addr + kPage > begin) overlap = true;
+        if (overlap)
+            trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::MappingTopologyChanged,
+                                    w.trace.status == GuestDmemWriteTraceStatus::Stepping);
+    }
     // k_munmap calls this for EVERY unmap (including non-dmem heap frees); skip the O(watched pages) scan
     // unless a dmem alias actually overlaps. When one does, drop coverage for EVERY page of the removed
     // range (not just the first) and delete emptied pages so no stale WatchedPage / pages_by_addr entry
@@ -915,6 +1375,16 @@ void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t 
     if (!w.fault_onstack.load(std::memory_order_acquire)) return;   // feature off -> nothing tracked
     std::lock_guard lock(w.mutex);
     const uint64_t end = addr + size;
+    if (w.trace.status == GuestDmemWriteTraceStatus::Armed ||
+        w.trace.status == GuestDmemWriteTraceStatus::Stepping) {
+        bool overlap = false;
+        for (const DmemTracePage& page : w.trace.pages)
+            for (const PageAlias& alias : page.aliases)
+                if (alias.addr < end && alias.addr + kPage > addr) overlap = true;
+        if (overlap)
+            trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::MappingProtectionChanged,
+                                    w.trace.status == GuestDmemWriteTraceStatus::Stepping);
+    }
     // A guest re-protect may cover only PART of an alias. Overwriting the whole AliasRange.prot would
     // mis-record the untouched remainder: if the change makes part read-only, the still-writable part
     // would read as non-writable, a future create() would skip arming it, and a CPU write there would go
@@ -940,6 +1410,11 @@ void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size) {
     if (!size) return;
     WatchState& w = state();
     std::lock_guard lock(w.mutex);
+    if ((w.trace.status == GuestDmemWriteTraceStatus::Armed ||
+         w.trace.status == GuestDmemWriteTraceStatus::Stepping) &&
+        phys < w.trace.target_end_phys && phys + size > w.trace.target_phys)
+        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::PhysicalWrite,
+                                w.trace.status == GuestDmemWriteTraceStatus::Stepping);
     bump(stats().physical_writes);
     invalidate_phys_range_locked(w, phys, phys + size);
 }
@@ -959,6 +1434,16 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     const uint64_t begin = addr & ~(kPage - 1);
     const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);
     if (!va_range_has_alias(w, begin, end)) return;   // not a dmem buffer -> skip the per-page scan
+    if (w.trace.status == GuestDmemWriteTraceStatus::Armed ||
+        w.trace.status == GuestDmemWriteTraceStatus::Stepping) {
+        uint64_t ignored_phys = 0;
+        bool overlap = false;
+        for (uint64_t va = begin; va < end && !overlap; va += kPage)
+            overlap = trace_va_to_phys_locked(w.trace, va, ignored_phys);
+        if (overlap)
+            trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::HostWrite,
+                                    true);
+    }
     std::vector<WatchedPage*> hit;
     for (uint64_t va = begin; va < end; va += kPage) {
         auto it = w.pages_by_addr.find(va);
@@ -975,6 +1460,23 @@ void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size) {
     if (!w.fault_onstack.load(std::memory_order_acquire)) return;
     const uint64_t end = addr + size;
     std::lock_guard lock(w.mutex);
+    if (w.trace.status == GuestDmemWriteTraceStatus::Armed ||
+        w.trace.status == GuestDmemWriteTraceStatus::Stepping) {
+        bool overlap = false;
+        for (const DmemTracePage& page : w.trace.pages) {
+            for (const PageAlias& alias : page.aliases) {
+                const uint64_t selected_begin = alias.addr +
+                    (w.trace.target_phys > page.phys ? w.trace.target_phys - page.phys : 0);
+                const uint64_t selected_end = alias.addr +
+                    (w.trace.target_end_phys < page.phys + kPage
+                         ? w.trace.target_end_phys - page.phys : kPage);
+                if (addr < selected_end && end > selected_begin) overlap = true;
+            }
+        }
+        if (overlap)
+            trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::PhysicalWrite,
+                                    w.trace.status == GuestDmemWriteTraceStatus::Stepping);
+    }
     for (auto& [id, registration] : w.registrations) {
         (void)id;
         if (registration.begin < end && addr < registration.end)
@@ -992,15 +1494,14 @@ void guest_write_watch_invalidate_all() {
     for (WatchedPage* page : all) page->generation++;
 }
 
-// Called from the SIGSEGV handler (exec_image_linux fault_handler) for every write fault. Returns true
-// ONLY for an address we armed: it disarms that physical page's aliases (so the store re-executes and
-// succeeds) and bumps the generation so the owning registration reads Dirty. Returns false otherwise,
-// so a genuine guest fault is untouched. Must be async-signal-safe: a plain mutex is not, so this uses
-// try_lock and, on contention, leaves the page armed (the store re-faults and retries) rather than
-// blocking in signal context.
-bool guest_write_watch_handle_fault(uint64_t addr) {
+// Unified page-fault path for the production dirty bit and the opt-in dmem provenance overlay. The
+// latter single-steps exactly one faulting store so it can retain before/after bytes; all vectors are
+// built before arming, so this signal path performs no allocation.
+GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint64_t writer_rip,
+                                                             int64_t tid) {
     WatchState& w = state();
-    if (!w.fault_onstack.load(std::memory_order_acquire)) return false;
+    if (!w.fault_onstack.load(std::memory_order_acquire))
+        return GuestWriteWatchFaultAction::NotHandled;
     std::unique_lock<std::mutex> lock(w.mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
         // Contended. We CANNOT decide ownership without the lock (pages_by_addr is being mutated), and
@@ -1011,13 +1512,43 @@ bool guest_write_watch_handle_fault(uint64_t addr) {
         // so it always frees; a genuine (non-watched) fault then re-enters, wins the lock, and takes the
         // false path below into the real fault handler. sched_yield keeps the retry from spinning hot.
         sched_yield();
-        return true;
+        return GuestWriteWatchFaultAction::Resume;
     }
     const uint64_t fault_page = addr & ~(kPage - 1);
-    auto it = w.pages_by_addr.find(fault_page);
-    if (it == w.pages_by_addr.end() || !it->second) return false;
-    WatchedPage* page = it->second;
-    if (!page->armed) {
+    auto production_found = w.pages_by_addr.find(fault_page);
+    WatchedPage* production_page = production_found == w.pages_by_addr.end()
+                                       ? nullptr : production_found->second;
+    uint64_t trace_fault_phys = 0;
+    const bool trace_page =
+        (w.trace.status == GuestDmemWriteTraceStatus::Armed ||
+         w.trace.status == GuestDmemWriteTraceStatus::Stepping) &&
+        trace_va_to_phys_locked(w.trace, addr, trace_fault_phys);
+    if (!production_page && !trace_page) return GuestWriteWatchFaultAction::NotHandled;
+
+    bool production_handled = false;
+    auto disarm_production_page = [&](WatchedPage* page) {
+        if (!page || !page->armed) return;
+        bool restored = true;
+        bool faulting_alias_restored = page != production_page;
+        for (const PageAlias& alias : page->aliases) {
+            if (!cpu_writable(alias.prot)) continue;
+            const bool ok = mprotect(
+                reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)), kPage,
+                host_prot(alias.prot)) == 0;
+            if (!ok)
+                restored = false;
+            if ((alias.addr & ~(kPage - 1)) == fault_page && ok)
+                faulting_alias_restored = true;
+        }
+        page->generation++;
+        // Preserve #1144's stale-alias contract: a failure on a non-faulting alias must not leave the
+        // successfully restored faulting VA logically armed. For diagnostic-only sibling pages there
+        // is no faulting VA, so require the complete restore instead.
+        if (page == production_page ? faulting_alias_restored : restored) page->armed = false;
+        production_handled = true;
+    };
+
+    if (production_page && !production_page->armed && !trace_page) {
         // Two guest workers can take the same RO-page fault before either signal handler runs. The
         // first handler restores RW and clears `armed`; the second delivery is already queued and used
         // to fall through as a fatal guest fault despite the store now being safe to retry (Cobra's
@@ -1029,30 +1560,173 @@ bool guest_write_watch_handle_fault(uint64_t addr) {
                 return fault_page >= alias.addr && fault_page < alias.addr + alias.size &&
                        cpu_writable(alias.prot);
             });
-        if (!live_cpu_writable) return false;
+        if (!live_cpu_writable) return GuestWriteWatchFaultAction::NotHandled;
         bump(stats().faults);
         bump(stats().stale_faults);
-        return true;
+        return GuestWriteWatchFaultAction::Resume;
     }
-    // Allocation-free (signal context): restore write directly on the page's aliases. mprotect is a
-    // syscall; the alias vector is already allocated and mutation-protected by the held lock. Do NOT
-    // call set_pages_armed here — its rollback vector would malloc, which can deadlock a thread caught
-    // mid-allocation. Track whether the FAULTING alias itself was restored: if that mprotect failed the
-    // store would re-fault forever, so keep the page armed (retry) rather than clearing it and dropping
-    // into the fatal handler on the next fault. Disarming (RO->RW) merges VMAs and effectively never
-    // fails, so this is a belt-and-braces guard, not an expected path.
-    bool faulting_alias_restored = true;
-    for (const PageAlias& al : page->aliases) {
-        if (!cpu_writable(al.prot)) continue;
-        const bool ok = mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(al.addr)), kPage,
-                                 host_prot(al.prot)) == 0;
-        if (!ok && (al.addr & ~(kPage - 1)) == fault_page) faulting_alias_restored = false;
+
+    if (trace_page && w.trace.status == GuestDmemWriteTraceStatus::Stepping) {
+        // A sibling already had this page fault queued before the first handler opened the global RW
+        // single-step window. It can now resume, but the window means later negative coverage is void.
+        if (w.trace.stepping_tid != tid) ++w.trace.coverage_gaps;
+        disarm_production_page(production_page);
+        if (production_handled) bump(stats().faults);
+        return GuestWriteWatchFaultAction::Resume;
     }
-    page->generation++;   // the store is about to land -> the page is Dirty regardless
-    bump(stats().faults);
-    if (faulting_alias_restored) page->armed = false;
-    return true;
+
+    if (!trace_page) {
+        disarm_production_page(production_page);
+        if (production_handled) bump(stats().faults);
+        return production_handled ? GuestWriteWatchFaultAction::Resume
+                                  : GuestWriteWatchFaultAction::NotHandled;
+    }
+
+    // The diagnostic opens every selected physical page for the one stepped instruction. Mark any
+    // production registrations for those pages Dirty first, so the overlay cannot make a cache watch
+    // silently miss the same store.
+    for (const DmemTracePage& trace_page_entry : w.trace.pages) {
+        const auto found = w.pages_by_phys.find(trace_page_entry.phys);
+        if (found != w.pages_by_phys.end()) disarm_production_page(found->second.get());
+    }
+    if (production_handled) bump(stats().faults);
+
+    ++w.trace.page_faults;
+    if (w.trace.event_count >= w.trace.config.max_events) {
+        for (const DmemTracePage& page : w.trace.pages)
+            for (const PageAlias& alias : page.aliases)
+                if (cpu_writable(alias.prot))
+                    (void)mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
+                                   kPage, host_prot(alias.prot));
+        w.trace.armed = false;
+        w.trace.status = GuestDmemWriteTraceStatus::Overflow;
+        ++w.trace.overflow_events;
+        ++w.trace.coverage_gaps;
+        return GuestWriteWatchFaultAction::Resume;
+    }
+
+    GuestDmemWriteTraceEvent pending{};
+    pending.ordinal = w.trace.page_faults;
+    pending.fault_addr = addr;
+    pending.fault_phys = trace_fault_phys;
+    pending.writer_rip = writer_rip;
+    pending.tid = tid;
+    pending.size = w.trace.config.size;
+    pending.selected = trace_fault_phys >= w.trace.target_phys &&
+                       trace_fault_phys < w.trace.target_end_phys;
+    pending.coverage_valid_before = w.trace.coverage_gaps == 0;
+    if (!trace_copy_target_locked(w.trace, pending.before)) {
+        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::MappingTopologyChanged, true);
+        return production_handled ? GuestWriteWatchFaultAction::Resume
+                                  : GuestWriteWatchFaultAction::NotHandled;
+    }
+
+    bool faulting_alias_restored = false;
+    bool all_restored = true;
+    for (const DmemTracePage& page : w.trace.pages) {
+        for (const PageAlias& alias : page.aliases) {
+            if (!cpu_writable(alias.prot)) continue;
+            const bool ok = mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
+                                     kPage, host_prot(alias.prot)) == 0;
+            if (!ok) all_restored = false;
+            if ((alias.addr & ~(kPage - 1)) == fault_page && ok) faulting_alias_restored = true;
+        }
+    }
+    if (!faulting_alias_restored) {
+        w.trace.armed = false;
+        w.trace.status = GuestDmemWriteTraceStatus::Invalid;
+        w.trace.invalid_reason = GuestDmemWriteTraceInvalidReason::ProtectFailed;
+        return production_handled ? GuestWriteWatchFaultAction::Resume
+                                  : GuestWriteWatchFaultAction::NotHandled;
+    }
+    if (!all_restored) {
+        w.trace.invalid_reason = GuestDmemWriteTraceInvalidReason::ProtectFailed;
+        ++w.trace.coverage_gaps;
+    }
+    if (pending.selected) ++w.trace.selected_faults;
+    w.trace.pending = pending;
+    w.trace.armed = false;
+    w.trace.stepping_tid = tid;
+    w.trace.status = GuestDmemWriteTraceStatus::Stepping;
+    return GuestWriteWatchFaultAction::SingleStep;
 }
+
+bool guest_write_watch_handle_fault(uint64_t addr) {
+    return guest_write_watch_handle_fault_ex(addr, 0, 0) !=
+           GuestWriteWatchFaultAction::NotHandled;
+}
+
+GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
+        int64_t tid, uint64_t next_rip, GuestDmemWriteTraceEvent& event) {
+    WatchState& w = state();
+    std::unique_lock<std::mutex> lock(w.mutex, std::defer_lock);
+    // The fault handler released this mutex before returning to the one stepped store, so this thread
+    // cannot own it. A different thread may briefly hold it in a normal mapping/query operation. Do
+    // not return to guest code while TF is set and every selected alias is RW: doing so would let an
+    // arbitrary number of instructions execute before the purported post-store snapshot. Instead,
+    // wait here for a bounded number of non-blocking acquisitions. Exhaustion is a fatal diagnostic
+    // verdict in the signal caller, not a retry that silently widens the capture window.
+    constexpr uint32_t kMaxStepLockAttempts = 1u << 20;
+    bool contention_hook_called = false;
+    for (uint32_t attempt = 0; attempt < kMaxStepLockAttempts && !lock.try_lock(); ++attempt) {
+        if (!contention_hook_called) {
+            contention_hook_called = true;
+            if (auto hook = trace_contention_hook_for_test.load(std::memory_order_acquire)) hook();
+        }
+        sched_yield();
+    }
+    if (!lock.owns_lock()) return GuestDmemWriteTraceStepAction::LockTimeout;
+    DmemTraceState& trace = w.trace;
+    if (trace.status != GuestDmemWriteTraceStatus::Stepping || trace.stepping_tid != tid)
+        return GuestDmemWriteTraceStepAction::NotHandled;
+
+    trace.pending.next_rip = next_rip;
+    const bool copied = trace_copy_target_locked(trace, trace.pending.after);
+    bool rearmed = copied && trace.invalid_reason == GuestDmemWriteTraceInvalidReason::None;
+    if (rearmed) {
+        for (const DmemTracePage& page : trace.pages) {
+            for (const PageAlias& alias : page.aliases) {
+                if (!cpu_writable(alias.prot)) continue;
+                if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)), kPage,
+                             host_prot(alias.prot) & ~PROT_WRITE) != 0)
+                    rearmed = false;
+            }
+        }
+    }
+    if (!rearmed) {
+        // A partial re-arm is worse than no watch: restore every alias RW and make the invalidity explicit.
+        for (const DmemTracePage& page : trace.pages)
+            for (const PageAlias& alias : page.aliases)
+                if (cpu_writable(alias.prot))
+                    (void)mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
+                                   kPage, host_prot(alias.prot));
+        trace.armed = false;
+        trace.status = GuestDmemWriteTraceStatus::Invalid;
+        if (trace.invalid_reason == GuestDmemWriteTraceInvalidReason::None)
+            trace.invalid_reason = copied ? GuestDmemWriteTraceInvalidReason::RearmFailed
+                                          : GuestDmemWriteTraceInvalidReason::MappingTopologyChanged;
+    } else {
+        trace.armed = true;
+        trace.status = GuestDmemWriteTraceStatus::Armed;
+        ++trace.rearms;
+    }
+    trace.pending.rearmed = rearmed;
+    ++trace.completed_steps;
+    ++trace.coverage_gaps;   // process-wide RO coverage is not provable during the RW single-step window
+    trace.events[trace.event_count++] = trace.pending;
+    event = trace.pending;
+    trace.pending = {};
+    trace.stepping_tid = 0;
+    return GuestDmemWriteTraceStepAction::Complete;
+}
+
+void guest_dmem_write_trace_set_contention_hook_for_test(
+        GuestDmemWriteTraceContentionHookForTest hook) {
+    trace_contention_hook_for_test.store(hook, std::memory_order_release);
+}
+
+void guest_dmem_write_trace_lock_state_for_test() { state().mutex.lock(); }
+void guest_dmem_write_trace_unlock_state_for_test() { state().mutex.unlock(); }
 
 } // namespace prosper::host
 

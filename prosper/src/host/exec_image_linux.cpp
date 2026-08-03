@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cerrno>
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <atomic>
@@ -1025,11 +1026,21 @@ namespace {
     // continuing through the ordinary fault path. Keep this helper stack-protector-free because it
     // deliberately changes %fs within its own frame.
     __attribute__((no_stack_protector))
-    bool handle_guest_write_watch_fault(uint64_t addr) {
+    prosper::host::GuestWriteWatchFaultAction handle_guest_write_watch_fault(
+            uint64_t addr, uint64_t rip, int64_t tid) {
         const uint64_t saved_guest_fs = guest_fs_to_host_scoped();
-        const bool handled = prosper::host::guest_write_watch_handle_fault(addr);
+        const auto handled = prosper::host::guest_write_watch_handle_fault_ex(addr, rip, tid);
         guest_fs_restore_scoped(saved_guest_fs);
         return handled;
+    }
+
+    __attribute__((no_stack_protector))
+    prosper::host::GuestDmemWriteTraceStepAction complete_guest_dmem_write_trace_step(
+            int64_t tid, uint64_t next_rip, prosper::host::GuestDmemWriteTraceEvent& event) {
+        const uint64_t saved_guest_fs = guest_fs_to_host_scoped();
+        const auto result = prosper::host::guest_dmem_write_trace_complete_step(tid, next_rip, event);
+        guest_fs_restore_scoped(saved_guest_fs);
+        return result;
     }
 
     // NO stack-protector here: the canary lives at %fs:0x28, and this handler runs on whatever %fs the
@@ -1050,13 +1061,78 @@ namespace {
         if ((sig == SIGSEGV || sig == SIGBUS) && try_emulate_fs_access((ucontext_t*)uctx, (uint64_t)si->si_addr))
             return;
 #endif
+        // The dmem writer overlay opens its watched page for exactly one instruction. Complete that
+        // TF step before any unrelated breakpoint machinery sees the trace trap, retain post-store
+        // bytes, and re-arm. A contended state lock is acquired without returning to guest execution;
+        // exhaustion is fatal and fail-visible rather than silently stepping additional instructions.
+        if (sig == SIGTRAP && si->si_code == TRAP_TRACE) {
+            auto* uc = (ucontext_t*)uctx;
+            prosper::host::GuestDmemWriteTraceEvent event{};
+            const auto step = complete_guest_dmem_write_trace_step(
+                cur_tid(), static_cast<uint64_t>(PROSPER_GREGS(uc)[REG_RIP]), event);
+            if (step == prosper::host::GuestDmemWriteTraceStepAction::LockTimeout) {
+                static constexpr char message[] =
+                    "[dmem-write-trace] invalid reason=step-lock-timeout\n";
+                raw_write(2, message, sizeof(message) - 1);
+                _exit(190);
+            }
+            if (step == prosper::host::GuestDmemWriteTraceStepAction::Complete) {
+                PROSPER_GREGS(uc)[REG_EFL] &= ~0x100ll;
+                const uint64_t saved_guest_fs = guest_fs_to_host_scoped();
+                constexpr char hex[] = "0123456789abcdef";
+                char line[1024] = {};
+                const bool guest = gin(event.writer_rip);
+                int written = snprintf(
+                    line, sizeof line,
+                    "[dmem-write-trace] event=%llu selected=%s coverage-valid-before=%s"
+                    " fault=0x%llx phys=0x%llx writer=%s%s0x%llx next=0x%llx tid=%lld"
+                    " rearmed=%s before=",
+                    static_cast<unsigned long long>(event.ordinal), event.selected ? "yes" : "no",
+                    event.coverage_valid_before ? "yes" : "no",
+                    static_cast<unsigned long long>(event.fault_addr),
+                    static_cast<unsigned long long>(event.fault_phys),
+                    guest ? gmod(event.writer_rip) : "host", guest ? "+" : ":",
+                    static_cast<unsigned long long>(guest ? goff(event.writer_rip)
+                                                          : event.writer_rip),
+                    static_cast<unsigned long long>(event.next_rip),
+                    static_cast<long long>(event.tid), event.rearmed ? "yes" : "no");
+                size_t used = written > 0
+                                  ? std::min<size_t>(static_cast<size_t>(written), sizeof(line) - 1)
+                                  : 0;
+                auto append_bytes = [&](const auto& bytes) {
+                    for (uint32_t i = 0; i < event.size && used + 2 < sizeof(line); ++i) {
+                        line[used++] = hex[bytes[i] >> 4];
+                        line[used++] = hex[bytes[i] & 0xf];
+                    }
+                };
+                append_bytes(event.before);
+                const char middle[] = " post=";
+                if (used + sizeof(middle) < sizeof(line)) {
+                    std::memcpy(line + used, middle, sizeof(middle) - 1);
+                    used += sizeof(middle) - 1;
+                }
+                append_bytes(event.after);
+                if (used < sizeof(line)) line[used++] = '\n';
+                raw_write(2, line, used);
+                guest_fs_restore_scoped(saved_guest_fs);
+                return;
+            }
+        }
         // Texture write-watch (#1144): a guest store into a page we armed read-only for cross-submit
         // dirty-tracking. Restore the page (all its aliases) to writable, mark it dirty, and resume so
         // the store re-executes. Returns false for any address we did not arm, so genuine guest faults
         // fall through untouched. Only ever true when this handler is on the sigaltstack (red-zone-safe).
-        if (sig == SIGSEGV && si->si_addr &&
-            handle_guest_write_watch_fault(reinterpret_cast<uint64_t>(si->si_addr)))
-            return;
+        if (sig == SIGSEGV && si->si_addr) {
+            auto* uc = (ucontext_t*)uctx;
+            if (PROSPER_REG_ERR(uc) & 2) {
+                const auto action = handle_guest_write_watch_fault(
+                    reinterpret_cast<uint64_t>(si->si_addr),
+                    static_cast<uint64_t>(PROSPER_GREGS(uc)[REG_RIP]), cur_tid());
+                if (action == prosper::host::GuestWriteWatchFaultAction::SingleStep)
+                    PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;
+                if (action != prosper::host::GuestWriteWatchFaultAction::NotHandled) return;
+            }
+        }
         // A SIGILL we did NOT emulate: log the faulting instruction bytes so the offending opcode can be
         // identified (another AMD-only ISA extension, or a decode miss in try_emulate_sse4a). #163-progress.
         if (sig == SIGILL) {
@@ -2753,6 +2829,9 @@ void install_trap_handler() {
     // it is red-zone-safe ONLY when this handler runs on the sigaltstack. Tell it whether that holds;
     // otherwise create() refuses to arm and callers keep the exact byte-comparison fallback (#1144).
     prosper::host::guest_write_watch_set_fault_onstack((sa.sa_flags & SA_ONSTACK) != 0);
+    // Parse the dynamic caller-chain/allocation/offset selector only after the red-zone-safety gate is
+    // known. No guest mapping exists yet; the matching allocation and map notifications arm it later.
+    prosper::host::guest_dmem_write_trace_init_from_environment();
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);
@@ -2762,7 +2841,9 @@ void install_trap_handler() {
         || getenv("PROSPER_WATCH_LABEL")
         || getenv("PROSPER_WATCH_ABS")
         || getenv("PROSPER_MB3WATCH")
-        || getenv("PROSPER_WATCH_HOT")) sigaction(SIGTRAP, &sa, nullptr);   // single-step / breakpoint
+        || getenv("PROSPER_WATCH_HOT")
+        || prosper::host::guest_dmem_write_trace_enabled())
+        sigaction(SIGTRAP, &sa, nullptr);   // single-step / breakpoint
 }
 
 // Write the 0xCC breakpoint into the (now-mapped) guest image. Call after the image load.
