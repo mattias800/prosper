@@ -1,5 +1,6 @@
 #include "live_compute.hpp"
 #include "compute_timing_selector.hpp"
+#include "compute_transfer_gate_census.hpp"
 #include "live_target_format.hpp"
 #include "rtt_scale.hpp"
 #include "rtt_authority.hpp"
@@ -758,6 +759,14 @@ struct CachedComputeImage {
     VkDeviceMemory result_memory = VK_NULL_HANDLE;
     VkDeviceSize result_allocation_bytes = 0;
     VkDeviceSize result_bytes = 0;
+};
+
+enum class ComputeTransferBorrowResult : uint8_t {
+    NotAttempted,
+    Hit,
+    NoCache,
+    InvalidCache,
+    AuthorityChanged,
 };
 
 bool persistent_compute_buffer_enabled(uint32_t bytes) {
@@ -1672,12 +1681,13 @@ struct VulkanComputeContext {
         found->second.graphics_export_valid = true;
     }
 
-    void authorize_cached_image_compute_transfer(const ComputeImageCacheKey& key) {
+    bool authorize_cached_image_compute_transfer(const ComputeImageCacheKey& key) {
         const auto found = image_cache.find(key);
         if (found == image_cache.end() || !found->second.content_valid || !found->second.image)
-            return;
+            return false;
         found->second.compute_transfer_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         found->second.compute_transfer_valid = true;
+        return true;
     }
 
     bool borrow_cached_image_for_graphics(const ComputeImageCacheKey& key,
@@ -1700,9 +1710,12 @@ struct VulkanComputeContext {
     }
 
     bool borrow_cached_image_for_compute_transfer(const ComputeImageCacheKey& key,
-                                                  VkImage& image, bool trace = false) {
+                                                  VkImage& image, bool trace = false,
+                                                  ComputeTransferBorrowResult* result = nullptr) {
+        if (result) *result = ComputeTransferBorrowResult::NotAttempted;
         const auto found = image_cache.find(key);
         if (found == image_cache.end()) {
+            if (result) *result = ComputeTransferBorrowResult::NoCache;
             if (trace)
                 std::fprintf(stderr,
                              "[compute]   native storage transfer miss: no storage cache\n");
@@ -1710,6 +1723,7 @@ struct VulkanComputeContext {
         }
         CachedComputeImage& cached = found->second;
         if (!cached.compute_transfer_valid || !cached.content_valid || !cached.image) {
+            if (result) *result = ComputeTransferBorrowResult::InvalidCache;
             if (trace)
                 std::fprintf(stderr,
                              "[compute]   native storage transfer miss: "
@@ -1726,6 +1740,7 @@ struct VulkanComputeContext {
         const bool watch_unchanged = !submit_unchanged && cached.write_watch &&
             cached.write_watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged;
         if (!submit_unchanged && !watch_unchanged) {
+            if (result) *result = ComputeTransferBorrowResult::AuthorityChanged;
             if (trace)
                 std::fprintf(stderr,
                              "[compute]   native storage transfer miss: "
@@ -1737,6 +1752,7 @@ struct VulkanComputeContext {
         cached.last_use = ++image_cache_clock;
         ++cached.pins;
         image = cached.image;
+        if (result) *result = ComputeTransferBorrowResult::Hit;
         return true;
     }
 
@@ -2771,6 +2787,352 @@ RuntimeComputeTimingSelector& runtime_compute_timing_selector() {
     return selector;
 }
 
+const char* compute_transfer_gate_role_name(ComputeTransferGateRole role) {
+    switch (role) {
+        case ComputeTransferGateRole::Producer: return "producer";
+        case ComputeTransferGateRole::Consumer: return "consumer";
+        case ComputeTransferGateRole::None: return "none";
+    }
+    return "none";
+}
+
+const char* compute_transfer_borrow_result_name(ComputeTransferBorrowResult result) {
+    switch (result) {
+        case ComputeTransferBorrowResult::NotAttempted: return "not-attempted";
+        case ComputeTransferBorrowResult::Hit: return "hit";
+        case ComputeTransferBorrowResult::NoCache: return "no-cache";
+        case ComputeTransferBorrowResult::InvalidCache: return "invalid-cache";
+        case ComputeTransferBorrowResult::AuthorityChanged: return "authority-changed";
+    }
+    return "unknown";
+}
+
+struct ComputeTransferGateStats {
+    uint64_t reflected_images = 0;
+    uint64_t reflected_storage = 0;
+    uint64_t reflected_sampled = 0;
+    uint64_t reflected_dim_2d = 0;
+    uint64_t reflected_nonarrayed = 0;
+    uint64_t reflected_nonmsaa = 0;
+    uint64_t ordinary_2d = 0;
+    uint64_t storage_float = 0;
+    uint64_t storage_native_semantic = 0;
+    uint64_t storage_native_device = 0;
+    uint64_t storage_cache_evaluated = 0;
+    uint64_t storage_cache_candidate = 0;
+    uint64_t storage_persistent_setup = 0;
+    uint64_t storage_publish_evaluated = 0;
+    uint64_t storage_publish_native = 0;
+    uint64_t storage_publish_unique = 0;
+    uint64_t storage_publish_candidate = 0;
+    uint64_t storage_publish_persistent = 0;
+    uint64_t storage_publish_authorized = 0;
+    uint64_t sampled_gate_evaluated = 0;
+    uint64_t sampled_cache_candidate = 0;
+    uint64_t sampled_persistent_setup = 0;
+    uint64_t sampled_ordinary_2d = 0;
+    uint64_t sampled_format_compatible = 0;
+    uint64_t sampled_transfer_dimension = 0;
+    uint64_t sampled_hostless = 0;
+    uint64_t sampled_format_match = 0;
+    uint64_t sampled_validation_enabled = 0;
+    uint64_t sampled_native_defined = 0;
+    uint64_t borrow_attempts = 0;
+    uint64_t borrow_hits = 0;
+    uint64_t borrow_no_cache = 0;
+    uint64_t borrow_invalid_cache = 0;
+    uint64_t borrow_authority_changed = 0;
+};
+
+void increment_gate_counter(uint64_t& value, bool condition = true) {
+    if (condition) value = saturating_increment(value);
+}
+
+class RuntimeComputeTransferGateCensus {
+public:
+    RuntimeComputeTransferGateCensus() {
+        const char* producer_env =
+            std::getenv("PROSPER_COMPUTE_TRANSFER_PRODUCER_HASH");
+        const char* consumer_env =
+            std::getenv("PROSPER_COMPUTE_TRANSFER_CONSUMER_HASH");
+        if (!producer_env && !consumer_env) return;
+        selector_.requested = true;
+        const ComputeTimingSelectorParseResult producer =
+            parse_compute_timing_selector_u64(producer_env);
+        const ComputeTimingSelectorParseResult consumer =
+            parse_compute_timing_selector_u64(consumer_env);
+        selector_.producer_hash = producer.value;
+        selector_.consumer_hash = consumer.value;
+        selector_.valid = producer.accepted() && consumer.accepted() &&
+                          producer.value != consumer.value;
+        producer_error_ = producer.error;
+        consumer_error_ = consumer.error;
+        if (selector_.valid) {
+            std::fprintf(stderr,
+                         "[compute-transfer-gates] accepted producer=0x%016llx "
+                         "consumer=0x%016llx mode=exact-hash\n",
+                         static_cast<unsigned long long>(selector_.producer_hash),
+                         static_cast<unsigned long long>(selector_.consumer_hash));
+        } else {
+            std::fprintf(stderr,
+                         "[compute-transfer-gates] ignored producer-reason=%s "
+                         "consumer-reason=%s distinct=%u; selector fails closed\n",
+                         compute_timing_selector_parse_error_name(producer.error),
+                         compute_timing_selector_parse_error_name(consumer.error),
+                         producer.value != consumer.value ? 1u : 0u);
+        }
+    }
+
+    ~RuntimeComputeTransferGateCensus() {
+        report_summary();
+    }
+
+    bool requested() const {
+        return selector_.requested;
+    }
+
+    ComputeTransferGateSelectorObservation observe(
+        const prosper::gpu::ComputeItem& item, uint64_t program_hash) {
+        if (!selector_.requested) return {};
+        std::lock_guard lock(mutex_);
+        const ComputeTransferGateSelectorObservation observation =
+            observe_compute_transfer_gate_selector(selector_, counters_, program_hash);
+        if (observation.first_match) {
+            const uint64_t matches = observation.role == ComputeTransferGateRole::Producer
+                ? counters_.producer_matches : counters_.consumer_matches;
+            std::fprintf(stderr,
+                         "[compute-transfer-gates] first-match role=%s hash=0x%016llx "
+                         "code=0x%llx seen=%llu role-matched=%llu\n",
+                         compute_transfer_gate_role_name(observation.role),
+                         static_cast<unsigned long long>(program_hash),
+                         static_cast<unsigned long long>(item.code_addr),
+                         static_cast<unsigned long long>(counters_.seen),
+                         static_cast<unsigned long long>(matches));
+        }
+        return observation;
+    }
+
+    void record_reflection(ComputeTransferGateRole role,
+                           const prosper::gpu::SpirvDescriptorBinding& descriptor,
+                           const prosper::gpu::ShaderResource& resource,
+                           bool storage, bool ordinary_2d,
+                           bool native_semantic, bool native_device,
+                           bool detail) {
+        if (role == ComputeTransferGateRole::None) return;
+        std::lock_guard lock(mutex_);
+        ComputeTransferGateStats& stats = stats_for(role);
+        increment_gate_counter(stats.reflected_images);
+        increment_gate_counter(stats.reflected_storage, storage);
+        increment_gate_counter(stats.reflected_sampled, !storage);
+        increment_gate_counter(stats.reflected_dim_2d, descriptor.image_dim == 1u);
+        increment_gate_counter(stats.reflected_nonarrayed, !descriptor.image_arrayed);
+        increment_gate_counter(stats.reflected_nonmsaa, !descriptor.image_multisampled);
+        increment_gate_counter(stats.ordinary_2d, ordinary_2d);
+        increment_gate_counter(stats.storage_float, storage && descriptor.storage_float);
+        increment_gate_counter(stats.storage_native_semantic, storage && native_semantic);
+        increment_gate_counter(stats.storage_native_device, storage && native_device);
+        if (detail) {
+            std::fprintf(stderr,
+                         "[compute-transfer-gates] detail role=%s stage=reflection "
+                         "binding=%u class=%s addr=0x%llx extent=%ux%ux%u "
+                         "resource-dim=%u format=%u components=%u reflected-dim=%u "
+                         "arrayed=%u msaa=%u storage-float=%u ordinary-2d=%u "
+                         "native-semantic=%u native-device=%u\n",
+                         compute_transfer_gate_role_name(role), descriptor.binding,
+                         storage ? "storage" : "sampled",
+                         static_cast<unsigned long long>(resource.gpu_addr),
+                         resource.width, resource.height, resource.depth, resource.img_dim,
+                         static_cast<unsigned>(resource.format), resource.num_components,
+                         descriptor.image_dim, descriptor.image_arrayed ? 1u : 0u,
+                         descriptor.image_multisampled ? 1u : 0u,
+                         descriptor.storage_float ? 1u : 0u, ordinary_2d ? 1u : 0u,
+                         native_semantic ? 1u : 0u, native_device ? 1u : 0u);
+        }
+    }
+
+    void record_sampled_gates(ComputeTransferGateRole role,
+                              const prosper::gpu::ShaderResource& resource,
+                              uint32_t binding, bool cache_candidate,
+                              bool persistent_setup, bool ordinary_2d,
+                              bool format_compatible, bool transfer_dimension,
+                              bool hostless, bool format_match,
+                              bool validation_enabled, bool native_defined,
+                              ComputeTransferBorrowResult borrow_result,
+                              bool detail) {
+        if (role == ComputeTransferGateRole::None) return;
+        std::lock_guard lock(mutex_);
+        ComputeTransferGateStats& stats = stats_for(role);
+        increment_gate_counter(stats.sampled_gate_evaluated);
+        increment_gate_counter(stats.sampled_cache_candidate, cache_candidate);
+        increment_gate_counter(stats.sampled_persistent_setup, persistent_setup);
+        increment_gate_counter(stats.sampled_ordinary_2d, ordinary_2d);
+        increment_gate_counter(stats.sampled_format_compatible, format_compatible);
+        increment_gate_counter(stats.sampled_transfer_dimension, transfer_dimension);
+        increment_gate_counter(stats.sampled_hostless, hostless);
+        increment_gate_counter(stats.sampled_format_match, format_match);
+        increment_gate_counter(stats.sampled_validation_enabled, validation_enabled);
+        increment_gate_counter(stats.sampled_native_defined, native_defined);
+        const bool attempted = borrow_result != ComputeTransferBorrowResult::NotAttempted;
+        increment_gate_counter(stats.borrow_attempts, attempted);
+        increment_gate_counter(stats.borrow_hits,
+                               borrow_result == ComputeTransferBorrowResult::Hit);
+        increment_gate_counter(stats.borrow_no_cache,
+                               borrow_result == ComputeTransferBorrowResult::NoCache);
+        increment_gate_counter(stats.borrow_invalid_cache,
+                               borrow_result == ComputeTransferBorrowResult::InvalidCache);
+        increment_gate_counter(stats.borrow_authority_changed,
+                               borrow_result == ComputeTransferBorrowResult::AuthorityChanged);
+        if (detail) {
+            std::fprintf(stderr,
+                         "[compute-transfer-gates] detail role=%s stage=sampled-gates "
+                         "binding=%u addr=0x%llx cache-candidate=%u persistent=%u "
+                         "ordinary-2d=%u format-compatible=%u transfer-dimension=%u "
+                         "hostless=%u format-match=%u validation=%u native-defined=%u "
+                         "borrow=%s\n",
+                         compute_transfer_gate_role_name(role), binding,
+                         static_cast<unsigned long long>(resource.gpu_addr),
+                         cache_candidate ? 1u : 0u, persistent_setup ? 1u : 0u,
+                         ordinary_2d ? 1u : 0u, format_compatible ? 1u : 0u,
+                         transfer_dimension ? 1u : 0u, hostless ? 1u : 0u,
+                         format_match ? 1u : 0u, validation_enabled ? 1u : 0u,
+                         native_defined ? 1u : 0u,
+                         compute_transfer_borrow_result_name(borrow_result));
+        }
+    }
+
+    void record_storage_cache(ComputeTransferGateRole role,
+                              const prosper::gpu::ShaderResource& resource,
+                              uint32_t binding, bool cache_candidate,
+                              bool persistent_setup, bool detail) {
+        if (role == ComputeTransferGateRole::None) return;
+        std::lock_guard lock(mutex_);
+        ComputeTransferGateStats& stats = stats_for(role);
+        increment_gate_counter(stats.storage_cache_evaluated);
+        increment_gate_counter(stats.storage_cache_candidate, cache_candidate);
+        increment_gate_counter(stats.storage_persistent_setup, persistent_setup);
+        if (detail) {
+            std::fprintf(stderr,
+                         "[compute-transfer-gates] detail role=%s stage=storage-cache "
+                         "binding=%u addr=0x%llx cache-candidate=%u persistent=%u\n",
+                         compute_transfer_gate_role_name(role), binding,
+                         static_cast<unsigned long long>(resource.gpu_addr),
+                         cache_candidate ? 1u : 0u, persistent_setup ? 1u : 0u);
+        }
+    }
+
+    void record_storage_publish(ComputeTransferGateRole role, bool native,
+                                bool unique, bool cache_candidate,
+                                bool persistent, bool authorized) {
+        if (role == ComputeTransferGateRole::None) return;
+        std::lock_guard lock(mutex_);
+        ComputeTransferGateStats& stats = stats_for(role);
+        increment_gate_counter(stats.storage_publish_evaluated);
+        increment_gate_counter(stats.storage_publish_native, native);
+        increment_gate_counter(stats.storage_publish_unique, unique);
+        increment_gate_counter(stats.storage_publish_candidate, cache_candidate);
+        increment_gate_counter(stats.storage_publish_persistent, persistent);
+        increment_gate_counter(stats.storage_publish_authorized, authorized);
+    }
+
+    void report_summary() {
+        if (!selector_.requested) return;
+        std::lock_guard lock(mutex_);
+        if (!claim_compute_transfer_gate_selector_summary(counters_)) return;
+        const bool invalid = compute_transfer_gate_selector_is_invalid(selector_, counters_);
+        std::fprintf(stderr,
+                     "[compute-transfer-gates] summary producer=0x%016llx "
+                     "consumer=0x%016llx seen=%llu producer-matched=%llu "
+                     "consumer-matched=%llu verdict=%s producer-reason=%s "
+                     "consumer-reason=%s\n",
+                     static_cast<unsigned long long>(selector_.producer_hash),
+                     static_cast<unsigned long long>(selector_.consumer_hash),
+                     static_cast<unsigned long long>(counters_.seen),
+                     static_cast<unsigned long long>(counters_.producer_matches),
+                     static_cast<unsigned long long>(counters_.consumer_matches),
+                     invalid ? "INVALID" : "matched",
+                     compute_timing_selector_parse_error_name(producer_error_),
+                     compute_timing_selector_parse_error_name(consumer_error_));
+        report_role_summary(ComputeTransferGateRole::Producer, producer_stats_);
+        report_role_summary(ComputeTransferGateRole::Consumer, consumer_stats_);
+    }
+
+private:
+    ComputeTransferGateStats& stats_for(ComputeTransferGateRole role) {
+        return role == ComputeTransferGateRole::Producer
+            ? producer_stats_ : consumer_stats_;
+    }
+
+    static void report_role_summary(ComputeTransferGateRole role,
+                                    const ComputeTransferGateStats& s) {
+        std::fprintf(stderr,
+                     "[compute-transfer-gates] summary role=%s reflected=%llu storage=%llu "
+                     "sampled=%llu dim2d=%llu nonarrayed=%llu nonmsaa=%llu ordinary2d=%llu "
+                     "storage-float=%llu native-semantic=%llu native-device=%llu "
+                     "storage-cache-eval=%llu storage-candidate=%llu "
+                     "storage-persistent-setup=%llu publish-eval=%llu publish-native=%llu "
+                     "publish-unique=%llu publish-candidate=%llu publish-persistent=%llu "
+                     "publish-authorized=%llu\n",
+                     compute_transfer_gate_role_name(role),
+                     static_cast<unsigned long long>(s.reflected_images),
+                     static_cast<unsigned long long>(s.reflected_storage),
+                     static_cast<unsigned long long>(s.reflected_sampled),
+                     static_cast<unsigned long long>(s.reflected_dim_2d),
+                     static_cast<unsigned long long>(s.reflected_nonarrayed),
+                     static_cast<unsigned long long>(s.reflected_nonmsaa),
+                     static_cast<unsigned long long>(s.ordinary_2d),
+                     static_cast<unsigned long long>(s.storage_float),
+                     static_cast<unsigned long long>(s.storage_native_semantic),
+                     static_cast<unsigned long long>(s.storage_native_device),
+                     static_cast<unsigned long long>(s.storage_cache_evaluated),
+                     static_cast<unsigned long long>(s.storage_cache_candidate),
+                     static_cast<unsigned long long>(s.storage_persistent_setup),
+                     static_cast<unsigned long long>(s.storage_publish_evaluated),
+                     static_cast<unsigned long long>(s.storage_publish_native),
+                     static_cast<unsigned long long>(s.storage_publish_unique),
+                     static_cast<unsigned long long>(s.storage_publish_candidate),
+                     static_cast<unsigned long long>(s.storage_publish_persistent),
+                     static_cast<unsigned long long>(s.storage_publish_authorized));
+        std::fprintf(stderr,
+                     "[compute-transfer-gates] summary role=%s sampled-gate-eval=%llu "
+                     "sampled-candidate=%llu sampled-persistent-setup=%llu "
+                     "sampled-ordinary2d=%llu format-compatible=%llu "
+                     "transfer-dimension=%llu hostless=%llu format-match=%llu "
+                     "validation=%llu native-defined=%llu borrow-attempts=%llu hits=%llu "
+                     "no-cache=%llu invalid-cache=%llu authority-changed=%llu\n",
+                     compute_transfer_gate_role_name(role),
+                     static_cast<unsigned long long>(s.sampled_gate_evaluated),
+                     static_cast<unsigned long long>(s.sampled_cache_candidate),
+                     static_cast<unsigned long long>(s.sampled_persistent_setup),
+                     static_cast<unsigned long long>(s.sampled_ordinary_2d),
+                     static_cast<unsigned long long>(s.sampled_format_compatible),
+                     static_cast<unsigned long long>(s.sampled_transfer_dimension),
+                     static_cast<unsigned long long>(s.sampled_hostless),
+                     static_cast<unsigned long long>(s.sampled_format_match),
+                     static_cast<unsigned long long>(s.sampled_validation_enabled),
+                     static_cast<unsigned long long>(s.sampled_native_defined),
+                     static_cast<unsigned long long>(s.borrow_attempts),
+                     static_cast<unsigned long long>(s.borrow_hits),
+                     static_cast<unsigned long long>(s.borrow_no_cache),
+                     static_cast<unsigned long long>(s.borrow_invalid_cache),
+                     static_cast<unsigned long long>(s.borrow_authority_changed));
+    }
+
+    ComputeTransferGateSelector selector_;
+    ComputeTransferGateSelectorCounters counters_;
+    ComputeTimingSelectorParseError producer_error_ =
+        ComputeTimingSelectorParseError::Unset;
+    ComputeTimingSelectorParseError consumer_error_ =
+        ComputeTimingSelectorParseError::Unset;
+    ComputeTransferGateStats producer_stats_;
+    ComputeTransferGateStats consumer_stats_;
+    std::mutex mutex_;
+};
+
+RuntimeComputeTransferGateCensus& runtime_compute_transfer_gate_census() {
+    static RuntimeComputeTransferGateCensus census;
+    return census;
+}
+
 void maybe_dump_traced_compute_spirv(const prosper::gpu::ComputeItem& item, bool trace) {
     const char* path = std::getenv("PROSPER_COMPUTELOG_SPIRV");
     if (!trace || !path || !*path || item.spirv.empty()) return;
@@ -3010,19 +3372,28 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         std::getenv("PROSPER_COMPUTE_PHASE_TIMING") != nullptr;
     const bool image_timing_requested =
         std::getenv("PROSPER_COMPUTE_IMAGE_TIMING") != nullptr;
-    // Preserve the cheap address pre-filter: an address-mismatched item never needs a stable hash.
-    // Hash-only selection has no address constraint and therefore hashes each timing candidate, as
-    // required; timing-disabled execution reaches neither this branch nor the hash walk.
+    // Preserve the cheap timing address pre-filter. The transfer gate census deliberately hashes
+    // every reflected compute candidate because its two stable hashes have no address constraint.
     uint64_t timing_program_hash = 0;
     bool timing_item_selected = false;
-    if ((phase_timing_requested || image_timing_requested) &&
-        time_compute_address_matches(item)) {
+    RuntimeComputeTransferGateCensus& transfer_gate_census =
+        runtime_compute_transfer_gate_census();
+    const bool transfer_gate_requested = transfer_gate_census.requested();
+    const bool timing_address_matches = time_compute_address_matches(item);
+    if (transfer_gate_requested ||
+        ((phase_timing_requested || image_timing_requested) && timing_address_matches)) {
         timing_program_hash = gpu_capture_hash(
             reinterpret_cast<const uint8_t*>(spirv.data()),
             spirv.size() * sizeof(uint32_t));
+    }
+    if ((phase_timing_requested || image_timing_requested) && timing_address_matches) {
         timing_item_selected =
             runtime_compute_timing_selector().matches(item, timing_program_hash);
     }
+    const ComputeTransferGateSelectorObservation transfer_gate_observation =
+        transfer_gate_requested
+            ? transfer_gate_census.observe(item, timing_program_hash)
+            : ComputeTransferGateSelectorObservation{};
     // The phase timer is also useful for buffer-only kernels. Astro Bot's heaviest dispatcher writes
     // buffers exclusively, so the historical storage-image gate hid the actual frame bottleneck.
     const bool timing_trace_only =
@@ -3436,17 +3807,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                              !r->depth_compare;
             const VkImageType native_storage_type = ordinary_3d_storage
                 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+            const bool native_storage_semantic = native_float_storage_image(
+                r->format, descriptor_components, r->srgb);
             // vkGetPhysicalDeviceImageFormatProperties is a driver query, not a cheap metadata
             // lookup. Sampled and raw-uvec4 descriptors cannot take this typed-storage path, so do
             // not repeat that query for every one of their per-frame bindings.
+            const bool native_storage_device = spirv_native_storage &&
+                (ordinary_2d_storage || ordinary_3d_storage) &&
+                native_storage_image_create_supported(
+                    ctx.physical, native_storage_format, native_storage_type,
+                    r->width, r->height,
+                    ordinary_3d_storage ? r->depth : 1u, 1u);
             const bool native_storage_supported = spirv_native_storage &&
                 native_float_storage_image_supported(
                     r->format, descriptor_components, r->srgb,
-                    (ordinary_2d_storage || ordinary_3d_storage) &&
-                        native_storage_image_create_supported(
-                            ctx.physical, native_storage_format, native_storage_type,
-                            r->width, r->height,
-                            ordinary_3d_storage ? r->depth : 1u, 1u));
+                    native_storage_device);
+            transfer_gate_census.record_reflection(
+                transfer_gate_observation.role, image_descriptors[i], *r, bi.storage,
+                ordinary_2d_view, native_storage_semantic, native_storage_device,
+                transfer_gate_observation.first_match);
             if (spirv_native_storage && !native_storage_supported) {
                 skip_image(r, "compiled typed storage format is unsupported by this device");
                 break;
@@ -4292,6 +4671,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // detiling and converting the 2x-larger FP16 base.
                 bi.cache_candidate = !sampled_dcc_fast_clear && dcc_cache_safe &&
                     persistent_compute_image_enabled(sbytes, ComputeImageCacheClass::sampled);
+                const VkFormat transfer_native_format =
+                    native_storage_vk_format(r->format, sampled_components);
+                const bool transfer_format_compatible =
+                    compute_native_2d_transfer_format_compatible(
+                        r->format, sampled_components);
+                const bool native_transfer_dimension =
+                    (dim_3d && native_3d_transfer_enabled()) ||
+                    (ordinary_2d_view && native_2d_transfer_enabled() &&
+                     transfer_format_compatible);
+                const bool transfer_hostless = !r->host_data;
+                const bool transfer_format_match = transfer_native_format == image_format;
+                const bool transfer_validation_enabled =
+                    adaptive_storage_result_validation_enabled();
+                const bool transfer_native_defined =
+                    transfer_native_format != VK_FORMAT_UNDEFINED;
+                ComputeTransferBorrowResult transfer_borrow_result =
+                    ComputeTransferBorrowResult::NotAttempted;
                 if (bi.cache_candidate) {
                     const auto cache_lookup_start = ComputeClock::now();
                     bi.cache_key = {
@@ -4312,22 +4708,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // replacement at the same guest address. Exact key lookup plus the ordered-submit
                     // journal (or an independently clean write watch) makes an intervening guest write
                     // fail closed to the existing upload path.
-                    const VkFormat native_format =
-                        native_storage_vk_format(r->format, sampled_components);
-                    const bool native_transfer_dimension =
-                        (dim_3d && native_3d_transfer_enabled()) ||
-                        (ordinary_2d_view &&
-                         native_2d_transfer_enabled() &&
-                         compute_native_2d_transfer_format_compatible(
-                             r->format, sampled_components));
-                    if (native_transfer_dimension && !r->host_data &&
-                        native_format == image_format &&
-                        adaptive_storage_result_validation_enabled() &&
-                        native_format != VK_FORMAT_UNDEFINED) {
+                    if (native_transfer_dimension && transfer_hostless &&
+                        transfer_format_match && transfer_validation_enabled &&
+                        transfer_native_defined) {
                         const ComputeImageCacheKey storage_key = storage_image_cache_key(
-                            *r, static_cast<uint32_t>(sampled_guest_need), native_format);
+                            *r, static_cast<uint32_t>(sampled_guest_need),
+                            transfer_native_format);
                         if (ctx.borrow_cached_image_for_compute_transfer(
-                                storage_key, bi.compute_transfer_seed, trace)) {
+                                storage_key, bi.compute_transfer_seed, trace,
+                                &transfer_borrow_result)) {
                             bi.compute_transfer_seed_key = storage_key;
                             bi.compute_transfer_seed_borrowed = true;
                             g_compute_storage_transfer_seeds.fetch_add(
@@ -4360,6 +4749,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     cache_lookup_ms = std::chrono::duration<double, std::milli>(
                         ComputeClock::now() - cache_lookup_start).count();
                 }
+                transfer_gate_census.record_sampled_gates(
+                    transfer_gate_observation.role, *r, bi.binding,
+                    bi.cache_candidate, bi.persistent, ordinary_2d_view,
+                    transfer_format_compatible, native_transfer_dimension,
+                    transfer_hostless, transfer_format_match,
+                    transfer_validation_enabled, transfer_native_defined,
+                    transfer_borrow_result, transfer_gate_observation.first_match);
             }
 
             // Allocate the host-visible staging buffer before conversion and write into its mapping
@@ -4505,6 +4901,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     cache_lookup_ms = std::chrono::duration<double, std::milli>(
                         ComputeClock::now() - cache_lookup_start).count();
                 }
+                transfer_gate_census.record_storage_cache(
+                    transfer_gate_observation.role, *r, bi.binding,
+                    bi.cache_candidate, bi.persistent,
+                    transfer_gate_observation.first_match);
                 if (!(bi.persistent && bi.upload_skipped)) {
                 const size_t linear_size = (bi.seed_skip || bi.seed_from_imported != SIZE_MAX)
                     ? size_t{0} : static_cast<size_t>(linear_guest_bytes);
@@ -6451,11 +6851,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // sampled cache with a device-local copy; exact 2D/3D images created with SAMPLED usage may
         // also be exported directly to graphics. Raw interchange images are compatible with neither.
         for (const BoundImage& image : images) {
-            if (!image.storage || !image.native_float_storage ||
-                image.alias_of != SIZE_MAX || !image.cache_candidate || !image.persistent)
-                continue;
-            ctx.authorize_cached_image_compute_transfer(image.cache_key);
-            if (image.graphics_sampled_usage)
+            if (!image.storage) continue;
+            const bool unique = image.alias_of == SIZE_MAX;
+            const bool publish_eligible = image.native_float_storage && unique &&
+                image.cache_candidate && image.persistent;
+            const bool authorized = publish_eligible &&
+                ctx.authorize_cached_image_compute_transfer(image.cache_key);
+            transfer_gate_census.record_storage_publish(
+                transfer_gate_observation.role, image.native_float_storage, unique,
+                image.cache_candidate, image.persistent, authorized);
+            if (publish_eligible && image.graphics_sampled_usage)
                 ctx.authorize_cached_image_export(image.cache_key);
         }
         writeback_publish_ms = std::chrono::duration<double, std::milli>(
@@ -6567,6 +6972,7 @@ bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat forma
 
 void report_live_compute_timing_selector_summary() {
     runtime_compute_timing_selector().report_summary();
+    runtime_compute_transfer_gate_census().report_summary();
 }
 
 bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampled_resource,
