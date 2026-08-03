@@ -5,11 +5,9 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <thread>
 
 using namespace prosper;
 
@@ -35,6 +33,51 @@ struct KEvent {
     uint64_t udata;
 };
 static_assert(sizeof(KEvent) == 0x20);
+
+// Host scheduling may pause a Rosetta/shared CI worker for much longer than AMPR's modeled 10 ms
+// fallback and 2 ms delivery latencies. Those durations are implementation details, while the
+// contract below is an ordering: wait until a distinct completion proves the relevant workers have
+// crossed the race, with a generous deadline used only to turn a real hang into a bounded failure.
+constexpr uint32_t kEventDeadlineUs = 2'000'000;
+
+struct EventSequence {
+    std::array<KEvent, 8> events{};
+    size_t size = 0;
+    bool reached_fence = false;
+};
+
+static bool wait_one(HleFn wait_eq, uint64_t eq, KEvent& event) {
+    int32_t out = -1;
+    uint32_t timeout = kEventDeadlineUs;
+    const uint64_t result = wait_eq(eq, (uint64_t)(uintptr_t)&event, 1,
+                                    (uint64_t)(uintptr_t)&out,
+                                    (uint64_t)(uintptr_t)&timeout, 0);
+    return result == 0 && out == 1;
+}
+
+// Drain through a distinct id-0 pointer-dialect tag. Both the subject completion and its fence use
+// the same AMPR tail scheduler and the same FIFO pointer-delivery worker. Seeing the fence therefore
+// proves every earlier accepted post was delivered; a duplicate cannot hide behind a short sleep or
+// behind the counter dialect's high-water coalescing.
+static EventSequence wait_through_fence(HleFn wait_eq, uint64_t eq, uint64_t fence_tag) {
+    EventSequence sequence;
+    while (sequence.size < sequence.events.size()) {
+        KEvent event{};
+        if (!wait_one(wait_eq, eq, event)) break;
+        sequence.events[sequence.size++] = event;
+        if ((uint64_t)event.data == fence_tag) {
+            sequence.reached_fence = true;
+            break;
+        }
+    }
+    return sequence;
+}
+
+static bool is_exact_fence(const EventSequence& sequence, uint64_t fence_tag) {
+    return sequence.reached_fence && sequence.size == 1 &&
+           sequence.events[0].ident == 0 && sequence.events[0].filter == -24 &&
+           (uint64_t)sequence.events[0].data == fence_tag;
+}
 
 int main() {
     std::printf("== test_ampr_measure ==\n");
@@ -134,25 +177,73 @@ int main() {
         construct(tail_cb, 0, 0x560, 0, 0, 0);
         append_equeue_320(tail_cb, eq, (uint64_t)event_id, tail_tag, 0, 0);
         KEvent tail_event{};
-        int32_t tail_out = -1;
-        uint32_t tail_timeout = 100000;
-        wait_eq(eq, (uint64_t)(uintptr_t)&tail_event, 1, (uint64_t)(uintptr_t)&tail_out,
-                (uint64_t)(uintptr_t)&tail_timeout, 0);
-        CHECK(tail_out == 1 && tail_event.ident == event_id && tail_event.filter == -24 &&
+        const bool tail_received = wait_one(wait_eq, eq, tail_event);
+        CHECK(tail_received && tail_event.ident == event_id && tail_event.filter == -24 &&
                   (uint64_t)tail_event.data == tail_tag,
               "unsent PS5 3.20 tail receives one deferred eager completion");
 
-        constexpr uint64_t submitted_tag = tail_tag + 1;
-        append_equeue_320(tail_cb, eq, (uint64_t)event_id, submitted_tag, 0, 0);
-        submit(tail_cb, 1, 0, 0, 0, 0);
+        // Exercise exact cardinality in the id-0 pointer dialect. Its one FIFO delivery worker lets
+        // a later fallback completion act as a real ordering fence; the counter dialect above uses
+        // independent delivery threads plus high-water coalescing, where a duplicate can otherwise
+        // be hidden by the instrument itself.
+        std::array<uint64_t, 8> exact_tail_storage{};
+        const uint64_t exact_tail_cb = (uint64_t)(uintptr_t)exact_tail_storage.data();
+        constexpr uint64_t exact_tail_tag = 0x1234'0001ull;
+        construct(exact_tail_cb, 0, 0x560, 0, 0, 0);
+        append_equeue_320(exact_tail_cb, eq, /*id=*/0, exact_tail_tag, 0, 0);
+        KEvent exact_tail_event{};
+        const bool exact_tail_received = wait_one(wait_eq, eq, exact_tail_event);
+        CHECK(exact_tail_received && exact_tail_event.ident == 0 &&
+                  exact_tail_event.filter == -24 &&
+                  (uint64_t)exact_tail_event.data == exact_tail_tag,
+              "deferred pointer-dialect completion arm delivered its distinct tag");
+
+        // A submit after the fallback fired must not post the same completion again. Schedule a
+        // second unsent tail after that submit; observing its distinct tag proves both the fallback
+        // scheduler and the pointer-delivery worker crossed the duplicate opportunity.
+        submit(exact_tail_cb, 1, 0, 0, 0, 0);
+        std::array<uint64_t, 8> fence_storage{};
+        const uint64_t fence_cb = (uint64_t)(uintptr_t)fence_storage.data();
+        constexpr uint64_t deferred_fence_tag = 0x1234'0002ull;
+        construct(fence_cb, 0, 0x560, 0, 0, 0);
+        append_equeue_320(fence_cb, eq, /*id=*/0, deferred_fence_tag, 0, 0);
+        const EventSequence deferred_sequence =
+            wait_through_fence(wait_eq, eq, deferred_fence_tag);
+        CHECK(deferred_sequence.reached_fence,
+              "deferred exact-once fence traversed the fallback and delivery workers");
+        CHECK(is_exact_fence(deferred_sequence, deferred_fence_tag) &&
+                  get_count(eq, 0, 0, 0, 0, 0) == 0,
+              "unsent PS5 3.20 tail completion remains exactly once after submit");
+
+        std::array<uint64_t, 8> submitted_storage{};
+        const uint64_t submitted_cb = (uint64_t)(uintptr_t)submitted_storage.data();
+        constexpr uint64_t submitted_tag = 0x1234'0003ull;
+        construct(submitted_cb, 0, 0x560, 0, 0, 0);
+        append_equeue_320(submitted_cb, eq, /*id=*/0, submitted_tag, 0, 0);
+        submit(submitted_cb, 1, 0, 0, 0, 0);
         KEvent submitted_event{};
-        int32_t submitted_out = -1;
-        uint32_t submitted_timeout = 100000;
-        wait_eq(eq, (uint64_t)(uintptr_t)&submitted_event, 1,
-                (uint64_t)(uintptr_t)&submitted_out,
-                (uint64_t)(uintptr_t)&submitted_timeout, 0);
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-        CHECK(submitted_out == 1 && (uint64_t)submitted_event.data == submitted_tag &&
+        const bool submitted_received = wait_one(wait_eq, eq, submitted_event);
+        CHECK(submitted_received && submitted_event.ident == 0 &&
+                  submitted_event.filter == -24 &&
+                  (uint64_t)submitted_event.data == submitted_tag,
+              "explicit-submit completion arm delivered its distinct tag");
+
+        // Bind the fence only after the explicit event was consumed, so its deadline is necessarily
+        // later than the submitted buffer's fallback deadline. Insert a new buffer after submitted_cb
+        // as well: the single tail worker scans its binding vector in insertion order. Even if the
+        // host wakes after both deadlines, it schedules a submitted-tag duplicate before this fence.
+        // Both then travel through the same FIFO pointer worker, making the ordering causal.
+        std::array<uint64_t, 8> submitted_fence_storage{};
+        const uint64_t submitted_fence_cb =
+            (uint64_t)(uintptr_t)submitted_fence_storage.data();
+        constexpr uint64_t submitted_fence_tag = 0x1234'0004ull;
+        construct(submitted_fence_cb, 0, 0x560, 0, 0, 0);
+        append_equeue_320(submitted_fence_cb, eq, /*id=*/0, submitted_fence_tag, 0, 0);
+        const EventSequence submitted_sequence =
+            wait_through_fence(wait_eq, eq, submitted_fence_tag);
+        CHECK(submitted_sequence.reached_fence,
+              "explicit-submit fence traversed the fallback and delivery workers");
+        CHECK(is_exact_fence(submitted_sequence, submitted_fence_tag) &&
                   get_count(eq, 0, 0, 0, 0, 0) == 0,
               "explicit submit wins the fallback race without a duplicate completion");
         delete_eq(eq, 0, 0, 0, 0, 0);
@@ -162,40 +253,60 @@ int main() {
         const uint64_t stale_identity = prosper_eq_identity(stale_eq);
         std::array<uint64_t, 8> stale_storage{};
         const uint64_t stale_cb = (uint64_t)(uintptr_t)stale_storage.data();
+        constexpr uint64_t stale_tail_tag = 0x1234'0005ull;
         construct(stale_cb, 0, 0x560, 0, 0, 0);
-        append_equeue_320(stale_cb, stale_eq, (uint64_t)event_id, tail_tag + 2, 0, 0);
+        append_equeue_320(stale_cb, stale_eq, /*id=*/0, stale_tail_tag, 0, 0);
         delete_eq(stale_eq, 0, 0, 0, 0, 0);
         uint64_t replacement_eq = 0;
         create_eq((uint64_t)(uintptr_t)&replacement_eq, 0, 0, 0, 0, 0);
         const uint64_t replacement_identity = prosper_eq_identity(replacement_eq);
         CHECK(stale_identity && replacement_identity && stale_identity != replacement_identity,
               "replacement equeue receives a distinct lifetime identity");
+        // The stale tail above, this direct stale post, and the accepted fence all use the
+        // non-coalescing pointer dialect. The fence is a later tail-scheduler binding; if either
+        // lifetime check regresses, scheduler/worker FIFO ordering exposes its stale tag first.
+        constexpr uint64_t stale_post_tag = 0x1234'0006ull;
+        constexpr uint64_t lifetime_fence_tag = 0x1234'0007ull;
         prosper_eq_post_apr_token(replacement_eq, stale_identity,
-                                  event_id, tail_tag + 3);
-        std::this_thread::sleep_for(std::chrono::milliseconds(40));
-        CHECK(get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
+                                  /*id=*/0, stale_post_tag);
+        std::array<uint64_t, 8> lifetime_fence_storage{};
+        const uint64_t lifetime_fence_cb =
+            (uint64_t)(uintptr_t)lifetime_fence_storage.data();
+        construct(lifetime_fence_cb, 0, 0x560, 0, 0, 0);
+        append_equeue_320(lifetime_fence_cb, replacement_eq, /*id=*/0,
+                          lifetime_fence_tag, 0, 0);
+        const EventSequence lifetime_sequence =
+            wait_through_fence(wait_eq, replacement_eq, lifetime_fence_tag);
+        CHECK(is_exact_fence(lifetime_sequence, lifetime_fence_tag) &&
+                  get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
               "deleted AMPR queue cannot post into a replacement lifetime");
         constexpr uint64_t replacement_tag = tail_tag + 1;
         prosper_eq_post_apr_token(replacement_eq, replacement_identity,
                                   event_id, replacement_tag);
         KEvent replacement_event{};
-        int32_t replacement_out = -1;
-        uint32_t replacement_timeout = 100000;
-        wait_eq(replacement_eq, (uint64_t)(uintptr_t)&replacement_event, 1,
-                (uint64_t)(uintptr_t)&replacement_out,
-                (uint64_t)(uintptr_t)&replacement_timeout, 0);
-        CHECK(replacement_out == 1 &&
+        const bool replacement_received = wait_one(wait_eq, replacement_eq, replacement_event);
+        CHECK(replacement_received && replacement_event.ident == event_id &&
+                  replacement_event.filter == -24 &&
                   (uint64_t)replacement_event.data == replacement_tag,
               "stale equeue lifetime cannot poison a replacement completion token");
 
         std::array<uint64_t, 8> destroyed_storage{};
         const uint64_t destroyed_cb = (uint64_t)(uintptr_t)destroyed_storage.data();
+        constexpr uint64_t destroyed_tag = 0x1234'0008ull;
         construct(destroyed_cb, 0, 0x560, 0, 0, 0);
-        append_equeue_320(destroyed_cb, replacement_eq, (uint64_t)event_id,
-                          tail_tag + 4, 0, 0);
+        append_equeue_320(destroyed_cb, replacement_eq, /*id=*/0, destroyed_tag, 0, 0);
         destruct(destroyed_cb, 0, 0, 0, 0, 0);
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-        CHECK(get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
+        std::array<uint64_t, 8> cancellation_fence_storage{};
+        const uint64_t cancellation_fence_cb =
+            (uint64_t)(uintptr_t)cancellation_fence_storage.data();
+        constexpr uint64_t destruction_fence_tag = 0x1234'0009ull;
+        construct(cancellation_fence_cb, 0, 0x560, 0, 0, 0);
+        append_equeue_320(cancellation_fence_cb, replacement_eq, /*id=*/0,
+                          destruction_fence_tag, 0, 0);
+        const EventSequence destruction_sequence =
+            wait_through_fence(wait_eq, replacement_eq, destruction_fence_tag);
+        CHECK(is_exact_fence(destruction_sequence, destruction_fence_tag) &&
+                  get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
               "destroying a PS5 3.20 command buffer cancels its pending tail");
         construct(destroyed_cb, 0, 0, 0, 0, 0);
         uint64_t unbound_out1 = 0, unbound_out2 = 0;
@@ -209,8 +320,13 @@ int main() {
         // Scope note: this pins "an unbound submit posts no event". It does NOT pin the *bound*
         // predicate that #1666 loosened — the buffer here is genuinely unbound, so this assertion
         // holds under `bound && bc.tag && bc.eq` and `bound && bc.eq` alike.
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-        CHECK(get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
+        constexpr uint64_t unbound_fence_tag = 0x1234'000aull;
+        append_equeue_320(cancellation_fence_cb, replacement_eq, /*id=*/0,
+                          unbound_fence_tag, 0, 0);
+        const EventSequence unbound_sequence =
+            wait_through_fence(wait_eq, replacement_eq, unbound_fence_tag);
+        CHECK(is_exact_fence(unbound_sequence, unbound_fence_tag) &&
+                  get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
               "unbound submit posts no completion event (#180 invented-counter rule)");
         delete_eq(replacement_eq, 0, 0, 0, 0, 0);
 
@@ -253,16 +369,13 @@ int main() {
                 CHECK(submit_plain(cri_cb, 1, 0, 0, 0, 0) == 0,
                       "CRI two-argument submit reports success");
                 KEvent cri_event{};
-                int32_t cri_out = -1;
-                uint32_t cri_timeout = 100000;
-                wait_eq(cri_eq, (uint64_t)(uintptr_t)&cri_event, 1, (uint64_t)(uintptr_t)&cri_out,
-                        (uint64_t)(uintptr_t)&cri_timeout, 0);
+                const bool cri_received = wait_one(wait_eq, cri_eq, cri_event);
                 // `filter` is the load-bearing half of this assertion. KEvent is zero-initialised
                 // and the pointer-dialect case uses id 0, so `ident == c.id` degenerates to 0 == 0
                 // and would hold even if no event ever arrived — vacuous in exactly the branch CRI
                 // uses for 9 of its 20 bindings. EVFILT_AMPR_MODELED (-24) is nonzero and is set by
                 // both apr_post and the id-0 pointer worker, so a zeroed KEvent cannot fake it.
-                CHECK(cri_out == 1 && cri_event.ident == c.id && cri_event.filter == -24, c.what);
+                CHECK(cri_received && cri_event.ident == c.id && cri_event.filter == -24, c.what);
                 CHECK(get_count(cri_eq, 0, 0, 0, 0, 0) == 0,
                       "zero-tag completion is delivered exactly once");
                 delete_eq(cri_eq, 0, 0, 0, 0, 0);
