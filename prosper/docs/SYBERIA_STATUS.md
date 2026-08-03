@@ -173,9 +173,31 @@ finds no cache because the arrayed producer was not eligible for typed storage. 
 candidate therefore preserves the producer's one-layer array view while retaining its exact native
 image, then seeds the distinct ordinary sampled image through the existing one-layer device copy and
 authority checks. General arrays remain unsupported by this path. The production-backend fixture
-proves this exact arrayed-producer/non-arrayed-consumer shape on llvmpipe; it is still a candidate
-until a new live arm moves the exact counter. Guest writeback remains synchronous until a separately
-proven visibility policy can replace it.
+proves this exact arrayed-producer/non-arrayed-consumer shape on llvmpipe. A causal mutation that
+forced the sampled-transfer gate false made exactly the named `single-layer arrayed native storage
+producer seeds ordinary 2D sampled consumer on-GPU` check fail while the pixel-fallback siblings
+remained green; the test therefore witnesses the mechanism instead of merely surviving it.
+
+A paired live A/B on exact rebased candidate `2dcaa194` then moved the independently observable
+lever. Both arms used the same full-resolution app, exact producer hash `0x45e5d145e1a35af9`, exact
+consumer hash `0xee8584cf839a5b44`, 140-frame / 60-second bound, and clean 0/1/0 process census. Both
+exited normally after frame 140 with no device or display error. The only configuration difference
+was `PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER=1` in the OFF arm. ON retained 140/140 eligible producer
+results and attempted and hit the device copy for all 1,540/1,540 consumer dispatches. OFF still
+matched the same 140 producers and 1,540 consumers, but transfer eligibility, attempts, and hits each
+moved to zero. ON measured 7.3 fps at frame 60 and 7.1 at frame 120 (midpoint 7.2); OFF measured 5.9
+and 5.7 fps (midpoint 5.8), a 1.4 fps / 24.1% improvement. Evidence:
+`<ARTIFACT_ROOT>/syberia-1737-arrayed-native-on-rebased-IIKd8r` and
+`<ARTIFACT_ROOT>/syberia-1737-arrayed-native-off-rebased-rPIGU6`.
+
+The shared ON-oriented validator labels the OFF evidence `RUN INVALID` solely because its expected
+hit assertions correctly observe zero after the switch disables the mechanism. The app exit,
+process census, selector match, and zero-error checks all pass, so this is an acceptance-policy
+mismatch in the apparatus rather than a title failure. This handoff removes the repeated full
+sampled-image detile/upload between atlas steps, but storage-image readback, guest packing and
+retile/writeback remain synchronous after every dispatch. At 7.2 fps the save warning is materially
+faster but still far short of the 30 fps target; that synchronous writeback is the next measured
+frontier and must not be deferred without a separately proven guest-visibility policy.
 
 ## Live validation of gameplay `v_max3_f16` recovery — 2026-08-03
 
