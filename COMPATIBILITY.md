@@ -52,7 +52,7 @@ closing bugs. Every title in the tested inventory has a long-lived tracker in th
 | *Little Nightmares III* | `PPSA05143` | Unreal Engine | 🔬 Starts graphics setup, then faults on a low-address read before presenting a frame |
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Boots and remains alive for the bounded test, but publishes no rendered frame |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 Loads the runtime and EOS module, then times out during initialization without presenting a frame |
-| *The House of the Dead 2: Remake* | `PPSA24203` | Unity / IL2CPP | 🚧 Clean animated 1080p opening, title menu and Training Mode selection render; loading Training 1 then ends on black before verified gameplay |
+| *The House of the Dead 2: Remake* | `PPSA24203` | Unity / IL2CPP | 🚧 A scripted route reaches Training 1 gameplay at native 1920×1080; the HUD, crosshair and sky render, but most world geometry is black or only sparse outlines (#1907) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🔬 Reaches a live rendered frame loop, but the sampled output remains black; an optional media probe also reports an unsupported FSB5 asset |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🔬 Clean 1080p opening key art renders, then the guest faults and the image stops advancing before a title screen |
 
@@ -991,12 +991,20 @@ presentation defect in [#1903](https://github.com/mattias800/prosper/issues/1903
   <img src="assets/screenshots/house-of-the-dead-2-remake-title.png" alt="The House of the Dead 2: Remake — title menu">
 </p>
 
+<p align="center">
+  <img src="assets/screenshots/house-of-the-dead-2-remake-gameplay.png" alt="The House of the Dead 2: Remake — Training 1 gameplay with severe missing-world rendering">
+</p>
+
 The Unity / IL2CPP title renders a clean animated opening and reaches its title menu at native
-1920×1080. Repeated Cross input continues into the Training Mode selection screen and starts loading
-Training 1. The loading presentation advances, but the output then becomes black, so gameplay is not
-yet claimed. The image above is a direct, unmodified frontend capture from the normal full-cadence
-Vulkan renderer. Current routes, evidence and follow-up work are tracked in
-[#1896](https://github.com/mattias800/prosper/issues/1896).
+1920×1080. A fresh-save repeated-Cross route selects Training Mode and Training 1. The loading-tip
+presentation at roughly 150–160 seconds is followed by a short black transition, the challenge
+prompt, `READY` / `GO`, and live rail-shooter gameplay from roughly 195 seconds onward.
+
+This is a rung-3 milestone, not a visual-verification claim. The HUD, weapon and ammunition display,
+crosshair, score objective, sky, changing camera frames and hit effects render, while most of the
+expected environment and actors are black, absent or reduced to sparse outlines (#1907). Both images
+are direct, unmodified captures from the normal full-cadence Vulkan renderer. Current routes and
+evidence are tracked in [#1896](https://github.com/mattias800/prosper/issues/1896).
 
 ## Requirements and scope
 
