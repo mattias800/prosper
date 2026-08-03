@@ -24,6 +24,7 @@
 #include "host/lifecycle.hpp"          // frontend-owned stop/pause gates
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
 #include "host/exec_image.hpp"         // run_entry
+#include "host/guest_write_watch.hpp"  // flush dmem writer diagnostic before deliberate _Exit
 #include "loader/linker.hpp"           // Program
 #include "input/pad.hpp"               // keyboard -> libScePad (HostPadState / PadBackend)
 #include "pad_overlay.hpp"              // keyboard pad 0 composed over the physical controller backend
@@ -2298,6 +2299,8 @@ int main(int argc, char** argv) {
         // the report is idempotent so a future cooperative teardown cannot duplicate it.
         prosper::frontend::report_live_compute_timing_selector_summary();
 #endif
+        // The bounded dmem writer trace also has a destructor/atexit fallback, which _Exit skips.
+        prosper::host::guest_dmem_write_trace_report();
         fflush(nullptr);
         std::_Exit(exitCode);
     }

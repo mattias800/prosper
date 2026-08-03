@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -31,6 +32,130 @@ struct GuestWriteWatchStats {
     uint64_t stale_faults = 0;
     uint64_t physical_writes = 0;
     uint64_t rearms = 0;
+};
+
+// Bounded, diagnostic-only provenance overlay for direct-memory CPU writes.  Unlike GuestWriteWatch,
+// which is a production dirty bit, this records the faulting instruction and the selected bytes on
+// both sides of one store.  Selection is run-relative: caller-chain + exact allocation size + offset.
+// Fixed guest virtual addresses are deliberately not accepted.
+inline constexpr size_t kGuestDmemWriteTraceMaxBytes = 128;
+inline constexpr size_t kGuestDmemWriteTraceMaxEvents = 64;
+inline constexpr uint32_t kGuestDmemWriteTraceMaxAllocationOccurrence = 4096;
+
+struct GuestDmemWriteTraceConfig {
+    uint32_t caller_chain = 0;
+    uint64_t allocation_size = 0;
+    uint64_t offset = 0;
+    uint32_t size = 0;
+    uint32_t max_events = 0;
+    // Zero preserves the four-field selector's strict-uniqueness contract. A nonzero value selects
+    // that one-based occurrence within the exact caller-chain/allocation-size family.
+    uint32_t allocation_occurrence = 0;
+};
+
+enum class GuestDmemWriteTraceStatus : uint8_t {
+    Disabled,
+    WaitingAllocation,
+    WaitingMapping,
+    Armed,
+    Stepping,
+    Invalid,
+    Overflow,
+};
+
+enum class GuestDmemWriteTraceInvalidReason : uint8_t {
+    None,
+    InvalidConfig,
+    CallerDiagnosticDisabled,
+    UnsupportedPlatform,
+    NoAlternateSignalStack,
+    AmbiguousAllocation,
+    AddressOverflow,
+    MappingTopologyChanged,
+    MappingProtectionChanged,
+    HostWrite,
+    PhysicalWrite,
+    ProtectFailed,
+    RearmFailed,
+    SingleStepUnavailable,
+    TrapFlagAlreadyOwned,
+};
+
+enum class GuestDmemWriteTraceResult : uint8_t {
+    Undetermined,
+    WriterObserved,
+    NoSelectedWriteObserved,
+};
+
+struct GuestDmemWriteTraceEvent {
+    uint64_t ordinal = 0;
+    uint64_t fault_addr = 0;
+    uint64_t fault_phys = 0;
+    uint64_t writer_rip = 0;
+    uint64_t next_rip = 0;
+    int64_t tid = 0;
+    uint32_t size = 0;
+    // Nonzero only when the signal-safe decoder proves one contiguous memory-write width for the
+    // faulting instruction. CR2 identifies the first inaccessible byte, not necessarily the operand
+    // start: a multi-byte store faulting exactly at a page boundary therefore remains uncertain when
+    // that fault byte is outside the selected interval.
+    uint32_t decoded_write_size = 0;
+    bool selected = false;
+    // A page fault reports the first faulting byte, not the memory operand's full write extent. When
+    // that byte begins outside the selected range and the bounded x86 decoder does not recognize the
+    // opcode, a crossing store cannot be ruled out. A changed post-image cannot attribute the write
+    // either because siblings share the process-wide RW step window. Such events are always reported
+    // as selection-uncertain rather than falsely claiming selected=yes/no.
+    bool selection_uncertain = false;
+    // The selected bytes changed while every alias was process-wide RW. This is useful evidence about
+    // the window, but does not attribute that change to an unrecognized faulting instruction: a sibling
+    // may have written during the same interval.
+    bool changed_during_window = false;
+    bool coverage_valid_before = false;
+    bool rearmed = false;
+    // False when an invalidation removed the retained mapping before completion. `after` remains
+    // value-initialized in that case and must never be presented as observed bytes.
+    bool post_available = false;
+    std::array<uint8_t, kGuestDmemWriteTraceMaxBytes> before{};
+    std::array<uint8_t, kGuestDmemWriteTraceMaxBytes> after{};
+};
+
+struct GuestDmemWriteTraceSnapshot {
+    GuestDmemWriteTraceConfig config{};
+    GuestDmemWriteTraceStatus status = GuestDmemWriteTraceStatus::Disabled;
+    GuestDmemWriteTraceInvalidReason invalid_reason = GuestDmemWriteTraceInvalidReason::None;
+    GuestDmemWriteTraceResult result = GuestDmemWriteTraceResult::Undetermined;
+    uint64_t allocation_matches = 0;
+    uint64_t mapping_matches = 0;
+    uint64_t page_faults = 0;
+    uint64_t selected_faults = 0;
+    uint64_t selection_uncertain_faults = 0;
+    uint64_t completed_steps = 0;
+    uint64_t rearms = 0;
+    uint64_t coverage_gaps = 0;
+    uint64_t overflow_events = 0;
+    uint64_t selected_occurrence = 0;
+    uint64_t target_phys = 0;
+    uint64_t target_addr = 0;
+    std::array<uint8_t, kGuestDmemWriteTraceMaxBytes> initial{};
+    uint32_t event_count = 0;
+    std::array<GuestDmemWriteTraceEvent, kGuestDmemWriteTraceMaxEvents> events{};
+};
+
+enum class GuestWriteWatchFaultAction : uint8_t {
+    NotHandled,
+    Resume,
+    SingleStep,
+};
+
+enum class GuestDmemWriteTraceStepAction : uint8_t {
+    NotHandled,
+    Complete,
+    // The owned TF trap was consumed and must be cleared, but a sibling normal-context operation
+    // invalidated the diagnostic during its one-instruction RW window. The event is retained without
+    // re-arming and the snapshot carries the explicit invalid reason.
+    CompleteInvalid,
+    LockTimeout,
 };
 
 // Windows direct memory is section-backed so MEM_WRITE_WATCH cannot observe it. Page-protection
@@ -79,9 +204,61 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size);
 // need not create a false dirty result.
 void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size);
 
-// Retained for the platform-neutral VEH interface; Windows currently returns false because
+// Retained for callers that can only resume a handled fault and cannot own a TF completion. On Linux
+// it preserves production dirty-watch behavior but fail-visibly invalidates/opens an overlapping dmem
+// diagnostic rather than publishing a step nobody can complete. Windows returns false because
 // page-fault write watches are unsafe for SysV guest code.
 bool guest_write_watch_handle_fault(uint64_t addr);
+
+// Extended Linux signal-path interface. The SIGSEGV caller sets TF only for SingleStep. On the
+// following TRAP_TRACE it calls complete_step, clears TF, and may log the returned bounded event.
+// complete_step has a lock-free pending-TID gate, so unrelated TRAP_TRACE users never wait for or
+// enter the dmem state lock. Other platforms return NotHandled/false.
+GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint64_t writer_rip,
+                                                             int64_t tid,
+                                                             bool trap_flag_already_owned = false);
+GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
+    int64_t tid, uint64_t next_rip, GuestDmemWriteTraceEvent& event);
+
+// Signal-safe bounded decoder used by the provenance trace. Returns a nonzero ascending contiguous
+// write width only for recognized single-destination MOV encodings; zero is explicit unknown.
+uint32_t guest_dmem_write_trace_decode_contiguous_store_size(const uint8_t* instruction);
+
+// Formats only the event's post-image payload. Unavailable observations produce the literal
+// `unavailable`, never the value-initialized contents of `after`. The returned count excludes NUL.
+size_t guest_dmem_write_trace_format_post(const GuestDmemWriteTraceEvent& event,
+                                          char* output, size_t capacity);
+
+// Normal-context setup/inspection. Production uses init_from_environment; configure is also the
+// deterministic test seam. Reconfiguration while a one-instruction TF step is pending is refused
+// without changing the live trace; invalidity never abandons signal ownership. Environment syntax is
+// Four fields preserve strict uniqueness:
+//   PROSPER_DMEM_WRITE_TRACE=<caller-chain>:<allocation-size>:<offset>:<bytes>
+// An explicit run-relative occurrence (1..4096) can disambiguate one exact allocation family:
+//   PROSPER_DMEM_WRITE_TRACE=<caller-chain>:<allocation-size>:<occurrence>:<offset>:<bytes>
+// PROSPER_DMEM_WRITE_TRACE_MAX_EVENTS is optional (1..64). PROSPER_DMEM_CALLER must also be enabled.
+void guest_dmem_write_trace_init_from_environment();
+bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig& config);
+bool guest_dmem_write_trace_enabled();
+GuestDmemWriteTraceSnapshot guest_dmem_write_trace_snapshot();
+void guest_dmem_write_trace_report();
+
+// Called immediately after the same bounded interner that prints PROSPER_DMEM_CALLER's allocation
+// record. chain_id==0 is an explicit unknown/overflow chain and cannot match a configured selector.
+void guest_dmem_write_trace_notify_allocation(uint64_t phys, uint64_t size, uint32_t chain_id);
+
+// Deterministic contention seam for the signal-path canary. Production never sets the hook or calls
+// the explicit lock helpers. The hook runs once after complete_step proves the state lock is busy.
+using GuestDmemWriteTraceContentionHookForTest = void (*)();
+void guest_dmem_write_trace_set_contention_hook_for_test(
+    GuestDmemWriteTraceContentionHookForTest hook);
+// Fires on entry to the normal-context protection helper that builds a dynamic rollback vector. A
+// SIGSEGV invalidation must use its allocation-free precomputed-alias path and never invoke this hook.
+using GuestDmemWriteTraceDynamicProtectionHookForTest = void (*)();
+void guest_dmem_write_trace_set_dynamic_protection_hook_for_test(
+    GuestDmemWriteTraceDynamicProtectionHookForTest hook);
+void guest_dmem_write_trace_lock_state_for_test();
+void guest_dmem_write_trace_unlock_state_for_test();
 
 // The Linux page-protection watch (mprotect + SIGSEGV) is only red-zone-safe when the SIGSEGV handler
 // runs on a sigaltstack (SA_ONSTACK): without it the kernel writes the signal frame into the guest's

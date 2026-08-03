@@ -202,6 +202,118 @@ two `[dmem-caller]` lines because the diagnostic silently suppresses repeated fi
 ordinary allocation line carries no correlation token. The target allocation therefore cannot safely be
 assigned either retained chain. #1599, #1859.
 
+The corrected caller-chain instrument was then rerun on master `1ccb88da` with the same exact v46
+submit/draw/stage/binding selector. The run completed 220 presents and captured submit 181 with the same
+8 draws, 6 computes, 14 operations, zero realization failures, raw descriptor full match, and uniformly
+zero 128-byte binding. This time every one of 102 main-direct-memory allocations carried correlation:
+97 were `caller-chain=1`, five were `caller-chain=2`, and none were unknown or overflow. The selected
+address was contained by exactly one map, `[0x2011500000,0x2012500000)`, whose unique allocation record
+was `len=0x1000000`, physical `0x21500000`, `caller-chain=1`; the selected offset remained `0xdd32f0`.
+Exactly one full definition existed for chain 1. Its first guest frame, `eboot+0x1b2454f`, follows a call
+whose PLT relocation resolves to `sceKernelAllocateMainDirectMemory`, independently confirming that the
+heuristic stack value is a real return site. Capsule SHA-256 was
+`cedf5d7bea196efa58fb90a0d69c1b03359084b90e5ae8cc8cda5ff5b57ca4de`. The earlier caller arm remains
+VOID as an apparatus result; the corrected arm establishes the dynamic allocation family and target
+membership, not uniqueness within that family. #1599, #1859,
+#1863.
+
+#1902 adds the next generic diagnostic contract. Four-field `PROSPER_DMEM_WRITE_TRACE` syntax,
+`<caller-chain>:<exact-allocation-size>:<offset>:<bytes>`, requires a unique allocation and rejects a
+second match as ambiguous. The optional five-field form inserts a one-based, bounded occurrence before
+the offset; it reports requested, observed, and selected occurrences and never accepts a prior run's VA.
+It waits for the correlated allocation, arms every known writable alias when the selected physical bytes
+are mapped, and records initial plus bounded faulting RIP/thread/before/after history.
+Any writable alias added after the initial arm invalidates the trace: that alias existed RW before its
+mapping notification, so retroactively protecting it could not prove continuous process-wide coverage.
+The Linux canary performs the first selected write from a different thread, an unrelated same-page write,
+a second selected write after re-arm, and one event beyond the history cap. A re-arm-bypass mutation fails
+the named history checks. It also holds the trace mutex across the first post-store trap and places a marker
+store as the exact following instruction: bounded acquisition must snapshot/re-arm while still in that first
+trap, with the marker unchanged. Reintroducing the old return-to-guest retry makes that named contention
+check fail. Lock-acquisition exhaustion terminates with explicit `step-lock-timeout`; it cannot widen the
+claimed single-step window. Because one instruction executes while the page is RW, only an event whose
+`coverage-valid-before=yes` has complete process-wide pre-fault coverage; after any step, later negative
+coverage is explicitly undetermined (or invalid/overflow), per orchestration trap 68.
+
+Independent review then found and deterministically reproduced three generic apparatus gaps before
+merge. Releasing an overlapping production `GuestWriteWatch` could make a still-`Armed` trace page RW;
+production re-arm could make the trace's pending one-instruction RW window RO. Page protection now uses
+the union of both logical owners, with Stepping as an explicit RW override that refuses production
+create/re-arm on covered pages. A sibling invalidation during Stepping now retains the exact published
+TID until `TRAP_TRACE`, returns `CompleteInvalid` so the caller clears TF, preserves the first invalid
+reason, and skips both stale reads and re-arm. Finally, `si_addr` is no longer treated as an operand
+extent: a bounded signal-safe decoder proves contiguous spans for common MOV stores (including the live
+event-1 qword form). An unrecognized off-range instruction always reports `selected=unknown`; a changed
+post-image is retained separately as `changed-during-window=yes`, because a sibling can write while the
+page is process-wide RW. Real fault canaries cover
+production reset/re-arm coexistence, sibling physical invalidation between SIGSEGV and TRAP, and a qword
+beginning four bytes before the selected interval. These harden the reusable instrument only; no new
+Asterix live run or writer conclusion was produced, and both historical live verdicts below remain VOID.
+
+A second exact-head review found five more ways the diagnostic could manufacture or lose evidence.
+Strict-unique mode could retain a real occurrence-1 event but still publish `writer-observed` after
+occurrence 2 made the subject ambiguous; terminal results now require a still-valid selected identity.
+Reconfiguration is refused without mutation while a TF step is pending. `CompleteInvalid` now carries
+an unavailable post-image explicitly and prints `post=unavailable`, never its value-initialized zeros.
+An unknown off-range instruction remains `selected=unknown` even when selected bytes changed during the
+process-wide RW window; the delta is retained separately because a sibling can be its writer. Finally,
+an instruction arriving with TF already owned by BP/HWBP/STEPWIN invalidates and opens the trace page but
+does not claim or clear that trap. Deterministic real-fault canaries cover selected-event-then-ambiguity,
+paused-step reconfiguration, unavailable post formatting, a sibling write during an unknown instruction's
+window, and a real `int3`-owned step through the protected store. These are apparatus corrections only and
+produce no new title-live conclusion.
+
+A third exact-head review closed two remaining capability/addressing holes in the apparatus. The
+retained boolean fault handler cannot request TF or route its completion, so it now preserves an
+overlapping production watch's Dirty/Resume behavior while invalidating the diagnostic as
+`single-step-unavailable`; it never publishes sentinel TID 0 or leaves selected pages stranded RW.
+Separately, a decoded store width is no longer added to page-boundary CR2 as if the first inaccessible
+byte were the operand start. A real qword beginning at `P-4`, faulting at P, and ending before a
+selection at `P+4` now remains selection-uncertain rather than becoming a false writer. Both real-fault
+canaries have defect-shaped mutations that fail only their named checks. These remain reusable
+instrument corrections; no new Asterix live run or writer conclusion was produced.
+
+A fourth exact-head review found that three fail-visible SIGSEGV exits still reached the
+normal-context protection helper. Although trace pages and aliases were precomputed, that helper built
+a dynamic rollback vector, making bool-capability, pre-owned-TF, and target-copy-failure invalidation
+unsafe if the signal interrupted allocator internals. Signal invalidation now walks only the existing
+page/alias storage, attempts every alias without rollback allocation, preserves the first invalid
+reason, records partial opening as an additional coverage gap, and resumes only when the faulting alias
+was actually restored by the trace or overlapping production path. A deterministic hook proves both
+real bool and pre-owned-TF signal controls never enter the allocating helper; a common-path mutation
+makes exactly those two named checks fail. This is an apparatus correction only, with no new Asterix
+live run or writer conclusion.
+
+The first exact live arm at commit `d181953e` was **VOID, by a useful self-invalidating result**. It
+completed 220 presents and captured submit 181 with the same exact positive control: 8 draws, 6 computes,
+14 operations, zero failures, and draw 0 PS binding 32 at `0x20122d32f0`, with 128/128 bytes at both
+samples, `full-equal`, raw descriptor `full-match`, and all bytes zero. The allocation census was again
+102 records (97 chain 1, five chain 2, none unknown/overflow), but **23** records were chain-1 16 MiB
+allocations. The trace selected occurrence 1, physical `0x20500000`, mapped at `0x2010500000`, and armed
+`0x20112d32f0`. Occurrence 2 was physical `0x21500000`, mapped at `0x2011500000`, and its offset resolves
+to the capture-selected `0x20122d32f0`; its arrival correctly invalidated the trace as
+`ambiguous-allocation` before any fault. The terminal summary reported two matches and zero events.
+Thus caller-chain plus allocation size is not unique, while two source-distinct runs now identify the
+resource as occurrence 2 of that run-relative allocation family. Capsule SHA-256 was
+`b4adcf7e1c81032246a03408fd2c469cef12bb0c559741e039730a29237d5391`. #1902.
+
+The exact occurrence-2 arm at commit `1da4d471` then validated that new lever but was also **VOID as a
+selected-byte writer result**. It completed 220 presents naturally. The selector reported requested
+occurrence 2, selected occurrence 2 at physical `0x21500000`, and armed `0x20122d32f0`; the terminal
+census observed all 23 family members. The independent v46 positive control named that exact same VA for
+draw 0 PS binding 32, again with 128/128 bytes at both samples, `full-equal`, raw descriptor `full-match`,
+and all bytes zero. Thus the run-relative allocation identity is accepted. However, the selected bytes
+share a page with heavy earlier activity: all 64 retained events were outside the selected range, spanning
+39 addresses from `0x20122d30b8` through `0x20122d3220`, below the selected start at `0x20122d32f0`.
+Event 1 had complete pre-fault coverage and was a real guest store at `eboot+0x1a5402e` to
+`0x20122d30c0`; independent disassembly confirms `mov QWORD PTR [r8+rdx+0x10],r10`. That first unrelated
+page write consumed trap 68's only complete interval. Event 65 then caused explicit overflow before any
+selected event. The terminal summary was `status=overflow`, with 23 observed allocations, occurrence 2
+selected, 65 page faults, zero selected faults, 64 steps/rearms, 65 coverage gaps, and 64/64 events.
+Therefore there is **no selected-byte CPU-writer conclusion** from this arm; merely raising the history
+cap could at most produce a later writer hint, not restore process-wide first-writer coverage. Capsule
+SHA-256 was `e358535fe2b864394a24df0a0d8735fcbfa1b18a79f57b67a13f0745a3b51f6d`. #1902.
+
 ## Ruled out
 
 - **Unresolved T#/S# lookup:** the title-live descriptor resolves; the rejection is the sampled MIMG
@@ -279,18 +391,19 @@ assigned either retained chain. #1599, #1859.
 
 ## Next discriminators
 
-1. After #1859 lands, repeat the exact v46 selector with `PROSPER_MEMLOG=1` and
-   `PROSPER_DMEM_CALLER=1`. Accept allocation ownership only when the selected address lies in one unique
-   map, its physical allocation record carries a nonzero `caller-chain=N`, and exactly one bounded full
-   chain defines that ID. Confirm the heuristic callsite in disassembly before using it as a mapping-relative
-   selector; `unknown`, `overflow`, or a missing ID makes the arm void.
-2. With that mapping identity, build a generic process-wide CPU write watch that arms at mapping creation,
-   records initial bytes plus bounded writer RIP/thread/post-store history, proves its fault/re-arm path with
-   a cross-thread canary, and requires the later v46 selector to match its dynamically derived address. Do
-   not reuse an absolute address from another process.
-3. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
+1. Treat occurrence 2 as accepted allocation identity: its dynamically selected VA exactly matched the
+   independent v46 resource address while the full family census remained 23. Do not return to a fixed VA or
+   the ambiguous four-field selector.
+2. The first same-page writer is now identified, but it is outside the selected bytes and consumes complete
+   coverage. Build the next generic instrument only if it can distinguish selected-range writes without
+   silently losing process-wide coverage; a larger history alone can provide a later writer hint, not the
+   first selected writer. Keep total faults/history bounded and every coverage gap explicit.
+3. If a later diagnostic observes a selected writer, confirm its module+offset in independent disassembly
+   before following that producer; do not promote it to process-wide first writer unless the new mechanism
+   independently closes trap 68's RW interval.
+4. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
    dispatch ran and reproduces its device loss; two failures in six runs are not a stable cause.
-4. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
+5. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
    Until then, do not update `COMPATIBILITY.md` or claim rung progress.
-5. Once output is useful, route beyond 125 seconds as a regression check for #1748; do not reopen the
+6. Once output is useful, route beyond 125 seconds as a regression check for #1748; do not reopen the
    old allocator diagnosis without a newly reproduced failure.

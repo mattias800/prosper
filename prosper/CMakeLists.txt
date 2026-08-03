@@ -821,6 +821,11 @@ if(TARGET prosper_core)
     target_link_libraries(test_guest_write_watch PRIVATE prosper_core)
     add_test(NAME guest_write_watch COMMAND test_guest_write_watch)
   endif()
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_dmem_write_trace tests/test_dmem_write_trace.cpp)
+    target_link_libraries(test_dmem_write_trace PRIVATE prosper_core)
+    add_test(NAME dmem_write_trace COMMAND test_dmem_write_trace)
+  endif()
 
   # Unannounced-32-bit index-buffer fingerprint (#304 — DOLL's Slate/UMG quads). No Vulkan needed.
   add_executable(test_index_size_detect tests/test_index_size_detect.cpp)
