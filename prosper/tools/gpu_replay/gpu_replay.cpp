@@ -9,9 +9,11 @@
 #include "compute_recompile.hpp"
 #include "realized_shader_dump.hpp"
 #include "pixel_input_linkage.hpp"
+#include "post_compute_resource.hpp"
 #include "render_runner.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -69,6 +71,8 @@ void usage(const char* argv0) {
                          "[--retry-failed-chain FAILURE] "
                          "[--retry-failed-stage FAILURE:STAGE] "
                          "[--dump-compute-resource N:BINDING PATH] "
+                         "[--dump-post-compute-resource N:BINDING PATH] "
+                         "[--require-post-change] [--expect-post-hash HASH] "
                          "[--legacy-htile-before-stencil] "
                          "<capture.prgcap> [output.bmp]\n", argv0);
 }
@@ -156,9 +160,25 @@ std::vector<uint8_t> inspect_live_target(const prosper::gpu::LiveTargetSnapshot&
     return inspect_rtt_seed(seed);
 }
 
+struct PostComputeDumpRequest {
+    size_t compute_index = SIZE_MAX;
+    uint64_t dispatch_index = UINT64_MAX;
+    uint32_t binding = UINT32_MAX;
+    size_t operation_index = SIZE_MAX;
+    size_t prefix_compute_executions = 0;
+    size_t prefix_compute_failures = 0;
+    size_t execution_count = 0;
+    bool execution_succeeded = false;
+    prosper::tools::PostComputeResourceSnapshot captured_seed;
+    prosper::tools::PostComputeResourceSnapshot selected_before;
+    prosper::tools::PostComputeResourceSnapshot after;
+    std::string error;
+};
+
 std::vector<uint8_t> execute_frame(const prosper::gpu::GpuReplayFrame& replay,
                                    bool draws_only = false,
-                                   size_t operation_limit = SIZE_MAX) {
+                                   size_t operation_limit = SIZE_MAX,
+                                   PostComputeDumpRequest* post_compute_dump = nullptr) {
     std::vector<prosper::gpu::SubmitOperation> operations;
     std::vector<prosper::gpu::ReplayDmaCopy> dma_copies;
     const size_t count = std::min(operation_limit, replay.operations.size());
@@ -182,7 +202,33 @@ std::vector<uint8_t> execute_frame(const prosper::gpu::GpuReplayFrame& replay,
         [](const auto& items, uint32_t width, uint32_t height) {
             return prosper::gpu::render_submit_items(items, width, height);
         },
-        [](const auto& items) { return prosper::gpu::execute_compute_items(items); },
+        [&](const auto& items) {
+            if (post_compute_dump)
+                post_compute_dump->prefix_compute_executions += items.size();
+            const bool selected = post_compute_dump && items.size() == 1 &&
+                items.front().dispatch_index == post_compute_dump->dispatch_index;
+            if (selected) {
+                ++post_compute_dump->execution_count;
+                if (!prosper::tools::snapshot_post_compute_resource(
+                        items.front().resources.get(), post_compute_dump->binding,
+                        post_compute_dump->selected_before, post_compute_dump->error)) {
+                    post_compute_dump->execution_succeeded = false;
+                    ++post_compute_dump->prefix_compute_failures;
+                    return false;
+                }
+            }
+            const bool ok = prosper::gpu::execute_compute_items(items);
+            if (post_compute_dump && !ok)
+                post_compute_dump->prefix_compute_failures += items.size();
+            if (selected) {
+                post_compute_dump->execution_succeeded = ok;
+                if (ok && !prosper::tools::snapshot_post_compute_resource(
+                              items.front().resources.get(), post_compute_dump->binding,
+                              post_compute_dump->after, post_compute_dump->error))
+                    post_compute_dump->execution_succeeded = false;
+            }
+            return ok;
+        },
         replay.metadata.width, replay.metadata.height);
     return result.frame.bytes();
 }
@@ -1456,6 +1502,8 @@ int main(int argc, char** argv) {
     bool recompile_raw = false;
     bool graph_only = false, bundle_zero_boundary = false, bundle_ds_summary = false;
     bool legacy_htile_before_stencil = false, draw_with_compute_prefix = false;
+    bool require_post_change = false, expected_post_hash_set = false;
+    uint64_t expected_post_hash = 0;
     size_t bundle_tail = 0;
     uint64_t bundle_through_submit_no = 0;
     uint32_t bundle_intermediate_target_width = 0, bundle_intermediate_target_height = 0;
@@ -1472,6 +1520,7 @@ int main(int argc, char** argv) {
     std::string compute_shader_spec, compute_shader_path;
     std::string compute_override_spec, compute_override_path;
     std::string compute_resource_spec, compute_resource_path;
+    std::string post_compute_resource_spec, post_compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
     std::string retry_failed_chain_spec, retry_failed_stage_spec;
     std::string realized_shader_spec, realized_shader_path;
@@ -1601,6 +1650,23 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-compute-resource" && i + 2 < argc) {
             compute_resource_spec = argv[++i]; compute_resource_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--dump-post-compute-resource" && i + 2 < argc) {
+            post_compute_resource_spec = argv[++i];
+            post_compute_resource_path = argv[++i];
+        }
+        else if (std::string(argv[i]) == "--require-post-change")
+            require_post_change = true;
+        else if (std::string(argv[i]) == "--expect-post-hash" && i + 1 < argc) {
+            char* end = nullptr;
+            const char* begin = argv[++i];
+            errno = 0;
+            const unsigned long long value = std::strtoull(begin, &end, 0);
+            if (!end || end == begin || *end || errno == ERANGE || *begin == '-') {
+                usage(argv[0]); return 2;
+            }
+            expected_post_hash = static_cast<uint64_t>(value);
+            expected_post_hash_set = true;
+        }
         else if (std::string(argv[i]) == "--dump-failed-shader" && i + 2 < argc) {
             failed_shader_spec = argv[++i]; failed_shader_path = argv[++i];
         }
@@ -1621,7 +1687,8 @@ int main(int argc, char** argv) {
             !shader_spec.empty() || !compute_shader_spec.empty() ||
             !realized_shader_spec.empty() ||
             !compute_override_spec.empty() ||
-            !compute_resource_spec.empty() || !failed_shader_spec.empty() ||
+            !compute_resource_spec.empty() || !post_compute_resource_spec.empty() ||
+            require_post_change || expected_post_hash_set || !failed_shader_spec.empty() ||
             !retry_failed_chain_spec.empty() ||
             !prepend_path.empty() || !draw_steps_prefix.empty()) {
             usage(argv[0]); return 2;
@@ -1651,6 +1718,16 @@ int main(int argc, char** argv) {
         (compute_only >= 0 && (draw_selected || through_operation >= 0))) {
         usage(argv[0]); return 2;
     }
+    if ((require_post_change || expected_post_hash_set) &&
+        post_compute_resource_spec.empty()) {
+        usage(argv[0]); return 2;
+    }
+    if (!post_compute_resource_spec.empty() &&
+        (inspect_only || validate_only || graph_only || draw_selected ||
+         through_operation >= 0 || compute_only >= 0 || warmup_repeats ||
+         !prepend_path.empty() || !draw_steps_prefix.empty())) {
+        usage(argv[0]); return 2;
+    }
     if (draw_with_compute_prefix && !draw_selected) { usage(argv[0]); return 2; }
     // #1332: the filmstrip sub-flags configure --draw-steps; alone they would be silently unused.
     if ((draw_steps_every > 0 || draw_steps_target_w) && draw_steps_prefix.empty()) {
@@ -1659,7 +1736,8 @@ int main(int argc, char** argv) {
     // #1330: ordered-prefix inspection modes must see the pass a prefix actually ends on, even when
     // that pass renders a non-RGBA8 target (an FP16 HDR scene). The shared live renderer publishes an
     // inspection-converted fallback only under this env, so full replays and live runs are unchanged.
-    if ((draw_selected || through_operation >= 0 || !draw_steps_prefix.empty()) &&
+    if ((draw_selected || through_operation >= 0 || !draw_steps_prefix.empty() ||
+         !post_compute_resource_spec.empty()) &&
         !set_environment("PROSPER_PREFIX_INSPECT", "1")) {
         std::fprintf(stderr, "gpu_replay: cannot set PROSPER_PREFIX_INSPECT\n"); return 2;
     }
@@ -2355,7 +2433,75 @@ int main(int argc, char** argv) {
                      static_cast<unsigned long long>(found->host_data_size),
                      compute_resource_path.c_str());
     }
-    size_t selected_operation_limit = SIZE_MAX;
+    PostComputeDumpRequest post_compute_dump;
+    PostComputeDumpRequest* post_compute_dump_ptr = nullptr;
+    if (!post_compute_resource_spec.empty()) {
+        const size_t colon = post_compute_resource_spec.find(':');
+        const char* index_begin = post_compute_resource_spec.c_str();
+        char* index_end = nullptr;
+        errno = 0;
+        const unsigned long long index = std::strtoull(index_begin, &index_end, 0);
+        const bool index_out_of_range = errno == ERANGE || index > SIZE_MAX;
+        const char* binding_begin = colon == std::string::npos ? index_begin :
+            index_begin + colon + 1;
+        char* binding_end = nullptr;
+        errno = 0;
+        const unsigned long long binding = colon == std::string::npos ? UINT64_MAX :
+            std::strtoull(binding_begin, &binding_end, 0);
+        if (colon == std::string::npos ||
+            index_end == index_begin || index_end != index_begin + colon ||
+            *index_begin == '-' || index_out_of_range ||
+            !binding_end || binding_end == binding_begin || *binding_end ||
+            *binding_begin == '-' || errno == ERANGE || binding > UINT32_MAX ||
+            static_cast<size_t>(index) >= replay.computes.size()) {
+            std::fprintf(stderr, "gpu_replay: invalid post-compute resource selector %s\n",
+                         post_compute_resource_spec.c_str());
+            return 2;
+        }
+        post_compute_dump.compute_index = static_cast<size_t>(index);
+        post_compute_dump.dispatch_index =
+            replay.computes[post_compute_dump.compute_index].dispatch_index;
+        post_compute_dump.binding = static_cast<uint32_t>(binding);
+        if (!prosper::tools::snapshot_post_compute_resource(
+                replay.computes[post_compute_dump.compute_index].resources.get(),
+                post_compute_dump.binding, post_compute_dump.captured_seed,
+                post_compute_dump.error)) {
+            std::fprintf(stderr, "gpu_replay: cannot arm post-compute resource %s: %s\n",
+                         post_compute_resource_spec.c_str(),
+                         post_compute_dump.error.c_str());
+            return 2;
+        }
+        size_t matches = 0;
+        for (size_t operation_index = 0; operation_index < replay.operations.size();
+             ++operation_index) {
+            const auto& operation = replay.operations[operation_index];
+            if (operation.kind != prosper::gpu::SubmitOperationKind::Dispatch ||
+                operation.source_index != post_compute_dump.dispatch_index ||
+                !operation.realized)
+                continue;
+            post_compute_dump.operation_index = operation_index;
+            ++matches;
+        }
+        if (matches != 1) {
+            std::fprintf(stderr,
+                         "gpu_replay: post-compute selector %s resolves to %zu realized "
+                         "operations (expected exactly one)\n",
+                         post_compute_resource_spec.c_str(), matches);
+            return 2;
+        }
+        post_compute_dump_ptr = &post_compute_dump;
+        allow_mismatch = true;
+        std::fprintf(stderr,
+                     "[post-compute-resource] armed compute=%zu dispatch=%llu operation=%zu "
+                     "binding=%u before-raw=%016llx before-linear=%016llx\n",
+                     post_compute_dump.compute_index,
+                     static_cast<unsigned long long>(post_compute_dump.dispatch_index),
+                     post_compute_dump.operation_index, post_compute_dump.binding,
+                     static_cast<unsigned long long>(post_compute_dump.captured_seed.raw_hash),
+                     static_cast<unsigned long long>(post_compute_dump.captured_seed.linear_hash));
+    }
+    size_t selected_operation_limit = post_compute_dump_ptr
+        ? post_compute_dump.operation_index + 1 : SIZE_MAX;
     if (draw_selected) {
         if (draw_last < draw_first) {
             std::fprintf(stderr, "gpu_replay: draw range %llu:%llu is out of range\n",
@@ -2534,7 +2680,99 @@ int main(int argc, char** argv) {
     const size_t operation_limit = through_operation >= 0
         ? static_cast<size_t>(through_operation) + 1 : selected_operation_limit;
     const bool selected_draws_only = draw_selected && !draw_with_compute_prefix;
-    std::vector<uint8_t> pixels = execute_frame(replay, selected_draws_only, operation_limit);
+    std::vector<uint8_t> pixels = execute_frame(
+        replay, selected_draws_only, operation_limit, post_compute_dump_ptr);
+    if (post_compute_dump_ptr) {
+        if (post_compute_dump.execution_count != 1) {
+            std::fprintf(stderr,
+                         "gpu_replay: selected post-compute dispatch executed %zu times "
+                         "(expected exactly one)\n",
+                         post_compute_dump.execution_count);
+            return 1;
+        }
+        if (!post_compute_dump.execution_succeeded) {
+            std::fprintf(stderr, "gpu_replay: selected post-compute dispatch failed%s%s\n",
+                         post_compute_dump.error.empty() ? "" : ": ",
+                         post_compute_dump.error.c_str());
+            return 1;
+        }
+        if (post_compute_dump.prefix_compute_failures) {
+            std::fprintf(stderr,
+                         "gpu_replay: post-compute prefix had %zu failed compute dispatches "
+                         "among %zu executions\n",
+                         post_compute_dump.prefix_compute_failures,
+                         post_compute_dump.prefix_compute_executions);
+            return 1;
+        }
+        FILE* file = std::fopen(post_compute_resource_path.c_str(), "wb");
+        if (!file ||
+            std::fwrite(post_compute_dump.after.linear.data(), 1,
+                        post_compute_dump.after.linear.size(), file) !=
+                post_compute_dump.after.linear.size()) {
+            if (file) std::fclose(file);
+            std::fprintf(stderr, "gpu_replay: cannot write %s\n",
+                         post_compute_resource_path.c_str());
+            return 2;
+        }
+        std::fclose(file);
+        const bool raw_changed = post_compute_dump.selected_before.raw_hash !=
+                                 post_compute_dump.after.raw_hash;
+        const auto change_evidence = prosper::tools::post_compute_change_evidence(
+            post_compute_dump.captured_seed, post_compute_dump.selected_before,
+            post_compute_dump.after);
+        std::fprintf(stderr,
+                     "[post-compute-resource] compute=%zu dispatch=%llu operation=%zu "
+                     "binding=%u prefix-computes=%zu selected-executions=%zu succeeded=yes "
+                     "raw-bytes=%zu linear-bytes=%zu "
+                     "selected-raw-hash=%016llx->%016llx changed=%s "
+                     "selected-linear-hash=%016llx->%016llx changed=%s "
+                     "captured-seed-linear=%016llx prefix-changed=%s output=%s\n",
+                     post_compute_dump.compute_index,
+                     static_cast<unsigned long long>(post_compute_dump.dispatch_index),
+                     post_compute_dump.operation_index, post_compute_dump.binding,
+                     post_compute_dump.prefix_compute_executions,
+                     post_compute_dump.execution_count, post_compute_dump.after.raw.size(),
+                     post_compute_dump.after.linear.size(),
+                     static_cast<unsigned long long>(post_compute_dump.selected_before.raw_hash),
+                     static_cast<unsigned long long>(post_compute_dump.after.raw_hash),
+                     raw_changed ? "yes" : "no",
+                     static_cast<unsigned long long>(post_compute_dump.selected_before.linear_hash),
+                     static_cast<unsigned long long>(post_compute_dump.after.linear_hash),
+                     change_evidence.selected_changed ? "yes" : "no",
+                     static_cast<unsigned long long>(
+                         post_compute_dump.captured_seed.linear_hash),
+                     change_evidence.prefix_changed ? "yes" : "no",
+                     post_compute_resource_path.c_str());
+        if (post_compute_dump.after.has_r11_stats) {
+            const auto& stats = post_compute_dump.after.r11;
+            std::fprintf(stderr,
+                         "[post-compute-resource] r11 texels=%llu channels=%llu finite=%llu "
+                         "zero=%llu gt1=%llu +inf=%llu nan=%llu min=%g max=%g mean=%g\n",
+                         static_cast<unsigned long long>(stats.texels),
+                         static_cast<unsigned long long>(stats.channels),
+                         static_cast<unsigned long long>(stats.finite),
+                         static_cast<unsigned long long>(stats.zero),
+                         static_cast<unsigned long long>(stats.above_one),
+                         static_cast<unsigned long long>(stats.positive_infinity),
+                         static_cast<unsigned long long>(stats.nan), stats.finite_min,
+                         stats.finite_max, stats.finite_mean);
+        }
+        if (require_post_change && !change_evidence.selected_changed) {
+            std::fprintf(stderr,
+                         "gpu_replay: selected dispatch did not change descriptor-visible "
+                         "resource content\n");
+            return 1;
+        }
+        if (expected_post_hash_set &&
+            post_compute_dump.after.raw_hash != expected_post_hash) {
+            std::fprintf(stderr,
+                         "gpu_replay: post-compute raw hash mismatch: got=%016llx "
+                         "expected=%016llx\n",
+                         static_cast<unsigned long long>(post_compute_dump.after.raw_hash),
+                         static_cast<unsigned long long>(expected_post_hash));
+            return 1;
+        }
+    }
     // Diagnostic: after rendering, read back every persistent depth/stencil surface's STENCIL plane and
     // write it as a grayscale image (value*80) plus a value histogram. This shows exactly where a
     // stencil-counting clip mask reached each count — e.g. GTA V's menu artwork is gated on stencil==2
