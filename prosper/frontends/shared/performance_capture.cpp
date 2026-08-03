@@ -341,8 +341,9 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
             out << ",\"rss_bytes\":";
             write_optional(out, sample.rss_bytes);
             out << ",\"guest_presents\":" << sample.guest_presents
-                << ",\"rendered_frames\":" << sample.rendered_frames
-                << ",\"host_presented_frames\":" << sample.host_presented_frames << "}\n";
+                << ",\"rendered_frames\":";
+            write_optional(out, sample.rendered_frames);
+            out << ",\"host_presented_frames\":" << sample.host_presented_frames << "}\n";
         };
         for (const ProcessSample& sample : capture->pre_samples) write_sample(sample, "pre");
         for (const ProcessSample& sample : capture->post_samples) write_sample(sample, "post");
@@ -436,7 +437,7 @@ uint64_t monotonic_now_ns() {
 }
 
 ProcessSample collect_process_sample(uint64_t monotonic_ns, uint64_t guest_presents,
-                                     uint64_t rendered_frames,
+                                     std::optional<uint64_t> rendered_frames,
                                      uint64_t host_presented_frames) {
     ProcessSample sample;
     sample.monotonic_ns = monotonic_ns;

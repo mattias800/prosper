@@ -110,6 +110,14 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         }]))
         self.assertIn("does not assign its cause", summary["pacing_note"])
 
+    def test_direct_present_unavailable_render_counter_declines_pacing_inference(self):
+        direct_present = [dict(sample, rendered_frames=None) for sample in SAMPLES]
+        summary = summarize(capture(direct_present, renderer=[{"total_ms": 1}]))
+        self.assertEqual(summary["rates"]["guest_fps"], 60)
+        self.assertEqual(summary["rates"]["host_fps"], 9)
+        self.assertIsNone(summary["rates"]["rendered_fps"])
+        self.assertIsNone(summary["pacing_note"])
+
     def test_dropped_counts_are_reported_not_added_to_population(self):
         summary = summarize(capture(SAMPLES, renderer=[{"total_ms": 1}], dropped=(7, 9)))
         self.assertEqual(summary["counts"]["renderer"], 1)

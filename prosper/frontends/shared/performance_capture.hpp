@@ -20,7 +20,9 @@ struct ProcessSample {
     std::optional<uint64_t> process_cpu_ns;
     std::optional<uint64_t> rss_bytes;
     uint64_t guest_presents = 0;
-    uint64_t rendered_frames = 0;
+    // The CPU handoff path exposes present_frame_seq(). The shared-device GPU-present path skips
+    // that handoff, so its production counter is unavailable rather than zero.
+    std::optional<uint64_t> rendered_frames;
     uint64_t host_presented_frames = 0;
 };
 
@@ -130,7 +132,7 @@ InteractivePerformanceCapture& interactive_performance_capture();
 
 uint64_t monotonic_now_ns();
 ProcessSample collect_process_sample(uint64_t monotonic_ns, uint64_t guest_presents,
-                                     uint64_t rendered_frames,
+                                     std::optional<uint64_t> rendered_frames,
                                      uint64_t host_presented_frames);
 const char* build_revision();
 

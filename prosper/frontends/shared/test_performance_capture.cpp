@@ -147,7 +147,9 @@ int main() {
     }
 
     capture.observe_sample(sample(600, 6));
-    capture.observe_sample(sample(700, 7));
+    auto unavailable_render_count = sample(700, 7);
+    unavailable_render_count.rendered_frames.reset();
+    capture.observe_sample(unavailable_render_count);
     check(capture.detailed_timing_active(), "detailed timing stays active before the post window ends");
     capture.observe_sample(sample(800, 8));
     check(!capture.detailed_timing_active(), "the bounded post window disables detailed timing");
@@ -176,6 +178,8 @@ int main() {
           "serialized artifact contains the exact pre-trigger ring population");
     check(count_text(text, "\"type\":\"sample\",\"phase\":\"post\"") == 3,
           "serialized artifact contains the exact post-trigger population");
+    check(count_text(text, "\"rendered_frames\":null") == 1,
+          "an unavailable rendered-frame population serializes as JSON null");
     check(count_text(text, "\"type\":\"renderer\"") == 2 &&
           count_text(text, "\"type\":\"compute\"") == 1,
           "serialized detail counts match the bounded retained records");
