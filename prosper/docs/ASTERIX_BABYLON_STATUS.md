@@ -77,9 +77,19 @@ edge producer=10 consumer=11 stage=ps binding=34 addr=0000002011800000
 ```
 
 The corrected graph reports six edges and no external image leaf for the final composite source.
-This does not yet identify which operation first produces black; that requires one bounded replay of
-the retained bundle with per-operation outputs. It does rule out the former conclusion that the
-final surface necessarily needed an earlier-submit producer.
+The proposed bounded replay has now run through operations 4/6/8/10/11. All five outputs were the
+same pure-black image (`hash=792bed5a3f02a383`; RGB min/max/mean zero), although they do not all name
+the same surface. Inspect and graph output map them respectively to draws 0/2/4/6/7. Operation 4 is
+the first graphics operation and directly renders color0 `0x2033b10000` black; its fragment shader's
+only captured input is a zero-filled 128-byte constant buffer, and the temporal seeds in this chain
+are also zero. The capture therefore contains no useful-color-to-black transition and does not
+justify a product-code fix.
+
+The run also exposed the remaining instrument limit. For fixed resolves 6 and 10,
+`--through-operation` selects the draw's color0 source (`0x2033b10000`) as its output, not raw color1
+destination `0x2011800000`. Their black BMPs therefore do not directly observe the resolve
+destination. The former prior-frame conclusion remains ruled out, but exact destination pixels need
+a target-address selector rather than another title boot.
 
 A separate 64.7-second semantic timeline recorded 31,982 complete submits before a recoverable
 truncated tail. Submit 1 had 8 draws/10 dispatches; every later submit had 8 draws/6 dispatches, and
@@ -202,22 +212,21 @@ self-validating reproduction.
 - **The final composite source as an unresolved prior-frame producer:** the old graph omitted
   fixed-function `MODE=RESOLVE` edges. Its `edges=0` result falsely listed `0x2011800000` as an
   external leaf consumed by operations 8/11. The corrected six edges are 4→5, 4→6, 6→8, 4→9,
-  4→10, and 10→11, closing that source through four color0-to-color1 copies in the same submit.
-  The first black operation remains to be localized by replay.
+  4→10, and 10→11, closing that source through four color0-to-color1 copies in the same submit. The
+  bounded prefix replay subsequently found the first graphics producer already black; it did not
+  reveal a useful-color-to-black boundary or justify a renderer change.
 - **A renderer-disabled title boot as a GPU-free experiment:** live compute remains active without
   `PROSPER_RENDER` and initializes Vulkan when the title dispatches supported compute.
 
 ## Next discriminators
 
-1. Under a bounded GPU lease, replay the retained present-180 bundle by operation around 4/6/8/10/11.
-   Compare the color0 producer, each fixed-function resolve destination, and both composites to name
-   the first black output. The dependency chain is now closed; no new title boot is needed for this step.
-2. If the first color0 producer is already black, inspect its shader inputs and target initialization.
-   If color0 is useful but color1 becomes black, isolate the resolve copy. If both survive and a
-   composite turns black, inspect that composite's sampled values and fixed-function state.
-3. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
+1. Add a generic replay selector that snapshots an exact target address after an exact operation.
+   Use it on `0x2011800000` after operations 6 and 10, and print both selectors beside the output so
+   the experiment proves its own lever moved. Prefix output cannot answer this because it selects
+   color0 for a fixed resolve. This is a tool gap; no new title boot is needed.
+2. Treat compute program `0x2011734400` as a candidate only if a discriminator independently proves the
    dispatch ran and reproduces its device loss; two failures in six runs are not a stable cause.
-4. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
+3. If output becomes non-black, compare source-distinct/pixel-distinct frames and post a screenshot.
    Until then, do not update `COMPATIBILITY.md` or claim rung progress.
-5. Once output is useful, route beyond 125 seconds as a regression check for #1748; do not reopen the
+4. Once output is useful, route beyond 125 seconds as a regression check for #1748; do not reopen the
    old allocator diagnosis without a newly reproduced failure.
