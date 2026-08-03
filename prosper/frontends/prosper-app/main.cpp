@@ -1616,10 +1616,6 @@ int main(int argc, char** argv) {
                     vk.gpu_present, gpu::present_frame_seq()),
                 shown));
         }
-        if (automaticPerfCapture.take_if_due(perfLoopStartNs, perfNow)) {
-            arm_performance_capture(
-                true, perfNow, (perfNow - perfLoopStartNs) / 1'000'000);
-        }
         prosper::perf::CaptureOutcome perfOutcome;
         if (perfCapture.take_outcome(perfOutcome)) {
             if (perfOutcome.ok) {
@@ -1636,6 +1632,13 @@ int main(int argc, char** argv) {
                              perfOutcome.error.c_str());
             }
             perfCaptureWasAutomatic = false;
+        }
+        // Consume a completion before starting a new automatic capture. Otherwise a user-triggered
+        // F8 outcome that completed on this same sample could be mislabeled as automatic after the
+        // new arm replaces the trigger-provenance flag.
+        if (automaticPerfCapture.take_if_due(perfLoopStartNs, perfNow)) {
+            arm_performance_capture(
+                true, perfNow, (perfNow - perfLoopStartNs) / 1'000'000);
         }
         openedThisBatch = rejectedThisBatch = false;
         SDL_Event ev;
