@@ -260,13 +260,10 @@ jobs:
           --out-dir "$RUNNER_TEMP/linux-release"
           --max-glibc 2.39
 
-      # Tag pushes always. On a pull request only when it carries the `ci:artifacts` label, so a
-      # build of a branch can be downloaded and opened by hand without giving every PR a
-      # release-sized artifact (#1462).
+      # Archives leave the runner only for a release tag. Pull requests still build, package, and
+      # execute the archives above, but never upload them (#1803).
       - name: Upload Linux archives
-        if: >-
-          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-          contains(github.event.pull_request.labels.*.name, 'ci:artifacts')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: prosper-linux-x86_64
