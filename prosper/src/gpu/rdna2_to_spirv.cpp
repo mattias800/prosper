@@ -5157,6 +5157,21 @@ inline void mask_write_clobbers_pair(RegState& rs, int dst) {
     rs.sreg_srt.erase(dst); rs.sreg_srt.erase(dst + 1);
 }
 
+// DS_APPEND/DS_CONSUME use M0 as two different architectural layouts. For LDS, M0[15:0]
+// is the byte base. For GDS, M0[31:16] is the 16-bit byte base and M0[15:0] is the
+// allocation size. Astro Bot supplies M0=0x0c600020 and resets the resulting counters at
+// 0xc70..0xc7c; treating the low size field as the base instead placed them at 0x30..0x3c,
+// where they accumulated without bound (#1742). The final 16-bit mask is part of both address
+// domains and keeps base+offset arithmetic wrapping at the 64 KiB share boundary.
+uint32_t ds_append_consume_index(SpirvCompute& b, uint32_t m0, uint32_t literal, bool gds) {
+    const uint32_t base = gds
+        ? b.ibin(Op_ShiftRightLogical, m0, b.uconst(16))
+        : b.ibin(Op_BitwiseAnd, m0, b.uconst(0xffffu));
+    const uint32_t byte_addr = b.ibin(
+        Op_BitwiseAnd, b.ibin(Op_IAdd, base, b.uconst(literal)), b.uconst(0xffffu));
+    return b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
+}
+
 // Emit one ALU instruction (VOP1/2/C/3 or SOP1/2) into `b`, updating `rs`. Returns true if `in` is an
 // ALU format handled here; sets ok=false if it is an ALU op this stage doesn't support yet. Non-ALU
 // formats (EXP/memory/...) return false so the stage-specific caller can handle them.
@@ -9886,11 +9901,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (in.opcode == 0x3d || in.opcode == 0x3e) {
                 auto m0 = rs.sreg.find(124);
                 if (!allow_wave || m0 == rs.sreg.end()) { ok = false; return true; }
-                const uint32_t base = b.ibin(Op_BitwiseAnd, m0->second, b.uconst(0xFFFFu));
-                const uint32_t byte_addr = b.ibin(
-                    Op_BitwiseAnd, b.ibin(Op_IAdd, base, b.uconst(in.literal)),
-                    b.uconst(0xFFFFu));
-                const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
+                const uint32_t idx = ds_append_consume_index(
+                    b, m0->second, in.literal, in.ds_gds);
                 const uint32_t old = vreg_old(b, rs, in.dst.value);
                 if (b.is_fragment && in.ds_gds) {
                     rs.vreg[in.dst.value] = b.native_gds_append(
@@ -12515,9 +12527,8 @@ bool emit_cfg_state_machine(
             const auto event = append_event_for_pc.find(append->pc);
             if (m0 == state.sreg.end() || event == append_event_for_pc.end()) return false;
             if (!append->ds_gds) b.declare_lds();
-            const uint32_t base = b.ibin(Op_BitwiseAnd, m0->second, b.uconst(0xffffu));
-            const uint32_t byte_addr = b.ibin(Op_IAdd, base, b.uconst(append->literal));
-            const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
+            const uint32_t idx = ds_append_consume_index(
+                b, m0->second, append->literal, append->ds_gds);
             if (b.native_subgroup_size) {
                 const uint32_t result = append->ds_gds
                     ? b.native_gds_append(idx, state.exec, append->opcode == 0x3d)
