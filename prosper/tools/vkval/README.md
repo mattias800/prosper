@@ -76,14 +76,12 @@ which.
 
 Checking each id separately is what catches a *partial* break. An all-absent check alone passes a
 VUID rename, or a framing change that affects some message shapes and not others, while silently
-halving what the guard can see. The two ids that genuinely cannot appear everywhere are marked
-`environment-dependent` and say why on their reason line, so the exemption is written down rather
+halving what the guard can see. The id that genuinely cannot appear everywhere is marked
+`environment-dependent` and says why on its reason line, so the exemption is written down rather
 than assumed:
 
 * `VUID-vkCmdDispatch-maintenance4-08602` is a newer check than validation layers 1.3.275, which is
-  what Ubuntu 24.04 (the CI runner) carries;
-* `VUID-VkMappedMemoryRange-size-01389` cannot trigger on lavapipe at all, whose
-  `nonCoherentAtomSize` is 1 — it was only seen on RADV.
+  what Ubuntu 24.04 (the CI runner) carries.
 
 Deleting the last allow-list entry — the intended end state — switches the check off.
 

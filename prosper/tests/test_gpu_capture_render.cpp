@@ -50,6 +50,20 @@ static void unset_env(const char* name) {
 #endif
 }
 
+constexpr bool mapped_readback_plan_satisfies_vuid_01389(
+        prosper::test::MappedReadbackPlan plan, VkDeviceSize allocation,
+        VkDeviceSize atom) {
+    if (!plan.map_size || !plan.invalidate_size || !allocation || !atom)
+        return false;
+    const VkDeviceSize mapping_end =
+        plan.map_size == VK_WHOLE_SIZE ? allocation : plan.map_size;
+    if (mapping_end > allocation) return false;
+    if (plan.invalidate_size == VK_WHOLE_SIZE)
+        return mapping_end == allocation || mapping_end % atom == 0;
+    return plan.invalidate_size <= mapping_end &&
+           (plan.invalidate_size == allocation || plan.invalidate_size % atom == 0);
+}
+
 int main() {
     // buffer_upload_bytes caches this override on first use. Reset it before the renderer can build
     // any buffer resource so the test always exercises the production default ceiling.
@@ -999,6 +1013,25 @@ int main() {
     CHECK(!read_gpu_capture_rtt_seed(fp16_history.guest_addr, retained_history, error) &&
           error == "render target is absent from live cache",
           "overlapping guest GPU write invalidates stale CPU FP16 history");
+
+    // #1717: this checkpoint is the exact defect shape on RADV: 4x3 D32S8 is 48 depth + 12
+    // stencil = 60 logical bytes, VkMemoryRequirements rounds the allocation to 64, and the device's
+    // nonCoherentAtomSize is 64. Invalidating VK_WHOLE_SIZE after mapping only 60 bytes violates
+    // VUID 01389; mapping the whole allocation makes its end equal the memory-object end.
+    {
+        using prosper::test::MappedReadbackPlan;
+        using prosper::test::mapped_readback_plan;
+        constexpr VkDeviceSize logical_bytes = 60;
+        constexpr VkDeviceSize allocation_bytes = 64;
+        constexpr VkDeviceSize atom_bytes = 64;
+        constexpr MappedReadbackPlan old_defect{logical_bytes, VK_WHOLE_SIZE};
+        constexpr MappedReadbackPlan fixed = mapped_readback_plan(logical_bytes);
+        CHECK(!mapped_readback_plan_satisfies_vuid_01389(
+                  old_defect, allocation_bytes, atom_bytes) &&
+                  mapped_readback_plan_satisfies_vuid_01389(
+                      fixed, allocation_bytes, atom_bytes),
+              "60-byte D32S8 readback maps through the 64-byte allocation end before invalidation");
+    }
 
     GpuCaptureDsSeed ds_seed;
     ds_seed.depth_read_base = ds_seed.depth_write_base = 0x810000;
