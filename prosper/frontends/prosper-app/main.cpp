@@ -1304,7 +1304,8 @@ int main(int argc, char** argv) {
     const auto loopStarted = std::chrono::steady_clock::now();
     auto lastFrameProgress = loopStarted;
     auto nextTimedDump = loopStarted + std::chrono::milliseconds(timedDumpMs);
-    uint64_t shown = 0, lastFrameSeq = ~0ull, patFrame = 0;
+    prosper::frontend::PresentedFrameCounter shown(exitAfter);
+    uint64_t lastFrameSeq = ~0ull, patFrame = 0;
     bool havePresentedGuestFlip = false;
     uint64_t lastPresentedGuestFlip = 0;
     int gpuPrevSlot = -1;   // #1270: the GPU scanout slot presented last frame (released after its read)
@@ -2164,7 +2165,8 @@ int main(int argc, char** argv) {
                 } else if (attempt == PresentAttempt::failed) {
                     running = false;
                 } else {
-                    shown++; lastFrameProgress = std::chrono::steady_clock::now();
+                    shown.record(prosper::frontend::PresentedFrameSource::GpuScanout, running);
+                    lastFrameProgress = std::chrono::steady_clock::now();
                     havePresentedGuestFlip = true;
                     lastPresentedGuestFlip = gf.frame_seq;
                     static auto t0 = std::chrono::steady_clock::now(); static uint64_t mark = 0;
@@ -2175,7 +2177,6 @@ int main(int argc, char** argv) {
                                 (shown - mark) / (s > 0 ? s : 1), (unsigned long long)shown);
                         t0 = now; mark = shown;
                     }
-                    if (exitAfter && (int)shown >= exitAfter) running = false;
                 }
             } else if (gpu::present_frame_seq() != lastFrameSeq) {
                 // #1270 Finding 2: no GPU frame was published this iteration. On a publish MISS (front
@@ -2200,7 +2201,8 @@ int main(int argc, char** argv) {
                     else if (a == PresentAttempt::failed) running = false;
                     else {
                         lastFrameSeq = cf.frame_seq;
-                        shown++;
+                        shown.record(
+                            prosper::frontend::PresentedFrameSource::GpuCpuFallback, running);
                         lastFrameProgress = std::chrono::steady_clock::now();
                         havePresentedGuestFlip = true;
                         lastPresentedGuestFlip = cf.guest_present_count;
@@ -2232,7 +2234,8 @@ int main(int argc, char** argv) {
                 } else if (attempt == PresentAttempt::failed) {
                     running = false;
                 } else {
-                    lastFrameSeq = frame.frame_seq; shown++;
+                    lastFrameSeq = frame.frame_seq;
+                    shown.record(prosper::frontend::PresentedFrameSource::Cpu, running);
                     lastFrameProgress = std::chrono::steady_clock::now();
                     flushGrabScreenshot(frame.rgba->data(), w, h);
                     // Periodic present-rate log (every 60 presented frames).
@@ -2262,7 +2265,6 @@ int main(int argc, char** argv) {
                         }
                         t0 = now; mark = shown;
                     }
-                    if (exitAfter && (int)shown >= exitAfter) running = false;
                 }
             }
         } else {

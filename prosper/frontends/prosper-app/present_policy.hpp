@@ -40,6 +40,39 @@ enum class PresentAttempt {
     failed,       // device/synchronization recovery failed — stop instead of waiting forever
 };
 
+// Every successful presentation path contributes to the same --frames budget.  Keep the count and
+// stop decision inseparable: a caller cannot increment the private counter while forgetting to apply
+// the limit, which was the CPU-fallback defect in #1858.  The source is explicit so focused tests can
+// prove that adding a new presentation route does not silently create a different policy.
+enum class PresentedFrameSource {
+    GpuScanout,
+    GpuCpuFallback,
+    Cpu,
+};
+
+class PresentedFrameCounter {
+public:
+    explicit constexpr PresentedFrameCounter(int exit_after)
+        : exit_after_(exit_after) {}
+
+    constexpr uint64_t count() const { return count_; }
+    constexpr operator uint64_t() const { return count_; }
+
+    constexpr void record(PresentedFrameSource source, bool& running) {
+        // All sources intentionally share one policy.  Naming the source makes a path-specific
+        // bypass observable to the defect-shaped mutation test without putting a switch here.
+        (void)source;
+        ++count_;
+        if (exit_after_ != 0 &&
+            (exit_after_ < 0 || count_ >= static_cast<uint64_t>(exit_after_)))
+            running = false;
+    }
+
+private:
+    int exit_after_ = 0;
+    uint64_t count_ = 0;
+};
+
 // What present_frame should do after a BOUNDED vkAcquireNextImageKHR.
 enum class AcquireAction { proceed, skip, recreate, fail };
 
