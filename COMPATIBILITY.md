@@ -22,7 +22,7 @@ closing bugs. Every title in the tested inventory has a long-lived tracker in th
 | *Evergate* | `PPSA01885` | Unity | ✅ Reaches and renders the first tutorial-room gameplay |
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Native 1920×1080 opening gameplay reached; scripted input and audio verified; `gris-gameplay` guard |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Native 1920×1080 tutorial combat and audio verified; `cobra-gameplay` guard |
-| *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 Complete Sonic Origins Plus base+update with four DLC packs reaches a black startup loop; two requested UI paths do not resolve (#1905) |
+| *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 Complete Sonic Origins Plus base+update with four DLC packs reaches a black startup loop; its root cause remains open (#1905) |
 | Terminator (2D)&nbsp;¹ | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay reached (user-verified) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Day One gameplay renders; the manor entrance hall matches the hardware reference |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
@@ -188,19 +188,23 @@ advertised Cx records instead of exposing stale stack entries as register writes
 ## Sonic Origins — `PPSA05325`
 
 The complete Sonic Origins Plus 02.002.000 installation contains its base executable and content,
-all four classic RSDK games, installed update state, and four DLC mounts. Its
+all four classic RSDK games, installed update state, and four DLC payloads with mount records. Its
 `targetContentVersion: 02.001.000` records update lineage; it does not mean that the assembled app is
-an update-only image. Live file tracing nevertheless finds two unresolved loose startup paths:
-`raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/ui_title_nocopy.dds`. Prosper then remains in a black
+an update-only image. Live file tracing finds two early loose-file misses,
+`raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/ui_title_nocopy.dds`, but the guest handles both
+failures and continues loading its real UI, fonts, language packs, and audio banks. They therefore
+do not establish the cause of the later black frame; an absent optional resource could still affect
+a particular visual, but the stronger startup-blocker claim is falsified. Prosper remains in a black
 startup loop with silent AudioOut2 buffers despite initializing its renderer, connected pad, and CRI
-sound banks. This is now tracked as an archive, update-overlay, mount, or path-resolution defect in
-[#1905](https://github.com/mattias800/prosper/issues/1905), not as an incomplete user dump. No title,
-audio, or compatibility milestone is claimed yet.
+sound banks, so [#1905](https://github.com/mattias800/prosper/issues/1905) keeps the root cause open.
+Installed-DLC enumeration is a separate Prosper gap (#1909) and occurs after these absolute base-app
+requests. No title, audio, or compatibility milestone is claimed yet.
 
 The app declares PS5 `launchActivity` support. An exact `TITLE_SONIC_1_CLASSIC` Game Intent is received
 by the guest and its `activityId` property is consumed, but Sonic still requests both unresolved UI
-paths before opening `raw/retro/Sonic1u.rsdk`. The platform activity route therefore does not bypass
-the startup-resolution blocker; truthful default no-intent behavior remains preserved.
+paths and does not open `raw/retro/Sonic1u.rsdk`. The platform activity route therefore does not
+bypass the current black startup state, but it does not make the handled file misses causal;
+truthful default no-intent behavior remains preserved.
 
 Routes, capture commands, audio evidence, and the Sonic audit are recorded in
 [`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md).
