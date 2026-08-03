@@ -106,6 +106,35 @@ bool has_instruction_operand(const std::vector<uint32_t>& spv, uint32_t opcode,
     return false;
 }
 
+// Prove that one binary SPIR-V instruction consumes the two requested literal constants. This is
+// stronger than checking that the constants and opcode merely coexist elsewhere in the module.
+bool binary_uses_literal_operands(const std::vector<uint32_t>& spv, uint32_t opcode,
+                                  uint32_t lhs_literal, uint32_t rhs_literal) {
+    constexpr uint32_t OpConstant = 43;
+    std::unordered_map<uint32_t, uint32_t> constants;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4) constants[spv[i + 2]] = spv[i + 3];
+        i += wc;
+    }
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        // Integer binary: {result type, result id, lhs id, rhs id}.
+        if (op == opcode && wc == 5) {
+            const auto lhs = constants.find(spv[i + 3]);
+            const auto rhs = constants.find(spv[i + 4]);
+            if (lhs != constants.end() && rhs != constants.end() &&
+                lhs->second == lhs_literal && rhs->second == rhs_literal)
+                return true;
+        }
+        i += wc;
+    }
+    return false;
+}
+
 bool has_select_with_false_constant(const std::vector<uint32_t>& spv, uint32_t literal) {
     constexpr uint32_t OpConstant = 43, OpSelect = 169;
     std::unordered_set<uint32_t> matching_constants;
@@ -391,6 +420,54 @@ int main() {
         return 1;
     }
     printf("  [ok]   signed kernel SPIR-V declares signed i32 with a nonzero id\n");
+
+    // M0 has different layouts for DS_APPEND/DS_CONSUME in the two address domains. Astro Bot's
+    // live GDS value must be shifted to obtain M0[31:16]; the same value in an ordinary LDS append
+    // must be masked to M0[15:0]. These are mutation controls for each other: swapping either field
+    // makes one of the two named checks fail while leaving the instruction present.
+    constexpr uint32_t OpShiftRightLogical = 194, OpBitwiseAnd = 199;
+    const uint32_t m0_gds_append[] = {
+        0xbefc03ffu, 0x0c600020u,
+        0xd8fa0010u, 0x00000000u, // ds_append v0 offset:0x10 gds
+        0xbf810000u,
+    };
+    const uint32_t m0_lds_append[] = {
+        0xbefc03ffu, 0x0c600020u,
+        0xd8f80010u, 0x00000000u, // ds_append v0 offset:0x10 (LDS)
+        0xbf810000u,
+    };
+    ShaderResourceTable m0_gds_table;
+    ShaderResource m0_gds_resource;
+    m0_gds_resource.cls = ResourceClass::ConstantBuffer;
+    m0_gds_resource.format = DataFormat::Uint32;
+    m0_gds_resource.num_components = 1;
+    m0_gds_resource.binding = kComputeInternalGdsBinding;
+    m0_gds_resource.size = 64 * 1024;
+    m0_gds_resource.stride = 4;
+    m0_gds_table.resources.push_back(m0_gds_resource);
+    ComputeShaderConfig m0_config;
+    const auto m0_gds_spv = recompile_compute(
+        m0_gds_append, std::size(m0_gds_append), &m0_gds_table, m0_config);
+    const auto m0_lds_spv = recompile_compute(
+        m0_lds_append, std::size(m0_lds_append), nullptr, m0_config);
+    if (m0_gds_spv.empty() ||
+        !binary_uses_literal_operands(
+            m0_gds_spv, OpShiftRightLogical, 0x0c600020u, 16u) ||
+        binary_uses_literal_operands(
+            m0_gds_spv, OpBitwiseAnd, 0x0c600020u, 0xffffu)) {
+        printf("  [FAIL] GDS append did not derive its byte base from M0[31:16]\n");
+        return 1;
+    }
+    printf("  [ok]   GDS append derives its byte base from M0[31:16]\n");
+    if (m0_lds_spv.empty() ||
+        !binary_uses_literal_operands(
+            m0_lds_spv, OpBitwiseAnd, 0x0c600020u, 0xffffu) ||
+        binary_uses_literal_operands(
+            m0_lds_spv, OpShiftRightLogical, 0x0c600020u, 16u)) {
+        printf("  [FAIL] LDS append did not derive its byte base from M0[15:0]\n");
+        return 1;
+    }
+    printf("  [ok]   LDS append keeps its byte base in M0[15:0]\n");
 
     // Fixed-offset private spill/fill must also produce structurally valid graphics-stage modules.
     // This exercises Function-variable placement in the fragment and vertex shells, independently

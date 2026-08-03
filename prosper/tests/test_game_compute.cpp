@@ -1078,6 +1078,45 @@ int main() {
     CHECK(gds_notifications == 0,
           "GPU-internal GDS writeback does not invalidate guest address zero");
 
+    // Astro Bot's four indirect-list counters prove the GDS M0 layout independently of the LDS
+    // append tests: M0[31:16] is the byte base and M0[15:0] is the allocation size. The exact live
+    // value 0x0c600020 plus offset 0x10 must append at 0xc70, not at the old low-half address 0x30.
+    // A second kernel crosses the 64 KiB boundary, proving that base+offset wraps in the GDS domain.
+    static const uint32_t gds_m0_high_append[] = {
+        0xbefc03ffu, 0x0c600020u,  // s_mov_b32 m0, {base=0xc60,size=0x20}
+        0xd8fa0010u, 0x00000000u,  // ds_append v0 offset:0x10 gds -> 0xc70
+        0xbf810000u,
+    };
+    static const uint32_t gds_m0_wrap_append[] = {
+        0xbefc03ffu, 0xfff00020u,  // s_mov_b32 m0, {base=0xfff0,size=0x20}
+        0xd8fa0030u, 0x00000000u,  // ds_append v0 offset:0x30 gds -> 0x20 after wrap
+        0xbf810000u,
+    };
+    gds_initial.fill(0);
+    const auto* gds_m0_words = reinterpret_cast<const uint32_t*>(gds_initial.data());
+    CHECK(gds_m0_words[0] == 0 && gds_m0_words[0x20 / 4] == 0 &&
+              gds_m0_words[0x30 / 4] == 0 && gds_m0_words[0x50 / 4] == 0 &&
+              gds_m0_words[0xc70 / 4] == 0,
+          "GDS M0 fixture starts with zeroed authoritative host backing");
+    // Match Astro's 1x1x1 producer. The earlier store fixture intentionally used the default
+    // 64-lane workgroup; leaving that config in place here would append 64 active lanes while the
+    // launch metadata claimed one, making the address assertion depend on an unrelated count.
+    gds_config.local_x = 1;
+    ComputeItem gds_high_append = make_gds_item(
+        gds_m0_high_append, std::size(gds_m0_high_append), 1, 30);
+    ComputeItem gds_wrap_append = make_gds_item(
+        gds_m0_wrap_append, std::size(gds_m0_wrap_append), 1, 40);
+    CHECK(!gds_high_append.spirv.empty() && !gds_wrap_append.spirv.empty(),
+          "GDS append kernels with nonzero M0 base recompile");
+    CHECK(prosper::frontend::execute_live_compute_items({gds_high_append, gds_wrap_append}),
+          "production compute backend executes GDS M0 base and wrap kernels");
+    printf("  GDS M0 words [0]=%u [0x20]=%u [0x30]=%u [0x50]=%u [0xc70]=%u\n",
+           gds_m0_words[0], gds_m0_words[0x20 / 4], gds_m0_words[0x30 / 4],
+           gds_m0_words[0x50 / 4], gds_m0_words[0xc70 / 4]);
+    CHECK(gds_m0_words[0xc70 / 4] == 1 && gds_m0_words[0x20 / 4] == 1 &&
+              gds_m0_words[0x30 / 4] == 0 && gds_m0_words[0x50 / 4] == 0,
+          "GDS append uses M0 high-half base, wraps at 64 KiB, and rejects low-half aliases");
+
     // --- #590: the live backend's storage-IMAGE path. The same 1D image-copy kernel that
     // test_storage_image_copy proves against the raw harness, executed through the PRODUCTION
     // backend with Unorm8x4 guest-style backing — exercising the full chain: channel unpack

@@ -2082,7 +2082,7 @@ int main() {
         0x7e000f00u,               // v_cvt_u32_f32 v0, v0 (lane number input)
         0x7e04028au, 0x7e060280u,  // v2=10, v3=byte address 0
         0x7e1002ffu, 0x00000063u,  // v8=99 fallback for inactive lanes
-        0xbefc0380u,               // s_mov_b32 m0, 0
+        0xbefc03ffu, 0x00010000u,  // s_mov_b32 m0, 0x10000 (LDS base is low half = 0)
         0x7da40080u,               // v_cmpx_eq_u32 0, v0 (lane zero initializes)
         0xd8340010u, 0x00000203u,  // ds_write_b32 v3, v2 offset:0x10
         0xbefe04c1u, 0xbf8a0000u,  // restore EXEC; barrier
@@ -2108,7 +2108,7 @@ int main() {
     else
         printf("\n");
     CHECK(got32b5.size()==WG && bad32b5==0,
-          "kernel 32b5 atomically adds popcount(EXEC), broadcasts old counter, and predicates VDST");
+          "kernel 32b5 uses M0 low half for LDS, atomically adds popcount(EXEC), and predicates VDST");
 
     // Kernel 32b6: ordinary LDS DS_CONSUME is the inverse operation. Start at 50, make the
     // first 16 lanes valid, and consume once. Active lanes observe old=50 and all lanes read the new

@@ -583,6 +583,44 @@ direct evidence of:
 
 Until those conditions hold, keep advancing the live failure frontier.
 
+## GDS M0 post-v10 result (2026-08-03)
+
+The retained high-half/low-half comparison now clears the old frame-17 stall confound; see the new
+`## Ruled out` entry below and #1732. Branch `fix/issue-1732-astro-post-v10` implements the narrow
+architectural change at both DS_APPEND/DS_CONSUME emission sites:
+
+- GDS derives its 16-bit byte base from `M0[31:16]`; `M0[15:0]` is the allocation size.
+- LDS still derives its byte base from `M0[15:0]`.
+- ADDTID is untouched.
+- Base plus instruction offset wraps at the 64 KiB LDS/GDS boundary in both straight-line and CFG
+  emission paths.
+
+The controls are mechanism-sensitive:
+
+- The CPU-only structural test compiles the same nonzero M0 value once as GDS and once as LDS, then
+  proves that the GDS module consumes it through shift-right-by-16 while the LDS module consumes it
+  through an `0xffff` mask.
+- Mutating only the GDS arm back to the old low-half extraction leaves DS_APPEND present but makes
+  the named GDS structural check fail. This reproduces the old address selection instead of deleting
+  the mechanism.
+- The production Vulkan backend executes Astro's exact `M0=0x0c600020`, offset `0x10` append plus a
+  boundary-wrap append. Its authoritative host words are
+  `[0]=0 [0x20]=1 [0x30]=0 [0x50]=0 [0xc70]=1`: the live counter lands at `0xc70`, the boundary
+  wraps to `0x20`, and neither old low-half alias is written. `test_game_compute` passes all 281
+  assertions; `test_rdna2_to_spirv` also passes, including its nonzero-high-half LDS control.
+
+The one authorized 150-second rendered title run also passes every declared mechanism criterion; full
+evidence is on #1732. The actual dumped producer module shifts SGPR-14 M0 right by 16 before each of
+its four GDS atomics. All 938 producer executions succeed, all 938 writeback blocks contain the four
+expected slots, and no Vulkan failure occurs through targeted submit 7,069. Progress reaches 924 guest
+flips and 2,773 live presents. The first argument ranges from 1 to 3,346 with both rises and falls;
+the third ranges from 1 to 10, while the other two remain one. This clears the historical producer-330
+/ submit-2349 device-loss boundary and the frame-17 stall confound by a wide margin.
+
+This is live acceptance of the GDS M0 mechanism, not a full Astro visual or performance claim. The
+run enabled extremely verbose graphics diagnostics and produced an 878 MiB log, so no FPS figure from
+it is meaningful. Continue the wider title-screen/gameplay investigation independently.
+
 ## Ruled out
 
 One line per falsified hypothesis, the evidence that killed it, and the issue/PR. Extend this rather
@@ -605,6 +643,22 @@ than re-deriving a dead answer at full cost.
   1,008 guest flips and 3,023 live presents by 173.5 seconds instead of reproducing the historical
   frame-17 stall. This rules out missing/late reset ordering and supports the high-half GDS address
   interpretation, but it is **not a fix claim**: the old stall did not reproduce on this revision.
+
+- **"The high-half GDS arm avoids the runaway only because Astro stalls or all four producer
+  outputs collapse to `(1,1,1)`."** False in the same retained v10 run. The uncapped
+  `PROSPER_COMPUTELOG_CODE=0x5006eac00` writeback trace contains 1,022 successful producer blocks;
+  every block has exactly one writeback for each of the four stable indirect-argument addresses.
+  `0x5074063c0` has 61 distinct tuples with `groups_x` ranging from 1 to 3,401 and both rising and
+  falling, while `0x50740a520` has 25 distinct tuples ranging from 1 to 96. The other two lists stay
+  at one, so the arm produces a mixed, changing workload rather than a blanket one-group result.
+  Independently, guest progress reaches 1,008 flips and 3,023 live presents with no Vulkan failure.
+  The exact same trace format on the retained low-half positive control has 329 successful producer
+  blocks before its first `VK_ERROR_DEVICE_LOST`: the first list grows monotonically from 1 to
+  1,006,872 and the other three from 1 to 328. The high-half arm therefore changes the counter
+  mechanism from cross-frame accumulation to bounded per-frame values; it does not merely stop the
+  subject. Retained-log SHA-256 values are `94e7ae5aaa081465c64da6ea929cb145e6f60a33d9501c1ba7a3eebb033c7b20`
+  (high v10) and `b788c537585789aeec71963fcb7fb8f0c81f9fcfac111103ee640f7308d36285`
+  (low-half control). See #1732.
 
 - **"Astro Bot's unbounded indirect dispatch (#1742) is caused by the dropped GDS counter resets."**
   False, and measured rather than argued. The guest does reset GDS counters with `DMA_DATA` packets
