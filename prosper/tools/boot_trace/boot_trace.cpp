@@ -40,6 +40,7 @@ extern "C" int prosper_reserved_range_state(uint64_t);   // memory-HLE mapping c
 #include "gpu/shader_resources.hpp"       // ShaderResourceTable / ResourceClass (bind the shaders' resources)
 #include "gpu/rdna2_to_spirv.hpp"         // recompile_fragment (diagnostic solid-color PS)
 #include "../../tests/render_runner.h"   // offscreen Vulkan backend (render_triangle_rgba) + dump_bmp
+#include "../../frontends/shared/frame_dump_policy.hpp" // explicit periodic-BMP policy
 #include "../../frontends/shared/live_renderer.hpp"   // shared live renderer (also used by prosper-app)
 #include "../../frontends/shared/live_compute.hpp"    // synchronous AGC compute execution
 #include <atomic>
@@ -254,13 +255,15 @@ int main(int argc, char** argv) {
     }
     // PROSPER_RENDER=1: register the live Vulkan renderer (shared with prosper-app via
     // frontends/shared/live_renderer) so execute_and_present composites every submitted Dcb with
-    // draws and hands the frame to the present path; periodic BMP screenshots go to PROSPER_FRAME_DIR
-    // (default cwd). Set PROSPER_NO_FRAME_DUMPS=1 for renderer-equivalence diagnostics without that
-    // boot_trace-only disk I/O. llvmpipe renders headless in WSL.
+    // draws and hands the frame to the present path. Periodic BMP screenshots are off by default;
+    // PROSPER_FRAME_DUMPS or one of the existing dump selectors opts in, PROSPER_FRAME_DIR selects
+    // the destination, and PROSPER_NO_FRAME_DUMPS always wins. llvmpipe renders headless in WSL.
     if (getenv("PROSPER_RENDER")) {
-        std::string fdir = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
-        const bool dump_bmps = getenv("PROSPER_NO_FRAME_DUMPS") == nullptr;
-        prosper::frontend::register_live_renderer(fdir, dump_bmps);
+        prosper::frontend::register_live_renderer_from_environment(
+            [](const char* name) { return getenv(name); },
+            [](const std::string& frame_dir, bool dump_bmps) {
+                prosper::frontend::register_live_renderer(frame_dir, dump_bmps);
+            });
     }
 #endif
 

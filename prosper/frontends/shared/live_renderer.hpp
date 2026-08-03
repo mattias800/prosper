@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <string>
 
+#include "frame_dump_policy.hpp"
 #include "gpu/gpu_execute.hpp"          // GuestGpuWriteQuery — the in-submit mutation proof
 
 namespace prosper::frontend {
@@ -123,9 +124,10 @@ bool texture_source_snapshot_can_follow_watch(bool source_matches_pixels,
                                               size_t retained_source_bytes,
                                               size_t expected_source_bytes);
 
-// Register the live renderer. `frame_dir` is where periodic BMP screenshots are written; pass
-// `dump_bmps = false` (the frontend app) to suppress them — a windowed app presents to screen and
-// doesn't want the periodic disk writes the headless runner uses for verification.
-void register_live_renderer(const std::string& frame_dir = ".", bool dump_bmps = true);
+// Register the live renderer. `frame_dir` only selects where explicitly requested periodic BMPs are
+// written; it does not enable them. PROSPER_NO_FRAME_DUMPS remains a final kill switch even when a
+// caller explicitly requests dumps.
+void register_live_renderer(const std::string& frame_dir = ".",
+                            bool dump_bmps = kFrameDumpsByDefault);
 
 } // namespace prosper::frontend
