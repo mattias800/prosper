@@ -31,6 +31,7 @@ static volatile LONG avx_stop;
 static volatile LONG avx_test_active;
 static volatile LONG gpr_ready;
 static volatile LONG gpr_stop;
+static volatile LONG gpr_ack;
 static volatile uint64_t gpr_observed;
 static volatile LONG prewait_ready;
 static volatile LONG prewait_release;
@@ -240,13 +241,16 @@ static void* gpr_worker(void*) {
         "movq %[expected], %%r12\n"
         "movl $1, (%[ready])\n"
         "1:\n"
+        "movl (%[delivered]), %%eax\n"
+        "movl %%eax, (%[ack])\n"
         "cmpl $0, (%[stop])\n"
         "je 1b\n"
         "movq %%r12, (%[observed])\n"
         :
         : [expected] "r"(kGprExpected), [ready] "r"(&gpr_ready),
+          [delivered] "r"(&delivered), [ack] "r"(&gpr_ack),
           [stop] "r"(&gpr_stop), [observed] "r"(&gpr_observed)
-        : "r12", "memory", "cc");
+        : "rax", "r12", "memory", "cc");
     InterlockedExchange(&resumed, 1);
     return nullptr;
 }
@@ -273,6 +277,7 @@ static void reset_delivery_state() {
     avx_test_active = 0;
     gpr_ready = 0;
     gpr_stop = 0;
+    gpr_ack = 0;
     gpr_observed = 0;
     prewait_ready = 0;
     prewait_release = 0;
@@ -792,12 +797,16 @@ int main() {
     for (LONG i = 1; i <= 100; ++i) {
         result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
         if (result != 0) { all_deliveries = false; break; }
-        for (int spin = 0; spin < 2000 && delivered < i; ++spin) Sleep(1);
-        if (delivered < i) { all_deliveries = false; break; }
+        // Handler entry increments delivered on the exception stack, before RtlRestoreContext.
+        // Only this target's restored normal-context loop can copy that generation to gpr_ack,
+        // so the acknowledgment proves the prior delivery has left the exception stack before
+        // the next raise tries to reclaim it. R12 stays live across that exact observation.
+        for (int spin = 0; spin < 2000 && gpr_ack < i; ++spin) Sleep(1);
+        if (gpr_ack < i) { all_deliveries = false; break; }
     }
     InterlockedExchange(&gpr_stop, 1);
     pthread_join(thread, nullptr);
-    CHECK(all_deliveries && delivered == 100,
+    CHECK(all_deliveries && delivered == 100 && gpr_ack == 100,
           "100 serialized deliveries complete while R12 is live");
     CHECK(gpr_observed == kGprExpected,
           "nonvolatile R12 survives repeated context redirection");
@@ -809,8 +818,8 @@ int main() {
 
     // Default delivery first offers a cooperative checkpoint, but a target running guest CPU code
     // may not reach one. The bounded queue must be withdrawn and forced-CONTEXT delivery must run the
-    // handler before success is returned. Repeating on one target also proves its slot was returned to
-    // Idle and the global queued counter did not leak.
+    // handler before success is returned. Repeating on one target also proves the prior delivery
+    // restored normal execution outside its exception stack and the global queued counter did not leak.
     CHECK(pthread_create(&thread, nullptr, gpr_worker, nullptr) == 0,
           "create CPU-bound default-delivery target thread");
     for (int i = 0; i < 1000 && !gpr_ready; ++i) Sleep(1);
@@ -818,8 +827,9 @@ int main() {
     for (LONG expected_deliveries = 1; expected_deliveries <= 2 && cpu_fallback_ok;
          ++expected_deliveries) {
         result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
-        for (int spin = 0; spin < 2000 && delivered < expected_deliveries; ++spin) Sleep(1);
+        for (int spin = 0; spin < 2000 && gpr_ack < expected_deliveries; ++spin) Sleep(1);
         cpu_fallback_ok = result == 0 && delivered == expected_deliveries &&
+                          gpr_ack == expected_deliveries &&
                           pending_guest_exception_count() == 0;
     }
     InterlockedExchange(&gpr_stop, 1);
