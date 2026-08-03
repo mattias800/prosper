@@ -596,6 +596,16 @@ than re-deriving a dead answer at full cost.
   PM4 order/operands/selectors plus an uncapped original count and explicit truncation flag. Older
   retained timelines cannot answer reset-versus-dispatch ordering; recapture that question with v10.
 
+- **"The four GDS resets are missing, late, or separated from producer `0x5006eac00`."** False on
+  master `fdc906d0` in the rendered high-half diagnostic run for #1732. Timeline v10 captured 1,022
+  producer submits, and every one had the same exact raw-PM4 sequence: zero GDS offsets
+  `0xc70/0xc74/0xc78/0xc7c` at producer-order deltas `-33/-31/-29/-27`, read them to guest memory at
+  `-20/-18/-16/-14`, run the producer, then read them again at `+3/+5/+7/+9`. All 7,788 recorded
+  submit journals were complete (`dma_journals_truncated=0`); the bounded 180-second run reached
+  1,008 guest flips and 3,023 live presents by 173.5 seconds instead of reproducing the historical
+  frame-17 stall. This rules out missing/late reset ordering and supports the high-half GDS address
+  interpretation, but it is **not a fix claim**: the old stall did not reproduce on this revision.
+
 - **"Astro Bot's unbounded indirect dispatch (#1742) is caused by the dropped GDS counter resets."**
   False, and measured rather than argued. The guest does reset GDS counters with `DMA_DATA` packets
   whose destination selector names a GDS offset, and prosper *was* discarding every one of them —
