@@ -5,6 +5,8 @@
 #include "seed_reprove.hpp"
 #include "vulkan_device_select.hpp"
 #include "write_watch_policy.hpp"
+#include "performance_capture.hpp"      // bounded F8 post-trigger compute timing
+#include "performance_timing_policy.hpp" // F8 measures without enabling verbose timing logs
 
 #include "gpu/bc_decode.hpp"
 #include "gpu/gpu_capture.hpp"
@@ -6702,7 +6704,12 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     VulkanComputeContext& context = *live_context;
     g_live_compute_context = &context;
     if (context.device_lost) return false;
-    const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const bool perf_capture_timing =
+        prosper::perf::interactive_performance_capture().detailed_timing_active();
+    const bool timing_log_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const prosper::frontend::PerformanceTimingMode timing_mode =
+        prosper::frontend::performance_timing_mode(timing_log_enabled, perf_capture_timing);
+    const bool timing_enabled = timing_mode.measure;
     const auto timing_start = timing_enabled
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     context.begin_write_watch_promotions();
@@ -6718,57 +6725,66 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
         if (context.device_lost) break;
     }
     if (timing_enabled) {
-        struct TimingTotals { uint64_t calls = 0, dispatches = 0; double milliseconds = 0; };
-        static TimingTotals totals;
-        static TimingTotals window;
         const double elapsed = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - timing_start).count();
-        auto accumulate = [&](TimingTotals& timing) {
-            timing.calls++;
-            timing.dispatches += items.size();
-            timing.milliseconds += elapsed;
-        };
-        accumulate(totals);
-        accumulate(window);
-        if (totals.calls % 25 == 0) {
-            std::fprintf(stderr,
-                         "[render-timing] compute calls=%llu dispatches=%llu avg_ms=%.2f\n",
-                         (unsigned long long)totals.calls,
-                         (unsigned long long)totals.dispatches,
-                         totals.milliseconds / static_cast<double>(totals.calls));
-            std::fprintf(stderr,
-                         "[render-timing] compute_cpu_fast fills=%llu\n",
-                         (unsigned long long)g_cpu_fill_dispatches.load(
-                             std::memory_order_relaxed));
-            const ComputeMemoryPoolStats pool = context.memory_pool_stats();
-            std::fprintf(stderr,
-                         "[render-timing] compute_memory_pool hits=%llu misses=%llu cached=%zu "
-                         "%.1f MiB discarded=%llu\n",
-                         (unsigned long long)pool.hits, (unsigned long long)pool.misses,
-                         pool.cached_allocations,
-                         static_cast<double>(pool.cached_bytes) / (1024.0 * 1024.0),
-                         (unsigned long long)pool.discarded);
-            std::fprintf(stderr,
-                         "[render-timing] compute_image_source snapshots=%llu %.1f MiB "
-                         "storage_results=%llu %.1f MiB result_fallbacks=%llu %.1f MiB "
-                         "gpu_transfer_seeds=%llu\n",
-                         (unsigned long long)context.image_source_snapshot_copies,
-                         static_cast<double>(context.image_source_snapshot_bytes) /
-                             (1024.0 * 1024.0),
-                         (unsigned long long)context.storage_result_snapshot_copies,
-                         static_cast<double>(context.storage_result_snapshot_bytes) /
-                             (1024.0 * 1024.0),
-                         (unsigned long long)context.image_result_snapshot_copies,
-                         static_cast<double>(context.image_result_snapshot_bytes) /
-                             (1024.0 * 1024.0),
-                         (unsigned long long)g_compute_storage_transfer_seeds.load(
-                             std::memory_order_relaxed));
-            std::fprintf(stderr,
-                         "[render-window] compute calls=%llu dispatches=%.1f avg_ms=%.2f\n",
-                         (unsigned long long)window.calls,
-                         window.dispatches / static_cast<double>(window.calls),
-                         window.milliseconds / static_cast<double>(window.calls));
-            window = {};
+        if (perf_capture_timing) {
+            prosper::perf::ComputeTimingRecord record;
+            record.dispatches = items.size();
+            record.cpu_fast_total = g_cpu_fill_dispatches.load(std::memory_order_relaxed);
+            record.total_ms = elapsed;
+            prosper::perf::interactive_performance_capture().record_compute(record);
+        }
+        if (timing_mode.log) {
+            struct TimingTotals { uint64_t calls = 0, dispatches = 0; double milliseconds = 0; };
+            static TimingTotals totals;
+            static TimingTotals window;
+            auto accumulate = [&](TimingTotals& timing) {
+                timing.calls++;
+                timing.dispatches += items.size();
+                timing.milliseconds += elapsed;
+            };
+            accumulate(totals);
+            accumulate(window);
+            if (totals.calls % 25 == 0) {
+                std::fprintf(stderr,
+                    "[render-timing] compute calls=%llu dispatches=%llu avg_ms=%.2f\n",
+                    (unsigned long long)totals.calls,
+                    (unsigned long long)totals.dispatches,
+                    totals.milliseconds / static_cast<double>(totals.calls));
+                std::fprintf(stderr,
+                    "[render-timing] compute_cpu_fast fills=%llu\n",
+                    (unsigned long long)g_cpu_fill_dispatches.load(
+                        std::memory_order_relaxed));
+                const ComputeMemoryPoolStats pool = context.memory_pool_stats();
+                std::fprintf(stderr,
+                    "[render-timing] compute_memory_pool hits=%llu misses=%llu cached=%zu "
+                    "%.1f MiB discarded=%llu\n",
+                    (unsigned long long)pool.hits, (unsigned long long)pool.misses,
+                    pool.cached_allocations,
+                    static_cast<double>(pool.cached_bytes) / (1024.0 * 1024.0),
+                    (unsigned long long)pool.discarded);
+                std::fprintf(stderr,
+                    "[render-timing] compute_image_source snapshots=%llu %.1f MiB "
+                    "storage_results=%llu %.1f MiB result_fallbacks=%llu %.1f MiB "
+                    "gpu_transfer_seeds=%llu\n",
+                    (unsigned long long)context.image_source_snapshot_copies,
+                    static_cast<double>(context.image_source_snapshot_bytes) /
+                        (1024.0 * 1024.0),
+                    (unsigned long long)context.storage_result_snapshot_copies,
+                    static_cast<double>(context.storage_result_snapshot_bytes) /
+                        (1024.0 * 1024.0),
+                    (unsigned long long)context.image_result_snapshot_copies,
+                    static_cast<double>(context.image_result_snapshot_bytes) /
+                        (1024.0 * 1024.0),
+                    (unsigned long long)g_compute_storage_transfer_seeds.load(
+                        std::memory_order_relaxed));
+                std::fprintf(stderr,
+                    "[render-window] compute calls=%llu dispatches=%.1f avg_ms=%.2f\n",
+                    (unsigned long long)window.calls,
+                    window.dispatches / static_cast<double>(window.calls),
+                    window.milliseconds / static_cast<double>(window.calls));
+                window = {};
+            }
         }
     }
     return all_ok;

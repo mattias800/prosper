@@ -9,6 +9,9 @@
 #include "write_watch_policy.hpp"
 #include "live_compute.hpp"
 #include "live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
+#include "performance_capture.hpp"      // bounded F8 post-trigger renderer timing
+#include "performance_timing_gate.hpp"  // turn on render_runner's existing backend clocks
+#include "performance_timing_policy.hpp" // retain timing across split semantic submits
 
 #include "gpu/gpu_execute.hpp"          // DrawItem, set_submit_renderer
 #include "gpu/gpu_timeline.hpp"         // phase-gated detailed-capture policy
@@ -1118,8 +1121,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             };
             static thread_local RenderTiming pending_timing;
             static thread_local std::vector<RttTimingRecord> pending_rtt_timing;
-            const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
-            const bool lightweight_rtt_timing = timing_enabled && getenv("PROSPER_RTT_TIMING");
+            const bool perf_capture_timing =
+                prosper::perf::interactive_performance_capture().detailed_timing_active();
+            const bool timing_log_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
+            const prosper::frontend::PerformanceTimingMode timing_mode =
+                prosper::frontend::performance_timing_mode(timing_log_enabled,
+                                                            perf_capture_timing);
+            const bool timing_enabled = timing_mode.measure;
+            // render_runner.h cannot depend on the app capture singleton: it is also compiled into
+            // standalone Vulkan tests. This thread-local scope activates its backend clocks only
+            // inside this production callback and restores the prior state on every return path.
+            prosper::frontend::ScopedInteractivePerformanceTiming scoped_perf_timing(
+                perf_capture_timing);
+            const bool lightweight_rtt_timing = timing_mode.log && getenv("PROSPER_RTT_TIMING");
             static const uint64_t rtt_timing_min_draws = getenv("PROSPER_RTT_TIMING_MIN_DRAWS")
                 ? strtoull(getenv("PROSPER_RTT_TIMING_MIN_DRAWS"), nullptr, 0) : 0;
             if (timing_enabled && phase.first_span) {
@@ -5732,6 +5746,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     pending_timing.total_ms += std::chrono::duration<double, std::milli>(
                         RenderClock::now() - callback_timing_start).count();
                 }
+                prosper::frontend::reset_performance_timing_after_span(
+                    pending_timing, timing_enabled, phase.final_span);
                 return {};
             }
             static const std::vector<uint8_t> empty_pixels;
@@ -5769,6 +5785,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.callbacks++;
                 pending_timing.total_ms += std::chrono::duration<double, std::milli>(
                     RenderClock::now() - callback_timing_start).count();
+                // One record per complete semantic submit. A submit may be split into several
+                // graphics spans by interleaved compute/DMA; recording every callback would count
+                // the growing pending total repeatedly and make the capture itself misattribute time.
+                if (perf_capture_timing && phase.final_span) {
+                    prosper::perf::RendererTimingRecord record;
+                    record.callbacks = pending_timing.callbacks;
+                    record.draws = pending_timing.backend_draws;
+                    record.texture_bytes = pending_timing.texture_bytes;
+                    record.buffer_bytes = pending_timing.buffer_bytes;
+                    record.total_ms = pending_timing.total_ms;
+                    record.build_resources_ms = pending_timing.build_resources_ms;
+                    record.backend_ms = pending_timing.backend_ms;
+                    record.output_copy_ms = pending_timing.output_copy_ms;
+                    record.gpu_wait_ms = pending_timing.backend_gpu_wait_ms;
+                    record.gpu_timestamp_samples =
+                        pending_timing.backend_gpu_timestamp_samples;
+                    record.gpu_device_ms = pending_timing.backend_gpu_device_ms;
+                    record.readback_ms = pending_timing.backend_readback_ms;
+                    record.setup_resources_ms = pending_timing.backend_setup_resources_ms;
+                    record.texture_ms = pending_timing.texture_ms;
+                    record.buffer_ms = pending_timing.buffer_ms;
+                    prosper::perf::interactive_performance_capture().record_renderer(record);
+                }
+                if (!timing_mode.log) {
+                    // F8 consumes the structured record above, then leaves without touching the
+                    // lifetime aggregates or their large periodic stderr summaries.
+                    prosper::frontend::reset_performance_timing_after_span(
+                        pending_timing, timing_enabled, phase.final_span);
+                    return prosper::gpu::RenderedFrame(std::move(selected_pixels));
+                }
                 struct TimingTotals {
                     uint64_t submits = 0, callbacks = 0;
                     double total_ms = 0, prelude_ms = 0, pass_ms = 0;
@@ -6172,6 +6218,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             window.persistent_validation_bytes / (wn * 1024.0 * 1024.0));
                     window = {};
                 }
+                // The complete semantic submit has now been recorded and added to aggregate logs.
+                // Intermediate spans take the earlier return and retain this same population.
+                prosper::frontend::reset_performance_timing_after_span(
+                    pending_timing, timing_enabled, phase.final_span);
             }
             return prosper::gpu::RenderedFrame(std::move(selected_pixels));
         });

@@ -69,6 +69,8 @@ SDL3 automatically uses a connected controller as pad 0. Keyboard input is compo
 | Enter | Options |
 | Pause or F10 | Pause/resume the guest and audio at a flip boundary |
 | F11 or Alt+Enter | Toggle host-window fullscreen |
+| F8 | Capture 5 seconds before and after a performance problem to `.prperf` |
+| F9 | Capture the current frame for offline replay |
 | Escape | Exit |
 
 Pause/F10 is host-owned and is not forwarded to guest keyboard input. Alt+Enter is consumed by the
