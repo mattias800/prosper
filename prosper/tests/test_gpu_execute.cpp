@@ -660,7 +660,7 @@ int main() {
         set_compute_authority_boundary_observer({});
         CHECK(submitted_indices == std::vector<uint32_t>({0, 1, 2}),
               "DMA-backed index buffer is realized after the ordered copy in the production path");
-        CHECK(authority_boundaries.size() == 5 &&
+        CHECK(authority_boundaries.size() == 6 &&
                   authority_boundaries[0].kind ==
                       ComputeAuthorityBoundaryKind::SubmitBegin &&
                   authority_boundaries[0].submit_no == 77 &&
@@ -678,8 +678,47 @@ int main() {
                   !authority_boundaries[3].range_known &&
                   authority_boundaries[3].command_order == 200 &&
                   authority_boundaries[4].kind ==
+                      ComputeAuthorityBoundaryKind::DrawResourceEnd &&
+                  authority_boundaries[4].draw_realized &&
+                  authority_boundaries[4].command_order == 200 &&
+                  authority_boundaries[5].kind ==
                       ComputeAuthorityBoundaryKind::SubmitEnd,
-              "authority hook preserves submit, DMA source/destination, draw, and end order");
+              "authority hook preserves submit, DMA, draw audit, and end order");
+    }
+
+    {
+        DrawItem draw_resource_probe;
+        draw_resource_probe.command_order = 321;
+        draw_resource_probe.prt = std::make_shared<ShaderResourceTable>();
+        ShaderResource atlas_resource;
+        atlas_resource.cls = ResourceClass::Texture;
+        atlas_resource.binding = 7;
+        atlas_resource.gpu_addr = 0x2107e50000ull;
+        atlas_resource.size = 12779520;
+        draw_resource_probe.prt->resources.push_back(atlas_resource);
+        ShaderResource replay_owned = atlas_resource;
+        uint8_t replay_bytes[4]{};
+        replay_owned.binding = 8;
+        replay_owned.host_data = replay_bytes;
+        replay_owned.host_data_size = sizeof(replay_bytes);
+        draw_resource_probe.prt->resources.push_back(replay_owned);
+        const std::vector<ComputeAuthorityBoundary> resource_boundaries =
+            compute_authority_draw_resource_boundaries(draw_resource_probe, 88);
+        CHECK(resource_boundaries.size() == 2 &&
+                  resource_boundaries[0].kind ==
+                      ComputeAuthorityBoundaryKind::DrawResource &&
+                  resource_boundaries[0].submit_no == 88 &&
+                  resource_boundaries[0].command_order == 321 &&
+                  resource_boundaries[0].range_known &&
+                  resource_boundaries[0].address == atlas_resource.gpu_addr &&
+                  resource_boundaries[0].bytes == atlas_resource.size &&
+                  resource_boundaries[0].binding == 7 &&
+                  resource_boundaries[0].resource_class ==
+                      static_cast<uint32_t>(ResourceClass::Texture) &&
+                  resource_boundaries[1].kind ==
+                      ComputeAuthorityBoundaryKind::DrawResourceEnd &&
+                  resource_boundaries[1].draw_realized,
+              "draw authority audit emits the exact live atlas resource and ignores replay-owned bytes");
     }
 
     // Indirect arguments are generated memory, not command-fold inputs. Supply them through an

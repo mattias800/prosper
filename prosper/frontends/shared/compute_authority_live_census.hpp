@@ -173,6 +173,9 @@ public:
     bool active_submit() const { return active_; }
     uint64_t submit_no() const { return submit_no_; }
     bool pending() const { return active_ && submit_.state().pending(); }
+    ShadowComputeAuthorityRange pending_range() const {
+        return pending() ? submit_.state().range : ShadowComputeAuthorityRange::unknown();
+    }
 
     void invalidate_apparatus(bool close_pending_as_unknown = false) {
         if (!selector_.requested) return;

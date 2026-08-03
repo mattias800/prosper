@@ -243,6 +243,46 @@ int main() {
               unknown_range.counters().unknown_range_materializations == 1,
           "an unbounded draw remains attributed while failing closed on its range");
 
+    ShadowComputeAuthorityDrawProbe draw_probe;
+    draw_probe.arm(77, 900, atlas);
+    const auto wrong_draw_resource = draw_probe.observe_resource(77, 901, atlas_tail);
+    const auto unrelated_draw_resource = draw_probe.observe_resource(77, 900, unrelated);
+    const auto atlas_draw_resource = draw_probe.observe_resource(77, 900, atlas_tail);
+    const auto completed_draw_probe = draw_probe.complete(77, 900, true);
+    CHECK(wrong_draw_resource == ShadowComputeAuthorityDrawProbeAction::Ignored &&
+              unrelated_draw_resource ==
+                  ShadowComputeAuthorityDrawProbeAction::UnrelatedRange &&
+              atlas_draw_resource ==
+                  ShadowComputeAuthorityDrawProbeAction::OverlappingRange &&
+              completed_draw_probe == ShadowComputeAuthorityDrawProbeAction::Completed &&
+              !draw_probe.active() && draw_probe.counters().armed == 1 &&
+              draw_probe.counters().resource_observations == 2 &&
+              draw_probe.counters().unrelated_ranges == 1 &&
+              draw_probe.counters().overlapping_ranges == 1 &&
+              draw_probe.counters().completed == 1 &&
+              draw_probe.counters().completed_with_overlap == 1 &&
+              draw_probe.counters().completed_without_overlap == 0,
+          "post-realization draw probe identifies an exact atlas alias after the conservative boundary");
+
+    draw_probe.arm(78, 910, atlas);
+    const auto invalid_draw_resource = draw_probe.observe_resource(
+        78, 910, ShadowComputeAuthorityRange::unknown());
+    const auto completed_unrelated_draw = draw_probe.complete(78, 910, true);
+    draw_probe.arm(79, 920, atlas);
+    const auto completed_unrealized_draw = draw_probe.complete(79, 920, false);
+    CHECK(invalid_draw_resource ==
+                  ShadowComputeAuthorityDrawProbeAction::InvalidRange &&
+              completed_unrelated_draw ==
+                  ShadowComputeAuthorityDrawProbeAction::Completed &&
+              completed_unrealized_draw ==
+                  ShadowComputeAuthorityDrawProbeAction::Completed &&
+              draw_probe.counters().armed == 3 &&
+              draw_probe.counters().invalid_ranges == 1 &&
+              draw_probe.counters().completed == 3 &&
+              draw_probe.counters().completed_without_overlap == 1 &&
+              draw_probe.counters().unrealized == 1,
+          "draw probe distinguishes no-overlap evidence from an unrealized draw");
+
     ShadowComputeAuthorityCensus unbounded_gpu;
     (void)unbounded_gpu.note_retained_result(atlas);
     const auto unknown_gpu_range = unbounded_gpu.observe(

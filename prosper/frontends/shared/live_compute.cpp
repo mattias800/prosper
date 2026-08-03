@@ -3299,6 +3299,8 @@ const char* compute_authority_boundary_name(
     switch (kind) {
         case Kind::SubmitBegin: return "submit-begin";
         case Kind::Draw: return "draw";
+        case Kind::DrawResource: return "draw-resource";
+        case Kind::DrawResourceEnd: return "draw-resource-end";
         case Kind::Dma: return "dma";
         case Kind::OrderedMemoryEffect: return "ordered-memory-effect";
         case Kind::Capture: return "capture";
@@ -3416,12 +3418,51 @@ public:
         const ShadowComputeAuthorityRange range = boundary.range_known
             ? ShadowComputeAuthorityRange::from(boundary.address, boundary.bytes)
             : ShadowComputeAuthorityRange::unknown();
+        if (boundary.kind == BoundaryKind::DrawResource) {
+            const ShadowComputeAuthorityDrawProbeAction action =
+                draw_probe_.observe_resource(
+                    boundary.submit_no, boundary.command_order, range);
+            if (action == ShadowComputeAuthorityDrawProbeAction::OverlappingRange) {
+                draw_probe_overlap_events_ = shadow_compute_authority_increment(
+                    draw_probe_overlap_events_);
+                if (draw_probe_overlap_events_ <= 16 ||
+                    (draw_probe_overlap_events_ & (draw_probe_overlap_events_ - 1)) == 0) {
+                    draw_probe_overlap_detail_lines_ = shadow_compute_authority_increment(
+                        draw_probe_overlap_detail_lines_);
+                    std::fprintf(stderr,
+                                 "[compute-authority] draw-resource-overlap n=%llu "
+                                 "submit=%llu order=%llu binding=%u class=%u "
+                                 "range=0x%llx+%llu\n",
+                                 static_cast<unsigned long long>(
+                                     draw_probe_overlap_events_),
+                                 static_cast<unsigned long long>(boundary.submit_no),
+                                 static_cast<unsigned long long>(boundary.command_order),
+                                 boundary.binding, boundary.resource_class,
+                                 static_cast<unsigned long long>(range.address),
+                                 static_cast<unsigned long long>(range.bytes));
+                }
+            }
+            return;
+        }
+        if (boundary.kind == BoundaryKind::DrawResourceEnd) {
+            (void)draw_probe_.complete(
+                boundary.submit_no, boundary.command_order, boundary.draw_realized);
+            return;
+        }
         ShadowComputeAuthorityTransition transition;
         switch (boundary.kind) {
-            case BoundaryKind::Draw:
+            case BoundaryKind::Draw: {
+                const ShadowComputeAuthorityRange pending_range =
+                    census_.pending_range();
                 transition = census_.observe(
                     ShadowComputeAuthorityConsumerKind::Draw, range);
+                if (transition.pending_before &&
+                    transition.reason ==
+                        ShadowComputeAuthorityReason::UnknownConsumerRange)
+                    draw_probe_.arm(
+                        boundary.submit_no, boundary.command_order, pending_range);
                 break;
+            }
             case BoundaryKind::Dma:
                 transition = census_.observe(
                     ShadowComputeAuthorityConsumerKind::Dma, range);
@@ -3444,6 +3485,8 @@ public:
                     : census_.observe(
                           ShadowComputeAuthorityConsumerKind::Unknown);
                 break;
+            case BoundaryKind::DrawResource:
+            case BoundaryKind::DrawResourceEnd:
             case BoundaryKind::SubmitBegin:
                 return;
         }
@@ -3456,6 +3499,7 @@ public:
         if (!requested()) return;
         std::lock_guard lock(mutex_);
         if (!census_.claim_summary()) return;
+        using BoundaryKind = prosper::gpu::ComputeAuthorityBoundaryKind;
         const ComputeAuthorityLiveSelector& selector = census_.selector();
         const ComputeAuthorityLiveCounters& c = census_.counters();
         const ShadowComputeAuthorityCounters& a = c.authority;
@@ -3512,17 +3556,52 @@ public:
                      static_cast<unsigned long long>(a.submit_end_materializations),
                      static_cast<unsigned long long>(a.unknown_range_materializations));
         std::fprintf(stderr,
-                     "[compute-authority] summary boundaries begin=%llu draw=%llu dma=%llu "
+                     "[compute-authority] summary boundaries begin=%llu draw=%llu "
+                     "draw-resource=%llu draw-resource-end=%llu dma=%llu "
                      "memory-effect=%llu capture=%llu end=%llu compute=%llu "
                      "detail-events=%llu\n",
-                     static_cast<unsigned long long>(boundary_counts_[0]),
-                     static_cast<unsigned long long>(boundary_counts_[1]),
-                     static_cast<unsigned long long>(boundary_counts_[2]),
-                     static_cast<unsigned long long>(boundary_counts_[3]),
-                     static_cast<unsigned long long>(boundary_counts_[4]),
-                     static_cast<unsigned long long>(boundary_counts_[5]),
-                     static_cast<unsigned long long>(boundary_counts_[6]),
+                     static_cast<unsigned long long>(boundary_counts_[
+                         static_cast<size_t>(BoundaryKind::SubmitBegin)]),
+                     static_cast<unsigned long long>(boundary_counts_[
+                         static_cast<size_t>(BoundaryKind::Draw)]),
+                     static_cast<unsigned long long>(boundary_counts_[
+                         static_cast<size_t>(BoundaryKind::DrawResource)]),
+                     static_cast<unsigned long long>(boundary_counts_[
+                         static_cast<size_t>(BoundaryKind::DrawResourceEnd)]),
+                     static_cast<unsigned long long>(boundary_counts_[
+                         static_cast<size_t>(BoundaryKind::Dma)]),
+                     static_cast<unsigned long long>(boundary_counts_[
+                         static_cast<size_t>(BoundaryKind::OrderedMemoryEffect)]),
+                     static_cast<unsigned long long>(boundary_counts_[
+                         static_cast<size_t>(BoundaryKind::Capture)]),
+                     static_cast<unsigned long long>(boundary_counts_[
+                         static_cast<size_t>(BoundaryKind::SubmitEnd)]),
+                     static_cast<unsigned long long>(boundary_counts_[
+                         static_cast<size_t>(BoundaryKind::Compute)]),
                      static_cast<unsigned long long>(detail_events_));
+        const ShadowComputeAuthorityDrawProbeCounters& draw_probe =
+            draw_probe_.counters();
+        std::fprintf(stderr,
+                     "[compute-authority] summary draw-probe armed=%llu completed=%llu "
+                     "with-overlap=%llu without-overlap=%llu unrealized=%llu "
+                     "resources=%llu overlaps=%llu unrelated=%llu invalid=%llu "
+                     "superseded=%llu active=%u detail-lines=%llu\n",
+                     static_cast<unsigned long long>(draw_probe.armed),
+                     static_cast<unsigned long long>(draw_probe.completed),
+                     static_cast<unsigned long long>(
+                         draw_probe.completed_with_overlap),
+                     static_cast<unsigned long long>(
+                         draw_probe.completed_without_overlap),
+                     static_cast<unsigned long long>(draw_probe.unrealized),
+                     static_cast<unsigned long long>(
+                         draw_probe.resource_observations),
+                     static_cast<unsigned long long>(draw_probe.overlapping_ranges),
+                     static_cast<unsigned long long>(draw_probe.unrelated_ranges),
+                     static_cast<unsigned long long>(draw_probe.invalid_ranges),
+                     static_cast<unsigned long long>(draw_probe.superseded),
+                     draw_probe_.active() ? 1u : 0u,
+                     static_cast<unsigned long long>(
+                         draw_probe_overlap_detail_lines_));
         std::fprintf(stderr,
                      "[compute-authority] summary image-sources selected-events=%llu "
                      "aliases=%llu direct-borrow=%llu owner-borrow=%llu "
@@ -3622,9 +3701,15 @@ private:
     }
 
     ComputeAuthorityLiveCensus census_;
-    std::array<uint64_t, 7> boundary_counts_{};
+    std::array<uint64_t,
+               static_cast<size_t>(
+                   prosper::gpu::ComputeAuthorityBoundaryKind::Compute) + 1>
+        boundary_counts_{};
+    ShadowComputeAuthorityDrawProbe draw_probe_;
     ComputeAuthorityImageSourceCounters image_sources_{};
     uint64_t detail_events_ = 0;
+    uint64_t draw_probe_overlap_events_ = 0;
+    uint64_t draw_probe_overlap_detail_lines_ = 0;
     uint64_t image_source_detail_lines_ = 0;
     bool submit_mismatch_reported_ = false;
     std::mutex mutex_;

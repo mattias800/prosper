@@ -547,6 +547,11 @@ using LiveComputeFn = std::function<bool(const std::vector<ComputeItem>& items)>
 enum class ComputeAuthorityBoundaryKind : uint8_t {
     SubmitBegin,
     Draw,
+    // Post-realization evidence for the conservative Draw event above. One event names one exact
+    // shader-resource backing range; DrawResourceEnd closes that draw and records whether it was
+    // realized. These are diagnostic-only and never relax the pre-realization fail-closed boundary.
+    DrawResource,
+    DrawResourceEnd,
     Dma,
     OrderedMemoryEffect,
     Capture,
@@ -563,7 +568,15 @@ struct ComputeAuthorityBoundary {
     uint64_t address = 0;
     uint64_t bytes = 0;
     bool range_known = false;
+    uint32_t binding = UINT32_MAX;
+    uint32_t resource_class = UINT32_MAX;
+    bool draw_realized = false;
 };
+// Exact post-realization shader-resource evidence for one draw, followed by DrawResourceEnd. This
+// planner does not claim that pre-realization descriptor/index/shader reads are covered; callers use
+// it only to audit which concrete draw resources overlap an already fail-closed boundary.
+std::vector<ComputeAuthorityBoundary> compute_authority_draw_resource_boundaries(
+    const DrawItem& item, uint64_t submit_no);
 using ComputeAuthorityBoundaryObserver =
     std::function<void(const ComputeAuthorityBoundary& boundary)>;
 void set_compute_authority_boundary_observer(ComputeAuthorityBoundaryObserver observer);
