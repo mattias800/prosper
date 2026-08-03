@@ -1076,21 +1076,29 @@ namespace {
                 raw_write(2, message, sizeof(message) - 1);
                 _exit(190);
             }
-            if (step == prosper::host::GuestDmemWriteTraceStepAction::Complete) {
+            if (step == prosper::host::GuestDmemWriteTraceStepAction::Complete ||
+                step == prosper::host::GuestDmemWriteTraceStepAction::CompleteInvalid) {
                 PROSPER_GREGS(uc)[REG_EFL] &= ~0x100ll;
                 const uint64_t saved_guest_fs = guest_fs_to_host_scoped();
                 constexpr char hex[] = "0123456789abcdef";
                 char line[1024] = {};
                 const bool guest = gin(event.writer_rip);
+                const char* selected = event.selected ? "yes"
+                                       : event.selection_uncertain ? "unknown" : "no";
                 int written = snprintf(
                     line, sizeof line,
-                    "[dmem-write-trace] event=%llu selected=%s coverage-valid-before=%s"
-                    " fault=0x%llx phys=0x%llx writer=%s%s0x%llx next=0x%llx tid=%lld"
+                    "[dmem-write-trace] event=%llu selected=%s completion=%s"
+                    " coverage-valid-before=%s"
+                    " fault=0x%llx phys=0x%llx decoded-write-bytes=%u"
+                    " writer=%s%s0x%llx next=0x%llx tid=%lld"
                     " rearmed=%s before=",
-                    static_cast<unsigned long long>(event.ordinal), event.selected ? "yes" : "no",
+                    static_cast<unsigned long long>(event.ordinal), selected,
+                    step == prosper::host::GuestDmemWriteTraceStepAction::CompleteInvalid
+                        ? "invalid" : "valid",
                     event.coverage_valid_before ? "yes" : "no",
                     static_cast<unsigned long long>(event.fault_addr),
                     static_cast<unsigned long long>(event.fault_phys),
+                    event.decoded_write_size,
                     guest ? gmod(event.writer_rip) : "host", guest ? "+" : ":",
                     static_cast<unsigned long long>(guest ? goff(event.writer_rip)
                                                           : event.writer_rip),

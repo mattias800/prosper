@@ -235,6 +235,20 @@ claimed single-step window. Because one instruction executes while the page is R
 `coverage-valid-before=yes` has complete process-wide pre-fault coverage; after any step, later negative
 coverage is explicitly undetermined (or invalid/overflow), per orchestration trap 68.
 
+Independent review then found and deterministically reproduced three generic apparatus gaps before
+merge. Releasing an overlapping production `GuestWriteWatch` could make a still-`Armed` trace page RW;
+production re-arm could make the trace's pending one-instruction RW window RO. Page protection now uses
+the union of both logical owners, with Stepping as an explicit RW override that refuses production
+create/re-arm on covered pages. A sibling invalidation during Stepping now retains the exact published
+TID until `TRAP_TRACE`, returns `CompleteInvalid` so the caller clears TF, preserves the first invalid
+reason, and skips both stale reads and re-arm. Finally, `si_addr` is no longer treated as an operand
+extent: a bounded signal-safe decoder proves contiguous spans for common MOV stores (including the live
+event-1 qword form), post-step selected-byte changes are positive overlap evidence, and an unrecognized
+unchanged same-page instruction reports `selected=unknown` rather than `no`. Real fault canaries cover
+production reset/re-arm coexistence, sibling physical invalidation between SIGSEGV and TRAP, and a qword
+beginning four bytes before the selected interval. These harden the reusable instrument only; no new
+Asterix live run or writer conclusion was produced, and both historical live verdicts below remain VOID.
+
 The first exact live arm at commit `d181953e` was **VOID, by a useful self-invalidating result**. It
 completed 220 presents and captured submit 181 with the same exact positive control: 8 draws, 6 computes,
 14 operations, zero failures, and draw 0 PS binding 32 at `0x20122d32f0`, with 128/128 bytes at both

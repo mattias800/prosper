@@ -87,7 +87,15 @@ struct GuestDmemWriteTraceEvent {
     uint64_t next_rip = 0;
     int64_t tid = 0;
     uint32_t size = 0;
+    // Nonzero only when the signal-safe decoder proves one contiguous memory-write span for the
+    // faulting instruction. This makes before-range crossing and definitely-disjoint writes exact.
+    uint32_t decoded_write_size = 0;
     bool selected = false;
+    // A page fault reports the first faulting byte, not the memory operand's full write extent. When
+    // that byte begins outside the selected range and the selected bytes do not change, a same-value
+    // crossing store cannot be ruled out when the bounded x86 decoder does not recognize the opcode.
+    // Such events are reported as selection-uncertain rather than falsely claiming selected=no.
+    bool selection_uncertain = false;
     bool coverage_valid_before = false;
     bool rearmed = false;
     std::array<uint8_t, kGuestDmemWriteTraceMaxBytes> before{};
@@ -102,6 +110,7 @@ struct GuestDmemWriteTraceSnapshot {
     uint64_t mapping_matches = 0;
     uint64_t page_faults = 0;
     uint64_t selected_faults = 0;
+    uint64_t selection_uncertain_faults = 0;
     uint64_t completed_steps = 0;
     uint64_t rearms = 0;
     uint64_t coverage_gaps = 0;
@@ -123,6 +132,10 @@ enum class GuestWriteWatchFaultAction : uint8_t {
 enum class GuestDmemWriteTraceStepAction : uint8_t {
     NotHandled,
     Complete,
+    // The owned TF trap was consumed and must be cleared, but a sibling normal-context operation
+    // invalidated the diagnostic during its one-instruction RW window. The event is retained without
+    // re-arming and the snapshot carries the explicit invalid reason.
+    CompleteInvalid,
     LockTimeout,
 };
 
@@ -184,6 +197,10 @@ GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint
                                                              int64_t tid);
 GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
     int64_t tid, uint64_t next_rip, GuestDmemWriteTraceEvent& event);
+
+// Signal-safe bounded decoder used by the provenance trace. Returns a nonzero ascending contiguous
+// write width only for recognized single-destination MOV encodings; zero is explicit unknown.
+uint32_t guest_dmem_write_trace_decode_contiguous_store_size(const uint8_t* instruction);
 
 // Normal-context setup/inspection. Production uses init_from_environment; configure is also the
 // deterministic test seam. Environment syntax is
