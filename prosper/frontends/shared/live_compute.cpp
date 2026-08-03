@@ -4354,14 +4354,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 break;
             }
             if (bi.alias_of != SIZE_MAX) {
+                const BoundImage& alias_owner = images[bi.alias_of];
                 if (image_timing)
                     std::fprintf(stderr,
                                  "[compute-image] code=0x%llx hash=0x%016llx "
-                                 "binding=%u class=%s alias=1 "
+                                 "binding=%u class=%s alias=1 addr=0x%llx alias_of=%u "
+                                 "persistent=%u upload-skipped=%u "
                                  "extent=%ux%ux%u ms=%.3f\n",
                                  (unsigned long long)item.code_addr,
                                  (unsigned long long)timing_program_hash, bi.binding,
-                                 bi.storage ? "storage" : "sampled", r->width, r->height, r->depth,
+                                 bi.storage ? "storage" : "sampled",
+                                 (unsigned long long)r->gpu_addr, alias_owner.binding,
+                                 alias_owner.persistent ? 1u : 0u,
+                                 alias_owner.upload_skipped ? 1u : 0u,
+                                 r->width, r->height, r->depth,
                                  std::chrono::duration<double, std::milli>(
                                      ComputeClock::now() - image_start).count());
                 continue;
@@ -5520,7 +5526,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (image_timing)
                 std::fprintf(stderr,
                              "[compute-image] code=0x%llx hash=0x%016llx "
-                             "binding=%u class=%s imported=%u "
+                             "binding=%u class=%s imported=%u addr=0x%llx "
+                             "persistent=%u upload-skipped=%u "
                              "extent=%ux%ux%u guest=%zu staging=%llu "
                              "normalized=%u texel=%u sampled-float=%u rgba8-reuse=%u "
                              "query_ms=%.3f import_ms=%.3f cache_ms=%.3f "
@@ -5529,6 +5536,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              (unsigned long long)item.code_addr,
                              (unsigned long long)timing_program_hash, bi.binding,
                              bi.storage ? "storage" : "sampled", bi.imported ? 1u : 0u,
+                             (unsigned long long)r->gpu_addr,
+                             bi.persistent ? 1u : 0u, bi.upload_skipped ? 1u : 0u,
                              r->width, r->height, r->depth, bi.guest_bytes,
                              (unsigned long long)sbytes,
                              image_descriptors[i].normalized_sampling ? 1u : 0u,

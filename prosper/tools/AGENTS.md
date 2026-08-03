@@ -267,9 +267,16 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   `PROSPER_COMPUTE_IMAGE_TIMING=1` emit a 17-timer decomposition *per dispatch*, which is unreadable
   at run scale; this aggregates both record types offline into ms / share / mean-per-dispatch, nested
   so each sub-timer sits under the phase containing it, plus the costliest programs and each one's
-  dominant leaf. **Run both switches together** — `setup_ms` spans the image-binding loop, which has
+  dominant leaf. Image records also carry `addr=`, `persistent=` and `upload-skipped=`; the report
+  ranks real bindings by stable shader hash + binding + sampled/storage class, retains at most four
+  address variants per group, and prints missing fields from older logs as unknown rather than zero.
+  Aliases expose their owner's state in the raw record but remain excluded from cost rollups.
+  **Run both switches together** — `setup_ms` spans the image-binding loop, which has
   no sub-timer of its own, so phase timing alone reports a large `setup` its named children do not
-  explain. It prints an `unattributed` row under every parent, excludes failed dispatches (their
+  explain. Sampled cache lookup is a sibling of upload preparation; storage cache validation is
+  measured *inside* `prepare_ms`, so the table prints storage cache as an included child plus the
+  exclusive preparation remainder. It prints an `unattributed` row under every parent and warns on
+  impossible nesting instead of publishing a negative residual. It excludes failed dispatches (their
   sub-timers are meaningless, see trap 47 in `docs/GAME_COMPAT_ORCHESTRATION.md`), and warns if its
   model of `execute_item` stops matching the emitter. Counts here cover backend-executed dispatches
   only — CPU-fast-path fills emit no record, so add

@@ -1823,6 +1823,10 @@ neither gives **+1.5 % to +1.9 %**, measured rather than assumed.
 
 ### Root cause: `0x500571000`'s dispatch size never resets
 
+This subsection records the pre-#1819 defect. #1819 corrected GDS append/consume addressing and a
+current-master run now produces bounded, nonmonotonic per-frame counts without device loss; the clean
+post-fix frontier is the world-map image round-trip measured below.
+
 One program is **75.2 % of succeeded-dispatch time** (317,271 ms of 421,827 ms, 323 dispatches, 982 ms
 mean, 93 % of it in the submit-and-wait) in the 853 s routed run.
 `PROSPER_COMPUTELOG_CODE=0x500571000` prints the derived geometry: `local` is a constant 16x16x1 and
@@ -1844,7 +1848,46 @@ Every figure in this section comes from the one 852.95 s decomposition run descr
 partial read of the same log, at 13,195 dispatches, gave 123,762 ms for the same program. Name the run
 and the point in it whenever quoting an absolute cost here.
 
+### Post-#1819 exact-hash world-map decomposition (2026-08-03)
+
+A clean interactive F8 run on exact revision `908c9eef` reached `worldmap` without device loss at about
+3.58 guest flips/s and identified stable SPIR-V hash `0x05975892ababe69f` as the largest current compute
+cost. A following selected timing arm proved its own hash selector through one accepted banner, one
+first-match witness and one terminal `seen=53507 matched=69 verdict=matched` summary. All 69 selected
+dispatches succeeded; the normal app shut down after 540 presented frames.
+
+The selected program consumed **31.285 ms/dispatch**, but only **3.450 ms** was the GPU dispatch:
+
+| top-level phase | total | mean/dispatch | share |
+|---|---:|---:|---:|
+| setup | 1,216.7 ms | **17.633 ms** | 56.4 % |
+| pipeline | 66.7 ms | 0.967 ms | 3.1 % |
+| GPU dispatch | 238.1 ms | **3.450 ms** | 11.0 % |
+| writeback | 630.5 ms | **9.138 ms** | 29.2 % |
+| cleanup | 6.7 ms | 0.097 ms | 0.3 % |
+
+Three 3840x2160 bindings explain 98.9 % of the 1,103 ms real image-setup population: storage binding
+73 costs **10.505 ms/dispatch**, while sampled bindings 44 and 41 cost **2.683** and **2.633 ms**.
+Binding 73 writes back on 67 of 69 matches, alternating two guest ranges: 51 records at 66,846,720
+bytes cost 9.862 ms/write and 16 at 51,118,080 bytes cost 7.803 ms/write. Across them, layout/retile is
+4.340 ms/write, retained-result cache work 3.533 ms/write and write-watch notification 1.436 ms/write.
+
+This run also exposed an instrument defect. Storage binding 73 reported 10.486 ms/dispatch of
+`prepare_ms` and 3.708 ms/dispatch of `cache_ms`, but the storage cache clock starts **after** the
+prepare clock. They are nested, not siblings: exclusive seed preparation is about **6.777
+ms/dispatch**. The old flat report added both, printed an impossible -252.5 ms residual, and was wrong
+only in its image sub-table; the top-level phase table above remains valid. The report now prints
+storage cache as an included child of preparation, checks the hierarchy per record, and groups real
+bindings by stable shader hash + binding + class. Selected image records also carry address,
+persistence and upload-skip state so one later exact-hash arm can distinguish real source changes from
+avoidable cache/provenance invalidation without a broad compute log (#1732).
+
 ### Ruled out
+
+- **"The current selected shader kernel itself costs about 30 ms."** False. On the valid post-#1819
+  exact-hash arm the whole dispatch costs 31.285 ms, but the GPU interval is only **3.450 ms**;
+  setup plus writeback consumes 26.771 ms and localises the current problem to the host image
+  round-trip (#1732).
 
 - **"The dominant dispatch cost is image upload volume."** False, and one matched pair settles it.
   Over the full 853 s run, counting only succeeded dispatches and non-alias bindings:
