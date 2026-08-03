@@ -224,7 +224,7 @@ Routes, capture commands, audio evidence, and the Sonic audit are recorded in
 ## Blue Prince — `PPSA25009`
 
 <p align="center">
-  <img src="assets/screenshots/blue-prince-title.png" alt="Blue Prince — title screen">
+  <img src="assets/screenshots/blue-prince-hall.png" alt="Blue Prince — Day One entrance hall at native 1920×1080">
 </p>
 
 This Unity target boots to its menu, renders the full opening cinematic, completes the first-room
@@ -241,8 +241,10 @@ a silent 1 MiB buffer-upload clamp that had been erasing 44 of 248 draws in that
 floor and the far table among them (#1427/#1429). Two loading-phase performance defects were fixed
 earlier: unbounded register-file growth (#1266) and per-draw full-buffer content hashing (#1269).
 
-Open: a by-eye play-through confirmation is still outstanding, the snapshot guard for the hall
-predates the geometry fix (#1433), floating black rectangles remain at the wall-lamp positions
+The checked-in image above is a fresh live-renderer capture from the same route. The hall snapshot
+guard now uses 16 visually reviewed native captures from two independent fresh-save runs and
+requires a progressing, cross-run-validated hall plateau (#1433). Open: a by-eye play-through
+confirmation is still outstanding, floating black rectangles remain at the wall-lamp positions
 (#1287), and boot remains intermittent (#1178). The 27 draws that still vanish at clip were
 individually probed and confirmed as legitimate frustum culls (#1435).
 

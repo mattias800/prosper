@@ -546,10 +546,10 @@
       "name": "blue-prince-hall",
       "dump": "PPSA25009-app0",
       "scale": 1,
-      "timeout": 480,
-      "sample_seconds": 3,
-      "capture_after_seconds": 345,
-      "capture_before_seconds": 388,
+      "timeout": 810,
+      "sample_seconds": 5,
+      "capture_after_seconds": 300,
+      "capture_before_seconds": 780,
       "pad_script": null,
       "savedata_policy": "fresh",
       "env": {
@@ -560,18 +560,28 @@
       "min_pixel_changes": 5,
       "min_structural_similarity": 0.85,
       "min_structural_matches": 6,
-      "min_content_match_ratio": 0.7,
+      "min_consecutive_content_matches": 6,
       "dims": [
         1920,
         1080
       ],
-      "review": "Approved 16 composited images from two independent runs on 2026-07-25; intended scene, layers, and progression visually confirmed.",
-      "_note": "Display-chain guard for Blue Prince's Day One entrance hall (#1334/#1382/#1287): a fresh-save IME-autokey route walks through the front door into Mount Holly by ~350s; the evidence window covers the vestibule/hall interior. Runs at scale 1 deliberately - scaled runs break the DS-bridge exact-extent match and could mask the resolve->tonemap chain this guard exists to protect (the pre-#1382 failure mode was a BLOWN overbright frame, not black, so the structural luma references are the discriminating check; the color floor only catches collapse).",
+      "review": "Approved all 16 opaque composited 1920x1080 hall images from two independent fresh-save runs on 2026-08-03: floor/reflections, table/bouquet, both busts, chandelier, props and HUD are present without alpha/checkerboard artifacts; plateaus contain 8/11 matches and 7/10 local pixel changes, with 11/8 opposite-run matches.",
+      "_note": "Display-chain guard for Blue Prince's Day One entrance hall (#1334/#1382/#1287/#1433): a fresh-save IME-autokey route walks through the front door into Mount Holly, but absolute wall-clock phase moves with frontend performance and load. Two independent opaque-capture profiles reached the seed-matched stable hall at 730.4s and 700.4s; the former 750s right edge admitted only four samples in the slower run because its 750.4s sample lay just outside the strict bound. The broad 300-780s profile therefore identifies a sustained hall-content plateau across both measured arrival times instead of treating wall time as scene identity. Runs at scale 1 deliberately - scaled runs break the DS-bridge exact-extent match and could mask the resolve->tonemap chain this guard exists to protect (the pre-#1382 failure mode was a BLOWN overbright frame, not black, so the structural luma references are the discriminating check; the color floor only catches collapse).",
       "structural_references": [
         {
-          "luma16x9": "0807000000010102020100000000000300000000040100010100000500020105000000000205232a271c0b01033c0911030209250e022047451d02040d6918190a0826360d031612080501020e6a1f1d0f1334511d09160e0e100b0e0f651d1e1b2e453825211b140d121d2313692e2f3e37432c170b0a0602020a151f36211d63570f0201020101010101020406091e",
-          "average_hash": "81c7e7caca580000",
-          "difference_hash": "078e8ebeb6b01411"
+          "luma16x9": "191716181c262c3f432b1c20181619271b1618191f292e2c2d2d1d231b1a282a231716191b2428383929211e2f272f2d2d1f1c252b242736372721293c32322d332725302b232d37382e1f2b3831302b342a2a332e1f2b35332d1e28332e2d292c2d2b302a1a333534331c283030322831373f27292b302e2f2f2b2b2b262829433321252a2b262d27282e272b342a26",
+          "average_hash": "6d5bdbdbd8d81818",
+          "difference_hash": "a1b3b29595b17171"
+        },
+        {
+          "luma16x9": "2d1d171926282d40432b1f26191717241516191922282f2a2c2d1f251a201f281816181b1d25283b3b28221f21392a30201d212e2b2328363728212b29442f3127242b2e2b202e37382e202826412e302a2a2e332b1e2b35322d1f27243c2c2d282e2d2c2a1a353736341e2622392f322d3532292b282d2f2e2e2a2e203226273d371f25262d282e272c2d2c1f302824",
+          "average_hash": "3dfbdbdadad81818",
+          "difference_hash": "e933b296b4903071"
+        },
+        {
+          "luma16x9": "2d1d171926282d40432b1f26191717241516191922282f2a2c2d1f251a201f281816181b1d25283b3b28231f21382a30201d212e2b2328363728212b29442f3127242b2e2b202e37382e202826402e302a2a2e332b1e2b35322d2027253b2c2d282e2d2b2a1a353736341e2622392f322e3532282b282d2f2e2e2a2e203226273c371f25262d282e272b2d2c20302824",
+          "average_hash": "2dfbdbdadad81818",
+          "difference_hash": "e933b296b4903071"
         }
       ],
       "min_nonblack_ratio": 0.359395

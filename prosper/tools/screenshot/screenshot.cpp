@@ -59,7 +59,6 @@
 #include <sstream>
 #include <string>
 #include <system_error>
-#include <unordered_set>
 #include <vector>
 #include <thread>
 #include <chrono>
@@ -68,27 +67,6 @@
 using namespace prosper;
 
 namespace {
-
-struct PixelContentMetrics {
-    uint32_t distinct_colors = 0;
-    uint64_t nonblack_pixels = 0;
-};
-
-PixelContentMetrics measure_pixel_content(const std::vector<uint8_t>& rgba) {
-    std::unordered_set<uint32_t> colors;
-    colors.reserve(std::min<size_t>(rgba.size() / 4, 65536));
-    uint64_t nonblack = 0;
-    for (size_t i = 0; i + 3 < rgba.size(); i += 4) {
-        const uint32_t alpha = rgba[i + 3];
-        const uint32_t red = (static_cast<uint32_t>(rgba[i]) * alpha + 127) / 255;
-        const uint32_t green = (static_cast<uint32_t>(rgba[i + 1]) * alpha + 127) / 255;
-        const uint32_t blue = (static_cast<uint32_t>(rgba[i + 2]) * alpha + 127) / 255;
-        const uint32_t rgb = (red << 16) | (green << 8) | blue;
-        colors.insert(rgb);
-        nonblack += rgb != 0;
-    }
-    return {static_cast<uint32_t>(colors.size()), nonblack};
-}
 
 bool set_environment(const char* name, const char* value, bool overwrite) {
     if (!overwrite && getenv(name)) return true;
@@ -592,6 +570,14 @@ int main(int argc, char** argv) {
                 const bool snap_rendered = snap.source == gpu::PresentSource::Rendered;
                 const bool source_allowed = snap_rendered ? rendered_capture : raw_scanout;
                 if (source_allowed && snap.width && snap.height && !snap.rgba.empty()) {
+                    const screenshot::CaptureSource capture_source =
+                        snap_rendered ? screenshot::CaptureSource::Rendered
+                                      : screenshot::CaptureSource::RawScanout;
+                    // prosper-app blits into an OPAQUE swapchain, so renderer-target alpha never
+                    // attenuates visible RGB. Normalize at this one persistence boundary so the PNG,
+                    // CRC, content metrics, perceptual hashes and stale-pixel tracker all describe
+                    // the same desktop-visible frame. Raw guest scanout bytes remain untouched.
+                    screenshot::normalize_capture_rgba(capture_source, snap.rgba);
                     std::ostringstream filename;
                     filename << out << "/" << code << "_" << ts << "_"
                              << std::setw(pad) << std::setfill('0') << saved << ".png";
@@ -600,8 +586,7 @@ int main(int argc, char** argv) {
                     if (write_png(fn.c_str(), snap.rgba.data(), snap.width, snap.height, png_error)) {
                         const uint32_t pixel_crc = crc32_bytes(snap.rgba.data(), snap.rgba.size());
                         screenshot::CaptureObservation observation;
-                        observation.source = snap_rendered ? screenshot::CaptureSource::Rendered
-                                                           : screenshot::CaptureSource::RawScanout;
+                        observation.source = capture_source;
                         observation.source_seq = snap.source_seq;
                         observation.frame_seq = snap.frame_seq;
                         observation.present_count = snap.present_count;
@@ -610,7 +595,7 @@ int main(int argc, char** argv) {
                         observation.height = snap.height;
                         observation.pixel_crc32 = pixel_crc;
                         observation.elapsed_seconds = el;
-                        const auto content = measure_pixel_content(snap.rgba);
+                        const auto content = screenshot::measure_pixel_content_rgba(snap.rgba);
                         observation.distinct_rgb_colors = content.distinct_colors;
                         observation.nonblack_rgb_pixels = content.nonblack_pixels;
                         const auto perceptual = screenshot::perceptual_hashes_rgba(
