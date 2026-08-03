@@ -74,6 +74,9 @@ namespace {
 LiveRenderFn g_live;   // empty until the runtime/test registers a device-backed renderer
 LiveComputeFn g_compute;   // synchronous compute backend, registered with the live Vulkan frontend
 GuestGpuWriteObserver g_guest_gpu_write_observer;
+ComputeAuthorityBoundaryObserver g_compute_authority_boundary_observer;
+std::mutex g_compute_authority_boundary_mutex;
+std::atomic<bool> g_compute_authority_boundary_enabled{false};
 thread_local LiveRenderPhase g_live_phase;
 std::array<uint8_t, 64 * 1024> g_compute_gds{};
 
@@ -90,6 +93,34 @@ struct GuestGpuWriteJournal {
 thread_local GuestGpuWriteJournal g_guest_gpu_writes;
 std::atomic<uint64_t> g_next_guest_gpu_submit_serial{0};
 std::atomic<uint64_t> g_next_shader_analysis_identity{0};
+
+void dispatch_compute_authority_boundary(const ComputeAuthorityBoundary& boundary) {
+    // Default path: one relaxed load and no mutex/std::function copy when the opt-in diagnostic is
+    // absent. This hook sits on every ordered draw, so making an unarmed census measurable would
+    // defeat the performance investigation it exists to support.
+    if (!g_compute_authority_boundary_enabled.load(std::memory_order_relaxed)) return;
+    ComputeAuthorityBoundaryObserver observer;
+    {
+        std::lock_guard lock(g_compute_authority_boundary_mutex);
+        observer = g_compute_authority_boundary_observer;
+    }
+    if (observer) observer(boundary);
+}
+
+void notify_compute_authority_range(ComputeAuthorityBoundaryKind kind,
+                                    uint64_t submit_no, uint64_t command_order,
+                                    uint64_t address, uint64_t bytes) {
+    const bool known = address != 0 && bytes != 0 &&
+        address <= UINT64_MAX - (bytes - 1);
+    dispatch_compute_authority_boundary(
+        {kind, submit_no, command_order, address, bytes, known});
+}
+
+void notify_compute_authority_unknown(ComputeAuthorityBoundaryKind kind,
+                                      uint64_t submit_no, uint64_t command_order = 0) {
+    dispatch_compute_authority_boundary(
+        {kind, submit_no, command_order, 0, 0, false});
+}
 
 bool ranges_overlap(uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
     if (!a_size || !b_size) return false;
@@ -4890,6 +4921,8 @@ static OrderedSubmitResult execute_ordered_gpustate(
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     if (st.dma_copies.empty() && (!g_compute || st.dispatches.empty())) return false;
     GuestReadableSubmitScope guest_readable_scope;
+    notify_compute_authority_unknown(
+        ComputeAuthorityBoundaryKind::SubmitBegin, submit_no);
     // Compute-only submits never reach execute_ordered_and_present(), but they are exactly where an
     // unsupported dispatch can disappear before there is a realized ComputeItem to select.  Give
     // the environment capture path the same semantic pre-submit hook as rendering submits so
@@ -4920,6 +4953,8 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
         pending_capture && can_defer_capture ? &capture_trace : nullptr);
     if (pending_capture) {
         std::string error;
+        notify_compute_authority_unknown(
+            ComputeAuthorityBoundaryKind::Capture, submit_no);
         if (!finish_requested_gpu_capture(
                 std::move(pending_capture), {}, error,
                 can_defer_capture ? &capture_trace.draws : nullptr,
@@ -4929,6 +4964,8 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
                 can_defer_capture ? &capture_trace.failures : nullptr))
             std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
     }
+    notify_compute_authority_unknown(
+        ComputeAuthorityBoundaryKind::SubmitEnd, submit_no);
     return !st.dma_execution_rejected &&
            (result.compute_executed || !st.dma_copies.empty() ||
             !st.ordered_memory_effects.empty());
@@ -5922,6 +5959,10 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                                      const std::vector<DrawItem>* eager_draws) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
     if (st.dma_execution_rejected) {
+        for (const GpuState::Dispatch& dispatch : st.dispatches)
+            notify_compute_authority_unknown(
+                ComputeAuthorityBoundaryKind::Compute,
+                submit_no, dispatch.command_order);
         static std::atomic<int> warned{0};
         if (warned.fetch_add(1) < 24)
             std::fprintf(stderr,
@@ -6000,6 +6041,12 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     }
                     break;
                 }
+                // Resource realization can inspect guest descriptor/backing state.  No exact draw
+                // read range has yet been proven at this seam, so an armed authority census must
+                // fail closed before that first possible consumer rather than after rendering.
+                notify_compute_authority_unknown(
+                    ComputeAuthorityBoundaryKind::Draw,
+                    submit_no, operation.command_order);
                 DrawItem item;
                 bool realized = false;
                 OperationRealizationFailure failure;
@@ -6048,6 +6095,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 flush_span();
                 const bool indirect = st.dispatches[operation.index].indirect;
                 if (indirect && (!indirect_dependencies_ok || !producer_epoch_ok)) {
+                    notify_compute_authority_unknown(
+                        ComputeAuthorityBoundaryKind::Compute,
+                        submit_no, operation.command_order);
                     if (capture_trace) {
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Dispatch, operation.index,
@@ -6058,6 +6108,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     break;
                 }
                 if (!compute) {
+                    notify_compute_authority_unknown(
+                        ComputeAuthorityBoundaryKind::Compute,
+                        submit_no, operation.command_order);
                     if (capture_trace) {
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Dispatch, operation.index,
@@ -6083,9 +6136,15 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     result.compute_executed |= executed;
                     producer_epoch_ok &= executed;
                 } else if (capture_trace && failure.reason != RealizationFailureReason::None) {
+                    notify_compute_authority_unknown(
+                        ComputeAuthorityBoundaryKind::Compute,
+                        submit_no, operation.command_order);
                     capture_trace->failures.push_back(std::move(failure));
                     producer_epoch_ok = false;
                 } else {
+                    notify_compute_authority_unknown(
+                        ComputeAuthorityBoundaryKind::Compute,
+                        submit_no, operation.command_order);
                     producer_epoch_ok = false;
                 }
                 break;
@@ -6093,6 +6152,14 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
             case RetainedSubmitKind::DmaCopy: {
                 flush_span(true);
                 const GpuState::DmaCopy& copy = st.dma_copies[operation.index];
+                // Source and destination are distinct ordered consumers: a disjoint source must not
+                // hide an overlapping destination (or vice versa).
+                notify_compute_authority_range(
+                    ComputeAuthorityBoundaryKind::Dma, submit_no,
+                    operation.command_order, copy.src, copy.bytes);
+                notify_compute_authority_range(
+                    ComputeAuthorityBoundaryKind::Dma, submit_no,
+                    operation.command_order, copy.dst, copy.bytes);
                 std::vector<uint8_t> current_source;
                 const LiveTargetByteReadResult source_result = read_live_render_target_bytes(
                     copy.src, copy.bytes, current_source);
@@ -6120,7 +6187,64 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 break;
             case RetainedSubmitKind::MemoryEffect:
                 flush_span();
-                execute_ordered_memory_effect(st.ordered_memory_effects[operation.index]);
+                {
+                    const GpuState::MemoryEffect& effect =
+                        st.ordered_memory_effects[operation.index];
+                    const Pm4Command& command = effect.cmd;
+                    bool exact = false;
+                    switch (command.kind) {
+                        case Pm4Command::Kind::ReleaseMem:
+                            notify_compute_authority_range(
+                                ComputeAuthorityBoundaryKind::OrderedMemoryEffect,
+                                submit_no, operation.command_order, command.rel_addr,
+                                command.rel_data_sel == 1u ? 4u : 8u);
+                            exact = command.rel_addr != 0;
+                            break;
+                        case Pm4Command::Kind::EventWrite:
+                            notify_compute_authority_range(
+                                ComputeAuthorityBoundaryKind::OrderedMemoryEffect,
+                                submit_no, operation.command_order, command.event_addr, 8u);
+                            exact = command.event_addr != 0;
+                            break;
+                        case Pm4Command::Kind::WriteData:
+                            notify_compute_authority_range(
+                                ComputeAuthorityBoundaryKind::OrderedMemoryEffect,
+                                submit_no, operation.command_order, command.wd_addr,
+                                static_cast<uint64_t>(command.wd_num) * 4u);
+                            exact = command.wd_addr != 0 && command.wd_num != 0;
+                            break;
+                        case Pm4Command::Kind::DmaData: {
+                            // Selector byte 1 names the 64 KiB GDS offset domain, not guest VA.
+                            // Every other valid destination is an exact guest write range.  A
+                            // >32-bit non-GDS source is an address copy and is observed separately.
+                            const bool source_gds = ((command.dd_sels >> 8u) & 0xffu) == 1u;
+                            const bool destination_gds = (command.dd_sels & 0xffu) == 1u;
+                            if (!source_gds && command.dd_src > UINT32_MAX) {
+                                notify_compute_authority_range(
+                                    ComputeAuthorityBoundaryKind::Dma, submit_no,
+                                    operation.command_order, command.dd_src,
+                                    command.dd_bytes);
+                                exact = command.dd_bytes != 0;
+                            }
+                            if (!destination_gds) {
+                                notify_compute_authority_range(
+                                    ComputeAuthorityBoundaryKind::Dma, submit_no,
+                                    operation.command_order, command.dd_dst,
+                                    command.dd_bytes);
+                                exact = exact ||
+                                    (command.dd_dst != 0 && command.dd_bytes != 0);
+                            }
+                            break;
+                        }
+                        default:
+                            break;
+                    }
+                    if (!exact)
+                        notify_compute_authority_unknown(
+                            ComputeAuthorityBoundaryKind::OrderedMemoryEffect,
+                            submit_no, operation.command_order);
+                    execute_ordered_memory_effect(effect);
+                }
                 break;
         }
     }
@@ -6145,6 +6269,18 @@ uint8_t* compute_gds_backing()            { return g_compute_gds.data(); }
 size_t   compute_gds_size()               { return g_compute_gds.size(); }
 void set_submit_compute(LiveComputeFn fn) { g_compute = std::move(fn); }
 bool have_submit_compute()                { return static_cast<bool>(g_compute); }
+void notify_compute_authority_boundary(
+        const ComputeAuthorityBoundary& boundary) {
+    dispatch_compute_authority_boundary(boundary);
+}
+void set_compute_authority_boundary_observer(
+        ComputeAuthorityBoundaryObserver observer) {
+    std::lock_guard lock(g_compute_authority_boundary_mutex);
+    g_compute_authority_boundary_observer = std::move(observer);
+    g_compute_authority_boundary_enabled.store(
+        static_cast<bool>(g_compute_authority_boundary_observer),
+        std::memory_order_release);
+}
 
 static LiveTargetQueryFn g_live_target_query;   // registered by the live renderer (#590)
 void set_live_target_query(LiveTargetQueryFn fn) { g_live_target_query = std::move(fn); }
@@ -6333,6 +6469,8 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     // Reuse positive page/VirtualQuery results only inside this synchronous execution window; the
     // scope is discarded before guest code can submit a later mapping generation.
     GuestReadableSubmitScope guest_readable_scope;
+    notify_compute_authority_unknown(
+        ComputeAuthorityBoundaryKind::SubmitBegin, submit_no);
     using TimingClock = std::chrono::steady_clock;
     const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -6400,6 +6538,8 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
 
     if (pending_capture) {
         std::string error;
+        notify_compute_authority_unknown(
+            ComputeAuthorityBoundaryKind::Capture, submit_no);
         const std::vector<DrawItem>* capture_draws = needs_ordered_realization
             ? &capture_trace.draws : &draws;
         const std::vector<ComputeItem>* capture_computes = needs_ordered_realization
@@ -6409,6 +6549,8 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                                           needs_ordered_realization ? &capture_trace.failures : nullptr))
             std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
     }
+    notify_compute_authority_unknown(
+        ComputeAuthorityBoundaryKind::SubmitEnd, submit_no);
     const bool frame_ready = px.size() == static_cast<size_t>(width) * height * 4;
     const bool presented = frame_ready && publish;
     if (presented) present_write_frame(result.frame.storage, width, height);

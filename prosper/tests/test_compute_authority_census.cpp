@@ -1,4 +1,5 @@
 #include "compute_authority_census.hpp"
+#include "compute_authority_live_census.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -274,6 +275,150 @@ int main() {
               rejected_pending.counters().invalid_result_materializations == 1 &&
               rejected_pending.counters().materializations == 1,
           "a forged invalid result flushes an existing pending authority");
+
+    const ComputeAuthorityLiveSelector selector =
+        parse_compute_authority_live_selector("0x45e5d145e1a35af9");
+    ComputeAuthorityLiveCensus live(selector);
+    live.begin_submit(41);
+    const auto wrong_program = live.observe_program(0xee8584cf839a5b44ull);
+    const auto producer = live.observe_program(0x45e5d145e1a35af9ull);
+    const auto selected_output = live.record_selected_storage_output(atlas, true);
+    const auto gpu_consumer = live.observe(
+        ShadowComputeAuthorityConsumerKind::ProvenGpuImage, atlas);
+    const auto capture_boundary = live.observe(
+        ShadowComputeAuthorityConsumerKind::Capture);
+    const auto clean_end = live.end_submit();
+    CHECK(selector.requested && selector.valid &&
+              !wrong_program.selected && producer.selected && producer.first_match &&
+              selected_output.action ==
+                  ShadowComputeAuthorityAction::TrackPendingResult &&
+              gpu_consumer.action == ShadowComputeAuthorityAction::KeepGpuAuthority &&
+              capture_boundary.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              clean_end.action == ShadowComputeAuthorityAction::NoPendingResult &&
+              live.counters().programs_seen == 2 &&
+              live.counters().programs_matched == 1 &&
+              live.counters().selected_storage_outputs == 1 &&
+              live.counters().retained_storage_outputs == 1 &&
+              live.counters().authority.proven_gpu_keeps == 1 &&
+              live.counters().authority.capture_materializations == 1 &&
+              live.counters().pending_after_submit_end == 0 && live.summary_valid(),
+          "live exact-hash chain closes at capture and ends with zero pending authority");
+
+    ComputeAuthorityLiveCensus ordered(selector);
+    ordered.begin_submit(42);
+    (void)ordered.observe_program(selector.producer_hash);
+    (void)ordered.record_selected_storage_output(atlas, true);
+    const auto disjoint_dma_source = ordered.observe(
+        ShadowComputeAuthorityConsumerKind::Dma, unrelated);
+    const auto overlapping_dma_destination = ordered.observe(
+        ShadowComputeAuthorityConsumerKind::Dma, atlas_tail);
+    const auto ordered_end = ordered.end_submit();
+    CHECK(disjoint_dma_source.action ==
+                  ShadowComputeAuthorityAction::KeepGpuAuthority &&
+              overlapping_dma_destination.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              overlapping_dma_destination.reason ==
+                  ShadowComputeAuthorityReason::OverlappingDmaConsumer &&
+              ordered_end.action == ShadowComputeAuthorityAction::NoPendingResult &&
+              ordered.counters().authority.dma_materializations == 1 &&
+              ordered.counters().authority.unrelated_keeps == 1 &&
+              ordered.counters().pending_after_submit_end == 0 &&
+              ordered.summary_valid(),
+          "live DMA source and destination are observed separately at ordered positions");
+
+    ComputeAuthorityLiveCensus submit_only(selector);
+    submit_only.begin_submit(420);
+    (void)submit_only.observe_program(selector.producer_hash);
+    (void)submit_only.record_selected_storage_output(atlas, true);
+    const auto mandatory_submit_end = submit_only.end_submit();
+    CHECK(mandatory_submit_end.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              mandatory_submit_end.reason == ShadowComputeAuthorityReason::SubmitEnd &&
+              submit_only.counters().authority.submit_end_materializations == 1 &&
+              submit_only.counters().authority.capture_materializations == 0 &&
+              submit_only.counters().pending_before_submit_end == 1 &&
+              submit_only.counters().pending_after_submit_end == 0 &&
+              submit_only.summary_valid(),
+          "live submit end unconditionally closes pending authority with exact attribution");
+
+    ComputeAuthorityLiveCensus unknown_draw(selector);
+    unknown_draw.begin_submit(43);
+    (void)unknown_draw.observe_program(selector.producer_hash);
+    (void)unknown_draw.record_selected_storage_output(atlas, true);
+    const auto draw_boundary = unknown_draw.observe(
+        ShadowComputeAuthorityConsumerKind::Draw);
+    (void)unknown_draw.end_submit();
+    CHECK(draw_boundary.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              draw_boundary.reason ==
+                  ShadowComputeAuthorityReason::UnknownConsumerRange &&
+              unknown_draw.counters().authority.draw_materializations == 1 &&
+              unknown_draw.counters().authority.unknown_range_materializations == 1,
+          "live draw with no proven range fails closed at the exact boundary");
+
+    ComputeAuthorityLiveCensus sync_output(selector);
+    sync_output.begin_submit(44);
+    (void)sync_output.observe_program(selector.producer_hash);
+    (void)sync_output.record_selected_storage_output(atlas, true);
+    const auto synchronous_replacement =
+        sync_output.record_selected_storage_output(atlas_tail, false);
+    (void)sync_output.end_submit();
+    CHECK(synchronous_replacement.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              synchronous_replacement.reason ==
+                  ShadowComputeAuthorityReason::OverlappingOrderedMemoryEffectConsumer &&
+              sync_output.counters().selected_storage_outputs == 2 &&
+              sync_output.counters().retained_storage_outputs == 1 &&
+              sync_output.counters().synchronous_storage_outputs == 1,
+          "a selected output without retained authority remains a visible synchronous write");
+
+    ComputeAuthorityLiveCensus zero_match(selector);
+    zero_match.begin_submit(45);
+    (void)zero_match.observe_program(0xee8584cf839a5b44ull);
+    (void)zero_match.end_submit();
+    CHECK(!zero_match.summary_valid(),
+          "a live authority run with zero producer matches is apparatus-invalid");
+
+    ComputeAuthorityLiveCensus zero_output(selector);
+    zero_output.begin_submit(451);
+    (void)zero_output.observe_program(selector.producer_hash);
+    (void)zero_output.end_submit();
+    CHECK(zero_output.counters().programs_matched == 1 &&
+              zero_output.counters().retained_storage_outputs == 0 &&
+              zero_output.counters().authority.admitted_results == 0 &&
+              !zero_output.summary_valid(),
+          "a matched producer with no admitted retained result is apparatus-invalid");
+
+    ComputeAuthorityLiveCensus invalid_selector(
+        parse_compute_authority_live_selector("0xnot-a-hash"));
+    invalid_selector.begin_submit(46);
+    CHECK(!invalid_selector.observe_program(selector.producer_hash).selected,
+          "an invalid live selector fails closed instead of selecting a producer");
+    (void)invalid_selector.end_submit();
+    CHECK(!invalid_selector.summary_valid(),
+          "an invalid live selector cannot produce a valid census verdict");
+
+    ComputeAuthorityLiveCensus interrupted(selector);
+    interrupted.begin_submit(47);
+    (void)interrupted.observe_program(selector.producer_hash);
+    (void)interrupted.record_selected_storage_output(atlas, true);
+    interrupted.begin_submit(48);
+    (void)interrupted.end_submit();
+    CHECK(interrupted.counters().interrupted_submits == 1 &&
+              interrupted.counters().authority.unknown_consumer_materializations == 1 &&
+              interrupted.counters().pending_after_submit_end == 0 &&
+              !interrupted.summary_valid(),
+          "a nested submit start closes pending authority and invalidates the apparatus");
+
+    ComputeAuthorityLiveCensus no_submit(selector);
+    (void)no_submit.observe(ShadowComputeAuthorityConsumerKind::Draw);
+    CHECK(no_submit.counters().observations_without_submit == 1 &&
+              !no_submit.summary_valid(),
+          "a boundary outside a live submit is counted and fails closed");
+
+    CHECK(live.claim_summary() && !live.claim_summary(),
+          "explicit and destructor-style live summaries can publish only once");
 
     if (failures) {
         std::printf("%d check(s) failed\n", failures);

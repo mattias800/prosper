@@ -540,6 +540,35 @@ struct OperationRealizationFailure {
 
 using LiveComputeFn = std::function<bool(const std::vector<ComputeItem>& items)>;
 
+// Behavior-neutral ordered-boundary observer for the live compute-authority census (#1854).  The
+// executor reports only architectural submit positions and exact guest ranges it already owns;
+// it never asks the observer whether work should execute.  Draw ranges are deliberately unknown
+// until resource consumption is proven precisely enough to make a narrower claim.
+enum class ComputeAuthorityBoundaryKind : uint8_t {
+    SubmitBegin,
+    Draw,
+    Dma,
+    OrderedMemoryEffect,
+    Capture,
+    SubmitEnd,
+    // A compute operation that could not reach the live backend's exact finalized-resource
+    // observations, or an exact CPU-fast write range. Unknown range fails closed; a known range is
+    // treated as an ordered compute memory effect.
+    Compute,
+};
+struct ComputeAuthorityBoundary {
+    ComputeAuthorityBoundaryKind kind = ComputeAuthorityBoundaryKind::SubmitBegin;
+    uint64_t submit_no = 0;
+    uint64_t command_order = 0;
+    uint64_t address = 0;
+    uint64_t bytes = 0;
+    bool range_known = false;
+};
+using ComputeAuthorityBoundaryObserver =
+    std::function<void(const ComputeAuthorityBoundary& boundary)>;
+void set_compute_authority_boundary_observer(ComputeAuthorityBoundaryObserver observer);
+void notify_compute_authority_boundary(const ComputeAuthorityBoundary& boundary);
+
 // Guest GPU writes can change backing memory represented by a persistent host-side image. Backends
 // register one observer so guest-memory-producing backends can invalidate overlapping cached surfaces
 // without making prosper_core depend on Vulkan.

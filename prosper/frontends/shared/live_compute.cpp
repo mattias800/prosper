@@ -1,4 +1,5 @@
 #include "live_compute.hpp"
+#include "compute_authority_live_census.hpp"
 #include "compute_timing_selector.hpp"
 #include "compute_transfer_gate_census.hpp"
 #include "live_target_format.hpp"
@@ -3133,6 +3134,311 @@ RuntimeComputeTransferGateCensus& runtime_compute_transfer_gate_census() {
     return census;
 }
 
+const char* compute_authority_action_name(ShadowComputeAuthorityAction action) {
+    switch (action) {
+        case ShadowComputeAuthorityAction::NoPendingResult: return "no-pending";
+        case ShadowComputeAuthorityAction::TrackPendingResult: return "track";
+        case ShadowComputeAuthorityAction::ReplacePendingResult: return "replace";
+        case ShadowComputeAuthorityAction::KeepGpuAuthority: return "keep-gpu";
+        case ShadowComputeAuthorityAction::MaterializeGuestMirror: return "materialize";
+        case ShadowComputeAuthorityAction::MaterializeAndTrackResult:
+            return "materialize+track";
+        case ShadowComputeAuthorityAction::RejectResult: return "reject";
+    }
+    return "unknown";
+}
+
+const char* compute_authority_reason_name(ShadowComputeAuthorityReason reason) {
+    switch (reason) {
+        case ShadowComputeAuthorityReason::NoPendingResult: return "no-pending";
+        case ShadowComputeAuthorityReason::ResultAdmitted: return "result-admitted";
+        case ShadowComputeAuthorityReason::ResultReplaced: return "result-replaced";
+        case ShadowComputeAuthorityReason::ProvenGpuConsumer: return "proven-gpu-consumer";
+        case ShadowComputeAuthorityReason::UnrelatedConsumer: return "unrelated-consumer";
+        case ShadowComputeAuthorityReason::OverlappingGuestImageConsumer:
+            return "guest-image-overlap";
+        case ShadowComputeAuthorityReason::OverlappingRawBufferConsumer:
+            return "raw-buffer-overlap";
+        case ShadowComputeAuthorityReason::OverlappingDrawConsumer: return "draw-overlap";
+        case ShadowComputeAuthorityReason::OverlappingDmaConsumer: return "dma-overlap";
+        case ShadowComputeAuthorityReason::OverlappingOrderedMemoryEffectConsumer:
+            return "ordered-memory-effect-overlap";
+        case ShadowComputeAuthorityReason::CaptureConsumer: return "capture";
+        case ShadowComputeAuthorityReason::UnknownConsumerRange: return "unknown-range";
+        case ShadowComputeAuthorityReason::UnknownConsumer: return "unknown-consumer";
+        case ShadowComputeAuthorityReason::SubmitEnd: return "submit-end";
+        case ShadowComputeAuthorityReason::ResultRangeChanged: return "result-range-changed";
+        case ShadowComputeAuthorityReason::InvalidResultRange: return "invalid-result-range";
+    }
+    return "unknown";
+}
+
+const char* compute_authority_boundary_name(
+        prosper::gpu::ComputeAuthorityBoundaryKind kind) {
+    using Kind = prosper::gpu::ComputeAuthorityBoundaryKind;
+    switch (kind) {
+        case Kind::SubmitBegin: return "submit-begin";
+        case Kind::Draw: return "draw";
+        case Kind::Dma: return "dma";
+        case Kind::OrderedMemoryEffect: return "ordered-memory-effect";
+        case Kind::Capture: return "capture";
+        case Kind::SubmitEnd: return "submit-end";
+        case Kind::Compute: return "compute";
+    }
+    return "unknown";
+}
+
+class RuntimeComputeAuthorityCensus {
+public:
+    RuntimeComputeAuthorityCensus()
+        : census_(parse_compute_authority_live_selector(
+              std::getenv("PROSPER_COMPUTE_AUTHORITY_HASH"))) {
+        const ComputeAuthorityLiveSelector& selector = census_.selector();
+        if (!selector.requested) return;
+        if (selector.valid) {
+            std::fprintf(stderr,
+                         "[compute-authority] PROSPER_COMPUTE_AUTHORITY_HASH accepted "
+                         "producer=0x%016llx mode=exact-stable-hash shadow-only\n",
+                         static_cast<unsigned long long>(selector.producer_hash));
+        } else {
+            std::fprintf(stderr,
+                         "[compute-authority] PROSPER_COMPUTE_AUTHORITY_HASH ignored "
+                         "reason=%s; selector fails closed\n",
+                         compute_timing_selector_parse_error_name(selector.error));
+        }
+    }
+
+    ~RuntimeComputeAuthorityCensus() { report_summary(); }
+
+    bool requested() const { return census_.selector().requested; }
+
+    ComputeAuthorityLiveObservation observe_program(
+            const prosper::gpu::ComputeItem& item, uint64_t program_hash) {
+        if (!requested()) return {};
+        std::lock_guard lock(mutex_);
+        verify_submit_locked(item.submit_no, "dispatch");
+        const ComputeAuthorityLiveObservation observation =
+            census_.observe_program(program_hash);
+        if (observation.first_match) {
+            std::fprintf(stderr,
+                         "[compute-authority] first-match producer=0x%016llx "
+                         "code=0x%llx submit=%llu dispatch=%llu order=%llu seen=%llu\n",
+                         static_cast<unsigned long long>(program_hash),
+                         static_cast<unsigned long long>(item.code_addr),
+                         static_cast<unsigned long long>(item.submit_no),
+                         static_cast<unsigned long long>(item.dispatch_index),
+                         static_cast<unsigned long long>(item.command_order),
+                         static_cast<unsigned long long>(
+                             census_.counters().programs_seen));
+        }
+        return observation;
+    }
+
+    void observe_compute_access(const prosper::gpu::ComputeItem& item,
+                                uint32_t binding,
+                                ShadowComputeAuthorityConsumerKind kind,
+                                const ShadowComputeAuthorityRange& range,
+                                const char* stage) {
+        if (!requested()) return;
+        std::lock_guard lock(mutex_);
+        verify_submit_locked(item.submit_no, stage);
+        const ShadowComputeAuthorityTransition transition = census_.observe(kind, range);
+        record_detail_locked(stage, item.submit_no, item.command_order, binding,
+                             range, transition);
+    }
+
+    void record_selected_storage_output(
+            const prosper::gpu::ComputeItem& item, uint32_t binding,
+            const ShadowComputeAuthorityRange& range, bool retained) {
+        if (!requested()) return;
+        std::lock_guard lock(mutex_);
+        verify_submit_locked(item.submit_no, "storage-output");
+        const ShadowComputeAuthorityTransition transition =
+            census_.record_selected_storage_output(range, retained);
+        record_detail_locked(retained ? "retained-storage-output" :
+                                      "synchronous-storage-output",
+                             item.submit_no, item.command_order, binding,
+                             range, transition);
+    }
+
+    void observe_boundary(const prosper::gpu::ComputeAuthorityBoundary& boundary) {
+        if (!requested()) return;
+        std::lock_guard lock(mutex_);
+        using BoundaryKind = prosper::gpu::ComputeAuthorityBoundaryKind;
+        boundary_counts_[static_cast<size_t>(boundary.kind)] =
+            shadow_compute_authority_increment(
+                boundary_counts_[static_cast<size_t>(boundary.kind)]);
+        if (boundary.kind == BoundaryKind::SubmitBegin) {
+            census_.begin_submit(boundary.submit_no);
+            return;
+        }
+        verify_submit_locked(boundary.submit_no,
+                             compute_authority_boundary_name(boundary.kind));
+        const ShadowComputeAuthorityRange range = boundary.range_known
+            ? ShadowComputeAuthorityRange::from(boundary.address, boundary.bytes)
+            : ShadowComputeAuthorityRange::unknown();
+        ShadowComputeAuthorityTransition transition;
+        switch (boundary.kind) {
+            case BoundaryKind::Draw:
+                transition = census_.observe(
+                    ShadowComputeAuthorityConsumerKind::Draw, range);
+                break;
+            case BoundaryKind::Dma:
+                transition = census_.observe(
+                    ShadowComputeAuthorityConsumerKind::Dma, range);
+                break;
+            case BoundaryKind::OrderedMemoryEffect:
+                transition = census_.observe(
+                    ShadowComputeAuthorityConsumerKind::OrderedMemoryEffect, range);
+                break;
+            case BoundaryKind::Capture:
+                transition = census_.observe(
+                    ShadowComputeAuthorityConsumerKind::Capture);
+                break;
+            case BoundaryKind::SubmitEnd:
+                transition = census_.end_submit();
+                break;
+            case BoundaryKind::Compute:
+                transition = range.valid()
+                    ? census_.observe(
+                          ShadowComputeAuthorityConsumerKind::OrderedMemoryEffect, range)
+                    : census_.observe(
+                          ShadowComputeAuthorityConsumerKind::Unknown);
+                break;
+            case BoundaryKind::SubmitBegin:
+                return;
+        }
+        record_detail_locked(compute_authority_boundary_name(boundary.kind),
+                             boundary.submit_no, boundary.command_order, UINT32_MAX,
+                             range, transition);
+    }
+
+    void report_summary() {
+        if (!requested()) return;
+        std::lock_guard lock(mutex_);
+        if (!census_.claim_summary()) return;
+        const ComputeAuthorityLiveSelector& selector = census_.selector();
+        const ComputeAuthorityLiveCounters& c = census_.counters();
+        const ShadowComputeAuthorityCounters& a = c.authority;
+        const char* verdict = !selector.valid ? "INVALID-selector-not-armed" :
+            c.programs_matched == 0 ? "INVALID-zero-matches" :
+            c.retained_storage_outputs == 0 || a.admitted_results == 0
+                ? "INVALID-zero-authority-lever" :
+            census_.active_submit() ? "INVALID-unfinished-submit" :
+            !c.apparatus_valid ? "INVALID-apparatus" :
+            c.pending_after_submit_end != 0 ? "INVALID-pending-after-submit" : "matched";
+        std::fprintf(stderr,
+                     "[compute-authority] summary producer=0x%016llx reason=%s "
+                     "seen=%llu matched=%llu submits=%llu/%llu interrupted=%llu "
+                     "outside-submit=%llu active=%u selected-outputs=%llu retained=%llu "
+                     "synchronous=%llu pending-before-end=%llu pending-after-end=%llu "
+                     "verdict=%s\n",
+                     static_cast<unsigned long long>(selector.producer_hash),
+                     compute_timing_selector_parse_error_name(selector.error),
+                     static_cast<unsigned long long>(c.programs_seen),
+                     static_cast<unsigned long long>(c.programs_matched),
+                     static_cast<unsigned long long>(c.submits_completed),
+                     static_cast<unsigned long long>(c.submits_started),
+                     static_cast<unsigned long long>(c.interrupted_submits),
+                     static_cast<unsigned long long>(c.observations_without_submit),
+                     census_.active_submit() ? 1u : 0u,
+                     static_cast<unsigned long long>(c.selected_storage_outputs),
+                     static_cast<unsigned long long>(c.retained_storage_outputs),
+                     static_cast<unsigned long long>(c.synchronous_storage_outputs),
+                     static_cast<unsigned long long>(c.pending_before_submit_end),
+                     static_cast<unsigned long long>(c.pending_after_submit_end), verdict);
+        std::fprintf(stderr,
+                     "[compute-authority] summary results candidates=%llu admitted=%llu "
+                     "replaced=%llu rejected=%llu observations=%llu gpu-keeps=%llu "
+                     "unrelated-keeps=%llu materializations=%llu overlap=%llu "
+                     "guest-image=%llu raw-buffer=%llu draw=%llu dma=%llu memory-effect=%llu "
+                     "capture=%llu unknown=%llu submit-end=%llu unknown-range=%llu\n",
+                     static_cast<unsigned long long>(a.result_candidates),
+                     static_cast<unsigned long long>(a.admitted_results),
+                     static_cast<unsigned long long>(a.replaced_results),
+                     static_cast<unsigned long long>(a.rejected_results),
+                     static_cast<unsigned long long>(a.consumer_observations),
+                     static_cast<unsigned long long>(a.proven_gpu_keeps),
+                     static_cast<unsigned long long>(a.unrelated_keeps),
+                     static_cast<unsigned long long>(a.materializations),
+                     static_cast<unsigned long long>(a.overlap_materializations),
+                     static_cast<unsigned long long>(a.guest_image_materializations),
+                     static_cast<unsigned long long>(a.raw_buffer_materializations),
+                     static_cast<unsigned long long>(a.draw_materializations),
+                     static_cast<unsigned long long>(a.dma_materializations),
+                     static_cast<unsigned long long>(
+                         a.ordered_memory_effect_materializations),
+                     static_cast<unsigned long long>(a.capture_materializations),
+                     static_cast<unsigned long long>(a.unknown_consumer_materializations),
+                     static_cast<unsigned long long>(a.submit_end_materializations),
+                     static_cast<unsigned long long>(a.unknown_range_materializations));
+        std::fprintf(stderr,
+                     "[compute-authority] summary boundaries begin=%llu draw=%llu dma=%llu "
+                     "memory-effect=%llu capture=%llu end=%llu compute=%llu "
+                     "detail-events=%llu\n",
+                     static_cast<unsigned long long>(boundary_counts_[0]),
+                     static_cast<unsigned long long>(boundary_counts_[1]),
+                     static_cast<unsigned long long>(boundary_counts_[2]),
+                     static_cast<unsigned long long>(boundary_counts_[3]),
+                     static_cast<unsigned long long>(boundary_counts_[4]),
+                     static_cast<unsigned long long>(boundary_counts_[5]),
+                     static_cast<unsigned long long>(boundary_counts_[6]),
+                     static_cast<unsigned long long>(detail_events_));
+    }
+
+private:
+    void verify_submit_locked(uint64_t submit_no, const char* stage) {
+        if (!census_.active_submit() || census_.submit_no() == submit_no) return;
+        census_.invalidate_apparatus(true);
+        if (!submit_mismatch_reported_) {
+            submit_mismatch_reported_ = true;
+            std::fprintf(stderr,
+                         "[compute-authority] apparatus-invalid stage=%s active-submit=%llu "
+                         "observed-submit=%llu; pending authority closed as unknown\n",
+                         stage,
+                         static_cast<unsigned long long>(census_.submit_no()),
+                         static_cast<unsigned long long>(submit_no));
+        }
+    }
+
+    void record_detail_locked(const char* stage, uint64_t submit_no,
+                              uint64_t command_order, uint32_t binding,
+                              const ShadowComputeAuthorityRange& range,
+                              const ShadowComputeAuthorityTransition& transition) {
+        if (!transition.pending_before && !transition.pending_after &&
+            transition.action == ShadowComputeAuthorityAction::NoPendingResult)
+            return;
+        detail_events_ = shadow_compute_authority_increment(detail_events_);
+        if (detail_events_ > 16 && (detail_events_ & (detail_events_ - 1)) != 0) return;
+        std::fprintf(stderr,
+                     "[compute-authority] detail n=%llu stage=%s submit=%llu order=%llu "
+                     "binding=%s%u range=%s0x%llx+%llu action=%s reason=%s pending=%u->%u\n",
+                     static_cast<unsigned long long>(detail_events_), stage,
+                     static_cast<unsigned long long>(submit_no),
+                     static_cast<unsigned long long>(command_order),
+                     binding == UINT32_MAX ? "-" : "",
+                     binding == UINT32_MAX ? 0u : binding,
+                     range.valid() ? "" : "unknown:",
+                     static_cast<unsigned long long>(range.address),
+                     static_cast<unsigned long long>(range.bytes),
+                     compute_authority_action_name(transition.action),
+                     compute_authority_reason_name(transition.reason),
+                     transition.pending_before ? 1u : 0u,
+                     transition.pending_after ? 1u : 0u);
+    }
+
+    ComputeAuthorityLiveCensus census_;
+    std::array<uint64_t, 7> boundary_counts_{};
+    uint64_t detail_events_ = 0;
+    bool submit_mismatch_reported_ = false;
+    std::mutex mutex_;
+};
+
+RuntimeComputeAuthorityCensus& runtime_compute_authority_census() {
+    static RuntimeComputeAuthorityCensus census;
+    return census;
+}
+
 void maybe_dump_traced_compute_spirv(const prosper::gpu::ComputeItem& item, bool trace) {
     const char* path = std::getenv("PROSPER_COMPUTELOG_SPIRV");
     if (!trace || !path || !*path || item.spirv.empty()) return;
@@ -3202,6 +3508,17 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
         destination = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(resource->gpu_addr));
     }
     if (!destination) return std::nullopt;
+
+    // The CPU shortcut bypasses execute_item's reflected-resource census entirely. Publish its
+    // exact write boundary before touching bytes so pending storage authority cannot survive an
+    // overlapping fast fill. With the diagnostic unarmed this is the same single atomic check as
+    // other executor boundaries; no hashing, lock, or callback copy occurs.
+    const bool authority_range_known = resource->gpu_addr != 0 && written_bytes != 0 &&
+        resource->gpu_addr <= UINT64_MAX - (written_bytes - 1);
+    prosper::gpu::notify_compute_authority_boundary({
+        prosper::gpu::ComputeAuthorityBoundaryKind::Compute,
+        item.submit_no, item.command_order, resource->gpu_addr, written_bytes,
+        authority_range_known});
 
     if (!resource->host_data && resource->gpu_addr)
         prosper::host::guest_write_watch_notify_host_write(
@@ -3379,8 +3696,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     RuntimeComputeTransferGateCensus& transfer_gate_census =
         runtime_compute_transfer_gate_census();
     const bool transfer_gate_requested = transfer_gate_census.requested();
+    RuntimeComputeAuthorityCensus& authority_census =
+        runtime_compute_authority_census();
+    const bool authority_requested = authority_census.requested();
     const bool timing_address_matches = time_compute_address_matches(item);
-    if (transfer_gate_requested ||
+    if (transfer_gate_requested || authority_requested ||
         ((phase_timing_requested || image_timing_requested) && timing_address_matches)) {
         timing_program_hash = gpu_capture_hash(
             reinterpret_cast<const uint8_t*>(spirv.data()),
@@ -3394,6 +3714,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         transfer_gate_requested
             ? transfer_gate_census.observe(item, timing_program_hash)
             : ComputeTransferGateSelectorObservation{};
+    const ComputeAuthorityLiveObservation authority_observation =
+        authority_requested
+            ? authority_census.observe_program(item, timing_program_hash)
+            : ComputeAuthorityLiveObservation{};
     // The phase timer is also useful for buffer-only kernels. Astro Bot's heaviest dispatcher writes
     // buffers exclusively, so the historical storage-image gate hid the actual frame bottleneck.
     const bool timing_trace_only =
@@ -5551,6 +5875,54 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  ComputeClock::now() - image_start).count());
         }
         if (!images_ready) break;
+
+        // #1854 shadow census: all bindings are now finalized, including aliases, persistent-cache
+        // reuse, and device-local compute-transfer seeds. Observe consumers before the dispatch can
+        // execute, but do not change any upload, barrier, wait, readback, or guest writeback. Writable
+        // buffers and unselected image outputs are ordered memory effects; selected storage-image
+        // results are classified only on the complete success/publish path below.
+        if (authority_requested) {
+            for (size_t i = 0; i < buffers.size(); ++i) {
+                const BoundBuffer& buffer = buffers[i];
+                if (!buffer.resource) continue;
+                const ShadowComputeAuthorityRange range =
+                    ShadowComputeAuthorityRange::from(
+                        buffer.resource->gpu_addr, buffer.guest_bytes);
+                if (descriptors[i].readable)
+                    authority_census.observe_compute_access(
+                        item, descriptors[i].binding,
+                        ShadowComputeAuthorityConsumerKind::RawBuffer,
+                        range, "compute-buffer-input");
+                if (buffer.writable)
+                    authority_census.observe_compute_access(
+                        item, descriptors[i].binding,
+                        ShadowComputeAuthorityConsumerKind::OrderedMemoryEffect,
+                        range, "compute-buffer-output");
+            }
+            for (size_t i = 0; i < images.size(); ++i) {
+                const BoundImage& image = images[i];
+                if (!image.resource) continue;
+                const ShadowComputeAuthorityRange range =
+                    ShadowComputeAuthorityRange::from(
+                        image.resource->gpu_addr, image.guest_bytes);
+                if (image_descriptors[i].readable) {
+                    const bool proven_gpu = image.compute_transfer_seed_borrowed ||
+                        (image.storage && image.persistent && image.upload_skipped);
+                    authority_census.observe_compute_access(
+                        item, image.binding,
+                        proven_gpu
+                            ? ShadowComputeAuthorityConsumerKind::ProvenGpuImage
+                            : ShadowComputeAuthorityConsumerKind::GuestImage,
+                        range, proven_gpu ? "compute-image-input-gpu" :
+                                            "compute-image-input-guest");
+                }
+                if (image.storage && !authority_observation.selected)
+                    authority_census.observe_compute_access(
+                        item, image.binding,
+                        ShadowComputeAuthorityConsumerKind::OrderedMemoryEffect,
+                        range, "compute-image-output-unselected");
+            }
+        }
         phase_setup = ComputeClock::now();
 
         // Layout: the buffer bindings (filled above) + one entry per image binding (#590).
@@ -6875,6 +7247,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             transfer_gate_census.record_storage_publish(
                 transfer_gate_observation.role, image.native_float_storage, unique,
                 image.cache_candidate, image.persistent, authorized);
+            if (authority_observation.selected && unique && image.resource) {
+                authority_census.record_selected_storage_output(
+                    item, image.binding,
+                    ShadowComputeAuthorityRange::from(
+                        image.resource->gpu_addr, image.guest_bytes),
+                    authorized);
+            }
             if (publish_eligible && image.graphics_sampled_usage)
                 ctx.authorize_cached_image_export(image.cache_key);
         }
@@ -6988,6 +7367,7 @@ bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat forma
 void report_live_compute_timing_selector_summary() {
     runtime_compute_timing_selector().report_summary();
     runtime_compute_transfer_gate_census().report_summary();
+    runtime_compute_authority_census().report_summary();
 }
 
 bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampled_resource,
@@ -7209,6 +7589,13 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
 }
 
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
+    auto fail_closed_items = [&]() {
+        for (const auto& item : items)
+            prosper::gpu::notify_compute_authority_boundary({
+                prosper::gpu::ComputeAuthorityBoundaryKind::Compute,
+                item.submit_no, item.command_order, 0, 0, false});
+        return false;
+    };
     // Keep the Vulkan device alive across dispatch spans. Constructing an instance, device, and queue for
     // every callback cost roughly 25 ms/frame on the native Windows frontend before any kernel work ran.
     // Function-local static initialization is thread-safe; AGC submit execution serializes subsequent use.
@@ -7264,7 +7651,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     }();
     if (!context_ready) {
         std::fprintf(stderr, "[compute] Vulkan initialization failed\n");
-        return false;
+        return fail_closed_items();
     }
     // The teardown handler nulls context_ptr, so a dispatch submitted from another thread once
     // exit() has begun must decline instead of dereferencing it. Read once: the handler writes this
@@ -7278,11 +7665,11 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
         std::call_once(teardown_logged, [] {
             std::fprintf(stderr, "[compute] dispatch after Vulkan teardown — declining\n");
         });
-        return false;
+        return fail_closed_items();
     }
     VulkanComputeContext& context = *live_context;
     g_live_compute_context = &context;
-    if (context.device_lost) return false;
+    if (context.device_lost) return fail_closed_items();
     const bool perf_capture_timing =
         prosper::perf::interactive_performance_capture().detailed_timing_active();
     const bool timing_log_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
@@ -7296,11 +7683,26 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     // backend can't bind yet, #590) must not abort the rest of the batch — that would regress
     // dispatches that executed before image bindings existed. Run all; report all-succeeded.
     bool all_ok = true;
+    RuntimeComputeAuthorityCensus& authority_census =
+        runtime_compute_authority_census();
+    const bool authority_requested = authority_census.requested();
     for (const auto& item : items) {
-        if (const std::optional<bool> cpu_result = execute_cpu_fast_path(item))
+        if (const std::optional<bool> cpu_result = execute_cpu_fast_path(item)) {
+            if (authority_requested) {
+                const uint64_t program_hash = prosper::gpu::gpu_capture_hash(
+                    reinterpret_cast<const uint8_t*>(item.spirv.data()),
+                    item.spirv.size() * sizeof(uint32_t));
+                (void)authority_census.observe_program(item, program_hash);
+            }
             all_ok &= *cpu_result;
-        else
-            all_ok &= execute_item(context, item);
+        } else {
+            const bool item_ok = execute_item(context, item);
+            all_ok &= item_ok;
+            if (!item_ok)
+                prosper::gpu::notify_compute_authority_boundary({
+                    prosper::gpu::ComputeAuthorityBoundaryKind::Compute,
+                    item.submit_no, item.command_order, 0, 0, false});
+        }
         if (context.device_lost) break;
     }
     if (timing_enabled) {
@@ -7389,6 +7791,14 @@ void register_live_compute() {
     // Parse and announce a stable timing selector at backend registration, not at the first matching
     // dispatch. A title that never reaches compute must still prove whether the instrument armed.
     (void)runtime_compute_timing_selector();
+    RuntimeComputeAuthorityCensus& authority_census =
+        runtime_compute_authority_census();
+    if (authority_census.requested()) {
+        prosper::gpu::set_compute_authority_boundary_observer(
+            [](const prosper::gpu::ComputeAuthorityBoundary& boundary) {
+                runtime_compute_authority_census().observe_boundary(boundary);
+            });
+    }
     const char* enabled = std::getenv("PROSPER_COMPUTE");
     if (enabled && (!std::strcmp(enabled, "0") || !std::strcmp(enabled, "off"))) {
         std::fprintf(stderr, "[compute] live execution disabled by PROSPER_COMPUTE=%s\n", enabled);

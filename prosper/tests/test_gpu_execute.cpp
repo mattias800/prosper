@@ -646,14 +646,40 @@ int main() {
             (uint64_t)(uintptr_t)copied_indices, (uint64_t)(uintptr_t)source_indices,
             sizeof(copied_indices), 0, 100, 0});
         std::vector<uint32_t> submitted_indices;
+        std::vector<ComputeAuthorityBoundary> authority_boundaries;
+        set_compute_authority_boundary_observer(
+            [&](const ComputeAuthorityBoundary& boundary) {
+                authority_boundaries.push_back(boundary);
+            });
         set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
             if (!items.empty()) submitted_indices = items.front().indices;
             return RenderedFrame{};
         });
         execute_ordered_and_present(ordered, W, H, 77, /*publish=*/false);
         set_submit_renderer({});
+        set_compute_authority_boundary_observer({});
         CHECK(submitted_indices == std::vector<uint32_t>({0, 1, 2}),
               "DMA-backed index buffer is realized after the ordered copy in the production path");
+        CHECK(authority_boundaries.size() == 5 &&
+                  authority_boundaries[0].kind ==
+                      ComputeAuthorityBoundaryKind::SubmitBegin &&
+                  authority_boundaries[0].submit_no == 77 &&
+                  authority_boundaries[1].kind == ComputeAuthorityBoundaryKind::Dma &&
+                  authority_boundaries[1].range_known &&
+                  authority_boundaries[1].address ==
+                      reinterpret_cast<uint64_t>(source_indices) &&
+                  authority_boundaries[1].bytes == sizeof(source_indices) &&
+                  authority_boundaries[2].kind == ComputeAuthorityBoundaryKind::Dma &&
+                  authority_boundaries[2].range_known &&
+                  authority_boundaries[2].address ==
+                      reinterpret_cast<uint64_t>(copied_indices) &&
+                  authority_boundaries[2].bytes == sizeof(copied_indices) &&
+                  authority_boundaries[3].kind == ComputeAuthorityBoundaryKind::Draw &&
+                  !authority_boundaries[3].range_known &&
+                  authority_boundaries[3].command_order == 200 &&
+                  authority_boundaries[4].kind ==
+                      ComputeAuthorityBoundaryKind::SubmitEnd,
+              "authority hook preserves submit, DMA source/destination, draw, and end order");
     }
 
     // Indirect arguments are generated memory, not command-fold inputs. Supply them through an
@@ -821,6 +847,14 @@ int main() {
         unresolved_dispatch.indirect_args_addr = 0xdead00000000ull;
         unresolved_dispatch.command_order = 19;
         nonrender.dispatches.push_back(unresolved_dispatch);
+        uint32_t authority_effect_target = 0;
+        const uint32_t authority_effect_value = 0x1854cafeu;
+        Pm4Command authority_effect;
+        authority_effect.kind = Pm4Command::Kind::WriteData;
+        authority_effect.wd_addr = reinterpret_cast<uint64_t>(&authority_effect_target);
+        authority_effect.wd_num = 1;
+        authority_effect.wd_data = &authority_effect_value;
+        nonrender.ordered_memory_effects.emplace_back(authority_effect, 18);
         const std::filesystem::path path =
             prosper_test::test_scratch_dir() / "prosper_nonrender_submit_capture.prgcap";
         std::error_code filesystem_error;
@@ -833,12 +867,18 @@ int main() {
         setenv("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1", 1);
 #endif
         uint32_t compute_calls = 0;
+        std::vector<ComputeAuthorityBoundary> nonrender_authority_boundaries;
+        set_compute_authority_boundary_observer(
+            [&](const ComputeAuthorityBoundary& boundary) {
+                nonrender_authority_boundaries.push_back(boundary);
+            });
         set_submit_compute([&](const std::vector<ComputeItem>& items) {
             compute_calls += static_cast<uint32_t>(items.size());
             return !items.empty();
         });
         const bool executed = execute_nonrender_submit_work(nonrender, 1441);
         set_submit_compute({});
+        set_compute_authority_boundary_observer({});
 #ifdef _WIN32
         _putenv_s("PROSPER_GPU_CAPTURE", "");
         _putenv_s("PROSPER_GPU_CAPTURE_METADATA_ONLY", "");
@@ -883,6 +923,27 @@ int main() {
                       std::vector<uint32_t>(std::begin(kNoopCs), std::end(kNoopCs)) &&
                   !captured.expected_output_valid,
               "ordered capture retains exact direct and unresolved indirect compute evidence");
+        CHECK(nonrender_authority_boundaries.size() == 5 &&
+                  nonrender_authority_boundaries[0].kind ==
+                      ComputeAuthorityBoundaryKind::SubmitBegin &&
+                  nonrender_authority_boundaries[0].submit_no == 1441 &&
+                  nonrender_authority_boundaries[1].kind ==
+                      ComputeAuthorityBoundaryKind::OrderedMemoryEffect &&
+                  nonrender_authority_boundaries[1].range_known &&
+                  nonrender_authority_boundaries[1].address ==
+                      reinterpret_cast<uint64_t>(&authority_effect_target) &&
+                  nonrender_authority_boundaries[1].bytes == sizeof(uint32_t) &&
+                  nonrender_authority_boundaries[1].command_order == 18 &&
+                  authority_effect_target == authority_effect_value &&
+                  nonrender_authority_boundaries[2].kind ==
+                      ComputeAuthorityBoundaryKind::Compute &&
+                  !nonrender_authority_boundaries[2].range_known &&
+                  nonrender_authority_boundaries[2].command_order == 19 &&
+                  nonrender_authority_boundaries[3].kind ==
+                      ComputeAuthorityBoundaryKind::Capture &&
+                  nonrender_authority_boundaries[4].kind ==
+                      ComputeAuthorityBoundaryKind::SubmitEnd,
+              "non-render authority hook fail-closes unrealized compute before capture and end");
         std::filesystem::remove(path, filesystem_error);
 
         // A partial exact trace can identify an operation whose source index happens to exist in
