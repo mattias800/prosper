@@ -10,10 +10,7 @@ Last updated: 2026-08-03
 This page is the user-facing overview. Day-to-day compatibility progress lives in the
 [`tracker:game` issue list](https://github.com/mattias800/prosper/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22tracker%3Agame%22),
 where each active title keeps its current rung, route, visual evidence and links to independently
-closing bugs. The initial trackers are [Blue Prince (#1808)](https://github.com/mattias800/prosper/issues/1808),
-[Astro Bot (#1809)](https://github.com/mattias800/prosper/issues/1809),
-[R-Type Delta: HD Boosted (#1810)](https://github.com/mattias800/prosper/issues/1810), and
-[Syberia: Remastered (#1811)](https://github.com/mattias800/prosper/issues/1811).
+closing bugs. Every title in the tested inventory has a long-lived tracker in that list.
 
 ## Summary
 
@@ -49,6 +46,15 @@ closing bugs. The initial trackers are [Blue Prince (#1808)](https://github.com/
 | *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 **Gameplay** — title screen and the first playable scene render with real GPU draws on a validated route; the profile menu's full-width 3D layer now renders but is overexposed (#1790), and the gameplay composite remains degraded (#1627) |
 | *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Scripted routes reach the title screen, EULA, main menu and new-game Options screen at native 1920×1080; the boot's modal confirmation dialog needs input |
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and the ASTRO BOT title screen render at native 3840×2160; the title is over-exposed, the world-map hub shows only its backdrop, and guest compute costs ~21× throughput (#1732) |
+| *The Forgotten City* | `PPSA03026` | Unreal Engine 4 | 🔬 Intermittent bring-up: one exact-master run rendered advancing native-4K logos and an autosave notice, while an immediate repeat stayed black; no title screen yet |
+| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine | 🔬 Reaches the frame loop, but live rendering fails and fallback output is mostly black with corrupted horizontal bands |
+| *Tactics Ogre: Reborn* | `PPSA03839` | Custom | 🔬 Reaches a fast frame loop, but the unsupported title-movie codec leaves the output black |
+| *Little Nightmares III* | `PPSA05143` | Unreal Engine | 🔬 Starts graphics setup, then faults on a low-address read before presenting a frame |
+| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Boots and remains alive for the bounded test, but publishes no rendered frame |
+| *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 Loads the runtime and EOS module, then times out during initialization without presenting a frame |
+| *The House of the Dead 2: Remake* | `PPSA24203` | Unity / IL2CPP | 🚧 Clean animated 1080p opening, title menu and Training Mode selection render; loading Training 1 then ends on black before verified gameplay |
+| *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🔬 Reaches a live rendered frame loop, but the sampled output remains black; an optional media probe also reports an unsupported FSB5 asset |
+| *Beneath* | `PPSA27640` | Unity / IL2CPP | 🔬 Clean 1080p opening key art renders, then the guest faults and the image stops advancing before a title screen |
 
 ¹ Exact retail game name pending confirmation.
 
@@ -966,6 +972,19 @@ input-triggered (#1730).
 
 Reusable input routes are documented in
 [`prosper/scripts/astrobot/README.md`](prosper/scripts/astrobot/README.md).
+
+## The House of the Dead 2: Remake — `PPSA24203`
+
+<p align="center">
+  <img src="assets/screenshots/house-of-the-dead-2-remake-title.png" alt="The House of the Dead 2: Remake — title menu">
+</p>
+
+The Unity / IL2CPP title renders a clean animated opening and reaches its title menu at native
+1920×1080. Repeated Cross input continues into the Training Mode selection screen and starts loading
+Training 1. The loading presentation advances, but the output then becomes black, so gameplay is not
+yet claimed. The image above is a direct, unmodified frontend capture from the normal full-cadence
+Vulkan renderer. Current routes, evidence and follow-up work are tracked in
+[#1896](https://github.com/mattias800/prosper/issues/1896).
 
 ## Requirements and scope
 
