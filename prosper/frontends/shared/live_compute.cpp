@@ -3285,6 +3285,25 @@ public:
                              range, transition);
     }
 
+    void observe_compute_image_access(
+            const prosper::gpu::ComputeItem& item,
+            const ShadowComputeAuthorityRange& range,
+            const ComputeAuthorityImageSourceFacts& facts) {
+        if (!requested()) return;
+        const ComputeAuthorityImageSourceDecision decision =
+            classify_compute_authority_image_source(facts);
+        if (!decision.observe) return;
+        std::lock_guard lock(mutex_);
+        verify_submit_locked(item.submit_no, "compute-image-input");
+        const ShadowComputeAuthorityTransition transition = census_.observe(
+            decision.consumer_kind(), range);
+        record_detail_locked(decision.proven_gpu ? "compute-image-input-gpu" :
+                                                   "compute-image-input-guest",
+                             item.submit_no, item.command_order, facts.binding,
+                             range, transition);
+        record_image_source_detail_locked(item, facts, decision, transition);
+    }
+
     void record_selected_storage_output(
             const prosper::gpu::ComputeItem& item, uint32_t binding,
             const ShadowComputeAuthorityRange& range, bool retained) {
@@ -3422,6 +3441,27 @@ public:
                      static_cast<unsigned long long>(boundary_counts_[5]),
                      static_cast<unsigned long long>(boundary_counts_[6]),
                      static_cast<unsigned long long>(detail_events_));
+        std::fprintf(stderr,
+                     "[compute-authority] summary image-sources selected-events=%llu "
+                     "aliases=%llu direct-borrow=%llu owner-borrow=%llu "
+                     "direct-persistent=%llu owner-persistent=%llu "
+                     "direct-upload-skipped=%llu owner-upload-skipped=%llu "
+                     "same-image=%llu same-view=%llu gpu=%llu guest=%llu detail-lines=%llu\n",
+                     static_cast<unsigned long long>(image_sources_.observations),
+                     static_cast<unsigned long long>(image_sources_.aliases),
+                     static_cast<unsigned long long>(
+                         image_sources_.direct_transfer_borrows),
+                     static_cast<unsigned long long>(
+                         image_sources_.owner_transfer_borrows),
+                     static_cast<unsigned long long>(image_sources_.direct_persistent),
+                     static_cast<unsigned long long>(image_sources_.owner_persistent),
+                     static_cast<unsigned long long>(image_sources_.direct_upload_skips),
+                     static_cast<unsigned long long>(image_sources_.owner_upload_skips),
+                     static_cast<unsigned long long>(image_sources_.same_images),
+                     static_cast<unsigned long long>(image_sources_.same_views),
+                     static_cast<unsigned long long>(image_sources_.proven_gpu),
+                     static_cast<unsigned long long>(image_sources_.guest),
+                     static_cast<unsigned long long>(image_source_detail_lines_));
     }
 
 private:
@@ -3465,9 +3505,45 @@ private:
                      transition.pending_after ? 1u : 0u);
     }
 
+    void record_image_source_detail_locked(
+            const prosper::gpu::ComputeItem& item,
+            const ComputeAuthorityImageSourceFacts& facts,
+            const ComputeAuthorityImageSourceDecision& decision,
+            const ShadowComputeAuthorityTransition& transition) {
+        if (!transition.pending_before && !transition.pending_after &&
+            transition.action == ShadowComputeAuthorityAction::NoPendingResult)
+            return;
+        record_compute_authority_image_source(image_sources_, facts, decision);
+        const uint64_t n = image_sources_.observations;
+        if (n > 16 && (n & (n - 1)) != 0) return;
+        image_source_detail_lines_ = shadow_compute_authority_increment(
+            image_source_detail_lines_);
+        std::fprintf(stderr,
+                     "[compute-authority] image-source n=%llu submit=%llu order=%llu "
+                     "binding=%u alias=%u owner-binding=%u "
+                     "direct-borrow=%u owner-borrow=%u "
+                     "direct-persistent=%u owner-persistent=%u "
+                     "direct-upload-skipped=%u owner-upload-skipped=%u "
+                     "same-image=%u same-view=%u class=%s\n",
+                     static_cast<unsigned long long>(n),
+                     static_cast<unsigned long long>(item.submit_no),
+                     static_cast<unsigned long long>(item.command_order),
+                     facts.binding, facts.alias ? 1u : 0u, facts.owner_binding,
+                     facts.direct_transfer_borrowed ? 1u : 0u,
+                     facts.owner_transfer_borrowed ? 1u : 0u,
+                     facts.direct_persistent ? 1u : 0u,
+                     facts.owner_persistent ? 1u : 0u,
+                     facts.direct_upload_skipped ? 1u : 0u,
+                     facts.owner_upload_skipped ? 1u : 0u,
+                     facts.same_image ? 1u : 0u, facts.same_view ? 1u : 0u,
+                     decision.proven_gpu ? "gpu" : "guest");
+    }
+
     ComputeAuthorityLiveCensus census_;
     std::array<uint64_t, 7> boundary_counts_{};
+    ComputeAuthorityImageSourceCounters image_sources_{};
     uint64_t detail_events_ = 0;
+    uint64_t image_source_detail_lines_ = 0;
     bool submit_mismatch_reported_ = false;
     std::mutex mutex_;
 };
@@ -5951,17 +6027,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const ShadowComputeAuthorityRange range =
                     ShadowComputeAuthorityRange::from(
                         image.resource->gpu_addr, image.guest_bytes);
-                if (image_descriptors[i].readable) {
-                    const bool proven_gpu = image.compute_transfer_seed_borrowed ||
-                        (image.storage && image.persistent && image.upload_skipped);
-                    authority_census.observe_compute_access(
-                        item, image.binding,
-                        proven_gpu
-                            ? ShadowComputeAuthorityConsumerKind::ProvenGpuImage
-                            : ShadowComputeAuthorityConsumerKind::GuestImage,
-                        range, proven_gpu ? "compute-image-input-gpu" :
-                                            "compute-image-input-guest");
-                }
+                const BoundImage& owner = image.alias_of == SIZE_MAX
+                    ? image : images[image.alias_of];
+                authority_census.observe_compute_image_access(
+                    item, range,
+                    {image.binding,
+                     owner.binding,
+                     image_descriptors[i].readable,
+                     image.storage,
+                     image.alias_of != SIZE_MAX,
+                     image.compute_transfer_seed_borrowed,
+                     owner.compute_transfer_seed_borrowed,
+                     image.persistent,
+                     owner.persistent,
+                     image.upload_skipped,
+                     owner.upload_skipped,
+                     image.image == owner.image,
+                     image.view == owner.view});
                 if (image.storage && !authority_observation.selected)
                     authority_census.observe_compute_access(
                         item, image.binding,
