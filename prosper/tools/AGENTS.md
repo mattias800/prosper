@@ -32,6 +32,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`boot_trace/`** — boots a SELF/ELF game image through the loader + HLE and
   runs it, with the fault handler, GPU executor, and (under `PROSPER_RENDER`) the
   live Vulkan renderer. The main harness for exercising a real title headlessly.
+  - **Periodic BMP frame dumps are opt-in.** `PROSPER_FRAME_DIR` only selects the output directory;
+    it does not enable writes. Set `PROSPER_FRAME_DUMPS=1` for the existing first-60/every-10 cadence,
+    or use `PROSPER_DUMP_CONTENT`, `PROSPER_FRAME_DUMP_FIRST`, or `PROSPER_FRAME_DUMP_EVERY` as a
+    deliberate selector. `PROSPER_NO_FRAME_DUMPS=1` has highest priority and disables all of them.
   - **Who allocated this memory?** `PROSPER_MEMLOG=1` reports every direct-memory reserve / allocate
     / map with its size, which answers *how much* but never *who* — and the same guest allocator
     serves every subsystem, so a title whose heap grows without bound looks identical to one that is

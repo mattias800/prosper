@@ -460,6 +460,12 @@ if(TARGET prosper_core)
   target_include_directories(test_capture_renderer_policy PRIVATE frontends/shared)
   add_test(NAME capture_renderer_policy COMMAND test_capture_renderer_policy)
 
+  # boot_trace periodic BMPs are opt-in, with the legacy disable taking priority. This exercises the
+  # exact environment-name lookup and registrar forwarding without constructing Vulkan or writing files.
+  add_executable(test_frame_dump_policy frontends/shared/test_frame_dump_policy.cpp)
+  target_include_directories(test_frame_dump_policy PRIVATE frontends/shared)
+  add_test(NAME frame_dump_policy COMMAND test_frame_dump_policy)
+
   add_executable(test_capture_compute_policy tests/test_capture_compute_policy.cpp)
   target_include_directories(test_capture_compute_policy PRIVATE src)
   add_test(NAME capture_compute_policy COMMAND test_capture_compute_policy)

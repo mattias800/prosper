@@ -26,9 +26,9 @@ instead; that is the pacing the retained world-map captures were produced with. 
 `PROSPER_PAD_SCRIPT_LOG=1` output against the observed frame counter before assuming a route applies
 to a new frontend.
 
-`boot_trace` also writes a 3840x2160 BMP per sampled frame by default (`dump=1`), which reaches
-gigabytes over a multi-minute route. Set `PROSPER_NO_FRAME_DUMPS=1` for capture runs that only need
-the `.prgbundle`.
+`boot_trace` frame BMPs are opt-in because 3840x2160 output reaches gigabytes over a multi-minute
+route. Set `PROSPER_FRAME_DUMPS=1` only when the periodic images are needed; bundle-only capture runs
+write no BMP sequence by default.
 
 ## The opening needs no route at all
 

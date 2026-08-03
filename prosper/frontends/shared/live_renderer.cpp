@@ -551,7 +551,11 @@ uint32_t buffer_upload_bytes(uint32_t declared_bytes) {
     return std::min(declared_bytes, ceiling) & ~3u;
 }
 
-void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
+void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested) {
+    // Keep the legacy global disable authoritative for every frontend, including callers with their
+    // own explicit opt-in such as PROSPER_APP_DUMP_FRAMES.
+    const bool dump_bmps = frame_dump_request_allowed(
+        dump_bmps_requested, getenv("PROSPER_NO_FRAME_DUMPS"));
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
     // dispatch before their first draw -- without this the compute device would be created first and
