@@ -178,7 +178,8 @@ bool guest_write_watch_handle_fault(uint64_t addr);
 
 // Extended Linux signal-path interface. The SIGSEGV caller sets TF only for SingleStep. On the
 // following TRAP_TRACE it calls complete_step, clears TF, and may log the returned bounded event.
-// Other platforms return NotHandled/false.
+// complete_step has a lock-free pending-TID gate, so unrelated TRAP_TRACE users never wait for or
+// enter the dmem state lock. Other platforms return NotHandled/false.
 GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint64_t writer_rip,
                                                              int64_t tid);
 GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(

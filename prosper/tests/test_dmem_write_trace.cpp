@@ -24,6 +24,9 @@ std::atomic<bool> request_contention{false};
 std::atomic<bool> contention_held{false};
 std::atomic<bool> contention_hook_entered{false};
 std::atomic<bool> contention_released{false};
+std::atomic<bool> unrelated_lock_held{false};
+std::atomic<bool> release_unrelated_lock{false};
+std::atomic<bool> unrelated_contention_hook_entered{false};
 std::atomic<uint32_t> trap_count{0};
 volatile sig_atomic_t post_store_marker = 0;
 volatile sig_atomic_t marker_when_first_completed = -1;
@@ -31,6 +34,13 @@ volatile sig_atomic_t marker_when_first_completed = -1;
 void contention_hook() {
     contention_hook_entered.store(true, std::memory_order_release);
     while (!contention_released.load(std::memory_order_acquire)) sched_yield();
+}
+
+void unrelated_contention_hook() {
+    unrelated_contention_hook_entered.store(true, std::memory_order_release);
+    // Let a mutant that enters the lock path terminate deterministically instead of exhausting the
+    // full retry bound. The named assertion below still proves that production never invoked us.
+    release_unrelated_lock.store(true, std::memory_order_release);
 }
 
 void trace_signal_handler(int sig, siginfo_t* info, void* raw_context) {
@@ -187,6 +197,27 @@ int main() {
           "arm records the selected initial bytes");
 
     const int64_t creator_tid = static_cast<int64_t>(syscall(SYS_gettid));
+    prosper::host::guest_dmem_write_trace_set_contention_hook_for_test(
+        &unrelated_contention_hook);
+    std::thread unrelated_locker([] {
+        prosper::host::guest_dmem_write_trace_lock_state_for_test();
+        unrelated_lock_held.store(true, std::memory_order_release);
+        while (!release_unrelated_lock.load(std::memory_order_acquire)) sched_yield();
+        prosper::host::guest_dmem_write_trace_unlock_state_for_test();
+        unrelated_lock_held.store(false, std::memory_order_release);
+    });
+    while (!unrelated_lock_held.load(std::memory_order_acquire)) sched_yield();
+    prosper::host::GuestDmemWriteTraceEvent unrelated_event{};
+    const auto unrelated_step = prosper::host::guest_dmem_write_trace_complete_step(
+        creator_tid, 0x1234, unrelated_event);
+    const bool unrelated_lock_still_held = unrelated_lock_held.load(std::memory_order_acquire);
+    release_unrelated_lock.store(true, std::memory_order_release);
+    unrelated_locker.join();
+    CHECK(unrelated_step == prosper::host::GuestDmemWriteTraceStepAction::NotHandled &&
+              !unrelated_contention_hook_entered.load(std::memory_order_acquire) &&
+              unrelated_lock_still_held,
+          "unrelated TRAP bypasses contended dmem state through the lock-free pending-TID gate");
+
     prosper::host::guest_dmem_write_trace_set_contention_hook_for_test(&contention_hook);
     std::thread locker([] {
         while (!request_contention.load(std::memory_order_acquire)) sched_yield();

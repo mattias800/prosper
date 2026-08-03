@@ -540,8 +540,14 @@ struct WatchState {
     std::unordered_map<uint64_t, WatchedPage*> pages_by_addr;              // page-aligned VA -> page
     std::unordered_map<uint64_t, Registration> registrations;
     std::atomic<bool> fault_onstack{false};                               // red-zone-safe gate
+    // Lock-free ownership gate for SIGTRAP coexistence. Most TRAP_TRACE deliveries belong to other
+    // debugger/profiler machinery; they must not touch (or wait for) the dmem state mutex unless this
+    // exact thread owns the diagnostic's one-instruction step.
+    std::atomic<int64_t> pending_trace_step_tid{0};
     DmemTraceState trace;
 };
+static_assert(std::atomic<int64_t>::is_always_lock_free,
+              "the signal-path pending-step discriminator must be lock-free");
 WatchState& state() { static WatchState* value = new WatchState; return *value; }
 std::atomic<GuestDmemWriteTraceContentionHookForTest> trace_contention_hook_for_test{nullptr};
 
@@ -772,6 +778,7 @@ bool set_trace_armed_locked(WatchState& w, bool armed, bool force_writable) {
 void trace_invalidate_locked(WatchState& w, GuestDmemWriteTraceInvalidReason reason,
                              bool force_writable = false) {
     DmemTraceState& trace = w.trace;
+    w.pending_trace_step_tid.store(0, std::memory_order_release);
     if (trace.status == GuestDmemWriteTraceStatus::Disabled ||
         trace.status == GuestDmemWriteTraceStatus::Invalid ||
         trace.status == GuestDmemWriteTraceStatus::Overflow)
@@ -1105,6 +1112,7 @@ bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig& config) {
     WatchState& w = state();
     std::lock_guard lock(w.mutex);
     if (w.trace.armed) (void)set_trace_armed_locked(w, false, false);
+    w.pending_trace_step_tid.store(0, std::memory_order_release);
     w.trace = {};
     w.trace.config = config;
     if (!trace_config_valid(config)) {
@@ -1645,6 +1653,7 @@ GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint
                     (void)mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
                                    kPage, host_prot(alias.prot));
         w.trace.armed = false;
+        w.pending_trace_step_tid.store(0, std::memory_order_release);
         w.trace.status = GuestDmemWriteTraceStatus::Overflow;
         ++w.trace.overflow_events;
         ++w.trace.coverage_gaps;
@@ -1694,6 +1703,10 @@ GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint
     w.trace.armed = false;
     w.trace.stepping_tid = tid;
     w.trace.status = GuestDmemWriteTraceStatus::Stepping;
+    // Publish only after all pending event state is complete and immediately before telling the
+    // signal caller to set TF. complete_step's acquire load is the lock-free discriminator for the
+    // following TRAP_TRACE.
+    w.pending_trace_step_tid.store(tid, std::memory_order_release);
     return GuestWriteWatchFaultAction::SingleStep;
 }
 
@@ -1705,6 +1718,8 @@ bool guest_write_watch_handle_fault(uint64_t addr) {
 GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
         int64_t tid, uint64_t next_rip, GuestDmemWriteTraceEvent& event) {
     WatchState& w = state();
+    if (w.pending_trace_step_tid.load(std::memory_order_acquire) != tid)
+        return GuestDmemWriteTraceStepAction::NotHandled;
     std::unique_lock<std::mutex> lock(w.mutex, std::defer_lock);
     // The fault handler released this mutex before returning to the one stepped store, so this thread
     // cannot own it. A different thread may briefly hold it in a normal mapping/query operation. Do
@@ -1763,6 +1778,7 @@ GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
     event = trace.pending;
     trace.pending = {};
     trace.stepping_tid = 0;
+    w.pending_trace_step_tid.store(0, std::memory_order_release);
     return GuestDmemWriteTraceStepAction::Complete;
 }
 
