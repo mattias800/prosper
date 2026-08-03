@@ -60,18 +60,15 @@ endif()
 
 # --- core library (M1+) --------------------------------------------------
 # Loader / HLE / kernel / gpu sources accrete here per the roadmap.
+include(cmake/ProsperBuildRevision.cmake)
+prosper_add_build_revision_library(prosper_build_revision WORK_TREE "${CMAKE_SOURCE_DIR}/..")
+
 file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
 if(PROSPER_SRC)
   add_library(prosper_core STATIC ${PROSPER_SRC})
   target_include_directories(prosper_core PUBLIC src)
-  target_link_libraries(prosper_core PUBLIC libatrac9)
+  target_link_libraries(prosper_core PUBLIC libatrac9 PRIVATE prosper_build_revision)
   target_compile_definitions(prosper_core PRIVATE PROSPER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-  execute_process(COMMAND git rev-parse --verify HEAD WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.."
-                  OUTPUT_VARIABLE PROSPER_GIT_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-  if(NOT PROSPER_GIT_REVISION)
-    set(PROSPER_GIT_REVISION "unknown")
-  endif()
-  target_compile_definitions(prosper_core PRIVATE PROSPER_GIT_REVISION="${PROSPER_GIT_REVISION}")
   find_package(Threads REQUIRED)
   target_link_libraries(prosper_core PUBLIC Threads::Threads)
   # Windows: the guest futex HLE (sceKernelWaitOnAddress/WakeByAddress) is backed by the native Win32
@@ -86,10 +83,7 @@ endif()
 # its ring, bounds, and atomic file contract run in ordinary headless CI.
 add_library(prosper_performance_capture STATIC frontends/shared/performance_capture.cpp)
 target_include_directories(prosper_performance_capture PUBLIC frontends/shared)
-if(PROSPER_GIT_REVISION)
-  target_compile_definitions(prosper_performance_capture
-    PRIVATE PROSPER_GIT_REVISION="${PROSPER_GIT_REVISION}")
-endif()
+target_link_libraries(prosper_performance_capture PRIVATE prosper_build_revision)
 
 # --- tests (agentic-first: self-checking, exit-code = truth) -------------
 enable_testing()
@@ -131,6 +125,16 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME compute_phase_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_phase_report.py")
+  if(GIT_EXECUTABLE)
+    add_test(NAME build_revision_refresh
+             COMMAND "${Python3_EXECUTABLE}"
+               "${CMAKE_SOURCE_DIR}/tools/revision/test_build_revision.py"
+               --cmake "${CMAKE_COMMAND}"
+               --git "${GIT_EXECUTABLE}"
+               --module "${CMAKE_SOURCE_DIR}/cmake/ProsperBuildRevision.cmake"
+               --scratch-root "${CMAKE_CURRENT_BINARY_DIR}/build-revision-regression"
+               --generator "${CMAKE_GENERATOR}")
+  endif()
 endif()
 # Path to the (gitignored) local game dump; override with -DGAME_DUMP=...
 set(GAME_DUMP "${CMAKE_SOURCE_DIR}/../PPSA24651-app0" CACHE PATH "Local PS5 game dump root")

@@ -8,6 +8,7 @@
 
 #include <mutex>
 #include "bc_decode.hpp"
+#include "build_revision.hpp"
 #include "guest_texture_layout.hpp"
 #include "rdna2_decode.hpp"
 #include "rdna2_to_spirv.hpp"
@@ -4046,11 +4047,7 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     }
     GpuCaptureMetadata m; m.width = width; m.height = height;
     m.submit_index = submit_no ? submit_no : current;
-#ifdef PROSPER_GIT_REVISION
-    m.revision = PROSPER_GIT_REVISION;
-#else
-    m.revision = "unknown";
-#endif
+    m.revision = embedded_build_revision();
     if (const char* revision = std::getenv("PROSPER_CAPTURE_REVISION")) m.revision = revision;
     m.title_id = env_or_empty("PROSPER_CAPTURE_TITLE"); m.input_route = env_or_empty("PROSPER_PAD_SCRIPT");
     m.savedata_dir = env_or_empty("PROSPER_SAVEDATA_DIR");
