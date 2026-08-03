@@ -3332,6 +3332,410 @@ int main() {
 #endif
     }
 
+    // Syberia's colour-grade LUT is a tiled R11G11B10F volume written by one compute dispatch and
+    // sampled by the immediately following dispatch in the same guest submit (#1790). Existing
+    // coverage separates that contract into 2D packed-R11 conversion, 3D FP16 storage, and a 2D
+    // same-submit graphics import. Keep the exact missing cross-product together here: a real 3D
+    // SAMPLE_LZ consumer, the guest's SW_64KB_R_X layout, exact storage with and without a native
+    // typed-format capability bit, and a quantitative f11/f10 oracle over every logical voxel.
+    {
+        static const uint32_t r11_volume_producer[] = {
+            0xF0000F10u, 0x00000400u, // IMAGE_LOAD v[4:7], v[0:2], s[0:7], dim:3D
+            0xBF8C3F70u,              // s_waitcnt vmcnt(0)
+            0xF0200F10u, 0x00020400u, // IMAGE_STORE v[4:7], v[0:2], s[8:15], dim:3D
+            0xBF810000u,
+        };
+        static const uint32_t r11_volume_consumer[] = {
+            0x7E080300u,              // v4 = v0 (integer x retained in v0)
+            0x7E0A0301u,              // v5 = v1 (integer y retained in v1)
+            0x7E0C0302u,              // v6 = v2 (integer z retained in v2)
+            0x7E080D04u,              // v_cvt_f32_u32 v4, v4
+            0x7E0A0D05u,              // v_cvt_f32_u32 v5, v5
+            0x7E0C0D06u,              // v_cvt_f32_u32 v6, v6
+            0x060808F0u,              // v4 = v4 + 0.5
+            0x060A0AF0u,              // v5 = v5 + 0.5
+            0x060C0CF0u,              // v6 = v6 + 0.5
+            0x100808FFu, 0x3E800000u, // v4 *= 0.25 (literal)
+            0x100A0AFFu, 0x3E800000u, // v5 *= 0.25 (literal)
+            0x100C0CFFu, 0x3E800000u, // v6 *= 0.25 (literal)
+            0xF09C0F10u, 0x00400C04u, // IMAGE_SAMPLE_LZ v[12:15], v[4:6], s[0:7], s[8:11], 3D
+            0xBF8C3F70u,              // s_waitcnt vmcnt(0)
+            0xF0200F10u, 0x00040C00u, // IMAGE_STORE v[12:15], v[0:2], s[16:23], dim:3D
+            0xBF810000u,
+        };
+
+        constexpr uint32_t LUT_W = 4, LUT_H = 4, LUT_D = 4;
+        constexpr size_t LUT_TEXELS = LUT_W * LUT_H * LUT_D;
+        constexpr uint32_t LUT_TILE = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        const size_t lut_guest_bytes =
+            tiled_volume_bytes(LUT_W, LUT_H, LUT_D, LUT_TILE, sizeof(uint32_t));
+        CHECK(lut_guest_bytes != 0 && tile_mode_supports_volume(LUT_TILE),
+              "Syberia reduced LUT uses the implemented tiled 3D SW_64KB_R_X layout");
+
+        auto float_bits = [](float value) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &value, sizeof(bits));
+            return bits;
+        };
+        std::vector<uint32_t> source_bits(LUT_TEXELS * 4u);
+        std::vector<uint32_t> expected_bits(LUT_TEXELS * 4u);
+        std::vector<uint32_t> expected_packed(LUT_TEXELS);
+        bool has_sub_one = false, has_hdr = false, has_quantized_value = false;
+        for (uint32_t z = 0; z < LUT_D; ++z) {
+            for (uint32_t y = 0; y < LUT_H; ++y) {
+                for (uint32_t x = 0; x < LUT_W; ++x) {
+                    const size_t texel = (static_cast<size_t>(z) * LUT_H + y) * LUT_W + x;
+                    const float values[4] = {
+                        0.003f + x * 0.537f + y * 0.019f + z * 0.007f,
+                        0.125f + x * 0.013f + y * 0.911f + z * 0.203f,
+                        0.250f + x * 0.017f + y * 0.071f + z * 2.003f,
+                        1.0f,
+                    };
+                    const float quantized[4] = {
+                        f11_to_float(float_to_f11(values[0])),
+                        f11_to_float(float_to_f11(values[1])),
+                        f10_to_float(float_to_f10(values[2])),
+                        1.0f,
+                    };
+                    for (uint32_t channel = 0; channel < 4; ++channel) {
+                        source_bits[texel * 4 + channel] = float_bits(values[channel]);
+                        expected_bits[texel * 4 + channel] = float_bits(quantized[channel]);
+                        if (channel < 3) {
+                            has_sub_one |= values[channel] > 0.0f && values[channel] < 1.0f;
+                            has_hdr |= values[channel] > 1.0f;
+                            has_quantized_value |= float_bits(values[channel]) !=
+                                                   float_bits(quantized[channel]);
+                        }
+                    }
+                    expected_packed[texel] =
+                        static_cast<uint32_t>(float_to_f11(values[0])) |
+                        (static_cast<uint32_t>(float_to_f11(values[1])) << 11) |
+                        (static_cast<uint32_t>(float_to_f10(values[2])) << 22);
+                }
+            }
+        }
+        CHECK(has_sub_one && has_hdr && has_quantized_value,
+              "Syberia reduced LUT oracle spans sub-one, HDR, and real packing boundaries");
+
+        auto spirv_has_opcode = [](const std::vector<uint32_t>& spirv, uint16_t wanted) {
+            for (size_t offset = 5; offset < spirv.size();) {
+                const uint32_t word_count = spirv[offset] >> 16;
+                if (!word_count || offset + word_count > spirv.size()) return false;
+                if (static_cast<uint16_t>(spirv[offset]) == wanted) return true;
+                offset += word_count;
+            }
+            return false;
+        };
+
+        auto run_r11_volume_handoff = [&](uint32_t native_support,
+                                           bool native_capability_present) {
+            const char* arm = native_capability_present ? "capability-present" : "portable";
+            std::vector<uint8_t> lut_guest(lut_guest_bytes, 0xA5);
+            const uint32_t sentinel_word = static_cast<uint32_t>(float_to_f11(0.0625f)) |
+                (static_cast<uint32_t>(float_to_f11(0.125f)) << 11) |
+                (static_cast<uint32_t>(float_to_f10(0.25f)) << 22);
+            std::vector<uint32_t> sentinel_linear(LUT_TEXELS, sentinel_word);
+            const bool sentinel_tiled = tile_volume(
+                lut_guest.data(), lut_guest.size(),
+                reinterpret_cast<const uint8_t*>(sentinel_linear.data()),
+                LUT_W, LUT_H, LUT_D, LUT_TILE, sizeof(uint32_t));
+            CHECK(sentinel_tiled,
+                  native_capability_present
+                      ? "native-capability R11 LUT sentinel tiles across XYZ"
+                      : "portable R11 LUT sentinel tiles across XYZ");
+
+            ShaderResource producer_src{};
+            producer_src.cls = ResourceClass::StorageImage;
+            producer_src.img_dim = 2;
+            producer_src.binding = 4;
+            producer_src.sgpr_base = 0;
+            producer_src.format = DataFormat::Float32;
+            producer_src.num_components = 4;
+            producer_src.width = LUT_W;
+            producer_src.height = LUT_H;
+            producer_src.depth = LUT_D;
+            producer_src.gpu_addr = reinterpret_cast<uint64_t>(source_bits.data());
+            producer_src.size = static_cast<uint32_t>(source_bits.size() * sizeof(uint32_t));
+
+            ShaderResource producer_dst{};
+            producer_dst.cls = ResourceClass::StorageImage;
+            producer_dst.img_dim = 2;
+            producer_dst.binding = 5;
+            producer_dst.sgpr_base = 8;
+            producer_dst.format = DataFormat::Float10_11_11;
+            producer_dst.num_components = 3;
+            producer_dst.width = LUT_W;
+            producer_dst.height = LUT_H;
+            producer_dst.depth = LUT_D;
+            producer_dst.tile_mode = LUT_TILE;
+            producer_dst.gpu_addr = reinterpret_cast<uint64_t>(lut_guest.data());
+            producer_dst.size = static_cast<uint32_t>(lut_guest.size());
+
+            ShaderResourceTable producer_rt;
+            producer_rt.resources = {producer_src, producer_dst};
+            ComputeShaderConfig producer_config;
+            producer_config.user_sgprs.resize(16);
+            producer_config.local_x = LUT_W;
+            producer_config.local_y = LUT_H;
+            producer_config.local_z = LUT_D;
+            producer_config.threads_x = LUT_W;
+            producer_config.threads_y = LUT_H;
+            producer_config.threads_z = LUT_D;
+            producer_config.tidig_comp_cnt = 2;
+            producer_config.native_storage_format_support = native_support;
+            producer_config.packed_r11_storage = true;
+            const std::vector<uint32_t> producer_spirv = recompile_compute(
+                r11_volume_producer, std::size(r11_volume_producer),
+                &producer_rt, producer_config);
+            const DescriptorValidationReport producer_report =
+                validate_spirv_descriptor_interface(
+                    producer_spirv, &producer_rt, 0, SpirvShaderStage::Compute, false);
+            const SpirvDescriptorBinding* reflected_lut =
+                find_spirv_descriptor_binding(producer_report, 0, producer_dst.binding);
+            const bool producer_shape_ok = !producer_spirv.empty() && producer_report.ok() &&
+                reflected_lut && reflected_lut->kind == SpirvDescriptorKind::StorageImage &&
+                reflected_lut->image_dim == 2 && reflected_lut->writable;
+            CHECK(producer_shape_ok,
+                  native_capability_present
+                      ? "native-capability R11 producer reflects writable 3D storage"
+                      : "portable R11 producer reflects writable 3D storage");
+            const bool exact_storage = producer_shape_ok && !reflected_lut->storage_float &&
+                reflected_lut->storage_image_format == kSpirvImageFormatR32ui;
+            CHECK(exact_storage,
+                  native_capability_present
+                      ? "native R11 capability preserves exact packed R32ui 3D storage"
+                      : "disabled native capability selects exact packed R32ui 3D storage");
+            if (!exact_storage) return;
+
+            std::vector<uint32_t> output_bits(LUT_TEXELS * 4u, 0xCDCDCDCDu);
+            ShaderResource sampled_lut = producer_dst;
+            sampled_lut.cls = ResourceClass::Texture;
+            sampled_lut.binding = 4;
+            sampled_lut.sgpr_base = 0;
+            sampled_lut.sampler_sgpr_base = 8;
+            sampled_lut.mag_filter = 1;
+            sampled_lut.min_filter = 1;
+            sampled_lut.mip_filter = 0;
+
+            ShaderResource consumer_dst{};
+            consumer_dst.cls = ResourceClass::StorageImage;
+            consumer_dst.img_dim = 2;
+            consumer_dst.binding = 5;
+            consumer_dst.sgpr_base = 16;
+            consumer_dst.format = DataFormat::Float32;
+            consumer_dst.num_components = 4;
+            consumer_dst.width = LUT_W;
+            consumer_dst.height = LUT_H;
+            consumer_dst.depth = LUT_D;
+            consumer_dst.gpu_addr = reinterpret_cast<uint64_t>(output_bits.data());
+            consumer_dst.size = static_cast<uint32_t>(output_bits.size() * sizeof(uint32_t));
+
+            ShaderResourceTable consumer_rt;
+            consumer_rt.resources = {sampled_lut, consumer_dst};
+            ComputeShaderConfig consumer_config;
+            consumer_config.user_sgprs.resize(24);
+            consumer_config.local_x = LUT_W;
+            consumer_config.local_y = LUT_H;
+            consumer_config.local_z = LUT_D;
+            consumer_config.threads_x = LUT_W;
+            consumer_config.threads_y = LUT_H;
+            consumer_config.threads_z = LUT_D;
+            consumer_config.tidig_comp_cnt = 2;
+            consumer_config.native_storage_format_support = native_support;
+            const std::vector<uint32_t> consumer_spirv = recompile_compute(
+                r11_volume_consumer, std::size(r11_volume_consumer),
+                &consumer_rt, consumer_config);
+            const DescriptorValidationReport consumer_report =
+                validate_spirv_descriptor_interface(
+                    consumer_spirv, &consumer_rt, 0, SpirvShaderStage::Compute, false);
+            const SpirvDescriptorBinding* reflected_sample =
+                find_spirv_descriptor_binding(consumer_report, 0, sampled_lut.binding);
+            constexpr uint16_t OpImageSampleExplicitLod = 88;
+            const bool consumer_shape_ok = !consumer_spirv.empty() && consumer_report.ok() &&
+                reflected_sample &&
+                reflected_sample->kind == SpirvDescriptorKind::CombinedImageSampler &&
+                reflected_sample->image_dim == 2 && reflected_sample->sampled_float &&
+                reflected_sample->normalized_sampling &&
+                spirv_has_opcode(consumer_spirv, OpImageSampleExplicitLod);
+            CHECK(consumer_shape_ok,
+                  native_capability_present
+                      ? "native-capability arm retains explicit-LOD normalized 3D R11 sampling"
+                      : "portable arm retains explicit-LOD normalized 3D R11 sampling");
+            if (!consumer_shape_ok) return;
+
+            ComputeItem producer_item;
+            producer_item.spirv = producer_spirv;
+            producer_item.resources = std::make_shared<ShaderResourceTable>(producer_rt);
+            producer_item.dispatch_index = native_capability_present ? 218 : 118;
+            producer_item.command_order = 10;
+            producer_item.code_addr = native_capability_present ? 0x1790a118u : 0x1790b118u;
+            producer_item.launch.threads_x = LUT_W;
+            producer_item.launch.threads_y = LUT_H;
+            producer_item.launch.threads_z = LUT_D;
+            producer_item.launch.local_x = LUT_W;
+            producer_item.launch.local_y = LUT_H;
+            producer_item.launch.local_z = LUT_D;
+            producer_item.launch.groups_x = producer_item.launch.groups_y =
+                producer_item.launch.groups_z = 1;
+
+            ComputeItem consumer_item = producer_item;
+            consumer_item.spirv = consumer_spirv;
+            consumer_item.resources = std::make_shared<ShaderResourceTable>(consumer_rt);
+            consumer_item.dispatch_index = native_capability_present ? 219 : 119;
+            consumer_item.command_order = 20;
+            consumer_item.code_addr = native_capability_present ? 0x1790a119u : 0x1790b119u;
+
+            // Prime the sampled-image cache with the old guest LUT. The ordered run must still see
+            // the producer's new result; otherwise a first-use upload would accidentally make the
+            // test green without exercising same-submit invalidation/authority.
+            std::vector<uint32_t> warm_bits(LUT_TEXELS * 4u, 0xABABABABu);
+            ShaderResourceTable warm_rt = consumer_rt;
+            warm_rt.resources.back().gpu_addr = reinterpret_cast<uint64_t>(warm_bits.data());
+            ComputeItem warm_item = consumer_item;
+            warm_item.resources = std::make_shared<ShaderResourceTable>(warm_rt);
+            warm_item.dispatch_index += 1000;
+            warm_item.command_order = 1;
+            const bool warm_executed =
+                prosper::frontend::execute_live_compute_items({warm_item});
+            const uint32_t warm_expected[4] = {
+                float_bits(f11_to_float(static_cast<uint16_t>(sentinel_word))),
+                float_bits(f11_to_float(static_cast<uint16_t>(sentinel_word >> 11))),
+                float_bits(f10_to_float(static_cast<uint16_t>(sentinel_word >> 22))),
+                float_bits(1.0f),
+            };
+            size_t warm_mismatches = 0;
+            for (size_t texel = 0; texel < LUT_TEXELS; ++texel)
+                for (uint32_t channel = 0; channel < 4; ++channel)
+                    warm_mismatches += warm_bits[texel * 4 + channel] !=
+                                       warm_expected[channel];
+            CHECK(warm_executed && warm_mismatches == 0,
+                  native_capability_present
+                      ? "native-capability sampled cache primes from the old tiled R11 sentinel"
+                      : "portable sampled cache primes from the old tiled R11 sentinel");
+
+            std::array<uint32_t, 2> callback_dispatches = {UINT32_MAX, UINT32_MAX};
+            size_t callback_count = 0;
+            bool callbacks_ok = true;
+            const OrderedSubmitResult submit = execute_ordered_items(
+                {{SubmitOperationKind::Dispatch, producer_item.dispatch_index,
+                  producer_item.command_order},
+                 {SubmitOperationKind::Dispatch, consumer_item.dispatch_index,
+                  consumer_item.command_order}},
+                {}, {producer_item, consumer_item},
+                [](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                    return RenderedFrame{};
+                },
+                [&](const std::vector<ComputeItem>& items) {
+                    const bool singleton = items.size() == 1;
+                    if (callback_count < callback_dispatches.size() && singleton)
+                        callback_dispatches[callback_count] = items[0].dispatch_index;
+                    ++callback_count;
+                    const bool ok = singleton &&
+                        prosper::frontend::execute_live_compute_items(items);
+                    callbacks_ok &= ok;
+                    return ok;
+                },
+                1, 1);
+            CHECK(submit.compute_executed && callbacks_ok && callback_count == 2,
+                  native_capability_present
+                      ? "native-capability ordered submit executes both dispatches exactly once"
+                      : "portable ordered submit executes both dispatches exactly once");
+            CHECK(callback_dispatches[0] == producer_item.dispatch_index &&
+                      callback_dispatches[1] == consumer_item.dispatch_index,
+                  native_capability_present
+                      ? "native-capability submit preserves producer-before-consumer order"
+                      : "portable submit preserves producer-before-consumer order");
+
+            std::vector<uint32_t> produced_packed(LUT_TEXELS, 0xDEADBEEFu);
+            const bool produced_detiled = detile_volume(
+                reinterpret_cast<uint8_t*>(produced_packed.data()), lut_guest.data(),
+                lut_guest.size(), LUT_W, LUT_H, LUT_D, LUT_TILE, sizeof(uint32_t));
+            CHECK(produced_detiled,
+                  native_capability_present
+                      ? "native-capability producer detiles for direct packed-word census"
+                      : "portable producer detiles for direct packed-word census");
+            const uint32_t field_shift[3] = {0, 11, 22};
+            const uint32_t field_mask[3] = {0x7ffu, 0x7ffu, 0x3ffu};
+            std::array<size_t, 3> packed_channel_mismatches{};
+            size_t packed_mismatches = 0, packed_lower = 0, packed_higher = 0;
+            for (size_t texel = 0; produced_detiled && texel < LUT_TEXELS; ++texel) {
+                if (produced_packed[texel] == expected_packed[texel]) continue;
+                ++packed_mismatches;
+                for (uint32_t channel = 0; channel < 3; ++channel) {
+                    const uint32_t actual =
+                        (produced_packed[texel] >> field_shift[channel]) & field_mask[channel];
+                    const uint32_t expected =
+                        (expected_packed[texel] >> field_shift[channel]) & field_mask[channel];
+                    if (actual == expected) continue;
+                    ++packed_channel_mismatches[channel];
+                    packed_lower += actual < expected;
+                    packed_higher += actual > expected;
+                }
+                if (packed_mismatches <= 8) {
+                    const size_t xy = LUT_W * LUT_H;
+                    const uint32_t z = static_cast<uint32_t>(texel / xy);
+                    const uint32_t y = static_cast<uint32_t>((texel % xy) / LUT_W);
+                    const uint32_t x = static_cast<uint32_t>(texel % LUT_W);
+                    std::printf("  %s R11 producer packed diff xyz=(%u,%u,%u) expected=%08x "
+                                "actual=%08x xor=%08x\n", arm, x, y, z,
+                                expected_packed[texel], produced_packed[texel],
+                                expected_packed[texel] ^ produced_packed[texel]);
+                }
+            }
+
+            size_t sentinel_survivors = 0, mismatches = 0;
+            std::array<size_t, 4> output_channel_mismatches{};
+            size_t first_texel = SIZE_MAX;
+            uint32_t first_channel = UINT32_MAX;
+            for (size_t texel = 0; texel < LUT_TEXELS; ++texel) {
+                for (uint32_t channel = 0; channel < 4; ++channel) {
+                    const size_t index = texel * 4 + channel;
+                    sentinel_survivors += output_bits[index] == 0xCDCDCDCDu;
+                    if (output_bits[index] == expected_bits[index]) continue;
+                    if (first_texel == SIZE_MAX) {
+                        first_texel = texel;
+                        first_channel = channel;
+                    }
+                    ++output_channel_mismatches[channel];
+                    ++mismatches;
+                }
+            }
+            if (packed_mismatches || mismatches) {
+                std::printf("  %s R11 producer census: packed-texels=%zu/%zu channels=(%zu,%zu,%zu) "
+                            "lower=%zu higher=%zu\n", arm, packed_mismatches, LUT_TEXELS,
+                            packed_channel_mismatches[0], packed_channel_mismatches[1],
+                            packed_channel_mismatches[2], packed_lower, packed_higher);
+            }
+            if (mismatches) {
+                std::printf("  %s tiled R11 3D census: mismatches=%zu/%zu first-texel=%zu "
+                            "channel=%u channels=(%zu,%zu,%zu,%zu) expected=%08x actual=%08x "
+                            "sentinel-survivors=%zu\n",
+                            arm, mismatches, expected_bits.size(), first_texel, first_channel,
+                            output_channel_mismatches[0], output_channel_mismatches[1],
+                            output_channel_mismatches[2], output_channel_mismatches[3],
+                            expected_bits[first_texel * 4 + first_channel],
+                            output_bits[first_texel * 4 + first_channel], sentinel_survivors);
+            }
+            CHECK(sentinel_survivors == 0,
+                  native_capability_present
+                      ? "native-capability 3D consumer overwrites every output channel"
+                      : "portable 3D consumer overwrites every output channel");
+            CHECK(packed_mismatches == 0,
+                  native_capability_present
+                      ? "native-capability producer matches every packed R11 voxel"
+                      : "portable producer matches every packed R11 voxel");
+            CHECK(mismatches == 0,
+                  native_capability_present
+                      ? "native-capability exact R11 handoff matches every CPU f11/f10 voxel"
+                      : "portable exact R11 handoff matches every CPU f11/f10 voxel");
+        };
+
+        run_r11_volume_handoff(0, false);
+        run_r11_volume_handoff(
+            native_storage_3d_format_support_bit(DataFormat::Float10_11_11, 3),
+            true);
+    }
+
     // (b) PARTIAL store under a FULL grid (reviewer B1): a write-only 2D kernel that always stores to
     // row 0 (v5 hard-zero), dispatched over a W x 2 grid so covers_extent is TRUE while row 1 is never
     // written. The proof must detect the survivor, NOT fast-skip, and preserve row 1's prior content.
