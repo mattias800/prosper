@@ -48,7 +48,7 @@ closing bugs. Every title in the tested inventory has a long-lived tracker in th
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and the ASTRO BOT title screen render at native 3840×2160; the title is over-exposed, the world-map hub shows only its backdrop, and guest compute costs ~21× throughput (#1732) |
 | *The Forgotten City* | `PPSA03026` | Unreal Engine 4 | 🔬 Intermittent bring-up: one exact-master run rendered advancing native-4K logos and an autosave notice, while an immediate repeat stayed black; no title screen yet |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine | 🔬 Reaches the frame loop, but live rendering fails and fallback output is mostly black with corrupted horizontal bands |
-| *Tactics Ogre: Reborn* | `PPSA03839` | Custom | 🚧 Clean native-1080p title and opening in-engine story scene render; HEVC movies remain flat gray/green, and interactive gameplay is not yet reached |
+| *Tactics Ogre: Reborn* | `PPSA03839` | Custom | 🚧 A fresh-save route reaches the first tutorial battle and an interactive move command at native 1920×1080; several sprites and HUD elements render as solid blocks (#1913), and HEVC movies remain flat gray/green (#1903) |
 | *Little Nightmares III* | `PPSA05143` | Unreal Engine | 🔬 Starts graphics setup, then faults on a low-address read before presenting a frame |
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Boots and remains alive for the bounded test, but publishes no rendered frame |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 Loads the runtime and EOS module, then times out during initialization without presenting a frame |
@@ -985,18 +985,25 @@ Reusable input routes are documented in
   <img src="assets/screenshots/tactics-ogre-reborn-opening-scene.png" alt="Tactics Ogre: Reborn — opening in-engine story scene with a known bright, outlined central character sprite">
 </p>
 
+<p align="center">
+  <img src="assets/screenshots/tactics-ogre-reborn-gameplay.png" alt="Tactics Ogre: Reborn — first tutorial battle in the interactive move-selection state, with known sprite and HUD composition defects">
+</p>
+
 With a codec-enabled FFmpeg build, the custom-engine title decodes its HEVC startup movie and reaches
 a clean, legible title menu at native 1920×1080. A scripted fresh-save route enters New Game, completes
 the birthdate, tarot and patron setup, and outlasts the 117.8-second Chapter 1 movie. Its natural end at
-roughly 325 seconds continues into the opening in-engine story scene from roughly 330 seconds onward.
+roughly 325 seconds continues into the opening in-engine story scene, then the first tutorial battle.
+The tutorial appears at roughly 410 seconds and the game enters an interactive `Select destination`
+move command at roughly 415 seconds. Subsequent routed input produces the game's own `A unit occupies
+this tile` response, independently confirming that the battle command state consumes player input.
 
-This remains a rung-2 milestone: the post-movie scene is an event sequence, not verified interactive
-tactical gameplay. The room, lighting, character sprites, portraits and dialogue render, but the central
-sprite is unusually bright/outlined and develops obvious horizontal banding in later frames. The HEVC
-movies themselves still present as uniform gray or dark green fields while their overlays advance. Both
-images are direct, unmodified frontend captures from the normal full-cadence Vulkan renderer. Current
-route evidence is tracked in [#1892](https://github.com/mattias800/prosper/issues/1892), and the remaining
-movie-presentation defect in [#1903](https://github.com/mattias800/prosper/issues/1903).
+This is a rung-3 milestone, not a claim of general playability or visual correctness. The battlefield,
+water, movement grid, tutorial, turn order and most UI render with real GPU draws. Several character
+sprites remain flat coloured silhouettes, some unit cards have solid-colour backings, and the lower-left
+HUD contains an opaque black block and unrelated red diamond (#1913). The HEVC movies themselves still
+present as uniform gray or dark green fields while their overlays advance (#1903). All three images are
+direct, unmodified frontend captures from the normal full-cadence Vulkan renderer. Current route evidence
+is tracked in [#1892](https://github.com/mattias800/prosper/issues/1892).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
 
