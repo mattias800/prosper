@@ -9,7 +9,7 @@ and GPU captures are local diagnostics and are intentionally not committed.
 | Title | Revision | Visual milestone | Audio evidence |
 | --- | --- | --- | --- |
 | GRIS (`PPSA09804`) | 01.001.000 | Native 1920×1080 opening gameplay with scripted movement | CLEAN on current master over the first 35 seconds: `rms=0.0082`, `peak=0.1173`, duplicated grains 0.0% |
-| Sonic Origins (`PPSA05325`) | Complete Sonic Origins Plus 02.002.000 base+update, four DLC mounts | Black startup loop after two unresolved UI paths (#1905) | AudioOut2 port 17 runs, but guest PCM is zero while startup is blocked |
+| Sonic Origins (`PPSA05325`) | Complete Sonic Origins Plus 02.002.000 base+update, four DLC payloads with mount records | Black startup loop; root cause remains open (#1905) | AudioOut2 port 17 runs, but guest PCM remains zero in the black state |
 | Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | Native 1920×1080 tutorial combat with scripted progression | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
 
 ## Visual evidence
@@ -132,8 +132,9 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 
 | Hypothesis | Verdict and evidence | Source |
 |---|---|---|
-| `targetContentVersion: 02.001.000` proves the supplied directory is update-only or incomplete | **Falsified.** The assembled 02.002.000 directory identifies itself as Sonic Origins Plus, contains the base executable/content and all four classic RSDK games, and mounts four installed DLC packs. The target version is update lineage, not a directory-completeness flag. The two unresolved loose UI requests remain real, but they are a Prosper archive/update-overlay/path-resolution question (#1905), not grounds for rejecting the game dump. | #1905, tracker #1871, this doc |
-| A PS5 `launchActivity` Game Intent routes around the missing UI assets | **Falsified.** The update does declare `launchActivity` support and ship the classic RSDK files, and the guest genuinely receives and consumes an exact `TITLE_SONIC_1_CLASSIC` intent — its `activityId` property is read and recognized. It still requests both missing UI files before it will open `raw/retro/Sonic1u.rsdk`. The activity experiment narrows the blocker; it does not bypass it. Truthful default no-intent behaviour is preserved. | this doc |
+| `targetContentVersion: 02.001.000` proves the supplied directory is update-only or incomplete | **Falsified.** The assembled 02.002.000 directory identifies itself as Sonic Origins Plus, contains the base executable/content and all four classic RSDK games, and includes four installed DLC payloads with mount records. The target version is update lineage, not a directory-completeness flag. The two loose UI misses remain real, but they are not grounds for rejecting the game dump. | #1905, tracker #1871, this doc |
+| The two early `/app0/raw/ui/...` ENOENT results are a terminal archive, update-overlay, mount, or path-resolution blocker | **Falsified as the asserted startup blocker.** On current master, both failures are handled before entitlement enumeration; the guest then makes 142 successful APR resolve calls across 38 other unique UI, font, language, and audio paths without a fault. A later DLC mount cannot explain the earlier absolute base-app misses. The absent resources may still affect an individual visual if used conditionally, but the black-frame root cause remains open. | #1905, tracker #1871 |
+| A PS5 `launchActivity` Game Intent routes around the current black startup state | **Falsified.** The update declares `launchActivity` support and ships the classic RSDK files, and the guest genuinely receives and consumes an exact `TITLE_SONIC_1_CLASSIC` intent — its `activityId` property is read and recognized. It still remains black and does not open `raw/retro/Sonic1u.rsdk`. This proves the activity route is insufficient, not that the handled UI misses cause the black frame. Truthful default no-intent behaviour is preserved. | this doc, #1905 |
 
 ## Sonic Origins dump audit
 
@@ -152,20 +153,28 @@ originContentVersion: 01.000.000
 
 `targetContentVersion` describes the installed update's lineage. It must not be read as proof that
 the merged application directory contains no base title. The inventory contains Sonic 1, Sonic 2,
-Sonic 3 & Knuckles, and Sonic CD payloads plus four installed DLC mounts.
+Sonic 3 & Knuckles, and Sonic CD payloads plus four installed DLC payloads with mount records.
 
-With `PROSPER_FILELOG=1`, the complete unresolved-path set is:
+With `PROSPER_FILELOG=1`, the complete unresolved-path set in a bounded current-master CPU run is:
 
 ```text
-3 /app0/raw/ui/ui_startup.pac
-3 /app0/raw/ui/rpl_texture/ui_title_nocopy.dds
+/app0/raw/ui/ui_startup.pac
+/app0/raw/ui/rpl_texture/ui_title_nocopy.dds
 ```
 
-Neither path exists as a loose file under `PPSA05325-app0`. After those failures the game publishes
-black scanouts and its correctly initialized AudioOut2 buffers remain zero. Because the full game,
-update, and DLC are present, the next step is to identify whether Prosper is missing an archive lookup,
-update overlay, mount fallback, or path transformation. Do not alias another PAC/DDS or use a black
-frame as a success screenshot.
+Neither path exists as a loose file under `PPSA05325-app0`, but ENOENT is handled. Immediately after
+the second failure the guest successfully resolves `ui_resident.pac`, `ui_text_texture.pac`,
+`scalablefont.pac`, its CRI banks, every common-language PAC, and the bitmap font. The 35-second run
+records 148 successful resolve calls across 40 unique paths; 142 calls across 38 unique paths occur
+after the second miss, with no guest fault. Entitlement enumeration happens later, so the later
+entitlement/DLC-mount path cannot explain these earlier absolute `/app0/raw/...` requests; the trace
+does not establish that an archive or update overlay should have supplied them. Installed-DLC
+enumeration is independently incomplete in Prosper (#1909), but it is not this temporal cause.
+
+The game still publishes black scanouts and its correctly initialized AudioOut2 buffers remain zero.
+That root cause is open: the absent resources may still affect a visual if the guest uses them
+conditionally, but the trace does not support treating their handled absence as the startup blocker.
+Do not alias another PAC/DDS or use a black frame as a success screenshot.
 
 ### Game Intent activity audit
 
@@ -185,11 +194,13 @@ sceNpGameIntentReceiveIntent
 sceNpGameIntentGetPropertyValueString(..., "activityId", ..., 0x21)
 ```
 
-That route still requests `ui_startup.pac` and `ui_title_nocopy.dds` before it can transfer control to
-the classic runtime. A 30-second filtered trace never opens `raw/retro/Sonic1u.rsdk`; a 44-second
+That route still requests `ui_startup.pac` and `ui_title_nocopy.dds`, but those failures are handled
+and do not by themselves explain why control does not reach the classic runtime. A 30-second filtered
+trace never opens `raw/retro/Sonic1u.rsdk`; a 44-second
 native capture remains black after frame 1, and the active stereo float32 48 kHz port 17 capture is
-silent (`rms=0`). The activity experiment therefore narrows the unresolved-path blocker but does not change the
-compatibility result. Reproduce it with:
+silent (`rms=0`). The activity experiment therefore proves that the requested activity is not
+sufficient to escape the black state; it does not change the compatibility result or identify the
+black-frame cause. Reproduce it with:
 
 ```bash
 PROSPER_GAME_INTENT_ACTIVITY_ID=TITLE_SONIC_1_CLASSIC \
