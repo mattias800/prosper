@@ -588,6 +588,14 @@ Until those conditions hold, keep advancing the live failure frontier.
 One line per falsified hypothesis, the evidence that killed it, and the issue/PR. Extend this rather
 than re-deriving a dead answer at full cost.
 
+- **"A timeline submit with `dmas=0` contains no GDS counter reset."** False for timeline versions
+  through v9. The timeline derived its DMA census exclusively from `GpuState::dma_copies`, the
+  ordered-execution vector for address-backed copies. Immediate fills, rejected packets, and GDS
+  offset destinations never entered that vector, so Astro's reset packets were invisible even when
+  decoded and executed. Timeline v10 adds an execution-neutral raw `DMA_DATA` journal with the exact
+  PM4 order/operands/selectors plus an uncapped original count and explicit truncation flag. Older
+  retained timelines cannot answer reset-versus-dispatch ordering; recapture that question with v10.
+
 - **"Astro Bot's unbounded indirect dispatch (#1742) is caused by the dropped GDS counter resets."**
   False, and measured rather than argued. The guest does reset GDS counters with `DMA_DATA` packets
   whose destination selector names a GDS offset, and prosper *was* discarding every one of them —

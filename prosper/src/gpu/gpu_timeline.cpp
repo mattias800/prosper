@@ -37,12 +37,15 @@ namespace {
 
 constexpr uint8_t kFileMagic[8] = {'P', 'R', 'G', 'T', 'L', 'N', '\0', '\0'};
 constexpr uint8_t kRecordMagic[4] = {'T', 'L', 'R', 'C'};
-constexpr uint32_t kVersion = 9;
+constexpr uint32_t kVersion = 10;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint32_t kMaxPayloadBytes = 1u << 20;
 constexpr uint32_t kFlushInterval = 256;
 constexpr uint32_t kMaxTargetSpans = 16384;
 constexpr uint32_t kMaxDmaCopies = 16384;
+// Raw and address-copy records are both 40 bytes. This cap lets their two journals coexist within
+// the 1 MiB per-record envelope; any additional raw packets remain visible through count/truncation.
+constexpr uint32_t kMaxDmaDataRecords = 8192;
 
 enum class RecordType : uint32_t { Metadata = 1, Submit = 2, Present = 3, Detail = 4, Producer = 5 };
 
@@ -158,6 +161,14 @@ const char* env_or_empty(const char* name) {
 }
 
 std::atomic<uint64_t> g_active_submit_no{0};
+
+bool gpu_timeline_requested() {
+    static const bool requested = [] {
+        const char* path = std::getenv("PROSPER_GPU_TIMELINE");
+        return path && *path;
+    }();
+    return requested;
+}
 
 struct RuntimeRecorder {
     std::mutex mutex;
@@ -1258,6 +1269,15 @@ bool GpuTimelineWriter::append_submit(const GpuTimelineSubmit& submit, std::stri
         error = "timeline submit has invalid ordered DMA records";
         return false;
     }
+    if (submit.dma_data_records.size() > kMaxDmaDataRecords ||
+        submit.dma_data_count < submit.dma_data_records.size() ||
+        (!submit.dma_data_records_truncated &&
+         submit.dma_data_count != submit.dma_data_records.size()) ||
+        (submit.dma_data_records_truncated &&
+         submit.dma_data_count <= submit.dma_data_records.size())) {
+        error = "timeline submit has invalid raw DMA_DATA journal";
+        return false;
+    }
     Bytes payload;
     payload.u64(submit.submit_no);
     payload.u64(submit.process_command_order);
@@ -1272,7 +1292,8 @@ bool GpuTimelineWriter::append_submit(const GpuTimelineSubmit& submit, std::stri
     // after the v6 target-span suffix, leaving the complete v1-v7 prefix byte-compatible.
     if (!submit.depth_surfaces.empty() || !submit.target_spans.empty() ||
         submit.target_spans_truncated || submit.dma_copy_count || submit.capture_incomplete ||
-        !submit.dma_copies.empty()) {
+        !submit.dma_copies.empty() || submit.dma_data_count ||
+        !submit.dma_data_records.empty() || submit.dma_data_records_truncated) {
         payload.u32(submit.dma_copy_count);
         payload.u32(submit.capture_incomplete ? 1u : 0u);
         payload.u32(static_cast<uint32_t>(submit.depth_surfaces.size()));
@@ -1307,6 +1328,17 @@ bool GpuTimelineWriter::append_submit(const GpuTimelineSubmit& submit, std::stri
             payload.u64(copy.dst); payload.u64(copy.src); payload.u32(copy.bytes);
             payload.u32(copy.sels); payload.u64(copy.command_order);
             payload.u64(copy.packet_addr);
+        }
+        // v10 appends the raw DMA_DATA census after the v8 address-copy records. `count` is
+        // uncapped while the retained vector is bounded, so an absent packet and a truncated
+        // instrument can never produce the same evidence.
+        payload.u64(submit.dma_data_count);
+        payload.u32(submit.dma_data_records_truncated ? 1u : 0u);
+        payload.u32(static_cast<uint32_t>(submit.dma_data_records.size()));
+        for (const auto& record : submit.dma_data_records) {
+            payload.u64(record.dst); payload.u64(record.src); payload.u32(record.bytes);
+            payload.u32(record.sels); payload.u64(record.command_order);
+            payload.u64(record.packet_addr);
         }
     }
     return impl_->append(RecordType::Submit, payload, error);
@@ -1579,6 +1611,27 @@ bool read_gpu_timeline(const std::string& path, GpuTimelineFile& timeline, std::
                     }
                 }
             }
+            if (version >= 10 && have_submit_tail) {
+                uint32_t truncated = 0, retained_count = 0;
+                if (!p.u64(submit.dma_data_count) || !p.u32(truncated) || truncated > 1 ||
+                    !p.u32(retained_count) || retained_count > kMaxDmaDataRecords ||
+                    submit.dma_data_count < retained_count ||
+                    (!truncated && submit.dma_data_count != retained_count) ||
+                    (truncated && submit.dma_data_count <= retained_count)) {
+                    error = "invalid timeline raw DMA_DATA journal metadata";
+                    return false;
+                }
+                submit.dma_data_records_truncated = truncated != 0;
+                submit.dma_data_records.resize(retained_count);
+                for (auto& record : submit.dma_data_records) {
+                    if (!p.u64(record.dst) || !p.u64(record.src) || !p.u32(record.bytes) ||
+                        !p.u32(record.sels) || !p.u64(record.command_order) ||
+                        !p.u64(record.packet_addr)) {
+                        error = "invalid timeline raw DMA_DATA journal record";
+                        return false;
+                    }
+                }
+            }
             if (p.left) {
                 error = "invalid timeline submit record size";
                 return false;
@@ -1802,12 +1855,10 @@ void log_timeline_mrt_draw(const GpuState& draw_state, uint64_t submit_no,
     std::fputc('\n', stderr);
 }
 
-void begin_gpu_timeline_submit(uint64_t submit_no) {
-    static const bool requested = [] {
-        const char* path = std::getenv("PROSPER_GPU_TIMELINE");
-        return path && *path;
-    }();
+bool begin_gpu_timeline_submit(uint64_t submit_no) {
+    const bool requested = gpu_timeline_requested();
     if (requested) g_active_submit_no.store(submit_no, std::memory_order_release);
+    return requested;
 }
 
 // ---- Interactive frame-bundle capture (prosper-app F9) ---------------------------------------------
@@ -2176,11 +2227,7 @@ bool take_interactive_grab_outcome(InteractiveGrabOutcome& out) {
 
 void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     interactive_frame_bundle_on_submit(state, submit_no);
-    static const bool requested = [] {
-        const char* path = std::getenv("PROSPER_GPU_TIMELINE");
-        return path && *path;
-    }();
-    if (!requested) return;
+    if (!gpu_timeline_requested()) return;
     GpuTimelineWriter* writer = runtime_recorder().get();
     if (!writer) return;
     GpuTimelineSubmit submit;
@@ -2194,6 +2241,12 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     for (const auto& copy : state.dma_copies)
         submit.dma_copies.push_back({copy.dst, copy.src, copy.bytes, copy.sels,
                                      copy.command_order, copy.packet_addr});
+    submit.dma_data_count = state.dma_data_record_count;
+    submit.dma_data_records_truncated = state.dma_data_records_truncated;
+    submit.dma_data_records.reserve(state.dma_data_records.size());
+    for (const auto& record : state.dma_data_records)
+        submit.dma_data_records.push_back({record.dst, record.src, record.bytes, record.sels,
+                                           record.command_order, record.packet_addr});
     submit.capture_incomplete = false;
     submit.first_command_order = std::numeric_limits<uint64_t>::max();
     const bool log_mrt = select_timeline_mrt_submit(state, submit_no);
@@ -2299,6 +2352,10 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
         submit.last_command_order = std::max(submit.last_command_order, dispatch.command_order);
     }
     for (const auto& dma : state.dma_copies) {
+        submit.first_command_order = std::min(submit.first_command_order, dma.command_order);
+        submit.last_command_order = std::max(submit.last_command_order, dma.command_order);
+    }
+    for (const auto& dma : state.dma_data_records) {
         submit.first_command_order = std::min(submit.first_command_order, dma.command_order);
         submit.last_command_order = std::max(submit.last_command_order, dma.command_order);
     }

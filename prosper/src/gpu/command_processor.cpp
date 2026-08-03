@@ -2988,6 +2988,24 @@ void GpuState::apply(const Pm4Command& c) {
             if (eop_write_sync()) honor_event_write(c); else pend_enqueue(c);
             break;
         case K::DmaData:
+            // Journal every raw DMA_DATA form before execution classification. The ordered executor
+            // retains only address-backed copies, so deriving a DMA census from `dma_copies` made
+            // immediate fills (including Astro Bot's GDS resets) disappear from timelines entirely.
+            // This record is observation-only: the existing completion/ordered execution paths below
+            // are deliberately unchanged.
+            if (capture_dma_data_records) {
+                if (dma_data_record_count != UINT64_MAX) {
+                    ++dma_data_record_count;
+                } else {
+                    dma_data_records_truncated = true;
+                }
+                if (dma_data_records.size() < kMaxDmaDataRecords) {
+                    dma_data_records.push_back({c.dd_dst, c.dd_src, c.dd_bytes, c.dd_sels,
+                                                command_order, pkt_addr(c)});
+                } else {
+                    dma_data_records_truncated = true;
+                }
+            }
             // Address-backed copies are ordinary in-stream producers: retain them beside draws and
             // dispatches so the ordered executor exposes old bytes to earlier consumers and copied
             // bytes to later consumers (#189). Immediate fills keep their established completion-

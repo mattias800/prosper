@@ -117,6 +117,26 @@ struct GpuState {
         uint64_t packet_addr = 0;
     };
     std::vector<DmaCopy> dma_copies;
+    // Raw, execution-neutral DMA_DATA journal. `dma_copies` above contains only address-backed
+    // operations retained by the ordered executor; immediate fills and rejected forms still matter
+    // to diagnostics, especially GDS counter resets whose destination is an offset rather than a
+    // guest address. Keep the raw operands/selectors and PM4 identity without claiming the packet
+    // executed. The bounded/truncated contract makes a zero count and an overfull submit distinct.
+    struct DmaDataRecord {
+        uint64_t dst = 0, src = 0;
+        uint32_t bytes = 0, sels = 0;
+        uint64_t command_order = 0;
+        uint64_t packet_addr = 0;
+    };
+    // At 40 bytes each, 8192 records leave room in the timeline's 1 MiB submit payload for the
+    // existing maximum address-copy journal. The original count remains uncapped below.
+    static constexpr size_t kMaxDmaDataRecords = 8192;
+    // Set once per submit from begin_gpu_timeline_submit(). Ordinary gameplay leaves this false,
+    // so DMA_DATA decode performs no count, allocation, or record writes for the diagnostic.
+    bool capture_dma_data_records = false;
+    std::vector<DmaDataRecord> dma_data_records;
+    uint64_t dma_data_record_count = 0;
+    bool dma_data_records_truncated = false;
     // StallCommandBufferParser is the visibility boundary between argument producers and later
     // indirect consumers. Retain it in the ordered timeline: folding it away loses the only proof
     // that a failed compute/DMA producer must poison the dependent indirect packet.

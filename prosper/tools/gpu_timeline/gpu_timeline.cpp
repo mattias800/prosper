@@ -267,7 +267,9 @@ int main(int argc, char** argv) {
                     continue;
                 const std::string signature = "draws=" + std::to_string(submit.draw_count) +
                     " dispatches=" + std::to_string(submit.dispatch_count) +
-                    " dmas=" + std::to_string(submit.dma_copy_count) +
+                    " dmas=" + std::to_string(timeline.version >= 10
+                                                   ? submit.dma_data_count
+                                                   : submit.dma_copy_count) +
                     " capture=" + (submit.capture_incomplete ? "incomplete" : "complete") +
                     " targets=" + target_signature(submit);
                 Stats& stats = grouped[signature];
@@ -329,13 +331,16 @@ int main(int argc, char** argv) {
         return matches ? 0 : 1;
     }
 
-    uint64_t last_ns = 0, draws = 0, dispatches = 0, dmas = 0, incomplete = 0;
+    uint64_t last_ns = 0, draws = 0, dispatches = 0, dmas = 0, dma_copies = 0;
+    uint64_t incomplete = 0, dma_journals_truncated = 0;
     std::map<std::pair<uint32_t, uint32_t>, uint64_t> target_extents;
     for (const auto& submit : timeline.submits) {
         last_ns = std::max(last_ns, submit.elapsed_ns);
         draws += submit.draw_count;
         dispatches += submit.dispatch_count;
-        dmas += submit.dma_copy_count;
+        dmas += timeline.version >= 10 ? submit.dma_data_count : submit.dma_copy_count;
+        dma_copies += submit.dma_copy_count;
+        dma_journals_truncated += submit.dma_data_records_truncated;
         incomplete += submit.capture_incomplete;
         if (submit.color0_width && submit.color0_height)
             target_extents[{submit.color0_width, submit.color0_height}]++;
@@ -346,11 +351,15 @@ int main(int argc, char** argv) {
                 timeline.version, timeline.metadata.revision.c_str(), timeline.metadata.title_id.c_str(),
                 timeline.metadata.input_route.c_str());
     std::printf("duration=%.3fs submits=%zu presents=%zu details=%zu producers=%zu "
-                "draws=%llu dispatches=%llu dmas=%llu capture_incomplete=%llu truncated_tail=%s\n",
+                "draws=%llu dispatches=%llu dmas=%llu dma_copies=%llu "
+                "dma_journals_truncated=%llu capture_incomplete=%llu truncated_tail=%s\n",
                 seconds, timeline.submits.size(), timeline.presents.size(), timeline.details.size(),
                 timeline.producers.size(),
                 static_cast<unsigned long long>(draws), static_cast<unsigned long long>(dispatches),
-                static_cast<unsigned long long>(dmas), static_cast<unsigned long long>(incomplete),
+                static_cast<unsigned long long>(dmas),
+                static_cast<unsigned long long>(dma_copies),
+                static_cast<unsigned long long>(dma_journals_truncated),
+                static_cast<unsigned long long>(incomplete),
                 timeline.truncated_tail ? "yes" : "no");
     if (seconds > 0)
         std::printf("rates submits=%.1f/s presents=%.1f/s\n",
@@ -411,21 +420,35 @@ int main(int argc, char** argv) {
             const uint64_t xs = xi < timeline.producers.size() ? timeline.producers[xi].sequence : UINT64_MAX;
             if (ss <= ps && ss <= ds && ss <= xs) {
                 const auto& s = timeline.submits[si++];
-                std::printf("%llu %.6f submit=%llu draws=%u dispatches=%u dmas=%u capture=%s "
+                const uint64_t dma_count = timeline.version >= 10
+                    ? s.dma_data_count : s.dma_copy_count;
+                std::printf("%llu %.6f submit=%llu draws=%u dispatches=%u dmas=%llu "
+                            "dma-copies=%u dma-journal=%s capture=%s "
                             "order=%llu..%llu target=%016llx/%ux%u\n",
                             static_cast<unsigned long long>(s.sequence), s.elapsed_ns / 1e9,
                             static_cast<unsigned long long>(s.submit_no), s.draw_count, s.dispatch_count,
-                            s.dma_copy_count, s.capture_incomplete ? "incomplete" : "complete",
+                            static_cast<unsigned long long>(dma_count), s.dma_copy_count,
+                            timeline.version < 10 ? "unavailable" :
+                                (s.dma_data_records_truncated ? "truncated" : "complete"),
+                            s.capture_incomplete ? "incomplete" : "complete",
                             static_cast<unsigned long long>(s.first_command_order),
                             static_cast<unsigned long long>(s.last_command_order),
                             static_cast<unsigned long long>(s.color0_base),
                             s.color0_width, s.color0_height);
                 for (const auto& copy : s.dma_copies)
-                    std::printf("  dma order=%llu src=%016llx dst=%016llx bytes=%u sels=%08x packet=%016llx\n",
+                    std::printf("  dma-copy order=%llu src=%016llx dst=%016llx bytes=%u sels=%08x packet=%016llx\n",
                                 static_cast<unsigned long long>(copy.command_order),
                                 static_cast<unsigned long long>(copy.src),
                                 static_cast<unsigned long long>(copy.dst), copy.bytes, copy.sels,
                                 static_cast<unsigned long long>(copy.packet_addr));
+                for (const auto& record : s.dma_data_records)
+                    std::printf("  dma-data order=%llu src=%016llx dst=%016llx bytes=%u "
+                                "dst-sel=%02x src-sel=%02x sels=%08x packet=%016llx\n",
+                                static_cast<unsigned long long>(record.command_order),
+                                static_cast<unsigned long long>(record.src),
+                                static_cast<unsigned long long>(record.dst), record.bytes,
+                                record.sels & 0xffu, (record.sels >> 8) & 0xffu, record.sels,
+                                static_cast<unsigned long long>(record.packet_addr));
                 for (const auto& depth : s.depth_surfaces)
                     std::printf("  depth z=%016llx/%016llx s=%016llx/%016llx htile=%016llx "
                                 "target=%ux%u draws=%u tests=%u writes=%u clears=%u compare-mask=%08x\n",

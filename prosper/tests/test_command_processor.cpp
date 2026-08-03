@@ -7,8 +7,11 @@
 #include "../src/hle/nid.hpp"
 #include "../src/gpu/command_processor.hpp"
 #include "../src/gpu/gpu_execute.hpp"
+#include "../src/gpu/gpu_timeline.hpp"
+#include "../src/gpu/pm4_decode.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 
@@ -18,6 +21,11 @@ using namespace prosper::gpu;
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
+
+static uint32_t PM4(uint32_t len, uint32_t op, uint32_t reason) {
+    return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) |
+           ((reason & (R_NUM - 1u)) << 2u);
+}
 
 struct Dcb {   // mirror of hle_agc.cpp's AgcDcb
     uint32_t* bottom; uint32_t* top; uint32_t* cursor_up; uint32_t* cursor_down;
@@ -447,6 +455,64 @@ int main() {
                   cs.dispatches[0].command_order < cs.dispatches[1].command_order,
                   "dispatches retain monotonic PM4 stream order");
         }
+    }
+
+    // A raw DMA_DATA census must not be inferred from `dma_copies`: that execution vector contains
+    // address-backed copies only. The journal is diagnostic work and must also remain completely
+    // dormant in ordinary gameplay. These two arms prove both halves independently: forcing the gate
+    // open makes the disabled check fail, while forcing it closed makes the enabled checks fail.
+    {
+        uint32_t stream[26] = {};
+        stream[0] = PM4(6, IT_NOP, R_DISPATCH_DIRECT);
+        stream[1] = stream[2] = stream[3] = 1;
+        stream[6] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[7] = 0xc70; stream[8] = 0;       // raw GDS offset destination
+        stream[9] = 0;     stream[10] = 0;      // immediate zero
+        stream[11] = 4;    stream[12] = 1;      // dst selector 1: GDS
+        stream[13] = PM4(6, IT_NOP, R_DISPATCH_DIRECT);
+        stream[14] = stream[15] = stream[16] = 1;
+        stream[19] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[20] = 0x44; stream[21] = 0;      // invalid low memory destination
+        stream[22] = 0;    stream[23] = 0;
+        stream[24] = 4;    stream[25] = 3;      // ordinary memory selector
+
+        // PROSPER_GPU_TIMELINE is intentionally absent in this executable. Feed the runtime gate to
+        // a normal submit state exactly as hle_agc does, then prove decode performs no record work.
+#ifdef _WIN32
+        _putenv_s("PROSPER_GPU_TIMELINE", "");
+#else
+        unsetenv("PROSPER_GPU_TIMELINE");
+#endif
+        GpuState ordinary;
+        ordinary.capture_dma_data_records = begin_gpu_timeline_submit(1);
+        const size_t ordinary_applied = run_command_buffer(stream, 26, ordinary);
+        CHECK(ordinary_applied == 4 && !ordinary.capture_dma_data_records &&
+                  ordinary.dma_data_record_count == 0 && ordinary.dma_data_records.empty() &&
+                  !ordinary.dma_data_records_truncated,
+              "absent PROSPER_GPU_TIMELINE performs zero raw DMA_DATA journal writes");
+
+        GpuState journal;
+        journal.capture_dma_data_records = true;
+        const size_t applied = run_command_buffer(stream, 26, journal);
+        CHECK(applied == 4 && journal.dma_data_record_count == 2 &&
+                  journal.dma_data_records.size() == 2 &&
+                  !journal.dma_data_records_truncated,
+              "enabled raw DMA_DATA journal includes GDS-immediate and rejected packets before execution");
+        CHECK(journal.dispatches.size() == 2 && journal.dma_data_records.size() == 2 &&
+                  journal.dispatches[0].command_order <
+                      journal.dma_data_records[0].command_order &&
+                  journal.dma_data_records[0].command_order <
+                      journal.dispatches[1].command_order &&
+                  journal.dma_data_records[0].dst == 0xc70 &&
+                  journal.dma_data_records[0].src == 0 &&
+                  journal.dma_data_records[0].bytes == 4 &&
+                  journal.dma_data_records[0].sels == 1 &&
+                  journal.dma_data_records[0].packet_addr ==
+                      reinterpret_cast<uint64_t>(&stream[6]) &&
+                  journal.dma_data_records[1].dst == 0x44 &&
+                  journal.dma_data_records[1].sels == 3,
+              "raw DMA_DATA journal preserves exact PM4 order, operands, selectors, and packet identity");
+        prosper_gpu_drain_completion_writes();
     }
 
     // The decoder also accepts the older three-dimension custom packet used by focused tools. With

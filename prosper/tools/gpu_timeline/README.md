@@ -75,7 +75,10 @@ semantics, draw isolation, resource/shader extraction, and the distinction betwe
 
 The summary reports duration, submit/present/draw/dispatch counts, rates, target extents, and whether
 an incomplete final record was discarded. `--records` prints the globally ordered submit/present
-index, v6 target spans, and exact v8 ordered DMA records. `--signatures DRAWS DISPATCHES` groups target-span sequences for candidate
+index, v6 target spans, v8 address-backed DMA execution records, and the v10 raw `DMA_DATA` journal.
+The raw journal includes immediate fills, GDS-offset destinations, and rejected forms without
+claiming they executed; its uncapped original count and explicit truncation flag distinguish a true
+absence from an exhausted instrument. `--signatures DRAWS DISPATCHES` groups target-span sequences for candidate
 submit-count ranges; each range accepts `N` or `MIN:MAX`. `--select WxH DRAW_INDEX DRAWS DISPATCHES` applies
 the same semantic predicate as live capture, reports its first/last match and total, and exits nonzero when no
 submit matches. It reports an inconclusive error instead of treating a truncated target signature as a negative.
@@ -109,8 +112,19 @@ positive and nearby negative `.prgtl` samples when timing can move the endpoint.
 
 ## Current boundary
 
+Version 10 reads version-1 through version-9 indexes. It appends a bounded raw journal of every
+decoded `DMA_DATA` packet before execution classification: source/destination operands, byte count,
+raw selectors, PM4 command order, and packet address. This closes the v8 blind spot where only
+address-backed copies appeared, so a submit containing only an immediate GDS counter reset reported
+`dmas=0`. Journal entries are observations, not success claims; compare them with execution logs or
+the ordered backend before concluding that a packet landed.
+Collection is gated at submit/decode time by `PROSPER_GPU_TIMELINE`; without it, ordinary gameplay
+performs no raw-journal count, allocation, or record writes. The journal is not collected retroactively,
+so a run started without compact timeline recording cannot acquire these records later.
+
 Version 8 reads version-1 through version-7 indexes. It appends exact ordered `DMA_DATA` records to each
-submit: source and destination guest identities, byte count, selectors, PM4 command order, and packet address.
+submit for the address-backed copy form: source and destination guest identities, byte count,
+selectors, PM4 command order, and packet address.
 Older indexes retain their historical count/incomplete signal and do not invent individual DMA operations.
 Detailed current-version capture v14 also closes both DMA endpoint ranges into content-addressed blobs so
 standalone replay can execute draw-to-DMA-to-draw or DMA-to-compute sequences at their original order.
