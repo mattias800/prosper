@@ -671,10 +671,19 @@ int main() {
         if (addr == buffer.gpu_addr && size == buffer.size)
             ++cpu_fill_write_notifications;
     });
+    std::vector<ComputeAuthorityBoundary> cpu_fill_authority_boundaries;
+    bool cpu_fill_boundary_preceded_write = false;
+    set_compute_authority_boundary_observer(
+        [&](const ComputeAuthorityBoundary& boundary) {
+            cpu_fill_authority_boundaries.push_back(boundary);
+            cpu_fill_boundary_preceded_write = !result.empty() &&
+                result.front() == 0xddddddddu;
+        });
     const uint64_t cpu_fills_before =
         prosper::frontend::live_compute_cpu_fill_dispatches();
     CHECK(prosper::frontend::execute_live_compute_items({cpu_fill_item}),
           "exact buffer-fill program executes through the CPU fast path");
+    set_compute_authority_boundary_observer({});
     set_guest_gpu_write_observer({});
     bool cpu_fill_matches = true;
     for (uint32_t record = 0; record < records && cpu_fill_matches; ++record)
@@ -687,7 +696,13 @@ int main() {
     CHECK(cpu_fill_matches && cpu_fill_padding_untouched &&
               cpu_fill_write_notifications == 1 &&
               prosper::frontend::live_compute_cpu_fill_dispatches() ==
-                  cpu_fills_before + 1,
+                  cpu_fills_before + 1 && cpu_fill_boundary_preceded_write &&
+              cpu_fill_authority_boundaries.size() == 1 &&
+              cpu_fill_authority_boundaries[0].kind ==
+                  ComputeAuthorityBoundaryKind::Compute &&
+              cpu_fill_authority_boundaries[0].range_known &&
+              cpu_fill_authority_boundaries[0].address == buffer.gpu_addr &&
+              cpu_fill_authority_boundaries[0].bytes == records * 16u,
           "CPU fill matches Vulkan, preserves padded lanes, and invalidates the declared range");
 
     ShaderResourceTable narrow_stride_rt = rt;
@@ -2242,8 +2257,19 @@ int main() {
         unsupported_tiled_item.launch.local_y = unsupported_tiled_item.launch.local_z = 1;
         unsupported_tiled_item.launch.groups_y = unsupported_tiled_item.launch.groups_z = 1;
         unsupported_tiled_item.code_addr = 0x590594;
-        CHECK(!prosper::frontend::execute_live_compute_items({unsupported_tiled_item}),
-              "unknown nonzero tile mode is rejected before storage writeback");
+        std::vector<ComputeAuthorityBoundary> failed_compute_boundaries;
+        set_compute_authority_boundary_observer(
+            [&](const ComputeAuthorityBoundary& boundary) {
+                failed_compute_boundaries.push_back(boundary);
+            });
+        const bool unsupported_executed =
+            prosper::frontend::execute_live_compute_items({unsupported_tiled_item});
+        set_compute_authority_boundary_observer({});
+        CHECK(!unsupported_executed && failed_compute_boundaries.size() == 1 &&
+                  failed_compute_boundaries[0].kind ==
+                      ComputeAuthorityBoundaryKind::Compute &&
+                  !failed_compute_boundaries[0].range_known,
+              "failed live compute emits one fail-closed boundary before returning false");
     }
 
     // A renderer-owned color target is newer than its guest backing. Recompile the same copy kernel
