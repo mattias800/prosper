@@ -66,6 +66,16 @@ entry can define:
 - `min_content_match_ratio`: fraction of all evidence-window frames that must
   meet both structural and non-black contracts; defaults to `0.75`. This keeps
   a few good frames from hiding an intermittently broken renderer.
+- `min_consecutive_content_matches`: alternative for a phase-variable checkpoint
+  inside a broad boot profile. It requires this many adjacent frames to jointly
+  satisfy colour, SSIM, non-black coverage, and dimensions, so scattered matches
+  from an intro or attract loop cannot add up to a pass. It is mutually exclusive
+  with `min_content_match_ratio`; all existing ratio guards retain their original
+  semantics. This mode needs existing reviewed `structural_references` to seed
+  plateau identification. `verify` first finds each run's plateau against that
+  seed, then requires A-plateau-only references to pass run B and B-plateau-only
+  references to pass run A before it can produce an adoptable candidate. Saved
+  review and candidate references come only from those identified plateaus.
 - `min_nonblack_ratio`: conservative coverage floor generated during baseline
   approval at half the lowest reviewed coverage. It rejects blank output
   without requiring a normally dark game to be bright.
@@ -170,6 +180,13 @@ above the threshold across animation phases, whereas a window straddling a load
 or transition makes the guard fail on healthy frames. Confirm the margin rather
 than assuming it — for `alexkidd-gameplay` the worst of 100 reviewed frames
 scores 0.93 against the reviewed references, against a 0.85 floor.
+
+For a checkpoint whose absolute wall-clock phase moves but whose intended state
+holds, profile the whole bounded boot and use `min_consecutive_content_matches`
+rather than narrowing the window until it happens to fit one run. The required
+run must have real margin in both independent profiles. Explicit intro/menu/
+attract negative controls still have to be scored offline; a consecutive count
+does not identify the intended scene by itself.
 
 ## Environment
 

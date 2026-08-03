@@ -344,8 +344,30 @@ def structural_similarity(left, right):
         ((2 * mean_left * mean_right + c1) * (2 * covariance + c2)) / denominator))
 
 
+def validate_content_entry(entry):
+    """Reject ambiguous or unusable content-guard configurations before capture."""
+    has_ratio = "min_content_match_ratio" in entry
+    has_consecutive = "min_consecutive_content_matches" in entry
+    if has_ratio and has_consecutive:
+        raise ValueError(
+            "min_content_match_ratio and min_consecutive_content_matches are mutually exclusive")
+    if has_ratio:
+        ratio = float(entry["min_content_match_ratio"])
+        if not 0 <= ratio <= 1:
+            raise ValueError(f"min_content_match_ratio {ratio} is outside [0, 1]")
+    if has_consecutive:
+        required = int(entry["min_consecutive_content_matches"])
+        if required <= 0:
+            raise ValueError("min_consecutive_content_matches must be positive")
+        if not entry.get("structural_references"):
+            raise ValueError(
+                "min_consecutive_content_matches requires existing structural_references "
+                "to seed plateau identification")
+
+
 def analyze_content_manifest(tmp, entry):
     """Measure presented screenshots in the configured evidence window."""
+    validate_content_entry(entry)
     after = float(entry.get("capture_after_seconds", 0))
     before = entry.get("capture_before_seconds")
     before = float(before) if before is not None else None
@@ -365,7 +387,8 @@ def analyze_content_manifest(tmp, entry):
 
     required_source = entry.get("capture_source", "composited")
     records = []
-    for sample in (e for e in events if e.get("type") == "sample"):
+    samples = [event for event in events if event.get("type") == "sample"]
+    for sample_ordinal, sample in enumerate(samples):
         elapsed = float(sample.get("elapsed_seconds", -1))
         if elapsed < after or (before is not None and elapsed > before):
             continue
@@ -385,7 +408,9 @@ def analyze_content_manifest(tmp, entry):
         if dims[0] <= 0 or dims[1] <= 0:
             raise RuntimeError(f"manifest screenshot has invalid dimensions: {dims}")
         records.append({
-            "index": int(sample.get("index", len(records))),
+            # Current manifests carry the sampler's index. The ordinal fallback preserves
+            # gaps when an older manifest's interspersed source is filtered out.
+            "index": int(sample.get("index", sample_ordinal)),
             "path": path, "filename": os.path.basename(path), "elapsed": elapsed,
             "colors": int(sample["distinct_rgb_colors"]), "dims": dims,
             "hash": str(sample["pixel_crc32"]), "source": sample.get("source"),
@@ -419,7 +444,7 @@ def analyze_content_manifest(tmp, entry):
             similarities.append(similarity)
     minimum_similarity = float(entry.get("min_structural_similarity", 0.85))
     minimum_coverage = float(entry.get("min_nonblack_ratio", 0))
-    return {
+    summary = {
         "records": records,
         "qualifying": qualifying,
         "richest": richest,
@@ -431,6 +456,8 @@ def analyze_content_manifest(tmp, entry):
         "nonblack_matches": sum(record["nonblack_ratio"] >= minimum_coverage
                                 for record in records),
     }
+    summary["longest_content_run"] = longest_content_run(entry, records)
+    return summary
 
 
 def choose_review_records(summary, count=8):
@@ -449,14 +476,89 @@ def choose_review_records(summary, count=8):
     return sorted({r["path"]: r for r in selected}.values(), key=lambda r: r["elapsed"])
 
 
+def longest_content_run(entry, records, reference_signatures=None, include_structural=True):
+    """Return the longest adjacent run satisfying the complete content contract.
+
+    A broad boot profile can contain logos, an intro, the intended checkpoint, and an
+    attract loop. Counting matches across that whole profile is not enough: unrelated
+    phases can contribute isolated matches. This helper deliberately keeps order and
+    requires one sustained run in the intended state.
+
+    reference_signatures overrides the entry's stored references for cross-run scoring.
+    """
+    expected_dims = tuple(entry["dims"]) if entry.get("dims") else None
+    minimum_similarity = float(entry.get("min_structural_similarity", 0.85))
+    minimum_coverage = entry.get("min_nonblack_ratio")
+    minimum_coverage = float(minimum_coverage) if minimum_coverage is not None else None
+
+    if reference_signatures is None and include_structural:
+        reference_signatures = [
+            decode_luma16x9(reference["luma16x9"])
+            for reference in entry.get("structural_references", [])
+        ]
+
+    best = []
+    current = []
+    for record in records:
+        if current and record.get("index") != current[-1].get("index", -2) + 1:
+            current = []
+        matches = record["colors"] >= int(entry["min_colors"])
+        matches = matches and (expected_dims is None or record["dims"] == expected_dims)
+        if minimum_coverage is not None:
+            matches = matches and record["nonblack_ratio"] >= minimum_coverage
+        if include_structural:
+            if not reference_signatures:
+                matches = False
+            else:
+                similarity = max(
+                    structural_similarity(record["luma16x9"], reference)
+                    for reference in reference_signatures
+                )
+                matches = matches and similarity >= minimum_similarity
+        if matches:
+            current.append(record)
+            if len(current) > len(best):
+                best = list(current)
+        else:
+            current = []
+    return best
+
+
+def cross_run_content_run(entry, source_summary, target_summary):
+    """Return target's run scored against references derived from source only."""
+    source_run = source_summary["longest_content_run"]
+    if not source_run:
+        return []
+    review_summary = dict(source_summary)
+    review_summary["records"] = source_run
+    review_summary["richest"] = max(source_run, key=lambda record: record["colors"])
+    references = [record["luma16x9"] for record in choose_review_records(review_summary)]
+    return longest_content_run(entry, target_summary["records"], references)
+
+
+def cross_run_content_streak(entry, source_summary, target_summary):
+    """Return the length of target's source-only cross-scored content run."""
+    return len(cross_run_content_run(entry, source_summary, target_summary))
+
+
 def content_result(entry, summary, include_structural=True):
     required_frames = int(entry.get("min_qualifying_frames", 2))
     required_changes = int(entry.get("min_pixel_changes", 0))
-    match_ratio = float(entry.get("min_content_match_ratio", 0.75))
+    consecutive_required = entry.get("min_consecutive_content_matches")
+    if ("min_content_match_ratio" in entry and
+            "min_consecutive_content_matches" in entry):
+        return False, [
+            "min_content_match_ratio and min_consecutive_content_matches are mutually exclusive"]
+    match_ratio = (None if consecutive_required is not None
+                   else float(entry.get("min_content_match_ratio", 0.75)))
     expected_dims = tuple(entry["dims"]) if entry.get("dims") else None
     failures = []
-    if not 0 <= match_ratio <= 1:
+    if match_ratio is not None and not 0 <= match_ratio <= 1:
         failures.append(f"min_content_match_ratio {match_ratio} is outside [0, 1]")
+    if consecutive_required is not None:
+        consecutive_required = int(consecutive_required)
+        if consecutive_required <= 0:
+            failures.append("min_consecutive_content_matches must be positive")
     if len(summary["qualifying"]) < required_frames:
         failures.append(f"qualifying frames {len(summary['qualifying'])} < {required_frames}")
     if summary["pixel_changes"] < required_changes:
@@ -467,27 +569,44 @@ def content_result(entry, summary, include_structural=True):
         failures.append(f"dimensions {summary['dims']} != {expected_dims}")
     references = entry.get("structural_references", [])
     if include_structural and references:
-        required_matches = max(int(entry.get("min_structural_matches", required_frames)),
-                               math.ceil(len(summary["records"]) * match_ratio))
+        required_matches = int(entry.get("min_structural_matches", required_frames))
+        if match_ratio is not None:
+            required_matches = max(
+                required_matches, math.ceil(len(summary["records"]) * match_ratio))
         if summary["structural_matches"] < required_matches:
             failures.append(
                 f"structural matches {summary['structural_matches']} < {required_matches} "
                 f"(minimum SSIM {entry.get('min_structural_similarity', 0.85)})")
     if entry.get("min_nonblack_ratio") is not None:
-        required_nonblack = max(int(entry.get("min_nonblack_matches", required_frames)),
-                                math.ceil(len(summary["records"]) * match_ratio))
+        required_nonblack = int(entry.get("min_nonblack_matches", required_frames))
+        if match_ratio is not None:
+            required_nonblack = max(
+                required_nonblack, math.ceil(len(summary["records"]) * match_ratio))
         if summary["nonblack_matches"] < required_nonblack:
             failures.append(
                 f"non-black coverage matches {summary['nonblack_matches']} < {required_nonblack} "
                 f"(minimum ratio {entry['min_nonblack_ratio']})")
+    if include_structural and consecutive_required is not None and consecutive_required > 0:
+        observed = len(summary.get("longest_content_run", []))
+        if observed < consecutive_required:
+            failures.append(
+                f"consecutive content matches {observed} < {consecutive_required}")
     return not failures, failures
 
 
-def save_content_evidence(name, run_number, summary):
+def save_content_evidence(name, run_number, summary, entry=None):
     out_dir = os.path.join(REVIEW_DIR, name)
     os.makedirs(out_dir, exist_ok=True)
     saved = []
-    selected = choose_review_records(summary)
+    review_summary = summary
+    if entry and entry.get("min_consecutive_content_matches") is not None:
+        plateau = summary.get("verified_content_run") or summary["longest_content_run"]
+        if not plateau:
+            raise RuntimeError("no content plateau available for review evidence")
+        review_summary = dict(summary)
+        review_summary["records"] = plateau
+        review_summary["richest"] = max(plateau, key=lambda record: record["colors"])
+    selected = choose_review_records(review_summary)
     review_names = {}
     for index, record in enumerate(selected):
         stem, extension = os.path.splitext(record["filename"])
@@ -520,12 +639,18 @@ def save_content_metadata(path, summary, review_names=None):
             "best_structural_similarity": record["best_structural_similarity"],
             "review_png": review_names.get(record["path"]),
         })
+    metadata = {
+        "schema": 1, "records": records,
+        "qualifying_frames": len(summary["qualifying"]),
+        "pixel_changes": summary["pixel_changes"],
+    }
+    if "verified_content_run" in summary:
+        metadata["longest_consecutive_content_matches"] = len(
+            summary.get("longest_content_run", []))
+        metadata["cross_verified_consecutive_content_matches"] = len(
+            summary["verified_content_run"])
     with open(path, "w") as f:
-        json.dump({
-            "schema": 1, "records": records,
-            "qualifying_frames": len(summary["qualifying"]),
-            "pixel_changes": summary["pixel_changes"],
-        }, f, indent=2)
+        json.dump(metadata, f, indent=2)
         f.write("\n")
 
 
@@ -580,7 +705,16 @@ def save_content_candidate(entry, summaries):
     out_dir = os.path.join(REVIEW_DIR, entry["name"])
     records = []
     for summary in summaries:
-        records.extend(choose_review_records(summary))
+        review_summary = summary
+        if entry.get("min_consecutive_content_matches") is not None:
+            plateau = summary.get("verified_content_run") or summary["longest_content_run"]
+            if not plateau:
+                raise RuntimeError("no content plateau available for candidate references")
+            review_summary = dict(summary)
+            review_summary["records"] = plateau
+            review_summary["richest"] = max(
+                plateau, key=lambda record: record["colors"])
+        records.extend(choose_review_records(review_summary))
     references = []
     seen = set()
     for record in records:
@@ -738,6 +872,7 @@ def capture(entry, run_log=None):
 
 def capture_content(entry, run_log=None):
     """Run the title and measure normal composited screenshots, never renderer intermediates."""
+    validate_content_entry(entry)
     frontend = screenshot_path()
     if not os.path.exists(frontend):
         raise RuntimeError(f"screenshot not found at {frontend} (build it, or set PROSPER_SCREENSHOT)")
@@ -869,15 +1004,29 @@ def cmd_verify(m, names):
                 out_dir = reset_review_evidence(s["name"])
                 _, summary1, t1 = capture_content(s, run_log=os.path.join(out_dir, "run1.log"))
                 temps.append(t1)
-                saved1 = save_content_evidence(s["name"], 1, summary1)
-                _cleanup(t1)
                 _, summary2, t2 = capture_content(s, run_log=os.path.join(out_dir, "run2.log"))
                 temps.append(t2)
-                saved2 = save_content_evidence(s["name"], 2, summary2)
-                _cleanup(t2)
                 ok1, why1 = content_result(s, summary1, include_structural=False)
                 ok2, why2 = content_result(s, summary2, include_structural=False)
                 ok = ok1 and ok2 and summary1["dims"] == summary2["dims"]
+                cross_ab = cross_ba = None
+                consecutive_required = s.get("min_consecutive_content_matches")
+                if consecutive_required is not None:
+                    consecutive_required = int(consecutive_required)
+                    cross_run2 = cross_run_content_run(s, summary1, summary2)
+                    cross_run1 = cross_run_content_run(s, summary2, summary1)
+                    summary1["verified_content_run"] = cross_run1
+                    summary2["verified_content_run"] = cross_run2
+                    cross_ab = len(cross_run2)
+                    cross_ba = len(cross_run1)
+                    ok = (ok and
+                          len(summary1["longest_content_run"]) >= consecutive_required and
+                          len(summary2["longest_content_run"]) >= consecutive_required and
+                          cross_ab >= consecutive_required and cross_ba >= consecutive_required)
+                saved1 = save_content_evidence(s["name"], 1, summary1, s)
+                saved2 = save_content_evidence(s["name"], 2, summary2, s)
+                _cleanup(t1)
+                _cleanup(t2)
                 if ok:
                     save_content_candidate(s, (summary1, summary2))
                 print(f"[verify] {s['name']}: {'CONTENT-STABLE' if ok else 'UNSTABLE'} "
@@ -886,6 +1035,10 @@ def cmd_verify(m, names):
                       f"changes={summary1['pixel_changes']}/{summary2['pixel_changes']}, "
                       f"dims={summary1['dims'][0]}x{summary1['dims'][1]}/"
                       f"{summary2['dims'][0]}x{summary2['dims'][1]})")
+                if cross_ab is not None:
+                    print(f"         consecutive={len(summary1['longest_content_run'])}/"
+                          f"{len(summary2['longest_content_run'])}; cross-run A->B={cross_ab} "
+                          f"B->A={cross_ba}; required={consecutive_required}")
                 if why1 or why2:
                     print(f"         failures: run1={why1 or 'none'} run2={why2 or 'none'}")
                 print(f"         REVIEW REQUIRED: inspect {len(saved1) + len(saved2)} images in {out_dir}")
@@ -937,12 +1090,17 @@ def cmd_check(m, names):
                 _, summary, tmp = capture_content(s, run_log=log)
                 ok, failures = content_result(s, summary)
                 if ok:
+                    consecutive_detail = ""
+                    if s.get("min_consecutive_content_matches") is not None:
+                        consecutive_detail = (
+                            f", consecutive_matches={len(summary['longest_content_run'])}")
                     print(f"[check] {s['name']}: OK ({summary['dims'][0]}x{summary['dims'][1]}, "
                           f"frames={len(summary['records'])}, qualifying={len(summary['qualifying'])}, "
                           f"richest={summary['richest']['colors']} colors, "
                           f"pixel_changes={summary['pixel_changes']}, "
                           f"structural_matches={summary['structural_matches']}, "
-                          f"nonblack_matches={summary['nonblack_matches']})")
+                          f"nonblack_matches={summary['nonblack_matches']}"
+                          f"{consecutive_detail})")
                     os.remove(log) if os.path.exists(log) else None
                 else:
                     failure_paths = []
