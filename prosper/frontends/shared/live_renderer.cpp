@@ -361,10 +361,12 @@ struct TextureDecodeKey {
     uint64_t host_data = 0;
     uint64_t host_data_size = 0;
     uint32_t size = 0;
+    uint64_t source_span_bytes = 0;
     uint32_t cls = 0;
     uint32_t format = 0;
     uint32_t num_components = 0;
     uint32_t width = 0, height = 0, depth = 1;
+    uint32_t sample_count = 1;
     uint32_t tile_mode = 0;
     uint32_t linear_row_pitch_bytes = 0;
     uint32_t img_dim = 0;
@@ -390,7 +392,9 @@ struct TextureDecodeKeyHash {
             hash *= 1099511628211ull;
         };
         mix(key.gpu_addr); mix(key.host_data); mix(key.host_data_size); mix(key.size);
+        mix(key.source_span_bytes);
         mix(key.cls); mix(key.format); mix(key.num_components); mix(key.width); mix(key.height); mix(key.depth);
+        mix(key.sample_count);
         mix(key.tile_mode); mix(key.linear_row_pitch_bytes); mix(key.img_dim);
         mix(key.mip_tail_bytes); mix(key.mip_tail_x); mix(key.mip_tail_y);
         mix(key.layer_stride_bytes); mix(key.layer_mip_offset_bytes);
@@ -423,6 +427,10 @@ struct DecodedTexture {
     uint64_t source_addr = 0;
     uint64_t source_size = 0;
     size_t texstore_slot = SIZE_MAX;
+    // Exact 2D-MSAA resolves use an owned plane-major allocation rather than a reusable texstore
+    // slot. Retaining the owner here gives same-submit cache hits the same lifetime guarantee as a
+    // pinned scratch slot, without pinning one ~32 MiB vector per distinct surface forever.
+    std::shared_ptr<const std::vector<uint8_t>> pixels_owner;
 };
 
 // Always-on identity-scope accounting; see TextureDecodeScopeStats in the header.
@@ -506,6 +514,20 @@ bool texture_decode_cache_candidate(bool has_live_color_target,
         !has_captured_host_data &&
         (image_dimension == 1u || image_dimension == 2u || image_dimension == 5u) &&
         is_sampled_texture && format_supported;
+}
+
+bool sampled_msaa_fetch_shape_supported(const prosper::gpu::ShaderResource& resource,
+                                        bool is_storage_image,
+                                        bool reflected_msaa_fetch) {
+    using prosper::gpu::DataFormat;
+    using prosper::gpu::ResourceClass;
+    return resource.cls == ResourceClass::Texture && !is_storage_image &&
+        resource.img_dim == 6u && resource.sample_count == 4u &&
+        resource.tile_mode == 24u && resource.format == DataFormat::Float32 &&
+        resource.num_components == 1u && resource.depth == 1u &&
+        resource.declared_mip_levels == 1u && !resource.in_mip_tail &&
+        resource.mip_tail_bytes == 0u && resource.layer_stride_bytes == 0u &&
+        resource.layer_mip_offset_bytes == 0u && reflected_msaa_fetch;
 }
 
 bool persistent_texture_decode_cache_eligible(bool guest_decode_candidate,
@@ -1600,10 +1622,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             r.gpu_addr, r.img_dim, r.in_mip_tail,
                             r.layer_mip_offset_bytes);
                         const bool sampled_2d_view = r.img_dim == 1u || r.img_dim == 5u;
+                        const size_t msaa_tiled_source_span = r.img_dim == 6u
+                            ? prosper::gpu::tiled_msaa_surface_bytes(
+                                  tw, th, r.tile_mode, 4u, r.sample_count)
+                            : 0u;
                         const TextureDecodeKey decode_key{
                             r.gpu_addr, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r.host_data)),
-                            r.host_data_size, r.size, static_cast<uint32_t>(r.cls),
+                            r.host_data_size, r.size, msaa_tiled_source_span,
+                            static_cast<uint32_t>(r.cls),
                             static_cast<uint32_t>(r.format), r.num_components, tw, th, r.depth,
+                            r.sample_count,
                             r.tile_mode, r.linear_row_pitch_bytes, r.img_dim,
                             r.mip_tail_bytes, r.mip_tail_x, r.mip_tail_y,
                             r.layer_stride_bytes, r.layer_mip_offset_bytes,
@@ -1624,6 +1652,249 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             r.in_mip_tail,
                             avplayer_chroma_layout,
                         };
+                        if (r.img_dim == 6u) {
+                            // GFX10 TYPE=2D_MSAA interleaves the sample coordinate into the tiled
+                            // address. It is neither an ordinary 2D texture nor a native Vulkan
+                            // multisample upload: IMAGE_LOAD names one sample explicitly, so the
+                            // recompiler exposes the samples as four layers of a single-sample 2D
+                            // array. Materialize exactly that representation here. Keep the first
+                            // live contract deliberately as narrow as the observed Asterix surface;
+                            // unsupported sample counts/layouts/formats must remain fail-visible.
+                            const bool reflected_msaa_fetch =
+                                reflected_binding->kind ==
+                                    prosper::gpu::SpirvDescriptorKind::CombinedImageSampler &&
+                                reflected_binding->image_dim == 1u &&
+                                reflected_binding->image_arrayed &&
+                                !reflected_binding->image_multisampled &&
+                                reflected_binding->texel_access &&
+                                !reflected_binding->normalized_sampling;
+                            const bool exact_msaa_shape = sampled_msaa_fetch_shape_supported(
+                                r, fr.is_storage_image, reflected_msaa_fetch);
+
+                            prosper::gpu::Gfx10HtileMsaaSource htile_source =
+                                r.compression_enabled
+                                    ? prosper::gpu::Gfx10HtileMsaaSource::Unsupported
+                                    : prosper::gpu::Gfx10HtileMsaaSource::UncompressedBase;
+                            uint32_t decompressed_htile_value = 0;
+                            std::vector<uint8_t> htile_metadata;
+                            size_t htile_metadata_got = 0;
+                            if (exact_msaa_shape && r.compression_enabled) {
+                                const uint64_t metadata_size =
+                                    prosper::gpu::gpu_capture_dcc_metadata_footprint(r);
+                                htile_metadata.resize(
+                                    static_cast<size_t>(metadata_size), 0);
+                                htile_metadata_got = metadata_size
+                                    ? copy_dcc_metadata(htile_metadata.data(),
+                                                        htile_metadata.size())
+                                    : 0u;
+                                // Mode-24 MSAA metadata is HTILE, not color DCC. The two exact PAL
+                                // initialization dwords disable depth compression for depth-only and
+                                // depth+stencil surfaces respectively. The metadata itself must prove
+                                // one uniform state across the complete AddrLib-sized plane; every
+                                // compressed, nonuniform, ambiguous, or short state remains rejected.
+                                htile_source = prosper::gpu::gfx10_htile_msaa_source(
+                                    htile_metadata.data(), htile_metadata_got,
+                                    tw, th, r.tile_mode, 4u, r.sample_count,
+                                    r.meta_pipe_aligned);
+                                if (htile_source ==
+                                    prosper::gpu::Gfx10HtileMsaaSource::UncompressedBase) {
+                                    prosper::gpu::gfx10_htile_metadata_is_decompressed(
+                                        htile_metadata.data(), htile_metadata_got,
+                                        htile_metadata.size(), &decompressed_htile_value);
+                                }
+                            }
+
+                            const bool uncompressed_base = htile_source ==
+                                prosper::gpu::Gfx10HtileMsaaSource::UncompressedBase;
+                            const bool depth_zero_fast_clear = htile_source ==
+                                prosper::gpu::Gfx10HtileMsaaSource::DepthZeroFastClear;
+                            const bool materializable_msaa = exact_msaa_shape &&
+                                (uncompressed_base || depth_zero_fast_clear);
+                            const size_t tiled_bytes = exact_msaa_shape && uncompressed_base
+                                ? msaa_tiled_source_span : 0u;
+                            const uint64_t linear_bytes64 =
+                                static_cast<uint64_t>(tw) * th * r.sample_count * 4u;
+                            if (!materializable_msaa || !linear_bytes64 ||
+                                linear_bytes64 > SIZE_MAX) {
+                                static uint32_t rejected = 0;
+                                const uint32_t ordinal = ++rejected;
+                                if (ordinal <= 32u) {
+                                    uint32_t htile_first = 0;
+                                    uint32_t htile_first_different = 0;
+                                    size_t htile_dwords_different = 0;
+                                    if (htile_metadata_got == htile_metadata.size() &&
+                                        htile_metadata.size() >= sizeof(uint32_t) &&
+                                        (htile_metadata.size() % sizeof(uint32_t)) == 0u) {
+                                        std::memcpy(&htile_first, htile_metadata.data(),
+                                                    sizeof(htile_first));
+                                        for (size_t offset = sizeof(uint32_t);
+                                             offset < htile_metadata.size();
+                                             offset += sizeof(uint32_t)) {
+                                            uint32_t value = 0;
+                                            std::memcpy(&value, htile_metadata.data() + offset,
+                                                        sizeof(value));
+                                            if (value != htile_first) {
+                                                if (!htile_dwords_different)
+                                                    htile_first_different = value;
+                                                ++htile_dwords_different;
+                                            }
+                                        }
+                                    }
+                                    fprintf(stderr,
+                                            "[render-msaa-reject] ordinal=%u set=%u binding=%u "
+                                            "addr=0x%llx "
+                                            "%ux%u samples=%u fmt=%u/%u tile=%u compression=%d "
+                                            "shape=%d reflected=%d base-uncompressed=%d "
+                                            "depth-zero-fast-clear=%d "
+                                            "htile=%zu/%zu first=0x%08x first-different=0x%08x "
+                                            "dwords-different=%zu\n",
+                                            ordinal, set, r.binding,
+                                            (unsigned long long)r.gpu_addr,
+                                            tw, th, r.sample_count, (unsigned)r.format,
+                                            r.num_components, r.tile_mode,
+                                            static_cast<int>(r.compression_enabled),
+                                            static_cast<int>(exact_msaa_shape),
+                                            static_cast<int>(reflected_msaa_fetch),
+                                            static_cast<int>(uncompressed_base),
+                                            static_cast<int>(depth_zero_fast_clear),
+                                            htile_metadata_got, htile_metadata.size(), htile_first,
+                                            htile_first_different, htile_dwords_different);
+                                }
+                                continue;
+                            }
+
+                            // Captured backing and DCC metadata cannot use the one-range journal
+                            // proof across callback spans. They still reuse safely inside the span
+                            // that decoded them. Plain guest backing may cross spans only while the
+                            // ordered write journal proves the complete padded tiled allocation was
+                            // untouched.
+                            const uint64_t cross_span_source_size =
+                                !r.host_data && !r.compression_enabled ? tiled_bytes : 0u;
+                            auto reused = decoded_textures.find(decode_key);
+                            if (reused != decoded_textures.end()) {
+                                const bool same_span =
+                                    reused->second.span == decode_span_ordinal;
+                                const prosper::gpu::GuestGpuWriteQuery journal_query = same_span
+                                    ? prosper::gpu::GuestGpuWriteQuery::Unknown
+                                    : prosper::gpu::guest_gpu_writes_since(
+                                          reused->second.snapshot,
+                                          reused->second.source_addr,
+                                          reused->second.source_size);
+                                if (!submit_local_texture_decode_reusable(
+                                        reused->second.span, decode_span_ordinal,
+                                        reused->second.source_addr, reused->second.source_size,
+                                        sampled_source_addr, cross_span_source_size,
+                                        journal_query) || !reused->second.pixels_owner) {
+                                    decoded_textures.erase(reused);
+                                    reused = decoded_textures.end();
+                                    ++g_texture_decode_scope.invalidations;
+                                }
+                            }
+
+                            if (reused != decoded_textures.end()) {
+                                fr.tex_rgba_owner = reused->second.pixels_owner;
+                                fr.tex_rgba = reused->second.pixels;
+                                resource_local_reuse = true;
+                                if (reused->second.span == decode_span_ordinal) {
+                                    ++g_texture_decode_scope.same_span_reuses;
+                                } else {
+                                    ++g_texture_decode_scope.cross_span_reuses;
+                                    reused->second.snapshot =
+                                        prosper::gpu::guest_gpu_write_snapshot();
+                                }
+                                if (timing_enabled) pending_timing.texture_reuses++;
+                            } else {
+                                std::vector<uint8_t> tiled;
+                                size_t copied = 0;
+                                if (uncompressed_base) {
+                                    tiled.resize(tiled_bytes, 0);
+                                    copied = copy_resource(
+                                        tiled.data(), sampled_source_addr, tiled.size());
+                                }
+                                std::vector<uint8_t> linear(
+                                    static_cast<size_t>(linear_bytes64), 0);
+                                prosper::gpu::Gfx10HtileMsaaSource realized_source =
+                                    prosper::gpu::Gfx10HtileMsaaSource::Unsupported;
+                                const bool materialized = r.compression_enabled
+                                    ? prosper::gpu::materialize_gfx10_htile_msaa_surface(
+                                          linear.data(), linear.size(),
+                                          tiled.empty() ? nullptr : tiled.data(), copied,
+                                          htile_metadata.data(), htile_metadata_got,
+                                          tw, th, r.tile_mode, 4u, r.sample_count,
+                                          r.meta_pipe_aligned, &realized_source)
+                                    : (copied == tiled.size() &&
+                                       prosper::gpu::detile_msaa_surface(
+                                           linear.data(), tiled.data(), copied, tw, th,
+                                           r.tile_mode, 4u, r.sample_count));
+                                if (!materialized ||
+                                    (r.compression_enabled && realized_source != htile_source)) {
+                                    static uint32_t short_sources = 0;
+                                    if (short_sources++ < 32u)
+                                        fprintf(stderr,
+                                                "[render-msaa-reject] set=%u binding=%u addr=0x%llx "
+                                                "source=%zu/%zu bytes\n",
+                                                set, r.binding, (unsigned long long)r.gpu_addr,
+                                                copied, tiled.size());
+                                    continue;
+                                }
+
+                                fr.tex_rgba_owner =
+                                    std::make_shared<const std::vector<uint8_t>>(std::move(linear));
+                                fr.tex_rgba = fr.tex_rgba_owner->data();
+                                ++g_texture_decode_scope.decodes;
+                                DecodedTexture decoded;
+                                decoded.pixels = fr.tex_rgba;
+                                decoded.output_height = th;
+                                decoded.span = decode_span_ordinal;
+                                decoded.snapshot = prosper::gpu::guest_gpu_write_snapshot();
+                                decoded.source_addr = sampled_source_addr;
+                                decoded.source_size = cross_span_source_size;
+                                decoded.pixels_owner = fr.tex_rgba_owner;
+                                decoded_textures.emplace(decode_key, std::move(decoded));
+                            }
+                            fr.tex_byte_size = fr.tex_rgba_owner->size();
+                            fr.tw = tw;
+                            fr.th = th;
+                            fr.td = 1u;
+                            fr.img_dim = r.img_dim;
+                            fr.sample_count = r.sample_count;
+                            fr.declared_mip_levels = 1u;
+                            fr.texture_format = VK_FORMAT_R32_SFLOAT;
+                            resource_texture_source_bytes = depth_zero_fast_clear
+                                ? htile_metadata.size() : tiled_bytes;
+                            if (decompressed_htile_value && getenv("PROSPER_GFXLOG")) {
+                                static uint32_t logged = 0;
+                                if (logged++ < 16u)
+                                    fprintf(stderr,
+                                            "[render-msaa] addr=0x%llx %ux%u samples=%u "
+                                            "decompressed-htile=0x%08x source=%zu bytes\n",
+                                            (unsigned long long)r.gpu_addr, tw, th,
+                                            r.sample_count, decompressed_htile_value, tiled_bytes);
+                            }
+                            if (depth_zero_fast_clear && getenv("PROSPER_GFXLOG")) {
+                                static uint32_t logged_zero_clear = 0;
+                                const uint32_t ordinal = ++logged_zero_clear;
+                                if (ordinal <= 16u)
+                                    fprintf(stderr,
+                                            "[render-msaa] ordinal=%u addr=0x%llx %ux%u "
+                                            "samples=%u depth-zero-fast-clear metadata=%zu bytes\n",
+                                            ordinal, (unsigned long long)r.gpu_addr, tw, th,
+                                            r.sample_count, htile_metadata.size());
+                            }
+
+                            fr.mag_filter = r.mag_filter;
+                            fr.min_filter = r.min_filter;
+                            fr.mip_filter = r.mip_filter;
+                            fr.addr_uvw[0] = r.addr_uvw[0];
+                            fr.addr_uvw[1] = r.addr_uvw[1];
+                            fr.addr_uvw[2] = r.addr_uvw[2];
+                            fr.border_color_type = r.border_color_type;
+                            fr.min_lod = r.min_lod;
+                            fr.max_lod = r.max_lod;
+                            fr.lod_bias = r.lod_bias;
+                            fr.max_aniso_ratio = r.max_aniso_ratio;
+                            for (int k = 0; k < 4; ++k) fr.swizzle[k] = r.swizzle[k];
+                        } else {
                         auto live_rtt = rtt_on ? g_rtt.find(sampled_source_addr) : g_rtt.end();
                         static const uint32_t render_scale = [] {
                             const char* e = std::getenv("PROSPER_RENDER_SCALE");
@@ -3626,8 +3897,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             for (auto it = decoded_textures.begin();
                                                  it != decoded_textures.end();) {
                                                 const uint64_t cached_addr = it->first.gpu_addr;
-                                                const uint64_t cached_bytes =
-                                                    std::max<uint64_t>(it->first.size, 1u);
+                                                const uint64_t cached_bytes = std::max<uint64_t>(
+                                                    std::max<uint64_t>(it->first.size,
+                                                                       it->first.source_span_bytes),
+                                                    1u);
                                                 const bool overlaps = cached_addr <= guest_addr
                                                     ? guest_addr - cached_addr < cached_bytes
                                                     : cached_addr - guest_addr < guest_bytes;
@@ -3688,6 +3961,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // black scene whose textures decode to real RGB but composite to nothing — if the
                         // level appears with this, the alpha channel (decode or DST_SEL swizzle) is the bug (#300).
                         if (getenv("PROSPER_ALPHA1")) fr.swizzle[3] = 1;
+                        }
                     } else {
                         fr.buffer_identity = r.gpu_addr;
                         const prosper::gpu::StorageBufferMaterializationPlan materialization =
@@ -3846,6 +4120,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (fr.is_texture()) {
                             pending_timing.textures++;
                             pending_timing.texture_bytes += static_cast<uint64_t>(fr.tw) * fr.th * fr.td *
+                                fr.sample_count *
                                 prosper::test::backend_color_bytes_per_pixel(fr.texture_format);
                             pending_timing.texture_ms += elapsed;
                             const uint64_t detail_min_submit = getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")

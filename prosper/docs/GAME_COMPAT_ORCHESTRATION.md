@@ -975,9 +975,9 @@ itself turned out to rest on a superseded diagnosis:
 - `PROSPER_DBBASETRACE` **cannot decide this**: it is hardcoded to DB offsets and only fires on a
   nonzero-then-zero-within-one-array signature, so it never fires for a register the guest never writes.
 
-**Next Astro step.** Capture **v43** (PR #1576) retains the raw colour-state triple per draw with presence flags
+**Next Astro step.** Capture format **v43+** (PR #1576) retains the raw colour-state triple per draw with presence flags
 and surfaces it in `--inspect`, which is what makes `cwm=0` attributable offline. The retained bundle is v42, so
-it reports `color-state unavailable` — a **fresh v43 capture** is required. Take one, then determine whether the
+it reports `color-state unavailable` — a **fresh current-format capture** is required. Take one, then determine whether the
 zero masks are genuine guest intent or a prosper defect. If they are genuine intent, "real content exists but
 nothing reaches the screen" via small mipped 4 KiB surfaces becomes the natural next suspect.
 
@@ -1482,7 +1482,7 @@ into a default fix or claim rung 3 from this diagnostic hardening.
 
 | Agent | First bounded task | GPU |
 |---|---|---|
-| Astro Bot | Take a **fresh v43** capture, then attribute the frame-wide `cwm=0` from the raw colour-state triple | One bounded capture |
+| Astro Bot | Take a **fresh current-format** capture, then attribute the frame-wide `cwm=0` from the raw colour-state triple | One bounded capture |
 | Dragon Quest VII | Measure `s97`/`s106` with two `--dump-resource` runs; decide PreExposure versus op103 execution | Two ~2 s runs |
 | The Plucky Squire | Live route: confirm `0x3017460000` executes; identify the next skipped stage | ~10 min routed run |
 | Alex Kidd | Land the snapshot guard; re-check #710 against the tiling fix | Snapshot verify |
@@ -1511,8 +1511,8 @@ Do NOT re-run the R11G11B10 storage fork (falsified: byte-identical output acros
 backend paths), compute-writer closure, submit 6279, or the b49 1x1 control.
 The frontier is that no geometry draw writes colour anywhere in the frame: 28 realized draws
 resolve cwm=0 and cwm1=0. An ABSENT target/shader mask resolves to write-all, so cwm=0 means
-present-and-zero, or MODE=DISABLE. Capture v43 retains the raw triple; the retained bundle is
-v42 and reports "color-state unavailable", so take a FRESH v43 capture first. Then determine
+present-and-zero, or MODE=DISABLE. Capture format v43+ retains the raw triple; the retained bundle is
+v42 and reports "color-state unavailable", so take a FRESH current-format capture first. Then determine
 whether the zero masks are guest intent or a prosper defect. The Gen5 stale-fold prior was
 investigated and NOT confirmed; read the lane notes before reviving it.
 ```

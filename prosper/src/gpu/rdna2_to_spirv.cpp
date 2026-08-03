@@ -1431,6 +1431,12 @@ struct SpirvCompute {
     // 2-component uint vector (integer texel coordinates for OpImageFetch).
     uint32_t t_v2u_cache = 0;
     uint32_t t_v2u() { if (!t_v2u_cache) { t_v2u_cache = id(); put(types, Op_TypeVector, {t_v2u_cache, t_u32, 2}); } return t_v2u_cache; }
+    uint32_t t_v3u_cache2 = 0;
+    uint32_t t_v3u_fetch() {
+        if (t_v3u) return t_v3u;   // compute/vertex shells already declare a uvec3 for built-ins
+        if (!t_v3u_cache2) { t_v3u_cache2 = id(); put(types, Op_TypeVector, {t_v3u_cache2, t_u32, 3}); }
+        return t_v3u_cache2;
+    }
     // image_load 2D (image_load): texelFetch the image at the combined sampler's `binding` with INTEGER
     // (x,y) coords (raw VGPR bits). OpImage strips the sampler; OpImageFetch at explicit LOD 0.
     void image_fetch_2d(uint32_t binding, uint32_t x_bits, uint32_t y_bits, uint32_t out[4]) {
@@ -1441,14 +1447,23 @@ struct SpirvCompute {
         unpack_texture_result(binding, res, out);
     }
 
+    // Exact sampled IMAGE_LOAD representation for guest 2D_MSAA: the host image is single-sample
+    // 2D-array, with each guest sample plane in one layer. The guest's explicit sample coordinate is
+    // therefore the third integer coordinate; LOD remains zero because the host view has one level.
+    void image_fetch_2d_array(uint32_t binding, uint32_t x_bits, uint32_t y_bits,
+                              uint32_t layer_bits, uint32_t out[4]) {
+        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t img   = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct,
+                                   {t_v3u_fetch(), coord, x_bits, y_bits, layer_bits});
+        uint32_t res   = id(); put(code, Op_ImageFetch,
+                                   {texture_vec4(binding), res, img, coord,
+                                    ImgOp_Lod, uconst(0)});
+        unpack_texture_result(binding, res, out);
+    }
+
     // image_load from a 3D texture (integer texel fetch through the combined sampler — DOLL's
     // color-grade LUT, #273): OpImage strips the sampler; OpImageFetch with (x,y,z) integer coords.
-    uint32_t t_v3u_cache2 = 0;
-    uint32_t t_v3u_fetch() {
-        if (t_v3u) return t_v3u;   // compute/vertex shells already declare a uvec3 for built-ins
-        if (!t_v3u_cache2) { t_v3u_cache2 = id(); put(types, Op_TypeVector, {t_v3u_cache2, t_u32, 3}); }
-        return t_v3u_cache2;
-    }
     void image_fetch_3d(uint32_t binding, uint32_t x_bits, uint32_t y_bits, uint32_t z_bits, uint32_t out[4]) {
         uint32_t simg  = tex_binding_simg[binding];
         uint32_t t_img3 = tex_binding_img[binding];   // OpImage's result type must be the pair's Image type
@@ -9568,13 +9583,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // SAMPLE_L/LZ is different: Astro Bot's world-map kernel selects both layers of a wide
             // texture atlas, so dropping cvg(2) destroys the lookup. Those forms use a real array below.
             const bool dim2d = (in.mimg_dim == 1u || in.mimg_dim == 5u), dim3d = (in.mimg_dim == 2u);
+            const bool dim_msaa = in.mimg_dim == 6u;
             const bool dimcube = (in.mimg_dim == 3u);   // CUBE: stacked-face 2D lowering (#273, below)
             if (in.mimg_dim == 5u && getenv("PROSPER_GFXLOG"))
                 fprintf(stderr, "[recompile] 2D_ARRAY image_sample -> sampled as base slice 0 (array index dropped; #325)\n");
             if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b &&
                  !is_sample_c_lz && !is_gather_lz &&
-                 !is_gather_lz_o && !is_sample_lz_o && !is_sample_d) || (!dim2d && !dim3d && !dimcube)) { ok = false; return true; }
+                 !is_gather_lz_o && !is_sample_lz_o && !is_sample_d) ||
+                (!dim2d && !dim3d && !dimcube && !dim_msaa)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
+            // Guest 2D_MSAA IMAGE_LOAD is represented exactly as a host single-sample 2D array: the
+            // guest sample coordinate selects the array layer. Asterix's resolve PS mixes the ordinary
+            // consecutive-vaddr packet with three one-extra-dword NSA packets; llvm-mc gfx1030 confirms
+            // those NSA addresses are [x,y,sample] in bytes {VADDR, words[2].lo, words[2].byte1}.
+            // Accept only those two exact address shapes. Nonzero unused NSA bytes could carry further
+            // operands, and every other MSAA op/count/address shape stays fail-visible.
+            const bool msaa_address_shape = in.len_dwords == 2u ||
+                (in.len_dwords == 3u && (in.words[2] & 0xffff0000u) == 0u);
+            const bool msaa_array_fetch = dim_msaa && is_load && msaa_address_shape &&
+                !in.mimg_unorm && !in.has_modifier && res->img_dim == 6u &&
+                res->sample_count == 4u && res->depth == 1u &&
+                res->declared_mip_levels == 1u && !res->depth_compare;
+            if (dim_msaa && !msaa_array_fetch) { ok = false; return true; }
             // UNRM=1 supplies unnormalized (texel-space) coordinates (Table 100). Compilers set it
             // only on loads/stores/atomics — and our fetch paths are already texel-space — but a
             // SAMPLER op with UNRM set would treat texel coords as normalized and sample a wildly
@@ -9721,10 +9751,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else {
                 const bool array_sample = b.is_compute && in.mimg_dim == 5u &&
                     res->img_dim == 5u && (is_sample || is_sample_l || is_sample_lz);
-                if (!b.declare_texture(res->binding, Dim_2D, uint_texture, array_sample)) {
+                const bool host_array = array_sample || msaa_array_fetch;
+                if (!b.declare_texture(res->binding, Dim_2D, uint_texture, host_array)) {
                     ok = false; return true;
                 }
-                if (array_sample) {
+                if (msaa_array_fetch) {
+                    b.image_fetch_2d_array(
+                        res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
+                } else if (array_sample) {
                     // Compute SAMPLE and SAMPLE_LZ both resolve level zero; SAMPLE_L supplies its
                     // explicit LOD. All retain the 2D-array slice in the SPIR-V coordinate.
                     b.image_sample_lod_2d_array(
@@ -13452,7 +13486,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (!handled || !ok) {
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
-                if (getenv("PROSPER_DBG"))
+                if (getenv("PROSPER_DBG")) {
                     fprintf(stderr, "[recompile-reject] pc=%u words=%08x,%08x fmt=%d op=0x%x "
                                     "dst=%d(kind%d) src=%d(k%d),%d(k%d),%d(k%d) dmask=0x%x "
                                     "dim=%u glc=%d len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u\n",
@@ -13464,6 +13498,16 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         in.mimg_dmask, in.mimg_dim, (int)in.mimg_glc, in.len_dwords, (int)in.has_modifier,
                         (int)in.has_dpp, in.sdwa_dst_sel, in.sdwa_dst_unused,
                         in.sdwa_src0_sel, in.sdwa_src1_sel);
+                    // The primary line historically printed only the fixed MIMG pair. That hid the
+                    // address VGPRs which distinguished Asterix's rejected NSA form from the accepted
+                    // consecutive-vaddr form. Keep a separate MIMG-only line so an address-shape
+                    // diagnosis sees every decoded extra dword without adding zeros to unrelated ops.
+                    if (in.fmt == Rdna2Format::MIMG && in.len_dwords > 2u)
+                        fprintf(stderr,
+                                "[recompile-reject-mimg-address] pc=%u extra=%u words=%08x,%08x,%08x\n",
+                                in.pc, in.len_dwords - 2u,
+                                in.words[2], in.words[3], in.words[4]);
+                }
                 return false;
             }
         }
@@ -14766,10 +14810,18 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         auto table_dependent = [](const Rdna2Inst& i) {
             switch (i.fmt) {
                 case Rdna2Format::MIMG: {
-                    // Storage load/store handle 1D/2D/3D + 1D/2D_ARRAY (dims 0,1,2,4,5) and NSA; image_load
-                    // also handles 2D_MSAA (dim 6). sample* go through the sampled-texture path (2D, non-NSA).
+                    // Storage load/store handle 1D/2D/3D + 1D/2D_ARRAY (dims 0,1,2,4,5) and NSA.
+                    // Sampled 2D_MSAA IMAGE_LOAD is narrower: only the exact consecutive-address or
+                    // one-extra NSA [x,y,sample] shapes accepted by emit_alu are table-dependent.
+                    // Do not credit dim7 or unused NSA address bytes merely because a T# could exist.
                     const bool st_dim = i.mimg_dim <= 2u || i.mimg_dim == 4u || i.mimg_dim == 5u;
-                    if (i.opcode == 0x00u) return st_dim || i.mimg_dim == 6u || i.mimg_dim == 7u;   // image_load (+ 2D_MSAA[_ARRAY])
+                    if (i.opcode == 0x00u) {
+                        if (st_dim) return true;
+                        const bool msaa_address_shape = i.len_dwords == 2u ||
+                            (i.len_dwords == 3u && (i.words[2] & 0xffff0000u) == 0u);
+                        return i.mimg_dim == 6u && !i.mimg_unorm && !i.has_modifier &&
+                               msaa_address_shape;
+                    }
                     if (i.opcode == 0x08u) return st_dim;                       // image_store (no per-sample MSAA store)
                     if (i.opcode == 0x0fu || i.opcode == 0x11u)                // image_atomic_swap/add R32_UINT 2D
                         return i.mimg_dim == 1u && i.mimg_dmask == 1u &&

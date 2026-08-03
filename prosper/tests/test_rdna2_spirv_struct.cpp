@@ -2,6 +2,7 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
@@ -151,6 +152,43 @@ bool has_explicit_lod_constant(const std::vector<uint32_t>& spv, uint32_t expect
                 value_id = bitcast->second;
             const auto value = constants.find(value_id);
             if (value != constants.end() && value->second == expected) return true;
+        }
+        i += wc;
+    }
+    return false;
+}
+
+// Resolve the integer coordinate constructed for OpImageFetch and prove its three components are the
+// requested literals. The third component is especially important for guest 2D_MSAA: it must be the
+// explicit sample VGPR, because the host representation stores each sample plane as an array layer.
+bool image_fetch_coord_literals(const std::vector<uint32_t>& spv,
+                                uint32_t x, uint32_t y, uint32_t layer) {
+    constexpr uint32_t OpConstant = 43, OpCompositeConstruct = 80, OpImageFetch = 95;
+    std::unordered_map<uint32_t, uint32_t> constants;
+    std::unordered_map<uint32_t, std::array<uint32_t, 3>> vectors;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4) constants[spv[i + 2]] = spv[i + 3];
+        if (op == OpCompositeConstruct && wc == 6)
+            vectors[spv[i + 2]] = {spv[i + 3], spv[i + 4], spv[i + 5]};
+        i += wc;
+    }
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpImageFetch && wc >= 7) {
+            const auto coordinate = vectors.find(spv[i + 4]);
+            if (coordinate != vectors.end()) {
+                const auto& ids = coordinate->second;
+                const auto cx = constants.find(ids[0]);
+                const auto cy = constants.find(ids[1]);
+                const auto cl = constants.find(ids[2]);
+                if (cx != constants.end() && cy != constants.end() && cl != constants.end() &&
+                    cx->second == x && cy->second == y && cl->second == layer)
+                    return true;
+            }
         }
         i += wc;
     }
@@ -2631,6 +2669,133 @@ int main() {
         return 1;
     }
     printf("  [ok]   2D-array image_sample_l retains its layer coordinate and reflected view shape\n");
+
+    // Exact title-live IMAGE_LOAD packet: v5/v6 are integer x/y and v7 is the guest sample index.
+    // The host descriptor is deliberately arrayed but non-multisampled; unlike the ordinary 2D-array
+    // sample above it is texel-space (OpImageFetch), and ShaderResource keeps img_dim/sample_count so
+    // backend identity cannot alias these two guest resource kinds.
+    const uint32_t cs_msaa_load_sample3[] = {
+        0x7e0a0280u,                       // v_mov_b32 v5, 0 (x)
+        0x7e0c0280u,                       // v_mov_b32 v6, 0 (y)
+        0x7e0e0283u,                       // v_mov_b32 v7, 3 (sample)
+        0xf0000130u, 0x00000305u,         // image_load v3, v[5:7], s[0:7] dmask:x dim:2D_MSAA
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_msaa;
+    { ShaderResource texture{}; texture.cls = ResourceClass::Texture;
+      texture.format = DataFormat::Float32; texture.num_components = 1;
+      texture.binding = 4; texture.sgpr_base = 0; texture.img_dim = 6;
+      texture.width = 1; texture.height = 1; texture.depth = 1;
+      texture.sample_count = 4; texture.declared_mip_levels = 1;
+      texture.gpu_addr = 0x200000; texture.size = 4 * sizeof(float);
+      rt_msaa.resources.push_back(texture); }
+    const std::vector<uint32_t> msaa_spv = recompile_valu(
+        cs_msaa_load_sample3, std::size(cs_msaa_load_sample3), 8, 0, &rt_msaa);
+    const DescriptorValidationReport msaa_report = validate_spirv_descriptor_interface(
+        msaa_spv, &rt_msaa, 0, SpirvShaderStage::Compute);
+    const SpirvDescriptorBinding* msaa_descriptor = nullptr;
+    for (const auto& descriptor : msaa_report.descriptors)
+        if (descriptor.binding == 4u &&
+            descriptor.kind == SpirvDescriptorKind::CombinedImageSampler)
+            msaa_descriptor = &descriptor;
+    if (msaa_spv.empty() || !msaa_descriptor ||
+        msaa_descriptor->image_dim != 1u || !msaa_descriptor->image_arrayed ||
+        msaa_descriptor->image_multisampled || !msaa_descriptor->texel_access ||
+        msaa_descriptor->normalized_sampling ||
+        !array_l_descriptor->image_arrayed || !array_l_descriptor->normalized_sampling ||
+        array_l_descriptor->texel_access || rt_array.resources[0].sample_count != 1u ||
+        rt_msaa.resources[0].sample_count != 4u) {
+        printf("  [FAIL] guest 2D_MSAA load did not retain its distinct host-array fetch contract "
+               "(words=%zu issues=%zu desc=%zu shape=%u/%d/%d access=%d/%d)\n",
+               msaa_spv.size(), msaa_report.issues.size(), msaa_report.descriptors.size(),
+               msaa_descriptor ? msaa_descriptor->image_dim : UINT32_MAX,
+               msaa_descriptor ? msaa_descriptor->image_arrayed : false,
+               msaa_descriptor ? msaa_descriptor->image_multisampled : false,
+               msaa_descriptor ? msaa_descriptor->texel_access : false,
+               msaa_descriptor ? msaa_descriptor->normalized_sampling : false);
+        return 1;
+    }
+    printf("  [ok]   guest 2D_MSAA fetch is distinct from ordinary 2D-array sampling in reflection and resource identity\n");
+    if (!image_fetch_coord_literals(msaa_spv, 0u, 0u, 3u)) {
+        printf("  [FAIL] 2D_MSAA IMAGE_LOAD did not use the explicit sample VGPR as its host array layer\n");
+        return 1;
+    }
+    uint32_t cs_msaa_load_sample1[std::size(cs_msaa_load_sample3)];
+    std::copy(std::begin(cs_msaa_load_sample3), std::end(cs_msaa_load_sample3),
+              cs_msaa_load_sample1);
+    cs_msaa_load_sample1[2] = 0x7e0e0281u; // mutate only v7: guest sample 3 -> sample 1
+    const std::vector<uint32_t> msaa_sample1_spv = recompile_valu(
+        cs_msaa_load_sample1, std::size(cs_msaa_load_sample1), 8, 0, &rt_msaa);
+    if (!image_fetch_coord_literals(msaa_sample1_spv, 0u, 0u, 1u) ||
+        image_fetch_coord_literals(msaa_sample1_spv, 0u, 0u, 3u)) {
+        printf("  [FAIL] changing the explicit guest sample VGPR did not change the host layer coordinate\n");
+        return 1;
+    }
+    printf("  [ok]   the explicit guest sample VGPR independently selects the host array layer\n");
+
+    // The same title shader uses the one-extra-dword NSA encoding for its other three samples.
+    // llvm-mc gfx1030 disassembles this exact packet as
+    //   image_load v2, [v5, v6, v2], s[0:7] dmask:x dim:2D_MSAA
+    // so the sample VGPR is the second byte of the extra word, independently of VADDR adjacency.
+    const uint32_t cs_msaa_nsa_sample1[] = {
+        0x7e0a0280u,                       // v_mov_b32 v5, 0 (x)
+        0x7e0c0280u,                       // v_mov_b32 v6, 0 (y)
+        0x7e040281u,                       // v_mov_b32 v2, 1 (sample)
+        0x7e060283u,                       // v_mov_b32 v3, 3 (mutation sample)
+        0xf0000132u, 0x00000205u, 0x00000206u,
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> msaa_nsa_sample1_spv = recompile_valu(
+        cs_msaa_nsa_sample1, std::size(cs_msaa_nsa_sample1), 8, 0, &rt_msaa);
+    if (!image_fetch_coord_literals(msaa_nsa_sample1_spv, 0u, 0u, 1u)) {
+        printf("  [FAIL] exact title NSA address did not map its third explicit VGPR to the host layer\n");
+        return 1;
+    }
+    uint32_t cs_msaa_nsa_sample3[std::size(cs_msaa_nsa_sample1)];
+    std::copy(std::begin(cs_msaa_nsa_sample1), std::end(cs_msaa_nsa_sample1),
+              cs_msaa_nsa_sample3);
+    cs_msaa_nsa_sample3[6] = 0x00000306u; // mutate only words[2].byte1: sample v2 -> v3
+    const std::vector<uint32_t> msaa_nsa_sample3_spv = recompile_valu(
+        cs_msaa_nsa_sample3, std::size(cs_msaa_nsa_sample3), 8, 0, &rt_msaa);
+    if (!image_fetch_coord_literals(msaa_nsa_sample3_spv, 0u, 0u, 3u) ||
+        image_fetch_coord_literals(msaa_nsa_sample3_spv, 0u, 0u, 1u)) {
+        printf("  [FAIL] mutating only the NSA sample byte did not change the host layer coordinate\n");
+        return 1;
+    }
+    printf("  [ok]   exact title NSA address bytes independently select the host array layer\n");
+
+    uint32_t unsupported_msaa_nsa_bytes[std::size(cs_msaa_nsa_sample1)];
+    std::copy(std::begin(cs_msaa_nsa_sample1), std::end(cs_msaa_nsa_sample1),
+              unsupported_msaa_nsa_bytes);
+    unsupported_msaa_nsa_bytes[6] |= 0x00010000u; // a nonzero, unmodelled fourth address byte
+    const uint32_t unsupported_msaa_two_extra[] = {
+        0x7e0a0280u, 0x7e0c0280u, 0x7e040281u,
+        0xf0000134u, 0x00000205u, 0x00000206u, 0x00000000u,
+        0xbf810000u,
+    };
+    if (!recompile_valu(unsupported_msaa_nsa_bytes, std::size(unsupported_msaa_nsa_bytes),
+                        8, 0, &rt_msaa).empty() ||
+        !recompile_valu(unsupported_msaa_two_extra, std::size(unsupported_msaa_two_extra),
+                        8, 0, &rt_msaa).empty()) {
+        printf("  [FAIL] unproved NSA address bytes/counts did not remain fail-visible\n");
+        return 1;
+    }
+    printf("  [ok]   unproved NSA address bytes and extra-dword counts remain fail-visible\n");
+
+    ShaderResourceTable unsupported_msaa = rt_msaa;
+    unsupported_msaa.resources[0].sample_count = 2;
+    uint32_t unsupported_msaa_op[std::size(cs_msaa_load_sample3)];
+    std::copy(std::begin(cs_msaa_load_sample3), std::end(cs_msaa_load_sample3),
+              unsupported_msaa_op);
+    unsupported_msaa_op[3] |= 0x00800000u; // IMAGE_SAMPLE opcode with dim:2D_MSAA
+    if (!recompile_valu(cs_msaa_load_sample3, std::size(cs_msaa_load_sample3),
+                        8, 0, &unsupported_msaa).empty() ||
+        !recompile_valu(unsupported_msaa_op, std::size(unsupported_msaa_op),
+                        8, 0, &rt_msaa).empty()) {
+        printf("  [FAIL] unsupported MSAA count/opcode did not remain fail-visible\n");
+        return 1;
+    }
+    printf("  [ok]   unsupported MSAA counts and sampled opcodes remain fail-visible\n");
 
     // The same map kernel reads its two-layer RGBA atlas with the NSA SAMPLE_LZ form. Its third
     // coordinate is still a layer, despite the fixed level zero, and must select an array view too.
