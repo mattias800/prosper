@@ -22,7 +22,7 @@ closing bugs. Every title in the tested inventory has a long-lived tracker in th
 | *Evergate* | `PPSA01885` | Unity | ✅ Reaches and renders the first tutorial-room gameplay |
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Native 1920×1080 opening gameplay reached; scripted input and audio verified; `gris-gameplay` guard |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Native 1920×1080 tutorial combat and audio verified; `cobra-gameplay` guard |
-| *Sonic Origins*&nbsp;² | `PPSA05325` | Hedgehog Engine | 🔬 Frontend loop reached; supplied update-only dump lacks its base title assets |
+| *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 Complete Sonic Origins Plus base+update with four DLC packs reaches a black startup loop; two requested UI paths do not resolve (#1905) |
 | Terminator (2D)&nbsp;¹ | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay reached (user-verified) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Day One gameplay renders; the manor entrance hall matches the hardware reference |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
@@ -57,10 +57,6 @@ closing bugs. Every title in the tested inventory has a long-lived tracker in th
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🔬 Clean 1080p opening key art renders, then the guest faults and the image stops advancing before a title screen |
 
 ¹ Exact retail game name pending confirmation.
-
-² No compatibility milestone is claimed for the incomplete Sonic dump. A merged base+update image is
-required before its title, gameplay, or audio can be evaluated. The guest also consumes an authentic
-Sonic 1 activity launch, but still needs the same base UI assets before entering the classic runtime.
 
 The dated 2026-08-02 frame-rate sweep and its measurement caveats are retained in
 [#1739](https://github.com/mattias800/prosper/issues/1739), rather than duplicated in this overview.
@@ -191,18 +187,20 @@ advertised Cx records instead of exposing stale stack entries as register writes
 
 ## Sonic Origins — `PPSA05325`
 
-The supplied 02.002.000 directory is an update image targeting 02.001.000, rather than a merged
-base+update app. Live file tracing shows that its only unresolved startup requests are
-`raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/ui_title_nocopy.dds`; both are absent from the dump.
-The game otherwise initializes its renderer, connected pad, CRI sound banks, and AudioOut2 pump, but
-correctly remains in a black startup loop and emits silence without those title assets. No screenshot,
-audio, or compatibility success is claimed until a complete dump is available.
+The complete Sonic Origins Plus 02.002.000 installation contains its base executable and content,
+all four classic RSDK games, installed update state, and four DLC mounts. Its
+`targetContentVersion: 02.001.000` records update lineage; it does not mean that the assembled app is
+an update-only image. Live file tracing nevertheless finds two unresolved loose startup paths:
+`raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/ui_title_nocopy.dds`. Prosper then remains in a black
+startup loop with silent AudioOut2 buffers despite initializing its renderer, connected pad, and CRI
+sound banks. This is now tracked as an archive, update-overlay, mount, or path-resolution defect in
+[#1905](https://github.com/mattias800/prosper/issues/1905), not as an incomplete user dump. No title,
+audio, or compatibility milestone is claimed yet.
 
-The update declares PS5 `launchActivity` support and contains the classic RSDK files. An exact
-`TITLE_SONIC_1_CLASSIC` Game Intent is received by the guest and its `activityId` property is consumed,
-but Sonic still requests both missing UI files before opening `raw/retro/Sonic1u.rsdk`. This rules out
-the platform activity route as a way around the incomplete content while preserving truthful default
-no-intent behavior.
+The app declares PS5 `launchActivity` support. An exact `TITLE_SONIC_1_CLASSIC` Game Intent is received
+by the guest and its `activityId` property is consumed, but Sonic still requests both unresolved UI
+paths before opening `raw/retro/Sonic1u.rsdk`. The platform activity route therefore does not bypass
+the startup-resolution blocker; truthful default no-intent behavior remains preserved.
 
 Routes, capture commands, audio evidence, and the Sonic audit are recorded in
 [`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md).
