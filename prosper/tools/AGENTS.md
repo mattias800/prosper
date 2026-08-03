@@ -278,10 +278,12 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   `PROSPER_COMPUTE_TIMING_HASH=0x...`; use `PROSPER_COMPUTE_TIMING_CODE=0x...` only for a known
   run-local address. If both are present they are an AND. The accepted/ignored banner, first-match
   line, and termination `seen`/`matched` summary are part of the validity contract: zero matches is
-  apparatus-invalid. Every selected phase/image record carries both identities. The selector's pure
+  apparatus-invalid. `prosper-app` publishes that summary explicitly before its deliberate `_Exit`;
+  ordinary teardown retains the same idempotent destructor fallback. Every selected phase/image
+  record carries both identities. The selector's pure
   policy is covered by ctest `compute_timing_selector_policy`; run
-  `tools/perf/mutate_compute_timing_selector.sh` to prove the exact mismatch and zero-match checks
-  kill their corresponding mutations.
+  `tools/perf/mutate_compute_timing_selector.sh` to prove the exact mismatch, zero-match, and
+  duplicate-summary checks kill their corresponding mutations.
   `test_compute_phase_report.py` self-tests it (ctest `compute_phase_report_logic`), and
   `mutate_compute_phase_report.sh` checks that suite at **per-check granularity** — each mutation must
   be killed by the check written for it, because a survivor masked by red siblings is invisible when

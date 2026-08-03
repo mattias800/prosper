@@ -2,8 +2,9 @@
 # Per-check mutation coverage for the pure compute-timing selector policy.
 #
 # A green selector test proves its fixtures ran. These mutations prove that the exact checks named
-# below detect the two dangerous failure shapes: accepting the wrong stable program, and calling a
-# zero-match run valid. The tracked source is never edited; each mutation builds a scratch copy.
+# below detect the three dangerous failure shapes: accepting the wrong stable program, calling a
+# zero-match run valid, and publishing both the explicit and destructor summaries. The tracked
+# source is never edited; each mutation builds a scratch copy.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -62,6 +63,10 @@ run_mutation "accept mismatched stable hash" "stable hash mismatches never selec
 run_mutation "accept a zero-match run" "zero-match summary is apparatus-invalid" \
   'return counters.matched == 0;' \
   'return counters.matched != 0;' || bad=1
+run_mutation "allow duplicate summaries" \
+  "explicit report and destructor fallback emit exactly once" \
+  'if (counters.summary_reported) return false;' \
+  'if (false) return false;' || bad=1
 
 cp "$PRISTINE" "$HEADER"
 if build_and_run >/dev/null; then

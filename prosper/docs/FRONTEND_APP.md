@@ -378,7 +378,9 @@ they are an **AND**: the current address and stable hash must both match. The ha
 complete unsigned decimal or `0x` hexadecimal `uint64_t`; signs, whitespace, overflow, and trailing
 characters fail closed with an explicit `ignored` banner. An accepted selector prints one bounded
 `first-match` proof and a termination summary with `seen`/`matched`; `matched=0` is labelled
-`INVALID-zero-matches`, not evidence that the shader did not run. Selected `[compute-phase]`,
+`INVALID-zero-matches`, not evidence that the shader did not run. Because a booted app deliberately
+uses `_Exit` while its detached guest thread is still alive, it reports the summary explicitly just
+before that exit; the ordinary destructor remains an idempotent fallback. Selected `[compute-phase]`,
 `[compute-image]`, and `[compute-image-writeback]` lines carry both `code=` and `hash=` so copied logs
 retain their own identity.
 

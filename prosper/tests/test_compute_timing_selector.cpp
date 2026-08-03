@@ -104,9 +104,16 @@ int main() {
               saturated.matched == std::numeric_limits<uint64_t>::max(),
           "diagnostic counters saturate instead of wrapping");
 
+    ComputeTimingSelectorCounters reported_once{7, 3};
+    const bool explicit_report = claim_compute_timing_selector_summary(reported_once);
+    const bool destructor_fallback = claim_compute_timing_selector_summary(reported_once);
+    CHECK(explicit_report && !destructor_fallback && reported_once.summary_reported,
+          "explicit report and destructor fallback emit exactly once");
+
     ComputeTimingSelectorCounters zero_matches{7, 0};
     ComputeTimingSelectorCounters one_match{7, 1};
-    CHECK(compute_timing_zero_match_is_invalid(zero_matches) &&
+    CHECK(claim_compute_timing_selector_summary(zero_matches) &&
+              compute_timing_zero_match_is_invalid(zero_matches) &&
               !compute_timing_zero_match_is_invalid(one_match),
           "zero-match summary is apparatus-invalid");
 
