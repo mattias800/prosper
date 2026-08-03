@@ -987,6 +987,7 @@ Reusable input routes are documented in
 
 <p align="center">
   <img src="assets/screenshots/tactics-ogre-reborn-gameplay.png" alt="Tactics Ogre: Reborn — first tutorial battle in the interactive move-selection state, with known sprite and HUD composition defects">
+  <br><sub>Direct, unmodified Linux/RADV <code>screenshot</code>-frontend capture from the fresh-save route through Chapter 1 natural EOF and poll-separated Cross input; first tutorial battle <code>Select destination</code> state.</sub>
 </p>
 
 With a codec-enabled FFmpeg build, the custom-engine title decodes its HEVC startup movie and reaches
