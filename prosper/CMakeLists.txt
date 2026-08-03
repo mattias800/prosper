@@ -1169,6 +1169,12 @@ if(TARGET prosper_core)
       add_test(NAME gpu_replay_seeded_raw_execution
         COMMAND test_gpu_replay_seed_order $<TARGET_FILE:gpu_replay>)
 
+      # Exercise the real metadata-only CLI path for v46's selected raw resource-input witness.
+      # Unit tests cover verdict policy; this process test keeps inspect formatting from silently
+      # disappearing or collapsing full-match/mismatch/unavailable into one output state.
+      add_test(NAME gpu_replay_resource_input_inspect
+        COMMAND test_gpu_capture --inspect-resource-input $<TARGET_FILE:gpu_replay>)
+
       # Capture -> serialize -> owned replay backing -> SAME live renderer -> pixels. This specifically
       # proves replay textures do not dereference the captured guest VA and still sample exact bytes.
       add_executable(test_gpu_capture_render tests/test_gpu_capture_render.cpp)

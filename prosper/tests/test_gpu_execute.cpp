@@ -1327,6 +1327,11 @@ int main() {
         ordered.sh[P::SPI_SHADER_USER_DATA_PS_0 + 2] =
             static_cast<uint32_t>(cbuffer.size());
         ordered.sh[P::SPI_SHADER_USER_DATA_PS_0 + 3] = (22u << 12) | 0xFACu;
+        for (uint32_t i = 0; i < 4; ++i) {
+            const uint32_t reg = P::SPI_SHADER_USER_DATA_PS_0 + i;
+            ordered.sh_prov[reg] = 90u + i;
+            ordered.sh_prov_src[reg] = GpuState::pack_prov_src(1, 0, 77);
+        }
         GpuState::Draw draw;
         draw.index_count = 3;
         draw.command_order = 100;
@@ -1380,6 +1385,11 @@ int main() {
         const auto* post_blob = provenance &&
                 provenance->post_blob_index < captured.blobs.size()
             ? &captured.blobs[provenance->post_blob_index] : nullptr;
+        const ShaderResource* captured_normalized = nullptr;
+        if (read && !captured.draws.empty())
+            for (const auto& resource : captured.draws[0].prt.resources)
+                if (resource.resource.binding == 32)
+                    captured_normalized = &resource.resource;
         const bool exact_temporal_samples = provenance && realization_blob && post_blob &&
             provenance->draw_index == 0 &&
             provenance->stage == ShaderProgramStage::Fragment &&
@@ -1393,14 +1403,23 @@ int main() {
                        realization_blob->bytes.begin()) &&
             std::equal(post_bytes.begin(), post_bytes.end(),
                        post_blob->bytes.begin() + provenance->post_blob_offset);
-        if (!renderer_saw_resource || !compute_executed || !exact_temporal_samples)
+        const bool exact_raw_identity = provenance && captured_normalized &&
+            provenance->input_mode == GpuCaptureResourceInputMode::DirectVSharp &&
+            provenance->input_sh_register_base == P::SPI_SHADER_USER_DATA_PS_0 &&
+            provenance->input_write_provenance_mask == 0x0f &&
+            gpu_capture_resource_input_verdict(*provenance, *captured_normalized) ==
+                GpuCaptureResourceInputVerdict::FullMatch;
+        if (!renderer_saw_resource || !compute_executed || !exact_temporal_samples ||
+            !exact_raw_identity)
             std::printf("  [diag] ordered resource provenance: renderer=%d compute=%d read=%d "
-                        "error=%s records=%zu\n",
+                        "temporal=%d raw=%d error=%s records=%zu\n",
                         renderer_saw_resource ? 1 : 0, compute_executed ? 1 : 0,
-                        read ? 1 : 0, capture_error.c_str(),
+                        read ? 1 : 0, exact_temporal_samples ? 1 : 0,
+                        exact_raw_identity ? 1 : 0, capture_error.c_str(),
                         captured.resource_provenance.size());
-        CHECK(renderer_saw_resource && compute_executed && exact_temporal_samples,
-              "eager draw snapshots its selected resource once at ordered execution before mutation");
+        CHECK(renderer_saw_resource && compute_executed && exact_temporal_samples &&
+                  exact_raw_identity,
+              "ordered selected draw captures temporal bytes and matching raw direct-V# input");
         std::filesystem::remove(capture_path, filesystem_error);
     }
 

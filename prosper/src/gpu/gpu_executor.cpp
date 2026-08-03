@@ -2792,7 +2792,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                 in.pc, desc_v3);
                             return;
                         }
-                        DynFetch fetch{ in.pc, srsrc, with_off(d), desc_v3, from_seed };
+                        DynFetch fetch{ in.pc, srsrc, with_off(d), desc_v3 };
+                        fetch.from_seed = from_seed;
+                        // A legal instruction/SOFFSET transform changes the normalized base without
+                        // changing the four raw seed dwords.  That transformed resource no longer has
+                        // byte-identical descriptor identity, so it cannot name the entry V# as a
+                        // direct raw witness (doing so would manufacture a mismatch in #1853).
+                        if (fetch_off == 0 && consecutive_seed_copy_range(srsrc, 4))
+                            fetch.direct_user_data_index =
+                                val_seed_origin[static_cast<size_t>(srsrc)];
                         fetch.unshifted_desc = d;
                         if (is_mtbuf) fetch.instruction_format = in.mtbuf_format;
                         fetch.index_mode = fetch_index_mode_before_write;
@@ -3834,6 +3842,17 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             r.fetch_pc      = kv.fetch_pc;        // PER-FETCH provenance = the exact fetch instruction
             r.fetch_index_mode = kv.index_mode;
             r.srt_offset    = 0xFFFFFFFFu;
+            // The dynamic fold may resolve a descriptor loaded or patched inside the shader. Only
+            // an unchanged four-dword entry seed has one exact raw PM4 SH source. Keep the primary
+            // entry range that actually fed the fold; do not search other stage bases by whether
+            // their decoded output happens to equal this normalized resource (#1853).
+            if (kv.direct_user_data_index <= kUserSgprs - 4u) {
+                r.direct_vsharp_sh_register_base =
+                    bases[0] + range_start + kv.direct_user_data_index;
+            } else {
+                r.direct_vsharp_sh_register_base =
+                    ShaderResource::kDirectVSharpOriginAmbiguous;
+            }
             if (!d.size_bytes && is_ps) {
                 static std::mutex zero_ps_mx;
                 static std::set<std::tuple<uint64_t, uint32_t, uint32_t>> zero_ps_seen;
@@ -4055,6 +4074,26 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     t.resources.push_back(r);
                 }
             }
+        }
+        // Metadata-described DIRECT buffers came from this exact candidate user-data range.
+        // Dynamic-fold resources already carry either their proven primary seed or the explicit
+        // ambiguous sentinel and are therefore never overwritten here.
+        for (auto& resource : t.resources) {
+            if (resource.direct_vsharp_sh_register_base !=
+                    ShaderResource::kDirectVSharpOriginUnavailable ||
+                resource.srt_offset != 0xFFFFFFFFu ||
+                resource.sgpr_base == 0xFFFFFFFFu ||
+                (resource.cls != ResourceClass::ConstantBuffer &&
+                 resource.cls != ResourceClass::VertexBuffer))
+                continue;
+            if (resource.sgpr_base < user_sgpr_base ||
+                resource.sgpr_base - user_sgpr_base > kUserSgprs - 4u) {
+                resource.direct_vsharp_sh_register_base =
+                    ShaderResource::kDirectVSharpOriginAmbiguous;
+                continue;
+            }
+            resource.direct_vsharp_sh_register_base = base + range_start +
+                (resource.sgpr_base - user_sgpr_base);
         }
         if (t.resources.empty()) continue;
         t.vertices_per_instance = is_ps ? 0u : draw_vertex_count;
@@ -5980,7 +6019,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 if (realized) {
                     if (capture_trace) {
                         snapshot_pending_gpu_capture_draw_resource(
-                            capture_trace->pending_capture, item);
+                            capture_trace->pending_capture, item, {}, &st);
                         capture_trace->draws.push_back(item);
                     }
                     span.push_back(std::move(item));

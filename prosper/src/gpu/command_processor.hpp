@@ -23,13 +23,13 @@ struct ShaderReg { uint32_t offset; uint32_t value; };
 // Folded GPU state after replaying a command stream.
 struct GpuState {
     std::unordered_map<uint32_t, uint32_t> cx, sh, uc;   // register files by offset
-    // PROSPER_UDPROV=1 (issue #305 instrument, diagnostic-only): per-SH-register last-write
-    // provenance. Resolved register VALUES cannot distinguish "this draw's bind wrote this dword"
+    // PROSPER_UDPROV=1 (issue #305) or an armed resource-provenance selector (#1853): per-SH-register
+    // last-write provenance. Resolved register VALUES cannot distinguish "this draw's bind wrote this dword"
     // from "a previous pipeline's bind wrote it and no newer write arrived" — which is exactly the
     // question the stale-user-data defect asks. Records, for each Sh offset, the command_order of
     // its most recent write with bit 63 set when that write came from the indirect
-    // (Set*RegsIndirect) path. Populated ONLY when the env var is set, so the default fold pays
-    // nothing and the per-draw snapshot copy is unchanged.
+    // (Set*RegsIndirect) path. Populated ONLY when one instrument is armed from process start, so the
+    // default fold pays nothing and the per-draw snapshot copy is unchanged.
     std::unordered_map<uint32_t, uint64_t> sh_prov;
     static constexpr uint64_t kProvIndirect = uint64_t{1} << 63;
     // Companion map for the same writes: WHERE the packet came from, which `command_order` alone
@@ -300,7 +300,7 @@ struct RegWatchEntry {
 // so one bad entry cannot silently disable a whole watch. An empty/absent setting yields no entries.
 std::vector<RegWatchEntry> parse_reg_watch(const char* setting);
 
-// PROSPER_UDPROV=1 (#305 instrument): whether GpuState::sh_prov write provenance is being recorded.
+// Whether GpuState::sh_prov write provenance is being recorded for #305 or selected capture #1853.
 bool udprov_enabled();
 
 } // namespace prosper::gpu

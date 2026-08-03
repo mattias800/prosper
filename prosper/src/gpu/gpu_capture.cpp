@@ -107,7 +107,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v45 (#1849): retain one opt-in draw-time resource sample and its independently captured post-submit
 // span. The append-only record references ordinary blobs so both read counts, bytes, and hashes remain
 // auditable offline; captures without the selector append only a zero count and copy no extra bytes.
-constexpr uint32_t kVersion = 45;
+// v46 (#1853): retain the selected direct V#'s four raw stage USER_DATA dwords and each dword's
+// PM4 last-write provenance. Replay decodes this input independently and compares it with the v45
+// normalized descriptor; unsupported/ambiguous paths are recorded as explicitly unavailable.
+constexpr uint32_t kVersion = 46;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -973,6 +976,28 @@ bool validate_dma_copies(const GpuCaptureFile& capture, std::string& error) {
     return true;
 }
 
+GpuCaptureResourceInputUnavailableReason direct_vsharp_coverage_reason(
+        const std::array<uint32_t, 4>& dwords) {
+    const DecodedBufferDescriptor decoded = decode_buffer_descriptor(dwords.data());
+    const bool format_unavailable =
+        decoded.format == DataFormat::Unknown || decoded.num_components == 0;
+    const bool size_unavailable = decoded.size_bytes == 0;
+    if (format_unavailable && size_unavailable)
+        return GpuCaptureResourceInputUnavailableReason::RawFormatAndSizeUnavailable;
+    if (format_unavailable)
+        return GpuCaptureResourceInputUnavailableReason::RawFormatUnavailable;
+    if (size_unavailable)
+        return GpuCaptureResourceInputUnavailableReason::RawSizeUnavailable;
+    return GpuCaptureResourceInputUnavailableReason::None;
+}
+
+bool is_direct_vsharp_coverage_reason(GpuCaptureResourceInputUnavailableReason reason) {
+    return reason == GpuCaptureResourceInputUnavailableReason::None ||
+        reason == GpuCaptureResourceInputUnavailableReason::RawFormatUnavailable ||
+        reason == GpuCaptureResourceInputUnavailableReason::RawSizeUnavailable ||
+        reason == GpuCaptureResourceInputUnavailableReason::RawFormatAndSizeUnavailable;
+}
+
 bool validate_resource_provenance(const GpuCaptureFile& capture, std::string& error) {
     if (capture.resource_provenance.size() > 1) {
         error = "invalid resource provenance record count";
@@ -1004,9 +1029,15 @@ bool validate_resource_provenance(const GpuCaptureFile& capture, std::string& er
             return false;
         }
 
+        const GpuCapturedDraw* captured_draw = nullptr;
         const GpuCapturedResource* captured_resource = nullptr;
         for (const auto& draw : capture.draws) {
             if (draw.draw_index != provenance.draw_index) continue;
+            if (captured_draw && captured_draw != &draw) {
+                error = "ambiguous resource provenance draw identity";
+                return false;
+            }
+            captured_draw = &draw;
             const auto& table = provenance.stage == ShaderProgramStage::Vertex
                 ? draw.vrt : draw.prt;
             for (const auto& resource : table.resources) {
@@ -1027,6 +1058,58 @@ bool validate_resource_provenance(const GpuCaptureFile& capture, std::string& er
             captured_resource->blob_index != provenance.post_blob_index ||
             captured_resource->blob_offset != provenance.post_blob_offset) {
             error = "resource provenance does not match its captured descriptor";
+            return false;
+        }
+        const auto reason_value = static_cast<uint32_t>(provenance.input_unavailable_reason);
+        if (provenance.input_mode == GpuCaptureResourceInputMode::Unavailable) {
+            if (provenance.input_unavailable_reason ==
+                    GpuCaptureResourceInputUnavailableReason::None ||
+                reason_value > static_cast<uint32_t>(
+                    GpuCaptureResourceInputUnavailableReason::MissingWriteProvenance) ||
+                provenance.input_write_provenance_mask != 0 ||
+                provenance.input_sh_register_base != 0xFFFFFFFFu ||
+                std::any_of(provenance.input_dwords.begin(), provenance.input_dwords.end(),
+                            [](uint32_t value) { return value != 0; }) ||
+                std::any_of(provenance.input_last_writes.begin(),
+                            provenance.input_last_writes.end(),
+                            [](uint64_t value) { return value != 0; }) ||
+                std::any_of(provenance.input_write_sources.begin(),
+                            provenance.input_write_sources.end(),
+                            [](uint64_t value) { return value != 0; })) {
+                error = "invalid unavailable resource input witness";
+                return false;
+            }
+        } else if (provenance.input_mode == GpuCaptureResourceInputMode::DirectVSharp) {
+            if (!captured_draw || provenance.input_write_provenance_mask != 0x0fu ||
+                provenance.input_sh_register_base > GpuState::kRegOffsetLimit - 4u ||
+                !is_direct_vsharp_coverage_reason(
+                    provenance.input_unavailable_reason) ||
+                provenance.input_unavailable_reason !=
+                    direct_vsharp_coverage_reason(provenance.input_dwords)) {
+                error = "invalid direct resource input witness";
+                return false;
+            }
+            for (const uint64_t write : provenance.input_last_writes) {
+                const uint64_t order = write & ~GpuState::kProvIndirect;
+                if (!order || order >= captured_draw->command_order) {
+                    error = "resource input write does not precede selected draw";
+                    return false;
+                }
+            }
+            for (const uint64_t source : provenance.input_write_sources) {
+                const uint8_t queue = static_cast<uint8_t>(source & 0xffu);
+                const uint8_t jump_depth = static_cast<uint8_t>((source >> 8u) & 0xffu);
+                const uint32_t fold = static_cast<uint32_t>(source >> 16u);
+                // pack_prov_src allocates bits 0..47 as q8/j8/fold32.  The command processor
+                // admits queue origins 0..3 and records Jump depth 0..8 inclusive (the parent at
+                // depth 7 may enter its final child at depth 8).  A top-level fold id is never zero.
+                if (queue > 3u || jump_depth > 8u || fold == 0u || (source >> 48u) != 0u) {
+                    error = "invalid resource input write source";
+                    return false;
+                }
+            }
+        } else {
+            error = "invalid resource input witness mode";
             return false;
         }
     }
@@ -2439,6 +2522,22 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u64(provenance.realization_content_hash);
         w.u64(provenance.post_content_hash);
     }
+    // v46 appends the input-side witness separately so every v45 record remains byte-exact. Repeat
+    // semantic identity before the raw dwords: a reordered vector must fail visibly instead of
+    // silently assigning one draw's witness to another normalized descriptor.
+    w.u32(static_cast<uint32_t>(c.resource_provenance.size()));
+    for (const auto& provenance : c.resource_provenance) {
+        w.u64(provenance.draw_index);
+        w.u8(static_cast<uint8_t>(provenance.stage));
+        w.u32(provenance.binding);
+        w.u8(static_cast<uint8_t>(provenance.input_mode));
+        w.u8(static_cast<uint8_t>(provenance.input_unavailable_reason));
+        w.u8(provenance.input_write_provenance_mask);
+        w.u32(provenance.input_sh_register_base);
+        for (const uint32_t value : provenance.input_dwords) w.u32(value);
+        for (const uint64_t write : provenance.input_last_writes) w.u64(write);
+        for (const uint64_t source : provenance.input_write_sources) w.u64(source);
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -3517,6 +3616,36 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         }
         if (!validate_resource_provenance(c, error)) return false;
     }
+    if (version >= 46) {
+        uint32_t count = 0;
+        if (!r.u32(count) || count != c.resource_provenance.size()) {
+            error = "invalid resource input witness record count";
+            return false;
+        }
+        for (auto& provenance : c.resource_provenance) {
+            uint64_t draw_index = 0;
+            uint8_t stage = 0, mode = 0, reason = 0, provenance_mask = 0;
+            uint32_t binding = 0;
+            if (!r.u64(draw_index) || !r.u8(stage) || !r.u32(binding) ||
+                !r.u8(mode) || !r.u8(reason) || !r.u8(provenance_mask) ||
+                !r.u32(provenance.input_sh_register_base))
+                return false;
+            if (draw_index != provenance.draw_index ||
+                stage != static_cast<uint8_t>(provenance.stage) ||
+                binding != provenance.binding) {
+                error = "resource input witness identity mismatch";
+                return false;
+            }
+            provenance.input_mode = static_cast<GpuCaptureResourceInputMode>(mode);
+            provenance.input_unavailable_reason =
+                static_cast<GpuCaptureResourceInputUnavailableReason>(reason);
+            provenance.input_write_provenance_mask = provenance_mask;
+            for (auto& value : provenance.input_dwords) if (!r.u32(value)) return false;
+            for (auto& write : provenance.input_last_writes) if (!r.u64(write)) return false;
+            for (auto& source : provenance.input_write_sources) if (!r.u64(source)) return false;
+        }
+        if (!validate_resource_provenance(c, error)) return false;
+    }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)
         restore_legacy_color_target_aliases(diagnostic);
@@ -3890,9 +4019,170 @@ bool parse_gpu_capture_resource_selector(std::string_view text,
     return true;
 }
 
+const char* gpu_capture_resource_input_unavailable_reason_name(
+        GpuCaptureResourceInputUnavailableReason reason) {
+    switch (reason) {
+        case GpuCaptureResourceInputUnavailableReason::None: return "none";
+        case GpuCaptureResourceInputUnavailableReason::CapturePredatesWitness:
+            return "capture-predates-v46";
+        case GpuCaptureResourceInputUnavailableReason::NoSemanticState:
+            return "no-semantic-draw-state";
+        case GpuCaptureResourceInputUnavailableReason::NonDirectResource:
+            return "not-a-direct-vsharp";
+        case GpuCaptureResourceInputUnavailableReason::InvalidSgprRange:
+            return "invalid-direct-sgpr-range";
+        case GpuCaptureResourceInputUnavailableReason::NoRawOrigin:
+            return "no-raw-sh-origin";
+        case GpuCaptureResourceInputUnavailableReason::AmbiguousRawOrigin:
+            return "ambiguous-raw-sh-origin";
+        case GpuCaptureResourceInputUnavailableReason::MissingWriteProvenance:
+            return "missing-sh-write-provenance";
+        case GpuCaptureResourceInputUnavailableReason::RawFormatUnavailable:
+            return "raw-format-not-architecturally-available";
+        case GpuCaptureResourceInputUnavailableReason::RawSizeUnavailable:
+            return "raw-size-not-architecturally-available";
+        case GpuCaptureResourceInputUnavailableReason::RawFormatAndSizeUnavailable:
+            return "raw-format-and-size-not-architecturally-available";
+    }
+    return "invalid-unavailable-reason";
+}
+
+GpuCaptureResourceInputVerdict gpu_capture_resource_input_verdict(
+        const GpuCaptureResourceProvenance& provenance,
+        const ShaderResource& normalized_resource) {
+    if (provenance.input_mode == GpuCaptureResourceInputMode::Unavailable)
+        return GpuCaptureResourceInputVerdict::Unavailable;
+    if (provenance.input_mode != GpuCaptureResourceInputMode::DirectVSharp ||
+        provenance.input_write_provenance_mask != 0x0fu ||
+        provenance.input_sh_register_base == 0xFFFFFFFFu)
+        return GpuCaptureResourceInputVerdict::Mismatch;
+
+    // Decode only architecturally encoded V# fields. Shader-instruction formats and compatibility
+    // allocations are front-half policy, not evidence in these four raw dwords.  Compare every
+    // counterpart the raw descriptor does encode before reporting a missing field as unavailable:
+    // NUM_RECORDS=0 still proves format/components, and FORMAT=INVALID still proves byte size.
+    const DecodedBufferDescriptor decoded =
+        decode_buffer_descriptor(provenance.input_dwords.data());
+    if (normalized_resource.srt_offset != 0xFFFFFFFFu ||
+        normalized_resource.sgpr_base != provenance.sgpr_base ||
+        normalized_resource.gpu_addr != provenance.guest_addr ||
+        normalized_resource.gpu_addr != decoded.base ||
+        normalized_resource.stride != decoded.stride)
+        return GpuCaptureResourceInputVerdict::Mismatch;
+
+    const auto coverage_reason = direct_vsharp_coverage_reason(provenance.input_dwords);
+    if (provenance.input_unavailable_reason != coverage_reason)
+        return GpuCaptureResourceInputVerdict::Mismatch;
+
+    const bool format_available =
+        coverage_reason != GpuCaptureResourceInputUnavailableReason::RawFormatUnavailable &&
+        coverage_reason !=
+            GpuCaptureResourceInputUnavailableReason::RawFormatAndSizeUnavailable;
+    const bool size_available =
+        coverage_reason != GpuCaptureResourceInputUnavailableReason::RawSizeUnavailable &&
+        coverage_reason !=
+            GpuCaptureResourceInputUnavailableReason::RawFormatAndSizeUnavailable;
+    if (format_available &&
+        (normalized_resource.format != decoded.format ||
+         normalized_resource.num_components != decoded.num_components))
+        return GpuCaptureResourceInputVerdict::Mismatch;
+    if (size_available && normalized_resource.size != decoded.size_bytes)
+        return GpuCaptureResourceInputVerdict::Mismatch;
+    if (coverage_reason != GpuCaptureResourceInputUnavailableReason::None)
+        return GpuCaptureResourceInputVerdict::Unavailable;
+    return GpuCaptureResourceInputVerdict::FullMatch;
+}
+
+namespace {
+
+void capture_resource_input_witness(GpuCaptureResourceProvenance& provenance,
+                                    const ShaderResource& selected,
+                                    const DrawItem& draw,
+                                    const GpuState* semantic_state) {
+    provenance.input_mode = GpuCaptureResourceInputMode::Unavailable;
+    provenance.input_unavailable_reason =
+        GpuCaptureResourceInputUnavailableReason::NoSemanticState;
+    provenance.input_write_provenance_mask = 0;
+    provenance.input_sh_register_base = 0xFFFFFFFFu;
+    provenance.input_dwords = {};
+    provenance.input_last_writes = {};
+    provenance.input_write_sources = {};
+
+    if (selected.srt_offset != 0xFFFFFFFFu || selected.sgpr_base == 0xFFFFFFFFu) {
+        provenance.input_unavailable_reason =
+            GpuCaptureResourceInputUnavailableReason::NonDirectResource;
+        return;
+    }
+    if (selected.direct_vsharp_sh_register_base ==
+        ShaderResource::kDirectVSharpOriginAmbiguous) {
+        provenance.input_unavailable_reason =
+            GpuCaptureResourceInputUnavailableReason::AmbiguousRawOrigin;
+        return;
+    }
+    if (selected.direct_vsharp_sh_register_base ==
+        ShaderResource::kDirectVSharpOriginUnavailable) {
+        provenance.input_unavailable_reason =
+            GpuCaptureResourceInputUnavailableReason::NoRawOrigin;
+        return;
+    }
+    const uint32_t shader_user_base =
+        provenance.stage == ShaderProgramStage::Fragment ? 0u : 8u;
+    if (selected.sgpr_base < shader_user_base ||
+        selected.sgpr_base - shader_user_base > 28u) {
+        provenance.input_unavailable_reason =
+            GpuCaptureResourceInputUnavailableReason::InvalidSgprRange;
+        return;
+    }
+    if (!semantic_state || draw.draw_index >= semantic_state->draws.size()) return;
+    const GpuState& draw_state = semantic_state->state_at_draw(
+        static_cast<size_t>(draw.draw_index));
+    provenance.input_sh_register_base = selected.direct_vsharp_sh_register_base;
+    if (provenance.input_sh_register_base > GpuState::kRegOffsetLimit - 4u) {
+        provenance.input_sh_register_base = 0xFFFFFFFFu;
+        provenance.input_unavailable_reason =
+            GpuCaptureResourceInputUnavailableReason::NoRawOrigin;
+        return;
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+        const auto value = draw_state.sh.find(provenance.input_sh_register_base + i);
+        if (value == draw_state.sh.end()) {
+            provenance.input_sh_register_base = 0xFFFFFFFFu;
+            provenance.input_dwords = {};
+            provenance.input_unavailable_reason =
+                GpuCaptureResourceInputUnavailableReason::NoRawOrigin;
+            return;
+        }
+        provenance.input_dwords[i] = value->second;
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+        const uint32_t reg = provenance.input_sh_register_base + i;
+        const auto write = draw_state.sh_prov.find(reg);
+        const auto source = draw_state.sh_prov_src.find(reg);
+        if (write == draw_state.sh_prov.end() || source == draw_state.sh_prov_src.end()) {
+            provenance.input_write_provenance_mask = 0;
+            provenance.input_sh_register_base = 0xFFFFFFFFu;
+            provenance.input_dwords = {};
+            provenance.input_last_writes = {};
+            provenance.input_write_sources = {};
+            provenance.input_unavailable_reason =
+                GpuCaptureResourceInputUnavailableReason::MissingWriteProvenance;
+            return;
+        }
+        provenance.input_write_provenance_mask |= static_cast<uint8_t>(1u << i);
+        provenance.input_last_writes[i] = write->second;
+        provenance.input_write_sources[i] = source->second;
+    }
+    provenance.input_mode = GpuCaptureResourceInputMode::DirectVSharp;
+    provenance.input_unavailable_reason =
+        direct_vsharp_coverage_reason(provenance.input_dwords);
+}
+
+} // namespace
+
 void snapshot_pending_gpu_capture_draw_resource(PendingGpuCapture* pending,
                                                 const DrawItem& draw,
-                                                const CaptureMemoryReader& reader) {
+                                                const CaptureMemoryReader& reader,
+                                                const GpuState* semantic_state) {
     // This check is the normal-path cost: no table walk, allocation, or guest-memory read occurs
     // unless a capture explicitly requests one semantic resource.
     if (!pending || !pending->resource_provenance_armed ||
@@ -3948,6 +4238,7 @@ void snapshot_pending_gpu_capture_draw_resource(PendingGpuCapture* pending,
     provenance.srt_offset = selected->srt_offset;
     provenance.sgpr_base = selected->sgpr_base;
     provenance.realization_content_hash = blob.content_hash;
+    capture_resource_input_witness(provenance, *selected, draw, semantic_state);
     pending->resource_provenance_realization_blob = std::move(blob);
 }
 
@@ -4339,7 +4630,8 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
         // producer. Deferred capture therefore has exactly one temporal owner, the ordered executor.
         if (!defer_materialization)
             for (const auto& draw : draws)
-                snapshot_pending_gpu_capture_draw_resource(pending.get(), draw);
+                snapshot_pending_gpu_capture_draw_resource(
+                    pending.get(), draw, {}, semantic_state);
     }
     pending->output_triggered = output_triggered;
     if (output_triggered) {

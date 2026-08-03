@@ -101,11 +101,27 @@ void reg_watch_report(RegClass reg_class, uint32_t offset, uint32_t value, uint3
 }
 }  // namespace
 
-// PROSPER_UDPROV=1 (#305 instrument): enable per-SH-register write provenance recording.
+// Enable per-SH-register write provenance recording for #305 or selected capture #1853.
 bool udprov_enabled() {
-    static const bool on = std::getenv("PROSPER_UDPROV") != nullptr;
+    // #1853: a selected resource-input witness needs this state from the first SH write, before the
+    // capture candidate is reached. The selector is process-start configuration just like UDPROV;
+    // enabling it records the maps without enabling RESDUMP/UDPROV's high-volume live output.
+    static const bool on = std::getenv("PROSPER_UDPROV") != nullptr ||
+        std::getenv("PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE") != nullptr;
     return on;
 }
+
+namespace {
+// Test-only fault injection for the #1853 provenance collector.  Keep the public activation
+// predicate true so the mutation exercises the selected-witness consumer, but suppress both the
+// write maps and their draw snapshot.  This is intentionally queried dynamically: the focused
+// regression arms it only for its safe cross-thread fixture after the older .at()-based provenance
+// checks have completed.
+bool udprov_collection_enabled() {
+    return udprov_enabled() &&
+        std::getenv("PROSPER_TEST_DISABLE_UDPROV_COLLECTION") == nullptr;
+}
+} // namespace
 
 // Readability probe (gpu_executor.cpp, declared in gpu_execute.hpp): page-granular check that a
 // guest range is mapped, so the Jump fold below never walks an unmapped segment address.
@@ -2739,7 +2755,7 @@ void GpuState::apply(const Pm4Command& c) {
                     continue;
                 }
                 file[offset] = regs[i].value;
-                if (udprov_enabled() && c.reg_class == RegClass::Sh) {
+                if (udprov_collection_enabled() && c.reg_class == RegClass::Sh) {
                     sh_prov[offset] = command_order | kProvIndirect;
                     sh_prov_src[offset] = pack_prov_src(
                         c.queue_origin, jump_depth,
@@ -2859,7 +2875,7 @@ void GpuState::apply(const Pm4Command& c) {
             }
             for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++)
                 file[c.reg_offset + k] = c.reg_data[k];
-            if (udprov_enabled() && c.reg_class == RegClass::Sh) {
+            if (udprov_collection_enabled() && c.reg_class == RegClass::Sh) {
                 const uint64_t src = pack_prov_src(c.queue_origin, jump_depth,
                                                    g_fold_seq.load(std::memory_order_relaxed));
                 for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++) {
@@ -2951,7 +2967,7 @@ void GpuState::apply(const Pm4Command& c) {
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
+                if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -3002,7 +3018,7 @@ void GpuState::apply(const Pm4Command& c) {
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
+                if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -3045,7 +3061,7 @@ void GpuState::apply(const Pm4Command& c) {
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
+                if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -3246,7 +3262,7 @@ void GpuState::apply(const Pm4Command& c) {
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
+                if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
@@ -3278,7 +3294,7 @@ void GpuState::apply(const Pm4Command& c) {
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
-                if (udprov_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
+                if (udprov_collection_enabled()) { snap->sh_prov = sh_prov; snap->sh_prov_src = sh_prov_src; }
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }

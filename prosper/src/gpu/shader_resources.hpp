@@ -186,6 +186,15 @@ struct ShaderResource {
     uint32_t      srt_offset    = 0xFFFFFFFFu;
     uint32_t      sgpr_base     = 0xFFFFFFFFu;
 
+    // Exact input-side origin for a DIRECT four-dword V# in the PM4 SH register file. This is
+    // runtime realization provenance only; it does not affect descriptor binding or shader-cache
+    // identity. The front half sets an absolute SPI_SHADER_USER_DATA_* register when it can prove
+    // that all four descriptor words came from one entry user-data range. A shader-loaded/modified
+    // descriptor can still be a valid runtime resource but has no single raw SH origin.
+    static constexpr uint32_t kDirectVSharpOriginUnavailable = 0xFFFFFFFFu;
+    static constexpr uint32_t kDirectVSharpOriginAmbiguous = 0xFFFFFFFEu;
+    uint32_t direct_vsharp_sh_register_base = kDirectVSharpOriginUnavailable;
+
     //   * fetch_pc — PER-FETCH: the pc of the exact buffer/tbuffer format instruction this descriptor was
     //     resolved for. A single SRSRC SGPR is reloaded with a DIFFERENT V# per vertex attribute (position,
     //     uv, color, …), so keying only by sgpr_base collapses them to the first. MUBUF may fall back to

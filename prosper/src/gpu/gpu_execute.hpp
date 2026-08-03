@@ -168,6 +168,11 @@ size_t dynamic_fold_shader_dwords(uint32_t shader_size_bytes);
 // unit-testable; production callers stay inside gpu_executor.cpp.
 struct DynFetch {
     uint32_t fetch_pc; int srsrc; DecodedBufferDescriptor desc; uint32_t desc_v3;
+    // Entry user-data dword that supplied the first raw V# word, proven only when all four live
+    // descriptor words remain an unchanged consecutive seed (possibly through scalar moves) and
+    // the fetch adds no instruction/SOFFSET byte transform to the normalized descriptor base.
+    // UINT32_MAX means the descriptor was loaded, patched, or otherwise has no single SH origin.
+    uint32_t direct_user_data_index = UINT32_MAX;
     // True when the V# came from the user-data SEED fallback (never s_loaded/patched-tracked). A
     // seed entry must NOT shadow a metadata-described direct vertex buffer at the same SGPRs: the
     // by_fetch_pc dyn path models the element address as gl_VertexIndex*stride (per-attribute

@@ -3,6 +3,7 @@
 
 #include "gpu_execute.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -60,6 +61,36 @@ struct GpuCaptureResourceSelector {
     uint32_t binding = 0;
 };
 
+// Capture-v46 input-side witness for the one resource selected by
+// PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE.  The normalized ShaderResource is the front-half output;
+// these fields retain the direct V# dwords and their PM4 write provenance so replay can decode the
+// input independently.  Unsupported/ambiguous paths stay explicit instead of copying the output back
+// into a structure that merely looks independent.
+enum class GpuCaptureResourceInputMode : uint8_t {
+    Unavailable = 0,
+    DirectVSharp = 1,
+};
+
+enum class GpuCaptureResourceInputUnavailableReason : uint8_t {
+    None = 0,
+    CapturePredatesWitness = 1,
+    NoSemanticState = 2,
+    NonDirectResource = 3,
+    InvalidSgprRange = 4,
+    NoRawOrigin = 5,
+    AmbiguousRawOrigin = 6,
+    MissingWriteProvenance = 7,
+    RawFormatUnavailable = 8,
+    RawSizeUnavailable = 9,
+    RawFormatAndSizeUnavailable = 10,
+};
+
+enum class GpuCaptureResourceInputVerdict : uint8_t {
+    Unavailable = 0,
+    FullMatch = 1,
+    Mismatch = 2,
+};
+
 struct GpuCaptureResourceProvenance {
     uint64_t draw_index = 0;
     ShaderProgramStage stage = ShaderProgramStage::Vertex;
@@ -74,6 +105,16 @@ struct GpuCaptureResourceProvenance {
     uint64_t post_blob_offset = 0;
     uint64_t realization_content_hash = 0;
     uint64_t post_content_hash = 0;
+    GpuCaptureResourceInputMode input_mode = GpuCaptureResourceInputMode::Unavailable;
+    GpuCaptureResourceInputUnavailableReason input_unavailable_reason =
+        GpuCaptureResourceInputUnavailableReason::CapturePredatesWitness;
+    uint8_t input_write_provenance_mask = 0;
+    uint32_t input_sh_register_base = 0xFFFFFFFFu;
+    std::array<uint32_t, 4> input_dwords{};
+    // Same encoding as GpuState::sh_prov: bit 63 is the indirect path, remaining bits are the
+    // command order. input_write_sources uses GpuState::pack_prov_src (queue/fold/Jump depth).
+    std::array<uint64_t, 4> input_last_writes{};
+    std::array<uint64_t, 4> input_write_sources{};
 };
 
 struct GpuCaptureShaderVersion {
@@ -429,9 +470,14 @@ struct PendingGpuCapture {
 };
 bool parse_gpu_capture_resource_selector(std::string_view text,
                                          GpuCaptureResourceSelector& selector);
+GpuCaptureResourceInputVerdict gpu_capture_resource_input_verdict(
+    const GpuCaptureResourceProvenance& provenance,
+    const ShaderResource& normalized_resource);
+const char* gpu_capture_resource_input_unavailable_reason_name(
+    GpuCaptureResourceInputUnavailableReason reason);
 void snapshot_pending_gpu_capture_draw_resource(
     PendingGpuCapture* pending, const DrawItem& draw,
-    const CaptureMemoryReader& reader = {});
+    const CaptureMemoryReader& reader = {}, const GpuState* semantic_state = nullptr);
 void snapshot_pending_gpu_capture_compute_gds(PendingGpuCapture* pending,
                                               const uint8_t* data, size_t bytes);
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
