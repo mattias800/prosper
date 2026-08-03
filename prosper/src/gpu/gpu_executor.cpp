@@ -158,6 +158,7 @@ struct ShaderResourceCompileKey {
     uint32_t height = 0;
     uint32_t depth = 0;
     uint32_t img_dim = 0;
+    uint32_t sample_count = 1;
     bool in_mip_tail = false;
     bool compression_enabled = false;
     uint32_t binding = 0;
@@ -338,6 +339,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.height);
             hash = hash_mix(hash, resource.depth);
             hash = hash_mix(hash, resource.img_dim);
+            hash = hash_mix(hash, resource.sample_count);
             hash = hash_mix(hash, resource.in_mip_tail);
             hash = hash_mix(hash, resource.compression_enabled);
             hash = hash_mix(hash, resource.binding);
@@ -1015,6 +1017,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.height = atomic_extent ? resource.height : 0u;
             compiled.depth = storage_image ? resource.depth : 0u;
             compiled.img_dim = (texture || storage_image) ? resource.img_dim : 0u;
+            compiled.sample_count = (texture || storage_image) ? resource.sample_count : 1u;
             compiled.in_mip_tail = storage_image && resource.in_mip_tail;
             compiled.compression_enabled = storage_image && resource.compression_enabled;
             compiled.binding = resource.binding;
@@ -3962,7 +3965,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         for (auto& r0 : t.resources)
                             if (r0.cls == wanted && r0.gpu_addr == view.base &&
                                 r0.width == view.width && r0.height == view.height &&
-                                r0.depth == d.depth && r0.format == fi.format && r0.img_dim == img_dim &&
+                                r0.depth == d.depth && r0.format == fi.format &&
+                                r0.img_dim == img_dim && r0.sample_count == d.sample_count &&
                                 r0.depth_compare == u.is_depth_compare &&
                                 r0.in_mip_tail == view.in_mip_tail &&
                                 r0.mip_tail_offset == (view.in_mip_tail ? view.mip_offset : 0) &&
@@ -3979,8 +3983,10 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.cls = wanted;
                     r.format = fi.format; r.num_components = fi.num_components;
                     r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
-                    r.declared_mip_levels =
-                        d.last_level >= d.base_level ? (uint32_t)(d.last_level - d.base_level) + 1u : 1u;
+                    r.sample_count = d.sample_count;
+                    r.declared_mip_levels = d.sample_count > 1u ? 1u :
+                        (d.last_level >= d.base_level ?
+                            (uint32_t)(d.last_level - d.base_level) + 1u : 1u);
                     r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
                     r.in_mip_tail = view.in_mip_tail;
                     r.mip_tail_offset = view.in_mip_tail
@@ -4005,9 +4011,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.depth_compare = u.is_depth_compare;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
-                    const uint64_t backing_bytes = is_bcn
+                    const uint64_t backing_bytes_per_sample = is_bcn
                         ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
                         : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
+                    if (!d.sample_count ||
+                        backing_bytes_per_sample > UINT32_MAX / d.sample_count) continue;
+                    const uint64_t backing_bytes = backing_bytes_per_sample * d.sample_count;
                     if (!backing_bytes || backing_bytes > UINT32_MAX) continue;
                     r.size = static_cast<uint32_t>(backing_bytes);
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;   // ambiguous/absent key: pc-only provenance
@@ -4388,7 +4397,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                             if (r0.cls == wanted && r0.gpu_addr == view.base &&
                                 r0.width == view.width && r0.height == view.height &&
                                 r0.depth == d.depth && r0.format == view_format &&
-                                r0.img_dim == img_dim && r0.depth_compare == u.is_depth_compare &&
+                                r0.img_dim == img_dim && r0.sample_count == d.sample_count &&
+                                r0.depth_compare == u.is_depth_compare &&
                                 r0.in_mip_tail == view.in_mip_tail &&
                                 r0.mip_tail_offset == (view.in_mip_tail ? view.mip_offset : 0) &&
                                 r0.mip_tail_x == view.mip_tail_x &&
@@ -4405,22 +4415,31 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     if (mapped_fmt) {
                         r.format = fi.format; r.num_components = fi.num_components;
                         const bool is_bcn = fi.block_width > 1;
-                        const uint64_t bytes = is_bcn
+                        const uint64_t bytes_per_sample = is_bcn
                             ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
                             : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
+                        if (!d.sample_count || bytes_per_sample > UINT32_MAX / d.sample_count)
+                            continue;
+                        const uint64_t bytes = bytes_per_sample * d.sample_count;
                         if (!bytes || bytes > UINT32_MAX) continue;
                         r.size = static_cast<uint32_t>(bytes);
                         r.srgb = fi.srgb;
                     } else {
-                        const uint64_t bytes = static_cast<uint64_t>(d.width) * d.height * d.depth * 4;
+                        const uint64_t bytes_per_sample =
+                            static_cast<uint64_t>(d.width) * d.height * d.depth * 4;
+                        if (!d.sample_count || bytes_per_sample > UINT32_MAX / d.sample_count)
+                            continue;
+                        const uint64_t bytes = bytes_per_sample * d.sample_count;
                         if (!bytes || bytes > UINT32_MAX) continue;
                         r.format = DataFormat::Unknown; r.num_components = 4;
                         r.size = static_cast<uint32_t>(bytes);
                     }
                     r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
+                    r.sample_count = d.sample_count;
                     r.tile_mode = d.tile_mode;
-                    r.declared_mip_levels =
-                        d.last_level >= d.base_level ? (uint32_t)(d.last_level - d.base_level) + 1u : 1u;
+                    r.declared_mip_levels = d.sample_count > 1u ? 1u :
+                        (d.last_level >= d.base_level ?
+                            (uint32_t)(d.last_level - d.base_level) + 1u : 1u);
                     r.in_mip_tail = view.in_mip_tail;
                     r.mip_tail_offset = view.in_mip_tail
                         ? static_cast<uint32_t>(view.mip_offset) : 0;

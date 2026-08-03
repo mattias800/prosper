@@ -216,6 +216,9 @@ struct ShaderResource {
     uint32_t      width             = 0;
     uint32_t      height            = 0;
     uint32_t      depth             = 1;
+    // Guest sample count. 2D_MSAA image_load is represented on the host as a single-sample 2D-array
+    // image with one exact sample plane per layer, while this field retains guest descriptor identity.
+    uint32_t      sample_count      = 1;
     uint32_t      tile_mode         = 0;                  // T# GFX10 TileMode; drives auto-detile of a sampled surface
     // Byte distance between rows of a linear sampled image. Zero means derive it from the live
     // descriptor/backing: exact HLE-producer provenance wins, other guest images use the GFX10

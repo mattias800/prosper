@@ -95,6 +95,16 @@ int main() {
               image_type_to_dim(14) == 6 && image_type_to_dim(15) == 7,
               "T# TYPE array/MSAA variants map to MIMG dims 4..7");
         CHECK(image_type_to_dim(0) == 1, "unknown T# TYPE keeps the conservative 2D fallback");
+        // Exact title-live 1920x1080 R32_FLOAT 2D_MSAA descriptor. TYPE 14 changes the meaning of
+        // LAST_LEVEL: value 2 is log2(4 samples), not a three-level mip range.
+        const uint32_t msaa_tsharp[8] = {
+            0x20382900u, 0xc1600000u, 0x010dc1dfu, 0xe1820924u,
+            0x00000000u, 0x00700020u, 0x80280400u, 0x00201208u,
+        };
+        const DecodedImageDescriptor dmsaa = decode_image_descriptor(msaa_tsharp);
+        CHECK(dmsaa.base == 0x2038290000ull && dmsaa.width == 1920 && dmsaa.height == 1080 &&
+                  dmsaa.type == 14 && dmsaa.last_level == 2 && dmsaa.sample_count == 4,
+              "2D_MSAA T# decodes LAST_LEVEL as four samples while preserving raw descriptor fields");
         uint32_t t3d[8];
         make_tsharp(t3d, 0x12000000ull, 32, 16, /*fmt*/56, /*tile*/0, /*type 3D*/10, /*depth*/8);
         t3d[6] = (2u << 15) | (1u << 17) | (1u << 19) | (1u << 20) |
@@ -264,6 +274,29 @@ int main() {
                   cube->layer_stride_bytes == 720896u &&
                   cube->layer_mip_offset_bytes == 65536u,
               "realized cube resource preserves selected-mip per-face layout");
+    }
+
+    // The runtime resource preserves the guest sample count, exposes one host mip, and bounds the
+    // complete four-plane allocation. This is the identity consumed by recompile, capture, and upload.
+    {
+        uint32_t sg[8];
+        make_tsharp(sg, 0x2038290000ull, 1920, 1080, /*R32_FLOAT*/22,
+                    /*SW_64KB_Z_X*/24, /*2D_MSAA*/14);
+        sg[3] |= 2u << 16; // LAST_LEVEL = log2(4 samples)
+        AgcShaderSharp sharp[1]; sharp[0].bits = 0;
+        AgcShaderUserData ud{};
+        ud.sharp_resource_offset[0] = sharp;
+        ud.sharp_resource_count[0] = 1;
+        AgcShaderHeader sh{};
+        sh.file_header = 0x34333231u; sh.version = 0x18; sh.type = 1; sh.user_data = &ud;
+        const ShaderResourceTable resources = build_shader_resources(sh, sg, 8);
+        const ShaderResource* msaa = resources.by_sgpr_base(0);
+        CHECK(msaa && msaa->img_dim == 6 && msaa->sample_count == 4 &&
+                  msaa->declared_mip_levels == 1 && msaa->depth == 1 &&
+                  msaa->format == DataFormat::Float32 && msaa->num_components == 1,
+              "realized 2D_MSAA resource retains four guest samples as one host mip");
+        CHECK(msaa && msaa->size == 1920u * 1080u * 4u * 4u,
+              "realized 2D_MSAA backing span includes every complete sample plane");
     }
 
     // A shifted thin-2D mip emits the selected extent and a matching backing span. Allocation-level

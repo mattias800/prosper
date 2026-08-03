@@ -1,6 +1,7 @@
 // tile.cpp — see tile.hpp. GFX10 SW_4KB_S de-swizzle, generalized over the element size (#119).
 // GFX10 SW_64KB_S / SW_64KB_R_X de-swizzle from the AMD addrlib swizzle-pattern tables (#288).
 #include "tile.hpp"
+#include <array>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -129,6 +130,7 @@ namespace {
 // Defined here (and the SW_64K_S table forward-declared) so sw4kb_morton below can derive the 4KB order
 // from the low bits of the SAME authoritative 64KB pattern (#379); both are defined together lower down.
 struct PatBit { uint16_t x, y; };
+struct PatBitMsaa { uint16_t x, y; uint8_t sample; };
 extern const PatBit kSw64kS[5][16];
 
 // GFX10 SW_256B_S is the micro-tiled standard swizzle used for small textures. AMD AddrLib's
@@ -400,6 +402,29 @@ static const PatBit kSw64kZX[5][16] = {
     { {0x0000,0x0000}, {0x0000,0x0000}, {0x0001,0x0000}, {0x0000,0x0001}, {0x0002,0x0000}, {0x0000,0x0002}, {0x0004,0x0000}, {0x0000,0x0004}, {0x0008,0x0008}, {0x0010,0x0010}, {0x0040,0x0020}, {0x0020,0x0040}, {0x0000,0x0008}, {0x0010,0x0000}, {0x0000,0x0040}, {0x0040,0x0000} },  // 4 bpe
     { {0x0000,0x0000}, {0x0000,0x0000}, {0x0000,0x0000}, {0x0001,0x0000}, {0x0000,0x0001}, {0x0002,0x0000}, {0x0000,0x0002}, {0x0004,0x0000}, {0x0008,0x0008}, {0x0010,0x0010}, {0x0040,0x0020}, {0x0020,0x0040}, {0x0000,0x0004}, {0x0008,0x0000}, {0x0000,0x0010}, {0x0040,0x0000} },  // 8 bpe
     { {0x0000,0x0000}, {0x0000,0x0000}, {0x0000,0x0000}, {0x0000,0x0000}, {0x0001,0x0000}, {0x0000,0x0001}, {0x0002,0x0000}, {0x0000,0x0002}, {0x0008,0x0008}, {0x0010,0x0010}, {0x0040,0x0020}, {0x0020,0x0040}, {0x0000,0x0004}, {0x0004,0x0000}, {0x0000,0x0008}, {0x0010,0x0000} },  // 16 bpe
+};
+
+// SW_64K_Z_X, 4 fragments, 16 pipes. Expanded from AMD AddrLib's
+// GFX10_SW_64K_Z_X_4xaa_PATINFO rows for the five supported element sizes. Unlike the 1xaa table,
+// S0/S1 are real address inputs: dropping them aliases all four samples. Z/slice remains zero for a
+// non-array 2D_MSAA resource. The pipe-count choice matches the established Oberon mode-24 path.
+// Source: AMD ROCr AddrLib gfx10SwizzlePattern.h (MIT), PATINFO rows {18..22, 74/95/96, 31/74..76}.
+static const PatBitMsaa kSw64kZX4x[5][16] = {
+    { {0,0,1}, {0,0,2}, {0x0001,0,0}, {0,0x0001,0}, {0x0002,0,0}, {0,0x0002,0}, {0x0004,0,0}, {0,0x0004,0},
+      {0x0008,0x0008,0}, {0x0010,0x0010,0}, {0x0040,0x0020,0}, {0x0020,0x0040,0},
+      {0,0x0008,0}, {0x0010,0,0}, {0,0x0040,0}, {0x0040,0,0} }, // 1 B
+    { {0,0,0}, {0,0,1}, {0,0,2}, {0x0001,0,0}, {0,0x0001,0}, {0x0002,0,0}, {0,0x0002,0}, {0x0004,0,0},
+      {0x0008,0x0008,0}, {0x0010,0x0010,0}, {0x0040,0x0020,0}, {0x0020,0x0040,0},
+      {0x0008,0,0}, {0,0x0010,0}, {0x0040,0,0}, {0,0x0004 | 0x0040,0} }, // 2 B
+    { {0,0,0}, {0,0,0}, {0,0,1}, {0,0,2}, {0x0001,0,0}, {0,0x0001,0}, {0x0002,0,0}, {0,0x0002,0},
+      {0x0008,0x0008,0}, {0x0010,0x0010,0}, {0x0040,0x0020,0}, {0x0020,0x0040,0},
+      {0,0x0008,0}, {0x0010,0,0}, {0,0x0004 | 0x0040,0}, {0x0004,0x0080,0} }, // 4 B
+    { {0,0,0}, {0,0,0}, {0,0,0}, {0,0,1}, {0,0,2}, {0x0001,0,0}, {0,0x0001,0}, {0x0002,0,0},
+      {0x0008,0x0008,0}, {0x0010,0x0010,0}, {0x0040,0x0020 | 0x0004,0}, {0x0020,0x0040,0},
+      {0,0x0008,0}, {0x0010,0,0}, {0,0x0002 | 0x0040,0}, {0x0004,0x0080,0} }, // 8 B
+    { {0,0,0}, {0,0,0}, {0,0,0}, {0,0,0}, {0,0,1}, {0,0,2}, {0x0001,0,0}, {0,0x0001,0},
+      {0x0008,0x0008,0}, {0x0010,0x0010,0}, {0x0040,0x0020 | 0x0004,0}, {0x0022,0x0040,0},
+      {0,0x0008,0}, {0x0010,0,0}, {0,0x0002 | 0x0040,0}, {0x0004,0x0080,0} }, // 16 B
 };
 
 // SW_64K_R_X (1 fragment): the pattern depends on the pipe count; [pipesLog2][elemLog2][bit].
@@ -1089,6 +1114,207 @@ void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t hei
         return;
     }
     sw4kb_copy<true>(dst, src, width, height, pitch, bytes_per_texel, dst_bytes);
+}
+
+size_t tiled_msaa_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode,
+                                uint32_t bytes_per_texel, uint32_t sample_count) {
+    if (!width || !height || sample_count != 4u ||
+        tile_mode != static_cast<uint32_t>(TileMode::Sw64KbZX))
+        return 0;
+    const uint32_t element_log2 = sw64kb_elem_log2(bytes_per_texel);
+    if (element_log2 == UINT32_MAX || element_log2 + 2u >= 16u) return 0;
+    // AMD AddrLib ComputeThinBlockDimension: log2(elements) = log2(64 KiB) - log2(B/element)
+    // - log2(samples). Four samples use the width-precedent square/square-ish split.
+    const uint32_t element_bits = 16u - element_log2 - 2u;
+    const uint32_t width_bits = (element_bits + 1u) / 2u;
+    const uint32_t block_width = 1u << width_bits;
+    const uint32_t block_height = 1u << (element_bits - width_bits);
+    const uint64_t blocks_x = (static_cast<uint64_t>(width) + block_width - 1u) / block_width;
+    const uint64_t blocks_y = (static_cast<uint64_t>(height) + block_height - 1u) / block_height;
+    if (blocks_x && blocks_y > SIZE_MAX / blocks_x / 65536u) return 0;
+    return static_cast<size_t>(blocks_x * blocks_y * 65536u);
+}
+
+namespace {
+template <bool ToTiled>
+bool sw64kb_zx_4xaa_copy(uint8_t* dst, size_t tiled_bytes, const uint8_t* src,
+                         uint32_t width, uint32_t height, uint32_t bytes_per_texel) {
+    const uint32_t element_log2 = sw64kb_elem_log2(bytes_per_texel);
+    if (!dst || !src || element_log2 == UINT32_MAX) return false;
+    const uint32_t element_bits = 16u - element_log2 - 2u;
+    const uint32_t width_bits = (element_bits + 1u) / 2u;
+    const uint32_t block_width = 1u << width_bits;
+    const uint32_t block_height = 1u << (element_bits - width_bits);
+    const uint64_t blocks_x = (static_cast<uint64_t>(width) + block_width - 1u) / block_width;
+    const PatBitMsaa* pattern = kSw64kZX4x[element_log2];
+
+    std::vector<uint16_t> x_offsets(width), y_offsets(height);
+    std::array<uint16_t, 4> sample_offsets{};
+    for (uint32_t x = 0; x < width; ++x)
+        for (uint32_t bit = element_log2; bit < 16u; ++bit)
+            x_offsets[x] |= static_cast<uint16_t>(
+                (__builtin_popcount(x & pattern[bit].x) & 1u) << bit);
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t bit = element_log2; bit < 16u; ++bit)
+            y_offsets[y] |= static_cast<uint16_t>(
+                (__builtin_popcount(y & pattern[bit].y) & 1u) << bit);
+    for (uint32_t sample = 0; sample < 4u; ++sample)
+        for (uint32_t bit = element_log2; bit < 16u; ++bit)
+            sample_offsets[sample] |= static_cast<uint16_t>(
+                (__builtin_popcount(sample & pattern[bit].sample) & 1u) << bit);
+
+    const size_t plane_texels = static_cast<size_t>(width) * height;
+    for (uint32_t sample = 0; sample < 4u; ++sample) {
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint64_t block_row = static_cast<uint64_t>(y / block_height) * blocks_x;
+            for (uint32_t x = 0; x < width; ++x) {
+                const uint64_t block = block_row + x / block_width;
+                const uint64_t tiled = (block << 16u) |
+                    (x_offsets[x] ^ y_offsets[y] ^ sample_offsets[sample]);
+                const size_t linear =
+                    (static_cast<size_t>(sample) * plane_texels +
+                     static_cast<size_t>(y) * width + x) * bytes_per_texel;
+                if (tiled > tiled_bytes || bytes_per_texel > tiled_bytes - tiled) {
+                    if constexpr (!ToTiled) std::memset(dst + linear, 0, bytes_per_texel);
+                    continue;
+                }
+                if constexpr (ToTiled)
+                    std::memcpy(dst + tiled, src + linear, bytes_per_texel);
+                else
+                    std::memcpy(dst + linear, src + tiled, bytes_per_texel);
+            }
+        }
+    }
+    return true;
+}
+} // namespace
+
+bool detile_msaa_surface(uint8_t* dst, const uint8_t* src, size_t src_bytes,
+                         uint32_t width, uint32_t height, uint32_t tile_mode,
+                         uint32_t bytes_per_texel, uint32_t sample_count) {
+    const size_t expected = tiled_msaa_surface_bytes(
+        width, height, tile_mode, bytes_per_texel, sample_count);
+    if (!expected || src_bytes < expected) return false;
+    return sw64kb_zx_4xaa_copy<false>(dst, src_bytes, src, width, height, bytes_per_texel);
+}
+
+bool tile_msaa_surface(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
+                       uint32_t width, uint32_t height, uint32_t tile_mode,
+                       uint32_t bytes_per_texel, uint32_t sample_count) {
+    const size_t expected = tiled_msaa_surface_bytes(
+        width, height, tile_mode, bytes_per_texel, sample_count);
+    if (!expected || dst_bytes < expected) return false;
+    std::memset(dst, 0, expected);
+    return sw64kb_zx_4xaa_copy<true>(dst, expected, src, width, height, bytes_per_texel);
+}
+
+size_t gfx10_htile_msaa_metadata_bytes(uint32_t width, uint32_t height,
+                                       uint32_t tile_mode, uint32_t sample_count,
+                                       bool pipe_aligned) {
+    if (!width || !height || sample_count != 4u || !pipe_aligned ||
+        tile_mode != static_cast<uint32_t>(TileMode::Sw64KbZX))
+        return 0;
+    // AMD AddrLib HwlComputeHtileInfo/GetMetaBlkSize, 16-pipe GFX10 configuration:
+    //   ROCm/ROCR-Runtime d614ea8bbd73, src/image/addrlib/src/gfx10/gfx10addrlib.cpp
+    // Pipe-aligned thin Z_X uses a 2^15-byte meta block. Its 2^19 covered pixels split
+    // width-precedent into 1024x512. HTILE sizing is independent of the depth sample count, but
+    // this API deliberately retains the observed 4xaa gate rather than claiming broader support.
+    constexpr uint64_t meta_width = 1024u;
+    constexpr uint64_t meta_height = 512u;
+    constexpr uint64_t meta_block_bytes = 1u << 15;
+    const uint64_t blocks_x = (static_cast<uint64_t>(width) + meta_width - 1u) / meta_width;
+    const uint64_t blocks_y = (static_cast<uint64_t>(height) + meta_height - 1u) / meta_height;
+    if (blocks_x && blocks_y > SIZE_MAX / blocks_x / meta_block_bytes) return 0;
+    return static_cast<size_t>(blocks_x * blocks_y * meta_block_bytes);
+}
+
+bool gfx10_htile_metadata_is_decompressed(const uint8_t* metadata, size_t metadata_bytes,
+                                           size_t expected_bytes, uint32_t* uniform_value) {
+    if (uniform_value) *uniform_value = 0;
+    if (!metadata || !expected_bytes || metadata_bytes != expected_bytes ||
+        (metadata_bytes % sizeof(uint32_t)) != 0)
+        return false;
+    uint32_t first = 0;
+    std::memcpy(&first, metadata, sizeof(first));
+    // PAL Gfx9Htile::GetInitialValue(), c5e800072a32, gfx9MaskRam.cpp:
+    // - depth-only:    ZMax=0x3fff, ZMin=0, ZMask=0xf (no Z compression)
+    // - depth+stencil: full Z range, SMem=3 (no stencil compression), SR0/SR1 unknown,
+    //                  ZMask=0xf (no Z compression)
+    constexpr uint32_t depth_only_decompressed = 0xfffc000fu;
+    constexpr uint32_t depth_stencil_decompressed = 0xfffff3ffu;
+    if (first != depth_only_decompressed && first != depth_stencil_decompressed) return false;
+    for (size_t offset = sizeof(uint32_t); offset < metadata_bytes;
+         offset += sizeof(uint32_t)) {
+        uint32_t value = 0;
+        std::memcpy(&value, metadata + offset, sizeof(value));
+        if (value != first) return false;
+    }
+    if (uniform_value) *uniform_value = first;
+    return true;
+}
+
+Gfx10HtileMsaaSource gfx10_htile_msaa_source(
+    const uint8_t* metadata, size_t metadata_bytes,
+    uint32_t width, uint32_t height, uint32_t tile_mode,
+    uint32_t bytes_per_texel, uint32_t sample_count, bool pipe_aligned) {
+    if (bytes_per_texel != sizeof(float)) return Gfx10HtileMsaaSource::Unsupported;
+    const size_t expected = gfx10_htile_msaa_metadata_bytes(
+        width, height, tile_mode, sample_count, pipe_aligned);
+    if (!metadata || !expected || metadata_bytes != expected)
+        return Gfx10HtileMsaaSource::Unsupported;
+
+    // PAL Gfx9Htile::GetClearValue(depth=0), depth-only layout:
+    //   (ZMax << 18) | (ZMin << 4) | ZMask = 0.
+    // A full uniform plane therefore describes every 8x8 block and all samples as +0.0 without
+    // consulting base memory. Do not generalize this to nonzero encodings here: inverse depth
+    // quantization and the depth+stencil layout require their own proven contract.
+    if (std::all_of(metadata, metadata + metadata_bytes,
+                    [](uint8_t value) { return value == 0u; }))
+        return Gfx10HtileMsaaSource::DepthZeroFastClear;
+    if (gfx10_htile_metadata_is_decompressed(
+            metadata, metadata_bytes, expected))
+        return Gfx10HtileMsaaSource::UncompressedBase;
+    return Gfx10HtileMsaaSource::Unsupported;
+}
+
+bool materialize_gfx10_htile_msaa_surface(
+    uint8_t* dst, size_t dst_bytes,
+    const uint8_t* tiled_base, size_t tiled_base_bytes,
+    const uint8_t* metadata, size_t metadata_bytes,
+    uint32_t width, uint32_t height, uint32_t tile_mode,
+    uint32_t bytes_per_texel, uint32_t sample_count, bool pipe_aligned,
+    Gfx10HtileMsaaSource* source) {
+    if (source) *source = Gfx10HtileMsaaSource::Unsupported;
+    if (!dst || !width || !height || !sample_count || !bytes_per_texel)
+        return false;
+    size_t linear_bytes = width;
+    if (linear_bytes > SIZE_MAX / height) return false;
+    linear_bytes *= height;
+    if (linear_bytes > SIZE_MAX / sample_count) return false;
+    linear_bytes *= sample_count;
+    if (linear_bytes > SIZE_MAX / bytes_per_texel) return false;
+    linear_bytes *= bytes_per_texel;
+    if (dst_bytes < linear_bytes) return false;
+
+    const Gfx10HtileMsaaSource selected = gfx10_htile_msaa_source(
+        metadata, metadata_bytes, width, height, tile_mode,
+        bytes_per_texel, sample_count, pipe_aligned);
+    if (selected == Gfx10HtileMsaaSource::DepthZeroFastClear) {
+        // IEEE-754 +0.0 is all-zero bits. Base may be null, short, or poison: fast-clear metadata is
+        // authoritative and the stale tiled allocation must not be observed.
+        std::memset(dst, 0, linear_bytes);
+    } else if (selected == Gfx10HtileMsaaSource::UncompressedBase) {
+        const size_t expected_base = tiled_msaa_surface_bytes(
+            width, height, tile_mode, bytes_per_texel, sample_count);
+        if (!tiled_base || !expected_base || tiled_base_bytes < expected_base ||
+            !detile_msaa_surface(dst, tiled_base, tiled_base_bytes, width, height,
+                                tile_mode, bytes_per_texel, sample_count))
+            return false;
+    } else {
+        return false;
+    }
+    if (source) *source = selected;
+    return true;
 }
 
 size_t tiled_elements_bytes(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode) {
