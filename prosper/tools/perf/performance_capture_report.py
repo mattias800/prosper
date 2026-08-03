@@ -72,6 +72,54 @@ def _total(records, field):
                if math.isfinite(float(record.get(field, 0.0))))
 
 
+def _hex64(value):
+    return f"0x{value:016x}"
+
+
+def _compute_program_groups(records, limit=10, address_limit=8):
+    groups = {}
+    unknown_records = 0
+    unknown_dispatches = 0
+    unknown_total_ms = 0.0
+    for record in records:
+        address = record.get("program_addr")
+        program_hash = record.get("program_hash")
+        total_ms = float(record.get("total_ms", 0.0))
+        dispatches = int(record.get("dispatches", 0))
+        if not isinstance(address, int) or not isinstance(program_hash, int):
+            unknown_records += 1
+            unknown_dispatches += dispatches
+            unknown_total_ms += total_ms
+            continue
+        group = groups.setdefault(program_hash, {
+            "records": 0, "dispatches": 0, "total_ms": 0.0, "max_ms": 0.0,
+            "addresses": set(),
+        })
+        group["records"] += 1
+        group["dispatches"] += dispatches
+        group["total_ms"] += total_ms
+        group["max_ms"] = max(group["max_ms"], total_ms)
+        group["addresses"].add(address)
+
+    ranked = []
+    for program_hash, group in groups.items():
+        addresses = sorted(group.pop("addresses"))
+        group["program_hash"] = _hex64(program_hash)
+        group["mean_ms"] = group["total_ms"] / group["records"]
+        group["address_count"] = len(addresses)
+        group["addresses"] = [_hex64(address) for address in addresses[:address_limit]]
+        ranked.append(group)
+    ranked.sort(key=lambda group: (-group["total_ms"], group["program_hash"]))
+    return {
+        "group_count": len(ranked),
+        "groups_omitted": max(0, len(ranked) - limit),
+        "groups": ranked[:limit],
+        "unknown_records": unknown_records,
+        "unknown_dispatches": unknown_dispatches,
+        "unknown_total_ms": unknown_total_ms,
+    }
+
+
 def summarize(records):
     header = records[0]
     footer = next(record for record in records if record.get("type") == "footer")
@@ -97,6 +145,7 @@ def summarize(records):
 
     graphics_total = _total(renderer, "total_ms")
     compute_total = _total(compute, "total_ms")
+    compute_programs = _compute_program_groups(compute)
     measured_total = graphics_total + compute_total
     gpu_wait_total = _total(renderer, "gpu_wait_ms")
     gpu_timestamp_samples = sum(int(record.get("gpu_timestamp_samples", 0))
@@ -174,6 +223,7 @@ def summarize(records):
         "rates": rates,
         "graphics_total_ms": graphics_total,
         "compute_total_ms": compute_total,
+        "compute_programs": compute_programs,
         "gpu_timestamp_samples": gpu_timestamp_samples,
         "gpu_timestamps_available": gpu_timestamps_available,
         "components": components,
@@ -216,6 +266,19 @@ def print_summary(summary):
           f"rendered={_fmt_rate(rates['rendered_fps'])} host-presented={_fmt_rate(rates['host_fps'])}")
     print(f"measured totals: graphics={summary['graphics_total_ms']:.1f} ms "
           f"compute={summary['compute_total_ms']:.1f} ms")
+    programs = summary["compute_programs"]
+    print(f"compute identities: groups={programs['group_count']} "
+          f"unknown={programs['unknown_records']} records/{programs['unknown_total_ms']:.1f} ms")
+    for group in programs["groups"]:
+        addresses = ",".join(group["addresses"])
+        if group["address_count"] > len(group["addresses"]):
+            addresses += f",+{group['address_count'] - len(group['addresses'])}"
+        print(f"  {group['program_hash']} records={group['records']} "
+              f"dispatches={group['dispatches']} total={group['total_ms']:.1f} ms "
+              f"mean={group['mean_ms']:.2f} ms max={group['max_ms']:.2f} ms "
+              f"addresses={addresses}")
+    if programs["groups_omitted"]:
+        print(f"  ... {programs['groups_omitted']} lower-cost groups omitted")
     print(f"GPU timestamps: {summary['gpu_timestamp_samples']} samples " +
           ("(device/wait split available)" if summary["gpu_timestamps_available"] else
            "(device/wait split unavailable)"))

@@ -370,7 +370,11 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << relative_ns(record.monotonic_ns, capture->trigger_ns)
                 << ",\"dispatches\":" << record.dispatches
                 << ",\"cpu_fast_total\":" << record.cpu_fast_total
-                << ",\"total_ms\":" << record.total_ms << "}\n";
+                << ",\"program_addr\":";
+            write_optional(out, record.program_addr);
+            out << ",\"program_hash\":";
+            write_optional(out, record.program_hash);
+            out << ",\"total_ms\":" << record.total_ms << "}\n";
         }
         out << "{\"type\":\"footer\",\"complete\":true,\"pre_samples\":"
             << capture->pre_samples.size() << ",\"post_samples\":" << capture->post_samples.size()

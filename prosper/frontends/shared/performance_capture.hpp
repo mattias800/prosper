@@ -51,6 +51,11 @@ struct ComputeTimingRecord {
     uint64_t monotonic_ns = 0;
     uint64_t dispatches = 0;
     uint64_t cpu_fast_total = 0;
+    // Present only when every dispatch in the retained batch uses one identical program at one
+    // run-local guest address. The SPIR-V hash is stable across address relocation and lets the
+    // offline report group the expensive programs without enabling a whole-boot compute trace.
+    std::optional<uint64_t> program_addr;
+    std::optional<uint64_t> program_hash;
     double total_ms = 0;
 };
 
