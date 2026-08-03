@@ -21,7 +21,46 @@ static int failures = 0;
         }                                                                      \
     } while (0)
 
+#define CHECK_NAMED(cond, name)                                                \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            std::fprintf(stderr, "FAIL %s\n", name);                         \
+            ++failures;                                                        \
+        }                                                                      \
+    } while (0)
+
+static bool stops_on_third_presented_frame(PresentedFrameSource source) {
+    PresentedFrameCounter shown(3);
+    bool running = true;
+    shown.record(source, running);
+    if (!running || shown.count() != 1) return false;
+    shown.record(source, running);
+    if (!running || shown.count() != 2) return false;
+    shown.record(source, running);
+    return !running && shown.count() == 3;
+}
+
 int main() {
+    CHECK_NAMED(stops_on_third_presented_frame(PresentedFrameSource::GpuScanout),
+                "direct GPU scanout honors the presented-frame limit");
+    CHECK_NAMED(stops_on_third_presented_frame(PresentedFrameSource::GpuCpuFallback),
+                "GPU CPU fallback honors the same presented-frame limit");
+    CHECK_NAMED(stops_on_third_presented_frame(PresentedFrameSource::Cpu),
+                "ordinary CPU presentation honors the presented-frame limit");
+
+    PresentedFrameCounter unlimited(0);
+    bool unlimited_running = true;
+    for (unsigned i = 0; i < 5; ++i)
+        unlimited.record(PresentedFrameSource::GpuCpuFallback, unlimited_running);
+    CHECK(unlimited_running && unlimited.count() == 5);
+
+    // Preserve the old atoi/nonzero CLI semantics for a malformed negative count: it stops after
+    // the first successful presentation instead of becoming an accidental unlimited run.
+    PresentedFrameCounter negative_limit(-1);
+    bool negative_running = true;
+    negative_limit.record(PresentedFrameSource::Cpu, negative_running);
+    CHECK(!negative_running && negative_limit.count() == 1);
+
     // GPU presentation is the normal game policy because adoption has a safe CPU fallback. Keep the
     // explicit zero override for driver diagnosis and never request it without a renderer-owned game.
     CHECK(request_gpu_present(nullptr, false, true));
