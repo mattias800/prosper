@@ -88,7 +88,7 @@ shared-GPU policy, the instrument-not-the-subject list, and the dated current ha
 | *Asterix & Obelix: Babylon Mission* `PPSA30490` | rung 0 — sampled 2D-MSAA resolve executes; output remains black (#1599) | `docs/ASTERIX_BABYLON_STATUS.md` |
 | *The Oregon Trail* `PPSA19244` | rung 0 — the guest issues no base pass; prosper decodes 100% of what it submits | `docs/OREGON_TRAIL_STATUS.md` |
 | *ArcRunner* `PPSA21406` | rung 0 — renderer bring-up reaches real GPU submissions, then the render thread faults (#1226) | `docs/ARCRUNNER_STATUS.md` |
-| *GRIS*, *Space Adventure Cobra*, *Sonic Origins* | rung 3 / rung 3 / incomplete dump | `docs/GRIS_SONIC_COBRA_BRINGUP.md` |
+| *GRIS*, *Space Adventure Cobra*, *Sonic Origins* | rung 3 / rung 3 / rung 0 — complete Sonic Origins Plus install; two UI paths unresolved (#1905) | `docs/GRIS_SONIC_COBRA_BRINGUP.md` |
 | Astro Bot, The Plucky Squire, The Pathless | active orchestration lanes | `docs/GAME_COMPAT_ORCHESTRATION.md` |
 | Every other title | — | `COMPATIBILITY.md` |
 | UE4 / IoStore bring-up (shared) | — | `docs/UE4_APR_IOSTORE_BRINGUP.md`, `docs/CROSS_ENGINE_UE4.md` |
