@@ -193,26 +193,27 @@ both temporal edges, uses one captured boundary seed, leaves no bounded or unres
 still produces a one-colour black 3840x2160 image. Every extracted operation capsule has zero failed
 stages. The first live `Vulkan render FAILED` line belongs to empty submit 448, before the later
 draw-carrying submissions; here it means that no cached scanout pixels were selected, not that a Vulkan
-operation failed. The capture names the current front buffer as absent from the live RTT cache, but the
-later complete render chain also produces black, so repairing that presentation miss alone cannot reveal
-content.
+operation failed. The capture names the current front buffer as absent from the live RTT cache, while the
+complete replay endpoint is also black. Runtime intermediate-output evidence is still required to decide
+whether repairing that presentation miss alone could reveal content.
 
-Manifest-only operation and dependency inspection narrows the black state further. Submit 463's final
-draw (operation 5 / `draw[3]`) is the first full-resolution scene composite into `0x20168f0000`. The
-capture payloads for all five of its 3840x2160 texture inputs (`b118..b122`) are zero. The graph records
-`b118` and `b119` as outputs of operations 2 and 1 in the same submit, while `b120..b122` are external
-leaves; two smaller utility/static textures (`b115` and `b123`) are genuinely nonzero. Its two large
-scene-data constant buffers (`b34` and `b35`) are also zero. This is not a blanket capture failure and
-does not prove why the full-resolution scene resources are empty.
+Manifest-only operation and dependency inspection identifies candidates but does not yet localize the
+first black-producing operation. Submit 463's final draw (operation 5 / `draw[3]`) is a full-resolution
+composite into `0x20168f0000`. The pre-submit capture payloads for its five 3840x2160 texture bindings
+(`b118..b122`) are zero. The graph records `b118` and `b119` as outputs of operations 2 and 1 in that same
+submit, so their values when operation 5 consumes them are unknown; `b120..b122` are external leaves and
+remain candidate inputs. Two smaller utility/static textures (`b115` and `b123`) are genuinely nonzero,
+so this is not a blanket-zero capture. The pre-submit payloads for the two large scene-data constant
+buffers (`b34` and `b35`) are also zero.
 
-Submit 465 then consumes `0x20168f0000` at operation 16, passes that result through operation 17, and
-writes the last full-resolution target `0x2010870000` at operation 18. Submit 467 consumes that target
-in its sole compute dispatch. All of those operations remain realized and failure-free, and the complete
-chain replays black. The actionable frontier is therefore upstream scene population no later than the
-submit-463 composite, not the empty-submit presentation warning. The next discriminator should trace the
-earlier producers of the full-resolution scene/G-buffer resources (starting with submit-463 operations 1
-and 2 and the external `b120..b122` leaves) and distinguish a guest scene gate from a producer or
-translation defect. Exact hashes and command shapes are retained in
+The dependency graph continues through submit 465: operation 16 reads `0x20168f0000` and writes
+`0x203a7d0000`, operation 17 reads that target, and operation 18 reads it and writes `0x2010870000`;
+submit 467 then reads `0x2010870000`. All operations are realized and failure-free, while the complete
+replay endpoint is black. Those edges establish ordering and dependency, not the values written by each
+producer. The next discriminator is runtime output inspection (`--output-target-after` / draw steps) at
+submit-463 operations 1, 2 and 5, then submit-465 operations 16-18 and submit 467. That will identify the
+first black-producing stage and distinguish an upstream guest/scene gate from a producer or translation
+defect without another title boot. Exact hashes and command shapes are retained in
 [#1905](https://github.com/mattias800/prosper/issues/1905#issuecomment-5172641024) and its follow-up.
 
 ### Game Intent activity audit
