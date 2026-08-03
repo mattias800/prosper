@@ -2196,6 +2196,20 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
     return invalidated;
 }
 
+struct MappedReadbackPlan {
+    VkDeviceSize map_size = 0;
+    VkDeviceSize invalidate_size = 0;
+};
+
+// VK_WHOLE_SIZE invalidates through the end of the CURRENT MAPPING, not unconditionally through the
+// allocation. That mapping end must be atom-aligned or equal the allocation end (VUID 01389). Map the
+// whole allocation as well, so the pair remains valid when a logical readback is shorter than its
+// VkMemoryRequirements allocation (the observed shape is 60 logical bytes in a 64-byte allocation).
+constexpr MappedReadbackPlan mapped_readback_plan(VkDeviceSize logical_bytes) {
+    return logical_bytes ? MappedReadbackPlan{VK_WHOLE_SIZE, VK_WHOLE_SIZE}
+                         : MappedReadbackPlan{};
+}
+
 // Make device writes visible before the CPU reads a mapped readback buffer. A HOST_CACHED memory
 // type is not required to also be HOST_COHERENT, so every mapped READ of a TRANSFER_DST buffer must
 // invalidate first. Specified as valid on coherent memory too, so callers can invoke it
@@ -2203,12 +2217,13 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
 // NOTE: this header contains a second readback allocator that requires HOST_COHERENT in every tier,
 // so its mapped reads need no invalidate. Keep that requirement, or route its reads through this
 // helper too -- relaxing it without adding invalidates would silently return stale bytes.
-inline bool invalidate_mapped_readback(const RenderVkCtx& ctx, VkDeviceMemory memory) {
-    if (!memory) return false;
+inline bool invalidate_mapped_readback(const RenderVkCtx& ctx, VkDeviceMemory memory,
+                                       const MappedReadbackPlan& plan) {
+    if (!memory || !plan.invalidate_size) return false;
     VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
     range.memory = memory;
     range.offset = 0;
-    range.size = VK_WHOLE_SIZE;   // VK_WHOLE_SIZE is exempt from the nonCoherentAtomSize size rule
+    range.size = plan.invalidate_size;
     return vkInvalidateMappedMemoryRanges(ctx.dev, 1, &range) == VK_SUCCESS;
 }
 
@@ -2471,11 +2486,12 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
         else backend_mark_unproven_submission();
         error = "persistent color target readback did not complete"; return false;
     }
+    const MappedReadbackPlan mapping = mapped_readback_plan(bytes);
     void* mapped = nullptr;
-    if (vkMapMemory(ctx.dev, memory, 0, bytes, 0, &mapped) != VK_SUCCESS || !mapped) {
+    if (vkMapMemory(ctx.dev, memory, 0, mapping.map_size, 0, &mapped) != VK_SUCCESS || !mapped) {
         cleanup(); error = "cannot map persistent color target readback"; return false;
     }
-    if (!invalidate_mapped_readback(ctx, memory)) {
+    if (!invalidate_mapped_readback(ctx, memory, mapping)) {
         vkUnmapMemory(ctx.dev, memory);
         cleanup(); error = "cannot invalidate persistent color target readback"; return false;
     }
@@ -2715,10 +2731,12 @@ inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDs
             }
             return false;
         }
+        const MappedReadbackPlan mapping =
+            mapped_readback_plan(depth_bytes + stencil_bytes);
         void* mapped = nullptr;
         const bool mapped_ok =
-            vkMapMemory(ctx.dev, memory, 0, depth_bytes + stencil_bytes, 0, &mapped) == VK_SUCCESS;
-        const bool invalidated = mapped_ok && invalidate_mapped_readback(ctx, memory);
+            vkMapMemory(ctx.dev, memory, 0, mapping.map_size, 0, &mapped) == VK_SUCCESS;
+        const bool invalidated = mapped_ok && invalidate_mapped_readback(ctx, memory, mapping);
         if (invalidated) {
             const auto* bytes = static_cast<const uint8_t*>(mapped);
             seed.depth.assign(bytes, bytes + depth_bytes);

@@ -6,10 +6,10 @@
 #     fixed — delete the line, in the same change — or the scan stopped seeing things, and the
 #     second is far more likely. Both are failures until someone says which.
 #   * `environment-dependent` exempts an id from that check, and its reason line must say WHY it
-#     can be absent. Two entries below qualify; nothing else may without an argument. That is
-#     enforced, not merely asked: ctest `vkval_scan_logic` asserts this file holds exactly TWO
-#     environment-dependent entries, so flipping a `required` id to duck a failure breaks a test in
-#     another file. Adding a genuine third means editing that assertion, deliberately — the friction
+#     can be absent. One entry below qualifies; nothing else may without an argument. That is
+#     enforced, not merely asked: ctest `vkval_scan_logic` asserts this file holds exactly ONE
+#     environment-dependent entry, so flipping a `required` id to duck a failure breaks a test in
+#     another file. Adding a genuine second means editing that assertion, deliberately — the friction
 #     is the point.
 #   * The test list must be the UNION across drivers. Attribution varies: an id can reach one extra
 #     test on hardware and never on lavapipe, and a test the ledger does not record is a failure.
@@ -33,14 +33,17 @@
 #     driver, reproduced in `podman run --rm ubuntu:24.04`):  7 ids, 187 messages, 168/168 pass
 #   Fedora 44 / validation layers 1.4.341.0 / Mesa 26.1.4 RADV (STRIX_HALO):  9 ids, 51 messages
 #
-# The two ids the CI environment does not produce are the two marked environment-dependent. Neither
-# is absent because it was fixed: `maintenance4-08602` is a newer check than layers 1.3.275, and
-# `size-01389` cannot trigger on lavapipe, whose nonCoherentAtomSize is 1. Both are real on hardware.
+# The id the CI environment does not produce is marked environment-dependent. It is not absent
+# because it was fixed: `maintenance4-08602` is a newer check than layers 1.3.275.
 #
 # Amended by #1726, which FIXED `VUID-VkShaderModuleCreateInfo-pCode-08737` and deleted its entry:
 # the baseline is now 6 ids on the CI runner and 8 on Fedora/RADV (measured there at 49 messages).
 # Recorded because this header is what a future scan is compared against, and the rules below call
 # an unexplained id-count drop far more likely to be the scan breaking than a defect being fixed.
+#
+# Amended by #1717, which FIXED `VUID-VkMappedMemoryRange-size-01389` and deleted its hardware-only
+# entry. The exact 60-byte mapping mutation reproduced one finding on RADV; the fixed whole-allocation
+# mapping produced none. The ledger is therefore now 6 ids on the CI runner and 7 on Fedora/RADV.
 
 # ---- #1710: compute pipeline layout has no push-constant range, and nothing is ever pushed -----
 VUID-VkComputePipelineCreateInfo-layout-07987 | required | game_compute_exec, game_compute_exec_no_adaptive_storage_result | Compute module declares a PushConstant block while the layout declares no range (#1710)
@@ -61,6 +64,3 @@ VUID-VkPipelineShaderStageCreateInfo-stage-00715 | required | interp_render | Th
 # ---- #1716: present_blit fixture transitions a transfer-only image to SHADER_READ_ONLY_OPTIMAL --
 # 168 of the CI environment's 187 messages; the test's own header asked for this check.
 VUID-VkImageMemoryBarrier-oldLayout-01211 | required | present_blit | Fixture source images lack SAMPLED_BIT but are transitioned to SHADER_READ_ONLY_OPTIMAL (#1716)
-
-# ---- #1717: VK_WHOLE_SIZE invalidate over a non-atom-aligned mapping ----------------------------
-VUID-VkMappedMemoryRange-size-01389 | environment-dependent | gpu_capture_render_replay | invalidate_mapped_readback assumes VK_WHOLE_SIZE is exempt from the mapping-end alignment rule; it is not (#1717). Cannot trigger on lavapipe, whose nonCoherentAtomSize is 1, so every range is trivially aligned there.

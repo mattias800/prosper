@@ -272,8 +272,8 @@ def main():
         real = scan.parse_allowlist(Path(__file__).resolve().parent / "allowlist.txt")
         check(len(real) >= 1 and all(a.reason and a.tests for a in real.values()),
               "the checked-in allowlist.txt parses, and every entry carries tests and a reason")
-        check(sum(1 for a in real.values() if a.expectation == "environment-dependent") == 2,
-              "exactly two checked-in entries claim to be environment-dependent")
+        check(sum(1 for a in real.values() if a.expectation == "environment-dependent") == 1,
+              "exactly one checked-in entry claims to be environment-dependent")
 
     # The guard must not read its own tail. ctest captures this test's stdout into the same
     # LastTest.log that vk_validation_scan.py parses, so anything printed here that LOOKS like a

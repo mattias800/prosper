@@ -312,8 +312,8 @@ def main(argv: list[str]) -> int:
     # Checking each `required` id separately rather than only the all-absent case is what catches a
     # PARTIAL break: a rename or a framing change that affects some message shapes and not others
     # would otherwise pass while silently halving what the guard can see. `environment-dependent`
-    # entries are exempt, and their reason line has to say why (lavapipe's nonCoherentAtomSize, a
-    # check newer than layers 1.3.275) — the exemption is written down, not assumed.
+    # entries are exempt, and their reason line has to say why (currently a check newer than layers
+    # 1.3.275) — the exemption is written down, not assumed.
     if absent_required:
         print()
         print(f"[vkval] FAIL: {len(absent_required)} allow-listed id(s) marked `required` produced "
