@@ -243,11 +243,25 @@ create/re-arm on covered pages. A sibling invalidation during Stepping now retai
 TID until `TRAP_TRACE`, returns `CompleteInvalid` so the caller clears TF, preserves the first invalid
 reason, and skips both stale reads and re-arm. Finally, `si_addr` is no longer treated as an operand
 extent: a bounded signal-safe decoder proves contiguous spans for common MOV stores (including the live
-event-1 qword form), post-step selected-byte changes are positive overlap evidence, and an unrecognized
-unchanged same-page instruction reports `selected=unknown` rather than `no`. Real fault canaries cover
+event-1 qword form). An unrecognized off-range instruction always reports `selected=unknown`; a changed
+post-image is retained separately as `changed-during-window=yes`, because a sibling can write while the
+page is process-wide RW. Real fault canaries cover
 production reset/re-arm coexistence, sibling physical invalidation between SIGSEGV and TRAP, and a qword
 beginning four bytes before the selected interval. These harden the reusable instrument only; no new
 Asterix live run or writer conclusion was produced, and both historical live verdicts below remain VOID.
+
+A second exact-head review found five more ways the diagnostic could manufacture or lose evidence.
+Strict-unique mode could retain a real occurrence-1 event but still publish `writer-observed` after
+occurrence 2 made the subject ambiguous; terminal results now require a still-valid selected identity.
+Reconfiguration is refused without mutation while a TF step is pending. `CompleteInvalid` now carries
+an unavailable post-image explicitly and prints `post=unavailable`, never its value-initialized zeros.
+An unknown off-range instruction remains `selected=unknown` even when selected bytes changed during the
+process-wide RW window; the delta is retained separately because a sibling can be its writer. Finally,
+an instruction arriving with TF already owned by BP/HWBP/STEPWIN invalidates and opens the trace page but
+does not claim or clear that trap. Deterministic real-fault canaries cover selected-event-then-ambiguity,
+paused-step reconfiguration, unavailable post formatting, a sibling write during an unknown instruction's
+window, and a real `int3`-owned step through the protected store. These are apparatus corrections only and
+produce no new title-live conclusion.
 
 The first exact live arm at commit `d181953e` was **VOID, by a useful self-invalidating result**. It
 completed 220 presents and captured submit 181 with the same exact positive control: 8 draws, 6 computes,

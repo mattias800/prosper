@@ -1027,9 +1027,10 @@ namespace {
     // deliberately changes %fs within its own frame.
     __attribute__((no_stack_protector))
     prosper::host::GuestWriteWatchFaultAction handle_guest_write_watch_fault(
-            uint64_t addr, uint64_t rip, int64_t tid) {
+            uint64_t addr, uint64_t rip, int64_t tid, bool trap_flag_already_owned) {
         const uint64_t saved_guest_fs = guest_fs_to_host_scoped();
-        const auto handled = prosper::host::guest_write_watch_handle_fault_ex(addr, rip, tid);
+        const auto handled = prosper::host::guest_write_watch_handle_fault_ex(
+            addr, rip, tid, trap_flag_already_owned);
         guest_fs_restore_scoped(saved_guest_fs);
         return handled;
     }
@@ -1089,6 +1090,7 @@ namespace {
                     line, sizeof line,
                     "[dmem-write-trace] event=%llu selected=%s completion=%s"
                     " coverage-valid-before=%s"
+                    " changed-during-window=%s"
                     " fault=0x%llx phys=0x%llx decoded-write-bytes=%u"
                     " writer=%s%s0x%llx next=0x%llx tid=%lld"
                     " rearmed=%s before=",
@@ -1096,6 +1098,7 @@ namespace {
                     step == prosper::host::GuestDmemWriteTraceStepAction::CompleteInvalid
                         ? "invalid" : "valid",
                     event.coverage_valid_before ? "yes" : "no",
+                    event.changed_during_window ? "yes" : "no",
                     static_cast<unsigned long long>(event.fault_addr),
                     static_cast<unsigned long long>(event.fault_phys),
                     event.decoded_write_size,
@@ -1119,7 +1122,8 @@ namespace {
                     std::memcpy(line + used, middle, sizeof(middle) - 1);
                     used += sizeof(middle) - 1;
                 }
-                append_bytes(event.after);
+                used += prosper::host::guest_dmem_write_trace_format_post(
+                    event, line + used, sizeof(line) - used);
                 if (used < sizeof(line)) line[used++] = '\n';
                 raw_write(2, line, used);
                 guest_fs_restore_scoped(saved_guest_fs);
@@ -1135,7 +1139,8 @@ namespace {
             if (PROSPER_REG_ERR(uc) & 2) {
                 const auto action = handle_guest_write_watch_fault(
                     reinterpret_cast<uint64_t>(si->si_addr),
-                    static_cast<uint64_t>(PROSPER_GREGS(uc)[REG_RIP]), cur_tid());
+                    static_cast<uint64_t>(PROSPER_GREGS(uc)[REG_RIP]), cur_tid(),
+                    (PROSPER_GREGS(uc)[REG_EFL] & 0x100ll) != 0);
                 if (action == prosper::host::GuestWriteWatchFaultAction::SingleStep)
                     PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;
                 if (action != prosper::host::GuestWriteWatchFaultAction::NotHandled) return;

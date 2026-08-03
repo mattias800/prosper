@@ -34,6 +34,16 @@ std::atomic<bool> pause_invalidation_step{false};
 std::atomic<bool> invalidation_step_ready{false};
 std::atomic<bool> release_invalidation_step{false};
 std::atomic<bool> invalidation_canary_active{false};
+std::atomic<bool> pause_reconfigure_step{false};
+std::atomic<bool> reconfigure_step_ready{false};
+std::atomic<bool> release_reconfigure_step{false};
+std::atomic<bool> reconfigure_canary_active{false};
+std::atomic<bool> pause_unknown_step{false};
+std::atomic<bool> unknown_step_ready{false};
+std::atomic<bool> release_unknown_step{false};
+std::atomic<bool> preowned_tf_active{false};
+std::atomic<bool> preowned_tf_started{false};
+std::atomic<uint32_t> preowned_tf_completed{0};
 std::atomic<int> last_step_action{-1};
 std::atomic<uint32_t> trap_count{0};
 volatile sig_atomic_t post_store_marker = 0;
@@ -54,17 +64,35 @@ void unrelated_contention_hook() {
 void trace_signal_handler(int sig, siginfo_t* info, void* raw_context) {
     auto* context = static_cast<ucontext_t*>(raw_context);
     const int64_t tid = static_cast<int64_t>(syscall(SYS_gettid));
+    if (sig == SIGTRAP && preowned_tf_active.load(std::memory_order_acquire) &&
+        !preowned_tf_started.load(std::memory_order_acquire) &&
+        (!info || info->si_code != TRAP_TRACE)) {
+        preowned_tf_started.store(true, std::memory_order_release);
+        context->uc_mcontext.gregs[REG_EFL] |= static_cast<greg_t>(0x100);
+        return;
+    }
     if (sig == SIGSEGV && info && info->si_addr &&
         (context->uc_mcontext.gregs[REG_ERR] & 2)) {
         const auto action = prosper::host::guest_write_watch_handle_fault_ex(
             reinterpret_cast<uint64_t>(info->si_addr),
-            static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RIP]), tid);
+            static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RIP]), tid,
+            (context->uc_mcontext.gregs[REG_EFL] & 0x100) != 0);
         if (action == prosper::host::GuestWriteWatchFaultAction::SingleStep)
             context->uc_mcontext.gregs[REG_EFL] |= 0x100;
         if (action == prosper::host::GuestWriteWatchFaultAction::SingleStep &&
             pause_invalidation_step.exchange(false, std::memory_order_acq_rel)) {
             invalidation_step_ready.store(true, std::memory_order_release);
             while (!release_invalidation_step.load(std::memory_order_acquire)) sched_yield();
+        }
+        if (action == prosper::host::GuestWriteWatchFaultAction::SingleStep &&
+            pause_reconfigure_step.exchange(false, std::memory_order_acq_rel)) {
+            reconfigure_step_ready.store(true, std::memory_order_release);
+            while (!release_reconfigure_step.load(std::memory_order_acquire)) sched_yield();
+        }
+        if (action == prosper::host::GuestWriteWatchFaultAction::SingleStep &&
+            pause_unknown_step.exchange(false, std::memory_order_acq_rel)) {
+            unknown_step_ready.store(true, std::memory_order_release);
+            while (!release_unknown_step.load(std::memory_order_acquire)) sched_yield();
         }
         if (action == prosper::host::GuestWriteWatchFaultAction::SingleStep &&
             !request_contention.exchange(true, std::memory_order_acq_rel)) {
@@ -90,7 +118,15 @@ void trace_signal_handler(int sig, siginfo_t* info, void* raw_context) {
         // A targeted mutation that drops pending ownership must fail the named assertion below rather
         // than trapping forever. Production has no such compensation and would take its fatal path.
         if (action == prosper::host::GuestDmemWriteTraceStepAction::NotHandled &&
-            invalidation_canary_active.load(std::memory_order_acquire)) {
+            (invalidation_canary_active.load(std::memory_order_acquire) ||
+             reconfigure_canary_active.load(std::memory_order_acquire))) {
+            context->uc_mcontext.gregs[REG_EFL] &= ~static_cast<greg_t>(0x100);
+            return;
+        }
+        if (action == prosper::host::GuestDmemWriteTraceStepAction::NotHandled &&
+            preowned_tf_active.load(std::memory_order_acquire) &&
+            preowned_tf_started.load(std::memory_order_acquire)) {
+            preowned_tf_completed.fetch_add(1, std::memory_order_relaxed);
             context->uc_mcontext.gregs[REG_EFL] &= ~static_cast<greg_t>(0x100);
             return;
         }
@@ -135,6 +171,20 @@ __attribute__((noinline)) void store_qword_then_mark(volatile uint8_t* address, 
         "movl $1, (%2)\n\t"
         :
         : "r"(address), "r"(value), "r"(marker)
+        : "memory");
+}
+
+// Models the existing PROSPER_BP/HWBP/STEPWIN ownership sequence: the breakpoint trap sets TF,
+// then the one instruction owned by that machinery writes the trace-protected page. The dmem overlay
+// must open/invalidate the page without consuming the following completion trap.
+__attribute__((noinline)) void breakpoint_then_store_byte(
+        volatile uint8_t* address, uint8_t value, volatile sig_atomic_t* marker) {
+    __asm__ volatile(
+        "int3\n\t"
+        "movb %b1, (%0)\n\t"
+        "movl $1, (%2)\n\t"
+        :
+        : "r"(address), "q"(value), "r"(marker)
         : "memory");
 }
 
@@ -366,7 +416,8 @@ int main() {
 
     const auto& first = result.events[0];
     CHECK(first.selected && first.decoded_write_size == 1 &&
-              first.coverage_valid_before && first.rearmed,
+              first.coverage_valid_before && first.rearmed && first.post_available &&
+              first.changed_during_window,
           "first selected write has continuous process-wide pre-fault coverage");
     CHECK(first.tid == writer_tid.load(std::memory_order_acquire) &&
               first.writer_rip != 0 && first.next_rip != 0,
@@ -417,6 +468,9 @@ int main() {
     invalidated_writer.join();
     invalidation_canary_active.store(false, std::memory_order_release);
     const auto invalidated = prosper::host::guest_dmem_write_trace_snapshot();
+    char invalidated_post[32] = {};
+    prosper::host::guest_dmem_write_trace_format_post(
+        invalidated.events[0], invalidated_post, sizeof(invalidated_post));
     CHECK(last_step_action.load(std::memory_order_acquire) == static_cast<int>(
               prosper::host::GuestDmemWriteTraceStepAction::CompleteInvalid) &&
               invalidation_marker == 1 &&
@@ -424,8 +478,124 @@ int main() {
               invalidated.invalid_reason ==
                   prosper::host::GuestDmemWriteTraceInvalidReason::PhysicalWrite &&
               invalidated.completed_steps == 1 && invalidated.event_count == 1 &&
-              !invalidated.events[0].rearmed,
-          "invalidated pending TF trap is consumed, cleared, retained, and returned explicitly invalid");
+              !invalidated.events[0].rearmed && !invalidated.events[0].post_available &&
+              std::strcmp(invalidated_post, "unavailable") == 0,
+          "invalidated pending TF trap is consumed without fabricating a zero post-image");
+
+    // Configuration is a normal-context seam, but cannot replace the trace while a faulting thread
+    // owns TF. Hold a real writer after SingleStep publication: the configure attempt must be refused
+    // without altering the pending TID, and the original event must complete normally.
+    CHECK(prosper::host::guest_dmem_write_trace_configure(config),
+          "selector can be reset for pending-step reconfiguration control");
+    prosper::host::guest_dmem_write_trace_notify_allocation(
+        physical, allocation_size, chain);
+    volatile sig_atomic_t reconfigure_marker = 0;
+    pause_reconfigure_step.store(true, std::memory_order_release);
+    reconfigure_step_ready.store(false, std::memory_order_release);
+    release_reconfigure_step.store(false, std::memory_order_release);
+    reconfigure_canary_active.store(true, std::memory_order_release);
+    last_step_action.store(-1, std::memory_order_release);
+    std::thread reconfigured_writer([&] {
+        install_altstack();
+        store_byte_then_mark(mapping + offset + 3, 0x67, &reconfigure_marker);
+    });
+    while (!reconfigure_step_ready.load(std::memory_order_acquire)) sched_yield();
+    const auto before_reconfigure = prosper::host::guest_dmem_write_trace_snapshot();
+    const bool reconfigured = prosper::host::guest_dmem_write_trace_configure(config);
+    const auto refused_reconfigure = prosper::host::guest_dmem_write_trace_snapshot();
+    CHECK(!reconfigured &&
+              before_reconfigure.status == prosper::host::GuestDmemWriteTraceStatus::Stepping &&
+              refused_reconfigure.status == prosper::host::GuestDmemWriteTraceStatus::Stepping &&
+              refused_reconfigure.event_count == 0,
+          "configure refuses a live TF owner without replacing its trace state");
+    release_reconfigure_step.store(true, std::memory_order_release);
+    reconfigured_writer.join();
+    reconfigure_canary_active.store(false, std::memory_order_release);
+    const auto after_reconfigure = prosper::host::guest_dmem_write_trace_snapshot();
+    CHECK(last_step_action.load(std::memory_order_acquire) == static_cast<int>(
+              prosper::host::GuestDmemWriteTraceStepAction::Complete) &&
+              reconfigure_marker == 1 &&
+              after_reconfigure.status == prosper::host::GuestDmemWriteTraceStatus::Armed &&
+              after_reconfigure.completed_steps == 1 && after_reconfigure.event_count == 1 &&
+              after_reconfigure.events[0].post_available,
+          "refused reconfiguration leaves the exact pending owner able to complete and re-arm");
+
+    // An unknown off-range instruction executes while all aliases are RW. Change a selected byte from
+    // a sibling during that window: the delta is retained, but cannot be attributed to the faulting RIP.
+    CHECK(prosper::host::guest_dmem_write_trace_configure(config),
+          "selector can be reset for unknown-window sibling-write control");
+    prosper::host::guest_dmem_write_trace_notify_allocation(
+        physical, allocation_size, chain);
+    pause_unknown_step.store(true, std::memory_order_release);
+    unknown_step_ready.store(false, std::memory_order_release);
+    release_unknown_step.store(false, std::memory_order_release);
+    std::thread unknown_writer([&] {
+        install_altstack();
+        exchange_byte(mapping + offset - 0x22, 0x79);
+    });
+    while (!unknown_step_ready.load(std::memory_order_acquire)) sched_yield();
+    store_byte(mapping + offset + 4, 0xa4);
+    release_unknown_step.store(true, std::memory_order_release);
+    unknown_writer.join();
+    const auto unknown_window = prosper::host::guest_dmem_write_trace_snapshot();
+    CHECK(unknown_window.status == prosper::host::GuestDmemWriteTraceStatus::Armed &&
+              unknown_window.event_count == 1 && unknown_window.selected_faults == 0 &&
+              unknown_window.selection_uncertain_faults == 1 &&
+              !unknown_window.events[0].selected &&
+              unknown_window.events[0].selection_uncertain &&
+              unknown_window.events[0].changed_during_window &&
+              unknown_window.events[0].post_available &&
+              std::memcmp(unknown_window.events[0].before.data(),
+                          unknown_window.events[0].after.data(), bytes) != 0,
+          "unknown off-range RIP stays unattributed when a sibling changes selected bytes in the RW window");
+
+    // A real int3-owned step reaches the selected store with TF already set, matching the ownership
+    // shape of BP/HWBP/STEPWIN. Dmem must invalidate/open the page and let that owner consume the trap.
+    CHECK(prosper::host::guest_dmem_write_trace_configure(config),
+          "selector can be reset for pre-owned TF control");
+    prosper::host::guest_dmem_write_trace_notify_allocation(
+        physical, allocation_size, chain);
+    volatile sig_atomic_t preowned_marker = 0;
+    preowned_tf_started.store(false, std::memory_order_release);
+    preowned_tf_completed.store(0, std::memory_order_release);
+    preowned_tf_active.store(true, std::memory_order_release);
+    breakpoint_then_store_byte(mapping + offset + 6, 0xb6, &preowned_marker);
+    preowned_tf_active.store(false, std::memory_order_release);
+    const auto preowned = prosper::host::guest_dmem_write_trace_snapshot();
+    CHECK(preowned_tf_started.load(std::memory_order_acquire) &&
+              preowned_tf_completed.load(std::memory_order_acquire) == 1 &&
+              preowned_marker == 1 && mapping[offset + 6] == 0xb6 &&
+              preowned.status == prosper::host::GuestDmemWriteTraceStatus::Invalid &&
+              preowned.invalid_reason ==
+                  prosper::host::GuestDmemWriteTraceInvalidReason::TrapFlagAlreadyOwned &&
+              preowned.event_count == 0 && preowned.selected_faults == 0 &&
+              preowned.page_faults == 1 && preowned.coverage_gaps == 1,
+          "pre-existing TF owner receives its completion and is never stolen or stranded");
+
+    // Strict-unique mode may observe a selected event from occurrence 1 before occurrence 2 arrives.
+    // Retain that history, but the terminal result must become undetermined for the ambiguous family.
+    CHECK(prosper::host::guest_dmem_write_trace_configure(config),
+          "selector can be reset for post-event strict-uniqueness control");
+    prosper::host::guest_dmem_write_trace_notify_allocation(
+        physical, allocation_size, chain);
+    store_byte(mapping + offset + 7, 0xc7);
+    const auto unique_before_ambiguity = prosper::host::guest_dmem_write_trace_snapshot();
+    CHECK(unique_before_ambiguity.result ==
+              prosper::host::GuestDmemWriteTraceResult::WriterObserved &&
+              unique_before_ambiguity.selected_faults == 1,
+          "strict-unique control first proves a selected event on occurrence 1");
+    prosper::host::guest_dmem_write_trace_notify_allocation(
+        physical + allocation_size, allocation_size, chain);
+    const auto ambiguous_after_event = prosper::host::guest_dmem_write_trace_snapshot();
+    CHECK(ambiguous_after_event.status == prosper::host::GuestDmemWriteTraceStatus::Invalid &&
+              ambiguous_after_event.invalid_reason ==
+                  prosper::host::GuestDmemWriteTraceInvalidReason::AmbiguousAllocation &&
+              ambiguous_after_event.result ==
+                  prosper::host::GuestDmemWriteTraceResult::Undetermined &&
+              ambiguous_after_event.allocation_matches == 2 &&
+              ambiguous_after_event.selected_faults == 1 &&
+              ambiguous_after_event.event_count == 1,
+          "occurrence 2 invalidates the writer verdict while retaining occurrence-1 history");
 
     // CR2 identifies the first faulting byte, not the qword's full span. Start four bytes before the
     // selected interval and change four selected bytes with one instruction; post-step evidence must

@@ -77,6 +77,13 @@ enum class GuestDmemWriteTraceInvalidReason : uint8_t {
     PhysicalWrite,
     ProtectFailed,
     RearmFailed,
+    TrapFlagAlreadyOwned,
+};
+
+enum class GuestDmemWriteTraceResult : uint8_t {
+    Undetermined,
+    WriterObserved,
+    NoSelectedWriteObserved,
 };
 
 struct GuestDmemWriteTraceEvent {
@@ -92,12 +99,20 @@ struct GuestDmemWriteTraceEvent {
     uint32_t decoded_write_size = 0;
     bool selected = false;
     // A page fault reports the first faulting byte, not the memory operand's full write extent. When
-    // that byte begins outside the selected range and the selected bytes do not change, a same-value
-    // crossing store cannot be ruled out when the bounded x86 decoder does not recognize the opcode.
-    // Such events are reported as selection-uncertain rather than falsely claiming selected=no.
+    // that byte begins outside the selected range and the bounded x86 decoder does not recognize the
+    // opcode, a crossing store cannot be ruled out. A changed post-image cannot attribute the write
+    // either because siblings share the process-wide RW step window. Such events are always reported
+    // as selection-uncertain rather than falsely claiming selected=yes/no.
     bool selection_uncertain = false;
+    // The selected bytes changed while every alias was process-wide RW. This is useful evidence about
+    // the window, but does not attribute that change to an unrecognized faulting instruction: a sibling
+    // may have written during the same interval.
+    bool changed_during_window = false;
     bool coverage_valid_before = false;
     bool rearmed = false;
+    // False when an invalidation removed the retained mapping before completion. `after` remains
+    // value-initialized in that case and must never be presented as observed bytes.
+    bool post_available = false;
     std::array<uint8_t, kGuestDmemWriteTraceMaxBytes> before{};
     std::array<uint8_t, kGuestDmemWriteTraceMaxBytes> after{};
 };
@@ -106,6 +121,7 @@ struct GuestDmemWriteTraceSnapshot {
     GuestDmemWriteTraceConfig config{};
     GuestDmemWriteTraceStatus status = GuestDmemWriteTraceStatus::Disabled;
     GuestDmemWriteTraceInvalidReason invalid_reason = GuestDmemWriteTraceInvalidReason::None;
+    GuestDmemWriteTraceResult result = GuestDmemWriteTraceResult::Undetermined;
     uint64_t allocation_matches = 0;
     uint64_t mapping_matches = 0;
     uint64_t page_faults = 0;
@@ -194,7 +210,8 @@ bool guest_write_watch_handle_fault(uint64_t addr);
 // complete_step has a lock-free pending-TID gate, so unrelated TRAP_TRACE users never wait for or
 // enter the dmem state lock. Other platforms return NotHandled/false.
 GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint64_t writer_rip,
-                                                             int64_t tid);
+                                                             int64_t tid,
+                                                             bool trap_flag_already_owned = false);
 GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
     int64_t tid, uint64_t next_rip, GuestDmemWriteTraceEvent& event);
 
@@ -202,8 +219,14 @@ GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
 // write width only for recognized single-destination MOV encodings; zero is explicit unknown.
 uint32_t guest_dmem_write_trace_decode_contiguous_store_size(const uint8_t* instruction);
 
+// Formats only the event's post-image payload. Unavailable observations produce the literal
+// `unavailable`, never the value-initialized contents of `after`. The returned count excludes NUL.
+size_t guest_dmem_write_trace_format_post(const GuestDmemWriteTraceEvent& event,
+                                          char* output, size_t capacity);
+
 // Normal-context setup/inspection. Production uses init_from_environment; configure is also the
-// deterministic test seam. Environment syntax is
+// deterministic test seam. Reconfiguration while a one-instruction TF step is pending is refused
+// without changing the live trace; invalidity never abandons signal ownership. Environment syntax is
 // Four fields preserve strict uniqueness:
 //   PROSPER_DMEM_WRITE_TRACE=<caller-chain>:<allocation-size>:<offset>:<bytes>
 // An explicit run-relative occurrence (1..4096) can disambiguate one exact allocation family:

@@ -1,5 +1,6 @@
 #include "guest_write_watch.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <utility>
 
@@ -38,6 +39,29 @@ uint32_t guest_dmem_write_trace_decode_contiguous_store_size(const uint8_t* code
     if ((opcode == 0xc6 || opcode == 0xc7) && ((modrm >> 3) & 7) != 0) return 0;
     if (opcode == 0x88 || opcode == 0xc6) return 1;
     return rex_w ? 8 : operand16 ? 2 : 4;
+}
+
+size_t guest_dmem_write_trace_format_post(const GuestDmemWriteTraceEvent& event,
+                                          char* output, size_t capacity) {
+    if (!output || !capacity) return 0;
+    size_t used = 0;
+    if (!event.post_available) {
+        static constexpr char unavailable[] = "unavailable";
+        while (used + 1 < capacity && used + 1 < sizeof(unavailable)) {
+            output[used] = unavailable[used];
+            ++used;
+        }
+    } else {
+        static constexpr char hex[] = "0123456789abcdef";
+        const uint32_t size = std::min<uint32_t>(event.size,
+                                                 kGuestDmemWriteTraceMaxBytes);
+        for (uint32_t i = 0; i < size && used + 2 < capacity; ++i) {
+            output[used++] = hex[event.after[i] >> 4];
+            output[used++] = hex[event.after[i] & 0xf];
+        }
+    }
+    output[used] = '\0';
+    return used;
 }
 
 } // namespace prosper::host
@@ -469,7 +493,7 @@ bool guest_write_watch_handle_fault(uint64_t addr) {
     return false;
 }
 
-GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t, uint64_t, int64_t) {
+GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t, uint64_t, int64_t, bool) {
     return GuestWriteWatchFaultAction::NotHandled;
 }
 GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
@@ -789,6 +813,34 @@ const char* trace_reason_name(GuestDmemWriteTraceInvalidReason reason) {
     case GuestDmemWriteTraceInvalidReason::PhysicalWrite: return "physical-write";
     case GuestDmemWriteTraceInvalidReason::ProtectFailed: return "protect-failed";
     case GuestDmemWriteTraceInvalidReason::RearmFailed: return "rearm-failed";
+    case GuestDmemWriteTraceInvalidReason::TrapFlagAlreadyOwned:
+        return "trap-flag-already-owned";
+    }
+    return "invalid-enum";
+}
+
+GuestDmemWriteTraceResult trace_result_locked(const DmemTraceState& trace) {
+    // A strict-unique selector has no subject once a second family member arrives. Historical events
+    // from occurrence 1 remain retained, but they cannot become a writer verdict for an identity the
+    // run itself proved ambiguous. Explicit ordinal selection remains valid while later matches are
+    // counted because that is the five-field selector's contract.
+    const bool selected_identity_valid = trace.selected_occurrence != 0 &&
+        (trace.config.allocation_occurrence != 0 || trace.allocation_matches == 1);
+    if (selected_identity_valid && trace.selected_faults != 0)
+        return GuestDmemWriteTraceResult::WriterObserved;
+    if (selected_identity_valid && trace.status == GuestDmemWriteTraceStatus::Armed &&
+        trace.selected_faults == 0 && trace.selection_uncertain_faults == 0 &&
+        trace.coverage_gaps == 0)
+        return GuestDmemWriteTraceResult::NoSelectedWriteObserved;
+    return GuestDmemWriteTraceResult::Undetermined;
+}
+
+const char* trace_result_name(GuestDmemWriteTraceResult result) {
+    switch (result) {
+    case GuestDmemWriteTraceResult::Undetermined: return "undetermined";
+    case GuestDmemWriteTraceResult::WriterObserved: return "writer-observed";
+    case GuestDmemWriteTraceResult::NoSelectedWriteObserved:
+        return "no-selected-write-observed";
     }
     return "invalid-enum";
 }
@@ -1193,6 +1245,13 @@ GuestWriteWatchStats guest_write_watch_stats() {
 bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig& config) {
     WatchState& w = state();
     std::lock_guard lock(w.mutex);
+    if (w.trace.status == GuestDmemWriteTraceStatus::Stepping ||
+        w.pending_trace_step_tid.load(std::memory_order_acquire) != 0) {
+        std::fprintf(stderr,
+                     "[dmem-write-trace] configure-refused reason=step-pending tid=%lld\n",
+                     static_cast<long long>(w.trace.stepping_tid));
+        return false;
+    }
     if (w.trace.armed) (void)set_trace_armed_locked(w, false, false);
     w.pending_trace_step_tid.store(0, std::memory_order_release);
     w.trace = {};
@@ -1302,6 +1361,7 @@ GuestDmemWriteTraceSnapshot guest_dmem_write_trace_snapshot() {
     out.config = trace.config;
     out.status = trace.status;
     out.invalid_reason = trace.invalid_reason;
+    out.result = trace_result_locked(trace);
     out.allocation_matches = trace.allocation_matches;
     out.mapping_matches = trace.mapping_matches;
     out.page_faults = trace.page_faults;
@@ -1326,13 +1386,7 @@ void guest_dmem_write_trace_report() {
     DmemTraceState& trace = w.trace;
     if (trace.status == GuestDmemWriteTraceStatus::Disabled || trace.report_emitted) return;
     trace.report_emitted = true;
-    const bool valid_negative = trace.status == GuestDmemWriteTraceStatus::Armed &&
-                                trace.selected_faults == 0 &&
-                                trace.selection_uncertain_faults == 0 &&
-                                trace.coverage_gaps == 0;
-    const char* result = trace.selected_faults ? "writer-observed"
-                         : valid_negative ? "no-selected-write-observed"
-                                          : "undetermined";
+    const char* result = trace_result_name(trace_result_locked(trace));
     std::fprintf(stderr,
                  "[dmem-write-trace] summary status=%s reason=%s result=%s"
                  " allocation-matches=%llu mapping-matches=%llu page-faults=%llu"
@@ -1639,7 +1693,8 @@ void guest_write_watch_invalidate_all() {
 // latter single-steps exactly one faulting store so it can retain before/after bytes; all vectors are
 // built before arming, so this signal path performs no allocation.
 GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint64_t writer_rip,
-                                                             int64_t tid) {
+                                                             int64_t tid,
+                                                             bool trap_flag_already_owned) {
     WatchState& w = state();
     if (!w.fault_onstack.load(std::memory_order_acquire))
         return GuestWriteWatchFaultAction::NotHandled;
@@ -1713,6 +1768,22 @@ GuestWriteWatchFaultAction guest_write_watch_handle_fault_ex(uint64_t addr, uint
         if (w.trace.stepping_tid != tid) ++w.trace.coverage_gaps;
         disarm_production_page(production_page);
         if (production_handled) bump(stats().faults);
+        return GuestWriteWatchFaultAction::Resume;
+    }
+
+    if (trace_page && trap_flag_already_owned) {
+        // TF already belongs to a breakpoint/step-window owner. Claiming this write and consuming its
+        // TRAP_TRACE would strand that owner's disabled breakpoint or unfinished step. Mark every
+        // overlapping production watch dirty, open the trace pages, and resume with TF untouched; the
+        // pre-existing owner receives the instruction's completion trap through the ordinary chain.
+        for (const DmemTracePage& trace_page_entry : w.trace.pages) {
+            const auto found = w.pages_by_phys.find(trace_page_entry.phys);
+            if (found != w.pages_by_phys.end()) disarm_production_page(found->second.get());
+        }
+        if (production_handled) bump(stats().faults);
+        ++w.trace.page_faults;
+        ++w.trace.coverage_gaps;
+        trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::TrapFlagAlreadyOwned, true);
         return GuestWriteWatchFaultAction::Resume;
     }
 
@@ -1844,6 +1915,10 @@ GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
     // re-protect it; consuming this owned trap and clearing TF is still mandatory.
     const bool copied = !invalidated_during_step &&
                         trace_copy_target_locked(trace, trace.pending.after);
+    trace.pending.post_available = copied;
+    trace.pending.changed_during_window =
+        copied && std::memcmp(trace.pending.before.data(), trace.pending.after.data(),
+                              trace.pending.size) != 0;
     bool rearmed = copied && trace.invalid_reason == GuestDmemWriteTraceInvalidReason::None;
     if (rearmed) {
         for (const DmemTracePage& page : trace.pages) {
@@ -1878,16 +1953,11 @@ GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
         ++trace.rearms;
     }
     if (!trace.pending.selected && !trace.pending.decoded_write_size) {
-        if (copied && std::memcmp(trace.pending.before.data(), trace.pending.after.data(),
-                                  trace.pending.size) != 0) {
-            // CR2 begins before the selected interval for a crossing store. A post-step byte change is
-            // positive evidence that the completed instruction overlapped the selected bytes.
-            trace.pending.selected = true;
-        } else {
-            // With no complete x86 operand decoder, an unchanged same-page store could still have
-            // crossed the boundary while writing the existing value. Report unknown, never "no".
-            trace.pending.selection_uncertain = true;
-        }
+        // With no complete x86 operand decoder, a same-page store whose fault byte is outside the
+        // interval could still cross it. A changed post-image does not identify this RIP either: every
+        // alias is process-wide RW for the step, so a sibling can be the writer. Preserve the delta as
+        // changed_during_window and report this instruction's selection as unknown, never yes/no.
+        trace.pending.selection_uncertain = true;
     }
     if (trace.pending.selected)
         ++trace.selected_faults;
