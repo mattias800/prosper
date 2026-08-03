@@ -135,6 +135,8 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | `targetContentVersion: 02.001.000` proves the supplied directory is update-only or incomplete | **Falsified.** The assembled 02.002.000 directory identifies itself as Sonic Origins Plus, contains the base executable/content and all four classic RSDK games, and includes four installed DLC payloads with mount records. The target version is update lineage, not a directory-completeness flag. The two loose UI misses remain real, but they are not grounds for rejecting the game dump. | #1905, tracker #1871, this doc |
 | The two early `/app0/raw/ui/...` ENOENT results are a terminal archive, update-overlay, mount, or path-resolution blocker | **Falsified as the asserted startup blocker.** On current master, both failures are handled before entitlement enumeration; the guest then makes 142 successful APR resolve calls across 38 other unique UI, font, language, and audio paths without a fault. A later DLC mount cannot explain the earlier absolute base-app misses. The absent resources may still affect an individual visual if used conditionally, but the black-frame root cause remains open. | #1905, tracker #1871 |
 | A PS5 `launchActivity` Game Intent routes around the current black startup state | **Falsified.** The update declares `launchActivity` support and ships the classic RSDK files, and the guest genuinely receives and consumes an exact `TITLE_SONIC_1_CLASSIC` intent — its `activityId` property is read and recognized. It still remains black and does not open `raw/retro/Sonic1u.rsdk`. This proves the activity route is insufficient, not that the handled UI misses cause the black frame. Truthful default no-intent behaviour is preserved. | this doc, #1905 |
+| Consuming the four installed add-content records naturally advances Sonic into an entitlement-key or mount path and changes the startup state | **Falsified at the `f72d8f0` black-loop boot depth.** After #1916, a valid routed 60 s CPU-only arm makes the count query and a real four-entry list call, then no individual info, key, AppContent, or mount call. A native/full-cadence 90 s renderer arm remains byte-identical black across 18 direct samples and port 17 remains silent. The result is scoped to this boot state; re-run it after any fix that advances the guest. | #1905, #1916 |
+| Sonic is black because it submits no GPU work or a shader/resource stage fails realization | **Falsified for the captured present-20 frame.** A deterministic whole-frame bundle contains 36 realized operations across submits 447-468; every extracted capsule reports `failed=0` and no failure diagnostics, its temporal closure is complete, and offline replay succeeds. The complete 3840x2160 result is nevertheless uniformly black. The first live `Vulkan render FAILED` line occurs earlier on empty submit 448, so it is a missing presentable scanout result rather than a failed Vulkan operation. | #1905 |
 
 ## Sonic Origins dump audit
 
@@ -169,12 +171,50 @@ records 148 successful resolve calls across 40 unique paths; 142 calls across 38
 after the second miss, with no guest fault. Entitlement enumeration happens later, so the later
 entitlement/DLC-mount path cannot explain these earlier absolute `/app0/raw/...` requests; the trace
 does not establish that an archive or update overlay should have supplied them. Installed-DLC
-enumeration is independently incomplete in Prosper (#1909), but it is not this temporal cause.
+enumeration landed separately in #1916, but it is not this temporal cause.
 
 The game still publishes black scanouts and its correctly initialized AudioOut2 buffers remain zero.
 That root cause is open: the absent resources may still affect a visual if the guest uses them
 conditionally, but the trace does not support treating their handled absence as the startup blocker.
 Do not alias another PAC/DDS or use a black frame as a success screenshot.
+
+### Post-add-content frame localization
+
+On exact master `f72d8f0` after #1916, a valid 60-second CPU-only route consumed all four installed
+records: the guest made the zero-capacity count query and followed it with a real `listNum=4` call.
+It made no subsequent individual-info, entitlement-key, AppContent, or mount call in that bounded
+boot. A separate direct native 3840x2160/full-cadence renderer run remained black for all 18 samples
+through guest present 456, while stereo float32 port 17 remained mathematically silent. The four-entry
+enumeration is therefore no longer hidden, but it does not by itself change the current startup state.
+
+The renderer path is active rather than empty. A whole-frame bundle scheduled at guest present 20
+retains 22 submits (`447..468`) and 36 fully realized draw/compute operations. Offline replay resolves
+both temporal edges, uses one captured boundary seed, leaves no bounded or unresolved frontier, and
+still produces a one-colour black 3840x2160 image. Every extracted operation capsule has zero failed
+stages. The first live `Vulkan render FAILED` line belongs to empty submit 448, before the later
+draw-carrying submissions; here it means that no cached scanout pixels were selected, not that a Vulkan
+operation failed. The capture names the current front buffer as absent from the live RTT cache, while the
+complete replay endpoint is also black. Runtime intermediate-output evidence is still required to decide
+whether repairing that presentation miss alone could reveal content.
+
+Manifest-only operation and dependency inspection identifies candidates but does not yet localize the
+first black-producing operation. Submit 463's final draw (operation 5 / `draw[3]`) is a full-resolution
+composite into `0x20168f0000`. The pre-submit capture payloads for its five 3840x2160 texture bindings
+(`b118..b122`) are zero. The graph records `b118` and `b119` as outputs of operations 2 and 1 in that same
+submit, so their values when operation 5 consumes them are unknown; `b120..b122` are external leaves and
+remain candidate inputs. Two smaller utility/static textures (`b115` and `b123`) are genuinely nonzero,
+so this is not a blanket-zero capture. The pre-submit payloads for the two large scene-data constant
+buffers (`b34` and `b35`) are also zero.
+
+The dependency graph continues through submit 465: operation 16 reads `0x20168f0000` and writes
+`0x203a7d0000`, operation 17 reads that target, and operation 18 reads it and writes `0x2010870000`;
+submit 467 then reads `0x2010870000`. All operations are realized and failure-free, while the complete
+replay endpoint is black. Those edges establish ordering and dependency, not the values written by each
+producer. The next discriminator is runtime output inspection (`--output-target-after` / draw steps) at
+submit-463 operations 1, 2 and 5, then submit-465 operations 16-18 and submit 467. That will identify the
+first black-producing stage and distinguish an upstream guest/scene gate from a producer or translation
+defect without another title boot. Exact hashes and command shapes are retained in
+[#1905](https://github.com/mattias800/prosper/issues/1905#issuecomment-5172641024) and its follow-up.
 
 ### Game Intent activity audit
 
