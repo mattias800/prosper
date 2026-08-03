@@ -274,7 +274,9 @@ Matched menu windows reduced texture construction from roughly 14-16 ms to 11-12
 progressed around 2-3 presented frames per second faster. A six-submit full-resolution GPU replay remained
 visually correct. A separate Float16 cube-retention experiment was rejected: the late loading route churned
 the 2 GiB cache, grew from 218 to 411 cumulative write watches, and fell from 3.8 to 1.7 FPS in a matched
-2,640-frame A/B. Cubes therefore remain on their dedicated layer-aware decode path.
+2,640-frame A/B. Non-block-compressed cubes therefore remain on their dedicated uncached layer-aware
+decode path. The supported block-compressed exception below is narrower: it retains an expensive decoded
+result against the exact complete six-face source span and does not admit the rejected Float16 class.
 
 Deferring every texture watch at or above 1 MiB was also rejected. It finished with essentially the same
 watch footprint and 3.8 FPS late checkpoint as the mixed policy, while cumulative exact validation rose
@@ -291,6 +293,47 @@ writes were correctly wired into persistent-watch invalidation, and late checkpo
 than a repeatable speedup. This is therefore primarily a memory/capacity improvement, not a validation or
 frame-rate claim. Dirty or unknown watches deliberately re-decode rather than using a hash, and
 `PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS=1` restores the control behavior for audit/performance comparisons.
+
+## Syberia block-compressed cube retention (2026-08-03)
+
+Syberia's save/profile screen repeatedly decoded one 2048x2048x6 BC6H cube. A five-second sampling
+profile attributed 33.70% of CPU samples to `decode_bc6h_block`; adjacent captures kept the same cube
+descriptor and content hash, and a bounded live miss trace observed address ordinals 1–8, 16 and 32
+with one unchanged key and `reason=unsupported-candidate`. The 33,570,816-byte footprint covers the
+selected mip in six independently-strided face chains. Each miss decoded 1,572,864 BC6H blocks, and
+presentation fell from about 3.5 fps to 2.0 fps when this cube appeared.
+
+The decoded-texture cache now admits a cube only when its format has a supported BC block decoder.
+Its validation range is the conservative contiguous descriptor footprint, including face-chain gaps;
+zero, host-size-overflowing and address-overflowing ranges stay ineligible. Reuse continues through the
+existing exact comparison, ordered GPU-write journal, deferred write-watch promotion and memory-aware
+LRU. This is intentionally not the rejected Plucky Float16 experiment: non-BC cubes remain excluded.
+CPU regression coverage asserts the exact Syberia candidate/range shape and the nearby exclusions.
+
+One post-fix full-resolution diagnostic reached the same profile-screen phase. The 2048 cube emitted
+one `cold-or-evicted` miss with `candidate=1`, `eligible=1` and the exact 33,570,816-byte source, then
+no later miss through t=225.1 s / frame 611. That arm removed the old repeated-miss signature but did
+not independently prove a same-identity hit: aggregate cache hits are not identity evidence, the
+detail logger suppresses resources below 0.5 ms, and an approved debugger breakpoint raced process
+exit. `PROSPER_DETILE_STATS` therefore gained a bounded first-hit witness carrying the key, source span
+and persistent ID/version.
+
+A subsequent short run proved the missing identity link. The run-local 2048x2048x6 BC6H resource at
+key `0x9dc5b36201047cea` first reported one exact 33,570,816-byte `cold-or-evicted` miss, then reported
+`cache=persistent-hit` with the same key, footprint and source span, persistent ID 195/version 1, and
+`validation=exact validated=33570816`. Both the submit journal and write-watch query returned clean
+result 2. The process was stopped immediately after this witness. The expensive decoded cube is thus
+being reused from the persistent cache; the earlier absence of repeated misses was not merely the
+texture disappearing from the workload.
+
+The profile output retained the expected full-width, overexposed scene without new cube corruption.
+Through the post-cube t=125.057→225.102 s window, presents advanced 419→614: **1.949 fps**, no
+measurable improvement over the earlier ~2.0 fps observation. This is not a clean negative A/B because
+the post arm additionally enabled verbose render timing. It does show that removing the repeated miss
+does not by itself make Syberia fast under that diagnostic load; the remaining renderer/compute costs
+still dominate. The screenshot command's exit 1 was self-inflicted apparatus failure — a 48×5 s
+schedule cannot complete under `--timeout 230` — after 45 source- and pixel-distinct samples, not a
+game stall.
 
 ## Plucky Squire unused descriptor materialization (2026-07-29)
 

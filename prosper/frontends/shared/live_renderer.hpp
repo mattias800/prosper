@@ -11,6 +11,8 @@
 #include <string>
 
 #include "frame_dump_policy.hpp"
+#include "texture_decode_cache_policy.hpp"
+#include "texture_decode_diagnostic.hpp"
 #include "gpu/gpu_execute.hpp"          // GuestGpuWriteQuery — the in-submit mutation proof
 
 namespace prosper::frontend {
@@ -83,18 +85,6 @@ uint32_t buffer_upload_bytes(uint32_t declared_bytes);
 // directly testable without constructing a renderer or depending on the test host's RAM size.
 size_t texture_decode_cache_limit_bytes(const char* override_mib,
                                         uint64_t physical_memory_bytes);
-
-// Decide whether guest bytes are the authoritative source for a sampled-texture decode. Retained
-// color and depth targets are already represented by Vulkan images and must bypass CPU decode-cache
-// validation; captured host backing, cube textures, and non-texture resources follow their dedicated
-// paths. Supported 3D volume inputs and the graphics backend's base-slice 2D-array view are pure
-// guest-byte decodes and may be retained like ordinary 2D inputs.
-bool texture_decode_cache_candidate(bool has_live_color_target,
-                                    bool has_live_depth_target,
-                                    bool has_captured_host_data,
-                                    uint32_t image_dimension,
-                                    bool is_sampled_texture,
-                                    bool format_supported);
 
 // Exact frontend shape for guest 2D_MSAA IMAGE_LOAD represented as four R32F array layers.
 // Exposed so a regression can prove nearby counts/formats/layouts remain fail-visible before upload.
