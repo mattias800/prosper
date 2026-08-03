@@ -5,7 +5,7 @@ describe specific, user-supplied PS5 dumps tested primarily on Linux. A mileston
 documented route is reproducible; it does **not** mean the entire game is playable or free of bugs.
 Different title revisions may behave differently.
 
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 ## Summary
 
@@ -38,7 +38,7 @@ Last updated: 2026-08-02
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🔬 Boots to a steady ~50 fps frame loop with a complete post-process chain, but the HDR scene colour is already black before tonemapping |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ Scripted route reaches sustained first-level gameplay at native 1920×1080 |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ Scripted route reaches the first nursery level at native 1920×1080 |
-| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 **Gameplay** — title screen and the first playable scene render with real GPU draws on a validated route; the profile menu's 3D layer and the gameplay composite are degraded (#1619) |
+| *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 **Gameplay** — title screen and the first playable scene render with real GPU draws on a validated route; the profile menu's full-width 3D layer now renders but is overexposed, and the gameplay composite remains degraded (#1619) |
 | *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Scripted routes reach the title screen, EULA, main menu and new-game Options screen at native 1920×1080; the boot's modal confirmation dialog needs input |
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and the ASTRO BOT title screen render at native 3840×2160; the title is over-exposed, the world-map hub shows only its backdrop, and guest compute costs ~21× throughput (#1732) |
 
@@ -629,7 +629,8 @@ reproduction are in
 ## Syberia: Remastered — `PPSA30140`
 
 <p align="center">
-  <img src="assets/screenshots/syberia-profile.png" alt="Syberia: Remastered — profile-select menu (the right portion of the frame is still black)">
+  <img src="assets/screenshots/syberia-profile.png" alt="Syberia: Remastered — profile-select menu with its full-width 3D scene restored; exposure remains incorrect (Linux, screenshot frontend, no input)"><br>
+  <em>Profile-select menu — the 3D layer is restored across the frame, with substantial overexposure still visible</em>
 </p>
 
 <p align="center">
@@ -655,11 +656,12 @@ Registering it against the shared DCB builder — the same treatment the five si
 already had — takes the boot to **523+ submits, 5,028+ draws and 88 flips**, rendering the autosave
 notice with animated gears and then the profile-select menu with its boarding-pass save slots.
 
-The right ~55% of the frame is black. That is now **established as a defect**, not art direction
-(#1619): the menu renders a full 3D scene — 2048x2048 shadow cascades, `R11G11B10F` HDR targets and a
-960x540 to 15x8 bloom pyramid — and the lit composite is **correct** at draw 465. It is then destroyed
-by an in-place compute pass, so the whole scene layer composites black and only the UI survives. No
-draw is scissored to the left; the animation does settle. Start from `prosper/docs/SYBERIA_STATUS.md`.
+The former right-55%-black defect is fixed by supporting Wave64 `s_cmp_lg_u64 exec,s[N:N+1]` when
+the SGPR pair contains a saved per-lane mask. The rejected source-101 compute shader was the missing
+producer for the menu's post-process chain; after it recompiles, a clean default-path run renders
+the full-width 3D interior behind the boarding-pass UI. The result is still substantially
+overexposed, and the routed gameplay composite remains degraded, so the title stays at rung 3 and
+is not visually correct yet. Start from `prosper/docs/SYBERIA_STATUS.md`.
 
 ## Tales of Graces f Remastered — `PPSA19991`
 

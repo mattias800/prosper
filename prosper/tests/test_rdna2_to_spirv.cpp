@@ -813,6 +813,105 @@ int main() {
     CHECK(got17d2.size() == N && bad17d2 == 0,
           "#825: dispatcher reduces mask==0 across the full emulated wave64");
 
+    // Kernel 17d2x: Syberia's fullscreen compute pass compares current EXEC with a mask written
+    // directly to s[16:17] by VOPC.  Keep the irreducible prefix so the comparison must use the
+    // generic dispatcher's synchronized guest-wave vote.  Wave 0's saved mask equals EXEC; wave 1
+    // differs only at lane 63, outside a narrow host subgroup.  Overwrite VCC before the scalar
+    // compare so an implementation that aliases the explicit SGPR destination back to VCC fails.
+    const uint32_t code17d2x_lg[] = {
+        0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
+        0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7c0c02f9u, 0x06069000u, // v_cmp_ge_f32 s[16:17], v0, v1
+        0x7d840100u,              // overwrite VCC; saved s[16:17] must remain independent
+        0xbf13107eu,              // s_cmp_lg_u64 exec, s[16:17]
+        0xbf840001u,              // s_cbranch_scc0 +1 (equal -> keep 1)
+        0x7e040287u,              // different -> v_mov_b32 v2, 7
+        0x7e040d02u, 0xbf810000u,
+    };
+    const std::vector<uint32_t> spv17d2x_lg = recompile_valu(
+        code17d2x_lg, std::size(code17d2x_lg), 2, /*out_vgpr*/2);
+    CHECK(!spv17d2x_lg.empty() && count_spirv_opcode(spv17d2x_lg, 224) > 0,
+          "Syberia EXEC-vs-saved-mask inequality uses a portable guest-wave vote");
+    const std::vector<float> got17d2x_lg = spv17d2x_lg.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv17d2x_lg, in17d, N, N);
+    uint32_t bad17d2x_lg_equal = 0, bad17d2x_lg_different = 0;
+    for (uint32_t i = 0; i < 64 && got17d2x_lg.size() == N; ++i)
+        bad17d2x_lg_equal += got17d2x_lg[i] != 1.0f;
+    for (uint32_t i = 64; i < N && got17d2x_lg.size() == N; ++i)
+        bad17d2x_lg_different += got17d2x_lg[i] != 7.0f;
+    CHECK(got17d2x_lg.size() == N && bad17d2x_lg_equal == 0,
+          "Syberia mask inequality stays clear when saved mask equals EXEC");
+    CHECK(got17d2x_lg.size() == N && bad17d2x_lg_different == 0,
+          "Syberia mask inequality detects a mismatch only at guest lane 63");
+
+    std::vector<uint32_t> code17d2x_eq(
+        std::begin(code17d2x_lg), std::end(code17d2x_lg));
+    code17d2x_eq[11] = 0xbf12107eu; // s_cmp_eq_u64 exec, s[16:17]
+    const std::vector<uint32_t> spv17d2x_eq = recompile_valu(
+        code17d2x_eq.data(), code17d2x_eq.size(), 2, /*out_vgpr*/2);
+    CHECK(!spv17d2x_eq.empty() && count_spirv_opcode(spv17d2x_eq, 224) > 0,
+          "Syberia EXEC-vs-saved-mask equality uses a portable guest-wave vote");
+    const std::vector<float> got17d2x_eq = spv17d2x_eq.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv17d2x_eq, in17d, N, N);
+    uint32_t bad17d2x_eq_equal = 0, bad17d2x_eq_different = 0;
+    for (uint32_t i = 0; i < 64 && got17d2x_eq.size() == N; ++i)
+        bad17d2x_eq_equal += got17d2x_eq[i] != 7.0f;
+    for (uint32_t i = 64; i < N && got17d2x_eq.size() == N; ++i)
+        bad17d2x_eq_different += got17d2x_eq[i] != 1.0f;
+    CHECK(got17d2x_eq.size() == N && bad17d2x_eq_equal == 0,
+          "Syberia mask equality is set when saved mask equals EXEC");
+    CHECK(got17d2x_eq.size() == N && bad17d2x_eq_different == 0,
+          "Syberia mask equality clears for the guest-lane-63 mismatch");
+
+    // A Bool value persisted by the dispatcher is not itself proof that the physical SGPR pair is
+    // still a wave mask. Ordinary scalar writes to either half end the saved-mask lifetime; the
+    // EXEC comparison must remain fail-visible instead of comparing against false/stale Bool data.
+    std::vector<uint32_t> code17d2x_pair_overwrite(
+        std::begin(code17d2x_lg), std::end(code17d2x_lg));
+    code17d2x_pair_overwrite.insert(
+        code17d2x_pair_overwrite.begin() + 11,
+        {0xbe900380u, 0xbe910380u}); // s_mov_b32 s16,0; s_mov_b32 s17,0
+    CHECK(recompile_valu(code17d2x_pair_overwrite.data(),
+                         code17d2x_pair_overwrite.size(), 2, 2).empty(),
+          "EXEC-vs-s16 rejects after an ordinary scalar pair overwrite");
+
+    std::vector<uint32_t> code17d2x_high_overwrite(
+        std::begin(code17d2x_lg), std::end(code17d2x_lg));
+    code17d2x_high_overwrite.insert(
+        code17d2x_high_overwrite.begin() + 11,
+        0xbe910380u); // s_mov_b32 s17,0 invalidates the B64 mask rooted at s16
+    CHECK(recompile_valu(code17d2x_high_overwrite.data(),
+                         code17d2x_high_overwrite.size(), 2, 2).empty(),
+          "EXEC-vs-s16 rejects after a high-half-only scalar overwrite");
+
+    std::vector<uint32_t> code17d2x_ambiguous_join(
+        std::begin(code17d2x_lg), std::end(code17d2x_lg));
+    code17d2x_ambiguous_join.insert(
+        code17d2x_ambiguous_join.begin() + 11,
+        {0xbf860001u,             // s_cbranch_vccz +1: one predecessor keeps the mask
+         0xbe910380u});           // fallthrough overwrites s17 before both paths rejoin
+    CHECK(recompile_valu(code17d2x_ambiguous_join.data(),
+                         code17d2x_ambiguous_join.size(), 2, 2).empty() &&
+              recompile_compute(code17d2x_ambiguous_join.data(),
+                                code17d2x_ambiguous_join.size(), nullptr,
+                                native_cfg17d).empty(),
+          "EXEC-vs-s16 rejects a mask/scalar lifetime join on portable and native paths");
+
+    const std::vector<uint32_t> native_spv17d2x_lg = recompile_compute(
+        code17d2x_lg, std::size(code17d2x_lg), nullptr, native_cfg17d);
+    const std::vector<uint32_t> native_spv17d2x_eq = recompile_compute(
+        code17d2x_eq.data(), code17d2x_eq.size(), nullptr, native_cfg17d);
+    const size_t native_cfg_votes = count_spirv_opcode(native_spv17d, 335);
+    CHECK(!native_spv17d2x_lg.empty() && !native_spv17d2x_eq.empty() &&
+              count_spirv_opcode(native_spv17d2x_lg, 335) == native_cfg_votes + 1 &&
+              count_spirv_opcode(native_spv17d2x_eq, 335) == native_cfg_votes + 1 &&
+              count_spirv_opcode(native_spv17d2x_lg, 224) == 0 &&
+              count_spirv_opcode(native_spv17d2x_eq, 224) == 0,
+          "exact Wave64 EXEC-vs-saved-mask compares add one native vote and no barrier");
+
     // Kernel 17e: the same irreducible-for-the-narrow-structurizer CFG followed by MBCNT. The
     // cross-lane pair must execute in the dispatcher's uniform common phase rather than beneath a
     // switch case, where OpControlBarrier would be invalid and could deadlock a real Vulkan driver.
