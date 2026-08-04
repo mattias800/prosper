@@ -52,6 +52,25 @@ fault is the guest's first dereference of that descriptor, **before** Prosper re
 This excludes a silent null-Jump fallback as a legitimate fix. It does not yet say whether the
 retained item is stale/corrupted or structurally valid with only its side segment absent.
 
+The static producer/teardown map now makes that distinction testable. The allocation-page builder
+gets each resource by calling method `+0x50` on a ref-counted wrapper (for example,
+`eboot+0x1197760` returns the wrapper's embedded resource at `wrapper+0x60`). It appends that raw
+resource pointer at `eboot+0x1177d90`, `+0x1177dcb`, or `+0x1177dfd` when resource fields `+0x88`,
+`+0x68`, or `+0x78` are populated. The page owns only its pointer array: the append takes no wrapper
+reference, and `eboot+0x1177ea0` later frees the arrays without releasing a resource.
+
+For all ten mapped normal resource-creation calls, `eboot+0x1186a40` constructs the side command
+before publishing the wrapper: the same `+0x68`/`+0x78`/`+0x88` condition that makes the page retain
+the resource allocates the 16-byte descriptor, writes its dword count, and stores it at resource
+`+0x98`. Conversely, the common resource teardown `eboot+0x1187300` frees that descriptor and writes
+`+0x98 = 0`; wrapper destructors call this teardown for their embedded resource. Teardown also
+replaces the resource vptr with `eboot+0x7007d60`. Therefore a sibling-fault peek of the retained
+item's first qword can discriminate the leading lifetime hypothesis without changing guest
+behaviour: `0x7007d60` with null `+0x98` means teardown ran after retention, a live secondary vtable
+means construction/later mutation remains open, and any unrelated value means reuse/corruption.
+The missing page-side reference is a concrete lifetime seam, not yet proof that external ownership
+fails to cover the page's consumption interval.
+
 One ordinary, unsuppressed rendered run on current master (`ce258440`) tried to recover those two
 objects with the existing generic fault-memory peek. It was **void for this question**: after about
 13 seconds the `AudioMixerRende` worker jumped to null first, so the process exited before reaching
@@ -138,6 +157,7 @@ Do not re-derive these without contradictory new evidence.
 | A prosper GPU write targets the `0x3001600000` page the poison decodes to | `PROSPER_PROVENANCE_ADDR=0x3001600000:0x10000` reports zero overlapping writes across a full faulting run; `PROSPER_POOLSHIFT=1` is also 0. The page is an ordinary 64 KiB guest `sceKernelBatchMap` mapping, consecutive in the same series as the earlier-reported `0x30015f0000`. | #1226, #1754 |
 | The renderer's fold latency (the guest outrunning our deferred label writes) is causal | `PROSPER_RENDER=0` faults at the same site with the same value, about 6 seconds in instead of about 21 seconds. | #1226, #1754 |
 | Suppressing the forging fence — or both known label writes — fixes the underlying allocator corruption | The fence-only arm removes the terminal `0x30016000` and moves the fault to `0x2400100024001`, two pops farther along the same walk. The first combined run at `dfd89f3f` was **PROVISIONAL/VOID for causality**: its forge population was at least 64 but its only totals snapshot was candidate 1. After the terminal census was fixed and mutation-tested, the corrected arm at `fb3daaa4` independently reached `INIT-SUPPRESS #1024` and ended with the exact final line **`candidates=20 suppressed=20 landed=0`**. It presented frames 0–52, then faulted at the other already-known sibling site `eboot+0x117811f` with `r14=0` (`addr=(nil)`), not at the `0x30016000` pop. Thus removing both writes is not a title fix, but the valid arm settles its narrow necessity question: the specific terminal `0x2000000001 -> 0x30016000` chain does **not** survive when neither known write lands. It does not isolate init from fence, nor attribute the sibling fault, because all-mode deliberately drops live fences. Content-selective capture retained exactly two non-alpha-only images; both were inspected and are single-colour clears (frame 12 solid yellow, frame 50 solid white), with no game imagery. | #1226, #1754 |
+| A resource completed by the mapped normal construction path can have `+0x68`, `+0x78`, or `+0x88` populated while its `+0x98` side-command descriptor was never created | `eboot+0x1186a40`, reached by all ten mapped resource-creation calls, uses the same populated-field condition as the allocation-page appender, allocates the 16-byte side-command descriptor, fills `{target, dword count}`, and stores it at `+0x98` before the wrapper is published. The common teardown at `eboot+0x1187300` is a confirmed later writer of null. This rules out omission by that normal completed path; it does not rule out an unlocated foreign/incomplete constructor, teardown-after-retention, or stale/reused memory. | #1226 |
 | The first current-master ordinary fault-memory arm proves the sibling absent or identifies its producer | The title exited first through an unrelated `AudioMixerRende` null jump. `eboot+0x117811f` was not reached, so the requested `rbp-0xa8` item and `rbp-0x70` page-header peeks sampled the wrong stack frame. The arm is **void/non-discriminating**, not a negative reproduction. A nearby D-queue unsatisfied wait is retained as co-occurring history only; it does not attribute the audio fault. | #1226 |
 
 ## Next discriminators
@@ -145,7 +165,10 @@ Do not re-derive these without contradictory new evidence.
 1. Attribute the `eboot+0x117811f` sibling null-object fault without using the combined suppression
    arm as a title fix. First prove whether the failure exists on current master in an ordinary
    unsuppressed run, then use the existing generic fault-memory peek to recover the original retained
-   item saved at `rbp-0xa8` and its allocation-page metadata at `rbp-0x70`.
+   item saved at `rbp-0xa8`, its allocation-page metadata at `rbp-0x70`, and item fields `+0`, `+0x68`,
+   `+0x78`, `+0x88`, and `+0x98`. In particular, classify the item vptr as the teardown marker
+   `0x7007d60`, a live resource secondary vtable, or unrelated/reused memory before adding any new
+   instrumentation.
 2. Isolate the init and REL1 fence interventions only with arms whose independent lever witnesses and
    terminal populations are complete. Do not infer authorship from a moved terminal fault alone.
 3. Revisit the per-queue barrier model and intro-movie path from #1226 only after checking their
