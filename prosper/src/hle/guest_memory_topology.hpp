@@ -25,4 +25,9 @@ GuestMemoryTopologyRelation guest_memory_topology_relation(
 bool guest_memory_gpu_write_supported(uint64_t destination, size_t bytes);
 bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t bytes);
 
+// Unit-test witness that the protected/backing-aware device-write path actually ran. Output bytes
+// alone cannot prove that lever moved: a host memmove can coincidentally choose the correct direction
+// for one pair of physically aliased but VA-disjoint views.
+uint64_t guest_memory_gpu_write_successes_for_test();
+
 } // namespace prosper

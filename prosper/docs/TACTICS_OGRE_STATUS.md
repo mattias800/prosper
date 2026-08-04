@@ -33,7 +33,8 @@ accepts such a destination only when the authoritative kernel mapping table prov
 range belongs to one committed direct mapping. The kernel helper writes through the shared physical
 backing while holding the mapping topology stable, retains the guest VA's CPU protection, invalidates
 physical aliases after releasing the topology lock, and rejects private, untracked, malformed, or
-cross-boundary destinations.
+cross-boundary destinations. Linux uses bounded `pwrite`; macOS uses bounded writable `MAP_SHARED`
+aliases of its POSIX-shm backing; Windows uses a bounded section view.
 
 The presented planes use 1920 visible bytes inside a 2048-byte physical row. Luma is R8 and chroma is
 interleaved RG8 with the title's `(X,X,X,Y)` descriptor swizzle. The live renderer preserves the exact
@@ -58,16 +59,29 @@ The movie begins after the static startup logos. Do not use `PROSPER_RENDER_SCAL
 ## Verification
 
 - `avplayer_hle`, `agc_dcb_pm4`, and `eop_write` pass in the Vulkan-enabled Linux build.
+- The builder/executor test carries an asserted `sourceKind=2` address of `0x4000` through the packet
+  and rejects it unmapped. Deleting the address-form metadata makes exactly that check fail by
+  reinterpreting the low address as an immediate fill.
 - The DMA tests exercise address and immediate forms into two CPU-read-only aliases of one direct
   allocation, require exact bytes through both aliases, and require the VAs to remain read-only.
-- A destructive `destination = source + 4` copy through two different VAs of the same physical
-  direct-memory range requires the prior memmove result. The backing helper resolves this hidden
-  physical overlap, stages bounded chunks, and copies in physical address order on POSIX and Windows.
+- Destructive `destination = source + 4` and `source = destination + 4` copies through two different
+  writable VAs of the same physical direct-memory range require both memmove results and independently
+  prove that both operations entered the backing-aware path. The helper resolves the hidden physical
+  overlap, stages bounded chunks, and copies in physical address order on POSIX and Windows.
+- Intervening retained `WRITE_DATA` and immediate-DMA destinations are included in the dependency
+  proof before eager indirect-register and wait readers. Indirect registers reject an overlapping
+  queued write; exact immediate-DMA label fills and fixed 32/64-bit releases are overlaid in order
+  for the wait, allowing a satisfied value while rejecting an unsatisfied, timestamp, or otherwise
+  ambiguous one. Removing those checks makes the named stale-reader controls fail even though the
+  original address-DMA destination is proven disjoint.
 - Private anonymous read-only memory and a direct range crossing its mapping boundary both reject
   without changing bytes or publishing a renderer write notification.
-- A defect-shaped mutation that removes direct-backing eligibility makes exactly the three protected
-  direct-memory copy, fill, and physical-alias-overlap checks fail while the private and
-  cross-boundary rejection checks remain green.
+- A forced backing failure after range validation leaves both aliases unchanged, publishes no renderer
+  notification, and records no full-write value provenance. Moving provenance before that fallible
+  operation makes the named negative check fail.
+- A defect-shaped mutation that removes direct-backing eligibility makes the protected direct-memory
+  copy/fill checks and the backing-path witness fail while the private and cross-boundary rejection
+  checks remain green.
 - The valid live run logged successful protected-backing DMA copy ordinals from `#1` through at least
   `#2048`, with no invalid DMA row, and the direct frames changed continuously through the movie.
 
@@ -87,10 +101,17 @@ The movie begins after the static startup logos. Do not use `PROSPER_RENDER_SCAL
 - **The movie upload uses argument 1 as its address source.** The live call has `sourceKind=2`, a zero
   argument 1, and the changing decoded row address in stack argument 8. Encoding argument 1 turned the
   upload into immediate-zero fills.
+- **Every source numerically at or below `UINT32_MAX` is an immediate.** `sourceKind=2` is a separate
+  ABI discriminator and can assert a low, invalid, or not-yet-mapped address. New HLE packets preserve
+  that form explicitly; only historical packets retain the numeric-width fallback.
 - **A whole retained-DMA submit must reject whenever any later packet reads guest memory.** Tactics
   Ogre's later waits and indirect-register arrays are physically disjoint from the 1,620 movie-row
   destinations. Authoritative VA-to-physical topology proves the safe case; same-physical aliases and
   unknown topology remain fail-closed.
+- **Proving only the first retained DMA destination disjoint is enough for an eager reader.** Later
+  queued writes are producers too. A `WRITE_DATA` to an indirect-register range must reject the eager
+  fold, while an exact immediate-DMA init and fixed-value release to a wait label must be overlaid and
+  evaluated from their queued values even when the original address-copy destination is disjoint.
 - **CPU read-only protection forbids the device write.** The destination is readable but not CPU
   writable, while its complete range is a committed shared direct-memory mapping. Writing the physical
   backing preserves CPU protection and restores the exact decoded movie.

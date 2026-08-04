@@ -4,6 +4,7 @@
 // the indirect-register patch helpers modify a previously-returned packet. This validates the port
 // independently of the (locale-blocked) boot.
 #include "../src/hle/dispatch.hpp"
+#include "../src/gpu/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -221,6 +222,8 @@ int main() {
             CHECK(packet[3] == (uint32_t)src && packet[4] == (uint32_t)(src >> 32u) &&
                       packet[5] == sizeof source,
                   "sourceKind=2 selects the stack source instead of immediate zero");
+            CHECK((packet[6] & gpu::kDmaDataAddressSource) != 0,
+                  "address-source DmaData preserves the asserted source form in packet metadata");
 
             // The other ABI arm must remain independent of a7. Existing immediate/offset calls use
             // sourceKind=0; give this one a deliberately tempting address in a7 and prove that the
@@ -238,11 +241,15 @@ int main() {
             CHECK(packet[3] == (uint32_t)immediate && packet[4] == 0 &&
                       packet[5] == sizeof source,
                   "sourceKind=0 preserves a1 even when stack source looks addressable");
+            CHECK((packet[6] & gpu::kDmaDataAddressSource) == 0,
+                  "immediate-source DmaData does not acquire address-form metadata");
 
             // An asserted address form must not degrade into an immediate fill merely because the
             // address is malformed or currently unmapped. The executor owns validation and will
             // reject this address visibly; the builder's only job is to retain the selected form.
-            constexpr uint64_t invalid_source = 0x00007fdeadbeef00ull;
+            // Deliberately keep this below UINT32_MAX. Numeric width used to be the executor's only
+            // discriminator, so this exact asserted address degraded into a 0x4000 fill.
+            constexpr uint64_t invalid_source = 0x4000ull;
             d.cursor_up = buf;
             packet = (uint32_t*)(uintptr_t)
                 ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,
@@ -251,7 +258,7 @@ int main() {
                     immediate, /*dstSel*/3, /*srcSel*/3, dst,
                     /*policy*/3, /*sourceKind*/2, invalid_source, sizeof source);
             CHECK(packet[3] == (uint32_t)invalid_source &&
-                      packet[4] == (uint32_t)(invalid_source >> 32u),
+                      packet[4] == 0 && (packet[6] & gpu::kDmaDataAddressSource) != 0,
                   "sourceKind=2 retains an invalid address instead of silently filling from a1");
         }
     }

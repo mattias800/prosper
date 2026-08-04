@@ -9,6 +9,7 @@
 #include "../src/gpu/mb3_freelist.hpp"
 #include "../src/gpu/pm4_decode.hpp"
 #include "../src/hle/dispatch.hpp"
+#include "../src/hle/guest_memory_topology.hpp"
 #include "../src/hle/nid.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -32,6 +33,7 @@ extern "C" uint64_t prosper_guest_tsc_ns();
 extern "C" void prosper_label_hist_dma_built(uint64_t addr, uint64_t cb, uint32_t src, uint8_t builder);
 // #1226: uncapped total of PROSPER_WRITE_TRAP payload matches (see command_processor.cpp).
 extern "C" uint64_t prosper_gpu_write_trap_matches();
+extern "C" void prosper_dma_backing_write_fail_once_for_test();
 extern "C" void prosper_rel1_forge_suppress_all_override_for_test(int value);
 extern "C" void prosper_rel1_forge_decision_reset_for_test();
 extern "C" void prosper_rel1_forge_decision_totals(uint64_t* candidates, uint64_t* suppressed,
@@ -645,6 +647,151 @@ int main() {
             CHECK(aliased_wait.dma_execution_rejected && *wait_target == 0,
                   "VA-disjoint same-physical wait still rejects fail-closed");
 
+            // Retained effects after the first address copy are earlier producers too. Prove the
+            // original copy is physically disjoint from B, then write B and eagerly read B through
+            // indirect registers. Folding the old bytes would execute a stale register snapshot.
+            auto* effect_dma_target = (uint64_t*)(uintptr_t)(first_view + 0x800);
+            auto* effect_reg = (ShaderReg*)(uintptr_t)(first_view + 0x5000);
+            *effect_dma_target = 0;
+            *effect_reg = {0x4a, 0x11111111u};
+            uint64_t effect_source = 0x8877665544332211ull;
+            const uint64_t effect_src = (uint64_t)(uintptr_t)&effect_source;
+            const uint64_t effect_dst = (uint64_t)(uintptr_t)effect_dma_target;
+            const uint64_t effect_reg_addr = (uint64_t)(uintptr_t)effect_reg;
+            uint32_t effect_reg_stream[18] = {};
+            effect_reg_stream[0] = PM4(7, IT_NOP, R_DMA_DATA);
+            effect_reg_stream[1] = (uint32_t)effect_dst;
+            effect_reg_stream[2] = (uint32_t)(effect_dst >> 32);
+            effect_reg_stream[3] = (uint32_t)effect_src;
+            effect_reg_stream[4] = (uint32_t)(effect_src >> 32);
+            effect_reg_stream[5] = sizeof(effect_source);
+            effect_reg_stream[7] = PM4(7, IT_NOP, R_WRITE_DATA);
+            effect_reg_stream[8] = 0;
+            effect_reg_stream[9] = (uint32_t)effect_reg_addr;
+            effect_reg_stream[10] = (uint32_t)(effect_reg_addr >> 32);
+            effect_reg_stream[11] = 2;
+            effect_reg_stream[12] = 0x4b;
+            effect_reg_stream[13] = 0xAABBCCDDu;
+            effect_reg_stream[14] = PM4(4, IT_NOP, R_SH_REGS_INDIRECT);
+            effect_reg_stream[15] = 1;
+            effect_reg_stream[16] = (uint32_t)effect_reg_addr;
+            effect_reg_stream[17] = (uint32_t)(effect_reg_addr >> 32);
+            GpuState effect_regs; run_cb(effect_reg_stream, 18, effect_regs);
+            CHECK(effect_regs.dma_execution_rejected && *effect_dma_target == 0 &&
+                      effect_reg->offset == 0x4a && effect_reg->value == 0x11111111u &&
+                      effect_regs.sh.find(0x4a) == effect_regs.sh.end() &&
+                      effect_regs.sh.find(0x4b) == effect_regs.sh.end(),
+                  "indirect registers reject an overlapping earlier retained WRITE_DATA effect");
+
+            // Same dependency shape through the other eager reader: an immediate DMA to B follows
+            // the disjoint address copy, then WAIT_REG_MEM consumes B. The fill cannot enter the
+            // ordered timeline while the wait is evaluated from stale guest memory.
+            auto* effect_wait = (uint64_t*)(uintptr_t)(first_view + 0x5100);
+            *effect_dma_target = 0;
+            *effect_wait = 0;
+            const uint64_t effect_wait_addr = (uint64_t)(uintptr_t)effect_wait;
+            uint32_t effect_wait_stream[22] = {};
+            memcpy(effect_wait_stream, effect_reg_stream, 7 * sizeof(uint32_t));
+            effect_wait_stream[7] = PM4(7, IT_NOP, R_DMA_DATA);
+            effect_wait_stream[8] = (uint32_t)effect_wait_addr;
+            effect_wait_stream[9] = (uint32_t)(effect_wait_addr >> 32);
+            effect_wait_stream[10] = 1;
+            effect_wait_stream[11] = 0;
+            effect_wait_stream[12] = sizeof(uint64_t);
+            effect_wait_stream[14] = PM4(8, IT_NOP, R_WAIT_MEM_64);
+            effect_wait_stream[15] = (uint32_t)effect_wait_addr;
+            effect_wait_stream[16] = (uint32_t)(effect_wait_addr >> 32);
+            effect_wait_stream[17] = 0xffffffffu;
+            effect_wait_stream[19] = 1;
+            effect_wait_stream[21] = 3;
+            GpuState effect_wait_state; run_cb(effect_wait_stream, 22, effect_wait_state);
+            CHECK(!effect_wait_state.dma_execution_rejected,
+                  "WAIT_REG_MEM accepts a satisfying retained immediate DMA overlay");
+            CHECK(effect_wait_state.ordered_memory_effects.size() == 1,
+                  "the accepted immediate DMA remains ordered after the address copy");
+            CHECK(*effect_dma_target == effect_source,
+                  "the accepted address copy executes before the wait");
+            CHECK(*effect_wait == 0x0000000100000001ull,
+                  "the accepted immediate DMA executes before the wait");
+
+            // The same overlay must not turn every retained fill into a satisfied wait. A fill of 1
+            // cannot satisfy equality with 2, so the submit remains fail-closed and lands nothing.
+            *effect_dma_target = 0;
+            *effect_wait = 0;
+            effect_wait_stream[19] = 2;
+            GpuState unsatisfied_effect_wait; run_cb(effect_wait_stream, 22,
+                                                     unsatisfied_effect_wait);
+            CHECK(unsatisfied_effect_wait.dma_execution_rejected &&
+                      *effect_dma_target == 0 && *effect_wait == 0,
+                  "WAIT_REG_MEM rejects an unsatisfied retained immediate DMA overlay");
+
+            // Tactics Ogre's movie submits add the completion leg between the label init and the
+            // wait: copy(A), fill(B, 0), release32(B, 1), wait(B == 1). The fixed release value is
+            // just as ordered and deterministic as the fill, so evaluate both before the eager
+            // wait instead of rejecting the whole decoded-frame upload.
+            *effect_dma_target = 0;
+            *effect_wait = 0;
+            uint32_t release_wait_stream[29] = {};
+            memcpy(release_wait_stream, effect_wait_stream, 14 * sizeof(uint32_t));
+            release_wait_stream[10] = 0;
+            release_wait_stream[11] = 0;
+            release_wait_stream[14] = PM4(7, IT_NOP, R_RELEASE_MEM);
+            release_wait_stream[15] = (uint32_t)effect_wait_addr;
+            release_wait_stream[16] = (uint32_t)(effect_wait_addr >> 32);
+            release_wait_stream[17] = 1;
+            release_wait_stream[18] = 1;
+            release_wait_stream[21] = PM4(8, IT_NOP, R_WAIT_MEM_64);
+            release_wait_stream[22] = (uint32_t)effect_wait_addr;
+            release_wait_stream[23] = (uint32_t)(effect_wait_addr >> 32);
+            release_wait_stream[24] = 0xffffffffu;
+            release_wait_stream[26] = 1;
+            release_wait_stream[28] = 3;
+            GpuState release_wait_state;
+            run_cb(release_wait_stream, 29, release_wait_state);
+            CHECK(!release_wait_state.dma_execution_rejected &&
+                      release_wait_state.ordered_memory_effects.size() == 2,
+                  "WAIT_REG_MEM accepts the retained fill-release label protocol");
+            CHECK(*effect_dma_target == effect_source && *effect_wait == 1,
+                  "the accepted copy, fill, and release execute in command order");
+
+            // Both guest views are writable here, but their VA-disjoint spans overlap in the same
+            // physical direct backing. Exercise both destructive physical directions; a plain VA
+            // memmove can coincidentally choose correctly for one virtual-address ordering, so the
+            // backing-path success counter independently proves the intended lever moved twice.
+            auto* writable_overlap_source = (uint8_t*)(uintptr_t)(first_view + 0x1000);
+            auto* writable_overlap_alias = (uint8_t*)(uintptr_t)(second_view + 0x1000);
+            constexpr size_t writable_overlap_bytes = 0x8000;
+            std::vector<uint8_t> writable_expected(writable_overlap_bytes + 4);
+            auto run_writable_overlap = [&](size_t source_offset, size_t destination_offset) {
+                for (size_t i = 0; i < writable_expected.size(); ++i)
+                    writable_overlap_source[i] = writable_expected[i] =
+                        (uint8_t)(i * 37u + 11u);
+                memmove(writable_expected.data() + destination_offset,
+                        writable_expected.data() + source_offset, writable_overlap_bytes);
+                uint32_t dma[7] = {};
+                const uint64_t overlap_src = first_view + 0x1000 + source_offset;
+                const uint64_t overlap_dst = second_view + 0x1000 + destination_offset;
+                dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+                dma[1] = (uint32_t)overlap_dst;
+                dma[2] = (uint32_t)(overlap_dst >> 32);
+                dma[3] = (uint32_t)overlap_src;
+                dma[4] = (uint32_t)(overlap_src >> 32);
+                dma[5] = writable_overlap_bytes;
+                GpuState writable_overlap; run_cb(dma, 7, writable_overlap);
+                return memcmp(writable_overlap_alias, writable_expected.data(),
+                              writable_expected.size()) == 0 &&
+                       guest_writable(overlap_dst, writable_overlap_bytes);
+            };
+            const uint64_t backing_writes_before =
+                prosper::guest_memory_gpu_write_successes_for_test();
+            const bool destructive_forward = run_writable_overlap(0, 4);
+            const bool destructive_backward = run_writable_overlap(4, 0);
+            CHECK(destructive_forward && destructive_backward,
+                  "GPU DMA preserves both memmove directions across writable physical aliases");
+            CHECK(prosper::guest_memory_gpu_write_successes_for_test() ==
+                      backing_writes_before + 2,
+                  "writable physical aliases prove both copies used the backing-aware path");
+
             // A GPU can write direct memory whose guest VA is CPU-read-only. Preserve that CPU
             // protection and update the shared physical backing instead of weakening mprotect or
             // blindly memmoving through the protected VA. Protect both aliases so this exercises
@@ -688,6 +835,27 @@ int main() {
                 CHECK(*read_only_target == gpu_source && *read_only_alias == gpu_source &&
                           notified && !guest_writable(gpu_dst, sizeof(gpu_source)),
                       "GPU DMA updates CPU-read-only direct backing and every physical alias");
+
+                // Validation and backing publication are separate operations. Force the latter to
+                // fail after the former accepted this exact direct range and prove neither write
+                // provenance nor renderer notification claims the payload landed.
+                uint64_t failed_gpu_source = 0x012345675a5a0001ull;
+                const uint64_t failed_gpu_src = (uint64_t)(uintptr_t)&failed_gpu_source;
+                gpu_stream[3] = (uint32_t)failed_gpu_src;
+                gpu_stream[4] = (uint32_t)(failed_gpu_src >> 32);
+                gpu_stream[5] = sizeof(failed_gpu_source);
+                notified = false;
+                set_guest_gpu_write_observer(
+                    [&](uint64_t, uint64_t) { notified = true; });
+                const uint64_t trap_before_failed_write = prosper_gpu_write_trap_matches();
+                prosper_dma_backing_write_fail_once_for_test();
+                GpuState failed_backing_dma; run_cb(gpu_stream, 7, failed_backing_dma);
+                set_guest_gpu_write_observer({});
+                CHECK(*read_only_target == gpu_source && *read_only_alias == gpu_source &&
+                          !notified,
+                      "a failed direct-backing DMA copy leaves aliases unchanged and unnotified");
+                CHECK(prosper_gpu_write_trap_matches() == trap_before_failed_write,
+                      "a failed direct-backing DMA copy records no full-write provenance");
 
                 constexpr uint32_t fill_value = 0xA5B6C7D8u;
                 gpu_stream[3] = fill_value;
@@ -788,6 +956,26 @@ int main() {
         CHECK(target == 0x8877665544332211ull,
               "DMA_DATA skips an unmapped address source without modifying the destination");
         CHECK(!notified, "a skipped DMA_DATA copy does not report a guest-memory write");
+    }
+
+    // The HLE's sourceKind=2 can assert an address whose numeric value lies inside the 32-bit
+    // immediate domain. Preserve that form through decode and reject the unmapped low address;
+    // discarding the metadata would fill the destination with 0x4000 instead.
+    {
+        uint64_t target = 0x1122334455667788ull;
+        const uint64_t dst = (uint64_t)(uintptr_t)&target;
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = (uint32_t)dst; dma[2] = (uint32_t)(dst >> 32);
+        dma[3] = 0x4000; dma[4] = 0;
+        dma[5] = sizeof(target);
+        dma[6] = kDmaDataAddressSource;
+        bool notified = false;
+        set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+        GpuState st; run_cb(dma, 7, st);
+        set_guest_gpu_write_observer({});
+        CHECK(st.dma_copies.size() == 1 && target == 0x1122334455667788ull && !notified,
+              "asserted low address source fails visibly instead of becoming an immediate fill");
     }
 
     // A mapped but read-only destination is readable, so source/destination mappedness alone is

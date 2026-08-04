@@ -13,6 +13,7 @@
 #include "../host/guest_memory_map.hpp"
 #include "../host/guest_write_watch.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -28,6 +29,14 @@ namespace prosper {
 // (only UE's 512 GiB MallocBinned3 flex arena qualifies) is steered off its low hint into the
 // guest auto window. See k_reserve_vrange (POSIX) / win_reserve (Windows).
 inline constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB
+
+namespace {
+std::atomic<uint64_t> g_guest_memory_gpu_write_successes{0};
+}
+
+uint64_t guest_memory_gpu_write_successes_for_test() {
+    return g_guest_memory_gpu_write_successes.load(std::memory_order_relaxed);
+}
 
 // libSceAmpr command-buffer accounting is host-platform independent. UE4 batches commands until
 // `GetSize(cb) - GetCurrentOffset(cb)` can no longer hold the next packet, then submits that cb.
@@ -2233,7 +2242,8 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
         // Hold the authoritative topology lock across revalidation and the backing write, so an
         // unmap/remap cannot redirect the operation after its destination proof. Do not acquire
         // the write-watch mutex here: mapping paths use g_mx -> write-watch, and reversing that
-        // order would deadlock. A pwrite bypasses guest VA protection, so notification may follow.
+        // order would deadlock. The backing write bypasses guest VA protection, so notification may
+        // follow after this lock is released.
         std::lock_guard<std::mutex> lock(g_mx);
         uint64_t current_physical = 0;
         if (!resolve_direct(destination, bytes, current_physical) || current_physical != physical)
@@ -2243,6 +2253,31 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
             size_t span_done = 0;
             while (span_done < span_size) {
                 const size_t remaining = span_size - span_done;
+#ifdef __APPLE__
+                // Darwin POSIX-shm descriptors are mmap backings, not ordinary files: pwrite does
+                // not update them reliably (the macOS eop_write guard caught all protected direct
+                // copies remaining unchanged). Use a short-lived writable shared alias so a device
+                // write can still bypass the CPU-read-only guest VA. Bound each view just like the
+                // overlap scratch path; a later map failure then dirties only the prefix that landed.
+                constexpr size_t kDarwinWriteChunk = 64u * 1024u;
+                const size_t chunk = std::min(remaining, kDarwinWriteChunk);
+                const uint64_t mapped_begin = physical + offset + span_done;
+                static const uint64_t page_size = [] {
+                    const long queried = sysconf(_SC_PAGESIZE);
+                    return queried > 0 ? static_cast<uint64_t>(queried) : uint64_t{4096};
+                }();
+                const uint64_t view_offset = mapped_begin - mapped_begin % page_size;
+                const uint64_t view_delta = mapped_begin - view_offset;
+                if (view_delta > SIZE_MAX || chunk > SIZE_MAX - static_cast<size_t>(view_delta))
+                    break;
+                const size_t view_size = static_cast<size_t>(view_delta) + chunk;
+                void* view = mmap(nullptr, view_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                                  static_cast<off_t>(view_offset));
+                if (view == MAP_FAILED) break;
+                std::memcpy(static_cast<uint8_t*>(view) + view_delta, span + span_done, chunk);
+                munmap(view, view_size);
+                const size_t written = chunk;
+#else
                 const size_t chunk = std::min<size_t>(
                     remaining, static_cast<size_t>(SSIZE_MAX));
                 const ssize_t written = pwrite(
@@ -2250,6 +2285,7 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
                     static_cast<off_t>(physical + offset + span_done));
                 if (written < 0 && errno == EINTR) continue;
                 if (written <= 0) break;
+#endif
                 const uint64_t write_begin = physical + offset + span_done;
                 const uint64_t write_end = write_begin + static_cast<size_t>(written);
                 dirty_begin = std::min(dirty_begin, write_begin);
@@ -2301,7 +2337,10 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
     // partial write dirties a conservative physical envelope before the failure is reported.
     if (dirty_begin != UINT64_MAX)
         host::guest_write_watch_notify_physical_write(dirty_begin, dirty_end - dirty_begin);
-    return done == bytes;
+    const bool complete = done == bytes;
+    if (complete)
+        g_guest_memory_gpu_write_successes.fetch_add(1, std::memory_order_relaxed);
+    return complete;
 }
 
 void register_kernel_mem_hle() {
@@ -5369,7 +5408,10 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
         }
         UnmapViewOfFile(view);
     }
-    if (written) host::guest_write_watch_notify_physical_write(physical, bytes);
+    if (written) {
+        host::guest_write_watch_notify_physical_write(physical, bytes);
+        g_guest_memory_gpu_write_successes.fetch_add(1, std::memory_order_relaxed);
+    }
     return written;
 }
 

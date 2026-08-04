@@ -642,8 +642,10 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
 //    visibly rather than silently changing into an immediate fill.
 // numBytes is stack arg9. The import ABI bridge forwards args 7-9 as normal fixed parameters on
 // Windows and on Linux's guest-FS path; no compiler-frame decoding is involved (#672).
-// Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=sels,
-// [7..8]=the destination qword when this exact packet was built (#312 generation identity).
+// Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=selector
+// bytes plus prosper's kDmaDataAddressSource form bit. The bit is necessary because sourceKind=2
+// can assert an address whose numeric value is still <=32 bits; discarding the kind would silently
+// reinterpret an invalid/unmapped address as an immediate fill in the executor.
 // CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol);
 // MED on the selector args (recorded raw; the executor distinguishes the captured 32-bit immediate
 // domain from mapped 64-bit address sources and keeps GDS/unmapped forms fail-closed).
@@ -673,7 +675,8 @@ HLE9(agc_dcb_dma_data) {  // (..., srcImmediate, dstSel?, srcSel?, dst, policy, 
     cmd[1] = (uint32_t)(a4 & 0xffffffffu); cmd[2] = (uint32_t)(a4 >> 32u);
     cmd[3] = (uint32_t)(src_or_imm & 0xffffffffu); cmd[4] = (uint32_t)(src_or_imm >> 32u);
     cmd[5] = (uint32_t)num_bytes;
-    cmd[6] = (uint32_t)((a2 & 0xffu) | ((a3 & 0xffu) << 8));
+    cmd[6] = (uint32_t)((a2 & 0xffu) | ((a3 & 0xffu) << 8) |
+                        (address_source ? gpu::kDmaDataAddressSource : 0u));
     if (num_bytes <= 8) {
         prosper_label_hist_dma_built(a4, a0, (uint32_t)a1, 1);                  // #312 label-init form
     }

@@ -6305,10 +6305,14 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         case Pm4Command::Kind::DmaData: {
                             // Selector byte 1 names the 64 KiB GDS offset domain, not guest VA.
                             // Every other valid destination is an exact guest write range.  A
-                            // >32-bit non-GDS source is an address copy and is observed separately.
+                            // An asserted address source (or a legacy >32-bit source) is observed
+                            // separately; numeric width alone is insufficient for new HLE packets.
                             const bool source_gds = ((command.dd_sels >> 8u) & 0xffu) == 1u;
                             const bool destination_gds = (command.dd_sels & 0xffu) == 1u;
-                            if (!source_gds && command.dd_src > UINT32_MAX) {
+                            const bool address_source =
+                                (command.dd_sels & kDmaDataAddressSource) != 0 ||
+                                command.dd_src > UINT32_MAX;
+                            if (!source_gds && address_source) {
                                 notify_compute_authority_range(
                                     ComputeAuthorityBoundaryKind::Dma, submit_no,
                                     operation.command_order, command.dd_src,
