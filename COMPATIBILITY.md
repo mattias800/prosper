@@ -48,7 +48,7 @@ closing bugs. Every title in the tested inventory has a long-lived tracker in th
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and the ASTRO BOT title screen render at native 3840×2160; the title is over-exposed, the world-map hub shows only its backdrop, and guest compute costs ~21× throughput (#1732) |
 | *The Forgotten City* | `PPSA03026` | Unreal Engine 4 | 🔬 Intermittent bring-up: one exact-master run rendered advancing native-4K logos and an autosave notice, while an immediate repeat stayed black; no title screen yet |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine | 🔬 Reaches the frame loop, but live rendering fails and fallback output is mostly black with corrupted horizontal bands |
-| *Tactics Ogre: Reborn* | `PPSA03839` | Custom | 🚧 A fresh-save route reaches the first tutorial battle and an interactive move command at native 1920×1080; several sprites and HUD elements render as solid blocks (#1913), and HEVC movies remain flat gray/green (#1903) |
+| *Tactics Ogre: Reborn* | `PPSA03839` | Custom | 🚧 A fresh-save route reaches the first tutorial battle and an interactive move command at native 1920×1080; decoded HEVC movies now render correctly, while several sprites and HUD elements remain solid blocks (#1913) |
 | *Little Nightmares III* | `PPSA05143` | Unreal Engine | 🔬 Starts graphics setup, then faults on a low-address read before presenting a frame |
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Boots and remains alive for the bounded test, but publishes no rendered frame |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 Loads the runtime and EOS module, then times out during initialization without presenting a frame |
@@ -978,6 +978,11 @@ Reusable input routes are documented in
 ## Tactics Ogre: Reborn — `PPSA03839`
 
 <p align="center">
+  <img src="assets/screenshots/tactics-ogre-hevc-movie.png" alt="Tactics Ogre: Reborn — decoded HEVC opening movie">
+  <br><sub>Direct, unmodified Linux/RADV <code>screenshot</code>-frontend capture from the normal full-cadence startup route; decoded HEVC opening movie.</sub>
+</p>
+
+<p align="center">
   <img src="assets/screenshots/tactics-ogre-title.png" alt="Tactics Ogre: Reborn — title menu">
 </p>
 
@@ -990,8 +995,8 @@ Reusable input routes are documented in
   <br><sub>Direct, unmodified Linux/RADV <code>screenshot</code>-frontend capture from the fresh-save route through Chapter 1 natural EOF and poll-separated Cross input; first tutorial battle <code>Select destination</code> state.</sub>
 </p>
 
-With a codec-enabled FFmpeg build, the custom-engine title decodes its HEVC startup movie and reaches
-a clean, legible title menu at native 1920×1080. A scripted fresh-save route enters New Game, completes
+With a codec-enabled FFmpeg build, the custom-engine title decodes and presents its HEVC startup movie,
+then reaches a clean, legible title menu at native 1920×1080. A scripted fresh-save route enters New Game, completes
 the birthdate, tarot and patron setup, and outlasts the 117.8-second Chapter 1 movie. Its natural end at
 roughly 325 seconds continues into the opening in-engine story scene, then the first tutorial battle.
 The tutorial appears at roughly 410 seconds and the game enters an interactive `Select destination`
@@ -1001,10 +1006,11 @@ this tile` response, independently confirming that the battle command state cons
 This is a rung-3 milestone, not a claim of general playability or visual correctness. The battlefield,
 water, movement grid, tutorial, turn order and most UI render with real GPU draws. Several character
 sprites remain flat coloured silhouettes, some unit cards have solid-colour backings, and the lower-left
-HUD contains an opaque black block and unrelated red diamond (#1913). The HEVC movies themselves still
-present as uniform gray or dark green fields while their overlays advance (#1903). All three images are
-direct, unmodified frontend captures from the normal full-cadence Vulkan renderer. Current route evidence
-is tracked in [#1892](https://github.com/mattias800/prosper/issues/1892).
+HUD contains an opaque black block and unrelated red diamond (#1913). The HEVC presentation path now
+preserves decoded NV12 imagery through the title's protected direct-memory DMA uploads (#1903). All four
+images are direct, unmodified frontend captures from the normal full-cadence Vulkan renderer. Current route
+evidence is tracked in [#1892](https://github.com/mattias800/prosper/issues/1892), with technical detail in
+[`prosper/docs/TACTICS_OGRE_STATUS.md`](prosper/docs/TACTICS_OGRE_STATUS.md).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
 
