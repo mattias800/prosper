@@ -266,6 +266,9 @@ namespace {
     // catch the one deserializer read that produces a garbage std::string length without the gdb-bp overhead
     // that times out on hot addresses. r15 is used because it carries the read length at eboot+0x7e40e1.
     uint64_t g_hwbp_r15 = 0; bool g_hwbp_r15_on = false;
+    // PROSPER_HWBP_R14=<hex>: the same exact-value log gate for r14. In particular, value 0 lets a
+    // breakpoint stay armed through valid resource descriptors and report only the first missing one.
+    uint64_t g_hwbp_r14 = 0; bool g_hwbp_r14_on = false;
     // PROSPER_HWBP_RET=<absolute VA>: only log calls whose stack return address matches. This isolates
     // one caller of a hot shared function while still stepping/rearming silently for all other hits.
     uint64_t g_hwbp_ret = 0; bool g_hwbp_ret_on = false;
@@ -327,6 +330,7 @@ namespace {
     bool g_hwbp_fields = false;         // PROSPER_HWBP_FIELDS: dump rbx object fields + object-field class names
     bool g_hwbp_obj = false;            // PROSPER_HWBP_OBJ: treat rdi as an il2cpp object at a method-entry bp
     bool g_hwbp_args = false;           // PROSPER_HWBP_ARGS: print SysV arg registers (rdi/rsi/rdx/rcx/r8/r9) per hit
+    const char* g_hwbp_probe = nullptr;  // PROSPER_HWBP_PROBE: generic pointer chains on gated hits
     const char* g_hwbp_global = nullptr;// PROSPER_HWBP_GLOBAL=0xADDR: resolve the class name at a fixed guest global
     void hwbp_dump_ring(const char* why);   // fwd decl (defined after probe_readable)
     // Optional chained DATA write-watchpoint: on the first exec-bp hit, arm a HW write watch on
@@ -1296,6 +1300,7 @@ namespace {
             const uint64_t rsp = (uint64_t)gr[REG_RSP];
             const uint64_t ret = probe_readable(rsp + 7) ? *(const uint64_t*)rsp : 0;
             bool cond_ok = (!g_hwbp_r15_on || (r15 == g_hwbp_r15)) &&
+                           (!g_hwbp_r14_on || (r14 == g_hwbp_r14)) &&
                            (!g_hwbp_ret_on || (ret == g_hwbp_ret)) && (rax >= g_hwbp_raxmin);
             // PROSPER_HWBP_ANOM ring trace: push every gated hit; when a read yields a value >= the
             // anomaly threshold, dump the ring (the cursor walk into the over-read) exactly once.
@@ -1457,6 +1462,11 @@ namespace {
                     (unsigned long long)rd(rdi+0x38),(unsigned long long)rd(rdi+0x48));
                 raw_write(2,b, n);
             }
+            // Reuse the software breakpoint's generic pointer-chain evaluator for race-free hardware
+            // breakpoints. Evaluate only hits that pass every register/return gate and remain under the
+            // ordinary output cap; unmatched hot-path hits neither print nor consume that cap.
+            if (g_hwbp_probe && cond_ok && g_hwbp_count < g_hwbp_max)
+                bp_eval_probes(g_hwbp_probe, uc, 0, "[hwbp-probe]");
             if (cond_ok && g_hwbp_r15_on) {
                 // The matching read: dump the window around rax (the source pointer) + classify its mapping,
                 // so we can see whether the deserializer's cursor points into a file buffer / heap / garbage.
@@ -2795,6 +2805,7 @@ void install_trap_handler() {
         g_hwbp_addr = g_base + strtoull(hb, nullptr, 0);
         if (const char* m = getenv("PROSPER_HWBP_MAX")) g_hwbp_max = (int)strtoul(m, nullptr, 0);
         if (const char* c = getenv("PROSPER_HWBP_R15")) { g_hwbp_r15 = strtoull(c, nullptr, 0); g_hwbp_r15_on = true; }
+        if (const char* c = getenv("PROSPER_HWBP_R14")) { g_hwbp_r14 = strtoull(c, nullptr, 0); g_hwbp_r14_on = true; }
         if (const char* c = getenv("PROSPER_HWBP_RET")) { g_hwbp_ret = strtoull(c, nullptr, 0); g_hwbp_ret_on = true; }
         if (const char* c = getenv("PROSPER_HWBP_RAXMIN")) g_hwbp_raxmin = strtoull(c, nullptr, 0);
         if (const char* c = getenv("PROSPER_HWBP_ANOM")) { g_hwbp_anom = strtoull(c, nullptr, 0); g_hwbp_anom_on = true; }
@@ -2808,6 +2819,7 @@ void install_trap_handler() {
         if (getenv("PROSPER_HWBP_FIELDS")) g_hwbp_fields = true;   // latch here (#159): handler must not getenv()
         if (getenv("PROSPER_HWBP_OBJ")) g_hwbp_obj = true;
         if (getenv("PROSPER_HWBP_ARGS")) g_hwbp_args = true;
+        g_hwbp_probe = getenv("PROSPER_HWBP_PROBE");               // stable environ string; handler only reads it
         g_hwbp_global = getenv("PROSPER_HWBP_GLOBAL");             // may be null; handler null-checks
         if (getenv("PROSPER_HWBP_ALLTHREADS")) g_hwbp_allthreads = true;
         ensure_probe_pipe();

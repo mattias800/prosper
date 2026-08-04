@@ -176,11 +176,16 @@ Do not re-derive these without contradictory new evidence.
 
 1. Attribute the `eboot+0x117811f` sibling null-object fault without using the combined suppression
    arm as a title fix. First prove whether the failure exists on current master in an ordinary
-   unsuppressed run, then use the existing generic fault-memory peek to recover the original retained
-   item saved at `rbp-0xa8`, its allocation-page metadata at `rbp-0x70`, and item fields `+0`, `+0x68`,
-   `+0x78`, `+0x88`, and `+0x98`. In particular, classify the item vptr as the teardown marker
-   `0x7007d60`, a live resource secondary vtable, or unrelated/reused memory before adding any new
-   instrumentation.
+   unsuppressed run. The first two generic fault-time arms lost to unrelated terminal paths, so the
+   branch now extends the race-free hardware execute breakpoint with an exact `r14` value gate and
+   generic pointer-chain probes. The next arm should use `PROSPER_HWBP=0x117811f`,
+   `PROSPER_HWBP_ALLTHREADS=1`, `PROSPER_HWBP_R14=0`, `PROSPER_HWBP_MAX=1`, and
+   `PROSPER_HWBP_PROBE` to recover the original retained item saved at `rbp-0xa8`, its allocation-page
+   metadata at `rbp-0x70`, and item fields `+0`, `+0x68`, `+0x78`, `+0x88`, and `+0x98`. Unmatched
+   valid-descriptor hits do not print or consume the one-record cap. A valid arm must show that the
+   breakpoint armed on the target worker and must emit `[hwbp-probe]` before the sibling fault; any
+   competing terminal path remains void. Classify the item vptr as the teardown marker `0x7007d60`,
+   a live resource secondary vtable, or unrelated/reused memory before mutating guest behaviour.
 2. Isolate the init and REL1 fence interventions only with arms whose independent lever witnesses and
    terminal populations are complete. Do not infer authorship from a moved terminal fault alone.
 3. Revisit the per-queue barrier model and intro-movie path from #1226 only after checking their
