@@ -201,9 +201,14 @@ the same thing, and do not treat either as superseding the other until that is c
   explicitly only `1/2` and no later content milestone is claimed.
 * Unit coverage exercises both ownership models: headless Open emits one bounded enter/return pair;
   a backend-owned ErrorDialog remains backgrounded while its frontend reports `RUNNING` and returns
-  foreground after `FINISHED`. A defect-shaped mutation that collapsed only the headless edge made
-  exactly `headless ErrorDialog exposes a background sample` fail; restoration passed both
-  `platform_ui` and `service_getters`.
+  foreground after `FINISHED`. The accepting backend is pinned with the registry lease; unregister
+  or replacement abandons safely to `FINISHED`, never calls the stale/replacement backend, and cannot
+  remain backgrounded. Four defect-shaped mutations are named: collapsing only the headless edge
+  fails `headless ErrorDialog exposes a background sample`; making the first backed sample advance
+  directly to return fails `backend ErrorDialog persists background across repeated RUNNING
+  samples`; leasing the replacement backend fails the abandonment/reroute check; and leasing the
+  replacement on direct Term fails the close-reroute check. Restoration passed both `platform_ui`
+  and `service_getters`.
 
 ## Reproduction
 
