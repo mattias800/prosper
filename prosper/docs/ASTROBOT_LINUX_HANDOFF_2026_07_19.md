@@ -712,10 +712,45 @@ made no new visual-correctness claim, so no new screenshot was warranted. Retain
 evidence remains outside git under
 `<EVIDENCE_ROOT>/astro-1732-allocation-reuse-41b37177/`.
 
+## Ordered retained-write wait result (2026-08-04)
+
+Issue #1732's post-#1924 PS-logo stall was an eager `WAIT_REG_MEM` reading a label before two
+retained producers could execute: an owned exact-base `WRITE_DATA(0)` followed by
+`RELEASE_MEM32(1)`. Candidate `88c61215`, based on master `5cecfbe8`, overlays only one or two owned
+inline dwords at the exact waited address and then applies the fixed release in command order. It
+keeps partial snapshots, unowned payloads, writes wider than the waited qword, offset writes, and
+physically aliased virtual addresses fail-closed.
+
+The exact live arm is summarized in the first `## Ruled out` entry below. It positively observed the
+new overlay and advanced from loaded and started `ps_logo` to loaded `title_controller_ship`; the
+earlier memory-effect wait blocker disappeared. It did **not** start the title level or reach
+`worldmap`, and no visual or FPS measurement was taken. The next exact frontier is a different eager
+wait dependency: every emitted rejection summary overlaps an earlier retained address-backed DMA,
+so its scalar overlay remains untouched. Do not broaden the `WRITE_DATA` model to address this.
+
+Focused `diag_ratelimit`, `eop_write`, and `agc_dcb_pm4` tests pass. Isolated mutations prove the
+supported overlay, low/high-dword order, ownership, partial/oversized bounds, exact-VA requirement,
+and reporter path are each observed by a named check. The GitHub issue carries the exact live
+revision, binary hash, bounded-run validity, and sparse diagnostic counts.
+
 ## Ruled out
 
 One line per falsified hypothesis, the evidence that killed it, and the issue/PR. Extend this rather
 than re-deriving a dead answer at full cost.
+
+- **"After exact retained `WRITE_DATA` overlays are accepted, the remaining title-load stall is
+  another instance of the same memory-effect/wait ambiguity."** False on exact candidate
+  `88c61215` in one natural, full-scale, every-submit 360-second run for #1732. The positive-control
+  reporter observed at least 16 satisfied ordered waits whose owned exact-base `WRITE_DATA(0)` was
+  followed by `RELEASE_MEM32(1)`; nine bounded summaries were emitted (ordinals 1--8 and 16).
+  The former rejection family emitted zero summaries and the capped generic log emitted zero
+  retained-memory-effect wait warnings. Astro advanced through loaded and started `ps_logo` to
+  `LevelDocument Loaded: title_controller_ship [title]`, beyond the earlier 240-second PS-logo
+  stall. It did not start that level or load `worldmap` before the bound. Every one of the 12 emitted
+  rejection summaries (ordinals 1--8, 16, 32, 64, and 128) instead had an unresolved retained
+  **address DMA** (`dma-overlaps=1`, scalar overlay untouched); the generic log reached its cap of 24
+  retained-DMA wait warnings. There was no device loss, fatal signal, or visual measurement. The
+  next question is the address-DMA dependency, not a broader `WRITE_DATA` relaxation. See #1732.
 
 - **"#1900's post-writeback DCC promotion makes the producer/consumer pair cheaper enough by itself
   to improve world-map throughput."** False in the first comparable whole-workload F8 window after
