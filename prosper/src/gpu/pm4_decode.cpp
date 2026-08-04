@@ -1,4 +1,5 @@
 // pm4_decode.cpp — see pm4_decode.hpp. Pure PM4 type-3 stream walker.
+#include <algorithm>
 #include <cstdio>
 #include "pm4_decode.hpp"
 
@@ -83,10 +84,11 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     // payload: [0]=dst, [1..2]=addr lo/hi, [3]=num_dwords, [4..]=inline data dwords.
                     if (npl >= 3) c.wd_addr = (uint64_t)pl[1] | ((uint64_t)pl[2] << 32);
                     if (npl >= 4) {
-                        c.wd_num  = pl[3];
-                        uint32_t avail = (npl > 4) ? (npl - 4) : 0;   // dwords actually present in the packet
-                        if (c.wd_num > avail) c.wd_num = avail;       // never read past the packet
+                        c.wd_declared_num = pl[3];
+                        const uint32_t avail = (npl > 4) ? (npl - 4) : 0;
+                        c.wd_num = std::min(c.wd_declared_num, avail); // never read past the packet
                         c.wd_data = (c.wd_num > 0) ? &pl[4] : nullptr;
+                        c.wd_valid = c.wd_declared_num <= avail;
                     }
                     break;
                 case R_WAIT_MEM_64:

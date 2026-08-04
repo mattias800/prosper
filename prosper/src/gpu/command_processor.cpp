@@ -1888,7 +1888,17 @@ bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
 
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
 static void honor_write_data(const Pm4Command& c) {
-    if (eop_writes_disabled() || !c.wd_addr || (c.wd_addr & 3) || !c.wd_data || !c.wd_num) return;
+    if (eop_writes_disabled()) return;
+    if (!c.wd_valid) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 24)
+            fprintf(stderr,
+                    "[agc] WRITE_DATA payload incomplete — write SKIPPED: addr=0x%llx "
+                    "declared=%u available=%u\n",
+                    (unsigned long long)c.wd_addr, c.wd_declared_num, c.wd_num);
+        return;
+    }
+    if (!c.wd_addr || (c.wd_addr & 3) || !c.wd_data || !c.wd_num) return;
     // #729: guard both the payload span and the 8-byte #312 pre-read below (a 4-byte label write
     // still pre-reads one qword). The deferred path's #449 guard only covers the payload size.
     uint32_t wbytes = c.wd_num * 4;
@@ -2287,7 +2297,8 @@ bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
                 v = c.rel_value;
                 touched = true;
             }
-        } else if (c.kind == K::WriteData && c.wd_addr == addr && c.wd_data && c.wd_num) {
+        } else if (c.kind == K::WriteData && c.wd_valid && c.wd_addr == addr &&
+                   c.wd_data && c.wd_num) {
             const size_t n = std::min<size_t>((size_t)c.wd_num * 4, sizeof v);
             memcpy(&v, c.wd_data, n);
             touched = true;
@@ -2495,7 +2506,8 @@ void effect_span(const Pm4Command& c, uint64_t* addr, uint64_t* bytes) {
     switch (c.kind) {
         case K::ReleaseMem: *addr = c.rel_addr;   *bytes = 8; break;
         case K::EventWrite: *addr = c.event_addr; *bytes = 8; break;
-        case K::WriteData:  *addr = c.wd_addr;    *bytes = (uint64_t)c.wd_num * 4; break;
+        case K::WriteData:  *addr = c.wd_addr;
+                            *bytes = (uint64_t)c.wd_declared_num * 4; break;
         case K::DmaData:    *addr = c.dd_dst;     *bytes = c.dd_bytes; break;
         default:            *addr = 0;            *bytes = 0; break;
     }
@@ -2886,13 +2898,13 @@ OrderedWaitEffectDiagnostic diagnose_ordered_wait_effect(
         // copy/move. Prove that exact ownership before reading: a pointer into the guest command
         // buffer may be recycled as soon as folding returns. A short vector is an incomplete
         // snapshot, and more than the waited qword is intentionally outside this scalar model.
+        if (!command.wd_valid || effect.write_data.size() != command.wd_num) {
+            diagnostic.effect_class = OrderedWaitEffectClass::WriteDataPartial;
+            return diagnostic;
+        }
         if (!command.wd_data || effect.write_data.empty() ||
             command.wd_data != effect.write_data.data()) {
             diagnostic.effect_class = OrderedWaitEffectClass::WriteDataUnowned;
-            return diagnostic;
-        }
-        if (effect.write_data.size() != command.wd_num) {
-            diagnostic.effect_class = OrderedWaitEffectClass::WriteDataPartial;
             return diagnostic;
         }
         if (command.wd_num > sizeof(value_before) / sizeof(uint32_t)) {

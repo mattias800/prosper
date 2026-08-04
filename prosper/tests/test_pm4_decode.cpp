@@ -23,6 +23,11 @@ struct Dcb {
     void* callback; void* user_data; uint32_t reserved_dw; uint32_t pad;
 };
 
+static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
+    return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) |
+           ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
+}
+
 int main() {
     printf("== test_pm4_decode ==\n");
     register_builtin_hle();
@@ -201,6 +206,43 @@ int main() {
         Dcb d5{}; d5.bottom = buf5; d5.top = buf5 + 64; d5.cursor_up = buf5; d5.cursor_down = buf5 + 64;
         uint64_t wr = wd((uint64_t)(uintptr_t)&d5, /*dst*/0, /*policy*/0, /*addr*/0, /*data*/0, /*num*/0x3FFF);
         CHECK(wr == 0 && d5.cursor_up == d5.bottom, "WriteData(num=0x3FFF) rejected (5+num overflows the length field)");
+    }
+
+    // Retain both WRITE_DATA's declared count and the bounded number of inline words present in
+    // the packet. A short packet may expose one safe-to-read word, but it is not a complete
+    // one-word write: downstream ordering must be able to keep the declared two-word effect
+    // fail-closed without ever indexing beyond this six-dword buffer.
+    {
+        const uint64_t address = 0x123456780ull;
+        uint32_t short_write[6] = {};
+        short_write[0] = PM4(6, IT_NOP, R_WRITE_DATA);
+        short_write[1] = 0;
+        short_write[2] = (uint32_t)address;
+        short_write[3] = (uint32_t)(address >> 32);
+        short_write[4] = 2;
+        short_write[5] = 0x11223344u;
+        std::vector<Pm4Command> short_ops;
+        const size_t short_consumed = decode_pm4(short_write, 6, short_ops);
+        CHECK(short_consumed == 6 && short_ops.size() == 1 &&
+                  short_ops[0].kind == K::WriteData &&
+                  short_ops[0].wd_addr == address &&
+                  short_ops[0].wd_declared_num == 2 && short_ops[0].wd_num == 1 &&
+                  short_ops[0].wd_data && short_ops[0].wd_data[0] == 0x11223344u &&
+                  !short_ops[0].wd_valid,
+              "WRITE_DATA decoder preserves a truncated declared-two/available-one payload");
+
+        uint32_t complete_write[7] = {};
+        memcpy(complete_write, short_write, sizeof short_write);
+        complete_write[0] = PM4(7, IT_NOP, R_WRITE_DATA);
+        complete_write[6] = 0x55667788u;
+        std::vector<Pm4Command> complete_ops;
+        const size_t complete_consumed = decode_pm4(complete_write, 7, complete_ops);
+        CHECK(complete_consumed == 7 && complete_ops.size() == 1 &&
+                  complete_ops[0].kind == K::WriteData &&
+                  complete_ops[0].wd_declared_num == 2 && complete_ops[0].wd_num == 2 &&
+                  complete_ops[0].wd_data && complete_ops[0].wd_data[1] == 0x55667788u &&
+                  complete_ops[0].wd_valid,
+              "WRITE_DATA decoder marks a complete declared-two payload valid");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

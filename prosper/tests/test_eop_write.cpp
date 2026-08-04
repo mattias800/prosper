@@ -158,8 +158,10 @@ int main() {
         Pm4Command write{};
         write.kind = Pm4Command::Kind::WriteData;
         write.wd_addr = address;
+        write.wd_declared_num = 2;
         write.wd_num = 2;
         write.wd_data = write_words;
+        write.wd_valid = true;
         GpuState::MemoryEffect write_effect(write, 14);
         const OrderedWaitEffectDiagnostic write_diag =
             diagnose_ordered_wait_effect(write_effect, address, label);
@@ -167,16 +169,6 @@ int main() {
                   write_diag.overlay == OrderedWaitEffectOverlay::Applied &&
                   write_diag.value_after == 0x5060708010203040ull,
               "ordered-wait overlay preserves WRITE_DATA low/high dword order");
-
-        GpuState::MemoryEffect partial_write_effect(write, 15);
-        partial_write_effect.write_data.resize(1);
-        partial_write_effect.cmd.wd_data = partial_write_effect.write_data.data();
-        const OrderedWaitEffectDiagnostic partial_write_diag =
-            diagnose_ordered_wait_effect(partial_write_effect, address, label);
-        CHECK(partial_write_diag.effect_class == OrderedWaitEffectClass::WriteDataPartial &&
-                  partial_write_diag.overlay == OrderedWaitEffectOverlay::Ambiguous &&
-                  partial_write_diag.value_after == label,
-              "ordered-wait overlay rejects an incomplete owned WRITE_DATA snapshot");
 
         GpuState::MemoryEffect unowned_write_effect(write, 16);
         unowned_write_effect.cmd.wd_data = write_words;
@@ -189,6 +181,7 @@ int main() {
 
         const uint32_t oversized_words[] = {0x10203040u, 0x50607080u, 0x90a0b0c0u};
         Pm4Command oversized_write = write;
+        oversized_write.wd_declared_num = 3;
         oversized_write.wd_num = 3;
         oversized_write.wd_data = oversized_words;
         GpuState::MemoryEffect oversized_write_effect(oversized_write, 17);
@@ -439,7 +432,9 @@ int main() {
               "WRITE_DATA copied all 3 inline dwords to the destination");
     }
 
-    // A WRITE_DATA claiming more dwords than the packet holds must clamp (never read past the packet).
+    // A WRITE_DATA claiming more dwords than the packet holds must never read past the packet or
+    // manufacture a shorter valid write. Keep the bounded available count for diagnostics, reject
+    // the whole malformed effect, and say why.
     {
         uint32_t target[4] = {0, 0, 0, 0};
         uint32_t buf[7];
@@ -448,9 +443,12 @@ int main() {
         buf[1] = 0; buf[2] = (uint32_t)(addr & 0xffffffffu); buf[3] = (uint32_t)(addr >> 32);
         buf[4] = 99;                                  // lies: claims 99 dwords, only 2 present (buf[5],buf[6])
         buf[5] = 0xDEADu; buf[6] = 0xBEEFu;
-        GpuState st; run_cb(buf, 7, st);
-        CHECK(target[0] == 0xDEADu && target[1] == 0xBEEFu && target[2] == 0 && target[3] == 0,
-              "WRITE_DATA clamped num_dwords to what the packet actually holds");
+        GpuState st;
+        const std::string diagnostic = capture_stderr([&] { run_cb(buf, 7, st); });
+        CHECK(target[0] == 0 && target[1] == 0 && target[2] == 0 && target[3] == 0 &&
+                  diagnostic.find("WRITE_DATA payload incomplete") != std::string::npos &&
+                  diagnostic.find("declared=99 available=2") != std::string::npos,
+              "WRITE_DATA rejects and reports a truncated payload without landing its prefix");
     }
 
     // Address-carrying EVENT_WRITE (#132): the widened packet ([0]=hdr [1]=event_type [2..3]=addr)
@@ -901,15 +899,17 @@ int main() {
                       *effect_dma_target == 0 && *effect_wait == 0,
                   "WAIT_REG_MEM rejects an unsatisfied retained immediate DMA overlay");
 
-            auto make_write_wait = [&](uint64_t write_address,
-                                       std::initializer_list<uint32_t> words,
-                                       uint64_t wait_address, uint64_t mask, uint64_t reference) {
+            auto make_declared_write_wait = [&](uint64_t write_address,
+                                                std::initializer_list<uint32_t> words,
+                                                uint32_t declared_words,
+                                                uint64_t wait_address, uint64_t mask,
+                                                uint64_t reference) {
                 std::vector<uint32_t> stream(effect_reg_stream, effect_reg_stream + 7);
                 stream.push_back(PM4(5 + words.size(), IT_NOP, R_WRITE_DATA));
                 stream.push_back(0);
                 stream.push_back((uint32_t)write_address);
                 stream.push_back((uint32_t)(write_address >> 32));
-                stream.push_back((uint32_t)words.size());
+                stream.push_back(declared_words);
                 stream.insert(stream.end(), words.begin(), words.end());
                 stream.push_back(PM4(8, IT_NOP, R_WAIT_MEM_64));
                 stream.push_back((uint32_t)wait_address);
@@ -920,6 +920,13 @@ int main() {
                 stream.push_back((uint32_t)(reference >> 32));
                 stream.push_back(3);
                 return stream;
+            };
+            auto make_write_wait = [&](uint64_t write_address,
+                                       std::initializer_list<uint32_t> words,
+                                       uint64_t wait_address, uint64_t mask, uint64_t reference) {
+                return make_declared_write_wait(
+                    write_address, words, (uint32_t)words.size(),
+                    wait_address, mask, reference);
             };
 
             // A retained exact-base WRITE_DATA owns its inline payload after command-buffer decode.
@@ -947,6 +954,24 @@ int main() {
             CHECK(unsatisfied_write_wait.dma_execution_rejected &&
                       *effect_dma_target == 0 && *effect_wait == 0,
                   "WAIT_REG_MEM rejects an unsatisfied exact owned WRITE_DATA overlay");
+
+            // The real decoder must preserve that this six-dword packet declares two inline words
+            // but carries only one. Clipping to the available word is necessary for memory safety,
+            // but must not manufacture a complete one-word producer that satisfies this wait.
+            *effect_dma_target = 0;
+            *effect_wait = 0;
+            write_wait_stream = make_declared_write_wait(
+                effect_wait_addr, {1}, 2, effect_wait_addr, 0xffffffffu, 1);
+            GpuState truncated_write_wait;
+            run_cb(write_wait_stream.data(), write_wait_stream.size(), truncated_write_wait);
+            const bool truncated_journal_preserved =
+                truncated_write_wait.ordered_memory_effects.size() == 1 &&
+                truncated_write_wait.ordered_memory_effects[0].cmd.wd_declared_num == 2 &&
+                truncated_write_wait.ordered_memory_effects[0].cmd.wd_num == 1 &&
+                !truncated_write_wait.ordered_memory_effects[0].cmd.wd_valid;
+            CHECK(truncated_write_wait.dma_execution_rejected && truncated_journal_preserved &&
+                      *effect_dma_target == 0 && *effect_wait == 0,
+                  "WAIT_REG_MEM rejects a real truncated WRITE_DATA before its satisfying word lands");
 
             // Exact-base does not mean arbitrary-width. A write extending beyond the scalar qword
             // remains fail-closed, even when its first dword would make the wait look satisfied.
