@@ -10,6 +10,7 @@
 #include "render_runner.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -1312,6 +1313,125 @@ int main() {
     CHECK(ds_read && restored != ds_snapshot.end() && restored->depth == ds_seed.depth &&
           restored->stencil == ds_seed.stencil && restored->depth_valid && restored->stencil_valid,
           "persistent Vulkan DS snapshot reads back byte-exact checkpoint contents");
+
+    // Sonic's full-screen resolve binds a renderer-owned D32S8 depth plane through a one-component
+    // Uint32 T#. The guest asks for the raw float bit pattern (for example 0.5f == 0x3f000000), not
+    // a normalized or numerically converted depth sample. D32S8's DEPTH-aspect buffer packing is
+    // exactly four bytes per texel; stencil is a separate one-byte aspect and must not leak into the
+    // R32_UINT view. Keep deliberately stale zero guest bytes beside the authoritative Vulkan plane.
+    static const uint32_t depth_bits_copy_2d[] = {
+        0x7E080300u,             // v4 = x from the shell input
+        0x7E0A0280u,             // v5 = y = 0
+        0xF0000F08u, 0x00000004u, 0xBF8C3F70u,
+        0xF0200F08u, 0x00020004u, 0xBF810000u,
+    };
+    constexpr uint32_t DEPTH_ROW_WIDTH = 4;
+    constexpr uint32_t DEPTH_TEXELS = DEPTH_ROW_WIDTH * 3;
+    std::array<uint32_t, DEPTH_ROW_WIDTH> depth_lane_index{0, 1, 2, 3};
+    std::array<uint32_t, 4> depth_dummy{};
+    const size_t stale_depth_bytes = tiled_surface_bytes(
+        ds_seed.width, ds_seed.height, 24u, 0u, sizeof(uint32_t));
+    std::vector<uint8_t> stale_depth_backing(stale_depth_bytes, 0);
+    auto run_depth_bits_copy = [&](uint64_t source_addr,
+                                   std::array<uint32_t, DEPTH_TEXELS>& output,
+                                   uint64_t code_addr) {
+        ShaderResourceTable table;
+        auto add_buffer = [&](uint32_t binding, const void* data, uint32_t size) {
+            ShaderResource resource{};
+            resource.cls = ResourceClass::ConstantBuffer;
+            resource.binding = binding;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(data);
+            resource.size = size;
+            table.resources.push_back(resource);
+        };
+        add_buffer(0, depth_lane_index.data(), sizeof(depth_lane_index));
+        add_buffer(1, depth_dummy.data(), sizeof(depth_dummy));
+        add_buffer(2, depth_dummy.data(), sizeof(depth_dummy));
+        add_buffer(3, depth_dummy.data(), sizeof(depth_dummy));
+
+        ShaderResource source{};
+        source.cls = ResourceClass::Texture;
+        source.binding = 4;
+        source.sgpr_base = 0;
+        source.img_dim = 1;
+        source.format = DataFormat::Uint32;
+        source.num_components = 1;
+        source.width = ds_seed.width;
+        source.height = ds_seed.height;
+        source.depth = 1;
+        source.tile_mode = 24;
+        source.gpu_addr = source_addr;
+        source.size = static_cast<uint32_t>(stale_depth_backing.size());
+        source.host_data = stale_depth_backing.data();
+        source.host_data_size = stale_depth_backing.size();
+        source.swizzle[0] = source.swizzle[1] =
+            source.swizzle[2] = source.swizzle[3] = 4;
+        table.resources.push_back(source);
+
+        ShaderResource destination{};
+        destination.cls = ResourceClass::StorageImage;
+        destination.binding = 5;
+        destination.sgpr_base = 8;
+        destination.img_dim = 1;
+        destination.format = DataFormat::Uint32;
+        destination.num_components = 1;
+        destination.width = ds_seed.width;
+        destination.height = ds_seed.height;
+        destination.depth = 1;
+        destination.gpu_addr = reinterpret_cast<uint64_t>(output.data());
+        destination.size = sizeof(output);
+        table.resources.push_back(destination);
+
+        const std::vector<uint32_t> spirv = recompile_valu(
+            depth_bits_copy_2d, std::size(depth_bits_copy_2d), 1, 0, &table);
+        if (spirv.empty()) return false;
+        ComputeItem compute;
+        compute.spirv = spirv;
+        compute.resources = std::make_shared<ShaderResourceTable>(std::move(table));
+        compute.launch.threads_x = DEPTH_ROW_WIDTH;
+        compute.launch.local_x = 64;
+        compute.launch.groups_x = 1;
+        compute.launch.local_y = compute.launch.local_z = 1;
+        compute.launch.groups_y = compute.launch.groups_z = 1;
+        compute.code_addr = code_addr;
+        return prosper::frontend::execute_live_compute_items({compute});
+    };
+
+    std::array<uint32_t, DEPTH_TEXELS> guest_control{};
+    CHECK(run_depth_bits_copy(ds_seed.depth_read_base + 0x1000u,
+                              guest_control, 0x19050001u) &&
+              std::all_of(guest_control.begin(), guest_control.end(),
+                          [](uint32_t value) { return value == 0; }),
+          "non-DS Uint32 alias observes the deliberately stale zero guest backing");
+    std::array<uint32_t, DEPTH_TEXELS> depth_bits_result{};
+    std::array<uint32_t, DEPTH_ROW_WIDTH> expected_depth_bits{};
+    std::memcpy(expected_depth_bits.data(), ds_seed.depth.data(), sizeof(expected_depth_bits));
+    CHECK(run_depth_bits_copy(ds_seed.depth_read_base,
+                              depth_bits_result, 0x19050002u) &&
+              std::equal(expected_depth_bits.begin(), expected_depth_bits.end(),
+                         depth_bits_result.begin()) &&
+              std::any_of(depth_bits_result.begin(),
+                          depth_bits_result.begin() + DEPTH_ROW_WIDTH,
+                          [](uint32_t value) { return value != 0; }),
+          "R32_UINT sampled alias receives exact renderer-owned D32 depth bits");
+    CHECK(std::all_of(stale_depth_backing.begin(), stale_depth_backing.end(),
+                      [](uint8_t value) { return value == 0; }),
+          "depth-bit bridge neither reads through nor mutates stale guest backing");
+
+    // A second renderer DS transfer declares the cache's tracked attachment layout as its old
+    // layout. Its byte-exact success is the observable postcondition that the compute bridge handed
+    // the borrowed image back in that layout; it also proves the stencil aspect survived untouched.
+    ds_snapshot.clear();
+    const bool ds_after_compute_read = read_all_gpu_capture_ds_seeds(ds_snapshot, error);
+    const auto restored_after_compute = std::find_if(
+        ds_snapshot.begin(), ds_snapshot.end(), [&](const auto& seed) {
+            return seed.depth_read_base == ds_seed.depth_read_base &&
+                   seed.stencil_read_base == ds_seed.stencil_read_base;
+        });
+    CHECK(ds_after_compute_read && restored_after_compute != ds_snapshot.end() &&
+              restored_after_compute->depth == ds_seed.depth &&
+              restored_after_compute->stencil == ds_seed.stencil,
+          "depth-bit bridge restores renderer DS layout and preserves both D32S8 aspects");
 
     DrawItem missing_texture = replay.items[0];
     missing_texture.prt = std::make_shared<ShaderResourceTable>();

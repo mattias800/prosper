@@ -2368,6 +2368,14 @@ struct BoundImage {
     // import time must be released.
     bool imported = false;
     bool imported_depth = false;        // borrowed persistent DS depth plane, not a color RTT
+    // A one-component Uint32 T# can alias a renderer-owned D32 depth plane byte-for-byte. Vulkan
+    // cannot create an R32_UINT view of a depth image, so keep the borrowed DS image as a transfer
+    // source and materialize the guest-declared integer view through a device buffer. This remains
+    // entirely on the shared GPU; no stale guest backing or synchronous host readback is involved.
+    bool depth_bits_source = false;
+    VkImage depth_bits_image = VK_NULL_HANDLE;
+    VkFormat depth_bits_format = VK_FORMAT_UNDEFINED;
+    uint32_t depth_bits_saved_layout = 0;
     VkFormat imported_format = VK_FORMAT_UNDEFINED;
     prosper::gpu::LiveTargetPixelFormat imported_pixel_format =
         prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm;
@@ -4223,7 +4231,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); i++) {
             // A pin is taken per successful import, so it is released per import -- including for a
             // binding that a later alias check folded into an earlier one (#1095).
-            if (images[i].imported)
+            if (images[i].imported || images[i].depth_bits_source)
                 release_live_render_target_image(images[i].imported_addr);
             if (images[i].alias_of != SIZE_MAX) continue;
             if (images[i].sampler) vkDestroySampler(ctx.device, images[i].sampler, nullptr);
@@ -4707,10 +4715,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // may also consume canonical RGBA8 because byte*257/65535 == byte/255. The independent
             // extent check below still rejects a scaled image for texel fetch/query access. Other
             // aliases and numeric conversions keep the snapshot path below.
-            const bool depth_import_eligible = !bi.storage && !dim_1d && !dim_3d &&
+            const bool depth_float_import_eligible = !bi.storage && !dim_1d && !dim_3d &&
                 !dim_2d_array && r->depth == 1 && r->img_dim == 1 &&
                 r->format == DataFormat::Float32 &&
                 (r->num_components ? r->num_components : 1u) == 1u;
+            const bool depth_bits_import_eligible = !bi.storage && !dim_1d && !dim_3d &&
+                !dim_2d_array && r->depth == 1 && r->img_dim == 1 &&
+                r->format == DataFormat::Uint32 &&
+                (r->num_components ? r->num_components : 1u) == 1u;
+            const bool depth_import_eligible =
+                depth_float_import_eligible || depth_bits_import_eligible;
             // Persistent renderer images do not carry VK_IMAGE_USAGE_STORAGE_BIT, and a writable
             // storage import would also leave overlapping guest buffer aliases stale. Storage
             // descriptors therefore retain the owned-image + guest-writeback path.
@@ -4760,30 +4774,54 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         prosper::frontend::rtt_direct_import_compatible(
                             bi.storage, r->width, r->height, import.width, import.height,
                             render_scale, scalable_normalized_sampling);
-                    if (compatible_format && direct_extent && compatible_device) {
-                        bi.imported = true;
-                        bi.imported_depth = depth_import;
-                        bi.imported_format = depth_import ? depth_format : VK_FORMAT_UNDEFINED;
-                        bi.imported_pixel_format = import.format;
-                        bi.imported_transfer_dst = import.transfer_dst;
-                        bi.imported_addr = r->gpu_addr;
-                        bi.imported_width = import.width;
-                        bi.imported_height = import.height;
-                        bi.imported_saved_layout = import.layout;
-                        bi.image = static_cast<VkImage>(import.image);
-                        live_target.width = import.width;
-                        live_target.height = import.height;
-                        live_target.format = import.format;
-                        if (trace)
-                            std::fprintf(stderr,
-                                         "[compute]   bound renderer RTT in place binding=%u class=%s "
-                                         "addr=0x%llx extent=%ux%u format=%s\n",
-                                         bi.binding, bi.storage ? "storage" : "sampled",
-                                         (unsigned long long)r->gpu_addr,
-                                         import.width, import.height,
-                                         depth_import ? "depth"
-                                             : prosper::frontend::live_target_pixel_format_name(
-                                                   import.format));
+                    // Raw bit views cannot use the normalized-sampling scale exception: the
+                    // transfer below copies exact texels and deliberately performs no resampling.
+                    const bool depth_bits_extent =
+                        import.width == r->width && import.height == r->height;
+                    if (compatible_format && direct_extent && compatible_device &&
+                        (!depth_bits_import_eligible || !depth_import || depth_bits_extent)) {
+                        if (depth_import && depth_bits_import_eligible) {
+                            bi.depth_bits_source = true;
+                            bi.depth_bits_image = static_cast<VkImage>(import.image);
+                            bi.depth_bits_format = depth_format;
+                            bi.depth_bits_saved_layout = import.layout;
+                            bi.imported_addr = r->gpu_addr;
+                            bi.imported_width = import.width;
+                            bi.imported_height = import.height;
+                            if (trace)
+                                std::fprintf(stderr,
+                                             "[compute]   bridged renderer depth bits binding=%u "
+                                             "addr=0x%llx extent=%ux%u depth-format=%u "
+                                             "sampled-format=R32_UINT\n",
+                                             bi.binding,
+                                             (unsigned long long)r->gpu_addr,
+                                             import.width, import.height,
+                                             static_cast<unsigned>(depth_format));
+                        } else {
+                            bi.imported = true;
+                            bi.imported_depth = depth_import;
+                            bi.imported_format = depth_import ? depth_format : VK_FORMAT_UNDEFINED;
+                            bi.imported_pixel_format = import.format;
+                            bi.imported_transfer_dst = import.transfer_dst;
+                            bi.imported_addr = r->gpu_addr;
+                            bi.imported_width = import.width;
+                            bi.imported_height = import.height;
+                            bi.imported_saved_layout = import.layout;
+                            bi.image = static_cast<VkImage>(import.image);
+                            live_target.width = import.width;
+                            live_target.height = import.height;
+                            live_target.format = import.format;
+                            if (trace)
+                                std::fprintf(stderr,
+                                             "[compute]   bound renderer RTT in place binding=%u "
+                                             "class=%s addr=0x%llx extent=%ux%u format=%s\n",
+                                             bi.binding, bi.storage ? "storage" : "sampled",
+                                             (unsigned long long)r->gpu_addr,
+                                             import.width, import.height,
+                                             depth_import ? "depth"
+                                                 : prosper::frontend::live_target_pixel_format_name(
+                                                       import.format));
+                        }
                     } else {
                         // Not our exact contract (a different device or a stale aliased view).
                         release_live_render_target_image(r->gpu_addr);
@@ -5032,12 +5070,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // when both bindings acquired the same concrete image/view format.
                 const bool same_backing_representation =
                     prior.imported == bi.imported &&
+                    prior.depth_bits_source == bi.depth_bits_source &&
                     prior.unorm_rtt_value_reuse == bi.unorm_rtt_value_reuse &&
                     (!bi.imported ||
                      (prior.image == bi.image &&
                       prior.imported_depth == bi.imported_depth &&
                       prior.imported_format == bi.imported_format &&
-                      prior.imported_pixel_format == bi.imported_pixel_format));
+                      prior.imported_pixel_format == bi.imported_pixel_format)) &&
+                    (!bi.depth_bits_source ||
+                     (prior.depth_bits_image == bi.depth_bits_image &&
+                      prior.depth_bits_format == bi.depth_bits_format));
                 const bool same_dcc_identity = p &&
                     p->max_uncompressed_block_size == r->max_uncompressed_block_size &&
                     p->max_compressed_block_size == r->max_compressed_block_size &&
@@ -5261,7 +5303,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 std::getenv("PROSPER_NO_IMPORTED_IMAGE_GUEST_BYPASS") != nullptr;
             static const bool sampled_dcc_fast_clear_disabled =
                 std::getenv("PROSPER_NO_COMPUTE_DCC_FAST_CLEAR") != nullptr;
-            if (compute_sampled_guest_prepare_required(
+            if (!bi.depth_bits_source && compute_sampled_guest_prepare_required(
                     bi.storage, renderer_owned, bi.imported,
                     imported_guest_bypass_disabled)) {
                 // Resolve and validate the guest source before allocating staging. A proven cache
@@ -5525,7 +5567,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // directly. The old path first built a heap upload and then memcpy'd the complete result
             // here -- an extra 132 MiB CPU pass for Astro Bot's 4K RGBA32 storage representation.
             ScopedMappedMemory upload_mapping(ctx);
-            const size_t upload_size = (bi.imported || bi.seed_skip ||
+            const size_t upload_size = (bi.imported || bi.depth_bits_source || bi.seed_skip ||
                                         bi.seed_from_imported != SIZE_MAX ||
                                         bi.compute_transfer_seed_borrowed)
                 ? size_t{0} : (size_t)sbytes;
@@ -5552,7 +5594,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     images_ready = false; break;
                 }
                 upload_mapping.memory = staging_memory[i];
-                if (!bi.seed_skip && bi.seed_from_imported == SIZE_MAX &&
+                if (!bi.depth_bits_source && !bi.seed_skip &&
+                    bi.seed_from_imported == SIZE_MAX &&
                     !bi.compute_transfer_seed_borrowed &&
                     !(bi.persistent && bi.upload_skipped) &&
                     !vk_ok(ctx.map_memory(staging_memory[i], 0, sbytes,
@@ -5566,6 +5609,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const auto prepare_upload_start = ComputeClock::now();
             if (bi.imported) {
                 // The renderer's sampled image is the source, so direct imports need no transfer.
+                bi.guest_bytes = 0;
+            } else if (bi.depth_bits_source) {
+                // The command buffer below copies the borrowed D32 depth plane through this
+                // binding's device buffer into its owned R32_UINT image. There are deliberately no
+                // host upload bytes to prepare: touching sampled_guest_source here would reinstate
+                // the stale guest-memory defect this bridge exists to close.
                 bi.guest_bytes = 0;
             } else if (bi.storage) {
                 if (r->tile_mode && !tile_mode_is_tiled(r->tile_mode)) {
@@ -6712,6 +6761,101 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &to_general);
+                continue;
+            }
+            if (bi.depth_bits_source) {
+                // D32 and R32_UINT have the same four-byte texel payload but are not Vulkan
+                // view-compatible. Preserve the guest's raw-bit alias with two transfer copies:
+                // depth image -> device buffer -> integer image. The buffer is never host-mapped.
+                const bool source_already_general = [&] {
+                    for (size_t prior = 0; prior < i; ++prior) {
+                        const BoundImage& candidate = images[prior];
+                        if (candidate.imported && candidate.alias_of == SIZE_MAX &&
+                            candidate.image == bi.depth_bits_image &&
+                            imported_barrier_owner(prior))
+                            return true;
+                    }
+                    return false;
+                }();
+                const VkImageLayout source_saved = source_already_general
+                    ? VK_IMAGE_LAYOUT_GENERAL
+                    : static_cast<VkImageLayout>(bi.depth_bits_saved_layout);
+                const VkImageAspectFlags source_aspects = VK_IMAGE_ASPECT_DEPTH_BIT |
+                    (bi.depth_bits_format == VK_FORMAT_D32_SFLOAT_S8_UINT
+                         ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+
+                VkImageMemoryBarrier source_to_copy{
+                    VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                source_to_copy.srcAccessMask = source_already_general
+                    ? VK_ACCESS_SHADER_READ_BIT
+                    : VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                source_to_copy.oldLayout = source_saved;
+                source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                source_to_copy.image = bi.depth_bits_image;
+                source_to_copy.subresourceRange = {source_aspects, 0, 1, 0, 1};
+
+                VkImageMemoryBarrier target_to_copy{
+                    VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                target_to_copy.srcAccessMask = 0;
+                target_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                target_to_copy.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                target_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                target_to_copy.srcQueueFamilyIndex = target_to_copy.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                target_to_copy.image = bi.image;
+                target_to_copy.subresourceRange = {
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                VkImageMemoryBarrier to_copy[2]{source_to_copy, target_to_copy};
+                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                                     nullptr, 2, to_copy);
+
+                VkBufferImageCopy source_copy{};
+                source_copy.imageSubresource = {
+                    VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+                source_copy.imageExtent = {r->width, r->height, 1};
+                vkCmdCopyImageToBuffer(command, bi.depth_bits_image,
+                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       staging[i], 1, &source_copy);
+                VkBufferMemoryBarrier buffer_ready{
+                    VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+                buffer_ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                buffer_ready.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                buffer_ready.srcQueueFamilyIndex = buffer_ready.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                buffer_ready.buffer = staging[i];
+                buffer_ready.size = staging_bytes[i];
+                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
+                                     &buffer_ready, 0, nullptr);
+
+                VkBufferImageCopy target_copy{};
+                target_copy.imageSubresource = {
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                target_copy.imageExtent = {r->width, r->height, 1};
+                vkCmdCopyBufferToImage(command, staging[i], bi.image,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       1, &target_copy);
+
+                VkImageMemoryBarrier ready[2]{source_to_copy, target_to_copy};
+                ready[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                ready[0].dstAccessMask = source_already_general
+                    ? VK_ACCESS_SHADER_READ_BIT
+                    : VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                ready[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                ready[0].newLayout = source_saved;
+                ready[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                ready[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                ready[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                ready[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                                     nullptr, 2, ready);
                 continue;
             }
             if (bi.persistent && (bi.upload_skipped || bi.seed_skip)) {

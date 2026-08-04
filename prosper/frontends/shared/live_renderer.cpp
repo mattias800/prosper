@@ -796,11 +796,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                      prosper::gpu::LiveTargetImageImport& import) {
             if (!direct_bind) return false;
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
-            // `allow_depth` is set only for a proven one-component Float32 2D descriptor. Prefer the
-            // matching DS plane before consulting the address-only color registry: guest allocations
-            // are reused, and a stale RttSurf at the same base must not hide the newer persistent
-            // depth image. Persistent DS entries are not evicted, and compute runs in ordered submit
-            // execution, so unlike the bounded color cache this path needs no pin.
+            // `allow_depth` is set only for a proven one-component Float32 sample or Uint32 raw-bit
+            // view of an ordinary 2D descriptor. Prefer the matching DS plane before consulting the
+            // address-only color registry: guest allocations are reused, and a stale RttSurf at the
+            // same base must not hide the newer persistent depth image. Persistent DS entries are
+            // not evicted, and compute runs in ordered submit execution, so unlike the bounded color
+            // cache this path needs no pin.
             if (request.allow_depth && request.width && request.height) {
                 const prosper::test::PersistentDsSampled sampled =
                     prosper::test::find_persistent_ds_sampled(
