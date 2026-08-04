@@ -21,6 +21,8 @@ Last updated: 2026-08-04
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 Frontend loop; no visual milestone yet | [#1871](https://github.com/mattias800/prosper/issues/1871) |
+| *Sonic Frontiers* | `PPSA03831` | — | 🔬 Initial compatibility run pending | [#1891](https://github.com/mattias800/prosper/issues/1891) |
+| *Sonic Racing: CrossWorlds* | `PPSA08804` | — | 🔬 Initial compatibility run pending | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and main menu | [#1873](https://github.com/mattias800/prosper/issues/1873) |
@@ -44,6 +46,13 @@ Last updated: 2026-08-04
 | *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 First playable scene | [#1811](https://github.com/mattias800/prosper/issues/1811) |
 | *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Title, EULA, menu, and options | [#1889](https://github.com/mattias800/prosper/issues/1889) |
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and title screen | [#1809](https://github.com/mattias800/prosper/issues/1809) |
+| *The Forgotten City* | `PPSA03026` | — | 🔬 Initial compatibility run pending | [#1890](https://github.com/mattias800/prosper/issues/1890) |
+| *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
+| *Little Nightmares III* | `PPSA05143` | — | 🔬 Initial compatibility run pending | [#1893](https://github.com/mattias800/prosper/issues/1893) |
+| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | — | 🔬 Initial compatibility run pending | [#1894](https://github.com/mattias800/prosper/issues/1894) |
+| *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
+| *Bendy and the Dark Revival* | `PPSA27624` | — | 🔬 Initial compatibility run pending | [#1897](https://github.com/mattias800/prosper/issues/1897) |
+| *Beneath* | `PPSA27640` | — | 🔬 Initial compatibility run pending | [#1898](https://github.com/mattias800/prosper/issues/1898) |
 
 ## Screenshots and short descriptions
 
@@ -96,6 +105,14 @@ The route reaches the native 1920×1080 desert tutorial combat scene with audio.
 ## Sonic Origins — `PPSA05325`
 
 The complete base game, update, and installed DLC reach the frontend loop, but no visual compatibility milestone is claimed yet. See the [tracker](https://github.com/mattias800/prosper/issues/1871).
+
+## Sonic Frontiers — `PPSA03831`
+
+No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1891).
+
+## Sonic Racing: CrossWorlds — `PPSA08804`
+
+No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1895).
 
 ## Terminator 2D: NO FATE — `PPSA25872`
 
@@ -243,6 +260,40 @@ The title, EULA, main menu, and new-game Options screen render at native 1920×1
 <p align="center"><img src="assets/screenshots/astro-bot-worldmap-background.png" alt="Astro Bot — world-map backdrop"></p>
 
 The opening sequence and ASTRO BOT title card render at native 3840×2160. See the [tracker](https://github.com/mattias800/prosper/issues/1809) for current visual and performance work.
+
+## The Forgotten City — `PPSA03026`
+
+No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1890).
+
+## Tactics Ogre: Reborn — `PPSA03839`
+
+<p align="center"><img src="assets/screenshots/tactics-ogre-title.png" alt="Tactics Ogre: Reborn — title screen"></p>
+<p align="center"><img src="assets/screenshots/tactics-ogre-reborn-gameplay.png" alt="Tactics Ogre: Reborn — first tutorial battle"></p>
+
+The route reaches the first tutorial battle with real GPU draws at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1892).
+
+## Little Nightmares III — `PPSA05143`
+
+No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1893).
+
+## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
+
+No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1894).
+
+## The House of the Dead 2: Remake — `PPSA24203`
+
+<p align="center"><img src="assets/screenshots/house-of-the-dead-2-remake-title.png" alt="The House of the Dead 2: Remake — title screen"></p>
+<p align="center"><img src="assets/screenshots/house-of-the-dead-2-remake-gameplay.png" alt="The House of the Dead 2: Remake — Training 1 gameplay"></p>
+
+The route reaches Training 1 with a live rail-shooter camera, HUD, crosshair, and interaction effects at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1896).
+
+## Bendy and the Dark Revival — `PPSA27624`
+
+No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1897).
+
+## Beneath — `PPSA27640`
+
+No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1898).
 
 ## Reproducible routes
 
