@@ -641,9 +641,13 @@ block-size fields, and metadata address. Version 12 captures the exact DCC contr
 validated single-sample/base-level SW_64KB_R_X layout; metadata-only and older capsules keep their absence
 explicit. Version 13 tags every temporal color RTT seed as `rgba8` or `rgba16f`, preserving its native byte
 width through standalone replay while reading v1..v12 seeds as the historical RGBA8 default.
-Version 14 appends address-backed `DMA_DATA` records with exact source and destination guest identities, byte
-counts, PM4 order, and content-addressed endpoint blob references. Replay mutates the same owned resource
-instances used by later draws and dispatches and invalidates renderer caches for the guest destination range;
+Version 14 appends address-backed `DMA_DATA` records with exact source and destination identities, selector
+domains, byte counts, PM4 order, and content-addressed endpoint blob references. A supported
+memory-to-GDS record (`dstSel=1`, `srcSel=3`, address source) binds its destination to a complete pre-submit
+64 KiB GDS snapshot even when that submit has no compute table; a later compute consumer aliases that same
+owned instance. Metadata-only capsules retain the record with both payload backings explicitly unavailable.
+Unknown selector directions remain fail-visible rather than replaying state that live execution rejected.
+Guest-memory copies still invalidate renderer caches for the guest destination range; GDS offsets never do.
 v1..v13 capsules remain readable and do not invent DMA operations.
 Version 37 appends each realized compute module's required subgroup size. A non-zero value recreates the exact
 `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo` plus full-subgroups contract used by live rendering;

@@ -5394,6 +5394,34 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
     return execute_ordered_items_impl(
         operations, draws, computes, dma_copies, render, compute, width, height,
         [](const ReplayDmaCopy& copy) {
+            const uint32_t source_selector = (copy.sels >> 8u) & 0xffu;
+            const uint32_t destination_selector = copy.sels & 0xffu;
+            const bool source_gds = source_selector == 1u;
+            const bool destination_gds = destination_selector == 1u;
+            if (source_gds) {
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 24)
+                    std::fprintf(stderr,
+                                 "[gpu_replay] DMA_DATA GDS source is unsupported: "
+                                 "src=0x%llx dst=0x%llx bytes=%u sels=0x%x\n",
+                                 static_cast<unsigned long long>(copy.src),
+                                 static_cast<unsigned long long>(copy.dst), copy.bytes,
+                                 copy.sels);
+                return;
+            }
+            const bool address_source = (copy.sels & kDmaDataAddressSource) != 0 ||
+                                        copy.src > UINT32_MAX;
+            if (destination_gds && (source_selector != 3u || !address_source)) {
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 24)
+                    std::fprintf(stderr,
+                                 "[gpu_replay] DMA_DATA memory-to-GDS selector form is "
+                                 "unsupported: src=0x%llx dst=0x%llx bytes=%u sels=0x%x\n",
+                                 static_cast<unsigned long long>(copy.src),
+                                 static_cast<unsigned long long>(copy.dst), copy.bytes,
+                                 copy.sels);
+                return;
+            }
             std::vector<uint8_t> current_source;
             const LiveTargetByteReadResult source_result = read_live_render_target_bytes(
                 copy.src, copy.bytes, current_source);
@@ -5413,7 +5441,7 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                 copy.bytes > copy.destination_size || copy.bytes > source_size)
                 return;
             std::memmove(copy.destination_data, source, copy.bytes);
-            notify_guest_gpu_write(copy.dst, copy.bytes);
+            if (!destination_gds) notify_guest_gpu_write(copy.dst, copy.bytes);
         });
 }
 
@@ -6243,12 +6271,19 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 const GpuState::DmaCopy& copy = st.dma_copies[operation.index];
                 // Source and destination are distinct ordered consumers: a disjoint source must not
                 // hide an overlapping destination (or vice versa).
-                notify_compute_authority_range(
-                    ComputeAuthorityBoundaryKind::Dma, submit_no,
-                    operation.command_order, copy.src, copy.bytes);
-                notify_compute_authority_range(
-                    ComputeAuthorityBoundaryKind::Dma, submit_no,
-                    operation.command_order, copy.dst, copy.bytes);
+                const bool source_gds = ((copy.sels >> 8u) & 0xffu) == 1u;
+                const bool destination_gds = (copy.sels & 0xffu) == 1u;
+                if (!source_gds)
+                    notify_compute_authority_range(
+                        ComputeAuthorityBoundaryKind::Dma, submit_no,
+                        operation.command_order, copy.src, copy.bytes);
+                // Selector byte 1 names a GDS offset, not guest memory. The source still consumes a
+                // guest/render-target range, while the destination is ordered by this executor's
+                // shared GDS backing and must not manufacture a guest range at (for example) 0x24.
+                if (!destination_gds)
+                    notify_compute_authority_range(
+                        ComputeAuthorityBoundaryKind::Dma, submit_no,
+                        operation.command_order, copy.dst, copy.bytes);
                 std::vector<uint8_t> current_source;
                 const LiveTargetByteReadResult source_result = read_live_render_target_bytes(
                     copy.src, copy.bytes, current_source);
@@ -6259,12 +6294,19 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                      "[agc] DMA_DATA live-target source range invalid: src=0x%llx bytes=%u\n",
                                      static_cast<unsigned long long>(copy.src), copy.bytes);
                     producer_epoch_ok = false;
+                    notify_compute_authority_unknown(
+                        ComputeAuthorityBoundaryKind::Dma, submit_no,
+                        operation.command_order);
                     break;
                 }
                 const bool executed = execute_ordered_dma_copy(
                     copy, source_result == LiveTargetByteReadResult::Success
                               ? current_source.data() : nullptr);
                 producer_epoch_ok &= executed;
+                if (!executed)
+                    notify_compute_authority_unknown(
+                        ComputeAuthorityBoundaryKind::Dma, submit_no,
+                        operation.command_order);
                 break;
             }
             case RetainedSubmitKind::ParserStall:

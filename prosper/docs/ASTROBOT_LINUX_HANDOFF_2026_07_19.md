@@ -733,10 +733,72 @@ supported overlay, low/high-dword order, ownership, partial/oversized bounds, ex
 and reporter path are each observed by a named check. The GitHub issue carries the exact live
 revision, binary hash, bounded-run validity, and sparse diagnostic counts.
 
+## Address-backed memory-to-GDS wait result (2026-08-04)
+
+The post-#1927 retained address DMA is now exact. In the retained run it repeatedly decoded as
+`src=0x56f6e6000`, `dst=0x24`, four bytes, `dstSel=1`, `srcSel=3`, and the preserved address-source
+bit. Older raw timeline records independently establish selector 1 as the GDS offset domain. The
+packet therefore copies mapped guest memory into `GDS+0x24`; it does not write guest VA `0x24`.
+
+PR #1931 implements only that generic observed form.
+The source must be mapped/readable or supplied as an authoritative renderer-owned snapshot; the GDS
+offset and byte count must be dword-aligned and the complete span must fit in the 64 KiB share.
+Unknown selector directions and GDS-to-memory remain fail-closed. The copy stays in the retained
+executor timeline, updates the shared GDS backing, and emits neither a guest-write notification nor a
+guest destination authority range. Retained GDS destinations are excluded from guest-address
+wait/indirect overlap classification and WAIT_DEFER address domains.
+
+Focused `eop_write` and `gpu_execute` tests pass. The defect-shaped CPU stream is the title's real
+shape: memory-to-`GDS+0x24`, owned `WRITE_DATA(0)`, fixed `RELEASE_MEM32(1)`, then
+`WAIT_REG_MEM(label==1)`. It proves the wait is accepted, the exact source value reaches GDS, and all
+three retained producers execute in command order. Separate negative checks cover unmapped asserted
+sources, out-of-range GDS spans, misaligned offsets, non-dword byte counts, the wrong source selector,
+and the unsupported reverse direction. Five isolated mutations independently make the guest-address
+overlap, execution/data, selector, authority, and paused-stream ordering checks fail.
+
+PR #1931 also makes offline capture truthful for this operation. A full capture stores the complete
+64 KiB pre-submit GDS image even when the submit has no compute table; replay materializes that image
+as the one shared GDS instance used by both the DMA and later compute consumers. Metadata-only
+captures instead keep both endpoint backings explicitly unavailable. Capture validation and replay
+execution independently enforce the observed `dstSel=1`, `srcSel=3`, address-source form, while
+selector 2, GDS-to-memory, and forms without address-source semantics fail visibly. Defect-shaped
+capture and executor mutations each make only their corresponding named regression fail while the
+valid DMA-only and shared-instance controls remain green.
+
+The one authorized live acceptance used the normal full-scale/every-submit `prosper-app` path with
+real renderer, compute, FFmpeg/VA-API, SDL audio and SDL input backends, no pad route, a 540-present
+target, and a 360-second hard bound. Exact-six pre/post GPU-process censuses were empty. Its binary
+SHA-256 was `a57aae534bb0a135105f954104824c48b53949e33b29196be28bc9b5cf5e7d7a`.
+The bounded sparse positive control emitted 21 lines (ordinals 1--16, 32, 64, 128, 256, and 512), so
+at least 512 exact memory-to-GDS executions occurred. The former ordered-wait rejection family,
+generic ordered-DMA submit rejection, invalid `dst=0x24` form, Vulkan device loss, and fatal markers
+all emitted zero matches. Astro progressed past #1927's loaded-title frontier:
+
+```text
+GAME: Level has started: title_controller_ship
+LevelDocument Loaded: worldmap [worldmap]
+```
+
+The app exited normally at 540/540 presents and reported 2.9 fps for its final interval. That number
+is an exact observation from a 601 MB high-volume GFXLOG run, not a controlled performance result;
+no throughput improvement is claimed. The run produced no image artifact and makes no new visual-
+correctness claim, so no screenshot is attached. Retained evidence is outside git under
+`<EVIDENCE_ROOT>/astro-1732-memory-gds-37eb14e/` and the complete audit trail is on #1732.
+
 ## Ruled out
 
 One line per falsified hypothesis, the evidence that killed it, and the issue/PR. Extend this rather
 than re-deriving a dead answer at full cost.
+
+- **"The post-#1927 retained address DMA writes guest memory at `0x24`, so it can genuinely overlap
+  every later guest label wait."** False on exact candidate `37eb14e7` for #1732. Raw operands and
+  selectors identify the operation as mapped memory to `GDS+0x24`, four bytes, and the CPU defect
+  stream proves that excluding this private-share destination accepts only the unrelated scalar
+  label protocol while still executing the GDS copy in order. Reintroducing guest-address overlap
+  classification makes the exact named wait check fail. In one natural 540-present app run the
+  memory-to-GDS positive ordinal reached at least 512, the former ordered-wait and ordered-DMA
+  rejection families emitted zero matches, and Astro started `title_controller_ship` then loaded
+  `worldmap`. No device loss, fatal, visual, or controlled performance claim is attached. See #1732.
 
 - **"After exact retained `WRITE_DATA` overlays are accepted, the remaining title-load stall is
   another instance of the same memory-effect/wait ambiguity."** False on exact candidate

@@ -686,6 +686,160 @@ int main() {
               "authority hook preserves submit, DMA, draw audit, and end order");
     }
 
+    // #1732: an ordered memory-to-GDS DMA consumes one guest/render-target source range, but its
+    // destination is an offset in the private GDS share. Publishing GDS+0x24 as a second guest
+    // authority range reproduces the same domain confusion that used to poison Astro Bot's waits.
+    {
+        uint32_t source = 0x7A6B5C4Du;
+        uint8_t* gds = compute_gds_backing();
+        memset(gds + 0x24, 0, sizeof(source));
+        GpuState ordered;
+        ordered.dma_copies.push_back({
+            0x24, reinterpret_cast<uint64_t>(&source), sizeof(source),
+            1u | (3u << 8) | kDmaDataAddressSource, 100, 0});
+        std::vector<ComputeAuthorityBoundary> authority_boundaries;
+        set_compute_authority_boundary_observer(
+            [&](const ComputeAuthorityBoundary& boundary) {
+                authority_boundaries.push_back(boundary);
+            });
+        execute_ordered_and_present(ordered, W, H, 78, /*publish=*/false);
+        set_compute_authority_boundary_observer({});
+        uint32_t copied = 0;
+        memcpy(&copied, gds + 0x24, sizeof(copied));
+        CHECK(copied == source,
+              "production ordered executor copies mapped memory into the GDS share");
+        CHECK(authority_boundaries.size() == 3 &&
+                  authority_boundaries[0].kind ==
+                      ComputeAuthorityBoundaryKind::SubmitBegin &&
+                  authority_boundaries[1].kind == ComputeAuthorityBoundaryKind::Dma &&
+                  authority_boundaries[1].range_known &&
+                  authority_boundaries[1].address == reinterpret_cast<uint64_t>(&source) &&
+                  authority_boundaries[1].bytes == sizeof(source) &&
+                  authority_boundaries[2].kind == ComputeAuthorityBoundaryKind::SubmitEnd,
+              "memory-to-GDS authority reports only the guest source, not GDS+0x24");
+    }
+
+    // Renderer-owned sources need not have CPU-readable guest backing. An exact live snapshot is
+    // authoritative for this ordered copy; InvalidRange must instead preserve GDS and poison a
+    // post-stall indirect consumer, while making the failure visible to the authority census.
+    {
+        constexpr uint64_t renderer_owned_source = 0x4000;
+        const uint32_t snapshot_value = 0x4D3C2B1Au;
+        uint8_t* gds = compute_gds_backing();
+        memset(gds + 0x30, 0, sizeof(snapshot_value));
+        CHECK(!guest_readable(renderer_owned_source, sizeof(snapshot_value)),
+              "renderer-owned DMA source is deliberately not guest-readable");
+
+        set_live_target_byte_range_reader(
+            [&](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
+                if (addr != renderer_owned_source || bytes != sizeof(snapshot_value))
+                    return LiveTargetByteReadResult::NotFound;
+                output.resize(bytes);
+                memcpy(output.data(), &snapshot_value, bytes);
+                return LiveTargetByteReadResult::Success;
+            });
+        GpuState ordered;
+        ordered.dma_copies.push_back({
+            0x30, renderer_owned_source, sizeof(snapshot_value),
+            1u | (3u << 8) | kDmaDataAddressSource, 100, 0});
+        std::vector<ComputeAuthorityBoundary> authority_boundaries;
+        set_compute_authority_boundary_observer(
+            [&](const ComputeAuthorityBoundary& boundary) {
+                authority_boundaries.push_back(boundary);
+            });
+        execute_ordered_and_present(ordered, W, H, 781, /*publish=*/false);
+        set_compute_authority_boundary_observer({});
+        uint32_t copied = 0;
+        memcpy(&copied, gds + 0x30, sizeof(copied));
+        CHECK(copied == snapshot_value,
+              "authoritative live snapshot supplies an otherwise unreadable memory-to-GDS source");
+        CHECK(authority_boundaries.size() == 3 &&
+                  authority_boundaries[1].kind == ComputeAuthorityBoundaryKind::Dma &&
+                  authority_boundaries[1].range_known &&
+                  authority_boundaries[1].address == renderer_owned_source &&
+                  authority_boundaries[1].bytes == sizeof(snapshot_value),
+              "renderer-owned source retains its exact guest identity in authority evidence");
+
+        const uint32_t sentinel = 0xA5A5A5A5u;
+        memcpy(gds + 0x30, &sentinel, sizeof(sentinel));
+        set_live_target_byte_range_reader(
+            [&](uint64_t addr, uint32_t bytes, std::vector<uint8_t>&) {
+                return addr == renderer_owned_source && bytes == sizeof(snapshot_value)
+                    ? LiveTargetByteReadResult::InvalidRange
+                    : LiveTargetByteReadResult::NotFound;
+            });
+        uint16_t indices[3] = {0, 1, 2};
+        uint32_t stale_args[5] = {3, 1, 0, 0, 0};
+        GpuState failed = st;
+        failed.draws.clear();
+        failed.dispatches.clear();
+        failed.dma_copies = ordered.dma_copies;
+        failed.parser_stalls.clear();
+        failed.ordered_memory_effects.clear();
+        failed.index_type = 0;
+        failed.parser_stalls.push_back({150});
+        GpuState::Draw indirect;
+        indirect.indexed = true;
+        indirect.index_base = reinterpret_cast<uint64_t>(indices);
+        indirect.indirect = true;
+        indirect.indirect_args_addr = reinterpret_cast<uint64_t>(stale_args);
+        indirect.command_order = 200;
+        failed.draws.push_back(indirect);
+        uint32_t backend_draws = 0;
+        authority_boundaries.clear();
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            backend_draws += static_cast<uint32_t>(items.size());
+            return RenderedFrame{};
+        });
+        set_compute_authority_boundary_observer(
+            [&](const ComputeAuthorityBoundary& boundary) {
+                authority_boundaries.push_back(boundary);
+            });
+        execute_ordered_and_present(failed, W, H, 782, /*publish=*/false);
+        set_compute_authority_boundary_observer({});
+        set_submit_renderer({});
+        set_live_target_byte_range_reader({});
+        memcpy(&copied, gds + 0x30, sizeof(copied));
+        CHECK(copied == sentinel && backend_draws == 0,
+              "InvalidRange leaves GDS unchanged and poisons the dependent indirect draw");
+        CHECK(std::any_of(authority_boundaries.begin(), authority_boundaries.end(),
+                          [](const ComputeAuthorityBoundary& boundary) {
+                              return boundary.kind == ComputeAuthorityBoundaryKind::Dma &&
+                                     !boundary.range_known;
+                          }),
+              "InvalidRange emits an explicit DMA failure boundary");
+    }
+
+    // The reverse selector form is deliberately unsupported. Its GDS source offset must never be
+    // published as guest authority, while the valid guest destination and failure stay observable.
+    {
+        uint32_t destination = 0xCAFEBABEu;
+        GpuState reverse;
+        reverse.dma_copies.push_back({
+            reinterpret_cast<uint64_t>(&destination), 0x24, sizeof(destination),
+            3u | (1u << 8) | kDmaDataAddressSource, 100, 0});
+        std::vector<ComputeAuthorityBoundary> authority_boundaries;
+        set_compute_authority_boundary_observer(
+            [&](const ComputeAuthorityBoundary& boundary) {
+                authority_boundaries.push_back(boundary);
+            });
+        execute_ordered_and_present(reverse, W, H, 783, /*publish=*/false);
+        set_compute_authority_boundary_observer({});
+        CHECK(destination == 0xCAFEBABEu,
+              "unsupported GDS-to-memory DMA fails without mutating guest memory");
+        CHECK(authority_boundaries.size() == 4 &&
+                  authority_boundaries[0].kind ==
+                      ComputeAuthorityBoundaryKind::SubmitBegin &&
+                  authority_boundaries[1].kind == ComputeAuthorityBoundaryKind::Dma &&
+                  authority_boundaries[1].range_known &&
+                  authority_boundaries[1].address ==
+                      reinterpret_cast<uint64_t>(&destination) &&
+                  authority_boundaries[2].kind == ComputeAuthorityBoundaryKind::Dma &&
+                  !authority_boundaries[2].range_known &&
+                  authority_boundaries[3].kind == ComputeAuthorityBoundaryKind::SubmitEnd,
+              "reverse DMA reports guest destination plus failure, never GDS source as a VA");
+    }
+
     {
         DrawItem draw_resource_probe;
         draw_resource_probe.command_order = 321;

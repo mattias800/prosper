@@ -64,6 +64,20 @@ static void emit_dma_copy(uint32_t* buf, uint64_t dst, uint64_t src, uint32_t by
     buf[3] = (uint32_t)src; buf[4] = (uint32_t)(src >> 32);
     buf[5] = bytes; buf[6] = 0;
 }
+static void emit_dma_gds_fill(uint32_t* buf, uint32_t dst_offset, uint32_t value,
+                              uint32_t bytes) {
+    buf[0] = PM4(7, IT_NOP, R_DMA_DATA);
+    buf[1] = dst_offset; buf[2] = 0;
+    buf[3] = value; buf[4] = 0;
+    buf[5] = bytes; buf[6] = 1u | (3u << 8);
+}
+static void emit_dma_memory_to_gds(uint32_t* buf, uint32_t dst_offset, uint64_t src,
+                                   uint32_t bytes) {
+    buf[0] = PM4(7, IT_NOP, R_DMA_DATA);
+    buf[1] = dst_offset; buf[2] = 0;
+    buf[3] = static_cast<uint32_t>(src); buf[4] = static_cast<uint32_t>(src >> 32);
+    buf[5] = bytes; buf[6] = 1u | (3u << 8) | kDmaDataAddressSource;
+}
 
 // Fold + drain the pipe-drain queue (upstream effects become guest-visible at a drain point).
 static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
@@ -298,6 +312,88 @@ int main() {
         execute_nonrender_submit_work(st);
         CHECK(target == 0 && completion == 0,
               "rejected gated DMA discards its deferred completion suffix without signaling");
+    }
+
+    // GDS offsets are outside guest-address dependency domains, but they are not outside stream
+    // order. The same unsatisfied wait must still reject a downstream retained memory-to-GDS copy;
+    // otherwise excluding GDS+0x24 from address overlap would also let it overtake the barrier.
+    {
+        volatile uint64_t cond = 0;
+        uint32_t source = 0xA1B2C3D4u;
+        uint64_t completion = 0;
+        uint8_t* gds = compute_gds_backing();
+        memset(gds + 0x24, 0, sizeof(source));
+        const uint64_t src = reinterpret_cast<uint64_t>(&source);
+        uint32_t stream[8 + 7 + 7] = {};
+        emit_wait_eq(stream, reinterpret_cast<uint64_t>(&cond), 1);
+        stream[8] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[9] = 0x24;
+        stream[11] = static_cast<uint32_t>(src);
+        stream[12] = static_cast<uint32_t>(src >> 32);
+        stream[13] = sizeof(source);
+        stream[14] = 1u | (3u << 8) | kDmaDataAddressSource;
+        emit_release(stream + 15, reinterpret_cast<uint64_t>(&completion), 1);
+        GpuState st;
+        run_cb(stream, 22, st);
+        CHECK(st.dma_copies.size() == 1 && st.dma_execution_rejected,
+              "WAIT_DEFER stream gate still rejects a downstream memory-to-GDS copy");
+        cond = 1;
+        flush_deferred_streams();
+        execute_nonrender_submit_work(st);
+        uint32_t copied = 0;
+        memcpy(&copied, gds + 0x24, sizeof(copied));
+        CHECK(copied == 0 && completion == 0,
+              "rejected gated memory-to-GDS copy cannot overtake its wait or signal completion");
+    }
+
+    // GDS ordering also crosses fold boundaries. Fold A leaves a GDS immediate fill pending behind
+    // its wait. A later fold's same-span memory-to-GDS producer must not overtake it, but a copy to
+    // a disjoint GDS span remains independent and can execute immediately.
+    {
+        volatile uint64_t cond = 0;
+        const uint32_t same_span_source = 0x22222222u;
+        const uint32_t disjoint_source = 0x33333333u;
+        uint8_t* gds = compute_gds_backing();
+        memset(gds + 0x24, 0, 8);
+
+        uint32_t first_fold[8 + 7] = {};
+        emit_wait_eq(first_fold, reinterpret_cast<uint64_t>(&cond), 1);
+        emit_dma_gds_fill(first_fold + 8, 0x24, 0x11111111u, 4);
+        GpuState first_state;
+        run_cb(first_fold, 15, first_state);
+
+        uint32_t same_span_copy[7] = {};
+        emit_dma_memory_to_gds(same_span_copy, 0x24,
+                               reinterpret_cast<uint64_t>(&same_span_source), 4);
+        GpuState same_span_state;
+        run_cb(same_span_copy, 7, same_span_state);
+        CHECK(same_span_state.dma_copies.size() == 1 &&
+                  same_span_state.dma_execution_rejected,
+              "a later fold cannot overtake a pending write to the same GDS span");
+
+        uint32_t disjoint_copy[7] = {};
+        emit_dma_memory_to_gds(disjoint_copy, 0x28,
+                               reinterpret_cast<uint64_t>(&disjoint_source), 4);
+        GpuState disjoint_state;
+        run_cb(disjoint_copy, 7, disjoint_state);
+        CHECK(disjoint_state.dma_copies.size() == 1 &&
+                  !disjoint_state.dma_execution_rejected,
+              "a later fold may write a disjoint GDS span while the first span is pending");
+        execute_nonrender_submit_work(disjoint_state);
+
+        uint32_t before_release = 0, disjoint_value = 0;
+        memcpy(&before_release, gds + 0x24, 4);
+        memcpy(&disjoint_value, gds + 0x28, 4);
+        CHECK(before_release == 0 && disjoint_value == disjoint_source,
+              "only the disjoint GDS copy executes before the earlier wait releases");
+
+        cond = 1;
+        flush_deferred_streams();
+        execute_nonrender_submit_work(same_span_state);
+        uint32_t final_same_span = 0;
+        memcpy(&final_same_span, gds + 0x24, 4);
+        CHECK(final_same_span == 0x11111111u,
+              "the pending GDS fill lands in order and rejected later work cannot overwrite it");
     }
 
     // A copy also depends on its source. A prior gated producer to S must prevent a later
