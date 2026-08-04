@@ -31,10 +31,12 @@ body originally called highest-value.
 
 **The GPU-side questions are answered. The remaining frontier is CPU/UI-side:** the signed-out
 account path opens and auto-finishes an ErrorDialog, but its account-completion poll is tied to a
-system foreground-return callback. Prosper currently reports no background transition at all. Prove
-that lifecycle edge (or its absence) with a clean, single-instrument arm before changing service
-behaviour, then distinguish EULA/splash `AddToViewport` from a UMG presentation failure. Do not
-return to base-pass or further GPU instrumentation without contradictory new evidence.
+system foreground-return callback. A clean CPU-only discriminator proves that writer never runs,
+and Prosper currently reports no background transition that could dispatch it. The next controlled
+arm is a one-shot background→foreground lifecycle pulse around the system dialog; no service
+behaviour change is justified until that lever proves its own edge and advances the writer. Then
+distinguish EULA/splash `AddToViewport` from a UMG presentation failure. Do not return to base-pass
+or further GPU instrumentation without contradictory new evidence.
 
 ## Shipped front-end progression contract
 
@@ -44,7 +46,7 @@ inferring progression from service-call volume:
 | Blueprint predicate/action | Native implementation | Completion state |
 |---|---|---|
 | `IsAccountLoginRequired` | `0x88af00` | Always required. |
-| `IsAccountLoginChecked` | `0x88aef0` | Reads byte `+0x109`. The ErrorDialog poll at `0x88ad6b` writes the two-byte value `0x0100` at `+0x108` on every non-`RUNNING` result, making `+0x108 = 0` and **`+0x109 = 1`**. The missing discriminator is whether that poll is dispatched after Prosper's headless dialog. |
+| `IsAccountLoginChecked` | `0x88aef0` | Reads byte `+0x109`. The ErrorDialog poll at `0x88ad6b` writes the two-byte value `0x0100` at `+0x108` on every non-`RUNNING` result, making `+0x108 = 0` and **`+0x109 = 1`**. A clean CPU-only arm proves that poll is not dispatched after Prosper's headless dialog. |
 | `IsNoFreeSpaceCheckRequired` | `0x8896c0` | Always required. |
 | `CheckNoFreeSpace` | `0x8896d0` | Its synchronous completion path unconditionally writes byte `+0xb0 = 1` at `0x889722`, then invokes and clears the callback. `IsNoFreeSpaceChecked` (`0x87d070`) reads that byte. |
 | `IsEULACheckRequired` | `0x88ab80` | Always required. |
@@ -68,7 +70,11 @@ active. The constructor registers `0x88ad20` through wrapper `0x887110` on multi
 (`isInBackgroundExecution`) transitions back to zero. Its other route is the NP-state callback, but
 the shipped handler returns immediately for Prosper's delivered `SIGNED_OUT` value. Prosper's
 `sceSystemServiceGetStatus` currently writes byte 5 as zero on every call, so an auto-finished system
-dialog cannot itself produce the required nonzero-to-zero edge. This is the current, bounded
+dialog cannot itself produce the required nonzero-to-zero edge. A same-binary, same-instrument pair
+made that static gap live: `PROSPER_BP=0x88ae00` hit `ShowAccountLogin` with immediate return
+`0x88ac99` in the account-state method, while `PROSPER_BP=0x88ad75` remained at zero for a bounded
+run that logged the ErrorDialog Open and more than 12 seconds of advancing frames. Both arms printed
+the progression-only no-compute witness and no Vulkan-device line. This is the current, bounded
 candidate—not yet a justified behaviour change.
 
 ## Ruled out
@@ -86,10 +92,11 @@ re-derive these without contradictory new evidence.
 | Prosper is failing to walk some submission path — a second queue/DCB, an IB2 chain, an unimplemented submit entry point | **Falsified by four independent measurements.** (1) `[agc] SubmitDcb` accounting over 1,700 submits / ~884 frames: 3,599,703 dwords produced 582,171 applied packets = **6.18 dwords per applied packet**, an ordinary PM4 density with **no unconsumed remainder**; an entire 4K frame arrives as ~4,310 dwords (~17 KB of PM4). (2) **Zero** `[pm4] unknown raw type-3 opcode` lines in the retained full boot log. (3) `PROSPER_PROGRESS_UNIMPL=1` reports 17 unimplemented functions, **not one of them AGC, GPU or submit related** (Coredump/Posix/Http/NpWebApi2/Net/SaveData telemetry only); both known submit entry points are implemented and exercised. (4) Compute flows normally through the same machinery — 7,629 dispatches over 884 presents. **Prosper decodes 100% of what the guest submits; the guest is not issuing the base pass.** CONFIDENCE: HIGH. | #1641 |
 | `~23 draws/frame` is implausibly few (an assertion) | **Now a measurement, against a calibrated control.** Blue Prince — the only title in the comparison that demonstrably renders a 3D world — shows both regimes in one run, same build, same instruments: **7–13 draws/frame on its own menus, 1,500–3,200 in its 3D scene.** Oregon Trail sits flat at 22.4 (peak 23) for an entire run while running a gameplay-scale post chain. Read the trap first: a whole-run average describes neither regime (Blue Prince's is 622.7). | #1641, PR #1645 |
 | The same signature confirms the defect on Nikoderiko or Asterix | **Neither is currently in a phase that can test it.** Nikoderiko's 35.9 draws/frame (peak 53) was measured **parked on the title screen and EULA** — a 2D UI screen — and a working title's own menus measure 7–13, so 53 is *normal*, not a signature; its rise lands exactly when the rich screen appears (samples 10–11 carry 160,300 and 161,248 distinct colours, samples 3–9 are uniformly black). Asterix `PPSA30490` sits at exactly 4.00 draws/frame (3 realized + 1 suppressed), dead flat across 14,472 frames, never reaching any content phase — a title that never starts rendering, a different failure. **Do not widen #1641 to those titles on this evidence.** | #1641 |
-| Headless ErrorDialog's immediate `FINISHED` result prevents the account-login flow from advancing | **Falsified, with exact control flow and a cross-title positive control.** At `0x903041` the guest compares `UpdateStatus` against `FINISHED` (`3`); equality terminates the dialog and invokes its completion callback, while every other state returns to wait. The account-specific poll at `0x88ad6b` returns only for `RUNNING` (`2`); any other result reaches `0x88ad75`, writes `0x0100` at object offset `+0x108` (clearing active and setting account-checked at `+0x109`), then invokes and clears its callback. Prosper's immediate `FINISHED` is therefore the exact advancing state, not a stall. DOLL is the cross-title positive control: the same honest offline `SIGNED_OUT` and ErrorDialog lifecycle immediately streams title assets and reaches its interactive title screen. Changing ErrorDialog semantics is not justified. | #1606; `DOLL_LOADING_PROGRESSION.md` |
+| Headless ErrorDialog's immediate `FINISHED` value is itself the wrong completion value | **Falsified by exact control flow.** At `0x903041` the guest compares `UpdateStatus` against `FINISHED` (`3`); equality terminates the dialog, while every other state returns to wait. The account-specific poll at `0x88ad6b` returns only for `RUNNING` (`2`); any other result reaches `0x88ad75`, writes `0x0100` at object offset `+0x108` (clearing active and setting account-checked at `+0x109`), then invokes and clears its callback. `FINISHED` is therefore the exact advancing value **if the account poll is dispatched**. The remaining defect is dispatch/lifecycle, not the value. Earlier text named DOLL as a cross-title ErrorDialog-Open positive control; retract that claim: DOLL validates the honest offline NP branch, but its retained run explicitly says no ErrorDialog Open-class NID fired. | #1606; `DOLL_LOADING_PROGRESSION.md` |
 | The retained ErrorDialog Open line proves the game-specific account poll at `0x88ad20` ran | **Falsified; it proves a different owner.** The Open import has one direct guest caller, `0x901ed8`, in a Sony online-identity virtual method inherited unchanged by the PS5 identity class. A Vulkan-free live positive at `0x901edd` fired once and its frame recovered the exact return site `caller_rbp=eboot+0x88ae5a`, immediately after `ShowAccountLogin`'s virtual call. Dialog completion is polled separately by the Sony online-subsystem tick (`0x97f9e0` → `0x9036a0` → `0x903020`). The earlier zero at `0x88ad70` remains void, and the static `0x88ad20` semantics remain conditional; neither says that function executed. | #1606; #1932 |
 | The Sony online-subsystem ErrorDialog tick directly completes the game account gate | **Falsified by the exact delegate flow.** `ShowAccountLogin` passes an empty delegate to the identity method at `0x901de0`; that method stores it at identity offset `+0x60`. The generic tick at `0x903020` correctly terminates a `FINISHED` dialog and invokes slot `+0x58` only when that stored delegate is non-empty. It is empty on this path, so the Sony tick cannot write account byte `+0x109`. The separate account poll at `0x88ad20` owns that write and is reached from foreground return (or a signed-in NP-state notification), not from the generic dialog callback. | #1606 |
 | `L_GameloftSplash` directly calls `ShowAccountLogin`, so its Blueprint bytecode should expose the missing call | **Falsified by the retained package import table.** The level imports `CheckNoFreeSpace`, `IsAccountLoginChecked`, `IsAccountLoginRequired`, the EULA predicates/setter, `Begin`, `Create` and `AddToViewport`, but no `ShowAccountLogin` or account-init function. Account initialization is an automatic native stage (`0x87d100` → `0x88abe0`); the Blueprint only polls its checked predicate. | #1606 |
+| The account completion writer runs but rejects Prosper's dialog status | **Falsified, positive-controlled.** On the same executable, a clean software-breakpoint control at `ShowAccountLogin` (`0x88ae00`) fired once and its first recovered return was `0x88ac99`, directly inside the account-state method. A second clean arm at the writer (`0x88ad75`) printed the same no-compute witness, armed the same instrument, logged ErrorDialog Open/auto-`FINISHED`, and advanced for more than 12 seconds with zero hits. The status comparison is never reached; changing `FINISHED` cannot repair an undispatched poll. | #1606 |
 | PlayGo `GetLocus` is a sustained chunk-0 poll or progression gate | **Falsified; the earlier rate interpretation was an instrumentation mistake.** The retained trace's 1,000 calls carry chunk IDs **0, 1, 2, …, 999 exactly once**, with no reset. Guest code at `0x13f28a4` is a bounded startup cache-population loop: it calls `GetLocus` for each ID, stores only successful `LOCAL_FAST` (`3`) results, cleanly skips absent IDs, stops at `0x3e8`, and sets its initialized byte at `0x13f29e7`. Chunk 0 succeeds and the remaining nonexistent IDs fail as expected. This is neither periodic polling nor a wait for those IDs to become local; changing PlayGo behaviour is not justified. | #1606, #1641 |
 
 **Note on the Asterix figure.** 4.00 is the #1641 census number — *decoded* draws per frame, realized
@@ -167,6 +174,16 @@ the same thing, and do not treat either as superseding the other until that is c
   corruption. Therefore the first pre-int3 HWBP owner record is valid, but the int3 record and every
   progression outcome are void. Tracked as #1932 and instrument trap 84; do not combine
   `PROSPER_HWBP` with `PROSPER_BP` until that routing defect is fixed.
+* The replacement account pair used **one instrument at a time** on the exact same executable.
+  Both arms had an exact zero process census before launch, printed
+  `[compute] progression-only no-op backend registered`, printed no Vulkan-device line, and had a
+  final zero census. The positive `PROSPER_BP=0x88ae00` arm hit `ShowAccountLogin` once; its first
+  recovered return was account-state call site `0x88ac99`. That arm later faulted, so only the
+  already-recorded pre-fault BP hit is usable. The negative `PROSPER_BP=0x88ad75` arm logged
+  ErrorDialog Open/auto-`FINISHED` and continued through guest timestamps past 12 seconds without a
+  hit. Its outer distrobox timeout left the exact child alive; the mandatory post-run census caught
+  and terminated it before the title-run gate was released. That wrapper behaviour is an instance
+  of instrument trap 66, not title evidence.
 
 ## Reproduction
 
