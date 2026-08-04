@@ -332,6 +332,8 @@ struct TypeInfo {
     bool image_depth = false;
     bool image_multisampled = false;
     bool scalar_float = false;
+    bool scalar_integer = false;
+    bool scalar_signed = false;
     std::vector<uint32_t> members;
 };
 
@@ -424,14 +426,18 @@ const TypeInfo* descriptor_image_type(const VariableInfo& var,
     return nullptr;
 }
 
-bool descriptor_image_float(const VariableInfo& var,
-                            const std::unordered_map<uint32_t, TypeInfo>& types) {
+SpirvImageNumericClass descriptor_image_numeric_class(
+    const VariableInfo& var, const std::unordered_map<uint32_t, TypeInfo>& types) {
     const TypeInfo* image = descriptor_image_type(var, types);
-    if (!image) return false;
+    if (!image) return SpirvImageNumericClass::Unknown;
     const auto sampled_type = types.find(image->element);
-    return sampled_type != types.end() &&
-           sampled_type->second.kind == TypeKind::Scalar &&
-           sampled_type->second.scalar_float;
+    if (sampled_type == types.end() || sampled_type->second.kind != TypeKind::Scalar)
+        return SpirvImageNumericClass::Unknown;
+    if (sampled_type->second.scalar_float) return SpirvImageNumericClass::Float;
+    if (sampled_type->second.scalar_integer)
+        return sampled_type->second.scalar_signed
+            ? SpirvImageNumericClass::Sint : SpirvImageNumericClass::Uint;
+    return SpirvImageNumericClass::Unknown;
 }
 
 SpirvDescriptorKind resource_kind(const ShaderResource& r) {
@@ -640,7 +646,14 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                     stage = static_cast<SpirvShaderStage>(word(in, 0));
                 break;
             case OpTypeInt:
-                if (n >= 2) { TypeInfo t; t.kind = TypeKind::Scalar; t.width = word(in, 1); types[word(in, 0)] = t; }
+                if (n >= 3) {
+                    TypeInfo t;
+                    t.kind = TypeKind::Scalar;
+                    t.width = word(in, 1);
+                    t.scalar_integer = true;
+                    t.scalar_signed = word(in, 2) != 0;
+                    types[word(in, 0)] = t;
+                }
                 break;
             case OpTypeFloat:
                 if (n >= 2) { TypeInfo t; t.kind = TypeKind::Scalar; t.width = word(in, 1); t.scalar_float = true; types[word(in, 0)] = t; }
@@ -726,11 +739,15 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     std::unordered_map<uint32_t, SpirvDescriptorKind> descriptor_vars;
     std::set<uint32_t> sampled_float_vars;
     std::set<uint32_t> storage_float_vars;
+    std::unordered_map<uint32_t, SpirvImageNumericClass> image_numeric_classes;
     for (const auto& [id, var] : variables) {
         SpirvDescriptorKind kind = descriptor_kind(var, types);
         if (kind != SpirvDescriptorKind::Unknown) {
             descriptor_vars[id] = kind;
-            if (descriptor_image_float(var, types)) {
+            const SpirvImageNumericClass numeric_class =
+                descriptor_image_numeric_class(var, types);
+            image_numeric_classes[id] = numeric_class;
+            if (numeric_class == SpirvImageNumericClass::Float) {
                 if (kind == SpirvDescriptorKind::CombinedImageSampler)
                     sampled_float_vars.insert(id);
                 else if (kind == SpirvDescriptorKind::StorageImage)
@@ -920,6 +937,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             storage_float_vars.count(var) != 0, image_format, image_dim,
             image_arrayed, image_multisampled, image_depth,
             atomic_vars.count(var) != 0};
+        descriptor.image_numeric_class = image_numeric_classes[var];
         const uint64_t marker_key = (static_cast<uint64_t>(descriptor.set) << 32u) |
                                     descriptor.binding;
         if (auto marker = zero_pad_markers.find(marker_key); marker != zero_pad_markers.end()) {

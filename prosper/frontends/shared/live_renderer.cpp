@@ -382,6 +382,16 @@ struct TextureDecodeKey {
     uint64_t metadata_host_data_size = 0;
     bool in_mip_tail = false;
     bool preserve_narrow_channels = false;
+    // The same guest T# can be consumed through incompatible shader interfaces. In particular,
+    // graphics IMAGE_LOAD uses a formatless raw-uvec4 image (16 host bytes per texel), while an
+    // image atomic over that descriptor requires exact R32ui (4 host bytes per texel). These are
+    // distinct decoded identities even when every guest descriptor field and source span matches.
+    uint32_t reflected_image_numeric_class = 0;
+    uint32_t reflected_storage_image_format = 0;
+    uint32_t reflected_image_dim = 0;
+    bool reflected_image_arrayed = false;
+    bool reflected_image_multisampled = false;
+    bool reflected_image_writable = false;
     bool operator==(const TextureDecodeKey&) const = default;
 };
 
@@ -406,6 +416,12 @@ struct TextureDecodeKeyHash {
         mix(key.metadata_host_data); mix(key.metadata_host_data_size);
         mix(key.in_mip_tail);
         mix(key.preserve_narrow_channels);
+        mix(key.reflected_image_numeric_class);
+        mix(key.reflected_storage_image_format);
+        mix(key.reflected_image_dim);
+        mix(key.reflected_image_arrayed);
+        mix(key.reflected_image_multisampled);
+        mix(key.reflected_image_writable);
         return hash;
     }
 };
@@ -434,6 +450,11 @@ struct DecodedTexture {
     // slot. Retaining the owner here gives same-submit cache hits the same lifetime guarantee as a
     // pinned scratch slot, without pinning one ~32 MiB vector per distinct surface forever.
     std::shared_ptr<const std::vector<uint8_t>> pixels_owner;
+    // Pixel bytes do not define their Vulkan interpretation. Restore these on every hit rather than
+    // re-deriving only the historical sampled R8/RG8/FP16 cases and accidentally reverting a
+    // portable UINT storage image to the FrameResource default RGBA8_UNORM.
+    VkFormat texture_format = VK_FORMAT_R8G8B8A8_UNORM;
+    bool storage_image_contract_valid = true;
 };
 
 // Always-on identity-scope accounting; see TextureDecodeScopeStats in the header.
@@ -451,6 +472,8 @@ struct PersistentDecodedTexture {
     uint64_t last_use = 0;
     uint64_t persistent_id = 0;
     uint64_t persistent_version = 0;
+    VkFormat texture_format = VK_FORMAT_R8G8B8A8_UNORM;
+    bool storage_image_contract_valid = true;
     prosper::gpu::GuestGpuWriteSnapshot validation_snapshot;
     prosper::host::GuestWriteWatch source_watch;
     uint32_t source_watch_dirty_count = 0;
@@ -1533,6 +1556,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     size_t resource_persistent_source_size = 0;
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
                     fr.is_storage_image = r.cls == RC::StorageImage;
+                    fr.storage_image_numeric_class = reflected_binding->image_numeric_class;
+                    fr.storage_image_contract_valid = !fr.is_storage_image ||
+                        reflected_binding->image_numeric_class !=
+                            prosper::gpu::SpirvImageNumericClass::Unknown;
                     const bool normalized_sampling =
                         reflected_binding->kind ==
                             prosper::gpu::SpirvDescriptorKind::CombinedImageSampler &&
@@ -1653,6 +1680,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             r.compression_enabled ? r.dcc_metadata_host_data_size : 0u,
                             r.in_mip_tail,
                             avplayer_chroma_layout,
+                            static_cast<uint32_t>(reflected_binding->image_numeric_class),
+                            reflected_binding->storage_image_format,
+                            reflected_binding->image_dim,
+                            reflected_binding->image_arrayed,
+                            reflected_binding->image_multisampled,
+                            reflected_binding->writable,
                         };
                         if (r.img_dim == 6u) {
                             // GFX10 TYPE=2D_MSAA interleaves the sample coordinate into the tiled
@@ -1852,6 +1885,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 decoded.source_addr = sampled_source_addr;
                                 decoded.source_size = cross_span_source_size;
                                 decoded.pixels_owner = fr.tex_rgba_owner;
+                                decoded.texture_format = VK_FORMAT_R32_SFLOAT;
                                 decoded_textures.emplace(decode_key, std::move(decoded));
                             }
                             fr.tex_byte_size = fr.tex_rgba_owner->size();
@@ -2174,6 +2208,50 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             r.cls == RC::StorageImage && r.img_dim == 1u &&
                             r.format == prosper::gpu::DataFormat::Uint32 &&
                             r.num_components == 1 && !r.compression_enabled;
+                        // The portable graphics recompiler declares formatless uvec4 storage images.
+                        // Their UINT Sampled Type is not compatible with the renderer's historical
+                        // RGBA8_UNORM upload even when the same undefined read happened to return useful
+                        // pixels. Materialize the same raw-channel ABI as live_compute instead.
+                        const bool portable_raw_uvec4_storage =
+                            fr.is_storage_image &&
+                            reflected_binding->image_numeric_class ==
+                                prosper::gpu::SpirvImageNumericClass::Uint &&
+                            reflected_binding->storage_image_format == 0u;
+                        const uint32_t portable_storage_guest_texel =
+                            portable_raw_uvec4_storage
+                                ? storage_image_guest_texel_bytes(
+                                      r.format, r.num_components ? r.num_components : 1u)
+                                : 0u;
+                        const bool portable_storage_shape =
+                            !writable_storage_image && !r.compression_enabled &&
+                            !reflected_binding->image_arrayed &&
+                            !reflected_binding->image_multisampled &&
+                            ((reflected_binding->image_dim == 1u && r.img_dim == 1u) ||
+                             (reflected_binding->image_dim == 2u && r.img_dim == 2u &&
+                              r.depth != 0u));
+                        if (portable_raw_uvec4_storage &&
+                            (!portable_storage_guest_texel || !portable_storage_shape))
+                            fr.storage_image_contract_valid = false;
+                        if (fr.is_storage_image &&
+                            reflected_binding->image_numeric_class ==
+                                prosper::gpu::SpirvImageNumericClass::Uint &&
+                            reflected_binding->storage_image_format ==
+                                prosper::gpu::kSpirvImageFormatR32ui &&
+                            !native_r32ui_storage)
+                            fr.storage_image_contract_valid = false;
+                        if (fr.is_storage_image &&
+                            reflected_binding->image_numeric_class ==
+                                prosper::gpu::SpirvImageNumericClass::Sint)
+                            fr.storage_image_contract_valid = false;
+                        const VkFormat decoded_texture_format = has_cpu_live_rtt
+                            ? live_rtt->second.format
+                            : (portable_raw_uvec4_storage
+                                   ? VK_FORMAT_R32G32B32A32_UINT
+                               : (native_r32ui_storage ? VK_FORMAT_R32_UINT
+                               : (native_r8_sampled ? VK_FORMAT_R8_UNORM
+                               : (native_rg8_sampled ? VK_FORMAT_R8G8_UNORM
+                               : (sampled_source_f32 ? VK_FORMAT_R16G16B16A16_SFLOAT
+                                                     : VK_FORMAT_R8G8B8A8_UNORM)))));
                         const bool persistent_source_matches_pixels =
                             native_r8_sampled || native_rg8_sampled ||
                             (persistent_unorm8_texture && r.num_components == 4 &&
@@ -2594,6 +2672,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                         cached->second.narrow,
                                                         cached->second.persistent_id,
                                                         cached->second.persistent_version};
+                                    persistent_reuse.texture_format =
+                                        cached->second.texture_format;
+                                    persistent_reuse.storage_image_contract_valid =
+                                        cached->second.storage_image_contract_valid;
                                     decoded_reuse = &persistent_reuse;
                                     resource_persistent_hit = true;
                                     if (timing_enabled) pending_timing.persistent_hits++;
@@ -2707,12 +2789,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fr.th = decoded_reuse->output_height;
                             fr.td = is_volume ? r.depth : 1u;
                             fr.img_dim = r.img_dim;
-                            if (native_r8_sampled)
-                                fr.texture_format = VK_FORMAT_R8_UNORM;
-                            else if (native_rg8_sampled)
-                                fr.texture_format = VK_FORMAT_R8G8_UNORM;
-                            else if (sampled_source_f32)
-                                fr.texture_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+                            fr.texture_format = decoded_reuse->texture_format;
+                            fr.storage_image_contract_valid =
+                                decoded_reuse->storage_image_contract_valid;
                             // #1272: plain 2D guest textures only — cube outputs stack 6 faces into
                             // one 2D image (fr.th != th), and volumes keep their own path; generated
                             // mips across face/slice boundaries would bleed.
@@ -2782,7 +2861,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                    decode_span_ordinal,
                                                    prosper::gpu::guest_gpu_write_snapshot(),
                                                    persistent_source_addr,
-                                                   cross_span_source_size, SIZE_MAX});
+                                                   cross_span_source_size, SIZE_MAX, nullptr,
+                                                   fr.texture_format,
+                                                   fr.storage_image_contract_valid});
                             if (timing_enabled) pending_timing.texture_reuses++;
                         } else {
                         // PROSPER_DETILE_STATS: this branch is the texture-decode MISS path — the cache
@@ -2992,16 +3073,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             }
                         }
                         const size_t volume_texels = (size_t)tw * th * (is_volume ? r.depth : 1u);
-                        const VkFormat live_rtt_format = has_cpu_live_rtt
-                            ? live_rtt->second.format
-                            : (native_r32ui_storage ? VK_FORMAT_R32_UINT
-                               : (native_r8_sampled ? VK_FORMAT_R8_UNORM
-                               : (native_rg8_sampled ? VK_FORMAT_R8G8_UNORM
-                               : (sampled_source_f32 ? VK_FORMAT_R16G16B16A16_SFLOAT
-                                                     : VK_FORMAT_R8G8B8A8_UNORM))));
-                        fr.texture_format = live_rtt_format;
+                        fr.texture_format = decoded_texture_format;
                         const uint32_t output_bpp =
-                            prosper::test::backend_color_bytes_per_pixel(live_rtt_format);
+                            prosper::test::backend_color_bytes_per_pixel(decoded_texture_format);
                         size_t nb = volume_texels * output_bpp * (is_cube ? 6u : 1u);
                         size_t linear_source_prefix_size = 0;
                         ++g_texture_decode_scope.decodes;
@@ -3143,7 +3217,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // normal format/detile path below is authoritative.
                         bool dcc_fast_clear_done = false;
                         bool dcc_uncompressed = false;
-                        if (r.compression_enabled && !rtt_hit) {
+                        if (r.compression_enabled && !rtt_hit && !fr.is_storage_image) {
                             const uint64_t metadata_bytes = sampled_dcc_metadata_size;
                             const std::vector<uint8_t>& metadata = sampled_dcc_metadata;
                             const size_t metadata_got = sampled_dcc_metadata_got;
@@ -3318,7 +3392,38 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const uint32_t bcb = (rtt_hit || cube_done || dcc_fast_clear_done)
                             ? 0u : prosper::gpu::bc_block_bytes(r.format);
                         if (rtt_hit || cube_done || dcc_fast_clear_done) { /* pixels already materialized */ }
-                        else if (bcb) {
+                        else if (portable_raw_uvec4_storage) {
+                            // Storage-image tiling describes the compact guest texels, not the expanded
+                            // 16-byte Vulkan representation. Detile at the real guest width first, then
+                            // convert every channel into the raw VGPR dword carried by the uvec4 image.
+                            const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
+                                !getenv("PROSPER_NODETILE");
+                            const uint32_t materialize_tile_mode = tiled ? r.tile_mode : 0u;
+                            const uint32_t materialize_depth = is_volume ? r.depth : 1u;
+                            const size_t source_bytes = storage_image_raw_uvec4_source_bytes(
+                                r.format, r.num_components ? r.num_components : 1u,
+                                tw, th, materialize_depth, materialize_tile_mode,
+                                r.in_mip_tail, r.mip_tail_bytes);
+                            std::vector<uint8_t> source(source_bytes);
+                            bool decoded = fr.storage_image_contract_valid;
+                            const size_t got = decoded && source_bytes
+                                ? copy_resource(
+                                      source.data(), sampled_source_addr, source_bytes)
+                                : 0u;
+                            decoded = decoded && got == source_bytes &&
+                                storage_image_materialize_raw_uvec4(
+                                    source.data(), got, r.format,
+                                    r.num_components ? r.num_components : 1u,
+                                    tw, th, materialize_depth, materialize_tile_mode,
+                                    r.in_mip_tail, r.mip_tail_bytes,
+                                    r.mip_tail_x, r.mip_tail_y,
+                                reinterpret_cast<uint32_t*>(texture_pixels.data()),
+                                texture_pixels.size() / sizeof(uint32_t));
+                            if (!decoded) {
+                                fr.storage_image_contract_valid = false;
+                                std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
+                            }
+                        } else if (bcb) {
                             uint32_t bw = (tw + 3) / 4, bh = (th + 3) / 4;
                             // Block-detile: tiled_elements_bytes/detile_elements now derive the 4KB
                             // micro-tile geometry from the block size (bpe) internally (#119) — 16-byte
@@ -3558,7 +3663,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const char* dt = getenv("PROSPER_DETILE");
                         // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
                         if (!rtt_hit && !cube_done && !dcc_fast_clear_done && !bcb && !narrow_decode_done &&
-                            !f16_done && !f32_done &&
+                            !f16_done && !f32_done && !portable_raw_uvec4_storage &&
                             !getenv("PROSPER_NODETILE") &&
                             (auto_tiled || (!is_volume && dt && atoi(dt) != 0))) {
                             const uint32_t tmode = auto_tiled ? r.tile_mode : (uint32_t)prosper::gpu::TileMode::Sw4KbS;
@@ -3601,7 +3706,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // scene-color RT format. The texel IS 4 bytes, so the generic read + auto-detile
                         // above already produced linear packed words; unpack each to RGBA8 in place with
                         // the same semantics as the fp16 path (NaN/neg -> 0, clamp [0,1], no alpha -> 255).
-                        if (!rtt_hit && !dcc_fast_clear_done &&
+                        if (!rtt_hit && !dcc_fast_clear_done && !portable_raw_uvec4_storage &&
                             r.format == prosper::gpu::DataFormat::Float10_11_11) {
                             uint8_t* tp = texture_pixels.data();
                             const size_t decoded_texels = volume_texels * (cube_done ? 6u : 1u);
@@ -3619,7 +3724,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // Packed R10G10B10A2 UNORM (GFX10 IMG_FMT 50 / "2_10_10_10_UNORM"):
                         // the generic 4-B read and detile above preserve packed texels; normalize each
                         // field to the RGBA8 image format used by this renderer before sampling.
-                        if (!rtt_hit && !dcc_fast_clear_done &&
+                        if (!rtt_hit && !dcc_fast_clear_done && !portable_raw_uvec4_storage &&
                             r.format == prosper::gpu::DataFormat::Unorm2_10_10_10) {
                             uint8_t* tp = texture_pixels.data();
                             const size_t decoded_texels = volume_texels * (cube_done ? 6u : 1u);
@@ -3919,6 +4024,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                                 cached.persistent_version = inherited_persistent_version + 1;
                                 if (!cached.persistent_version) cached.persistent_version = 1;
+                                cached.texture_format = fr.texture_format;
+                                cached.storage_image_contract_valid =
+                                    fr.storage_image_contract_valid;
                                 cached.validation_snapshot =
                                     prosper::gpu::guest_gpu_write_snapshot();
                                 cached.source_watch_dirty_count = inherited_watch_dirty_count;
@@ -3967,7 +4075,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                           decode_span_ordinal,
                                                           prosper::gpu::guest_gpu_write_snapshot(),
                                                           persistent_source_addr,
-                                                          cross_span_source_size, pinned_slot});
+                                                          cross_span_source_size, pinned_slot,
+                                                          nullptr, fr.texture_format,
+                                                          fr.storage_image_contract_valid});
                         }
                         }
                         if (native_r32ui_storage && writable_storage_image) {
@@ -4372,6 +4482,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     255, 0, 255, 255,   0, 255, 255, 255,
                     0, 255, 255, 255,   255, 0, 255, 255,
                 };
+                static const uint32_t poison_storage_uint[16] = {
+                    0x3f800000u, 0u, 0x3f800000u, 0x3f800000u,
+                    0u, 0x3f800000u, 0x3f800000u, 0x3f800000u,
+                    0u, 0x3f800000u, 0x3f800000u, 0x3f800000u,
+                    0x3f800000u, 0u, 0x3f800000u, 0x3f800000u,
+                };
                 for (const auto& d : report.descriptors) {
                     bool invalid = false;
                     for (const auto& issue : report.issues)
@@ -4406,7 +4522,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         words = std::min<size_t>(words, 1u << 18);
                         replacement.dwords.assign(words, 0x7FC0CDCDu);
                     } else {
-                        replacement.tex_rgba = poison_tex; replacement.tw = 2; replacement.th = 2;
+                        replacement.storage_image_numeric_class = d.image_numeric_class;
+                        replacement.storage_image_contract_valid =
+                            d.image_numeric_class ==
+                                prosper::gpu::SpirvImageNumericClass::Float ||
+                            d.image_numeric_class ==
+                                prosper::gpu::SpirvImageNumericClass::Uint;
+                        if (wants_storage_image &&
+                            d.image_numeric_class ==
+                                prosper::gpu::SpirvImageNumericClass::Uint) {
+                            replacement.tex_rgba = reinterpret_cast<const uint8_t*>(
+                                poison_storage_uint);
+                            replacement.texture_format = VK_FORMAT_R32G32B32A32_UINT;
+                        } else {
+                            replacement.tex_rgba = poison_tex;
+                        }
+                        replacement.tw = 2; replacement.th = 2;
                         replacement.is_storage_image = wants_storage_image;
                         replacement.mag_filter = replacement.min_filter = 0;
                     }

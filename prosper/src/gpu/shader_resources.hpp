@@ -416,6 +416,17 @@ enum class SpirvShaderStage : uint32_t {
     Unknown = 0xFFFFFFFFu,
 };
 
+// Scalar numeric class carried by an OpTypeImage's Sampled Type. Vulkan requires a storage-image
+// view's numeric class to agree with this type even when the SPIR-V Image Format is Unknown. Keep
+// Unknown explicit: guessing float from a normalized guest format is exactly the undefined binding
+// that #1713 exposed.
+enum class SpirvImageNumericClass : uint32_t {
+    Unknown = 0,
+    Float,
+    Uint,
+    Sint,
+};
+
 // Semantic carried by the strict two-byte -> one-dword storage-buffer materialization contract.
 // It is explicit because Uint16 and Float16 share the same physical bytes but produce different
 // guest VGPR values; a cached module or replay marker must never infer one from the other.
@@ -473,6 +484,10 @@ struct SpirvDescriptorBinding {
     // The descriptor is reached by an OpAtomic*. Compute uses this to recognize the deliberately
     // buffer-backed view of an exact R32_UINT StorageImage (the RADV image-atomic workaround).
     bool atomic_access = false;
+    // Exact Sampled Type numeric class. `sampled_float` / `storage_float` remain as convenient,
+    // backwards-compatible predicates; this field prevents a signed/unsigned integer image from
+    // collapsing into the same false boolean at the Vulkan binding boundary.
+    SpirvImageNumericClass image_numeric_class = SpirvImageNumericClass::Unknown;
     // A generated module may prove that every access to this storage-buffer binding is an exact
     // one-record scalar Uint16/Float16 format-load contract. Vulkan storage buffers are arrays of u32 in our
     // portable ABI, so that two-byte guest record is materialized as one zero-padded dword. These
