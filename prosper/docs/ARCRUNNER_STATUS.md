@@ -35,6 +35,23 @@ and prints **no** worker-fault report, while empty `PROSPER_GUEST_ARGS`, or `gdb
 passed through, reports the same fault completely. Use the empty-argument route when fault evidence
 is required.
 
+Static import attribution now identifies what the sibling `eboot+0x117811f` path was trying to do.
+The guest walks the object references retained by each submitted command-allocation page, reads a
+side-command descriptor from `item+0x98`, opens a `sceAgcDcbSetPredication` window, and then passes
+the descriptor's `{target, dword count}` to `sceAgcDcbJump` before marking that jump predicated. The
+fault is the guest's first dereference of that descriptor, **before** Prosper receives the Jump:
+
+```text
+1178064: mov r14, [rax+0x98]   ; retained item -> side-command descriptor
+117811a: call SetPredication   ; begin
+117811f: mov rcx, [r14]        ; fault: r14 == 0
+1178122: mov r8d, [r14+8]
+117812d: call DcbJump          ; target=[r14], num_dw=[r14+8]
+```
+
+This excludes a silent null-Jump fallback as a legitimate fix. It does not yet say whether the
+retained item is stale/corrupted or structurally valid with only its side segment absent.
+
 No screenshot belongs in the compatibility record yet. The latest content-selective capture
 retained exactly two non-alpha-only frames: frame 12 was a uniform solid-yellow clear and frame 50
 was a uniform solid-white clear. Full inspection found no geometry, text, or game imagery in either.
@@ -115,7 +132,9 @@ Do not re-derive these without contradictory new evidence.
 ## Next discriminators
 
 1. Attribute the `eboot+0x117811f` sibling null-object fault without using the combined suppression
-   arm as a title fix; first prove whether the failure exists on an ordinary unsuppressed run.
+   arm as a title fix. First prove whether the failure exists on current master in an ordinary
+   unsuppressed run, then use the existing generic fault-memory peek to recover the original retained
+   item saved at `rbp-0xa8` and its allocation-page metadata at `rbp-0x70`.
 2. Isolate the init and REL1 fence interventions only with arms whose independent lever witnesses and
    terminal populations are complete. Do not infer authorship from a moved terminal fault alone.
 3. Revisit the per-queue barrier model and intro-movie path from #1226 only after checking their
