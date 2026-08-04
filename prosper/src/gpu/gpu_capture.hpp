@@ -217,6 +217,9 @@ struct GpuCapturedOperation {
 
 // Ordered address-backed DMA_DATA. Guest addresses preserve the semantic identity; blob references
 // bind the source and destination to their exact pre-submit backing versions for standalone replay.
+// For a selector-1 GDS destination, destination_blob_index instead names the complete shared 64 KiB
+// pre-submit GDS snapshot and destination_blob_offset is the GDS byte offset. Metadata-only captures
+// leave both endpoint indices unavailable, as they do for every other resource payload.
 struct GpuCapturedDmaCopy {
     uint64_t dst = 0, src = 0;
     uint32_t bytes = 0, sels = 0;
@@ -356,7 +359,9 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                           std::string& error, const CaptureRttSeedReader& rtt_reader = {},
                           const std::vector<OperationRealizationFailure>& failures = {},
                           const std::vector<GpuState::DmaCopy>& dma_copies = {},
-                          uint64_t resource_limit_bytes = 0);
+                          uint64_t resource_limit_bytes = 0,
+                          const uint8_t* pre_submit_compute_gds = nullptr,
+                          size_t pre_submit_compute_gds_bytes = 0);
 bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              uint32_t width, uint32_t height,
                              const GpuCaptureMetadata& metadata,

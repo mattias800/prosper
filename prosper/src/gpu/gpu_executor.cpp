@@ -5394,14 +5394,29 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
     return execute_ordered_items_impl(
         operations, draws, computes, dma_copies, render, compute, width, height,
         [](const ReplayDmaCopy& copy) {
-            const bool source_gds = ((copy.sels >> 8u) & 0xffu) == 1u;
-            const bool destination_gds = (copy.sels & 0xffu) == 1u;
+            const uint32_t source_selector = (copy.sels >> 8u) & 0xffu;
+            const uint32_t destination_selector = copy.sels & 0xffu;
+            const bool source_gds = source_selector == 1u;
+            const bool destination_gds = destination_selector == 1u;
             if (source_gds) {
                 static std::atomic<int> warned{0};
                 if (warned.fetch_add(1) < 24)
                     std::fprintf(stderr,
                                  "[gpu_replay] DMA_DATA GDS source is unsupported: "
                                  "src=0x%llx dst=0x%llx bytes=%u sels=0x%x\n",
+                                 static_cast<unsigned long long>(copy.src),
+                                 static_cast<unsigned long long>(copy.dst), copy.bytes,
+                                 copy.sels);
+                return;
+            }
+            const bool address_source = (copy.sels & kDmaDataAddressSource) != 0 ||
+                                        copy.src > UINT32_MAX;
+            if (destination_gds && (source_selector != 3u || !address_source)) {
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 24)
+                    std::fprintf(stderr,
+                                 "[gpu_replay] DMA_DATA memory-to-GDS selector form is "
+                                 "unsupported: src=0x%llx dst=0x%llx bytes=%u sels=0x%x\n",
                                  static_cast<unsigned long long>(copy.src),
                                  static_cast<unsigned long long>(copy.dst), copy.bytes,
                                  copy.sels);

@@ -740,7 +740,7 @@ The post-#1927 retained address DMA is now exact. In the retained run it repeate
 bit. Older raw timeline records independently establish selector 1 as the GDS offset domain. The
 packet therefore copies mapped guest memory into `GDS+0x24`; it does not write guest VA `0x24`.
 
-Candidate `37eb14e7`, based on exact master `130ad451`, implements only that generic observed form.
+PR #1931 implements only that generic observed form.
 The source must be mapped/readable or supplied as an authoritative renderer-owned snapshot; the GDS
 offset and byte count must be dword-aligned and the complete span must fit in the 64 KiB share.
 Unknown selector directions and GDS-to-memory remain fail-closed. The copy stays in the retained
@@ -755,6 +755,15 @@ three retained producers execute in command order. Separate negative checks cove
 sources, out-of-range GDS spans, misaligned offsets, non-dword byte counts, the wrong source selector,
 and the unsupported reverse direction. Five isolated mutations independently make the guest-address
 overlap, execution/data, selector, authority, and paused-stream ordering checks fail.
+
+PR #1931 also makes offline capture truthful for this operation. A full capture stores the complete
+64 KiB pre-submit GDS image even when the submit has no compute table; replay materializes that image
+as the one shared GDS instance used by both the DMA and later compute consumers. Metadata-only
+captures instead keep both endpoint backings explicitly unavailable. Capture validation and replay
+execution independently enforce the observed `dstSel=1`, `srcSel=3`, address-source form, while
+selector 2, GDS-to-memory, and forms without address-source semantics fail visibly. Defect-shaped
+capture and executor mutations each make only their corresponding named regression fail while the
+valid DMA-only and shared-instance controls remain green.
 
 The one authorized live acceptance used the normal full-scale/every-submit `prosper-app` path with
 real renderer, compute, FFmpeg/VA-API, SDL audio and SDL input backends, no pad route, a 540-present

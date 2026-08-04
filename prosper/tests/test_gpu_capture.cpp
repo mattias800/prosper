@@ -2014,10 +2014,13 @@ int main(int argc, char** argv) {
     GpuCaptureFile gds_capture;
     CHECK(capture_submit_items({}, {gds_consumer}, gds_operations, meta, ordered_reader,
                                gds_capture, error, {}, {}, {gds_copy}) &&
-              gds_capture.dma_copies.size() == 1 && gds_capture.blobs.size() == 1 &&
-              gds_capture.dma_copies[0].destination_blob_index == 0xFFFFFFFFu &&
-              gds_capture.dma_copies[0].destination_blob_offset == 0,
-          "memory-to-GDS capture stores only the guest source blob");
+              gds_capture.dma_copies.size() == 1 && gds_capture.blobs.size() == 2 &&
+              gds_capture.dma_copies[0].destination_blob_index <
+                  gds_capture.blobs.size() &&
+              gds_capture.dma_copies[0].destination_blob_offset == gds_copy.dst &&
+              gds_capture.blobs[gds_capture.dma_copies[0].destination_blob_index].bytes ==
+                  initial_gds,
+          "memory-to-GDS capture retains the complete pre-submit GDS independently");
     std::vector<uint8_t> gds_capture_bytes;
     GpuCaptureFile gds_loaded;
     GpuReplayFrame gds_replay;
@@ -2055,12 +2058,108 @@ int main(int argc, char** argv) {
     CHECK(invalidations.empty(),
           "replay never publishes a GDS offset as a guest GPU write");
 
+    // A valid submit may contain the retained DMA and no compute table at all. Its standalone
+    // backing must therefore come from the pre-submit GDS snapshot, not from a coincidental
+    // same-submit consumer descriptor.
+    const std::vector<SubmitOperation> gds_dma_only_operations = {
+        {SubmitOperationKind::DmaCopy, 0, 20},
+    };
+    GpuCaptureFile gds_dma_only_capture;
+    CHECK(capture_submit_items({}, {}, gds_dma_only_operations, meta, ordered_reader,
+                               gds_dma_only_capture, error, {}, {}, {gds_copy}, 0,
+                               initial_gds.data(), initial_gds.size()) &&
+              gds_dma_only_capture.computes.empty() &&
+              gds_dma_only_capture.dma_copies.size() == 1 &&
+              gds_dma_only_capture.dma_copies[0].destination_blob_index <
+                  gds_dma_only_capture.blobs.size(),
+          "full-data memory-to-GDS capture owns a snapshot without a compute table");
+    std::vector<uint8_t> gds_dma_only_bytes;
+    GpuCaptureFile gds_dma_only_loaded;
+    GpuReplayFrame gds_dma_only_replay;
+    const bool gds_dma_only_materialized =
+        serialize_gpu_capture(gds_dma_only_capture, gds_dma_only_bytes, error) &&
+        deserialize_gpu_capture(gds_dma_only_bytes, gds_dma_only_loaded, error) &&
+        materialize_gpu_replay(gds_dma_only_loaded, gds_dma_only_replay, error);
+    const bool gds_dma_only_backed = gds_dma_only_materialized &&
+              gds_dma_only_replay.computes.empty() &&
+              gds_dma_only_replay.dma_copies.size() == 1 &&
+              gds_dma_only_replay.dma_copies[0].destination_data &&
+              gds_dma_only_replay.dma_copies[0].source_data &&
+              gds_dma_only_replay.dma_copies[0].destination_data[0] == 0x19;
+    CHECK(gds_dma_only_backed,
+          "DMA-only GDS state serializes and materializes with its exact pre-submit byte");
+    std::vector<SubmitOperation> gds_dma_only_replay_operations;
+    for (const auto& operation : gds_dma_only_replay.operations)
+        if (operation.realized)
+            gds_dma_only_replay_operations.push_back(
+                {operation.kind, static_cast<size_t>(operation.source_index),
+                 operation.command_order});
+    if (gds_dma_only_backed)
+        execute_ordered_items(gds_dma_only_replay_operations, {}, {},
+                              gds_dma_only_replay.dma_copies, {}, {}, 1, 1);
+    CHECK(gds_dma_only_backed &&
+              gds_dma_only_replay.dma_copies[0].destination_data[0] == 0xa1,
+          "DMA-only replay executes against its independently captured GDS backing");
+
+    // Thin captures retain truthful operation/selector metadata while making both omitted payloads
+    // explicitly unavailable. This is the contract used by inspect/validate/graph.
+    set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1");
+    GpuCaptureFile gds_metadata_capture;
+    const bool gds_metadata_captured = capture_submit_items(
+        {}, {}, gds_dma_only_operations, meta, ordered_reader, gds_metadata_capture, error,
+        {}, {}, {gds_copy}, 0, initial_gds.data(), initial_gds.size());
+    set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", nullptr);
+    std::vector<uint8_t> gds_metadata_bytes;
+    GpuCaptureFile gds_metadata_loaded;
+    GpuReplayFrame gds_metadata_replay;
+    CHECK(gds_metadata_captured && gds_metadata_capture.blobs.empty() &&
+              gds_metadata_capture.dma_copies.size() == 1 &&
+              gds_metadata_capture.dma_copies[0].source_blob_index == 0xFFFFFFFFu &&
+              gds_metadata_capture.dma_copies[0].destination_blob_index == 0xFFFFFFFFu &&
+              serialize_gpu_capture(gds_metadata_capture, gds_metadata_bytes, error) &&
+              deserialize_gpu_capture(gds_metadata_bytes, gds_metadata_loaded, error) &&
+              materialize_gpu_replay(gds_metadata_loaded, gds_metadata_replay, error) &&
+              gds_metadata_replay.dma_copies.size() == 1 &&
+              !gds_metadata_replay.dma_copies[0].source_data &&
+              !gds_metadata_replay.dma_copies[0].destination_data,
+          "metadata-only memory-to-GDS capture materializes with unavailable backings explicit");
+
     GpuCaptureFile unsupported_gds_source = gds_capture;
     unsupported_gds_source.dma_copies[0].sels = 3u | (1u << 8) |
         kDmaDataAddressSource;
     CHECK(!serialize_gpu_capture(unsupported_gds_source, gds_capture_bytes, error) &&
-              error == "invalid ordered DMA record",
+              error == "unsupported ordered DMA GDS source selector",
           "capture rejects the unsupported GDS-to-memory direction fail-visibly");
+
+    GpuCaptureFile unsupported_gds_memory_selector = gds_capture;
+    unsupported_gds_memory_selector.dma_copies[0].sels =
+        1u | (2u << 8) | kDmaDataAddressSource;
+    CHECK(!serialize_gpu_capture(unsupported_gds_memory_selector, gds_capture_bytes, error) &&
+              error == "unsupported ordered DMA memory-to-GDS selector form",
+          "serialized memory-to-GDS capture rejects source selector 2 fail-visibly");
+
+    GpuCaptureFile unsupported_gds_source_kind = gds_capture;
+    unsupported_gds_source_kind.dma_copies[0].sels = 1u | (3u << 8);
+    unsupported_gds_source_kind.dma_copies[0].src = 0x5010;
+    CHECK(!serialize_gpu_capture(unsupported_gds_source_kind, gds_capture_bytes, error) &&
+              error == "unsupported ordered DMA memory-to-GDS selector form",
+          "serialized memory-to-GDS capture requires address-source semantics");
+
+    std::array<uint8_t, 4> rejected_gds_destination = {0x55, 0x66, 0x77, 0x88};
+    const std::array<uint8_t, 4> rejected_gds_source = {0xaa, 0xbb, 0xcc, 0xdd};
+    ReplayDmaCopy rejected_gds_replay;
+    rejected_gds_replay.dst = 0x24;
+    rejected_gds_replay.src = 0x5010;
+    rejected_gds_replay.bytes = 4;
+    rejected_gds_replay.sels = 1u | (2u << 8) | kDmaDataAddressSource;
+    rejected_gds_replay.command_order = 20;
+    rejected_gds_replay.destination_data = rejected_gds_destination.data();
+    rejected_gds_replay.destination_size = rejected_gds_destination.size();
+    rejected_gds_replay.source_data = rejected_gds_source.data();
+    rejected_gds_replay.source_size = rejected_gds_source.size();
+    execute_ordered_items(gds_dma_only_operations, {}, {}, {rejected_gds_replay}, {}, {}, 1, 1);
+    CHECK((rejected_gds_destination == std::array<uint8_t, 4>{0x55, 0x66, 0x77, 0x88}),
+          "replay executor refuses a retained GDS copy with source selector 2");
 
     GpuState failed_state;
     set_pgm(failed_state, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, kDiagnosticVs);

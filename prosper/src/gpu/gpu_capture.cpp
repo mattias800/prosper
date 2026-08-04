@@ -650,11 +650,39 @@ bool is_compute_internal_gds(const ShaderResource& r) {
 }
 
 constexpr uint32_t kCaptureDmaSelGds = 1u;
+constexpr uint32_t kCaptureDmaSelMemory = 3u;
 bool captured_dma_destination_is_gds(uint32_t sels) {
     return (sels & 0xffu) == kCaptureDmaSelGds;
 }
 bool captured_dma_source_is_gds(uint32_t sels) {
     return ((sels >> 8u) & 0xffu) == kCaptureDmaSelGds;
+}
+bool captured_dma_memory_to_gds_is_supported(const GpuCapturedDmaCopy& copy) {
+    const uint32_t source_selector = (copy.sels >> 8u) & 0xffu;
+    const bool address_source = (copy.sels & kDmaDataAddressSource) != 0 ||
+                                copy.src > UINT32_MAX;
+    return captured_dma_destination_is_gds(copy.sels) &&
+           source_selector == kCaptureDmaSelMemory && address_source;
+}
+bool capture_is_metadata_only(const GpuCaptureFile& capture) {
+    return std::any_of(capture.metadata.renderer_env.begin(),
+                       capture.metadata.renderer_env.end(), [](const auto& entry) {
+        return entry.first == "PROSPER_GPU_CAPTURE_METADATA_ONLY" &&
+               !entry.second.empty() && entry.second != "0" && entry.second != "off";
+    });
+}
+bool capture_has_internal_gds_descriptor(const GpuCaptureFile& capture) {
+    auto table_has_gds = [](const GpuCapturedTable& table) {
+        return std::any_of(table.resources.begin(), table.resources.end(),
+                           [](const GpuCapturedResource& resource) {
+            return is_compute_internal_gds(resource.resource);
+        });
+    };
+    for (const auto& draw : capture.draws)
+        if (table_has_gds(draw.vrt) || table_has_gds(draw.prt)) return true;
+    for (const auto& compute : capture.computes)
+        if (table_has_gds(compute.resources)) return true;
+    return false;
 }
 
 bool collect_intervals(const std::vector<DrawItem>& draws,
@@ -959,13 +987,40 @@ bool validate_dma_copies(const GpuCaptureFile& capture, std::string& error) {
     for (const auto& copy : capture.dma_copies) {
         const bool destination_gds = captured_dma_destination_is_gds(copy.sels);
         const bool source_gds = captured_dma_source_is_gds(copy.sels);
+        if (source_gds) {
+            error = "unsupported ordered DMA GDS source selector";
+            return false;
+        }
+        if (destination_gds && !captured_dma_memory_to_gds_is_supported(copy)) {
+            error = "unsupported ordered DMA memory-to-GDS selector form";
+            return false;
+        }
         const bool gds_destination_valid = !destination_gds ||
-            (copy.dst < 64u * 1024u && copy.bytes <= 64u * 1024u - copy.dst &&
+            (captured_dma_memory_to_gds_is_supported(copy) &&
+             copy.dst < 64u * 1024u && copy.bytes <= 64u * 1024u - copy.dst &&
              !(copy.dst & 3u) && !(copy.bytes & 3u) &&
-             copy.destination_blob_index == 0xFFFFFFFFu &&
-             copy.destination_blob_offset == 0);
+             ((copy.destination_blob_index == 0xFFFFFFFFu &&
+               copy.destination_blob_offset == 0 &&
+               (capture_is_metadata_only(capture) ||
+                capture_has_internal_gds_descriptor(capture))) ||
+              (copy.destination_blob_index != 0xFFFFFFFFu &&
+               copy.destination_blob_offset == copy.dst)));
+        if (destination_gds && copy.destination_blob_index != 0xFFFFFFFFu) {
+            if (copy.destination_blob_index >= capture.blobs.size()) {
+                error = "ordered DMA GDS destination references an invalid capture blob";
+                return false;
+            }
+            const auto& blob = capture.blobs[copy.destination_blob_index];
+            if (blob.guest_addr != 0 ||
+                (!capture_blob_payload_omitted(blob) &&
+                 (blob.bytes.size() != 64u * 1024u ||
+                  blob.bytes_read != blob.bytes.size()))) {
+                error = "ordered DMA GDS destination has an invalid pre-submit snapshot";
+                return false;
+            }
+        }
         if ((!destination_gds && !copy.dst) || !copy.src || !copy.bytes ||
-            copy.bytes > kMaxBlobBytes || source_gds || !gds_destination_valid ||
+            copy.bytes > kMaxBlobBytes || !gds_destination_valid ||
             (!destination_gds &&
              copy.dst > std::numeric_limits<uint64_t>::max() - copy.bytes) ||
             copy.src > std::numeric_limits<uint64_t>::max() - copy.bytes ||
@@ -1540,7 +1595,9 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                           std::string& error, const CaptureRttSeedReader& rtt_reader,
                           const std::vector<OperationRealizationFailure>& failures,
                           const std::vector<GpuState::DmaCopy>& dma_copies,
-                          uint64_t resource_limit_bytes_override) {
+                          uint64_t resource_limit_bytes_override,
+                          const uint8_t* pre_submit_compute_gds,
+                          size_t pre_submit_compute_gds_bytes) {
     error.clear(); out = {}; out.format_version = kVersion; out.metadata = metadata;
     out.failure_diagnostics_available = true;
     if (draws.size() > kMaxDraws || computes.size() > kMaxComputes ||
@@ -1627,6 +1684,55 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                            c.resources, error)) return false;
         out.computes.push_back(std::move(c));
     }
+    uint32_t gds_snapshot_blob_index = 0xFFFFFFFFu;
+    if (include_resource_data && std::any_of(
+            dma_copies.begin(), dma_copies.end(), [](const GpuState::DmaCopy& copy) {
+                return captured_dma_destination_is_gds(copy.sels);
+            })) {
+        const uint8_t* snapshot = pre_submit_compute_gds_bytes
+            ? pre_submit_compute_gds : nullptr;
+        size_t snapshot_bytes = pre_submit_compute_gds_bytes;
+        auto find_internal_snapshot = [&](const GpuCapturedTable& table) {
+            if (snapshot) return;
+            for (const auto& resource : table.resources) {
+                if (!is_compute_internal_gds(resource.resource) ||
+                    resource.internal_bytes.empty())
+                    continue;
+                snapshot = resource.internal_bytes.data();
+                snapshot_bytes = resource.internal_bytes.size();
+                return;
+            }
+        };
+        for (const auto& draw : out.draws) {
+            find_internal_snapshot(draw.vrt);
+            find_internal_snapshot(draw.prt);
+        }
+        for (const auto& compute : out.computes)
+            find_internal_snapshot(compute.resources);
+        if (!snapshot || snapshot_bytes != 64u * 1024u) {
+            error = "memory-to-GDS capture has no complete pre-submit GDS snapshot";
+            return false;
+        }
+        for (const auto& compute : out.computes) {
+            for (const auto& resource : compute.resources.resources) {
+                if (is_compute_internal_gds(resource.resource) &&
+                    !resource.internal_bytes.empty() &&
+                    (resource.internal_bytes.size() != snapshot_bytes ||
+                     std::memcmp(resource.internal_bytes.data(), snapshot,
+                                 snapshot_bytes) != 0)) {
+                    error = "compute GDS resources disagree with the pre-submit snapshot";
+                    return false;
+                }
+            }
+        }
+        GpuCaptureBlob blob;
+        blob.guest_addr = 0;
+        blob.bytes_read = snapshot_bytes;
+        blob.bytes.assign(snapshot, snapshot + snapshot_bytes);
+        blob.content_hash = gpu_capture_hash(blob.bytes);
+        gds_snapshot_blob_index = static_cast<uint32_t>(out.blobs.size());
+        out.blobs.push_back(std::move(blob));
+    }
     out.dma_copies.reserve(dma_copies.size());
     for (const auto& copy : dma_copies) {
         GpuCapturedDmaCopy captured;
@@ -1634,6 +1740,10 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         captured.sels = copy.sels; captured.command_order = copy.command_order;
         captured.packet_addr = copy.packet_addr;
         const bool destination_gds = captured_dma_destination_is_gds(copy.sels);
+        if (include_resource_data && destination_gds) {
+            captured.destination_blob_index = gds_snapshot_blob_index;
+            captured.destination_blob_offset = copy.dst;
+        }
         if (include_resource_data &&
             ((!destination_gds && !assign_blob_range(intervals, copy.dst, copy.bytes,
                                 captured.destination_blob_index,
@@ -1756,7 +1866,8 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
     CaptureMemoryReader ordered_reader = ordered_gpustate_capture_reader(state);
     return capture_submit_items(draws, computes, ops, actual, ordered_reader, out, error,
                                 g_rtt_seed_reader, failures, state.dma_copies,
-                                resource_limit_bytes);
+                                resource_limit_bytes, compute_gds_backing(),
+                                compute_gds_size());
 }
 
 bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
@@ -1783,7 +1894,8 @@ bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
     actual.width = width; actual.height = height; actual.submit_index = submit_no;
     return capture_submit_items(draws, {}, operations, actual,
                                 ordered_gpustate_capture_reader(state),
-                                out, error, g_rtt_seed_reader, {}, state.dma_copies);
+                                out, error, g_rtt_seed_reader, {}, state.dma_copies, 0,
+                                compute_gds_backing(), compute_gds_size());
 }
 
 bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes, std::string& error) {
@@ -3826,19 +3938,38 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         copy.packet_addr = captured.packet_addr;
         uint8_t* source = nullptr;
         if (captured_dma_destination_is_gds(captured.sels)) {
-            const auto internal = internal_instance_by_binding.find(kComputeInternalGdsBinding);
-            if (internal == internal_instance_by_binding.end()) {
-                error = "ordered DMA GDS destination has no captured internal GDS instance";
-                return false;
+            auto internal = internal_instance_by_binding.find(kComputeInternalGdsBinding);
+            if (captured.destination_blob_index != 0xFFFFFFFFu) {
+                if (captured.destination_blob_index >= out.blobs.size()) {
+                    error = "ordered DMA GDS destination references an invalid capture blob";
+                    return false;
+                }
+                const auto& blob = out.blobs[captured.destination_blob_index];
+                if (blob.bytes.size() != 64u * 1024u) {
+                    error = "ordered DMA GDS destination snapshot is unavailable";
+                    return false;
+                }
+                if (internal == internal_instance_by_binding.end()) {
+                    const size_t index = out.resource_instances.size();
+                    out.resource_instances.push_back({0, captured.destination_blob_index,
+                                                      blob.bytes});
+                    internal = internal_instance_by_binding.emplace(
+                        kComputeInternalGdsBinding, index).first;
+                } else if (out.resource_instances[internal->second].bytes != blob.bytes) {
+                    error = "compute GDS resources disagree with DMA pre-submit state";
+                    return false;
+                }
             }
-            auto& instance = out.resource_instances[internal->second].bytes;
-            if (captured.dst >= instance.size() ||
-                captured.bytes > instance.size() - captured.dst) {
-                error = "ordered DMA GDS destination exceeds captured internal GDS";
-                return false;
+            if (internal != internal_instance_by_binding.end()) {
+                auto& instance = out.resource_instances[internal->second].bytes;
+                if (captured.dst >= instance.size() ||
+                    captured.bytes > instance.size() - captured.dst) {
+                    error = "ordered DMA GDS destination exceeds captured internal GDS";
+                    return false;
+                }
+                copy.destination_data = instance.data() + captured.dst;
+                copy.destination_size = instance.size() - captured.dst;
             }
-            copy.destination_data = instance.data() + captured.dst;
-            copy.destination_size = instance.size() - captured.dst;
         } else if (!bind_range(
                        captured.destination_blob_index, captured.destination_blob_offset,
                        captured.dst, captured.bytes, copy.destination_data,
@@ -4537,7 +4668,8 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
     const bool captured = capture_submit_items(
         draws, snapshot_computes, exact_operations, metadata, reader, pending.capture, error,
         g_rtt_seed_reader, failures,
-        semantic_state ? semantic_state->dma_copies : std::vector<GpuState::DmaCopy>{});
+        semantic_state ? semantic_state->dma_copies : std::vector<GpuState::DmaCopy>{}, 0,
+        pending.pre_submit_compute_gds.data(), pending.pre_submit_compute_gds.size());
     if (!captured) return false;
     pending.materialized = true;
     return !gpu_capture_ds_seed_snapshot_available() ||
