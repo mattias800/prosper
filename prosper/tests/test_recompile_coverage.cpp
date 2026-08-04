@@ -845,6 +845,53 @@ int main() {
     CHECK(f.unsupported == 0 && f.table_dependent >= 1 && f.first_bad_fmt < 0,
           "#325: a 2D_ARRAY image_sample is recompilable-in-context (base slice), not unsupported");
 
+    // House of the Dead 2's exact IMAGE_GET_LOD packet needs both a fragment execution model and its
+    // captured T#/S# pair. The table-less coverage pass must classify it as context-dependent rather
+    // than keep reporting opcode 0x60 as unsupported after the production fragment lowering accepts it.
+    const uint32_t get_lod_2d[] = { 0xf1800108u, 0x01480809u, 0xbf810000u };
+    const RecompileCoverage get_lod = recompile_coverage(
+        get_lod_2d, std::size(get_lod_2d));
+    CHECK(get_lod.total == 1 && get_lod.table_dependent == 1 &&
+              get_lod.unsupported == 0 && get_lod.first_bad_fmt < 0,
+          "2D IMAGE_GET_LOD reports recompilable-in-context, not unsupported");
+
+    struct UnsupportedGetLod {
+        const char* name;
+        std::vector<uint32_t> instruction;
+    };
+    const std::vector<UnsupportedGetLod> unsupported_get_lod = {
+        // NSA/A16/DLC/GLC/SLC/R128/TFE/LWE are exact llvm-mc gfx1030 encodings. UNRM comes directly
+        // from Table 100 because LLVM exposes no IMAGE_GET_LOD spelling for it; D16 is rejected for
+        // this opcode. Their raw fields and the reserved holes must not alias the ordinary contract.
+        {"NSA",      {0xf180010au, 0x01480809u, 0x0000000au}},
+        {"UNRM",     {0xf1801108u, 0x01480809u}},
+        {"A16",      {0xf1800108u, 0x41480809u}},
+        {"DLC",      {0xf1800188u, 0x01480809u}},
+        {"GLC",      {0xf1802108u, 0x01480809u}},
+        {"SLC",      {0xf3800108u, 0x01480809u}},
+        {"R128",     {0xf1808108u, 0x01480809u}},
+        {"TFE",      {0xf1810108u, 0x01480809u}},
+        {"LWE",      {0xf1820108u, 0x01480809u}},
+        {"D16-raw",  {0xf1800108u, 0x81480809u}},
+        {"reserved-w0-b6",  {0xf1800148u, 0x01480809u}},
+        {"reserved-w0-b14", {0xf1804108u, 0x01480809u}},
+        {"reserved-w1-b26", {0xf1800108u, 0x05480809u}},
+        {"reserved-w1-b27", {0xf1800108u, 0x09480809u}},
+        {"reserved-w1-b28", {0xf1800108u, 0x11480809u}},
+        {"reserved-w1-b29", {0xf1800108u, 0x21480809u}},
+    };
+    for (const auto& form : unsupported_get_lod) {
+        std::vector<uint32_t> code = form.instruction;
+        code.push_back(0xbf810000u);
+        const RecompileCoverage classified = recompile_coverage(code.data(), code.size());
+        char message[160];
+        std::snprintf(message, sizeof(message),
+                      "IMAGE_GET_LOD %s remains unsupported in table-less coverage", form.name);
+        CHECK(classified.total == 1 && classified.table_dependent == 0 &&
+                  classified.unsupported == 1,
+              message);
+    }
+
     // Asterix's resolve PS mixes the ordinary and exact one-extra-word NSA 2D_MSAA IMAGE_LOAD
     // encodings. Coverage is table-less, but it can still distinguish the address shapes the real
     // resource-aware emitter accepts from superficially similar, deliberately unsupported packets.

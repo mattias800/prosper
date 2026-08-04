@@ -89,6 +89,84 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+// Trace IMAGE_GET_LOD all the way from two known VGPR bit patterns to the fragment output. This is
+// deliberately a dataflow check rather than an opcode-presence check: it proves coordinate
+// provenance, AMD/SPIR-V x/y component order, compact dmask-to-VDATA placement, and the EXEC select
+// that preserves an inactive lane's old VGPR value.
+bool image_query_lod_contract(const std::vector<uint32_t>& spv,
+                              uint32_t expected_u_bits, uint32_t expected_v_bits,
+                              const std::array<int, 4>& expected_export_components) {
+    constexpr uint32_t OpConstant = 43, OpVariable = 59, OpStore = 62,
+                       OpCompositeConstruct = 80, OpCompositeExtract = 81,
+                       OpBitcast = 124, OpSelect = 169, OpImageQueryLod = 105;
+    constexpr uint32_t StorageClassOutput = 3;
+    struct SelectOperands { uint32_t condition = 0, true_value = 0, false_value = 0; };
+    struct Extract { uint32_t composite = 0, component = 0; };
+    std::unordered_map<uint32_t, uint32_t> constants;
+    std::unordered_map<uint32_t, uint32_t> bitcast_sources;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> composites;
+    std::unordered_map<uint32_t, Extract> extracts;
+    std::unordered_map<uint32_t, SelectOperands> selects;
+    std::unordered_set<uint32_t> outputs;
+    uint32_t query_result = 0, query_coordinate = 0, stored_output = 0;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4) constants[spv[i + 2]] = spv[i + 3];
+        if (op == OpVariable && wc >= 4 && spv[i + 3] == StorageClassOutput)
+            outputs.insert(spv[i + 2]);
+        if (op == OpBitcast && wc == 4) bitcast_sources[spv[i + 2]] = spv[i + 3];
+        if (op == OpCompositeConstruct && wc >= 4)
+            composites[spv[i + 2]] = std::vector<uint32_t>(spv.begin() + i + 3,
+                                                            spv.begin() + i + wc);
+        if (op == OpCompositeExtract && wc == 5)
+            extracts[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        if (op == OpSelect && wc == 6)
+            selects[spv[i + 2]] = {spv[i + 3], spv[i + 4], spv[i + 5]};
+        if (op == OpImageQueryLod && wc == 5) {
+            if (query_result) return false;
+            query_result = spv[i + 2];
+            query_coordinate = spv[i + 4];
+        }
+        if (op == OpStore && wc == 3 && outputs.contains(spv[i + 1])) {
+            if (stored_output) return false;
+            stored_output = spv[i + 2];
+        }
+        i += wc;
+    }
+    if (!query_result || !query_coordinate || !stored_output) return false;
+    const auto coordinate = composites.find(query_coordinate);
+    if (coordinate == composites.end() || coordinate->second.size() != 2u) return false;
+    const uint32_t expected_coordinate_bits[2] = {expected_u_bits, expected_v_bits};
+    for (uint32_t component = 0; component < 2; ++component) {
+        const auto coordinate_bitcast = bitcast_sources.find(coordinate->second[component]);
+        if (coordinate_bitcast == bitcast_sources.end()) return false;
+        const auto coordinate_constant = constants.find(coordinate_bitcast->second);
+        if (coordinate_constant == constants.end() ||
+            coordinate_constant->second != expected_coordinate_bits[component])
+            return false;
+    }
+    const auto output_vector = composites.find(stored_output);
+    if (output_vector == composites.end() || output_vector->second.size() != 4u) return false;
+    for (uint32_t output_component = 0; output_component < 4; ++output_component) {
+        const int expected_query_component = expected_export_components[output_component];
+        if (expected_query_component < 0) continue;
+        const auto output_bitcast = bitcast_sources.find(output_vector->second[output_component]);
+        if (output_bitcast == bitcast_sources.end()) return false;
+        const auto predicated_write = selects.find(output_bitcast->second);
+        if (predicated_write == selects.end() || !predicated_write->second.condition ||
+            predicated_write->second.true_value == predicated_write->second.false_value)
+            return false;
+        const auto query_bitcast = bitcast_sources.find(predicated_write->second.true_value);
+        if (query_bitcast == bitcast_sources.end()) return false;
+        const auto extract = extracts.find(query_bitcast->second);
+        if (extract == extracts.end() || extract->second.composite != query_result ||
+            extract->second.component != static_cast<uint32_t>(expected_query_component))
+            return false;
+    }
+    return true;
+}
+
 // Whether an instruction's zero-based operand has the requested literal value.
 bool has_instruction_operand(const std::vector<uint32_t>& spv, uint32_t opcode,
                              uint32_t operand_index, uint32_t value) {
@@ -2512,7 +2590,8 @@ int main() {
     // image_sample there must lower to OpImageSampleExplicitLod (LOD 0) or spirv-val rejects the
     // module and pipeline creation fails.
     enum : uint32_t { OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88,
-                      OpImageQuerySizeLod = 103, OpImageQueryLevels = 106 };
+                      OpImageQuerySizeLod = 103, OpImageQueryLod = 105,
+                      OpImageQueryLevels = 106 };
     ShaderResourceTable rt_tex;
     { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 1; /*2D*/
       t.width = 2; t.height = 2; t.sgpr_base = 8; rt_tex.resources.push_back(t); }
@@ -2554,6 +2633,105 @@ int main() {
         return 1;
     }
     printf("  [ok]   fragment image_sample still uses OpImageSampleImplicitLod\n");
+
+    // House of the Dead 2's Unity scene shaders use IMAGE_GET_LOD on ordinary 2D textures before
+    // their explicit-LOD samples. The exact instruction returns clamped/raw LOD in the selected
+    // VDATA channels. A constant replacement would hide the rejected opcode while choosing the
+    // wrong mip, so require the real derivative-consuming SPIR-V image query. SPIR-V permits that
+    // query only in a fragment stage; the same bytes must remain fail-visible in compute.
+    ShaderResourceTable rt_get_lod;
+    { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 1;
+      t.width = 1024; t.height = 1024; t.sgpr_base = 32; t.sampler_sgpr_base = 40;
+      rt_get_lod.resources.push_back(t); }
+    constexpr uint32_t lod_u_bits = 0x3e800000u; // 0.25, distinct provenance sentinels
+    constexpr uint32_t lod_v_bits = 0x3f400000u; // 0.75
+    auto compile_get_lod = [&](uint32_t dmask) {
+        const uint32_t export_mask = dmask == 3u ? 3u : 1u;
+        const std::array<uint32_t, 10> shader = {
+            0x7e1202ffu, lod_u_bits,           // v_mov_b32 v9, 0.25
+            0x7e1402ffu, lod_v_bits,           // v_mov_b32 v10, 0.75
+            0x7da40100u,                       // v_cmpx_eq_u32 v0,v0: force an EXEC-predicated write
+            0xf1800008u | (dmask << 8), 0x01480809u,
+            0xf8000000u | export_mask, 0x0b0a0908u, // export selected VDATA from v8[/v9]
+            0xbf810000u,
+        };
+        return recompile_fragment(shader.data(), shader.size(), &rt_get_lod);
+    };
+    const std::vector<uint32_t> get_lod_x_spv = compile_get_lod(1u);
+    const std::vector<uint32_t> get_lod_y_spv = compile_get_lod(2u);
+    const std::vector<uint32_t> get_lod_xy_spv = compile_get_lod(3u);
+    if (get_lod_x_spv.empty() ||
+        !image_query_lod_contract(get_lod_x_spv, lod_u_bits, lod_v_bits,
+                                  std::array<int, 4>{0, -1, -1, -1})) {
+        printf("  [FAIL] IMAGE_GET_LOD dmask:x lost coordinate, clamped-LOD, or predicated VDATA flow\n");
+        return 1;
+    }
+    if (get_lod_y_spv.empty() ||
+        !image_query_lod_contract(get_lod_y_spv, lod_u_bits, lod_v_bits,
+                                  std::array<int, 4>{1, -1, -1, -1})) {
+        printf("  [FAIL] IMAGE_GET_LOD dmask:y did not compact raw LOD into VDATA[0]\n");
+        return 1;
+    }
+    if (get_lod_xy_spv.empty() ||
+        !image_query_lod_contract(get_lod_xy_spv, lod_u_bits, lod_v_bits,
+                                  std::array<int, 4>{0, 1, -1, -1})) {
+        printf("  [FAIL] IMAGE_GET_LOD dmask:xy lost clamped/raw order in consecutive VDATA\n");
+        return 1;
+    }
+    printf("  [ok]   IMAGE_GET_LOD preserves uv, clamped/raw x/y, compact VDATA, and EXEC predication\n");
+
+    // Exact ordinary title packet. The compute negative is intentionally isolated from every MIMG
+    // control gate: mutating only `!b.is_fragment` makes this named check fail.
+    const uint32_t ps_get_lod[] = {
+        0xf1800108u, 0x01480809u,           // House pc-99: dmask:x, ordinary FP32 2D form
+        0xf8000001u, 0x0b0a0908u,
+        0xbf810000u,
+    };
+    const uint32_t cs_get_lod[] = {
+        ps_get_lod[0], ps_get_lod[1],
+        0xbf810000u,
+    };
+    if (!recompile_valu(cs_get_lod, std::size(cs_get_lod), 0, 0, &rt_get_lod).empty()) {
+        printf("  [FAIL] compute-shell IMAGE_GET_LOD bypassed the fragment-only derivative contract\n");
+        return 1;
+    }
+    printf("  [ok]   compute shell rejects only the fragment-stage IMAGE_GET_LOD contract\n");
+
+    // Every non-ordinary Table 100 control remains fail-visible in both production and the
+    // table-less classifier. NSA/A16/DLC/GLC/SLC/R128/TFE/LWE are exact llvm-mc gfx1030 encodings.
+    // UNRM comes directly from Table 100 because LLVM exposes no IMAGE_GET_LOD spelling for it;
+    // LLVM rejects D16 for IMAGE_GET_LOD. Their raw fields and every reserved hole still reject.
+    struct UnsupportedGetLod {
+        const char* name;
+        std::vector<uint32_t> instruction;
+    };
+    const std::vector<UnsupportedGetLod> unsupported_get_lod = {
+        {"NSA",      {0xf180010au, 0x01480809u, 0x0000000au}},
+        {"UNRM",     {0xf1801108u, 0x01480809u}},
+        {"A16",      {0xf1800108u, 0x41480809u}},
+        {"DLC",      {0xf1800188u, 0x01480809u}},
+        {"GLC",      {0xf1802108u, 0x01480809u}},
+        {"SLC",      {0xf3800108u, 0x01480809u}},
+        {"R128",     {0xf1808108u, 0x01480809u}},
+        {"TFE",      {0xf1810108u, 0x01480809u}},
+        {"LWE",      {0xf1820108u, 0x01480809u}},
+        {"D16-raw",  {0xf1800108u, 0x81480809u}},
+        {"reserved-w0-b6",  {0xf1800148u, 0x01480809u}},
+        {"reserved-w0-b14", {0xf1804108u, 0x01480809u}},
+        {"reserved-w1-b26", {0xf1800108u, 0x05480809u}},
+        {"reserved-w1-b27", {0xf1800108u, 0x09480809u}},
+        {"reserved-w1-b28", {0xf1800108u, 0x11480809u}},
+        {"reserved-w1-b29", {0xf1800108u, 0x21480809u}},
+    };
+    for (const auto& form : unsupported_get_lod) {
+        std::vector<uint32_t> fragment = form.instruction;
+        fragment.insert(fragment.end(), {0xf8000001u, 0x0b0a0908u, 0xbf810000u});
+        if (!recompile_fragment(fragment.data(), fragment.size(), &rt_get_lod).empty()) {
+            printf("  [FAIL] IMAGE_GET_LOD %s control was accepted by production\n", form.name);
+            return 1;
+        }
+    }
+    printf("  [ok]   all unsupported IMAGE_GET_LOD controls reject in production\n");
 
     // UE4/DOLL volume initialization starts by querying a 3D T# with image_get_resinfo, then uses the
     // xyz result for its dispatch bounds. This was the sole rejected opcode in that captured kernel.
