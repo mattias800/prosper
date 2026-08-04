@@ -46,9 +46,9 @@ Last updated: 2026-08-04
 | *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 First playable scene | [#1811](https://github.com/mattias800/prosper/issues/1811) |
 | *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Title, EULA, menu, and options | [#1889](https://github.com/mattias800/prosper/issues/1889) |
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and title screen | [#1809](https://github.com/mattias800/prosper/issues/1809) |
-| *The Forgotten City* | `PPSA03026` | — | 🔬 Initial compatibility run pending | [#1890](https://github.com/mattias800/prosper/issues/1890) |
+| *The Forgotten City* | `PPSA03026` | Unreal Engine | 🚧 Title screen | [#1890](https://github.com/mattias800/prosper/issues/1890) |
 | *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
-| *Little Nightmares III* | `PPSA05143` | — | 🔬 Initial compatibility run pending | [#1893](https://github.com/mattias800/prosper/issues/1893) |
+| *Little Nightmares III* | `PPSA05143` | — | 🔬 Graphics setup; startup fault before title | [#1893](https://github.com/mattias800/prosper/issues/1893) |
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | — | 🔬 CPU boot reaches initial AGC setup; no visual milestone | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | — | 🔬 CPU boot reaches media initialization; no visual milestone | [#1897](https://github.com/mattias800/prosper/issues/1897) |
@@ -263,7 +263,9 @@ The opening sequence and ASTRO BOT title card render at native 3840×2160. See t
 
 ## The Forgotten City — `PPSA03026`
 
-No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1890).
+<p align="center"><img src="assets/screenshots/forgotten-city-title.png" alt="The Forgotten City — title screen"></p>
+
+The direct native 3840×2160 frontend capture reaches the title screen and its `Press Any Button` prompt. Gameplay has not yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues/1890).
 
 ## Tactics Ogre: Reborn — `PPSA03839`
 
@@ -274,12 +276,11 @@ The route reaches the first tutorial battle with real GPU draws at native 1920×
 
 ## Little Nightmares III — `PPSA05143`
 
-No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1893).
+The CPU-only baseline reaches graphics setup, then faults on a denied low-address read before a title screen or other visible checkpoint. See the [tracker](https://github.com/mattias800/prosper/issues/1893).
 
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
 
-A bounded current-master CPU-only/no-render boot reaches its first AGC fence-builder event and then stalls.
-It establishes no visual compatibility milestone. See the [tracker](https://github.com/mattias800/prosper/issues/1894).
+No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1894).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
 
@@ -290,8 +291,7 @@ The route reaches Training 1 with a live rail-shooter camera, HUD, crosshair, an
 
 ## Bendy and the Dark Revival — `PPSA27624`
 
-A bounded current-master CPU-only/no-render boot reaches initial AGC/session/trophy setup and logs an FSB-v5
-media-open failure. It establishes no visual compatibility milestone. See the [tracker](https://github.com/mattias800/prosper/issues/1897).
+No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1897).
 
 ## Beneath — `PPSA27640`
 
