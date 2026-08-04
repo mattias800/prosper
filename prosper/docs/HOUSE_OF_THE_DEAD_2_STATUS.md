@@ -45,7 +45,7 @@ while the publishing event alone selects SCC. It also executes the exact in-plac
 `v_min_u32_dpp row_shr:{1,2,4,8}` family in that common phase. Value, source activity and static
 event identity use the same subgroup source lane, and the shuffled source tag must match the
 destination tag before UMin can update the persistent VGPR. The 83-resource scene shader that
-previously stopped at pc 1,276 now recompiles completely to 288,728 SPIR-V dwords; a second copy of
+previously stopped at pc 1,276 now recompiles completely to 288,955 SPIR-V dwords; a second copy of
 both instruction families later in the same shader is covered as well.
 
 The last current-recompiler deterministic replay, made before the event-isolation review hardening
