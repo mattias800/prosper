@@ -8,6 +8,12 @@ Engine: Unity 6000.1.5f1 / IL2CPP
 
 Current verified rung: **0 — frame submission, but no real visible graphics**
 
+> **Read `## The title is deadlocked in Unity's video-splash seek` first (2026-08-04).** The current
+> blocker is CPU-side and not a renderer defect: the title never leaves `level0`, its MP4 splash scene,
+> because `sceAvPlayerJumpToTime` is unimplemented. Everything between here and that section is the
+> earlier GPU-side investigation of a frame produced in that deadlocked state, and its
+> constant-buffer-writer line is superseded — see `## Ruled out`.
+
 ## Current symptom
 
 The title boots and publishes source-distinct renderer frames, but the measured output is still black.
@@ -314,6 +320,68 @@ Therefore there is **no selected-byte CPU-writer conclusion** from this arm; mer
 cap could at most produce a later writer hint, not restore process-wide first-writer coverage. Capsule
 SHA-256 was `e358535fe2b864394a24df0a0d8735fcbfa1b18a79f57b67a13f0745a3b51f6d`. #1902.
 
+## The title is deadlocked in Unity's video-splash seek, before any content exists
+
+The black frame is not the endpoint of a lost render. The title never leaves its **first scene**, and that
+scene's only visible content is a video.
+
+`Media/level0` is the only level file the guest ever opens. Its strings name `ScenesManager`,
+`gui_menu_title_logo`, `/Logo_Microids.mp4` and `/Logo_BalioStudio.mp4`; `Media/StreamingAssets/` holds
+exactly three clips (`Logo_Microids.mp4`, `Logo_BalioStudio.mp4`, `Logo_Unity.mp4`), and `level1` is
+`SPLASH !`. So the first frame the title intends to present is an MP4 logo played through
+`libSceAvPlayer`, and the eboot carries Unity's `PS5VideoMedia` wrapper plus the `Hidden/VideoDecode`
+shader name.
+
+Two bounded `screenshot` runs (36 s and 60 s) with `PROSPER_AVPLOG=1 PROSPER_FILELOG=1` show the exact,
+reproducible sequence:
+
+```text
+[avp] init-ex … num-fb=6 auto=0
+[avp] add source handle=0x3 guest='/app0/Media/StreamingAssets/Logo_Microids.mp4' mode=native
+[avp] call s_avp_start                                   ; ra=eboot+0x15d85d9
+[avp] video-ex result=1 …                                ; six real VA-API-decoded frames,
+[avp] video-ex result=1 …                                ; one per guest framebuffer
+[avp] call s_avp_pause                                   ; ra=eboot+0x15dbf02
+[avp] -> event 0x04
+[prosper] unimplemented: libSceAvPlayer::XC9wM+xULz8  -> returning 0
+… then 12,913 sceAvPlayerGetVideoDataEx + 12,908 sceAvPlayerIsActive calls, forever
+```
+
+`XC9wM+xULz8` is **`sceAvPlayerJumpToTime`** (PS5 3.20 `libSceAvPlayer`). It is not registered, so the
+dispatcher's default `0` is returned — and `0` is `SCE_OK` for this contract, so the guest reads a
+no-op as a successful seek.
+
+The guest side is unambiguous in its own disassembly. `sceAvPlayerJumpToTime` is called only from
+`func eboot+0x15dbcb0`, the routine that owns both `failed to pause the AvPlayer while seeking` and
+`failed to resume the AvPlayer while seeking`:
+
+```text
+15dc1db: mov  DWORD PTR [rbx+0x690],0x806a00a3     ; pre-set failure state
+15dc1e5: mov  rdi,QWORD PTR [rbx+0x5a0]            ; handle
+15dc1ec: call 0x1c2ec30                            ; sceAvPlayerJumpToTime(handle, rsi = target ms)
+15dc1f1: test eax,eax
+15dc1f3: je   0x15dc45c                            ; 0 == success -> wait for the seek to land
+…        lea  rdx,[rip+…]                          ; else "failed to jump while seeking"
+```
+
+The success path at `0x15dc45c` then waits for the player's own tracked time `[rbx+0x5e8]` to change
+(`15dc46c: cmp r14,QWORD PTR [rbx+0x5e8]; jne …`) by pulling frames, and only past that does it call
+`sceAvPlayerResume` at `0x15dc0c1`. The frame-pull helper `func eboot+0x15d9f70` additionally discards
+any frame whose `SceAvPlayerFrameInfoEx.timeStamp` (`[rcx+0x10]`) is not both **strictly newer** than
+the last one and **at or past** the seek target (`15d9fcc: cmp rdx,QWORD PTR [rax+0x48]; jbe …` and
+`15d9fda: cmp rdx,QWORD PTR [rax+0x40]; jb …`). No seek ever happens, so that time never reaches the
+target, `sceAvPlayerResume` is never called (zero occurrences in every run), and the player stays
+paused. prosper's `s_avp_getvideodataex` early-outs on `paused` before its own log line, while
+`s_avplayer_isactive` returns `1` while paused, so the guest's pull loop
+(`func eboot+0x15d8dc0`, `0x15d9950`-`0x15d9997`: pull, `IsActive`, 10 s deadline, `usleep(1000)`)
+spins indefinitely — 200-360 calls/s — and the composited output is a correct render of a scene whose
+only content has not arrived. Both arms are uniformly black at the pixel level (`max_rgb=0`,
+zero non-zero RGB samples over 1920x1080, `crc=064567f8`).
+
+`prosper::video::VideoBackend` has **no seek entry point** (`open`/`info`/`next_video`/`next_audio`/
+`eof`/`close`), so implementing `sceAvPlayerJumpToTime` requires a new backend operation, not only an
+HLE registration. #1599, #1884.
+
 ## Ruled out
 
 - **Unresolved T#/S# lookup:** the title-live descriptor resolves; the rejection is the sampled MIMG
@@ -388,9 +456,36 @@ SHA-256 was `e358535fe2b864394a24df0a0d8735fcbfa1b18a79f57b67a13f0745a3b51f6d`. 
   it. The address remains run-local even though deterministic fresh boots reused it. #1599, #1853, #1857.
 - **A renderer-disabled title boot as a GPU-free experiment:** live compute remains active without
   `PROSPER_RENDER` and initializes Vulkan when the title dispatches supported compute.
+- **The black frame as a render/composite defect at all, or draw 0's zero 128-byte PS binding 32 as
+  missing guest data whose CPU writer must be found:** the title never leaves `level0`, the
+  video-splash scene, and is deadlocked in Unity's `PS5VideoMedia` seek because
+  `sceAvPlayerJumpToTime` is unimplemented (see the section above). The submit under investigation is
+  therefore produced with no video content in existence, so a uniformly zero material input is what a
+  correct render of that state looks like. This does not prove the constant buffer *should* be zero,
+  but it removes the premise that a missing CPU producer must explain it, and no writer hunt should be
+  resumed until the title advances past the splash. #1599, #1884.
+- **Pause-gated video-frame delivery as the wall:** an env-gated A/B (`PROSPER_AVP_PAUSED_DELIVER`,
+  default off, one lever, same binary, `strings`-verified) let `sceAvPlayerGetVideoDataEx` keep
+  delivering decoded frames while the guest holds the player paused. It is a real lever — the futile
+  pull census collapses from 14,546 calls to 14, and two further frames are delivered after the jump —
+  but `sceAvPlayerResume` is still never called, all AvPlayer traffic then ceases entirely for the
+  remaining ~35 s, and both arms stay uniformly black (`max_rgb=0`). Removing the pause gate is
+  therefore not the fix and not a route to visible video. #1599.
+- **The guest failing the video open, or a missing/absent Linux decoder:** the VA-API backend opens the
+  clip (`backend=1`), FFmpeg demuxes it, and six real decoded NV12 frames reach the guest's own six
+  framebuffers. Video decode is working; the seek primitive is what is missing.
 
 ## Next discriminators
 
+0. **The frontier is `sceAvPlayerJumpToTime`, not the GPU.** The next step is a real seek: add a seek
+   operation to `prosper::video::VideoBackend` (a defaulted virtual, so the Media Foundation and
+   VideoToolbox backends keep compiling), implement it in `frontends/video_vaapi` (seek the container,
+   flush the decoder, drop the queued frames, clear EOF), and register `XC9wM+xULz8` in
+   `src/hle/hle_service.cpp` so it seeks and reports a real error when the backend cannot. The guest's
+   acceptance test is exact and observable: the post-jump frame's `timeStamp` must be at or past the
+   requested target, after which `sceAvPlayerResume` must appear in `PROSPER_AVPLOG`. Until Resume
+   appears, nothing downstream can be measured. Items 1-4 below belong to the superseded
+   constant-buffer-writer line of investigation and should not be resumed (see `## Ruled out`).
 1. Treat occurrence 2 as accepted allocation identity: its dynamically selected VA exactly matched the
    independent v46 resource address while the full family census remained 23. Do not return to a fixed VA or
    the ambiguous four-field selector.
