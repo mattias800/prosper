@@ -137,6 +137,7 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | A PS5 `launchActivity` Game Intent routes around the current black startup state | **Falsified.** The update declares `launchActivity` support and ships the classic RSDK files, and the guest genuinely receives and consumes an exact `TITLE_SONIC_1_CLASSIC` intent — its `activityId` property is read and recognized. It still remains black and does not open `raw/retro/Sonic1u.rsdk`. This proves the activity route is insufficient, not that the handled UI misses cause the black frame. Truthful default no-intent behaviour is preserved. | this doc, #1905 |
 | Consuming the four installed add-content records naturally advances Sonic into an entitlement-key or mount path and changes the startup state | **Falsified at the `f72d8f0` black-loop boot depth.** After #1916, a valid routed 60 s CPU-only arm makes the count query and a real four-entry list call, then no individual info, key, AppContent, or mount call. A native/full-cadence 90 s renderer arm remains byte-identical black across 18 direct samples and port 17 remains silent. The result is scoped to this boot state; re-run it after any fix that advances the guest. | #1905, #1916 |
 | Sonic is black because it submits no GPU work or a shader/resource stage fails realization | **Falsified for the captured present-20 frame.** A deterministic whole-frame bundle contains 36 realized operations across submits 447-468; every extracted capsule reports `failed=0` and no failure diagnostics, its temporal closure is complete, and offline replay succeeds. The complete 3840x2160 result is nevertheless uniformly black. The first live `Vulkan render FAILED` line occurs earlier on empty submit 448, so it is a missing presentable scanout result rather than a failed Vulkan operation. | #1905 |
+| Submit 463's operation-5 black target is caused solely by operation 2 sampling stale zero guest bytes for its Uint32 view of the persistent depth plane | **Falsified, while exposing and fixing a real generic interop defect.** The authoritative D32S8 depth plane at `0x2064ae0000` is uniformly `0.5`, but the old Uint32 compute path read its stale zero guest backing. A GPU-only raw-bit bridge changes operation 2's 3840x2160 binding-7 output from all zero (`ccc433ff6d980383`) to the exact depth-plane bits (`1d0ffd6fc0338383`). Operation 5 still produces the identical black `26ed8b6191338383` target with a complete six-operation closure, so the stale depth alias was real but not sufficient to explain this frame's black composite. | #1905, this doc |
 
 ## Sonic Origins dump audit
 
@@ -206,14 +207,29 @@ remain candidate inputs. Two smaller utility/static textures (`b115` and `b123`)
 so this is not a blanket-zero capture. The pre-submit payloads for the two large scene-data constant
 buffers (`b34` and `b35`) are also zero.
 
+Runtime inspection completed that first discriminator. Operation 1's output is transparent black.
+Operation 2 reads binding 6 at `0x2064ae0000` through a one-component Uint32 T#, while the
+authoritative renderer-owned D32S8 plane at that address contains `0.5` in every texel. The old path
+did not offer the persistent depth import for an integer descriptor and detiled the stale all-zero
+guest allocation instead. The generic fix preserves the raw D32 bit payload entirely on the shared
+Vulkan device: depth image to transfer buffer to an owned `R32_UINT` sampled image, with the renderer
+layout restored afterward. The production regression contrasts the same stale backing at a non-DS
+address against the exact DS address, requires `0x3f000000` rather than zero, then re-snapshots both
+D32 and stencil planes byte-exactly.
+
+On the retained submit-463 capsule, the fix moves operation 2's binding-7 linear result from all-zero
+hash `ccc433ff6d980383` to `1d0ffd6fc0338383`, exactly the captured depth-plane hash. That positive
+control proves the source lever moved. Operation 5 nevertheless remains the identical uniformly black
+target (`26ed8b6191338383`; closure `6/6`, unresolved `0`). The depth alias was therefore a real
+translation defect, but it is not the sole cause of the black composite; the remaining cause is
+downstream or independent.
+
 The dependency graph continues through submit 465: operation 16 reads `0x20168f0000` and writes
 `0x203a7d0000`, operation 17 reads that target, and operation 18 reads it and writes `0x2010870000`;
 submit 467 then reads `0x2010870000`. All operations are realized and failure-free, while the complete
 replay endpoint is black. Those edges establish ordering and dependency, not the values written by each
-producer. The next discriminator is runtime output inspection (`--output-target-after` / draw steps) at
-submit-463 operations 1, 2 and 5, then submit-465 operations 16-18 and submit 467. That will identify the
-first black-producing stage and distinguish an upstream guest/scene gate from a producer or translation
-defect without another title boot. Exact hashes and command shapes are retained in
+producer. Further localization must now inspect operation 5's shader-visible inputs and the submit-465
+chain rather than re-testing operation 2's depth authority. Exact hashes and command shapes are retained in
 [#1905](https://github.com/mattias800/prosper/issues/1905#issuecomment-5172641024) and its follow-up.
 
 ### Game Intent activity audit
