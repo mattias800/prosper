@@ -11335,6 +11335,23 @@ bool emit_cfg_state_machine(
         return -1;
     };
 
+    // Unity fragment programs also compare two ordinary saved B64 mask pairs.  Keep candidate
+    // discovery syntactic so block splitting does not depend on a path-local register lifetime;
+    // the MUST dataflow below separately proves that BOTH pairs are masks at the exact compare.
+    // A numeric pair, an EXEC/VCC special pair, or a path-dependent mask/data join therefore does
+    // not enter this lowering and falls back to the ordinary scalar emitter (or rejects visibly).
+    auto saved_mask_pair_compare_sources = [&](const Rdna2Inst& in)
+            -> std::array<int, 2> {
+        if (in.fmt != Rdna2Format::SOPC ||
+            (in.opcode != 0x12 && in.opcode != 0x13) ||
+            in.src[0].kind != OperandKind::SGPR ||
+            in.src[1].kind != OperandKind::SGPR ||
+            in.src[0].value < 0 || in.src[0].value > 105 ||
+            in.src[1].value < 0 || in.src[1].value > 105)
+            return {-1, -1};
+        return {in.src[0].value, in.src[1].value};
+    };
+
     // VOPC e64 can compare a complete 64-bit scalar mask as integer data. Generated Wave64 code
     // uses `v_cmp_gt_u64 vcc,vcc,0` to broadcast (old VCC != 0) back into every active VCC lane.
     // The per-invocation mask representation has no 64-bit scalar payload, but the comparison is
@@ -11494,6 +11511,11 @@ bool emit_cfg_state_machine(
                 start_set.insert(ins[i + 1].pc);
         }
         if (exec_saved_mask_compare_source(in) >= 0) {
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (saved_mask_pair_compare_sources(in)[0] >= 0) {
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -11661,6 +11683,7 @@ bool emit_cfg_state_machine(
     std::vector<std::set<int>> b64_mask_in(starts.size());
     std::vector<std::set<int>> b64_mask_ambiguous_in(starts.size());
     std::vector<bool> b32_mask_reachable(starts.size(), false);
+    std::unordered_set<uint32_t> proven_saved_mask_pair_compare_pcs;
     if (b.allow_b32_masks && !starts.empty()) {
         b32_mask_in.front().insert(
             initial.sreg_bool_b32.begin(), initial.sreg_bool_b32.end());
@@ -11712,6 +11735,19 @@ bool emit_cfg_state_machine(
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
+
+                const auto compare_sources = saved_mask_pair_compare_sources(in);
+                if (compare_sources[0] >= 0) {
+                    const bool proven =
+                        b64_masks.contains(compare_sources[0]) &&
+                        b64_masks.contains(compare_sources[1]) &&
+                        !b64_ambiguous.contains(compare_sources[0]) &&
+                        !b64_ambiguous.contains(compare_sources[1]);
+                    if (proven)
+                        proven_saved_mask_pair_compare_pcs.insert(in.pc);
+                    else
+                        proven_saved_mask_pair_compare_pcs.erase(in.pc);
+                }
 
                 // The dispatcher may use a false backing value for a physical VCC lifetime that is
                 // provably dead. Do not let that implementation placeholder become observable: every
@@ -11933,10 +11969,11 @@ bool emit_cfg_state_machine(
     // Wave64 dispatcher Bool variables hold values, not lifetime tags. A scalar overwrite stores
     // false for a dead mask, and an unfiltered load at a later case can therefore make mere map
     // membership look like a valid saved mask. Prove the B64 mask domain separately at every
-    // EXEC-vs-saved-mask comparison: mask producers generate the fact, every overlapping half/pair
-    // scalar write kills it, and joins retain it only when all reachable predecessors agree.
+    // Wave64 whole-mask comparisons (EXEC-vs-saved or saved-vs-saved): mask producers generate the
+    // fact, every overlapping half/pair scalar write kills it, and joins retain it only when all
+    // reachable predecessors agree.
     std::unordered_set<uint32_t> proven_exec_saved_mask_compare_pcs;
-    if (b.is_compute && b.wave_size == 64 && !starts.empty()) {
+    if ((b.is_compute || b.is_fragment) && b.wave_size == 64 && !starts.empty()) {
         std::vector<std::set<int>> wave64_b64_mask_in(starts.size());
         std::vector<bool> wave64_b64_reachable(starts.size(), false);
         for (const auto& mask : initial.sreg_bool)
@@ -11950,6 +11987,10 @@ bool emit_cfg_state_machine(
             const int compare_source = exec_saved_mask_compare_source(in);
             if (record_compare && compare_source >= 0 && masks.contains(compare_source))
                 proven_exec_saved_mask_compare_pcs.insert(in.pc);
+            const auto pair_compare = saved_mask_pair_compare_sources(in);
+            if (record_compare && pair_compare[0] >= 0 &&
+                masks.contains(pair_compare[0]) && masks.contains(pair_compare[1]))
+                proven_saved_mask_pair_compare_pcs.insert(in.pc);
 
             auto source_is_mask = [&](const Operand& source) {
                 if (source.kind == OperandKind::InlineInt) return true;
@@ -12094,6 +12135,7 @@ bool emit_cfg_state_machine(
                 swizzle_pcs.contains(in.pc) ||
                 mask_zero_compare_candidate_source(in) >= 0 ||
                 exec_saved_mask_compare_source(in) >= 0 ||
+                saved_mask_pair_compare_sources(in)[0] >= 0 ||
                 vopc_mask_zero_compare_source(in) >= 0 ||
                 b64_mask_scc_vote_pcs.contains(in.pc);
             conditional_block[block] = conditional_block[block] ||
@@ -12489,6 +12531,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* swizzle = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
         const Rdna2Inst* exec_saved_mask_compare = nullptr;
+        const Rdna2Inst* saved_mask_pair_compare = nullptr;
         const Rdna2Inst* vopc_mask_compare = nullptr;
         const Rdna2Inst* b64_mask_scc_vote = nullptr;
         const uint32_t final_block = dispatch_blocks[dispatch].back();
@@ -12504,6 +12547,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_swizzle = nullptr;
             const Rdna2Inst* block_mask_compare = nullptr;
             const Rdna2Inst* block_exec_saved_mask_compare = nullptr;
+            const Rdna2Inst* block_saved_mask_pair_compare = nullptr;
             const Rdna2Inst* block_vopc_mask_compare = nullptr;
             const Rdna2Inst* block_b64_mask_scc_vote = nullptr;
             for (const auto& in : ins) {
@@ -12547,6 +12591,23 @@ bool emit_cfg_state_machine(
                                      "pc=%u source=s%d op=0x%x\n",
                                      in.pc, exec_saved_mask_source, in.opcode);
                     block_exec_saved_mask_compare = &in;
+                    break;
+                }
+                const auto saved_pair_sources =
+                    saved_mask_pair_compare_sources(in);
+                if (saved_pair_sources[0] >= 0 &&
+                    proven_saved_mask_pair_compare_pcs.contains(in.pc) &&
+                    state.sreg_bool.contains(saved_pair_sources[0]) &&
+                    state.sreg_bool.contains(saved_pair_sources[1])) {
+                    if (getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[%s-saved-mask-pair-compare] "
+                                     "pc=%u sources=s[%d:%d],s[%d:%d] op=0x%x\n",
+                                     b.is_compute ? "compute" : "graphics",
+                                     in.pc, saved_pair_sources[0], saved_pair_sources[0] + 1,
+                                     saved_pair_sources[1], saved_pair_sources[1] + 1,
+                                     in.opcode);
+                    block_saved_mask_pair_compare = &in;
                     break;
                 }
                 const int vopc_mask_compare_source =
@@ -12593,7 +12654,8 @@ bool emit_cfg_state_machine(
             if (!last) {
                 // Group construction admits only one-successor plain blocks before the tail.
                 if (block_mbcnt || block_append || block_swizzle || block_mask_compare ||
-                    block_exec_saved_mask_compare || block_vopc_mask_compare ||
+                    block_exec_saved_mask_compare || block_saved_mask_pair_compare ||
+                    block_vopc_mask_compare ||
                     block_b64_mask_scc_vote ||
                     (block_terminator && (block_terminator->is_end ||
                                           block_terminator->opcode != 0x02)))
@@ -12606,6 +12668,7 @@ bool emit_cfg_state_machine(
             swizzle = block_swizzle;
             mask_compare = block_mask_compare;
             exec_saved_mask_compare = block_exec_saved_mask_compare;
+            saved_mask_pair_compare = block_saved_mask_pair_compare;
             vopc_mask_compare = block_vopc_mask_compare;
             b64_mask_scc_vote = block_b64_mask_scc_vote;
         }
@@ -12752,6 +12815,33 @@ bool emit_cfg_state_machine(
                 b.store_function(vote_to_scc_var, yes);
             }
         }
+        if (saved_mask_pair_compare) {
+            const auto sources =
+                saved_mask_pair_compare_sources(*saved_mask_pair_compare);
+            const auto first = state.sreg_bool.find(sources[0]);
+            const auto second = state.sreg_bool.find(sources[1]);
+            if (first == state.sreg_bool.end() || second == state.sreg_bool.end())
+                return reject_cfg(saved_mask_pair_compare->pc,
+                                  "missing-saved-mask-pair-compare-source");
+            const uint32_t mismatch = b.bsel(
+                first->second, b.logical_not(second->second), second->second);
+            if (b.native_subgroup_size || b.is_fragment) {
+                const uint32_t different = b.is_fragment
+                    ? b.fragment_wave_any(mismatch)
+                    : b.native_wave_any(mismatch);
+                if (!different)
+                    return reject_cfg(saved_mask_pair_compare->pc,
+                                      "saved-mask-pair-vote");
+                state.scc = saved_mask_pair_compare->opcode == 0x12
+                    ? b.logical_not(different) : different;
+            } else {
+                b.store_function(vote_pending_var, yes);
+                b.store_function(vote_value_var, mismatch);
+                b.store_function(vote_invert_var,
+                    saved_mask_pair_compare->opcode == 0x12 ? yes : no);
+                b.store_function(vote_to_scc_var, yes);
+            }
+        }
         if (vopc_mask_compare) {
             if (b.is_vertex) {
                 if (getenv("PROSPER_DBG"))
@@ -12834,6 +12924,11 @@ bool emit_cfg_state_machine(
                           exec_saved_mask_compare->len_dwords))
                 return reject_cfg(exec_saved_mask_compare->pc,
                                   "exec-saved-mask-compare-successor");
+        } else if (saved_mask_pair_compare) {
+            if (!set_next(saved_mask_pair_compare->pc +
+                          saved_mask_pair_compare->len_dwords))
+                return reject_cfg(saved_mask_pair_compare->pc,
+                                  "saved-mask-pair-compare-successor");
         } else if (vopc_mask_compare) {
             if (!set_next(vopc_mask_compare->pc + vopc_mask_compare->len_dwords))
                 return reject_cfg(vopc_mask_compare->pc,

@@ -89,6 +89,52 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+uint32_t opcode_count(const std::vector<uint32_t>& spv, uint32_t opcode) {
+    uint32_t count = 0;
+    if (spv.size() < 5) return count;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return 0;
+        count += op == opcode;
+        i += wc;
+    }
+    return count;
+}
+
+// Prove that a subgroup vote is persisted through the CFG dispatcher's bool register file and then
+// consumed as the condition of a later OpSelect.  This is the structural shape of a scalar mask
+// comparison followed by s_cselect: opcode presence alone would not prove that SCC survived the
+// dispatcher boundary or that the select read the newly-produced condition.
+bool wave_vote_reaches_later_select(const std::vector<uint32_t>& spv,
+                                    bool expect_inverted) {
+    constexpr uint32_t OpLoad = 61, OpStore = 62, OpLogicalNot = 168,
+                       OpSelect = 169, OpGroupNonUniformAny = 335;
+    std::unordered_set<uint32_t> direct_values, inverted_values;
+    std::unordered_set<uint32_t> vote_variables;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpGroupNonUniformAny && wc >= 4)
+            direct_values.insert(spv[i + 2]);
+        if (op == OpLogicalNot && wc == 4) {
+            if (direct_values.contains(spv[i + 3]))
+                inverted_values.insert(spv[i + 2]);
+            if (inverted_values.contains(spv[i + 3]))
+                direct_values.insert(spv[i + 2]);
+        }
+        const auto& expected_values = expect_inverted ? inverted_values : direct_values;
+        if (op == OpStore && wc == 3 && expected_values.contains(spv[i + 2]))
+            vote_variables.insert(spv[i + 1]);
+        if (op == OpLoad && wc == 4 && vote_variables.contains(spv[i + 3]))
+            (expect_inverted ? inverted_values : direct_values).insert(spv[i + 2]);
+        if (op == OpSelect && wc == 6 &&
+            (expect_inverted ? inverted_values : direct_values).contains(spv[i + 3]))
+            return true;
+        i += wc;
+    }
+    return false;
+}
+
 // Trace IMAGE_GET_LOD all the way from two known VGPR bit patterns to the fragment output. This is
 // deliberately a dataflow check rather than an opcode-presence check: it proves coordinate
 // provenance, AMD/SPIR-V x/y component order, compact dmask-to-VDATA placement, and the EXEC select
@@ -2235,6 +2281,136 @@ int main() {
         return 1;
     }
     printf("  [ok]   complex fragment CFG lowers wave-mask comparisons to exact wave64 votes\n");
+
+    // House of the Dead 2's large scene fragments reach this exact mask relationship inside the
+    // graphics CFG dispatcher:
+    //   s[44:45] = EXEC & s[30:31]
+    //   s[46:47] = VCC  & s[30:31]
+    //   SCC = (s[44:45] ==/!= s[46:47]); s[48:49] = SCC ? EXEC : 0
+    // Both operands are complete saved masks, so the scalar comparison is one exact whole-wave
+    // ANY(mask0 xor mask1) vote. Keep the later s_cselect and EXEC copy: they prove the vote's SCC
+    // survives a dispatcher case boundary and is consumed, rather than merely appearing in SPIR-V.
+    const uint32_t fragment_saved_mask_pair_prelude[] = {
+        0xbe9e047eu,                         // s_mov_b64 s[30:31],exec
+        0x87ac1e7eu,                         // s_and_b64 s[44:45],exec,s[30:31]
+        0x7c020300u,                         // v_cmp_lt_f32 vcc,v0,v1
+        0x87ae1e6au,                         // s_and_b64 s[46:47],vcc,s[30:31]
+        0xbf122e2cu,                         // exact live s_cmp_eq_u64 s[44:45],s[46:47]
+        0xbf800000u,                         // SCC-preserving scheduled nop
+        0x85b0807eu,                         // s_cselect_b64 s[48:49],exec,0
+        0xbefe0430u,                         // s_mov_b64 exec,s[48:49]
+    };
+    // Crossing scalar branch regions force the same arbitrary graphics CFG dispatcher without
+    // introducing any additional subgroup vote. That makes the exact one-vote EQ/LG polarity below
+    // a self-checking dataflow witness rather than an opcode census hidden behind red siblings.
+    const uint32_t fragment_scalar_cfg_dispatch[] = {
+        0x7e040280u,                         // pc0:  v_mov_b32 v2,0
+        0x7e060280u,                         // pc1:  v_mov_b32 v3,0
+        0x7e080280u,                         // pc2:  v_mov_b32 v4,0
+        0x7e0a0280u,                         // pc3:  v_mov_b32 v5,0
+        0xbf068080u,                         // pc4:  s_cmp_eq_u32 0,0
+        0xbf840003u,                         // pc5:  s_cbranch_scc0 -> pc9
+        0xbf068080u,                         // pc6:  s_cmp_eq_u32 0,0
+        0xbf840002u,                         // pc7:  s_cbranch_scc0 -> pc10 (crossing region)
+        0x7e040281u,                         // pc8:  v_mov_b32 v2,1
+        0x7e060281u,                         // pc9:  v_mov_b32 v3,1
+        0xbf068080u,                         // pc10: s_cmp_eq_u32 0,0
+        0xbf840003u,                         // pc11: s_cbranch_scc0 -> alternate export at pc15
+        0xf800180fu, 0x05040302u,            // pc12: exp mrt0 v2,v3,v4,v5 done vm
+        0xbf820003u,                         // pc14: s_branch -> verified tail exit at pc18
+        0xf800180fu, 0x05040302u,            // pc15: alternate exp mrt0 v2,v3,v4,v5 done vm
+        0xbf810000u,                         // pc17: s_endpgm
+        0xbf810000u,                         // pc18: branch-target s_endpgm
+    };
+    auto saved_mask_pair_shader = [&]() {
+        std::vector<uint32_t> shader(
+            std::begin(fragment_saved_mask_pair_prelude),
+            std::end(fragment_saved_mask_pair_prelude));
+        shader.insert(shader.end(), std::begin(fragment_scalar_cfg_dispatch),
+                      std::end(fragment_scalar_cfg_dispatch));
+        return shader;
+    };
+    auto mask_pair_module_is_exact = [&](const std::vector<uint32_t>& spirv,
+                                         uint32_t wave_size, bool inverted) {
+        return !spirv.empty() && has_opcode(spirv, 251) &&
+            opcode_count(spirv, 335) == 1 &&
+            fragment_spirv_required_subgroup_size(spirv) == wave_size &&
+            wave_vote_reaches_later_select(spirv, inverted) &&
+            type_result_ids_are_nonzero(spirv, nullptr) &&
+            phi_ids_are_nonzero(spirv);
+    };
+    std::vector<uint32_t> fragment_saved_mask_pair_eq = saved_mask_pair_shader();
+    const auto fragment_saved_mask_pair_eq_spv = recompile_fragment(
+        fragment_saved_mask_pair_eq.data(), fragment_saved_mask_pair_eq.size());
+    if (!mask_pair_module_is_exact(fragment_saved_mask_pair_eq_spv, 64,
+                                   /*inverted EQ vote*/true)) {
+        printf("  [FAIL] House saved-mask equality did not feed CFG-persisted SCC in Wave64\n");
+        return 1;
+    }
+    std::vector<uint32_t> fragment_saved_mask_pair_lg = fragment_saved_mask_pair_eq;
+    fragment_saved_mask_pair_lg[4] = 0xbf132e2cu; // s_cmp_lg_u64 s[44:45],s[46:47]
+    const auto fragment_saved_mask_pair_lg_spv = recompile_fragment(
+        fragment_saved_mask_pair_lg.data(), fragment_saved_mask_pair_lg.size());
+    if (!mask_pair_module_is_exact(fragment_saved_mask_pair_lg_spv, 64,
+                                   /*direct LG vote*/false)) {
+        printf("  [FAIL] saved-mask inequality did not feed CFG-persisted SCC in Wave64\n");
+        return 1;
+    }
+    const auto fragment_wave32_saved_mask_pair_eq_spv =
+        recompile_fragment_wave32_for_test(
+            fragment_saved_mask_pair_eq.data(), fragment_saved_mask_pair_eq.size());
+    const auto fragment_wave32_saved_mask_pair_lg_spv =
+        recompile_fragment_wave32_for_test(
+            fragment_saved_mask_pair_lg.data(), fragment_saved_mask_pair_lg.size());
+    if (!mask_pair_module_is_exact(fragment_wave32_saved_mask_pair_eq_spv, 32, true) ||
+        !mask_pair_module_is_exact(fragment_wave32_saved_mask_pair_lg_spv, 32, false)) {
+        printf("  [FAIL] saved-mask EQ/LG lost the complete-pair contract in Wave32\n");
+        return 1;
+    }
+    printf("  [ok]   saved-mask EQ/LG votes persist into s_cselect in Wave32 and Wave64 CFGs\n");
+
+    // Every physical/dataflow obligation is independently load-bearing. A write to either half of
+    // a saved pair ends that lifetime; a numeric replacement is not reinterpreted as a mask; and a
+    // producer skipped on one reachable predecessor cannot establish a mask at the join.
+    std::vector<uint32_t> saved_mask_high_overwrite = fragment_saved_mask_pair_eq;
+    saved_mask_high_overwrite.insert(saved_mask_high_overwrite.begin() + 4, 0xbead0380u);
+    if (!recompile_fragment(saved_mask_high_overwrite.data(),
+                            saved_mask_high_overwrite.size()).empty()) {
+        printf("  [FAIL] high-half scalar overwrite retained a stale saved-mask pair\n");
+        return 1;
+    }
+    std::vector<uint32_t> saved_mask_numeric_replacement = fragment_saved_mask_pair_eq;
+    saved_mask_numeric_replacement.insert(
+        saved_mask_numeric_replacement.begin() + 4,
+        {0xbeae0381u, 0xbeaf0380u});          // numeric s[46:47] = 1
+    if (!recompile_fragment(saved_mask_numeric_replacement.data(),
+                            saved_mask_numeric_replacement.size()).empty()) {
+        printf("  [FAIL] numeric SGPR pair was reinterpreted as a saved wave mask\n");
+        return 1;
+    }
+    std::vector<uint32_t> saved_mask_path_dependent = {
+        0xbe9e047eu,                         // s_mov_b64 s[30:31],exec
+        0x87ac1e7eu,                         // s_and_b64 s[44:45],exec,s[30:31]
+        0xbf060100u,                         // pc2: s_cmp_eq_u32 s0,s1
+        0xbf840001u,                         // pc3: edge skips s46 -> compare at pc5
+        0x87ae1e6au,                         // pc4: s_and_b64 s[46:47],vcc,s[30:31]
+        0xbf122e2cu,                         // pc5: joined s[46:47] lifetime is path-dependent
+        0xbf800000u,                         // pc6: SCC-preserving nop
+        0x85b0807eu,                         // pc7: consumes comparison SCC
+        0xbefe0430u,
+    };
+    saved_mask_path_dependent.insert(
+        saved_mask_path_dependent.end(), std::begin(fragment_scalar_cfg_dispatch),
+        std::end(fragment_scalar_cfg_dispatch));
+    const auto saved_mask_path_dependent_spv = recompile_fragment(
+        saved_mask_path_dependent.data(), saved_mask_path_dependent.size());
+    if (wave_vote_reaches_later_select(saved_mask_path_dependent_spv,
+                                       /*inverted EQ vote*/true)) {
+        printf("  [FAIL] path-dependent saved-mask vote reached a later select\n");
+        return 1;
+    }
+    printf("  [ok]   saved-mask pair compare rejects half-overwrite/numeric mutations and "
+           "does not vote across joins\n");
 
     // Astro Bot's world-map material PS reaches the same graphics CFG dispatcher with an
     // s_orn2_saveexec_b64 whose destination is VCC. Keep a saved EXEC source live across dispatcher
