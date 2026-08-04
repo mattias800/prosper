@@ -2518,6 +2518,11 @@ bool defer_enabled() {
 // the tail drains within the watchdog cadence anyway).
 std::array<std::unordered_set<uint64_t>, kDeferredQueueCount> g_gated_granules;             // addr >> 3
 std::array<std::vector<std::pair<uint64_t, uint64_t>>, kDeferredQueueCount> g_gated_ranges; // [lo, hi)
+// GDS has its own 64 KiB address space.  Keeping these spans separate is not merely an authority
+// concern: an immediate GDS fill deferred in one fold must order a later memory-to-GDS copy in a
+// different fold, while the numerically equal guest address remains unrelated.
+std::array<std::vector<std::pair<uint64_t, uint64_t>>, kDeferredQueueCount>
+    g_gated_gds_ranges; // [offset, offset + bytes)
 // The guest-memory span a command writes (0 bytes = writes nothing we track).
 void effect_span(const Pm4Command& c, uint64_t* addr, uint64_t* bytes) {
     using K = Pm4Command::Kind;
@@ -2531,6 +2536,17 @@ void effect_span(const Pm4Command& c, uint64_t* addr, uint64_t* bytes) {
     }
 }
 void gated_register(const Pm4Command& c) {
+    if (c.kind == Pm4Command::Kind::DmaData &&
+        dma_data_dst_sel(c) == kDmaSelGds) {
+        const uint64_t gds_size = compute_gds_size();
+        if (!c.dd_valid || !c.dd_bytes || c.dd_dst >= gds_size ||
+            c.dd_bytes > gds_size - c.dd_dst || (c.dd_dst & 3u) ||
+            (c.dd_bytes & 3u))
+            return;
+        g_gated_gds_ranges[deferred_queue(c.queue_origin)].emplace_back(
+            c.dd_dst, c.dd_dst + c.dd_bytes);
+        return;
+    }
     uint64_t a = 0, n = 0;
     effect_span(c, &a, &n);
     if (!a || !n) return;
@@ -2551,7 +2567,17 @@ bool addr_gated(uint64_t a, uint64_t n, uint8_t origin) {
         if (a < r.second && r.first < a + n) return true;
     return false;
 }
+bool gds_gated(uint64_t offset, uint64_t bytes, uint8_t origin) {
+    const uint64_t gds_size = compute_gds_size();
+    if (!bytes || offset >= gds_size || bytes > gds_size - offset) return false;
+    for (const auto& r : g_gated_gds_ranges[deferred_queue(origin)])
+        if (offset < r.second && r.first < offset + bytes) return true;
+    return false;
+}
 bool effect_gated(const Pm4Command& c) {
+    if (c.kind == Pm4Command::Kind::DmaData &&
+        dma_data_dst_sel(c) == kDmaSelGds)
+        return gds_gated(c.dd_dst, c.dd_bytes, c.queue_origin);
     uint64_t a = 0, n = 0;
     effect_span(c, &a, &n);
     return addr_gated(a, n, c.queue_origin);
@@ -2749,6 +2775,7 @@ int flush_deferred_streams() {
         // blocked peer queue cannot over-gate future work from this one.
         g_gated_granules[queue].clear();
         g_gated_ranges[queue].clear();
+        g_gated_gds_ranges[queue].clear();
         // Deliver every pulse owed by submissions from this queue. A blocked peer queue retains its
         // own pulses; an Acb completion must not wait for an unrelated Dcb barrier (and vice versa).
         uint64_t owed = g_owed_pulses[queue];
@@ -3619,10 +3646,9 @@ void GpuState::apply(const Pm4Command& c) {
             // FIFO behavior until a general copy appears; its suffix joins the ordered timeline.
             if (dma_data_address_source(c)) {
                 if (!c.dd_valid) { report_invalid_dma_data(c); break; }
-                // A GDS offset does not participate in WAIT_DEFER's guest-address domains, but a
-                // copy downstream of this fold's unsatisfied wait still cannot overtake the stream.
-                const bool gated_destination = g_fold_deferring ||
-                    (dma_data_dst_sel(c) != kDmaSelGds && defer_gate(c));
+                // Destination ordering is domain-aware: guest VAs and GDS offsets never alias one
+                // another, but either kind can carry a pending same-domain write across folds.
+                const bool gated_destination = defer_gate(c);
                 const bool gated_source = !g_deferred.empty() &&
                                           addr_gated(c.dd_src, c.dd_bytes, c.queue_origin);
                 if (gated_destination || gated_source) {

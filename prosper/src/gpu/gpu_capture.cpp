@@ -649,6 +649,14 @@ bool is_compute_internal_gds(const ShaderResource& r) {
            r.cls == ResourceClass::ConstantBuffer && r.size == 64u * 1024u && r.stride == 4;
 }
 
+constexpr uint32_t kCaptureDmaSelGds = 1u;
+bool captured_dma_destination_is_gds(uint32_t sels) {
+    return (sels & 0xffu) == kCaptureDmaSelGds;
+}
+bool captured_dma_source_is_gds(uint32_t sels) {
+    return ((sels >> 8u) & 0xffu) == kCaptureDmaSelGds;
+}
+
 bool collect_intervals(const std::vector<DrawItem>& draws,
                        const std::vector<ComputeItem>& computes,
                        const std::vector<GpuState::DmaCopy>& dma_copies,
@@ -696,13 +704,21 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
     for (const auto& d : draws) if (!add_table(d.vrt.get()) || !add_table(d.prt.get())) return false;
     for (const auto& c : computes) if (!add_table(c.resources.get())) return false;
     for (const auto& copy : dma_copies) {
-        if (!copy.dst || !copy.src || !copy.bytes ||
-            copy.dst > std::numeric_limits<uint64_t>::max() - copy.bytes ||
+        const bool destination_gds = captured_dma_destination_is_gds(copy.sels);
+        const bool source_gds = captured_dma_source_is_gds(copy.sels);
+        if ((!destination_gds && !copy.dst) || !copy.src || !copy.bytes ||
+            (!destination_gds &&
+             copy.dst > std::numeric_limits<uint64_t>::max() - copy.bytes) ||
             copy.src > std::numeric_limits<uint64_t>::max() - copy.bytes) {
             error = "ordered DMA capture range is invalid";
             return false;
         }
-        intervals.push_back({copy.dst, copy.dst + copy.bytes});
+        if (source_gds) {
+            error = "ordered DMA capture has an unsupported GDS source";
+            return false;
+        }
+        if (!destination_gds)
+            intervals.push_back({copy.dst, copy.dst + copy.bytes});
         intervals.push_back({copy.src, copy.src + copy.bytes});
     }
     std::sort(intervals.begin(), intervals.end(), [](auto a, auto b) { return a.begin < b.begin; });
@@ -941,8 +957,17 @@ bool validate_dma_copies(const GpuCaptureFile& capture, std::string& error) {
         return true;
     };
     for (const auto& copy : capture.dma_copies) {
-        if (!copy.dst || !copy.src || !copy.bytes || copy.bytes > kMaxBlobBytes ||
-            copy.dst > std::numeric_limits<uint64_t>::max() - copy.bytes ||
+        const bool destination_gds = captured_dma_destination_is_gds(copy.sels);
+        const bool source_gds = captured_dma_source_is_gds(copy.sels);
+        const bool gds_destination_valid = !destination_gds ||
+            (copy.dst < 64u * 1024u && copy.bytes <= 64u * 1024u - copy.dst &&
+             !(copy.dst & 3u) && !(copy.bytes & 3u) &&
+             copy.destination_blob_index == 0xFFFFFFFFu &&
+             copy.destination_blob_offset == 0);
+        if ((!destination_gds && !copy.dst) || !copy.src || !copy.bytes ||
+            copy.bytes > kMaxBlobBytes || source_gds || !gds_destination_valid ||
+            (!destination_gds &&
+             copy.dst > std::numeric_limits<uint64_t>::max() - copy.bytes) ||
             copy.src > std::numeric_limits<uint64_t>::max() - copy.bytes ||
             !validate_blob(copy.destination_blob_index, copy.destination_blob_offset, copy.bytes,
                            "ordered DMA destination references an invalid capture blob",
@@ -1608,11 +1633,12 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         captured.dst = copy.dst; captured.src = copy.src; captured.bytes = copy.bytes;
         captured.sels = copy.sels; captured.command_order = copy.command_order;
         captured.packet_addr = copy.packet_addr;
+        const bool destination_gds = captured_dma_destination_is_gds(copy.sels);
         if (include_resource_data &&
-            (!assign_blob_range(intervals, copy.dst, copy.bytes,
+            ((!destination_gds && !assign_blob_range(intervals, copy.dst, copy.bytes,
                                 captured.destination_blob_index,
                                 captured.destination_blob_offset,
-                                "ordered DMA destination was not assigned to a capture blob", error) ||
+                                "ordered DMA destination was not assigned to a capture blob", error)) ||
              !assign_blob_range(intervals, copy.src, copy.bytes,
                                 captured.source_blob_index, captured.source_blob_offset,
                                 "ordered DMA source was not assigned to a capture blob", error)))
@@ -3799,13 +3825,30 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         copy.sels = captured.sels; copy.command_order = captured.command_order;
         copy.packet_addr = captured.packet_addr;
         uint8_t* source = nullptr;
-        if (!bind_range(captured.destination_blob_index, captured.destination_blob_offset,
-                        captured.dst, captured.bytes, copy.destination_data,
-                        copy.destination_size,
-                        "ordered DMA destination references an invalid capture blob",
-                        "ordered DMA destination exceeds capture blob",
-                        "ordered DMA destination blob offset exceeds its logical address") ||
-            !bind_range(captured.source_blob_index, captured.source_blob_offset,
+        if (captured_dma_destination_is_gds(captured.sels)) {
+            const auto internal = internal_instance_by_binding.find(kComputeInternalGdsBinding);
+            if (internal == internal_instance_by_binding.end()) {
+                error = "ordered DMA GDS destination has no captured internal GDS instance";
+                return false;
+            }
+            auto& instance = out.resource_instances[internal->second].bytes;
+            if (captured.dst >= instance.size() ||
+                captured.bytes > instance.size() - captured.dst) {
+                error = "ordered DMA GDS destination exceeds captured internal GDS";
+                return false;
+            }
+            copy.destination_data = instance.data() + captured.dst;
+            copy.destination_size = instance.size() - captured.dst;
+        } else if (!bind_range(
+                       captured.destination_blob_index, captured.destination_blob_offset,
+                       captured.dst, captured.bytes, copy.destination_data,
+                       copy.destination_size,
+                       "ordered DMA destination references an invalid capture blob",
+                       "ordered DMA destination exceeds capture blob",
+                       "ordered DMA destination blob offset exceeds its logical address")) {
+            return false;
+        }
+        if (!bind_range(captured.source_blob_index, captured.source_blob_offset,
                         captured.src, captured.bytes, source, copy.source_size,
                         "ordered DMA source references an invalid capture blob",
                         "ordered DMA source exceeds capture blob",
