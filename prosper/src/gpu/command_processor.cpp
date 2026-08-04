@@ -1733,16 +1733,12 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         return false;
     }
     if (form == DmaDataForm::GdsImmediate || form == DmaDataForm::MemoryToGds) {
-        // A GDS counter reset: the guest zeroes these offsets every frame, and the shaders that use
-        // GDS reach the same 64 KiB backing through the internal binding. Dropping the write loses
-        // guest state outright.
-        //
-        // NOT the cause of #1742 — this was the hypothesis that motivated the fix and it was tested
-        // and FALSIFIED. With these writes restored (343 per routed run, against 0 before), Astro
-        // Bot's indirect dispatch still grows 1, 1, 2, 3, 4, 5, 7, 15, 6711, 26783, 40167, 66927.
-        // Whatever accumulates that count is elsewhere; do not re-derive this.
         uint8_t* gds = compute_gds_backing();
         if (form == DmaDataForm::GdsImmediate) {
+            // A GDS counter reset: the guest zeroes these offsets every frame, and shaders reach the
+            // same 64 KiB backing through the internal binding. NOT the cause of #1742: with these
+            // immediate resets restored, Astro's indirect dispatch still grew without bound. Do not
+            // re-derive that falsified reset hypothesis.
             const uint32_t v32 = (uint32_t)c.dd_src;
             for (uint32_t i = 0; i + 4 <= c.dd_bytes; i += 4)
                 memcpy(gds + c.dd_dst + i, &v32, 4);
@@ -3623,8 +3619,10 @@ void GpuState::apply(const Pm4Command& c) {
             // FIFO behavior until a general copy appears; its suffix joins the ordered timeline.
             if (dma_data_address_source(c)) {
                 if (!c.dd_valid) { report_invalid_dma_data(c); break; }
-                // A GDS offset does not participate in WAIT_DEFER's guest-address domains.
-                const bool gated_destination = dma_data_dst_sel(c) != kDmaSelGds && defer_gate(c);
+                // A GDS offset does not participate in WAIT_DEFER's guest-address domains, but a
+                // copy downstream of this fold's unsatisfied wait still cannot overtake the stream.
+                const bool gated_destination = g_fold_deferring ||
+                    (dma_data_dst_sel(c) != kDmaSelGds && defer_gate(c));
                 const bool gated_source = !g_deferred.empty() &&
                                           addr_gated(c.dd_src, c.dd_bytes, c.queue_origin);
                 if (gated_destination || gated_source) {

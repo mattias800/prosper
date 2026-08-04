@@ -300,6 +300,38 @@ int main() {
               "rejected gated DMA discards its deferred completion suffix without signaling");
     }
 
+    // GDS offsets are outside guest-address dependency domains, but they are not outside stream
+    // order. The same unsatisfied wait must still reject a downstream retained memory-to-GDS copy;
+    // otherwise excluding GDS+0x24 from address overlap would also let it overtake the barrier.
+    {
+        volatile uint64_t cond = 0;
+        uint32_t source = 0xA1B2C3D4u;
+        uint64_t completion = 0;
+        uint8_t* gds = compute_gds_backing();
+        memset(gds + 0x24, 0, sizeof(source));
+        const uint64_t src = reinterpret_cast<uint64_t>(&source);
+        uint32_t stream[8 + 7 + 7] = {};
+        emit_wait_eq(stream, reinterpret_cast<uint64_t>(&cond), 1);
+        stream[8] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[9] = 0x24;
+        stream[11] = static_cast<uint32_t>(src);
+        stream[12] = static_cast<uint32_t>(src >> 32);
+        stream[13] = sizeof(source);
+        stream[14] = 1u | (3u << 8) | kDmaDataAddressSource;
+        emit_release(stream + 15, reinterpret_cast<uint64_t>(&completion), 1);
+        GpuState st;
+        run_cb(stream, 22, st);
+        CHECK(st.dma_copies.size() == 1 && st.dma_execution_rejected,
+              "WAIT_DEFER stream gate still rejects a downstream memory-to-GDS copy");
+        cond = 1;
+        flush_deferred_streams();
+        execute_nonrender_submit_work(st);
+        uint32_t copied = 0;
+        memcpy(&copied, gds + 0x24, sizeof(copied));
+        CHECK(copied == 0 && completion == 0,
+              "rejected gated memory-to-GDS copy cannot overtake its wait or signal completion");
+    }
+
     // A copy also depends on its source. A prior gated producer to S must prevent a later
     // address DMA(S->D) from reading stale S even when D itself is in an unrelated domain.
     {
