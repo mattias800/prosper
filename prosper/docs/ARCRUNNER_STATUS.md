@@ -16,6 +16,18 @@ real GPU work, but no game frame is ever composited. The earlier async-compute s
 fixed. Between about 8 and 14 seconds the guest's `RenderThread 1` instead faults at one of two
 already-recorded sibling sites.
 
+**The terminal fault is not the rung-1 blocker, and the sibling fault's null register is
+prosper-manufactured.** Both corrections come from the rung-1 pass recorded below, and both invalidate
+the framing this document previously used to pick discriminators:
+
+- Every recorded terminal fault happens **after** dozens of frames have already been presented
+  (19 in one ordinary arm here, 53 in the retained combined arm). Fixing the fault yields more black
+  frames, not a first frame. Rung 1 is blocked by what the presented frames contain.
+- The `addr=(nil)` sibling class is produced by prosper's own reserved-range lazy-commit handler
+  zero-filling guest page `0x2100000000` under the guest's *load*, after which the guest dereferences
+  that zero on the next instruction. This is [#1944](https://github.com/mattias800/prosper/issues/1944),
+  in shared host mapping — not a guest resource-lifetime bug.
+
 The usual terminal chain is:
 
 ```text
@@ -117,6 +129,73 @@ elsewhere, and the null descriptor may be an independent later blocker exposed b
 No screenshot belongs in the compatibility record yet. The latest content-selective capture
 retained exactly two non-alpha-only frames: frame 12 was a uniform solid-yellow clear and frame 50
 was a uniform solid-white clear. Full inspection found no geometry, text, or game imagery in either.
+**Neither is a clear.** Each was presented immediately after one of the run's exactly two
+`CB_COLOR_CONTROL.MODE=2` (`ELIMINATE_FAST_CLEAR`) draws, which prosper executes as an ordinary colour
+draw ([#1588](https://github.com/mattias800/prosper/issues/1588)) — so they are that gap's artifact
+blanketing the target, not content and not a guest clear. See the `## Ruled out` row.
+
+## Rung-1 pass: what the presented frames actually contain
+
+Three bounded runs on `9dcb6c4b`, ordinary and unsuppressed
+(`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), each with exact zero pre/post process
+censuses and no suppression, skip, or shim. Timing is deliberately not quoted: peer lanes shared the GPU.
+
+**prosper executes what the guest submits.** With `PROSPER_DRAWLOG=1`, one run realized **456 of 468
+submitted draws across 20 submits** — 19 of 20 submits realized every draw, one single-draw submit
+realized none. There were **zero** `recompile-reject`, `cfg-recompile-reject`, `exec-recompile-reject`,
+compute-skip, or unsupported-format lines in any of the three runs. So the black output is not a
+dropped-draw or rejected-shader problem.
+
+**The guest issues a complete but very small UE4 frame, and it composites to the scanout.** With
+`PROSPER_COLORSTATETRACE=all`, 256 draw records over 7 frames (~36 draws/frame) resolve to a
+recognisable UE4 4.27 post-process frame: one depth prepass, three 4K passes, a 512x512 atlas, **two
+complete bloom pyramids** (1920x1080 → 960x540 → 480x270 → 240x135 → 120x68 → 60x34), a 16x2 histogram,
+32x32 and 64x64 stages, 1x1 average-luminance targets, and **one final composite per frame into the
+double-buffered scanout** (`0x9fc0000000` alternating with `0x9fc2000000`, 3840x2160, `mode=1` NORMAL,
+`resolved-cwm=7`). ~36 draws/frame is far too few for gameplay geometry; this is a post-process-dominated
+frame over a nearly empty scene.
+
+**No draw in the sample has depth test or depth write enabled.** All 256 records carry `test=0 write=0`.
+249 of them bind no depth surface at all (`z=0x0/0x0`, `raw-size=00000000`, extent decoded as `1x1`); the
+remaining 7 — one per frame, the `mode=0` prepass into `0x310fea0000` — do bind a real 3840x2160 surface
+at `zbase=0x3140f00000` and still resolve to `test=0 write=0`. A UE4 4.27 depth prepass with depth writes
+disabled is anomalous. This is recorded as an observation, not yet a diagnosis: most of the 249 are
+post-process passes that legitimately have no depth, and whether the prepass register decode or the guest
+itself is responsible is unresolved. `CONFIDENCE: LOW` on any causal role in the black output, since
+`test=0` rejects nothing.
+
+**Readback localises where the content dies.** `PROSPER_DUMP_RTGROUPS=1` writes a BMP for every rendered
+target group with at least one nonzero byte, so a drawn-but-absent file is a fully-zero target. All images
+were opened, not just measured:
+
+| target | extent | readback |
+| --- | --- | --- |
+| `0x315f4f0000` | 1920x1080 | **real content** — a geometric wedge with a soft gradient edge plus ~12 bright specular points; 184 distinct values around grey 175 |
+| `0x315e4f0000` | 1920x1080 | uniform `(54,54,54)` with the **same** ~12 specular points at identical positions |
+| `0x3157710000` | 3840x2160 | 100% white, same ~12 points inverted as dark dots |
+| `0x3003800000` | 512x512 | shadow-atlas-shaped: 884 non-black pixels, thin yellow curve |
+| `0x3151af0000` | 32x32 | 722 distinct colours in 1024 pixels |
+| `0x3153380000`, `0x3163390000`, `0x31633b0000` | 1x1 | `(255,92,255)` / `(251,92,255)` — **magenta** |
+| `0x312bee0000` | 3840x2160 | 100% black RGB |
+| both bloom pyramids (`0x3160700000`, `0x3162380000` and every level) | — | **no file at all**: fully zero, alpha included |
+| eleven `0x316*` targets | 1792x1080 | 100% black RGB |
+| `0x9fc0000000`, `0x9fc2000000` | 3840x2160 | **0 of 8,294,400 non-black pixels** |
+
+So real geometry does reach `0x315f4f0000`; the two bloom pyramids and the 1792x1080 series are entirely
+zero; the 1x1 auto-exposure targets hold magenta; and the final composite executes with `cwm=7` and
+writes RGB zero. The presented-frame counter agrees exactly — frames go from `nz=0` to alpha-only
+`nz=8294400` (RGB 0, alpha 255) and never carry colour except after a `MODE=2` draw.
+
+The instrument is positively controlled from **inside the same run**: the same readback path that reports
+zero for the scanout reports a 722-colour 32x32 image and a structured 512x512 atlas, so "black" is a
+measurement of the target, not of a broken dump path.
+
+**The narrowest remaining rung-1 question** is the step between the scene-colour target that has content
+(`0x315f4f0000`) and the post-process input that does not (`0x3160700000`, the root of both fully-zero
+bloom pyramids), together with the magenta 1x1 auto-exposure value. A garbage average-luminance value is
+exactly the shape that makes a UE4 tonemapper map a live scene to black, which is the failure mode the
+charter warns about for skipped exposure work — except that here nothing is skipped, so the value itself
+is wrong rather than missing.
 
 ## Reproduction
 
@@ -126,6 +205,26 @@ Build and run inside the `ps5ys` distrobox, with `TMPDIR` on disk rather than `/
 cd prosper
 PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 \
   ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+```
+
+The rung-1 census arms above are, in order, the realization check, the per-draw colour/depth state
+census, and the rendered-target content readback. Write every artifact under `~/`, never `/tmp` or
+`/var/tmp`:
+
+```bash
+# 1. submitted-vs-realized draws, plus any recompile/skip lines
+PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_DRAWLOG=1 \
+  ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+
+# 2. one raw-to-resolved colour/depth record per draw (runs BEFORE the no-effect fast path,
+#    so a dropped draw is still visible)
+PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_COLORSTATETRACE=all \
+PROSPER_PRESENT_NZLOG=1 ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+
+# 3. a BMP per rendered target group with >=1 nonzero byte; a DRAWN target with NO file is
+#    fully zero. ~1 GB per 14 s -- keep the run short and delete afterwards.
+PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_DUMP_RTGROUPS=1 \
+PROSPER_FRAME_DIR=~/arc-work/rtt ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
 ```
 
 The combined diagnostic arm used for the most recent narrow experiment is:
@@ -191,25 +290,38 @@ Do not re-derive these without contradictory new evidence.
 | The renderer's fold latency (the guest outrunning our deferred label writes) is causal | `PROSPER_RENDER=0` faults at the same site with the same value, about 6 seconds in instead of about 21 seconds. | #1226, #1754 |
 | Suppressing the forging fence — or both known label writes — fixes the underlying allocator corruption | The fence-only arm removes the terminal `0x30016000` and moves the fault to `0x2400100024001`, two pops farther along the same walk. The first combined run at `dfd89f3f` was **PROVISIONAL/VOID for causality**: its forge population was at least 64 but its only totals snapshot was candidate 1. After the terminal census was fixed and mutation-tested, the corrected arm at `fb3daaa4` independently reached `INIT-SUPPRESS #1024` and ended with the exact final line **`candidates=20 suppressed=20 landed=0`**. It presented frames 0–52, then faulted at the other already-known sibling site `eboot+0x117811f` with `r14=0` (`addr=(nil)`), not at the `0x30016000` pop. Thus removing both writes is not a title fix, but the valid arm settles its narrow necessity question: the specific terminal `0x2000000001 -> 0x30016000` chain does **not** survive when neither known write lands. It does not isolate init from fence, nor attribute the sibling fault, because all-mode deliberately drops live fences. Content-selective capture retained exactly two non-alpha-only images; both were inspected and are single-colour clears (frame 12 solid yellow, frame 50 solid white), with no game imagery. | #1226, #1754 |
 | A resource completed by the mapped normal construction path can have `+0x68`, `+0x78`, or `+0x88` populated while its `+0x98` side-command descriptor was never created | `eboot+0x1186a40`, reached by all ten mapped resource-creation calls, uses the same populated-field condition as the allocation-page appender, allocates the 16-byte side-command descriptor, fills `{target, dword count}`, and stores it at `+0x98` before the wrapper is published. The common teardown at `eboot+0x1187300` is a confirmed later writer of null. This rules out omission by that normal completed path; it does not rule out an unlocated foreign/incomplete constructor, teardown-after-retention, or stale/reused memory. | #1226 |
+| The `eboot+0x117811f` sibling fault is a **guest resource-lifetime bug** — a retained command item whose `+0x98` side-command descriptor was freed by teardown, or was never constructed, or belongs to reused memory. This framing drove the vptr-classification discriminator, the `PROSPER_HWBP_R14=0` probe, and the whole producer/teardown static map | The null `r14` is **prosper's own zero**. `[lazy-commit] mapped page=0x2100000000 rip=eboot+0x1178064` fires exactly once in the retained combined arm, at exactly the documented `mov r14,[rax+0x98]`, and the `addr=(nil)` fault at `eboot+0x117811f` is the next instruction. An independent ordinary run here reproduced the pattern at a **different** guest site: `[lazy-commit] ... rip=eboot+0x117e221` followed by `sig=11 addr=(nil) rip=eboot+0x117e225` — **+4 bytes**. A third ordinary run had **no** lazy-commit line and **no** null-pointer fault, terminating on the allocator chain instead. So: lazy-commit present → null deref within a few bytes (2/2); absent → no null deref (1/1). The reserved-range handler `mmap`s 64 KiB of anonymous zeros with `MAP_FIXED` and resumes, so a load of a pointer field returns 0. Both guest sites first-touch the **same** page `0x2100000000`, a round 4 GiB above the arena base — a wild pointer would not repeat that. Do not resume vptr classification, teardown-after-retention, or `r14`-gated probing of this site: they classify a value prosper wrote. The static producer/teardown map remains correct as disassembly; it is simply not what this fault is about. | #1944, #1226 |
+| The two retained non-alpha-only frames (solid yellow, solid white) are **guest clears**, and therefore evidence that the guest reaches a clear-only phase | They are `ELIMINATE_FAST_CLEAR` artifacts. Across two independent runs — the retained combined-suppression arm and an ordinary unsuppressed run here — **every** coloured frame is presented immediately after a `CB_COLOR_CONTROL.MODE=2` draw, and **no** coloured frame occurs without one (3 for 3; the combined arm's MODE=2 count reached exactly 2 for its 2 coloured frames, the ordinary run's count reached 1 for its 1). prosper runs MODE=2 as an ordinary colour draw, which blankets the target with the fast-clear colour. Do not read either frame as a phase marker or as progress. | #1588, #1226 |
+| The rung-1 blocker is the terminal render-thread fault, so bring-up should continue by attributing that fault | Every recorded terminal fault occurs **after** dozens of presented frames — 19 in an ordinary arm here, 53 in the retained combined arm — and all of those frames carry RGB 0. The fault cannot be what prevents a first frame. Separately, prosper realizes **456 of 468** submitted draws with **zero** recompile-reject/compute-skip/unsupported-format lines, so the black output is not a dropped-draw problem either. | #1226 |
 | The first three current-master ordinary diagnostic arms prove the sibling absent or identify its producer | The first title run exited through an unrelated `AudioMixerRende` null jump. The second lost to the usual allocator chain at `eboot+0x127e8eb`, with the guest reporting `Attempt to realloc an unrecognized block 2000000001`. The third used the address-filtered hardware probe, which armed on primary and worker guest boundaries, but lost to the allocator predecessor at `eboot+0x127e751` before recording any target hit. None reached `eboot+0x117811f`; the first two stack peeks sampled unrelated frames and the third correctly emitted no probe. All three arms are **void/non-discriminating**, not negative reproductions. A nearby D-queue unsatisfied wait is retained as co-occurring history only; it does not attribute any competing failure. | #1226 |
 
 ## Next discriminators
 
-1. Attribute the `eboot+0x117811f` sibling null-object fault without using the combined suppression
-   arm as a title fix. First prove whether the failure exists on current master in an ordinary
-   unsuppressed run. The first two generic fault-time arms lost to unrelated terminal paths, so the
-   branch now extends the race-free hardware execute breakpoint with an exact `r14` value gate and
-   generic pointer-chain probes. The next arm should use `PROSPER_HWBP=0x117811f`,
-   `PROSPER_HWBP_ALLTHREADS=1`, `PROSPER_HWBP_R14=0`, `PROSPER_HWBP_MAX=1`, and
-   `PROSPER_HWBP_PROBE` to recover the original retained item saved at `rbp-0xa8`, its allocation-page
-   metadata at `rbp-0x70`, and item fields `+0`, `+0x68`, `+0x78`, `+0x88`, and `+0x98`. Unmatched
-   valid-descriptor hits do not print or consume the one-record cap. A valid arm must show that the
-   breakpoint armed on the target worker and must emit `[hwbp-probe]` before the sibling fault; any
-   competing terminal path remains void. Classify the item vptr as the teardown marker `0x7007d60`,
-   a live resource secondary vtable, or unrelated/reused memory before mutating guest behaviour.
-2. Isolate the init and REL1 fence interventions only with arms whose independent lever witnesses and
+Ordered for **rung 1** (any real graphics), which the terminal faults do not block.
+
+1. **Find the step that loses the scene colour.** Content exists in `0x315f4f0000` (1920x1080, real
+   geometry) and is absent from `0x3160700000`, the root of both fully-zero bloom pyramids. Take one F9 /
+   `PROSPER_CAPTURE_BUNDLE_AT_PRESENT` bundle in this window and dissect it offline with
+   `gpu_replay --inspect-only` / `--draw-steps` / `--dump-resource`, so the pass that reads
+   `0x315f4f0000` and writes `0x3160700000` can be checked draw-by-draw without another boot. Confirm
+   whether that pass samples the target it should, and at the extent and format it should.
+2. **Explain the magenta 1x1 auto-exposure targets** (`0x3153380000`, `0x3163390000`, `0x31633b0000`
+   reading `(255,92,255)`). If UE4's average-luminance value is garbage, the tonemapper maps a live scene
+   to black, which matches the observed composite writing RGB 0 with `cwm=7`. Identify the pass that
+   writes these 1x1 targets and what it samples. Nothing is being skipped here, so this is a wrong value
+   rather than a missing dispatch.
+3. **Resolve #1944 before spending any further arm on an `addr=(nil)` fault.** Add the default-off
+   fail-visible lazy-commit mode described there, so the fault reports at the *loading* instruction with
+   the real faulting address, and decide whether page `0x2100000000` is a legitimately committed guest
+   region whose contents prosper lost, or a wild read the handler is masking. Until then, no null-pointer
+   fault site in this title should be treated as guest evidence.
+4. Establish whether the `mode=0` depth prepass into `0x310fea0000` should have depth writes enabled, and
+   if so whether prosper's decode or the guest drops them. See the depth paragraph above; `CONFIDENCE: LOW`
+   on any role in the black output.
+5. Isolate the init and REL1 fence interventions only with arms whose independent lever witnesses and
    terminal populations are complete. Do not infer authorship from a moved terminal fault alone.
-3. Revisit the per-queue barrier model and intro-movie path from #1226 only after checking their
+6. Revisit the per-queue barrier model and intro-movie path from #1226 only after checking their
    current master reproductions; neither is settled by the allocator arm.
-4. Capture and inspect a real game image before advancing the tracker or adding an ArcRunner
-   screenshot to `COMPATIBILITY.md`.
+7. Capture and inspect a real game image before advancing the tracker or adding an ArcRunner
+   screenshot to `COMPATIBILITY.md`. A frame presented right after a `MODE=2` draw does not qualify —
+   see the `## Ruled out` row.
