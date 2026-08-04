@@ -81,6 +81,18 @@ events in its retained history and the already-known DCB object `0x2420e48230`. 
 does not attribute the null audio call to that wait. The run had exact zero pre/post process censuses
 and terminated naturally with worker-fault exit 90; no suppression or skip was armed.
 
+A second ordinary arm on the exact documentation revision `bdae813d` (runtime code unchanged from
+`ce258440`) was also **void for the sibling-lifetime question**, for a different reason. After 13.4
+seconds the usual allocator chain won the race first: `RenderThread 1` faulted at
+`eboot+0x127e8eb` while dereferencing `0x30016000`, alongside the guest fatal
+`FMallocBinned3 Attempt to realloc an unrecognized block 2000000001`. A subsequent null fault was
+part of the already-fatal shutdown race. The item/page peek was armed and fired, but neither dump
+was at `eboot+0x117811f`, so their stack-relative fields are unrelated and must not be classified as
+resource evidence. The arm was bounded to 45 seconds, terminated naturally with exit 90 after 13.4
+seconds, had exact zero pre/post process censuses, and used no suppression or skip. This confirms
+that ordinary runs can lose to at least two competing terminal paths before the target sibling; it
+does not make the sibling absent or weaken the static lifetime seam.
+
 No screenshot belongs in the compatibility record yet. The latest content-selective capture
 retained exactly two non-alpha-only frames: frame 12 was a uniform solid-yellow clear and frame 50
 was a uniform solid-white clear. Full inspection found no geometry, text, or game imagery in either.
@@ -158,7 +170,7 @@ Do not re-derive these without contradictory new evidence.
 | The renderer's fold latency (the guest outrunning our deferred label writes) is causal | `PROSPER_RENDER=0` faults at the same site with the same value, about 6 seconds in instead of about 21 seconds. | #1226, #1754 |
 | Suppressing the forging fence — or both known label writes — fixes the underlying allocator corruption | The fence-only arm removes the terminal `0x30016000` and moves the fault to `0x2400100024001`, two pops farther along the same walk. The first combined run at `dfd89f3f` was **PROVISIONAL/VOID for causality**: its forge population was at least 64 but its only totals snapshot was candidate 1. After the terminal census was fixed and mutation-tested, the corrected arm at `fb3daaa4` independently reached `INIT-SUPPRESS #1024` and ended with the exact final line **`candidates=20 suppressed=20 landed=0`**. It presented frames 0–52, then faulted at the other already-known sibling site `eboot+0x117811f` with `r14=0` (`addr=(nil)`), not at the `0x30016000` pop. Thus removing both writes is not a title fix, but the valid arm settles its narrow necessity question: the specific terminal `0x2000000001 -> 0x30016000` chain does **not** survive when neither known write lands. It does not isolate init from fence, nor attribute the sibling fault, because all-mode deliberately drops live fences. Content-selective capture retained exactly two non-alpha-only images; both were inspected and are single-colour clears (frame 12 solid yellow, frame 50 solid white), with no game imagery. | #1226, #1754 |
 | A resource completed by the mapped normal construction path can have `+0x68`, `+0x78`, or `+0x88` populated while its `+0x98` side-command descriptor was never created | `eboot+0x1186a40`, reached by all ten mapped resource-creation calls, uses the same populated-field condition as the allocation-page appender, allocates the 16-byte side-command descriptor, fills `{target, dword count}`, and stores it at `+0x98` before the wrapper is published. The common teardown at `eboot+0x1187300` is a confirmed later writer of null. This rules out omission by that normal completed path; it does not rule out an unlocated foreign/incomplete constructor, teardown-after-retention, or stale/reused memory. | #1226 |
-| The first current-master ordinary fault-memory arm proves the sibling absent or identifies its producer | The title exited first through an unrelated `AudioMixerRende` null jump. `eboot+0x117811f` was not reached, so the requested `rbp-0xa8` item and `rbp-0x70` page-header peeks sampled the wrong stack frame. The arm is **void/non-discriminating**, not a negative reproduction. A nearby D-queue unsatisfied wait is retained as co-occurring history only; it does not attribute the audio fault. | #1226 |
+| The first two current-master ordinary fault-memory arms prove the sibling absent or identify its producer | The first title run exited through an unrelated `AudioMixerRende` null jump. The second lost to the usual allocator chain at `eboot+0x127e8eb`, with the guest reporting `Attempt to realloc an unrecognized block 2000000001`. Neither reached `eboot+0x117811f`, so the requested `rbp-0xa8` item and `rbp-0x70` page-header peeks sampled unrelated stack frames. Both arms are **void/non-discriminating**, not negative reproductions. A nearby D-queue unsatisfied wait is retained as co-occurring history only; it does not attribute either competing failure. | #1226 |
 
 ## Next discriminators
 
