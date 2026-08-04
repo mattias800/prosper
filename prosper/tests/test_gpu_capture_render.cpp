@@ -1,8 +1,10 @@
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../src/gpu/tile.hpp"
 #include "../src/gpu/videoout_present.hpp"
 #include "../src/hle/dispatch.hpp"
+#include "../frontends/shared/live_compute.hpp"
 #include "../frontends/shared/live_renderer.hpp"
 #include "render_runner.h"
 
@@ -158,6 +160,179 @@ int main() {
         CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
               "replay samples captured red texel from owned backing");
     }
+
+    // Graphics storage IMAGE_LOAD uses the same compact-guest -> raw-uvec4 converter as compute.
+    // Prove its tiled source gate with the exact old failure shape: a 1x1 RGBA8 surface has only four
+    // useful bytes but a 4 KiB tiled footprint. A 4095-byte capture used to be zero-extended and
+    // detiled successfully because it exceeded the tight four-byte size; the detiler is entitled to
+    // index the complete 4096 bytes, so only the full source may reach it.
+    constexpr uint32_t STORAGE_TILE_MODE = 5u;
+    const uint8_t storage_linear_red[4] = {255, 0, 0, 255};
+    const size_t storage_tiled_bytes =
+        prosper::frontend::storage_image_raw_uvec4_source_bytes(
+            DataFormat::Unorm8, 4u, 1u, 1u, 1u, STORAGE_TILE_MODE, false, 0u);
+    std::vector<uint8_t> storage_tiled(storage_tiled_bytes, 0);
+    if (storage_tiled_bytes)
+        tile_surface(storage_tiled.data(), storage_linear_red, 1u, 1u,
+                     STORAGE_TILE_MODE, 0u, 4u);
+    uint32_t storage_channels[4]{};
+    const bool full_storage_materialized =
+        prosper::frontend::storage_image_materialize_raw_uvec4(
+            storage_tiled.data(), storage_tiled.size(), DataFormat::Unorm8, 4u,
+            1u, 1u, 1u, STORAGE_TILE_MODE, false, 0u, 0u, 0u,
+            storage_channels, std::size(storage_channels));
+    float storage_red = 0.0f;
+    std::memcpy(&storage_red, &storage_channels[0], sizeof(storage_red));
+    CHECK(storage_tiled_bytes == 4096u && full_storage_materialized && storage_red == 1.0f,
+          "raw-uvec4 converter consumes a complete tiled source footprint");
+    CHECK(storage_tiled_bytes > 1u &&
+              !prosper::frontend::storage_image_materialize_raw_uvec4(
+                  storage_tiled.data(), storage_tiled.size() - 1u,
+                  DataFormat::Unorm8, 4u, 1u, 1u, 1u, STORAGE_TILE_MODE,
+                  false, 0u, 0u, 0u, storage_channels, std::size(storage_channels)),
+          "raw-uvec4 converter rejects a short padded tiled backing before detile");
+
+    // Exercise the submit-local identity map through live build_R, not a manually populated
+    // FrameResource. Both references use the same compact guest backing and formatless UINT shader.
+    // The first call converts 4 B/texel to 16 B/texel; the second must reuse those pixels together
+    // with their R32G32B32A32_UINT interpretation. Losing that format on the hit makes the backend's
+    // numeric-class gate reject the whole pass (#1713).
+    const uint32_t storage_load_ps[] = {
+        0x7e000280u, 0x7e020280u, 0xf0000f08u, 0x00020000u,
+        0xf800000fu, 0x03020100u, 0xbf810000u,
+    };
+    auto make_storage_draw = [&](ShaderResource resource,
+                                 const std::vector<uint32_t>& fragment,
+                                 uint64_t target) {
+        auto table = std::make_shared<ShaderResourceTable>();
+        table->resources.push_back(resource);
+        DrawItem draw = replay.items[0];
+        draw.fs_shared.reset();
+        draw.fs = fragment;
+        draw.prt = std::move(table);
+        draw.color0_base = target;
+        draw.color0_width = 64;
+        draw.color0_height = 64;
+        return draw;
+    };
+    uint8_t compact_storage_texels[16] = {
+        255, 0, 0, 255,   255, 0, 0, 255,
+        255, 0, 0, 255,   255, 0, 0, 255,
+    };
+    ShaderResource raw_storage{};
+    raw_storage.cls = ResourceClass::StorageImage;
+    raw_storage.format = DataFormat::Unorm8;
+    raw_storage.num_components = 4;
+    raw_storage.binding = 4;
+    raw_storage.img_dim = 1;
+    raw_storage.width = raw_storage.height = 2;
+    raw_storage.depth = 1;
+    raw_storage.sgpr_base = 8;
+    raw_storage.gpu_addr = 0x17130000u;
+    raw_storage.size = sizeof(compact_storage_texels);
+    raw_storage.linear_row_pitch_bytes = 8;
+    raw_storage.host_data = compact_storage_texels;
+    raw_storage.host_data_size = sizeof(compact_storage_texels);
+    ShaderResourceTable raw_storage_compile;
+    raw_storage_compile.resources.push_back(raw_storage);
+    const std::vector<uint32_t> raw_storage_frag = recompile_fragment(
+        storage_load_ps, std::size(storage_load_ps), &raw_storage_compile);
+    DrawItem raw_storage_draw = make_storage_draw(
+        raw_storage, raw_storage_frag, 0x17131000u);
+    prosper::frontend::reset_texture_decode_scope_stats();
+    render_submit_items({raw_storage_draw, raw_storage_draw}, W, H);
+    const auto raw_storage_reuse = prosper::frontend::texture_decode_scope_stats();
+    LiveTargetSnapshot raw_storage_snapshot;
+    const bool raw_storage_published = read_live_render_target(
+        raw_storage_draw.color0_base, raw_storage_snapshot);
+    const uint8_t* raw_storage_center = raw_storage_published &&
+        raw_storage_snapshot.pixels &&
+        raw_storage_snapshot.pixels->size() == static_cast<size_t>(W) * H * 4u
+            ? &(*raw_storage_snapshot.pixels)[
+                  (static_cast<size_t>(H / 2) * W + W / 2) * 4u]
+            : nullptr;
+    CHECK(raw_storage_reuse.decodes == 1u &&
+              raw_storage_reuse.same_span_reuses == 1u,
+          "two same-span storage references execute one production conversion and one cache hit");
+    CHECK(raw_storage_center && raw_storage_center[0] > 0xc0 &&
+              raw_storage_center[1] < 0x40 && raw_storage_center[2] < 0x40,
+          "submit-local raw-uvec4 reuse restores its UINT Vulkan representation");
+
+    // One guest descriptor may be reflected as either formatless raw-uvec4 or exact R32ui. Patch
+    // only OpTypeImage's Image Format in a copy of the recompiled read shader, leaving both runtime
+    // T# records and both read-only access modes identical. They must remain two decode identities:
+    // the former stores 16 host bytes/texel and the latter four.
+    uint32_t shared_storage_word = 0x3f800000u;
+    ShaderResource shared_storage = raw_storage;
+    shared_storage.format = DataFormat::Uint32;
+    shared_storage.num_components = 1;
+    shared_storage.width = shared_storage.height = 1;
+    shared_storage.size = sizeof(shared_storage_word);
+    shared_storage.linear_row_pitch_bytes = sizeof(shared_storage_word);
+    shared_storage.host_data = reinterpret_cast<uint8_t*>(&shared_storage_word);
+    shared_storage.host_data_size = sizeof(shared_storage_word);
+    ShaderResourceTable shared_storage_compile;
+    shared_storage_compile.resources.push_back(shared_storage);
+    std::vector<uint32_t> formatless_storage_frag = recompile_fragment(
+        storage_load_ps, std::size(storage_load_ps), &shared_storage_compile);
+    std::vector<uint32_t> r32ui_storage_frag = formatless_storage_frag;
+    bool patched_r32ui = false;
+    for (size_t i = 5; i < r32ui_storage_frag.size();) {
+        const uint32_t word_count = r32ui_storage_frag[i] >> 16;
+        const uint32_t opcode = r32ui_storage_frag[i] & 0xffffu;
+        if (!word_count || i + word_count > r32ui_storage_frag.size()) break;
+        if (opcode == 25u && word_count >= 9u) { // OpTypeImage
+            r32ui_storage_frag[i + 8u] = kSpirvImageFormatR32ui;
+            patched_r32ui = true;
+            break;
+        }
+        i += word_count;
+    }
+    const DescriptorValidationReport r32ui_interface =
+        validate_spirv_descriptor_interface(
+            r32ui_storage_frag, &shared_storage_compile, 1,
+            SpirvShaderStage::Fragment, false);
+    const SpirvDescriptorBinding* r32ui_binding =
+        find_spirv_descriptor_binding(r32ui_interface, 1, shared_storage.binding);
+    CHECK(patched_r32ui && r32ui_binding &&
+              r32ui_binding->storage_image_format == kSpirvImageFormatR32ui,
+          "typed-read fixture changes the reflected storage representation lever");
+    DrawItem formatless_draw = make_storage_draw(
+        shared_storage, formatless_storage_frag, 0x17132000u);
+    DrawItem r32ui_draw = make_storage_draw(
+        shared_storage, r32ui_storage_frag, 0x17132000u);
+    prosper::frontend::reset_texture_decode_scope_stats();
+    render_submit_items({formatless_draw, r32ui_draw}, W, H);
+    const auto storage_representation_split =
+        prosper::frontend::texture_decode_scope_stats();
+    CHECK(storage_representation_split.decodes == 2u &&
+              storage_representation_split.same_span_reuses == 0u,
+          "formatless raw-uvec4 and exact R32ui reads cannot alias one submit-local decode");
+
+    // Finally route the short 4 KiB tiled capture through build_R. The source contains the useful
+    // 1x1 red texel, so the pre-fix zero-padding path rendered red; absence of this unique target plus
+    // a recorded decode proves the production converter ran and failed the materialization contract
+    // before Vulkan accepted the descriptor.
+    ShaderResource short_tiled_storage = raw_storage;
+    short_tiled_storage.width = short_tiled_storage.height = 1;
+    short_tiled_storage.tile_mode = STORAGE_TILE_MODE;
+    short_tiled_storage.size = static_cast<uint32_t>(storage_tiled_bytes);
+    short_tiled_storage.linear_row_pitch_bytes = 0;
+    short_tiled_storage.host_data = storage_tiled.data();
+    short_tiled_storage.host_data_size = storage_tiled.size() - 1u;
+    ShaderResourceTable short_storage_compile;
+    short_storage_compile.resources.push_back(short_tiled_storage);
+    const std::vector<uint32_t> short_storage_frag = recompile_fragment(
+        storage_load_ps, std::size(storage_load_ps), &short_storage_compile);
+    constexpr uint64_t SHORT_STORAGE_TARGET = 0x17133000u;
+    prosper::frontend::reset_texture_decode_scope_stats();
+    render_submit_items(
+        {make_storage_draw(short_tiled_storage, short_storage_frag, SHORT_STORAGE_TARGET)}, W, H);
+    const auto short_storage_stats = prosper::frontend::texture_decode_scope_stats();
+    LiveTargetSnapshot short_storage_snapshot;
+    CHECK(short_storage_stats.decodes == 1u &&
+              !read_live_render_target(SHORT_STORAGE_TARGET, short_storage_snapshot),
+          "live storage materialization fails closed on a short padded tiled backing");
 
     // R-Type Delta's movie shader passes pixel coordinates and sets S# FORCE_UNNORMALIZED. Vulkan's
     // native unnormalized sampler cannot preserve the title's wrap/LOD state, so the recompiler

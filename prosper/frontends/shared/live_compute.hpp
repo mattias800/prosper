@@ -113,6 +113,23 @@ bool storage_image_unpack_raw_uvec4(const uint8_t* source, size_t source_bytes,
                                     size_t texels, uint32_t* channels,
                                     size_t channel_dwords);
 
+// Exact source footprint and complete guest->portable materialization for the shared raw-uvec4
+// storage-image ABI. Tiled sources must provide the whole padded allocation: the detilers index that
+// footprint without a source-length argument, so accepting only the tight linear byte count would
+// silently turn an absent tiled tail into zero texels. Zero/false means unsupported shape, overflow,
+// or short backing. `depth` is one for a 2D image and the real slice count for a volume.
+size_t storage_image_raw_uvec4_source_bytes(
+    prosper::gpu::DataFormat format, uint32_t components,
+    uint32_t width, uint32_t height, uint32_t depth, uint32_t tile_mode,
+    bool in_mip_tail, uint32_t mip_tail_bytes);
+bool storage_image_materialize_raw_uvec4(
+    const uint8_t* source, size_t source_bytes,
+    prosper::gpu::DataFormat format, uint32_t components,
+    uint32_t width, uint32_t height, uint32_t depth, uint32_t tile_mode,
+    bool in_mip_tail, uint32_t mip_tail_bytes,
+    uint32_t mip_tail_x, uint32_t mip_tail_y,
+    uint32_t* channels, size_t channel_dwords);
+
 // A typed Vulkan storage image already exposes the guest format as exact row-major bytes. For a
 // tiled guest surface the tiler can therefore read the mapped staging image directly, unless a
 // poison-proving dispatch still needs a mutable linear copy to restore untouched texels.

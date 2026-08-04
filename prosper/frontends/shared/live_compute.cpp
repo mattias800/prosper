@@ -7738,6 +7738,71 @@ bool storage_image_unpack_raw_uvec4(const uint8_t* source, size_t source_bytes,
     return true;
 }
 
+size_t storage_image_raw_uvec4_source_bytes(
+    prosper::gpu::DataFormat format, uint32_t components,
+    uint32_t width, uint32_t height, uint32_t depth, uint32_t tile_mode,
+    bool in_mip_tail, uint32_t mip_tail_bytes) {
+    const uint32_t guest_texel = storage_image_guest_texel_bytes(format, components);
+    if (!guest_texel || !width || !height || !depth) return 0;
+    if (prosper::gpu::tile_mode_is_tiled(tile_mode)) {
+        if (depth > 1u)
+            return prosper::gpu::tiled_volume_bytes(
+                width, height, depth, tile_mode, guest_texel);
+        if (in_mip_tail) return mip_tail_bytes;
+        return prosper::gpu::tiled_surface_bytes(
+            width, height, tile_mode, 0, guest_texel);
+    }
+    if (width > SIZE_MAX / height) return 0;
+    const size_t plane_texels = static_cast<size_t>(width) * height;
+    if (plane_texels > SIZE_MAX / depth) return 0;
+    const size_t texels = plane_texels * depth;
+    return texels <= SIZE_MAX / guest_texel ? texels * guest_texel : 0;
+}
+
+bool storage_image_materialize_raw_uvec4(
+    const uint8_t* source, size_t source_bytes,
+    prosper::gpu::DataFormat format, uint32_t components,
+    uint32_t width, uint32_t height, uint32_t depth, uint32_t tile_mode,
+    bool in_mip_tail, uint32_t mip_tail_bytes,
+    uint32_t mip_tail_x, uint32_t mip_tail_y,
+    uint32_t* channels, size_t channel_dwords) {
+    const uint32_t guest_texel = storage_image_guest_texel_bytes(format, components);
+    const size_t required_source = storage_image_raw_uvec4_source_bytes(
+        format, components, width, height, depth, tile_mode,
+        in_mip_tail, mip_tail_bytes);
+    if (!source || !channels || !guest_texel || !required_source ||
+        source_bytes < required_source || width > SIZE_MAX / height)
+        return false;
+    const size_t plane_texels = static_cast<size_t>(width) * height;
+    if (plane_texels > SIZE_MAX / depth) return false;
+    const size_t texels = plane_texels * depth;
+    if (texels > SIZE_MAX / guest_texel) return false;
+    const size_t linear_bytes = texels * guest_texel;
+
+    if (!prosper::gpu::tile_mode_is_tiled(tile_mode))
+        return storage_image_unpack_raw_uvec4(
+            source, source_bytes, format, components, texels,
+            channels, channel_dwords);
+
+    std::vector<uint8_t> linear(linear_bytes);
+    bool detiled = true;
+    if (depth > 1u) {
+        detiled = prosper::gpu::detile_volume(
+            linear.data(), source, source_bytes, width, height, depth,
+            tile_mode, guest_texel);
+    } else if (in_mip_tail) {
+        prosper::gpu::detile_surface_level(
+            linear.data(), source, source_bytes, width, height, tile_mode,
+            guest_texel, mip_tail_x, mip_tail_y);
+    } else {
+        prosper::gpu::detile_surface(
+            linear.data(), source, width, height, tile_mode, 0, guest_texel);
+    }
+    return detiled && storage_image_unpack_raw_uvec4(
+        linear.data(), linear.size(), format, components, texels,
+        channels, channel_dwords);
+}
+
 bool compute_native_2d_transfer_format_compatible(prosper::gpu::DataFormat format,
                                                   uint32_t components) {
     // Keep this intentionally narrower than every format the sampled uploader can materialize.
