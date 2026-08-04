@@ -5,6 +5,7 @@
 // log/debug the guest's address-space construction.
 #include "dispatch.hpp"
 #include "dmem_caller_chain.hpp"
+#include "guest_memory_topology.hpp"
 #include "nid.hpp"
 #include "sce_errno.hpp"
 #include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
@@ -14,10 +15,12 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <iterator>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace prosper {
 // #312/#946 huge-reserve redirect threshold, shared by the Linux and Windows reserve paths (one
@@ -2117,6 +2120,188 @@ HLE(k_batch_map) {
          n ? *((const uint8_t*)(uintptr_t)a0 + 0x18) : 0, (unsigned long long)ret);
     if (a2) *(int32_t*)(uintptr_t)a2 = done;
     return ret;
+}
+
+GuestMemoryTopologyRelation guest_memory_topology_relation(
+        uint64_t first_address, uint64_t first_size,
+        uint64_t second_address, uint64_t second_size) {
+    if (!first_address || !first_size || first_address > UINT64_MAX - first_size ||
+        !second_address || !second_size || second_address > UINT64_MAX - second_size)
+        return GuestMemoryTopologyRelation::Unknown;
+    const uint64_t first_end = first_address + first_size;
+    const uint64_t second_end = second_address + second_size;
+    if (first_address < second_end && second_address < first_end)
+        return GuestMemoryTopologyRelation::Overlap;
+
+    std::lock_guard<std::mutex> lock(g_mx);
+    const auto resolve = [](uint64_t address, uint64_t size, const Mapping*& result) {
+        const auto after = std::upper_bound(
+            g_maps.begin(), g_maps.end(), address,
+            [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
+        if (after == g_maps.begin()) return false;
+        const Mapping& mapping = *std::prev(after);
+        if (!mapping.committed || address < mapping.base ||
+            address - mapping.base >= mapping.size ||
+            size > mapping.size - (address - mapping.base))
+            return false;
+        result = &mapping;
+        return true;
+    };
+    const Mapping* first = nullptr;
+    const Mapping* second = nullptr;
+    if (!resolve(first_address, first_size, first) ||
+        !resolve(second_address, second_size, second))
+        return GuestMemoryTopologyRelation::Unknown;
+
+    const bool first_direct = (first->query_flags & kVirtualQueryDirect) != 0;
+    const bool second_direct = (second->query_flags & kVirtualQueryDirect) != 0;
+    if (first_direct != second_direct || !first_direct)
+        return GuestMemoryTopologyRelation::Disjoint;
+
+    const uint64_t first_delta = first_address - first->base;
+    const uint64_t second_delta = second_address - second->base;
+    if (first_delta > UINT64_MAX - first->offset ||
+        second_delta > UINT64_MAX - second->offset)
+        return GuestMemoryTopologyRelation::Unknown;
+    const uint64_t first_physical = first->offset + first_delta;
+    const uint64_t second_physical = second->offset + second_delta;
+    if (first_physical > UINT64_MAX - first_size ||
+        second_physical > UINT64_MAX - second_size)
+        return GuestMemoryTopologyRelation::Unknown;
+    return first_physical < second_physical + second_size &&
+                   second_physical < first_physical + first_size
+               ? GuestMemoryTopologyRelation::Overlap
+               : GuestMemoryTopologyRelation::Disjoint;
+}
+
+bool guest_memory_gpu_write_supported(uint64_t destination, size_t bytes) {
+    if (!destination || !bytes || destination > UINT64_MAX - bytes)
+        return false;
+    std::lock_guard<std::mutex> lock(g_mx);
+    const auto after = std::upper_bound(
+        g_maps.begin(), g_maps.end(), destination,
+        [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
+    if (after == g_maps.begin()) return false;
+    const Mapping& mapping = *std::prev(after);
+    if (!mapping.committed || !(mapping.query_flags & kVirtualQueryDirect) ||
+        destination < mapping.base || destination - mapping.base >= mapping.size ||
+        bytes > mapping.size - (destination - mapping.base))
+        return false;
+    const uint64_t delta = destination - mapping.base;
+    if (mapping.offset > UINT64_MAX - delta) return false;
+    const uint64_t physical = mapping.offset + delta;
+    return dmem_fd() >= 0 && physical >= kDmemBase &&
+           physical - kDmemBase <= kDmemTotal &&
+           bytes <= kDmemTotal - (physical - kDmemBase);
+}
+
+bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t bytes) {
+    if (!source || !guest_memory_gpu_write_supported(destination, bytes)) return false;
+
+    auto resolve_direct = [](uint64_t address, size_t size, uint64_t& physical) {
+        const auto after = std::upper_bound(
+            g_maps.begin(), g_maps.end(), address,
+            [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
+        if (after == g_maps.begin()) return false;
+        const Mapping& mapping = *std::prev(after);
+        if (!mapping.committed || !(mapping.query_flags & kVirtualQueryDirect) ||
+            address < mapping.base || address - mapping.base >= mapping.size ||
+            size > mapping.size - (address - mapping.base))
+            return false;
+        const uint64_t delta = address - mapping.base;
+        if (mapping.offset > UINT64_MAX - delta) return false;
+        physical = mapping.offset + delta;
+        return physical >= kDmemBase && physical - kDmemBase <= kDmemTotal &&
+               size <= kDmemTotal - (physical - kDmemBase);
+    };
+
+    uint64_t physical = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mx);
+        if (!resolve_direct(destination, bytes, physical)) return false;
+    }
+    const int fd = dmem_fd();
+    if (fd < 0 || physical > static_cast<uint64_t>(INT64_MAX) ||
+        bytes > static_cast<uint64_t>(INT64_MAX) - physical)
+        return false;
+
+    size_t done = 0;
+    uint64_t dirty_begin = UINT64_MAX;
+    uint64_t dirty_end = 0;
+    const auto* input = static_cast<const uint8_t*>(source);
+    {
+        // Hold the authoritative topology lock across revalidation and the backing write, so an
+        // unmap/remap cannot redirect the operation after its destination proof. Do not acquire
+        // the write-watch mutex here: mapping paths use g_mx -> write-watch, and reversing that
+        // order would deadlock. A pwrite bypasses guest VA protection, so notification may follow.
+        std::lock_guard<std::mutex> lock(g_mx);
+        uint64_t current_physical = 0;
+        if (!resolve_direct(destination, bytes, current_physical) || current_physical != physical)
+            return false;
+
+        const auto write_span = [&](size_t offset, const uint8_t* span, size_t span_size) {
+            size_t span_done = 0;
+            while (span_done < span_size) {
+                const size_t remaining = span_size - span_done;
+                const size_t chunk = std::min<size_t>(
+                    remaining, static_cast<size_t>(SSIZE_MAX));
+                const ssize_t written = pwrite(
+                    fd, span + span_done, chunk,
+                    static_cast<off_t>(physical + offset + span_done));
+                if (written < 0 && errno == EINTR) continue;
+                if (written <= 0) break;
+                const uint64_t write_begin = physical + offset + span_done;
+                const uint64_t write_end = write_begin + static_cast<size_t>(written);
+                dirty_begin = std::min(dirty_begin, write_begin);
+                dirty_end = std::max(dirty_end, write_end);
+                span_done += static_cast<size_t>(written);
+            }
+            return span_done;
+        };
+
+        uint64_t source_physical = 0;
+        const bool source_is_direct = resolve_direct(
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source)), bytes,
+            source_physical);
+        const bool physical_overlap = source_is_direct &&
+            source_physical < physical + bytes && physical < source_physical + bytes;
+        if (physical_overlap && source_physical == physical) {
+            done = bytes;
+        } else if (physical_overlap) {
+            // The source and destination may be different VAs for overlapping bytes in the same
+            // shared backing. Host memmove/pwrite sees different pointers and cannot infer that
+            // physical alias. Stage bounded chunks and choose the physical memmove direction.
+            constexpr size_t kCopyChunk = 64u * 1024u;
+            std::vector<uint8_t> scratch(std::min(bytes, kCopyChunk));
+            if (physical > source_physical) {
+                size_t remaining = bytes;
+                while (remaining) {
+                    const size_t take = std::min(remaining, scratch.size());
+                    const size_t offset = remaining - take;
+                    std::memcpy(scratch.data(), input + offset, take);
+                    const size_t wrote = write_span(offset, scratch.data(), take);
+                    done += wrote;
+                    if (wrote != take) break;
+                    remaining = offset;
+                }
+            } else {
+                while (done < bytes) {
+                    const size_t take = std::min(bytes - done, scratch.size());
+                    std::memcpy(scratch.data(), input + done, take);
+                    const size_t wrote = write_span(done, scratch.data(), take);
+                    done += wrote;
+                    if (wrote != take) break;
+                }
+            }
+        } else {
+            done = write_span(0, input, bytes);
+        }
+    }
+    // Notify after releasing g_mx to preserve the global mapping -> watch lock order. Even a rare
+    // partial write dirties a conservative physical envelope before the failure is reported.
+    if (dirty_begin != UINT64_MAX)
+        host::guest_write_watch_notify_physical_write(dirty_begin, dirty_end - dirty_begin);
+    return done == bytes;
 }
 
 void register_kernel_mem_hle() {
@@ -5025,6 +5210,167 @@ HLE(k_wake_by_address) {
     if (a1 == 1) WakeByAddressSingle((PVOID)(uintptr_t)a0);
     else         WakeByAddressAll((PVOID)(uintptr_t)a0);
     return 0;
+}
+
+GuestMemoryTopologyRelation guest_memory_topology_relation(
+        uint64_t first_address, uint64_t first_size,
+        uint64_t second_address, uint64_t second_size) {
+    if (!first_address || !first_size || first_address > UINT64_MAX - first_size ||
+        !second_address || !second_size || second_address > UINT64_MAX - second_size)
+        return GuestMemoryTopologyRelation::Unknown;
+    const uint64_t first_end = first_address + first_size;
+    const uint64_t second_end = second_address + second_size;
+    if (first_address < second_end && second_address < first_end)
+        return GuestMemoryTopologyRelation::Overlap;
+
+    std::lock_guard<std::mutex> lock(g_mx);
+    const auto resolve = [](uint64_t address, uint64_t size, const Mapping*& result) {
+        const auto after = std::upper_bound(
+            g_maps.begin(), g_maps.end(), address,
+            [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
+        if (after == g_maps.begin()) return false;
+        const Mapping& mapping = *std::prev(after);
+        if (!mapping.committed || address < mapping.base ||
+            address - mapping.base >= mapping.size ||
+            size > mapping.size - (address - mapping.base))
+            return false;
+        result = &mapping;
+        return true;
+    };
+    const Mapping* first = nullptr;
+    const Mapping* second = nullptr;
+    if (!resolve(first_address, first_size, first) ||
+        !resolve(second_address, second_size, second))
+        return GuestMemoryTopologyRelation::Unknown;
+
+    const bool first_direct = (first->query_flags & kVirtualQueryDirect) != 0;
+    const bool second_direct = (second->query_flags & kVirtualQueryDirect) != 0;
+    if (first_direct != second_direct || !first_direct)
+        return GuestMemoryTopologyRelation::Disjoint;
+
+    const uint64_t first_delta = first_address - first->base;
+    const uint64_t second_delta = second_address - second->base;
+    if (first_delta > UINT64_MAX - first->offset ||
+        second_delta > UINT64_MAX - second->offset)
+        return GuestMemoryTopologyRelation::Unknown;
+    const uint64_t first_physical = first->offset + first_delta;
+    const uint64_t second_physical = second->offset + second_delta;
+    if (first_physical > UINT64_MAX - first_size ||
+        second_physical > UINT64_MAX - second_size)
+        return GuestMemoryTopologyRelation::Unknown;
+    return first_physical < second_physical + second_size &&
+                   second_physical < first_physical + first_size
+               ? GuestMemoryTopologyRelation::Overlap
+               : GuestMemoryTopologyRelation::Disjoint;
+}
+
+bool guest_memory_gpu_write_supported(uint64_t destination, size_t bytes) {
+    if (!destination || !bytes || destination > UINT64_MAX - bytes)
+        return false;
+    std::lock_guard<std::mutex> lock(g_mx);
+    const auto after = std::upper_bound(
+        g_maps.begin(), g_maps.end(), destination,
+        [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
+    if (after == g_maps.begin()) return false;
+    const Mapping& mapping = *std::prev(after);
+    if (!mapping.committed || !(mapping.query_flags & kVirtualQueryDirect) ||
+        destination < mapping.base || destination - mapping.base >= mapping.size ||
+        bytes > mapping.size - (destination - mapping.base))
+        return false;
+    const uint64_t delta = destination - mapping.base;
+    if (mapping.offset > UINT64_MAX - delta) return false;
+    const uint64_t physical = mapping.offset + delta;
+    return dmem_section() && physical >= kDmemBase &&
+           physical - kDmemBase <= kDmemTotal &&
+           bytes <= kDmemTotal - (physical - kDmemBase);
+}
+
+bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t bytes) {
+    if (!source || !guest_memory_gpu_write_supported(destination, bytes)) return false;
+
+    auto resolve_direct = [](uint64_t address, size_t size, uint64_t& physical) {
+        const auto after = std::upper_bound(
+            g_maps.begin(), g_maps.end(), address,
+            [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
+        if (after == g_maps.begin()) return false;
+        const Mapping& mapping = *std::prev(after);
+        if (!mapping.committed || !(mapping.query_flags & kVirtualQueryDirect) ||
+            address < mapping.base || address - mapping.base >= mapping.size ||
+            size > mapping.size - (address - mapping.base))
+            return false;
+        const uint64_t delta = address - mapping.base;
+        if (mapping.offset > UINT64_MAX - delta) return false;
+        physical = mapping.offset + delta;
+        return physical >= kDmemBase && physical - kDmemBase <= kDmemTotal &&
+               size <= kDmemTotal - (physical - kDmemBase);
+    };
+
+    uint64_t physical = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mx);
+        if (!resolve_direct(destination, bytes, physical)) return false;
+    }
+    HANDLE section = dmem_section();
+    if (!section) return false;
+
+    bool written = false;
+    {
+        // Match the POSIX lock order: prove and write while topology is stable, then notify after
+        // releasing g_mx. Mapping paths may take g_mx -> write-watch, never the reverse.
+        std::lock_guard<std::mutex> lock(g_mx);
+        uint64_t current_physical = 0;
+        if (!resolve_direct(destination, bytes, current_physical) || current_physical != physical)
+            return false;
+
+        const uint64_t relative = physical - kDmemBase;
+        const uint64_t file_offset = relative & ~(kWinAllocationGranularity - 1);
+        const uint64_t delta = relative - file_offset;
+        if (bytes > SIZE_MAX - delta) return false;
+        const size_t view_size = static_cast<size_t>(delta + bytes);
+        void* view = MapViewOfFile(section, FILE_MAP_ALL_ACCESS,
+                                   static_cast<DWORD>(file_offset >> 32),
+                                   static_cast<DWORD>(file_offset & 0xffffffffu), view_size);
+        if (!view) return false;
+        uint8_t* output = static_cast<uint8_t*>(view) + delta;
+        written = ensure_section_pages_committed(
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(output)), bytes, HP_R | HP_W);
+        if (written) {
+            uint64_t source_physical = 0;
+            const bool source_is_direct = resolve_direct(
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source)), bytes,
+                source_physical);
+            const bool physical_overlap = source_is_direct &&
+                source_physical < physical + bytes && physical < source_physical + bytes;
+            if (!physical_overlap) {
+                std::memmove(output, source, bytes);
+            } else if (source_physical != physical) {
+                constexpr size_t kCopyChunk = 64u * 1024u;
+                std::vector<uint8_t> scratch(std::min(bytes, kCopyChunk));
+                const auto* input = static_cast<const uint8_t*>(source);
+                if (physical > source_physical) {
+                    size_t remaining = bytes;
+                    while (remaining) {
+                        const size_t take = std::min(remaining, scratch.size());
+                        const size_t offset = remaining - take;
+                        std::memcpy(scratch.data(), input + offset, take);
+                        std::memcpy(output + offset, scratch.data(), take);
+                        remaining = offset;
+                    }
+                } else {
+                    size_t done = 0;
+                    while (done < bytes) {
+                        const size_t take = std::min(bytes - done, scratch.size());
+                        std::memcpy(scratch.data(), input + done, take);
+                        std::memcpy(output + done, scratch.data(), take);
+                        done += take;
+                    }
+                }
+            }
+        }
+        UnmapViewOfFile(view);
+    }
+    if (written) host::guest_write_watch_notify_physical_write(physical, bytes);
+    return written;
 }
 
 void register_kernel_mem_hle() {

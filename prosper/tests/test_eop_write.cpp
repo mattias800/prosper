@@ -8,6 +8,8 @@
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/mb3_freelist.hpp"
 #include "../src/gpu/pm4_decode.hpp"
+#include "../src/hle/dispatch.hpp"
+#include "../src/hle/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>   // setenv/_putenv_s: arm the #1226-retired suppression guards for this test
@@ -517,6 +519,236 @@ int main() {
               "rejected DMA/indirect submit executes neither copy nor stale register fold");
     }
 
+    // VA-disjoint ranges outside the authoritative guest mapping table are not evidence of physical
+    // disjointness. Keep unknown topology fail-closed rather than assuming ordinary host layout.
+    {
+        struct {
+            ShaderReg target{0x47, 0x11111111u};
+            uint8_t separation[64]{};
+            ShaderReg independent{0x48, 0x22222222u};
+        } untracked;
+        ShaderReg source{0x47, 0xAABBCCDDu};
+        const uint64_t src = (uint64_t)(uintptr_t)&source;
+        const uint64_t dst = (uint64_t)(uintptr_t)&untracked.target;
+        const uint64_t regs = (uint64_t)(uintptr_t)&untracked.independent;
+        uint32_t stream[11] = {};
+        stream[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[1] = (uint32_t)dst; stream[2] = (uint32_t)(dst >> 32);
+        stream[3] = (uint32_t)src; stream[4] = (uint32_t)(src >> 32);
+        stream[5] = sizeof(source); stream[6] = 0;
+        stream[7] = PM4(4, IT_NOP, R_SH_REGS_INDIRECT);
+        stream[8] = 1; stream[9] = (uint32_t)regs; stream[10] = (uint32_t)(regs >> 32);
+        GpuState st; run_cb(stream, 11, st);
+        CHECK(st.dma_execution_rejected && untracked.target.value == 0x11111111u &&
+                  st.sh.find(untracked.independent.offset) == st.sh.end(),
+              "VA-disjoint untracked topology remains fail-closed");
+    }
+
+    // Tactics Ogre uploads movie rows and later reads unrelated command arrays/fence labels in the
+    // same submit. The distinction must use physical topology, not VA intervals: two separate guest
+    // direct-memory views can alias the same physical pages. Build both views through the real HLE
+    // and prove disjoint physical offsets execute while equal-physical aliases remain fail-closed.
+    {
+        prosper::register_builtin_hle();
+        auto alloc = prosper::Hle::lookup(prosper::nid_hash("sceKernelAllocateDirectMemory"));
+        auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapDirectMemory"));
+        auto protect = prosper::Hle::lookup(prosper::nid_hash("sceKernelMprotect"));
+        auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+        auto release = prosper::Hle::lookup(prosper::nid_hash("sceKernelReleaseDirectMemory"));
+        constexpr uint64_t direct_len = 0x10000;
+        constexpr uint64_t direct_end = 0x10000000ull + 16ull * 1024 * 1024 * 1024;
+        uint64_t physical = 0, first_view = 0, second_view = 0;
+        const bool mapped = alloc && map && unmap && release &&
+            alloc(0, direct_end, direct_len, direct_len, 0,
+                  (uint64_t)(uintptr_t)&physical) == 0 &&
+            map((uint64_t)(uintptr_t)&first_view, direct_len, 0x2, 0,
+                physical, direct_len) == 0 && first_view &&
+            map((uint64_t)(uintptr_t)&second_view, direct_len, 0x2, 0,
+                physical, direct_len) == 0 && second_view && second_view != first_view;
+        CHECK(mapped, "mapped two virtual views of one direct-memory range for DMA alias guards");
+        if (mapped) {
+            uint64_t source = 0xA1B2C3D4E5F60718ull;
+            auto* target = (uint64_t*)(uintptr_t)(first_view + 0x100);
+            auto* independent_reg = (ShaderReg*)(uintptr_t)(second_view + 0x4000);
+            *target = 0;
+            *independent_reg = {0x45, 0x55667788u};
+            const uint64_t src = (uint64_t)(uintptr_t)&source;
+            const uint64_t dst = (uint64_t)(uintptr_t)target;
+            const uint64_t regs = (uint64_t)(uintptr_t)independent_reg;
+            uint32_t stream[11] = {};
+            stream[0] = PM4(7, IT_NOP, R_DMA_DATA);
+            stream[1] = (uint32_t)dst; stream[2] = (uint32_t)(dst >> 32);
+            stream[3] = (uint32_t)src; stream[4] = (uint32_t)(src >> 32);
+            stream[5] = sizeof(source); stream[6] = 0;
+            stream[7] = PM4(4, IT_NOP, R_SH_REGS_INDIRECT);
+            stream[8] = 1; stream[9] = (uint32_t)regs; stream[10] = (uint32_t)(regs >> 32);
+            GpuState disjoint_regs; run_cb(stream, 11, disjoint_regs);
+            CHECK(!disjoint_regs.dma_execution_rejected && *target == source &&
+                      disjoint_regs.sh.count(independent_reg->offset) &&
+                      disjoint_regs.sh[independent_reg->offset] == independent_reg->value,
+                  "physically disjoint indirect registers allow the retained DMA submit");
+
+            ShaderReg copied_reg{0x46, 0x99AABBCCu};
+            auto* alias_reg = (ShaderReg*)(uintptr_t)(second_view + 0x100);
+            *target = 0x1111111100000046ull;
+            memset(stream, 0, sizeof stream);
+            stream[0] = PM4(7, IT_NOP, R_DMA_DATA);
+            stream[1] = (uint32_t)dst; stream[2] = (uint32_t)(dst >> 32);
+            const uint64_t copied_src = (uint64_t)(uintptr_t)&copied_reg;
+            stream[3] = (uint32_t)copied_src; stream[4] = (uint32_t)(copied_src >> 32);
+            stream[5] = sizeof(copied_reg); stream[6] = 0;
+            stream[7] = PM4(4, IT_NOP, R_SH_REGS_INDIRECT);
+            const uint64_t alias_regs = (uint64_t)(uintptr_t)alias_reg;
+            stream[8] = 1; stream[9] = (uint32_t)alias_regs;
+            stream[10] = (uint32_t)(alias_regs >> 32);
+            GpuState aliased_regs; run_cb(stream, 11, aliased_regs);
+            CHECK(aliased_regs.dma_execution_rejected &&
+                      aliased_regs.sh.find(0x46) == aliased_regs.sh.end() &&
+                      alias_reg->value == 0x11111111u,
+                  "VA-disjoint same-physical indirect registers still reject fail-closed");
+
+            auto emit_wait = [&](uint64_t condition_address, uint64_t destination_address,
+                                 uint64_t source_address, uint32_t* wait_stream) {
+                memset(wait_stream, 0, 15 * sizeof(uint32_t));
+                wait_stream[0] = PM4(7, IT_NOP, R_DMA_DATA);
+                wait_stream[1] = (uint32_t)destination_address;
+                wait_stream[2] = (uint32_t)(destination_address >> 32);
+                wait_stream[3] = (uint32_t)source_address;
+                wait_stream[4] = (uint32_t)(source_address >> 32);
+                wait_stream[5] = sizeof(uint64_t);
+                wait_stream[7] = PM4(8, IT_NOP, R_WAIT_MEM_64);
+                wait_stream[8] = (uint32_t)condition_address;
+                wait_stream[9] = (uint32_t)(condition_address >> 32);
+                wait_stream[10] = 0xffffffffu;
+                wait_stream[12] = 1;
+                wait_stream[14] = 3;
+            };
+            uint64_t wait_source = 1;
+            auto* wait_target = (uint64_t*)(uintptr_t)(first_view + 0x200);
+            auto* disjoint_condition = (uint64_t*)(uintptr_t)(second_view + 0x5000);
+            *wait_target = 0; *disjoint_condition = 1;
+            uint32_t wait_stream[15];
+            emit_wait((uint64_t)(uintptr_t)disjoint_condition,
+                      (uint64_t)(uintptr_t)wait_target,
+                      (uint64_t)(uintptr_t)&wait_source, wait_stream);
+            GpuState disjoint_wait; run_cb(wait_stream, 15, disjoint_wait);
+            CHECK(!disjoint_wait.dma_execution_rejected && *wait_target == 1,
+                  "physically disjoint satisfied wait allows the retained DMA submit");
+
+            wait_target = (uint64_t*)(uintptr_t)(first_view + 0x300);
+            auto* alias_condition = (uint64_t*)(uintptr_t)(second_view + 0x300);
+            *wait_target = 0;
+            emit_wait((uint64_t)(uintptr_t)alias_condition,
+                      (uint64_t)(uintptr_t)wait_target,
+                      (uint64_t)(uintptr_t)&wait_source, wait_stream);
+            GpuState aliased_wait; run_cb(wait_stream, 15, aliased_wait);
+            CHECK(aliased_wait.dma_execution_rejected && *wait_target == 0,
+                  "VA-disjoint same-physical wait still rejects fail-closed");
+
+            // A GPU can write direct memory whose guest VA is CPU-read-only. Preserve that CPU
+            // protection and update the shared physical backing instead of weakening mprotect or
+            // blindly memmoving through the protected VA. Protect both aliases so this exercises
+            // the backing write itself, not an incidental writable alias.
+            auto* read_only_target = (uint64_t*)(uintptr_t)(second_view + 0x7000);
+            auto* read_only_alias = (uint64_t*)(uintptr_t)(first_view + 0x7000);
+            auto* overlap_source = (uint8_t*)(uintptr_t)(first_view + 0x7200);
+            auto* overlap_alias = (uint8_t*)(uintptr_t)(second_view + 0x7200);
+            auto* boundary_marker = (uint32_t*)(uintptr_t)(first_view + direct_len - 4);
+            *read_only_target = 0;
+            uint8_t overlap_expected[32] = {};
+            for (uint8_t i = 0; i < sizeof overlap_expected; ++i)
+                overlap_source[i] = overlap_expected[i] = i;
+            memmove(overlap_expected + 4, overlap_expected, 16);
+            *boundary_marker = 0x55667788u;
+            const bool protected_read_only = protect &&
+                protect(first_view, direct_len, 0x1, 0, 0, 0) == 0 &&
+                protect(second_view, direct_len, 0x1, 0, 0, 0) == 0;
+            CHECK(protected_read_only &&
+                      !guest_writable((uint64_t)(uintptr_t)read_only_target,
+                                      sizeof(*read_only_target)),
+                  "direct-memory DMA destination remains CPU-read-only");
+            if (protected_read_only) {
+                uint64_t gpu_source = 0x0F1E2D3C4B5A6978ull;
+                uint32_t gpu_stream[7] = {};
+                gpu_stream[0] = PM4(7, IT_NOP, R_DMA_DATA);
+                const uint64_t gpu_dst = (uint64_t)(uintptr_t)read_only_target;
+                const uint64_t gpu_src = (uint64_t)(uintptr_t)&gpu_source;
+                gpu_stream[1] = (uint32_t)gpu_dst;
+                gpu_stream[2] = (uint32_t)(gpu_dst >> 32);
+                gpu_stream[3] = (uint32_t)gpu_src;
+                gpu_stream[4] = (uint32_t)(gpu_src >> 32);
+                gpu_stream[5] = sizeof(gpu_source);
+                bool notified = false;
+                set_guest_gpu_write_observer(
+                    [&](uint64_t address, uint64_t size) {
+                        notified |= address == gpu_dst && size == sizeof(gpu_source);
+                    });
+                GpuState read_only_dma; run_cb(gpu_stream, 7, read_only_dma);
+                set_guest_gpu_write_observer({});
+                CHECK(*read_only_target == gpu_source && *read_only_alias == gpu_source &&
+                          notified && !guest_writable(gpu_dst, sizeof(gpu_source)),
+                      "GPU DMA updates CPU-read-only direct backing and every physical alias");
+
+                constexpr uint32_t fill_value = 0xA5B6C7D8u;
+                gpu_stream[3] = fill_value;
+                gpu_stream[4] = 0;
+                gpu_stream[5] = 3 * sizeof(uint32_t);
+                notified = false;
+                set_guest_gpu_write_observer(
+                    [&](uint64_t address, uint64_t size) {
+                        notified |= address == gpu_dst && size == 3 * sizeof(uint32_t);
+                    });
+                GpuState read_only_fill; run_cb(gpu_stream, 7, read_only_fill);
+                set_guest_gpu_write_observer({});
+                const auto* target_words = reinterpret_cast<const uint32_t*>(read_only_target);
+                const auto* alias_words = reinterpret_cast<const uint32_t*>(read_only_alias);
+                CHECK(target_words[0] == fill_value && target_words[1] == fill_value &&
+                          target_words[2] == fill_value && alias_words[0] == fill_value &&
+                          alias_words[1] == fill_value && alias_words[2] == fill_value &&
+                          notified && !guest_writable(gpu_dst, 3 * sizeof(uint32_t)),
+                      "GPU immediate fill updates CPU-read-only direct backing without relaxing protection");
+
+                // Two virtual aliases can hide physical overlap from std::memmove. Exercise the
+                // destructive direction (destination starts after source) and require physical
+                // memmove semantics through the protected-backing path.
+                const uint64_t overlap_src = first_view + 0x7200;
+                const uint64_t overlap_dst = second_view + 0x7204;
+                gpu_stream[1] = (uint32_t)overlap_dst;
+                gpu_stream[2] = (uint32_t)(overlap_dst >> 32);
+                gpu_stream[3] = (uint32_t)overlap_src;
+                gpu_stream[4] = (uint32_t)(overlap_src >> 32);
+                gpu_stream[5] = 16;
+                notified = false;
+                set_guest_gpu_write_observer(
+                    [&](uint64_t address, uint64_t size) {
+                        notified |= address == overlap_dst && size == 16;
+                    });
+                GpuState overlapping_dma; run_cb(gpu_stream, 7, overlapping_dma);
+                set_guest_gpu_write_observer({});
+                CHECK(memcmp(overlap_alias, overlap_expected, sizeof overlap_expected) == 0 &&
+                          notified && !guest_writable(overlap_dst, 16),
+                      "GPU DMA preserves memmove semantics across physical direct-memory aliases");
+
+                const uint64_t crossing_dst = second_view + direct_len - 4;
+                gpu_stream[1] = (uint32_t)crossing_dst;
+                gpu_stream[2] = (uint32_t)(crossing_dst >> 32);
+                gpu_stream[3] = (uint32_t)gpu_src;
+                gpu_stream[4] = (uint32_t)(gpu_src >> 32);
+                gpu_stream[5] = sizeof(gpu_source);
+                notified = false;
+                set_guest_gpu_write_observer(
+                    [&](uint64_t, uint64_t) { notified = true; });
+                GpuState crossing_dma; run_cb(gpu_stream, 7, crossing_dma);
+                set_guest_gpu_write_observer({});
+                CHECK(*boundary_marker == 0x55667788u && !notified,
+                      "GPU DMA rejects a destination crossing its direct mapping boundary");
+            }
+        }
+        if (first_view) unmap(first_view, direct_len, 0, 0, 0, 0);
+        if (second_view) unmap(second_view, direct_len, 0, 0, 0, 0);
+        if (physical) release(physical, direct_len, 0, 0, 0, 0);
+    }
+
     // Conversely, a later immediate DMA fill must not enter the completion FIFO and overtake an
     // earlier retained copy. Keeping the suffix in command_order leaves the destination filled.
     {
@@ -598,6 +830,18 @@ int main() {
                 CHECK(page[0] == 0x5A && page[sizeof(source) - 1] == 0x5A,
                       "DMA_DATA skips a read-only destination without modifying it");
                 CHECK(!notified, "a read-only DMA destination does not report a guest-memory write");
+
+                dma[3] = 0xA5B6C7D8u;
+                dma[4] = 0;
+                dma[5] = 3 * sizeof(uint32_t);
+                notified = false;
+                set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+                GpuState fill; run_cb(dma, 7, fill);
+                set_guest_gpu_write_observer({});
+                CHECK(page[0] == 0x5A && page[3 * sizeof(uint32_t) - 1] == 0x5A,
+                      "DMA_DATA skips an immediate fill into private read-only memory");
+                CHECK(!notified,
+                      "a rejected private read-only immediate fill does not report a write");
             }
 #ifdef _WIN32
             DWORD ignored = 0; VirtualProtect(page, page_size, PAGE_READWRITE, &ignored);

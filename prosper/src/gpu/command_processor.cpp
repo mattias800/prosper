@@ -1,5 +1,6 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "command_processor.hpp"
+#include "../hle/guest_memory_topology.hpp"
 #include "diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
 #include "mb3_freelist.hpp"
 #include "pm4_registers.hpp"
@@ -1664,12 +1665,15 @@ static DmaDataForm dma_data_form(const Pm4Command& c, bool source_materialized =
         // The immediate path peeks one qword for the consumed-marker safety journal.
         const uint32_t probe_bytes = c.dd_bytes < 8 ? 8 : c.dd_bytes;
         return c.dd_bytes <= kMaxImmediateBytes && !(c.dd_dst & 3) &&
-                       guest_readable(c.dd_dst, probe_bytes)
+                       guest_readable(c.dd_dst, probe_bytes) &&
+                       (guest_writable(c.dd_dst, c.dd_bytes) ||
+                        prosper::guest_memory_gpu_write_supported(c.dd_dst, c.dd_bytes))
                    ? DmaDataForm::Immediate
                    : DmaDataForm::Invalid;
     }
     return (source_materialized || guest_readable(c.dd_src, c.dd_bytes)) &&
-                   guest_writable(c.dd_dst, c.dd_bytes)
+                   (guest_writable(c.dd_dst, c.dd_bytes) ||
+                    prosper::guest_memory_gpu_write_supported(c.dd_dst, c.dd_bytes))
                ? DmaDataForm::Copy
                : DmaDataForm::Invalid;
 }
@@ -1684,9 +1688,9 @@ static void report_invalid_dma_data(const Pm4Command& c) {
                 (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes, c.dd_sels);
 }
 
-static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 0,
+static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 0,
                            const uint8_t* authoritative_source = nullptr) {
-    if (eop_writes_disabled() || !c.dd_valid) return;
+    if (eop_writes_disabled() || !c.dd_valid) return false;
     const uint64_t packet_addr = retained_packet_addr ? retained_packet_addr : pkt_addr(c);
     const DmaDataForm form = dma_data_form(c, authoritative_source != nullptr);
     // #1124 (gated): trace every DMA that targets a specific guest region — used to find whether a
@@ -1700,7 +1704,7 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     }
     if (form == DmaDataForm::Invalid) {
         report_invalid_dma_data(c);
-        return;
+        return false;
     }
     if (form == DmaDataForm::GdsImmediate) {
         // A GDS counter reset: the guest zeroes these offsets every frame, and the shaders that use
@@ -1718,9 +1722,10 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_GDSLOG"))
             fprintf(stderr, "[agc]   DmaData GDS fill [gds+0x%llx] := 0x%x (%u bytes)\n",
                     (unsigned long long)c.dd_dst, v32, c.dd_bytes);
-        return;
+        return true;
     }
     uint8_t* dst = (uint8_t*)(uintptr_t)c.dd_dst;
+    bool used_direct_backing = false;
     if (form == DmaDataForm::Immediate) {
         const uint32_t v32 = (uint32_t)c.dd_src;
         uint64_t pre_dma = peek_qword(c.dd_dst);   // #312: generation/membership pre-content
@@ -1733,30 +1738,49 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
             if (generation_changed) {
                 label_hist_dma_free(c.dd_dst, 0);
                 stale_dma_change_report(c.dd_dst, build_pre, pre_dma, packet_addr);
-                return;
+                return false;
             }
             Mb3FreelistMatch match{};
             if (mb3_freelist_contains_stable(c.dd_dst, &match)) {
                 label_hist_dma_free(c.dd_dst, match.pool_base);
                 mb3_freelist_report("DMA", c.dd_dst, pre_dma, &match, false);
-                return;
+                return false;
             }
         }
         forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, packet_addr);
         init_trip(c, pre_dma, v32);   // #1226: is THIS write the first half of the corruption?
         if (init_suppress(c, pre_dma, v32)) {   // #1226 A/B arm; default OFF
             label_hist_dma_skip(c.dd_dst);
-            return;
+            return false;
         }
         // After the suppression decision: the value trap answers "which prosper write STORED this
         // dword", so counting a write that never lands would make its hits unusable as provenance.
         write_trap_scan("DMA-imm", c.dd_dst, pre_dma, &v32, sizeof v32, packet_addr);
-        if (v32 == 0) {
-            memset(dst, 0, c.dd_bytes);
+        if (guest_writable(c.dd_dst, c.dd_bytes)) {
+            if (v32 == 0) {
+                memset(dst, 0, c.dd_bytes);
+            } else {
+                uint32_t i = 0;
+                for (; i + 4 <= c.dd_bytes; i += 4) memcpy(dst + i, &v32, 4);
+                if (i < c.dd_bytes) memcpy(dst + i, &v32, c.dd_bytes - i);
+            }
         } else {
-            uint32_t i = 0;
-            for (; i + 4 <= c.dd_bytes; i += 4) memcpy(dst + i, &v32, 4);
-            if (i < c.dd_bytes) memcpy(dst + i, &v32, c.dd_bytes - i);
+            // Device fills are allowed to target CPU-read-only direct memory too. Materialize a
+            // bounded repeated chunk and write the physical backing without changing VA protection.
+            constexpr size_t kFillChunk = 64u * 1024u;
+            std::vector<uint8_t> fill(std::min<size_t>(c.dd_bytes, kFillChunk));
+            for (size_t i = 0; i < fill.size(); ++i)
+                fill[i] = reinterpret_cast<const uint8_t*>(&v32)[i & 3u];
+            size_t done = 0;
+            while (done < c.dd_bytes) {
+                const size_t take = std::min<size_t>(fill.size(), c.dd_bytes - done);
+                if (!prosper::guest_memory_gpu_write(c.dd_dst + done, fill.data(), take)) {
+                    report_invalid_dma_data(c);
+                    return false;
+                }
+                done += take;
+            }
+            used_direct_backing = true;
         }
         poolshift_check("DMA", c.dd_dst, c.dd_bytes, c.dd_src, packet_addr);
         if (c.dd_bytes <= 8) label_hist_dma_exec(c.dd_dst, pre_dma, c.queue_origin);
@@ -1775,10 +1799,30 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         if (write_trap_armed())
             write_trap_scan("DMA-copy", c.dd_dst, 0, copy_src,
                             c.dd_bytes > 4096 ? 4096 : c.dd_bytes, packet_addr);
-        memmove(dst, copy_src, c.dd_bytes);
+        if (guest_writable(c.dd_dst, c.dd_bytes)) {
+            memmove(dst, copy_src, c.dd_bytes);
+        } else if (!prosper::guest_memory_gpu_write(c.dd_dst, copy_src, c.dd_bytes)) {
+            report_invalid_dma_data(c);
+            return false;
+        } else {
+            used_direct_backing = true;
+        }
         if (getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc]   DmaData copy [0x%llx] <- [0x%llx] (%u bytes)\n",
                     (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes);
+    }
+    if (used_direct_backing && getenv("PROSPER_DMA_BACKING_LOG")) {
+        // Exact positive control for device writes that bypass a CPU-read-only guest VA. Keep a
+        // separate ordinal per form and a sparse tail so neither kind can consume the other's log
+        // budget and the print count can never be mistaken for the event population.
+        static std::atomic<uint64_t> ordinals[2]{};
+        const size_t slot = form == DmaDataForm::Immediate ? 0 : 1;
+        const uint64_t ordinal = ordinals[slot].fetch_add(1, std::memory_order_relaxed) + 1;
+        if (prosper::diag_should_print(ordinal, 8))
+            fprintf(stderr,
+                    "[agc] DMA_DATA direct-backing %s #%llu dst=0x%llx bytes=%u\n",
+                    slot == 0 ? "fill" : "copy", (unsigned long long)ordinal,
+                    (unsigned long long)c.dd_dst, c.dd_bytes);
     }
     notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
     ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, packet_addr);
@@ -1787,6 +1831,7 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         record_guest_write(GuestWriterKind::DmaData, c.dd_dst, c.dd_bytes,
                            0, 0, c.stream_order, packet_addr);
     wake_on_label(c.dd_dst);
+    return true;
 }
 
 bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
@@ -1799,10 +1844,7 @@ bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
     c.dd_sels = copy.sels;
     c.dd_valid = true;
     c.stream_order = copy.command_order;
-    const bool executable = !eop_writes_disabled() &&
-        dma_data_form(c, authoritative_source != nullptr) != DmaDataForm::Invalid;
-    honor_dma_data(c, copy.packet_addr, authoritative_source);
-    return executable;
+    return honor_dma_data(c, copy.packet_addr, authoritative_source);
 }
 
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
@@ -2643,22 +2685,48 @@ int flush_deferred_streams() {
     return completed;
 }
 
+// An eager guest-memory reader after a retained address DMA is unsafe only when it can observe that
+// DMA's destination. Direct-memory aliases make VA-only interval comparison insufficient, so ask the
+// authoritative kernel mapping table about every VA-disjoint pair. Unknown/malformed/untracked
+// topology remains fail-closed; only a proven physical disjoint result relaxes the whole-submit
+// rejection. This is deliberately correctness-first despite the bounded mapping lookups.
+// Tactics Ogre's movie upload is the decisive disjoint case: thousands of row copies target its
+// Y/UV staging textures while later waits and indirect-register packets read separate allocations.
+static bool retained_dma_destination_overlaps(
+        const std::vector<GpuState::DmaCopy>& copies, uint64_t address, uint64_t bytes) {
+    if (!address || !bytes || address > UINT64_MAX - bytes) return true;
+    const uint64_t end = address + bytes;
+    for (const GpuState::DmaCopy& copy : copies) {
+        if (!copy.dst || !copy.bytes || copy.dst > UINT64_MAX - copy.bytes) return true;
+        const uint64_t copy_end = copy.dst + copy.bytes;
+        if (address < copy_end && copy.dst < end) return true;
+        if (guest_memory_topology_relation(address, bytes, copy.dst, copy.bytes) !=
+            GuestMemoryTopologyRelation::Disjoint)
+            return true;
+    }
+    return false;
+}
+
 void GpuState::apply(const Pm4Command& c) {
     using K = Pm4Command::Kind;
     command_order = c.stream_order ? c.stream_order : command_order + 1;
     switch (c.kind) {
         case K::SetRegsIndirect: {
-            if (!dma_copies.empty()) {
+            if (c.regs_vaddr == 0 || c.num_regs == 0 || c.num_regs > kMaxRegsPerPacket) return;
+            const uint64_t regs_bytes =
+                static_cast<uint64_t>(c.num_regs) * sizeof(ShaderReg);
+            if (!dma_copies.empty() &&
+                retained_dma_destination_overlaps(dma_copies, c.regs_vaddr, regs_bytes)) {
                 dma_execution_rejected = true;
                 static std::atomic<int> warned{0};
                 if (warned.fetch_add(1) < 24)
                     fprintf(stderr,
-                            "[agc] ordered DMA submit rejected: SetRegsIndirect reads guest memory "
-                            "after retained DMA (order=%llu)\n",
+                            "[agc] ordered DMA submit rejected: SetRegsIndirect overlaps retained "
+                            "DMA destination (addr=0x%llx bytes=%llu order=%llu)\n",
+                            (unsigned long long)c.regs_vaddr, (unsigned long long)regs_bytes,
                             (unsigned long long)command_order);
                 break;
             }
-            if (c.regs_vaddr == 0 || c.num_regs == 0 || c.num_regs > kMaxRegsPerPacket) return;
             // #312/#448: the indirect-register array lives in GUEST memory (regs_vaddr from the packet),
             // and a freed/decommitted or recycled command buffer can leave it unmapped. Every other
             // guest read in this file is guest_readable-guarded; this reader (up to 4096*8 = 32 KiB) was
@@ -3169,13 +3237,15 @@ void GpuState::apply(const Pm4Command& c) {
             if (eop_write_sync()) honor_dma_data(c); else pend_enqueue(c);
             break;
         case K::WaitRegMem:
-            if (!dma_copies.empty()) {
+            if (!dma_copies.empty() && c.wm_valid && c.wm_addr && !(c.wm_addr & 3) &&
+                retained_dma_destination_overlaps(dma_copies, c.wm_addr, 8)) {
                 dma_execution_rejected = true;
                 static std::atomic<int> warned{0};
                 if (warned.fetch_add(1) < 24)
                     fprintf(stderr,
-                            "[agc] ordered DMA submit rejected: WAIT_REG_MEM reads guest memory "
-                            "after retained DMA (order=%llu)\n",
+                            "[agc] ordered DMA submit rejected: WAIT_REG_MEM overlaps retained DMA "
+                            "destination (addr=0x%llx order=%llu)\n",
+                            (unsigned long long)c.wm_addr,
                             (unsigned long long)command_order);
                 break;
             }

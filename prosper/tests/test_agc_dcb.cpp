@@ -193,6 +193,69 @@ int main() {
           "DmaData source patch leaves the destination untouched (historical 9-dword packet)");
     CHECK(dma[3] == 0x00112233u && dma[4] == 0xAABBCCDDu,
           "DmaData source patch writes the full 64-bit source (historical 9-dword packet)");
+
+    // Tactics Ogre's movie upload reaches the same builder through its generic copyData helper.
+    // That call shape keeps a1 at zero and carries sourceKind=2 plus the real source pointer in a7.
+    // Encoding a1 makes a valid address copy become an immediate-zero fill, which leaves both movie
+    // planes byte-for-byte zero even though AvPlayer returned decoded pixels. Exercise the exact
+    // nine-argument ABI and require the packet—not merely a helper—to retain the source address.
+    {
+        auto dma_build = Hle::lookup("WmAc2MEj6Io");
+        CHECK(dma_build != nullptr, "sceAgcDcbDmaData registered for address-source ABI coverage");
+        if (dma_build) {
+            alignas(16) uint8_t source[64] = {};
+            uint32_t buf[16] = {};
+            Dcb d{}; d.bottom = buf; d.top = buf + 16; d.cursor_up = buf; d.cursor_down = buf + 16;
+            constexpr uint64_t dst = 0x2012340000ull;
+            const uint64_t src = (uint64_t)(uintptr_t)source;
+            auto* packet = (uint32_t*)(uintptr_t)
+                ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,
+                              uint64_t,uint64_t,uint64_t))dma_build)(
+                    (uint64_t)(uintptr_t)&d,
+                    /*srcImmediateOrOffset*/0, /*dstSel*/3, /*srcSel*/3, dst,
+                    /*policy*/3, /*sourceKind*/2, src, sizeof source);
+            CHECK(packet == buf && packet[0] == PM4(7, IT_NOP, R_DMA_DATA),
+                  "address-source DmaData call emits the ordinary seven-dword packet");
+            CHECK(packet[1] == (uint32_t)dst && packet[2] == (uint32_t)(dst >> 32u),
+                  "address-source DmaData preserves the destination address");
+            CHECK(packet[3] == (uint32_t)src && packet[4] == (uint32_t)(src >> 32u) &&
+                      packet[5] == sizeof source,
+                  "sourceKind=2 selects the stack source instead of immediate zero");
+
+            // The other ABI arm must remain independent of a7. Existing immediate/offset calls use
+            // sourceKind=0; give this one a deliberately tempting address in a7 and prove that the
+            // packet still contains a1. This keeps the historical fill path intact.
+            constexpr uint64_t immediate = 0x12345678ull;
+            d.cursor_up = buf;
+            packet = (uint32_t*)(uintptr_t)
+                ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,
+                              uint64_t,uint64_t,uint64_t))dma_build)(
+                    (uint64_t)(uintptr_t)&d,
+                    immediate, /*dstSel*/3, /*srcSel*/0, dst,
+                    /*policy*/2, /*sourceKind*/0, src, sizeof source);
+            CHECK(packet == buf && packet[0] == PM4(7, IT_NOP, R_DMA_DATA),
+                  "immediate-source DmaData call emits the ordinary seven-dword packet");
+            CHECK(packet[3] == (uint32_t)immediate && packet[4] == 0 &&
+                      packet[5] == sizeof source,
+                  "sourceKind=0 preserves a1 even when stack source looks addressable");
+
+            // An asserted address form must not degrade into an immediate fill merely because the
+            // address is malformed or currently unmapped. The executor owns validation and will
+            // reject this address visibly; the builder's only job is to retain the selected form.
+            constexpr uint64_t invalid_source = 0x00007fdeadbeef00ull;
+            d.cursor_up = buf;
+            packet = (uint32_t*)(uintptr_t)
+                ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,
+                              uint64_t,uint64_t,uint64_t))dma_build)(
+                    (uint64_t)(uintptr_t)&d,
+                    immediate, /*dstSel*/3, /*srcSel*/3, dst,
+                    /*policy*/3, /*sourceKind*/2, invalid_source, sizeof source);
+            CHECK(packet[3] == (uint32_t)invalid_source &&
+                      packet[4] == (uint32_t)(invalid_source >> 32u),
+                  "sourceKind=2 retains an invalid address instead of silently filling from a1");
+        }
+    }
+
     // #1124's clobbered-header recovery, and the ONLY guard on it (#1756). Alex Kidd (PPSA02664,
     // rung 6) zeroes a DMA_DATA header before patching it; dma_patch_recover_header rebuilds the
     // header from scratch, which means it STAMPS A LENGTH. That length must equal what the builder

@@ -36,7 +36,7 @@ uint32_t guest_linear_texture_row_pitch(uint64_t address, uint32_t visible_row_b
     auto it = g_linear_texture_layouts.upper_bound(address);
     if (it == g_linear_texture_layouts.begin()) return 0;
     --it;
-    return address < it->second.end && visible_row_bytes == it->second.row_pitch_bytes
+    return address < it->second.end && visible_row_bytes <= it->second.row_pitch_bytes
         ? it->second.row_pitch_bytes : 0;
 }
 

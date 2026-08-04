@@ -1613,36 +1613,58 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     };
                     if (r.cls == RC::Texture || r.cls == RC::StorageImage) {
                         uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
-                        // AvPlayer exposes NV12 as a tight R8 luma plane followed by an RG8 UV plane.
-                        // Live resources carry exact HLE allocation provenance. Capture replay has no
-                        // process-local registry, so recognize the same two-plane contract from the
-                        // captured table: matching tight pitches, 2:1 extents, and adjacent guest VAs.
+                        // AvPlayer exposes NV12 as an R8 luma plane followed by an RG8 UV plane. The
+                        // visible row can be narrower than its physical pitch. Live HLE resources carry
+                        // exact allocation provenance; title-staged/captured copies retain the same
+                        // contract in their descriptors: matching pitches, 2:1 extents, and adjacent
+                        // allocations (the second allocation may begin at the next 64 KiB boundary).
                         // Keep this deliberately narrower than all RG8 resources; several established
                         // game paths still rely on the historical narrow-texture coverage broadcast.
                         const bool avplayer_chroma_layout = [&] {
                             if (r.cls != RC::Texture || r.format != prosper::gpu::DataFormat::Unorm8 ||
                                 r.num_components != 2 || r.img_dim != 1u || r.tile_mode != 0u ||
-                                r.compression_enabled || r.swizzle[0] != 4 || r.swizzle[1] != 5 ||
-                                r.swizzle[2] != 0 || r.swizzle[3] != 1 || tw > UINT32_MAX / 2u)
+                                r.compression_enabled || tw > UINT32_MAX / 2u)
                                 return false;
+                            const bool rg01_swizzle =
+                                r.swizzle[0] == 4 && r.swizzle[1] == 5 &&
+                                r.swizzle[2] == 0 && r.swizzle[3] == 1;
+                            const bool xxxy_swizzle =
+                                r.swizzle[0] == 4 && r.swizzle[1] == 4 &&
+                                r.swizzle[2] == 4 && r.swizzle[3] == 5;
+                            if (!rg01_swizzle && !xxxy_swizzle) return false;
                             const uint32_t row_bytes = tw * 2u;
-                            if (prosper::gpu::guest_linear_texture_row_pitch(r.gpu_addr, row_bytes) ==
-                                row_bytes)
+                            const uint32_t registered_pitch =
+                                prosper::gpu::guest_linear_texture_row_pitch(
+                                    r.gpu_addr, row_bytes);
+                            if (registered_pitch >= row_bytes)
                                 return true;
-                            if (!r.host_data || r.linear_row_pitch_bytes != row_bytes) return false;
+                            const uint32_t chroma_pitch = r.linear_row_pitch_bytes
+                                ? r.linear_row_pitch_bytes
+                                : static_cast<uint32_t>(
+                                      prosper::gpu::linear_sampled_row_pitch(tw, 2u));
+                            if (chroma_pitch < row_bytes) return false;
                             for (const auto& luma : t->resources) {
                                 if (luma.cls != RC::Texture ||
                                     luma.format != prosper::gpu::DataFormat::Unorm8 ||
                                     luma.num_components != 1 || luma.img_dim != 1u ||
                                     luma.tile_mode != 0u || luma.compression_enabled ||
                                     luma.width != row_bytes ||
-                                    (static_cast<uint64_t>(luma.height) + 1u) / 2u != th ||
-                                    luma.linear_row_pitch_bytes != row_bytes)
+                                    (static_cast<uint64_t>(luma.height) + 1u) / 2u != th)
                                     continue;
+                                const uint32_t luma_pitch = luma.linear_row_pitch_bytes
+                                    ? luma.linear_row_pitch_bytes
+                                    : static_cast<uint32_t>(
+                                          prosper::gpu::linear_sampled_row_pitch(
+                                              luma.width, 1u));
+                                if (luma_pitch != chroma_pitch) continue;
                                 const uint64_t luma_bytes =
-                                    static_cast<uint64_t>(row_bytes) * luma.height;
-                                if (luma.gpu_addr <= UINT64_MAX - luma_bytes &&
-                                    luma.gpu_addr + luma_bytes == r.gpu_addr)
+                                    static_cast<uint64_t>(luma_pitch) * luma.height;
+                                if (luma.gpu_addr > UINT64_MAX - luma_bytes) continue;
+                                const uint64_t luma_end = luma.gpu_addr + luma_bytes;
+                                if (luma_end == r.gpu_addr)
+                                    return true;
+                                if (luma_end <= UINT64_MAX - 0xffffu &&
+                                    ((luma_end + 0xffffu) & ~uint64_t{0xffffu}) == r.gpu_addr)
                                     return true;
                             }
                             return false;
@@ -2197,9 +2219,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             r.format == prosper::gpu::DataFormat::Unorm8 &&
                             r.num_components == 1 && r.tile_mode == 0u &&
                             !r.compression_enabled && !linear_padded_read;
-                        // AvPlayer's exact chroma plane is already tight interleaved RG8. Keeping it
-                        // native halves the upload bytes and avoids the CPU RGBA expansion on every
-                        // decoded frame while the descriptor swizzle still preserves U/V semantics.
+                        // AvPlayer's exact chroma plane is interleaved RG8. Keeping it native halves
+                        // the upload bytes and avoids CPU RGBA expansion while the descriptor swizzle
+                        // preserves U/V. A pitch-padded source is copied row-by-row below.
                         const bool native_rg8_sampled = avplayer_chroma_layout;
                         // Storage-image atomics require a typed integer Vulkan view. Keep R32_UINT
                         // texels byte-exact through the existing 4-B read/detile path instead of
@@ -3556,13 +3578,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             narrow_decode_done = true;
                             narrow_done = true;
                         } else if (native_rg8_sampled) {
-                            // Tight RG8 is already the backend's two-byte sampled representation.
-                            linear_source_prefix_size = copy_resource(
-                                texture_pixels.data(), sampled_source_addr,
-                                texture_pixels.size());
-                            if (linear_source_prefix_size < texture_pixels.size())
-                                std::fill(texture_pixels.begin() + linear_source_prefix_size,
-                                          texture_pixels.end(), 0);
+                            // RG8 is already the backend's two-byte sampled representation. Strip
+                            // physical row padding when present; a contiguous copy would advance the
+                            // next visible row into padding and produce a diagonal chroma weave.
+                            if (linear_padded_read) {
+                                linear_source_prefix_size = copy_linear_padded_rows(
+                                    texture_pixels.data(), linear_dst_row, th);
+                            } else {
+                                linear_source_prefix_size = copy_resource(
+                                    texture_pixels.data(), sampled_source_addr,
+                                    texture_pixels.size());
+                                if (linear_source_prefix_size < texture_pixels.size())
+                                    std::fill(texture_pixels.begin() + linear_source_prefix_size,
+                                              texture_pixels.end(), 0);
+                            }
                             narrow_decode_done = true;
                             narrow_done = true;
                         } else if (bpt < 4) {

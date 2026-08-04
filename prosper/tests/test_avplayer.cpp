@@ -342,10 +342,12 @@ int main() {
           "1920 visible bytes are copied row-by-row while luma/chroma padding remains cleared");
     CHECK(gpu::guest_linear_texture_row_pitch(staged_address, FakeVideoBackend::kStride) ==
               FakeVideoBackend::kStride &&
+          gpu::guest_linear_texture_row_pitch(staged_address, FakeVideoBackend::kWidth) ==
+              FakeVideoBackend::kStride &&
           gpu::guest_linear_texture_row_pitch(
               staged_address + native_y_bytes,
-              FakeVideoBackend::kStride) == FakeVideoBackend::kStride,
-          "native luma and chroma addresses retain exact padded-layout provenance for GPU sampling");
+              FakeVideoBackend::kWidth) == FakeVideoBackend::kStride,
+          "native luma and chroma addresses expose their exact physical pitch for visible rows");
     fake.nv12[0] = 0x7f;
     CHECK(static_cast<const uint8_t*>(native_frame.data)[0] == 0x40,
           "guest frame storage remains independent when the backend recycles its packet");
