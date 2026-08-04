@@ -37,6 +37,8 @@ int main() {
     // --- Accepted: the exact instructions observed faulting in DOLL's init walk. ---
     expect_ok("mov (%rdx),%rdx",        {0x48,0x8b,0x12},              2, 3);  // reg=rdx
     expect_ok("mov 0x8(%rdx),%rax",     {0x48,0x8b,0x42,0x08},         0, 4);  // reg=rax, disp8
+    // Exact low-address read reached by Beneath when Linux cannot map the diagnostic zero page.
+    expect_ok("mov 0x8(%rdx),%rdx",     {0x48,0x8b,0x52,0x08},         2, 4);
     expect_ok("mov disp32(%rdx),%rax",  {0x48,0x8b,0x82,0x34,0x12,0,0},0, 7);  // disp32
     // --- Accepted: register-extension and size variants where full-dest zero is correct. ---
     expect_ok("mov r8,(%rsi) [REX.R]",  {0x4c,0x8b,0x06},              8, 3);  // REX.WR -> r8

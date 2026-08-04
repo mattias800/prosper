@@ -2,6 +2,7 @@
 // on non-Linux so the shared (mingw) build is unaffected.
 #include "exec_image.hpp"
 #include "sse4a.hpp"
+#include "x86_read_decode.hpp"
 #include "guest_write_watch.hpp"
 #include "fs_emu.hpp"
 #include "raw_syscall.hpp"
@@ -135,6 +136,55 @@ namespace {
     bool     g_null_page = false;              // PROSPER_NULL_PAGE: back low null reads with zero page
     volatile sig_atomic_t g_null_page_count = 0;
     unsigned g_null_page_mask = 0;             // which of the 16 low pages [0,0x10000) are backed
+    void nullpage_deep_dump(ucontext_t* uc, uint64_t rip);
+#ifdef __linux__
+    // Linux's gregset order is not the architectural x86 register encoding used by
+    // decode_low_read_dest(): map rax..r15 explicitly rather than treating the two layouts as alike.
+    constexpr int kX86ToLinuxGreg[16] = { REG_RAX, REG_RCX, REG_RDX, REG_RBX,
+                                           REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+                                           REG_R8,  REG_R9,  REG_R10, REG_R11,
+                                           REG_R12, REG_R13, REG_R14, REG_R15 };
+
+    // When the host forbids mapping below vm.mmap_min_addr, preserve the NULL_PAGE probe's narrow
+    // read-as-zero behavior only for an instruction form the shared decoder proves safe. This is a
+    // fallback for the same low-page mapping the probe would otherwise install, not a general null
+    // dereference recovery: writes, instruction fetches, protection faults, map failures other than
+    // the host-policy denials, and every unknown instruction all remain on the normal fatal path.
+    bool try_emulate_denied_null_read(ucontext_t* uc, uint64_t addr, uint64_t rip, long map_result) {
+        constexpr uint64_t kPageFaultWrite = 1ull << 1;
+        constexpr uint64_t kPageFaultInstructionFetch = 1ull << 4;
+        if (map_result != -EPERM && map_result != -EACCES) return false;
+        if (addr >= 0x10000ull || addr == rip || !uc ||
+            (PROSPER_REG_ERR(uc) & (kPageFaultWrite | kPageFaultInstructionFetch))) return false;
+
+        // The current instruction page was executable (or the CPU could not have reached this data
+        // fault). Do not read beyond that page in the handler: a cross-page instruction is declined
+        // rather than risking a nested fault while decoding it.
+        size_t avail = (size_t)(0x1000ull - (rip & 0xfffull));
+        if (avail > 15) avail = 15; // x86-64's architectural maximum instruction length
+        int dest = 0, insn_len = 0;
+        if (!decode_low_read_dest((const uint8_t*)rip, avail, &dest, &insn_len)) return false;
+
+        auto regs = PROSPER_GREGS(uc);
+        regs[kX86ToLinuxGreg[dest]] = 0;
+        regs[REG_RIP] = (greg_t)(rip + (uint64_t)insn_len);
+
+        g_null_page_count = g_null_page_count + 1;
+        const int count = (int)g_null_page_count;
+        // Keep the fallback observable without allowing a malformed/null-chain loop to flood a log.
+        // The printed monotonic count makes the cap explicit rather than disguising it as frequency.
+        if (count <= 64 || (count & 1023) == 0) {
+            char b[192];
+            int n = snprintf(b, sizeof b,
+                             "[nullpage] #%d EMULATED-READ addr=0x%llx rip=%s+0x%llx maperr=%ld\n",
+                             count, (unsigned long long)addr, gmod(rip),
+                             (unsigned long long)goff(rip), map_result);
+            raw_write(2, b, (uint64_t)n);
+        }
+        nullpage_deep_dump(uc, rip);
+        return true;
+    }
+#endif
     // PROSPER_WATCH_COMPANION: write-watchpoint on the companion slot [obj+0x140] that the reader
     // eboot+0xba6e08 finds null. Armed on the first such read (r15 known); the slot is null there, so
     // any real writer MUST run after — this catches all of them. Implemented by mprotect-ing the
@@ -1935,9 +1985,16 @@ namespace {
                     nullpage_deep_dump(uc, rip);   // issue-#312 attribution dump (registers + heap + GPU ring)
                     return;   // re-execute; the null read now sees zero
                 }
+#ifdef __linux__
+                // Rootless/containerized Linux commonly rejects only this diagnostic mapping with
+                // EPERM/EACCES. Emulate a strictly decoder-proven *read* instead of letting host
+                // policy decide whether that diagnostic can reach the guest's next real endpoint.
+                // Any unsupported access remains fail-visible below.
+                if (si->si_code == SEGV_MAPERR && try_emulate_denied_null_read(uc, a, rip, mr)) return;
+#endif
                 // Fail-visible: low mappings need CAP_SYS_RAWIO once addr < vm.mmap_min_addr
-                // (default 65536), so unprivileged/containerized hosts land here. Fall through
-                // to the normal fatal report instead of silently retrying.
+                // (default 65536). If the conservative fallback above cannot prove this is an
+                // emulatable read, fall through to the normal fatal report instead of guessing.
                 char b[160];
                 int n = snprintf(b, sizeof b,
                                  "[nullpage] BACKING DENIED addr=0x%llx rip=eboot+0x%llx err=%ld"
