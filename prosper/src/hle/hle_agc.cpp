@@ -615,9 +615,10 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
     return (uint64_t)(uintptr_t)cmd;
 }
 // sceAgcDcbDmaData (WmAc2MEj6Io) — append a CP-DMA packet (issue #312, the MallocBinned3 heap-
-// corruption root cause). ABI RE-pinned from three eboot callsites (disassembly, this branch):
-//   sceAgcDcbDmaData(dcb, srcAddressOrOffsetOrImmediate, srcSel?, dstSel?, dstAddressOrOffset,
-//                    <sel/policy>, stack7, stack8, stack9=numBytes, ..., stack12=isBlocking)
+// corruption root cause). ABI RE-pinned from four eboot callsites (disassembly, this branch):
+//   sceAgcDcbDmaData(dcb, srcImmediateOrOffset, dstSel?, srcSel?, dstAddressOrOffset,
+//                    <sel/policy>, sourceKind, sourceAddress, stack9=numBytes, ...,
+//                    stack12=isBlocking)
 // Evidence for the roles:
 //  - eboot+0x221ad2d..6c: GMalloc->Malloc(size) result (+ running offset) is passed in A4 and the
 //    packet fills it — a freshly-allocated buffer can only be a DESTINATION, so a4 = dst.
@@ -632,10 +633,19 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
 //    this generation's fence packets are still in flight, and our (faithful) value-1 fence writes
 //    then land in freed MallocBinned3 memory — the #312 "Canary was 0x3, should be 0x1" /
 //    "free an unrecognized block 0x1000000001" / 0x20015f00 freelist-pop fatals.
+//  - Tactics Ogre eboot+0x5a0ac0 emits the address-backed copy form used by its movie upload. It
+//    passes sourceKind=2 and the decoded row address in stack arg8 (a7), while a1 remains zero. The
+//    old builder encoded a1 unconditionally, turning every movie row copy into an immediate-zero
+//    fill. The two call shapes are self-distinguishing: the established immediate/placeholder forms
+//    pass sourceKind=0 and sourceAddress=0; the address form passes sourceKind=2 and a 64-bit source.
+//    Select solely from that ABI discriminator: an invalid address must reach the executor and fail
+//    visibly rather than silently changing into an immediate fill.
 // numBytes is stack arg9. The import ABI bridge forwards args 7-9 as normal fixed parameters on
 // Windows and on Linux's guest-FS path; no compiler-frame decoding is involved (#672).
-// Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=sels,
-// [7..8]=the destination qword when this exact packet was built (#312 generation identity).
+// Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=selector
+// bytes plus prosper's kDmaDataAddressSource form bit. The bit is necessary because sourceKind=2
+// can assert an address whose numeric value is still <=32 bits; discarding the kind would silently
+// reinterpret an invalid/unmapped address as an immediate fill in the executor.
 // CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol);
 // MED on the selector args (recorded raw; the executor distinguishes the captured 32-bit immediate
 // domain from mapped 64-bit address sources and keeps GDS/unmapped forms fail-closed).
@@ -646,21 +656,27 @@ static uint64_t label_build_pre(uint64_t dst, uint64_t num_bytes) {
     return pre;
 }
 
-HLE9(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, ..., stack9=numBytes)
+HLE9(agc_dcb_dma_data) {  // (..., srcImmediate, dstSel?, srcSel?, dst, policy, sourceKind, sourceAddress, bytes)
     uint64_t num_bytes = a8 <= 0x10000000ull ? a8 : 0;
+    const bool address_source = a6 == 2;
+    const uint64_t src_or_imm = address_source ? a7 : a1;
     static std::atomic<uint64_t> g_dma_n{0};
     uint32_t* cmd; if (!begin_packet(a0, kDwDmaData, IT_NOP, R_DMA_DATA, &cmd)) return 0;
     if (getenv("PROSPER_PREDLOG") || getenv("PROSPER_GFXLOG")) {
         uint64_t k = g_dma_n.fetch_add(1);
         if (k < 48 || (k % 4096) == 0)
-            fprintf(stderr, "[pred] DcbDmaData #%llu cmd=%p dst=0x%llx srcOrImm=0x%llx bytes=0x%llx sels=0x%llx/0x%llx\n",
-                    (unsigned long long)k, (void*)cmd, (unsigned long long)a4, (unsigned long long)a1,
-                    (unsigned long long)num_bytes, (unsigned long long)a2, (unsigned long long)a3);
+            fprintf(stderr, "[pred] DcbDmaData #%llu cmd=%p dst=0x%llx srcOrImm=0x%llx bytes=0x%llx sels=0x%llx/0x%llx source-kind=0x%llx source-address=0x%llx selected=%s\n",
+                    (unsigned long long)k, (void*)cmd, (unsigned long long)a4,
+                    (unsigned long long)src_or_imm, (unsigned long long)num_bytes,
+                    (unsigned long long)a2, (unsigned long long)a3,
+                    (unsigned long long)a6, (unsigned long long)a7,
+                    address_source ? "address" : "immediate/offset");
     }
     cmd[1] = (uint32_t)(a4 & 0xffffffffu); cmd[2] = (uint32_t)(a4 >> 32u);
-    cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
+    cmd[3] = (uint32_t)(src_or_imm & 0xffffffffu); cmd[4] = (uint32_t)(src_or_imm >> 32u);
     cmd[5] = (uint32_t)num_bytes;
-    cmd[6] = (uint32_t)((a2 & 0xffu) | ((a3 & 0xffu) << 8));
+    cmd[6] = (uint32_t)((a2 & 0xffu) | ((a3 & 0xffu) << 8) |
+                        (address_source ? gpu::kDmaDataAddressSource : 0u));
     if (num_bytes <= 8) {
         prosper_label_hist_dma_built(a4, a0, (uint32_t)a1, 1);                  // #312 label-init form
     }

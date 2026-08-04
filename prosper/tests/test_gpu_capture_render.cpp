@@ -1,5 +1,6 @@
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/gpu_execute.hpp"
+#include "../src/gpu/guest_texture_layout.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/tile.hpp"
 #include "../src/gpu/videoout_present.hpp"
@@ -426,6 +427,82 @@ int main() {
         }
         CHECK(rg_preserved,
               "narrow RG8 uploads preserve both channels and apply the descriptor swizzle");
+
+        // Extended AvPlayer frames retain 1920 visible bytes inside a 2048-byte physical row.
+        // Tactics Ogre samples the interleaved UV plane with (X,X,X,Y), so V reaches alpha. Prove
+        // both the HLE layout-provenance arm and the padded native-RG8 row copy: a contiguous copy
+        // would sample the zero padding as the second row, while the legacy coverage broadcast
+        // would replace alpha with U.
+        uint8_t padded_rg_texels[16] = {
+            32, 224, 32, 224, 0, 0, 0, 0,
+            32, 224, 32, 224, 0, 0, 0, 0,
+        };
+        DrawItem registered_padded_draw = rg_draw;
+        registered_padded_draw.color0_base = 0x211000;
+        auto registered_padded_table =
+            std::make_shared<ShaderResourceTable>(*registered_padded_draw.prt);
+        registered_padded_table->resources.resize(1);
+        ShaderResource& registered_rg = registered_padded_table->resources[0];
+        registered_rg.gpu_addr = 0x130000;
+        registered_rg.size = 8;
+        registered_rg.linear_row_pitch_bytes = 8;
+        registered_rg.host_data = padded_rg_texels;
+        registered_rg.host_data_size = sizeof(padded_rg_texels);
+        registered_rg.swizzle[0] = 4; registered_rg.swizzle[1] = 4;
+        registered_rg.swizzle[2] = 4; registered_rg.swizzle[3] = 5;
+        registered_padded_draw.prt = std::move(registered_padded_table);
+        register_guest_linear_texture_layout(
+            registered_rg.gpu_addr, sizeof(padded_rg_texels), 8);
+        const std::vector<uint8_t> registered_padded_pixels =
+            render_submit_items({registered_padded_draw}, W, H);
+        unregister_guest_linear_texture_layout(registered_rg.gpu_addr);
+        bool registered_padded_preserved =
+            registered_padded_pixels.size() == static_cast<size_t>(W) * H * 4;
+        if (registered_padded_preserved) {
+            const uint8_t* center = &registered_padded_pixels[
+                (static_cast<size_t>(H / 2) * W + W / 2) * 4];
+            registered_padded_preserved =
+                center[0] >= 24 && center[0] <= 40 &&
+                center[1] >= 24 && center[1] <= 40 &&
+                center[2] >= 24 && center[2] <= 40 &&
+                center[3] >= 216 && center[3] <= 232;
+        }
+        CHECK(registered_padded_preserved,
+              "registered padded NV12 chroma preserves V through an alpha swizzle");
+
+        // Captures cannot retain the process-local HLE registry. Recover only the same narrow
+        // contract from a matching full-resolution luma plane immediately before the chroma plane.
+        DrawItem captured_padded_draw = registered_padded_draw;
+        captured_padded_draw.color0_base = 0x212000;
+        auto captured_padded_table =
+            std::make_shared<ShaderResourceTable>(*captured_padded_draw.prt);
+        uint8_t padded_luma_texels[32] = {};
+        ShaderResource padded_luma = captured_padded_table->resources[0];
+        padded_luma.binding = 5;
+        padded_luma.gpu_addr = registered_rg.gpu_addr - sizeof(padded_luma_texels);
+        padded_luma.num_components = 1;
+        padded_luma.width = padded_luma.height = 4;
+        padded_luma.size = 16;
+        padded_luma.linear_row_pitch_bytes = 8;
+        padded_luma.host_data = padded_luma_texels;
+        padded_luma.host_data_size = sizeof(padded_luma_texels);
+        captured_padded_table->resources.push_back(padded_luma);
+        captured_padded_draw.prt = std::move(captured_padded_table);
+        const std::vector<uint8_t> captured_padded_pixels =
+            render_submit_items({captured_padded_draw}, W, H);
+        bool captured_padded_preserved =
+            captured_padded_pixels.size() == static_cast<size_t>(W) * H * 4;
+        if (captured_padded_preserved) {
+            const uint8_t* center = &captured_padded_pixels[
+                (static_cast<size_t>(H / 2) * W + W / 2) * 4];
+            captured_padded_preserved =
+                center[0] >= 24 && center[0] <= 40 &&
+                center[1] >= 24 && center[1] <= 40 &&
+                center[2] >= 24 && center[2] <= 40 &&
+                center[3] >= 216 && center[3] <= 232;
+        }
+        CHECK(captured_padded_preserved,
+              "captured padded NV12 adjacency preserves V through an alpha swizzle");
     }
 
     // R8 masks historically broadcast coverage to every channel and deliberately ignore a T#

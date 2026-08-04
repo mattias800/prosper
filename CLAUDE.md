@@ -90,6 +90,7 @@ shared-GPU policy, the instrument-not-the-subject list, and the dated current ha
 | *ArcRunner* `PPSA21406` | rung 0 — renderer bring-up reaches real GPU submissions, then the render thread faults (#1226) | `docs/ARCRUNNER_STATUS.md` |
 | *GRIS*, *Space Adventure Cobra*, *Sonic Origins* | rung 3 / rung 3 / rung 0 — complete Sonic Origins Plus install; black-frame cause open (#1905) | `docs/GRIS_SONIC_COBRA_BRINGUP.md` |
 | Astro Bot, The Plucky Squire, The Pathless | active orchestration lanes | `docs/GAME_COMPAT_ORCHESTRATION.md` |
+| *Tactics Ogre: Reborn* `PPSA03839` | rung 3 — gameplay reached; HEVC movies render, sprite/HUD composition remains open | `docs/TACTICS_OGRE_STATUS.md` |
 | Every other title | — | `COMPATIBILITY.md` |
 | UE4 / IoStore bring-up (shared) | — | `docs/UE4_APR_IOSTORE_BRINGUP.md`, `docs/CROSS_ENGINE_UE4.md` |
 | Renderer performance | July pass complete; the stop decision is recorded | `docs/RENDERER_PERFORMANCE_2026_07.md` |

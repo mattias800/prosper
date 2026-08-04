@@ -15,6 +15,13 @@
 
 namespace prosper::gpu {
 
+// Prosper's custom seven-dword R_DMA_DATA packet retains the two raw selector bytes in bits 0..15.
+// The SDK ABI also supplies a separate sourceKind, which cannot be reconstructed from a low numeric
+// source address. Preserve its asserted address form in an otherwise-unused metadata bit so an
+// unmapped low address fails visibly instead of degrading into an immediate fill. Historical packets
+// and captures do not carry the bit; their established >32-bit address discriminator remains valid.
+inline constexpr uint32_t kDmaDataAddressSource = 1u << 16;
+
 // IT_* opcodes and the R_* sub-opcodes carried inside IT_NOP (mirror hle_agc.cpp).
 enum : uint32_t {
     IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_NUM_INSTANCES = 0x2F, IT_EVENT_WRITE = 0x46,
@@ -185,12 +192,13 @@ struct Pm4Command {
     // stack arg9 = byte count. DOLL's RHI translate loop emits DmaData(src=0, dst=<per-chunk fence
     // label>, 4 bytes) per segment — the GPU-side label INIT (label := 0) of the consumed-marker
     // protocol whose completion leg is ReleaseMem(label <- 1). Packet payload:
-    // [0..1]=dst lo/hi, [2..3]=srcOrImm lo/hi, [4]=numBytes, [5]=sels (a2 | a3<<8),
-    // [6..7]=the destination qword captured at build time (stale-generation identity, #312).
+    // [0..1]=dst lo/hi, [2..3]=srcOrImm lo/hi, [4]=numBytes, [5]=selector/form metadata.
+    // Historical extended packets may additionally carry the destination qword captured at build
+    // time in [6..7] (stale-generation identity, #312).
     uint64_t dd_dst = 0;                 // DmaData: destination address
     uint64_t dd_src = 0;                 // DmaData: mapped 64-bit source address OR 32-bit immediate
     uint32_t dd_bytes = 0;               // DmaData: byte count (0 = unrecovered -> not executed)
-    uint32_t dd_sels = 0;                // DmaData: raw selector args (a2 | a3<<8)
+    uint32_t dd_sels = 0;                // DmaData: selector bytes plus kDmaDataAddressSource metadata
     bool     dd_valid = false;           // DmaData: payload carried the full operand set
     uint64_t dd_build_pre = 0;           // DmaData: destination qword when this exact packet was built
     bool     dd_build_pre_valid = false; // DmaData: extended packet carried the build snapshot
