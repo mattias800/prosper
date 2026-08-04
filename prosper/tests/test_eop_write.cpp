@@ -16,9 +16,12 @@
 #include <cstdlib>   // setenv/_putenv_s: arm the #1226-retired suppression guards for this test
 #include <cstring>
 #include <chrono>
+#include <initializer_list>
+#include <string>
 #include <thread>
 #include <vector>
 #ifdef _WIN32
+#include <io.h>
 #include <windows.h>
 #else
 #include <sys/mman.h>
@@ -44,6 +47,43 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+#ifdef _WIN32
+static int test_fileno(FILE* stream) { return _fileno(stream); }
+static int test_dup(int descriptor) { return _dup(descriptor); }
+static int test_dup2(int source, int destination) { return _dup2(source, destination); }
+static void test_close(int descriptor) { _close(descriptor); }
+#else
+static int test_fileno(FILE* stream) { return fileno(stream); }
+static int test_dup(int descriptor) { return dup(descriptor); }
+static int test_dup2(int source, int destination) { return dup2(source, destination); }
+static void test_close(int descriptor) { close(descriptor); }
+#endif
+
+template <typename Fn>
+static std::string capture_stderr(Fn&& action) {
+    FILE* capture = std::tmpfile();
+    if (!capture) return {};
+    std::fflush(stderr);
+    const int stderr_fd = test_fileno(stderr);
+    const int saved_fd = test_dup(stderr_fd);
+    if (saved_fd < 0 || test_dup2(test_fileno(capture), stderr_fd) < 0) {
+        if (saved_fd >= 0) test_close(saved_fd);
+        std::fclose(capture);
+        return {};
+    }
+    action();
+    std::fflush(stderr);
+    test_dup2(saved_fd, stderr_fd);
+    test_close(saved_fd);
+    std::rewind(capture);
+    std::string output;
+    char chunk[2048];
+    while (const size_t bytes = std::fread(chunk, 1, sizeof(chunk), capture))
+        output.append(chunk, bytes);
+    std::fclose(capture);
+    return output;
+}
+
 // PM4 type-3 NOP-wrapped header, identical to hle_agc.cpp PM4(): len = total dwords incl. header.
 static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
@@ -66,6 +106,140 @@ int main() {
     prosper_rel1_forge_suppress_all_override_for_test(0);
     prosper_rel1_forge_decision_reset_for_test();
     printf("== test_eop_write ==\n");
+
+    // The default-off ordered-wait diagnostic must distinguish the exact effects that are safe to
+    // overlay from the ones that explain a fail-closed submit. These checks exercise the same
+    // classifier the live GFXLOG reporter uses. Reporter spelling is asserted separately against
+    // captured stderr, so a reporter-only mutation cannot hide behind these behavioral checks.
+    {
+        uint64_t label = 0xaaaabbbbccccddddull;
+        const uint64_t address = reinterpret_cast<uint64_t>(&label);
+
+        Pm4Command immediate{};
+        immediate.kind = Pm4Command::Kind::DmaData;
+        immediate.dd_dst = address;
+        immediate.dd_src = 0x11223344u;
+        immediate.dd_bytes = sizeof(label);
+        immediate.dd_valid = true;
+        GpuState::MemoryEffect immediate_effect(immediate, 11);
+        const OrderedWaitEffectDiagnostic immediate_diag =
+            diagnose_ordered_wait_effect(immediate_effect, address, label);
+        CHECK(immediate_diag.effect_class == OrderedWaitEffectClass::ImmediateDma &&
+                  immediate_diag.overlay == OrderedWaitEffectOverlay::Applied &&
+                  immediate_diag.value_after == 0x1122334411223344ull,
+              "ordered-wait diagnostic identifies an exact immediate DMA overlay");
+
+        Pm4Command release32{};
+        release32.kind = Pm4Command::Kind::ReleaseMem;
+        release32.rel_addr = address;
+        release32.rel_data_sel = 1;
+        release32.rel_value = 0x55667788u;
+        release32.rel_value_valid = true;
+        GpuState::MemoryEffect release32_effect(release32, 12);
+        const OrderedWaitEffectDiagnostic release32_diag =
+            diagnose_ordered_wait_effect(release32_effect, address, label);
+        CHECK(release32_diag.effect_class == OrderedWaitEffectClass::FixedRelease32 &&
+                  release32_diag.overlay == OrderedWaitEffectOverlay::Applied &&
+                  release32_diag.value_after == 0xaaaabbbb55667788ull,
+              "ordered-wait diagnostic identifies an exact fixed 32-bit release overlay");
+
+        Pm4Command release64 = release32;
+        release64.rel_data_sel = 2;
+        release64.rel_value = 0x0123456789abcdefull;
+        GpuState::MemoryEffect release64_effect(release64, 13);
+        const OrderedWaitEffectDiagnostic release64_diag =
+            diagnose_ordered_wait_effect(release64_effect, address, label);
+        CHECK(release64_diag.effect_class == OrderedWaitEffectClass::FixedRelease64 &&
+                  release64_diag.overlay == OrderedWaitEffectOverlay::Applied &&
+                  release64_diag.value_after == release64.rel_value,
+              "ordered-wait diagnostic identifies an exact fixed 64-bit release overlay");
+
+        const uint32_t write_words[] = {0x10203040u, 0x50607080u};
+        Pm4Command write{};
+        write.kind = Pm4Command::Kind::WriteData;
+        write.wd_addr = address;
+        write.wd_num = 2;
+        write.wd_data = write_words;
+        GpuState::MemoryEffect write_effect(write, 14);
+        const OrderedWaitEffectDiagnostic write_diag =
+            diagnose_ordered_wait_effect(write_effect, address, label);
+        CHECK(write_diag.effect_class == OrderedWaitEffectClass::WriteData &&
+                  write_diag.overlay == OrderedWaitEffectOverlay::Applied &&
+                  write_diag.value_after == 0x5060708010203040ull,
+              "ordered-wait overlay preserves WRITE_DATA low/high dword order");
+
+        GpuState::MemoryEffect partial_write_effect(write, 15);
+        partial_write_effect.write_data.resize(1);
+        partial_write_effect.cmd.wd_data = partial_write_effect.write_data.data();
+        const OrderedWaitEffectDiagnostic partial_write_diag =
+            diagnose_ordered_wait_effect(partial_write_effect, address, label);
+        CHECK(partial_write_diag.effect_class == OrderedWaitEffectClass::WriteDataPartial &&
+                  partial_write_diag.overlay == OrderedWaitEffectOverlay::Ambiguous &&
+                  partial_write_diag.value_after == label,
+              "ordered-wait overlay rejects an incomplete owned WRITE_DATA snapshot");
+
+        GpuState::MemoryEffect unowned_write_effect(write, 16);
+        unowned_write_effect.cmd.wd_data = write_words;
+        const OrderedWaitEffectDiagnostic unowned_write_diag =
+            diagnose_ordered_wait_effect(unowned_write_effect, address, label);
+        CHECK(unowned_write_diag.effect_class == OrderedWaitEffectClass::WriteDataUnowned &&
+                  unowned_write_diag.overlay == OrderedWaitEffectOverlay::Ambiguous &&
+                  unowned_write_diag.value_after == label,
+              "ordered-wait overlay rejects a WRITE_DATA payload outside its owned snapshot");
+
+        const uint32_t oversized_words[] = {0x10203040u, 0x50607080u, 0x90a0b0c0u};
+        Pm4Command oversized_write = write;
+        oversized_write.wd_num = 3;
+        oversized_write.wd_data = oversized_words;
+        GpuState::MemoryEffect oversized_write_effect(oversized_write, 17);
+        const OrderedWaitEffectDiagnostic oversized_write_diag =
+            diagnose_ordered_wait_effect(oversized_write_effect, address, label);
+        CHECK(oversized_write_diag.effect_class == OrderedWaitEffectClass::WriteDataOversized &&
+                  oversized_write_diag.overlay == OrderedWaitEffectOverlay::Ambiguous &&
+                  oversized_write_diag.value_after == label,
+              "ordered-wait overlay rejects WRITE_DATA wider than the waited qword");
+
+        uint64_t copy_source = 0;
+        Pm4Command address_dma = immediate;
+        address_dma.dd_src = reinterpret_cast<uint64_t>(&copy_source);
+        address_dma.dd_sels = kDmaDataAddressSource;
+        GpuState::MemoryEffect address_effect(address_dma, 18);
+        const OrderedWaitEffectDiagnostic address_diag =
+            diagnose_ordered_wait_effect(address_effect, address, label);
+        CHECK(address_diag.effect_class == OrderedWaitEffectClass::AddressDma &&
+                  address_diag.overlay == OrderedWaitEffectOverlay::Ambiguous,
+              "ordered-wait diagnostic keeps an address DMA dependency ambiguous");
+
+        Pm4Command timestamp{};
+        timestamp.kind = Pm4Command::Kind::EventWrite;
+        timestamp.event_addr = address;
+        GpuState::MemoryEffect timestamp_effect(timestamp, 19);
+        const OrderedWaitEffectDiagnostic timestamp_diag =
+            diagnose_ordered_wait_effect(timestamp_effect, address, label);
+        CHECK(timestamp_diag.effect_class == OrderedWaitEffectClass::EventTimestamp &&
+                  timestamp_diag.overlay == OrderedWaitEffectOverlay::Ambiguous,
+              "ordered-wait diagnostic keeps an event timestamp dependency ambiguous");
+
+        Pm4Command dynamic_release = release32;
+        dynamic_release.rel_data_sel = 3;
+        dynamic_release.rel_value_valid = false;
+        GpuState::MemoryEffect dynamic_effect(dynamic_release, 20);
+        const OrderedWaitEffectDiagnostic dynamic_diag =
+            diagnose_ordered_wait_effect(dynamic_effect, address, label);
+        CHECK(dynamic_diag.effect_class == OrderedWaitEffectClass::DynamicRelease &&
+                  dynamic_diag.overlay == OrderedWaitEffectOverlay::Ambiguous,
+              "ordered-wait diagnostic keeps a timestamp release dependency ambiguous");
+
+        Pm4Command offset_release = release32;
+        offset_release.rel_addr = address + sizeof(uint32_t);
+        GpuState::MemoryEffect offset_effect(offset_release, 21);
+        const OrderedWaitEffectDiagnostic offset_diag =
+            diagnose_ordered_wait_effect(offset_effect, address, label);
+        CHECK(offset_diag.effect_class == OrderedWaitEffectClass::OffsetOverlap &&
+                  offset_diag.overlay == OrderedWaitEffectOverlay::Ambiguous,
+              "ordered-wait diagnostic keeps a partial offset overlap ambiguous");
+    }
+
     // #1226: the generation and MB3-freelist suppression families are OFF by default (their
     // content/membership premises misfire on live protocols — see generation_guard() /
     // mb3_freelist_guard() in command_processor.cpp). This test verifies the suppression
@@ -74,10 +248,12 @@ int main() {
     _putenv_s("PROSPER_GENERATION_GUARD", "1");
     _putenv_s("PROSPER_MB3_FREELIST_GUARD", "1");
     _putenv_s("PROSPER_WRITE_TRAP", "0x5a5a0001");
+    _putenv_s("PROSPER_GFXLOG", "");
 #else
     setenv("PROSPER_GENERATION_GUARD", "1", 1);
     setenv("PROSPER_MB3_FREELIST_GUARD", "1", 1);
     setenv("PROSPER_WRITE_TRAP", "0x5a5a0001", 1);
+    unsetenv("PROSPER_GFXLOG");
 #endif
 
     // SDK-13 completion writes must remain invisible for the entire guest submit import. The
@@ -725,34 +901,171 @@ int main() {
                       *effect_dma_target == 0 && *effect_wait == 0,
                   "WAIT_REG_MEM rejects an unsatisfied retained immediate DMA overlay");
 
+            auto make_write_wait = [&](uint64_t write_address,
+                                       std::initializer_list<uint32_t> words,
+                                       uint64_t wait_address, uint64_t mask, uint64_t reference) {
+                std::vector<uint32_t> stream(effect_reg_stream, effect_reg_stream + 7);
+                stream.push_back(PM4(5 + words.size(), IT_NOP, R_WRITE_DATA));
+                stream.push_back(0);
+                stream.push_back((uint32_t)write_address);
+                stream.push_back((uint32_t)(write_address >> 32));
+                stream.push_back((uint32_t)words.size());
+                stream.insert(stream.end(), words.begin(), words.end());
+                stream.push_back(PM4(8, IT_NOP, R_WAIT_MEM_64));
+                stream.push_back((uint32_t)wait_address);
+                stream.push_back((uint32_t)(wait_address >> 32));
+                stream.push_back((uint32_t)mask);
+                stream.push_back((uint32_t)(mask >> 32));
+                stream.push_back((uint32_t)reference);
+                stream.push_back((uint32_t)(reference >> 32));
+                stream.push_back(3);
+                return stream;
+            };
+
+            // A retained exact-base WRITE_DATA owns its inline payload after command-buffer decode.
+            // Overlay that bounded payload in little-endian dword order before evaluating the eager
+            // wait, then execute the original copy and write in their real order.
+            *effect_dma_target = 0;
+            *effect_wait = 0;
+            std::vector<uint32_t> write_wait_stream =
+                make_write_wait(effect_wait_addr, {1}, effect_wait_addr, 0xffffffffu, 1);
+            GpuState write_wait_state;
+            run_cb(write_wait_stream.data(), write_wait_stream.size(), write_wait_state);
+            CHECK(!write_wait_state.dma_execution_rejected &&
+                      write_wait_state.ordered_memory_effects.size() == 1 &&
+                      *effect_dma_target == effect_source && *effect_wait == 1,
+                  "WAIT_REG_MEM accepts a satisfying exact owned WRITE_DATA overlay");
+
+            // The producer being deterministic is not enough: its concrete payload still has to
+            // satisfy the packet's comparison. An unsatisfied value rejects the whole submit.
+            *effect_dma_target = 0;
+            *effect_wait = 0;
+            write_wait_stream =
+                make_write_wait(effect_wait_addr, {0}, effect_wait_addr, 0xffffffffu, 1);
+            GpuState unsatisfied_write_wait;
+            run_cb(write_wait_stream.data(), write_wait_stream.size(), unsatisfied_write_wait);
+            CHECK(unsatisfied_write_wait.dma_execution_rejected &&
+                      *effect_dma_target == 0 && *effect_wait == 0,
+                  "WAIT_REG_MEM rejects an unsatisfied exact owned WRITE_DATA overlay");
+
+            // Exact-base does not mean arbitrary-width. A write extending beyond the scalar qword
+            // remains fail-closed, even when its first dword would make the wait look satisfied.
+            // Arm GFXLOG only for this run so the reporter assertion is independent of semantics.
+            *effect_dma_target = 0;
+            *effect_wait = 0;
+            write_wait_stream = make_write_wait(
+                effect_wait_addr, {1, 0, 0xdeadbeefu}, effect_wait_addr, 0xffffffffu, 1);
+#ifdef _WIN32
+            _putenv_s("PROSPER_GFXLOG", "1");
+#else
+            setenv("PROSPER_GFXLOG", "1", 1);
+#endif
+            GpuState oversized_write_wait;
+            const std::string oversized_write_wait_diagnostic = capture_stderr([&] {
+                run_cb(write_wait_stream.data(), write_wait_stream.size(), oversized_write_wait);
+            });
+#ifdef _WIN32
+            _putenv_s("PROSPER_GFXLOG", "");
+#else
+            unsetenv("PROSPER_GFXLOG");
+#endif
+            CHECK(oversized_write_wait.dma_execution_rejected &&
+                      *effect_dma_target == 0 && *effect_wait == 0,
+                  "WAIT_REG_MEM rejects WRITE_DATA wider than its waited qword");
+            CHECK(oversized_write_wait_diagnostic.find("ordered-wait rejection #1") !=
+                          std::string::npos &&
+                      oversized_write_wait_diagnostic.find(
+                          "reason=write-data-oversized") != std::string::npos &&
+                      oversized_write_wait_diagnostic.find(
+                          "dma-overlaps=0 effect-overlaps=1") !=
+                          std::string::npos &&
+                      oversized_write_wait_diagnostic.find(
+                          "effect[1] kind=write-data-oversized overlay=ambiguous") !=
+                          std::string::npos,
+                  "ordered-wait reporter names and counts the oversized WRITE_DATA blocker");
+
+            // A write at +4 overlaps only the high dword and cannot satisfy this low-half wait.
+            // Blindly treating it as an exact-base scalar replacement would accept the submit, so
+            // rejection proves the offset guard moved.
+            *effect_dma_target = 0;
+            *effect_wait = 0;
+            write_wait_stream = make_write_wait(
+                effect_wait_addr + sizeof(uint32_t), {1}, effect_wait_addr,
+                0xffffffffu, 1);
+            GpuState offset_write_wait;
+            run_cb(write_wait_stream.data(), write_wait_stream.size(), offset_write_wait);
+            CHECK(offset_write_wait.dma_execution_rejected &&
+                      *effect_dma_target == 0 && *effect_wait == 0,
+                  "WAIT_REG_MEM rejects a satisfying partial-offset WRITE_DATA overlap");
+
+            // Distinct virtual views can name the same direct-memory qword. Do not infer the
+            // WRITE_DATA byte order across that alias: the scalar model is exact-VA only.
+            auto* alias_wait = (uint64_t*)(uintptr_t)(first_view + 0x5200);
+            const uint64_t alias_write_addr = second_view + 0x5200;
+            *effect_dma_target = 0;
+            *alias_wait = 0;
+            write_wait_stream = make_write_wait(
+                alias_write_addr, {1}, (uint64_t)(uintptr_t)alias_wait, 0xffffffffu, 1);
+            GpuState aliased_write_wait;
+            run_cb(write_wait_stream.data(), write_wait_stream.size(), aliased_write_wait);
+            CHECK(aliased_write_wait.dma_execution_rejected &&
+                      *effect_dma_target == 0 && *alias_wait == 0,
+                  "WAIT_REG_MEM rejects a physically aliased WRITE_DATA overlap");
+
             // Tactics Ogre's movie submits add the completion leg between the label init and the
-            // wait: copy(A), fill(B, 0), release32(B, 1), wait(B == 1). The fixed release value is
-            // just as ordered and deterministic as the fill, so evaluate both before the eager
+            // wait: copy(A), write(B, 0), release32(B, 1), wait(B == 1). Both fixed values are
+            // ordered and deterministic, so evaluate them before the eager
             // wait instead of rejecting the whole decoded-frame upload.
             *effect_dma_target = 0;
             *effect_wait = 0;
-            uint32_t release_wait_stream[29] = {};
-            memcpy(release_wait_stream, effect_wait_stream, 14 * sizeof(uint32_t));
-            release_wait_stream[10] = 0;
-            release_wait_stream[11] = 0;
-            release_wait_stream[14] = PM4(7, IT_NOP, R_RELEASE_MEM);
-            release_wait_stream[15] = (uint32_t)effect_wait_addr;
-            release_wait_stream[16] = (uint32_t)(effect_wait_addr >> 32);
-            release_wait_stream[17] = 1;
-            release_wait_stream[18] = 1;
-            release_wait_stream[21] = PM4(8, IT_NOP, R_WAIT_MEM_64);
-            release_wait_stream[22] = (uint32_t)effect_wait_addr;
-            release_wait_stream[23] = (uint32_t)(effect_wait_addr >> 32);
-            release_wait_stream[24] = 0xffffffffu;
-            release_wait_stream[26] = 1;
-            release_wait_stream[28] = 3;
+            std::vector<uint32_t> release_wait_stream(effect_reg_stream, effect_reg_stream + 7);
+            release_wait_stream.push_back(PM4(6, IT_NOP, R_WRITE_DATA));
+            release_wait_stream.push_back(0);
+            release_wait_stream.push_back((uint32_t)effect_wait_addr);
+            release_wait_stream.push_back((uint32_t)(effect_wait_addr >> 32));
+            release_wait_stream.push_back(1);
+            release_wait_stream.push_back(0);
+            release_wait_stream.push_back(PM4(7, IT_NOP, R_RELEASE_MEM));
+            release_wait_stream.push_back((uint32_t)effect_wait_addr);
+            release_wait_stream.push_back((uint32_t)(effect_wait_addr >> 32));
+            release_wait_stream.push_back(1);
+            release_wait_stream.push_back(1);
+            release_wait_stream.push_back(0);
+            release_wait_stream.push_back(0);
+            release_wait_stream.push_back(PM4(8, IT_NOP, R_WAIT_MEM_64));
+            release_wait_stream.push_back((uint32_t)effect_wait_addr);
+            release_wait_stream.push_back((uint32_t)(effect_wait_addr >> 32));
+            release_wait_stream.push_back(0xffffffffu);
+            release_wait_stream.push_back(0);
+            release_wait_stream.push_back(1);
+            release_wait_stream.push_back(0);
+            release_wait_stream.push_back(3);
+#ifdef _WIN32
+            _putenv_s("PROSPER_GFXLOG", "1");
+#else
+            setenv("PROSPER_GFXLOG", "1", 1);
+#endif
             GpuState release_wait_state;
-            run_cb(release_wait_stream, 29, release_wait_state);
+            const std::string release_wait_diagnostic = capture_stderr([&] {
+                run_cb(release_wait_stream.data(), release_wait_stream.size(), release_wait_state);
+            });
+#ifdef _WIN32
+            _putenv_s("PROSPER_GFXLOG", "");
+#else
+            unsetenv("PROSPER_GFXLOG");
+#endif
             CHECK(!release_wait_state.dma_execution_rejected &&
                       release_wait_state.ordered_memory_effects.size() == 2,
-                  "WAIT_REG_MEM accepts the retained fill-release label protocol");
+                  "WAIT_REG_MEM accepts the retained WRITE_DATA-release label protocol");
             CHECK(*effect_dma_target == effect_source && *effect_wait == 1,
-                  "the accepted copy, fill, and release execute in command order");
+                  "the accepted copy, WRITE_DATA, and release execute in command order");
+            CHECK(release_wait_diagnostic.find("ordered-wait acceptance #1") !=
+                          std::string::npos &&
+                      release_wait_diagnostic.find("final=fixed-release32") !=
+                          std::string::npos &&
+                      release_wait_diagnostic.find(
+                          "write-data-overlays=1 effect-count=2") != std::string::npos,
+                  "ordered-wait acceptance reporter proves the WRITE_DATA overlay ran");
 
             // Both guest views are writable here, but their VA-disjoint spans overlap in the same
             // physical direct backing. Exercise both destructive physical directions; a plain VA

@@ -2770,58 +2770,323 @@ static bool retained_ordered_effect_destination_overlaps(
 
 enum class OrderedQwordOverlay { Untouched, Touched, Ambiguous };
 
+const char* ordered_wait_effect_class_name(OrderedWaitEffectClass effect_class) {
+    switch (effect_class) {
+        case OrderedWaitEffectClass::Disjoint: return "disjoint";
+        case OrderedWaitEffectClass::ImmediateDma: return "immediate-dma";
+        case OrderedWaitEffectClass::AddressDma: return "address-dma";
+        case OrderedWaitEffectClass::FixedRelease32: return "fixed-release32";
+        case OrderedWaitEffectClass::FixedRelease64: return "fixed-release64";
+        case OrderedWaitEffectClass::InterruptOnlyRelease: return "interrupt-only-release";
+        case OrderedWaitEffectClass::DynamicRelease: return "dynamic-release";
+        case OrderedWaitEffectClass::WriteData: return "write-data";
+        case OrderedWaitEffectClass::WriteDataPartial: return "write-data-partial";
+        case OrderedWaitEffectClass::WriteDataOversized: return "write-data-oversized";
+        case OrderedWaitEffectClass::WriteDataUnowned: return "write-data-unowned";
+        case OrderedWaitEffectClass::EventTimestamp: return "event-timestamp";
+        case OrderedWaitEffectClass::OffsetOverlap: return "offset-overlap";
+        case OrderedWaitEffectClass::AliasedOverlap: return "aliased-overlap";
+        case OrderedWaitEffectClass::Unsupported: return "unsupported";
+    }
+    return "unsupported";
+}
+
+const char* ordered_wait_effect_overlay_name(OrderedWaitEffectOverlay overlay) {
+    switch (overlay) {
+        case OrderedWaitEffectOverlay::None: return "none";
+        case OrderedWaitEffectOverlay::Applied: return "applied";
+        case OrderedWaitEffectOverlay::Ambiguous: return "ambiguous";
+    }
+    return "ambiguous";
+}
+
+OrderedWaitEffectDiagnostic diagnose_ordered_wait_effect(
+        const GpuState::MemoryEffect& effect, uint64_t wait_address, uint64_t value_before) {
+    OrderedWaitEffectDiagnostic diagnostic;
+    diagnostic.command_order = effect.cmd.stream_order;
+    diagnostic.value_before = value_before;
+    diagnostic.value_after = value_before;
+
+    const Pm4Command& command = effect.cmd;
+    effect_span(command, &diagnostic.address, &diagnostic.bytes);
+    if (!diagnostic.address || !diagnostic.bytes ||
+        guest_memory_topology_relation(
+            wait_address, sizeof(value_before), diagnostic.address, diagnostic.bytes) ==
+            GuestMemoryTopologyRelation::Disjoint) {
+        diagnostic.effect_class = OrderedWaitEffectClass::Disjoint;
+        diagnostic.overlay = OrderedWaitEffectOverlay::None;
+        return diagnostic;
+    }
+
+    if (command.kind == Pm4Command::Kind::DmaData) {
+        if (command.dd_dst != wait_address) {
+            diagnostic.effect_class = OrderedWaitEffectClass::OffsetOverlap;
+            return diagnostic;
+        }
+        if (dma_data_form(command) != DmaDataForm::Immediate) {
+            diagnostic.effect_class = dma_data_address_source(command)
+                ? OrderedWaitEffectClass::AddressDma
+                : OrderedWaitEffectClass::Unsupported;
+            return diagnostic;
+        }
+        const uint32_t word = static_cast<uint32_t>(command.dd_src);
+        const size_t bytes = std::min<size_t>(command.dd_bytes, sizeof(value_before));
+        for (size_t offset = 0; offset < bytes; offset += sizeof(word))
+            memcpy(reinterpret_cast<uint8_t*>(&diagnostic.value_after) + offset, &word,
+                   std::min(sizeof(word), bytes - offset));
+        diagnostic.effect_class = OrderedWaitEffectClass::ImmediateDma;
+        diagnostic.overlay = OrderedWaitEffectOverlay::Applied;
+        return diagnostic;
+    }
+
+    if (command.kind == Pm4Command::Kind::ReleaseMem) {
+        if (command.rel_addr != wait_address) {
+            diagnostic.effect_class = OrderedWaitEffectClass::OffsetOverlap;
+            return diagnostic;
+        }
+        if (command.rel_data_sel == 0) {
+            diagnostic.effect_class = OrderedWaitEffectClass::InterruptOnlyRelease;
+            diagnostic.overlay = OrderedWaitEffectOverlay::None;
+            return diagnostic;
+        }
+        if (!command.rel_value_valid) {
+            diagnostic.effect_class = OrderedWaitEffectClass::DynamicRelease;
+            return diagnostic;
+        }
+        if (command.rel_data_sel == 1) {
+            const uint32_t low = static_cast<uint32_t>(command.rel_value);
+            memcpy(&diagnostic.value_after, &low, sizeof(low));
+            diagnostic.effect_class = OrderedWaitEffectClass::FixedRelease32;
+            diagnostic.overlay = OrderedWaitEffectOverlay::Applied;
+            return diagnostic;
+        }
+        if (command.rel_data_sel == 2) {
+            diagnostic.value_after = command.rel_value;
+            diagnostic.effect_class = OrderedWaitEffectClass::FixedRelease64;
+            diagnostic.overlay = OrderedWaitEffectOverlay::Applied;
+            return diagnostic;
+        }
+        diagnostic.effect_class = OrderedWaitEffectClass::DynamicRelease;
+        return diagnostic;
+    }
+
+    if (command.kind == Pm4Command::Kind::WriteData) {
+        if (command.wd_addr != wait_address) {
+            const bool virtual_overlap =
+                wait_address <= UINT64_MAX - sizeof(value_before) &&
+                command.wd_addr <= UINT64_MAX - diagnostic.bytes &&
+                wait_address < command.wd_addr + diagnostic.bytes &&
+                command.wd_addr < wait_address + sizeof(value_before);
+            diagnostic.effect_class = virtual_overlap
+                ? OrderedWaitEffectClass::OffsetOverlap
+                : OrderedWaitEffectClass::AliasedOverlap;
+            return diagnostic;
+        }
+        // MemoryEffect deep-copies WRITE_DATA's inline dwords and rebinds cmd.wd_data after every
+        // copy/move. Prove that exact ownership before reading: a pointer into the guest command
+        // buffer may be recycled as soon as folding returns. A short vector is an incomplete
+        // snapshot, and more than the waited qword is intentionally outside this scalar model.
+        if (!command.wd_data || effect.write_data.empty() ||
+            command.wd_data != effect.write_data.data()) {
+            diagnostic.effect_class = OrderedWaitEffectClass::WriteDataUnowned;
+            return diagnostic;
+        }
+        if (effect.write_data.size() != command.wd_num) {
+            diagnostic.effect_class = OrderedWaitEffectClass::WriteDataPartial;
+            return diagnostic;
+        }
+        if (command.wd_num > sizeof(value_before) / sizeof(uint32_t)) {
+            diagnostic.effect_class = OrderedWaitEffectClass::WriteDataOversized;
+            return diagnostic;
+        }
+        diagnostic.value_after =
+            (value_before & 0xffffffff00000000ull) | effect.write_data[0];
+        if (command.wd_num == 2)
+            diagnostic.value_after =
+                static_cast<uint64_t>(effect.write_data[0]) |
+                (static_cast<uint64_t>(effect.write_data[1]) << 32);
+        diagnostic.effect_class = OrderedWaitEffectClass::WriteData;
+        diagnostic.overlay = OrderedWaitEffectOverlay::Applied;
+        return diagnostic;
+    }
+    if (command.kind == Pm4Command::Kind::EventWrite) {
+        diagnostic.effect_class = OrderedWaitEffectClass::EventTimestamp;
+        return diagnostic;
+    }
+    diagnostic.effect_class = OrderedWaitEffectClass::Unsupported;
+    return diagnostic;
+}
+
+struct OrderedQwordOverlayResult {
+    OrderedQwordOverlay overlay = OrderedQwordOverlay::Untouched;
+    OrderedWaitEffectClass reason = OrderedWaitEffectClass::Disjoint;
+    uint64_t value = 0;
+};
+
 // WAIT_REG_MEM is an eager scalar reader, but the overwhelmingly common suffix dependency is an
-// immediate DMA label initialization followed by a fixed-value release. Evaluate those exact
-// producers from the ordered journal rather than rejecting a valid
-// `DMA(A), fill(B), release(B), wait(B)` submit or reading stale B. Keep every other overlapping
-// effect fail-closed: timestamp events, partial/offset writes, and address copies need execution-
-// time semantics, not a guess.
-static OrderedQwordOverlay overlay_ordered_qword(
+// immediate DMA or owned, qword-bounded WRITE_DATA label initialization followed by a fixed-value
+// release. Evaluate those exact producers from the ordered journal rather than rejecting a valid
+// `DMA(A), write(B), release(B), wait(B)` submit or reading stale B. Keep every other overlapping
+// effect fail-closed: timestamps, offset/aliased/incompletely-owned writes, oversized writes, and
+// address copies need execution-time semantics, not a guess.
+static OrderedQwordOverlayResult overlay_ordered_qword(
         const std::vector<GpuState::MemoryEffect>& effects, uint64_t address, uint64_t* value) {
     bool touched = false;
     uint64_t result = *value;
+    OrderedWaitEffectClass last_applied = OrderedWaitEffectClass::Disjoint;
     for (const GpuState::MemoryEffect& effect : effects) {
-        const Pm4Command& command = effect.cmd;
-        if (command.kind == Pm4Command::Kind::DmaData &&
-            dma_data_dst_sel(command) == kDmaSelGds)
+        if (effect.cmd.kind == Pm4Command::Kind::DmaData &&
+            dma_data_dst_sel(effect.cmd) == kDmaSelGds)
             continue;
-        uint64_t destination = 0, effect_bytes = 0;
-        effect_span(command, &destination, &effect_bytes);
-        if (!destination || !effect_bytes) continue;
-        const GuestMemoryTopologyRelation relation = guest_memory_topology_relation(
-            address, sizeof(result), destination, effect_bytes);
-        if (relation == GuestMemoryTopologyRelation::Disjoint) continue;
-        if (command.kind == Pm4Command::Kind::DmaData) {
-            if (command.dd_dst != address ||
-                dma_data_form(command) != DmaDataForm::Immediate)
-                return OrderedQwordOverlay::Ambiguous;
-            const uint32_t word = static_cast<uint32_t>(command.dd_src);
-            const size_t bytes = std::min<size_t>(command.dd_bytes, sizeof(result));
-            for (size_t offset = 0; offset < bytes; offset += sizeof(word))
-                memcpy(reinterpret_cast<uint8_t*>(&result) + offset, &word,
-                       std::min(sizeof(word), bytes - offset));
-            touched = true;
+        const OrderedWaitEffectDiagnostic diagnostic =
+            diagnose_ordered_wait_effect(effect, address, result);
+        if (diagnostic.overlay == OrderedWaitEffectOverlay::None) {
+            if (diagnostic.effect_class != OrderedWaitEffectClass::Disjoint)
+                last_applied = diagnostic.effect_class;
             continue;
         }
-        if (command.kind == Pm4Command::Kind::ReleaseMem) {
-            if (command.rel_addr != address) return OrderedQwordOverlay::Ambiguous;
-            if (command.rel_data_sel == 0) continue; // interrupt only; no memory write
-            if (!command.rel_value_valid) return OrderedQwordOverlay::Ambiguous;
-            if (command.rel_data_sel == 1) {
-                const uint32_t low = static_cast<uint32_t>(command.rel_value);
-                memcpy(&result, &low, sizeof(low));
-            } else if (command.rel_data_sel == 2) {
-                result = command.rel_value;
-            } else {
-                return OrderedQwordOverlay::Ambiguous;
-            }
-            touched = true;
-            continue;
-        }
-        return OrderedQwordOverlay::Ambiguous;
+        if (diagnostic.overlay == OrderedWaitEffectOverlay::Ambiguous)
+            return {OrderedQwordOverlay::Ambiguous, diagnostic.effect_class, result};
+        result = diagnostic.value_after;
+        last_applied = diagnostic.effect_class;
+        touched = true;
     }
     if (touched) *value = result;
-    return touched ? OrderedQwordOverlay::Touched : OrderedQwordOverlay::Untouched;
+    return {touched ? OrderedQwordOverlay::Touched : OrderedQwordOverlay::Untouched,
+            last_applied, result};
+}
+
+static const char* ordered_qword_overlay_name(OrderedQwordOverlay overlay) {
+    switch (overlay) {
+        case OrderedQwordOverlay::Untouched: return "untouched";
+        case OrderedQwordOverlay::Touched: return "touched";
+        case OrderedQwordOverlay::Ambiguous: return "ambiguous";
+    }
+    return "ambiguous";
+}
+
+// This instrument deliberately lives behind the existing high-volume GFXLOG switch. A rejection
+// alone says only that the fail-closed guard ran; it does not say which retained operation made the
+// eager wait unknowable. Report the first eight occurrences and a power-of-two tail, with a stable
+// 1-based ordinal on every line. Each reported occurrence is additionally bounded to sixteen
+// overlapping operations, while the summary retains the complete overlap counts.
+static void diagnose_ordered_wait_rejection(
+        const Pm4Command& wait, const std::vector<GpuState::DmaCopy>& copies,
+        const std::vector<GpuState::MemoryEffect>& effects, bool readable,
+        uint64_t base_value, const OrderedQwordOverlayResult& overlay,
+        bool comparison_satisfied) {
+    if (!std::getenv("PROSPER_GFXLOG")) return;
+    static std::atomic<uint64_t> ordinal_counter{0};
+    const uint64_t ordinal = ordinal_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!prosper::diag_should_print(ordinal, 8)) return;
+
+    size_t overlapping_copies = 0, overlapping_effects = 0;
+    for (const GpuState::DmaCopy& copy : copies)
+        if (guest_memory_topology_relation(
+                wait.wm_addr, sizeof(uint64_t), copy.dst, copy.bytes) !=
+            GuestMemoryTopologyRelation::Disjoint)
+            ++overlapping_copies;
+    for (const GpuState::MemoryEffect& effect : effects) {
+        const OrderedWaitEffectDiagnostic diagnostic =
+            diagnose_ordered_wait_effect(effect, wait.wm_addr, base_value);
+        if (diagnostic.effect_class != OrderedWaitEffectClass::Disjoint)
+            ++overlapping_effects;
+    }
+
+    std::fprintf(stderr,
+                 "[agc] ordered-wait rejection #%llu addr=0x%llx readable=%u "
+                 "base=0x%016llx overlaid=0x%016llx overlay=%s reason=%s "
+                 "compare=%s mask=0x%llx ref=0x%llx func=%u "
+                 "dma-overlaps=%zu effect-overlaps=%zu\n",
+                 static_cast<unsigned long long>(ordinal),
+                 static_cast<unsigned long long>(wait.wm_addr), readable ? 1u : 0u,
+                 static_cast<unsigned long long>(base_value),
+                 static_cast<unsigned long long>(overlay.value),
+                 ordered_qword_overlay_name(overlay.overlay),
+                 ordered_wait_effect_class_name(overlay.reason),
+                 overlay.overlay == OrderedQwordOverlay::Touched
+                     ? (comparison_satisfied ? "satisfied" : "unsatisfied")
+                     : "not-evaluated",
+                 static_cast<unsigned long long>(wait.wm_mask),
+                 static_cast<unsigned long long>(wait.wm_ref), wait.wm_func,
+                 overlapping_copies, overlapping_effects);
+
+    constexpr size_t kMaxDetailEffects = 16;
+    size_t detail = 0;
+    for (const GpuState::DmaCopy& copy : copies) {
+        if (guest_memory_topology_relation(
+                wait.wm_addr, sizeof(uint64_t), copy.dst, copy.bytes) ==
+            GuestMemoryTopologyRelation::Disjoint)
+            continue;
+        if (detail++ >= kMaxDetailEffects) continue;
+        std::fprintf(stderr,
+                     "[agc] ordered-wait rejection #%llu effect[%zu] kind=address-dma "
+                     "overlay=ambiguous span=0x%llx+%u order=%llu\n",
+                     static_cast<unsigned long long>(ordinal), detail,
+                     static_cast<unsigned long long>(copy.dst), copy.bytes,
+                     static_cast<unsigned long long>(copy.command_order));
+    }
+    uint64_t diagnostic_value = base_value;
+    for (const GpuState::MemoryEffect& effect : effects) {
+        const OrderedWaitEffectDiagnostic diagnostic =
+            diagnose_ordered_wait_effect(effect, wait.wm_addr, diagnostic_value);
+        if (diagnostic.effect_class == OrderedWaitEffectClass::Disjoint) continue;
+        if (detail++ < kMaxDetailEffects) {
+            std::fprintf(stderr,
+                         "[agc] ordered-wait rejection #%llu effect[%zu] kind=%s overlay=%s "
+                         "span=0x%llx+%llu order=%llu before=0x%016llx after=0x%016llx\n",
+                         static_cast<unsigned long long>(ordinal), detail,
+                         ordered_wait_effect_class_name(diagnostic.effect_class),
+                         ordered_wait_effect_overlay_name(diagnostic.overlay),
+                         static_cast<unsigned long long>(diagnostic.address),
+                         static_cast<unsigned long long>(diagnostic.bytes),
+                         static_cast<unsigned long long>(diagnostic.command_order),
+                         static_cast<unsigned long long>(diagnostic.value_before),
+                         static_cast<unsigned long long>(diagnostic.value_after));
+        }
+        if (diagnostic.overlay == OrderedWaitEffectOverlay::Applied)
+            diagnostic_value = diagnostic.value_after;
+    }
+    if (overlapping_copies + overlapping_effects > kMaxDetailEffects)
+        std::fprintf(stderr,
+                     "[agc] ordered-wait rejection #%llu effects-truncated retained=%zu shown=%zu\n",
+                     static_cast<unsigned long long>(ordinal),
+                     overlapping_copies + overlapping_effects, kMaxDetailEffects);
+}
+
+// A route progressing after a semantic change is not proof that the new lever ran. When GFXLOG is
+// armed, positively identify satisfied eager waits whose ordered scalar evaluation actually
+// consumed at least one owned WRITE_DATA overlay. This is bounded independently of rejections.
+static void diagnose_ordered_wait_acceptance(
+        const Pm4Command& wait, const std::vector<GpuState::MemoryEffect>& effects,
+        uint64_t base_value, const OrderedQwordOverlayResult& overlay) {
+    if (!std::getenv("PROSPER_GFXLOG")) return;
+    size_t write_data_overlays = 0;
+    uint64_t diagnostic_value = base_value;
+    for (const GpuState::MemoryEffect& effect : effects) {
+        const OrderedWaitEffectDiagnostic diagnostic =
+            diagnose_ordered_wait_effect(effect, wait.wm_addr, diagnostic_value);
+        if (diagnostic.overlay != OrderedWaitEffectOverlay::Applied) continue;
+        if (diagnostic.effect_class == OrderedWaitEffectClass::WriteData)
+            ++write_data_overlays;
+        diagnostic_value = diagnostic.value_after;
+    }
+    if (!write_data_overlays) return;
+
+    static std::atomic<uint64_t> ordinal_counter{0};
+    const uint64_t ordinal = ordinal_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!prosper::diag_should_print(ordinal, 8)) return;
+    std::fprintf(stderr,
+                 "[agc] ordered-wait acceptance #%llu addr=0x%llx order=%llu "
+                 "base=0x%016llx overlaid=0x%016llx final=%s "
+                 "write-data-overlays=%zu effect-count=%zu\n",
+                 static_cast<unsigned long long>(ordinal),
+                 static_cast<unsigned long long>(wait.wm_addr),
+                 static_cast<unsigned long long>(wait.stream_order),
+                 static_cast<unsigned long long>(base_value),
+                 static_cast<unsigned long long>(overlay.value),
+                 ordered_wait_effect_class_name(overlay.reason),
+                 write_data_overlays, effects.size());
 }
 
 void GpuState::apply(const Pm4Command& c) {
@@ -3367,20 +3632,41 @@ void GpuState::apply(const Pm4Command& c) {
                 retained_ordered_effect_destination_overlaps(
                     ordered_memory_effects, c.wm_addr, 8);
             bool ordered_wait_satisfied = false;
-            if (wait_overlaps_effect && !wait_overlaps_dma &&
-                guest_readable(c.wm_addr, sizeof(uint64_t))) {
+            const bool wait_value_needed =
+                (wait_overlaps_effect && !wait_overlaps_dma) ||
+                (wait_overlaps_dma && std::getenv("PROSPER_GFXLOG"));
+            const bool wait_readable = wait_value_needed &&
+                c.wm_valid && c.wm_addr && !(c.wm_addr & 3) &&
+                guest_readable(c.wm_addr, sizeof(uint64_t));
+            uint64_t ordered_base_value = 0;
+            OrderedQwordOverlayResult ordered_overlay;
+            if (wait_readable) {
+                memcpy(&ordered_base_value,
+                       reinterpret_cast<const void*>(uintptr_t(c.wm_addr)),
+                       sizeof(ordered_base_value));
+                pend_overlay_qword(c.wm_addr, &ordered_base_value);
+                ordered_overlay.value = ordered_base_value;
+            } else if (wait_overlaps_dma || wait_overlaps_effect) {
+                ordered_overlay.overlay = OrderedQwordOverlay::Ambiguous;
+                ordered_overlay.reason = OrderedWaitEffectClass::Unsupported;
+            }
+            if (wait_overlaps_effect && !wait_overlaps_dma && wait_readable) {
                 uint64_t ordered_value = 0;
-                memcpy(&ordered_value, reinterpret_cast<const void*>(uintptr_t(c.wm_addr)),
-                       sizeof(ordered_value));
-                pend_overlay_qword(c.wm_addr, &ordered_value);
+                ordered_value = ordered_base_value;
+                ordered_overlay = overlay_ordered_qword(
+                    ordered_memory_effects, c.wm_addr, &ordered_value);
                 ordered_wait_satisfied =
-                    overlay_ordered_qword(
-                        ordered_memory_effects, c.wm_addr, &ordered_value) ==
-                        OrderedQwordOverlay::Touched &&
+                    ordered_overlay.overlay == OrderedQwordOverlay::Touched &&
                     wait_regmem_value_satisfied(c, ordered_value);
             }
+            if (ordered_wait_satisfied)
+                diagnose_ordered_wait_acceptance(
+                    c, ordered_memory_effects, ordered_base_value, ordered_overlay);
             if (wait_overlaps_dma || (wait_overlaps_effect && !ordered_wait_satisfied)) {
                 dma_execution_rejected = true;
+                diagnose_ordered_wait_rejection(
+                    c, dma_copies, ordered_memory_effects, wait_readable,
+                    ordered_base_value, ordered_overlay, ordered_wait_satisfied);
                 static std::atomic<int> warned{0};
                 if (warned.fetch_add(1) < 24)
                     fprintf(stderr,
