@@ -51,7 +51,7 @@ Last updated: 2026-08-04
 | *Little Nightmares III* | `PPSA05143` | — | 🔬 Graphics setup; startup fault before title | [#1893](https://github.com/mattias800/prosper/issues/1893) |
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | — | 🔬 CPU boot reaches initial AGC setup; no visual milestone | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
-| *Bendy and the Dark Revival* | `PPSA27624` | — | 🔬 CPU boot reaches media initialization; no visual milestone | [#1897](https://github.com/mattias800/prosper/issues/1897) |
+| *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🔬 Live frame loop; the guest stops on Unity's empty transition scene, so every frame is black | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Title screen | [#1898](https://github.com/mattias800/prosper/issues/1898) |
 
 ## Screenshots and short descriptions
@@ -293,7 +293,12 @@ The route reaches Training 1 with a live rail-shooter camera, HUD, crosshair, an
 
 ## Bendy and the Dark Revival — `PPSA27624`
 
-No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1897).
+The title boots into a live native Linux/Vulkan frame loop, and every composited frame is uniformly black, so no
+screenshot is published. The guest loads its Unity bootstrap scene and then `Core/2_General/Empty.unity`, never
+requests `Core/2_General/Game.unity` or any `Core/3_Sections/Section_*` scene, and submits exactly two draws per
+submit for the whole run — the empty scene rendered faithfully. Prosper rejects no shader, packet or format on this
+boot, and the sibling *Bendy and the Ink Machine* renders its menu from the same build as a positive control. See
+the [tracker](https://github.com/mattias800/prosper/issues/1897).
 
 ## Beneath — `PPSA27640`
 
