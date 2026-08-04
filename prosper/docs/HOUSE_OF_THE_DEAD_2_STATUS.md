@@ -48,12 +48,12 @@ destination tag before UMin can update the persistent VGPR. The 83-resource scen
 previously stopped at pc 1,276 now recompiles completely to 288,728 SPIR-V dwords; a second copy of
 both instruction families later in the same shader is covered as well.
 
-The last complete deterministic replay, made before the event-isolation review hardening above,
-remained byte-for-byte visually corrupted while every retained raw VS, FS and compute stage
-substituted successfully. The corrected head has not yet consumed another GPU lease. There is no
-next unsupported retained shader instruction to quote from this capture; the next useful GPU arm is
-to rerun operation 1,937 once and determine whether exact cross-PC semantics change the target before
-returning to draw/resource/state localization.
+The last current-recompiler deterministic replay, made before the event-isolation review hardening
+above, remained byte-for-byte visually corrupted while every retained raw VS, FS and compute stage
+substituted successfully. No current-recompiler Vulkan replay of the corrected lowering has been
+run. There is no next unsupported retained shader instruction to quote from this capture; the next
+useful GPU arm is to rerun operation 1,937 once and determine whether exact cross-PC semantics change
+the target before returning to draw/resource/state localization.
 
 ## Ruled out
 
