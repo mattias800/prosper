@@ -746,17 +746,18 @@ struct SpirvCompute {
             {t_u32, result, uconst(Scope_Subgroup), value, lane});
         return result;
     }
-    uint32_t subgroup_row_shr(uint32_t value, uint32_t active, uint32_t amount,
-                              uint32_t* valid_lane = nullptr) {
+    uint32_t subgroup_row_shr_dynamic(uint32_t value, uint32_t active,
+                                      uint32_t amount,
+                                      uint32_t* valid_lane = nullptr) {
         mark_subgroup_min16();
         const uint32_t lane = subgroup_local_id();
         const uint32_t row_lane = ibin(Op_BitwiseAnd, lane, uconst(15));
-        const uint32_t in_bounds = ucmp(Op_UGreaterThanEqual, row_lane, uconst(amount));
+        const uint32_t in_bounds = ucmp(Op_UGreaterThanEqual, row_lane, amount);
         // Keep the shuffle index valid even for row-leading lanes. FI=0 also makes an EXEC-inactive
         // source invalid. The caller uses `valid` to preserve VDST for BOUND_CTRL=0; returning VALUE
         // here is only a safe placeholder for the disabled lane, not its architectural result.
         const uint32_t source_lane = sel(in_bounds,
-            ibin(Op_ISub, lane, uconst(amount)), lane);
+            ibin(Op_ISub, lane, amount), lane);
         const uint32_t shifted = subgroup_shuffle(value, source_lane);
         const uint32_t source_active = subgroup_shuffle(
             sel(active, uconst(1), uconst(0)), source_lane);
@@ -764,6 +765,10 @@ struct SpirvCompute {
             ucmp(Op_INotEqual, source_active, uconst(0)));
         if (valid_lane) *valid_lane = valid;
         return sel(valid, shifted, value);
+    }
+    uint32_t subgroup_row_shr(uint32_t value, uint32_t active, uint32_t amount,
+                              uint32_t* valid_lane = nullptr) {
+        return subgroup_row_shr_dynamic(value, active, uconst(amount), valid_lane);
     }
     uint32_t subgroup_quad_permute(uint32_t value, uint32_t ctrl) {
         const uint32_t lane = subgroup_local_id();
@@ -11352,6 +11357,23 @@ bool emit_cfg_state_machine(
         return {in.src[0].value, in.src[1].value};
     };
 
+    // House of the Dead 2 reduces an unsigned value in place across one architectural DPP row
+    // immediately after the two saved-mask comparisons above. Keep this dispatcher escape hatch
+    // exact: fragment V_MIN_U32, unbounded ROW_SHR, full-mask/no-modifier DPP16 (proved by the
+    // decoder's has_dpp contract), and one physical VGPR used as VDST/SRC0/SRC1. The subgroup
+    // operation itself is emitted in the common phase below so lanes taking other CFG cases still
+    // participate without supplying a false neighbor.
+    auto fragment_dpp_min_row_shr = [&](const Rdna2Inst& in) {
+        return b.is_fragment && in.fmt == Rdna2Format::VOP2 &&
+            in.opcode == 0x13 && in.has_dpp && !in.dpp_bound_ctrl &&
+            in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11fu &&
+            in.dst.kind == OperandKind::VGPR &&
+            in.src[0].kind == OperandKind::VGPR &&
+            in.src[1].kind == OperandKind::VGPR &&
+            in.dst.value == in.src[0].value &&
+            in.dst.value == in.src[1].value;
+    };
+
     // VOPC e64 can compare a complete 64-bit scalar mask as integer data. Generated Wave64 code
     // uses `v_cmp_gt_u64 vcc,vcc,0` to broadcast (old VCC != 0) back into every active VCC lane.
     // The per-invocation mask representation has no 64-bit scalar payload, but the comparison is
@@ -11479,6 +11501,8 @@ bool emit_cfg_state_machine(
     bool has_gds_append = false;
     bool has_lds_append = false;
     std::unordered_set<uint32_t> swizzle_pcs;
+    std::unordered_set<uint32_t> fragment_dpp_min_row_shr_pcs;
+    std::set<int> fragment_dpp_min_row_shr_dsts;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& in = ins[i];
         if (in.is_end) break;
@@ -11501,6 +11525,13 @@ bool emit_cfg_state_machine(
         }
         if (in.fmt == Rdna2Format::DS && in.opcode == 0x35) {
             swizzle_pcs.insert(in.pc);
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (fragment_dpp_min_row_shr(in)) {
+            fragment_dpp_min_row_shr_pcs.insert(in.pc);
+            fragment_dpp_min_row_shr_dsts.insert(in.dst.value);
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -12133,6 +12164,7 @@ bool emit_cfg_state_machine(
             synchronized_block[block] = synchronized_block[block] ||
                 mbcnt_event_for_pc.contains(in.pc) || append_event_for_pc.contains(in.pc) ||
                 swizzle_pcs.contains(in.pc) ||
+                fragment_dpp_min_row_shr_pcs.contains(in.pc) ||
                 mask_zero_compare_candidate_source(in) >= 0 ||
                 exec_saved_mask_compare_source(in) >= 0 ||
                 saved_mask_pair_compare_sources(in)[0] >= 0 ||
@@ -12289,6 +12321,17 @@ bool emit_cfg_state_machine(
     const uint32_t swizzle_source_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t swizzle_source_lane_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t swizzle_dst_var = b.function_var(b.t_u32, ptr_u32);
+    const bool has_dpp_min_row_shr = !fragment_dpp_min_row_shr_pcs.empty();
+    const uint32_t dpp_min_pending_var = has_dpp_min_row_shr
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t dpp_min_active_var = has_dpp_min_row_shr
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t dpp_min_source_var = has_dpp_min_row_shr
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t dpp_min_amount_var = has_dpp_min_row_shr
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t dpp_min_dst_var = has_dpp_min_row_shr
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
 
     const uint32_t zero = b.uconst(0), no = b.bfalse(), yes = b.btrue();
     for (const auto& kv : vv) {
@@ -12336,6 +12379,11 @@ bool emit_cfg_state_machine(
     b.store_function(swizzle_source_var, zero);
     b.store_function(swizzle_source_lane_var, zero);
     b.store_function(swizzle_dst_var, zero);
+    if (has_dpp_min_row_shr) {
+        b.store_function(dpp_min_source_var, zero);
+        b.store_function(dpp_min_amount_var, zero);
+        b.store_function(dpp_min_dst_var, zero);
+    }
 
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
         RegState state;
@@ -12485,6 +12533,10 @@ bool emit_cfg_state_machine(
     }
     b.store_function(swizzle_pending_var, no);
     b.store_function(swizzle_active_var, no);
+    if (has_dpp_min_row_shr) {
+        b.store_function(dpp_min_pending_var, no);
+        b.store_function(dpp_min_active_var, no);
+    }
     b.emit_loopmerge(loop_merge, loop_continue);
     b.emit_branch(switch_header);
     b.emit_label(switch_header);
@@ -12529,6 +12581,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* mbcnt = nullptr;
         const Rdna2Inst* append = nullptr;
         const Rdna2Inst* swizzle = nullptr;
+        const Rdna2Inst* dpp_min_row_shr = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
         const Rdna2Inst* exec_saved_mask_compare = nullptr;
         const Rdna2Inst* saved_mask_pair_compare = nullptr;
@@ -12545,6 +12598,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_mbcnt = nullptr;
             const Rdna2Inst* block_append = nullptr;
             const Rdna2Inst* block_swizzle = nullptr;
+            const Rdna2Inst* block_dpp_min_row_shr = nullptr;
             const Rdna2Inst* block_mask_compare = nullptr;
             const Rdna2Inst* block_exec_saved_mask_compare = nullptr;
             const Rdna2Inst* block_saved_mask_pair_compare = nullptr;
@@ -12567,6 +12621,16 @@ bool emit_cfg_state_machine(
                 }
                 if (in.fmt == Rdna2Format::DS && in.opcode == 0x35) {
                     block_swizzle = &in;
+                    break;
+                }
+                if (fragment_dpp_min_row_shr_pcs.contains(in.pc)) {
+                    if (getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[graphics-cfg-dpp-min-row-shr] "
+                                     "pc=%u vgpr=v%d amount=%u\n",
+                                     in.pc, in.dst.value,
+                                     static_cast<uint32_t>(in.dpp_ctrl - 0x110u));
+                    block_dpp_min_row_shr = &in;
                     break;
                 }
                 const int mask_compare_source =
@@ -12653,7 +12717,8 @@ bool emit_cfg_state_machine(
             const bool last = member + 1 == dispatch_blocks[dispatch].size();
             if (!last) {
                 // Group construction admits only one-successor plain blocks before the tail.
-                if (block_mbcnt || block_append || block_swizzle || block_mask_compare ||
+                if (block_mbcnt || block_append || block_swizzle ||
+                    block_dpp_min_row_shr || block_mask_compare ||
                     block_exec_saved_mask_compare || block_saved_mask_pair_compare ||
                     block_vopc_mask_compare ||
                     block_b64_mask_scc_vote ||
@@ -12666,6 +12731,7 @@ bool emit_cfg_state_machine(
             mbcnt = block_mbcnt;
             append = block_append;
             swizzle = block_swizzle;
+            dpp_min_row_shr = block_dpp_min_row_shr;
             mask_compare = block_mask_compare;
             exec_saved_mask_compare = block_exec_saved_mask_compare;
             saved_mask_pair_compare = block_saved_mask_pair_compare;
@@ -12763,6 +12829,19 @@ bool emit_cfg_state_machine(
             b.store_function(swizzle_source_lane_var, source_lane);
             b.store_function(swizzle_dst_var,
                 b.uconst(static_cast<uint32_t>(swizzle->dst.value)));
+        }
+        if (dpp_min_row_shr) {
+            if (!fragment_dpp_min_row_shr(*dpp_min_row_shr))
+                return reject_cfg(dpp_min_row_shr->pc, "dpp-min-row-shr-contract");
+            const auto source = state.vreg.find(dpp_min_row_shr->src[0].value);
+            b.store_function(dpp_min_pending_var, yes);
+            b.store_function(dpp_min_active_var, state.exec);
+            b.store_function(dpp_min_source_var,
+                source == state.vreg.end() ? zero : source->second);
+            b.store_function(dpp_min_amount_var,
+                b.uconst(static_cast<uint32_t>(dpp_min_row_shr->dpp_ctrl - 0x110u)));
+            b.store_function(dpp_min_dst_var,
+                b.uconst(static_cast<uint32_t>(dpp_min_row_shr->dst.value)));
         }
         if (mask_compare) {
             if (b.is_vertex) {
@@ -12916,6 +12995,10 @@ bool emit_cfg_state_machine(
         } else if (swizzle) {
             if (!set_next(swizzle->pc + swizzle->len_dwords))
                 return reject_cfg(swizzle->pc, "swizzle-successor");
+        } else if (dpp_min_row_shr) {
+            if (!set_next(dpp_min_row_shr->pc + dpp_min_row_shr->len_dwords))
+                return reject_cfg(dpp_min_row_shr->pc,
+                                  "dpp-min-row-shr-successor");
         } else if (mask_compare) {
             if (!set_next(mask_compare->pc + mask_compare->len_dwords))
                 return reject_cfg(mask_compare->pc, "mask-compare-successor");
@@ -13059,6 +13142,50 @@ bool emit_cfg_state_machine(
                 swizzle_pending,
                 b.ucmp(Op_IEqual, swizzle_dst,
                        b.uconst(static_cast<uint32_t>(kv.first.first))));
+            const uint32_t old = b.load_function(b.t_bool, kv.second);
+            b.store_function(kv.second, b.bsel(selected, no, old));
+        }
+    }
+
+    // Fragment DPP V_MIN_U32 common phase. A graphics dispatcher's PC is lane-local, so a source
+    // lane is eligible only when it published this same DPP event and its EXEC bit is active. The
+    // unbounded ROW_SHR contract disables out-of-row/inactive-source lanes and preserves VDST;
+    // active destination lanes reduce the shifted neighbor with their unchanged local value.
+    if (!fragment_dpp_min_row_shr_pcs.empty()) {
+        const uint32_t pending = b.load_function(b.t_bool, dpp_min_pending_var);
+        const uint32_t active = b.load_function(b.t_bool, dpp_min_active_var);
+        const uint32_t source = b.load_function(b.t_u32, dpp_min_source_var);
+        uint32_t valid_source = 0;
+        const uint32_t shifted = b.subgroup_row_shr_dynamic(
+            source, b.land(pending, active),
+            b.load_function(b.t_u32, dpp_min_amount_var), &valid_source);
+        const uint32_t result = b.uext2(Glsl_UMin, shifted, source);
+        const uint32_t write = b.land(b.land(pending, active), valid_source);
+        const uint32_t dst = b.load_function(b.t_u32, dpp_min_dst_var);
+        for (int reg : fragment_dpp_min_row_shr_dsts) {
+            const auto kv = vv.find(reg);
+            if (kv == vv.end()) return reject_cfg(0, "missing-dpp-min-row-shr-dst");
+            const uint32_t selected = b.land(
+                write, b.ucmp(Op_IEqual, dst,
+                              b.uconst(static_cast<uint32_t>(reg))));
+            const uint32_t old = b.load_function(b.t_u32, kv->second);
+            b.store_function(kv->second, b.sel(selected, result, old));
+        }
+        // A physical VGPR definition ends scalar lane-spill lifetimes even when EXEC suppresses
+        // this lane's data write, matching predicate_write and the DS_SWIZZLE common phase above.
+        for (const auto& kv : lv) {
+            if (!fragment_dpp_min_row_shr_dsts.contains(kv.first.first)) continue;
+            const uint32_t selected = b.land(
+                pending, b.ucmp(Op_IEqual, dst,
+                                b.uconst(static_cast<uint32_t>(kv.first.first))));
+            const uint32_t old = b.load_function(b.t_u32, kv.second);
+            b.store_function(kv.second, b.sel(selected, zero, old));
+        }
+        for (const auto& kv : lmv) {
+            if (!fragment_dpp_min_row_shr_dsts.contains(kv.first.first)) continue;
+            const uint32_t selected = b.land(
+                pending, b.ucmp(Op_IEqual, dst,
+                                b.uconst(static_cast<uint32_t>(kv.first.first))));
             const uint32_t old = b.load_function(b.t_bool, kv.second);
             b.store_function(kv.second, b.bsel(selected, no, old));
         }

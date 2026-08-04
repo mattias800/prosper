@@ -135,6 +135,109 @@ bool wave_vote_reaches_later_select(const std::vector<uint32_t>& spv,
     return false;
 }
 
+// Prove the complete common-phase lowering for House's in-place DPP minimum reduction. The four
+// dispatcher cases must publish shifts 1/2/4/8 into one mailbox; one uniform subgroup phase must use
+// that dynamic amount for both the row bound and lane subtraction, gate source participation by
+// two persisted bools (pending + EXEC), feed the shuffle into UMin, and store the selected result
+// back to a Function VGPR. Opcode presence alone would miss direction and divergent-PC mistakes.
+bool dpp_min_row_shr_updates_dispatch_vgpr(const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpConstant = 43, OpExtInst = 12, OpLoad = 61, OpStore = 62,
+                       OpISub = 130, OpLogicalAnd = 167, OpSelect = 169,
+                       OpUGreaterThanEqual = 174, OpGroupNonUniformShuffle = 345,
+                       GlslUMin = 38;
+    struct Select { uint32_t condition = 0, yes = 0, no = 0; };
+    std::unordered_map<uint32_t, uint32_t> constants, load_pointer;
+    std::unordered_map<uint32_t, std::array<uint32_t, 2>> logical_ands;
+    std::unordered_map<uint32_t, Select> selects;
+    std::vector<std::array<uint32_t, 2>> stores;
+    std::vector<uint32_t> shuffle_values;
+    std::unordered_set<uint32_t> shuffle_derived, umin_results;
+    std::unordered_set<uint32_t> amount_bound_uses, amount_subtract_uses;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4)
+            constants[spv[i + 2]] = spv[i + 3];
+        else if (op == OpLoad && wc == 4)
+            load_pointer[spv[i + 2]] = spv[i + 3];
+        else if (op == OpStore && wc == 3)
+            stores.push_back({spv[i + 1], spv[i + 2]});
+        else if (op == OpLogicalAnd && wc == 5)
+            logical_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpSelect && wc == 6) {
+            selects[spv[i + 2]] = {spv[i + 3], spv[i + 4], spv[i + 5]};
+            if (shuffle_derived.contains(spv[i + 4]) ||
+                shuffle_derived.contains(spv[i + 5]))
+                shuffle_derived.insert(spv[i + 2]);
+        } else if (op == OpGroupNonUniformShuffle && wc == 6) {
+            shuffle_derived.insert(spv[i + 2]);
+            shuffle_values.push_back(spv[i + 4]);
+        } else if (op == OpExtInst && wc == 7 && spv[i + 4] == GlslUMin &&
+                   (shuffle_derived.contains(spv[i + 5]) ||
+                    shuffle_derived.contains(spv[i + 6]))) {
+            umin_results.insert(spv[i + 2]);
+        } else if (op == OpUGreaterThanEqual && wc == 5) {
+            amount_bound_uses.insert(spv[i + 4]);
+        } else if (op == OpISub && wc == 5) {
+            amount_subtract_uses.insert(spv[i + 4]);
+        }
+        i += wc;
+    }
+    if (opcode_count(spv, OpGroupNonUniformShuffle) != 2 || umin_results.empty())
+        return false;
+
+    std::unordered_map<uint32_t, std::unordered_set<uint32_t>> stored_constants;
+    for (const auto& store : stores) {
+        const auto value = constants.find(store[1]);
+        if (value != constants.end()) stored_constants[store[0]].insert(value->second);
+    }
+    bool exact_amount = false;
+    for (const auto& load : load_pointer) {
+        const auto values = stored_constants.find(load.second);
+        if (values != stored_constants.end() && values->second.contains(1) &&
+            values->second.contains(2) && values->second.contains(4) &&
+            values->second.contains(8) &&
+            amount_bound_uses.contains(load.first) &&
+            amount_subtract_uses.contains(load.first)) {
+            exact_amount = true;
+            break;
+        }
+    }
+
+    bool pending_and_exec_gate = false;
+    for (uint32_t value : shuffle_values) {
+        const auto select = selects.find(value);
+        if (select == selects.end()) continue;
+        const auto one = constants.find(select->second.yes);
+        const auto zero = constants.find(select->second.no);
+        const auto both = logical_ands.find(select->second.condition);
+        if (one == constants.end() || one->second != 1 ||
+            zero == constants.end() || zero->second != 0 ||
+            both == logical_ands.end())
+            continue;
+        const auto first = load_pointer.find(both->second[0]);
+        const auto second = load_pointer.find(both->second[1]);
+        if (first != load_pointer.end() && second != load_pointer.end() &&
+            first->second != second->second) {
+            pending_and_exec_gate = true;
+            break;
+        }
+    }
+
+    bool min_reaches_store = false;
+    for (const auto& select : selects) {
+        if (!umin_results.contains(select.second.yes)) continue;
+        if (std::any_of(stores.begin(), stores.end(), [&](const auto& store) {
+                return store[1] == select.first;
+            })) {
+            min_reaches_store = true;
+            break;
+        }
+    }
+    return exact_amount && pending_and_exec_gate && min_reaches_store;
+}
+
 // Trace IMAGE_GET_LOD all the way from two known VGPR bit patterns to the fragment output. This is
 // deliberately a dataflow check rather than an opcode-presence check: it proves coordinate
 // provenance, AMD/SPIR-V x/y component order, compact dmask-to-VDATA placement, and the EXEC select
@@ -2411,6 +2514,66 @@ int main() {
     }
     printf("  [ok]   saved-mask pair compare rejects half-overwrite/numeric mutations and "
            "does not vote across joins\n");
+
+    // The exact House shader next performs four in-place unsigned minima across DPP row-right
+    // neighbors. Keep them inside the same crossing graphics CFG fixture: the dispatcher must
+    // publish each lane's source and shift, execute two subgroup shuffles in its uniform common
+    // phase (value + source-activity), persist the UMin, and do so for both fragment wave sizes.
+    auto saved_mask_pair_dpp_shader = [&]() {
+        std::vector<uint32_t> shader(
+            std::begin(fragment_saved_mask_pair_prelude),
+            std::end(fragment_saved_mask_pair_prelude));
+        shader.insert(shader.end(), {
+            0x7e060287u,                         // v_mov_b32 v3,7
+            0x260606fau, 0xff011103u,            // v_min_u32_dpp v3,v3,v3 row_shr:1
+            0x260606fau, 0xff011203u,            // row_shr:2
+            0x260606fau, 0xff011403u,            // row_shr:4
+            0x260606fau, 0xff011803u,            // row_shr:8
+        });
+        shader.insert(shader.end(), std::begin(fragment_scalar_cfg_dispatch),
+                      std::end(fragment_scalar_cfg_dispatch));
+        return shader;
+    };
+    auto dpp_min_module_is_exact = [&](const std::vector<uint32_t>& spirv,
+                                       uint32_t wave_size) {
+        return !spirv.empty() && has_opcode(spirv, 251) &&
+            dpp_min_row_shr_updates_dispatch_vgpr(spirv) &&
+            fragment_spirv_required_subgroup_size(spirv) == wave_size &&
+            (fragment_spirv_required_subgroup_features(spirv) &
+             kFragmentSubgroupShuffle) &&
+            type_result_ids_are_nonzero(spirv, nullptr) &&
+            phi_ids_are_nonzero(spirv);
+    };
+    std::vector<uint32_t> fragment_dpp_min_row = saved_mask_pair_dpp_shader();
+    const auto fragment_dpp_min_row_wave64_spv = recompile_fragment(
+        fragment_dpp_min_row.data(), fragment_dpp_min_row.size());
+    const auto fragment_dpp_min_row_wave32_spv = recompile_fragment_wave32_for_test(
+        fragment_dpp_min_row.data(), fragment_dpp_min_row.size());
+    if (!dpp_min_module_is_exact(fragment_dpp_min_row_wave64_spv, 64) ||
+        !dpp_min_module_is_exact(fragment_dpp_min_row_wave32_spv, 32)) {
+        printf("  [FAIL] House DPP minimum did not persist through the Wave32/64 CFG common phase\n");
+        return 1;
+    }
+
+    std::vector<uint32_t> dpp_min_wrong_opcode = fragment_dpp_min_row;
+    dpp_min_wrong_opcode[9] = 0x280606fau; // v_max_u32 is outside the exact contract
+    std::vector<uint32_t> dpp_min_distinct_source = fragment_dpp_min_row;
+    dpp_min_distinct_source[10] = 0xff011104u; // src0=v4, while VDST/SRC1 remain v3
+    std::vector<uint32_t> dpp_min_wrong_amount = fragment_dpp_min_row;
+    dpp_min_wrong_amount[10] = 0xff011203u; // duplicates :2; loses exact :1/:2/:4/:8 chain
+    const auto wrong_opcode_spv = recompile_fragment(
+        dpp_min_wrong_opcode.data(), dpp_min_wrong_opcode.size());
+    const auto distinct_source_spv = recompile_fragment(
+        dpp_min_distinct_source.data(), dpp_min_distinct_source.size());
+    const auto wrong_amount_spv = recompile_fragment(
+        dpp_min_wrong_amount.data(), dpp_min_wrong_amount.size());
+    if (dpp_min_row_shr_updates_dispatch_vgpr(wrong_opcode_spv) ||
+        dpp_min_row_shr_updates_dispatch_vgpr(distinct_source_spv) ||
+        dpp_min_row_shr_updates_dispatch_vgpr(wrong_amount_spv)) {
+        printf("  [FAIL] DPP minimum admitted an opcode/source/amount mutation\n");
+        return 1;
+    }
+    printf("  [ok]   House DPP minimum preserves row direction, CFG participation, and VGPR dataflow\n");
 
     // Astro Bot's world-map material PS reaches the same graphics CFG dispatcher with an
     // s_orn2_saveexec_b64 whose destination is VCC. Keep a saved EXEC source live across dispatcher
