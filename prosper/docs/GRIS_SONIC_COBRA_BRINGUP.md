@@ -139,6 +139,10 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | Sonic is black because it submits no GPU work or a shader/resource stage fails realization | **Falsified for the captured present-20 frame.** A deterministic whole-frame bundle contains 36 realized operations across submits 447-468; every extracted capsule reports `failed=0` and no failure diagnostics, its temporal closure is complete, and offline replay succeeds. The complete 3840x2160 result is nevertheless uniformly black. The first live `Vulkan render FAILED` line occurs earlier on empty submit 448, so it is a missing presentable scanout result rather than a failed Vulkan operation. | #1905 |
 | Submit 463's operation-5 black target is caused solely by operation 2 sampling stale zero guest bytes for its Uint32 view of the persistent depth plane | **Falsified, while exposing and fixing a real generic interop defect.** The authoritative D32S8 depth plane at `0x2064ae0000` is uniformly `0.5`, but the old Uint32 compute path read its stale zero guest backing. A GPU-only raw-bit bridge changes operation 2's 3840x2160 binding-7 output from all zero (`ccc433ff6d980383`) to the exact depth-plane bits (`1d0ffd6fc0338383`). Operation 5 still produces the identical black `26ed8b6191338383` target with a complete six-operation closure, so the stale depth alias was real but not sufficient to explain this frame's black composite. | #1905, this doc |
 | Operation 5 turns black because one of its large shader/resource paths fails or reads the wrong downstream input | **Falsified for the captured frame.** The exact dependency graph proves operation 1 writes operation 5's binding 119 at `0x204ec40000`. Operation 1's complete four-dword fragment program unconditionally exports zero to every RGBA channel. Operation 5 samples that texture first, computes `(uint(alpha * 255) & 64)`, and bypasses its large body when the bit is clear; its fallback exports binding 32 words 84-87, which are `(0,0,0,1)`. The black result is therefore selected by the guest shader before the other scene resources can affect it, not produced by a failed operation-5 translation. The remaining blocker is upstream of this submit's GPU program. | #1905, this doc |
+| The frontend is stalled on a Sony call prosper has not implemented (the classic "guest polls a missing stub" wall) | **Falsified.** A 185 s routed CPU-only arm on `9dcb6c4b` with `PROSPER_PROGRESS=5 PROSPER_PROGRESS_UNIMPL=1` dumps the unimplemented-NID call-count table 38 times and every dump reads `(0 distinct unimplemented functions)`. The table is the per-call-count form specifically built to expose a *polled* missing stub, so a deduped first-seen log cannot be hiding one. | #1905, this doc |
+| The frontend is waiting on a Sony service, an incomplete asset load, or an APR read that never completes | **Falsified for the post-resident state.** With `PROSPER_FILELOG=1` the whole resident set (`param_tech.rfl`, `NeedleShader.pac`, `ui_resident`/`ui_text_texture`/`scalablefont`, the CRI ACB/AWB banks, `rfl_resident.pac`, all twelve `text_common_*`, `segafont.pac`) resolves and reads OK and the **last file operation completes before the t=5 s heartbeat**; the following 180 s contain zero file activity. Under `PROSPER_SVCLOG=1` the only per-frame service traffic is `sceUserServiceGetEvent` (4,264 calls / 60 s) plus `scePadReadState`; `sceSaveDataInitialize3` and the entitlement list call happen once each and no mount, key or trophy call ever blocks. | #1905, this doc |
+| The black startup state is input-gated and previous arms simply never pressed the button that dismisses it | **Falsified — and the suspicion was well founded, because the committed route really is short.** `scripts/sonic/reach-title-or-gameplay.pad` ends at **pad-read 404**, and the route clock is pad reads, not seconds, so at the ~61 reads/s of a CPU-only arm it delivers its last edge at **t≈6.6 s** and every previous CPU-only run then ran input-free. A 12,000-read probe route (`scripts/sonic/long-input-probe.pad`, ~400 Cross pulses with Options every tenth) changes nothing: the 200 s CPU-only arm and a 160 s live-renderer arm both plateau on a **byte-identical resolved-path set**, and no run in the series ever requests `ui_mainmenu*.pac`, `stage_title.pac`, `gedit_stage_title.pac`, a `.rsdk` or a `.usm`. | #1905, this doc |
+| The absent `raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/` group prove the supplied `raw/` tree is a truncated repack | **Falsified as an integrity claim.** The tree is internally consistent: `ui_museum_item_texture_l_art1..214` is contiguous with no gaps, all seven multi-language `ui_*` families are complete at 12/12 languages, `raw/ui` contains no subdirectories at all, and the application's own `AMPRIDX3` index enumerates 631 of the 633 files actually present. The eboot's name pool contains exactly one base-game `ui/` entry with no file (`ui/ui_startup`) plus the six region rating textures (`ui_title_cero`/`esrb_e10`/`esrb_rp`/`nocopy`/`pegi`/`titile_healthy`) — one functional group, requested back to back, consistent with an optional region/legal asset set this build does not ship. Their absence is therefore not evidence of a damaged dump, and remains insufficient to explain the black frame. | #1905, this doc |
 
 ## Sonic Origins dump audit
 
@@ -279,3 +283,62 @@ PROSPER_PAD_SCRIPT=@prosper/scripts/sonic/reach-title-or-gameplay.pad \
 ```
 
 The control is off by default; an ordinary launch continues to report no pending Game Intent.
+
+### Post-resident steady state and thread census (2026-08-04, master `9dcb6c4b`)
+
+The frontier moved upstream of the GPU once the captured frame was classified as guest-programmed
+black. This section records what the guest actually does *after* its resident load, so the next lane
+does not have to re-measure it.
+
+**The load finishes almost immediately and nothing follows it.** In a routed CPU-only arm
+(`PROSPER_NO_COMPUTE=1`), every resolve/read in the resident set completes before the t=5 s
+`PROSPER_PROGRESS` heartbeat. The remaining 180 s contain no file operation at all, and the resolved
+path set is a fixed 46 entries — the same set under the live renderer with continuous input.
+
+**The frame work is constant, not merely repetitive.** Across the whole arm the guest submits exactly
+**22 submits, 22 draws and 14 dispatches per flip** (185 s: 248,048 draws / 157,954 dispatches /
+11,274 flips). That is the same 22 submits and 36 operations the retained present-20 bundle contains,
+so the frame the earlier lanes dissected is the *only* frame Sonic ever builds: the engine reaches its
+steady render state before present 20 and never changes it. There is no fade, no animation and no
+progressive load behind the black output.
+
+**Thread census.** Guest-named threads recovered by attaching to the settled process and classifying
+stack contents against the eboot load base (57 threads total):
+
+| Guest thread name | Count | Sampled behaviour |
+| --- | --- | --- |
+| `RsdxThread` | 13 | active — stacks advance between samples |
+| `CRI MPV Worker` | 12 | **permanently parked**, identical stacks across all samples |
+| `JobTPool1..12:0` | 12 | thread pool, mixed idle/active |
+| `CRI FS *` / `CRI Server Mana` / `CRI Audio Outpu` | 6 | active |
+| `module-rt` | 3 | prosper-side |
+| `CriManaDecodeTh` | 1 | **permanently parked** |
+| `Rsdx11CoreCommo`, `JobQueue`, `WorkerIO`, `WorkerResource`, `WorkerNVMe` | 5 | one core thread active; NVMe/queue idle |
+
+The CRI Mana / MPV movie-player group (13 threads) is fully constructed and then never used: no `.usm`
+is opened in any arm of this series. Whether Sonic's boot is supposed to play a movie here is the open
+question — it is the one large subsystem that is initialised and idle.
+
+**No thread is blocked on a primitive prosper never signals.** `tools/guest_bt` (the right instrument
+here — it bridges the HLE stub boundary that defeats a plain gdb stack walk) resolves guest thread 1's
+chain through the Sony sleep stub to `eboot+0x933088`, reached from `eboot+0x930360`, which the entry
+region calls at `eboot+0x50ef27`. That call site is followed by `mov r14d, eax` and a virtual teardown
+of the global at `eboot+0x3522950`, so `eboot+0x930360` is the RSDX **application run loop** and the
+sleep is its frame pacing. Main is therefore healthy and inside the normal run loop, not parked on a
+wait. Every other thread resolves to an ordinary `pthread_cond_wait` / `cond_timedwait` / `nanosleep`
+pool idle. The whole "some guest thread waits forever for something prosper never posts" family is
+closed for this state.
+
+**What is therefore left.** The guest is alive, not deadlocked, and asks prosper for nothing it does
+not get: no unimplemented call, no pending file, no blocking service, no missing input. It simply
+re-renders an empty scene. The next discriminator has to identify the internal condition the RSDX
+frontend is testing — the candidates now worth separating are (a) a wrong value prosper already
+returned earlier in boot (a registered-but-mismodelled call, which the unimplemented-NID table cannot
+see by construction) and (b) a CRI Mana / Sofdec2 boot-movie step that never starts. Neither is
+addressable by another whole-frame GPU capture of this state.
+
+**Route caveat that cost this series time.** `.pad` route positions are **pad reads, not seconds**, so
+a route's wall-clock length scales with the guest's frame rate: the 404-read
+`reach-title-or-gameplay.pad` lasts ~6.6 s in a 61 reads/s CPU-only arm but ~80 s in a ~5 reads/s live
+renderer arm. `scripts/sonic/long-input-probe.pad` exists so an input-gated hypothesis can be excluded
+without that ambiguity; it is an investigation aid, not an evidence route.
