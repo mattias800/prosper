@@ -2179,6 +2179,72 @@ HLE(s_syss_param_int) {
 // Layout cross-checked against Kyty LibSystemService.cpp:83: int32 eventNum @0; bool
 // isSystemUiOverlaid @4, isInBackgroundExecution @5, isCpuMode7CpuNormal @6 (defaults TRUE),
 // isGameLiveStreamingOnAir @7, isOutOfVrPlayArea @8; 12 bytes with tail padding.
+namespace {
+// ErrorDialog is system-owned UI. Platform glue uses SystemService status' background -> foreground
+// transition to resume requests after it closes, independently of the CommonDialog FINISHED value.
+// A real backend may stay active across many status samples; the headless backend dismisses during
+// Open and must still expose one observable enter/return pair instead of collapsing both edges into
+// a permanent foreground value. Oregon Trail #1606 positive-controlled this exact contract twice:
+// the account-completion writer ran only after both SystemService samples. No title address or
+// title identity participates in this state machine.
+enum ErrorDialogBackgroundPhase : unsigned {
+    ErrorDialogIdle = 0,
+    ErrorDialogHeadlessEnter,
+    ErrorDialogHeadlessReturn,
+    ErrorDialogBackedEnter,
+    ErrorDialogBackedActive,
+    ErrorDialogBackedReturn,
+};
+std::atomic<unsigned> g_error_dialog_background_phase{ErrorDialogIdle};
+
+void begin_error_dialog_background(bool backed) {
+    g_error_dialog_background_phase.store(
+        backed ? ErrorDialogBackedEnter : ErrorDialogHeadlessEnter, std::memory_order_release);
+}
+
+void finish_error_dialog_background() {
+    unsigned phase = g_error_dialog_background_phase.load(std::memory_order_acquire);
+    for (;;) {
+        unsigned next = phase;
+        if (phase == ErrorDialogBackedEnter) next = ErrorDialogHeadlessEnter;
+        else if (phase == ErrorDialogBackedActive) next = ErrorDialogBackedReturn;
+        else return;
+        if (g_error_dialog_background_phase.compare_exchange_weak(
+                phase, next, std::memory_order_acq_rel, std::memory_order_acquire)) return;
+    }
+}
+
+uint8_t sample_error_dialog_background() {
+    unsigned phase = g_error_dialog_background_phase.load(std::memory_order_acquire);
+    for (;;) {
+        unsigned next = phase;
+        uint8_t background = 0;
+        const char* edge = nullptr;
+        switch (phase) {
+        case ErrorDialogHeadlessEnter:
+            next = ErrorDialogHeadlessReturn; background = 1; edge = "enter"; break;
+        case ErrorDialogHeadlessReturn:
+            next = ErrorDialogIdle; background = 0; edge = "return"; break;
+        case ErrorDialogBackedEnter:
+            next = ErrorDialogBackedActive; background = 1; edge = "enter"; break;
+        case ErrorDialogBackedActive:
+            return 1;
+        case ErrorDialogBackedReturn:
+            next = ErrorDialogIdle; background = 0; edge = "return"; break;
+        default:
+            return 0;
+        }
+        if (!g_error_dialog_background_phase.compare_exchange_weak(
+                phase, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            continue;
+        }
+        fprintf(stderr, "[svc] ErrorDialog system lifecycle background=%u phase=%s\n",
+                (unsigned)background, edge);
+        return background;
+    }
+}
+}
+
 HLE(s_syss_getstatus) {
     auto* st = (uint8_t*)PW(a0);
     if (!st) return 0x80A10003ull;   // SYSTEM_SERVICE_ERROR_PARAMETER (Kyty Errno.h:382)
@@ -2190,6 +2256,7 @@ HLE(s_syss_getstatus) {
         gameintent_activity_id()) {
         *(int32_t*)st = 1;
     }
+    st[5] = sample_error_dialog_background();
     st[6] = 1;                       // isCpuMode7CpuNormal = true
     return 0;
 }
@@ -3349,21 +3416,50 @@ extern "C" uint64_t s_np_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint
 // errorCode is printed unconditionally — a one-shot, high-value diagnostic of WHAT the game
 // thinks failed. CONFIDENCE: HIGH (shadPS4 implements this exact lifecycle).
 namespace { std::atomic<int> g_errdialog_status{0 /*NONE*/}; std::atomic<int> g_errdialog_backed{0}; }
-HLE(s_errdialog_init)   { g_errdialog_backed.store(0); g_errdialog_status.store(1 /*INITIALIZED*/); return 0; }
+HLE(s_errdialog_init)   {
+    g_errdialog_backed.store(0);
+    g_error_dialog_background_phase.store(ErrorDialogIdle);
+    g_errdialog_status.store(1 /*INITIALIZED*/);
+    return 0;
+}
 HLE(s_errdialog_open)   {
     // Offer the error dialog to a registered PlatformUi first (a real message box); else auto-dismiss.
-    if (auto* ui = platform_ui(); ui && ui->errorDialogOpen(a0)) { g_errdialog_backed.store(1); return 0; }
+    if (auto* ui = platform_ui()) {
+        begin_error_dialog_background(true);
+        if (ui->errorDialogOpen(a0)) { g_errdialog_backed.store(1); return 0; }
+    }
     g_errdialog_backed.store(0);
     uint32_t code = 0;
     if (svc_ptrish(a0)) code = *(const uint32_t*)((const char*)PW(a0) + 4);
     fprintf(stderr, "[svc] sceErrorDialogOpen(errorCode=%#x) -> auto-dismiss FINISHED\n", code);
     g_errdialog_status.store(3 /*FINISHED (auto-dismiss)*/);
+    begin_error_dialog_background(false);
     return 0;
 }
-HLE(s_errdialog_close)  { if (g_errdialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->errorDialogClose(); } g_errdialog_status.store(3 /*FINISHED*/); return 0; }
-HLE(s_errdialog_term)   { if (g_errdialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->errorDialogClose(); } g_errdialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_errdialog_close)  {
+    if (g_errdialog_backed.exchange(0)) {
+        if (auto* ui = platform_ui()) ui->errorDialogClose();
+    }
+    finish_error_dialog_background();
+    g_errdialog_status.store(3 /*FINISHED*/);
+    return 0;
+}
+HLE(s_errdialog_term)   {
+    if (g_errdialog_backed.exchange(0)) {
+        if (auto* ui = platform_ui()) ui->errorDialogClose();
+    }
+    finish_error_dialog_background();
+    g_errdialog_status.store(0 /*NONE*/);
+    return 0;
+}
 HLE(s_errdialog_status) {
-    if (g_errdialog_backed.load()) { if (auto* ui = platform_ui()) return (uint64_t)(unsigned)ui->errorDialogStatus(); }
+    if (g_errdialog_backed.load()) {
+        if (auto* ui = platform_ui()) {
+            const int status = ui->errorDialogStatus();
+            if (status == 0 /*NONE*/ || status == 3 /*FINISHED*/) finish_error_dialog_background();
+            return (uint64_t)(unsigned)status;
+        }
+    }
     return (uint64_t)(unsigned)g_errdialog_status.load();
 }
 

@@ -136,10 +136,40 @@ int main() {
         set_platform_ui(nullptr);
         e_init(0,0,0,0,0,0); e_open(0,0,0,0,0,0);
         CHECK(e_status(0,0,0,0,0,0) == 3, "ErrorDialog headless: Open auto-dismisses to FINISHED");
+
+        // ErrorDialog is system-owned UI. Even an immediate headless dismissal must expose one
+        // independently observable background -> foreground pair through SystemServiceGetStatus.
+        HleFn sys_status = Hle::lookup(nid_hash("sceSystemServiceGetStatus"));
+        CHECK(sys_status, "SystemServiceGetStatus registered for ErrorDialog lifecycle");
+        if (sys_status) {
+            uint8_t service_status[12]{};
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 1,
+                  "headless ErrorDialog exposes a background sample");
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 0,
+                  "headless ErrorDialog exposes a foreground-return sample");
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 0,
+                  "headless ErrorDialog lifecycle is a bounded one-shot");
+        }
+
         set_platform_ui(&ui);
         e_init(0,0,0,0,0,0); e_open(0xBBBB,0,0,0,0,0);
         CHECK(ui.err_opens == 1 && ui.err_last_param == 0xBBBB, "ErrorDialog backend: Open forwards the param");
         CHECK(e_status(0,0,0,0,0,0) == 2, "ErrorDialog backend: status follows the frontend (RUNNING)");
+        if (sys_status) {
+            uint8_t service_status[12]{};
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 1,
+                  "backend ErrorDialog remains backgrounded while the frontend is RUNNING");
+            ui.err_status = 3;
+            CHECK(e_status(0,0,0,0,0,0) == 3,
+                  "ErrorDialog backend reports frontend completion");
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 0,
+                  "backend ErrorDialog exposes foreground return after completion");
+        }
         if (e_term) { e_term(0,0,0,0,0,0); CHECK(ui.err_closes == 1, "ErrorDialog backend: Term routes to errorDialogClose"); }
     }
 

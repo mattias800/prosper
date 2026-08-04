@@ -29,14 +29,13 @@ body originally called highest-value.
   widget; that widget's own completion path loads `/Game/Maps/L_Main`. The empty base pass is
   therefore correct for the content state that actually loaded, rather than a missing GPU draw list.
 
-**The GPU-side questions are answered. The remaining frontier is CPU/UI-side:** the signed-out
-account path opens and auto-finishes an ErrorDialog, but its account-completion poll is tied to a
-system foreground-return callback. A clean CPU-only discriminator proves that writer never runs,
-and Prosper currently reports no background transition that could dispatch it. The next controlled
-arm is a one-shot background→foreground lifecycle pulse around the system dialog; no service
-behaviour change is justified until that lever proves its own edge and advances the writer. Then
-distinguish EULA/splash `AddToViewport` from a UMG presentation failure. Do not return to base-pass
-or further GPU instrumentation without contradictory new evidence.
+**The GPU-side questions are answered. The account gate is now fixed:** the signed-out account path
+opens and finishes an ErrorDialog, and Prosper exposes the system-dialog background→foreground
+lifecycle that dispatches the game's account-completion poll. Two same-instrument CPU-only arms
+recorded both lifecycle samples before the writer fired; the default-behaviour arm carries the exact
+foreground-broadcast stack. The remaining frontier is downstream CPU/UI progression: prove the EULA
+stage and splash `AddToViewport`, then distinguish a content gate from UMG presentation failure. Do
+not return to base-pass or further GPU instrumentation without contradictory new evidence.
 
 ## Shipped front-end progression contract
 
@@ -46,7 +45,7 @@ inferring progression from service-call volume:
 | Blueprint predicate/action | Native implementation | Completion state |
 |---|---|---|
 | `IsAccountLoginRequired` | `0x88af00` | Always required. |
-| `IsAccountLoginChecked` | `0x88aef0` | Reads byte `+0x109`. The ErrorDialog poll at `0x88ad6b` writes the two-byte value `0x0100` at `+0x108` on every non-`RUNNING` result, making `+0x108 = 0` and **`+0x109 = 1`**. A clean CPU-only arm proves that poll is not dispatched after Prosper's headless dialog. |
+| `IsAccountLoginChecked` | `0x88aef0` | Reads byte `+0x109`. The ErrorDialog poll at `0x88ad6b` writes the two-byte value `0x0100` at `+0x108` on every non-`RUNNING` result, making `+0x108 = 0` and **`+0x109 = 1`**. Before the fix that poll was undispatched; the ErrorDialog lifecycle fix now reaches the writer after the observed foreground edge. |
 | `IsNoFreeSpaceCheckRequired` | `0x8896c0` | Always required. |
 | `CheckNoFreeSpace` | `0x8896d0` | Its synchronous completion path unconditionally writes byte `+0xb0 = 1` at `0x889722`, then invokes and clears the callback. `IsNoFreeSpaceChecked` (`0x87d070`) reads that byte. |
 | `IsEULACheckRequired` | `0x88ab80` | Always required. |
@@ -69,13 +68,21 @@ active. The constructor registers `0x88ad20` through wrapper `0x887110` on multi
 `0x867af10`; the platform status loop broadcasts that multicast when status byte 5
 (`isInBackgroundExecution`) transitions back to zero. Its other route is the NP-state callback, but
 the shipped handler returns immediately for Prosper's delivered `SIGNED_OUT` value. Prosper's
-`sceSystemServiceGetStatus` currently writes byte 5 as zero on every call, so an auto-finished system
-dialog cannot itself produce the required nonzero-to-zero edge. A same-binary, same-instrument pair
-made that static gap live: `PROSPER_BP=0x88ae00` hit `ShowAccountLogin` with immediate return
-`0x88ac99` in the account-state method, while `PROSPER_BP=0x88ad75` remained at zero for a bounded
-run that logged the ErrorDialog Open and more than 12 seconds of advancing frames. Both arms printed
-the progression-only no-compute witness and no Vulkan-device line. This is the current, bounded
-candidate—not yet a justified behaviour change.
+`sceSystemServiceGetStatus` previously wrote byte 5 as zero on every call, so an auto-finished system
+dialog could not produce the required nonzero-to-zero edge. A same-binary, same-instrument pair made
+that gap live: `PROSPER_BP=0x88ae00` hit `ShowAccountLogin` with immediate return `0x88ac99` in the
+account-state method, while `PROSPER_BP=0x88ad75` remained at zero after ErrorDialog Open and more
+than 12 seconds of advancing frames. The lifecycle discriminator then logged background 1 and 0
+before the writer hit; the production-default implementation repeated the exact ordering and stack.
+All arms printed the progression-only no-compute witness and no Vulkan-device line.
+
+The general fix models ErrorDialog as system-owned UI. A backend-owned dialog reports background
+while its frontend status is `RUNNING` and a foreground return when it finishes. The instantaneous
+headless path preserves the same two observable samples instead of collapsing them. It contains no
+title identity or guest address. The two writer arms prove account completion **2/2**, but not stable
+downstream progression: the discriminator arm continued for its 16-second bound, while the final
+default-behaviour arm hit an unrelated worker null fault after the writer and exited early. Treat
+post-account stability as mixed `1/2`; do not claim EULA, splash, title screen, or gameplay yet.
 
 ## Ruled out
 
@@ -97,6 +104,7 @@ re-derive these without contradictory new evidence.
 | The Sony online-subsystem ErrorDialog tick directly completes the game account gate | **Falsified by the exact delegate flow.** `ShowAccountLogin` passes an empty delegate to the identity method at `0x901de0`; that method stores it at identity offset `+0x60`. The generic tick at `0x903020` correctly terminates a `FINISHED` dialog and invokes slot `+0x58` only when that stored delegate is non-empty. It is empty on this path, so the Sony tick cannot write account byte `+0x109`. The separate account poll at `0x88ad20` owns that write and is reached from foreground return (or a signed-in NP-state notification), not from the generic dialog callback. | #1606 |
 | `L_GameloftSplash` directly calls `ShowAccountLogin`, so its Blueprint bytecode should expose the missing call | **Falsified by the retained package import table.** The level imports `CheckNoFreeSpace`, `IsAccountLoginChecked`, `IsAccountLoginRequired`, the EULA predicates/setter, `Begin`, `Create` and `AddToViewport`, but no `ShowAccountLogin` or account-init function. Account initialization is an automatic native stage (`0x87d100` → `0x88abe0`); the Blueprint only polls its checked predicate. | #1606 |
 | The account completion writer runs but rejects Prosper's dialog status | **Falsified, positive-controlled.** On the same executable, a clean software-breakpoint control at `ShowAccountLogin` (`0x88ae00`) fired once and its first recovered return was `0x88ac99`, directly inside the account-state method. A second clean arm at the writer (`0x88ad75`) printed the same no-compute witness, armed the same instrument, logged ErrorDialog Open/auto-`FINISHED`, and advanced for more than 12 seconds with zero hits. The status comparison is never reached; changing `FINISHED` cannot repair an undispatched poll. | #1606 |
+| A foreground-return pulse changes the lever but still does not dispatch the account writer | **Falsified twice, with exact event order.** The opt-in discriminator and the production-default build each logged ErrorDialog Open, background `1`, foreground `0`, then exactly one breakpoint hit at writer `0x88ad75`. The latter hit's stack includes platform transition site `0x191c324` and multicast `0x867af10`, proving the expected broadcaster owned the hit. The first arm ran for its 16-second bound; the second later faulted on a separate worker, after all mechanism evidence was already recorded. | #1606 |
 | PlayGo `GetLocus` is a sustained chunk-0 poll or progression gate | **Falsified; the earlier rate interpretation was an instrumentation mistake.** The retained trace's 1,000 calls carry chunk IDs **0, 1, 2, …, 999 exactly once**, with no reset. Guest code at `0x13f28a4` is a bounded startup cache-population loop: it calls `GetLocus` for each ID, stores only successful `LOCAL_FAST` (`3`) results, cleanly skips absent IDs, stops at `0x3e8`, and sets its initialized byte at `0x13f29e7`. Chunk 0 succeeds and the remaining nonexistent IDs fail as expected. This is neither periodic polling nor a wait for those IDs to become local; changing PlayGo behaviour is not justified. | #1606, #1641 |
 
 **Note on the Asterix figure.** 4.00 is the #1641 census number — *decoded* draws per frame, realized
@@ -184,6 +192,18 @@ the same thing, and do not treat either as superseding the other until that is c
   hit. Its outer distrobox timeout left the exact child alive; the mandatory post-run census caught
   and terminated it before the title-run gate was released. That wrapper behaviour is an instance
   of instrument trap 66, not title evidence.
+* The lifecycle fix used two additional clean, single-instrument CPU-only arms. Both had exact zero
+  pre/post process censuses, printed the progression-only no-compute banner, printed no Vulkan-device
+  line, and logged ErrorDialog Open → background `1` → foreground `0` → writer `0x88ad75`. The
+  opt-in discriminator reached its 16-second timeout. The production-default arm recorded the same
+  ordering and broadcaster stack, then a different worker faulted through null `rip` and the subject
+  exited `90`. Thus the lifecycle mechanism is reproduced `2/2`, while subsequent stability is
+  explicitly only `1/2` and no later content milestone is claimed.
+* Unit coverage exercises both ownership models: headless Open emits one bounded enter/return pair;
+  a backend-owned ErrorDialog remains backgrounded while its frontend reports `RUNNING` and returns
+  foreground after `FINISHED`. A defect-shaped mutation that collapsed only the headless edge made
+  exactly `headless ErrorDialog exposes a background sample` fail; restoration passed both
+  `platform_ui` and `service_getters`.
 
 ## Reproduction
 
