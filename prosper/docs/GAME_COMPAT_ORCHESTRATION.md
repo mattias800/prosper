@@ -1565,6 +1565,36 @@ session of depth.
 | babylon-r1 | Asterix & Obelix Babylon (PPSA30490, Unity 6) | sampled 2D-MSAA resolve executes, output still black | #1884 / #1599 |
 | arcrunner-r1 | ArcRunner (PPSA21406, UE4 4.27) | real GPU submissions, then the render thread faults | #1817 / #1226 |
 
+#### Wave 1 outcome — all five merged, one rung gained, four blockers relocated
+
+| Title | Result | Landed |
+|---|---|---|
+| **The Oregon Trail** | **rung 0 → 1.** Renders `WBP_System_Disclaimer_Popup` on a *default* launch (4,009,938 non-black px). Screenshot committed. Enabled by #1933's ErrorDialog lifecycle, established by a single-variable A/B. | #1950 |
+| Asterix Babylon | Blocker moved **GPU → CPU**: the guest deadlocks in its video splash because `sceAvPlayerJumpToTime` is unimplemented and the dispatcher's default `0` reads as a successful seek. Kills the whole `DMEM_WRITE_TRACE` writer-hunt premise. | #1953 |
+| ArcRunner | The `addr=(nil)` sibling fault is **prosper's own lazy-commit zero**, not a guest lifetime bug — roughly five sessions had been classifying a value prosper wrote. The fault was never the rung-1 blocker either. | #1948 |
+| R-Type Delta | The issue's **standing recommendation** ("faithful, slower I/O timing wins the race") falsified quantitatively — it points the wrong way. Display-rate pacing also dead, on a lever-verified A/B. | #1947 |
+| Sonic Origins | Five hypotheses dead. The guest is alive, unblocked, and builds **exactly one frame forever** (22 submits / 22 draws / 14 dispatches per flip, constant over 11,274 flips). | #1952 |
+
+**Four new shared-substrate issues, three of which help titles beyond their lane:** #1944
+(lazy-commit hands the guest a zero), #1945 (guest UE4 pooled-allocator free-list corruption),
+#1949 (AvPlayer seek is missing from `VideoBackend` entirely), #1951 (APR resolve leaves later
+entries uninitialized after the first miss).
+
+**The cross-title link worth acting on.** ArcRunner (`eboot+0x127e751`) and Oregon Trail
+(`eboot+0x14600df`) both fault on `mov rax,[rcx]` with `rcx = 0x30016000`, popping a pooled-allocator
+free-list head — in **different guest binaries**. Either one shared prosper defect or one shared UE4
+guest pattern; nobody has separated those yet, and the answer decides where the fix goes. **Oregon
+Trail is now the fastest repro in the library**: 3 of 4 *default* launches die within 6 s, exit 90,
+no route or diagnostics. Work #1226 there, not on an ArcRunner boot.
+
+**Two lessons about the apparatus, both now traps.** Trap 85: an asset-load trace read as proof the
+guest executed the code using the asset — UE4 pulls a level's referenced classes through the map
+import table before any Blueprint runs, so the pre-fix arm loaded the same assets at identical
+ordinals over a 12× longer run. Trap 86: a generic-named shell redirect into the shared `~/` scratch,
+read as writing a private file. Also, recorded in the Sonic notes and worth propagating: **`.pad`
+route positions are pad reads, not seconds** — a committed 404-read route ends at t≈6.6 s in a
+~61 reads/s arm, so runs that looked input-driven were input-free through their whole steady state.
+
 ### Wave 2 (queued) — every rung-1 title, target rung 2 (title screen)
 
 The Forgotten City (PPSA03026, #1890), Sonic Racing: CrossWorlds (PPSA08804, #1895), Sonic Frontiers
