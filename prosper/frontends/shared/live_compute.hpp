@@ -197,6 +197,10 @@ uint64_t live_compute_storage_transfer_seeds();
 // Monotonic count of compressed storage results admitted only after an exact successful writeback
 // published both ordinary base bytes and an all-uncompressed DCC metadata plane.
 uint64_t live_compute_dcc_post_writeback_promotions();
+// Monotonic witnesses for the compressed-producer allocation path. An exact unpinned entry can be
+// forcibly reseeded in place; all other cases retain the post-writeback replacement fallback.
+uint64_t live_compute_dcc_forced_seed_allocation_reuses();
+uint64_t live_compute_dcc_post_writeback_replacements();
 // Query the initialized live backend for the exact typed 3D storage+transfer image contract. Tests
 // use this to exercise native-volume execution only on devices that can create the Vulkan image.
 bool live_compute_native_storage_3d_supported(prosper::gpu::DataFormat format,
@@ -221,11 +225,12 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
 void live_compute_fail_next_storage_readback_for_test();
 
-// Deterministic controls for post-DCC cache-promotion regressions.  The first leaves the next
-// writable metadata plane unresolved, exercising the final all-0xff recheck.  The second models a
-// real replacement cache-capacity preflight after successful writeback; both must keep the
-// transient fallback owned by the caller and publish no cache/export authority.
+// Deterministic controls for post-DCC cache-promotion regressions. The first leaves the next
+// writable metadata plane unresolved, exercising the final all-0xff recheck. The second disables
+// one eligible allocation reuse so tests prove the replacement fallback actually runs. The third
+// models a real replacement cache-capacity preflight after successful writeback.
 void live_compute_leave_next_dcc_metadata_compressed_for_test();
+void live_compute_disable_next_dcc_allocation_reuse_for_test();
 void live_compute_limit_next_image_replacement_for_test();
 
 // Deterministically lower the next eligible cold storage admission crossover to zero. This lets a

@@ -1890,11 +1890,19 @@ int main() {
                 tile_surface(tiled_src.data(), img_src.data(), W, 1, dcc_tile, 0, 4);
                 const uint64_t pinned_promotions_before =
                     prosper::frontend::live_compute_dcc_post_writeback_promotions();
+                const uint64_t pinned_reuses_before =
+                    prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses();
+                const uint64_t pinned_replacements_before =
+                    prosper::frontend::live_compute_dcc_post_writeback_replacements();
                 CHECK(prosper::frontend::execute_live_compute_items({dcc_item}),
                       "compressed producer completes while its old exact cache entry is pinned");
                 CHECK(prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
-                          pinned_promotions_before,
-                      "pinned exact cache entry declines post-DCC replacement");
+                          pinned_promotions_before &&
+                          prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses() ==
+                              pinned_reuses_before &&
+                          prosper::frontend::live_compute_dcc_post_writeback_replacements() ==
+                              pinned_replacements_before,
+                      "pinned exact cache entry declines reuse and post-DCC replacement");
                 pinned_import = {};
                 auto [pinned_consumer_ok, pinned_linear,
                       pinned_seeds_before, pinned_seeds_after] = run_dcc_consumer();
@@ -1904,15 +1912,19 @@ int main() {
                       "declined pinned promotion publishes no new transfer authority");
             }
 
-            // Repeat with the exact cache entry unpinned and a changed producer result.  This is
-            // the Astro frame shape: an older consumer entry exists under the same key, and the
-            // compressed producer must replace it rather than letting emplace collide.
+            // Repeat with the exact cache entry unpinned and a changed producer result. This is the
+            // Astro frame shape: an older consumer entry exists under the same key, and compressed
+            // guest bytes must be uploaded into its allocation without inheriting source authority.
             std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x40);
             for (size_t index = 0; index < img_src.size(); ++index)
                 img_src[index] = static_cast<uint8_t>(index * 13u + 0x51u);
             tile_surface(tiled_src.data(), img_src.data(), W, 1, dcc_tile, 0, 4);
             const uint64_t replacement_promotions_before =
                 prosper::frontend::live_compute_dcc_post_writeback_promotions();
+            const uint64_t allocation_reuses_before =
+                prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses();
+            const uint64_t replacements_before =
+                prosper::frontend::live_compute_dcc_post_writeback_replacements();
             auto [replacement_ok, replacement_linear,
                   ordered_replacement_promotions_before,
                   ordered_replacement_promotions_after,
@@ -1922,13 +1934,17 @@ int main() {
                       replacement_promotions_before ==
                           ordered_replacement_promotions_before &&
                       ordered_replacement_promotions_after ==
-                          replacement_promotions_before + 1,
-                  "unpinned exact-key collision is replaced after successful DCC writeback");
+                          replacement_promotions_before + 1 &&
+                      prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses() ==
+                          allocation_reuses_before + 1 &&
+                      prosper::frontend::live_compute_dcc_post_writeback_replacements() ==
+                          replacements_before,
+                  "unpinned exact-key allocation is reused after a mandatory producer upload");
             CHECK(replacement_ok && replacement_linear == img_src,
-                  "replacement promotion preserves changed producer bytes exactly");
+                  "forced upload into a reused allocation observes changed producer bytes exactly");
             CHECK(!native_2d_compute_transfer_available ||
                       replacement_seeds_after > replacement_seeds_before,
-                  "replacement promotion restores producer-to-consumer image reuse");
+                  "reused-allocation promotion restores producer-to-consumer image reuse");
 
             ShaderResource mismatched_dcc_output = sampled_dcc_output;
             ++mismatched_dcc_output.width;
@@ -1936,6 +1952,32 @@ int main() {
             CHECK(!prosper::frontend::import_live_compute_storage_image(
                       mismatched_dcc_output, tiled_bytes, mismatched_import),
                   "post-DCC graphics reuse requires the exact promoted cache key");
+
+            // Mutate the mechanism, not the expected output: disable one eligible reuse while
+            // leaving every cache-promotion gate intact. The changed bytes must remain exact, and
+            // the independent counters must prove that the old replacement path actually ran.
+            std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x40);
+            for (size_t index = 0; index < img_src.size(); ++index)
+                img_src[index] = static_cast<uint8_t>(index * 17u + 0x35u);
+            tile_surface(tiled_src.data(), img_src.data(), W, 1, dcc_tile, 0, 4);
+            prosper::frontend::live_compute_disable_next_dcc_allocation_reuse_for_test();
+            const uint64_t mutated_reuses_before =
+                prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses();
+            const uint64_t mutated_replacements_before =
+                prosper::frontend::live_compute_dcc_post_writeback_replacements();
+            auto [mutated_ok, mutated_linear, mutated_promotions_before,
+                  mutated_promotions_after, mutated_seeds_before, mutated_seeds_after] =
+                run_dcc_ordered_handoff(nullptr);
+            CHECK(mutated_ok && mutated_linear == img_src &&
+                      mutated_promotions_after == mutated_promotions_before + 1 &&
+                      prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses() ==
+                          mutated_reuses_before &&
+                      prosper::frontend::live_compute_dcc_post_writeback_replacements() ==
+                          mutated_replacements_before + 1,
+                  "disabling allocation reuse restores exact post-writeback replacement");
+            CHECK(!native_2d_compute_transfer_available ||
+                      mutated_seeds_after > mutated_seeds_before,
+                  "replacement mutation preserves producer-to-consumer image reuse");
 
             // Force the real replacement cache-limit preflight below this allocation after exact
             // writeback and DCC publication. It must leave this dispatch transient, so the next
@@ -1945,12 +1987,21 @@ int main() {
             for (size_t index = 0; index < img_src.size(); ++index)
                 img_src[index] = static_cast<uint8_t>(index * 7u + 0x23u);
             tile_surface(tiled_src.data(), img_src.data(), W, 1, dcc_tile, 0, 4);
+            prosper::frontend::live_compute_disable_next_dcc_allocation_reuse_for_test();
             prosper::frontend::live_compute_limit_next_image_replacement_for_test();
             const uint64_t refused_promotions_before =
                 prosper::frontend::live_compute_dcc_post_writeback_promotions();
+            const uint64_t refused_reuses_before =
+                prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses();
+            const uint64_t refused_replacements_before =
+                prosper::frontend::live_compute_dcc_post_writeback_replacements();
             CHECK(prosper::frontend::execute_live_compute_items({dcc_item}) &&
                       prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
-                          refused_promotions_before,
+                          refused_promotions_before &&
+                      prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses() ==
+                          refused_reuses_before &&
+                      prosper::frontend::live_compute_dcc_post_writeback_replacements() ==
+                          refused_replacements_before,
                   "post-DCC capacity preflight preserves the transient fallback");
             auto [refused_ok, refused_linear,
                   refused_seeds_before, refused_seeds_after] = run_dcc_consumer();
@@ -1969,12 +2020,16 @@ int main() {
             prosper::frontend::live_compute_leave_next_dcc_metadata_compressed_for_test();
             const uint64_t unresolved_promotions_before =
                 prosper::frontend::live_compute_dcc_post_writeback_promotions();
+            const uint64_t unresolved_reuses_before =
+                prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses();
             CHECK(prosper::frontend::execute_live_compute_items({dcc_item}) &&
                       prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
                           unresolved_promotions_before &&
+                      prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses() ==
+                          unresolved_reuses_before + 1 &&
                       std::any_of(dcc_metadata.begin(), dcc_metadata.end(),
                                   [](uint8_t code) { return code != 0xff; }),
-                  "unresolved post-writeback DCC metadata blocks cache acquisition");
+                  "unresolved post-writeback DCC metadata invalidates the reused allocation");
             auto [unresolved_ok, unresolved_linear,
                   unresolved_seeds_before, unresolved_seeds_after] = run_dcc_consumer();
             CHECK(unresolved_ok && unresolved_linear == img_src,
