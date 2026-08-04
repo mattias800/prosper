@@ -89,6 +89,374 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+uint32_t opcode_count(const std::vector<uint32_t>& spv, uint32_t opcode) {
+    uint32_t count = 0;
+    if (spv.size() < 5) return count;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return 0;
+        count += op == opcode;
+        i += wc;
+    }
+    return count;
+}
+
+// Prove that a subgroup vote is persisted through the CFG dispatcher's bool register file and then
+// consumed as the condition of a later OpSelect.  This is the structural shape of a scalar mask
+// comparison followed by s_cselect: opcode presence alone would not prove that SCC survived the
+// dispatcher boundary or that the select read the newly-produced condition.
+bool wave_vote_reaches_later_select(const std::vector<uint32_t>& spv,
+                                    bool expect_inverted) {
+    constexpr uint32_t OpLoad = 61, OpStore = 62, OpLogicalNot = 168,
+                       OpSelect = 169, OpGroupNonUniformAny = 335;
+    struct Select { uint32_t result = 0, condition = 0, yes = 0, no = 0; };
+    std::unordered_set<uint32_t> votes, values, variables;
+    std::vector<std::array<uint32_t, 2>> logical_nots, stores, loads;
+    std::vector<Select> selects;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpGroupNonUniformAny && wc >= 4)
+            votes.insert(spv[i + 2]);
+        if (op == OpLogicalNot && wc == 4)
+            logical_nots.push_back({spv[i + 2], spv[i + 3]});
+        if (op == OpStore && wc == 3)
+            stores.push_back({spv[i + 1], spv[i + 2]});
+        if (op == OpLoad && wc == 4)
+            loads.push_back({spv[i + 2], spv[i + 3]});
+        if (op == OpSelect && wc == 6)
+            selects.push_back({spv[i + 2], spv[i + 3], spv[i + 4], spv[i + 5]});
+        i += wc;
+    }
+    if (expect_inverted) {
+        for (const auto& negate : logical_nots)
+            if (votes.contains(negate[1])) values.insert(negate[0]);
+    } else {
+        values = votes;
+    }
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& select : selects)
+            if ((values.contains(select.yes) || values.contains(select.no)) &&
+                values.insert(select.result).second)
+                changed = true;
+        for (const auto& store : stores)
+            if (values.contains(store[1]) && variables.insert(store[0]).second)
+                changed = true;
+        for (const auto& load : loads)
+            if (variables.contains(load[1]) && values.insert(load[0]).second)
+                changed = true;
+    }
+    return std::any_of(selects.begin(), selects.end(),
+        [&](const Select& select) { return values.contains(select.condition); });
+}
+
+// Prove the defect-shaped saved-mask lowering: two distinct static comparisons publish event tags
+// from alternate dispatcher cases, while both subgroup votes execute after the switch merge from
+// ungated persistent mask loads.  Each event gate must select its own EQ/LG polarity into one SCC
+// variable, whose later load controls s_cselect.  A vote left inside a lane-local case, or a vote
+// predicate gated by the publishing lane's PC, fails this dataflow/location check.
+bool saved_mask_pair_votes_use_uniform_event_phase(const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpConstant = 43, OpLoad = 61, OpStore = 62,
+                       OpLabel = 248, OpSelectionMerge = 247, OpSwitch = 251,
+                       OpIEqual = 170, OpLogicalNot = 168, OpLogicalAnd = 167,
+                       OpSelect = 169, OpGroupNonUniformAny = 335;
+    struct Select { uint32_t condition = 0, yes = 0, no = 0; size_t position = 0; };
+    struct Pair { uint32_t first = 0, second = 0; };
+    struct Vote { uint32_t result = 0, predicate = 0; size_t position = 0; };
+    std::unordered_map<uint32_t, uint32_t> constants, loads, logical_nots;
+    std::unordered_map<uint32_t, Pair> logical_ands, equals;
+    std::unordered_map<uint32_t, Select> selects;
+    std::vector<std::array<uint32_t, 2>> stores;
+    std::vector<Vote> votes;
+    uint32_t last_selection_merge = 0, switch_merge = 0;
+    size_t switch_position = 0, common_position = 0;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4)
+            constants[spv[i + 2]] = spv[i + 3];
+        else if (op == OpLoad && wc == 4)
+            loads[spv[i + 2]] = spv[i + 3];
+        else if (op == OpStore && wc == 3)
+            stores.push_back({spv[i + 1], spv[i + 2]});
+        else if (op == OpLogicalNot && wc == 4)
+            logical_nots[spv[i + 2]] = spv[i + 3];
+        else if (op == OpLogicalAnd && wc == 5)
+            logical_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpIEqual && wc == 5)
+            equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpSelect && wc == 6)
+            selects[spv[i + 2]] = {spv[i + 3], spv[i + 4], spv[i + 5], i};
+        else if (op == OpGroupNonUniformAny && wc == 5)
+            votes.push_back({spv[i + 2], spv[i + 4], i});
+        else if (op == OpSelectionMerge && wc >= 3)
+            last_selection_merge = spv[i + 1];
+        else if (op == OpSwitch && last_selection_merge) {
+            switch_merge = last_selection_merge;
+            switch_position = i;
+        } else if (op == OpLabel && wc == 2 && switch_merge &&
+                   spv[i + 1] == switch_merge && i > switch_position)
+            common_position = i;
+        i += wc;
+    }
+    if (votes.size() != 2 || !switch_position || !common_position) return false;
+
+    std::unordered_set<uint32_t> mask_pointers;
+    std::unordered_set<uint32_t> event_tags;
+    uint32_t event_pointer = 0, pending_pointer = 0, scc_pointer = 0;
+    bool saw_direct = false, saw_inverted = false;
+    for (const Vote& vote : votes) {
+        if (vote.position <= common_position) return false;
+        const auto mismatch = selects.find(vote.predicate);
+        if (mismatch == selects.end()) return false;
+        const auto first = loads.find(mismatch->second.condition);
+        const auto second = loads.find(mismatch->second.no);
+        const auto negated_second = logical_nots.find(mismatch->second.yes);
+        if (first == loads.end() || second == loads.end() ||
+            negated_second == logical_nots.end() ||
+            negated_second->second != mismatch->second.no ||
+            first->second == second->second)
+            return false;
+        mask_pointers.insert(first->second);
+        mask_pointers.insert(second->second);
+
+        const auto inverted = std::find_if(
+            logical_nots.begin(), logical_nots.end(),
+            [&](const auto& item) { return item.second == vote.result; });
+        const uint32_t direct_result = vote.result;
+        const uint32_t inverted_result = inverted == logical_nots.end() ? 0 : inverted->first;
+        bool selected_vote = false;
+        for (const auto& selected : selects) {
+            if (selected.second.position <= vote.position) continue;
+            const bool direct = selected.second.yes == direct_result;
+            const bool inverse = inverted_result && selected.second.yes == inverted_result;
+            if (!direct && !inverse) continue;
+            const auto gate = logical_ands.find(selected.second.condition);
+            if (gate == logical_ands.end()) continue;
+            uint32_t pending_load = 0, equality_id = 0;
+            if (loads.contains(gate->second.first) && equals.contains(gate->second.second)) {
+                pending_load = gate->second.first;
+                equality_id = gate->second.second;
+            } else if (loads.contains(gate->second.second) &&
+                       equals.contains(gate->second.first)) {
+                pending_load = gate->second.second;
+                equality_id = gate->second.first;
+            } else {
+                continue;
+            }
+            const Pair equal = equals.at(equality_id);
+            uint32_t event_load = 0, event_constant = 0;
+            if (loads.contains(equal.first) && constants.contains(equal.second)) {
+                event_load = equal.first;
+                event_constant = equal.second;
+            } else if (loads.contains(equal.second) && constants.contains(equal.first)) {
+                event_load = equal.second;
+                event_constant = equal.first;
+            } else {
+                continue;
+            }
+            const uint32_t this_event_pointer = loads.at(event_load);
+            const uint32_t this_pending_pointer = loads.at(pending_load);
+            if ((event_pointer && event_pointer != this_event_pointer) ||
+                (pending_pointer && pending_pointer != this_pending_pointer))
+                return false;
+            event_pointer = this_event_pointer;
+            pending_pointer = this_pending_pointer;
+            event_tags.insert(constants.at(event_constant));
+
+            const auto stored = std::find_if(
+                stores.begin(), stores.end(),
+                [&](const auto& store) { return store[1] == selected.first; });
+            if (stored == stores.end()) continue;
+            if (scc_pointer && scc_pointer != (*stored)[0]) return false;
+            scc_pointer = (*stored)[0];
+            saw_direct |= direct;
+            saw_inverted |= inverse;
+            selected_vote = true;
+            break;
+        }
+        if (!selected_vote) return false;
+    }
+    if (mask_pointers.size() != 4 || event_tags.size() != 2 ||
+        !event_tags.contains(1) || !event_tags.contains(2) ||
+        !event_pointer || !pending_pointer || event_pointer == pending_pointer ||
+        !scc_pointer || !saw_direct || !saw_inverted)
+        return false;
+    std::unordered_set<uint32_t> published_event_tags;
+    for (const auto& store : stores) {
+        if (store[0] != event_pointer) continue;
+        const auto value = constants.find(store[1]);
+        if (value != constants.end()) published_event_tags.insert(value->second);
+    }
+    if (!published_event_tags.contains(0) || !published_event_tags.contains(1) ||
+        !published_event_tags.contains(2))
+        return false;
+
+    for (const auto& load : loads) {
+        if (load.second != scc_pointer) continue;
+        const auto consumed = std::find_if(
+            selects.begin(), selects.end(),
+            [&](const auto& selected) {
+                return selected.second.condition == load.first;
+            });
+        if (consumed != selects.end()) return true;
+    }
+    return false;
+}
+
+// Prove the complete common-phase lowering for House's in-place DPP minimum reduction. The four
+// dispatcher cases must publish shifts 1/2/4/8 into one mailbox; one uniform subgroup phase must use
+// that dynamic amount for both the row bound and lane subtraction, gate source participation by
+// two persisted bools (pending + EXEC), and shuffle a static event tag beside value/activity. The
+// source event must equal the destination event on the write path before UMin reaches a Function
+// VGPR. Opcode presence alone would miss direction and divergent-PC cross-site contamination.
+bool dpp_min_row_shr_updates_dispatch_vgpr(const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpConstant = 43, OpExtInst = 12, OpLoad = 61, OpStore = 62,
+                       OpISub = 130, OpLogicalAnd = 167, OpSelect = 169,
+                       OpIEqual = 170, OpUGreaterThanEqual = 174,
+                       OpGroupNonUniformShuffle = 345,
+                       GlslUMin = 38;
+    struct Select { uint32_t condition = 0, yes = 0, no = 0; };
+    struct Shuffle { uint32_t result = 0, value = 0, lane = 0; };
+    std::unordered_map<uint32_t, uint32_t> constants, load_pointer;
+    std::unordered_map<uint32_t, std::array<uint32_t, 2>> logical_ands;
+    std::unordered_map<uint32_t, std::array<uint32_t, 2>> equals;
+    std::unordered_map<uint32_t, Select> selects;
+    std::vector<std::array<uint32_t, 2>> stores;
+    std::vector<Shuffle> shuffles;
+    std::unordered_set<uint32_t> shuffle_derived, umin_results;
+    std::unordered_set<uint32_t> amount_bound_uses, amount_subtract_uses;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4)
+            constants[spv[i + 2]] = spv[i + 3];
+        else if (op == OpLoad && wc == 4)
+            load_pointer[spv[i + 2]] = spv[i + 3];
+        else if (op == OpStore && wc == 3)
+            stores.push_back({spv[i + 1], spv[i + 2]});
+        else if (op == OpLogicalAnd && wc == 5)
+            logical_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpIEqual && wc == 5)
+            equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpSelect && wc == 6) {
+            selects[spv[i + 2]] = {spv[i + 3], spv[i + 4], spv[i + 5]};
+            if (shuffle_derived.contains(spv[i + 4]) ||
+                shuffle_derived.contains(spv[i + 5]))
+                shuffle_derived.insert(spv[i + 2]);
+        } else if (op == OpGroupNonUniformShuffle && wc == 6) {
+            shuffle_derived.insert(spv[i + 2]);
+            shuffles.push_back({spv[i + 2], spv[i + 4], spv[i + 5]});
+        } else if (op == OpExtInst && wc == 7 && spv[i + 4] == GlslUMin &&
+                   (shuffle_derived.contains(spv[i + 5]) ||
+                    shuffle_derived.contains(spv[i + 6]))) {
+            umin_results.insert(spv[i + 2]);
+        } else if (op == OpUGreaterThanEqual && wc == 5) {
+            amount_bound_uses.insert(spv[i + 4]);
+        } else if (op == OpISub && wc == 5) {
+            amount_subtract_uses.insert(spv[i + 4]);
+        }
+        i += wc;
+    }
+    if (opcode_count(spv, OpGroupNonUniformShuffle) != 3 || umin_results.empty())
+        return false;
+
+    std::unordered_map<uint32_t, std::unordered_set<uint32_t>> stored_constants;
+    for (const auto& store : stores) {
+        const auto value = constants.find(store[1]);
+        if (value != constants.end()) stored_constants[store[0]].insert(value->second);
+    }
+    bool exact_amount = false;
+    for (const auto& load : load_pointer) {
+        const auto values = stored_constants.find(load.second);
+        if (values != stored_constants.end() && values->second.contains(1) &&
+            values->second.contains(2) && values->second.contains(4) &&
+            values->second.contains(8) &&
+            amount_bound_uses.contains(load.first) &&
+            amount_subtract_uses.contains(load.first)) {
+            exact_amount = true;
+            break;
+        }
+    }
+
+    bool pending_and_exec_gate = false;
+    for (const auto& shuffle : shuffles) {
+        const auto select = selects.find(shuffle.value);
+        if (select == selects.end()) continue;
+        const auto one = constants.find(select->second.yes);
+        const auto zero = constants.find(select->second.no);
+        const auto both = logical_ands.find(select->second.condition);
+        if (one == constants.end() || one->second != 1 ||
+            zero == constants.end() || zero->second != 0 ||
+            both == logical_ands.end())
+            continue;
+        const auto first = load_pointer.find(both->second[0]);
+        const auto second = load_pointer.find(both->second[1]);
+        if (first != load_pointer.end() && second != load_pointer.end() &&
+            first->second != second->second) {
+            pending_and_exec_gate = true;
+            break;
+        }
+    }
+
+    // The event mailbox contains one distinct nonzero tag per static DPP site. Its load is shuffled
+    // with the exact same source-lane id as value/activity, then compared against the destination
+    // lane's unshuffled tag. Track that equality through every LogicalAnd into the final VGPR write.
+    uint32_t event_match = 0;
+    std::unordered_set<uint32_t> shuffle_lanes;
+    for (const auto& shuffle : shuffles) shuffle_lanes.insert(shuffle.lane);
+    for (const auto& shuffle : shuffles) {
+        const auto event_load = load_pointer.find(shuffle.value);
+        if (event_load == load_pointer.end()) continue;
+        const auto tags = stored_constants.find(event_load->second);
+        if (tags == stored_constants.end() || !tags->second.contains(0) ||
+            !tags->second.contains(1) || !tags->second.contains(2) ||
+            !tags->second.contains(3) || !tags->second.contains(4))
+            continue;
+        for (const auto& equal : equals) {
+            const bool exact_pair =
+                (equal.second[0] == shuffle.result && equal.second[1] == shuffle.value) ||
+                (equal.second[1] == shuffle.result && equal.second[0] == shuffle.value);
+            if (exact_pair) {
+                event_match = equal.first;
+                break;
+            }
+        }
+        if (event_match) break;
+    }
+    std::unordered_set<uint32_t> event_guarded;
+    if (event_match) event_guarded.insert(event_match);
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& value : logical_ands) {
+            if ((event_guarded.contains(value.second[0]) ||
+                 event_guarded.contains(value.second[1])) &&
+                event_guarded.insert(value.first).second)
+                changed = true;
+        }
+    }
+
+    bool min_reaches_store = false;
+    for (const auto& select : selects) {
+        if (!umin_results.contains(select.second.yes) ||
+            !event_guarded.contains(select.second.condition))
+            continue;
+        if (std::any_of(stores.begin(), stores.end(), [&](const auto& store) {
+                return store[1] == select.first;
+            })) {
+            min_reaches_store = true;
+            break;
+        }
+    }
+    return exact_amount && pending_and_exec_gate && event_match &&
+        shuffle_lanes.size() == 1 && min_reaches_store;
+}
+
 // Trace IMAGE_GET_LOD all the way from two known VGPR bit patterns to the fragment output. This is
 // deliberately a dataflow check rather than an opcode-presence check: it proves coordinate
 // provenance, AMD/SPIR-V x/y component order, compact dmask-to-VDATA placement, and the EXEC select
@@ -2235,6 +2603,271 @@ int main() {
         return 1;
     }
     printf("  [ok]   complex fragment CFG lowers wave-mask comparisons to exact wave64 votes\n");
+
+    // House of the Dead 2's large scene fragments reach this exact mask relationship inside the
+    // graphics CFG dispatcher:
+    //   s[44:45] = EXEC & s[30:31]
+    //   s[46:47] = VCC  & s[30:31]
+    //   SCC = (s[44:45] ==/!= s[46:47]); s[48:49] = SCC ? EXEC : 0
+    // Both operands are complete saved masks, so the scalar comparison is one exact whole-wave
+    // ANY(mask0 xor mask1) vote. Keep the later s_cselect and EXEC copy: they prove the vote's SCC
+    // survives a dispatcher case boundary and is consumed, rather than merely appearing in SPIR-V.
+    const uint32_t fragment_saved_mask_pair_prelude[] = {
+        0xbe9e047eu,                         // s_mov_b64 s[30:31],exec
+        0x87ac1e7eu,                         // s_and_b64 s[44:45],exec,s[30:31]
+        0x7c020300u,                         // v_cmp_lt_f32 vcc,v0,v1
+        0x87ae1e6au,                         // s_and_b64 s[46:47],vcc,s[30:31]
+        0xbf122e2cu,                         // exact live s_cmp_eq_u64 s[44:45],s[46:47]
+        0xbf800000u,                         // SCC-preserving scheduled nop
+        0x85b0807eu,                         // s_cselect_b64 s[48:49],exec,0
+        0xbefe0430u,                         // s_mov_b64 exec,s[48:49]
+    };
+    // Crossing scalar branch regions force the same arbitrary graphics CFG dispatcher without
+    // introducing any additional subgroup vote. That makes the exact one-vote EQ/LG polarity below
+    // a self-checking dataflow witness rather than an opcode census hidden behind red siblings.
+    const uint32_t fragment_scalar_cfg_dispatch[] = {
+        0x7e040280u,                         // pc0:  v_mov_b32 v2,0
+        0x7e060280u,                         // pc1:  v_mov_b32 v3,0
+        0x7e080280u,                         // pc2:  v_mov_b32 v4,0
+        0x7e0a0280u,                         // pc3:  v_mov_b32 v5,0
+        0xbf068080u,                         // pc4:  s_cmp_eq_u32 0,0
+        0xbf840003u,                         // pc5:  s_cbranch_scc0 -> pc9
+        0xbf068080u,                         // pc6:  s_cmp_eq_u32 0,0
+        0xbf840002u,                         // pc7:  s_cbranch_scc0 -> pc10 (crossing region)
+        0x7e040281u,                         // pc8:  v_mov_b32 v2,1
+        0x7e060281u,                         // pc9:  v_mov_b32 v3,1
+        0xbf068080u,                         // pc10: s_cmp_eq_u32 0,0
+        0xbf840003u,                         // pc11: s_cbranch_scc0 -> alternate export at pc15
+        0xf800180fu, 0x05040302u,            // pc12: exp mrt0 v2,v3,v4,v5 done vm
+        0xbf820003u,                         // pc14: s_branch -> verified tail exit at pc18
+        0xf800180fu, 0x05040302u,            // pc15: alternate exp mrt0 v2,v3,v4,v5 done vm
+        0xbf810000u,                         // pc17: s_endpgm
+        0xbf810000u,                         // pc18: branch-target s_endpgm
+    };
+    auto saved_mask_pair_shader = [&]() {
+        std::vector<uint32_t> shader(
+            std::begin(fragment_saved_mask_pair_prelude),
+            std::end(fragment_saved_mask_pair_prelude));
+        shader.insert(shader.end(), std::begin(fragment_scalar_cfg_dispatch),
+                      std::end(fragment_scalar_cfg_dispatch));
+        return shader;
+    };
+    auto mask_pair_module_is_exact = [&](const std::vector<uint32_t>& spirv,
+                                         uint32_t wave_size, bool inverted) {
+        return !spirv.empty() && has_opcode(spirv, 251) &&
+            opcode_count(spirv, 335) == 1 &&
+            fragment_spirv_required_subgroup_size(spirv) == wave_size &&
+            wave_vote_reaches_later_select(spirv, inverted) &&
+            type_result_ids_are_nonzero(spirv, nullptr) &&
+            phi_ids_are_nonzero(spirv);
+    };
+    std::vector<uint32_t> fragment_saved_mask_pair_eq = saved_mask_pair_shader();
+    const auto fragment_saved_mask_pair_eq_spv = recompile_fragment(
+        fragment_saved_mask_pair_eq.data(), fragment_saved_mask_pair_eq.size());
+    if (!mask_pair_module_is_exact(fragment_saved_mask_pair_eq_spv, 64,
+                                   /*inverted EQ vote*/true)) {
+        printf("  [FAIL] House saved-mask equality did not feed CFG-persisted SCC in Wave64\n");
+        return 1;
+    }
+    std::vector<uint32_t> fragment_saved_mask_pair_lg = fragment_saved_mask_pair_eq;
+    fragment_saved_mask_pair_lg[4] = 0xbf132e2cu; // s_cmp_lg_u64 s[44:45],s[46:47]
+    const auto fragment_saved_mask_pair_lg_spv = recompile_fragment(
+        fragment_saved_mask_pair_lg.data(), fragment_saved_mask_pair_lg.size());
+    if (!mask_pair_module_is_exact(fragment_saved_mask_pair_lg_spv, 64,
+                                   /*direct LG vote*/false)) {
+        printf("  [FAIL] saved-mask inequality did not feed CFG-persisted SCC in Wave64\n");
+        return 1;
+    }
+    const auto fragment_wave32_saved_mask_pair_eq_spv =
+        recompile_fragment_wave32_for_test(
+            fragment_saved_mask_pair_eq.data(), fragment_saved_mask_pair_eq.size());
+    const auto fragment_wave32_saved_mask_pair_lg_spv =
+        recompile_fragment_wave32_for_test(
+            fragment_saved_mask_pair_lg.data(), fragment_saved_mask_pair_lg.size());
+    if (!mask_pair_module_is_exact(fragment_wave32_saved_mask_pair_eq_spv, 32, true) ||
+        !mask_pair_module_is_exact(fragment_wave32_saved_mask_pair_lg_spv, 32, false)) {
+        printf("  [FAIL] saved-mask EQ/LG lost the complete-pair contract in Wave32\n");
+        return 1;
+    }
+    printf("  [ok]   saved-mask EQ/LG votes persist into s_cselect in Wave32 and Wave64 CFGs\n");
+
+    // Two alternate saved-pair comparison sites model adjacent fragment lanes parked at distinct
+    // dispatcher PCs.  Event 1 is EQ over s[44:45]/s[46:47], while event 2 is LG over the disjoint
+    // s[52:53]/s[54:55] pair.  A mismatch bit may live on a lane currently taking the other case,
+    // so both complete-pair votes must be unconditional after the switch merge; only the SCC write
+    // is selected by the publishing lane's nonzero event tag.
+    std::vector<uint32_t> saved_mask_pair_divergent_sites = {
+        0xbe9e047eu,                         // pc0:  s_mov_b64 s[30:31],exec
+        0x87ac1e7eu,                         // pc1:  s_and_b64 s[44:45],exec,s[30:31]
+        0x7c020300u,                         // pc2:  v_cmp_lt_f32 vcc,v0,v1
+        0x87ae1e6au,                         // pc3:  s_and_b64 s[46:47],vcc,s[30:31]
+        0x87b41e7eu,                         // pc4:  s_and_b64 s[52:53],exec,s[30:31]
+        0x87b61e6au,                         // pc5:  s_and_b64 s[54:55],vcc,s[30:31]
+        0xbf060100u,                         // pc6:  s_cmp_eq_u32 s0,s1
+        0xbf840002u,                         // pc7:  alternate event -> pc10
+        0xbf122e2cu,                         // pc8:  event 1: EQ s[44:45],s[46:47]
+        0xbf820001u,                         // pc9:  join -> pc11
+        0xbf133634u,                         // pc10: event 2: LG s[52:53],s[54:55]
+        0xbf800000u,                         // pc11: SCC-preserving join
+        0x85b0807eu,                         // pc12: s_cselect_b64 s[48:49],exec,0
+        0xbefe0430u,                         // pc13: s_mov_b64 exec,s[48:49]
+    };
+    saved_mask_pair_divergent_sites.insert(
+        saved_mask_pair_divergent_sites.end(), std::begin(fragment_scalar_cfg_dispatch),
+        std::end(fragment_scalar_cfg_dispatch));
+    const auto saved_mask_pair_divergent_wave64_spv = recompile_fragment(
+        saved_mask_pair_divergent_sites.data(), saved_mask_pair_divergent_sites.size());
+    const auto saved_mask_pair_divergent_wave32_spv = recompile_fragment_wave32_for_test(
+        saved_mask_pair_divergent_sites.data(), saved_mask_pair_divergent_sites.size());
+    if (!saved_mask_pair_votes_use_uniform_event_phase(
+            saved_mask_pair_divergent_wave64_spv) ||
+        !saved_mask_pair_votes_use_uniform_event_phase(
+            saved_mask_pair_divergent_wave32_spv)) {
+        printf("  [FAIL] divergent-PC saved-mask votes escaped uniform event isolation\n");
+        return 1;
+    }
+    printf("  [ok]   divergent-PC saved-mask bits vote in uniform Wave32/64 event phases\n");
+
+    // Every physical/dataflow obligation is independently load-bearing. A write to either half of
+    // a saved pair ends that lifetime; a numeric replacement is not reinterpreted as a mask; and a
+    // producer skipped on one reachable predecessor cannot establish a mask at the join.
+    std::vector<uint32_t> saved_mask_high_overwrite = fragment_saved_mask_pair_eq;
+    saved_mask_high_overwrite.insert(saved_mask_high_overwrite.begin() + 4, 0xbead0380u);
+    if (!recompile_fragment(saved_mask_high_overwrite.data(),
+                            saved_mask_high_overwrite.size()).empty()) {
+        printf("  [FAIL] high-half scalar overwrite retained a stale saved-mask pair\n");
+        return 1;
+    }
+    std::vector<uint32_t> saved_mask_numeric_replacement = fragment_saved_mask_pair_eq;
+    saved_mask_numeric_replacement.insert(
+        saved_mask_numeric_replacement.begin() + 4,
+        {0xbeae0381u, 0xbeaf0380u});          // numeric s[46:47] = 1
+    if (!recompile_fragment(saved_mask_numeric_replacement.data(),
+                            saved_mask_numeric_replacement.size()).empty()) {
+        printf("  [FAIL] numeric SGPR pair was reinterpreted as a saved wave mask\n");
+        return 1;
+    }
+    std::vector<uint32_t> saved_mask_path_dependent = {
+        0xbe9e047eu,                         // s_mov_b64 s[30:31],exec
+        0x87ac1e7eu,                         // s_and_b64 s[44:45],exec,s[30:31]
+        0xbf060100u,                         // pc2: s_cmp_eq_u32 s0,s1
+        0xbf840001u,                         // pc3: edge skips s46 -> compare at pc5
+        0x87ae1e6au,                         // pc4: s_and_b64 s[46:47],vcc,s[30:31]
+        0xbf122e2cu,                         // pc5: joined s[46:47] lifetime is path-dependent
+        0xbf800000u,                         // pc6: SCC-preserving nop
+        0x85b0807eu,                         // pc7: consumes comparison SCC
+        0xbefe0430u,
+    };
+    saved_mask_path_dependent.insert(
+        saved_mask_path_dependent.end(), std::begin(fragment_scalar_cfg_dispatch),
+        std::end(fragment_scalar_cfg_dispatch));
+    const auto saved_mask_path_dependent_spv = recompile_fragment(
+        saved_mask_path_dependent.data(), saved_mask_path_dependent.size());
+    if (wave_vote_reaches_later_select(saved_mask_path_dependent_spv,
+                                       /*inverted EQ vote*/true)) {
+        printf("  [FAIL] path-dependent saved-mask vote reached a later select\n");
+        return 1;
+    }
+    printf("  [ok]   saved-mask pair compare rejects half-overwrite/numeric mutations and "
+           "does not vote across joins\n");
+
+    // The exact House shader next performs four in-place unsigned minima across DPP row-right
+    // neighbors. Keep them inside the same crossing graphics CFG fixture: the dispatcher must
+    // publish each lane's source, shift, and event, execute three subgroup shuffles in its uniform
+    // common phase (value + source-activity + event), persist the UMin, and do so for both sizes.
+    auto saved_mask_pair_dpp_shader = [&]() {
+        std::vector<uint32_t> shader(
+            std::begin(fragment_saved_mask_pair_prelude),
+            std::end(fragment_saved_mask_pair_prelude));
+        shader.insert(shader.end(), {
+            0x7e060287u,                         // v_mov_b32 v3,7
+            0x260606fau, 0xff011103u,            // v_min_u32_dpp v3,v3,v3 row_shr:1
+            0x260606fau, 0xff011203u,            // row_shr:2
+            0x260606fau, 0xff011403u,            // row_shr:4
+            0x260606fau, 0xff011803u,            // row_shr:8
+        });
+        shader.insert(shader.end(), std::begin(fragment_scalar_cfg_dispatch),
+                      std::end(fragment_scalar_cfg_dispatch));
+        return shader;
+    };
+    auto dpp_min_module_is_exact = [&](const std::vector<uint32_t>& spirv,
+                                       uint32_t wave_size) {
+        return !spirv.empty() && has_opcode(spirv, 251) &&
+            dpp_min_row_shr_updates_dispatch_vgpr(spirv) &&
+            fragment_spirv_required_subgroup_size(spirv) == wave_size &&
+            (fragment_spirv_required_subgroup_features(spirv) &
+             kFragmentSubgroupShuffle) &&
+            type_result_ids_are_nonzero(spirv, nullptr) &&
+            phi_ids_are_nonzero(spirv);
+    };
+
+    // Four alternate static DPP sites make the cross-PC hazard explicit.  A source lane parked at
+    // row_shr:2/4/8 must never satisfy a destination executing row_shr:1 (and vice versa), even when
+    // both publish active data in the same common phase.  Value, activity, and event identity must
+    // use one source-lane shuffle; the event equality is load-bearing on the VGPR write path.
+    std::vector<uint32_t> fragment_dpp_min_divergent_sites(
+        std::begin(fragment_saved_mask_pair_prelude),
+        std::end(fragment_saved_mask_pair_prelude));
+    fragment_dpp_min_divergent_sites.insert(
+        fragment_dpp_min_divergent_sites.end(), {
+            0x7e060287u,                         // pc8:  v_mov_b32 v3,7
+            0xbf060100u,                         // pc9:  s_cmp_eq_u32 s0,s1
+            0xbf840003u,                         // pc10: alternate event -> pc14
+            0x260606fau, 0xff011103u,            // pc11: event 1 row_shr:1
+            0xbf820002u,                         // pc13: join -> pc16
+            0x260606fau, 0xff011203u,            // pc14: event 2 row_shr:2
+            0xbf800000u,                         // pc16: first join
+            0xbf060100u,                         // pc17: s_cmp_eq_u32 s0,s1
+            0xbf840003u,                         // pc18: alternate event -> pc22
+            0x260606fau, 0xff011403u,            // pc19: event 3 row_shr:4
+            0xbf820002u,                         // pc21: join -> pc24
+            0x260606fau, 0xff011803u,            // pc22: event 4 row_shr:8
+            0xbf800000u,                         // pc24: second join
+        });
+    fragment_dpp_min_divergent_sites.insert(
+        fragment_dpp_min_divergent_sites.end(),
+        std::begin(fragment_scalar_cfg_dispatch), std::end(fragment_scalar_cfg_dispatch));
+    const auto fragment_dpp_min_divergent_wave64_spv = recompile_fragment(
+        fragment_dpp_min_divergent_sites.data(), fragment_dpp_min_divergent_sites.size());
+    const auto fragment_dpp_min_divergent_wave32_spv = recompile_fragment_wave32_for_test(
+        fragment_dpp_min_divergent_sites.data(), fragment_dpp_min_divergent_sites.size());
+    if (!dpp_min_module_is_exact(fragment_dpp_min_divergent_wave64_spv, 64) ||
+        !dpp_min_module_is_exact(fragment_dpp_min_divergent_wave32_spv, 32)) {
+        printf("  [FAIL] divergent-PC DPP sources escaped static-event isolation\n");
+        return 1;
+    }
+    printf("  [ok]   divergent-PC DPP sources require matching Wave32/64 static events\n");
+
+    std::vector<uint32_t> fragment_dpp_min_row = saved_mask_pair_dpp_shader();
+    const auto fragment_dpp_min_row_wave64_spv = recompile_fragment(
+        fragment_dpp_min_row.data(), fragment_dpp_min_row.size());
+    const auto fragment_dpp_min_row_wave32_spv = recompile_fragment_wave32_for_test(
+        fragment_dpp_min_row.data(), fragment_dpp_min_row.size());
+    if (!dpp_min_module_is_exact(fragment_dpp_min_row_wave64_spv, 64) ||
+        !dpp_min_module_is_exact(fragment_dpp_min_row_wave32_spv, 32)) {
+        printf("  [FAIL] House DPP minimum did not persist through the Wave32/64 CFG common phase\n");
+        return 1;
+    }
+
+    std::vector<uint32_t> dpp_min_wrong_opcode = fragment_dpp_min_row;
+    dpp_min_wrong_opcode[9] = 0x280606fau; // v_max_u32 is outside the exact contract
+    std::vector<uint32_t> dpp_min_distinct_source = fragment_dpp_min_row;
+    dpp_min_distinct_source[10] = 0xff011104u; // src0=v4, while VDST/SRC1 remain v3
+    std::vector<uint32_t> dpp_min_wrong_amount = fragment_dpp_min_row;
+    dpp_min_wrong_amount[10] = 0xff011203u; // duplicates :2; loses exact :1/:2/:4/:8 chain
+    const auto wrong_opcode_spv = recompile_fragment(
+        dpp_min_wrong_opcode.data(), dpp_min_wrong_opcode.size());
+    const auto distinct_source_spv = recompile_fragment(
+        dpp_min_distinct_source.data(), dpp_min_distinct_source.size());
+    const auto wrong_amount_spv = recompile_fragment(
+        dpp_min_wrong_amount.data(), dpp_min_wrong_amount.size());
+    if (dpp_min_row_shr_updates_dispatch_vgpr(wrong_opcode_spv) ||
+        dpp_min_row_shr_updates_dispatch_vgpr(distinct_source_spv) ||
+        dpp_min_row_shr_updates_dispatch_vgpr(wrong_amount_spv)) {
+        printf("  [FAIL] DPP minimum admitted an opcode/source/amount mutation\n");
+        return 1;
+    }
+    printf("  [ok]   House DPP minimum preserves row direction, CFG participation, and VGPR dataflow\n");
 
     // Astro Bot's world-map material PS reaches the same graphics CFG dispatcher with an
     // s_orn2_saveexec_b64 whose destination is VCC. Keep a saved EXEC source live across dispatcher
