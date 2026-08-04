@@ -36,12 +36,19 @@ compute stages without retaining stored SPIR-V.
 
 ## Current frontier
 
-The complete replay remains visually corrupted. The first large scene families now advance past
-`IMAGE_GET_LOD` and stop at `s_cmp_eq_u64` comparing two saved wave-mask SGPR pairs. One exact live
-sequence creates `s[44:45]` and `s[46:47]` with `s_and_b64` against EXEC, then compares the pairs.
-The fragment CFG dispatcher handles mask-versus-zero comparisons, while this two-mask form remains
-fail-visible. That is the next distinct recompiler frontier; it is not part of the `IMAGE_GET_LOD`
-change.
+The saved-mask comparison and adjacent DPP reduction frontier is now implemented. The fragment CFG
+dispatcher proves both ordinary B64 operands are live masks on every incoming path, reduces their
+EQ/LG result over the exact guest wave and persists SCC into the later `s_cselect_b64`. It also
+executes the exact in-place `v_min_u32_dpp row_shr:{1,2,4,8}` family in a uniform common phase, with
+per-lane dispatcher-PC and EXEC participation preserved. The 83-resource scene shader that
+previously stopped at pc 1,276 now recompiles completely to 288,728 SPIR-V dwords; a second copy of
+both instruction families later in the same shader is covered as well.
+
+The complete deterministic replay remains byte-for-byte visually corrupted, and every retained raw
+VS, FS and compute stage substitutes successfully. There is therefore no next unsupported retained
+shader instruction to quote from this capture. The current frontier returns to draw/resource/state
+correctness: localize why the now-complete scene shaders still generate the corrupt red-triangle
+output, using the operation-1,937 replay as the deterministic discriminator.
 
 ## Ruled out
 
@@ -50,6 +57,12 @@ change.
   replay changed the BMP SHA-256 from `9b579dee...` to `cb33895b...`, but the red-pixel fraction was
   effectively unchanged (`0.486912` to `0.486932`) and human inspection showed the same corrupt
   scene. The hypothesis that implementing the first rejection alone restores this frame is false.
+- **The saved-mask EQ/LG comparisons and adjacent DPP unsigned-minimum row reductions being
+  unsupported are not, by themselves, the cause of the corrupt frame.** After both exact live
+  families recompiled completely, the operation-1,937 target kept backend hash
+  `dce8e600954195f4`; its BMP was byte-for-byte identical to the prior post-`IMAGE_GET_LOD` image
+  (SHA-256 `cb33895b...`, red-pixel fraction `0.486932`).
+  [#1907](https://github.com/mattias800/prosper/issues/1907)
 - **Draw 1,846 is not explained by non-finite or wholly clipped geometry.** Its 9,600 transformed
   vertices are finite; 4,872 are on-screen and 4,728 clipped. Of 3,200 triangles, 3,057 are
   non-degenerate and the screen-spanning triangles are present in the transformed output.
@@ -67,6 +80,7 @@ Focused CPU suites pass in the `ps5ys` distrobox:
 recompile_coverage
 rdna2_decode_walk
 rdna2_spirv_struct
+spv_validate
 shader_resource_contract
 ```
 
@@ -83,7 +97,22 @@ compaction, removed EXEC predication, admitted the operation in compute, disable
 address/cache/result/reserved control family, and erased reserved-bit decode. Each mutation broke
 its named check and the clean implementation passed again after restoration.
 
-The single authorized Vulkan replay completed in 2.689 seconds with return code zero and empty
-pre/post process censuses. It recompiled all retained stages, read back the exact 1920x1080 FP16
-target at operation 1,937, and produced the unchanged corrupt-scene result recorded above. This is
-generic shader-coverage progress, not a title-screen, gameplay-visual or performance improvement.
+The saved-mask tests use the exact House EQ/LG encodings in Wave32 and Wave64 arbitrary CFGs. They
+trace the one required whole-wave vote through the dispatcher's Function-memory SCC and into the
+later scalar select. High-half overwrite, numeric-pair and path-dependent-join controls prevent a
+stale or non-mask pair from acquiring that lowering. Production mutations that removed EQ
+admission, inverted its polarity or weakened the two-source MUST proof each broke the corresponding
+named dataflow check.
+
+The DPP test uses the exact `v_min_u32_dpp v3,v3,v3 row_shr:{1,2,4,8}` packets in the same crossing
+graphics CFG for both wave sizes. It proves the shared dynamic amount feeds both the row-bound check
+and lane subtraction, pending plus EXEC gate source participation, and subgroup shuffle feeds UMin
+and the persistent VGPR store. Opcode, distinct-source and amount packet mutations fail the exact
+contract; production mutations to opcode admission, row direction and divergent-PC participation
+each make the named House DPP check red.
+
+The current authorized Vulkan replay completed in 2.803 seconds with return code zero and empty
+pre/post process censuses. It substituted all 809 VS/FS pairs and 106 compute stages with zero stored
+modules retained, read back the exact 1920x1080 FP16 target at operation 1,937, and produced the
+byte-identical corrupt-scene result recorded above. This is generic shader-coverage progress, not a
+title-screen, gameplay-visual or performance improvement.
