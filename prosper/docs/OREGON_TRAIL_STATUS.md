@@ -29,10 +29,12 @@ body originally called highest-value.
   widget; that widget's own completion path loads `/Game/Maps/L_Main`. The empty base pass is
   therefore correct for the content state that actually loaded, rather than a missing GPU draw list.
 
-**The GPU-side questions are answered. The remaining frontier is CPU/UI-side:** distinguish whether
-the shipped splash Blueprint reaches its EULA/splash `AddToViewport` calls from a failure in the UMG
-presentation path. Do not return to base-pass or further GPU instrumentation without contradictory
-new evidence.
+**The GPU-side questions are answered. The remaining frontier is CPU/UI-side:** the signed-out
+account path opens and auto-finishes an ErrorDialog, but its account-completion poll is tied to a
+system foreground-return callback. Prosper currently reports no background transition at all. Prove
+that lifecycle edge (or its absence) with a clean, single-instrument arm before changing service
+behaviour, then distinguish EULA/splash `AddToViewport` from a UMG presentation failure. Do not
+return to base-pass or further GPU instrumentation without contradictory new evidence.
 
 ## Shipped front-end progression contract
 
@@ -42,19 +44,32 @@ inferring progression from service-call volume:
 | Blueprint predicate/action | Native implementation | Completion state |
 |---|---|---|
 | `IsAccountLoginRequired` | `0x88af00` | Always required. |
-| `IsAccountLoginChecked` | `0x88aef0` | Reads byte `+0x109`. The ErrorDialog poll at `0x88ad6b` writes the two-byte value `0x0100` at `+0x108` on every non-`RUNNING` result, making `+0x108 = 0` and **`+0x109 = 1`**. |
+| `IsAccountLoginChecked` | `0x88aef0` | Reads byte `+0x109`. The ErrorDialog poll at `0x88ad6b` writes the two-byte value `0x0100` at `+0x108` on every non-`RUNNING` result, making `+0x108 = 0` and **`+0x109 = 1`**. The missing discriminator is whether that poll is dispatched after Prosper's headless dialog. |
 | `IsNoFreeSpaceCheckRequired` | `0x8896c0` | Always required. |
 | `CheckNoFreeSpace` | `0x8896d0` | Its synchronous completion path unconditionally writes byte `+0xb0 = 1` at `0x889722`, then invokes and clears the callback. `IsNoFreeSpaceChecked` (`0x87d070`) reads that byte. |
 | `IsEULACheckRequired` | `0x88ab80` | Always required. |
 | `IsEULAChecked` / `SetEULAChecked` | `0x87d640` / `0x886a60` | The getter reads byte `+0xc8`; the setter writes it to one. The shipped `BP_EULA_Controller` creates `WBP_System_Disclaimer_Popup`, adds it to the viewport, and calls the setter from its close path. |
 
 `L_GameloftSplash` contains the state flags `bLoginChecked`, `bNoFreeSpaceCheckStarted`,
-`bEULACheckStarted` and `bSplashStarted` and calls the predicates above. It creates
-`WBP_Splash_Gameloft`; that widget polls `IsSplashMoviePlaying`, then its `LoadNextLevel` path opens
-`/Game/Maps/L_Main`. This establishes a bounded next discriminator: trace the existing native
-predicate/writer RVAs and the Blueprint UI transition to determine whether startup never reaches
-`AddToViewport`, or reaches it but produces no Slate/UMG draws. No service behaviour change is
-justified before that discriminator is run.
+`bEULACheckStarted` and `bSplashStarted` and calls the predicates above. Exact retained-package
+bytecode order is: start/check free space; wait for `IsNoFreeSpaceChecked`; wait for
+`IsAccountLoginChecked`; call `Begin`; run the EULA branch; create `WBP_Splash_Gameloft`; then
+`AddToViewport`. That widget polls `IsSplashMoviePlaying`, and its `LoadNextLevel` path opens
+`/Game/Maps/L_Main`.
+
+The automatic native account stage is now mapped too. `0x87d100` checks
+`IsAccountLoginRequired`, wraps its incoming continuation, and calls the account-state method
+`0x88abe0` through vtable slot `+0x78`. Completion invokes wrapper slot `+0x58`
+(`0x8a54e0`) and enters the EULA stage at `0x87d350`; EULA completion similarly invokes
+`0x8a5600` and continues at `0x879dd0`. In the signed-out arm, `0x88abe0` calls
+`ShowAccountLogin`, whose observed successful ErrorDialog Open returns true and leaves account state
+active. The constructor registers `0x88ad20` through wrapper `0x887110` on multicast
+`0x867af10`; the platform status loop broadcasts that multicast when status byte 5
+(`isInBackgroundExecution`) transitions back to zero. Its other route is the NP-state callback, but
+the shipped handler returns immediately for Prosper's delivered `SIGNED_OUT` value. Prosper's
+`sceSystemServiceGetStatus` currently writes byte 5 as zero on every call, so an auto-finished system
+dialog cannot itself produce the required nonzero-to-zero edge. This is the current, bounded
+candidate—not yet a justified behaviour change.
 
 ## Ruled out
 
@@ -72,6 +87,9 @@ re-derive these without contradictory new evidence.
 | `~23 draws/frame` is implausibly few (an assertion) | **Now a measurement, against a calibrated control.** Blue Prince — the only title in the comparison that demonstrably renders a 3D world — shows both regimes in one run, same build, same instruments: **7–13 draws/frame on its own menus, 1,500–3,200 in its 3D scene.** Oregon Trail sits flat at 22.4 (peak 23) for an entire run while running a gameplay-scale post chain. Read the trap first: a whole-run average describes neither regime (Blue Prince's is 622.7). | #1641, PR #1645 |
 | The same signature confirms the defect on Nikoderiko or Asterix | **Neither is currently in a phase that can test it.** Nikoderiko's 35.9 draws/frame (peak 53) was measured **parked on the title screen and EULA** — a 2D UI screen — and a working title's own menus measure 7–13, so 53 is *normal*, not a signature; its rise lands exactly when the rich screen appears (samples 10–11 carry 160,300 and 161,248 distinct colours, samples 3–9 are uniformly black). Asterix `PPSA30490` sits at exactly 4.00 draws/frame (3 realized + 1 suppressed), dead flat across 14,472 frames, never reaching any content phase — a title that never starts rendering, a different failure. **Do not widen #1641 to those titles on this evidence.** | #1641 |
 | Headless ErrorDialog's immediate `FINISHED` result prevents the account-login flow from advancing | **Falsified, with exact control flow and a cross-title positive control.** At `0x903041` the guest compares `UpdateStatus` against `FINISHED` (`3`); equality terminates the dialog and invokes its completion callback, while every other state returns to wait. The account-specific poll at `0x88ad6b` returns only for `RUNNING` (`2`); any other result reaches `0x88ad75`, writes `0x0100` at object offset `+0x108` (clearing active and setting account-checked at `+0x109`), then invokes and clears its callback. Prosper's immediate `FINISHED` is therefore the exact advancing state, not a stall. DOLL is the cross-title positive control: the same honest offline `SIGNED_OUT` and ErrorDialog lifecycle immediately streams title assets and reaches its interactive title screen. Changing ErrorDialog semantics is not justified. | #1606; `DOLL_LOADING_PROGRESSION.md` |
+| The retained ErrorDialog Open line proves the game-specific account poll at `0x88ad20` ran | **Falsified; it proves a different owner.** The Open import has one direct guest caller, `0x901ed8`, in a Sony online-identity virtual method inherited unchanged by the PS5 identity class. A Vulkan-free live positive at `0x901edd` fired once and its frame recovered the exact return site `caller_rbp=eboot+0x88ae5a`, immediately after `ShowAccountLogin`'s virtual call. Dialog completion is polled separately by the Sony online-subsystem tick (`0x97f9e0` → `0x9036a0` → `0x903020`). The earlier zero at `0x88ad70` remains void, and the static `0x88ad20` semantics remain conditional; neither says that function executed. | #1606; #1932 |
+| The Sony online-subsystem ErrorDialog tick directly completes the game account gate | **Falsified by the exact delegate flow.** `ShowAccountLogin` passes an empty delegate to the identity method at `0x901de0`; that method stores it at identity offset `+0x60`. The generic tick at `0x903020` correctly terminates a `FINISHED` dialog and invokes slot `+0x58` only when that stored delegate is non-empty. It is empty on this path, so the Sony tick cannot write account byte `+0x109`. The separate account poll at `0x88ad20` owns that write and is reached from foreground return (or a signed-in NP-state notification), not from the generic dialog callback. | #1606 |
+| `L_GameloftSplash` directly calls `ShowAccountLogin`, so its Blueprint bytecode should expose the missing call | **Falsified by the retained package import table.** The level imports `CheckNoFreeSpace`, `IsAccountLoginChecked`, `IsAccountLoginRequired`, the EULA predicates/setter, `Begin`, `Create` and `AddToViewport`, but no `ShowAccountLogin` or account-init function. Account initialization is an automatic native stage (`0x87d100` → `0x88abe0`); the Blueprint only polls its checked predicate. | #1606 |
 | PlayGo `GetLocus` is a sustained chunk-0 poll or progression gate | **Falsified; the earlier rate interpretation was an instrumentation mistake.** The retained trace's 1,000 calls carry chunk IDs **0, 1, 2, …, 999 exactly once**, with no reset. Guest code at `0x13f28a4` is a bounded startup cache-population loop: it calls `GetLocus` for each ID, stores only successful `LOCAL_FAST` (`3`) results, cleanly skips absent IDs, stops at `0x3e8`, and sets its initialized byte at `0x13f29e7`. Chunk 0 succeeds and the remaining nonexistent IDs fail as expected. This is neither periodic polling nor a wait for those IDs to become local; changing PlayGo behaviour is not justified. | #1606, #1641 |
 
 **Note on the Asterix figure.** 4.00 is the #1641 census number — *decoded* draws per frame, realized
@@ -116,6 +134,39 @@ the same thing, and do not treat either as superseding the other until that is c
   rate. The 1,000 PlayGo `GetLocus` records are IDs 0 through 999 from one bounded loop, not a
   sustained ~17 calls/s chunk-0 ticker. Always inspect arguments and sequence boundaries before
   converting a trace count into frequency.
+* The first live CPU discriminator on 2026-08-04 is **VOID, not a falsification**. In a single
+  bounded 15-second arm, the all-thread HWBP at `0x995ed0`
+  (`GameloftOnlineFeaturesSubsystem::Begin`) and the process-wide BP at `0x34cba70`
+  (`UUserWidget::AddToViewport`) both armed, but neither fired. Because the promised `Begin` positive
+  control was also zero, the run cannot distinguish a missed temporal window or wrong native owner
+  from an unexecuted UI path. It must not be cited as evidence that either function is unreachable.
+  That arm also omitted `PROSPER_RENDER` but not `PROSPER_NO_COMPUTE`, so boot_trace registered the
+  Vulkan compute backend; future CPU-only arms require `PROSPER_NO_COMPUTE=1` **and** the
+  `[compute] progression-only no-op backend registered` witness before interpreting any hit count.
+* The corrected 2026-08-04 account-dialog arm is also **VOID, and corrects an owner conflation**.
+  `PROSPER_NO_COMPUTE=1` printed the required progression-only banner, the title emitted
+  `sceErrorDialogOpen(errorCode=0x80550006)`, and the HWBP/BP at `0x88ad70`/`0x88ad75` both armed;
+  however, neither breakpoint fired. The `0x88ad70` positive was immediately after one
+  game-specific `UpdateStatus` call, so the adjacent account-checked writer's zero is not
+  interpretable. Offline owner recovery explains why: the ErrorDialog Open import has one direct
+  guest caller, `0x901ed8`, in the Sony online-identity base method at `0x901de0`. The base vtable
+  (`0x7d4a438`) and its PS5-derived vtable (`0x7d51100`) both put that method at slot `+0x10`;
+  the PS5 constructor at `0x972960` installs the latter. The game's `ShowAccountLogin` method
+  (`0x88ae00`) obtains the identity interface and calls that exact slot at `0x88ae57`. Dialog
+  completion is polled independently by the Sony online-subsystem tick: `0x97f9e0` calls
+  `0x9036a0`, which obtains the same interface and calls the `0x903020` UpdateStatus/Terminate path.
+  Thus the retained Open line proves `0x901de0`, not `0x88ad20`; the static statement remains valid
+  only conditionally — **if** `0x88ad20` runs, any non-`RUNNING` result writes checked=true.
+* The bounded owner discriminator resolved that owner, but also exposed a generic instrument bug.
+  Exact process census was zero before and after; `PROSPER_NO_COMPUTE=1` printed the progression-only
+  banner and no Vulkan-device line. The genuine all-thread HWBP at `0x901edd` fired once and its own
+  frame recorded `caller_rbp=eboot+0x88ae5a`, directly proving the observed Open returned to
+  `ShowAccountLogin`. The simultaneous int3 at `0x88ae5a` is **not** a second confirmation: while an
+  HWBP fd was live, the Linux handler misrouted that int3 as a second `[hwbp]` event at `0x88ae5b`,
+  skipped the software-breakpoint restore/step state machine, and the subject then aborted with heap
+  corruption. Therefore the first pre-int3 HWBP owner record is valid, but the int3 record and every
+  progression outcome are void. Tracked as #1932 and instrument trap 84; do not combine
+  `PROSPER_HWBP` with `PROSPER_BP` until that routing defect is fixed.
 
 ## Reproduction
 
