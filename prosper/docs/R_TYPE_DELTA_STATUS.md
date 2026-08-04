@@ -119,6 +119,43 @@ without calling it a defect. The coordinate fix does not bypass the default-laun
   <sub>Intermediate retained-frame replay: detail recovery is real; the green/purple cast is a replay-provenance artifact, and live chroma/placement correctness remains unverified.</sub>
 </p>
 
+## The shell state machine, decoded to guest symbol names
+
+Earlier notes described the pre-graphics shell dispatcher (`eboot+0x1080`, called once per iteration
+from `eboot+0x17c0`) with placeholder stage names. The dispatcher is fully decoded now, and the names
+are the title's own:
+
+`eboot+0x1950(sceneId, phase)` is `sceKernelDlsym(moduleHandle[sceneId], phaseName[phase - 1])`.
+The handle array is `eboot+0x4e4530`; the name table is `eboot+0x3e9860` and holds exactly six
+entries — `DLLInit`, `DLLMain`, `DLLExit`, `DLLLoadStart`, `DLLLoadCheck`, `DLLLoadEnd`. The
+`phase - 1` index comes from `shl rsi,0x20 / add / sar rax,0x1e` at `eboot+0x1980..0x199c`. The
+state word is `eboot+0x4e0658`, initialized to 1 at `eboot+0x17a8`; the jump table is
+`eboot+0x3e97b0`.
+
+| State | Handler | Calls | Transition |
+| --- | --- | --- | --- |
+| 1 | `eboot+0x10f0` | `DLLLoadStart` | → 2 |
+| 2 | `eboot+0x12dc` | `DLLLoadCheck` | stays while it returns 0; → 3 on nonzero |
+| 3 | `eboot+0x11a8` | `DLLInit` | → 4 (written *before* the call) |
+| 4 | `eboot+0x11d9` | `DLLMain` | stays while it returns nonzero |
+| 5 | `eboot+0x118d` | — | counts `eboot+0x4e065c` (set to 8 at `eboot+0x1371`) down to 0, → 1 |
+
+`eboot+0x1080` calls the common app update `eboot+0xa970` at `eboot+0x1586` on **every** iteration,
+whatever the state. That update is where the fault happens, so the mapping is directly checkable
+against a boot: `PROSPER_SYNCLOG=1` logs every resolved `sceKernelDlsym`, and a default boot shows
+exactly `1 × DLLLoadStart`, `80–86 × DLLLoadCheck`, `1 × DLLInit`, and **zero** `DLLMain`,
+`DLLExit` or `DLLLoadEnd` — which independently confirms both the state mapping and the existing
+record that state 4 is never reached. Because the dispatcher re-resolves the symbol on every
+iteration, that dlsym count is a free, non-invasive iteration counter for the pre-graphics loop.
+
+The faulting branch is gated by `app+0x20c0` (`eboot+0x4e66b0`, read at `eboot+0xc275`) becoming
+non-NULL. Its only writer is the one-instruction virtual setter `eboot+0xa100`
+(`mov [rdi+0x20c0], rdx ; ret`, vtable slot `eboot+0x4108a8`). With that setter armed,
+`PROSPER_HWBP=0xa100 PROSPER_HWBP_ALLTHREADS=1` records exactly one hit, with
+`ret=runtime-prx+0x99c` — the title's own `title_Release.prx` queues the request from inside
+`DLLInit`, on the main thread. The same dispatcher iteration then reaches `eboot+0xc2b3` →
+`eboot+0x24030` → `users.front()` and faults at `eboot+0x24055`.
+
 ## Ruled out
 
 | Hypothesis | Verdict and evidence | Source |
@@ -135,6 +172,12 @@ without calling it a defect. The coordinate fix does not bypass the default-laun
 | The corrected replay's green/purple cast proves live chroma upload or shader conversion is wrong | **Falsified as a replay claim.** Captured U/V bytes are distinct in 494,043/552,960 pairs, T# swizzle `(X,Y,0,1)` and the shader's BT.709 component flow are correct, and a forced `(U,U)` CPU model matches replay at 42.17 dB / 0.9816 SSIM. Capture reports row pitch zero, so replay misses the AvPlayer contract and intentionally broadcasts the first narrow channel. Live output has not passed the startup race and remains unverified. | submit 1741 capture metadata, #1807 |
 | The first state-3 renderer completion poll or `sceVideoOutLatencyControlWaitBeforeInput` should delay startup until the LOGIN pump runs | **Falsified.** Both double-buffered completion qwords are initialized to 2, and an armed breakpoint recorded zero hits at the poll while the sole downstream VideoOut call proved execution crossed it before the ordinary fault. Available implementations allow the latency-control hint to return OK immediately, so adding a guessed delay has no oracle. The remaining #1746 frontier is an unidentified generic scheduling contract, if one exists. | `eboot+0x1acb0/+0x1acca`, CPU-only `cb7602b7` run, #1746 |
 | The shell's fixed 512-update state-4 delay causes the default startup race | **Falsified by reachability.** State 3 calls `DLLMain(1)`, writes shell state 4, and calls the common app update in the same invocation; that update faults on the empty user vector before the dispatcher can enter state 4 and perform its first `DLLMain(2)` poll. The 512-update counter exists only downstream, after the input worker has already won. Post-#1837 HWBP correctly reports zero hits at the unreachable state-4 test; the merged guest-entry boundary is not missing this execution. | guest `eboot+0x11a8..0x11ef`, fault return `eboot+0x158b`, #1746 |
+| A prosper Pad/UserService HLE side effect makes the pending pad-vibration request non-NULL earlier than hardware would, so the faulting branch is prosper-induced | **Falsified.** `app+0x20c0`'s only writer is the setter `eboot+0xa100`. Armed on every thread it records exactly one hit, from `ret=runtime-prx+0x99c`: the title's own runtime PRX queues the request from inside `DLLInit`. No prosper call sets it, and both consumer branches (`eboot+0x23ee0` and `eboot+0x24030`) dereference the user vector, so suppressing either branch would not help. | `PROSPER_HWBP=0xa100`, default route on `9dcb6c4b`, #1746 |
+| Pacing the guest's pre-graphics loop at the display rate, as hardware does, delays `DLLInit` past the INPUT worker's 400 ms sleep | **Falsified by a lever-verified A/B.** A local diagnostic that pads only the main thread's per-iteration `sceKernelDlsym` by 16 ms moved the `DLLLoadCheck` count from 83–86 to **12** — the lever demonstrably worked — and the identical fault still occurred at `eboot+0x24055`. The live-render route independently gives 31 iterations and the same fault. The title's loader completes on wall clock in its own worker, so a slower dispatcher only reduces the poll count; it does not postpone `DLLInit`. Pacing made the load *finish sooner* (12 × 16 ms ≈ 0.19 s), because the free-running loop had been contending with the loader worker for CPU. | CPU-only and render routes on `9dcb6c4b`, #1746 |
+| Faithful (slower) guest-visible I/O timing is the lever that lets the title win its own race — a PS5 loading the same assets from its own storage takes longer than 400 ms | **Falsified quantitatively; it points the wrong way.** A default boot reads **101.4 MB** before the fault: `data/sound/sound.bnk` 26.05 MB in 398 reads (all of them *before* the first `DLLLoadCheck`), `data/tex/title_tga.bin` 56.68 MB in 45 preads inside the poll window, and ~18 MB of `data/font/*.tga`. Prosper's effective pre-fault rate is roughly 0.3 GB/s; PS5 storage is an order of magnitude faster, so faithful storage timing would *shorten* the window the INPUT worker needs. No storage model makes 101 MB take 400 ms. | `PROSPER_FILELOG=1` byte census on `9dcb6c4b`, #1746 |
+| The title's loader is frame-budgeted (a fixed streaming quota per `DLLLoadCheck`), so the iteration count is the governor | **Falsified.** The count is not invariant: 80, 83, 86, 86 across identical commands, 103 with `PROSPER_FILELOG=1`, 31 on the render route and 12 under a 16 ms dispatcher pad — it tracks loop speed, not work quanta. All 398 `sound.bnk` reads also complete before the first poll, so the bulk of the load is not streamed across polls at all. | dlsym census, five routes on `9dcb6c4b`, #1746 |
+| prosper's `sceKernelUsleep` has a units or timebase error that manufactures the 400 ms window | **Falsified.** `eboot+0x19e0` is `imul edi,edi,0x3e8 ; jmp sceKernelUsleep`, so the guest's `Sleep(0x190)` really requests 400,000 µs, and `k_usleep` (`hle_kernel_time.cpp`) nanosleeps exactly that. The window is the title's own, at the requested length. | guest `eboot+0x19e0`/`+0x23210`, `hle_kernel_time.cpp:401`, #1746 |
+| The INPUT worker is created late under prosper, so its 400 ms window starts too late | **Falsified.** `[thread] create … name=INPUT` appears at `PROSPER_SYNCLOG` line 66 of a default boot, roughly 2,150 lines before the `DLLLoadStart` dlsym that begins the load. The worker is created and asleep long before the load starts. | `PROSPER_SYNCLOG=1` default boot on `9dcb6c4b`, #1746 |
 | A missing UserService event-delivery behavior can populate the title's user vector before the crash | **Falsified by the guest call graph and live call census.** The vector's only producer is the title's LOGIN handler, reached only when its input worker calls `sceUserServiceGetEvent` after a deliberate 400 ms sleep. Default launch makes zero `GetEvent` calls before `users.front()` faults. `Initialize` and `GetInitialUser` can report service state and a user id, but cannot invoke that title-owned handler; doing so would require a title-memory mutation or scheduling shim rather than an API implementation. Prosper's process-global delivery flag and no-op `Initialize`/`Terminate` leave a separate generic lifecycle question, but the repository has no PS5 hardware oracle for its correct transitions. That unproven lifecycle contract cannot cause or repair this fresh-launch ordering defect. | guest `eboot+0x23690`, `+0x23860`, `+0x49070`; service trace; #1746 |
 
 ## Next frontier
@@ -142,7 +185,25 @@ without calling it a defect. The coordinate fix does not bypass the default-laun
 The coordinate failure in #1807 is isolated and mutation-proven. The next product frontier remains
 #1746: identify a generic, oracle-backed scheduling or synchronization contract, if one exists, that
 prevents the state-3 common update from reaching `users.front()` before the INPUT worker's deliberate
-400 ms delay expires. This audit does not identify such a contract. Once an unmodified launch reaches
+400 ms delay expires. This audit does not identify such a contract.
+
+Two directions are now closed rather than merely unexplored, and both were the obvious next guesses:
+**display-rate pacing of the guest loop** and **slower guest-visible storage timing** (see the two
+rows in `## Ruled out`). The second matters most, because it was the standing recommendation: the
+pre-fault load is 101.4 MB and prosper already moves it *slower* than PS5 storage would, so faithful
+I/O timing makes the race worse, not better. Any remaining lever therefore has to **lengthen the
+title's load in a way that is genuinely present on hardware and absent here**, not slow prosper down.
+The one candidate this audit did not test is whether the load's completion is gated on GPU-side
+work that prosper retires early or never performs: the poll window is dominated by 45 texture preads
+of `data/tex/title_tga.bin` plus 190 semaphore round-trips over two guest threads (`TextureSema`,
+`RequestSema`, `RenderSema`), while the live-render route receives only **four** draw submits before
+the fault, all of them presenting an all-zero framebuffer. If those uploads should be paced by real
+GPU completion, the load would stretch on hardware for a reason prosper can honour generically.
+Nothing above establishes that; it is the next hypothesis to test, not a conclusion.
+
+Rung 1 remains blocked. On `9dcb6c4b` the unmodified route renders exactly four frames, each
+1920×1080 with `nz=0` — pure black — before the fault, so the landed #1807 coordinate recovery cannot
+produce a visible milestone until the race is won. Once an unmodified launch reaches
 the same frame, verify live chroma and movie placement by eye before assigning either a renderer bug.
 Separately, capture/replay should serialize or reconstruct the AvPlayer row-pitch provenance so future
 retained frames take the same narrow-RG path as live rendering; until then the screenshot is evidence
