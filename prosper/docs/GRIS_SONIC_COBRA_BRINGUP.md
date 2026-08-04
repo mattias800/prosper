@@ -138,6 +138,7 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | Consuming the four installed add-content records naturally advances Sonic into an entitlement-key or mount path and changes the startup state | **Falsified at the `f72d8f0` black-loop boot depth.** After #1916, a valid routed 60 s CPU-only arm makes the count query and a real four-entry list call, then no individual info, key, AppContent, or mount call. A native/full-cadence 90 s renderer arm remains byte-identical black across 18 direct samples and port 17 remains silent. The result is scoped to this boot state; re-run it after any fix that advances the guest. | #1905, #1916 |
 | Sonic is black because it submits no GPU work or a shader/resource stage fails realization | **Falsified for the captured present-20 frame.** A deterministic whole-frame bundle contains 36 realized operations across submits 447-468; every extracted capsule reports `failed=0` and no failure diagnostics, its temporal closure is complete, and offline replay succeeds. The complete 3840x2160 result is nevertheless uniformly black. The first live `Vulkan render FAILED` line occurs earlier on empty submit 448, so it is a missing presentable scanout result rather than a failed Vulkan operation. | #1905 |
 | Submit 463's operation-5 black target is caused solely by operation 2 sampling stale zero guest bytes for its Uint32 view of the persistent depth plane | **Falsified, while exposing and fixing a real generic interop defect.** The authoritative D32S8 depth plane at `0x2064ae0000` is uniformly `0.5`, but the old Uint32 compute path read its stale zero guest backing. A GPU-only raw-bit bridge changes operation 2's 3840x2160 binding-7 output from all zero (`ccc433ff6d980383`) to the exact depth-plane bits (`1d0ffd6fc0338383`). Operation 5 still produces the identical black `26ed8b6191338383` target with a complete six-operation closure, so the stale depth alias was real but not sufficient to explain this frame's black composite. | #1905, this doc |
+| Operation 5 turns black because one of its large shader/resource paths fails or reads the wrong downstream input | **Falsified for the captured frame.** The exact dependency graph proves operation 1 writes operation 5's binding 119 at `0x204ec40000`. Operation 1's complete four-dword fragment program unconditionally exports zero to every RGBA channel. Operation 5 samples that texture first, computes `(uint(alpha * 255) & 64)`, and bypasses its large body when the bit is clear; its fallback exports binding 32 words 84-87, which are `(0,0,0,1)`. The black result is therefore selected by the guest shader before the other scene resources can affect it, not produced by a failed operation-5 translation. The remaining blocker is upstream of this submit's GPU program. | #1905, this doc |
 
 ## Sonic Origins dump audit
 
@@ -224,12 +225,24 @@ target (`26ed8b6191338383`; closure `6/6`, unresolved `0`). The depth alias was 
 translation defect, but it is not the sole cause of the black composite; the remaining cause is
 downstream or independent.
 
+Static output slicing and the exact operation graph narrow that result further. Operation 1 is the
+producer of operation 5's binding 119 (`0x204ec40000`), and its fragment shader consists only of
+`v_mov_b32 v0, 0`, an RGBA export of `v0`, and `s_endpgm`. Operation 5's first sample reads binding 119,
+multiplies its alpha by 255, converts it to an integer, and tests bit 6. Zero alpha makes the test false,
+so the shader skips its large scene body and exports the constant-buffer fallback `(0,0,0,1)`. This is
+not a stale captured seed: the graph names operation 1 as the in-submit producer, and replay executes it
+before operation 5. The captured frame's black output is therefore guest-programmed at this point. A
+resource override could force the unused branch for localization, but it would not model a producer the
+guest actually submitted and is not evidence of a compatibility fix.
+
 The dependency graph continues through submit 465: operation 16 reads `0x20168f0000` and writes
 `0x203a7d0000`, operation 17 reads that target, and operation 18 reads it and writes `0x2010870000`;
 submit 467 then reads `0x2010870000`. All operations are realized and failure-free, while the complete
 replay endpoint is black. Those edges establish ordering and dependency, not the values written by each
-producer. Further localization must now inspect operation 5's shader-visible inputs and the submit-465
-chain rather than re-testing operation 2's depth authority. Exact hashes and command shapes are retained in
+producer. Further GPU localization inside operation 5 is no longer useful for this frame: the guest's
+operation-1 zero mask prevents that body from running. The next discriminator must move upstream to the
+guest progression/state that submits only the zero-mask path, then revisit the submit-465 chain after a
+capture whose operation-1 mask is nonzero. Exact hashes and command shapes are retained in
 [#1905](https://github.com/mattias800/prosper/issues/1905#issuecomment-5172641024) and its follow-up.
 
 ### Game Intent activity audit
