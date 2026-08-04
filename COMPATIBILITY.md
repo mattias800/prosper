@@ -49,9 +49,9 @@ Last updated: 2026-08-04
 | *The Forgotten City* | `PPSA03026` | — | 🔬 Initial compatibility run pending | [#1890](https://github.com/mattias800/prosper/issues/1890) |
 | *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
 | *Little Nightmares III* | `PPSA05143` | — | 🔬 Initial compatibility run pending | [#1893](https://github.com/mattias800/prosper/issues/1893) |
-| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | — | 🔬 Initial compatibility run pending | [#1894](https://github.com/mattias800/prosper/issues/1894) |
+| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | — | 🔬 CPU boot reaches initial AGC setup; no visual milestone | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
-| *Bendy and the Dark Revival* | `PPSA27624` | — | 🔬 Initial compatibility run pending | [#1897](https://github.com/mattias800/prosper/issues/1897) |
+| *Bendy and the Dark Revival* | `PPSA27624` | — | 🔬 CPU boot reaches media initialization; no visual milestone | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | — | 🔬 Initial compatibility run pending | [#1898](https://github.com/mattias800/prosper/issues/1898) |
 
 ## Screenshots and short descriptions
@@ -278,7 +278,8 @@ No verified compatibility run has been recorded yet. See the [tracker](https://g
 
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
 
-No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1894).
+A bounded current-master CPU-only/no-render boot reaches its first AGC fence-builder event and then stalls.
+It establishes no visual compatibility milestone. See the [tracker](https://github.com/mattias800/prosper/issues/1894).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
 
@@ -289,7 +290,8 @@ The route reaches Training 1 with a live rail-shooter camera, HUD, crosshair, an
 
 ## Bendy and the Dark Revival — `PPSA27624`
 
-No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1897).
+A bounded current-master CPU-only/no-render boot reaches initial AGC/session/trophy setup and logs an FSB-v5
+media-open failure. It establishes no visual compatibility milestone. See the [tracker](https://github.com/mattias800/prosper/issues/1897).
 
 ## Beneath — `PPSA27640`
 
