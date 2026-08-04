@@ -319,6 +319,16 @@ The CRI Mana / MPV movie-player group (13 threads) is fully constructed and then
 is opened in any arm of this series. Whether Sonic's boot is supposed to play a movie here is the open
 question — it is the one large subsystem that is initialised and idle.
 
+**No thread is blocked on a primitive prosper never signals.** `tools/guest_bt` (the right instrument
+here — it bridges the HLE stub boundary that defeats a plain gdb stack walk) resolves guest thread 1's
+chain through the Sony sleep stub to `eboot+0x933088`, reached from `eboot+0x930360`, which the entry
+region calls at `eboot+0x50ef27`. That call site is followed by `mov r14d, eax` and a virtual teardown
+of the global at `eboot+0x3522950`, so `eboot+0x930360` is the RSDX **application run loop** and the
+sleep is its frame pacing. Main is therefore healthy and inside the normal run loop, not parked on a
+wait. Every other thread resolves to an ordinary `pthread_cond_wait` / `cond_timedwait` / `nanosleep`
+pool idle. The whole "some guest thread waits forever for something prosper never posts" family is
+closed for this state.
+
 **What is therefore left.** The guest is alive, not deadlocked, and asks prosper for nothing it does
 not get: no unimplemented call, no pending file, no blocking service, no missing input. It simply
 re-renders an empty scene. The next discriminator has to identify the internal condition the RSDX
