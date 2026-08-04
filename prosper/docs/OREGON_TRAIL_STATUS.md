@@ -1,15 +1,55 @@
 # The Oregon Trail (`PPSA19244`) — status and evidence
 
-Unreal Engine 4. **Rung 0 — no real graphics.** The title boots cleanly and holds a steady ~50 fps
-frame loop with frames provably advancing, but every one is uniformly black. Tracked on
+Unreal Engine 4. **Rung 1 — real graphics.** Since #1933 landed the ErrorDialog foreground
+lifecycle, the title renders its startup legal/EULA popup (`WBP_System_Disclaimer_Popup`) at native
+3840x2160 from the live renderer, then **dies within ~4-6 s** on a corrupted guest heap. Tracked on
 [#1606](https://github.com/mattias800/prosper/issues/1606) and
-[#1641](https://github.com/mattias800/prosper/issues/1641).
+[#1641](https://github.com/mattias800/prosper/issues/1641); the crash that now bounds every run is
+[#1945](https://github.com/mattias800/prosper/issues/1945).
 
 Read `## Ruled out` before forming a hypothesis. Several separate leads on this title have been
 measured and killed, including the GPU-side questions and the two service candidates that the issue
 body originally called highest-value.
 
-## Where it actually stands
+## Where it stands after #1933 (2026-08-04)
+
+The black-frame era is over. On master `9dcb6c4b` the default environment
+(`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1`, no diagnostics, no
+route) produces real content within two seconds: a green legal panel titled *"Welcome to The Oregon
+Trail"*, three legal links, and a focused confirm button, at 3840x2160 with **4,009,938 non-black
+pixels** (48 % of the frame). `assets/screenshots/oregon-trail-legal-popup.png` is that frame.
+
+Two defects now bound the title, in this order:
+
+1. **A guest heap corruption ends the run after ~4-6 s (#1945).** `RenderThread 1` faults in the
+   guest's own small-block allocator at `eboot+0x14600df` (`mov rax,QWORD PTR [rcx]` — popping the
+   free-list head of the 32-byte size class). Three of four default-environment runs died this way
+   within six seconds; the pad route below never even reaches its first press. Exit status is 90.
+2. **Slate text renders as solid blocks (#1946).** Layout, kerning and word shapes are correct, so
+   the font is loaded and measured; every glyph quad draws fully opaque instead of sampling its
+   coverage.
+
+Nothing here needs more base-pass or colour-state work. **The empty base pass was never a renderer
+defect** — the guest was gated on account login, exactly as the shipped Blueprint contract below
+says, and the 4K `R16G16B16A16_SFLOAT` surface with "no producer" is simply the scene target of a
+frame whose only content is a UMG popup.
+
+### The A/B that establishes this
+
+One binary, one instrument, one variable — `sceSystemServiceGetStatus`'s
+`isInBackgroundExecution` byte, which is what #1933 changed:
+
+| Arm | `st[5]` | Frames | Fonts / ICU loaded | Fault |
+|---|---|---|---|---|
+| A — master as shipped | `sample_error_dialog_background()` | Legal popup, 32 distinct colours, 4,009,938 non-black px | `FF_Exo2_Bold.ufont`, `FF_PressStart2P_Condensed.ufont`, `icudt64l/brkitr/line.brk` | **yes**, ~4-6 s, `eboot+0x14600df` |
+| B — control, pre-#1933 behaviour | forced `0` | 12/12 samples, 1 distinct colour, **0** non-black px, 2,911 frames over 60 s | none, over a **12x longer** run | none, exit 0 |
+
+Arm B reproduces the historical rung-0 signature exactly, so the difference is attributable to the
+one byte. The **font and ICU line-break loads are the progression witness**: Slate pulls a `.ufont`
+and the ICU break iterator when it first *lays out* text, and the far longer control run never
+touches them. (The widget *classes* are not a witness — see `## Ruled out`.)
+
+## Where the GPU investigation stood before that (historical)
 
 * The complete UE4 post-process chain is present and healthy: a 1920x1080 `R11G11B10F` HDR scene
   colour, a bloom pyramid from 960x540 down to 60x34, tonemap, a 32x32x32 grading LUT, and the
@@ -33,9 +73,16 @@ body originally called highest-value.
 opens and finishes an ErrorDialog, and Prosper exposes the system-dialog background→foreground
 lifecycle that dispatches the game's account-completion poll. Two same-instrument CPU-only arms
 recorded both lifecycle samples before the writer fired; the default-behaviour arm carries the exact
-foreground-broadcast stack. The remaining frontier is downstream CPU/UI progression: prove the EULA
-stage and splash `AddToViewport`, then distinguish a content gate from UMG presentation failure. Do
-not return to base-pass or further GPU instrumentation without contradictory new evidence.
+foreground-broadcast stack. Do not return to base-pass or further GPU instrumentation without
+contradictory new evidence.
+
+**That frontier is now closed by observation, not by inference.** The 2026-08-04 rendering arms show
+the EULA stage reached and its popup *presented* — so both halves of the old open question ("prove the
+EULA stage and splash `AddToViewport`", "content gate versus UMG presentation failure") are answered:
+the gate was the content gate, and UMG presents. The frontier moved to #1945 (the guest heap
+corruption that ends the run) and #1946 (glyph coverage). `WBP_Splash_Gameloft` and
+`/Game/Maps/L_Main` have **not** been observed yet — the crash lands before a route can accept the
+popup — so the splash and title screen remain unproven, not disproven.
 
 ## Shipped front-end progression contract
 
@@ -105,6 +152,9 @@ re-derive these without contradictory new evidence.
 | `L_GameloftSplash` directly calls `ShowAccountLogin`, so its Blueprint bytecode should expose the missing call | **Falsified by the retained package import table.** The level imports `CheckNoFreeSpace`, `IsAccountLoginChecked`, `IsAccountLoginRequired`, the EULA predicates/setter, `Begin`, `Create` and `AddToViewport`, but no `ShowAccountLogin` or account-init function. Account initialization is an automatic native stage (`0x87d100` → `0x88abe0`); the Blueprint only polls its checked predicate. | #1606 |
 | The account completion writer runs but rejects Prosper's dialog status | **Falsified, positive-controlled.** On the same executable, a clean software-breakpoint control at `ShowAccountLogin` (`0x88ae00`) fired once and its first recovered return was `0x88ac99`, directly inside the account-state method. A second clean arm at the writer (`0x88ad75`) printed the same no-compute witness, armed the same instrument, logged ErrorDialog Open/auto-`FINISHED`, and advanced for more than 12 seconds with zero hits. The status comparison is never reached; changing `FINISHED` cannot repair an undispatched poll. | #1606 |
 | A foreground-return pulse changes the lever but still does not dispatch the account writer | **Falsified twice, with exact event order.** The opt-in discriminator and the production-default build each logged ErrorDialog Open, background `1`, foreground `0`, then exactly one breakpoint hit at writer `0x88ad75`. The latter hit's stack includes platform transition site `0x191c324` and multicast `0x867af10`, proving the expected broadcaster owned the hit. The first arm ran for its 16-second bound; the second later faulted on a separate worker, after all mechanism evidence was already recorded. | #1606 |
+| The asset load trace proves the guest reached `Create` / `AddToViewport` on the splash and EULA widgets | **Falsified by a control arm — those loads are package dependencies, not execution.** `tools/re/pak_index.py --distinct` over the shipped-master run resolves `WBP_Splash_Gameloft`, `BP_EULA_Controller`, `WBP_System_Disclaimer_Popup`, `WBP_EULA_NotificationScroll_Popup` and the `T_Logo_*` atlas — and the **pre-#1933 control arm loads the identical set at the identical ordinals** (lines 2190-2239 of both traces) over a run **12x longer**, while never reaching the popup. `L_GameloftSplash.umap`'s import table pulls those classes when the map loads, before any Blueprint gate runs. What *does* discriminate is `FF_Exo2_Bold.ufont`, `FF_PressStart2P_Condensed.ufont` and `icudt64l/brkitr/line.brk`: Slate loads a font and the ICU break iterator only when it lays text out, and only the shipped-master arm loads them (3 assets present in A and absent from B; B's 486 extra assets are streamed `.vaff` audio from its longer run). **A class load is not an instantiation.** Any load-trace progression claim needs a duration-matched or longer control. | this doc, #1606 |
+| The 4K `R16G16B16A16_SFLOAT` "surface with no producer" is a renderer or base-pass defect | **Resolved, not by GPU work.** It was the scene target of a frame whose only content is a UMG popup, in a process still gated on account login. With the gate open the same code path renders 4,009,938 non-black pixels. Do not reopen the producer question. | this doc, #1933 |
+| `PROSPER_FAULT_SKIP` over the corrupt free-list pop is a usable workaround for #1945 | **Falsified.** `PROSPER_FAULT_SKIP=0x14600df:0x14600f3` (the allocator's own general-allocator fallback) does survive the pop, but the run then wedges — `frame_seq` frozen at 223 from 6 s to 33 s, frames black — and dies in `std::terminate`'s `ud2` at `0x5c00359af` on a worker. The corruption is upstream and must be fixed at its source. | #1945 |
 | PlayGo `GetLocus` is a sustained chunk-0 poll or progression gate | **Falsified; the earlier rate interpretation was an instrumentation mistake.** The retained trace's 1,000 calls carry chunk IDs **0, 1, 2, …, 999 exactly once**, with no reset. Guest code at `0x13f28a4` is a bounded startup cache-population loop: it calls `GetLocus` for each ID, stores only successful `LOCAL_FAST` (`3`) results, cleanly skips absent IDs, stops at `0x3e8`, and sets its initialized byte at `0x13f29e7`. Chunk 0 succeeds and the remaining nonexistent IDs fail as expected. This is neither periodic polling nor a wait for those IDs to become local; changing PlayGo behaviour is not justified. | #1606, #1641 |
 
 **Note on the Asterix figure.** 4.00 is the #1641 census number — *decoded* draws per frame, realized
@@ -210,7 +260,33 @@ the same thing, and do not treat either as superseding the other until that is c
   replacement on direct Term fails the close-reroute check. Restoration passed both `platform_ui`
   and `service_getters`.
 
+* The `[fault] … on-guest-TCB=NO(host-%fs leak?)` line printed at the #1945 fault is **not** evidence of
+  a `%fs` leak. That heuristic assumes `rax` still holds the `%fs` self-pointer from a nearby
+  `mov %fs:0x0`; at `eboot+0x14600df` `rax` is the guest allocator's per-thread bin-array base
+  (`0x30209c0000` / `0x3020140000` in the two observed instances). Do not open a #1155-class
+  investigation from it without an independent `%fs` witness.
+* In a 5-second arm that provably decoded and realized draws (32 `CB_COLOR_CONTROL` diagnostics, a
+  folded `WaitRegMem`, and rendered popup frames in the sibling arms), `PROSPER_RTT_TIMING=1` emitted
+  **zero** `[rtt-timing]` lines. If a draw census depends on that stream, confirm it emits inside your
+  window before reading a zero as "no draws".
+
 ## Reproduction
+
+**Current — the popup, and the fault that follows it (2026-08-04, master `9dcb6c4b`):**
+
+```bash
+PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+  ./build-linux/screenshot <DUMP_ROOT>/PPSA19244-app0 \
+      --seconds 2 --count 8 --out <OUT> --timeout 60
+```
+
+Samples at 2.0 s and 4.0 s carry the legal popup (3840x2160, 32 distinct colours, 4,009,938 non-black
+pixels); the run then usually dies with `WORKER-THREAD FAULT … rip=…+0x14600df` and exit 90 (#1945).
+Sample every 1-3 s: a 5-second interval is longer than the whole run in most arms. The route
+`scripts/oregon-trail/reach-past-eula.pad` is committed for when #1945 is fixed — it has **not** yet
+been observed to act, because the crash lands before its first press.
+
+**Historical — the black-frame draw census (pre-#1933):**
 
 ```bash
 PROSPER_NO_FRAME_DUMPS=1 PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \

@@ -1,0 +1,24 @@
+# The Oregon Trail (PPSA19244) — accept the startup legal/EULA popup and continue.
+#
+# Timing is anchored to the game's FIRST PAD POLL, not process start.
+#
+# What the route drives: the title opens on `WBP_System_Disclaimer_Popup` ("Welcome to The Oregon
+# Trail" + three legal links + a focused confirm button). The shipped `BP_EULA_Controller` closes
+# that popup from its confirm path and calls `SetEULAChecked`, after which `L_GameloftSplash`'s level
+# Blueprint creates `WBP_Splash_Gameloft` and its completion path opens `/Game/Maps/L_Main`.
+#
+# Why repeated Cross pulses rather than one press at a fixed offset: the popup's own appearance time
+# moves with load timing, the confirm button may require a focus pass first, and each legal link
+# opens a scroll page whose Cross is "continue". Surplus presses are harmless in all of those
+# states, and every arm of an A/B therefore sees the same input stream. Verify what the guest
+# actually read with PROSPER_PAD_SCRIPT_LOG=1.
+3-4:cross
+7-8:cross
+11-12:cross
+15-16:cross
+19-20:cross
+23-24:cross
+27-28:cross
+31-32:cross
+35-36:cross
+39-40:cross
