@@ -25,8 +25,8 @@ ordered pair in fragment shaders.
 
 The generic 2D fragment form is now lowered to a real `OpImageQueryLod`. The accepted contract is
 deliberately narrow: ordinary non-NSA 2D texture and sampler resources, normalized coordinates,
-only x/y result channels, and no GLC or instruction modifier. Other dimensions, stages and forms
-remain visible recompiler failures.
+only x/y result channels, and no auxiliary MIMG address, cache-policy, descriptor/result, D16 or
+reserved controls. Other dimensions, stages and forms remain visible recompiler failures.
 
 Three representative failed fragment programs now recompile through their original resource
 tables: the 663-dword shader that supplied the exact instruction test produces 14,542 SPIR-V dwords
@@ -70,11 +70,18 @@ rdna2_spirv_struct
 shader_resource_contract
 ```
 
-The structural test uses the exact title-live packet `f1800108 01480809` and requires a real
-`OpImageQueryLod`; an independent compute-stage arm requires the derivative-consuming operation to
-remain rejected outside fragment shaders. Mutating the production opcode gate from `0x60` to `0x61`
-breaks the named structural check, and mutating only the table-less coverage classifier breaks the
-named coverage check. Both pass again after restoration.
+The structural test uses the exact title-live packet `f1800108 01480809` in x, y and xy dmask forms.
+It traces distinct U/V bit patterns into the real `OpImageQueryLod`, then traces clamped/raw query
+components through compact consecutive VDATA writes, EXEC predication and the fragment export. An
+isolated compute-stage arm requires the derivative-consuming operation to remain rejected outside
+fragment shaders. Exact or raw negative packets separately cover NSA, UNRM, A16, DLC, GLC, SLC,
+R128, TFE, LWE, D16 and all six reserved Table 100 bit positions in both production and table-less
+coverage.
+
+Defect-shaped mutations separately swapped U/V, swapped clamped/raw results, broke y-only VDATA
+compaction, removed EXEC predication, admitted the operation in compute, disabled each shared
+address/cache/result/reserved control family, and erased reserved-bit decode. Each mutation broke
+its named check and the clean implementation passed again after restoration.
 
 The single authorized Vulkan replay completed in 2.689 seconds with return code zero and empty
 pre/post process censuses. It recompiled all retained stages, read back the exact 1920x1080 FP16

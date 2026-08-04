@@ -3877,6 +3877,25 @@ bool instruction_may_change_exec(const Rdna2Inst& in) {
     return is_exec(in.dst) || is_exec(in.sdst);
 }
 
+// IMAGE_GET_LOD currently models only the ordinary FP32 sampled-image form. Keep the unsupported
+// Table 100 control families separate so each can be mutation-tested, while production and the
+// table-less coverage classifier consume one shared predicate and cannot drift apart.
+bool mimg_get_lod_has_address_controls(const Rdna2Inst& in) {
+    return in.mimg_nsa != 0u || in.mimg_unorm || in.mimg_a16;
+}
+bool mimg_get_lod_has_cache_controls(const Rdna2Inst& in) {
+    return in.mimg_dlc || in.mimg_glc || in.mimg_slc;
+}
+bool mimg_get_lod_has_result_controls(const Rdna2Inst& in) {
+    return in.mimg_r128 || in.mimg_tfe || in.mimg_lwe || in.mimg_d16;
+}
+bool mimg_get_lod_has_unmodeled_controls(const Rdna2Inst& in) {
+    return mimg_get_lod_has_address_controls(in) ||
+           mimg_get_lod_has_cache_controls(in) ||
+           mimg_get_lod_has_result_controls(in) ||
+           in.mimg_reserved;
+}
+
 // A scalar VCCZ branch tests whether ANY active lane set VCC, not this lane's bit. Stages without
 // fragment's forced wave64 vote may lower it as structured control only when the VCC producer is
 // provably uniform across the wave. Dead Cells' light loops use the narrow compiler shape
@@ -9588,11 +9607,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // IMAGE_GET_LOD (0x60): RDNA2 returns {sampler-clamped LOD, raw LOD}; SPIR-V's
             // OpImageQueryLod returns the same pair. House of the Dead 2's Unity scene shaders use
             // the ordinary non-NSA 2D form in fragment programs. Keep every unverified dimension,
-            // flag, address shape, and output component fail-visible rather than guessing.
+            // Table 100 control, address shape, and output component fail-visible rather than guessing.
             if (in.opcode == 0x60) {
                 if (!b.is_fragment || res->cls != ResourceClass::Texture ||
                     in.mimg_dim != SQ_DIM_2D || res->img_dim != SQ_DIM_2D ||
-                    in.len_dwords != 2u || in.mimg_unorm || in.mimg_glc || in.has_modifier ||
+                    in.len_dwords != 2u || mimg_get_lod_has_unmodeled_controls(in) ||
                     !(in.mimg_dmask & 0x3u) || (in.mimg_dmask & ~0x3u) ||
                     res->unnormalized || res->depth_compare ||
                     !b.declare_texture(res->binding, Dim_2D, uint_texture)) {
@@ -14956,7 +14975,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     if (i.opcode == 0x0eu) return i.mimg_dim <= 2u;             // image_get_resinfo 1D/2D/3D
                     if (i.opcode == 0x60u)                                     // fragment image_get_lod 2D
                         return i.mimg_dim == 1u && i.len_dwords == 2u &&
-                               !i.mimg_unorm && !i.mimg_glc && !i.has_modifier &&
+                               !mimg_get_lod_has_unmodeled_controls(i) &&
                                (i.mimg_dmask & 0x3u) && !(i.mimg_dmask & ~0x3u);
                     // sample*: 2D (NSA ok); plus implicit-LOD image_sample (0x20) / LOD-0 image_sample_lz
                     // (0x27) from a 3D texture; sample_b (0x25) and gather4_lz (0x47) are 2D. 2D_ARRAY (dim 5)

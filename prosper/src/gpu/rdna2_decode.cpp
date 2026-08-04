@@ -521,15 +521,27 @@ void decode_operands(Rdna2Inst& i) {
             // Image op. opcode is 8 bits: MSB in dword0 bit 0, low 7 bits in [24:18] (Table 100:
             // "combine bits zero and 18-24" — dropping bit 0 aliased IMAGE_MSAA_LOAD (128) onto
             // IMAGE_LOAD (0) and the _G16/BVH families onto wrong identities); dmask[11:8];
-            // unorm[12]; GLC[13]; dim[5:3]. dword1: VADDR base[7:0]; VDATA base[15:8]; SRSRC (T# base
-            // SGPR, ×4)[20:16]; SSAMP (S# base SGPR, ×4)[25:21].
+            // dim[5:3]; DLC[7]; unorm[12]; GLC[13]; R128[15]; TFE[16]; LWE[17]; SLC[25].
+            // dword1: VADDR base[7:0]; VDATA base[15:8]; SRSRC (T# base SGPR, ×4)[20:16];
+            // SSAMP (S# base SGPR, ×4)[25:21]; A16[30]; D16[31]. Retain the reserved holes too,
+            // so an unsupported raw packet cannot be mistaken for the ordinary form.
             // image_sample = opcode 0x20, image_load = 0x00. (Bit layout verified via llvm-mc gfx1030.)
             const uint32_t d1 = i.words[1];
             i.opcode     = ((w & 1u) << 7) | ((w >> 18) & 0x7Fu);
+            i.mimg_nsa   = (w >> 1)  & 0x3u;
             i.mimg_dmask = (w >> 8)  & 0xFu;
             i.mimg_unorm = (w >> 12) & 0x1u;
             i.mimg_glc   = (w >> 13) & 0x1u;
             i.mimg_dim   = (w >> 3)  & 0x7u;
+            i.mimg_dlc   = (w >> 7)  & 0x1u;
+            i.mimg_r128  = (w >> 15) & 0x1u;
+            i.mimg_tfe   = (w >> 16) & 0x1u;
+            i.mimg_lwe   = (w >> 17) & 0x1u;
+            i.mimg_slc   = (w >> 25) & 0x1u;
+            i.mimg_a16   = (d1 >> 30) & 0x1u;
+            i.mimg_d16   = (d1 >> 31) & 0x1u;
+            i.mimg_reserved = (w & ((1u << 6) | (1u << 14))) != 0u ||
+                              (d1 & (0xFu << 26)) != 0u;
             i.dst    = vgpr(d1 >> 8);                         // VDATA (dest base)
             i.src[0] = vgpr(d1 & 0xFFu);                      // VADDR (coord base VGPR)
             i.src[1] = sgpr(((d1 >> 16) & 0x1Fu) << 2);       // SRSRC (T# base, 8 SGPRs)

@@ -3,6 +3,7 @@
 // The stream mixes every major encoding class + inline literals + S_ENDPGM; the walker must classify
 // each instruction's format, compute its length (incl. literals), and terminate at S_ENDPGM.
 #include "../src/gpu/rdna2_decode.hpp"
+#include <array>
 #include <cstdio>
 #include <cstdint>
 
@@ -319,7 +320,8 @@ int main() {
     // reads exactly these bytes to gather the non-sequential coords.
     const uint32_t mimg_nsa3d[] = { 0xf0000f12u, 0x00000000u, 0x00000307u };
     Rdna2Inst n3 = rdna2_decode_one(mimg_nsa3d, 3);
-    CHECK(n3.fmt == Rdna2Format::MIMG && n3.opcode == 0x00u && n3.len_dwords == 3 && n3.mimg_dim == 2u &&
+    CHECK(n3.fmt == Rdna2Format::MIMG && n3.opcode == 0x00u && n3.len_dwords == 3 &&
+          n3.mimg_nsa == 1u && n3.mimg_dim == 2u &&
           (n3.words[1] & 0xFFu) == 0u && (n3.words[2] & 0xFFu) == 7u && ((n3.words[2] >> 8) & 0xFFu) == 3u,
           "NSA MIMG 3D captures the extra address dword; coords decode to v0,v7,v3");
     // Astro Bot's world-map ray traversal uses the maximum three NSA dwords to name eleven input
@@ -348,6 +350,47 @@ int main() {
           atomic_add.mimg_dim == 1u && atomic_add.mimg_dmask == 1u && atomic_add.mimg_glc &&
           atomic_add.dst.value == 1 && atomic_add.src[0].value == 4 && atomic_add.src[1].value == 28,
           "Astro image_atomic_add decodes the live 2D/R32 visibility packet");
+
+    // Every MIMG Table 100 control is retained independently. These are exact llvm-mc gfx1030
+    // IMAGE_GET_LOD encodings except D16, which llvm-mc rejects for this opcode; the raw D16 field
+    // still has to remain fail-visible rather than alias the ordinary FP32 result form.
+    const Rdna2Inst lod_plain = rdna2_decode_one(
+        std::array<uint32_t, 2>{0xf1800108u, 0x01480809u}.data(), 2);
+    const Rdna2Inst lod_dlc = rdna2_decode_one(
+        std::array<uint32_t, 2>{0xf1800188u, 0x01480809u}.data(), 2);
+    const Rdna2Inst lod_slc = rdna2_decode_one(
+        std::array<uint32_t, 2>{0xf3800108u, 0x01480809u}.data(), 2);
+    const Rdna2Inst lod_r128 = rdna2_decode_one(
+        std::array<uint32_t, 2>{0xf1808108u, 0x01480809u}.data(), 2);
+    const Rdna2Inst lod_tfe = rdna2_decode_one(
+        std::array<uint32_t, 2>{0xf1810108u, 0x01480809u}.data(), 2);
+    const Rdna2Inst lod_lwe = rdna2_decode_one(
+        std::array<uint32_t, 2>{0xf1820108u, 0x01480809u}.data(), 2);
+    const Rdna2Inst lod_a16 = rdna2_decode_one(
+        std::array<uint32_t, 2>{0xf1800108u, 0x41480809u}.data(), 2);
+    const Rdna2Inst lod_d16_raw = rdna2_decode_one(
+        std::array<uint32_t, 2>{0xf1800108u, 0x81480809u}.data(), 2);
+    CHECK(lod_plain.mimg_nsa == 0u && !lod_plain.mimg_unorm && !lod_plain.mimg_dlc &&
+              !lod_plain.mimg_glc && !lod_plain.mimg_slc && !lod_plain.mimg_r128 &&
+              !lod_plain.mimg_tfe && !lod_plain.mimg_lwe && !lod_plain.mimg_a16 &&
+              !lod_plain.mimg_d16 && !lod_plain.mimg_reserved,
+          "ordinary IMAGE_GET_LOD has no auxiliary MIMG controls");
+    CHECK(lod_dlc.mimg_dlc && lod_slc.mimg_slc && lod_r128.mimg_r128 &&
+              lod_tfe.mimg_tfe && lod_lwe.mimg_lwe && lod_a16.mimg_a16 &&
+              lod_d16_raw.mimg_d16,
+          "IMAGE_GET_LOD retains exact DLC/SLC/R128/TFE/LWE/A16 and raw D16 fields");
+    bool all_reserved_retained = true;
+    for (const auto words : std::array<std::array<uint32_t, 2>, 6>{
+             std::array<uint32_t, 2>{0xf1800148u, 0x01480809u}, // dword0 bit 6
+             std::array<uint32_t, 2>{0xf1804108u, 0x01480809u}, // dword0 bit 14
+             std::array<uint32_t, 2>{0xf1800108u, 0x05480809u}, // dword1 bit 26
+             std::array<uint32_t, 2>{0xf1800108u, 0x09480809u}, // dword1 bit 27
+             std::array<uint32_t, 2>{0xf1800108u, 0x11480809u}, // dword1 bit 28
+             std::array<uint32_t, 2>{0xf1800108u, 0x21480809u}, // dword1 bit 29
+         })
+        all_reserved_retained &= rdna2_decode_one(words.data(), words.size()).mimg_reserved;
+    CHECK(all_reserved_retained,
+          "all six reserved MIMG control bits are retained for fail-visible rejection");
 
     // inline-constant field decode: SGPR106 special, field 129 -> +1, 193 -> -1, 242 -> 1.0f
     CHECK(decode_src_field(0).kind == OperandKind::SGPR && decode_src_field(0).value == 0, "field 0 -> SGPR0");
