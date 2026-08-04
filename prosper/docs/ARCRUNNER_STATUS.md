@@ -103,6 +103,17 @@ pre/post process censuses and no suppression or skip. This is not evidence that 
 absent: the instrument was armed, but the target instruction never executed before the competing
 terminal path.
 
+The allocator predecessor and descriptor sibling are not merely two arbitrary render-thread
+failures. The allocator fault's first guest return address is `eboot+0x1177b4d`, inside the same
+allocation-page builder mapped above. Immediately before that return, the builder gets the guest
+allocator at `eboot+0x1177b35` and calls its virtual allocation method with size `0x20` and alignment
+`0x8` at `eboot+0x1177b4a`. The callee is the `eboot+0x127e6c0` free-list pop whose bad-head
+dereference is `eboot+0x127e751`. If that allocation succeeds, the builder proceeds to walk the
+command entries and retain their raw resources; the later page consumer is where
+`eboot+0x117811f` can dereference a null side-command descriptor. This establishes ordering and a
+shared page-build/consume path, not a common corruptor: the allocator damage can still originate
+elsewhere, and the null descriptor may be an independent later blocker exposed by suppression.
+
 No screenshot belongs in the compatibility record yet. The latest content-selective capture
 retained exactly two non-alpha-only frames: frame 12 was a uniform solid-yellow clear and frame 50
 was a uniform solid-white clear. Full inspection found no geometry, text, or game imagery in either.
