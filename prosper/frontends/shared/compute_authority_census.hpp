@@ -158,6 +158,11 @@ constexpr uint64_t shadow_compute_authority_increment(uint64_t value) {
     return value == std::numeric_limits<uint64_t>::max() ? value : value + 1;
 }
 
+constexpr uint64_t shadow_compute_authority_add(uint64_t value, uint64_t addend) {
+    return addend > std::numeric_limits<uint64_t>::max() - value
+        ? std::numeric_limits<uint64_t>::max() : value + addend;
+}
+
 // Post-realization audit for the conservative unknown-range Draw boundary. The authority census
 // still fails closed before draw realization; this companion only asks whether the subsequently
 // realized shader-resource tables name the pending result that forced that materialization. Keeping
@@ -267,8 +272,9 @@ private:
 // allocation. It remains diagnostic-only: authority was already materialized before this probe arms.
 //
 // One bounded epoch is retained. A second arm before submit end, a submit transition without an end,
-// or malformed draw-resource ordering invalidates the apparatus instead of silently discarding an
-// unfinished epoch. Draw ordinals are one-based within the armed epoch.
+// an invalid footprint, resource rows followed by an unrealized end, or malformed draw-resource
+// ordering invalidates the apparatus instead of silently discarding evidence. Overlap observations
+// remain provisional until the matching realized end. Draw ordinals are one-based within the epoch.
 enum class ShadowComputeAuthoritySubmitDrawProbeAction : uint8_t {
     Ignored,
     InvalidRange,
@@ -287,6 +293,8 @@ struct ShadowComputeAuthoritySubmitDrawProbeCounters {
     uint64_t invalid_ranges = 0;
     uint64_t unrelated_ranges = 0;
     uint64_t overlapping_ranges = 0;
+    uint64_t unrealized_resource_observations = 0;
+    uint64_t unrealized_overlapping_ranges = 0;
     uint64_t first_draw_overlapping_ranges = 0;
     uint64_t later_draw_overlapping_ranges = 0;
     uint64_t draws_completed = 0;
@@ -306,7 +314,9 @@ public:
 
     constexpr bool active() const { return active_; }
     constexpr bool apparatus_valid() const {
-        return counters_.superseded == 0 && counters_.interrupted == 0 && !active_;
+        return counters_.invalid_ranges == 0 &&
+               counters_.unrealized_resource_observations == 0 &&
+               counters_.superseded == 0 && counters_.interrupted == 0 && !active_;
     }
     constexpr uint64_t next_draw_ordinal() const {
         return active_ ? draws_in_epoch_ + 1 : 0;
@@ -339,6 +349,8 @@ public:
             return ShadowComputeAuthoritySubmitDrawProbeAction::Interrupted;
         counters_.resource_observations = shadow_compute_authority_increment(
             counters_.resource_observations);
+        current_draw_resource_observations_ = shadow_compute_authority_increment(
+            current_draw_resource_observations_);
         if (!resource_range.valid()) {
             counters_.invalid_ranges = shadow_compute_authority_increment(
                 counters_.invalid_ranges);
@@ -349,13 +361,8 @@ public:
                 counters_.unrelated_ranges);
             return ShadowComputeAuthoritySubmitDrawProbeAction::UnrelatedRange;
         }
-        saw_overlap_ = true;
-        counters_.overlapping_ranges = shadow_compute_authority_increment(
-            counters_.overlapping_ranges);
-        uint64_t& ordinal_counter = draws_in_epoch_ == 0
-            ? counters_.first_draw_overlapping_ranges
-            : counters_.later_draw_overlapping_ranges;
-        ordinal_counter = shadow_compute_authority_increment(ordinal_counter);
+        current_draw_overlapping_ranges_ = shadow_compute_authority_increment(
+            current_draw_overlapping_ranges_);
         return ShadowComputeAuthoritySubmitDrawProbeAction::OverlappingRange;
     }
 
@@ -367,6 +374,23 @@ public:
         if (observing_draw_ && current_draw_order_ != command_order) {
             interrupt();
             return ShadowComputeAuthoritySubmitDrawProbeAction::Interrupted;
+        }
+        if (realized) {
+            if (current_draw_overlapping_ranges_ != 0) saw_overlap_ = true;
+            counters_.overlapping_ranges = shadow_compute_authority_add(
+                counters_.overlapping_ranges, current_draw_overlapping_ranges_);
+            uint64_t& ordinal_counter = draws_in_epoch_ == 0
+                ? counters_.first_draw_overlapping_ranges
+                : counters_.later_draw_overlapping_ranges;
+            ordinal_counter = shadow_compute_authority_add(
+                ordinal_counter, current_draw_overlapping_ranges_);
+        } else {
+            counters_.unrealized_resource_observations = shadow_compute_authority_add(
+                counters_.unrealized_resource_observations,
+                current_draw_resource_observations_);
+            counters_.unrealized_overlapping_ranges = shadow_compute_authority_add(
+                counters_.unrealized_overlapping_ranges,
+                current_draw_overlapping_ranges_);
         }
         if (draws_in_epoch_ != 0)
             counters_.later_draws_completed = shadow_compute_authority_increment(
@@ -381,6 +405,8 @@ public:
         have_last_draw_ = true;
         observing_draw_ = false;
         current_draw_order_ = 0;
+        current_draw_resource_observations_ = 0;
+        current_draw_overlapping_ranges_ = 0;
         return ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted;
     }
 
@@ -426,6 +452,8 @@ private:
         current_draw_order_ = 0;
         last_draw_order_ = 0;
         draws_in_epoch_ = 0;
+        current_draw_resource_observations_ = 0;
+        current_draw_overlapping_ranges_ = 0;
         active_ = false;
         observing_draw_ = false;
         have_last_draw_ = false;
@@ -439,6 +467,8 @@ private:
     uint64_t current_draw_order_ = 0;
     uint64_t last_draw_order_ = 0;
     uint64_t draws_in_epoch_ = 0;
+    uint64_t current_draw_resource_observations_ = 0;
+    uint64_t current_draw_overlapping_ranges_ = 0;
     bool active_ = false;
     bool observing_draw_ = false;
     bool have_last_draw_ = false;

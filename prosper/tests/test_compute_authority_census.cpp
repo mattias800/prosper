@@ -293,8 +293,6 @@ int main() {
     const auto later_atlas_resource = submit_draw_probe.observe_resource(
         80, 1010, atlas_tail);
     const auto second_draw_done = submit_draw_probe.complete_draw(80, 1010, true);
-    const auto invalid_later_resource = submit_draw_probe.observe_resource(
-        80, 1020, ShadowComputeAuthorityRange::unknown());
     const auto third_draw_done = submit_draw_probe.complete_draw(80, 1020, false);
     const auto submit_draw_epoch_done = submit_draw_probe.end_submit(80);
     const auto& submit_draw_counts = submit_draw_probe.counters();
@@ -307,18 +305,18 @@ int main() {
                   ShadowComputeAuthoritySubmitDrawProbeAction::OverlappingRange &&
               second_draw_done ==
                   ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted &&
-              invalid_later_resource ==
-                  ShadowComputeAuthoritySubmitDrawProbeAction::InvalidRange &&
               third_draw_done ==
                   ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted &&
               submit_draw_epoch_done ==
                   ShadowComputeAuthoritySubmitDrawProbeAction::EpochCompleted &&
               submit_draw_probe.apparatus_valid() &&
               submit_draw_counts.armed == 1 &&
-              submit_draw_counts.resource_observations == 3 &&
-              submit_draw_counts.invalid_ranges == 1 &&
+              submit_draw_counts.resource_observations == 2 &&
+              submit_draw_counts.invalid_ranges == 0 &&
               submit_draw_counts.unrelated_ranges == 1 &&
               submit_draw_counts.overlapping_ranges == 1 &&
+              submit_draw_counts.unrealized_resource_observations == 0 &&
+              submit_draw_counts.unrealized_overlapping_ranges == 0 &&
               submit_draw_counts.first_draw_overlapping_ranges == 0 &&
               submit_draw_counts.later_draw_overlapping_ranges == 1 &&
               submit_draw_counts.draws_completed == 3 &&
@@ -330,10 +328,56 @@ int main() {
               submit_draw_counts.epochs_without_overlap == 0,
           "full-submit draw probe retains atlas through a later draw until submit end");
 
+    ShadowComputeAuthoritySubmitDrawProbe unrealized_overlap_probe;
+    unrealized_overlap_probe.arm(81, 1100, atlas);
+    const auto unrealized_overlap = unrealized_overlap_probe.observe_resource(
+        81, 1100, atlas_tail);
+    const auto unrealized_overlap_done = unrealized_overlap_probe.complete_draw(
+        81, 1100, false);
+    const auto unrealized_overlap_epoch = unrealized_overlap_probe.end_submit(81);
+    const auto& unrealized_overlap_counts = unrealized_overlap_probe.counters();
+    CHECK(unrealized_overlap ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::OverlappingRange &&
+              unrealized_overlap_done ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted &&
+              unrealized_overlap_epoch ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::EpochCompleted &&
+              !unrealized_overlap_probe.apparatus_valid() &&
+              unrealized_overlap_counts.resource_observations == 1 &&
+              unrealized_overlap_counts.overlapping_ranges == 0 &&
+              unrealized_overlap_counts.unrealized_resource_observations == 1 &&
+              unrealized_overlap_counts.unrealized_overlapping_ranges == 1 &&
+              unrealized_overlap_counts.first_draw_overlapping_ranges == 0 &&
+              unrealized_overlap_counts.later_draw_overlapping_ranges == 0 &&
+              unrealized_overlap_counts.epochs_with_overlap == 0 &&
+              unrealized_overlap_counts.epochs_without_overlap == 1,
+          "full-submit draw probe never promotes overlap from an unrealized draw");
+
+    ShadowComputeAuthoritySubmitDrawProbe invalid_submit_probe;
+    invalid_submit_probe.arm(82, 1200, atlas);
+    const auto invalid_submit_resource = invalid_submit_probe.observe_resource(
+        82, 1200, ShadowComputeAuthorityRange::unknown());
+    const auto invalid_submit_draw = invalid_submit_probe.complete_draw(82, 1200, true);
+    const auto invalid_submit_epoch = invalid_submit_probe.end_submit(82);
+    const auto& invalid_submit_counts = invalid_submit_probe.counters();
+    CHECK(invalid_submit_resource ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::InvalidRange &&
+              invalid_submit_draw ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted &&
+              invalid_submit_epoch ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::EpochCompleted &&
+              !invalid_submit_probe.apparatus_valid() &&
+              invalid_submit_counts.resource_observations == 1 &&
+              invalid_submit_counts.invalid_ranges == 1 &&
+              invalid_submit_counts.overlapping_ranges == 0 &&
+              invalid_submit_counts.epochs_with_overlap == 0 &&
+              invalid_submit_counts.epochs_without_overlap == 1,
+          "full-submit draw probe rejects an invalid resource footprint");
+
     ShadowComputeAuthoritySubmitDrawProbe superseded_submit_probe;
-    superseded_submit_probe.arm(81, 1100, atlas);
-    superseded_submit_probe.arm(81, 1110, atlas_tail);
-    (void)superseded_submit_probe.end_submit(81);
+    superseded_submit_probe.arm(83, 1300, atlas);
+    superseded_submit_probe.arm(83, 1310, atlas_tail);
+    (void)superseded_submit_probe.end_submit(83);
     CHECK(!superseded_submit_probe.apparatus_valid() &&
               superseded_submit_probe.counters().armed == 2 &&
               superseded_submit_probe.counters().superseded == 1 &&
@@ -341,8 +385,8 @@ int main() {
           "full-submit draw probe marks a superseded epoch apparatus-invalid");
 
     ShadowComputeAuthoritySubmitDrawProbe interrupted_submit_probe;
-    interrupted_submit_probe.arm(82, 1200, atlas);
-    interrupted_submit_probe.begin_submit(83);
+    interrupted_submit_probe.arm(84, 1400, atlas);
+    interrupted_submit_probe.begin_submit(85);
     CHECK(!interrupted_submit_probe.active() &&
               !interrupted_submit_probe.apparatus_valid() &&
               interrupted_submit_probe.counters().armed == 1 &&

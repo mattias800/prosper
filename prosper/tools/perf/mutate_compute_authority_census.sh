@@ -144,19 +144,22 @@ fi
 printf 'zero-authority-lever mutation: killed by: %s\n' "$expected"
 
 # The full-submit draw probe exists specifically because the first exact realized draw did not name
-# Syberia's hot atlas. Recreate the old probe's defect shape by closing the epoch after its first
-# draw; only the later-draw canary may kill it.
+# Syberia's hot atlas. Recreate the old probe's defect shape by dropping the retained range after
+# its first draw while leaving the epoch otherwise healthy; only the later-draw canary may kill it.
 cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
 cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"
 python3 - "$HEADER" <<'PY' || exit 1
 import sys
 
 path = sys.argv[1]
-old = """        return ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted;
+old = """        current_draw_overlapping_ranges_ = 0;
+        return ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted;
     }
 
     constexpr ShadowComputeAuthoritySubmitDrawProbeAction end_submit"""
-new = """        clear_epoch();
+new = """        current_draw_overlapping_ranges_ = 0;
+        if (draws_in_epoch_ == 1)
+            pending_range_ = ShadowComputeAuthorityRange::unknown();
         return ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted;
     }
 
@@ -190,6 +193,93 @@ if [ "$failed" != "$expected" ]; then
     exit 1
 fi
 printf 'later-draw retention mutation: killed by: %s\n' "$expected"
+
+# A resource row is provisional until DrawResourceEnd proves the draw realized. Recreate the review
+# defect by promoting a staged overlap from an unrealized draw into the epoch totals; only the exact
+# unrealized-overlap check may kill it.
+cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
+cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"
+python3 - "$HEADER" <<'PY' || exit 1
+import sys
+
+path = sys.argv[1]
+old = """        } else {
+            counters_.unrealized_resource_observations = shadow_compute_authority_add("""
+new = """        } else {
+            if (current_draw_overlapping_ranges_ != 0) saw_overlap_ = true;
+            counters_.overlapping_ranges = shadow_compute_authority_add(
+                counters_.overlapping_ranges, current_draw_overlapping_ranges_);
+            counters_.unrealized_resource_observations = shadow_compute_authority_add("""
+with open(path, encoding="utf-8") as stream:
+    source = stream.read()
+if source.count(old) != 1:
+    raise SystemExit(f"mutation anchor count is {source.count(old)}, expected exactly one")
+with open(path, "w", encoding="utf-8") as stream:
+    stream.write(source.replace(old, new, 1))
+PY
+
+if ! "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -I"$WORK" \
+    "$WORK/test_compute_authority_census.cpp" -o "$WORK/test-authority"
+then
+    echo "unrealized-overlap mutation: BUILD FAILED (mutation not observed)"
+    exit 1
+fi
+
+output=$("$WORK/test-authority" 2>&1)
+status=$?
+failed=$(printf '%s\n' "$output" | sed -n 's/^  FAIL //p')
+expected="full-submit draw probe never promotes overlap from an unrealized draw"
+if [ "$status" -eq 0 ]; then
+    echo "unrealized-overlap mutation: *** SURVIVED ***"
+    exit 1
+fi
+if [ "$failed" != "$expected" ]; then
+    printf 'unrealized-overlap mutation: WRONG KILL expected "%s", got: %s\n' \
+        "$expected" "$failed"
+    exit 1
+fi
+printf 'unrealized-overlap mutation: killed by: %s\n' "$expected"
+
+# An unknown resource range can conceal the selected atlas. Remove only that fail-closed validity
+# term; the exact invalid-footprint fixture must be the sole kill.
+cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
+cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"
+python3 - "$HEADER" <<'PY' || exit 1
+import sys
+
+path = sys.argv[1]
+old = """        return counters_.invalid_ranges == 0 &&
+               counters_.unrealized_resource_observations == 0 &&"""
+new = """        return counters_.unrealized_resource_observations == 0 &&"""
+with open(path, encoding="utf-8") as stream:
+    source = stream.read()
+if source.count(old) != 1:
+    raise SystemExit(f"mutation anchor count is {source.count(old)}, expected exactly one")
+with open(path, "w", encoding="utf-8") as stream:
+    stream.write(source.replace(old, new, 1))
+PY
+
+if ! "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -I"$WORK" \
+    "$WORK/test_compute_authority_census.cpp" -o "$WORK/test-authority"
+then
+    echo "invalid-footprint mutation: BUILD FAILED (mutation not observed)"
+    exit 1
+fi
+
+output=$("$WORK/test-authority" 2>&1)
+status=$?
+failed=$(printf '%s\n' "$output" | sed -n 's/^  FAIL //p')
+expected="full-submit draw probe rejects an invalid resource footprint"
+if [ "$status" -eq 0 ]; then
+    echo "invalid-footprint mutation: *** SURVIVED ***"
+    exit 1
+fi
+if [ "$failed" != "$expected" ]; then
+    printf 'invalid-footprint mutation: WRONG KILL expected "%s", got: %s\n' \
+        "$expected" "$failed"
+    exit 1
+fi
+printf 'invalid-footprint mutation: killed by: %s\n' "$expected"
 
 cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
 cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"

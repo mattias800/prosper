@@ -3685,7 +3685,8 @@ public:
                      "[compute-authority] summary submit-draw-probe armed=%llu "
                      "epochs=%llu with-overlap=%llu without-overlap=%llu "
                      "draws=%llu later-draws=%llu realized=%llu unrealized=%llu "
-                     "resources=%llu overlaps=%llu first-overlaps=%llu later-overlaps=%llu "
+                     "resources=%llu overlaps=%llu unrealized-resources=%llu "
+                     "unrealized-overlaps=%llu first-overlaps=%llu later-overlaps=%llu "
                      "unrelated=%llu invalid=%llu superseded=%llu interrupted=%llu "
                      "active=%u detail-lines=%llu\n",
                      static_cast<unsigned long long>(submit_draw_probe.armed),
@@ -3707,6 +3708,10 @@ public:
                          submit_draw_probe.resource_observations),
                      static_cast<unsigned long long>(
                          submit_draw_probe.overlapping_ranges),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.unrealized_resource_observations),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.unrealized_overlapping_ranges),
                      static_cast<unsigned long long>(
                          submit_draw_probe.first_draw_overlapping_ranges),
                      static_cast<unsigned long long>(
