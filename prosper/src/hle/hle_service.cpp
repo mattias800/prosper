@@ -873,6 +873,27 @@ uint64_t avp_synth_duration_ms() {
     return value ? strtoull(value, nullptr, 0) : avp_synth_frames() * 33;
 }
 bool avp_log() { static const bool enabled = getenv("PROSPER_AVPLOG") != nullptr; return enabled; }
+// PROSPER_AVP_PAUSED_DELIVER — a PRESERVED FALSIFICATION LEVER, NOT A FEATURE, AND NOT A FIX.
+// It MUST stay off by default; do not "enable" it and do not promote it into the paused contract.
+//
+// The shipped contract is the one below: while the guest holds a player paused, GetVideoData/Ex
+// deliver nothing. Turning this lever on makes them keep handing out already-decoded frames
+// instead. It exists only so the A/B that KILLED a hypothesis stays reproducible, exactly as
+// PROSPER_UD_TAIL_ALIGN does for the user-data-tail hypothesis (see CLAUDE.md).
+//
+// The dead hypothesis (#1599, Asterix & Obelix: Babylon Mission PPSA30490): "the title is stuck in
+// Unity's video splash because pause gates frame delivery." Measured, the lever is real but is not
+// the cause — it collapses the futile pull census from 14,546 calls to 14 and delivers two further
+// frames after the guest's seek, yet sceAvPlayerResume is still never called, all AvPlayer traffic
+// then stops, and the output stays uniformly black (max_rgb=0). The actual blocker is that
+// sceAvPlayerJumpToTime (NID XC9wM+xULz8) is unimplemented, so the dispatcher's default 0 is read
+// as a successful seek: #1949, and prosper/docs/ASTERIX_BABYLON_STATUS.md § Ruled out.
+//
+// Whoever implements #1949 will want to re-run this arm; that is the only reason it is here.
+bool avp_paused_deliver() {
+    static const bool enabled = getenv("PROSPER_AVP_PAUSED_DELIVER") != nullptr;  // default: false
+    return enabled;
+}
 
 #if defined(__linux__)
 // Linux import stubs swap the guest %fs to the host TCB before entering an HLE handler.  AvPlayer
@@ -1317,7 +1338,10 @@ HLE(s_avp_getvideodata) {
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0);
-        if (it == g_avp.end() || !it->second.playing || it->second.paused) return 0;
+        // Paused gates delivery. avp_paused_deliver() is the default-off #1599 falsification
+        // lever documented above, not a feature; it never changes a default run.
+        if (it == g_avp.end() || !it->second.playing ||
+            (it->second.paused && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
@@ -1364,7 +1388,10 @@ HLE(s_avp_getvideodataex) {
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0);
-        if (it == g_avp.end() || !it->second.playing || it->second.paused) return 0;
+        // Paused gates delivery. avp_paused_deliver() is the default-off #1599 falsification
+        // lever documented above, not a feature; it never changes a default run.
+        if (it == g_avp.end() || !it->second.playing ||
+            (it->second.paused && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
