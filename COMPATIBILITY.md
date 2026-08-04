@@ -52,7 +52,7 @@ Last updated: 2026-08-04
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | — | 🔬 CPU boot reaches initial AGC setup; no visual milestone | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | — | 🔬 CPU boot reaches media initialization; no visual milestone | [#1897](https://github.com/mattias800/prosper/issues/1897) |
-| *Beneath* | `PPSA27640` | — | 🔬 Initial compatibility run pending | [#1898](https://github.com/mattias800/prosper/issues/1898) |
+| *Beneath* | `PPSA27640` | Unity / IL2CPP | 🔬 Opening key art (rung 1); no title screen | [#1898](https://github.com/mattias800/prosper/issues/1898) |
 
 ## Screenshots and short descriptions
 
@@ -295,7 +295,9 @@ No verified compatibility run has been recorded yet. See the [tracker](https://g
 
 ## Beneath — `PPSA27640`
 
-No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1898).
+A Linux/RADV run renders full-colour opening key art (rung 1), but no title-screen or gameplay milestone is
+claimed. A later CPU-only, no-render baseline faults before its first draw or present. See the
+[tracker](https://github.com/mattias800/prosper/issues/1898).
 
 ## Reproducible routes
 
