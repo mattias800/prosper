@@ -891,8 +891,10 @@ int main() {
         Pm4Command authority_effect;
         authority_effect.kind = Pm4Command::Kind::WriteData;
         authority_effect.wd_addr = reinterpret_cast<uint64_t>(&authority_effect_target);
+        authority_effect.wd_declared_num = 1;
         authority_effect.wd_num = 1;
         authority_effect.wd_data = &authority_effect_value;
+        authority_effect.wd_valid = true;
         nonrender.ordered_memory_effects.emplace_back(authority_effect, 18);
         const std::filesystem::path path =
             prosper_test::test_scratch_dir() / "prosper_nonrender_submit_capture.prgcap";

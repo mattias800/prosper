@@ -6296,11 +6296,13 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                             exact = command.event_addr != 0;
                             break;
                         case Pm4Command::Kind::WriteData:
-                            notify_compute_authority_range(
-                                ComputeAuthorityBoundaryKind::OrderedMemoryEffect,
-                                submit_no, operation.command_order, command.wd_addr,
-                                static_cast<uint64_t>(command.wd_num) * 4u);
-                            exact = command.wd_addr != 0 && command.wd_num != 0;
+                            if (command.wd_valid) {
+                                notify_compute_authority_range(
+                                    ComputeAuthorityBoundaryKind::OrderedMemoryEffect,
+                                    submit_no, operation.command_order, command.wd_addr,
+                                    static_cast<uint64_t>(command.wd_num) * 4u);
+                                exact = command.wd_addr != 0 && command.wd_num != 0;
+                            }
                             break;
                         case Pm4Command::Kind::DmaData: {
                             // Selector byte 1 names the 64 KiB GDS offset domain, not guest VA.

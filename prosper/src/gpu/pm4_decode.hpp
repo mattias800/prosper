@@ -163,8 +163,10 @@ struct Pm4Command {
     // address_or_offset, data*, num_dwords, …) (Kyty GraphicsDcbWriteData, Graphics.cpp:2061). Packet
     // payload: [0]=dst, [1..2]=destination address (lo/hi), [3]=num_dwords, [4..]=inline data dwords.
     uint64_t wd_addr = 0;                // WriteData: destination address
-    uint32_t wd_num = 0;                 // WriteData: number of dwords to write
+    uint32_t wd_declared_num = 0;        // WriteData: payload's declared dword count
+    uint32_t wd_num = 0;                 // WriteData: bounded inline dwords actually available
     const uint32_t* wd_data = nullptr;   // WriteData: -> the inline data dwords within the packet
+    bool wd_valid = false;               // WriteData: packet carried every declared inline dword
 
     // Flip — laid out by hle_agc.cpp agc_dcb_set_flip per sceAgcDcbSetFlip(buf, video_out_handle,
     // display_buffer_index, flip_mode, flip_arg). Packet payload: [0]=videoout handle, [1]=display

@@ -231,6 +231,45 @@ private:
     bool state_dirty_ = true;
 };
 
+// Classification shared by the ordered WAIT_REG_MEM evaluator and its default-off GFXLOG
+// diagnostic. `Applied` means this exact effect can be overlaid without executing guest memory;
+// `Ambiguous` means the submit retains its existing fail-closed rejection. Keeping the reason
+// structured makes the instrument unit-testable instead of relying on an opaque live log string.
+enum class OrderedWaitEffectClass : uint8_t {
+    Disjoint,
+    ImmediateDma,
+    AddressDma,
+    FixedRelease32,
+    FixedRelease64,
+    InterruptOnlyRelease,
+    DynamicRelease,
+    WriteData,
+    WriteDataPartial,
+    WriteDataOversized,
+    WriteDataUnowned,
+    EventTimestamp,
+    OffsetOverlap,
+    AliasedOverlap,
+    Unsupported,
+};
+
+enum class OrderedWaitEffectOverlay : uint8_t { None, Applied, Ambiguous };
+
+struct OrderedWaitEffectDiagnostic {
+    OrderedWaitEffectClass effect_class = OrderedWaitEffectClass::Unsupported;
+    OrderedWaitEffectOverlay overlay = OrderedWaitEffectOverlay::Ambiguous;
+    uint64_t address = 0;
+    uint64_t bytes = 0;
+    uint64_t command_order = 0;
+    uint64_t value_before = 0;
+    uint64_t value_after = 0;
+};
+
+OrderedWaitEffectDiagnostic diagnose_ordered_wait_effect(
+    const GpuState::MemoryEffect& effect, uint64_t wait_address, uint64_t value_before);
+const char* ordered_wait_effect_class_name(OrderedWaitEffectClass effect_class);
+const char* ordered_wait_effect_overlay_name(OrderedWaitEffectOverlay overlay);
+
 // Execute one retained address-backed DMA_DATA operation at its ordered submit position.
 // Re-validates the destination and either the raw guest source or a bounded authoritative renderer
 // snapshot immediately before the byte copy, then notifies renderer caches. Returns whether the
