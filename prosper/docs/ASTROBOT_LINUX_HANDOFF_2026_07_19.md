@@ -621,10 +621,121 @@ This is live acceptance of the GDS M0 mechanism, not a full Astro visual or perf
 run enabled extremely verbose graphics diagnostics and produced an 878 MiB log, so no FPS figure from
 it is meaningful. Continue the wider title-screen/gameplay investigation independently.
 
+## DCC producer allocation reuse result (2026-08-04)
+
+PR #1900 made Astro's consumer reuse the producer's retained 4K storage image, but the producer then
+became the dominant compute frontier. A complete post-#1900 F8 window on exact master `61446754`
+localized the shift by stable SPIR-V identity: consumer `0x05975892ababe69f` fell from 30.35 to
+8.95 ms/dispatch, while producer `0xa5e27ec0def1a807` rose from 27.91 to 57.72 ms/dispatch. An exact
+producer-only phase/image arm then found that the shader and retile were unchanged: post-writeback
+cache work rose from 1.040 to 32.155 ms/dispatch because `replace_or_retain_image()` destroyed the
+consumer's exact cached image/result allocation and installed a new producer allocation every frame.
+See #1732 for the complete retained evidence chain.
+
+Commit `41b37177` replaces that allocation churn with a generic, fail-closed lease. A DCC-unsafe
+producer may reuse only an exact-key, unpinned cached image allocation. The lease immediately clears
+all source, graphics-export, and compute-transfer authority; it preserves snapshot capacity only as
+untrusted storage. `upload_skipped` remains false, so the complete guest seed is always uploaded. The
+dispatch may republish authority only after successful guest writeback and a final all-`0xff` scan of
+the writable DCC metadata plane. Missing, pinned, ambiguous/aliased, ineligible, and unresolved cases
+retain the existing transient replacement or guest-memory fallback.
+
+The focused production-backend controls were run in the required distrobox:
+
+```sh
+distrobox enter ps5ys -- bash -lc '
+  cd <WORKTREE>/build &&
+  ./test_game_compute &&
+  PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1 ./test_game_compute'
+
+distrobox enter ps5ys -- bash -lc '
+  cd <WORKTREE>/build && ./test_compute_timing_selector'
+
+python3 <REPO_ROOT>/prosper/tools/perf/test_compute_phase_report.py
+```
+
+The normal backend passed 315 assertions and the no-adaptive arm passed 301; the selector policy and
+offline report self-tests also passed. The defect-shaped image fixture changes the producer bytes and
+requires the consumer to observe every new byte, which proves allocation reuse did not suppress the
+mandatory upload. Independent monotonic witnesses require reuse to advance while replacement stays
+flat. A mutation disables exactly one otherwise-eligible reuse and must make the real replacement
+witness advance instead. Pinned-entry, replacement-capacity, and unresolved-final-DCC arms must leave
+both cache/export and producer-to-consumer transfer authority unpublished.
+
+The single authorized live acceptance used normal full-scale/every-submit `prosper-app`, its renderer,
+FFmpeg/VA-API, SDL audio and SDL controller backends, 540 real presents, and a 360-second hard cap. Its
+command shape was:
+
+```sh
+env -u PROSPER_RENDER_SCALE \
+    -u PROSPER_RENDER_EVERY \
+    -u PROSPER_RENDER_EVERY_FOR_MS \
+    -u PROSPER_NO_PERSISTENT_COMPUTE_IMAGE \
+    -u PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER \
+    -u PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION \
+  PROSPER_GUEST_FS=1 \
+  PROSPER_GUEST_ARGS=-force-gfx-direct \
+  PROSPER_RENDER=1 \
+  PROSPER_COMPUTE_TIMING_HASH=0xa5e27ec0def1a807 \
+  PROSPER_COMPUTE_PHASE_TIMING=1 \
+  PROSPER_COMPUTE_IMAGE_TIMING=1 \
+  PROSPER_COMPUTE_TRANSFER_PRODUCER_HASH=0xa5e27ec0def1a807 \
+  PROSPER_COMPUTE_TRANSFER_CONSUMER_HASH=0x05975892ababe69f \
+  timeout --signal=TERM --kill-after=10s 360s \
+    <WORKTREE>/build/prosper-app --dump <DUMP_ROOT>/PPSA21564-app0 --frames 540
+```
+
+The run reached `LevelDocument Loaded: worldmap [worldmap]`, exited rc 0 at 540/540 presents, and
+left corrected exact pre/post process censuses empty. The timing selector accepted, first-matched
+run-local code `0x50057b800`, and ended `seen=53443 matched=68 verdict=matched`. Both transfer hashes
+matched 68 times and reached 136 storage gates. Binding 65 reported
+`persistent=1 allocation-reused=1 upload-skipped=0 allocation_ms=0.000` on all 68 selected producer
+dispatches, while producer and consumer publication each remained authorized on all 136 storage
+results. There was no Vulkan device loss, worker fault, SIGFPE, timeout, or lingering process.
+
+The exact selected-producer result is:
+
+| phase | replacement baseline | allocation reuse | delta |
+|---|---:|---:|---:|
+| total | 60.451 ms | **27.667 ms** | -32.784 ms (-54.2%) |
+| setup | 17.938 ms | **13.265 ms** | -4.673 ms |
+| GPU dispatch | 3.112 ms | 3.697 ms | +0.585 ms |
+| writeback | 39.218 ms | **10.517 ms** | -28.701 ms |
+| retile/layout | 5.990 ms | 5.920 ms | -0.070 ms |
+| aggregate cache | 32.155 ms | **3.587 ms** | -28.568 ms (-88.8%) |
+| binding-65 cache only | 30.915 ms | **2.406 ms** | -28.509 ms (-92.2%) |
+
+This restores the producer essentially to its retained pre-#1900 cost of 26.081 ms. The final displayed
+interval was 3.7 fps versus 3.2 fps in the old selected arm, but that is context rather than a
+controlled whole-title FPS result: other compute/render work still dominates the world map. The run
+made no new visual-correctness claim, so no new screenshot was warranted. Retained title-derived
+evidence remains outside git under
+`<EVIDENCE_ROOT>/astro-1732-allocation-reuse-41b37177/`.
+
 ## Ruled out
 
 One line per falsified hypothesis, the evidence that killed it, and the issue/PR. Extend this rather
 than re-deriving a dead answer at full cost.
+
+- **"#1900's post-writeback DCC promotion makes the producer/consumer pair cheaper enough by itself
+  to improve world-map throughput."** False in the first comparable whole-workload F8 window after
+  merge. On exact master `61446754`, a normal native/default run reached `worldmap` before the
+  automatic trigger and retained a complete 5.02-second window (`pre=20 post=21 renderer=51
+  compute=1359`, zero dropped or unknown-identity records). The exact consumer fell from 30.35 to
+  8.95 ms/dispatch versus the retained pre-#1900 window, but the exact producer rose from 27.91 to
+  57.72 ms/dispatch. The pair therefore moved from 58.26 to 66.67 ms per cycle. This cross-revision
+  capture localized the frontier rather than proving a whole-build regression; do not continue
+  optimizing the old consumer or quote #1900 alone as a gameplay/FPS win. The exact producer arm and
+  allocation-reuse acceptance above close the mechanism question. See #1732.
+
+- **"The post-#1900 producer increase comes from slower shader execution or DCC retile."** False on
+  exact selected-producer arms. Before allocation reuse, GPU dispatch was 3.112 ms and retile was
+  5.990 ms, essentially their retained pre-#1900 values of 3.122 and 5.934 ms. The new cost was the
+  post-writeback cache leaf: 32.155 ms total and 30.915 ms on binding 65 alone. Reusing the exact
+  unpinned allocation at `41b37177` reduced those values to 3.587 and 2.406 ms while preserving a
+  forced upload on 68/68 dispatches; selected total fell from 60.451 to 27.667 ms. The mechanism
+  mutation restores replacement, and the ordinary shader/retile leaves do not move with it. See
+  #1732.
 
 - **"The 4K consumer keeps rebuilding a stable image because unrelated GPU-write notifications
   falsely invalidate its cache entry."** False on exact master `04c43b15` in the natural 720-present
