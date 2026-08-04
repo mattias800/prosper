@@ -36,9 +36,10 @@ struct MockUi : PlatformUi {
     void msgDialogClose() override { msg_closes++; msg_status = 0; }
 
     // ErrorDialog
-    int err_status = 2, err_opens = 0, err_closes = 0; uint64_t err_last_param = 0;
+    int err_status = 2, err_opens = 0, err_closes = 0, err_status_calls = 0;
+    uint64_t err_last_param = 0;
     bool errorDialogOpen(uint64_t param) override { err_opens++; err_last_param = param; err_status = 2; return true; }
-    int  errorDialogStatus() override { return err_status; }
+    int  errorDialogStatus() override { err_status_calls++; return err_status; }
     void errorDialogClose() override { err_closes++; err_status = 0; }
 
     // SaveDataDialog
@@ -136,11 +137,93 @@ int main() {
         set_platform_ui(nullptr);
         e_init(0,0,0,0,0,0); e_open(0,0,0,0,0,0);
         CHECK(e_status(0,0,0,0,0,0) == 3, "ErrorDialog headless: Open auto-dismisses to FINISHED");
+
+        // ErrorDialog is system-owned UI. Even an immediate headless dismissal must expose one
+        // independently observable background -> foreground pair through SystemServiceGetStatus.
+        HleFn sys_status = Hle::lookup(nid_hash("sceSystemServiceGetStatus"));
+        CHECK(sys_status, "SystemServiceGetStatus registered for ErrorDialog lifecycle");
+        if (sys_status) {
+            uint8_t service_status[12]{};
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 1,
+                  "headless ErrorDialog exposes a background sample");
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 0,
+                  "headless ErrorDialog exposes a foreground-return sample");
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 0,
+                  "headless ErrorDialog lifecycle is a bounded one-shot");
+        }
+
         set_platform_ui(&ui);
         e_init(0,0,0,0,0,0); e_open(0xBBBB,0,0,0,0,0);
         CHECK(ui.err_opens == 1 && ui.err_last_param == 0xBBBB, "ErrorDialog backend: Open forwards the param");
         CHECK(e_status(0,0,0,0,0,0) == 2, "ErrorDialog backend: status follows the frontend (RUNNING)");
+        if (sys_status) {
+            uint8_t service_status[12]{};
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 1,
+                  "backend ErrorDialog remains backgrounded while the frontend is RUNNING");
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 1,
+                  "backend ErrorDialog persists background across repeated RUNNING samples");
+            ui.err_status = 3;
+            CHECK(e_status(0,0,0,0,0,0) == 3,
+                  "ErrorDialog backend reports frontend completion");
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 0,
+                  "backend ErrorDialog exposes foreground return after completion");
+        }
         if (e_term) { e_term(0,0,0,0,0,0); CHECK(ui.err_closes == 1, "ErrorDialog backend: Term routes to errorDialogClose"); }
+
+        // An accepting PlatformUi is non-owning and may unregister or be replaced while its dialog
+        // remains open. Status/close must never call the stale owner or a replacement that did not
+        // accept this request; abandon safely to FINISHED and expose one bounded foreground return.
+        ui.err_status = 2;
+        set_platform_ui(&ui);
+        e_init(0,0,0,0,0,0); e_open(0xCCCC,0,0,0,0,0);
+        CHECK(ui.err_opens == 2, "ErrorDialog can open a second backend-owned request");
+        if (sys_status) {
+            uint8_t service_status[12]{};
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 1,
+                  "backend ErrorDialog enters background before owner replacement");
+            const int old_status_calls = ui.err_status_calls;
+            const int old_closes = ui.err_closes;
+            MockUi replacement;
+            set_platform_ui(nullptr);
+            set_platform_ui(&replacement);
+            CHECK(e_status(0,0,0,0,0,0) == 3 && ui.err_status_calls == old_status_calls &&
+                      replacement.err_status_calls == 0,
+                  "ErrorDialog safely abandons an unregistered owner without rerouting status");
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 0,
+                  "abandoned ErrorDialog exposes a bounded foreground return");
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 0,
+                  "abandoned ErrorDialog does not remain permanently backgrounded");
+            if (e_term) e_term(0,0,0,0,0,0);
+            CHECK(ui.err_closes == old_closes && replacement.err_closes == 0,
+                  "ErrorDialog Term never closes an unregistered or replacement backend");
+            set_platform_ui(nullptr);
+
+            // Exercise the close path independently: no preceding Status call may be required to
+            // clear ownership safely or publish the foreground-return edge.
+            set_platform_ui(&ui);
+            e_init(0,0,0,0,0,0); e_open(0xDDDD,0,0,0,0,0);
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            const int closes_before_direct_term = ui.err_closes;
+            MockUi close_replacement;
+            set_platform_ui(nullptr);
+            set_platform_ui(&close_replacement);
+            if (e_term) e_term(0,0,0,0,0,0);
+            CHECK(ui.err_closes == closes_before_direct_term && close_replacement.err_closes == 0,
+                  "ErrorDialog Term never reroutes close after direct owner replacement");
+            sys_status((uint64_t)(uintptr_t)service_status,0,0,0,0,0);
+            CHECK(service_status[5] == 0,
+                  "directly terminated abandoned ErrorDialog returns to foreground");
+            set_platform_ui(nullptr);
+        }
     }
 
     // --- SaveDataDialog: declined ownership keeps headless behavior; accepted ownership stays bound
