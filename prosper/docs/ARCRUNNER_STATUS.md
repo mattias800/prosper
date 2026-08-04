@@ -52,6 +52,16 @@ fault is the guest's first dereference of that descriptor, **before** Prosper re
 This excludes a silent null-Jump fallback as a legitimate fix. It does not yet say whether the
 retained item is stale/corrupted or structurally valid with only its side segment absent.
 
+One ordinary, unsuppressed rendered run on current master (`ce258440`) tried to recover those two
+objects with the existing generic fault-memory peek. It was **void for this question**: after about
+13 seconds the `AudioMixerRende` worker jumped to null first, so the process exited before reaching
+`eboot+0x117811f`. The peek fired correctly but sampled the audio function's unrelated stack layout;
+its `rbp-0xa8` and `rbp-0x70` values are not command-item evidence. Immediately beforehand the
+barrier diagnostic recorded one D-queue unsatisfied wait at fold time, with both D- and A-queue
+events in its retained history and the already-known DCB object `0x2420e48230`. Temporal adjacency
+does not attribute the null audio call to that wait. The run had exact zero pre/post process censuses
+and terminated naturally with worker-fault exit 90; no suppression or skip was armed.
+
 No screenshot belongs in the compatibility record yet. The latest content-selective capture
 retained exactly two non-alpha-only frames: frame 12 was a uniform solid-yellow clear and frame 50
 was a uniform solid-white clear. Full inspection found no geometry, text, or game imagery in either.
@@ -128,6 +138,7 @@ Do not re-derive these without contradictory new evidence.
 | A prosper GPU write targets the `0x3001600000` page the poison decodes to | `PROSPER_PROVENANCE_ADDR=0x3001600000:0x10000` reports zero overlapping writes across a full faulting run; `PROSPER_POOLSHIFT=1` is also 0. The page is an ordinary 64 KiB guest `sceKernelBatchMap` mapping, consecutive in the same series as the earlier-reported `0x30015f0000`. | #1226, #1754 |
 | The renderer's fold latency (the guest outrunning our deferred label writes) is causal | `PROSPER_RENDER=0` faults at the same site with the same value, about 6 seconds in instead of about 21 seconds. | #1226, #1754 |
 | Suppressing the forging fence — or both known label writes — fixes the underlying allocator corruption | The fence-only arm removes the terminal `0x30016000` and moves the fault to `0x2400100024001`, two pops farther along the same walk. The first combined run at `dfd89f3f` was **PROVISIONAL/VOID for causality**: its forge population was at least 64 but its only totals snapshot was candidate 1. After the terminal census was fixed and mutation-tested, the corrected arm at `fb3daaa4` independently reached `INIT-SUPPRESS #1024` and ended with the exact final line **`candidates=20 suppressed=20 landed=0`**. It presented frames 0–52, then faulted at the other already-known sibling site `eboot+0x117811f` with `r14=0` (`addr=(nil)`), not at the `0x30016000` pop. Thus removing both writes is not a title fix, but the valid arm settles its narrow necessity question: the specific terminal `0x2000000001 -> 0x30016000` chain does **not** survive when neither known write lands. It does not isolate init from fence, nor attribute the sibling fault, because all-mode deliberately drops live fences. Content-selective capture retained exactly two non-alpha-only images; both were inspected and are single-colour clears (frame 12 solid yellow, frame 50 solid white), with no game imagery. | #1226, #1754 |
+| The first current-master ordinary fault-memory arm proves the sibling absent or identifies its producer | The title exited first through an unrelated `AudioMixerRende` null jump. `eboot+0x117811f` was not reached, so the requested `rbp-0xa8` item and `rbp-0x70` page-header peeks sampled the wrong stack frame. The arm is **void/non-discriminating**, not a negative reproduction. A nearby D-queue unsatisfied wait is retained as co-occurring history only; it does not attribute the audio fault. | #1226 |
 
 ## Next discriminators
 
