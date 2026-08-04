@@ -81,7 +81,7 @@ shared-GPU policy, the instrument-not-the-subject list, and the dated current ha
 | *Dead Cells* `PPSA15552` | rung 6 — full-colour Prisoners' Quarters; `dead-cells-gameplay` guard | `docs/DEAD_CELLS_STATUS.md` |
 | *Blasphemous 2* `PPSA13579` | rung 6 — first playable room; `blasphemous2-gameplay` guard | `scripts/blasphemous2/README.md` |
 | *Alex Kidd in Miracle World DX* `PPSA02664` | rung 6 — resolved by #1578 (generic 4 KiB mip-tail tiling); `alexkidd-gameplay` guard | `docs/PPSA02664_BLACK_WORLD.md` (historical) |
-| *Blue Prince* `PPSA25009` | rung 5 — entrance hall matches the hardware reference; by-eye play-through still outstanding | `docs/BLUE_PRINCE_STATUS.md` |
+| *Blue Prince* `PPSA25009` | rung 6 — sustained Day One gameplay and the Mount Holly entrance hall; reviewed automatic gameplay snapshot guard (tracker #1808) | `docs/BLUE_PRINCE_STATUS.md` |
 | *Syberia: Remastered* `PPSA30140` | rung 3 — gameplay renders; menu 3D layer and gameplay composite degraded (#1619 / #1627) | `docs/SYBERIA_STATUS.md` |
 | *Dragon Quest VII Reimagined* `PPSA17942` (a.k.a. DOLL) | rung 2 — title, name entry, onboarding; composition defect and gameplay open | `docs/DRAGON_QUEST_STATUS.md` |
 | *Nikoderiko* `PPSA23760` | rung 2 — 3D world dropped; **blocked on #305**, not on the recompiler | `docs/NIKODERIKO_STATUS.md` |
