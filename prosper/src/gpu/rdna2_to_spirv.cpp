@@ -747,7 +747,7 @@ struct SpirvCompute {
         return result;
     }
     uint32_t subgroup_row_shr_dynamic(uint32_t value, uint32_t active,
-                                      uint32_t amount,
+                                      uint32_t amount, uint32_t event = 0,
                                       uint32_t* valid_lane = nullptr) {
         mark_subgroup_min16();
         const uint32_t lane = subgroup_local_id();
@@ -761,14 +761,22 @@ struct SpirvCompute {
         const uint32_t shifted = subgroup_shuffle(value, source_lane);
         const uint32_t source_active = subgroup_shuffle(
             sel(active, uconst(1), uconst(0)), source_lane);
-        const uint32_t valid = land(in_bounds,
+        uint32_t valid = land(in_bounds,
             ucmp(Op_INotEqual, source_active, uconst(0)));
+        // A lane-local graphics dispatcher can have adjacent lanes parked at distinct static DPP
+        // instructions in the same common phase.  Shuffling only ACTIVE would let one instruction
+        // consume a neighbour published by another instruction.  Carry the static event tag through
+        // the identical shuffle and require it to match the destination lane's event.
+        if (event) {
+            const uint32_t source_event = subgroup_shuffle(event, source_lane);
+            valid = land(valid, ucmp(Op_IEqual, source_event, event));
+        }
         if (valid_lane) *valid_lane = valid;
         return sel(valid, shifted, value);
     }
     uint32_t subgroup_row_shr(uint32_t value, uint32_t active, uint32_t amount,
                               uint32_t* valid_lane = nullptr) {
-        return subgroup_row_shr_dynamic(value, active, uconst(amount), valid_lane);
+        return subgroup_row_shr_dynamic(value, active, uconst(amount), 0, valid_lane);
     }
     uint32_t subgroup_quad_permute(uint32_t value, uint32_t ctrl) {
         const uint32_t lane = subgroup_local_id();
@@ -11502,6 +11510,7 @@ bool emit_cfg_state_machine(
     bool has_lds_append = false;
     std::unordered_set<uint32_t> swizzle_pcs;
     std::unordered_set<uint32_t> fragment_dpp_min_row_shr_pcs;
+    std::unordered_map<uint32_t, uint32_t> fragment_dpp_min_event_for_pc;
     std::set<int> fragment_dpp_min_row_shr_dsts;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& in = ins[i];
@@ -11531,6 +11540,8 @@ bool emit_cfg_state_machine(
         }
         if (fragment_dpp_min_row_shr(in)) {
             fragment_dpp_min_row_shr_pcs.insert(in.pc);
+            fragment_dpp_min_event_for_pc.emplace(
+                in.pc, static_cast<uint32_t>(fragment_dpp_min_event_for_pc.size() + 1));
             fragment_dpp_min_row_shr_dsts.insert(in.dst.value);
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
@@ -12117,6 +12128,29 @@ bool emit_cfg_state_machine(
         }
     }
 
+    // Fragment scalar PCs are lane-local in the dispatcher.  A saved-mask pair comparison must
+    // nevertheless vote over every lane in the guest wave, including lanes currently executing a
+    // different switch case.  Give every proven static comparison an identity and retain its exact
+    // operands/polarity for the uniform common-phase votes emitted below.
+    struct SavedMaskPairCompareEvent {
+        int first = -1;
+        int second = -1;
+        uint32_t opcode = 0;
+    };
+    std::unordered_map<uint32_t, uint32_t> saved_mask_pair_event_for_pc;
+    std::vector<SavedMaskPairCompareEvent> saved_mask_pair_events;
+    if (b.is_fragment) {
+        for (const auto& in : ins) {
+            if (in.is_end) break;
+            if (!proven_saved_mask_pair_compare_pcs.contains(in.pc)) continue;
+            const auto sources = saved_mask_pair_compare_sources(in);
+            if (sources[0] < 0) continue;
+            saved_mask_pair_events.push_back({sources[0], sources[1], in.opcode});
+            saved_mask_pair_event_for_pc.emplace(
+                in.pc, static_cast<uint32_t>(saved_mask_pair_events.size()));
+        }
+    }
+
     std::vector<std::unordered_set<int>> scalar_may_write_in(starts.size());
     std::vector<bool> scalar_reachable(starts.size(), false);
     if (!scalar_may_write_in.empty()) {
@@ -12321,6 +12355,11 @@ bool emit_cfg_state_machine(
     const uint32_t swizzle_source_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t swizzle_source_lane_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t swizzle_dst_var = b.function_var(b.t_u32, ptr_u32);
+    const bool has_saved_mask_pair_events = !saved_mask_pair_events.empty();
+    const uint32_t saved_mask_pair_pending_var = has_saved_mask_pair_events
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t saved_mask_pair_event_var = has_saved_mask_pair_events
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
     const bool has_dpp_min_row_shr = !fragment_dpp_min_row_shr_pcs.empty();
     const uint32_t dpp_min_pending_var = has_dpp_min_row_shr
         ? b.function_var(b.t_bool, ptr_bool) : 0;
@@ -12331,6 +12370,8 @@ bool emit_cfg_state_machine(
     const uint32_t dpp_min_amount_var = has_dpp_min_row_shr
         ? b.function_var(b.t_u32, ptr_u32) : 0;
     const uint32_t dpp_min_dst_var = has_dpp_min_row_shr
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t dpp_min_event_var = has_dpp_min_row_shr
         ? b.function_var(b.t_u32, ptr_u32) : 0;
 
     const uint32_t zero = b.uconst(0), no = b.bfalse(), yes = b.btrue();
@@ -12379,10 +12420,13 @@ bool emit_cfg_state_machine(
     b.store_function(swizzle_source_var, zero);
     b.store_function(swizzle_source_lane_var, zero);
     b.store_function(swizzle_dst_var, zero);
+    if (has_saved_mask_pair_events)
+        b.store_function(saved_mask_pair_event_var, zero);
     if (has_dpp_min_row_shr) {
         b.store_function(dpp_min_source_var, zero);
         b.store_function(dpp_min_amount_var, zero);
         b.store_function(dpp_min_dst_var, zero);
+        b.store_function(dpp_min_event_var, zero);
     }
 
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
@@ -12533,9 +12577,14 @@ bool emit_cfg_state_machine(
     }
     b.store_function(swizzle_pending_var, no);
     b.store_function(swizzle_active_var, no);
+    if (has_saved_mask_pair_events) {
+        b.store_function(saved_mask_pair_pending_var, no);
+        b.store_function(saved_mask_pair_event_var, zero);
+    }
     if (has_dpp_min_row_shr) {
         b.store_function(dpp_min_pending_var, no);
         b.store_function(dpp_min_active_var, no);
+        b.store_function(dpp_min_event_var, zero);
     }
     b.emit_loopmerge(loop_merge, loop_continue);
     b.emit_branch(switch_header);
@@ -12833,6 +12882,9 @@ bool emit_cfg_state_machine(
         if (dpp_min_row_shr) {
             if (!fragment_dpp_min_row_shr(*dpp_min_row_shr))
                 return reject_cfg(dpp_min_row_shr->pc, "dpp-min-row-shr-contract");
+            const auto event = fragment_dpp_min_event_for_pc.find(dpp_min_row_shr->pc);
+            if (event == fragment_dpp_min_event_for_pc.end())
+                return reject_cfg(dpp_min_row_shr->pc, "dpp-min-row-shr-event");
             const auto source = state.vreg.find(dpp_min_row_shr->src[0].value);
             b.store_function(dpp_min_pending_var, yes);
             b.store_function(dpp_min_active_var, state.exec);
@@ -12842,6 +12894,7 @@ bool emit_cfg_state_machine(
                 b.uconst(static_cast<uint32_t>(dpp_min_row_shr->dpp_ctrl - 0x110u)));
             b.store_function(dpp_min_dst_var,
                 b.uconst(static_cast<uint32_t>(dpp_min_row_shr->dst.value)));
+            b.store_function(dpp_min_event_var, b.uconst(event->second));
         }
         if (mask_compare) {
             if (b.is_vertex) {
@@ -12895,30 +12948,38 @@ bool emit_cfg_state_machine(
             }
         }
         if (saved_mask_pair_compare) {
-            const auto sources =
-                saved_mask_pair_compare_sources(*saved_mask_pair_compare);
-            const auto first = state.sreg_bool.find(sources[0]);
-            const auto second = state.sreg_bool.find(sources[1]);
-            if (first == state.sreg_bool.end() || second == state.sreg_bool.end())
-                return reject_cfg(saved_mask_pair_compare->pc,
-                                  "missing-saved-mask-pair-compare-source");
-            const uint32_t mismatch = b.bsel(
-                first->second, b.logical_not(second->second), second->second);
-            if (b.native_subgroup_size || b.is_fragment) {
-                const uint32_t different = b.is_fragment
-                    ? b.fragment_wave_any(mismatch)
-                    : b.native_wave_any(mismatch);
-                if (!different)
+            if (b.is_fragment) {
+                const auto event =
+                    saved_mask_pair_event_for_pc.find(saved_mask_pair_compare->pc);
+                if (event == saved_mask_pair_event_for_pc.end())
                     return reject_cfg(saved_mask_pair_compare->pc,
-                                      "saved-mask-pair-vote");
-                state.scc = saved_mask_pair_compare->opcode == 0x12
-                    ? b.logical_not(different) : different;
+                                      "saved-mask-pair-event");
+                b.store_function(saved_mask_pair_pending_var, yes);
+                b.store_function(saved_mask_pair_event_var, b.uconst(event->second));
             } else {
-                b.store_function(vote_pending_var, yes);
-                b.store_function(vote_value_var, mismatch);
-                b.store_function(vote_invert_var,
-                    saved_mask_pair_compare->opcode == 0x12 ? yes : no);
-                b.store_function(vote_to_scc_var, yes);
+                const auto sources =
+                    saved_mask_pair_compare_sources(*saved_mask_pair_compare);
+                const auto first = state.sreg_bool.find(sources[0]);
+                const auto second = state.sreg_bool.find(sources[1]);
+                if (first == state.sreg_bool.end() || second == state.sreg_bool.end())
+                    return reject_cfg(saved_mask_pair_compare->pc,
+                                      "missing-saved-mask-pair-compare-source");
+                const uint32_t mismatch = b.bsel(
+                    first->second, b.logical_not(second->second), second->second);
+                if (b.native_subgroup_size) {
+                    const uint32_t different = b.native_wave_any(mismatch);
+                    if (!different)
+                        return reject_cfg(saved_mask_pair_compare->pc,
+                                          "saved-mask-pair-vote");
+                    state.scc = saved_mask_pair_compare->opcode == 0x12
+                        ? b.logical_not(different) : different;
+                } else {
+                    b.store_function(vote_pending_var, yes);
+                    b.store_function(vote_value_var, mismatch);
+                    b.store_function(vote_invert_var,
+                        saved_mask_pair_compare->opcode == 0x12 ? yes : no);
+                    b.store_function(vote_to_scc_var, yes);
+                }
             }
         }
         if (vopc_mask_compare) {
@@ -13147,8 +13208,42 @@ bool emit_cfg_state_machine(
         }
     }
 
+    // Fragment saved-mask pair comparisons execute their subgroup votes here, outside the
+    // lane-divergent dispatcher switch.  Every invocation evaluates every static event from the
+    // persistent mask register file, so a mismatch bit remains visible even when that lane is
+    // currently parked at another guest PC.  The publishing lane's event tag selects the exact
+    // operand pair and EQ/LG polarity whose result updates its SCC.
+    if (has_saved_mask_pair_events) {
+        const uint32_t pending =
+            b.load_function(b.t_bool, saved_mask_pair_pending_var);
+        const uint32_t event =
+            b.load_function(b.t_u32, saved_mask_pair_event_var);
+        for (size_t index = 0; index < saved_mask_pair_events.size(); ++index) {
+            const auto& compare = saved_mask_pair_events[index];
+            const auto first_var = mv.find(compare.first);
+            const auto second_var = mv.find(compare.second);
+            if (first_var == mv.end() || second_var == mv.end())
+                return reject_cfg(0, "missing-saved-mask-pair-common-source");
+            const uint32_t first = b.load_function(b.t_bool, first_var->second);
+            const uint32_t second = b.load_function(b.t_bool, second_var->second);
+            const uint32_t mismatch = b.bsel(
+                first, b.logical_not(second), second);
+            const uint32_t different = b.fragment_wave_any(mismatch);
+            if (!different) return reject_cfg(0, "saved-mask-pair-common-vote");
+            const uint32_t result = compare.opcode == 0x12
+                ? b.logical_not(different) : different;
+            const uint32_t selected = b.land(
+                pending,
+                b.ucmp(Op_IEqual, event,
+                       b.uconst(static_cast<uint32_t>(index + 1))));
+            const uint32_t old = b.load_function(b.t_bool, scc_var);
+            b.store_function(scc_var, b.bsel(selected, result, old));
+        }
+    }
+
     // Fragment DPP V_MIN_U32 common phase. A graphics dispatcher's PC is lane-local, so a source
-    // lane is eligible only when it published this same DPP event and its EXEC bit is active. The
+    // lane is eligible only when it published this same static DPP event and its EXEC bit is active.
+    // The source's event tag is shuffled beside its value and compared with the destination tag. The
     // unbounded ROW_SHR contract disables out-of-row/inactive-source lanes and preserves VDST;
     // active destination lanes reduce the shifted neighbor with their unchanged local value.
     if (!fragment_dpp_min_row_shr_pcs.empty()) {
@@ -13158,7 +13253,8 @@ bool emit_cfg_state_machine(
         uint32_t valid_source = 0;
         const uint32_t shifted = b.subgroup_row_shr_dynamic(
             source, b.land(pending, active),
-            b.load_function(b.t_u32, dpp_min_amount_var), &valid_source);
+            b.load_function(b.t_u32, dpp_min_amount_var),
+            b.load_function(b.t_u32, dpp_min_event_var), &valid_source);
         const uint32_t result = b.uext2(Glsl_UMin, shifted, source);
         const uint32_t write = b.land(b.land(pending, active), valid_source);
         const uint32_t dst = b.load_function(b.t_u32, dpp_min_dst_var);
