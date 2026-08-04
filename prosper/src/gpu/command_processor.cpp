@@ -1815,6 +1815,15 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         // while remaining deterministic if an unusual packet overlaps its endpoints.
         const uint8_t* copy_src = authoritative_source ? authoritative_source
                                                        : (const uint8_t*)(uintptr_t)c.dd_src;
+        // The value trap is provenance for the payload this command stored.  Snapshot its bounded
+        // prefix before an overlap-capable copy: after memmove (including hidden physical-alias
+        // overlap), copy_src may already name bytes overwritten by the destination.  Publication
+        // still happens only after the complete store succeeds below.
+        std::vector<uint8_t> write_trap_payload;
+        if (write_trap_armed()) {
+            const size_t trap_bytes = std::min<size_t>(c.dd_bytes, 4096);
+            write_trap_payload.assign(copy_src, copy_src + trap_bytes);
+        }
         // Different writable guest VAs can still overlap in the same physical direct backing.
         // std::memmove sees only the virtual ranges and cannot choose the physical copy direction,
         // so route that exact topology through the backing-aware helper as well.
@@ -1834,9 +1843,9 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         // #1226 value trap: bound the scan — a copy DMA can move megabytes and this is diagnostic.
         // `pre` is 0 because bulk destination pre-content is not meaningful. As above, scan only
         // after the complete virtual or physical write has succeeded.
-        if (write_trap_armed())
-            write_trap_scan("DMA-copy", c.dd_dst, 0, copy_src,
-                            c.dd_bytes > 4096 ? 4096 : c.dd_bytes, packet_addr);
+        if (!write_trap_payload.empty())
+            write_trap_scan("DMA-copy", c.dd_dst, 0, write_trap_payload.data(),
+                            write_trap_payload.size(), packet_addr);
         if (getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc]   DmaData copy [0x%llx] <- [0x%llx] (%u bytes)\n",
                     (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes);

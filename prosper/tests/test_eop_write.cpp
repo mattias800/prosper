@@ -762,10 +762,19 @@ int main() {
             auto* writable_overlap_alias = (uint8_t*)(uintptr_t)(second_view + 0x1000);
             constexpr size_t writable_overlap_bytes = 0x8000;
             std::vector<uint8_t> writable_expected(writable_overlap_bytes + 4);
-            auto run_writable_overlap = [&](size_t source_offset, size_t destination_offset) {
+            auto run_writable_overlap = [&](size_t source_offset, size_t destination_offset,
+                                            bool include_trap_marker) {
                 for (size_t i = 0; i < writable_expected.size(); ++i)
                     writable_overlap_source[i] = writable_expected[i] =
                         (uint8_t)(i * 37u + 11u);
+                if (include_trap_marker) {
+                    constexpr uint32_t trap_marker = 0x5a5a0001u;
+                    constexpr size_t trap_offset = 4092;
+                    memcpy(writable_overlap_source + source_offset + trap_offset, &trap_marker,
+                           sizeof trap_marker);
+                    memcpy(writable_expected.data() + source_offset + trap_offset, &trap_marker,
+                           sizeof trap_marker);
+                }
                 memmove(writable_expected.data() + destination_offset,
                         writable_expected.data() + source_offset, writable_overlap_bytes);
                 uint32_t dma[7] = {};
@@ -784,10 +793,13 @@ int main() {
             };
             const uint64_t backing_writes_before =
                 prosper::guest_memory_gpu_write_successes_for_test();
-            const bool destructive_forward = run_writable_overlap(0, 4);
-            const bool destructive_backward = run_writable_overlap(4, 0);
+            const uint64_t overlap_trap_before = prosper_gpu_write_trap_matches();
+            const bool destructive_forward = run_writable_overlap(0, 4, true);
+            const bool destructive_backward = run_writable_overlap(4, 0, false);
             CHECK(destructive_forward && destructive_backward,
                   "GPU DMA preserves both memmove directions across writable physical aliases");
+            CHECK(prosper_gpu_write_trap_matches() == overlap_trap_before + 1,
+                  "overlapping DMA reports the bounded pre-copy payload after a successful store");
             CHECK(prosper::guest_memory_gpu_write_successes_for_test() ==
                       backing_writes_before + 2,
                   "writable physical aliases prove both copies used the backing-aware path");
