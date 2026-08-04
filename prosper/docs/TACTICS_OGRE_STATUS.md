@@ -82,8 +82,11 @@ The movie begins after the static startup logos. Do not use `PROSPER_RENDER_SCAL
 - A defect-shaped mutation that removes direct-backing eligibility makes the protected direct-memory
   copy/fill checks and the backing-path witness fail while the private and cross-boundary rejection
   checks remain green.
+- The exact-code 470-second fresh-save route produced all 94 requested source-distinct samples and 82
+  pixel-distinct samples, rendered both HEVC movies, and ended at an interactive move command in the
+  first tutorial battle. It logged no ordered-submit rejection or invalid DMA row.
 - The valid live run logged successful protected-backing DMA copy ordinals from `#1` through at least
-  `#2048`, with no invalid DMA row, and the direct frames changed continuously through the movie.
+  `#4096`, and the direct movie frames changed continuously.
 
 ## Ruled out
 
