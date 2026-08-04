@@ -3448,6 +3448,7 @@ public:
             shadow_compute_authority_increment(
                 boundary_counts_[static_cast<size_t>(boundary.kind)]);
         if (boundary.kind == BoundaryKind::SubmitBegin) {
+            submit_draw_probe_.begin_submit(boundary.submit_no);
             census_.begin_submit(boundary.submit_no);
             return;
         }
@@ -3480,10 +3481,40 @@ public:
                                  static_cast<unsigned long long>(range.bytes));
                 }
             }
+            const uint64_t draw_ordinal = submit_draw_probe_.next_draw_ordinal();
+            const ShadowComputeAuthoritySubmitDrawProbeAction submit_action =
+                submit_draw_probe_.observe_resource(
+                    boundary.submit_no, boundary.command_order, range);
+            if (submit_action ==
+                    ShadowComputeAuthoritySubmitDrawProbeAction::OverlappingRange) {
+                submit_draw_probe_overlap_events_ = shadow_compute_authority_increment(
+                    submit_draw_probe_overlap_events_);
+                if (submit_draw_probe_overlap_events_ <= 16 ||
+                    (submit_draw_probe_overlap_events_ &
+                     (submit_draw_probe_overlap_events_ - 1)) == 0) {
+                    submit_draw_probe_overlap_detail_lines_ =
+                        shadow_compute_authority_increment(
+                            submit_draw_probe_overlap_detail_lines_);
+                    std::fprintf(stderr,
+                                 "[compute-authority] submit-draw-resource-overlap n=%llu "
+                                 "submit=%llu draw-ordinal=%llu order=%llu binding=%u class=%u "
+                                 "range=0x%llx+%llu\n",
+                                 static_cast<unsigned long long>(
+                                     submit_draw_probe_overlap_events_),
+                                 static_cast<unsigned long long>(boundary.submit_no),
+                                 static_cast<unsigned long long>(draw_ordinal),
+                                 static_cast<unsigned long long>(boundary.command_order),
+                                 boundary.binding, boundary.resource_class,
+                                 static_cast<unsigned long long>(range.address),
+                                 static_cast<unsigned long long>(range.bytes));
+                }
+            }
             return;
         }
         if (boundary.kind == BoundaryKind::DrawResourceEnd) {
             (void)draw_probe_.complete(
+                boundary.submit_no, boundary.command_order, boundary.draw_realized);
+            (void)submit_draw_probe_.complete_draw(
                 boundary.submit_no, boundary.command_order, boundary.draw_realized);
             return;
         }
@@ -3498,6 +3529,11 @@ public:
                     transition.reason ==
                         ShadowComputeAuthorityReason::UnknownConsumerRange)
                     draw_probe_.arm(
+                        boundary.submit_no, boundary.command_order, pending_range);
+                if (transition.pending_before &&
+                    transition.reason ==
+                        ShadowComputeAuthorityReason::UnknownConsumerRange)
+                    submit_draw_probe_.arm(
                         boundary.submit_no, boundary.command_order, pending_range);
                 break;
             }
@@ -3514,6 +3550,7 @@ public:
                     ShadowComputeAuthorityConsumerKind::Capture);
                 break;
             case BoundaryKind::SubmitEnd:
+                (void)submit_draw_probe_.end_submit(boundary.submit_no);
                 transition = census_.end_submit();
                 break;
             case BoundaryKind::Compute:
@@ -3546,6 +3583,8 @@ public:
             c.retained_storage_outputs == 0 || a.admitted_results == 0
                 ? "INVALID-zero-authority-lever" :
             census_.active_submit() ? "INVALID-unfinished-submit" :
+            !submit_draw_probe_.apparatus_valid()
+                ? "INVALID-full-submit-draw-probe" :
             !c.apparatus_valid ? "INVALID-apparatus" :
             c.pending_after_submit_end != 0 ? "INVALID-pending-after-submit" : "matched";
         std::fprintf(stderr,
@@ -3640,6 +3679,49 @@ public:
                      draw_probe_.active() ? 1u : 0u,
                      static_cast<unsigned long long>(
                          draw_probe_overlap_detail_lines_));
+        const ShadowComputeAuthoritySubmitDrawProbeCounters& submit_draw_probe =
+            submit_draw_probe_.counters();
+        std::fprintf(stderr,
+                     "[compute-authority] summary submit-draw-probe armed=%llu "
+                     "epochs=%llu with-overlap=%llu without-overlap=%llu "
+                     "draws=%llu later-draws=%llu realized=%llu unrealized=%llu "
+                     "resources=%llu overlaps=%llu first-overlaps=%llu later-overlaps=%llu "
+                     "unrelated=%llu invalid=%llu superseded=%llu interrupted=%llu "
+                     "active=%u detail-lines=%llu\n",
+                     static_cast<unsigned long long>(submit_draw_probe.armed),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.epochs_completed),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.epochs_with_overlap),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.epochs_without_overlap),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.draws_completed),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.later_draws_completed),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.realized_draws),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.unrealized_draws),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.resource_observations),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.overlapping_ranges),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.first_draw_overlapping_ranges),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.later_draw_overlapping_ranges),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.unrelated_ranges),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.invalid_ranges),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.superseded),
+                     static_cast<unsigned long long>(
+                         submit_draw_probe.interrupted),
+                     submit_draw_probe_.active() ? 1u : 0u,
+                     static_cast<unsigned long long>(
+                         submit_draw_probe_overlap_detail_lines_));
         std::fprintf(stderr,
                      "[compute-authority] summary image-sources selected-events=%llu "
                      "aliases=%llu direct-borrow=%llu owner-borrow=%llu "
@@ -3744,10 +3826,13 @@ private:
                    prosper::gpu::ComputeAuthorityBoundaryKind::Compute) + 1>
         boundary_counts_{};
     ShadowComputeAuthorityDrawProbe draw_probe_;
+    ShadowComputeAuthoritySubmitDrawProbe submit_draw_probe_;
     ComputeAuthorityImageSourceCounters image_sources_{};
     uint64_t detail_events_ = 0;
     uint64_t draw_probe_overlap_events_ = 0;
     uint64_t draw_probe_overlap_detail_lines_ = 0;
+    uint64_t submit_draw_probe_overlap_events_ = 0;
+    uint64_t submit_draw_probe_overlap_detail_lines_ = 0;
     uint64_t image_source_detail_lines_ = 0;
     bool submit_mismatch_reported_ = false;
     std::mutex mutex_;

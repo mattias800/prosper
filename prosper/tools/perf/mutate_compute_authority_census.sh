@@ -143,6 +143,54 @@ if [ "$failed" != "$expected" ]; then
 fi
 printf 'zero-authority-lever mutation: killed by: %s\n' "$expected"
 
+# The full-submit draw probe exists specifically because the first exact realized draw did not name
+# Syberia's hot atlas. Recreate the old probe's defect shape by closing the epoch after its first
+# draw; only the later-draw canary may kill it.
+cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
+cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"
+python3 - "$HEADER" <<'PY' || exit 1
+import sys
+
+path = sys.argv[1]
+old = """        return ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted;
+    }
+
+    constexpr ShadowComputeAuthoritySubmitDrawProbeAction end_submit"""
+new = """        clear_epoch();
+        return ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted;
+    }
+
+    constexpr ShadowComputeAuthoritySubmitDrawProbeAction end_submit"""
+with open(path, encoding="utf-8") as stream:
+    source = stream.read()
+if source.count(old) != 1:
+    raise SystemExit(f"mutation anchor count is {source.count(old)}, expected exactly one")
+with open(path, "w", encoding="utf-8") as stream:
+    stream.write(source.replace(old, new, 1))
+PY
+
+if ! "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -I"$WORK" \
+    "$WORK/test_compute_authority_census.cpp" -o "$WORK/test-authority"
+then
+    echo "later-draw retention mutation: BUILD FAILED (mutation not observed)"
+    exit 1
+fi
+
+output=$("$WORK/test-authority" 2>&1)
+status=$?
+failed=$(printf '%s\n' "$output" | sed -n 's/^  FAIL //p')
+expected="full-submit draw probe retains atlas through a later draw until submit end"
+if [ "$status" -eq 0 ]; then
+    echo "later-draw retention mutation: *** SURVIVED ***"
+    exit 1
+fi
+if [ "$failed" != "$expected" ]; then
+    printf 'later-draw retention mutation: WRONG KILL expected "%s", got: %s\n' \
+        "$expected" "$failed"
+    exit 1
+fi
+printf 'later-draw retention mutation: killed by: %s\n' "$expected"
+
 cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
 cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"
 if "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -I"$WORK" \

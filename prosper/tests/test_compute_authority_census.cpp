@@ -283,6 +283,73 @@ int main() {
               draw_probe.counters().unrealized == 1,
           "draw probe distinguishes no-overlap evidence from an unrealized draw");
 
+    ShadowComputeAuthoritySubmitDrawProbe submit_draw_probe;
+    submit_draw_probe.arm(80, 1000, atlas);
+    const uint64_t first_draw_ordinal = submit_draw_probe.next_draw_ordinal();
+    const auto first_draw_resource = submit_draw_probe.observe_resource(
+        80, 1000, unrelated);
+    const auto first_draw_done = submit_draw_probe.complete_draw(80, 1000, true);
+    const uint64_t second_draw_ordinal = submit_draw_probe.next_draw_ordinal();
+    const auto later_atlas_resource = submit_draw_probe.observe_resource(
+        80, 1010, atlas_tail);
+    const auto second_draw_done = submit_draw_probe.complete_draw(80, 1010, true);
+    const auto invalid_later_resource = submit_draw_probe.observe_resource(
+        80, 1020, ShadowComputeAuthorityRange::unknown());
+    const auto third_draw_done = submit_draw_probe.complete_draw(80, 1020, false);
+    const auto submit_draw_epoch_done = submit_draw_probe.end_submit(80);
+    const auto& submit_draw_counts = submit_draw_probe.counters();
+    CHECK(first_draw_ordinal == 1 && second_draw_ordinal == 2 &&
+              first_draw_resource ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::UnrelatedRange &&
+              first_draw_done ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted &&
+              later_atlas_resource ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::OverlappingRange &&
+              second_draw_done ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted &&
+              invalid_later_resource ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::InvalidRange &&
+              third_draw_done ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted &&
+              submit_draw_epoch_done ==
+                  ShadowComputeAuthoritySubmitDrawProbeAction::EpochCompleted &&
+              submit_draw_probe.apparatus_valid() &&
+              submit_draw_counts.armed == 1 &&
+              submit_draw_counts.resource_observations == 3 &&
+              submit_draw_counts.invalid_ranges == 1 &&
+              submit_draw_counts.unrelated_ranges == 1 &&
+              submit_draw_counts.overlapping_ranges == 1 &&
+              submit_draw_counts.first_draw_overlapping_ranges == 0 &&
+              submit_draw_counts.later_draw_overlapping_ranges == 1 &&
+              submit_draw_counts.draws_completed == 3 &&
+              submit_draw_counts.realized_draws == 2 &&
+              submit_draw_counts.unrealized_draws == 1 &&
+              submit_draw_counts.later_draws_completed == 2 &&
+              submit_draw_counts.epochs_completed == 1 &&
+              submit_draw_counts.epochs_with_overlap == 1 &&
+              submit_draw_counts.epochs_without_overlap == 0,
+          "full-submit draw probe retains atlas through a later draw until submit end");
+
+    ShadowComputeAuthoritySubmitDrawProbe superseded_submit_probe;
+    superseded_submit_probe.arm(81, 1100, atlas);
+    superseded_submit_probe.arm(81, 1110, atlas_tail);
+    (void)superseded_submit_probe.end_submit(81);
+    CHECK(!superseded_submit_probe.apparatus_valid() &&
+              superseded_submit_probe.counters().armed == 2 &&
+              superseded_submit_probe.counters().superseded == 1 &&
+              superseded_submit_probe.counters().epochs_completed == 1,
+          "full-submit draw probe marks a superseded epoch apparatus-invalid");
+
+    ShadowComputeAuthoritySubmitDrawProbe interrupted_submit_probe;
+    interrupted_submit_probe.arm(82, 1200, atlas);
+    interrupted_submit_probe.begin_submit(83);
+    CHECK(!interrupted_submit_probe.active() &&
+              !interrupted_submit_probe.apparatus_valid() &&
+              interrupted_submit_probe.counters().armed == 1 &&
+              interrupted_submit_probe.counters().interrupted == 1 &&
+              interrupted_submit_probe.counters().epochs_completed == 0,
+          "full-submit draw probe marks an interrupted epoch apparatus-invalid");
+
     ShadowComputeAuthorityCensus unbounded_gpu;
     (void)unbounded_gpu.note_retained_result(atlas);
     const auto unknown_gpu_range = unbounded_gpu.observe(
