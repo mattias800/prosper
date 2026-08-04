@@ -16,9 +16,47 @@ log, while this document is the map that helps the next orchestrator find and in
 
 - Repository: `mattias800/prosper` (renamed from `mattias800/ps5ys`).
 - Remote branch: `master`.
-- Exact master at this update: `ede320b6` (2026-07-31 session; eleven merges).
-- Active title lanes: Astro Bot, Dragon Quest VII, The Plucky Squire, Alex Kidd, and The Pathless.
+- Exact master at this update: `9dcb6c4b` (2026-08-04; ~210 commits after `6414f402`).
+- **Game dumps now live in `<REPO_ROOT>/testdata/<TITLE_ID>-app0`** (gitignored). Briefs and commands
+  that still say `<DUMP_ROOT>/…` mean this path. All 39 tracked titles have a dump present, and every
+  dump has a tracker — the sets match exactly, so there is no unexplored title.
+- Active title lanes (2026-08-04 wave 1): **The Oregon Trail, Sonic Origins, R-Type Delta, Asterix &
+  Obelix Babylon Mission, ArcRunner** — every title currently at rung 0.
 - GPU state: sharing is the default; see the scheduling rules below.
+
+### The standing objective, in the user's words
+
+**Rung 0 titles first, then title screens. Breadth beats depth: "progress on many titles is more
+important than progress in a few."** The user also asked explicitly *not* to spend heavily on Astro
+Bot unless it yields real progress — it is a 149 GB AAA showcase that has produced no shippable title
+fix across several sessions. Every new visible checkpoint gets an **unmodified frontend screenshot**
+committed under `assets/screenshots/` and referenced from **both** the game tracker issue and
+`COMPATIBILITY.md`; the user asks for this specifically.
+
+### Where the library actually stands (2026-08-04)
+
+Read the per-title rung off the `tracker:game` issues, not off this table — it is a snapshot. Of 39
+tracked titles:
+
+| Rung | Count | Meaning |
+|---|---|---|
+| 6 | 13 | snapshot-guarded; "done" |
+| 4 | 1 | human-verified |
+| 3 | 5 | gameplay with real GPU draws |
+| 2 | 9 | title screen |
+| 1 | 6 | some real graphics, no title screen |
+| 0 | 5 | no graphics at all |
+
+So 28 of 39 are at a title screen or better. The eleven titles at rung 0 and rung 1 are the current
+work queue, in that order.
+
+### Doc-staleness warning
+
+The `Lane A` … `Lane F` sections below are the **2026-07-31** allocation and are now partly historical:
+Alex Kidd (Lane D) reached rung 6, The Pathless (Lane E) reached rung 2, and Nikoderiko (Lane F)
+reached rung 2. Their falsification records remain valuable and binding — read them before reviving
+any hypothesis they killed — but do not read their "Public state" or "next assignment" text as
+current. Verify against the title's `tracker:game` issue.
 
 **Read the falsification record before planning anything.** The three lanes handed over on `81a9548e` each had
 their assigned premise **falsified** during the 2026-07-31 session, including both items the previous handoff
@@ -1506,14 +1544,43 @@ into a default fix or claim rung 3 from this diagnostic hardening.
 
 ## Suggested allocation for a new orchestrator
 
-| Agent | First bounded task | GPU |
-|---|---|---|
-| Astro Bot | Take a **fresh current-format** capture, then attribute the frame-wide `cwm=0` from the raw colour-state triple | One bounded capture |
-| Dragon Quest VII | Measure `s97`/`s106` with two `--dump-resource` runs; decide PreExposure versus op103 execution | Two ~2 s runs |
-| The Plucky Squire | Live route: confirm `0x3017460000` executes; identify the next skipped stage | ~10 min routed run |
-| Alex Kidd | Land the snapshot guard; re-check #710 against the tiling fix | Snapshot verify |
-| The Pathless | `.prgtl` survey of all ~6,150 submits for the real composite; then the packed-FP16 export path | CPU first |
-| Orchestrator | Review diffs, sequence GPU, publish/merge, keep this document current | Coordinates leases |
+**Superseded by the 2026-08-04 wave structure below.** The table that used to sit here allocated
+agents to Astro Bot, Dragon Quest VII, The Plucky Squire, Alex Kidd and The Pathless; three of those
+titles have since advanced and the allocation is kept only in git history.
+
+### Wave 1 (dispatched 2026-08-04, base `9dcb6c4b`) — every rung-0 title
+
+One title per agent, each mandated to reach **rung 1 (any real graphics from the live renderer; a
+logo counts, black or diagnostic-only output does not)** *or* return a precise evidence-backed
+diagnosis of the next blocker. Explicitly bounded: a sharp diagnosis handed back beats a sixth
+session of depth.
+
+| Agent | Title | Frontier at dispatch | Tracker / blocker |
+|---|---|---|---|
+| oregon-r1 | The Oregon Trail (PPSA19244, UE4) | guest issues no base pass; prosper decodes 100% of what it submits | #1886 / #1606 |
+| sonicorigins-r1 | Sonic Origins (PPSA05325) | black startup loop after real UI/font asset loads | #1871 / #1905 |
+| rtype-r1 | R-Type Delta (PPSA26414) | startup race dereferences an empty logged-in-user vector; movie-texture shader emits flat gradients | #1810 / #1746, #1753 |
+| babylon-r1 | Asterix & Obelix Babylon (PPSA30490, Unity 6) | sampled 2D-MSAA resolve executes, output still black | #1884 / #1599 |
+| arcrunner-r1 | ArcRunner (PPSA21406, UE4 4.27) | real GPU submissions, then the render thread faults | #1817 / #1226 |
+
+### Wave 2 (queued) — every rung-1 title, target rung 2 (title screen)
+
+The Forgotten City (PPSA03026, #1890), Sonic Racing: CrossWorlds (PPSA08804, #1895), Sonic Frontiers
+(PPSA03831, #1891), Little Nightmares III (PPSA05143, #1893), Crisis Core Reunion (PPSA07809, #1894),
+Bendy and the Dark Revival (PPSA27624, #1897).
+
+### Cross-lane serialization, which is the orchestrator's real job here
+
+Wave 1 runs five concurrent lanes and **three of the five titles are UE4** (Oregon Trail, ArcRunner,
+R-Type Delta). Title-specific route and doc work proceeds freely, but every lane is required to
+report a change touching **shared code — loader, HLE, recompiler, generic GPU/AGC, host mapping —
+to the orchestrator BEFORE pushing**, naming the files. The orchestrator reviews the diff, sequences
+the merges, and rebases the other lanes. Expect the durable wins to come from exactly those shared
+changes: they help titles beyond the lane that found them.
+
+One cheap win deliberately deferred: **Earthion (PPSA28061) is a 79 MB dump already at rung 2** and
+its only stated blocker is that the menu needs directional navigation to route into gameplay. It is
+the best value-per-token item on the board once the rung-0 and rung-1 queues are served.
 
 **Balance breadth against depth.** Astro Bot is a AAA showcase title and has produced no shippable title fix
 across two sessions; Dragon Quest and Plucky are deep but tractable. Alex Kidd went from stuck to gameplay in one
