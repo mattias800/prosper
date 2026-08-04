@@ -432,6 +432,14 @@ overlong lines; non-stdout streams and descriptors are ignored. The one match di
 adapter that contributed to the line. Do not use a substring or a program address as a substitute for a
 real phase marker. Persistent color/depth targets must remain enabled so the bundle can seed the frame
 boundary it is intended to preserve.
+If present counts vary and the title emits no honest guest-stdout marker, use the headless F9 control:
+set `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE=/path/capture.ready` together with
+`PROSPER_CAPTURE_BUNDLE=/path/frame.prgbundle`, keep the trigger absent at process start, and create it
+only after a lightweight screenshot proves the target phase. The trigger remains as a durable lever
+witness and fires once. Automatic trigger-file, fixed-present, and exact-guest-log gates are mutually
+exclusive; configuring more than one disables every configured gate so one arm's completion cannot be
+mistaken for another. Require the trigger-observed log, `[grab] frame-bundle written`, and a nonzero
+bundle; a trigger file or screenshot by itself is not a completed capture.
 `PROSPER_SUBMITLOG_DIM=WxH` prints the exact renderer invocation for any submit targeting that Gen5
 surface extent, even while `PROSPER_RENDER_FIRST` skips Vulkan work. Use it to start a later render
 window on a one-time offscreen producer rather than after the producer has already been lost.
