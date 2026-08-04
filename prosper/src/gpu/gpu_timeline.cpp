@@ -1935,6 +1935,32 @@ bool interactive_capture_bundle_active() {
 }
 
 namespace {
+constexpr const char* kAutomaticCaptureBundleGates[] = {
+    "PROSPER_CAPTURE_BUNDLE_AT_PRESENT",
+    "PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG",
+    "PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE",
+};
+
+bool automatic_capture_bundle_gate_conflicts(const char* selected_gate) {
+    uint32_t configured = 0;
+    for (const char* gate : kAutomaticCaptureBundleGates) {
+        const char* value = std::getenv(gate);
+        if (value && *value) ++configured;
+    }
+    if (configured <= 1) return false;
+
+    std::fprintf(stderr,
+                 "[grab] %s disabled: automatic whole-frame capture gates are mutually "
+                 "exclusive; configured gates:",
+                 selected_gate);
+    for (const char* gate : kAutomaticCaptureBundleGates) {
+        const char* value = std::getenv(gate);
+        if (value && *value) std::fprintf(stderr, " %s", gate);
+    }
+    std::fputc('\n', stderr);
+    return true;
+}
+
 struct GuestLogCaptureBundleState {
     bool enabled = false;
     std::string marker;
@@ -1950,6 +1976,9 @@ struct GuestLogCaptureBundleState {
     GuestLogCaptureBundleState() {
         const char* marker_env = std::getenv("PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG");
         if (!marker_env || !*marker_env) return;
+        if (automatic_capture_bundle_gate_conflicts(
+                "PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG"))
+            return;
         const char* path_env = std::getenv("PROSPER_CAPTURE_BUNDLE");
         if (!path_env || !*path_env) {
             std::fprintf(stderr,
@@ -2068,6 +2097,71 @@ void observe_guest_log_capture_gap() {
     state.line_sources = 0;
     state.discard_line = true;
     state.suppress_lf_after_cr = false;
+}
+
+namespace {
+struct CaptureBundleTriggerFileState {
+    bool enabled = false;
+    std::string trigger_path;
+    std::string bundle_path;
+    uint32_t max_mb = 0;
+    std::atomic<bool> fired{false};
+
+    CaptureBundleTriggerFileState() {
+        const char* trigger_env = std::getenv("PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE");
+        if (!trigger_env || !*trigger_env) return;
+        if (automatic_capture_bundle_gate_conflicts(
+                "PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE"))
+            return;
+        const char* bundle_env = std::getenv("PROSPER_CAPTURE_BUNDLE");
+        if (!bundle_env || !*bundle_env) {
+            std::fprintf(stderr,
+                         "[grab] PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE requires "
+                         "PROSPER_CAPTURE_BUNDLE\n");
+            return;
+        }
+        trigger_path = trigger_env;
+        bundle_path = bundle_env;
+        if (const char* limit = std::getenv("PROSPER_CAPTURE_BUNDLE_MAX_MB")) {
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long parsed = std::strtoul(limit, &end, 0);
+            if (!errno && end != limit && end && !*end && parsed <= UINT32_MAX)
+                max_mb = static_cast<uint32_t>(parsed);
+        }
+        enabled = true;
+    }
+};
+
+CaptureBundleTriggerFileState& capture_bundle_trigger_file_state() {
+    static CaptureBundleTriggerFileState state;
+    return state;
+}
+
+void capture_bundle_trigger_file_on_present(uint64_t present_count) {
+    CaptureBundleTriggerFileState& state = capture_bundle_trigger_file_state();
+    if (!state.enabled || state.fired.load(std::memory_order_acquire)) return;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(state.trigger_path, ec) || ec) return;
+    if (state.fired.exchange(true, std::memory_order_acq_rel)) return;
+
+    const std::string replaced =
+        request_interactive_capture_bundle(state.bundle_path, state.max_mb);
+    std::fprintf(stderr,
+                 "[grab] trigger file observed at present %llu; whole-frame capture armed; "
+                 "trigger path %s; target path %s\n",
+                 static_cast<unsigned long long>(present_count), state.trigger_path.c_str(),
+                 state.bundle_path.c_str());
+    if (!replaced.empty())
+        std::fprintf(stderr,
+                     "[grab] this arm replaced an armed capture that had not started; it will never "
+                     "report: %s\n", replaced.c_str());
+}
+} // namespace
+
+bool capture_bundle_trigger_file_enabled() {
+    const CaptureBundleTriggerFileState& state = capture_bundle_trigger_file_state();
+    return state.enabled && !state.fired.load(std::memory_order_acquire);
 }
 
 // Called per submit: when a frame grab is in progress, append this submit's realized state to the bundle.
@@ -2801,6 +2895,11 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
 
 void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64_t flip_arg,
                                  uint32_t width, uint32_t height) {
+    // A remote controller can create this file only after a lightweight screenshot proves the title
+    // is in the desired phase. Polling stays entirely absent from normal runs; when configured, the
+    // file and this log line independently prove the lever moved before the existing F9 state machine
+    // captures the following complete frame.
+    capture_bundle_trigger_file_on_present(present_count);
     // Headless/automated equivalent of prosper-app's F9 grab. A known present checkpoint can arm the
     // same complete-frame bundle without an SDL window or synthetic key event, which is essential for
     // long scripted bring-up routes. This retains F9's exact boundary semantics: the matching present
@@ -2817,6 +2916,9 @@ void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64
         const char* path = std::getenv("PROSPER_CAPTURE_BUNDLE");
         const char* at = std::getenv("PROSPER_CAPTURE_BUNDLE_AT_PRESENT");
         if (path && *path && at && *at) {
+            if (automatic_capture_bundle_gate_conflicts(
+                    "PROSPER_CAPTURE_BUNDLE_AT_PRESENT"))
+                return config;
             char* end = nullptr;
             errno = 0;
             const uint64_t wanted = std::strtoull(at, &end, 0);

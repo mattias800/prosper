@@ -31,6 +31,17 @@ does not accept substrings; CR, LF, and CRLF differ only as line terminators. Fr
 `printf`, `puts`, `putchar`, `fputs`, `fwrite`, or fd writes is observed, and the match diagnostic names the
 contributing adapter(s). Non-stdout output is ignored. Keep persistent targets enabled.
 
+When neither a fixed present nor guest stdout is phase-stable, set
+`PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE=/path/capture.ready` with
+`PROSPER_CAPTURE_BUNDLE=/path/frame.prgbundle`. Keep the trigger path absent at startup, watch
+lightweight screenshots, then create a regular file there only after one proves the desired phase. The
+next present observes that durable witness and arms the same complete-frame capture as F9. The trigger
+file remains in place and can arm only once per process. Do not combine it with
+`PROSPER_CAPTURE_BUNDLE_AT_PRESENT` or `PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG`: automatic gates are
+mutually exclusive and all configured gates fail closed on a conflict. Treat the arm as valid only when
+the log names the trigger and target, and treat the capture as complete only after
+`[grab] frame-bundle written` and a nonzero bundle.
+
 Normal capture preflights merged resource ranges and rejects plans above 512 MiB before allocating.
 `PROSPER_GPU_CAPTURE_MAX_MB=1..3072` overrides that bound. If descriptor metadata is the evidence you
 need, `PROSPER_GPU_CAPTURE_METADATA_ONLY=1` writes a thin capsule with shaders, operations, pipeline

@@ -330,4 +330,13 @@ void observe_guest_log_for_capture(
 // line ending so an unobserved suffix can cause only a missed match, never a false exact-line match.
 void observe_guest_log_capture_gap();
 
+// Optional headless/remote equivalent of pressing F9. When
+// PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE names a regular file and PROSPER_CAPTURE_BUNDLE names the
+// output, the first present that observes the trigger file arms the existing one-frame bundle.
+// The trigger file is deliberately not removed: its continued existence is a durable witness that
+// the external controller moved its lever, while the one-shot state prevents a second arm.
+// Automatic trigger-file, fixed-present, and guest-log gates are mutually exclusive and fail closed
+// when more than one is configured, so one gate's completion cannot be attributed to another arm.
+bool capture_bundle_trigger_file_enabled();
+
 } // namespace prosper::gpu

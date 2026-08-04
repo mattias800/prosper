@@ -898,6 +898,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_log_capture PRIVATE prosper_core)
   add_test(NAME guest_log_capture COMMAND test_guest_log_capture)
 
+  # Remote/headless F9 equivalent: an external regular-file witness arms the existing seeded
+  # whole-frame capture on the next present. Pure/cross-platform; no game dump or Vulkan device.
+  add_executable(test_capture_trigger_file tests/test_capture_trigger_file.cpp)
+  target_link_libraries(test_capture_trigger_file PRIVATE prosper_core)
+  add_test(NAME capture_trigger_file COMMAND test_capture_trigger_file)
+
   # gpu_replay output dimensions follow the selected draw/prefix target when its byte count agrees.
   # Pure/cross-platform so focused replay tooling remains available in CI.
   add_executable(test_gpu_replay_extent tests/test_gpu_replay_extent.cpp)
