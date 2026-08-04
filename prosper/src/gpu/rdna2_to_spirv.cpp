@@ -49,7 +49,7 @@ enum : uint32_t {
     Op_ImageSampleDrefImplicitLod=89, Op_ImageSampleDrefExplicitLod=90,
     Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
     Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103, Op_ImageQuerySize=104,
-    Op_ImageQueryLevels=106,
+    Op_ImageQueryLod=105, Op_ImageQueryLevels=106,
     Op_TypeArray=28, Op_ControlBarrier=224, Op_AtomicExchange=229, Op_AtomicIAdd=234,
     Op_AtomicISub=235,
     Op_AtomicSMin=236, Op_AtomicUMin=237, Op_AtomicSMax=238, Op_AtomicUMax=239,
@@ -1427,6 +1427,23 @@ struct SpirvCompute {
         }
         uint32_t levels = id(); put(code, Op_ImageQueryLevels, {t_i32, levels, img});
         out[3] = i2u(levels);
+    }
+    // image_get_lod: return the sampler-clamped and raw implicit LOD for a hypothetical 2D sample.
+    // SPIR-V defines OpImageQueryLod's x/y results in the same order as RDNA2's VDATA[0]/[1], so the
+    // two raw FP32 values can be copied directly to the guest VGPRs. Like the hardware instruction,
+    // this consumes screen-space derivatives and is therefore fragment-only.
+    void image_get_lod_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t out[2]) {
+        if (!declared_image_query) { put(caps, Op_Capability, {Cap_ImageQuery}); declared_image_query = true; }
+        const uint32_t simg = tex_binding_simg[binding];
+        uint32_t si = id(); put(code, Op_Load, {simg, si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct,
+                                   {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t lod = id(); put(code, Op_ImageQueryLod, {t_v2f(), lod, si, coord});
+        for (uint32_t component = 0; component < 2; ++component) {
+            uint32_t value = id();
+            put(code, Op_CompositeExtract, {t_f32, value, lod, component});
+            out[component] = bcu(value);
+        }
     }
     // 2-component uint vector (integer texel coordinates for OpImageFetch).
     uint32_t t_v2u_cache = 0;
@@ -9568,6 +9585,34 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
 
+            // IMAGE_GET_LOD (0x60): RDNA2 returns {sampler-clamped LOD, raw LOD}; SPIR-V's
+            // OpImageQueryLod returns the same pair. House of the Dead 2's Unity scene shaders use
+            // the ordinary non-NSA 2D form in fragment programs. Keep every unverified dimension,
+            // flag, address shape, and output component fail-visible rather than guessing.
+            if (in.opcode == 0x60) {
+                if (!b.is_fragment || res->cls != ResourceClass::Texture ||
+                    in.mimg_dim != SQ_DIM_2D || res->img_dim != SQ_DIM_2D ||
+                    in.len_dwords != 2u || in.mimg_unorm || in.mimg_glc || in.has_modifier ||
+                    !(in.mimg_dmask & 0x3u) || (in.mimg_dmask & ~0x3u) ||
+                    res->unnormalized || res->depth_compare ||
+                    !b.declare_texture(res->binding, Dim_2D, uint_texture)) {
+                    ok = false;
+                    return true;
+                }
+                uint32_t out[2];
+                b.image_get_lod_2d(res->binding, vread(in.src[0].value),
+                                   vread(in.src[0].value + 1), out);
+                int vd = in.dst.value, written = 0;
+                for (uint32_t component = 0; component < 2; ++component) {
+                    if (!(in.mimg_dmask & (1u << component))) continue;
+                    const uint32_t old = vreg_old(b, rs, vd + written);
+                    rs.vreg[vd + written] = out[component];
+                    predicate_write(b, rs, vd + written, old);
+                    ++written;
+                }
+                return true;
+            }
+
             // --- Sampled-texture path: image_sample* (0x20/0x24/0x25/0x27) / image_gather4_lz (0x47) /
             // image_load (0x00). 2D (any LOD variant) or 3D (implicit-LOD or LOD-0 sample); NSA allowed
             // (coords gathered below). image_sample = 0x20 (implicit-LOD), image_sample_l = 0x24
@@ -14909,6 +14954,10 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                         return i.mimg_dim == 1u && i.mimg_dmask == 1u &&
                                !i.mimg_unorm && i.len_dwords == 2u;
                     if (i.opcode == 0x0eu) return i.mimg_dim <= 2u;             // image_get_resinfo 1D/2D/3D
+                    if (i.opcode == 0x60u)                                     // fragment image_get_lod 2D
+                        return i.mimg_dim == 1u && i.len_dwords == 2u &&
+                               !i.mimg_unorm && !i.mimg_glc && !i.has_modifier &&
+                               (i.mimg_dmask & 0x3u) && !(i.mimg_dmask & ~0x3u);
                     // sample*: 2D (NSA ok); plus implicit-LOD image_sample (0x20) / LOD-0 image_sample_lz
                     // (0x27) from a 3D texture; sample_b (0x25) and gather4_lz (0x47) are 2D. 2D_ARRAY (dim 5)
                     // is accepted for all sample paths and handled as its base 2D slice (array index dropped,

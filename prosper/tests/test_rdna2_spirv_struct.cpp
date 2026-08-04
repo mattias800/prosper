@@ -2512,7 +2512,8 @@ int main() {
     // image_sample there must lower to OpImageSampleExplicitLod (LOD 0) or spirv-val rejects the
     // module and pipeline creation fails.
     enum : uint32_t { OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88,
-                      OpImageQuerySizeLod = 103, OpImageQueryLevels = 106 };
+                      OpImageQuerySizeLod = 103, OpImageQueryLod = 105,
+                      OpImageQueryLevels = 106 };
     ShaderResourceTable rt_tex;
     { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 1; /*2D*/
       t.width = 2; t.height = 2; t.sgpr_base = 8; rt_tex.resources.push_back(t); }
@@ -2554,6 +2555,37 @@ int main() {
         return 1;
     }
     printf("  [ok]   fragment image_sample still uses OpImageSampleImplicitLod\n");
+
+    // House of the Dead 2's Unity scene shaders use IMAGE_GET_LOD on ordinary 2D textures before
+    // their explicit-LOD samples. The exact instruction returns clamped/raw LOD in the selected
+    // VDATA channels. A constant replacement would hide the rejected opcode while choosing the
+    // wrong mip, so require the real derivative-consuming SPIR-V image query. SPIR-V permits that
+    // query only in a fragment stage; the same bytes must remain fail-visible in compute.
+    ShaderResourceTable rt_get_lod;
+    { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 1;
+      t.width = 1024; t.height = 1024; t.sgpr_base = 32; t.sampler_sgpr_base = 40;
+      rt_get_lod.resources.push_back(t); }
+    const uint32_t ps_get_lod[] = {
+        // Exact pc-99 words from House's 663-dword failing fragment family (f67b86713089788d).
+        0xf1800108u, 0x01480809u,           // image_get_lod v8, v[9:10], s[32:39], s[40:43], dmask:x, dim:2D
+        0xf800000fu, 0x0b0a0908u,           // exp mrt0 v8,v9,v10,v11
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> get_lod_spv = recompile_fragment(
+        ps_get_lod, std::size(ps_get_lod), &rt_get_lod);
+    if (get_lod_spv.empty() || !has_opcode(get_lod_spv, OpImageQueryLod)) {
+        printf("  [FAIL] fragment IMAGE_GET_LOD did not lower to OpImageQueryLod\n");
+        return 1;
+    }
+    const uint32_t cs_get_lod[] = {
+        ps_get_lod[0], ps_get_lod[1],
+        0xbf810000u,
+    };
+    if (!recompile_valu(cs_get_lod, std::size(cs_get_lod), 0, 0, &rt_get_lod).empty()) {
+        printf("  [FAIL] compute-shell IMAGE_GET_LOD bypassed the fragment-only derivative contract\n");
+        return 1;
+    }
+    printf("  [ok]   fragment IMAGE_GET_LOD lowers to a real fragment-only image LOD query\n");
 
     // UE4/DOLL volume initialization starts by querying a 3D T# with image_get_resinfo, then uses the
     // xyz result for its dispatch bounds. This was the sole rejected opcode in that captured kernel.

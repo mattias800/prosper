@@ -845,6 +845,16 @@ int main() {
     CHECK(f.unsupported == 0 && f.table_dependent >= 1 && f.first_bad_fmt < 0,
           "#325: a 2D_ARRAY image_sample is recompilable-in-context (base slice), not unsupported");
 
+    // House of the Dead 2's exact IMAGE_GET_LOD packet needs both a fragment execution model and its
+    // captured T#/S# pair. The table-less coverage pass must classify it as context-dependent rather
+    // than keep reporting opcode 0x60 as unsupported after the production fragment lowering accepts it.
+    const uint32_t get_lod_2d[] = { 0xf1800108u, 0x01480809u, 0xbf810000u };
+    const RecompileCoverage get_lod = recompile_coverage(
+        get_lod_2d, std::size(get_lod_2d));
+    CHECK(get_lod.total == 1 && get_lod.table_dependent == 1 &&
+              get_lod.unsupported == 0 && get_lod.first_bad_fmt < 0,
+          "2D IMAGE_GET_LOD reports recompilable-in-context, not unsupported");
+
     // Asterix's resolve PS mixes the ordinary and exact one-extra-word NSA 2D_MSAA IMAGE_LOAD
     // encodings. Coverage is table-less, but it can still distinguish the address shapes the real
     // resource-aware emitter accepts from superficially similar, deliberately unsupported packets.
