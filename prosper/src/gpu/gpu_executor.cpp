@@ -6246,9 +6246,13 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 notify_compute_authority_range(
                     ComputeAuthorityBoundaryKind::Dma, submit_no,
                     operation.command_order, copy.src, copy.bytes);
-                notify_compute_authority_range(
-                    ComputeAuthorityBoundaryKind::Dma, submit_no,
-                    operation.command_order, copy.dst, copy.bytes);
+                // Selector byte 1 names a GDS offset, not guest memory. The source still consumes a
+                // guest/render-target range, while the destination is ordered by this executor's
+                // shared GDS backing and must not manufacture a guest range at (for example) 0x24.
+                if ((copy.sels & 0xffu) != 1u)
+                    notify_compute_authority_range(
+                        ComputeAuthorityBoundaryKind::Dma, submit_no,
+                        operation.command_order, copy.dst, copy.bytes);
                 std::vector<uint8_t> current_source;
                 const LiveTargetByteReadResult source_result = read_live_render_target_bytes(
                     copy.src, copy.bytes, current_source);

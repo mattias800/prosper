@@ -1621,7 +1621,7 @@ static void honor_event_write(const Pm4Command& c) {
 // packets therefore preserve sourceKind in kDmaDataAddressSource; historical packets retain the
 // established >32-bit address fallback. GDS offsets and malformed/unmapped endpoints fail closed.
 // CONFIDENCE: HIGH on immediate fill and mapped address-copy behavior; MED on the large-fill form.
-enum class DmaDataForm { Invalid, Immediate, Copy, GdsImmediate };
+enum class DmaDataForm { Invalid, Immediate, Copy, GdsImmediate, MemoryToGds };
 
 // The destination selector occupies the LOW byte of the packed `dd_sels` word: the HLE builder writes
 // `(a2 & 0xff) | ((a3 & 0xff) << 8)`, and a2 is the argument that tracks the destination DOMAIN. This
@@ -1647,6 +1647,7 @@ enum class DmaDataForm { Invalid, Immediate, Copy, GdsImmediate };
 // it, but the sample is a handful of call sites, and no shader has yet been shown to READ these
 // offsets. The guards below keep every unrecognised form fail-closed.
 static constexpr uint32_t kDmaSelGds = 1;
+static constexpr uint32_t kDmaSelMemory = 3;
 static uint32_t dma_data_dst_sel(const Pm4Command& c) { return c.dd_sels & 0xffu; }
 static uint32_t dma_data_src_sel(const Pm4Command& c) { return (c.dd_sels >> 8) & 0xffu; }
 static bool dma_data_address_source(const Pm4Command& c) {
@@ -1664,9 +1665,10 @@ static DmaDataForm dma_data_form(const Pm4Command& c, bool source_materialized =
     if (!c.dd_valid || !c.dd_bytes || c.dd_bytes > kMaxCopyBytes) return DmaDataForm::Invalid;
     // A GDS destination is an OFFSET into the 64 KiB share, not a guest address, so it is legitimately
     // below the 0x10000 floor that rejects malformed guest pointers — which is exactly why every one
-    // of these was being discarded. Only the immediate (<=32-bit source) form is accepted here: a
-    // GDS-to-memory or memory-to-GDS copy has no title evidence yet and stays fail-closed
-    // (the source guard above is what makes that true of the GDS-to-memory direction).
+    // of these was being discarded. Astro Bot now provides exact title evidence for the address
+    // sibling too: dstSel=1/srcSel=3/sourceKind=2 copies four bytes from guest memory into GDS+0x24.
+    // Keep that contract narrow; GDS-to-memory and every unrecognised selector direction stay
+    // fail-closed.
     // A GDS SOURCE would make `dd_src` a small offset, which the immediate path below cannot tell from
     // a 32-bit fill value — it would write the offset itself into guest memory. There is no title
     // evidence for that form, so reject it rather than mis-execute it. (This is a behaviour change
@@ -1675,9 +1677,11 @@ static DmaDataForm dma_data_form(const Pm4Command& c, bool source_materialized =
     if (dma_data_dst_sel(c) == kDmaSelGds) {
         const size_t gds_size = compute_gds_size();
         const bool in_range = c.dd_dst < gds_size && c.dd_bytes <= gds_size - c.dd_dst;
-        return (dma_data_immediate_source(c) && in_range && !(c.dd_dst & 3) &&
-                !(c.dd_bytes & 3))
-                   ? DmaDataForm::GdsImmediate
+        if (!in_range || (c.dd_dst & 3) || (c.dd_bytes & 3)) return DmaDataForm::Invalid;
+        if (dma_data_immediate_source(c)) return DmaDataForm::GdsImmediate;
+        return dma_data_src_sel(c) == kDmaSelMemory &&
+                       (source_materialized || guest_readable(c.dd_src, c.dd_bytes))
+                   ? DmaDataForm::MemoryToGds
                    : DmaDataForm::Invalid;
     }
     if (c.dd_dst < 0x10000) return DmaDataForm::Invalid;
@@ -1728,7 +1732,7 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         report_invalid_dma_data(c);
         return false;
     }
-    if (form == DmaDataForm::GdsImmediate) {
+    if (form == DmaDataForm::GdsImmediate || form == DmaDataForm::MemoryToGds) {
         // A GDS counter reset: the guest zeroes these offsets every frame, and the shaders that use
         // GDS reach the same 64 KiB backing through the internal binding. Dropping the write loses
         // guest state outright.
@@ -1738,12 +1742,30 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         // Bot's indirect dispatch still grows 1, 1, 2, 3, 4, 5, 7, 15, 6711, 26783, 40167, 66927.
         // Whatever accumulates that count is elsewhere; do not re-derive this.
         uint8_t* gds = compute_gds_backing();
-        const uint32_t v32 = (uint32_t)c.dd_src;
-        for (uint32_t i = 0; i + 4 <= c.dd_bytes; i += 4)
-            memcpy(gds + c.dd_dst + i, &v32, 4);
-        if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_GDSLOG"))
-            fprintf(stderr, "[agc]   DmaData GDS fill [gds+0x%llx] := 0x%x (%u bytes)\n",
-                    (unsigned long long)c.dd_dst, v32, c.dd_bytes);
+        if (form == DmaDataForm::GdsImmediate) {
+            const uint32_t v32 = (uint32_t)c.dd_src;
+            for (uint32_t i = 0; i + 4 <= c.dd_bytes; i += 4)
+                memcpy(gds + c.dd_dst + i, &v32, 4);
+            if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_GDSLOG"))
+                fprintf(stderr, "[agc]   DmaData GDS fill [gds+0x%llx] := 0x%x (%u bytes)\n",
+                        (unsigned long long)c.dd_dst, v32, c.dd_bytes);
+        } else {
+            const uint8_t* source = authoritative_source
+                ? authoritative_source
+                : reinterpret_cast<const uint8_t*>(uintptr_t(c.dd_src));
+            memcpy(gds + c.dd_dst, source, c.dd_bytes);
+            if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_GDSLOG")) {
+                static std::atomic<uint64_t> ordinal{0};
+                const uint64_t n = ordinal.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (prosper::diag_should_print(n, 16))
+                    fprintf(stderr,
+                            "[agc] DmaData memory-to-GDS #%llu [gds+0x%llx] <- "
+                            "[0x%llx] (%u bytes order=%llu sels=0x%x)\n",
+                            (unsigned long long)n, (unsigned long long)c.dd_dst,
+                            (unsigned long long)c.dd_src, c.dd_bytes,
+                            (unsigned long long)c.stream_order, c.dd_sels);
+            }
+        }
         return true;
     }
     uint8_t* dst = (uint8_t*)(uintptr_t)c.dd_dst;
@@ -2751,6 +2773,9 @@ int flush_deferred_streams() {
 static bool retained_dma_destination_overlaps(
         const std::vector<GpuState::DmaCopy>& copies, uint64_t address, uint64_t bytes) {
     for (const GpuState::DmaCopy& copy : copies) {
+        // GDS destinations are offsets into the private 64 KiB share, not guest VAs. Treating the
+        // live Astro Bot offset 0x24 as an unknown guest address made it overlap every wait.
+        if ((copy.sels & 0xffu) == kDmaSelGds) continue;
         if (guest_memory_topology_relation(address, bytes, copy.dst, copy.bytes) !=
             GuestMemoryTopologyRelation::Disjoint)
             return true;
@@ -3598,7 +3623,8 @@ void GpuState::apply(const Pm4Command& c) {
             // FIFO behavior until a general copy appears; its suffix joins the ordered timeline.
             if (dma_data_address_source(c)) {
                 if (!c.dd_valid) { report_invalid_dma_data(c); break; }
-                const bool gated_destination = defer_gate(c);
+                // A GDS offset does not participate in WAIT_DEFER's guest-address domains.
+                const bool gated_destination = dma_data_dst_sel(c) != kDmaSelGds && defer_gate(c);
                 const bool gated_source = !g_deferred.empty() &&
                                           addr_gated(c.dd_src, c.dd_bytes, c.queue_origin);
                 if (gated_destination || gated_source) {

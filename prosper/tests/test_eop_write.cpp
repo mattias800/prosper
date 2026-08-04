@@ -530,6 +530,144 @@ int main() {
         CHECK(gds[offset + 4] == 0xAB, "GDS fill wrote exactly the requested byte span");
     }
 
+    // #1732: Astro Bot's world-map loader emits the address-backed sibling with the exact contract
+    // dstSel=GDS, srcSel=memory, sourceKind=address. Preserve it in the ordered timeline and copy
+    // mapped source bytes into the private GDS share without publishing a fictitious guest write to
+    // address 0x24. Each assertion has a distinct mutation target: form selection, payload, bounds,
+    // and destination-domain notification.
+    {
+        uint8_t* gds = compute_gds_backing();
+        const uint32_t offset = 0x24;
+        alignas(4) uint32_t source[2] = {0xA1B2C3D4u, 0x55667788u};
+        memset(gds + offset, 0xCC, 12);
+        const uint64_t src = reinterpret_cast<uint64_t>(source);
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = offset; dma[2] = 0;
+        dma[3] = static_cast<uint32_t>(src); dma[4] = static_cast<uint32_t>(src >> 32);
+        dma[5] = sizeof(source);
+        dma[6] = 1u | (3u << 8) | kDmaDataAddressSource;
+        bool notified = false;
+        set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+        GpuState st; run_cb(dma, 7, st);
+        set_guest_gpu_write_observer({});
+        CHECK(st.dma_copies.size() == 1 && st.dma_copies[0].dst == offset &&
+                  st.dma_copies[0].src == src && st.dma_copies[0].sels == dma[6],
+              "memory-to-GDS DMA is retained with its exact address and selector contract");
+        CHECK(memcmp(gds + offset, source, sizeof(source)) == 0 &&
+                  gds[offset + sizeof(source)] == 0xCC,
+              "memory-to-GDS DMA copies the exact mapped source span in order");
+        CHECK(!notified,
+              "memory-to-GDS DMA does not publish its GDS offset as a guest-memory write");
+    }
+
+    // The exact source selector is part of the supported direction. A valid host address paired
+    // with any other source domain must not be enough to opt an unknown form into GDS execution.
+    {
+        uint8_t* gds = compute_gds_backing();
+        const uint32_t offset = 0x34;
+        uint32_t source = 0x10203040u;
+        memset(gds + offset, 0x5A, 4);
+        const uint64_t src = reinterpret_cast<uint64_t>(&source);
+        uint32_t dma[7] = {PM4(7, IT_NOP, R_DMA_DATA), offset, 0,
+                           static_cast<uint32_t>(src), static_cast<uint32_t>(src >> 32), 4,
+                           1u | (2u << 8) | kDmaDataAddressSource};
+        GpuState st; run_cb(dma, 7, st);
+        CHECK(gds[offset] == 0x5A,
+              "memory-to-GDS DMA rejects an unrecognised source selector");
+    }
+
+    // sourceKind is authoritative: an unmapped address must remain an address and fail closed, not
+    // become a repeated immediate merely because its numeric value fits in 32 bits.
+    {
+        uint8_t* gds = compute_gds_backing();
+        const uint32_t offset = 0x38;
+        memset(gds + offset, 0x6B, 4);
+        uint32_t dma[7] = {PM4(7, IT_NOP, R_DMA_DATA), offset, 0, 0x4000u, 0, 4,
+                           1u | (3u << 8) | kDmaDataAddressSource};
+        GpuState st; run_cb(dma, 7, st);
+        CHECK(st.dma_copies.size() == 1 && gds[offset] == 0x6B,
+              "memory-to-GDS DMA retains and rejects an unmapped asserted address source");
+    }
+
+    // GDS copy validation is exact, not a clamping path: reject a span crossing the 64 KiB share,
+    // a non-dword byte count, and a misaligned offset without changing any in-range sentinel.
+    {
+        uint8_t* gds = compute_gds_backing();
+        uint32_t source[2] = {0xDEADBEEFu, 0xCAFEBABEu};
+        const uint64_t src = reinterpret_cast<uint64_t>(source);
+        auto run_invalid_gds_copy = [&](uint32_t offset, uint32_t bytes, uint8_t sentinel) {
+            memset(gds + offset, sentinel, std::min<size_t>(4, compute_gds_size() - offset));
+            uint32_t dma[7] = {PM4(7, IT_NOP, R_DMA_DATA), offset, 0,
+                               static_cast<uint32_t>(src), static_cast<uint32_t>(src >> 32), bytes,
+                               1u | (3u << 8) | kDmaDataAddressSource};
+            GpuState st; run_cb(dma, 7, st);
+            return gds[offset] == sentinel;
+        };
+        CHECK(run_invalid_gds_copy(static_cast<uint32_t>(compute_gds_size()) - 4, 8, 0x71),
+              "memory-to-GDS DMA rejects an out-of-range destination span");
+        CHECK(run_invalid_gds_copy(0x44, 6, 0x72),
+              "memory-to-GDS DMA rejects a non-dword byte count");
+        CHECK(run_invalid_gds_copy(0x4A, 4, 0x73),
+              "memory-to-GDS DMA rejects a misaligned destination offset");
+    }
+
+    // Exact live defect shape from #1927: the GDS copy is unrelated to this guest label, then an
+    // owned WRITE_DATA/release pair satisfies the eager wait. GDS+0x24 used to be classified as an
+    // unknown guest address and therefore poisoned every such wait. The diagnostic is an independent
+    // positive witness that the new execution arm actually ran, rather than merely skipping overlap.
+    {
+        uint8_t* gds = compute_gds_backing();
+        const uint32_t offset = 0x24;
+        uint32_t source = 0x89ABCDEFu;
+        uint64_t label = 0;
+        const uint64_t src = reinterpret_cast<uint64_t>(&source);
+        const uint64_t label_addr = reinterpret_cast<uint64_t>(&label);
+        std::vector<uint32_t> stream;
+        stream.reserve(28);
+        stream.insert(stream.end(), {PM4(7, IT_NOP, R_DMA_DATA), offset, 0,
+                                     static_cast<uint32_t>(src), static_cast<uint32_t>(src >> 32),
+                                     4, 1u | (3u << 8) | kDmaDataAddressSource});
+        stream.insert(stream.end(), {PM4(6, IT_NOP, R_WRITE_DATA), 0,
+                                     static_cast<uint32_t>(label_addr),
+                                     static_cast<uint32_t>(label_addr >> 32), 1, 0});
+        stream.insert(stream.end(), {PM4(7, IT_NOP, R_RELEASE_MEM),
+                                     static_cast<uint32_t>(label_addr),
+                                     static_cast<uint32_t>(label_addr >> 32), 1, 1, 0, 0});
+        stream.insert(stream.end(), {PM4(8, IT_NOP, R_WAIT_MEM_64),
+                                     static_cast<uint32_t>(label_addr),
+                                     static_cast<uint32_t>(label_addr >> 32),
+                                     0xffffffffu, 0, 1, 0, 3});
+#ifdef _WIN32
+        _putenv_s("PROSPER_GDSLOG", "1");
+#else
+        setenv("PROSPER_GDSLOG", "1", 1);
+#endif
+        GpuState st;
+        const std::string diagnostic = capture_stderr(
+            [&] { run_cb(stream.data(), stream.size(), st); });
+#ifdef _WIN32
+        _putenv_s("PROSPER_GDSLOG", "");
+#else
+        unsetenv("PROSPER_GDSLOG");
+#endif
+        uint32_t copied = 0;
+        memcpy(&copied, gds + offset, sizeof(copied));
+        CHECK(!st.dma_execution_rejected && st.dma_copies.size() == 1 &&
+                  st.ordered_memory_effects.size() == 2,
+              "GDS destination does not poison an unrelated retained label wait");
+        CHECK(st.dma_copies[0].command_order <
+                      st.ordered_memory_effects[0].cmd.stream_order &&
+                  st.ordered_memory_effects[0].cmd.stream_order <
+                      st.ordered_memory_effects[1].cmd.stream_order &&
+                  copied == source && label == 1,
+              "memory-to-GDS, WRITE_DATA, and release execute in retained stream order");
+        CHECK(diagnostic.find("DmaData memory-to-GDS #1") != std::string::npos &&
+                  diagnostic.find("[gds+0x24]") != std::string::npos &&
+                  diagnostic.find("sels=0x10301") != std::string::npos,
+              "memory-to-GDS reporter proves the exact execution arm moved");
+    }
+
     // ...and the guard that made it fail-closed still rejects a genuinely malformed guest pointer:
     // a sub-0x10000 destination WITHOUT the GDS selector must remain unwritten, or the fix above
     // would have turned every malformed packet into a wild write at a low address. Assert on GDS

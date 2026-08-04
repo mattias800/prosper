@@ -686,6 +686,39 @@ int main() {
               "authority hook preserves submit, DMA, draw audit, and end order");
     }
 
+    // #1732: an ordered memory-to-GDS DMA consumes one guest/render-target source range, but its
+    // destination is an offset in the private GDS share. Publishing GDS+0x24 as a second guest
+    // authority range reproduces the same domain confusion that used to poison Astro Bot's waits.
+    {
+        uint32_t source = 0x7A6B5C4Du;
+        uint8_t* gds = compute_gds_backing();
+        memset(gds + 0x24, 0, sizeof(source));
+        GpuState ordered;
+        ordered.dma_copies.push_back({
+            0x24, reinterpret_cast<uint64_t>(&source), sizeof(source),
+            1u | (3u << 8) | kDmaDataAddressSource, 100, 0});
+        std::vector<ComputeAuthorityBoundary> authority_boundaries;
+        set_compute_authority_boundary_observer(
+            [&](const ComputeAuthorityBoundary& boundary) {
+                authority_boundaries.push_back(boundary);
+            });
+        execute_ordered_and_present(ordered, W, H, 78, /*publish=*/false);
+        set_compute_authority_boundary_observer({});
+        uint32_t copied = 0;
+        memcpy(&copied, gds + 0x24, sizeof(copied));
+        CHECK(copied == source,
+              "production ordered executor copies mapped memory into the GDS share");
+        CHECK(authority_boundaries.size() == 3 &&
+                  authority_boundaries[0].kind ==
+                      ComputeAuthorityBoundaryKind::SubmitBegin &&
+                  authority_boundaries[1].kind == ComputeAuthorityBoundaryKind::Dma &&
+                  authority_boundaries[1].range_known &&
+                  authority_boundaries[1].address == reinterpret_cast<uint64_t>(&source) &&
+                  authority_boundaries[1].bytes == sizeof(source) &&
+                  authority_boundaries[2].kind == ComputeAuthorityBoundaryKind::SubmitEnd,
+              "memory-to-GDS authority reports only the guest source, not GDS+0x24");
+    }
+
     {
         DrawItem draw_resource_probe;
         draw_resource_probe.command_order = 321;
