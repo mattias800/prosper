@@ -158,6 +158,11 @@ constexpr uint64_t shadow_compute_authority_increment(uint64_t value) {
     return value == std::numeric_limits<uint64_t>::max() ? value : value + 1;
 }
 
+constexpr uint64_t shadow_compute_authority_add(uint64_t value, uint64_t addend) {
+    return addend > std::numeric_limits<uint64_t>::max() - value
+        ? std::numeric_limits<uint64_t>::max() : value + addend;
+}
+
 // Post-realization audit for the conservative unknown-range Draw boundary. The authority census
 // still fails closed before draw realization; this companion only asks whether the subsequently
 // realized shader-resource tables name the pending result that forced that materialization. Keeping
@@ -258,6 +263,215 @@ private:
     uint64_t submit_no_ = 0;
     uint64_t command_order_ = 0;
     bool active_ = false;
+    bool saw_overlap_ = false;
+};
+
+// Full-submit companion to ShadowComputeAuthorityDrawProbe. The first probe deliberately closes
+// after the draw that forced the conservative materialization. This probe keeps the retired result
+// identity alive until submit end so a later realized draw can prove whether it names the same guest
+// allocation. It remains diagnostic-only: authority was already materialized before this probe arms.
+//
+// One bounded epoch is retained. A second arm before submit end, a submit transition without an end,
+// an invalid footprint, resource rows followed by an unrealized end, or malformed draw-resource
+// ordering invalidates the apparatus instead of silently discarding evidence. Overlap observations
+// remain provisional until the matching realized end. Draw ordinals are one-based within the epoch.
+enum class ShadowComputeAuthoritySubmitDrawProbeAction : uint8_t {
+    Ignored,
+    InvalidRange,
+    UnrelatedRange,
+    OverlappingRange,
+    DrawCompleted,
+    EpochCompleted,
+    Interrupted,
+};
+
+struct ShadowComputeAuthoritySubmitDrawProbeCounters {
+    uint64_t armed = 0;
+    uint64_t superseded = 0;
+    uint64_t interrupted = 0;
+    uint64_t resource_observations = 0;
+    uint64_t invalid_ranges = 0;
+    uint64_t unrelated_ranges = 0;
+    uint64_t overlapping_ranges = 0;
+    uint64_t unrealized_resource_observations = 0;
+    uint64_t unrealized_overlapping_ranges = 0;
+    uint64_t first_draw_overlapping_ranges = 0;
+    uint64_t later_draw_overlapping_ranges = 0;
+    uint64_t draws_completed = 0;
+    uint64_t realized_draws = 0;
+    uint64_t unrealized_draws = 0;
+    uint64_t later_draws_completed = 0;
+    uint64_t epochs_completed = 0;
+    uint64_t epochs_with_overlap = 0;
+    uint64_t epochs_without_overlap = 0;
+};
+
+class ShadowComputeAuthoritySubmitDrawProbe {
+public:
+    constexpr const ShadowComputeAuthoritySubmitDrawProbeCounters& counters() const {
+        return counters_;
+    }
+
+    constexpr bool active() const { return active_; }
+    constexpr bool apparatus_valid() const {
+        return counters_.invalid_ranges == 0 &&
+               counters_.unrealized_resource_observations == 0 &&
+               counters_.superseded == 0 && counters_.interrupted == 0 && !active_;
+    }
+    constexpr uint64_t next_draw_ordinal() const {
+        return active_ ? draws_in_epoch_ + 1 : 0;
+    }
+
+    constexpr void arm(uint64_t submit_no, uint64_t command_order,
+                       const ShadowComputeAuthorityRange& pending_range) {
+        if (active_) {
+            counters_.superseded = shadow_compute_authority_increment(
+                counters_.superseded);
+            clear_epoch();
+        }
+        if (!pending_range.valid()) return;
+        active_ = true;
+        submit_no_ = submit_no;
+        first_command_order_ = command_order;
+        pending_range_ = pending_range;
+        counters_.armed = shadow_compute_authority_increment(counters_.armed);
+    }
+
+    constexpr void begin_submit(uint64_t submit_no) {
+        if (active_ && submit_no != submit_no_) interrupt();
+    }
+
+    constexpr ShadowComputeAuthoritySubmitDrawProbeAction observe_resource(
+            uint64_t submit_no, uint64_t command_order,
+            const ShadowComputeAuthorityRange& resource_range) {
+        if (!active_) return ShadowComputeAuthoritySubmitDrawProbeAction::Ignored;
+        if (!accept_draw_event(submit_no, command_order))
+            return ShadowComputeAuthoritySubmitDrawProbeAction::Interrupted;
+        counters_.resource_observations = shadow_compute_authority_increment(
+            counters_.resource_observations);
+        current_draw_resource_observations_ = shadow_compute_authority_increment(
+            current_draw_resource_observations_);
+        if (!resource_range.valid()) {
+            counters_.invalid_ranges = shadow_compute_authority_increment(
+                counters_.invalid_ranges);
+            return ShadowComputeAuthoritySubmitDrawProbeAction::InvalidRange;
+        }
+        if (!shadow_compute_authority_ranges_overlap(pending_range_, resource_range)) {
+            counters_.unrelated_ranges = shadow_compute_authority_increment(
+                counters_.unrelated_ranges);
+            return ShadowComputeAuthoritySubmitDrawProbeAction::UnrelatedRange;
+        }
+        current_draw_overlapping_ranges_ = shadow_compute_authority_increment(
+            current_draw_overlapping_ranges_);
+        return ShadowComputeAuthoritySubmitDrawProbeAction::OverlappingRange;
+    }
+
+    constexpr ShadowComputeAuthoritySubmitDrawProbeAction complete_draw(
+            uint64_t submit_no, uint64_t command_order, bool realized) {
+        if (!active_) return ShadowComputeAuthoritySubmitDrawProbeAction::Ignored;
+        if (!accept_draw_event(submit_no, command_order))
+            return ShadowComputeAuthoritySubmitDrawProbeAction::Interrupted;
+        if (observing_draw_ && current_draw_order_ != command_order) {
+            interrupt();
+            return ShadowComputeAuthoritySubmitDrawProbeAction::Interrupted;
+        }
+        if (realized) {
+            if (current_draw_overlapping_ranges_ != 0) saw_overlap_ = true;
+            counters_.overlapping_ranges = shadow_compute_authority_add(
+                counters_.overlapping_ranges, current_draw_overlapping_ranges_);
+            uint64_t& ordinal_counter = draws_in_epoch_ == 0
+                ? counters_.first_draw_overlapping_ranges
+                : counters_.later_draw_overlapping_ranges;
+            ordinal_counter = shadow_compute_authority_add(
+                ordinal_counter, current_draw_overlapping_ranges_);
+        } else {
+            counters_.unrealized_resource_observations = shadow_compute_authority_add(
+                counters_.unrealized_resource_observations,
+                current_draw_resource_observations_);
+            counters_.unrealized_overlapping_ranges = shadow_compute_authority_add(
+                counters_.unrealized_overlapping_ranges,
+                current_draw_overlapping_ranges_);
+        }
+        if (draws_in_epoch_ != 0)
+            counters_.later_draws_completed = shadow_compute_authority_increment(
+                counters_.later_draws_completed);
+        draws_in_epoch_ = shadow_compute_authority_increment(draws_in_epoch_);
+        counters_.draws_completed = shadow_compute_authority_increment(
+            counters_.draws_completed);
+        uint64_t& realization_counter = realized
+            ? counters_.realized_draws : counters_.unrealized_draws;
+        realization_counter = shadow_compute_authority_increment(realization_counter);
+        last_draw_order_ = command_order;
+        have_last_draw_ = true;
+        observing_draw_ = false;
+        current_draw_order_ = 0;
+        current_draw_resource_observations_ = 0;
+        current_draw_overlapping_ranges_ = 0;
+        return ShadowComputeAuthoritySubmitDrawProbeAction::DrawCompleted;
+    }
+
+    constexpr ShadowComputeAuthoritySubmitDrawProbeAction end_submit(uint64_t submit_no) {
+        if (!active_) return ShadowComputeAuthoritySubmitDrawProbeAction::Ignored;
+        if (submit_no != submit_no_ || observing_draw_) {
+            interrupt();
+            return ShadowComputeAuthoritySubmitDrawProbeAction::Interrupted;
+        }
+        counters_.epochs_completed = shadow_compute_authority_increment(
+            counters_.epochs_completed);
+        uint64_t& outcome = saw_overlap_
+            ? counters_.epochs_with_overlap : counters_.epochs_without_overlap;
+        outcome = shadow_compute_authority_increment(outcome);
+        clear_epoch();
+        return ShadowComputeAuthoritySubmitDrawProbeAction::EpochCompleted;
+    }
+
+private:
+    constexpr bool accept_draw_event(uint64_t submit_no, uint64_t command_order) {
+        if (submit_no != submit_no_ || command_order < first_command_order_ ||
+            (have_last_draw_ && command_order <= last_draw_order_) ||
+            (observing_draw_ && command_order != current_draw_order_)) {
+            interrupt();
+            return false;
+        }
+        if (!observing_draw_) {
+            observing_draw_ = true;
+            current_draw_order_ = command_order;
+        }
+        return true;
+    }
+
+    constexpr void interrupt() {
+        counters_.interrupted = shadow_compute_authority_increment(counters_.interrupted);
+        clear_epoch();
+    }
+
+    constexpr void clear_epoch() {
+        pending_range_ = ShadowComputeAuthorityRange::unknown();
+        submit_no_ = 0;
+        first_command_order_ = 0;
+        current_draw_order_ = 0;
+        last_draw_order_ = 0;
+        draws_in_epoch_ = 0;
+        current_draw_resource_observations_ = 0;
+        current_draw_overlapping_ranges_ = 0;
+        active_ = false;
+        observing_draw_ = false;
+        have_last_draw_ = false;
+        saw_overlap_ = false;
+    }
+
+    ShadowComputeAuthoritySubmitDrawProbeCounters counters_;
+    ShadowComputeAuthorityRange pending_range_;
+    uint64_t submit_no_ = 0;
+    uint64_t first_command_order_ = 0;
+    uint64_t current_draw_order_ = 0;
+    uint64_t last_draw_order_ = 0;
+    uint64_t draws_in_epoch_ = 0;
+    uint64_t current_draw_resource_observations_ = 0;
+    uint64_t current_draw_overlapping_ranges_ = 0;
+    bool active_ = false;
+    bool observing_draw_ = false;
+    bool have_last_draw_ = false;
     bool saw_overlap_ = false;
 };
 
