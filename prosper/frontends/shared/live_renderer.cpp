@@ -5686,8 +5686,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             for (size_t p = 0; p + 3 < counted.size(); p += 4)
                                 if (counted[p] || counted[p + 1] || counted[p + 2]) nz++;
                         // In-window: every pass. Out of window: only content-bearing (or deferred)
-                        // passes, so the publish source can be found without knowing the callback.
-                        if ((at >= pl_min && at < pl_min + 3u) || nz > 100 || defer_readback)
+                        // passes, so the publish source can be found without knowing the callback —
+                        // plus `nz < 0`, a pass whose format the inspection path cannot convert. That
+                        // last case has to stay visible out of window: it is the one where this line
+                        // cannot say whether the pass carries content, which is exactly when the
+                        // reader needs to know the pass existed.
+                        if ((at >= pl_min && at < pl_min + 3u) || nz > 100 || nz < 0 ||
+                            defer_readback)
                             fprintf(stderr,
                                     "[pass] cb=%llu pass=%zu/%zu base=0x%llx %ux%u fmt=%d vo=%d "
                                     "seed=%d defer=%d writes=%llu px_nonblack=%lld\n",
