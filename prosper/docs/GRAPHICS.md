@@ -546,6 +546,14 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   **short** — the tail past the nominal end holds real texels of the last block row, so truncating it
   drops part of the bottom-right (measured: the bottom-right 1024x48 of a 3840x2160 scanout loses half
   its non-black pixels). #1968.
+- **Sonic Frontiers' post-intro black frame is not a present-path defect — the guest's own display
+  buffer is black.** With the flipped buffer published, `PROSPER_DUMP_SCANOUT` dumps de-swizzled at
+  guest flips 420 and 480 read `rgb_nonblack=0, distinct_rgb=1`, while flips 60–360 from the same run
+  are exact frames (SEGA logo, middleware credits, the Cyber Space warp). The same non-draw writer
+  therefore works throughout, and what changes after `ui_gamemodeinitialize.pac` is that the title
+  composites nothing into the buffer it keeps flipping. Do not look for a lost render target, a
+  mis-selected pass or a dropped publish for this symptom: prosper is showing what the console would.
+  The remaining blocker is upstream guest progression. #1968.
 
 ## Recommended implementation order
 
