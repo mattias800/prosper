@@ -587,3 +587,30 @@ names its state object `GOCTinyFsm2`. That reads as an in-stage cutscene trigger
 likely boot path and the better place to start. Neither conclusion is measured — both are read off the
 disassembly — and the useful next step is dynamic: break on `eboot+0x6d76c0`'s two callers *and* on
 whatever writes the movie index, rather than another static walk.
+
+### The one hypothesis that joins all of it (2026-08-05) — labelled as a hypothesis
+
+Everything measured above is compatible with a single reading, and the next lane should test it before
+anything more expensive. It is **not** established, and it is written here as a candidate:
+
+> `raw/ui/ui_startup.pac` **is** the boot sequence. Its absence is why the frontend's first scene is
+> empty, why no logo movie is requested, and why the state machine never advances to `ui_mainmenu`.
+
+What supports it: the package is named `ui_startup`; it is the **third** entry of the title's 34-entry
+resident list and the only absent one; the guest hides the system splash at tick 22 and then displays
+an empty scene forever, i.e. it believes it is past boot; no scene, menu, `.rsdk` or `.usm` is ever
+requested afterwards; and the boot logo movie (`sonicteam_logo_4k.usm`) exists, its decoder is
+initialised, and its player entry is measurably never entered. A UI scene that drives the logo, the
+legal screens and the hand-off to the title menu would account for every one of those at once.
+
+What argues against it, and must not be waved away: the loop that requests the package **skips a
+missing entry cleanly** (`eboot+0x990239` -> `eboot+0x990120`), with no error path, no retry and no
+wait — so nothing yet shows the *state machine* depends on it, only that the *loader* does not.
+
+How to settle it, in increasing cost: (1) check whether `raw/ui/ui_startup.pac` exists in another copy
+of this title's app0 — if it does, this is a dump gap and the honest result is to record it as the
+blocker, not to alias anything; (2) find the guest state that consumes the loaded package handle and
+see whether it has a no-package path; (3) break on the writer of the movie index and see whether any
+state ever selects one. **Do not fabricate the package, alias another `.pac` to it, or force the
+`exists()` predicate true** — that would model a producer the guest never had and could not be
+progression evidence even if it changed the screen.
