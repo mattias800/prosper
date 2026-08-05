@@ -24,43 +24,98 @@ t≈60 s before.
 [progress] t=356.9s submits=9817 draws_cum=376986 dispatches=80095 flips=1067 presents=6606
 ```
 
-### The open defect: most title frames arrive yellow
+### The open defect: the UI's background clears to yellow instead of black
 
-The title screen is reached but degraded. Most composited frames are the **correct frame with the
-red and green channels forced to maximum**, which reads as a flat yellow background under otherwise
-perfect white content. The mapping is exact, measured over two 4K frames 10 s apart in one run:
+Menu frames are intermittently degraded: the background behind the UI is `RGB(255,255,0)` where it
+should be black. **The content itself is correct** — every layer composites over that background
+with its own alpha, exactly as it does over black.
 
-| correct frame | degraded frame |
-| --- | --- |
-| `(0,0,0)` ×8,090,540 | `(255,255,0)` ×8,090,521 |
-| `(255,255,255)` ×151,941 | `(255,255,255)` ×151,941 |
-| `(102,102,102)` ×14,539 | `(255,255,102)` ×14,537 |
-| `(1,1,1)` ×1,263 | `(255,255,1)` ×1,249 |
+> **Superseded framing — do not reuse.** This was first written up as "red and green forced to
+> maximum", `out = (255, 255, in.b)`. That fitted the title screen, whose content is all
+> white-on-black at one alpha, and it is **wrong**. The EULA screen falsifies it: its dialog panel
+> is `(0,0,0)` clean and `(102,102,0)` degraded, where `out = (255,255,in.b)` demands `(255,255,0)`.
+> #2014.
 
-So `out = (255, 255, in.b)`, with the blue channel carrying the true value. Equivalently it is an
-additive/max composite against opaque yellow — the two are indistinguishable when one operand is
-0 or 255, so do not claim one over the other without a frame containing a non-grey colour.
+The background-colour model fits every measured pixel on **two different screens with three
+different alphas**. With content `C` at alpha `a` over background `B`, `out = a·C + (1-a)·B`, and
+only `B` differs — `(0,0,0)` clean against `(255,255,0)` degraded:
+
+| element | clean | degraded | implied `(1-a)` |
+| --- | --- | --- | --- |
+| title-screen background | `(0,0,0)` ×8,090,540 | `(255,255,0)` ×8,090,521 | 1.0 |
+| title logo, fully opaque | `(255,255,255)` ×151,941 | `(255,255,255)` ×151,941 | 0.0 |
+| title-screen footer text | `(102,102,102)` ×14,539 | `(255,255,102)` ×14,537 | 0.6 |
+| EULA dialog panel | `(0,0,0)` | `(102,102,0)` | 0.4 |
+| EULA body text | `(153,153,153)` ×31,976 | `(194,194,153)` ×31,949 | 0.16 |
+
+Two of those rows are load-bearing. **Fully opaque white is byte-identical in both frames** — 126,501
+pixels on the EULA screen — so nothing is being clamped or channel-swizzled; opaque content is
+already correct. And the blue channel is *never* touched in any row, in either frame, which is what
+identifies the wrong value as a background colour rather than a per-channel transform.
+
+This is a much narrower place to look than a channel map: the question is why the surface the UI
+composites onto is cleared to `(1,1,0)` instead of `(0,0,0)` on roughly two thirds of frames.
 
 What is and is not bounded:
 
-- **It is intermittent from very early, NOT switched on by the post-process chain.** It is tempting
-  to read "the logos are clean and the title screen is not" as an onset, and an earlier draft of
-  this doc did. It does not survive the mapping above: the earliest tinted frame on record is the
-  *empty* composite at `frame_seq=4`, t≈4.0 s (#1962, build `ff72e77c`), and a black empty composite
-  under `out = (255,255,in.b)` is exactly the pure `RGB(255,255,0)` that was seen. Clean logo frames
-  at t=20/40/60/80 s are interleaved with it. So the tint is present and intermittent from the first
-  seconds, and **the post-process/tonemap stage is not localised by this evidence** — do not narrow
-  to it on the strength of the splash frames.
+- **It tints frames that contain no content at all, so it is NOT switched on by the post-process
+  chain.** It is tempting to read "the logos are clean and the title screen is not" as an onset, and
+  an earlier draft of this doc did. Two independent observations kill it, and the second needs no
+  cross-build argument:
+  - The earliest tinted frame on record is the *empty* composite at `frame_seq=4`, t≈4.0 s (#1962,
+    build `ff72e77c`); a frame with nothing drawn over a yellow background is exactly the pure
+    `RGB(255,255,0)` seen there. Clean logo frames at t=20/40/60/80 s are interleaved with it.
+  - On **`4d7a2ded` itself**, ten consecutive samples (t=120–210 s) are pure `(255,255,0)` across
+    all 8,294,400 pixels — one colour, no content — while that arm did not composite the title
+    screen until t≈230 s. Ten of its twenty-four tinted samples therefore carry nothing that any
+    post-process chain could have acted on.
+
+  So the tint is present and intermittent from the first seconds and applies to empty frames, and
+  **the post-process/tonemap stage is not localised by this evidence** — do not narrow to it on the
+  strength of the splash frames.
 - **It is not frontend-specific.** The native SDL3 `prosper-app` window shows it too, and there it
   is *persistent* — three grabs 40 s apart at the title screen are byte-identical yellow. Headless
   `screenshot` sees it on roughly two thirds of samples, with correct black frames interleaved.
 - **The rate is 24/36 in both 360 s arms, but that is not yet a calibrated discriminator.** The two
   arms are the default and the `PROSPER_NO_PACKED_R11_STORAGE=1` arm — i.e. the same pair an A/B
   would compare, so their agreement cannot also serve as the baseline's run-to-run variance. With
-  n=1 per configuration the null spread is unknown. Establish it with two same-configuration arms
-  before reading any future "unchanged at 24/36" as a negative.
+  n=1 per configuration the null spread is unknown. Worse, the two 24s are not even counting the
+  same thing: the treated arm reached the title screen ~120 s later, so most of its tinted samples
+  are empty composites where the default arm's are title-screen frames. Establish a null with two
+  **same-configuration** arms, and compare within a fixed content window, before reading any future
+  "unchanged at 24/36" as a negative.
 
 Open as [#2014](https://github.com/mattias800/prosper/issues/2014).
+
+### Past the title screen: the EULA, via a checked-in input route
+
+`scripts/little-nightmares-3/reach-gameplay.pad` presses `cross` at the title screen and the title
+advances to its **End-User License Agreement** screen — Bandai Namco's EULA text, a `Decline` /
+`Accept` selector with `Accept` highlighted, and the `Navigate / Skip / Select / Back` prompt row.
+It renders completely and, in the clean frames, correctly —
+`assets/screenshots/little-nightmares-3-eula.png`.
+
+This is still **rung 2**, not rung 3: a EULA is a menu, not gameplay with real GPU draws. It is
+recorded because it establishes two things the next lane would otherwise have to re-derive — that
+guest input is reaching this title at all, and where the route stands.
+
+The route is written to be self-invalidating. Run it with `PROSPER_PAD_SCRIPT_LOG=1` and check the
+`[pad-script]` transitions before believing any null result:
+
+```text
+[pad-script] elapsed=120.249 frame=730 read=733 buttons=cross
+[pad-script] elapsed=124.219 frame=737 read=740 buttons=neutral
+…8 press/release pairs, each observed at a real pad poll…
+```
+
+Without that log, "the guest ignored the input" and "the input was never applied" are the same
+observation. Note also that the route's wall-clock windows are calibrated against a **default-route,
+lightly-loaded** boot: under GPU contention the title screen arrives later and the presses can land
+early. Re-check the log rather than the frames when the route appears to do nothing.
+
+**What remains for rung 3:** accepting the EULA and reaching gameplay. Whether the remaining presses
+in the route already accept it is not established — the run that discovered the screen was still on
+it at its bound.
 
 ### #2003 is not inert here — but it is not the reason the wall went
 
@@ -90,9 +145,9 @@ title" — that claim was made on this tracker from an unarmed `svc_log` and wit
   Oregon Trail* shows a "corrupted blue/magenta frame" in its own startup sequence
   (`OREGON_TRAIL_STATUS.md`), so this may be one shape across UE4 titles rather than two defects —
   filed together on that hypothesis as
-  [#2028](https://github.com/mattias800/prosper/issues/2028). It is **not** #2014: #2014 preserves
-  content through the blue channel, this replaces it, and both occur in different samples of the
-  same run.
+  [#2028](https://github.com/mattias800/prosper/issues/2028). It is **not** #2014: #2014 changes only
+  the background the UI composites onto and leaves the content correct, this replaces the content
+  entirely, and both occur in different samples of the same run.
 - 17 distinct compute programs are dropped with `[compute] skip unsupported program 0x…`. Each is
   logged once, so the line count is **not** a dispatch count. Per the charter this is a fatal gap
   regardless of whether it turns out to relate to the tint —
@@ -110,7 +165,8 @@ PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER
 The title screen first appears at roughly t=110 s on the **default** route, so any arm shorter than
 about two minutes will miss it entirely and see only the splash sequence. `PROSPER_NULL_PAGE=1`
 matches the earlier arms on this title and does not change the outcome either way. There is no input
-route yet — nothing past the title screen has been driven.
+route: `scripts/little-nightmares-3/reach-gameplay.pad` reaches the EULA screen (see above), and
+nothing past that has been driven.
 
 **Length is not sufficient on its own, only on the default route.** Three of three default-route
 arms reached the title screen. Both `PROSPER_NO_PACKED_R11_STORAGE=1` arms ran markedly further
@@ -141,7 +197,7 @@ Read this before forming a hypothesis.
 
 - [x] Rung 1 — real graphics from the live renderer (splash sequence, native 3840x2160)
 - [x] Rung 2 — title screen reached and rendered (degraded by #2014)
-- [ ] Rung 3 — gameplay with real GPU draws — no input route yet
+- [ ] Rung 3 — gameplay with real GPU draws — route reaches the EULA screen, not gameplay
 - [ ] Rung 4 — manual visual verification
 - [ ] Rung 5 — PS5 hardware-oracle comparison
 - [ ] Rung 6 — reviewed automatic gameplay snapshot guard
