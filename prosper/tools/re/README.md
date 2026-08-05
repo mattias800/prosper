@@ -115,3 +115,31 @@ which content is actually resident first.
 Limits: unencrypted index only, pak index versions 10-11 (the v10+ encoded-entry + full-directory
 layout). IoStore `.utoc`/`.ucas` containers are a different format and are not handled. Run
 `--self-test` to check the entry decoder, the offset lookup, and the log parser without a pak.
+
+## `gstr.py` — name a stripped function by the strings it references
+
+`xref.py from <addr>` mostly prints `lea -> 0x…` / `load -> 0x…` into read-only data, and on a
+stripped native title those data addresses are the *only* way to identify a function. Feed them to
+`gstr.py` and the function names itself:
+
+```bash
+python3 tools/re/xref.py /tmp/eboot.elf from 0x2121d9e \
+  | awk '/^   (lea|load) /{print $3}' \
+  | python3 tools/re/gstr.py /tmp/eboot.elf - --strings-only
+0x700bd18      W"nothreadtimeout"
+0x705fd1e      W"GPU has hung or crashed!"
+0x718c6ca      W"GameThread timed out waiting for RenderThread after %.02f secs"
+```
+
+— so the guest frame at `eboot+0x2121d9e` is UE4's `GameThreadWaitForTask`, i.e. that thread is
+blocked on the render-command fence, not on the async loader. Three frames identified this way
+(`Create{Vertex,Index,Structured}Buffer_RenderThread`, `FlushRHIThreadFlushResourcesTotal`,
+`r.RHICmdAsyncRHIThreadDispatch`) turned a 90-thread `guest_bt` dump on `PPSA07809` into a named
+GameThread → RenderThread → RHIThread wait chain (#1982).
+
+`strings`/`objdump`/`readelf` cannot do this: `prx_to_elf.py` writes no section header table, so they
+reject the image, and none of them maps a VADDR to a file offset. `gstr.py` resolves the address
+through the image's `PT_LOAD` headers and auto-detects UTF-16LE (UE4's `TCHAR`) as well as ASCII.
+Addresses are image-relative, like every other tool here. An address that holds no string prints
+`bytes <hex>` and one outside every `PT_LOAD` prints `<unmapped>`, so a wrong address is visibly
+wrong rather than silently empty.
