@@ -5777,8 +5777,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         fprintf(stderr,
                                 "[rtt] PRESENT SOURCE DEMOTED #%llu: chose %s for a requested %ux%u "
                                 "(%zu-byte) frame because a higher-priority candidate did not fit — "
-                                "px_front=%ux%u(%zu bytes) px_vo=%ux%u(%zu bytes); the flipped scanout "
-                                "extent is no longer pinned to the present extent\n",
+                                "px_front=%ux%u(%zu bytes) px_vo=%ux%u(%zu bytes); this should be "
+                                "unreachable while VO passes are pinned to the present extent "
+                                "(live_renderer.cpp:5060) — check that pin first\n",
                                 (unsigned long long)ord,
                                 prosper::frontend::present_source_name(present_choice), w, h,
                                 present_extent_bytes, px_front_w, px_front_h,
