@@ -1,0 +1,18 @@
+# Little Nightmares III (PPSA05143) — press past the title screen.
+#
+# The title screen composites at roughly t=110 s on a default launch and shows a
+# "(X) Start" prompt bottom-right. These are wall-clock seconds ranges from the
+# first pad poll; they are held for several seconds each because a range shorter
+# than the interval between pad polls can be skipped entirely (tools/AGENTS.md).
+#
+# Run with PROSPER_PAD_SCRIPT_LOG=1 so the route reports the transitions it
+# actually delivered — without that this route cannot tell "the guest ignored the
+# input" from "the input was never applied".
+120-124:cross
+130-134:cross
+142-146:cross
+155-159:cross
+170-174:cross
+185-189:cross
+205-209:cross
+225-229:cross
