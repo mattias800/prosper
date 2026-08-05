@@ -398,18 +398,65 @@ namespace {
         pthread_cond_destroy(c); free(c);
         return (pthread_cond_t*)cur;
     }
-    pthread_rwlock_t* ensure_rwlock(uint64_t slot_addr) {
+    // A guest rwlock is the host lock PLUS the outstanding-hold accounting FreeBSD keeps in its
+    // umtx word, because glibc keeps none that survives an unmatched unlock (#2012, and the long
+    // comment above the handlers). The accounting belongs to the LOCK, not to a thread: FreeBSD
+    // permits a read hold to be released by a different thread, and prosper's own fibers can move
+    // between host threads across a yield.
+    // The write flag and the hold count live in ONE atomic word, so "is this a decrementable
+    // non-write hold?" is decided and committed by a single compare-exchange. Two separate atomics
+    // cannot express that: the unlocking thread's loads of the two can straddle a writer's acquire,
+    // and no amount of re-checking fixes it, because a re-check is an ABA test — it distinguishes
+    // "an owner is here now" from "no owner", never "an owner came and went". See rw_release.
+    //   bit 63       WRITE — a write hold is outstanding; `owner` names the thread holding it
+    //   bits 32..62  must remain ZERO — see the static_assert below
+    //   bits 0..31   COUNT — outstanding acquisitions (each reader 1, a writer 1)
+    //
+    // A NON-OWNER CAN NEITHER SET NOR CLEAR BIT 63, which is what makes every claim below hold
+    // rather than merely being likely: the write path runs only behind an exclusive host lock, the
+    // write branch of rw_release is gated on `owner == self`, and the reader path's `s - 1` is
+    // guarded by `(s & kRwCount) != 0` so it can never borrow out of bit 31 into the flag space.
+    // A write hold therefore cannot be stolen by anything.
+    struct GuestRwlock {
+        pthread_rwlock_t rw;
+        std::atomic<uint64_t> state;   // WRITE | COUNT
+        std::atomic<uint64_t> owner;   // owning tid while WRITE is set; only read when WRITE is set
+    };
+    constexpr uint64_t kRwWrite = 1ull << 63;
+    constexpr uint64_t kRwCount = 0xffffffffull;
+    // The gap between COUNT and WRITE is unused and MUST stay that way: the layout has no
+    // structural defence, so an arithmetic edit written without the guards above (a bare `s + 1`,
+    // or widening COUNT) walks straight into the flag space and silently turns a hold count into a
+    // write hold. Nothing reachable spills into these bits today — COUNT is bounded by the number
+    // of concurrent guest holds — and this assert is the reminder, not the protection.
+    static_assert((kRwWrite & kRwCount) == 0, "the WRITE flag must not overlap the hold count");
+    static_assert(kRwCount == 0xffffffffull && kRwWrite == (1ull << 63),
+                  "bits 32..62 are reserved and must remain zero");
+    GuestRwlock* guest_rwlock_create() {
+        void* mem = calloc(1, sizeof(GuestRwlock));
+        if (!mem) return nullptr;
+        auto* g = new (mem) GuestRwlock{};
+        if (pthread_rwlock_init(&g->rw, nullptr) != 0) { g->~GuestRwlock(); free(mem); return nullptr; }
+        return g;
+    }
+    void guest_rwlock_destroy(GuestRwlock* g) {
+        if (!g) return;
+        pthread_rwlock_destroy(&g->rw);
+        g->~GuestRwlock();
+        free(g);
+    }
+    GuestRwlock* ensure_rwlock(uint64_t slot_addr) {
         if (!slot_addr) return nullptr;
         void** slot = (void**)(uintptr_t)slot_addr;
         void* cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
-        if (!pt_static_sentinel(cur)) return (pthread_rwlock_t*)cur;
-        auto* rw = (pthread_rwlock_t*)calloc(1, sizeof(pthread_rwlock_t));
-        pthread_rwlock_init(rw, nullptr);
-        if (__atomic_compare_exchange_n(slot, &cur, (void*)rw, false,
+        if (!pt_static_sentinel(cur)) return (GuestRwlock*)cur;
+        auto* g = guest_rwlock_create();
+        if (!g) return nullptr;
+        if (__atomic_compare_exchange_n(slot, &cur, (void*)g, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            return rw;
-        pthread_rwlock_destroy(rw); free(rw);
-        return (pthread_rwlock_t*)cur;
+            return g;
+        guest_rwlock_destroy(g);          // lost the init race: use the winner's object
+        return (GuestRwlock*)cur;
     }
     // scePthreadSem*: read the sem_t created by scePthreadSemInit (no static SEM_INITIALIZER, so no lazy
     // self-init -- Init is the sole creator). Returns null if the guest never called Init.
@@ -787,17 +834,252 @@ HLE(k_cond_timedwait) {
 // under the 15-thread IL2CPP pool -> data races. Real locking is a genuine correctness fix. ---
 HLE(k_rwlock_init) {
     if (!a0) return 0x16;
-    auto* rw = (pthread_rwlock_t*)calloc(1, sizeof(pthread_rwlock_t));
-    pthread_rwlock_init(rw, nullptr);
-    *(void**)a0 = rw;   // store handle through caller's slot (a1=attr, a2=name ignored)
+    auto* g = guest_rwlock_create();
+    if (!g) return 12;   // ENOMEM
+    *(void**)a0 = g;    // store handle through caller's slot (a1=attr, a2=name ignored)
     return 0;
 }
-HLE(k_rwlock_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_rwlock_destroy((pthread_rwlock_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
-HLE(k_rwlock_rdlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_rdlock(rw); return 0; }
-HLE(k_rwlock_wrlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_wrlock(rw); return 0; }
-HLE(k_rwlock_unlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_unlock(rw); return 0; }
-HLE(k_rwlock_tryrdlock){ auto* rw = ensure_rwlock(a0); return rw ? (uint64_t)pthread_rwlock_tryrdlock(rw) : 0x16; }
-HLE(k_rwlock_trywrlock){ auto* rw = ensure_rwlock(a0); return rw ? (uint64_t)pthread_rwlock_trywrlock(rw) : 0x16; }
+// PRE-EXISTING HAZARD, recorded rather than fixed (#2042): destroying a rwlock while another thread
+// is inside one of the handlers below frees the object under it. That was already true when the
+// object was a bare pthread_rwlock_t — the concurrent thread dereferenced it once — and the hold
+// accounting widens the window to a few atomics. Destroying a lock another thread may still be
+// using is a guest bug on any platform, and no title in the corpus is known to do it; closing it
+// properly needs a lifetime scheme (epoch or refcount) that is out of scope here.
+HLE(k_rwlock_destroy) {
+    if (a0 && !pt_static_sentinel(*(void**)a0)) guest_rwlock_destroy((GuestRwlock*)*(void**)a0);
+    if (a0) *(void**)a0 = nullptr;
+    return 0;
+}
+// An UNMATCHED unlock must never reach the host lock (#2012).
+//
+// glibc's pthread_rwlock_unlock is *undefined* when the lock is not held, and what it actually does
+// is unrecoverable: with the lock in read phase it takes the reader-release path and subtracts one
+// reader from `__readers`, so an unmatched unlock drives the reader count NEGATIVE. Every later
+// writer then blocks forever waiting for a reader population that can never drain, and every later
+// reader inherits a corrupt lock. There is no error, no signal, and no way back — one stray unlock
+// permanently bricks that rwlock.
+//
+// Measured on Sonic Racing: CrossWorlds (PPSA08804, UE5): the guest's own main thread parks in
+// pthread_rwlock_wrlock forever while the host lock reads __readers = 0xfffffff2 — WRLOCKED set and
+// a reader count of exactly -2, i.e. two more read-unlocks than read-locks. Nothing else in the
+// 64-thread process is spinning; the whole engine is waiting on that one thread.
+//
+// FreeBSD, the platform the guest was built against, cannot get into that state, and its rule is
+// specifically NOT "the caller must hold it":
+//   * `_pthread_rwlock_unlock` (libthr) checks the WRITE owner in userland -> EPERM for a non-owner
+//     write unlock.
+//   * everything else defers to `_umtx_op(UMTX_OP_RW_UNLOCK)`, which returns EPERM only when there
+//     is no write owner AND the reader count is zero. With readers present it decrements and
+//     succeeds — with no thread-identity check at all.
+// So a read hold taken on one thread and released on another is LEGAL there, and prosper must not
+// refuse it: `sceFiberRun` resumes a suspended fiber on whichever host thread calls it, so a fiber
+// that read-locks, yields, and is resumed elsewhere would release from a different host thread. A
+// per-thread rule would deadlock exactly the way this fix exists to prevent. The accounting
+// therefore lives WITH THE LOCK, not with the thread, and reproduces FreeBSD's rule directly.
+// CONFIDENCE: HIGH (libthr + the umtx path; the glibc corruption was read out of a live process).
+//
+// PROSPER_RWLOCKLOG=1 reports refusals, =2 every rwlock operation — both rate-limited per report
+// kind, so a flood of one kind cannot starve another (see rw_report). PROSPER_RWLOCK_UNSAFE_UNLOCK
+// (set to ANY value, including 0) restores the old forwarding so the A/B stays reproducible.
+namespace {
+    int rwlocklog() {
+        static const int lvl = []{ const char* e = getenv("PROSPER_RWLOCKLOG");
+                                   return e ? atoi(e) : 0; }();
+        return lvl;
+    }
+    // Under this hatch the accounting is KNOWINGLY UNSOUND, and that is the point: a refused unlock
+    // is forwarded to the host lock anyway while COUNT keeps its value, so COUNT stops tracking the
+    // outstanding host holds and later EPERMs and hangs are the reproduction, not new bugs. It
+    // exists so the A/B that established #2012 stays runnable. Never diagnose under it.
+    bool rwlock_unsafe_unlock() {
+        static const bool on = getenv("PROSPER_RWLOCK_UNSAFE_UNLOCK") != nullptr;
+        return on;
+    }
+    // The OS thread id, in the same vocabulary as /proc/<pid>/task and guest_bt. prosper_gettid()
+    // does not exist on Windows (posix_shim.hpp is entirely #ifndef _WIN32), so this mirrors the
+    // sctid() split above. Any live thread's id is non-zero on every platform, which is what makes
+    // `writer != 0` usable as "write-held".
+    uint64_t rw_self_tid() {
+#if defined(__linux__) || defined(__APPLE__)
+        return (uint64_t)prosper_gettid();
+#elif defined(_WIN32)
+        return (uint64_t)GetCurrentThreadId();
+#else
+        return (uint64_t)(uintptr_t)pthread_self();
+#endif
+    }
+    // WHY THE WRITE FLAG AND THE COUNT SHARE ONE WORD, written down because two earlier versions of
+    // this function got it wrong in two different ways and the second one looked airtight.
+    //
+    // A stray unlock — the thing this accounting exists to refuse — runs concurrently with real
+    // acquisitions, so any decision it makes by reading TWO atomics can be invalidated between the
+    // reads. Version 2 read `writer` then `holds`, which let the pair straddle a writer's acquire.
+    // Version 3 re-read `writer` after the decrement and undid it if an owner had appeared; that is
+    // an ABA test, and it only narrowed the window. It answers "is an owner here NOW?", never "did
+    // an owner come and go?", so this interleaving still slipped through (S = stray, W' and W" =
+    // balanced writers, all values permitted by the memory model):
+    //
+    //   1. idle: count=0, writer=0
+    //   2. S loads writer -> 0, takes the reader path
+    //   3. W' acquires: writer=W', count 0->1
+    //   4. S loads count -> 1
+    //   5. W' releases: count 1->0, writer=0, forwards its host unlock — the lock is free
+    //   6. S pre-checks writer -> 0, proceeds
+    //   7. W" acquires the free lock: writer=W", count 0->1
+    //   8. S's CAS expects count==1, and count IS 1 (W"'s) -> succeeds, count->0
+    //   9. W" releases: owner==self, decrement-if-positive finds 0, forwards its own host unlock
+    //  10. S post-checks writer -> 0 -> returns 0 -> forwards a SECOND host unlock on a free lock
+    //      -> glibc takes the reader path -> __readers negative -> #2012, reproduced by its own fix
+    //
+    // Reaching that needs S to be interrupted inside two ~2-instruction gaps, so a clean stress run
+    // does not refute it — which is exactly why it must be closed by construction rather than by
+    // testing. Folding WRITE into the counted word does that, and it kills the trace at step 4
+    // rather than step 8: W' publishes `WRITE|1`, so S's load sees bit 63 and takes the write
+    // branch, where `owner != self` refuses it. Even holding a reader-era `s`, S's CAS compares the
+    // whole 64-bit value against one that now reads `WRITE|1` — never equal — so it re-reads and
+    // re-decides. There is no interleaving in which a reader-path decrement commits against a
+    // write-held lock.
+    void rw_acquired(GuestRwlock* g, bool write) {
+        if (!write) { g->state.fetch_add(1, std::memory_order_acq_rel); return; }
+        // The owner store is sequenced-before the acq_rel CAS below, so any thread that observes
+        // WRITE through an acquire load of `state` has synchronized-with that CAS and therefore
+        // sees THIS owner value. That pairing — not any claim that `owner` is stable — is what
+        // makes reading `owner` before the CAS in rw_release sound; `owner` is genuinely NOT
+        // stable, because this store runs for the next writer before its WRITE becomes visible.
+        g->owner.store(rw_self_tid(), std::memory_order_release);
+        // `s` is 0 here, and the tight reason is worth recording: COUNT > 0 while the host lock is
+        // acquirable would require a host-side release that did not decrement COUNT, and the only
+        // construct that produces one is the PROSPER_RWLOCK_UNSAFE_UNLOCK escape hatch. The CAS
+        // loop rather than a plain store is a cheap concession to that hatch and to future callers.
+        uint64_t s = g->state.load(std::memory_order_acquire);
+        while (!g->state.compare_exchange_weak(s, (s | kRwWrite) + 1,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {}
+    }
+    // 0 = released (the caller may now unlock the host lock); EPERM = FreeBSD refuses this unlock
+    // and the host lock must not be touched.
+    int rw_release(GuestRwlock* g) {
+        const uint64_t self = rw_self_tid();
+        uint64_t s = g->state.load(std::memory_order_acquire);
+        for (;;) {
+            if (s & kRwWrite) {
+                // Only the owner may release a write hold (FreeBSD checks this in libthr). Reading
+                // `owner` before the CAS is sound by release/acquire pairing, not by stability: the
+                // acquire load of `state` that produced this WRITE synchronizes-with the owner's
+                // acq_rel CAS in rw_acquired, which its `owner.store(release)` is sequenced-before,
+                // so the value read here is that writer's. Read-read coherence also rules out the
+                // tid-reuse case — a later `owner` value cannot be observed before an earlier one.
+                if (g->owner.load(std::memory_order_acquire) != self) return EPERM;
+                // Clear WRITE and drop the count in ONE commit. Decrement-if-positive, so a count
+                // that somehow reached 0 cannot wrap to 4 billion and refuse every future unlock.
+                const uint64_t ns = (s & ~kRwWrite) - ((s & kRwCount) ? 1u : 0u);
+                if (!g->state.compare_exchange_weak(s, ns, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire))
+                    continue;                              // raced: re-read and re-decide
+                // Cleared before the caller forwards its host unlock, so the next writer to acquire
+                // cannot observe this owner.
+                g->owner.store(0, std::memory_order_release);
+                return 0;
+            }
+            if ((s & kRwCount) == 0) return EPERM;         // nothing held: refuse, lock untouched
+            // A read hold is released, and it need not be THIS thread's — nor even the same hold
+            // that was outstanding when `s` was loaded. That residual ABA is unobservable rather
+            // than merely tolerable: COUNT is a pure counter with no identity, nothing downstream
+            // of this CAS reads the value of `s`, and the caller forwards exactly one host unlock.
+            // The invariant that matters is COUNT == outstanding host holds, and a steal preserves
+            // it exactly — glibc goes N -> N-1 either way, and *which* reader was robbed is not a
+            // distinction this system can express. The robbed reader's own release then finds COUNT
+            // one short, takes a spurious EPERM and does NOT forward, so glibc lands at 0 rather
+            // than negative. (FreeBSD accepts the same unlock, but that is a coincidence of a
+            // matching design, not the reason this is safe — do not reason from it.)
+            if (g->state.compare_exchange_weak(s, s - 1, std::memory_order_acq_rel,
+                                               std::memory_order_acquire))
+                return 0;
+        }
+    }
+    // One counter per report KIND: a flood of one must not consume another's budget (the trap this
+    // repository records as asymmetric cap exhaustion). Each line carries its own kind's ordinal.
+    enum class RwReport { Failed, Unmatched, Trace, Count_ };
+    void rw_report(RwReport kind, const char* what, uint64_t slot, const GuestRwlock* g, int rc) {
+        static std::atomic<int> printed[(size_t)RwReport::Count_];
+        const int n = printed[(size_t)kind].fetch_add(1);
+        if (n >= 64 && (n & (n - 1)) != 0) return;   // first 64 of this kind, then powers of two
+        const uint64_t s = g ? g->state.load(std::memory_order_relaxed) : 0;
+        fprintf(stderr, "[rwlock] %s slot=0x%llx rw=%p rc=%d tid=%llu holds=%llu%s #%d\n", what,
+                (unsigned long long)slot, (const void*)g, rc,
+                (unsigned long long)rw_self_tid(),
+                (unsigned long long)(s & kRwCount), (s & kRwWrite) ? " WRITE" : "", n);
+    }
+    // A lock call that FAILED records no hold, and it is worth saying so: the handlers below still
+    // report success to the guest, which is the other way an unmatched unlock can originate inside
+    // prosper rather than in the guest (#2024).
+    void rw_note_lock_result(const char* what, uint64_t slot, GuestRwlock* g, int rc) {
+        if (rc == 0) { if (rwlocklog() >= 2) rw_report(RwReport::Trace, what, slot, g, 0); return; }
+        rw_report(RwReport::Failed, what, slot, g, rc);
+    }
+}
+HLE(k_rwlock_rdlock)  {
+    auto* g = ensure_rwlock(a0);
+    if (!g) return 0;
+    const int rc = pthread_rwlock_rdlock(&g->rw);
+    if (rc == 0) rw_acquired(g, false);
+    rw_note_lock_result("rdlock", a0, g, rc);
+    return 0;
+}
+HLE(k_rwlock_wrlock)  {
+    auto* g = ensure_rwlock(a0);
+    if (!g) return 0;
+    const int rc = pthread_rwlock_wrlock(&g->rw);
+    if (rc == 0) rw_acquired(g, true);
+    rw_note_lock_result("wrlock", a0, g, rc);
+    return 0;
+}
+HLE(k_rwlock_unlock)  {
+    auto* g = ensure_rwlock(a0);
+    if (!g) return 0;
+    const int rc = rw_release(g);
+    if (rc != 0) {
+        if (rwlocklog() || !rwlock_unsafe_unlock())
+            rw_report(RwReport::Unmatched,
+                      "UNMATCHED unlock: the lock is unheld, or write-held by another thread — "
+                      "refused (FreeBSD returns EPERM); forwarding it would corrupt the lock",
+                      a0, g, rc);
+        // POSIX spelling reports the bare FreeBSD errno; the Sony spelling is registered through
+        // SCE_PTHREAD_ALIAS below, which encodes it the way libkernel does (#1984's split).
+        if (!rwlock_unsafe_unlock()) return fbsd_errno(rc);
+        pthread_rwlock_unlock(&g->rw);   // PROSPER_RWLOCK_UNSAFE_UNLOCK: the pre-#2012 behaviour
+        return 0;
+    }
+    pthread_rwlock_unlock(&g->rw);
+    if (rwlocklog() >= 2) rw_report(RwReport::Trace, "unlock", a0, g, 0);
+    return 0;
+}
+HLE(k_rwlock_tryrdlock){
+    auto* g = ensure_rwlock(a0); if (!g) return 0x16;
+    const int rc = pthread_rwlock_tryrdlock(&g->rw);
+    if (rc == 0) rw_acquired(g, false);
+    // EAGAIN (host 11) is FreeBSD EDEADLK unmapped — the #1612 defect. Never a bare host errno.
+    return fbsd_errno(rc);
+}
+HLE(k_rwlock_trywrlock){
+    auto* g = ensure_rwlock(a0); if (!g) return 0x16;
+    const int rc = pthread_rwlock_trywrlock(&g->rw);
+    if (rc == 0) rw_acquired(g, true);
+    return fbsd_errno(rc);
+}
+// The Sony spellings report failure in the libkernel encoding; the POSIX ones keep the bare errno.
+// Same split, and the same reason, as the mutex aliases above — but note the evidence boundary:
+// #1984's proof is the shipped guest libc.prx comparing MUTEX and CONDVAR results against the
+// encoded constants. No guest code has been observed testing an encoded RWLOCK result, so applying
+// it here is an extrapolation from a consistent libkernel-wide convention rather than a direct
+// observation. It is the safer of the two errors (a guest that only tests == 0 is unaffected either
+// way), and it makes the family self-consistent. CONFIDENCE: MED.
+// Init is aliased too: it can fail with ENOMEM (a failed allocation), so it is not a can't-fail
+// entry point.
+SCE_PTHREAD_ALIAS(k_sce_rwlock_init,      k_rwlock_init)
+SCE_PTHREAD_ALIAS(k_sce_rwlock_unlock,    k_rwlock_unlock)
+SCE_PTHREAD_ALIAS(k_sce_rwlock_tryrdlock, k_rwlock_tryrdlock)
+SCE_PTHREAD_ALIAS(k_sce_rwlock_trywrlock, k_rwlock_trywrlock)
 HLE(k_rwlockattr_init) {
     if (!a0) return 0x16;
     auto* attr = (pthread_rwlockattr_t*)calloc(1, sizeof(pthread_rwlockattr_t));
@@ -1851,19 +2133,96 @@ HLE(k_cond_timedwait_sce) {
 // Were MISSING -> the generic stub returned 0 (= "lock held") without taking the lock, so the guest ran
 // its critical section unguarded (the same silent-unsync / heap-race class as k_mutex_timedlock above).
 HLE(k_rwlock_timedrdlock) {
-    auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;   // EINVAL
+    auto* g = ensure_rwlock(a0); if (!g) return 0x16;   // EINVAL
     timespec dl = abs_deadline_us(a1);
-    int rc = pthread_rwlock_timedrdlock(rw, &dl);
+    int rc = pthread_rwlock_timedrdlock(&g->rw, &dl);
+    if (rc == 0) rw_acquired(g, false);   // record the hold so its unlock is not refused (#2012)
     // EAGAIN here means "too many concurrent readers"; unmapped it reached the guest as
     // FreeBSD EDEADLK, turning a retryable condition into a deadlock report (#1612).
     return fbsd_errno(rc);
 }
 HLE(k_rwlock_timedwrlock) {
-    auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;   // EINVAL
+    auto* g = ensure_rwlock(a0); if (!g) return 0x16;   // EINVAL
     timespec dl = abs_deadline_us(a1);
-    int rc = pthread_rwlock_timedwrlock(rw, &dl);
+    int rc = pthread_rwlock_timedwrlock(&g->rw, &dl);
+    if (rc == 0) rw_acquired(g, true);    // record the hold so its unlock is not refused (#2012)
     return fbsd_errno(rc);
 }
+// The POSIX spellings libScePosix exports alongside the Sony ones. They were NOT registered, so the
+// dispatcher answered its default 0 — "you hold the lock" — for a lock nobody took (#2012). That is
+// the silent-unsync class, and here it was also the *source* of the unmatched unlocks that corrupt
+// the host rwlock: Sonic Racing: CrossWorlds calls `pthread_rwlock_trywrlock` (`XhWHn6P5R7U`, one of
+// exactly 21 unimplemented NIDs in its boot), is told it succeeded, runs the critical section and
+// then unlocks a lock it never held.
+//
+// Two argument shapes, and they must NOT share a body:
+//   * scePthreadRwlockTimedrd/wrlock take a RELATIVE µs scalar   (handled above)
+//   * pthread_rwlock_timedrd/wrlock  take an ABSOLUTE timespec*  (POSIX, CLOCK_REALTIME)
+//   * pthread_rwlock_reltimedrd/wrlock_np take a RELATIVE timespec*
+// Aliasing the first two is the same defect the k_cond_timedwait note above records.
+namespace {
+    // Read a guest timespec; FreeBSD and Linux agree on {time_t tv_sec; long tv_nsec} for x86-64.
+    bool read_guest_timespec(uint64_t addr, timespec& out) {
+        if (!addr) return false;
+        const auto* ts = (const timespec*)(uintptr_t)addr;
+        out.tv_sec = ts->tv_sec;
+        out.tv_nsec = ts->tv_nsec;
+        return true;
+    }
+    // A relative timeout expressed against CLOCK_REALTIME, because that is the clock the host's
+    // timed rwlock waits on; a wall-clock jump therefore shifts it, which is the same exposure
+    // every other abs_deadline_us() caller in this file already has.
+    timespec rel_to_abs(const timespec& rel) {
+        timespec now{};
+        clock_gettime(CLOCK_REALTIME, &now);
+        timespec dl{now.tv_sec + rel.tv_sec, now.tv_nsec + rel.tv_nsec};
+        // Normalize by division, not by subtraction in a loop: an out-of-spec tv_nsec near LONG_MAX
+        // would be ~9.2e9 iterations. Without normalizing at all, glibc answers EINVAL instead of
+        // timing out.
+        if (dl.tv_nsec >= 1000000000L) {
+            dl.tv_sec += dl.tv_nsec / 1000000000L;
+            dl.tv_nsec %= 1000000000L;
+        }
+        return dl;
+    }
+}
+HLE(k_posix_rwlock_timedrdlock) {
+    auto* g = ensure_rwlock(a0); if (!g) return 0x16;
+    timespec dl{}; if (!read_guest_timespec(a1, dl)) return 0x16;
+    const int rc = pthread_rwlock_timedrdlock(&g->rw, &dl);
+    if (rc == 0) rw_acquired(g, false);
+    return fbsd_errno(rc);
+}
+HLE(k_posix_rwlock_timedwrlock) {
+    auto* g = ensure_rwlock(a0); if (!g) return 0x16;
+    timespec dl{}; if (!read_guest_timespec(a1, dl)) return 0x16;
+    const int rc = pthread_rwlock_timedwrlock(&g->rw, &dl);
+    if (rc == 0) rw_acquired(g, true);
+    return fbsd_errno(rc);
+}
+// The `_np` pair takes a RELATIVE timespec*. No title in the corpus is yet known to call these, so
+// the shape follows the documented `_np` convention rather than live evidence; registering them is
+// still strictly better than the dispatcher's default 0, which claims the lock was acquired.
+// CONFIDENCE: MED.
+HLE(k_posix_rwlock_reltimedrdlock) {
+    auto* g = ensure_rwlock(a0); if (!g) return 0x16;
+    timespec rel{}; if (!read_guest_timespec(a1, rel)) return 0x16;
+    timespec dl = rel_to_abs(rel);
+    const int rc = pthread_rwlock_timedrdlock(&g->rw, &dl);
+    if (rc == 0) rw_acquired(g, false);
+    return fbsd_errno(rc);
+}
+HLE(k_posix_rwlock_reltimedwrlock) {
+    auto* g = ensure_rwlock(a0); if (!g) return 0x16;
+    timespec rel{}; if (!read_guest_timespec(a1, rel)) return 0x16;
+    timespec dl = rel_to_abs(rel);
+    const int rc = pthread_rwlock_timedwrlock(&g->rw, &dl);
+    if (rc == 0) rw_acquired(g, true);
+    return fbsd_errno(rc);
+}
+// Sony spellings of the timed acquisitions encode their failure the libkernel way (#1984).
+SCE_PTHREAD_ALIAS(k_sce_rwlock_timedrdlock, k_rwlock_timedrdlock)
+SCE_PTHREAD_ALIAS(k_sce_rwlock_timedwrlock, k_rwlock_timedwrlock)
 // scePthreadSem* -- POSIX-style counting semaphores (DISTINCT from sceKernelCreateSema). Were MISSING ->
 // the generic stub returned 0: SemInit created nothing, SemWait returned immediately (never blocked),
 // SemGetvalue left *value uninitialized -> a producer/consumer or gate built on these got NO
@@ -3422,15 +3781,23 @@ void register_kernel_hle() {
     R("scePthreadCondWait", k_cond_wait);
     R("scePthreadCondTimedwait", k_cond_timedwait_sce);   // Sony: relative µs, NOT the POSIX abstime form
     // read/write locks + once (Sony + POSIX names) — real host primitives (thread-safety fix).
-    R("scePthreadRwlockInit", k_rwlock_init);        R("pthread_rwlock_init", k_rwlock_init);
+    R("scePthreadRwlockInit", k_sce_rwlock_init);    R("pthread_rwlock_init", k_rwlock_init);
     R("scePthreadRwlockDestroy", k_rwlock_destroy);  R("pthread_rwlock_destroy", k_rwlock_destroy);
     R("scePthreadRwlockRdlock", k_rwlock_rdlock);    R("pthread_rwlock_rdlock", k_rwlock_rdlock);
     R("scePthreadRwlockWrlock", k_rwlock_wrlock);    R("pthread_rwlock_wrlock", k_rwlock_wrlock);
-    R("scePthreadRwlockUnlock", k_rwlock_unlock);    R("pthread_rwlock_unlock", k_rwlock_unlock);
-    R("scePthreadRwlockTryrdlock", k_rwlock_tryrdlock);
-    R("scePthreadRwlockTrywrlock", k_rwlock_trywrlock);
-    R("scePthreadRwlockTimedrdlock", k_rwlock_timedrdlock);   // were MISSING -> faked "locked" without locking
-    R("scePthreadRwlockTimedwrlock", k_rwlock_timedwrlock);
+    R("scePthreadRwlockUnlock", k_sce_rwlock_unlock); R("pthread_rwlock_unlock", k_rwlock_unlock);
+    R("scePthreadRwlockTryrdlock", k_sce_rwlock_tryrdlock);
+    R("scePthreadRwlockTrywrlock", k_sce_rwlock_trywrlock);
+    // The POSIX spellings libScePosix exports. Unregistered they fell to the dispatcher's default 0,
+    // i.e. "the lock is yours" for a lock nobody took (#2012).
+    R("pthread_rwlock_tryrdlock", k_rwlock_tryrdlock);
+    R("pthread_rwlock_trywrlock", k_rwlock_trywrlock);
+    R("pthread_rwlock_timedrdlock", k_posix_rwlock_timedrdlock);      // ABSOLUTE timespec*
+    R("pthread_rwlock_timedwrlock", k_posix_rwlock_timedwrlock);      // ABSOLUTE timespec*
+    R("pthread_rwlock_reltimedrdlock_np", k_posix_rwlock_reltimedrdlock);   // RELATIVE timespec*
+    R("pthread_rwlock_reltimedwrlock_np", k_posix_rwlock_reltimedwrlock);   // RELATIVE timespec*
+    R("scePthreadRwlockTimedrdlock", k_sce_rwlock_timedrdlock);   // were MISSING -> faked "locked" without locking
+    R("scePthreadRwlockTimedwrlock", k_sce_rwlock_timedwrlock);
     R("scePthreadRwlockattrInit", k_rwlockattr_init);
     R("scePthreadRwlockattrDestroy", k_rwlockattr_destroy);
     R("pthread_rwlockattr_init", k_rwlockattr_init);
