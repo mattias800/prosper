@@ -104,13 +104,20 @@ dozen concurrent agent lanes live (load average 16–33 on 32 logical cores), th
 videos alone* were still on screen at **t = 185 s** — they are decoded in software, because
 `[avp-vaapi] … Not yet implemented in FFmpeg` makes the VA-API H.264 hwaccel fail on this dump, so the
 splash is CPU-bound and stretches with load. Every Cross in the route then lands in the wrong state and
-the run reaches only black. Two arms differing **only** in the recompiler patch under test behaved
-identically (content at t≈150–185 s, then a frozen black composited frame with `distinct_rgb_colors=1`
-from t≈190 s), and one arm additionally ended its guest thread with a `SIGSEGV` after a burst of
-`tlsf_add_pool: Memory size must be between 0x28 and 0x100000000` — so **a black routed Syberia run
-under load is an apparatus result, not a title or renderer regression.** Confirm the timetable above
-still holds (the save warning must appear by ~15 s) before reading anything into a routed capture, and
-prefer an uncontended box for this title.
+the run reaches only black or an intro logo.
+
+Two concurrent arms, identical except for the recompiler patch under test (one `origin/master`, one
+patched), were indistinguishable through every state either reached: 253 colours / ~2,780 non-black
+pixels at t=12 s, the full-frame Microids logo video (~35,000 colours, all 2,073,600 pixels non-black)
+at t=216–228 s, and the same engine-logo wireframe animation a few frames apart at t=480 s. **Neither
+reached the profile menu**, which the timetable puts at 183 s. An earlier pair froze on the *identical*
+black composited frame (`pixel_crc32=064567f8`, `distinct_rgb_colors=1`) from t≈190 s onward — again on
+both the patched and the unpatched binary — and one arm ended its guest thread with a `SIGSEGV` after a
+burst of `tlsf_add_pool: Memory size must be between 0x28 and 0x100000000`.
+
+So **a black or logo-stuck routed Syberia run under load is an apparatus result, not a title or
+renderer regression.** Confirm the timetable above still holds (the save warning must appear by ~15 s)
+before reading anything into a routed capture, and prefer an uncontended box for this title.
 
 ## BC6H cube decode cost — 2026-08-03
 
