@@ -49,7 +49,7 @@ Last updated: 2026-08-04
 | *The Forgotten City* | `PPSA03026` | Unreal Engine | 🚧 Title screen | [#1890](https://github.com/mattias800/prosper/issues/1890) |
 | *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
 | *Little Nightmares III* | `PPSA05143` | — | 🔬 Graphics setup; startup fault before title | [#1893](https://github.com/mattias800/prosper/issues/1893) |
-| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | — | 🔬 CPU boot reaches initial AGC setup; no visual milestone | [#1894](https://github.com/mattias800/prosper/issues/1894) |
+| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Engine bootstrap completes; the first synchronous package load never returns, so no frame is composited | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🔬 Live frame loop; the guest stops on Unity's empty transition scene, so every frame is black | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Title screen | [#1898](https://github.com/mattias800/prosper/issues/1898) |
@@ -282,7 +282,12 @@ The CPU-only baseline reaches graphics setup, then faults on a denied low-addres
 
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
 
-No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1894).
+The title is Unreal Engine 4.27 with IoStore packaging. It boots into a native Linux/Vulkan run and completes
+engine bootstrap — config, plugin manifest, asset registry, the global shader cache, the title's own shader
+archive and the Slate style set all load, 429 asset reads and no failures — and then the game thread blocks
+forever on its first synchronous package load. The engine never requests a single byte from the IoStore content
+container, submits exactly one command buffer carrying no draws, and composites no frame, so the display stays
+black and no screenshot is published. See the [tracker](https://github.com/mattias800/prosper/issues/1894).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
 
