@@ -13,10 +13,12 @@
 #include "../src/gpu/tile.hpp"
 #include <cstdio>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace prosper;
@@ -170,6 +172,43 @@ public:
     bool next_video(int, video::VideoFrame&) override { return false; }
     bool next_audio(int, video::AudioFrame&) override { return false; }
     bool eof(int) override { return true; }
+    void close(int) override {}
+};
+
+// #1973 — a source NOBODY CONSUMES. prosper's host decode workers fill a small bounded queue and
+// block while it is full, so a guest that starts a movie and never pulls a frame leaves the queue
+// full forever: frames are always available to anyone who asks, and the decoder can never finish.
+// eof() therefore stays false for as long as the session lives, which is exactly the state
+// PPSA27624 sat in (14,843 sceAvPlayerIsActive polls, zero GetVideoDataEx calls, no STOP).
+class UnconsumedVideoBackend final : public video::VideoBackend {
+public:
+    static constexpr uint32_t kWidth = 64;
+    static constexpr uint32_t kHeight = 64;
+    static constexpr uint64_t kFrameUs = 16'667;
+    // Deliberately short, so the guard exercises a real wall-clock timeline in under a second.
+    uint64_t duration_us = 300'000;
+    uint64_t cursor = 0;
+    std::vector<uint8_t> nv12 =
+        std::vector<uint8_t>(static_cast<size_t>(kWidth) * (kHeight + kHeight / 2), 0x20);
+
+    int open(const std::string&) override { cursor = 0; return 51; }
+    bool info(int id, video::StreamInfo& out) override {
+        if (id != 51) return false;
+        out.width = kWidth; out.height = kHeight; out.fps = 60.0f;
+        out.has_audio = false; out.duration_us = duration_us;
+        return true;
+    }
+    bool next_video(int id, video::VideoFrame& out) override {
+        if (id != 51) return false;
+        out.y = nv12.data();
+        out.uv = nv12.data() + static_cast<size_t>(kWidth) * kHeight;
+        out.width = kWidth; out.height = kHeight; out.y_stride = kWidth; out.uv_stride = kWidth;
+        out.pts_us = cursor * kFrameUs;
+        ++cursor;
+        return true;
+    }
+    bool next_audio(int, video::AudioFrame&) override { return false; }
+    bool eof(int) override { return false; }
     void close(int) override {}
 };
 
@@ -586,6 +625,118 @@ int main() {
         CHECK(jump(seek_handle, 500, 0, 0, 0, 0) != 0 && seeker.cursor > 0,
               "a backend that refuses the seek yields an error and leaves the position alone");
         close(seek_handle, 0, 0, 0, 0, 0);
+    }
+
+    // ---- the media clock (#1973) ---------------------------------------------------------------
+    // Playback used to end only when the DECODER finished and its queue drained. That signal is
+    // unreachable for a source nobody pulls from, because prosper's decode workers block on a full
+    // queue — so PPSA27624 polled sceAvPlayerIsActive forever on a movie that could not end. A real
+    // player is clocked: the media plays out whether or not the application collects frames.
+    //
+    // The two arms below are the whole contract. The clock must end an UNCONSUMED source at its own
+    // media duration, and it must never touch a source something is still pulling from — every
+    // title that plays video today (PPSA02664, PPSA02849, PPSA30490) is in the second arm.
+    {
+        using clock = std::chrono::steady_clock;
+        constexpr uint64_t kDurationMs = 300;   // UnconsumedVideoBackend::duration_us
+        UnconsumedVideoBackend stalled;
+        prosper::video::set_backend(&stalled);
+        AvpInitData clock_data{};
+        clock_data.event.event_callback = (void*)&on_avplayer_event;
+
+        event_count = 0;
+        uint64_t unconsumed = init((uint64_t)(uintptr_t)&clock_data, 0, 0, 0, 0, 0);
+        CHECK(add(unconsumed, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0 &&
+                  start(unconsumed, 0, 0, 0, 0, 0) == 0,
+              "an unconsumed source starts on a backend whose decoder can never finish");
+        const auto unconsumed_start = clock::now();
+        CHECK(active(unconsumed, 0, 0, 0, 0, 0) == 1,
+              "an unconsumed player is still active while its media is still playing");
+        uint64_t played_out_after_ms = 0;
+        bool played_out = false;
+        while (clock::now() - unconsumed_start < std::chrono::seconds(10)) {
+            if (active(unconsumed, 0, 0, 0, 0, 0) == 0) {
+                played_out = true;
+                played_out_after_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    clock::now() - unconsumed_start).count();
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(played_out,
+              "a source no consumer ever pulls from still reaches the end of its media (#1973)");
+        CHECK(played_out && played_out_after_ms >= kDurationMs,
+              "the media clock never ends a movie before the media itself would have ended");
+        CHECK(event_count == 3 && events[0] == 2 && events[1] == 3 && events[2] == 1,
+              "playing out on the media clock fires exactly one STOP, after READY and PLAY");
+        CHECK(active(unconsumed, 0, 0, 0, 0, 0) == 0 && event_count == 3,
+              "a played-out player stays inactive without repeating STOP");
+        close(unconsumed, 0, 0, 0, 0, 0);
+
+        // THE ARM THAT PROTECTS THE CORPUS. Same never-finishing backend, same short duration — the
+        // only difference is that this player is being pulled from. It must stay active for as long
+        // as it is, however far past the media duration that runs: a title whose movie plays back
+        // slower than real time (prosper renders below 60 FPS routinely) must not be cut short.
+        event_count = 0;
+        uint64_t consumer = init((uint64_t)(uintptr_t)&clock_data, 0, 0, 0, 0, 0);
+        CHECK(add(consumer, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0 &&
+                  start(consumer, 0, 0, 0, 0, 0) == 0,
+              "a consumed source starts on the same never-finishing backend");
+        bool consumer_stayed_active = true;
+        unsigned consumer_frames = 0;
+        const auto consumer_start = clock::now();
+        // Four times the clock's own deadline (duration + its guard band), so an over-eager clock
+        // has ample room to fire.
+        while (clock::now() - consumer_start < std::chrono::milliseconds(4 * (kDurationMs + 250))) {
+            AvpFrameInfoEx pulled{};
+            if (video(consumer, (uint64_t)(uintptr_t)&pulled, 0, 0, 0, 0) == 1) ++consumer_frames;
+            if (active(consumer, 0, 0, 0, 0, 0) == 0) { consumer_stayed_active = false; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(consumer_stayed_active && consumer_frames > 0,
+              "a player that keeps pulling frames is never ended by the media clock");
+        CHECK(event_count == 2,
+              "a consumed player fires no STOP while something is still asking it for frames");
+        close(consumer, 0, 0, 0, 0, 0);
+
+        // A pause is not an absent consumer. The guest holds the player paused (PPSA30490 does this
+        // around a seek); nothing is presented and nothing should be pulled, so resuming must
+        // restart the clock rather than find the whole media duration already spent.
+        event_count = 0;
+        uint64_t held = init((uint64_t)(uintptr_t)&clock_data, 0, 0, 0, 0, 0);
+        CHECK(add(held, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0 &&
+                  start(held, 0, 0, 0, 0, 0) == 0 && pause(held, 0, 0, 0, 0, 0) == 0,
+              "a paused source starts and pauses on the never-finishing backend");
+        bool paused_stayed_active = true;
+        const auto pause_start = clock::now();
+        while (clock::now() - pause_start < std::chrono::milliseconds(2 * (kDurationMs + 250))) {
+            if (active(held, 0, 0, 0, 0, 0) == 0) { paused_stayed_active = false; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(paused_stayed_active && event_count == 3 && events[2] == 4,
+              "a paused player stays active however long it is held, and fires no STOP");
+        CHECK(resume(held, 0, 0, 0, 0, 0) == 0 && active(held, 0, 0, 0, 0, 0) == 1,
+              "resuming after a long pause restarts the media clock instead of expiring it");
+        close(held, 0, 0, 0, 0, 0);
+
+        // No duration, no clock. A container that does not say how long it is gives prosper nothing
+        // to reason about, and inventing an end is exactly the lie #1949 was about.
+        stalled.duration_us = 0;
+        event_count = 0;
+        uint64_t timeless = init((uint64_t)(uintptr_t)&clock_data, 0, 0, 0, 0, 0);
+        CHECK(add(timeless, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0 &&
+                  start(timeless, 0, 0, 0, 0, 0) == 0,
+              "a source with no reported duration starts");
+        bool timeless_stayed_active = true;
+        const auto timeless_start = clock::now();
+        while (clock::now() - timeless_start < std::chrono::milliseconds(4 * (kDurationMs + 250))) {
+            if (active(timeless, 0, 0, 0, 0, 0) == 0) { timeless_stayed_active = false; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(timeless_stayed_active && event_count == 2,
+              "a source whose duration is unknown is never clocked out, and fires no STOP");
+        close(timeless, 0, 0, 0, 0, 0);
+        prosper::video::set_backend(nullptr);
     }
 
 #ifndef _WIN32

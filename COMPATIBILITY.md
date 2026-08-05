@@ -51,7 +51,7 @@ Last updated: 2026-08-05
 | *Little Nightmares III* | `PPSA05143` | Unreal Engine 4 | 🚧 Boot splash sequence; render thread stalls before the title | [#1893](https://github.com/mattias800/prosper/issues/1893) |
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Engine bootstrap completes; the first synchronous package load never returns, so no frame is composited | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
-| *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🔬 Live frame loop; the guest stops on Unity's empty transition scene, so every frame is black | [#1897](https://github.com/mattias800/prosper/issues/1897) |
+| *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Health warning and title screen; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Title screen | [#1898](https://github.com/mattias800/prosper/issues/1898) |
 
 ## Screenshots and short descriptions
@@ -315,14 +315,15 @@ The route reaches Training 1 with a live rail-shooter camera, HUD, crosshair, an
 
 ## Bendy and the Dark Revival — `PPSA27624`
 
-The title boots into a live native Linux/Vulkan frame loop, and every composited frame is uniformly black, so no
-screenshot is published. The guest loads its Unity bootstrap scene and then `Core/2_General/Empty.unity`, never
-requests `Core/2_General/Game.unity` or any `Core/3_Sections/Section_*` scene, and submits exactly two draws per
-submit for the whole run — the empty scene rendered faithfully. Prosper rejects no shader, packet or format on this
-boot, and the sibling *Bendy and the Ink Machine* renders its menu from the same build as a positive control. Its
-opening video now demuxes correctly — the guest's own file-replacement reader supplies the clip that lives inside
-`Media/resources.resource` — but the title still does not reach visible content. See
-the [tracker](https://github.com/mattias800/prosper/issues/1897).
+<p align="center"><img src="assets/screenshots/bendy-dark-revival-title.png" alt="Bendy and the Dark Revival — title screen"></p>
+
+A default launch reaches the multi-language photosensitivity warning and then the title screen and its BEGIN menu at
+native 3840×2160. The title had previously stopped on Unity's empty transition scene, waiting on an opening movie
+that could not finish: the guest starts the clip and never collects a frame, and prosper's decode worker only
+advances when someone pulls, so playback never ended. The player now runs the source on its own media clock, the
+movie plays out, and the boot proceeds. The menu's background video decodes and is delivered to the guest but is not
+composited, so the menu sits on a flat grey background. See the
+[tracker](https://github.com/mattias800/prosper/issues/1897).
 
 ## Beneath — `PPSA27640`
 
