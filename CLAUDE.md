@@ -86,7 +86,7 @@ shared-GPU policy, the instrument-not-the-subject list, and the dated current ha
 | *Dragon Quest VII Reimagined* `PPSA17942` (a.k.a. DOLL) | rung 2 — title, name entry, onboarding; composition defect and gameplay open | `docs/DRAGON_QUEST_STATUS.md` |
 | *Nikoderiko* `PPSA23760` | rung 2 — 3D world dropped; **blocked on #305**, not on the recompiler | `docs/NIKODERIKO_STATUS.md` |
 | *Asterix & Obelix: Babylon Mission* `PPSA30490` | rung 2 — logo movies, intro cutscene and title menu; the video-splash seek deadlock is fixed (#1949) | `docs/ASTERIX_BABYLON_STATUS.md` |
-| *The Oregon Trail* `PPSA19244` | rung 1 — legal popup, Gameloft splash and health warning on a default launch; stalls before the title screen on a declined AGC ordered-DMA submit. #1945 still fires intermittently; Slate glyphs draw as solid blocks (#1946) | `docs/OREGON_TRAIL_STATUS.md` |
+| *The Oregon Trail* `PPSA19244` | rung 2 — title screen rendered on a default launch (60 s / 3,689 frames clean); the ordered-DMA stall is fixed (#1987) and **#1945 no longer reproduces here** (0 of 9 arms — use `PPSA21406` for that repro). Slate glyphs draw as solid blocks (#1946) | `docs/OREGON_TRAIL_STATUS.md` |
 | *ArcRunner* `PPSA21406` | rung 0 — renderer bring-up reaches real GPU submissions, then the render thread faults (#1226) | `docs/ARCRUNNER_STATUS.md` |
 | *GRIS*, *Space Adventure Cobra*, *Sonic Origins* | rung 3 / rung 3 / rung 0 — complete Sonic Origins Plus install; black-frame cause open (#1905) | `docs/GRIS_SONIC_COBRA_BRINGUP.md` |
 | Astro Bot, The Plucky Squire, The Pathless | active orchestration lanes | `docs/GAME_COMPAT_ORCHESTRATION.md` |

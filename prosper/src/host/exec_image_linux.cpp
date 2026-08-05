@@ -2197,7 +2197,7 @@ namespace {
                 // be a guest address; de-duplicate pages and cap the list so a 16-register dump
                 // cannot flood the terminal fault report.
                 uint64_t probe_pages[12];
-                unsigned probe_page_n = 0;
+                unsigned probe_page_n = 0, probe_page_considered = 0;
                 {
                     const uint64_t cand[] = {
                         (uint64_t)(uintptr_t)g_fault_addr, g_rax, g_rbx, g_rcx, g_rdx, g_rsi, g_rdi,
@@ -2210,14 +2210,22 @@ namespace {
                         const uint64_t pg = v & ~0xfffull;
                         bool dup = false;
                         for (unsigned i = 0; i < probe_page_n; i++) dup = dup || probe_pages[i] == pg;
-                        if (!dup && probe_page_n < (unsigned)(sizeof probe_pages / sizeof probe_pages[0]))
+                        if (dup) continue;
+                        // Count every distinct eligible page, then keep what fits. Reporting only
+                        // the kept count would make a truncated probe read as an exhaustive one —
+                        // the very failure this widening exists to remove — so print kept/considered.
+                        probe_page_considered++;
+                        if (probe_page_n < (unsigned)(sizeof probe_pages / sizeof probe_pages[0]))
                             probe_pages[probe_page_n++] = pg;
                     }
                 }
                 {
-                    char cb[160];
-                    int cn = snprintf(cb, sizeof cb, "[faultobj] rcx=0x%llx rdx=0x%llx probe-pages=%u\n",
-                                      (unsigned long long)g_rcx, (unsigned long long)g_rdx, probe_page_n);
+                    char cb[176];
+                    int cn = snprintf(cb, sizeof cb,
+                                      "[faultobj] rcx=0x%llx rdx=0x%llx probe-pages=%u/%u%s\n",
+                                      (unsigned long long)g_rcx, (unsigned long long)g_rdx,
+                                      probe_page_n, probe_page_considered,
+                                      probe_page_n < probe_page_considered ? " (CAPPED)" : "");
                     raw_write(2, cb, (size_t)cn);
                     if (prosper_gpu_write_ring_scan) {
                         static char ring[8192];
