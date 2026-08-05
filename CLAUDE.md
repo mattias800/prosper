@@ -305,6 +305,30 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   `return 1` makes it progress, and the change looks like progress in a screenshot. If a title cannot
   advance because content is genuinely absent, that is the honest result — record it as the blocker
   and, if the content exists locally, wire it through the inventory. `CONFIDENCE: HIGH`.
+  - **The positive half of the same rule, and it is an obligation: every feature and every piece of
+    content that IS in the dump must be reachable.** Under-reporting what is present is as much a
+    defect as over-reporting it would be a circumvention — it just fails in the direction that looks
+    safe, so nobody files it. A stub that answers a local-inventory question with 0 silently removes
+    content the user has, and the title is then behaving *correctly* on a wrong answer, which is the
+    hardest kind of bug to see: the game's own UI explains the problem in the game's own words, so it
+    reads as a licensing wall rather than as our defect.
+  - **The test that separates the two cases is whether the answer is derivable from bytes in the
+    dump.** "What SKU is this installed application?" is a *platform* query about local content —
+    `param.json`'s `contentId`, `applicationCategoryType`, `applicationDrmType` all state it offline,
+    so reimplement it faithfully, exactly as `GetVersionEx` is reimplemented. "Did this person buy X?"
+    is not derivable from anything local, and no amount of engineering makes it so — stop there and
+    record the cap. Derive; never hardcode a full/owned answer. A dump that is a free or trial SKU
+    must report that SKU, and the regression test proving you derived rather than hardcoded is a
+    **mutation arm where a synthesized free-SKU declaration yields the non-full answer**. Without that
+    arm the change is indistinguishable from `return <full>`.
+  - **Answer the same question the same way through every library that exposes it.** Sony surfaces SKU
+    and add-content state through more than one library, and a divergence between them is a defect
+    even when each path looks defensible alone. Worked example (#1873): `hle_service.cpp`'s
+    `sceAppContentAppParamGetInt` answered `SKU_FLAG` as full while
+    `sceNpEntitlementAccessGetSkuFlag` was unregistered and fell to the return-0 stub — so the answer
+    depended on which library the guest happened to ask through, and *Grand Theft Auto V* asks through
+    the NP one. Put the derivation in **one** place both paths call; if two paths can still disagree
+    after a fix, the defect has moved rather than gone.
 - **PR verification and merging.** Keep each PR description self-contained: link the issue or goal, explain the
   failure scenario and behavioral contract, summarize the approach and important invariants, identify affected
   and deliberately unaffected behavior, record risks, and list the exact build/test/snapshot commands and
