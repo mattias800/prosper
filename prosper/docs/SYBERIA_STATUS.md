@@ -249,6 +249,66 @@ The fixed screenshot is visually equivalent to the baseline: the same dark, over
 gameplay composite remains. This closes a real, consumed shader gap but does **not** localize or fix
 the visible #1627 defect, and it is not a reason to advance the compatibility rung or replace the
 published screenshot.
+
+## Gameplay composite localized: fifteen dropped forward-pass draws — 2026-08-05
+
+`#1627` was auto-closed by PR #1821's `Fixes #1627` even though that PR's own evidence said the image
+was unchanged; it is reopened. The defect is now localized, and it is **not** a lost renderer-owned
+target, an exposure/tonemap input, or a temporal history buffer. It is fifteen ordinary draws that the
+recompiler refused, all on one instruction shape.
+
+Offline on the retained gameplay F9 capture (submit 4347 — 1,967 draws, 110 dispatches, 2,100
+operations, taken on the validated `reach-gameplay.pad` route), `gpu_replay --inspect-only` reports 23
+unrealized operations. **Sixteen are draws**, and fifteen of those carry `reason=shader-recompile`.
+Every one targets the same 1920x1080 `R11G11B10F` HDR surface with `cwm=7`, in the frame's forward /
+lighting pass:
+
+| failure | source draw | vertices | depth | blend |
+|---|---|---|---|---|
+| 3 | 1885 | 81 | `1/1/2` (depth write) | 0 |
+| 4 | 1886 | **38,994** | `1/1/2` (depth write) | 0 |
+| 6–18 | 1924…1963 | 36–3,600 | `1/0/6` (test only) | 1 |
+
+Their vertex stages recompile. The **fragment** stages do not, and
+`gpu_replay --retry-failed-stage F:1` under `PROSPER_DBG=1` reports the identical first reject in all
+fifteen — for example failure 3:
+
+```
+[recompile-reject] pc=1827 words=261414fa,ff01110a fmt=6 op=0x13 dpp=1
+```
+
+`llvm-mc -arch=amdgcn -mcpu=gfx1010` decodes that pair as
+**`v_min_u32_dpp v10, v10, v10 row_shr:1 row_mask:0xf bank_mask:0xf`**. `shader_inspect` shows it is
+the head of the standard Wave64 unsigned-minimum reduction — `row_shr:1,2,4,8`, then
+`v_permlanex16_b32`, then `v_readlane_b32 s0,v10,31` / `s1,v10,63` — i.e. the Forward+ light-list
+scalarization that turns a divergent light index into a wave-uniform scalar. It occurs twice per
+program (a second site at pc 2802 in the same shader).
+
+The cause was a **single-opcode allow-list**, `src/gpu/rdna2_to_spirv.cpp:7100`:
+
+```cpp
+if (in.opcode != 0x1c || in.dpp_bound_ctrl) { ok = false; return true; }   // 0x1c = V_OR_B32
+```
+
+The lowering behind it was already general and already correct: `subgroup_row_shr()` shuffles SRC0
+inside each architectural 16-lane row and returns the valid-lane predicate, and the VOP2 epilogue uses
+that predicate to preserve the old VDST for out-of-row / EXEC-inactive lanes. DPP16 rewrites SRC0
+only, so both halves are opcode-independent — only the admission test named one opcode
+(`V_OR_B32`, added for Astro Bot's material mask). Fourteen of the fifteen stages recompile once the
+test admits every VOP2 whose sole architectural result is VDST; the VOP2 carry trio
+(`v_add_co_ci` / `v_sub_co_ci` / `v_subrev_co_ci`, opcodes `0x28`–`0x2A`) also writes VCC and its
+disabled-lane bit is not modelled, so it stays fail-visible.
+
+The change is **monotone**: a stage that previously compiled never reached this branch, because
+reaching it meant rejection. Nothing that rendered before can render differently.
+
+Failure 9 (source draw 1929) then rejects further in at an unrelated gap —
+`s_cmp_eq_u64 s[16:17], s[18:19]` where the operand pair is not resolvable to two tracked wave
+masks — and is tracked on #2020.
+
+The remaining two dispatch rejects in the same submit (`pc=24 fmt=0 op=0xf` and `pc=4 fmt=4 op=0x8`)
+are already the first two rows of #1628's table; source 87 now recompiles, as #1821 reported.
+
 ## The former "right ~55% is black" question — localized and fixed
 
 Before source-101 support, this was **a defect, not art direction, and not a scissor/viewport clip.**
