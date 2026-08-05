@@ -3953,8 +3953,18 @@ HLE(s_npent_getkey) {
 // a0 is a stack address whose slot the guest had pre-seeded with 1 (its TRIAL default, per its own
 // code at eboot+0x4dfc92) and a1 is 0 — a single-argument call.
 //
-// CONFIDENCE: HIGH on the contract and the enum (guest-pinned in three titles); MED on the exact errno
-// for the unknown case, which is chosen inside the producer-pinned 0x817D NpEntitlementAccess facility.
+// CONFIDENCE: HIGH on the contract and the enum (guest-pinned in three titles).
+//
+// LOW on the exact errno for the unknown-SKU case, and deliberately left admitted rather than dressed
+// up. NO_ENTITLEMENT is a semantic stretch for "prosper cannot derive this application's SKU": it is a
+// placeholder picked inside the producer-pinned 0x817D NpEntitlementAccess facility, NOT a known
+// contract, and a more precise-looking value invented here would be worse than the stretch, because
+// the next reader would treat a specific code as evidence that the contract is known.
+// What makes the placeholder safe: no caller's behaviour depends on the value. All four titles in the
+// project's local dumps test only for non-zero and fall back to their own conservative default, so the
+// observable behaviour is identical for any error in this facility.
+// What would settle it, and let this be replaced without re-deriving anything above: a title observed
+// branching on a specific error code from this call, or the value observed from real firmware.
 HLE(s_npent_skuflag) {
     svc_log("sceNpEntitlementAccessGetSkuFlag", a0,a1,a2,a3,a4,a5);
     if (!svc_ptrish(a0)) return NP_ENTITLEMENT_ERROR_PARAMETER;
