@@ -2515,6 +2515,10 @@ uint64_t addcontent_info_list(uint64_t list_address, uint64_t list_num,
 // rather than inventing one — a value invented here is indistinguishable from a real declaration to
 // every caller. CONFIDENCE: HIGH.
 HLE(s_appcontent_int) {
+    // Logged because this is the head of a causal chain that is otherwise invisible: a title stores
+    // a user-defined param in its own state and acts on it much later, so "what did prosper answer
+    // here" is the question a stalled content gate needs answered first.
+    svc_log("sceAppContentAppParamGetInt", a0,a1,a2,a3,a4,a5);
     const int32_t param_id = (int32_t)a0;
     if (param_id < 0 || param_id > 4 || !svc_ptrish(a1)) return APP_CONTENT_ERROR_PARAMETER;
     const AppParamDeclaration decl = app_param_declaration();
