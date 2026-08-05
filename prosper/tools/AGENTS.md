@@ -162,6 +162,16 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   guest thread under its **real engine thread name** (`RenderThread 1`, `TaskGraphThread`,
   `FAPREventQueueL`, …) with the prosper-side wait frame attached, which is usually enough to say
   which subsystem is stuck. See `guest_bt/README.md`.
+- **`hle_calls/`** — per-function call histogram over **every** HLE handler in the prosper binary,
+  taken from a live process over a bounded window: "which Sony functions is the guest calling *right
+  now*?". Complements `guest_bt` (which says where a thread is *parked*, and so says nothing about a
+  thread that is running). It exists because `PROSPER_SVCLOG=1` is opt-in per handler — ~1,035 handler
+  registrations against 94 `svc_log` call sites — so svc-log silence bounds the *instrumented*
+  surface, not the guest's traffic, and `PROSPER_PROGRESS_UNIMPL` counts only the handlers that do
+  **not** exist. Needs no rebuild and no gating env var: it enumerates handlers out of the binary by
+  their shared six-`unsigned long` signature and counts them with non-stopping gdb breakpoints.
+  Always pair a surprising zero with a handler you know fires — see the README's note on the
+  `hit_count` trap that made all 151 handlers read zero. See `hle_calls/README.md`.
 - **`re/pak_index.py`** — resolve UE4 `.pak` byte offsets to asset names, and decode a
   `PROSPER_FILELOG=1` run's `[apr] read-submit` stream into an ordered asset load trace. Answers
   "which map/blueprint/texture did the guest actually load, and where did loading stop?" offline,
