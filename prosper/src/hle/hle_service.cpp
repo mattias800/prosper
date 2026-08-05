@@ -2495,11 +2495,39 @@ uint64_t addcontent_info_list(uint64_t list_address, uint64_t list_num,
 }
 } // namespace
 
-// sceAppContentAppParamGetInt(paramId, int32_t* value): paramId 0 = SKU_FLAG, whose only valid values are
-// TRIAL=1 / FULL=3 (there is NO 0). Writing 0 for it made the SKU check indeterminate -> a game testing
-// `sku == FULL` drops into trial/demo mode (locked content, "buy full game" gating). Report FULL for a
-// legally-owned title; other params (USER_DEFINED_PARAM_1..4) stay 0 absent a param.sfo read.
-HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = ((int32_t)a0 == 0) ? 3 : 0; return 0; }
+// sceAppContentAppParamGetInt(SceAppContentAppParamId paramId, int32_t* value)
+//   paramId 0 = SKU_FLAG, 1..4 = USER_DEFINED_PARAM_1..4.
+//
+// Every one of these is a property the installed application declares about ITSELF in its own
+// sce_sys/param.json, so all of them are answered from that local declaration and nothing else. The
+// previous stub hardcoded SKU_FLAG to FULL and answered every user-defined param with 0, and it is
+// the second half that gated GTA V's (PPSA04263) story mode: the title reads USER_DEFINED_PARAM_1 —
+// which its own param.json declares as 9 — stores it, and tests bit 3 to decide that its installed
+// content needs no online entitlement lookup. Answering 0 cleared that bit and sent it down the
+// online path instead, where sceNpEntitlementAccessGetSkuFlag left the guest's own pre-seeded TRIAL
+// value standing and the title offered story mode as a purchase. The declared values matter well
+// beyond that gate: Crisis Core (PPSA07809) uses USER_DEFINED_PARAM_2 as a bounded content-variant
+// index, and Little Nightmares II/III use USER_DEFINED_PARAM_1 as an index into their own
+// add-content list.
+//
+// param.json omits a userDefinedParamN the publishing tool left at its default, so an absent key is a
+// declared zero. With no parseable param.json there is no declaration at all and the query fails
+// rather than inventing one — a value invented here is indistinguishable from a real declaration to
+// every caller. CONFIDENCE: HIGH.
+HLE(s_appcontent_int) {
+    const int32_t param_id = (int32_t)a0;
+    if (param_id < 0 || param_id > 4 || !svc_ptrish(a1)) return APP_CONTENT_ERROR_PARAMETER;
+    const AppParamDeclaration decl = app_param_declaration();
+    if (!decl.declared) return APP_CONTENT_ERROR_NOT_FOUND;
+    int32_t value = 0;
+    if (param_id == 0) {
+        if (!decl.sku_flag) return APP_CONTENT_ERROR_NOT_FOUND;
+        value = (int32_t)*decl.sku_flag;
+    } else {
+        value = decl.user_param[param_id - 1];
+    }
+    return svc_write_bytes(a1, &value, sizeof(value)) ? 0 : APP_CONTENT_ERROR_PARAMETER;
+}
 
 // sceSystemServiceParamGetInt(SceSystemServiceParamId paramId, int32_t* value): a0=paramId, a1=value.
 // The system-settings a blanket-zero stub gives are mostly harmless, EXCEPT the LANGUAGE (paramId 1):
@@ -3896,6 +3924,30 @@ HLE(s_npent_getkey) {
         ? 0 : NP_ENTITLEMENT_ERROR_PARAMETER;
 }
 
+// sceNpEntitlementAccessGetSkuFlag(int32_t* skuFlag) — the SAME question
+// sceAppContentAppParamGetInt answers for paramId 0, asked through libSceNpEntitlementAccess. It is a
+// platform query about the SKU of the LOCALLY INSTALLED application, not a query about anything a
+// user purchased from a network service, so it is answered from the same one local derivation and the
+// two libraries cannot disagree.
+//
+// The NID was registered nowhere, so it fell to the dispatcher's unimplemented stub, which reports
+// SUCCESS while leaving the out pointer untouched. That is worse than a wrong value: of the four
+// titles in the project's local dumps that call this, three (PPSA07809, PPSA02154, PPSA05143) hand it
+// an uninitialized stack slot and then act on whatever residue was there, and the fourth (PPSA04263)
+// pre-seeds TRIAL and keeps it. Failing when the SKU is unknown is a path all four already handle —
+// each falls back to its own conservative default — whereas reporting a SKU prosper cannot derive is
+// a value the guest cannot tell from a real one. CONFIDENCE: HIGH on the contract and the enum
+// (guest-pinned in three titles); MED on the exact errno for the unknown case, which is chosen inside
+// the producer-pinned 0x817D NpEntitlementAccess facility.
+HLE(s_npent_skuflag) {
+    svc_log("sceNpEntitlementAccessGetSkuFlag", a0,a1,a2,a3,a4,a5);
+    if (!svc_ptrish(a0)) return NP_ENTITLEMENT_ERROR_PARAMETER;
+    const AppParamDeclaration decl = app_param_declaration();
+    if (!decl.declared || !decl.sku_flag) return NP_ENTITLEMENT_ERROR_NO_ENTITLEMENT;
+    const int32_t value = (int32_t)*decl.sku_flag;
+    return svc_write_bytes(a0, &value, sizeof(value)) ? 0 : NP_ENTITLEMENT_ERROR_PARAMETER;
+}
+
 // sceSaveDataTransferringMount (PS5-only, live-captured x4 in DOLL's save-slot menu): mount a
 // PS4-era save for transfer/import. We have no PS4 save to transfer — the truthful fresh-console
 // answer is NOT_FOUND with the result untouched. The previous success+garbage made the game read
@@ -4210,6 +4262,7 @@ void register_service_hle() {
     Hle::register_fn("TFyU+KFBv54", (HleFn)s_npent_addcont_list,
                      "sceNpEntitlementAccessGetAddcontEntitlementInfoList");
     Hle::register_fn("5LiMEPuW0DQ", (HleFn)s_npent_getkey, "sceNpEntitlementAccessGetEntitlementKey");
+    Hle::register_fn("lPDO62PpJIA", (HleFn)s_npent_skuflag, "sceNpEntitlementAccessGetSkuFlag");
     Hle::register_fn("WAzWTZm1H+I", (HleFn)s_savedata_transfermount, "sceSaveDataTransferringMount");
     Hle::register_fn("3RQ5aQfnstU", (HleFn)s_syss_noticeskip, "sceSystemServiceGetNoticeScreenSkipFlag");
     // libSceNpUniversalDataSystem — inert ids (guarded LOW-confidence out-writes).
