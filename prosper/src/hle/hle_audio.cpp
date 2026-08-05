@@ -2176,7 +2176,12 @@ namespace {
     constexpr uint64_t AJM_ERR_INVALID_INSTANCE  = (uint64_t)(int64_t)(int32_t)0x80930003u;
     constexpr uint64_t AJM_ERR_INVALID_BATCH     = (uint64_t)(int64_t)(int32_t)0x80930004u;
     constexpr uint64_t AJM_ERR_INVALID_PARAMETER = (uint64_t)(int64_t)(int32_t)0x80930005u;
+    // sceAjmInitialize's `config` word is a revision selector carried in its HIGH dword: PS4-style
+    // callers pass 0, and PS5 titles pass a non-zero revision (0x200000000 on PPSA17942, 0x300000000
+    // on PPSA05143). Only the low dword is known to be reserved, so validate that and accept the
+    // revision rather than allow-listing values one title at a time.
     constexpr uint64_t AJM_INITIALIZE_PS5_CONFIG = 0x200000000ull;
+    constexpr uint64_t AJM_INITIALIZE_CONFIG_RESERVED_MASK = 0xffffffffull;
 
     // The four pointer-returning builder exports serialize a batch from 8/16-byte chunks. These
     // layout values are shared by Sony's PS4-inherited AJM ABI and the PS5 3.20 export surface.
@@ -2313,10 +2318,22 @@ std::map<uint32_t, AjmDecodeInst> g_ajm2_inst;             // instance id -> cod
 std::map<uint64_t, std::vector<AjmDecJob>> g_ajm2_jobs;   // batchInfo -> queued decode jobs
 } // namespace
 
-// sceAjmInitialize(u64 config, u32* out_context): create a context. PS4-style callers pass zero,
-// while PS5 titles also use the observed 0x200000000 configuration value.
+// sceAjmInitialize(u64 config, u32* out_context): create a context. PS4-style callers pass zero;
+// PS5 titles pass a revision in the high dword (0x200000000 on PPSA17942, 0x300000000 on PPSA05143).
+// Allow-listing individual revisions is what made this fail on an unseen one, and the failure is not
+// contained: a guest that reads SCE_AJM_ERROR_INVALID_PARAMETER as "no audio subsystem" skips
+// creating its audio-thread object and then dereferences the null singleton it never built.
+// An unrecognized revision is still reported once so a genuinely malformed call stays visible.
+// CONFIDENCE: MED — the two observed revisions and the reserved low dword are live evidence; the
+// meaning of the revision number itself is not established, and prosper's context does not use it.
 HLE(ajm_initialize) {
-    if ((a0 != 0 && a0 != AJM_INITIALIZE_PS5_CONFIG) || !a1) return AJM_ERR_INVALID_PARAMETER;
+    if (!a1 || (a0 & AJM_INITIALIZE_CONFIG_RESERVED_MASK) != 0) return AJM_ERR_INVALID_PARAMETER;
+    if (a0 != 0 && a0 != AJM_INITIALIZE_PS5_CONFIG) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            fprintf(stderr, "[ajm] sceAjmInitialize: unrecognized config revision 0x%llx (accepted)\n",
+                    (unsigned long long)a0);
+    }
     if (!a2_store_u32(a1, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     return 0;
 }
