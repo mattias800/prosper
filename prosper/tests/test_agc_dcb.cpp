@@ -443,6 +443,19 @@ int main() {
           blend[0].value == 0x20010001u,
           "SDK 13 resolves the render-target-zero blend default");
 
+    // The sibling key. 0xef550356 is the record the same pipeline builder reads for render targets
+    // 1..7, deriving each one's register offset as `record.offset + rtIndex`; 0xa6d12629 is the one
+    // it reads for render target 0. They must therefore describe the SAME register and the SAME
+    // default, or RT0 would start from a different blend state than RT1..7 in a title that programs
+    // both. Pin them together so an edit to one that misses the other fails here rather than
+    // showing up as an inter-target blend mismatch on some future title.
+    ShaderRegister* blend_siblings = lookup_default(defaults, 0xef550356u);
+    CHECK(blend_siblings && blend && blend_siblings[0].offset == 0x1e0u &&
+          blend_siblings[0].value == 0x20010001u &&
+          blend_siblings[0].offset == blend[0].offset &&
+          blend_siblings[0].value == blend[0].value,
+          "the RT1..7 blend key agrees with the RT0 key on register and default");
+
     // Guard a legacy multi-register run: the pointer must begin at the first register pair, not at
     // the preceding type hash. DQ copies these exact 16 bytes into its FOV defaults block.
     ShaderRegister* fov = lookup_default(defaults, 0x88f5e915u);
@@ -465,6 +478,13 @@ int main() {
               older_blend && older_blend[0].offset == 0x1e0u &&
               older_blend[0].value == 0x20010001u,
               "a pre-13 caller resolves the render-target-zero blend default too");
+        // …and it agrees with the RT1..7 key on every version too, for the reason above.
+        ShaderRegister* older_siblings = lookup_default(older, 0xef550356u);
+        CHECK(older_siblings && older_blend && older_siblings[0].offset == 0x1e0u &&
+              older_siblings[0].value == 0x20010001u &&
+              older_siblings[0].offset == older_blend[0].offset &&
+              older_siblings[0].value == older_blend[0].value,
+              "a pre-13 caller's RT1..7 and RT0 blend keys agree");
         // The rest of the table must be untouched by that addition: same multi-register run,
         // same pointer arithmetic, for every version.
         ShaderRegister* older_fov = lookup_default(older, 0x88f5e915u);

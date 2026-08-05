@@ -244,7 +244,7 @@ re-derive these without contradictory new evidence.
 | PlayGo `GetLocus` is a sustained chunk-0 poll or progression gate | **Falsified; the earlier rate interpretation was an instrumentation mistake.** The retained trace's 1,000 calls carry chunk IDs **0, 1, 2, …, 999 exactly once**, with no reset. Guest code at `0x13f28a4` is a bounded startup cache-population loop: it calls `GetLocus` for each ID, stores only successful `LOCAL_FAST` (`3`) results, cleanly skips absent IDs, stops at `0x3e8`, and sets its initialized byte at `0x13f29e7`. Chunk 0 succeeds and the remaining nonexistent IDs fail as expected. This is neither periodic polling nor a wait for those IDs to become local; changing PlayGo behaviour is not justified. | #1606, #1641 |
 | #1946's solid-block glyphs are a Slate **font-atlas** defect — a blank/unpopulated atlas, wrong glyph UVs, a single-channel format/swizzle, or a mip-tail tiling error | **Falsified — the atlas is correct and was read by eye.** `PROSPER_RESOURCE_HASH_DIM=2048x2048 PROSPER_DUMP_RESOURCE_VERSION=1` dumped the decoded 2048x2048 UI atlas at `0x30252f0000` (`[tdump]`: `fmt=130` = `8_8_8_8_SRGB`, `tile=9`, DST_SEL `BGRA`); the image is crisp and readable — the *"The Oregon Trail"* logo, the Gameloft and HarperCollins/HMH marks, the ornamental divider. Half its texels are content (`rgb_nonblack = alpha_nonzero = 2,138,372` of 4,194,304), so its alpha is real and prosper decodes it. `PROSPER_TEXCOMMIT=1` also shows the title samples **no single-channel texture at all** — every sampled surface is `f9` (`Unorm8`) at 4 B/texel. The defect was lost **alpha blending**, not lost coverage. | #1946 |
 | Every UE4 title with UMG text is exposed to the same defect (the #1946 issue body's premise) | **Falsified by a same-build positive control.** *Dragon Quest VII Reimagined* (`PPSA17942`, UE4) renders anti-aliased Slate text and alpha-blended logos correctly on the identical binary, and `PROSPER_RTTLOG=1` records **2,069 blend-enabled draws** for it against **0 of 1,231** for Oregon Trail. The exposure is not "UE4 + UMG" but "**asks `sceAgcGetRegisterDefaults2` for an SDK version below 13 and uses render target 0 blending**" — DQ asks for 13 and was never affected. | #1946 |
-| Offering the RT0 blend key on every SDK version changes the other titles that are on the pre-13 path | **Falsified by a same-binary pre/post pair.** Ten titles were surveyed with the `[agc] register defaults requested for SDK version N` line: only *Dead Cells* (10), *Blasphemous 2* (10) and Oregon Trail (12) ask below 13; every other title asks for 13 and is bit-for-bit unaffected. The two version-10 titles were then run against a build carrying master's pre-fix table and against the fixed one, and their `CB_BLEND0_CONTROL` value **distributions are unchanged** — Dead Cells 43.96/39.01/17.03 % → 43.63/39.09/17.28 %, Blasphemous 2 46.00/27.31/15.44/10.77/0.47 % → 45.35/27.28/15.86/10.80/0.71 % over the same five values. Both already program `ENABLE=1` blend on RT0 through another path in their SDK-10 builder, so the key is inert for them. Their title screens were opened on the fixed build and match their committed captures. | #1946 |
+| Offering the RT0 blend key on every SDK version changes the other titles that are on the pre-13 path | **Falsified by a same-binary pre/post pair.** Ten titles were surveyed with the `[agc] register defaults requested for SDK version N` line: only *Dead Cells* (10), *Blasphemous 2* (10) and Oregon Trail (12) ask below 13; every other title asks for 13 and is bit-for-bit unaffected. The two version-10 titles were then run against a build carrying master's pre-fix table and against the fixed one, and their `CB_BLEND0_CONTROL` value **distributions are unchanged** — Dead Cells 43.96/39.01/17.03 % → 43.63/39.09/17.28 %, Blasphemous 2 46.00/27.31/15.44/10.77/0.47 % → 45.35/27.28/15.86/10.80/0.71 % over the same five values. Both already program `ENABLE=1` blend on RT0 through another path in their SDK-10 builder, so the key is inert for them. Their title screens were opened on the fixed build and match their committed captures. **A static scan for the key constant sharpens this rather than replacing it, and rules out the tempting shortcut explanation:** `0xA6D12629` is *present* in both — one `cmp`-immediate site in Dead Cells' `eboot.bin` (file offset `0x174de69`) and two in Blasphemous 2 (`eboot.bin` `0x3a9963`, `sce_module/libSceJobManager.prx` `0x6b73`) — so "those titles never search for the key" is **false** and was never why the change is inert for them. (The scan reads a known answer correctly: it lands Oregon Trail's own site at `0x4ab2e03`, inside the `cmp` at the documented `eboot+0x4ab2e00`.) The measured distributions above remain the evidence: their RT0 blend does not come from this record. | #1946 |
 | `PROSPER_DUMP_ATLAS=1` producing no font atlas means the title never sampled one | **Void as evidence — the diagnostic is doubly filtered.** It writes only textures with `tw <= 2048 && th <= 1024` **and** a decoded `VK_FORMAT_R8G8B8A8_UNORM`, so a 2048x2048 atlas and every natively-uploaded `R8_UNORM` surface are silently skipped, and its 24-bit BMP output drops alpha entirely — the channel this investigation was actually about. Use `PROSPER_TEXCOMMIT=1` to enumerate what is sampled and `PROSPER_RESOURCE_HASH_DIM` + `PROSPER_DUMP_RESOURCE_VERSION` to dump it. Note `PROSPER_DUMP_ATLAS` also switches the renderer onto the CPU RTT-copy diagnostic path, so it is not a neutral observer. | #1946 |
 
 **Note on the Asterix figure.** 4.00 is the #1641 census number — *decoded* draws per frame, realized
@@ -274,7 +274,7 @@ the same thing, and do not treat either as superseding the other until that is c
 
 * `PROSPER_COMPUTELOG`, `PROSPER_EXECLOG`, `PROSPER_GFXLOG`, `PROSPER_REGWATCH`,
   `PROSPER_RENDER_TIMING`, `PROSPER_RTT_TIMING` and `PROSPER_PROVENANCE_DIM` are **not** in the
-  `live_gpu_targets` disable list (`live_renderer.cpp:933`), so none of them forces the CPU readback
+  `live_gpu_targets` disable list (`live_renderer.cpp:1008-1015`), so none of them forces the CPU readback
   RTT path. `PROSPER_RTTLOG`, `PROSPER_RESOURCE_HASH_DIM` and `PROSPER_GPU_CAPTURE` **do** — and
   `PROSPER_RTTLOG` therefore cannot observe the compute→renderer-RTT mirror path at all.
 * `PROSPER_REGWATCH` reports at command-processor **decode** time while `PROSPER_EXECLOG` reports at
@@ -384,17 +384,39 @@ each of which detects its own invalidity, in the order they were useful:
 … ./build-linux/screenshot <DUMP_ROOT>/<TITLE>-app0 …    # grep '[agc] register defaults requested'
 
 # 2. Is any draw blending at all?  Per-draw enable + factors + every sampled texture.
-PROSPER_RTTLOG=1 …            # grep -c 'blend=1'   (bound with PROSPER_RTTLOG_{MIN,MAX}_SUBMIT)
+#    Count with a form that PRINTS a zero instead of exiting non-zero on one — see below.
+PROSPER_RTTLOG=1 … > rttlog.txt 2>&1          # bound with PROSPER_RTTLOG_{MIN,MAX}_SUBMIT
+grep -o 'blend=1' rttlog.txt | wc -l          # blend-enabled draws  (0 prints as 0)
+grep -o 'blend=[01]' rttlog.txt | wc -l       # total draws — the denominator
 
 # 3. What did the guest actually write to the blend register, and by which path?
 PROSPER_REGWATCH=Cx:0x1E0,Cx:0x1E1 …   # 0x1E0 = CB_BLEND0_CONTROL, 0x1E1 = CB_BLEND1_CONTROL
 ```
+
+**Do not count this with `grep -c`.** Zero is the *expected* answer for the defect being measured, and
+`grep -c` exits 1 on zero matches — so in an `&&` chain it aborts the run that was supposed to report
+the finding, and its "failure" is indistinguishable from a real one (`CLAUDE.md`). `grep -o … | wc -l`
+prints `0` and exits 0. Take the denominator from the same file in the same way: a bare enabled-count
+is not interpretable without the total.
+
+**`PROSPER_RTTLOG` is itself in the `live_gpu_targets` disable list**
+(`live_renderer.cpp:1008-1015`), so arming it forces the CPU-readback RTT path for the whole run. Two
+consequences: it cannot observe the compute→renderer-RTT mirror path at all, and its run is not
+frame-for-frame or timing-comparable with a default run — so use it to compare **two RTTLOG arms**
+(before/after, or subject/control), never an RTTLOG arm against a default one.
 
 A `blend=1` count of zero is only evidence when a **positive control** on the same binary produces a
 non-zero one: *Dragon Quest VII* (`PPSA17942`) is the calibrated control used here — 2,069 against
 Oregon Trail's 0. And to attribute a register value to prosper rather than to the guest, change the
 value in `src/hle/agc_reg_defaults.cpp` to a marker and re-run `PROSPER_REGWATCH`: if the marker
 appears in the register, prosper's table is the source. That is what proved this one.
+
+**Whether a title searches for the key at all is a static question**, answerable without booting it:
+the search is a plain `cmp DWORD PTR [reg], imm32` against the key, so the 4-byte little-endian
+constant appears verbatim in the module that contains the builder. `29 26 d1 a6` is `0xA6D12629` and
+`56 03 55 ef` is `0xEF550356`. Validate the scan on a known answer before trusting it — on
+`PPSA19244-app0/eboot.bin` the first lands at file offset `0x4ab2e03`, i.e. inside the `81 3c 3e …`
+at the documented search site `eboot+0x4ab2e00`.
 
 **Current — the popup, and the fault that follows it (2026-08-04, master `9dcb6c4b`):**
 
