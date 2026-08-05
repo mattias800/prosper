@@ -520,6 +520,20 @@ looks the entry up in a 0x68-byte-stride table, and selects the `"_4k.usm"` (`eb
 plain `".usm"` (`eboot+0xdba47f`) suffix from a per-entry flag at `+0x10932`
 (`cmp BYTE PTR [rcx+rdx*1+0x10932],0x0` … `cmove rdx,rcx` at `eboot+0x6d7719..0x6d772f`). It has
 exactly two callers — `eboot+0x703a67` (in `eboot+0x701280`) and `eboot+0x796016` (in
-`eboot+0x795870`) — and neither is reached in any arm of this series. A breakpoint on `eboot+0x6d76c0`
-that never fires is the cheapest confirmation that no movie is even requested; finding which state
-should call it, and with which index, is the open work.
+`eboot+0x795870`).
+
+**None of the three is ever entered, and that is a measurement, not an inference.** A CPU-only arm
+breaks on all three guest addresses plus a fourth as a control, and reports:
+
+```text
+MOVIERESULT armed=4 ticks=1500 movie_hits=0 control_hits=243
+```
+
+Two things make that a real negative rather than a void run. `armed=4` says all four breakpoints were
+actually inserted — guest breakpoints **cannot** be armed before `run`, because prosper maps the guest
+image itself and the addresses do not exist when gdb inserts breakpoints, so they are armed on the
+first `prosper::k_usleep` tick instead. And `control_hits=243` is a **guest** address the run loop
+reaches every frame (`eboot+0x933063`, the frame-pacing compare ahead of the sleep at
+`eboot+0x933083`), so a guest breakpoint of exactly this kind demonstrably fires in this window while
+the movie ones do not. Finding which state should call `eboot+0x6d76c0`, and with which index, is the
+open work.
