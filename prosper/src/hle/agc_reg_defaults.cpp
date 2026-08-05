@@ -11,8 +11,10 @@
 // Consumed by hle_graphics.cpp's GetRegisterDefaults2 thunk via prosper_agc_reg_defaults().
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <iterator>
 
 #include "../gpu/command_processor.hpp"
@@ -483,35 +485,51 @@ static uint32_t        g_tbl_index2[] = {KYTY_INDEX_CX2(0),  KYTY_INDEX_CX2(1), 
                                          KYTY_INDEX_SH2(11), KYTY_INDEX_SH2(12), KYTY_INDEX_SH2(13), KYTY_INDEX_SH2(14), KYTY_INDEX_UC2(0),
                                          KYTY_INDEX_UC2(1),  KYTY_INDEX_UC2(2)};
 
-static RegisterDefaults g_reg_defaults1 = { // @suppress("Invalid arguments")
-    g_tbl_cx1, g_tbl_sh1, g_tbl_uc1, nullptr, {0, 0}, g_tbl_index1, sizeof(g_tbl_index1) / 12};
 static RegisterDefaults g_reg_defaults2 = { // @suppress("Invalid arguments")
     g_tbl_cx2, g_tbl_sh2, g_tbl_uc2, nullptr, {0, 0}, g_tbl_index2, sizeof(g_tbl_index2) / 12};
 
 // SDK 13 preserves the same ABI: Dragon Quest VII reads the count at +0x38, walks
 // 12-byte type records, then follows one of the pointer banks at +0x00. The two
 // qwords at +0x20 remain zero, matching the established table.
-static RegisterDefaultInfo g_modern_cx_extra[] = {
-    // DQ's SDK-13 pipeline builder requests RT0 blend state through this separate
-    // key. Without it, the guest copies its all-ones sentinel into CB_BLEND0_CONTROL.
+//
+// `0xA6D12629` is the key the AGC pipeline builder uses for **render target 0's**
+// blend record, and it is NOT the same key as Kyty's `0xEF550356` (which the same
+// builder uses for render targets 1..7, deriving each one's register offset as
+// `record.offset + rtIndex`). The Oregon Trail eboot shows the whole contract:
+//   * `eboot+0x4ab2e00` linearly searches this table's 12-byte type records for
+//     `0xA6D12629`; on a hit it caches the record's `{offset,value}` qword, and on a
+//     MISS it caches `0xffffffffffffffff` (`eboot+0x4ab36be`).
+//   * `eboot+0x138caf0` loads that cached qword as RT0's blend record; the sibling
+//     `eboot+0x138cac7` loads the `0xEF550356` record for RT1..7.
+//   * The emitted register write therefore carries offset `0xffffffff` whenever the
+//     key is absent, and the command processor correctly drops it as a nonexistent
+//     register — so CB_BLEND0_CONTROL keeps its default and **every draw in the
+//     title renders with blending disabled**. On The Oregon Trail that erased alpha
+//     on the whole Slate/UMG layer: text quads wrote their solid fill colour over
+//     each glyph rect (#1946) and the title logo's transparent surround drew as an
+//     opaque black panel.
+// The key must therefore be offered on EVERY SDK version, not only on 13+. Gating it
+// on the version was an accident of where it was first needed (DQ, which asks for 13);
+// a title that asks for an older version searches for the identical key.
+static RegisterDefaultInfo g_public_cx_extra[] = {
     {0xA6D12629, {{Pm4::CB_BLEND0_CONTROL, 0x20010001}}},
 };
 
-struct ModernPublicTables {
-    std::array<ShaderRegister*, std::size(g_tbl_cx1) + std::size(g_modern_cx_extra)> cx{};
-    std::array<uint32_t, std::size(g_tbl_index1) + 3 * std::size(g_modern_cx_extra)> types{};
+struct PublicTables {
+    std::array<ShaderRegister*, std::size(g_tbl_cx1) + std::size(g_public_cx_extra)> cx{};
+    std::array<uint32_t, std::size(g_tbl_index1) + 3 * std::size(g_public_cx_extra)> types{};
     RegisterDefaults defaults{};
 
-    ModernPublicTables() {
+    PublicTables() {
         std::copy(std::begin(g_tbl_cx1), std::end(g_tbl_cx1), cx.begin());
         std::copy(std::begin(g_tbl_index1), std::end(g_tbl_index1), types.begin());
 
-        for (std::size_t i = 0; i < std::size(g_modern_cx_extra); ++i) {
+        for (std::size_t i = 0; i < std::size(g_public_cx_extra); ++i) {
             const std::size_t id = std::size(g_tbl_cx1) + i;
-            cx[id] = g_modern_cx_extra[i].reg;
+            cx[id] = g_public_cx_extra[i].reg;
 
             const std::size_t out = std::size(g_tbl_index1) + 3 * i;
-            types[out] = g_modern_cx_extra[i].type;
+            types[out] = g_public_cx_extra[i].type;
             types[out + 1] = static_cast<uint32_t>(id * 4);
             types[out + 2] = 0;
         }
@@ -521,8 +539,8 @@ struct ModernPublicTables {
     }
 };
 
-static RegisterDefaults* modern_public_defaults() {
-    static ModernPublicTables tables;
+static RegisterDefaults* public_defaults() {
+    static PublicTables tables;
     return &tables.defaults;
 }
 
@@ -530,11 +548,17 @@ static RegisterDefaults* modern_public_defaults() {
 
 // Returned by the sceAgcGetRegisterDefaults2 HLE thunk.
 extern "C" void* prosper_agc_reg_defaults(unsigned int version) {
-    if (version >= 13) {
-        prosper_gpu_enable_post_submit_visibility();
-        return prosper::agc::modern_public_defaults();
-    }
-    return &prosper::agc::g_reg_defaults1;
+    // Which SDK version a title asks for decides real behaviour below and is otherwise
+    // invisible; print it once so "this title is on the pre-13 path" is a fact in the
+    // log rather than something the next investigation has to re-derive.
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true))
+        std::fprintf(stderr, "[agc] register defaults requested for SDK version %u\n", version);
+    // The post-submit visibility contract is a real SDK-13 behavioural difference and
+    // stays version-gated; the register table itself does not, because the keys a
+    // guest searches for are the same on every version it may ask about.
+    if (version >= 13) prosper_gpu_enable_post_submit_visibility();
+    return prosper::agc::public_defaults();
 }
 extern "C" void* prosper_agc_reg_defaults_internal(unsigned int version) {
     if (version >= 13) prosper_gpu_enable_post_submit_visibility();

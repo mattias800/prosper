@@ -1,7 +1,7 @@
 # The Oregon Trail (`PPSA19244`) — status and evidence
 
-Unreal Engine 4. **Rung 2 — title screen** (2026-08-05, master `c77c66b4`;
-`assets/screenshots/oregon-trail-title-screen.png`). Since #1933 landed the ErrorDialog foreground
+Unreal Engine 4. **Rung 2 — title screen**, and since #1946 the whole UI layer composites correctly
+(`assets/screenshots/oregon-trail-title-screen.png`). Since #1933 landed the ErrorDialog foreground
 lifecycle, the title renders its startup legal/EULA popup (`WBP_System_Disclaimer_Popup`) at native
 3840x2160 from the live renderer. Tracked on
 [#1606](https://github.com/mattias800/prosper/issues/1606) and
@@ -16,9 +16,39 @@ title screen with its "Press any button" prompt
 (`assets/screenshots/oregon-trail-title-screen.png`). Neither the ordered-DMA stall below (closed by
 #1987) nor #1945 bounds a default launch any more. The #1945 non-reproduction is a **timing**
 result, not a code one — the same binary previously produced 10/10 exit-90 — see `## Ruled out`.
-The next frontier here is a route past the title screen, plus three defects visible in that
-screenshot: #1946 (Slate glyphs as solid blocks), an unblended black panel behind the title logo, and
-a flat pink lower field where the sky/ground gradient should be.
+The next frontier here is a route past the title screen.
+
+### The three title-screen defects were one defect, and it is fixed (#1946)
+
+The three things that screenshot showed — **#1946's solid-block Slate glyphs, the unblended black
+panel behind the title logo, and the flat pink lower field** — were a single cause: **every draw in
+the title rendered with alpha blending disabled.** Not a font, atlas, coverage or UV defect at all.
+
+The chain, end to end:
+
+* `sceAgcGetRegisterDefaults2` hands the guest a hash-keyed table of `{register offset, default
+  value}` records; the guest's AGC pipeline builder searches it linearly and caches each record.
+* Render target **0's** blend record has its own key, `0xA6D12629` — *not* the `0xEF550356` key that
+  the same builder uses for RT1..7 (it derives those offsets as `record.offset + rtIndex`). The
+  Oregon Trail eboot shows both: the search at `eboot+0x4ab2e00`, the miss path at `eboot+0x4ab36be`
+  that caches `0xffffffffffffffff`, and the consumer at `eboot+0x138caf0` that loads the cached
+  qword as RT0's record while `eboot+0x138cac7` loads the `0xEF550356` one for RT1..7.
+* prosper offered `0xA6D12629` **only for SDK version >= 13** (it was added for *Dragon Quest VII*,
+  which asks for 13). **The Oregon Trail asks for version 12** — `[agc] register defaults requested
+  for SDK version 12`, 8 of 8 arms — so its lookup missed, its RT0 blend write went out with offset
+  `0xffffffff`, and the command processor correctly dropped it as a nonexistent register (that is
+  the `[agc] out-of-range indirect reg write dropped … off=0xffffffff val=0xffffffff` line, whose
+  print is capped at four). `CB_BLEND0_CONTROL` therefore never left its default.
+* Measured, before: `PROSPER_REGWATCH=Cx:0x1E0` recorded **133 writes, every one `0x20010001`**
+  (`ENABLE=0`), and `PROSPER_RTTLOG=1` recorded **0 of 1,231 draws with blending enabled.**
+  After: `0x65010504` appears — `ENABLE=1`, `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` — and blend-enabled
+  draws appear. `0x65010504` is byte-identical to what *Dragon Quest VII* programs.
+
+Making the key available on every SDK version restores the whole layer at once: the logo composites
+on the night-sky gradient with no black box, the sky/ground gradient and clouds are back, the three
+"solid white rectangles" resolve into the HarperCollins Productions / Gameloft / Unreal Engine
+logos, and Slate text draws its real glyph coverage. A default-launch title-screen sample goes from
+a handful of flat colours to **66,460 distinct colours**.
 
 ## Where it stood earlier on 2026-08-05
 
@@ -203,6 +233,9 @@ re-derive these without contradictory new evidence.
 | #1944 (the reserved-range lazy-commit handler zero-filling a guest page) is the same bug as #1945, or is what corrupts the free list here | **Falsified on this title.** `[lazy-commit]` is printed unconditionally by `exec_image_linux.cpp`, so every run reports it. Across **ten** `PPSA19244` arms on 2026-08-05 — three default render arms on `ff72e77c`, three with the mutex-encoding fix, four with `PROSPER_FAULTMEM`/`PROSPER_PEEK` — the count is **0 in every single one**, including the arms that faulted at `eboot+0x14600df` / `eboot+0x146027d` on `0x30016000`. The handler never fires on this title, so it cannot be the writer. This agrees with the third ArcRunner row already recorded there (its `0x30016000` arm also had no lazy-commit line, while both `addr=(nil)` arms did). Do not merge the two issues. | #1945, #1944 |
 | The `std::system_error("invalid argument")` / `std::terminate` face is guest heap corruption, or the same defect as #1945 | **Falsified — it is prosper's own error encoding, and it is fixed.** `scePthreadMutexTrylock` returned the bare FreeBSD `EBUSY` (16); the shipped `libc.prx` `_Mtx_trylock` (export `k6pGNMwJB08` at `libc.prx+0x5ef0`) compares the result against `0x80020010` and maps anything else non-zero to Dinkumware `_Thrd_error` (4), which `std::_Throw_C_error` turns into an uncaught `std::system_error`. Encoding the Sony spellings flipped the named check `Terminating due to uncaught exception 'invalid argument: invalid argument'` from **3/3 present to 0/3**, in the same binary and environment, and the title went from a black frame at frame 5 to the Gameloft splash and the health warning. `_Mtx_lock` (`0x8002000b`) and `_Mtx_timedlock` (`0x8002003c`) carry the same contract; `_Mtx_unlock` and `_Cnd_wait` discard the result entirely. | #1945, #1612 |
 | PlayGo `GetLocus` is a sustained chunk-0 poll or progression gate | **Falsified; the earlier rate interpretation was an instrumentation mistake.** The retained trace's 1,000 calls carry chunk IDs **0, 1, 2, …, 999 exactly once**, with no reset. Guest code at `0x13f28a4` is a bounded startup cache-population loop: it calls `GetLocus` for each ID, stores only successful `LOCAL_FAST` (`3`) results, cleanly skips absent IDs, stops at `0x3e8`, and sets its initialized byte at `0x13f29e7`. Chunk 0 succeeds and the remaining nonexistent IDs fail as expected. This is neither periodic polling nor a wait for those IDs to become local; changing PlayGo behaviour is not justified. | #1606, #1641 |
+| #1946's solid-block glyphs are a Slate **font-atlas** defect — a blank/unpopulated atlas, wrong glyph UVs, a single-channel format/swizzle, or a mip-tail tiling error | **Falsified — the atlas is correct and was read by eye.** `PROSPER_RESOURCE_HASH_DIM=2048x2048 PROSPER_DUMP_RESOURCE_VERSION=1` dumped the decoded 2048x2048 UI atlas at `0x30252f0000` (`[tdump]`: `fmt=130` = `8_8_8_8_SRGB`, `tile=9`, DST_SEL `BGRA`); the image is crisp and readable — the *"The Oregon Trail"* logo, the Gameloft and HarperCollins/HMH marks, the ornamental divider. Half its texels are content (`rgb_nonblack = alpha_nonzero = 2,138,372` of 4,194,304), so its alpha is real and prosper decodes it. `PROSPER_TEXCOMMIT=1` also shows the title samples **no single-channel texture at all** — every sampled surface is `f9` (`Unorm8`) at 4 B/texel. The defect was lost **alpha blending**, not lost coverage. | #1946 |
+| Every UE4 title with UMG text is exposed to the same defect (the #1946 issue body's premise) | **Falsified by a same-build positive control.** *Dragon Quest VII Reimagined* (`PPSA17942`, UE4) renders anti-aliased Slate text and alpha-blended logos correctly on the identical binary, and `PROSPER_RTTLOG=1` records **2,069 blend-enabled draws** for it against **0 of 1,231** for Oregon Trail. The exposure is not "UE4 + UMG" but "**asks `sceAgcGetRegisterDefaults2` for an SDK version below 13 and uses render target 0 blending**" — DQ asks for 13 and was never affected. | #1946 |
+| `PROSPER_DUMP_ATLAS=1` producing no font atlas means the title never sampled one | **Void as evidence — the diagnostic is doubly filtered.** It writes only textures with `tw <= 2048 && th <= 1024` **and** a decoded `VK_FORMAT_R8G8B8A8_UNORM`, so a 2048x2048 atlas and every natively-uploaded `R8_UNORM` surface are silently skipped, and its 24-bit BMP output drops alpha entirely — the channel this investigation was actually about. Use `PROSPER_TEXCOMMIT=1` to enumerate what is sampled and `PROSPER_RESOURCE_HASH_DIM` + `PROSPER_DUMP_RESOURCE_VERSION` to dump it. Note `PROSPER_DUMP_ATLAS` also switches the renderer onto the CPU RTT-copy diagnostic path, so it is not a neutral observer. | #1946 |
 
 **Note on the Asterix figure.** 4.00 is the #1641 census number — *decoded* draws per frame, realized
 plus suppressed, over the whole run. A separate Asterix plugin-link A/B, run while investigating the
@@ -331,6 +364,27 @@ the same thing, and do not treat either as superseding the other until that is c
   window before reading a zero as "no draws".
 
 ## Reproduction
+
+**The blend-state measurement (#1946), and how to re-take it on any title.** Three cheap instruments,
+each of which detects its own invalidity, in the order they were useful:
+
+```bash
+# 1. Which SDK version does the title ask for?  One line, printed unconditionally at AGC init.
+#    Below 13 was the exposed path before #1946.
+… ./build-linux/screenshot <DUMP_ROOT>/<TITLE>-app0 …    # grep '[agc] register defaults requested'
+
+# 2. Is any draw blending at all?  Per-draw enable + factors + every sampled texture.
+PROSPER_RTTLOG=1 …            # grep -c 'blend=1'   (bound with PROSPER_RTTLOG_{MIN,MAX}_SUBMIT)
+
+# 3. What did the guest actually write to the blend register, and by which path?
+PROSPER_REGWATCH=Cx:0x1E0,Cx:0x1E1 …   # 0x1E0 = CB_BLEND0_CONTROL, 0x1E1 = CB_BLEND1_CONTROL
+```
+
+A `blend=1` count of zero is only evidence when a **positive control** on the same binary produces a
+non-zero one: *Dragon Quest VII* (`PPSA17942`) is the calibrated control used here — 2,069 against
+Oregon Trail's 0. And to attribute a register value to prosper rather than to the guest, change the
+value in `src/hle/agc_reg_defaults.cpp` to a marker and re-run `PROSPER_REGWATCH`: if the marker
+appears in the register, prosper's table is the source. That is what proved this one.
 
 **Current — the popup, and the fault that follows it (2026-08-04, master `9dcb6c4b`):**
 
