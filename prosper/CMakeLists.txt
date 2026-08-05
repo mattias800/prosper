@@ -506,6 +506,12 @@ if(TARGET prosper_core)
   target_include_directories(test_capture_renderer_policy PRIVATE frontends/shared)
   add_test(NAME capture_renderer_policy COMMAND test_capture_renderer_policy)
 
+  # The publish extent contract (#1986): which rendered pass may become the present source, and what
+  # the retained-frame net may retain. Pure byte-count policy, so no device and no renderer.
+  add_executable(test_present_extent frontends/shared/test_present_extent.cpp)
+  target_include_directories(test_present_extent PRIVATE frontends/shared)
+  add_test(NAME present_extent COMMAND test_present_extent)
+
   # boot_trace periodic BMPs are opt-in, with the legacy disable taking priority. This exercises the
   # exact environment-name lookup and registrar forwarding without constructing Vulkan or writing files.
   add_executable(test_frame_dump_policy frontends/shared/test_frame_dump_policy.cpp)

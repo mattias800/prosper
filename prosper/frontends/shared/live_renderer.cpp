@@ -25,6 +25,8 @@
 #include "gpu/videoout_present.hpp"     // present_front_index (flip-anchored present selection)
 #include "present_blit.hpp"             // GPU scanout handoff (#1270 unified-device present)
 #include "present_blit_policy.hpp"      // flip-anchored scanout publication policy
+#include "present_extent.hpp"           // the publish extent contract with the caller (#1986)
+#include "gpu/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/guest_write_watch.hpp"
 #include "render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 
@@ -4768,6 +4770,49 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     pass_timing_start - callback_timing_start).count();
             std::shared_ptr<const std::vector<uint8_t>> selected_pixels;
             bool published_gpu = false;
+            // The extent contract with our caller (#1986). A submit headed for the publish gate is
+            // published only as exactly w*h*4 bytes and anything else is silently discarded, so a
+            // rendered pass of a different extent is not a present source at all — see
+            // present_extent.hpp for what that changes, and PresentSubmitScope in gpu_execute.hpp for
+            // why the answer cannot be derived here: render_submit_items (gpu_replay's ordered-prefix
+            // inspection, the renderer's own tests) deliberately wants the last pass AT ITS OWN
+            // EXTENT, and is indistinguishable from a present by anything visible in this callback.
+            // Zero means "no contract", which is that path and not a degenerate case.
+            const size_t present_extent_bytes = prosper::gpu::present_submit_in_progress()
+                ? static_cast<size_t>(w) * h * 4u : 0u;
+            // The chosen source and each candidate's own extent, so the report below can name what was
+            // available rather than only that nothing was.
+            prosper::frontend::PresentSourceChoice present_choice =
+                prosper::frontend::PresentSourceChoice::None;
+            uint32_t px_front_w = 0, px_front_h = 0;
+            uint32_t px_vo_w = 0, px_vo_h = 0;
+            uint32_t px_last_w = 0, px_last_h = 0;
+            uint64_t px_front_base = 0, px_vo_base = 0, px_last_base = 0;
+            // Fail-visible: a submit that renders yet offers no present-extent source is exactly the
+            // Frontiers wall, and before #1968's diagnostics nothing anywhere said so — the publish
+            // counter simply stopped while the guest kept submitting. Never expected, so it reports
+            // unconditionally; capped per the rate-limit contract (ordinal on every line so the last
+            // one bounds the population from below, plus a power-of-two tail so the tail exists at
+            // all — src/gpu/diag_ratelimit.hpp, instrument trap 49).
+            static std::atomic<uint64_t> present_extent_reports{0};
+            auto report_present_extent_shortfall = [&](const char* outcome, size_t offered_bytes) {
+                const uint64_t ord = present_extent_reports.fetch_add(1) + 1;
+                if (!prosper::diag_should_print(ord)) return;
+                auto describe = [](char* out, size_t n, uint32_t cw, uint32_t ch, uint64_t cbase) {
+                    if (!cw || !ch) snprintf(out, n, "none");
+                    else snprintf(out, n, "%ux%u@0x%llx", cw, ch, (unsigned long long)cbase);
+                };
+                char front_text[64], vo_text[64], last_text[64];
+                describe(front_text, sizeof front_text, px_front_w, px_front_h, px_front_base);
+                describe(vo_text, sizeof vo_text, px_vo_w, px_vo_h, px_vo_base);
+                describe(last_text, sizeof last_text, px_last_w, px_last_h, px_last_base);
+                fprintf(stderr,
+                        "[rtt] PRESENT SOURCE EXTENT MISMATCH #%llu: no pass produced a %ux%u "
+                        "(%zu-byte) present source — px_front=%s px_vo=%s px_last=%s, offered %zu "
+                        "bytes; %s\n",
+                        (unsigned long long)ord, w, h, present_extent_bytes,
+                        front_text, vo_text, last_text, offered_bytes, outcome);
+            };
             if (pertarget) {
                 // PER-TARGET RTT: a real frame is a sequence of passes, each rendering into a specific
                 // color target (CB_COLOR0_BASE), and a final composite pass SAMPLES the earlier targets.
@@ -4803,15 +4848,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 std::shared_ptr<const std::vector<uint8_t>> px_front;
                 std::shared_ptr<const std::vector<uint8_t>> px_vo;
                 std::shared_ptr<const std::vector<uint8_t>> px_last;
-                // Each candidate's own target extent and base, kept only so a publish-extent
-                // mismatch can name its source. A pass is selected below on identity (front buffer
-                // / any registered scanout / last RGBA8 pass) with no extent contract, so a title
-                // whose last RGBA8 pass is an internal target smaller than the scanout returns a
-                // frame the caller cannot publish (#1968).
-                uint32_t px_front_w = 0, px_front_h = 0;
-                uint32_t px_vo_w = 0, px_vo_h = 0;
-                uint32_t px_last_w = 0, px_last_h = 0;
-                uint64_t px_last_base = 0;
+                // px_front_*/px_vo_*/px_last_* (each candidate's own target extent, and px_last's
+                // base) are declared at callback scope above so the final-span report can name which
+                // sources this submit actually offered.
                 // Render-target persistence (default on; PROSPER_RTT_NOSEED reverts to per-pass blue
                 // clear): seed each group's framebuffer with the pixels last rendered into that SAME
                 // target VA, so a pass that draws into an already-written target (UE4's UI pass onto
@@ -5653,9 +5692,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (!rendered_pixels.empty() && pass_format == VK_FORMAT_R8G8B8A8_UNORM) {
                         if (base && base == front_va) {                          // the flipped buffer
                             px_front = pass_pixels; px_front_w = gw; px_front_h = gh;
+                            px_front_base = base;
                         }
                         if (is_vo) {                                            // any registered scanout
                             px_vo = pass_pixels; px_vo_w = gw; px_vo_h = gh;
+                            px_vo_base = base;
                         }
                         px_last = pass_pixels;                                  // last non-empty (fallback)
                         px_last_w = gw; px_last_h = gh; px_last_base = base;
@@ -5694,36 +5735,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 }
                 // Present priority: the flipped front buffer > any registered scanout target > the
                 // legacy "last group" fallback (unchanged behavior when no group targets a VO buffer).
-                selected_pixels = px_front ? px_front : (px_vo ? px_vo : px_last);
-                // Fail-visible: the selection above is by target IDENTITY only. When the chosen pass
-                // is not the size the caller asked for, the caller's publish gate drops the frame
-                // silently, so say so here — with the source and its extent — rather than leaving the
-                // publish counter to stop for no stated reason (#1968). Rate-limited; diagnostic only.
-                if (selected_pixels && !selected_pixels->empty() &&
-                    selected_pixels->size() != static_cast<size_t>(w) * h * 4) {
-                    static std::atomic<int> logged{0};
-                    const int n = logged.fetch_add(1);
-                    if (n < 32)
-                        fprintf(stderr,
-                                "[rtt] PRESENT SOURCE EXTENT MISMATCH: selected %s at %ux%u "
-                                "(base=0x%llx) for a requested %ux%u frame — %zu bytes vs %zu "
-                                "expected; the caller cannot publish it%s\n",
-                                px_front ? "px_front" : (px_vo ? "px_vo" : "px_last"),
-                                px_front ? px_front_w : (px_vo ? px_vo_w : px_last_w),
-                                px_front ? px_front_h : (px_vo ? px_vo_h : px_last_h),
-                                (unsigned long long)(px_front || px_vo ? front_va : px_last_base),
-                                w, h, selected_pixels->size(),
-                                static_cast<size_t>(w) * h * 4,
-                                n == 31 ? " [further reports suppressed]" : "");
-                }
+                // Under the publish extent contract (#1986) a candidate whose byte count disagrees is
+                // not a present source, so a correctly sized lower-priority candidate is preferred over
+                // an incorrectly sized higher-priority one, and "nothing qualified" yields no source at
+                // all rather than a frame the caller must discard. Without a scanout (offline replay,
+                // render_submit_items tests) this is byte-for-byte the historical identity priority.
+                auto candidate_bytes = [](const std::shared_ptr<const std::vector<uint8_t>>& p) {
+                    return p ? p->size() : size_t{0};
+                };
+                present_choice = prosper::frontend::select_present_source(
+                    candidate_bytes(px_front), candidate_bytes(px_vo), candidate_bytes(px_last),
+                    present_extent_bytes);
+                using prosper::frontend::PresentSourceChoice;
+                selected_pixels = present_choice == PresentSourceChoice::Front ? px_front
+                                : present_choice == PresentSourceChoice::Vo    ? px_vo
+                                : present_choice == PresentSourceChoice::Last  ? px_last
+                                : nullptr;
                 {
                     const uint64_t at = g_pass_log_submit.fetch_add(1);
                     if (const char* pl = getenv("PROSPER_PASS_LOG")) {
                         const uint64_t pl_min = std::strtoull(pl, nullptr, 0);
                         if (at >= pl_min && at < pl_min + 3u)
                             fprintf(stderr, "[pass] cb=%llu selected=%s\n", (unsigned long long)at,
-                                    px_front ? "px_front"
-                                             : (px_vo ? "px_vo" : (px_last ? "px_last" : "none")));
+                                    prosper::frontend::present_source_name(present_choice));
                     }
                 }
                 // PROSPER_DUMP_PERSISTENT=<min-submit>: read back and dump EVERY persistent color
@@ -5740,7 +5774,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         fprintf(stderr, "[persist] submit=%llu present: front=%d/%d front_va=0x%llx "
                                 "selected=%s vo:", (unsigned long long)sub, vo_front, vo_n,
                                 (unsigned long long)front_va,
-                                px_front ? "px_front" : (px_vo ? "px_vo" : (px_last ? "px_last" : "none")));
+                                prosper::frontend::present_source_name(present_choice));
                         for (int i = 0; i < vo_n && i < 8; i++)
                             fprintf(stderr, " [%d]=0x%llx", i, (unsigned long long)prosper_vo_buffer_addr(i));
                         fprintf(stderr, "\n");
@@ -5909,10 +5943,42 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // renderer's single present thread (this callback and its sibling statics — dp_submit,
                 // warned, frame_no — all assume the one serialized present path). It must not be read or
                 // assigned from another thread; a concurrent present would race the object assignment.
+                // The net's own test used to be `!empty()`, which is not the publish predicate (#1986):
+                // a non-empty WRONG-EXTENT frame took the store branch, overwrote the retained good
+                // frame, and made the recovery branch unreachable for the rest of the process. Sonic
+                // Frontiers' 4K publish wall was permanent for exactly that reason. Retaining is now
+                // the same predicate as publishing, so a frame prosper could not publish can never
+                // become the frame it serves later.
                 static std::shared_ptr<const std::vector<uint8_t>> last_scanout_present;
                 if (!published_gpu) {
-                    if (selected_pixels && !selected_pixels->empty()) last_scanout_present = selected_pixels;
-                    else if (last_scanout_present) selected_pixels = last_scanout_present;
+                    const size_t current_bytes = selected_pixels ? selected_pixels->size() : 0u;
+                    const size_t retained_bytes =
+                        last_scanout_present ? last_scanout_present->size() : 0u;
+                    switch (prosper::frontend::retained_frame_action(
+                                current_bytes, retained_bytes, present_extent_bytes)) {
+                        case prosper::frontend::RetainedFrameAction::StoreCurrent:
+                            last_scanout_present = selected_pixels;
+                            break;
+                        case prosper::frontend::RetainedFrameAction::ServeRetained:
+                            selected_pixels = last_scanout_present;
+                            // A stale-but-correct frame IS what the guest sees, so say so rather than
+                            // letting a silent substitution read as a healthy present. Under no extent
+                            // contract this branch is the historical empty-frame recovery and is not
+                            // itself a defect, so it stays quiet there.
+                            if (present_extent_bytes)
+                                report_present_extent_shortfall(
+                                    "serving the retained frame instead", current_bytes);
+                            break;
+                        case prosper::frontend::RetainedFrameAction::NoUsableFrame:
+                            // Nothing publishable exists and there is nothing retained to fall back on.
+                            // selected_pixels is left alone so the capture/dump paths and the caller's
+                            // own `[agc] PUBLISH DROPPED` backstop still see what was rendered; the
+                            // caller will not publish it.
+                            if (present_extent_bytes && current_bytes)
+                                report_present_extent_shortfall(
+                                    "nothing is published for this submit", current_bytes);
+                            break;
+                    }
                 }
                 if (getenv("PROSPER_DUMP_PERSISTENT")) {
                     size_t nb = 0;
