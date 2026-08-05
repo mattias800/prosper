@@ -798,6 +798,40 @@ void avp_register_frame_layout(uint8_t* base, size_t bytes, uint32_t pitch) {
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(base)), bytes, pitch);
 }
 
+// AvPlayerVideoEx follows the H.264 SPS convention its four field names mirror
+// (frame_crop_{left,right,top,bottom}_offset): width/height are the CODED extent, and the crop
+// offsets trim that down to the visible picture. prosper stages decoded NV12 at a 256-byte-aligned
+// physical pitch (#1814), so the coded width IS that pitch and the padded columns are exactly what
+// crop_right_offset removes.
+//
+// Publishing the VISIBLE width here while ALSO publishing a non-zero crop_right_offset made the two
+// ways a title can spell the same question disagree, and shipping titles use both spellings:
+//
+//   GRIS       visible = pitch - crop_left - crop_right  ->  2048 - 0 - 128 = 1920   (correct)
+//   ArcRunner  visible = width - crop_left - crop_right  ->  1920 - 0 - 128 = 1792   (WRONG)
+//
+// Measured on ArcRunner (PPSA21406, #2011): with the movie's 1920x1080 frame staged at pitch 2048,
+// the guest sizes its luma T# from the pitch (2048x1080, chroma 1024x540 — half of it) and then
+// renders the converted frame into a 1792x1080 target, losing a 128-column slice of every movie
+// frame. Reporting width == pitch satisfies both spellings at once and leaves GRIS unchanged.
+//
+// `aspect` stays the VISIBLE display ratio: it is not part of the crop arithmetic, and a consumer
+// reads it to letterbox, never to size a surface.
+// CONFIDENCE: MED — derived from two independent shipping consumers plus the H.264 cropping
+// convention the field names follow. No Sony header was consulted.
+void avp_fill_video_ex(AvpVideoEx& out, uint32_t visible_w, uint32_t visible_h, uint32_t pitch,
+                       double framerate) {
+    out = {};
+    out.width = pitch;                 // coded extent the crop offsets trim
+    out.height = visible_h;            // prosper stages no padded rows
+    out.aspect = visible_h ? static_cast<float>(visible_w) / static_cast<float>(visible_h) : 0.0f;
+    out.crop_right_offset = pitch - visible_w;
+    out.pitch = pitch;
+    out.luma_bd = 8;
+    out.chroma_bd = 8;
+    out.framerate = framerate;
+}
+
 void avp_release_frame_storage(AvpPlayer& player) {
     if (!player.frame.empty())
         gpu::unregister_guest_linear_texture_layout(
@@ -1289,12 +1323,7 @@ HLE(s_avp_getstreaminfoex) { // s32 sceAvPlayerGetStreamInfoEx(handle, stream_id
     if (a1 == 0) {
         uint32_t pitch = 0;
         if (!avp_video_pitch(p.width, pitch)) return 0x806a0001ull;
-        out->details.video.width = p.width; out->details.video.height = p.height;
-        out->details.video.aspect = (float)p.width / (float)p.height;
-        out->details.video.crop_right_offset = pitch - p.width;
-        out->details.video.pitch = pitch;
-        out->details.video.luma_bd = 8; out->details.video.chroma_bd = 8;
-        out->details.video.framerate = p.fps;
+        avp_fill_video_ex(out->details.video, p.width, p.height, pitch, p.fps);
     } else {
         out->details.audio.channels = (uint16_t)p.audio_channels;
         out->details.audio.sample_rate = p.audio_rate;
@@ -1727,12 +1756,7 @@ HLE(s_avp_getvideodataex) {
                     fi->timestamp = vf.pts_us / 1000;
                     p.last_ts_ms = fi->timestamp;
                     p.seek_deliver = false;
-                    fi->details.video = {}; fi->details.video.width = vf.width; fi->details.video.height = vf.height;
-                    fi->details.video.aspect = vf.height ? (float)vf.width / (float)vf.height : 0.0f;
-                    fi->details.video.crop_right_offset = pitch - vf.width;
-                    fi->details.video.pitch = pitch;
-                    fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
-                    fi->details.video.framerate = p.fps;
+                    avp_fill_video_ex(fi->details.video, vf.width, vf.height, pitch, p.fps);
                     result = 1;
                 }
             } else if (b->eof(p.backend_id) && !p.stop_fired) {
@@ -1744,12 +1768,7 @@ HLE(s_avp_getvideodataex) {
             if (avp_stage_synthetic(p, true, staged, pitch)) {
                 fi->p_data = staged; fi->timestamp = p.poll * 33ull;
                 p.last_ts_ms = fi->timestamp;
-                fi->details.video = {}; fi->details.video.width = p.width; fi->details.video.height = p.height;
-                fi->details.video.aspect = (float)p.width / (float)p.height;
-                fi->details.video.crop_right_offset = pitch - p.width;
-                fi->details.video.pitch = pitch;
-                fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
-                fi->details.video.framerate = p.fps;
+                avp_fill_video_ex(fi->details.video, p.width, p.height, pitch, p.fps);
                 p.poll++; result = 1;
             }
         } else if (!p.stop_fired) {
