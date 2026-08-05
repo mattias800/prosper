@@ -1492,7 +1492,22 @@ HLE(k_ampr_getsize) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     ampr_arglog("tZDDEo2tE5k(GetSize)", a0, a1, a2, a3, a4, a5);
     if (uint64_t capacity = ampr_cb_capacity(a0)) return capacity;
-    return g_apr_last_cb_size ? g_apr_last_cb_size : 0x10000;
+    // The legacy `g_apr_last_cb_size` global is the capacity of ONE specific command buffer
+    // (`g_apr_last_cb`, recorded together with it in k_ampr_init). Serving it for a DIFFERENT cb
+    // whose own capacity we failed to recognise is not a fallback, it is a wrong answer — and a
+    // too-small wrong answer is unrecoverable, because the guest's IoStore batch builder only
+    // appends once `GetSize(cb) - GetCurrentOffset(cb) > 0xff`. The Forgotten City (PPSA03026, UE4)
+    // proved this: its IoService command buffer is constructed as (a1=0, a2=<ptr>, a5=<ptr>), a
+    // shape `ampr_cb_capacity_arg` cannot read a capacity from, and one unrelated init elsewhere in
+    // the boot records a1=0x81 (129). GetSize then answered 129 for the IoService cb, 129 - 0 never
+    // exceeds 255, and the IoService thread span at 100% CPU forever while the GameThread waited on
+    // I/O that could never be enqueued (present_count frozen at 1). Whether that unrelated init won
+    // the race against IoService's first poll is what made the title intermittently boot at all.
+    // So: use the global only for the cb it was actually recorded against, and otherwise fall back
+    // to the roomy default, which is the only safe answer for an unknown capacity.
+    // CONFIDENCE: HIGH (the spin and its disappearance are both directly observed).
+    if (a0 && a0 == g_apr_last_cb && g_apr_last_cb_size) return g_apr_last_cb_size;
+    return 0x10000;
 }
 HLE(k_ampr_x3) { return ampr_arglog("Qs1xtplKo0U", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }

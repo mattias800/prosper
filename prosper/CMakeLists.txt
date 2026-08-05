@@ -668,6 +668,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_ampr_measure PRIVATE prosper_core)
   add_test(NAME ampr_measure COMMAND test_ampr_measure)
 
+  # sceAmprCommandBufferGetSize must not answer for one command buffer with another's recorded
+  # capacity: a too-small answer permanently hangs the guest's IoStore append loop, which polls
+  # GetSize(cb) - GetCurrentOffset(cb) > 0xff without a bound (The Forgotten City, PPSA03026).
+  add_executable(test_ampr_getsize_fallback tests/test_ampr_getsize_fallback.cpp)
+  target_link_libraries(test_ampr_getsize_fallback PRIVATE prosper_core)
+  add_test(NAME ampr_getsize_fallback COMMAND test_ampr_getsize_fallback)
+
   # Direct-memory allocate/available (issue #99): AvailableDirectMemorySize reports the largest
   # free aligned block in the search window and writes both out-params (was a total-size stub).
   add_executable(test_dmem tests/test_dmem.cpp)
