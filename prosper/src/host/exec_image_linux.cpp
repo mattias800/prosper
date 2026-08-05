@@ -2158,8 +2158,13 @@ namespace {
             // number); this is a dev diagnostic and the exercised worker-fault RE runs on Linux.
 #ifndef __APPLE__
             if (getenv("PROSPER_FAULTOBJ")) {
+                // #1945: rdi/r12/r13/r14 as well as the original rax/r15/rbx. The corrupted object
+                // is whichever register the faulting instruction dereferenced, and on PPSA21406's
+                // eboot+0x117e21d that is rdi (the forged pointer) and r12 (the pointer array it
+                // was loaded from) — neither of which the original three-register list dumped.
                 const struct { const char* nm; uint64_t addr; } objs[] = {
-                    {"rax", g_rax}, {"r15", g_r15}, {"rbx", g_rbx},
+                    {"rax", g_rax}, {"r15", g_r15}, {"rbx", g_rbx}, {"rdi", g_rdi},
+                    {"r12", g_r12}, {"r13", g_r13}, {"r14", g_r14},
                 };
                 for (const auto& o : objs) {
                     uint64_t buf[24];
@@ -2175,20 +2180,57 @@ namespace {
                     on += snprintf(ob + on, sizeof ob - (size_t)on, "\n");
                     raw_write(2, ob, (size_t)on);
                 }
-                // Corruption-source probe: dump rcx/rdx and scan the GPU-write ring around rdx (the
-                // free-list head slot for a `mov [rdx]`-style pop) and rax. If a prosper ReleaseMem/fence
-                // write landed on a guest allocator header, it shows here (DOLL #232/#241 stomp class).
+                // Corruption-source probe: dump rcx/rdx and scan the GPU-write ring around every
+                // guest-pointer-shaped register. If a prosper ReleaseMem/fence write landed on a
+                // guest allocator header or a live guest pointer array, it shows here (DOLL
+                // #232/#241 stomp class).
+                //
+                // #1945: the probe set used to be exactly { rdx, rax } — chosen for DOLL's
+                // `mov [rdx]`-style free-list pop. That silently answers nothing whenever the
+                // corrupted pointer lives in a different register. Measured on PPSA21406 at
+                // eboot+0x117e21d (`mov (%r12,%rcx,8),%rdi` / `mov 0x40(%rdi),%rcx` /
+                // `vucomisd (%rcx),%xmm0`): the forged pointer is rdi = 0x2100000001 and the array
+                // base is r12, while rax = 0 and rdx = 1 — both below 0x1000, so BOTH probes hit
+                // the `continue` and the scans printed not one line. A ring scan that skipped the
+                // only page worth reading is indistinguishable from a ring that held no hit, i.e.
+                // void, not negative. Probe the fault address and every register whose value could
+                // be a guest address; de-duplicate pages and cap the list so a 16-register dump
+                // cannot flood the terminal fault report.
+                uint64_t probe_pages[12];
+                unsigned probe_page_n = 0, probe_page_considered = 0;
                 {
-                    char cb[160];
-                    int cn = snprintf(cb, sizeof cb, "[faultobj] rcx=0x%llx rdx=0x%llx\n",
-                                      (unsigned long long)g_rcx, (unsigned long long)g_rdx);
+                    const uint64_t cand[] = {
+                        (uint64_t)(uintptr_t)g_fault_addr, g_rax, g_rbx, g_rcx, g_rdx, g_rsi, g_rdi,
+                        g_r8, g_r9, g_r10, g_r11, g_r12, g_r13, g_r14, g_r15,
+                    };
+                    for (uint64_t v : cand) {
+                        // Skip small integers (a count/flag, and the corrupt `0x1` head itself has
+                        // no page worth scanning) and host addresses (stack/libc live at 0x7f…).
+                        if (v < 0x10000 || v >= 0x7f0000000000ull) continue;
+                        const uint64_t pg = v & ~0xfffull;
+                        bool dup = false;
+                        for (unsigned i = 0; i < probe_page_n; i++) dup = dup || probe_pages[i] == pg;
+                        if (dup) continue;
+                        // Count every distinct eligible page, then keep what fits. Reporting only
+                        // the kept count would make a truncated probe read as an exhaustive one —
+                        // the very failure this widening exists to remove — so print kept/considered.
+                        probe_page_considered++;
+                        if (probe_page_n < (unsigned)(sizeof probe_pages / sizeof probe_pages[0]))
+                            probe_pages[probe_page_n++] = pg;
+                    }
+                }
+                {
+                    char cb[176];
+                    int cn = snprintf(cb, sizeof cb,
+                                      "[faultobj] rcx=0x%llx rdx=0x%llx probe-pages=%u/%u%s\n",
+                                      (unsigned long long)g_rcx, (unsigned long long)g_rdx,
+                                      probe_page_n, probe_page_considered,
+                                      probe_page_n < probe_page_considered ? " (CAPPED)" : "");
                     raw_write(2, cb, (size_t)cn);
                     if (prosper_gpu_write_ring_scan) {
                         static char ring[8192];
-                        const uint64_t probes[2] = { g_rdx, g_rax };
-                        for (uint64_t probe : probes) {
-                            uint64_t pg = probe & ~0xfffull;
-                            if (pg < 0x1000) continue;
+                        for (unsigned i = 0; i < probe_page_n; i++) {
+                            const uint64_t pg = probe_pages[i];
                             int rn = prosper_gpu_write_ring_scan(pg, pg + 0x1000, ring, sizeof ring);
                             if (rn > 0) {
                                 char hb[96]; int hn = snprintf(hb, sizeof hb,
@@ -2207,10 +2249,8 @@ namespace {
                     // was NEVER a clock-fence target), so report both outcomes.
                     if (prosper_gpu_clockfence_scan) {
                         static char cfb[8192];
-                        const uint64_t probes[2] = { g_rdx, g_rax };
-                        for (uint64_t probe : probes) {
-                            uint64_t pg = probe & ~0xfffull;
-                            if (pg < 0x1000) continue;
+                        for (unsigned i = 0; i < probe_page_n; i++) {
+                            const uint64_t pg = probe_pages[i];
                             int fn2 = prosper_gpu_clockfence_scan(pg, pg + 0x1000, cfb, sizeof cfb);
                             char hb[112]; int hn = snprintf(hb, sizeof hb,
                                 "[faultobj] clock-fence targets in page 0x%llx: %d\n",
