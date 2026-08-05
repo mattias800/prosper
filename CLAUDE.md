@@ -369,6 +369,24 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   reviewer posts approval on the corrected exact head. Address every blocking finding and re-review authored
   corrections, then merge only after the merge agent separately confirms author verification, reviewer approval
   where required, and green required CI.
+  - **How a verdict is expressed and detected — this is mechanical, and getting it wrong has merged a rejected
+    PR.** The reviewer posts one or more **registered reviews** with `gh pr review <N> --comment --body '…'`,
+    each stating a verdict as a literal **`APPROVED`** or **`REJECTED`** in the body. The author reads the
+    comments, fixes what is raised, and merges only once a review says `APPROVED` **on the current head**.
+    Two mechanical facts make this the only workable scheme here, and both are invisible until they bite:
+    - **`gh pr comment` does NOT register as a review.** It creates an *issue* comment, fully visible on the PR
+      page and absent from `gh pr view --json reviews`. A verdict posted that way is invisible to anyone
+      checking programmatically. Several reviews were posted this way before it was noticed.
+    - **GitHub refuses `--approve` on a PR opened by the same account**, and every agent here operates as the
+      repository owner. So the review *state* is **always `COMMENTED`**, for approvals and rejections alike, and
+      `reviewDecision` stays empty. **The GitHub review state carries no verdict in this repository. Never gate
+      on it, and never treat "a review exists" as "a review approved".** A merge daemon that counted
+      `reviews > 0` merged #2026 with two blocking findings outstanding; the revert is #2044. The verdict lives
+      in the prose, so **a human or an agent must read it** — this specific check cannot be automated here.
+    - Corollary for the merge step: **a rebase or a new push detaches every review from head.** `reviews` still
+      reports rows, with a `commit_id` that is no longer on the branch. Compare each review's `commit_id`
+      against the current head; if it is stale, establish by **content** (`git diff <reviewed-sha> <head>`)
+      whether the approval still applies rather than assuming in either direction.
 - **Unpublished desktop-app parity is not a merge requirement.** A Linux-, Windows-, or macOS-specific app
   improvement may merge without matching work in every other frontend unless the issue explicitly promises
   parity or a shared public contract requires it. Unaffected platforms must still retain existing behavior and
