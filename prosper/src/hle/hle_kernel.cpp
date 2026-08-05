@@ -403,11 +403,20 @@ namespace {
     // comment above the handlers). The accounting belongs to the LOCK, not to a thread: FreeBSD
     // permits a read hold to be released by a different thread, and prosper's own fibers can move
     // between host threads across a yield.
+    // The write flag and the hold count live in ONE atomic word, so "is this a decrementable
+    // non-write hold?" is decided and committed by a single compare-exchange. Two separate atomics
+    // cannot express that: the unlocking thread's loads of the two can straddle a writer's acquire,
+    // and no amount of re-checking fixes it, because a re-check is an ABA test — it distinguishes
+    // "an owner is here now" from "no owner", never "an owner came and went". See rw_release.
+    //   bit 63      WRITE  — a write hold is outstanding; `owner` names the thread holding it
+    //   bits 0..31  COUNT  — outstanding acquisitions (each reader 1, a writer 1)
     struct GuestRwlock {
         pthread_rwlock_t rw;
-        std::atomic<int32_t> holds;    // outstanding acquisitions (each reader 1, a writer 1)
-        std::atomic<uint64_t> writer;  // owning tid while write-held, 0 otherwise
+        std::atomic<uint64_t> state;   // WRITE | COUNT
+        std::atomic<uint64_t> owner;   // owning tid while WRITE is set; only read when WRITE is set
     };
+    constexpr uint64_t kRwWrite = 1ull << 63;
+    constexpr uint64_t kRwCount = 0xffffffffull;
     GuestRwlock* guest_rwlock_create() {
         void* mem = calloc(1, sizeof(GuestRwlock));
         if (!mem) return nullptr;
@@ -815,6 +824,12 @@ HLE(k_rwlock_init) {
     *(void**)a0 = g;    // store handle through caller's slot (a1=attr, a2=name ignored)
     return 0;
 }
+// PRE-EXISTING HAZARD, recorded rather than fixed (#2042): destroying a rwlock while another thread
+// is inside one of the handlers below frees the object under it. That was already true when the
+// object was a bare pthread_rwlock_t — the concurrent thread dereferenced it once — and the hold
+// accounting widens the window to a few atomics. Destroying a lock another thread may still be
+// using is a guest bug on any platform, and no title in the corpus is known to do it; closing it
+// properly needs a lifetime scheme (epoch or refcount) that is out of scope here.
 HLE(k_rwlock_destroy) {
     if (a0 && !pt_static_sentinel(*(void**)a0)) guest_rwlock_destroy((GuestRwlock*)*(void**)a0);
     if (a0) *(void**)a0 = nullptr;
@@ -874,61 +889,71 @@ namespace {
         return (uint64_t)(uintptr_t)pthread_self();
 #endif
     }
-    // ORDER IS LOAD-BEARING IN BOTH DIRECTIONS, and the obvious order is the wrong one.
+    // WHY THE WRITE FLAG AND THE COUNT SHARE ONE WORD, written down because two earlier versions of
+    // this function got it wrong in two different ways and the second one looked airtight.
     //
-    // These two fields are read by a STRAY unlock running on another thread — that is the whole
-    // point of the accounting — so "only the writer can be running here" is false, and any window
-    // in which `writer == 0` while `holds > 0` lets a stray unlock take the reader path and forward
-    // a host unlock that releases the WRITE hold. The owner then decrements to -1 and forwards its
-    // own unlock, glibc takes the reader path, `__readers` goes negative, and the lock is bricked:
-    // #2012 reproduced by its own fix.
+    // A stray unlock — the thing this accounting exists to refuse — runs concurrently with real
+    // acquisitions, so any decision it makes by reading TWO atomics can be invalidated between the
+    // reads. Version 2 read `writer` then `holds`, which let the pair straddle a writer's acquire.
+    // Version 3 re-read `writer` after the decrement and undid it if an owner had appeared; that is
+    // an ABA test, and it only narrowed the window. It answers "is an owner here NOW?", never "did
+    // an owner come and go?", so this interleaving still slipped through (S = stray, W' and W" =
+    // balanced writers, all values permitted by the memory model):
     //
-    // So: publish the owner BEFORE the count on acquire, and drop the count BEFORE clearing the
-    // owner on release. A non-owner arriving at any instant then sees either `writer == owner`
-    // (EPERM) or `holds == 0` (EPERM) — never a decrementable count with no owner. Both stores
-    // still happen inside rw_release, i.e. before the caller's host unlock, so the next writer
-    // cannot observe a stale owner either.
+    //   1. idle: count=0, writer=0
+    //   2. S loads writer -> 0, takes the reader path
+    //   3. W' acquires: writer=W', count 0->1
+    //   4. S loads count -> 1
+    //   5. W' releases: count 1->0, writer=0, forwards its host unlock — the lock is free
+    //   6. S pre-checks writer -> 0, proceeds
+    //   7. W" acquires the free lock: writer=W", count 0->1
+    //   8. S's CAS expects count==1, and count IS 1 (W"'s) -> succeeds, count->0
+    //   9. W" releases: owner==self, decrement-if-positive finds 0, forwards its own host unlock
+    //  10. S post-checks writer -> 0 -> returns 0 -> forwards a SECOND host unlock on a free lock
+    //      -> glibc takes the reader path -> __readers negative -> #2012, reproduced by its own fix
+    //
+    // Reaching that needs S to be interrupted inside two ~2-instruction gaps, so a clean stress run
+    // does not refute it — which is exactly why it must be closed by construction rather than by
+    // testing. Folding WRITE into the counted word does that: the write flag is part of the value
+    // the compare-exchange compares, so a reader-path decrement can never commit against a word
+    // that has WRITE set, and step 8's CAS fails instead of succeeding. `owner` is consulted ONLY
+    // when WRITE is set, and WRITE is set and cleared by the owner while it holds the host lock
+    // exclusively, so a stale read of `owner` cannot decide anything on its own.
     void rw_acquired(GuestRwlock* g, bool write) {
-        if (write) g->writer.store(rw_self_tid(), std::memory_order_release);
-        g->holds.fetch_add(1, std::memory_order_acq_rel);
+        if (!write) { g->state.fetch_add(1, std::memory_order_acq_rel); return; }
+        // Publish the owner before WRITE becomes visible: anything that observes WRITE through the
+        // release-CAS below also observes this store.
+        g->owner.store(rw_self_tid(), std::memory_order_release);
+        uint64_t s = g->state.load(std::memory_order_acquire);
+        while (!g->state.compare_exchange_weak(s, (s | kRwWrite) + 1,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {}
     }
     // 0 = released (the caller may now unlock the host lock); EPERM = FreeBSD refuses this unlock
     // and the host lock must not be touched.
     int rw_release(GuestRwlock* g) {
         const uint64_t self = rw_self_tid();
-        if (const uint64_t owner = g->writer.load(std::memory_order_acquire)) {
-            if (owner != self) return EPERM;              // non-owner write unlock
-            // Decrement-if-positive even here: after the ordering above it provably cannot
-            // underflow, and if it ever did, a negative `holds` would refuse every future unlock on
-            // this lock forever with no diagnostic. One compare buys fail-safe over fail-permanent.
-            int32_t cur = g->holds.load(std::memory_order_acquire);
-            while (cur > 0 && !g->holds.compare_exchange_weak(cur, cur - 1,
-                                                              std::memory_order_acq_rel,
-                                                              std::memory_order_acquire)) {}
-            g->writer.store(0, std::memory_order_release);
-            return 0;
-        }
-        // The reader path re-reads `writer` AFTER the decrement, and undoes it if an owner appeared.
-        // Publishing the owner before the count is not enough on its own: this thread's two loads
-        // can STRADDLE a writer's acquire — read `writer` as 0, then read `holds` as 1 from the
-        // very increment that writer just made — and then release a write hold it does not own.
-        // Measured, not theorised: a write-only stress workload accepted exactly one stray unlock
-        // this way and wedged every worker in pthread_rwlock_wrlock forever. Because the writer's
-        // `writer.store` happens-before its `holds.fetch_add`, observing that increment guarantees
-        // the re-read sees the owner, so the undo closes the window rather than narrowing it.
-        int32_t cur = g->holds.load(std::memory_order_acquire);
-        while (cur > 0) {
-            if (g->writer.load(std::memory_order_acquire) != 0) return EPERM;
-            if (g->holds.compare_exchange_weak(cur, cur - 1, std::memory_order_acq_rel,
-                                               std::memory_order_acquire)) {
-                if (g->writer.load(std::memory_order_acquire) != 0) {
-                    g->holds.fetch_add(1, std::memory_order_acq_rel);   // an owner appeared: undo
-                    return EPERM;
-                }
+        uint64_t s = g->state.load(std::memory_order_acquire);
+        for (;;) {
+            if (s & kRwWrite) {
+                // Only the owner may release a write hold (FreeBSD checks this in libthr).
+                if (g->owner.load(std::memory_order_acquire) != self) return EPERM;
+                // Clear WRITE and drop the count in ONE commit. Decrement-if-positive, so a count
+                // that somehow reached 0 cannot wrap to 4 billion and refuse every future unlock.
+                const uint64_t ns = (s & ~kRwWrite) - ((s & kRwCount) ? 1u : 0u);
+                if (!g->state.compare_exchange_weak(s, ns, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire))
+                    continue;                              // raced: re-read and re-decide
+                // Cleared before the caller forwards its host unlock, so the next writer to acquire
+                // cannot observe this owner.
+                g->owner.store(0, std::memory_order_release);
                 return 0;
             }
+            if ((s & kRwCount) == 0) return EPERM;         // nothing held: refuse, lock untouched
+            if (g->state.compare_exchange_weak(s, s - 1, std::memory_order_acq_rel,
+                                               std::memory_order_acquire))
+                return 0;                                  // a read hold released (any thread may)
         }
-        return EPERM;                                     // no hold outstanding: refuse
     }
     // One counter per report KIND: a flood of one must not consume another's budget (the trap this
     // repository records as asymmetric cap exhaustion). Each line carries its own kind's ordinal.
@@ -937,10 +962,11 @@ namespace {
         static std::atomic<int> printed[(size_t)RwReport::Count_];
         const int n = printed[(size_t)kind].fetch_add(1);
         if (n >= 64 && (n & (n - 1)) != 0) return;   // first 64 of this kind, then powers of two
-        fprintf(stderr, "[rwlock] %s slot=0x%llx rw=%p rc=%d tid=%llu holds=%d #%d\n", what,
+        const uint64_t s = g ? g->state.load(std::memory_order_relaxed) : 0;
+        fprintf(stderr, "[rwlock] %s slot=0x%llx rw=%p rc=%d tid=%llu holds=%llu%s #%d\n", what,
                 (unsigned long long)slot, (const void*)g, rc,
                 (unsigned long long)rw_self_tid(),
-                g ? g->holds.load(std::memory_order_relaxed) : 0, n);
+                (unsigned long long)(s & kRwCount), (s & kRwWrite) ? " WRITE" : "", n);
     }
     // A lock call that FAILED records no hold, and it is worth saying so: the handlers below still
     // report success to the guest, which is the other way an unmatched unlock can originate inside

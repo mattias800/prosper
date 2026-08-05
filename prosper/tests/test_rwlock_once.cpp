@@ -240,6 +240,10 @@ int main() {
         for (auto& w : workers) w.join();
         CHECK(rounds.load() == 6000 && strays_refused.load() > 1000,
               "the concurrency arm actually ran (6000 balanced write rounds; strays were refused)");
+        // If this ever fires, it is NOT flakiness — it is the signature of a residual ordering
+        // window between the write flag and the hold count, and it is the only assertion here that
+        // can see one (`refused_after_write` cannot: a stray that steals the hold returns 0 to
+        // ITSELF, and the owner's own release still succeeds). Do not retry it; go read rw_release.
         CHECK(strays_accepted.load() == 0,
               "no stray unlock is EVER accepted against a write-only workload (the ordering invariant)");
         CHECK(refused_after_write.load() == 0,
