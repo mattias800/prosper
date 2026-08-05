@@ -101,6 +101,117 @@ public:
     void close(int id) override { if (id == 17) ++close_count; }
 };
 
+// A backend with a real timeline, so a seek can be observed as a CHANGE OF POSITION rather than as
+// "the call returned zero" (#1949). Frame i sits at i * kFrameUs; a seek lands on the first frame at
+// or after the requested time, exactly as an accurate container seek does.
+class SeekingVideoBackend final : public video::VideoBackend {
+public:
+    static constexpr uint32_t kWidth = 64;
+    static constexpr uint32_t kHeight = 64;
+    static constexpr uint64_t kFrameUs = 16'667;
+    static constexpr uint64_t kFrames = 300;
+    bool support_seek = true;
+    int seek_calls = 0;
+    uint64_t last_seek_us = 0;
+    uint64_t cursor = 0;
+    std::vector<uint8_t> nv12 =
+        std::vector<uint8_t>(static_cast<size_t>(kWidth) * (kHeight + kHeight / 2), 0x30);
+
+    int open(const std::string&) override { cursor = 0; return 21; }
+    bool info(int id, video::StreamInfo& out) override {
+        if (id != 21) return false;
+        out.width = kWidth; out.height = kHeight; out.fps = 60.0f;
+        out.has_audio = false; out.duration_us = kFrames * kFrameUs;
+        return true;
+    }
+    bool next_video(int id, video::VideoFrame& out) override {
+        if (id != 21 || cursor >= kFrames) return false;
+        out.y = nv12.data();
+        out.uv = nv12.data() + static_cast<size_t>(kWidth) * kHeight;
+        out.width = kWidth; out.height = kHeight; out.y_stride = kWidth; out.uv_stride = kWidth;
+        out.pts_us = cursor * kFrameUs;
+        ++cursor;
+        return true;
+    }
+    bool next_audio(int, video::AudioFrame&) override { return false; }
+    bool eof(int id) override { return id != 21 || cursor >= kFrames; }
+    bool seek(int id, uint64_t position_us) override {
+        if (id != 21 || !support_seek) return false;
+        ++seek_calls;
+        last_seek_us = position_us;
+        cursor = (position_us + kFrameUs - 1) / kFrameUs;   // first frame at or after the request
+        return true;
+    }
+    void close(int) override {}
+};
+
+// #1955 — a backend that only accepts caller-supplied bytes. host `open()` returning -1 while
+// recording the call makes "prosper fell back to the host path" a visible failure rather than a
+// silent one.
+class MemorySourceBackend final : public video::VideoBackend {
+public:
+    std::vector<uint8_t> received;
+    std::string received_name;
+    int host_open_calls = 0;
+    int memory_open_calls = 0;
+
+    int open(const std::string&) override { ++host_open_calls; return -1; }
+    int open_memory(const std::string& debug_name, const uint8_t* data, size_t bytes) override {
+        ++memory_open_calls;
+        received_name = debug_name;
+        received.assign(data, data + bytes);
+        return 31;
+    }
+    bool info(int id, video::StreamInfo& out) override {
+        if (id != 31) return false;
+        out.width = 64; out.height = 64; out.fps = 30.0f; out.duration_us = 1'000'000;
+        return true;
+    }
+    bool next_video(int, video::VideoFrame&) override { return false; }
+    bool next_audio(int, video::AudioFrame&) override { return false; }
+    bool eof(int) override { return true; }
+    void close(int) override {}
+};
+
+#ifndef _WIN32
+// A guest file-replacement table over a synthetic container: the "media" is a byte range that does
+// NOT start at offset 0, which is exactly the case prosper cannot express any other way. Windows
+// production calls these through prosper_call_guest_sysv4; the in-memory backend is Linux-only, so
+// this fixture stays POSIX rather than growing four more ABI bridge stubs.
+static std::vector<uint8_t> guest_container;
+static constexpr size_t kGuestMediaOffset = 4096;
+static constexpr size_t kGuestMediaBytes = 5000;
+static int guest_file_open_calls = 0, guest_file_close_calls = 0;
+static void* guest_file_expected_object = nullptr;
+static bool guest_file_is_open = false;
+
+static int32_t PROSPER_SYSV_ABI on_avplayer_file_open(void* object, const char* path) {
+    if (object != guest_file_expected_object || !path) return -1;
+    guest_file_open_calls++;
+    guest_file_is_open = true;
+    return 5;
+}
+static int32_t PROSPER_SYSV_ABI on_avplayer_file_close(void* object) {
+    if (object != guest_file_expected_object) return -1;
+    guest_file_close_calls++;
+    guest_file_is_open = false;
+    return 0;
+}
+static uint64_t PROSPER_SYSV_ABI on_avplayer_file_size(void* object) {
+    if (object != guest_file_expected_object || !guest_file_is_open) return 0;
+    return kGuestMediaBytes;
+}
+static int32_t PROSPER_SYSV_ABI on_avplayer_file_read(void* object, uint8_t* buffer,
+                                                      uint64_t position, uint32_t length) {
+    if (object != guest_file_expected_object || !guest_file_is_open || !buffer) return -1;
+    if (position >= kGuestMediaBytes) return 0;
+    const uint64_t available = kGuestMediaBytes - position;
+    const uint32_t take = static_cast<uint32_t>(std::min<uint64_t>(length, available));
+    memcpy(buffer, guest_container.data() + kGuestMediaOffset + position, take);
+    return static_cast<int32_t>(take);
+}
+#endif
+
 static void set_synthetic_frames(const char* value) {
 #ifdef _WIN32
     _putenv_s("PROSPER_AVP_SYNTH_FRAMES", value ? value : "");
@@ -208,6 +319,8 @@ int main() {
     HleFn infoex  = Hle::lookup("ctTAcF5DiKQ");
     HleFn pause   = Hle::lookup("9y5v+fGN4Wk");
     HleFn resume  = Hle::lookup("w5moABNwnRY");
+    HleFn jump    = Hle::lookup("XC9wM+xULz8");   // sceAvPlayerJumpToTime (#1949)
+    HleFn current = Hle::lookup("wwM99gjFf1Y");   // sceAvPlayerCurrentTime
     HleFn close   = Hle::lookup(nid_hash("sceAvPlayerClose"));
     CHECK(init && initex && active && add && start && video_basic && video && audio && streams &&
               infoex && pause && resume && close,
@@ -404,6 +517,127 @@ int main() {
     close(basic_handle, 0, 0, 0, 0, 0);
     CHECK(gpu::guest_linear_texture_row_pitch(basic_address, FakeVideoBackend::kWidth) == 0,
           "Close removes the basic AvPlayer fallback layout provenance");
+
+    // ---- sceAvPlayerJumpToTime (#1949) ---------------------------------------------------------
+    // Registering the NID is only half the fix. The guest reads a zero return as a COMPLETED seek:
+    // PPSA30490 pauses the player, jumps, then pulls frames until the reported timestamp moves
+    // before it will call sceAvPlayerResume. So all of these must hold together — a backend that
+    // cannot seek produces a real error instead of a silent success, a backend that can is really
+    // repositioned, and the paused player publishes the post-seek frame exactly once.
+    CHECK(jump != nullptr && current != nullptr,
+          "sceAvPlayerJumpToTime (XC9wM+xULz8) and sceAvPlayerCurrentTime are registered");
+    if (jump && current) {
+        AvpInitData seek_data{};
+        seek_data.event.event_callback = (void*)&on_avplayer_event;
+
+        // FakeVideoBackend does not override the defaulted VideoBackend::seek, i.e. it is a backend
+        // with no seek support. That must reach the guest as an error, never as SCE_OK.
+        prosper::video::set_backend(&fake);
+        uint64_t unseekable = init((uint64_t)(uintptr_t)&seek_data, 0, 0, 0, 0, 0);
+        CHECK(add(unseekable, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0 &&
+                  start(unseekable, 0, 0, 0, 0, 0) == 0,
+              "seek probe source starts on the backend that cannot seek");
+        CHECK(jump(unseekable, 1200, 0, 0, 0, 0) != 0,
+              "sceAvPlayerJumpToTime FAILS when the backend cannot seek (never an implicit SCE_OK)");
+        close(unseekable, 0, 0, 0, 0, 0);
+        CHECK(jump(0xbadf00d, 1200, 0, 0, 0, 0) != 0,
+              "sceAvPlayerJumpToTime FAILS for an unknown player handle");
+
+        SeekingVideoBackend seeker;
+        prosper::video::set_backend(&seeker);
+        event_count = 0;
+        uint64_t seek_handle = init((uint64_t)(uintptr_t)&seek_data, 0, 0, 0, 0, 0);
+        CHECK(add(seek_handle, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0 &&
+                  start(seek_handle, 0, 0, 0, 0, 0) == 0,
+              "seekable source starts through the registered backend");
+        AvpFrameInfoEx seek_frame{};
+        CHECK(video(seek_handle, (uint64_t)(uintptr_t)&seek_frame, 0, 0, 0, 0) == 1 &&
+                  seek_frame.timestamp == 0,
+              "playback before the seek delivers the first frame at timestamp 0");
+
+        // The guest's own order: pause, then jump. While paused and un-sought, delivery stays shut.
+        CHECK(pause(seek_handle, 0, 0, 0, 0, 0) == 0,
+              "the player pauses before seeking, as the guest does");
+        AvpFrameInfoEx paused_frame{};
+        CHECK(video(seek_handle, (uint64_t)(uintptr_t)&paused_frame, 0, 0, 0, 0) == 0,
+              "a paused player with no pending seek still delivers nothing");
+
+        CHECK(jump(seek_handle, 2000, 0, 0, 0, 0) == 0,
+              "sceAvPlayerJumpToTime succeeds on a backend that can seek");
+        CHECK(seeker.seek_calls == 1 && seeker.last_seek_us == 2'000'000,
+              "the millisecond guest target reaches the backend as the same microsecond position");
+        CHECK(current(seek_handle, 0, 0, 0, 0, 0) == 2000,
+              "sceAvPlayerCurrentTime reports the new position before any frame is pulled");
+
+        AvpFrameInfoEx sought_frame{};
+        CHECK(video(seek_handle, (uint64_t)(uintptr_t)&sought_frame, 0, 0, 0, 0) == 1,
+              "the PAUSED player publishes the post-seek frame (what unblocks the guest's wait)");
+        CHECK(sought_frame.timestamp >= 2000 && sought_frame.timestamp < 2020,
+              "the delivered post-seek frame is the one at the requested time, not the old position");
+        AvpFrameInfoEx after_frame{};
+        CHECK(video(seek_handle, (uint64_t)(uintptr_t)&after_frame, 0, 0, 0, 0) == 0,
+              "the post-seek delivery window closes after one frame, restoring the paused contract");
+        CHECK(resume(seek_handle, 0, 0, 0, 0, 0) == 0 &&
+                  video(seek_handle, (uint64_t)(uintptr_t)&after_frame, 0, 0, 0, 0) == 1 &&
+                  after_frame.timestamp > sought_frame.timestamp,
+              "playback continues forward from the seek target once the guest resumes");
+
+        seeker.support_seek = false;
+        CHECK(jump(seek_handle, 500, 0, 0, 0, 0) != 0 && seeker.cursor > 0,
+              "a backend that refuses the seek yields an error and leaves the position alone");
+        close(seek_handle, 0, 0, 0, 0, 0);
+    }
+
+#ifndef _WIN32
+    // ---- guest file-replacement reader (#1955) -------------------------------------------------
+    // A title whose clip lives at an offset inside a container file (PPSA27624 plays a VideoClip out
+    // of Unity's resources.resource) can only express that through sceAvPlayerInit's file-replacement
+    // callbacks. Ignoring them made prosper demux the container's first bytes, which are a different
+    // format entirely. The source must therefore come from the guest's reader, not the host path.
+    {
+        guest_container.assign(kGuestMediaOffset + kGuestMediaBytes, 0x11);
+        for (size_t i = 0; i < kGuestMediaBytes; ++i)
+            guest_container[kGuestMediaOffset + i] = static_cast<uint8_t>(0x40 + (i % 191));
+        guest_file_open_calls = guest_file_close_calls = 0;
+        guest_file_is_open = false;
+        int file_object = 0x5678;
+        guest_file_expected_object = &file_object;
+
+        MemorySourceBackend memory_backend;
+        prosper::video::set_backend(&memory_backend);
+        AvpInitData file_data{};
+        file_data.event.event_callback = (void*)&on_avplayer_event;
+        file_data.file.obj = guest_file_expected_object;
+        file_data.file.open = (void*)&on_avplayer_file_open;
+        file_data.file.close = (void*)&on_avplayer_file_close;
+        file_data.file.read_offset = (void*)&on_avplayer_file_read;
+        file_data.file.size = (void*)&on_avplayer_file_size;
+        uint64_t file_handle = init((uint64_t)(uintptr_t)&file_data, 0, 0, 0, 0, 0);
+        const char container_source[] = "/app0/Media/resources.resource";
+        CHECK(add(file_handle, (uint64_t)(uintptr_t)container_source, 0, 0, 0, 0) == 0,
+              "a source with a guest file-replacement table opens");
+        CHECK(memory_backend.memory_open_calls == 1 && memory_backend.host_open_calls == 0,
+              "the source is demuxed from the guest reader's bytes, never from the host file");
+        CHECK(memory_backend.received.size() == kGuestMediaBytes &&
+                  memcmp(memory_backend.received.data(),
+                         guest_container.data() + kGuestMediaOffset, kGuestMediaBytes) == 0,
+              "the backend receives the media at the guest's offset, not the container's first bytes");
+        CHECK(guest_file_open_calls == 1 && guest_file_close_calls == 1 && !guest_file_is_open,
+              "the guest reader is opened once and closed once");
+        close(file_handle, 0, 0, 0, 0, 0);
+
+        // A guest table is not permission to lose the titles that work today: when the reader has
+        // nothing to give, the host path must still be used.
+        guest_file_expected_object = nullptr;   // every guest callback now fails
+        FakeVideoBackend fallback;
+        prosper::video::set_backend(&fallback);
+        uint64_t fallback_handle = init((uint64_t)(uintptr_t)&file_data, 0, 0, 0, 0, 0);
+        CHECK(add(fallback_handle, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0 &&
+                  fallback.opened_path == "C:/prosper-test-app0/movie.mp4",
+              "a failing guest reader falls back to the host path instead of failing the source");
+        close(fallback_handle, 0, 0, 0, 0, 0);
+    }
+#endif
     prosper::video::set_backend(nullptr);
 
     // One delivered synthetic frame, then EOF on the next pull. Astro Bot follows this path and does

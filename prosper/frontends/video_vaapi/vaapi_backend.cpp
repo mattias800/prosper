@@ -73,8 +73,42 @@ struct AudioPacket {
     uint64_t pts_us = 0;
 };
 
+// An in-memory source (#1955). A title whose clip lives at an offset inside a container file hands
+// prosper the bytes through sceAvPlayerInit's file-replacement callbacks; the HLE reads them and the
+// session owns the copy for its whole life, so a seek that recreates the worker can re-demux them.
+constexpr int kAvioBufferBytes = 64 * 1024;
+
+struct MemorySource {
+    const uint8_t* data = nullptr;
+    size_t bytes = 0;
+    size_t position = 0;   // owned by one decode worker at a time
+};
+
+int memory_read(void* opaque, uint8_t* buffer, int buffer_size) {
+    auto* source = static_cast<MemorySource*>(opaque);
+    if (!source || buffer_size <= 0 || source->position >= source->bytes) return AVERROR_EOF;
+    const size_t take = std::min(static_cast<size_t>(buffer_size), source->bytes - source->position);
+    std::memcpy(buffer, source->data + source->position, take);
+    source->position += take;
+    return static_cast<int>(take);
+}
+
+int64_t memory_seek(void* opaque, int64_t offset, int whence) {
+    auto* source = static_cast<MemorySource*>(opaque);
+    if (!source) return -1;
+    if (whence == AVSEEK_SIZE) return static_cast<int64_t>(source->bytes);
+    int64_t target = offset;
+    if (whence == SEEK_CUR) target += static_cast<int64_t>(source->position);
+    else if (whence == SEEK_END) target += static_cast<int64_t>(source->bytes);
+    else if (whence != SEEK_SET) return -1;
+    if (target < 0 || target > static_cast<int64_t>(source->bytes)) return -1;
+    source->position = static_cast<size_t>(target);
+    return target;
+}
+
 struct Session {
     std::string path;
+    std::vector<uint8_t> memory;   // non-empty: demux these bytes instead of opening `path`
     bool allow_software = false;
 
     std::mutex mutex;
@@ -82,7 +116,16 @@ struct Session {
     bool initialized = false;
     bool init_ok = false;
     bool stopping = false;
+    bool closed = false;
     bool decode_done = false;
+    // Seek state (#1949). `start_us` is where this worker must position the container before it
+    // decodes anything; `discard_before_us` drops the frames between the landed keyframe and the
+    // requested time so the FIRST frame handed to the guest is the one it asked for rather than the
+    // preceding keyframe. `seek_settled` releases the caller once the worker knows the answer.
+    uint64_t start_us = 0;
+    uint64_t discard_before_us = 0;
+    bool seek_settled = false;
+    bool seek_ok = false;
     std::string failure;
     StreamInfo stream_info;
 
@@ -90,6 +133,9 @@ struct Session {
     std::deque<AudioPacket> audio_queue;
     VideoPacket last_video;
     AudioPacket last_audio;
+    // Guards ownership of `thread` itself, so a seek that is replacing the worker cannot race a
+    // concurrent close that is tearing it down. Always taken BEFORE `mutex`, never the other way.
+    std::mutex worker_mutex;
     std::jthread thread;
 };
 
@@ -117,6 +163,7 @@ AVPixelFormat select_video_format(AVCodecContext* context, const AVPixelFormat* 
 }
 
 struct Pipeline {
+    AVIOContext* avio = nullptr;   // set only for an in-memory source
     AVFormatContext* format = nullptr;
     AVCodecContext* video = nullptr;
     AVCodecContext* audio = nullptr;
@@ -140,6 +187,13 @@ struct Pipeline {
         avcodec_free_context(&video);
         av_buffer_unref(&hardware_device);
         avformat_close_input(&format);
+        // AVFMT_FLAG_CUSTOM_IO keeps avformat from freeing a caller-provided AVIOContext, so this
+        // must run after the format context is gone and it must free the (possibly reallocated)
+        // buffer as well as the context.
+        if (avio) {
+            av_freep(&avio->buffer);
+            avio_context_free(&avio);
+        }
     }
 };
 
@@ -187,9 +241,18 @@ bool enqueue_audio(Session& session, AudioPacket packet, std::stop_token stop) {
     return true;
 }
 
+// A seek lands on the keyframe at or before the requested time, so the decoder legitimately produces
+// frames the caller did not ask for. Drop them here rather than handing the guest a position it did
+// not request (#1949). `discard_before_us` is fixed for a worker's whole lifetime — the seek protocol
+// writes it before the thread starts and never while it runs — so this read needs no lock.
+bool precedes_requested_position(const Session& session, uint64_t pts_us) {
+    return session.discard_before_us != 0 && pts_us < session.discard_before_us;
+}
+
 bool convert_video_frame(Pipeline& pipeline, HardwareSelection& selection, Session& session,
                          AVFrame* decoded, AVRational time_base, std::stop_token stop,
                          std::string& failure) {
+    if (precedes_requested_position(session, frame_timestamp_us(decoded, time_base))) return true;
     const bool hardware = selection.format != AV_PIX_FMT_NONE &&
                           decoded->format == selection.format;
     if (!hardware && selection.require_hardware) {
@@ -257,6 +320,7 @@ bool convert_video_frame(Pipeline& pipeline, HardwareSelection& selection, Sessi
 
 bool convert_audio_frame(Pipeline& pipeline, Session& session, AVFrame* frame,
                          AVRational time_base, std::stop_token stop, std::string& failure) {
+    if (precedes_requested_position(session, frame_timestamp_us(frame, time_base))) return true;
     const int channels = frame->ch_layout.nb_channels;
     const int rate = frame->sample_rate;
     const auto format = static_cast<AVSampleFormat>(frame->format);
@@ -316,17 +380,57 @@ bool convert_audio_frame(Pipeline& pipeline, Session& session, AVFrame* frame,
     return converted == 0 || enqueue_audio(session, std::move(packet), stop);
 }
 
+// Release a seek() caller. The worker settles once, either after it has actually repositioned the
+// container or from the failure epilogue, so a source that cannot be reopened reports a real error
+// instead of leaving the seek waiting forever.
+void settle_seek(Session& session, bool ok) {
+    std::lock_guard<std::mutex> lock(session.mutex);
+    if (session.seek_settled) return;
+    session.seek_settled = true;
+    session.seek_ok = ok;
+    session.cv.notify_all();
+}
+
 void decode_session(Session& session, std::stop_token stop) {
     HardwareSelection selection;
     selection.require_hardware = !session.allow_software;
+    // Declared BEFORE `pipeline` so it outlives the AVIOContext that points at it.
+    MemorySource memory_source;
     Pipeline pipeline;
     std::string failure;
+    int result = 0;
     int video_stream = -1;
     int audio_stream = -1;
+    uint8_t* avio_buffer = nullptr;
     AVRational video_time_base{1, 1};
     AVRational audio_time_base{1, 1};
 
-    int result = avformat_open_input(&pipeline.format, session.path.c_str(), nullptr, nullptr);
+    if (!session.memory.empty()) {
+        memory_source.data = session.memory.data();
+        memory_source.bytes = session.memory.size();
+        avio_buffer = static_cast<uint8_t*>(av_malloc(kAvioBufferBytes));
+        if (!avio_buffer) {
+            failure = "could not allocate an in-memory demux buffer";
+            goto finished;
+        }
+        pipeline.avio = avio_alloc_context(avio_buffer, kAvioBufferBytes, 0, &memory_source,
+                                           memory_read, nullptr, memory_seek);
+        if (!pipeline.avio) {
+            av_free(avio_buffer);
+            failure = "could not create an in-memory demux context";
+            goto finished;
+        }
+        pipeline.format = avformat_alloc_context();
+        if (!pipeline.format) {
+            failure = "could not allocate a demuxer for the in-memory source";
+            goto finished;
+        }
+        pipeline.format->pb = pipeline.avio;
+        pipeline.format->flags |= AVFMT_FLAG_CUSTOM_IO;
+        result = avformat_open_input(&pipeline.format, nullptr, nullptr, nullptr);
+    } else {
+        result = avformat_open_input(&pipeline.format, session.path.c_str(), nullptr, nullptr);
+    }
     if (result < 0) {
         failure = "could not open source: " + ff_error(result);
         goto finished;
@@ -335,6 +439,20 @@ void decode_session(Session& session, std::stop_token stop) {
     if (result < 0) {
         failure = "could not read stream headers: " + ff_error(result);
         goto finished;
+    }
+    // #1949: a seek restarts this worker with the requested position. `start_us` is 0 for an ordinary
+    // open and for a seek to the very beginning, both of which the fresh container already satisfies.
+    if (session.start_us > 0) {
+        result = avformat_seek_file(
+            pipeline.format, -1, INT64_MIN,
+            static_cast<int64_t>(std::min<uint64_t>(session.start_us, INT64_MAX)), INT64_MAX, 0);
+        if (result < 0) {
+            failure = "could not seek the source: " + ff_error(result);
+            goto finished;
+        }
+        if (avp_log())
+            std::fprintf(stderr, "[avp-vaapi] '%s': repositioned to %llu us\n", session.path.c_str(),
+                         static_cast<unsigned long long>(session.start_us));
     }
 
     video_stream = av_find_best_stream(pipeline.format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
@@ -455,6 +573,11 @@ void decode_session(Session& session, std::stop_token stop) {
         goto finished;
     }
 
+    // Everything a repositioned session needs is now in place: the container is at the requested
+    // time and both decoders are open. Release the seek() caller before decoding, so the guest's
+    // sceAvPlayerJumpToTime returns as soon as the answer is known rather than after a first frame.
+    settle_seek(session, true);
+
     {
         auto receive_frames = [&](AVCodecContext* decoder, bool video) -> bool {
             for (;;) {
@@ -519,6 +642,10 @@ finished:
             session.initialized = true;
             session.init_ok = false;
         }
+        if (!session.seek_settled) {
+            session.seek_settled = true;
+            session.seek_ok = false;   // a worker that never reached the loop did not reposition
+        }
         session.failure = failure;
         session.decode_done = true;
         session.cv.notify_all();
@@ -531,8 +658,10 @@ finished:
 
 void stop_session(const std::shared_ptr<Session>& session) {
     if (!session) return;
+    std::lock_guard<std::mutex> worker(session->worker_mutex);
     {
         std::lock_guard<std::mutex> lock(session->mutex);
+        session->closed = true;   // a concurrent seek() must not resurrect a torn-down session
         session->stopping = true;
         session->cv.notify_all();
     }
@@ -562,6 +691,10 @@ struct VaapiBackend::Impl {
         const auto found = sessions.find(id);
         return found == sessions.end() ? nullptr : found->second;
     }
+
+    // Launch the decode worker and publish the session once its headers parsed. Shared by the
+    // host-path open() and the in-memory open_memory(); only the Session's source differs.
+    int start(std::shared_ptr<Session> session);
 };
 
 VaapiBackend::VaapiBackend() : impl_(std::make_unique<Impl>()) {}
@@ -569,10 +702,25 @@ VaapiBackend::~VaapiBackend() = default;
 
 bool VaapiBackend::available() const { return impl_ != nullptr; }
 
+// #1955: demux bytes the caller already holds. Identical decode pipeline; only the AVIO source
+// differs. The copy is deliberate — the session must be able to re-demux for a seek long after the
+// guest thread that produced the bytes has returned.
+int VaapiBackend::open_memory(const std::string& debug_name, const uint8_t* data, size_t bytes) {
+    if (!available() || !data || bytes == 0) return -1;
+    auto session = std::make_shared<Session>();
+    session->path = debug_name;
+    session->memory.assign(data, data + bytes);
+    return impl_->start(std::move(session));
+}
+
 int VaapiBackend::open(const std::string& host_path) {
     if (!available() || host_path.empty()) return -1;
     auto session = std::make_shared<Session>();
     session->path = host_path;
+    return impl_->start(std::move(session));
+}
+
+int VaapiBackend::Impl::start(std::shared_ptr<Session> session) {
     session->allow_software = software_decode_allowed();
     session->thread = std::jthread(
         [session](std::stop_token stop) { decode_session(*session, stop); });
@@ -585,9 +733,9 @@ int VaapiBackend::open(const std::string& host_path) {
             return -1;
         }
     }
-    const int id = impl_->next_id.fetch_add(1);
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->sessions.emplace(id, std::move(session));
+    const int id = next_id.fetch_add(1);
+    std::lock_guard<std::mutex> lock(mutex);
+    sessions.emplace(id, std::move(session));
     return id;
 }
 
@@ -636,6 +784,44 @@ bool VaapiBackend::next_audio(int id, AudioFrame& out) {
     out.sample_rate = session->last_audio.sample_rate;
     out.pts_us = session->last_audio.pts_us;
     return true;
+}
+
+// #1949 — reposition an open session. The decode worker is recreated at the requested time rather
+// than unwound in place: FFmpeg's demuxer, the VA-API decoder and the bounded frame queues all hold
+// state that a cross-thread mid-flight seek would have to tear down anyway, and only a fresh worker
+// can seek a session whose decode already ran to completion. Guest seeks are rare (one per
+// sceAvPlayerJumpToTime), so paying a container reopen here buys a deterministic, race-free result.
+// A failure to reposition is reported as false and becomes a real guest-visible error.
+bool VaapiBackend::seek(int id, uint64_t position_us) {
+    const auto session = impl_->get(id);
+    if (!session) return false;
+    std::lock_guard<std::mutex> worker(session->worker_mutex);
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->closed) return false;
+        session->stopping = true;
+        session->cv.notify_all();
+    }
+    session->thread.request_stop();
+    if (session->thread.joinable()) session->thread.join();
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->closed) return false;
+        session->stopping = false;
+        session->decode_done = false;
+        session->seek_settled = false;
+        session->seek_ok = false;
+        session->failure.clear();
+        session->video_queue.clear();
+        session->audio_queue.clear();
+        session->start_us = position_us;
+        session->discard_before_us = position_us;
+    }
+    session->thread = std::jthread(
+        [session](std::stop_token stop) { decode_session(*session, stop); });
+    std::unique_lock<std::mutex> lock(session->mutex);
+    session->cv.wait(lock, [&] { return session->seek_settled; });
+    return session->seek_ok;
 }
 
 bool VaapiBackend::eof(int id) {

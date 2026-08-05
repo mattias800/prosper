@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -42,6 +43,14 @@ class VideoBackend {
 public:
     virtual ~VideoBackend() = default;
     virtual int  open(const std::string& host_path) = 0;  // returns stream id (>=0), <0 on error; starts demux+HW decode
+    // Open a source whose bytes the CALLER supplies rather than a host path (#1955). sceAvPlayerInit's
+    // guest file-replacement callbacks are the only way a title can express "the media is a byte range
+    // inside this container file", and prosper cannot call them from a decode worker (they are guest
+    // code and need the calling guest thread's TCB), so the HLE reads the media through them up front
+    // and hands the bytes over here. The backend TAKES A COPY; `data` need not outlive the call.
+    // `debug_name` is for logs only. Defaulted to unsupported so other backends keep compiling.
+    virtual int  open_memory(const std::string& /*debug_name*/, const uint8_t* /*data*/,
+                             size_t /*bytes*/) { return -1; }
     virtual bool info(int id, StreamInfo& out) = 0;        // true once stream headers are parsed
     // Successful pull pointers remain valid until the next pull of that media type for this id.
     virtual bool next_video(int id, VideoFrame& out) = 0;  // false if no frame ready yet
@@ -49,6 +58,14 @@ public:
     // AvPlayer video completion is driven by the video stream. Queued audio must not keep a
     // video-only consumer active after decode has ended and the final video frame was delivered.
     virtual bool eof(int id) = 0;
+    // Reposition playback so the NEXT pulled frame is the one at or after `position_us`, discarding
+    // everything already queued and clearing any end-of-stream state (#1949, sceAvPlayerJumpToTime).
+    //
+    // Defaulted to "unsupported" so a backend that cannot seek keeps compiling AND answers honestly:
+    // the HLE turns `false` into a real sceAvPlayer error. That distinction is the whole point of the
+    // issue — the unregistered NID's implicit SCE_OK was read by PPSA30490 as a completed seek, so it
+    // waited forever for a position that never moved instead of taking its own failure branch.
+    virtual bool seek(int /*id*/, uint64_t /*position_us*/) { return false; }
     virtual void close(int id) = 0;
 };
 

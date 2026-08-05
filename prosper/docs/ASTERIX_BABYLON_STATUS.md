@@ -6,15 +6,51 @@ Title ID: `PPSA30490`
 
 Engine: Unity 6000.1.5f1 / IL2CPP
 
-Current verified rung: **0 — frame submission, but no real visible graphics**
+Current verified rung: **2 — title screen reached and rendered**
 
-> **Read `## The title is deadlocked in Unity's video-splash seek` first (2026-08-04).** The current
-> blocker is CPU-side and not a renderer defect: the title never leaves `level0`, its MP4 splash scene,
-> because `sceAvPlayerJumpToTime` is unimplemented. Everything between here and that section is the
-> earlier GPU-side investigation of a frame produced in that deadlocked state, and its
-> constant-buffer-writer line is superseded — see `## Ruled out`.
+> **The video-splash deadlock is FIXED (2026-08-05, #1949).** `sceAvPlayerJumpToTime` is implemented
+> over a real backend seek, and the title now plays both publisher logo movies, renders its narrated
+> intro cutscene, and reaches the title screen with its `ADVENTURE` / `OPTIONS` menu. Everything below
+> the next section is the earlier GPU-side investigation of a frame produced in the deadlocked state:
+> read it as history, not as the current frontier. Its premise — that a black composite indicated a
+> renderer defect — is superseded, because the frames it examined were correct renders of a scene
+> whose only content had not arrived.
 
-## Current symptom
+## The splash deadlock and what fixed it (2026-08-05)
+
+The title screen is reached by a default `screenshot` route with no title-specific switches
+(`PROSPER_RENDER=1`, the tool's own `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct`
+defaults). Two independent bounded runs reproduce it.
+
+`sceAvPlayerJumpToTime` (`XC9wM+xULz8`) was unregistered, so the dispatcher's default `0` reached the
+guest as a completed seek. Three things had to be true together before the title could advance, and
+each is separately load-bearing (each was confirmed by a mutation that killed exactly one named
+regression check):
+
+1. **The seek must really move the container.** `prosper::video::VideoBackend::seek` is new; the
+   VA-API backend implements it by recreating the decode worker at the requested position.
+2. **The seek must be *accurate*.** A container seek lands on the keyframe at or before the target;
+   the backend discards decoded frames before the requested time so the first frame the guest sees is
+   the one it asked for.
+3. **A PAUSED player must publish the post-seek frame.** The guest pauses *before* it seeks
+   (`eboot+0x15dbf02`), then waits at `eboot+0x15dc45c` for its own tracked time `[rbx+0x5e8]` — which
+   only the frame-pull helper `eboot+0x15d9f70` writes, from `SceAvPlayerFrameInfoEx::timeStamp` — to
+   change, and calls `sceAvPlayerResume` at `eboot+0x15dc0c1` only after that. Prosper's paused
+   contract is otherwise unchanged: the window opens on a successful seek and closes on the first
+   delivered frame.
+
+Observed post-fix, with `PROSPER_AVPLOG=1`: `jump-to-time handle=0x3 target=0 ms -> ok`, then
+`call s_avp_resume guest_ra=0x4115dc0c6` — literally the return address of that Resume call site — for
+**both** logo movies, then the intro cutscene and the menu. The pre-fix run's ~13,000-call futile
+`GetVideoDataEx`/`IsActive` spin is gone; a run now issues 18 pulls before it advances.
+
+**Bounding note for anyone re-running this:** after the post-seek frame the guest takes a semaphore
+with a **15-second** timeout (`eboot+0x15d8d40`, `esi=0x3a98`) before it evaluates the seek result. A
+run bounded at ~30 s ends inside that wait and looks like a *new* wall — the first bounded run of this
+fix did exactly that and showed Resume zero times. Give the title at least ~60 s before concluding
+anything about the post-seek path.
+
+## Current symptom (historical — pre-#1949 state)
 
 The title boots and publishes source-distinct renderer frames, but the measured output is still black.
 On the pre-fix baseline, the first instruction shown below was the only unique fragment-stage rejection;
@@ -320,7 +356,11 @@ Therefore there is **no selected-byte CPU-writer conclusion** from this arm; mer
 cap could at most produce a later writer hint, not restore process-wide first-writer coverage. Capsule
 SHA-256 was `e358535fe2b864394a24df0a0d8735fcbfa1b18a79f57b67a13f0745a3b51f6d`. #1902.
 
-## The title is deadlocked in Unity's video-splash seek, before any content exists
+## The title is deadlocked in Unity's video-splash seek, before any content exists (RESOLVED by #1949)
+
+> Kept because its guest-side disassembly is the evidence the fix was built from. The deadlock itself
+> no longer reproduces — see `## The splash deadlock and what fixed it` above.
+
 
 The black frame is not the endpoint of a lost render. The title never leaves its **first scene**, and that
 scene's only visible content is a video.
@@ -384,6 +424,22 @@ HLE registration. #1599, #1884.
 
 ## Ruled out
 
+- **Registering `sceAvPlayerJumpToTime` without a real backend seek:** a returned `SCE_OK` is exactly
+  what the unregistered NID already produced, and it is what deadlocked the title. Both halves of the
+  seek are load-bearing and were each proved by mutation: forcing the requested position to zero, or
+  keeping the container seek while dropping the accurate-position discard, each independently breaks
+  `the first frame after a seek is at or after the requested position` in `test_video_vaapi`. #1949.
+- **Keeping the paused contract absolute during a seek:** with delivery gated on `paused`, the guest's
+  post-seek wait at `eboot+0x15dc45c` can never see its tracked time move, because only a delivered
+  `SceAvPlayerFrameInfoEx::timeStamp` writes it. Removing the post-seek window from the delivery gate
+  kills `the PAUSED player publishes the post-seek frame` in `test_avplayer`, and the live title stops
+  short of `sceAvPlayerResume` again. This is a *narrow* window opened by a successful seek and closed
+  by the first delivered frame — it is NOT `PROSPER_AVP_PAUSED_DELIVER`, which remains default-off and
+  is still not a fix on its own. #1949.
+- **A ~30-second bounded run as sufficient to judge the post-seek path:** the guest waits on a
+  15-second semaphore (`eboot+0x15d8d40`) after the post-seek frame before it decides. The first
+  bounded run of the working fix ended inside that wait, showed zero `sceAvPlayerResume` calls, and
+  read exactly like an unfixed run. #1949.
 - **Unresolved T#/S# lookup:** the title-live descriptor resolves; the rejection is the sampled MIMG
   dimension gate, not descriptor discovery.
 - **Ordinary 2D or 2D-array sampling:** this packet is integer-coordinate `IMAGE_LOAD`, and the third
