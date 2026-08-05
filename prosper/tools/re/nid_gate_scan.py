@@ -207,6 +207,40 @@ def _scratch_path():
     return _SCRATCH
 
 
+_OBJDUMP = False   # False = not probed yet; None = no capable objdump found
+
+
+def objdump_binary():
+    """Path to an objdump that can disassemble a RAW BINARY blob, or None.
+
+    Existence is not the test — capability is. macOS ships LLVM's objdump as plain `objdump`, and it
+    answers `--version` happily while rejecting `-b binary` outright, so a probe that only checks the
+    binary is present reports a working toolchain on a machine where every decode fails. Probe with
+    an actual one-byte decode, and accept Homebrew's `gobjdump` as the GNU binutils build.
+    """
+    global _OBJDUMP
+    if _OBJDUMP is not False:
+        return _OBJDUMP
+    _OBJDUMP = None
+    cands = [os.environ["OBJDUMP"]] if os.environ.get("OBJDUMP") else ["objdump", "gobjdump"]
+    probe = _scratch_path()
+    try:
+        with open(probe, "wb") as f:
+            f.write(b"\x90")                                   # nop
+        for c in cands:
+            try:
+                r = subprocess.run([c, "-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel", probe],
+                                   capture_output=True, text=True)
+            except (OSError, FileNotFoundError):
+                continue
+            if r.returncode == 0 and "nop" in r.stdout:
+                _OBJDUMP = c
+                break
+    except OSError:
+        pass
+    return _OBJDUMP
+
+
 def disasm(blob, base):
     """objdump a raw byte blob as x86-64 Intel; returns [(va, mnemonic, operands)].
 
@@ -214,11 +248,16 @@ def disasm(blob, base):
     be classified as an ordinary window and drain into a bucket, turning a broken toolchain into a
     plausible-looking measurement.
     """
+    od = objdump_binary()
+    if od is None:
+        raise RuntimeError("no GNU objdump that can disassemble a raw binary was found "
+                           "(tried objdump, gobjdump; set OBJDUMP=/path). LLVM's objdump — the "
+                           "default on macOS — does not support -b binary.")
     tmp = _scratch_path()
     with open(tmp, "wb") as f:
         f.write(blob)
     r = subprocess.run(
-        ["objdump", "-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel",
+        [od, "-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel",
          "--adjust-vma=%#x" % base, tmp],
         capture_output=True, text=True)
     if r.returncode != 0:

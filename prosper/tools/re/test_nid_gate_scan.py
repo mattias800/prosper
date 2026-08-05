@@ -121,7 +121,11 @@ def main():
 
 
 if __name__ == "__main__":
-    if subprocess.run(["objdump", "--version"], capture_output=True).returncode != 0:
-        print("objdump unavailable — skipping")
+    # Capability, not existence. The first version of this guard ran `objdump --version` and treated
+    # success as "usable" — but macOS ships LLVM's objdump as plain `objdump`, and it answers
+    # --version happily while rejecting `-b binary`, so the guard passed on a machine where every
+    # single decode raises. The macOS CI job caught it. objdump_binary() probes with a real decode.
+    if G.objdump_binary() is None:
+        print("no GNU objdump able to disassemble a raw binary (LLVM's cannot) — skipping")
         sys.exit(0)
     sys.exit(main())

@@ -116,8 +116,14 @@ because the ordinary compiler output is `mov ecx,eax; xor eax,eax; test ecx,ecx`
 *enclosing* function's return value, and an `eax`-only reader therefore reports a live gate as
 `ignored`, i.e. it errs in the reassuring direction. That, an unconditional `jmp` being walked
 through into the next basic block, and a mask-test being called `ignored` are all regression cases in
-`test_nid_gate_scan.py` (ctest: `re_nid_gate_classifier`). Requires `objdump` on PATH; set `TMPDIR`
-to keep its scratch file off `/tmp`.
+`test_nid_gate_scan.py` (ctest: `re_nid_gate_classifier`). Set `TMPDIR` to keep its scratch file off
+`/tmp`.
+
+Requires **GNU binutils** `objdump`: it disassembles a raw blob with `-b binary`, which LLVM's
+`objdump` does not support. That matters on macOS, where Xcode's LLVM build *is* `objdump` and answers
+`--version` happily while rejecting every actual decode — so the tool probes with a real one-byte
+disassembly rather than trusting the binary's presence, accepts Homebrew's `gobjdump`, and honours
+`$OBJDUMP`. The ctest skips cleanly when no capable objdump exists.
 
 ## `pak_index.py` — turn a UE4 `.pak` byte offset into an asset name
 
