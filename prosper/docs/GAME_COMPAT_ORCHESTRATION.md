@@ -734,6 +734,21 @@ copy path, so a binding-miss run with the same environment is the control for a 
 
 - Focused tests are part of iteration. The full snapshot matrix is optional for ordinary development and PRs; the PR
   author decides whether it is useful.
+- **The default cadence is batched, not per-PR: run the guards once per ~10 merged fixes, then bisect a failure.**
+  Many PRs therefore merge with no guard validation at all, which is correct and intended — the guards exist to
+  replace manual play-testing of 39 titles before a release, not to certify every commit on master. A per-fix
+  cadence costs `N` guard runs; batching at `B=10` costs `N/10 + F·log₂10`, which at a 1-in-5 batch failure rate
+  is about **0.17·N** — a ~6x reduction, and still under `0.43·N` even if every batch regresses something. Both
+  cadences are linear in `N`, so this is a constant-factor win rather than a complexity-class one; it is a large
+  constant and it holds at any realistic failure rate, so do not re-derive this tradeoff per PR.
+  - **Re-run a failed guard on the same commit before spending the bisect.** A flaky guard makes `git bisect`
+    converge confidently on an innocent commit — an answer-shaped non-answer, worse than no signal. One extra
+    run protects the ~4 the bisect will spend. Guards that sample a route window are phase-sensitive, so this is
+    not a hypothetical (see the `blue-prince-hall` / `terminator-boot` note above).
+  - Automate with `git bisect run` over the guard's exit code; every candidate builds standalone because each fix
+    is its own merged commit. A batch can hold two independent regressions — bisect finds the earliest, so re-run
+    after fixing. Expect to attribute a regression to a lane that has already finished: the orchestrator owns the
+    fix, not the original author.
 - The snapshot matrix is mandatory before every release. A release delay is acceptable; day-to-day development should
   not be delayed solely to keep master regression-free.
 - Master may regress during heavy development. A correct fix may intentionally expose a different title regression.
