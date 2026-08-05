@@ -37,7 +37,7 @@ Last updated: 2026-08-05
 | *The Plucky Squire* | `PPSA15319` | Unreal Engine 4 | 🚧 Title and save/play-style menus | [#1882](https://github.com/mattias800/prosper/issues/1882) |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🚧 Title screen | [#1883](https://github.com/mattias800/prosper/issues/1883) |
 | *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🔬 Render bring-up, no composited frame | [#1817](https://github.com/mattias800/prosper/issues/1817) |
-| *Asterix &amp; Obelix: Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🔬 GPU work, black output | [#1884](https://github.com/mattias800/prosper/issues/1884) |
+| *Asterix &amp; Obelix: Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🚧 Logo movies, intro cutscene, and title menu | [#1884](https://github.com/mattias800/prosper/issues/1884) |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Startup fault before title | [#1810](https://github.com/mattias800/prosper/issues/1810) |
 | *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Title screen and EULA | [#1885](https://github.com/mattias800/prosper/issues/1885) |
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🚧 Startup legal popup; heap fault ends the run | [#1886](https://github.com/mattias800/prosper/issues/1886) |
@@ -213,7 +213,12 @@ The game reaches the UE4 render bring-up and submits real GPU work, but no compo
 
 ## Asterix &amp; Obelix: Babylon Mission — `PPSA30490`
 
-The game submits real GPU work indefinitely, but the current output remains black. See the [tracker](https://github.com/mattias800/prosper/issues/1884).
+<p align="center"><img src="assets/screenshots/asterix-babylon-intro-cutscene.png" alt="Asterix &amp; Obelix: Babylon Mission — narrated intro cutscene"></p>
+<p align="center"><img src="assets/screenshots/asterix-babylon-title.png" alt="Asterix &amp; Obelix: Babylon Mission — title screen and main menu"></p>
+
+A direct, unmodified native 1920×1080 capture plays both publisher logo movies, renders the narrated
+intro cutscene, and reaches the title screen with its `ADVENTURE` / `OPTIONS` menu. Gameplay has not
+yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues/1884).
 
 ## R-Type Delta: HD Boosted — `PPSA26414`
 
@@ -314,7 +319,9 @@ The title boots into a live native Linux/Vulkan frame loop, and every composited
 screenshot is published. The guest loads its Unity bootstrap scene and then `Core/2_General/Empty.unity`, never
 requests `Core/2_General/Game.unity` or any `Core/3_Sections/Section_*` scene, and submits exactly two draws per
 submit for the whole run — the empty scene rendered faithfully. Prosper rejects no shader, packet or format on this
-boot, and the sibling *Bendy and the Ink Machine* renders its menu from the same build as a positive control. See
+boot, and the sibling *Bendy and the Ink Machine* renders its menu from the same build as a positive control. Its
+opening video now demuxes correctly — the guest's own file-replacement reader supplies the clip that lives inside
+`Media/resources.resource` — but the title still does not reach visible content. See
 the [tracker](https://github.com/mattias800/prosper/issues/1897).
 
 ## Beneath — `PPSA27640`

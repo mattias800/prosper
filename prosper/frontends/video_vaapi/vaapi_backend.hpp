@@ -20,10 +20,12 @@ public:
 
     bool available() const;
     int open(const std::string& host_path) override;
+    int open_memory(const std::string& debug_name, const uint8_t* data, size_t bytes) override;
     bool info(int id, StreamInfo& out) override;
     bool next_video(int id, VideoFrame& out) override;
     bool next_audio(int id, AudioFrame& out) override;
     bool eof(int id) override;
+    bool seek(int id, uint64_t position_us) override;
     void close(int id) override;
 
 private:

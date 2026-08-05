@@ -730,9 +730,18 @@ static_assert(sizeof(AvpStreamInfoEx) == 104 && offsetof(AvpStreamInfoEx, durati
 struct AvpPlayer {
     void* ev_obj = nullptr; AvpEventCb ev_cb = nullptr;
     AvpMemAllocator memory{};
+    // The guest's file-replacement table, retained verbatim from sceAvPlayerInit(Ex). #1955 asks
+    // whether a title that stores media inside a container file supplies one; nothing can answer
+    // that without recording what the guest actually passed, so keep it and report it under
+    // PROSPER_AVPLOG. prosper does not route source I/O through it yet.
+    AvpFileReplace file{};
     int32_t num_fb = 0;
     bool auto_start = false, have_source = false, synthetic = false;
     bool playing = false, paused = false, stop_fired = false;
+    // Set by a successful sceAvPlayerJumpToTime, cleared by the first frame delivered after it.
+    // A seek repositions the player and must publish the new position even while the guest holds
+    // the player PAUSED — see the delivery gate in s_avp_getvideodata[ex] for the guest evidence.
+    bool seek_deliver = false;
     std::string guest_path;
     prosper::video::VideoBackend* backend = nullptr;
     int backend_id = -1;             // >=0 when a host backend is decoding
@@ -885,11 +894,14 @@ bool avp_log() { static const bool enabled = getenv("PROSPER_AVPLOG") != nullptr
 // Unity's video splash because pause gates frame delivery." Measured, the lever is real but is not
 // the cause — it collapses the futile pull census from 14,546 calls to 14 and delivers two further
 // frames after the guest's seek, yet sceAvPlayerResume is still never called, all AvPlayer traffic
-// then stops, and the output stays uniformly black (max_rgb=0). The actual blocker is that
-// sceAvPlayerJumpToTime (NID XC9wM+xULz8) is unimplemented, so the dispatcher's default 0 is read
+// then stops, and the output stays uniformly black (max_rgb=0). The actual blocker was that
+// sceAvPlayerJumpToTime (NID XC9wM+xULz8) was unimplemented, so the dispatcher's default 0 was read
 // as a successful seek: #1949, and prosper/docs/ASTERIX_BABYLON_STATUS.md § Ruled out.
 //
-// Whoever implements #1949 will want to re-run this arm; that is the only reason it is here.
+// #1949 has since landed and the title now reaches its title screen. Note carefully what that did
+// and did not vindicate: a *seek* legitimately publishes its landing frame while paused, and
+// s_avp_getvideodata[ex] opens a one-frame window for exactly that (AvpPlayer::seek_deliver). This
+// blanket lever is still not that, is still not a fix, and must stay off.
 bool avp_paused_deliver() {
     static const bool enabled = getenv("PROSPER_AVP_PAUSED_DELIVER") != nullptr;  // default: false
     return enabled;
@@ -922,6 +934,72 @@ struct AvpCallbackGuestFsScope {
     }
 };
 #endif
+
+// ---- guest file-replacement reader (#1955) ---------------------------------------------------
+// SceAvPlayerFileReplacement is {objectPointer, open, close, readOffset, size} — the order this file
+// already declares. Signatures follow the published sceAvPlayer contract: open(obj, path) and
+// readOffset(obj, buffer, position, length) return a signed count/status, size(obj) returns the
+// media length. CONFIDENCE: MED-HIGH — struct order is confirmed by the ABI static_asserts above and
+// by PPSA27624 supplying all four entries, but no live title has yet exercised the call semantics.
+using AvpOpenFileCb = int32_t (PROSPER_SYSV_ABI *)(void*, const char*);
+using AvpCloseFileCb = int32_t (PROSPER_SYSV_ABI *)(void*);
+using AvpReadOffsetFileCb = int32_t (PROSPER_SYSV_ABI *)(void*, uint8_t*, uint64_t, uint32_t);
+using AvpSizeFileCb = uint64_t (PROSPER_SYSV_ABI *)(void*);
+
+bool avp_has_file_replacement(const AvpFileReplace& file) {
+    return file.open && file.close && file.read_offset && file.size;
+}
+
+int32_t avp_file_open(const AvpFileReplace& file, const char* path) {
+#if defined(_WIN32)
+    return (int32_t)prosper_call_guest_sysv4(reinterpret_cast<uint64_t>(file.open),
+                                             reinterpret_cast<uint64_t>(file.obj),
+                                             reinterpret_cast<uint64_t>(path), 0, 0);
+#else
+#if defined(__linux__)
+    AvpCallbackGuestFsScope guest_fs(t_avp_callback_guest_fs);
+#endif
+    return ((AvpOpenFileCb)file.open)(file.obj, path);
+#endif
+}
+
+int32_t avp_file_close(const AvpFileReplace& file) {
+#if defined(_WIN32)
+    return (int32_t)prosper_call_guest_sysv4(reinterpret_cast<uint64_t>(file.close),
+                                             reinterpret_cast<uint64_t>(file.obj), 0, 0, 0);
+#else
+#if defined(__linux__)
+    AvpCallbackGuestFsScope guest_fs(t_avp_callback_guest_fs);
+#endif
+    return ((AvpCloseFileCb)file.close)(file.obj);
+#endif
+}
+
+uint64_t avp_file_size(const AvpFileReplace& file) {
+#if defined(_WIN32)
+    return prosper_call_guest_sysv4(reinterpret_cast<uint64_t>(file.size),
+                                    reinterpret_cast<uint64_t>(file.obj), 0, 0, 0);
+#else
+#if defined(__linux__)
+    AvpCallbackGuestFsScope guest_fs(t_avp_callback_guest_fs);
+#endif
+    return ((AvpSizeFileCb)file.size)(file.obj);
+#endif
+}
+
+int32_t avp_file_read(const AvpFileReplace& file, uint8_t* buffer, uint64_t position,
+                      uint32_t length) {
+#if defined(_WIN32)
+    return (int32_t)prosper_call_guest_sysv4(reinterpret_cast<uint64_t>(file.read_offset),
+                                             reinterpret_cast<uint64_t>(file.obj),
+                                             reinterpret_cast<uint64_t>(buffer), position, length);
+#else
+#if defined(__linux__)
+    AvpCallbackGuestFsScope guest_fs(t_avp_callback_guest_fs);
+#endif
+    return ((AvpReadOffsetFileCb)file.read_offset)(file.obj, buffer, position, length);
+#endif
+}
 
 void* avp_allocate_texture(const AvpMemAllocator& memory, uint32_t align, uint32_t size) {
     if (!memory.allocate_texture) return nullptr;
@@ -998,6 +1076,18 @@ bool avp_build_textures(const AvpMemAllocator& memory, int32_t requested,
     return true;
 }
 
+// #1955 discriminator: report the guest's file-replacement table verbatim. A title that stores media
+// inside a container file can only express the byte range through these callbacks, and prosper opens
+// the URI as a host path instead. Whether a given title even supplies the table is a measurement, not
+// an assumption, so print all four entries (and "absent" when the table is null).
+void avp_log_file_replacement(const char* entry, const AvpFileReplace& file) {
+    const bool present = file.open || file.close || file.read_offset || file.size;
+    fprintf(stderr,
+            "[avp] %s file-replacement=%s obj=%p open=%p close=%p read-offset=%p size=%p\n",
+            entry, present ? "present" : "absent", file.obj, file.open, file.close,
+            file.read_offset, file.size);
+}
+
 // Fire the guest event callback. Caller MUST NOT hold g_avp_mx (the callback re-enters AvPlayer HLE).
 void avp_fire(void* obj, AvpEventCb cb, uint32_t ev) {
     if (!cb) return;
@@ -1021,14 +1111,17 @@ HLE(s_avplayer_init) {   // AvPlayerHandle sceAvPlayerInit(AvPlayerInitData*)
     uint64_t h = g_handle.fetch_add(1);
     AvpPlayer p;
     if (auto* d = (const AvpInitData*)PW(a0)) {
-        p.memory = d->memory; p.num_fb = d->num_fb;
+        p.memory = d->memory; p.file = d->file; p.num_fb = d->num_fb;
         p.ev_obj = d->event.obj; p.ev_cb = (AvpEventCb)d->event.event_callback;
         p.auto_start = d->auto_start != 0;
-        if (avp_log()) fprintf(stderr,
-            "[avp] init memory=%p alloc=%p free=%p texture=%p texture-free=%p num-fb=%d auto=%d\n",
-            p.memory.obj, (void*)p.memory.allocate, (void*)p.memory.deallocate,
-            (void*)p.memory.allocate_texture, (void*)p.memory.deallocate_texture,
-            p.num_fb, (int)p.auto_start);
+        if (avp_log()) {
+            fprintf(stderr,
+                "[avp] init memory=%p alloc=%p free=%p texture=%p texture-free=%p num-fb=%d auto=%d\n",
+                p.memory.obj, (void*)p.memory.allocate, (void*)p.memory.deallocate,
+                (void*)p.memory.allocate_texture, (void*)p.memory.deallocate_texture,
+                p.num_fb, (int)p.auto_start);
+            avp_log_file_replacement("init", p.file);
+        }
     }
     { std::lock_guard<std::mutex> lk(g_avp_mx); g_avp[h] = std::move(p); }
     return h;   // non-NULL SceAvPlayerHandle
@@ -1041,14 +1134,17 @@ HLE(s_avplayer_initex) {   // s32 sceAvPlayerInitEx(const AvPlayerInitDataEx*, A
     uint64_t h = g_handle.fetch_add(1);
     AvpPlayer p;
     if (auto* d = (const AvpInitDataEx*)PW(a0)) {
-        p.memory = d->memory; p.num_fb = d->num_fb;
+        p.memory = d->memory; p.file = d->file; p.num_fb = d->num_fb;
         p.ev_obj = d->event.obj; p.ev_cb = (AvpEventCb)d->event.event_callback;
         p.auto_start = d->auto_start != 0;
-        if (avp_log()) fprintf(stderr,
-            "[avp] init-ex memory=%p alloc=%p free=%p texture=%p texture-free=%p num-fb=%d auto=%d\n",
-            p.memory.obj, (void*)p.memory.allocate, (void*)p.memory.deallocate,
-            (void*)p.memory.allocate_texture, (void*)p.memory.deallocate_texture,
-            p.num_fb, (int)p.auto_start);
+        if (avp_log()) {
+            fprintf(stderr,
+                "[avp] init-ex memory=%p alloc=%p free=%p texture=%p texture-free=%p num-fb=%d auto=%d\n",
+                p.memory.obj, (void*)p.memory.allocate, (void*)p.memory.deallocate,
+                (void*)p.memory.allocate_texture, (void*)p.memory.deallocate_texture,
+                p.num_fb, (int)p.auto_start);
+            avp_log_file_replacement("init-ex", p.file);
+        }
     }
     { std::lock_guard<std::mutex> lk(g_avp_mx); g_avp[h] = std::move(p); }
     if (a1) *(uint64_t*)PW(a1) = h;
@@ -1144,12 +1240,14 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
     prosper::video::VideoBackend* old_backend = nullptr;
     int old_backend_id = -1;
     AvpMemAllocator memory{};
+    AvpFileReplace file{};
     int32_t requested_textures = 0;
     std::vector<uint8_t*> old_textures;
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(handle); if (it == g_avp.end()) return 0x80000000ull;
         AvpPlayer& p = it->second;
+        file = p.file;
         old_backend = p.backend;
         old_backend_id = p.backend_id;
         memory = p.memory;
@@ -1164,15 +1262,76 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
     if (old_backend && old_backend_id >= 0) old_backend->close(old_backend_id);
     avp_release_textures(memory, old_textures);
 
+    // #1955: when the guest supplies a file-replacement table, IT decides which bytes of the named
+    // file are the media. A title that stores a clip at an offset inside a container has no other way
+    // to express that — SceAvPlayerSourceDetails carries no byte range — so opening the host path at
+    // offset 0 demuxes the wrong bytes. Read the media through the guest's own reader instead.
+    //
+    // The read happens HERE, on the guest thread that called sceAvPlayerAddSource(Ex), because these
+    // callbacks are guest code and need that thread's TCB; the decode worker is a prosper-owned host
+    // thread and must never call them. The whole media is therefore buffered up front.
+    std::vector<uint8_t> guest_media;
+    if (avp_has_file_replacement(file)) {
+        const int32_t opened = avp_file_open(file, guest_path);
+        const uint64_t media_bytes = opened >= 0 ? avp_file_size(file) : 0;
+        if (avp_log())
+            fprintf(stderr, "[avp] guest file-replacement reader: open('%s') -> %d size=%llu bytes\n",
+                    guest_path, (int)opened, (unsigned long long)media_bytes);
+        if (opened >= 0) {
+            // Bound the buffer: a guest that answers with a whole multi-hundred-megabyte container
+            // is not describing a clip, and silently allocating that is worse than saying so.
+            constexpr uint64_t kMaxGuestMediaBytes = 256ull * 1024 * 1024;
+            if (media_bytes == 0 || media_bytes > kMaxGuestMediaBytes) {
+                fprintf(stderr,
+                        "[avp] guest file-replacement reader for '%s' reports %llu bytes; refusing to "
+                        "buffer it and falling back to the host path (#1955)\n",
+                        guest_path, (unsigned long long)media_bytes);
+            } else {
+                guest_media.resize(static_cast<size_t>(media_bytes));
+                uint64_t position = 0;
+                bool read_ok = true;
+                while (position < media_bytes) {
+                    const uint64_t remaining = media_bytes - position;
+                    const uint32_t chunk = static_cast<uint32_t>(
+                        std::min<uint64_t>(remaining, 1u << 20));
+                    const int32_t got = avp_file_read(file, guest_media.data() + position, position,
+                                                      chunk);
+                    if (got <= 0) {
+                        fprintf(stderr,
+                                "[avp] guest file-replacement read('%s') failed at offset %llu: %d "
+                                "-> falling back to the host path (#1955)\n",
+                                guest_path, (unsigned long long)position, (int)got);
+                        read_ok = false;
+                        break;
+                    }
+                    position += static_cast<uint64_t>(got);
+                }
+                if (!read_ok) guest_media.clear();
+            }
+            avp_file_close(file);
+        }
+    }
+
     const std::string host_path = resolve_guest_path(guest_path);
     auto* selected_backend = prosper::video::backend();
     if (avp_log()) {
-        fprintf(stderr, "[avp] opening source host='%s' backend=%d\n",
-                host_path.c_str(), selected_backend != nullptr);
+        fprintf(stderr, "[avp] opening source host='%s' backend=%d guest-media=%zu bytes\n",
+                host_path.c_str(), selected_backend != nullptr, guest_media.size());
         fflush(stderr);
     }
     prosper::video::StreamInfo stream{};
-    int backend_id = selected_backend ? selected_backend->open(host_path) : -1;
+    int backend_id = -1;
+    if (selected_backend && !guest_media.empty()) {
+        backend_id = selected_backend->open_memory(host_path, guest_media.data(),
+                                                   guest_media.size());
+        // A backend with no in-memory path, or media the demuxer rejects, must not silently lose the
+        // titles that work today: fall back to the host file exactly as before.
+        if (backend_id < 0)
+            fprintf(stderr,
+                    "[avp] the guest-supplied media for '%s' could not be demuxed; falling back to "
+                    "the host path (#1955)\n", guest_path);
+    }
+    if (backend_id < 0 && selected_backend) backend_id = selected_backend->open(host_path);
     if (backend_id >= 0 && !selected_backend->info(backend_id, stream)) {
         selected_backend->close(backend_id);
         backend_id = -1;
@@ -1205,7 +1364,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
                 p.guest_path = guest_path;
                 p.have_source = true; p.synthetic = false;
                 p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0;
-                p.paused = false; p.stop_fired = false;
+                p.paused = false; p.stop_fired = false; p.seek_deliver = false;
                 p.texture_frames.clear(); p.texture_frame_bytes = 0; p.next_texture_frame = 0;
                 p.backend = nullptr; p.backend_id = -1;
                 // Non-zero placeholder dims/fps: a title that queries GetStreamInfo up-front (before it
@@ -1246,7 +1405,8 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
             AvpPlayer& p = it->second;
             p.guest_path = guest_path;
             p.have_source = true; p.synthetic = synthetic;
-            p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0; p.paused = false; p.stop_fired = false;
+            p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0; p.paused = false;
+            p.stop_fired = false; p.seek_deliver = false;
             p.texture_frames = std::move(textures);
             p.texture_frame_bytes = texture_bytes;
             p.next_texture_frame = 0;
@@ -1322,12 +1482,72 @@ HLE(s_avp_resume) {   // s32 sceAvPlayerResume(handle)
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0); if (it == g_avp.end()) return 0x806a0001ull;
+        it->second.seek_deliver = false;   // ordinary delivery resumes; the seek window is over
         if (it->second.playing && it->second.paused) {
             it->second.paused = false;
             obj = it->second.ev_obj; cb = it->second.ev_cb; notify = true;
         }
     }
     if (notify) avp_fire(obj, cb, AVP_PLAY);
+    return 0;
+}
+// s32 sceAvPlayerJumpToTime(SceAvPlayerHandle, uint64_t offset_ms) — reposition playback (#1949).
+//
+// UNITS: milliseconds. PPSA30490 builds the argument as a seconds double scaled by 1000
+// (eboot+0x15dc197 .. 0x15dc1ec) and then compares the resulting value directly against the
+// millisecond SceAvPlayerFrameInfoEx::timeStamp that sceAvPlayerGetVideoDataEx returns, and against
+// sceAvPlayerCurrentTime's millisecond position. CONFIDENCE: HIGH.
+//
+// WHY EVERY FAILURE PATH RETURNS NON-ZERO: this NID used to be unregistered, so the dispatcher's
+// default 0 reached the guest as SCE_OK. PPSA30490 pre-sets its own failure state, tests only
+// `eax == 0`, and on zero enters a wait for the player's position to move before it calls
+// sceAvPlayerResume. A "successful" seek that moved nothing therefore deadlocked the title in its
+// video splash forever, while the guest had a perfectly good `failed to jump while seeking` branch
+// it could never reach. A truthful error is strictly better than a silent no-op here.
+HLE(s_avp_jumptotime) {
+    svc_log("sceAvPlayerJumpToTime", a0,a1,a2,a3,a4,a5);
+    const uint64_t target_ms = a1;
+    const char* reason = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_avp_mx);
+        auto it = g_avp.find(a0);
+        if (it == g_avp.end()) {
+            reason = "unknown player handle";
+        } else {
+            AvpPlayer& p = it->second;
+            // The backend seek runs under g_avp_mx on purpose: it tears down and recreates the
+            // decode worker, and a concurrent GetVideoData/IsActive that observed the intermediate
+            // end-of-decode state would fire a spurious AVP_STOP at the guest.
+            if (!p.have_source) {
+                reason = "no source is attached to this player";
+            } else if (!p.backend || p.backend_id < 0) {
+                // Includes the #1105 graceful-skip empty source and any headless/synthetic session:
+                // there is no decoder to move, so say so instead of reporting a seek that cannot exist.
+                reason = "the source has no host decoder to reposition";
+            } else if (target_ms > UINT64_MAX / 1000ull) {
+                reason = "the requested position overflows a microsecond position";
+            } else if (!p.backend->seek(p.backend_id, target_ms * 1000ull)) {
+                reason = "the host video backend could not seek this source";
+            } else {
+                // The player is now at the requested time even though no frame has been pulled yet,
+                // so sceAvPlayerCurrentTime must already report it. A seek deliberately does NOT
+                // change play/pause state: the observed guest sequence is pause -> jump -> resume.
+                // CONFIDENCE: LOW on seeking a player that has already reported AVP_STOP — no title
+                // does it, so nothing here revives one; it stays stopped with a repositioned source.
+                p.last_ts_ms = target_ms;
+                p.seek_deliver = true;
+            }
+        }
+    }
+    if (reason) {
+        // Loud by design (not gated on PROSPER_AVPLOG): a guest-visible seek failure is exactly the
+        // kind of gap that must not read as "handled" in a default run.
+        fprintf(stderr, "[avp] sceAvPlayerJumpToTime handle=0x%llx target=%llu ms FAILED: %s\n",
+                (unsigned long long)a0, (unsigned long long)target_ms, reason);
+        return 0x806a0001ull;   // SCE_AVPLAYER_ERROR_INVALID_PARAMS, as used across this surface
+    }
+    if (avp_log()) fprintf(stderr, "[avp] jump-to-time handle=0x%llx target=%llu ms -> ok\n",
+                           (unsigned long long)a0, (unsigned long long)target_ms);
     return 0;
 }
 // bool sceAvPlayerGetVideoData(handle, AvPlayerFrameInfo*) — deliver the next decoded frame (NV12).
@@ -1338,10 +1558,15 @@ HLE(s_avp_getvideodata) {
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0);
-        // Paused gates delivery. avp_paused_deliver() is the default-off #1599 falsification
+        // Paused gates delivery, EXCEPT in the window opened by a successful sceAvPlayerJumpToTime.
+        // A seek repositions the player and must publish the new position while it is still paused:
+        // PPSA30490 pauses, seeks, then pulls frames until the player's timestamp moves and only
+        // then calls sceAvPlayerResume (eboot+0x15dc45c loop -> +0x15dc0c1). A player that delivered
+        // nothing while paused could never let that guest leave its splash. The window closes on the
+        // first delivered frame. avp_paused_deliver() is the separate default-off #1599 falsification
         // lever documented above, not a feature; it never changes a default run.
         if (it == g_avp.end() || !it->second.playing ||
-            (it->second.paused && !avp_paused_deliver())) return 0;
+            (it->second.paused && !it->second.seek_deliver && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
@@ -1352,6 +1577,7 @@ HLE(s_avp_getvideodata) {
                     fi->p_data = staged;
                     fi->timestamp = vf.pts_us / 1000;
                     p.last_ts_ms = fi->timestamp;
+                    p.seek_deliver = false;
                     fi->d0 = vf.width; fi->d1 = vf.height; fi->d2 = 0; fi->d3 = 0;
                     result = 1;
                 }
@@ -1388,10 +1614,9 @@ HLE(s_avp_getvideodataex) {
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0);
-        // Paused gates delivery. avp_paused_deliver() is the default-off #1599 falsification
-        // lever documented above, not a feature; it never changes a default run.
+        // See s_avp_getvideodata: paused gates delivery except inside the post-seek window.
         if (it == g_avp.end() || !it->second.playing ||
-            (it->second.paused && !avp_paused_deliver())) return 0;
+            (it->second.paused && !it->second.seek_deliver && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
@@ -1402,6 +1627,7 @@ HLE(s_avp_getvideodataex) {
                     fi->p_data = staged;
                     fi->timestamp = vf.pts_us / 1000;
                     p.last_ts_ms = fi->timestamp;
+                    p.seek_deliver = false;
                     fi->details.video = {}; fi->details.video.width = vf.width; fi->details.video.height = vf.height;
                     fi->details.video.aspect = vf.height ? (float)vf.width / (float)vf.height : 0.0f;
                     fi->details.video.crop_right_offset = pitch - vf.width;
@@ -1503,6 +1729,7 @@ HLE(s_avp_stop) {   // s32 sceAvPlayerStop(handle)
         avp_release_frame_storage(p);
         p.texture_frame_bytes = 0; p.next_texture_frame = 0;
         p.backend = nullptr; p.backend_id = -1; p.have_source = false; p.synthetic = false;
+        p.seek_deliver = false;
         if (p.playing && !p.stop_fired) {
             p.playing = false; p.paused = false; p.stop_fired = true;
             fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
@@ -3795,6 +4022,11 @@ void register_service_hle() {
     Hle::register_fn("9y5v+fGN4Wk", (HleFn)s_avp_pause_entry, "sceAvPlayerPause");
     Hle::register_fn("w5moABNwnRY", (HleFn)s_avp_resume_entry, "sceAvPlayerResume");
 #endif
+    // sceAvPlayerJumpToTime (#1949). Unregistered, its dispatcher default of 0 was read as a
+    // completed seek and deadlocked PPSA30490's Unity video splash; the handler now performs a real
+    // backend seek and returns a real error when it cannot. NID verified in the PS5 3.20
+    // libSceAvPlayer stub table. Calls no guest code, so it needs no entry-rsp trampoline.
+    Hle::register_fn("XC9wM+xULz8", (HleFn)s_avp_jumptotime, "sceAvPlayerJumpToTime");
     Hle::register_fn("k-q+xOxdc3E", (HleFn)s_avp_stream_ok, "sceAvPlayerSetAvSyncMode");
     Hle::register_fn("OVths0xGfho", (HleFn)s_avp_stream_ok, "sceAvPlayerSetLooping");
     R("sceSystemServiceGetStatus", s_syss_getstatus);
