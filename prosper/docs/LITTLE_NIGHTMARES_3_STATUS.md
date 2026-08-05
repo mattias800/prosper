@@ -55,6 +55,28 @@ Two facts bound where it can live:
 
 Open as [#2014](https://github.com/mattias800/prosper/issues/2014).
 
+### #2003 is not inert here — but it is not the reason the wall went
+
+This title calls both APIs #2003 changed. Under `PROSPER_SVCLOG=1` (9,270 `[svc]` lines in the run,
+which is the positive control that the logger was live):
+
+```text
+[svc] sceAppContentAppParamGetInt(0x1, …)        once, before the t=20 s sample
+[svc] sceNpEntitlementAccessGetSkuFlag(…)        x2, between the t=100 s and t=120 s samples
+```
+
+Both `GetSkuFlag` calls land in the window where the title screen composites. The dump answers them
+from its own bytes: `sce_sys/param.json` declares `applicationDrmType: "upgradable"`, which
+`derive_sku_flag` (`hle_addcontent.cpp:372`) maps to `Full`, and `userDefinedParam1: 0`. Before
+#2003 the NID was unregistered and fell to the dispatcher's stub, which reports success while
+leaving the out pointer untouched — `hle_service.cpp:3941` names `PPSA05143` as one of the titles
+that then acts on uninitialized stack residue.
+
+**Not established:** whether #2003 is *necessary* for rung 2. The wall was at t≈60 s, before either
+call, and its removal is attributable to the ordered-DMA rejection going 1 → 0 (#1987, measured).
+Settling it needs a revert arm, which has not been run. Do not restate "#2003 is inert for this
+title" — that claim was made on this tracker from an unarmed `svc_log` and withdrawn.
+
 ### Other things visible in the same run
 
 - Two of 36 samples are a blue/magenta noise band rather than content (t=150 s, t=190 s). *The
@@ -91,6 +113,7 @@ Read this before forming a hypothesis.
 | `[agc] WaitRegMem … dependency violated` is the lead for the stall | **Falsified — instrument noise.** 31 events on *The Pathless* (`PPSA01826`, UE4), which renders its title screen for a full 140 s arm without stalling, against 40 on this title, and on this title they all stop *before* the stall began. #1962. |
 | `crc=666f7b3f` fingerprints this title's wall | **No — it is just "black 3840x2160".** The same crc was the frozen frame of Crisis Core (#1982) and Sonic Frontiers (#1968), which have different causes. Do not group titles by it. |
 | The `0x30016000` UE pooled-allocator fault (#1945 / #1226) bounds this title | **Not seen** in any arm of six on `ff72e77c`, nor in any arm on `4d7a2ded`. |
+| #2003 is inert for this title (no `sceNpEntitlementAccessGetSkuFlag` line in the run logs) | **Void, not negative — the instrument was never armed.** `svc_log()` is gated on `PROSPER_SVCLOG`, which those arms did not set. With it armed the title calls `GetSkuFlag` twice, in the same window the title screen composites. Claimed and withdrawn on #1893. |
 | The boot dies in the guest at `addr=0x80` | **Falsified — the faulting instruction was prosper's own.** `k_ef_create` (`hle_kernel.cpp:1767`) storing through a guest out-pointer of `0x80`; the `rip=eboot+0x…` label was instrument-trap 22. The `0x80` itself came from `sceAjmInitialize` rejecting this title's config revision, fixed by #1966. Filed as #1963. |
 
 ## Ladder
