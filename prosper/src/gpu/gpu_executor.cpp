@@ -6689,6 +6689,26 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     notify_compute_authority_unknown(
         ComputeAuthorityBoundaryKind::SubmitEnd, submit_no);
     const bool frame_ready = px.size() == static_cast<size_t>(width) * height * 4;
+    // A submit that RENDERED but whose frame does not match the requested extent is dropped here
+    // with no trace anywhere: the frontend's own failure log prints only for an EMPTY frame
+    // (instrument trap 87), so a non-empty wrong-extent frame is silently discarded and the
+    // publish counter simply stops. Sonic Frontiers' publish freeze (#1968) lived in exactly that
+    // blind spot through two investigations — the guest kept submitting, the renderer kept
+    // producing pixels, and nothing said why nothing reached the screen. Reported unconditionally
+    // and rate-limited, because an extent mismatch between the renderer and its caller is never
+    // expected. Diagnostic only; the publish decision is unchanged.
+    if (publish && !frame_ready && !px.empty()) {
+        static std::atomic<int> logged{0};
+        const int n = logged.fetch_add(1);
+        if (n < 32)
+            std::fprintf(stderr,
+                         "[agc] PUBLISH DROPPED submit #%llu: the renderer returned %zu bytes for a "
+                         "requested %ux%u frame (%zu expected) — nothing is published for this "
+                         "submit%s\n",
+                         (unsigned long long)submit_no, px.size(), width, height,
+                         static_cast<size_t>(width) * height * 4,
+                         n == 31 ? " [further reports suppressed]" : "");
+    }
     const bool presented = frame_ready && publish;
     if (presented) present_write_frame(result.frame.storage, width, height);
     if (timing_enabled) {
