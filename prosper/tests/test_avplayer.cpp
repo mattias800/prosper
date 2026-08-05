@@ -54,6 +54,10 @@ public:
     static constexpr uint32_t kHeight = 1080;
     static constexpr uint32_t kStride = 2048;
     static constexpr size_t kUvRows = (kHeight + 1u) / 2u;
+    // prosper RE-pitches rather than propagating the decoder's stride, so what it publishes is its
+    // OWN 256-byte-aligned pitch, not kStride. The two coincide here; asserting against this constant
+    // keeps the checks true for the right reason if the fake backend's stride ever changes.
+    static constexpr uint32_t kPitch = (kWidth + 255u) & ~255u;
     bool fail_open = false;
     bool delivered = false;
     bool audio_delivered = false;
@@ -464,8 +468,8 @@ int main() {
     memcpy(&native_info_crop_top, native_info.details + 28, sizeof(native_info_crop_top));
     memcpy(&native_info_crop_bottom, native_info.details + 32, sizeof(native_info_crop_bottom));
     memcpy(&native_info_pitch, native_info.details + 36, sizeof(native_info_pitch));
-    CHECK(native_info_width == FakeVideoBackend::kStride &&
-              native_info_pitch == FakeVideoBackend::kStride &&
+    CHECK(native_info_width == FakeVideoBackend::kPitch &&
+              native_info_pitch == FakeVideoBackend::kPitch &&
               native_info_crop_left == 0 && native_info_crop_right == 128 &&
               native_info_crop_top == 0 && native_info_crop_bottom == 0,
           "native stream metadata separates the 2048 physical pitch from 1920 visible pixels");
@@ -519,8 +523,8 @@ int main() {
     memcpy(&native_crop_bottom, native_frame.details + 32, sizeof(native_crop_bottom));
     memcpy(&native_pitch, native_frame.details + 36, sizeof(native_pitch));
     memcpy(&native_fps, native_frame.details + 48, sizeof(native_fps));
-    CHECK(native_width == FakeVideoBackend::kStride && native_height == FakeVideoBackend::kHeight &&
-              native_pitch == FakeVideoBackend::kStride && native_crop_left == 0 &&
+    CHECK(native_width == FakeVideoBackend::kPitch && native_height == FakeVideoBackend::kHeight &&
+              native_pitch == FakeVideoBackend::kPitch && native_crop_left == 0 &&
               native_crop_right == 128 && native_crop_top == 0 && native_crop_bottom == 0 &&
               native_fps == 60.0,
           "native frame details publish the coded extent, physical pitch, crop, and frame rate");

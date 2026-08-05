@@ -798,31 +798,53 @@ void avp_register_frame_layout(uint8_t* base, size_t bytes, uint32_t pitch) {
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(base)), bytes, pitch);
 }
 
-// AvPlayerVideoEx follows the H.264 SPS convention its four field names mirror
-// (frame_crop_{left,right,top,bottom}_offset): width/height are the CODED extent, and the crop
-// offsets trim that down to the visible picture. prosper stages decoded NV12 at a 256-byte-aligned
-// physical pitch (#1814), so the coded width IS that pitch and the padded columns are exactly what
-// crop_right_offset removes.
+// AvPlayerVideoEx publishes `width` as the extent the crop offsets TRIM, not as the visible picture.
 //
-// Publishing the VISIBLE width here while ALSO publishing a non-zero crop_right_offset made the two
-// ways a title can spell the same question disagree, and shipping titles use both spellings:
+// The load-bearing evidence is that three shipping titles run on retail PS5 hardware while spelling
+// "how wide is the visible picture" two different ways, so Sony's own publication must satisfy both
+// at once. Two of the three fields are already pinned by prior live evidence:
+//
+//   pitch = 2048   forced by R-Type Delta, which builds its luma T# with `pitch` AS the descriptor
+//                  width and requires agc_footprint == pitch*height (#1814, R_TYPE_DELTA_STATUS.md).
+//   crop_right     forced by GRIS: #1393 padded the pitch with a zero crop and exposed the padded
+//     = 128        columns as a right-edge strip, so the crop must describe that padding.
+//
+// With those pinned, ArcRunner's spelling leaves exactly one free value:
 //
 //   GRIS       visible = pitch - crop_left - crop_right  ->  2048 - 0 - 128 = 1920   (correct)
 //   ArcRunner  visible = width - crop_left - crop_right  ->  1920 - 0 - 128 = 1792   (WRONG)
 //
-// Measured on ArcRunner (PPSA21406, #2011): with the movie's 1920x1080 frame staged at pitch 2048,
-// the guest sizes its luma T# from the pitch (2048x1080, chroma 1024x540 — half of it) and then
-// renders the converted frame into a 1792x1080 target, losing a 128-column slice of every movie
-// frame. Reporting width == pitch satisfies both spellings at once and leaves GRIS unchanged.
+// so `width` must be 2048. Measured on ArcRunner (PPSA21406, #2011): the guest sizes its movie luma
+// T# from the published pitch (2048x1080, chroma 1024x540 — half of it) and, while width published
+// the visible 1920, sized every converted movie surface 128 columns short at 1792x1080. Publishing
+// width == pitch satisfies both spellings at once and leaves GRIS and R-Type unchanged.
+//
+// The four crop field names mirror H.264's frame_crop_{left,right,top,bottom}_offset, and that is an
+// ANALOGY, not the evidence: H.264's coded extent is macroblock-aligned (a 1920x1080 stream codes
+// 1920x1088 with crop_bottom, crop_right=0), never memory-pitch-aligned, so the SPS convention alone
+// would argue for width=1920/crop_right=0. The real statement is that the crop fields are the only
+// ABI channel able to describe buffer padding, so that is what this contract uses them for.
 //
 // `aspect` stays the VISIBLE display ratio: it is not part of the crop arithmetic, and a consumer
 // reads it to letterbox, never to size a surface.
-// CONFIDENCE: MED — derived from two independent shipping consumers plus the H.264 cropping
-// convention the field names follow. No Sony header was consulted.
+//
+// `width == pitch` is only meaningful because every path here is 8-bit (luma_bd/chroma_bd below):
+// `pitch` is a BYTE stride and `width` a PIXEL count, and they coincide only at 1 byte per luma
+// sample. A 10-bit/P010 source would need the pixel pitch, not the byte pitch, computed here.
+//
+// CONFIDENCE: MED — derived from three independent shipping consumers that all work on retail
+// hardware. No Sony header was consulted. The counter-model this cannot exclude is that
+// AvPlayerVideoEx merely EXTENDS AvPlayerVideo (whose `width` is unambiguously visible) and Sony's
+// crop fields describe bitstream cropping rather than buffer padding.
 void avp_fill_video_ex(AvpVideoEx& out, uint32_t visible_w, uint32_t visible_h, uint32_t pitch,
                        double framerate) {
     out = {};
-    out.width = pitch;                 // coded extent the crop offsets trim
+    // Every current caller derives `pitch` from the same width it passes, so this cannot trip today.
+    // It is a guard rather than an assumption because the underflow would be silent and guest-visible:
+    // crop_right_offset is unsigned, so pitch < visible_w publishes ~4 G and every consumer that
+    // subtracts it gets a nonsense extent.
+    if (pitch < visible_w) pitch = visible_w;
+    out.width = pitch;                 // the extent the crop offsets trim
     out.height = visible_h;            // prosper stages no padded rows
     out.aspect = visible_h ? static_cast<float>(visible_w) / static_cast<float>(visible_h) : 0.0f;
     out.crop_right_offset = pitch - visible_w;
@@ -1302,6 +1324,11 @@ HLE(s_avp_getstreaminfo) { // s32 sceAvPlayerGetStreamInfo(handle, stream_id, ou
     if (a1 >= (p.has_audio ? 2u : 1u)) return 0x806a0001ull;
     *out = {}; out->type = a1 == 0 ? 1u : 2u;
     if (a1 == 0) {
+        // The basic AvPlayerVideo has NO pitch and NO crop fields, so its `width` must be the VISIBLE
+        // extent — there is no channel here through which a consumer could subtract padding. That is
+        // why it deliberately differs from the Ex struct's coded `width` (see avp_fill_video_ex): the
+        // two structs answer the same question through different field sets, and the basic path also
+        // stages tight rows to match.
         out->details.video.width = p.width; out->details.video.height = p.height;
         out->details.video.aspect = (float)p.width / (float)p.height;
     } else {

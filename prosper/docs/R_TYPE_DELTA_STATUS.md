@@ -41,6 +41,15 @@ pitch but left all crop fields zero correctly removed the stride corruption, but
 128-pixel tail as a right-edge strip. Padding and crop are one contract; testing only the first half
 made the correct physical layout look invalid.
 
+**`AvPlayerVideoEx.width` is the extent the crop offsets TRIM, not the visible picture** (#2011).
+The Ex struct originally published the visible 1920 alongside `crop_right_offset=128`, which makes
+the two ways a title can spell "visible width" disagree — and shipping titles use both. ArcRunner
+(`PPSA21406`) computes it off `width` rather than off `pitch`, so it got `1920 - 0 - 128 = 1792` and
+sized every movie surface 128 columns short. Since `pitch=2048` is pinned by R-Type's footprint
+check and `crop_right=128` is pinned by GRIS's strip, `width` must be 2048 for both spellings to
+land on 1920. Note that the basic non-Ex `AvPlayerVideo` has no pitch or crop field, so **its**
+`width` is and must remain the visible extent; the two structs deliberately differ.
+
 ## CPU guard and mutation evidence
 
 `test_avplayer` supplies a 1920x1080 NV12 frame with 2048-byte decoder strides and checks all of the
@@ -233,6 +242,7 @@ Two apparatus corrections belong with that table, because both produced wrong an
 | The chroma bind packet is lost by Prosper | **Falsified.** The title returns before constructing the chroma descriptor, then later binds that uninitialized slot itself. There is no valid descriptor for a packet decoder to recover. | guest `eboot+0x19d10`, this doc |
 | AvPlayer output must remain tight because padded output caused GRIS's right-edge strip | **Falsified.** GRIS subtracts the ABI crop offsets from pitch. The prior padded experiment left crop right zero; the missing crop, not the physical padding, exposed the strip. | #1393, GRIS `eboot+0xf6d5ab`, this doc |
 | Reporting pitch 2048 while retaining tight rows is sufficient | **Falsified by construction.** The title advances plane addresses by the published physical extent. The CPU fixture verifies row-by-row storage and both plane bases, not metadata alone. | `test_avplayer` |
+| Publishing the VISIBLE width in `AvPlayerVideoEx.width` is compatible with a non-zero `crop_right_offset` | **Falsified.** It double-counts the padding for any consumer that subtracts the crops from `width` rather than from `pitch`, and both spellings ship. ArcRunner (`PPSA21406`) rendered every movie frame into a `1792x1080` surface (= `1920 - 128`); publishing `width == pitch` moved it to `1920x1080` with zero `1792x1080` surfaces remaining, and left GRIS's `pitch - crops` and R-Type's `pitch * height` footprint identical. | #2011, #2032 |
 | The pc-52 resource rejection was the only movie-visual blocker | **Falsified live.** The size mismatch and all shader/resource rejects are gone, but retained frames contain only flat clears and low-colour gradients. The downstream frontier is #1807. | bounded `4114391c` run, #1807 |
 | The decoded/staged movie planes contain the low-colour gradient | **Falsified.** The exact captured R8/RG8 bytes produce a sharp full-colour frame through an independent CPU NV12 conversion; only Prosper's replay of the same bytes collapses to the gradient. | present 1740 capture, #1807 |
 | Vulkan's native unnormalized-coordinate sampler can apply `FORCE_UNNORMALIZED` directly | **Falsified against the live S#.** R-Type combines the bit with wrap addressing (`CLAMP_X/Y=0`) and `maxLod=15.9961`; Vulkan requires clamp addressing and zero LOD for an unnormalized sampler. The native candidate correctly became fail-visible but could not represent the guest contract. | retained submit 1741, #1807 |
