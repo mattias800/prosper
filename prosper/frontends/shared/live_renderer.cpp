@@ -5738,8 +5738,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // Under the publish extent contract (#1986) a candidate whose byte count disagrees is
                 // not a present source, so a correctly sized lower-priority candidate is preferred over
                 // an incorrectly sized higher-priority one, and "nothing qualified" yields no source at
-                // all rather than a frame the caller must discard. Without a scanout (offline replay,
-                // render_submit_items tests) this is byte-for-byte the historical identity priority.
+                // all rather than a frame the caller must discard. Outside a publish-gate submit
+                // (offline replay, render_submit_items tests) this is byte-for-byte the historical
+                // identity priority.
                 auto candidate_bytes = [](const std::shared_ptr<const std::vector<uint8_t>>& p) {
                     return p ? p->size() : size_t{0};
                 };
@@ -5970,11 +5971,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     "serving the retained frame instead", current_bytes);
                             break;
                         case prosper::frontend::RetainedFrameAction::NoUsableFrame:
-                            // Nothing publishable exists and there is nothing retained to fall back on.
-                            // selected_pixels is left alone so the capture/dump paths and the caller's
-                            // own `[agc] PUBLISH DROPPED` backstop still see what was rendered; the
-                            // caller will not publish it.
-                            if (present_extent_bytes && current_bytes)
+                            // Nothing publishable this submit and nothing retained to fall back on, so
+                            // the screen does not advance. selected_pixels is left as selection found
+                            // it — normally empty on this path, since selection already refused every
+                            // wrong-extent candidate — which keeps the caller's `[render] … Vulkan
+                            // render FAILED` and `[agc] PUBLISH DROPPED` backstops intact. This is the
+                            // one outcome that is a lost frame rather than a substituted one, so it is
+                            // reported whenever the contract applies, including when nothing rendered
+                            // at all: "no pass produced a present-extent source" is the finding either
+                            // way, and Frontiers' wall was invisible for exactly as long as it was not
+                            // stated anywhere.
+                            if (present_extent_bytes)
                                 report_present_extent_shortfall(
                                     "nothing is published for this submit", current_bytes);
                             break;
