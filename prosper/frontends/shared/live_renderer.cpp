@@ -6052,51 +6052,72 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // they are the only description of the frame that exists, and publishing them is the
                 // literal meaning of the flip.
                 //
-                // Three conditions keep this off every path that already works:
+                // Four conditions keep this off every path that already works. It is a LAST resort in
+                // the literal sense — it never changes which of prosper's own sources wins, only what
+                // happens when there is none:
+                //   * `!selected_pixels` — selection at the top of this callback already refused every
+                //     wrong-extent candidate, so a surviving one is a frame prosper can publish and
+                //     keeps its priority. Without this test the guest buffer would OVERRIDE a
+                //     qualifying `px_last`, which is a cross-title present-priority change and not
+                //     what this is for.
                 //   * `!scanout` — prosper's own image for that address always wins when it has one,
                 //     since it is unscaled and needs no CPU round trip.
-                //   * `g_rtt` has no entry at the flipped address at all. An entry that merely failed
-                //     `cached_scanout` (wrong extent mid-resize, a readback that did not materialize)
-                //     means prosper IS the writer and is between states; overriding it with guest
-                //     memory would publish a surface prosper is in the middle of producing.
+                //   * `g_rtt` has no entry at the address the read actually came from. An entry that
+                //     merely failed `cached_scanout` (wrong extent mid-resize, a readback that did not
+                //     materialize) means prosper IS the writer and is between states; overriding it
+                //     with guest memory would publish a surface prosper is mid-way through producing.
+                //     Testing the address the reader returned rather than the one looked up here also
+                //     closes the gap where the guest flips between the two.
                 //   * the bytes are not all zero. A registered-but-never-written buffer reads as
                 //     zeros, and Bendy (PPSA27616) re-registers its scanouts constantly — turning
                 //     those frames black instead of holding the previous one is exactly the flicker
                 //     the retained-frame net exists to prevent, so an untouched buffer declines here
-                //     and falls through to it.
+                //     and falls through to it. This is "was anything written", not "is it not black":
+                //     a frame the guest deliberately clears to opaque black publishes as black, which
+                //     is what the console shows.
+                // The display-extent test comes BEFORE the read, not after: under PROSPER_RENDER_SCALE
+                // the guest buffer can never match the reduced present extent, and 15 of 17 snapshot
+                // guards run at scale 4 — checking afterwards would make them pay a full-resolution
+                // de-swizzle per flip only to discard it.
                 // Read once per guest flip, not once per submit: this callback runs for every span of
                 // every submit (eleven per frame on Frontiers), the buffer only changes when the
-                // guest flips a new one, and a 4K copy-plus-de-swizzle is not free. These two statics
-                // have the same single-present-thread contract as `last_scanout_present` below.
+                // guest flips a new one, and a 4K copy-plus-de-swizzle is not free. These statics have
+                // the same single-present-thread contract as `last_scanout_present` below.
                 static uint64_t guest_scanout_flip = UINT64_MAX;
                 static std::shared_ptr<const std::vector<uint8_t>> guest_scanout_pixels;
-                if (!published_gpu && !scanout && front >= 0 && present_extent_bytes) {
-                    const uint64_t front_addr = prosper_vo_buffer_addr(front);
-                    if (front_addr && g_rtt.find(front_addr) == g_rtt.end()) {
-                        if (guest_scanout_flip != current_flip) {
-                            guest_scanout_flip = current_flip;
-                            guest_scanout_pixels.reset();
-                            std::vector<uint8_t> linear;
-                            prosper::VideoOutBufferSnapshot meta;
-                            if (prosper::videoout_read_front_linear(linear, meta) &&
-                                linear.size() == present_extent_bytes &&
-                                std::any_of(linear.begin(), linear.end(),
-                                            [](uint8_t b) { return b != 0; })) {
-                                guest_scanout_pixels =
-                                    std::make_shared<const std::vector<uint8_t>>(std::move(linear));
-                                static std::atomic<uint64_t> guest_scanout_publishes{0};
-                                const uint64_t ord = guest_scanout_publishes.fetch_add(1) + 1;
-                                if (prosper::diag_should_print(ord))
-                                    fprintf(stderr,
-                                            "[rtt] GUEST SCANOUT PRESENT #%llu: no pass and no "
-                                            "renderer target at the flipped buffer 0x%llx — "
-                                            "publishing its own %ux%u guest contents (tiling=%u)\n",
-                                            (unsigned long long)ord,
-                                            (unsigned long long)front_addr, w, h, meta.tiling_mode);
-                            }
+                const size_t display_bytes =
+                    static_cast<size_t>(prosper::gpu::present_width()) *
+                    prosper::gpu::present_height() * 4u;
+                if (!published_gpu && !scanout && !selected_pixels && present_extent_bytes &&
+                    display_bytes == present_extent_bytes) {
+                    if (guest_scanout_flip != current_flip) {
+                        guest_scanout_flip = current_flip;
+                        guest_scanout_pixels.reset();
+                        std::vector<uint8_t> linear;
+                        prosper::VideoOutBufferSnapshot meta;
+                        if (prosper::videoout_read_front_linear(linear, meta) &&
+                            linear.size() == present_extent_bytes && meta.address &&
+                            g_rtt.find(meta.address) == g_rtt.end() &&
+                            std::any_of(linear.begin(), linear.end(),
+                                        [](uint8_t b) { return b != 0; })) {
+                            guest_scanout_pixels =
+                                std::make_shared<const std::vector<uint8_t>>(std::move(linear));
+                            static std::atomic<uint64_t> guest_scanout_publishes{0};
+                            const uint64_t ord = guest_scanout_publishes.fetch_add(1) + 1;
+                            if (prosper::diag_should_print(ord))
+                                fprintf(stderr,
+                                        "[rtt] GUEST SCANOUT PRESENT #%llu: no present source and no "
+                                        "renderer target at the flipped buffer 0x%llx — publishing "
+                                        "its own %ux%u guest contents (tiling=%u)\n",
+                                        (unsigned long long)ord,
+                                        (unsigned long long)meta.address, w, h, meta.tiling_mode);
                         }
-                        if (guest_scanout_pixels) selected_pixels = guest_scanout_pixels;
                     }
+                    // Re-check the size on the cached path too: a two-set geometry switch can change
+                    // the present extent between spans of one flip, and the cache is keyed on the
+                    // flip alone.
+                    if (guest_scanout_pixels && guest_scanout_pixels->size() == present_extent_bytes)
+                        selected_pixels = guest_scanout_pixels;
                 }
                 // Hold the last good scanout across VideoOut buffer rotation. Bendy (PPSA27616) rapidly
                 // re-registers its scanout buffers; on the frames where the guest has registered new

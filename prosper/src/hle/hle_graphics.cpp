@@ -312,62 +312,112 @@ size_t videoout_copy_front_buffer(void* dst, size_t dst_cap, VideoOutBufferSnaps
 // is what prosper published for such titles before #1968: the registry had recorded the tiling mode
 // all along and no reader consulted it.
 //
-// Two details the raw copies get wrong for a tiled surface and this one does not:
-//   * the tiled footprint is LARGER than width*height*4 (block-padded height), and the tail bytes
-//     are not padding at the bottom of the image — they hold real texels of the last block row, so a
-//     width*height*4 read loses part of the bottom-right of the picture. Measured on Frontiers'
-//     3840x2160 scanout: the bottom-right 1024x48 region drops to half its non-black pixels.
-//   * the guest allocation is probed before the over-read, so a surface whose backing is smaller
-//     than the swizzle implies is declined instead of faulting.
-static bool videoout_read_snapshot_linear(const VideoOutBufferSnapshot& current,
-                                          std::vector<uint8_t>& out) {
-    size_t linear_bytes = 0;
-    if (!videoout_buffer_bytes(current, linear_bytes)) return false;
-    const uint32_t tile_mode = gpu::videoout_scanout_tile_mode(current.tiling_mode, 4);
-    if (!gpu::tile_mode_is_tiled(tile_mode)) {
-        out.resize(linear_bytes);
-        std::memcpy(out.data(), reinterpret_cast<const void*>((uintptr_t)current.address),
-                    linear_bytes);
-        return true;
-    }
+// The detail the raw copies get wrong for a tiled surface and this one does not: the swizzle
+// footprint is LARGER than width*height*4 (the height is padded up to whole blocks), and the tail
+// bytes are not padding at the BOTTOM of the image — they hold real texels of the last block row.
+// A width*height*4 read therefore loses part of the bottom-right of the picture; measured on
+// Frontiers' 3840x2160 scanout, the bottom-right 1024x48 drops to half its non-black pixels.
+//
+// Reading past the nominal end has to be earned rather than assumed, and `guest_readable` cannot
+// earn it: it answers "are these pages mapped", not "does this object own them", so a small
+// allocation followed by any other mapping passes it. The guest's own registration is the real
+// proof — a VideoOut set's buffers are one surface apart, so the smallest positive distance between
+// two registered addresses is a lower bound on what each of them owns. With fewer than two buffers
+// nothing proves anything and the nominal read stands. Requires the registry lock.
+static size_t videoout_provable_footprint_locked(const VideoOutBufferSnapshot& current,
+                                                 size_t linear_bytes, uint32_t tile_mode) {
     const size_t tiled_bytes =
         gpu::tiled_surface_bytes(current.width, current.height, tile_mode, 0, 4);
-    if (tiled_bytes < linear_bytes || tiled_bytes > UINT32_MAX) return false;
-    // Read the whole swizzle footprint when the backing allows it. If it does not, de-swizzle from
-    // the nominal width*height*4 zero-padded up instead of declining: that loses the part of the
-    // last block row that lives past the nominal end (on a 3840x2160 scanout, the bottom-right
-    // 1024x48), which is a far better answer than handing back swizzled bytes as if they were an
-    // image — the behavior every reader had before this existed.
-    size_t read_bytes = tiled_bytes;
-    if (!gpu::guest_readable(current.address, static_cast<uint32_t>(tiled_bytes))) {
-        static std::atomic<int> warned{0};
-        if (warned.fetch_add(1) < 8)
-            fprintf(stderr,
-                    "[vo] scanout 0x%llx (%ux%u tiling=%u) backs only %zu bytes of its %zu-byte "
-                    "swizzle footprint — de-swizzling the readable part\n",
-                    (unsigned long long)current.address, current.width, current.height,
-                    current.tiling_mode, linear_bytes, tiled_bytes);
-        read_bytes = linear_bytes;
+    if (tiled_bytes <= linear_bytes || tiled_bytes > UINT32_MAX) return linear_bytes;
+    uint64_t stride = UINT64_MAX;
+    for (int i = 0; i < 16; ++i) {
+        if (!g_display.buffer_set[i] || !g_display.buffer_addr[i]) continue;
+        for (int j = i + 1; j < 16; ++j) {
+            if (!g_display.buffer_set[j] || !g_display.buffer_addr[j]) continue;
+            const uint64_t a = g_display.buffer_addr[i], b = g_display.buffer_addr[j];
+            const uint64_t d = a > b ? a - b : b - a;
+            if (d) stride = std::min(stride, d);
+        }
     }
-    std::vector<uint8_t> tiled(tiled_bytes, 0);
-    std::memcpy(tiled.data(), reinterpret_cast<const void*>((uintptr_t)current.address), read_bytes);
+    if (stride == UINT64_MAX || stride < tiled_bytes) return linear_bytes;
+    if (!gpu::guest_readable(current.address, static_cast<uint32_t>(tiled_bytes)))
+        return linear_bytes;
+    return tiled_bytes;
+}
+
+// Read a registered scanout as an IMAGE rather than as bytes: copy its guest memory and de-swizzle
+// it according to the tiling mode the guest registered with it, so `out` is always linear
+// width*height*4 RGBA.
+//
+// The three copies above are deliberately raw — they are the "hand me those bytes" primitive, and a
+// diagnostic that dumps guest memory wants exactly that. Every consumer that treats the result as
+// PIXELS needs this one instead. A TILE-mode scanout read linearly is horizontal-band noise, which
+// is what prosper published for such titles before #1968: the registry had recorded the tiling mode
+// all along and no reader consulted it.
+//
+// Only the copy is done under the registry lock. sceVideoOutSubmitFlip takes the same lock, so
+// de-swizzling a 4K surface inside it would park the guest's own flip behind this work.
+//
+// `bytes_per_texel` is 4 throughout, which is the same assumption videoout_buffer_bytes already
+// makes for every registered surface; videoout_scanout_tile_mode fails closed for anything else, so
+// a future non-32-bpp display format degrades to the straight copy rather than mis-de-swizzling.
+static bool videoout_copy_snapshot_for_detile_locked(const VideoOutBufferSnapshot& current,
+                                                     std::vector<uint8_t>& raw,
+                                                     size_t& linear_bytes, uint32_t& tile_mode) {
+    linear_bytes = 0;
+    if (!videoout_buffer_bytes(current, linear_bytes)) return false;
+    tile_mode = gpu::videoout_scanout_tile_mode(current.tiling_mode, 4);
+    const size_t read_bytes = gpu::tile_mode_is_tiled(tile_mode)
+        ? videoout_provable_footprint_locked(current, linear_bytes, tile_mode)
+        : linear_bytes;
+    raw.assign(gpu::tile_mode_is_tiled(tile_mode)
+                   ? gpu::tiled_surface_bytes(current.width, current.height, tile_mode, 0, 4)
+                   : linear_bytes,
+               0);
+    if (raw.size() < read_bytes) return false;
+    std::memcpy(raw.data(), reinterpret_cast<const void*>((uintptr_t)current.address), read_bytes);
+    return true;
+}
+
+static bool videoout_detile_copy(const VideoOutBufferSnapshot& current, std::vector<uint8_t>&& raw,
+                                 size_t linear_bytes, uint32_t tile_mode,
+                                 std::vector<uint8_t>& out) {
+    if (!gpu::tile_mode_is_tiled(tile_mode)) {
+        out = std::move(raw);
+        out.resize(linear_bytes);
+        return true;
+    }
     out.assign(linear_bytes, 0);
-    gpu::detile_surface(out.data(), tiled.data(), current.width, current.height, tile_mode, 0, 4);
+    gpu::detile_surface(out.data(), raw.data(), current.width, current.height, tile_mode, 0, 4);
     return true;
 }
 
 bool videoout_read_buffer_linear(const VideoOutBufferSnapshot& expected, std::vector<uint8_t>& out) {
-    std::lock_guard<std::mutex> lk(g_display_mx);
+    std::vector<uint8_t> raw;
+    size_t linear_bytes = 0;
+    uint32_t tile_mode = 0;
     VideoOutBufferSnapshot current;
-    if (!videoout_buffer_snapshot_locked(expected.buffer_index, current) ||
-        current.generation != expected.generation) return false;
-    return videoout_read_snapshot_linear(current, out);
+    {
+        std::lock_guard<std::mutex> lk(g_display_mx);
+        if (!videoout_buffer_snapshot_locked(expected.buffer_index, current) ||
+            current.generation != expected.generation ||
+            !videoout_copy_snapshot_for_detile_locked(current, raw, linear_bytes, tile_mode))
+            return false;
+    }
+    return videoout_detile_copy(current, std::move(raw), linear_bytes, tile_mode, out);
 }
 
 bool videoout_read_front_linear(std::vector<uint8_t>& out, VideoOutBufferSnapshot& metadata) {
-    std::lock_guard<std::mutex> lk(g_display_mx);
-    if (!videoout_front_snapshot_locked(metadata)) return false;
-    return videoout_read_snapshot_linear(metadata, out);
+    std::vector<uint8_t> raw;
+    size_t linear_bytes = 0;
+    uint32_t tile_mode = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_display_mx);
+        if (!videoout_front_snapshot_locked(metadata) ||
+            !videoout_copy_snapshot_for_detile_locked(metadata, raw, linear_bytes, tile_mode))
+            return false;
+    }
+    return videoout_detile_copy(metadata, std::move(raw), linear_bytes, tile_mode, out);
 }
 namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; return v; } }
 // Implemented in hle_kernel_time.cpp (the equeue backend). Register a flip/vblank event source so the
