@@ -242,7 +242,6 @@ The warning screen, publisher logo, title screen, and EULA render at native 3840
 
 ## The Oregon Trail — `PPSA19244`
 
-<p align="center"><img src="assets/screenshots/oregon-trail-legal-popup.png" alt="The Oregon Trail — startup legal/EULA popup"></p>
 <p align="center"><img src="assets/screenshots/oregon-trail-gameloft-splash.png" alt="The Oregon Trail — Gameloft splash"></p>
 <p align="center"><img src="assets/screenshots/oregon-trail-health-warning.png" alt="The Oregon Trail — health/epilepsy warning screen"></p>
 <p align="center"><img src="assets/screenshots/oregon-trail-title-screen.png" alt="The Oregon Trail — title screen"></p>

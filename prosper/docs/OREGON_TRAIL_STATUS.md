@@ -52,6 +52,13 @@ on the night-sky gradient with no black box, the sky/ground gradient and clouds 
 logos, and Slate text draws its real glyph coverage. A default-launch title-screen sample goes from
 a handful of flat colours to **66,460 distinct colours**.
 
+`assets/screenshots/oregon-trail-title-screen.png`, `…-gameloft-splash.png` and
+`…-health-warning.png` are all re-captured from a default-environment run on the fixed build.
+`…-legal-popup.png` is **not** — it is a pre-fix capture and still shows the blocky text; four dense
+arms (0.5 s sampling) all reached the Gameloft splash by 2.0 s without catching the popup, so it was
+dropped from `COMPATIBILITY.md`'s gallery rather than shipped alongside three corrected frames. The
+file is kept because the earlier sections above cite it.
+
 ## Where it stood earlier on 2026-08-05
 
 The startup sequence now runs **past** the EULA stage. On a default launch the title presents, in
