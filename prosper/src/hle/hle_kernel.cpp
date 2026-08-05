@@ -408,8 +408,15 @@ namespace {
     // cannot express that: the unlocking thread's loads of the two can straddle a writer's acquire,
     // and no amount of re-checking fixes it, because a re-check is an ABA test — it distinguishes
     // "an owner is here now" from "no owner", never "an owner came and went". See rw_release.
-    //   bit 63      WRITE  — a write hold is outstanding; `owner` names the thread holding it
-    //   bits 0..31  COUNT  — outstanding acquisitions (each reader 1, a writer 1)
+    //   bit 63       WRITE — a write hold is outstanding; `owner` names the thread holding it
+    //   bits 32..62  must remain ZERO — see the static_assert below
+    //   bits 0..31   COUNT — outstanding acquisitions (each reader 1, a writer 1)
+    //
+    // A NON-OWNER CAN NEITHER SET NOR CLEAR BIT 63, which is what makes every claim below hold
+    // rather than merely being likely: the write path runs only behind an exclusive host lock, the
+    // write branch of rw_release is gated on `owner == self`, and the reader path's `s - 1` is
+    // guarded by `(s & kRwCount) != 0` so it can never borrow out of bit 31 into the flag space.
+    // A write hold therefore cannot be stolen by anything.
     struct GuestRwlock {
         pthread_rwlock_t rw;
         std::atomic<uint64_t> state;   // WRITE | COUNT
@@ -417,6 +424,14 @@ namespace {
     };
     constexpr uint64_t kRwWrite = 1ull << 63;
     constexpr uint64_t kRwCount = 0xffffffffull;
+    // The gap between COUNT and WRITE is unused and MUST stay that way: the layout has no
+    // structural defence, so an arithmetic edit written without the guards above (a bare `s + 1`,
+    // or widening COUNT) walks straight into the flag space and silently turns a hold count into a
+    // write hold. Nothing reachable spills into these bits today — COUNT is bounded by the number
+    // of concurrent guest holds — and this assert is the reminder, not the protection.
+    static_assert((kRwWrite & kRwCount) == 0, "the WRITE flag must not overlap the hold count");
+    static_assert(kRwCount == 0xffffffffull && kRwWrite == (1ull << 63),
+                  "bits 32..62 are reserved and must remain zero");
     GuestRwlock* guest_rwlock_create() {
         void* mem = calloc(1, sizeof(GuestRwlock));
         if (!mem) return nullptr;
@@ -872,6 +887,10 @@ namespace {
                                    return e ? atoi(e) : 0; }();
         return lvl;
     }
+    // Under this hatch the accounting is KNOWINGLY UNSOUND, and that is the point: a refused unlock
+    // is forwarded to the host lock anyway while COUNT keeps its value, so COUNT stops tracking the
+    // outstanding host holds and later EPERMs and hangs are the reproduction, not new bugs. It
+    // exists so the A/B that established #2012 stays runnable. Never diagnose under it.
     bool rwlock_unsafe_unlock() {
         static const bool on = getenv("PROSPER_RWLOCK_UNSAFE_UNLOCK") != nullptr;
         return on;
@@ -914,16 +933,24 @@ namespace {
     //
     // Reaching that needs S to be interrupted inside two ~2-instruction gaps, so a clean stress run
     // does not refute it — which is exactly why it must be closed by construction rather than by
-    // testing. Folding WRITE into the counted word does that: the write flag is part of the value
-    // the compare-exchange compares, so a reader-path decrement can never commit against a word
-    // that has WRITE set, and step 8's CAS fails instead of succeeding. `owner` is consulted ONLY
-    // when WRITE is set, and WRITE is set and cleared by the owner while it holds the host lock
-    // exclusively, so a stale read of `owner` cannot decide anything on its own.
+    // testing. Folding WRITE into the counted word does that, and it kills the trace at step 4
+    // rather than step 8: W' publishes `WRITE|1`, so S's load sees bit 63 and takes the write
+    // branch, where `owner != self` refuses it. Even holding a reader-era `s`, S's CAS compares the
+    // whole 64-bit value against one that now reads `WRITE|1` — never equal — so it re-reads and
+    // re-decides. There is no interleaving in which a reader-path decrement commits against a
+    // write-held lock.
     void rw_acquired(GuestRwlock* g, bool write) {
         if (!write) { g->state.fetch_add(1, std::memory_order_acq_rel); return; }
-        // Publish the owner before WRITE becomes visible: anything that observes WRITE through the
-        // release-CAS below also observes this store.
+        // The owner store is sequenced-before the acq_rel CAS below, so any thread that observes
+        // WRITE through an acquire load of `state` has synchronized-with that CAS and therefore
+        // sees THIS owner value. That pairing — not any claim that `owner` is stable — is what
+        // makes reading `owner` before the CAS in rw_release sound; `owner` is genuinely NOT
+        // stable, because this store runs for the next writer before its WRITE becomes visible.
         g->owner.store(rw_self_tid(), std::memory_order_release);
+        // `s` is 0 here, and the tight reason is worth recording: COUNT > 0 while the host lock is
+        // acquirable would require a host-side release that did not decrement COUNT, and the only
+        // construct that produces one is the PROSPER_RWLOCK_UNSAFE_UNLOCK escape hatch. The CAS
+        // loop rather than a plain store is a cheap concession to that hatch and to future callers.
         uint64_t s = g->state.load(std::memory_order_acquire);
         while (!g->state.compare_exchange_weak(s, (s | kRwWrite) + 1,
                                                std::memory_order_acq_rel,
@@ -936,7 +963,12 @@ namespace {
         uint64_t s = g->state.load(std::memory_order_acquire);
         for (;;) {
             if (s & kRwWrite) {
-                // Only the owner may release a write hold (FreeBSD checks this in libthr).
+                // Only the owner may release a write hold (FreeBSD checks this in libthr). Reading
+                // `owner` before the CAS is sound by release/acquire pairing, not by stability: the
+                // acquire load of `state` that produced this WRITE synchronizes-with the owner's
+                // acq_rel CAS in rw_acquired, which its `owner.store(release)` is sequenced-before,
+                // so the value read here is that writer's. Read-read coherence also rules out the
+                // tid-reuse case — a later `owner` value cannot be observed before an earlier one.
                 if (g->owner.load(std::memory_order_acquire) != self) return EPERM;
                 // Clear WRITE and drop the count in ONE commit. Decrement-if-positive, so a count
                 // that somehow reached 0 cannot wrap to 4 billion and refuse every future unlock.
@@ -950,9 +982,19 @@ namespace {
                 return 0;
             }
             if ((s & kRwCount) == 0) return EPERM;         // nothing held: refuse, lock untouched
+            // A read hold is released, and it need not be THIS thread's — nor even the same hold
+            // that was outstanding when `s` was loaded. That residual ABA is unobservable rather
+            // than merely tolerable: COUNT is a pure counter with no identity, nothing downstream
+            // of this CAS reads the value of `s`, and the caller forwards exactly one host unlock.
+            // The invariant that matters is COUNT == outstanding host holds, and a steal preserves
+            // it exactly — glibc goes N -> N-1 either way, and *which* reader was robbed is not a
+            // distinction this system can express. The robbed reader's own release then finds COUNT
+            // one short, takes a spurious EPERM and does NOT forward, so glibc lands at 0 rather
+            // than negative. (FreeBSD accepts the same unlock, but that is a coincidence of a
+            // matching design, not the reason this is safe — do not reason from it.)
             if (g->state.compare_exchange_weak(s, s - 1, std::memory_order_acq_rel,
                                                std::memory_order_acquire))
-                return 0;                                  // a read hold released (any thread may)
+                return 0;
         }
     }
     // One counter per report KIND: a flood of one must not consume another's budget (the trap this
