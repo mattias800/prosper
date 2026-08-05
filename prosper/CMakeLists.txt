@@ -1005,6 +1005,11 @@ if(TARGET prosper_core)
   add_executable(test_x86_read_decode tests/test_x86_read_decode.cpp)
   add_test(NAME x86_read_decode COMMAND test_x86_read_decode)
 
+  # #2018: a fatal worker-thread fault report must describe one fault. Header-only snapshot of the
+  # handler's own siginfo/ucontext; POSIX signal contexts only (the test self-skips elsewhere).
+  add_executable(test_fault_context tests/test_fault_context.cpp)
+  add_test(NAME fault_context COMMAND test_fault_context)
+
   # End-to-end AGC submit plus fixed args 7-9 in ReleaseMem/WaitRegMem. This is cross-platform so
   # Windows validates the real fence builders behind the generated import-ABI conformance test.
   add_executable(test_agc_submit tests/test_agc_submit.cpp)
