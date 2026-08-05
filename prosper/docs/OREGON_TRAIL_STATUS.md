@@ -2,16 +2,46 @@
 
 Unreal Engine 4. **Rung 1 — real graphics.** Since #1933 landed the ErrorDialog foreground
 lifecycle, the title renders its startup legal/EULA popup (`WBP_System_Disclaimer_Popup`) at native
-3840x2160 from the live renderer, then **dies within ~4-6 s** on a corrupted guest heap. Tracked on
+3840x2160 from the live renderer. Tracked on
 [#1606](https://github.com/mattias800/prosper/issues/1606) and
-[#1641](https://github.com/mattias800/prosper/issues/1641); the crash that now bounds every run is
-[#1945](https://github.com/mattias800/prosper/issues/1945).
+[#1641](https://github.com/mattias800/prosper/issues/1641).
+
+## Where it stands (2026-08-05)
+
+The startup sequence now runs **past** the EULA stage. On a default launch the title presents, in
+order: the legal popup, the **Gameloft splash** (`assets/screenshots/oregon-trail-gameloft-splash.png`),
+one corrupted blue/magenta frame, and the **health/epilepsy warning screen**
+(`assets/screenshots/oregon-trail-health-warning.png`) — then **stalls with the frame counter frozen**
+(frame 252 and frame 396 in two arms), immediately after:
+
+```text
+[agc] ordered DMA submit rejected: Jump reads target/predication memory after retained DMA (order=…)
+[agc] ordered DMA submit not executed: unsupported eager/deferred guest-memory dependency
+```
+
+That rejected submit is the current frontier — a *hang*, not a fault. Three of four arms on
+`ff72e77c` + the mutex-encoding fix reached it and survived their whole 12 s bound; one hit #1945
+instead, so **#1945 is no longer what bounds every run** (1 of 4 here, against 3 of 4 in the
+2026-08-04 census).
+
+What unblocked the EULA stage was **not** a graphics or a heap change. `scePthreadMutex{Lock,
+Trylock,Timedlock}` returned the bare FreeBSD errno while the Sony contract is the libkernel-encoded
+`SCE_KERNEL_ERROR_*` form, and the shipped guest `libc.prx` compares against the encoded constants
+exactly (`_Mtx_trylock` → `0x80020010`, `_Mtx_lock` → `0x8002000b`, `_Mtx_timedlock` →
+`0x8002003c`). An unrecognised value becomes Dinkumware `_Thrd_error`, and `std::_Throw_C_error(4)`
+raises an **uncaught** `std::system_error("invalid argument")`. On master the title died on that
+`std::terminate` ~2 s in, deterministically (4/4 arms), with a black frame — the popup was no longer
+being reached at all. See `## Ruled out`.
+
+Two further defects remain visible in the new frames: the corrupted blue/magenta frame between the
+splash and the warning, and #1946 (Slate glyphs draw as solid blocks — clearly legible in the
+warning screen capture).
 
 Read `## Ruled out` before forming a hypothesis. Several separate leads on this title have been
 measured and killed, including the GPU-side questions and the two service candidates that the issue
 body originally called highest-value.
 
-## Where it stands after #1933 (2026-08-04)
+## Historical — where it stood after #1933 (2026-08-04)
 
 The black-frame era is over. On master `9dcb6c4b` the default environment
 (`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1`, no diagnostics, no
@@ -155,6 +185,8 @@ re-derive these without contradictory new evidence.
 | The asset load trace proves the guest reached `Create` / `AddToViewport` on the splash and EULA widgets | **Falsified by a control arm — those loads are package dependencies, not execution.** `tools/re/pak_index.py --distinct` over the shipped-master run resolves `WBP_Splash_Gameloft`, `BP_EULA_Controller`, `WBP_System_Disclaimer_Popup`, `WBP_EULA_NotificationScroll_Popup` and the `T_Logo_*` atlas — and the **pre-#1933 control arm loads the identical set at the identical ordinals** (lines 2190-2239 of both traces) over a run **12x longer**, while never reaching the popup. `L_GameloftSplash.umap`'s import table pulls those classes when the map loads, before any Blueprint gate runs. What *does* discriminate is `FF_Exo2_Bold.ufont`, `FF_PressStart2P_Condensed.ufont` and `icudt64l/brkitr/line.brk`: Slate loads a font and the ICU break iterator only when it lays text out, and only the shipped-master arm loads them (3 assets present in A and absent from B; B's 486 extra assets are streamed `.vaff` audio from its longer run). **A class load is not an instantiation.** Any load-trace progression claim needs a duration-matched or longer control. | this doc, #1606 |
 | The 4K `R16G16B16A16_SFLOAT` "surface with no producer" is a renderer or base-pass defect | **Resolved, not by GPU work.** It was the scene target of a frame whose only content is a UMG popup, in a process still gated on account login. With the gate open the same code path renders 4,009,938 non-black pixels. Do not reopen the producer question. | this doc, #1933 |
 | `PROSPER_FAULT_SKIP` over the corrupt free-list pop is a usable workaround for #1945 | **Falsified.** `PROSPER_FAULT_SKIP=0x14600df:0x14600f3` (the allocator's own general-allocator fallback) does survive the pop, but the run then wedges — `frame_seq` frozen at 223 from 6 s to 33 s, frames black — and dies in `std::terminate`'s `ud2` at `0x5c00359af` on a worker. The corruption is upstream and must be fixed at its source. | #1945 |
+| #1944 (the reserved-range lazy-commit handler zero-filling a guest page) is the same bug as #1945, or is what corrupts the free list here | **Falsified on this title.** `[lazy-commit]` is printed unconditionally by `exec_image_linux.cpp`, so every run reports it. Across **ten** `PPSA19244` arms on 2026-08-05 — three default render arms on `ff72e77c`, three with the mutex-encoding fix, four with `PROSPER_FAULTMEM`/`PROSPER_PEEK` — the count is **0 in every single one**, including the arms that faulted at `eboot+0x14600df` / `eboot+0x146027d` on `0x30016000`. The handler never fires on this title, so it cannot be the writer. This agrees with the third ArcRunner row already recorded there (its `0x30016000` arm also had no lazy-commit line, while both `addr=(nil)` arms did). Do not merge the two issues. | #1945, #1944 |
+| The `std::system_error("invalid argument")` / `std::terminate` face is guest heap corruption, or the same defect as #1945 | **Falsified — it is prosper's own error encoding, and it is fixed.** `scePthreadMutexTrylock` returned the bare FreeBSD `EBUSY` (16); the shipped `libc.prx` `_Mtx_trylock` (export `k6pGNMwJB08` at `libc.prx+0x5ef0`) compares the result against `0x80020010` and maps anything else non-zero to Dinkumware `_Thrd_error` (4), which `std::_Throw_C_error` turns into an uncaught `std::system_error`. Encoding the Sony spellings flipped the named check `Terminating due to uncaught exception 'invalid argument: invalid argument'` from **3/3 present to 0/3**, in the same binary and environment, and the title went from a black frame at frame 5 to the Gameloft splash and the health warning. `_Mtx_lock` (`0x8002000b`) and `_Mtx_timedlock` (`0x8002003c`) carry the same contract; `_Mtx_unlock` and `_Cnd_wait` discard the result entirely. | #1945, #1612 |
 | PlayGo `GetLocus` is a sustained chunk-0 poll or progression gate | **Falsified; the earlier rate interpretation was an instrumentation mistake.** The retained trace's 1,000 calls carry chunk IDs **0, 1, 2, …, 999 exactly once**, with no reset. Guest code at `0x13f28a4` is a bounded startup cache-population loop: it calls `GetLocus` for each ID, stores only successful `LOCAL_FAST` (`3`) results, cleanly skips absent IDs, stops at `0x3e8`, and sets its initialized byte at `0x13f29e7`. Chunk 0 succeeds and the remaining nonexistent IDs fail as expected. This is neither periodic polling nor a wait for those IDs to become local; changing PlayGo behaviour is not justified. | #1606, #1641 |
 
 **Note on the Asterix figure.** 4.00 is the #1641 census number — *decoded* draws per frame, realized
@@ -265,6 +297,19 @@ the same thing, and do not treat either as superseding the other until that is c
   `mov %fs:0x0`; at `eboot+0x14600df` `rax` is the guest allocator's per-thread bin-array base
   (`0x30209c0000` / `0x3020140000` in the two observed instances). Do not open a #1155-class
   investigation from it without an independent `%fs` witness.
+* **A guest `std::terminate` is worth one disassembly pass before it is treated as heap damage.**
+  For an *uncaught* exception the C++ runtime calls `std::terminate` from `__cxa_throw` **without
+  unwinding**, so prosper's own frame-pointer walk at the `ud2` still carries the throwing stack.
+  Here that walk named `eboot+0x4ca716c`, three instructions of disassembly identified the shipped
+  "throw unless the result is 0 or `ignore`" helper, and the two PLT slots resolved through
+  `self_dump`'s `DT_JMPREL`/`DT_PLTGOT` to `_Mtx_trylock` and `std::_Throw_C_error`. That is the
+  whole distance from "the guest terminated" to "prosper returned the wrong error encoding" — no
+  live instrument, no re-boot. The recipe is reusable: read the PLT thunk's
+  `jmp QWORD PTR [rip+…]` target, subtract `DT_PLTGOT`, `/8`, `-3` for the relocation index, and
+  index `DT_JMPREL` to get the NID, then resolve it in `../PS5-3.20_Libs/`.
+* `PROSPER_PEEK` produced **no output** on the `WORKER-THREAD FAULT` path in four armed arms. It is
+  consumed by the primary-thread fault report only, so a zero from it on a worker fault is void, not
+  a negative. `PROSPER_FAULTMEM` does print on the worker path.
 * In a 5-second arm that provably decoded and realized draws (32 `CB_COLOR_CONTROL` diagnostics, a
   folded `WaitRegMem`, and rendered popup frames in the sibling arms), `PROSPER_RTT_TIMING=1` emitted
   **zero** `[rtt-timing]` lines. If a draw census depends on that stream, confirm it emits inside your

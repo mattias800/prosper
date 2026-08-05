@@ -40,7 +40,7 @@ Last updated: 2026-08-05
 | *Asterix &amp; Obelix: Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🚧 Logo movies, intro cutscene, and title menu | [#1884](https://github.com/mattias800/prosper/issues/1884) |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Startup fault before title | [#1810](https://github.com/mattias800/prosper/issues/1810) |
 | *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Title screen and EULA | [#1885](https://github.com/mattias800/prosper/issues/1885) |
-| *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🚧 Startup legal popup; heap fault ends the run | [#1886](https://github.com/mattias800/prosper/issues/1886) |
+| *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🚧 Legal popup, Gameloft splash and health warning; stalls before the title screen | [#1886](https://github.com/mattias800/prosper/issues/1886) |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ First-level gameplay | [#1887](https://github.com/mattias800/prosper/issues/1887) |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ First nursery level | [#1888](https://github.com/mattias800/prosper/issues/1888) |
 | *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 First playable scene | [#1811](https://github.com/mattias800/prosper/issues/1811) |
@@ -233,8 +233,10 @@ The warning screen, publisher logo, title screen, and EULA render at native 3840
 ## The Oregon Trail — `PPSA19244`
 
 <p align="center"><img src="assets/screenshots/oregon-trail-legal-popup.png" alt="The Oregon Trail — startup legal/EULA popup"></p>
+<p align="center"><img src="assets/screenshots/oregon-trail-gameloft-splash.png" alt="The Oregon Trail — Gameloft splash"></p>
+<p align="center"><img src="assets/screenshots/oregon-trail-health-warning.png" alt="The Oregon Trail — health/epilepsy warning screen"></p>
 
-The startup legal popup renders at native 3840×2160; text glyphs currently draw as solid blocks, and a guest heap fault ends the run a few seconds later. See the [tracker](https://github.com/mattias800/prosper/issues/1886).
+The startup sequence renders at native 3840×2160 and now runs past the EULA stage: the legal popup, the Gameloft splash, then the health/epilepsy warning screen. It stalls there, before the title screen, on an AGC ordered-DMA submit prosper declines to execute. Text glyphs still draw as solid blocks. See the [tracker](https://github.com/mattias800/prosper/issues/1886).
 
 ## Greak: Memories of Azur — `PPSA02849`
 
