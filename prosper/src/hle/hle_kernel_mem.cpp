@@ -1418,7 +1418,13 @@ namespace { bool amprlog() { static int v = getenv("PROSPER_AMPRLOG") ? 1 : 0; r
 // with (req, cbSize, 0, cbBuf, poolCtx, 3) — the actual read COMMAND (file offset / dest / size)
 // lives inside cbBuf (the "CB offset 40" of the guest's error message is a byte offset into it).
 // Exposed so the read-submit HLE can locate and decode the real command. CONFIDENCE: MED.
-uint64_t g_apr_last_cb = 0, g_apr_last_cb_size = 0;
+//
+// Atomic because GetSize now reads them as a PAIR — it serves g_apr_last_cb_size only when a0
+// matches g_apr_last_cb — and both are written from arbitrary guest threads. A torn read that
+// matched a freshly stored cb against the previous size would hand that cb a too-small capacity,
+// which is precisely the failure this fix exists to remove. Relaxed is enough: the pair is a hint,
+// nothing is published through it, and a stale-but-consistent read is harmless.
+std::atomic<uint64_t> g_apr_last_cb{0}, g_apr_last_cb_size{0};
 // Per-cb capacity, recorded at init (issue #208 follow-up). Live-captured init flavors carry the
 // size in different args: the APR read flow uses a1; Pathless's IoStore batch uses a2=0x560; and
 // DOLL's IoStore batch uses a5=0x720. The
