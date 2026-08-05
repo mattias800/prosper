@@ -22,7 +22,7 @@ Last updated: 2026-08-05
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 Frontend loop; no visual milestone yet | [#1871](https://github.com/mattias800/prosper/issues/1871) |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🔬 4K opening logo sequence; frames stop before the title screen | [#1891](https://github.com/mattias800/prosper/issues/1891) |
-| *Sonic Racing: CrossWorlds* | `PPSA08804` | — | 🔬 Initial compatibility run pending | [#1895](https://github.com/mattias800/prosper/issues/1895) |
+| *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K SEGA logo; the composite goes uniform before a title screen | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and main menu | [#1873](https://github.com/mattias800/prosper/issues/1873) |
@@ -117,9 +117,12 @@ A default launch reaches the game's own opening logo sequence, composited by the
 
 ## Sonic Racing: CrossWorlds — `PPSA08804`
 
-The Unreal Engine 5 guest completes core initialization and then stalls: its `IoService` thread spins on an
-IoStore command-buffer capacity query and no frame is produced. No visual compatibility milestone is claimed
-yet. See the [tracker](https://github.com/mattias800/prosper/issues/1895).
+<p align="center"><img src="assets/screenshots/sonic-crossworlds-sega-logo.png" alt="Sonic Racing: CrossWorlds — SEGA logo"></p>
+
+A default launch reaches the game's SEGA logo, composited by the live renderer at 3840×2160. The
+engine keeps producing frames afterwards, but the composite becomes a single uniform colour before a
+title screen is reached. See [`docs/SONIC_CROSSWORLDS_STATUS.md`](prosper/docs/SONIC_CROSSWORLDS_STATUS.md)
+and the [tracker](https://github.com/mattias800/prosper/issues/1895).
 
 ## Terminator 2D: NO FATE — `PPSA25872`
 

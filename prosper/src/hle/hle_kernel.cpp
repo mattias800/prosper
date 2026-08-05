@@ -793,11 +793,127 @@ HLE(k_rwlock_init) {
     return 0;
 }
 HLE(k_rwlock_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_rwlock_destroy((pthread_rwlock_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
-HLE(k_rwlock_rdlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_rdlock(rw); return 0; }
-HLE(k_rwlock_wrlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_wrlock(rw); return 0; }
-HLE(k_rwlock_unlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_unlock(rw); return 0; }
-HLE(k_rwlock_tryrdlock){ auto* rw = ensure_rwlock(a0); return rw ? (uint64_t)pthread_rwlock_tryrdlock(rw) : 0x16; }
-HLE(k_rwlock_trywrlock){ auto* rw = ensure_rwlock(a0); return rw ? (uint64_t)pthread_rwlock_trywrlock(rw) : 0x16; }
+// An UNMATCHED unlock must never reach the host lock (#2012).
+//
+// FreeBSD's pthread_rwlock_unlock — the contract the guest was built against — returns EPERM and
+// leaves the lock untouched when the calling thread holds neither a read nor a write hold. glibc's
+// is *undefined* for that case, and what it actually does is unrecoverable: with the lock in read
+// phase it takes the reader-release path and subtracts one reader from `__readers`, so an unmatched
+// unlock drives the reader count NEGATIVE. Every later writer then blocks forever waiting for a
+// reader population that can never drain, and every later reader inherits a corrupt lock. There is
+// no error, no signal, and no way back — one stray unlock permanently bricks that rwlock.
+//
+// Measured on Sonic Racing: CrossWorlds (PPSA08804, UE5): the guest's own main thread parks in
+// pthread_rwlock_wrlock forever while the host lock reads __readers = 0xfffffff2 — WRLOCKED set and
+// a reader count of exactly -2, i.e. two more read-unlocks than read-locks. Nothing else in the
+// 64-thread process is spinning; the whole engine is waiting on that one thread.
+//
+// So prosper tracks each thread's own holds and answers an unmatched unlock the way the hardware
+// does. The bookkeeping is thread-local (a thread can only release what IT holds), so there is no
+// added contention on the lock path. PROSPER_RWLOCKLOG=1 reports every refusal (and, at level 2,
+// every rwlock operation); PROSPER_RWLOCK_UNSAFE_UNLOCK=1 restores the old forwarding so the A/B
+// that established this stays reproducible.
+namespace {
+    struct GuestRwHold { pthread_rwlock_t* rw; uint32_t reads; uint32_t writes; };
+    // Small by construction: a thread holds a handful of rwlocks at once, never hundreds.
+    thread_local std::vector<GuestRwHold> g_rw_holds;
+    int rwlocklog() {
+        static const int lvl = []{ const char* e = getenv("PROSPER_RWLOCKLOG");
+                                   return e ? atoi(e) : 0; }();
+        return lvl;
+    }
+    bool rwlock_unsafe_unlock() {
+        static const bool on = getenv("PROSPER_RWLOCK_UNSAFE_UNLOCK") != nullptr;
+        return on;
+    }
+    GuestRwHold* rw_find_hold(pthread_rwlock_t* rw) {
+        for (auto& h : g_rw_holds) if (h.rw == rw) return &h;
+        return nullptr;
+    }
+    void rw_note_locked(pthread_rwlock_t* rw, bool write) {
+        if (auto* h = rw_find_hold(rw)) { if (write) h->writes++; else h->reads++; return; }
+        g_rw_holds.push_back(GuestRwHold{rw, write ? 0u : 1u, write ? 1u : 0u});
+    }
+    // false = this thread holds nothing on `rw`, so the unlock is unmatched. A hold that reaches
+    // zero is dropped, so the vector stays bounded by the locks a thread holds AT ONCE rather than
+    // by how many distinct rwlocks it has ever touched (this is a hot path in an engine).
+    bool rw_note_unlocked(pthread_rwlock_t* rw) {
+        for (size_t i = 0; i < g_rw_holds.size(); i++) {
+            auto& h = g_rw_holds[i];
+            if (h.rw != rw) continue;
+            if (h.reads == 0 && h.writes == 0) return false;
+            if (h.writes) h.writes--; else h.reads--;
+            if (h.reads == 0 && h.writes == 0) {
+                h = g_rw_holds.back();
+                g_rw_holds.pop_back();
+            }
+            return true;
+        }
+        return false;
+    }
+    // A lock call that FAILED must not be recorded as a hold, and it is worth saying so: the guest
+    // was told success by the handlers below, which is how an unmatched unlock can originate here
+    // rather than in the guest.
+    void rw_report(const char* what, uint64_t slot, pthread_rwlock_t* rw, int rc) {
+        static std::atomic<int> printed{0};
+        const int n = printed.fetch_add(1);
+        if (n >= 64 && (n & (n - 1)) != 0) return;   // first 64, then powers of two
+        fprintf(stderr, "[rwlock] %s slot=0x%llx rw=%p rc=%d tid=%llu #%d\n", what,
+                (unsigned long long)slot, (void*)rw, rc,
+                (unsigned long long)(uintptr_t)pthread_self(), n);
+    }
+}
+HLE(k_rwlock_rdlock)  {
+    auto* rw = ensure_rwlock(a0);
+    if (!rw) return 0;
+    const int rc = pthread_rwlock_rdlock(rw);
+    if (rc == 0) rw_note_locked(rw, false);
+    else rw_report("rdlock FAILED (no hold recorded)", a0, rw, rc);
+    if (rwlocklog() >= 2) rw_report("rdlock", a0, rw, rc);
+    return 0;
+}
+HLE(k_rwlock_wrlock)  {
+    auto* rw = ensure_rwlock(a0);
+    if (!rw) return 0;
+    const int rc = pthread_rwlock_wrlock(rw);
+    if (rc == 0) rw_note_locked(rw, true);
+    else rw_report("wrlock FAILED (no hold recorded)", a0, rw, rc);
+    if (rwlocklog() >= 2) rw_report("wrlock", a0, rw, rc);
+    return 0;
+}
+HLE(k_rwlock_unlock)  {
+    auto* rw = ensure_rwlock(a0);
+    if (!rw) return 0;
+    if (!rw_note_unlocked(rw)) {
+        if (rwlocklog() || !rwlock_unsafe_unlock())
+            rw_report("UNMATCHED unlock: this thread holds no read or write hold — "
+                      "refused (FreeBSD returns EPERM); forwarding it would corrupt the lock",
+                      a0, rw, 0);
+        // POSIX spelling reports the bare errno; the Sony spelling is registered through
+        // SCE_PTHREAD_ALIAS below, which encodes it the way libkernel does (#1984's split).
+        if (!rwlock_unsafe_unlock()) return (uint64_t)EPERM;
+        pthread_rwlock_unlock(rw);   // PROSPER_RWLOCK_UNSAFE_UNLOCK=1: the pre-#2012 behaviour
+        return 0;
+    }
+    pthread_rwlock_unlock(rw);
+    if (rwlocklog() >= 2) rw_report("unlock", a0, rw, 0);
+    return 0;
+}
+HLE(k_rwlock_tryrdlock){
+    auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;
+    const int rc = pthread_rwlock_tryrdlock(rw);
+    if (rc == 0) rw_note_locked(rw, false);
+    return (uint64_t)rc;
+}
+HLE(k_rwlock_trywrlock){
+    auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;
+    const int rc = pthread_rwlock_trywrlock(rw);
+    if (rc == 0) rw_note_locked(rw, true);
+    return (uint64_t)rc;
+}
+// scePthreadRwlockUnlock reports the refusal in the libkernel encoding; the POSIX spelling keeps the
+// bare errno. Same split, and the same reason, as the mutex aliases above (#1984).
+SCE_PTHREAD_ALIAS(k_sce_rwlock_unlock, k_rwlock_unlock)
 HLE(k_rwlockattr_init) {
     if (!a0) return 0x16;
     auto* attr = (pthread_rwlockattr_t*)calloc(1, sizeof(pthread_rwlockattr_t));
@@ -1854,6 +1970,7 @@ HLE(k_rwlock_timedrdlock) {
     auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;   // EINVAL
     timespec dl = abs_deadline_us(a1);
     int rc = pthread_rwlock_timedrdlock(rw, &dl);
+    if (rc == 0) rw_note_locked(rw, false);   // record the hold so its unlock is not refused (#2012)
     // EAGAIN here means "too many concurrent readers"; unmapped it reached the guest as
     // FreeBSD EDEADLK, turning a retryable condition into a deadlock report (#1612).
     return fbsd_errno(rc);
@@ -1862,6 +1979,66 @@ HLE(k_rwlock_timedwrlock) {
     auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;   // EINVAL
     timespec dl = abs_deadline_us(a1);
     int rc = pthread_rwlock_timedwrlock(rw, &dl);
+    if (rc == 0) rw_note_locked(rw, true);    // record the hold so its unlock is not refused (#2012)
+    return fbsd_errno(rc);
+}
+// The POSIX spellings libScePosix exports alongside the Sony ones. They were NOT registered, so the
+// dispatcher answered its default 0 — "you hold the lock" — for a lock nobody took (#2012). That is
+// the silent-unsync class, and here it was also the *source* of the unmatched unlocks that corrupt
+// the host rwlock: Sonic Racing: CrossWorlds calls `pthread_rwlock_trywrlock` (`XhWHn6P5R7U`, one of
+// exactly 21 unimplemented NIDs in its boot), is told it succeeded, runs the critical section and
+// then unlocks a lock it never held.
+//
+// Two argument shapes, and they must NOT share a body:
+//   * scePthreadRwlockTimedrd/wrlock take a RELATIVE µs scalar   (handled above)
+//   * pthread_rwlock_timedrd/wrlock  take an ABSOLUTE timespec*  (POSIX, CLOCK_REALTIME)
+//   * pthread_rwlock_reltimedrd/wrlock_np take a RELATIVE timespec*
+// Aliasing the first two is the same defect the k_cond_timedwait note above records.
+namespace {
+    // Read a guest timespec; FreeBSD and Linux agree on {time_t tv_sec; long tv_nsec} for x86-64.
+    bool read_guest_timespec(uint64_t addr, timespec& out) {
+        if (!addr) return false;
+        const auto* ts = (const timespec*)(uintptr_t)addr;
+        out.tv_sec = ts->tv_sec;
+        out.tv_nsec = ts->tv_nsec;
+        return true;
+    }
+    timespec rel_to_abs(const timespec& rel) {
+        timespec now{};
+        clock_gettime(CLOCK_REALTIME, &now);
+        timespec dl{now.tv_sec + rel.tv_sec, now.tv_nsec + rel.tv_nsec};
+        if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+        return dl;
+    }
+}
+HLE(k_posix_rwlock_timedrdlock) {
+    auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;
+    timespec dl{}; if (!read_guest_timespec(a1, dl)) return 0x16;
+    const int rc = pthread_rwlock_timedrdlock(rw, &dl);
+    if (rc == 0) rw_note_locked(rw, false);
+    return fbsd_errno(rc);
+}
+HLE(k_posix_rwlock_timedwrlock) {
+    auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;
+    timespec dl{}; if (!read_guest_timespec(a1, dl)) return 0x16;
+    const int rc = pthread_rwlock_timedwrlock(rw, &dl);
+    if (rc == 0) rw_note_locked(rw, true);
+    return fbsd_errno(rc);
+}
+HLE(k_posix_rwlock_reltimedrdlock) {
+    auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;
+    timespec rel{}; if (!read_guest_timespec(a1, rel)) return 0x16;
+    timespec dl = rel_to_abs(rel);
+    const int rc = pthread_rwlock_timedrdlock(rw, &dl);
+    if (rc == 0) rw_note_locked(rw, false);
+    return fbsd_errno(rc);
+}
+HLE(k_posix_rwlock_reltimedwrlock) {
+    auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;
+    timespec rel{}; if (!read_guest_timespec(a1, rel)) return 0x16;
+    timespec dl = rel_to_abs(rel);
+    const int rc = pthread_rwlock_timedwrlock(rw, &dl);
+    if (rc == 0) rw_note_locked(rw, true);
     return fbsd_errno(rc);
 }
 // scePthreadSem* -- POSIX-style counting semaphores (DISTINCT from sceKernelCreateSema). Were MISSING ->
@@ -3426,9 +3603,17 @@ void register_kernel_hle() {
     R("scePthreadRwlockDestroy", k_rwlock_destroy);  R("pthread_rwlock_destroy", k_rwlock_destroy);
     R("scePthreadRwlockRdlock", k_rwlock_rdlock);    R("pthread_rwlock_rdlock", k_rwlock_rdlock);
     R("scePthreadRwlockWrlock", k_rwlock_wrlock);    R("pthread_rwlock_wrlock", k_rwlock_wrlock);
-    R("scePthreadRwlockUnlock", k_rwlock_unlock);    R("pthread_rwlock_unlock", k_rwlock_unlock);
+    R("scePthreadRwlockUnlock", k_sce_rwlock_unlock); R("pthread_rwlock_unlock", k_rwlock_unlock);
     R("scePthreadRwlockTryrdlock", k_rwlock_tryrdlock);
     R("scePthreadRwlockTrywrlock", k_rwlock_trywrlock);
+    // The POSIX spellings libScePosix exports. Unregistered they fell to the dispatcher's default 0,
+    // i.e. "the lock is yours" for a lock nobody took (#2012).
+    R("pthread_rwlock_tryrdlock", k_rwlock_tryrdlock);
+    R("pthread_rwlock_trywrlock", k_rwlock_trywrlock);
+    R("pthread_rwlock_timedrdlock", k_posix_rwlock_timedrdlock);      // ABSOLUTE timespec*
+    R("pthread_rwlock_timedwrlock", k_posix_rwlock_timedwrlock);      // ABSOLUTE timespec*
+    R("pthread_rwlock_reltimedrdlock_np", k_posix_rwlock_reltimedrdlock);   // RELATIVE timespec*
+    R("pthread_rwlock_reltimedwrlock_np", k_posix_rwlock_reltimedwrlock);   // RELATIVE timespec*
     R("scePthreadRwlockTimedrdlock", k_rwlock_timedrdlock);   // were MISSING -> faked "locked" without locking
     R("scePthreadRwlockTimedwrlock", k_rwlock_timedwrlock);
     R("scePthreadRwlockattrInit", k_rwlockattr_init);

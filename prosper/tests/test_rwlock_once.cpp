@@ -7,6 +7,7 @@
 #include "../src/hle/nid.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <ctime>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -49,6 +50,80 @@ int main() {
     CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0, "unlock after wrlock ok");
     CHECK(call1(RWtrywr, (uint64_t)(uintptr_t)&h) == 0, "trywrlock succeeds when free");
     call1(RWun, (uint64_t)(uintptr_t)&h);
+
+    // #2012: an UNMATCHED unlock — the calling thread holds neither a read nor a write hold — must
+    // be refused, not forwarded. FreeBSD (the guest's contract) returns EPERM and leaves the lock
+    // untouched; glibc's is undefined and subtracts a reader, driving the count NEGATIVE so the
+    // lock can never be write-acquired again. The lock still working afterwards is the assertion
+    // that matters: without the guard, `trywrlock` below sees a phantom reader and returns EBUSY.
+    const uint64_t unmatched = call1(RWun, (uint64_t)(uintptr_t)&h);
+    CHECK(unmatched == 0x80020001ull, "unmatched scePthreadRwlockUnlock returns encoded EPERM");
+    CHECK(call1(RWtrywr, (uint64_t)(uintptr_t)&h) == 0,
+          "the lock still write-acquires after an unmatched unlock (reader count not corrupted)");
+    call1(RWun, (uint64_t)(uintptr_t)&h);
+    // The POSIX spelling shares the body and keeps the bare errno (the #1984 split).
+    auto RWunPosix = Hle::lookup(nid_hash("pthread_rwlock_unlock"));
+    CHECK(RWunPosix != nullptr, "pthread_rwlock_unlock registered");
+    if (RWunPosix)
+        CHECK(call1(RWunPosix, (uint64_t)(uintptr_t)&h) == 1,
+              "unmatched pthread_rwlock_unlock returns bare EPERM");
+    // A read hold taken by THIS thread still releases normally afterwards.
+    CHECK(call1(RWrd, (uint64_t)(uintptr_t)&h) == 0, "rdlock ok after the refusals");
+    CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0, "matched unlock still returns success");
+
+    // #2012: libScePosix exports POSIX spellings of the try/timed acquisitions too. Unregistered,
+    // they fell to the dispatcher's default 0 — "the lock is yours" for a lock nobody took — which
+    // is how a guest ends up unlocking a lock it never held. They must exist AND really fail while
+    // the lock is write-held; a 0 here is the stub answer, not an acquisition.
+    auto RWtryrdP = Hle::lookup(nid_hash("pthread_rwlock_tryrdlock"));
+    auto RWtrywrP = Hle::lookup(nid_hash("pthread_rwlock_trywrlock"));
+    auto RWtimedrdP = Hle::lookup(nid_hash("pthread_rwlock_timedrdlock"));
+    auto RWtimedwrP = Hle::lookup(nid_hash("pthread_rwlock_timedwrlock"));
+    auto RWreltimedrdP = Hle::lookup(nid_hash("pthread_rwlock_reltimedrdlock_np"));
+    auto RWreltimedwrP = Hle::lookup(nid_hash("pthread_rwlock_reltimedwrlock_np"));
+    CHECK(RWtryrdP && RWtrywrP && RWtimedrdP && RWtimedwrP && RWreltimedrdP && RWreltimedwrP,
+          "POSIX rwlock try/timed spellings are registered (not the default-0 stub)");
+    if (RWtryrdP && RWtrywrP && RWtimedrdP && RWtimedwrP && RWreltimedrdP && RWreltimedwrP) {
+        // The write hold must belong to ANOTHER thread: a timed acquisition attempted by the thread
+        // that already holds the write lock reports EDEADLK, not ETIMEDOUT, so a same-thread arm
+        // would test the deadlock detector instead of the timeout path.
+        std::atomic<bool> held{false}, release{false};
+        std::thread holder([&]{
+            call1(RWwr, (uint64_t)(uintptr_t)&h);
+            held.store(true);
+            while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            call1(RWun, (uint64_t)(uintptr_t)&h);
+        });
+        for (int i = 0; i < 2000 && !held.load(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(held.load(), "helper thread holds the write lock for the POSIX try/timed arms");
+        CHECK(call1(RWtrywrP, (uint64_t)(uintptr_t)&h) != 0,
+              "pthread_rwlock_trywrlock FAILS while another thread write-holds (a 0 is the stub lie)");
+        CHECK(call1(RWtryrdP, (uint64_t)(uintptr_t)&h) != 0,
+              "pthread_rwlock_tryrdlock FAILS while another thread write-holds");
+        // POSIX timed variants take an ABSOLUTE timespec*; a deadline already in the past must time
+        // out rather than acquire. The Sony spellings take a RELATIVE microsecond scalar, so reading
+        // this argument the Sony way would dereference the pointer value as a µs count instead.
+        timespec past{};
+        clock_gettime(CLOCK_REALTIME, &past);
+        past.tv_sec -= 1;
+        CHECK(call2(RWtimedwrP, (uint64_t)(uintptr_t)&h, (uint64_t)(uintptr_t)&past) == 60,
+              "pthread_rwlock_timedwrlock with a past absolute deadline reports ETIMEDOUT(60)");
+        CHECK(call2(RWtimedrdP, (uint64_t)(uintptr_t)&h, (uint64_t)(uintptr_t)&past) == 60,
+              "pthread_rwlock_timedrdlock with a past absolute deadline reports ETIMEDOUT(60)");
+        // The _np variants take a RELATIVE timespec: zero means "do not wait".
+        timespec zero{0, 0};
+        CHECK(call2(RWreltimedwrP, (uint64_t)(uintptr_t)&h, (uint64_t)(uintptr_t)&zero) == 60,
+              "pthread_rwlock_reltimedwrlock_np with a zero relative timeout reports ETIMEDOUT(60)");
+        CHECK(call2(RWreltimedrdP, (uint64_t)(uintptr_t)&h, (uint64_t)(uintptr_t)&zero) == 60,
+              "pthread_rwlock_reltimedrdlock_np with a zero relative timeout reports ETIMEDOUT(60)");
+        release.store(true);
+        holder.join();
+        // The lock is free and undamaged once the helper releases it.
+        CHECK(call1(RWtrywrP, (uint64_t)(uintptr_t)&h) == 0,
+              "pthread_rwlock_trywrlock succeeds once the helper releases");
+        CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0, "unlock the write hold from the POSIX arms");
+    }
     call1(RWdes, (uint64_t)(uintptr_t)&h);
 
     // once: init runs exactly once no matter how many times it's called.
