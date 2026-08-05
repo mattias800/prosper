@@ -171,8 +171,12 @@ int main() {
             });
             while (!held.load(std::memory_order_acquire)) std::this_thread::yield();
             const uint64_t rc = mtx_timedlock((uint64_t)slot, 20000 /* µs */, 0, 0, 0, 0);
-            CHECK(rc == static_cast<uint64_t>(FreeBsdErrno::ETimedOut),
-                  "scePthreadMutexTimedlock expiry reports FreeBSD ETIMEDOUT (60), not host 110");
+            // #1945: the Sony spelling reports the libkernel-encoded form. The guest libc.prx's
+            // `_Mtx_timedlock` compares against 0x8002003c exactly; a bare 60 became `_Thrd_error`
+            // and threw. The FreeBSD numbering (60, not host 110) is still what gets encoded.
+            CHECK(rc == prosper::hle::kSceKernelErrorETIMEDOUT,
+                  "scePthreadMutexTimedlock expiry reports SCE-encoded FreeBSD ETIMEDOUT "
+                  "(0x8002003c), not host 110 and not a bare 60");
             release.store(true, std::memory_order_release);
             holder.join();
         } else {

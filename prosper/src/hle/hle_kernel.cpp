@@ -548,6 +548,34 @@ HLE(k_mutex_unlock)  {
     return mtx_report("unlock", a0, m, result);
 }
 
+// --- Sony vs POSIX failure encoding for the shared pthread bodies (#1945, family of #1612) -------
+// The handler bodies above are registered under BOTH spellings. They are not the same contract:
+//   * POSIX `pthread_mutex_trylock` returns the bare errno (EBUSY).
+//   * Sony's `scePthreadMutexTrylock` returns the libkernel-encoded SCE_KERNEL_ERROR_* form
+//     (0x8002_0000 | FreeBSD errno), the same encoding every sceKernel* entry point uses.
+// The shipped guest `libc.prx` proves the Sony side directly: its C11 `_Mtx_*`/`_Cnd_*` wrappers
+// call the scePthread* entry points and compare the result against the ENCODED constants —
+// `_Mtx_trylock` tests 0x80020010 (EBUSY), `_Mtx_lock` tests 0x8002000b (EDEADLK),
+// `_Mtx_timedlock`/`_Cnd_timedwait` test 0x8002003c (ETIMEDOUT), `_Cnd_timedwait` also tests
+// 0x80020001 (EPERM). A bare errno matches none of them, so the wrapper maps the result to
+// Dinkumware's `_Thrd_error` (4), and `std::_Throw_C_error(4)` raises an *uncaught*
+// std::system_error("invalid argument") that terminates the process. A perfectly ordinary
+// "the mutex was busy" therefore killed the guest.
+// CONFIDENCE: HIGH (guest disassembly of the shipped libc.prx is the primary evidence).
+namespace {
+    inline uint64_t sce_pthread_rc(uint64_t posix_rc) {
+        // Pass through success, and anything a body already encoded or that is not an errno.
+        if (posix_rc == 0 || (posix_rc & ~0xffull) != 0) return posix_rc;
+        return prosper::hle::sce_kernel_error(
+            static_cast<prosper::hle::FreeBsdErrno>(static_cast<uint32_t>(posix_rc)));
+    }
+}
+// One Sony-spelling alias per shared body: same behaviour, libkernel error encoding.
+#define SCE_PTHREAD_ALIAS(sce_name, posix_body) \
+    HLE(sce_name) { return sce_pthread_rc(posix_body(a0, a1, a2, a3, a4, a5)); }
+SCE_PTHREAD_ALIAS(k_sce_mutex_lock,    k_mutex_lock)
+SCE_PTHREAD_ALIAS(k_sce_mutex_trylock, k_mutex_trylock)
+
 // --- condition variables ---
 namespace {
     constexpr int32_t kSonyClockRealtime = 0;
@@ -1792,13 +1820,18 @@ static timespec abs_deadline_us(uint64_t usec) {
 // returning 0 only when actually locked. Was MISSING -> the generic stub returned 0 (= "lock held")
 // without taking the lock, so the guest ran its critical section unguarded (the heap/GC-corruption class
 // root-caused for null static locks). ETIMEDOUT -> FreeBSD 60 (fbsd_errno doesn't remap it).
+// scePthreadMutexTimedlock has no POSIX spelling registered, so it encodes in place. The shipped
+// guest libc.prx's `_Mtx_timedlock` compares this result against 0x8002003c (encoded ETIMEDOUT) and
+// maps anything else non-zero to Dinkumware `_Thrd_error`, which throws — so a plain 60 turned an
+// ordinary lock timeout into an uncaught std::system_error. Same contract as the mutex lock/trylock
+// aliases above (#1945).
 HLE(k_mutex_timedlock) {
-    auto* m = ensure_mutex(a0); if (!m) return 0x16;   // EINVAL
-    if (guest_mutex_self_deadlock(m)) return 11u;
+    auto* m = ensure_mutex(a0); if (!m) return prosper::hle::kSceKernelErrorEINVAL;
+    if (guest_mutex_self_deadlock(m)) return prosper::hle::kSceKernelErrorEDEADLK;
     timespec dl = abs_deadline_us(a1);
     int rc = pthread_mutex_timedlock(m, &dl);
     if (rc == 0) guest_mutex_acquired(m);
-    return fbsd_errno(rc);   // the table maps host ETIMEDOUT -> FreeBSD 60
+    return sce_pthread_rc(fbsd_errno(rc));   // the table maps host ETIMEDOUT -> FreeBSD 60
 }
 // scePthreadCondTimedwait(cond, mutex, SceKernelUseconds usec): the Sony 3rd arg is a RELATIVE µs scalar,
 // NOT an abstime pointer -> it must NOT be aliased to the POSIX k_cond_timedwait (which reads a2 as a
@@ -3370,8 +3403,10 @@ void register_kernel_hle() {
     R("scePthreadMutexattrDestroy", k_mutexattr_destroy);
     R("scePthreadMutexInit", k_mutex_init);
     R("scePthreadMutexDestroy", k_mutex_destroy);
-    R("scePthreadMutexLock", k_mutex_lock);
-    R("scePthreadMutexTrylock", k_mutex_trylock);
+    // Sony spellings report failure in the libkernel-encoded form; the POSIX aliases further down
+    // keep the bare errno. See sce_pthread_rc() above for the guest-side evidence (#1945).
+    R("scePthreadMutexLock", k_sce_mutex_lock);
+    R("scePthreadMutexTrylock", k_sce_mutex_trylock);
     R("scePthreadMutexTimedlock", k_mutex_timedlock);   // was MISSING -> faked "locked" without locking
     R("scePthreadMutexUnlock", k_mutex_unlock);
     R("scePthreadCondattrInit", k_condattr_init);
