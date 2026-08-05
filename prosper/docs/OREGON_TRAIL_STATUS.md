@@ -36,9 +36,11 @@ The chain, end to end:
 * prosper offered `0xA6D12629` **only for SDK version >= 13** (it was added for *Dragon Quest VII*,
   which asks for 13). **The Oregon Trail asks for version 12** — `[agc] register defaults requested
   for SDK version 12`, 8 of 8 arms — so its lookup missed, its RT0 blend write went out with offset
-  `0xffffffff`, and the command processor correctly dropped it as a nonexistent register (that is
-  the `[agc] out-of-range indirect reg write dropped … off=0xffffffff val=0xffffffff` line, whose
-  print is capped at four). `CB_BLEND0_CONTROL` therefore never left its default.
+  `0xffffffff`, and the command processor correctly dropped it as a nonexistent register.
+  `CB_BLEND0_CONTROL` therefore never left its default. (The run does print
+  `[agc] out-of-range indirect reg write dropped … off=0xffffffff val=0xffffffff`, which is the same
+  signature — but that print is capped at four lines and the #1264 unfilled-placeholder family shares
+  it, so treat it as consistent with this, not as the count. The register watch is the measurement.)
 * Measured, before: `PROSPER_REGWATCH=Cx:0x1E0` recorded **133 writes, every one `0x20010001`**
   (`ENABLE=0`), and `PROSPER_RTTLOG=1` recorded **0 of 1,231 draws with blending enabled.**
   After: `0x65010504` appears — `ENABLE=1`, `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` — and blend-enabled
