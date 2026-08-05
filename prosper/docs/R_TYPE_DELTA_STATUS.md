@@ -223,6 +223,7 @@ Two apparatus corrections belong with that table, because both produced wrong an
   line-flushing consumer added ~180 ms and the title *survived*; `PROSPER_FRAME_DUMPS=1` (24 MB BMP
   per frame) moved the fault from 0.386 s to 0.780 s. Any startup-timing number for this title taken
   with a verbose log is worthless — measure with the low-volume combination above.
+
 ## Why the user list is empty: it has exactly one producer, and no Sony API can reach it
 
 The first hypothesis any reader forms about #1746 is that prosper answers a **synchronous**
@@ -241,20 +242,33 @@ them, and the 3.20 firmware database resolves them:
 | `yH17Q6NWtVg` | `sceUserServiceGetEvent` | `s_user_getevent` | one `LOGIN(user 1)`, then `NO_EVENT` |
 
 `sceUserServiceGetLoginUserIdList`, `…GetUserName`, `…GetUserNumber`, `…GetForegroundUser` and the
-rest of the library are **not imported at all**, by the eboot or by `title_Release.prx` (which imports
-only 21 libc and 2 libkernel functions). No answer prosper could give them can reach this title.
+rest of the library are **not imported at all** — not by the eboot, and not by any of the title's 24
+PRXs, every one of which imports only `libc` and `libkernel`. No answer prosper could give them can
+reach this title.
 
 **The list is a `std::vector<User*>` at `eboot+0x6f41a8`** (`_M_start`; `_M_finish` at `+0x6f41b0`,
 `_M_end_of_storage` at `+0x6f41b8`, and the container object the reallocation helper `eboot+0x246b0`
-takes as `this` starts at `+0x6f41a0`). Its complete reference set, from `tools/re/xref.py`:
+takes as `this` starts at `+0x6f41a0`). Every reference to those four addresses, enumerated with
+`tools/re/xref.py` **and cross-checked against a full linear disassembly of the text segment**
+(`xref.py` does not decode `sub reg,[rip+d]`, `add [rip+d], imm8`, `cmp reg,[rip+d]` or an AVX store,
+and all four forms occur here — #2025):
 
 - **one producer** — `eboot+0x23690`, which `operator new`s a 0x78-byte user object, stores the
-  incoming user id at `[obj+0]`, opens a pad for it (`eboot+0x240a0`), and push-backs the pointer at
-  `eboot+0x237b0`. Its **only** caller is `eboot+0x23def`, the `eventType == 0` (LOGIN) arm of the
-  drain loop at `eboot+0x23dd0`, whose event source is the `sceUserServiceGetEvent` PLT stub at
-  `eboot+0x3509e0`.
-- **one clear** — `eboot+0x23640` (`_M_finish = _M_start`), which is `InputSystem::Init`.
-- **consumers only** everywhere else, including `eboot+0x24030`, the faulting one.
+  incoming user id at `[obj+0]`, opens a pad for it (`eboot+0x240a0` → `scePadOpen` at `+0x240c5`,
+  handle to `[obj+0x60]`), and push-backs the pointer at `eboot+0x237b0`. Its **only** caller is
+  `eboot+0x23def`, the `eventType == 0` (LOGIN) arm of the drain loop at `eboot+0x23dd0`, whose event
+  source is the `sceUserServiceGetEvent` PLT stub at `eboot+0x3509e0`.
+- **three ways to remove** and none to add — `InputSystem::Init`'s clear at `eboot+0x23640`
+  (`_M_finish = _M_start`), the erase-by-id helper `eboot+0x237e0` (`pop_back` at `+0x23834`), and
+  the `eventType == 1` (LOGOUT) arm inside `eboot+0x23860` (`pop_back` at `+0x23dac`).
+- **one static constructor** — `eboot+0x24790` (registered at `eboot+0x461200`) zeroes the whole
+  32-byte container with a single `vmovups`, which is why `_M_start` is NULL rather than stale.
+- **consumers** everywhere else, including `eboot+0x24030`, the faulting one.
+
+`_M_start` itself (`eboot+0x6f41a8`) is *written* by exactly two things: that static constructor, and
+the reallocation helper `eboot+0x246b0` — whose only two call sites are both **inside the producer**
+`eboot+0x23690`. So the faulting load at `eboot+0x2404e` cannot observe a non-NULL pointer until a
+LOGIN event has been drained. That is the whole argument, and it is a property of the binary.
 
 The drain loop runs on exactly one thread. `eboot+0x23860` (containing it) is called only from
 `eboot+0x49190`, which is called from `eboot+0x49070` — the INPUT worker body — and from
@@ -262,8 +276,8 @@ The drain loop runs on exactly one thread. `eboot+0x23860` (containing it) is ca
 code). `eboot+0x49070`'s first two actions are `vtbl[0](this)` and `vtbl[8](this, 0x190)`; vtable slot
 `eboot+0x411048` holds `eboot+0x23210` = `Sleep(ms)` → `eboot+0x19e0` → `sceKernelUsleep(ms * 1000)`.
 The
-thread entry `eboot+0x22f10` reaches that body in two instructions, so the 400 ms clock starts within
-microseconds of the `[thread] create … name=INPUT` line.
+thread entry `eboot+0x22f10` reaches that body immediately (four instructions, no branch), so the
+400 ms clock starts within microseconds of the `[thread] create … name=INPUT` line.
 
 So the vector cannot be non-empty before the worker's first drain, **whatever any Sony API returns**.
 That is a statement about the guest's call graph, not a measurement.
@@ -279,8 +293,8 @@ return sceUserServiceGetInitialUser(&g_initialUser);   // eboot+0x3509d0, g_init
 ```
 
 The initial user id is stored in `eboot+0x6f419c` — a **different** global from the vector. Its 24
-references live in five functions, and the two that identify themselves take it exactly where a user
-id belongs: `eboot+0x248f0` is the save-data path (`sceSaveDataDirNameSearch`, `sceSaveDataMount3`,
+references live in eight functions, and the two that identify themselves take it exactly where a
+user id belongs: `eboot+0x248f0` is the save-data path (`sceSaveDataDirNameSearch`, `sceSaveDataMount3`,
 `sceSaveDataUmount2`, `sceSaveDataDialogInitialize/Open`) and `eboot+0x29ab0` is the NP/UDS path
 (`sceNpUniversalDataSystemInitialize/Terminate`). None of the five touches the vector.
 
@@ -309,9 +323,12 @@ above (~17 ms inside a 244 ms load) appears to close it, but that census — and
 number in this document — was taken with the dump already resident. That mechanism is
 real, and it is worth more than the deficit: evicting *only this dump's* pages makes the same
 unmodified binary, on the same host, **boot**. `tools/dropcache.py` is the instrument —
-`posix_fadvise(POSIX_FADV_DONTNEED)` over the named tree, unprivileged, scoped to those files so no
-other agent's working set is disturbed, and it reports `mincore(2)` residency **before and after** so
-a cold arm can prove it was cold.
+`posix_fadvise(POSIX_FADV_DONTNEED)` over the named tree, unprivileged, and touching nothing *outside*
+those files (unlike `/proc/sys/vm/drop_caches`, which drops the whole machine's cache). It is **not**
+free of cross-lane effects: the page cache is global, so evicting a shared dump evicts it for every
+process on the host, and pointing it at a tree another lane is timing silently invalidates their run.
+Say what you are evicting first. It reports `mincore(2)` residency **before and after** so a cold arm
+can prove it was cold.
 
 Every arm below is `boot_trace`, default route (`PROSPER_GUEST_FS=1
 PROSPER_GUEST_ARGS=-force-gfx-direct`), low-volume timeline (`PROSPER_SYNCLOG=1` +
@@ -338,28 +355,41 @@ faults on the first common update after `DLLInit`. Five warm arms land at 289–
 fault**; five cold arms land at 779–1158 ms and **none does**. The deficit on a contended host is
 **38–111 ms**; the CPU-contention section above measured **95–145 ms** on an idle one.
 
-**The lowest-load arms are the decisive pair**, because CPU contention is the standing confound for
-this title — a passing run under load may be passing because a peer lane is compiling. Warm E ran at
-load 13.4 and faulted; cold E ran at load 14.7, i.e. *more* contended, and booted. Cold D likewise
-booted while its load fell from 26.5, and both cold arms carry `mincore` proof that the pages really
-were gone (179.0 → 0.0 MB, 119.7 → 0.0 MB) and were pulled back from storage by the run itself
-(119.7 MB resident again afterwards). The lever is the cache, not the load.
+**What makes this an A/B rather than a coincidence** is that the arms were interleaved, the two
+populations do not overlap at all (289–362 ms against 779–1158 ms), and the outcome agrees with the
+population in 10 of 10 runs. CPU contention is the standing confound for this title — a passing run
+under load may be passing because a peer lane is compiling — and it is ruled out in the same
+direction: the least-loaded warm arm (E, load 13.4) faulted while the least-loaded cold arm (E, load
+14.7) booted, i.e. the cold arm that booted was the *more* contended of the two. Treat that pair as
+supporting rather than decisive — a **1-minute** load average cannot resolve contention over a 300 ms
+window, and 13.4 against 14.7 is a 10 % difference on a lagging metric. Cold D and E additionally
+carry `mincore` proof that the pages really were gone (179.0 → 0.0 MB and 119.7 → 0.0 MB, printed by
+`tools/dropcache.py` immediately before each run) and were pulled back from storage by the run itself
+(119.7 MB resident again afterwards); cold A–C predate that instrument and rest on the eviction call
+alone.
 
 **This does not mean prosper's I/O is faster than the hardware it emulates, and it is not a licence to
 add a storage-latency model.** The cold arm's extra ~360 ms is this box reading ~101 MB from the
 **external USB SSD** the dumps live on, at roughly 0.25 GB/s under concurrent load. A PS5 reads the
-same 101.4 MB from its internal SSD at a published 5.5 GB/s raw — ~18 ms, and still well under 200 ms
-even an order of magnitude off spec — so a *PS5-faithful* storage model would land near the **warm**
-arm, not the cold one, and would not reliably supply the deficit. `CONFIDENCE: HIGH` that the cold arm
-is not a hardware model; `MED` on the exact PS5 number, which comes from the published rate rather
-than from a measured console. What the A/B
+same 101.4 MB from its internal SSD at a published 5.5 GB/s raw — **~18 ms, against the ~17 ms of
+file-I/O syscall time the warm arm already spends**, so a PS5-faithful model at spec adds about a
+millisecond and changes nothing. The break-even is worth stating rather than hand-waving a margin:
+the deficit is 38–111 ms, so a storage model would have to spend **~55 ms** on this load (≈1.8 GB/s
+effective) to flip the narrowest warm arm and **~128 ms** (≈0.8 GB/s) to flip the widest. Both are far
+below what PS5 storage does, which is why this is not the missing fidelity — but the conclusion does
+rest on the console being near its published rate for this access pattern (443 reads, mostly 64 KB),
+and this repository has no measured console. `CONFIDENCE: HIGH` that the cold arm is not a hardware
+model; `MED` on the PS5 number itself. What the A/B
 proves is narrower and more useful: the pre-`DLLInit` interval, not any one API answer, is the whole
-question, and it is set by how fast the host executes the title's own loader.
+question. The section above and this one are two levers on that same interval — host CPU speed and
+host cache state — and neither is *the* decider on its own; what decides the outcome is whether their
+sum clears the title's 400 ms.
 
 It also has two immediate practical consequences:
 
 - **Any startup-timing number for this title is void unless the page-cache state is recorded.** Two
-  runs of the same binary on the same host differ by 3–4× here. The same applies to whether the title
+  runs of the same binary on the same host differ by 2–4× here (779/362 comparing the closest arms of
+  the two populations, 1158/289 comparing the extremes). The same applies to whether the title
   boots at all: a user's first launch after a reboot may well work and the second may not.
 - Evicting the dump is the cheapest known way to get this title past #1746 **without touching the
   binary, the guest, or any guest sleep**:
@@ -400,7 +430,7 @@ It also has two immediate practical consequences:
 | The load is bound by wall-clock waits the title requests, so it would take the same time on hardware | **Falsified.** Per-thread `clock_nanosleep` census during the load: the reading worker sleeps only `usleep(0)` × 78, the main thread `1 µs` × 173 and `1 ms` × 45; the 5 ms × 55 and 20 ms × 14 loops belong to the audio threads and run regardless. Guest-requested sleep on the threads that gate the load totals ~56 ms of a 244 ms window, and CPU contention stretches that window 4.5×, which a wall-clock wait could not do. | `strace -f -tt -T -e trace=pread64,clock_nanosleep`, spinner arm, #1746 |
 | Prosper answers some call in the 13–24 ms between the INPUT worker's creation and `DLLLoadStart` (`sceKernelLoadStartModule`, the NP/Scream/audio initialisations) ~140 ms too fast, and that is where the fidelity gap lives | **Not supported, and no longer needed.** It was the leading candidate once I/O and GPU were excluded, but the CPU-contention arm accounts for the entire deficit inside the *load* itself, and it does so with an executed positive outcome. Recorded so the next reader does not chase a module-load latency model for which this repository has no oracle. | this doc, #1746 |
 | The chroma cast in the corrected movie replay is only a capture-provenance artifact, so live output may be correct | **Falsified live.** With the race won by host CPU contention, the unmodified default route renders the publisher logos and the whole opening movie with the *same* green/magenta cast as the replay. Live chroma is now verified broken, not merely unverified. Tracked in #2005. | throttled `screenshot` route on `bffa5e25`, #2005 |
-| A **synchronous** user-service API should report the already-signed-in user immediately, and prosper answering it empty/zero/error is the real defect | **Falsified by the import census, the call graph and a live breakpoint census.** The eboot imports exactly three UserService NIDs — `sceUserServiceInitialize`, `sceUserServiceGetInitialUser`, `sceUserServiceGetEvent` — and `title_Release.prx` imports none (only 21 libc + 2 libkernel). `GetLoginUserIdList`/`GetUserName`/`GetUserNumber`/`GetForegroundUser` are never imported, so their answers are unreachable. `GetInitialUser` **is** called, exactly once, and prosper answers it correctly: a gdb census records the single call with `out=0x4106f419c`, the global `eboot+0x6f419c` that `InputSystem::Init` passes it, which is read only by save-data/trophy/NP code and never copied into the vector. The vector at `eboot+0x6f41a8` has one producer (`eboot+0x23690`) with one caller (the LOGIN arm at `eboot+0x23def`) fed by one source (`sceUserServiceGetEvent`) on one thread (`eboot+0x49070`, after its own `Sleep(400)`); the alternative caller `eboot+0x49130` is unreferenced dead code. No API answer can populate it earlier. | `self_dump --symbols`, `tools/re/xref.py`, gdb census on `4d7a2ded`, #1746 |
+| A **synchronous** user-service API should report the already-signed-in user immediately, and prosper answering it empty/zero/error is the real defect | **Falsified by the import census, the call graph and a live breakpoint census.** The eboot imports exactly three UserService NIDs — `sceUserServiceInitialize`, `sceUserServiceGetInitialUser`, `sceUserServiceGetEvent` — and `title_Release.prx` imports none (only 21 libc + 2 libkernel). `GetLoginUserIdList`/`GetUserName`/`GetUserNumber`/`GetForegroundUser` are never imported, so their answers are unreachable. `GetInitialUser` **is** called, exactly once, and prosper answers it correctly: a gdb census records the single call with `out=0x4106f419c`, the global `eboot+0x6f419c` that `InputSystem::Init` passes it, which is read by the save-data and NP/UDS paths and never copied into the vector. The vector at `eboot+0x6f41a8` has one producer (`eboot+0x23690`) with one caller (the LOGIN arm at `eboot+0x23def`) fed by one source (`sceUserServiceGetEvent`) on one thread (`eboot+0x49070`, after its own `Sleep(400)`); the alternative caller `eboot+0x49130` is unreferenced dead code. No API answer can populate it earlier. | `self_dump --symbols`, `tools/re/xref.py`, gdb census on `4d7a2ded`, #1746 |
 | Prosper's guest reads are unrealistically fast because they come from the host page cache, so a storage-latency model is the missing fidelity | **Half true, and it still is not the fix.** Page-cache state really does decide this race: with only the dump's pages evicted, INPUT→`DLLInit` is 779–1158 ms across five arms and the title **boots** every time, against 289–362 ms and five SIGSEGVs warm — and the least-contended pair points the same way (warm at load 13.4 faults, cold at load 14.7 boots), so it is not peer CPU load. But the cold arm is this box's **external USB SSD** at ~0.25 GB/s, not a PS5: a PS5 internal SSD delivers the same 101.4 MB in tens of ms, i.e. it behaves like the *warm* arm. A PS5-faithful storage model would therefore add almost nothing and cannot be justified by this race. The measurable consequence is an instrument rule, not a fix: **no startup-timing number for this title is valid unless the page-cache state is recorded.** | cold/warm A/B on `4d7a2ded`, § Host page-cache state, #1746 |
 
 ## Next frontier
