@@ -18,8 +18,9 @@ PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 ```
 
 The logo appears at t≈60 s and holds to t≈80 s (1,373 distinct colours, 430,916 non-black pixels,
-decoded from the PNG rather than scored). From t≈100 s the composite becomes a **uniform
-`RGBA(1,0,1,255)`** while the engine keeps producing frames — see *The frontier* below.
+decoded from the PNG rather than scored). A second arm with no diagnostics at all reproduced it at
+t=45 s with the **identical** `pixel_crc32` (`0d70a70a`). From t≈100 s the composite becomes a
+**uniform `RGBA(1,0,1,255)`** while the engine keeps producing frames — see *The frontier* below.
 
 ## What unblocked it: #2012
 
@@ -42,6 +43,13 @@ The mechanism, measured rather than inferred:
 FreeBSD — the contract the guest was built against — returns `EPERM` for an unmatched unlock and
 leaves the lock untouched, so on real hardware step 3 is harmless. The fix registers the missing
 POSIX spellings and makes an unmatched unlock answer the way the hardware does.
+
+**The chain is closed by measurement, not by argument.** With only the unlock guard (step 3) in
+place, the title reports **14** unmatched unlocks per boot, from one guest thread across 12 distinct
+rwlock slots — one of which, `0x23c00d2538`, appears in the deadlocked thread's own backtrace. With
+the missing registrations added as well (step 1), the same instrument reports **0**, and
+`XhWHn6P5R7U` disappears from the unimplemented-NID list. So the fake "you acquired it" was the
+*source* of the unmatched unlocks, and the guard is the backstop for any other source.
 
 ## The frontier: the composite after the logo
 
