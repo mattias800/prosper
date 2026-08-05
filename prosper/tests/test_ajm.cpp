@@ -106,6 +106,13 @@ int main() {
     CHECK(init(0x300000001ull, (uint64_t)(uintptr_t)&dirty_ctx, 0, 0, 0, 0) == kInvalidParameter,
           "Initialize(valid revision, dirty reserved dword) -> INVALID_PARAMETER");
     CHECK(dirty_ctx == 0xF00D, "rejected Initialize leaves the context output untouched");
+    // Bit 16, not bit 0. Both cases above set the low bit, so they are satisfied by a mask as narrow
+    // as 0xffff — an independent review mutated the mask to exactly that and the suite stayed green.
+    // The reserved region is the whole low dword, so pin its upper half too.
+    uint32_t hi16_ctx = 0xBEEF;
+    CHECK(init(0x300010000ull, (uint64_t)(uintptr_t)&hi16_ctx, 0, 0, 0, 0) == kInvalidParameter,
+          "Initialize(reserved dword dirty above bit 15) -> INVALID_PARAMETER");
+    CHECK(hi16_ctx == 0xBEEF, "a reserved-dword rejection above bit 15 leaves the context untouched");
 
     // ModuleRegister needs a context.
     CHECK(modreg(ctx, 1 /*At9Dec*/, 0, 0, 0, 0) == 0, "sceAjmModuleRegister(ctx) -> OK");
