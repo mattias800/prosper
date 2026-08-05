@@ -524,6 +524,36 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
 - **`pixel_crc32` for a black frame is not a fingerprint.** `666f7b3f` is just "black 3840x2160" and
   recurs on three unrelated titles, so it identifies a resolution, not a title or a defect. Do not use
   a black-frame hash as an oracle or to claim two titles share a cause. #1990.
+- **"No pass targets the flipped VideoOut buffer" is not necessarily a defect in pass selection — some
+  titles never draw into their scanout at all, and the frame is in the buffer anyway.** This kills
+  #1968 §5's framing (that a post-intro change makes Frontiers stop targeting the scanout). A
+  `PROSPER_PASS_LOG` census over a full Sonic Frontiers boot records **`vo=1` on 0 of ~3,700 passes**,
+  in every phase — including the intro, which prosper composites *correctly*. `PROSPER_DUMP_PERSISTENT`
+  agrees from the other side: `scanout=MISS` on every submit, no `g_rtt` entry at the flipped address
+  (`0x200a160000` / `0x200c140000`), and that address is not the base of a single pass. What prosper
+  publishes during the intro is an internal RTT (`0x20851c0000`) that happens to be CPU-materialized
+  and happens to hold the movie; when that stops, selection has nothing left, which is the whole of the
+  "black composite". Sonic Origins (PPSA05325) reproduces the same structure. So the question to ask of
+  a scanout that no pass writes is not "which pass was mis-selected" but **"what is in the guest's
+  flipped buffer"** — for these titles, the finished frame. #1968.
+- **A registered scanout's bytes are swizzled, and every raw-scanout read took them literally.**
+  `videoout_copy_*` memcpy'd guest display memory while `VideoOutBufferSnapshot::tiling_mode` had
+  recorded the layout all along, so a TILE-mode title's `raw_scanout` present was horizontal-band
+  noise. Two things not to re-derive: (1) a `PROSPER_DUMP_SCANOUT` dump that looks like bands is a
+  **real, tiled** frame, not an empty one — Frontiers' bands de-swizzle under SW_64KB_R_X into an exact
+  SEGA logo and an exact intro shot, while `distinct_rgb_colors` in the low thousands reads as
+  "content" for something that is not an image; (2) a `width*height*4` read of a tiled surface is
+  **short** — the tail past the nominal end holds real texels of the last block row, so truncating it
+  drops part of the bottom-right (measured: the bottom-right 1024x48 of a 3840x2160 scanout loses half
+  its non-black pixels). #1968.
+- **Sonic Frontiers' post-intro black frame is not a present-path defect — the guest's own display
+  buffer is black.** With the flipped buffer published, `PROSPER_DUMP_SCANOUT` dumps de-swizzled at
+  guest flips 420 and 480 read `rgb_nonblack=0, distinct_rgb=1`, while flips 60–360 from the same run
+  are exact frames (SEGA logo, middleware credits, the Cyber Space warp). The same non-draw writer
+  therefore works throughout, and what changes after `ui_gamemodeinitialize.pac` is that the title
+  composites nothing into the buffer it keeps flipping. Do not look for a lost render target, a
+  mis-selected pass or a dropped publish for this symptom: prosper is showing what the console would.
+  The remaining blocker is upstream guest progression. #1968.
 
 ## Recommended implementation order
 
