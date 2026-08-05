@@ -23,6 +23,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <deque>
 #include <filesystem>
 #include <mutex>
@@ -754,6 +755,12 @@ struct AvpPlayer {
     uint64_t audio_poll = 0;
     uint64_t active_poll = 0;        // independent progress for IsActive-only playback loops
     uint64_t last_ts_ms = 0;         // newest delivered frame timestamp (sceAvPlayerCurrentTime)
+    // When something last ASKED this player for a video frame — the media clock's only input
+    // (#1973, see avp_media_played_out). Refreshed by every GetVideoData[Ex] call whatever that call
+    // returns, and at every point presentation (re)starts: AddSource, Start, Resume, JumpToTime.
+    // Those are also every place `paused` is cleared, which is what keeps paused time — during which
+    // nothing is presented and nothing should be pulled — from counting as an absent consumer.
+    std::chrono::steady_clock::time_point video_request_at = std::chrono::steady_clock::now();
     // When the title supplies its AvPlayer texture allocator, decoded NV12 must be written into those
     // guest-visible buffers.  A host vector is invisible to the title's pre-wired texture descriptors.
     std::vector<uint8_t*> texture_frames;
@@ -905,6 +912,56 @@ bool avp_log() { static const bool enabled = getenv("PROSPER_AVPLOG") != nullptr
 bool avp_paused_deliver() {
     static const bool enabled = getenv("PROSPER_AVP_PAUSED_DELIVER") != nullptr;  // default: false
     return enabled;
+}
+
+// ---- the media clock (#1973) ------------------------------------------------------------------
+//
+// prosper's host decode backends are CONSUMER-DRIVEN: the decode worker fills a small bounded frame
+// queue and blocks while it is full, so the decoder only advances when someone pulls. That makes
+// "the decoder finished" — until now the player's ONLY end-of-playback signal — unreachable for a
+// guest that starts a movie and then never collects a frame. The queue nobody drains never empties,
+// VideoBackend::eof() never turns true, and sceAvPlayerIsActive answers 1 forever.
+//
+// PPSA27624 (Bendy and the Dark Revival) does exactly that: measured on ff72e77c, 14,843
+// sceAvPlayerIsActive polls from one call site, ZERO sceAvPlayerGetVideoData[Ex] calls, and no STOP
+// event, for a 15.1 s source. The title waits on a movie that cannot end.
+//
+// A real player is CLOCKED, not consumer-driven. The console's playback timeline runs whether or not
+// the application collects frames, so a movie nobody watches still finishes when its media does.
+// Model exactly that and nothing more: when NOTHING has asked this player for a video frame for as
+// long as the remainder of the media would have taken to play, the media has played out. That is a
+// statement about the source's own timeline, not a guess — which is why it may only be made when
+// there is a real host decode session with a duration the container actually reported. A synthetic
+// session has its own frame budget, and an unknown duration is precisely the case where prosper must
+// NOT claim to know when the movie ends.
+//
+// The "nothing has asked" input is what keeps this off every title that works today. A consumer
+// resets the window on EVERY GetVideoData[Ex] call, including calls that return no frame, so a
+// starved consumer, or one running far below real time because prosper renders slowly, still ends
+// its movie the way it does now: by the queue draining after the decoder finished. This clock can
+// only fire where no consumer exists at all — the one case the drain path cannot resolve.
+//
+// REJECTED ALTERNATIVE, so nobody re-derives it: making video enqueue non-blocking the way audio
+// already is (drop the oldest frame when the queue is full) — #1973's own suggested fix. It does let
+// decode reach EOF, but it also removes the ONLY thing pacing a movie for every title that works
+// today. The decoder would run the whole clip at CPU speed, dropping all but the last few frames, so
+// a consuming title's 15-second cutscene becomes six frames and an immediate STOP. The queue's
+// backpressure is correct for a decoder; what was missing was a player that knows when its media is
+// over. Nothing in the decode backends is touched by this fix, and the same reasoning rules out
+// running decode ahead to EOF "bounded by the queue cap" — the bound IS the frame dropping.
+//
+// CONFIDENCE: HIGH that an unconsumed source must reach the end of its own media. CONFIDENCE: MED on
+// the guard band below, which is slop for scheduling rather than a modelled console property.
+constexpr uint64_t kAvpMediaClockGraceMs = 250;
+
+bool avp_media_played_out(const AvpPlayer& p, std::chrono::steady_clock::time_point now,
+                          uint64_t& idle_ms, uint64_t& remaining_ms) {
+    if (!p.backend || p.backend_id < 0 || p.duration_ms == 0) return false;
+    remaining_ms = p.duration_ms > p.last_ts_ms ? p.duration_ms - p.last_ts_ms : 0;
+    const auto idle =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - p.video_request_at).count();
+    idle_ms = idle > 0 ? static_cast<uint64_t>(idle) : 0;
+    return idle_ms >= remaining_ms + kAvpMediaClockGraceMs;
 }
 
 #if defined(__linux__)
@@ -1153,19 +1210,39 @@ HLE(s_avplayer_initex) {   // s32 sceAvPlayerInitEx(const AvPlayerInitDataEx*, A
 HLE(s_avplayer_isactive) {   // bool sceAvPlayerIsActive(AvPlayerHandle)
     svc_log("sceAvPlayerIsActive", a0,a1,a2,a3,a4,a5);
     void* obj = nullptr; AvpEventCb cb = nullptr; bool fire_stop = false; uint64_t active = 0;
+    bool played_out = false; uint64_t clock_idle_ms = 0, clock_remaining_ms = 0, clock_duration_ms = 0;
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0); if (it == g_avp.end()) return 0;
         AvpPlayer& p = it->second;
         if (p.playing) {
+            const auto now = std::chrono::steady_clock::now();
+            // A paused player is active and presents nothing; its media clock is restarted by
+            // sceAvPlayerResume, the only exit from this state, so no time is accumulated here.
             if (p.paused) return 1;
             p.active_poll++;
             bool still = p.backend && p.backend_id >= 0
                              ? !p.backend->eof(p.backend_id)
                              : p.synthetic && p.active_poll < avp_synth_frames();
+            // #1973: a consumer-driven decoder cannot report the end of a source nobody consumes.
+            if (still && avp_media_played_out(p, now, clock_idle_ms, clock_remaining_ms)) {
+                still = false;
+                played_out = true;
+                clock_duration_ms = p.duration_ms;
+            }
             if (still) { active = 1; }
             else if (!p.stop_fired) { p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb; }
         }
+    }
+    if (played_out) {
+        // Loud by design, like the JumpToTime failure above: playback that ends on the clock rather
+        // than by delivering its frames is a title consuming nothing, and must never read as an
+        // ordinary drain in a default run.
+        fprintf(stderr,
+                "[avp] handle=0x%llx: the %llu ms source played out on the media clock — nothing "
+                "requested a video frame for %llu ms and %llu ms of the media remained (#1973)\n",
+                (unsigned long long)a0, (unsigned long long)clock_duration_ms,
+                (unsigned long long)clock_idle_ms, (unsigned long long)clock_remaining_ms);
     }
     if (fire_stop) avp_fire(obj, cb, AVP_STOP);   // playback complete -> game advances past the video
     return active;
@@ -1365,6 +1442,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
                 p.have_source = true; p.synthetic = false;
                 p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0;
                 p.paused = false; p.stop_fired = false; p.seek_deliver = false;
+                p.video_request_at = std::chrono::steady_clock::now();
                 p.texture_frames.clear(); p.texture_frame_bytes = 0; p.next_texture_frame = 0;
                 p.backend = nullptr; p.backend_id = -1;
                 // Non-zero placeholder dims/fps: a title that queries GetStreamInfo up-front (before it
@@ -1407,6 +1485,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
             p.have_source = true; p.synthetic = synthetic;
             p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0; p.paused = false;
             p.stop_fired = false; p.seek_deliver = false;
+            p.video_request_at = std::chrono::steady_clock::now();
             p.texture_frames = std::move(textures);
             p.texture_frame_bytes = texture_bytes;
             p.next_texture_frame = 0;
@@ -1432,10 +1511,15 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
     }
     avp_fire(obj, cb, AVP_READY);
     if (play)  avp_fire(obj, cb, AVP_PLAY);
+    // The duration is the media clock's only input besides delivered frames (#1973); log it so a run
+    // shows whether this source has a timeline prosper can reason about at all.
     if (avp_log()) fprintf(stderr,
-                           "[avp] add source handle=0x%llx guest='%s' host='%s' mode=%s auto_start=%d\n",
+                           "[avp] add source handle=0x%llx guest='%s' host='%s' mode=%s auto_start=%d "
+                           "duration=%llums\n",
                            (unsigned long long)handle, guest_path, host_path.c_str(),
-                           synthetic ? "synthetic-explicit" : "native", (int)play);
+                           synthetic ? "synthetic-explicit" : "native", (int)play,
+                           (unsigned long long)(synthetic ? avp_synth_duration_ms()
+                                                          : stream.duration_us / 1000));
     return 0;
 }
 HLE(s_avp_addsource)   {   // s32 sceAvPlayerAddSource(handle, const char* filename)
@@ -1457,6 +1541,7 @@ HLE(s_avp_start) {   // s32 sceAvPlayerStart(handle) — used when auto_start is
         AvpPlayer& p = it->second;
         if (p.have_source && !p.playing && !p.stop_fired) {
             p.playing = true; p.paused = false; play = true; obj = p.ev_obj; cb = p.ev_cb;
+            p.video_request_at = std::chrono::steady_clock::now();   // the media clock starts here
         }
     }
     if (play) avp_fire(obj, cb, AVP_PLAY);
@@ -1486,6 +1571,9 @@ HLE(s_avp_resume) {   // s32 sceAvPlayerResume(handle)
         if (it->second.playing && it->second.paused) {
             it->second.paused = false;
             obj = it->second.ev_obj; cb = it->second.ev_cb; notify = true;
+            // Presentation restarts now; the media clock must measure from here, not from whenever
+            // the player was paused.
+            it->second.video_request_at = std::chrono::steady_clock::now();
         }
     }
     if (notify) avp_fire(obj, cb, AVP_PLAY);
@@ -1536,6 +1624,9 @@ HLE(s_avp_jumptotime) {
                 // does it, so nothing here revives one; it stays stopped with a repositioned source.
                 p.last_ts_ms = target_ms;
                 p.seek_deliver = true;
+                // The source was just repositioned: the media clock measures the remainder from the
+                // new position, starting now.
+                p.video_request_at = std::chrono::steady_clock::now();
             }
         }
     }
@@ -1565,7 +1656,12 @@ HLE(s_avp_getvideodata) {
         // nothing while paused could never let that guest leave its splash. The window closes on the
         // first delivered frame. avp_paused_deliver() is the separate default-off #1599 falsification
         // lever documented above, not a feature; it never changes a default run.
-        if (it == g_avp.end() || !it->second.playing ||
+        if (it == g_avp.end()) return 0;
+        // A consumer exists (#1973). Record that BEFORE any refusal below: a pull that returns
+        // nothing because the player is paused or because decode has not caught up is still a title
+        // asking for frames, and the media clock must never mistake it for one that never asks.
+        it->second.video_request_at = std::chrono::steady_clock::now();
+        if (!it->second.playing ||
             (it->second.paused && !it->second.seek_deliver && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
         if (auto* b = p.backend; b && p.backend_id >= 0) {
@@ -1614,8 +1710,11 @@ HLE(s_avp_getvideodataex) {
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0);
-        // See s_avp_getvideodata: paused gates delivery except inside the post-seek window.
-        if (it == g_avp.end() || !it->second.playing ||
+        // See s_avp_getvideodata: paused gates delivery except inside the post-seek window, and any
+        // request — answered or refused — proves a consumer exists for the media clock (#1973).
+        if (it == g_avp.end()) return 0;
+        it->second.video_request_at = std::chrono::steady_clock::now();
+        if (!it->second.playing ||
             (it->second.paused && !it->second.seek_deliver && !avp_paused_deliver())) return 0;
         AvpPlayer& p = it->second;
         if (auto* b = p.backend; b && p.backend_id >= 0) {
