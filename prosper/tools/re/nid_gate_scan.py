@@ -129,7 +129,15 @@ class Image:
             return None
         syment = self.tag(0xB) or 24
         count = self.tag(0x6100003F)
-        n = (count // syment) if count else max(0, (to - so) // syment)
+        if count:
+            n = count // syment
+        elif to > so:
+            n = (to - so) // syment          # symtab runs up to strtab, the usual PS5 layout
+        else:
+            # No DT_SCE_SYMTABSZ and strtab does NOT follow symtab: the symbol count is unknown.
+            # Falling through with n=0 would report "no-import" for a module that may well import
+            # the NID — a false negative that reads exactly like a real absence. Fail loudly.
+            raise ValueError("cannot bound symtab: no DT_SCE_SYMTABSZ and strtab precedes symtab")
         want = nid.encode() + b"#"
         for i in range(n):
             base = so + i * syment
@@ -180,19 +188,42 @@ def scan_code(img):
     return xref
 
 
+_SCRATCH = None
+
+
+def _scratch_path():
+    """One reusable scratch file for objdump input, deliberately NOT under /tmp by default.
+
+    /tmp on the project's Linux box is a RAM-backed tmpfs with a per-user quota shared by every
+    concurrent agent, so a tool that creates a file per call is a bad citizen there even when each
+    file is tiny and short-lived. Honour TMPDIR when the caller sets one; otherwise use the user
+    cache directory, which is real disk.
+    """
+    global _SCRATCH
+    if _SCRATCH is None:
+        d = os.environ.get("TMPDIR") or os.path.join(os.path.expanduser("~"), ".cache")
+        os.makedirs(d, exist_ok=True)
+        _SCRATCH = os.path.join(d, "nid_gate_scan-%d.bin" % os.getpid())
+    return _SCRATCH
+
+
 def disasm(blob, base):
-    """objdump a raw byte blob as x86-64 Intel; returns [(va, mnemonic, operands)]."""
-    import tempfile
-    fd, tmp = tempfile.mkstemp(suffix=".bin")
-    try:
-        os.write(fd, blob)
-        os.close(fd)
-        out = subprocess.run(
-            ["objdump", "-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel",
-             "--adjust-vma=%#x" % base, tmp],
-            capture_output=True, text=True).stdout
-    finally:
-        os.unlink(tmp)
+    """objdump a raw byte blob as x86-64 Intel; returns [(va, mnemonic, operands)].
+
+    Raises on an objdump failure rather than returning an empty list: a silent empty decode would
+    be classified as an ordinary window and drain into a bucket, turning a broken toolchain into a
+    plausible-looking measurement.
+    """
+    tmp = _scratch_path()
+    with open(tmp, "wb") as f:
+        f.write(blob)
+    r = subprocess.run(
+        ["objdump", "-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel",
+         "--adjust-vma=%#x" % base, tmp],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("objdump failed (%d): %s" % (r.returncode, r.stderr.strip()[:200]))
+    out = r.stdout
     insns = []
     for line in out.splitlines():
         m = re.match(r"\s*([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*(\S+)\s*(.*)", line)
@@ -238,6 +269,13 @@ def canon(operand):
     return _SUBREG.get(op)
 
 
+# Read-modify-write ALU ops: they consume the tainted register, set flags from the result, and
+# write it back. `and eax,0x80000000; jne` is a gate on a BIT of the result, so treating these as
+# "the value was overwritten, therefore ignored" hides a real dependency in the one bucket whose
+# meaning is "cannot be affected". Self-`xor`/`sub` are the zeroing idiom and still kill.
+ALU_RMW = {"and", "or", "xor", "add", "sub", "shl", "shr", "sar", "not", "neg", "inc", "dec", "imul"}
+
+
 def classify_window(insns, const):
     """Classify what the code right after the call does with the returned eax.
 
@@ -245,13 +283,21 @@ def classify_window(insns, const):
     common compiler output moves eax into another register and *then* zeroes eax as the enclosing
     function's own return value, so an eax-only reader calls a live gate "ignored" (measured on
     GTA V eboot+0x2d850cc: `mov ecx,eax; xor eax,eax; test ecx,ecx`).
+
+    Buckets: const / nonzero / other-cmp / alu-gate all mean "branches on the result"; `forward`
+    means the result left the window still live (returned, spilled, or tail-jumped) and needs a
+    look by hand; `ignored` means it was dead before any read; `undecodable` means objdump could
+    not decode the window, which is a VOID sample, not a negative one.
     """
     const_forms = {"0x%x" % const, str(const)}
     live = {"a"}
     spilled = False
     for va, mn, ops in insns:
         if mn.startswith("(bad)") or mn.startswith(".byte") or mn in ("data16", "rex.W", "rex.RB"):
-            break                                         # decode ran off the end of the block
+            # The decode ran into data or a prefix objdump could not attach. Say so instead of
+            # letting a broken window fall into `forward`, where it is indistinguishable from a
+            # real forward and quietly weakens every count in the table.
+            return "undecodable", (va, mn, ops)
         parts = [p.strip() for p in ops.split(",")] if ops else []
         dst = canon(parts[0]) if parts else None
         src = canon(parts[-1]) if len(parts) > 1 else None
@@ -272,9 +318,21 @@ def classify_window(insns, const):
             continue
         if mn in ("cdqe", "cdq", "cwde"):
             continue
+        if mn in ALU_RMW and dst in live:
+            if src == dst and mn in ("xor", "sub"):
+                live.discard(dst)                         # self-xor / self-sub: the zeroing idiom
+                if not live:
+                    return ("forward" if spilled else "ignored"), (va, mn, ops)
+                continue
+            return "alu-gate", (va, mn, ops)              # flags now derive from the result
         if mn == "ret":
             return ("forward" if ("a" in live or spilled) else "ignored"), (va, mn, ops)
-        if mn in ("call", "jmp") and (mn == "call" or not live):
+        if mn == "jmp":
+            # An unconditional jump ends this basic block; anything after it belongs to unrelated
+            # code. Without this the scan walked straight on and could pick up a `cmp` from the
+            # NEXT block, over-reporting a gate that the result never reaches.
+            return ("forward" if (live or spilled) else "ignored"), (va, mn, ops)
+        if mn == "call":
             live -= CALLER_SAVED
             if not live:
                 return ("forward" if spilled else "ignored"), (va, mn, ops)
@@ -302,8 +360,17 @@ def scan_module(path, nid, const, window, verbose=False):
     sites = []
     for slot in slots:
         for site, kind in xref.get(slot, []):
-            if kind == "jmp*":                               # a PLT-ish stub: its callers are the users
-                sites += [(s, "call") for s, k in xref.get(site, []) if k == "call"]
+            if kind == "jmp*":
+                # A PLT-ish stub; its callers are the real users. A caller targets the stub's FIRST
+                # byte, which is not always the `jmp` — a CET-enabled stub opens with `endbr64`
+                # (f3 0f 1e fa), so calls land 4 bytes earlier and looking only at the `jmp` address
+                # would report zero call sites for an entire module while nothing looked wrong.
+                entries = [site]
+                fo = img.foff(site - 4)
+                if fo is not None and img.raw[fo:fo + 4] == b"\xf3\x0f\x1e\xfa":
+                    entries.append(site - 4)
+                for e in entries:
+                    sites += [(s, "call") for s, k in xref.get(e, []) if k == "call"]
             elif kind == "call*":                            # direct indirect call through the slot
                 sites.append((site, "call*"))
     census, details = {}, []

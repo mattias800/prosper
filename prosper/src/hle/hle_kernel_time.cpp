@@ -525,15 +525,22 @@ HLE(k_ok)              { return 0; }                       // generic success no
 // back to the query. Grand Theft Auto V (PPSA04263) does exactly this at eboot+0x197a22a and again
 // at eboot+0x4b978f (`cmp eax,0x805a1001`), losing sceAppContentInitialize and its
 // userDefinedParam1 read; the guest's own compare is the primary evidence for the errno value.
-// Measured across the 44 local dumps with tools/re/nid_gate_scan.py: all 39 importers branch on the
-// result — 441 call sites, of which 237 compare against this exact errno and 204 test it for zero.
-// Not one importer ignores the answer, so there is no "imports it but is inert" set to lean on.
+// Measured statically over the 44 local dumps with tools/re/nid_gate_scan.py: 39 import the NID, and
+// at all 441 call sites the returned value is READ before it dies — 237 compare it against this
+// exact errno, 204 test it for zero, none discard it. Read that bound precisely: the scan classifies
+// the COMPARE, not the branch target, so it says which titles *can* change behaviour under a
+// different answer, not which ones do, and "441 sites" is a lower bound on reach (it follows one
+// stub level and one call deep). The `test eax,eax` half matters as much as the errno half — it is
+// the plain defensive form of the same gate and never mentions 0x805A1001.
 //
 // What prosper can honestly answer is which ids the guest asked it to load. The sysmodule id space
 // is the set of *optional* modules an application must request; the always-resident libraries
 // (libkernel, libc, libSceGnmDriver, libSceVideoOut) are bound through DT_NEEDED and never travel
 // through this API — so per-process "did this process load it?" is the contract, and prosper's own
-// load history is exactly the state that answers it.
+// load history is exactly the state that answers it. Supporting evidence that Sony models
+// residency-without-a-request as a DIFFERENT question: libSceSysmodule exports a separate
+// sceSysmoduleIsCameraPreloaded (3.20 export list), which would be redundant if IsLoaded already
+// reported system-preloaded modules.
 //
 // Answering UNLOADED cannot cost a capability here: prosper's HLE surface for a module is resident
 // whether or not the guest ever calls LoadModule, so the worst case is that the guest performs the
@@ -541,7 +548,16 @@ HLE(k_ok)              { return 0; }                       // generic success no
 // the only one that can silently remove behaviour. Sony's loader reference-counts the per-process
 // load; prosper does not model the count, because an unload that drops a nested load only produces
 // an extra UNLOADED, which prompts a redundant (succeeding) load — the error in the safe direction.
-// CONFIDENCE: HIGH for the loaded/unloaded distinction, MED for the unmodelled nesting.
+// CONFIDENCE: HIGH that answering "loaded" for a module this process never loaded is wrong (the
+// guest's own compare proves the contract). CONFIDENCE: MED that no sysmodule id is legitimately
+// resident before the app asks — that half rests on the API's shape, not on primary evidence — and
+// MED for the unmodelled ref-count nesting.
+//
+// NOT fixed here, and it is the same defect on a parallel path: the eight *Internal entry points
+// (sceSysmoduleIsLoadedInternal ynFKQ5bfGks, LoadModule{,ByName,WithArg}Internal,
+// UnloadModule{,ByName,WithArg}Internal, GetModuleHandleInternal) are unregistered, so they fall to
+// prosper_on_unimpl, which also returns 0. No dump in the local corpus imports any of them —
+// measured, which is why this stays focused — but a title that uses them reproduces #2002 exactly.
 constexpr uint64_t k_sysmodule_error_unloaded = 0x805A1001;   // SCE_SYSMODULE_ERROR_UNLOADED
 
 namespace {

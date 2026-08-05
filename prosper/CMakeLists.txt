@@ -107,6 +107,11 @@ if(Python3_Interpreter_FOUND)
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
   add_test(NAME re_edis_mapping
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_edis.py")
+  # nid_gate_scan answers "does this title BRANCH on an imported function's return value?", and a
+  # wrong answer there is a plausible-looking table rather than a visible failure. Three of its
+  # cases are regressions for classifier bugs found only after a table had been published (#2002).
+  add_test(NAME re_nid_gate_classifier
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_nid_gate_scan.py")
   add_test(NAME snapshot_guard_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/snapshot/test_snapshot.py")
   add_test(NAME gpu_replay_regress_logic

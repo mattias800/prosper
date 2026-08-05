@@ -13,9 +13,17 @@
 //                              stops recording the id
 //   unloaded-id-is-unloaded    dies if UnloadModule stops clearing the id
 //   distinct-ids-independent   dies if the state is a single global flag rather than per-id
+//   two-ids-loaded-at-once     dies if the state is a single *slot* — one id at a time
+//   unload-leaves-other-id     dies if unloading one id clears another
 //   load-still-succeeds        dies if the honest query answer leaks into the load result
 // A constant in EITHER direction therefore fails a named check, which is what separates this from a
 // test that would also pass on unfixed master.
+//
+// `two-ids-loaded-at-once` and `unload-leaves-other-id` exist because of a review finding: without
+// them a "remember only the most recently loaded id" implementation (`uint16_t g_last; bool g_have;`)
+// satisfies every other check here, INCLUDING `distinct-ids-independent` — which never held two ids
+// at the same time and so did not test what its name claims. Holding two simultaneously is the only
+// arrangement that separates a per-id map from a single slot.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include <cstdint>
@@ -51,10 +59,17 @@ int main() {
     CHECK(unload(kAppContent, 0, 0, 0, 0, 0) == 0, "unload-still-succeeds");
     CHECK(is_loaded(kAppContent, 0, 0, 0, 0, 0) == kUnloaded, "unloaded-id-is-unloaded");
 
+    // Two ids held at the same time — the only arrangement a single-slot implementation fails.
+    CHECK(load(kAppContent, 0, 0, 0, 0, 0) == 0 && load(kOther, 0, 0, 0, 0, 0) == 0,
+          "second-load-succeeds");
+    CHECK(is_loaded(kAppContent, 0, 0, 0, 0, 0) == 0 && is_loaded(kOther, 0, 0, 0, 0, 0) == 0,
+          "two-ids-loaded-at-once");
+    CHECK(unload(kOther, 0, 0, 0, 0, 0) == 0 && is_loaded(kAppContent, 0, 0, 0, 0, 0) == 0,
+          "unload-leaves-other-id");
+
     // The id is a uint16_t in the Sony prototype; upper bits of the register must not create a
     // second, distinct entry for the same module.
-    CHECK(load(kOther, 0, 0, 0, 0, 0) == 0, "second-load-succeeds");
-    CHECK(is_loaded(0xFFFF0000u | kOther, 0, 0, 0, 0, 0) == 0, "id-truncated-to-uint16");
+    CHECK(is_loaded(0xFFFF0000u | kAppContent, 0, 0, 0, 0, 0) == 0, "id-truncated-to-uint16");
 
     printf(fails ? "== FAILURES: %d ==\n" : "== all checks passed ==\n", fails);
     return fails ? 1 : 0;
