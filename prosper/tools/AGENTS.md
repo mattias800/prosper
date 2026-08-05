@@ -239,6 +239,19 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   `--thread REGEX` isolates one thread, `--mode folded` emits flamegraph stacks. Complements
   `guest_bt` (which does the GUEST/managed-C# side). `--self-test` checks the symbol parser.
   See `hostprof/README.md`.
+- **`dropcache.py`** — evict a dump (or any path) from the **host page cache** before a timed run,
+  and prove it happened. A guest `read`/`pread` is served from the page cache on every launch after
+  the first, so a title's asset load can be several times faster than the same bytes off storage —
+  which is invisible for most work and decisive for a startup *race*: PPSA26414 reaches `DLLInit` in
+  289–362 ms warm and 779–1158 ms evicted, and it faults in the first case and boots in the second
+  (`docs/R_TYPE_DELTA_STATUS.md`). `posix_fadvise(POSIX_FADV_DONTNEED)` on the named files only, so it
+  needs no root and touches nothing outside them — but **the page cache is global**, so evicting a
+  shared dump evicts it for every process on the box and will silently invalidate another lane's
+  timing run. Say what you are evicting first. It prints `mincore(2)` residency **before and after**,
+  because "evicted it", "it was already cold" and "eviction silently did nothing" otherwise look
+  identical, and it exits non-zero (never silently) when pages stay resident, when a path is absent,
+  and when a flag is misspelled. `--report-only` measures without evicting; `--self-test` needs no
+  dump. **Record cache state alongside any startup-timing number**; without it it is unreproducible.
 - **F8 interactive performance capture / `perf/performance_capture_report.py`** — while playing in
   `prosper-app`, press **F8** when performance is bad. The app keeps a cheap 4 Hz rolling ring of
   process CPU/RSS plus guest-flip, rendered-frame, and host-present counts; the press freezes the
