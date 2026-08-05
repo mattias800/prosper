@@ -56,6 +56,21 @@ constexpr PresentSourceChoice select_present_source(size_t front_bytes, size_t v
     return PresentSourceChoice::None;
 }
 
+// True when the extent contract passed over a non-empty HIGHER-priority candidate to reach `choice`
+// — the one new semantic path this rule introduces, and therefore the one worth a report. It is
+// unreachable on current master: a pass whose target is the flipped front buffer or any registered
+// scanout has its extent pinned to the present extent before it renders (`live_renderer.cpp:5060-5063`
+// sets `native_w/native_h` from `present_width()/present_height()` for `is_vo`), and the contract only
+// applies where that extent is non-zero, so `px_front`/`px_vo` always fit. That makes this a tripwire
+// on that pin rather than a live branch: if the pin is ever relaxed, a demotion must not be silent —
+// a silent substitution is the whole defect #1986 is about.
+constexpr bool present_source_demoted(PresentSourceChoice choice, size_t front_bytes,
+                                      size_t vo_bytes) {
+    if (choice == PresentSourceChoice::Vo)   return front_bytes != 0;
+    if (choice == PresentSourceChoice::Last) return front_bytes != 0 || vo_bytes != 0;
+    return false;  // Front is already the top priority; None is the shortfall report's business
+}
+
 // What the retained-frame net does with this submit's frame. The net exists because Bendy and the
 // Ink Machine (PPSA27616) rapidly re-registers its scanout buffers: on the frames where the guest
 // has registered new buffers but not yet rendered and flipped them, none is valid and the present

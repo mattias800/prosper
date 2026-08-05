@@ -508,11 +508,19 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   3840x3072 against a requested 3840x2160) were silently dropped. Nothing logged it. #1986 / #1990.
 - **Removing the publish wall does not restore blacked-out content — the two are separate causes.**
   With the extent contract in place Frontiers publishes again and the composited frame is *still*
-  uniformly black (`distinct_rgb_colors == 1`, `nonblack_rgb_pixels == 0`): the last publishable 4K
-  frame was already black when the wall formed, so the now-correctly-served retained frame is black.
-  This kills #1968 §6 (that the content going black shortly *before* the wall shared the wall's cause).
-  The open question is unchanged and is #1968 §5: why no post-intro pass targets the flipped VideoOut
-  buffer. #1990.
+  uniformly black (`distinct_rgb_colors == 1`, `nonblack_rgb_pixels == 0`) for the remaining 140 s of a
+  300 s arm. This kills #1968 §6 (that the content going black shortly *before* the wall shared the
+  wall's cause). The open question is unchanged and is #1968 §5: why no post-intro pass targets the
+  flipped VideoOut buffer. #1990.
+- **A climbing publish counter does not distinguish "rendering fresh frames" from "re-serving one
+  retained frame" — instrument the two branches, do not infer.** On the same Frontiers arm, `frame_seq`
+  reaching 5,499 was compatible with either, and the two send the next investigation to opposite places.
+  The renderer's `fresh=`/`retained=` totals (carried on every `[rtt] PRESENT SOURCE EXTENT MISMATCH`
+  line) settle it: between shortfall #2048 and #4096 **fresh grew by 1 (141 → 142) while retained grew
+  by 2,048 (1,109 → 3,157)**. So post-wall Frontiers publishes **one retained black frame, re-served
+  thousands of times**, and the last *fresh* 4K composite prosper produced was itself already black.
+  That is the surface to investigate: not "why is the served frame black" but "why did the 4K composite
+  go black, and then stop being produced at all". #1990.
 - **`pixel_crc32` for a black frame is not a fingerprint.** `666f7b3f` is just "black 3840x2160" and
   recurs on three unrelated titles, so it identifies a resolution, not a title or a defect. Do not use
   a black-frame hash as an oracle or to claim two titles share a cause. #1990.

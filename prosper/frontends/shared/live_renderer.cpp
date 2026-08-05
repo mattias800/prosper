@@ -4794,6 +4794,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // unconditionally; capped per the rate-limit contract (ordinal on every line so the last
             // one bounds the population from below, plus a power-of-two tail so the tail exists at
             // all — src/gpu/diag_ratelimit.hpp, instrument trap 49).
+            //
+            // The two totals on every line settle a question the frame counter cannot: whether a title
+            // whose publish rate looks healthy is publishing FRESH frames or re-serving one retained
+            // frame. `frame_seq` climbing says nothing about which (instrument trap 90), and the answer
+            // decides where the next investigation looks, so the counters are carried by the instrument
+            // rather than left to be inferred.
+            static std::atomic<uint64_t> present_frames_stored{0};   // publishable, this submit's own
+            static std::atomic<uint64_t> present_frames_served{0};   // the retained frame, re-served
             static std::atomic<uint64_t> present_extent_reports{0};
             auto report_present_extent_shortfall = [&](const char* outcome, size_t offered_bytes) {
                 const uint64_t ord = present_extent_reports.fetch_add(1) + 1;
@@ -4809,9 +4817,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 fprintf(stderr,
                         "[rtt] PRESENT SOURCE EXTENT MISMATCH #%llu: no pass produced a %ux%u "
                         "(%zu-byte) present source — px_front=%s px_vo=%s px_last=%s, offered %zu "
-                        "bytes; %s\n",
+                        "bytes; %s (published so far: fresh=%llu retained=%llu)\n",
                         (unsigned long long)ord, w, h, present_extent_bytes,
-                        front_text, vo_text, last_text, offered_bytes, outcome);
+                        front_text, vo_text, last_text, offered_bytes, outcome,
+                        (unsigned long long)present_frames_stored.load(std::memory_order_relaxed),
+                        (unsigned long long)present_frames_served.load(std::memory_order_relaxed));
             };
             if (pertarget) {
                 // PER-TARGET RTT: a real frame is a sequence of passes, each rendering into a specific
@@ -5752,6 +5762,28 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 : present_choice == PresentSourceChoice::Vo    ? px_vo
                                 : present_choice == PresentSourceChoice::Last  ? px_last
                                 : nullptr;
+                // The one new semantic path: a non-empty higher-priority candidate was passed over on
+                // extent. Unreachable today (a VO/front-buffer pass has its extent pinned to the present
+                // extent at :5060-5063 before it renders, so those candidates always fit), which is
+                // exactly why it gets a report rather than a comment — this PR's whole thesis is that a
+                // silent substitution is what cost 31 consecutive submits, and that applies to its own
+                // substitution too. If the pin is ever relaxed, this says so instead of quietly changing
+                // which surface reaches the screen.
+                if (prosper::frontend::present_source_demoted(
+                        present_choice, candidate_bytes(px_front), candidate_bytes(px_vo))) {
+                    static std::atomic<uint64_t> demotions{0};
+                    const uint64_t ord = demotions.fetch_add(1) + 1;
+                    if (prosper::diag_should_print(ord))
+                        fprintf(stderr,
+                                "[rtt] PRESENT SOURCE DEMOTED #%llu: chose %s for a requested %ux%u "
+                                "(%zu-byte) frame because a higher-priority candidate did not fit — "
+                                "px_front=%ux%u(%zu bytes) px_vo=%ux%u(%zu bytes); the flipped scanout "
+                                "extent is no longer pinned to the present extent\n",
+                                (unsigned long long)ord,
+                                prosper::frontend::present_source_name(present_choice), w, h,
+                                present_extent_bytes, px_front_w, px_front_h,
+                                candidate_bytes(px_front), px_vo_w, px_vo_h, candidate_bytes(px_vo));
+                }
                 {
                     const uint64_t at = g_pass_log_submit.fetch_add(1);
                     if (const char* pl = getenv("PROSPER_PASS_LOG")) {
@@ -5959,9 +5991,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 current_bytes, retained_bytes, present_extent_bytes)) {
                         case prosper::frontend::RetainedFrameAction::StoreCurrent:
                             last_scanout_present = selected_pixels;
+                            present_frames_stored.fetch_add(1, std::memory_order_relaxed);
                             break;
                         case prosper::frontend::RetainedFrameAction::ServeRetained:
                             selected_pixels = last_scanout_present;
+                            present_frames_served.fetch_add(1, std::memory_order_relaxed);
                             // A stale-but-correct frame IS what the guest sees, so say so rather than
                             // letting a silent substitution read as a healthy present. Under no extent
                             // contract this branch is the historical empty-frame recovery and is not

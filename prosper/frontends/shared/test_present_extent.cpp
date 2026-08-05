@@ -31,6 +31,7 @@ namespace {
 using prosper::frontend::PresentSourceChoice;
 using prosper::frontend::RetainedFrameAction;
 using prosper::frontend::present_frame_publishable;
+using prosper::frontend::present_source_demoted;
 using prosper::frontend::present_source_name;
 using prosper::frontend::retained_frame_action;
 using prosper::frontend::select_present_source;
@@ -80,6 +81,20 @@ int main() {
           "with no extent contract a scanout pass still outranks the last pass");
     CHECK(select_present_source(0, 0, 0, 0) == PresentSourceChoice::None,
           "with no extent contract an empty submit still selects no source");
+
+    // ---- demotion: the one new semantic path, and the only one with no other witness ---------
+    // Unreachable on current master (a VO/front-buffer pass has its extent pinned to the present
+    // extent before it renders), so these assert the tripwire that would fire if that pin were
+    // relaxed — not live behaviour. Stated here so the next reader does not mistake them for it.
+    CHECK(present_source_demoted(PresentSourceChoice::Vo, k1080p, k4k) &&
+              present_source_demoted(PresentSourceChoice::Last, k1080p, 0) &&
+              present_source_demoted(PresentSourceChoice::Last, 0, k1080p),
+          "passing over a non-empty higher-priority candidate on extent counts as a demotion");
+    CHECK(!present_source_demoted(PresentSourceChoice::Front, k4k, k4k) &&
+              !present_source_demoted(PresentSourceChoice::Vo, 0, k4k) &&
+              !present_source_demoted(PresentSourceChoice::Last, 0, 0) &&
+              !present_source_demoted(PresentSourceChoice::None, k1080p, k1080p),
+          "choosing the top available candidate, or none at all, is not a demotion");
 
     // ---- the retained-frame net -------------------------------------------------------------
     // The permanence bug: a non-empty wrong-extent frame must NOT be retained, and the retained good
