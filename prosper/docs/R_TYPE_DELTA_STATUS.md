@@ -572,14 +572,21 @@ The luma plane is declared the same way and survived by luck: rejected, it takes
 broadcast to `(Y,Y,Y,Y)` and the shader reads `.x`, which is still Y. Only the two-channel plane
 loses information.
 
-The fix admits a one-layer 2D array (`depth ≤ 1`, no layer stride, no layer mip offset) and keeps
-rejecting real multi-layer arrays, whose slices are not one contiguous plane. The classification
+The fix admits a one-layer 2D array (`depth == 1`, no layer stride, no layer mip offset) and keeps
+rejecting real multi-layer arrays, whose slices are not one contiguous plane. `depth` is tested for
+**equality** with 1, not `<= 1`: the descriptor decoder emits `depth = LAST_ARRAY - BASE_ARRAY + 1`
+for an array type and **zero** when `LAST_ARRAY < BASE_ARRAY`, so zero is a malformed inverted array
+range rather than a single layer and must keep failing visibly. The classification
 moved to `frontends/shared/avplayer_plane_policy.hpp` with a unit test whose primary arm is R-Type's
-exact live descriptors; reverting the predicate to `img_dim == 1` fails 11 of its checks.
+exact live descriptors; reverting the predicate to `img_dim == 1` fails 11 of its checks, and
+loosening `depth == 1` to `depth <= 1` fails the three `depth == 0` rejections.
 
-Live result on the same throttled default route, `tools/screenshot`, unmodified binary and guest:
-the opening movie renders in full natural colour, peaking at **405,267 distinct colours** in one
-1920×1080 frame against **38,682** before.
+Live result on the deterministic `tools/dropcache.py` default route (#2019), `tools/screenshot`,
+unmodified binary and guest, 45 samples over 180 s: the opening movie renders in full natural colour
+across samples 00-05, at **8,584 to 315,101 distinct colours** per 1920×1080 frame against a pre-fix
+maximum of **38,682**. (An earlier figure of 405,267 in this section came from the superseded
+CPU-contention arm, not from this route; the numbers above are the route this document now
+describes.)
 
 <p align="center">
   <img src="../../assets/screenshots/rtype-delta-opening-movie-colour.png" alt="R-Type Delta HD Boosted: the opening movie's R-9 hangar shot rendered live in full, correct colour"><br>
