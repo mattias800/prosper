@@ -49,7 +49,7 @@ Last updated: 2026-08-05
 | *The Forgotten City* | `PPSA03026` | Unreal Engine | 🚧 Title screen | [#1890](https://github.com/mattias800/prosper/issues/1890) |
 | *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
 | *Little Nightmares III* | `PPSA05143` | Unreal Engine 4 | 🚧 Boot splash sequence; render thread stalls before the title | [#1893](https://github.com/mattias800/prosper/issues/1893) |
-| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Engine bootstrap completes; the first synchronous package load never returns, so no frame is composited | [#1894](https://github.com/mattias800/prosper/issues/1894) |
+| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Content streams and the engine submits real draws, then a declined GPU submit freezes every thread, so the display stays black | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Health warning and title screen; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Title screen | [#1898](https://github.com/mattias800/prosper/issues/1898) |
@@ -299,12 +299,12 @@ stops advancing the composited frame and Unreal's own watchdog ends the run
 
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
 
-The title is Unreal Engine 4.27 with IoStore packaging. It boots into a native Linux/Vulkan run and completes
-engine bootstrap — config, plugin manifest, asset registry, the global shader cache, the title's own shader
-archive and the Slate style set all load, 429 asset reads and no failures — and then the game thread blocks
-forever on its first synchronous package load. The engine never requests a single byte from the IoStore content
-container, submits exactly one command buffer carrying no draws, and composites no frame, so the display stays
-black and no screenshot is published. See the [tracker](https://github.com/mattias800/prosper/issues/1894).
+The title is Unreal Engine 4.27 with IoStore packaging. It boots into a native Linux/Vulkan run, completes
+engine bootstrap, and now streams real content: 394 reads served from the 8.49 GB IoStore container, real GPU
+draws, and nine composited frames. Then prosper declines one GPU submit it cannot order safely, and because the
+whole submit is discarded the completion the guest is waiting for is never written — all ninety guest threads
+park, from the game thread's render fence down through the render and RHI threads. Every composited frame is
+black, so no screenshot is published. See the [tracker](https://github.com/mattias800/prosper/issues/1894).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
 
