@@ -5727,16 +5727,45 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (const char* pl = getenv("PROSPER_PASS_LOG")) {
                         const uint64_t at = g_pass_log_submit.load(std::memory_order_relaxed);
                         const uint64_t pl_min = std::strtoull(pl, nullptr, 0);
-                        size_t nz = 0;
-                        for (size_t p = 0; p + 3 < rendered_pixels.size(); p += 4)
-                            if (rendered_pixels[p] || rendered_pixels[p + 1] ||
-                                rendered_pixels[p + 2]) nz++;
+                        // px_nonblack must be counted in the PASS's OWN format. The original loop
+                        // stepped 4 bytes and tested bytes `p`, `p+1`, `p+2` — never `p+3` — as if
+                        // every target were 8-bit RGBA. Over an 8-byte FP16 texel that reads
+                        // {R_lo, R_hi, G_lo} and then {B_lo, B_hi, A_lo}, so whether a texel counts
+                        // depends only on where a half-float happens to put its non-zero bytes.
+                        // Measured on Sonic Origins' 3840x2160 R16G16B16A16_SFLOAT scene target, whose
+                        // texels are RGB bit-zero with alpha 0x3c05 (1.00488): byte 6 is that alpha's
+                        // low mantissa byte 0x05, which lands on the second group's `p+2`, so exactly
+                        // one of the two groups per texel counted and the line reported 8,294,400 —
+                        // precisely w*h, reading as "every pixel has content" for a frame with no
+                        // colour in it at all. An alpha of exactly 1.0 would have counted ZERO:
+                        // 0x3c00's only non-zero byte is the `p+3` this loop skipped. The number was
+                        // never a property of the image, only of its bit layout — and it survived long
+                        // enough to become a hypothesis (#1905). Count through the same inspection
+                        // conversion the persistent dump uses; -1 says the format has no conversion,
+                        // which is honest where a wrong number is not.
+                        long long nz = 0;
+                        const bool direct_rgba8 = pass_format == VK_FORMAT_R8G8B8A8_UNORM &&
+                            rendered_pixels.size() == static_cast<size_t>(gw) * gh * 4u;
+                        const std::vector<uint8_t> inspected = direct_rgba8
+                            ? std::vector<uint8_t>{}
+                            : inspection_rgba8(rendered_pixels, gw, gh, pass_format);
+                        const std::vector<uint8_t>& counted =
+                            direct_rgba8 ? rendered_pixels : inspected;
+                        if (!rendered_pixels.empty() && counted.empty()) nz = -1;
+                        else
+                            for (size_t p = 0; p + 3 < counted.size(); p += 4)
+                                if (counted[p] || counted[p + 1] || counted[p + 2]) nz++;
                         // In-window: every pass. Out of window: only content-bearing (or deferred)
-                        // passes, so the publish source can be found without knowing the callback.
-                        if ((at >= pl_min && at < pl_min + 3u) || nz > 100 || defer_readback)
+                        // passes, so the publish source can be found without knowing the callback —
+                        // plus `nz < 0`, a pass whose format the inspection path cannot convert. That
+                        // last case has to stay visible out of window: it is the one where this line
+                        // cannot say whether the pass carries content, which is exactly when the
+                        // reader needs to know the pass existed.
+                        if ((at >= pl_min && at < pl_min + 3u) || nz > 100 || nz < 0 ||
+                            defer_readback)
                             fprintf(stderr,
                                     "[pass] cb=%llu pass=%zu/%zu base=0x%llx %ux%u fmt=%d vo=%d "
-                                    "seed=%d defer=%d writes=%llu px_nonblack=%zu\n",
+                                    "seed=%d defer=%d writes=%llu px_nonblack=%lld\n",
                                     (unsigned long long)at, pass_i, items.size(),
                                     (unsigned long long)base, gw, gh, (int)pass_format,
                                     (int)is_vo, (int)seed_rtt, (int)defer_readback,
@@ -5827,15 +5856,56 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             size_t rgbnz = 0;
                             for (size_t p = 0; p + 3 < rgba.size(); p += 4)
                                 if (rgba[p] || rgba[p + 1] || rgba[p + 2]) rgbnz++;
+                            // "Black" and "empty" are different findings, and `rgb_nonblack` alone
+                            // cannot tell them apart: an HDR target whose texels are negative,
+                            // non-finite or below 1/510 converts to black from bits that are NOT
+                            // zero, which is a different defect signature from a zero-filled buffer
+                            // (#1905 recorded the wrong one from the converted count alone). Report
+                            // the PRE-conversion evidence beside it: how many raw bytes are non-zero,
+                            // and the first non-zero texel's own bytes, so the row a lane writes down
+                            // is a measurement.
+                            size_t rawnz = 0;
+                            size_t first_nz_texel = 0;
+                            bool have_first = false;
+                            const uint32_t texel_bytes = px.size() && s.w && s.h
+                                ? (uint32_t)(px.size() / ((size_t)s.w * s.h)) : 0;
+                            for (size_t i = 0; i < px.size(); i++) {
+                                if (!px[i]) continue;
+                                rawnz++;
+                                if (!have_first && texel_bytes) {
+                                    first_nz_texel = i / texel_bytes;
+                                    have_first = true;
+                                }
+                            }
+                            // Two distinct sentinels, not one: "none" is the finding "no byte of this
+                            // target is non-zero", while an unprintable texel stride is the
+                            // instrument declining to answer. Sharing one string would let the
+                            // second read as the first — a silent zero, which is the class of lie
+                            // this whole diagnostic exists to stop reporting. Unreachable today
+                            // (every format the census dumps is <= 16 B/texel), so the point is that
+                            // it stays unambiguous if a wider one ever appears.
+                            char first_text[96] = "none";
+                            if (have_first && (!texel_bytes || texel_bytes > 16))
+                                std::snprintf(first_text, sizeof first_text,
+                                              "unprintable (%u bytes/texel)", texel_bytes);
+                            if (have_first && texel_bytes && texel_bytes <= 16) {
+                                int at = std::snprintf(first_text, sizeof first_text,
+                                                       "texel %zu =", first_nz_texel);
+                                for (uint32_t b = 0; b < texel_bytes && at > 0 &&
+                                                    at < (int)sizeof first_text - 4; b++)
+                                    at += std::snprintf(first_text + at, sizeof first_text - at,
+                                                        " %02x", px[first_nz_texel * texel_bytes + b]);
+                            }
                             char fn[512];
                             std::snprintf(fn, sizeof fn, "%s/persist_s%04llu_%llx_%ux%u.bmp",
                                           dd ? dd : ".", (unsigned long long)sub,
                                           (unsigned long long)kv.first, s.w, s.h);
                             prosper::test::dump_bmp(fn, rgba, s.w, s.h);
                             fprintf(stderr, "[persist] submit=%llu addr=0x%llx %ux%u fmt=%u "
-                                    "rgb_nonblack=%zu/%u\n", (unsigned long long)sub,
+                                    "rgb_nonblack=%zu/%u raw_nonzero_bytes=%zu/%zu first_nonzero=%s\n",
+                                    (unsigned long long)sub,
                                     (unsigned long long)kv.first, s.w, s.h, (unsigned)s.format,
-                                    rgbnz, s.w * s.h);
+                                    rgbnz, s.w * s.h, rawnz, px.size(), first_text);
                         }
                     }
                 }
