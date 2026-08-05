@@ -8,7 +8,7 @@ bugs. Different title revisions may behave differently.
 Detailed investigation notes, measurements, known defects, and next steps live in the linked
 [game-tracker issues](https://github.com/mattias800/prosper/issues?q=is%3Aissue+%22%5BGame+tracker%5D%22).
 
-Last updated: 2026-08-04
+Last updated: 2026-08-05
 
 ## Summary
 
@@ -21,7 +21,7 @@ Last updated: 2026-08-04
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 Frontend loop; no visual milestone yet | [#1871](https://github.com/mattias800/prosper/issues/1871) |
-| *Sonic Frontiers* | `PPSA03831` | — | 🔬 Initial compatibility run pending | [#1891](https://github.com/mattias800/prosper/issues/1891) |
+| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🔬 4K opening logo sequence; frames stop before the title screen | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | — | 🔬 Initial compatibility run pending | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
@@ -108,7 +108,12 @@ The complete base game, update, and installed DLC reach the frontend loop, but n
 
 ## Sonic Frontiers — `PPSA03831`
 
-No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1891).
+<p align="center"><img src="assets/screenshots/sonic-frontiers-opening-sequence.png" alt="Sonic Frontiers — opening logo sequence"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-sonic-team-logo.png" alt="Sonic Frontiers — Sonic Team logo"></p>
+
+A default launch reaches the game's own opening logo sequence, composited by the live renderer at
+3840×2160. Frame production then stops before a title screen is reached. See the
+[tracker](https://github.com/mattias800/prosper/issues/1891).
 
 ## Sonic Racing: CrossWorlds — `PPSA08804`
 
