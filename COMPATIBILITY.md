@@ -117,7 +117,9 @@ A default launch reaches the game's own opening logo sequence, composited by the
 
 ## Sonic Racing: CrossWorlds — `PPSA08804`
 
-No verified compatibility run has been recorded yet. See the [tracker](https://github.com/mattias800/prosper/issues/1895).
+The Unreal Engine 5 guest completes core initialization and then stalls: its `IoService` thread spins on an
+IoStore command-buffer capacity query and no frame is produced. No visual compatibility milestone is claimed
+yet. See the [tracker](https://github.com/mattias800/prosper/issues/1895).
 
 ## Terminator 2D: NO FATE — `PPSA25872`
 
