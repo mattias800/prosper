@@ -226,7 +226,13 @@ yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues
 
 The Clear River Games publisher logo and the full opening movie — the R-9 fighter in its hangar — render live at 1920×1080 from the real GPU command stream. Colours are wrong: greys render green and the image carries a magenta cast ([#2005](https://github.com/mattias800/prosper/issues/2005)). After the movie every frame collapses to a single colour while the frame loop keeps advancing ([#2006](https://github.com/mattias800/prosper/issues/2006)), so the title screen is not reached.
 
-Reaching this needs the **host CPU loaded**. The title's input worker sleeps 400 ms before its first `sceUserServiceGetEvent` drain, and on a fast host prosper finishes the asset load in ~250 ms — so the shell runs first, dereferences an empty user vector and dies. Contending the CPU stretches the load to ~1133 ms and the title survives its own race. Every guest sleep is honoured exactly and every service answer is faithful; a PS5's slower core is what makes this title ship working. See the [tracker](https://github.com/mattias800/prosper/issues/1810) and [#1746](https://github.com/mattias800/prosper/issues/1746).
+Reaching this needs the game's files **evicted from the host page cache** first, which takes one command and no change to how the title is launched:
+
+```bash
+python3 prosper/tools/dropcache.py <DUMP_ROOT>/PPSA26414-app0    # then launch normally
+```
+
+The title's input worker sleeps 400 ms before its first `sceUserServiceGetEvent` drain, and on a fast host prosper finishes the asset load well inside that window — so the shell runs first, dereferences an empty user vector and dies. Reading the assets from storage rather than from cache stretches the load past the 400 ms mark and the title survives its own race. (Repeat the eviction before each launch: the run itself re-warms the cache.) Every guest sleep is honoured exactly and every service answer is faithful — a PS5's slower core is what makes this title ship working, and prosper simply executes the game's own loader faster than the console it is emulating. See the [tracker](https://github.com/mattias800/prosper/issues/1810) and [#1746](https://github.com/mattias800/prosper/issues/1746).
 
 ## Nikoderiko: The Magical World — `PPSA23760`
 
