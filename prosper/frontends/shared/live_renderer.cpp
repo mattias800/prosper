@@ -4803,6 +4803,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 std::shared_ptr<const std::vector<uint8_t>> px_front;
                 std::shared_ptr<const std::vector<uint8_t>> px_vo;
                 std::shared_ptr<const std::vector<uint8_t>> px_last;
+                // Each candidate's own target extent and base, kept only so a publish-extent
+                // mismatch can name its source. A pass is selected below on identity (front buffer
+                // / any registered scanout / last RGBA8 pass) with no extent contract, so a title
+                // whose last RGBA8 pass is an internal target smaller than the scanout returns a
+                // frame the caller cannot publish (#1968).
+                uint32_t px_front_w = 0, px_front_h = 0;
+                uint32_t px_vo_w = 0, px_vo_h = 0;
+                uint32_t px_last_w = 0, px_last_h = 0;
+                uint64_t px_last_base = 0;
                 // Render-target persistence (default on; PROSPER_RTT_NOSEED reverts to per-pass blue
                 // clear): seed each group's framebuffer with the pixels last rendered into that SAME
                 // target VA, so a pass that draws into an already-written target (UE4's UI pass onto
@@ -5642,9 +5651,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                     }
                     if (!rendered_pixels.empty() && pass_format == VK_FORMAT_R8G8B8A8_UNORM) {
-                        if (base && base == front_va) px_front = pass_pixels;  // the flipped buffer
-                        if (is_vo)                    px_vo = pass_pixels;     // any registered scanout
+                        if (base && base == front_va) {                          // the flipped buffer
+                            px_front = pass_pixels; px_front_w = gw; px_front_h = gh;
+                        }
+                        if (is_vo) {                                            // any registered scanout
+                            px_vo = pass_pixels; px_vo_w = gw; px_vo_h = gh;
+                        }
                         px_last = pass_pixels;                                  // last non-empty (fallback)
+                        px_last_w = gw; px_last_h = gh; px_last_base = base;
                     } else if (!rendered_pixels.empty() && prefix_inspect_publish()) {
                         // #1330: under gpu_replay's ordered-prefix inspection (--draw/--draw-steps/
                         // --through-operation set PROSPER_PREFIX_INSPECT), a prefix ending on a
@@ -5681,6 +5695,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // Present priority: the flipped front buffer > any registered scanout target > the
                 // legacy "last group" fallback (unchanged behavior when no group targets a VO buffer).
                 selected_pixels = px_front ? px_front : (px_vo ? px_vo : px_last);
+                // Fail-visible: the selection above is by target IDENTITY only. When the chosen pass
+                // is not the size the caller asked for, the caller's publish gate drops the frame
+                // silently, so say so here — with the source and its extent — rather than leaving the
+                // publish counter to stop for no stated reason (#1968). Rate-limited; diagnostic only.
+                if (selected_pixels && !selected_pixels->empty() &&
+                    selected_pixels->size() != static_cast<size_t>(w) * h * 4) {
+                    static std::atomic<int> logged{0};
+                    const int n = logged.fetch_add(1);
+                    if (n < 32)
+                        fprintf(stderr,
+                                "[rtt] PRESENT SOURCE EXTENT MISMATCH: selected %s at %ux%u "
+                                "(base=0x%llx) for a requested %ux%u frame — %zu bytes vs %zu "
+                                "expected; the caller cannot publish it%s\n",
+                                px_front ? "px_front" : (px_vo ? "px_vo" : "px_last"),
+                                px_front ? px_front_w : (px_vo ? px_vo_w : px_last_w),
+                                px_front ? px_front_h : (px_vo ? px_vo_h : px_last_h),
+                                (unsigned long long)(px_front || px_vo ? front_va : px_last_base),
+                                w, h, selected_pixels->size(),
+                                static_cast<size_t>(w) * h * 4,
+                                n == 31 ? " [further reports suppressed]" : "");
+                }
                 {
                     const uint64_t at = g_pass_log_submit.fetch_add(1);
                     if (const char* pl = getenv("PROSPER_PASS_LOG")) {
