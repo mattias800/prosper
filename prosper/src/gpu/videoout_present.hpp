@@ -47,13 +47,6 @@ bool videoout_copy_front_buffer(std::vector<uint8_t>& out, VideoOutBufferSnapsho
 size_t videoout_copy_front_buffer(void* dst, size_t dst_cap,
                                   VideoOutBufferSnapshot* metadata = nullptr);
 
-// The same read as an IMAGE: `out` is linear width*height*4 RGBA, de-swizzled from the registered
-// tiling mode. Use this wherever the result is treated as pixels; the raw copies above stay raw for
-// diagnostics that want guest bytes exactly as they are. False means the buffer is not registered,
-// its generation changed, or its backing is smaller than its own swizzle implies.
-bool videoout_read_buffer_linear(const VideoOutBufferSnapshot& expected, std::vector<uint8_t>& out);
-bool videoout_read_front_linear(std::vector<uint8_t>& out, VideoOutBufferSnapshot& metadata);
-
 } // namespace prosper
 
 namespace prosper::gpu {
