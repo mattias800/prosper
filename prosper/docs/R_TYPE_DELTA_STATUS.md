@@ -272,12 +272,13 @@ LOGIN event has been drained. That is the whole argument, and it is a property o
 
 The drain loop runs on exactly one thread. `eboot+0x23860` (containing it) is called only from
 `eboot+0x49190`, which is called from `eboot+0x49070` — the INPUT worker body — and from
-`eboot+0x49130`, which has **no code reference and no relocation anywhere in the module** (dead
-code). `eboot+0x49070`'s first two actions are `vtbl[0](this)` and `vtbl[8](this, 0x190)`; vtable slot
-`eboot+0x411048` holds `eboot+0x23210` = `Sleep(ms)` → `eboot+0x19e0` → `sceKernelUsleep(ms * 1000)`.
-The
-thread entry `eboot+0x22f10` reaches that body immediately (four instructions, no branch), so the
-400 ms clock starts within microseconds of the `[thread] create … name=INPUT` line.
+`eboot+0x49130`, which is **dead code**: no call or jump targets it in a full linear disassembly of
+the text segment, no relocation carries it as an addend, and neither the 4- nor the 8-byte
+little-endian encoding of `0x49130` occurs anywhere in the 7.6 MB image. `eboot+0x49070`'s first two
+actions are `vtbl[0](this)` and `vtbl[8](this, 0x190)`; vtable slot `eboot+0x411048` holds
+`eboot+0x23210` = `Sleep(ms)` → `eboot+0x19e0` → `sceKernelUsleep(ms * 1000)`. The thread entry
+`eboot+0x22f10` reaches that body immediately (four instructions, no branch), so the 400 ms clock
+starts within microseconds of the `[thread] create … name=INPUT` line.
 
 So the vector cannot be non-empty before the worker's first drain, **whatever any Sony API returns**.
 That is a statement about the guest's call graph, not a measurement.
