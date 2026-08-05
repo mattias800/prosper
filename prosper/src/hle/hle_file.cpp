@@ -987,8 +987,10 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
             // #1659: was a two-branch dispatcher whose eboot base was the stale pre-#825 literal
             // (the il2cpp one was current). This formatter already carried a per-entry module tag, so
             // unlike [preadlog] above it can name every module correctly.
+            // #2000: ..._code, not ..._in_module — a stub address IS a real guest address, but it
+            // names prosper's own import trampoline rather than the guest caller this chain is for.
             const char* m = nullptr; uint64_t o = 0;
-            if (prosper::guest_va_in_module(v)) {
+            if (prosper::guest_va_in_module_code(v)) {
                 m = prosper::guest_module_name(v); o = prosper::guest_module_offset(v);
             }
             if (m && o != last) { p += snprintf(line + p, sizeof line - p, " %s+%llx", m, (unsigned long long)o); last = o; nf++; }
@@ -2067,12 +2069,18 @@ int prosper_apr_match_by_size(uint64_t size, std::string* out_path) {
 // decision — it only annotates a log line, so an imprecise hit costs nothing but a wider window to
 // disassemble. Appended to the existing filelog-gated MISS line, so the default log is unchanged.
 //
-// THREE candidates, not one, because a stack word can be residue rather than a live return address:
+// SEVERAL candidates, not one, because a stack word can be residue rather than a live return address:
 // measured on Sonic Origins, the DLC wave-bank misses reported `ra=eboot+0xef4a8 ra2=eboot+0xf0609`,
 // which disassemble to exactly `call <wrapper>` / `call <APR import>` return sites — a real chain —
 // while the UI misses' first candidate landed in a block of `lea rax,[rip+…]; ret` type-name thunks
 // that cannot have called anything. Reading the annotation therefore means checking each address:
 // the one preceded by a `call` is the caller. `tools/re/edis.py <flattened.elf> <addr>` does that.
+//
+// Six rather than three, because on the case this was built for three was not enough: residue took
+// one slot and the two-deep APR wrapper chain (`exists()` -> errno wrapper -> import) took the other
+// two, so the engine frame that actually wanted the file — the only one that answers "what does the
+// caller do when the answer is no?" — fell off the end of the line. The cost of a wider window is a
+// longer log line in a gated diagnostic; the cost of a narrow one was a whole lane of guessing.
 static std::string apr_miss_callsite() {
     volatile uint64_t* stack_scan = (uint64_t*)__builtin_frame_address(0);
     // 96 words (768 B) matches the fence1-builder precedent, and it is additionally clamped to this
@@ -2084,15 +2092,17 @@ static std::string apr_miss_callsite() {
     const int stack_limit = stack_words_above((uint64_t*)stack_scan);
     if (stack_limit < max_words) max_words = stack_limit;
 #endif
-    uint64_t ra[3] = {0, 0, 0};
+    static constexpr int kCandidates = 6;
+    uint64_t ra[kCandidates] = {0, 0, 0, 0, 0, 0};
     int found = 0;
-    for (int i = 1; i < max_words && found < 3; i++) {
+    for (int i = 1; i < max_words && found < kCandidates; i++) {
         const uint64_t v = stack_scan[i];
         if (prosper::guest_va_in_module_code(v)) ra[found++] = v;
     }
     if (!found) return std::string();
     std::string text;
-    static const char* const kLabel[3] = {" ra=", " ra2=", " ra3="};
+    static const char* const kLabel[kCandidates] = {" ra=", " ra2=", " ra3=",
+                                                   " ra4=", " ra5=", " ra6="};
     for (int i = 0; i < found; i++) {
         char one[96];
         snprintf(one, sizeof one, "%s%s+0x%llx", kLabel[i],
@@ -2463,13 +2473,18 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
         // wrapper submitted this read — sync mount path vs async FAPREventQueue path, issue #115).
         if (entry_rsp) {
             const uint64_t* sp = (const uint64_t*)entry_rsp;
+            // #2000: never walk past the thread's stack top (the same clamp apr_miss_callsite uses).
+            const int maxw = stack_words_above((uint64_t*)(uintptr_t)entry_rsp);
             int shown = 0;
-            for (int i = 0; i < 160 && shown < 6; i++) {
+            for (int i = 0; i < 160 && i < maxw && shown < 6; i++) {
                 uint64_t v = sp[i];
                 // Was `>= 0x400000000` with an "eboot+" label subtracting the same literal (#1659):
                 // that base is the PRE-#825 eboot address, so every offset was 0x10000000 too high,
                 // and the range covered IL2CPP/PSN modules too — all labelled "eboot".
-                if (!prosper::guest_va_in_module(v)) continue;
+                // #2000: ..._code, not ..._in_module. A stub address passes the weaker predicate and
+                // then names prosper's own import trampoline as if it were the guest caller, pushing
+                // the real caller down or off the end of the six reported slots.
+                if (!prosper::guest_va_in_module_code(v)) continue;
                 fprintf(stderr, "[apr]   guest-ra[%d] = %s+0x%llx\n", i,
                         prosper::guest_module_name(v),
                         (unsigned long long)prosper::guest_module_offset(v));
