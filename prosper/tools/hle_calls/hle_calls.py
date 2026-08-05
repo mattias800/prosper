@@ -168,10 +168,12 @@ def main():
     ap.add_argument("--timeout", type=int, default=600, help="seconds (default 600)")
     args = ap.parse_args()
 
-    if (args.pid is None) == (not args.launch):
-        sys.exit("hle_calls: pass exactly one of --pid <pid> or --launch <program> [args...]")
+    # `--launch` with nothing after it parses as an empty REMAINDER, which is falsy — check that case
+    # first so it gets its own message instead of the generic "pass exactly one" one.
     if args.launch is not None and not args.launch:
         sys.exit("hle_calls: --launch needs a program to run")
+    if (args.pid is None) == (not args.launch):
+        sys.exit("hle_calls: pass exactly one of --pid <pid> or --launch <program> [args...]")
 
     if args.launch:
         binary = args.binary or args.launch[0]
