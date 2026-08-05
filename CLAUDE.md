@@ -289,6 +289,22 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   treat every one you hit on a live boot as the next thing to implement. Find the exact failing op with
   `PROSPER_DBG=1` (`[recompile-reject] pc=… op=0x…` from the recompiler) or the `[compute] … skipped`
   lines from the live backend, then implement it with a round-trip/execution test — do not leave it skipped.
+- **Entitlement and add-content APIs answer from LOCAL INVENTORY — never blanket-approve.** When a
+  title asks whether an add-on or entitlement is owned, prosper answers from the content actually
+  declared and present locally (`src/hle/hle_addcontent.cpp` parses real entitlement labels and keys
+  and rejects malformed or duplicated ones). That is the right design for a preservation tool, and it
+  is deliberate: a compatibility layer must keep working when the licensing service it would
+  otherwise consult no longer exists, so the answer has to be derivable offline.
+  **What must never happen is making these calls return "owned" unconditionally to get a title past a
+  check.** The distinction is not cosmetic. Faithfully reimplementing a *platform* query — what system
+  software this is, whether a user is signed in — is exactly the job, the same way Wine answers
+  `GetVersionEx`. Manufacturing a positive answer to an *ownership* query is not reimplementation; it
+  is the emulator performing the circumvention itself, and it would make prosper a circumvention tool
+  rather than a compatibility layer no matter how the code were phrased.
+  This is written down because the failure mode is attractive: a title stalls at a content check, one
+  `return 1` makes it progress, and the change looks like progress in a screenshot. If a title cannot
+  advance because content is genuinely absent, that is the honest result — record it as the blocker
+  and, if the content exists locally, wire it through the inventory. `CONFIDENCE: HIGH`.
 - **PR verification and merging.** Keep each PR description self-contained: link the issue or goal, explain the
   failure scenario and behavioral contract, summarize the approach and important invariants, identify affected
   and deliberately unaffected behavior, record risks, and list the exact build/test/snapshot commands and
