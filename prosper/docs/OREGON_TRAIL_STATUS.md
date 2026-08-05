@@ -1,12 +1,25 @@
 # The Oregon Trail (`PPSA19244`) — status and evidence
 
-Unreal Engine 4. **Rung 1 — real graphics.** Since #1933 landed the ErrorDialog foreground
+Unreal Engine 4. **Rung 2 — title screen** (2026-08-05, master `c77c66b4`;
+`assets/screenshots/oregon-trail-title-screen.png`). Since #1933 landed the ErrorDialog foreground
 lifecycle, the title renders its startup legal/EULA popup (`WBP_System_Disclaimer_Popup`) at native
 3840x2160 from the live renderer. Tracked on
 [#1606](https://github.com/mattias800/prosper/issues/1606) and
 [#1641](https://github.com/mattias800/prosper/issues/1641).
 
-## Where it stands (2026-08-05)
+## Where it stands (2026-08-05, later)
+
+**Rung 2 reached: the title screen renders.** At master `c77c66b4`, seven default-launch arms on an
+idle host produced **zero** #1945 faults and zero exit-90 (bounds 12 s / 15 s / 32 s / 60 s); the 60 s
+arm ran 3,689 guest frames, every sample pixel-distinct, ending on the rendered *The Oregon Trail*
+title screen with its "Press any button" prompt
+(`assets/screenshots/oregon-trail-title-screen.png`). Neither the ordered-DMA stall below (closed by
+#1987) nor #1945 bounds a default launch any more. The #1945 non-reproduction is a **timing**
+result, not a code one — the same binary previously produced 10/10 exit-90 — see `## Ruled out`.
+The next frontier here is a route past the title screen, plus #1946 (Slate glyphs as solid blocks,
+visible in the screenshot).
+
+## Where it stood earlier on 2026-08-05
 
 The startup sequence now runs **past** the EULA stage. On a default launch the title presents, in
 order: the legal popup, the **Gameloft splash** (`assets/screenshots/oregon-trail-gameloft-splash.png`),
@@ -168,6 +181,7 @@ re-derive these without contradictory new evidence.
 
 | Hypothesis | Verdict and evidence | Source |
 |---|---|---|
+| #1945 bounds **every** run on this title, so it is the reproducible member of that issue's four-title family | **Falsified at master `c77c66b4` on an idle host — and the title now reaches the TITLE SCREEN.** Seven arms on 2026-08-05, two with diagnostics and five clean, at 12 s / 15 s / 32 s / 60 s bounds: **zero** `WORKER-THREAD FAULT` lines, zero exit-90, every sample pixel-distinct. The longest arm ran **60 s / 3,689 guest frames** and its last sample is the rendered *The Oregon Trail* title screen with the "Press any button" prompt (`assets/screenshots/oregon-trail-title-screen.png`) — a **rung 2** this doc previously recorded as never reached. The earlier 10/10 exit-90 census was measured on the same binary (`278c9b1f`; `c77c66b4` is its docs-only child), so the difference is **timing, not code**: this is a write-after-free race whose window widens under machine/GPU contention, which also explains the 2/7, 3/4 and 1/4 rates on the other three titles. Do not plan work here on the assumption that a default launch reproduces #1945. | #1945 |
 | The `R11G11B10F` compute write-back notifier gap (Syberia #1619) explains the black scene here | **Falsified.** The precondition holds — the scene-colour target really is `R11G11B10_FLOAT` — but the notifier is only reached from `live_compute.cpp` under `bi.mirror_result_to_imported`, i.e. when a dispatch writes a *renderer-owned* storage image. A validated live trace with `PROSPER_COMPUTELOG=1` (which does **not** clear `live_gpu_targets`) produced **11,440 `[compute]` lines and zero** `mirrored storage result into renderer RTT` lines; every storage image in the run logs `renderer_owned=0`. **The notifier is never invoked by this title.** CONFIDENCE: HIGH. | #1606 |
 | Prosper's `CB_COLOR_CONTROL` tracking is stale, unwritten, or folds wrongly, and the `MODE` decode is wrong | **Falsified — the tracking is exact.** `PROSPER_REGWATCH` over ~14 s records **12,390** `CB_COLOR_CONTROL` writes and 11,358 `CB_TARGET_MASK` writes, all on the indirect (`Set*RegsIndirect`) path. `MODE=1` (`CB_NORMAL`) is the **dominant** value at 9,346 writes versus 1,335 `MODE=0`, a 7:1 ratio. Joined correctly against each draw's own `command_order`, all **1,050 of 1,050** suppressed draws resolve exactly the `CB_COLOR_CONTROL` and `CB_TARGET_MASK` the guest wrote at or before that draw — **zero mismatches**. The guest deliberately programs `CB_DISABLE` on these draws, immediately before each one. The decode is sound in the other direction too: the same title's post-process draws decode `MODE=1` and render. **Do not force `MODE=1`** — it is not a fix, and `PROSPER_FORCE_COLORWRITE=1` leaves the frame byte-identically black. **Amended by #1724:** this row's finding stands (the decode is exact and the guest deliberately programs `CB_DISABLE`), but prosper no longer *acts* on `MODE` when deriving the colour write mask — the mask comes from `CB_TARGET_MASK & CB_SHADER_MASK` alone. If this title's suppressed draws carry a non-zero mask they now write; re-measure before reasoning from the old suppression counts. | #1606 |
 | This is Astro Bot's colour-state signature (#1585), or #305's stale/unwritten-register family | **Falsified.** #1585 records `MODE=1` occurring *zero* times in an entire Astro frame; here it is dominant 7:1. Do not correlate these investigations on that basis. | #1606 |
