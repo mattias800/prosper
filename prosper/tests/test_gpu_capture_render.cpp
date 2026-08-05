@@ -1018,6 +1018,42 @@ int main() {
                   static_cast<size_t>(producer.color0_width) * producer.color0_height * 4,
           "compute reader materializes a deferred GPU-only graphics target on demand");
 
+    // #1986, end to end on the SAME two passes the check above just made: outside a publish-gate
+    // submit the last pass comes back at its own 16x16 extent (that is the contract gpu_replay's
+    // prefix inspection and this test depend on); inside one it must not, because the gate publishes
+    // only width*height*4 bytes and would discard it, leaving the guest submitting into a frozen
+    // screen with nothing saying why (Sonic Frontiers, #1968). PresentSubmitScope is exactly what
+    // execute_ordered_and_present opens around its own render, so this exercises the production
+    // discriminator rather than a test-only switch.
+    {
+        prosper::gpu::PresentSubmitScope present_submit_scope;
+        CHECK(prosper::gpu::present_submit_in_progress(),
+              "PresentSubmitScope makes the publish extent contract observable to the renderer");
+        // A full-extent submit first, so the renderer holds a publishable frame to fall back on.
+        DrawItem present_extent_pass = replay.items[0];
+        present_extent_pass.color0_base = 0x510000;
+        const std::vector<uint8_t> full = render_submit_items({present_extent_pass}, W, H);
+        CHECK(full.size() == static_cast<size_t>(W) * H * 4,
+              "a pass at the present extent is returned and retained under the extent contract");
+        const std::vector<uint8_t> undersized = render_submit_items({producer, consumer}, W, H);
+        CHECK(undersized.size() != static_cast<size_t>(16) * 16 * 4,
+              "under the extent contract a 16x16 pass is never the present source for a 64x64 frame");
+        CHECK(undersized.size() == static_cast<size_t>(W) * H * 4,
+              "under the extent contract the retained present-extent frame is served instead");
+        // The discriminating case: request an extent that NEITHER the rendered pass nor the retained
+        // frame matches. The check above is satisfied by the retained-frame net alone, so without this
+        // one a selection rule that still picked the undersized pass would go undetected — and so
+        // would a net that served a stale frame of the wrong size. Handing back either is handing the
+        // caller something it must throw away.
+        const std::vector<uint8_t> mismatched = render_submit_items({producer, consumer}, 32, 32);
+        CHECK(mismatched.size() != static_cast<size_t>(16) * 16 * 4,
+              "a pass smaller than a changed present extent is still not the present source");
+        CHECK(mismatched.empty(),
+              "when neither the rendered pass nor the retained frame fits, no frame is handed back");
+    }
+    CHECK(!prosper::gpu::present_submit_in_progress(),
+          "the publish extent contract ends with its scope");
+
     // A native 32x32 offscreen target receives a scissor that was globally scaled from 32 to 16
     // for the 128->64 presentation reduction above. The pass-local target correction must undo that
     // scale for scissors as well as viewports. Otherwise only the target's top-left 16x16 quadrant is

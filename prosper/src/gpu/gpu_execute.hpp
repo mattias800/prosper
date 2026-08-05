@@ -1874,6 +1874,31 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height,
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
                                  uint64_t submit_no = 0, bool publish = true);
 
+// The extent contract between the live renderer and the publish gate (#1986). Both *_and_present
+// functions publish a frame only when its byte count is exactly width*height*4 and silently discard
+// anything else, so inside such a submit a rendered pass of a different extent is not a present
+// source at all — the renderer must not hand one back, or the frame is dropped with the guest still
+// submitting and nothing saying why (Sonic Frontiers, #1968).
+//
+// That contract holds ONLY for a submit destined for the gate. render_submit_items — gpu_replay's
+// ordered-prefix inspection (--draw / --draw-steps / --through-operation) and the renderer's own
+// tests — deliberately consumes the LAST PASS AT ITS OWN EXTENT and infers the extent from the
+// returned byte count afterwards, which is a different and equally deliberate contract (#1330,
+// #526). A scope rather than a callback parameter because that signature is shared by every
+// consumer, including replay-owned renderers; the callback is invoked synchronously on the
+// submitting thread, so the state is thread-local. Nesting is counted, so an inner scope cannot
+// end an outer one.
+class PresentSubmitScope {
+public:
+    PresentSubmitScope();
+    ~PresentSubmitScope();
+    PresentSubmitScope(const PresentSubmitScope&) = delete;
+    PresentSubmitScope& operator=(const PresentSubmitScope&) = delete;
+};
+
+// True while this thread is inside a submit whose frame will reach the publish gate.
+bool present_submit_in_progress();
+
 // The 64 KiB Global Data Share. Compute shaders reach it through the internal binding installed when
 // a kernel decodes a `ds_*` instruction with the GDS flag; the command processor reaches it here,
 // because DMA_DATA can name a GDS OFFSET rather than a guest address as its endpoint (Sony's own

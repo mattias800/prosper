@@ -6588,6 +6588,14 @@ GuestGpuWriteQuery guest_gpu_writes_since(const GuestGpuWriteSnapshot& snapshot,
     return GuestGpuWriteQuery::Unchanged;
 }
 LiveRenderPhase live_render_phase()       { return g_live_phase; }
+
+// See PresentSubmitScope in gpu_execute.hpp. Thread-local and counted: the renderer callback runs
+// synchronously on the submitting thread, and a nested scope must not end its parent's.
+namespace { thread_local unsigned g_present_submit_depth = 0; }
+PresentSubmitScope::PresentSubmitScope()  { ++g_present_submit_depth; }
+PresentSubmitScope::~PresentSubmitScope() { --g_present_submit_depth; }
+bool present_submit_in_progress()         { return g_present_submit_depth != 0; }
+
 std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
                                          uint32_t width, uint32_t height) {
     if (!g_live) return {};
@@ -6606,6 +6614,11 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     // Reuse positive page/VirtualQuery results only inside this synchronous execution window; the
     // scope is discarded before guest code can submit a later mapping generation.
     GuestReadableSubmitScope guest_readable_scope;
+    // This submit's frame is headed for the publish gate below, so the renderer owes us a frame of
+    // exactly width*height*4 bytes (#1986). Opened regardless of `publish`: the gate's extent test
+    // is independent of it, and the frame also feeds the capture, so the contract must not differ
+    // between a published and an unpublished submit.
+    PresentSubmitScope present_submit_scope;
     notify_compute_authority_unknown(
         ComputeAuthorityBoundaryKind::SubmitBegin, submit_no);
     using TimingClock = std::chrono::steady_clock;
@@ -6689,6 +6702,26 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     notify_compute_authority_unknown(
         ComputeAuthorityBoundaryKind::SubmitEnd, submit_no);
     const bool frame_ready = px.size() == static_cast<size_t>(width) * height * 4;
+    // A submit that RENDERED but whose frame does not match the requested extent is dropped here
+    // with no trace anywhere: the frontend's own failure log prints only for an EMPTY frame
+    // (instrument trap 87), so a non-empty wrong-extent frame is silently discarded and the
+    // publish counter simply stops. Sonic Frontiers' publish freeze (#1968) lived in exactly that
+    // blind spot through two investigations — the guest kept submitting, the renderer kept
+    // producing pixels, and nothing said why nothing reached the screen. Reported unconditionally
+    // and rate-limited, because an extent mismatch between the renderer and its caller is never
+    // expected. Diagnostic only; the publish decision is unchanged.
+    if (publish && !frame_ready && !px.empty()) {
+        static std::atomic<int> logged{0};
+        const int n = logged.fetch_add(1);
+        if (n < 32)
+            std::fprintf(stderr,
+                         "[agc] PUBLISH DROPPED submit #%llu: the renderer returned %zu bytes for a "
+                         "requested %ux%u frame (%zu expected) — nothing is published for this "
+                         "submit%s\n",
+                         (unsigned long long)submit_no, px.size(), width, height,
+                         static_cast<size_t>(width) * height * 4,
+                         n == 31 ? " [further reports suppressed]" : "");
+    }
     const bool presented = frame_ready && publish;
     if (presented) present_write_frame(result.frame.storage, width, height);
     if (timing_enabled) {
@@ -6794,6 +6827,9 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
 
 bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height, bool publish) {
     if (!g_live || st.draws.empty() || !width || !height) return false;
+    // Same extent contract as the ordered path: this frame is checked against width*height*4 below
+    // before it can be published (#1986).
+    PresentSubmitScope present_submit_scope;
     // Bind the target dimensions and defer to the pure core, which recompiles the shaders from their
     // SHADER_PGM addresses and resolves fixed-function state before calling back into the live renderer.
     // Scale the guest viewport to our framebuffer: `width`/`height` are the render target (reduced by
