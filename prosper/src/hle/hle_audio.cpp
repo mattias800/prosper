@@ -2176,7 +2176,15 @@ namespace {
     constexpr uint64_t AJM_ERR_INVALID_INSTANCE  = (uint64_t)(int64_t)(int32_t)0x80930003u;
     constexpr uint64_t AJM_ERR_INVALID_BATCH     = (uint64_t)(int64_t)(int32_t)0x80930004u;
     constexpr uint64_t AJM_ERR_INVALID_PARAMETER = (uint64_t)(int64_t)(int32_t)0x80930005u;
+    // sceAjmInitialize's `config` word is a revision selector carried in its HIGH dword: PS4-style
+    // callers pass 0, and PS5 titles pass a non-zero revision. Surveyed across all 39 dumps in the
+    // local corpus: 43 modules import sceAjmInitialize, 41 decode to a constant, and the high dword
+    // is only ever 0, 2 or 3 — 0x200000000 on PPSA01826 (The Pathless), 0x300000000 on PPSA05143
+    // (Little Nightmares III) and PPSA09804 (GRIS, via Wwise's AkSoundEngine.prx). No module passes
+    // a constant with a non-zero low dword, so validate that and accept the revision rather than
+    // allow-listing values one title at a time.
     constexpr uint64_t AJM_INITIALIZE_PS5_CONFIG = 0x200000000ull;
+    constexpr uint64_t AJM_INITIALIZE_CONFIG_RESERVED_MASK = 0xffffffffull;
 
     // The four pointer-returning builder exports serialize a batch from 8/16-byte chunks. These
     // layout values are shared by Sony's PS4-inherited AJM ABI and the PS5 3.20 export surface.
@@ -2313,11 +2321,45 @@ std::map<uint32_t, AjmDecodeInst> g_ajm2_inst;             // instance id -> cod
 std::map<uint64_t, std::vector<AjmDecJob>> g_ajm2_jobs;   // batchInfo -> queued decode jobs
 } // namespace
 
-// sceAjmInitialize(u64 config, u32* out_context): create a context. PS4-style callers pass zero,
-// while PS5 titles also use the observed 0x200000000 configuration value.
+// sceAjmInitialize(u64 config, u32* out_context): create a context. PS4-style callers pass zero;
+// PS5 titles pass a revision in the high dword — 0x200000000 on PPSA01826 (The Pathless),
+// 0x300000000 on PPSA05143 (Little Nightmares III) and PPSA09804 (GRIS, via Wwise). Allow-listing
+// individual revisions is what made this fail on an unseen one, and the failure is not contained:
+// a guest that reads SCE_AJM_ERROR_INVALID_PARAMETER as "no audio subsystem" skips creating its
+// audio-thread object and then dereferences the null singleton it never built.
+//
+// Accepting an unknown revision is NOT the #1949 mistake (returning success for something prosper
+// does not implement). The two AJM batch ABIs are already discriminated by the import the guest
+// resolves, not by this word — prosper registers both sceAjmBatchStartBuffer and sceAjmBatchStart —
+// and the downstream decode paths really are implemented, so the guest gets behaviour rather than a
+// silent wait. Rejecting, by contrast, is not fail-visible: it surfaces as a SIGSEGV inside
+// sceKernelCreateEventFlag, far from the cause.
+//
+// An unrecognized revision is reported once PER REVISION, and only after the context store succeeds,
+// so the line cannot claim "accepted" for a call that then failed. See #1971.
+// CONFIDENCE: MED — the reserved low dword holds across all 41 constant call sites in the corpus,
+// but two sites compute the low dword at runtime, so it is unfalsified rather than established. The
+// meaning of the revision number itself is not known, and prosper's context does not use it.
 HLE(ajm_initialize) {
-    if ((a0 != 0 && a0 != AJM_INITIALIZE_PS5_CONFIG) || !a1) return AJM_ERR_INVALID_PARAMETER;
+    if (!a1 || (a0 & AJM_INITIALIZE_CONFIG_RESERVED_MASK) != 0) return AJM_ERR_INVALID_PARAMETER;
     if (!a2_store_u32(a1, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
+    if (a0 != 0 && a0 != AJM_INITIALIZE_PS5_CONFIG) {
+        // Per-revision, not once globally: a single shared slot lets the first unknown revision
+        // consume the notice and hide every later one.
+        static std::mutex mx;
+        static std::vector<uint64_t> seen;
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            if (std::find(seen.begin(), seen.end(), a0) == seen.end() && seen.size() < 16) {
+                seen.push_back(a0);
+                first = true;
+            }
+        }
+        if (first)
+            fprintf(stderr, "[ajm] sceAjmInitialize: unrecognized config revision 0x%llx (accepted)\n",
+                    (unsigned long long)a0);
+    }
     return 0;
 }
 HLE(ajm_finalize)         { return 0; }

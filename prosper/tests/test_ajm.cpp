@@ -88,10 +88,31 @@ int main() {
           "Initialize(PS5 config) -> OK");
     CHECK(ps5_ctx != 0 && ps5_ctx != 0xBEEF,
           "Initialize(PS5 config) writes a valid non-zero context");
+    // PPSA05143 (Little Nightmares III, UE4) passes revision 3. Allow-listing revisions one title at
+    // a time made this return INVALID_PARAMETER, which the guest reads as "no audio subsystem": it
+    // then never builds its audio-thread object and calls into the null singleton, so the boot dies
+    // in sceKernelCreateEventFlag("AudioThread") on a null+0x80 out-pointer. Only the LOW dword is
+    // reserved; the revision itself is opaque to prosper.
+    uint32_t rev3_ctx = 0xFEED;
+    CHECK(init(0x300000000ull, (uint64_t)(uintptr_t)&rev3_ctx, 0, 0, 0, 0) == 0,
+          "Initialize(PS5 config revision 3) -> OK");
+    CHECK(rev3_ctx != 0 && rev3_ctx != 0xFEED,
+          "Initialize(PS5 config revision 3) writes a valid non-zero context");
     uint32_t rejected_ctx = 0xCAFE;
     CHECK(init(1, (uint64_t)(uintptr_t)&rejected_ctx, 0, 0, 0, 0) == kInvalidParameter,
-          "Initialize(unknown config) -> INVALID_PARAMETER");
+          "Initialize(reserved low dword set) -> INVALID_PARAMETER");
     CHECK(rejected_ctx == 0xCAFE, "invalid Initialize leaves the context output untouched");
+    uint32_t dirty_ctx = 0xF00D;
+    CHECK(init(0x300000001ull, (uint64_t)(uintptr_t)&dirty_ctx, 0, 0, 0, 0) == kInvalidParameter,
+          "Initialize(valid revision, dirty reserved dword) -> INVALID_PARAMETER");
+    CHECK(dirty_ctx == 0xF00D, "rejected Initialize leaves the context output untouched");
+    // Bit 16, not bit 0. Both cases above set the low bit, so they are satisfied by a mask as narrow
+    // as 0xffff — an independent review mutated the mask to exactly that and the suite stayed green.
+    // The reserved region is the whole low dword, so pin its upper half too.
+    uint32_t hi16_ctx = 0xBEEF;
+    CHECK(init(0x300010000ull, (uint64_t)(uintptr_t)&hi16_ctx, 0, 0, 0, 0) == kInvalidParameter,
+          "Initialize(reserved dword dirty above bit 15) -> INVALID_PARAMETER");
+    CHECK(hi16_ctx == 0xBEEF, "a reserved-dword rejection above bit 15 leaves the context untouched");
 
     // ModuleRegister needs a context.
     CHECK(modreg(ctx, 1 /*At9Dec*/, 0, 0, 0, 0) == 0, "sceAjmModuleRegister(ctx) -> OK");

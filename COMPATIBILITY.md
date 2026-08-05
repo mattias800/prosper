@@ -48,7 +48,7 @@ Last updated: 2026-08-05
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and title screen | [#1809](https://github.com/mattias800/prosper/issues/1809) |
 | *The Forgotten City* | `PPSA03026` | Unreal Engine | 🚧 Title screen | [#1890](https://github.com/mattias800/prosper/issues/1890) |
 | *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
-| *Little Nightmares III* | `PPSA05143` | — | 🔬 Graphics setup; startup fault before title | [#1893](https://github.com/mattias800/prosper/issues/1893) |
+| *Little Nightmares III* | `PPSA05143` | Unreal Engine 4 | 🚧 Boot splash sequence; render thread stalls before the title | [#1893](https://github.com/mattias800/prosper/issues/1893) |
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Engine bootstrap completes; the first synchronous package load never returns, so no frame is composited | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🔬 Live frame loop; the guest stops on Unity's empty transition scene, so every frame is black | [#1897](https://github.com/mattias800/prosper/issues/1897) |
@@ -285,7 +285,12 @@ The route reaches the first tutorial battle with real GPU draws at native 1920×
 
 ## Little Nightmares III — `PPSA05143`
 
-The CPU-only baseline reaches graphics setup, then faults on a denied low-address read before a title screen or other visible checkpoint. See the [tracker](https://github.com/mattias800/prosper/issues/1893).
+<p align="center"><img src="assets/screenshots/little-nightmares-3-boot-splash.png" alt="Little Nightmares III — developer splash from the boot sequence"></p>
+
+The boot splash sequence renders at native 3840×2160. Roughly two minutes in, the engine's render thread
+stops advancing the composited frame and Unreal's own watchdog ends the run
+(`GameThread timed out waiting for RenderThread`), so no title screen is reached. See the
+[tracker](https://github.com/mattias800/prosper/issues/1893).
 
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
 
