@@ -142,6 +142,7 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | The frontend is stalled on a Sony call prosper has not implemented (the classic "guest polls a missing stub" wall) | **Falsified.** A 185 s routed CPU-only arm on `9dcb6c4b` with `PROSPER_PROGRESS=5 PROSPER_PROGRESS_UNIMPL=1` dumps the unimplemented-NID call-count table 38 times and every dump reads `(0 distinct unimplemented functions)`. The table is the per-call-count form specifically built to expose a *polled* missing stub, so a deduped first-seen log cannot be hiding one. | #1905, this doc |
 | The frontend is waiting on a Sony service, an incomplete asset load, or an APR read that never completes | **Falsified for the post-resident state.** With `PROSPER_FILELOG=1` the whole resident set (`param_tech.rfl`, `NeedleShader.pac`, `ui_resident`/`ui_text_texture`/`scalablefont`, the CRI ACB/AWB banks, `rfl_resident.pac`, all twelve `text_common_*`, `segafont.pac`) resolves and reads OK and the **last file operation completes before the t=5 s heartbeat**; the following 180 s contain zero file activity. Under `PROSPER_SVCLOG=1` the only per-frame service traffic is `sceUserServiceGetEvent` (4,264 calls / 60 s) plus `scePadReadState`; `sceSaveDataInitialize3` and the entitlement list call happen once each and no mount, key or trophy call ever blocks. | #1905, this doc |
 | The black startup state is input-gated and previous arms simply never pressed the button that dismisses it | **Falsified — and the suspicion was well founded, because the committed route really is short.** `scripts/sonic/reach-title-or-gameplay.pad` ends at **pad-read 404**, and the route clock is pad reads, not seconds, so at the ~61 reads/s of a CPU-only arm it delivers its last edge at **t≈6.6 s** and every previous CPU-only run then ran input-free. A 12,000-read probe route (`scripts/sonic/long-input-probe.pad`, ~400 Cross pulses with Options every tenth) changes nothing: the 200 s CPU-only arm and a 160 s live-renderer arm both plateau on a **byte-identical resolved-path set**, and no run in the series ever requests `ui_mainmenu*.pac`, `stage_title.pac`, `gedit_stage_title.pac`, a `.rsdk` or a `.usm`. | #1905, this doc |
+| The injected Unity guest argv (`PROSPER_GUEST_ARGS=-force-gfx-direct`, which `screenshot` defaults on) puts this non-Unity engine on a different path | **Falsified.** Two 30 s CPU-only arms differing only in that variable resolve a **byte-identical 40-path set** and flip at the same rate (1,534 vs 1,533 flips), with the same six distinct APR misses. The A/B is self-validating: it compares the resolved-path sets directly, so "no difference" is a measurement rather than an absence. | #1905, this doc |
 | The absent `raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/` group prove the supplied `raw/` tree is a truncated repack | **Falsified as an integrity claim.** The tree is internally consistent: `ui_museum_item_texture_l_art1..214` is contiguous with no gaps, all seven multi-language `ui_*` families are complete at 12/12 languages, and `raw/ui` contains no subdirectories at all. The eboot's name pool contains exactly one base-game `ui/` entry with no file (`ui/ui_startup`) plus the six region rating textures (`ui_title_cero`/`esrb_e10`/`esrb_rp`/`nocopy`/`pegi`/`titile_healthy`) — one functional group, requested back to back, consistent with an optional region/legal asset set this build does not ship. Their absence is therefore not evidence of a damaged dump, and remains insufficient to explain the black frame. **One leg of the original argument is withdrawn — see the `AMPRIDX3` row below.** | #1905, this doc |
 | `ampr_emu.index` is the application's own `AMPRIDX3` file index, so a name absent from it is a name this build does not ship | **Falsified — misattribution.** The index is *repack scaffolding*, not the game's: the eboot contains no `AMPRIDX` string anywhere, prosper never opens the file (no reference in `src/` or `tools/`), and it sits beside `dlc_emu.ini`, four `fakelib/*.sprx` stubs and a `_DUPLEX_/duplex.nfo` — and its entries include `/app0/dlcN/dlc/dlcN/...` mount paths a shipped app0 index could not contain. It therefore records what the repacker's tool found on disk, which cannot establish what the application expects. This does not resurrect the truncated-repack claim (the contiguity and language-completeness legs stand on their own); it removes one leg that was never evidence. | #1905, this doc |
 | Sonic is black because prosper renders content and then loses it in the present path (the #1990 publish wall) | **The wall is real and it is not the cause.** On `c77c66b4` Sonic reproduces the Frontiers signature exactly: `frame_seq` freezes at **1** while `present_count` climbs (21 → 49 → 76 → … across eight 6 s samples), i.e. exactly one frame is ever published. With #1990 applied, `frame_seq` advances again (110 / 300 / 490 / 669 / 844 across 8 s samples) and every pixel is unchanged black. #1990's own report names why: `[rtt] PRESENT SOURCE EXTENT MISMATCH: no pass produced a 3840x2160 (33177600-byte) present source — px_front=none px_vo=none px_last=none` on submit after submit, with one wrong-extent `px_last=1920x1080` candidate — the frame that poisoned the retained slot and made the freeze permanent. So Sonic needs #1990, and #1990 does not make it render. | #1905, #1990, #1986 |
@@ -342,6 +343,22 @@ returned earlier in boot (a registered-but-mismodelled call, which the unimpleme
 see by construction) and (b) a CRI Mana / Sofdec2 boot-movie step that never starts. Neither is
 addressable by another whole-frame GPU capture of this state.
 
+**The steady state's complete HLE surface (2026-08-05, `tools/hle_calls`).** The `PROSPER_SVCLOG` census
+above bounds the *instrumented* surface, not the guest's traffic — roughly 1,035 handler registrations
+are served by 94 `svc_log` call sites. `tools/hle_calls` (#1980) counts every handler instead, and two
+400-tick windows on `c77c66b4` agree: the settled loop enters exactly **47** distinct handlers
+(`total≈21,000` calls per window, positive control `s_user_getevent`=4). Everything but three of them is
+`agc_*`, `audio2_*` or `k_*`; the entire external surface is **`s_user_getevent`, `s_syss_getstatus` and
+`pad_read_state`, one call each per frame**. That is the complete list of places a wrong value could
+still be hiding *at this depth*, and it is short.
+
+It is not the list for candidate (a), which is about init. `hle_calls` cannot see init: it attaches to a
+live pid, and an arm that launched `boot_trace` and attached at t=1 s with `--filter '^s_'` still opened
+its window inside the frame loop — the "boot" and "settled" passes returned the identical two-handler
+histogram at `entries=4000`. Counts would not be enough either, since a mismodelled call returns a wrong
+*value*. Both gaps are filed as **#1997** (launch mode + return-value recording), which is the concrete
+enabler for candidate (a).
+
 **Route caveat that cost this series time.** `.pad` route positions are **pad reads, not seconds**, so
 a route's wall-clock length scales with the guest's frame rate: the 404-read
 `reach-title-or-gameplay.pad` lasts ~6.6 s in a 61 reads/s CPU-only arm but ~80 s in a ~5 reads/s live
@@ -378,11 +395,16 @@ are worth separating:
 1. **Present-source selection cannot see this frame at all.** A pass becomes a candidate only when it
    has CPU pixels *and* its format is exactly `R8G8B8A8_UNORM`. `0x2010870000` satisfies the format
    and never the pixels: it is neither `is_vo` nor `front_va`, so it takes the intermediate-RTT
-   deferral every time, and a deferred pass has no `rendered_pixels` to offer. The scanout-materialize
-   path that would rescue it keys on `is_vo`, which no pass here ever is. This is the same shape as
-   #1968 §5 ("why no post-intro pass targets the flipped VideoOut buffer") on a second, unrelated
-   title, so it is a **cross-title present-path gap, not a Frontiers quirk** — and on Sonic it is
-   total rather than partial.
+   deferral every time (`live_renderer.cpp`'s `defer_readback`), and a deferred pass has no
+   `rendered_pixels` to offer. Two recovery paths exist and both miss for a precise reason worth
+   keeping straight: the deferred-scanout materialization is gated on `is_vo` (never true here), and
+   the final span's `cached_scanout` recovery is keyed on the **flipped address** rather than on any
+   pass — it would materialize a persistent target found at a VideoOut address — but `g_rtt` holds no
+   entry for either scanout VA at all, which is exactly what `[persist] … scanout=MISS` reports. So
+   the gap is not "the wrong pass was chosen"; it is that **nothing prosper owns exists at the address
+   the guest flips**. This is the same shape as #1968 §5 ("why no post-intro pass targets the flipped
+   VideoOut buffer") on a second, unrelated title, so it is a **cross-title present-path gap, not a
+   Frontiers quirk** — and on Sonic it is total rather than partial.
 2. **It is nevertheless not why the screen is black.** Every one of those targets is uniformly black
    when dumped through a correct format conversion, and so are the raw guest scanout buffers. There is
    no content anywhere for the present path to lose. Repairing (1) on Sonic today would publish black.
