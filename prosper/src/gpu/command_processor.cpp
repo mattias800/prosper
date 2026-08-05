@@ -3888,13 +3888,59 @@ void GpuState::apply(const Pm4Command& c) {
             // title frame REQUIRES the composite every frame on real hardware, and the condition
             // memory reads 0 throughout the title steady state, so 0 must mean "execute" here
             // ("skip when non-zero", matching PM4 SET_PREDICATION's draw-discard-on-set model).
-            if (!dma_copies.empty()) {
+            // #1982: decline only on a REAL overlap, the way the two sibling readers already do.
+            //
+            // This used to reject the whole submit whenever ANY DMA was retained, without asking
+            // whether that DMA touched the memory the jump reads. `SetRegsIndirect` (above) tests
+            // its register block against `retained_dma_destination_overlaps`, and `WaitRegMem`
+            // tests its label; only this site painted with the full brush. And because
+            // `dma_execution_rejected` discards the submit's ORDERED MEMORY EFFECTS along with the
+            // jump, the label the guest polls was never written at all — so the guest waited
+            // forever on a write prosper had decided to throw away.
+            //
+            // Two titles proved it, both stalling on the last graphics event of the run with every
+            // thread parked and the missing side ours: The Oregon Trail (PPSA19244, #1982) right
+            // after its health-warning screen, and Crisis Core (PPSA07809) with 90 threads parked
+            // through AgcRHI down to an `AgcInterruptThr` waiting on a GPU event that never came.
+            // Lifting the blanket decline took Crisis Core from guest frame ~25 to f124, mounted
+            // all nine pak containers, and doubled `present_count` within a second — and BOTH the
+            // skip-only and execute arms cleared it, which is what localises the defect to the
+            // submit-wide decline rather than to the jump.
+            //
+            // The jump reads exactly two things, so those are exactly what to test: the target
+            // segment it is about to run, and the predication condition that decides whether to run
+            // it. A retained DMA landing on either really would make the jump read stale bytes;
+            // anything else is unrelated traffic and must not cost the guest its label.
+            // CONFIDENCE: HIGH — the narrow contract is the one the sibling readers already use,
+            // and the blanket form is falsified by both titles clearing under either arm.
+            const uint64_t jump_bytes =
+                c.jump_valid ? static_cast<uint64_t>(c.jump_dwords) * 4u : 0u;
+            const bool jump_reads_dma =
+                !dma_copies.empty() &&
+                ((c.jump_addr && jump_bytes &&
+                  retained_dma_destination_overlaps(dma_copies, c.jump_addr, jump_bytes)) ||
+                 (c.jump_pred && pred_cond_addr &&
+                  retained_dma_destination_overlaps(dma_copies, pred_cond_addr, 8)));
+            const bool jump_reads_effect =
+                !ordered_memory_effects.empty() &&
+                ((c.jump_addr && jump_bytes &&
+                  retained_ordered_effect_destination_overlaps(
+                      ordered_memory_effects, c.jump_addr, jump_bytes)) ||
+                 (c.jump_pred && pred_cond_addr &&
+                  retained_ordered_effect_destination_overlaps(
+                      ordered_memory_effects, pred_cond_addr, 8)));
+            if (jump_reads_dma || jump_reads_effect) {
                 dma_execution_rejected = true;
                 static std::atomic<int> warned{0};
-                if (warned.fetch_add(1) < 24)
+                const uint64_t ord = warned.fetch_add(1) + 1;
+                if (ord <= 24 || (ord & (ord - 1)) == 0)
                     fprintf(stderr,
-                            "[agc] ordered DMA submit rejected: Jump reads target/predication "
-                            "memory after retained DMA (order=%llu)\n",
+                            "[agc] ordered DMA submit rejected #%llu: Jump reads target/predication "
+                            "memory overlapping a retained %s (target=0x%llx bytes=%llu "
+                            "cond=0x%llx order=%llu)\n",
+                            (unsigned long long)ord, jump_reads_effect ? "memory-effect" : "DMA",
+                            (unsigned long long)c.jump_addr, (unsigned long long)jump_bytes,
+                            (unsigned long long)pred_cond_addr,
                             (unsigned long long)command_order);
                 break;
             }
