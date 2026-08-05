@@ -37,13 +37,15 @@ Reading the result
 ------------------
 The header line reports the window actually observed:
 
-    clock=prosper::k_usleep entries=400 armed=750 mode=attach calls=21362 \\
-        finish-failures=0 exited=0
+    clock=prosper::k_usleep entries=400/400 window=complete armed=750 mode=attach \\
+        calls=21362 finish-failures=0 exited=0
 
 An **empty histogram with a non-zero `entries`** is a real measurement: the
 guest entered no HLE handler while the clock advanced 400 times. An empty
 histogram with `entries=0` means the window never opened and the run says
-nothing — treat it as void, not as a negative.
+nothing — treat it as void, not as a negative. `window=SHORT` means gdb stopped
+before the clock reached `--ticks` (a signal it stops for, or the inferior
+exiting), so the histogram is truncated rather than finished.
 
 Include a handler you already know fires as your own positive control before
 believing a surprising zero (`sceUserServiceGetEvent` is a good one on almost
@@ -75,9 +77,20 @@ That line is also the built-in positive control for the mechanism. `s_user_getev
 delivers the initial LOGIN event exactly once (returning 0) and then reports
 NO_EVENT (`0x80960007`) forever, so a correct capture must show exactly one `0x0`
 against many `0x80960007`. If it does not, distrust every other value in the run.
-`finish-failures` counts returns that could not be captured at all; a non-zero
-value there means the value set is incomplete, not that those calls returned
-nothing.
+
+Completeness is per row, not per run. `finish-failures` in the header counts
+captures that could not be **armed or decoded**, and it does not see the more
+common loss: a handler that leaves its frame without returning normally (longjmp,
+thread teardown) loses its value silently. So each row prints `(captured N/M)`
+whenever fewer values were recorded than calls counted — that is the field to
+read before calling a value set complete.
+
+Two limits to know before believing a number: `--values` records the return
+**register**, never an out-struct, so a handler that returns 0 while writing
+wrong bytes through a pointer is invisible; and on a handler that longjmps back
+into its own caller, gdb's finish breakpoint can capture the *landing* value as
+if it were a return (measured on gdb 17.2), so a `(captured N/M)` row's other
+values are suspect rather than merely fewer.
 
 `--values` costs a second trap per call, so pair it with `--filter`.
 
@@ -207,22 +220,42 @@ def main():
         cmd = [args.gdb, "-batch", "-x", script, "--args"] + list(args.launch)
     else:
         cmd = [args.gdb, "-p", str(args.pid), "-batch", "-x", script]
-    # Own a process group so a timeout takes the launched emulator down with gdb.
-    # Killing gdb alone would orphan the inferior it started, and an orphaned
-    # emulator holds the GPU and the dump against every other lane on the box.
+    # Popen rather than subprocess.run so a timeout can kill the whole tree. Note what actually
+    # reaps the launched emulator: gdb sets PTRACE_O_EXITKILL on a process it STARTED, so the
+    # inferior dies when gdb dies even though it sits in its own process group (measured:
+    # gdb pid==pgrp, inferior pid==its own pgrp, both in gdb's session). The killpg below is the
+    # belt to that braces and also covers anything else gdb spawned. It does NOT apply in --pid
+    # mode, correctly: there the emulator is not gdb's child and must survive a detach.
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, start_new_session=True)
-    try:
-        out, err = proc.communicate(timeout=args.timeout)
-    except subprocess.TimeoutExpired:
+
+    def _kill_tree():
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             proc.kill()
-        proc.communicate()
-        os.unlink(syms_path)
+        try:
+            proc.communicate()
+        except Exception:
+            pass
+        try:
+            os.unlink(syms_path)
+        except OSError:
+            pass
+
+    try:
+        out, err = proc.communicate(timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree()
         sys.exit("hle_calls: gdb timed out after %ds — result is void, not negative"
                  % args.timeout)
+    except BaseException:
+        # KeyboardInterrupt included, and it is the likely way a human ends a long run.
+        # start_new_session detaches gdb from the terminal, so Ctrl-C does NOT reach it:
+        # without this the tool exits and leaves gdb plus the emulator reparented to init —
+        # exactly the orphan the session/group handling exists to prevent.
+        _kill_tree()
+        raise
     run = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
     os.unlink(syms_path)
 

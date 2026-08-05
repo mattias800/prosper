@@ -86,11 +86,33 @@ remaining class of bring-up blocker after every absence check comes back clean i
 `s_user_getevent` delivers the initial LOGIN event exactly once (returning `0`) and reports
 `SCE_USER_SERVICE_ERROR_NO_EVENT` (`0x80960007`) forever after, so a correct capture shows exactly
 one `0x0` against many `0x80960007`. If it does not, distrust every other value in that run rather
-than believing the surprising one. `finish-failures` in the header counts returns that could not be
-captured at all — a non-zero value means the value set is *incomplete*, not that those calls
-returned nothing.
+than believing the surprising one.
+
+**Completeness is per row, not per run.** `finish-failures` in the header counts captures that could
+not be *armed or decoded*, and it does not see the more common loss: a handler that leaves its frame
+without returning normally (longjmp, thread teardown) loses its value silently. Each row therefore
+prints `(captured N/M)` whenever fewer values were recorded than calls counted, and that is the field
+to read before calling a value set complete.
+
+Two limits before believing a number:
+
+- `--values` records the return **register**, never an out-struct. A handler that returns 0 while
+  writing wrong bytes through a pointer argument is invisible — and on this codebase that is a common
+  bug shape.
+- On a handler that longjmps back into its own caller, gdb's finish breakpoint sits at an address the
+  landing pad reuses, so it can capture the *landing* value as if it were a return (measured on
+  gdb 17.2). A `(captured N/M)` row's other values are therefore suspect, not merely fewer.
+
+`window=complete|SHORT` in the header is the matching check for the run as a whole: `run`/`continue`
+also return on a signal gdb stops for (`SIGABRT` is not passed through, and these titles do abort),
+which would otherwise print a truncated histogram that reads as a finished window.
 
 Cost: a second trap per call, so pair `--values` with `--filter`.
+
+One behaviour change that also reaches `--pid`: the gdb side now passes SIGSEGV/SIGBUS/SIGILL/SIGFPE
+straight through without stopping. prosper uses SIGSEGV as a working mechanism (write watches, the
+fault handler) and gdb's default is to stop, so an attach window previously truncated at the first
+guest fault.
 
 ## Reading a zero — and the trap this tool was built around
 

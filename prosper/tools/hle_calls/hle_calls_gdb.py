@@ -26,8 +26,35 @@ both are printed unconditionally:
     late leads with the frame-loop pollers. That distinction is what separates
     "init made no interesting call" from "this run never saw init" — the two read
     identically in a histogram.
-  * `finish-failures` counts return-value captures that could not be armed, so
-    `--values` cannot quietly report a partial value set as a complete one.
+  * `finish-failures` counts return-value captures that could not be armed or
+    decoded — but it is NOT the whole story, so each row also prints
+    `(captured N/M)` whenever fewer values were recorded than calls counted.
+    That second form is the one to trust: a handler that leaves its frame
+    without returning normally (longjmp, thread teardown) loses its capture
+    without incrementing `finish-failures`.
+  * `window=complete|SHORT` says whether the clock really reached `--ticks`.
+    `run`/`continue` also return on a signal gdb stops for, which would
+    otherwise print a truncated histogram that reads as a finished window.
+
+Two limits of `--values` worth knowing before believing a number:
+
+  * It records the return **register**, never an out-struct. A handler that
+    returns 0 while writing wrong bytes through a pointer argument is invisible.
+  * On a handler that longjmps back into its own caller, gdb's finish breakpoint
+    sits at an address the landing pad reuses, so it can capture the *landing*
+    value as if it were a return. Measured on gdb 17.2. Non-returning paths are
+    therefore not merely uncounted, they can be mis-counted; `(captured N/M)` is
+    what flags the surrounding rows as suspect.
+
+`handle SIGSEGV … pass` below applies to attach mode too, and materially improves
+it: prosper uses SIGSEGV as a working mechanism (write watches, fault handler),
+and gdb's default is to stop, so an attach window previously truncated at the
+first guest fault.
+
+GDB's manual says a `Breakpoint.stop()` implementation "should not ... alter, add
+or delete any breakpoint", and `--values` adds one there. It works on gdb 17.2 —
+verified across recursion and multiple threads — but a future gdb misbehaving
+here is a tool bug, not a new emulator defect.
 """
 
 import os
@@ -78,7 +105,10 @@ class _Finish(gdb.FinishBreakpoint):
 
     def out_of_scope(self):
         # The handler's frame vanished without a normal return (longjmp, thread
-        # teardown). Nothing to record, and it is not a capture failure.
+        # teardown). Deliberately NOT counted into finish_failures: gdb calls this
+        # more than once per breakpoint on some versions, so it is not a reliable
+        # counter. The per-row `captured N/M` below is what makes such a loss
+        # visible, and it needs no cooperation from gdb at all.
         pass
 
 
@@ -148,15 +178,20 @@ else:
 
 rows = sorted(((c, n) for n, c in counts.items() if c), reverse=True)
 print("HLE_CALLS_BEGIN")
-print("clock=%s entries=%d armed=%d mode=%s calls=%d finish-failures=%d exited=%d"
-      % (CLOCK, state["ticks"], armed, MODE, state["calls"],
-         state["finish_failures"], 1 if state["exited"] else 0))
+# `window=` is the difference between "the guest made no more calls" and "gdb stopped early".
+# `run`/`continue` also return on a signal gdb stops for (SIGABRT is not in the pass list above,
+# and these titles do abort), which otherwise prints a truncated histogram that looks complete.
+print("clock=%s entries=%d/%d window=%s armed=%d mode=%s calls=%d finish-failures=%d exited=%d"
+      % (CLOCK, state["ticks"], TICKS, "complete" if state["ticks"] >= TICKS else "SHORT",
+         armed, MODE, state["calls"], state["finish_failures"],
+         1 if state["exited"] else 0))
 if order:
     print("first-calls: " + "  ".join("%d:%s" % (n, name) for n, name in order))
 for count, name in rows:
     line = "%8d  %s" % (count, name)
     if VALUES:
         seen = values.get(name, {})
+        captured = sum(seen.values())
         if seen:
             top = sorted(seen.items(), key=lambda kv: -kv[1])[:6]
             line += "   ret " + ", ".join("%#x x%d" % (v, c) for v, c in top)
@@ -164,6 +199,11 @@ for count, name in rows:
                 line += ", +%d more" % (len(seen) - len(top))
         else:
             line += "   ret (none captured)"
+        # A handler that leaves its frame without returning normally (longjmp, thread teardown)
+        # loses its capture WITHOUT incrementing finish-failures, so the header alone cannot say
+        # a value set is complete. Only this per-row comparison can.
+        if captured != count:
+            line += "   (captured %d/%d)" % (captured, count)
     print(line)
 print("distinct=%d total=%d" % (len(rows), sum(c for c, _ in rows)))
 print("HLE_CALLS_END")
