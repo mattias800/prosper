@@ -537,3 +537,14 @@ reaches every frame (`eboot+0x933063`, the frame-pacing compare ahead of the sle
 `eboot+0x933083`), so a guest breakpoint of exactly this kind demonstrably fires in this window while
 the movie ones do not. Finding which state should call `eboot+0x6d76c0`, and with which index, is the
 open work.
+
+Both callers are reached **indirectly**, which is why a static walk stops here. `eboot+0x701280` is
+never called: it is taken by address at `eboot+0x70111c` and installed as a task alongside a companion
+at `eboot+0x700c80`, and the install is gated at `eboot+0x7010ff` on
+`cmp BYTE PTR [rax+0x13e],0x0` falling through to a predicate `eboot+0x7f3560` — which compares two
+**floats** (`[rsi+0x124]` against `[rdx+0x11c]`), i.e. a timeline position, and the surrounding code
+names its state object `GOCTinyFsm2`. That reads as an in-stage cutscene trigger, not a boot logo.
+`eboot+0x795870` is a **vtable slot** (`0x1e191a8`) with no direct reference at all, so it is the more
+likely boot path and the better place to start. Neither conclusion is measured — both are read off the
+disassembly — and the useful next step is dynamic: break on `eboot+0x6d76c0`'s two callers *and* on
+whatever writes the movie index, rather than another static walk.
