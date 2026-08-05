@@ -1418,7 +1418,13 @@ namespace { bool amprlog() { static int v = getenv("PROSPER_AMPRLOG") ? 1 : 0; r
 // with (req, cbSize, 0, cbBuf, poolCtx, 3) — the actual read COMMAND (file offset / dest / size)
 // lives inside cbBuf (the "CB offset 40" of the guest's error message is a byte offset into it).
 // Exposed so the read-submit HLE can locate and decode the real command. CONFIDENCE: MED.
-uint64_t g_apr_last_cb = 0, g_apr_last_cb_size = 0;
+//
+// Atomic because GetSize now reads them as a PAIR — it serves g_apr_last_cb_size only when a0
+// matches g_apr_last_cb — and both are written from arbitrary guest threads. A torn read that
+// matched a freshly stored cb against the previous size would hand that cb a too-small capacity,
+// which is precisely the failure this fix exists to remove. Relaxed is enough: the pair is a hint,
+// nothing is published through it, and a stale-but-consistent read is harmless.
+std::atomic<uint64_t> g_apr_last_cb{0}, g_apr_last_cb_size{0};
 // Per-cb capacity, recorded at init (issue #208 follow-up). Live-captured init flavors carry the
 // size in different args: the APR read flow uses a1; Pathless's IoStore batch uses a2=0x560; and
 // DOLL's IoStore batch uses a5=0x720. The
@@ -1492,7 +1498,22 @@ HLE(k_ampr_getsize) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     ampr_arglog("tZDDEo2tE5k(GetSize)", a0, a1, a2, a3, a4, a5);
     if (uint64_t capacity = ampr_cb_capacity(a0)) return capacity;
-    return g_apr_last_cb_size ? g_apr_last_cb_size : 0x10000;
+    // The legacy `g_apr_last_cb_size` global is the capacity of ONE specific command buffer
+    // (`g_apr_last_cb`, recorded together with it in k_ampr_init). Serving it for a DIFFERENT cb
+    // whose own capacity we failed to recognise is not a fallback, it is a wrong answer — and a
+    // too-small wrong answer is unrecoverable, because the guest's IoStore batch builder only
+    // appends once `GetSize(cb) - GetCurrentOffset(cb) > 0xff`. The Forgotten City (PPSA03026, UE4)
+    // proved this: its IoService command buffer is constructed as (a1=0, a2=<ptr>, a5=<ptr>), a
+    // shape `ampr_cb_capacity_arg` cannot read a capacity from, and one unrelated init elsewhere in
+    // the boot records a1=0x81 (129). GetSize then answered 129 for the IoService cb, 129 - 0 never
+    // exceeds 255, and the IoService thread span at 100% CPU forever while the GameThread waited on
+    // I/O that could never be enqueued (present_count frozen at 1). Whether that unrelated init won
+    // the race against IoService's first poll is what made the title intermittently boot at all.
+    // So: use the global only for the cb it was actually recorded against, and otherwise fall back
+    // to the roomy default, which is the only safe answer for an unknown capacity.
+    // CONFIDENCE: HIGH (the spin and its disappearance are both directly observed).
+    if (a0 && a0 == g_apr_last_cb && g_apr_last_cb_size) return g_apr_last_cb_size;
+    return 0x10000;
 }
 HLE(k_ampr_x3) { return ampr_arglog("Qs1xtplKo0U", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }

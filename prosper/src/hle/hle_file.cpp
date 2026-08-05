@@ -2233,7 +2233,12 @@ HLE(f_apr_get_file_stat) {
 // Ampr command-buffer address/size captured at init (hle_kernel_mem.cpp). Declared at namespace
 // scope (NOT inside the extern "C" handler, where a block-scope extern would take C linkage and
 // miss the mangled prosper:: definition).
-extern uint64_t g_apr_last_cb, g_apr_last_cb_size;
+// Atomic since #1965: GetSize reads the pair together (size served only when the cb matches), so a
+// torn read could pair a new cb with a stale size. The uses below are #ifndef _WIN32 guarded.
+// Note the implicit conversion is NOT sufficient everywhere — a `?:` between an int literal and an
+// atomic is ambiguous because each operand converts to the other — so read with an explicit
+// .load() where the value feeds an expression rather than a single conversion.
+extern std::atomic<uint64_t> g_apr_last_cb, g_apr_last_cb_size;
 // Mark an APR request frame eventful (async streaming read -> equeue completion event) or sync;
 // consumed by the ASoW5WE-UPo submit handler (hle_kernel_mem.cpp, issue #180).
 void prosper_apr_mark_eventful(uint64_t req, bool eventful);
@@ -2452,7 +2457,8 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
         if (g_apr_last_cb) {
             fprintf(stderr, "[apr]   cb=0x%llx size=0x%llx\n",
                     (unsigned long long)g_apr_last_cb, (unsigned long long)g_apr_last_cb_size);
-            uint64_t n = g_apr_last_cb_size > 0x80 ? 0x80 : g_apr_last_cb_size;
+            const uint64_t cb_size = g_apr_last_cb_size.load(std::memory_order_relaxed);
+            uint64_t n = cb_size > 0x80 ? 0x80 : cb_size;
             for (uint64_t o = 0; o < n; o += 8)
                 if (apr_peek(g_apr_last_cb + o, &pv))
                     fprintf(stderr, "[apr]   cb+0x%02llx = 0x%016llx\n", (unsigned long long)o,

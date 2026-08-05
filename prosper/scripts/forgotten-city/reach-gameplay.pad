@@ -1,0 +1,53 @@
+# The Forgotten City (PPSA03026, Unreal Engine 4) — dismiss the title screen and start a new game.
+#
+# Timing is anchored to the game's FIRST PAD POLL, not process start, so the route tolerates the
+# long first asset load off the 26 GB dump.
+#
+# What the route drives. The boot sequence is: white splash -> Unreal Engine / Film Victoria logo
+# card -> legal text -> an autosave notice -> the "THE FORGOTTEN CITY / Press Any Button" title
+# screen, which holds indefinitely with no input. Cross dismisses that prompt and opens the main
+# menu, whose first entry is the new-game entry; further Cross presses confirm it and advance the
+# opening dialogue.
+#
+# Why repeated Cross pulses rather than single presses at fixed offsets: the logo cards and the
+# autosave notice each appear at load-dependent times, the title prompt may need a focus pass
+# first, and the opening sequence is dialogue-advanced. Surplus presses are harmless on the title
+# screen (it holds unchanged under them), so every arm of an A/B sees the same input stream.
+# Verify what the guest actually read with PROSPER_PAD_SCRIPT_LOG=1.
+#
+# STATUS: EXPLORATORY — NOT a validated route, despite the file name. As of 2026-08-05 no arm has
+# survived past the "Press Any Button" prompt, so everything this route does after that point is
+# UNVERIFIED GUESSWORK about the menu it has never been observed to open. What IS verified: pad
+# delivery reaches the guest (PROSPER_PAD_SCRIPT_LOG shows buttons=cross at the guest's own reads),
+# and the route causes neither of the two faults that bound the title (#1961 and #1945 — arms with
+# and without this route fault identically, at the same point).
+#
+# Runs end 7-14 s in, before the title screen appears at about 20 s, so the presses beyond roughly
+# t=20 have never actually been consumed by the game. Do not cite this file as evidence that
+# gameplay is reachable, and re-derive the post-title presses against real captures once #1961 and
+# #1945 are fixed. Current state is recorded on the tracker: #1890.
+2-3:cross
+6-7:cross
+10-11:cross
+14-15:cross
+18-19:cross
+22-23:cross
+26-27:cross
+30-31:cross
+34-35:cross
+38-39:cross
+42-43:cross
+46-47:cross
+50-51:cross
+54-55:cross
+58-59:cross
+62-63:cross
+66-67:cross
+70-71:cross
+74-75:cross
+78-79:cross
+82-83:cross
+86-87:cross
+90-91:cross
+94-95:cross
+98-99:cross

@@ -274,7 +274,7 @@ The opening sequence and ASTRO BOT title card render at native 3840×2160. See t
 
 <p align="center"><img src="assets/screenshots/forgotten-city-title.png" alt="The Forgotten City — title screen"></p>
 
-The direct native 3840×2160 frontend capture reaches the title screen and its `Press Any Button` prompt. Gameplay has not yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues/1890).
+The direct native 3840×2160 frontend capture reaches the title screen and its `Press Any Button` prompt, through the full white splash, Unreal Engine and Film Victoria logo cards, legal text and autosave notice. Gameplay has not yet been reached, and the run is bounded by two intermittent guest-heap faults. See the [tracker](https://github.com/mattias800/prosper/issues/1890).
 
 ## Tactics Ogre: Reborn — `PPSA03839`
 
