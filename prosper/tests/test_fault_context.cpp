@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 #if defined(__linux__) || defined(__APPLE__)
 #include "../src/host/fault_context.hpp"
@@ -54,6 +55,15 @@ int main() {
 
     // Two distinct fault contexts, standing in for two threads faulting milliseconds apart.
     ucontext_t uc_a{}, uc_b{};
+#ifdef __APPLE__
+    // Darwin's ucontext_t holds a POINTER to the machine context (`uc_mcontext->__ss`), unlike
+    // Linux's inline `uc_mcontext.gregs[]`. A value-initialized ucontext_t therefore has a null
+    // uc_mcontext here, and PROSPER_GREGS would dereference it. The kernel always supplies one at a
+    // real fault; the test has to.
+    std::remove_pointer<mcontext_t>::type mc_a{}, mc_b{};
+    uc_a.uc_mcontext = &mc_a;
+    uc_b.uc_mcontext = &mc_b;
+#endif
     auto set = [](ucontext_t& uc, uint64_t base) {
         auto g = PROSPER_GREGS(&uc);
         g[REG_RIP] = (greg_t)(base + 0x01); g[REG_RBP] = (greg_t)(base + 0x02);
