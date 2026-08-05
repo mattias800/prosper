@@ -107,6 +107,11 @@ if(Python3_Interpreter_FOUND)
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
   add_test(NAME re_edis_mapping
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_edis.py")
+  # nid_gate_scan answers "does this title BRANCH on an imported function's return value?", and a
+  # wrong answer there is a plausible-looking table rather than a visible failure. Three of its
+  # cases are regressions for classifier bugs found only after a table had been published (#2002).
+  add_test(NAME re_nid_gate_classifier
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_nid_gate_scan.py")
   add_test(NAME snapshot_guard_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/snapshot/test_snapshot.py")
   add_test(NAME gpu_replay_regress_logic
@@ -318,6 +323,12 @@ if(TARGET prosper_core)
   add_executable(test_service_getters tests/test_service_getters.cpp)
   target_link_libraries(test_service_getters PRIVATE prosper_core)
   add_test(NAME service_getters COMMAND test_service_getters)
+
+  # libSceSysmodule state query (#2002): IsLoaded answers from prosper's own load history, so a
+  # title that gates its initialization on UNLOADED stops skipping that initialization.
+  add_executable(test_sysmodule_state tests/test_sysmodule_state.cpp)
+  target_link_libraries(test_sysmodule_state PRIVATE prosper_core)
+  add_test(NAME sysmodule_state COMMAND test_sysmodule_state)
 
   # libSceHttp local URI parser (#642): two-pass caller pool sizing, public URI layout, and
   # deterministic error paths. Pure and offline; it never contacts a network.

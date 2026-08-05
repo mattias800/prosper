@@ -2505,10 +2505,11 @@ uint64_t addcontent_info_list(uint64_t list_address, uint64_t list_num,
 // which its own param.json declares as 9 — stores it, and tests bit 3 to decide that its installed
 // content needs no online entitlement lookup. Answering 0 cleared that bit and sent it down the
 // online path instead, where sceNpEntitlementAccessGetSkuFlag left the guest's own pre-seeded TRIAL
-// value standing and the title offered story mode as a purchase. That chain is only half the story on
-// current master: the param read is itself skipped because sceSysmoduleIsLoaded reports every module
-// loaded, so GTA V never runs its own sceAppContentInitialize (#2002). Both halves are needed, and a
-// three-arm A/B on #1873 shows neither alone opens the gate. The declared values matter well
+// value standing and the title offered story mode as a purchase. That chain was only half the story:
+// the param read was itself skipped, because sceSysmoduleIsLoaded reported every module loaded and
+// GTA V therefore never ran its own sceAppContentInitialize. Fixed separately in #2002 (the query
+// now answers from prosper's real load history); both halves are needed, and a three-arm A/B on
+// #1873 shows neither alone opens the gate. The declared values matter well
 // beyond that gate: Crisis Core (PPSA07809) uses USER_DEFINED_PARAM_2 as a bounded content-variant
 // index, and Little Nightmares II/III use USER_DEFINED_PARAM_1 as an index into their own
 // add-content list.

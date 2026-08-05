@@ -74,6 +74,57 @@ code at a site does. It complements `xref.py to <slot>`, which lists the *sites*
 `/tmp/text.bin` for one title, `edis.py` takes any flattened module ELF directly, so the same command works
 for every title. Requires `objdump` (binutils) on PATH.
 
+## `nid_gate_scan.py` — does a title *branch on* an imported function's return value?
+
+Before changing what an HLE handler returns, the question that bounds the blast radius is not "who
+imports this NID?" — it is "who **inspects the result**, and how?" Those are very different sets: a
+title that calls the import and drops `eax` cannot be affected by any answer.
+
+```bash
+# does this dump gate on sceSysmoduleIsLoaded's answer, and against which errno?
+python3 tools/re/nid_gate_scan.py <DUMP_ROOT>/PPSA04263-app0 --nid fMP5NHUOaMk --const 0x805a1001 -v
+```
+
+```text
+    call at 0x197a22a id=0xb4     -> const     cmp eax,0x805a1001
+    call at 0x25e3dc4 id=0xa8     -> nonzero   test eax,eax
+eboot.bin                                                ok const=2 nonzero=14
+```
+
+It resolves NID → dynsym index → JMPREL jump slot → the `jmp *[rip+d]` stub → every `call rel32`
+that reaches it, then disassembles the bytes after each call and classifies what happens to the
+result. Pass a module or a whole `app0` directory (every `eboot.bin` and `*.prx`/`*.sprx` under it).
+Flattening happens in memory, so there is no `prx_to_elf.py` step.
+
+| bucket | meaning |
+|---|---|
+| `const` | compares the result against `--const` |
+| `nonzero` | `test eax,eax` / `cmp eax,0` → conditional branch |
+| `alu-gate` | folds the result into flags (`and eax,mask` …) and branches on that |
+| `other-cmp` | compares against some other immediate |
+| `forward` | still live when the window ends — returned, spilled, or tail-jumped; read it by hand |
+| `ignored` | dead before any read: this call site cannot be affected |
+| `undecodable` | objdump could not decode the window — a **void** sample, not a negative one |
+
+**Read the output as a bound, not a census.** It classifies the *compare*, never the branch target,
+so it tells you which titles *can* change behaviour, not which do; and site discovery follows one
+stub level and one call deep, so a count is a lower bound. `forward=0` across a corpus is worth
+quoting for the opposite reason — together with `undecodable=0` it shows every window decoded.
+
+The classifier tracks the result as a small register taint set rather than watching `eax` alone,
+because the ordinary compiler output is `mov ecx,eax; xor eax,eax; test ecx,ecx` — the `xor` is the
+*enclosing* function's return value, and an `eax`-only reader therefore reports a live gate as
+`ignored`, i.e. it errs in the reassuring direction. That, an unconditional `jmp` being walked
+through into the next basic block, and a mask-test being called `ignored` are all regression cases in
+`test_nid_gate_scan.py` (ctest: `re_nid_gate_classifier`). Set `TMPDIR` to keep its scratch file off
+`/tmp`.
+
+Requires **GNU binutils** `objdump`: it disassembles a raw blob with `-b binary`, which LLVM's
+`objdump` does not support. That matters on macOS, where Xcode's LLVM build *is* `objdump` and answers
+`--version` happily while rejecting every actual decode — so the tool probes with a real one-byte
+disassembly rather than trusting the binary's presence, accepts Homebrew's `gobjdump`, and honours
+`$OBJDUMP`. The ctest skips cleanly when no capable objdump exists.
+
 ## `pak_index.py` — turn a UE4 `.pak` byte offset into an asset name
 
 A UE4 title on PS5 streams content through the Ampr/APR async-read path, and `PROSPER_FILELOG=1`

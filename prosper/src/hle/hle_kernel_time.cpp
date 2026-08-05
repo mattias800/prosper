@@ -513,6 +513,108 @@ HLE(k_clock_getres) { if (a1) { int64_t* r = (int64_t*)P(a1); r[0] = 0; r[1] = 1
 
 // --- assorted libkernel stubs ---
 HLE(k_ok)              { return 0; }                       // generic success no-op
+
+// --- libSceSysmodule: per-process load state (#2002) ---------------------------------------------
+//
+// sceSysmoduleIsLoaded is a *state query*, and it used to share k_ok with Load/UnloadModule: every
+// module id answered 0 == "loaded". That is not a harmlessly optimistic answer. The idiom titles
+// actually write is
+//     if (sceSysmoduleIsLoaded(id) == SCE_SYSMODULE_ERROR_UNLOADED) { LoadModule(id); Initialize(); }
+// so a wrong "loaded" makes the guest conclude somebody already did the setup and **skip its own
+// initialization**. The defect then surfaces as missing content minutes later with nothing tying it
+// back to the query. Grand Theft Auto V (PPSA04263) does exactly this at eboot+0x197a22a and again
+// at eboot+0x4b978f (`cmp eax,0x805a1001`), losing sceAppContentInitialize and its
+// userDefinedParam1 read; the guest's own compare is the primary evidence for the errno value.
+// Measured statically over the 44 local dumps with tools/re/nid_gate_scan.py: 39 import the NID, and
+// at all 441 call sites the returned value is READ before it dies — 237 compare it against this
+// exact errno, 204 test it for zero, none discard it. Read that bound precisely: the scan classifies
+// the COMPARE, not the branch target, so it says which titles *can* change behaviour under a
+// different answer, not which ones do, and "441 sites" is a lower bound on reach (it follows one
+// stub level and one call deep). The `test eax,eax` half matters as much as the errno half — it is
+// the plain defensive form of the same gate and never mentions 0x805A1001.
+//
+// What prosper can honestly answer is which ids the guest asked it to load. The sysmodule id space
+// is the set of *optional* modules an application must request; the always-resident libraries
+// (libkernel, libc, libSceGnmDriver, libSceVideoOut) are bound through DT_NEEDED and never travel
+// through this API — so per-process "did this process load it?" is the contract, and prosper's own
+// load history is exactly the state that answers it. Supporting evidence that Sony models
+// residency-without-a-request as a DIFFERENT question: libSceSysmodule exports a separate
+// sceSysmoduleIsCameraPreloaded (3.20 export list), which would be redundant if IsLoaded already
+// reported system-preloaded modules.
+//
+// Answering UNLOADED cannot cost a capability here: prosper's HLE surface for a module is resident
+// whether or not the guest ever calls LoadModule, so the worst case is that the guest performs the
+// load+initialize sequence it performs on hardware, and the load succeeds. The opposite answer is
+// the only one that can silently remove behaviour. Sony's loader reference-counts the per-process
+// load; prosper does not model the count, because an unload that drops a nested load only produces
+// an extra UNLOADED, which prompts a redundant (succeeding) load — the error in the safe direction.
+// CONFIDENCE: HIGH that answering "loaded" for a module this process never loaded is wrong (the
+// guest's own compare proves the contract). CONFIDENCE: MED that no sysmodule id is legitimately
+// resident before the app asks — that half rests on the API's shape, not on primary evidence — and
+// MED for the unmodelled ref-count nesting.
+//
+// The id is masked to 16 bits because that is genuinely its width in Sony's prototype
+// (`sceSysmoduleLoadModule(uint16_t)`), so a caller may leave anything in the upper half; both the
+// load and the query must therefore agree on the same truncation, or they name different entries
+// for one module. Note which direction the risk runs, because it is the opposite of this change's
+// general direction: everywhere else an over-eager UNLOADED is the safe error, but truncation is
+// the ONE place here that can manufacture a false *loaded* — two distinct ids congruent mod 2^16
+// would share an entry. The tripwire is therefore an observed id >= 0x10000; the corpus's widest is
+// 0x130, so nothing is close, and if one ever appears this mask is the first thing to revisit.
+//
+// NOT fixed here, and it is the same defect on a parallel path: the eight *Internal entry points
+// (sceSysmoduleIsLoadedInternal ynFKQ5bfGks, LoadModule{,ByName,WithArg}Internal,
+// UnloadModule{,ByName,WithArg}Internal, GetModuleHandleInternal) are unregistered, so they fall to
+// prosper_on_unimpl, which also returns 0. No dump in the local corpus imports any of them —
+// measured, which is why this stays focused — but a title that uses them reproduces #2002 exactly.
+constexpr uint64_t k_sysmodule_error_unloaded = 0x805A1001;   // SCE_SYSMODULE_ERROR_UNLOADED
+
+namespace {
+// Heap-backed, not a namespace-scope std::mutex: on macOS the latter is constant-initialized
+// non-zero and lands in __DATA, where the #707 corruptor zeroes its pthread signature during
+// Blasphemous 2's asset load — and Blasphemous 2 is one of the titles that reaches these handlers.
+// See heap_mutex.hpp. Call sites must use the deduced `std::lock_guard lk(...)` form.
+PROSPER_HEAP_MUTEX(g_sysmodule_mx);
+std::unordered_map<uint16_t, bool> g_sysmodule_state;   // id -> loaded; absent == never asked for
+
+// One line per id the FIRST time it answers UNLOADED, so a title that reacts badly to an honest
+// answer is diagnosable instead of silent (the charter's fail-visible rule). Deduped per id — the
+// line says nothing about how often the id is queried.
+void sysmodule_report_unloaded(uint16_t id) {
+    static std::unordered_map<uint16_t, bool> seen;      // guarded by g_sysmodule_mx
+    if (seen.size() >= 64 || !seen.emplace(id, true).second) return;
+    fprintf(stderr, "[sysmodule] IsLoaded(0x%x) -> UNLOADED: this process has not loaded it "
+                    "(first query for this id; repeats are not logged)\n", (unsigned)id);
+}
+} // namespace
+
+// sceSysmoduleLoadModule(uint16_t id). prosper's PRX and HLE for the module are already resident,
+// so the load itself is a no-op that genuinely succeeds — the only new behaviour is that the load
+// is now recorded, so the state query stops contradicting the loader's own history.
+HLE(k_sysmodule_load) {
+    const uint16_t id = (uint16_t)a0;
+    std::lock_guard lk(g_sysmodule_mx);
+    g_sysmodule_state[id] = true;
+    return 0;
+}
+
+// sceSysmoduleUnloadModule(uint16_t id)
+HLE(k_sysmodule_unload) {
+    const uint16_t id = (uint16_t)a0;
+    std::lock_guard lk(g_sysmodule_mx);
+    g_sysmodule_state[id] = false;
+    return 0;
+}
+
+// sceSysmoduleIsLoaded(uint16_t id) -> SCE_OK when this process loaded it, else UNLOADED.
+HLE(k_sysmodule_is_loaded) {
+    const uint16_t id = (uint16_t)a0;
+    std::lock_guard lk(g_sysmodule_mx);
+    const auto it = g_sysmodule_state.find(id);
+    if (it != g_sysmodule_state.end() && it->second) return 0;
+    sysmodule_report_unloaded(id);
+    return k_sysmodule_error_unloaded;
+}
 // sceKernelLoadStartModule: a PRX already in the linked set resolves to its REAL handle, and dlsym
 // then consults that module's own exports first (#147). A path NOT in the linked set used to get a
 // fake monotonically-increasing success handle while loading nothing (#146) — the guest believed
@@ -1459,10 +1561,11 @@ void register_kernel_time_hle() {
     R("sceRtcGetCurrentDateTimeUtc", k_rtc_get_clock_utc);
     R("sceRtcSetTick", k_rtc_set_tick);   // tick -> UTC datetime (issue #115 follow-on: FDateTime spam)
     R("sceRtcGetTick", k_rtc_get_tick);   // UTC datetime -> tick
-    // module loading (report success; real PRX are already resident in our address space)
-    R("sceSysmoduleLoadModule", k_ok);
-    R("sceSysmoduleUnloadModule", k_ok);
-    R("sceSysmoduleIsLoaded", k_ok);
+    // module loading (report success; real PRX are already resident in our address space).
+    // IsLoaded is a state QUERY and must not share that stub — see the handlers above (#2002).
+    R("sceSysmoduleLoadModule", k_sysmodule_load);
+    R("sceSysmoduleUnloadModule", k_sysmodule_unload);
+    R("sceSysmoduleIsLoaded", k_sysmodule_is_loaded);
 #ifndef _WIN32
     R("sceKernelLoadStartModule", k_load_start_mod_entry);   // entry-rsp trampoline (#639)
 #else
