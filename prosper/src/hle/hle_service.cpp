@@ -3945,13 +3945,22 @@ HLE(s_npent_getkey) {
 // each falls back to its own conservative default — whereas reporting a SKU prosper cannot derive is
 // a value the guest cannot tell from a real one.
 //
-// ARG 0 IS THE OUT POINTER, and that needed proving rather than assuming: both neighbouring exports in
-// this library (GetAddcontEntitlementInfoList, GetEntitlementKey) lead with a SceNpServiceLabel, so if
-// this one did too, writing through a0 would be writing through a label and the whole fix would be
-// inert. A live GTA V (PPSA04263) boot under PROSPER_SVCLOG settles it:
+// THE OUT POINTER LEADS (arg 0), and that needed proving rather than assuming: both neighbouring exports
+// in this library (GetAddcontEntitlementInfoList, GetEntitlementKey) lead with a SceNpServiceLabel, so
+// if this one did too, writing through a0 would be writing through a label and the whole fix would be
+// inert with every test still green. A live GTA V (PPSA04263) boot under PROSPER_SVCLOG settles it — the
+// second line is the load-bearing one, because it is an observation of the slot rather than a reading of
+// guest code:
 //   [svc] sceNpEntitlementAccessGetSkuFlag(0x7f4fc82d6e2c, 0, 0xb, 0, 0x1d, 0xb)
-// a0 is a stack address whose slot the guest had pre-seeded with 1 (its TRIAL default, per its own
-// code at eboot+0x4dfc92) and a1 is 0 — a single-argument call.
+//   [svc]   a0 -> 0001a9bf00000001 0000003ab0ba4900 …
+// a0 is a stack address, and the low dword at it is 0x00000001 — the guest's own pre-seeded TRIAL
+// default, which is what the unimplemented stub used to leave standing. Only the SHAPE of the pointer
+// carries the argument: 0x7f4f… is run-local under ASLR, so a later run will print different digits and
+// that is not a disagreement.
+// What this does NOT establish: whether a trailing SceNpServiceLabel parameter exists. An
+// (out, label = 0) two-argument form would log byte-identically, and the sibling capture in the same run
+// shows label 0 is exactly what these calls pass — GetAddcontEntitlementInfoList(0, 0, 0, 0x7f4f…, …).
+// Unresolved and immaterial here: this handler ignores a1 either way.
 //
 // CONFIDENCE: HIGH on the contract and the enum (guest-pinned in three titles).
 //
