@@ -383,6 +383,27 @@ def classify_window(insns, const):
     return ("forward" if (live or spilled) else "ignored"), (insns[0] if insns else (0, "", ""))
 
 
+ENDBR64 = b"\xf3\x0f\x1e\xfa"
+
+
+def stub_entry_points(img, site):
+    """Addresses a caller may target for the PLT-ish stub whose `jmp *[rip+d]` sits at `site`.
+
+    A caller targets the stub's FIRST byte, which is not always the `jmp`: a CET-enabled stub opens
+    with `endbr64`, so calls land 4 bytes earlier. Looking only at the `jmp` address would report
+    zero call sites for an entire module with nothing about the output looking wrong — a whole
+    title silently classified "imports it but never inspects the result".
+
+    Split out from scan_module so it can be tested without a module fixture: no dump in the local
+    corpus uses a CET prologue, so this path is exercised by nothing but its unit test.
+    """
+    entries = [site]
+    fo = img.foff(site - 4)
+    if fo is not None and img.raw[fo:fo + 4] == ENDBR64:
+        entries.append(site - 4)
+    return entries
+
+
 def scan_module(path, nid, const, window, verbose=False):
     """Returns (status, detail) where status is 'no-import', 'no-slot', or a bucket census dict."""
     try:
@@ -400,15 +421,7 @@ def scan_module(path, nid, const, window, verbose=False):
     for slot in slots:
         for site, kind in xref.get(slot, []):
             if kind == "jmp*":
-                # A PLT-ish stub; its callers are the real users. A caller targets the stub's FIRST
-                # byte, which is not always the `jmp` — a CET-enabled stub opens with `endbr64`
-                # (f3 0f 1e fa), so calls land 4 bytes earlier and looking only at the `jmp` address
-                # would report zero call sites for an entire module while nothing looked wrong.
-                entries = [site]
-                fo = img.foff(site - 4)
-                if fo is not None and img.raw[fo:fo + 4] == b"\xf3\x0f\x1e\xfa":
-                    entries.append(site - 4)
-                for e in entries:
+                for e in stub_entry_points(img, site):
                     sites += [(s, "call") for s, k in xref.get(e, []) if k == "call"]
             elif kind == "call*":                            # direct indirect call through the slot
                 sites.append((site, "call*"))

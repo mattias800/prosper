@@ -553,6 +553,15 @@ HLE(k_ok)              { return 0; }                       // generic success no
 // resident before the app asks — that half rests on the API's shape, not on primary evidence — and
 // MED for the unmodelled ref-count nesting.
 //
+// The id is masked to 16 bits because that is genuinely its width in Sony's prototype
+// (`sceSysmoduleLoadModule(uint16_t)`), so a caller may leave anything in the upper half; both the
+// load and the query must therefore agree on the same truncation, or they name different entries
+// for one module. Note which direction the risk runs, because it is the opposite of this change's
+// general direction: everywhere else an over-eager UNLOADED is the safe error, but truncation is
+// the ONE place here that can manufacture a false *loaded* — two distinct ids congruent mod 2^16
+// would share an entry. The tripwire is therefore an observed id >= 0x10000; the corpus's widest is
+// 0x130, so nothing is close, and if one ever appears this mask is the first thing to revisit.
+//
 // NOT fixed here, and it is the same defect on a parallel path: the eight *Internal entry points
 // (sceSysmoduleIsLoadedInternal ynFKQ5bfGks, LoadModule{,ByName,WithArg}Internal,
 // UnloadModule{,ByName,WithArg}Internal, GetModuleHandleInternal) are unregistered, so they fall to

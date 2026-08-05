@@ -36,13 +36,21 @@ def check(name, got, want):
 
 
 def bucket(asm_bytes, base=0x1000):
-    """Assemble-free: classify a literal byte string as the window after the call."""
+    """Classify a literal byte string as the window after the call. Needs GNU objdump."""
     return G.classify_window(G.disasm(asm_bytes, base), UNLOADED)[0]
 
 
-def main():
-    print("== test_nid_gate_scan ==")
+def tbucket(*insns):
+    """Classify pre-decoded instructions — the same classifier, no objdump involved.
 
+    These carry the classifier coverage on a host with no GNU objdump. Without them the skip guard
+    below would take the whole file with it and the ctest would report green having tested nothing,
+    which is the trap this file's own header is about, one level up (instrument-trap 94)."""
+    return G.classify_window([(0x1000 + i * 4, m, o) for i, (m, o) in enumerate(insns)], UNLOADED)[0]
+
+
+def objdump_free_checks():
+    """Everything that does not need a disassembler. ALWAYS runs."""
     # --- canon(): the register normaliser the taint set depends on -------------------------------
     check("canon-eax", G.canon("eax"), "a")
     check("canon-rax", G.canon("rax"), "a")
@@ -53,6 +61,56 @@ def main():
     check("canon-memory-operand", G.canon("QWORD PTR [rbp-0x30]"), None)
     check("canon-immediate", G.canon("0x805a1001"), None)
 
+    # --- classify_window() over pre-decoded instructions (no disassembler needed) -----------------
+    check("t-const-gate", tbucket(("cmp", "eax,0x805a1001")), "const")
+    check("t-nonzero-gate", tbucket(("test", "eax,eax")), "nonzero")
+    check("t-other-cmp", tbucket(("cmp", "eax,0x5")), "other-cmp")
+    check("t-taint-follows-move",
+          tbucket(("mov", "ecx,eax"), ("xor", "eax,eax"), ("test", "ecx,ecx")), "nonzero")
+    check("t-jmp-ends-window",
+          tbucket(("jmp", "0x2000"), ("cmp", "eax,0x805a1001")), "forward")
+    check("t-alu-mask-is-a-gate", tbucket(("and", "eax,0x80000000")), "alu-gate")
+    check("t-self-xor-is-ignored", tbucket(("xor", "eax,eax"), ("ret", "")), "ignored")
+    check("t-call-clobbers", tbucket(("call", "0x2000"), ("ret", "")), "ignored")
+    check("t-ret-forwards", tbucket(("ret", "")), "forward")
+    check("t-callee-saved-survives-call",
+          tbucket(("mov", "r14d,eax"), ("call", "0x2000"), ("test", "r14d,r14d")), "nonzero")
+    check("t-undecodable", tbucket(("(bad)", "")), "undecodable")
+
+    # --- stub_entry_points(): the CET prologue case ----------------------------------------------
+    # No dump in the local corpus uses a CET-enabled stub, so the re-sweep that left every other
+    # number unchanged does NOT constrain this path — it only ever adds call sites, and it never
+    # fired. These assertions are the only thing testing it.
+    class FakeImg:
+        def __init__(self, base, blob):
+            self.base, self.raw = base, blob
+
+        def foff(self, va):
+            off = va - self.base
+            return off if 0 <= off < len(self.raw) else None
+
+    #  stub at 0x1000: f3 0f 1e fa (endbr64) then ff 25 ... at 0x1004
+    cet = FakeImg(0x1000, b"\xf3\x0f\x1e\xfa" + b"\xff\x25\x00\x00\x00\x00")
+    check("stub-entry-cet-adds-prologue", sorted(G.stub_entry_points(cet, 0x1004)), [0x1000, 0x1004])
+    #  a plain stub: the four bytes before the jmp are not endbr64
+    plain = FakeImg(0x1000, b"\x90\x90\x90\x90" + b"\xff\x25\x00\x00\x00\x00")
+    check("stub-entry-plain-is-jmp-only", G.stub_entry_points(plain, 0x1004), [0x1004])
+    #  a stub at the very start of a segment: site-4 is unmapped, must not raise
+    edge = FakeImg(0x1000, b"\xff\x25\x00\x00\x00\x00")
+    check("stub-entry-unmapped-prologue", G.stub_entry_points(edge, 0x1000), [0x1000])
+
+    # --- arg0_before(): the module-id recovery, a pure byte scan ---------------------------------
+    #  bf b4 00 00 00          mov edi,0xb4   immediately before the call at offset 5
+    check("arg0-exact", G.arg0_before(b"\xbf\xb4\x00\x00\x00", 5), (0xB4, True))
+    #  31 ff                   xor edi,edi
+    check("arg0-xor-edi", G.arg0_before(b"\x31\xff", 2), (0, True))
+    #  bf b4 00 00 00 90       mov edi,0xb4 ; nop  -> recovered but not exact
+    check("arg0-not-exact", G.arg0_before(b"\xbf\xb4\x00\x00\x00\x90", 6), (0xB4, False))
+    check("arg0-absent", G.arg0_before(b"\x90\x90\x90\x90", 4), None)
+
+
+def objdump_checks():
+    """End-to-end cases: real bytes through objdump, the output regex, and --adjust-vma."""
     # --- the gate idioms -------------------------------------------------------------------------
     #  3d 01 10 5a 80          cmp eax,0x805a1001
     check("const-gate", bucket(b"\x3d\x01\x10\x5a\x80\x75\x10"), "const")
@@ -99,33 +157,33 @@ def main():
     # --- a window that cannot be decoded is VOID, not negative ------------------------------------
     check("undecodable-is-its-own-bucket", bucket(b"\x06\x07\x0e\x16"), "undecodable")
 
-    # --- arg0_before(): the module-id recovery ---------------------------------------------------
-    #  bf b4 00 00 00          mov edi,0xb4   immediately before the call at offset 5
-    check("arg0-exact", G.arg0_before(b"\xbf\xb4\x00\x00\x00", 5), (0xB4, True))
-    #  31 ff                   xor edi,edi
-    check("arg0-xor-edi", G.arg0_before(b"\x31\xff", 2), (0, True))
-    #  bf b4 00 00 00 90       mov edi,0xb4 ; nop  -> recovered but not exact
-    check("arg0-not-exact", G.arg0_before(b"\xbf\xb4\x00\x00\x00\x90", 6), (0xB4, False))
-    check("arg0-absent", G.arg0_before(b"\x90\x90\x90\x90", 4), None)
-
-    # --- disasm() must not swallow an objdump failure --------------------------------------------
-    try:
-        G.disasm(b"\x90", 0)
-        objdump_ok = True
-    except Exception:                                                # noqa: BLE001
-        objdump_ok = False
-    check("disasm-works-on-a-nop", objdump_ok, True)
-
-    print("== FAILURES: %d ==" % fails if fails else "== all checks passed ==")
-    return 1 if fails else 0
+    # --- disasm() itself: addresses, mnemonics, and the output regex ------------------------------
+    # Asserting only "it did not raise" is tautological once the capability probe has passed — the
+    # probe already ran a decode. Assert the DECODE: two nops at the requested base, which covers
+    # --adjust-vma, the objdump output regex, and the toolchain in one line.
+    check("disasm-decodes-two-nops-at-base", G.disasm(b"\x90\x90", 0x4000),
+          [(0x4000, "nop", ""), (0x4001, "nop", "")])
 
 
-if __name__ == "__main__":
+def main():
+    print("== test_nid_gate_scan ==")
+    objdump_free_checks()                       # always — never gated on the toolchain
     # Capability, not existence. The first version of this guard ran `objdump --version` and treated
     # success as "usable" — but macOS ships LLVM's objdump as plain `objdump`, and it answers
     # --version happily while rejecting `-b binary`, so the guard passed on a machine where every
     # single decode raises. The macOS CI job caught it. objdump_binary() probes with a real decode.
+    #
+    # And the guard is scoped to the cases that actually need the decoder. Skipping the whole file
+    # would leave macOS reporting this test green while running nothing at all — the same trap one
+    # level up, and the reason objdump_free_checks() carries the classifier coverage in tuple form.
     if G.objdump_binary() is None:
-        print("no GNU objdump able to disassemble a raw binary (LLVM's cannot) — skipping")
-        sys.exit(0)
+        print("  [skip] no GNU objdump able to disassemble a raw binary (LLVM's cannot) — "
+              "end-to-end decode cases skipped; classifier cases above still ran")
+    else:
+        objdump_checks()
+    print("== FAILURES: %d ==" % fails if fails else "== ALL CHECKS PASSED ==")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
     sys.exit(main())
