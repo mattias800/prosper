@@ -861,28 +861,74 @@ namespace {
         static const bool on = getenv("PROSPER_RWLOCK_UNSAFE_UNLOCK") != nullptr;
         return on;
     }
+    // The OS thread id, in the same vocabulary as /proc/<pid>/task and guest_bt. prosper_gettid()
+    // does not exist on Windows (posix_shim.hpp is entirely #ifndef _WIN32), so this mirrors the
+    // sctid() split above. Any live thread's id is non-zero on every platform, which is what makes
+    // `writer != 0` usable as "write-held".
+    uint64_t rw_self_tid() {
+#if defined(__linux__) || defined(__APPLE__)
+        return (uint64_t)prosper_gettid();
+#elif defined(_WIN32)
+        return (uint64_t)GetCurrentThreadId();
+#else
+        return (uint64_t)(uintptr_t)pthread_self();
+#endif
+    }
+    // ORDER IS LOAD-BEARING IN BOTH DIRECTIONS, and the obvious order is the wrong one.
+    //
+    // These two fields are read by a STRAY unlock running on another thread — that is the whole
+    // point of the accounting — so "only the writer can be running here" is false, and any window
+    // in which `writer == 0` while `holds > 0` lets a stray unlock take the reader path and forward
+    // a host unlock that releases the WRITE hold. The owner then decrements to -1 and forwards its
+    // own unlock, glibc takes the reader path, `__readers` goes negative, and the lock is bricked:
+    // #2012 reproduced by its own fix.
+    //
+    // So: publish the owner BEFORE the count on acquire, and drop the count BEFORE clearing the
+    // owner on release. A non-owner arriving at any instant then sees either `writer == owner`
+    // (EPERM) or `holds == 0` (EPERM) — never a decrementable count with no owner. Both stores
+    // still happen inside rw_release, i.e. before the caller's host unlock, so the next writer
+    // cannot observe a stale owner either.
     void rw_acquired(GuestRwlock* g, bool write) {
+        if (write) g->writer.store(rw_self_tid(), std::memory_order_release);
         g->holds.fetch_add(1, std::memory_order_acq_rel);
-        // Only the writer itself can be running here (it holds the lock exclusively), so this store
-        // races with nothing. It is cleared BEFORE the host unlock, so the next writer can never
-        // observe a stale owner.
-        if (write) g->writer.store((uint64_t)prosper_gettid(), std::memory_order_release);
     }
     // 0 = released (the caller may now unlock the host lock); EPERM = FreeBSD refuses this unlock
     // and the host lock must not be touched.
     int rw_release(GuestRwlock* g) {
-        const uint64_t self = (uint64_t)prosper_gettid();
+        const uint64_t self = rw_self_tid();
         if (const uint64_t owner = g->writer.load(std::memory_order_acquire)) {
             if (owner != self) return EPERM;              // non-owner write unlock
+            // Decrement-if-positive even here: after the ordering above it provably cannot
+            // underflow, and if it ever did, a negative `holds` would refuse every future unlock on
+            // this lock forever with no diagnostic. One compare buys fail-safe over fail-permanent.
+            int32_t cur = g->holds.load(std::memory_order_acquire);
+            while (cur > 0 && !g->holds.compare_exchange_weak(cur, cur - 1,
+                                                              std::memory_order_acq_rel,
+                                                              std::memory_order_acquire)) {}
             g->writer.store(0, std::memory_order_release);
-            g->holds.fetch_sub(1, std::memory_order_acq_rel);
             return 0;
         }
+        // The reader path re-reads `writer` AFTER the decrement, and undoes it if an owner appeared.
+        // Publishing the owner before the count is not enough on its own: this thread's two loads
+        // can STRADDLE a writer's acquire — read `writer` as 0, then read `holds` as 1 from the
+        // very increment that writer just made — and then release a write hold it does not own.
+        // Measured, not theorised: a write-only stress workload accepted exactly one stray unlock
+        // this way and wedged every worker in pthread_rwlock_wrlock forever. Because the writer's
+        // `writer.store` happens-before its `holds.fetch_add`, observing that increment guarantees
+        // the re-read sees the owner, so the undo closes the window rather than narrowing it.
         int32_t cur = g->holds.load(std::memory_order_acquire);
-        while (cur > 0 && !g->holds.compare_exchange_weak(cur, cur - 1,
-                                                          std::memory_order_acq_rel,
-                                                          std::memory_order_acquire)) {}
-        return cur > 0 ? 0 : EPERM;                       // no hold outstanding: refuse
+        while (cur > 0) {
+            if (g->writer.load(std::memory_order_acquire) != 0) return EPERM;
+            if (g->holds.compare_exchange_weak(cur, cur - 1, std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
+                if (g->writer.load(std::memory_order_acquire) != 0) {
+                    g->holds.fetch_add(1, std::memory_order_acq_rel);   // an owner appeared: undo
+                    return EPERM;
+                }
+                return 0;
+            }
+        }
+        return EPERM;                                     // no hold outstanding: refuse
     }
     // One counter per report KIND: a flood of one must not consume another's budget (the trap this
     // repository records as asymmetric cap exhaustion). Each line carries its own kind's ordinal.
@@ -891,8 +937,9 @@ namespace {
         static std::atomic<int> printed[(size_t)RwReport::Count_];
         const int n = printed[(size_t)kind].fetch_add(1);
         if (n >= 64 && (n & (n - 1)) != 0) return;   // first 64 of this kind, then powers of two
-        fprintf(stderr, "[rwlock] %s slot=0x%llx rw=%p rc=%d tid=%ld holds=%d #%d\n", what,
-                (unsigned long long)slot, (const void*)g, rc, (long)prosper_gettid(),
+        fprintf(stderr, "[rwlock] %s slot=0x%llx rw=%p rc=%d tid=%llu holds=%d #%d\n", what,
+                (unsigned long long)slot, (const void*)g, rc,
+                (unsigned long long)rw_self_tid(),
                 g ? g->holds.load(std::memory_order_relaxed) : 0, n);
     }
     // A lock call that FAILED records no hold, and it is worth saying so: the handlers below still
@@ -953,8 +1000,15 @@ HLE(k_rwlock_trywrlock){
     return fbsd_errno(rc);
 }
 // The Sony spellings report failure in the libkernel encoding; the POSIX ones keep the bare errno.
-// Same split, and the same reason, as the mutex aliases above (#1984) — the rwlock family was
-// inconsistent about it, so all four Sony entry points that can fail are aliased.
+// Same split, and the same reason, as the mutex aliases above — but note the evidence boundary:
+// #1984's proof is the shipped guest libc.prx comparing MUTEX and CONDVAR results against the
+// encoded constants. No guest code has been observed testing an encoded RWLOCK result, so applying
+// it here is an extrapolation from a consistent libkernel-wide convention rather than a direct
+// observation. It is the safer of the two errors (a guest that only tests == 0 is unaffected either
+// way), and it makes the family self-consistent. CONFIDENCE: MED.
+// Init is aliased too: it can fail with ENOMEM (a failed allocation), so it is not a can't-fail
+// entry point.
+SCE_PTHREAD_ALIAS(k_sce_rwlock_init,      k_rwlock_init)
 SCE_PTHREAD_ALIAS(k_sce_rwlock_unlock,    k_rwlock_unlock)
 SCE_PTHREAD_ALIAS(k_sce_rwlock_tryrdlock, k_rwlock_tryrdlock)
 SCE_PTHREAD_ALIAS(k_sce_rwlock_trywrlock, k_rwlock_trywrlock)
@@ -2054,9 +2108,13 @@ namespace {
         timespec now{};
         clock_gettime(CLOCK_REALTIME, &now);
         timespec dl{now.tv_sec + rel.tv_sec, now.tv_nsec + rel.tv_nsec};
-        // Normalize repeatedly: an out-of-spec tv_nsec >= 1e9 from the guest would otherwise leave
-        // the deadline out of range and glibc would answer EINVAL instead of timing out.
-        while (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+        // Normalize by division, not by subtraction in a loop: an out-of-spec tv_nsec near LONG_MAX
+        // would be ~9.2e9 iterations. Without normalizing at all, glibc answers EINVAL instead of
+        // timing out.
+        if (dl.tv_nsec >= 1000000000L) {
+            dl.tv_sec += dl.tv_nsec / 1000000000L;
+            dl.tv_nsec %= 1000000000L;
+        }
         return dl;
     }
 }
@@ -3655,7 +3713,7 @@ void register_kernel_hle() {
     R("scePthreadCondWait", k_cond_wait);
     R("scePthreadCondTimedwait", k_cond_timedwait_sce);   // Sony: relative µs, NOT the POSIX abstime form
     // read/write locks + once (Sony + POSIX names) — real host primitives (thread-safety fix).
-    R("scePthreadRwlockInit", k_rwlock_init);        R("pthread_rwlock_init", k_rwlock_init);
+    R("scePthreadRwlockInit", k_sce_rwlock_init);    R("pthread_rwlock_init", k_rwlock_init);
     R("scePthreadRwlockDestroy", k_rwlock_destroy);  R("pthread_rwlock_destroy", k_rwlock_destroy);
     R("scePthreadRwlockRdlock", k_rwlock_rdlock);    R("pthread_rwlock_rdlock", k_rwlock_rdlock);
     R("scePthreadRwlockWrlock", k_rwlock_wrlock);    R("pthread_rwlock_wrlock", k_rwlock_wrlock);

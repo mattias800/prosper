@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 using namespace prosper;
 
@@ -184,6 +185,68 @@ int main() {
         CHECK(call1(RWtrywrP, (uint64_t)(uintptr_t)&h) == 0,
               "pthread_rwlock_trywrlock succeeds once the helper releases");
         CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0, "unlock the write hold from the POSIX arms");
+    }
+    // #2012: CONCURRENT cross-thread traffic against stray unlocks. The two ordering windows this
+    // guard can get wrong — publishing the hold count before the owner on acquire, or clearing the
+    // owner before the count on release — are each a few instructions wide, so a single-shot arm
+    // passes by luck. This LOOPS: balanced writers and readers on several threads while another
+    // thread hammers stray unlocks at the same lock.
+    //
+    // The invariant is NOT "a balanced pair always releases". FreeBSD makes no identity check for
+    // readers, so a stray unlock that arrives while readers are present legitimately consumes one
+    // reader's release — on hardware too. What must hold is sharper, and is exactly what the store
+    // ordering buys:
+    //   * a WRITE hold can never be stolen: the owner is published before the count and cleared
+    //     after it, so a stray either sees the owner (EPERM) or sees no count (EPERM). With the
+    //     two stores in the obvious order, a stray robs the writer, the owner's own release then
+    //     drives the count negative, and the lock is bricked — #2012 reproduced by its own fix.
+    //   * a READ hold can only be stolen by a stray that was ACCEPTED, so the victims are bounded
+    //     by the accepted strays.
+    //   * and the lock is never corrupted: it still write-acquires afterwards.
+    // The workers take WRITE holds only, deliberately. A write-held lock has an owner published at
+    // every instant a stray could observe it, and an idle lock has a zero count, so under the
+    // correct ordering **no stray is ever accepted** — which makes the arm deterministic and gives
+    // it a crisp invariant. Under the wrong ordering the stray slips into the reader path, robs the
+    // owner, and the owner's own release then drives the count negative.
+    //
+    // Reader stealing is deliberately NOT in this loop. It is legal (the serialized cross-thread
+    // read arm above covers it), but forwarding a non-owner read release into glibc under heavy
+    // contention is undefined territory in the HOST lock rather than in this accounting, and a test
+    // that manufactures it is testing glibc, not prosper — a real guest issues balanced pairs plus
+    // the occasional stray, not 4,000 adversarial ones.
+    {
+        std::atomic<int> refused_after_write{0};
+        std::atomic<int> strays_accepted{0}, strays_refused{0}, rounds{0};
+        std::vector<std::thread> workers;
+        for (int t = 0; t < 3; t++) {
+            workers.emplace_back([&]{
+                for (int i = 0; i < 2000; i++) {
+                    call1(RWwr, (uint64_t)(uintptr_t)&h);
+                    if (call1(RWun, (uint64_t)(uintptr_t)&h) != 0) refused_after_write.fetch_add(1);
+                    rounds.fetch_add(1);
+                }
+            });
+        }
+        workers.emplace_back([&]{
+            // The attacker: unlocks it never took. Bounded on BOTH sides — it stops when the
+            // workers are done, and never spins more than this many times, because an unbounded
+            // "while the workers run" loop reaches half a billion attempts on a fast host and buys
+            // no additional interleavings.
+            for (int i = 0; i < 200000 && rounds.load(std::memory_order_relaxed) < 6000; i++) {
+                if (call1(RWun, (uint64_t)(uintptr_t)&h) != 0) strays_refused.fetch_add(1);
+                else strays_accepted.fetch_add(1);
+            }
+        });
+        for (auto& w : workers) w.join();
+        CHECK(rounds.load() == 6000 && strays_refused.load() > 1000,
+              "the concurrency arm actually ran (6000 balanced write rounds; strays were refused)");
+        CHECK(strays_accepted.load() == 0,
+              "no stray unlock is EVER accepted against a write-only workload (the ordering invariant)");
+        CHECK(refused_after_write.load() == 0,
+              "no WRITE hold was ever stolen, so every owner released its own hold");
+        CHECK(call1(RWtrywr, (uint64_t)(uintptr_t)&h) == 0,
+              "the lock still write-acquires after the concurrency arm (never corrupted)");
+        call1(RWun, (uint64_t)(uintptr_t)&h);
     }
     call1(RWdes, (uint64_t)(uintptr_t)&h);
 
