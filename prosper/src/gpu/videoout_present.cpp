@@ -68,6 +68,10 @@ void present_flip(int buffer_index, int64_t flip_arg) {
     // actually puts on screen — vs our execute_and_present composite render). First 8 flips + every 60th.
     // Written as raw w*h*4 bytes; convert offline. This reveals whether the game's real display holds the
     // title/scene even when the captured draws are a no-op composite.
+    // Deliberately RAW, so it stays a faithful view of guest memory. A TILE-mode scanout therefore
+    // looks like horizontal-band noise until it is de-swizzled — that is the surface being real and
+    // tiled, not empty. Use videoout_read_front_linear (or detile with videoout_scanout_tile_mode)
+    // to see it as an image; #1968 spent an arm concluding "content" from exactly this dump.
     if (const char* dir = getenv("PROSPER_DUMP_SCANOUT"); dir && (n < 8 || n % 60 == 0)) {
         std::vector<uint8_t> raw;
         if (videoout_copy_buffer(selected, raw)) {
@@ -113,8 +117,15 @@ size_t present_readback(void* dst, size_t dst_cap) {
         }
         return 0;
     }
-    // Fallback: scan out the raw guest display buffer (contents are whatever the guest put there).
-    return videoout_copy_front_buffer(dst, dst_cap);
+    // Fallback: scan out the guest display buffer (contents are whatever the guest put there). Read
+    // it as an image — a TILE-mode scanout's bytes are swizzled, and returning them raw hands the
+    // caller band noise in place of the guest's own frame (#1968).
+    std::vector<uint8_t> linear;
+    VideoOutBufferSnapshot metadata;
+    if (!videoout_read_front_linear(linear, metadata) || linear.empty() || dst_cap < linear.size())
+        return 0;
+    std::memcpy(dst, linear.data(), linear.size());
+    return linear.size();
 }
 
 bool present_acquire_rendered_frame(PresentFrameLease& out) {
@@ -149,7 +160,7 @@ bool present_snapshot(PresentSnapshot& out) {
     }
 
     VideoOutBufferSnapshot scanout;
-    if (!videoout_copy_front_buffer(out.rgba, scanout)) return false;
+    if (!videoout_read_front_linear(out.rgba, scanout)) return false;
     out.source = PresentSource::RawScanout;
     out.present_count = g_present_count.load(std::memory_order_relaxed);
     out.source_seq = out.present_count;

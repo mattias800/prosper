@@ -4,6 +4,8 @@
 // NID registry exactly as the guest does, then asserts the reported display + recorded buffers.
 #include "../src/hle/dispatch.hpp"
 #include "../src/gpu/videoout_present.hpp"
+#include "../src/gpu/tile.hpp"   // tile/detile round trip for the flipped-buffer image contract
+#include <vector>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>   // setenv/_putenv_s (PROSPER_HDR both-modes test)
@@ -534,6 +536,77 @@ int main() {
               prosper_vo_buffer_count() == 0 && prosper_vo_buffer_addr(0) == 0 &&
               prosper_vo_display_width() == 0 && prosper_vo_display_height() == 0,
           "unregistering the remaining set clears the registry and geometry");
+
+    // ---- The flipped buffer read as an IMAGE, not as bytes (#1968) --------------------------------
+    // A registered scanout carries its own tiling mode, and until this was honoured every consumer
+    // that treated the read as pixels got a swizzled surface: Sonic Frontiers' guest-composited
+    // frames reached prosper as horizontal-band noise rather than as the frames they are. The
+    // round trip below is the contract — tile a known image into guest memory exactly as the GPU
+    // would, flip it, and require the present layer to hand back the original linear image.
+    {
+        constexpr uint32_t kW = 256, kH = 128;   // one whole SW_64KB_R_X block row: footprint == W*H*4
+        std::vector<uint8_t> reference(static_cast<size_t>(kW) * kH * 4);
+        for (size_t i = 0; i < reference.size(); i += 4) {
+            const size_t texel = i / 4;
+            reference[i + 0] = (uint8_t)(texel & 0xff);
+            reference[i + 1] = (uint8_t)((texel >> 8) & 0xff);
+            reference[i + 2] = (uint8_t)(texel * 7u);
+            reference[i + 3] = 0xff;
+        }
+        const uint32_t tiled_mode = gpu::videoout_scanout_tile_mode(0 /*TILE*/, 4);
+        CHECK(tiled_mode == (uint32_t)gpu::TileMode::Sw64KbRX,
+              "a TILE-mode 32-bpp scanout is the SW_64KB_R_X render-target swizzle");
+        CHECK(gpu::videoout_scanout_tile_mode(1 /*LINEAR*/, 4) == (uint32_t)gpu::TileMode::Linear &&
+                  gpu::videoout_scanout_tile_mode(0, 8) == (uint32_t)gpu::TileMode::Linear &&
+                  gpu::videoout_scanout_tile_mode(7 /*unknown*/, 4) == (uint32_t)gpu::TileMode::Linear,
+              "LINEAR, non-32-bpp and unrecognized VideoOut tiling modes stay a straight copy");
+        const size_t tiled_bytes = gpu::tiled_surface_bytes(kW, kH, tiled_mode, 0, 4);
+        CHECK(tiled_bytes == reference.size(),
+              "the chosen extent has no block padding, so the round trip is exact");
+
+        std::vector<uint8_t> tiled_fb(tiled_bytes, 0);
+        gpu::tile_surface(tiled_fb.data(), reference.data(), kW, kH, tiled_mode, 0, 4);
+        CHECK(tiled_fb != reference, "the tiled framebuffer really is swizzled, not a copy");
+
+        uint8_t tiled_attr[0x50];
+        setba2((uint64_t)(uintptr_t)tiled_attr, fmt, 0 /*TILE*/, kW, kH, option, 0, 0);
+        VOB tiled_buffers[1] = { {tiled_fb.data(), 0, {0, 0}} };
+        CHECK(regb2(handle, 0, 0, (uint64_t)(uintptr_t)tiled_buffers, 1,
+                    (uint64_t)(uintptr_t)tiled_attr) == 0,
+              "registered a TILE-mode scanout");
+        CHECK(flip(handle, 0, 0, 0, 0, 0) == 0, "flipped the TILE-mode scanout");
+
+        gpu::PresentSnapshot snapshot;
+        const bool got = gpu::present_snapshot(snapshot);
+        CHECK(got && snapshot.source == gpu::PresentSource::RawScanout,
+              "with no rendered frame the present layer reads the guest scanout");
+        CHECK(got && snapshot.width == kW && snapshot.height == kH &&
+                  snapshot.rgba.size() == reference.size(),
+              "the guest scanout read is the registered extent, linear");
+        CHECK(got && snapshot.rgba == reference,
+              "a TILE-mode scanout is de-swizzled into the image the guest composited");
+
+        // The raw byte primitive stays raw: a diagnostic that dumps guest memory must keep seeing
+        // exactly what is there, so only the image reader de-swizzles.
+        std::vector<uint8_t> raw;
+        VideoOutBufferSnapshot raw_meta;
+        CHECK(videoout_copy_front_buffer(raw, raw_meta) && raw == tiled_fb,
+              "videoout_copy_front_buffer still returns the untouched guest bytes");
+        CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the TILE-mode scanout");
+
+        // LINEAR keeps the historical straight copy end to end.
+        uint8_t linear_attr[0x50];
+        setba2((uint64_t)(uintptr_t)linear_attr, fmt, 1 /*LINEAR*/, kW, kH, option, 0, 0);
+        VOB linear_buffers[1] = { {reference.data(), 0, {0, 0}} };
+        CHECK(regb2(handle, 0, 0, (uint64_t)(uintptr_t)linear_buffers, 1,
+                    (uint64_t)(uintptr_t)linear_attr) == 0,
+              "registered a LINEAR scanout");
+        CHECK(flip(handle, 0, 0, 0, 0, 0) == 0, "flipped the LINEAR scanout");
+        gpu::PresentSnapshot linear_snapshot;
+        CHECK(gpu::present_snapshot(linear_snapshot) && linear_snapshot.rgba == reference,
+              "a LINEAR scanout is published byte-for-byte");
+        CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the LINEAR scanout");
+    }
 
     const uint64_t before_blank_flip = prosper_vo_flip_count();
     CHECK(flip(handle, (uint64_t)(int64_t)-1, 0, 0, 0, 0) == 0 &&
