@@ -43,22 +43,32 @@ additive/max composite against opaque yellow — the two are indistinguishable w
 
 What is and is not bounded:
 
-- **It is intermittent from very early, NOT switched on by the post-process chain.** It is tempting
-  to read "the logos are clean and the title screen is not" as an onset, and an earlier draft of
-  this doc did. It does not survive the mapping above: the earliest tinted frame on record is the
-  *empty* composite at `frame_seq=4`, t≈4.0 s (#1962, build `ff72e77c`), and a black empty composite
-  under `out = (255,255,in.b)` is exactly the pure `RGB(255,255,0)` that was seen. Clean logo frames
-  at t=20/40/60/80 s are interleaved with it. So the tint is present and intermittent from the first
-  seconds, and **the post-process/tonemap stage is not localised by this evidence** — do not narrow
-  to it on the strength of the splash frames.
+- **It tints frames that contain no content at all, so it is NOT switched on by the post-process
+  chain.** It is tempting to read "the logos are clean and the title screen is not" as an onset, and
+  an earlier draft of this doc did. Two independent observations kill it, and the second needs no
+  cross-build argument:
+  - The earliest tinted frame on record is the *empty* composite at `frame_seq=4`, t≈4.0 s (#1962,
+    build `ff72e77c`); a black empty composite under `out = (255,255,in.b)` is exactly the pure
+    `RGB(255,255,0)` seen there. Clean logo frames at t=20/40/60/80 s are interleaved with it.
+  - On **`4d7a2ded` itself**, ten consecutive samples (t=120–210 s) are pure `(255,255,0)` across
+    all 8,294,400 pixels — one colour, no content — while that arm did not composite the title
+    screen until t≈230 s. Ten of its twenty-four tinted samples therefore carry nothing that any
+    post-process chain could have acted on.
+
+  So the tint is present and intermittent from the first seconds and applies to empty frames, and
+  **the post-process/tonemap stage is not localised by this evidence** — do not narrow to it on the
+  strength of the splash frames.
 - **It is not frontend-specific.** The native SDL3 `prosper-app` window shows it too, and there it
   is *persistent* — three grabs 40 s apart at the title screen are byte-identical yellow. Headless
   `screenshot` sees it on roughly two thirds of samples, with correct black frames interleaved.
 - **The rate is 24/36 in both 360 s arms, but that is not yet a calibrated discriminator.** The two
   arms are the default and the `PROSPER_NO_PACKED_R11_STORAGE=1` arm — i.e. the same pair an A/B
   would compare, so their agreement cannot also serve as the baseline's run-to-run variance. With
-  n=1 per configuration the null spread is unknown. Establish it with two same-configuration arms
-  before reading any future "unchanged at 24/36" as a negative.
+  n=1 per configuration the null spread is unknown. Worse, the two 24s are not even counting the
+  same thing: the treated arm reached the title screen ~120 s later, so most of its tinted samples
+  are empty composites where the default arm's are title-screen frames. Establish a null with two
+  **same-configuration** arms, and compare within a fixed content window, before reading any future
+  "unchanged at 24/36" as a negative.
 
 Open as [#2014](https://github.com/mattias800/prosper/issues/2014).
 
