@@ -146,8 +146,8 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | The absent `raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/` group prove the supplied `raw/` tree is a truncated repack | **Falsified as an integrity claim.** The tree is internally consistent: `ui_museum_item_texture_l_art1..214` is contiguous with no gaps, all seven multi-language `ui_*` families are complete at 12/12 languages, and `raw/ui` contains no subdirectories at all. The eboot's name pool contains exactly one base-game `ui/` entry with no file (`ui/ui_startup`) plus the six region rating textures (`ui_title_cero`/`esrb_e10`/`esrb_rp`/`nocopy`/`pegi`/`titile_healthy`) — one functional group, requested back to back, consistent with an optional region/legal asset set this build does not ship. Their absence is therefore not evidence of a damaged dump, and remains insufficient to explain the black frame. **One leg of the original argument is withdrawn — see the `AMPRIDX3` row below.** | #1905, this doc |
 | `ampr_emu.index` is the application's own `AMPRIDX3` file index, so a name absent from it is a name this build does not ship | **Falsified — misattribution.** The index is *repack scaffolding*, not the game's: the eboot contains no `AMPRIDX` string anywhere, prosper never opens the file (no reference in `src/` or `tools/`), and it sits beside `dlc_emu.ini`, four `fakelib/*.sprx` stubs and a `_DUPLEX_/duplex.nfo` — and its entries include `/app0/dlcN/dlc/dlcN/...` mount paths a shipped app0 index could not contain. It therefore records what the repacker's tool found on disk, which cannot establish what the application expects. This does not resurrect the truncated-repack claim (the contiguity and language-completeness legs stand on their own); it removes one leg that was never evidence. | #1905, this doc |
 | Sonic is black because prosper renders content and then loses it in the present path (the #1990 publish wall) | **The wall is real and it is not the cause.** On `c77c66b4` Sonic reproduces the Frontiers signature exactly: `frame_seq` freezes at **1** while `present_count` climbs (21 → 49 → 76 → … across eight 6 s samples), i.e. exactly one frame is ever published. With #1990 applied, `frame_seq` advances again (110 / 300 / 490 / 669 / 844 across 8 s samples) and every pixel is unchanged black. #1990's own report names why: `[rtt] PRESENT SOURCE EXTENT MISMATCH: no pass produced a 3840x2160 (33177600-byte) present source — px_front=none px_vo=none px_last=none` on submit after submit, with one wrong-extent `px_last=1920x1080` candidate — the frame that poisoned the retained slot and made the freeze permanent. So Sonic needs #1990, and #1990 does not make it render. | #1905, #1990, #1986 |
-| The 3840x2160 `R16G16B16A16_SFLOAT` scene target holds full-frame content that the publish path discards (`px_nonblack=8294400`) | **Falsified — that number was the instrument, and it is fixed.** `PROSPER_PASS_LOG`'s counter stepped 4 bytes and tested bytes 0..2 as if every target were 8-bit RGBA, so on an 8-byte-per-texel FP16 target it walked *half*-texels: every second group holds the B and A halves, and an alpha of 1.0 (`0x3c00`) is non-zero, so it reported exactly `w*h` "non-black pixels" for a buffer whose RGB is entirely zero. Counting through `inspection_rgba8` instead reports **0** for the same non-deferred pass on the same target. Read as content, the old number said "every pixel of the 4K scene is lit" for a completely black frame. | #1905, this PR |
-| Every GPU target is black only in the retained offline replay, so the live render may still hold content | **Falsified on the live path.** A `PROSPER_DUMP_PERSISTENT` census (which is deliberately *not* in the `live_gpu_targets` disable list, so it observes the normal persistent-render path) dumps all **10** persistent color targets across three consecutive live submits, each converted through `inspection_rgba8`: `0x2010870000`, `0x20168f0000`, `0x203a7d0000`, `0x204ec40000` (4K), `0x20274e0000`, `0x20692c0000` (1080p) and the three 960x540 bloom chains are uniformly black. The only non-black target is a 256x256 grey utility texture (`0x2076f60000`). The guest-programmed-black finding is therefore a property of the title's live frame, not of the replay. | #1905, this doc |
+| The 3840x2160 `R16G16B16A16_SFLOAT` scene target holds full-frame content that the publish path discards (`px_nonblack=8294400`) | **Falsified — that number was the instrument, and it is fixed.** `PROSPER_PASS_LOG`'s counter stepped 4 bytes and tested `p`, `p+1`, `p+2` — never `p+3` — as if every target were 8-bit RGBA, so over an 8-byte FP16 texel it read `{R_lo, R_hi, G_lo}` then `{B_lo, B_hi, A_lo}`. The target's texels are **RGB bit-zero with alpha `0x3c05` (1.00488)**, measured byte-exactly, and that alpha's low mantissa byte `0x05` sits at texel byte 6 — the second group's `p+2` — so exactly one of the two groups per texel counted and the line printed precisely `w*h`. An alpha of exactly 1.0 would have counted **zero** (`0x3c00`'s only non-zero byte is the skipped `p+3`), so the number was never a property of the image, only of its bit layout. Counting through `inspection_rgba8` reports **0** for the same pass. | #1905, this PR |
+| Every GPU target is black only in the retained offline replay, so the live render may still hold content | **Falsified on the live path, at bit level.** A `PROSPER_DUMP_PERSISTENT` census (deliberately *not* in the `live_gpu_targets` disable list, so it observes the normal persistent-render path) dumps all **10** persistent color targets across three consecutive live submits and now reports the *pre*-conversion bytes beside the converted count, because "black" and "empty" are different findings. Every target has `rgb_nonblack=0` except a 256x256 grey utility texture (`0x2076f60000`) and **two** texels of a 960x540 bloom target. The raw bytes name what the colour count cannot: the final 4K RGBA8 composite `0x2010870000` is `00 00 00 ff` per texel (opaque black, 8,294,400 of 33,177,600 bytes non-zero — the alpha byte only); the 4K FP16 scene target `0x20168f0000` is `00 00 00 00 00 00 05 3c` (RGB bit-zero, alpha 1.00488); the mask target `0x204ec40000` and the 1080p `B10G11R11` target are **entirely zero**. So the frame is black *by content*, not merely by conversion — the guest-programmed-black finding is a property of the title's live frame, not of the replay or of a clamp. | #1905, this doc |
 | The guest's own scanout memory holds a frame prosper simply fails to publish | **Falsified.** `PROSPER_DUMP_SCANOUT` dumps ten raw flipped guest buffers (both registered VideoOut buffers, 33,177,600 bytes each); every sampled pixel of every dump is `(0,0,0)`. The guest's last step into the scanout is a *compute dispatch* (`0x2010870000 -> 0x2012850000`), and neither its output nor any draw reaches those addresses with content. | #1905, this doc |
 
 ## Sonic Origins dump audit
@@ -375,9 +375,12 @@ are what the next lane has to work with.
 
 A `PROSPER_PASS_LOG` census over 3,859 pass records finds **six distinct render targets and not one
 of them is a registered VideoOut buffer** (`vo=1` count: **0**). The registered scanout pair is
-`0x2012850000` / `0x2014830000` (the front alternates between them), and `PROSPER_DUMP_PERSISTENT`
-reports `scanout=MISS` for both — prosper holds no GPU-resident image for the flipped address either.
-Per flip the guest renders:
+`0x2012850000` / `0x2014830000` (the front alternates between them), and neither address appears
+anywhere in `PROSPER_DUMP_PERSISTENT`'s enumeration of the RTT cache — that census walks every entry
+in `g_rtt`, and it lists ten targets, none of them a scanout. (The accompanying `scanout=MISS` on the
+same line is consistent but weaker on its own: `cached_scanout` returns null on four distinct
+conditions, so a MISS alone would not prove the entry is absent. The absence is carried by the
+enumeration and by the `vo=1` count of zero.) Per flip the guest renders:
 
 | target | extent | format | readback |
 | --- | --- | --- | --- |
@@ -399,18 +402,21 @@ are worth separating:
    `rendered_pixels` to offer. Two recovery paths exist and both miss for a precise reason worth
    keeping straight: the deferred-scanout materialization is gated on `is_vo` (never true here), and
    the final span's `cached_scanout` recovery is keyed on the **flipped address** rather than on any
-   pass — it would materialize a persistent target found at a VideoOut address — but `g_rtt` holds no
-   entry for either scanout VA at all, which is exactly what `[persist] … scanout=MISS` reports. So
-   the gap is not "the wrong pass was chosen"; it is that **nothing prosper owns exists at the address
-   the guest flips**. This is the same shape as #1968 §5 ("why no post-intro pass targets the flipped
-   VideoOut buffer") on a second, unrelated title, so it is a **cross-title present-path gap, not a
-   Frontiers quirk** — and on Sonic it is total rather than partial.
-2. **It is nevertheless not why the screen is black.** Every one of those targets is uniformly black
-   when dumped through a correct format conversion, and so are the raw guest scanout buffers. There is
-   no content anywhere for the present path to lose. Repairing (1) on Sonic today would publish black.
+   pass — it would materialize a persistent target found at a VideoOut address — but the RTT-cache
+   enumeration above contains no entry for either scanout VA. So the gap is not "the wrong pass was
+   chosen"; it is that **nothing prosper owns exists at the address the guest flips**. This is the same
+   shape as #1968 §5 ("why no post-intro pass targets the flipped VideoOut buffer") on a second,
+   unrelated title, so it is a **cross-title present-path gap, not a Frontiers quirk** — and on Sonic
+   it is total rather than partial.
+2. **It is nevertheless not why the screen is black.** Every one of those targets is black at bit
+   level, not merely after conversion — the final 4K composite is `00 00 00 ff` per texel and the 4K
+   FP16 scene target is RGB bit-zero — and so are the raw guest scanout buffers. There is no content
+   anywhere for the present path to lose. Repairing (1) on Sonic today would publish black.
 
-So the frontier is unchanged in substance and much better bounded: the guest builds an **empty** 4K
-frame, and the reason is upstream of every GPU and present mechanism prosper has now inspected.
+So the frontier is unchanged in substance and much better bounded: the guest builds a frame with **no
+colour in it** — the 4K composite is opaque black per texel and the scene target's RGB bits are zero,
+so this is measured content rather than a conversion artifact — and the reason is upstream of every GPU
+and present mechanism prosper has now inspected.
 
 ### APR miss census, with guest call sites (2026-08-05)
 

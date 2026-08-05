@@ -5728,13 +5728,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const uint64_t at = g_pass_log_submit.load(std::memory_order_relaxed);
                         const uint64_t pl_min = std::strtoull(pl, nullptr, 0);
                         // px_nonblack must be counted in the PASS's OWN format. The original loop
-                        // stepped 4 bytes and tested bytes 0..2 as if every target were 8-bit RGBA,
-                        // so on an FP16 target (8 bytes per texel) it walked HALF-texels: every
-                        // second group holds the B and A halves, and an alpha of 1.0 (0x3c00) is
-                        // non-zero, so it reported exactly w*h "non-black pixels" for a buffer whose
-                        // RGB is entirely zero. Sonic Origins' 3840x2160 R16G16B16A16_SFLOAT scene
-                        // target read as 8,294,400 non-black pixels that way — "every pixel has
-                        // content" for a completely black frame, and the reading survived long
+                        // stepped 4 bytes and tested bytes `p`, `p+1`, `p+2` — never `p+3` — as if
+                        // every target were 8-bit RGBA. Over an 8-byte FP16 texel that reads
+                        // {R_lo, R_hi, G_lo} and then {B_lo, B_hi, A_lo}, so whether a texel counts
+                        // depends only on where a half-float happens to put its non-zero bytes.
+                        // Measured on Sonic Origins' 3840x2160 R16G16B16A16_SFLOAT scene target, whose
+                        // texels are RGB bit-zero with alpha 0x3c05 (1.00488): byte 6 is that alpha's
+                        // low mantissa byte 0x05, which lands on the second group's `p+2`, so exactly
+                        // one of the two groups per texel counted and the line reported 8,294,400 —
+                        // precisely w*h, reading as "every pixel has content" for a frame with no
+                        // colour in it at all. An alpha of exactly 1.0 would have counted ZERO:
+                        // 0x3c00's only non-zero byte is the `p+3` this loop skipped. The number was
+                        // never a property of the image, only of its bit layout — and it survived long
                         // enough to become a hypothesis (#1905). Count through the same inspection
                         // conversion the persistent dump uses; -1 says the format has no conversion,
                         // which is honest where a wrong number is not.
@@ -5851,15 +5856,46 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             size_t rgbnz = 0;
                             for (size_t p = 0; p + 3 < rgba.size(); p += 4)
                                 if (rgba[p] || rgba[p + 1] || rgba[p + 2]) rgbnz++;
+                            // "Black" and "empty" are different findings, and `rgb_nonblack` alone
+                            // cannot tell them apart: an HDR target whose texels are negative,
+                            // non-finite or below 1/510 converts to black from bits that are NOT
+                            // zero, which is a different defect signature from a zero-filled buffer
+                            // (#1905 recorded the wrong one from the converted count alone). Report
+                            // the PRE-conversion evidence beside it: how many raw bytes are non-zero,
+                            // and the first non-zero texel's own bytes, so the row a lane writes down
+                            // is a measurement.
+                            size_t rawnz = 0;
+                            size_t first_nz_texel = 0;
+                            bool have_first = false;
+                            const uint32_t texel_bytes = px.size() && s.w && s.h
+                                ? (uint32_t)(px.size() / ((size_t)s.w * s.h)) : 0;
+                            for (size_t i = 0; i < px.size(); i++) {
+                                if (!px[i]) continue;
+                                rawnz++;
+                                if (!have_first && texel_bytes) {
+                                    first_nz_texel = i / texel_bytes;
+                                    have_first = true;
+                                }
+                            }
+                            char first_text[96] = "none";
+                            if (have_first && texel_bytes && texel_bytes <= 16) {
+                                int at = std::snprintf(first_text, sizeof first_text,
+                                                       "texel %zu =", first_nz_texel);
+                                for (uint32_t b = 0; b < texel_bytes && at > 0 &&
+                                                    at < (int)sizeof first_text - 4; b++)
+                                    at += std::snprintf(first_text + at, sizeof first_text - at,
+                                                        " %02x", px[first_nz_texel * texel_bytes + b]);
+                            }
                             char fn[512];
                             std::snprintf(fn, sizeof fn, "%s/persist_s%04llu_%llx_%ux%u.bmp",
                                           dd ? dd : ".", (unsigned long long)sub,
                                           (unsigned long long)kv.first, s.w, s.h);
                             prosper::test::dump_bmp(fn, rgba, s.w, s.h);
                             fprintf(stderr, "[persist] submit=%llu addr=0x%llx %ux%u fmt=%u "
-                                    "rgb_nonblack=%zu/%u\n", (unsigned long long)sub,
+                                    "rgb_nonblack=%zu/%u raw_nonzero_bytes=%zu/%zu first_nonzero=%s\n",
+                                    (unsigned long long)sub,
                                     (unsigned long long)kv.first, s.w, s.h, (unsigned)s.format,
-                                    rgbnz, s.w * s.h);
+                                    rgbnz, s.w * s.h, rawnz, px.size(), first_text);
                         }
                     }
                 }
