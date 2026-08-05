@@ -5877,7 +5877,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     have_first = true;
                                 }
                             }
+                            // Two distinct sentinels, not one: "none" is the finding "no byte of this
+                            // target is non-zero", while an unprintable texel stride is the
+                            // instrument declining to answer. Sharing one string would let the
+                            // second read as the first — a silent zero, which is the class of lie
+                            // this whole diagnostic exists to stop reporting. Unreachable today
+                            // (every format the census dumps is <= 16 B/texel), so the point is that
+                            // it stays unambiguous if a wider one ever appears.
                             char first_text[96] = "none";
+                            if (have_first && (!texel_bytes || texel_bytes > 16))
+                                std::snprintf(first_text, sizeof first_text,
+                                              "unprintable (%u bytes/texel)", texel_bytes);
                             if (have_first && texel_bytes && texel_bytes <= 16) {
                                 int at = std::snprintf(first_text, sizeof first_text,
                                                        "texel %zu =", first_nz_texel);
