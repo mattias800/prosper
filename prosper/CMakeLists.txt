@@ -319,6 +319,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_service_getters PRIVATE prosper_core)
   add_test(NAME service_getters COMMAND test_service_getters)
 
+  # libSceSysmodule state query (#2002): IsLoaded answers from prosper's own load history, so a
+  # title that gates its initialization on UNLOADED stops skipping that initialization.
+  add_executable(test_sysmodule_state tests/test_sysmodule_state.cpp)
+  target_link_libraries(test_sysmodule_state PRIVATE prosper_core)
+  add_test(NAME sysmodule_state COMMAND test_sysmodule_state)
+
   # libSceHttp local URI parser (#642): two-pass caller pool sizing, public URI layout, and
   # deterministic error paths. Pure and offline; it never contacts a network.
   add_executable(test_http tests/test_http.cpp)
