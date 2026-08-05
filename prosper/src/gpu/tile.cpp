@@ -42,14 +42,6 @@ bool tile_mode_is_tiled(uint32_t tile_mode) {
            tile_mode == (uint32_t)TileMode::Sw64KbRX;
 }
 
-uint32_t videoout_scanout_tile_mode(uint32_t videoout_tiling_mode, uint32_t bytes_per_texel) {
-    // Only the 32-bpp display formats are established here; anything else stays linear rather than
-    // de-swizzling with an unverified block geometry. See the header for the evidence.
-    if (videoout_tiling_mode != kVideoOutTilingModeTile || bytes_per_texel != 4)
-        return (uint32_t)TileMode::Linear;
-    return (uint32_t)TileMode::Sw64KbRX;
-}
-
 size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
                                 uint32_t tile_mode, uint32_t bytes_per_texel,
                                 bool pipe_aligned) {
