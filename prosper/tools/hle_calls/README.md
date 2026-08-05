@@ -26,20 +26,71 @@ python3 tools/hle_calls/hle_calls.py --pid $(pgrep -x boot_trace) --ticks 400
 
 # only the libSce service layer (skip kernel / file / graphics handlers)
 python3 tools/hle_calls/hle_calls.py --pid <pid> --filter '^s_'
+
+# cover INIT, and record what each handler answered rather than only that it ran
+PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+python3 tools/hle_calls/hle_calls.py --ticks 30 --values --filter '^s_' \
+    --launch build-linux/boot_trace <DUMP_ROOT>/PPSA05325-app0
 ```
 
-Flags: `--binary` (defaults to `/proc/<pid>/exe`), `--ticks N` (window length), `--clock SYMBOL`
-(what advances the window, default `prosper::k_usleep` — one or more entries per frame on every
-title observed so far), `--filter REGEX`, `--gdb PATH`, `--timeout SECONDS`.
+Flags: `--binary` (defaults to `/proc/<pid>/exe`, or the `--launch` program), `--ticks N` (window
+length), `--clock SYMBOL` (what advances the window, default `prosper::k_usleep` — one or more
+entries per frame on every title observed so far), `--filter REGEX`, `--order N`, `--gdb PATH`,
+`--timeout SECONDS`.
 
 Output:
 
 ```
-clock=prosper::k_usleep entries=400 armed=151
+clock=prosper::k_usleep entries=400 armed=151 mode=attach calls=72 finish-failures=0 exited=0
+first-calls: 1:pad_read_state  2:s_user_getevent  3:s_syss_getstatus  …
       36  s_user_getevent
       36  s_syss_getstatus
 distinct=2 total=72
 ```
+
+## `--launch`: the init window
+
+`--pid` **cannot see init.** The process is past it before anything can attach, and arming hundreds
+of breakpoints takes longer still. Measured on Sonic Origins (`PPSA05325`): an arm that started
+`boot_trace` and attached at t=1 s with `--filter '^s_'` produced a *boot* pass and a *settled* pass
+with the identical two-handler histogram — the window was real, it simply never covered init.
+
+`--launch` runs the program under gdb itself: every breakpoint is armed while the inferior is still
+loaded-but-not-started, so the window opens at the first instruction. It passes the invoking
+environment straight through, so put the `PROSPER_*` switches on the `hle_calls` command line.
+
+**Do not take init coverage on faith — the result carries its own check.** `first-calls` lists the
+leading calls *in call order*. A window that covered init leads with allocator / module-setup
+handlers; one that opened late leads with the frame-loop pollers (`pad_read_state`,
+`s_user_getevent`, `s_syss_getstatus`). A histogram cannot distinguish those two, which is exactly
+how the attach arm above looked like a negative when it was void.
+
+A launch run ends when the window closes (the inferior is killed) or when the guest exits first;
+`exited=1` in the header says which. On a timeout the tool kills the whole process group, so a
+launched emulator is never orphaned holding the GPU.
+
+## `--values`: what prosper answered, not just what ran
+
+A count says *which* Sony function ran, never whether prosper answered it **correctly**. The
+remaining class of bring-up blocker after every absence check comes back clean is a
+*registered-but-mismodelled* call whose wrong value was consumed once, early — invisible to
+`PROSPER_PROGRESS_UNIMPL` (which only sees handlers that do **not** exist) and to a histogram alike.
+
+`--values` adds a per-handler histogram of return values:
+
+```
+      36  s_user_getevent   ret 0x80960007 x35, 0x0 x1
+```
+
+**That line is also this feature's positive control, and it is worth using every time.**
+`s_user_getevent` delivers the initial LOGIN event exactly once (returning `0`) and reports
+`SCE_USER_SERVICE_ERROR_NO_EVENT` (`0x80960007`) forever after, so a correct capture shows exactly
+one `0x0` against many `0x80960007`. If it does not, distrust every other value in that run rather
+than believing the surprising one. `finish-failures` in the header counts returns that could not be
+captured at all — a non-zero value means the value set is *incomplete*, not that those calls
+returned nothing.
+
+Cost: a second trap per call, so pair `--values` with `--filter`.
 
 ## Reading a zero — and the trap this tool was built around
 

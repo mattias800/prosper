@@ -6,6 +6,10 @@ environment so the driver can stay a plain subprocess call:
     HLE_CALLS_SYMS    path to a "<hex-addr> <name>" table (one per line)
     HLE_CALLS_CLOCK   symbol whose entries bound the window (default prosper::k_usleep)
     HLE_CALLS_TICKS   how many clock entries to run for (default 400)
+    HLE_CALLS_MODE    "attach" (default) or "launch" — launch arms every breakpoint
+                      BEFORE the guest's entry point runs, so the window covers init
+    HLE_CALLS_VALUES  "1" to record each handler's return values, not only its count
+    HLE_CALLS_ORDER   how many leading calls to report in call order (default 24)
 
 Every handler gets a Python breakpoint whose `stop()` counts the hit and returns
 False, so the inferior is never actually stopped for the user. The count is kept
@@ -13,6 +17,17 @@ in this script rather than read back from `Breakpoint.hit_count`: relying on
 hit_count for a non-stopping breakpoint silently reported zero for every handler
 in the first version of this tool, which reads exactly like "the guest called
 nothing" and is the trap this file exists to avoid.
+
+Two things make a launch-mode result checkable rather than merely plausible, and
+both are printed unconditionally:
+
+  * `first-calls` lists the leading calls **in call order**. A window that opened
+    during init leads with allocator/module-setup handlers; a window that opened
+    late leads with the frame-loop pollers. That distinction is what separates
+    "init made no interesting call" from "this run never saw init" — the two read
+    identically in a histogram.
+  * `finish-failures` counts return-value captures that could not be armed, so
+    `--values` cannot quietly report a partial value set as a complete one.
 """
 
 import os
@@ -33,9 +48,38 @@ def _load_syms(path):
 SYMS = _load_syms(os.environ["HLE_CALLS_SYMS"])
 CLOCK = os.environ.get("HLE_CALLS_CLOCK", "prosper::k_usleep")
 TICKS = int(os.environ.get("HLE_CALLS_TICKS", "400"))
+MODE = os.environ.get("HLE_CALLS_MODE", "attach")
+VALUES = os.environ.get("HLE_CALLS_VALUES", "") == "1"
+ORDER_N = int(os.environ.get("HLE_CALLS_ORDER", "24"))
 
 counts = {}
-state = {"ticks": 0}
+values = {}                     # name -> {return value: count}
+order = []                      # leading calls, in call order
+state = {"ticks": 0, "calls": 0, "finish_failures": 0, "exited": False}
+
+
+class _Finish(gdb.FinishBreakpoint):
+    """One-shot: record what the handler returned, then get out of the way."""
+
+    def __init__(self, frame, name):
+        super().__init__(frame, internal=True)
+        self.hle_name = name
+        self.silent = True
+
+    def stop(self):
+        try:
+            result = int(self.return_value) & 0xFFFFFFFFFFFFFFFF
+        except Exception:                       # no debug info for the return type
+            state["finish_failures"] += 1
+            return False
+        values.setdefault(self.hle_name, {})
+        values[self.hle_name][result] = values[self.hle_name].get(result, 0) + 1
+        return False
+
+    def out_of_scope(self):
+        # The handler's frame vanished without a normal return (longjmp, thread
+        # teardown). Nothing to record, and it is not a capture failure.
+        pass
 
 
 class _Counter(gdb.Breakpoint):
@@ -47,6 +91,14 @@ class _Counter(gdb.Breakpoint):
 
     def stop(self):
         counts[self.hle_name] += 1
+        state["calls"] += 1
+        if len(order) < ORDER_N:
+            order.append((state["calls"], self.hle_name))
+        if VALUES:
+            try:
+                _Finish(gdb.newest_frame(), self.hle_name)
+            except Exception:
+                state["finish_failures"] += 1
         return False
 
 
@@ -60,8 +112,16 @@ class _Clock(gdb.Breakpoint):
         return state["ticks"] >= TICKS
 
 
+def _on_exited(event):
+    state["exited"] = True
+
+
 gdb.execute("set pagination off")
 gdb.execute("set confirm off")
+# A guest fault is the emulator's business, not this tool's: pass every signal
+# straight through so a launch-mode run cannot be stopped short by one.
+gdb.execute("handle SIGSEGV SIGBUS SIGILL SIGFPE nostop noprint pass")
+gdb.events.exited.connect(_on_exited)
 
 armed = 0
 for addr, name in SYMS:
@@ -76,17 +136,41 @@ try:
 except gdb.error as exc:
     raise SystemExit("hle_calls: cannot set the clock breakpoint on %s: %s" % (CLOCK, exc))
 
-print("hle_calls: armed %d handler breakpoints; window = %d entries of %s"
-      % (armed, TICKS, CLOCK))
-gdb.execute("continue")
+print("hle_calls: armed %d handler breakpoints; window = %d entries of %s (mode=%s values=%s)"
+      % (armed, TICKS, CLOCK, MODE, "on" if VALUES else "off"))
+
+if MODE == "launch":
+    # Every breakpoint above is already in place, so the window opens at the
+    # process's first instruction — which is the whole point of this mode.
+    gdb.execute("run")
+else:
+    gdb.execute("continue")
 
 rows = sorted(((c, n) for n, c in counts.items() if c), reverse=True)
 print("HLE_CALLS_BEGIN")
-print("clock=%s entries=%d armed=%d" % (CLOCK, state["ticks"], armed))
+print("clock=%s entries=%d armed=%d mode=%s calls=%d finish-failures=%d exited=%d"
+      % (CLOCK, state["ticks"], armed, MODE, state["calls"],
+         state["finish_failures"], 1 if state["exited"] else 0))
+if order:
+    print("first-calls: " + "  ".join("%d:%s" % (n, name) for n, name in order))
 for count, name in rows:
-    print("%8d  %s" % (count, name))
+    line = "%8d  %s" % (count, name)
+    if VALUES:
+        seen = values.get(name, {})
+        if seen:
+            top = sorted(seen.items(), key=lambda kv: -kv[1])[:6]
+            line += "   ret " + ", ".join("%#x x%d" % (v, c) for v, c in top)
+            if len(seen) > len(top):
+                line += ", +%d more" % (len(seen) - len(top))
+        else:
+            line += "   ret (none captured)"
+    print(line)
 print("distinct=%d total=%d" % (len(rows), sum(c for c, _ in rows)))
 print("HLE_CALLS_END")
 
-gdb.execute("detach")
+if MODE == "launch":
+    if not state["exited"]:
+        gdb.execute("kill")
+else:
+    gdb.execute("detach")
 gdb.execute("quit")
