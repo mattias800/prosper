@@ -38,7 +38,7 @@ Last updated: 2026-08-05
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🚧 Title screen | [#1883](https://github.com/mattias800/prosper/issues/1883) |
 | *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🔬 Render bring-up, no composited frame | [#1817](https://github.com/mattias800/prosper/issues/1817) |
 | *Asterix &amp; Obelix: Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🚧 Logo movies, intro cutscene, and title menu | [#1884](https://github.com/mattias800/prosper/issues/1884) |
-| *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🔬 Startup fault before title | [#1810](https://github.com/mattias800/prosper/issues/1810) |
+| *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🚧 Publisher logo and opening movie | [#1810](https://github.com/mattias800/prosper/issues/1810) |
 | *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Title screen and EULA | [#1885](https://github.com/mattias800/prosper/issues/1885) |
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🚧 Title screen reached and rendered | [#1886](https://github.com/mattias800/prosper/issues/1886) |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ First-level gameplay | [#1887](https://github.com/mattias800/prosper/issues/1887) |
@@ -48,7 +48,7 @@ Last updated: 2026-08-05
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and title screen | [#1809](https://github.com/mattias800/prosper/issues/1809) |
 | *The Forgotten City* | `PPSA03026` | Unreal Engine | 🚧 Title screen | [#1890](https://github.com/mattias800/prosper/issues/1890) |
 | *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
-| *Little Nightmares III* | `PPSA05143` | Unreal Engine 4 | 🚧 Boot splash sequence; render thread stalls before the title | [#1893](https://github.com/mattias800/prosper/issues/1893) |
+| *Little Nightmares III* | `PPSA05143` | Unreal Engine 4 | 🚧 Boot splash sequence and title screen; most title frames carry a yellow tint | [#1893](https://github.com/mattias800/prosper/issues/1893) |
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Content streams and the engine submits real draws, then a declined GPU submit freezes every thread, so the display stays black | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Health warning and title screen; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
@@ -222,7 +222,17 @@ yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues
 
 ## R-Type Delta: HD Boosted — `PPSA26414`
 
-The runtime PRX loads and recompiles its first graphics stages, but the title currently faults before producing a visible screen. See the [tracker](https://github.com/mattias800/prosper/issues/1810).
+<p align="center"><img src="assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.png" alt="R-Type Delta — Clear River Games logo and the opening movie"></p>
+
+The Clear River Games publisher logo and the full opening movie — the R-9 fighter in its hangar — render live at 1920×1080 from the real GPU command stream. Colours are wrong: greys render green and the image carries a magenta cast ([#2005](https://github.com/mattias800/prosper/issues/2005)). After the movie every frame collapses to a single colour while the frame loop keeps advancing ([#2006](https://github.com/mattias800/prosper/issues/2006)), so the title screen is not reached.
+
+Reaching this needs the game's files **evicted from the host page cache** first, which takes one command and no change to how the title is launched:
+
+```bash
+python3 prosper/tools/dropcache.py <DUMP_ROOT>/PPSA26414-app0    # then launch normally
+```
+
+The title's input worker sleeps 400 ms before its first `sceUserServiceGetEvent` drain, and on a fast host prosper finishes the asset load well inside that window — so the shell runs first, dereferences an empty user vector and dies. Reading the assets from storage rather than from cache stretches the load past the 400 ms mark and the title survives its own race. (Repeat the eviction before each launch: the run itself re-warms the cache.) Every guest sleep is honoured exactly and every service answer is faithful — a PS5's slower core is what makes this title ship working, and prosper simply executes the game's own loader faster than the console it is emulating. See the [tracker](https://github.com/mattias800/prosper/issues/1810) and [#1746](https://github.com/mattias800/prosper/issues/1746).
 
 ## Nikoderiko: The Magical World — `PPSA23760`
 
@@ -294,10 +304,14 @@ The route reaches the first tutorial battle with real GPU draws at native 1920×
 ## Little Nightmares III — `PPSA05143`
 
 <p align="center"><img src="assets/screenshots/little-nightmares-3-boot-splash.png" alt="Little Nightmares III — developer splash from the boot sequence"></p>
+<p align="center"><img src="assets/screenshots/little-nightmares-3-title-screen.png" alt="Little Nightmares III — title screen"></p>
 
-The boot splash sequence renders at native 3840×2160. Roughly two minutes in, the engine's render thread
-stops advancing the composited frame and Unreal's own watchdog ends the run
-(`GameThread timed out waiting for RenderThread`), so no title screen is reached. See the
+The boot splash sequence and the title screen render at native 3840×2160 on a default launch, with the
+logo, the player slot and the Start prompt all legible. The render-thread stall that used to end the run
+before the title is gone.
+
+The title screen is still degraded: most composited frames arrive with the red and green channels forced
+to maximum, which reads as a flat yellow background under otherwise-correct content. See the
 [tracker](https://github.com/mattias800/prosper/issues/1893).
 
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
