@@ -12,24 +12,17 @@ invalidated by its own incomplete census before the corrected run answered the n
 ## Current state
 
 The title boots through UE4 initialisation and its `.pak` load, installs the renderer, submits real
-GPU work, and **starts playing its intro movie** — but stops after about 19 presented frames, having
-delivered 43-54 *video* frames, which is 0.2-0.6 s of media short of the first frame that movie is
-not black in (and about 3.2 s short of full picture). The earlier
-async-compute submit ABI failure is fixed. Between about 8 and 14 seconds the guest's `RenderThread 1`
-may instead fault at one of two already-recorded sibling sites.
+GPU work, and **starts playing its intro movie** — then dies on the #1226 terminal fault after about
+19 presented frames, having delivered 43-54 *video* frames. That is 6-17 frames short of the first
+frame the movie is not black in, and about 100 frames short of full picture. The earlier
+async-compute submit ABI failure is fixed.
 
 **Read `## 2026-08-05: the black composite is the movie, and the movie is black there` before
-anything else in this document.** It supersedes the rung-1 framing below: the composite is not losing
-content, and the remaining rung-1 question is guest progress, not rendering.
+anything else in this document.** It supersedes the rung-1 framing below in two ways: the composite is
+not losing content, **and the terminal fault IS the rung-1 blocker after all.**
 
-**The terminal fault is not the rung-1 blocker, and the sibling fault's null register is
-prosper-manufactured.** Both corrections come from the rung-1 pass recorded below, and both invalidate
-the framing this document previously used to pick discriminators:
+**The sibling fault's null register is prosper-manufactured**, and that correction still stands:
 
-- Every recorded terminal fault happens **after** dozens of frames have already been presented
-  (19 in one ordinary arm here, 53 in the retained combined arm). Fixing the fault yields more black
-  frames, not a first frame. (**Superseded** — see § 2026-08-05: rung 1 is blocked by guest
-  progress, not by what the presented frames contain.)
 - The `addr=(nil)` sibling class is produced by prosper's own reserved-range lazy-commit handler
   zero-filling guest page `0x2100000000` under the guest's *load*, after which the guest dereferences
   that zero on the next instruction. This is [#1944](https://github.com/mattias800/prosper/issues/1944),
@@ -252,19 +245,31 @@ the path), `arcrunner_intro_a_1080p_ps5_30fps.mp4` has mean luma **0.0 with max 
 t=1 s, first content at t=2 s (mean 9.1), and full picture by t=5 s (mean 77.5). **The movie's own
 opening two seconds are pure black.**
 
-**3. Every run stops short of the first picture.** Three runs delivered 43, 53 and 54 *video* frames
-and, separately, exactly **19 presented frames** each. At 30 fps those are 1.43 s, 1.77 s and 1.80 s
-of movie, against t=2 s (frame 60) where picture begins — so **6, 7 and 17 frames short**, or
-0.20-0.57 s. One run reached its 120 s timeout without faulting and still presented only 19 frames,
-so the wall is a stall, not only the terminal fault.
+**3. Every run stops short of the first picture, and it stops on the #1226 terminal fault.** Four runs
+delivered 43, 47, 53 and 54 *video* frames and, separately, exactly **19 presented frames** each. At
+30 fps those are 1.43-1.80 s of movie, against t=2 s (frame 60) where picture begins — so **6 to 17
+frames short**.
+
+**Every one of the four faulted.** The census is `WORKER-THREAD FAULT` occurrences per run: 2, 1, 1, 1
+(one run took both the `0x30016000` pop and an `addr=(nil)` sibling). An earlier draft of this section
+claimed one run "reached its 120 s timeout without faulting", and that was **wrong** — `rc=124` was the
+timeout killing a process that had *already* faulted and wedged, and the fault report is in its log.
+There is no evidence here of a stall independent of the fault; do not build on one.
 
 Two numbers matter and they are different. The **first** non-black frame is at t=2 s, and its mean
 luma is only 9.1 — barely above black. **Full picture** is t=5 s (mean luma 77.5), which is frame
 150, i.e. **96-107 frames** beyond where these runs stop. Rung 1 needs a real visible frame, so quote
 the second number when asking how far away rung 1 is; the first only says how close the *onset* is.
 
+**This reverses the standing conclusion that the terminal fault is not the rung-1 blocker.** That
+conclusion (recorded in `## Ruled out`) reasoned: frames are already being presented before the fault,
+and they are all black, so the fault cannot be what prevents a first frame. The missing premise was
+*why* they are black. Now that the movie is known to be black until video frame 60, the runs' 43-54
+delivered frames land **before** the picture starts, and the fault is exactly what stops them getting
+there. Fixing #1226 does not yield "more black frames" — past frame 60 it yields picture.
+
 **Therefore the black scanout is the correct rendering of a black movie frame, and rung 1 is blocked
-by guest progress rather than by the renderer.**
+by the #1226 terminal fault killing the run before the movie reaches picture — not by the renderer.**
 
 ## Reproduction
 
@@ -363,7 +368,7 @@ Do not re-derive these without contradictory new evidence.
 | A resource completed by the mapped normal construction path can have `+0x68`, `+0x78`, or `+0x88` populated while its `+0x98` side-command descriptor was never created | `eboot+0x1186a40`, reached by all ten mapped resource-creation calls, uses the same populated-field condition as the allocation-page appender, allocates the 16-byte side-command descriptor, fills `{target, dword count}`, and stores it at `+0x98` before the wrapper is published. The common teardown at `eboot+0x1187300` is a confirmed later writer of null. This rules out omission by that normal completed path; it does not rule out an unlocated foreign/incomplete constructor, teardown-after-retention, or stale/reused memory. | #1226 |
 | The `eboot+0x117811f` sibling fault is a **guest resource-lifetime bug** — a retained command item whose `+0x98` side-command descriptor was freed by teardown, or was never constructed, or belongs to reused memory. This framing drove the vptr-classification discriminator, the `PROSPER_HWBP_R14=0` probe, and the whole producer/teardown static map | The null `r14` is **prosper's own zero**. `[lazy-commit] mapped page=0x2100000000 rip=eboot+0x1178064` fires exactly once in the retained combined arm, at exactly the documented `mov r14,[rax+0x98]`, and the `addr=(nil)` fault at `eboot+0x117811f` is the next instruction. An independent ordinary run here reproduced the pattern at a **different** guest site: `[lazy-commit] ... rip=eboot+0x117e221` followed by `sig=11 addr=(nil) rip=eboot+0x117e225` — **+4 bytes**. A third ordinary run had **no** lazy-commit line and **no** null-pointer fault, terminating on the allocator chain instead. So: lazy-commit present → null deref within a few bytes (2/2); absent → no null deref (1/1). The reserved-range handler `mmap`s 64 KiB of anonymous zeros with `MAP_FIXED` and resumes, so a load of a pointer field returns 0. Both guest sites first-touch the **same** page `0x2100000000`, a round 4 GiB above the arena base — a wild pointer would not repeat that. Do not resume vptr classification, teardown-after-retention, or `r14`-gated probing of this site: they classify a value prosper wrote. The static producer/teardown map remains correct as disassembly; it is simply not what this fault is about. | #1944, #1226 |
 | The two retained non-alpha-only frames (solid yellow, solid white) are **guest clears**, and therefore evidence that the guest reaches a clear-only phase | They are `ELIMINATE_FAST_CLEAR` artifacts. Across two independent runs — the retained combined-suppression arm and an ordinary unsuppressed run here — **every** coloured frame is presented immediately after a `CB_COLOR_CONTROL.MODE=2` draw, and **no** coloured frame occurs without one (3 for 3; the combined arm's MODE=2 count reached exactly 2 for its 2 coloured frames, the ordinary run's count reached 1 for its 1). prosper runs MODE=2 as an ordinary colour draw, which blankets the target with the fast-clear colour. Do not read either frame as a phase marker or as progress. | #1588, #1226 |
-| The rung-1 blocker is the terminal render-thread fault, so bring-up should continue by attributing that fault | Every recorded terminal fault occurs **after** dozens of presented frames — 19 in an ordinary arm here, 53 in the retained combined arm — and all of those frames carry RGB 0. The fault cannot be what prevents a first frame. Separately, prosper realizes **456 of 468** submitted draws with **zero** recompile-reject/compute-skip/unsupported-format lines, so the black output is not a dropped-draw problem either. | #1226 |
+| ~~The rung-1 blocker is the terminal render-thread fault, so bring-up should continue by attributing that fault~~ — **THIS ROW IS WITHDRAWN (#2011). The fault IS the rung-1 blocker.** | The original entry read: "Every recorded terminal fault occurs **after** dozens of presented frames — 19 in an ordinary arm here, 53 in the retained combined arm — and all of those frames carry RGB 0. The fault cannot be what prevents a first frame." The inference had a hole: it never asked **why** those frames are black. They are black because ArcRunner's intro movie is black until video frame 60 (independently measured on the file with `ffmpeg`, and prosper stages it byte-correctly), and every run is killed by the fault at 43-54 delivered video frames — i.e. **before** the picture starts. Fixing #1226 does not yield "more black frames"; past frame 60 it yields picture. The row's *second* sentence stands unchanged and was always separate: prosper realizes 456 of 468 submitted draws with zero recompile-reject/compute-skip/unsupported-format lines, so the black output is not a dropped-draw problem. | #2011, #1226 |
 | The black composite needs a rendering explanation at all, in the window the guest currently reaches | **Not falsified — made unnecessary and untestable here, which is a weaker statement and the honest one.** Every input to the composite is legitimately black in this window, so a rendering defect, if one existed, would be invisible rather than absent. ArcRunner plays `arcrunner_intro_a_1080p_ps5_30fps.mp4`; prosper opens it, decodes it in the real libavcodec software fallback, and stages byte-correct BT.601 black (`Y=0x10`, `U=V=0x80`, exactly `1920x1080` non-zero bytes with the pitch padding cleared, measured with `PROSPER_DUMP_RAWTEX`). The **independent** control is the file: decoded on the host with `ffmpeg`, the mp4 has mean luma 0.0 / max 0 at t=0 s and t=1 s and no picture until t=2 s. Three runs delivered 43/53/54 video frames, so every run stops before the movie's first picture. **Re-open this question once the guest reaches a frame the movie is not black in** — do not read this row as "rendering is fine". | #2011 |
 | The narrow claim that content is **lost between the scene-colour target and the scanout** | Falsified on the **default live-target path**: the 4K scene-colour target `0x312aee0000` measures `rgb_nonblack=0/8294400` **and** `raw_nonzero_bytes=0/66355200` under `PROSPER_DUMP_PERSISTENT`, so nothing is present there to lose. Zero `[agc] PUBLISH DROPPED`, zero recompile-rejects and zero compute-skips across four runs, so the composite is neither dropped nor degraded. | #2011 |
 | The fully-zero bloom pyramids and the "step that loses the scene colour between `0x315f4f0000` and `0x3160700000`" are a defect worth a capture bundle (the previous discriminator 1) | A black scene thresholds to zero bloom; that is UE4 behaving correctly, not content being dropped. The 4K scene-colour target measures `raw_nonzero_bytes=0/66355200` on the **default live-target path** (`PROSPER_DUMP_PERSISTENT`), which is what an empty scene behind a black movie frame looks like. Do not spend a bundle on this until the guest reaches a frame the movie is not black in. | #2011 |
@@ -375,12 +380,11 @@ Do not re-derive these without contradictory new evidence.
 
 Ordered for **rung 1** (any real graphics), which the terminal faults do not block.
 
-1. **Get the guest past ~19 presented frames.** That is the whole of rung 1 now: the movie needs 60
-   delivered video frames for its first (barely) non-black frame and 150 for full picture, and every
-   run stops at 43-54. One run reached its 120 s timeout still at 19 presents, so a stall — not only
-   the terminal fault — holds it there. Find what blocks after the 19th present. This is the one
-   measurement that would turn the title's first real frame on, and it is a **guest-progress**
-   question, not a renderer one.
+1. **Fix #1226's terminal fault — that is now the whole of rung 1.** The movie needs 60 delivered
+   video frames for its first (barely) non-black frame and 150 for full picture; every run is killed
+   by the fault at 43-54. Nothing else stands between this title and real visible graphics, and the
+   ownership question in #1945 is the live part of it. Note this **reverses** the standing guidance
+   that redirected the lane away from the fault — see the withdrawn `## Ruled out` row.
 2. **Re-check the movie surface extent after the `AvPlayerVideoEx` crop fix.** The guest sizes its
    movie luma T# from the published pitch (measured `2048x1080`, chroma `1024x540`) and rendered the
    converted frame into a **1792x1080** target — `width - crop_left - crop_right` under the pre-fix
