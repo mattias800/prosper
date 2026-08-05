@@ -513,3 +513,13 @@ remaining frontier, and it is a rung-1 target in its own right: the SONIC TEAM l
 kind of splash the ladder counts. The movie names are not in the eboot's string pool (nor in
 `rfl_resident.pac`, `bindata/*.bin`, `param_tech.rfl` or `ui_resident.pac` as plain text), so the boot
 sequence that would name one is data-driven and has still to be located.
+
+The guest side of that path is already mapped, so the next lane does not have to re-find it.
+`eboot+0x6d76c0` is the **movie-path builder / player entry**: it takes a movie **index** in `esi`,
+looks the entry up in a 0x68-byte-stride table, and selects the `"_4k.usm"` (`eboot+0xdb231f`) or
+plain `".usm"` (`eboot+0xdba47f`) suffix from a per-entry flag at `+0x10932`
+(`cmp BYTE PTR [rcx+rdx*1+0x10932],0x0` … `cmove rdx,rcx` at `eboot+0x6d7719..0x6d772f`). It has
+exactly two callers — `eboot+0x703a67` (in `eboot+0x701280`) and `eboot+0x796016` (in
+`eboot+0x795870`) — and neither is reached in any arm of this series. A breakpoint on `eboot+0x6d76c0`
+that never fires is the cheapest confirmation that no movie is even requested; finding which state
+should call it, and with which index, is the open work.
