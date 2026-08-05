@@ -2062,6 +2062,46 @@ int prosper_apr_match_by_size(uint64_t size, std::string* out_path) {
 // makes APR proceed on garbage ids and wild-write over the allocator, so every successful entry
 // writes its id and size. `error_index` is one scalar, not an output array; a missing path records
 // its index and fails the batch so callers do not construct a zero-length reader (#1226).
+// "Which guest code asked for the file that is not there?" — the question every missing-asset
+// bring-up investigation reaches, and the one a path alone cannot answer. A resolve MISS names the
+// path; it does not name the engine call site, so the next step (does the caller fall back to an
+// archive? does it park a load state machine forever?) needed a disassembly starting point that had
+// to be guessed. Sonic Origins' two startup misses cost a whole lane's worth of speculation for want
+// of it (#1905).
+//
+// DIAGNOSTIC-ONLY stack scan, the same technique hle_agc.cpp's fence1-builder attribution uses: walk
+// this frame's stack for the first words that land in guest MODULE CODE (not the import-stub
+// aperture, which would only name prosper's own trampoline). Never used for ABI arguments or any
+// decision — it only annotates a log line, so an imprecise hit costs nothing but a wider window to
+// disassemble. Appended to the existing filelog-gated MISS line, so the default log is unchanged.
+//
+// THREE candidates, not one, because a stack word can be residue rather than a live return address:
+// measured on Sonic Origins, the DLC wave-bank misses reported `ra=eboot+0xef4a8 ra2=eboot+0xf0609`,
+// which disassemble to exactly `call <wrapper>` / `call <APR import>` return sites — a real chain —
+// while the UI misses' first candidate landed in a block of `lea rax,[rip+…]; ret` type-name thunks
+// that cannot have called anything. Reading the annotation therefore means checking each address:
+// the one preceded by a `call` is the caller. `tools/re/edis.py <flattened.elf> <addr>` does that.
+static std::string apr_miss_callsite() {
+    volatile uint64_t* stack_scan = (uint64_t*)__builtin_frame_address(0);
+    uint64_t ra[3] = {0, 0, 0};
+    int found = 0;
+    for (int i = 1; i < 96 && found < 3; i++) {
+        const uint64_t v = stack_scan[i];
+        if (prosper::guest_va_in_module_code(v)) ra[found++] = v;
+    }
+    if (!found) return std::string();
+    std::string text;
+    static const char* const kLabel[3] = {" ra=", " ra2=", " ra3="};
+    for (int i = 0; i < found; i++) {
+        char one[96];
+        snprintf(one, sizeof one, "%s%s+0x%llx", kLabel[i],
+                 prosper::guest_module_name(ra[i]),
+                 (unsigned long long)prosper::guest_module_offset(ra[i]));
+        text += one;
+    }
+    return text;
+}
+
 static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int count,
                                  uint32_t* out_ids, uint64_t* out_sizes, uint32_t* error_index) {
     if (!paths || count <= 0) return 0x80020016ull;   // EINVAL
@@ -2106,8 +2146,10 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
             if (out_ids) out_ids[i] = 0xffffffffu;
             if (out_sizes) out_sizes[i] = 0;
             if (error_index) *error_index = (uint32_t)i;
-            if (filelog()) fprintf(stderr, "[apr] resolve MISS %s\n",
-                                   guest.empty() ? "(null)" : guest.c_str());
+            if (filelog())
+                fprintf(stderr, "[apr] resolve MISS %s%s\n",
+                        guest.empty() ? "(null)" : guest.c_str(),
+                        apr_miss_callsite().c_str());
             return 0x80020002ull;   // ENOENT
         }
         // A collision does not affect normal reads, which resolve by APR file id. Keep it visible

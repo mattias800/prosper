@@ -5662,16 +5662,35 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (const char* pl = getenv("PROSPER_PASS_LOG")) {
                         const uint64_t at = g_pass_log_submit.load(std::memory_order_relaxed);
                         const uint64_t pl_min = std::strtoull(pl, nullptr, 0);
-                        size_t nz = 0;
-                        for (size_t p = 0; p + 3 < rendered_pixels.size(); p += 4)
-                            if (rendered_pixels[p] || rendered_pixels[p + 1] ||
-                                rendered_pixels[p + 2]) nz++;
+                        // px_nonblack must be counted in the PASS's OWN format. The original loop
+                        // stepped 4 bytes and tested bytes 0..2 as if every target were 8-bit RGBA,
+                        // so on an FP16 target (8 bytes per texel) it walked HALF-texels: every
+                        // second group holds the B and A halves, and an alpha of 1.0 (0x3c00) is
+                        // non-zero, so it reported exactly w*h "non-black pixels" for a buffer whose
+                        // RGB is entirely zero. Sonic Origins' 3840x2160 R16G16B16A16_SFLOAT scene
+                        // target read as 8,294,400 non-black pixels that way — "every pixel has
+                        // content" for a completely black frame, and the reading survived long
+                        // enough to become a hypothesis (#1905). Count through the same inspection
+                        // conversion the persistent dump uses; -1 says the format has no conversion,
+                        // which is honest where a wrong number is not.
+                        long long nz = 0;
+                        const bool direct_rgba8 = pass_format == VK_FORMAT_R8G8B8A8_UNORM &&
+                            rendered_pixels.size() == static_cast<size_t>(gw) * gh * 4u;
+                        const std::vector<uint8_t> inspected = direct_rgba8
+                            ? std::vector<uint8_t>{}
+                            : inspection_rgba8(rendered_pixels, gw, gh, pass_format);
+                        const std::vector<uint8_t>& counted =
+                            direct_rgba8 ? rendered_pixels : inspected;
+                        if (!rendered_pixels.empty() && counted.empty()) nz = -1;
+                        else
+                            for (size_t p = 0; p + 3 < counted.size(); p += 4)
+                                if (counted[p] || counted[p + 1] || counted[p + 2]) nz++;
                         // In-window: every pass. Out of window: only content-bearing (or deferred)
                         // passes, so the publish source can be found without knowing the callback.
                         if ((at >= pl_min && at < pl_min + 3u) || nz > 100 || defer_readback)
                             fprintf(stderr,
                                     "[pass] cb=%llu pass=%zu/%zu base=0x%llx %ux%u fmt=%d vo=%d "
-                                    "seed=%d defer=%d writes=%llu px_nonblack=%zu\n",
+                                    "seed=%d defer=%d writes=%llu px_nonblack=%lld\n",
                                     (unsigned long long)at, pass_i, items.size(),
                                     (unsigned long long)base, gw, gh, (int)pass_format,
                                     (int)is_vo, (int)seed_rtt, (int)defer_readback,
