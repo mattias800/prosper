@@ -2505,7 +2505,10 @@ uint64_t addcontent_info_list(uint64_t list_address, uint64_t list_num,
 // which its own param.json declares as 9 — stores it, and tests bit 3 to decide that its installed
 // content needs no online entitlement lookup. Answering 0 cleared that bit and sent it down the
 // online path instead, where sceNpEntitlementAccessGetSkuFlag left the guest's own pre-seeded TRIAL
-// value standing and the title offered story mode as a purchase. The declared values matter well
+// value standing and the title offered story mode as a purchase. That chain is only half the story on
+// current master: the param read is itself skipped because sceSysmoduleIsLoaded reports every module
+// loaded, so GTA V never runs its own sceAppContentInitialize (#2002). Both halves are needed, and a
+// three-arm A/B on #1873 shows neither alone opens the gate. The declared values matter well
 // beyond that gate: Crisis Core (PPSA07809) uses USER_DEFINED_PARAM_2 as a bounded content-variant
 // index, and Little Nightmares II/III use USER_DEFINED_PARAM_1 as an index into their own
 // add-content list.
@@ -3940,9 +3943,18 @@ HLE(s_npent_getkey) {
 // an uninitialized stack slot and then act on whatever residue was there, and the fourth (PPSA04263)
 // pre-seeds TRIAL and keeps it. Failing when the SKU is unknown is a path all four already handle —
 // each falls back to its own conservative default — whereas reporting a SKU prosper cannot derive is
-// a value the guest cannot tell from a real one. CONFIDENCE: HIGH on the contract and the enum
-// (guest-pinned in three titles); MED on the exact errno for the unknown case, which is chosen inside
-// the producer-pinned 0x817D NpEntitlementAccess facility.
+// a value the guest cannot tell from a real one.
+//
+// ARG 0 IS THE OUT POINTER, and that needed proving rather than assuming: both neighbouring exports in
+// this library (GetAddcontEntitlementInfoList, GetEntitlementKey) lead with a SceNpServiceLabel, so if
+// this one did too, writing through a0 would be writing through a label and the whole fix would be
+// inert. A live GTA V (PPSA04263) boot under PROSPER_SVCLOG settles it:
+//   [svc] sceNpEntitlementAccessGetSkuFlag(0x7f4fc82d6e2c, 0, 0xb, 0, 0x1d, 0xb)
+// a0 is a stack address whose slot the guest had pre-seeded with 1 (its TRIAL default, per its own
+// code at eboot+0x4dfc92) and a1 is 0 — a single-argument call.
+//
+// CONFIDENCE: HIGH on the contract and the enum (guest-pinned in three titles); MED on the exact errno
+// for the unknown case, which is chosen inside the producer-pinned 0x817D NpEntitlementAccess facility.
 HLE(s_npent_skuflag) {
     svc_log("sceNpEntitlementAccessGetSkuFlag", a0,a1,a2,a3,a4,a5);
     if (!svc_ptrish(a0)) return NP_ENTITLEMENT_ERROR_PARAMETER;

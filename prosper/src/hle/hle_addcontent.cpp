@@ -143,11 +143,6 @@ public:
         return doc_;
     }
 
-    std::optional<std::string> top_level_title_id() {
-        const ParamJsonDocument doc = read();
-        return doc.valid ? doc.title_id : std::nullopt;
-    }
-
 private:
     // Index of userDefinedParam1..4, or -1 for any other key.
     static int user_param_index(std::string_view key) {
@@ -621,6 +616,18 @@ void addcontent_configure_for_app0(const std::string& app0_root) {
         }
         for (size_t i = 0; i < 4; ++i)
             if (doc.user_param[i]) params.user_param[i] = *doc.user_param[i];
+    } else {
+        // No local declaration at all, so from here every sceAppContentAppParamGetInt returns
+        // NOT_FOUND and every GetSkuFlag returns NO_ENTITLEMENT. That is the honest answer, but it
+        // silently converts calls that always succeeded into calls that always fail, and it IS
+        // reachable for a real user: a dump is accepted on eboot.bin alone, so an eboot-only tree
+        // boots and loses every app-param answer with no other symptom. Name the case rather than
+        // leaving the next reader to bisect it.
+        std::fprintf(stderr,
+                     "[appparam] no usable sce_sys/param.json (%s): the application declares no SKU "
+                     "and no user-defined params, and every app-param query fails visibly\n",
+                     param.state == BoundedFileState::Missing ? "absent"
+                                                             : "unreadable, oversized or malformed");
     }
 
     const BoundedFile manifest = read_bounded_file(root, "dlc_emu.ini", kMaxManifestBytes);

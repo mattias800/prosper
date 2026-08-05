@@ -1107,6 +1107,31 @@ int main() {
                     R"("userDefinedParam1":1,"userDefinedParam1":2})");
             CHECK(app_value(1) == kSentinel && rc == kAppContentNotFound,
                   "a duplicated userDefinedParam invalidates the declaration");
+            declare(R"({"titleId":"PPSA00001","applicationDrmType":"standard",)"
+                    R"("applicationDrmType":"upgradable"})");
+            CHECK(app_value(0) == kSentinel && rc == kAppContentNotFound,
+                  "a duplicated applicationDrmType invalidates the declaration");
+
+            // int32 boundaries. A userDefinedParam is a signed 32-bit value: both extremes must survive
+            // the round trip exactly, and one past either extreme must invalidate rather than wrap into
+            // a believable number.
+            declare(R"({"titleId":"PPSA00001","userDefinedParam1":2147483647,)"
+                    R"("userDefinedParam2":-2147483648,"userDefinedParam3":-1})");
+            CHECK(app_value(1) == 2147483647 && rc == 0,
+                  "USER_DEFINED_PARAM_1 round-trips INT32_MAX exactly");
+            CHECK(app_value(2) == (-2147483647 - 1) && rc == 0,
+                  "USER_DEFINED_PARAM_2 round-trips INT32_MIN exactly");
+            CHECK(app_value(3) == -1 && rc == 0,
+                  "a negative USER_DEFINED_PARAM_3 is reported as declared");
+            declare(R"({"titleId":"PPSA00001","userDefinedParam1":2147483648})");
+            CHECK(app_value(1) == kSentinel && rc == kAppContentNotFound,
+                  "a userDefinedParam one past INT32_MAX invalidates instead of wrapping");
+            declare(R"({"titleId":"PPSA00001","userDefinedParam1":-2147483649})");
+            CHECK(app_value(1) == kSentinel && rc == kAppContentNotFound,
+                  "a userDefinedParam one past INT32_MIN invalidates instead of wrapping");
+            declare(R"({"titleId":"PPSA00001","userDefinedParam1":01})");
+            CHECK(app_value(1) == kSentinel && rc == kAppContentNotFound,
+                  "a leading-zero userDefinedParam invalidates the declaration");
             declare(R"({"nested":{"applicationDrmType":"standard"}})");
             CHECK(np_value() == kSentinel && np_rc == kNpNoEntitlement,
                   "a nested applicationDrmType does not stand in for the top-level declaration");
