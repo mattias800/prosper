@@ -251,7 +251,7 @@ Two apparatus corrections belong with that table, because both produced wrong an
 | Guest-visible file I/O timing is a material part of the load, in either direction | **Falsified by syscall time, not by byte count.** `strace -f -c` over a complete pre-fault boot (same run reproduced the fault, and its 68 `pread64` calls match the standalone trace) charges **9.1 ms to 68 `pread64` and 8.1 ms to 1,599 `read`** — ~17 ms of file I/O inside a 244 ms load. The earlier byte census argued about direction; this measures the time and shows the term is negligible either way. | `strace -f -c` on `bffa5e25`, #1746 |
 | The load is bound by wall-clock waits the title requests, so it would take the same time on hardware | **Falsified.** Per-thread `clock_nanosleep` census during the load: the reading worker sleeps only `usleep(0)` × 78, the main thread `1 µs` × 173 and `1 ms` × 45; the 5 ms × 55 and 20 ms × 14 loops belong to the audio threads and run regardless. Guest-requested sleep on the threads that gate the load totals ~56 ms of a 244 ms window, and CPU contention stretches that window 4.5×, which a wall-clock wait could not do. | `strace -f -tt -T -e trace=pread64,clock_nanosleep`, spinner arm, #1746 |
 | Prosper answers some call in the 13–24 ms between the INPUT worker's creation and `DLLLoadStart` (`sceKernelLoadStartModule`, the NP/Scream/audio initialisations) ~140 ms too fast, and that is where the fidelity gap lives | **Not supported, and no longer needed.** It was the leading candidate once I/O and GPU were excluded, but the CPU-contention arm accounts for the entire deficit inside the *load* itself, and it does so with an executed positive outcome. Recorded so the next reader does not chase a module-load latency model for which this repository has no oracle. | this doc, #1746 |
-| The chroma cast in the corrected movie replay is only a capture-provenance artifact, so live output may be correct | **Falsified live.** With the race won by host CPU contention, the unmodified default route renders the publisher logos and the whole opening movie with the *same* green/magenta cast as the replay. Live chroma is now verified broken, not merely unverified. Tracked separately. | throttled `screenshot` route on `bffa5e25`, #1746 |
+| The chroma cast in the corrected movie replay is only a capture-provenance artifact, so live output may be correct | **Falsified live.** With the race won by host CPU contention, the unmodified default route renders the publisher logos and the whole opening movie with the *same* green/magenta cast as the replay. Live chroma is now verified broken, not merely unverified. Tracked in #2005. | throttled `screenshot` route on `bffa5e25`, #2005 |
 
 ## Next frontier
 
@@ -300,22 +300,24 @@ Two things are visible in those frames and both are real, live defects rather th
 
 - **The movie's chroma is wrong** — greys render green and the whole image carries a magenta cast,
   the same signature the #1807 replay showed and attributed to missing capture provenance. It is now
-  reproduced on the live path, so that attribution was incomplete.
+  reproduced on the live path, so that attribution was incomplete. Tracked in #2005.
 - Software H.264 fallback: `No support for codec h264 profile 77` / `Failed setup for format vaapi`.
   The movie decodes and plays anyway; worth checking whether VAAPI should have taken profile 77.
 
-**Rung 2 (title screen) is not reached, and the reason is now bounded.** A 170 s continuation of the
-same route watched the movie end and the title enter its next phase: every sample from 112 s to 168 s
-(guest frames 2,909 → 3,595) is a **single flat colour**, the dark blue-grey `(11,13,28)` the earlier
-`PROSPER_USLEEP_MAX_US` diagnostic also saw. The frame loop keeps running and the presented extent
-stays 1920×1080, so this is a content defect in the post-movie screens rather than a hang or a
-present failure. That is the rung-1 → rung-2 blocker and it is now separable from #1746: the race no
-longer hides it.
+**Rung 2 (title screen) is not reached, and the reason is now bounded.** A 272 s continuation of the
+same route (34 samples, 8 s apart) watched the movie end and the title enter its next phase. Samples
+00–07 (to 64 s) carry movie content — 6,559 to 38,682 distinct colours each — and then **every one of
+the remaining 26 samples, 72 s through 272 s, guest frames 2,451 → 5,088, has exactly one distinct
+colour**: the dark blue-grey `(11,13,28)` the earlier `PROSPER_USLEEP_MAX_US` diagnostic also saw,
+fading toward black. The frame loop keeps running the whole time (frames advance ~15/s) and the
+presented extent stays 1920×1080, so this is a content defect in the post-movie screens, not a hang
+and not a present failure. That is the rung-1 → rung-2 blocker and it is now separable from #1746:
+the race no longer hides it. Tracked in #2006.
 
 Two apparatus notes for whoever picks that up:
 
-- **`tools/screenshot` prints `status=ok` after the guest thread has died.** On the unthrottled
-  default route it wrote 25 PNGs and reported `status=ok` while the log also carried
+- **`tools/screenshot` prints `status=ok` after the guest thread has died** (#2007). On the
+  unthrottled default route it wrote 25 PNGs and reported `status=ok` while the log also carried
   `[shot] guest thread ended: kind=2 detail=SIGSEGV … +0x24055`. The tells are
   `source-distinct=1 pixel-distinct=1` and `max-*-stale` equal to the whole route. Read the
   `guest thread ended` line before believing any `status=ok`, or pass `--min-pixel-distinct-frames`.
