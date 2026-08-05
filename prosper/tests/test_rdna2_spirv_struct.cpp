@@ -3007,6 +3007,107 @@ int main() {
         return 1;
     }
     printf("  [ok]   unbounded fragment DPP still rejects the VOP2 VCC carry-out trio\n");
+
+    // The straight-line arm above takes the shell's unconditional wave_ok. The LIVE Syberia stage
+    // does not: its reject was reported as `structured emission stopped next-if=1850 next-loop=2462`,
+    // i.e. the ladder sits inside the structured if/loop emitter. Wrap the same ladder in a forward
+    // s_cbranch_scc0 so the path the title actually exercises is covered too.
+    const uint32_t fragment_dpp_row_min_structured[] = {
+        0xbf06800au,                         // pc0:  s_cmp_eq_u32 s10, 0
+        0xbf840008u,                         // pc1:  s_cbranch_scc0 -> pc10
+        0x7e1402c1u,                         // pc2:  v_mov_b32 v10, -1
+        0x261414fau, 0xff01110au,            // pc3:  v_min_u32_dpp v10,v10,v10 row_shr:1
+        0x261414fau, 0xff01120au,            // pc5:  row_shr:2
+        0xd7781009u, 0x0305830au,            // pc7:  v_permlanex16 v9,v10,-1,-1 BC=1
+        0x2614130au,                         // pc9:  v_min_u32 v10,v10,v9
+        0xf800000fu, 0x0a0a0a0au,            // pc10: exp mrt0 v10,v10,v10,v10
+        0xbf810000u,
+    };
+    const auto fragment_dpp_row_min_structured_spv = recompile_fragment(
+        fragment_dpp_row_min_structured, std::size(fragment_dpp_row_min_structured));
+    if (fragment_dpp_row_min_structured_spv.empty() ||
+        !has_opcode(fragment_dpp_row_min_structured_spv, 345) ||
+        fragment_spirv_required_subgroup_size(fragment_dpp_row_min_structured_spv) != 64 ||
+        !type_result_ids_are_nonzero(fragment_dpp_row_min_structured_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_dpp_row_min_structured_spv)) {
+        printf("  [FAIL] structured fragment shell rejected the DPP MIN ladder inside an if\n");
+        return 1;
+    }
+    printf("  [ok]   structured fragment shell lowers the DPP MIN ladder (the live Syberia path)\n");
+
+    // Counter-arm for the `allow_wave` half, which neither arm above exercises because both reach
+    // `emit_body`. A crossing-branch CFG routes to the per-invocation dispatcher instead, whose
+    // lanes can be parked at DIFFERENT static DPP instructions, so a plain row shuffle is not
+    // admissible there. Both arms carry the SAME instruction — `v_min_u32_dpp v2, v0, v1`, with
+    // distinct VDST/SRC0/SRC1 so the dispatcher's own V_MIN_U32 escape hatch (which requires
+    // VDST==SRC0==SRC1) deliberately does NOT match it — and differ only in the surrounding CFG.
+    // The straight-line arm is the positive control: it proves the instruction is otherwise
+    // admissible, so the crossing-CFG arm's rejection can only come from the routing. Without the
+    // pair, "rejected" would be indistinguishable from "this stream never reached the branch".
+    const uint32_t dpp_min_distinct_lo = 0x260402fau;    // v_min_u32_dpp v2, v0, v1 ...
+    const uint32_t dpp_min_distinct_hi = 0xff011100u;    // ... row_shr:1 row_mask:0xf bank_mask:0xf
+    const uint32_t fragment_dpp_distinct_straight[] = {
+        dpp_min_distinct_lo, dpp_min_distinct_hi,
+        0xf800000fu, 0x02020202u,
+        0xbf810000u,
+    };
+    if (recompile_fragment(fragment_dpp_distinct_straight,
+                           std::size(fragment_dpp_distinct_straight)).empty()) {
+        printf("  [FAIL] positive control: the structured shell rejected the distinct-register "
+               "DPP MIN, so the dispatcher arm below proves nothing\n");
+        return 1;
+    }
+    // The CFG is `fragment_cfg_orn2_saveexec` verbatim — the stream the test above already proves
+    // reaches the dispatcher (it asserts OpSwitch) — with the DPP pair inserted at pc7. Every
+    // following PC shifts by exactly 2 and every branch is PC-relative, so all four targets stay
+    // correct. Reusing a stream with proven routing is what makes this arm a real discriminator.
+    const uint32_t fragment_dpp_distinct_dispatcher[] = {
+        0xbe82047eu,                         // pc0:  s_mov_b64 s[2:3], exec
+        0xbeea2802u,                         // pc1:  s_orn2_saveexec_b64 vcc, s[2:3]
+        0xbefe046au,                         // pc2:  s_mov_b64 exec, vcc
+        0x7e040280u,                         // pc3:  v_mov_b32 v2, 0
+        0x7e060280u,                         // pc4:  v_mov_b32 v3, 0
+        0x7e080280u,                         // pc5:  v_mov_b32 v4, 0
+        0x7e0a0280u,                         // pc6:  v_mov_b32 v5, 0
+        dpp_min_distinct_lo, dpp_min_distinct_hi,   // pc7:  the only added instruction
+        0x7c020300u,                         // pc9:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc10: s_cbranch_vccz -> pc14
+        0x7c020300u,                         // pc11: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860002u,                         // pc12: s_cbranch_vccz -> pc15 (crossing region)
+        0x7e040281u,                         // pc13: v_mov_b32 v2, 1
+        0x7e060281u,                         // pc14: v_mov_b32 v3, 1
+        0x7c020300u,                         // pc15: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc16: s_cbranch_vccz -> pc20
+        0xf800180fu, 0x05040302u,            // pc17: exp mrt0 v2, v3, v4, v5 done vm
+        0xbf820003u,                         // pc19: s_branch -> pc23
+        0xf800180fu, 0x05040302u,            // pc20: alternate exp
+        0xbf810000u,                         // pc22: s_endpgm
+        0xbf810000u,                         // pc23: branch-target s_endpgm
+    };
+    if (!recompile_fragment(fragment_dpp_distinct_dispatcher,
+                            std::size(fragment_dpp_distinct_dispatcher)).empty()) {
+        printf("  [FAIL] the per-invocation CFG dispatcher admitted an untagged DPP row shuffle\n");
+        return 1;
+    }
+    printf("  [ok]   unbounded fragment DPP stays closed on the lane-parking CFG dispatcher "
+           "(same packet accepted straight-line)\n");
+
+    // A DPP packet never carries the K literal that v_madmk/v_madak/v_fmamk/v_fmaak read, because
+    // SRC0=0xFA takes the decoder's modifier branch and `literal` keeps its default 0. Admitting one
+    // would compile `d = src0*0.0f + src1` instead of rejecting — a miscompile replacing a
+    // fail-visible reject.
+    const uint32_t fragment_dpp_row_madmk[] = {
+        0x7e1402c1u,                         // v_mov_b32 v10, -1
+        0x401414fau, 0xff01110au,            // v_madmk_f32-shaped VOP2 op 0x20 with a DPP src0
+        0xf800000fu, 0x0a0a0a0au,
+        0xbf810000u,
+    };
+    if (!recompile_fragment(fragment_dpp_row_madmk,
+                            std::size(fragment_dpp_row_madmk)).empty()) {
+        printf("  [FAIL] unbounded fragment DPP admitted a K-literal VOP2 with no literal\n");
+        return 1;
+    }
+    printf("  [ok]   unbounded fragment DPP still rejects the literal-K VOP2 quartet\n");
     // #1474: partially-overlapping LOOPS in the fragment shell. Two back-edges whose ranges cross
     // without nesting (B's header lies inside A's body, B's back-edge outside it) are what the narrow
     // pattern structurizer calls unstructured and rejects. Since the graphics CFG dispatcher above

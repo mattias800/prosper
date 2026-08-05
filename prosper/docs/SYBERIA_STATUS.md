@@ -37,7 +37,7 @@ re-derive these without contradictory new evidence.
 | The native R11 storage rounding bias is the primary cause of the profile menu's severe overexposure | **Falsified at the restored profile-menu boot depth on the pre-#1800 branch state recorded in #1790 (the R11 change was rebased unchanged here).** Two bounded default-renderer runs changed only the exact-packed recovery switch and each retained ten five-second samples from t=170–215 s; neither used capture/RTT/resource-hash diagnostics. Source 118's exact arm directly reported the real 32³ tiled R11 LUT as `native-storage=0`, `R32_UINT`, module hash `7e01d14b7e21d0b2`; the same configuration lever's CPU-only reflection A/B produced distinct exact/native-recovery module hashes `d3509f259a1baa99` / `a7bcc1ec7d05db52`, asserted `R32ui` versus typed-float storage, and the live native run independently proved the device's typed 3D storage capability before source 118 executed. At identical rendered frame sequences 15 and 22, exact versus native-recovery images differed by normalized RMSE 0.00920 / 0.00940 (PSNR 40.73 / 40.54 dB), but both showed the same full-width, severely blown-out scene. Exact packing was slightly brighter, not corrective: mean luma was 0.80285 versus 0.80160 at frame 15 and 0.79367 versus 0.79276 at frame 22. This rules out the conversion bias as the **primary visible mechanism at this boot depth**; it does not erase the deterministic precision defect above, and it does not localize the remaining source-101→bloom→source-119 error. The runs are not a performance A/B: exact carried much broader compute tracing, and both stayed near the known ~1.4 composited fps in the sampled window. | #1790 |
 | Replay uses a stale/no-op source-101 or source-119 writeback, or source 119 numerically explodes the whole HDR frame | **Falsified for the current captured host-renderer path; this is not a PS5 hardware oracle.** Two bounded `--recompile-raw --dump-post-compute-resource` runs executed the retained mixed-operation prefix and required both descriptor-visible change and the independently recorded live raw hash. Realized compute `62:14` (source 101, operation 566) executed once after 62 earlier successful computes: its captured seed equalled its immediate-before state (`raw=89a341fece902e2e`, `linear=4313b6f00a038092`), then changed to raw `e00d49942f888cad` (**exact live-hash match**) / linear `8aeefa2a7bc15ef9`. Its 2,073,600 R11 texels contained 6,220,800 finite channels, 2,839,736 zero, 1,234,144 greater than one, no Inf/NaN, maximum 12.375, mean 0.683273. Realized compute `80:23` (source 119, operation 584) likewise executed once after 80 earlier successful computes: captured/immediate-before `15af296b7f257522` / `cdbfc7204d266c16` changed to raw `2974a84058d4feb5` (**exact live-hash match**) / linear `7ba80885c5585b55`. Its output had no zero, Inf, or NaN channels, only 2,412 greater than one, maximum 1.03125, mean 0.35676. Thus source 119 strongly compresses the source-101 HDR population instead of causing a frame-wide numeric blow-up. The source-101 distribution itself remains **unverified against PS5 hardware** and may still enter the chain incorrectly; these runs prove the host live/replay boundary and falsify the stale/no-op and whole-output-explosion mechanisms, not visual correctness. | #1790 |
 | The source-90/source-92 shader-recompile failures cause missing gameplay pixels | **Falsified.** Both captured packets are direct dispatches with `threads=0x0x0` and `groups=0x0x0`; they are hardware no-ops regardless of whether their shader bodies compile. A temporary diagnostic arm independently moved the lever by admitting both shaders as realized zero-group computes, while the routed gameplay image remained visually unchanged. Their unsupported instructions remain legitimate recompiler coverage work, but cannot repair this frame. | #1627 |
-| The gameplay frame's unrealized operations are all **compute** dispatches, so the composite defect must be on the compute/exposure side | **Falsified by counting the draws.** `--inspect-only` on the gameplay submit reports 23 unrealized operations, of which only **three** are dispatches; **sixteen are draws**, and fifteen of those carry `reason=shader-recompile`. Every earlier Syberia investigation enumerated dispatch rejects (#1628 lists ten for the menu frame, whose capture genuinely has zero failed draws) and none enumerated draw rejects, so the draw side went unexamined for two months. Fifteen 1920x1080 `R11G11B10F` forward-pass draws — including a 38,994-vertex opaque depth-writing one — were being dropped. | #1627 |
+| The gameplay frame's unrealized operations are all **compute** dispatches, so the composite defect must be on the compute/exposure side | **Falsified by counting the draws.** `--inspect-only` on the gameplay submit reports 23 unrealized operations, of which only **three** are dispatches; **twenty are draws**, fifteen of them `reason=shader-recompile` and five `no-effect`. Every earlier Syberia investigation enumerated dispatch rejects (#1628 lists ten for the menu frame, whose capture genuinely has zero failed draws) and none enumerated draw rejects, so the draw side went unexamined for two months. Fifteen 1920x1080 `R11G11B10F` forward-pass draws — including a 38,994-vertex opaque depth-writing one — were being dropped. | #1627 |
 | The fifteen dropped gameplay draws fail for fifteen different reasons, so recovering them is open-ended | **Falsified.** `--retry-failed-stage F:1` under `PROSPER_DBG=1` reports the *identical* first reject in all fifteen: a fragment `v_min_u32_dpp vN,vN,vN row_shr:N`, i.e. one admission test, not fifteen gaps. Fourteen recompile after that single test is generalized. | #1627 |
 | A black routed Syberia run is evidence about the renderer | **Not necessarily — check the load first.** Under heavy concurrent-lane load the intro logo videos alone reach t≈185 s and the time-based pad route desynchronizes; two arms differing only in the patch under test were identically black. See the route-timing warning above. | #1627 |
 
@@ -284,9 +284,9 @@ recompiler refused, all on one instruction shape.
 
 Offline on the retained gameplay F9 capture (submit 4347 — 1,967 draws, 110 dispatches, 2,100
 operations, taken on the validated `reach-gameplay.pad` route), `gpu_replay --inspect-only` reports 23
-unrealized operations. **Sixteen are draws**, and fifteen of those carry `reason=shader-recompile`.
-Every one targets the same 1920x1080 `R11G11B10F` HDR surface with `cwm=7`, in the frame's forward /
-lighting pass:
+unrealized operations: **twenty are draws** and three are dispatches. Fifteen of the twenty carry
+`reason=shader-recompile` (the other five are `no-effect`), and every one of the fifteen targets the
+same 1920x1080 `R11G11B10F` HDR surface with `cwm=7`, in the frame's forward / lighting pass:
 
 | failure | source draw | vertices | depth | blend |
 |---|---|---|---|---|
@@ -324,8 +324,10 @@ test admits every VOP2 whose sole architectural result is VDST; the VOP2 carry t
 (`v_add_co_ci` / `v_sub_co_ci` / `v_subrev_co_ci`, opcodes `0x28`–`0x2A`) also writes VCC and its
 disabled-lane bit is not modelled, so it stays fail-visible.
 
-The change is **monotone**: a stage that previously compiled never reached this branch, because
-reaching it meant rejection. Nothing that rendered before can render differently.
+The change is **monotone**. For `V_OR_B32` the new predicate reduces to the old one, so anything
+compiling today keeps compiling to byte-identical SPIR-V; for every other opcode the branch previously
+returned `ok = false`, so no stage that compiled could have reached it. The change can only turn a
+rejected stage into an accepted one.
 
 Failure 9 (source draw 1929) then rejects further in at an unrelated gap —
 `s_cmp_eq_u64 s[16:17], s[18:19]` where the operand pair is not resolvable to two tracked wave
@@ -333,6 +335,40 @@ masks — and is tracked on #2020.
 
 The remaining two dispatch rejects in the same submit (`pc=24 fmt=0 op=0xf` and `pc=4 fmt=4 op=0x8`)
 are already the first two rows of #1628's table; source 87 now recompiles, as #1821 reported.
+
+### The dumped layers, and what they actually show
+
+Offline on the same capture, `gpu_replay --through-operation N` at four points in the composite chain
+(this is the layer evidence, not an inference from draw calls):
+
+| operation | target | what the image contains |
+|---|---|---|
+| 2043 (last forward draw, 1962) | `0x210bc50000` 1920x1080 `R11G11B10F` | **the complete factory hall** — walls, staircase, wrought-iron railing, window, Kate's silhouette |
+| 2086 (draw 1974) | `0x210edd0000` 1920x1080 | black except the "Leave" prompt glyphs |
+| 2099 (final draw 1986) | `0x21132a0000` 1920x1080 | black except the UI (gear, "Leave", tutorial banner) |
+
+Two facts follow, and they are different problems:
+
+1. **The scene layer exists and is structurally correct** at `0x210bc50000`. Geometry, silhouettes and
+   shadows are all present and sharp. What is wrong there is the **lighting**: every light renders as
+   an enormous smooth disc with visible concentric banding — the two hall lamps are flat orange blobs
+   many times their real size, and the window blows to white. That over-bright, hugely-blurred
+   lighting is exactly the shape of the degraded live gameplay image, so **this target, not the
+   composite, is where the visible defect is introduced.** The fifteen dropped forward draws land in
+   this same target and are the first thing to re-check once they render.
+2. **In replay the 3D layer does not survive into the final composite target at all** — `0x210edd0000`
+   and `0x21132a0000` are black-plus-UI, while the live frontend capture of the same route plainly
+   shows the (dim, ghosted) scene. Live and replay therefore disagree about the composite. Do **not**
+   read the black replay composite as the title's defect until that divergence is explained; it is the
+   same live/replay boundary that `## Ruled out` already warns about for the menu frame.
+
+**Trap 91 applies to this document.** `px_nonblack` used to assume 4 bytes per texel and inverted on
+other formats. Every "non-black pixels" figure in this file that was measured over an `R11G11B10F`
+target — the 2,066,070 in the `[rtt]` trace, the 2,063,996/2,063,887 profile-menu counts, the 670,815
+pre-fix baseline — is therefore **void as a magnitude**. They are retained only as
+same-instrument-same-run comparisons; do not quote them as pixel counts or compare them against a
+figure measured after #1994. Counts taken by the `screenshot` frontend over the presented RGBA8
+surface are unaffected.
 
 ## The former "right ~55% is black" question — localized and fixed
 

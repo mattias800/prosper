@@ -7116,11 +7116,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         // That dispatcher lowers the exact V_MIN_U32 reduction itself, with a
                         // static event tag carried through the identical shuffle. V_OR_B32 keeps
                         // its historical unconditional admission so no stage that compiles today
-                        // starts failing; widening the dispatcher's coverage is separate work.
+                        // starts failing; widening the dispatcher's coverage is separate work, filed as #2043.
                         const bool writes_carry_out = in.opcode == 0x28 ||
                                                       in.opcode == 0x29 || in.opcode == 0x2A;
+                        // The four mul-add-with-literal-K ops read `in.literal`, and a DPP packet
+                        // never carries one: SRC0=0xFA takes the decoder's modifier branch, so
+                        // `has_literal` stays false and `literal` keeps its default 0. Admitting
+                        // them here would silently compile `d = src0*0.0f + src1` where the old
+                        // gate rejected — a miscompile replacing a fail-visible reject, which is
+                        // exactly what the omod/clamp guard below refuses to do. `llvm-mc` calls
+                        // the encoding invalid, so only a desynced stream can produce one, and a
+                        // desynced stream is what the reject path is for.
+                        const bool reads_k_literal = in.opcode == 0x20 || in.opcode == 0x21 ||
+                                                     in.opcode == 0x2C || in.opcode == 0x2D;
                         const bool wave_visible = allow_wave || in.opcode == 0x1c;
-                        if (writes_carry_out || !wave_visible || in.dpp_bound_ctrl) {
+                        if (writes_carry_out || reads_k_literal || !wave_visible ||
+                            in.dpp_bound_ctrl) {
                             ok = false; return true;
                         }
                         a = b.subgroup_row_shr(
