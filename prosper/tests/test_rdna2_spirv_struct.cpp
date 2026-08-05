@@ -2957,6 +2957,56 @@ int main() {
         return 1;
     }
     printf("  [ok]   unbounded fragment DPP preserves VDST and requires host shuffle support\n");
+
+    // Syberia: Remastered's Forward+ light-list scalarization reduces an unsigned index across the
+    // wave with the SAME unbounded ROW_SHR ladder, differing from Astro only in the VOP2 opcode
+    // (V_MIN_U32 instead of V_OR_B32). These are the exact live packets at pc 1825..1841 of the
+    // gameplay fragment program 8ab1535bbb28d3bd. DPP16 rewrites SRC0 only and an out-of-row or
+    // EXEC-inactive source preserves VDST, so the lowering is opcode-independent; a per-opcode
+    // allow-list silently dropped fifteen 1920x1080 HDR draws in one gameplay submit (#1627).
+    const uint32_t fragment_dpp_row_min[] = {
+        0x7e1402c1u,                         // v_mov_b32 v10, -1
+        0x261414fau, 0xff01110au,            // v_min_u32_dpp v10,v10,v10 row_shr:1
+        0x261414fau, 0xff01120au,            // row_shr:2
+        0x261414fau, 0xff01140au,            // row_shr:4
+        0x261414fau, 0xff01180au,            // row_shr:8
+        0xd7781009u, 0x0305830au,            // v_permlanex16 v9,v10,-1,-1 BC=1
+        0x2614130au,                         // v_min_u32 v10,v10,v9
+        0xd7600000u, 0x00013f0au,            // v_readlane_b32 s0,v10,31
+        0xd7600001u, 0x00017f0au,            // v_readlane_b32 s1,v10,63
+        0x883f0100u,                         // s_or_b32 s63,s0,s1
+        0xf800000fu, 0x0a0a0a0au,            // exp mrt0 v10,v10,v10,v10
+        0xbf810000u,
+    };
+    const auto fragment_dpp_row_min_spv = recompile_fragment(
+        fragment_dpp_row_min, std::size(fragment_dpp_row_min));
+    if (fragment_dpp_row_min_spv.empty() ||
+        !has_opcode(fragment_dpp_row_min_spv, 345) ||
+        !has_builtin(fragment_dpp_row_min_spv, 41) ||
+        fragment_spirv_required_subgroup_size(fragment_dpp_row_min_spv) != 64 ||
+        !type_result_ids_are_nonzero(fragment_dpp_row_min_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_dpp_row_min_spv)) {
+        printf("  [FAIL] Syberia fragment DPP row-right MIN reduction did not emit valid subgroup SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   Syberia fragment DPP row-right V_MIN_U32 reduction lowers like the OR ladder\n");
+
+    // The boundary is deliberate and stays fail-visible: the VOP2 carry trio also writes VCC, and a
+    // ROW_SHR-disabled lane would have to preserve its old VCC bit, which the VDST-only epilogue
+    // does not model. VCC is defined first so the rejection cannot come from the missing carry-in.
+    const uint32_t fragment_dpp_row_carry[] = {
+        0x7d840300u,                         // v_cmp_eq_u32 vcc, v0, v1   (defines VCC)
+        0x7e1402c1u,                         // v_mov_b32 v10, -1
+        0x501414fau, 0xff01110au,            // v_add_co_ci_u32_dpp v10,vcc,v10,v10,vcc row_shr:1
+        0xf800000fu, 0x0a0a0a0au,
+        0xbf810000u,
+    };
+    if (!recompile_fragment(fragment_dpp_row_carry,
+                            std::size(fragment_dpp_row_carry)).empty()) {
+        printf("  [FAIL] unbounded fragment DPP admitted a VOP2 carry-out opcode\n");
+        return 1;
+    }
+    printf("  [ok]   unbounded fragment DPP still rejects the VOP2 VCC carry-out trio\n");
     // #1474: partially-overlapping LOOPS in the fragment shell. Two back-edges whose ranges cross
     // without nesting (B's header lies inside A's body, B's back-edge outside it) are what the narrow
     // pattern structurizer calls unstructured and rejects. Since the graphics CFG dispatcher above

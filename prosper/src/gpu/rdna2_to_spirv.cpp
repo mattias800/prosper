@@ -7094,10 +7094,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         }
                         a = b.uconst(0);
                     } else if (b.is_fragment) {
-                        // Astro's material mask uses unbounded v_or_b32 ROW_SHR:{1,2,4,8}. An
-                        // out-of-row or EXEC-inactive source disables the instruction, preserving
-                        // the old destination even when VDST and the two sources are distinct.
-                        if (in.opcode != 0x1c || in.dpp_bound_ctrl) {
+                        // Unbounded ROW_SHR is a pure SOURCE transform: DPP16 rewrites SRC0 only,
+                        // and an out-of-row or EXEC-inactive source disables the instruction,
+                        // preserving the old destination even when VDST and the two sources are
+                        // distinct. Both halves are opcode-independent, so every VOP2 whose only
+                        // architectural result is VDST lowers identically — Astro's material mask
+                        // uses v_or_b32, Syberia's Forward+ light scalarization uses the
+                        // v_min_u32 ROW_SHR:{1,2,4,8} wave reduction, and a per-opcode allow-list
+                        // silently drops every draw using any other one. The carry trio
+                        // (v_add_co_ci/v_sub_co_ci/v_subrev_co_ci) ALSO writes VCC, and a disabled
+                        // lane would have to preserve its old VCC bit too; the epilogue below only
+                        // restores VDST, so keep exactly that shape fail-visible.
+                        const bool writes_carry_out = in.opcode == 0x28 ||
+                                                      in.opcode == 0x29 || in.opcode == 0x2A;
+                        if (writes_carry_out || in.dpp_bound_ctrl) {
                             ok = false; return true;
                         }
                         a = b.subgroup_row_shr(
