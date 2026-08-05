@@ -3,7 +3,8 @@
 Unity / IL2CPP, Microids / Virtuallyz Gaming. **Rung 3 — gameplay reached** with real GPU draws on a
 validated route (`scripts/syberia/reach-gameplay.pad`). Two visual defects remain: the profile
 menu's formerly missing 3D layer is restored but overexposed (#1790), and the routed gameplay
-composite remains degraded (#1627).
+composite remains degraded (#1627 — draw-side cause localized 2026-08-05, fourteen of the fifteen
+dropped forward-pass draws recovered offline; **the post-fix routed screenshot is still owed**).
 
 Read **`## Ruled out`** below before repeating any experiment on the "right side of the frame is
 black" question. Several hypotheses about that frame — including the one this document originally
@@ -36,6 +37,9 @@ re-derive these without contradictory new evidence.
 | The native R11 storage rounding bias is the primary cause of the profile menu's severe overexposure | **Falsified at the restored profile-menu boot depth on the pre-#1800 branch state recorded in #1790 (the R11 change was rebased unchanged here).** Two bounded default-renderer runs changed only the exact-packed recovery switch and each retained ten five-second samples from t=170–215 s; neither used capture/RTT/resource-hash diagnostics. Source 118's exact arm directly reported the real 32³ tiled R11 LUT as `native-storage=0`, `R32_UINT`, module hash `7e01d14b7e21d0b2`; the same configuration lever's CPU-only reflection A/B produced distinct exact/native-recovery module hashes `d3509f259a1baa99` / `a7bcc1ec7d05db52`, asserted `R32ui` versus typed-float storage, and the live native run independently proved the device's typed 3D storage capability before source 118 executed. At identical rendered frame sequences 15 and 22, exact versus native-recovery images differed by normalized RMSE 0.00920 / 0.00940 (PSNR 40.73 / 40.54 dB), but both showed the same full-width, severely blown-out scene. Exact packing was slightly brighter, not corrective: mean luma was 0.80285 versus 0.80160 at frame 15 and 0.79367 versus 0.79276 at frame 22. This rules out the conversion bias as the **primary visible mechanism at this boot depth**; it does not erase the deterministic precision defect above, and it does not localize the remaining source-101→bloom→source-119 error. The runs are not a performance A/B: exact carried much broader compute tracing, and both stayed near the known ~1.4 composited fps in the sampled window. | #1790 |
 | Replay uses a stale/no-op source-101 or source-119 writeback, or source 119 numerically explodes the whole HDR frame | **Falsified for the current captured host-renderer path; this is not a PS5 hardware oracle.** Two bounded `--recompile-raw --dump-post-compute-resource` runs executed the retained mixed-operation prefix and required both descriptor-visible change and the independently recorded live raw hash. Realized compute `62:14` (source 101, operation 566) executed once after 62 earlier successful computes: its captured seed equalled its immediate-before state (`raw=89a341fece902e2e`, `linear=4313b6f00a038092`), then changed to raw `e00d49942f888cad` (**exact live-hash match**) / linear `8aeefa2a7bc15ef9`. Its 2,073,600 R11 texels contained 6,220,800 finite channels, 2,839,736 zero, 1,234,144 greater than one, no Inf/NaN, maximum 12.375, mean 0.683273. Realized compute `80:23` (source 119, operation 584) likewise executed once after 80 earlier successful computes: captured/immediate-before `15af296b7f257522` / `cdbfc7204d266c16` changed to raw `2974a84058d4feb5` (**exact live-hash match**) / linear `7ba80885c5585b55`. Its output had no zero, Inf, or NaN channels, only 2,412 greater than one, maximum 1.03125, mean 0.35676. Thus source 119 strongly compresses the source-101 HDR population instead of causing a frame-wide numeric blow-up. The source-101 distribution itself remains **unverified against PS5 hardware** and may still enter the chain incorrectly; these runs prove the host live/replay boundary and falsify the stale/no-op and whole-output-explosion mechanisms, not visual correctness. | #1790 |
 | The source-90/source-92 shader-recompile failures cause missing gameplay pixels | **Falsified.** Both captured packets are direct dispatches with `threads=0x0x0` and `groups=0x0x0`; they are hardware no-ops regardless of whether their shader bodies compile. A temporary diagnostic arm independently moved the lever by admitting both shaders as realized zero-group computes, while the routed gameplay image remained visually unchanged. Their unsupported instructions remain legitimate recompiler coverage work, but cannot repair this frame. | #1627 |
+| The gameplay frame's unrealized operations are all **compute** dispatches, so the composite defect must be on the compute/exposure side | **Falsified by counting the draws.** `--inspect-only` on the gameplay submit reports 23 unrealized operations, of which only **three** are dispatches; **sixteen are draws**, and fifteen of those carry `reason=shader-recompile`. Every earlier Syberia investigation enumerated dispatch rejects (#1628 lists ten for the menu frame, whose capture genuinely has zero failed draws) and none enumerated draw rejects, so the draw side went unexamined for two months. Fifteen 1920x1080 `R11G11B10F` forward-pass draws — including a 38,994-vertex opaque depth-writing one — were being dropped. | #1627 |
+| The fifteen dropped gameplay draws fail for fifteen different reasons, so recovering them is open-ended | **Falsified.** `--retry-failed-stage F:1` under `PROSPER_DBG=1` reports the *identical* first reject in all fifteen: a fragment `v_min_u32_dpp vN,vN,vN row_shr:N`, i.e. one admission test, not fifteen gaps. Fourteen recompile after that single test is generalized. | #1627 |
+| A black routed Syberia run is evidence about the renderer | **Not necessarily — check the load first.** Under heavy concurrent-lane load the intro logo videos alone reach t≈185 s and the time-based pad route desynchronizes; two arms differing only in the patch under test were identically black. See the route-timing warning above. | #1627 |
 
 **Still open:** what causes the restored menu layer's substantial overexposure (#1790). Recompiling
 source 101 restores the visible 3D layer on the **default** path, but does not make it visually
@@ -91,8 +95,29 @@ it without re-running:
 | ~312 s onward | **gameplay** — Kate Walker in the factory hall, the "Leave" interaction prompt, the "Use the left stick to move" tutorial, the pause HUD (≈46,000–48,000 colours, 2,068,000+ non-black px, i.e. 99.7% of the frame) |
 
 Gameplay composition is **degraded**: a translucent ghost of another scene is blended over the middle
-of the frame and the image is over-dark. It is tracked separately on #1627 and has **not** been
-localized; there is no evidence yet that it shares the profile menu's exposure mechanism.
+of the frame and the image is over-dark. It is tracked on #1627; the draw-side cause is now localized
+(see the 2026-08-05 section below), but no post-fix routed screenshot exists yet.
+
+**This route's absolute times are only valid on a lightly-loaded box, and the failure mode is silent.**
+The times above assume the boot reaches the save-warning at ~12 s. Measured 2026-08-05 with roughly a
+dozen concurrent agent lanes live (load average 16–33 on 32 logical cores), the *intro publisher logo
+videos alone* were still on screen at **t = 185 s** — they are decoded in software, because
+`[avp-vaapi] … Not yet implemented in FFmpeg` makes the VA-API H.264 hwaccel fail on this dump, so the
+splash is CPU-bound and stretches with load. Every Cross in the route then lands in the wrong state and
+the run reaches only black or an intro logo.
+
+Two concurrent arms, identical except for the recompiler patch under test (one `origin/master`, one
+patched), were indistinguishable through every state either reached: 253 colours / ~2,780 non-black
+pixels at t=12 s, the full-frame Microids logo video (~35,000 colours, all 2,073,600 pixels non-black)
+at t=216–228 s, and the same engine-logo wireframe animation a few frames apart at t=480 s. **Neither
+reached the profile menu**, which the timetable puts at 183 s. An earlier pair froze on the *identical*
+black composited frame (`pixel_crc32=064567f8`, `distinct_rgb_colors=1`) from t≈190 s onward — again on
+both the patched and the unpatched binary — and one arm ended its guest thread with a `SIGSEGV` after a
+burst of `tlsf_add_pool: Memory size must be between 0x28 and 0x100000000`.
+
+So **a black or logo-stuck routed Syberia run under load is an apparatus result, not a title or
+renderer regression.** Confirm the timetable above still holds (the save warning must appear by ~15 s)
+before reading anything into a routed capture, and prefer an uncontended box for this title.
 
 ## BC6H cube decode cost — 2026-08-03
 
@@ -249,6 +274,66 @@ The fixed screenshot is visually equivalent to the baseline: the same dark, over
 gameplay composite remains. This closes a real, consumed shader gap but does **not** localize or fix
 the visible #1627 defect, and it is not a reason to advance the compatibility rung or replace the
 published screenshot.
+
+## Gameplay composite localized: fifteen dropped forward-pass draws — 2026-08-05
+
+`#1627` was auto-closed by PR #1821's `Fixes #1627` even though that PR's own evidence said the image
+was unchanged; it is reopened. The defect is now localized, and it is **not** a lost renderer-owned
+target, an exposure/tonemap input, or a temporal history buffer. It is fifteen ordinary draws that the
+recompiler refused, all on one instruction shape.
+
+Offline on the retained gameplay F9 capture (submit 4347 — 1,967 draws, 110 dispatches, 2,100
+operations, taken on the validated `reach-gameplay.pad` route), `gpu_replay --inspect-only` reports 23
+unrealized operations. **Sixteen are draws**, and fifteen of those carry `reason=shader-recompile`.
+Every one targets the same 1920x1080 `R11G11B10F` HDR surface with `cwm=7`, in the frame's forward /
+lighting pass:
+
+| failure | source draw | vertices | depth | blend |
+|---|---|---|---|---|
+| 3 | 1885 | 81 | `1/1/2` (depth write) | 0 |
+| 4 | 1886 | **38,994** | `1/1/2` (depth write) | 0 |
+| 6–18 | 1924…1963 | 36–3,600 | `1/0/6` (test only) | 1 |
+
+Their vertex stages recompile. The **fragment** stages do not, and
+`gpu_replay --retry-failed-stage F:1` under `PROSPER_DBG=1` reports the identical first reject in all
+fifteen — for example failure 3:
+
+```
+[recompile-reject] pc=1827 words=261414fa,ff01110a fmt=6 op=0x13 dpp=1
+```
+
+`llvm-mc -arch=amdgcn -mcpu=gfx1010` decodes that pair as
+**`v_min_u32_dpp v10, v10, v10 row_shr:1 row_mask:0xf bank_mask:0xf`**. `shader_inspect` shows it is
+the head of the standard Wave64 unsigned-minimum reduction — `row_shr:1,2,4,8`, then
+`v_permlanex16_b32`, then `v_readlane_b32 s0,v10,31` / `s1,v10,63` — i.e. the Forward+ light-list
+scalarization that turns a divergent light index into a wave-uniform scalar. It occurs twice per
+program (a second site at pc 2802 in the same shader).
+
+The cause was a **single-opcode allow-list**, `src/gpu/rdna2_to_spirv.cpp:7100`:
+
+```cpp
+if (in.opcode != 0x1c || in.dpp_bound_ctrl) { ok = false; return true; }   // 0x1c = V_OR_B32
+```
+
+The lowering behind it was already general and already correct: `subgroup_row_shr()` shuffles SRC0
+inside each architectural 16-lane row and returns the valid-lane predicate, and the VOP2 epilogue uses
+that predicate to preserve the old VDST for out-of-row / EXEC-inactive lanes. DPP16 rewrites SRC0
+only, so both halves are opcode-independent — only the admission test named one opcode
+(`V_OR_B32`, added for Astro Bot's material mask). Fourteen of the fifteen stages recompile once the
+test admits every VOP2 whose sole architectural result is VDST; the VOP2 carry trio
+(`v_add_co_ci` / `v_sub_co_ci` / `v_subrev_co_ci`, opcodes `0x28`–`0x2A`) also writes VCC and its
+disabled-lane bit is not modelled, so it stays fail-visible.
+
+The change is **monotone**: a stage that previously compiled never reached this branch, because
+reaching it meant rejection. Nothing that rendered before can render differently.
+
+Failure 9 (source draw 1929) then rejects further in at an unrelated gap —
+`s_cmp_eq_u64 s[16:17], s[18:19]` where the operand pair is not resolvable to two tracked wave
+masks — and is tracked on #2020.
+
+The remaining two dispatch rejects in the same submit (`pc=24 fmt=0 op=0xf` and `pc=4 fmt=4 op=0x8`)
+are already the first two rows of #1628's table; source 87 now recompiles, as #1821 reported.
+
 ## The former "right ~55% is black" question — localized and fixed
 
 Before source-101 support, this was **a defect, not art direction, and not a scissor/viewport clip.**
