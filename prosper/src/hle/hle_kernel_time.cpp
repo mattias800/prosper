@@ -545,7 +545,11 @@ HLE(k_ok)              { return 0; }                       // generic success no
 constexpr uint64_t k_sysmodule_error_unloaded = 0x805A1001;   // SCE_SYSMODULE_ERROR_UNLOADED
 
 namespace {
-std::mutex g_sysmodule_mx;
+// Heap-backed, not a namespace-scope std::mutex: on macOS the latter is constant-initialized
+// non-zero and lands in __DATA, where the #707 corruptor zeroes its pthread signature during
+// Blasphemous 2's asset load — and Blasphemous 2 is one of the titles that reaches these handlers.
+// See heap_mutex.hpp. Call sites must use the deduced `std::lock_guard lk(...)` form.
+PROSPER_HEAP_MUTEX(g_sysmodule_mx);
 std::unordered_map<uint16_t, bool> g_sysmodule_state;   // id -> loaded; absent == never asked for
 
 // One line per id the FIRST time it answers UNLOADED, so a title that reacts badly to an honest
@@ -564,7 +568,7 @@ void sysmodule_report_unloaded(uint16_t id) {
 // is now recorded, so the state query stops contradicting the loader's own history.
 HLE(k_sysmodule_load) {
     const uint16_t id = (uint16_t)a0;
-    std::lock_guard<std::mutex> lk(g_sysmodule_mx);
+    std::lock_guard lk(g_sysmodule_mx);
     g_sysmodule_state[id] = true;
     return 0;
 }
@@ -572,7 +576,7 @@ HLE(k_sysmodule_load) {
 // sceSysmoduleUnloadModule(uint16_t id)
 HLE(k_sysmodule_unload) {
     const uint16_t id = (uint16_t)a0;
-    std::lock_guard<std::mutex> lk(g_sysmodule_mx);
+    std::lock_guard lk(g_sysmodule_mx);
     g_sysmodule_state[id] = false;
     return 0;
 }
@@ -580,7 +584,7 @@ HLE(k_sysmodule_unload) {
 // sceSysmoduleIsLoaded(uint16_t id) -> SCE_OK when this process loaded it, else UNLOADED.
 HLE(k_sysmodule_is_loaded) {
     const uint16_t id = (uint16_t)a0;
-    std::lock_guard<std::mutex> lk(g_sysmodule_mx);
+    std::lock_guard lk(g_sysmodule_mx);
     const auto it = g_sysmodule_state.find(id);
     if (it != g_sysmodule_state.end() && it->second) return 0;
     sysmodule_report_unloaded(id);
