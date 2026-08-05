@@ -758,7 +758,7 @@ copy path, so a binding-miss run with the same environment is the control for a 
 - Artifacts are uploaded only for a release. A release is created only for a Git release tag. Ordinary PR CI must show
   the release-publication job skipped.
 - Keep PRs short-lived so other agents inherit generic improvements quickly.
-- **Two mechanical holes in the merge gate, both of which let a PR read as satisfied when it is not.**
+- **Three mechanical holes in the merge gate, each of which lets a PR read as satisfied when it is not.**
   - **A registered review is not the same as a comment.** `gh pr comment` creates an *issue* comment;
     only `gh pr review --comment` appears in `gh pr view --json reviews` / `pulls/N/reviews`. A review
     posted the first way is fully visible on the PR page and invisible to the gate, so the findings
@@ -793,6 +793,25 @@ copy path, so a binding-miss run with the same environment is the control for a 
     This is not hypothetical — on #1687 the head moved **twice after the branch was called frozen**,
     and a reviewer guarding on `headRefOid` correctly refused both times. Posting unconditionally
     would have left `reviews[]` showing a perfectly healthy row bound to code that had moved on.
+  - **A running check reports `conclusion=""` — an empty string, not `null` — so a pending-count gate
+    written as `select(.conclusion==null)` returns 0 while jobs are still executing.** Observed
+    directly on #1991: `macOS (x86_64 / Rosetta 2)  conclusion=  state=null  status=IN_PROGRESS`,
+    while the same query reported zero pending. This is how #1952 merged with a check unfinished; that
+    was originally written off as a command-chaining slip, and the gate itself was the cause.
+    **Gate on a terminal-success allowlist, never on a pending denylist:**
+    ```bash
+    gh pr view <N> --json statusCheckRollup --jq '
+      [.statusCheckRollup[]?] as $c
+      | { total:   ($c|length),
+          notdone: ([$c[]|select((.conclusion//"")|IN("SUCCESS","SKIPPED")|not)]|length),
+          failed:  ([$c[]|select((.conclusion//"")|IN("FAILURE","CANCELLED","TIMED_OUT","ACTION_REQUIRED"))]|length) }'
+    ```
+    Merge only on `notdone == 0 && failed == 0 && total > 0 && mergeStateStatus == "CLEAN"`. The `//""`
+    coalesce is load-bearing. **The general rule is worth more than the `gh` detail: a filter that
+    enumerates the states you consider bad silently admits every state you did not think of** — so
+    enumerate what you accept and reject the complement. Note also how this hid: on the same day two
+    merges passed the broken gate *correctly*, because their success count already equalled the full
+    job count, and a gate that happens to agree with the right answer looks like a working gate.
 - The orchestrator opens the PR with a self-contained behavioral contract, issue links, evidence, exact tests, risks,
   and known limitations. Wait for all Linux, Windows, and macOS checks before merging.
 - When a game changes from black to visible content, reaches title, reaches gameplay, or materially improves visuals,
