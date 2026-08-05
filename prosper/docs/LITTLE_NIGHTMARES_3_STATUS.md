@@ -49,6 +49,9 @@ Two facts bound where it can live:
 - **It is not frontend-specific.** The native SDL3 `prosper-app` window shows it too, and there it
   is *persistent* — three grabs 40 s apart at the title screen are byte-identical yellow. Headless
   `screenshot` sees it on roughly two thirds of samples, with correct black frames interleaved.
+- **The rate is stable and is a usable discriminator.** Two independent 360 s arms both give
+  **24 / 36** tinted samples. That reproducibility is what makes an A/B on this defect worth
+  running: a switch that does not move 24/36 has not touched the cause.
 
 Open as [#2014](https://github.com/mattias800/prosper/issues/2014).
 
@@ -84,6 +87,7 @@ Read this before forming a hypothesis.
 | The stall before the title is the undelivered-GPU-completion family (#232 / #208 / #210 / #984) as its own defect | **Superseded.** The completion was never generated, because the submit owing it was declined: `PROSPER_EOPLOG=1` censused 2,706 `FIRE`, 1 `SKIP(rejected)`, 0 `OWE`. Same root cause as #1982, fixed by #1987. #1962. |
 | The flat yellow frame is a real guest screen whose text layer is missing (e.g. a health warning) | **Falsified.** It is pure `RGB(255,255,0)` over the whole 4K frame, first composited at `frame_seq=4` with the identical crc — before any title content exists — and the frame the freeze landed on varied between runs. #1962. |
 | The yellow tint is a per-scanout-buffer defect (one flip buffer composited wrong) | **Falsified.** The manifest's `front_index` does not correlate with the tint: 14 yellow / 6 clean on `front_index=0` and 10 / 6 on `front_index=1` over 36 samples. #2014. |
+| The yellow tint comes from the packed-R11G11B10 compute storage path | **Falsified by a one-variable A/B.** `PROSPER_NO_PACKED_R11_STORAGE=1` over a 360 s arm gives **24 / 36** tinted samples — *identical* to the default arm's 24 / 36, on the same binary, route and host. Both arms also reach the same title screen and both show the same occasional clean frame, so the switch moved nothing. #2014. |
 | `[agc] WaitRegMem … dependency violated` is the lead for the stall | **Falsified — instrument noise.** 31 events on *The Pathless* (`PPSA01826`, UE4), which renders its title screen for a full 140 s arm without stalling, against 40 on this title, and on this title they all stop *before* the stall began. #1962. |
 | `crc=666f7b3f` fingerprints this title's wall | **No — it is just "black 3840x2160".** The same crc was the frozen frame of Crisis Core (#1982) and Sonic Frontiers (#1968), which have different causes. Do not group titles by it. |
 | The `0x30016000` UE pooled-allocator fault (#1945 / #1226) bounds this title | **Not seen** in any arm of six on `ff72e77c`, nor in any arm on `4d7a2ded`. |
