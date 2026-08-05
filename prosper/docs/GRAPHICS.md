@@ -494,6 +494,29 @@ violate correctness-first (endless chain of fakes that never reaches real render
 **parked pending the SDK headers**. Independent, provably-correct graphics-pipeline work (AGC command
 decode, shader recompiler, Vulkan backend — all unit-testable in isolation) proceeds meanwhile.
 
+## Ruled out
+
+Cross-title falsifications for the **present / publish path** (what reaches the screen once passes
+have rendered). One line each: the dead hypothesis, the evidence, the link. Extend this rather than
+re-deriving — and read it before forming a hypothesis about a frozen, black, or missing frame.
+
+- **A frozen frame with a live guest is not necessarily a guest or a draw problem — check the publish
+  gate first.** Sonic Frontiers (PPSA03831) looked dead from t≈140 s with `frame_seq` frozen at 2,081,
+  while the guest went on to flip 283 more times and prosper accepted 13,028 further submits and folded
+  8,223 more draws. The renderer was selecting a present source by target *identity* and the publisher
+  accepts only `w*h*4` bytes, so correctly rendered passes at the wrong extent (1920x1080, 1024x1024,
+  3840x3072 against a requested 3840x2160) were silently dropped. Nothing logged it. #1986 / #1990.
+- **Removing the publish wall does not restore blacked-out content — the two are separate causes.**
+  With the extent contract in place Frontiers publishes again and the composited frame is *still*
+  uniformly black (`distinct_rgb_colors == 1`, `nonblack_rgb_pixels == 0`): the last publishable 4K
+  frame was already black when the wall formed, so the now-correctly-served retained frame is black.
+  This kills #1968 §6 (that the content going black shortly *before* the wall shared the wall's cause).
+  The open question is unchanged and is #1968 §5: why no post-intro pass targets the flipped VideoOut
+  buffer. #1990.
+- **`pixel_crc32` for a black frame is not a fingerprint.** `666f7b3f` is just "black 3840x2160" and
+  recurs on three unrelated titles, so it identifies a resolution, not a title or a defect. Do not use
+  a black-frame hash as an oracle or to claim two titles share a cause. #1990.
+
 ## Recommended implementation order
 
 1. **Real unified memory.** Make GPU allocations CPU/GPU-VA *aliased*: when the guest maps direct
