@@ -750,6 +750,24 @@ copy path, so a binding-miss run with the same environment is the control for a 
     converge confidently on an innocent commit — an answer-shaped non-answer, worse than no signal. One extra
     run protects the ~4 the bisect will spend. Guards that sample a route window are phase-sensitive, so this is
     not a hypothetical (see the `blue-prince-hall` / `terminator-boot` note above).
+  - **One re-run is NOT sufficient, and the first batch run proved it.** `messenger-scene` failed **twice
+    consecutively with a byte-identical signature** (`pixel_crc32=d21ae76a`, all 29 window frames identical),
+    which passes the re-run safeguard above and looks exactly like a real, deterministic regression. The bisect
+    then named #2003 — with an *attractive* mechanism, since Messenger's `param.json` declares
+    `userDefinedParam4 = 1` and #2003 changed that answer from 0 to 1. It was wrong: #2003 passes, and it
+    differs from the failing head only by a comment block, a docs file and a PNG. Re-running the named head
+    settled it — **FAIL, FAIL, PASS, PASS, PASS**. A flake can repeat, and a repeated flake plus a plausible
+    mechanism is the most convincing wrong answer this process can produce.
+    **So bracket the bisect at both ends:** (1) establish the **good endpoint** first — run the guard on the
+    pre-batch base and confirm it passes, or the whole bisect is measuring noise against noise; and (2)
+    **re-test the commit the bisect names**, several times, before believing it. Both cost one run each and
+    they are what separates a bisect result from a coincidence. Treat "the mechanism is plausible" as a reason
+    for *more* scepticism, not less — it is what stops you re-testing.
+  - **A bisect that skips environmentally loses resolution silently.** Two steps of the first batch recorded
+    `build FAILED -> skip` purely because podman's DB lock fails spuriously under many concurrent lanes, not
+    because the commit was unbuildable. `git bisect skip` widens the surviving range without saying that the
+    evidence is missing rather than negative. Wrap the build in a retry, and if a step still skips, say so in
+    the report rather than letting the narrowed range imply coverage it does not have.
   - Automate with `git bisect run` over the guard's exit code; every candidate builds standalone because each fix
     is its own merged commit. A batch can hold two independent regressions — bisect finds the earliest, so re-run
     after fixing. Expect to attribute a regression to a lane that has already finished: the orchestrator owns the
