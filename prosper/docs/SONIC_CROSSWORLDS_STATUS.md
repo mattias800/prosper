@@ -40,9 +40,20 @@ The mechanism, measured rather than inferred:
    **-2**.
 4. A negative reader count never drains, so every later `wrlock` on that lock blocks forever.
 
-FreeBSD — the contract the guest was built against — returns `EPERM` for an unmatched unlock and
-leaves the lock untouched, so on real hardware step 3 is harmless. The fix registers the missing
-POSIX spellings and makes an unmatched unlock answer the way the hardware does.
+FreeBSD, the platform the guest was built against, cannot reach that state. Its rule is **not** "the
+caller must hold it": `_pthread_rwlock_unlock` checks the *write* owner in userland and returns
+`EPERM` for a non-owner write release, and everything else defers to `_umtx_op(UMTX_OP_RW_UNLOCK)`,
+which returns `EPERM` only when there is no write owner **and** the reader count is zero. With
+readers present it decrements and succeeds, with no thread-identity check at all — so releasing a
+read hold from a different thread is legal there, and prosper must not refuse it (`sceFiberRun`
+resumes a fiber on whichever host thread calls it, so a fiber that read-locks, yields and resumes
+elsewhere releases from another thread).
+
+The fix therefore registers the missing POSIX spellings and keeps the outstanding-hold accounting
+**with the lock**, reproducing FreeBSD's rule directly. `PROSPER_RWLOCKLOG=1` reports refusals and
+`=2` every rwlock operation (rate-limited per report kind);
+`PROSPER_RWLOCK_UNSAFE_UNLOCK` — set to any value — restores the old forwarding, which is the A/B
+lever that established all of this and must stay off in normal runs.
 
 **The chain is closed by measurement, not by argument.** With only the unlock guard (step 3) in
 place, the title reports **14** unmatched unlocks per boot, from one guest thread across 12 distinct

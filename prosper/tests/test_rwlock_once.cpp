@@ -51,11 +51,11 @@ int main() {
     CHECK(call1(RWtrywr, (uint64_t)(uintptr_t)&h) == 0, "trywrlock succeeds when free");
     call1(RWun, (uint64_t)(uintptr_t)&h);
 
-    // #2012: an UNMATCHED unlock — the calling thread holds neither a read nor a write hold — must
-    // be refused, not forwarded. FreeBSD (the guest's contract) returns EPERM and leaves the lock
-    // untouched; glibc's is undefined and subtracts a reader, driving the count NEGATIVE so the
-    // lock can never be write-acquired again. The lock still working afterwards is the assertion
-    // that matters: without the guard, `trywrlock` below sees a phantom reader and returns EBUSY.
+    // #2012: an UNMATCHED unlock — nothing is held on the lock at all — must be refused, not
+    // forwarded. FreeBSD (the guest's contract) returns EPERM and leaves the lock untouched;
+    // glibc's is undefined and subtracts a reader, driving the count NEGATIVE so the lock can never
+    // be write-acquired again. The lock still working afterwards is the assertion that matters:
+    // without the guard, `trywrlock` below sees a phantom reader and returns EBUSY.
     const uint64_t unmatched = call1(RWun, (uint64_t)(uintptr_t)&h);
     CHECK(unmatched == 0x80020001ull, "unmatched scePthreadRwlockUnlock returns encoded EPERM");
     CHECK(call1(RWtrywr, (uint64_t)(uintptr_t)&h) == 0,
@@ -67,9 +67,54 @@ int main() {
     if (RWunPosix)
         CHECK(call1(RWunPosix, (uint64_t)(uintptr_t)&h) == 1,
               "unmatched pthread_rwlock_unlock returns bare EPERM");
-    // A read hold taken by THIS thread still releases normally afterwards.
-    CHECK(call1(RWrd, (uint64_t)(uintptr_t)&h) == 0, "rdlock ok after the refusals");
+    // A read hold taken by THIS thread still releases normally afterwards. (The rdlock line is
+    // setup — the handler returns 0 unconditionally — the unlock is the assertion: it proves the
+    // acquisition was recorded, because an unrecorded one would be refused with EPERM.)
+    call1(RWrd, (uint64_t)(uintptr_t)&h);
     CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0, "matched unlock still returns success");
+
+    // #2012: the accounting is PER LOCK, not per thread, and that distinction is load-bearing.
+    // FreeBSD's umtx path refuses an unlock only when nothing is held (or when a non-owner tries to
+    // release a WRITE hold) — it makes no thread-identity check for readers, so releasing a read
+    // hold from a different thread is legal there. prosper's own fibers make it reachable:
+    // sceFiberRun resumes a suspended fiber on whichever host thread calls it, so a fiber that
+    // read-locks, yields and is resumed elsewhere releases from another host thread. A per-thread
+    // rule would refuse that and hang the title exactly the way this fix exists to prevent.
+    {
+        std::atomic<bool> locked{false};
+        std::thread reader([&]{ call1(RWrd, (uint64_t)(uintptr_t)&h); locked.store(true); });
+        reader.join();
+        CHECK(locked.load(), "a read hold was taken on another thread");
+        CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0,
+              "a read hold taken on ANOTHER thread releases here (FreeBSD reader rule, not per-thread)");
+        CHECK(call1(RWtrywr, (uint64_t)(uintptr_t)&h) == 0,
+              "the lock is free after the cross-thread release");
+        call1(RWun, (uint64_t)(uintptr_t)&h);
+    }
+    // A WRITE hold is different: FreeBSD checks the owner in userland and refuses a non-owner
+    // release, so the write lock must still be held afterwards.
+    {
+        std::atomic<bool> locked{false}, release{false}, released{false};
+        std::thread writer([&]{
+            call1(RWwr, (uint64_t)(uintptr_t)&h);
+            locked.store(true);
+            while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            call1(RWun, (uint64_t)(uintptr_t)&h);
+            released.store(true);
+        });
+        for (int i = 0; i < 2000 && !locked.load(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(locked.load(), "a write hold was taken on another thread");
+        CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0x80020001ull,
+              "releasing another thread's WRITE hold is refused with encoded EPERM");
+        CHECK(call1(RWtrywr, (uint64_t)(uintptr_t)&h) != 0,
+              "the write hold survived the refused cross-thread release");
+        release.store(true);
+        writer.join();
+        CHECK(released.load(), "the owning thread released its own write hold");
+        CHECK(call1(RWtrywr, (uint64_t)(uintptr_t)&h) == 0, "the lock is free once its owner releases");
+        call1(RWun, (uint64_t)(uintptr_t)&h);
+    }
 
     // #2012: libScePosix exports POSIX spellings of the try/timed acquisitions too. Unregistered,
     // they fell to the dispatcher's default 0 — "the lock is yours" for a lock nobody took — which
@@ -102,8 +147,9 @@ int main() {
         CHECK(call1(RWtryrdP, (uint64_t)(uintptr_t)&h) != 0,
               "pthread_rwlock_tryrdlock FAILS while another thread write-holds");
         // POSIX timed variants take an ABSOLUTE timespec*; a deadline already in the past must time
-        // out rather than acquire. The Sony spellings take a RELATIVE microsecond scalar, so reading
-        // this argument the Sony way would dereference the pointer value as a µs count instead.
+        // out rather than acquire. NOTE how this arm fails if the shape is wrong: under a relative
+        // or Sony scalar-µs reading the deadline lands far in the FUTURE while the helper still
+        // holds the lock, so a wrong implementation produces a ctest TIMEOUT rather than a [FAIL].
         timespec past{};
         clock_gettime(CLOCK_REALTIME, &past);
         past.tv_sec -= 1;
@@ -111,12 +157,27 @@ int main() {
               "pthread_rwlock_timedwrlock with a past absolute deadline reports ETIMEDOUT(60)");
         CHECK(call2(RWtimedrdP, (uint64_t)(uintptr_t)&h, (uint64_t)(uintptr_t)&past) == 60,
               "pthread_rwlock_timedrdlock with a past absolute deadline reports ETIMEDOUT(60)");
-        // The _np variants take a RELATIVE timespec: zero means "do not wait".
-        timespec zero{0, 0};
-        CHECK(call2(RWreltimedwrP, (uint64_t)(uintptr_t)&h, (uint64_t)(uintptr_t)&zero) == 60,
-              "pthread_rwlock_reltimedwrlock_np with a zero relative timeout reports ETIMEDOUT(60)");
-        CHECK(call2(RWreltimedrdP, (uint64_t)(uintptr_t)&h, (uint64_t)(uintptr_t)&zero) == 60,
-              "pthread_rwlock_reltimedrdlock_np with a zero relative timeout reports ETIMEDOUT(60)");
+        // The _np variants take a RELATIVE timespec. A zero timeout would NOT discriminate — {0,0}
+        // is also a past deadline when read as absolute — so use a real 50 ms relative timeout and
+        // assert the WAIT HAPPENED. Read as absolute, {0, 50'000'000} is a 1970 deadline and
+        // returns immediately, so the elapsed-time bound is the only lever that moves.
+        timespec rel50ms{0, 50L * 1000L * 1000L};
+        auto elapsed_ms = [](auto begin) {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - begin).count();
+        };
+        auto t0 = std::chrono::steady_clock::now();
+        const uint64_t relwr = call2(RWreltimedwrP, (uint64_t)(uintptr_t)&h,
+                                     (uint64_t)(uintptr_t)&rel50ms);
+        const auto relwr_ms = elapsed_ms(t0);
+        CHECK(relwr == 60 && relwr_ms >= 40,
+              "pthread_rwlock_reltimedwrlock_np waits its RELATIVE timeout, then ETIMEDOUT(60)");
+        t0 = std::chrono::steady_clock::now();
+        const uint64_t relrd = call2(RWreltimedrdP, (uint64_t)(uintptr_t)&h,
+                                     (uint64_t)(uintptr_t)&rel50ms);
+        const auto relrd_ms = elapsed_ms(t0);
+        CHECK(relrd == 60 && relrd_ms >= 40,
+              "pthread_rwlock_reltimedrdlock_np waits its RELATIVE timeout, then ETIMEDOUT(60)");
         release.store(true);
         holder.join();
         // The lock is free and undamaged once the helper releases it.
