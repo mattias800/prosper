@@ -504,6 +504,24 @@ and the one value that *was* wrong (`USER_DEFINED_PARAM_1`, fixed by #2003) is t
 while writing the wrong bytes through a pointer is still reachable, and that is the residue of this
 candidate.
 
+**The guest thinks it has finished booting — it hides the system splash screen at tick 22.** Sonic
+imports `sceSystemServiceHideSplashScreen` (`Vo5V8KAwCmk`, PLT `eboot+0xc487c0`), which is how a PS5
+title tells the shell to stop compositing the store splash over it and start showing the title's own
+output. A CPU-only arm breaking on the guest PLT reports:
+
+```text
+SPLASH first-hit sceSystemServiceHideSplashScreen at tick=22
+SPLASHRESULT armed=4 ticks=1500 sceSystemServiceHideSplashScreen=1 \
+    sceSystemServiceReceiveEvent=0 sceCommonDialogIsUsed=0 CONTROL_run_loop_frame_pacing=239
+```
+
+Same self-check as the movie arm: `armed=4`, and `CONTROL_…=239` is a guest address the run loop
+reaches every frame, so the two zeros are measurements. The call happens **once, very early**, and is
+never repeated. So the black frame is not a title still sitting in a pre-display boot phase waiting to
+be released — the guest has already declared itself ready to display, and what it then displays is an
+empty scene, forever. That also rules out `sceCommonDialogIsUsed` / `sceSystemServiceReceiveEvent`
+gating: neither is ever called.
+
 **Candidate (b) has a named artifact.** `raw/movie/` holds 83 `.usm`, and all but a few are per-game
 intros/outros or `tutorial_<n>_<m>` — but it also holds **`sonicteam_logo_4k.usm` (6,476,896 bytes)**,
 `PencilTest.usm`, `soniccd_op_4k.usm` and three `sonic_30th_as_*.usm`. A boot logo movie therefore
