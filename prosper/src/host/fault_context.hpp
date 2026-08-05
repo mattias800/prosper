@@ -18,13 +18,16 @@
 #include <atomic>
 #include <cstdint>
 
-#ifndef _WIN32
+#if defined(__linux__)
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE   // glibc gates the REG_* gregs[] indices behind __USE_GNU
 #endif
 #include <signal.h>
 #include <ucontext.h>
 #endif
+// Darwin deliberately gets no <ucontext.h>: that header is `#error`-guarded behind _XOPEN_SOURCE
+// on macOS. posix_shim.hpp's Darwin branch already pulls in <sys/ucontext.h>, which is where
+// ucontext_t/mcontext_t come from there.
 
 #include "posix_shim.hpp"   // PROSPER_GREGS + the REG_* indices (Linux gregs[] / Darwin __ss)
 
@@ -60,19 +63,23 @@ inline FaultContext capture_fault_context(int sig, long tid, const void* fault_a
     return f;
 }
 
-// Who owns the one fatal fault report. A coherent snapshot stops a report from carrying another
-// thread's registers; it does not stop two coherent reports from being written to stderr at the same
-// time and arriving spliced together. So the first faulting thread claims the report and the others
-// say so in one line instead of printing over it.
+// Who owns the fatal fault report *right now*. A coherent snapshot stops a report from carrying
+// another thread's registers; it does not stop two coherent reports from being written to stderr at
+// the same time and arriving spliced together. So the first faulting thread claims the report and a
+// thread that arrives while one is in flight says so in one line instead of printing over it.
 //
-// Never blocks. A signal handler that waited for another *faulting* thread to finish could wait
-// forever — the owner may itself die inside its dump — so a loser reports and leaves rather than
-// queueing. `owner` starts at 0 (no owner) and is never cleared: the process is on its way to
-// `_exit`, and a second claim after the first report is finished would still splice into a log the
-// reader is treating as one crash.
+// This call itself never blocks — it is one compare-exchange. Whether a loser then WAITS for the
+// owner is the caller's decision, and the caller must bound it: the owner may die inside its own
+// dump, and a signal handler that waited unconditionally on another *faulting* thread would hang a
+// run that used to terminate.
 //
-// Returns true when this thread owns the full dump. `already` is set to the owning tid either way,
-// so a losing thread can name who is reporting.
+// Ownership is scoped to one report, not to the process: `release_fault_report` frees it when the
+// dump completes, so a fault arriving LATER — with no concurrency at all — gets its own full
+// report. Holding it for the life of the process would be sound only if a fatal fault always ended
+// the process, and PROSPER_WORKER_PARK exists precisely so that it does not.
+//
+// Returns true when this thread owns the dump. `already` is set to the owning tid either way, so a
+// losing thread can name who is reporting and can watch that value for the release.
 inline bool claim_fault_report(std::atomic<long>& owner, long tid, long* already = nullptr) {
     long expected = 0;
     const bool won = owner.compare_exchange_strong(expected, tid);
@@ -80,6 +87,14 @@ inline bool claim_fault_report(std::atomic<long>& owner, long tid, long* already
     // Re-entering on the same thread (a fault raised inside the dump) is not a competing report:
     // it is the owner, and refusing it there would silently truncate the record.
     return won || expected == tid;
+}
+
+// Release a claim taken by `claim_fault_report`. Compare-exchange rather than a plain store, so a
+// thread that never owned the gate cannot hand it to a third thread in the middle of someone
+// else's report.
+inline void release_fault_report(std::atomic<long>& owner, long tid) {
+    long expected = tid;
+    owner.compare_exchange_strong(expected, 0);
 }
 
 }  // namespace prosper::host

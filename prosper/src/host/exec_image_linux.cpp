@@ -761,14 +761,16 @@ namespace {
             }
         }
     }
-    void dump_fault_mem() {
+    // Takes this fault's own snapshot rather than reading the shared globals (#2018): it runs on the
+    // worker path too, where a second faulting thread can rewrite them mid-dump.
+    void dump_fault_mem(const prosper::host::FaultContext& fc) {
         if (g_dumpat_n) dump_at_addrs();
         if (!g_faultmem) return;
         const struct { const char* n; uint64_t v; } regs[] = {
-            {"rdi", g_rdi}, {"rsi", g_rsi}, {"rdx", g_rdx}, {"rcx", g_rcx},
-            {"rax", g_rax}, {"rbx", g_rbx}, {"rbp", g_rbp}, {"rsp", g_rsp},
-            {"r8 ", g_r8},  {"r9 ", g_r9},  {"r12", g_r12}, {"r13", g_r13},
-            {"r14", g_r14}, {"r15", g_r15},
+            {"rdi", fc.rdi}, {"rsi", fc.rsi}, {"rdx", fc.rdx}, {"rcx", fc.rcx},
+            {"rax", fc.rax}, {"rbx", fc.rbx}, {"rbp", fc.rbp}, {"rsp", fc.rsp},
+            {"r8 ", fc.r8},  {"r9 ", fc.r9},  {"r12", fc.r12}, {"r13", fc.r13},
+            {"r14", fc.r14}, {"r15", fc.r15},
         };
         char b[256];
         int n = snprintf(b, sizeof b, "[prosper] FAULTMEM dump (regs -> guest memory):\n");
@@ -2068,16 +2070,6 @@ namespace {
         g_r10 = (uint64_t)g[REG_R10]; g_r11 = (uint64_t)g[REG_R11];
         g_r12 = (uint64_t)g[REG_R12]; g_r13 = (uint64_t)g[REG_R13];
         g_r14 = (uint64_t)g[REG_R14]; g_r15 = (uint64_t)g[REG_R15];
-        // #2018: the globals above are shared by every thread, and the guest's faults are correlated
-        // (one heap corruption takes several worker threads within milliseconds). A second thread
-        // faulting while the first is printing rewrites all of them underneath it, and the first
-        // report then continues with the second thread's registers while still reading as one
-        // complete fault. Keep the globals — the armed/main-thread recovery path below and
-        // trap_detail()/record_fault() are single-threaded by construction and use them — but give
-        // the FATAL worker-thread report its own stack-local snapshot, which no other thread can
-        // touch. Every value it prints then comes from one fault.
-        const prosper::host::FaultContext fc =
-            prosper::host::capture_fault_context(sig, cur_tid(), si->si_addr, uc);
         g_trap_sig = sig;
         g_trap_kind = (sig == SIGILL) ? 3 : 2;
         // Guest `int $0x41` (opcode CD 41) is RAGE's software breakpoint / assert trap (GTA V,
@@ -2120,7 +2112,14 @@ namespace {
             if (g_base && g_fault_rip == g_base + foff) { g[REG_RAX] = 0; g[REG_RIP] = g_base + roff;
                 guest_fs_restore_scoped(saved_guest_fs); return; }   // resume guest on guest %fs (#1155)
         }
-        dump_fault_mem();   // no-op unless PROSPER_FAULTMEM is set
+        // #2018: this fault's own registers, captured once and used by everything below. Taken HERE
+        // rather than beside the global stores at the top: every path above this point either
+        // returns to the guest (the int-0x41 skip, PROSPER_FAULT_SKIP, the sse4a and read-emulation
+        // paths) or has already returned, and RAGE's debugbreak path in particular is hot. Nothing
+        // above needs a snapshot, so it should not pay for one.
+        const prosper::host::FaultContext fc =
+            prosper::host::capture_fault_context(sig, cur_tid(), si->si_addr, uc);
+        dump_fault_mem(fc);   // no-op unless PROSPER_FAULTMEM is set
         // Dump the HWBP ring on the recoverable (armed/main-thread) crash too — the deser fault is kind=2.
         if (g_hwbp_node_on && !g_hwbp_ring_dumped) { uint64_t sfs = guest_fs_to_host_scoped();
             hwbp_dump_ring("recover"); guest_fs_restore_scoped(sfs); }
@@ -2128,14 +2127,30 @@ namespace {
         // Fault on a thread with no recovery point (a guest worker thread). Report where
         // (async-signal-safe write) then terminate cleanly instead of a cross-thread longjmp.
         {
+            // #2018: the globals above are shared by every thread, and the guest's faults are
+            // correlated (one heap corruption takes several worker threads within milliseconds). A
+            // second thread faulting while the first is printing rewrites all of them underneath
+            // it, and the first report then continues with the second thread's registers while
+            // still reading as one complete fault. Keep the globals — the armed/main-thread
+            // recovery path above and trap_detail()/record_fault() are single-threaded by
+            // construction and use them — but drive this FATAL report from `fc`, the stack-local
+            // snapshot taken above, which no other thread can touch. Every value it prints then
+            // comes from one fault.
+            //
             // #2018: one report at a time. Two worker threads faulting milliseconds apart used to
             // interleave their lines into a single apparent report; with the snapshot above each
             // line is now self-consistent, but two coherent reports written concurrently would still
             // be spliced together on stderr. First arrival owns the full dump; a thread that arrives
             // while one is in flight prints one clearly-labelled line for its own fault, so the
             // second fault is named rather than silently lost.
+            //
+            // Ownership is RELEASED when the dump finishes, not held for the life of the process.
+            // Holding it would be sound only if a fatal fault always ended the process, and under
+            // PROSPER_WORKER_PARK it deliberately does not: faulting threads park and the run
+            // continues, so later faults arrive seconds apart with no concurrency at all and must
+            // get their own full reports rather than a "someone else is reporting" line about a
+            // report that finished long ago.
             static std::atomic<long> dump_owner{0};
-            static std::atomic<int> dump_done{0};
             long expected = 0;
             if (!prosper::host::claim_fault_report(dump_owner, fc.tid, &expected)) {
                 char cb2[224];
@@ -2151,9 +2166,20 @@ namespace {
                 // line and nothing after it). BOUNDED, because the owner may itself die inside its
                 // dump and a signal handler that waited unconditionally on another faulting thread
                 // would hang a run that used to exit 90. `nanosleep` is async-signal-safe.
-                for (int i = 0; i < 400 && !dump_done.load(std::memory_order_acquire); i++) {
+                int waited = 0;
+                for (; waited < 400 &&
+                       dump_owner.load(std::memory_order_acquire) == expected; waited++) {
                     struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 5 * 1000 * 1000;   // 5 ms
                     nanosleep(&ts, nullptr);
+                }
+                // Say so when the bound is what ended the wait. A silent timeout truncates the
+                // owner's report exactly as the pre-fix `_exit` did, and a reader who is not told
+                // cannot tell a complete report from a cut-off one.
+                if (waited >= 400) {
+                    static const char to[] =
+                        "[prosper]   (report may be TRUNCATED: waited 2s for the owning thread's "
+                        "dump and it had not finished)\n";
+                    raw_write(2, to, sizeof to - 1);
                 }
                 if (getenv("PROSPER_WORKER_PARK")) { for (;;) pause(); }
                 _exit(90);
@@ -2182,24 +2208,30 @@ namespace {
             // on the host TCB, so any %fs-relative TLS read returned host garbage (the #1155 fault class,
             // now fixed by restoring guest %fs on signal-handler return-to-guest paths above).
             //
-            // The premise is a HEURISTIC and it is not always met: rax only holds the TCB self-pointer
-            // when the fault lands shortly after that load. When it holds something else — a corrupted
-            // free-list head, a count — the magic check reads an unrelated address and prints
-            // "NO(host-%fs leak?)" for a thread that is perfectly on its guest TCB. So the line now
-            // says when its own premise does not hold rather than asserting a leak (#2018 saw exactly
-            // this: rax = 0x30016000, the corrupt pointer, on a thread with no %fs problem at all).
+            // The rax premise is a HEURISTIC and it is not always met — rax holds the TCB
+            // self-pointer only when the fault lands shortly after that load, and when it holds
+            // something else (a corrupt free-list head, a count) the magic check reads an unrelated
+            // address and asserted `NO(host-%fs leak?)` for a thread with no %fs problem at all
+            // (#2018: rax = 0x30016000). It does not need to guess: `saved_guest_fs` above is the
+            // answer. `guest_fs_to_host_scoped()` read this thread's real %fs base and returned it
+            // only after checking TCB_MAGIC there (guest_tls.cpp:161-171), so non-zero IS "this
+            // thread was on our guest TCB". rax stays on the line as raw evidence, without a claim
+            // attached to it.
+            //
+            // Darwin has no equivalent: `guest_fs_to_host_scoped()` is a `return 0` stub there
+            // (guest_tls.cpp:288), so 0 must not be read as "leaked" on that platform.
             {
                 char nm[16] = {0}; pthread_getname_np(pthread_self(), nm, sizeof nm);   // portable (Linux+macOS)
-                const bool magic_readable = probe_readable(fc.rax + 0x108);
-                const bool on_guest_tcb = magic_readable &&
-                                    *(const uint32_t*)(uintptr_t)(fc.rax + 0x108) == 0x50524F53u;
+#ifdef __APPLE__
+                const char* tcb = "unknown (not determined on this platform)";
+#else
+                const char* tcb = saved_guest_fs ? "yes" : "NO(host-%fs leak?)";
+#endif
                 char tb[224];
-                int t = snprintf(tb, sizeof tb, "[fault] thread='%s' fs(rax)=0x%llx on-guest-TCB=%s\n",
-                                 nm, (unsigned long long)fc.rax,
-                                 on_guest_tcb    ? "yes"
-                                 : magic_readable ? "NO(host-%fs leak?)"
-                                                  : "unknown (rax is not a TCB pointer here — "
-                                                    "no %fs conclusion follows)");
+                int t = snprintf(tb, sizeof tb,
+                                 "[fault] thread='%s' guest-fs=0x%llx rax=0x%llx on-guest-TCB=%s\n",
+                                 nm, (unsigned long long)saved_guest_fs,
+                                 (unsigned long long)fc.rax, tcb);
                 raw_write(2, tb, (size_t)t);
             }
             // PROSPER_FAULTOBJ (#1226): dump the leading 0xC0 bytes of the objects in rax/r15/rbx via a
@@ -2539,9 +2571,10 @@ namespace {
             nullpage_deep_dump(uc, fc.rip);
             // If PROSPER_HWBP_NODE ring-capture is active, the crash node's typetree metadata is the tail.
             if (g_hwbp_node_on) hwbp_dump_ring("worker-fault");
-            // The report is complete: a concurrently-faulting thread waiting above may now end the
-            // process (#2018).
-            dump_done.store(1, std::memory_order_release);
+            // The report is complete (#2018): a concurrently-faulting thread waiting above may now
+            // end the process, and under PROSPER_WORKER_PARK a LATER fault can take the gate and
+            // get a full report of its own.
+            prosper::host::release_fault_report(dump_owner, fc.tid);
         }
         // PROSPER_WORKER_PARK=1 (diagnostic): instead of terminating the whole process on a guest
         // worker-thread fault, park the faulting thread so the main thread can proceed to its own

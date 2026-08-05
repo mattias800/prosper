@@ -18,15 +18,19 @@
 // test cannot reproduce that, and this one does not claim to: it pins the two mechanisms the fix
 // introduces. Section 1-4 assert that a capture reads the ucontext it is handed (a capture reading
 // any shared or stale source lands values that are not this ucontext's and fails) and that the
-// result is a value another capture cannot alter. Section 5 is the one with a real mutation arm:
-// remove the gate — the pre-fix state, where every faulting thread printed — and its second and
-// fourth assertions fail.
+// result is a value another capture cannot alter. Sections 5 and 6 are the ones with real mutation
+// arms: remove the gate — the pre-fix state, where every faulting thread printed — and section 5's
+// second assertion fails; make the gate a non-atomic `if (owner == 0) owner = tid;`, which passes
+// every sequential check, and section 6 fails on a round with two winners.
 //
 // Exit code is truth: 0 = pass.
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
+#include <thread>
 #include <type_traits>
+#include <vector>
 
 #if defined(__linux__) || defined(__APPLE__)
 #include "../src/host/fault_context.hpp"
@@ -154,11 +158,66 @@ int main() {
         if (!prosper::host::claim_fault_report(owner, 4242, &who)) {
             printf("  FAIL the owner was refused re-entry into its own dump\n"); ++failures;
         }
-        // The owner is sticky: a later fault, after the first report has finished, must not open a
-        // second dump into a log the reader is treating as one crash.
-        if (prosper::host::claim_fault_report(owner, 4244, &who)) {
-            printf("  FAIL a late third thread was granted a second dump\n"); ++failures;
+        // A non-owner must not be able to free the gate out from under the owner.
+        prosper::host::release_fault_report(owner, 4243);
+        check_eq("gate: a non-owner cannot release", (uint64_t)owner.load(), 4242u);
+        // And once the owner releases, a LATER fault gets a full report of its own. Under
+        // PROSPER_WORKER_PARK a fatal fault does not end the process, so those arrive seconds apart
+        // with no concurrency; holding ownership for the life of the process would answer them with
+        // "someone else is reporting" about a report that finished long ago.
+        prosper::host::release_fault_report(owner, 4242);
+        check_eq("gate: released", (uint64_t)owner.load(), 0u);
+        if (!prosper::host::claim_fault_report(owner, 4244, &who)) {
+            printf("  FAIL a later fault was refused its own report after the gate was released\n");
+            ++failures;
         }
+        check_eq("gate: later owner", (uint64_t)who, 4244u);
+    }
+
+    // 6. The gate must be ATOMIC, not merely first-come. Section 5 is sequential and would pass for
+    //    a plain `if (owner == 0) owner = tid;`, which is exactly the shape that loses a race. Every
+    //    thread claims the same gate at once; precisely one may win, and the winner's tid must be
+    //    what every loser was told.
+    printf(" report gate under contention\n");
+    {
+        constexpr int kThreads = 16;
+        constexpr int kRounds = 2000;
+        std::atomic<int> total_winners{0};
+        std::atomic<int> bad_reports{0};
+        for (int round = 0; round < kRounds; round++) {
+            std::atomic<long> owner{0};
+            std::atomic<int> winners{0};
+            std::atomic<int> ready{0};
+            std::atomic<bool> go{false};
+            std::vector<std::thread> ts;
+            for (int i = 0; i < kThreads; i++) {
+                ts.emplace_back([&, i] {
+                    ready.fetch_add(1);
+                    while (!go.load(std::memory_order_acquire)) { /* spin to the same instant */ }
+                    long who = -1;
+                    const long tid = 1000 + i;
+                    if (prosper::host::claim_fault_report(owner, tid, &who)) {
+                        winners.fetch_add(1);
+                        if (who != tid) bad_reports.fetch_add(1);   // winner told the wrong owner
+                    } else if (who == 0 || who == tid) {
+                        bad_reports.fetch_add(1);   // loser told "nobody" / "itself" is reporting
+                    }
+                });
+            }
+            while (ready.load() < kThreads) { }
+            go.store(true, std::memory_order_release);
+            for (auto& t : ts) t.join();
+            const int w = winners.load();
+            if (w != 1) {
+                printf("  FAIL round %d had %d winners (must be exactly 1)\n", round, w);
+                ++failures;
+                break;
+            }
+            total_winners.fetch_add(w);
+        }
+        check_eq("contended: one winner per round", (uint64_t)total_winners.load(),
+                 (uint64_t)kRounds);
+        check_eq("contended: every claimant told the true owner", (uint64_t)bad_reports.load(), 0u);
     }
 
     printf(failures ? "FAILED (%d)\n" : "ok\n", failures);
