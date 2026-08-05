@@ -1000,6 +1000,165 @@ int main() {
         fs::remove_all(scratch, ec);
     }
 
+    // App-param declaration (Refs #1873): SKU_FLAG and USER_DEFINED_PARAM_1..4 are properties the
+    // installed application declares about ITSELF in sce_sys/param.json, and Sony asks the SKU half
+    // through TWO libraries. Both must be derived from that one local declaration, and both must
+    // agree. Before this, sceAppContentAppParamGetInt hardcoded SKU_FLAG to FULL and answered every
+    // user-defined param with 0 regardless of what the title declared, while the
+    // sceNpEntitlementAccessGetSkuFlag spelling was registered nowhere and so reported success
+    // without writing the out pointer at all — which is what left GTA V (PPSA04263) reading its own
+    // pre-seeded TRIAL value and offering story mode as a purchase.
+    {
+        namespace fs = std::filesystem;
+        const fs::path scratch = prosper_test::test_scratch_dir() /
+            ("prosper-appparam-" + std::to_string((uintptr_t)&fails));
+        const fs::path app0 = scratch / "app0";
+        std::error_code ec;
+        fs::remove_all(scratch, ec);
+        fs::create_directories(app0 / "sce_sys", ec);
+        auto declare = [&](const char* json) {
+            std::ofstream param(app0 / "sce_sys" / "param.json", std::ios::binary | std::ios::trunc);
+            param << json;
+            param.close();
+            set_app0_root(app0.string());
+        };
+
+        HleFn app_param = Hle::lookup("99b82IKXpH4");   // sceAppContentAppParamGetInt
+        HleFn np_sku = Hle::lookup("lPDO62PpJIA");      // sceNpEntitlementAccessGetSkuFlag
+        CHECK(app_param && np_sku,
+              "AppContent and NpEntitlementAccess SKU queries are both registered");
+        if (app_param && np_sku) {
+            constexpr int32_t kSentinel = (int32_t)0xDEADBEEF;
+            constexpr uint64_t kAppContentParameter = 0x80D90002ull;
+            constexpr uint64_t kAppContentNotFound = 0x80D90005ull;
+            constexpr uint64_t kNpNoEntitlement = 0x817D0007ull;
+            uint64_t rc = 0, np_rc = 0;
+            // Each returns the value actually written, leaving kSentinel when the call wrote nothing.
+            auto app_value = [&](int32_t id) {
+                int32_t out = kSentinel;
+                rc = app_param((uint64_t)(uint32_t)id, (uint64_t)(uintptr_t)&out, 0, 0, 0, 0);
+                return out;
+            };
+            auto np_value = [&]() {
+                int32_t out = kSentinel;
+                np_rc = np_sku((uint64_t)(uintptr_t)&out, 0, 0, 0, 0, 0);
+                return out;
+            };
+
+            // GTA V's own declaration: an upgradable full-game disc that declares
+            // userDefinedParam1 = 9. Bit 3 of that 9 is what tells the title its installed content
+            // needs no online entitlement lookup, so answering 0 here is what gated story mode.
+            declare(R"({"titleId":"PPSA04263","applicationDrmType":"upgradable",)"
+                    R"("userDefinedParam1":9,"userDefinedParam2":0,"contentBadgeType":1})");
+            CHECK(app_value(1) == 9 && rc == 0,
+                  "USER_DEFINED_PARAM_1 reports the value param.json declares, not 0");
+            CHECK(app_value(2) == 0 && rc == 0,
+                  "an explicitly declared USER_DEFINED_PARAM_2 of 0 is reported as 0");
+            CHECK(app_value(3) == 0 && rc == 0,
+                  "an omitted USER_DEFINED_PARAM_3 is a declared zero, not a failure");
+            CHECK(app_value(0) == 3 && rc == 0,
+                  "an upgradable declaration reports the FULL SKU flag through AppContent");
+            CHECK(np_value() == 3 && np_rc == 0,
+                  "an upgradable declaration reports the FULL SKU flag through NpEntitlementAccess");
+            CHECK(app_value(0) == np_value() && rc == 0 && np_rc == 0,
+                  "AppContent and NpEntitlementAccess report the SAME SKU flag");
+
+            // Crisis Core's declaration: standard, and a userDefinedParam2 it uses as a bounded
+            // content-variant index.
+            declare(R"({"titleId":"PPSA07809","applicationDrmType":"standard",)"
+                    R"("userDefinedParam1":1,"userDefinedParam2":1})");
+            CHECK(app_value(0) == 3 && rc == 0 && np_value() == 3 && np_rc == 0,
+                  "a standard declaration reports the FULL SKU flag through both libraries");
+            CHECK(app_value(2) == 1 && rc == 0,
+                  "USER_DEFINED_PARAM_2 reports its declared content-variant index");
+
+            // MUTATION ARM. A declaration prosper has no evidence for must NOT be rounded up to
+            // FULL: an online-only/free SKU of a title whose full SKU is in the corpus has to keep
+            // its purchase gate. Both libraries fail and neither writes the out slot, which is the
+            // path every calling title already handles by falling back to its own default. This is
+            // the check that distinguishes a derivation from a hardcoded FULL.
+            declare(R"({"titleId":"PPSA04263","applicationDrmType":"onlineonly",)"
+                    R"("userDefinedParam1":9})");
+            CHECK(app_value(0) == kSentinel && rc == kAppContentNotFound,
+                  "an unrecognised applicationDrmType fails the AppContent SKU query "
+                  "instead of reporting a SKU");
+            CHECK(np_value() == kSentinel && np_rc == kNpNoEntitlement,
+                  "an unrecognised applicationDrmType fails the NpEntitlementAccess SKU query "
+                  "instead of reporting a SKU");
+            CHECK(app_value(1) == 9 && rc == 0,
+                  "an unknown SKU still reports the user-defined params the title declares");
+
+            // A title that declares no DRM type at all has no SKU to report, but its user-defined
+            // params are still declared.
+            declare(R"({"titleId":"PPSA00001","userDefinedParam4":7})");
+            CHECK(app_value(0) == kSentinel && rc == kAppContentNotFound &&
+                      np_value() == kSentinel && np_rc == kNpNoEntitlement,
+                  "an absent applicationDrmType fails both SKU queries rather than assuming FULL");
+            CHECK(app_value(4) == 7 && rc == 0,
+                  "USER_DEFINED_PARAM_4 is reported without any DRM-type declaration");
+
+            // A value that is legal JSON but not an int32 param invalidates the whole document
+            // rather than being truncated into a believable number.
+            declare(R"({"titleId":"PPSA00001","applicationDrmType":"standard","userDefinedParam1":1.5})");
+            CHECK(app_value(1) == kSentinel && rc == kAppContentNotFound &&
+                      app_value(0) == kSentinel && rc == kAppContentNotFound,
+                  "a non-integer userDefinedParam invalidates the declaration instead of truncating");
+            declare(R"({"titleId":"PPSA00001","applicationDrmType":"standard",)"
+                    R"("userDefinedParam1":1,"userDefinedParam1":2})");
+            CHECK(app_value(1) == kSentinel && rc == kAppContentNotFound,
+                  "a duplicated userDefinedParam invalidates the declaration");
+            declare(R"({"titleId":"PPSA00001","applicationDrmType":"standard",)"
+                    R"("applicationDrmType":"upgradable"})");
+            CHECK(app_value(0) == kSentinel && rc == kAppContentNotFound,
+                  "a duplicated applicationDrmType invalidates the declaration");
+
+            // int32 boundaries. A userDefinedParam is a signed 32-bit value: both extremes must survive
+            // the round trip exactly, and one past either extreme must invalidate rather than wrap into
+            // a believable number.
+            declare(R"({"titleId":"PPSA00001","userDefinedParam1":2147483647,)"
+                    R"("userDefinedParam2":-2147483648,"userDefinedParam3":-1})");
+            CHECK(app_value(1) == 2147483647 && rc == 0,
+                  "USER_DEFINED_PARAM_1 round-trips INT32_MAX exactly");
+            CHECK(app_value(2) == (-2147483647 - 1) && rc == 0,
+                  "USER_DEFINED_PARAM_2 round-trips INT32_MIN exactly");
+            CHECK(app_value(3) == -1 && rc == 0,
+                  "a negative USER_DEFINED_PARAM_3 is reported as declared");
+            declare(R"({"titleId":"PPSA00001","userDefinedParam1":2147483648})");
+            CHECK(app_value(1) == kSentinel && rc == kAppContentNotFound,
+                  "a userDefinedParam one past INT32_MAX invalidates instead of wrapping");
+            declare(R"({"titleId":"PPSA00001","userDefinedParam1":-2147483649})");
+            CHECK(app_value(1) == kSentinel && rc == kAppContentNotFound,
+                  "a userDefinedParam one past INT32_MIN invalidates instead of wrapping");
+            declare(R"({"titleId":"PPSA00001","userDefinedParam1":01})");
+            CHECK(app_value(1) == kSentinel && rc == kAppContentNotFound,
+                  "a leading-zero userDefinedParam invalidates the declaration");
+            declare(R"({"nested":{"applicationDrmType":"standard"}})");
+            CHECK(np_value() == kSentinel && np_rc == kNpNoEntitlement,
+                  "a nested applicationDrmType does not stand in for the top-level declaration");
+
+            // No parseable declaration at all: there is nothing local to derive from, and neither
+            // library may invent one.
+            fs::remove(app0 / "sce_sys" / "param.json", ec);
+            set_app0_root(app0.string());
+            CHECK(app_value(0) == kSentinel && rc == kAppContentNotFound &&
+                      app_value(1) == kSentinel && rc == kAppContentNotFound,
+                  "no param.json fails every AppContent app-param query");
+            CHECK(np_value() == kSentinel && np_rc == kNpNoEntitlement,
+                  "no param.json fails the NpEntitlementAccess SKU query");
+
+            // Argument validation.
+            declare(R"({"titleId":"PPSA04263","applicationDrmType":"upgradable"})");
+            CHECK(app_value(5) == kSentinel && rc == kAppContentParameter,
+                  "an out-of-range AppContent paramId is rejected");
+            CHECK(app_param(0, 0, 0, 0, 0, 0) == kAppContentParameter,
+                  "AppContentAppParamGetInt rejects a null output pointer");
+            CHECK(np_sku(0, 0, 0, 0, 0, 0) == 0x817D0002ull,
+                  "GetSkuFlag rejects a null output pointer");
+        }
+        fs::remove_all(scratch, ec);
+        set_app0_root(std::string());
+    }
+
     // SystemService / AppContent / NP getters: each must WRITE its out-param with the CORRECT value —
     // returning success with an unfilled (or wrong-valued) out is the harmful-stub class whose downstream
     // effects are hard to trace (a 0.0 safe-area ratio collapses the viewport; lang 0 localizes to

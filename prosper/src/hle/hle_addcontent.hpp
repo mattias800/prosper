@@ -4,11 +4,47 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace prosper {
+
+// The SKU flag of the running application, as the published AppContent contract enumerates it. There
+// is deliberately no "unknown" enumerator: an application whose local declaration prosper cannot
+// recognise has no SKU to report, which is an absent std::optional, not a third value a guest could
+// mistake for data.
+//
+// Guest code in the project's local test dumps pins both values independently of any header: Crisis
+// Core (PPSA07809) holds a predicate that is true only when sceNpEntitlementAccessGetSkuFlag yields
+// exactly 3, Little Nightmares II (PPSA02154) holds one that is true only when it yields 1, and both
+// GTA V (PPSA04263) and Little Nightmares III (PPSA05143) route a 1 into their restricted-SKU branch.
+enum class AppSkuFlag : int32_t {
+    Trial = 1,   // SCE_APP_CONTENT_APPPARAM_SKU_FLAG_TRIAL
+    Full  = 3,   // SCE_APP_CONTENT_APPPARAM_SKU_FLAG_FULL
+};
+
+// What the installed application declares about ITSELF in sce_sys/param.json. Sony asks the same SKU
+// question through two libraries — sceAppContentAppParamGetInt(SKU_FLAG) and
+// sceNpEntitlementAccessGetSkuFlag — so both read this one derivation and cannot disagree.
+struct AppParamDeclaration {
+    // sce_sys/param.json was present and parsed. False means there is no local declaration to answer
+    // from at all, and every app-param query must fail rather than invent one.
+    bool declared = false;
+    // Absent when param.json declares no applicationDrmType, or declares one prosper has no evidence
+    // for. Either way the SKU is unknown and the queries fail visibly instead of reporting a value.
+    std::optional<AppSkuFlag> sku_flag;
+    // Exactly as declared, for diagnostics; empty when the key is absent.
+    std::string declared_drm_type;
+    // USER_DEFINED_PARAM_1..4. param.json omits a userDefinedParamN the publishing tool left at its
+    // default, so an absent key is a declared zero rather than missing information.
+    int32_t user_param[4]{};
+};
+
+// Published by addcontent_configure_for_app0 from the same single param.json parse the add-content
+// inventory uses. Safe to call from any guest thread.
+AppParamDeclaration app_param_declaration();
 
 enum class AddcontentInventoryState {
     None,       // no dlc_emu.ini: this title has no locally declared add-content

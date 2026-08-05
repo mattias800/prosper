@@ -20,8 +20,9 @@ constexpr size_t kMaxManifestBytes = 32 * 1024; // dlc_emu producer limit
 constexpr size_t kMaxParamBytes = 2 * 1024 * 1024;
 constexpr size_t kMaxEntries = 1024;             // dlc_emu producer limit
 
-std::mutex g_inventory_mutex;
+std::mutex g_inventory_mutex;              // also guards g_app_params
 AddcontentInventorySnapshot g_inventory;
+AppParamDeclaration g_app_params;
 
 enum class BoundedFileState {
     Missing,
@@ -116,44 +117,105 @@ BoundedFile read_bounded_file(const std::filesystem::path& root,
     return result;
 }
 
-// Small bounded JSON reader for one authorization-bearing metadata field. It validates the document
-// and accepts exactly one top-level string named titleId; a textual occurrence in a nested
-// object or string must never authorize a foreign dlc_emu.ini record. Escapes in the title value are
-// rejected so its identity has one byte representation. Nesting is capped to avoid hostile recursion.
+// The declaration-bearing fields of sce_sys/param.json, all of them read from ONE parse. A second
+// parse of the same file is a second chance to disagree with the first.
+struct ParamJsonDocument {
+    bool valid = false;                        // the whole document parsed
+    std::optional<std::string> title_id;
+    std::optional<std::string> drm_type;
+    std::optional<int32_t> user_param[4];
+};
+
+// Small bounded JSON reader for the authorization- and declaration-bearing metadata fields. It
+// validates the document and accepts each recognized key at most once at the TOP LEVEL only; a
+// textual occurrence in a nested object or string must never authorize a foreign dlc_emu.ini record
+// nor stand in for the application's own declaration. Escapes in the string values are rejected so
+// each identity has one byte representation. Nesting is capped to avoid hostile recursion.
 class ParamJsonReader {
 public:
     explicit ParamJsonReader(std::string_view input) : input_(input) {}
 
-    std::optional<std::string> top_level_title_id() {
-        skip_space();
-        if (!take('{')) return std::nullopt;
-        skip_space();
-        if (take('}')) return finish() ? title_id_ : std::nullopt;
-        for (;;) {
-            std::string key;
-            if (!parse_string(&key)) return std::nullopt;
-            skip_space();
-            if (!take(':')) return std::nullopt;
-            skip_space();
-            if (key == "titleId") {
-                if (saw_title_id_) return std::nullopt;
-                saw_title_id_ = true;
-                bool value_escaped = false;
-                std::string value;
-                if (!parse_string(&value, &value_escaped) || value_escaped) return std::nullopt;
-                title_id_ = std::move(value);
-            } else if (!skip_value(1)) {
-                return std::nullopt;
-            }
-            skip_space();
-            if (take('}')) break;
-            if (!take(',')) return std::nullopt;
-            skip_space();
-        }
-        return finish() && saw_title_id_ ? title_id_ : std::nullopt;
+    // A malformed document yields `valid == false` and no fields at all: a file prosper cannot parse
+    // is not a file it may quote selected values out of.
+    ParamJsonDocument read() {
+        if (!parse_object()) return ParamJsonDocument{};
+        doc_.valid = true;
+        return doc_;
     }
 
 private:
+    // Index of userDefinedParam1..4, or -1 for any other key.
+    static int user_param_index(std::string_view key) {
+        constexpr std::string_view kPrefix = "userDefinedParam";
+        if (key.size() != kPrefix.size() + 1 || key.substr(0, kPrefix.size()) != kPrefix) return -1;
+        const char digit = key.back();
+        if (digit < '1' || digit > '4') return -1;
+        return digit - '1';
+    }
+
+    bool parse_object() {
+        skip_space();
+        if (!take('{')) return false;
+        skip_space();
+        if (take('}')) return finish();
+        for (;;) {
+            std::string key;
+            if (!parse_string(&key)) return false;
+            skip_space();
+            if (!take(':')) return false;
+            skip_space();
+            if (key == "titleId") {
+                if (doc_.title_id) return false;
+                bool value_escaped = false;
+                std::string value;
+                if (!parse_string(&value, &value_escaped) || value_escaped) return false;
+                doc_.title_id = std::move(value);
+            } else if (key == "applicationDrmType") {
+                if (doc_.drm_type) return false;
+                bool value_escaped = false;
+                std::string value;
+                if (!parse_string(&value, &value_escaped) || value_escaped) return false;
+                doc_.drm_type = std::move(value);
+            } else if (const int index = user_param_index(key); index >= 0) {
+                if (doc_.user_param[index]) return false;
+                int32_t value = 0;
+                if (!parse_int32(&value)) return false;
+                doc_.user_param[index] = value;
+            } else if (!skip_value(1)) {
+                return false;
+            }
+            skip_space();
+            if (take('}')) break;
+            if (!take(',')) return false;
+            skip_space();
+        }
+        return finish();
+    }
+
+    // A USER_DEFINED_PARAM is a signed 32-bit integer. A fraction or exponent is legal JSON but is
+    // not one of these, so it is rejected rather than truncated into a believable value; so is any
+    // magnitude outside int32_t, which cannot be reported through the guest ABI at all.
+    bool parse_int32(int32_t* out) {
+        const bool negative = take('-');
+        if (pos_ == input_.size() || !ascii_digit(input_[pos_])) return false;
+        if (input_[pos_] == '0' && pos_ + 1 < input_.size() && ascii_digit(input_[pos_ + 1]))
+            return false;                                  // JSON forbids a leading zero
+        int64_t value = 0;
+        while (pos_ < input_.size() && ascii_digit(input_[pos_])) {
+            value = value * 10 + (input_[pos_++] - '0');
+            if (value > 0x80000000ll) return false;         // bounded before it can overflow
+        }
+        if (pos_ < input_.size() &&
+            (input_[pos_] == '.' || input_[pos_] == 'e' || input_[pos_] == 'E')) return false;
+        if (negative) {
+            *out = static_cast<int32_t>(-value);            // -2147483648 is representable
+            return true;
+        }
+        if (value > 0x7fffffffll) return false;
+        *out = static_cast<int32_t>(value);
+        return true;
+    }
+
     static bool hex_digit(char ch) {
         return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
                (ch >= 'A' && ch <= 'F');
@@ -287,9 +349,29 @@ private:
 
     std::string_view input_;
     size_t pos_ = 0;
-    bool saw_title_id_ = false;
-    std::optional<std::string> title_id_;
+    ParamJsonDocument doc_;
 };
+
+// Derive the application's SKU flag from its own applicationDrmType declaration.
+//
+// applicationDrmType names the DRM/entitlement class the application was published under. Two values
+// occur across the project's local test dumps, and guest code pins both of them to the FULL SKU:
+//   "standard"   — Crisis Core (PPSA07809) declares it and holds a predicate that is true only when
+//                  sceNpEntitlementAccessGetSkuFlag returns FULL.
+//   "upgradable" — GTA V (PPSA04263) declares it (a full-game disc carrying a PS4 cross-generation
+//                  upgrade path) and routes a TRIAL answer into its purchase-gated branch.
+// Every other spelling is left UNKNOWN on purpose. No dump available to this project declares a
+// trial, demo, or free SKU, so there is nothing to calibrate those spellings against, and inventing
+// one would either under-report a full application or over-report a limited one. The second of those
+// is the failure this project must never commit, so an unrecognised declaration fails the query
+// loudly instead of being rounded up to FULL. A free/online-only SKU of a title whose full SKU is in
+// the corpus therefore keeps its purchase gate, which is the correct answer for that dump.
+// CONFIDENCE: HIGH that these two declarations are full SKUs; the limited-SKU spellings are
+// deliberately unmapped until a dump declaring one exists to derive them from.
+std::optional<AppSkuFlag> derive_sku_flag(std::string_view drm_type) {
+    if (drm_type == "standard" || drm_type == "upgradable") return AppSkuFlag::Full;
+    return std::nullopt;
+}
 
 bool parse_hex_key(std::string_view text, std::array<uint8_t, 16>& out) {
     if (text.size() != out.size() * 2) return false;
@@ -505,12 +587,49 @@ ParseResult parse_inventory(const std::filesystem::path& root, std::string_view 
 
 void addcontent_configure_for_app0(const std::string& app0_root) {
     AddcontentInventorySnapshot next;
+    AppParamDeclaration params;
     if (app0_root.empty()) {
         std::lock_guard<std::mutex> lock(g_inventory_mutex);
         g_inventory = std::move(next);
+        g_app_params = std::move(params);
         return;
     }
     const std::filesystem::path root(app0_root);
+    // ONE param.json parse serves both readers: the add-content manifest's title authorization and
+    // the application's own SKU / user-defined-param declaration. Two parses could disagree about
+    // what the same file says; one cannot. It is read unconditionally — the app-param declaration
+    // exists whether or not this title also declares add-content.
+    const BoundedFile param = read_bounded_file(root, std::filesystem::path("sce_sys") /
+                                               "param.json", kMaxParamBytes);
+    const ParamJsonDocument doc = param.state == BoundedFileState::Ready
+        ? ParamJsonReader(param.data).read() : ParamJsonDocument{};
+    if (doc.valid) {
+        params.declared = true;
+        if (doc.drm_type) {
+            params.declared_drm_type = *doc.drm_type;
+            params.sku_flag = derive_sku_flag(params.declared_drm_type);
+            if (!params.sku_flag)
+                std::fprintf(stderr,
+                             "[appparam] unrecognised applicationDrmType \"%s\": the application's "
+                             "SKU flag stays unknown and every SKU query fails visibly\n",
+                             params.declared_drm_type.c_str());
+        }
+        for (size_t i = 0; i < 4; ++i)
+            if (doc.user_param[i]) params.user_param[i] = *doc.user_param[i];
+    } else {
+        // No local declaration at all, so from here every sceAppContentAppParamGetInt returns
+        // NOT_FOUND and every GetSkuFlag returns NO_ENTITLEMENT. That is the honest answer, but it
+        // silently converts calls that always succeeded into calls that always fail, and it IS
+        // reachable for a real user: a dump is accepted on eboot.bin alone, so an eboot-only tree
+        // boots and loses every app-param answer with no other symptom. Name the case rather than
+        // leaving the next reader to bisect it.
+        std::fprintf(stderr,
+                     "[appparam] no usable sce_sys/param.json (%s): the application declares no SKU "
+                     "and no user-defined params, and every app-param query fails visibly\n",
+                     param.state == BoundedFileState::Missing ? "absent"
+                                                             : "unreadable, oversized or malformed");
+    }
+
     const BoundedFile manifest = read_bounded_file(root, "dlc_emu.ini", kMaxManifestBytes);
     if (manifest.state == BoundedFileState::Missing) {
         next.state = AddcontentInventoryState::None;
@@ -518,10 +637,7 @@ void addcontent_configure_for_app0(const std::string& app0_root) {
         next.state = AddcontentInventoryState::Invalid;
         std::fprintf(stderr, "[addcontent] invalid install manifest: unreadable or oversized\n");
     } else {
-        const BoundedFile param = read_bounded_file(root, std::filesystem::path("sce_sys") /
-                                                   "param.json", kMaxParamBytes);
-        const std::optional<std::string> title_id = param.state == BoundedFileState::Ready
-            ? ParamJsonReader(param.data).top_level_title_id() : std::nullopt;
+        const std::optional<std::string> title_id = doc.valid ? doc.title_id : std::nullopt;
         if (!title_id || !valid_title_id(*title_id)) {
             next.state = AddcontentInventoryState::Invalid;
             std::fprintf(stderr,
@@ -536,6 +652,12 @@ void addcontent_configure_for_app0(const std::string& app0_root) {
     }
     std::lock_guard<std::mutex> lock(g_inventory_mutex);
     g_inventory = std::move(next);
+    g_app_params = std::move(params);
+}
+
+AppParamDeclaration app_param_declaration() {
+    std::lock_guard<std::mutex> lock(g_inventory_mutex);
+    return g_app_params;
 }
 
 AddcontentInventorySnapshot addcontent_inventory_snapshot() {
