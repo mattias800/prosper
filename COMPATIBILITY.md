@@ -225,9 +225,9 @@ yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues
 
 ## R-Type Delta: HD Boosted — `PPSA26414`
 
-<p align="center"><img src="assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.png" alt="R-Type Delta — Clear River Games logo and the opening movie"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-opening-movie-colour.png" alt="R-Type Delta — the opening movie's R-9 hangar shot in full colour"></p>
 
-The Clear River Games publisher logo and the full opening movie — the R-9 fighter in its hangar — render live at 1920×1080 from the real GPU command stream. Colours are wrong: greys render green and the image carries a magenta cast ([#2005](https://github.com/mattias800/prosper/issues/2005)). After the movie every frame collapses to a single colour while the frame loop keeps advancing ([#2006](https://github.com/mattias800/prosper/issues/2006)), so the title screen is not reached.
+The Clear River Games publisher logo and the full opening movie — the R-9 fighter in its hangar — render live at 1920×1080 from the real GPU command stream, in full colour. After the movie every frame collapses to a single colour while the frame loop keeps advancing ([#2006](https://github.com/mattias800/prosper/issues/2006)), so the title screen is not reached.
 
 Reaching this needs the game's files **evicted from the host page cache** first, which takes one command and no change to how the title is launched:
 

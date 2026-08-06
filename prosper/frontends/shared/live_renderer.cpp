@@ -26,6 +26,7 @@
 #include "present_blit.hpp"             // GPU scanout handoff (#1270 unified-device present)
 #include "present_blit_policy.hpp"      // flip-anchored scanout publication policy
 #include "present_extent.hpp"           // the publish extent contract with the caller (#1986)
+#include "avplayer_plane_policy.hpp"    // which sampled resource is AvPlayer's NV12 chroma plane
 #include "gpu/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/guest_write_watch.hpp"
 #include "render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
@@ -43,6 +44,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
 #include <unordered_map>
 
 #ifdef _WIN32
@@ -427,6 +429,54 @@ struct TextureDecodeKeyHash {
         return hash;
     }
 };
+
+// ---- AvPlayer NV12 chroma-plane recognition diagnostic (#2005) --------------------------------
+//
+// The classification itself lives in avplayer_plane_policy.hpp (with its own unit test); this is
+// only its live log. PROSPER_AVPCHROMA_LOG=1 emits one line per distinct narrow Unorm8 sampled
+// texture — both NV12 planes qualify, whatever DIM they declare — naming every field the predicate
+// reads and the clause that decided it. Off by default. A wrong verdict here is silent: a chroma
+// plane sent down the coverage broadcast still produces correct luma, detail and geometry, so no
+// draw census, colour count or non-black metric can see it.
+using prosper::frontend::AvpChromaReason;
+using prosper::frontend::AvpChromaVerdict;
+using prosper::frontend::avp_chroma_reason_name;
+using prosper::frontend::classify_avplayer_chroma_plane;
+
+bool avp_chroma_log() {
+    static const bool enabled = getenv("PROSPER_AVPCHROMA_LOG") != nullptr;
+    return enabled;
+}
+
+void log_avp_chroma_candidate(const prosper::gpu::ShaderResource& r,
+                              uint32_t tw, uint32_t th, const AvpChromaVerdict& v) {
+    static std::mutex mx;
+    static std::set<uint64_t> seen;
+    {
+        std::lock_guard<std::mutex> lock(mx);
+        const uint64_t identity = r.gpu_addr ^ (static_cast<uint64_t>(tw) << 12) ^
+                                  (static_cast<uint64_t>(th) << 34) ^
+                                  (static_cast<uint64_t>(r.num_components) << 56);
+        if (!seen.insert(identity).second) return;
+    }
+    // A one-component plane is a luma candidate, never a chroma one: report it as context rather
+    // than as a rejected chroma plane, so the pair can be read off one log without confusion.
+    const char* verdict = r.num_components == 1u ? "luma-plane-candidate "
+                        : v.match               ? "CHROMA "
+                                                : "coverage-broadcast ";
+    fprintf(stderr,
+            "[avpchroma] addr=%llx %ux%u fmt=%u ncomp=%u tile=%u dim=%u depth=%u "
+            "lstride=%u lmipoff=%u miptail=%u size=%u swz=%u,%u,%u,%u "
+            "row_bytes=%u pitch_field=%u registered=%u resolved=%u luma=%llx -> %s%s\n",
+            (unsigned long long)r.gpu_addr, tw, th, static_cast<unsigned>(r.format),
+            r.num_components, r.tile_mode, r.img_dim, r.depth,
+            r.layer_stride_bytes, r.layer_mip_offset_bytes, r.in_mip_tail ? 1u : 0u, r.size,
+            r.swizzle[0], r.swizzle[1], r.swizzle[2], r.swizzle[3],
+            v.row_bytes, r.linear_row_pitch_bytes, v.registered_pitch, v.resolved_pitch,
+            (unsigned long long)v.sibling_luma_addr,
+            verdict, avp_chroma_reason_name(v.reason));
+    fflush(stderr);
+}
 
 struct DecodedTexture {
     const uint8_t* pixels = nullptr;
@@ -1616,62 +1666,85 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     };
                     if (r.cls == RC::Texture || r.cls == RC::StorageImage) {
                         uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
-                        // AvPlayer exposes NV12 as an R8 luma plane followed by an RG8 UV plane. The
-                        // visible row can be narrower than its physical pitch. Live HLE resources carry
-                        // exact allocation provenance; title-staged/captured copies retain the same
-                        // contract in their descriptors: matching pitches, 2:1 extents, and adjacent
-                        // allocations (the second allocation may begin at the next 64 KiB boundary).
-                        // Keep this deliberately narrower than all RG8 resources; several established
-                        // game paths still rely on the historical narrow-texture coverage broadcast.
-                        const bool avplayer_chroma_layout = [&] {
-                            if (r.cls != RC::Texture || r.format != prosper::gpu::DataFormat::Unorm8 ||
-                                r.num_components != 2 || r.img_dim != 1u || r.tile_mode != 0u ||
-                                r.compression_enabled || tw > UINT32_MAX / 2u)
-                                return false;
-                            const bool rg01_swizzle =
-                                r.swizzle[0] == 4 && r.swizzle[1] == 5 &&
-                                r.swizzle[2] == 0 && r.swizzle[3] == 1;
-                            const bool xxxy_swizzle =
-                                r.swizzle[0] == 4 && r.swizzle[1] == 4 &&
-                                r.swizzle[2] == 4 && r.swizzle[3] == 5;
-                            if (!rg01_swizzle && !xxxy_swizzle) return false;
-                            const uint32_t row_bytes = tw * 2u;
-                            const uint32_t registered_pitch =
-                                prosper::gpu::guest_linear_texture_row_pitch(
-                                    r.gpu_addr, row_bytes);
-                            if (registered_pitch >= row_bytes)
-                                return true;
-                            const uint32_t chroma_pitch = r.linear_row_pitch_bytes
-                                ? r.linear_row_pitch_bytes
-                                : static_cast<uint32_t>(
-                                      prosper::gpu::linear_sampled_row_pitch(tw, 2u));
-                            if (chroma_pitch < row_bytes) return false;
-                            for (const auto& luma : t->resources) {
-                                if (luma.cls != RC::Texture ||
-                                    luma.format != prosper::gpu::DataFormat::Unorm8 ||
-                                    luma.num_components != 1 || luma.img_dim != 1u ||
-                                    luma.tile_mode != 0u || luma.compression_enabled ||
-                                    luma.width != row_bytes ||
-                                    (static_cast<uint64_t>(luma.height) + 1u) / 2u != th)
-                                    continue;
-                                const uint32_t luma_pitch = luma.linear_row_pitch_bytes
-                                    ? luma.linear_row_pitch_bytes
-                                    : static_cast<uint32_t>(
-                                          prosper::gpu::linear_sampled_row_pitch(
-                                              luma.width, 1u));
-                                if (luma_pitch != chroma_pitch) continue;
-                                const uint64_t luma_bytes =
-                                    static_cast<uint64_t>(luma_pitch) * luma.height;
-                                if (luma.gpu_addr > UINT64_MAX - luma_bytes) continue;
-                                const uint64_t luma_end = luma.gpu_addr + luma_bytes;
-                                if (luma_end == r.gpu_addr)
-                                    return true;
-                                if (luma_end <= UINT64_MAX - 0xffffu &&
-                                    ((luma_end + 0xffffu) & ~uint64_t{0xffffu}) == r.gpu_addr)
-                                    return true;
+                        // AvPlayer exposes NV12 as an R8 luma plane followed by an RG8 UV plane.
+                        // Which resource IS that chroma plane — and why a candidate was rejected —
+                        // is decided by avplayer_plane_policy.hpp, which carries the reasoning and
+                        // has its own unit test. A false verdict here is silent: the plane falls
+                        // into the legacy narrow coverage broadcast, the shader's V becomes its U,
+                        // and the movie keeps correct luma, detail and geometry while every colour
+                        // collapses onto one green<->magenta axis. (#2005)
+                        const AvpChromaVerdict avplayer_chroma_verdict =
+                            classify_avplayer_chroma_plane(r, tw, th, t->resources);
+                        const bool avplayer_chroma_layout = avplayer_chroma_verdict.match;
+                        // Deliberately NOT filtered by img_dim: a plane the classifier rejects on
+                        // exactly that field has to appear in this log, or the log cannot report
+                        // the rejection that matters most.
+                        if (avp_chroma_log() && r.cls == RC::Texture &&
+                            r.format == prosper::gpu::DataFormat::Unorm8 && r.num_components <= 2)
+                            log_avp_chroma_candidate(r, tw, th, avplayer_chroma_verdict);
+                        // PROSPER_AVPCHROMA_DUMP=<dir> — write each candidate plane's exact guest
+                        // source bytes once, at the resolved row pitch. Converting the two dumped
+                        // planes on the CPU separates a decode/staging defect (planes wrong) from a
+                        // sampling/recognition defect (planes right, picture wrong), which is the
+                        // only way to tell a chroma cast's two very different causes apart.
+                        if (const char* avp_dump_dir = getenv("PROSPER_AVPCHROMA_DUMP")) {
+                            if (r.cls == RC::Texture &&
+                                r.format == prosper::gpu::DataFormat::Unorm8 &&
+                                r.num_components >= 1 && r.num_components <= 2 &&
+                                (r.img_dim == 1u || r.img_dim == 5u) &&
+                                r.tile_mode == 0u && tw && th) {
+                                static std::mutex dump_mx;
+                                static std::map<uint64_t, uint64_t> sightings;
+                                static uint64_t dump_count = 0;
+                                // PROSPER_AVPCHROMA_DUMP_EVERY samples one in N sightings of each
+                                // plane allocation (default: only the first). A movie opens on a
+                                // fade from black, so the first sighting is a useless all-dark
+                                // plane; sampling a series lands somewhere mid-shot without having
+                                // to guess a frame index. Capped so a long run cannot fill a disk.
+                                const char* every_env = getenv("PROSPER_AVPCHROMA_DUMP_EVERY");
+                                const uint64_t every = every_env
+                                    ? std::max<uint64_t>(1, strtoull(every_env, nullptr, 0)) : 0;
+                                uint64_t sighting = 0;
+                                bool first = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(dump_mx);
+                                    sighting = ++sightings[r.gpu_addr ^
+                                                           (uint64_t{r.num_components} << 56)];
+                                    first = every ? (sighting % every == 0 && dump_count < 40)
+                                                  : sighting == 1;
+                                    if (first) ++dump_count;
+                                }
+                                if (first) {
+                                    const uint32_t bpt = r.num_components;
+                                    const uint32_t tight = tw * bpt;
+                                    uint32_t pitch = r.linear_row_pitch_bytes;
+                                    if (!pitch)
+                                        pitch = prosper::gpu::guest_linear_texture_row_pitch(
+                                            r.gpu_addr, tight);
+                                    if (!pitch)
+                                        pitch = static_cast<uint32_t>(
+                                            prosper::gpu::linear_sampled_row_pitch(tw, bpt));
+                                    std::vector<uint8_t> plane(
+                                        static_cast<size_t>(pitch) * th, 0);
+                                    const size_t got = copy_resource(plane.data(), r.gpu_addr,
+                                                                     plane.size());
+                                    char name[512];
+                                    snprintf(name, sizeof name,
+                                             "%s/avpplane_%ux%u_c%u_p%u_%llx_s%06llu.bin",
+                                             avp_dump_dir, tw, th, bpt, pitch,
+                                             (unsigned long long)r.gpu_addr,
+                                             (unsigned long long)sighting);
+                                    if (FILE* f = fopen(name, "wb")) {
+                                        fwrite(plane.data(), 1, plane.size(), f);
+                                        fclose(f);
+                                        fprintf(stderr,
+                                                "[avpchroma] dumped %zu/%zu bytes -> %s\n",
+                                                got, plane.size(), name);
+                                        fflush(stderr);
+                                    }
+                                }
                             }
-                            return false;
-                        }();
+                        }
                         const uint64_t sampled_source_addr = texture_decode_source_address(
                             r.gpu_addr, r.img_dim, r.in_mip_tail,
                             r.layer_mip_offset_bytes);

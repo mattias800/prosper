@@ -1,12 +1,16 @@
 # R-Type Delta: HD Boosted status
 
 `PPSA26414` is **rung 1** — the publisher logo and the whole opening movie render as real,
-recognizable frames from the live renderer, with a chroma defect. A default launch still dies first
-on the title's logged-in-user startup race (#1746), which is now measured to be decided by host
-single-thread CPU speed and is a product decision rather than an open investigation; the rung-1
-frames were taken on an unmodified binary whose *host* was CPU-contended so the title wins that race.
-Start from **`## The race is decided by host single-thread CPU speed`** and **`## Rung 1 reached`**
-below; everything before them is the older movie-pipeline record (#1753, #1807, both closed).
+recognizable, **full-colour** frames from the live renderer. The green/magenta chroma cast the rung-1
+frames carried is fixed (#2005): the title declares both NV12 planes as one-layer 2D arrays, and the
+renderer's AvPlayer chroma test required `DIM=2D`, so the chroma plane took the coverage broadcast.
+A default launch still dies first on the title's logged-in-user startup race (#1746), which is now
+measured to be decided by how fast the host completes the asset load — host single-thread CPU speed
+and, more sharply, host page-cache state — and is a product decision rather than an open
+investigation. The reproduction is `tools/dropcache.py` before a default launch. Start from
+**`## Host page-cache state decides the race`**, **`## Rung 1 reached`** and
+**`## The chroma cast, solved`** below; everything before them is the older movie-pipeline record
+(#1753, #1807, both closed).
 
 ## Movie resource failure
 
@@ -491,7 +495,10 @@ Two things are visible in those frames and both are real, live defects rather th
 
 - **The movie's chroma is wrong** — greys render green and the whole image carries a magenta cast,
   the same signature the #1807 replay showed and attributed to missing capture provenance. It is now
-  reproduced on the live path, so that attribution was incomplete. Tracked in #2005.
+  reproduced on the live path, so that attribution was incomplete. Tracked in #2005 — **fixed; see
+  `## The chroma cast, solved` below.** The screenshot above is retained as the historical rung-1
+  evidence and still shows the cast; the corrected capture is
+  `assets/screenshots/rtype-delta-opening-movie-colour.png`.
 - Software H.264 fallback: `No support for codec h264 profile 77` / `Failed setup for format vaapi`.
   The movie decodes and plays anyway; worth checking whether VAAPI should have taken profile 77.
 
@@ -514,3 +521,105 @@ Two apparatus notes for whoever picks that up:
   `guest thread ended` line before believing any `status=ok`, or pass `--min-pixel-distinct-frames`.
 - The flat post-movie colour is *not* the same value as the pre-fault black (`crc=064567f8`); the two
   are distinguishable by CRC, which makes them separable in a route manifest.
+
+## The chroma cast, solved: the chroma plane was never recognised (2026-08-05, #2005)
+
+The cast is **not** a YUV conversion, a plane order, a stride, a range or a coefficient problem. Its
+signature says so before any code is read, and the signature is measurable from the committed rung-1
+screenshot alone. Recovering per-pixel `(Cb, Cr)` from the rendered RGB and taking the principal axis
+of that scatter gives:
+
+| Quantity | Rung-1 frames (broken) | After the fix |
+|---|---|---|
+| minor/major eigenvalue ratio of the `(Cb, Cr)` scatter | **0.00007** | 0.34 |
+| per-pixel mean \|Cr − Cb\| | **0.0010** (below 8-bit quantisation) | 0.098 |
+| `Cr/Cb` slope of the principal axis | **+0.998** | — |
+
+Chroma confined to the line `Cr = Cb` is exactly one thing: **one value broadcast into both chroma
+components**. It is also why the picture looks the way it does. `Cr = Cb = c` moves colour along
+`(+1.5748, −0.6554, +1.8556)`, a single **green ↔ magenta** axis through grey — greys where the true
+`Cb` sits below 128 go green, everything above goes magenta, and luma, detail and geometry stay
+perfectly correct. A U/V swap, a plane-order swap, NV12-vs-I420, or a full/limited-range or
+BT.601-vs-709 mismatch all leave grey grey and none of them collapse chroma to a line.
+
+**The planes were never wrong.** `PROSPER_AVPCHROMA_DUMP` (added with this work) writes each plane's
+exact guest bytes at its resolved pitch. A mid-movie sample of the live 2048×1080 R8 and 1024×540 RG8
+planes has **4,736 distinct `(U,V)` pairs** with U ≠ V in **94.6 %** of texels, and an independent CPU
+BT.709 conversion of those exact bytes produces a sharp, full-colour hangar frame with **112,736
+distinct colours**. Forcing `(U,U)` on the same bytes reproduces the live cast exactly. So decode and
+staging were correct and the defect was entirely in how the renderer *consumed* the chroma plane.
+
+The renderer has a deliberate AvPlayer chroma test, because the alternative is the legacy narrow
+coverage path that broadcasts a narrow surface's first byte to all four channels. The live verdict
+log (`PROSPER_AVPCHROMA_LOG`) named the failing clause immediately:
+
+```
+[avpchroma] addr=2051400600 2048x1080 fmt=9 ncomp=1 tile=0 dim=5 depth=1 ... swz=4,0,0,1
+[avpchroma] addr=205161c600 1024x540  fmt=9 ncomp=2 tile=0 dim=5 depth=1 ... swz=4,5,0,1
+                                                          ^^^^^  -> not-narrow-linear-rg8
+```
+
+`dim=5` is `2D_ARRAY`. **R-Type declares both NV12 planes as one-layer 2D arrays, not as `DIM=2D`**,
+and the test required `img_dim == 1`. Everything else about the planes was exactly as expected —
+linear, Unorm8, `(R,G,0,1)` DST_SEL, a registered 2048-byte AvPlayer pitch, and the chroma allocation
+starting precisely `pitch × height` after the luma one — so the test failed on the single field that
+carries no layout meaning here. A one-layer 2D-array descriptor is byte-identical to a 2D image; the
+project already says so in `shader_resource_uses_ordinary_2d_image`, and the rest of this same path
+already admits `img_dim == 5` (the padded-linear row read, the sampled-2D source address, and the
+`VK_IMAGE_VIEW_TYPE_2D` view it creates). Only this one test disagreed.
+
+The luma plane is declared the same way and survived by luck: rejected, it takes the coverage
+broadcast to `(Y,Y,Y,Y)` and the shader reads `.x`, which is still Y. Only the two-channel plane
+loses information.
+
+The fix admits a one-layer 2D array (`depth == 1`, no layer stride, no layer mip offset) and keeps
+rejecting real multi-layer arrays, whose slices are not one contiguous plane. `depth` is tested for
+**equality** with 1, not `<= 1`: the descriptor decoder emits `depth = LAST_ARRAY - BASE_ARRAY + 1`
+for an array type and **zero** when `LAST_ARRAY < BASE_ARRAY`, so zero is a malformed inverted array
+range rather than a single layer and must keep failing visibly. The classification
+moved to `frontends/shared/avplayer_plane_policy.hpp` with a unit test whose primary arm is R-Type's
+exact live descriptors; reverting the predicate to `img_dim == 1` fails 11 of its checks, and
+loosening `depth == 1` to `depth <= 1` fails the three `depth == 0` rejections.
+
+Live result on the deterministic `tools/dropcache.py` default route (#2019), `tools/screenshot`,
+unmodified binary and guest, 45 samples over 180 s: the opening movie renders in full natural colour
+across samples 00-05, at **8,584 to 315,101 distinct colours** per 1920×1080 frame against a pre-fix
+maximum of **38,682**. (An earlier figure of 405,267 in this section came from the superseded
+CPU-contention arm, not from this route; the numbers above are the route this document now
+describes.)
+
+<p align="center">
+  <img src="../../assets/screenshots/rtype-delta-opening-movie-colour.png" alt="R-Type Delta HD Boosted: the opening movie's R-9 hangar shot rendered live in full, correct colour"><br>
+  <sub>The opening movie after the fix, on the deterministic <code>tools/dropcache.py</code> route.
+  <code>tools/screenshot</code> frontend, <strong>default route with no CPU-contention hack</strong>,
+  unmodified binary and guest, no diagnostic environment. Sample 05 of a 180 s / 45-sample run, guest
+  frame 1,954, native 1920×1080. The cool blue-white ceiling lights, the red hull accents, the magenta
+  engine strip and the neutral grey panels are all present and none of them are green; the frame
+  carries 146,322 distinct colours (peak 315,101 over the run).</sub>
+</p>
+
+The reproduction is now the page-cache route rather than CPU contention, which removes the confound
+that made the old workaround unreliable as an acceptance condition:
+
+```bash
+python3 tools/dropcache.py <DUMP_ROOT>/PPSA26414-app0
+PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+  ./build/screenshot <DUMP_ROOT>/PPSA26414-app0 --seconds 4 --count 45 --out <dir>
+```
+
+**#2006 does not share this cause, measured on that same route.** After the fix the movie occupies
+samples 00–05 (8,584 to 315,101 distinct colours each) and then **every one of the remaining 39
+samples, 24 s through 176 s, has exactly one distinct colour**, while the frame loop keeps advancing
+to guest frame 7,768. The chroma fix moves the movie from wrong-colour to right-colour and does not
+touch the post-movie phase at all. #2006 remains the rung-1 → rung-2 blocker, and **rung 2 is not
+reached**: no title screen appears.
+
+## Ruled out (chroma)
+
+| Hypothesis | Verdict and evidence | Source |
+|---|---|---|
+| The live cast is a YUV plane-order, stride, NV12-vs-I420, range or BT.601-vs-709 error | **Falsified by the chroma geometry, before reading code.** Every one of those leaves grey grey and leaves chroma two-dimensional. The rung-1 frames' chroma lies on the single line `Cr = Cb` (eigen ratio 7e-5, mean \|Cr−Cb\| 0.0010), which only a broadcast of one value into both components produces. | screenshot analysis, #2005 |
+| The decoded/staged NV12 planes are wrong on the live path | **Falsified.** A mid-movie live dump has 4,736 distinct `(U,V)` pairs, U ≠ V in 94.6 % of texels, and an independent CPU BT.709 conversion of the exact bytes gives a sharp 112,736-colour frame. | `PROSPER_AVPCHROMA_DUMP`, #2005 |
+| The renderer has no AvPlayer chroma contract on the live path (only replay lacks it) | **Falsified.** The contract exists and is reached; it *rejected* the plane. The live verdict log names the clause: `dim=5 -> not-narrow-linear-rg8`. | `PROSPER_AVPCHROMA_LOG`, #2005 |
+| Requiring `DIM=2D` for an AvPlayer plane is safe because planes are 2D surfaces | **Falsified by the title's own descriptors.** R-Type declares both planes `DIM=2D_ARRAY` with one layer — byte-identical to 2D, and already treated as such by the padded-row read, the source-address computation and the created 2D image view in the same function. | live `[avpchroma]` census, #2005 |
+| The `(U,U)` broadcast seen in the #1807 replay was only a capture-provenance artifact | **Superseded.** The replay's missing row-pitch provenance was real, but it was not the only way to reach the broadcast: live rendering reached it through the `img_dim` clause with full provenance present. Two independent causes, one signature. | #1807, #2005 |

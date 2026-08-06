@@ -517,6 +517,13 @@ if(TARGET prosper_core)
   target_include_directories(test_capture_renderer_policy PRIVATE frontends/shared)
   add_test(NAME capture_renderer_policy COMMAND test_capture_renderer_policy)
 
+  # Which sampled resource is AvPlayer's NV12 chroma plane (#2005). Descriptor-level classification
+  # only — no device — but it reads the real guest-linear pitch registry, so it links prosper_core.
+  add_executable(test_avplayer_plane_policy frontends/shared/test_avplayer_plane_policy.cpp)
+  target_include_directories(test_avplayer_plane_policy PRIVATE frontends/shared src)
+  target_link_libraries(test_avplayer_plane_policy PRIVATE prosper_core)
+  add_test(NAME avplayer_plane_policy COMMAND test_avplayer_plane_policy)
+
   # The publish extent contract (#1986): which rendered pass may become the present source, and what
   # the retained-frame net may retain. Pure byte-count policy, so no device and no renderer.
   add_executable(test_present_extent frontends/shared/test_present_extent.cpp)

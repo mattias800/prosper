@@ -54,6 +54,22 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     an allocation-heavy boot cannot bury the log. A walk with no guest return address is recorded as
     `caller-chain=unknown`; allocations beyond the distinct-chain limit say `caller-chain=overflow`,
     and the ceiling is announced once. Neither state is a negative caller result.
+  - **Is a movie's colour wrong because its chroma plane was never recognised?**
+    **`PROSPER_AVPCHROMA_LOG=1`** prints one line per distinct narrow Unorm8 sampled texture — both
+    AvPlayer NV12 planes qualify — with every field the chroma test reads and the clause that decided
+    it, so a rejection names itself instead of being silent:
+    ```text
+    [avpchroma] addr=205161c600 1024x540 fmt=9 ncomp=2 tile=0 dim=5 depth=1 … swz=4,5,0,1
+                row_bytes=2048 pitch_field=0 registered=2048 … -> CHROMA matched-registered-pitch
+    ```
+    Why it needs its own diagnostic: an unrecognised chroma plane takes the legacy narrow coverage
+    path, which broadcasts its first byte to every channel, so the shader's V equals its U. Luma,
+    detail and geometry stay exactly right and only colour collapses onto a single green↔magenta axis
+    — invisible to draw counts, colour counts and every non-black metric, and it reads as a shading
+    bug. **`PROSPER_AVPCHROMA_DUMP=<dir>`** additionally writes each plane's exact guest bytes at its
+    resolved pitch (`PROSPER_AVPCHROMA_DUMP_EVERY=N` samples one sighting in N, because a movie opens
+    on a fade from black); converting the dumped pair on the CPU separates a decode/staging defect
+    from a sampling one. Both off by default. First use: #2005.
   - **Is prosper overrunning a command-buffer reservation the guest made?** prosper's AGC builders
     append into the *guest's* buffer, and the guest reserves that buffer from the packet sizes it was
     compiled against — so a builder that emits more dwords than the real AGC function overruns it.
