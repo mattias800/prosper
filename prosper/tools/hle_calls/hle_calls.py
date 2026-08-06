@@ -94,10 +94,24 @@ values are suspect rather than merely fewer.
 
 `--values` costs a second trap per call, so pair it with `--filter`.
 
+The launched process's own output
+--------------------------------
+`--launch` passes this process's environment straight through, so set `PROSPER_*`
+switches on the hle_calls command line itself — which makes it easy to launch an
+emulator that prints a 1.5 GB run log. That output does **not** come back through
+this tool: gdb's own stdout is on a pipe (the result block is tiny), and the
+inferior's stdin/stdout/stderr are redirected to `--inferior-log`, which defaults
+to `/dev/null`. Pass a real path to keep the run log:
+
+    ... --inferior-log ~/work/boot.log --launch build-linux/boot_trace <DUMP_ROOT>/...
+
+The file is created and truncated before gdb starts. The inferior's *stdin* is
+redirected too, so a launched program that reads stdin sees EOF. `--inferior-log`
+applies to `--launch` only; passing it with `--pid` is an error, because there is
+no inferior whose output this tool controls.
+
 Requirements: Linux, `gdb` with Python, `nm`, and ptrace attach permitted
 (`kernel.yama.ptrace_scope=0`). The prosper binary must not be stripped.
-`--launch` passes this process's environment straight through, so set
-`PROSPER_*` switches on the hle_calls command line itself.
 """
 
 import argparse
@@ -155,6 +169,29 @@ def enumerate_handlers(binary, name_filter):
     return out
 
 
+def _prepare_inferior_log(path):
+    """Absolute path for gdb's `set inferior-tty`, with the file ready to be opened.
+
+    gdb *opens* this path for the inferior and does not create it — a missing file aborts
+    the run at `run` with "No such file or directory", before a single breakpoint fires —
+    so create it here. Truncate a regular file so a run's log is that run's; leave anything
+    else (`/dev/null`, a tty, a fifo) exactly as it is.
+    """
+    resolved = os.path.abspath(path or os.devnull)
+    # `set inferior-tty` takes the rest of the gdb command line as the path, so a space in it
+    # would silently truncate the name. Say so instead of writing the log somewhere unexpected.
+    if any(c.isspace() for c in resolved):
+        sys.exit("hle_calls: --inferior-log path must not contain whitespace (gdb's "
+                 "`set inferior-tty` takes the rest of the line): %s" % resolved)
+    try:
+        if not os.path.exists(resolved) or os.path.isfile(resolved):
+            with open(resolved, "w"):
+                pass
+    except OSError as exc:
+        sys.exit("hle_calls: cannot open --inferior-log %s: %s" % (resolved, exc))
+    return resolved
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -177,6 +214,11 @@ def main():
                     help="symbol whose entries bound the window (default prosper::k_usleep)")
     ap.add_argument("--filter", default=None,
                     help="regex; keep only handlers whose short name matches")
+    ap.add_argument("--inferior-log", default=None,
+                    help="--launch only: where the LAUNCHED program's stdin/stdout/stderr go "
+                         "(default /dev/null). Its output is deliberately not returned through "
+                         "this tool — an emulator run log reaches gigabytes and would otherwise "
+                         "sit in this process's memory. The file is created and truncated first.")
     ap.add_argument("--gdb", default="gdb")
     ap.add_argument("--timeout", type=int, default=600, help="seconds (default 600)")
     args = ap.parse_args()
@@ -187,6 +229,11 @@ def main():
         sys.exit("hle_calls: --launch needs a program to run")
     if (args.pid is None) == (not args.launch):
         sys.exit("hle_calls: pass exactly one of --pid <pid> or --launch <program> [args...]")
+    # Refuse rather than silently ignore: in --pid mode the emulator is not this tool's child,
+    # it already owns its stdout/stderr, and accepting the flag would imply we redirected them.
+    if not args.launch and args.inferior_log is not None:
+        sys.exit("hle_calls: --inferior-log applies to --launch only — a --pid target owns its "
+                 "own output and this tool cannot redirect it")
 
     if args.launch:
         binary = args.binary or args.launch[0]
@@ -207,6 +254,12 @@ def main():
         syms_path = table.name
 
     env = dict(os.environ)
+    if args.launch:
+        env["HLE_CALLS_INFERIOR_TTY"] = _prepare_inferior_log(args.inferior_log)
+    else:
+        # This process's environment is passed straight through, so drop any inherited copy
+        # rather than let it look like attach mode redirects something. It does not.
+        env.pop("HLE_CALLS_INFERIOR_TTY", None)
     env["HLE_CALLS_SYMS"] = syms_path
     env["HLE_CALLS_CLOCK"] = args.clock
     env["HLE_CALLS_TICKS"] = str(args.ticks)
@@ -220,6 +273,10 @@ def main():
         cmd = [args.gdb, "-batch", "-x", script, "--args"] + list(args.launch)
     else:
         cmd = [args.gdb, "-p", str(args.pid), "-batch", "-x", script]
+    # These pipes hold GDB's own output only, and that is deliberate: the result block is a few
+    # hundred bytes, while a launched emulator's run log reaches gigabytes and would otherwise be
+    # inherited straight onto this pipe and buffered here until the window closed. The inferior's
+    # stdin/stdout/stderr go to --inferior-log instead (HLE_CALLS_INFERIOR_TTY above).
     # Popen rather than subprocess.run so a timeout can kill the whole tree. Note what actually
     # reaps the launched emulator: gdb sets PTRACE_O_EXITKILL on a process it STARTED, so the
     # inferior dies when gdb dies even though it sits in its own process group (measured:

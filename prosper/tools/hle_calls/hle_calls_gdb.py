@@ -10,6 +10,11 @@ environment so the driver can stay a plain subprocess call:
                       BEFORE the guest's entry point runs, so the window covers init
     HLE_CALLS_VALUES  "1" to record each handler's return values, not only its count
     HLE_CALLS_ORDER   how many leading calls to report in call order (default 24)
+    HLE_CALLS_INFERIOR_TTY  launch mode only: where the INFERIOR's stdin/stdout/stderr
+                      go. The driver holds gdb's own stdout on a pipe, and without this
+                      the launched emulator's entire run log would inherit that pipe and
+                      accumulate in the driver's memory. gdb opens the path; it does not
+                      create it, so the driver does that first.
 
 Every handler gets a Python breakpoint whose `stop()` counts the hit and returns
 False, so the inferior is never actually stopped for the user. The count is kept
@@ -78,6 +83,7 @@ TICKS = int(os.environ.get("HLE_CALLS_TICKS", "400"))
 MODE = os.environ.get("HLE_CALLS_MODE", "attach")
 VALUES = os.environ.get("HLE_CALLS_VALUES", "") == "1"
 ORDER_N = int(os.environ.get("HLE_CALLS_ORDER", "24"))
+INFERIOR_TTY = os.environ.get("HLE_CALLS_INFERIOR_TTY", "")
 
 counts = {}
 values = {}                     # name -> {return value: count}
@@ -170,6 +176,15 @@ print("hle_calls: armed %d handler breakpoints; window = %d entries of %s (mode=
       % (armed, TICKS, CLOCK, MODE, "on" if VALUES else "off"))
 
 if MODE == "launch":
+    if INFERIOR_TTY:
+        # Without this the inferior inherits gdb's stdout/stderr, which the driver holds on a
+        # pipe until the window closes: the emulator's ENTIRE run log would then sit in the
+        # driver's memory (a PROSPER_GFXLOG/PROSPER_DBG log reaches 1.5 GB, and exhausting
+        # memory on this box takes every concurrent lane's shell down with it). gdb's own
+        # stdout stays on the pipe — the result block is a few hundred bytes.
+        # `set inferior-tty` takes the rest of the line as the path and does not create it;
+        # the driver rejects whitespace and creates the file.
+        gdb.execute("set inferior-tty %s" % INFERIOR_TTY)
     # Every breakpoint above is already in place, so the window opens at the
     # process's first instruction — which is the whole point of this mode.
     gdb.execute("run")

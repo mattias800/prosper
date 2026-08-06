@@ -35,8 +35,8 @@ python3 tools/hle_calls/hle_calls.py --ticks 30 --values --filter '^s_' \
 
 Flags: `--binary` (defaults to `/proc/<pid>/exe`, or the `--launch` program), `--ticks N` (window
 length), `--clock SYMBOL` (what advances the window, default `prosper::k_usleep` — one or more
-entries per frame on every title observed so far), `--filter REGEX`, `--order N`, `--gdb PATH`,
-`--timeout SECONDS`.
+entries per frame on every title observed so far), `--filter REGEX`, `--order N`,
+`--inferior-log PATH` (`--launch` only — see below), `--gdb PATH`, `--timeout SECONDS`.
 
 Output:
 
@@ -58,6 +58,27 @@ with the identical two-handler histogram — the window was real, it simply neve
 `--launch` runs the program under gdb itself: every breakpoint is armed while the inferior is still
 loaded-but-not-started, so the window opens at the first instruction. It passes the invoking
 environment straight through, so put the `PROSPER_*` switches on the `hle_calls` command line.
+
+**The launched program's own output does not come back through this tool.** That is deliberate, and
+it is the direct consequence of the line above: `PROSPER_GFXLOG=1` / `PROSPER_DBG=1` / `PROSPER_FILELOG=1`
+on the `hle_calls` command line launches an emulator whose run log reaches **1.5 GB**, and an inferior
+that inherits gdb's stdout would pour all of it into the driver's memory, where it would sit until the
+window closed. gdb's own stdout stays on a pipe — the result block is a few hundred bytes — and the
+inferior's stdin/stdout/stderr are redirected with `set inferior-tty` to `--inferior-log`, default
+`/dev/null`. Measured on a fixture printing 4,000 lines: **439,806 bytes buffered without the
+redirect, 1,534 with it.** Pass a path to keep the log:
+
+```bash
+python3 tools/hle_calls/hle_calls.py --ticks 30 --values --filter '^s_' \
+    --inferior-log ~/work/sonic-boot.log \
+    --launch build-linux/boot_trace <DUMP_ROOT>/PPSA05325-app0
+```
+
+The file is created and truncated before gdb starts (gdb *opens* this path, it does not create it),
+and the path may not contain whitespace — `set inferior-tty` takes the rest of its command line.
+The inferior's **stdin** is redirected too, so a launched program that reads stdin sees EOF.
+`--inferior-log` is rejected in `--pid` mode, where the target owns its own output and this tool has
+nothing to redirect.
 
 **Do not take init coverage on faith — the result carries its own check.** `first-calls` lists the
 leading calls *in call order*. A window that covered init leads with allocator / module-setup
