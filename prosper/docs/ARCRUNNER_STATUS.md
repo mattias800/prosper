@@ -788,9 +788,10 @@ bounded by how far the run got.**
 
 ```bash
 # per arm, on ArcRunner's own established route -- ONE binary for all twelve.
-# PROSPER_GUEST_FS=1 is inert on Linux (CLAUDE.md) but was set on every arm, so it is kept here
-# for exactness rather than because it does anything.
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_PROGRESS=20 PROSPER_AVPLOG=1 \
+# No PROSPER_GUEST_FS here on purpose: it is read ONLY on macOS (`guest_tls.cpp:46`); Linux and
+# Windows take the `:58` branch, where guest TLS is default-ON and the variable that exists is
+# the opt-OUT `PROSPER_NO_GUEST_FS`. The arms did set it and it did nothing. #2095.
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_PROGRESS=20 PROSPER_AVPLOG=1 \
   PROSPER_SUBMIT_STALL_US=<unset|500|1500|3000> \
   timeout 120 ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
 
