@@ -27,6 +27,12 @@ not losing content, **and the terminal fault IS the rung-1 blocker after all.**
 throttle the title runs its whole intro cinematic in 4K with no fault, so the renderer was never
 the blocker.
 
+**`## 2026-08-06: the submit-duration dose-response` measures that race.** Twelve arms, four doses:
+0/3 survive at no stall and at 500 us, 3/3 at 1500 us and at 3000 us, so this title's threshold is
+`(500, 1500]` — the same bracket Crisis Core measured, and no longer imported from it. That section
+also kills the two cheapest explanations of the lever and records what a default build's own
+diagnostics say about which arms die (#2084).
+
 **Then read `## 2026-08-06: all three terminal values are prosper's own two label writes over a LIVE
 pointer`.** It settles the *author* of the fault — the three values this document tracked as three
 racing causes are one composition rule, and prosper performs both halves of it — and it withdraws the
@@ -563,12 +569,11 @@ decides whether corruption happens at all.
 #1945/#1894 measured a dose-response over the same lever on `PPSA07809` — 0/3 survive at no stall,
 0/3 at 500 us, 3/3 at 1500 us, 3/3 at 3000 us — and found pend-queue residency peaked at 3 ms, so
 "our completion writes land late" is false there too. ArcRunner gives the same lever the same **answer**, at the
-only two doses tried here (1500 us and 3000 us, both 2/2). **Its threshold is NOT measured**: with no
-500 us arm, ArcRunner's bracket is only `(0, 1500]`, and the tighter `(500, 1500]` figure is Crisis
-Core's — imported, not reproduced. `CRISIS_CORE_STATUS.md` says in terms that its result does not
-transfer to another title without that title's own dose-response, so treat the shared *direction* as
-the cross-title finding and the shared *threshold* as an untested assumption until someone runs the
-500 us arm here. It also agrees with this document's own
+only two doses tried here (1500 us and 3000 us, both 2/2). **Its threshold was NOT measured when this
+section was written** — with no 500 us arm the bracket was only `(0, 1500]`, and the tighter
+`(500, 1500]` figure was Crisis Core's, imported rather than reproduced. **That gap is now closed: the
+full twelve-arm dose-response was run on this title (#2084) and its own bracket is `(500, 1500]`, the
+same one. See § *2026-08-06: the submit-duration dose-response*.** It also agrees with this document's own
 `PROSPER_EOP_WRITE_SYNC` null: moving *when* our writes land changes nothing, because the gap that
 matters is inside the guest's own build-to-submit interval.
 
@@ -576,8 +581,12 @@ matters is inside the guest's own build-to-submit interval.
 it slows every submit unconditionally. The honest statement is: *the title's graphics are complete and
 correct; the default route still faults.* Closing that gap means making prosper's submit fold behave
 correctly without the artificial delay, which is now the whole of #1226 and #1945. The next lane
-should start from the dose-response threshold (between 500 and 1500 us) and ask what the guest
-observes during that window, not what value ends up in the pointer.
+should start from the dose-response threshold — **measured on this title as `(500, 1500]`**, see the
+following section — and ask what the guest observes during that window, not what value ends up in the
+pointer. One candidate answer is already eliminated there: honouring the guest's `WAIT_REG_MEM`
+barriers (`PROSPER_WAIT_DEFER=1`) does not rescue the title, 3 of 3 with the lever witnessed. A
+second — that the throttle shortens the guest's build-to-submit interval — is **unmeasured rather
+than eliminated**: the sample that appeared to settle it was selected for the condition under test.
 
 **Two defects visible in the frames, both new and neither blocking rung 1:**
 
@@ -586,6 +595,213 @@ observes during that window, not what value ends up in the pointer.
    movie is decoded through the software libavcodec path (`yuv420p -> NV12`). Filed separately.
 2. The default-route composite question in the rung-1 section below is answered: it was never losing
    content. It composited a black movie frame correctly, exactly as that section concluded.
+
+## 2026-08-06: the submit-duration dose-response — the threshold transfers exactly
+
+The section above left this title's threshold bracketed only at `(0, 1500]` and imported the tighter
+`(500, 1500]` figure from *Crisis Core*. **The 500 us arm has now been run here, and ArcRunner's own
+bracket is `(500, 1500]` — the same one.** [#2084](https://github.com/mattias800/prosper/issues/2084).
+
+Twelve arms, four doses, three arms per dose, **one binary** (built from `f080fc23`; the same
+`sha256` recorded in every arm's log header), ArcRunner's own `boot_trace` route, a 120 s bound, and
+one endpoint scored the same way for every arm. Two design points beyond the method in #2084. The
+doses were **interleaved** — 0, 500, 1500, 3000, repeated three times — rather than run in per-dose
+blocks, so drift in machine load cannot align with dose. And **no passive observer was armed**:
+instrument trap 104 records that a read-only probe's *duration* can decide whether this failure
+happens, so the only diagnostics in the path are the ones a default build prints unconditionally.
+Each arm's log header records a `pgrep` census of peer `boot_trace`/`prosper-app`/`screenshot`
+processes taken immediately before and after it; every one of the twenty-four censuses is zero, so
+no peer lane shared the GPU during the matrix.
+
+**Endpoint, fixed before the first arm ran.** SURVIVED = the process was still alive at the bound
+(`rc=124`) **and** the log carries zero `WORKER-THREAD FAULT` lines **and** zero
+`FMallocBinned3`/`LowLevelFatalError` fatals. `rc=124` on its own is *not* survival — the
+2026-08-05 section records an arm where the timeout killed a process that had already faulted and
+wedged, and an earlier draft of that section read it as a clean run.
+
+| stall per submit | survived the bound | died |
+| --- | --- | --- |
+| none (default) | **0 / 3** | 3 / 3 |
+| 500 us | **0 / 3** | 3 / 3 |
+| 1500 us | **3 / 3** | 0 / 3 |
+| 3000 us | **3 / 3** | 0 / 3 |
+
+**0 of 6 below the threshold, 6 of 6 above** (Fisher exact, two-tailed, p ≈ 0.002), monotone, with
+the threshold between 500 us and 1500 us. Per arm:
+
+| dose | rep | rc | wall | video frames | verdict | terminal fault | faulting thread |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 1 | 90 | 17.3 s | 138 | DIED | `addr=0x30016000 rip=eboot+0x127e8eb` | `RHIThread` |
+| 0 | 2 | 90 | 14.0 s | 38 | DIED | `addr=0x30016000 rip=eboot+0x127e751` | `RenderThread 1` |
+| 0 | 3 | 90 | 10.9 s | 36 | DIED | `addr=(nil) rip=0x0` | `AudioMixerRende` |
+| 500 | 1 | 90 | 17.9 s | 31 | DIED | `addr=0x30016000 rip=eboot+0x127e8eb` | `RHIThread` |
+| 500 | 2 | 90 | 14.2 s | 36 | DIED | `addr=(nil) rip=0x0` | `AudioMixerRende` |
+| 500 | 3 | 90 | 11.6 s | 37 | DIED | `addr=0x30016000 rip=eboot+0x127e8eb` | `RHIThread` |
+| 1500 | 1 | 124 | 123 s | 1,906 | SURVIVED | none | — |
+| 1500 | 2 | 124 | 133 s | 1,986 | SURVIVED | none | — |
+| 1500 | 3 | 124 | 121 s | 1,988 | SURVIVED | none | — |
+| 3000 | 1 | 124 | 124 s | 1,986 | SURVIVED | none | — |
+| 3000 | 2 | 124 | 122 s | 1,983 | SURVIVED | none | — |
+| 3000 | 3 | 124 | 121 s | 1,924 | SURVIVED | none | — |
+
+Every fault is in the already-recorded family — four in the `0x30016000` allocator-pop class, two in
+the `AudioMixerRende` `rip=0x0` class — and no arm produced a new one.
+
+**Read the transfer claim narrowly.** What replicates is that *this title's* #1945 is decided by
+submit duration, at the same bracket. It is still not a general law, and #2084 says why the temptation
+to make it one is the error to avoid: one env var makes the arm cheap. The right reading is that two
+independently-brought-up UE4 titles put the boundary in the same 500–1500 us window, which makes it a
+property of prosper's submit timing rather than of either guest — but a third title still owes its own
+twelve arms. `CRISIS_CORE_STATUS.md` states the same limit from the other side, and is the doc to read
+for that title's arms.
+
+### What the arms say beyond the survival table
+
+All four observations below come from diagnostics that print **unconditionally** in a default build,
+so they cost the arms nothing and cannot have confounded the timing.
+
+**1. The `SUSPECT-REL1-OVERLAP` tripwire selects the allocator class exactly, and is empty in every
+surviving arm.** The tripwire (`command_processor.cpp`, `label_rel_overlap`) fires when prosper
+executes a `RELEASE_MEM` fence for a label while the guest has already **built** a newer init for the
+same label that prosper has not executed — two fence generations in flight together, which is the
+condition under which the guest can free the block on the first `1` and prosper's later pair then
+lands in it. Its ordinals partition the matrix cleanly:
+
+| arm class | `SUSPECT-REL1-OVERLAP` population |
+| --- | --- |
+| died at `0x30016000` (4 arms) | 11, 22, 27, 24 |
+| died at `rip=0x0` (2 arms) | 0, 0 |
+| survived (6 arms) | 0, 0, 0, 0, 0, 0 |
+
+The counts are exact, not capped: `diag_should_print` prints the first 64 ordinals and every power of
+two after, and the largest ordinal seen is 27. **The zero is positively controlled from inside the
+same runs** — the counters it differences (`dma_built_n`, `dma_exec_n`) are demonstrably live in the
+surviving arms, whose `WaitRegMem` reports carry 28–40 populated label event rings with both `dmaB`
+and `dmaX` events. So this is "armed and nothing matched", not "never armed".
+
+**And the reporter is not reachable-but-bypassed either**, which is the sharper form of the same
+worry: the overlap check sits at the *end* of `case 1:` of `rel_data_sel`, behind seven earlier
+`return`s, and a zero would be worthless if the surviving arms had simply been exiting sooner. All
+seven are accounted for on a default build:
+
+| early return | why it cannot explain the zero |
+| --- | --- |
+| `!c.rel_value_valid` | a short-decoded packet. `report_short_fold` is unconditional and reports **0** in all 15 arms — nothing was truncated. |
+| `mb3_suppress_release` | needs `PROSPER_MB3_FREELIST_GUARD`, default OFF, not armed |
+| `stale_release_generation` | needs `PROSPER_GENERATION_GUARD`, default OFF, not armed |
+| `waf_guard` | `PROSPER_REL1_WAF_GUARD`, default OFF, not armed |
+| `REL1-LIVE` branch | **reports before it returns**; zero `REL1-LIVE` lines in all 15 arms |
+| `rel1_forge_suppress_candidate` | `rel1_forge_decision_mode()` is 0 unless armed, so it returns false |
+| `REL1-FORGE` branch | **reports before it returns**; zero `REL1-FORGE` lines in all 15 arms |
+
+Two of the seven announce themselves and did not fire; four are default-OFF levers nobody armed; the
+one genuinely silent path is contradicted by an unconditional counter.
+
+**And the positive form closes it outright, which is the evidence to quote rather than the table
+above.** The success path records `LE_REL_EXEC` at `label_hist_rel_exec` — *downstream* of the overlap
+check — while the three suppression branches record theirs upstream at their own `return`s. So a
+`relX` event in a label ring is a witness that control passed the tripwire. The surviving arms carry
+**53, 74, 82, 94, 109 and 119** of them. With zero `REL1-LIVE` and zero `REL1-FORGE` lines (both
+branches report before returning) and `PROSPER_NONHEAP_PTR_GUARD` unarmed, every one of those `relX`
+events was recorded on the success path. The tripwire was reached and returned zero.
+
+It is also a much sharper statement than the survival table alone: the tripwire is a **selector for one
+of the two terminal classes**, present in 4 of 4 allocator-pop arms and absent from 2 of 2 null-jump
+arms — while the throttle removes *both*.
+
+**2. No evidence that the throttle shortens the guest's build-to-submit gap — and the obvious way to
+measure it is confounded.** Pairing each label ring's last `dmaB` (the guest's own AGC builder call)
+with the following `dmaX` (prosper executing that packet at fold time) gives the interval the
+2026-08-06 sections identify as the exposure window. **Do not take that sample over all ring-bearing
+lines**, which is how the first revision of this section did it and got a much stronger claim than the
+data supports. Rings are only visible inside diagnostics that embed `label_hist_report`, and the two
+arm classes do not have the same ones: a dying arm carries 1–4 `WaitRegMem` reports and 11–27
+`SUSPECT-REL1-OVERLAP` reports, a surviving arm carries 28–40 `WaitRegMem` reports and **zero**
+overlap reports. Pooling them draws the dying arms' pairs almost entirely from a population that
+exists *only* when a second generation is in flight — i.e. selected for the condition under test.
+
+Restricted to the one population both classes have, the `WaitRegMem` rings:
+
+| | median build→exec gap | pairs |
+| --- | --- | --- |
+| dying arms (6) | 282, 350, 352, 364, 409, 413 ms | 2–8 each, **29 total** |
+| surviving arms (6) | 347, 400, 424, 435, 437, 584 ms | 38–80 each, **363 total** |
+
+The surviving arms are certainly not *shorter*, and if anything longer — but at 2–8 pairs per dying
+arm this supports **no** falsification, only the absence of evidence for the shortening story. The
+strong form of this claim ("the throttle lengthens the interval") is **withdrawn**; it was an artifact
+of the pooled sample. `CONFIDENCE: LOW`, and it needs a per-fold instrument rather than whatever
+rings a diagnostic happens to print.
+
+**3. Unsatisfied `WAIT_REG_MEM` barriers are not the discriminator.** They occur in every arm,
+including all six surviving ones, with recorded packet ages from 3 ms to 445 ms. Their line count is
+print-capped at 40 (`ln < 40 || (ln & 1023) == 0`), so it is a ceiling and not a rate. Four of the six
+surviving arms sit exactly on it (40) and two are below (36, 28), so only the four are censored; in
+no case is the number a frequency.
+
+**4. prosper's deferred-stream barrier model is not in the default path at all.** `PROSPER_WAIT_DEFER`
+is **opt-in and default OFF** (`command_processor.cpp`), so on the default route prosper barrels
+through an unsatisfied wait with the "dependency violated" log rather than pausing the stream. The
+count of `dependency violated` equals the count of unsatisfied waits in all twelve arms, which
+confirms it directly. This matters because the ~250–580 ms / 3–7 fold build-to-exec gap in
+observation 2 is therefore **entirely the guest's own build-ahead**, with no prosper deferral in it —
+do not reason about that gap as though prosper were holding the packet.
+
+### The obvious non-throttle lever was run, and it does not work
+
+Since observation 4 says prosper barrels through the guest's own barriers on the default route, the
+natural candidate fix is to stop doing that. **`PROSPER_WAIT_DEFER=1` was run here — three arms, same
+binary, same route, no throttle — and it does not rescue the title.** 3 of 3 faulted, at 11.4 s,
+13.6 s and 11.4 s, delivering 61, 34 and 35 video frames; all three took the `addr=(nil) rip=0x0`
+`AudioMixerRende` class, and `SUSPECT-REL1-OVERLAP` still reached ordinals 25 and 22.
+
+The lever is witnessed, not assumed: every defer arm carries
+`WaitRegMem #0 … — pausing queue (deferred effects)` where a default arm carries `dependency
+violated`, one arm additionally logs `WaitRegMem DEFER TIMEOUT #1 after 1000ms`, and the default arms
+carry the marker `pausing queue (deferred effects)` **0 times against 3 of 3** here. (Use that exact
+marker, not a bare `defer` grep: the surviving dose arms each contain one unrelated
+`layered image deferred to #657` line, so a loose grep does not separate the arms.) So the model was
+on, the barriers were honoured, and the title
+still died — sooner, on median, than the unthrottled control arms. That reproduces on ArcRunner the
+verdict `command_processor.cpp` already records from ~20 instrumented DOLL runs: honouring the
+barriers removes the ordering-violation leg and leaves a second, wait-order-independent leg that
+dominates, while deferral latency shifts the guest into it earlier.
+
+One incidental corroboration worth keeping: in `defer` rep 3 the label the guest is waiting on reads
+`0x1700f1e8` — the low dword of `0x41700f1e8`, the module-image vtable named in the section below. The
+guest was polling a "label" that had become a C++ object.
+
+### One correction to this document's own census, which cost nothing to find
+
+Earlier sections record **zero** `recompile-reject` / compute-skip / unsupported-format lines across
+20+ runs, and read that as this title's shader coverage being complete. It is not: **every one of
+those censuses was taken on a run that died at 8–14 s.** The six surviving arms here each reach a
+`[compute] skip unsupported program` line for **three programs reproducibly** (`0x3005330000`,
+`0x3007780000`, `0x30094d0000`), plus a run-varying fourth, plus one
+`layered image deferred to #657 -> dispatch skipped (#590)`. All of them are past the point where a
+default run dies. The clean census is a fact about the first fourteen seconds, not about ArcRunner.
+Filed as [#2090](https://github.com/mattias800/prosper/issues/2090). Generalise it before quoting any
+"zero X across N runs" figure on a title whose runs are terminated by a fault: **a coverage census is
+bounded by how far the run got.**
+
+### Reproduction
+
+```bash
+# per arm, on ArcRunner's own established route -- ONE binary for all twelve.
+# No PROSPER_GUEST_FS here on purpose: it is read ONLY on macOS (`guest_tls.cpp:46`); Linux and
+# Windows take the `:58` branch, where guest TLS is default-ON and the variable that exists is
+# the opt-OUT `PROSPER_NO_GUEST_FS`. The arms did set it and it did nothing. #2095.
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_PROGRESS=20 PROSPER_AVPLOG=1 \
+  PROSPER_SUBMIT_STALL_US=<unset|500|1500|3000> \
+  timeout 120 ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+
+# score (the same expression as the endpoint above): rc=124 AND zero matches for
+#   grep -cE 'WORKER-THREAD FAULT'      AND zero for
+#   grep -cE 'unrecognized block|LowLevelFatalError'
+```
+
+The control arm leaves `PROSPER_SUBMIT_STALL_US` **unset** rather than setting it to `0`; both are
+inert (`submit_stall()` returns early on 0), but unset is the default route exactly.
 
 ## 2026-08-06: all three terminal values are prosper's own two label writes over a LIVE pointer
 
@@ -814,7 +1030,12 @@ Do not re-derive these without contradictory new evidence.
 | prosper's **deferred** completion-write model (#312's post-submit worker) is what makes a label write land in memory the guest has reallocated — so `PROSPER_EOP_WRITE_SYNC=1` should remove it | It does not. Five armed runs with the lever now witnessed (`[agc] EOP-WRITE-SYNC ARMED`, added for this): the live-pointer stomp rate is **25.9–26.5%** of examined sub-qword writes against the default's **25.1%** (both measured before `liveptr_trip`'s WRITE_DATA call moved inside the `wd_num <= 4` branch, which narrowed the `examined` denominator by excluding packets that could never have matched — a re-run at a later head will not reproduce these exact percentages, and that is a denominator change, not a subject change), and the module-image vptr class occurs in **4 of 5** armed runs against 1 of 6 default runs. Read those two facts separately. The **aggregate rate is unmoved**, which is the result. The class-frequency difference is large and in the *opposite* direction from a null, and it is **unexplained at n = 5/6** — it is as consistent with the synchronous lever increasing exposure to the class as with small-sample noise, and it must not be folded into the null as though it were merely a positive control. What it does establish is that the class occurred inside the armed arm, so the arm is not a silent one. The cleanest hit has `events(total=3): dmaB@8408/f31 relB@8408/f31 waitB@8408/f31` and executes at 8745 ms, i.e. the guest named the block as a label and freed/reallocated it 337 ms later, before the referencing submit. Synchronous writes cannot help: the build→submit gap is the guest's own. | #1226 |
 | Suppressing the label writes prosper can detect is enough to get the title past the fault | It is not. The maximal arm `PROSPER_MB3_FREELIST_GUARD=1 PROSPER_GENERATION_GUARD=1 PROSPER_REL1_WAF_GUARD=1 PROSPER_NONHEAP_PTR_GUARD=1`, with every lever independently witnessed (**26** `MB3-` suppressions, **3–10** `REL-GENERATION-CHANGED-STALE-SUPPRESS`, **1** `NONHEAP-PTR-DECLINE`), still faults on `RHIThread` in the same window and still delivers **31** video frames with 31 successes — the same as an unguarded run. The label writes compose the fault *value*; they are not the whole blocker. A fix has to address the block-lifetime seam. | #1226 |
 | The rung-1 blocker is a rendering, recompiler, AvPlayer or composite defect somewhere in prosper's graphics path | It is none of those. With `PROSPER_SUBMIT_STALL_US=1500` the title renders its **entire intro cinematic** in 4K — a nebula and the ringed station captioned *TITAN-CLASS SPACE STATION "THE ARC"*, a rainy neon street with a character and reflections, and a *POPULATION: 10 MIL* text card — with **0 of 4** stalled runs faulting against **17 of 17** default runs, 1,901 of 1,908 `GetVideoDataEx` calls succeeding against 31, and ~26.4 M of 33.2 M bytes nonzero per presented frame against RGB 0. Frames opened, not just measured: `assets/screenshots/arcrunner-intro-space-station.png`, `assets/screenshots/arcrunner-intro-city.png`. Every graphics subsystem needed to produce this cinematic runs — geometry, text, composition and presentation are all correct — and the blocker is a submit-timing race. Not a claim that the graphics path is defect-free: the same frames carry a chroma-plane colour fault (#2085). | #1226, #1945 |
-| The ArcRunner corruption is title-specific, so it needs a title-specific fix | The same lever gives the same answer on **Crisis Core** (`PPSA07809`), whose dose-response is 0/3 at no stall, 0/3 at 500 us, 3/3 at 1500 us, 3/3 at 3000 us. **The shared finding is the direction, not the threshold**: ArcRunner was run only at 1500 and 3000 us, so its bracket is `(0, 1500]` and the `(500, 1500]` figure is Crisis Core's alone — and pend-queue residency there peaks at 3 ms, so "our completion writes land late" is false on both titles. Two titles, one lever, one threshold: this is a property of prosper's submit timing, not of either guest. It also agrees with this document's own `PROSPER_EOP_WRITE_SYNC` null. | #1945, #1894, #1226 |
+| The ArcRunner corruption is title-specific, so it needs a title-specific fix | The same lever gives the same answer on **Crisis Core** (`PPSA07809`), whose dose-response is 0/3 at no stall, 0/3 at 500 us, 3/3 at 1500 us, 3/3 at 3000 us. **The shared finding was originally the direction only, because ArcRunner had been run at 1500 and 3000 us alone — that caveat is now retired: this title's own twelve arms give 0/3, 0/3, 3/3, 3/3 at the same four doses, so its bracket is `(500, 1500]`, identical to Crisis Core's** (#2084; see § *2026-08-06: the submit-duration dose-response*). Pend-queue residency on Crisis Core peaks at 3 ms, so "our completion writes land late" is false on both titles. Two titles, one lever, one measured threshold: this is a property of prosper's submit timing, not of either guest. It also agrees with this document's own `PROSPER_EOP_WRITE_SYNC` null. It is still not a general law — a third title owes its own dose-response. | #1945, #1894, #1226, #2084 |
+| ArcRunner's `(500, 1500]` threshold is Crisis Core's, imported rather than reproduced, and must be treated as an untested assumption until someone runs the 500 us arm here | The 500 us arm was run: **0 of 3 survived**, all three faulting in the already-recorded family (two at `0x30016000`, one at `rip=0x0`) at 11.6–17.9 s with 31–37 video frames. With 3/3 surviving at 1500 us, this title's bracket is measured, not inherited. Twelve arms, four doses, one binary from `f080fc23`, doses interleaved so load drift cannot align with dose, no passive observer armed (instrument trap 104), and a peer-process census of zero before and after each arm. | #2084, #1226 |
+| ~~The throttle rescues the title by giving prosper time to catch up inside the guest's build-to-submit interval~~ — **NOT ESTABLISHED; this row is withdrawn as filed** | The first revision claimed the opposite (that the interval is *longer* when the arm survives) from a pooled sample of every ring-bearing diagnostic line. That sample is **selected for the condition under test**: rings are only printed inside diagnostics that embed `label_hist_report`, and a dying arm's pairs come almost entirely from its 11–27 `SUSPECT-REL1-OVERLAP` lines, a population a surviving arm has **zero** of. Restricted to the `WaitRegMem` rings both classes have, the medians are 282–413 ms over **29** pairs in the dying arms against 347–584 ms over **363** in the surviving ones — not shorter, but 2–8 pairs per dying arm cannot falsify anything. What stands is only the absence of evidence for the shortening story. `CONFIDENCE: LOW`; needs a per-fold instrument. Caught in review of #2091, not by the author. | #2084, #1226 |
+| prosper's deferred-stream barrier model (#312) is in the default path, so the build-to-exec gap on this title is prosper holding the packet | `PROSPER_WAIT_DEFER` is **opt-in and default OFF** (`src/gpu/command_processor.cpp`). On the default route prosper barrels through an unsatisfied `WAIT_REG_MEM` with the "dependency violated" log and defers nothing — confirmed directly in all twelve dose arms, where the `dependency violated` count equals the unsatisfied-wait count exactly (3/3, 4/4, 2/2, 1/1, 2/2, 4/4, 40/40, 36/36, 28/28, 40/40, 40/40, 40/40) and the barrier model's own marker `pausing queue (deferred effects)` appears **0 times in all twelve**, against 1 in each of the three `PROSPER_WAIT_DEFER=1` arms. The ~250–580 ms build-to-exec gap is therefore entirely the **guest's own** build-ahead. | #2084, #1226 |
+| Honouring the guest's `WAIT_REG_MEM` barriers instead of barrelling through them fixes the title — the obvious non-throttle candidate, and the one #312's original 5/5 evidence points at | `PROSPER_WAIT_DEFER=1`, three arms on the same binary and route with no throttle: **3 of 3 faulted**, at 11.4/13.6/11.4 s with 61/34/35 video frames, all in the `addr=(nil) rip=0x0` `AudioMixerRende` class, with `SUSPECT-REL1-OVERLAP` still reaching ordinals 25 and 22. The lever is witnessed rather than assumed — every arm logs `WaitRegMem … — pausing queue (deferred effects)` and one logs `DEFER TIMEOUT #1 after 1000ms`, while no dose arm carries the `pausing queue (deferred effects)` marker at all — 0 of 12 against 3 of 3. Do not substitute a bare `defer` grep for that marker: the six surviving dose arms each contain one unrelated `layered image deferred to #657` line. This reproduces on ArcRunner the verdict `command_processor.cpp` already records from ~20 DOLL runs: the model removes the ordering-violation leg and a wait-order-independent leg dominates, and deferral latency makes the title die sooner. | #2084, #312, #1226 |
+| The zero `recompile-reject` / compute-skip / unsupported-format census recorded in the sections above describes this title's shader coverage | It describes the **first 8–14 seconds**, which is all any of those runs got. Every one of the six surviving dose arms reaches `[compute] skip unsupported program` for three programs reproducibly (`0x3005330000`, `0x3007780000`, `0x30094d0000`), plus a run-varying fourth, plus one `layered image deferred to #657 -> dispatch skipped (#590)` — all past the point where a default run dies. Generalise before quoting any "zero X across N runs" figure on a title whose runs end in a fault: a coverage census is bounded by how far the run got. | #2090, #2084, #1226 |
 | `PROSPER_AVP_LOG=1` enables the AvPlayer log, so a run with it set and zero `video-ex` lines means the movie never started | `avp_log()` reads **`PROSPER_AVPLOG`** (`src/hle/hle_service.cpp:978`), not `PROSPER_AVP_LOG`. A max-guard arm here reported `video-ex calls: 0` purely because the wrong switch was passed; re-run with `PROSPER_AVPLOG=1` it reported **31**. Two arms were void this way before it was caught. Pass `PROSPER_AVPLOG=1`. | #1226 |
 | `PROSPER_PRESENT_NZLOG=1` on its own reports presented-frame content under `boot_trace` | It reports nothing. A run with it set produced **zero** `[render-nz]` lines over ~100 presented frames: the line is gated on `!px.empty()` in `frontends/shared/live_renderer.cpp`, `px` comes from `selected_pixels`, and the registrar announced `dump=0` — the readback that fills it is opt-in and this switch does not request it. A silent run is **not** "every frame was black". | #1226 |
 | The `addr=(nil)` faults show that page `0x2100000000` is a **legitimately committed guest region whose contents prosper lost** — [#1944](https://github.com/mattias800/prosper/issues/1944) reading 1, argued from "two *different* guest code sites first-touch the same 64 KiB page; a wild pointer would not repeat like that" | It is reading 2 (a wild read masked), and the repetition is a property of the value, not the mapping. `PROSPER_LAZY_COMMIT_STRICT=1` moves the fault to the loading instruction: `[lazy-commit] #1 DECLINED(strict) page=0x2100000000 addr=0x2100000041 access=read rip=0x41117e221`, then `sig=11 addr=0x2100000041 rip=eboot+0x117e221`. The load is `mov rdi,[r12+rcx*8]` / `mov rcx,[rdi+0x40]` with `rdi=0x2100000001`, and `0x40` is added **without masking the low bit**, so `rdi` is a plain corrupt pointer. **Any** `0x21000000xx` value lands in page `0x2100000000` — which is exactly the shape a heap pointer takes when its low dword is lost — so both recorded sites hitting that page is expected, not anomalous. Exactly one lazy-commit event occurs per affected run. Do not spend another arm treating the page as a commit-protocol gap on this title. | #1944, #1226 |
@@ -878,6 +1099,25 @@ guest's faulting virtual call disassembled. What remains is **ownership**, not a
 3. **The module-image half is safely separable** and `PROSPER_NONHEAP_PTR_GUARD=1` exists for it, but
    it needs runs in which the class actually occurs — three armed runs declined nothing.
 4. **Give a rung-1 arm a long bound and count `video-ex` calls.** See the `## Ruled out` row.
+
+**Added 2026-08-06 by the #2084 dose-response lane, without renumbering the list above:**
+
+5. **The threshold is measured on this title now — `(500, 1500]`, the same bracket as Crisis Core** —
+   and the two cheapest explanations of *why* the throttle works are both dead. It does not shorten the
+   guest's barriers — `PROSPER_WAIT_DEFER=1` faults 3/3, sooner, with the lever witnessed, and that one
+   is in `## Ruled out`. The build-to-submit-interval story is **still open**: the measurement that
+   looked like it settled it was drawn from a population only dying arms have, and its row is
+   withdrawn. Re-ask it with a per-fold instrument, not with whatever rings a diagnostic prints.
+6. **`SUSPECT-REL1-OVERLAP` is the sharpest live discriminator this title has**, and it is free — a
+   default build prints it. Population 11/22/27/24 in the four arms that die at `0x30016000`, **0** in
+   the two that die at `rip=0x0`, and **0** in all six that survive, with the counters it differences
+   positively controlled inside the surviving arms. It says the fault happens when prosper executes a
+   fence for label generation *k* while the guest has already built generation *k+1*. Any candidate fix
+   should be scored against this number, not only against survival: it separates the two terminal
+   classes, which survival does not.
+7. **Do not quote a "zero X across N runs" coverage census on this title without saying how far the
+   runs got.** Six surviving arms reach three `[compute] skip unsupported program` lines that no
+   14-second run can see (#2090).
 
 *Superseded — the previous summary, kept because its provenance census is still the record:*
 
