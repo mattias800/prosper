@@ -150,7 +150,6 @@ Smoke-test the actual SDL window and Vulkan swapchain without a game, then run t
 
 ```powershell
 prosper/build-mingw-app/prosper-app.exe --test-pattern --frames 120
-$env:PROSPER_GUEST_FS = '1'
 $env:PROSPER_GUEST_ARGS = '-force-gfx-direct'
 prosper/build-mingw-app/prosper-app.exe --dump <DUMP_ROOT>/PPSA24651-app0
 ```

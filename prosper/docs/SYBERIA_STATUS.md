@@ -51,7 +51,7 @@ already zero before guest packing/writeback.
 
 ## Route and timing (Linux, hardware Vulkan, RADV, 1920x1080)
 
-`screenshot` / `prosper-app` with `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct
+`screenshot` / `prosper-app` with `PROSPER_GUEST_ARGS=-force-gfx-direct
 PROSPER_RENDER=1`. No input is needed to reach the menu.
 
 | t | state |
@@ -523,7 +523,7 @@ that every consumed recompiler gap is the visible composite cause.
 
 ```bash
 # One settled-menu submit, ~680 MB capsule
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 PROSPER_NO_FRAME_DUMPS=1 \
 PROSPER_GPU_CAPTURE=~/menu.prgcap PROSPER_GPU_CAPTURE_AFTER_MS=190000 \
 PROSPER_GPU_CAPTURE_TARGET_DIM=1920x1080 PROSPER_GPU_CAPTURE_MIN_DRAWS=1 \

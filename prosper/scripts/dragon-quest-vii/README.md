@@ -20,7 +20,6 @@ directory created under `$HOME`; substitute its absolute path before running the
 screenshots do not land in the worktree or `/tmp`.
 
 ```bash
-PROSPER_GUEST_FS=1 \
 PROSPER_NULL_PAGE=1 \
 PROSPER_GUEST_ARGS= \
 PROSPER_SAVE0=<FRESH_SAVE_ROOT>/save0 \

@@ -58,7 +58,7 @@ to isolate a single working thread.
 
 ```bash
 # Boot a title headless, let it reach steady state, then find the hot host function:
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
   ./build-linux/boot_trace /path/PPSA27616-app0 &
 sleep 45
 

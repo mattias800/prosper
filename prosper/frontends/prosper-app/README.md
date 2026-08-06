@@ -48,7 +48,7 @@ no-UI launch command, save-data selection, keyboard map, and runtime requirement
 
 ```bash
 # The game (reaching the frame loop needs these two env switches, same as boot_trace):
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_GUEST_ARGS=-force-gfx-direct \
   ./build-app/prosper-app --dump /path/to/PPSA24651-app0
 
 # Window/swapchain smoke without a dump:

@@ -45,7 +45,7 @@ unwinder derived from the swap-stub's fixed stack layout.
 1. Run the title once with the module map (and, for managed names, capture nothing extra — the map is
    all `guest_bt.py` needs):
 
-       PROSPER_INITLOG=1 PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+       PROSPER_INITLOG=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
          ./screenshot <dump>-app0 ... 2> run.log
 
 2. (IL2CPP titles, once) build a managed symbol map — see `tools/il2cpp/README.md` — and keep the

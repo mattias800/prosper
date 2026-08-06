@@ -47,7 +47,6 @@ carrying them into `prosper-app` skips visible updates during the opening and re
 1920x1080 output at 480x270 before scaling it to the window.
 
 ```sh
-PROSPER_GUEST_FS=1 \
 PROSPER_GUEST_ARGS=-force-gfx-direct \
 PROSPER_RENDER_EVERY=1 \
 PROSPER_RENDER_SCALE=1 \

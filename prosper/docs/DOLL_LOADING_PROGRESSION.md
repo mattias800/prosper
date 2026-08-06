@@ -34,7 +34,9 @@ flow target eboot+0x124beb0.
 
 Diagnosed 2026-07-10 on `diag/doll-loading-progression` (= master e116cd4) with the new
 `PROSPER_PROGRESS` heartbeat + `PROSPER_PROGRESS_UNIMPL` call-count dump (this branch). All runs:
-WSL2 ext4 fast path (`/root/PPSA17942-app0`), `PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1`.
+WSL2 ext4 fast path (`/root/PPSA17942-app0`), `PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1` — recorded as
+run, but `PROSPER_GUEST_FS` was the then-current Linux opt-in gate for guest `%fs` TLS and has been
+default-on since #825 (2026-07-17); today only `PROSPER_NULL_PAGE=1` is needed here (#2095).
 Tracked as **issue #306** (`bug`, `area:ue4`).
 
 ## 1. The steady state, measured (run 1: no renderer, 420 s)
@@ -261,7 +263,7 @@ pad → title menu → `PROSPER_PAD_SCRIPT` press Start → first level).
 
 ```
 # heartbeat + call-count boot (no renderer, full speed):
-timeout 420 env PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_FILELOG=1 PROSPER_EVLOG=1 \
+timeout 420 env PROSPER_NULL_PAGE=1 PROSPER_FILELOG=1 PROSPER_EVLOG=1 \
   PROSPER_PROGRESS=5 PROSPER_PROGRESS_UNIMPL=1 \
   ./build-linux/boot_trace /root/PPSA17942-app0 > /root/doll.log 2>&1
 # scripts: scripts/diag/run{1..5}*.sh on diag/doll-loading-progression

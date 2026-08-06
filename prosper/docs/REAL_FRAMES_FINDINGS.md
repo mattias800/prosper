@@ -66,8 +66,8 @@ block ~966). Crash RIP varies (downstream corruption). So the actual title/gamep
 Prime suspects (first-exercised on the load path, all currently returning 0): the libSceAgc trace-only stubs
 `H7uZqCoNuWk` (called with a GPU-VA-map shape `a2=0x2000000000 a3=… a4=0x10000`), `-KRzWekV120`,
 `tSBxhAPyytQ`; and the one-shot unimplemented `libSceAmpr` trio (`8aI7R7WaOlc`/`a8uLzYY--tM`/`N-FSPA4S3nI` —
-PS5 async memory/streaming, directly load-relevant). Repro under gdb: `PROSPER_GUEST_FS=1
-PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_FILELOG=1 PROSPER_PREADLOG=1 gdb ./boot_trace`; watch the
+PS5 async memory/streaming, directly load-relevant). Repro under gdb:
+`PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_FILELOG=1 PROSPER_PREADLOG=1 gdb ./boot_trace`; watch the
 `resources.assets` stream reach ~blk 966, then the WORKER-THREAD FAULT.
 
 ## What's in this branch
@@ -94,7 +94,7 @@ PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_FILELOG=1 PROSPER_PREADLOG=1 gdb ./
 
 ```
 # Prove the title renders (reference VS isolates the VS-UV bug):
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER_RENDER_REFVS=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER_RENDER_REFVS=1 \
   PROSPER_FRAME_DIR=/tmp/t ./boot_trace <dump>    # a late frame → ~1992 distinct colors (the title)
 # The game's own render (currently uniform — the VS-UV bug):
 … (drop PROSPER_RENDER_REFVS)

@@ -97,7 +97,7 @@ body originally called highest-value.
 ## Historical — where it stood after #1933 (2026-08-04)
 
 The black-frame era is over. On master `9dcb6c4b` the default environment
-(`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1`, no diagnostics, no
+(`PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1`, no diagnostics, no
 route) produces real content within two seconds: a green legal panel titled *"Welcome to The Oregon
 Trail"*, three legal links, and a focused confirm button, at 3840x2160 with **4,009,938 non-black
 pixels** (48 % of the frame). `assets/screenshots/oregon-trail-legal-popup.png` is that frame.
@@ -430,7 +430,7 @@ at the documented search site `eboot+0x4ab2e00`.
 **Current — the popup, and the fault that follows it (2026-08-04, master `9dcb6c4b`):**
 
 ```bash
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
   ./build-linux/screenshot <DUMP_ROOT>/PPSA19244-app0 \
       --seconds 2 --count 8 --out <OUT> --timeout 60
 ```
@@ -444,7 +444,7 @@ been observed to act, because the crash lands before its first press.
 **Historical — the black-frame draw census (pre-#1933):**
 
 ```bash
-PROSPER_NO_FRAME_DUMPS=1 PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_NO_FRAME_DUMPS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 PROSPER_RENDER_TIMING=1 PROSPER_RTT_TIMING=1 PROSPER_EXECLOG=1 \
   ./build-linux/screenshot <DUMP_ROOT>/PPSA19244-app0 --seconds 10 --count 2 --out <OUT> --timeout 250
 ```

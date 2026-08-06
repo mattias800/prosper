@@ -158,7 +158,7 @@ normal Linux checkout.
 
 ```bash
 # from prosper/ , with a DOLL-dump build of boot_trace:
-PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_DBG=1 \
+PROSPER_NULL_PAGE=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_DBG=1 \
   PROSPER_SHADER_DUMP=/tmp/doll_dump \
   ./build-linux/boot_trace <path-to-PPSA17942-app0> 2> boot.log
 

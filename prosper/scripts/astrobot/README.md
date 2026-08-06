@@ -37,7 +37,7 @@ through `ps_logo` -> `title_controller_ship` -> `worldmap` and stops there:
 
 ```sh
 cd prosper
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_VULKAN_LIB=libvulkan.so.1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_VULKAN_LIB=libvulkan.so.1 \
   ../build-app/screenshot <DUMP_ROOT>/PPSA21564-app0 \
     --seconds 1 --count 300 --timeout 600 --out ~/astro-run
 ```
@@ -59,7 +59,7 @@ route had produced it. Sample sparsely and run long:
 
 ```sh
 cd prosper
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_VULKAN_LIB=libvulkan.so.1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_VULKAN_LIB=libvulkan.so.1 \
   ../build-app/screenshot <DUMP_ROOT>/PPSA21564-app0 \
     --seconds 20 --count 40 --timeout 1200 --out ~/astro-title
 ```
@@ -125,7 +125,6 @@ On a host without a usable VA-API device, explicitly enable the bounded syntheti
 video fallback for control-flow testing:
 
 ```sh
-PROSPER_GUEST_FS=1 \
 PROSPER_GUEST_ARGS=-force-gfx-direct \
 PROSPER_NO_COMPUTE=1 \
 PROSPER_AVP_SYNTH_FRAMES=120 \
@@ -155,7 +154,6 @@ guest pad polling to roughly 1-2 Hz. The route also retains the validated
 flip-anchored Linux sequence:
 
 ```powershell
-$env:PROSPER_GUEST_FS = '1'
 $env:PROSPER_GUEST_ARGS = '-force-gfx-direct'
 $env:PROSPER_NO_COMPUTE = '1'
 $env:PROSPER_PAD_SCRIPT = '@C:/path/to/prosper/scripts/astrobot/reach-first-level-windows.pad'

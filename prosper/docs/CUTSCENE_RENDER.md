@@ -41,7 +41,7 @@ So the game **reaches** the cutscene and submits its draws; they just don't prod
 
 Dump the composite VS and read its position math:
 ```bash
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
   PROSPER_SHADER_DUMP=/tmp/sd PROSPER_RENDER_FIRST=140 PROSPER_DETILE=1 ./boot_trace <dump>
 spirv-dis /tmp/sd/frame_vs.spv          # frame_vs.spv = items[0].vs of the LAST render
 ```
@@ -71,7 +71,7 @@ letterbox appears even before the island/text draw correctly.
 
 ## Repro / tooling
 
-- Repro: `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER_DETILE=1`
+- Repro: `PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER_DETILE=1`
   (+ `PROSPER_RENDER_FIRST=140` to skip to the post-loading phase).
 - `PROSPER_DRAWLOG` (per-draw counts), `PROSPER_SHADER_DUMP=<dir>` (`frame_vs.spv`/`frame_fs.spv` +
   `exec_*_*.bin` for *failed* recompiles), `PROSPER_DUMP_TEX` (bound textures → BMP),

@@ -41,7 +41,6 @@ The direct executable form is also supported. The environment is currently requi
 is no settings UI:
 
 ```powershell
-$env:PROSPER_GUEST_FS = '1'
 $env:PROSPER_GUEST_ARGS = '-force-gfx-direct'
 $env:PROSPER_SAVEDATA_DIR = "$PWD/savedata"
 ./prosper-app.exe --dump 'D:/PS5/PPSA24651-app0'

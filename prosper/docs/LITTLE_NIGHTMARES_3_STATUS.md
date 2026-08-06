@@ -157,7 +157,7 @@ title" — that claim was made on this tracker from an unarmed `svc_log` and wit
 ## Reproduction
 
 ```bash
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER_NULL_PAGE=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER_NULL_PAGE=1 \
   ./build-linux/screenshot <DUMP_ROOT>/PPSA05143-app0 \
       --seconds 10 --count 36 --timeout 380 --out <OUT>
 ```

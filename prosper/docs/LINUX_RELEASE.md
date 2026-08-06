@@ -51,11 +51,11 @@ With the AppImage:
 
 ```bash
 chmod +x prosper-linux-x86_64.AppImage
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_GUEST_ARGS=-force-gfx-direct \
   ./prosper-linux-x86_64.AppImage --dump ~/ps5/PPSA24651-app0
 ```
 
-The tarball ships `start-prosper.sh`, which sets those switches for you and creates a `savedata`
+The tarball ships `start-prosper.sh`, which sets that switch for you and creates a `savedata`
 directory beside itself:
 
 ```bash

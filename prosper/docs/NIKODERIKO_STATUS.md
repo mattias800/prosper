@@ -79,7 +79,7 @@ re-derive these without contradictory new evidence.
 ## Reproduction
 
 ```bash
-PROSPER_NO_FRAME_DUMPS=1 PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_NO_FRAME_DUMPS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 PROSPER_DBG=1 PROSPER_DYNTRACE_FAIL=1 PROSPER_UDPROV=1 \
   ./build-linux/screenshot <DUMP_ROOT>/PPSA23760-app0 --seconds 8 --count 55 --out <OUT> --timeout 460
 ```
