@@ -207,6 +207,21 @@ One line per falsified hypothesis, with the evidence that killed it.
 
 ## Not verified
 
-Rung 2. Whether the post-logo uniform frame is a movie surface, a dropped-draw composite, or a
-legitimate loading screen. Any input route — nothing has been shown to respond to a pad yet. Windows
-or macOS. Performance figures: every arm shared the GPU with other lanes.
+Rung 2. Whether the post-logo uniform frame is a dropped-draw composite or a legitimate loading
+screen — a movie surface is now ruled out above, but the other two are not separated. Whether the two
+dropped `(es, ps)` pipelines are the UI layer, the post chain, or both, and therefore whether
+finishing the reject list is enough to reach a title screen. Any input route — nothing has been shown
+to respond to a pad yet. Windows or macOS. Performance figures: every arm shared the GPU with other
+lanes.
+
+## The next step, in order
+
+1. **Finish the reject list** (#2013). The non-16-bit remainder is small and each piece is separable:
+   the SDWA WORD-select forms of `v_and_b32`/`v_mov_b32`, `v_pk_add_u16`, `v_mbcnt_lo_u32_b32`,
+   `buffer_load_format_xyz`, the #590 `s_cbranch_vcc*` family, `s_flbit_i32_b64`. The two
+   `[mimg-unresolved]` failures belong with the bindless-descriptor work instead.
+2. **Then re-measure the composite**, not before — the two pipelines reject at their *first*
+   unhandled instruction, so no partial tier can be expected to change a pixel.
+3. If the composite is still uniform with zero `[exec-recompile-reject]` lines, the cause is
+   elsewhere and the nine skipped compute programs plus the skipped 16x16x16 volume dispatch are the
+   next inventory.
