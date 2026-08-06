@@ -276,6 +276,129 @@ int main() {
               "realized cube resource preserves selected-mip per-face layout");
     }
 
+    // A T# that selects a NON-ZERO first slice must materialize, at the slice's own byte origin.
+    // image_base_level_view has modelled that origin since #5237659e (the case directly above pins
+    // its 720896-byte per-slice stride), but every materialization path still refused the descriptor
+    // outright — a guard left over from before the stride existed. Sonic Racing: CrossWorlds
+    // (PPSA08804) samples layer 1 of a 4K 2D_ARRAY target from both of the pixel shaders whose draws
+    // were dropped, so the resource never reached the recompiler and the sample read as an
+    // unresolved descriptor. Same fixture as above, one field changed, so the two read as a pair.
+    {
+        uint32_t sg[8];
+        make_tsharp(sg, 0x31465d0000ull, 256, 256, /*RGBA16F*/71,
+                    /*SW_64KB_R_X*/27, /*2D array*/13, /*layers*/6, /*base array*/1);
+        sg[3] |= (1u << 12) | (1u << 16);
+        sg[5] |= 8u << 4;
+        AgcShaderSharp sharp[1]; sharp[0].bits = 0;
+        AgcShaderUserData ud{};
+        ud.sharp_resource_offset[0] = sharp;
+        ud.sharp_resource_count[0] = 1;
+        AgcShaderHeader sh{};
+        sh.file_header = 0x34333231u; sh.version = 0x18; sh.type = 1; sh.user_data = &ud;
+        const ShaderResourceTable resources = build_shader_resources(sh, sg, 8);
+        const ShaderResource* slice = resources.by_sgpr_base(0);
+        CHECK(slice && slice->img_dim == 5 && slice->depth == 6 &&
+                  slice->gpu_addr == 0x31465d0000ull + 720896u &&
+                  slice->layer_stride_bytes == 720896u &&
+                  slice->layer_mip_offset_bytes == 65536u,
+              "2D-array T# selecting BASE_ARRAY=1 materializes at the second slice's origin");
+
+        // Contract mutations. The gate is on the image TYPE, not on BASE_ARRAY being zero: only the
+        // types whose per-slice stride image_base_level_view actually computes (cube, 2D array) may
+        // carry a non-zero first slice. 1D_ARRAY, 2D_MSAA_ARRAY and a 3D UAV view have unmodelled
+        // slice origins and must still fail closed — binding them would silently sample slice zero.
+        // Each of these arms materializes a resource (at the WRONG address) if the type gate is
+        // dropped and the predicate merely deleted.
+        uint32_t sg_1d_array[8];
+        make_tsharp(sg_1d_array, 0x31465d0000ull, 256, 1, /*RGBA16F*/71,
+                    /*SW_64KB_R_X*/27, /*1D array*/12, /*layers*/6, /*base array*/1);
+        CHECK(build_shader_resources(sh, sg_1d_array, 8).by_sgpr_base(0) == nullptr,
+              "1D_ARRAY T# with BASE_ARRAY=1 stays refused (per-slice origin unmodelled)");
+
+        uint32_t sg_msaa_array[8];
+        make_tsharp(sg_msaa_array, 0x31465d0000ull, 256, 256, /*RGBA16F*/71,
+                    /*SW_64KB_R_X*/27, /*2D_MSAA array*/15, /*layers*/6, /*base array*/1);
+        CHECK(build_shader_resources(sh, sg_msaa_array, 8).by_sgpr_base(0) == nullptr,
+              "2D_MSAA_ARRAY T# with BASE_ARRAY=1 stays refused");
+
+        uint32_t sg_3d_uav[8];
+        make_tsharp(sg_3d_uav, 0x31465d0000ull, 256, 256, /*RGBA16F*/71,
+                    /*SW_64KB_R_X*/27, /*3D*/10, /*depth*/6);
+        sg_3d_uav[4] = (1u << 16) | 6u;     // BASE_ARRAY=1, LAST=6 (a UAV-style layer window)
+        sg_3d_uav[5] |= 1u;                 // ARRAY_PITCH bit 0 -> read WORD4 as first/last layer
+        const DecodedImageDescriptor d3d_uav = decode_image_descriptor(sg_3d_uav);
+        CHECK(d3d_uav.base_array == 1 && d3d_uav.depth == 6,
+              "3D UAV-view fixture really does decode a non-zero BASE_ARRAY");
+        CHECK(build_shader_resources(sh, sg_3d_uav, 8).by_sgpr_base(0) == nullptr,
+              "3D UAV view with BASE_ARRAY=1 stays refused");
+
+        // A layered TYPE is necessary but not sufficient: image_base_level_view only applies the
+        // slice offset once it has a proven mip-chain layout, and it legitimately does not have one
+        // for any tile mode outside {LINEAR, 256B_S, 4KB_S, 64KB_S, 64KB_Z_X, 64KB_R_X}. That early
+        // return keeps view.base at the ALLOCATION base, and with BASE_LEVEL 0 it used to report
+        // supported — which would bind slice ZERO's texels for a descriptor selecting slice 1. No
+        // error, no validation failure, just the wrong image. It must fail closed instead.
+        uint32_t sg_untiled[8];
+        make_tsharp(sg_untiled, 0x31465d0000ull, 256, 256, /*RGBA16F*/71,
+                    /*an unhandled GFX10 swizzle*/3, /*2D array*/13, /*layers*/6, /*base array*/1);
+        Gen5ImageFormatInfo untiled_format;
+        CHECK(gen5_image_format(71, &untiled_format), "unhandled-tile fixture format is mapped");
+        const DecodedImageDescriptor duntiled = decode_image_descriptor(sg_untiled);
+        CHECK(duntiled.base_array == 1 && duntiled.base_level == 0 && duntiled.tile_mode == 3,
+              "unhandled-tile fixture really is BASE_ARRAY=1 at BASE_LEVEL 0");
+        CHECK(!image_base_level_view(duntiled, untiled_format).supported,
+              "a layered view whose slice offset could not be applied fails closed, never unshifted");
+        CHECK(build_shader_resources(sh, sg_untiled, 8).by_sgpr_base(0) == nullptr,
+              "no resource is bound at slice zero for a BASE_ARRAY=1 T# with no proven layout");
+
+        // The same descriptor at BASE_ARRAY 0 still takes the historical path: an unproven layout is
+        // not itself a reason to drop a level-zero view, and this arm is what keeps the guard above
+        // from being a blanket rejection of unhandled tile modes.
+        uint32_t sg_untiled_slice0[8];
+        make_tsharp(sg_untiled_slice0, 0x31465d0000ull, 256, 256, /*RGBA16F*/71,
+                    /*an unhandled GFX10 swizzle*/3, /*2D array*/13, /*layers*/6, /*base array*/0);
+        const DecodedImageView vslice0 =
+            image_base_level_view(decode_image_descriptor(sg_untiled_slice0), untiled_format);
+        CHECK(vslice0.supported && vslice0.base == 0x31465d0000ull,
+              "the same unproven-layout view at BASE_ARRAY 0 is unchanged and still supported");
+    }
+
+    // The reject predicate names WHY a candidate T# was refused. A dropped texture is otherwise
+    // invisible: the draw's only symptom is the recompiler reporting an unresolved descriptor, which
+    // reads identically to a provenance failure and sent one investigation down the wrong path.
+    {
+        uint32_t good[8];
+        make_tsharp(good, 0x31465d0000ull, 256, 256, /*RGBA16F*/71, /*tile*/27, /*2D*/9);
+        CHECK(image_descriptor_reject_reason(decode_image_descriptor(good)) == nullptr,
+              "a well-formed 2D T# is not rejected");
+
+        uint32_t zero_base[8]; memcpy(zero_base, good, sizeof good);
+        zero_base[0] = 0; zero_base[1] &= ~0xffu;
+        CHECK(image_descriptor_reject_reason(decode_image_descriptor(zero_base)) != nullptr &&
+                  strcmp(image_descriptor_reject_reason(decode_image_descriptor(zero_base)),
+                         "base-zero") == 0,
+              "a zero-base T# is rejected as base-zero");
+
+        uint32_t bad_type[8]; memcpy(bad_type, good, sizeof good);
+        bad_type[3] = (bad_type[3] & ~(0xfu << 28)) | (0u << 28);   // TYPE 0 = buffer, not an image
+        CHECK(image_descriptor_reject_reason(decode_image_descriptor(bad_type)) != nullptr &&
+                  strcmp(image_descriptor_reject_reason(decode_image_descriptor(bad_type)),
+                         "bad-image-type") == 0,
+              "a non-image TYPE is rejected as bad-image-type");
+
+        // LAST_ARRAY < BASE_ARRAY decodes to depth 0 — a malformed inverted range, not one layer,
+        // and it must keep failing visibly (#2005).
+        uint32_t inverted[8];
+        make_tsharp(inverted, 0x31465d0000ull, 256, 256, /*RGBA16F*/71, /*tile*/27,
+                    /*2D array*/13, /*layers*/1, /*base array*/4);
+        inverted[4] = (4u << 16) | 1u;                              // BASE_ARRAY 4, LAST_ARRAY 1
+        const DecodedImageDescriptor dinv = decode_image_descriptor(inverted);
+        CHECK(dinv.depth == 0, "inverted array-range fixture really decodes depth 0");
+        CHECK(image_descriptor_reject_reason(dinv) != nullptr &&
+                  strcmp(image_descriptor_reject_reason(dinv), "inverted-array-range") == 0,
+              "an inverted LAST_ARRAY/BASE_ARRAY range is rejected as inverted-array-range");
+    }
+
     // The runtime resource preserves the guest sample count, exposes one host mip, and bounds the
     // complete four-plane allocation. This is the identity consumed by recompile, capture, and upload.
     {

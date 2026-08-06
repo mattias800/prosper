@@ -4051,14 +4051,14 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     t.resources.push_back(r);
                 } else {                                  // sampled texture or storage image (T# [+ paired S#])
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
+                    const char* reject = image_descriptor_reject_reason(d);
                     if (g_dyntrace_force)
-                        fprintf(stderr, "[dynfail] tex use pc=%u key=0x%x base=0x%llx %ux%u fmt=%u tile=%u\n",
+                        fprintf(stderr, "[dynfail] tex use pc=%u key=0x%x base=0x%llx %ux%u type=%u "
+                                        "base_array=%u fmt=%u tile=%u -> %s\n",
                                 u.use_pc, u.key, (unsigned long long)d.base, d.width, d.height,
-                                d.format, d.tile_mode);
-                    if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
-                        !valid_image_type(d.type) ||
-                        d.base_array != 0 ||
-                        d.width > 16384 || d.height > 16384) continue;       // garbage/degenerate T#
+                                d.type, d.base_array, d.format, d.tile_mode,
+                                reject ? reject : "materialize");
+                    if (reject) continue;                                    // garbage/degenerate T#
                     // A previous use already produced a resource for this SAME selected view (address +
                     // extent): don't duplicate the binding/upload — give it this use's pc provenance
                     // if it has none yet (#273). If it already carries a DIFFERENT use's pc, fall
@@ -4513,10 +4513,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
                         if (r0.srt_offset == u.key) { clash = true; break; }
                 {                                         // T# — storage image (store) or sampled texture
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
-                    if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
-                        !valid_image_type(d.type) ||
-                        d.base_array != 0 ||
-                        d.width > 16384 || d.height > 16384) continue;   // garbage/degenerate T#
+                    const char* reject = image_descriptor_reject_reason(d);
+                    if (g_dyntrace_force)
+                        fprintf(stderr, "[dynfail] compute tex use pc=%u key=0x%x base=0x%llx %ux%u "
+                                        "type=%u base_array=%u fmt=%u tile=%u -> %s\n",
+                                u.use_pc, u.key, (unsigned long long)d.base, d.width, d.height,
+                                d.type, d.base_array, d.format, d.tile_mode,
+                                reject ? reject : "materialize");
+                    if (reject) continue;                            // garbage/degenerate T#
                     Gen5ImageFormatInfo fi;
                     const bool mapped_fmt = gen5_image_format(d.format, &fi);
                     // Unknown sampled formats cannot be decoded. Unknown storage formats may still
@@ -4524,10 +4528,15 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     // rejects them instead of silently treating arbitrary bytes as RGBA8.
                     if (!mapped_fmt && !u.is_storage_image) continue;
                     if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
+                    // The unmapped-format fallback builds a view by hand and therefore never applies
+                    // a slice offset. It must fail closed on a non-zero BASE_ARRAY for the same
+                    // reason image_base_level_view's early returns do: an unshifted base under a
+                    // selected slice binds slice ZERO's texels silently. (Storage images are the only
+                    // consumer here — a sampled use with an unmapped format was already dropped.)
                     const DecodedImageView view = mapped_fmt
                         ? image_base_level_view(d, fi)
                         : DecodedImageView{d.base, d.width, d.height, 0, false, 0, 0, 0,
-                                           0, 0, d.base_level == 0};
+                                           0, 0, d.base_level == 0 && d.base_array == 0};
                     if (!view.supported) {
                         warn_unsupported_image_view(d);
                         continue;
