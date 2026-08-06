@@ -1722,6 +1722,38 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
 // external branch edge into the region. This is intentionally stronger than merely observing an
 // earlier forward branch: the prior no-hit experiment did not establish dominance and could hide an
 // unguarded missing descriptor.
+// SOPP direct branches: s_branch (0x02) and the s_cbranch_* family (0x04..0x09). Hoisted so the two
+// CFG proofs in this file share one definition of "is a branch" and one target computation — #2181
+// unified four private copies of the VOPC cmpx windows for the same reason, and #2120 is the
+// cautionary tale for a forked predicate.
+bool sopp_is_branch(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOPP &&
+           (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
+}
+bool sopp_is_unconditional_branch(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOPP && in.opcode == 0x02;
+}
+// GFX10 branch target: PC of the branch + its own length + the signed dword displacement. Direction
+// is deliberately NOT filtered here — a predecessor tally that only counts forward edges is not a
+// predecessor tally (#2202 review, B2).
+int64_t sopp_branch_target(const Rdna2Inst& in) {
+    return static_cast<int64_t>(in.pc) + static_cast<int64_t>(in.len_dwords) +
+           static_cast<int64_t>(in.simm16);
+}
+// Indirect control transfer: s_setpc_b64 / s_swappc_b64 / s_rfe_b64 (SOP1 0x20/0x21/0x22) and
+// s_call_b64 (SOPK 0x16). Encodings round-tripped through llvm-mc -mcpu=gfx1030, never read off a
+// table (see SONIC_CROSSWORLDS_STATUS.md § Ruled out, the 0x305 trap). A shader containing one has a
+// CFG no static scan over SOPP displacements can represent.
+bool has_indirect_control_flow(const std::vector<Rdna2Inst>& instructions) {
+    for (const Rdna2Inst& in : instructions) {
+        if (in.fmt == Rdna2Format::SOP1 &&
+            (in.opcode == 0x20 || in.opcode == 0x21 || in.opcode == 0x22))
+            return true;
+        if (in.fmt == Rdna2Format::SOPK && in.opcode == 0x16) return true;
+    }
+    return false;
+}
+
 bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc) {
     auto changes_exec = [](const Rdna2Inst& in) {
         // Every v_cmpx writes EXEC. This listed three of the six windows, so a cmpx from
@@ -1735,13 +1767,8 @@ bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc
                 in.opcode == 0x37 || in.opcode == 0x38 ||
                 in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44);
     };
-    auto is_branch = [](const Rdna2Inst& in) {
-        return in.fmt == Rdna2Format::SOPP &&
-               (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
-    };
-    auto target = [](const Rdna2Inst& in) -> int64_t {
-        return static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
-    };
+    const auto& is_branch = sopp_is_branch;
+    const auto& target = sopp_branch_target;
 
     for (size_t i = 1; i < instructions.size(); ++i) {
         const Rdna2Inst& guard = instructions[i];
@@ -1930,6 +1957,178 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_seed_origin_known.set((size_t)reg);
         }
     }
+    // BRANCH-EXCLUSIVE WRITES (#2132). This fold walks the decoded stream STRAIGHT-LINE — it models
+    // no control flow at all. That is fine while every block is on one path, and silently wrong the
+    // moment a shader guards its descriptor setup with a branch: the walk executes the not-taken
+    // side and carries its register writes into a block that, on hardware, is only ever entered from
+    // the branch. CrossWorlds' failing NGG vertex stage is exactly that shape —
+    //
+    //     pc=21   s_cbranch_vccz 151                  -> pc=173
+    //     pc=45   s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60    (not-taken side)
+    //     pc=113  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60    (not-taken side)
+    //     pc=172  s_branch 47                         -> pc=220     (so pc=173 has NO fall-through)
+    //     pc=173  s_load_dword     s20, s[18:19]
+    //     pc=188  s_load_dwordx4   s[4:7], s[16:17], vcc_lo
+    //
+    // s16..s19 are the stage's two DECLARED DIRECT POINTERS, seeded above and both readable. The
+    // two dwordx16 loads overwrite them with float uniforms (0x3f800000 = 1.0f and zeros), so by
+    // pc=173 the walk dereferences 0 and reports a "null bindless-table pointer" that no writer ever
+    // wrote and no guest ever had. Four investigations hunted that phantom writer.
+    //
+    // THE QUALIFYING SHAPE, stated as what the code actually tests (#2202 review, B1/B2):
+    //
+    //   * `ins` is the COMPACTED fold stream (`retain_fold_instructions`), which drops ordinary
+    //     VALU/EXP/DS/FLAT while preserving original PCs. So "the previous element" is the previous
+    //     RETAINED instruction, and a dropped VALU block between it and the target would be
+    //     invisible. The check is therefore PHYSICAL: `prev.pc + prev.len_dwords == ins[k].pc`
+    //     proves prev immediately precedes the target in the real program, whatever was compacted
+    //     away. Without it a target with a genuine fall-through predecessor can qualify, and the
+    //     restore then installs a *known* wrong value — a worse failure than the bug being fixed.
+    //   * prev must be an UNCONDITIONAL `s_branch`, so no fall-through edge enters the target.
+    //   * EXACTLY ONE branch in the DECODED STREAM targets it, counted over BOTH directions. A
+    //     backward edge into the target is a second predecessor and disqualifies it. "Decoded
+    //     stream" rather than "program" is deliberate: the decode stops at the first s_endpgm, so
+    //     anything past it is not scanned. B1 existed because a property of a stream was described
+    //     as a property of a program, so the distinction is spelled out rather than assumed.
+    //   * The program contains no indirect control transfer at all; one makes the CFG
+    //     unrepresentable by any scan over SOPP displacements, so the rule declines to fire.
+    //
+    // This is the same standard `guarded_bvh_use` above already holds itself to, and for the same
+    // reason its comment gives: observing an earlier forward branch does not establish dominance.
+    //
+    // The target's only predecessor is then the branch at B, and since a SOPP branch writes no
+    // register, THE STATE AT THE TARGET IS EXACTLY THE STATE AT B. So the rule is a whole-state
+    // save at B and restore at the target, rather than a per-register rollback: every write in
+    // (B, target) belongs to a path that cannot reach the target, including the ones that live in
+    // `scc`, the scalar spill slots and the vector index-mode table, which a register-only rollback
+    // left behind. Published uses (`out`, `srt_uses`) are deliberately NOT rolled back: an
+    // instruction inside the skipped region is genuinely reachable on its own path and the
+    // recompiler still needs its descriptor.
+    //
+    // What this does NOT claim: that the state at B is itself right. If branches precede B the walk
+    // may already be a chimera, and this only makes the target agree with the walk's own state at B.
+    // That is strictly closer to one real path than mixing both arms of a branch.
+    // CONFIDENCE: HIGH on the CFG rule; the shape is proved from the guest's own encodings.
+    //
+    // Kept allocation-free for the overwhelmingly common shader (no branch at all): this fold runs
+    // thousands of times per submit. The scan is linear — one pass collecting every branch target,
+    // one sort, then a binary search per candidate.
+    std::vector<std::pair<uint32_t, uint32_t>> restore_at;   // (target pc, its sole predecessor branch pc)
+    size_t restore_cursor = 0;
+    {
+        // PROSPER_NO_BRANCH_EXCLUSIVE=<any value> restores the old straight-line walk. It exists so
+        // the A/B that established this — CrossWorlds' two dropped vertex pipelines and its
+        // `[mubuf-unresolved]` line appear with it set and are absent without it — stays reproducible
+        // for the next reader, in the same spirit as PROSPER_UD_TAIL_ALIGN. It must stay OFF in every
+        // normal run: with it set the fold reports descriptors built from a path the wave cannot be on.
+        static const bool branch_exclusive_disabled =
+            std::getenv("PROSPER_NO_BRANCH_EXCLUSIVE") != nullptr;
+        bool any_branch = false;
+        for (const Rdna2Inst& in : ins)
+            if (sopp_is_branch(in)) { any_branch = true; break; }
+        if (any_branch && !branch_exclusive_disabled && !has_indirect_control_flow(ins)) {
+            // Every branch edge, both directions — the predecessor tally is only a tally if it
+            // counts them all.
+            std::vector<std::pair<uint32_t, uint32_t>> edges;   // (target, branch pc)
+            for (const Rdna2Inst& in : ins) {
+                if (!sopp_is_branch(in)) continue;
+                const int64_t t = sopp_branch_target(in);
+                if (t < 0 || t > (int64_t)UINT32_MAX) continue;
+                edges.emplace_back((uint32_t)t, in.pc);
+            }
+            std::sort(edges.begin(), edges.end());
+            for (size_t k = 1; k < ins.size(); ++k) {
+                const Rdna2Inst& prev = ins[k - 1];
+                const uint32_t t = ins[k].pc;
+                if (!sopp_is_unconditional_branch(prev)) continue;      // a fall-through edge exists
+                if (prev.pc + prev.len_dwords != t) continue;           // ...unless prev physically ends here
+                const auto lo = std::lower_bound(edges.begin(), edges.end(),
+                                                 std::make_pair(t, uint32_t{0}));
+                const auto hi = std::upper_bound(edges.begin(), edges.end(),
+                                                 std::make_pair(t, UINT32_MAX));
+                if (std::distance(lo, hi) != 1) continue;               // 0 or >=2 predecessors
+                const uint32_t source = lo->second;
+                if (source >= t) continue;                              // a lone backward edge: no region
+                restore_at.emplace_back(t, source);
+            }
+        }
+    }
+    // The interpreter state that a restore has to put back. Everything the walk mutates and that can
+    // be read after the target — deliberately excluding the published uses, and excluding
+    // `next_null_chain_origin`, which is a monotonic id allocator: rewinding it would let two
+    // distinct null chains share an origin, which is worse than leaking ids.
+    struct FoldStateSnapshot {
+        std::array<uint32_t, kFoldSgprs> val;
+        std::bitset<kFoldSgprs> val_known;
+        std::array<uint32_t, kFoldSgprs> val_seed_origin;
+        std::bitset<kFoldSgprs> val_seed_origin_known;
+        std::array<uint32_t, kFoldSgprs> val_srt_key;
+        std::bitset<kFoldSgprs> val_srt_key_known;
+        std::unordered_map<uint32_t, uint32_t> scalar_spill_slots;
+        std::array<std::array<uint32_t, 4>, kFoldSgprs> descr;
+        std::bitset<kFoldSgprs> descr_known;
+        std::array<uint32_t, kFoldSgprs> descr_key;
+        std::bitset<kFoldSgprs> descr_key_known;
+        std::array<std::array<uint32_t, 8>, kFoldSgprs> descr8;
+        std::bitset<kFoldSgprs> descr8_known;
+        std::array<uint32_t, kFoldSgprs> descr8_key;
+        std::bitset<kFoldSgprs> descr8_key_known;
+        std::array<uint32_t, kFoldSgprs> null_chain_origin;
+        std::bitset<kFoldSgprs> null_chain_known;
+        std::bitset<kFoldSgprs> reloaded;
+        std::array<FoldMask, kFoldSgprs> mask_state;
+        std::array<VertexFetchIndexMode, kFoldVgprs> vector_index_mode;
+        int scc;
+    };
+    // One slot per qualifying target, indexed rather than searched: each target has exactly one
+    // predecessor branch, so `restore_slot[i]` is the slot that `restore_at[i]`'s branch fills.
+    // `.first` is "this slot has been written", so a target reached before its branch (impossible for
+    // a forward edge, but cheap to be safe about) restores nothing rather than garbage.
+    std::vector<std::pair<bool, FoldStateSnapshot>> saved_at_branch;
+    std::vector<size_t> restore_slot;
+    std::unordered_map<uint32_t, size_t> save_slot_of_pc;
+    if (!restore_at.empty()) {
+        restore_slot.reserve(restore_at.size());
+        saved_at_branch.reserve(restore_at.size());
+        for (const auto& [target, branch_pc] : restore_at) {
+            (void)target;
+            auto existing = save_slot_of_pc.find(branch_pc);
+            if (existing == save_slot_of_pc.end()) {
+                existing = save_slot_of_pc.emplace(branch_pc, saved_at_branch.size()).first;
+                saved_at_branch.emplace_back();
+                saved_at_branch.back().first = false;
+            }
+            restore_slot.push_back(existing->second);
+        }
+    }
+    auto capture_fold_state = [&]() {
+        FoldStateSnapshot s;
+        s.val = val; s.val_known = val_known;
+        s.val_seed_origin = val_seed_origin; s.val_seed_origin_known = val_seed_origin_known;
+        s.val_srt_key = val_srt_key; s.val_srt_key_known = val_srt_key_known;
+        s.scalar_spill_slots = scalar_spill_slots;
+        s.descr = descr; s.descr_known = descr_known;
+        s.descr_key = descr_key; s.descr_key_known = descr_key_known;
+        s.descr8 = descr8; s.descr8_known = descr8_known;
+        s.descr8_key = descr8_key; s.descr8_key_known = descr8_key_known;
+        s.null_chain_origin = null_chain_origin; s.null_chain_known = null_chain_known;
+        s.reloaded = reloaded; s.mask_state = mask_state;
+        s.vector_index_mode = vector_index_mode; s.scc = scc;
+        return s;
+    };
+    auto restore_fold_state = [&](const FoldStateSnapshot& s) {
+        val = s.val; val_known = s.val_known;
+        val_seed_origin = s.val_seed_origin; val_seed_origin_known = s.val_seed_origin_known;
+        val_srt_key = s.val_srt_key; val_srt_key_known = s.val_srt_key_known;
+        scalar_spill_slots = s.scalar_spill_slots;
+        descr = s.descr; descr_known = s.descr_known;
+        descr_key = s.descr_key; descr_key_known = s.descr_key_known;
+        descr8 = s.descr8; descr8_known = s.descr8_known;
+        descr8_key = s.descr8_key; descr8_key_known = s.descr8_key_known;
+        null_chain_origin = s.null_chain_origin; null_chain_known = s.null_chain_known;
+        reloaded = s.reloaded; mask_state = s.mask_state;
+        vector_index_mode = s.vector_index_mode; scc = s.scc;
+    };
     if (explicit_ngg_index_provenance) {
         // s3 is the merged GS/ES wave info: s3[7:0] is the active ES-vertex count and s3[15:8]
         // the GS-primitive count.  The Vulkan vertex shell represents one active ES vertex and no
@@ -2026,6 +2225,39 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
 
     for (const auto& in : ins) {
         if (in.is_end) break;
+        // #2132. RESTORE FIRST, THEN SAVE — the order is load-bearing and getting it wrong
+        // reproduces the very defect this rule exists to fix (#2202 review, B3). One instruction can
+        // be BOTH a qualifying target and the sole-predecessor branch of a later target: a block
+        // whose first instruction is a branch, which is ordinary compiler output. Saving first would
+        // store the pre-restore chimera and reinstate it one block later, so the second target would
+        // be handed exactly the mixed-path state the rule is meant to remove.
+        //
+        // Arrival at a target: put back the state its only predecessor left, discarding everything
+        // the walk did on the path that branch skips. `restore_at` is ascending by target, as is the
+        // walk, so a cursor suffices.
+        while (restore_cursor < restore_at.size() && restore_at[restore_cursor].first < in.pc)
+            ++restore_cursor;
+        if (restore_cursor < restore_at.size() && restore_at[restore_cursor].first == in.pc) {
+            const size_t slot = restore_slot[restore_cursor];
+            if (slot < saved_at_branch.size() && saved_at_branch[slot].first) {
+                restore_fold_state(saved_at_branch[slot].second);
+                if (trc)
+                    fprintf(stderr, "[dyntrace]   branch-exclusive: pc=%u restored the fold state to "
+                                    "pc=%u (its only predecessor); every write in between is on the "
+                                    "path that branch skips\n",
+                            in.pc, restore_at[restore_cursor].second);
+            }
+        }
+        // ...and only now record the state at this instruction, if it is itself some later target's
+        // only predecessor. Each source appears at most once in `restore_at`, so this is an indexed
+        // store rather than a scan.
+        if (!save_slot_of_pc.empty()) {
+            const auto slot = save_slot_of_pc.find(in.pc);
+            if (slot != save_slot_of_pc.end()) {
+                saved_at_branch[slot->second].first = true;
+                saved_at_branch[slot->second].second = capture_fold_state();
+            }
+        }
         const bool scalar_spill = in.fmt == Rdna2Format::VOP3 &&
                                   (in.opcode == 0x360 || in.opcode == 0x361);
         const bool vector_select =
@@ -2551,6 +2783,54 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                 guest_write_history_size(), guest_write_recorder_summary(),
                                 guest_write_history_size() ? ""
                                     : "  <- HISTORY EMPTY: this is VOID, not negative");
+                    }
+                }
+                // WHOLE-BUFFER DUMP for a traced scalar buffer load (#2132). When a bindless chain
+                // dies on a pointer field that reads zero, the loaded dwords alone cannot separate
+                // "this buffer legitimately carries no table pointer here" from "we read the wrong
+                // bytes of the right buffer" from "this is the wrong buffer" — all three produce the
+                // same null. So dump the buffer the descriptor itself bounds, and flag every dword
+                // pair inside it that is a mapped guest address. That makes the negative checkable
+                // against the buffer's own contents instead of against the one offset the chain
+                // happened to dereference: a table pointer present at some OTHER offset is a
+                // positive instance built independently of the failing load, which is the only kind
+                // that can validate this null (CLAUDE.md, same-source positive controls).
+                // Bounded by the V#'s own size and a hard cap; probes readability before touching.
+                if (trc && is_buffer) {
+                    uint32_t r2 = 0, r3 = 0;
+                    const bool size_ok = known(sbase + 2, r2) && known(sbase + 3, r3);
+                    uint32_t stride = 0, b1v = 0;
+                    if (known(sbase + 1, b1v)) stride = (b1v >> 16) & 0x3FFFu;
+                    uint64_t bytes = 0;
+                    if (size_ok) bytes = stride ? (uint64_t)r2 * stride : (uint64_t)r2;
+                    const uint64_t kCap = 512;
+                    if (bytes > kCap) bytes = kCap;
+                    fprintf(stderr, "[dyntrace]   V# buffer base=0x%llx stride=%u num_records=%u "
+                                    "dword3=0x%08x -> %llu bytes%s\n",
+                            (unsigned long long)base, stride, r2, r3,
+                            (unsigned long long)bytes, size_ok ? "" : " (size UNKNOWN)");
+                    if (bytes >= 4 && readable(base, (uint32_t)bytes)) {
+                        const uint32_t* buf = (const uint32_t*)(uintptr_t)base;
+                        // NOT `dwords` — that names the shader length in this scope (#2202 N4).
+                        const uint32_t buf_dwords = (uint32_t)(bytes / 4);
+                        for (uint32_t i = 0; i < buf_dwords; i += 8) {
+                            fprintf(stderr, "[dyntrace]   +0x%03x:", i * 4);
+                            for (uint32_t j = i; j < i + 8 && j < buf_dwords; ++j)
+                                fprintf(stderr, " %08x", buf[j]);
+                            fprintf(stderr, "\n");
+                        }
+                        fprintf(stderr, "[dyntrace]   mapped 64-bit pointer candidates in buffer:");
+                        bool any_ptr = false;
+                        for (uint32_t i = 0; i + 1 < buf_dwords; ++i) {
+                            const uint64_t cand =
+                                (uint64_t)buf[i] | ((uint64_t)buf[i + 1] << 32);
+                            if (cand <= 0x10000 || !readable(cand, 8)) continue;
+                            fprintf(stderr, " +0x%x=0x%llx", i * 4, (unsigned long long)cand);
+                            any_ptr = true;
+                        }
+                        fprintf(stderr, "%s\n", any_ptr ? "" : " none");
+                    } else {
+                        fprintf(stderr, "[dyntrace]   buffer body not readable -> dump skipped\n");
                     }
                 }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;

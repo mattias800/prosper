@@ -2306,6 +2306,166 @@ int main() {
               cached_first[0].desc.base == 0x1000u && patched[0].desc.base == 0x2000u,
           "cache invalidation preserves the real fold result after a shader literal changes");
 
+    // Kernel 6 (#2132): BRANCH-EXCLUSIVE WRITES. The fold walks straight-line, so a shader that
+    // guards its descriptor setup with a branch had the not-taken side's register writes carried
+    // into a block the hardware only ever enters FROM the branch. CrossWorlds' NGG vertex stage is
+    // this shape: `s_cbranch_vccz T`, then a `s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60` that
+    // overwrites the stage's two seeded direct pointers with float uniforms, then an unconditional
+    // `s_branch` OVER T — so T has no fall-through predecessor and exactly one branch reaches it.
+    // At T the shader dereferences s[16:17]; the walk had replaced it with 1.0f/0, which read as a
+    // "null bindless-table pointer" that no writer ever wrote.
+    //
+    // Layout mirrors the guest exactly: a 160-byte stride-16 constant buffer whose dwords at +0x60
+    // are 1.0f,0,0,0, and a descriptor table reached only through the seeded pointer at dw8.
+    alignas(16) uint32_t k6_vbuf[32] = {};                  // 8 records x 16 bytes
+    alignas(16) uint32_t k6_cbuf[40] = {};                  // 10 records x 16 bytes = 160
+    k6_cbuf[24] = 0x3F800000u;                              // +0x60 = 1.0f  (lands in s16)
+    k6_cbuf[25] = 0u; k6_cbuf[26] = 0u; k6_cbuf[27] = 0u;   // +0x64..+0x6c  (s17, s18, s19)
+    const uint64_t k6_vbuf_addr = (uint64_t)(uintptr_t)k6_vbuf;
+    alignas(16) uint32_t k6_table[4] = {
+        (uint32_t)k6_vbuf_addr,
+        (uint32_t)((k6_vbuf_addr >> 32) & 0xFFFFu) | (16u << 16),   // stride 16
+        8u, 0u,
+    };
+    const uint64_t k6_cbuf_addr = (uint64_t)(uintptr_t)k6_cbuf;
+    const uint64_t k6_table_addr = (uint64_t)(uintptr_t)k6_table;
+    uint32_t seed6[12] = {
+        (uint32_t)k6_cbuf_addr,                                          // dw0..3 -> s8..s11: cbuf V#
+        (uint32_t)((k6_cbuf_addr >> 32) & 0xFFFFu) | (16u << 16),        //   stride 16
+        10u, 0u,                                                         //   num_records 10 (160 B)
+        0u, 0u, 0u, 0u,                                                  // dw4..7 -> s12..s15
+        (uint32_t)k6_table_addr,                                         // dw8..9 -> s16:s17 table ptr
+        (uint32_t)(k6_table_addr >> 32),
+        0u, 0u,                                                          // dw10..11 -> s18:s19
+    };
+    const uint32_t k6[] = {
+        0xBF860003u,                // pc=0  s_cbranch_vccz 3      -> T (pc=4)
+        0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+        0xBF820004u,                // pc=3  s_branch 4            -> pc=8 (so T has no fall-through)
+        0xF4080108u, 0xFA000000u,   // pc=4  T: s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=6  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF810000u,                // pc=8  s_endpgm
+    };
+    auto k6_fetch = resolve_dynamic_fetch(k6, sizeof(k6)/sizeof(k6[0]), seed6, 12, 8);
+    CHECK(k6_fetch.size() == 1 &&
+              k6_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "#2132: a branch-exclusive write does not clobber the seeded pointer its target reads");
+
+    // Counter-arm — the same kernel with ONE dword changed: the unconditional s_branch at pc=3
+    // becomes s_nop, so T now HAS a fall-through predecessor and the rule must not fire. Without
+    // this arm the assertion above would also pass if the fold simply re-seeded every register at
+    // every block, which is a different (and wrong) behaviour.
+    uint32_t k6_ft[sizeof(k6)/sizeof(k6[0])];
+    std::copy(std::begin(k6), std::end(k6), std::begin(k6_ft));
+    k6_ft[3] = 0xBF800000u;         // s_nop 0
+    clear_shader_decode_cache();
+    auto k6_ft_fetch = resolve_dynamic_fetch(k6_ft, sizeof(k6_ft)/sizeof(k6_ft[0]), seed6, 12, 8);
+    CHECK(k6_ft_fetch.empty() ||
+              k6_ft_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "#2132 counter-arm: a target with a fall-through predecessor keeps the walked value");
+
+    // Kernel 7 (#2202 B1): the fold walks a COMPACTED stream (`retain_fold_instructions`) that drops
+    // EXP among other formats while preserving PCs, so "the previous element of `ins`" is not "the
+    // instruction before it". Here an `exp` sits physically between the `s_branch` at pc=3 and the
+    // target at pc=6, giving the target a real fall-through predecessor — but the previous RETAINED
+    // instruction is still that `s_branch`. Without the physical-adjacency conjunct the rule fires
+    // and *installs a known wrong value*, which is worse than the bug it fixes. It must decline.
+    const uint32_t k7[] = {
+        0xBF860005u,                // pc=0  s_cbranch_vccz 5     -> pc=6
+        0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+        0xBF820006u,                // pc=3  s_branch 6           -> pc=10
+        0xF80000CFu, 0x00000000u,   // pc=4  exp pos0 v0,v0,v0,v0  (dropped from the fold stream)
+        0xF4080108u, 0xFA000000u,   // pc=6  target: s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=8  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF810000u,                // pc=10 s_endpgm
+    };
+    clear_shader_decode_cache();
+    auto k7_fetch = resolve_dynamic_fetch(k7, sizeof(k7)/sizeof(k7[0]), seed6, 12, 8);
+    CHECK(k7_fetch.empty() ||
+              k7_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "#2202 B1: a dropped instruction physically between the branch and its target blocks the rule");
+
+    // Kernel 8 (#2202 B2): a predecessor tally that counts only FORWARD branches is not a tally. Two
+    // edges reach pc=4 — the forward `s_cbranch_vccz` at pc=0 and the backward `s_branch` at pc=8 —
+    // so the target has two predecessors and the rule must decline. The forward branch and the
+    // physical adjacency both still hold, so this isolates the direction filter and nothing else.
+    const uint32_t k8[] = {
+        0xBF860003u,                // pc=0  s_cbranch_vccz 3     -> pc=4
+        0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+        0xBF820004u,                // pc=3  s_branch 4           -> pc=8
+        0xF4080108u, 0xFA000000u,   // pc=4  target: s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=6  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF82FFFBu,                // pc=8  s_branch -5          -> pc=4  (second predecessor)
+        0xBF810000u,                // pc=9  s_endpgm
+    };
+    clear_shader_decode_cache();
+    auto k8_fetch = resolve_dynamic_fetch(k8, sizeof(k8)/sizeof(k8[0]), seed6, 12, 8);
+    CHECK(k8_fetch.empty() ||
+              k8_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "#2202 B2: a backward edge into the target counts as a predecessor and blocks the rule");
+
+    // Kernel 9: the positive control for both of the above — identical to k7 with the `exp` removed,
+    // so the `s_branch` at pc=3 IS physically adjacent to the target at pc=4 and nothing else reaches
+    // it. Without this arm, k7 and k8 would both pass on a rule that never fires at all.
+    const uint32_t k9[] = {
+        0xBF860003u,                // pc=0  s_cbranch_vccz 3     -> pc=4
+        0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+        0xBF820004u,                // pc=3  s_branch 4           -> pc=8
+        0xF4080108u, 0xFA000000u,   // pc=4  target: s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=6  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF810000u,                // pc=8  s_endpgm
+    };
+    clear_shader_decode_cache();
+    auto k9_fetch = resolve_dynamic_fetch(k9, sizeof(k9)/sizeof(k9[0]), seed6, 12, 8);
+    CHECK(k9_fetch.size() == 1 &&
+              k9_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "#2202: with the region's only entry a physically adjacent branch, the rule still fires");
+
+    // Kernel 10 (#2202 B2, second half): indirect control flow makes the CFG unrepresentable by any
+    // scan over SOPP displacements, so the rule declines rather than firing on a partial edge set.
+    // Same shape as k9 plus one `s_swappc_b64`.
+    const uint32_t k10[] = {
+        0xBE862104u,                // pc=0  s_swappc_b64 s[6:7], s[4:5]  -- the only difference
+        0xBF860003u,                // pc=1  s_cbranch_vccz 3     -> pc=5
+        0xF4300404u, 0xFA000060u,   // pc=2  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+        0xBF820004u,                // pc=4  s_branch 4           -> pc=9
+        0xF4080108u, 0xFA000000u,   // pc=5  target: s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=7  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF810000u,                // pc=9  s_endpgm
+    };
+    clear_shader_decode_cache();
+    auto k10_fetch = resolve_dynamic_fetch(k10, sizeof(k10)/sizeof(k10[0]), seed6, 12, 8);
+    CHECK(k10_fetch.empty() ||
+              k10_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "#2202: an indirect control transfer disables the rule for the whole program");
+
+    // Kernel 11 (#2202 B3): TWO qualifying targets, where the second's sole-predecessor branch IS
+    // the first target. `pc=4` is both — it is entered only from `pc=0` (so it is a target), and it
+    // is the only branch reaching `pc=8` (so it is a predecessor). If the walk saves the state at
+    // `pc=4` BEFORE restoring it, the snapshot handed to `pc=8` is the pre-restore chimera and the
+    // clobbered s[16:17] is reinstated one block later — the #2132 defect reproduced by the fix's own
+    // bookkeeping. Neither region is on the path that reaches `pc=8`, so the seeded table pointer
+    // must survive both.
+    //
+    // None of k6-k10 has two qualifying targets, which is exactly why this shape got through the
+    // first round: an absent case cannot fail.
+    const uint32_t k11[] = {
+        0xBF860003u,                // pc=0  s_cbranch_vccz 3     -> pc=4
+        0xF4300404u, 0xFA000060u,   // pc=1  region 1: clobbers s16..s31 with cbuf floats
+        0xBF820008u,                // pc=3  s_branch 8           -> pc=12 (so pc=4 has no fall-through)
+        0xBF840003u,                // pc=4  TARGET 1, and the only branch into pc=8: s_cbranch_scc0 3
+        0xF4300404u, 0xFA000060u,   // pc=5  region 2: clobbers s16..s31 again
+        0xBF820004u,                // pc=7  s_branch 4           -> pc=12 (so pc=8 has no fall-through)
+        0xF4080108u, 0xFA000000u,   // pc=8  TARGET 2: s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=10 buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF810000u,                // pc=12 s_endpgm
+    };
+    clear_shader_decode_cache();
+    auto k11_fetch = resolve_dynamic_fetch(k11, sizeof(k11)/sizeof(k11[0]), seed6, 12, 8);
+    CHECK(k11_fetch.size() == 1 &&
+              k11_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "#2202 B3: a target that is itself the next target's predecessor saves the RESTORED state");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

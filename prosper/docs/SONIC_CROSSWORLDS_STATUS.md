@@ -128,14 +128,15 @@ dump offline, and the exact logged words can be located by index inside those du
 
 | population | how many | what actually fails |
 |---|---|---|
-| the dropped **graphics** pipelines | 4 → **2** | a **descriptor resolution**, never a missing opcode |
+| the dropped **graphics** pipelines | 4 → 2 → **0** | a **descriptor resolution**, never a missing opcode |
 | the skipped **compute** programs | 8 | missing instructions, and unstructured control flow |
 
 At the census above, every one of the four dropped pipelines failed on an unresolved descriptor.
 The lines are reproduced **unedited** — no `-- FIXED` marker or other annotation inside the block —
 because their field values are the evidence for the reading that follows, and an annotated copy
-cannot carry it. **Two of the three are now fixed by #2131**; that is stated after the block rather
-than inside it, so the excerpt stays verbatim and the current status stays unmissable:
+cannot carry it. **All three are now fixed** — the two `[mimg-unresolved]` by #2131 and the
+`[mubuf-unresolved]` by #2132; that is stated after the block rather than inside it, so the excerpt
+stays verbatim and the current status stays unmissable:
 
 ```text
 [mimg-unresolved] pc=80 srsrc=s0 srt_tag=NONE 0x0 key_res=null pc_res=null (7 res)
@@ -143,8 +144,10 @@ than inside it, so the excerpt stays verbatim and the current status stays unmis
 [mubuf-unresolved] pc=211 srsrc=s4 srt_tag=NONE 0x0 key_res=null (5 res)
 ```
 
-**Status now: the two `[mimg-unresolved]` lines are FIXED (#2131); the `[mubuf-unresolved]` one is
-not.** Dropped pipelines went 4 → 2 and `[mimg-unresolved]` 10 → 0.
+**Status now: all three are FIXED — the two `[mimg-unresolved]` by #2131, the `[mubuf-unresolved]`
+by #2132.** Dropped pipelines went 4 → 2 → **0**, `[mimg-unresolved]` 10 → 0 and
+`[mubuf-unresolved]` 1 → 0. **The composite is byte-identical across all three states**, so this
+whole frontier is closed without moving a pixel — see the two subsections below for each half.
 
 Read those lines the way the reject path does, not by pattern-matching the tag. **`[mimg-unresolved]`
 prints on a wider condition than the one that rejects**: it fires whenever `res` is null *or* carries
@@ -224,39 +227,98 @@ Measured, two 260 s `tools/screenshot` arms on `61cc4877`, identical switches, s
 each carries its own positive control. Restoring these two pipelines is a necessary step that is not
 by itself sufficient; the title is still rung 1.
 
-#### The two VERTEX stages: the descriptor chain starts at a null pointer in guest memory
+#### The two VERTEX stages: RESOLVED — the "null pointer" was prosper's own straight-line walk
 
-The same instrument settles the vertex stage, and **the answer is not the one the static recon
-predicted**. The fold models this shader's entire "synthesized V#" idiom already — `s_bfe_u64`,
-`s_or_b32`, `s_cmp_eq_u32` and `s_cselect_b32` are all implemented, the last one explicitly as *"the
-vertex-fetch format patch's tail"*. It never gets to use them, because everything upstream is
-unknown:
+**There was never a null pointer in guest memory, and no writer was ever missing.** The dword that
+"reads zero" is not a pointer field: it is `float4(1.0, 0, 0, 0)` in an ordinary uniform buffer, and
+prosper's scalar const-fold put it into the register the shader dereferences by executing a block
+the wave cannot be on. Fixed in [#2132](https://github.com/mattias800/prosper/issues/2132).
+
+The fold walks the decoded stream **straight-line and models no control flow**. That is harmless
+while a shader is one basic block. This stage is not. Walked from the retained
+`PROSPER_SHADER_DUMP` binary with instruction lengths validated against the emulator's own pcs — the
+MUBUF the reject names lands on dword **211**, exactly where `[dyntrace]` reports it, and the
+`s_cselect_b32` on dword **210**:
 
 ```text
-[dyntrace] SMEM op=0xc bufload sdst=s16 sbase=s8 base=0x4148dca410 … imm=0x60 n=16
-                                    ; s_buffer_load_dwordx16 s[16:31] <- a 160-byte cbuf, in range
-[dyntrace] SMEM op=0x0  load sdst=s20 sbase=s18 base=0x0 …
-[dyntrace]   addr 0x0 unreadable                       ; s[18:19] read back as NULL -> s20 unknown
-[dyntrace] SMEM op=0x2  load sdst=s4  sbase=s16 base=0x3f800000 soff_field=106 soff_ok=0
-                                    ; the V# load: SBASE is 0x3f800000 (the float 1.0), SOFFSET
-                                    ; is vcc_lo, itself derived from the unknown s20
-[dyntrace]   SOP2 pc=210 op=0xa dst=s7 src0=7(k0) src1=107(k0) ok=0   ; s_cselect: both arms unknown
-[dyntrace] MUBUF fetch pc=211 op=0x2 SRSRC=s4 patched=0 (k=0000) have_descr=0 soff_known=0
-[dyntrace]   MUBUF pc=211 SOFFSET untracked -> fetch left unresolved (not folded to 0)
+pc=16   s_buffer_load_dwordx4  s[0:3], s[8:11], 0x50
+pc=19   v_cmp_ge_f32_sdwa      vcc_lo, s0, 1.0        ; the cbuf holds FLOATS, compared against 1.0
+pc=21   s_cbranch_vccz 151                            ; -> pc=173
+pc=45   s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+pc=113  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+pc=172  s_branch 47                                   ; -> pc=220, jumping OVER pc=173
+pc=173  s_load_dword           s20, s[18:19], null
+pc=188  s_load_dwordx4         s[4:7], s[16:17], vcc_lo
+pc=210  s_cselect_b32          s7, s7, vcc_hi
+pc=211  buffer_load_format_xyz v[0:2], v0, s[4:7], vcc_lo idxen
 ```
 
-Read the chain end to end: the shader loads 64 bytes of a constant buffer into `s[16:31]`, and the
-bytes that land in `s[18:19]` are **zero** while `s16` reads `0x3f800000`. It then dereferences that
-null pointer, extracts a bitfield from the result, and builds both the V#'s SOFFSET and its word-3
-select out of it. The fold reads that constant buffer successfully (`base_ok=1 soff_ok=1`, in range
-of its own `num_records=10 × stride=16`) — so this is **real guest data, correctly read, containing a
-null bindless-table pointer**, not a fold that ran out of modelled opcodes.
+`pc=173` has **no fall-through predecessor** — `pc=172` is an unconditional `s_branch` past it — and
+exactly one branch targets it. So whenever the wave executes `pc=173`, the two
+`s_buffer_load_dwordx16` at `pc=45`/`pc=113` **did not run**: they are inside the block the branch
+skips. The straight-line walk ran them anyway, and they write `s16..s31`.
 
-So the question for the vertex stage is not "how do we resolve a runtime-selected descriptor". It is
-**why that constant buffer's pointer field is zero when prosper realizes the draw** — the guest
-either has not populated it through a path prosper replays, or prosper is reading the wrong buffer.
-`CONFIDENCE: HIGH` on the trace; `CONFIDENCE: LOW` on which of those two it is — nothing here
-separates them yet. Filed as [#2132](https://github.com/mattias800/prosper/issues/2132).
+**What they overwrite is the answer.** A vertex stage seeds user data at **s8**
+(`user_sgpr_base = is_ps ? 0u : 8u`), so user-data dword *k* lands in s(8+*k*) — and this stage's
+AGC header declares direct pointers at dw8 and dw10:
+
+```text
+[resdump]   direct offset_dw: … [8]=8 … [10]=10
+[resdump] sgprs@0x8c: 37b4a410 00100041 0000000a 0004dfac   ; dw0..3  -> s8..s11  cbuf V# (160 B)
+                      40079ca0 00100029 00000166 0004dfac   ; dw4..7  -> s12..s15 second V#
+                      37b4a210 00000041                     ; dw8..9  -> s16:s17  table pointer
+                      40208268 00000025                     ; dw10..11-> s18:s19  fetch-descriptor ptr
+[udmap] declared direct: [8]@dw8=0x4137b4a210(readable) [10]@dw10=0x2540208268(readable)
+```
+
+Both pointers are seeded and **both are readable**. The walk replaces them with the constant
+buffer's floats, so by `pc=173` `s[18:19]` is `0` and `s[16:17]` is `0x3f800000` — the float `1.0`
+read as an address. That `[udmap]` line was printed in **every arm of this investigation** and read
+as "the block is coherent, look elsewhere"; it was in fact naming the two pointers the fold then
+destroyed.
+
+The fix is a narrow CFG rule in the fold. A target qualifies only when **all** of these hold, and the
+list is worth reading exactly as written because a weaker version of it fires on shapes it must not
+(#2202 review):
+
+- the instruction **physically** preceding it is an unconditional `s_branch` — physically, because
+  the fold walks a *compacted* stream that drops ordinary VALU/EXP/DS/FLAT while preserving PCs, so
+  "the previous element" is the previous *retained* instruction and a dropped block between them
+  would be invisible;
+- **exactly one** branch in the whole program targets it, counted over **both** directions, since a
+  backward edge is a second predecessor;
+- the program contains no indirect control transfer (`s_setpc_b64` / `s_swappc_b64` / `s_rfe_b64` /
+  `s_call_b64`), which would make the CFG unrepresentable by any scan over branch displacements.
+
+Its only predecessor is then that branch, and since a branch writes no register, **the state at the
+target is exactly the state at the branch** — so the rule saves the whole interpreter state at the
+branch and restores it at the target, rather than rolling back registers one at a time. That also
+covers `scc`, the scalar spill slots and the vector index-mode table, which a register-only rollback
+left carrying the skipped path forward. Published descriptor *uses* are deliberately not rolled
+back: an instruction inside the skipped region is genuinely reachable on its own path.
+
+This does not claim the state at the branch is itself right — if branches precede it the walk may
+already be a chimera. It claims only that the target now agrees with one real path instead of two
+mutually exclusive ones. `PROSPER_NO_BRANCH_EXCLUSIVE` restores the old walk and **must stay off**;
+it exists only so the A/B below stays reproducible.
+
+Measured, two 270 s `tools/screenshot` arms, same binary, same session, identical switches:
+
+| | `PROSPER_NO_BRANCH_EXCLUSIVE=1` | default |
+| --- | --- | --- |
+| `[exec-recompile-reject]` lines | 8 | **0** |
+| distinct dropped `(es, ps)` pipelines | 2 | **0** |
+| `[mubuf-unresolved]` lines | 1 | **0** |
+| `[dynfail] replaying VS` | 1 | **0** |
+| skipped compute programs | 8 | 8 (unchanged) |
+| composite | `666f7b3f` → `0d70a70a` → `8bf1b518` | **identical** |
+
+**The composite did not move.** The off arm reproduces the recorded signature exactly — the same two
+pipelines `vs=0 fs=88449` / `vs=0 fs=139235` sharing one `es`, and
+`[mubuf-unresolved] pc=211 srsrc=s4 srt_tag=NONE 0x0 key_res=null (5 res)` — so the lever is
+demonstrably connected and the identical composite is a real null rather than an undelivered change.
+**Every dropped graphics pipeline and every unresolved descriptor in this title is now gone (4 → 0),
+and the title is still rung 1.**
 
 ### The opcode tiers, measured
 
@@ -407,8 +469,35 @@ One line per falsified hypothesis, with the evidence that killed it.
   The live `[recompile-reject]` from a real boot is the only instrument that names the actual failing
   instruction in a graphics stage. It is still exact for **compute**, which passes `allow_smem=true`.
   (This lane, 2026-08-06.)
+- **THE WHOLE "null bindless-table pointer" SEARCH WAS FOR A PHANTOM — the dword is `1.0f` uniform
+  data, and prosper's own const-fold put it in that register. Do not resume any hunt for the writer,
+  the stale buffer, or the legitimate-null arm.** The fold walks the decoded stream straight-line and
+  models no control flow, so it executed `s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60` at `pc=45`
+  and `pc=113` — both inside the block that `s_cbranch_vccz` at `pc=21` skips whenever `pc=173`
+  executes — and overwrote the stage's two **declared direct pointers** (dw8/dw10, seeded at
+  `s16..s19` because a vertex stage seeds at s8, and both reported `readable` by `[udmap]` in every
+  arm) with the constant buffer's floats. Same-binary, same-session A/B on
+  `PROSPER_NO_BRANCH_EXCLUSIVE`: off → 8 `[exec-recompile-reject]`, 1 `[mubuf-unresolved]`, 1 VS
+  replay; on → 0/0/0. **All four candidates on #2132 are dead at once**, because all four presumed
+  the value was something the guest produced: a missing GPU writer, a guest CPU write, a stale/wrong
+  buffer, and a legitimate null the shader guards. It was none of them. (This lane, 2026-08-06, #2132.)
+- **Restoring the last dropped pipelines does NOT change the post-logo composite.** With 0 dropped
+  pipelines, 0 `[mimg-unresolved]` and 0 `[mubuf-unresolved]`, both A/B arms produce the identical
+  hash sequence `666f7b3f` → `0d70a70a` → `8bf1b518`, and the post-logo frame is exactly **one**
+  distinct colour, `RGB(1,0,1)`, over all 8,294,400 pixels. Since the lever demonstrably changes the
+  reject counts in the same session, this is a real null and not an undelivered change.
+  **Read the scope precisely**: what is falsified is *"restoring these pipelines moves the
+  composite"*. It is **not** established that "the uniform frame is not a dropped-draw composite" —
+  the counters prove these stages now *recompile and submit*, not that their draws executed, wrote
+  anything, or that what they wrote reaches the present source, and `[rtt] PRESENT SOURCE EXTENT
+  MISMATCH` still fires early in every arm. Recompiling is not contributing. The delivery path and
+  the 8 skipped **compute** programs are both still open. (This lane, 2026-08-06, #2132; scope
+  narrowed after the #2202 review, which caught this row overreaching its own commit's
+  *Not verified* section.)
 - **No GPU-side writer that prosper executes ever fills the vertex stage's null constant-buffer
-  pointer.** The remaining two dropped pipelines fail because a constant-buffer dword holding a
+  pointer.** *(Superseded by the two rows above — the negative was correct and the question was
+  wrong; nothing was supposed to write it.)* The remaining two dropped pipelines fail because a
+  constant-buffer dword holding a
   bindless-table pointer reads zero (#2132). Queried against the shared guest-write history at the
   failing stage's own replay: `no recorded GPU writer overlaps [0x…470,+0x40) (history=8589 recorded:
   color=39 compute-buffer=4744 dma-data=8127 write-data=1111)` — 8,589 retained writes, all four
@@ -421,7 +510,9 @@ One line per falsified hypothesis, with the evidence that killed it.
   populations remain unexamined and are NOT ruled out**: a *skipped* compute dispatch records nothing
   by construction — this title skips 8 per boot, and that is the leading hypothesis — and guest CPU
   writes are recorded by no writer kind at all. (This lane, 2026-08-06.)
-- **The zero is not run-to-run nondeterminism.** The pointer field reads zero in **five** independent
+- **The zero is not run-to-run nondeterminism.** *(Correct, and now explained: it is deterministic
+  because it is a compile-time constant in a uniform buffer, reached by a fold that takes the same
+  wrong path every boot.)* The pointer field reads zero in **five** independent
   boots while its containing allocation base moves every time (`0x4148dca410` / `0x4137f4a410` /
   `0x400e6ba410` / `0x413080a410` / `0x413111a410`), with the same offsets and the same neighbouring
   `0x3f800000` each time. **This does not rule out an ordering defect** — only a nondeterministic
@@ -459,34 +550,32 @@ One line per falsified hypothesis, with the evidence that killed it.
 
 ## Not verified
 
-Rung 2. Whether the post-logo uniform frame is a dropped-draw composite or a legitimate loading
-screen — a movie surface is now ruled out above, but the other two are not separated. Whether the
-remaining two dropped `(es, ps)` pipelines are the UI layer, the post chain, or both. Whether
-resolving their descriptors is enough to reach a title screen: it is now known that finishing the
-*opcode* list is not, because none of the four was blocked on one, **and that restoring the two
-pixel-stage pipelines is not either — the composite is byte-identical with them recompiling.** What
-the two now-restored pipelines actually draw has not been examined. Any input route — nothing has
+Rung 2. Whether the post-logo uniform frame is a legitimate loading screen — the movie surface and
+the dropped-draw composite are both now ruled out above, which leaves that reading and "content the
+skipped compute programs were supposed to produce" unseparated. What the four now-restored pipelines
+actually draw has not been examined; that they submit and recompile is established, that their output
+reaches the present source is not. Whether restoring the 8 skipped **compute** programs moves the
+composite — untested, and now the only population left. Any input route — nothing has
 been shown to respond to a pad yet. Windows or macOS. Performance figures: every arm shared the GPU
 with other lanes.
 
 ## The next step, in order
 
-1. **Find out why `s[18:19]` is null** — [#2132](https://github.com/mattias800/prosper/issues/2132),
-   which carries the full trace and the two candidate explanations.
-   The remaining two dropped draws share one vertex stage whose
-   descriptor chain begins by dereferencing a constant-buffer dword that reads zero (traced above).
-   The two candidate explanations — the guest fills it through a path prosper does not replay, or
-   prosper realizes the draw against the wrong/stale buffer — are separated by watching that address:
-   the cbuf is at a V# the user-data block supplies directly (`s[8:11]`), so `PROSPER_HWWATCH` on
-   `V#.base + 0x60` during the uniform phase says whether anything ever writes it. That is the
-   frontier; it is **not** a runtime-selected-V# modelling problem, which is what the earlier reading
-   implied (see *Ruled out*).
-2. **Look at what the two restored pixel pipelines now draw** before assuming the composite needs
-   more pipelines. They recompile and submit; whether their output reaches the present source is a
-   separate question, and `[rtt] PRESENT SOURCE EXTENT MISMATCH` still fires early in every arm.
-3. **The remaining opcode work is control flow**, not arithmetic: `s_cbranch_vccz`/`vccnz` and a
-   forward `s_cbranch_execz`, in two compute programs, one of them on a `backward else` shape. The
-   16-bit VALU family is otherwise complete through five tiers.
-4. **Then re-measure the composite.** It has not moved: black to t≈20 s, SEGA logo, then the uniform
-   frame, on every arm of every tier so far — including the arm where the two pixel pipelines were
-   restored.
+**The graphics-descriptor frontier is closed — do not reopen it.** 0 dropped pipelines, 0
+`[mimg-unresolved]`, 0 `[mubuf-unresolved]` (#2131 + #2132), and the composite is byte-identical
+before and after. Everything below is what remains.
+
+1. **Establish whether the four now-restored pipelines reach the present source at all.** Ordered
+   first because it is the cheapest way to tell a *delivery* defect from a *content* one, and
+   because the counters above cannot: they prove these stages recompile and submit, not that their
+   draws executed, wrote anything, or contributed a pixel. A byte-identical composite while four
+   more pipelines submit is itself weak evidence for a delivery problem, and
+   `[rtt] PRESENT SOURCE EXTENT MISMATCH` still fires once early in every arm.
+2. **The 8 skipped compute programs**, and the charter names
+   a skipped LUT/exposure dispatch as a documented way a whole composite collapses. They fail on
+   **control flow**, not arithmetic: 21 `[cfg-recompile-reject]` and 26 `[compute-struct-reject]`
+   lines per boot, on `s_cbranch_vccz`/`vccnz` and a forward `s_cbranch_execz`, one of them a
+   `backward else` shape (#590). The 16-bit VALU family is complete through five tiers.
+3. **Then re-measure the composite.** It has not moved through any change so far: black to t≈20 s,
+   SEGA logo (`0d70a70a`, 1,373 colours), then a single-colour `RGB(1,0,1)` frame (`8bf1b518`) —
+   including both arms of the #2132 A/B, where the reject counts differ and the pixels do not.
