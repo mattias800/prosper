@@ -78,7 +78,6 @@ public:
     }
 
     const DiagnosticWindowSpec& spec() const { return spec_; }
-    bool started() const { return started_ || !spec_.by_time; }
 
 private:
     DiagnosticWindowSpec spec_{};

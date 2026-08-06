@@ -5918,7 +5918,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const uint64_t at = g_pass_log_submit.fetch_add(1);
                     if (getenv("PROSPER_PASS_LOG")) {
                         // The same window object and the same ordinal the per-pass report used, so
-                        // the two lines always describe one set of callbacks.
+                        // the two lines describe one set of callbacks — with one seam: if a `ms:`
+                        // deadline is crossed between the pass loop and this site, the latching
+                        // callback carries `selected=` with no per-pass lines beside it.
                         if (g_pass_log_window.contains(at, diagnostic_elapsed_ms()))
                             fprintf(stderr, "[pass] cb=%llu selected=%s\n", (unsigned long long)at,
                                     prosper::frontend::present_source_name(present_choice));
@@ -5927,7 +5929,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // PROSPER_DUMP_PERSISTENT=<min-submit>|ms:<millis>: read back and dump EVERY
                 // persistent color target after this submit's passes render. Unlike
                 // PROSPER_RTT*/DUMP_*, this flag is NOT in the live_gpu_targets disable list
-                // (:480-487), so it observes the NORMAL persistent-render path (all other CPU-pixel
+                // (:1078-1085), so it observes the NORMAL persistent-render path (all other CPU-pixel
                 // diagnostics change that path -> #1103). readback_persistent_color_target restores
                 // the image layout, so rendering is unaffected. The `ms:` form aims the window by
                 // wall time, because the ordinal below is a renderer-internal counter with no
