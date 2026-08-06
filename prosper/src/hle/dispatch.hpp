@@ -107,6 +107,16 @@ std::vector<std::string> savedata0_list_dirs();   // existing save dirs under th
 // Read a virtual save slot's param.sfo modification time (or directory time if absent). Rejects names
 // that are not a single guest directory component; used only for SaveDataDialog date-focus ordering.
 bool savedata0_dir_mtime(const std::string& dirname, int64_t& modified);
+// libSceSaveData transaction resources (#1905). sceSaveDataCreateTransactionResource returns the
+// new resource's ID, NOT 0-on-success: the id is what a later sceSaveDataMount3 descriptor carries
+// at +0x28. Sonic Origins' save handler proves the polarity — eboot+0x93fdb0 is
+// `call sceSaveDataCreateTransactionResource(0); test eax,eax; jle -> error`, so a zero return is
+// read as failure. Ids are handed out from a monotonic counter and recorded, so Delete can reject
+// an id that was never created. CONFIDENCE: HIGH on "positive id, negative error" (guest
+// disassembly); the id's numeric range is ours to choose, as it is opaque to the guest.
+int32_t savedata_tx_resource_create();
+bool savedata_tx_resource_destroy(int32_t id);
+size_t savedata_tx_resource_live_count();
 // PS5 system services (user/NP/mouse/appcontent/dialog); called by register_builtin_hle().
 void register_service_hle();
 // libSceHttp local URI helpers; called by register_builtin_hle().
