@@ -300,7 +300,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   "handled" when they are not. Reject paths still exist as a *fail-visible* backstop for genuinely
   unknown encodings (mark `CONFIDENCE: LOW`, log loudly, file an issue with the exact opcode/format), but
   treat every one you hit on a live boot as the next thing to implement. Find the exact failing op with
-  `PROSPER_DBG=1` (`[recompile-reject] pc=… op=0x…` from the recompiler) or the `[compute] … skipped`
+  `PROSPER_DBG=1` (`[recompile-reject] pc=… op=0x…` from the recompiler) or the `[compute] skip …`
   lines from the live backend, then implement it with a round-trip/execution test — do not leave it skipped.
 - **Entitlement and add-content APIs answer from LOCAL INVENTORY — never blanket-approve.** When a
   title asks whether an add-on or entitlement is owned, prosper answers from the content actually
