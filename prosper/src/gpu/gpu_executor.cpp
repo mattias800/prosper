@@ -1929,12 +1929,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         }
     }
     if (explicit_ngg_index_provenance) {
-        // Match recompile_vertex's merged GS/ES ABI model: s3[7:0] is the active ES-vertex
-        // count and s3[15:8] the GS-primitive count.  The Vulkan vertex shell represents one
-        // active ES vertex and no GS primitive, so s3=1.  Fetch prologues use this value to
-        // choose and patch V# descriptors before their MUBUF loads; leaving it unknown made the
-        // dynamic resource walk drop otherwise valid scene-geometry fetches even though the
-        // translator itself already compiled the same prologue with s3=1.
+        // s3 is the merged GS/ES wave info: s3[7:0] is the active ES-vertex count and s3[15:8]
+        // the GS-primitive count.  The Vulkan vertex shell represents one active ES vertex and no
+        // GS primitive, so s3=1.  Fetch prologues use this value to choose and patch V#
+        // descriptors before their MUBUF loads; leaving it unknown made the dynamic resource walk
+        // drop otherwise valid scene-geometry fetches.
+        // WARNING: this does NOT match recompile_vertex for most programs, and this comment used to
+        // claim it did.  There, s3=1 is seeded only under exact_ngg_projection, i.e. only for the
+        // seven wrappers is_astro_bot_ngg_one_lane_wrapper() admits; every other NGG program gets
+        // 0x40004040|(wave<<24).  The two models differ in exactly the high bits a prologue reads
+        // when it builds a SOFFSET from s3 — 0 here against 0x40000000 there.  #2072.
         set_value(3, 1u);
     }
 
@@ -2111,6 +2115,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // Capture both source lanes before touching either destination: source and
                     // destination pairs may overlap. Only an entirely known SGPR pair is modeled;
                     // special/inline sources and partial pairs retain the previous fail-closed erase.
+                    // A saved wave MASK is a separate domain from scalar data and survives even when
+                    // the pair's value does not: `s_mov_b64 sDST, sSRC` copies it (see the EXEC form
+                    // below for why the fetch prologue depends on this).
+                    const FoldMask source_mask_state = valid_reg(in.src[0].value)
+                        ? mask_state[(size_t)in.src[0].value] : FoldMask::Unknown;
                     std::array<uint32_t, 2> source_values{};
                     std::array<uint32_t, 2> source_keys{};
                     std::array<uint32_t, 2> source_origins{};
@@ -2148,6 +2157,44 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         }
                         mark_null_origin(dst, source_null_origins[(size_t)k]);
                     }
+                    if (valid_reg(in.dst.value))
+                        mask_state[(size_t)in.dst.value] = source_mask_state;
+                } else if (in.opcode == 0x04 &&                 // s_mov_b64 sDST, exec
+                           in.dst.kind == OperandKind::SGPR &&
+                           in.src[0].kind == OperandKind::Special &&
+                           (in.src[0].value == 126 || in.src[0].value == 127)) {
+                    // Saving EXEC is not a scalar-data move — the pair's VALUE stays fail-closed —
+                    // but it does carry a wave MASK the NGG fetch prologue later consumes. R-Type
+                    // Delta's AGC prologue saves EXEC once and then selects vertex-vs-instance
+                    // indexing per attribute through that saved copy
+                    // (`s_cselect_b64 sSEL, sSAVED, 0` -> `v_cndmask_b32 vIDX, v8, v5, sSEL`).
+                    // Losing the mask made s_cselect_b64 fold to Unknown, which classified a
+                    // per-vertex attribute as shader-computed. Two things then go wrong at once, and
+                    // each alone still reads zero: every vertex takes the *instance* index (0 for a
+                    // one-instance draw), and the recompiler retains the load's runtime SOFFSET,
+                    // which for that shader is `s3 & 0xfff80000`. This fold seeds s3 = 1 below (see
+                    // set_value(3, 1u)), so that term is 0 and fetch_off is 0; recompile_vertex seeds
+                    // s3 = 1 only for the seven wrappers is_astro_bot_ngg_one_lane_wrapper() admits,
+                    // and otherwise 0x40004040|(wave<<24), whose
+                    // masked value is 0x40000000. The shader therefore adds ~1 GiB to a 96-byte
+                    // descriptor and robustBufferAccess returns 0. That s3 mismatch is #2072 (the
+                    // vertex-rate bit's separate SMEM divergence is #2069); NEITHER is repaired here.
+                    // This only removes the shader's address expression from the path for every
+                    // attribute the fold classifies Vertex or Instance.
+                    //
+                    // `All` is this fold's standing assumption about EXEC, not a new one: `srcmask()`
+                    // already answers `All` for a directly named EXEC operand, because this walk is a
+                    // linearised prologue scan with no EXEC model at all. The one thing that changes
+                    // here is that the assumption becomes durable in a register and copyable, so
+                    // record it: if a future prologue narrows EXEC before saving it, this fold will
+                    // still read the saved copy as all-lanes. That is tolerable for the only consumer
+                    // — selecting *which ABI register* holds the element index is a wave-uniform
+                    // question either way — and would need an explicit EXEC model to do better.
+                    // CONFIDENCE: HIGH.
+                    forget(in.dst.value);
+                    forget(in.dst.value + 1);
+                    if (valid_reg(in.dst.value))
+                        mask_state[(size_t)in.dst.value] = FoldMask::All;
                 } else if (in.dst.kind == OperandKind::SGPR) {
                     // Not a modeled scalar move -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
                     // (s_getpc_b64, s_and/or/xor/not_b64, s_*_saveexec_b64, …) write

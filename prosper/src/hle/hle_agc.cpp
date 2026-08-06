@@ -1743,6 +1743,7 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
 // `dw_num == 0` means "length unknown" — decode_pm4 self-terminates at the first non-type-3 dword, and
 // we cap the walk at kUnknownCap dwords as a runaway guard (a bounded ring can't legitimately exceed it).
 extern "C" uint64_t prosper_guest_tsc_ns();                    // shared guest clock (hle_kernel_time)
+extern "C" void prosper_label_hist_dump(uint64_t addr, char* out, unsigned cap);   // command_processor.cpp
 // #1226 POOLSHIFT window probe (PROSPER_POOLSHIFT_WINDOW=1): after each submit, scan the learned
 // TLS pool bins + global recycler slots for the byte-shifted-head poison signature and log on STATE
 // CHANGE. A change gives only a WEAK bound — the poison was at a scanned head between these two
@@ -1762,6 +1763,63 @@ static void poolshift_window_probe(uint64_t submit_no) {
                 (unsigned long long)prosper_guest_tsc_ns() / 1000000ull, found ? buf : "");
         last_found = found;
     }
+}
+// #1945 INTERIOR poison probe (PROSPER_MB3_POISON=1, hop bound PROSPER_MB3_POISON_HOPS). The
+// poolshift probe above samples head RESIDENCE only; this walks the bundle chains and reports a
+// poisoned `next` link while it is still in the chain — which is the only moment the ADDRESS of the
+// node holding it exists anywhere. That address is then put to the label-history table, so each hit
+// carries prosper's own answer to "did any DMA_DATA/RELEASE_MEM label write ever target this exact
+// guest block?". An empty history is the strongest available exclusion of prosper's label writes for
+// that node; a populated one names the packets. Serialized by the callers' g_agc_state_mu.
+static void mb3_poison_probe(uint64_t submit_no) {
+    static const bool on = [] { const char* e = getenv("PROSPER_MB3_POISON");
+                                return e && strtol(e, nullptr, 0) != 0; }();
+    if (!on) return;
+    static const uint32_t hops = [] {
+        const char* e = getenv("PROSPER_MB3_POISON_HOPS");
+        return e ? (uint32_t)strtoul(e, nullptr, 0) : 64u;
+    }();
+    static int last_found = -1;
+    gpu::Mb3PoisonHit hits[8];
+    char census[192];
+    const int found = gpu::mb3_poison_scan(hits, 8, hops, census, sizeof census);
+    if (found == last_found) return;
+    fprintf(stderr, "[agc] MB3-POISON submit=%llu found=%d (was %d) t=%llums | %s\n",
+            (unsigned long long)submit_no, found, last_found,
+            (unsigned long long)prosper_guest_tsc_ns() / 1000000ull, census);
+    for (int i = 0; i < found && i < 8; i++) {
+        char hist[512];
+        prosper_label_hist_dump(hits[i].node, hist, sizeof hist);
+        // label_hist_report always writes at least "events(total=0, no-history)", which IS the
+        // answer when prosper never wrote a label at this address — so there is no empty case to
+        // substitute for, and a substitution here would only invent a second wording for it.
+        fprintf(stderr, "[agc] MB3-POISON   pool=0x%llx class+0x%x list=%u hops=%u node=0x%llx "
+                        "bad-next=0x%llx | label-history: %s\n",
+                (unsigned long long)hits[i].pool_base, hits[i].class_off, hits[i].list,
+                hits[i].hops, (unsigned long long)hits[i].node,
+                (unsigned long long)hits[i].bad_next, hist);
+    }
+    last_found = found;
+}
+// #1945 A/B lever, diagnostic only, default OFF: hold the GUEST's own submit call for N
+// microseconds after the fold. It exists because the interior poison probe above turned out to
+// change the OUTCOME on PPSA07809 — deep walk survives, 1-hop walk faults — which makes the walk's
+// DURATION the suspect rather than anything it reads. A read-only probe that decides whether a
+// title lives is not a measurement, it is a confound, and this is the control that separates the
+// two: if a plain stall of comparable length rescues the title as well, the corruption is a race
+// the guest wins by running ahead of prosper's completion writes, and nothing about the scan
+// matters. Never a fix — it throttles the guest unconditionally.
+static void submit_stall(void) {
+    static const unsigned us = [] {
+        const char* e = getenv("PROSPER_SUBMIT_STALL_US");
+        unsigned v = e ? (unsigned)strtoul(e, nullptr, 0) : 0u;
+        if (v) fprintf(stderr, "[agc] PROSPER_SUBMIT_STALL_US=%u ARMED — diagnostic throttle, "
+                               "not a fix\n", v);
+        return v;
+    }();
+    if (!us) return;
+    struct timespec ts { (time_t)(us / 1000000u), (long)(us % 1000000u) * 1000L };
+    nanosleep(&ts, nullptr);
 }
 // #305/#1662: a fold that decodes fewer dwords than the guest declared has silently dropped the tail
 // of that submit — and if a shader bind was in the dropped tail, the NEXT submit inherits a register
@@ -1966,6 +2024,8 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     // the Jump-recursion flag reset once hid a deferring fold entirely — the wedge class).
     if (gpu::deferred_pending()) start_defer_watchdog();
     poolshift_window_probe(g_submit_count);
+    mb3_poison_probe(g_submit_count);
+    submit_stall();
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc] %s #%llu: %u dwords (walk=%u) -> %zu packets applied (draws: %zu, dispatches: %llu)\n",
                 who, (unsigned long long)g_submit_count, dw_num, walk, applied,
@@ -2102,6 +2162,8 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     gpu::submit_completion_pulse(agc_gpu_state().dma_execution_rejected);
     if (gpu::deferred_pending()) start_defer_watchdog();
     poolshift_window_probe(g_submit_count);
+    mb3_poison_probe(g_submit_count);
+    submit_stall();
     if (getenv("PROSPER_GFXLOG")) {
         fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu, dispatches total: %llu)\n",
                 (unsigned long long)g_submit_count, p->dw_num, applied, agc_gpu_state().draws.size(),

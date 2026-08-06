@@ -150,6 +150,9 @@ namespace {
     volatile sig_atomic_t g_null_page_count = 0;
     unsigned g_null_page_mask = 0;             // which of the 16 low pages [0,0x10000) are backed
     void nullpage_deep_dump(ucontext_t* uc, uint64_t rip);
+    // #1226: the command processor's per-label protocol ring, already exported for exactly this
+    // kind of out-of-band question. Writes "events(total=0, no-history)" for an untracked address.
+    extern "C" void prosper_label_hist_dump(uint64_t addr, char* out, unsigned cap);
 #ifdef __linux__
     // Linux's gregset order is not the architectural x86 register encoding used by
     // decode_low_read_dest(): map rax..r15 explicitly rather than treating the two layouts as alike.
@@ -235,6 +238,18 @@ namespace {
         // DOLL and ArcRunner store 0x30015f00 (<<8 = 0x30015f0000), which the old window could not
         // see (dmem layout moved). Matches is_byteshift_poolptr in command_processor.cpp.
         return (v >> 32) == 0 && ((v << 8) >= 0x2000000000ull && (v << 8) < 0x4000000000ull);
+    }
+    // The value a MallocBinned3 free-list head slot may legally hold: either 0 (empty list) or the
+    // address of an FBundleNode, which is a naturally 0x20-aligned block inside the guest's mapped
+    // heap/dmem window. ANY other value in that slot is corruption by construction, whatever shape it
+    // has — so this, not a value-shape guess, is what the head watch must trigger on. Without it the
+    // watch reports only `lwatch_is_pool_shift` values and stays SILENT for every other corrupt head
+    // (Crisis Core PPSA07809 observed 0xff000000ff000000 and 0x0002400100024001 in the same slot),
+    // which reads exactly like "armed and saw nothing wrong".
+    static inline bool lwatch_is_plausible_bundle_node(uint64_t v) {
+        if (v == 0) return true;
+        if (v & 0x1full) return false;
+        return v >= 0x2000000000ull && v < 0x4000000000ull;
     }
     bool g_bp_shift = false;   // PROSPER_BP_SHIFT=1: only log a BP hit when rsi is a pool-shifted ptr
     // PROSPER_BP=0xOFFSET (guest image offset): int3 code-breakpoint that LOGS registers at each hit,
@@ -540,6 +555,7 @@ namespace {
     struct Mb3W { int fd; uint64_t addr; };
     Mb3W             g_mb3w[64];
     unsigned char    g_mb3w_seen[64] = {0};   // per-slot benign-write log budget (see handler)
+    unsigned         g_mb3w_loud[64] = {0};   // per-slot ORDINAL for the structural corrupt-head arm
     std::atomic<int> g_mb3w_cnt{0};
     int mb3w_match(int fd) {
         int n = g_mb3w_cnt.load(std::memory_order_acquire);
@@ -887,6 +903,31 @@ namespace {
             n += snprintf(b + n, sizeof b - (size_t)n, "%s%s=0x%llx", (i % 4) ? " " : "[nullpage]   ",
                           regs[i].nm, (unsigned long long)regs[i].v);
             if (i % 4 == 3) { b[n++] = '\n'; raw_write(2, b, (size_t)n); n = 0; }
+        }
+        // #1226 — is a faulting register a GPU LABEL SLOT? On ArcRunner every terminal fault carries
+        // the shape {small nonzero high dword, low dword 1}, which is byte-identical to a 0x20-byte
+        // label whose 4-byte fence value 1 sits under stale malloc residue in the high half (the
+        // #1226 "residue 0x2020e31680 -> 0x2000000000" mechanism, one generation later). That reading
+        // and "prosper stomped a live pointer" predict the same VALUE and are told apart only by
+        // whether the address has a label protocol history — which the command processor already
+        // records per label and exports here. Printed only for registers that HAVE one, so a silent
+        // run means no register named a tracked label rather than a disabled probe.
+        for (int i = 0; i < 16; i++) {
+            const uint64_t v = regs[i].v;
+            if (v < 0x10000) continue;
+            char hist[512];
+            prosper_label_hist_dump(v, hist, (unsigned)sizeof hist);
+            if (!hist[0] || strstr(hist, "no-history")) continue;
+            snprintf(b, sizeof b, "[labelhist] %s=0x%llx %s\n", regs[i].nm,
+                     (unsigned long long)v, hist);
+            // strlen, NOT snprintf's return: snprintf returns the WOULD-BE length, and `hist` is the
+            // same 512 bytes as `b`. A full 16-event ring formats to ~450-500 characters, so the
+            // prefix pushes the would-be length past `sizeof b` on exactly the richest labels this
+            // instrument exists to print — handing that value to raw_write() reads past the end of a
+            // stack buffer. Every other raw_write in this handler is either length-bounded by its
+            // format or already uses strlen; this is the first whose format embeds a %s of comparable
+            // size to the buffer. (Reported in review of #2077.)
+            raw_write(2, b, strlen(b));
         }
         for (int i = 0; i < 16; i++) {
             uint64_t v = regs[i].v;
@@ -1239,7 +1280,26 @@ namespace {
                 unsigned long long v = *(volatile uint64_t*)addr;
                 uint64_t wr = (uint64_t)gr2[REG_RIP];
                 bool in_eboot = (gin(wr));
+                // A byte-shifted pool pointer is one corrupt shape; a head that is not a plausible
+                // FBundleNode at all is the general case, and the one this watch must never miss.
+                //
+                // BUDGETED, unlike the shifted case it joins. The loud arm writes ~1 KB (regs plus a
+                // guest-stack scan) from inside a SIGTRAP handler on the owning thread, and this
+                // PR's own result is that the duration of work on that thread decides whether the
+                // title survives — an unbudgeted loud path would be a timing confound in the
+                // instrument built to study a timing bug. The first hits are what matter; a slot
+                // that keeps re-reporting adds nothing.
                 bool shifted = lwatch_is_pool_shift(v);
+                unsigned loud_ord = 0;
+                if (!shifted && !lwatch_is_plausible_bundle_node(v)) {
+                    // Trap 51: a bare cap makes the ceiling the finding. Count every corrupt head,
+                    // print the first 8 and then every 256th, and carry the ordinal on the line —
+                    // otherwise "8" reads as the population, and a head that keeps being re-poisoned
+                    // would be silenced for good by the benign-write budget below.
+                    loud_ord = ++g_mb3w_loud[mi];
+                    if (loud_ord <= 8 || (loud_ord & 0xff) == 0) shifted = true;
+                    else return;
+                }
                 // base+0x20 is a HOT free-list head (every idx-1 malloc/free touches it), so logging
                 // every benign write floods I/O and stalls the run before the t~60s corruption burst.
                 // Log only the corruptor (a byte-shifted pool pointer) + the first couple of hits per
@@ -1248,11 +1308,17 @@ namespace {
                     if (g_mb3w_seen[mi] >= 3) return;   // silent steady-state
                     g_mb3w_seen[mi]++;
                 }
+                // The ordinal is folded into ONE conditional string: a bare `%u` beside a
+                // conditional separator prints `0` on every benign write and fuses it onto the tid
+                // field (`tid=12340`), which is exactly the kind of misreading this log exists to
+                // prevent.
+                char ord[24] = "";
+                if (loud_ord) snprintf(ord, sizeof ord, "  #%u", loud_ord);
                 char b[256]; int n = snprintf(b, sizeof b,
-                    "[mb3watch] WRITE [0x%llx]=0x%llx by rip=%s%s0x%llx tid=%ld%s\n",
+                    "[mb3watch] WRITE [0x%llx]=0x%llx by rip=%s%s0x%llx tid=%ld%s%s\n",
                     (unsigned long long)addr, v, in_eboot ? gmod(wr) : "host:", in_eboot ? "+" : "",
                     (unsigned long long)(in_eboot ? goff(wr) : wr), cur_tid(),
-                    shifted ? "  <<<<< POOLSHIFT CORRUPTOR" : "");
+                    shifted ? "  <<<<< CORRUPT HEAD" : "", ord);
                 raw_write(2, b, (size_t)n);
                 if (!in_eboot) classify_addr(wr);
                 if (shifted) {
@@ -3022,7 +3088,13 @@ void install_trap_handler() {
     if (const char* n = getenv("PROSPER_MB3WATCH_N"))   g_mb3w_nslots = (int)strtol(n, nullptr, 0);
     if (g_mb3w_on) {
         g_mb3_arm_hook = [](uint64_t base) {
-            if (base < 0x2000000000ull || base >= 0x2100000000ull) return;   // MB3 pool-region only
+            // #1945: the window was the DOLL-era [0x20..0x21), the same stale filter #1998 found on
+            // PROSPER_WATCH_LABEL/PROSPER_WATCH_HOT. prosper's dmem layout moved: Crisis Core
+            // (PPSA07809) hands the guest its per-thread cache at 0x301ac50000 and ArcRunner at
+            // 0x3152350000, so on every current title this hook armed NOTHING and the instrument
+            // printed NOTHING — indistinguishable from "armed and saw no write". [0x20..0x40) is the
+            // window command_processor.cpp already uses post-#1226 (is_byteshift_poolptr).
+            if (base < 0x2000000000ull || base >= 0x4000000000ull) return;   // MB3 pool-region only
             mb3w_arm_current_thread(base);
         };
     }
