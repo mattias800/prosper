@@ -15,6 +15,7 @@
 #include "rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "shader_resources.hpp"    // ShaderResourceTable
 #include "agc_shader_layout.hpp"   // DecodedBufferDescriptor (DynFetch)
+#include "videoout_present.hpp"    // PresentFrameOrigin: a rendered frame carries its provenance
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -1791,6 +1792,11 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
 // shape as RenderFn, plus (w,h).
 struct RenderedFrame {
     std::shared_ptr<const std::vector<uint8_t>> storage;
+    // Where these pixels came from, carried to the present layer so a consumer can tell a frame
+    // prosper composited from the guest's own display buffer republished verbatim (#1968, #2044).
+    // Defaults to Composited, which is what every producer other than the renderer's last-resort
+    // guest-scanout branch means.
+    PresentFrameOrigin origin = PresentFrameOrigin::Composited;
 
     RenderedFrame() = default;
     RenderedFrame(std::vector<uint8_t> pixels)

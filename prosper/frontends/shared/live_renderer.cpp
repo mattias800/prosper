@@ -27,6 +27,7 @@
 #include "present_blit_policy.hpp"      // flip-anchored scanout publication policy
 #include "present_extent.hpp"           // the publish extent contract with the caller (#1986)
 #include "avplayer_plane_policy.hpp"    // which sampled resource is AvPlayer's NV12 chroma plane
+#include "guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
 #include "gpu/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/guest_write_watch.hpp"
 #include "render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
@@ -4842,6 +4843,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.prelude_ms += std::chrono::duration<double, std::milli>(
                     pass_timing_start - callback_timing_start).count();
             std::shared_ptr<const std::vector<uint8_t>> selected_pixels;
+            // Provenance of whatever `selected_pixels` ends up holding. It travels with the frame to
+            // the present layer so a verification gate can tell a composited frame from a
+            // republished guest scanout — `--require-composited-frame` asserts prosper rendered
+            // something, and #2026 was reverted (#2044) for letting the one frame that assertion
+            // exists to reject satisfy it.
+            auto frame_origin = prosper::gpu::PresentFrameOrigin::Composited;
             bool published_gpu = false;
             // The extent contract with our caller (#1986). A submit headed for the publish gate is
             // published only as exactly w*h*4 bytes and anything else is silently discarded, so a
@@ -6111,6 +6118,72 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if ((scanout = cached_scanout(prosper_vo_buffer_addr(i)))) break;
                 }
                 if (scanout) selected_pixels = scanout->rgba;
+                // Last resort before the retained frame: the flipped buffer's own guest memory.
+                // The decision itself lives in guest_scanout_present.hpp so it can be unit-tested;
+                // read that header for why each condition is there. Only the mechanism is here.
+                //
+                // Read once per guest flip, not once per submit: this callback runs for every span
+                // of every submit (eleven per frame on Frontiers), the buffer only changes when the
+                // guest flips a new one, and a 4K copy plus de-swizzle is not free. These statics
+                // have the same single-present-thread contract as `last_scanout_present` below.
+                static uint64_t guest_scanout_flip = UINT64_MAX;
+                static std::shared_ptr<const std::vector<uint8_t>> guest_scanout_pixels;
+                const size_t display_bytes =
+                    static_cast<size_t>(prosper::gpu::present_width()) *
+                    prosper::gpu::present_height() * 4u;
+                if (prosper::frontend::guest_scanout_read_warranted(
+                        published_gpu, scanout != nullptr, (bool)selected_pixels,
+                        present_extent_bytes, display_bytes) ==
+                    prosper::frontend::GuestScanoutDecision::Publish) {
+                    if (guest_scanout_flip != current_flip) {
+                        guest_scanout_flip = current_flip;
+                        guest_scanout_pixels.reset();
+                        prosper::VideoOutLinearRead read;
+                        const bool got = prosper::videoout_read_front_linear(read);
+                        const auto decision = prosper::frontend::guest_scanout_publishable(
+                            got ? read.pixels.size() : 0u, present_extent_bytes,
+                            got && read.metadata.address != 0,
+                            got && g_rtt.find(read.metadata.address) != g_rtt.end(),
+                            read.guest_authored);
+                        if (decision == prosper::frontend::GuestScanoutDecision::Publish)
+                            guest_scanout_pixels = std::make_shared<const std::vector<uint8_t>>(
+                                std::move(read.pixels));
+                        // Report the OUTCOME, publish or decline, and name which. A negative
+                        // control that can only observe silence cannot tell "correctly declined"
+                        // from "never reached" — and a decline is exactly what the Bendy
+                        // (PPSA27616) reused-memory case must produce, so it has to be legible.
+                        //
+                        // Budgeted PER DECISION, which is the whole point on this line and not
+                        // ceremony (diag_ratelimit.hpp: "budget per key, or a noisy key exhausts the
+                        // log before the one under investigation gets a line"). A title that
+                        // declines on every flip would otherwise push the first PUBLISH past the
+                        // cap, and "no publish line" is exactly the reading the negative control
+                        // rests on. With its own counter the first publish is ordinal 1 and always
+                        // prints, so the absence of a `publish` line means zero publishes.
+                        static std::atomic<uint64_t>
+                            guest_scanout_reports[(size_t)
+                                prosper::frontend::GuestScanoutDecision::SkipNotAuthored + 1]{};
+                        const uint64_t ord =
+                            guest_scanout_reports[(size_t)decision].fetch_add(1) + 1;
+                        if (prosper::diag_should_print(ord))
+                            fprintf(stderr,
+                                    "[rtt] GUEST SCANOUT #%llu: no present source and no renderer "
+                                    "target at the flipped buffer 0x%llx — %s (%ux%u tiling=%u "
+                                    "authored=%d footprint=%s)\n",
+                                    (unsigned long long)ord,
+                                    (unsigned long long)read.metadata.address,
+                                    prosper::frontend::guest_scanout_decision_name(decision), w, h,
+                                    read.metadata.tiling_mode, (int)read.guest_authored,
+                                    read.padded_footprint ? "padded" : "nominal");
+                    }
+                    // Re-check the size on the cached path too: a two-set geometry switch can change
+                    // the present extent between spans of one flip, and the cache is keyed on the
+                    // flip alone.
+                    if (guest_scanout_pixels && guest_scanout_pixels->size() == present_extent_bytes) {
+                        selected_pixels = guest_scanout_pixels;
+                        frame_origin = prosper::gpu::PresentFrameOrigin::GuestScanout;
+                    }
+                }
                 // Hold the last good scanout across VideoOut buffer rotation. Bendy (PPSA27616) rapidly
                 // re-registers its scanout buffers; on the frames where the guest has registered new
                 // buffers but not yet rendered+flipped them, none is gpu_valid and the present would be
@@ -6127,6 +6200,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // the same predicate as publishing, so a frame prosper could not publish can never
                 // become the frame it serves later.
                 static std::shared_ptr<const std::vector<uint8_t>> last_scanout_present;
+                // Provenance is a property of the RETAINED frame, not of the submit that re-serves
+                // it. Post-wall, Frontiers re-serves one retained frame thousands of times (fresh +1
+                // against retained +2,048 between two shortfall ordinals), so a label that reset on
+                // re-serve would report the guest's own buffer as a composited frame for all but the
+                // first of them — and `--require-composited-frame` would pass on the strength of the
+                // copies.
+                static bool last_scanout_present_from_guest = false;
                 if (!published_gpu) {
                     const size_t current_bytes = selected_pixels ? selected_pixels->size() : 0u;
                     const size_t retained_bytes =
@@ -6135,10 +6215,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 current_bytes, retained_bytes, present_extent_bytes)) {
                         case prosper::frontend::RetainedFrameAction::StoreCurrent:
                             last_scanout_present = selected_pixels;
+                            last_scanout_present_from_guest =
+                                frame_origin == prosper::gpu::PresentFrameOrigin::GuestScanout;
                             present_frames_stored.fetch_add(1, std::memory_order_relaxed);
                             break;
                         case prosper::frontend::RetainedFrameAction::ServeRetained:
                             selected_pixels = last_scanout_present;
+                            frame_origin = last_scanout_present_from_guest
+                                ? prosper::gpu::PresentFrameOrigin::GuestScanout
+                                : prosper::gpu::PresentFrameOrigin::Composited;
                             present_frames_served.fetch_add(1, std::memory_order_relaxed);
                             // A stale-but-correct frame IS what the guest sees, so say so rather than
                             // letting a silent substitution read as a healthy present. Under no extent
@@ -6260,7 +6345,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // lifetime aggregates or their large periodic stderr summaries.
                     prosper::frontend::reset_performance_timing_after_span(
                         pending_timing, timing_enabled, phase.final_span);
-                    return prosper::gpu::RenderedFrame(std::move(selected_pixels));
+                    prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
+                    frame.origin = frame_origin;
+                    return frame;
                 }
                 struct TimingTotals {
                     uint64_t submits = 0, callbacks = 0;
@@ -6670,7 +6757,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 prosper::frontend::reset_performance_timing_after_span(
                     pending_timing, timing_enabled, phase.final_span);
             }
-            return prosper::gpu::RenderedFrame(std::move(selected_pixels));
+            prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
+            frame.origin = frame_origin;
+            return frame;
         });
     fprintf(stderr, "[render] live Vulkan submit renderer registered (dump=%d, frames -> %s)\n",
             (int)dump_bmps, frame_dir.c_str());

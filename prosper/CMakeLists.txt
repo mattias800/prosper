@@ -530,6 +530,12 @@ if(TARGET prosper_core)
   target_include_directories(test_present_extent PRIVATE frontends/shared)
   add_test(NAME present_extent COMMAND test_present_extent)
 
+  # When prosper may publish the guest's OWN flipped display buffer (#1968), including the guest
+  # authorship precondition whose absence reverted the first attempt (#2044). Pure policy, no device.
+  add_executable(test_guest_scanout_present frontends/shared/test_guest_scanout_present.cpp)
+  target_include_directories(test_guest_scanout_present PRIVATE frontends/shared)
+  add_test(NAME guest_scanout_present COMMAND test_guest_scanout_present)
+
   # boot_trace periodic BMPs are opt-in, with the legacy disable taking priority. This exercises the
   # exact environment-name lookup and registrar forwarding without constructing Vulkan or writing files.
   add_executable(test_frame_dump_policy frontends/shared/test_frame_dump_policy.cpp)
@@ -774,6 +780,19 @@ if(TARGET prosper_core)
   add_executable(test_eop_write tests/test_eop_write.cpp)
   target_link_libraries(test_eop_write PRIVATE prosper_core)
   add_test(NAME eop_write COMMAND test_eop_write)
+
+  # #1945: the interior free-chain poison scan — its structural predicate, and the census that keeps
+  # a zero from reading as "the chains are clean" when the walk reached nothing. POSIX only: the test
+  # needs a MAP_FIXED anonymous mapping inside the guest VA window to build a pool array with real
+  # addresses, and mingw-w64 has no <sys/mman.h>. The code under test is built on every platform.
+  if(NOT WIN32)
+    add_executable(test_mb3_poison_scan tests/test_mb3_poison_scan.cpp)
+    target_link_libraries(test_mb3_poison_scan PRIVATE prosper_core)
+    add_test(NAME mb3_poison_scan COMMAND test_mb3_poison_scan)
+    # A host that cannot place the mapping must SKIP, not pass: the structural half of the test
+    # would otherwise be silently absent from a green run.
+    set_tests_properties(mb3_poison_scan PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
 
   # #729: the synchronous (PROSPER_EOP_WRITE_SYNC=1) honor_* label writes must probe
   # guest_readable before dereferencing a guest-PM4-supplied address (own executable: the

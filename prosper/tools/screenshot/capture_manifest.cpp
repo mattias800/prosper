@@ -9,7 +9,11 @@
 namespace prosper::screenshot {
 
 void normalize_capture_rgba(CaptureSource source, std::vector<uint8_t>& pixels) {
-    if (source != CaptureSource::Rendered) return;
+    // A republished guest scanout is normalized like a composited frame and for the same reason:
+    // both reach the desktop through the OPAQUE swapchain, so neither one's alpha attenuates the
+    // visible RGB. Only RawScanout — read straight out of guest memory with no renderer publication
+    // behind it — stays byte-for-byte guest evidence.
+    if (source == CaptureSource::RawScanout) return;
     for (size_t offset = 3; offset < pixels.size(); offset += 4)
         pixels[offset] = 255;
 }
@@ -118,7 +122,11 @@ CaptureClassification CaptureTracker::observe(const CaptureObservation& observat
         result.pixel_stale_seconds =
             std::max(0.0, observation.elapsed_seconds - last_pixel_change_seconds_);
     }
+    // Deliberately Rendered ONLY. `--require-composited-frame` is enforced off this counter, and its
+    // contract is "prosper composited at least one of these frames" — a republished guest scanout
+    // is precisely the case it must keep rejecting.
     if (observation.source == CaptureSource::Rendered) rendered_samples_++;
+    if (observation.source == CaptureSource::GuestScanout) guest_scanout_samples_++;
     max_stale_seconds_ = std::max(max_stale_seconds_, result.stale_seconds);
     max_pixel_stale_seconds_ =
         std::max(max_pixel_stale_seconds_, result.pixel_stale_seconds);
@@ -156,7 +164,12 @@ std::string json_escape(const std::string& value) {
 }
 
 const char* capture_source_name(CaptureSource source) {
-    return source == CaptureSource::Rendered ? "composited" : "raw_scanout";
+    switch (source) {
+        case CaptureSource::Rendered:     return "composited";
+        case CaptureSource::GuestScanout: return "guest_scanout";
+        case CaptureSource::RawScanout:   break;
+    }
+    return "raw_scanout";
 }
 
 std::string manifest_run_json(const CaptureRunConfig& c) {
@@ -237,6 +250,7 @@ std::string manifest_summary_json(int saved, int requested, bool timed_out,
          << ",\"distinct_source_frames\":" << tracker.distinct_source_frames()
          << ",\"pixel_distinct_frames\":" << tracker.pixel_distinct_frames()
          << ",\"rendered_samples\":" << tracker.rendered_samples()
+         << ",\"guest_scanout_samples\":" << tracker.guest_scanout_samples()
          << ",\"max_stale_seconds\":" << std::fixed << std::setprecision(6)
          << tracker.max_stale_seconds()
          << ",\"max_pixel_stale_seconds\":" << std::fixed << std::setprecision(6)

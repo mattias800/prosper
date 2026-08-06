@@ -10,7 +10,16 @@ namespace prosper::screenshot {
 
 constexpr size_t kPerceptualLumaCells = 16 * 9;
 
-enum class CaptureSource : uint8_t { Rendered, RawScanout };
+// Provenance of a captured sample, mirroring prosper::gpu::PresentSource.
+//   Rendered     — prosper composited this frame from the guest's draws/dispatches.
+//   GuestScanout — prosper composited NOTHING and republished the guest's own flipped display
+//                  buffer. It arrives through the same renderer publish path as a composited frame,
+//                  so it needs its own label: `--require-composited-frame` asserts that prosper
+//                  rendered something, and folding this into Rendered makes the exact frame that
+//                  assertion exists to reject satisfy it (#2026 review B1; the revert is #2044).
+//   RawScanout   — no renderer frame ever existed and the reader fell back to the guest display
+//                  buffer directly (the pre-renderer boot path).
+enum class CaptureSource : uint8_t { Rendered, RawScanout, GuestScanout };
 
 struct CaptureObservation {
     CaptureSource source = CaptureSource::Rendered;
@@ -98,6 +107,7 @@ public:
     uint64_t distinct_source_frames() const { return distinct_source_frames_; }
     uint64_t pixel_distinct_frames() const { return pixel_distinct_frames_; }
     uint64_t rendered_samples() const { return rendered_samples_; }
+    uint64_t guest_scanout_samples() const { return guest_scanout_samples_; }
     double max_stale_seconds() const { return max_stale_seconds_; }
     double max_pixel_stale_seconds() const { return max_pixel_stale_seconds_; }
     uint64_t max_frame_seq() const { return max_frame_seq_; }
@@ -112,6 +122,7 @@ private:
     uint64_t distinct_source_frames_ = 0;
     uint64_t pixel_distinct_frames_ = 0;
     uint64_t rendered_samples_ = 0;
+    uint64_t guest_scanout_samples_ = 0;
     double max_stale_seconds_ = 0;
     double max_pixel_stale_seconds_ = 0;
     uint64_t max_frame_seq_ = 0;

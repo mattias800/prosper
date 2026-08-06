@@ -16,6 +16,7 @@ for bugs an independent review found after the first table had already been publ
 Run directly, or via ctest as `re_nid_gate_classifier`.
 """
 import os
+import struct
 import subprocess
 import sys
 
@@ -107,6 +108,45 @@ def objdump_free_checks():
     #  bf b4 00 00 00 90       mov edi,0xb4 ; nop  -> recovered but not exact
     check("arg0-not-exact", G.arg0_before(b"\xbf\xb4\x00\x00\x00\x90", 6), (0xB4, False))
     check("arg0-absent", G.arg0_before(b"\x90\x90\x90\x90", 4), None)
+
+    # --- imported_nids(): the --all-nids enumerator -----------------------------------------------
+    # This decides the whole sweep's coverage, and both ways it can be wrong are silent: too strict
+    # drops real imports from a census whose entire purpose is to be exhaustive, and too loose pulls
+    # ordinary defined symbols in as phantom "imports" that then report zero call sites and read as
+    # a clean negative. The `#` alone is not the discriminator — the 11-character NID before it is.
+    class FakeSyms(G.Image):
+        """A dynsym of `syment`-byte entries whose only field is the u32 st_name, then a strtab."""
+
+        def __init__(self, names):
+            syment = 4
+            strtab = syment * len(names)
+            blob, ents = bytearray(), bytearray()
+            for n in names:
+                ents += struct.pack("<I", len(blob))
+                blob += n.encode() + b"\0"
+            self.raw = bytes(ents + blob)
+            self._d = (0, strtab, len(names), syment)
+
+        def dynsym(self):
+            return self._d
+
+    syms = FakeSyms(["fMP5NHUOaMk#h#h",                      # a real import: 11-char NID then '#'
+                     "_ZNK3sce4Json6Object5emptyEv",         # C++ mangled, no '#' at all
+                     "short#h#h",                            # '#' present, NID too short
+                     "twelvecharss#h#h",                     # '#' present, NID too long
+                     "Oad3rvY-NJQ#libSceNpManager#libSceNpManager"])
+    check("imported-nids-picks-11-char-nids",
+          syms.imported_nids(), [("fMP5NHUOaMk", 0), ("Oad3rvY-NJQ", 4)])
+    #  The `#`-less name above is rejected in this fixture because the NEXT string's `#` is far
+    #  away, which does not pin the NUL clamp at all. Put a `#`-less name immediately before one
+    #  whose `#` lands at exactly distance 11 from it: an unclamped search finds that borrowed `#`
+    #  and admits a symbol that has no NID. Both entries must be rejected.
+    #  "nohash" is 6 bytes + NUL, so "abcd#efgh" starts at 7 and its '#' sits at absolute 11 —
+    #  exactly 11 from "nohash"'s first byte. An unclamped search therefore admits the phantom NID
+    #  "nohash\0abcd"; the clamped one rejects both entries. Verified to discriminate: with the
+    #  clamp removed this assertion returns [('nohash\0abcd', 0)].
+    borrow = FakeSyms(["nohash", "abcd#efgh"])
+    check("imported-nids-clamps-hash-search-to-nul", borrow.imported_nids(), [])
 
 
 def objdump_checks():

@@ -567,12 +567,20 @@ int main(int argc, char** argv) {
         if ((rendered_capture || raw_scanout) && due) {
             gpu::PresentSnapshot snap;
             if (gpu::present_snapshot(snap)) {
-                const bool snap_rendered = snap.source == gpu::PresentSource::Rendered;
-                const bool source_allowed = snap_rendered ? rendered_capture : raw_scanout;
+                // A republished guest scanout arrives through the renderer publish path, so it obeys
+                // the rendered-capture gate — but it is NOT a composited frame and must not be
+                // recorded as one (#2044).
+                const bool snap_from_renderer =
+                    snap.source == gpu::PresentSource::Rendered ||
+                    snap.source == gpu::PresentSource::GuestScanout;
+                const bool source_allowed = snap_from_renderer ? rendered_capture : raw_scanout;
                 if (source_allowed && snap.width && snap.height && !snap.rgba.empty()) {
                     const screenshot::CaptureSource capture_source =
-                        snap_rendered ? screenshot::CaptureSource::Rendered
-                                      : screenshot::CaptureSource::RawScanout;
+                        snap.source == gpu::PresentSource::Rendered
+                            ? screenshot::CaptureSource::Rendered
+                        : snap.source == gpu::PresentSource::GuestScanout
+                            ? screenshot::CaptureSource::GuestScanout
+                            : screenshot::CaptureSource::RawScanout;
                     // prosper-app blits into an OPAQUE swapchain, so renderer-target alpha never
                     // attenuates visible RGB. Normalize at this one persistence boundary so the PNG,
                     // CRC, content metrics, perceptual hashes and stale-pixel tracker all describe
@@ -657,7 +665,9 @@ int main(int argc, char** argv) {
         assertion_failed("maximum pixel-stale duration %.3fs > allowed %.3fs",
                          tracker.max_pixel_stale_seconds(), max_pixel_stale_seconds);
     if (require_composited_frame && tracker.rendered_samples() == 0)
-        assertion_failed("%s", "no composited renderer frame was captured");
+        assertion_failed("no composited renderer frame was captured (%llu guest-scanout republish, "
+                         "%d saved)",
+                         (unsigned long long)tracker.guest_scanout_samples(), saved);
     if (tracker.max_present_count() < min_present_count)
         assertion_failed("present count %llu < required %llu",
                          (unsigned long long)tracker.max_present_count(),

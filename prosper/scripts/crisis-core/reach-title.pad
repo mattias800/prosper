@@ -1,0 +1,40 @@
+# Crisis Core –Final Fantasy VII– Reunion (PPSA07809, Unreal Engine 4.27 + IoStore)
+# Reach the title screen: dismiss the autosave notice, then hold still.
+#
+# The boot sequence is: black -> white splash (several seconds) -> an "This game uses an autosave
+# feature. / OK" dialog, which holds indefinitely -> the "Press Any Button" title screen with the
+# version string and the Square Enix copyright. A Cross dismisses the dialog and the title screen
+# then holds for as long as the run lasts (verified to t=75 s). Two pulses are used, not one; see
+# the next paragraph for why.
+#
+# Anchored on DISPLAY FLIPS, not seconds: the pre-dialog load is IoStore-bound and its wall-clock
+# length varies by tens of seconds between arms. The flip at which the dialog appears varies too —
+# measured directly: one arm had it up before flip 120 and a repeat still had it up at flip ~700 —
+# so a SINGLE press at a fixed flip is not enough, and the first version of this file (one press at
+# f120) failed to dismiss it in 1 of 2 arms. Two pulses cover both cases.
+#
+# The second pulse is not free: if the first already dismissed the dialog, the second is consumed by
+# the title screen and opens the new-game settings flow. That is why they are 60 flips apart — the
+# title screen holds unchanged in between, which at 1 s sampling is 10-20 samples of it. Do not add
+# a third pulse without re-capturing what it lands on.
+#
+# THIS ROUTE DOES NOT BOOT THE TITLE ON ITS OWN. A default run dies 5-12 s in, inside the guest's
+# MallocBinned3 bundle-list pop (#1945), long before the dialog. The route was captured with the
+# guest's submit call throttled, which is what gets past that fault:
+#
+#   PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_SUBMIT_STALL_US=3000 \
+#     PROSPER_PAD_SCRIPT=@prosper/scripts/crisis-core/reach-title.pad \
+#     ./build-linux/screenshot <DUMP_ROOT>/PPSA07809-app0 --seconds 2 --count 90 --timeout 220
+#
+# PROSPER_SUBMIT_STALL_US is a plain sleep in the guest's submit call and is a stopgap, not a fix.
+# It is named here rather than the deep PROSPER_MB3_POISON scan that first got past the fault,
+# because the measurement in docs/CRISIS_CORE_STATUS.md shows the scan works only through its
+# DURATION — so a route that used it would be running a diagnostic as a throttle and would silently
+# change behaviour the day that scan gets cheaper. Both reach the title screen; only one says what
+# it is doing.
+#
+# STATUS: EXPLORATORY. Verified only as far as the title screen. Cross presses beyond that point
+# open the new-game settings flow (voice language, then "Begin game with selected settings?"), so
+# do not add blind presses here without re-capturing what they land on. Tracker: #1894.
+f120-140:cross
+f200-220:cross

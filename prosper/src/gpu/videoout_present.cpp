@@ -20,6 +20,7 @@ std::mutex           g_frame_mx;
 std::shared_ptr<const std::vector<uint8_t>> g_frame; // w*h*4 bytes when a frame is present
 uint32_t             g_frame_w = 0, g_frame_h = 0;
 uint64_t             g_frame_guest_present_count = 0;
+PresentFrameOrigin   g_frame_origin = PresentFrameOrigin::Composited;
 std::atomic<bool>    g_have_frame{false};
 
 bool current_scanout(VideoOutBufferSnapshot& out, int* index = nullptr) {
@@ -32,21 +33,24 @@ bool current_scanout(VideoOutBufferSnapshot& out, int* index = nullptr) {
 }
 }
 
-void present_write_frame(const void* pixels, uint32_t w, uint32_t h) {
+void present_write_frame(const void* pixels, uint32_t w, uint32_t h, PresentFrameOrigin origin) {
     if (!pixels || !w || !h) return;
     size_t bytes = (size_t)w * h * 4;
     auto owned = std::make_shared<std::vector<uint8_t>>(bytes);
     std::memcpy(owned->data(), pixels, bytes);
-    present_write_frame(std::move(owned), w, h);
+    present_write_frame(std::move(owned), w, h, origin);
 }
 
 void present_write_frame(std::shared_ptr<const std::vector<uint8_t>> pixels,
-                         uint32_t w, uint32_t h) {
+                         uint32_t w, uint32_t h, PresentFrameOrigin origin) {
     if (!pixels || !w || !h || pixels->size() != (size_t)w * h * 4) return;
     std::lock_guard<std::mutex> lk(g_frame_mx);
     g_frame = std::move(pixels);
     g_frame_w = w; g_frame_h = h;
     g_frame_guest_present_count = g_present_count.load(std::memory_order_relaxed);
+    // The origin travels with the pixels under the same mutex as the dimensions and the sequence
+    // number, so a consumer can never pair one publication's bytes with another's provenance.
+    g_frame_origin = origin;
     g_have_frame.store(true, std::memory_order_release);
     g_frame_seq.fetch_add(1, std::memory_order_relaxed);
 }
@@ -68,6 +72,10 @@ void present_flip(int buffer_index, int64_t flip_arg) {
     // actually puts on screen — vs our execute_and_present composite render). First 8 flips + every 60th.
     // Written as raw w*h*4 bytes; convert offline. This reveals whether the game's real display holds the
     // title/scene even when the captured draws are a no-op composite.
+    // Deliberately RAW, so it stays a faithful view of guest memory. A TILE-mode scanout therefore
+    // looks like horizontal-band noise until it is de-swizzled — that is the surface being real and
+    // tiled, not empty. Use videoout_read_front_linear (or detile with videoout_scanout_tile_mode)
+    // to see it as an image; #1968 spent an arm concluding "content" from exactly this dump.
     if (const char* dir = getenv("PROSPER_DUMP_SCANOUT"); dir && (n < 8 || n % 60 == 0)) {
         std::vector<uint8_t> raw;
         if (videoout_copy_buffer(selected, raw)) {
@@ -113,8 +121,14 @@ size_t present_readback(void* dst, size_t dst_cap) {
         }
         return 0;
     }
-    // Fallback: scan out the raw guest display buffer (contents are whatever the guest put there).
-    return videoout_copy_front_buffer(dst, dst_cap);
+    // Fallback: scan out the guest display buffer (contents are whatever the guest put there). Read
+    // it as an image — a TILE-mode scanout's bytes are swizzled, and returning them raw hands the
+    // caller band noise in place of the guest's own frame (#1968).
+    VideoOutLinearRead read;
+    if (!videoout_read_front_linear(read) || read.pixels.empty() || dst_cap < read.pixels.size())
+        return 0;
+    std::memcpy(dst, read.pixels.data(), read.pixels.size());
+    return read.pixels.size();
 }
 
 bool present_acquire_rendered_frame(PresentFrameLease& out) {
@@ -137,7 +151,12 @@ bool present_snapshot(PresentSnapshot& out) {
     if (g_have_frame.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lk(g_frame_mx);
         if (!g_frame || g_frame->empty() || !g_frame_w || !g_frame_h) return false;
-        out.source = PresentSource::Rendered;
+        // A republished guest scanout travels the same path as a composited frame and MUST NOT be
+        // reported as one: `--require-composited-frame` (tools/screenshot) asserts that prosper
+        // rendered something, and labelling this Rendered would make the exact frame that assertion
+        // exists to reject satisfy it. #2026's review, B1; the revert is #2044.
+        out.source = g_frame_origin == PresentFrameOrigin::GuestScanout
+            ? PresentSource::GuestScanout : PresentSource::Rendered;
         out.frame_seq = g_frame_seq.load(std::memory_order_relaxed);
         out.source_seq = out.frame_seq;
         out.present_count = g_present_count.load(std::memory_order_relaxed);
@@ -148,15 +167,16 @@ bool present_snapshot(PresentSnapshot& out) {
         return true;
     }
 
-    VideoOutBufferSnapshot scanout;
-    if (!videoout_copy_front_buffer(out.rgba, scanout)) return false;
+    VideoOutLinearRead read;
+    if (!videoout_read_front_linear(read)) return false;
+    out.rgba = std::move(read.pixels);
     out.source = PresentSource::RawScanout;
     out.present_count = g_present_count.load(std::memory_order_relaxed);
     out.source_seq = out.present_count;
     out.frame_seq = g_frame_seq.load(std::memory_order_relaxed);
-    out.front_index = scanout.buffer_index;
-    out.width = scanout.width;
-    out.height = scanout.height;
+    out.front_index = read.metadata.buffer_index;
+    out.width = read.metadata.width;
+    out.height = read.metadata.height;
     return true;
 }
 
@@ -166,6 +186,7 @@ void present_reset() {
     std::lock_guard<std::mutex> lk(g_frame_mx);
     g_frame.reset(); g_frame_w = g_frame_h = 0;
     g_frame_guest_present_count = 0;
+    g_frame_origin = PresentFrameOrigin::Composited;
     g_frame_seq.store(0, std::memory_order_relaxed);   // #399: reset the rendered-frame counter too
     g_have_frame.store(false, std::memory_order_release);
 }

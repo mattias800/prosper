@@ -47,11 +47,49 @@ bool videoout_copy_front_buffer(std::vector<uint8_t>& out, VideoOutBufferSnapsho
 size_t videoout_copy_front_buffer(void* dst, size_t dst_cap,
                                   VideoOutBufferSnapshot* metadata = nullptr);
 
+// The result of reading a registered scanout as an IMAGE rather than as bytes.
+struct VideoOutLinearRead {
+    std::vector<uint8_t> pixels;        // linear width*height*4 RGBA, de-swizzled
+    VideoOutBufferSnapshot metadata{};
+    // True when the buffer's contents have been observed to DIFFER from what they were at the
+    // moment the guest registered it — the only evidence available in-process that the guest,
+    // rather than whatever previously owned this memory, authored what is in there now. Sticky per
+    // registration: once a write is seen, later frames stay authored even if one happens to match
+    // the baseline. False also means "no baseline was taken" (the range was not readable at
+    // registration), which is deliberately indistinguishable from "not written": both mean prosper
+    // cannot say the guest wrote it, and callers must decline in either case.
+    bool guest_authored = false;
+    // True when the read covered the whole swizzle footprint rather than stopping at
+    // width*height*4. False means the tail — real texels of the last block row — could not be
+    // proven to belong to this buffer and was left zero, so the bottom-right of the image is
+    // incomplete. Reported so a title showing a corrupt corner is diagnosable without a rebuild.
+    bool padded_footprint = false;
+};
+
+// Read the currently flipped (front) scanout as an image: `out.pixels` is linear width*height*4
+// RGBA, de-swizzled from the tiling mode the guest registered with the buffer. Use this wherever the
+// result is treated as PIXELS; the raw copies above stay raw for diagnostics that want guest bytes
+// exactly as they are. False means no buffer is flipped, its registration changed under the read, or
+// its geometry is unusable.
+bool videoout_read_front_linear(VideoOutLinearRead& out);
+
 } // namespace prosper
 
 namespace prosper::gpu {
 
-enum class PresentSource : uint8_t { None, Rendered, RawScanout };
+// Where the frame a consumer just read actually came from. These are provenance labels, not quality
+// labels, and one of them exists specifically so a verification gate can tell two cases apart:
+//   Rendered     — prosper composited it from the guest's draws/dispatches.
+//   GuestScanout — prosper composited NOTHING for this flip and republished the guest's own display
+//                  buffer verbatim. It reaches consumers through the same present_write_frame path
+//                  as a composited frame (it is what the swapchain shows), so without its own label
+//                  `--require-composited-frame` would accept the exact frame it exists to reject.
+//   RawScanout   — no renderer frame has ever been handed in, and the reader fell back to the guest
+//                  display buffer directly (the pre-renderer boot path).
+enum class PresentSource : uint8_t { None, Rendered, RawScanout, GuestScanout };
+
+// The provenance a producer declares when it hands a frame to the present layer.
+enum class PresentFrameOrigin : uint8_t { Composited, GuestScanout };
 
 // One internally consistent readback plus the counters that identify it. The older query/readback
 // calls remain for lightweight consumers, but tools that persist evidence should use this snapshot:
@@ -85,9 +123,11 @@ void present_flip(int buffer_index, int64_t flip_arg);
 // 4 bytes/pixel) to the present layer. present_readback then returns THIS frame — the real rendered
 // pixels — instead of the raw guest display buffer, closing the loop shader → render →
 // present_write_frame → present_readback. Thread-safe (renderer writes, present reads).
-void present_write_frame(const void* pixels, uint32_t w, uint32_t h);
+void present_write_frame(const void* pixels, uint32_t w, uint32_t h,
+                         PresentFrameOrigin origin = PresentFrameOrigin::Composited);
 void present_write_frame(std::shared_ptr<const std::vector<uint8_t>> pixels,
-                         uint32_t w, uint32_t h);
+                         uint32_t w, uint32_t h,
+                         PresentFrameOrigin origin = PresentFrameOrigin::Composited);
 
 // True once a rendered frame has been handed in (readback returns rendered pixels, not the guest buffer).
 bool present_has_frame();
