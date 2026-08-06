@@ -583,23 +583,28 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   compute program, alternating between the two buffers, packing and tiling its result back into
   guest memory across the padded SW_64KB_R_X footprint. **Do not read that event count as a dispatch
   rate**: `live_compute`'s "skipped identical storage writeback" fast path `continue`s *before* the
-  record, so the events count writes that **changed** something — 237 over 360 s against ~1,055
-  flips, collapsing to ~0 per sample once the frame is uniformly black and every writeback is
-  byte-identical to the last. The dispatch is still issued: a capture selected by
-  `PROSPER_GPU_CAPTURE_COMPUTE_ADDR` fires in the black phase. **Zero** `dma-data` and **zero**
-  `write-data` events touch either address, and the draw half is settled independently by the pass
-  census (`vo=1` on 0 of 8,443 records — a census of every *deferred* pass plus every pass with more
-  than 100 non-black pixels, which on the default live-target path is all of them). So the guest
-  composites with a compute dispatch,
+  record, so the events are an **upper bound on writebacks that changed something** — that fast
+  path also requires the binding to be a cache candidate, so a non-candidate records even with
+  identical bytes. 237 over 360 s against ~1,055 flips, collapsing to ~0 per sample once the frame
+  is uniformly black and every writeback is byte-identical to the last. The dispatch is still
+  issued: a capture selected by `PROSPER_GPU_CAPTURE_COMPUTE_ADDR` fires in the black phase.
+  **Zero** `dma-data` and **zero** `write-data` events touch either address, and the draw half is
+  settled independently by the pass
+  census (`vo=1` on 0 of 8,443 records — every *deferred* pass plus every pass with more than 100
+  non-black pixels; 8,443 over ~1,055 flips is 8.0 records per frame, exactly the post chain the
+  capture enumerated, so coverage is complete **for that run** — which is the claim the arithmetic
+  supports and the code paths do not, since `PROSPER_READBACK_WHY` names six ways a pass on the
+  live-target path is not deferred). So the guest composites with a compute dispatch,
   prosper executes it, prosper writes it back, and prosper publishes it. Reach for
   `PROSPER_PROVENANCE_ADDR` first on any title whose scanout no pass targets — it names the writer
   kind, the program's code address and the submit, which no pass census can. **Read its silence with
   one limit in mind, because it is not stated anywhere else:** the address watch arms the
   compute-writeback, `DMA_DATA` and `WRITE_DATA` recorders, but the **colour-target** recorder lives
   inside `diagnose_resource_provenance`, which returns early unless the *separate*
-  `PROSPER_PROVENANCE_DIM` is also set (`gpu_executor.cpp`). An `ADDR`-only run therefore reports
-  **no `color` lines at all**, and that zero is void rather than negative — filed as #2111. Set both
-  variables, or settle the draw question with `PROSPER_PASS_LOG`. #1968.
+  `PROSPER_PROVENANCE_DIM` is also set — and set to something that *parses* as `WxH` with both
+  dimensions non-zero, so `=1` is not enough (`gpu_executor.cpp`). An `ADDR`-only run therefore
+  reports **no `color` lines at all**, and that zero is void rather than negative — filed as #2111.
+  Set both variables, or settle the draw question with `PROSPER_PASS_LOG`. #1968.
 - **Post-intro Frontiers runs a complete post-processing chain over an empty scene — the missing
   thing is geometry, not a composite step.** A capture of the submit containing that composite
   dispatch (selected with `PROSPER_GPU_CAPTURE_COMPUTE_ADDR=0x20002fe800`, 240 s into a default
@@ -613,7 +618,18 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   and taken with no capture armed) enumerates **17** persistent colour targets over three
   consecutive black-phase submits, in each of two independent runs. Read 17 as a **lower bound**:
   the census skips anything smaller than 64x64 and silently `continue`s on a readback failure, so
-  the 16x16 / 4x4 / 2x1 tail of the luminance chain is outside it by construction. Exactly one
+  the 16x16 / 4x4 / 2x1 tail of the luminance chain is outside it by construction. **The headline
+  survives that gap transitively rather than by enumeration**, and it is worth seeing why: those
+  unseen stages are exposure *scalars*, not image content — a 2x1 luminance value cannot be the
+  missing picture however it reads — and **in the captured frame** their consumer is the tonemap,
+  whose 3840x2160 `RGBA8` output IS in the census and reads opaque black. Read that consumer as
+  *that frame's*: a one-submit capture cannot see a cross-frame read by construction, and a
+  luminance reduction is exactly the quantity a renderer adapts temporally, so "the tonemap is the
+  only consumer" is a claim this instrument cannot make. **The scalar half is what carries the
+  headline**; the tonemap corroborates it. The silent readback-failure path is bounded separately
+  and weakly:
+  the enumerated count is **identical (17) in both runs**, so it is not dropping a target
+  nondeterministically. Exactly one
   enumerated target has content — the CPU-materialised movie composite, still holding the last
   credits frame at `rgb_nonblack=778215/8294400`, which is *stale* and not an input to the post
   chain (`0x2059ea0000` in one run and `0x2059eb0000` in the next: **the address is run-local**,
@@ -621,8 +637,11 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   `00 00 00 00 00 00 00 3c` per texel (RGB bit-zero, alpha exactly 1.0) and every 4K `RGBA8` target
   reads `00 00 00 ff` (opaque black); the bloom target and three others are entirely zero. Nothing
   is lost between any target and the scanout because there is nothing anywhere to lose. Corroborated
-  by a full `PROSPER_DBG=1` run: **0** recompile-rejects of any kind and **0** `[compute] skip`, the
-  only skipped dispatch in the whole boot being #657's `64x64x6` layered image, twice, at boot.
+  by a full `PROSPER_DBG=1` run: **0** recompile-rejects of any kind and **0** `[compute] skip` —
+  not self-contradictory with what follows, because they are different tokens: `[compute] skip` is
+  the unsupported-program / descriptor-contract reject, while the only skipped dispatch in the whole
+  boot is #657's `64x64x6` layered image, twice, at boot, reported as `layered image deferred to
+  #657 -> dispatch skipped (#590)`.
   **That zero has a positive control, and it needs one**: all four reject emitters
   (`[recompile-reject]`, `[cfg-recompile-reject]`, `[vertex-recompile-reject]`,
   `[exec-recompile-reject]`) are `PROSPER_DBG`-gated, so an unset variable is indistinguishable from
@@ -639,8 +658,8 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   come from `gpu_capture_hash` (`gpu_capture.cpp`), so the hash of *N* zero bytes — or of any
   repeating texel pattern, which is how "opaque black" and "alpha 1.0" were identified above — can
   be computed offline and compared. **Do not reach for a stock FNV-1a 64 to do it.**
-  `gpu_capture_hash` uses the FNV prime with a **basis of `0x14650fb0739d0383`**, which is the FNV-1a
-  64 offset basis with a digit dropped; a standard implementation produces a value that can never
+  `gpu_capture_hash` uses the FNV prime with a **basis of `0x14650fb0739d0383`** — the FNV-1a 64
+  offset basis with a digit dropped; a standard implementation produces a value that can never
   match a prosper hash, and that mismatch reads as "the buffer is not zero" — the exact false
   conclusion this row exists to prevent. Same family as the `px_nonblack` inversion. #1968.
 - **The census ordinal `PROSPER_DUMP_PERSISTENT` / `PROSPER_PASS_LOG` take is NOT the submit number
