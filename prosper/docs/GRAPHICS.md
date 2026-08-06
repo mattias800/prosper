@@ -581,11 +581,18 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   only writer of either registered VideoOut buffer (`0x200a160000` / `0x200c140000`) is
   `compute-buffer … identity=0x20002fe800 size=33423360` — the storage-image writeback of **one**
   compute program, alternating between the two buffers, packing and tiling its result back into
-  guest memory across the padded SW_64KB_R_X footprint. **Zero** `color` (draw) and **zero**
-  `dma-data` events touch either address. So the guest composites with a compute dispatch, prosper
-  executes it, prosper writes it back, and prosper publishes it. Reach for `PROSPER_PROVENANCE_ADDR`
-  first on any title whose scanout no pass targets — it names the writer kind, the program's code
-  address and the submit, which no pass census can. #1968.
+  guest memory across the padded SW_64KB_R_X footprint. **Zero** `dma-data` and **zero**
+  `write-data` events touch either address, and the draw half is settled independently by the pass
+  census below (`vo=1` on 0 of 8,443 records). So the guest composites with a compute dispatch,
+  prosper executes it, prosper writes it back, and prosper publishes it. Reach for
+  `PROSPER_PROVENANCE_ADDR` first on any title whose scanout no pass targets — it names the writer
+  kind, the program's code address and the submit, which no pass census can. **Read its silence with
+  one limit in mind, because it is not stated anywhere else:** the address watch arms the
+  compute-writeback, `DMA_DATA` and `WRITE_DATA` recorders, but the **colour-target** recorder lives
+  inside `diagnose_resource_provenance`, which returns early unless the *separate*
+  `PROSPER_PROVENANCE_DIM` is also set (`gpu_executor.cpp`). An `ADDR`-only run therefore reports
+  **no `color` lines at all**, and that zero is void rather than negative — filed as #2111. Set both
+  variables, or settle the draw question with `PROSPER_PASS_LOG`. #1968.
 - **Post-intro Frontiers runs a complete post-processing chain over an empty scene — the missing
   thing is geometry, not a composite step.** A capture of the submit containing that composite
   dispatch (selected with `PROSPER_GPU_CAPTURE_COMPUTE_ADDR=0x20002fe800`, 240 s into a default
