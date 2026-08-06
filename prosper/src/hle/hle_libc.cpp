@@ -13,6 +13,17 @@
 #include <cwchar>
 #include <cerrno>
 #include <cstddef>
+#if !defined(_WIN32)
+// malloc_usable_size / malloc_size: the only portable way to bound a copy out of a block whose
+// original request size the caller does not carry (reallocalign, #2185).
+#  if defined(__APPLE__)
+#    include <malloc/malloc.h>
+#    define PROSPER_USABLE_SIZE(p) malloc_size(p)
+#  else
+#    include <malloc.h>
+#    define PROSPER_USABLE_SIZE(p) malloc_usable_size(p)
+#  endif
+#endif
 #include <array>
 #include <limits>
 #include <atomic>
@@ -184,6 +195,50 @@ static void* guest_realloc_portable(void* p, size_t size) {
 #endif
 }
 
+// reallocalign(ptr, size, alignment): resize a block and give the RESULT the requested extended
+// alignment. Sony ships this as a function separate from realloc (libSceLibcInternal exports
+// `reallocalign` OGybVuPAhAY beside `realloc` Y7aJ1uydPMo, and pairs sceLibcMspaceRealloc with
+// sceLibcMspaceReallocalign) for the reason the C standard implies: a two-argument resize is never
+// told an alignment, so it cannot promise to carry one. C17 7.22.3p1 guarantees only fundamental
+// alignment (<= alignof(max_align_t), 6.2.8p2); 256 is an EXTENDED alignment (6.2.8p3) that plain
+// realloc may drop the moment the block relocates. See #2165 / #2185.
+//
+// Unregistered, this NID fell to the dispatcher's 0 — a NULL return, which an allocator caller reads
+// as OOM. That is a false FAILURE (a title treating allocation failure as fatal aborts), the mirror
+// of #2081's false successes.
+static void* guest_reallocalign_portable(void* p, size_t size, size_t alignment) {
+    if (alignment < alignof(std::max_align_t)) alignment = alignof(std::max_align_t);
+    if (alignment & (alignment - 1)) { errno = EINVAL; return nullptr; }
+#ifdef _WIN32
+    // Windows keeps size and alignment in a header ahead of the payload, so the old size is exact
+    // and the new alignment can differ from the old one without the CRT's _aligned_realloc
+    // restriction applying.
+    if (!p) return guest_windows_alloc(alignment, size);
+    GuestAllocHeader* header = guest_windows_header(p);
+    if (header->magic != kGuestAllocMagic) { errno = EINVAL; return nullptr; }
+    if (!size) { guest_windows_free(p); return nullptr; }
+    const size_t old_size = header->size;
+    void* replacement = guest_windows_alloc(alignment, size);
+    if (!replacement) return nullptr;                     // errno set by guest_windows_alloc
+    memcpy(replacement, p, old_size < size ? old_size : size);
+    guest_windows_free(p);
+    return replacement;
+#else
+    if (!p) return aligned_alloc_portable(alignment, size);
+    if (!size) { free(p); return nullptr; }
+    void* replacement = aligned_alloc_portable(alignment, size);
+    if (!replacement) return nullptr;                     // errno set by the allocator; old block kept
+    // The old request size is not recoverable here, so copy what is provably READABLE in the old
+    // block, capped by the new one. malloc_usable_size is always >= the original request, so this
+    // never copies less than the payload; capping at `size` is what keeps it in bounds when the
+    // block shrinks. Copying more than the guest wrote is harmless — it is its own storage.
+    size_t old_readable = PROSPER_USABLE_SIZE(p);
+    memcpy(replacement, p, old_readable < size ? old_readable : size);
+    free(p);
+    return replacement;
+#endif
+}
+
 static void guest_free_portable(void* p) {
 #ifdef _WIN32
     guest_windows_free(p);
@@ -246,6 +301,8 @@ HLE(h_malloc)  { return (uint64_t)(uintptr_t)guest_malloc_portable(a0); }
 HLE(h_calloc)  { return (uint64_t)(uintptr_t)guest_calloc_portable(a0, a1); }
 HLE(h_realloc) { return (uint64_t)(uintptr_t)guest_realloc_portable(P(a0), a1); }
 HLE(h_free)    { guest_free_portable(P(a0)); return 0; }
+// reallocalign(ptr, size, alignment) — argument order follows the firmware's own signature.
+HLE(h_reallocalign) { return (uint64_t)(uintptr_t)guest_reallocalign_portable(P(a0), a1, a2); }
 // memalign(alignment, size): aligned allocation. Normalize alignment to a valid
 // power-of-two >= sizeof(void*) for posix_memalign.
 HLE(h_memalign) {
@@ -721,6 +778,7 @@ void register_builtin_hle() {
     R("strcat_s", h_strcat_s);   R("strncat_s", h_strncat_s);
     R("malloc", h_malloc);   R("calloc", h_calloc);   R("realloc", h_realloc); R("free", h_free);
     R("memalign", h_memalign); R("posix_memalign", h_posix_memalign); R("aligned_alloc", h_aligned_alloc);
+    R("reallocalign", h_reallocalign);
     // operator new / new[] (+ nothrow), and aligned variants
     R("_Znwm", h_new); R("_Znam", h_new);
     R("_ZnwmRKSt9nothrow_t", h_new_nothrow); R("_ZnamRKSt9nothrow_t", h_new_nothrow);
