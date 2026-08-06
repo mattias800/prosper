@@ -836,7 +836,8 @@ on this path are offline-consistent (`sceNetCtlGetState` -> DISCONNECTED, `sceNp
   `PROSPER_ASM_TRAMPOLINE` entries rather than six-`unsigned long` C++ handlers. Their absence from
   the histogram reads exactly like "the guest never pumps its callbacks" — a conclusion this lane
   formed and then falsified against the `DELIVERED` lines above. Any `hle_calls` zero for a
-  trampoline-registered handler is **void**.
+  trampoline-registered handler is **void**. Recorded as instrument trap 105 in
+  `GAME_COMPAT_ORCHESTRATION.md`.
 - **`hle_calls --values` is currently void on this machine** (#2075), and its own positive control says so.
   Three independent arms (60 ticks / 1500 ticks / a single-handler 40-tick arm) report
   `finish-failures` exactly equal to the call count — 20/20, 543/543, 4/4 — with
