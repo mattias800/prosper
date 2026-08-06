@@ -92,6 +92,13 @@ inline bool claim_fault_report(std::atomic<long>& owner, long tid, long* already
 // Release a claim taken by `claim_fault_report`. Compare-exchange rather than a plain store, so a
 // thread that never owned the gate cannot hand it to a third thread in the middle of someone
 // else's report.
+//
+// Deliberately NOT nesting-counted, and that is safe only because of a property of the caller:
+// `claim_fault_report` grants re-entry to the owning tid (a fault raised inside the dump), and a
+// re-entrant call would then release the gate while the outer report is still open. It cannot,
+// because the fatal report block never returns — its every exit is `_exit` or an unbounded park —
+// so an inner report ends the process rather than unwinding back into the outer one. If that ever
+// stops being true, this needs a depth count, not a bool.
 inline void release_fault_report(std::atomic<long>& owner, long tid) {
     long expected = tid;
     owner.compare_exchange_strong(expected, 0);
