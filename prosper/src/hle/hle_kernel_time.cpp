@@ -11,6 +11,7 @@
 #include "sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "heap_mutex.hpp"   // #707: keep hot equeue/APR mutexes off macOS __DATA
 #include "sync_futex.hpp"
+#include "sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
 #include <pthread.h>
 #include <chrono>
 #if defined(__linux__)
@@ -714,12 +715,19 @@ HLE(k_uuid_create) {                                       // fill 16 non-zero b
 HLE(m_mtx_init)   { if (a0) { auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t)); pthread_mutexattr_t at; pthread_mutexattr_init(&at); pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(m, &at); pthread_mutexattr_destroy(&at); *(void**)P(a0) = m; } return 0; }
 HLE(m_mtx_lock)   { if (a0 && *(void**)P(a0)) interruptible_mutex_lock((pthread_mutex_t*)*(void**)P(a0)); return 0; }
 HLE(m_mtx_unlock) { if (a0 && *(void**)P(a0)) pthread_mutex_unlock((pthread_mutex_t*)*(void**)P(a0)); return 0; }
-HLE(m_mtx_destroy){ if (a0 && *(void**)P(a0)) { pthread_mutex_destroy((pthread_mutex_t*)*(void**)P(a0)); free(*(void**)P(a0)); } return 0; }
+// _Mtx_destroy / _Cnd_destroy are the guest STL's own spelling of the same objects, so they carry
+// the same lifetime rule as scePthreadMutexDestroy / scePthreadCondDestroy: quarantine the storage
+// instead of freeing it here, and defer the host destroy to reclaim, because a thread may be parked
+// inside the object. See the contract block above k_mutex_destroy in hle_kernel.cpp, and
+// sync_retire.hpp (#2042).
+HLE(m_mtx_destroy){ if (a0 && *(void**)P(a0)) { retire_sync_object(*(void**)P(a0), SyncObjectKind::StlMutex,
+                                                          [](void* p) { pthread_mutex_destroy((pthread_mutex_t*)p); }); } return 0; }
 HLE(m_cnd_init)   { if (a0) { auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t)); pthread_cond_init(c, nullptr); *(void**)P(a0) = c; } return 0; }
 HLE(m_cnd_signal) { if (a0 && *(void**)P(a0)) interruptible_cond_signal((pthread_cond_t*)*(void**)P(a0)); return 0; }
 HLE(m_cnd_broadcast){ if (a0 && *(void**)P(a0)) interruptible_cond_broadcast((pthread_cond_t*)*(void**)P(a0)); return 0; }
 HLE(m_cnd_wait)   { if (a0 && *(void**)P(a0) && a1 && *(void**)P(a1)) interruptible_cond_wait((pthread_cond_t*)*(void**)P(a0), (pthread_mutex_t*)*(void**)P(a1)); return 0; }
-HLE(m_cnd_destroy){ if (a0 && *(void**)P(a0)) { auto* c = (pthread_cond_t*)*(void**)P(a0); pthread_cond_destroy(c); interruptible_cond_forget(c); free(c); } return 0; }
+HLE(m_cnd_destroy){ if (a0 && *(void**)P(a0)) { auto* c = (pthread_cond_t*)*(void**)P(a0); interruptible_cond_forget(c); retire_sync_object(c, SyncObjectKind::StlCond,
+                                                                       [](void* p) { pthread_cond_destroy((pthread_cond_t*)p); }); } return 0; }
 
 // --- event queue (sceKernelEqueue): kqueue-like event mechanism the engine uses for vsync/flip
 // and async I/O completion. Headless: give a valid queue object; WaitEqueue yields briefly and

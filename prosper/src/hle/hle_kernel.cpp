@@ -17,6 +17,7 @@
 #include "sce_errno.hpp"
 #include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "sync_futex.hpp"
+#include "sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
 #include "../gpu/mb3_freelist.hpp"
 #include "../host/exec_image.hpp"
 #include <pthread.h>
@@ -464,7 +465,12 @@ namespace {
         if (pthread_rwlock_init(&g->rw, nullptr) != 0) { g->~GuestRwlock(); free(mem); return nullptr; }
         return g;
     }
-    void guest_rwlock_destroy(GuestRwlock* g) {
+    // ONLY for an object that was never published through a guest slot: the init-failure path above
+    // and the lost-init-race path below. No other thread can hold this pointer, so the storage
+    // really can go back to the allocator — which matters, because the lost-race path is the
+    // CONTENDED one and must stay allocation-neutral. A published object is retired instead
+    // (`retire_sync_object`, #2042); do not reuse this for one.
+    void guest_rwlock_free_unpublished(GuestRwlock* g) {
         if (!g) return;
         pthread_rwlock_destroy(&g->rw);
         g->~GuestRwlock();
@@ -480,7 +486,7 @@ namespace {
         if (__atomic_compare_exchange_n(slot, &cur, (void*)g, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             return g;
-        guest_rwlock_destroy(g);          // lost the init race: use the winner's object
+        guest_rwlock_free_unpublished(g);   // lost the init race: use the winner's object
         return (GuestRwlock*)cur;
     }
     // scePthreadSem*: read the sem_t created by scePthreadSemInit (no static SEM_INITIALIZER, so no lazy
@@ -542,7 +548,45 @@ namespace { inline uint64_t fbsd_errno(int host) {
     if (host == 0) return 0;
     return (uint64_t)static_cast<uint32_t>(prosper::hle::freebsd_errno_from_host(host));
 } }
-HLE(k_mutex_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { auto* m = (pthread_mutex_t*)*(void**)a0; guest_mutex_unregister(m); pthread_mutex_destroy(m); free(m); } if (a0) *(void**)a0 = nullptr; return 0; }
+// --- DESTROYING A GUEST SYNC OBJECT (#2042) — read this before editing any *Destroy handler ------
+//
+// Every one of these handlers used to `free()` the object outright. That is a use-after-free waiting
+// for a guest that destroys an object another thread is still using: the handlers resolve the
+// pointer from a guest slot and then dereference it, sometimes while PARKED INSIDE it
+// (`interruptible_mutex_lock`, `pthread_rwlock_rdlock`), so the freed block is handed to the next
+// `calloc` and prosper's own heap is corrupted. The storage now goes into a time-bounded QUARANTINE
+// instead, and the host `pthread_*_destroy` runs at reclaim rather than here — which keeps the
+// guest's bug the guest's bug. `sync_retire.hpp` carries the full argument, the measurement that
+// sized the window, and what the window does not close. `sceKernelDeleteEventFlag` and
+// `sceKernelDeleteSema` below already solved the same hazard their own way (defer the free to the
+// last waiter) and are left alone.
+//
+// WHAT THESE HANDLERS DELIBERATELY STILL DO NOT DO: refuse a busy destroy. FreeBSD libthr — the
+// platform the guest was built against — is NOT uniform here, and the differences are not
+// guessable, so each spelling follows its own source rather than a house rule:
+//
+//   pthread_mutex_destroy   EBUSY when an owner is recorded (`PMUTEX_OWNER_ID(m) != 0`); frees only
+//                           when unowned. EINVAL on an already-destroyed object.
+//   pthread_cond_destroy    EBUSY when `__has_user_waiters || kcond.c_has_waiters`. EINVAL likewise.
+//   pthread_barrier_destroy EBUSY when `b_waiters > 0`, or when another destroy is in progress; it
+//                           also waits out `b_refcount` on the barrier's own condition.
+//   pthread_rwlock_destroy  NO busy check of any kind — it frees unconditionally and returns 0,
+//                           whatever is held or blocked. EINVAL only for a double destroy.
+//   sem_destroy             no busy check; it does not free at all (the sem_t is caller storage).
+//
+// So the EBUSY that is obvious for a *rwlock* is exactly the one the platform does not have, and
+// inventing it here would be a guest-visible divergence introduced to paper over an emulator-side
+// memory-safety problem — the wrong trade in both directions. The three EBUSY results FreeBSD DOES
+// specify are a separate defect (a contract divergence, not a lifetime bug): prosper has no owner
+// tracking on POSIX hosts and no waiter counts for cond/barrier, so each needs new accounting and
+// is guest-visible on every title. Filed as #2168 rather than folded in here. The slot prosper
+// clears to NULL is a third divergence — FreeBSD writes a DESTROYED poison and fails EINVAL, where
+// prosper's sentinel test self-initializes a fresh unheld object instead — filed as #2170.
+// CONFIDENCE: HIGH on the table above (read out of libthr and libc, the guest's own platform);
+// CONFIDENCE: MED that Sony's libkernel did not re-write these bodies, which no evidence in the
+// corpus can currently settle either way — a title observed testing a Destroy result would.
+HLE(k_mutex_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { auto* m = (pthread_mutex_t*)*(void**)a0; guest_mutex_unregister(m); retire_sync_object(m, SyncObjectKind::Mutex,
+                                    [](void* p) { pthread_mutex_destroy((pthread_mutex_t*)p); }); } if (a0) *(void**)a0 = nullptr; return 0; }
 // PROSPER_MUTEX_FAILLOG: report any mutex op that returns a non-zero (EINVAL/EDEADLK/...) result,
 // with the guest slot address and the host object it resolved to. Diagnostic for the macOS
 // guest-side "std::mutex lock failed: Invalid argument" terminate — a host EINVAL(22) surfaces as
@@ -810,10 +854,13 @@ HLE(k_cond_init) {
 HLE(k_cond_destroy) {
     if (a0 && !pt_static_sentinel(*(void**)a0)) {
         auto* cond = (pthread_cond_t*)*(void**)a0;
-        pthread_cond_destroy(cond);
+        // Quarantined, not freed, and the host `pthread_cond_destroy` runs at reclaim rather than
+        // here — see the contract block above k_mutex_destroy and sync_retire.hpp (#2042). A thread
+        // parked in interruptible_cond_wait is inside this very object.
         interruptible_cond_forget(cond);
         guest_cond_unregister(cond);
-        free(cond);
+        retire_sync_object(cond, SyncObjectKind::Cond,
+                           [](void* p) { pthread_cond_destroy((pthread_cond_t*)p); });
     }
     if (a0) *(void**)a0 = nullptr;
     return 0;
@@ -864,14 +911,19 @@ HLE(k_rwlock_init) {
     *(void**)a0 = g;    // store handle through caller's slot (a1=attr, a2=name ignored)
     return 0;
 }
-// PRE-EXISTING HAZARD, recorded rather than fixed (#2042): destroying a rwlock while another thread
-// is inside one of the handlers below frees the object under it. That was already true when the
-// object was a bare pthread_rwlock_t — the concurrent thread dereferenced it once — and the hold
-// accounting widens the window to a few atomics. Destroying a lock another thread may still be
-// using is a guest bug on any platform, and no title in the corpus is known to do it; closing it
-// properly needs a lifetime scheme (epoch or refcount) that is out of scope here.
+// #2042. Destroying a rwlock while another thread is inside one of the handlers below used to free
+// the object under it — and the rwlock is the worst of the family, because `k_rwlock_rdlock` parks
+// the caller INSIDE `pthread_rwlock_rdlock(&g->rw)` with the raw pointer live for as long as the
+// lock stays write-held. The storage is quarantined instead (`sync_retire.hpp`), and the host
+// `pthread_rwlock_destroy` runs at reclaim, since a parked thread may be sitting in it right now.
+//
+// The hold accounting from #2012 is NOT consulted here, and that is the interesting part: FreeBSD's
+// own `pthread_rwlock_destroy` performs no busy check at all and returns 0 whatever is held, so an
+// EBUSY refusal would be a divergence rather than a fix. See the contract table above
+// k_mutex_destroy. The return value, and the cleared slot, are exactly what they were before.
 HLE(k_rwlock_destroy) {
-    if (a0 && !pt_static_sentinel(*(void**)a0)) guest_rwlock_destroy((GuestRwlock*)*(void**)a0);
+    if (a0 && !pt_static_sentinel(*(void**)a0)) retire_sync_object(*(void**)a0, SyncObjectKind::Rwlock,
+            [](void* p) { auto* g = (GuestRwlock*)p; pthread_rwlock_destroy(&g->rw); g->~GuestRwlock(); });
     if (a0) *(void**)a0 = nullptr;
     return 0;
 }
@@ -2288,14 +2340,18 @@ HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem
 HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return 0x16; timespec dl = abs_deadline_us(a1); int rc = sem_timedwait(s, &dl); return rc == 0 ? 0 : fbsd_errno(errno); }
 HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; int rc = sem_post(s); if (semlog()) fprintf(stderr, "[sem] post slot=%p rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : fbsd_errno(errno); }
 HLE(k_sem_getvalue)  { auto* s = ensure_sem(a0); if (!s) return 0x16; int v = 0; sem_getvalue(s, &v); if (a1) *(int*)(uintptr_t)a1 = v; return 0; }
-HLE(k_sem_destroy)   { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { sem_destroy((sem_t*)*slot); free(*slot); *slot = nullptr; } } return 0; }
+// Quarantined, not freed, and `sem_destroy` deferred to reclaim — a thread parked in `sem_wait` is
+// inside this object. See the contract block above k_mutex_destroy and sync_retire.hpp (#2042).
+HLE(k_sem_destroy)   { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { retire_sync_object(*slot, SyncObjectKind::Sem, [](void* p) { sem_destroy((sem_t*)p); }); *slot = nullptr; } } return 0; }
 // scePthreadBarrier* -- were MISSING -> the generic stub returned 0, so BarrierWait let every thread sail
 // past a rendezvous before its peers arrived: the barrier's downstream invariant (all-arrived) is false ->
 // reads of not-yet-produced data (the async-load race class). Back with host pthread_barrier_t; the serial
 // thread gets -1 (PTHREAD_BARRIER_SERIAL_THREAD, FreeBSD's value), the rest 0. Barrierattr are no-ops.
 HLE(k_barrier_init)    { if (!a0 || a2 == 0) return 0x16; auto* b = (pthread_barrier_t*)calloc(1, sizeof(pthread_barrier_t)); pthread_barrier_init(b, nullptr, (unsigned)a2); *(void**)(uintptr_t)a0 = b; return 0; }
 HLE(k_barrier_wait)    { auto* b = ensure_barrier(a0); if (!b) return 0x16; int rc = pthread_barrier_wait(b); return rc == PTHREAD_BARRIER_SERIAL_THREAD ? (uint64_t)(int64_t)-1 : fbsd_errno(rc); }
-HLE(k_barrier_destroy) { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { pthread_barrier_destroy((pthread_barrier_t*)*slot); free(*slot); *slot = nullptr; } } return 0; }
+// Quarantined, not freed (#2042) — `pthread_barrier_wait` parks every arriving thread inside the
+// object, the widest window in the family. See the contract block above k_mutex_destroy.
+HLE(k_barrier_destroy) { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { retire_sync_object(*slot, SyncObjectKind::Barrier, [](void* p) { pthread_barrier_destroy((pthread_barrier_t*)p); }); *slot = nullptr; } } return 0; }
 HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* timeout)
     // The timeout arg (a4) was previously IGNORED — a bounded guest wait blocked forever (the
     // same class of silent hang root-caused for wait_on_address, hle_kernel_mem.cpp). Sony

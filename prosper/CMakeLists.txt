@@ -1198,6 +1198,40 @@ if(TARGET prosper_core)
     target_link_libraries(test_rwlock_once PRIVATE prosper_core)
     add_test(NAME rwlock_once_semantics COMMAND test_rwlock_once)
 
+    # #2042: a destroyed guest sync object's storage is quarantined, not returned to the allocator,
+    # so a Destroy racing a handler cannot corrupt prosper's own heap. The assertions hold on every
+    # allocator, so the test itself runs everywhere.
+    add_executable(test_sync_destroy_lifetime tests/test_sync_destroy_lifetime.cpp)
+    target_link_libraries(test_sync_destroy_lifetime PRIVATE prosper_core)
+    add_test(NAME sync_destroy_lifetime COMMAND test_sync_destroy_lifetime)
+    set_tests_properties(sync_destroy_lifetime PROPERTIES TIMEOUT 120)
+
+    # The window switch must FAIL SAFE. `atof` returns 0.0 on no conversion, so an early version of
+    # retire_window_seconds() turned the guard off for `=on`, `=true` or any typo — the exact
+    # use-after-free this exists to prevent, reached by misspelling a tuning knob. This arm passes an
+    # unparseable value and requires the suite to still PASS, i.e. the default window is in force.
+    # It asserts the green outcome, so unlike the counter-arm it is allocator-independent.
+    add_test(NAME sync_destroy_lifetime_bad_window COMMAND test_sync_destroy_lifetime)
+    set_tests_properties(sync_destroy_lifetime_bad_window PROPERTIES
+        ENVIRONMENT "PROSPER_SYNC_RETIRE_SECONDS=on" TIMEOUT 120)
+
+    # The counter-arm runs the SAME binary with the quarantine switched off
+    # (PROSPER_SYNC_RETIRE_SECONDS=0 is the pre-#2042 immediate free) and requires it to FAIL, so CI
+    # keeps proving the assertions can move without anyone rebuilding against an older master.
+    #
+    # LINUX ONLY, and the restriction is the honest one rather than a convenience: the arm is red
+    # because glibc's tcache hands a just-freed block of the same size back to the very next
+    # allocation, deterministically and LIFO. That reuse is the mechanism being demonstrated, not an
+    # incidental detail — on an allocator that does not reuse promptly the assertions would pass and
+    # WILL_FAIL would turn a correct result into a red build. Asserting an allocator's internals as
+    # a merge gate on hosts where they were never measured is how a guard starts failing for reasons
+    # unrelated to what it guards.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      add_test(NAME sync_destroy_lifetime_counter_arm COMMAND test_sync_destroy_lifetime)
+      set_tests_properties(sync_destroy_lifetime_counter_arm PROPERTIES
+          ENVIRONMENT "PROSPER_SYNC_RETIRE_SECONDS=0" WILL_FAIL TRUE TIMEOUT 120)
+    endif()
+
     # __tls_get_addr per-thread DTV is purged (blocks freed) on both thread-exit paths (#68), and
     # normal return leaves guest %fs before glibc resumes host pthread cleanup (#644).
     add_executable(test_tls_dtv_purge tests/test_tls_dtv_purge.cpp)
