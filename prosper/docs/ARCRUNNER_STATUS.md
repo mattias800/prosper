@@ -1140,6 +1140,14 @@ Three things this is and is not.
 they delivered 30–31 and none did. The 4K readback per sample is not free. Instrument trap 104
 again — take the widest sampling interval that can still catch the window.
 
+**One switch interaction to know before quoting a level-1 arm.** The declined init records
+dma-free debt, and **two** paths consume that debt: `declines_drifted_pair_release` (level 2) and
+`mb3_suppress_release`, which is gated on `PROSPER_MB3_FREELIST_GUARD`. So
+`PROSPER_DMA_INIT_DRIFT_GUARD=1` **together with** `PROSPER_MB3_FREELIST_GUARD=1` behaves as level 2,
+because the MB3 release leg retires the paired fence that level 1 deliberately leaves alone. The
+level-1 arms recorded above did not arm the MB3 guard, so they are level 1. Anyone combining the two
+must read the arm as level 2 or the comparison is between two labels for one condition.
+
 ### What this leaves
 
 The mechanism is now stated as narrowly as the evidence allows: **the guest rebuilds a
