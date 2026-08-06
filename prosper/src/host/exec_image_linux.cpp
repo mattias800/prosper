@@ -1280,12 +1280,17 @@ namespace {
                     if (g_mb3w_seen[mi] >= 3) return;   // silent steady-state
                     g_mb3w_seen[mi]++;
                 }
+                // The ordinal is folded into ONE conditional string: a bare `%u` beside a
+                // conditional separator prints `0` on every benign write and fuses it onto the tid
+                // field (`tid=12340`), which is exactly the kind of misreading this log exists to
+                // prevent.
+                char ord[24] = "";
+                if (loud_ord) snprintf(ord, sizeof ord, "  #%u", loud_ord);
                 char b[256]; int n = snprintf(b, sizeof b,
-                    "[mb3watch] WRITE [0x%llx]=0x%llx by rip=%s%s0x%llx tid=%ld%s%s%u\n",
+                    "[mb3watch] WRITE [0x%llx]=0x%llx by rip=%s%s0x%llx tid=%ld%s%s\n",
                     (unsigned long long)addr, v, in_eboot ? gmod(wr) : "host:", in_eboot ? "+" : "",
                     (unsigned long long)(in_eboot ? goff(wr) : wr), cur_tid(),
-                    shifted ? "  <<<<< CORRUPT HEAD" : "",
-                    loud_ord ? "  #" : "", loud_ord);
+                    shifted ? "  <<<<< CORRUPT HEAD" : "", ord);
                 raw_write(2, b, (size_t)n);
                 if (!in_eboot) classify_addr(wr);
                 if (shifted) {

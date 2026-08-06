@@ -376,6 +376,10 @@ static int mb3_poison_scan_once(Mb3PoisonHit* hits, int max_hits, uint32_t max_h
         // region to use 0x20 of it drops a pool array that sits within 0x400 of the end of its
         // mapping — coverage lost for bytes the scan does not touch.
         uint8_t bins[0x40];
+        // The class loop below reads a qword at o+0x10 for o = the class offset; keep the buffer
+        // sized for whatever class scope a later change gives it.
+        static_assert(0x20 + 0x10 + sizeof(uint64_t) <= sizeof bins,
+                      "bins[] must cover the highest class offset the loop reads");
         if (!safe_read(base, bins, sizeof bins)) continue;
         ++walked_pools;
         // ONLY size class idx=1. Every class's bins have the same {head, count, head, count} shape,
