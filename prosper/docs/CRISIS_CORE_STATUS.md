@@ -38,8 +38,8 @@ throttled route, not rung 2 on the default one. Say so wherever the rung is quot
 The first captures were taken with `PROSPER_MB3_POISON=1` instead, which reaches the same screens.
 The route names the sleep because the measurement below shows the scan works only through its
 duration: a route built on a diagnostic would silently change behaviour the day that diagnostic gets
-cheaper — and it did get 32x cheaper inside this very PR, when the scan was narrowed to one size
-class.
+cheaper — and it did get roughly an order of magnitude cheaper inside this very PR, when the scan
+was narrowed from 32 size classes to one and then made double-observing.
 
 ## #1945 on this title is decided by submit duration — and is not a late write
 
@@ -67,9 +67,14 @@ but duration. Twelve arms, three per dose, 60 s bound, one binary, otherwise the
 threshold between 500 us and 1500 us. Surviving arms reach 300-480 flips and 14,000-23,000 draws;
 dying arms never get past the engine's startup.
 
-The diagnostic arms agree and are why the lever was looked for at all:
+The diagnostic arms agree and are why the lever was looked for at all. **All three were measured
+against the pre-narrowing, single-pass scan and are not expected to reproduce on merged master** —
+the shipped scan walks one size class instead of 32 and walks it twice, so it is roughly an order of
+magnitude cheaper, and by this section's own thesis a cheaper probe may simply stop rescuing the
+title. They are kept because they are what pointed at duration; do not quote them as current
+behaviour, and use `PROSPER_SUBMIT_STALL_US` for anything that needs to reproduce.
 
-| arm | outcome |
+| arm (pre-narrowing scan) | outcome |
 | --- | --- |
 | `PROSPER_MB3_POISON=1` (deep interior chain walk, thousands of reads/submit) | **survives**, reaches the title screen — 2/2 |
 | `PROSPER_MB3_POISON=1 PROSPER_MB3_POISON_HOPS=1` (same probe, shallow) | faults 5 s in |
@@ -117,7 +122,7 @@ globally. It also does not transfer to another title without its own dose-respon
   TCB, measured.
 - **`PROSPER_MB3WATCH` reporting nothing meant the head was not being stomped.** The hook armed on
   a stale `[0x20_0000_0000, 0x21_0000_0000)` window while this title's per-thread cache base is
-  `0x30_1af0_0000`, so it armed **nothing** on any current title — the same silent false negative
+  `0x3001af0000`, so it armed **nothing** on any current title — the same silent false negative
   #1998 recorded for `PROSPER_WATCH_LABEL`/`PROSPER_WATCH_HOT`. Fixed in this lane; any null result
   quoted from it before 2026-08-06 is **void, not negative**. (It is also not usable on this title
   even when armed: the head is written by every 32-byte malloc/free, and the SIGTRAP storm stops
@@ -129,7 +134,12 @@ globally. It also does not transfer to another title without its own dose-respon
 2. **The title screen's key art is missing** (#2057). The "Press Any Button" prompt, version string
    and copyright render; the CRISIS CORE logo/character art that occupies the left of the screen on
    hardware is absent (flat black). Rung 5 will need this.
-3. **Most published frames are a flat blue with magenta blocks** while the real content exists —
+3. **Most published frames select a source that is not the screen** (#2058). Before this lane's
+   throttled route, the frames delivered ahead of the fault were a **single flat colour, alternating
+   black and white**, while intermediate render targets carried real image content — that
+   measurement (previously in `COMPATIBILITY.md`) is preserved here because it is distinct from what
+   follows and may be the same defect at an earlier boot stage. On a run that survives to the menus
+   the same path presents a flat blue with magenta blocks while the real content exists —
    3 to 6 of every 90 samples carry the actual screen (measured across four 90-sample runs). The
    dialog text is visible *through* the blue in some frames, so this is a publish/composite source
    selection problem, not a lost draw. Filed as #2058; it makes any small-sample content measurement

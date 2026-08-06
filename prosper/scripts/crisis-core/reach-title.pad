@@ -3,8 +3,9 @@
 #
 # The boot sequence is: black -> white splash (several seconds) -> an "This game uses an autosave
 # feature. / OK" dialog, which holds indefinitely -> the "Press Any Button" title screen with the
-# version string and the Square Enix copyright. One Cross dismisses the dialog; nothing further is
-# needed, and the title screen then holds for as long as the run lasts (verified to t=75 s).
+# version string and the Square Enix copyright. A Cross dismisses the dialog and the title screen
+# then holds for as long as the run lasts (verified to t=75 s). Two pulses are used, not one; see
+# the next paragraph for why.
 #
 # Anchored on DISPLAY FLIPS, not seconds: the pre-dialog load is IoStore-bound and its wall-clock
 # length varies by tens of seconds between arms. The flip at which the dialog appears varies too —

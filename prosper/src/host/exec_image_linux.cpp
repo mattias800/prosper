@@ -552,7 +552,7 @@ namespace {
     struct Mb3W { int fd; uint64_t addr; };
     Mb3W             g_mb3w[64];
     unsigned char    g_mb3w_seen[64] = {0};   // per-slot benign-write log budget (see handler)
-    unsigned char    g_mb3w_loud[64] = {0};   // per-slot budget for the structural corrupt-head arm
+    unsigned         g_mb3w_loud[64] = {0};   // per-slot ORDINAL for the structural corrupt-head arm
     std::atomic<int> g_mb3w_cnt{0};
     int mb3w_match(int fd) {
         int n = g_mb3w_cnt.load(std::memory_order_acquire);
@@ -1262,8 +1262,15 @@ namespace {
                 // instrument built to study a timing bug. The first hits are what matter; a slot
                 // that keeps re-reporting adds nothing.
                 bool shifted = lwatch_is_pool_shift(v);
+                unsigned loud_ord = 0;
                 if (!shifted && !lwatch_is_plausible_bundle_node(v)) {
-                    if (g_mb3w_loud[mi] < 8) { g_mb3w_loud[mi]++; shifted = true; }
+                    // Trap 51: a bare cap makes the ceiling the finding. Count every corrupt head,
+                    // print the first 8 and then every 256th, and carry the ordinal on the line —
+                    // otherwise "8" reads as the population, and a head that keeps being re-poisoned
+                    // would be silenced for good by the benign-write budget below.
+                    loud_ord = ++g_mb3w_loud[mi];
+                    if (loud_ord <= 8 || (loud_ord & 0xff) == 0) shifted = true;
+                    else return;
                 }
                 // base+0x20 is a HOT free-list head (every idx-1 malloc/free touches it), so logging
                 // every benign write floods I/O and stalls the run before the t~60s corruption burst.
@@ -1274,10 +1281,11 @@ namespace {
                     g_mb3w_seen[mi]++;
                 }
                 char b[256]; int n = snprintf(b, sizeof b,
-                    "[mb3watch] WRITE [0x%llx]=0x%llx by rip=%s%s0x%llx tid=%ld%s\n",
+                    "[mb3watch] WRITE [0x%llx]=0x%llx by rip=%s%s0x%llx tid=%ld%s%s%u\n",
                     (unsigned long long)addr, v, in_eboot ? gmod(wr) : "host:", in_eboot ? "+" : "",
                     (unsigned long long)(in_eboot ? goff(wr) : wr), cur_tid(),
-                    shifted ? "  <<<<< POOLSHIFT CORRUPTOR" : "");
+                    shifted ? "  <<<<< CORRUPT HEAD" : "",
+                    loud_ord ? "  #" : "", loud_ord);
                 raw_write(2, b, (size_t)n);
                 if (!in_eboot) classify_addr(wr);
                 if (shifted) {

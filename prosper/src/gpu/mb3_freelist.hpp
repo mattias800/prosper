@@ -64,8 +64,8 @@ int mb3_freelist_selftest(char* out, unsigned cap);
 // The terminal fault of this family is a bundle-list POP that dereferences a head which is not an
 // FBundleNode. By then the poison has already been copied out of the chain into the bin, so the
 // node it came from is gone from every register and every log. This walks each learned per-thread
-// pool array's bundle chains (both heads of all 32 size classes) up to `max_hops` nodes deep and
-// reports any node whose `next` link is NOT a plausible FBundleNode — i.e. the poison while it is
+// pool array's size-class-1 bundle chains (both bundle heads; see SCOPE below) up to `max_hops`
+// nodes deep and reports any node whose `next` link is NOT a plausible FBundleNode — i.e. the poison while it is
 // still IN the chain, together with the address of the node that holds it.
 //
 // That node address is the whole point: it is the exact guest block a prosper label write would

@@ -1790,11 +1790,14 @@ static void mb3_poison_probe(uint64_t submit_no) {
     for (int i = 0; i < found && i < 8; i++) {
         char hist[512];
         prosper_label_hist_dump(hits[i].node, hist, sizeof hist);
+        // label_hist_report always writes at least "events(total=0, no-history)", which IS the
+        // answer when prosper never wrote a label at this address — so there is no empty case to
+        // substitute for, and a substitution here would only invent a second wording for it.
         fprintf(stderr, "[agc] MB3-POISON   pool=0x%llx class+0x%x list=%u hops=%u node=0x%llx "
                         "bad-next=0x%llx | label-history: %s\n",
                 (unsigned long long)hits[i].pool_base, hits[i].class_off, hits[i].list,
                 hits[i].hops, (unsigned long long)hits[i].node,
-                (unsigned long long)hits[i].bad_next, hist[0] ? hist : "(none — prosper never wrote a label here)");
+                (unsigned long long)hits[i].bad_next, hist);
     }
     last_found = found;
 }

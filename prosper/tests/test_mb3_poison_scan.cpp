@@ -47,7 +47,8 @@ static void* map_fixed(uint64_t at, size_t len) {
     void* p = mmap((void*)(uintptr_t)at, len, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #endif
-    if (p == MAP_FAILED || (uint64_t)(uintptr_t)p != at) return nullptr;
+    if (p == MAP_FAILED) return nullptr;
+    if ((uint64_t)(uintptr_t)p != at) { munmap(p, len); return nullptr; }   // wrong address: give it back
     return p;
 }
 
@@ -115,14 +116,36 @@ int main() {
     check(found == 0, "repaired chain reports no poison again");
     check(clean_census == census, "repaired chain walks exactly what the clean chain walked");
 
-    // The WINDOW leg of the predicate, which nothing above exercises: a 0x20-aligned link that is
-    // correctly aligned but points OUTSIDE the guest window is still not a bundle node. Without this
-    // case, deleting the window test from plausible_link leaves the whole file passing.
-    *at(0x1020) = 0x1000000020ull;              // 0x20-aligned, below the window
+    // The MAPPEDNESS leg: correctly aligned, but the target is not mapped at all. (This case was
+    // first written as the window-leg case and it is not one — review measured that it is rejected
+    // by safe_read before the window test is ever reached, so deleting the window line still left
+    // the file green. Both legs are pinned separately below.)
+    *at(0x1020) = 0x1000000020ull;              // 0x20-aligned, unmapped
     found = mb3_poison_scan(hits, 4, 64, census, sizeof census);
     check(found == 1 && hits[0].bad_next == 0x1000000020ull,
-          "an aligned link outside the guest window is poison too");
+          "an aligned link to unmapped memory is poison");
     *at(0x1020) = n2;
+
+    // The WINDOW leg, discriminated: an ordinary anonymous mapping is page-aligned (so it passes the
+    // alignment test) and readable (so it passes safe_read). ONLY the window line can reject it, so
+    // deleting that line fails exactly this check and nothing else.
+    void* ow_map = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ow_map == MAP_FAILED) {
+        fprintf(stderr, "FAIL: could not map an out-of-window page for the window-leg case\n");
+        failures++;
+    } else {
+        const uint64_t ow = (uint64_t)(uintptr_t)ow_map;
+        check((ow & 0x1full) == 0, "the out-of-window probe address is 0x20-aligned (else it is void)");
+        check(ow < 0x2000000000ull || ow >= 0x4000000000ull,
+              "the out-of-window probe address really is outside the window (else it is void)");
+        *at(0x1020) = ow;
+        found = mb3_poison_scan(hits, 4, 64, census, sizeof census);
+        check(found == 1 && hits[0].bad_next == ow,
+              "a MAPPED, aligned link outside the guest window is poison too");
+        *at(0x1020) = n2;
+        munmap(ow_map, 0x1000);
+    }
 
     // A healthy 16-byte-class chain (0x10-aligned nodes, class offset 0x00) must NOT be reported:
     // it is legal for its own class and the scan has no business judging it. Before the scan was

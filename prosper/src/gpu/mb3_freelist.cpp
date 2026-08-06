@@ -372,7 +372,10 @@ static int mb3_poison_scan_once(Mb3PoisonHit* hits, int max_hits, uint32_t max_h
     for (uint32_t i = 0; i < pools; ++i) {
         const uint64_t base = g_pool_candidates[i].load(std::memory_order_acquire);
         if (!base) continue;
-        uint8_t bins[0x400];
+        // Only class idx=1 is walked, so read only its 0x20-byte bin. Reading the whole 0x400 bin
+        // region to use 0x20 of it drops a pool array that sits within 0x400 of the end of its
+        // mapping — coverage lost for bytes the scan does not touch.
+        uint8_t bins[0x40];
         if (!safe_read(base, bins, sizeof bins)) continue;
         ++walked_pools;
         // ONLY size class idx=1. Every class's bins have the same {head, count, head, count} shape,
