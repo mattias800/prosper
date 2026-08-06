@@ -925,7 +925,7 @@ whose phase vectors are still intact at the last sample. Note the phase-0 vector
 static entries at every sample, so which owner tracks the runtime `ui/ui_startup` insert is not
 settled here. The missing package therefore does not park the loader: every phase this boot
 requests reaches its completion clear, which removes the one mechanism by which a handled ENOENT
-could have stalled the state machine. The listener dispatch that the clear guards (`eboot+0x55b42f..0x55b463`)
+could have stalled the state machine. The listener dispatch that follows the clear (`eboot+0x55b42f..0x55b463`)
 is read off the disassembly rather than observed, so treat "the listeners were notified" as inference and
 the clear itself as the measurement. What remains open is upstream of the loader
 entirely: nothing ever *asks* for phase 2.
