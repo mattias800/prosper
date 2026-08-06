@@ -347,6 +347,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_service_getters PRIVATE prosper_core)
   add_test(NAME service_getters COMMAND test_service_getters)
 
+  # #2185: reallocalign was unregistered, so the dispatcher's 0 reached the guest as a NULL
+  # allocation — a false FAILURE (reads as OOM), the mirror of the #2081 family below. Asserts the
+  # extended alignment survives a resize, which plain realloc never promised. Pure, no game dump.
+  add_executable(test_reallocalign tests/test_reallocalign.cpp)
+  target_link_libraries(test_reallocalign PRIVATE prosper_core)
+  add_test(NAME reallocalign COMMAND test_reallocalign)
+
   # #2081 FALSE SUCCESS: an unregistered NID answers the dispatcher's 0, which for an SCE_OK
   # contract is a success report over an out-parameter nothing wrote. Pure, no game dump.
   add_executable(test_false_success_nids tests/test_false_success_nids.cpp)
