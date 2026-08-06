@@ -1237,8 +1237,10 @@ screen at sample 13 (t = 112 s) and **held it to the end of the run**: samples 1
 
 Two things this settles and one it does not.
 
-* It is **not** a `MODE=2` blanket: that failure mode is `distinct_rgb_colors=1`, and sample 0 in this
-  same run is exactly that. 6,880 colours with legible glyphs is not it.
+* It is **not** a `MODE=2` blanket. That failure mode presents as `distinct_rgb_colors=1`; these
+  samples are 6,880 with legible glyphs. The metric is shown to separate the two **inside this run**:
+  sample 0 reads `distinct_rgb_colors=1` and is uniform `(0,0,0)` over all 8,294,400 pixels (an empty
+  first frame, not a blanket — a blanket is a non-black uniform colour).
 * **Nothing other than #1226 is now known to stand between this title and rung 2.** Before this run
   the throttled route was only known to reach the end of the intro cinematic, so "what is behind the
   movie" was open. It is a title screen.
