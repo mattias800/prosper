@@ -271,6 +271,52 @@ there. Fixing #1226 does not yield "more black frames" — past frame 60 it yiel
 **Therefore the black scanout is the correct rendering of a black movie frame, and rung 1 is blocked
 by the #1226 terminal fault killing the run before the movie reaches picture — not by the renderer.**
 
+## The movie surface extent, measured before and after the `AvPlayerVideoEx` fix
+
+This is the measurement the "Next discriminators" list used to ask the next agent to perform. **It is
+done** — the numbers are here so nobody re-runs it (#2032).
+
+The guest sizes its movie luma T# from the published **pitch** (`2048x1080`, chroma `1024x540` —
+exactly half) and then renders the converted frame into a target sized by `width - crop_left -
+crop_right`. Under the pre-fix contract that published the visible 1920 alongside
+`crop_right_offset=128`, that expression double-counted the padding and yielded **1792**.
+
+Ordinary unsuppressed `boot_trace`
+(`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_COLORSTATETRACE=all`), exact zero
+pre/post process censuses, no suppression, skip or shim. Movie surfaces counted by their
+`raw-format=10 resolved-format=50` signature:
+
+| arm | `1792x1080` movie surfaces | `1920x1080` movie surfaces |
+| --- | --- | --- |
+| before (`width` = visible 1920) | 17 distinct | **0** |
+| after (`width` = coded 2048) | **0** | 9 distinct |
+
+The two arms ran for different lengths, so the raw counts are not comparable to each other; the
+discriminating fact is the **category flip**, which is absolute in both directions. The before arm
+found zero `1920x1080` surfaces of that signature *despite other 1920x1080 targets existing in the
+run*, so the signature does isolate the movie surfaces. **ArcRunner therefore uses the `width`-based
+spelling**, and the coded-extent contract is the right reading.
+
+**No visible change follows from this on ArcRunner**, and that is expected: the movie is black in the
+window the guest reaches (above), so the surfaces are now the right size and still black. The value of
+the fix here is that it removes a real 128-column loss that would otherwise appear the moment #1226 is
+fixed and the movie reaches picture.
+
+**Cross-title control — the same change moves nothing on R-Type Delta** (`PPSA26414`), the other live
+`Ex` consumer, whose 1920-wide movie also discriminates because 1920 is not 256-aligned. Measured with
+`PROSPER_AVPCHROMA_LOG=1` on the deterministic `tools/dropcache.py` route, before and after the
+one-line `width` change and nothing else:
+
+| arm | luma T# | chroma T# | chroma verdict |
+| --- | --- | --- | --- |
+| before (`width` = visible 1920) | `2048x1080` | `1024x540` | `CHROMA matched-registered-pitch` |
+| after (`width` = coded 2048) | `2048x1080` | `1024x540` | `CHROMA matched-registered-pitch` |
+
+Identical, down to the guest allocation addresses. R-Type derives **both** plane descriptors from
+`pitch`, never from `width`, so the concern that a chroma plane sized `width/2` would move 960 → 1024
+and flip the resource layer's narrow-texture path selection is **falsified**: the chroma extent is
+1024 in both arms and was never 960. #2005's investigation is not disturbed by this commit.
+
 ## Reproduction
 
 Build and run inside the `ps5ys` distrobox, with `TMPDIR` on disk rather than `/tmp`:
@@ -385,12 +431,11 @@ Ordered for **rung 1** (any real graphics), which the terminal faults do not blo
    by the fault at 43-54. Nothing else stands between this title and real visible graphics, and the
    ownership question in #1945 is the live part of it. Note this **reverses** the standing guidance
    that redirected the lane away from the fault — see the withdrawn `## Ruled out` row.
-2. **Re-check the movie surface extent after the `AvPlayerVideoEx` crop fix.** The guest sizes its
-   movie luma T# from the published pitch (measured `2048x1080`, chroma `1024x540`) and rendered the
-   converted frame into a **1792x1080** target — `width - crop_left - crop_right` under the pre-fix
-   contract that published the visible 1920 alongside `crop_right_offset=128`. With `width` published as
-   the coded extent the same expression yields 1920. Confirm the surfaces become `1920x1080`; if they
-   stay `1792x1080` the guest uses some other spelling and the crop contract needs re-deriving.
+2. ~~Re-check the movie surface extent after the `AvPlayerVideoEx` crop fix.~~ **CONFIRMED on `b97d0bb3`
+   — do not re-run this.** The measurement and its numbers are in
+   § *The movie surface extent, measured before and after the `AvPlayerVideoEx` fix* above: the
+   `1792x1080` movie surfaces go to **zero** and `1920x1080` ones appear, so the guest does use the
+   `width`-based spelling and the coded-extent contract is the right one. Nothing further is owed here.
 3. **Resolve #1944 before spending any further arm on an `addr=(nil)` fault.** Add the default-off
    fail-visible lazy-commit mode described there, so the fault reports at the *loading* instruction with
    the real faulting address, and decide whether page `0x2100000000` is a legitimately committed guest

@@ -495,12 +495,26 @@ int main() {
     const auto* staged = static_cast<const uint8_t*>(native_frame.data);
     const uint64_t staged_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(staged));
     CHECK(staged[0] == 0x40 && staged[FakeVideoBackend::kWidth - 1] == 0x40 &&
-              staged[FakeVideoBackend::kWidth] == 0 &&
               staged[FakeVideoBackend::kStride] == 0x41 &&
               staged[native_y_bytes] == 0x80 &&
-              staged[native_y_bytes + FakeVideoBackend::kWidth] == 0 &&
               staged[native_y_bytes + FakeVideoBackend::kStride] == 0x81,
-          "1920 visible bytes are copied row-by-row while luma/chroma padding remains cleared");
+          "1920 visible bytes are copied row-by-row into the padded pitch");
+    // #2011: the padding is limited-range BLACK, not zero. `Y=0, U=V=0` converts to roughly
+    // (0, 136, 0) — mid green — so with `width` published as the coded extent a crop-ignoring
+    // consumer would draw a 128-column green stripe down every movie frame. Assert the exact
+    // values, on the first and last padded column of a padded row of each plane: a revert to
+    // memset(..., 0, ...) turns this red, and so does padding left uninitialised.
+    bool luma_pad_black = true, chroma_pad_black = true;
+    for (uint32_t col = FakeVideoBackend::kWidth; col < FakeVideoBackend::kPitch; ++col) {
+        if (staged[col] != 0x10) luma_pad_black = false;
+        if (staged[static_cast<size_t>(FakeVideoBackend::kPitch) + col] != 0x10)
+            luma_pad_black = false;
+        if (staged[native_y_bytes + col] != 0x80) chroma_pad_black = false;
+        if (staged[native_y_bytes + FakeVideoBackend::kPitch + col] != 0x80)
+            chroma_pad_black = false;
+    }
+    CHECK(luma_pad_black && chroma_pad_black,
+          "the 128 padded columns are limited-range black (Y=0x10, U=V=0x80), never zero/green");
     CHECK(gpu::guest_linear_texture_row_pitch(staged_address, FakeVideoBackend::kStride) ==
               FakeVideoBackend::kStride &&
           gpu::guest_linear_texture_row_pitch(staged_address, FakeVideoBackend::kWidth) ==
