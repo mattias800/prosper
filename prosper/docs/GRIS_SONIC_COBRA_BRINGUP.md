@@ -1119,7 +1119,15 @@ none appeared.
 | *Little Nightmares III* `PPSA05143` | `0x280467f` | — | `mov [rip+0x60a3856],eax` (`0x88a7ee0`) | retained in a global |
 
 **All seven titles retain the value; not one discards it and not one uses `jne`/`je`**, so no title in
-the local inventory is regressed by returning an id instead of 0. `sceSaveDataMount3` still ignores
+the local inventory is regressed by returning an id instead of 0. Every row above was
+re-derived independently of the review that supplied the corrections: five at runtime by breaking on
+prosper's own handler and scanning between `rsp` and `rbp` for a return address whose preceding five
+bytes are an `e8` **whose target is an `ff 25` PLT thunk** (all three conditions must hold, so a
+merely-plausible return address is rejected), and the two with no runtime call statically by the same
+three checks. The thunk is then resolved to its import through `DT_JMPREL` -> symbol -> `DT_STRTAB`,
+which is what proves it is *this* NID's thunk rather than *a* thunk: Sonic's `0xc49710` resolves to
+`gjRZNnw0JPE` while the adjacent `0xc49730` resolves to `ZP4e7rlzOUk` (Mount3), so the resolver
+discriminates. `sceSaveDataMount3` still ignores
 the descriptor's `+0x28`, so no mount behaviour changes either.
 
 **A second title was silently failing on the old return, and it is not the one anyone was looking
