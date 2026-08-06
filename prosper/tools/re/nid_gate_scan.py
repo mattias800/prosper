@@ -22,12 +22,28 @@ Buckets (see `classify_window`):
 
 Usage:
     nid_gate_scan.py <module|app0-dir> --nid <NID> [--const 0x805a1001] [--window 48] [-v]
+    nid_gate_scan.py <module|app0-dir> --all-nids [--names <PS5-libs-dir>] [--min-gated N] [-v]
 
 `<module>` is a SELF/PRX/eboot.bin (flattened in memory — no temp files) or an already-flat ELF.
 Given a directory, every `eboot.bin` and `*.prx`/`*.sprx` under it is scanned.
 
 Example — the sysmodule gate (#2002); `0x805A1001` is SCE_SYSMODULE_ERROR_UNLOADED:
     nid_gate_scan.py testdata/PPSA04263-app0 --nid fMP5NHUOaMk --const 0x805a1001
+
+`--all-nids` inverts the question: instead of "who branches on THIS value?", it answers **"which
+Sony answers does this title depend on at all?"** — every import, classified, in one pass. That is
+the bound a *registered-but-mismodelled return value* investigation needs and cannot get any other
+way. An absence check (the unimplemented-NID table) cannot see a handler that is registered and
+answers wrongly; a runtime return-value histogram says what prosper returned but not whether the
+guest looked. This says which call sites can be affected by an answer at all, so the ones that
+cannot are removed from the search before a single boot:
+
+    nid_gate_scan.py <DUMP_ROOT>/PPSA05325-app0/eboot.bin --all-nids --names ../PS5-3.20_Libs
+
+Read the buckets the same way as in single-NID mode, and read `ignored` as the load-bearing one:
+it is the only bucket that says an answer *cannot* matter at that site. `--names` is symbolication
+only — an unknown NID is still scanned and still reported, so a missing library dump costs labels,
+never coverage.
 """
 import argparse
 import os
@@ -118,8 +134,13 @@ class Image:
                 return self.tags[n]
         return None
 
-    def symbol_index(self, nid):
-        """Index of the dynsym entry whose NID is `nid` ("<NID>#<lib>#<mod>"), or None."""
+    def dynsym(self):
+        """(symtab file offset, strtab file offset, symbol count, entry size), or None.
+
+        Shared by the single-NID lookup and the whole-table sweep so both agree on how the table
+        is bounded — the bounding rule below is the one thing that can silently turn a present
+        import into a reported absence.
+        """
         symtab = self.tag(6, 0x61000039)
         strtab = self.tag(5, 0x61000035)
         if symtab is None or strtab is None:
@@ -138,6 +159,14 @@ class Image:
             # Falling through with n=0 would report "no-import" for a module that may well import
             # the NID — a false negative that reads exactly like a real absence. Fail loudly.
             raise ValueError("cannot bound symtab: no DT_SCE_SYMTABSZ and strtab precedes symtab")
+        return so, to, n, syment
+
+    def symbol_index(self, nid):
+        """Index of the dynsym entry whose NID is `nid` ("<NID>#<lib>#<mod>"), or None."""
+        d = self.dynsym()
+        if d is None:
+            return None
+        so, to, n, syment = d
         want = nid.encode() + b"#"
         for i in range(n):
             base = so + i * syment
@@ -147,6 +176,43 @@ class Image:
             if self.raw[to + st_name:to + st_name + len(want)] == want:
                 return i
         return None
+
+    def imported_nids(self):
+        """Every `<NID>#<lib>#<mod>` dynsym entry, as [(nid, symbol index)] in table order.
+
+        A PS5 dynsym name is the 11-character base64 NID, `#`, the import-library id, `#`, the
+        module id. Requiring exactly 11 characters before the first `#` is what keeps ordinary
+        C++ mangled names out — and the rule has to be *exactly* 11, not "contains a `#`", because
+        both looser and stricter versions fail silently: a mangled name admitted as a phantom
+        import reports zero call sites and reads as a clean negative, while a dropped real import
+        shrinks a census whose whole point is exhaustiveness.
+
+        The `#` search is clamped to the name's own NUL. Without that clamp a name with no `#` at
+        all can borrow the *next* strtab string's, and if that one happened to land at distance 11
+        the entry would be admitted — an over-report with nothing about it looking wrong.
+
+        This does NOT distinguish an import from an export: a module's own exports carry the same
+        shape. What removes them downstream is the JMPREL/call-site filter, since an export has no
+        jump slot bound to it. Duplicates are possible in principle — one NID can appear under two
+        library ids — so the caller gets every row rather than a dict that would silently keep one.
+        """
+        d = self.dynsym()
+        if d is None:
+            return []
+        so, to, n, syment = d
+        out = []
+        for i in range(n):
+            base = so + i * syment
+            if base + syment > len(self.raw):
+                break
+            st_name = struct.unpack_from("<I", self.raw, base)[0]
+            start = to + st_name
+            stop = self.raw.find(b"\0", start)
+            end = self.raw.find(b"#", start, stop if stop >= 0 else None)
+            if end < 0 or end - start != 11:
+                continue
+            out.append((self.raw[start:end].decode("latin1"), i))
+        return out
 
     def jump_slots(self, sym_index):
         """JMPREL jump-slot VAs bound to `sym_index` (usually exactly one)."""
@@ -404,6 +470,33 @@ def stub_entry_points(img, site):
     return entries
 
 
+def call_sites(img, xref, sym_index):
+    """Every (site VA, kind) that reaches the import bound to `sym_index`."""
+    sites = []
+    for slot in img.jump_slots(sym_index):
+        for site, kind in xref.get(slot, []):
+            if kind == "jmp*":
+                for e in stub_entry_points(img, site):
+                    sites += [(s, "call") for s, k in xref.get(e, []) if k == "call"]
+            elif kind == "call*":                            # direct indirect call through the slot
+                sites.append((site, "call*"))
+    return sorted(set(sites))
+
+
+def classify_sites(img, sites, const, window):
+    """(census, details) for a set of call sites. `details` rows are (site, bucket, ev, arg0)."""
+    census, details = {}, []
+    for site, kind in sites:
+        after = site + (6 if kind == "call*" else 5)
+        fo = img.foff(after)
+        if fo is None:
+            continue
+        bucket, ev = classify_window(disasm(img.raw[fo:fo + window], after), const)
+        census[bucket] = census.get(bucket, 0) + 1
+        details.append((site, bucket, ev, arg0_before(img.raw, img.foff(site))))
+    return census, details
+
+
 def scan_module(path, nid, const, window, verbose=False):
     """Returns (status, detail) where status is 'no-import', 'no-slot', or a bucket census dict."""
     try:
@@ -413,27 +506,9 @@ def scan_module(path, nid, const, window, verbose=False):
     idx = img.symbol_index(nid)
     if idx is None:
         return "no-import", {}
-    slots = img.jump_slots(idx)
-    if not slots:
+    if not img.jump_slots(idx):
         return "import-no-slot", {}
-    xref = scan_code(img)
-    sites = []
-    for slot in slots:
-        for site, kind in xref.get(slot, []):
-            if kind == "jmp*":
-                for e in stub_entry_points(img, site):
-                    sites += [(s, "call") for s, k in xref.get(e, []) if k == "call"]
-            elif kind == "call*":                            # direct indirect call through the slot
-                sites.append((site, "call*"))
-    census, details = {}, []
-    for site, kind in sorted(set(sites)):
-        after = site + (6 if kind == "call*" else 5)
-        fo = img.foff(after)
-        if fo is None:
-            continue
-        bucket, ev = classify_window(disasm(img.raw[fo:fo + window], after), const)
-        census[bucket] = census.get(bucket, 0) + 1
-        details.append((site, bucket, ev, arg0_before(img.raw, img.foff(site))))
+    census, details = classify_sites(img, call_sites(img, scan_code(img), idx), const, window)
     if verbose:
         for site, bucket, ev, arg in details:
             argtxt = ("id=%#x%s" % (arg[0], "" if arg[1] else "?")) if arg else "id=?"
@@ -441,14 +516,115 @@ def scan_module(path, nid, const, window, verbose=False):
     return "ok", census
 
 
+GATED = ("const", "nonzero", "other-cmp", "alu-gate")
+
+
+def load_nid_names(libs_dir):
+    """{NID: (function name, library)} from a PS5 firmware `genstub.py` library dump.
+
+    Each generated `libSceXxx.c` binds its imports with
+    `sprx_dlsym(__handle, "<NID>", &__ptr_<funcName>)`, so the file is a NID<->name table. This
+    is symbolication only: a NID that is absent stays a NID and is still scanned and reported, so
+    a missing or partial dump degrades the *labels* and never the census.
+    """
+    names = {}
+    pat = re.compile(r'sprx_dlsym\(__handle,\s*"([^"]+)",\s*&__ptr_([A-Za-z0-9_]+)\)')
+    try:
+        entries = sorted(os.listdir(libs_dir))
+    except OSError as e:
+        raise SystemExit("--names %s: %s" % (libs_dir, e))
+    for fn in entries:
+        if not fn.endswith(".c"):
+            continue
+        try:
+            with open(os.path.join(libs_dir, fn), errors="ignore") as f:
+                txt = f.read()
+        except OSError:
+            continue
+        for nid, name in pat.findall(txt):
+            names.setdefault(nid, (name, fn[:-2]))
+    if not names:
+        raise SystemExit("--names %s: no `sprx_dlsym(...)` lines — not a genstub library dump" % libs_dir)
+    return names
+
+
+def sweep_module(path, const, window, names, min_gated, verbose):
+    """Classify EVERY imported NID of one module. Prints a row per import that has call sites."""
+    img = Image(flatten(path))
+    if img.dynsym() is None:
+        # Returning an empty sweep here would print "0 imported NIDs are called", which reads as a
+        # module that imports nothing rather than as a table this tool could not locate. Same
+        # fail-loudly rule as the symtab bound in dynsym().
+        raise ValueError("no dynamic symbol/string table (DT_SYMTAB/DT_STRTAB): cannot enumerate imports")
+    xref = scan_code(img)                                    # once for the module, not once per NID
+    rows = []
+    for nid, idx in img.imported_nids():
+        sites = call_sites(img, xref, idx)
+        if not sites:
+            continue                                         # imported, never called: no gate here
+        census, details = classify_sites(img, sites, const, window)
+        gated = sum(census.get(b, 0) for b in GATED)
+        rows.append((gated, len(sites), nid, census, details))
+    rows.sort(key=lambda r: (-r[0], -r[1], r[2]))
+    shown = 0
+    for gated, nsites, nid, census, details in rows:
+        if gated < min_gated:
+            continue
+        shown += 1
+        name, lib = names.get(nid, ("", ""))
+        print("%-12s %-52s %-28s sites=%-5d gated=%-5d %s" % (
+            nid, name or "?", lib or "?", nsites, gated,
+            " ".join("%s=%d" % kv for kv in sorted(census.items()))))
+        if verbose:
+            for site, bucket, ev, arg in details:
+                if bucket not in GATED:
+                    continue
+                argtxt = ("id=%#x%s" % (arg[0], "" if arg[1] else "?")) if arg else "id=?"
+                print("    call at %#x %-10s -> %-9s %s %s" % (site, argtxt, bucket, ev[1], ev[2]))
+    return rows, shown
+
+
+def sweep_summary(label, rows, shown, min_gated):
+    """The trailing `#` block: what was hidden, and why the table is not a clean partition.
+
+    A row that is not gated is NOT automatically a row that cannot matter. `forward` means the
+    result left the window still live and needs a look by hand, and `undecodable` is a void sample.
+    Reporting only "N called, M shown" invites exactly the wrong reading — that everything below the
+    cut is cleared — which is the expensive direction in a document whose whole purpose is to stop
+    the next reader re-deriving a dead answer. So state the three-way split explicitly, and print
+    the site-level bucket totals so the undecodable share is impossible to miss.
+    """
+    gated_rows = sum(1 for g, _n, _i, _c, _d in rows if g)
+    ignored_only = sum(1 for g, _n, _i, c, _d in rows if not g and set(c) <= {"ignored"})
+    unresolved = len(rows) - gated_rows - ignored_only
+    totals = {}
+    for _g, _n, _i, c, _d in rows:
+        for k, v in c.items():
+            totals[k] = totals.get(k, 0) + v
+    print("# %s: %d imported NIDs are called; %d shown at --min-gated=%d"
+          % (label, len(rows), shown, min_gated))
+    print("#   %d gated, %d ignored-only (cannot matter), %d unresolved "
+          "(>=1 forward/undecodable window — NOT cleared, read by hand)"
+          % (gated_rows, ignored_only, unresolved))
+    print("#   site buckets: %s" % " ".join("%s=%d" % kv for kv in sorted(totals.items())))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("target", help="SELF/PRX/ELF module, or an app0 directory")
-    ap.add_argument("--nid", required=True)
+    ap.add_argument("--nid", help="one NID to scan; omit and pass --all-nids to sweep every import")
+    ap.add_argument("--all-nids", action="store_true",
+                    help="classify EVERY imported NID of the module in one pass")
+    ap.add_argument("--names", metavar="DIR",
+                    help="PS5 firmware genstub library dump, to label NIDs with function names")
+    ap.add_argument("--min-gated", type=int, default=1,
+                    help="with --all-nids, hide imports with fewer than N gated call sites (default 1)")
     ap.add_argument("--const", default="0x805a1001")
     ap.add_argument("--window", type=lambda s: int(s, 0), default=48)
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
+    if bool(a.nid) == bool(a.all_nids):
+        ap.error("pass exactly one of --nid <NID> or --all-nids")
     const = int(a.const, 0)
 
     targets = []
@@ -459,6 +635,21 @@ def main():
                     targets.append(os.path.join(root, f))
     else:
         targets = [a.target]
+
+    names = load_nid_names(a.names) if a.names else {}
+
+    if a.all_nids:
+        for t in sorted(targets):
+            label = os.path.relpath(t, a.target) if os.path.isdir(a.target) else t
+            try:
+                rows, shown = sweep_module(t, const, a.window, names, a.min_gated, a.verbose)
+            except Exception as e:                           # noqa: BLE001 — report, keep going
+                # Loud and per module: a directory sweep must not lose one module's failure in the
+                # noise of the others', and this is where dynsym()'s deliberate raises surface.
+                print("# %s: SCAN FAILED (no census for this module): %s" % (label, e))
+                continue
+            sweep_summary(label, rows, shown, a.min_gated)
+        return 0
 
     total = {}
     for t in sorted(targets):

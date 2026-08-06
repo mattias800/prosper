@@ -152,6 +152,9 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | The `dlc3`-prefixed CRI wave-bank APR misses leave the Atom banks without waveform data (the silent-audio candidate, #1993) | **Falsified as the silent-audio cause — the bank loads on the base-content-root retry.** On `c3614f51` the pattern is exact and repeats for every bank: `[apr] resolve MISS /app0/dlc3/sound/X.awb`, then immediately `[apr] content-root fallback /app0/sound/X.awb -> /app0/raw/sound/X.awb` and `[apr] resolve /app0/sound/X.awb -> id=12 size=28352512`. **Seven** banks do this, not the four #1993 recorded (`STH1_music`, `STH2_music`, `SCD_music`, `HITE_music`, `HITE_missions`, `Music03_S3K`, `Music09_Museum`). **Why the guest asks the DLC prefix first is NOT settled here**, and the difference matters for where a fix would belong: an add-content override search and #1993's own competing reading — a single engine-global content root that the DLC mount overwrote — both produce this log. The one detail that discriminates leans toward the latter: all three repeats target the same `dlc3` prefix while **four** DLC mount, whereas a genuine override search would probe each mount once. It does not matter for the audio path, because the bank resolves either way, so do not add a `/app0/dlc*/` -> `/app0/raw/` alias on this evidence. The silent AudioOut2 port has another cause. | #1905, #1993, this doc |
 | The absent `raw/ui/rpl_texture/ui_title_nocopy.dds` request says something about the dump | **Falsified — it was prosper's own wrong answer, and it is gone.** The title derives its **region** from the app's own declaration at `eboot+0x51230c`: it calls `sceAppContentAppParamGetInt(USER_DEFINED_PARAM_1)` into a pre-zeroed slot and branches `2 -> "EU"`, `1 -> "US"`, anything else -> `"JP"`, with JP additionally setting a flag the other two clear. That branch mapping is **read off the disassembly** at `eboot+0x51231c..0x512357` (the two-character codes are the immediates `0x5545`/`0x5355`/`0x504a`), not measured. This application declares `userDefinedParam1: 2` and `contentId EP0177-PPSA05325_00-…`, so the correct answer is **EU**, and that is what the handler now writes — measured directly rather than inferred, by breaking on `prosper::s_appcontent_int` and reading its out-slot after the return: `paramId=1 ret=0 value=2` (the neighbouring `sceSystemServiceParamGetInt(1)` reads `value=1`, en-US). Before #2003 `s_appcontent_int` was `*(int32_t*)PW(a1) = (a0 == 0) ? 3 : 0`, so this same call wrote `0`, which the branch above maps to **JP** — i.e. every earlier Sonic arm in this document is best read as having run the title as Japanese. That last step is an inference from the disassembly plus the disappearance of the JP-only request, not an A/B against the old binary. `ui_title_nocopy` / `ui_title_cero` / `ui_titile_healthy` are the JP legal-and-rating set (`ui_title_pegi` is the EU one). On current master the request is gone and `ui_startup.pac` is the only remaining UI miss. Nothing about the dump changed; prosper's answer did. | #1905, #2003, this doc |
 | The absent `raw/ui/ui_startup.pac` parks the resource loader (the "handled ENOENT is still a stalled state machine" reading) | **Falsified at the consumer, not just at the resolver.** The widened `apr_miss_callsite` annotation names the frame: `ra4=eboot+0x990235`. `eboot+0x98fa80` is a thin `exists()` predicate over the APR resolve (`call 0xf0600; test eax,eax; sete al`), reached as a virtual call `call QWORD PTR [rax+0x88]` at `eboot+0x99022f`. The **not-found** branch at `eboot+0x990239` releases its temporaries and jumps to `eboot+0x990120`, which is a loop head: `add r14,0x18; cmp r12,r14; je <exit>`. So a missing entry advances the cursor and the loop continues — the miss is skipped by construction, with no error path and no wait. Whether the *startup scene* later needs what that package would have contained is a separate question this does not answer. | #1905, this doc |
+| Sonic skipped initialization it still needed because `sceSysmoduleIsLoaded` used to claim every module was loaded (#2021/#2002), and the CRI Mana group is parked for that reason | **Falsified.** Sonic does import `fMP5NHUOaMk` and does query it — a `beeff2ab` boot logs `[sysmodule] IsLoaded -> UNLOADED` for ids `0x115`, `0x105` and `0x110` — but all **five** static call sites are the benign `if (not loaded) { LoadModule(id); mark-that-we-own-it; }` idiom, verified by disassembly (`eboot+0x8c4f0e`, `+0x9273e5`, `+0x92740f`, and the two finalize-side sites at `+0x927699`/`+0x9276c5`). The load then succeeds, so the only state #2021 changes is the ownership bit the object clears at finalize (`or BYTE [rbx+0x150],1` / `,2`; `or BYTE [r14+0x80],0x80`). The whole-boot result is unchanged: same 40-path resolved set, no `.usm`, no `.rsdk`, 10/10 black samples. | #1905, #2021, this doc |
+| An unsupported shader op, storage format or dispatch is silently skipped, and that is what collapses the composite | **Falsified on the live path, with a positive control.** Two 18 s live-renderer arms differing only in `PROSPER_DBG` match **zero** lines for `recompile-reject` (covering `[recompile-reject]`, `[cfg-…]` and `[exec-…]`) and zero for the literal pattern **`\[compute\] skip`** — the emitter writes `skip`, not `skipped` (`src/gpu/gpu_executor.cpp`: `skip unregistered/unreadable`, `skip unsupported`, `skip invalid descriptor contract`), so a grep for `skipped` would have returned zero by construction. The recompiler zero is a measurement rather than a void window because the `DBG=1` arm gains two prefixes the `DBG=0` arm does not have at all — `[compute-cfg]` ×6 and `[graphics-cfg]` ×6, emitted from the same translation unit under the same gate — and no line in either arm reports a non-zero `cf_rejected`. The three `[compute] skip` sites are **not** `DBG`-gated, so their zero needs no control. Note the twelve CFG lines are the count of *branching* shaders (they are also conditioned on `cfg_branches != 0`), so they are the channel control; the zero rejects carry the conclusion. | #1905, this doc |
+| The 22 draws per flip are what survives prosper dropping the rest of a larger frame at *translation* | **Falsified.** `state.draws` is filled by the PM4 decoder (`src/gpu/command_processor.cpp`) and printed by `progress_heartbeat` (`src/hle/hle_agc.cpp`), so the counter is pre-translation by construction; a `PROSPER_NO_COMPUTE=1` arm — where nothing is translated and therefore nothing can be rejected — reports the identical per-flip figures (66,988 draws and 42,734 dispatches over 3,044 flips at t=50 s: 22.01 and 14.04), which is the consistency check on that reading rather than its proof. **Scope it exactly:** this closes *translation* loss, not *decode* loss. A draw inside a PM4 packet prosper never decodes is invisible to this counter too, and the `walk=` field that would bound it is on the `[agc] <who> #N` form, not the `[agc] SubmitDcb #N: %u dwords -> %zu packets applied` form this title takes (266 of 266 lines in a 10 s `PROSPER_GFXLOG` arm). That bound is still open. | #1905, this doc |
 
 ## Sonic Origins dump audit
 
@@ -631,3 +634,84 @@ see whether it has a no-package path; (3) break on the writer of the movie index
 state ever selects one. **Do not fabricate the package, alias another `.pac` to it, or force the
 `exists()` predicate true** — that would model a producer the guest never had and could not be
 progression evidence even if it changed the screen.
+### Current-master re-run and the boot-gate bound (2026-08-06, master `beeff2ab`)
+
+**#2021** (`sceSysmoduleIsLoaded` answers from prosper's own load history) and **#2031** (the
+render-target-0 blend key on every SDK version) landed after the section above, and both touch
+surfaces this title uses, so the baseline was re-measured rather than assumed. **Neither moved
+anything.** A direct headless `screenshot` arm at native 3840x2160 with `PROSPER_RENDER_SCALE=1
+PROSPER_RENDER_EVERY=1` and `scripts/sonic/long-input-probe.pad`, 10 samples over 120 s, reports
+`source-distinct=10 pixel-distinct=1`, every sample `crc=666f7b3f`. A `PROSPER_NO_COMPUTE=1` arm over
+the same route resolves the same 40 unique paths, opens no `.usm` and no `.rsdk`, and settles into
+the same 22 draws / 14 dispatches per flip. Sonic Origins remains **rung 0**; nothing here is a
+visual claim.
+
+Scope that precisely, because the neighbouring section is easy to contradict: **#2003 is not part of
+this arm's claim.** `c3614f51` — the master the census above ran on — already contained it, and that
+section records what it *did* change here (the region flipped JP→EU and the
+`ui_title_nocopy.dds` request disappeared). "Neither moved anything" is about #2021 and #2031 only.
+
+`#1990`'s wall still fires on this title on current master — `[rtt] PRESENT SOURCE EXTENT MISMATCH …
+px_front=none px_vo=none px_last=none, offered 0 bytes; serving the retained frame instead (published
+so far: fresh=1 retained=465)` — which is the same reading as before: selection has nothing to offer,
+and every target it could offer is black anyway.
+
+**Bounding the "registered-but-mismodelled value" candidate statically.** That candidate is invisible
+to every absence check by construction (the call happens; the answer is wrong), and a runtime
+return-value histogram says what prosper returned, not whether the guest looked. `nid_gate_scan.py`
+gained an `--all-nids` mode for exactly this question — it classifies **every** import of a module in
+one pass, so the call sites that cannot be affected by any answer are struck off before a boot:
+
+```bash
+python3 tools/re/nid_gate_scan.py <DUMP_ROOT>/PPSA05325-app0/eboot.bin \
+    --all-nids --names ../PS5-3.20_Libs
+```
+
+Of 813 NID-shaped dynsym entries, 536 imports are actually called. The tool's own summary states the
+split, and it is deliberately a **three**-way one, not two:
+
+```text
+# eboot.bin: 536 imported NIDs are called; 247 shown at --min-gated=1
+#   247 gated, 157 ignored-only (cannot matter), 132 unresolved (>=1 forward/undecodable window
+#   — NOT cleared, read by hand)
+#   site buckets: alu-gate=125 const=1 forward=3445 ignored=14432 nonzero=3440 other-cmp=166
+#                 undecodable=2699
+```
+
+**Not-gated is not the same as cleared.** Only the **157** `ignored`-only rows are struck off; the
+**132** unresolved rows carry at least one `forward` window (the result left the window still live —
+returned, spilled or tail-jumped, so the gate is in a caller) or at least one `undecodable` one, and
+**2,699 of the 24,308 windows — 11.1% — are undecodable**, which is a void sample rather than a
+negative. Anyone narrowing the candidate list from this table must work through those 132 by hand
+rather than treat the 247 as the whole search space. Two further properties matter more than the
+numbers:
+
+- It is a **static upper bound on what can matter**, not a list of what runs. Cross it with the boot
+  census (`hle_calls --launch --values`) before treating any row as live: the
+  `PROSPER_PROGRESS_UNIMPL` table reads `(0 distinct unimplemented functions)` on this title, so every
+  row whose prosper handler is *unregistered* is called by code Sonic's boot never reaches.
+- The gated rows that prosper answers with a **shared** stub are the residue worth reading by hand,
+  because one prosper symbol can cover several Sony entry points and collapses into a single `0x0`
+  row in any runtime histogram. **This residue is open, and it is larger than the two rows checked
+  below.** Crossing the 247 gated rows against prosper's registration tables, **41** are answered by
+  a handler registered for more than one Sony name — `s_ok` covers 15 entry points and `k_attr_noop`
+  covers 20. Those 41 split **24 `libkernel` / 4 `libSceLibcInternal` / 13 across the eight service
+  libraries** (`libSceNpUniversalDataSystem` 3, `libSceErrorDialog` 3, `libSceNpManager` 2, and one
+  each from `libSceMsgDialog`, `libSceCommonDialog`, `libSceLoginDialog`, `libScePad`, `libSceRtc`).
+  Quote the split rather than a "non-libc" subtotal: whether `libkernel` counts as libc is a
+  definition, not a measurement, and it is the whole difference between the 37 and 13 that two
+  readings of the same 41 produce. Only the **`s_ok`** intersection was worked through
+  here, and it is exactly two: `sceCommonDialogIsUsed`, which the census above measured at zero
+  calls, and `sceLoginDialogInitialize` at `eboot+0x9b5d0e`, which is the same init-and-record idiom
+  as the sysmodule sites (`test eax,eax` → `or BYTE PTR [rbx+0x6a8],0x2`) and so cannot change what
+  the frontend renders whichever way it is answered. **The other 39 have not been read.** A
+  dispatcher-authoritative NID→handler→arity dump would make that cross cheap and drift-proof for
+  every future title; tracked as #2070.
+
+Verified against a known answer before use: in single-NID mode the sweep reproduces the
+`sceSysmoduleIsLoaded` result byte-for-byte after the refactor (`const=1 nonzero=4`, the same five
+sites), and directory-mode output over two other dumps `diff`s clean against the pre-refactor tool.
+The `--all-nids` figures above were first produced by a throwaway driver written against the same
+classifier and then reproduced by the committed mode; that is a re-derivation of the *enumeration*,
+not an independent implementation of the classifier, so it constrains the symbol walk and not the
+bucket rules — those are covered by `test_nid_gate_scan.py`.
