@@ -667,8 +667,11 @@ fix has to address the block-lifetime seam rather than any individual write.
   presented frames. The line is gated on `!px.empty()` (`frontends/shared/live_renderer.cpp`), `px`
   comes from `selected_pixels`, and the registrar announced `dump=0` — the readback that fills it is
   opt-in and this switch does not request it. It needs a companion that turns readback on. **Do not
-  read a silent `PROSPER_PRESENT_NZLOG` run as "every frame was black"**; that is the shape of the
-  claim the rung-1 section above rests on, and it needs the companion switch to mean anything.
+  read a silent `PROSPER_PRESENT_NZLOG` run as "every frame was black"** — the absence of a line is
+  the absence of a measurement. This does **not** impugn the `nz=0` / `nz=8294400` figures in the
+  rung-1 section above: those runs reported lines, so their readback was evidently on (a companion
+  such as `PROSPER_DUMP_RTGROUPS=1` or `PROSPER_FRAME_DIR` was in the same arm). The correction is to
+  the *recipe*, which prescribes the switch alone.
 
 ## How far the movie actually is, and why the fault is only half the arithmetic
 
