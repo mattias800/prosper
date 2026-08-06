@@ -357,8 +357,14 @@ static bool plausible_link(uint64_t v) {
     return safe_read(v, &probe, sizeof probe);
 }
 
-int mb3_poison_scan(Mb3PoisonHit* hits, int max_hits, uint32_t max_hops, char* out, unsigned cap) {
-    if (!max_hops) max_hops = 256;
+// One pass of the walk. `mb3_poison_scan` runs it twice and keeps only what both passes saw, for
+// the same reason `mb3_freelist_contains_stable` observes twice: the allocator mutates these chains
+// concurrently from the owning thread, so a single pass can read a head and its successor from two
+// different generations and manufacture a link that never existed. A poison, unlike a transient,
+// survives to the second pass — it is only cleared when the guest overwrites the node.
+static int mb3_poison_scan_once(Mb3PoisonHit* hits, int max_hits, uint32_t max_hops,
+                                uint32_t* walked_pools_out, uint32_t* walked_heads_out,
+                                uint32_t* walked_nodes_out, uint32_t* pools_out) {
     uint32_t pools = g_pool_candidate_count.load(std::memory_order_acquire);
     if (pools > kMaxPoolCandidates) pools = kMaxPoolCandidates;
     int found = 0;
@@ -369,7 +375,16 @@ int mb3_poison_scan(Mb3PoisonHit* hits, int max_hits, uint32_t max_hops, char* o
         uint8_t bins[0x400];
         if (!safe_read(base, bins, sizeof bins)) continue;
         ++walked_pools;
-        for (uint32_t o = 0; o + 0x20 <= sizeof bins; o += 0x20) {
+        // ONLY size class idx=1. Every class's bins have the same {head, count, head, count} shape,
+        // but the NODES do not: a bundle node is a block of that class's own size, so the 16-byte
+        // class links on 0x10 and only idx=1 links on 0x20. Walking every class with the idx=1
+        // alignment rule reports every healthy 16-byte-class head as poison — measured live on
+        // PPSA07809, dozens per submit, and an instrument that cries wolf is worse than none. The
+        // class geometry for the others has not been read out of the guest, so this scans the one
+        // whose geometry is confirmed AND which is the only class ever observed corrupt in this
+        // family (it is the class the consumed-marker labels are allocated from). Widening this
+        // means deriving each class's block size from the guest's own class table first.
+        for (uint32_t o = 0x20; o <= 0x20; o += 0x20) {
             for (uint8_t list = 1; list <= 2; ++list) {
                 uint64_t head = 0;
                 memcpy(&head, bins + o + (list == 1 ? 0 : 0x10), sizeof head);
@@ -396,10 +411,37 @@ int mb3_poison_scan(Mb3PoisonHit* hits, int max_hits, uint32_t max_hops, char* o
             }
         }
     }
+    if (walked_pools_out) *walked_pools_out = walked_pools;
+    if (walked_heads_out) *walked_heads_out = walked_heads;
+    if (walked_nodes_out) *walked_nodes_out = walked_nodes;
+    if (pools_out)        *pools_out        = pools;
+    return found;
+}
+
+int mb3_poison_scan(Mb3PoisonHit* hits, int max_hits, uint32_t max_hops, char* out, unsigned cap) {
+    if (!max_hops) max_hops = 256;
+    constexpr int kMaxStable = 8;
+    Mb3PoisonHit first[kMaxStable] = {}, second[kMaxStable] = {};
+    uint32_t wp = 0, wh = 0, wn = 0, pools = 0;
+    const int n1 = mb3_poison_scan_once(first, kMaxStable, max_hops, nullptr, nullptr, nullptr, nullptr);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const int n2 = mb3_poison_scan_once(second, kMaxStable, max_hops, &wp, &wh, &wn, &pools);
+
+    int found = 0;
+    for (int i = 0; i < n2 && i < kMaxStable; ++i) {
+        bool also_first = false;
+        for (int j = 0; j < n1 && j < kMaxStable; ++j)
+            if (second[i].node == first[j].node && second[i].bad_next == first[j].bad_next) {
+                also_first = true; break;
+            }
+        if (!also_first) continue;                 // transient: one pass only
+        if (hits && found < max_hits) hits[found] = second[i];
+        ++found;
+    }
     if (out && cap)
-        snprintf(out, cap, "pools=%u/%u heads=%u nodes=%u max_hops=%u found=%d%s",
-                 walked_pools, pools, walked_heads, walked_nodes, max_hops, found,
-                 walked_nodes == 0 ? "  [WALKED NOTHING — a zero here is void, not negative]" : "");
+        snprintf(out, cap, "pools=%u/%u heads=%u nodes=%u max_hops=%u found=%d (pass1=%d pass2=%d)%s",
+                 wp, pools, wh, wn, max_hops, found, n1, n2,
+                 wn == 0 ? "  [WALKED NOTHING — a zero here is void, not negative]" : "");
     return found;
 }
 

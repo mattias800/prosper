@@ -552,6 +552,7 @@ namespace {
     struct Mb3W { int fd; uint64_t addr; };
     Mb3W             g_mb3w[64];
     unsigned char    g_mb3w_seen[64] = {0};   // per-slot benign-write log budget (see handler)
+    unsigned char    g_mb3w_loud[64] = {0};   // per-slot budget for the structural corrupt-head arm
     std::atomic<int> g_mb3w_cnt{0};
     int mb3w_match(int fd) {
         int n = g_mb3w_cnt.load(std::memory_order_acquire);
@@ -1253,7 +1254,17 @@ namespace {
                 bool in_eboot = (gin(wr));
                 // A byte-shifted pool pointer is one corrupt shape; a head that is not a plausible
                 // FBundleNode at all is the general case, and the one this watch must never miss.
-                bool shifted = lwatch_is_pool_shift(v) || !lwatch_is_plausible_bundle_node(v);
+                //
+                // BUDGETED, unlike the shifted case it joins. The loud arm writes ~1 KB (regs plus a
+                // guest-stack scan) from inside a SIGTRAP handler on the owning thread, and this
+                // PR's own result is that the duration of work on that thread decides whether the
+                // title survives — an unbudgeted loud path would be a timing confound in the
+                // instrument built to study a timing bug. The first hits are what matter; a slot
+                // that keeps re-reporting adds nothing.
+                bool shifted = lwatch_is_pool_shift(v);
+                if (!shifted && !lwatch_is_plausible_bundle_node(v)) {
+                    if (g_mb3w_loud[mi] < 8) { g_mb3w_loud[mi]++; shifted = true; }
+                }
                 // base+0x20 is a HOT free-list head (every idx-1 malloc/free touches it), so logging
                 // every benign write floods I/O and stalls the run before the t~60s corruption burst.
                 // Log only the corruptor (a byte-shifted pool pointer) + the first couple of hits per

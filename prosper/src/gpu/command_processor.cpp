@@ -2131,6 +2131,12 @@ struct PendWrite {
 // label, so the queue's real residency IS the exposure window and nothing measured it. Reports the
 // running max and a loud line for any write older than PROSPER_PEND_AGE_WARN_MS (default 20).
 // Default OFF, log-only, never gates a write.
+//
+// Called from EVERY site that applies a queued write — the FIFO drain, the renderer's selective
+// extraction, and the gated-span release. A residency figure taken from only one of the three would
+// bound only that path, and the conclusion drawn from this instrument ("prosper's completion writes
+// do NOT land late on PPSA07809") is exactly the kind that a partially-instrumented population
+// would falsely support.
 static void pend_age_note(std::chrono::steady_clock::time_point queued) {
     static const int on = [] { const char* e = getenv("PROSPER_PEND_AGE");
                                return e && strtol(e, nullptr, 0) != 0 ? 1 : 0; }();
@@ -2354,6 +2360,7 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
             p.q.erase(it);
             p.inflight++;
             lk.unlock();
+            pend_age_note(w.queued);
             apply_deferred_effect(w.cmd);
             lk.lock();
             p.inflight--;
@@ -2442,8 +2449,10 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
         p.q.swap(blocked);
         p.inflight++;
         lk.unlock();
-        for (const PendWrite& write : ready)
+        for (const PendWrite& write : ready) {
+            pend_age_note(write.queued);
             apply_deferred_effect(write.cmd);
+        }
         lk.lock();
         p.inflight--;
         p.cv.notify_all();

@@ -339,7 +339,6 @@ is fixed. Two rendering defects remain on the reached screens: the title screen'
 published frames select a non-scanout composite source while the real screen exists. See
 [`docs/CRISIS_CORE_STATUS.md`](prosper/docs/CRISIS_CORE_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1894).
-[tracker](https://github.com/mattias800/prosper/issues/1894).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
 

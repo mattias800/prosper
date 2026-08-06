@@ -74,8 +74,19 @@ int mb3_freelist_selftest(char* out, unsigned cap);
 // or a 0x20-aligned pointer into mapped guest memory — so it cannot be fooled by a poison that
 // happens not to look byte-shifted (measured on PPSA07809: 0xff000000ff000000, 0x0002400100024001).
 //
-// SELF-VALIDATING: the walked-pools/heads/nodes census is written to `out` on EVERY call, so a
-// found=0 from a scan that walked nothing is never mistakable for "the chains are clean".
+// SCOPE: size class **idx=1 only** (bin offset 0x20 — the 32-byte class the consumed-marker labels
+// are allocated from, and the only class ever observed corrupt in this family). The other classes
+// share the bin shape but not the node alignment, so the structural rule below would report their
+// healthy heads as poison; widening this needs each class's block size read out of the guest first.
+//
+// The walk is performed TWICE and only hits seen by both passes are reported — the same contract
+// `mb3_freelist_contains_stable` has, and for the same reason: the owning thread mutates these
+// chains concurrently, so one pass can read a head and its successor from two different generations
+// and manufacture a link that never existed. A real poison survives to the second pass.
+//
+// SELF-VALIDATING: the walked-pools/heads/nodes census is written to `out` on EVERY call (with each
+// pass's raw count), so a found=0 from a scan that walked nothing is never mistakable for "the
+// chains are clean".
 // Fault-safe (process_vm_readv), read-only, never gates a write. Returns the poison count.
 struct Mb3PoisonHit {
     uint64_t pool_base = 0;

@@ -6,6 +6,10 @@
 //      one replaces (`PROSPER_MB3WATCH`) armed on a stale address window and therefore printed
 //      nothing on every current title, which reads exactly like "armed and saw no corruption".
 //      So the census is asserted, not just the verdict.
+//   2a. The scan stays on size class idx=1. Every class shares the bin shape but not the node
+//      alignment, so applying the idx=1 rule to all of them reports healthy 16-byte-class heads as
+//      poison — measured live before this was narrowed. A healthy chain hung off a DIFFERENT class
+//      with 0x10-aligned nodes must therefore report zero.
 //   2. The poison predicate is STRUCTURAL, not a value shape. A next-link that is neither 0 nor a
 //      0x20-aligned pointer into mapped guest memory must be found whatever it looks like — the
 //      live values on PPSA07809 were 0x30016000, 0xff000000ff000000 and 0x0002400100024001, and a
@@ -20,7 +24,9 @@
 #include <cstring>
 #include <cstdint>
 #include <string>
+#if !defined(_WIN32)
 #include <sys/mman.h>
+#endif
 
 using namespace prosper::gpu;
 
@@ -58,8 +64,11 @@ int main() {
     const size_t   kLen  = 0x10000;
     void* mem = map_fixed(kPool, kLen);
     if (!mem) {
+        // 77 is ctest's SKIP_RETURN_CODE. Returning 0 here would let the whole structural half of
+        // this test silently not run while the job goes green — the exact failure mode the rest of
+        // this file exists to prevent.
         fprintf(stderr, "SKIP: cannot map a fake pool at 0x%llx\n", (unsigned long long)kPool);
-        return failures ? 1 : 0;
+        return failures ? 1 : 77;
     }
     memset(mem, 0, kLen);
 
@@ -100,11 +109,30 @@ int main() {
     }
 
     // Restoring the link must restore the clean verdict — the scan is reporting the chain's state,
-    // not latching.
+    // not latching. (Repair BEFORE the next case: the loop above leaves the last poison in place.)
     *at(0x1020) = n2;
     found = mb3_poison_scan(hits, 4, 64, census, sizeof census);
     check(found == 0, "repaired chain reports no poison again");
     check(clean_census == census, "repaired chain walks exactly what the clean chain walked");
+
+    // The WINDOW leg of the predicate, which nothing above exercises: a 0x20-aligned link that is
+    // correctly aligned but points OUTSIDE the guest window is still not a bundle node. Without this
+    // case, deleting the window test from plausible_link leaves the whole file passing.
+    *at(0x1020) = 0x1000000020ull;              // 0x20-aligned, below the window
+    found = mb3_poison_scan(hits, 4, 64, census, sizeof census);
+    check(found == 1 && hits[0].bad_next == 0x1000000020ull,
+          "an aligned link outside the guest window is poison too");
+    *at(0x1020) = n2;
+
+    // A healthy 16-byte-class chain (0x10-aligned nodes, class offset 0x00) must NOT be reported:
+    // it is legal for its own class and the scan has no business judging it. Before the scan was
+    // narrowed to idx=1 this reported every such head as poison, dozens per submit on a live title.
+    const uint64_t m0 = kPool + 0x2000, m1 = kPool + 0x2010;
+    *at(0x00)   = m0;
+    *at(0x2000) = m1;
+    *at(0x2010) = 0;
+    found = mb3_poison_scan(hits, 4, 64, census, sizeof census);
+    check(found == 0, "a healthy 0x10-aligned chain in another size class is not called poison");
 
     munmap(mem, kLen);
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }

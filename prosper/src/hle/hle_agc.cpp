@@ -1772,7 +1772,8 @@ static void poolshift_window_probe(uint64_t submit_no) {
 // guest block?". An empty history is the strongest available exclusion of prosper's label writes for
 // that node; a populated one names the packets. Serialized by the callers' g_agc_state_mu.
 static void mb3_poison_probe(uint64_t submit_no) {
-    static const bool on = getenv("PROSPER_MB3_POISON") != nullptr;
+    static const bool on = [] { const char* e = getenv("PROSPER_MB3_POISON");
+                                return e && strtol(e, nullptr, 0) != 0; }();
     if (!on) return;
     static const uint32_t hops = [] {
         const char* e = getenv("PROSPER_MB3_POISON_HOPS");
