@@ -238,7 +238,17 @@ the raw guest bytes of every sampled texture. The movie's luma and chroma planes
 | chroma | 1024x540 | — | every valid byte `0x80` |
 
 `Y=0x10, U=V=0x80` is BT.601 limited-range **black**, and the non-zero count is exactly
-`1920 x 1080` — the 128-column pitch padding is correctly zeroed. So the staging is byte-correct.
+`1920 x 1080` — every valid pixel, with the 128-column pitch padding reading zero. So the staging is
+byte-correct.
+
+> **Do not re-measure this and read a difference as a regression.** These counts were taken on
+> `c3614f51`, when the pitch padding was `memset` to `0`. #2032 changed the padding fill to
+> limited-range black (`Y=0x10`, `U=V=0x80`) — because `Y=0, U=V=0` is not black but mid green
+> (~`(0, 136, 0)`), which with the coded-extent `width` would have shown as a green right-edge
+> stripe. On current master the same dump therefore reads **2,211,840 of 2,211,840** luma bytes
+> non-zero, and the padding is no longer distinguishable from the picture's own black. That is the
+> intended change, not a defect. The finding this table supports — the staged frame is legitimately
+> black — is unaffected either way.
 
 The independent control is the file itself. Decoded on the host with `ffmpeg` (nothing of prosper's in
 the path), `arcrunner_intro_a_1080p_ps5_30fps.mp4` has mean luma **0.0 with max 0** at t=0 s and
