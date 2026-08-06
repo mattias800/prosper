@@ -1749,11 +1749,18 @@ void dma_init_gen_trip(uint64_t dst, uint64_t pre, uint32_t value, uint32_t widt
 // because our init zeroes that dword first). The dma-free debt is still recorded so the MB3 release
 // leg also declines when THAT guard is armed.
 //
-// Measured on PPSA21406 with `PROSPER_DMA_INIT_GEN=1` before this arm existed: 18 drifts in 524
-// journal-matched inits on a default (faulting) run, and 0 in 10,079 on a
-// `PROSPER_SUBMIT_STALL_US=1500` (surviving) run of the same build. The predicate fires only in the
-// arm that faults, which is the specificity control a content-shape guard has never had here.
-// CONFIDENCE: MED — the mechanism is measured, the cross-title behaviour is not.
+// Measured on PPSA21406 with `PROSPER_DMA_INIT_GEN=1`, three default runs against two
+// `PROSPER_SUBMIT_STALL_US=1500` runs of one build: **14 / 26 / 25** drifts in ~524 journal-matched
+// inits per faulting run, against **0** in 10,079 on a surviving one. The predicate fires only in
+// the arm that faults, which is the specificity control a content-shape guard has never had here.
+//
+// That specificity cuts BOTH ways, and the honest reading is the unflattering one: nothing about
+// the title differs between those arms — only prosper's own schedule does — so drift is a measure
+// of prosper's timing rather than of the guest. Acting on it declines two writes the guest asked
+// for and hardware performs, instead of performing them at the right time. This is a LEVER for
+// isolating the race, not a candidate fix, and it must not be made default-ON on the strength of
+// the progression it buys (see `docs/ARCRUNNER_STATUS.md`). CONFIDENCE: HIGH that it is a lever;
+// MED on the drift predicate's own soundness (see the journal-rebuild caveat in that document).
 // Levels, so the init decline and the paired-fence decline are SEPARABLE arms. They are not the
 // same experiment and the first head of this change conflated them: level 1 alone took a default
 // run from 34 to 271 delivered video frames, and level 2 on the same build produced a fault class
