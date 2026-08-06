@@ -80,6 +80,22 @@ the guest's file sequence is the progression oracle for this title.
 run inherits whatever a peer's run left behind. Pass `PROSPER_SAVE0=<private dir>` for a
 first-boot arm; both routes reach the title screen (measured), but they are not the same route.
 
+### The errno is `CONFIDENCE: MED`, and two other titles disagree with the guess — a lead, not a finding
+
+Frontiers gates on the **sign** alone (`test eax,eax; js` at all five call sites), so `NOT_FOUND`
+(`0x809F0008`) is sufficient for everything this title does and the rung-2 result does not rest on
+it. But the corpus says something about the *precise* code that nobody should have to re-derive:
+
+**Two independent titles have a dedicated arm for `0x809F000F` and none for `0x809F0008`.** Of the
+five local titles that call `sceSaveDataTransferringMountPs4`, three const-compare the result —
+PPSA03839 against `0x809F0003` (a retry loop), and **PPSA07809 and PPSA08804 against `0x809F000F`**.
+PPSA08804's compare is inside its error arm *past* the branch, which is why a `nid_gate_scan` bucket
+reports it as a plain non-zero test.
+
+`0x809F000F` appears nowhere in prosper, and the PS5 3.20 library dump carries names and NIDs only —
+no constants — so what it means is unresolved. Start from this rather than from
+`0x809F0008` if a title ever turns out to need the exact code. (Review of PR #2208.)
+
 ## Known defects at rung 2
 
 - The title-screen heading renders the string **"Try Again"** where the SONIC FRONTIERS logo
@@ -95,9 +111,9 @@ Both are filed as [#2206](https://github.com/mattias800/prosper/issues/2206).
 
 ## Ruled out
 
-One line per falsified hypothesis, with the evidence that killed it. Read this before forming a new
-one. The first row is this document's own; the rest were established on #1968 / #2023 and are copied
-here so they survive those issues being closed.
+Thirteen rows, one line per falsified hypothesis with the evidence that killed it. Read this before
+forming a new one. The first row is this document's own; the other twelve were established on #1968
+/ #2023 and are copied here so they survive those issues being closed.
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |
