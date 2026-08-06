@@ -1245,6 +1245,14 @@ uint64_t sse4a_fastpath_patch_count() {
 void arm_hwbp_this_thread() {}
 
 void guest_execution_thread_enter(bool primary) {
+    // Register the OS thread handle here rather than at the call sites, because there are TWO paths
+    // into guest code on the primary thread and only one of them was covered. run_guest_inits()
+    // executes every module_start/.init_array entry BEFORE run_entry() is ever reached, so a
+    // registration placed in run_entry leaves the whole init phase unreachable by
+    // sceKernelRaiseException -- which is exactly the window #2139 is about. Both paths call this
+    // function, and register_current_thread_handle is idempotent (it closes and replaces an existing
+    // duplicate), so registering here is safe and complete.
+    register_guest_execution_thread_handle();
     // Windows has no perf_event HWBP backend. Keep that platform contract unchanged while exposing
     // the same guest-entry boundary to CPU-only tests and future Windows diagnostics.
     if (auto hook = g_guest_execution_enter_test_hook.load(std::memory_order_acquire))
@@ -1362,9 +1370,6 @@ BootResult run_entry(const LoadedImage& img) {
     BootResult r;
     if (!stk) { r.kind = 2; r.detail = "guest stack VirtualAlloc failed"; return r; }
     register_thread_stack(cur_tid(), stk, STK);
-    // Mirror win_thread_trampoline's registration for the primary thread, BEFORE any guest code can
-    // run and therefore before the guest's GC can first try to stop it (#2139).
-    register_guest_execution_thread_handle();
     guest_execution_thread_enter(/*primary=*/true);
     arm_diag_breakpoints();
     trace_guest_thread_lifecycle(true, (uint64_t)pthread_self(), cur_tid(), stk, STK);

@@ -115,8 +115,18 @@ namespace {
     void register_current_thread_handle(uint64_t guest_thread) {
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &duplicate,
-                             0, FALSE, DUPLICATE_SAME_ACCESS))
+                             0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            // Fail LOUDLY. An unregistered thread is unreachable by sceKernelRaiseException, and on
+            // the primary thread that is the #2139 heap corruption -- a defect whose symptom appears
+            // arbitrarily far from here. A silent return would make the one condition that produces
+            // it indistinguishable from normal operation.
+            std::fprintf(stderr,
+                         "[thread] register_current_thread_handle: DuplicateHandle failed for guest "
+                         "thread 0x%llx (GetLastError=%lu) -- this thread is NOT reachable by "
+                         "sceKernelRaiseException\n",
+                         (unsigned long long)guest_thread, (unsigned long)GetLastError());
             return;
+        }
         std::lock_guard<std::mutex> lk(g_thread_handle_mx);
         auto [it, inserted] = g_thread_handles.emplace(guest_thread, duplicate);
         if (!inserted) { CloseHandle(it->second); it->second = duplicate; }
