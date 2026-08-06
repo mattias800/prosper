@@ -255,3 +255,31 @@ that thread waits on becomes the focus, so matching signals from other threads a
   is insufficient because it may never return to guest code (#678).
 - Dynamic-fetch constant folding must reject unreadable guest ranges on every host. The native
   renderer exercises this path; an unconditional Windows readability stub caused #688.
+- `sceKernelMprotect` on Windows accepts guest memory the VA tracker (`g_maps`) does not own, but
+  **only inside a fixed guest MODULE-CODE aperture** — the eboot, the PRXes, the plugin and
+  runtime-PRX pools (`guest_va_in_module_code`). Those images are mapped by the exec substrate's
+  `VirtualAlloc`, so they never enter `g_maps`, and a title mprotecting its own segment must succeed
+  the way POSIX `mprotect` does (#2101: The Messenger abandoned AGC device init over the refusal).
+  Everything else still fails: `MEM_FREE`, `MEM_RESERVE` with no tracker backing, a tracked mapping
+  the tracker calls uncommitted over committed host pages, and any committed page outside every
+  module aperture. **`guest_module_name(a) != "mapped/host"` is the wrong test for this** — it also
+  matches `[BOOT_STUB, BOOT_STUB_END)`, which is prosper's OWN emitted import trampolines, committed
+  by `install_stubs`' plain `VirtualAlloc` and therefore untracked exactly like a module image; using
+  it let a guest strip execute permission from every HLE entry point (#2144 F2).
+- The tracker snapshot that decides all of the above (`tracked_mapping_slices`) must be the *complete*
+  coverage of the span. Returning early on the first untracked hole silently reclassified every tracked
+  slice above it (#2144 F1), and **two** consumers read that vector for completeness, not one:
+  `tracked_slices_back_host_reservation` in the `MEM_RESERVE` arm, and — less obviously —
+  `next_slice_base` in the `MEM_COMMIT` arm, which is *derived from the vector* and collapses to
+  `region_end` when it is truncated, so the untracked gap handed to the aperture test is a different
+  range than it should be. Reason about both before changing that function; a safety argument covering
+  only the first one is the shape of mistake that produced #2144 in the first place.
+- Accepting a tracker-backed `MEM_RESERVE` region is **not** a relaxation. `win_protect`'s own
+  precondition comment (added 2026-07-18 in `9e8b22b5`, well before #2117) already states it: reserved
+  pages take a tracking-only protection change, matching the POSIX `PROT_NONE` reservation path. The
+  `MEM_RESERVE` arm pushes nothing into `committed`, so no `VirtualProtect` runs for it at all — the
+  entire effect is a success return plus `k_mprotect`'s `retrack_prot` on a range the tracker already
+  owns. Truncation never implemented a narrower *policy*; it just made that arm unreachable whenever
+  anything untracked preceded the reservation.
+- Note that #2117 narrowed the allowance during review: its PR body still describes the withdrawn first
+  cut, which accepted any committed page.
