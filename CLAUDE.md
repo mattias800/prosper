@@ -91,7 +91,7 @@ shared-GPU policy, the instrument-not-the-subject list, and the dated current ha
 | *Little Nightmares III* `PPSA05143` | rung 2 — title screen rendered on a default launch; the render-thread stall is fixed (#1987). Most title frames arrive with red and green forced to maximum, reading as a yellow background (#2014) | `docs/LITTLE_NIGHTMARES_3_STATUS.md` |
 | *ArcRunner* `PPSA21406` | rung 0 — renderer bring-up reaches real GPU submissions, then the render thread faults (#1226) | `docs/ARCRUNNER_STATUS.md` |
 | *Sonic Racing: CrossWorlds* `PPSA08804` | rung 1 — the SEGA logo renders; the composite then goes uniform (#2013). The boot deadlock is #2012 | `docs/SONIC_CROSSWORLDS_STATUS.md` |
-| *GRIS*, *Space Adventure Cobra*, *Sonic Origins* | rung 3 / rung 3 / rung 0 — complete Sonic Origins Plus install; black-frame cause open (#1905) | `docs/GRIS_SONIC_COBRA_BRINGUP.md` |
+| *GRIS*, *Space Adventure Cobra*, *Sonic Origins* | rung 3 / rung 3 / rung 1 — Sonic's black startup loop is fixed (#1905: `sceSaveDataCreateTransactionResource` must return a positive resource id); it renders the 4K SEGA logo and then holds on white | `docs/GRIS_SONIC_COBRA_BRINGUP.md` |
 | Astro Bot, The Plucky Squire, The Pathless | active orchestration lanes | `docs/GAME_COMPAT_ORCHESTRATION.md` |
 | *Tactics Ogre: Reborn* `PPSA03839` | rung 3 — gameplay reached; HEVC movies render, sprite/HUD composition remains open | `docs/TACTICS_OGRE_STATUS.md` |
 | Every other title | — | `COMPATIBILITY.md` |

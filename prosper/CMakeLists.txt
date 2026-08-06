@@ -633,6 +633,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_dirname PRIVATE prosper_core)
   add_test(NAME savedata_dirname_guard COMMAND test_savedata_dirname)
 
+  add_executable(test_savedata_txres tests/test_savedata_txres.cpp)
+  target_link_libraries(test_savedata_txres PRIVATE prosper_core)
+  add_test(NAME savedata_tx_resource_ids COMMAND test_savedata_txres)
+
   add_executable(test_translate_sandbox tests/test_translate_sandbox.cpp)
   target_link_libraries(test_translate_sandbox PRIVATE prosper_core)
   add_test(NAME translate_sandbox_guard COMMAND test_translate_sandbox)

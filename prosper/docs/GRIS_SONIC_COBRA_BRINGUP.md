@@ -9,7 +9,7 @@ and GPU captures are local diagnostics and are intentionally not committed.
 | Title | Revision | Visual milestone | Audio evidence |
 | --- | --- | --- | --- |
 | GRIS (`PPSA09804`) | 01.001.000 | Native 1920×1080 opening gameplay with scripted movement | CLEAN on current master over the first 35 seconds: `rms=0.0082`, `peak=0.1173`, duplicated grains 0.0% |
-| Sonic Origins (`PPSA05325`) | Complete Sonic Origins Plus 02.002.000 base+update, four DLC payloads with mount records | Black startup loop; root cause remains open (#1905) | AudioOut2 port 17 runs, but guest PCM remains zero in the black state |
+| Sonic Origins (`PPSA05325`) | Complete Sonic Origins Plus 02.002.000 base+update, four DLC payloads with mount records | **rung 1** — 3840x2160 SEGA logo, then a white hold before any title screen. The black startup loop is fixed (#1905: `sceSaveDataCreateTransactionResource` must return a positive resource id) | Not re-measured since the boot advanced; the earlier silent-port figure no longer describes this state |
 | Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | Native 1920×1080 tutorial combat with scripted progression | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
 
 ## Visual evidence
@@ -158,6 +158,9 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | The `ui/ui_startup` insert at runtime index 3 is *conditional*, so the condition is a value prosper supplies (the "registered-but-mismodelled call" candidate, in the one place it would be visible) | **Falsified.** The insert is `eboot+0x5875b0`'s only unconditional action once that coroutine step is entered on resume index `-3`: the name is materialised from two `movabs` immediates at `eboot+0x587626`/`+0x587630` and handed to the add-resource call at `eboot+0x5876ba`, with no test of any kind between the step's entry and it. Measured — one hit per boot at both the build site and the add call, armed at `prosper::run_entry` so nothing in the chain can run unobserved. The only conditional part of that branch is the *region rating texture* that follows it. This closes the mismodelled-value reading for this insert and strengthens the dump-gap reading. | #1905, this doc, this PR |
 | The eboot's zero references to `ui/ui_startup` mean the request is not name-driven, or the cross-reference index is dead at that address | **Resolved, and it was an instrument gap, not a property of the title.** The literal at `eboot+0xdd593b` is genuinely unreferenced — 0 RIP-relative references by a byte-exhaustive disp32 scan over the whole executable segment (not merely over decoded instructions), 0 self-relative int32 offsets, 0 raw `u32` occurrences of the address anywhere in the image, 0 relocations. It is a **dead literal**: clang built the 13-byte string into the small-buffer from immediates instead, so the string has no address to reference. `xref.py` gained an `imm` mode for exactly this question and reports the one construction site; `bmpfont/segafont` (1 code ref, 0 constructions) and `ui/ui_modefade` (0 code refs, 1 relocation, 0 constructions) are its controls. Any `xref.py to <string VA>` zero for a string of 22 bytes or fewer is void until `imm` has been run. | #1905, this doc, this PR |
 | The boot resource load never completes because `ui/ui_startup.pac` is absent, so the frontend waits forever for a phase that can never finish | **Falsified at the completion site.** `eboot+0x55b400` is the manager's per-phase completion poll: for each in-flight phase it tests that phase's batch counter (`[mgr+0x58]`/`[mgr+0x60]` → `+0xa0`), and when it is zero it clears the in-flight bit and notifies every listener in `[mgr+0xf8]`. Both requested phases reach it: the mask goes `0 → 1` at `eboot+0x55aecf`, is cleared at `eboot+0x55b428`, then `0 → 1 → cleared`, then `0 → 2 → cleared` at `eboot+0x55b480`, on the same manager object, and its entry vectors are still intact at t≈2400 ticks. The read path is positive-controlled: the same byte is read immediately before and after the single `or` that sets it, 3/3 arms `before\|bit == after`. Which phase the runtime `ui/ui_startup` insert lands in is **not** established here — phase 0's vector holds its two static entries and nothing else at every sample, so the package is tracked by another owner. Scope the notification precisely: what is **measured** is the in-flight bit being cleared, which the poll does only after that phase's batch counter reaches zero. The listener dispatch that follows the clear (`eboot+0x55b42f..0x55b463`) is read off the disassembly, not observed. The row's claim is the narrower measured one: every phase this boot requests reaches its completion clear, so a handled ENOENT does not leave the loader waiting. | #1905, this doc, this PR |
+| The absent `raw/ui/ui_startup.pac` is what stops Sonic's frontend (the standing "one hypothesis that joins all of it") | **Falsified.** The file is still absent and the SEGA logo now renders: with `sceSaveDataCreateTransactionResource` fixed, the same boot resolves **159** unique paths instead of 40, requests resource phase 2 (`text/text_menu` … `ui/ui_modefade`) and **opens `sonicteam_logo_4k.usm`**. The whole `ui_startup` line of investigation — eight lanes of it — was measuring a real dump gap that the frontend skips by construction, downstream of the actual wall. | #1905, this doc, this PR |
+| The rating-organisation id at `[eboot+0x350bf80]+0x1c` reading 0 is a value prosper should be supplying, and is why the startup scene is empty | **Not the blocker.** It still reads 0 on the fixed boot and the rating-texture jump table is still skipped, and the frontend advances past that step anyway — so it cannot be what held the state machine. Who owns `+0x1c` remains unestablished (a register-relative store is invisible to a RIP-relative scan), but it is no longer on the critical path and is not evidence of a missing platform query. | #1905, this doc, this PR |
+| Phase 2 is never requested because of something in the resource manager, the phase mask, or the loader | **Falsified — it is upstream of all of them.** Phase 2's requester `eboot+0x598310` is installed by `eboot+0x597b80`, which is installed by `eboot+0x5978f0` only after `[SaveManager+0x78]` (the outstanding-job count) reaches zero. It never did. Nothing in the resource manager was ever consulted. | #1905, this doc, this PR |
 
 ## Sonic Origins dump audit
 
@@ -949,3 +952,179 @@ PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_NO_COMPUTE=1 \
 - **`xref.py to <string VA>` cannot see a string built from immediates**, and the zero it returns is
   indistinguishable from "nothing uses this". `xref.py imm '<string>'` is the query for that, added with
   this section; `tools/re/README.md` documents both numbers and why neither is sufficient alone.
+
+### The boot wall, resolved: one wrong return value (2026-08-06, master `7dc2a106`)
+
+Sonic Origins reached rung 1 here. The whole black-frame investigation — nine lanes, a dump audit, a
+Game-Intent experiment, a whole-frame GPU capture, a depth-alias fix, a present-path fix — was
+downstream of a **single wrong HLE return value**.
+
+**The chain, end to end.** Each link is measured, not inferred:
+
+1. `eboot+0x93fdb0` is the save handler's prepare method. Its body is
+   `xor edi,edi; call sceSaveDataCreateTransactionResource; test eax,eax; jle <ebx=3>`, and on the
+   success arm `mov [r14+0xc0],eax` — so the call must return a **positive** resource id, a zero
+   return is read as failure, and the value is *kept* (which is what makes it an id rather than a
+   status; see the contract section below).
+2. prosper returned **0**. The handler stored `3` in its sticky-error field `[handler+0x68]`.
+3. `eboot+0x93e7f0`, the save dispatcher, returns that sticky error for every op **before running
+   it**, so the load of `option/data.dat` never happened. Measured: `op_kind=3
+   sticky_err[+0x68]=3`.
+4. The result lands in the request object's `[+0x20]`. The SaveProcess coroutine step
+   `eboot+0x7b2120` waits for the request's status `[+0x1c] >= 2` and then switches on `[+0x20]`
+   through the 8-entry table at `eboot+0x1b24c98`. **Cases 0/1/4/7 advance; cases 2/3/5/6 fall to
+   `eboot+0x7b2430`, which reinstalls the same step.** Case 3 was taken, forever.
+5. So `[SaveManager+0x78]` — the outstanding-job count — stayed at 1. Measured across a whole run:
+   the same job (`id=0x22 kind=1 done=0`) present at poll 1, 50, 200 and at the end.
+6. `eboot+0x5978f0` is the boot coroutine step that waits for exactly that count to reach zero. It
+   polled **466 times in 3,000 ticks and never advanced**, so it never installed `eboot+0x597b80` —
+   the step that requests **AppResourceManager phase 2**.
+
+That is the complete answer to "why does nothing ask for phase 2".
+
+**The fix and what it changed.** `sceSaveDataCreateTransactionResource` now returns a real, positive,
+monotonically allocated resource id, and `sceSaveDataDeleteTransactionResource` frees it (and rejects
+an id that was never created). On the same route and the same dump:
+
+| | before | after |
+| --- | --- | --- |
+| save job drains | never (466 polls, count stuck at 1) | yes, at poll 9 |
+| `eboot+0x597b80` (the phase-2 step) | never entered | entered, plus a second save job that also completes |
+| unique resolved paths in a 90 s CPU-only arm | 40 | **159** |
+| phase-2 marker group | never requested | `text/text_menu`, `text_game`, `text_gamegear`, `text_mission`, `text_museum`, `text_mydata`, `text_option`, `text_achievement`, `text_license`, `ui/ui_modefade` |
+| `sonicteam_logo_4k.usm` | never opened | opened |
+| pixel-distinct frames in a 120 s native 3840x2160 `screenshot` run | 1 (black) | **8** |
+
+![Sonic Origins — SEGA logo](../../assets/screenshots/sonic-origins-sega-logo.png)
+
+Direct, unmodified `screenshot` frontend capture at 3840x2160 with `PROSPER_RENDER_SCALE=1
+PROSPER_RENDER_EVERY=1`, route `scripts/sonic/reach-title-or-gameplay.pad`, sample 8 of 24 at t=40 s.
+Reproduce with:
+
+```bash
+PROSPER_PAD_SCRIPT=@prosper/scripts/sonic/reach-title-or-gameplay.pad \
+  prosper/build-linux/screenshot <DUMP_ROOT>/PPSA05325-app0 \
+  --seconds 5 --count 24 --timeout 150 --out "$HOME/prosper-artifacts/sonic-shots"
+```
+
+**Where it stops now, stated narrowly.** The sequence is black → an animated cyan element → the
+full-colour SEGA logo → a fade → a **uniformly white** composite that holds for the rest of the run
+(16 of 24 samples, one crc). That white hold is the next frontier and it is *not* characterised here:
+it could be the legal/rating screen the absent `ui_startup.pac` would have populated, the boot movie
+decoding but not compositing, or an ordinary composition defect. Nothing above establishes which.
+
+One thing about it *is* established: **it is not input-gated at this depth.** A 150 s CPU-only arm on
+the ~12,000-read `scripts/sonic/long-input-probe.pad` resolves a path set identical to the 90 s
+short-route arm apart from one audio bank's DLC-prefix fallback (162 vs 159 entries, the difference
+being the three logged forms of `SCD_music.awb`), and still never requests `ui_mainmenu*`,
+`stage_title*` or any `.rsdk`. So whatever the frontend is waiting for after the logo, it is not a
+button press.
+
+**How the wall was found, because the method transfers.** Static call-graph walking is useless in
+this engine — every step is reached through a vtable slot, and `xref.py to <fn>` on the phase-2
+requester returns *zero* code references and one data relocation. What worked was a
+**function-entry coverage probe**: one self-disabling gdb breakpoint at the entry of every function
+in an address range, armed at `prosper::run_entry`. Each costs one trap and then nothing, so 1,978
+breakpoints over `eboot+0x505000..0x5c0000` are cheap. 159 functions were covered; the frontier is
+wherever a covered function `lea`s an uncovered one, which named `eboot+0x5978f0 -> 0x597b80` in one
+pass. Repeating it over the save-data region found the stalled coroutine step the same way. Pair it
+with a **guest backtrace by rbp chain** (this eboot keeps frame pointers, so at a function's first
+instruction `ra0=[rsp]` then `ra_{n+1}=[fp+8]`, `fp=[fp]` walks the caller chain) and the two together
+answer "what runs, and who called it" without a symbol table.
+
+**But do not classify a call site from that walk alone.** When the guest reaches an import through a
+local wrapper, the frame the walk lands on is the *wrapper's* caller, so the address it reports is one
+frame too high — and it is never obviously wrong, because it is always a real return address with a
+plausible instruction after it. It produced four wrong rows in the polarity table above, including a
+title recorded as "ignores the return" that in fact has Sonic's exact `jle`. The check that separates
+the two costs one step: **confirm the five bytes ending at the reported address are an `e8` call whose
+target is the `ff 25` PLT thunk for the NID in question.** Recorded as instrument trap 114.
+
+**One instrument trap, and it nearly produced a phantom defect.** A breakpoint placed on
+`mov r14,[r12+rbx]` and then reading `$r14` reports the **stale** value — gdb stops *before* the
+instruction executes. Two such reads printed `r14=0x0` for a search that had just succeeded, which
+reads exactly like "the component was not found, and the guest is about to store through a null
+pointer". Read the register **after** the write, or read the memory the instruction is about to load.
+Recorded as instrument trap 113 in `GAME_COMPAT_ORCHESTRATION.md`.
+
+**The contract is "returns the resource ID", not merely "returns something positive".** The whole
+handle lifecycle is visible in Sonic's own disassembly, which is what makes the distinction a
+measurement rather than an assumption — many values satisfy `> 0`, and the difference matters for
+every later title that calls this.
+
+*Create → retained in a member.* `eboot+0x93fdb0`:
+
+```text
+93fdbe:  call 0xc49710                     ; PLT -> GOT 0x1e68120 -> NID gjRZNnw0JPE
+93fdc3:  test eax,eax
+93fdc5:  jle  0x93fdd0                     ; -> ebx = 3, the sticky error
+93fdc7:  mov  DWORD PTR [r14+0xc0],eax     ; the success arm RETAINS the value
+```
+
+*Use → the Mount3 descriptor's `+0x28`.* `eboot+0x94032e` is the title's only `sceSaveDataMount3`
+call; its descriptor base is `lea r12,[rsp+0x40]`, and `rsp+0x68 - rsp+0x40 = 0x28`:
+
+```text
+9402cd:  mov  eax,DWORD PTR [r14+0xc0]     ; the Create result
+9402d4:  mov  DWORD PTR [rsp+0x68],eax     ; +0x28  transactionResourceId
+940328:  mov  rdi,r12
+94032e:  call 0xc49730                     ; NID ZP4e7rlzOUk = sceSaveDataMount3
+```
+
+That also **independently reproduces the Mount3 descriptor layout** `hle_service.cpp` had only ever
+derived from *Dragon Quest VII* — two unrelated titles now agree on it.
+
+*Destroy → the same field is the sole Delete argument.* `eboot+0x93f24e`:
+
+```text
+93f24e:  mov  edi,DWORD PTR [rdi+0xc0]
+93f254:  cmp  edi,0xffffffff               ; the guest's own "no resource" sentinel is -1, not 0
+93f257:  je   0x93f25e                     ; skip
+93f259:  call 0xc496e0                     ; NID lJUQuaKqoKY = sceSaveDataDeleteTransactionResource
+```
+
+Stored in a member, carried as a mount-descriptor field, handed back to the matching destroy call:
+that is a **handle**, and no status code is used that way. `CONFIDENCE: HIGH`. Two corollaries kill
+the competing readings: `arg0` is a size/budget (`0xc0000` in Oregon Trail and DQ7, `[r15+0x94]` in
+Tactics Ogre, `0` in Sonic and Dead Cells), so "the id is returned through an out-pointer" is out;
+and the invalid-id sentinel is `-1`, consistent with the `jle` polarity.
+
+**Sonic has four Delete call sites but only one transaction resource.** `0x93f259` and `0x93f2d9`
+read `[this+0xc0]`; `0x93f29a` and `0x93f32e` read `[this+0xa8]`, but their `this` is a secondary-base
+subobject pointer (`lea r14,[rdi-0x18]` at `0x93f318` fixes the adjustment), so `+0x18 + 0xa8 = 0xc0`
+— **the same field**, reached through the two D0/D1 destructor pairs. There is exactly **one** Create
+call site in the entire eboot, and the constructor initialises the field to `-1` at `0x939b7d`, so an
+object destroyed before Create never calls Delete at all. One residual remains and is stated rather
+than left implicit: nothing writes `-1` back after a Delete, so an object torn down through both
+destructors would present the same id twice and the second call now returns `PARAMETER` where it
+previously returned 0. No such path was hit on the run that reached the SEGA logo, and the call is
+`svc_log`ged, so it is visible under `PROSPER_SVCLOG=1` if it ever happens.
+
+**Cross-title safety check on the return polarity, because 23 dumps import this NID.** The change is
+only safe if no title reads the result as a 0-on-success status. Each row is read at the title's
+**direct call site** — the `e8` whose target is the `ff 25` PLT thunk for this NID, located by
+resolving the import's GOT slot out of `JMPREL` — because the return address alone is not sufficient
+(see the method warning below). A `test eax,eax` followed by `jne`/`je` would have meant "wants 0";
+none appeared.
+
+| Title | Call site | `arg0` | After the call | Reads the result as |
+| --- | --- | --- | --- | --- |
+| *Sonic Origins* `PPSA05325` | `0x93fdbe` | `0` | `test eax,eax; jle`; then `mov [r14+0xc0],eax` | **positive id, retained** |
+| *Tactics Ogre: Reborn* `PPSA03839` | `0x445af` | `[r15+0x94]` | `test eax,eax; jle`; then `mov [rip+0xe83eae],eax` (`0xec846c`) | **positive id, retained in a global** |
+| *The Oregon Trail* `PPSA19244` | `0x875d19` | `0xc0000` | `mov [rbp-0x4c],eax; test eax,eax; js`; then `lea rax,[rbp-0x4c]` | **non-negative id, passed on by pointer** |
+| *The Oregon Trail* (2nd site) | `0x139879d` | `0xc0000` | `mov [rbx+0x8790],eax` | retained in a member |
+| *Dragon Quest VII Reimagined* `PPSA17942` | `0x22515bd` | `0xc0000` | `mov [rbx+0x87d8],eax` | retained in a member |
+| *Dead Cells* `PPSA15552` | `0x173c427` | `0` | `test eax,eax; js`; then `mov [rip+0x95b5a2],eax` (`0x20979d8`) | **non-negative id, retained in a global** |
+| *R-Type Delta: HD Boosted* `PPSA26414` | `0x25be3` | `0` | `mov [rip+0x6ce64a],eax` (`0x6f4238`) | retained in a global |
+| *Little Nightmares III* `PPSA05143` | `0x280467f` | — | `mov [rip+0x60a3856],eax` (`0x88a7ee0`) | retained in a global |
+
+**All seven titles retain the value; not one discards it and not one uses `jne`/`je`**, so no title in
+the local inventory is regressed by returning an id instead of 0. `sceSaveDataMount3` still ignores
+the descriptor's `+0x28`, so no mount behaviour changes either.
+
+**A second title was silently failing on the old return, and it is not the one anyone was looking
+at.** *Tactics Ogre: Reborn* has Sonic's identical `test eax,eax; jle` at `0x445b4`, so `return 0`
+sent it down the failure arm at `0x445c0` on every boot. It is at rung 3 with gameplay working, so
+nothing about it looked broken. Tracked as #2125. Note also that *R-Type Delta* and *Little
+Nightmares III* **do** have static call sites: "never called" in an earlier revision of this section
+was a runtime observation over a 1,500-tick boot and must not be read as "never calls it".

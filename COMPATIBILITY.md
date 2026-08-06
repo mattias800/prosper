@@ -20,7 +20,7 @@ Last updated: 2026-08-05
 | *Evergate* | `PPSA01885` | Unity | ✅ First tutorial-room gameplay | [#1868](https://github.com/mattias800/prosper/issues/1868) |
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
-| *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 Frontend loop; no visual milestone yet | [#1871](https://github.com/mattias800/prosper/issues/1871) |
+| *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 4K SEGA logo; the boot sequence then holds on a white screen before a title screen | [#1871](https://github.com/mattias800/prosper/issues/1871) |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🔬 Full 4K opening sequence; the guest's own display buffer then goes black before the title screen | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K SEGA logo; the composite goes uniform before a title screen | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
@@ -104,7 +104,17 @@ The route reaches the native 1920×1080 desert tutorial combat scene with audio.
 
 ## Sonic Origins — `PPSA05325`
 
-The complete base game, update, and installed DLC reach the frontend loop, but no visual compatibility milestone is claimed yet. See the [tracker](https://github.com/mattias800/prosper/issues/1871).
+<p align="center"><img src="assets/screenshots/sonic-origins-sega-logo.png" alt="Sonic Origins — SEGA logo"></p>
+
+The `scripts/sonic/reach-title-or-gameplay.pad` route reaches the game's SEGA logo, composited by the
+live renderer at 3840×2160. The title had previously produced nothing but black: its boot state
+machine waits for a save-data job that could never finish, because
+`sceSaveDataCreateTransactionResource` returned 0 when it must return the id of the transaction
+resource it creates. With a real id the boot advances,
+the frontend loads its menu resource set and opens its logo movie, and the SEGA logo renders. **No
+title screen is reached:** after the logo fades the composite holds on white. See
+[`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) and the
+[tracker](https://github.com/mattias800/prosper/issues/1871).
 
 ## Sonic Frontiers — `PPSA03831`
 
