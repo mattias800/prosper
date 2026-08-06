@@ -277,13 +277,30 @@ read as an address. That `[udmap]` line was printed in **every arm of this inves
 as "the block is coherent, look elsewhere"; it was in fact naming the two pointers the fold then
 destroyed.
 
-The fix is a narrow CFG rule in the fold: when a target has no fall-through predecessor and exactly
-one branch reaches it, its only predecessor is that branch, so every write in between belongs to a
-path that cannot reach it. On arrival, a register whose first and last write both fall inside that
-region is put back the way the branch left it — restored to its seed when it is a seeded user-data
-register, otherwise forgotten, because a value produced only on the not-taken path is *unknown*
-rather than stale. `PROSPER_NO_BRANCH_EXCLUSIVE` restores the old walk and **must stay off**; it
-exists only so the A/B below stays reproducible.
+The fix is a narrow CFG rule in the fold. A target qualifies only when **all** of these hold, and the
+list is worth reading exactly as written because a weaker version of it fires on shapes it must not
+(#2202 review):
+
+- the instruction **physically** preceding it is an unconditional `s_branch` — physically, because
+  the fold walks a *compacted* stream that drops ordinary VALU/EXP/DS/FLAT while preserving PCs, so
+  "the previous element" is the previous *retained* instruction and a dropped block between them
+  would be invisible;
+- **exactly one** branch in the whole program targets it, counted over **both** directions, since a
+  backward edge is a second predecessor;
+- the program contains no indirect control transfer (`s_setpc_b64` / `s_swappc_b64` / `s_rfe_b64` /
+  `s_call_b64`), which would make the CFG unrepresentable by any scan over branch displacements.
+
+Its only predecessor is then that branch, and since a branch writes no register, **the state at the
+target is exactly the state at the branch** — so the rule saves the whole interpreter state at the
+branch and restores it at the target, rather than rolling back registers one at a time. That also
+covers `scc`, the scalar spill slots and the vector index-mode table, which a register-only rollback
+left carrying the skipped path forward. Published descriptor *uses* are deliberately not rolled
+back: an instruction inside the skipped region is genuinely reachable on its own path.
+
+This does not claim the state at the branch is itself right — if branches precede it the walk may
+already be a chimera. It claims only that the target now agrees with one real path instead of two
+mutually exclusive ones. `PROSPER_NO_BRANCH_EXCLUSIVE` restores the old walk and **must stay off**;
+it exists only so the A/B below stays reproducible.
 
 Measured, two 270 s `tools/screenshot` arms, same binary, same session, identical switches:
 
@@ -464,14 +481,19 @@ One line per falsified hypothesis, with the evidence that killed it.
   replay; on → 0/0/0. **All four candidates on #2132 are dead at once**, because all four presumed
   the value was something the guest produced: a missing GPU writer, a guest CPU write, a stale/wrong
   buffer, and a legitimate null the shader guards. It was none of them. (This lane, 2026-08-06, #2132.)
-- **Restoring the dropped draws does NOT change the post-logo composite — the descriptor frontier is
-  closed and the uniform frame is untouched.** With 0 dropped pipelines, 0 `[mimg-unresolved]` and 0
-  `[mubuf-unresolved]`, both A/B arms produce the identical hash sequence `666f7b3f` → `0d70a70a` →
-  `8bf1b518`, and the post-logo frame is exactly **one** distinct colour, `RGB(1,0,1)`, over all
-  8,294,400 pixels. Since the lever demonstrably changes the reject counts in the same session, this
-  is a real null and not an undelivered change. **So "the uniform frame is a dropped-draw composite"
-  is falsified**: every graphics draw this title issues now recompiles. The 8 skipped **compute**
-  programs are the remaining population. (This lane, 2026-08-06, #2132.)
+- **Restoring the last dropped pipelines does NOT change the post-logo composite.** With 0 dropped
+  pipelines, 0 `[mimg-unresolved]` and 0 `[mubuf-unresolved]`, both A/B arms produce the identical
+  hash sequence `666f7b3f` → `0d70a70a` → `8bf1b518`, and the post-logo frame is exactly **one**
+  distinct colour, `RGB(1,0,1)`, over all 8,294,400 pixels. Since the lever demonstrably changes the
+  reject counts in the same session, this is a real null and not an undelivered change.
+  **Read the scope precisely**: what is falsified is *"restoring these pipelines moves the
+  composite"*. It is **not** established that "the uniform frame is not a dropped-draw composite" —
+  the counters prove these stages now *recompile and submit*, not that their draws executed, wrote
+  anything, or that what they wrote reaches the present source, and `[rtt] PRESENT SOURCE EXTENT
+  MISMATCH` still fires early in every arm. Recompiling is not contributing. The delivery path and
+  the 8 skipped **compute** programs are both still open. (This lane, 2026-08-06, #2132; scope
+  narrowed after the #2202 review, which caught this row overreaching its own commit's
+  *Not verified* section.)
 - **No GPU-side writer that prosper executes ever fills the vertex stage's null constant-buffer
   pointer.** *(Superseded by the two rows above — the negative was correct and the question was
   wrong; nothing was supposed to write it.)* The remaining two dropped pipelines fail because a
@@ -543,14 +565,17 @@ with other lanes.
 `[mimg-unresolved]`, 0 `[mubuf-unresolved]` (#2131 + #2132), and the composite is byte-identical
 before and after. Everything below is what remains.
 
-1. **The 8 skipped compute programs are now the only unexercised population**, and the charter names
+1. **Establish whether the four now-restored pipelines reach the present source at all.** Ordered
+   first because it is the cheapest way to tell a *delivery* defect from a *content* one, and
+   because the counters above cannot: they prove these stages recompile and submit, not that their
+   draws executed, wrote anything, or contributed a pixel. A byte-identical composite while four
+   more pipelines submit is itself weak evidence for a delivery problem, and
+   `[rtt] PRESENT SOURCE EXTENT MISMATCH` still fires once early in every arm.
+2. **The 8 skipped compute programs**, and the charter names
    a skipped LUT/exposure dispatch as a documented way a whole composite collapses. They fail on
    **control flow**, not arithmetic: 21 `[cfg-recompile-reject]` and 26 `[compute-struct-reject]`
    lines per boot, on `s_cbranch_vccz`/`vccnz` and a forward `s_cbranch_execz`, one of them a
    `backward else` shape (#590). The 16-bit VALU family is complete through five tiers.
-2. **Look at what the four now-restored pipelines actually draw.** They recompile and submit;
-   whether their output reaches the present source is a separate question, and
-   `[rtt] PRESENT SOURCE EXTENT MISMATCH` still fires once early in every arm.
 3. **Then re-measure the composite.** It has not moved through any change so far: black to t≈20 s,
    SEGA logo (`0d70a70a`, 1,373 colours), then a single-colour `RGB(1,0,1)` frame (`8bf1b518`) —
    including both arms of the #2132 A/B, where the reject counts differ and the pixels do not.

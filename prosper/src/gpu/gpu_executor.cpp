@@ -1722,6 +1722,38 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
 // external branch edge into the region. This is intentionally stronger than merely observing an
 // earlier forward branch: the prior no-hit experiment did not establish dominance and could hide an
 // unguarded missing descriptor.
+// SOPP direct branches: s_branch (0x02) and the s_cbranch_* family (0x04..0x09). Hoisted so the two
+// CFG proofs in this file share one definition of "is a branch" and one target computation — #2181
+// unified four private copies of the VOPC cmpx windows for the same reason, and #2120 is the
+// cautionary tale for a forked predicate.
+bool sopp_is_branch(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOPP &&
+           (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
+}
+bool sopp_is_unconditional_branch(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOPP && in.opcode == 0x02;
+}
+// GFX10 branch target: PC of the branch + its own length + the signed dword displacement. Direction
+// is deliberately NOT filtered here — a predecessor tally that only counts forward edges is not a
+// predecessor tally (#2202 review, B2).
+int64_t sopp_branch_target(const Rdna2Inst& in) {
+    return static_cast<int64_t>(in.pc) + static_cast<int64_t>(in.len_dwords) +
+           static_cast<int64_t>(in.simm16);
+}
+// Indirect control transfer: s_setpc_b64 / s_swappc_b64 / s_rfe_b64 (SOP1 0x20/0x21/0x22) and
+// s_call_b64 (SOPK 0x16). Encodings round-tripped through llvm-mc -mcpu=gfx1030, never read off a
+// table (see SONIC_CROSSWORLDS_STATUS.md § Ruled out, the 0x305 trap). A shader containing one has a
+// CFG no static scan over SOPP displacements can represent.
+bool has_indirect_control_flow(const std::vector<Rdna2Inst>& instructions) {
+    for (const Rdna2Inst& in : instructions) {
+        if (in.fmt == Rdna2Format::SOP1 &&
+            (in.opcode == 0x20 || in.opcode == 0x21 || in.opcode == 0x22))
+            return true;
+        if (in.fmt == Rdna2Format::SOPK && in.opcode == 0x16) return true;
+    }
+    return false;
+}
+
 bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc) {
     auto changes_exec = [](const Rdna2Inst& in) {
         // Every v_cmpx writes EXEC. This listed three of the six windows, so a cmpx from
@@ -1735,13 +1767,8 @@ bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc
                 in.opcode == 0x37 || in.opcode == 0x38 ||
                 in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44);
     };
-    auto is_branch = [](const Rdna2Inst& in) {
-        return in.fmt == Rdna2Format::SOPP &&
-               (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
-    };
-    auto target = [](const Rdna2Inst& in) -> int64_t {
-        return static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
-    };
+    const auto& is_branch = sopp_is_branch;
+    const auto& target = sopp_branch_target;
 
     for (size_t i = 1; i < instructions.size(); ++i) {
         const Rdna2Inst& guard = instructions[i];
@@ -1901,20 +1928,6 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // The SPI loads the user-data block starting at shader SGPR `user_sgpr_base` (s0..s7 are NGG system
     // SGPRs). So user-data block index k lands in shader SGPR (user_sgpr_base + k).
     auto valid_reg = [](int r) { return r >= 0 && r < (int)kFoldSgprs; };
-    // Per-register write history, used by the branch-exclusive-write rule below (#2132). Recorded
-    // only while `walking` is true, so the seeding just below — and the NGG s3 default — are never
-    // mistaken for writes the shader itself performed.
-    constexpr uint32_t kNoWrite = UINT32_MAX;
-    std::array<uint32_t, kFoldSgprs> first_write_pc{}, last_write_pc{};
-    first_write_pc.fill(kNoWrite);
-    last_write_pc.fill(kNoWrite);
-    uint32_t cur_pc = 0;
-    bool walking = false;
-    auto note_write = [&](int r) {
-        if (!walking || r < 0 || r >= (int)kFoldSgprs) return;
-        if (first_write_pc[(size_t)r] == kNoWrite) first_write_pc[(size_t)r] = cur_pc;
-        last_write_pc[(size_t)r] = cur_pc;
-    };
     auto set_value = [&](int r, uint32_t v) {
         if (valid_reg(r)) {
             val[(size_t)r] = v;
@@ -1923,7 +1936,6 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_seed_origin_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
             mask_state[(size_t)r] = FoldMask::Unknown;
-            note_write(r);
         }
     };
     auto forget = [&](int r) {
@@ -1933,7 +1945,6 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_seed_origin_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
             mask_state[(size_t)r] = FoldMask::Unknown;
-            note_write(r);
         }
     };
     for (uint32_t i = 0; system_sgprs && i < nsystem_sgprs && i < kFoldSgprs; ++i)
@@ -1964,32 +1975,44 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // pc=173 the walk dereferences 0 and reports a "null bindless-table pointer" that no writer ever
     // wrote and no guest ever had. Four investigations hunted that phantom writer.
     //
-    // The rule applied here is the narrow, provable one. A target T qualifies when it has NO
-    // fall-through predecessor (the instruction before it is s_branch or s_endpgm) and EXACTLY ONE
-    // branch targets it, from some B < T. T's only predecessor is then B, so the correct state at T
-    // is the state at B, and every write in (B,T) belongs to a path that cannot reach T. On arrival
-    // at T each register whose first and last writes both fall inside (B,T) is put back the way B
-    // left it: restored to its seed when it is a seeded user-data register (its first write is
-    // inside the region, so at B it still held the seed), and otherwise forgotten, because a value
-    // produced only on the not-taken path is unknown at T rather than stale.
+    // THE QUALIFYING SHAPE, stated as what the code actually tests (#2202 review, B1/B2):
+    //
+    //   * `ins` is the COMPACTED fold stream (`retain_fold_instructions`), which drops ordinary
+    //     VALU/EXP/DS/FLAT while preserving original PCs. So "the previous element" is the previous
+    //     RETAINED instruction, and a dropped VALU block between it and the target would be
+    //     invisible. The check is therefore PHYSICAL: `prev.pc + prev.len_dwords == ins[k].pc`
+    //     proves prev immediately precedes the target in the real program, whatever was compacted
+    //     away. Without it a target with a genuine fall-through predecessor can qualify, and the
+    //     restore then installs a *known* wrong value — a worse failure than the bug being fixed.
+    //   * prev must be an UNCONDITIONAL `s_branch`, so no fall-through edge enters the target.
+    //   * EXACTLY ONE branch anywhere in the program targets it, counted over BOTH directions.
+    //     A backward edge into the target is a second predecessor and disqualifies it.
+    //   * The program contains no indirect control transfer at all; one makes the CFG
+    //     unrepresentable by any scan over SOPP displacements, so the rule declines to fire.
+    //
+    // This is the same standard `guarded_bvh_use` above already holds itself to, and for the same
+    // reason its comment gives: observing an earlier forward branch does not establish dominance.
+    //
+    // The target's only predecessor is then the branch at B, and since a SOPP branch writes no
+    // register, THE STATE AT THE TARGET IS EXACTLY THE STATE AT B. So the rule is a whole-state
+    // save at B and restore at the target, rather than a per-register rollback: every write in
+    // (B, target) belongs to a path that cannot reach the target, including the ones that live in
+    // `scc`, the scalar spill slots and the vector index-mode table, which a register-only rollback
+    // left behind. Published uses (`out`, `srt_uses`) are deliberately NOT rolled back: an
+    // instruction inside the skipped region is genuinely reachable on its own path and the
+    // recompiler still needs its descriptor.
+    //
+    // What this does NOT claim: that the state at B is itself right. If branches precede B the walk
+    // may already be a chimera, and this only makes the target agree with the walk's own state at B.
+    // That is strictly closer to one real path than mixing both arms of a branch.
     // CONFIDENCE: HIGH on the CFG rule; the shape is proved from the guest's own encodings.
-    // Kept allocation-free for the overwhelmingly common shader (no forward branch at all): this fold
-    // runs thousands of times per submit, so the CFG pass must not cost a heap allocation per call.
-    // `restore_at` is built ascending by target and consumed with a cursor by the ascending walk.
-    std::vector<std::pair<uint32_t, uint32_t>> restore_at;   // (target pc, its single branch predecessor)
+    //
+    // Kept allocation-free for the overwhelmingly common shader (no branch at all): this fold runs
+    // thousands of times per submit. The scan is linear — one pass collecting every branch target,
+    // one sort, then a binary search per candidate.
+    std::vector<std::pair<uint32_t, uint32_t>> restore_at;   // (target pc, its sole predecessor branch pc)
     size_t restore_cursor = 0;
     {
-        auto is_branch = [](const Rdna2Inst& in) {
-            return in.fmt == Rdna2Format::SOPP &&
-                   (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
-        };
-        auto forward_target = [&](const Rdna2Inst& in, uint32_t& target) {
-            if (!is_branch(in)) return false;
-            const int64_t t = (int64_t)in.pc + (int64_t)in.len_dwords + (int64_t)in.simm16;
-            if (t <= (int64_t)in.pc || t > (int64_t)UINT32_MAX) return false;   // forward branches only
-            target = (uint32_t)t;
-            return true;
-        };
         // PROSPER_NO_BRANCH_EXCLUSIVE=<any value> restores the old straight-line walk. It exists so
         // the A/B that established this — CrossWorlds' two dropped vertex pipelines and its
         // `[mubuf-unresolved]` line appear with it set and are absent without it — stays reproducible
@@ -1997,72 +2020,91 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         // normal run: with it set the fold reports descriptors built from a path the wave cannot be on.
         static const bool branch_exclusive_disabled =
             std::getenv("PROSPER_NO_BRANCH_EXCLUSIVE") != nullptr;
-        bool any_forward_branch = false;
-        for (const Rdna2Inst& in : ins) {
-            uint32_t t = 0;
-            if (forward_target(in, t)) { any_forward_branch = true; break; }
-        }
-        if (branch_exclusive_disabled) any_forward_branch = false;
-        if (any_forward_branch) {
+        bool any_branch = false;
+        for (const Rdna2Inst& in : ins)
+            if (sopp_is_branch(in)) { any_branch = true; break; }
+        if (any_branch && !branch_exclusive_disabled && !has_indirect_control_flow(ins)) {
+            // Every branch edge, both directions — the predecessor tally is only a tally if it
+            // counts them all.
+            std::vector<std::pair<uint32_t, uint32_t>> edges;   // (target, branch pc)
+            for (const Rdna2Inst& in : ins) {
+                if (!sopp_is_branch(in)) continue;
+                const int64_t t = sopp_branch_target(in);
+                if (t < 0 || t > (int64_t)UINT32_MAX) continue;
+                edges.emplace_back((uint32_t)t, in.pc);
+            }
+            std::sort(edges.begin(), edges.end());
             for (size_t k = 1; k < ins.size(); ++k) {
                 const Rdna2Inst& prev = ins[k - 1];
-                const bool fallthrough = !(prev.fmt == Rdna2Format::SOPP &&
-                                           (prev.opcode == 0x02 || prev.opcode == 0x01)) && !prev.is_end;
-                if (fallthrough) continue;
                 const uint32_t t = ins[k].pc;
-                uint32_t preds = 0, source = 0;
-                for (const Rdna2Inst& in : ins) {
-                    uint32_t bt = 0;
-                    if (forward_target(in, bt) && bt == t) { ++preds; source = in.pc; }
-                }
-                if (preds == 1) restore_at.emplace_back(t, source);
+                if (!sopp_is_unconditional_branch(prev)) continue;      // a fall-through edge exists
+                if (prev.pc + prev.len_dwords != t) continue;           // ...unless prev physically ends here
+                const auto lo = std::lower_bound(edges.begin(), edges.end(),
+                                                 std::make_pair(t, uint32_t{0}));
+                const auto hi = std::upper_bound(edges.begin(), edges.end(),
+                                                 std::make_pair(t, UINT32_MAX));
+                if (std::distance(lo, hi) != 1) continue;               // 0 or >=2 predecessors
+                const uint32_t source = lo->second;
+                if (source >= t) continue;                              // a lone backward edge: no region
+                restore_at.emplace_back(t, source);
             }
         }
     }
-    // Applied on arrival at a qualifying target T whose single predecessor is the branch at B.
-    auto restore_branch_exclusive_writes = [&](uint32_t target, uint32_t branch_pc) {
-        for (int r = 0; r < (int)kFoldSgprs; ++r) {
-            const uint32_t last = last_write_pc[(size_t)r];
-            if (last == kNoWrite || last <= branch_pc || last >= target) continue;
-            const uint32_t first = first_write_pc[(size_t)r];
-            const bool seeded = user_sgprs && r >= (int)user_sgpr_base &&
-                                r < (int)(user_sgpr_base + nsgpr);
-            if (seeded && first > branch_pc) {
-                const uint32_t idx = (uint32_t)r - user_sgpr_base;
-                val[(size_t)r] = user_sgprs[idx];
-                val_known.set((size_t)r);
-                val_srt_key_known.reset((size_t)r);
-                null_chain_known.reset((size_t)r);
-                mask_state[(size_t)r] = FoldMask::Unknown;
-                val_seed_origin[(size_t)r] = idx;
-                val_seed_origin_known.set((size_t)r);
-                if (trc)
-                    fprintf(stderr, "[dyntrace]   branch-exclusive: pc=%u restored s%d to seed "
-                                    "dw%u=0x%08x (write at pc=%u is on the path branch pc=%u skips)\n",
-                            target, r, idx, user_sgprs[idx], last, branch_pc);
-            } else {
-                val_known.reset((size_t)r);
-                val_srt_key_known.reset((size_t)r);
-                val_seed_origin_known.reset((size_t)r);
-                null_chain_known.reset((size_t)r);
-                mask_state[(size_t)r] = FoldMask::Unknown;
-                if (trc)
-                    fprintf(stderr, "[dyntrace]   branch-exclusive: pc=%u forgot s%d "
-                                    "(written at pc=%u, only on the path branch pc=%u skips)\n",
-                            target, r, last, branch_pc);
-            }
-            // A load-time V#/T# snapshot taken on the skipped path is no more valid than the value
-            // that produced it.
-            descr_known.reset((size_t)r);
-            descr_key_known.reset((size_t)r);
-            descr8_known.reset((size_t)r);
-            descr8_key_known.reset((size_t)r);
-            // Likewise the "an s_load has since overwritten this seed" mark: that reload is on the
-            // skipped path, so a restored register is once again an untouched seed.
-            if (val_seed_origin_known.test((size_t)r)) reloaded.reset((size_t)r);
-            last_write_pc[(size_t)r] = kNoWrite;
-            first_write_pc[(size_t)r] = kNoWrite;
-        }
+    // The interpreter state that a restore has to put back. Everything the walk mutates and that can
+    // be read after the target — deliberately excluding the published uses, and excluding
+    // `next_null_chain_origin`, which is a monotonic id allocator: rewinding it would let two
+    // distinct null chains share an origin, which is worse than leaking ids.
+    struct FoldStateSnapshot {
+        std::array<uint32_t, kFoldSgprs> val;
+        std::bitset<kFoldSgprs> val_known;
+        std::array<uint32_t, kFoldSgprs> val_seed_origin;
+        std::bitset<kFoldSgprs> val_seed_origin_known;
+        std::array<uint32_t, kFoldSgprs> val_srt_key;
+        std::bitset<kFoldSgprs> val_srt_key_known;
+        std::unordered_map<uint32_t, uint32_t> scalar_spill_slots;
+        std::array<std::array<uint32_t, 4>, kFoldSgprs> descr;
+        std::bitset<kFoldSgprs> descr_known;
+        std::array<uint32_t, kFoldSgprs> descr_key;
+        std::bitset<kFoldSgprs> descr_key_known;
+        std::array<std::array<uint32_t, 8>, kFoldSgprs> descr8;
+        std::bitset<kFoldSgprs> descr8_known;
+        std::array<uint32_t, kFoldSgprs> descr8_key;
+        std::bitset<kFoldSgprs> descr8_key_known;
+        std::array<uint32_t, kFoldSgprs> null_chain_origin;
+        std::bitset<kFoldSgprs> null_chain_known;
+        std::bitset<kFoldSgprs> reloaded;
+        std::array<FoldMask, kFoldSgprs> mask_state;
+        std::array<VertexFetchIndexMode, kFoldVgprs> vector_index_mode;
+        int scc;
+    };
+    std::vector<std::pair<uint32_t, FoldStateSnapshot>> saved_at_branch;   // (branch pc, state at it)
+    auto capture_fold_state = [&]() {
+        FoldStateSnapshot s;
+        s.val = val; s.val_known = val_known;
+        s.val_seed_origin = val_seed_origin; s.val_seed_origin_known = val_seed_origin_known;
+        s.val_srt_key = val_srt_key; s.val_srt_key_known = val_srt_key_known;
+        s.scalar_spill_slots = scalar_spill_slots;
+        s.descr = descr; s.descr_known = descr_known;
+        s.descr_key = descr_key; s.descr_key_known = descr_key_known;
+        s.descr8 = descr8; s.descr8_known = descr8_known;
+        s.descr8_key = descr8_key; s.descr8_key_known = descr8_key_known;
+        s.null_chain_origin = null_chain_origin; s.null_chain_known = null_chain_known;
+        s.reloaded = reloaded; s.mask_state = mask_state;
+        s.vector_index_mode = vector_index_mode; s.scc = scc;
+        return s;
+    };
+    auto restore_fold_state = [&](const FoldStateSnapshot& s) {
+        val = s.val; val_known = s.val_known;
+        val_seed_origin = s.val_seed_origin; val_seed_origin_known = s.val_seed_origin_known;
+        val_srt_key = s.val_srt_key; val_srt_key_known = s.val_srt_key_known;
+        scalar_spill_slots = s.scalar_spill_slots;
+        descr = s.descr; descr_known = s.descr_known;
+        descr_key = s.descr_key; descr_key_known = s.descr_key_known;
+        descr8 = s.descr8; descr8_known = s.descr8_known;
+        descr8_key = s.descr8_key; descr8_key_known = s.descr8_key_known;
+        null_chain_origin = s.null_chain_origin; null_chain_known = s.null_chain_known;
+        reloaded = s.reloaded; mask_state = s.mask_state;
+        vector_index_mode = s.vector_index_mode; scc = s.scc;
     };
     if (explicit_ngg_index_provenance) {
         // s3 is the merged GS/ES wave info: s3[7:0] is the active ES-vertex count and s3[15:8]
@@ -2158,16 +2200,28 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         return FoldMask::Unknown;
     };
 
-    walking = true;
     for (const auto& in : ins) {
         if (in.is_end) break;
-        cur_pc = in.pc;
-        // #2132: this instruction's only predecessor is a forward branch, so undo the writes the
-        // straight-line walk made on the path that branch skips (see the rule above).
+        // #2132. Save the state at a branch that is some later target's ONLY predecessor...
+        if (!restore_at.empty())
+            for (const auto& [target, branch_pc] : restore_at)
+                if (branch_pc == in.pc) { saved_at_branch.emplace_back(in.pc, capture_fold_state()); break; }
+        // ...and put it back on arrival at that target, discarding everything the walk did on the
+        // path the branch skips. `restore_at` is ascending by target and so is the walk.
         while (restore_cursor < restore_at.size() && restore_at[restore_cursor].first < in.pc)
             ++restore_cursor;
-        if (restore_cursor < restore_at.size() && restore_at[restore_cursor].first == in.pc)
-            restore_branch_exclusive_writes(in.pc, restore_at[restore_cursor].second);
+        if (restore_cursor < restore_at.size() && restore_at[restore_cursor].first == in.pc) {
+            const uint32_t branch_pc = restore_at[restore_cursor].second;
+            for (auto it = saved_at_branch.rbegin(); it != saved_at_branch.rend(); ++it)
+                if (it->first == branch_pc) {
+                    restore_fold_state(it->second);
+                    if (trc)
+                        fprintf(stderr, "[dyntrace]   branch-exclusive: pc=%u restored the fold state to "
+                                        "pc=%u (its only predecessor); every write in between is on the "
+                                        "path that branch skips\n", in.pc, branch_pc);
+                    break;
+                }
+        }
         const bool scalar_spill = in.fmt == Rdna2Format::VOP3 &&
                                   (in.opcode == 0x360 || in.opcode == 0x361);
         const bool vector_select =
@@ -2721,16 +2775,17 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             (unsigned long long)bytes, size_ok ? "" : " (size UNKNOWN)");
                     if (bytes >= 4 && readable(base, (uint32_t)bytes)) {
                         const uint32_t* buf = (const uint32_t*)(uintptr_t)base;
-                        const uint32_t dwords = (uint32_t)(bytes / 4);
-                        for (uint32_t i = 0; i < dwords; i += 8) {
+                        // NOT `dwords` — that names the shader length in this scope (#2202 N4).
+                        const uint32_t buf_dwords = (uint32_t)(bytes / 4);
+                        for (uint32_t i = 0; i < buf_dwords; i += 8) {
                             fprintf(stderr, "[dyntrace]   +0x%03x:", i * 4);
-                            for (uint32_t j = i; j < i + 8 && j < dwords; ++j)
+                            for (uint32_t j = i; j < i + 8 && j < buf_dwords; ++j)
                                 fprintf(stderr, " %08x", buf[j]);
                             fprintf(stderr, "\n");
                         }
                         fprintf(stderr, "[dyntrace]   mapped 64-bit pointer candidates in buffer:");
                         bool any_ptr = false;
-                        for (uint32_t i = 0; i + 1 < dwords; ++i) {
+                        for (uint32_t i = 0; i + 1 < buf_dwords; ++i) {
                             const uint64_t cand =
                                 (uint64_t)buf[i] | ((uint64_t)buf[i + 1] << 32);
                             if (cand <= 0x10000 || !readable(cand, 8)) continue;
