@@ -22,12 +22,22 @@ namespace {
         Clock::time_point retired_at{};
     };
 
-    std::mutex g_mutex;
-    std::deque<Retired> g_quarantine;          // FIFO: retirement time is monotonic, so is the order
-    uint64_t g_total = 0;
-    uint64_t g_by_kind[(size_t)SyncObjectKind::Count_] = {};
-    size_t g_high_water = 0;
-    size_t g_reported_high_water = 0;
+    struct Registry {
+        std::mutex mutex;
+        std::deque<Retired> quarantine;   // FIFO: retirement time is monotonic, so is the order
+        uint64_t total = 0;
+        uint64_t by_kind[(size_t)SyncObjectKind::Count_] = {};
+        size_t high_water = 0;
+        size_t reported_high_water = 0;
+    };
+    // DELIBERATELY LEAKED, and never destroyed. A guest thread can reach a *Destroy handler during
+    // static teardown (guest TSD destructors and atexit handlers both run there), and a namespace
+    // -scope registry would already have been destroyed by then — trading a use-after-free on the
+    // guest's object for a use-after-free on the machinery that exists to prevent it.
+    Registry& registry() {
+        static Registry* const r = new Registry();
+        return *r;
+    }
 
     bool retire_log() {
         static const bool on = getenv("PROSPER_SYNC_RETIRELOG") != nullptr;
@@ -57,32 +67,34 @@ void retire_sync_object(void* storage, SyncObjectKind kind, SyncObjectHostDestro
     size_t held = 0;
     bool report = false;
     uint64_t by_kind[(size_t)SyncObjectKind::Count_];
+    Registry& reg = registry();
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        ++g_total;
-        if (kind < SyncObjectKind::Count_) ++g_by_kind[(size_t)kind];
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        ++reg.total;
+        if (kind < SyncObjectKind::Count_) ++reg.by_kind[(size_t)kind];
 
         const double window = retire_window_seconds();
         const Clock::time_point now = Clock::now();
         const Clock::time_point cutoff =
             now - std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(window));
-        while (!g_quarantine.empty() && g_quarantine.front().retired_at <= cutoff) {
-            reclaim.push_back(g_quarantine.front());
-            g_quarantine.pop_front();
+        while (!reg.quarantine.empty() && reg.quarantine.front().retired_at <= cutoff) {
+            reclaim.push_back(reg.quarantine.front());
+            reg.quarantine.pop_front();
         }
 
-        if (window > 0.0) g_quarantine.push_back(Retired{storage, host_destroy, now});
+        if (window > 0.0) reg.quarantine.push_back(Retired{storage, host_destroy, now});
         else              reclaim.push_back(Retired{storage, host_destroy, now});
 
-        held = g_quarantine.size();
-        g_high_water = std::max(g_high_water, held);
+        held = reg.quarantine.size();
+        reg.high_water = std::max(reg.high_water, held);
         // Report on powers of two of the HIGH WATER, so a steady state reports once rather than
         // oscillating across a boundary forever.
-        if (g_high_water > g_reported_high_water && (g_high_water & (g_high_water - 1)) == 0 &&
-            (retire_log() || g_high_water >= kUngatedReportFloor)) {
-            g_reported_high_water = g_high_water;
+        if (reg.high_water > reg.reported_high_water &&
+            (reg.high_water & (reg.high_water - 1)) == 0 &&
+            (retire_log() || reg.high_water >= kUngatedReportFloor)) {
+            reg.reported_high_water = reg.high_water;
             report = true;
-            for (size_t k = 0; k < (size_t)SyncObjectKind::Count_; ++k) by_kind[k] = g_by_kind[k];
+            for (size_t k = 0; k < (size_t)SyncObjectKind::Count_; ++k) by_kind[k] = reg.by_kind[k];
         }
     }
 
@@ -102,13 +114,15 @@ void retire_sync_object(void* storage, SyncObjectKind kind, SyncObjectHostDestro
 }
 
 uint64_t retired_sync_object_count() {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    return g_total;
+    Registry& reg = registry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    return reg.total;
 }
 
 uint64_t quarantined_sync_object_count() {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    return (uint64_t)g_quarantine.size();
+    Registry& reg = registry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    return (uint64_t)reg.quarantine.size();
 }
 
 }  // namespace prosper
