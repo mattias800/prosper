@@ -345,8 +345,8 @@ process on the host, and pointing it at a tree another lane is timing silently i
 Say what you are evicting first. It reports `mincore(2)` residency **before and after** so a cold arm
 can prove it was cold.
 
-Every arm below is `boot_trace`, default route (`PROSPER_GUEST_FS=1
-PROSPER_GUEST_ARGS=-force-gfx-direct`), low-volume timeline (`PROSPER_SYNCLOG=1` +
+Every arm below is `boot_trace`, default route (`PROSPER_GUEST_ARGS=-force-gfx-direct`),
+low-volume timeline (`PROSPER_SYNCLOG=1` +
 `PROSPER_SYNCLOG_SEMA_ONLY=1` + `PROSPER_SYNCLOG_COND_ONLY=1`), unmodified binary and unmodified
 guest, on `4d7a2ded` (master `278c9b1f`). The host was shared with 8–9 other agent lanes, so the
 1-minute load average is reported for every arm — the point of the table is that the two populations
@@ -411,7 +411,7 @@ It also has two immediate practical consequences:
 
   ```bash
   python3 tools/dropcache.py <DUMP_ROOT>/PPSA26414-app0     # prints resident MB before -> after
-  PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct ./build/boot_trace <DUMP_ROOT>/PPSA26414-app0
+  PROSPER_GUEST_ARGS=-force-gfx-direct ./build/boot_trace <DUMP_ROOT>/PPSA26414-app0
   ```
 
   It is a measurement aid, not a fix, and it is one-shot: the run it enables re-warms the cache, so
@@ -500,7 +500,7 @@ loops pinned to the same four logical CPUs as prosper:
 
 ```bash
 for i in $(seq 1 12); do taskset -c 0-3 bash -c 'while :; do :; done' & done
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
   taskset -c 0-3 ./build/screenshot <DUMP_ROOT>/PPSA26414-app0 --seconds 3 --count 25 --out <dir>
 ```
 
@@ -621,7 +621,7 @@ that made the old workaround unreliable as an acceptance condition:
 
 ```bash
 python3 tools/dropcache.py <DUMP_ROOT>/PPSA26414-app0
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
   ./build/screenshot <DUMP_ROOT>/PPSA26414-app0 --seconds 4 --count 45 --out <dir>
 ```
 

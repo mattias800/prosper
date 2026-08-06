@@ -147,7 +147,8 @@ globally. It also does not transfer to another title without its own dose-respon
 
 ## Reproduction notes
 
-- No `PROSPER_GUEST_FS`, no `-force-gfx-direct`: `PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1`.
+- No `-force-gfx-direct`: `PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1`. (Guest `%fs` TLS is on by
+  default and is *not* disabled by omitting a switch; `PROSPER_NO_GUEST_FS=1` is the opt-out.)
 - `#1982` (the declined ordered-DMA submit) does **not** reproduce on this title on current
   master — 0 occurrences across every arm since #1987.
 - `#2027` (the frame-bundle writer never completing) still blocks the F9/`gpu_replay` loop here.

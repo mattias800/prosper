@@ -100,7 +100,6 @@ headless title render is correct.
 The strongest exact-head diagnostic for PR #1030 used:
 
 ```sh
-PROSPER_GUEST_FS=1 \
 PROSPER_GUEST_ARGS=-force-gfx-direct \
 PROSPER_NO_COMPUTE=1 \
 PROSPER_AVP_SYNTH_FRAMES=120 \
@@ -450,7 +449,6 @@ For rapid control-flow iteration, the documented synthetic/no-compute route is a
 
 ```sh
 cd prosper
-PROSPER_GUEST_FS=1 \
 PROSPER_GUEST_ARGS=-force-gfx-direct \
 PROSPER_NO_COMPUTE=1 \
 PROSPER_AVP_SYNTH_FRAMES=120 \
@@ -673,7 +671,6 @@ env -u PROSPER_RENDER_SCALE \
     -u PROSPER_NO_PERSISTENT_COMPUTE_IMAGE \
     -u PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER \
     -u PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION \
-  PROSPER_GUEST_FS=1 \
   PROSPER_GUEST_ARGS=-force-gfx-direct \
   PROSPER_RENDER=1 \
   PROSPER_COMPUTE_TIMING_HASH=0xa5e27ec0def1a807 \

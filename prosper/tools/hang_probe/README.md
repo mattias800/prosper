@@ -11,8 +11,8 @@ so you need a **rate** and a **backtrace of a stuck run**, not one launch. This 
 
 ## What it does
 
-For each run it launches the title headless via `boot_trace` (with the gated `PROSPER_GUEST_FS` /
-`-force-gfx-direct` / `PROSPER_RENDER` switches and a fresh per-run savedata), waits, then attaches
+For each run it launches the title headless via `boot_trace` (with the `-force-gfx-direct` /
+`PROSPER_RENDER` switches and a fresh per-run savedata), waits, then attaches
 `guest_bt` to the main thread (Thread 1) and classifies it:
 
 - **BLOCKED** — the top HLE frame is a kernel wait (`k_sema_wait` / `k_eq_wait` / `k_cond_wait` /

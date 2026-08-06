@@ -17,7 +17,7 @@ Direct, unmodified `tools/screenshot` capture, Linux/RADV (`AMD Radeon 8060S (RA
 native 3840x2160, default switches, no route:
 
 ```bash
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
   ./build-linux/screenshot <DUMP_ROOT>/PPSA08804-app0 --seconds 20 --count 20 --out ~/shots
 ```
 

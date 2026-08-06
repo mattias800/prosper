@@ -24,7 +24,7 @@ so it covers both rather than guessing an offset; surplus presses land in the me
 the route returns to it, which keeps both arms of an A/B on the same states.
 
 ```bash
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 PROSPER_RENDER_SCALE=1 PROSPER_RENDER_EVERY=1 \
 PROSPER_PAD_SCRIPT=@scripts/earthion/reach-title-menu.pad PROSPER_PAD_SCRIPT_LOG=1 \
 PROSPER_VULKAN_LIB=libvulkan.so.1 \

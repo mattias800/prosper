@@ -245,7 +245,7 @@ FUSE). Like the Windows archive, neither contains games, firmware, or keys.
 
 ```bash
 chmod +x prosper-linux-x86_64.AppImage
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_GUEST_ARGS=-force-gfx-direct \
   ./prosper-linux-x86_64.AppImage --dump ~/ps5/PPSA24651-app0
 ```
 

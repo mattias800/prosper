@@ -4,9 +4,10 @@ Status as of this doc: the title boots from garbage-byte execution all the way t
 bootstrap, platform-services init, and into UE's **IoStore asset layer**. The MallocBinned
 allocator is deterministically healthy (0 canary fatals) and the engine's own error handler runs.
 
-Boot recipe: `PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 ./boot_trace <PPSA17942-app0>`
-(GUEST_FS: UE MallocBinned TLS caches read `%fs`; NULL_PAGE: UE's FP-chain backtrace walker
-derefs the null chain terminator).
+Boot recipe: `PROSPER_NULL_PAGE=1 ./boot_trace <PPSA17942-app0>`
+(NULL_PAGE: UE's FP-chain backtrace walker derefs the null chain terminator). This title also
+depends on guest `%fs` TLS, because UE's MallocBinned TLS caches read `%fs` — that is on by
+default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for bisection.
 
 ## Ruled out
 
@@ -634,7 +635,7 @@ Two changes of fact, both measured:
   re-verify, then follow the boot toward VideoOut/RHI init and the first SubmitDcb.
 
 Boot recipe (fast): `cp -r` the dump to `/root/PPSA17942-app0` once, then
-`PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 [PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_FILELOG=1
+`PROSPER_NULL_PAGE=1 [PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_FILELOG=1
 PROSPER_EVLOG=1 PROSPER_AMPRLOG=1] ./build-linux/boot_trace /root/PPSA17942-app0` — reaches the
 stall (the current frontier) in ~15-80 s.
 

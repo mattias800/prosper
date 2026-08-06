@@ -166,7 +166,7 @@ blanketing the target, not content and not a guest clear. See the `## Ruled out`
 ## Rung-1 pass: what the presented frames actually contain
 
 Three bounded runs on `9dcb6c4b`, ordinary and unsuppressed
-(`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), each with exact zero pre/post process
+(`PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), each with exact zero pre/post process
 censuses and no suppression, skip, or shim. Timing is deliberately not quoted: peer lanes shared the GPU.
 
 **prosper executes what the guest submits.** With `PROSPER_DRAWLOG=1`, one run realized **456 of 468
@@ -239,7 +239,7 @@ is wrong rather than missing.
 
 This section **supersedes the rung-1 framing above**. The three findings below were taken on
 `c3614f51` with `boot_trace`, ordinary and unsuppressed
-(`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), three runs, exact zero pre/post process
+(`PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), three runs, exact zero pre/post process
 censuses, no suppression, skip, or shim. See [#2011](https://github.com/mattias800/prosper/issues/2011).
 
 **1. ArcRunner plays its intro movie, and prosper's AvPlayer path works.** With `PROSPER_AVPLOG=1`
@@ -321,7 +321,7 @@ crop_right`. Under the pre-fix contract that published the visible 1920 alongsid
 `crop_right_offset=128`, that expression double-counted the padding and yielded **1792**.
 
 Ordinary unsuppressed `boot_trace`
-(`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_COLORSTATETRACE=all`), exact zero
+(`PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_COLORSTATETRACE=all`), exact zero
 pre/post process censuses, no suppression, skip or shim. Movie surfaces counted by their
 `raw-format=10 resolved-format=50` signature:
 
@@ -362,7 +362,7 @@ Build and run inside the `ps5ys` distrobox, with `TMPDIR` on disk rather than `/
 
 ```bash
 cd prosper
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 \
   ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
 ```
 
@@ -372,7 +372,7 @@ census, and the rendered-target content readback. Write every artifact under `~/
 
 ```bash
 # 1. submitted-vs-realized draws, plus any recompile/skip lines
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_DRAWLOG=1 \
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_DRAWLOG=1 \
   ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
 
 # 2. one raw-to-resolved colour/depth record per draw (runs BEFORE the no-effect fast path,
@@ -385,14 +385,14 @@ PROSPER_PRESENT_NZLOG=1 PROSPER_DUMP_RTGROUPS=1 PROSPER_FRAME_DIR=~/arc-work/rtt
 
 # 3. a BMP per rendered target group with >=1 nonzero byte; a DRAWN target with NO file is
 #    fully zero. ~1 GB per 14 s -- keep the run short and delete afterwards.
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_DUMP_RTGROUPS=1 \
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_DUMP_RTGROUPS=1 \
 PROSPER_FRAME_DIR=~/arc-work/rtt ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
 ```
 
 The combined diagnostic arm used for the most recent narrow experiment is:
 
 ```bash
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 \
 PROSPER_INIT_SUPPRESS=ptr PROSPER_REL1_FORGE_SUPPRESS_ALL=1 \
 PROSPER_FORGE_TRIP=1 PROSPER_PRESENT_NZLOG=1 PROSPER_DUMP_RTGROUPS=1 \
   ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0   # NZLOG needs the readback companion
@@ -442,7 +442,7 @@ Durable run records are in the #1226 comments for the
 ## What the `addr=(nil)` fault actually dereferences
 
 Measured on current master (`c9e2588e`), ordinary and unsuppressed
-(`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), with the new `PROSPER_LAZY_COMMIT_STRICT`
+(`PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), with the new `PROSPER_LAZY_COMMIT_STRICT`
 discriminator. **Three terminal paths compete for the same run**, so a single run per arm cannot A/B
 anything on this title — see the `## Ruled out` row.
 

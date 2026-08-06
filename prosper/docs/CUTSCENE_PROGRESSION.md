@@ -3,6 +3,13 @@
 **Goal:** advance the game past the loading screen (the "Werewolf" title art) into the first cutscene
 (mostly-black background + text, 8-bit graphics).
 
+> **Note on `PROSPER_GUEST_FS=1`.** Two dated records below quote it as part of the environment they
+> were run in, and are left as they were run: it was the Linux opt-in gate for guest `%fs` TLS in July
+> 2026. Guest TLS became **on by default** in #825 (`4fd585ac`, 2026-07-17), with
+> `PROSPER_NO_GUEST_FS=1` as the opt-out, so the reproduction recipe no longer carries it. On current
+> master the token is inert on Linux and Windows; `PROSPER_GUEST_FS` is read only on macOS/Rosetta
+> (`src/host/guest_tls.cpp:46`, inside `#ifdef __APPLE__`). See #2095.
+
 ## What was fixed — `sceSystemServiceParamGetString` (committed)
 
 The single biggest blocker was a one-line HLE gap. `sceSystemServiceParamGetString` (NID `SsC-m-S9JTA`)
@@ -129,7 +136,7 @@ addresses → uncaught SIGSEGV).
 ## Reproduce
 ```sh
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_PREADLOG=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_PREADLOG=1 \
   ./build/boot_trace /path/to/PPSA24651-app0
 # watch resources.assets block offsets climb, then a main-thread SIGSEGV in the Il2cpp+0x49d1 chain.
 ```

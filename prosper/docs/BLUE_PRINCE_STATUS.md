@@ -14,7 +14,7 @@ resolved 2026-07-26); rung 4 needs the live oracle side-by-side plus families 4-
 Reaching the frame loop uses the standard gated switches:
 
 ```bash
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_IME_AUTOKEY=1 PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_IME_AUTOKEY=1 PROSPER_RENDER=1 \
   ./build-linux/screenshot <root>/PPSA25009-app0 --seconds 3 --count 650 --timeout 2000 --no-manifest
 ```
 

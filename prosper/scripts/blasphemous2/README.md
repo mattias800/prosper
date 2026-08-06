@@ -56,7 +56,6 @@ future vertex-buffer-backed RectList still needs general post-VS corner synthesi
 Capture one full-resolution PNG per second with:
 
 ```bash
-PROSPER_GUEST_FS=1 \
 PROSPER_GUEST_ARGS=-force-gfx-direct \
 PROSPER_PAD_SCRIPT=@scripts/blasphemous2/reach-first-gameplay.pad \
 ./build-linux/screenshot /path/PPSA13579-app0 \
@@ -104,7 +103,7 @@ Audio is verifiable without a human listening: `PROSPER_AUDIO_DUMP=<path>` recor
 output, so a run can be asserted on level/coverage.
 
 ```bash
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 PROSPER_VULKAN_LIB=libvulkan.so.1 PROSPER_AUDIO_DUMP=/tmp/t.raw \
 PROSPER_PAD_SCRIPT=@scripts/blasphemous2/title-screen-idle.pad \
   ./build-linux/prosper-app --dump <PPSA13579-app0>

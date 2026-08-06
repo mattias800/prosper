@@ -53,8 +53,8 @@ suggests:
   (EFLAGS.TF), `sigsetjmp` recovery, raw `SYS_write` inside handlers.
 - `perf_event_open` hardware break/watchpoints (`PROSPER_HWBP`/`PROSPER_HWWATCH`),
   `/proc/self/maps` classification.
-- Guest `%fs` TLS (`PROSPER_GUEST_FS`): per-thread guest TCB, base switched with
-  `rdfsbase`/`wrfsbase`; import stubs are hand-emitted x86 that swap `%fs` per HLE call.
+- Guest `%fs` TLS (on by default; opt out with `PROSPER_NO_GUEST_FS`): per-thread guest TCB, base
+  switched with `rdfsbase`/`wrfsbase`; import stubs are hand-emitted x86 that swap `%fs` per HLE call.
 - x86 machine-code emitters for import stubs; `int3` patching for `PROSPER_BP`.
 
 **HLE Linuxisms (small list):**
@@ -289,7 +289,8 @@ CPU a real guest fs base the way Linux (`wrfsbase`) and Windows (FSGSBASE + VEH 
 Solved by **trap-and-emulate**, settled by a spike: under Rosetta a guest `%fs:disp` access faults at
 linear address == the raw offset (fs base is 0), so the real target is simply `guest_TP + fault_addr`
 — no addressing-mode decode needed. Implementation:
-- `guest_tls.cpp` macOS "trap mode" (same `PROSPER_GUEST_FS` gate): build the per-thread Variant-II
+- `guest_tls.cpp` macOS "trap mode" (opt-in, and the one platform where `PROSPER_GUEST_FS` is read —
+  Linux/Windows are on by default): build the per-thread Variant-II
   guest TCB and store its thread pointer in host (`%gs`) TLS, but **do not** touch the CPU fs base.
 - `exec_image_linux.cpp` `try_emulate_fs_access`: in the SIGSEGV/SIGBUS handler, if the faulting
   instruction carries an `%fs` prefix and trap-mode TLS is active, redirect the access to

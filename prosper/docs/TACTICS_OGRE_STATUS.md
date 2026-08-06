@@ -47,7 +47,7 @@ placement.
 Use an FFmpeg installation with an HEVC decoder and the normal full-cadence renderer:
 
 ```bash
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_GUEST_ARGS=-force-gfx-direct \
 PROSPER_RENDER=1 \
   ./build-linux/screenshot <DUMP_ROOT>/PPSA03839-app0 \
   --seconds 1 --count 16 --timeout 25 --out ~/tactics-hevc

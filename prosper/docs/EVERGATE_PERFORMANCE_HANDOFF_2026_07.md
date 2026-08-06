@@ -155,7 +155,6 @@ ctest --test-dir prosper/build-linux --output-on-failure
 Run Evergate at native scale and full cadence from `prosper/`:
 
 ```sh
-PROSPER_GUEST_FS=1 \
 PROSPER_GUEST_ARGS=-force-gfx-direct \
 PROSPER_RENDER_EVERY=1 \
 PROSPER_RENDER_SCALE=1 \

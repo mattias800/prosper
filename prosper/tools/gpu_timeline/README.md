@@ -7,7 +7,6 @@ immutable replay capsule. Submit numbers are run-local. Vulkan warmup and render
 the selection.
 
 ```bash
-PROSPER_GUEST_FS=1 \
 PROSPER_GUEST_ARGS=-force-gfx-direct \
 PROSPER_GPU_TIMELINE=/tmp/dead-cells.prgtl \
 PROSPER_CAPTURE_TITLE=PPSA15552 \

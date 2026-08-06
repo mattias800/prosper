@@ -28,7 +28,7 @@ python3 tools/hle_calls/hle_calls.py --pid $(pgrep -x boot_trace) --ticks 400
 python3 tools/hle_calls/hle_calls.py --pid <pid> --filter '^s_'
 
 # cover INIT, and record what each handler answered rather than only that it ran
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_GUEST_ARGS=-force-gfx-direct \
 python3 tools/hle_calls/hle_calls.py --ticks 30 --values --filter '^s_' \
     --launch build-linux/boot_trace <DUMP_ROOT>/PPSA05325-app0
 ```

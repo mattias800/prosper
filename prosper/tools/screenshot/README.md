@@ -124,6 +124,11 @@ other titles set the appropriate env first, e.g. a UE4 title:
 PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1 screenshot /path/PPSA01885-app0
 ```
 
+`PROSPER_GUEST_FS=1` is named above because the tool really does set it, not because a run needs it:
+guest `%fs` TLS is **on by default** on Linux (since #825) and Windows (since #624), and is opted out
+of with `PROSPER_NO_GUEST_FS=1`. `PROSPER_GUEST_FS` is read only on macOS/Rosetta. Do not carry it
+into a new recipe (#2095).
+
 ## Example
 
 ```bash

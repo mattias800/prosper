@@ -18,7 +18,7 @@ logging/serialization perturbs the timing) and manifests on either the main thre
 ## How to reproduce
 
 ```
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_PAD_PRESS=1 \
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_PAD_PRESS=1 \
   ./boot_trace <dump>
 ```
 
