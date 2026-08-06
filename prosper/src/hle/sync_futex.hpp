@@ -78,6 +78,12 @@ bool interrupt_guest_wait(uint64_t thread);
 // unless PROSPER_SYNC_RING is set, and a no-op off Windows.
 void dump_guest_sync_trace(const char* path = nullptr);
 
+// Record a wake issued OUTSIDE this file -- notably sceKernelWakeByAddress, which calls
+// WakeByAddress* directly. Without this the ring sees waits but not the guest's own wakes, and every
+// address it wakes looks like an object nothing ever woke: an instrument that manufactures its own
+// findings. No-op unless PROSPER_SYNC_RING is set, and off Windows.
+void sync_ring_note_guest_wake(uintptr_t address, uint64_t count);
+
 // Read every Windows interruptible wait currently registered by a guest thread. Nested exception
 // delivery can retain more than one; callers must not claim an arbitrary slot is the current wait.
 // Returns the total validated count and stores up to capacity entries. Other hosts return zero.

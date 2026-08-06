@@ -61,7 +61,7 @@ struct CondSlot {
 // hottest paths in the emulator, and the failure it exists to diagnose is TIMING SENSITIVE, so an
 // instrument that serialises on stderr changes the answer. Off by default for the same reason.
 enum class SyncTraceKind : uint32_t { WaitEnter, WaitWake, Signal, Broadcast, Interrupt,
-                                      FutexWait, FutexWake };
+                                      FutexWait, FutexWake, GuestWake };
 
 struct SyncTraceEvent {
     std::atomic<uint64_t> published{0};
@@ -124,6 +124,7 @@ const char* sync_trace_kind_name(SyncTraceKind kind) {
         case SyncTraceKind::Interrupt: return "interrupt";
         case SyncTraceKind::FutexWait: return "futex-wait";
         case SyncTraceKind::FutexWake: return "futex-wake";
+        case SyncTraceKind::GuestWake: return "guest-wake";
     }
     return "?";
 }
@@ -596,6 +597,14 @@ void wake_label_waiters(uint64_t addr) {
     if (g_waiters.load(std::memory_order_seq_cst) == 0) return;
     futex_wake(addr, INT_MAX);
     futex_wake(addr + 4, INT_MAX);   // 64-bit labels: a waiter may block on the high dword too
+}
+
+void sync_ring_note_guest_wake(uintptr_t address, uint64_t count) {
+#ifdef _WIN32
+    sync_trace(SyncTraceKind::GuestWake, address, address, (uint32_t)count);
+#else
+    (void)address; (void)count;
+#endif
 }
 
 // PROSPER_SYNC_RING reader. Prints the retained events oldest-first. Safe to call while the guest

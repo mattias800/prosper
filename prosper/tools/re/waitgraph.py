@@ -42,7 +42,7 @@ EVENT_RE = re.compile(
     r"^\[sync-trace\] seq=(\d+) kind=(\S+)\s+tid=(\d+) pthread=(0x[0-9a-f]+) "
     r"object=(0x[0-9a-f]+) source=(0x[0-9a-f]+) value=(\d+)")
 
-WAKE_KINDS = ("signal", "broadcast", "interrupt", "futex-wake")
+WAKE_KINDS = ("signal", "broadcast", "interrupt", "futex-wake", "guest-wake")
 
 
 def main(paths):
@@ -73,8 +73,8 @@ def main(paths):
     for pthread, (kind, obj, source) in sorted(threads.items(), key=lambda kv: int(kv[0], 16)):
         if obj in last_wake:
             edges[pthread] = last_wake[obj][2]
-        elif kind == "address":
-            unrecorded.append((pthread, kind, obj, source))   # not instrumented; not a finding
+        elif kind == "address" and events_on[obj] == 0:
+            unrecorded.append((pthread, kind, obj, source))   # no events at all; not a finding
         else:
             roots.append((pthread, kind, obj, source, events_on[obj]))
 
