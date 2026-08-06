@@ -381,6 +381,19 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   reviewer posts approval on the corrected exact head. Address every blocking finding and re-review authored
   corrections, then merge only after the merge agent separately confirms author verification, reviewer approval
   where required, and green required CI.
+  - **A cited claim reads as a verified one — and reviewers' findings propagate hardest.** A review
+    finding carries more authority than the same sentence anywhere else: it has been *checked* by
+    definition, and attaching a `file:line` makes it look checked twice. So a **wrong** finding with a
+    citation is the most contagious kind of error this project produces. Worked example (#2049 → #2052):
+    a reviewer stated an inverted default with a file:line, and that citation is what made it credible
+    enough to travel unchallenged into a briefing, then a shipped code comment, then an author's own
+    verification comment, then roughly fifteen agent briefings — with **nobody opening the cited file at
+    any step**. It was `guest_tls.cpp:46`, which is the Apple-only branch; Linux is `:58`, opt-**out**,
+    default **enabled**.
+    **So: check a claim against the source, never against anything downstream of the thing being
+    checked.** Opening the cited file and running one `grep -rn 'getenv("…")' prosper/src` is the whole
+    defence, and it is two commands. This binds on reviewers most of all — when you cite a line, you are
+    asserting you read it.
   - **How a verdict is expressed and detected — this is mechanical, and getting it wrong has merged a rejected
     PR.** The reviewer posts one or more **registered reviews** with `gh pr review <N> --comment --body '…'`,
     each stating a verdict as a literal **`APPROVED`** or **`REJECTED`** in the body. The author reads the
