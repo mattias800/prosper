@@ -98,6 +98,18 @@ namespace {
     // trustworthy way to inspect deep crashes (e.g. the null std::ctype facet at eboot+0x3b5ea6).
     bool g_faultmem = false;
     bool g_faultlog = false;
+    // #1944: PROSPER_LAZY_COMMIT_STRICT=1 declines to back a reserved-but-uncommitted page, so the
+    // SIGSEGV reports at the LOADING instruction with the real faulting address instead of handing
+    // the guest a zero and reporting the dereference of that zero one instruction later. Read once
+    // at install time — getenv() is not async-signal-safe. Default OFF: the normal boot keeps the
+    // lazy commit, which several titles depend on to get past their allocator bring-up.
+    bool g_lazy_commit_strict = false;
+    // Whole-run census (#1944). ATOMIC, not `volatile sig_atomic_t`: this handler runs on every
+    // guest thread, and the ordinal now backs the claim "exactly one lazy-commit event per affected
+    // run" — a non-atomic read-modify-write could lose an increment and turn two events into one,
+    // which is precisely the statement being made. Relaxed is enough (a counter, not a fence) and
+    // `fetch_add` on a lock-free atomic is async-signal-safe.
+    std::atomic<unsigned> g_lazy_commit_events{0};
     bool g_int41_skip = true;   // guest int $0x41 (RAGE debugbreak) -> skip; PROSPER_NO_INT41_SKIP disables (#1138)
     // Probe pipe for probe_readable() below — a pipe write imports the source pages (EFAULT on
     // unmapped memory) where a /dev/null write does not. O_NONBLOCK so a full pipe can never
@@ -1925,17 +1937,57 @@ namespace {
             uint64_t a = (uint64_t)si->si_addr;
             if (a >= 0x1000000000ull && prosper_reserved_range_state(a) == 1) {
                 void* page = (void*)(a & ~(uint64_t)0xffff);
-                bool ok = mmap(page, 0x10000, PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page;
-                char b[128]; auto* uc2 = (ucontext_t*)uctx;
-                int n = snprintf(b, sizeof b, "[lazy-commit] %s page=0x%llx rip=0x%llx\n",
-                                 ok ? "mapped" : "MMAP-FAILED", (unsigned long long)(uint64_t)(uintptr_t)page,
-                                 (unsigned long long)PROSPER_GREGS(uc2)[REG_RIP]);
+                auto* uc2 = (ucontext_t*)uctx;
+                // #1944: the line used to carry only the 64 KiB page and the rip, which is why a
+                // masked wild READ was indistinguishable from a lost commit. Report the exact
+                // faulting address, whether the access was a read or a write (x86 page-fault error
+                // code bit 1), and a running ordinal so the whole-run population is visible without
+                // an atexit summary (the worker-fault path calls _exit()).
+                const bool is_write = (PROSPER_REG_ERR(uc2) & 2) != 0;
+                const unsigned ord =
+                    g_lazy_commit_events.fetch_add(1, std::memory_order_relaxed) + 1u;
+                // #1226 tell: a faulting address that lands in the FIRST 64 KiB PAGE of a heap
+                // pointer's high half is not a page the guest ever populated — it is a pointer that
+                // lost its low dword (a 4-byte immediate-zero init, or any other sub-qword write)
+                // and then took a small structure offset. ArcRunner's terminal `addr=(nil)` fault
+                // dereferences `rdi=0x2100000001` and faults at `rdi+0x40` = `0x2100000041`.
+                //
+                // Test the PAGE, not the address. An earlier form tested `(uint32_t)a <= 1` and was
+                // therefore INERT on the exact case it was written for — `0x41` is not `<= 1` — a
+                // marker that could never fire on its own founding evidence. Every `0x21000000xx`
+                // value lands in page `0x2100000000`, which is the same argument the doc makes for
+                // why two different guest sites appear to first-touch one page, so the page is the
+                // right granularity. The enclosing block already requires `a >= 0x1000000000`, so
+                // no separate high-half test is needed.
+                const bool forged_shape = ((uint32_t)a) <= 0xffffu;
+                bool ok = false;
+                if (!g_lazy_commit_strict)
+                    ok = mmap(page, 0x10000, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page;
+                // 320, not 256: the worst-case line is ~228 bytes (max ordinal + two 16-digit
+                // addresses + rip + the FORGED-PTR-SHAPE suffix), and `n` is used unclamped as the
+                // raw_write length below — a suffix edit that pushed past the buffer would make
+                // snprintf return the would-be length and turn the write into an over-read.
+                char b[320];
+                int n = snprintf(b, sizeof b,
+                                 "[lazy-commit] #%u %s page=0x%llx addr=0x%llx access=%s rip=0x%llx%s\n",
+                                 ord,
+                                 g_lazy_commit_strict ? "DECLINED(strict)"
+                                                      : (ok ? "mapped" : "MMAP-FAILED"),
+                                 (unsigned long long)(uint64_t)(uintptr_t)page,
+                                 (unsigned long long)a, is_write ? "write" : "read",
+                                 (unsigned long long)PROSPER_GREGS(uc2)[REG_RIP],
+                                 forged_shape ? "  FORGED-PTR-SHAPE(low-dword<=0xffff: a truncated pointer, "
+                                                "not a page the guest populated; see #1226)" : "");
                 // raw_write (raw_syscall.hpp), NOT glibc write() OR syscall(): this handler can run on a
                 // thread whose %fs is the GUEST TCB (PROSPER_GUEST_FS). glibc write()'s cancellation
                 // prologue reads the TCB through %fs, and even glibc's syscall() wrapper stores errno
                 // via %fs on write failure — either is a nested SIGSEGV inside the handler that killed
                 // the process (the UE4 boot's silent exit-139; #1071/#1075).
+                // Clamp: snprintf returns the length it WOULD have written, so an unclamped `n`
+                // after truncation reads past the buffer.
+                if (n < 0) n = 0;
+                if ((size_t)n > sizeof b - 1) n = (int)(sizeof b - 1);
                 raw_write(2, b, (uint64_t)n);
                 if (ok) return;   // re-execute against the now-backed page
             }
@@ -2942,6 +2994,19 @@ void install_trap_handler() {
         arm_hwwatch(addr);
     };
     g_faultlog = getenv("PROSPER_FAULTLOG") != nullptr;
+    // #1944 discriminator, default OFF (see the declaration): decline the lazy commit so the fault
+    // reports at the loading instruction with the real address. A malformed value is refused LOUDLY
+    // — `PROSPER_LAZY_COMMIT_STRICT=yes` silently parsing to OFF would make an unarmed run
+    // indistinguishable from one where the commit legitimately never fired.
+    if (const char* s = getenv("PROSPER_LAZY_COMMIT_STRICT")) {
+        char* end = nullptr;
+        const long parsed = strtol(s, &end, 0);
+        if (end == s || (end && *end))
+            fprintf(stderr, "[lazy-commit] NOT ARMED: PROSPER_LAZY_COMMIT_STRICT='%s' is not a "
+                            "number — the lazy commit stays enabled\n", s);
+        else
+            g_lazy_commit_strict = parsed != 0;
+    }
     g_skip_null_companion = getenv("PROSPER_SKIP_NULL_COMPANION") != nullptr;
     g_null_page = getenv("PROSPER_NULL_PAGE") != nullptr;
     g_watch_companion = getenv("PROSPER_WATCH_COMPANION") != nullptr;

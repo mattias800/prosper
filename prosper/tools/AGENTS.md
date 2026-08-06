@@ -165,6 +165,47 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     an exact terminal census from this bounded dense prefix. Combine it with
     `PROSPER_INIT_SUPPRESS=ptr` for the decisive landed-forges-zero plus init-suppressed arm. A
     malformed selector prints `NOT ARMED` rather than silently becoming a negative result.
+
+    **`PROSPER_FORGE_TRIP=1` now reports which address window matched, and its own totals.** The
+    forge-shape test is split in two: the *decision* predicate the default guards use (a DOLL-era
+    window that stops at `0x2100000000`) and the *report* predicate a census must use (prosper's
+    whole guest-VA window). Each `FORGE-STOMP` line carries `window=narrow` — a guard can see and
+    possibly decline this write — or `window=wide-only` — no guard is reachable for it at all — plus
+    a running `FORGE-TRIP-TOTALS seen=… narrow=… wide_only=…`. Without the split a census silently
+    measures the *predicate* instead of the title: ArcRunner's arena is `[0x2000000000,0xa000000000)`
+    and its terminal fault dereferences `0x2100000001`, one byte above the narrow bound, so "how many
+    forges are there" could not be asked at all. **A `wide_only=0` is now a real negative**; before
+    the split it was unobtainable. `PROSPER_PTRLIKE_WIDE=1` additionally arms **both** guards (the forge
+    branch and the `REL1-LIVE` branch) over the wide window — default OFF on purpose, because
+    `rel1_stomp_guard()` is default-ON and widening it is an unmeasured suppression over 500 GiB of
+    addresses on every title at once. It announces itself, since an A/B lever that cannot show it
+    moved turns a hard negative into a void result:
+    ```text
+    [agc] PTRLIKE-WIDE ARMED: guard window [0x1000000000,0xa000000000) (narrow default was …)
+    [agc] PTRLIKE-WIDE NOT ARMED: PROSPER_PTRLIKE_WIDE='yes' is not a number — guards keep the narrow window
+    ```
+    Pair it with a positive control before quoting a zero: `report_suspect_write()` emits nothing at
+    all on some titles (ArcRunner, nine runs), and an emitter that never fires cannot distinguish
+    "no such write happened" from "this diagnostic is not reachable here".
+  - **Is an `addr=(nil)` fault the guest's, or ours?** **`PROSPER_LAZY_COMMIT_STRICT=1`** (#1944).
+    prosper backs a guest touch of a reserved-but-uncommitted VA with 64 KiB of anonymous zeros and
+    resumes. When the faulting access is a *read of a pointer field* the guest gets a zero and
+    dereferences it on the next instruction, so the fault report names the **dereference** site and a
+    register **prosper itself set to 0** — which reads exactly like a guest object-lifetime bug.
+    Strict mode declines the commit, so the SIGSEGV reports at the *loading* instruction with the
+    real faulting address. The default-path line is also fail-visible now:
+    ```text
+    [lazy-commit] #1 mapped page=0x2100000000 addr=0x2100000041 access=read rip=0x…  FORGED-PTR-SHAPE(low-dword<=0xffff: …)
+    [lazy-commit] #1 DECLINED(strict) page=0x2100000000 addr=0x2100000041 access=read rip=0x…  FORGED-PTR-SHAPE(low-dword<=0xffff: …)
+    ```
+    The ordinal is a whole-run census (the worker-fault path `_exit()`s, so no atexit summary can
+    run), `access=` comes from the x86 page-fault error code, and `FORGED-PTR-SHAPE` marks a faulting
+    address in the **first 64 KiB page** of a heap pointer's high half — i.e. a pointer that lost its
+    low dword and then took a small structure offset, not a page the guest ever populated. Test the
+    page, not the address: the founding case faults at `rdi+0x40` = `0x2100000041`, so a
+    `low dword <= 1` form of this marker would have been inert on its own evidence. **A repeated page is not evidence of a
+    lost mapping**: every `0x21000000xx` pointer lands in page `0x2100000000`, which is why two
+    different guest sites appeared to "first-touch the same page".
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
   `--seconds 1` for wall-clock sampling, warmup or `--render-every N --render-every-for-seconds S`
   for slow software rendering,
