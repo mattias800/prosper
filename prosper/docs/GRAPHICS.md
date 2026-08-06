@@ -676,6 +676,24 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   and its resources are unaffected — which is why a capture is still the right instrument for "what
   did the guest submit" — but do not compare a capture run's *renderer* behaviour, target residency
   or publish provenance against a default run. #1968.
+- **A `0x0` native pass extent does not occur in practice — do not reach for MRT-prefix truncation to
+  explain a missing colour attachment.** The renderer truncated the prefix whenever a bound slot's
+  extent differed from MRT0's, and `native_w`/`native_h` are `0` whenever the guest's
+  `CB_COLOR0_ATTRIB2` was never seen, so any real MRT1 compared unequal against `0` and was dropped
+  with nothing logged (#2114). A per-pass census over **17 titles and ~72,900 passes** found **zero**
+  passes at `native=0x0` and **zero** truncations of any kind — while five of those titles bind 464
+  real MRT1 attachments, so the path is genuinely exercised rather than merely absent. The defect is
+  **latent, not active**: it was closed as a guard, and no title's rendering changed.
+  **Those zeros are only readable because the detector was proved able to report non-zero.** Forcing
+  `native_w`/`native_h` to 0 at the MRT decision moved the counter `0 -> 2,030` and collapsed
+  *rendered* MRT1 attachments `206 -> 0` under the old predicate, against `206` under the fix.
+  Without that arm a census reporting zero is void, not negative.
+  **Bound on the instrument, and it is the part worth inheriting:** `PROSPER_RTTLOG` is itself in the
+  `live_gpu_targets` disable list — same family as the `PROSPER_GPU_CAPTURE` entry above — so this
+  census ran the CPU-render path, not the default persistent-GPU-target route. No input to the
+  truncation decision depends on that flag, so the `native=0x0` and truncation counts stand; but the
+  forced arm never exercised the GPU-side cost of *keeping* an attachment, which is argued from the
+  extent-keyed target cache rather than measured. #2114 / #2127.
 
 ## Recommended implementation order
 
