@@ -16,6 +16,8 @@
 #include "host/exec_image.hpp"
 #include "gpu/videoout_present.hpp"
 #include "gpu/gpu_execute.hpp"      // guest_readable (safe pointer probe for the diagnostic dumps)
+#include "gpu/tile.hpp"             // de-swizzle a TILE-mode scanout into a linear image
+#include "host/guest_memory_map.hpp" // guest_readable_mapping_containing (real over-read proof)
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
@@ -25,9 +27,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <algorithm>
 #include <thread>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace prosper {
 
@@ -163,6 +167,13 @@ namespace {
         uint64_t buffer_addr[16] = {0};   // guest GPU-VA of each registered framebuffer
         uint8_t  buffer_set[16] = {0};    // set_index + 1; zero means the slot is unregistered
         uint64_t buffer_generation[16] = {0};
+        // Guest-authorship evidence, per registered slot. `buffer_digest` is a cheap content
+        // fingerprint sampled at the instant the guest registered the buffer; `buffer_authored`
+        // latches once the contents are seen to differ from it. See videoout_content_digest and
+        // videoout_buffer_authored_locked for why "not all bytes are zero" is NOT a substitute.
+        uint64_t buffer_digest[16] = {0};
+        uint8_t  buffer_digest_valid[16] = {0};
+        uint8_t  buffer_authored[16] = {0};
         uint64_t next_generation = 0;
         int      front_index = -1;
         uint64_t front_generation = 0;
@@ -227,6 +238,102 @@ bool videoout_buffer_bytes(const VideoOutBufferSnapshot& buffer, size_t& bytes) 
     const uint64_t pixels = (uint64_t)buffer.width * buffer.height;
     if (pixels > SIZE_MAX / 4) return false;
     bytes = (size_t)pixels * 4;
+    return true;
+}
+
+// ---- Guest authorship of a registered scanout ----------------------------------------------------
+//
+// The question this answers is "did the GUEST write this display buffer, or is prosper looking at
+// whatever previously occupied this memory?" — and it is the load-bearing precondition for
+// publishing a flipped buffer's own contents (live_renderer.cpp / guest_scanout_present.hpp).
+//
+// The obvious proxy, "not all bytes are zero", is wrong and was the blocking finding that reverted
+// #2026 (#2044, review finding B2). It holds only while a newly registered buffer is guaranteed to
+// be freshly zeroed memory. A title that re-registers scanouts over REUSED memory — Bendy and the
+// Ink Machine (PPSA27616) re-registers constantly — hands back a buffer full of unrelated bytes
+// that passes `any_of(b != 0)` trivially, and prosper's own render-target map misses it precisely
+// BECAUSE the address is new. The result would be publishing stale garbage in place of the retained
+// good frame: a wrong frame where the previous behaviour was a correct-but-stale one, which is
+// #1990's failure class arriving through a new door.
+//
+// The real test is differential: fingerprint the buffer when the guest registers it, and require
+// the contents to have CHANGED since. That is the only in-process evidence of authorship available
+// — prosper does not observe guest CPU stores — and it fails in the safe direction in every case it
+// gets wrong:
+//   * baseline unreadable at registration -> no baseline -> "not authored" -> decline;
+//   * the guest writes a frame byte-identical to the registration content -> "not authored" ->
+//     decline and serve the retained frame, which is visually the same image;
+//   * the guest writes only a region no sample point covers -> "not authored" -> decline.
+// The one direction it must never get wrong — calling untouched reused memory "authored" — requires
+// the stale contents to collide with the fingerprint of the same range taken moments earlier, i.e.
+// to be unchanged, which is exactly the case that should decline.
+//
+// Sampling rather than hashing the whole surface keeps this affordable: a 4K scanout is 33 MB and
+// this runs per guest flip. kDigestSamples evenly spaced 8-byte words span the entire range, so any
+// full-surface composite changes essentially all of them.
+constexpr int kDigestSamples = 4096;
+
+uint64_t videoout_content_digest(uint64_t address, size_t bytes) {
+    uint64_t hash = 0xcbf29ce484222325ull ^ (uint64_t)bytes;   // FNV-1a offset basis, salted by size
+    auto mix = [&hash](uint64_t word) {
+        hash ^= word;
+        hash *= 0x100000001b3ull;
+    };
+    const auto* base = reinterpret_cast<const uint8_t*>((uintptr_t)address);
+    if (bytes < sizeof(uint64_t)) {
+        for (size_t i = 0; i < bytes; ++i) mix(base[i]);
+        return hash;
+    }
+    const size_t span = bytes - sizeof(uint64_t);
+    for (int i = 0; i < kDigestSamples; ++i) {
+        // Evenly spaced across the WHOLE range including its last word, computed in 64-bit so the
+        // multiply cannot overflow for a 4K surface.
+        const size_t offset = (size_t)((uint64_t)span * (uint64_t)i / (uint64_t)(kDigestSamples - 1));
+        uint64_t word = 0;
+        std::memcpy(&word, base + offset, sizeof word);
+        mix(word);
+    }
+    return hash;
+}
+
+// Seed the authorship baseline for a slot the guest has just registered. Requires the registry lock.
+// The readability probe is what makes this safe to run on every registration of every title: an
+// address prosper cannot vouch for is left without a baseline, and a buffer without a baseline
+// never counts as authored.
+//
+// LOAD-BEARING INVARIANT: the byte range digested here must be the SAME range
+// videoout_buffer_authored_locked digests later. The digest is salted by `bytes` and its sample
+// offsets are derived from `bytes`, so a size drift between seed and compare changes the hash
+// without the contents changing — manufacturing a false POSITIVE, which is the one direction this
+// mechanism must never fail in. It holds because both sides compute width*height*4 from the same
+// `DisplayConfig::SetConfig`: a set is whole-assigned only at register (guarded against an occupied
+// slot) and cleared at unregister, so the geometry is immutable for the life of a generation, and
+// SetBufferAttribute(2) writes the caller's struct rather than the registry. Anything that makes a
+// registered set's dimensions mutable breaks this and must re-seed the baseline.
+void videoout_seed_authorship_locked(int slot, uint64_t address, uint32_t width, uint32_t height) {
+    g_display.buffer_digest[slot] = 0;
+    g_display.buffer_digest_valid[slot] = 0;
+    g_display.buffer_authored[slot] = 0;
+    const uint64_t pixels = (uint64_t)width * height;
+    if (!address || !pixels || pixels > UINT32_MAX / 4) return;
+    const uint32_t bytes = (uint32_t)(pixels * 4);
+    if (!gpu::guest_readable(address, bytes)) return;
+    g_display.buffer_digest[slot] = videoout_content_digest(address, bytes);
+    g_display.buffer_digest_valid[slot] = 1;
+}
+
+// True when this buffer's contents have been observed to differ from its registration baseline.
+// Sticky, so a title whose frame N happens to match the baseline does not lose authorship it has
+// already demonstrated. Requires the registry lock.
+bool videoout_buffer_authored_locked(const VideoOutBufferSnapshot& buffer, size_t bytes) {
+    const int slot = buffer.buffer_index;
+    if (slot < 0 || slot >= 16) return false;
+    if (g_display.buffer_generation[slot] != buffer.generation) return false;
+    if (g_display.buffer_authored[slot]) return true;
+    if (!g_display.buffer_digest_valid[slot]) return false;
+    if (videoout_content_digest(buffer.address, bytes) == g_display.buffer_digest[slot])
+        return false;
+    g_display.buffer_authored[slot] = 1;
     return true;
 }
 } // namespace
@@ -300,6 +407,114 @@ size_t videoout_copy_front_buffer(void* dst, size_t dst_cap, VideoOutBufferSnaps
     if (metadata) *metadata = current;
     return bytes;
 }
+
+namespace {
+// Is it safe to read the swizzle footprint's TAIL — the bytes past width*height*4?
+//
+// For a tiled surface the footprint is larger than the nominal image, and those extra bytes are not
+// bottom padding: they hold real texels of the last block row, so truncating the read visibly costs
+// the bottom-right of the picture (measured on a 3840x2160 scanout, the bottom-right 1024x48 drops
+// to half its non-black pixels). Reading them has to be EARNED, and two independent facts are
+// required because each covers the other's blind spot:
+//
+//   1. The guest's own registration. A VideoOut set's buffers are one surface apart, so the
+//      smallest positive distance between two registered addresses is a lower bound on what each of
+//      them owns. Fewer than two registered buffers proves nothing about what follows the last one.
+//   2. One registered guest mapping contains the whole padded range. Fact 1 alone is satisfied by
+//      two buffers allocated SEPARATELY that merely happen to land far apart while each owns only
+//      width*height*4 — at 4K that is a ~240 KiB silent over-read into an unrelated object. The
+//      page probe (`gpu::guest_readable`) cannot rule that out either: it answers "are these pages
+//      mapped", and an adjacent mapping passes. `guest_readable_mapping_containing` answers the
+//      strictly stronger question — does ONE registered mapping span the entire range — which is
+//      what the claim actually needs. (#2026 review, finding N2.)
+//
+// Requires the registry lock.
+bool videoout_footprint_provable_locked(const VideoOutBufferSnapshot& current, size_t tiled_bytes) {
+    if (!tiled_bytes || current.address > UINT64_MAX - tiled_bytes) return false;
+    uint64_t stride = UINT64_MAX;
+    for (int i = 0; i < 16; ++i) {
+        if (!g_display.buffer_set[i] || !g_display.buffer_addr[i]) continue;
+        for (int j = i + 1; j < 16; ++j) {
+            if (!g_display.buffer_set[j] || !g_display.buffer_addr[j]) continue;
+            const uint64_t a = g_display.buffer_addr[i], b = g_display.buffer_addr[j];
+            const uint64_t d = a > b ? a - b : b - a;
+            if (d) stride = std::min(stride, d);
+        }
+    }
+    if (stride == UINT64_MAX || stride < tiled_bytes) return false;
+    host::GuestReadableRange mapping{};
+    return host::guest_readable_mapping_containing(current.address, current.address + tiled_bytes,
+                                                   mapping);
+}
+} // namespace
+
+// Read the flipped scanout as an IMAGE rather than as bytes: copy its guest memory and de-swizzle it
+// according to the tiling mode the guest registered with it, so `out.pixels` is always linear
+// width*height*4 RGBA.
+//
+// The three copies above are deliberately raw — they are the "hand me those bytes" primitive, and a
+// diagnostic that dumps guest memory wants exactly that. Every consumer that treats the result as
+// PIXELS needs this one instead. A TILE-mode scanout read linearly is horizontal-band noise, which
+// is what prosper published for such titles before #1968: the registry had recorded the tiling mode
+// all along and no reader consulted it.
+//
+// The work is split so that only what MUST be under the registry lock is: sceVideoOutSubmitFlip
+// takes the same lock, so every byte touched inside it is a byte the guest's own flip path waits on.
+// Allocating and zeroing the staging buffer (33 MB for a 4K scanout) happens unlocked; the lock
+// covers the copy — which cannot leave it, because the lease is what stops UnregisterBuffers
+// freeing the backing mid-read — plus the cheap registration re-check and the authorship digest.
+// The re-check is not ceremony: the geometry read in phase 1 sizes the buffer, and a flip or a
+// re-registration in between would otherwise let a differently shaped surface be copied into it.
+//
+// `bytes_per_texel` is 4 throughout, which is the same assumption videoout_buffer_bytes already
+// makes for every registered surface; videoout_scanout_tile_mode fails closed for anything else, so
+// a future non-32-bpp display format degrades to the straight copy rather than mis-de-swizzling.
+bool videoout_read_front_linear(VideoOutLinearRead& out) {
+    out = VideoOutLinearRead{};
+
+    VideoOutBufferSnapshot meta;
+    size_t linear_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_display_mx);
+        if (!videoout_front_snapshot_locked(meta) || !videoout_buffer_bytes(meta, linear_bytes))
+            return false;
+    }
+    const uint32_t tile_mode = gpu::videoout_scanout_tile_mode(meta.tiling_mode, 4);
+    const bool tiled = gpu::tile_mode_is_tiled(tile_mode);
+    const size_t footprint =
+        tiled ? gpu::tiled_surface_bytes(meta.width, meta.height, tile_mode, 0, 4) : linear_bytes;
+    if (footprint < linear_bytes) return false;
+
+    std::vector<uint8_t> raw(footprint, 0);
+
+    {
+        std::lock_guard<std::mutex> lk(g_display_mx);
+        VideoOutBufferSnapshot current;
+        if (!videoout_front_snapshot_locked(current) || current.address != meta.address ||
+            current.generation != meta.generation || current.width != meta.width ||
+            current.height != meta.height || current.tiling_mode != meta.tiling_mode)
+            return false;
+        size_t read_bytes = linear_bytes;
+        if (footprint > linear_bytes && videoout_footprint_provable_locked(current, footprint)) {
+            read_bytes = footprint;
+            out.padded_footprint = true;
+        }
+        std::memcpy(raw.data(), reinterpret_cast<const void*>((uintptr_t)current.address),
+                    read_bytes);
+        out.guest_authored = videoout_buffer_authored_locked(current, linear_bytes);
+    }
+
+    out.metadata = meta;
+    if (!tiled) {
+        raw.resize(linear_bytes);
+        out.pixels = std::move(raw);
+        return true;
+    }
+    out.pixels.assign(linear_bytes, 0);
+    gpu::detile_surface(out.pixels.data(), raw.data(), meta.width, meta.height, tile_mode, 0, 4);
+    return true;
+}
+
 namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; return v; } }
 // Implemented in hle_kernel_time.cpp (the equeue backend). Register a flip/vblank event source so the
 // ~60 Hz pump posts events into the given equeue; the game's WaitEqueue then returns them.
@@ -678,6 +893,8 @@ HLE(g_vo_register_buffers) {  // a0=handle a1=start a2=addresses a3=buffer_num a
         uint64_t generation = ++g_display.next_generation;
         if (generation == 0) generation = ++g_display.next_generation;
         g_display.buffer_generation[start + i] = generation;
+        videoout_seed_authorship_locked(start + i, g_display.buffer_addr[start + i],
+                                        config.width, config.height);
     }
     if (g_display.buffer_num < start + num) g_display.buffer_num = start + num;
     g_display.configured = true;
@@ -726,6 +943,8 @@ HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a
         uint64_t generation = ++g_display.next_generation;
         if (generation == 0) generation = ++g_display.next_generation;
         g_display.buffer_generation[start + i] = generation;
+        videoout_seed_authorship_locked(start + i, g_display.buffer_addr[start + i],
+                                        config.width, config.height);
     }
     if (g_display.buffer_num < start + num) g_display.buffer_num = start + num;
     g_display.configured = true;
@@ -766,6 +985,12 @@ HLE(g_vo_unregister_buffers) {
             g_display.buffer_set[i] = 0;
             g_display.buffer_addr[i] = 0;
             g_display.buffer_generation[i] = 0;
+            // Authorship is evidence about ONE registration. A slot registered again — even at the
+            // same address — starts with no baseline and no latched write, so the next
+            // registration's stale contents cannot inherit the previous one's authorship.
+            g_display.buffer_digest[i] = 0;
+            g_display.buffer_digest_valid[i] = 0;
+            g_display.buffer_authored[i] = 0;
         }
     }
     if (!found)

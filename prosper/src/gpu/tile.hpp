@@ -37,6 +37,43 @@ size_t linear_sampled_surface_bytes(uint32_t width, uint32_t height, uint32_t by
 // True if `tile_mode` denotes a swizzled layout that detile_surface will de-swizzle.
 bool tile_mode_is_tiled(uint32_t tile_mode);
 
+// libSceVideoOut's own two-value tiling enum, as passed to sceVideoOutSetBufferAttribute(2) and
+// recorded with each registered display buffer. It is NOT a GFX10 swizzle index: it only says
+// whether the scanout surface is stored in the hardware's render-target layout or row-major.
+inline constexpr uint32_t kVideoOutTilingModeTile   = 0;
+inline constexpr uint32_t kVideoOutTilingModeLinear = 1;
+
+// Map a registered scanout's VideoOut tiling mode to the GFX10 swizzle its bytes are actually in, so
+// the flipped buffer can be read as an image. TILE on Gen5 means the render-target 64 KiB swizzle
+// with the pipe XOR (SW_64KB_R_X) — the layout CB writes and the one a compute dispatch writing the
+// display buffer produces.
+//
+// Evidence (#1968): Sonic Frontiers (PPSA03831) registers tiling_mode=0 (TILE) for a 3840x2160
+// 32-bpp scanout, and the raw bytes of its flipped buffer de-swizzle under SW_64KB_R_X into exact,
+// recognizable frames (the SEGA logo at flip 60 and an intro shot at flip 180); read linearly the
+// same bytes are horizontal-band noise, and no other supported mode resolves them. Before this the
+// display buffer was memcpy'd out untouched even though the registry had recorded its tiling mode.
+// CONFIDENCE: MED — one title, two frames, 32 bpp only.
+//
+// **The TILE value is load-bearing in one direction, deliberately.** `kVideoOutTilingModeTile` is 0,
+// and `DisplayConfig::SetConfig::tiling_mode` also defaults to 0, so "the guest asked for TILE" and
+// "no attribute was parsed, or it was parsed at the wrong offset" are the SAME input here. Every
+// other value fails closed to the historical straight copy; this one value fails open into a
+// de-swizzle.
+//
+// The mitigation is not in this function, and it is NOT uniform across callers — be precise about
+// which one you are reading. Only the live renderer's last-resort branch additionally proves the
+// guest wrote the buffer before publishing from it (`guest_scanout_present.hpp`), so there a
+// mis-parsed attribute on an untouched buffer cannot reach the screen. `present_snapshot`'s
+// RawScanout path and `present_readback`'s fallback consume the same de-swizzled pixels with **no**
+// authorship gate — they are the pre-renderer boot path, where the alternative is showing nothing at
+// all. If a title ever reads as band noise where it used to read as an image, suspect this default
+// first.
+//
+// Returns TileMode::Linear (0) for LINEAR and for anything unrecognized or not 4 bytes/texel, which
+// reproduces the historical straight copy rather than guessing at a geometry nothing has verified.
+uint32_t videoout_scanout_tile_mode(uint32_t videoout_tiling_mode, uint32_t bytes_per_texel);
+
 // Byte size of the TILED surface for `tile_mode` — for swizzled modes the dimensions are padded up
 // to whole 4KB micro-tiles, whose texel size depends on bytes_per_texel (a tile is a FIXED 4096
 // bytes: 32x32 at 4 B, 64x32 at 2 B, 64x64 at 1 B — #119), so the tiled buffer is larger than

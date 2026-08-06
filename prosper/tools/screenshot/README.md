@@ -55,7 +55,7 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
 | `--max-stale-seconds S` | unset | Fail if one source publication is reused longer than S seconds |
 | `--min-pixel-distinct-frames N` | 0 | Fail unless at least N samples differ from the preceding PNG |
 | `--max-pixel-stale-seconds S` | unset | Fail if identical pixels persist longer than S seconds, even across new publications |
-| `--require-composited-frame` | off | Fail if every PNG came from raw guest scanout fallback |
+| `--require-composited-frame` | off | Fail unless prosper composited at least one PNG — a raw guest-scanout fallback or a republished guest scanout does not count |
 | `--min-present-count N` | 0 | Fail unless a captured sample reaches guest flip N |
 | `--min-frame-seq N` | 0 | Fail unless a captured sample reaches rendered-frame N |
 | `--require-crc32 N` | unset | Fail unless a sample has this RGBA CRC32 (decimal or `0xHEX`) |
@@ -66,7 +66,10 @@ Directory-creation and PNG write failures include the failing path and operating
 Every normal run writes a JSONL manifest beside its PNGs. Each sample records the atomic present-source
 identity, guest flip count, rendered-frame sequence, dimensions, CRC32, distinct RGB color count,
 non-black pixel count, a 16x9 luminance signature, and standard 64-bit average/difference hashes,
-capture source, elapsed time, input route, and whether the source advanced or was stale. The color
+capture source, elapsed time, input route, and whether the source advanced or was stale. `source` is
+one of `composited` (prosper rendered it), `guest_scanout` (prosper rendered nothing for that flip
+and republished the guest's own display buffer — see `docs/GRAPHICS.md`), or `raw_scanout` (read
+straight out of guest memory before any renderer frame existed). The color
 count and signatures are computed from the visible presented RGBA result (including alpha) and support scene-collapse,
 coverage, and SSIM likeness guards without decoding the PNG again. The hashes and CRC32 remain useful
 diagnostics, but are not sufficient likeness oracles by themselves. A final summary records distinct-frame and
