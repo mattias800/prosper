@@ -204,6 +204,39 @@ uint32_t inline_float_f16_bits(int code) {
     }
 }
 
+// The 32-bit dword an inline constant places on the source bus when the consuming operand is
+// 16 bits wide. Hardware materializes the constant at the OPERAND's width and leaves the rest of
+// the dword ZERO, so the packed operand is simply that dword: an inline FLOAT contributes its
+// documented f16 encoding in [15:0] and 0 in [31:16] — it is NOT duplicated into the high half —
+// while an inline INT is its sign-extended two's-complement dword, which is why `-1` legitimately
+// reads 0xffff in BOTH halves but `1` reads 0 in the high one. A half select (VOP3P OPSEL /
+// OPSEL_HI, VOP3 OPSEL) therefore applies to an inline constant exactly as it does to a register:
+// it is NEVER a no-op. Returns false when `o` is not an inline constant.
+//
+// VERIFIED (llvm-mc gfx1030 literal folding, both directions — #2119):
+//   `v_pk_add_f16 v0, 0x00003c00, v1` canonicalizes to `v_pk_add_f16 v0, 1.0, v1`, while
+//   `0x3c003c00` stays a 32-bit literal. The fold is value-preserving, so inline `1.0` IS
+//   0x00003c00 in a packed f16 operand. The integer side rules out "the assembler simply never
+//   folds packed literals": 0x00000001 folds to `1` and 0xffffffff to `-1`, but 0x00010001 does
+//   not fold. Identical on gfx1010/1030/1100/1200 — there is NO gfx10-vs-gfx11 split here, and
+//   #2119 was filed supposing one. The ISA is consistent with this and states no replication
+//   rule: VOP3P pseudocode simply reads S0[31:16] for the high result, and the inline-constant
+//   table gives a half-precision constant as a 16-bit pattern ("half: 0x3118"). CONFIDENCE: HIGH.
+//
+// Three f16 paths used to hardcode the LOW half here and call the select a no-op; kernels
+// 32r14a/b/c in test_rdna2_to_spirv pin the high-half value each one now reads.
+bool inline_16bit_operand_dword(const Operand& o, uint32_t& out) {
+    if (o.kind == OperandKind::InlineFloat) {
+        out = inline_float_f16_bits(o.value);
+        return true;
+    }
+    if (o.kind == OperandKind::InlineInt) {
+        out = static_cast<uint32_t>(o.value);
+        return true;
+    }
+    return false;
+}
+
 // A compute-shader SPIR-V builder specialized for "load N floats -> compute over SSA floats ->
 // store 1 float", with helpers the VALU translator drives.
 struct SpirvCompute {
@@ -6647,12 +6680,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const Operand& operand = in.src[k];
                     const uint8_t selectors = high_result ? in.vop3p_opsel_hi : in.vop3p_opsel;
                     const uint32_t half = (selectors >> k) & 1u;
-                    uint32_t v;
-                    if (operand.kind == OperandKind::InlineFloat)
-                        v = b.uconst(half ? 0u : inline_float_f16_bits(operand.value));
-                    else if (operand.kind == OperandKind::InlineInt)
-                        v = b.uconst((static_cast<uint32_t>(operand.value) >> (16u * half)) &
-                                     0xFFFFu);
+                    uint32_t v, inline_dword;
+                    if (inline_16bit_operand_dword(operand, inline_dword))
+                        v = b.uconst((inline_dword >> (16u * half)) & 0xFFFFu);
                     else
                         v = b.bfe_u(val(operand), b.uconst(16u * half), b.uconst(16));
                     const bool negate = high_result ? ((in.vop3p_neg_hi >> k) & 1u) != 0
@@ -6693,18 +6723,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 auto half = [&](int source, bool high_result) -> uint32_t {
                     uint32_t v = val(in.src[source]);
                     const uint8_t selectors = high_result ? in.vop3p_opsel_hi : in.vop3p_opsel;
-                    if (in.src[source].kind == OperandKind::InlineFloat) {
-                        // A 16-bit operand receives the f16 encoding of the constant (replicated to
-                        // both halves, so the half select is a no-op) — exact even for 1/(2*pi).
-                        v = b.unpack_half(b.uconst(inline_float_f16_bits(in.src[source].value)), 0);
-                    } else if (in.src[source].kind == OperandKind::InlineInt) {
-                        // Integer inline constants are raw two's-complement bits at operand width
-                        // (ISA sec 6.2): the packed operand's halves are the low/high 16 bits of the
-                        // sign-extended value — inline 1 reads as the f16 denormal 0x0001, NOT 1.0.
-                        v = b.unpack_half(b.uconst(static_cast<uint32_t>(in.src[source].value)),
-                                          (selectors >> source) & 1u);
+                    const uint32_t sel = (selectors >> source) & 1u;
+                    // An inline constant is the raw dword its width produces (see
+                    // inline_16bit_operand_dword): a float contributes its f16 encoding in the LOW
+                    // half and ZERO in the high one — exact even for 1/(2*pi) — and an int its
+                    // sign-extended two's-complement bits, so inline 1 reads as the f16 denormal
+                    // 0x0001, NOT 1.0. Either way the half select applies; it is not a no-op. This
+                    // path used to replicate the float into both halves (#2119, kernel 32r14a).
+                    uint32_t inline_dword;
+                    if (inline_16bit_operand_dword(in.src[source], inline_dword)) {
+                        v = b.unpack_half(b.uconst(inline_dword), sel);
                     } else {
-                        v = b.unpack_half(v, (selectors >> source) & 1u);
+                        v = b.unpack_half(v, sel);
                     }
                     const bool negate = high_result
                         ? ((in.vop3p_neg_hi >> source) & 1u) != 0
@@ -6743,23 +6773,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (in.opcode != 0x20 && in.opcode != 0x21 && in.opcode != 0x22) { ok = false; return true; }
             uint32_t old_d = vreg_old(b, rs, in.dst.value);
             // Per-source mix resolve (#273): OPSEL_HI[k] -> f16 half (OPSEL[k]: 0=lo,1=hi) converted
-            // to f32; else full f32. An inline constant is already a full-width value, so the half
-            // select is a no-op for it (hardware reads the f16-converted constant — same value).
+            // to f32; else full f32. An inline constant read at f16 width is the dword its width
+            // produces (see inline_16bit_operand_dword), so OPSEL selects a half of THAT — a float
+            // reads 0.0h from the high half, not the constant again. This used to treat the select
+            // as a no-op for inline floats (#2119, kernel 32r14b).
             // NEG_HI = abs, NEG = negate (abs first, hardware order).
             auto mixv = [&](int k) -> uint32_t {
                 uint32_t v = val(in.src[k]);
                 const bool half = (in.vop3p_opsel_hi >> k) & 1u;
                 if (half) {
-                    if (in.src[k].kind == OperandKind::InlineFloat)
-                        // f16-half read of an inline float: the exact documented f16 encoding.
-                        v = b.unpack_half(b.uconst(inline_float_f16_bits(in.src[k].value)), 0);
-                    else if (in.src[k].kind == OperandKind::InlineInt)
-                        // Raw two's-complement bits at operand width: the selected half of the
-                        // sign-extended value (inline 1 -> f16 denormal, not 1.0).
-                        v = b.unpack_half(b.uconst(static_cast<uint32_t>(in.src[k].value)),
-                                          (in.vop3p_opsel >> k) & 1u);
+                    const uint32_t sel = (in.vop3p_opsel >> k) & 1u;
+                    uint32_t inline_dword;
+                    if (inline_16bit_operand_dword(in.src[k], inline_dword))
+                        v = b.unpack_half(b.uconst(inline_dword), sel);
                     else
-                        v = b.unpack_half(v, (in.vop3p_opsel >> k) & 1u);
+                        v = b.unpack_half(v, sel);
                 }
                 if (in.src_abs[k]) v = b.fext1(Glsl_FAbs, v);
                 if (in.src_neg[k]) v = b.fneg(v);
@@ -8254,13 +8282,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 auto f16src = [&](int k) {
                     const Operand& operand = in.src[k];
                     uint32_t raw = val(operand);
-                    // Inline constants supply their 16-bit operand encoding (see the VOP2 f16 path).
-                    uint32_t value = operand.kind == OperandKind::InlineFloat
-                                       ? b.unpack_half(b.uconst(inline_float_f16_bits(operand.value)), 0)
-                                   : operand.kind == OperandKind::InlineInt
-                                       ? b.unpack_half(b.uconst(static_cast<uint32_t>(operand.value)),
-                                                       (in.vop3p_opsel >> k) & 1u)
-                                       : b.unpack_half(raw, (in.vop3p_opsel >> k) & 1u);
+                    // Inline constants supply the dword their operand width produces (see
+                    // inline_16bit_operand_dword) and OPSEL[k] selects a half of THAT — a float
+                    // reads 0.0h from the high half rather than the constant again (#2119,
+                    // kernel 32r14c).
+                    const uint32_t sel = (in.vop3p_opsel >> k) & 1u;
+                    uint32_t inline_dword;
+                    uint32_t value = inline_16bit_operand_dword(operand, inline_dword)
+                                       ? b.unpack_half(b.uconst(inline_dword), sel)
+                                       : b.unpack_half(raw, sel);
                     if (in.src_abs[k]) value = b.fext1(Glsl_FAbs, value);
                     if (in.src_neg[k]) value = b.fneg(value);
                     return value;
