@@ -141,6 +141,21 @@ The standing warnings that are **not** title-specific:
   can fail silently. Check a diagnostic's rate limit before quoting its volume as a frequency, and
   check whether it clears `live_gpu_targets` before comparing it against a default run.
 
+- **A positive control drawn from the same source as the null it validates tests the DISCRIMINATOR,
+  never the DOMAIN.** This qualifies the rule above, and it is the harder half. "A discriminator that
+  cannot show its lever moved is void" is true — but a lever that *does* move proves only that the
+  machinery runs, not that the space it searches can express the case you are testing for. Worked
+  example (2026-08-06, instrument trap 122): a reviewer's fuzz reported zero instances of a widening
+  class. Suspecting the zero, they ran a positive control — **and it passed**: 41,206 constructions,
+  17,659 narrowings, 0 widenings. It could not have done otherwise, because it drew from the same
+  generator and so inherited the same broken geometry, in which the case was *structurally
+  inexpressible*. Interior geometry surfaced 1,277 instances immediately.
+  **So: before believing a clean zero, construct one positive instance of the class BY HAND, outside
+  whatever produced the null.** A same-source control confirms the machinery fires on cases the source
+  can build — which is exactly the assumption in question. This is the sharpest form of the family the
+  instrument-trap list records, because unlike the silent instruments in traps 64, 116 and 121, this
+  one is *loud*, and the noise is what launders the null.
+
 ### Superseded documents
 
 `docs/NEXT_STEP_VERTEX_FETCH.md` (bindless-dynamic vertex fetch, superseded 2026-07-11) and
