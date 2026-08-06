@@ -178,6 +178,15 @@ int main() {
         const uint32_t mn = std::min(u0, u1), mx = std::max(u0, u1);
         exp4b[i] = (float)std::max(mn, std::min(mx, u2));
     }
+    // Kernel 4c (#2013): unsigned max-of-three, the shape Sonic Racing: CrossWorlds rejects four
+    // times per boot. Same u32 round-trip as 4b so real Vulkan execution checks every ordering.
+    const uint32_t code4c[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E040F02u, 0xD5560003u, 0x040A0300u,
+        0x7E000D03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4c = recompile_valu(code4c, std::size(code4c), 3, 0);
+    CHECK(!spv4c.empty(), "recompiled kernel 4c (v_max3_u32) -> SPIR-V");
+
     std::vector<float> got4b = prosper::test::run_compute(spv4b, in4b, N, N);
     uint32_t bad4b = 0;
     for (uint32_t i = 0; i < N && got4b.size() == N; i++)
@@ -185,6 +194,17 @@ int main() {
     printf("  kernel4b mismatches=%u (out[60]=%g expect=%g)\n",
            bad4b, got4b.size()==N ? got4b[60] : -1, exp4b[60]);
     CHECK(got4b.size()==N && bad4b==0, "recompiled kernel 4b computes unsigned median correctly");
+
+    std::vector<float> got4c = prosper::test::run_compute(spv4c, in4b, N, N);
+    uint32_t bad4c = 0;
+    for (uint32_t i = 0; i < N && got4c.size() == N; i++) {
+        const uint32_t u0 = (i * 37u) % 211u;
+        const uint32_t u1 = (i * 83u + 17u) % 211u;
+        const uint32_t u2 = (i * 19u + 101u) % 211u;
+        if (got4c[i] != (float)std::max(u0, std::max(u1, u2))) bad4c++;
+    }
+    printf("  kernel4c mismatches=%u (out[60]=%g)\n", bad4c, got4c.size()==N ? got4c[60] : -1);
+    CHECK(got4c.size()==N && bad4c==0, "recompiled kernel 4c computes unsigned max-of-three correctly");
 
     // Kernel 5: unsigned min/max/sub/not/and. u=(uint)a; d=(max-min) & ~u0. out=(float)d.
     const uint32_t code5[] = {
@@ -2470,6 +2490,141 @@ int main() {
         spv32o3, std::vector<float>(1), 1, 1);
     CHECK(got32o3.size()==1 && bits_of(got32o3[0])==0x42004200u,
           "kernel 32o3 selects and preserves packed f16 halves exactly");
+
+    // Kernel 32o4 (#2013): the 16-bit shift family. Sonic Racing: CrossWorlds' post chain emits
+    // `v_lshrrev_b16 v1, 1, v0 op_sel:[0,0,1]` — a HIGH-half destination write — fifteen times per
+    // boot, and rejecting it dropped the draws that used it. Shift the same source into both
+    // destination halves of one register: the high half through OPSEL, the low half plain, each
+    // preserving the other. A lowering that ignores OPSEL, or that zero-fills instead of
+    // preserving, produces a different packed word and fails here.
+    //   v0 = 0x0000a5c3, v2 = 0x12345678
+    //   v_lshrrev_b16 v2, 3, v0 op_sel:[0,0,1]  -> v2.hi = 0xa5c3 >> 3 = 0x14b8 (v2.lo preserved)
+    //   v_lshrrev_b16 v2, 5, v1                 -> v2.lo = 0xa5c3 >> 5 = 0x052e (v2.hi preserved)
+    const uint32_t code32o4[] = {
+        0x7e0002ffu, 0x0000a5c3u,            // v0 = 0x0000a5c3
+        0x7e0202ffu, 0x0000a5c3u,            // v1 = 0x0000a5c3
+        0x7e0402ffu, 0x12345678u,            // v2 = old packed destination
+        0xd7074002u, 0x00020083u,            // v2.hi = v0.lo >> 3
+        0xd7070002u, 0x00020285u,            // v2.lo = v1.lo >> 5
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o4 = recompile_valu(code32o4, std::size(code32o4), 0, 2);
+    CHECK(!spv32o4.empty(), "recompiled kernel 32o4 (v_lshrrev_b16 OPSEL pair) -> SPIR-V");
+    std::vector<float> got32o4 = prosper::test::run_compute(
+        spv32o4, std::vector<float>(1), 1, 1);
+    CHECK(got32o4.size()==1 && bits_of(got32o4[0])==0x14b8052eu,
+          "kernel 32o4 shifts 16-bit halves into the selected destination half");
+
+    // Kernel 32o5 (#2013): plain-form v_rcp_f16_e32 (0x7e1ea910 in the live shader). The result
+    // occupies D.f16_lo and bits [31:16] are PRESERVED. 1/2.0h = 0.5h = 0x3800 exactly, so this is
+    // a bit-exact check rather than a tolerance.
+    const uint32_t code32o5[] = {
+        0x7e0002ffu, 0x12344000u,            // v0 = {hi=0x1234, lo=2.0h}
+        0x7e0202ffu, 0xaabbccddu,            // v1 = old packed destination
+        0x7e02a900u,                          // v_rcp_f16_e32 v1, v0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o5 = recompile_valu(code32o5, std::size(code32o5), 0, 1);
+    CHECK(!spv32o5.empty(), "recompiled kernel 32o5 (plain v_rcp_f16_e32) -> SPIR-V");
+    std::vector<float> got32o5 = prosper::test::run_compute(
+        spv32o5, std::vector<float>(1), 1, 1);
+    CHECK(got32o5.size()==1 && bits_of(got32o5[0])==0xaabb3800u,
+          "kernel 32o5 writes v_rcp_f16 into the low half and preserves the high half");
+
+    // Kernel 32o6 (#2013): 16-bit integer arithmetic, including the OPSEL source select. This one
+    // also pins the opcode numbering that is easy to get wrong: 0x305 is v_mul_lo_u16, NOT a shift
+    // (v_lshlrev_b16 is 0x314, checked by kernel 32o7). A lowering that treated 0x305 as a left
+    // shift would put 3<<10 here and fail.
+    //   v0 = {hi=7, lo=3}, v1 = {lo=10}, v2 = 0x12345678
+    //   v_add_nc_u16 v2, v0, v1                 -> v2.lo = 3 + 10 = 13   (v2.hi preserved = 0x1234)
+    //   v_mul_lo_u16 v2, v0, v1 op_sel:[1,0,1]  -> v2.hi = 7 * 10 = 70   (v2.lo preserved = 13)
+    const uint32_t code32o6[] = {
+        0x7e0002ffu, 0x00070003u,
+        0x7e0202ffu, 0x0000000au,
+        0x7e0402ffu, 0x12345678u,
+        0xd7030002u, 0x00020300u,
+        0xd7054802u, 0x00020300u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o6 = recompile_valu(code32o6, std::size(code32o6), 0, 2);
+    CHECK(!spv32o6.empty(), "recompiled kernel 32o6 (v_add_nc_u16 / v_mul_lo_u16) -> SPIR-V");
+    std::vector<float> got32o6 = prosper::test::run_compute(
+        spv32o6, std::vector<float>(1), 1, 1);
+    CHECK(got32o6.size()==1 && bits_of(got32o6[0])==0x0046000du,
+          "kernel 32o6 computes 16-bit add and multiply into the selected halves");
+
+    // Kernel 32o7 (#2013): v_lshlrev_b16 at its real opcode 0x314, signed 16-bit min/max (which
+    // need sign extension, not a bare mask), and the plain-form v_cvt_u16_f16 the live shader uses.
+    //   v0 = {lo=-2}, v1 = {lo=3}, v2 = 0x12345678
+    //   v_max_i16 v2, v0, v1                 -> v2.lo = max(-2,3) = 3
+    //   v_min_i16 v2, v0, v1 op_sel:[0,0,1]  -> v2.hi = min(-2,3) = -2 = 0xfffe
+    const uint32_t code32o7[] = {
+        0x7e0002ffu, 0x0000fffeu,
+        0x7e0202ffu, 0x00000003u,
+        0x7e0402ffu, 0x12345678u,
+        0xd70a0002u, 0x00020300u,
+        0xd70c4002u, 0x00020300u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o7 = recompile_valu(code32o7, std::size(code32o7), 0, 2);
+    CHECK(!spv32o7.empty(), "recompiled kernel 32o7 (signed 16-bit min/max) -> SPIR-V");
+    std::vector<float> got32o7 = prosper::test::run_compute(
+        spv32o7, std::vector<float>(1), 1, 1);
+    CHECK(got32o7.size()==1 && bits_of(got32o7[0])==0xfffe0003u,
+          "kernel 32o7 sign-extends 16-bit operands for signed min/max");
+
+    //   v0 = 0x0000abcd, v1 = 0x11112222
+    //   v_lshlrev_b16 v1, 4, v0    -> v1.lo = 0xabcd << 4 = 0xbcd0   (v1.hi preserved = 0x1111)
+    //   v3 = {lo = 5.0h}, v4 = 0xdeadbeef
+    //   v_cvt_u16_f16_e32 v4, v3   -> v4.lo = 5                      (v4.hi preserved = 0xdead)
+    const uint32_t code32o8[] = {
+        0x7e0002ffu, 0x0000abcdu,
+        0x7e0202ffu, 0x11112222u,
+        0xd7140001u, 0x00020084u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o8 = recompile_valu(code32o8, std::size(code32o8), 0, 1);
+    CHECK(!spv32o8.empty(), "recompiled kernel 32o8 (v_lshlrev_b16 at 0x314) -> SPIR-V");
+    std::vector<float> got32o8 = prosper::test::run_compute(
+        spv32o8, std::vector<float>(1), 1, 1);
+    CHECK(got32o8.size()==1 && bits_of(got32o8[0])==0x1111bcd0u,
+          "kernel 32o8 shifts a 16-bit half left and preserves the other half");
+
+    const uint32_t code32o9[] = {
+        0x7e0602ffu, 0x77774500u,
+        0x7e0802ffu, 0xdeadbeefu,
+        0x7e08a503u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o9 = recompile_valu(code32o9, std::size(code32o9), 0, 4);
+    CHECK(!spv32o9.empty(), "recompiled kernel 32o9 (plain v_cvt_u16_f16_e32) -> SPIR-V");
+    std::vector<float> got32o9 = prosper::test::run_compute(
+        spv32o9, std::vector<float>(1), 1, 1);
+    CHECK(got32o9.size()==1 && bits_of(got32o9[0])==0xdead0005u,
+          "kernel 32o9 converts f16 to u16 in the low half and preserves the high half");
+
+    // Kernel 32o10 (#2013): the three-source 16-bit integer forms. v_med3_i16 is the deepest reject
+    // this title reaches after the two-source family is implemented (14 sites per boot). The median
+    // is taken over SIGN-EXTENDED operands — an unsigned median of the same bits would return
+    // 0x0064 (100) instead of 3. v_mad_u16 wraps at 16 bits: 65531*3 + 100 = 0x0055 mod 2^16.
+    //   v0 = {lo=-5}, v1 = {lo=3}, v3 = {lo=100}, v2 = 0x12345678
+    //   v_med3_i16 v2, v0, v1, v3                 -> v2.lo = median(-5,3,100) = 3
+    //   v_mad_u16  v2, v0, v1, v3 op_sel:[…,dst]  -> v2.hi = (65531*3 + 100) & 0xffff = 0x0055
+    const uint32_t code32o10[] = {
+        0x7e0002ffu, 0x0000fffbu,
+        0x7e0202ffu, 0x00000003u,
+        0x7e0602ffu, 0x00000064u,
+        0x7e0402ffu, 0x12345678u,
+        0xd7580002u, 0x040e0300u,
+        0xd7404002u, 0x040e0300u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o10 = recompile_valu(code32o10, std::size(code32o10), 0, 2);
+    CHECK(!spv32o10.empty(), "recompiled kernel 32o10 (v_med3_i16 / v_mad_u16) -> SPIR-V");
+    std::vector<float> got32o10 = prosper::test::run_compute(
+        spv32o10, std::vector<float>(1), 1, 1);
+    CHECK(got32o10.size()==1 && bits_of(got32o10[0])==0x00550003u,
+          "kernel 32o10 takes a SIGNED 16-bit median and a wrapping 16-bit multiply-add");
 
     // Kernel 32p: exact live v_cndmask_b32_sdwa selects src1 WORD_0 through VCC, writes WORD_1,
     // and preserves the destination's low half.

@@ -359,10 +359,19 @@ void decode_operands(Rdna2Inst& i) {
                     break;
                 default: break;
             }
-            // Scalar-f16 VOP3 operations: OPSEL[2:0] selects each packed source half and OPSEL[3]
+            // Scalar 16-bit VOP3 operations: OPSEL[2:0] selects each packed source half and OPSEL[3]
             // selects the destination half. Reuse the packed-op selector field for this family.
-            // VERIFIED(llvm-mc gfx1030): 0x354 is v_max3_f16.
-            if (i.opcode == 0x34Bu || i.opcode == 0x354u)
+            // VERIFIED(llvm-mc gfx1030): 0x354 is v_max3_f16; 0x303-0x30e (0x306 is not an
+            // instruction), 0x314, 0x340/0x35e and 0x352-0x359 are the 16-bit integer VALU family —
+            // add/sub/mul, the reversed shifts, min/max, mad and min3/max3/med3 (#2013 — Sonic
+            // Racing: CrossWorlds emits
+            // `v_lshrrev_b16 v1, 1, v0 op_sel:[0,0,1]`, which writes the HIGH destination half;
+            // dropping OPSEL there would silently write the wrong half).
+            if (i.opcode == 0x34Bu || i.opcode == 0x354u ||
+                (i.opcode >= 0x303u && i.opcode <= 0x30Eu && i.opcode != 0x306u) ||
+                i.opcode == 0x314u || i.opcode == 0x340u || i.opcode == 0x35Eu ||
+                i.opcode == 0x352u || i.opcode == 0x353u || i.opcode == 0x355u ||
+                i.opcode == 0x356u || i.opcode == 0x358u || i.opcode == 0x359u)
                 i.vop3p_opsel = static_cast<uint8_t>((w >> 11) & 0xFu);
             // V_PERMLANE16_B32 / V_PERMLANEX16_B32 overload OPSEL[0] as FI and OPSEL[1] as
             // BOUND_CTRL. OPSEL[2:3], ABS, NEG, CLAMP and OMOD remain reserved/unsupported and are

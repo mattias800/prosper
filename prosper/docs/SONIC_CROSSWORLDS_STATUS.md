@@ -68,20 +68,53 @@ the missing registrations added as well (step 1), the same instrument reports **
 
 ## The frontier: the composite after the logo
 
-From t≈100 s to the end of a 400 s arm the presented frame is a single colour, `RGBA(1,0,1,255)`,
-while `frame_seq` climbs 990 → 3,252 and `present_count` 305 → 1,059. **This is not a hang, and
-`frame_seq` climbing is not evidence that it is alive** (instrument trap 90): the image is
-byte-identical for 300 s. The engine itself is healthy — the AGC submission threads, `RHIThread`,
-`RenderThread 0` and `CriManaDecodeTh` all accumulate CPU time throughout.
+From t≈80 s the presented frame is a single colour, `RGBA(1,0,1,255)`, while `frame_seq` and
+`present_count` keep climbing. **This is not a hang, and `frame_seq` climbing is not evidence that
+it is alive** (instrument trap 90). The engine itself is healthy — the AGC submission threads,
+`RHIThread`, `RenderThread 0` and `CriManaDecodeTh` all accumulate CPU time throughout.
+
+**The uniform frame is a PHASE, not a terminal state** (2026-08-06). A 270 s arm sampling every 30 s
+leaves it: `pixel_crc32` is `8bf1b518` (the uniform colour) at t=90…240 s and `666f7b3f` (pure black,
+0 non-black pixels) again at t=270 s, with `frame_seq` 945 → 2,630 and `present_count` 290 → 851. So
+the boot sequence is still advancing behind a composite that shows almost nothing, and the earlier
+"byte-identical for 300 s / the state it stays in" framing was an artifact of where the samples fell.
+Do not treat a run that ends inside the uniform window as having reached the end of the sequence.
+
+The composite is thin rather than absent. With `PROSPER_SUBMITLOG_DIM=3840x2160`, the 10 s window
+before a uniform sample carries **53 submits targeting the 4K present extent, 89 draw items in
+total** — one to two draws per submit, the same order as during the SEGA logo (44 submits / 73 draw
+items at t=50 s). (GPU shared with two other lanes; read those as counts per interval, not as a rate.)
 
 Two measured leads, both recorded on [#2013](https://github.com/mattias800/prosper/issues/2013):
 
 - **Draws are dropped because their shaders do not recompile.** `[exec-recompile-reject]` names a
   graphics pair (`es=…`/`ps=…`) whose draws are skipped, and `PROSPER_DBG=1` gives the rejecting
-  opcodes: VOP3 `0x307` (15 sites), VOP3 `0x156` (4), VOP1 `0x54` (3), SOPP `0x6` (`s_cbranch_*`),
-  and two MIMG ops (`0x20`, `0x27`) that reject as `[mimg-unresolved]`.
+  opcodes. Two `(es, ps)` pairs are affected on every arm — `vs=4445 ena=0x20` and
+  `vs=1346 ena=0x302` — and the occurrence counter (logged on powers of two) reaches **256+** for one
+  of them, so this is hundreds of dropped draws per boot, not the 32 the first census could see.
 - **Nine distinct compute programs are skipped** (`[compute] skip unsupported program`), plus one
   3D-tile volume dispatch skipped under #590.
+
+### The reject chain, and how deep it goes
+
+`PROSPER_DBG=1` names the *first* unhandled instruction in each program, so the census is a peeled
+onion: implementing one tier reveals the next inside the same shaders. Measured on current master
+(`beeff2ab`) and after each tier landed, over identical 200 s `boot_trace` arms:
+
+| tier | rejecting ops (sites/boot) | disassembly (`llvm-mc -mcpu=gfx1030` of the exact logged words) |
+|---|---|---|
+| master | VOP3 `0x307` (30), VOP3 `0x156` (8), VOP1 `0x54` (3) | `v_lshrrev_b16` (one site with `op_sel:[0,0,1]`), `v_max3_u32`, `v_rcp_f16_e32` |
+| after those | VOP3 `0x303` (24), VOP1 `0x52` (10) | `v_add_nc_u16`, `v_cvt_u16_f16_e32` |
+| after those | VOP3 `0x358` (14), VOP3 `0x365` (5), VOP3P `0xa` (5) | `v_med3_i16`, `v_mbcnt_lo_u32_b32`, `v_pk_add_u16` |
+
+Everything in the first three tiers is the **16-bit VALU family**, which is why it peels this way:
+one UE5 post-processing shader does its whole chain in packed 16-bit arithmetic. What survives all
+three tiers, and is *not* that family, is the real remaining list: `v_and_b32_sdwa` /
+`v_mov_b32_sdwa` in WORD-select form (VOP2 `0x1b`, VOP1 `0x1`), `v_pk_add_u16` (VOP3P `0xa`),
+`v_mbcnt_lo_u32_b32` (VOP3 `0x365`), `buffer_load_format_xyz` (MUBUF `0x2`), `s_cbranch_vccz/vccnz`
+(SOPP `0x6`/`0x7`, the #590 family), `s_flbit_i32_b64` (SOP1 `0x16`), and the two `[mimg-unresolved]`
+descriptor failures. **The two MIMG rejects are not missing opcodes** — `0x20`/`0x27` disassemble to
+`image_sample` / `image_sample_lz`, which the recompiler supports; their SRSRC does not resolve.
 
 ## Unimplemented-call census (default launch, current master + #2012)
 
@@ -91,6 +124,11 @@ listed on the tracker. Nothing in the list is an entitlement or add-content quer
 `scePlayGo`/`sceAppContent` traffic is answered from local inventory, and the two unimplemented
 `libScePlayGo` NIDs (`scePlayGoGetSupportedOptionalChunk`, `scePlayGoGetInstallChunkId`) are the
 same two the 2026-08-05 baseline recorded.
+
+Re-run on `beeff2ab` (2026-08-06) the list is unchanged in kind. `sceRandomGetRandomNumber`
+(`PI7jIZj4pcE`) is worth calling out separately: the dispatcher's default `0` is a **success** return
+that leaves the caller's output buffer untouched, so the guest reads whatever was already there as
+"random" data. Filed as its own issue rather than fixed here.
 
 ## Ruled out
 
@@ -115,6 +153,27 @@ One line per falsified hypothesis, with the evidence that killed it.
 - **Entitlement answers cannot be the boot blocker.** No `sceAppContent*`/`sceNpEntitlementAccess*`
   ownership query is reached before the wall, and none of the 21 unimplemented NIDs is one.
   (Tracker #1895, 2026-08-05 breakpoint census; unchanged by this lane's arms.)
+- **#2021 and #2003 change nothing here.** `sceSysmoduleIsLoaded` answering from prosper's own load
+  history, and app-param/SKU answering from `param.json`, were both absent from the `c3614f51` base
+  the rung-1 evidence was taken on. On `beeff2ab`, which has both, the boot is identical
+  frame-for-frame: black to t≈20 s, SEGA logo `pixel_crc32=0d70a70a` (1,373 colours, 430,916
+  non-black px) at t≈40–60 s, uniform `8bf1b518` from t≈80 s. The only `[sysmodule]` traffic is two
+  first-query `IsLoaded` misses (`0xe2`, `0xba`). (This lane, 2026-08-06, two independent arms.)
+- **The uniform frame is not the end of the sequence, and a 400 s bound is not enough to see that.**
+  A 270 s arm sampled every 30 s leaves the uniform colour and returns to pure black at t=270 s
+  (`666f7b3f`, 0 non-black px). Any claim that the title "stays" in a state needs a sample cadence
+  that would have caught a change. (This lane, 2026-08-06.)
+- **`0x156 = v_max3_u32` is confirmed, and `0x307` is NOT `v_lshlrev_b16`.** #2013 flagged the first
+  as positional inference; a round-trip through `llvm-mc -mcpu=gfx1030` of the exact logged words
+  confirms it and names the other two (`0x307 = v_lshrrev_b16`, `0x54 = v_rcp_f16`). The trap is one
+  opcode over: **`0x305` is `v_mul_lo_u16`, and `v_lshlrev_b16` is `0x314`** — implementing 0x305 as
+  a left shift compiles, validates, and silently computes the wrong value. Caught by a bit-exact
+  execution test before it shipped. (This lane, PR for #2013.)
+- **A one-frame F9 grab is not a reliable instrument on this title.** The headless
+  `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE` grab armed at present 470 and reported `[grab] frame-bundle:
+  window had no submits` — a real measurement (that present interval carried no GPU submit at all),
+  but not evidence that the title has stopped submitting: the same phase carries ~50 4K-target
+  submits per 10 s. Use `PROSPER_CAPTURE_FRAMES>1` here. (This lane, 2026-08-06.)
 
 ## Not verified
 
