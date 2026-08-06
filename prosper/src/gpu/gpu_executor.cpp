@@ -2165,8 +2165,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // indexing per attribute through that saved copy
                     // (`s_cselect_b64 sSEL, sSAVED, 0` -> `v_cndmask_b32 vIDX, v8, v5, sSEL`).
                     // Losing the mask made s_cselect_b64 fold to Unknown, which classified a
-                    // per-vertex attribute as shader-computed: every vertex then read record 0 and
-                    // the shader's own OFFSET/SOFFSET were re-added to an already-resolved base.
+                    // per-vertex attribute as shader-computed. Two things then go wrong at once, and
+                    // each alone still reads zero: every vertex takes the *instance* index (0 for a
+                    // one-instance draw), and the recompiler retains the load's runtime SOFFSET,
+                    // which for that shader is the top bits of an accumulator rather than the byte
+                    // offset the fold resolved (the fold's own fetch_off here is 0). The read then
+                    // leaves the descriptor and robustBufferAccess returns 0. The SOFFSET divergence
+                    // is #2069 and is NOT repaired here — this only removes the shader's address
+                    // expression from the path for attributes the fold can classify.
                     //
                     // `All` is this fold's standing assumption about EXEC, not a new one: `srcmask()`
                     // already answers `All` for a directly named EXEC operand, because this walk is a

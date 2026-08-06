@@ -700,15 +700,35 @@ zero and the defect looked like a blank source:
 
 1. The recompiler keeps the shader's own VADDR for `Shader` mode — and that VADDR is now the
    *instance* index, i.e. 0 for every vertex of a one-instance draw.
-2. `Shader` mode also keeps the instruction's `OFFSET`/`SOFFSET`, which are re-added to a base the
-   fold has already resolved, pushing the read past the descriptor's 96 bytes so
+2. `Shader` mode also keeps the instruction's address terms, and the **runtime `SOFFSET` is wrong**.
+   The load is `buffer_load_format_x v3, v3, s[0:3], s106 idxen` (`e0002000,6a000303`): its inst
+   `OFFSET` field is **0**, so `SOFFSET` is the only additive term. `s106` is *not* the width-1
+   vertex-rate flag it held at pc 263 — it is overwritten at pc 273, then at pc 279 with
+   `s_and_b32 s106, s3, 0xfff80000` and at pc 282 with `s_or_b32 s106, s106, s20`, so its live value
+   at the load is the top 13 bits of `s3`. Adding that leaves the descriptor's 96 bytes and
    `robustBufferAccess` returns 0.
 
-Both were confirmed by lever-verified A/B on the captured submit before the fix was written: forcing
-`v8 = gl_VertexIndex` alone left the replay hash at `1f521f254fbb8b83`; dropping `OFFSET`/`SOFFSET`
-for `Shader`-mode fetches alone left it at `1f521f254fbb8b83`; **both together** produced
-`40575baeea3a5b74` and 16,410 distinct colours — the real screen. Each lever's own effect was checked
-with `PROSPER_SHADER_TAP` at the exact PC, so neither arm is a silent no-op.
+Both were confirmed by lever-verified A/B on the captured submit before the fix was written, and the
+second lever names the exact term:
+
+| Arm | Replay hash | Distinct colours |
+| --- | --- | --- |
+| baseline (stored SPIR-V, and `--recompile-raw`) | `1f521f254fbb8b83` | 1 |
+| (a) force `v8 = gl_VertexIndex` only | `1f521f254fbb8b83` | 1 |
+| (c) drop **`SOFFSET`** only | `1f521f254fbb8b83` | 1 |
+| **(a) + (c)** | **`40575baeea3a5b74`** | **16,410** |
+
+`PROSPER_SHADER_TAP=296` reads the fetched index directly and agrees arm for arm: `0,0,0,0,0,0` for
+(a) alone and for (c) alone, and `0,1,2,1,3,2` — the correct per-vertex indices — for (a)+(c). So
+neither arm is a silent no-op, and neither term alone is the defect.
+
+**The fold's own offset is zero, so this is not double-counting.** Comparing the bound descriptor
+before and after the fix, `unshifted_desc.base` and `with_off(desc).base` are the same address
+(`0x2011c0a690`), i.e. the fold resolves `fetch_off = 0`. The fold and the recompiled shader therefore
+disagree about `SOFFSET` exactly as they disagree about the vertex-rate bit — the same scalar
+divergence, tracked in **#2069**. This fix removes the shader's address expression from the path for
+this shape; it does not repair that divergence, which still governs every attribute the fold
+legitimately classifies `Shader`.
 
 The fix restores the mask lifetime on `s_mov_b64 sDST, exec` (and propagates it through a further
 `s_mov_b64 sDST, sSRC`), which makes the attribute classify as `Vertex` and take the ordinary

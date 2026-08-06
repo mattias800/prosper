@@ -182,9 +182,10 @@ int main() {
     // answer without the selection being modelled at all. Writing an unseeded VGPR makes the check
     // depend on the fold actually resolving the saved mask.
     //
-    // The instance arm below does NOT discriminate this fix on its own — `s_cselect_b64`'s false arm
-    // is the literal zero mask, which was always resolvable — but it does fail any "fix" that
-    // defaults a saved mask to all-lanes instead of tracking it.
+    // The instance arm below does NOT discriminate this fix — `s_cselect_b64`'s false arm is the
+    // literal zero mask, which was always resolvable, so it passes with or without the mask save. It
+    // is kept as the opposite-polarity control: it fails any "fix" that hands back all-lanes for a
+    // saved mask instead of tracking it.
     const uint32_t ngg_saved_exec_fetch[] = {
         0xBE90047Eu,                // s_mov_b64 s[16:17], exec
         0xBF066A80u,                // s_cmp_eq_u32 0, s106
