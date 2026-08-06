@@ -60,7 +60,8 @@ struct CondSlot {
 // Deliberately a ring of plain stores rather than PROSPER_SYNCLOG's fprintf: this sits on the
 // hottest paths in the emulator, and the failure it exists to diagnose is TIMING SENSITIVE, so an
 // instrument that serialises on stderr changes the answer. Off by default for the same reason.
-enum class SyncTraceKind : uint32_t { WaitEnter, WaitWake, Signal, Broadcast, Interrupt };
+enum class SyncTraceKind : uint32_t { WaitEnter, WaitWake, Signal, Broadcast, Interrupt,
+                                      FutexWait, FutexWake };
 
 struct SyncTraceEvent {
     std::atomic<uint64_t> published{0};
@@ -121,6 +122,8 @@ const char* sync_trace_kind_name(SyncTraceKind kind) {
         case SyncTraceKind::Signal:    return "signal";
         case SyncTraceKind::Broadcast: return "broadcast";
         case SyncTraceKind::Interrupt: return "interrupt";
+        case SyncTraceKind::FutexWait: return "futex-wait";
+        case SyncTraceKind::FutexWake: return "futex-wake";
     }
     return "?";
 }
@@ -220,6 +223,9 @@ WaitRegistration futex_wait_enter(uint64_t addr) {
 #ifdef _WIN32
     WaitSlot* registration = register_wait(GuestWaitKind::Address, (uintptr_t)addr,
                                            (uintptr_t)addr);
+    // Recorded so a raw futex waiter is not indistinguishable from one whose producer never
+    // existed: without this every `address` wait looks like a wait-for-graph root by construction.
+    sync_trace(SyncTraceKind::FutexWait, (uintptr_t)addr, (uintptr_t)addr, 0);
     // Close queue-before-sleep: a GC stop can be published just before this wait is registered.
     // Accept it now rather than blocking forever after the raiser's wake lookup already missed us.
     dispatch_pending_guest_exception();
@@ -574,6 +580,7 @@ void futex_wake(uint64_t addr, int n) {
     // Windows and rendering wedges after the first submit. Wake ALL (n is a hint; label waiters are few).
     if (!addr) return;
     (void)n;
+    sync_trace(SyncTraceKind::FutexWake, (uintptr_t)addr, (uintptr_t)addr, 0);
     WakeByAddressAll((PVOID)(uintptr_t)addr);
 #else
     (void)addr; (void)n;

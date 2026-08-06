@@ -42,7 +42,7 @@ EVENT_RE = re.compile(
     r"^\[sync-trace\] seq=(\d+) kind=(\S+)\s+tid=(\d+) pthread=(0x[0-9a-f]+) "
     r"object=(0x[0-9a-f]+) source=(0x[0-9a-f]+) value=(\d+)")
 
-WAKE_KINDS = ("signal", "broadcast", "interrupt")
+WAKE_KINDS = ("signal", "broadcast", "interrupt", "futex-wake")
 
 
 def main(paths):
