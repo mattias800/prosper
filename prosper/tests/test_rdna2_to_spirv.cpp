@@ -3023,6 +3023,38 @@ int main() {
     CHECK(got32r10.size()==1 && bits_of(got32r10[0])==0x33337c00u,
           "kernel 32r10 takes the median and the minimum of three f16 sources");
 
+    // Kernel 32r10n (#2013): the DISCRIMINATING NaN case for `v_med3_f16`, on the exact live
+    // encoding that motivated the opcode — Sonic Racing: CrossWorlds' NaN-safe saturate idiom
+    //   d7571003,02020af2 = v_med3_f16 v3, 1.0, v5, 0 op_sel:[0,1,0,0]
+    // with v5's HIGH half (the half OPSEL[1]=1 selects) set to the f16 quiet NaN 0x7e00.
+    // RDNA2 ISA op 855 opens with a SEPARATE any-NaN clause:
+    //   if (isNan(S0) || isNan(S1) || isNan(S2)) D.f16 = V_MIN3_F16(S0,S1,S2)
+    // so hardware returns MIN3(1.0h, NaN, 0.0h) = 0.0h. The bare max(min(...)) median formula
+    // returns 1.0h instead — a saturate that yields white where hardware yields black. Three
+    // outcomes are distinguishable, so the kernel cannot pass by not running:
+    //   0x11110000 = correct (0.0h)   0x11113c00 = the bare-formula bug (1.0h)
+    //   0x11112222 = the instruction never executed (seed untouched)
+    // OPSEL[3]=0 writes the LOW half, so the 0x1111 marker must survive in the high half.
+    // The kernel also discriminates HOW the NaN is detected, not merely that it is: 0x7e000000
+    // is a NaN only when its HIGH HALF is read as f16 — as a full dword it is a finite f32
+    // (exponent 0xfc). So a lowering that copies the f32 arm's whole-dword fv() compares instead
+    // of the unpacked f16src() halves sees no NaN, skips the clause and returns 0x11113c00.
+    // Verified by mutation: swapping the compares to the packed dword turns this kernel red.
+    const uint32_t code32r10n[] = {
+        0x7e0602ffu, 0x11112222u,            // v3 = seed {hi=0x1111 marker, lo=0x2222 sentinel}
+        0x7e0a02ffu, 0x7e000000u,            // v5 = {hi=NaNh (0x7e00), lo=0}
+        0xd7571003u, 0x02020af2u,            // v_med3_f16 v3, 1.0, v5.hi, 0  -> v3.lo (LIVE words)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r10n = recompile_valu(code32r10n, std::size(code32r10n), 0, 3);
+    CHECK(!spv32r10n.empty(), "recompiled kernel 32r10n (live v_med3_f16 NaN saturate) -> SPIR-V");
+    std::vector<float> got32r10n = prosper::test::run_compute(spv32r10n, std::vector<float>(1), 1, 1);
+    printf("  kernel 32r10n out=0x%08x (want 0x11110000; 0x11113c00 = bare-formula bug, "
+           "0x11112222 = did not execute)\n",
+           got32r10n.size()==1 ? bits_of(got32r10n[0]) : 0u);
+    CHECK(got32r10n.size()==1 && bits_of(got32r10n[0])==0x11110000u,
+          "kernel 32r10n: v_med3_f16(1.0, NaN, 0) takes the ISA any-NaN MIN3 path -> 0.0h, not 1.0h");
+
     // Kernel 32r11: the packed f16 siblings of the add/mul pair the recompiler already had —
     // v_pk_fma_f16 (three sources), v_pk_min_f16 and v_pk_max_f16.
     const uint32_t code32r11[] = {
