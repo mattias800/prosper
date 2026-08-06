@@ -41,6 +41,25 @@ managed logic (scene load, boot state machines) during emulator debugging.
    (`0xFF` at v-2/-3/-6/-7), not just `0xE8` (call rel32) — IL2CPP dispatches
    managed methods indirectly, so an 0xE8-only filter drops every managed frame.
 
+## What binutils can and cannot do with the flattened ELF
+
+The image has program headers but **no section header table**, so `e_shoff`, `e_shnum` and
+`e_shstrndx` are all zero (`prx_to_elf.py`; regression: `test_prx_to_elf.py`, ctest
+`il2cpp_prx_to_elf_header`). That is enough for binutils to *accept* the file — `objdump -f`,
+`objdump -p` and `objdump -T` all work, and `-T` is genuinely useful: it lists the module's Sony
+NID dynamic symbols. It is **not** enough for `objdump -d`, which disassembles sections and finds
+none; disassembly still needs `objdump -D -b binary -m i386:x86-64 --start-address=…`, or
+`tools/re/xref.py`. Synthesizing section headers from the PT_LOADs would fix that and is #2154.
+
+### Ruled out
+- **"binutils also needs `e_ident[EI_OSABI]`/`[EI_ABIVERSION]` cleared" (#2016's own note) — false.**
+  binutils 2.46 accepts the flattened image with the module's `0x09 0x02` (FreeBSD, ABI 2) intact,
+  as long as `e_shnum` **and** `e_shstrndx` are both 0. A/B over all four combinations on the
+  `PPSA24651` IL2CPP module: `(shnum=14, shstrndx=43)` REJECT, `(0, 43)` REJECT, `(14, 0)` REJECT,
+  `(0, 0)` ACCEPT — and `(0, 0)` with OSABI cleared is also ACCEPT, i.e. OSABI changes nothing.
+  Zeroing only `e_shnum`, as #2016 suggested, would not have made binutils accept the file. No
+  `--gnu-compat` flag is needed (#2016 / PR #2155).
+
 ## gdb caveat (prosper)
 prosper installs a SIGSEGV handler for lazy memory commit. Under gdb, ALWAYS use
 

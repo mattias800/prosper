@@ -112,6 +112,12 @@ if(Python3_Interpreter_FOUND)
   # cases are regressions for classifier bugs found only after a table had been published (#2002).
   add_test(NAME re_nid_gate_classifier
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_nid_gate_scan.py")
+  # prx_to_elf.py writes an ELF header by hand, four bytes apart from a field that means something
+  # else entirely — #2016 put the program-header count in the section-header-count slot, and the
+  # result was a malformed image no consumer complained about until binutils refused the file. The
+  # test reads the produced bytes at their gABI offsets; nothing else can see this class of bug.
+  add_test(NAME il2cpp_prx_to_elf_header
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/il2cpp/test_prx_to_elf.py")
   add_test(NAME snapshot_guard_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/snapshot/test_snapshot.py")
   add_test(NAME gpu_replay_regress_logic
