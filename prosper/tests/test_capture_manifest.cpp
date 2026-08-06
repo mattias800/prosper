@@ -103,6 +103,34 @@ int main() {
           "opaque rendered capture preserves viewer-visible colors and structure despite low alpha");
     CHECK(raw_scanout[3] == 0 && raw_scanout[7] == 1,
           "raw scanout capture preserves guest alpha bytes");
+
+    // A republished guest scanout (#1968) is a third provenance and needs both halves of its
+    // contract asserted. It reaches the desktop through the same opaque swapchain as a composited
+    // frame, so it is normalized the same way — otherwise a guest buffer holding RGB content behind
+    // low alpha would score as black and read as a regression that the viewer cannot see.
+    auto guest_scanout_pixels = low_alpha_rendered;
+    for (size_t i = 3; i < guest_scanout_pixels.size(); i += 4) guest_scanout_pixels[i] = (i & 4) ? 1 : 0;
+    normalize_capture_rgba(CaptureSource::GuestScanout, guest_scanout_pixels);
+    CHECK(guest_scanout_pixels == opaque_expected,
+          "a republished guest scanout is normalized like the composited frame it is presented as");
+    // …and yet it must never be COUNTED as one: --require-composited-frame is enforced off
+    // rendered_samples(), and #2026 was reverted (#2044) for letting exactly this frame satisfy it.
+    CaptureTracker provenance_tracker;
+    std::vector<uint8_t> tracked(16, 0x40);
+    CaptureObservation composited_obs{CaptureSource::Rendered, 1, 1, 1, 0, 2, 2, 0xaa, 0.0};
+    CaptureObservation republished_obs{CaptureSource::GuestScanout, 2, 2, 2, 0, 2, 2, 0xbb, 1.0};
+    provenance_tracker.observe(republished_obs, tracked);
+    CHECK(provenance_tracker.rendered_samples() == 0 &&
+              provenance_tracker.guest_scanout_samples() == 1,
+          "a republished guest scanout does not satisfy the composited-frame requirement");
+    provenance_tracker.observe(composited_obs, tracked);
+    CHECK(provenance_tracker.rendered_samples() == 1 &&
+              provenance_tracker.guest_scanout_samples() == 1,
+          "a genuinely composited frame still counts, so the gate is narrowed and not disabled");
+    CHECK(std::string(capture_source_name(CaptureSource::GuestScanout)) == "guest_scanout" &&
+              std::string(capture_source_name(CaptureSource::Rendered)) == "composited" &&
+              std::string(capture_source_name(CaptureSource::RawScanout)) == "raw_scanout",
+          "each capture provenance has its own manifest name");
     const std::string long_route(4096, 'x');
     const std::string long_line = manifest_sample_json(3, "long.png", c, cc, long_route);
     CHECK(long_line.size() > long_route.size() && long_line.find(long_route) != std::string::npos,

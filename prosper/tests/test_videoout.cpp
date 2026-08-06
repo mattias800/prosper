@@ -4,6 +4,10 @@
 // NID registry exactly as the guest does, then asserts the reported display + recorded buffers.
 #include "../src/hle/dispatch.hpp"
 #include "../src/gpu/videoout_present.hpp"
+#include "../src/gpu/tile.hpp"              // tile/detile round trip for the flipped-buffer image
+#include "../src/host/guest_memory_map.hpp" // the registered-mapping proof for the padded read
+#include <algorithm>
+#include <vector>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>   // setenv/_putenv_s (PROSPER_HDR both-modes test)
@@ -534,6 +538,216 @@ int main() {
               prosper_vo_buffer_count() == 0 && prosper_vo_buffer_addr(0) == 0 &&
               prosper_vo_display_width() == 0 && prosper_vo_display_height() == 0,
           "unregistering the remaining set clears the registry and geometry");
+
+    // ---- The flipped buffer read as an IMAGE, not as bytes (#1968) --------------------------------
+    // A registered scanout carries its own tiling mode, and until this was honoured every consumer
+    // that treated the read as pixels got a swizzled surface: Sonic Frontiers' guest-composited
+    // frames reached prosper as horizontal-band noise rather than as the frames they are. The
+    // round trip below is the contract — tile a known image into guest memory exactly as the GPU
+    // would, flip it, and require the present layer to hand back the original linear image.
+    {
+        constexpr uint32_t kW = 256, kH = 128;   // one whole SW_64KB_R_X block row: footprint == W*H*4
+        std::vector<uint8_t> reference(static_cast<size_t>(kW) * kH * 4);
+        for (size_t i = 0; i < reference.size(); i += 4) {
+            const size_t texel = i / 4;
+            reference[i + 0] = (uint8_t)(texel & 0xff);
+            reference[i + 1] = (uint8_t)((texel >> 8) & 0xff);
+            reference[i + 2] = (uint8_t)(texel * 7u);
+            reference[i + 3] = 0xff;
+        }
+        const uint32_t tiled_mode = gpu::videoout_scanout_tile_mode(0 /*TILE*/, 4);
+        CHECK(tiled_mode == (uint32_t)gpu::TileMode::Sw64KbRX,
+              "a TILE-mode 32-bpp scanout is the SW_64KB_R_X render-target swizzle");
+        CHECK(gpu::videoout_scanout_tile_mode(1 /*LINEAR*/, 4) == (uint32_t)gpu::TileMode::Linear &&
+                  gpu::videoout_scanout_tile_mode(0, 8) == (uint32_t)gpu::TileMode::Linear &&
+                  gpu::videoout_scanout_tile_mode(7 /*unknown*/, 4) == (uint32_t)gpu::TileMode::Linear,
+              "LINEAR, non-32-bpp and unrecognized VideoOut tiling modes stay a straight copy");
+        const size_t tiled_bytes = gpu::tiled_surface_bytes(kW, kH, tiled_mode, 0, 4);
+        CHECK(tiled_bytes == reference.size(),
+              "the chosen extent has no block padding, so the round trip is exact");
+
+        std::vector<uint8_t> tiled_fb(tiled_bytes, 0);
+        gpu::tile_surface(tiled_fb.data(), reference.data(), kW, kH, tiled_mode, 0, 4);
+        CHECK(tiled_fb != reference, "the tiled framebuffer really is swizzled, not a copy");
+        const std::vector<uint8_t> tiled_at_registration = tiled_fb;
+
+        uint8_t tiled_attr[0x50];
+        setba2((uint64_t)(uintptr_t)tiled_attr, fmt, 0 /*TILE*/, kW, kH, option, 0, 0);
+        VOB tiled_buffers[1] = { {tiled_fb.data(), 0, {0, 0}} };
+        CHECK(regb2(handle, 0, 0, (uint64_t)(uintptr_t)tiled_buffers, 1,
+                    (uint64_t)(uintptr_t)tiled_attr) == 0,
+              "registered a TILE-mode scanout");
+        CHECK(flip(handle, 0, 0, 0, 0, 0) == 0, "flipped the TILE-mode scanout");
+
+        gpu::PresentSnapshot snapshot;
+        const bool got = gpu::present_snapshot(snapshot);
+        CHECK(got && snapshot.source == gpu::PresentSource::RawScanout,
+              "with no rendered frame the present layer reads the guest scanout");
+        CHECK(got && snapshot.width == kW && snapshot.height == kH &&
+                  snapshot.rgba.size() == reference.size(),
+              "the guest scanout read is the registered extent, linear");
+        CHECK(got && snapshot.rgba == reference,
+              "a TILE-mode scanout is de-swizzled into the image the guest composited");
+
+        // ---- guest authorship (#2044, review finding B2) -----------------------------------------
+        // The precondition for publishing a flipped buffer as a present source. The buffer here is
+        // full of non-zero bytes and has NOT been written since it was registered, so the predicate
+        // that reverted the first attempt — "not all bytes are zero" — would call this authored.
+        VideoOutLinearRead read;
+        CHECK(videoout_read_front_linear(read) && read.pixels == reference,
+              "the image reader returns the same de-swizzled frame as the present snapshot");
+        CHECK(!read.guest_authored,
+              "a registered-but-unwritten buffer is NOT authored, however non-zero its bytes are");
+
+        // The guest composites into it. Anything that changes the surface counts; this writes the
+        // whole thing, which is what a real composite does.
+        for (size_t i = 0; i < tiled_fb.size(); ++i) tiled_fb[i] = (uint8_t)(tiled_fb[i] ^ 0x5a);
+        CHECK(videoout_read_front_linear(read) && read.guest_authored,
+              "a buffer whose contents changed after registration is authored");
+        // Sticky: authorship already demonstrated is not lost by a later frame that happens to match
+        // the registration baseline — otherwise a title returning to its opening image would flicker.
+        tiled_fb = tiled_at_registration;
+        CHECK(videoout_read_front_linear(read) && read.guest_authored,
+              "authorship is sticky across a frame that coincidentally matches the baseline");
+
+        // Bendy's case (PPSA27616), stated exactly: the SAME memory, still holding a real frame, is
+        // re-registered. Authorship is evidence about one registration, so the new one starts with
+        // none and the branch declines — where "not all bytes are zero" would publish stale bytes.
+        CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the TILE-mode scanout");
+        CHECK(regb2(handle, 0, 0, (uint64_t)(uintptr_t)tiled_buffers, 1,
+                    (uint64_t)(uintptr_t)tiled_attr) == 0 && flip(handle, 0, 0, 0, 0, 0) == 0,
+              "re-registered the same memory, still holding the previous frame");
+        CHECK(videoout_read_front_linear(read) && !read.guest_authored,
+              "re-registering over reused memory does NOT inherit the previous authorship");
+        CHECK(read.pixels == reference,
+              "…and the frame is still read correctly; only the authorship claim is withheld");
+
+        // The raw byte primitive stays raw: a diagnostic that dumps guest memory must keep seeing
+        // exactly what is there, so only the image reader de-swizzles.
+        std::vector<uint8_t> raw;
+        VideoOutBufferSnapshot raw_meta;
+        CHECK(videoout_copy_front_buffer(raw, raw_meta) && raw == tiled_fb,
+              "videoout_copy_front_buffer still returns the untouched guest bytes");
+        CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the reused-memory scanout");
+
+        // LINEAR keeps the historical straight copy end to end.
+        uint8_t linear_attr[0x50];
+        setba2((uint64_t)(uintptr_t)linear_attr, fmt, 1 /*LINEAR*/, kW, kH, option, 0, 0);
+        VOB linear_buffers[1] = { {reference.data(), 0, {0, 0}} };
+        CHECK(regb2(handle, 0, 0, (uint64_t)(uintptr_t)linear_buffers, 1,
+                    (uint64_t)(uintptr_t)linear_attr) == 0,
+              "registered a LINEAR scanout");
+        CHECK(flip(handle, 0, 0, 0, 0, 0) == 0, "flipped the LINEAR scanout");
+        gpu::PresentSnapshot linear_snapshot;
+        CHECK(gpu::present_snapshot(linear_snapshot) && linear_snapshot.rgba == reference,
+              "a LINEAR scanout is published byte-for-byte");
+        CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the LINEAR scanout");
+    }
+
+    // ---- The swizzle footprint is larger than width*height*4, and reading it must be earned -------
+    // An extent with block padding: SW_64KB_R_X blocks are 256x64 texels at 32 bpp, so 256x100 spans
+    // two block rows and its footprint is 256x128x4 — 28,672 bytes past the nominal end, holding real
+    // texels of the second block row rather than bottom padding. Two independent facts must hold
+    // before those bytes may be read: the guest's own registration stride, AND one registered guest
+    // mapping spanning the whole padded range. Each covers the other's blind spot (#2026 review N2),
+    // so all three combinations are asserted.
+    {
+        constexpr uint32_t kW = 256, kH = 100;
+        const size_t linear_bytes = static_cast<size_t>(kW) * kH * 4;
+        const uint32_t tiled_mode = (uint32_t)gpu::TileMode::Sw64KbRX;
+        const size_t tiled_bytes = gpu::tiled_surface_bytes(kW, kH, tiled_mode, 0, 4);
+        CHECK(tiled_bytes > linear_bytes, "this extent's swizzle footprint exceeds width*height*4");
+
+        std::vector<uint8_t> reference(linear_bytes);
+        for (size_t i = 0; i < reference.size(); i += 4) {
+            const size_t texel = i / 4;
+            reference[i + 0] = (uint8_t)(texel * 5u);
+            reference[i + 1] = (uint8_t)(texel >> 4);
+            reference[i + 2] = (uint8_t)(texel | 1u);
+            reference[i + 3] = 0xff;
+        }
+        // What a truncated read can produce, derived rather than hand-picked so the expectation is
+        // independent of the block geometry.
+        std::vector<uint8_t> expected_partial(linear_bytes, 0);
+        {
+            std::vector<uint8_t> whole(tiled_bytes, 0), readable(tiled_bytes, 0);
+            gpu::tile_surface(whole.data(), reference.data(), kW, kH, tiled_mode, 0, 4);
+            std::copy(whole.begin(), whole.begin() + linear_bytes, readable.begin());
+            gpu::detile_surface(expected_partial.data(), readable.data(), kW, kH, tiled_mode, 0, 4);
+        }
+        CHECK(expected_partial != reference,
+              "truncating the read really does cost image content, so these arms can differ");
+
+        uint8_t padded_attr[0x50];
+        setba2((uint64_t)(uintptr_t)padded_attr, fmt, 0 /*TILE*/, kW, kH, option, 0, 0);
+
+        // (a) Both proofs hold: two buffers one whole footprint apart, inside one guest mapping that
+        // spans them. This is how a real VideoOut set is allocated.
+        std::vector<uint8_t> pair(tiled_bytes * 2, 0);
+        gpu::tile_surface(pair.data(), reference.data(), kW, kH, tiled_mode, 0, 4);
+        host::notify_guest_mapping_added((uint64_t)(uintptr_t)pair.data(), pair.size(), true);
+        VOB pair_buffers[2] = { {pair.data(), 0, {0, 0}},
+                                {pair.data() + tiled_bytes, 0, {0, 0}} };
+        CHECK(regb2(handle, 0, 0, (uint64_t)(uintptr_t)pair_buffers, 2,
+                    (uint64_t)(uintptr_t)padded_attr) == 0 && flip(handle, 0, 0, 0, 0, 0) == 0,
+              "registered and flipped a padded-footprint scanout whose allocation is proven");
+        VideoOutLinearRead proven;
+        CHECK(videoout_read_front_linear(proven) && proven.padded_footprint &&
+                  proven.pixels == reference,
+              "with both proofs the whole image de-swizzles, padded block row included");
+        CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the proven-footprint scanout");
+        host::notify_guest_mapping_removed((uint64_t)(uintptr_t)pair.data(), pair.size());
+
+        // (b) The stride proof alone is not enough — the N2 case. Two buffers far apart, each owning
+        // only width*height*4: the smallest registered distance is comfortably larger than the
+        // footprint, so the stride test passes, and only the mapping test stops a silent over-read
+        // into whatever follows the allocation (~240 KiB of it at 4K).
+        std::vector<uint8_t> apart(tiled_bytes * 4, 0);
+        gpu::tile_surface(apart.data(), reference.data(), kW, kH, tiled_mode, 0, 4);
+        const uint64_t first = (uint64_t)(uintptr_t)apart.data();
+        const uint64_t second = first + tiled_bytes * 2;
+        host::notify_guest_mapping_added(first, linear_bytes, true);
+        host::notify_guest_mapping_added(second, linear_bytes, true);
+        VOB apart_buffers[2] = { {apart.data(), 0, {0, 0}},
+                                 {apart.data() + tiled_bytes * 2, 0, {0, 0}} };
+        CHECK(regb2(handle, 0, 0, (uint64_t)(uintptr_t)apart_buffers, 2,
+                    (uint64_t)(uintptr_t)padded_attr) == 0 && flip(handle, 0, 0, 0, 0, 0) == 0,
+              "registered and flipped two separately allocated buffers that land far apart");
+        VideoOutLinearRead unmapped;
+        CHECK(videoout_read_front_linear(unmapped) && !unmapped.padded_footprint,
+              "a stride wide enough on its own does NOT license reading past the allocation");
+        CHECK(unmapped.pixels == expected_partial,
+              "…and the read stops exactly at the bytes the mapping vouches for");
+        CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the far-apart scanouts");
+        host::notify_guest_mapping_removed(first, linear_bytes);
+        host::notify_guest_mapping_removed(second, linear_bytes);
+
+        // (c) The mapping proof alone is not enough either: one buffer inside a generous mapping
+        // still proves nothing about what follows it, because nothing says the rest of that mapping
+        // is not another object. The image must still come back — de-swizzling the readable part is
+        // far better than handing back swizzled bytes — but it cannot be complete, and that has to
+        // be visible here rather than discovered as a corrupted corner in a title.
+        std::vector<uint8_t> lone(tiled_bytes * 2, 0);
+        gpu::tile_surface(lone.data(), reference.data(), kW, kH, tiled_mode, 0, 4);
+        host::notify_guest_mapping_added((uint64_t)(uintptr_t)lone.data(), lone.size(), true);
+        VOB lone_buffers[1] = { {lone.data(), 0, {0, 0}} };
+        CHECK(regb2(handle, 0, 0, (uint64_t)(uintptr_t)lone_buffers, 1,
+                    (uint64_t)(uintptr_t)padded_attr) == 0 && flip(handle, 0, 0, 0, 0, 0) == 0,
+              "registered and flipped a lone padded-footprint scanout inside a large mapping");
+        VideoOutLinearRead unproven;
+        CHECK(videoout_read_front_linear(unproven) && !unproven.padded_footprint,
+              "a single registered buffer never licenses the padded read, mapped or not");
+        CHECK(unproven.pixels.size() == linear_bytes && unproven.pixels == expected_partial,
+              "an unproven footprint de-swizzles precisely the bytes it is allowed to read");
+        size_t matching = 0;
+        for (size_t i = 0; i + 3 < reference.size(); i += 4)
+            if (std::equal(reference.begin() + i, reference.begin() + i + 4,
+                           unproven.pixels.begin() + i)) ++matching;
+        CHECK(matching > reference.size() / 4 / 2 && matching < reference.size() / 4,
+              "most of the image survives the truncation, but demonstrably not all of it");
+        CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the lone scanout");
+        host::notify_guest_mapping_removed((uint64_t)(uintptr_t)lone.data(), lone.size());
+    }
 
     const uint64_t before_blank_flip = prosper_vo_flip_count();
     CHECK(flip(handle, (uint64_t)(int64_t)-1, 0, 0, 0, 0) == 0 &&
