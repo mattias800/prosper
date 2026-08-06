@@ -1985,8 +1985,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     //     away. Without it a target with a genuine fall-through predecessor can qualify, and the
     //     restore then installs a *known* wrong value — a worse failure than the bug being fixed.
     //   * prev must be an UNCONDITIONAL `s_branch`, so no fall-through edge enters the target.
-    //   * EXACTLY ONE branch anywhere in the program targets it, counted over BOTH directions.
-    //     A backward edge into the target is a second predecessor and disqualifies it.
+    //   * EXACTLY ONE branch in the DECODED STREAM targets it, counted over BOTH directions. A
+    //     backward edge into the target is a second predecessor and disqualifies it. "Decoded
+    //     stream" rather than "program" is deliberate: the decode stops at the first s_endpgm, so
+    //     anything past it is not scanned. B1 existed because a property of a stream was described
+    //     as a property of a program, so the distinction is spelled out rather than assumed.
     //   * The program contains no indirect control transfer at all; one makes the CFG
     //     unrepresentable by any scan over SOPP displacements, so the rule declines to fire.
     //
@@ -2077,7 +2080,27 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         std::array<VertexFetchIndexMode, kFoldVgprs> vector_index_mode;
         int scc;
     };
-    std::vector<std::pair<uint32_t, FoldStateSnapshot>> saved_at_branch;   // (branch pc, state at it)
+    // One slot per qualifying target, indexed rather than searched: each target has exactly one
+    // predecessor branch, so `restore_slot[i]` is the slot that `restore_at[i]`'s branch fills.
+    // `.first` is "this slot has been written", so a target reached before its branch (impossible for
+    // a forward edge, but cheap to be safe about) restores nothing rather than garbage.
+    std::vector<std::pair<bool, FoldStateSnapshot>> saved_at_branch;
+    std::vector<size_t> restore_slot;
+    std::unordered_map<uint32_t, size_t> save_slot_of_pc;
+    if (!restore_at.empty()) {
+        restore_slot.reserve(restore_at.size());
+        saved_at_branch.reserve(restore_at.size());
+        for (const auto& [target, branch_pc] : restore_at) {
+            (void)target;
+            auto existing = save_slot_of_pc.find(branch_pc);
+            if (existing == save_slot_of_pc.end()) {
+                existing = save_slot_of_pc.emplace(branch_pc, saved_at_branch.size()).first;
+                saved_at_branch.emplace_back();
+                saved_at_branch.back().first = false;
+            }
+            restore_slot.push_back(existing->second);
+        }
+    }
     auto capture_fold_state = [&]() {
         FoldStateSnapshot s;
         s.val = val; s.val_known = val_known;
@@ -2202,25 +2225,38 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
 
     for (const auto& in : ins) {
         if (in.is_end) break;
-        // #2132. Save the state at a branch that is some later target's ONLY predecessor...
-        if (!restore_at.empty())
-            for (const auto& [target, branch_pc] : restore_at)
-                if (branch_pc == in.pc) { saved_at_branch.emplace_back(in.pc, capture_fold_state()); break; }
-        // ...and put it back on arrival at that target, discarding everything the walk did on the
-        // path the branch skips. `restore_at` is ascending by target and so is the walk.
+        // #2132. RESTORE FIRST, THEN SAVE — the order is load-bearing and getting it wrong
+        // reproduces the very defect this rule exists to fix (#2202 review, B3). One instruction can
+        // be BOTH a qualifying target and the sole-predecessor branch of a later target: a block
+        // whose first instruction is a branch, which is ordinary compiler output. Saving first would
+        // store the pre-restore chimera and reinstate it one block later, so the second target would
+        // be handed exactly the mixed-path state the rule is meant to remove.
+        //
+        // Arrival at a target: put back the state its only predecessor left, discarding everything
+        // the walk did on the path that branch skips. `restore_at` is ascending by target, as is the
+        // walk, so a cursor suffices.
         while (restore_cursor < restore_at.size() && restore_at[restore_cursor].first < in.pc)
             ++restore_cursor;
         if (restore_cursor < restore_at.size() && restore_at[restore_cursor].first == in.pc) {
-            const uint32_t branch_pc = restore_at[restore_cursor].second;
-            for (auto it = saved_at_branch.rbegin(); it != saved_at_branch.rend(); ++it)
-                if (it->first == branch_pc) {
-                    restore_fold_state(it->second);
-                    if (trc)
-                        fprintf(stderr, "[dyntrace]   branch-exclusive: pc=%u restored the fold state to "
-                                        "pc=%u (its only predecessor); every write in between is on the "
-                                        "path that branch skips\n", in.pc, branch_pc);
-                    break;
-                }
+            const size_t slot = restore_slot[restore_cursor];
+            if (slot < saved_at_branch.size() && saved_at_branch[slot].first) {
+                restore_fold_state(saved_at_branch[slot].second);
+                if (trc)
+                    fprintf(stderr, "[dyntrace]   branch-exclusive: pc=%u restored the fold state to "
+                                    "pc=%u (its only predecessor); every write in between is on the "
+                                    "path that branch skips\n",
+                            in.pc, restore_at[restore_cursor].second);
+            }
+        }
+        // ...and only now record the state at this instruction, if it is itself some later target's
+        // only predecessor. Each source appears at most once in `restore_at`, so this is an indexed
+        // store rather than a scan.
+        if (!save_slot_of_pc.empty()) {
+            const auto slot = save_slot_of_pc.find(in.pc);
+            if (slot != save_slot_of_pc.end()) {
+                saved_at_branch[slot->second].first = true;
+                saved_at_branch[slot->second].second = capture_fold_state();
+            }
         }
         const bool scalar_spill = in.fmt == Rdna2Format::VOP3 &&
                                   (in.opcode == 0x360 || in.opcode == 0x361);

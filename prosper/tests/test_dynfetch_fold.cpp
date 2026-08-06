@@ -2439,6 +2439,33 @@ int main() {
               k10_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
           "#2202: an indirect control transfer disables the rule for the whole program");
 
+    // Kernel 11 (#2202 B3): TWO qualifying targets, where the second's sole-predecessor branch IS
+    // the first target. `pc=4` is both — it is entered only from `pc=0` (so it is a target), and it
+    // is the only branch reaching `pc=8` (so it is a predecessor). If the walk saves the state at
+    // `pc=4` BEFORE restoring it, the snapshot handed to `pc=8` is the pre-restore chimera and the
+    // clobbered s[16:17] is reinstated one block later — the #2132 defect reproduced by the fix's own
+    // bookkeeping. Neither region is on the path that reaches `pc=8`, so the seeded table pointer
+    // must survive both.
+    //
+    // None of k6-k10 has two qualifying targets, which is exactly why this shape got through the
+    // first round: an absent case cannot fail.
+    const uint32_t k11[] = {
+        0xBF860003u,                // pc=0  s_cbranch_vccz 3     -> pc=4
+        0xF4300404u, 0xFA000060u,   // pc=1  region 1: clobbers s16..s31 with cbuf floats
+        0xBF820008u,                // pc=3  s_branch 8           -> pc=12 (so pc=4 has no fall-through)
+        0xBF840003u,                // pc=4  TARGET 1, and the only branch into pc=8: s_cbranch_scc0 3
+        0xF4300404u, 0xFA000060u,   // pc=5  region 2: clobbers s16..s31 again
+        0xBF820004u,                // pc=7  s_branch 4           -> pc=12 (so pc=8 has no fall-through)
+        0xF4080108u, 0xFA000000u,   // pc=8  TARGET 2: s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=10 buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF810000u,                // pc=12 s_endpgm
+    };
+    clear_shader_decode_cache();
+    auto k11_fetch = resolve_dynamic_fetch(k11, sizeof(k11)/sizeof(k11[0]), seed6, 12, 8);
+    CHECK(k11_fetch.size() == 1 &&
+              k11_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "#2202 B3: a target that is itself the next target's predecessor saves the RESTORED state");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
