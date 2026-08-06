@@ -106,9 +106,10 @@ Two measured leads, both recorded on [#2013](https://github.com/mattias800/prosp
 - **Draws are dropped because one of their two shader stages does not recompile.**
   `[exec-recompile-reject]` names the pair (`es=…`/`ps=…`) whose draws are skipped and reports each
   stage's emitted SPIR-V size, so it also says *which* stage failed. **Four** `(es, ps)` pairs are
-  affected on every arm, not the two the first census recorded: `vs=4445 fs=0` and `vs=1346 fs=0`
-  fail in the **pixel** shader, and two pairs sharing one `es` at `vs=0 fs=88449` / `vs=0 fs=139235`
-  fail in the **vertex** shader. The occurrence counter (logged on powers of two) reaches **256+**
+  affected on every arm, not the two the first census recorded: two report `fs=0` and so fail in the
+  **pixel** shader, and two more — sharing one `es` — report `vs=0` and fail in the **vertex**
+  shader. Those numbers are per-stage SPIR-V word counts, so a zero names the stage that produced
+  nothing; they are not shader identifiers, and the non-zero one is not a name for the pipeline. The occurrence counter (logged on powers of two) reaches **256+**
   for one of them, so this is hundreds of dropped draws per boot.
 - **Eight distinct compute programs are skipped** (`[compute] skip unsupported program`), plus one
   3D-tile volume dispatch skipped under #590.
@@ -130,20 +131,52 @@ dump offline, and the exact logged words can be located by index inside those du
 | the dropped **graphics** pipelines | 4 → **2** | a **descriptor resolution**, never a missing opcode |
 | the skipped **compute** programs | 8 | missing instructions, and unstructured control flow |
 
-Every one of the four dropped pipelines fails on an unresolved descriptor:
+At the census above, every one of the four dropped pipelines failed on an unresolved descriptor.
+The lines are reproduced **unedited** — no `-- FIXED` marker or other annotation inside the block —
+because their field values are the evidence for the reading that follows, and an annotated copy
+cannot carry it. **Two of the three are now fixed by #2131**; that is stated after the block rather
+than inside it, so the excerpt stays verbatim and the current status stays unmissable:
 
 ```text
-[mimg-unresolved]  pc=80   srsrc=s0  srt_tag=NONE  (ps 4445, image_sample)     -- FIXED
-[mimg-unresolved]  pc=654  srsrc=s8  srt_tag=0x60  (ps 1346, image_sample_lz)  -- FIXED
-[mubuf-unresolved] pc=211  srsrc=s4  srt_tag=NONE  (the shared vs, buffer_load_format_xyz)
+[mimg-unresolved] pc=80 srsrc=s0 srt_tag=NONE 0x0 key_res=null pc_res=null (7 res)
+[mimg-unresolved] pc=654 srsrc=s8 srt_tag=0x60 key_res=null pc_res=null (12 res)
+[mubuf-unresolved] pc=211 srsrc=s4 srt_tag=NONE 0x0 key_res=null (5 res)
 ```
+
+**Status now: the two `[mimg-unresolved]` lines are FIXED (#2131); the `[mubuf-unresolved]` one is
+not.** Dropped pipelines went 4 → 2 and `[mimg-unresolved]` 10 → 0.
+
+Read those lines the way the reject path does, not by pattern-matching the tag. **`[mimg-unresolved]`
+prints on a wider condition than the one that rejects**: it fires whenever `res` is null *or* carries
+a class that is neither Texture nor StorageImage, while the reject immediately below is `if (!res)`.
+For MIMG `0x00`/`0x0e` the class filter above it deliberately does not null a wrong-class `res`, so
+the line can print on a resolved descriptor and **not** reject.
+
+**And the two fields it prints are not the whole story.** `res` has *three* provenances —
+`by_fetch_pc`, `by_srt_offset`, and `by_sgpr_base` — but the printf reports only the first two, as
+`pc_res` and `key_res`. `by_sgpr_base` is class-blind and is never named in the output. So
+`key_res=null pc_res=null` is **necessary but not sufficient**: it does not by itself establish that
+`res` is null.
+
+**#2131 is the confirming instance, and it is stronger than the argument.** Both of those pixel-stage
+lines printed with `key_res=null pc_res=null`, and the const-fold nevertheless **recovered the T#
+exactly** from both provenance routes. The descriptor was resolved and then discarded during
+*materialization* by a `base_array != 0 → continue` guard — so the reject line was reporting a
+downstream refusal while reading, to anyone who trusted the two printed fields, as a provenance
+failure. Two lines that look like "the descriptor could not be found" meant "the descriptor was found
+and thrown away." That is why the excerpt above is kept raw.
+
+Note also that the live vertex stage reports `(5 res)`, not `no-table`: it *has* a resource table and
+the key lookup fails inside it. (A table-less `shader_inspect` run of the same shader prints
+`key_res=no-table` instead, which is the tool's limitation, not the guest's behaviour — see
+*Ruled out*.)
 
 So **`buffer_load_format_xyz` was never a missing opcode.** `e0082000,6a010000` disassembles to
 `buffer_load_format_xyz v[0:2], v0, s[4:7], vcc_lo idxen`, which the recompiler has always
 supported; its V# does not resolve. It belongs with the two `[mimg-unresolved]` failures and the
 bindless-descriptor work, exactly where the two MIMG rejects were already assigned.
 
-The consequence is load-bearing: **finishing the opcode list cannot change what the four dropped
+The consequence is load-bearing: **finishing the opcode list cannot change what those dropped
 draws do**, because not one of them is blocked on an opcode. Opcode work can only restore compute
 programs — which is still worth doing (a skipped LUT or exposure dispatch is a documented way a
 whole composite collapses), but it is not the lever for these draws.
@@ -262,8 +295,25 @@ which is why it peels rather than showing its whole requirement at once.
   with the same dim (MIMG `0x11`) — arrayed-image sampling and atomics, the deferred MIMG features
   already inventoried in [`RECOMPILER_REMAINING.md`](RECOMPILER_REMAINING.md).
 - The three `[mimg-unresolved]` / `[mubuf-unresolved]` descriptor failures above.
-- One "program" at `0x2d800d0000` that is **12,916 dwords of zero**. It is not a shader; treat a
+- One "program" (address is run-local) that is **12,916 dwords of zero**. It is not a shader; treat a
   reject at `pc=0 words=00000000,00000000` as a bad `code_addr`, not as an opcode gap.
+- **A fourth `[mimg-unresolved]`, newly exposed.** `pc=686 srsrc=s40 srt_tag=0x60 key_res=null
+  pc_res=null (47 res)` appears **only** on the arm taken after every tier above landed: `pc=686`
+  occurs 0 times in the base, first-tier and second-tier census arms and 20 times in the last one.
+  It is in a **compute** program that previously stopped at an arithmetic op long before reaching
+  it — in the first-tier arm that same shader was still stopping at `pc=34`/`101`/`113`/`115`/`130`
+  (the VOPC `0xab`, `s_flbit`, and the two 16-bit converts). So the opcode work did move something
+  measurable — just not a pixel: it advanced a compute program far enough to hit the same
+  descriptor frontier the graphics pipelines are stuck on.
+
+  **The stage is established from the shader dump, not from the adjacent diagnostic.** It would be
+  natural to read "compute" off the `[cfg-recompile-reject]` line printed at the same pc, and that
+  inference is wrong: `emit_cfg_state_machine` is reached from graphics too (`rdna2_to_spirv.cpp`,
+  the `complex_graphics_cfg` caller, whose own comment says the dispatcher selects from "this
+  pixel/vertex's SCC, VCC, or EXEC bit"). What settles it is locating the exact word at the exact pc
+  inside the retained `PROSPER_SHADER_DUMP` binaries: `word[686] == 0xf09c0f28` lands in an
+  `exec_cs_*.bin` — the same 2,348-dword compute shader in every arm that contains it (the addresses
+  in those filenames are run-local).
 
 ## Unimplemented-call census (default launch, current master + #2012)
 

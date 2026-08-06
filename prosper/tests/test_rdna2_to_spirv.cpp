@@ -3259,6 +3259,74 @@ int main() {
     CHECK(got32r18b.size()==1 && bits_of(got32r18b[0])==0x42003c00u,
           "kernel 32r18b selects each source's half through OPSEL and writes the whole dword");
 
+    // Kernel 32r19 (LIVE shape, exec_cs_25c0066900 pc=101-106; raised in review of the #2013 PR):
+    // `s_flbit_i32_b64` writing **VCC_LO used as scalar data**, then read back. The four arms above
+    // all write an ordinary SGPR, so none of them covered the `rs.vcc = 0` invalidation that this
+    // destination needs, nor the `rs.sreg` write that the read-back goes through.
+    //   s[0:1] = 0x0000000000080000 -> 44 leading zeros; 64 - 44 = 20 = the highest set bit + 1,
+    //   which is exactly what the guest computes here before feeding it to v_ldexp_f32.
+    const uint32_t code32r19[] = {
+        0xbe8003ffu, 0x00080000u,            // s_mov_b32 s0, 0x00080000
+        0xbe810380u,                          // s_mov_b32 s1, 0
+        0xbeea1600u,                          // s_flbit_i32_b64 vcc_lo, s[0:1]   -> 44
+        0x81ea6ac0u,                          // s_sub_i32 vcc_lo, 64, vcc_lo     -> 20
+        0x7e00026au,                          // v_mov_b32 v0, vcc_lo
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r19 = recompile_valu(code32r19, std::size(code32r19), 0, 0);
+    CHECK(!spv32r19.empty(), "recompiled kernel 32r19 (live s_flbit into VCC_LO as scalar data) -> SPIR-V");
+    std::vector<float> got32r19 = spv32r19.empty()
+        ? std::vector<float>()
+        : prosper::test::run_compute(spv32r19, std::vector<float>(1), 1, 1);
+    CHECK(got32r19.size()==1 && bits_of(got32r19[0])==20u,
+          "kernel 32r19 writes s_flbit's result into VCC_LO and reads it back as scalar data");
+
+    // Kernel 32r19b: the OTHER half of that destination's contract, which 32r19 does not observe.
+    // Overwriting VCC_LO with scalar data destroys whatever predicate the pair held, so the emitter
+    // drops the tracked mask (`rs.vcc = 0`) and a later per-lane consumer of VCC must REJECT rather
+    // than branch on a value the guest has already overwritten. Arm VCC with a real compare first,
+    // so that without the invalidation the v_cndmask below would happily compile against the stale
+    // predicate — which is exactly the regression this arm exists to catch.
+    const uint32_t code32r19b[] = {
+        0x7e000281u,                          // v0 = 1
+        0x7e020287u,                          // v1 = 7
+        0x7d820300u,                          // v_cmp_lt_u32 vcc_lo, v0, v1   (VCC now holds a mask)
+        0xbe8003ffu, 0x00080000u,            // s_mov_b32 s0, 0x00080000
+        0xbe810380u,                          // s_mov_b32 s1, 0
+        0xbeea1600u,                          // s_flbit_i32_b64 vcc_lo, s[0:1]  (VCC is data now)
+        0x02040903u,                          // v_cndmask_b32 v2, v3, v4, vcc_lo  -> must reject
+        0xbf810000u,
+    };
+    CHECK(recompile_valu(code32r19b, std::size(code32r19b), 0, 2).empty(),
+          "kernel 32r19b REJECTS a VCC predicate read after s_flbit overwrote the pair with data");
+
+    // Kernel 32r20 (LIVE encoding, exec_cs_290000eb00 pc=34; raised in review): the **SDWA** form of
+    // the 16-bit compare. 32r16 covers the plain e32 encodings, so nothing executed the composition
+    // of the SDWA source select with the 16-bit narrowing until this kernel.
+    //   v1 = 0xffff0001, v2 = 2. src0_sel:WORD_1 reads 65535 (65535 <= 2 is FALSE); src0_sel:WORD_0
+    //   reads 1 (1 <= 2 is TRUE). The two v_cndmask results therefore pick different sources and
+    //   their xor is non-zero; an implementation that ignored src0_sel picks the same source twice
+    //   and the xor collapses to 0.
+    const uint32_t code32r20[] = {
+        0x7e0202ffu, 0xffff0001u,            // v1 = {hi=0xffff, lo=1}
+        0x7e040282u,                          // v2 = 2
+        0x7e0802ffu, 0xaaaa0000u,            // v4
+        0x7e0a02ffu, 0x0000bbbbu,            // v5
+        0x7d5604f9u, 0x06050001u,            // v_cmp_le_u16_sdwa vcc, v1, v2 src0_sel:WORD_1 -> false
+        0x02060b04u,                          // v_cndmask_b32 v3, v4, v5, vcc -> v4
+        0x7d5604f9u, 0x06040001u,            // v_cmp_le_u16_sdwa vcc, v1, v2 src0_sel:WORD_0 -> true
+        0x020c0b04u,                          // v_cndmask_b32 v6, v4, v5, vcc -> v5
+        0x3a0e0d03u,                          // v_xor_b32 v7, v3, v6
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r20 = recompile_valu(code32r20, std::size(code32r20), 0, 7);
+    CHECK(!spv32r20.empty(), "recompiled kernel 32r20 (live v_cmp_le_u16_sdwa) -> SPIR-V");
+    std::vector<float> got32r20 = spv32r20.empty()
+        ? std::vector<float>()
+        : prosper::test::run_compute(spv32r20, std::vector<float>(1), 1, 1);
+    CHECK(got32r20.size()==1 && bits_of(got32r20[0])==0xaaaabbbbu,
+          "kernel 32r20 composes the SDWA source select with the 16-bit compare narrowing");
+
     // Kernel 32p: exact live v_cndmask_b32_sdwa selects src1 WORD_0 through VCC, writes WORD_1,
     // and preserves the destination's low half.
     const uint32_t code32p[] = {

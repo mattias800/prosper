@@ -6611,9 +6611,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // NEG_LO/NEG_HI on a packed INTEGER source: applied as a flip of bit 15 of the
                 // selected 16-bit half — physically the same shared sign-negate the packed f16 path
                 // above already models with fneg, sitting between the operand read and the ALU and
-                // indifferent to how the ALU then interprets the bits. CONFIDENCE: MED — this is
-                // derived from live evidence, not from a published statement, so here is the
-                // derivation. All FOUR sites in this title that set the bits use the same literal
+                // indifferent to how the ALU then interprets the bits. CONFIDENCE: MED — the
+                // derivation below is LIVE evidence, and no published statement confirms it.
+                //
+                // DO NOT RAISE THIS TO HIGH ON THE LLVM CITATION. It was tried and withdrawn. Two
+                // things were offered as "published support" and neither holds: (1) LLVM's AMDGPU
+                // modifier reference says of neg_lo/neg_hi "This modifier is valid for
+                // floating-point operands only" — that is a RESTRICTION, and if anything it cuts
+                // AGAINST applying the bit to an integer opcode, which is exactly the unpublished
+                // step this MED is hedging; (2) the claim that LLVM folds `xor 0x80008000` into
+                // neg_lo/neg_hi for integer packed ops traces to llvm-project PR #130234, which was
+                // merged and REVERTED the same day and covered the dot-product family, not
+                // v_pk_add_u16/v_pk_max_i16. Under the charter's evidence hierarchy that is a single
+                // secondary implementation — tier 4, hypothesis only.
+                //
+                // What actually carries the reading is the live derivation, and it is strong. All
+                // FOUR sites in this title that set the bits use the same literal
                 // `0x00007fff` and set NEG_LO[0] and NEG_HI[0] together, with OPSEL/OPSEL_HI
                 // selecting that literal's LOW half:
                 //   * `v_pk_add_u16 v4, -(0x7fff), v2 op_sel:[0,1] op_sel_hi:[0,0]` produces the

@@ -270,6 +270,13 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`shader_inspect/`** — decode one raw `PROSPER_SHADER_DUMP` binary offline. It prints bounded
   instruction PCs, operands, raw words, signed branch immediates, and resolved branch targets so a
   failed shader's CFG can be mapped without hand-counting variable-length instructions.
+  **And it answers "which opcode?", never "which value?" (#2132).** A fold that stops early looks
+  identical whether it ran out of modelled opcodes or out of *readable data* — the reject line is the
+  same — and a disassembler can only see the first. Sonic Racing: CrossWorlds' failing vertex fetch
+  was hypothesised from a static read as a runtime-selected descriptor the fold could not model; it
+  models that idiom completely, and the real cause was a **null pointer** read out of a constant
+  buffer the fold read correctly. When the chain runs through memory, use `PROSPER_DYNTRACE_FAIL=1`,
+  which reports `base_ok`/`soff_ok`/`unreadable` per step, before reaching for this tool.
   **`--stage` cannot prove a shader is unsupported (#1571).** A raw dump has no descriptors, so the tool
   has no `ShaderResourceTable`, and the recompiler correctly refuses `MIMG`/`MUBUF`/`MTBUF` in any stage
   plus `SMEM` in the vertex/fragment stages (`recompile_fragment_impl` / `recompile_vertex_impl` gate on
