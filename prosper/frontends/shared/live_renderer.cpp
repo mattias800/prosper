@@ -3862,7 +3862,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // Focused per-consumer version probe (#586). Hash both the raw guest backing
                         // and the final decoded/RTT-injected pixels so a live draw identifies whether
                         // divergence precedes format conversion or enters through renderer-owned state.
-                        if (resource_hash_w == tw && resource_hash_h == th) {
+                        // Unset parses to 0x0; require the probe to have been requested (see the
+                        // matching guard on the pass hash below).
+                        if (resource_hash_w && resource_hash_h &&
+                            resource_hash_w == tw && resource_hash_h == th) {
                             const size_t raw_size = std::min<size_t>(
                                 r.size ? r.size : volume_texels * 4, 64u << 20);
                             std::vector<uint8_t> raw(raw_size, 0);
@@ -5621,7 +5624,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             surface.rgba.reset();
                     }
                     const std::vector<uint8_t>& rendered_pixels = *pass_pixels;
-                    if (native_w == resource_hash_w && native_h == resource_hash_h &&
+                    // Both dims parse to 0 when PROSPER_RESOURCE_HASH_DIM is UNSET, so an extent
+                    // comparison alone made every 0x0 pass satisfy the filter and switch the
+                    // diagnostic on by itself. Require it to have actually been requested.
+                    if (resource_hash_w && resource_hash_h &&
+                        native_w == resource_hash_w && native_h == resource_hash_h &&
                         !rendered_pixels.empty()) {
                         uint64_t hash = 1469598103934665603ull;
                         for (uint8_t byte : rendered_pixels) {
@@ -5647,7 +5654,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 first ? first->ps.clear_color[3] : 0.0f,
                                 (unsigned long long)hash);
                     }
-                    if (native_w == target_step_w && native_h == target_step_h &&
+                    // Same unset-is-0 trap as the resource hash above, and far more expensive here:
+                    // the loop below re-renders every growing draw prefix, so a 0x0 pass silently
+                    // turned one pass into O(draws^2) rendering plus a readback and pixel census per
+                    // step. Require PROSPER_TARGET_STEP_HASH_DIM to have actually been requested.
+                    if (target_step_w && target_step_h &&
+                        native_w == target_step_w && native_h == target_step_h &&
                         render_pass.size() >= target_step_min_draws) {
                         for (size_t k = 1; k <= render_pass.size(); ++k) {
                             std::vector<const prosper::gpu::DrawItem*> prefix(
