@@ -583,9 +583,10 @@ correct; the default route still faults.* Closing that gap means making prosper'
 correctly without the artificial delay, which is now the whole of #1226 and #1945. The next lane
 should start from the dose-response threshold — **measured on this title as `(500, 1500]`**, see the
 following section — and ask what the guest observes during that window, not what value ends up in the
-pointer. Two candidate answers are already eliminated there: the throttle does not shorten the guest's
-build-to-submit interval (it lengthens it), and honouring the guest's `WAIT_REG_MEM` barriers
-(`PROSPER_WAIT_DEFER=1`) does not rescue the title.
+pointer. One candidate answer is already eliminated there: honouring the guest's `WAIT_REG_MEM`
+barriers (`PROSPER_WAIT_DEFER=1`) does not rescue the title, 3 of 3 with the lever witnessed. A
+second — that the throttle shortens the guest's build-to-submit interval — is **unmeasured rather
+than eliminated**: the sample that appeared to settle it was selected for the condition under test.
 
 **Two defects visible in the frames, both new and neither blocking rung 1:**
 
@@ -651,7 +652,8 @@ submit duration, at the same bracket. It is still not a general law, and #2084 s
 to make it one is the error to avoid: one env var makes the arm cheap. The right reading is that two
 independently-brought-up UE4 titles put the boundary in the same 500–1500 us window, which makes it a
 property of prosper's submit timing rather than of either guest — but a third title still owes its own
-twelve arms.
+twelve arms. `CRISIS_CORE_STATUS.md` states the same limit from the other side, and is the doc to read
+for that title's arms.
 
 ### What the arms say beyond the survival table
 
@@ -693,24 +695,49 @@ seven are accounted for on a default build:
 | `REL1-FORGE` branch | **reports before it returns**; zero `REL1-FORGE` lines in all 15 arms |
 
 Two of the seven announce themselves and did not fire; four are default-OFF levers nobody armed; the
-one genuinely silent path is contradicted by an unconditional counter. So control reached the overlap
-check on every `RELEASE_MEM` data_sel 1 in every arm.
+one genuinely silent path is contradicted by an unconditional counter.
+
+**And the positive form closes it outright, which is the evidence to quote rather than the table
+above.** The success path records `LE_REL_EXEC` at `label_hist_rel_exec` — *downstream* of the overlap
+check — while the three suppression branches record theirs upstream at their own `return`s. So a
+`relX` event in a label ring is a witness that control passed the tripwire. The surviving arms carry
+**53, 74, 82, 94, 109 and 119** of them. With zero `REL1-LIVE` and zero `REL1-FORGE` lines (both
+branches report before returning) and `PROSPER_NONHEAP_PTR_GUARD` unarmed, every one of those `relX`
+events was recorded on the success path. The tripwire was reached and returned zero.
 
 It is also a much sharper statement than the survival table alone: the tripwire is a **selector for one
 of the two terminal classes**, present in 4 of 4 allocator-pop arms and absent from 2 of 2 null-jump
 arms — while the throttle removes *both*.
 
-**2. The throttle does not work by shortening the guest's build-to-submit gap — it lengthens it.**
-Pairing each label ring's last `dmaB` (the guest's own AGC builder call) with the following `dmaX`
-(prosper executing that packet at fold time) gives the interval the 2026-08-06 sections identify as
-the exposure window. Median over 51–80 pairs per arm: **229–389 ms and 3–5 folds in the dying arms,
-347–584 ms and 6 folds in the surviving ones.** Every surviving arm has a longer median gap than every
-dying arm. Whatever the stall buys, it is not prosper catching up inside that interval.
+**2. No evidence that the throttle shortens the guest's build-to-submit gap — and the obvious way to
+measure it is confounded.** Pairing each label ring's last `dmaB` (the guest's own AGC builder call)
+with the following `dmaX` (prosper executing that packet at fold time) gives the interval the
+2026-08-06 sections identify as the exposure window. **Do not take that sample over all ring-bearing
+lines**, which is how the first revision of this section did it and got a much stronger claim than the
+data supports. Rings are only visible inside diagnostics that embed `label_hist_report`, and the two
+arm classes do not have the same ones: a dying arm carries 1–4 `WaitRegMem` reports and 11–27
+`SUSPECT-REL1-OVERLAP` reports, a surviving arm carries 28–40 `WaitRegMem` reports and **zero**
+overlap reports. Pooling them draws the dying arms' pairs almost entirely from a population that
+exists *only* when a second generation is in flight — i.e. selected for the condition under test.
+
+Restricted to the one population both classes have, the `WaitRegMem` rings:
+
+| | median build→exec gap | pairs |
+| --- | --- | --- |
+| dying arms (6) | 282, 350, 352, 364, 409, 413 ms | 2–8 each, **29 total** |
+| surviving arms (6) | 347, 400, 424, 435, 437, 584 ms | 38–80 each, **363 total** |
+
+The surviving arms are certainly not *shorter*, and if anything longer — but at 2–8 pairs per dying
+arm this supports **no** falsification, only the absence of evidence for the shortening story. The
+strong form of this claim ("the throttle lengthens the interval") is **withdrawn**; it was an artifact
+of the pooled sample. `CONFIDENCE: LOW`, and it needs a per-fold instrument rather than whatever
+rings a diagnostic happens to print.
 
 **3. Unsatisfied `WAIT_REG_MEM` barriers are not the discriminator.** They occur in every arm,
 including all six surviving ones, with recorded packet ages from 3 ms to 445 ms. Their line count is
-print-capped at 40 (`ln < 40 || (ln & 1023) == 0`), so it is a ceiling and not a rate — the surviving
-arms all sit exactly on that ceiling, which says only that they ran long enough to reach it.
+print-capped at 40 (`ln < 40 || (ln & 1023) == 0`), so it is a ceiling and not a rate. Four of the six
+surviving arms sit exactly on it (40) and two are below (36, 28), so only the four are censored; in
+no case is the number a frequency.
 
 **4. prosper's deferred-stream barrier model is not in the default path at all.** `PROSPER_WAIT_DEFER`
 is **opt-in and default OFF** (`command_processor.cpp`), so on the default route prosper barrels
@@ -760,12 +787,16 @@ bounded by how far the run got.**
 ### Reproduction
 
 ```bash
-# per arm, on ArcRunner's own established route -- ONE binary for all twelve
-PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_PROGRESS=20 PROSPER_AVPLOG=1 \
+# per arm, on ArcRunner's own established route -- ONE binary for all twelve.
+# PROSPER_GUEST_FS=1 is inert on Linux (CLAUDE.md) but was set on every arm, so it is kept here
+# for exactness rather than because it does anything.
+PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_PROGRESS=20 PROSPER_AVPLOG=1 \
   PROSPER_SUBMIT_STALL_US=<unset|500|1500|3000> \
   timeout 120 ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
 
-# score: rc=124 AND zero 'WORKER-THREAD FAULT' AND zero 'unrecognized block|LowLevelFatalError'
+# score (the same expression as the endpoint above): rc=124 AND zero matches for
+#   grep -cE 'WORKER-THREAD FAULT'      AND zero for
+#   grep -cE 'unrecognized block|LowLevelFatalError'
 ```
 
 The control arm leaves `PROSPER_SUBMIT_STALL_US` **unset** rather than setting it to `0`; both are
@@ -1000,7 +1031,7 @@ Do not re-derive these without contradictory new evidence.
 | The rung-1 blocker is a rendering, recompiler, AvPlayer or composite defect somewhere in prosper's graphics path | It is none of those. With `PROSPER_SUBMIT_STALL_US=1500` the title renders its **entire intro cinematic** in 4K — a nebula and the ringed station captioned *TITAN-CLASS SPACE STATION "THE ARC"*, a rainy neon street with a character and reflections, and a *POPULATION: 10 MIL* text card — with **0 of 4** stalled runs faulting against **17 of 17** default runs, 1,901 of 1,908 `GetVideoDataEx` calls succeeding against 31, and ~26.4 M of 33.2 M bytes nonzero per presented frame against RGB 0. Frames opened, not just measured: `assets/screenshots/arcrunner-intro-space-station.png`, `assets/screenshots/arcrunner-intro-city.png`. Every graphics subsystem needed to produce this cinematic runs — geometry, text, composition and presentation are all correct — and the blocker is a submit-timing race. Not a claim that the graphics path is defect-free: the same frames carry a chroma-plane colour fault (#2085). | #1226, #1945 |
 | The ArcRunner corruption is title-specific, so it needs a title-specific fix | The same lever gives the same answer on **Crisis Core** (`PPSA07809`), whose dose-response is 0/3 at no stall, 0/3 at 500 us, 3/3 at 1500 us, 3/3 at 3000 us. **The shared finding was originally the direction only, because ArcRunner had been run at 1500 and 3000 us alone — that caveat is now retired: this title's own twelve arms give 0/3, 0/3, 3/3, 3/3 at the same four doses, so its bracket is `(500, 1500]`, identical to Crisis Core's** (#2084; see § *2026-08-06: the submit-duration dose-response*). Pend-queue residency on Crisis Core peaks at 3 ms, so "our completion writes land late" is false on both titles. Two titles, one lever, one measured threshold: this is a property of prosper's submit timing, not of either guest. It also agrees with this document's own `PROSPER_EOP_WRITE_SYNC` null. It is still not a general law — a third title owes its own dose-response. | #1945, #1894, #1226, #2084 |
 | ArcRunner's `(500, 1500]` threshold is Crisis Core's, imported rather than reproduced, and must be treated as an untested assumption until someone runs the 500 us arm here | The 500 us arm was run: **0 of 3 survived**, all three faulting in the already-recorded family (two at `0x30016000`, one at `rip=0x0`) at 11.6–17.9 s with 31–37 video frames. With 3/3 surviving at 1500 us, this title's bracket is measured, not inherited. Twelve arms, four doses, one binary from `f080fc23`, doses interleaved so load drift cannot align with dose, no passive observer armed (instrument trap 104), and a peer-process census of zero before and after each arm. | #2084, #1226 |
-| The throttle rescues the title by giving prosper time to catch up inside the guest's build-to-submit interval | The interval is **longer** in every surviving arm than in any dying one. Median over 51–80 `dmaB`→`dmaX` pairs per arm: 229–389 ms / 3–5 folds when the arm dies, 347–584 ms / 6 folds when it survives. Whatever the stall buys, it is not a shorter exposure window. Measured from the default-build label rings, so it cost the arms nothing. | #2084, #1226 |
+| ~~The throttle rescues the title by giving prosper time to catch up inside the guest's build-to-submit interval~~ — **NOT ESTABLISHED; this row is withdrawn as filed** | The first revision claimed the opposite (that the interval is *longer* when the arm survives) from a pooled sample of every ring-bearing diagnostic line. That sample is **selected for the condition under test**: rings are only printed inside diagnostics that embed `label_hist_report`, and a dying arm's pairs come almost entirely from its 11–27 `SUSPECT-REL1-OVERLAP` lines, a population a surviving arm has **zero** of. Restricted to the `WaitRegMem` rings both classes have, the medians are 282–413 ms over **29** pairs in the dying arms against 347–584 ms over **363** in the surviving ones — not shorter, but 2–8 pairs per dying arm cannot falsify anything. What stands is only the absence of evidence for the shortening story. `CONFIDENCE: LOW`; needs a per-fold instrument. Caught in review of #2091, not by the author. | #2084, #1226 |
 | prosper's deferred-stream barrier model (#312) is in the default path, so the build-to-exec gap on this title is prosper holding the packet | `PROSPER_WAIT_DEFER` is **opt-in and default OFF** (`src/gpu/command_processor.cpp`). On the default route prosper barrels through an unsatisfied `WAIT_REG_MEM` with the "dependency violated" log and defers nothing — confirmed directly in all twelve dose arms, where the `dependency violated` count equals the unsatisfied-wait count exactly (3/3, 4/4, 2/2, 1/1, 2/2, 4/4, 40/40, 36/36, 28/28, 40/40, 40/40, 40/40) and the barrier model's own marker `pausing queue (deferred effects)` appears **0 times in all twelve**, against 1 in each of the three `PROSPER_WAIT_DEFER=1` arms. The ~250–580 ms build-to-exec gap is therefore entirely the **guest's own** build-ahead. | #2084, #1226 |
 | Honouring the guest's `WAIT_REG_MEM` barriers instead of barrelling through them fixes the title — the obvious non-throttle candidate, and the one #312's original 5/5 evidence points at | `PROSPER_WAIT_DEFER=1`, three arms on the same binary and route with no throttle: **3 of 3 faulted**, at 11.4/13.6/11.4 s with 61/34/35 video frames, all in the `addr=(nil) rip=0x0` `AudioMixerRende` class, with `SUSPECT-REL1-OVERLAP` still reaching ordinals 25 and 22. The lever is witnessed rather than assumed — every arm logs `WaitRegMem … — pausing queue (deferred effects)` and one logs `DEFER TIMEOUT #1 after 1000ms`, while no dose arm carries the `pausing queue (deferred effects)` marker at all — 0 of 12 against 3 of 3. Do not substitute a bare `defer` grep for that marker: the six surviving dose arms each contain one unrelated `layered image deferred to #657` line. This reproduces on ArcRunner the verdict `command_processor.cpp` already records from ~20 DOLL runs: the model removes the ordering-violation leg and a wait-order-independent leg dominates, and deferral latency makes the title die sooner. | #2084, #312, #1226 |
 | The zero `recompile-reject` / compute-skip / unsupported-format census recorded in the sections above describes this title's shader coverage | It describes the **first 8–14 seconds**, which is all any of those runs got. Every one of the six surviving dose arms reaches `[compute] skip unsupported program` for three programs reproducibly (`0x3005330000`, `0x3007780000`, `0x30094d0000`), plus a run-varying fourth, plus one `layered image deferred to #657 -> dispatch skipped (#590)` — all past the point where a default run dies. Generalise before quoting any "zero X across N runs" figure on a title whose runs end in a fault: a coverage census is bounded by how far the run got. | #2090, #2084, #1226 |
@@ -1072,9 +1103,10 @@ guest's faulting virtual call disassembled. What remains is **ownership**, not a
 
 5. **The threshold is measured on this title now — `(500, 1500]`, the same bracket as Crisis Core** —
    and the two cheapest explanations of *why* the throttle works are both dead. It does not shorten the
-   guest's build-to-submit interval (that interval is **longer** in every surviving arm), and it is not
-   about prosper barrelling through the guest's barriers (`PROSPER_WAIT_DEFER=1` faults 3/3, sooner,
-   with the lever witnessed). Both are in `## Ruled out`.
+   guest's barriers — `PROSPER_WAIT_DEFER=1` faults 3/3, sooner, with the lever witnessed, and that one
+   is in `## Ruled out`. The build-to-submit-interval story is **still open**: the measurement that
+   looked like it settled it was drawn from a population only dying arms have, and its row is
+   withdrawn. Re-ask it with a per-fold instrument, not with whatever rings a diagnostic prints.
 6. **`SUSPECT-REL1-OVERLAP` is the sharpest live discriminator this title has**, and it is free — a
    default build prints it. Population 11/22/27/24 in the four arms that die at `0x30016000`, **0** in
    the two that die at `rip=0x0`, and **0** in all six that survive, with the counters it differences
