@@ -49,6 +49,7 @@ def main(paths):
     threads = {}                        # pthread -> (kind, object, source); last snapshot wins
     last_wake = {}                      # object -> (seq, kind, pthread)
     events_on = collections.Counter()
+    sources_on = collections.defaultdict(set)   # object -> guest condvars seen behind that slot
 
     for path in paths:
         with open(path, encoding="utf-8", errors="replace") as handle:
@@ -61,6 +62,7 @@ def main(paths):
                 if match:
                     obj = match.group(5)
                     events_on[obj] += 1
+                    sources_on[obj].add(match.group(6))
                     if match.group(2) in WAKE_KINDS:
                         last_wake[obj] = (int(match.group(1)), match.group(2), match.group(4))
 
@@ -89,6 +91,21 @@ def main(paths):
         print("\n=== not evidence: raw `address` waits, whose wakes this ring does not record ===")
         for pthread, kind, obj, source in unrecorded:
             print("  pthread=%-6s %-10s object=%s" % (pthread, kind, obj))
+
+    # A condition slot is a recycled entry in a fixed 4096-slot array (sync_futex.cpp: a retired
+    # slot returns to 0 and a DIFFERENT guest condvar may then claim it). So one object address can
+    # cover two unrelated condvars, and an edge drawn across that boundary joins a wake on one to a
+    # wait on the other. The event record carries the guest source, so the run can say whether it
+    # actually happened here instead of leaving the reader to assume it did not.
+    reused = sorted(obj for obj in sources_on if len(sources_on[obj]) > 1)
+    tainted = sorted(p for p in edges if threads[p][1] in reused)
+    if reused:
+        print("\n=== WARNING: %d slot(s) held more than one guest condvar in this run ===" % len(reused))
+        for obj in reused:
+            print("  object=%s  sources=%s" % (obj, " ".join(sorted(sources_on[obj]))))
+        print("  Edges through these objects may pair a wake on one condvar with a wait on another.")
+        print("  %s" % ("%d edge(s) below rest on a reused slot: %s" % (len(tainted), " ".join(tainted))
+                        if tainted else "No edge below rests on one, so the graph is unaffected."))
 
     print("\n=== wait-for edges (thread -> thread that last woke its object) ===")
     fanin = collections.Counter()
