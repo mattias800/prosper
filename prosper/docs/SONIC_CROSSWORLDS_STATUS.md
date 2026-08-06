@@ -407,6 +407,28 @@ One line per falsified hypothesis, with the evidence that killed it.
   The live `[recompile-reject]` from a real boot is the only instrument that names the actual failing
   instruction in a graphics stage. It is still exact for **compute**, which passes `allow_smem=true`.
   (This lane, 2026-08-06.)
+- **No GPU-side writer that prosper executes ever fills the vertex stage's null constant-buffer
+  pointer.** The remaining two dropped pipelines fail because a constant-buffer dword holding a
+  bindless-table pointer reads zero (#2132). Queried against the shared guest-write history at the
+  failing stage's own replay: `no recorded GPU writer overlaps [0x…470,+0x40) (history=8589 recorded:
+  color=39 compute-buffer=4744 dma-data=8127 write-data=1111)` — 8,589 retained writes, all four
+  recorders demonstrably firing, none overlapping that window. Measured on a
+  `PROSPER_WRITER_PROVENANCE=1` arm, which matters: that switch selects **unfiltered** retention, and
+  without it DmaData/WriteData discard writes below 256 bytes / 64 dwords — exactly the size that
+  could hide a write to a 64-byte window. The negative carries its own positive
+  control (#2143 made it do so; before that the same query printed 183 bare negatives while the
+  colour recorder had never been armed, and the result was VOID rather than negative). **Two
+  populations remain unexamined and are NOT ruled out**: a *skipped* compute dispatch records nothing
+  by construction — this title skips 8 per boot, and that is the leading hypothesis — and guest CPU
+  writes are recorded by no writer kind at all. (This lane, 2026-08-06.)
+- **The zero is not run-to-run nondeterminism.** The pointer field reads zero in **five** independent
+  boots while its containing allocation base moves every time (`0x4148dca410` / `0x4137f4a410` /
+  `0x400e6ba410` / `0x413080a410` / `0x413111a410`), with the same offsets and the same neighbouring
+  `0x3f800000` each time. **This does not rule out an ordering defect** — only a nondeterministic
+  one. A *deterministic* mis-ordering (realizing the stage table before a producer that precedes it
+  in `command_order`) reads zero on every boot with a moving base too, and is entirely consistent
+  with all five. Read this row as "stop looking for a flaky race", not as "ordering is cleared".
+  (This lane, 2026-08-06.)
 - **The dropped draws were NOT four instances of one descriptor problem — they are two populations
   with unrelated causes, and neither is "the descriptor cannot be resolved".** A
   `PROSPER_DYNTRACE_FAIL=1` arm replays each failed stage's resource build with the scalar const-fold
