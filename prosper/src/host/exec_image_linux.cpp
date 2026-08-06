@@ -2212,20 +2212,41 @@ namespace {
             // self-pointer only when the fault lands shortly after that load, and when it holds
             // something else (a corrupt free-list head, a count) the magic check reads an unrelated
             // address and asserted `NO(host-%fs leak?)` for a thread with no %fs problem at all
-            // (#2018: rax = 0x30016000). It does not need to guess: `saved_guest_fs` above is the
-            // answer. `guest_fs_to_host_scoped()` read this thread's real %fs base and returned it
-            // only after checking TCB_MAGIC there (guest_tls.cpp:161-171), so non-zero IS "this
-            // thread was on our guest TCB". rax stays on the line as raw evidence, without a claim
-            // attached to it.
+            // (#2018: rax = 0x30016000). It does not need to guess for the positive answer:
+            // `saved_guest_fs` above is a fact. `guest_fs_to_host_scoped()` read this thread's real
+            // %fs base and returned it only after checking TCB_MAGIC there
+            // (guest_tls.cpp:161-171), so non-zero IS "this thread was on our guest TCB". rax stays
+            // on the line as raw evidence, without a claim attached to it.
             //
-            // Darwin has no equivalent: `guest_fs_to_host_scoped()` is a `return 0` stub there
-            // (guest_tls.cpp:288), so 0 must not be read as "leaked" on that platform.
+            // ZERO is NOT the mirror image of that, and the line must not print as though it were.
+            // Zero has three causes and only one of them is a defect:
+            //   (1) the thread really did run guest code on the host glibc TCB — the #1155 class,
+            //       and the only reading worth alarming about;
+            //   (2) guest %fs is not enabled for this process at all. That is the DEFAULT —
+            //       `g_enabled = getenv("PROSPER_GUEST_FS") != nullptr` (guest_tls.cpp:46), opt-in,
+            //       and neither a plain prosper-app run nor most of tools/dbg/*.sh sets it — so
+            //       every thread reads zero and none of them leaked anything;
+            //   (3) the faulting thread is one of prosper's OWN host threads, which never had a
+            //       guest TCB to leak off. This report is reached by any non-armed thread, host or
+            //       guest, so that is not a rare case.
+            // `guest_tls_enabled()` (guest_tls.cpp:79) separates (2) from (1)/(3) as fact; nothing
+            // available in a signal handler separates (1) from (3), so the line says so rather than
+            // asserting a leak. It is two static bool loads: no allocation, no lock, handler-safe.
+            //
+            // Darwin: `guest_fs_to_host_scoped()` returns 0 unconditionally there — the
+            // `#ifdef __APPLE__` early-out inside the shared POSIX definition (guest_tls.cpp:162-164),
+            // NOT the separate Windows stub at guest_tls.cpp:288 — so zero carries no information on
+            // that platform at all, and the Darwin arm below prints neither answer.
             {
                 char nm[16] = {0}; pthread_getname_np(pthread_self(), nm, sizeof nm);   // portable (Linux+macOS)
 #ifdef __APPLE__
                 const char* tcb = "unknown (not determined on this platform)";
 #else
-                const char* tcb = saved_guest_fs ? "yes" : "NO(host-%fs leak?)";
+                // Async-signal-safe: guest_tls_enabled() is two static bool loads, no lock and no
+                // allocation, and this TU already calls it unqualified.
+                const char* tcb = !guest_tls_enabled() ? "n/a (guest %fs not enabled)"
+                                : saved_guest_fs       ? "yes"
+                                : "no (host TCB — a leak only if this thread should have had a guest TCB)";
 #endif
                 char tb[224];
                 int t = snprintf(tb, sizeof tb,
