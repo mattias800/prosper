@@ -619,6 +619,10 @@ if(TARGET prosper_core)
   add_test(NAME sync_ring COMMAND test_sync_ring)
   set_tests_properties(sync_ring PROPERTIES ENVIRONMENT "PROSPER_SYNC_RING=64")
 
+  add_executable(test_cond_slot_identity tests/test_cond_slot_identity.cpp)
+  target_link_libraries(test_cond_slot_identity PRIVATE prosper_core)
+  add_test(NAME cond_slot_identity COMMAND test_cond_slot_identity)
+
   # sceKernelDlsym honors its module handle (#147): per-module export tables, real handles from
   # LoadStartModule for linked-module paths, global first-wins fallback. Pure, no game dump needed.
   add_executable(test_dlsym_handle tests/test_dlsym_handle.cpp)

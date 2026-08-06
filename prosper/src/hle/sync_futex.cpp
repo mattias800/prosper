@@ -140,15 +140,56 @@ int consume_cond_wait_failure(CondWaitFailurePointForTest point) {
     return (int)(uint32_t)armed;
 }
 
+// One condvar must resolve to ONE slot, for the life of that condvar.
+//
+// #2139: this used to search for an existing owner and claim a free slot in the SAME pass, so a free
+// slot encountered before this cond's own slot was taken instead of it. That splits a waiter and its
+// signaller across two slots, and the signal is then delivered to a sequence nobody is waiting on --
+// a permanent, silent lost wakeup. Blue Prince deadlocked exactly this way:
+//
+//   guest cond 0x…910 claims slot ...ad8 (…ac8 was busy); a thread parks on ...ad8;
+//   the cond that owned ...ac8 is destroyed, freeing an EARLIER slot;
+//   the next lookup for 0x…910 claims ...ac8 and signals it. The waiter on ...ad8 never wakes,
+//   the signaller then waits for that thread's reply, and all 70 guest threads pile up behind it.
+//
+// It needs slot churn plus a destroy in the window between a waiter's lookup and its signaller's, so
+// it only bites deep into a long run -- which is why it read as timing sensitivity.
+//
+// The fix is that an existing owner ANYWHERE in the table beats any free slot: prove the key absent
+// before claiming. Kept lock-free deliberately -- exception delivery can suspend a thread at any
+// instruction, so a mutex here can be held by a thread that is stopped (see g_wait_slots above).
 CondSlot* cond_slot_for(pthread_cond_t* cond) {
     const uintptr_t key = (uintptr_t)cond;
-    for (CondSlot& slot : g_cond_slots) {
-        uintptr_t owner = slot.cond.load(std::memory_order_acquire);
-        if (owner == key || (owner == 0 && slot.cond.compare_exchange_strong(
-                owner, key, std::memory_order_acq_rel)))
-            return &slot;
+    if (!key) return nullptr;
+    auto find_owner = [key]() -> CondSlot* {
+        for (CondSlot& slot : g_cond_slots)
+            if (slot.cond.load(std::memory_order_acquire) == key) return &slot;
+        return nullptr;
+    };
+    // Bounded: each iteration either returns or releases a slot that a lower-indexed claim won, and
+    // only a concurrent first-use of the SAME condvar can cause one. A spin cap keeps a pathological
+    // interleaving from becoming an unbounded loop inside a guest sync primitive.
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        if (CondSlot* owner = find_owner()) return owner;
+
+        CondSlot* claimed = nullptr;
+        for (CondSlot& slot : g_cond_slots) {
+            uintptr_t expected = 0;
+            if (slot.cond.compare_exchange_strong(expected, key, std::memory_order_acq_rel)) {
+                claimed = &slot;
+                break;
+            }
+        }
+        if (!claimed) return nullptr;   // table full
+
+        // Two threads can reach the claim above for the same new condvar at once and take two
+        // different slots. Resolve it the same way on both sides -- lowest index wins -- so they
+        // converge on one slot instead of each keeping its own.
+        CondSlot* winner = find_owner();
+        if (winner == claimed) return claimed;
+        claimed->cond.store(0, std::memory_order_release);
     }
-    return nullptr;
+    return find_owner();
 }
 
 WaitSlot* register_wait(GuestWaitKind kind, uintptr_t object, uintptr_t source = 0) {
