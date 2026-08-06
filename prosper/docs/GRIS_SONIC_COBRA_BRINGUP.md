@@ -143,12 +143,15 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | The frontend is waiting on a Sony service, an incomplete asset load, or an APR read that never completes | **Falsified for the post-resident state.** With `PROSPER_FILELOG=1` the whole resident set (`param_tech.rfl`, `NeedleShader.pac`, `ui_resident`/`ui_text_texture`/`scalablefont`, the CRI ACB/AWB banks, `rfl_resident.pac`, all twelve `text_common_*`, `segafont.pac`) resolves and reads OK and the **last file operation completes before the t=5 s heartbeat**; the following 180 s contain zero file activity. Under `PROSPER_SVCLOG=1` the only per-frame service traffic is `sceUserServiceGetEvent` (4,264 calls / 60 s) plus `scePadReadState`; `sceSaveDataInitialize3` and the entitlement list call happen once each and no mount, key or trophy call ever blocks. | #1905, this doc |
 | The black startup state is input-gated and previous arms simply never pressed the button that dismisses it | **Falsified — and the suspicion was well founded, because the committed route really is short.** `scripts/sonic/reach-title-or-gameplay.pad` ends at **pad-read 404**, and the route clock is pad reads, not seconds, so at the ~61 reads/s of a CPU-only arm it delivers its last edge at **t≈6.6 s** and every previous CPU-only run then ran input-free. A 12,000-read probe route (`scripts/sonic/long-input-probe.pad`, ~400 Cross pulses with Options every tenth) changes nothing: the 200 s CPU-only arm and a 160 s live-renderer arm both plateau on a **byte-identical resolved-path set**, and no run in the series ever requests `ui_mainmenu*.pac`, `stage_title.pac`, `gedit_stage_title.pac`, a `.rsdk` or a `.usm`. | #1905, this doc |
 | The injected Unity guest argv (`PROSPER_GUEST_ARGS=-force-gfx-direct`, which `screenshot` defaults on) puts this non-Unity engine on a different path | **Falsified.** Two 30 s CPU-only arms differing only in that variable resolve a **byte-identical 40-path set** and flip at the same rate (1,534 vs 1,533 flips), with the same six distinct APR misses. The A/B is self-validating: it compares the resolved-path sets directly, so "no difference" is a measurement rather than an absence. | #1905, this doc |
-| The absent `raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/` group prove the supplied `raw/` tree is a truncated repack | **Falsified as an integrity claim.** The tree is internally consistent: `ui_museum_item_texture_l_art1..214` is contiguous with no gaps, all seven multi-language `ui_*` families are complete at 12/12 languages, and `raw/ui` contains no subdirectories at all. The eboot's name pool contains exactly one base-game `ui/` entry with no file (`ui/ui_startup`) plus the six region rating textures (`ui_title_cero`/`esrb_e10`/`esrb_rp`/`nocopy`/`pegi`/`titile_healthy`) — one functional group, requested back to back, consistent with an optional region/legal asset set this build does not ship. Their absence is therefore not evidence of a damaged dump, and remains insufficient to explain the black frame. **One leg of the original argument is withdrawn — see the `AMPRIDX3` row below.** | #1905, this doc |
+| The absent `raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/` group prove the supplied `raw/` tree is a truncated repack | **Falsified as an integrity claim.** The tree is internally consistent: `ui_museum_item_texture_l_art1..214` is contiguous with no gaps, all seven multi-language `ui_*` families are complete at 12/12 languages, and `raw/ui` contains no subdirectories at all. The eboot's name pool contains exactly one base-game `ui/` entry with no file (`ui/ui_startup`) plus the six region rating textures (`ui_title_cero`/`esrb_e10`/`esrb_rp`/`nocopy`/`pegi`/`titile_healthy`) — one functional group, requested back to back, consistent with an optional region/legal asset set this build does not ship. Their absence is therefore not evidence of a damaged dump, and remains insufficient to explain the black frame. **One leg of the original argument is withdrawn — see the `AMPRIDX3` row below. A second leg is now contradicted by measurement: `ui_startup.pac` is the sole absent member of a 34-entry resident resource list whose other 33 members all ship (`tested=34 found=33 missing=1`), which is not the shape of an optional group — see the boot-call census section. The tree-consistency and 12/12-language legs still stand, and the file's absence is still not shown to cause the black frame.** | #1905, this doc |
 | `ampr_emu.index` is the application's own `AMPRIDX3` file index, so a name absent from it is a name this build does not ship | **Falsified — misattribution.** The index is *repack scaffolding*, not the game's: the eboot contains no `AMPRIDX` string anywhere, prosper never opens the file (no reference in `src/` or `tools/`), and it sits beside `dlc_emu.ini`, four `fakelib/*.sprx` stubs and a `_DUPLEX_/duplex.nfo` — and its entries include `/app0/dlcN/dlc/dlcN/...` mount paths a shipped app0 index could not contain. It therefore records what the repacker's tool found on disk, which cannot establish what the application expects. This does not resurrect the truncated-repack claim (the contiguity and language-completeness legs stand on their own); it removes one leg that was never evidence. | #1905, this doc |
 | Sonic is black because prosper renders content and then loses it in the present path (the #1990 publish wall) | **The wall is real and it is not the cause.** On `c77c66b4` Sonic reproduces the Frontiers signature exactly: `frame_seq` freezes at **1** while `present_count` climbs (21 → 49 → 76 → … across eight 6 s samples), i.e. exactly one frame is ever published. With #1990 applied, `frame_seq` advances again (110 / 300 / 490 / 669 / 844 across 8 s samples) and every pixel is unchanged black. #1990's own report names why: `[rtt] PRESENT SOURCE EXTENT MISMATCH: no pass produced a 3840x2160 (33177600-byte) present source — px_front=none px_vo=none px_last=none` on submit after submit, with one wrong-extent `px_last=1920x1080` candidate — the frame that poisoned the retained slot and made the freeze permanent. So Sonic needs #1990, and #1990 does not make it render. | #1905, #1990, #1986 |
 | The 3840x2160 `R16G16B16A16_SFLOAT` scene target holds full-frame content that the publish path discards (`px_nonblack=8294400`) | **Falsified — that number was the instrument, and it is fixed.** `PROSPER_PASS_LOG`'s counter stepped 4 bytes and tested `p`, `p+1`, `p+2` — never `p+3` — as if every target were 8-bit RGBA, so over an 8-byte FP16 texel it read `{R_lo, R_hi, G_lo}` then `{B_lo, B_hi, A_lo}`. The target's texels are **RGB bit-zero with alpha `0x3c05` (1.00488)**, measured byte-exactly, and that alpha's low mantissa byte `0x05` sits at texel byte 6 — the second group's `p+2` — so exactly one of the two groups per texel counted and the line printed precisely `w*h`. An alpha of exactly 1.0 would have counted **zero** (`0x3c00`'s only non-zero byte is the skipped `p+3`), so the number was never a property of the image, only of its bit layout. Counting through `inspection_rgba8` reports **0** for the same pass. | #1905, this PR |
 | Every GPU target is black only in the retained offline replay, so the live render may still hold content | **Falsified on the live path, at bit level.** A `PROSPER_DUMP_PERSISTENT` census (deliberately *not* in the `live_gpu_targets` disable list, so it observes the normal persistent-render path) dumps all **10** persistent color targets across three consecutive live submits and now reports the *pre*-conversion bytes beside the converted count, because "black" and "empty" are different findings. Every target has `rgb_nonblack=0` except a 256x256 grey utility texture (`0x2076f60000`) and **two** texels of a 960x540 bloom target. The raw bytes name what the colour count cannot: the final 4K RGBA8 composite `0x2010870000` is `00 00 00 ff` per texel (opaque black, 8,294,400 of 33,177,600 bytes non-zero — the alpha byte only); the 4K FP16 scene target `0x20168f0000` is `00 00 00 00 00 00 05 3c` (RGB bit-zero, alpha 1.00488); the mask target `0x204ec40000` and the 1080p `B10G11R11` target are **entirely zero**. So the frame is black *by content*, not merely by conversion — the guest-programmed-black finding is a property of the title's live frame, not of the replay or of a clamp. | #1905, this doc |
 | The guest's own scanout memory holds a frame prosper simply fails to publish | **Falsified.** `PROSPER_DUMP_SCANOUT` dumps ten raw flipped guest buffers (both registered VideoOut buffers, 33,177,600 bytes each); every sampled pixel of every dump is `(0,0,0)`. The guest's last step into the scanout is a *compute dispatch* (`0x2010870000 -> 0x2012850000`), and neither its output nor any draw reaches those addresses with content. | #1905, this doc |
+| The `dlc3`-prefixed CRI wave-bank APR misses leave the Atom banks without waveform data (the silent-audio candidate, #1993) | **Falsified as the silent-audio cause — the bank loads on the base-content-root retry.** On `c3614f51` the pattern is exact and repeats for every bank: `[apr] resolve MISS /app0/dlc3/sound/X.awb`, then immediately `[apr] content-root fallback /app0/sound/X.awb -> /app0/raw/sound/X.awb` and `[apr] resolve /app0/sound/X.awb -> id=12 size=28352512`. **Seven** banks do this, not the four #1993 recorded (`STH1_music`, `STH2_music`, `SCD_music`, `HITE_music`, `HITE_missions`, `Music03_S3K`, `Music09_Museum`). **Why the guest asks the DLC prefix first is NOT settled here**, and the difference matters for where a fix would belong: an add-content override search and #1993's own competing reading — a single engine-global content root that the DLC mount overwrote — both produce this log. The one detail that discriminates leans toward the latter: all three repeats target the same `dlc3` prefix while **four** DLC mount, whereas a genuine override search would probe each mount once. It does not matter for the audio path, because the bank resolves either way, so do not add a `/app0/dlc*/` -> `/app0/raw/` alias on this evidence. The silent AudioOut2 port has another cause. | #1905, #1993, this doc |
+| The absent `raw/ui/rpl_texture/ui_title_nocopy.dds` request says something about the dump | **Falsified — it was prosper's own wrong answer, and it is gone.** The title derives its **region** from the app's own declaration at `eboot+0x51230c`: it calls `sceAppContentAppParamGetInt(USER_DEFINED_PARAM_1)` into a pre-zeroed slot and branches `2 -> "EU"`, `1 -> "US"`, anything else -> `"JP"`, with JP additionally setting a flag the other two clear. That branch mapping is **read off the disassembly** at `eboot+0x51231c..0x512357` (the two-character codes are the immediates `0x5545`/`0x5355`/`0x504a`), not measured. This application declares `userDefinedParam1: 2` and `contentId EP0177-PPSA05325_00-…`, so the correct answer is **EU**, and that is what the handler now writes — measured directly rather than inferred, by breaking on `prosper::s_appcontent_int` and reading its out-slot after the return: `paramId=1 ret=0 value=2` (the neighbouring `sceSystemServiceParamGetInt(1)` reads `value=1`, en-US). Before #2003 `s_appcontent_int` was `*(int32_t*)PW(a1) = (a0 == 0) ? 3 : 0`, so this same call wrote `0`, which the branch above maps to **JP** — i.e. every earlier Sonic arm in this document is best read as having run the title as Japanese. That last step is an inference from the disassembly plus the disappearance of the JP-only request, not an A/B against the old binary. `ui_title_nocopy` / `ui_title_cero` / `ui_titile_healthy` are the JP legal-and-rating set (`ui_title_pegi` is the EU one). On current master the request is gone and `ui_startup.pac` is the only remaining UI miss. Nothing about the dump changed; prosper's answer did. | #1905, #2003, this doc |
+| The absent `raw/ui/ui_startup.pac` parks the resource loader (the "handled ENOENT is still a stalled state machine" reading) | **Falsified at the consumer, not just at the resolver.** The widened `apr_miss_callsite` annotation names the frame: `ra4=eboot+0x990235`. `eboot+0x98fa80` is a thin `exists()` predicate over the APR resolve (`call 0xf0600; test eax,eax; sete al`), reached as a virtual call `call QWORD PTR [rax+0x88]` at `eboot+0x99022f`. The **not-found** branch at `eboot+0x990239` releases its temporaries and jumps to `eboot+0x990120`, which is a loop head: `add r14,0x18; cmp r12,r14; je <exit>`. So a missing entry advances the cursor and the loop continues — the miss is skipped by construction, with no error path and no wait. Whether the *startup scene* later needs what that package would have contained is a separate question this does not answer. | #1905, this doc |
 
 ## Sonic Origins dump audit
 
@@ -447,3 +450,184 @@ class as the `/app0/X -> /app0/raw/X` content-root fallback already in `apr_reso
 CRI ACB naming its companion AWB relative to a content root), one mount level further out, and it is
 the first concrete candidate for the silent AudioOut2 port. Tracked separately as **#1993** — it is an
 audio path, not the black frame.
+
+**That last paragraph is superseded: the DLC-prefixed miss is not a gap at all.** The census above
+stopped at the miss. Read one line further and the guest retries the same bank against the base
+content root, where it resolves — see the `## Ruled out` row, and #1993. The census is repeated below
+on current master because both of its groups changed.
+
+### Boot-call census with return values (2026-08-05, master `c3614f51`)
+
+`tools/hle_calls --launch --values` (#1997) opens its window before the guest's first instruction, so
+this is the **whole boot**, not the settled loop, and each row carries what prosper answered. Every
+arm here is CPU-only (`PROSPER_NO_COMPUTE=1`) and self-checked: `first-calls` leads with
+`s_ok`/`s_videodec2_query_compute_memory`/`s_user_initial` rather than the frame-loop pollers (so the
+window really covered init), and `s_user_getevent` reports `0x0 x1, 0x80960007 x529` — its known
+deliver-LOGIN-once contract — as the value-capture positive control.
+
+**The complete non-hot boot surface is 445 calls.** Excluding `agc_*`, `k_*`, `audio2_*`, `pad_*` and
+the two per-frame service pollers, the guest makes 445 calls across 49 distinct handlers and then
+**stops**: after ordinal 445 nothing but `s_user_getevent`, `s_syss_getstatus` and `pad_read_state`,
+one each per frame, forever. The shape of the boot is:
+
+| ordinals | what runs |
+| --- | --- |
+| 1-14 | guest `f_write` banner (`Rsdx-Default Allocator onion/garlic/main`, `Poolmemory CPUGPU`) |
+| 15-19 | AGC register defs, `sceVideoOutOpen` (`ret 0x1001`), `RegisterBuffers2` |
+| 20-37 | first APR measures; Videodec2 compute-memory query x4 + `allocate_compute_queue` |
+| 39-46 | UserService initial-user/name/id, **`sceAppContentAppParamGetInt`**, `sceSystemServiceParamGetInt`, GameIntent init |
+| 47-65 | resident APR resolves (this is where `ui_startup.pac` misses) |
+| 67-81 | NP state callback, NetCtl callback + state, SaveData init3, NpUds/Trophy2/NpEntitlement init, Share |
+| 82-167 | JSON object/string churn (Share content parameters) |
+| 168-214 | entitlement list x2, NpUds events, Trophy2 create/register, **`sceAppContentAddcontMount` x4 (all `ret 0`)** |
+| 215-439 | the bulk of the asset load — `f_apr_resolve` / `resolve_ids` / `measure_read_file` |
+| 440-445 | `sceNetPoolCreate`, `sceSslInit`, `sceHttp2Init`, `sceNpWebApi2Initialize`, `sceNpWebApi2CreateUserContext`, **`sceNpHasSignedUp` (last call of the boot)** |
+
+Two things in that table are new relative to everything above it in this document. **All four DLC
+now mount** (`s_appcontent_addcont_mount` x4, each returning 0) — the earlier record that Sonic
+"consumes the four installed records but does not continue into a key/mount path" is out of date.
+And the **asset load terminates at ordinal 439** having loaded only the resident set: no scene, no
+`ui_mainmenu*`, no `stage_title`, no `.rsdk`, no `.usm`.
+
+**No return value in the census is implausible.** The full `^s_` value histogram over 3,000 ticks:
+`s_user_getevent` `0x80960007`/`0x0`, `s_nptrophy2_unavailable` `0x80551500` (deliberate — see its
+comment in `hle_service.cpp`), `s_npweb_create_user_context` `0x3e9` (a context id),
+`s_ssl_init`/`s_http2_init`/`s_net_pool_create`/`s_np_register_state_cbA` `0x1` (ids), and `0x0`
+everywhere else. The file/graphics surface is equally clean: `f_apr_resolve_ids` returns `0x0` x87
+and `0x80020002` (ENOENT) x22 — which decomposes as the seven wave banks retried three times each
+(the three-repeat factor is #1993's measurement, not this run's) plus the single `ui_startup.pac`
+miss — `f_apr_resolve`
+`0x0` x61, `g_vo_open` `0x1001`.
+
+So the "a registered-but-mismodelled value returned during init" candidate is now **bounded rather
+than confirmed** — though read the bound precisely: it is over 49 **prosper handler symbols**, not over
+49 Sony functions. Alias stubs cover several Sony entry points each (`s_ok` alone is registered for
+`sceLoginDialogInitialize`, `sceUserServiceInitialize`/`Terminate`, `sceNpRegisterStateCallback`,
+`sceNpCheckCallback` and more), and every one of them collapses into a single census row reading `0x0`
+— which is exactly what a mismodelled call looks like. The search space is a specific list whose every
+answer is recorded,
+and the one value that *was* wrong (`USER_DEFINED_PARAM_1`, fixed by #2003) is the region, above.
+`--values` cannot see a wrong **out-struct** — only the return register — so a handler that returns 0
+while writing the wrong bytes through a pointer is still reachable, and that is the residue of this
+candidate.
+
+**The resident resource list has 34 entries and exactly one of them is absent.** Breaking on the
+`test al,al` at `eboot+0x990235` — the instruction immediately after the virtual `exists()` call that
+produces every one of these APR requests — counts the whole pass:
+
+```text
+RESRESULT armed=3 ticks=1500 control=239 loop_iters=1 tested=34 found=33 missing=1
+          seq=1101111111111111111111111111111111
+```
+
+Thirty-four entries are tested, **thirty-three exist**, and the single miss is the **third** entry
+(`seq[2]`), which the file log independently names as `/app0/raw/ui/ui_startup.pac`. `loop_iters=1`
+(the not-found continue at `eboot+0x990120`) equals `missing=1`, so the two counters agree.
+`control=239` is the same per-frame guest control as above, so this is a measurement rather than a
+void window.
+
+This does **not** show that the absence causes the stall — the loop skips the entry cleanly, as the
+`## Ruled out` row above establishes. What it does settle is the *character* of the absence: this file
+is not part of "an optional region/legal asset set this build does not ship", it is the sole missing
+member of the title's own 34-entry resident list, every other member of which is present and loads.
+Any future reading of the earlier dump-integrity row has to account for that.
+
+**The guest thinks it has finished booting — it hides the system splash screen at tick 22.** Sonic
+imports `sceSystemServiceHideSplashScreen` (`Vo5V8KAwCmk`, PLT `eboot+0xc487c0`), which is how a PS5
+title tells the shell to stop compositing the store splash over it and start showing the title's own
+output. A CPU-only arm breaking on the guest PLT reports:
+
+```text
+SPLASH first-hit sceSystemServiceHideSplashScreen at tick=22
+SPLASHRESULT armed=4 ticks=1500 sceSystemServiceHideSplashScreen=1 \
+    sceSystemServiceReceiveEvent=0 sceCommonDialogIsUsed=0 CONTROL_run_loop_frame_pacing=239
+```
+
+Same self-check as the movie arm: `armed=4`, and `CONTROL_…=239` is a guest address the run loop
+reaches every frame, so the two zeros are measurements. The call happens **once, very early**, and is
+never repeated. So the black frame is not a title still sitting in a pre-display boot phase waiting to
+be released — the guest has already declared itself ready to display, and what it then displays is an
+empty scene, forever. That also rules out `sceCommonDialogIsUsed` / `sceSystemServiceReceiveEvent`
+gating: neither is ever called.
+
+**Candidate (b) has a named artifact.** `raw/movie/` holds 83 `.usm`, and all but a few are per-game
+intros/outros or `tutorial_<n>_<m>` — but it also holds **`sonicteam_logo_4k.usm` (6,476,896 bytes)**,
+`PencilTest.usm`, `soniccd_op_4k.usm` and three `sonic_30th_as_*.usm`. A boot logo movie therefore
+exists in this application, the Videodec2 compute queue is allocated at ordinal 33-37, the CRI Mana /
+MPV worker group is constructed — and **no `.usm` is ever opened in any arm**. That is the sharpest
+remaining frontier, and it is a rung-1 target in its own right: the SONIC TEAM logo is exactly the
+kind of splash the ladder counts. The movie names are not in the eboot's string pool (nor in
+`rfl_resident.pac`, `bindata/*.bin`, `param_tech.rfl` or `ui_resident.pac` as plain text), so the boot
+sequence that would name one is data-driven and has still to be located.
+
+The guest side of that path is already mapped, so the next lane does not have to re-find it.
+`eboot+0x6d76c0` is the **movie-path builder / player entry**: it takes a movie **index** in `esi`,
+looks the entry up in a 0x68-byte-stride table, and selects the `"_4k.usm"` (`eboot+0xdb231f`) or
+plain `".usm"` (`eboot+0xdba47f`) suffix from a per-entry flag at `+0x10932`
+(`cmp BYTE PTR [rcx+rdx*1+0x10932],0x0` … `cmove rdx,rcx` at `eboot+0x6d7719..0x6d772f`). It has
+exactly two callers — `eboot+0x703a67` (in `eboot+0x701280`) and `eboot+0x796016` (in
+`eboot+0x795870`).
+
+**None of the three is ever entered, and that is a measurement, not an inference.** A CPU-only arm
+breaks on all three guest addresses plus a fourth as a control, and reports:
+
+```text
+MOVIERESULT armed=4 ticks=1500 movie_hits=0 control_hits=243
+```
+
+Two things make that a real negative rather than a void run. `armed=4` says all four breakpoints were
+actually inserted — guest breakpoints **cannot** be armed before `run`, because prosper maps the guest
+image itself and the addresses do not exist when gdb inserts breakpoints, so they are armed on the
+first `prosper::k_usleep` tick instead. And `control_hits=243` is a **guest** address the run loop
+reaches every frame (`eboot+0x933063`, the frame-pacing compare ahead of the sleep at
+`eboot+0x933083`), so a guest breakpoint of exactly this kind demonstrably fires in this window while
+the movie ones do not.
+
+**Read that negative with its arming caveat, because the caveat lands exactly where the hypothesis
+does.** The guest breakpoints go in on the *first* `k_usleep` tick, so `movie_hits=0` strictly means
+"never entered after the first tick" — and a boot logo is precisely the thing you would expect
+*before* it. `control_hits=243` proves that breakpoints fire inside the window, not that the window
+opens early enough. The genuinely init-covering evidence that no movie is ever requested is the
+`--launch --values` census above, which starts at the first instruction and contains no file open of
+any `.usm` and no Videodec2 call beyond the boot-time queue allocation. The same caveat applies to
+reading `SPLASH first-hit … at tick=22` as a *first* hit.
+
+Finding which state should call `eboot+0x6d76c0`, and with which index, is the open work.
+
+Both callers are reached **indirectly**, which is why a static walk stops here. `eboot+0x701280` is
+never called: it is taken by address at `eboot+0x70111c` and installed as a task alongside a companion
+at `eboot+0x700c80`, and the install is gated at `eboot+0x7010ff` on
+`cmp BYTE PTR [rax+0x13e],0x0` falling through to a predicate `eboot+0x7f3560` — which compares two
+**floats** (`[rsi+0x124]` against `[rdx+0x11c]`), i.e. a timeline position, and the surrounding code
+names its state object `GOCTinyFsm2`. That reads as an in-stage cutscene trigger, not a boot logo.
+`eboot+0x795870` is a **vtable slot** (`0x1e191a8`) with no direct reference at all, so it is the more
+likely boot path and the better place to start. Neither conclusion is measured — both are read off the
+disassembly — and the useful next step is dynamic: break on `eboot+0x6d76c0`'s two callers *and* on
+whatever writes the movie index, rather than another static walk.
+
+### The one hypothesis that joins all of it (2026-08-05) — labelled as a hypothesis
+
+Everything measured above is compatible with a single reading, and the next lane should test it before
+anything more expensive. It is **not** established, and it is written here as a candidate:
+
+> `raw/ui/ui_startup.pac` **is** the boot sequence. Its absence is why the frontend's first scene is
+> empty, why no logo movie is requested, and why the state machine never advances to `ui_mainmenu`.
+
+What supports it: the package is named `ui_startup`; it is the **third** entry of the title's 34-entry
+resident list and the only absent one; the guest hides the system splash at tick 22 and then displays
+an empty scene forever, i.e. it believes it is past boot; no scene, menu, `.rsdk` or `.usm` is ever
+requested afterwards; and the boot logo movie (`sonicteam_logo_4k.usm`) exists, its decoder is
+initialised, and its player entry is measurably never entered. A UI scene that drives the logo, the
+legal screens and the hand-off to the title menu would account for every one of those at once.
+
+What argues against it, and must not be waved away: the loop that requests the package **skips a
+missing entry cleanly** (`eboot+0x990239` -> `eboot+0x990120`), with no error path, no retry and no
+wait — so nothing yet shows the *state machine* depends on it, only that the *loader* does not.
+
+How to settle it, in increasing cost: (1) check whether `raw/ui/ui_startup.pac` exists in another copy
+of this title's app0 — if it does, this is a dump gap and the honest result is to record it as the
+blocker, not to alias anything; (2) find the guest state that consumes the loaded package handle and
+see whether it has a no-package path; (3) break on the writer of the movie index and see whether any
+state ever selects one. **Do not fabricate the package, alias another `.pac` to it, or force the
+`exists()` predicate true** — that would model a producer the guest never had and could not be
+progression evidence even if it changed the screen.
