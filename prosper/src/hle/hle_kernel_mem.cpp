@@ -4128,19 +4128,6 @@ namespace {
         return true;
     }
 
-    bool tracked_slices_have_commit_state(const std::vector<TrackedMappingSlice>& slices,
-                                          uint64_t begin, uint64_t end, bool committed) {
-        uint64_t cursor = begin;
-        for (const TrackedMappingSlice& slice : slices) {
-            const uint64_t slice_end = slice.base + slice.size;
-            if (slice_end <= cursor || slice.base >= end) continue;
-            if (slice.base > cursor || slice.committed != committed) return false;
-            cursor = std::min<uint64_t>(end, slice_end);
-            if (cursor == end) return true;
-        }
-        return false;
-    }
-
     bool tracked_slices_back_host_reservation(
         const std::vector<TrackedMappingSlice>& slices, uint64_t begin, uint64_t end) {
         uint64_t cursor = begin;
