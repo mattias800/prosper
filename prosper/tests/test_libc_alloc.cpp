@@ -134,8 +134,31 @@ int main(int argc, char** argv) {
         (uint8_t*)(uintptr_t)realloc_fn(U(aligned), 1027, 0, 0, 0, 0);
     preserved = aligned_grown != nullptr;
     for (size_t i = 0; preserved && i < 513; ++i) preserved = aligned_grown[i] == 0xa5;
-    CHECK(preserved && ((uintptr_t)aligned_grown & 255) == 0,
-          "realloc preserves a memalign allocation's contents and original alignment");
+    // realloc guarantees the CONTENTS and *fundamental* alignment, and nothing beyond that. C17
+    // 7.22.3p1: the pointer it returns "is suitably aligned so that it may be assigned to a pointer
+    // to any type of object with a fundamental alignment requirement"; 6.2.8p2 fixes that at
+    // alignof(max_align_t), and 6.2.8p3 makes 256 an *extended* alignment, which realloc never
+    // promises to carry. The platform agrees rather than merely permitting this: libSceLibcInternal
+    // exports `reallocalign` (OGybVuPAhAY) as a function SEPARATE from `realloc` (Y7aJ1uydPMo),
+    // because a two-argument resize cannot know an alignment. Registering it is #2185.
+    //
+    // So do NOT re-add an `& 255` assertion here. One stood until #2165 and passed on heap-layout
+    // luck rather than on behavior: on POSIX `guest_realloc_portable` is `return realloc(p, size)`
+    // (hle_libc.cpp:183) and holds no lever that could make such an assertion pass or fail. It was
+    // passing only because glibc happened to grow this block IN PLACE, which trivially keeps the
+    // original alignment; once the block relocates, the new address has no reason to be 256-aligned.
+    // Allocation performed before the test body decides which of those two happens, so four inert,
+    // never-imported NID registrations were enough to turn it red on unmodified master -- meaning
+    // any PR that registered a NID could fail this file without touching it.
+    //
+    // The Windows branch does preserve the alignment, as a side effect of the header it needs so
+    // _aligned_malloc storage can reach plain free (hle_libc.cpp:78-88). That is an implementation
+    // superset, deliberately not asserted here: the guest-visible contract stays identical on both
+    // platforms, and the console's own realloc does not preserve an extended alignment either.
+    CHECK(preserved, "realloc carries a memalign block's contents into the resized block");
+    CHECK(aligned_grown != nullptr &&
+              ((uintptr_t)aligned_grown % alignof(std::max_align_t)) == 0,
+          "realloc returns fundamentally-aligned storage when resizing an over-aligned block");
     free_fn(U(aligned_grown), 0, 0, 0, 0, 0);
 
     void* posix = nullptr;
