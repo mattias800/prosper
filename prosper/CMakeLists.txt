@@ -143,6 +143,12 @@ if(Python3_Interpreter_FOUND)
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_phase_report.py")
   if(GIT_EXECUTABLE)
+    # The provenance GATE: refuses to quote a measurement from a build that is not the revision the
+    # author thinks it is. Pure argument/exit-status contract, no build required — but it resolves
+    # real refs and creates a scratch repository, so it needs git exactly as its sibling below does.
+    add_test(NAME check_build_revision
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/revision/test_check_build_revision.py")
     add_test(NAME build_revision_refresh
              COMMAND "${Python3_EXECUTABLE}"
                "${CMAKE_SOURCE_DIR}/tools/revision/test_build_revision.py"
@@ -196,7 +202,10 @@ if(TARGET prosper_core)
   # Screenshot evidence classification/JSON is pure and must remain testable without Vulkan or a dump.
   add_executable(test_capture_manifest tests/test_capture_manifest.cpp
                                        tools/screenshot/capture_manifest.cpp)
-  target_include_directories(test_capture_manifest PRIVATE tools/screenshot)
+  # `src` and the revision library are for `build_revision.hpp` only: the run header records the
+  # revision the binary was compiled from, so the manifest self-describes. Still no Vulkan, no dump.
+  target_include_directories(test_capture_manifest PRIVATE tools/screenshot src)
+  target_link_libraries(test_capture_manifest PRIVATE prosper_build_revision)
   add_test(NAME capture_manifest COMMAND test_capture_manifest)
 
   # va2foff resolution order (issue #113): DYNAMIC/PROCPARAM/TLS must never shadow

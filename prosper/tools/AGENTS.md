@@ -226,6 +226,40 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     `PROSPER_DUMP_PERSISTENT` is deliberately **not** in the `live_gpu_targets` disable list, so it
     observes the normal persistent-GPU-target path;
     `PROSPER_GPU_CAPTURE` **is**, so an env-triggered capture run is on the CPU-readback path.
+- **`revision/check_build_revision.py`** — **is the binary you are about to quote a measurement from
+  actually built from the code you think it is?** The failure it exists for is silent and produces a
+  *confident* wrong answer: a lane checks out new work (or rebases onto a master that moved), runs
+  an existing build directory, and reports the result as a measurement of current master. The source
+  tree IS current, the run succeeds, and nothing says the executable predates the change under test.
+  On 2026-08-06 that nearly turned "#2121 does not move Sonic Frontiers" into a false negative on a
+  title that gates on the exact NID #2121 fixed.
+  ```bash
+  python3 tools/revision/check_build_revision.py build-linux          # vs origin/master
+  python3 tools/revision/check_build_revision.py build-linux --binary build-linux/screenshot
+  python3 tools/revision/check_build_revision.py --manifest ~/work/manifest.json
+  ```
+  **It certifies an executable, not a build directory, and that distinction is the whole tool.**
+  `prosper_build_revision_refresh` is an unconditional custom target consumers merely depend on, so
+  `generated/prosper_build_revision/build_revision.cpp` is rewritten at the **start** of a build — a
+  build that then fails leaves it recording the new revision while every executable still embeds the
+  old one. The first version of this tool read only that file and therefore **certified a stale
+  binary as current**, which is the failure it exists to prevent with a green tick on top; review
+  caught it with a two-sided scratch reproduction. It now also requires an executable whose mtime is
+  at least the generated source's, and **names which one it certified** so the claim is auditable.
+  `configure_file` preserves the mtime when the revision is unchanged, so a rebuild at the same
+  revision is not a false alarm. **Exit status is the contract: 0 only when a named executable is
+  certified**, 1 for a mismatch, a stale binary, and every case where provenance cannot be
+  established — no recorded revision, nothing linked to certify, not a build directory, an
+  unresolvable ref. An unestablished provenance is not a match. (Usage errors exit 2, argparse's
+  convention.) `--allow-stale` downgrades any refusal to 0 while still printing it, for deliberate
+  pre-fix A/B arms — which must then say in the write-up which revision the numbers describe.
+  Screenshot manifests carry `build_revision` in their run header, so an archived artifact nobody
+  can re-run still says which build produced it. Three things it cannot see, by construction: a
+  **dirty tree** (the embedded revision is HEAD — `--strict-dirty` fails when tracked files under
+  `prosper/` differ, and resolves git from the checkout that owns the target rather than the cwd,
+  which is a real distinction under the worktree rule); an **executable it was not asked about**
+  (name the one you will run); and a **binary copied in from elsewhere**, whose mtime says nothing
+  about this build directory.
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
   `--seconds 1` for wall-clock sampling, warmup or `--render-every N --render-every-for-seconds S`
   for slow software rendering,

@@ -1,5 +1,7 @@
 #include "capture_manifest.hpp"
 
+#include "build_revision.hpp"   // revision this binary was compiled from
+
 #include <algorithm>
 #include <cstdio>
 #include <iomanip>
@@ -176,6 +178,13 @@ std::string manifest_run_json(const CaptureRunConfig& c) {
     std::ostringstream line;
     line << "{\"type\":\"run\",\"schema\":1"
          << ",\"title\":\"" << json_escape(c.title) << "\""
+         // The revision this BINARY was compiled from, not the revision of the checkout it is run
+         // from. Those differ whenever a lane checks out new work and measures without rebuilding,
+         // and nothing else in the artifact can tell them apart: the source tree looks current, the
+         // run succeeds, and the result is a confident measurement of the wrong build (instrument
+         // trap 81). Recording it here makes every manifest self-describing, including archived ones
+         // nobody can re-run. `tools/revision/check_build_revision.py` is the active check.
+         << ",\"build_revision\":\"" << json_escape(prosper::embedded_build_revision()) << "\""
          << ",\"timestamp\":\"" << json_escape(c.timestamp) << "\""
          << ",\"output_dir\":\"" << json_escape(c.output_dir) << "\""
          << ",\"input_route\":\"" << json_escape(c.input_route) << "\""
