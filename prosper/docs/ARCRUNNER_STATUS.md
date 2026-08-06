@@ -27,6 +27,12 @@ not losing content, **and the terminal fault IS the rung-1 blocker after all.**
 throttle the title runs its whole intro cinematic in 4K with no fault, so the renderer was never
 the blocker.
 
+**Then read `## 2026-08-06: the init-side generation census`** — the last section in this document.
+It answers the "blocked on #1756" question the previous handoff left as the concrete next step,
+measures the generation overlap and the build→exec content drift at the init, falsifies four
+hypotheses including the pend queue and the drift decline itself, and records the first real game
+imagery this title has produced **without** the throttle.
+
 **`## 2026-08-06: the submit-duration dose-response` measures that race.** Twelve arms, four doses:
 0/3 survive at no stall and at 500 us, 3/3 at 1500 us and at 3000 us, so this title's threshold is
 `(500, 1500]` — the same bracket Crisis Core measured, and no longer imported from it. That section
@@ -997,6 +1003,219 @@ currently allows. Fixing the terminal fault is necessary and, on this arithmetic
 sufficient (the movie is 63 s long), but a rung-1 arm must be given a **long** bound and must count
 `video-ex` calls, not seconds. Do not read "43-54 video frames" from the section above as a rate.
 
+## 2026-08-06: the init-side generation census — the question #1756 made unanswerable, answered
+
+The previous handoff named one concrete next step and recorded it as blocked: *"restoring a
+build-time snapshot out of band … is the concrete next step, and it needs no content predicate"*,
+blocked because #1756 shrank `DMA_DATA` to its hardware 7 dwords and removed the slot
+`dma_build_pre_changed()` reads. **It was not blocked.** The fence build journal
+(`prosper_fence_journal_record`, keyed by the packet's guest address) already stored a per-packet
+build-time target and content snapshot for the `RELEASE_MEM`, `WRITE_DATA` and `WAIT_REG_MEM` legs —
+the DMA-init builder simply never called it. It does now, and `PROSPER_DMA_INIT_GEN=1` (default OFF,
+log-only, gates nothing) reports, at the instant prosper executes a 4-byte label init:
+
+* **generation depth** — `dma_built_n - dma_exec_n`, read before this exec's own bump. `>= 2` means
+  the guest has already built a LATER generation of this label's protocol while this one is still
+  unexecuted. This is the init-side twin of `label_rel_overlap()`, which only sees the fence side.
+* **build→exec drift** — did the target's qword change between the guest building this packet and
+  prosper executing it. A consumed-marker label is deliberately uninitialised at build time, so
+  residue proves nothing; residue *changing* does, because nothing may legitimately write the block
+  in that window.
+
+### The result: both are properties of the dying arm and absent from the surviving one
+
+One binary, ordinary `boot_trace` (`PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_AVPLOG=1`), exact
+zero peer-process censuses (`pgrep -x` over `prosper-app`/`screenshot`/`boot_trace`/`gpu_replay`)
+immediately before and after every arm.
+
+| arm | reps | terminal fault | video frames | examined inits | depth >= 2 | drift | age max / mean |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| default | 3 | **3 of 3** | 34 / 34 / 36 | 960 each | **19 / 11 / 17** | **14 / 26 / 25** of ~524 journal-matched | ~838 / ~345 ms |
+| `PROSPER_SUBMIT_STALL_US=1500` | 1 | **0 of 1**, ran to the 60 s bound | 1,327 | 19,520 | **0** | **0** of 10,079 | 902 / 354 ms |
+
+`SUSPECT-REL1-OVERLAP`, which a default build prints for free, agrees exactly: in the run where the
+census reported `depth>=2=21` the log carries **21** `SUSPECT-REL1-OVERLAP` lines. The init-side and
+fence-side instruments are counting the same events from opposite ends of the pair, which is the
+cross-check neither had on its own.
+
+Three things follow, and the third is the load-bearing one:
+
+1. **The overlap and the drift are real, measurable at the init, and specific to the failing arm.**
+   Roughly 2% of label inits in a dying run execute with a later generation already built, and
+   ~4% execute into a block whose content has changed since the guest built the packet.
+2. **The raw build→exec lag is NOT what the throttle removes.** It is essentially the same in both
+   arms (~345 ms mean, ~840–900 ms max). Whatever the throttle fixes, it is not "prosper catches up".
+3. **The throttle changes neither how fast the guest runs nor how fast prosper executes — only how
+   long the run lives.** A first revision of this section claimed the opposite (a sixfold speed-up)
+   from rates taken over **whole-run** duration. That is a denominator artifact and the row is
+   corrected below: both arms spend an identical **~6.8 s** boot prefix before the first
+   `sceAvPlayerGetVideoDataEx`, which dilutes a 9-second arm's average and barely touches a
+   59-second one's. Measured over the movie window itself — first delivered video frame to last —
+   the arms are indistinguishable, and if anything the **default** arms are marginally faster:
+
+   | arm | first video frame | movie window | video frames/s | label inits/s |
+   | --- | --- | --- | --- | --- |
+   | default | 6.77 / 6.73 / 7.00 s | 1.25 / 1.24 / 1.26 s | **27.2 / 27.4 / 28.5** | **437 / 440 / 434** |
+   | `PROSPER_SUBMIT_STALL_US=1500` | 6.82 / 6.81 s | 52.56 / 52.49 s | **26.3 / 26.3** | **414 / 406** |
+
+   Both arms decode at essentially the movie's nominal 30 fps. So **both** "the throttle slows the
+   guest down" and "the throttle speeds the guest up" are false, and the lever's entire observable
+   effect on this title is **survival**. That is a much tighter constraint on any remaining
+   hypothesis than the wrong one it replaces. It also condemns one figure this document already
+   quotes: the "~2.6 Hz" poll rate in § *How far the movie actually is* is the same whole-run
+   average over the same ~6.8 s prefix, and the true rate there is ~27 Hz.
+
+### The pend queue is not the late-write path on this title
+
+`PROSPER_PEND_AGE=1` over a full default faulting run: **peak residency 5 ms** across 4,096 applied
+completion writes. Against a build→exec age of ~345 ms mean and ~840 ms max, the deferred-write
+model contributes about 1.5% of the window. The entire gap is the **guest's own build-to-submit
+interval** — prosper folds a submit synchronously inside the caller's HLE handler and the pend queue
+adds single-digit milliseconds on top. This reproduces on ArcRunner the 3 ms figure Crisis Core
+already recorded, and it closes `PROSPER_EOP_WRITE_SYNC` as a lead here for a second, independent
+reason (the first is in `## Ruled out`).
+
+### Acting on the drift does not fix the title
+
+`PROSPER_DMA_INIT_DRIFT_GUARD` (default OFF) is the A/B arm that declines on that evidence, so this
+null stays reproducible. It has two levels because the init decline and the paired-fence decline are
+**not the same experiment**:
+
+* **Level 1 — decline the drifted init.** 3 of 3 runs faulted, delivering **35 / 34 / 35** video
+  frames against the baseline's 34 / 34 / 36, with the lever witnessed on every arm (**21 / 13 / 15**
+  `DMA-INIT-DRIFT-DECLINE` lines). A readable null, not a silent one.
+* **Level 2 — also retire that generation's paired fence** through the dma-free debt. Level 2 exists
+  because the first head of this work assumed the default-ON `rel1_stomp_guard()` would decline the
+  fence for free once the init no longer zeroed the low dword. **It does not**, and the terminal
+  fault of that arm named the reason exactly: the surviving pre-content was `0x21c0f88b70`, above
+  `ptr_like_narrow()`'s `[0x2000000000, 0x2100000000)` ceiling, so the fence guard could not see it
+  and wrote `1` over the pointer's low dword anyway — producing `0x2100000001`, the value in `rdi`
+  at the fault. **Declining half a pair is worse than declining neither**: the fence alone composes
+  the forge without any help from the init.
+
+**Level 2 does not stop the fault either — but it is the first intervention on this title that moves
+the progress metric at all, and it moves it a long way.** Five runs, same binary and route, against
+seven baseline runs whose spread is remarkably tight:
+
+| arm | delivered video frames, per run | max |
+| --- | --- | --- |
+| baseline (7 runs, two binaries) | 31, 33, 34, 34, 34, 36, 37 | **37** |
+| `PROSPER_DMA_INIT_DRIFT_GUARD=1` (3) | 34, 35, 35 | 35 |
+| `PROSPER_DMA_INIT_DRIFT_GUARD=2` (5) | 31, 39, 147, 203, 509 | **509** |
+| `PROSPER_SUBMIT_STALL_US=1500` (2) | 1,380, 1,383 — both ran to the 60 s bound | — |
+
+**Four of five level-2 runs exceed the maximum of every baseline run**, by up to 14x, and **5 of 5
+still fault**. Read it as a distribution, not a fix: level 1 is indistinguishable from baseline,
+level 2 is not, and neither survives. The variance is real and large — one level-2 run delivered 31
+frames — so no single level-2 run is evidence of anything on its own (see the standing `## Ruled
+out` row about one-run-per-arm comparisons on this title). Peer-process censuses were exact zero
+before every run and after all but one, which is recorded because a peer sharing the GPU slows
+prosper and, per the throughput inversion above, slowing prosper is not obviously a bias in the
+conservative direction on this title.
+
+So the earlier `## Ruled out` verdict — *suppressing the label writes prosper can detect is not
+enough* — survives, and now covers the one detectable class it had not been tested against. What is
+new is that the class is detectable exactly where the previous handoff predicted, and that acting on
+it as a **pair** buys real progression while acting on it by halves buys none.
+
+### Real game graphics on the un-throttled route
+
+![ArcRunner — the intro's TrickJump, PQube and Unreal Engine logos, captured on the default route with no submit throttle](../../assets/screenshots/arcrunner-default-route-logos.png)
+
+`assets/screenshots/arcrunner-default-route-logos.png` is the **unmodified** `tools/screenshot`
+frontend capture, 3840x2160, taken with `PROSPER_GUEST_ARGS= PROSPER_RENDER=1
+PROSPER_RENDER_SCALE=1 PROSPER_RENDER_EVERY=1 PROSPER_DMA_INIT_DRIFT_GUARD=2` and **no**
+`PROSPER_SUBMIT_STALL_US`. It carries the guest's *TrickJump* and *PQube* logos, the *Unreal Engine*
+logo, and the game's own *PRESS ANY BUTTON TO SKIP…* prompt: 426,965 non-black RGB pixels of
+8,294,400 and 47 distinct colours. It is very dark because the movie is still fading in at this
+point; the image was **opened and read**, not merely measured.
+
+Three things this is and is not.
+
+* It **is** the first real ArcRunner game imagery produced without the diagnostic throttle. Baseline
+  cannot reach it structurally, not merely by luck: the movie's first non-black frame is video frame
+  60 and seven baseline runs deliver 31–37.
+* It is **not** rung 1, and the guard is **not** a candidate correctness change. An earlier
+  revision of this section called it one — "it declines a write into a block whose content proves
+  the guest has repurposed it" — and that is wrong on the decisive point. **It is a lever, in the
+  same evidentiary class as the throttle**, for five reasons, in weight order:
+  1. It **discards** two writes the guest asked for and hardware performs — the `DMA_DATA` init, and
+     via the dma-free debt the paired `RELEASE_MEM` fence. It does not re-time, re-target or
+     re-derive either one. A fix for *"prosper executes this too late"* executes it at the right
+     time.
+  2. **The predicate measures prosper's schedule, not the title.** Drift is 14–26 per dying run and
+     **0 in 10,079** under the throttle. Nothing about ArcRunner differs between those arms — only
+     prosper's timing does.
+  3. The section above already says it in other words: the declined writes are *the messenger*, and
+     only the throttle, *which changes the schedule rather than the writes*, removes the fault.
+  4. **The 5/5-still-fault spread is a widened race window, not a removed defect.** 31 / 39 / 147 /
+     203 / 509 spans 16x with one run at the baseline floor. Removing a defect looks like the
+     throttled arm: 1,380 / 1,383, tight, 0 of 2 faulting.
+  5. It is **strictly broader** than the default-ON guards it resembles. `rel1_stomp_guard` and
+     `mb3_suppress_release` decline only the *fence*, on a *content-shape* predicate. Level 2 also
+     declines the *init*, on a *temporal* predicate, and forces the fence through the debt even
+     where the fence's own predicate would have allowed it.
+
+  The precedent is already in this document: with the throttle the title renders its whole intro
+  cinematic in 4K and is still held at rung 0. Guard-dependent output is the same class of evidence
+  — about prosper's renderer, not about the title's progression. **Do not make this guard default-ON
+  on the strength of the progression it buys.**
+* It is **not** a `MODE=2` artifact. That failure mode is a single-colour blanket, and this frame has
+  47 distinct colours and legible geometry. One sample in the same session *was* one — a uniform
+  `distinct_rgb_colors=1` frame with all 8,294,400 pixels non-black at 30 delivered video frames —
+  and it is excluded on exactly that test. Keep using it: `distinct_rgb_colors` separates the two in
+  the `screenshot` frontend's own JSONL with no extra instrument.
+
+**Sampling cadence changed the subject.** Two capture batches, same build and route: at
+`--seconds 3` the runs delivered 140 video frames and two of five reached picture; at `--seconds 1`
+they delivered 30–31 and none did. The 4K readback per sample is not free. Instrument trap 104
+again — take the widest sampling interval that can still catch the window.
+
+**Two limits on the drift predicate itself, both measurable with what this census already prints.**
+
+1. **The journal is keyed by packet guest address and replaces on write.** If a later generation of
+   the same label rebuilds at the same address while the older packet is still unexecuted, the
+   census compares the older exec against the *newer* build's snapshot — the wrong baseline — and
+   that population is exactly `depth>=2`, exactly where the guard fires. The throttled control
+   cannot discriminate it, because `depth>=2=0` and `drift=0` co-occur there. What bounds it is the
+   census's own `target-changed` count, which is **0, 0, 0** across the three default arms (~524
+   journal hits each) and 1,249 / 1,208 across the two 22,000-init throttled arms. So no slot was
+   reused *at all* in the window where the guard fires, and slot reuse landing on a **different**
+   label is far likelier than reuse landing on the same one — several hundred distinct label
+   addresses share a monotonically advancing packet ring. Zero of the likelier kind bounds the
+   rarer kind; it does not eliminate it. Settling it needs a build generation in the journal record,
+   not another arm. `CONFIDENCE: MED` on the drift predicate; it is one more reason the guard is a
+   lever.
+2. **Roughly 45% of label inits are invisible to both the census and the guard**, and the rate is
+   **structural rather than collision**: 436 / 434 / 436 of 960 in the default arms and 9,290 /
+   9,199 of ~22,000 in the throttled ones — 45.4% against 42.2% across a 23x population change. A
+   hash-collision miss would fall with population; this does not. The likely cause is one queue
+   whose builder records the journal against a packet address the fold does not execute from.
+   Tracked as [#2126](https://github.com/mattias800/prosper/issues/2126).
+
+**One switch interaction to know before quoting a level-1 arm.** The declined init records
+dma-free debt, and **two** paths consume that debt: `declines_drifted_pair_release` (level 2) and
+`mb3_suppress_release`, which is gated on `PROSPER_MB3_FREELIST_GUARD`. So
+`PROSPER_DMA_INIT_DRIFT_GUARD=1` **together with** `PROSPER_MB3_FREELIST_GUARD=1` behaves as level 2,
+because the MB3 release leg retires the paired fence that level 1 deliberately leaves alone. The
+level-1 arms recorded above did not arm the MB3 guard, so they are level 1. Anyone combining the two
+must read the arm as level 2 or the comparison is between two labels for one condition.
+
+### What this leaves
+
+The mechanism is now stated as narrowly as the evidence allows: **the guest rebuilds a
+consumed-marker label roughly one frame after building the previous generation's packet, and prosper
+executes that packet at the very end of the same frame; the margin is under one submit.** In the
+label rings the pattern is exact and repeatable — build at fold *f*, exec at fold *f+5* or *f+6*,
+rebuild at fold *f+6*. When the exec lands on *f+6* rather than *f+5* the two collide, and which of
+them reaches the block first decides whether the run survives. That is why every intervention that
+merely suppresses one of prosper's two writes moves the fault without removing it, and why the
+throttle — which changes the schedule rather than the writes — removes it completely.
+
+The open question is therefore **what sets the guest's recycle margin**, not what writes the value.
+Nothing in this pass measured that, and the throughput inversion above says the cheap answers
+("prosper is late", "the guest outruns us") are the wrong shape.
+
 ## Ruled out
 
 Do not re-derive these without contradictory new evidence.
@@ -1044,6 +1263,11 @@ Do not re-derive these without contradictory new evidence.
 | A one-run-per-arm comparison can A/B a candidate fix on this title | **Three terminal paths compete for every run** and which one wins is a race: measured on `c9e2588e`, the allocator chain (`addr=0x30016000 rip=eboot+0x127e751`), the lazy-commit-masked null (`rip=eboot+0x117e225`, one lazy-commit event), and an `AudioMixerRende` jump to `rip=0x0` with `rax=0x400000001` each terminated at least one of six runs, and one run produced two faults. Consequently the `PROSPER_EOP_WRITE_SYNC=1` and `PROSPER_REL1_WAF_GUARD=1` arms run here are **non-discriminating, not negative**: each was a single run, each ended on the same `AudioMixerRende` null jump as its baseline at ~16 presented frames. Any future arm needs ≥3 runs and a quantitative progress metric (presented frames, delivered video frames, time to first fault), not the identity of the terminal fault. | #1226 |
 | The `PROSPER_MB3WATCH` per-thread head watch reports nothing, so the bin head is not being stomped | A DIFFERENT instrument from the `ptr_like()` upper bound two rows above — that one is `command_processor.cpp`'s report predicate, this one is the watchpoint's arm hook, and widening either says nothing about the other. The arm hook (`exec_image_linux.cpp`) filtered on a stale DOLL-era `[0x20_0000_0000, 0x21_0000_0000)` window while every current title's per-thread cache base is `0x30_xxxx_xxxx` — ArcRunner's is `0x3152350000`, Crisis Core's `0x3001af0000`. It therefore **armed nothing at all**, printed nothing, and read exactly like "armed and saw no write" — the same class as the #1998 finding for `PROSPER_WATCH_LABEL`/`PROSPER_WATCH_HOT`. Window widened to `[0x20..0x40)`, and its report trigger widened from the byte-shift value shape to the structural "a head must be 0 or a 0x20-aligned mapped node". Any null quoted from this instrument before 2026-08-06 is **void, not negative**. | #1945, #1998 |
 | Both prosper-authored halves of the forged pointer are jointly necessary for the corruption (the open question left by the *Suppressing the forging fence* row above; that ArcRunner arm was read as settling it) | Run on **Crisis Core** (`PPSA07809`), a cheaper reproducer for the same family, with the same lever and a valid census (`candidates=127 suppressed=127 landed=0`, `INIT-SUPPRESS` past #4096): the guest allocator is **still** corrupted and still faults at its bundle-list pop, with `0x0002400100024001` in the bin head. Separately, the "our completion writes land late in a recycled block" premise underneath this whole line was measured on that title and is **false**: pend-queue residency peaked at **3 ms** over 5,632 writes, none above 20 ms (`PROSPER_PEND_AGE`). What *does* decide the outcome there is the DURATION of the guest's own submit call, measured as a dose-response over a plain `nanosleep` in the submit fold: **0/3 survive at no stall, 0/3 at 500 us, 3/3 at 1500 us, 3/3 at 3000 us** (0/6 vs 6/6, Fisher two-tailed p ≈ 0.002), threshold between 500 and 1500 us. That is the controlled form of the timing-not-code conclusion `OREGON_TRAIL_STATUS.md` reached from nine arms of PPSA19244. | #1945, #1894 |
+| The DMA-init generation question is **blocked** because #1756 removed the packet slot `dma_build_pre_changed()` reads — recorded as the concrete next step and as unreachable in the same paragraph | It was never blocked. The build snapshot the check needs already existed **out of band**: `prosper_fence_journal_record()` stores a per-packet build-time target and content, keyed by the packet's guest address, and the `RELEASE_MEM` / `WRITE_DATA` / `WAIT_REG_MEM` legs all called it — the DMA-init builder was the only one that did not. Adding that one call, plus `PROSPER_DMA_INIT_GEN=1` to read it back at exec time, answers both halves (generation depth and build→exec drift) with no packet-format change and no content predicate. Generalise: before recording a question as blocked on a removed field, check whether a sibling path already records the same fact for its own reasons. | #1226, #2084 |
+| prosper's completion writes land late on **ArcRunner**, so the deferred pend queue is what puts a label write into a recycled block (the premise the Crisis Core measurement left open for this title) | `PROSPER_PEND_AGE=1` over a full default faulting run: **peak residency 5 ms** across 4,096 applied completion writes. The build→exec age measured in the same arm is ~345 ms mean and ~840 ms max, so the deferred model contributes about **1.5%** of the window and the remaining 98.5% is the **guest's own build-to-submit interval**. The 3 ms Crisis Core figure therefore reproduces here, on a second title, and `PROSPER_EOP_WRITE_SYNC` is closed as a lead for a second independent reason. | #1226, #1945 |
+| Declining the label init whose target **drifted** between the guest's build and prosper's exec fixes the title — the check `dma_build_pre_changed()` was written for, re-armed out of band | It does not, at either level. `PROSPER_DMA_INIT_DRIFT_GUARD=1` (init only): **3 of 3 faulted**, delivering **34 / 35 / 35** video frames against seven baseline runs' **31–37**, with the lever witnessed on every arm (**21 / 13 / 15** `DMA-INIT-DRIFT-DECLINE` lines) — a readable null, not the silent-non-arm class. `=2` (init **and** its paired fence): **5 of 5 faulted**, at **31 / 39 / 147 / 203 / 509** video frames — four of five above every baseline run, so this is the first intervention here that moves the progress metric, and it still does not remove the fault. The predicate is sound and specific (14–26 drifts per dying run against **0 in 10,079** journal-matched inits in a surviving throttled arm), which makes the null stronger rather than weaker: the writes prosper can detect and decline are the messenger. | #1226 |
+| Declining a drifted init is enough on its own, because the default-ON `rel1_stomp_guard()` will decline the paired fence once the low dword is no longer zeroed | It will not, and the arm that assumed it named the reason at its own terminal fault: the surviving pre-content was `0x21c0f88b70`, which is above `ptr_like_narrow()`'s `[0x2000000000, 0x2100000000)` ceiling, so the fence guard could not represent it and wrote `1` over the pointer's low dword — producing exactly the `0x2100000001` in `rdi` at the fault. **Declining half a pair is worse than declining neither**: the 4-byte value-1 fence composes the `{stale high dword, 1}` forge on its own, with no help from the init. Any future arm that suppresses one half must carry the decision across the pair explicitly (`PROSPER_DMA_INIT_DRIFT_GUARD=2` does, through the dma-free debt). | #1226 |
+| The submit throttle changes **how fast the guest runs** — either slowing it down (the reading its name invites, and every "the guest outruns prosper" framing built on it) or, as the first revision of this row claimed, speeding it up about sixfold | **Neither. It changes only how long the run lives.** The sixfold claim was a denominator artifact and is retracted here rather than merely softened: both figures behind it were totals divided by **whole-run** duration, and both arms spend an identical **~6.8 s** boot prefix before the first `sceAvPlayerGetVideoDataEx` — which dilutes a 9-second arm's average and barely touches a 59-second one's. Time-to-first-video-frame is **6.77 / 6.73 / 7.00 s** default against **6.82 / 6.81 s** throttled, i.e. the same. Over the movie window itself the rates are indistinguishable and the **default** arms are marginally *faster*: **27.2 / 27.4 / 28.5** video frames/s against **26.3 / 26.3**, and **437 / 440 / 434** label-init executions/s against **414 / 406**. Both decode at about the movie's nominal 30 fps. The build→exec lag is also unchanged (~345 ms mean either way), so the throttle is not letting prosper catch up either. The lever's entire observable effect on this title is **survival** — a tighter constraint on any remaining hypothesis than the inversion it replaces. Two consequences: a rate quoted over whole-run duration on a title whose arms differ in lifetime by 6x is not a rate, and this document's own "~2.6 Hz" poll figure has the same defect (true rate ~27 Hz). | #1226, #2084 |
 
 ## Next discriminators
 

@@ -1582,6 +1582,261 @@ static void report_suspect_write(const char* kindtag, uint64_t addr, uint64_t va
             (unsigned long long)bpre, (have && ptr_like(bpre)) ? " STALE-AT-BUILD" : "", hist);
 }
 
+// #1226 (arc5): the DMA-init staleness census — PROSPER_DMA_INIT_GEN=1, default OFF, log-only,
+// never gates a write.
+//
+// This asks, at the moment prosper EXECUTES a 4-byte label init, the two questions the
+// generation guard used to ask at the same point and can no longer answer. #1756 shrank DMA_DATA
+// to its hardware 7 dwords and removed the slot `dma_build_pre_changed()` read, so its DMA leg is
+// inert on every current build; both questions are still answerable out of band:
+//
+//   1. GENERATION DEPTH — `dma_built_n - dma_exec_n`, read BEFORE this exec's own bump (which
+//      happens at the end of the immediate branch, after every guard). >= 2 means the guest has
+//      already BUILT a later generation of this label's protocol while this one is still
+//      unexecuted, i.e. two generations are in flight over one 0x20-byte block. That is the
+//      init-side twin of `label_rel_overlap()`, which only sees the fence side.
+//   2. CONTENT DRIFT — the fence build journal, keyed by the packet's guest address, records the
+//      qword the target held when the GUEST built the packet. A consumed-marker label is
+//      deliberately uninitialised at build time (malloc residue is EXPECTED), so residue alone
+//      says nothing; what does say something is the residue CHANGING before we execute. Nothing
+//      may legitimately write a label between its own build and its own init: the previous
+//      generation's fence is older than this build, and the guest does not initialise the block
+//      itself. A changed qword therefore means the block left the guest's label ownership in the
+//      build->exec window — freed, recycled, and handed to a new owner whose first field we are
+//      about to overwrite.
+//
+// The journal record for the DMA leg is added by this change (`agc_dcb_dma_data` /
+// `agc_acb_dma_data` in hle_agc.cpp); the RELEASE_MEM, WRITE_DATA and WAIT_REG_MEM legs already
+// recorded theirs. A journal MISS is reported as its own count rather than folded into either
+// answer, so an unpopulated journal can never read as "no drift".
+//
+// The totals line rides `examined`, not any hit count, and prints on its own schedule: a run that
+// ends in `_exit(90)` (the worker-fault path) never reaches an atexit handler, so a census that
+// only printed at exit would be empty exactly on the runs that matter. CONFIDENCE: HIGH that the
+// instrument reports what it says; it gates nothing.
+namespace {
+struct DmaInitGenTotals {
+    uint64_t examined = 0, with_history = 0, journal_hit = 0, journal_miss = 0, target_changed = 0;
+    uint64_t depth_ge2 = 0, drift_any = 0, drift_lo = 0;
+    uint64_t age_max_ms = 0, age_sum_ms = 0, depth_max = 0;
+};
+std::mutex g_dma_init_gen_mu;
+DmaInitGenTotals g_dma_init_gen;
+bool dma_init_gen_trip_on() {
+    static const bool v = [] {
+        const char* e = getenv("PROSPER_DMA_INIT_GEN");
+        const bool on = e && strtol(e, nullptr, 0) != 0;
+        if (on)
+            fprintf(stderr, "[agc] DMA-INIT-GEN ARMED: per-label generation depth and build->exec "
+                            "content drift at DMA-init exec time (log-only, gates nothing)\n");
+        return on;
+    }();
+    return v;
+}
+// One derivation, read by BOTH the census and the A/B guard below, so the guard can never decline
+// on a condition the census does not report (and vice versa).
+struct DmaInitProvenance {
+    bool     has_history = false;   // this address owns a label-protocol history slot
+    bool     have_journal = false;  // the guest's build of THIS packet is on record
+    bool     same_target = false;   // ...and it named this same label address
+    bool     drift = false;         // the qword changed between build and exec
+    bool     drift_lo = false;      // ...in the low dword, the 4 bytes the init writes
+    uint64_t bpre = 0, age_ms = 0;
+    uint32_t depth = 0, db = 0, dx = 0;
+};
+DmaInitProvenance dma_init_provenance(uint64_t dst, uint64_t pre, uint64_t pkt) {
+    DmaInitProvenance p;
+    // Read-only lookup: this path must never evict a colliding label's protocol state (see
+    // label_hist_find) — a probe that changes what the guards decide is not a probe.
+    const LabelHist* h = label_hist_find(dst);
+    p.has_history = h != nullptr;
+    p.db = h ? h->dma_built_n.load(std::memory_order_relaxed) : 0;
+    p.dx = h ? h->dma_exec_n.load(std::memory_order_relaxed) : 0;
+    p.depth = p.db > p.dx ? p.db - p.dx : 0;   // this exec's own bump is downstream of here
+    uint64_t baddr = 0, bt = 0;
+    p.have_journal = prosper_fence_journal_lookup(pkt, &baddr, &p.bpre, &bt) != 0;
+    p.same_target = p.have_journal && baddr == dst;
+    p.age_ms = (p.have_journal && now_ms() > bt) ? now_ms() - bt : 0;
+    p.drift = p.same_target && p.bpre != pre;
+    p.drift_lo = p.same_target && (uint32_t)p.bpre != (uint32_t)pre;
+    return p;
+}
+void dma_init_gen_trip(uint64_t dst, uint64_t pre, uint32_t value, uint32_t width, uint64_t pkt) {
+    if (!dma_init_gen_trip_on()) return;
+    if (width != 4 || value != 0) return;             // the exact consumed-marker initializer
+    const DmaInitProvenance p = dma_init_provenance(dst, pre, pkt);
+    const LabelHist* h = p.has_history ? label_hist_find(dst) : nullptr;
+    const uint32_t db = p.db, dx = p.dx, depth = p.depth;
+    const uint64_t bpre = p.bpre, age = p.age_ms;
+    const bool have = p.have_journal, same_target = p.same_target;
+    const bool drift = p.drift, drift_lo = p.drift_lo;
+    uint64_t ord;
+    char totals[256];
+    bool print_totals;
+    {
+        std::lock_guard<std::mutex> lk(g_dma_init_gen_mu);
+        DmaInitGenTotals& t = g_dma_init_gen;
+        ord = ++t.examined;
+        if (h) t.with_history++;
+        if (have) t.journal_hit++; else t.journal_miss++;
+        if (have && !same_target) t.target_changed++;
+        if (depth >= 2) t.depth_ge2++;
+        if (depth > t.depth_max) t.depth_max = depth;
+        if (drift) t.drift_any++;
+        if (drift_lo) t.drift_lo++;
+        if (same_target) { t.age_sum_ms += age; if (age > t.age_max_ms) t.age_max_ms = age; }
+        // The schedule must cover the population of interest, not merely the run. The first
+        // version of this census printed every 256th examined write and the whole
+        // generation-overlap population of the run fell into the unprinted tail after the last
+        // multiple of 256 — the run died three tenths of a second later. So: every drift and every
+        // generation overlap forces a totals line of its own, and the periodic cadence is 64.
+        print_totals = (ord == 1) || (ord & 63) == 0 || drift || depth >= 2;
+        if (print_totals)
+            snprintf(totals, sizeof totals,
+                     "[agc] DMA-INIT-GEN-TOTALS examined=%llu with-history=%llu journal(hit=%llu "
+                     "miss=%llu target-changed=%llu) depth>=2=%llu depth-max=%llu drift(qword=%llu "
+                     "lodword=%llu) age(max=%llums mean=%llums) t=%llums\n",
+                     (unsigned long long)t.examined, (unsigned long long)t.with_history,
+                     (unsigned long long)t.journal_hit,
+                     (unsigned long long)t.journal_miss, (unsigned long long)t.target_changed,
+                     (unsigned long long)t.depth_ge2, (unsigned long long)t.depth_max,
+                     (unsigned long long)t.drift_any, (unsigned long long)t.drift_lo,
+                     (unsigned long long)t.age_max_ms,
+                     (unsigned long long)(t.journal_hit ? t.age_sum_ms / t.journal_hit : 0),
+                     (unsigned long long)now_ms());
+    }
+    if (print_totals) fputs(totals, stderr);
+    // Detail lines are budgeted PER CLASS, so the rare drift/deep-generation case can never be
+    // starved by the common clean one sharing a single ordinal (the trap that cost #1226 a run).
+    static std::atomic<uint64_t> n_clean{0}, n_drift{0}, n_deep{0};
+    const bool deep = depth >= 2;
+    if (!drift && !deep) { if (!diag_should_print(n_clean.fetch_add(1) + 1, 8)) return; }
+    else if (drift)      { if (!diag_should_print(n_drift.fetch_add(1) + 1, 64)) return; }
+    else                 { if (!diag_should_print(n_deep.fetch_add(1) + 1, 64)) return; }
+    char hist[512]; label_hist_report(dst, hist, sizeof hist);
+    fprintf(stderr, "[agc] DMA-INIT-GEN #%llu [0x%llx] depth=%u(built=%u exec=%u) "
+                    "pre@build=0x%llx pre@exec=0x%llx%s%s journal=%s%s age=%llums pkt=0x%llx "
+                    "t=%llums | %s\n",
+            (unsigned long long)ord, (unsigned long long)dst, depth, db, dx,
+            (unsigned long long)bpre, (unsigned long long)pre,
+            drift ? " DRIFTED" : "", deep ? " GEN-OVERLAP" : "",
+            have ? "hit" : "MISS", (have && !same_target) ? " TARGET-CHANGED" : "",
+            (unsigned long long)age, (unsigned long long)pkt, (unsigned long long)now_ms(), hist);
+}
+
+// #1226 (arc5) A/B arm, PROSPER_DMA_INIT_DRIFT_GUARD=1, default OFF: decline a 4-byte label init
+// whose target's content CHANGED between the guest building the packet and prosper executing it.
+//
+// This is the check `dma_build_pre_changed()` performs, re-armed from the build journal instead of
+// the in-packet snapshot #1756 removed — and gated on the DRIFT alone, with none of the
+// `mb3_freelist_guard()` membership walk the old DMA leg additionally required. That coupling is
+// why the previous A/B could not separate the two: the recorded worst state was "generation off,
+// membership on", and the arms that measured worse ran both.
+//
+// Why drift is the right predicate and residue is not. A consumed-marker label is DELIBERATELY
+// uninitialised when its packet is built — stale `FFreeBlock` residue is expected there, and every
+// content-shape guard that tried to read staleness out of it repeated #1245. What residue cannot
+// be is UNSTABLE: between the guest building this init and prosper executing it, nothing may
+// legitimately write the block. The paired fence is younger than the build, the guest does not
+// initialise the label itself, and no other generation of the protocol owns the address while this
+// one is outstanding. So a changed qword means the block left the guest's label ownership inside
+// that window — freed, recycled, and handed to a new owner whose first field this init is about to
+// zero, which is the first half of the `{stale high dword, 1}` forge.
+//
+// Declining the init alone is deliberately sufficient for the pair on the population it was
+// measured against: with the low dword left holding a real pointer half, the default-ON
+// `rel1_stomp_guard()` declines the paired fence on its own predicate (it cannot fire today only
+// because our init zeroes that dword first). The dma-free debt is still recorded so the MB3 release
+// leg also declines when THAT guard is armed.
+//
+// Measured on PPSA21406 with `PROSPER_DMA_INIT_GEN=1`, three default runs against two
+// `PROSPER_SUBMIT_STALL_US=1500` runs of one build: **14 / 26 / 25** drifts in ~524 journal-matched
+// inits per faulting run, against **0** in 10,079 on a surviving one. The predicate fires only in
+// the arm that faults, which is the specificity control a content-shape guard has never had here.
+//
+// That specificity cuts BOTH ways, and the honest reading is the unflattering one: nothing about
+// the title differs between those arms — only prosper's own schedule does — so drift is a measure
+// of prosper's timing rather than of the guest. Acting on it declines two writes the guest asked
+// for and hardware performs, instead of performing them at the right time. This is a LEVER for
+// isolating the race, not a candidate fix, and it must not be made default-ON on the strength of
+// the progression it buys (see `docs/ARCRUNNER_STATUS.md`). CONFIDENCE: HIGH that it is a lever;
+// MED on the drift predicate's own soundness (see the journal-rebuild caveat in that document).
+// Levels, so the init decline and the paired-fence decline are SEPARABLE arms. They are not the
+// same experiment and the first head of this change conflated them: level 1 alone took a default
+// run from 34 to 271 delivered video frames, and level 2 on the same build produced a fault class
+// neither arm had shown before. One env var with ordinal levels rather than two booleans, because
+// "1" and "2" cannot be set in a combination that means nothing.
+//   1 = decline the drifted init only (the paired fence still runs its own default guards)
+//   2 = also retire that generation's paired fence through the dma-free debt
+int dma_init_drift_level() {
+    static const int v = [] {
+        const char* e = getenv("PROSPER_DMA_INIT_DRIFT_GUARD");
+        if (!e) return 0;
+        char* end = nullptr;
+        const long parsed = strtol(e, &end, 0);
+        if (end == e || (end && *end) || parsed < 0 || parsed > 2) {
+            fprintf(stderr, "[agc] DMA-INIT-DRIFT-GUARD NOT ARMED: "
+                            "PROSPER_DMA_INIT_DRIFT_GUARD='%s' is not 0, 1 or 2\n", e);
+            return 0;
+        }
+        if (parsed >= 1)
+            fprintf(stderr, "[agc] DMA-INIT-DRIFT-GUARD ARMED level=%ld: declining a 4-byte label "
+                            "init whose target changed content between the guest's build and this "
+                            "exec%s\n", parsed,
+                    parsed >= 2 ? ", and retiring that generation's paired fence" : "");
+        return (int)parsed;
+    }();
+    return v;
+}
+bool dma_init_drift_guard() { return dma_init_drift_level() >= 1; }
+bool declines_drifted_init(uint64_t dst, uint64_t pre, uint32_t value, uint32_t width,
+                           uint64_t pkt) {
+    if (!dma_init_drift_guard()) return false;
+    if (width != 4 || value != 0) return false;        // the exact consumed-marker initializer
+    const DmaInitProvenance p = dma_init_provenance(dst, pre, pkt);
+    if (!p.has_history || !p.same_target || !p.drift) return false;
+    // Counted uncapped, printed sparsely: the LINE count of a suppression reporter is read as the
+    // suppressed population often enough that #1761 had to fix it twice.
+    static std::atomic<uint64_t> n{0};
+    const uint64_t ord = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (diag_should_print(ord, 256)) {
+        char hist[512]; label_hist_report(dst, hist, sizeof hist);
+        fprintf(stderr, "[agc] DMA-INIT-DRIFT-DECLINE #%llu [0x%llx] pre@build=0x%llx "
+                        "pre@exec=0x%llx depth=%u(built=%u exec=%u) age=%llums pkt=0x%llx "
+                        "t=%llums | %s\n",
+                (unsigned long long)ord, (unsigned long long)dst, (unsigned long long)p.bpre,
+                (unsigned long long)pre, p.depth, p.db, p.dx, (unsigned long long)p.age_ms,
+                (unsigned long long)pkt, (unsigned long long)now_ms(), hist);
+    }
+    return true;
+}
+// The declined init's PAIRED FENCE must be declined too, and an earlier head of this change
+// assumed `rel1_stomp_guard()` would do it for free. It does not, and the terminal fault of the
+// arm that assumed so named the reason exactly: the surviving pre-content was `0x21c0f88b70`,
+// which is above `ptr_like_narrow()`'s `[0x2000000000, 0x2100000000)` ceiling, so the fence guard
+// could not see it and wrote `1` over the pointer's low dword anyway — producing `0x2100000001`,
+// the value in `rdi` at the fault. Declining half a pair is worse than declining neither: the
+// fence alone forges `{stale high dword, 1}` without any help from the init.
+//
+// So the decline is carried across the pair explicitly, by the dma-free debt the init records.
+// `label_hist_take_dma_free_debt` is a CAS, so each declined init retires exactly one fence and a
+// later live generation at the same address is untouched. No `rel_exec_n` bump: a suppressed fence
+// signalled nothing, and advancing the counter would make the NEXT real pair read as stale.
+bool declines_drifted_pair_release(uint64_t addr, uint64_t value, const char* kind) {
+    if (dma_init_drift_level() < 2 || value != 1) return false;
+    if (!label_hist_take_dma_free_debt(addr)) return false;
+    static std::atomic<uint64_t> n{0};
+    const uint64_t ord = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (diag_should_print(ord, 256))
+        fprintf(stderr, "[agc] DMA-INIT-DRIFT-PAIR-DECLINE #%llu kind=%s [0x%llx] pre=0x%llx "
+                        "t=%llums\n",
+                (unsigned long long)ord, kind, (unsigned long long)addr,
+                (unsigned long long)peek_qword(addr), (unsigned long long)now_ms());
+    label_hist_rel_free(addr, 0);
+    return true;
+}
+}   // namespace
+
 // #312 the WHERE fix (default ON; PROSPER_REL1_STOMP_GUARD=0 restores the old barrel-through for
 // A/B). When a data_sel==1 fence write would land on a live MallocBinned3 freelist/pool block —
 // captured live as REL1-LIVE: the destination qword is a heap pointer (ptr_like) whose low dword is
@@ -1770,6 +2025,9 @@ static void honor_eop_write(const Pm4Command& c) {
         // packet's rel_value is a fabricated 0 that could move a satisfied fence label BACKWARDS
         // (re-blocking a `*label >= expected` poll).
         case 1: { if (!c.rel_value_valid) return;
+                  // #1226 A/B: retire the fence of a generation whose init this run declined for
+                  // build->exec content drift. Inert unless PROSPER_DMA_INIT_DRIFT_GUARD=1.
+                  if (declines_drifted_pair_release(c.rel_addr, c.rel_value, "REL1")) return;
                   if (mb3_suppress_release(c.rel_addr, c.rel_value, "REL1")) return;
                   // #312 stomp-catcher: a live fence label holds small ints/timestamps; a freed
                   // MallocBinned3 FFreeBlock header holds heap POINTERS. Pointer-like pre-content
@@ -2157,6 +2415,14 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
             }
         }
         forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, packet_addr);
+        // #1226 (arc5): generation depth + build->exec content drift, before any guard and before
+        // this exec's own dma_exec_n bump (which is at the end of this branch).
+        dma_init_gen_trip(c.dd_dst, pre_dma, v32, c.dd_bytes, packet_addr);
+        if (declines_drifted_init(c.dd_dst, pre_dma, v32, c.dd_bytes, packet_addr)) {  // #1226 A/B
+            label_hist_dma_skip(c.dd_dst);
+            label_hist_dma_free(c.dd_dst, 0);   // debt: the MB3 release leg declines the pair too
+            return false;
+        }
         init_trip(c, pre_dma, v32);   // #1226: is THIS write the first half of the corruption?
         if (init_suppress(c, pre_dma, v32)) {   // #1226 A/B arm; default OFF
             label_hist_dma_skip(c.dd_dst);
