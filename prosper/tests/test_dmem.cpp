@@ -507,6 +507,38 @@ int main() {
                   (writable_after.Protect & 0xff) == PAGE_READWRITE,
               "mprotect updates an existing sparse host page");
     }
+    // #2101: memory the guest did NOT get from the memory HLE is still real guest memory, and the
+    // guest may protect it. A module image is mapped by the exec substrate's VirtualAlloc, so it
+    // never enters g_maps; requiring tracker coverage made sceKernelMprotect refuse a title's
+    // mprotect of its OWN eboot segment with EINVAL. The Messenger treats that as fatal and
+    // abandons AGC device init, losing its register-offset table (upside-down, world-less frames).
+    // POSIX mprotect accepts this, so Windows must too. Stand in for the module image with a plain
+    // VirtualAlloc the memory HLE has never heard of.
+    {
+        constexpr SIZE_T kLen = 0x4000;
+        void* untracked = VirtualAlloc(nullptr, kLen, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        CHECK(untracked != nullptr, "reserve an untracked committed region to stand in for a module image");
+        if (untracked) {
+            const uint64_t va = (uint64_t)(uintptr_t)untracked;
+            CHECK(protect(va, kLen, 0x1, 0, 0, 0) == 0,
+                  "sceKernelMprotect accepts committed memory the VA tracker does not own");
+            MEMORY_BASIC_INFORMATION after{};
+            VirtualQuery(untracked, &after, sizeof(after));
+            CHECK(after.State == MEM_COMMIT && (after.Protect & 0xff) == PAGE_READONLY,
+                  "the untracked region's host protection actually changed");
+            CHECK(protect(va, kLen, 0x2, 0, 0, 0) == 0,
+                  "and it can be restored to read/write");
+            MEMORY_BASIC_INFORMATION restored{};
+            VirtualQuery(untracked, &restored, sizeof(restored));
+            CHECK(restored.State == MEM_COMMIT && (restored.Protect & 0xff) == PAGE_READWRITE,
+                  "restoring an untracked region leaves it writable");
+            // The OS stays the authority on existence: a freed range must still be refused, so the
+            // fix above cannot be read as "mprotect now accepts anything".
+            VirtualFree(untracked, 0, MEM_RELEASE);
+            CHECK(protect(va, kLen, 0x2, 0, 0, 0) != 0,
+                  "sceKernelMprotect still refuses a freed (MEM_FREE) range");
+        }
+    }
     CHECK(map((uint64_t)(uintptr_t)&sparse_va2, sparse_len, 0x1, 0,
               sparse_phys, sparse_align) == 0 && sparse_va2 && sparse_va2 != sparse_va1,
           "map a second read-only sparse view of the same physical range");
