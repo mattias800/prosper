@@ -7,8 +7,15 @@
 # needed, and the title screen then holds for as long as the run lasts (verified to t=75 s).
 #
 # Anchored on DISPLAY FLIPS, not seconds: the pre-dialog load is IoStore-bound and its wall-clock
-# length varies by tens of seconds between arms, while the flip at which the dialog appears is
-# stable. Flip 120 is comfortably after it appears (~flip 100) and well before anything else.
+# length varies by tens of seconds between arms. The flip at which the dialog appears varies too —
+# measured directly: one arm had it up before flip 120 and a repeat still had it up at flip ~700 —
+# so a SINGLE press at a fixed flip is not enough, and the first version of this file (one press at
+# f120) failed to dismiss it in 1 of 2 arms. Two pulses cover both cases.
+#
+# The second pulse is not free: if the first already dismissed the dialog, the second is consumed by
+# the title screen and opens the new-game settings flow. That is why they are 60 flips apart — the
+# title screen holds unchanged in between, which at 1 s sampling is 10-20 samples of it. Do not add
+# a third pulse without re-capturing what it lands on.
 #
 # THIS ROUTE DOES NOT BOOT THE TITLE ON ITS OWN. A default run dies 5-12 s in, inside the guest's
 # MallocBinned3 bundle-list pop (#1945), long before the dialog. The route was captured with the
@@ -26,3 +33,4 @@
 # open the new-game settings flow (voice language, then "Begin game with selected settings?"), so
 # do not add blind presses here without re-capturing what they land on. Tracker: #1894.
 f120-140:cross
+f200-220:cross

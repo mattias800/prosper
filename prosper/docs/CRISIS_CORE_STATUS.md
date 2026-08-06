@@ -6,11 +6,21 @@ Unreal Engine 4.27 + IoStore. Tracker: [#1894](https://github.com/mattias800/pro
 Linux/Vulkan run (RADV, AMD Radeon 8060S), unmodified `tools/screenshot`, images inspected by eye.
 
 <p align="center"><img src="../../assets/screenshots/crisis-core-title.png" alt="Crisis Core Reunion — title screen"></p>
+<p align="center"><img src="../../assets/screenshots/crisis-core-main-menu.png" alt="Crisis Core Reunion — main menu"></p>
 
 The boot sequence that now runs end to end: white splash → the autosave-notice dialog → (one
 Cross) → **"Press Any Button" title screen** with `Ver. 1.0.4` and the Square Enix copyright, held
-stably to t=75 s. Pressing Cross again opens the new-game settings flow — voice language, then
-"Begin game with selected settings? Yes/No" — all of which render correctly.
+stably to t=75 s. Pressing Cross again opens the **main menu** — `NEW GAME` / `LOAD GAME` /
+`CONTINUE` (correctly greyed out, no save present) / `OPTIONS` / `CONVERT SAVE DATA` — and pressing
+on through it opens the new-game settings flow: voice language, then "Begin game with selected
+settings? Yes/No". All of these render correctly.
+
+Route arms, stated exactly, because the second one is why the checked-in route has two input
+pulses: with a **single** Cross at flip 120-140, 1 of 2 arms reached the title screen and the other
+sat on the autosave dialog to t=90 s — the flip at which that dialog appears varies more than
+expected between arms. With **two** pulses (the checked-in form), the one arm run reached the title
+screen and then its main menu. So: title screen observed in 2 arms across 3, and never a fault in
+any arm that had the throttle.
 
 ## The route, and the one thing that is not honest about it
 
@@ -88,12 +98,14 @@ scan, and never read a result from an arm that had both.
 ## Open defects, in the order they matter
 
 1. **#1945** — the bundle-list corruption. The whole reason the default route dies. Narrowed above.
-2. **The title screen's key art is missing.** The "Press Any Button" prompt, version string and
-   copyright render; the CRISIS CORE logo/character art that occupies the left of the screen on
+2. **The title screen's key art is missing** (#2057). The "Press Any Button" prompt, version string
+   and copyright render; the CRISIS CORE logo/character art that occupies the left of the screen on
    hardware is absent (flat black). Rung 5 will need this.
 3. **Most published frames are a flat blue with magenta blocks** while the real content exists —
-   roughly 5 of every 90 samples carry the actual screen. The dialog text is visible *through* the
-   blue in some frames, so this is a publish/composite source selection problem, not a lost draw.
+   3 to 6 of every 90 samples carry the actual screen (measured across four 90-sample runs). The
+   dialog text is visible *through* the blue in some frames, so this is a publish/composite source
+   selection problem, not a lost draw. Filed as #2058; it makes any small-sample content measurement
+   on this title a lottery.
 
 ## Reproduction notes
 
