@@ -730,7 +730,7 @@ content root and `rsi` is the entry's name with its extension already appended:
 ```text
  1  decotext/parameter/param_tech.rfl    18  sound/Music03_S3K.acb
  2  NeedleShader.pac                     19  sound/Music09_Museum.acb
- 3  ui/ui_startup.pac   <-- the only MISS 20  rfl/rfl_resident.pac
+ 3  ui/ui_startup.pac  <-- the only MISS  20  rfl/rfl_resident.pac
  4  ui/ui_resident.pac                   21  text/text_common.pac
  5  ui/ui_text_texture.pac               22  text/text_common_de.pac
  6  scalablefont/scalablefont.pac        23  text/text_common_en.pac
