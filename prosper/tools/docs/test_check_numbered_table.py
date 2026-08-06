@@ -132,6 +132,102 @@ run("out of ascending order",
     "| # | What |\n|---|---|\n| 1 | a |\n| 3 | b |\n| 2 | c |\n",
     sequential=True, want_problems=True)
 
+# ---------------------------------------------------------------------------------------------
+# ARITY (#2108). GFM splits a row into cells on `|` BEFORE parsing inline content, so a pipe
+# inside a code span is a cell boundary and the excess cells are SILENTLY DISCARDED. Six rows of
+# GAME_COMPAT_ORCHESTRATION.md rendered truncated on GitHub for months, including instrument trap
+# 40 -- whose subject is `cmd \| tail`, and which was broken by writing `cmd | tail` unescaped.
+# The raw file is correct-looking, so an editor never shows it; only the rendered page is wrong.
+
+# The trap-40 shape, reduced. This is the whole defect in one row.
+run("an unescaped pipe in a code span truncates the row",
+    "| # | Instrument | How it lied |\n|---|---|---|\n| 1 | x | so `cmd | tail` discards it |\n",
+    want_problems=True, want_count=1, want_lines=[3],
+    expect_text="SILENTLY DISCARDS")
+
+# The message must point at the offending CHARACTER, not merely report a count -- a 3,000-character
+# trap row has no other way to be found. Pins the column of the first stray boundary.
+run("the message locates the first stray pipe",
+    "| # | Instrument | How it lied |\n|---|---|---|\n| 1 | x | so `cmd | tail` discards it |\n",
+    want_problems=True, expect_text="`cmd | tail`")
+
+# Trap 87's shape, and a DIFFERENT defect from the code-span one: a row that grows a genuine extra
+# column the table's header never declared. Its `#1891, #1968` evidence cell was discarded whole.
+run("a phantom extra column is discarded whole",
+    "| # | Instrument | How it lied |\n|---|---|---|\n| 1 | x | text | #1891, #1968 |\n",
+    want_problems=True, want_count=1, want_lines=[3])
+
+# Multiple bad rows must ALL be reported. A detector that compares only until its first hit -- the
+# shape this suite already caught once in the structure class -- would report 1 and pass the rest.
+run("every short-changed row is reported, not just the first",
+    "| # | Instrument | How it lied |\n|---|---|---|\n"
+    "| 1 | x | `a | b` |\n| 2 | y | fine |\n| 3 | z | `c | d` |\n| 4 | w | `e | f` |\n",
+    want_problems=True, want_count=3, want_lines=[3, 5, 6])
+
+# The opposite direction: GFM pads a short row, so a dropped cell renders as a blank column rather
+# than as anything visible. Trap 53 records this happening twice in one scripted edit.
+run("a row that dropped a cell",
+    "| # | Instrument | How it lied |\n|---|---|---|\n| 1 | x |\n",
+    want_problems=True, want_count=1, want_lines=[3],
+    expect_text="pads the row with empty cells")
+
+# Worse than any row defect: GFM requires the delimiter to match the header, so this block does not
+# render as a table AT ALL. Reported separately because the symptom is unrelated -- the whole table
+# disappears into a paragraph of literal pipes.
+run("a delimiter that disagrees with the header",
+    "| # | Instrument | How it lied |\n|---|---|\n| 1 | x | y |\n",
+    want_problems=True, expect_text="does NOT render as a table at all")
+
+print("correct shapes the arity check must not reject:")
+
+# THE discriminating case for escape handling: remove it and this correct row is reported. It is
+# also the fix this check prescribes, so a checker that rejected it would be self-contradictory.
+run(r"an escaped pipe is content, not a boundary",
+    "| # | Instrument | How it lied |\n|---|---|---|\n| 1 | x | so `cmd \\| tail` discards it |\n",
+    want_problems=False)
+
+# Backslash PARITY, not mere presence. `\\|` is a literal backslash followed by a REAL delimiter,
+# so this row genuinely has an extra cell. A `(?<!\\)\|` lookbehind -- the obvious implementation,
+# and the one the issue suggested -- reads the pipe as escaped and passes this silently.
+run(r"a doubled backslash does not escape the pipe after it",
+    "| x | y |\n|---|---|\n| a | b\\\\|c |\n",
+    want_problems=True, want_count=1, want_lines=[3])
+
+run(r"a single backslash does escape the pipe after it",
+    "| x | y |\n|---|---|\n| a | b\\|c |\n",
+    want_problems=False)
+
+# Leading and trailing pipes are optional decoration in GFM and do not create empty cells, so
+# `| a | b | c |` is three cells and not five. Note WHY this needs the count pinned rather than a
+# want_problems=False case: the comparison is relative, so a checker that counted the decorative
+# leading pipe would shift header and row together, still detect every mismatch, and merely report
+# both numbers one too high. A truthiness case for it cannot fail -- an earlier draft of this suite
+# had exactly that void case, caught by mutating the rule and watching the suite stay green.
+run("the reported cell counts are the ones a reader would count",
+    "| # | Instrument | How it lied |\n|---|---|---|\n| 1 | x | so `cmd | tail` discards it |\n",
+    want_problems=True, expect_text="has 4 cells but the header at line 1 has 3")
+
+# An intentionally empty cell is still a cell: only the FIRST and LAST segments are decoration.
+# Discriminating against the obvious shortcut of dropping every blank segment.
+run("an empty interior cell still counts",
+    "| a | b | c |\n|---|---|---|\n| 1 |  | 3 |\n",
+    want_problems=False)
+
+# A ``` block is not a table, and a checker that cries wolf on pasted tool output gets disabled
+# rather than heeded -- which would cost the whole gate. The fenced block here is a COMPLETE,
+# well-formed table with a bad row, so it is only invisible because fences are skipped; a block of
+# bare `cmd | tail` lines would pass for the unrelated reason that they lack a leading pipe.
+run("a mis-sized table inside a fence is not a defect",
+    "| # | What |\n|---|---|\n| 1 | a |\n\n```\n| # | What |\n|---|---|\n| 1 | a | b |\n```\n",
+    want_problems=False)
+
+# KNOWN LIMIT, pinned so it is a decision rather than a surprise: a pipe run with no delimiter row
+# has no header to be measured against, so its rows are not arity-checked. The structure class is
+# what reports such a fragment when it abuts a real table; an isolated one is invisible to both.
+run("a delimiter-less pipe block is not arity-checked",
+    "prose\n\n| hand | written | with | four |\n| 1 | 2 |\n",
+    want_problems=False)
+
 print("fails closed (never vacuously green):")
 
 # Absence of a table is an error only when we were pointed at ONE specific table (--sequential):

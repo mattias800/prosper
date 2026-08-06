@@ -157,9 +157,16 @@ jobs:
           python3 prosper/tools/docs/check_numbered_table.py --github --sequential \
             --table-header Instrument prosper/docs/GAME_COMPAT_ORCHESTRATION.md
 
-      # Structure only, across every tracked Markdown file: catches the same table-splitting defect
-      # anywhere it appears. Documents with no table at all are ordinary here and are not an error.
-      - name: Verify no Markdown table is split anywhere in docs
+      # Structure and cell ARITY, across every tracked Markdown file: catches the same
+      # table-splitting defect anywhere it appears, plus a third class no gate here could see
+      # before (#2108). GFM splits a row into cells on `|` BEFORE parsing inline content, so a pipe
+      # inside an inline code span is a cell boundary and the excess cells are SILENTLY DISCARDED
+      # on the rendered page. Six rows of the instrument-trap table were truncated this way for
+      # months -- including trap 40, whose subject is `cmd | tail` and which was broken by writing
+      # exactly that unescaped -- while the step above reported the file `unbroken`, because it
+      # validates numbering contiguity and never cell counts. The fix per row is one character,
+      # `\|`. Documents with no table at all are ordinary here and are not an error.
+      - name: Verify no Markdown table is split or mis-sized anywhere in docs
         run: |
           git ls-files '*.md' -z | xargs -0 python3 prosper/tools/docs/check_numbered_table.py --github
 
