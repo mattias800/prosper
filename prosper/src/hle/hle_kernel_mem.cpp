@@ -3,6 +3,15 @@
 // an opaque offset, then map it (or flexible memory) into VA. We back it with host
 // native VM primitives and TRACK every mapping so VirtualQuery is truthful and so we can
 // log/debug the guest's address-space construction.
+#ifdef _WIN32
+// Must precede EVERY header — including <thread>/<mutex>/<atomic>, which pull in MinGW's _mingw.h and
+// default _WIN32_WINNT to 0x0601 (Windows 7). A later `#ifndef _WIN32_WINNT` is then a silent no-op, and
+// GetCurrentThreadStackLimits / WaitOnAddress / WakeByAddress* (all >= 0x0602, Win8) go undeclared.
+// Same placement rule as hle_kernel.cpp and exec_image_win.cpp.
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#endif
 #include "dispatch.hpp"
 #include "dmem_caller_chain.hpp"
 #include "guest_memory_topology.hpp"
@@ -2483,9 +2492,8 @@ int dmem_caller_scan_slots_for_test(const volatile uint64_t* frame, int want) {
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0A00   // Win10: WaitOnAddress/WakeByAddress* need >= 0x0602 (Win8)
-#endif
+// _WIN32_WINNT is set at the TOP of this file, not here: by this point the C++ standard headers
+// above have already fixed it at MinGW's 0x0601 default, so an `#ifndef` here would never fire.
 #include <windows.h>
 #include <winioctl.h>
 #include <algorithm>
