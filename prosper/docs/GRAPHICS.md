@@ -616,7 +616,11 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   bloom target and three others are entirely zero. Nothing is lost between any target and the
   scanout because there is nothing anywhere to lose. Corroborated by a full `PROSPER_DBG=1` run:
   **0** recompile-rejects of any kind and **0** `[compute] skip`, the only skipped dispatch in the
-  whole boot being #657's `64x64x6` layered image, twice, at boot. #1968 / #2023.
+  whole boot being #657's `64x64x6` layered image, twice, at boot. **That zero has a positive
+  control, and it needs one**: all three reject emitters (`[recompile-reject]`,
+  `[exec-recompile-reject]`, `[cfg-recompile-reject]`) are `PROSPER_DBG`-gated, so an unset variable
+  is indistinguishable from a clean run. The same binary, the same variable and the same log filter
+  print **118** reject lines on *Nikoderiko* (`PPSA23760`) in 130 s. #1968 / #2023.
 - **`nz=0` on a `gpu_replay --inspect-only` resource marked `temporal-RTT-seed` is NOT evidence that
   the target is empty.** That count is over the resource's *guest-memory* bytes, and a
   renderer-owned target is legitimately all-zero there on the persistent-GPU-target path — prosper
