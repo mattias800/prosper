@@ -30,7 +30,17 @@ def main(src, dst):
     struct.pack_into("<H", buf, 0x10, 3)       # e_type = ET_DYN
     struct.pack_into("<Q", buf, 0x20, 0x40)    # e_phoff
     struct.pack_into("<Q", buf, 0x28, 0)       # e_shoff = 0
-    struct.pack_into("<H", buf, 0x3c, e_phnum)
+    # The flattened image has no section header table, so all three fields describing one have to
+    # say so together. e_shoff is zeroed above; the values the source module carries describe a
+    # table that is not in this file (stripped PS5 modules keep stale ones — across 22 title
+    # modules e_shoff is always a past-EOF offset, e_shstrndx is always 41-46, and e_shnum is
+    # 0 or 43-48). Either survivor makes binutils reject the whole file with "file format not
+    # recognized"; both must be cleared, and clearing only one is not enough.
+    # e_phnum at 0x38 needs NO write: it survives the verbatim header copy above, and the loop
+    # below emits exactly that many program headers. Writing it to 0x3c — the e_shnum slot — was
+    # the bug in #2016.
+    struct.pack_into("<H", buf, 0x3c, 0)       # e_shnum = 0
+    struct.pack_into("<H", buf, 0x3e, 0)       # e_shstrndx = SHN_UNDEF
     for i, p in enumerate(phdrs):              # p_offset := p_vaddr for every phdr
         struct.pack_into("<IIQQQQQQ", buf, 0x40+i*56, p[0], p[1], p[3], p[3], p[4], p[5], p[6], p[7])
     open(dst, "wb").write(buf)
