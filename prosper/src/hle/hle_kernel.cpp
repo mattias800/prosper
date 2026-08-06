@@ -554,7 +554,9 @@ namespace { inline uint64_t fbsd_errno(int host) {
 // memory-safety problem — the wrong trade in both directions. The three EBUSY results FreeBSD DOES
 // specify are a separate defect (a contract divergence, not a lifetime bug): prosper has no owner
 // tracking on POSIX hosts and no waiter counts for cond/barrier, so each needs new accounting and
-// is guest-visible on every title. Filed rather than folded in here — see #2042's follow-up.
+// is guest-visible on every title. Filed as #2168 rather than folded in here. The slot prosper
+// clears to NULL is a third divergence — FreeBSD writes a DESTROYED poison and fails EINVAL, where
+// prosper's sentinel test self-initializes a fresh unheld object instead — filed as #2170.
 // CONFIDENCE: HIGH on the table above (read out of libthr and libc, the guest's own platform);
 // CONFIDENCE: MED that Sony's libkernel did not re-write these bodies, which no evidence in the
 // corpus can currently settle either way — a title observed testing a Destroy result would.

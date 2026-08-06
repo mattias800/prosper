@@ -30,7 +30,7 @@
 // unbounded case: a thread PARKED inside a destroyed object (blocked on a lock the guest then
 // destroyed) can outlive any window, and after it expires the object is reclaimed under that thread.
 // Closing that needs hazard-pointer or epoch reclamation bracketing every sync handler — real, and
-// far larger than this defect justifies; see #2042's follow-up. Note that FreeBSD frees a rwlock
+// far larger than this defect justifies; filed as #2169. Note that FreeBSD frees a rwlock
 // under a parked waiter too, so prosper is not worse than the platform there.
 //
 // WHY THE HOST PRIMITIVE IS DESTROYED ONLY AT RECLAIM. `pthread_*_destroy` on an object another
