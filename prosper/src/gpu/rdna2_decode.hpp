@@ -42,6 +42,12 @@ struct Operand {
 Operand decode_src_field(uint32_t field);
 // The float value an InlineFloat operand encodes (0.5, 1.0, ... , 1/(2*pi)); 0 for non-float codes.
 float inline_float_value(uint32_t code);
+// True when a VOPC opcode is the `v_cmpx_*` form, which writes EXEC instead of a VCC/SGPR mask.
+// Every one sits at its `v_cmp_*` counterpart + 0x10, so `opcode - 0x10` recovers the base compare.
+// The six windows and the two invalid holes are enumerated (and sourced) at the definition in
+// rdna2_decode.cpp. This is a property of the ENCODING, so it is shared: the decoder's SDWA
+// admission and the recompiler's EXEC/mask bookkeeping must not carry separate copies (#2120).
+bool vopc_is_cmpx(uint32_t opcode);
 
 struct Rdna2Inst {
     Rdna2Format fmt = Rdna2Format::Unknown;

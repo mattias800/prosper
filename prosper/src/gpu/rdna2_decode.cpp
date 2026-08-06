@@ -40,6 +40,48 @@ Operand decode_src_field(uint32_t f) {
     return {OperandKind::Special, (int32_t)f};   // VCC_LO/HI, EXEC, M0, null, ttmp, ...
 }
 
+// VOPC lays out its 256 opcodes as alternating 16-wide cmp / cmpx blocks, so every `v_cmpx_*` sits
+// at exactly its `v_cmp_*` counterpart + 0x10 and the base is recovered by subtracting it. The full
+// gfx1030 map, derived by disassembling all 256 VOPC e32 encodings with
+// `llvm-mc -arch=amdgcn -mcpu=gfx1030 -disassemble` (#2120):
+//
+//   0x00-0x0f v_cmp_*_f32      | 0x10-0x1f v_cmpx_*_f32
+//   0x20-0x2f v_cmp_*_f64      | 0x30-0x3f v_cmpx_*_f64
+//   0x40-0x7f  --- not compare opcodes at all: 64 invalid encodings ---
+//   0x80-0x87 v_cmp_*_i32      | 0x90-0x97 v_cmpx_*_i32
+//   0x88      v_cmp_class_f32  | 0x98      v_cmpx_class_f32
+//   0x89-0x8e v_cmp_*_i16      | 0x99-0x9e v_cmpx_*_i16
+//   0x8f      v_cmp_class_f16  | 0x9f      v_cmpx_class_f16
+//   0xa0-0xa7 v_cmp_*_i64      | 0xb0-0xb7 v_cmpx_*_i64
+//   0xa8      v_cmp_class_f64  | 0xb8      v_cmpx_class_f64
+//   0xa9-0xae v_cmp_*_u16      | 0xb9-0xbe v_cmpx_*_u16
+//   0xaf      INVALID          | 0xbf      INVALID
+//   0xc0-0xc7 v_cmp_*_u32      | 0xd0-0xd7 v_cmpx_*_u32
+//   0xc8-0xcf v_cmp_*_f16      | 0xd8-0xdf v_cmpx_*_f16
+//   0xe0-0xe7 v_cmp_*_u64      | 0xf0-0xf7 v_cmpx_*_u64
+//   0xe8-0xef v_cmp_*_f16      | 0xf8-0xff v_cmpx_*_f16   (the second half of the 16-op f16 set)
+//
+// The 0xaf / 0xbf holes are real and confirmed twice over: llvm-mc rejects both as invalid
+// encodings, and the ISA guide's own numbered opcode table SKIPS 175 and 191 (it runs 174 -> 176
+// and 190 -> 192). Note that the ISA's *summary* tables 58 and 60 disagree with all of this — they
+// place v_cmpx_*_f32 at 0x50-0x5f and v_cmpx_*_i16 at 0xb0-0xb7, and they list V_CMPS/V_CMPSX
+// opcodes that do not exist on RDNA2 at all. Those two tables are stale GCN-era boilerplate; the
+// per-opcode table 61 is the one that matches hardware and llvm-mc. Do not "correct" this map back
+// to them.
+//
+// This lives here, next to the decode tables, because it is a property of the ENCODING rather than
+// of the translation: both the decoder's SDWA admission and the recompiler's EXEC/mask bookkeeping
+// must agree on it, and they did not (#2120 — the decoder listed three of the six windows, so a
+// `v_cmpx_*_u16` SDWA packet rejected while its plain e32 form worked).
+bool vopc_is_cmpx(uint32_t opcode) {
+    return (opcode >= 0x10u && opcode <= 0x1Fu) ||   // f32
+           (opcode >= 0x30u && opcode <= 0x3Fu) ||   // f64
+           (opcode >= 0x90u && opcode <= 0x9Fu) ||   // i32 / class_f32 / i16 / class_f16
+           (opcode >= 0xB0u && opcode <= 0xBEu) ||   // i64 / class_f64 / u16   (0xbf is INVALID)
+           (opcode >= 0xD0u && opcode <= 0xDFu) ||   // u32 / f16
+           (opcode >= 0xF0u && opcode <= 0xFFu);     // u64 / f16
+}
+
 namespace {
 Operand vgpr(uint32_t n) { return {OperandKind::VGPR, (int32_t)(n & 0xFFu)}; }
 Operand sgpr(uint32_t n) { return {OperandKind::SGPR, (int32_t)(n & 0x7Fu)}; }
@@ -322,10 +364,11 @@ void decode_operands(Rdna2Inst& i) {
                 // values (`v_cmpx_gt_f16_sdwa ..., v7, 0 src0_sel:WORD_1`). Preserve the selects so
                 // the recompiler can unpack the chosen half; other sub-dword compare forms reject.
                 else {
-                    const bool cmpx = (i.opcode >= 0x10u && i.opcode <= 0x1Fu) ||
-                                      (i.opcode >= 0x90u && i.opcode <= 0x9Fu) ||
-                                      (i.opcode >= 0xD0u && i.opcode <= 0xDFu);
-                    const uint32_t eff = cmpx ? i.opcode - 0x10u : i.opcode;
+                    // Map a cmpx opcode onto the base compare whose windows are tested below. This
+                    // used to re-list the cmpx ranges here and got three of the six, so every
+                    // `v_cmpx_*_u16` SDWA packet rejected while its plain e32 form worked (#2120).
+                    const uint32_t eff =
+                        vopc_is_cmpx(i.opcode) ? i.opcode - 0x10u : i.opcode;
                     const uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
                     if (eff >= 0xC9u && eff <= 0xCEu &&
                         s0sel >= 4u && s0sel <= 6u && s1sel >= 4u && s1sel <= 6u &&

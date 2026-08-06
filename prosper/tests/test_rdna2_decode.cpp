@@ -223,6 +223,46 @@ int main() {
     CHECK(fc.fmt == Rdna2Format::VOPC && fc.opcode == 0xDCu && !fc.has_modifier &&
           fc.sdwa_src0_sel == 5u && fc.sdwa_src1_sel == 6u,
           "VOPC f16 SDWA WORD_1 source select is decoded for recompilation");
+
+    // #2120: the cmpx opcode windows, which the decoder's SDWA admission and the recompiler's
+    // EXEC/mask bookkeeping used to define separately. The decoder listed three of the six, so
+    // `v_cmpx_*_u16` worked in its plain e32 form and REJECTED in SDWA. Boundaries are asserted
+    // from BOTH sides of every window so an off-by-one at either end fails here; the map comes
+    // from disassembling all 256 VOPC e32 encodings with llvm-mc for gfx1030.
+    {
+        // Last v_cmp / first v_cmpx / last v_cmpx / first non-cmpx, per window.
+        const uint32_t is_cmpx[]  = { 0x10, 0x1F, 0x30, 0x3F, 0x90, 0x9F,
+                                      0xB0, 0xBE, 0xD0, 0xDF, 0xF0, 0xFF };
+        const uint32_t not_cmpx[] = { 0x0F, 0x20, 0x2F, 0x40, 0x8F, 0xA0,
+                                      0xAE, 0xAF, 0xBF, 0xC0, 0xCF, 0xE0, 0xEF };
+        bool ok = true;
+        for (uint32_t op : is_cmpx)  if (!vopc_is_cmpx(op)) { ok = false; printf("  cmpx miss 0x%02x\n", op); }
+        for (uint32_t op : not_cmpx) if (vopc_is_cmpx(op))  { ok = false; printf("  cmpx false-pos 0x%02x\n", op); }
+        CHECK(ok, "vopc_is_cmpx covers all six cmpx windows and stops at every boundary");
+    }
+    // `v_cmpx_le_u16_sdwa v3, v4 src0_sel:WORD_0 src1_sel:WORD_0` (llvm-mc gfx1030). Opcode 0xbb =
+    // base 0xab + 0x10, and 0xab is inside the admitted u16 integer window — so this must be
+    // admitted with its selects, exactly as the non-cmpx 0xab form below already was. Before the
+    // fix the decoder did not recognise 0xbb as cmpx, left eff = 0xbb, matched no window, and kept
+    // has_modifier so the whole shader rejected.
+    const uint32_t cmpx_u16[] = { 0x7d7608f9u, 0x04040003u };
+    Rdna2Inst cxu = rdna2_decode_one(cmpx_u16, 2);
+    CHECK(cxu.fmt == Rdna2Format::VOPC && cxu.opcode == 0xBBu && !cxu.has_modifier &&
+          isV(cxu.src[0], 3) && isV(cxu.src[1], 4) &&
+          cxu.sdwa_src0_sel == 4u && cxu.sdwa_src1_sel == 4u,
+          "v_cmpx_le_u16 SDWA is admitted with its selects, like its v_cmp_le_u16 base");
+    const uint32_t cmpx_u16_hi[] = { 0x7d7608f9u, 0x04050003u };
+    Rdna2Inst cxh = rdna2_decode_one(cmpx_u16_hi, 2);
+    CHECK(cxh.fmt == Rdna2Format::VOPC && cxh.opcode == 0xBBu && !cxh.has_modifier &&
+          cxh.sdwa_src0_sel == 5u && cxh.sdwa_src1_sel == 4u,
+          "v_cmpx_le_u16 SDWA keeps a WORD_1 source select");
+    // The base compare, which was admitted before this fix too — the positive control proving the
+    // u16 window itself is reached, so the two arms above isolate the cmpx mapping and nothing else.
+    const uint32_t cmp_u16[] = { 0x7d5608f9u, 0x04040003u };
+    Rdna2Inst cmu = rdna2_decode_one(cmp_u16, 2);
+    CHECK(cmu.fmt == Rdna2Format::VOPC && cmu.opcode == 0xABu && !cmu.has_modifier &&
+          cmu.sdwa_src0_sel == 4u && cmu.sdwa_src1_sel == 4u,
+          "v_cmp_le_u16 SDWA (the cmpx base) remains admitted with its selects");
     // Exact packet at pc1933 in Astro Bot's world-map visibility compute shader.
     const uint32_t class_f32[] = { 0x7d1106f9u, 0x86068801u };
     Rdna2Inst cf = rdna2_decode_one(class_f32, 2);

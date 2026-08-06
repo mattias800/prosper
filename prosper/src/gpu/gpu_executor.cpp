@@ -1724,10 +1724,12 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
 // unguarded missing descriptor.
 bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc) {
     auto changes_exec = [](const Rdna2Inst& in) {
+        // Every v_cmpx writes EXEC. This listed three of the six windows, so a cmpx from
+        // 0x30-0x3f / 0xb0-0xbe / 0xf0-0xff read as NOT touching EXEC and the dominance proof
+        // below could accept a region whose guard it had mis-located. Use the shared predicate so
+        // this cannot drift from the decoder again (#2120).
         if (in.fmt == Rdna2Format::VOPC)
-            return (in.opcode >= 0x10 && in.opcode <= 0x1f) ||
-                   (in.opcode >= 0x90 && in.opcode <= 0x9f) ||
-                   (in.opcode >= 0xd0 && in.opcode <= 0xdf);
+            return vopc_is_cmpx(in.opcode);
         return in.fmt == Rdna2Format::SOP1 &&
                ((in.opcode >= 0x24 && in.opcode <= 0x2b) ||
                 in.opcode == 0x37 || in.opcode == 0x38 ||
