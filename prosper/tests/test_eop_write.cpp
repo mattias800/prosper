@@ -47,6 +47,10 @@ extern "C" bool prosper_rel1_forge_report_due_for_test(uint64_t candidates);
 // report verdict.
 extern "C" int prosper_forge_predicate_for_test(uint64_t pre, uint64_t width, uint64_t value,
                                                 int* wide);
+// #1226: the windowless live-pointer shape behind PROSPER_LIVEPTR_TRIP / PROSPER_NONHEAP_PTR_GUARD,
+// and the guard's own narrower content decision (the shape PLUS `!heap_ptr_like`).
+extern "C" int prosper_liveptr_shape_for_test(uint64_t pre, uint64_t width, uint64_t value);
+extern "C" int prosper_nonheap_guard_content_for_test(uint64_t pre, uint64_t width, uint64_t value);
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -1998,6 +2002,97 @@ int main() {
             char msg[192];
             snprintf(msg, sizeof msg, "forge predicate: %s", c.what);
             CHECK(narrow == c.narrow && wide == c.wide, msg);
+        }
+    }
+
+    // #1226 — the live-pointer shape predicate behind PROSPER_LIVEPTR_TRIP and
+    // PROSPER_NONHEAP_PTR_GUARD. The case this exists for is the one BOTH forge predicates above
+    // reject on their window: `pre` is a module-image vtable pointer, which sits below
+    // `heap_ptr_like`'s 0x1000000000 floor (by a factor of about four -- an earlier draft said
+    // "three orders of magnitude", which is wrong; the structural fact is what matters).
+    // Measured on ArcRunner: the label ring at the
+    // faulting register recorded `dmaX(D):0x41700f1e8` then `relX(D):0x400000000`, so prosper's own
+    // 4-byte init and 4-byte fence composed `0x400000001` out of the vptr `eboot+0x700f1e8`, and the
+    // guest's next `call [rax+0x20]` jumped to 0.
+    //
+    // The window cases are deliberately paired with the forge table above: the same `pre` that the
+    // forge predicate must REJECT for being outside its window must be ACCEPTED here, or the two
+    // have silently collapsed into one and the blind spot is back.
+    {
+        struct Case { uint64_t pre; uint64_t width; uint64_t value; int want; const char* what; };
+        const Case cases[] = {
+            // The measured ArcRunner cases, all three composition instances.
+            {0x000000041700f1e8ull, 4, 0, 1, "a module-image vptr is a live-pointer stomp (0x400000001)"},
+            {0x00000021c1388890ull, 4, 0, 1, "a heap object pointer with a live low dword is a stomp"},
+            {0x00000021c0e182d0ull, 4, 0, 1, "the second measured heap instance is a stomp"},
+            // Free-list residue: identical SHAPE, and deliberately still reported. The census must
+            // see this population — it is what makes a zero readable — while the guard excludes it
+            // separately by window, because content cannot separate residue from a live pointer.
+            {0x0000002020e39fc0ull, 4, 0, 1, "free-list residue has the same shape and is reported"},
+            // The #1245 regression shape must NEVER match: a correctly initialised label reads
+            // {stale malloc residue high, low dword ZERO}, and suppressing those desynchronised the
+            // guest's fence protocol. This is the one case whose misclassification is destructive.
+            {0x0000000400000000ull, 4, 1, 0, "an already-initialised label ({high,0}) is NOT a stomp"},
+            {0x0000002000000000ull, 4, 1, 0, "the #1245 shape is NOT a stomp on the heap window either"},
+            // Remaining shape rules.
+            {0x0000000000000001ull, 4, 0, 0, "a small integer (no high dword) is not a pointer"},
+            {0x000000041700f1e8ull, 8, 0, 0, "a full-width write replaces the qword — not a stomp"},
+            {0x000000041700f1e8ull, 4, 0x1700f1e8ull, 0, "a write that does not change the low dword is not a stomp"},
+        };
+        for (const auto& c : cases) {
+            const int got = prosper_liveptr_shape_for_test(c.pre, c.width, c.value);
+            char msg[192];
+            snprintf(msg, sizeof msg, "liveptr shape: %s", c.what);
+            CHECK(got == c.want, msg);
+        }
+        // Cross-check against the forge predicate — the module-image blind spot this whole predicate
+        // exists for. The discriminating input MUST have a ZERO low dword. `forges_freelist_ptr`
+        // rejects on two independent grounds (`!ptr_like(pre)` AND `(uint32_t)pre != 0`), so asking
+        // it about a vptr like 0x41700f1e8 is answered by the LOW-DWORD rule and says nothing about
+        // the window: widening `heap_ptr_like` to the image range would leave such a check passing
+        // unchanged. That is a tautology with respect to its own stated purpose — the exact trap
+        // command_processor.cpp warns about beside `prosper_forge_predicate_for_test`, and it is what
+        // the first version of this block did. (Reported in review of #2077.)
+        //
+        // `0x400000000` is the post-init state of a stomped vptr and has low dword 0, so only the
+        // window can reject it. Today `heap_ptr_like(0x400000000)` is false → wide == 0; drop the
+        // floor below the image range and `forges_freelist_ptr_wide` returns true, failing this.
+        {
+            int wide = -1;
+            const int narrow = prosper_forge_predicate_for_test(0x0000000400000000ull, 4, 1, &wide);
+            CHECK(narrow == 0 && wide == 0,
+                  "liveptr shape: an image-range pre with a ZERO low dword is outside BOTH forge "
+                  "windows (the blind spot; fails if heap_ptr_like's floor is dropped)");
+        }
+        // Kept for completeness with a correct justification: the live vptr shape reaches neither
+        // forge predicate at all, here because its low dword is nonzero rather than because of any
+        // window. That is precisely why `stomps_live_ptr_shape` had to be written.
+        {
+            int wide = -1;
+            const int narrow = prosper_forge_predicate_for_test(0x000000041700f1e8ull, 4, 1, &wide);
+            CHECK(narrow == 0 && wide == 0 &&
+                      prosper_liveptr_shape_for_test(0x000000041700f1e8ull, 4, 1) == 1,
+                  "liveptr shape: a live vptr is rejected by both forge predicates (nonzero low "
+                  "dword) and caught only by the liveptr shape");
+        }
+        // The GUARD's content decision, which the census shape alone does not pin. The single line
+        // `!heap_ptr_like(pre)` in `declines_nonheap_ptr` is what stops the arm from declining the
+        // ~1,280 free-list-residue writes an ArcRunner run makes — i.e. from being #1245 again — and
+        // deleting it failed no test before this block existed. (Reported in review of #2077.)
+        {
+            struct GCase { uint64_t pre; uint64_t width; uint64_t value; int want; const char* what; };
+            const GCase gcases[] = {
+                {0x000000041700f1e8ull, 4, 0, 1, "declines a module-image vptr"},
+                {0x0000002020e39fc0ull, 4, 0, 0, "does NOT decline free-list residue (that is #1245)"},
+                {0x00000021c1388890ull, 4, 0, 0, "does NOT decline a live heap pointer either"},
+                {0x0000000400000000ull, 4, 1, 0, "does NOT decline an already-initialised label"},
+            };
+            for (const auto& g : gcases) {
+                const int got = prosper_nonheap_guard_content_for_test(g.pre, g.width, g.value);
+                char msg[192];
+                snprintf(msg, sizeof msg, "nonheap guard content: %s", g.what);
+                CHECK(got == g.want, msg);
+            }
         }
     }
 

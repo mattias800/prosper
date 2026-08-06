@@ -150,6 +150,9 @@ namespace {
     volatile sig_atomic_t g_null_page_count = 0;
     unsigned g_null_page_mask = 0;             // which of the 16 low pages [0,0x10000) are backed
     void nullpage_deep_dump(ucontext_t* uc, uint64_t rip);
+    // #1226: the command processor's per-label protocol ring, already exported for exactly this
+    // kind of out-of-band question. Writes "events(total=0, no-history)" for an untracked address.
+    extern "C" void prosper_label_hist_dump(uint64_t addr, char* out, unsigned cap);
 #ifdef __linux__
     // Linux's gregset order is not the architectural x86 register encoding used by
     // decode_low_read_dest(): map rax..r15 explicitly rather than treating the two layouts as alike.
@@ -900,6 +903,31 @@ namespace {
             n += snprintf(b + n, sizeof b - (size_t)n, "%s%s=0x%llx", (i % 4) ? " " : "[nullpage]   ",
                           regs[i].nm, (unsigned long long)regs[i].v);
             if (i % 4 == 3) { b[n++] = '\n'; raw_write(2, b, (size_t)n); n = 0; }
+        }
+        // #1226 — is a faulting register a GPU LABEL SLOT? On ArcRunner every terminal fault carries
+        // the shape {small nonzero high dword, low dword 1}, which is byte-identical to a 0x20-byte
+        // label whose 4-byte fence value 1 sits under stale malloc residue in the high half (the
+        // #1226 "residue 0x2020e31680 -> 0x2000000000" mechanism, one generation later). That reading
+        // and "prosper stomped a live pointer" predict the same VALUE and are told apart only by
+        // whether the address has a label protocol history — which the command processor already
+        // records per label and exports here. Printed only for registers that HAVE one, so a silent
+        // run means no register named a tracked label rather than a disabled probe.
+        for (int i = 0; i < 16; i++) {
+            const uint64_t v = regs[i].v;
+            if (v < 0x10000) continue;
+            char hist[512];
+            prosper_label_hist_dump(v, hist, (unsigned)sizeof hist);
+            if (!hist[0] || strstr(hist, "no-history")) continue;
+            snprintf(b, sizeof b, "[labelhist] %s=0x%llx %s\n", regs[i].nm,
+                     (unsigned long long)v, hist);
+            // strlen, NOT snprintf's return: snprintf returns the WOULD-BE length, and `hist` is the
+            // same 512 bytes as `b`. A full 16-event ring formats to ~450-500 characters, so the
+            // prefix pushes the would-be length past `sizeof b` on exactly the richest labels this
+            // instrument exists to print — handing that value to raw_write() reads past the end of a
+            // stack buffer. Every other raw_write in this handler is either length-bounded by its
+            // format or already uses strlen; this is the first whose format embeds a %s of comparable
+            // size to the buffer. (Reported in review of #2077.)
+            raw_write(2, b, strlen(b));
         }
         for (int i = 0; i < 16; i++) {
             uint64_t v = regs[i].v;
