@@ -171,16 +171,24 @@ void test_savedata_transferring_mount() {
         // Kills: THE BUG — the dispatcher's `return 0`, and equally a hand-written `return 0` stub.
         snprintf(msg, sizeof(msg), "%s reports unavailable rather than success", mounts[i].name);
         CHECK(answers[i] != 0, msg);
-        // Kills: an error whose low 32 bits are zero. Every guest call site tests `eax`, not `rax`
-        // (nid_gate_scan --nid RjMlsR8EXrw: nonzero=5 on PPSA03831, no const compare).
-        snprintf(msg, sizeof(msg), "%s error is non-zero in its low 32 bits", mounts[i].name);
-        CHECK((uint32_t)answers[i] != 0, msg);
+        // Kills: an error whose low 32 bits are zero, AND — the reason this is a SIGN test rather
+        // than a non-zero one — any positive low dword. The guest sites gate with `test eax,eax; js`,
+        // a SIGN test, so `return 1` is non-zero and still reads as SUCCESS at every one of them:
+        // the bug would be reinstated with this assertion green. Sony error codes are 0x8xxxxxxx, so
+        // negative-as-int32 is the property the call sites actually test.
+        snprintf(msg, sizeof(msg), "%s error is NEGATIVE as int32 (the sign the call sites test)",
+                 mounts[i].name);
+        CHECK((int32_t)(uint32_t)answers[i] < 0, msg);
         // Kills: writing a mount point the caller would then treat as a real mounted path.
         snprintf(msg, sizeof(msg), "%s leaves the mount-point result untouched", mounts[i].name);
         CHECK(all_bytes_equal(result, sizeof(result), 0), msg);
     }
     // Kills: the two siblings drifting apart — one answering NOT_FOUND and the other some other
     // code, so the title's behaviour would depend on which entry point it happened to call.
+    // NOTE this is a cross-title POLICY lock, not #1873's same-question-two-libraries case:
+    // PPSA03831 does not import WAzWTZm1H+I at all. It is still worth holding, because five local
+    // titles call the Ps4 form and two of them const-compare the code (PPSA03839 against
+    // 0x809F0003, PPSA07809 against 0x809F000F) — so the value is not inert across the corpus.
     CHECK(answers[0] == answers[1], "both transferring-mount entry points give the same answer");
 }
 
