@@ -1,6 +1,8 @@
 # ArcRunner (`PPSA21406`) — status and evidence
 
-Unreal Engine 4.27-plus. **Rung 0 — renderer bring-up, with no real visible game graphics yet.**
+Unreal Engine 4.27-plus. **Rung 0 on a default launch — but the title's graphics are complete: with
+the `PROSPER_SUBMIT_STALL_US=1500` diagnostic throttle it renders its whole intro cinematic in 4K
+with no fault (2026-08-06, below). The blocker is a submit-timing race, not the renderer.**
 The long-lived compatibility index is [#1817](https://github.com/mattias800/prosper/issues/1817),
 and the primary allocator, barrier, and intro-movie investigation is
 [#1226](https://github.com/mattias800/prosper/issues/1226).
@@ -20,6 +22,10 @@ async-compute submit ABI failure is fixed.
 **Read `## 2026-08-05: the black composite is the movie, and the movie is black there` before
 anything else in this document.** It supersedes the rung-1 framing below in two ways: the composite is
 not losing content, **and the terminal fault IS the rung-1 blocker after all.**
+
+**Read `## 2026-08-06: ArcRunner renders real game graphics — the blocker is a TIMING race` FIRST.** It supersedes the rung framing everywhere below: with a diagnostic submit
+throttle the title runs its whole intro cinematic in 4K with no fault, so the renderer was never
+the blocker.
 
 **Then read `## 2026-08-06: all three terminal values are prosper's own two label writes over a LIVE
 pointer`.** It settles the *author* of the fault — the three values this document tracked as three
@@ -365,8 +371,11 @@ PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_DRAWLOG=1 \
 
 # 2. one raw-to-resolved colour/depth record per draw (runs BEFORE the no-effect fast path,
 #    so a dropped draw is still visible)
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_COLORSTATETRACE=all \
-PROSPER_PRESENT_NZLOG=1 ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+#    PROSPER_PRESENT_NZLOG needs a readback companion or it prints NOTHING -- see the
+#    instrument note in the 2026-08-06 section. Alone it is a void arm, not a black frame.
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_COLORSTATETRACE=all \
+PROSPER_PRESENT_NZLOG=1 PROSPER_DUMP_RTGROUPS=1 PROSPER_FRAME_DIR=~/arc-work/rtt \
+  ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
 
 # 3. a BMP per rendered target group with >=1 nonzero byte; a DRAWN target with NO file is
 #    fully zero. ~1 GB per 14 s -- keep the run short and delete afterwards.
@@ -379,8 +388,8 @@ The combined diagnostic arm used for the most recent narrow experiment is:
 ```bash
 PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 \
 PROSPER_INIT_SUPPRESS=ptr PROSPER_REL1_FORGE_SUPPRESS_ALL=1 \
-PROSPER_FORGE_TRIP=1 PROSPER_PRESENT_NZLOG=1 \
-  ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+PROSPER_FORGE_TRIP=1 PROSPER_PRESENT_NZLOG=1 PROSPER_DUMP_RTGROUPS=1 \
+  ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0   # NZLOG needs the readback companion
 ```
 
 `PROSPER_REL1_FORGE_SUPPRESS_ALL` is a default-off diagnostic, not a title fix. It suppresses every
@@ -506,6 +515,77 @@ line of any kind on ArcRunner across nine runs, so its zero carries no in-run po
 is consistent with the observed REL1 population being homogeneous (`pre=0x2000000000` on every
 candidate), not independently proven. The lever is default OFF because `rel1_stomp_guard()` is
 default ON.
+
+## 2026-08-06: ArcRunner renders real game graphics — the blocker is a TIMING race
+
+**Rung 1 is demonstrated, under a diagnostic throttle.** With `PROSPER_SUBMIT_STALL_US=1500` (a
+`nanosleep` in the submit fold — documented in `hle_agc.cpp` as *"Never a fix — it throttles the guest
+unconditionally"*), ArcRunner runs its full intro cinematic with real 4K content and no fault at all.
+
+| arm | terminal fault | video frames delivered | presented content |
+| --- | --- | --- | --- |
+| default | **17 of 17 runs faulted** at 8–14 s | 31–54 | RGB 0 |
+| `PROSPER_SUBMIT_STALL_US=1500` | **0 of 2** — both ran to the 120 s timeout | **1,901 of 1,908 succeeded** | ~26.4 M of 33.2 M bytes nonzero at 3840x2160 |
+| `PROSPER_SUBMIT_STALL_US=3000` | **0 of 2** — both ran to the timeout | ~1,905 | — |
+
+Zero `WORKER-THREAD FAULT`, zero `FMallocBinned3` fatals, zero canary aborts across the stalled runs.
+
+Frames were **opened, not merely measured** — `assets/screenshots/arcrunner-intro-space-station.png`
+(a nebula, the ringed station, engine glow, and the legible caption *TITAN-CLASS SPACE STATION "THE
+ARC"*) and `assets/screenshots/arcrunner-intro-city.png` (a rainy neon street, a character in
+silhouette, signage, wet-ground reflections). A third retained frame is a mid-typewriter text card
+reading *POPULATION: 10 MIL*. All three carry the game's own *PRESS ANY BUTTON TO SKIP* prompt.
+
+**Reproduce it.** The headline arm, and the frame capture that produced the screenshots:
+
+```bash
+# the arm itself -- no fault, ~1,900 delivered video frames; give it a LONG bound
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_SUBMIT_STALL_US=1500 PROSPER_AVPLOG=1 \
+  timeout 120 ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+
+# the same arm, writing BMPs -- frames 100 and 236 are the two committed screenshots
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_SUBMIT_STALL_US=1500 PROSPER_AVPLOG=1 \
+PROSPER_FRAME_DIR=~/arc-work/frames PROSPER_FRAME_DUMP_EVERY=25 PROSPER_DUMP_CONTENT=200000 \
+  timeout 100 ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+```
+
+`rc=124` (timeout) is the SUCCESS condition here — it means the process was still alive. `rc=90` is the
+worker-fault exit. Count `video-ex` lines, not seconds, and pass `PROSPER_AVPLOG` (not
+`PROSPER_AVP_LOG`, which nothing reads — see the `## Ruled out` row).
+
+**What this settles.** The renderer, the recompiler, the AvPlayer path, the resource layer and the
+composite were never the blocker: they produce a correct 4K cinematic the moment the guest is not
+racing prosper. Everything in the sections below about *what* corrupts the pointer remains accurate
+and is now framed correctly — the label writes compose the fault **value**, but the **race** is what
+decides whether corruption happens at all.
+
+**This reproduces master's Crisis Core result on a second title.** The `## Ruled out` row added by
+#1945/#1894 measured a dose-response over the same lever on `PPSA07809` — 0/3 survive at no stall,
+0/3 at 500 us, 3/3 at 1500 us, 3/3 at 3000 us — and found pend-queue residency peaked at 3 ms, so
+"our completion writes land late" is false there too. ArcRunner gives the same lever the same **answer**, at the
+only two doses tried here (1500 us and 3000 us, both 2/2). **Its threshold is NOT measured**: with no
+500 us arm, ArcRunner's bracket is only `(0, 1500]`, and the tighter `(500, 1500]` figure is Crisis
+Core's — imported, not reproduced. `CRISIS_CORE_STATUS.md` says in terms that its result does not
+transfer to another title without that title's own dose-response, so treat the shared *direction* as
+the cross-title finding and the shared *threshold* as an untested assumption until someone runs the
+500 us arm here. It also agrees with this document's own
+`PROSPER_EOP_WRITE_SYNC` null: moving *when* our writes land changes nothing, because the gap that
+matters is inside the guest's own build-to-submit interval.
+
+**What is still owed for a real rung 1.** The throttle is not a fix and must not be presented as one —
+it slows every submit unconditionally. The honest statement is: *the title's graphics are complete and
+correct; the default route still faults.* Closing that gap means making prosper's submit fold behave
+correctly without the artificial delay, which is now the whole of #1226 and #1945. The next lane
+should start from the dose-response threshold (between 500 and 1500 us) and ask what the guest
+observes during that window, not what value ends up in the pointer.
+
+**Two defects visible in the frames, both new and neither blocking rung 1:**
+
+1. The cinematic has a heavy **green/magenta cast** — the nebula is pure green, the city is magenta.
+   Green-vs-magenta is the classic chroma-plane signature (a U/V swap or a plane-order error), and the
+   movie is decoded through the software libavcodec path (`yuv420p -> NV12`). Filed separately.
+2. The default-route composite question in the rung-1 section below is answered: it was never losing
+   content. It composited a black movie frame correctly, exactly as that section concluded.
 
 ## 2026-08-06: all three terminal values are prosper's own two label writes over a LIVE pointer
 
@@ -639,7 +719,11 @@ data relocation. Both construction sites have the same shape:
 So it is a **24-byte (`0x18`) `new` allocation** with layout `{ vptr, u32 @+8, u32 @+0xc, ptr @+0x10 }`,
 built in the RHI/graphics layer at `eboot+0x1250720` and `eboot+0x128e4b0`. `FMallocBinned3`'s
 small-block bins step 16/32/48/…, so a 24-byte request lands in the **32-byte bin** — the same bin the
-guest's 0x20-byte GPU labels come from. **That closes the collision statically**: the interleaving of
+guest's 0x20-byte GPU labels come from. The 24-byte allocation size and both construction sites are
+**measured from the binary**; the *bin-step* itself is not measured here and is `CONFIDENCE: MED`,
+corroborated independently within this document by the provenance census — 1,314 writes at
+32-byte-aligned addresses over 282 distinct slots is a 32-byte-stride pool on its own evidence.
+**So this all but closes the collision statically**: the interleaving of
 label destinations and this object at 32-byte stride in one 64 KiB page is two consumers of one
 allocator bin, not an address-decode accident or a page-mapping coincidence, and the finding carries
 no run-local addresses.
@@ -726,9 +810,11 @@ Do not re-derive these without contradictory new evidence.
 | prosper's label writes are excluded as the author of `0x2100000001` / `0x400000001` (recorded from `FORGE-TRIP-TOTALS seen=256 narrow=256 wide_only=0` and `SUSPECT-REL1-LIVE=0`, both levers witnessed) | **Withdrawn.** Those censuses are correct and structurally blind to this population: every shape predicate filters `pre` through `ptr_like()`/`heap_ptr_like()`, whose widest window floor is `0x1000000000`, and a vtable pointer lives in the module image at `0x41xxxxxxx`. `PROSPER_PTRLIKE_WIDE=1` shares that floor, so it does not reach it either. The windowless `PROSPER_LIVEPTR_TRIP` census reports `examined=5091 shape=1280 live=1280` in one run. A negative from a predicate that cannot represent the case is not a negative. | #1226 |
 | The `AudioMixerRende` `rip=0x0` jump is an unrelated audio failure, retained only as a competing terminal path | It is the same defect. Census of nine runs: **4** `AudioMixerRende`, **3** `RHIThread`, **1** `AgcCleanupThrea`, and **1** whose log is truncated mid-line and carries no `[fault] thread=` record — 4+3+1+1, where an earlier revision of this row listed only eight. Restricting to the **six default (unarmed) runs**, `AudioMixerRende` is 4 of 6. `rax=0x400000001` is the object's **vptr**, read by `mov rax,[rdi]` one instruction before the faulting `call [rax+0x20]`. **Attribution to prosper's two writes is witnessed for ONE of the four** — the run whose `[labelhist]` ring records `dmaX(D):0x41700f1e8` then `relX(D):0x400000000`. For the other three it rests on value shape, and the `{small nonzero high dword, low dword ≤ 1}` row below says in terms that value shape alone cannot attribute such a qword; those three are *consistent with* the mechanism, not instances of it. | #1226 |
 | A rung-1 arm can be bounded like the fault arms, because the fault is what stops the movie | The fault is necessary but not the whole arithmetic. `sceAvPlayerGetVideoDataEx` advances the movie one frame per guest call (`next_video()` pops the decode queue with no media-clock test), and a bounded run measured **31 calls / 31 successes** with **no** other AvPlayer call — so the queue is never starved and the rate is the guest's poll rate, ~2.6 Hz. Reaching video frame 150 needs ~150 polls, about a minute of wall time. Count `video-ex` calls, never seconds. | #1226 |
-| `PROSPER_NONHEAP_PTR_GUARD=1` (decline a sub-qword label write over a mapped non-heap pointer) does or does not remove the fault | Neither. Three armed runs recorded `declines=0`: the image-vptr class did not occur in them, so the arm is **non-discriminating**, exactly like the three void arms above. The lever announces itself and counts, so this is a readable null rather than a silent one. | #1226 |
-| prosper's **deferred** completion-write model (#312's post-submit worker) is what makes a label write land in memory the guest has reallocated — so `PROSPER_EOP_WRITE_SYNC=1` should remove it | It does not. Five armed runs with the lever now witnessed (`[agc] EOP-WRITE-SYNC ARMED`, added for this): the live-pointer stomp rate is **25.9–26.5%** of examined sub-qword writes against the default's **25.1%**, and the module-image vptr class occurs in **4 of 5** armed runs against 1 of 6 default runs. Read those two facts separately. The **aggregate rate is unmoved**, which is the result. The class-frequency difference is large and in the *opposite* direction from a null, and it is **unexplained at n = 5/6** — it is as consistent with the synchronous lever increasing exposure to the class as with small-sample noise, and it must not be folded into the null as though it were merely a positive control. What it does establish is that the class occurred inside the armed arm, so the arm is not a silent one. The cleanest hit has `events(total=3): dmaB@8408/f31 relB@8408/f31 waitB@8408/f31` and executes at 8745 ms, i.e. the guest named the block as a label and freed/reallocated it 337 ms later, before the referencing submit. Synchronous writes cannot help: the build→submit gap is the guest's own. | #1226 |
+| `PROSPER_NONHEAP_PTR_GUARD=1` (decline a sub-qword label write over a mapped non-heap pointer) does or does not remove the fault | Neither, **on those three runs**. They recorded `declines=0` because the image-vptr class did not occur in them, so that arm is **non-discriminating**, exactly like the three void arms above. Do not read this row as the current state: the max-guard row below witnesses **1** `NONHEAP-PTR-DECLINE` — on the same vtable `0x41700f1e8` — and the run still faulted. The lever announces itself and counts, so this is a readable null rather than a silent one. | #1226 |
+| prosper's **deferred** completion-write model (#312's post-submit worker) is what makes a label write land in memory the guest has reallocated — so `PROSPER_EOP_WRITE_SYNC=1` should remove it | It does not. Five armed runs with the lever now witnessed (`[agc] EOP-WRITE-SYNC ARMED`, added for this): the live-pointer stomp rate is **25.9–26.5%** of examined sub-qword writes against the default's **25.1%** (both measured before `liveptr_trip`'s WRITE_DATA call moved inside the `wd_num <= 4` branch, which narrowed the `examined` denominator by excluding packets that could never have matched — a re-run at a later head will not reproduce these exact percentages, and that is a denominator change, not a subject change), and the module-image vptr class occurs in **4 of 5** armed runs against 1 of 6 default runs. Read those two facts separately. The **aggregate rate is unmoved**, which is the result. The class-frequency difference is large and in the *opposite* direction from a null, and it is **unexplained at n = 5/6** — it is as consistent with the synchronous lever increasing exposure to the class as with small-sample noise, and it must not be folded into the null as though it were merely a positive control. What it does establish is that the class occurred inside the armed arm, so the arm is not a silent one. The cleanest hit has `events(total=3): dmaB@8408/f31 relB@8408/f31 waitB@8408/f31` and executes at 8745 ms, i.e. the guest named the block as a label and freed/reallocated it 337 ms later, before the referencing submit. Synchronous writes cannot help: the build→submit gap is the guest's own. | #1226 |
 | Suppressing the label writes prosper can detect is enough to get the title past the fault | It is not. The maximal arm `PROSPER_MB3_FREELIST_GUARD=1 PROSPER_GENERATION_GUARD=1 PROSPER_REL1_WAF_GUARD=1 PROSPER_NONHEAP_PTR_GUARD=1`, with every lever independently witnessed (**26** `MB3-` suppressions, **3–10** `REL-GENERATION-CHANGED-STALE-SUPPRESS`, **1** `NONHEAP-PTR-DECLINE`), still faults on `RHIThread` in the same window and still delivers **31** video frames with 31 successes — the same as an unguarded run. The label writes compose the fault *value*; they are not the whole blocker. A fix has to address the block-lifetime seam. | #1226 |
+| The rung-1 blocker is a rendering, recompiler, AvPlayer or composite defect somewhere in prosper's graphics path | It is none of those. With `PROSPER_SUBMIT_STALL_US=1500` the title renders its **entire intro cinematic** in 4K — a nebula and the ringed station captioned *TITAN-CLASS SPACE STATION "THE ARC"*, a rainy neon street with a character and reflections, and a *POPULATION: 10 MIL* text card — with **0 of 4** stalled runs faulting against **17 of 17** default runs, 1,901 of 1,908 `GetVideoDataEx` calls succeeding against 31, and ~26.4 M of 33.2 M bytes nonzero per presented frame against RGB 0. Frames opened, not just measured: `assets/screenshots/arcrunner-intro-space-station.png`, `assets/screenshots/arcrunner-intro-city.png`. Every graphics subsystem needed to produce this cinematic runs — geometry, text, composition and presentation are all correct — and the blocker is a submit-timing race. Not a claim that the graphics path is defect-free: the same frames carry a chroma-plane colour fault (#2085). | #1226, #1945 |
+| The ArcRunner corruption is title-specific, so it needs a title-specific fix | The same lever gives the same answer on **Crisis Core** (`PPSA07809`), whose dose-response is 0/3 at no stall, 0/3 at 500 us, 3/3 at 1500 us, 3/3 at 3000 us. **The shared finding is the direction, not the threshold**: ArcRunner was run only at 1500 and 3000 us, so its bracket is `(0, 1500]` and the `(500, 1500]` figure is Crisis Core's alone — and pend-queue residency there peaks at 3 ms, so "our completion writes land late" is false on both titles. Two titles, one lever, one threshold: this is a property of prosper's submit timing, not of either guest. It also agrees with this document's own `PROSPER_EOP_WRITE_SYNC` null. | #1945, #1894, #1226 |
 | `PROSPER_AVP_LOG=1` enables the AvPlayer log, so a run with it set and zero `video-ex` lines means the movie never started | `avp_log()` reads **`PROSPER_AVPLOG`** (`src/hle/hle_service.cpp:978`), not `PROSPER_AVP_LOG`. A max-guard arm here reported `video-ex calls: 0` purely because the wrong switch was passed; re-run with `PROSPER_AVPLOG=1` it reported **31**. Two arms were void this way before it was caught. Pass `PROSPER_AVPLOG=1`. | #1226 |
 | `PROSPER_PRESENT_NZLOG=1` on its own reports presented-frame content under `boot_trace` | It reports nothing. A run with it set produced **zero** `[render-nz]` lines over ~100 presented frames: the line is gated on `!px.empty()` in `frontends/shared/live_renderer.cpp`, `px` comes from `selected_pixels`, and the registrar announced `dump=0` — the readback that fills it is opt-in and this switch does not request it. A silent run is **not** "every frame was black". | #1226 |
 | The `addr=(nil)` faults show that page `0x2100000000` is a **legitimately committed guest region whose contents prosper lost** — [#1944](https://github.com/mattias800/prosper/issues/1944) reading 1, argued from "two *different* guest code sites first-touch the same 64 KiB page; a wild pointer would not repeat like that" | It is reading 2 (a wild read masked), and the repetition is a property of the value, not the mapping. `PROSPER_LAZY_COMMIT_STRICT=1` moves the fault to the loading instruction: `[lazy-commit] #1 DECLINED(strict) page=0x2100000000 addr=0x2100000041 access=read rip=0x41117e221`, then `sig=11 addr=0x2100000041 rip=eboot+0x117e221`. The load is `mov rdi,[r12+rcx*8]` / `mov rcx,[rdi+0x40]` with `rdi=0x2100000001`, and `0x40` is added **without masking the low bit**, so `rdi` is a plain corrupt pointer. **Any** `0x21000000xx` value lands in page `0x2100000000` — which is exactly the shape a heap pointer takes when its low dword is lost — so both recorded sites hitting that page is expected, not anomalous. Exactly one lazy-commit event occurs per affected run. Do not spend another arm treating the page as a commit-protocol gap on this title. | #1944, #1226 |

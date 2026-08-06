@@ -965,13 +965,21 @@ static inline bool stomps_live_ptr_shape(uint64_t pre, uint64_t width, uint64_t 
 extern "C" int prosper_liveptr_shape_for_test(uint64_t pre, uint64_t width, uint64_t value) {
     return stomps_live_ptr_shape(pre, width, value) ? 1 : 0;
 }
-// The GUARD's content decision, separately from the census shape it shares. `declines_nonheap_ptr`
-// adds `!heap_ptr_like(pre)` on top, and that one line is the whole reason the arm cannot repeat
+// The GUARD's content decision. `!heap_ptr_like(pre)` is the whole reason the arm cannot repeat
 // #1245: without it the arm would decline the ~1,280 free-list-residue writes an ArcRunner run makes.
-// Deleting it failed no test before this existed. The liveness probe (`guest_readable`) is left to
-// the caller — it needs a live process — so this covers exactly the pure part.
+//
+// `declines_nonheap_ptr()` calls THIS function rather than re-deriving the conjunction, and that is
+// the point. A first version exported a private copy of the same expression, so deleting the guard's
+// own `!heap_ptr_like` line left every case green — a test that could not fail for the deletion it
+// claimed to cover, which is the trap recorded beside `prosper_forge_predicate_for_test` above.
+// One definition, two callers: now the deletion fails `nonheap guard content` in test_eop_write.
+// The liveness probe (`guest_readable`) stays at the call site — it needs a live process — so this
+// covers exactly the pure part.
+static inline bool nonheap_guard_content(uint64_t pre, uint64_t width, uint64_t value) {
+    return stomps_live_ptr_shape(pre, width, value) && !heap_ptr_like(pre);
+}
 extern "C" int prosper_nonheap_guard_content_for_test(uint64_t pre, uint64_t width, uint64_t value) {
-    return (stomps_live_ptr_shape(pre, width, value) && !heap_ptr_like(pre)) ? 1 : 0;
+    return nonheap_guard_content(pre, width, value) ? 1 : 0;
 }
 namespace {
 struct LivePtrTotals {
@@ -1003,6 +1011,15 @@ void liveptr_totals_line(const char* why, char* out, size_t cap) {
     for (int i = 0; i < g_liveptr.hi_used && off < (int)sizeof buckets - 40; ++i)
         off += snprintf(buckets + off, sizeof buckets - off, " hi=0x%llx:%llu",
                         (unsigned long long)g_liveptr.hi[i], (unsigned long long)g_liveptr.hi_n[i]);
+    // `off` accumulates snprintf's WOULD-BE length, so it can run past the array: the loop admits an
+    // iteration at off <= 279 and one entry's would-be length reaches 43, so off can hit 322. The
+    // loop then exits safely, but the append below would compute `buckets + 322` with
+    // `sizeof buckets - off` — an int-to-size_t conversion that underflows to SIZE_MAX-1, i.e. an
+    // out-of-bounds write with an effectively unbounded size. Unreachable at kBuckets == 12 (twelve
+    // realistic entries total ~180 chars), but the comment above tells the next agent to RAISE
+    // kBuckets, which is exactly what arms it. Clamp rather than leave that trap behind the advice.
+    // (Same snprintf-return-value class as the [labelhist] defect this PR fixed; reported in review.)
+    if (off > (int)sizeof buckets - 1) off = (int)sizeof buckets - 1;
     if (g_liveptr.hi_other)
         snprintf(buckets + off, sizeof buckets - off, " hi=other:%llu",
                  (unsigned long long)g_liveptr.hi_other);
@@ -1119,13 +1136,13 @@ static bool nonheap_ptr_guard() {
     return v;
 }
 // True when this sub-qword write would destroy the low dword of a mapped pointer that lies outside
-// the heap window. Shares `stomps_live_ptr_shape` with the census above so the arm and the
-// measurement can never drift apart.
+// the heap window. The content decision comes from `nonheap_guard_content()` — the SAME function the
+// test exports — rather than a second copy of its conjunction, so removing the `!heap_ptr_like` term
+// (the one line standing between this arm and #1245) fails a test instead of passing silently.
 static bool declines_nonheap_ptr(const char* kind, uint64_t dst, uint64_t pre, uint64_t value,
                                  uint64_t width) {
     if (!nonheap_ptr_guard()) return false;
-    if (!stomps_live_ptr_shape(pre, width, value)) return false;
-    if (heap_ptr_like(pre)) return false;          // the #1245 ambiguity lives here; leave it alone
+    if (!nonheap_guard_content(pre, width, value)) return false;
     if (!guest_readable(pre, 8)) return false;     // not a live pointer at all
     static std::atomic<uint64_t> n{0};
     const uint64_t ord = n.fetch_add(1, std::memory_order_relaxed) + 1;
