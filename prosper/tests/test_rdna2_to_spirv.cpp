@@ -2709,40 +2709,89 @@ int main() {
     CHECK(got32o13.size()==1 && bits_of(got32o13[0])==0x00640003u,
           "kernel 32o13 keeps min3/max3 signedness separate at 16 bits");
 
-    // Kernel 32o14 (#2013): the SATURATION RAIL of v_cvt_u16_f16. f16's finite maximum (65504) is
-    // below 0xffff, so only an infinity can reach the rail — and a lowering that saturated at the
-    // 32-bit boundary (what cvt_f2u does on its own) and then masked would produce 0xffff here by
-    // luck but 0x0000 for a value just above 65535. Checked with +Inf, which must clamp to 0xffff.
-    //   v0 = {lo = +Inf}, v2 = 0x12345678  ->  v2 = 0x1234ffff
+    // Kernel 32o14 (#2013): the NEGATIVE clamp of v_cvt_u16_f16, on a finite in-f16-range input, so
+    // the assertion does not rest on SPIR-V's undefined float->int conversion. RDNA2 specifies a
+    // clamp to [0, 65535]; handing -3.0 straight to OpConvertFToU is undefined, and a conforming
+    // implementation that wrapped would survive an integer-domain UMin and give 0xffff. The
+    // lowering therefore clamps in the FLOAT domain, and this is the arm that proves it.
+    //   v0 = {lo = -3.0h}, v2 = 0x12345678  ->  v2 = 0x12340000
     const uint32_t code32o14[] = {
-        0x7e0002ffu, 0x00007c00u,
+        0x7e0002ffu, 0x0000c200u,
         0x7e0402ffu, 0x12345678u,
         0x7e04a500u,
         0xbf810000u,
     };
     std::vector<uint32_t> spv32o14 = recompile_valu(code32o14, std::size(code32o14), 0, 2);
-    CHECK(!spv32o14.empty(), "recompiled kernel 32o14 (v_cvt_u16_f16 saturation) -> SPIR-V");
+    CHECK(!spv32o14.empty(), "recompiled kernel 32o14 (v_cvt_u16_f16 negative clamp) -> SPIR-V");
     std::vector<float> got32o14 = prosper::test::run_compute(
         spv32o14, std::vector<float>(1), 1, 1);
-    CHECK(got32o14.size()==1 && bits_of(got32o14[0])==0x1234ffffu,
-          "kernel 32o14 saturates v_cvt_u16_f16 at the 16-bit rail");
+    CHECK(got32o14.size()==1 && bits_of(got32o14[0])==0x12340000u,
+          "kernel 32o14 clamps a negative f16 to 0 rather than wrapping it");
 
-    // Kernel 32o15 (#2013): the negative rail of v_cvt_i16_f16 (-Inf -> 0x8000), plus v_cvt_f16_u16
-    // and v_sqrt_f16 so the integer->float direction and a second transcendental are not
-    // untested. Each writes its own register; the assertions below check all three.
-    //   v1 = {lo = -Inf}, v3 = 0xaaaa0000  ->  v3 = 0xaaaa8000
+    // Kernel 32o14b: the upper rail of the same op. f16's finite maximum is 65504 < 0xffff, so an
+    // infinity is the only input that can reach it. NaN takes the explicit zero path.
+    //   v0 = {lo = +Inf}, v2 = 0x12345678  ->  v2 = 0x1234ffff
+    const uint32_t code32o14b[] = {
+        0x7e0002ffu, 0x00007c00u,
+        0x7e0402ffu, 0x12345678u,
+        0x7e04a500u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o14b = recompile_valu(code32o14b, std::size(code32o14b), 0, 2);
+    CHECK(!spv32o14b.empty(), "recompiled kernel 32o14b (v_cvt_u16_f16 upper rail) -> SPIR-V");
+    std::vector<float> got32o14b = prosper::test::run_compute(
+        spv32o14b, std::vector<float>(1), 1, 1);
+    CHECK(got32o14b.size()==1 && bits_of(got32o14b[0])==0x1234ffffu,
+          "kernel 32o14b saturates v_cvt_u16_f16 at the upper 16-bit rail");
+
+    // Kernel 32o15 (#2013): the POSITIVE rail of v_cvt_i16_f16 with a FINITE input — 40000.0h is
+    // exactly representable in f16 and well above 32767, so this arm is well-defined under the
+    // float-domain clamp and would fail under an integer-domain one that wrapped.
+    //   v1 = {lo = 40000.0h}, v3 = 0xaaaa0000  ->  v3 = 0xaaaa7fff
     const uint32_t code32o15[] = {
-        0x7e0202ffu, 0x0000fc00u,
+        0x7e0202ffu, 0x000078e2u,
         0x7e0602ffu, 0xaaaa0000u,
         0x7e06a701u,
         0xbf810000u,
     };
     std::vector<uint32_t> spv32o15 = recompile_valu(code32o15, std::size(code32o15), 0, 3);
-    CHECK(!spv32o15.empty(), "recompiled kernel 32o15 (v_cvt_i16_f16 negative rail) -> SPIR-V");
+    CHECK(!spv32o15.empty(), "recompiled kernel 32o15 (v_cvt_i16_f16 positive rail) -> SPIR-V");
     std::vector<float> got32o15 = prosper::test::run_compute(
         spv32o15, std::vector<float>(1), 1, 1);
-    CHECK(got32o15.size()==1 && bits_of(got32o15[0])==0xaaaa8000u,
-          "kernel 32o15 saturates v_cvt_i16_f16 at the negative 16-bit rail");
+    CHECK(got32o15.size()==1 && bits_of(got32o15[0])==0xaaaa7fffu,
+          "kernel 32o15 clamps v_cvt_i16_f16 at the positive 16-bit rail");
+
+    // Kernel 32o15b: the negative rail of the same op, and the NaN contract (RDNA2 converts a NaN
+    // to 0, which the NaN-aware clamp alone would carry to -32768 instead).
+    //   v1 = {lo = -Inf},   v3 = 0xaaaa0000  ->  v3 = 0xaaaa8000
+    //   v5 = {lo = NaN},    v6 = 0xbbbb1111  ->  v6 = 0xbbbb0000
+    const uint32_t code32o15b[] = {
+        0x7e0202ffu, 0x0000fc00u,
+        0x7e0602ffu, 0xaaaa0000u,
+        0x7e06a701u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o15b = recompile_valu(code32o15b, std::size(code32o15b), 0, 3);
+    CHECK(!spv32o15b.empty(), "recompiled kernel 32o15b (v_cvt_i16_f16 negative rail) -> SPIR-V");
+    std::vector<float> got32o15b = prosper::test::run_compute(
+        spv32o15b, std::vector<float>(1), 1, 1);
+    CHECK(got32o15b.size()==1 && bits_of(got32o15b[0])==0xaaaa8000u,
+          "kernel 32o15b clamps v_cvt_i16_f16 at the negative 16-bit rail");
+
+    // Kernel 32o15c: NaN must convert to 0, not to a rail.
+    //   v1 = {lo = NaN (0x7e00)}, v3 = 0xaaaa1111  ->  v3 = 0xaaaa0000
+    const uint32_t code32o15c[] = {
+        0x7e0202ffu, 0x00007e00u,
+        0x7e0602ffu, 0xaaaa1111u,
+        0x7e06a701u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o15c = recompile_valu(code32o15c, std::size(code32o15c), 0, 3);
+    CHECK(!spv32o15c.empty(), "recompiled kernel 32o15c (v_cvt_i16_f16 NaN) -> SPIR-V");
+    std::vector<float> got32o15c = prosper::test::run_compute(
+        spv32o15c, std::vector<float>(1), 1, 1);
+    CHECK(got32o15c.size()==1 && bits_of(got32o15c[0])==0xaaaa0000u,
+          "kernel 32o15c converts a NaN f16 to 0 rather than to a rail");
 
     //   v0 = {lo = 5}, v1 = 0xbeef0000   v_cvt_f16_u16 v1, v0 -> v1 = 0xbeef4500 (5.0h)
     const uint32_t code32o16[] = {
