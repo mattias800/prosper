@@ -72,6 +72,18 @@ int interruptible_mutex_lock(pthread_mutex_t* mutex);
 // Returns true when a registered wait was found and woken.
 bool interrupt_guest_wait(uint64_t thread);
 
+// PROSPER_SYNC_RING: print the retained tail of synchronisation history (wait-enter / wait-wake /
+// signal / broadcast / interrupt) to `path` if given, else stderr. Written for a TOTAL deadlock,
+// where a thread snapshot shows where everyone stopped but nothing shows how they got there. Empty
+// unless PROSPER_SYNC_RING is set, and a no-op off Windows.
+void dump_guest_sync_trace(const char* path = nullptr);
+
+// Record a wake issued OUTSIDE this file -- notably sceKernelWakeByAddress, which calls
+// WakeByAddress* directly. Without this the ring sees waits but not the guest's own wakes, and every
+// address it wakes looks like an object nothing ever woke: an instrument that manufactures its own
+// findings. No-op unless PROSPER_SYNC_RING is set, and off Windows.
+void sync_ring_note_guest_wake(uintptr_t address, uint64_t count);
+
 // Read every Windows interruptible wait currently registered by a guest thread. Nested exception
 // delivery can retain more than one; callers must not claim an arbitrary slot is the current wait.
 // Returns the total validated count and stores up to capacity entries. Other hosts return zero.

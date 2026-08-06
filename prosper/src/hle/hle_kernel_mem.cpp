@@ -5456,6 +5456,9 @@ HLE(k_wake_by_address) {
     // Native per-address wake: n==1 wakes ONE waiter on THIS address (correct semaphore-release
     // semantics), otherwise wake all. No lost wakeup and no global thundering herd (unlike the old
     // single shared condition_variable).
+    // Visible to PROSPER_SYNC_RING: this wake does not go through futex_wake, so without it the
+    // ring records the guest's waits but none of its wakes (#2139).
+    prosper::sync_ring_note_guest_wake((uintptr_t)a0, a1);
     if (a1 == 1) WakeByAddressSingle((PVOID)(uintptr_t)a0);
     else         WakeByAddressAll((PVOID)(uintptr_t)a0);
     return 0;

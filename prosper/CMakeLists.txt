@@ -605,6 +605,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_sync_on_address PRIVATE prosper_core)
   add_test(NAME sync_on_address COMMAND test_sync_on_address)
 
+  # PROSPER_SYNC_RING is sized from the environment at static init, so the ring size must be set
+  # for the process rather than by the test body. 64 is deliberately tiny: the property under test is
+  # what the dump reports once it has DROPPED events.
+  add_executable(test_sync_ring tests/test_sync_ring.cpp)
+  target_link_libraries(test_sync_ring PRIVATE prosper_core)
+  add_test(NAME sync_ring COMMAND test_sync_ring)
+  set_tests_properties(sync_ring PROPERTIES ENVIRONMENT "PROSPER_SYNC_RING=64")
+
   # sceKernelDlsym honors its module handle (#147): per-module export tables, real handles from
   # LoadStartModule for linked-module paths, global first-wins fallback. Pure, no game dump needed.
   add_executable(test_dlsym_handle tests/test_dlsym_handle.cpp)

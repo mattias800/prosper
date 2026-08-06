@@ -6,6 +6,8 @@
 #include "dispatch.hpp"
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <climits>
 #if defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
@@ -46,6 +48,86 @@ struct CondSlot {
     std::atomic<uintptr_t> cond{0};
     std::atomic<uint32_t> sequence{0};
 };
+
+// PROSPER_SYNC_RING: a lock-free ring of the last N synchronisation events.
+//
+// Motivating case (#2139): a title deadlocks with EVERY guest thread parked and none running. A
+// thread snapshot says where everyone is stuck, but not how they got there -- and once the deadlock
+// is total there is nothing left running to log anything. What is needed is the tail of history
+// leading INTO the freeze: which object was last signalled, which wait was interrupted, and whether
+// anybody signalled the object the stuck thread is waiting on. This is that record.
+//
+// Deliberately a ring of plain stores rather than PROSPER_SYNCLOG's fprintf: this sits on the
+// hottest paths in the emulator, and the failure it exists to diagnose is TIMING SENSITIVE, so an
+// instrument that serialises on stderr changes the answer. Off by default for the same reason.
+enum class SyncTraceKind : uint32_t { WaitEnter, WaitWake, Signal, Broadcast, Interrupt,
+                                      FutexWait, FutexWake, GuestWake };
+
+struct SyncTraceEvent {
+    std::atomic<uint64_t> published{0};
+    uint64_t sequence = 0;
+    SyncTraceKind kind = SyncTraceKind::WaitEnter;
+    uint32_t windows_tid = 0;
+    uint64_t pthread_id = 0;
+    uintptr_t object = 0;
+    uintptr_t source = 0;
+    uint32_t value = 0;   // the slot's sequence counter as this event observed it
+};
+
+// Sized by the caller, because the right size is a property of the run being diagnosed rather than
+// something this file can guess: Blue Prince produces ~200k events in the 100 s before it deadlocks,
+// so a fixed small ring retains only the last instants and drops exactly the objects of interest --
+// the ones whose last activity is OLDEST. PROSPER_SYNC_RING=<count> sets it; PROSPER_SYNC_RING=1
+// (or any non-numeric value) takes the default below. 262144 events is about 14 MiB.
+constexpr size_t kSyncTraceDefaultEvents = 65536;
+
+size_t sync_trace_capacity_from_env() {
+    const char* value = std::getenv("PROSPER_SYNC_RING");
+    if (!value || !*value) return 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 0);
+    if (end == value || parsed < 2) return kSyncTraceDefaultEvents;   // "1", "yes", ... => default
+    return (size_t)parsed;
+}
+
+// Read once at startup: getenv is neither cheap nor safe to call from these paths.
+const size_t g_sync_trace_capacity = sync_trace_capacity_from_env();
+// new[] rather than calloc: SyncTraceEvent holds std::atomic members, which must be constructed.
+SyncTraceEvent* const g_sync_trace =
+    g_sync_trace_capacity ? new SyncTraceEvent[g_sync_trace_capacity] : nullptr;
+std::atomic<uint64_t> g_sync_trace_sequence{0};
+const bool g_sync_trace_enabled = g_sync_trace != nullptr;
+
+void sync_trace(SyncTraceKind kind, uintptr_t object, uintptr_t source, uint32_t value) {
+    if (!g_sync_trace_enabled) return;
+    const uint64_t sequence = g_sync_trace_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    SyncTraceEvent& event = g_sync_trace[(sequence - 1) % g_sync_trace_capacity];
+    // Publish the generation LAST, so a reader that races a writer discards a torn entry rather
+    // than reporting half of one. Same contract as the exception ring in hle_kernel.cpp.
+    event.published.store(0, std::memory_order_relaxed);
+    event.sequence = sequence;
+    event.kind = kind;
+    event.windows_tid = GetCurrentThreadId();
+    event.pthread_id = (uint64_t)pthread_self();
+    event.object = object;
+    event.source = source;
+    event.value = value;
+    event.published.store(sequence, std::memory_order_release);
+}
+
+const char* sync_trace_kind_name(SyncTraceKind kind) {
+    switch (kind) {
+        case SyncTraceKind::WaitEnter: return "wait-enter";
+        case SyncTraceKind::WaitWake:  return "wait-wake";
+        case SyncTraceKind::Signal:    return "signal";
+        case SyncTraceKind::Broadcast: return "broadcast";
+        case SyncTraceKind::Interrupt: return "interrupt";
+        case SyncTraceKind::FutexWait: return "futex-wait";
+        case SyncTraceKind::FutexWake: return "futex-wake";
+        case SyncTraceKind::GuestWake: return "guest-wake";
+    }
+    return "?";
+}
 std::array<CondSlot, 4096> g_cond_slots;
 constexpr uintptr_t kCondSlotRetiring = UINTPTR_MAX;
 std::atomic<uint64_t> g_cond_wait_failure{0};
@@ -142,6 +224,9 @@ WaitRegistration futex_wait_enter(uint64_t addr) {
 #ifdef _WIN32
     WaitSlot* registration = register_wait(GuestWaitKind::Address, (uintptr_t)addr,
                                            (uintptr_t)addr);
+    // Recorded so a raw futex waiter is not indistinguishable from one whose producer never
+    // existed: without this every `address` wait looks like a wait-for-graph root by construction.
+    sync_trace(SyncTraceKind::FutexWait, (uintptr_t)addr, (uintptr_t)addr, 0);
     // Close queue-before-sleep: a GC stop can be published just before this wait is registered.
     // Accept it now rather than blocking forever after the raiser's wake lookup already missed us.
     dispatch_pending_guest_exception();
@@ -190,7 +275,12 @@ int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex,
     }
     if (mutex_state) mutex_state->unlocked = true;
     dispatch_pending_guest_exception();
+    sync_trace(SyncTraceKind::WaitEnter, (uintptr_t)&slot->sequence,
+               source ? source : (uintptr_t)cond, expected);
     WaitOnAddress((volatile void*)&slot->sequence, &expected, sizeof(expected), INFINITE);
+    sync_trace(SyncTraceKind::WaitWake, (uintptr_t)&slot->sequence,
+               source ? source : (uintptr_t)cond,
+               slot->sequence.load(std::memory_order_acquire));
     dispatch_pending_guest_exception();
     if (const int injected = consume_cond_wait_failure(
             CondWaitFailurePointForTest::BeforeRelock)) {
@@ -356,7 +446,8 @@ int interruptible_cond_signal(pthread_cond_t* cond) {
 #ifdef _WIN32
     CondSlot* slot = cond_slot_for(cond);
     if (!slot) return ENOMEM;
-    slot->sequence.fetch_add(1, std::memory_order_release);
+    const uint32_t value = slot->sequence.fetch_add(1, std::memory_order_release) + 1;
+    sync_trace(SyncTraceKind::Signal, (uintptr_t)&slot->sequence, (uintptr_t)cond, value);
     WakeByAddressSingle((PVOID)&slot->sequence);
     return 0;
 #else
@@ -368,7 +459,8 @@ int interruptible_cond_broadcast(pthread_cond_t* cond) {
 #ifdef _WIN32
     CondSlot* slot = cond_slot_for(cond);
     if (!slot) return ENOMEM;
-    slot->sequence.fetch_add(1, std::memory_order_release);
+    const uint32_t value = slot->sequence.fetch_add(1, std::memory_order_release) + 1;
+    sync_trace(SyncTraceKind::Broadcast, (uintptr_t)&slot->sequence, (uintptr_t)cond, value);
     WakeByAddressAll((PVOID)&slot->sequence);
     return 0;
 #else
@@ -428,7 +520,8 @@ bool interrupt_guest_wait(uint64_t thread) {
         if ((kind == GuestWaitKind::ConditionSequence || kind == GuestWaitKind::EventFlag ||
              kind == GuestWaitKind::Semaphore) && object) {
             auto* sequence = reinterpret_cast<std::atomic<uint32_t>*>(object);
-            sequence->fetch_add(1, std::memory_order_release);
+            const uint32_t value = sequence->fetch_add(1, std::memory_order_release) + 1;
+            sync_trace(SyncTraceKind::Interrupt, object, snapshot.wait.source, value);
             WakeByAddressAll((PVOID)object);
             interrupted = true;
         }
@@ -488,6 +581,7 @@ void futex_wake(uint64_t addr, int n) {
     // Windows and rendering wedges after the first submit. Wake ALL (n is a hint; label waiters are few).
     if (!addr) return;
     (void)n;
+    sync_trace(SyncTraceKind::FutexWake, (uintptr_t)addr, (uintptr_t)addr, 0);
     WakeByAddressAll((PVOID)(uintptr_t)addr);
 #else
     (void)addr; (void)n;
@@ -503,6 +597,60 @@ void wake_label_waiters(uint64_t addr) {
     if (g_waiters.load(std::memory_order_seq_cst) == 0) return;
     futex_wake(addr, INT_MAX);
     futex_wake(addr + 4, INT_MAX);   // 64-bit labels: a waiter may block on the high dword too
+}
+
+void sync_ring_note_guest_wake(uintptr_t address, uint64_t count) {
+#ifdef _WIN32
+    sync_trace(SyncTraceKind::GuestWake, address, address, (uint32_t)count);
+#else
+    (void)address; (void)count;
+#endif
+}
+
+// PROSPER_SYNC_RING reader. Prints the retained events oldest-first. Safe to call while the guest
+// is deadlocked -- it only reads published entries and never takes a lock, which is the whole point:
+// the situation it describes is one where no lock can be acquired because nothing is running.
+void dump_guest_sync_trace(const char* path) {
+#ifdef _WIN32
+    FILE* out = stderr;
+    FILE* opened = nullptr;
+    if (path && *path) { opened = std::fopen(path, "a"); if (opened) out = opened; }
+    const uint64_t total = g_sync_trace_sequence.load(std::memory_order_acquire);
+    if (!g_sync_trace_enabled) {
+        std::fprintf(out, "[sync-trace] disabled (set PROSPER_SYNC_RING=1 to retain events)\n");
+        if (opened) std::fclose(opened);
+        return;
+    }
+    const uint64_t capacity = (uint64_t)g_sync_trace_capacity;
+    const uint64_t first = total > capacity ? total - capacity + 1 : 1;
+    std::fprintf(out, "[sync-trace] %llu events total, showing %llu..%llu\n",
+                 (unsigned long long)total, (unsigned long long)first,
+                 (unsigned long long)total);
+    for (uint64_t sequence = first; sequence <= total; ++sequence) {
+        const SyncTraceEvent& event = g_sync_trace[(sequence - 1) % g_sync_trace_capacity];
+        // Re-read the generation around the payload: a writer that lapped us mid-read invalidates
+        // this entry, and a torn record is worse than an omitted one.
+        const uint64_t before = event.published.load(std::memory_order_acquire);
+        if (before != sequence) continue;
+        const SyncTraceKind kind = event.kind;
+        const uint32_t windows_tid = event.windows_tid;
+        const uint64_t pthread_id = event.pthread_id;
+        const uintptr_t object = event.object;
+        const uintptr_t source = event.source;
+        const uint32_t value = event.value;
+        if (event.published.load(std::memory_order_acquire) != sequence) continue;
+        std::fprintf(out,
+                     "[sync-trace] seq=%llu kind=%-10s tid=%lu pthread=0x%llx object=0x%llx "
+                     "source=0x%llx value=%lu\n",
+                     (unsigned long long)sequence, sync_trace_kind_name(kind),
+                     (unsigned long)windows_tid, (unsigned long long)pthread_id,
+                     (unsigned long long)object, (unsigned long long)source,
+                     (unsigned long)value);
+    }
+    if (opened) std::fclose(opened);
+#else
+    (void)path;
+#endif
 }
 
 } // namespace prosper

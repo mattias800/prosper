@@ -41,6 +41,19 @@ nested-wait case deliberately holds the handler after the inner wait returns and
 is still discoverable. `PROSPER_APP_STALL_DUMP_MS=<milliseconds>` makes `prosper-app` dump the bounded
 exception ring when presented-frame progress stops, and `PROSPER_VEHLOG=1` adds fatal worker context.
 
+`PROSPER_SYNC_RING=<events>` retains the last N synchronisation events (wait-enter / wait-wake /
+signal / broadcast / interrupt) in a lock-free ring, dumped by `prosper-app`'s timed guest-state dump
+alongside the thread snapshot. It exists for the case a thread snapshot cannot explain: a TOTAL guest
+deadlock, where the snapshot shows where all ~76 threads stopped but nothing shows how they got there,
+and once the deadlock is complete there is nothing left running to log anything. Use it, not
+`PROSPER_SYNCLOG`, when the failure is timing sensitive -- it is plain stores rather than `fprintf`,
+so it does not serialise the very race being studied. Size it for the run: Blue Prince emits ~200k
+events in the 100 s before it deadlocks, and a small ring drops exactly the objects of interest (the
+ones whose last activity is OLDEST). The dump header reports the true total and the retained window,
+so a truncated history is visible rather than silently passing as complete. Correlate it with the
+snapshot using `tools/re/waitgraph.py`, which builds the wait-for graph -- each parked thread against
+the thread that last woke its object -- and names the roots and any cycle.
+
 Validation on 2026-07-16: 30 consecutive exception-suite passes and 12/12 fresh-save Blasphemous 2
 Windows boots reached 360 presented frames with no stall or early exit. This validates boot/GC stability,
 not the title-to-menu graphics transition; tiled 2D compute storage writeback remains tracked in #787.
