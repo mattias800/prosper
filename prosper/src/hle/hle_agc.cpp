@@ -679,6 +679,11 @@ HLE9(agc_dcb_dma_data) {  // (..., srcImmediate, dstSel?, srcSel?, dst, policy, 
                         (address_source ? gpu::kDmaDataAddressSource : 0u));
     if (num_bytes <= 8) {
         prosper_label_hist_dma_built(a4, a0, (uint32_t)a1, 1);                  // #312 label-init form
+        // #1226: the DMA-init leg of the build journal. The fence/wait/write legs already record
+        // theirs; without this one, nothing can answer "did the label's content change between the
+        // guest building this init and prosper executing it" now that #1756 removed the in-packet
+        // build snapshot. Diagnostic-grade and prosper-private: it writes only prosper's table.
+        prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a4);
     }
     return (uint64_t)(uintptr_t)cmd;
 }
@@ -697,6 +702,7 @@ HLE9(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm,
     cmd[6] = (uint32_t)((a1 & 0xffu) | ((a2 & 0xffu) << 8));
     if (num_bytes <= 8) {
         prosper_label_hist_dma_built(a3, a0, (uint32_t)src_imm, 2);              // #312
+        prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a3);              // #1226 (see Dcb form)
     }
     return (uint64_t)(uintptr_t)cmd;
 }
