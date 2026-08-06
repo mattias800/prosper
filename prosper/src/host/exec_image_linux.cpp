@@ -667,7 +667,12 @@ namespace {
                 else if (c>='A'&&c<='F') d=c-'A'+10; else break; v = v*16 + d; }
             *pp = p; return v;
         };
-        char out[400]; int on = snprintf(out, sizeof out, "%s", tag);
+        // Every cursor advance in this function goes through raw_fmt_advance (#2161): snprintf
+        // returns the WOULD-BE length, so an unclamped `on` walks past `out` and the next
+        // `sizeof out - on` underflows to ~2^64. Saturated at `sizeof out`, so `out + on` stays
+        // in range, later appends see size 0 and write nothing, and the terminator/flush below
+        // still read `on >= sizeof out` as "this line truncated".
+        char out[400]; int on = raw_fmt_advance(0, snprintf(out, sizeof out, "%s", tag), sizeof out);
         const char* p = spec;
         while (*p && on < (int)sizeof out - 64) {
             while (*p==';'||*p==','||*p==' ') p++;
@@ -686,10 +691,10 @@ namespace {
                 else p++;
             }
             int slen = (int)(p - start); if (slen > 40) slen = 40;
-            if (bad) { on += snprintf(out+on, sizeof out-on, " %.*s=<unmapped>", slen, start); continue; }
+            if (bad) { on = raw_fmt_advance(on, snprintf(out+on, sizeof out-on, " %.*s=<unmapped>", slen, start), sizeof out); continue; }
             // probe_readable(v) verifies [v,v+8), covering any 1..8-byte read at v (guard the read's base).
             if (type=='s') {   // Il2CppString at v: length@0x10 (i32), UTF-16 chars@0x14 — print ASCII, capped.
-                on += snprintf(out+on, sizeof out-on, " %.*s=", slen, start);
+                on = raw_fmt_advance(on, snprintf(out+on, sizeof out-on, " %.*s=", slen, start), sizeof out);
                 if (probe_readable(v + 0x10)) {
                     int len = *(const int32_t*)(v + 0x10);
                     if (len < 0) len = 0; if (len > 48) len = 48;
@@ -709,12 +714,13 @@ namespace {
             else if (type=='d') snprintf(vb, sizeof vb, probe_readable(v) ? "0x%x"   : "?", probe_readable(v) ? *(const uint32_t*)v : 0);
             else if (type=='f') snprintf(vb, sizeof vb, probe_readable(v) ? "f:0x%x" : "?", probe_readable(v) ? *(const uint32_t*)v : 0);
             else                snprintf(vb, sizeof vb, probe_readable(v) ? "0x%llx" : "?", (unsigned long long)(probe_readable(v) ? *(const uint64_t*)v : 0));
-            on += snprintf(out+on, sizeof out-on, " %.*s=%s", slen, start, vb);
+            on = raw_fmt_advance(on, snprintf(out+on, sizeof out-on, " %.*s=%s", slen, start, vb), sizeof out);
         }
-        // `on` is a running total of snprintf returns, so a truncating chain leaves it ABOVE
-        // sizeof out — which would put the newline store out of bounds and hand raw_write a
-        // length past the end of the buffer. Clamp once, then both are provably in range: the
-        // store lands at index <= sizeof out - 1 and the write covers <= sizeof out bytes (#2050).
+        // Since #2161 every append above saturates `on` at sizeof out, so the only value the
+        // clamp still has to absorb here is that saturation itself — the newline store needs one
+        // byte more room than the appends do. `cut` is exactly `on == sizeof out`, which is how
+        // #2050's contract reads "this line truncated": the write covers the bytes that really
+        // landed and the marker tells the reader the tail is missing.
         const bool cut = on < 0 || (size_t)on >= sizeof out;
         on = (int)raw_fmt_len(on, sizeof out);
         out[on] = '\n';
@@ -909,12 +915,12 @@ namespace {
         };
         n = 0;
         for (int i = 0; i < 16; i++) {
-            n += snprintf(b + n, sizeof b - (size_t)n, "%s%s=0x%llx", (i % 4) ? " " : "[nullpage]   ",
-                          regs[i].nm, (unsigned long long)regs[i].v);
+            n = raw_fmt_advance(n, snprintf(b + n, sizeof b - (size_t)n, "%s%s=0x%llx", (i % 4) ? " " : "[nullpage]   ",
+                          regs[i].nm, (unsigned long long)regs[i].v), sizeof b);
             if (i % 4 == 3) {
-                // Same shape as the [il2cpp-probe] line above: `n` is a running snprintf total, so
-                // a truncating chain leaves it past the end of `b`. Clamp before the newline store
-                // so the store and the write are both provably in range (#2050).
+                // Same shape as the [il2cpp-probe] line above: the append saturates `n` at
+                // sizeof b (#2161), and the newline store needs one byte more room than that,
+                // so `cut` is exactly the saturated case and the clamp lands it in range (#2050).
                 const bool cut = n < 0 || (size_t)n >= sizeof b;
                 n = (int)raw_fmt_len(n, sizeof b);
                 b[n++] = '\n';
@@ -959,17 +965,17 @@ namespace {
             uint64_t base = (v & ~0xfull) - (i == 6 /*rbp*/ ? 0x80 : 0x20);
             if (!probe_readable(base)) base = v & ~0xfull;
             int nw = (i == 6) ? 20 : 12;
-            n = snprintf(b, sizeof b, "[nullpage]   %s=0x%llx mem@0x%llx:", regs[i].nm,
-                         (unsigned long long)v, (unsigned long long)base);
+            n = raw_fmt_advance(0, snprintf(b, sizeof b, "[nullpage]   %s=0x%llx mem@0x%llx:", regs[i].nm,
+                         (unsigned long long)v, (unsigned long long)base), sizeof b);
             for (int w = 0; w < nw; w++) {
                 uint64_t addr = base + (uint64_t)w * 8;
                 if (probe_readable(addr))
-                    n += snprintf(b + n, sizeof b - (size_t)n, " %016llx",
-                                  (unsigned long long)*(const uint64_t*)addr);
+                    n = raw_fmt_advance(n, snprintf(b + n, sizeof b - (size_t)n, " %016llx",
+                                  (unsigned long long)*(const uint64_t*)addr), sizeof b);
                 else
-                    n += snprintf(b + n, sizeof b - (size_t)n, " ????????????????");
+                    n = raw_fmt_advance(n, snprintf(b + n, sizeof b - (size_t)n, " ????????????????"), sizeof b);
             }
-            n += snprintf(b + n, sizeof b - (size_t)n, "\n");
+            n = raw_fmt_advance(n, snprintf(b + n, sizeof b - (size_t)n, "\n"), sizeof b);
             raw_write_fmt(2, b, sizeof b, n);
             // Corrupted-header hunt: the canary walk faulted following a NextFreeBlock == 0x1, so
             // the stomped FFreeBlock header is a qword equal to 0x1 somewhere in the current slab
@@ -1283,8 +1289,8 @@ namespace {
         if (sig == SIGILL) {
             uint64_t rip = (uint64_t)PROSPER_GREGS((ucontext_t*)uctx)[REG_RIP];
             const uint8_t* p = (const uint8_t*)rip;
-            char b[96]; int n = snprintf(b, sizeof b, "[sigill] rip=0x%llx bytes:", (unsigned long long)rip);
-            for (int k = 0; k < 16 && n < (int)sizeof b - 4; k++) n += snprintf(b + n, sizeof b - n, " %02x", p[k]);
+            char b[96]; int n = raw_fmt_advance(0, snprintf(b, sizeof b, "[sigill] rip=0x%llx bytes:", (unsigned long long)rip), sizeof b);
+            for (int k = 0; k < 16 && n < (int)sizeof b - 4; k++) n = raw_fmt_advance(n, snprintf(b + n, sizeof b - n, " %02x", p[k]), sizeof b);
             if (n < (int)sizeof b - 1) b[n++] = '\n';
             ssize_t w = raw_write_fmt(2, b, sizeof b, n); (void)w;
         }
@@ -1356,18 +1362,24 @@ namespace {
                     raw_write_fmt(2, rb, sizeof rb, rn);
                     // Guest call stack: scan [rsp, rsp+0x200) for eboot-range return addresses.
                     uint64_t rsp = (uint64_t)gr2[REG_RSP];
-                    char sb[320]; int sn = snprintf(sb, sizeof sb, "[mb3watch]   guest-stack:");
+                    // The one chain in this file with NO cursor guard at all AND a variable-length
+                    // %s in its append (`gmod` returns module names up to 25 characters), so ten
+                    // captured frames can format to ~470 characters into 320 bytes. Before #2161
+                    // the append after the first truncating one computed `sizeof sb - sn` with
+                    // sn > 320 and wrote at `sb + sn` with a ~2^64 size: a real out-of-bounds
+                    // write, off the end of the signal stack, on realistic guest stacks.
+                    char sb[320]; int sn = raw_fmt_advance(0, snprintf(sb, sizeof sb, "[mb3watch]   guest-stack:"), sizeof sb);
                     int found = 0;
                     for (uint64_t p = rsp; p < rsp + 0x200 && found < 10; p += 8) {
                         if (!probe_readable(p)) break;
                         uint64_t ra = *(const uint64_t*)p;
                         if (gin(ra)) {
-                            sn += snprintf(sb + sn, sizeof sb - sn, " %s+0x%llx",
-                                           gmod(ra), (unsigned long long)goff(ra));
+                            sn = raw_fmt_advance(sn, snprintf(sb + sn, sizeof sb - sn, " %s+0x%llx",
+                                           gmod(ra), (unsigned long long)goff(ra)), sizeof sb);
                             found++;
                         }
                     }
-                    sn += snprintf(sb + sn, sizeof sb - sn, "\n");
+                    sn = raw_fmt_advance(sn, snprintf(sb + sn, sizeof sb - sn, "\n"), sizeof sb);
                     raw_write_fmt(2, sb, sizeof sb, sn);
                 }
                 return;
@@ -1527,12 +1539,12 @@ namespace {
                 if (g_hwbp_fields) {
                     uint64_t o = (uint64_t)gr[REG_RBX];
                     if (probe_readable(o + 0x60)) {
-                        char b[400]; int n = snprintf(b, sizeof b, "[hwbp-fields] rbx=0x%llx:", (unsigned long long)o);
+                        char b[400]; int n = raw_fmt_advance(0, snprintf(b, sizeof b, "[hwbp-fields] rbx=0x%llx:", (unsigned long long)o), sizeof b);
                         for (uint64_t off = 0x10; off <= 0x60; off += 8) {
                             uint64_t v = *(const uint64_t*)(o + off);
-                            n += snprintf(b+n, sizeof b-n, " +0x%llx=0x%llx", (unsigned long long)off, (unsigned long long)v);
+                            n = raw_fmt_advance(n, snprintf(b+n, sizeof b-n, " +0x%llx=0x%llx", (unsigned long long)off, (unsigned long long)v), sizeof b);
                         }
-                        n += snprintf(b+n, sizeof b-n, "\n"); raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
+                        n = raw_fmt_advance(n, snprintf(b+n, sizeof b-n, "\n"), sizeof b); raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                         // Resolve the class name of each object-typed field (its [obj]->klass->[+0x10]=name).
                         for (uint64_t off = 0x10; off <= 0x88; off += 8) {
                             if (!probe_readable(o + off + 7)) continue;
@@ -1782,14 +1794,14 @@ namespace {
                     uint64_t r10 = (uint64_t)gr[REG_R10], rdx = (uint64_t)gr[REG_RDX];
                     uint64_t r8 = (uint64_t)gr[REG_R8];
                     char b[512];
-                    int n = snprintf(b, sizeof b,
+                    int n = raw_fmt_advance(0, snprintf(b, sizeof b,
                         "[bp] #%d rsi=0x%llx r10=0x%llx rdx=0x%llx rcx=0x%llx r8=0x%llx rax=0x%llx rdi=0x%llx r14=0x%llx r15=0x%llx [rdi]=0x%llx [rdi+0x1e4c]=0x%llx tid=%ld",
                         (int)g_bp_count, (unsigned long long)rsi, (unsigned long long)r10,
                         (unsigned long long)rdx, (unsigned long long)rcx, (unsigned long long)r8,
                         (unsigned long long)rax, (unsigned long long)rdi, (unsigned long long)r14,
                         (unsigned long long)r15, rd(rdi),
                         (unsigned long long)(probe_readable(rdi + 0x1e4c) ? *(const uint32_t*)(rdi + 0x1e4c) : 0xBADBAD),
-                        cur_tid());
+                        cur_tid()), sizeof b);
                     // Caller stack: first guest-text return addresses (who called free with this ptr).
                     uint64_t rsp = (uint64_t)gr[REG_RSP];
                     int found = 0;
@@ -1797,8 +1809,8 @@ namespace {
                         if (!probe_readable(rsp + o)) break;
                         uint64_t v = *(const uint64_t*)(rsp + o);
                         if (gin(v)) {
-                            n += snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
-                                          (unsigned long long)goff(v));
+                            n = raw_fmt_advance(n, snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
+                                          (unsigned long long)goff(v)), sizeof b);
                             found++;
                         }
                     }
@@ -1849,15 +1861,15 @@ namespace {
                     g_lwatch_hits = g_lwatch_hits + 1;
                     char b[512];
                     bool guest = gin(g_lwatch_step_rip);
-                    int n = snprintf(b, sizeof b,
+                    int n = raw_fmt_advance(0, snprintf(b, sizeof b,
                         "[lwatch] SHIFT-STOMP fa=0x%llx val=0x%llx (<<8=0x%llx) rip=%s0x%llx tid=%ld",
                         (unsigned long long)g_lwatch_fa, (unsigned long long)v,
                         (unsigned long long)(v << 8), guest ? "eboot+" : "host:",
                         (unsigned long long)(guest ? goff(g_lwatch_step_rip) : g_lwatch_step_rip),
-                        cur_tid());
+                        cur_tid()), sizeof b);
                     for (int i = 0; i < g_lwatch_stkn && n < (int)sizeof b - 24; i++)
-                        n += snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
-                                      (unsigned long long)goff(g_lwatch_stk[i]));
+                        n = raw_fmt_advance(n, snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
+                                      (unsigned long long)goff(g_lwatch_stk[i])), sizeof b);
                     if (n < (int)sizeof b - 1) b[n++] = '\n';
                     raw_write_fmt(2, b, sizeof b, n);
                     if (g_lwatch_hits >= g_lwatch_max) {   // caught enough — disarm, leave page RW
@@ -1913,13 +1925,13 @@ namespace {
                     g_lwatch_hits = g_lwatch_hits + 1;
                     char b[512];
                     bool guest = gin(rip);
-                    int n = snprintf(b, sizeof b,
+                    int n = raw_fmt_advance(0, snprintf(b, sizeof b,
                         "[lwatch] #%d write fa=0x%llx rip=%s0x%llx tid=%ld pre[0]=0x%llx pre[8]=0x%llx",
                         (int)g_lwatch_hits, (unsigned long long)fa,
                         guest ? "eboot+" : "host:",
                         (unsigned long long)(guest ? goff(rip) : rip), cur_tid(),
                         (unsigned long long)*(const uint64_t*)g_lwatch_slot,
-                        (unsigned long long)*(const uint64_t*)(g_lwatch_slot + 8));
+                        (unsigned long long)*(const uint64_t*)(g_lwatch_slot + 8)), sizeof b);
                     // #312: call-stack capture — scan the writer's stack for eboot-text return
                     // addresses (up to 8), so the guest free/alloc path above the raw write is
                     // identifiable (async-signal-safe: bounded reads of the faulting thread's
@@ -1930,8 +1942,8 @@ namespace {
                         if (!probe_readable(rsp + o)) break;
                         uint64_t v = *(const uint64_t*)(rsp + o);
                         if (gin(v)) {
-                            n += snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
-                                          (unsigned long long)goff(v));
+                            n = raw_fmt_advance(n, snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
+                                          (unsigned long long)goff(v)), sizeof b);
                             found++;
                         }
                     }
@@ -2425,12 +2437,12 @@ namespace {
                     struct iovec riov; riov.iov_base = (void*)(uintptr_t)o.addr; riov.iov_len = sizeof buf;
                     ssize_t got = syscall(SYS_process_vm_readv, getpid(), &liov, 1UL, &riov, 1UL, 0UL);
                     char ob[700];
-                    int on = snprintf(ob, sizeof ob, "[faultobj] %s=0x%llx got=%zd:",
-                                      o.nm, (unsigned long long)o.addr, (ssize_t)got);
+                    int on = raw_fmt_advance(0, snprintf(ob, sizeof ob, "[faultobj] %s=0x%llx got=%zd:",
+                                      o.nm, (unsigned long long)o.addr, (ssize_t)got), sizeof ob);
                     for (int w = 0; got > 0 && w < (int)((size_t)got / 8) && on < (int)sizeof ob - 24; w++)
-                        on += snprintf(ob + on, sizeof ob - (size_t)on, " +%02x=%016llx",
-                                       w * 8, (unsigned long long)buf[w]);
-                    on += snprintf(ob + on, sizeof ob - (size_t)on, "\n");
+                        on = raw_fmt_advance(on, snprintf(ob + on, sizeof ob - (size_t)on, " +%02x=%016llx",
+                                       w * 8, (unsigned long long)buf[w]), sizeof ob);
+                    on = raw_fmt_advance(on, snprintf(ob + on, sizeof ob - (size_t)on, "\n"), sizeof ob);
                     raw_write_fmt(2, ob, sizeof ob, on);
                 }
                 // Corruption-source probe: dump rcx/rdx and scan the GPU-write ring around every
@@ -2573,12 +2585,12 @@ namespace {
                             ssize_t got = syscall(SYS_process_vm_readv, getpid(), &lb, 1UL, &rb, 1UL, 0UL);
                             if (got <= 0) return;
                             char bb[640];
-                            int bn = snprintf(bb, sizeof bb, "[faultobj] bytes (%s) @0x%llx:", nm,
-                                              (unsigned long long)(center - 0x20));
+                            int bn = raw_fmt_advance(0, snprintf(bb, sizeof bb, "[faultobj] bytes (%s) @0x%llx:", nm,
+                                              (unsigned long long)(center - 0x20)), sizeof bb);
                             for (ssize_t k = 0; k < got && bn < (int)sizeof bb - 4; k++)
-                                bn += snprintf(bb + bn, sizeof bb - (size_t)bn, "%s%02x",
-                                               (k % 8 == 0) ? " " : "", bytes[k]);
-                            bn += snprintf(bb + bn, sizeof bb - (size_t)bn, "\n");
+                                bn = raw_fmt_advance(bn, snprintf(bb + bn, sizeof bb - (size_t)bn, "%s%02x",
+                                               (k % 8 == 0) ? " " : "", bytes[k]), sizeof bb);
+                            bn = raw_fmt_advance(bn, snprintf(bb + bn, sizeof bb - (size_t)bn, "\n"), sizeof bb);
                             raw_write_fmt(2, bb, sizeof bb, bn);
                         };
                         byte_dump("rdx", fc.rdx);
