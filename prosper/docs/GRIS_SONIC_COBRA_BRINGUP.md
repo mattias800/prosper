@@ -157,7 +157,7 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | The 22 draws per flip are what survives prosper dropping the rest of a larger frame at *translation* | **Falsified.** `state.draws` is filled by the PM4 decoder (`src/gpu/command_processor.cpp`) and printed by `progress_heartbeat` (`src/hle/hle_agc.cpp`), so the counter is pre-translation by construction; a `PROSPER_NO_COMPUTE=1` arm — where nothing is translated and therefore nothing can be rejected — reports the identical per-flip figures (66,988 draws and 42,734 dispatches over 3,044 flips at t=50 s: 22.01 and 14.04), which is the consistency check on that reading rather than its proof. **Scope it exactly:** this closes *translation* loss, not *decode* loss. A draw inside a PM4 packet prosper never decodes is invisible to this counter too, and the `walk=` field that would bound it is on the `[agc] <who> #N` form, not the `[agc] SubmitDcb #N: %u dwords -> %zu packets applied` form this title takes (266 of 266 lines in a 10 s `PROSPER_GFXLOG` arm). That bound is still open. | #1905, this doc |
 | The `ui/ui_startup` insert at runtime index 3 is *conditional*, so the condition is a value prosper supplies (the "registered-but-mismodelled call" candidate, in the one place it would be visible) | **Falsified.** The insert is `eboot+0x5875b0`'s only unconditional action once that coroutine step is entered on resume index `-3`: the name is materialised from two `movabs` immediates at `eboot+0x587626`/`+0x587630` and handed to the add-resource call at `eboot+0x5876ba`, with no test of any kind between the step's entry and it. Measured — one hit per boot at both the build site and the add call, armed at `prosper::run_entry` so nothing in the chain can run unobserved. The only conditional part of that branch is the *region rating texture* that follows it. This closes the mismodelled-value reading for this insert and strengthens the dump-gap reading. | #1905, this doc, this PR |
 | The eboot's zero references to `ui/ui_startup` mean the request is not name-driven, or the cross-reference index is dead at that address | **Resolved, and it was an instrument gap, not a property of the title.** The literal at `eboot+0xdd593b` is genuinely unreferenced — 0 RIP-relative references by a byte-exhaustive disp32 scan over the whole executable segment (not merely over decoded instructions), 0 self-relative int32 offsets, 0 raw `u32` occurrences of the address anywhere in the image, 0 relocations. It is a **dead literal**: clang built the 13-byte string into the small-buffer from immediates instead, so the string has no address to reference. `xref.py` gained an `imm` mode for exactly this question and reports the one construction site; `bmpfont/segafont` (1 code ref, 0 constructions) and `ui/ui_modefade` (0 code refs, 1 relocation, 0 constructions) are its controls. Any `xref.py to <string VA>` zero for a string of 22 bytes or fewer is void until `imm` has been run. | #1905, this doc, this PR |
-| The boot resource load never completes because `ui/ui_startup.pac` is absent, so the frontend waits forever for a phase that can never finish | **Falsified at the completion site.** `eboot+0x55b400` is the manager's per-phase completion poll: for each in-flight phase it tests that phase's batch counter (`[mgr+0x58]`/`[mgr+0x60]` → `+0xa0`), and when it is zero it clears the in-flight bit and notifies every listener in `[mgr+0xf8]`. Both phase 0 (which contains the missing package) and phase 1 reach it: the mask goes `0 → 1` at `eboot+0x55aecf`, is cleared at `eboot+0x55b428`, then `0 → 1 → cleared`, then `0 → 2 → cleared` at `eboot+0x55b480`, on the same manager object, and its entry vectors are still intact at t≈2400 ticks. The read path is positive-controlled: the same byte is read immediately before and after the single `or` that sets it, 3/3 arms `before|bit == after`. So the absent package does not stall the loader, and it does not withhold the completion callback. | #1905, this doc, this PR |
+| The boot resource load never completes because `ui/ui_startup.pac` is absent, so the frontend waits forever for a phase that can never finish | **Falsified at the completion site.** `eboot+0x55b400` is the manager's per-phase completion poll: for each in-flight phase it tests that phase's batch counter (`[mgr+0x58]`/`[mgr+0x60]` → `+0xa0`), and when it is zero it clears the in-flight bit and notifies every listener in `[mgr+0xf8]`. Both requested phases reach it: the mask goes `0 → 1` at `eboot+0x55aecf`, is cleared at `eboot+0x55b428`, then `0 → 1 → cleared`, then `0 → 2 → cleared` at `eboot+0x55b480`, on the same manager object, and its entry vectors are still intact at t≈2400 ticks. The read path is positive-controlled: the same byte is read immediately before and after the single `or` that sets it, 3/3 arms `before|bit == after`. Which phase the runtime `ui/ui_startup` insert lands in is **not** established here — phase 0's vector holds its two static entries and nothing else at every sample, so the package is tracked by another owner. The row's claim is the narrower measured one: every phase this boot requests completes and notifies, so a handled ENOENT does not leave the loader waiting. | #1905, this doc, this PR |
 
 ## Sonic Origins dump audit
 
@@ -878,7 +878,7 @@ test [mgr+0x11c], al` — so `mgr+0x11c` is a four-bit per-phase state. Statical
 sites: one passes 0, two pass 1, seven pass 2, four pass 3, and `eboot+0x5b84b0` is a helper that walks
 a caller-supplied bitmask at `[obj+0x30]` and issues 0/1/2/3 in order.
 
-**Measured, whole boot: only phases 0 and 1 are ever requested.** Breaking on `eboot+0x55ac00` for a
+**Measured over a 2000-tick CPU-only arm (`PROSPER_NO_COMPUTE=1`, no input route): only phases 0 and 1 are ever requested.** Breaking on `eboot+0x55ac00` for a
 2000-tick CPU-only `boot_trace` yields exactly three calls — `phase=0` from `eboot+0x5b85bc`, `phase=0`
 from `eboot+0x587514`, `phase=1` from `eboot+0x58a7ba` — and none of the seven phase-2 sites is reached,
 nor is any of their containing functions entered. That is the mechanical form of the `ui/ui_modefade`
@@ -900,11 +900,17 @@ absent package.** After `ui_startup` the same branch adds a region rating textur
 config at `eboot+0x350bf80`: `+0x12` is the two-character region code (`"EU"` here, from #2003), a
 `"CH"` value adds `ui/rpl_texture/ui_titile_healthy`, `+0x20 & 1` adds `ui_title_nocopy`, and `+0x1c` is
 a rating-organisation id switched 1→`ui_title_cero`, 2→`ui_title_esrb_e10`, 3→`ui_title_esrb_rp`,
-4→`ui_title_pegi`. **`+0x1c` is 0 at runtime, and nothing in the eboot ever writes it** — the field is
-absent from the init function at `eboot+0x5113f0` and from all 14 sites that load the config pointer, of
-which every one is a `48 8b` load. So the jump table is skipped and *no* rating texture is requested:
-measured, the switch site `eboot+0x587913` is never reached. Sonic's startup scene asks for exactly one
-asset, `ui/ui_startup.pac`, and this dump does not contain it.
+4→`ui_title_pegi`. **`+0x1c` reads 0 at runtime**, so the jump table is skipped and *no* rating texture
+is requested: measured, the switch site `eboot+0x587913` is never reached. Sonic's startup scene asks
+for exactly one asset, `ui/ui_startup.pac`, and this dump does not contain it.
+
+No writer of `+0x1c` was found — it is absent from the init function at `eboot+0x5113f0`, which writes
+`+0x12`, `+0x18` and `+0x20` only. **That is not an exhaustive negative and must not be read as one.**
+A store to `[cfg+0x1c]` is register-relative and no RIP-relative scan can see it, so the 14 sites that
+load the config pointer bound nothing by being loads — a writer would necessarily reach the field
+*through* one of them, and could equally arrive via an argument, a member, a deserialisation, or
+another module. A rating-organisation id sitting at zero is exactly the shape of a value a platform
+query might be expected to fill, so **whether prosper should be supplying it is open**, not closed.
 
 Checked and cleared while there, so it is not re-derived: `[cfg+0x10]` is 0, which is **correct**. It is
 not a language *string* but a one-byte internal id, looked up from the 23-entry table at
@@ -915,8 +921,10 @@ not a language *string* but a one-byte internal id, looked up from the 23-entry 
 in-flight phase it reads that phase's batch object (`[mgr+0x58]`, `[mgr+0x60]`) and, when `[obj+0xa0]`
 is zero, clears the bit and calls every listener in `[mgr+0xf8]`. Both phase 0 and phase 1 get there —
 the mask is set at `eboot+0x55aecf` and cleared at `eboot+0x55b428` / `+0x55b480` on the same manager,
-whose phase vectors are still intact at the last sample. The missing package therefore does not park the
-loader and does not withhold the completion notification, which removes the one mechanism by which a
+whose phase vectors are still intact at the last sample. Note the phase-0 vector holds only its two
+static entries at every sample, so which owner tracks the runtime `ui/ui_startup` insert is not
+settled here. The missing package therefore does not park the loader and does not withhold the
+completion notification of any phase this boot requests, which removes the one mechanism by which a
 handled ENOENT could have stalled the state machine. What remains open is upstream of the loader
 entirely: nothing ever *asks* for phase 2.
 

@@ -115,6 +115,20 @@ def imm():
     for ch in scattered:
         decoy += bytes((ch, 0))
     code[0x80:0x80 + len(decoy)] = decoy
+
+    # 8 + 4 + 1 — the other shape a 13-byte string arrives in, and the only arm that reaches the
+    # tail-completion branch.
+    tailed = b"rfl/param_hud"
+    code[0x30:0x38] = tailed[0:8]
+    code[0x3a:0x3e] = tailed[8:12]
+    code[0x40:0x41] = tailed[12:13]
+
+    # Two separate constructions of one string, 0xa0 apart, so they must not chain into one cluster.
+    repeated = b"text/text_menu"
+    code[0x50:0x58] = repeated[0:8]
+    code[0x58:0x60] = repeated[6:14]
+    code[0xf0:0xf8] = repeated[0:8]
+    code[0xf8:0x100] = repeated[6:14]
     raw[0x100:0x200] = code
 
     referenced = b"bmpfont/segafont"
@@ -134,15 +148,39 @@ def imm():
         assert (first, last) == (0x1012, 0x101c), hits
         assert [(lo, hi) for _, lo, hi in parts] == [(0, 8), (5, 13)], parts
 
-        # The literal copy of the same string carries no reference at all — the trap `imm` exists
-        # for. Assert it, so a future change that starts reporting one is caught here.
+        # The fixture emits no reference to the literal copy, which is the situation `imm` exists
+        # for; this only records that the fixture models it, and is not a test of the tool.
         assert module.code_xref.get(0x2000, []) == [], module.code_xref.get(0x2000)
         assert module.data_xref.get(0x2000, []) == [], module.data_xref.get(0x2000)
 
-        # A string that only exists as a literal must not be reported as immediate-built.
+        # A string that only exists as a literal must not be reported as immediate-built. This is a
+        # real negative: it fails if the search ever reaches non-executable segments.
         assert XREF.find_immediate_builds(module, referenced) == []
-        # ...nor may the byte-scattered decoy satisfy the cover.
+        # ...nor may the byte-scattered decoy satisfy the cover. This is the arm with the lever:
+        # relaxing the >= 4-byte window floor makes it fail.
         assert XREF.find_immediate_builds(module, scattered) == []
+
+        # The <= 3-byte tail path: 8-byte store, 4-byte store, then a single trailing byte. Nothing
+        # else in this function reaches that branch, because a decoy with no contiguous 4-byte run
+        # leaves `strong` empty and returns early.
+        tail_hits = XREF.find_immediate_builds(module, tailed)
+        assert len(tail_hits) == 1, tail_hits
+        sizes = sorted(hi - lo for _, lo, hi in tail_hits[0][2])
+        assert sizes == [1, 4, 8], tail_hits
+
+        # Two constructions of one string, further apart than the cluster span, must stay two.
+        twice = XREF.find_immediate_builds(module, repeated)
+        assert len(twice) == 2, twice
+        assert twice[1][0] - twice[0][0] > 0x60, twice
+
+        # Under 4 bytes the window floor cannot exist, so the query is refused rather than answered
+        # with every plain occurrence of those bytes in the instruction stream.
+        try:
+            XREF.find_immediate_builds(module, b"cfg")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a 3-byte needle must be refused, not answered")
     finally:
         if path:
             os.unlink(path)

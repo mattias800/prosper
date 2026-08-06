@@ -162,12 +162,29 @@ def find_immediate_builds(m, needle, span=0x60):
     Only the >= 4-byte windows form clusters, and a cluster is reported only when they cover the
     whole string apart from such a tail. That bound is what makes the answer trustworthy: 1-byte
     windows match constantly in a dense instruction stream, so admitting them into the cover lets
-    any 96-byte stretch of code "build" any string. Requiring the 4- and 8-byte windows to do the
-    work leaves the tail as the only concession, which is the shape the compiler actually emits.
+    a stretch of code "build" any string. Requiring the 4- and 8-byte windows to do the work leaves
+    the tail as the only concession, which is the shape the compiler actually emits.
+
+    A needle shorter than 4 bytes is REFUSED (ValueError) rather than answered, because the floor
+    that makes the answer meaningful cannot exist below the needle's own length: every plain
+    occurrence of those bytes anywhere in the instruction stream would be reported as a
+    construction, in the same confident format as a real one.
+
+    Two precision limits the caller should read off the output rather than assume away:
+      * a cluster is single-linkage over CONSECUTIVE matches no more than `span` bytes apart, so it
+        can grow longer than `span` overall — the printed first..last range is what bounds it;
+      * a tail-completed hit's small window is accepted anywhere inside the cluster's span, with no
+        positional or origin relation to the strong stores, so its precision rests entirely on
+        those. The reported [lo:hi] sizes are how a reader tells the two cases apart.
     """
     n = len(needle)
     if n == 0:
         return []
+    if n < 4:
+        raise ValueError(
+            "needle %r is %d byte(s); `imm` needs at least 4. Below that the >=4-byte window floor "
+            "that makes a match meaningful cannot apply, and every plain occurrence of these bytes "
+            "in the instruction stream would be reported as a construction." % (needle, n))
 
     def scan(sizes):
         windows = [(lo, lo + s) for s in sizes if s <= n for lo in range(0, n - s + 1)]
@@ -187,7 +204,7 @@ def find_immediate_builds(m, needle, span=0x60):
                     start = i + 1
         return sorted(found)
 
-    strong = scan((8, 4) if n >= 4 else (n,))
+    strong = scan((8, 4))
     if not strong:
         return []
     weak = None                                 # scanned lazily; only a <= 3-byte tail may use it
@@ -244,7 +261,11 @@ def main():
     if mode == 'imm':
         text = sys.argv[3]
         needle = text.encode('utf-8')
-        builds = find_immediate_builds(m, needle)
+        try:
+            builds = find_immediate_builds(m, needle)
+        except ValueError as exc:
+            print(f"refused: {exc}")
+            return 1
         print(f"inline-immediate constructions of {text!r} ({len(needle)} bytes): {len(builds)}")
         for first, last, parts in builds:
             where = ", ".join(f"0x{va:x}[{lo}:{hi}]" for va, lo, hi in parts)
