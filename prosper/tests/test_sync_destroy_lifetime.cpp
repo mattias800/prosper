@@ -20,7 +20,9 @@
 //
 // THE COUNTER-ARM IS PART OF THE SUITE. `PROSPER_SYNC_RETIRE_SECONDS=0` restores the pre-#2042
 // immediate free on this same binary, and CMake registers that as `sync_destroy_lifetime_counter_arm`
-// with WILL_FAIL, so CI keeps proving that these assertions CAN fail. Measured: 10 do — all seven
+// with WILL_FAIL (**Linux only** — the red depends on glibc's tcache reusing a just-freed block
+// immediately, which is the mechanism being demonstrated and not measured on other allocators; see
+// the CMake comment), so CI keeps proving that these assertions CAN fail. Measured: 10 do — all seven
 // spellings in arm 1 and three in arm 2, including `[rwlock] UNMATCHED unlock … holds=0` as the
 // freed object's accounting is reused by the next Init and the parked reader is never woken. The
 // retirement census below still passes under the counter-arm, and should: the objects really are

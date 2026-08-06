@@ -45,13 +45,19 @@ namespace {
     }
     // How long a destroyed object stays unreachable-but-alive. 0 restores the pre-#2042 immediate
     // free (the counter-arm). Negative and unparseable values fall back to the default rather than
-    // silently disabling the guard.
+    // silently disabling the guard — and that has to be enforced by `strtod` + an endptr check, not
+    // by `atof`, which returns 0.0 on no conversion. Under `atof`, `PROSPER_SYNC_RETIRE_SECONDS=on`
+    // or any typo would pass `>= 0.0` and switch the guard OFF, which is the exact use-after-free
+    // this file exists to prevent — with the comment above promising the opposite, so a reader
+    // checking "does this switch fail safe?" would find the reassurance and stop looking.
     double retire_window_seconds() {
         static const double seconds = [] {
             const char* e = getenv("PROSPER_SYNC_RETIRE_SECONDS");
             if (!e || !*e) return 30.0;
-            const double v = atof(e);
-            return v >= 0.0 ? v : 30.0;
+            char* end = nullptr;
+            const double v = strtod(e, &end);
+            if (end == e || *end != '\0' || !(v >= 0.0)) return 30.0;   // !(v>=0) also rejects NaN
+            return v;
         }();
         return seconds;
     }
