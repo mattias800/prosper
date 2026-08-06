@@ -257,6 +257,14 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   `re/README.md`.
 - **`re/xref.py`** — find relative data pointers, direct references, runtime function-table
   writers, and indirect callers in a flattened guest module. See `re/README.md`.
+- **`re/disasm_words.py`** — name an RDNA2 instruction from the raw dwords a diagnostic printed.
+  `[recompile-reject]` prints `words=AABBCCDD,EEFFGGHH`; this pipes those bytes through
+  `llvm-mc -arch=amdgcn -mcpu=gfx1030 -disassemble` and prints the mnemonic, deduplicated. Takes
+  word pairs as arguments or reads a log on stdin (`grep recompile-reject run.log | disasm_words.py`).
+  Use it instead of reading an opcode table: neighbouring opcodes in this ISA are unrelated
+  operations — `0x305` is `v_mul_lo_u16`, not the shift its neighbour `0x307` is, and an early draft
+  of #2067 shipped that guess through `spirv-val` before a bit-exact test caught it. Requires
+  `llvm-mc` with the AMDGPU target on PATH.
 - **`shader_histo/`** — histogram RDNA2 opcodes across a title's shaders.
 - **`shader_inspect/`** — decode one raw `PROSPER_SHADER_DUMP` binary offline. It prints bounded
   instruction PCs, operands, raw words, signed branch immediates, and resolved branch targets so a

@@ -2831,6 +2831,402 @@ int main() {
     CHECK(recompile_valu(code32o18, std::size(code32o18), 0, 0).empty(),
           "kernel 32o18 REJECTS an SDWA 16-bit convert instead of dropping its source modifier");
 
+    // ---- #2013: the VALU gaps left after the 16-bit family (PR for the SDWA / VOP3P tier) ----
+    //
+    // Every encoding below is the exact word pair `llvm-mc -mcpu=gfx1030` assembles for the
+    // mnemonic in its comment, and the four marked LIVE are bytes read out of Sonic Racing:
+    // CrossWorlds' own compute programs.
+
+    // Kernel 32r1 (LIVE, exec_cs_290000eb00 pc=3): an integer VOP2 SDWA with a sub-dword
+    // DESTINATION. `v_and_b32_sdwa v2, 6, v0 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
+    // src1_sel:WORD_0` must write only bits [15:0] and keep [31:16]. Before this change the decoder
+    // admitted only dst_sel:DWORD, so the whole program rejected; a lowering that accepts the
+    // encoding and then writes the full dword produces 0x00000004 and fails here.
+    const uint32_t code32r1[] = {
+        0x7e0002ffu, 0xdead1234u,            // v0 = 0xdead1234
+        0x7e0402ffu, 0xaabbccddu,            // v2 = old packed destination
+        0x360400f9u, 0x04861486u,            // v_and_b32_sdwa v2, 6, v0 WORD_0/PRESERVE, src1 WORD_0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r1 = recompile_valu(code32r1, std::size(code32r1), 0, 2);
+    CHECK(!spv32r1.empty(), "recompiled kernel 32r1 (live v_and_b32_sdwa WORD destination) -> SPIR-V");
+    std::vector<float> got32r1 = prosper::test::run_compute(spv32r1, std::vector<float>(1), 1, 1);
+    CHECK(got32r1.size()==1 && bits_of(got32r1[0])==0xaabb0004u,
+          "kernel 32r1 writes the selected destination word and preserves the other half");
+
+    // Kernel 32r2: the same family with a BYTE destination and UNUSED_PAD, which must ZERO the rest
+    // of the register rather than preserve it — the opposite arm of 32r1. Source select is BYTE_2.
+    //   v1 = 0xf0, v0 BYTE_2 = 0x34 -> 0x30 into BYTE_1, everything else zeroed.
+    const uint32_t code32r2[] = {
+        0x7e0002ffu, 0x12345678u,            // v0
+        0x7e0202ffu, 0x000000f0u,            // v1
+        0x7e0602ffu, 0x99999999u,            // v3 = old destination (PAD must discard it)
+        0x360600f9u, 0x02060101u,            // v_and_b32_sdwa v3, v1, v0 BYTE_1/PAD, src1 BYTE_2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r2 = recompile_valu(code32r2, std::size(code32r2), 0, 3);
+    CHECK(!spv32r2.empty(), "recompiled kernel 32r2 (v_and_b32_sdwa BYTE destination, UNUSED_PAD) -> SPIR-V");
+    std::vector<float> got32r2 = prosper::test::run_compute(spv32r2, std::vector<float>(1), 1, 1);
+    CHECK(got32r2.size()==1 && bits_of(got32r2[0])==0x00003000u,
+          "kernel 32r2 zero-fills the bytes DST_UNUSED marks unused");
+
+    // Kernel 32r3: WORD_1 destination with UNUSED_PRESERVE and a BYTE_3 source select, so a
+    // lowering that confused the destination offset with the source offset fails.
+    const uint32_t code32r3[] = {
+        0x7e0002ffu, 0x12345678u,            // v0
+        0x7e0202ffu, 0x0000ffffu,            // v1
+        0x7e0602ffu, 0x99999999u,            // v3 = old destination
+        0x360600f9u, 0x03061501u,            // v_and_b32_sdwa v3, v1, v0 WORD_1/PRESERVE, src1 BYTE_3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r3 = recompile_valu(code32r3, std::size(code32r3), 0, 3);
+    CHECK(!spv32r3.empty(), "recompiled kernel 32r3 (v_and_b32_sdwa WORD_1 destination) -> SPIR-V");
+    std::vector<float> got32r3 = prosper::test::run_compute(spv32r3, std::vector<float>(1), 1, 1);
+    CHECK(got32r3.size()==1 && bits_of(got32r3[0])==0x00129999u,
+          "kernel 32r3 places the result in the selected destination word");
+
+    // Kernel 32r4 (LIVE, exec_cs_2a80007800 pc=73 and exec_cs_290000eb00 pc=25): the WORD source
+    // select of `v_mov_b32_sdwa`, dst DWORD + UNUSED_PAD — a zero-extending 16-bit extract. Master
+    // admitted only BYTE_0..3 here, so `src0_sel:WORD_0` rejected the whole program.
+    //   v1 = zext(v0.hi) = 0xdead, v2 = zext(v0.lo) = 0x1234, v3 = v1 + v2.
+    const uint32_t code32r4[] = {
+        0x7e0002ffu, 0xdead1234u,            // v0
+        0x7e0202ffu, 0x11111111u,            // v1 = old (UNUSED_PAD must discard it)
+        0x7e0402ffu, 0x22222222u,            // v2 = old
+        0x7e0202f9u, 0x00050600u,            // v_mov_b32_sdwa v1, v0 DWORD/PAD src0_sel:WORD_1
+        0x7e0402f9u, 0x00040600u,            // v_mov_b32_sdwa v2, v0 DWORD/PAD src0_sel:WORD_0
+        0x4a060501u,                          // v_add_nc_u32 v3, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r4 = recompile_valu(code32r4, std::size(code32r4), 0, 3);
+    CHECK(!spv32r4.empty(), "recompiled kernel 32r4 (live v_mov_b32_sdwa WORD source select) -> SPIR-V");
+    std::vector<float> got32r4 = prosper::test::run_compute(spv32r4, std::vector<float>(1), 1, 1);
+    CHECK(got32r4.size()==1 && bits_of(got32r4[0])==0x0000f0e1u,
+          "kernel 32r4 zero-extends each selected source word");
+
+    // Kernel 32r5 (LIVE encoding shape): the plainest `v_pk_add_u16`. Its DEFAULT op_sel_hi:[1,1]
+    // sets dword1[28:27], which the old blanket "any VOP3P modifier bit rejects" rule read as a
+    // modifier — so the whole packed 16-bit integer family was unreachable.
+    const uint32_t code32r5[] = {
+        0x7e0802ffu, 0x00050007u,            // v4 = {hi=5, lo=7}
+        0x7e0402ffu, 0x0009000bu,            // v2 = {hi=9, lo=11}
+        0xcc0a4002u, 0x18020504u,            // v_pk_add_u16 v2, v4, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r5 = recompile_valu(code32r5, std::size(code32r5), 0, 2);
+    CHECK(!spv32r5.empty(), "recompiled kernel 32r5 (v_pk_add_u16) -> SPIR-V");
+    std::vector<float> got32r5 = prosper::test::run_compute(spv32r5, std::vector<float>(1), 1, 1);
+    CHECK(got32r5.size()==1 && bits_of(got32r5[0])==0x000e0012u,
+          "kernel 32r5 adds both packed 16-bit halves independently");
+
+    // Kernel 32r6 (LIVE, exec_cs_29400bcf00 pc=25): the encoding that pins what NEG means on a
+    // packed INTEGER source, and the OPSEL/OPSEL_HI cross-select at the same time.
+    //   v_pk_add_u16 v4, 0x7fff, v2 op_sel:[0,1] op_sel_hi:[0,0] neg_lo:[1,0] neg_hi:[1,0]
+    // NEG flips bit 15 of the selected half, so the literal reads as 0xffff = -1 and the result is
+    // {lo: v2.hi - 1, hi: v2.lo - 1} — the base of a gather whose per-lane offsets are +0/+2.
+    // Reading NEG as two's-complement negation instead would give 0x80818101 and fail here; that is
+    // the whole point of this kernel.
+    const uint32_t code32r6[] = {
+        0x7e0402ffu, 0x01000080u,            // v2 = {hi=0x0100, lo=0x0080}
+        0xcc0a5104u, 0x200204ffu, 0x00007fffu,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r6 = recompile_valu(code32r6, std::size(code32r6), 0, 4);
+    CHECK(!spv32r6.empty(), "recompiled kernel 32r6 (live v_pk_add_u16 with NEG + cross OPSEL) -> SPIR-V");
+    std::vector<float> got32r6 = prosper::test::run_compute(spv32r6, std::vector<float>(1), 1, 1);
+    CHECK(got32r6.size()==1 && bits_of(got32r6[0])==0x007f00ffu,
+          "kernel 32r6 applies packed-integer NEG as a sign-bit flip and honours OPSEL_HI");
+
+    // Kernel 32r7: signed vs unsigned packed max on inputs where they disagree, so a signedness
+    // crossover in either direction changes the answer.
+    //   v1 = {hi=0xffff, lo=2}, v2 = {hi=1, lo=3}
+    //   max_i16 -> {hi=1, lo=3}; max_u16 -> {hi=0xffff, lo=3}; xor = 0xfffe0000.
+    const uint32_t code32r7[] = {
+        0x7e0202ffu, 0xffff0002u,            // v1
+        0x7e0402ffu, 0x00010003u,            // v2
+        0xcc074003u, 0x18020501u,            // v_pk_max_i16 v3, v1, v2
+        0xcc0c4004u, 0x18020501u,            // v_pk_max_u16 v4, v1, v2
+        0x3a0a0903u,                          // v_xor_b32 v5, v3, v4
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r7 = recompile_valu(code32r7, std::size(code32r7), 0, 5);
+    CHECK(!spv32r7.empty(), "recompiled kernel 32r7 (v_pk_max_i16 / v_pk_max_u16) -> SPIR-V");
+    std::vector<float> got32r7 = prosper::test::run_compute(spv32r7, std::vector<float>(1), 1, 1);
+    CHECK(got32r7.size()==1 && bits_of(got32r7[0])==0xfffe0000u,
+          "kernel 32r7 separates signed and unsigned packed max");
+
+    // Kernel 32r8a/32r8b: the reversed-operand packed shift, the low-half multiply, and the
+    // three-source packed mad chained so it consumes the shift's own result.
+    const uint32_t code32r8a[] = {
+        0x7e0202ffu, 0x00030002u,
+        0x7e0402ffu, 0xf0f00ff0u,
+        0xcc054003u, 0x18020501u,            // v3 = v_pk_lshrrev_b16 v1, v2
+        0xcc014004u, 0x18020501u,            // v4 = v_pk_mul_lo_u16  v1, v2
+        0x3a0c0903u,                          // v_xor_b32 v6, v3, v4
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r8a = recompile_valu(code32r8a, std::size(code32r8a), 0, 6);
+    CHECK(!spv32r8a.empty(), "recompiled kernel 32r8a (v_pk_lshrrev_b16 / v_pk_mul_lo_u16) -> SPIR-V");
+    std::vector<float> got32r8a = prosper::test::run_compute(spv32r8a, std::vector<float>(1), 1, 1);
+    CHECK(got32r8a.size()==1 && bits_of(got32r8a[0])==0xccce1c1cu,
+          "kernel 32r8a shifts and multiplies each packed half with the reversed-operand order");
+
+    const uint32_t code32r8b[] = {
+        0x7e0202ffu, 0x00030002u,
+        0x7e0402ffu, 0xf0f00ff0u,
+        0xcc054003u, 0x18020501u,            // v3 = v_pk_lshrrev_b16 v1, v2
+        0xcc094005u, 0x1c0e0501u,            // v5 = v_pk_mad_u16 v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r8b = recompile_valu(code32r8b, std::size(code32r8b), 0, 5);
+    CHECK(!spv32r8b.empty(), "recompiled kernel 32r8b (v_pk_mad_u16, three packed sources) -> SPIR-V");
+    std::vector<float> got32r8b = prosper::test::run_compute(spv32r8b, std::vector<float>(1), 1, 1);
+    CHECK(got32r8b.size()==1 && bits_of(got32r8b[0])==0xf0ee23dcu,
+          "kernel 32r8b evaluates the packed mad on both halves");
+
+    // Kernel 32r9: packed subtract, signed packed min, and the ARITHMETIC packed shift, on inputs
+    // whose high bits are set so a logical shift or an unsigned min fails.
+    const uint32_t code32r9[] = {
+        0x7e0202ffu, 0x00030002u,            // v1 = shift amounts
+        0x7e0402ffu, 0x8000ff00u,            // v2 = {hi=-32768, lo=-256}
+        0xcc0b4003u, 0x18020501u,            // v_pk_sub_u16     v3, v1, v2
+        0xcc084004u, 0x18020501u,            // v_pk_min_i16     v4, v1, v2
+        0xcc064005u, 0x18020501u,            // v_pk_ashrrev_i16 v5, v1, v2
+        0x3a0c0903u,                          // v_xor_b32 v6, v3, v4
+        0x3a0c0b06u,                          // v_xor_b32 v6, v6, v5
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r9 = recompile_valu(code32r9, std::size(code32r9), 0, 6);
+    CHECK(!spv32r9.empty(), "recompiled kernel 32r9 (v_pk_sub_u16 / v_pk_min_i16 / v_pk_ashrrev_i16) -> SPIR-V");
+    std::vector<float> got32r9 = prosper::test::run_compute(spv32r9, std::vector<float>(1), 1, 1);
+    CHECK(got32r9.size()==1 && bits_of(got32r9[0])==0xf00301c2u,
+          "kernel 32r9 sign-extends the packed arithmetic shift and the signed packed min");
+
+    // Kernel 32r10 (LIVE, exec_cs_2a80007800 pc=102): `v_med3_f16` (VOP3 0x357) and its sibling
+    // `v_min3_f16` (0x351). The window is interleaved by signedness — 0x352/0x355/0x358 are the i16
+    // forms and 0x353/0x356/0x359 the u16 ones — so these two are NOT adjacent to 0x354 by type,
+    // and the destination half is OPSEL[3] with the other half preserved.
+    const uint32_t code32r10[] = {
+        0x7e0002ffu, 0x00004000u,            // v0 = 2.0h in the low half
+        0x7e0202ffu, 0x00003c00u,            // v1 = 1.0h
+        0x7e0402ffu, 0x00004200u,            // v2 = 3.0h
+        0x7e0602ffu, 0x11110000u,            // v3 = old destination
+        0x7e0802ffu, 0x22220000u,            // v4 = old destination
+        0xd7570003u, 0x040a0300u,            // v_med3_f16 v3, v0, v1, v2   -> 2.0h
+        0xd7510004u, 0x040a0300u,            // v_min3_f16 v4, v0, v1, v2   -> 1.0h
+        0x3a0a0903u,                          // v_xor_b32 v5, v3, v4
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r10 = recompile_valu(code32r10, std::size(code32r10), 0, 5);
+    CHECK(!spv32r10.empty(), "recompiled kernel 32r10 (live v_med3_f16 + v_min3_f16) -> SPIR-V");
+    std::vector<float> got32r10 = prosper::test::run_compute(spv32r10, std::vector<float>(1), 1, 1);
+    CHECK(got32r10.size()==1 && bits_of(got32r10[0])==0x33337c00u,
+          "kernel 32r10 takes the median and the minimum of three f16 sources");
+
+    // Kernel 32r11: the packed f16 siblings of the add/mul pair the recompiler already had —
+    // v_pk_fma_f16 (three sources), v_pk_min_f16 and v_pk_max_f16.
+    const uint32_t code32r11[] = {
+        0x7e0002ffu, 0x40003c00u,            // v0 = {hi=2.0h, lo=1.0h}
+        0x7e0202ffu, 0x42003800u,            // v1 = {hi=3.0h, lo=0.5h}
+        0x7e0402ffu, 0x3c004000u,            // v2 = {hi=1.0h, lo=2.0h}
+        0xcc0e4003u, 0x1c0a0300u,            // v_pk_fma_f16 v3, v0, v1, v2
+        0xcc114004u, 0x18020300u,            // v_pk_min_f16 v4, v0, v1
+        0xcc124005u, 0x18020300u,            // v_pk_max_f16 v5, v0, v1
+        0x3a0c0903u,                          // v_xor_b32 v6, v3, v4
+        0x3a0c0b06u,                          // v_xor_b32 v6, v6, v5
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r11 = recompile_valu(code32r11, std::size(code32r11), 0, 6);
+    CHECK(!spv32r11.empty(), "recompiled kernel 32r11 (v_pk_fma/min/max_f16) -> SPIR-V");
+    std::vector<float> got32r11 = prosper::test::run_compute(spv32r11, std::vector<float>(1), 1, 1);
+    CHECK(got32r11.size()==1 && bits_of(got32r11[0])==0x45004500u,
+          "kernel 32r11 evaluates the packed f16 fma, min and max on both halves");
+
+    // Kernel 32r12 (LIVE, exec_cs_29400bcf00 pc=23): `v_mbcnt_lo_u32_b32 v2, -1, 0` INSIDE a
+    // structured region. The compute structurizer sets its wave gate to `is_fragment`, so the
+    // cross-lane MBCNT path is unavailable there and this used to reject the whole program — even
+    // though an all-ones mask makes MBCNT read no other lane at all. Placing the instruction after
+    // a forward `s_cbranch_scc0` whose SCC is always 1 keeps the then-arm live and forces the
+    // structured path; the answer is this invocation's own lane index.
+    const uint32_t code32r12[] = {
+        0x7e000500u,                          // v_readfirstlane_b32 s0, v0
+        0xbf0b0000u,                          // s_cmp_le_u32 s0, s0   -> SCC = 1
+        0x7e0402ffu, 0xffffffffu,            // v2 = sentinel (the else value)
+        0xbf840002u,                          // s_cbranch_scc0 +2     (never taken)
+        0xd7650002u, 0x000100c1u,            // v_mbcnt_lo_u32_b32 v2, -1, 0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r12 = recompile_valu(code32r12, std::size(code32r12), 1, 2);
+    CHECK(!spv32r12.empty(),
+          "recompiled kernel 32r12 (live v_mbcnt_lo with an all-ones mask, structured) -> SPIR-V");
+    {
+        const uint32_t lanes = 128;
+        std::vector<float> in32r12(lanes, 0.0f);
+        // A rejected shader returns an empty module, and handing that to the Vulkan runner faults
+        // rather than failing — which is exactly what the mutation arm for this kernel produces.
+        // Score it as a miss instead so the arm reports a FAIL rather than a crash.
+        std::vector<float> got = spv32r12.empty()
+            ? std::vector<float>()
+            : prosper::test::run_compute(spv32r12, in32r12, lanes, lanes);
+        uint32_t bad = got.size() == lanes ? 0u : lanes;
+        for (uint32_t i = 0; i < got.size(); i++) {
+            const uint32_t lane = i & 63u;
+            if (bits_of(got[i]) != (lane < 32u ? lane : 32u)) bad++;
+        }
+        CHECK(bad == 0, "kernel 32r12 returns this lane's own index from an all-ones MBCNT");
+    }
+
+    // Kernel 32r13: the fail-visible arms. Integer saturation (CLAMP on a packed integer op) and
+    // SDWA UNUSED_SEXT are both real semantics this change does NOT model, so each must still
+    // reject rather than compile into a silently wrong value.
+    const uint32_t code32r13a[] = {
+        0x7e0802ffu, 0x00050007u,
+        0x7e0402ffu, 0x0009000bu,
+        0xcc0ac002u, 0x18020504u,            // v_pk_add_u16 v2, v4, v2 clamp
+        0xbf810000u,
+    };
+    CHECK(recompile_valu(code32r13a, std::size(code32r13a), 0, 2).empty(),
+          "kernel 32r13a REJECTS packed-integer CLAMP instead of dropping the saturation");
+    const uint32_t code32r13b[] = {
+        0x7e0002ffu, 0xdead1234u,
+        0x7e0402ffu, 0xaabbccddu,
+        0x360400f9u, 0x04860c86u,            // v_and_b32_sdwa ... dst_unused:UNUSED_SEXT
+        0xbf810000u,
+    };
+    CHECK(recompile_valu(code32r13b, std::size(code32r13b), 0, 2).empty(),
+          "kernel 32r13b REJECTS SDWA UNUSED_SEXT instead of zero-filling or preserving");
+
+    // Kernel 32r14 (LIVE, exec_cs_25c0066900 pc=101): `s_flbit_i32_b64` over ordinary scalar DATA.
+    // Four arms, because the interesting behaviour is entirely in the boundaries: which word wins,
+    // the +32 offset for a value that lives only in the low word, and the -1 answer for zero (which
+    // is where a naive `31 - FindUMsb` returns 32 instead, since FindUMsb is undefined there).
+    struct FlbitArm { const char* what; std::vector<uint32_t> code; uint32_t expect; };
+    const std::vector<FlbitArm> flbit_arms = {
+        // s[0:1] = 0x0000000000080000 -> highest set bit is 19, so 63 - 19 = 44 leading zeros.
+        {"counts leading zeros across the whole 64-bit pair",
+         {0xbe8003ffu, 0x00080000u, 0xbe8103ffu, 0x00000000u,
+          0xbe821600u, 0x7e000202u, 0xbf810000u}, 44u},
+        // The B32 form of the same word: 31 - 19 = 12.
+        {"counts leading zeros of one word for the B32 form",
+         {0xbe8003ffu, 0x00080000u, 0xbe821500u, 0x7e000202u, 0xbf810000u}, 12u},
+        // A zero source returns -1, not 32 or 64.
+        {"returns -1 for an all-zero source",
+         {0xbe800380u, 0xbe810380u, 0xbe821600u, 0x7e000202u, 0xbf810000u}, 0xffffffffu},
+        // s[0:1] = 0x8000000000000001: the HIGH word decides, so the answer is 0, not 63.
+        {"lets the high word decide when both words are non-zero",
+         {0xbe800381u, 0xbe8103ffu, 0x80000000u, 0xbe821600u, 0x7e000202u, 0xbf810000u}, 0u},
+    };
+    for (const auto& arm : flbit_arms) {
+        std::vector<uint32_t> spv = recompile_valu(arm.code.data(), arm.code.size(), 0, 0);
+        CHECK(!spv.empty(), "recompiled an s_flbit_i32 kernel -> SPIR-V");
+        std::vector<float> got = spv.empty()
+            ? std::vector<float>()
+            : prosper::test::run_compute(spv, std::vector<float>(1), 1, 1);
+        CHECK(got.size() == 1 && bits_of(got[0]) == arm.expect, arm.what);
+    }
+
+    // Kernel 32r15 (LIVE, exec_cs_2a80007800 pc=130 and pc=115): the SDWA WORD-destination form of
+    // the 16-bit convert family. #2067 gated the whole family on `!has_sdwa` because a DWORD-select
+    // SDWA control word can carry src0 NEG/ABS that the generic VOP1 path would apply in the f32
+    // domain; the form the title actually emits has a DWORD SOURCE select and no modifier at all,
+    // writing WORD_1 with UNUSED_PRESERVE, and is exact.
+    //   v9 = {hi=0x1111, lo=3.0h}; v9.hi = i16(3.0h) = 3, v9.lo preserved.
+    const uint32_t code32r15a[] = {
+        0x7e1202ffu, 0x11114200u,            // v9 = {hi=0x1111, lo=3.0h}
+        0x7e12a6f9u, 0x00061509u,            // v_cvt_i16_f16_sdwa v9, v9 WORD_1/PRESERVE src DWORD
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r15a = recompile_valu(code32r15a, std::size(code32r15a), 0, 9);
+    CHECK(!spv32r15a.empty(), "recompiled kernel 32r15a (live v_cvt_i16_f16_sdwa WORD_1) -> SPIR-V");
+    std::vector<float> got32r15a = prosper::test::run_compute(spv32r15a, std::vector<float>(1), 1, 1);
+    CHECK(got32r15a.size()==1 && bits_of(got32r15a[0])==0x00034200u,
+          "kernel 32r15a converts f16 -> i16 into the selected destination word");
+
+    //   v11 = 5; v14 = 0xaaaabbbb; v14.hi = f16(5) = 0x4500, v14.lo preserved.
+    const uint32_t code32r15b[] = {
+        0x7e160285u,                          // v11 = 5
+        0x7e1c02ffu, 0xaaaabbbbu,            // v14 = old destination
+        0x7e1ca2f9u, 0x0006150bu,            // v_cvt_f16_i16_sdwa v14, v11 WORD_1/PRESERVE
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r15b = recompile_valu(code32r15b, std::size(code32r15b), 0, 14);
+    CHECK(!spv32r15b.empty(), "recompiled kernel 32r15b (live v_cvt_f16_i16_sdwa WORD_1) -> SPIR-V");
+    std::vector<float> got32r15b = prosper::test::run_compute(spv32r15b, std::vector<float>(1), 1, 1);
+    CHECK(got32r15b.size()==1 && bits_of(got32r15b[0])==0x4500bbbbu,
+          "kernel 32r15b converts i16 -> f16 into the selected destination word");
+
+    // Kernel 32r16 (LIVE opcode, exec_cs_290000eb00 pc=34): the 16-bit VOPC integer compares. The
+    // 32-bit windows were handled; i16 (0x88-0x8f) and u16 (0xa8-0xaf) were not, so
+    // `v_cmp_le_u16_sdwa` rejected the whole program.
+    //   v1 = 0x7777ffff, v2 = 1. Only bits [15:0] participate, so u16 sees 65535 <= 1 (FALSE) and
+    //   i16 sees -1 <= 1 (TRUE). The two v_cndmask results therefore pick DIFFERENT sources, and
+    //   their xor is non-zero only if the signedness is right in both. A 32-bit compare would read
+    //   0x7777ffff, which is neither 65535 nor -1, and answers FALSE for both — collapsing the xor
+    //   to zero. So this one value separates all three readings.
+    const uint32_t code32r16[] = {
+        0x7e0202ffu, 0x7777ffffu,            // v1
+        0x7e040281u,                          // v2 = 1
+        0x7e0802ffu, 0xaaaa0000u,            // v4
+        0x7e0a02ffu, 0x0000bbbbu,            // v5
+        0x7d560501u,                          // v_cmp_le_u16 vcc_lo, v1, v2   -> false
+        0x02060b04u,                          // v_cndmask_b32 v3, v4, v5, vcc -> v4
+        0x7d160501u,                          // v_cmp_le_i16 vcc_lo, v1, v2   -> true
+        0x020c0b04u,                          // v_cndmask_b32 v6, v4, v5, vcc -> v5
+        0x3a0e0d03u,                          // v_xor_b32 v7, v3, v6
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r16 = recompile_valu(code32r16, std::size(code32r16), 0, 7);
+    CHECK(!spv32r16.empty(), "recompiled kernel 32r16 (v_cmp_le_u16 / v_cmp_le_i16) -> SPIR-V");
+    std::vector<float> got32r16 = prosper::test::run_compute(spv32r16, std::vector<float>(1), 1, 1);
+    CHECK(got32r16.size()==1 && bits_of(got32r16[0])==0xaaaabbbbu,
+          "kernel 32r16 compares only bits [15:0] and separates the i16 and u16 windows");
+
+    // Kernel 32r17 (LIVE, exec_cs_2a80007800): the same convert family reading its 16-bit operand
+    // out of the HIGH source word. DWORD and WORD_0 both name bits [15:0] for a 16-bit op, so only
+    // WORD_1 changes anything — and it changes the answer completely.
+    //   v11 = 0xfffb0007: WORD_1 is -5, WORD_0 is +7. f16(-5) = 0xc500, f16(7) = 0x4700.
+    const uint32_t code32r17[] = {
+        0x7e1602ffu, 0xfffb0007u,            // v11 = {hi=-5, lo=+7}
+        0x7e2002ffu, 0xccccddddu,            // v16 = old destination
+        0x7e20a2f9u, 0x0005140bu,            // v_cvt_f16_i16_sdwa v16, v11 WORD_0/PRESERVE src WORD_1
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r17 = recompile_valu(code32r17, std::size(code32r17), 0, 16);
+    CHECK(!spv32r17.empty(), "recompiled kernel 32r17 (live v_cvt_f16_i16_sdwa src0_sel:WORD_1) -> SPIR-V");
+    std::vector<float> got32r17 = prosper::test::run_compute(spv32r17, std::vector<float>(1), 1, 1);
+    CHECK(got32r17.size()==1 && bits_of(got32r17[0])==0xccccc500u,
+          "kernel 32r17 reads the selected SOURCE word of a 16-bit convert");
+
+    // Kernel 32r18 (LIVE, exec_cs_2a80007800): `v_pack_b32_f16` — the instruction that reassembles
+    // the halves the convert family produces, which is why it surfaced immediately behind them.
+    // D = {S1.f16, S0.f16}: S0 supplies bits [15:0] and S1 bits [31:16]. Two arms, because the
+    // operand ORDER and OPSEL are independently easy to get backwards.
+    //   v0 = {hi=1.0h, lo=2.0h}, v2 = {hi=3.0h, lo=5.0h}; opsel 0 -> {5.0h, 2.0h} = 0x45004000.
+    const uint32_t code32r18a[] = {
+        0x7e0002ffu, 0x3c004000u,            // v0
+        0x7e0402ffu, 0x42004500u,            // v2
+        0xd7110020u, 0x00020500u,            // v_pack_b32_f16 v32, v0, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r18a = recompile_valu(code32r18a, std::size(code32r18a), 0, 32);
+    CHECK(!spv32r18a.empty(), "recompiled kernel 32r18a (live v_pack_b32_f16) -> SPIR-V");
+    std::vector<float> got32r18a = prosper::test::run_compute(spv32r18a, std::vector<float>(1), 1, 1);
+    CHECK(got32r18a.size()==1 && bits_of(got32r18a[0])==0x45004000u,
+          "kernel 32r18a packs src0's half low and src1's half high");
+    //   The same sources with op_sel:[1,1] read the OTHER half of each -> {3.0h, 1.0h} = 0x42003c00.
+    const uint32_t code32r18b[] = {
+        0x7e0002ffu, 0x3c004000u,            // v0
+        0x7e0202ffu, 0x42004500u,            // v1
+        0x7e0602ffu, 0x99999999u,            // v3 = old destination (a full-dword write discards it)
+        0xd7111803u, 0x00020300u,            // v_pack_b32_f16 v3, v0, v1 op_sel:[1,1,0]
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r18b = recompile_valu(code32r18b, std::size(code32r18b), 0, 3);
+    CHECK(!spv32r18b.empty(), "recompiled kernel 32r18b (v_pack_b32_f16 op_sel) -> SPIR-V");
+    std::vector<float> got32r18b = prosper::test::run_compute(spv32r18b, std::vector<float>(1), 1, 1);
+    CHECK(got32r18b.size()==1 && bits_of(got32r18b[0])==0x42003c00u,
+          "kernel 32r18b selects each source's half through OPSEL and writes the whole dword");
+
     // Kernel 32p: exact live v_cndmask_b32_sdwa selects src1 WORD_0 through VCC, writes WORD_1,
     // and preserves the destination's low half.
     const uint32_t code32p[] = {
