@@ -42,6 +42,11 @@ extern "C" void prosper_rel1_forge_decision_reset_for_test();
 extern "C" void prosper_rel1_forge_decision_totals(uint64_t* candidates, uint64_t* suppressed,
                                                      uint64_t* landed);
 extern "C" bool prosper_rel1_forge_report_due_for_test(uint64_t candidates);
+// #1226: the forge-shape predicates, split into the DECISION window the default guards use and the
+// REPORT window a census must use. Returns the narrow (guard-reachable) verdict; *wide receives the
+// report verdict.
+extern "C" int prosper_forge_predicate_for_test(uint64_t pre, uint64_t width, uint64_t value,
+                                                int* wide);
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -1949,6 +1954,51 @@ int main() {
                   "PROSPER_WRITE_TRAP/DMA-copy counts the armed value, and the store lands", dma_copy);
         both_arms("PROSPER_WRITE_TRAP/WDATA ignores a value adjacent to the armed one",
                   "PROSPER_WRITE_TRAP/WDATA counts the armed value, and the store lands", wdata);
+    }
+
+    // #1226: pin the exact bound that made ArcRunner's own address range unmeasurable. The default
+    // guard window (ptr_like_narrow) stops at 0x2100000000 while the title's MallocBinned3 arena is
+    // [0x2000000000, 0xa000000000), so a forge whose destination holds a 0x21xxxxxxxx-shaped pointer
+    // is invisible to the DECISION predicate. The REPORT predicate must see it, otherwise a census
+    // measures the predicate instead of the title — and this is how "wide_only=0" became a usable
+    // negative for ArcRunner rather than an artifact.
+    //
+    // Both arms are asserted on every case: a test that only checked the wide verdict would pass
+    // just as well if the two predicates had been collapsed into one, which is the change this
+    // deliberately does NOT make (rel1_stomp_guard() is default-ON; widening it is an unmeasured
+    // suppression over 500 GiB, so it stays behind PROSPER_PTRLIKE_WIDE).
+    {
+        struct Case { uint64_t pre; uint64_t width; uint64_t value; int narrow; int wide;
+                      const char* what; };
+        const Case cases[] = {
+            // Inside both windows — the shape #312/#1226 already guarded on DOLL and ArcRunner.
+            {0x2000000000ull, 4, 1, 1, 1, "0x2000000000 (arena base half) is narrow AND wide"},
+            {0x1000000000ull, 4, 1, 1, 1, "0x1000000000 (DOLL arena) is narrow AND wide"},
+            // Exactly one byte above the narrow bound: ArcRunner's terminal `addr=(nil)` fault
+            // dereferences 0x2100000001, whose pre is this value.
+            {0x2100000000ull, 4, 1, 0, 1, "0x2100000000 is WIDE-ONLY — the #1226 blind spot"},
+            {0x9f00000000ull, 4, 1, 0, 1, "0x9f00000000 (arena top) is WIDE-ONLY"},
+            // Outside the guest VA window entirely: neither predicate may claim it.
+            {0x0000000000ull, 4, 1, 0, 0, "a null pre is neither narrow nor wide"},
+            {0xa000000000ull, 4, 1, 0, 0, "0xa000000000 (past the arena) is neither"},
+            // Shape rules are shared by both windows and must not drift apart. These use a pre that
+            // is INSIDE the narrow window, so each rejection is attributable to the shape rule under
+            // test; the same case with a 0x21… pre would be rejected by the window on the narrow arm
+            // and prove nothing about the rule.
+            {0x2000000005ull, 4, 1, 0, 0, "a nonzero low dword is not a forge on either window"},
+            {0x2000000000ull, 8, 1, 0, 0, "a full-width write replaces the qword — not a forge"},
+            {0x2000000000ull, 4, 0, 0, 0, "a zero value cannot forge a nonzero low dword"},
+            // …and once more above the narrow bound, so a shape rule that is accidentally applied
+            // only inside the narrow window is still caught.
+            {0x2100000005ull, 4, 1, 0, 0, "a nonzero low dword is not a forge above the narrow bound"},
+        };
+        for (const auto& c : cases) {
+            int wide = -1;
+            const int narrow = prosper_forge_predicate_for_test(c.pre, c.width, c.value, &wide);
+            char msg[192];
+            snprintf(msg, sizeof msg, "forge predicate: %s", c.what);
+            CHECK(narrow == c.narrow && wide == c.wide, msg);
+        }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

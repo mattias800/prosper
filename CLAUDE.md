@@ -271,9 +271,20 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     to catch the moment live — the human presses F9 once, then the fix is iterated on the frozen frame.
     It captures *rendered-frame* bugs (not CPU/logic/audio). See `tools/AGENTS.md` (interactive frame grab)
     and `tools/gpu_replay/README.md`.
-- **Reaching the running frame loop** needs two gated switches (off by default, so the default boot stays
-  stable): `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct`. Add `PROSPER_RENDER=1` to run the
-  live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
+- **Reaching the running frame loop:** `PROSPER_GUEST_ARGS=-force-gfx-direct`, plus `PROSPER_RENDER=1`
+  to run the live renderer and `PROSPER_GFXLOG=1` for graphics diagnostics.
+  - **`PROSPER_GUEST_FS=1` is NOT needed on Linux or Windows, and this line used to say it was.** Guest
+    initial-exec TLS is **enabled by default** there; the environment variable actually read is the
+    **opt-OUT** `PROSPER_NO_GUEST_FS`, kept for compatibility bisection (`src/host/guest_tls.cpp:58`,
+    `:240`; `src/hle/dispatch.hpp:218`). `PROSPER_GUEST_FS` is never read as an env var on those
+    platforms — setting it is harmless but does nothing, and *believing* it is required is not: it
+    turns a default-on path into one people think they are enabling, so nobody checks it when a guest
+    TLS problem is the actual cause. On **macOS/Rosetta** `PROSPER_GUEST_FS` does remain the opt-in for
+    trap emulation, which is where the confusion came from.
+  - Recorded because of how far a wrong default travelled: this line propagated into a review's wording,
+    then a briefing, then a shipped code comment, then an author-verification comment — with nobody
+    opening `guest_tls.cpp` at any step (#2049). **A default stated in this file is the kind of claim
+    every reader inherits without checking; verify against the code before restating one.**
 - **Do not reuse snapshot acceleration for interactive or performance runs.** `PROSPER_RENDER_SCALE>1`,
   `PROSPER_RENDER_EVERY>1`, and `PROSPER_RENDER_EVERY_FOR_MS` deliberately reduce resolution or skip
   graphics submits. Keep the defaults (`PROSPER_RENDER_SCALE=1`, `PROSPER_RENDER_EVERY=1`, and no timed
@@ -289,7 +300,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   "handled" when they are not. Reject paths still exist as a *fail-visible* backstop for genuinely
   unknown encodings (mark `CONFIDENCE: LOW`, log loudly, file an issue with the exact opcode/format), but
   treat every one you hit on a live boot as the next thing to implement. Find the exact failing op with
-  `PROSPER_DBG=1` (`[recompile-reject] pc=… op=0x…` from the recompiler) or the `[compute] … skipped`
+  `PROSPER_DBG=1` (`[recompile-reject] pc=… op=0x…` from the recompiler) or the `[compute] skip …`
   lines from the live backend, then implement it with a round-trip/execution test — do not leave it skipped.
 - **Entitlement and add-content APIs answer from LOCAL INVENTORY — never blanket-approve.** When a
   title asks whether an add-on or entitlement is owned, prosper answers from the content actually
@@ -370,6 +381,19 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   reviewer posts approval on the corrected exact head. Address every blocking finding and re-review authored
   corrections, then merge only after the merge agent separately confirms author verification, reviewer approval
   where required, and green required CI.
+  - **A cited claim reads as a verified one — and reviewers' findings propagate hardest.** A review
+    finding carries more authority than the same sentence anywhere else: it has been *checked* by
+    definition, and attaching a `file:line` makes it look checked twice. So a **wrong** finding with a
+    citation is the most contagious kind of error this project produces. Worked example (#2049 → #2052):
+    a reviewer stated an inverted default with a file:line, and that citation is what made it credible
+    enough to travel unchallenged into a briefing, then a shipped code comment, then an author's own
+    verification comment, then roughly fifteen agent briefings — with **nobody opening the cited file at
+    any step**. It was `guest_tls.cpp:46`, which is the Apple-only branch; Linux is `:58`, opt-**out**,
+    default **enabled**.
+    **So: check a claim against the source, never against anything downstream of the thing being
+    checked.** Opening the cited file and running one `grep -rn 'getenv("…")' prosper/src` is the whole
+    defence, and it is two commands. This binds on reviewers most of all — when you cite a line, you are
+    asserting you read it.
   - **How a verdict is expressed and detected — this is mechanical, and getting it wrong has merged a rejected
     PR.** The reviewer posts one or more **registered reviews** with `gh pr review <N> --comment --body '…'`,
     each stating a verdict as a literal **`APPROVED`** or **`REJECTED`** in the body. The author reads the

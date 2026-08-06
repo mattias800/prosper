@@ -54,6 +54,10 @@ public:
     static constexpr uint32_t kHeight = 1080;
     static constexpr uint32_t kStride = 2048;
     static constexpr size_t kUvRows = (kHeight + 1u) / 2u;
+    // prosper RE-pitches rather than propagating the decoder's stride, so what it publishes is its
+    // OWN 256-byte-aligned pitch, not kStride. The two coincide here; asserting against this constant
+    // keeps the checks true for the right reason if the fake backend's stride ever changes.
+    static constexpr uint32_t kPitch = (kWidth + 255u) & ~255u;
     bool fail_open = false;
     bool delivered = false;
     bool audio_delivered = false;
@@ -464,11 +468,16 @@ int main() {
     memcpy(&native_info_crop_top, native_info.details + 28, sizeof(native_info_crop_top));
     memcpy(&native_info_crop_bottom, native_info.details + 32, sizeof(native_info_crop_bottom));
     memcpy(&native_info_pitch, native_info.details + 36, sizeof(native_info_pitch));
-    CHECK(native_info_width == FakeVideoBackend::kWidth &&
-              native_info_pitch == FakeVideoBackend::kStride &&
+    CHECK(native_info_width == FakeVideoBackend::kPitch &&
+              native_info_pitch == FakeVideoBackend::kPitch &&
               native_info_crop_left == 0 && native_info_crop_right == 128 &&
               native_info_crop_top == 0 && native_info_crop_bottom == 0,
           "native stream metadata separates the 2048 physical pitch from 1920 visible pixels");
+    CHECK(native_info_width - native_info_crop_left - native_info_crop_right ==
+              FakeVideoBackend::kWidth &&
+          native_info_pitch - native_info_crop_left - native_info_crop_right ==
+              FakeVideoBackend::kWidth,
+          "GetStreamInfoEx: both the width- and pitch-based crop spellings yield 1920 visible");
     native_info = {}; native_info.size = sizeof(native_info);
     CHECK(infoex(native_handle, 1, (uint64_t)(uintptr_t)&native_info, 0, 0, 0) == 0 &&
               native_info.type == 2,
@@ -486,12 +495,26 @@ int main() {
     const auto* staged = static_cast<const uint8_t*>(native_frame.data);
     const uint64_t staged_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(staged));
     CHECK(staged[0] == 0x40 && staged[FakeVideoBackend::kWidth - 1] == 0x40 &&
-              staged[FakeVideoBackend::kWidth] == 0 &&
               staged[FakeVideoBackend::kStride] == 0x41 &&
               staged[native_y_bytes] == 0x80 &&
-              staged[native_y_bytes + FakeVideoBackend::kWidth] == 0 &&
               staged[native_y_bytes + FakeVideoBackend::kStride] == 0x81,
-          "1920 visible bytes are copied row-by-row while luma/chroma padding remains cleared");
+          "1920 visible bytes are copied row-by-row into the padded pitch");
+    // #2011: the padding is limited-range BLACK, not zero. `Y=0, U=V=0` converts to roughly
+    // (0, 136, 0) — mid green — so with `width` published as the coded extent a crop-ignoring
+    // consumer would draw a 128-column green stripe down every movie frame. Assert the exact
+    // values, on the first and last padded column of a padded row of each plane: a revert to
+    // memset(..., 0, ...) turns this red, and so does padding left uninitialised.
+    bool luma_pad_black = true, chroma_pad_black = true;
+    for (uint32_t col = FakeVideoBackend::kWidth; col < FakeVideoBackend::kPitch; ++col) {
+        if (staged[col] != 0x10) luma_pad_black = false;
+        if (staged[static_cast<size_t>(FakeVideoBackend::kPitch) + col] != 0x10)
+            luma_pad_black = false;
+        if (staged[native_y_bytes + col] != 0x80) chroma_pad_black = false;
+        if (staged[native_y_bytes + FakeVideoBackend::kPitch + col] != 0x80)
+            chroma_pad_black = false;
+    }
+    CHECK(luma_pad_black && chroma_pad_black,
+          "the 128 padded columns are limited-range black (Y=0x10, U=V=0x80), never zero/green");
     CHECK(gpu::guest_linear_texture_row_pitch(staged_address, FakeVideoBackend::kStride) ==
               FakeVideoBackend::kStride &&
           gpu::guest_linear_texture_row_pitch(staged_address, FakeVideoBackend::kWidth) ==
@@ -514,16 +537,27 @@ int main() {
     memcpy(&native_crop_bottom, native_frame.details + 32, sizeof(native_crop_bottom));
     memcpy(&native_pitch, native_frame.details + 36, sizeof(native_pitch));
     memcpy(&native_fps, native_frame.details + 48, sizeof(native_fps));
-    CHECK(native_width == FakeVideoBackend::kWidth && native_height == FakeVideoBackend::kHeight &&
-              native_pitch == FakeVideoBackend::kStride && native_crop_left == 0 &&
+    CHECK(native_width == FakeVideoBackend::kPitch && native_height == FakeVideoBackend::kHeight &&
+              native_pitch == FakeVideoBackend::kPitch && native_crop_left == 0 &&
               native_crop_right == 128 && native_crop_top == 0 && native_crop_bottom == 0 &&
               native_fps == 60.0,
-          "native frame details preserve visible dimensions, physical pitch, crop, and frame rate");
+          "native frame details publish the coded extent, physical pitch, crop, and frame rate");
     CHECK(gpu::linear_sampled_surface_bytes(native_pitch, native_height, 1) ==
               static_cast<size_t>(native_pitch) * native_height,
           "R-Type movie luma descriptor footprint matches the published pitch extent");
-    CHECK(native_pitch - native_crop_left - native_crop_right == native_width,
+    CHECK(native_pitch - native_crop_left - native_crop_right == FakeVideoBackend::kWidth,
           "GRIS crop offsets hide the padded tail instead of exposing a right-edge strip");
+    // #2011: ArcRunner (PPSA21406) spells the same question off `width` rather than `pitch`. While
+    // width published the VISIBLE 1920 alongside crop_right=128 the two spellings disagreed, and the
+    // title rendered every movie frame into a 1792x1080 surface — a 128-column slice lost. Both
+    // spellings must land on the same visible extent.
+    CHECK(native_width - native_crop_left - native_crop_right == FakeVideoBackend::kWidth,
+          "ArcRunner crop spelling off width yields the same 1920 visible extent as off pitch");
+    float native_aspect = 0.0f;
+    memcpy(&native_aspect, native_frame.details + 8, sizeof(native_aspect));
+    CHECK(native_aspect == static_cast<float>(FakeVideoBackend::kWidth) /
+                           static_cast<float>(FakeVideoBackend::kHeight),
+          "aspect stays the VISIBLE display ratio and is not widened by the coded pitch");
     CHECK(video(native_handle, (uint64_t)(uintptr_t)&native_frame, 0, 0, 0, 0) == 0 &&
               event_count == 3 && events[2] == 1 && !fake.audio_delivered,
           "video-only consumption of an audio-bearing source reaches EOF and fires one STOP");
@@ -829,9 +863,13 @@ int main() {
     memcpy(&crop_bottom, frame.details + 32, sizeof(crop_bottom));
     memcpy(&pitch, frame.details + 36, sizeof(pitch));
     memcpy(&fps, frame.details + 48, sizeof(fps));
-    CHECK(width == 1920 && height == 1080 && pitch == 2048 && crop_left == 0 &&
+    CHECK(width == 2048 && height == 1080 && pitch == 2048 && crop_left == 0 &&
               crop_right == 128 && crop_top == 0 && crop_bottom == 0 && fps == 30.0,
           "AvPlayerVideoEx uses the published 80-byte padded-pitch/crop layout");
+    // #2011: the synthetic Ex path publishes the same contract as the native one — width is the
+    // CODED extent the crop offsets trim, so both spellings of "visible width" agree at 1920.
+    CHECK(width - crop_left - crop_right == 1920 && pitch - crop_left - crop_right == 1920,
+          "synthetic Ex: the width- and pitch-based crop spellings agree on 1920 visible");
     CHECK(gpu::guest_linear_texture_row_pitch(synthetic_frame_address, pitch) == pitch,
           "fallback AvPlayer storage also publishes its exact physical layout");
     CHECK(pause(h2, 0, 0, 0, 0, 0) == 0 && event_count == 3 && events[2] == 4,

@@ -183,6 +183,25 @@ int main() {
     CHECK(snap.width == W && snap.height == H && snap.rgba == rendered,
           "snapshot metadata and pixels describe the same frame");
 
+    // Provenance travels with the pixels (#1968 / #2044). A frame the renderer republished from the
+    // guest's own flipped display buffer reaches this layer through the SAME path as a composited
+    // frame — so without its own label, `--require-composited-frame` (tools/screenshot, enforced off
+    // CaptureSource::Rendered counts) would accept the exact frame it exists to reject. Both arms are
+    // asserted: the default must stay Composited, and the declared origin must survive the handoff.
+    std::vector<uint8_t> republished(FB_BYTES, 0x27);
+    gpu::present_write_frame(republished.data(), W, H, gpu::PresentFrameOrigin::GuestScanout);
+    gpu::PresentSnapshot republished_snap;
+    CHECK(gpu::present_snapshot(republished_snap) &&
+              republished_snap.source == gpu::PresentSource::GuestScanout,
+          "a republished guest scanout is NOT reported as a composited frame");
+    CHECK(republished_snap.rgba == republished && republished_snap.width == W &&
+              republished_snap.height == H,
+          "the republished frame's own pixels and extent are what the snapshot describes");
+    gpu::present_write_frame(rendered.data(), W, H);
+    CHECK(gpu::present_snapshot(republished_snap) &&
+              republished_snap.source == gpu::PresentSource::Rendered,
+          "the next composited publication clears the guest-scanout label");
+
     // The shared publication path must retain the renderer's exact immutable allocation. A lease
     // keeps the old frame alive even after a newer frame replaces it or the present state resets.
     auto shared_pixels = std::make_shared<const std::vector<uint8_t>>(rendered);

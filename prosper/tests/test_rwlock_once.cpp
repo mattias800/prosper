@@ -196,18 +196,31 @@ int main() {
     // readers, so a stray unlock that arrives while readers are present legitimately consumes one
     // reader's release — on hardware too. What must hold is sharper, and is exactly what the store
     // ordering buys:
-    //   * a WRITE hold can never be stolen: the owner is published before the count and cleared
-    //     after it, so a stray either sees the owner (EPERM) or sees no count (EPERM). With the
-    //     two stores in the obvious order, a stray robs the writer, the owner's own release then
-    //     drives the count negative, and the lock is bricked — #2012 reproduced by its own fix.
+    //   * a WRITE hold can never be stolen: the write flag and the hold count live in ONE atomic
+    //     word (bit 63 WRITE, bits 0..31 COUNT), so the unlock decision is a single CAS over the
+    //     whole value. A stray either sees WRITE set (owner check -> EPERM) or sees COUNT == 0
+    //     (-> EPERM). There is no pair of loads to straddle, by construction.
+    //     This is NOT the two-store ordering argument, which was tried and falsified. With
+    //     `writer` and `holds` as separate atomics, a stray could straddle the pre-check/post-check
+    //     pair across two stalls: the owner clears `writer` before decrementing `holds`, so the
+    //     stray reads writer == 0 with holds == 1, takes the reader path, and forwards an unlock
+    //     that glibc services as a WRITER release — freeing the real owner's lock. The owner then
+    //     decrements to -1 and its own unlock takes the reader path, driving __readers negative:
+    //     #2012 reproduced by its own fix. Publishing the owner before the count and clearing it
+    //     after is necessary and NOT sufficient; only the single-word CAS closes it.
     //   * a READ hold can only be stolen by a stray that was ACCEPTED, so the victims are bounded
     //     by the accepted strays.
     //   * and the lock is never corrupted: it still write-acquires afterwards.
-    // The workers take WRITE holds only, deliberately. A write-held lock has an owner published at
-    // every instant a stray could observe it, and an idle lock has a zero count, so under the
-    // correct ordering **no stray is ever accepted** — which makes the arm deterministic and gives
-    // it a crisp invariant. Under the wrong ordering the stray slips into the reader path, robs the
-    // owner, and the owner's own release then drives the count negative.
+    // The workers take WRITE holds only, deliberately. A write-held lock always has WRITE set in
+    // the same word the stray must CAS, and an idle lock has COUNT == 0, so **no stray is ever
+    // accepted** — which makes the arm deterministic and gives it a crisp invariant.
+    //
+    // Read this before acting on a failure: the invariant follows from the single-word CAS, NOT
+    // from this test. A two-stall interleaving is not observable by any amount of hammering here,
+    // so a clean run is not evidence of closure — the CAS's atomicity is the argument, and the arm
+    // exists to catch a future regression that reintroduces a straddle. If `strays_accepted != 0`
+    // ever fires, that is the signature of a residual ordering window in `rw_release`. Do not retry
+    // it; go read `rw_release`.
     //
     // Reader stealing is deliberately NOT in this loop. It is legal (the serialized cross-thread
     // read arm above covers it), but forwarding a non-owner read release into glibc under heavy

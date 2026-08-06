@@ -517,11 +517,24 @@ if(TARGET prosper_core)
   target_include_directories(test_capture_renderer_policy PRIVATE frontends/shared)
   add_test(NAME capture_renderer_policy COMMAND test_capture_renderer_policy)
 
+  # Which sampled resource is AvPlayer's NV12 chroma plane (#2005). Descriptor-level classification
+  # only — no device — but it reads the real guest-linear pitch registry, so it links prosper_core.
+  add_executable(test_avplayer_plane_policy frontends/shared/test_avplayer_plane_policy.cpp)
+  target_include_directories(test_avplayer_plane_policy PRIVATE frontends/shared src)
+  target_link_libraries(test_avplayer_plane_policy PRIVATE prosper_core)
+  add_test(NAME avplayer_plane_policy COMMAND test_avplayer_plane_policy)
+
   # The publish extent contract (#1986): which rendered pass may become the present source, and what
   # the retained-frame net may retain. Pure byte-count policy, so no device and no renderer.
   add_executable(test_present_extent frontends/shared/test_present_extent.cpp)
   target_include_directories(test_present_extent PRIVATE frontends/shared)
   add_test(NAME present_extent COMMAND test_present_extent)
+
+  # When prosper may publish the guest's OWN flipped display buffer (#1968), including the guest
+  # authorship precondition whose absence reverted the first attempt (#2044). Pure policy, no device.
+  add_executable(test_guest_scanout_present frontends/shared/test_guest_scanout_present.cpp)
+  target_include_directories(test_guest_scanout_present PRIVATE frontends/shared)
+  add_test(NAME guest_scanout_present COMMAND test_guest_scanout_present)
 
   # boot_trace periodic BMPs are opt-in, with the legacy disable taking priority. This exercises the
   # exact environment-name lookup and registrar forwarding without constructing Vulkan or writing files.
@@ -1015,6 +1028,15 @@ if(TARGET prosper_core)
   # decode logic is verified on every platform even though the VEH caller is Windows-only.
   add_executable(test_x86_read_decode tests/test_x86_read_decode.cpp)
   add_test(NAME x86_read_decode COMMAND test_x86_read_decode)
+
+  # #2018: a fatal worker-thread fault report must describe one fault. Header-only snapshot of the
+  # handler's own siginfo/ucontext; POSIX signal contexts only (the test self-skips elsewhere).
+  add_executable(test_fault_context tests/test_fault_context.cpp)
+  # The contention arm spawns real threads. This target links no library, so unlike every other
+  # thread-using test here it inherits -pthread from nothing; name Threads::Threads explicitly
+  # (found above with prosper_core, whose existence gates this block).
+  target_link_libraries(test_fault_context PRIVATE Threads::Threads)
+  add_test(NAME fault_context COMMAND test_fault_context)
 
   # End-to-end AGC submit plus fixed args 7-9 in ReleaseMem/WaitRegMem. This is cross-platform so
   # Windows validates the real fence builders behind the generated import-ABI conformance test.

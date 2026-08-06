@@ -6723,7 +6723,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                          n == 31 ? " [further reports suppressed]" : "");
     }
     const bool presented = frame_ready && publish;
-    if (presented) present_write_frame(result.frame.storage, width, height);
+    if (presented) present_write_frame(result.frame.storage, width, height, result.frame.origin);
     if (timing_enabled) {
         const auto timing_done = TimingClock::now();
         auto ms = [](auto begin, auto end) {
@@ -6855,7 +6855,7 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height, bo
     }
     if (rendered.size() != static_cast<size_t>(width) * height * 4) return false;
     if (!publish) return false;
-    present_write_frame(rendered.storage, width, height);
+    present_write_frame(rendered.storage, width, height, rendered.origin);
     return true;
 }
 

@@ -21,7 +21,7 @@ Last updated: 2026-08-05
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 Frontend loop; no visual milestone yet | [#1871](https://github.com/mattias800/prosper/issues/1871) |
-| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🔬 4K opening logo sequence; frames stop before the title screen | [#1891](https://github.com/mattias800/prosper/issues/1891) |
+| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🔬 Full 4K opening sequence; the guest's own display buffer then goes black before the title screen | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K SEGA logo; the composite goes uniform before a title screen | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
@@ -49,7 +49,7 @@ Last updated: 2026-08-05
 | *The Forgotten City* | `PPSA03026` | Unreal Engine | 🚧 Title screen | [#1890](https://github.com/mattias800/prosper/issues/1890) |
 | *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
 | *Little Nightmares III* | `PPSA05143` | Unreal Engine 4 | 🚧 Boot splash sequence and title screen; most title frames carry a yellow tint | [#1893](https://github.com/mattias800/prosper/issues/1893) |
-| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Content streams and the engine submits real draws, then a declined GPU submit freezes every thread, so the display stays black | [#1894](https://github.com/mattias800/prosper/issues/1894) |
+| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Content streams and the engine submits real draws and composites frames, then a guest memory fault ends the run a few seconds in, before any title screen | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Health warning and title screen; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Title screen | [#1898](https://github.com/mattias800/prosper/issues/1898) |
@@ -108,12 +108,17 @@ The complete base game, update, and installed DLC reach the frontend loop, but n
 
 ## Sonic Frontiers — `PPSA03831`
 
+<p align="center"><img src="assets/screenshots/sonic-frontiers-sega-logo.png" alt="Sonic Frontiers — SEGA logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-middleware-credits.png" alt="Sonic Frontiers — middleware credits"></p>
 <p align="center"><img src="assets/screenshots/sonic-frontiers-opening-sequence.png" alt="Sonic Frontiers — opening logo sequence"></p>
 <p align="center"><img src="assets/screenshots/sonic-frontiers-sonic-team-logo.png" alt="Sonic Frontiers — Sonic Team logo"></p>
 
-A default launch reaches the game's own opening logo sequence, composited by the live renderer at
-3840×2160. Frame production then stops before a title screen is reached. See the
-[tracker](https://github.com/mattias800/prosper/issues/1891).
+A default launch reaches the game's whole opening sequence at 3840×2160 — the SEGA logo, the Cyber
+Space intro, the Sonic Team logo and the middleware credits. The title composites those into the
+display buffer it flips rather than through render passes, so publishing them needed the flipped
+buffer itself to become a present source. **No title screen is reached:** from about 140 s the
+display buffer the title keeps flipping is itself black, and prosper reads and publishes it fresh on
+every flip. See the [tracker](https://github.com/mattias800/prosper/issues/1891).
 
 ## Sonic Racing: CrossWorlds — `PPSA08804`
 
@@ -225,9 +230,9 @@ yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues
 
 ## R-Type Delta: HD Boosted — `PPSA26414`
 
-<p align="center"><img src="assets/screenshots/rtype-delta-rung1-logo-and-opening-movie.png" alt="R-Type Delta — Clear River Games logo and the opening movie"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-opening-movie-colour.png" alt="R-Type Delta — the opening movie's R-9 hangar shot in full colour"></p>
 
-The Clear River Games publisher logo and the full opening movie — the R-9 fighter in its hangar — render live at 1920×1080 from the real GPU command stream. Colours are wrong: greys render green and the image carries a magenta cast ([#2005](https://github.com/mattias800/prosper/issues/2005)). After the movie every frame collapses to a single colour while the frame loop keeps advancing ([#2006](https://github.com/mattias800/prosper/issues/2006)), so the title screen is not reached.
+The Clear River Games publisher logo and the full opening movie — the R-9 fighter in its hangar — render live at 1920×1080 from the real GPU command stream, in full colour. After the movie every frame collapses to a single colour while the frame loop keeps advancing ([#2006](https://github.com/mattias800/prosper/issues/2006)), so the title screen is not reached.
 
 Reaching this needs the game's files **evicted from the host page cache** first, which takes one command and no change to how the title is launched:
 
@@ -319,11 +324,15 @@ to maximum, which reads as a flat yellow background under otherwise-correct cont
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
 
 The title is Unreal Engine 4.27 with IoStore packaging. It boots into a native Linux/Vulkan run, completes
-engine bootstrap, and now streams real content: 394 reads served from the 8.49 GB IoStore container, real GPU
-draws, and nine composited frames. Then prosper declines one GPU submit it cannot order safely, and because the
-whole submit is discarded the completion the guest is waiting for is never written — all ninety guest threads
-park, from the game thread's render fence down through the render and RHI threads. Every composited frame is
-black, so no screenshot is published. See the [tracker](https://github.com/mattias800/prosper/issues/1894).
+engine bootstrap, and streams real content from the 8.49 GB IoStore container. The engine reaches its frame loop:
+over a thousand draws, hundreds of compute dispatches, and composited frames delivered to the display. The
+declined-GPU-submit freeze that used to stop it here is gone, fixed by
+[#1987](https://github.com/mattias800/prosper/pull/1987). What ends the run now is a guest memory fault a few
+seconds into the boot — on the render thread, the RHI thread or a worker pool thread depending on the run, and in
+some runs the game's own allocator catches it first — far too early for a title screen, so nothing beyond the
+engine's own startup is reached. The frames delivered before the fault are a single flat colour, alternating
+black and white, while intermediate render targets do carry real image content. See the
+[tracker](https://github.com/mattias800/prosper/issues/1894).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
 

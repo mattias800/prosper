@@ -100,6 +100,16 @@ static std::string capture_stderr(Fn&& fn) {
 }
 
 int main() {
+    // Unbuffered stdout, so a crash cannot erase the evidence of where it happened.
+    // ctest captures a test's stdout through a pipe, which makes libc fully buffer it (4 KiB
+    // typically) rather than line-buffer it as it would to a terminal. This whole file's output
+    // is well under that, so on a SegFault the buffer is discarded unflushed and ctest reports
+    // "***Exception: SegFault" with NOTHING captured -- even under --output-on-failure. That is
+    // exactly what #2048 recorded on a Windows MinGW job: one occurrence, zero evidence, and a
+    // rerun of the identical commit passed, so the next occurrence is the only chance to learn
+    // anything. With this line the last [ok] printed before the fault names the surviving
+    // checkpoint, which turns a bare "it crashed" into "it crashed after check N".
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     printf("== test_apr_registry ==\n");
     CHECK(set_test_env("PROSPER_FILELOG", "1"), "APR read diagnostics enabled for regression");
     prosper_apr_reset_for_test();

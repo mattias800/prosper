@@ -798,6 +798,88 @@ void avp_register_frame_layout(uint8_t* base, size_t bytes, uint32_t pitch) {
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(base)), bytes, pitch);
 }
 
+// AvPlayerVideoEx publishes `width` as the extent the crop offsets TRIM, not as the visible picture.
+//
+// The load-bearing evidence is that three shipping titles run on retail PS5 hardware while spelling
+// "how wide is the visible picture" two different ways, so Sony's own publication must satisfy both
+// at once. Two of the three fields are already pinned by prior live evidence:
+//
+//   pitch = 2048   forced by R-Type Delta, which builds its luma T# with `pitch` AS the descriptor
+//                  width and requires agc_footprint == pitch*height (#1814, R_TYPE_DELTA_STATUS.md).
+//   crop_right     forced by GRIS: #1393 padded the pitch with a zero crop and exposed the padded
+//     = 128        columns as a right-edge strip, so the crop must describe that padding.
+//
+// With those pinned, ArcRunner's spelling leaves exactly one free value:
+//
+//   GRIS       visible = pitch - crop_left - crop_right  ->  2048 - 0 - 128 = 1920   (correct)
+//   ArcRunner  visible = width - crop_left - crop_right  ->  1920 - 0 - 128 = 1792   (WRONG)
+//
+// so `width` must be 2048. Measured on ArcRunner (PPSA21406, #2011): the guest sizes its movie luma
+// T# from the published pitch (2048x1080, chroma 1024x540 — half of it) and, while width published
+// the visible 1920, sized every converted movie surface 128 columns short at 1792x1080. Publishing
+// width == pitch satisfies both spellings at once and leaves GRIS and R-Type unchanged.
+//
+// The four crop field names mirror H.264's frame_crop_{left,right,top,bottom}_offset, and that is an
+// ANALOGY, not the evidence: H.264's coded extent is macroblock-aligned (a 1920x1080 stream codes
+// 1920x1088 with crop_bottom, crop_right=0), never memory-pitch-aligned, so the SPS convention alone
+// would argue for width=1920/crop_right=0. The real statement is that the crop fields are the only
+// ABI channel able to describe buffer padding, so that is what this contract uses them for.
+//
+// `aspect` stays the VISIBLE display ratio: it is not part of the crop arithmetic, and a consumer
+// reads it to letterbox, never to size a surface.
+//
+// `width == pitch` is only meaningful because every path here is 8-bit (luma_bd/chroma_bd below):
+// `pitch` is a BYTE stride and `width` a PIXEL count, and they coincide only at 1 byte per luma
+// sample. A 10-bit/P010 source would need the pixel pitch, not the byte pitch, computed here.
+//
+// CONFIDENCE: MED — derived from three independent shipping consumers that all work on retail
+// hardware. No Sony header was consulted. The counter-model this cannot exclude is that
+// AvPlayerVideoEx merely EXTENDS AvPlayerVideo (whose `width` is unambiguously visible) and Sony's
+// crop fields describe bitstream cropping rather than buffer padding.
+bool avp_fill_video_ex(AvpVideoEx& out, uint32_t visible_w, uint32_t visible_h, uint32_t pitch,
+                       double framerate) {
+    out = {};
+    // Every current caller derives `pitch` from the same width it passes, so this cannot trip today.
+    // It is a guard rather than an assumption because the underflow would be silent and guest-visible:
+    // crop_right_offset is unsigned, so pitch < visible_w publishes ~4 G and every consumer that
+    // subtracts it gets a nonsense extent.
+    //
+    // FAIL-VISIBLE rather than clamping. Clamping to `visible_w` looks like the safe repair and is the
+    // more dangerous of the two: the buffer was staged at the REAL pitch, so publishing a larger row
+    // stride with crop_right = 0 tells a guest that trusts it to read past the end of every row, and
+    // the extents it gets are plausible enough that nobody notices. The ~4 G crop is at least absurd
+    // on sight. Since the branch is unreachable from any current caller, refusing costs nothing and
+    // keeps a future caller's mistake loud instead of silently corrupting its sampling.
+    if (pitch < visible_w) {
+        fprintf(stderr,
+                "[avp] REFUSING AvPlayerVideoEx: pitch %u < visible width %u — the staged surface and "
+                "the published extent disagree; frame not published\n",
+                pitch, visible_w);
+        return false;
+    }
+    out.width = pitch;                 // the extent the crop offsets trim
+    out.height = visible_h;            // prosper stages no padded rows
+    out.aspect = visible_h ? static_cast<float>(visible_w) / static_cast<float>(visible_h) : 0.0f;
+    out.crop_right_offset = pitch - visible_w;
+    out.pitch = pitch;
+    out.luma_bd = 8;
+    out.chroma_bd = 8;
+    out.framerate = framerate;
+    return true;
+}
+
+// The byte values the pitch padding is filled with, and why they are not 0.
+//
+// `Y=0, U=V=0` is NOT black in either BT.601 or BT.709, limited or full range: it converts to roughly
+// (0, 136, 0) — mid green. Since #2011 publishes `width` as the CODED extent, a consumer that reads
+// `width` and ignores the crop offsets samples the padded columns, and zero-filled padding would draw
+// a bright green stripe down the right edge of every movie frame. Limited-range black is `Y=0x10`
+// with `U=V=0x80`, which is what the decoders themselves emit for a black frame (measured on
+// ArcRunner's intro movie with PROSPER_DUMP_RAWTEX), so padding filled this way is indistinguishable
+// from the picture's own black and costs exactly the same memset.
+constexpr uint8_t AVP_PAD_LUMA = 0x10;
+constexpr uint8_t AVP_PAD_CHROMA = 0x80;
+
 void avp_release_frame_storage(AvpPlayer& player) {
     if (!player.frame.empty())
         gpu::unregister_guest_linear_texture_layout(
@@ -838,20 +920,21 @@ bool avp_stage_video(AvpPlayer& player, const prosper::video::VideoFrame& frame,
         dst = avp_frame_storage(player, bytes, pitch);
     }
     if (!dst) return false;
-    // Copy visible pixels and clear only the padded tail. Clearing the entire frame before copying
+    // Copy visible pixels and fill only the padded tail. Filling the entire frame before copying
     // it would double memory traffic on every decoded frame; the crop still must not expose stale
-    // decoder bytes if a title deliberately samples beyond the valid image extent.
+    // decoder bytes if a title deliberately samples beyond the valid image extent. The fill is
+    // limited-range BLACK, not zero — see AVP_PAD_LUMA/AVP_PAD_CHROMA above.
     const size_t padding = static_cast<size_t>(pitch) - frame.width;
     for (uint32_t row = 0; row < frame.height; ++row) {
         memcpy(dst + static_cast<size_t>(row) * pitch,
                frame.y + static_cast<size_t>(row) * y_stride, frame.width);
         if (padding)
-            memset(dst + static_cast<size_t>(row) * pitch + frame.width, 0, padding);
+            memset(dst + static_cast<size_t>(row) * pitch + frame.width, AVP_PAD_LUMA, padding);
     }
     uint8_t* dst_uv = dst + static_cast<size_t>(pitch) * frame.height;
     for (size_t row = 0; row < uv_rows; ++row) {
         memcpy(dst_uv + row * pitch, frame.uv + row * uv_stride, frame.width);
-        if (padding) memset(dst_uv + row * pitch + frame.width, 0, padding);
+        if (padding) memset(dst_uv + row * pitch + frame.width, AVP_PAD_CHROMA, padding);
     }
     // Callback storage is registered before the first pull. Refresh it here because the basic API
     // retains its historical tight layout while GetVideoDataEx publishes the padded physical pitch.
@@ -874,7 +957,11 @@ bool avp_stage_synthetic(AvpPlayer& player, bool extended_layout,
         data = avp_frame_storage(player, need, pitch);
         if (!data) return false;
     }
-    memset(data, 0, need);
+    // Same reason as the padding fill: a zero-filled NV12 frame is mid green, not black. The
+    // synthetic path fabricates a blank frame, so it should fabricate a legitimately black one.
+    const size_t synth_y_bytes = static_cast<size_t>(pitch) * player.height;
+    memset(data, AVP_PAD_LUMA, synth_y_bytes);
+    memset(data + synth_y_bytes, AVP_PAD_CHROMA, need - synth_y_bytes);
     avp_register_frame_layout(data, need, pitch);
     return true;
 }
@@ -1268,6 +1355,11 @@ HLE(s_avp_getstreaminfo) { // s32 sceAvPlayerGetStreamInfo(handle, stream_id, ou
     if (a1 >= (p.has_audio ? 2u : 1u)) return 0x806a0001ull;
     *out = {}; out->type = a1 == 0 ? 1u : 2u;
     if (a1 == 0) {
+        // The basic AvPlayerVideo has NO pitch and NO crop fields, so its `width` must be the VISIBLE
+        // extent — there is no channel here through which a consumer could subtract padding. That is
+        // why it deliberately differs from the Ex struct's coded `width` (see avp_fill_video_ex): the
+        // two structs answer the same question through different field sets, and the basic path also
+        // stages tight rows to match.
         out->details.video.width = p.width; out->details.video.height = p.height;
         out->details.video.aspect = (float)p.width / (float)p.height;
     } else {
@@ -1289,12 +1381,8 @@ HLE(s_avp_getstreaminfoex) { // s32 sceAvPlayerGetStreamInfoEx(handle, stream_id
     if (a1 == 0) {
         uint32_t pitch = 0;
         if (!avp_video_pitch(p.width, pitch)) return 0x806a0001ull;
-        out->details.video.width = p.width; out->details.video.height = p.height;
-        out->details.video.aspect = (float)p.width / (float)p.height;
-        out->details.video.crop_right_offset = pitch - p.width;
-        out->details.video.pitch = pitch;
-        out->details.video.luma_bd = 8; out->details.video.chroma_bd = 8;
-        out->details.video.framerate = p.fps;
+        if (!avp_fill_video_ex(out->details.video, p.width, p.height, pitch, p.fps))
+            return 0x806a0001ull;
     } else {
         out->details.audio.channels = (uint16_t)p.audio_channels;
         out->details.audio.sample_rate = p.audio_rate;
@@ -1722,17 +1810,14 @@ HLE(s_avp_getvideodataex) {
             if (b->next_video(p.backend_id, vf)) {
                 uint8_t* staged = nullptr;
                 uint32_t pitch = 0;
-                if (avp_stage_video(p, vf, true, staged, pitch)) {
+                // Publish the frame only if its metadata is publishable: a refused fill would
+                // otherwise hand the guest a staged pointer described by a zeroed AvPlayerVideoEx.
+                if (avp_stage_video(p, vf, true, staged, pitch) &&
+                    avp_fill_video_ex(fi->details.video, vf.width, vf.height, pitch, p.fps)) {
                     fi->p_data = staged;
                     fi->timestamp = vf.pts_us / 1000;
                     p.last_ts_ms = fi->timestamp;
                     p.seek_deliver = false;
-                    fi->details.video = {}; fi->details.video.width = vf.width; fi->details.video.height = vf.height;
-                    fi->details.video.aspect = vf.height ? (float)vf.width / (float)vf.height : 0.0f;
-                    fi->details.video.crop_right_offset = pitch - vf.width;
-                    fi->details.video.pitch = pitch;
-                    fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
-                    fi->details.video.framerate = p.fps;
                     result = 1;
                 }
             } else if (b->eof(p.backend_id) && !p.stop_fired) {
@@ -1741,15 +1826,10 @@ HLE(s_avp_getvideodataex) {
         } else if (p.synthetic && p.poll < avp_synth_frames()) {
             uint8_t* staged = nullptr;
             uint32_t pitch = 0;
-            if (avp_stage_synthetic(p, true, staged, pitch)) {
+            if (avp_stage_synthetic(p, true, staged, pitch) &&
+                avp_fill_video_ex(fi->details.video, p.width, p.height, pitch, p.fps)) {
                 fi->p_data = staged; fi->timestamp = p.poll * 33ull;
                 p.last_ts_ms = fi->timestamp;
-                fi->details.video = {}; fi->details.video.width = p.width; fi->details.video.height = p.height;
-                fi->details.video.aspect = (float)p.width / (float)p.height;
-                fi->details.video.crop_right_offset = pitch - p.width;
-                fi->details.video.pitch = pitch;
-                fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
-                fi->details.video.framerate = p.fps;
                 p.poll++; result = 1;
             }
         } else if (!p.stop_fired) {

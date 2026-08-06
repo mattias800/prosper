@@ -125,6 +125,57 @@ Requires **GNU binutils** `objdump`: it disassembles a raw blob with `-b binary`
 disassembly rather than trusting the binary's presence, accepts Homebrew's `gobjdump`, and honours
 `$OBJDUMP`. The ctest skips cleanly when no capable objdump exists.
 
+### `--all-nids` — which Sony answers does this title depend on *at all*?
+
+`--nid` asks about one function. `--all-nids` inverts the question and classifies **every** import in
+one pass, which is the bound a *registered-but-mismodelled return value* investigation needs and
+cannot get any other way. An absence check (the `PROSPER_PROGRESS_UNIMPL` table) cannot see a handler
+that is registered and answers wrongly — the call happens, so nothing is missing. A runtime
+return-value histogram says what prosper returned, not whether the guest looked. This says which call
+sites *can* be affected by an answer, so the ones that cannot are struck off before any boot.
+
+```bash
+python3 tools/re/nid_gate_scan.py <DUMP_ROOT>/PPSA05325-app0/eboot.bin \
+    --all-nids --names ../PS5-3.20_Libs --min-gated 1
+```
+
+Rows sort by gated call sites descending, so the head of the table is libc, and the trailing `#`
+block is the part to read first:
+
+```text
+Ovb2dSJOAuE  strcmp                libSceLibcInternal  sites=981 gated=973 forward=7 nonzero=972 …
+…
+fMP5NHUOaMk  sceSysmoduleIsLoaded  libSceSysmodule     sites=5   gated=5   const=1 nonzero=4
+…
+# <path>: 536 imported NIDs are called; 247 shown at --min-gated=1
+#   247 gated, 157 ignored-only (cannot matter), 132 unresolved (>=1 forward/undecodable window
+#   — NOT cleared, read by hand)
+#   site buckets: alu-gate=125 const=1 forward=3445 ignored=14432 nonzero=3440 other-cmp=166
+#                 undecodable=2699
+```
+
+**Not-gated is not the same as cleared, and the summary says so on purpose.** `ignored` is the only
+bucket that means an answer cannot matter at that site; `forward` explicitly needs a look by hand and
+`undecodable` is a void sample. A two-way "called / gated" split invites the reading that everything
+below the cut is struck off — here that would wrongly retire 132 rows, and 11.1% of all windows are
+undecodable. The three-way split plus the site-bucket totals make it impossible to mistake the table
+for a clean partition.
+
+`--names` points at the gitignored PS5 firmware `genstub.py` library dump and is **symbolication
+only** — an unlabelled NID is still scanned and still reported, so a missing dump costs names, never
+coverage; a directory with no `sprx_dlsym` lines is rejected rather than silently producing an
+all-`?` table. `--min-gated N` hides imports with fewer than N gated sites; the summary always states
+the unfiltered total, so a filtered table cannot be mistaken for the whole one either.
+
+The enumerator accepts a dynsym name only when exactly 11 characters precede the first `#`, searching
+no further than the name's own NUL, because every relaxation of that rule fails silently — a C++
+mangled name pulled in as a phantom "import" reports zero call sites and reads as a clean negative, a
+dropped real import shrinks a census whose whole purpose is exhaustiveness, and an unclamped `#`
+search lets a name with no `#` borrow the next strtab string's. `test_nid_gate_scan.py` pins all
+three with a synthetic symbol table. Note the rule does **not** separate imports from exports (PS5
+exports carry the same shape) — what removes exports is the JMPREL/call-site filter, since an export
+has no jump slot bound to it.
+
 ## `pak_index.py` — turn a UE4 `.pak` byte offset into an asset name
 
 A UE4 title on PS5 streams content through the Ampr/APR async-read path, and `PROSPER_FILELOG=1`
