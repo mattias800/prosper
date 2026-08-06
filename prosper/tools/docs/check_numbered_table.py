@@ -77,6 +77,13 @@ What ARITY specifically cannot see, stated so silence is not read as coverage:
   * Any pipe run with no delimiter row -- a fragment has no header to be measured against, so its
     rows are unchecked. The structure class reports the fragment itself when it abuts a real table
     above it, but an isolated delimiter-less pipe block is invisible to every class here.
+  * Tables whose rows have NO LEADING PIPE (`a | b` / `--- | ---`), and tables inside a BLOCKQUOTE
+    (`> | a | b |`). GitHub renders both as real tables and truncates them exactly the same way,
+    and `parse_tables` sees neither, because it requires a row to start with `|`. Both are real
+    false negatives rather than judgement calls; there are zero instances in the corpus today,
+    which is the only reason they are recorded here instead of fixed. Note the shape of this
+    entry: it is trap 112's own rule -- a gate's silence is only evidence about the class it
+    inspects -- applied to trap 112's own gate (#2116 review).
   * Content INSIDE a cell. A pipe that is correctly escaped is counted as text and nothing asks
     whether `\|` was what the author meant; equally, a cell count that matches the header proves
     nothing about the cells being in the right ORDER or the right columns.
@@ -125,28 +132,38 @@ DELIMITER = re.compile(r"^\s*\|[\s:|-]+\|?\s*$")
 LEADING_NUMBER = re.compile(r"^\s*\|\s*(\d+)\s*\|")
 
 
+ESCAPED_PIPE = re.compile(r"(?<!\\)\|")
+
+
 def delimiter_pipes(line: str) -> list[int]:
     """Indices of every `|` in `line` that GFM treats as a CELL BOUNDARY.
 
-    The only thing that exempts a pipe is a backslash escape, and it is the PARITY of the
-    backslash run that decides: `\\|` is an escaped pipe (text), while `\\\\|` is a literal
-    backslash followed by a real delimiter. A lookbehind for a single backslash gets the second
-    case wrong, so this walks the string and lets a backslash consume the character after it.
+    The rule is exactly "a pipe is a delimiter unless the IMMEDIATELY PRECEDING character is a
+    backslash" -- no backslash counting. cmark-gfm splits table rows into cells in a pre-inline
+    pass that only looks at the one character before the pipe; CommonMark's parity rule for
+    backslash escapes belongs to the *inline* pass, which never runs on a cell boundary.
+
+    This is measured, not reasoned. Rows `b|c` through `b\\\\\\\\|c` (0 to 4 backslashes) were put
+    through GitHub's own renderer, with the 0-backslash row as a positive control:
+
+        0 backslashes  ->  splits, trailing cell discarded   (control: the instrument works)
+        1 backslash    ->  one cell, renders `b|c`
+        2 backslashes  ->  one cell, renders `b|c`      <-- a parity rule predicts a SPLIT here
+        3 backslashes  ->  one cell, renders `b\\|c`
+        4 backslashes  ->  one cell, renders `b\\|c`
+
+    So every backslash run of length >= 1 escapes the pipe for splitting purposes. Only the
+    rendered *text* differs above 2, because the inline pass then applies CommonMark escaping to
+    what the split left behind -- and cell ARITY, which is all this measures, is unaffected.
+
+    An earlier revision of this function counted parity and therefore reported `| a | b\\\\|c | d |`
+    as a truncated row, which GitHub renders perfectly (#2116 review).
 
     Nothing else protects a pipe -- not an inline code span, not emphasis, not a link title --
     because GFM performs this split BEFORE any inline parsing. That is the entire defect this
     exists to catch (#2108).
     """
-    out: list[int] = []
-    i = 0
-    while i < len(line):
-        if line[i] == "\\":
-            i += 2  # a backslash consumes whatever follows it, pipe or not
-            continue
-        if line[i] == "|":
-            out.append(i)
-        i += 1
-    return out
+    return [m.start() for m in ESCAPED_PIPE.finditer(line)]
 
 
 def cell_bounds(line: str) -> list[int]:

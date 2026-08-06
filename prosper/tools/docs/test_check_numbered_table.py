@@ -146,10 +146,23 @@ run("an unescaped pipe in a code span truncates the row",
     expect_text="SILENTLY DISCARDS")
 
 # The message must point at the offending CHARACTER, not merely report a count -- a 3,000-character
-# trap row has no other way to be found. Pins the column of the first stray boundary.
-run("the message locates the first stray pipe",
+# trap row has no other way to be found, and locating it is this feature's whole ergonomic claim.
+#
+# The COLUMN NUMBER is what pins it. An excerpt substring does not: on a short fixture the 46-char
+# window still contains the right text no matter which boundary it centres on, so mutating
+# `bounds[expected - 1]` to `bounds[0]` left an excerpt-only assertion green (#2116 review). The
+# stray pipe here is the one inside the code span, at 1-based column 19; `bounds[0]` would say 5.
+run("the message locates the first stray pipe by column",
     "| # | Instrument | How it lied |\n|---|---|---|\n| 1 | x | so `cmd | tail` discards it |\n",
-    want_problems=True, expect_text="`cmd | tail`")
+    want_problems=True, expect_text="First stray boundary at column 19: ")
+
+# Same assertion on a row long enough that a wrong boundary choice cannot coincidentally land in
+# the same excerpt window -- the short fixture above cannot distinguish them by excerpt alone.
+run("the located column is the stray pipe, not the first pipe",
+    "| # | Instrument | How it lied |\n|---|---|---|\n| 1 | x | "
+    + "padding text that is comfortably wider than the excerpt window. " * 3
+    + "tail `a | b` end |\n",
+    want_problems=True, expect_text="at column 211: ")
 
 # Trap 87's shape, and a DIFFERENT defect from the code-span one: a row that grows a genuine extra
 # column the table's header never declared. Its `#1891, #1968` evidence cell was discarded whole.
@@ -186,16 +199,29 @@ run(r"an escaped pipe is content, not a boundary",
     "| # | Instrument | How it lied |\n|---|---|---|\n| 1 | x | so `cmd \\| tail` discards it |\n",
     want_problems=False)
 
-# Backslash PARITY, not mere presence. `\\|` is a literal backslash followed by a REAL delimiter,
-# so this row genuinely has an extra cell. A `(?<!\\)\|` lookbehind -- the obvious implementation,
-# and the one the issue suggested -- reads the pipe as escaped and passes this silently.
-run(r"a doubled backslash does not escape the pipe after it",
+# A backslash RUN of any length escapes the pipe: the rule is "unless the immediately preceding
+# character is a backslash", with no parity counting. cmark-gfm splits cells in a pre-inline pass
+# that inspects exactly one character; CommonMark's parity rule governs the inline pass, which
+# never runs on a cell boundary.
+#
+# An earlier revision of this checker counted parity and pinned the OPPOSITE of this case, on the
+# reasoning that `\\|` is a literal backslash plus a real delimiter. GitHub's renderer says
+# otherwise -- 0 through 4 backslashes were put through it, and every run of length >= 1 keeps the
+# row intact while 0 splits it. Reasoning about the case instead of measuring it is what produced
+# the wrong rule; the oracle was already open for the single-backslash case (#2116 review).
+run(r"a doubled backslash still escapes the pipe after it",
     "| x | y |\n|---|---|\n| a | b\\\\|c |\n",
-    want_problems=True, want_count=1, want_lines=[3])
+    want_problems=False)
 
-run(r"a single backslash does escape the pipe after it",
+run(r"a single backslash escapes the pipe after it",
     "| x | y |\n|---|---|\n| a | b\\|c |\n",
     want_problems=False)
+
+# ...and the unescaped form of the same row must still fail, or the two cases above would be
+# satisfied by a checker that had simply stopped detecting anything.
+run(r"the same row unescaped is still a defect",
+    "| x | y |\n|---|---|\n| a | b|c |\n",
+    want_problems=True, want_count=1, want_lines=[3])
 
 # Leading and trailing pipes are optional decoration in GFM and do not create empty cells, so
 # `| a | b | c |` is three cells and not five. Note WHY this needs the count pinned rather than a
