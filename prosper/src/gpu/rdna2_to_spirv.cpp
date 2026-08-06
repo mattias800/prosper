@@ -3134,8 +3134,6 @@ bool sopp_is_noop(const Rdna2Inst& in) {
     }
 }
 
-bool vopc_is_cmpx(uint32_t opcode);   // defined below (register-lifetime helpers)
-
 // Is SGPR `R` provably DEAD at pc `target` — i.e. redefined before any read on the fall-through, so a
 // write to it inside a divergent (execz) block linearized before `target` cannot be observed by later
 // code? Sound/conservative: we only reason across the simple wave-uniform ALU formats whose SGPR source
@@ -3389,8 +3387,6 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
     }
     return safe;
 }
-
-bool vopc_is_cmpx(uint32_t opcode);
 
 namespace {
 uint32_t scalar_write_width(const Rdna2Inst& in);
@@ -3903,15 +3899,6 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
         default:
             return 0;
     }
-}
-
-bool vopc_is_cmpx(uint32_t opcode) {
-    return (opcode >= 0x10 && opcode <= 0x1f) ||
-           (opcode >= 0x30 && opcode <= 0x3f) ||
-           (opcode >= 0x90 && opcode <= 0x9f) ||
-           (opcode >= 0xb0 && opcode <= 0xbf) ||
-           (opcode >= 0xd0 && opcode <= 0xdf) ||
-           (opcode >= 0xf0 && opcode <= 0xff);
 }
 
 bool instruction_may_change_exec(const Rdna2Inst& in) {
