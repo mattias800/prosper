@@ -352,7 +352,27 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   produced by forced guest-state diagnostics may illustrate an investigation but is not acceptance evidence.
   Run the strongest relevant local checks and wait for every applicable required CI check. Before
   merging, synchronize with the live target branch when needed, inspect the resulting diff, run `diff --check`,
-  and address every known correctness concern. An agent may merge only when the user or task explicitly
+  and address every known correctness concern.
+  - **Exception — a documentation-only PR may be merged immediately, without waiting for CI.** If the diff
+    touches nothing but `.md` files, there is no build, no test and no snapshot that CI can tell you
+    anything about, so waiting on it only slows the queue. Merge it.
+    **Run the docs gate locally first** — it is the one check that can actually fail on a docs diff, and
+    it takes a second:
+    ```bash
+    python3 prosper/tools/docs/check_numbered_table.py --sequential \
+        --table-header Instrument prosper/docs/GAME_COMPAT_ORCHESTRATION.md
+    git ls-files '*.md' -z | xargs -0 python3 prosper/tools/docs/check_numbered_table.py
+    ```
+    This matters most for `GAME_COMPAT_ORCHESTRATION.md`'s numbered tables, where the gate requires rows
+    to be unique, ascending **and gapless**: several lanes append to them concurrently, so a PR that was
+    contiguous when written can be gapped by the time it merges (#2087 sat conflicting for exactly this).
+    Confirm the diff really is `.md`-only — `git diff --name-only origin/master...HEAD | grep -v '\.md$'`
+    should be empty. The exception is about the *diff*, not the intent; one stray file makes it an
+    ordinary PR again.
+    **This waives the CI wait only.** It does not waive independent review where review is warranted — a
+    docs PR that rewrites a `## Ruled out` row, a reproduction route, or a numbered table's semantics can
+    be just as wrong as code, and no CI job has ever been able to see that. It also does not waive
+    `diff --check`, the trap-41 deletion check, or the session-trailer gate. An agent may merge only when the user or task explicitly
   authorizes it. Each agent owns its PR through merge and branch cleanup: before claiming or starting new work,
   merge the current PR after all gates pass, or explicitly close it with a clear rejected/superseded explanation.
   Do not accumulate floating PRs or silently hand merge ownership to another agent. The PR author owns
