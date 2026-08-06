@@ -1,6 +1,17 @@
 // reallocalign (OGybVuPAhAY) must resize a block AND give the result the requested extended
 // alignment (#2185).
 //
+// KNOWN GAP, so nobody reads these arms as covering more than they do: the checks below detect an
+// over-WRITE (the copy bound too large in the destination direction) by two mechanisms — the slack
+// guard for a sub-fatal overrun, and glibc's own heap check for a gross one. **Neither detects an
+// over-READ.** Dropping the cap in the source direction (`memcpy(dst, src, size)`) over-reads past
+// the source block on the grow arm, and every assertion here still passes: no out-of-bounds write
+// occurs, the copied prefix is correct, and the shrink arm is unaffected. That direction is the more
+// on-point half, since bounding a read out of a block whose request size is unrecoverable is the
+// whole reason malloc_usable_size appears in the implementation. Detecting it needs a guard page,
+// i.e. abandoning posix_memalign and the real allocation path — deliberately not done. **ASan catches
+// it cleanly; run this suite under a sanitizer if you change the copy.**
+//
 // Unregistered, this NID fell to the dispatcher's default 0. For an allocator that is a NULL
 // return, which a caller reads as OOM — a false FAILURE, the mirror of #2081's false successes:
 // a title treating allocation failure as fatal aborts, and one that retries loops. So the arm that
@@ -101,6 +112,14 @@ int main() {
                 // the destination's own slack. That slack is readable by the same argument the
                 // implementation relies on, so this checks a defined region.
                 const size_t usable = USABLE(small);
+                // Make the guard's own vacuity VISIBLE. The window is non-empty only because of the
+                // constant chosen: glibc's size ladder is 24, 40, 56, 72, ... so usable(64) = 72 and
+                // eight bytes are checkable. Pick kNew = 72, 88 or 104 and the loop body never runs
+                // while still printing [ok]. It is genuinely empty on macOS (malloc_size(64) == 64),
+                // on musl, and under ASan (which intercepts and returns the REQUESTED size) — so on
+                // those configurations this arm reports nothing and must say so rather than pass.
+                CHECK(usable > kNew,
+                      "the over-copy guard has a non-empty window (else the arm below is vacuous)");
                 bool slack_clean = true;
                 for (size_t i = kNew; i < usable && slack_clean; ++i) slack_clean = small[i] != 0xC3;
                 CHECK(slack_clean,
