@@ -595,6 +595,24 @@ int main() {
         const auto deduped = parse_reg_watch("0x202,0x202,Cx:0x202");
         CHECK(deduped.size() == 1,
               "a repeated register is watched once so one write reports one line");
+
+        // `Cx:*` censuses a whole class. Without it, "this title never writes register X" cannot be
+        // told apart from "X was not on the list I guessed", which is the question the watch exists
+        // to answer.
+        const auto whole = parse_reg_watch("Sh:*");
+        CHECK(whole.size() == 1 && whole[0].all_offsets &&
+                  whole[0].reg_class == RegClass::Sh,
+              "a class-qualified * watches every offset of that class");
+
+        CHECK(parse_reg_watch("*").empty(),
+              "a bare * names no register file and is skipped like any unparsable entry");
+
+        const auto mixed = parse_reg_watch("Cx:*,Cx:0x202");
+        CHECK(mixed.size() == 2 && mixed[0].all_offsets && !mixed[1].all_offsets,
+              "a whole-class watch and a single offset of the same class are distinct entries");
+
+        const auto both = parse_reg_watch("Cx:*,Cx:*");
+        CHECK(both.size() == 1, "a repeated whole-class watch is deduplicated");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
