@@ -2306,8 +2306,18 @@ bool post_submit_visibility_enabled() {
 }
 
 bool eop_write_sync() {
-    static const bool v = [] { const char* e = getenv("PROSPER_EOP_WRITE_SYNC");
-                               return e && strtol(e, nullptr, 0) != 0; }();
+    // #1226: announce the arm. This is an A/B lever whose whole purpose is to be compared against the
+    // default, and a result from it was already recorded as "non-discriminating, not negative" partly
+    // because nothing in the log distinguished an armed run from an unarmed one. A lever nobody can
+    // witness cannot carry a null. Printed once, only when on, so the default path is untouched.
+    static const bool v = [] {
+        const char* e = getenv("PROSPER_EOP_WRITE_SYNC");
+        const bool on = e && strtol(e, nullptr, 0) != 0;
+        if (on)
+            fprintf(stderr, "[agc] EOP-WRITE-SYNC ARMED: completion writes land inside the submit "
+                            "call, not through the post-submit worker\n");
+        return on;
+    }();
     return v;
 }
 struct PendWrite {

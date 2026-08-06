@@ -584,6 +584,37 @@ a label protocol and nothing in an allocator free list ever holds a code-image p
 for exactly that class. It is **not yet evidence of anything**: three armed runs recorded
 `declines=0`, because the image-vptr class did not occur in them — non-discriminating, not negative.
 
+**The deferred completion-write model is not what puts the write in reallocated memory.**
+`PROSPER_EOP_WRITE_SYNC=1` makes completion writes land inside the submit call instead of through the
+post-submit worker, and it now announces `[agc] EOP-WRITE-SYNC ARMED` so the arm is witnessable — the
+earlier result from this lever was recorded as non-discriminating partly because nothing in the log
+separated an armed run from an unarmed one. Five armed runs, lever witnessed on every one:
+
+| | live-pointer stomps / sub-qword writes examined | module-image (`hi=0x4`) stomps |
+| --- | --- | --- |
+| default (deferred) | 1280 / 5091 = **25.1%** | 1 run in 6 |
+| `PROSPER_EOP_WRITE_SYNC=1` | 512/1975, 512/1971, 256/965 = **25.9–26.5%** | **4 runs in 5** |
+
+The rate does not move, and the vptr class occurs *inside* the armed arm — so the arm carries its own
+positive control and the null is readable. Two of the sync runs stomped the **same** vtable
+`0x4170033e8` (`eboot+0x70033e8`) at different destinations, and a third stomped `0x41700f1e8`, the
+same vtable as the baseline `AudioMixerRende` fault: this is one recurring class of C++ object, not a
+scattered accident.
+
+The sharpest form of what remains comes from the cleanest of those hits, whose label had **no prior
+generation at all**:
+
+```text
+[agc] LIVEPTR-STOMP hi=0x4#1 kind=DMA-imm dst=0x2020e31e40 pre=0x41700f1e8 (NON-HEAP) val=0x0
+      -> 0x400000000 after-mapped=0 t=8745ms | events(total=3): dmaB@8408/f31 relB@8408/f31 waitB@8408/f31
+```
+
+The guest itself named `0x2020e31e40` as a label — `dmaB` is recorded from `hle_agc.cpp` at the
+guest's own AGC builder call, so this is not a prosper decode error — and 337 ms later, at submit, the
+block held a vtable pointer. **The guest builds a label into a 0x20-byte block and then frees and
+reallocates that block before the command buffer referencing it is submitted.** Whatever gates that
+free on real hardware is the thing prosper is modelling wrongly; the label write is the messenger.
+
 **Two instrument facts that shaped this and will bite the next arm.**
 
 - The trip's detail schedule is **per `pre >> 32` bucket**, not global. On a shared ordinal the one
@@ -639,6 +670,7 @@ Do not re-derive these without contradictory new evidence.
 | The `AudioMixerRende` `rip=0x0` jump is an unrelated audio failure, retained only as a competing terminal path | It is the same defect, and on current master it is the most frequent one — 4 of 9 runs here, against 3 allocator/`RHIThread` and 1 `AgcCleanupThrea`. `rax=0x400000001` is the object's **vptr**, read by `mov rax,[rdi]` one instruction before the faulting `call [rax+0x20]`, and it is byte-for-byte what prosper's two label writes made of `eboot+0x700f1e8`. | #1226 |
 | A rung-1 arm can be bounded like the fault arms, because the fault is what stops the movie | The fault is necessary but not the whole arithmetic. `sceAvPlayerGetVideoDataEx` advances the movie one frame per guest call (`next_video()` pops the decode queue with no media-clock test), and a bounded run measured **31 calls / 31 successes** with **no** other AvPlayer call — so the queue is never starved and the rate is the guest's poll rate, ~2.6 Hz. Reaching video frame 150 needs ~150 polls, about a minute of wall time. Count `video-ex` calls, never seconds. | #1226 |
 | `PROSPER_NONHEAP_PTR_GUARD=1` (decline a sub-qword label write over a mapped non-heap pointer) does or does not remove the fault | Neither. Three armed runs recorded `declines=0`: the image-vptr class did not occur in them, so the arm is **non-discriminating**, exactly like the three void arms above. The lever announces itself and counts, so this is a readable null rather than a silent one. | #1226 |
+| prosper's **deferred** completion-write model (#312's post-submit worker) is what makes a label write land in memory the guest has reallocated — so `PROSPER_EOP_WRITE_SYNC=1` should remove it | It does not. Five armed runs with the lever now witnessed (`[agc] EOP-WRITE-SYNC ARMED`, added for this): the live-pointer stomp rate is **25.9–26.5%** of examined sub-qword writes against the default's **25.1%**, and the module-image vptr class occurs in **4 of 5** armed runs against 1 of 6 default runs — so the arm carries its own positive control rather than being another silent null. The cleanest hit has `events(total=3): dmaB@8408/f31 relB@8408/f31 waitB@8408/f31` and executes at 8745 ms, i.e. the guest named the block as a label and freed/reallocated it 337 ms later, before the referencing submit. Synchronous writes cannot help: the build→submit gap is the guest's own. | #1226 |
 | The `addr=(nil)` faults show that page `0x2100000000` is a **legitimately committed guest region whose contents prosper lost** — [#1944](https://github.com/mattias800/prosper/issues/1944) reading 1, argued from "two *different* guest code sites first-touch the same 64 KiB page; a wild pointer would not repeat like that" | It is reading 2 (a wild read masked), and the repetition is a property of the value, not the mapping. `PROSPER_LAZY_COMMIT_STRICT=1` moves the fault to the loading instruction: `[lazy-commit] #1 DECLINED(strict) page=0x2100000000 addr=0x2100000041 access=read rip=0x41117e221`, then `sig=11 addr=0x2100000041 rip=eboot+0x117e221`. The load is `mov rdi,[r12+rcx*8]` / `mov rcx,[rdi+0x40]` with `rdi=0x2100000001`, and `0x40` is added **without masking the low bit**, so `rdi` is a plain corrupt pointer. **Any** `0x21000000xx` value lands in page `0x2100000000` — which is exactly the shape a heap pointer takes when its low dword is lost — so both recorded sites hitting that page is expected, not anomalous. Exactly one lazy-commit event occurs per affected run. Do not spend another arm treating the page as a commit-protocol gap on this title. | #1944, #1226 |
 | The `0x2100000001` that the terminal `addr=(nil)` fault dereferences is composed by prosper's own `RELEASE_MEM`/`WRITE_DATA` fence, the way `0x2000000001` is — and `ptr_like()`'s stale upper bound (exactly `0x2100000000`) is hiding that population from the tripwire and from both guards | The blind spot is **real but empty on this title**, on both branches. With the tripwire's report predicate widened to prosper's whole guest-VA window, one bounded run on `c9e2588e` ends at `FORGE-TRIP-TOTALS seen=256 narrow=256 wide_only=0`: none of the 256 reported candidates is wide-only, every one has `pre=0x2000000000`, and the absence of a `#512` totals line on the dense every-256 schedule bounds the run's population below 512. The sibling `REL1-LIVE` branch — a fence over a pre whose low dword is a real pointer half, which is what would turn a live `0x2100e05140` into exactly `0x2100000001` — was checked separately with `PROSPER_PTRLIKE_WIDE=1`, which arms both guards over the wide window and prints `PTRLIKE-WIDE ARMED` so the lever is witnessed: two runs, `SUSPECT-REL1-LIVE` count **0**, terminal fault unchanged. So prosper's label writes are excluded as the author of the value that terminates the run. Two limits: `report_suspect_write()` has emitted no line of any kind on this title across nine runs, so the `REL1-LIVE` zero has no in-run positive control (it is consistent with the REL1 population being homogeneous, not independently proven); and this does **not** clear the narrow window for other titles — it is still stale, and the lever exists to A/B flipping it. | #1226 |
 | `{small nonzero high dword, low dword ≤ 1}` is by itself a prosper-forge signature, so a value of that shape found in guest memory attributes the write to us | It is also **ordinary guest data**. A fault-time dump of a live guest table (`PROSPER_FAULTMEM=1`, register `r12`) shows 16-byte `{pointer, metadata}` entries whose metadata qword is a constant `0x0000000400000002`, interleaved with live pointers `0x2000e03840` / `0x2000e03830` / `0x2100e05140`. `0x400000001` — the value at the `AudioMixerRende` `rip=0x0` jump, and the one #1945's brief quotes — has that same `{4, n}` shape. Value-shape alone therefore cannot attribute a `<high>_0000000n` qword to a GPU write; only a write-side record (the attribution ring, or the forge tripwire's `pre`) can. | #1226, #1945 |
