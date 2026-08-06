@@ -2561,17 +2561,33 @@ namespace prosper {
 // #2139: Windows sibling. Same contract, but fault-safe: this half never dereferences a guest
 // pointer it has not proven writable, because a fault here kills the emulator rather than the
 // guest (same rule as k_ampr_write_address below). A slot that is not committed and writable is
-// skipped -- the submit still posts its completion event, which is the part the guest waits on.
+// skipped -- but the skip is REPORTED, not silent. The guest asked for a result and did not get
+// one, so if a title ever stalls waiting on that value the log is what points at this line; a
+// silent skip would leave it looking like the write happened. Bounded so a pathological caller
+// cannot flood the log. POSIX cannot reach this state: its store faults instead of skipping.
 static void apr_write_result_slot(uint64_t addr, uint64_t value) {
     MEMORY_BASIC_INFORMATION mbi{};
     constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY |
                                 PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    if (VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), &mbi, sizeof(mbi)) &&
+    const bool writable =
+        VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), &mbi, sizeof(mbi)) &&
         mbi.State == MEM_COMMIT && (mbi.Protect & kWritable) &&
         static_cast<uintptr_t>(addr) + sizeof(uint64_t) <=
-            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize) {
-        *reinterpret_cast<uint64_t*>(static_cast<uintptr_t>(addr)) = value;
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    if (!writable) {
+        static std::atomic<int> skipped{0};
+        const int n = skipped.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8)
+            fprintf(stderr,
+                    "[ampr] APR result slot 0x%llx NOT WRITABLE (state=0x%lx prot=0x%lx) -- the "
+                    "guest's result value 0x%llx was dropped\n",
+                    (unsigned long long)addr, (unsigned long)mbi.State, (unsigned long)mbi.Protect,
+                    (unsigned long long)value);
+        else if (n == 8)
+            fprintf(stderr, "[ampr] further APR result-slot drops suppressed\n");
+        return;
     }
+    *reinterpret_cast<uint64_t*>(static_cast<uintptr_t>(addr)) = value;
 }
 
 // #2139 Windows sibling: prove the whole pair is committed and readable before touching it.
