@@ -21,6 +21,7 @@
 #include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
 #include "present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
 #include "present_blit_policy.hpp"    // reject stale CPU/GPU representations of guest flips
+#include "hle/sync_futex.hpp"         // dump_guest_sync_trace (PROSPER_SYNC_RING deadlock history)
 #include "host/lifecycle.hpp"          // frontend-owned stop/pause gates
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
 #include "host/exec_image.hpp"         // run_entry
@@ -1965,6 +1966,9 @@ int main(int argc, char** argv) {
                     timedDumpCount, (long long)elapsed, (unsigned long long)shown);
             if (timedDumpCount == 1) dump_guest_exception_trace();
             dump_guest_thread_trace(timedDumpPath, timedDumpPthread);
+            // #2139: what the threads were DOING before they all stopped. Empty unless
+            // PROSPER_SYNC_RING is set, so this costs nothing on an ordinary run.
+            prosper::dump_guest_sync_trace(timedDumpPath);
             if (timedDumpIntervalMs > 0)
                 nextTimedDump = loopNow + std::chrono::milliseconds(timedDumpIntervalMs);
             else
