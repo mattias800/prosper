@@ -1929,12 +1929,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         }
     }
     if (explicit_ngg_index_provenance) {
-        // Match recompile_vertex's merged GS/ES ABI model: s3[7:0] is the active ES-vertex
-        // count and s3[15:8] the GS-primitive count.  The Vulkan vertex shell represents one
-        // active ES vertex and no GS primitive, so s3=1.  Fetch prologues use this value to
-        // choose and patch V# descriptors before their MUBUF loads; leaving it unknown made the
-        // dynamic resource walk drop otherwise valid scene-geometry fetches even though the
-        // translator itself already compiled the same prologue with s3=1.
+        // s3 is the merged GS/ES wave info: s3[7:0] is the active ES-vertex count and s3[15:8]
+        // the GS-primitive count.  The Vulkan vertex shell represents one active ES vertex and no
+        // GS primitive, so s3=1.  Fetch prologues use this value to choose and patch V#
+        // descriptors before their MUBUF loads; leaving it unknown made the dynamic resource walk
+        // drop otherwise valid scene-geometry fetches.
+        // WARNING: this does NOT match recompile_vertex for most programs, and this comment used to
+        // claim it did.  There, s3=1 is seeded only under exact_ngg_projection (the seven
+        // whitelisted Astro Bot wrappers); every other NGG program gets
+        // 0x40004040|(wave<<24).  The two models differ in exactly the high bits a prologue reads
+        // when it builds a SOFFSET from s3 — 0 here against 0x40000000 there.  #2072.
         set_value(3, 1u);
     }
 
@@ -2168,11 +2172,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // per-vertex attribute as shader-computed. Two things then go wrong at once, and
                     // each alone still reads zero: every vertex takes the *instance* index (0 for a
                     // one-instance draw), and the recompiler retains the load's runtime SOFFSET,
-                    // which for that shader is the top bits of an accumulator rather than the byte
-                    // offset the fold resolved (the fold's own fetch_off here is 0). The read then
-                    // leaves the descriptor and robustBufferAccess returns 0. The SOFFSET divergence
-                    // is #2069 and is NOT repaired here — this only removes the shader's address
-                    // expression from the path for attributes the fold can classify.
+                    // which for that shader is `s3 & 0xfff80000`. This fold seeds s3 = 1 below, so
+                    // that term is 0 and fetch_off is 0; recompile_vertex seeds s3 = 1 only for the
+                    // seven whitelisted Astro Bot wrappers and otherwise 0x40004040|(wave<<24), whose
+                    // masked value is 0x40000000. The shader therefore adds ~1 GiB to a 96-byte
+                    // descriptor and robustBufferAccess returns 0. That s3 mismatch is #2072 (the
+                    // vertex-rate bit's separate SMEM divergence is #2069); NEITHER is repaired here.
+                    // This only removes the shader's address expression from the path for every
+                    // attribute the fold classifies Vertex or Instance.
                     //
                     // `All` is this fold's standing assumption about EXEC, not a new one: `srcmask()`
                     // already answers `All` for a directly named EXEC operand, because this walk is a

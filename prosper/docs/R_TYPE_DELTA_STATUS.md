@@ -722,13 +722,31 @@ second lever names the exact term:
 (a) alone and for (c) alone, and `0,1,2,1,3,2` — the correct per-vertex indices — for (a)+(c). So
 neither arm is a silent no-op, and neither term alone is the defect.
 
-**The fold's own offset is zero, so this is not double-counting.** Comparing the bound descriptor
-before and after the fix, `unshifted_desc.base` and `with_off(desc).base` are the same address
-(`0x2011c0a690`), i.e. the fold resolves `fetch_off = 0`. The fold and the recompiled shader therefore
-disagree about `SOFFSET` exactly as they disagree about the vertex-rate bit — the same scalar
-divergence, tracked in **#2069**. This fix removes the shader's address expression from the path for
-this shape; it does not repair that divergence, which still governs every attribute the fold
-legitimately classifies `Shader`.
+**The fold's own offset is zero, so this is not double-counting** — and the reason the two disagree
+is a *constant*, not a memory read. Comparing the bound descriptor before and after the fix,
+`unshifted_desc.base` and `with_off(desc).base` are the same address (`0x2011c0a690`), i.e. the fold
+resolves `fetch_off = 0`. That is because the fold seeds the merged-wave-info SGPR as
+`set_value(3, 1u)` for **every** NGG stage (`gpu_executor.cpp:1938`), and `1 & 0xfff80000 == 0`.
+
+The recompiler seeds the same register differently. `rs.sreg[3] = 1` runs only under
+`exact_ngg_projection` (`rdna2_to_spirv.cpp:16246`), which is `ngg && is_astro_bot_ngg_one_lane_wrapper`
+— a whitelist of **seven exact (program-dword-count, hash) pairs** from Astro Bot
+(`:15752`). R-Type's composite VS is not one of them, so the else arm at `:16336` runs:
+`rs.sreg[3] = 0x40004040u | (wave << 24)`. And `0x40004040 & 0xfff80000` is **`0x40000000`** —
+**1,073,741,824 bytes**. The shader adds a gigabyte to a 96-byte descriptor and
+`robustBufferAccess` returns 0.
+
+So half 2 is **two unreconciled shell models of `s3`**, not the SMEM divergence in #2069, and it is
+cross-title: any non-Astro NGG prologue that reads `s3` into an address gets the same ~1 GiB term
+while the fold believes the offset is 0. Tracked separately in **#2072**. #2069 remains the *first*
+half — the `s_load_dword s18, s[14:15], 0x4` / `s_bfe_u32` vertex-rate bit, which really is an SMEM
+read the fold and the shader evaluate differently.
+
+This fix repairs neither divergence. It removes the shader's address expression from the path for
+**every attribute the fold classifies `Vertex` or `Instance`, whatever prologue produced it** —
+`folded_vfetch` is set only when `fetch_index_mode != Shader`, and that path computes exactly
+`element * stride`, skipping the inst offset, the `offen` VGPR and `val(in.src[2])` entirely. Every
+attribute the fold legitimately classifies `Shader` still carries both.
 
 The fix restores the mask lifetime on `s_mov_b64 sDST, exec` (and propagates it through a further
 `s_mov_b64 sDST, sSRC`), which makes the attribute classify as `Vertex` and take the ordinary
