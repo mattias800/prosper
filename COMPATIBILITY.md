@@ -38,7 +38,7 @@ Last updated: 2026-08-05
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🚧 Title screen | [#1883](https://github.com/mattias800/prosper/issues/1883) |
 | *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🔬 Render bring-up, no composited frame | [#1817](https://github.com/mattias800/prosper/issues/1817) |
 | *Asterix &amp; Obelix: Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🚧 Logo movies, intro cutscene, and title menu | [#1884](https://github.com/mattias800/prosper/issues/1884) |
-| *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🚧 Publisher logo and opening movie | [#1810](https://github.com/mattias800/prosper/issues/1810) |
+| *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🚧 Title screen and attract mode | [#1810](https://github.com/mattias800/prosper/issues/1810) |
 | *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Title screen and EULA | [#1885](https://github.com/mattias800/prosper/issues/1885) |
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🚧 Title screen reached and rendered | [#1886](https://github.com/mattias800/prosper/issues/1886) |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ First-level gameplay | [#1887](https://github.com/mattias800/prosper/issues/1887) |
@@ -231,8 +231,10 @@ yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues
 ## R-Type Delta: HD Boosted — `PPSA26414`
 
 <p align="center"><img src="assets/screenshots/rtype-delta-opening-movie-colour.png" alt="R-Type Delta — the opening movie's R-9 hangar shot in full colour"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-title.png" alt="R-Type Delta: HD Boosted — title screen"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-force-select.png" alt="R-Type Delta — attract-mode demonstration, the R-9 and its Force device"></p>
 
-The Clear River Games publisher logo and the full opening movie — the R-9 fighter in its hangar — render live at 1920×1080 from the real GPU command stream, in full colour. After the movie every frame collapses to a single colour while the frame loop keeps advancing ([#2006](https://github.com/mattias800/prosper/issues/2006)), so the title screen is not reached.
+The Clear River Games publisher logo and the full opening movie — the R-9 fighter in its hangar — render live at 1920×1080 from the real GPU command stream, in full colour, and the run continues into the **title screen** and the attract-mode demonstration. Gameplay has not yet been reached.
 
 Reaching this needs the game's files **evicted from the host page cache** first, which takes one command and no change to how the title is launched:
 
