@@ -16,6 +16,7 @@
 #include "nid.hpp"
 #include "sce_errno.hpp"
 #include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
+#include "../host/exec_image.hpp"      // describe_code_address (host frame naming)
 #include "sync_futex.hpp"
 #include "sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
 #include "../gpu/mb3_freelist.hpp"
@@ -3519,6 +3520,29 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
             guest_returns_used += (size_t)appended;
             ++guest_return_count;
         }
+        // Host-side companion to the guest scan above: name the PROSPER frames on the same stack.
+        // A sampled rip inside a system DLL (getenv, memcpy, a wait) says WHAT the thread is doing
+        // and nothing about WHY; the prosper frame below it is the answer, and without this the
+        // reader is left inferring it from the guest frame, which is often several calls away.
+        char host_returns[288] = "-";
+        size_t host_returns_used = 0;
+        unsigned host_return_count = 0;
+        for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && host_return_count < 6; ++i) {
+            const uint64_t candidate = stack_words[i];
+            if (candidate < 0x10000) continue;
+            if (!guest_trace_page_executable((uintptr_t)candidate)) continue;
+            const std::string described = describe_code_address(candidate);
+            if (described.rfind("prosper+", 0) != 0) continue;   // ours only; DLLs are noise here
+            bool duplicate = false;
+            for (size_t j = 0; j < i; ++j) duplicate |= stack_words[j] == candidate;
+            if (duplicate) continue;
+            const int appended = std::snprintf(
+                host_returns + host_returns_used, sizeof(host_returns) - host_returns_used,
+                host_return_count ? ",%s" : "%s", described.c_str());
+            if (appended <= 0 || (size_t)appended >= sizeof(host_returns) - host_returns_used) break;
+            host_returns_used += (size_t)appended;
+            ++host_return_count;
+        }
         char wait_description[256] = "-";
         if (captured_wait_count) {
             wait_description[0] = 0;
@@ -3547,12 +3571,12 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
                 std::snprintf(wait_description + used, sizeof(wait_description) - used,
                               ";+%zu-more", captured_wait_count - captured_waits.size());
         }
-        trace("[thread-trace] tid=%lu pthread=0x%llx rip=%s+0x%llx "
-              "raw=0x%llx rsp=0x%llx suspend=%lu waits=%s guest-stack=%s\n",
-              (unsigned long)native_id, (unsigned long long)pthread_id, module_name,
-              (unsigned long long)offset, (unsigned long long)rip,
+        trace("[thread-trace] tid=%lu pthread=0x%llx rip=%s "
+              "raw=0x%llx rsp=0x%llx suspend=%lu waits=%s guest-stack=%s host-stack=%s\n",
+              (unsigned long)native_id, (unsigned long long)pthread_id,
+              describe_code_address(rip).c_str(), (unsigned long long)rip,
               (unsigned long long)context.Rsp, (unsigned long)prior_suspend,
-              wait_description, guest_returns);
+              wait_description, guest_returns, host_returns);
     }
     if (close_output) CloseHandle(output);
 #else
