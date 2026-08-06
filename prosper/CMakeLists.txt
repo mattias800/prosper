@@ -1116,6 +1116,10 @@ if(TARGET prosper_core)
 
   # End-to-end AGC submit plus fixed args 7-9 in ReleaseMem/WaitRegMem. This is cross-platform so
   # Windows validates the real fence builders behind the generated import-ABI conformance test.
+  add_executable(test_agc_dcb_callback_abi tests/test_agc_dcb_callback_abi.cpp)
+  target_link_libraries(test_agc_dcb_callback_abi PRIVATE prosper_core)
+  add_test(NAME agc_dcb_callback_abi COMMAND test_agc_dcb_callback_abi)
+
   add_executable(test_agc_submit tests/test_agc_submit.cpp)
   target_link_libraries(test_agc_submit PRIVATE prosper_core)
   add_test(NAME agc_submit_to_gpustate COMMAND test_agc_submit)
