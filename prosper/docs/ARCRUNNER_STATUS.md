@@ -21,6 +21,14 @@ async-compute submit ABI failure is fixed.
 anything else in this document.** It supersedes the rung-1 framing below in two ways: the composite is
 not losing content, **and the terminal fault IS the rung-1 blocker after all.**
 
+**Then read `## 2026-08-06: all three terminal values are prosper's own two label writes over a LIVE
+pointer`.** It settles the *author* of the fault — the three values this document tracked as three
+racing causes are one composition rule, and prosper performs both halves of it — and it withdraws the
+`## Ruled out` row that excluded prosper's label writes, because the census behind that row is
+structurally unable to represent a stomped vtable pointer. It also corrects the rung-1 arithmetic:
+the movie advances one frame per guest `sceAvPlayerGetVideoDataEx` call, so a rung-1 arm must be
+bounded by **poll count**, not seconds.
+
 **The sibling fault's null register is prosper-manufactured**, and that correction still stands:
 
 - The `addr=(nil)` sibling class is produced by prosper's own reserved-range lazy-commit handler
@@ -499,6 +507,108 @@ is consistent with the observed REL1 population being homogeneous (`pre=0x200000
 candidate), not independently proven. The lever is default OFF because `rel1_stomp_guard()` is
 default ON.
 
+## 2026-08-06: all three terminal values are prosper's own two label writes over a LIVE pointer
+
+Measured on `66eaf77b` plus the two instruments this section introduces, nine ordinary unsuppressed
+`boot_trace` runs (`PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), exact zero pre/post process censuses, no
+suppression, skip or shim. See [#1226](https://github.com/mattias800/prosper/issues/1226).
+
+**The `{small nonzero high dword, low dword 1}` shape is not three racing causes. It is one
+composition rule, and prosper performs both halves of it.** The section above had this for
+`0x2000000001` as an inference from `pre=0x2000000000`; the label ring at the *faulting register*
+now shows the whole sequence, for three different faults on three different threads:
+
+| faulting thread | the pointer that was there | after our 4-byte init | after our 4-byte fence |
+| --- | --- | --- | --- |
+| `AudioMixerRende` | `0x41700f1e8` — a **vtable pointer**, `eboot+0x700f1e8` | `0x400000000` | **`0x400000001`** |
+| `RHIThread` | `0x21c1388890` — a live heap pointer | `0x2100000000` | `0x2100000001` |
+| (`rdi` at fault) | `0x21c0e182d0` — a live heap pointer | `0x2100000000` | **`0x2100000001`** |
+
+The `AudioMixerRende` row is the complete chain end to end. The guest instruction is named by
+disassembly (`tools/re/edis.py` over a `prx_to_elf.py` flattening):
+
+```text
+32b61bb:  mov  rax, QWORD PTR [rdi]     ; rax := the object's VPTR
+32b61be:  call QWORD PTR [rax+0x20]     ; <- jumps to 0; rip=0x0, return address 32b61c1
+```
+
+and the label ring for that exact `rdi` reads:
+
+```text
+[labelhist] rdi=0x2020e32080 events(total=25): … dmaB@7587/f31 relB@7587/f31 waitB@7587/f31
+            dmaX(D)@7895/f37:0x41700f1e8   relX(D)@7895/f37:0x400000000
+```
+
+So the object at `0x2020e32080` held vtable `eboot+0x700f1e8`; prosper's 4-byte immediate-zero DMA
+init destroyed its low dword; prosper's paired 4-byte value-1 fence set that dword to 1; the guest's
+next virtual call read `0x400000001` and jumped through `[0x400000021]`. **`rax=0x400000001` in every
+recorded `AudioMixerRende` report is prosper's own arithmetic, not a guest value.**
+
+**Why no existing guard, tripwire or census could see it.** Every shape predicate in
+`command_processor.cpp` filters `pre` through `ptr_like()`/`heap_ptr_like()`, whose widest window is
+`[0x1000000000,0xa000000000)` — the guest arena. A C++ vtable pointer is not in the arena: it points
+into a loaded **module image**, and ArcRunner's eboot base is `0x410000000`, three orders of magnitude
+below that floor. `PROSPER_PTRLIKE_WIDE=1` does not reach it either; the wide window has the same
+floor. So the `FORGE-TRIP-TOTALS wide_only=0` and `SUSPECT-REL1-LIVE=0` negatives recorded in the
+section above are **correct and irrelevant** to this population — they were taken with an instrument
+that cannot represent it. This is not a tuning gap: an arena bound is exactly what a heap predicate
+is for.
+
+`PROSPER_LIVEPTR_TRIP=1` (default OFF, log-only) asks the shape question with **no address window**:
+`pre` counts as a live pointer when its high dword is nonzero and its value addresses mapped memory
+(`guest_readable`, a real `write(2)` EFAULT probe, so module images are in scope). One bounded run:
+
+```text
+[agc] LIVEPTR-TOTALS(hit) examined=5091 shape=1280 live=1280 t=11607ms | hi=0x20:1280
+[agc] LIVEPTR-STOMP hi=0x21#1 kind=DMA-imm dst=0x2020e33080 pre=0x21c1388890 (mapped, heap)
+      val=0x0 -> 0x2100000000 after-mapped=0 width=4 pkt=0x300310fa18 t=12006ms | …
+```
+
+Read `examined` beside every zero: it counts every sub-qword write offered to the trip and prints on
+its own schedule even when `live` is 0, so "armed and nothing matched" is distinguishable from
+"never armed". **`after-mapped=0` is the fault preannounced** — the corrupted qword no longer
+addresses anything, and the guest dereferences it next.
+
+**The damage is done by the INIT, not the fence, and the init has no guard of this kind at all.**
+`rel1_stomp_guard()` already declines a *fence* over `ptr_like(pre) && pre_low != 0` and ships
+default ON; by the time it runs, the init has already replaced the low dword with 0, so `pre_low` is
+0 and the branch cannot fire. There is no equivalent check on the 4-byte DMA immediate.
+
+**And content alone cannot fix the heap half of it.** A label the guest legitimately popped from its
+own pool free list carries a stale `NextFreeBlock`, which is a heap pointer with a nonzero low dword —
+byte-identical to a live object pointer. That is the population the `hi=0x20:1280` bucket is: a
+free-list walk, where each write's `dst` is the previous write's `pre`. Declining those would repeat
+the #1245 regression at 1,280 events per run. The **module-image** half has no such twin: nothing in
+a label protocol and nothing in an allocator free list ever holds a code-image pointer, so
+`PROSPER_NONHEAP_PTR_GUARD=1` (default OFF, announces itself, counts its declines) is a sound A/B arm
+for exactly that class. It is **not yet evidence of anything**: three armed runs recorded
+`declines=0`, because the image-vptr class did not occur in them — non-discriminating, not negative.
+
+**Two instrument facts that shaped this and will bite the next arm.**
+
+- The trip's detail schedule is **per `pre >> 32` bucket**, not global. On a shared ordinal the one
+  image-vptr hit lands somewhere around #300 — past the first-64 window, not a power of two — and is
+  counted but never printed, among hundreds of free-list-residue hits. That happened on the first arm
+  here and cost a run. A rare class sharing a rate limit with a common one is invisible.
+- **`nullpage_deep_dump`'s per-register memory windows print nothing** — 9 of 9 runs, all 16
+  registers, including `rsp`, which is unquestionably readable. `[rdi]` would have answered this in
+  one run instead of five. The `[labelhist]` line added here does not depend on `probe_readable` and
+  is what recovered the evidence.
+
+## How far the movie actually is, and why the fault is only half the arithmetic
+
+`sceAvPlayerGetVideoDataEx` advances the movie **one frame per guest call** — `next_video()` pops the
+decode queue with no media-clock test. One bounded run: **31 calls, 31 successes** (`result=1` on
+every one), and the guest makes no other AvPlayer call at all — no `IsActive` poll, no `CurrentTime`
+poll. So the queue is never starved and the movie's playback rate is exactly the guest's poll rate,
+measured here at ~2.6 Hz against ~8.3 presented frames/s.
+
+The consequence for rung 1: full picture is video frame 150, so the run must survive **~150 guest
+polls**, which at the observed rate is roughly a minute of wall time — not the ~13 s the fault
+currently allows. Fixing the terminal fault is necessary and, on this arithmetic, close to
+sufficient (the movie is 63 s long), but a rung-1 arm must be given a **long** bound and must count
+`video-ex` calls, not seconds. Do not read "43-54 video frames" from the section above as a rate.
+
 ## Ruled out
 
 Do not re-derive these without contradictory new evidence.
@@ -523,6 +633,12 @@ Do not re-derive these without contradictory new evidence.
 | The magenta 1x1 auto-exposure targets (the previous discriminator 2) are garbage feeding a tonemapper (`(255,92,255)`) | Not a defect worth chasing: those targets are `1x1 VK_FORMAT_R32G32B32A32_SFLOAT` (`resolved-format=109`), and a 16-byte float texel converted for display is not readable as an exposure value. With the scene legitimately black there is nothing for the tonemapper to lose. | #2011 |
 | The per-target readback table in this document describes prosper's **default** rendering path | It does not. It was taken with `PROSPER_DUMP_RTGROUPS`, and `frontends/shared/live_renderer.cpp:1008-1015` lists that variable (with `_RGBA`, `PROSPER_DUMP_DRAWSTEPS`, `PROSPER_DUMP_SAMPLED_RTT`, `PROSPER_RTTLOG`, `PROSPER_RESOURCE_HASH_DIM`, `PROSPER_TARGET_STEP_HASH_DIM`, `PROSPER_GPU_REPLAY_*`) in the `live_gpu_targets` **disable** list — so the whole table describes the CPU-readback path. `PROSPER_DUMP_PERSISTENT` is the census that does observe the normal persistent-GPU-target path, and it agrees on the black scanout. Re-take any localisation on that variable before building on it. | #2011 |
 | The first three current-master ordinary diagnostic arms prove the sibling absent or identify its producer | The first title run exited through an unrelated `AudioMixerRende` null jump. The second lost to the usual allocator chain at `eboot+0x127e8eb`, with the guest reporting `Attempt to realloc an unrecognized block 2000000001`. The third used the address-filtered hardware probe, which armed on primary and worker guest boundaries, but lost to the allocator predecessor at `eboot+0x127e751` before recording any target hit. None reached `eboot+0x117811f`; the first two stack peeks sampled unrelated frames and the third correctly emitted no probe. All three arms are **void/non-discriminating**, not negative reproductions. A nearby D-queue unsatisfied wait is retained as co-occurring history only; it does not attribute any competing failure. | #1226 |
+| A prosper GPU write lands on the guest's pointer table slot at `0x2020e381c0` — the co-location lead that made "which writer touches that 8-byte slot" the open question | `PROSPER_PROVENANCE_ADDR=0x2020e30000:0x10000` over a full faulting run records **zero** writes overlapping `0x2020e381c0`, with **1,314** writes elsewhere in the same 64 KiB page as the in-run positive control. Every one of those 1,314 is `kind=dma-data size=4` at a 32-byte-aligned address (282 distinct slots) — so the **`DMA_DATA` copy** candidate named as the other half of that question is also empty here: the population is 4-byte **immediates**, not copies. The `0x2020e3xxxx` page is a 0x20-byte label pool, and the table shares it. | #1226 |
+| The three terminal faults (`0x2000000001`, `0x2100000001`, `0x400000001`) are three racing causes that need separate attribution | One composition rule, performed by prosper. The label ring at the faulting register shows the pointer that was in the destination, our 4-byte immediate-zero init clearing its low dword, and our paired 4-byte value-1 fence setting that dword to 1 — measured for a module-image vptr (`0x41700f1e8` → `0x400000001`, with the guest's `mov rax,[rdi]; call [rax+0x20]` at `eboot+0x32b61be` disassembled) and twice for live heap pointers (`0x21c1388890` and `0x21c0e182d0` → `0x2100000001`). See the 2026-08-06 section. | #1226 |
+| prosper's label writes are excluded as the author of `0x2100000001` / `0x400000001` (recorded from `FORGE-TRIP-TOTALS seen=256 narrow=256 wide_only=0` and `SUSPECT-REL1-LIVE=0`, both levers witnessed) | **Withdrawn.** Those censuses are correct and structurally blind to this population: every shape predicate filters `pre` through `ptr_like()`/`heap_ptr_like()`, whose widest window floor is `0x1000000000`, and a vtable pointer lives in the module image at `0x41xxxxxxx`. `PROSPER_PTRLIKE_WIDE=1` shares that floor, so it does not reach it either. The windowless `PROSPER_LIVEPTR_TRIP` census reports `examined=5091 shape=1280 live=1280` in one run. A negative from a predicate that cannot represent the case is not a negative. | #1226 |
+| The `AudioMixerRende` `rip=0x0` jump is an unrelated audio failure, retained only as a competing terminal path | It is the same defect, and on current master it is the most frequent one — 4 of 9 runs here, against 3 allocator/`RHIThread` and 1 `AgcCleanupThrea`. `rax=0x400000001` is the object's **vptr**, read by `mov rax,[rdi]` one instruction before the faulting `call [rax+0x20]`, and it is byte-for-byte what prosper's two label writes made of `eboot+0x700f1e8`. | #1226 |
+| A rung-1 arm can be bounded like the fault arms, because the fault is what stops the movie | The fault is necessary but not the whole arithmetic. `sceAvPlayerGetVideoDataEx` advances the movie one frame per guest call (`next_video()` pops the decode queue with no media-clock test), and a bounded run measured **31 calls / 31 successes** with **no** other AvPlayer call — so the queue is never starved and the rate is the guest's poll rate, ~2.6 Hz. Reaching video frame 150 needs ~150 polls, about a minute of wall time. Count `video-ex` calls, never seconds. | #1226 |
+| `PROSPER_NONHEAP_PTR_GUARD=1` (decline a sub-qword label write over a mapped non-heap pointer) does or does not remove the fault | Neither. Three armed runs recorded `declines=0`: the image-vptr class did not occur in them, so the arm is **non-discriminating**, exactly like the three void arms above. The lever announces itself and counts, so this is a readable null rather than a silent one. | #1226 |
 | The `addr=(nil)` faults show that page `0x2100000000` is a **legitimately committed guest region whose contents prosper lost** — [#1944](https://github.com/mattias800/prosper/issues/1944) reading 1, argued from "two *different* guest code sites first-touch the same 64 KiB page; a wild pointer would not repeat like that" | It is reading 2 (a wild read masked), and the repetition is a property of the value, not the mapping. `PROSPER_LAZY_COMMIT_STRICT=1` moves the fault to the loading instruction: `[lazy-commit] #1 DECLINED(strict) page=0x2100000000 addr=0x2100000041 access=read rip=0x41117e221`, then `sig=11 addr=0x2100000041 rip=eboot+0x117e221`. The load is `mov rdi,[r12+rcx*8]` / `mov rcx,[rdi+0x40]` with `rdi=0x2100000001`, and `0x40` is added **without masking the low bit**, so `rdi` is a plain corrupt pointer. **Any** `0x21000000xx` value lands in page `0x2100000000` — which is exactly the shape a heap pointer takes when its low dword is lost — so both recorded sites hitting that page is expected, not anomalous. Exactly one lazy-commit event occurs per affected run. Do not spend another arm treating the page as a commit-protocol gap on this title. | #1944, #1226 |
 | The `0x2100000001` that the terminal `addr=(nil)` fault dereferences is composed by prosper's own `RELEASE_MEM`/`WRITE_DATA` fence, the way `0x2000000001` is — and `ptr_like()`'s stale upper bound (exactly `0x2100000000`) is hiding that population from the tripwire and from both guards | The blind spot is **real but empty on this title**, on both branches. With the tripwire's report predicate widened to prosper's whole guest-VA window, one bounded run on `c9e2588e` ends at `FORGE-TRIP-TOTALS seen=256 narrow=256 wide_only=0`: none of the 256 reported candidates is wide-only, every one has `pre=0x2000000000`, and the absence of a `#512` totals line on the dense every-256 schedule bounds the run's population below 512. The sibling `REL1-LIVE` branch — a fence over a pre whose low dword is a real pointer half, which is what would turn a live `0x2100e05140` into exactly `0x2100000001` — was checked separately with `PROSPER_PTRLIKE_WIDE=1`, which arms both guards over the wide window and prints `PTRLIKE-WIDE ARMED` so the lever is witnessed: two runs, `SUSPECT-REL1-LIVE` count **0**, terminal fault unchanged. So prosper's label writes are excluded as the author of the value that terminates the run. Two limits: `report_suspect_write()` has emitted no line of any kind on this title across nine runs, so the `REL1-LIVE` zero has no in-run positive control (it is consistent with the REL1 population being homogeneous, not independently proven); and this does **not** clear the narrow window for other titles — it is still stale, and the lever exists to A/B flipping it. | #1226 |
 | `{small nonzero high dword, low dword ≤ 1}` is by itself a prosper-forge signature, so a value of that shape found in guest memory attributes the write to us | It is also **ordinary guest data**. A fault-time dump of a live guest table (`PROSPER_FAULTMEM=1`, register `r12`) shows 16-byte `{pointer, metadata}` entries whose metadata qword is a constant `0x0000000400000002`, interleaved with live pointers `0x2000e03840` / `0x2000e03830` / `0x2100e05140`. `0x400000001` — the value at the `AudioMixerRende` `rip=0x0` jump, and the one #1945's brief quotes — has that same `{4, n}` shape. Value-shape alone therefore cannot attribute a `<high>_0000000n` qword to a GPU write; only a write-side record (the attribution ring, or the forge tripwire's `pre`) can. | #1226, #1945 |
@@ -558,8 +674,32 @@ Ordered for **rung 1** (any real graphics), which the terminal faults do not blo
    screenshot to `COMPATIBILITY.md`. A frame presented right after a `MODE=2` draw does not qualify —
    see the `## Ruled out` row.
 
-**Where the terminal-fault hunt actually stands after the instrument repair** (added without
-renumbering the list above, which a concurrent lane also edits):
+**Where the terminal-fault hunt stands after 2026-08-06** (added without renumbering the list above,
+which a concurrent lane also edits — the paragraph below it is the previous standing summary and is
+now superseded by this one):
+
+The **author** of every terminal value is settled: prosper's own 4-byte immediate-zero label init,
+followed by its paired 4-byte value-1 fence, over a destination that still held a live pointer. Three
+instances are measured at the faulting register, one of them a module-image vtable pointer with the
+guest's faulting virtual call disassembled. What remains is **ownership**, not authorship:
+
+1. **Why is a built label packet still pointing at a block the guest has reallocated?** The label
+   ring shows the same address rebuilt every few frames (`dmaB@11450/f94` → `dmaX@11786/f100`, 336 ms
+   and six frames apart) and, at the last generation, holding an object. The existing content-free
+   answer to exactly this — `dma_build_pre_changed()`, which compares the destination at build time
+   against exec time — is **inert on current builds**: #1756 shrank `DMA_DATA` to its hardware
+   7 dwords and removed the slot that carried the build snapshot, and the guard says so once when
+   armed. Restoring a build-time snapshot out of band (the label ring already records the init event
+   via `prosper_label_hist_dma_built`) is the concrete next step, and it needs no content predicate.
+2. **The heap half cannot be closed by content and should not be attempted.** Stale `NextFreeBlock`
+   residue in a popped label block is byte-identical to a live object pointer; the `hi=0x20:1280`
+   bucket is a free-list walk (each write's `dst` is the previous write's `pre`). Suppressing it is
+   #1245 again at 1,280 events per run.
+3. **The module-image half is safely separable** and `PROSPER_NONHEAP_PTR_GUARD=1` exists for it, but
+   it needs runs in which the class actually occurs — three armed runs declined nothing.
+4. **Give a rung-1 arm a long bound and count `video-ex` calls.** See the `## Ruled out` row.
+
+*Superseded — the previous summary, kept because its provenance census is still the record:*
 
 The `addr=(nil)` class is now attributed down to one slot. The guest loads
 `rdi = table[index]` from a pointer table at `r12 = 0x2020e381c0` and gets `0x2100000001` — a

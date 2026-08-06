@@ -47,6 +47,8 @@ extern "C" bool prosper_rel1_forge_report_due_for_test(uint64_t candidates);
 // report verdict.
 extern "C" int prosper_forge_predicate_for_test(uint64_t pre, uint64_t width, uint64_t value,
                                                 int* wide);
+// #1226: the windowless live-pointer shape behind PROSPER_LIVEPTR_TRIP / PROSPER_NONHEAP_PTR_GUARD.
+extern "C" int prosper_liveptr_shape_for_test(uint64_t pre, uint64_t width, uint64_t value);
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -1999,6 +2001,53 @@ int main() {
             snprintf(msg, sizeof msg, "forge predicate: %s", c.what);
             CHECK(narrow == c.narrow && wide == c.wide, msg);
         }
+    }
+
+    // #1226 — the live-pointer shape predicate behind PROSPER_LIVEPTR_TRIP and
+    // PROSPER_NONHEAP_PTR_GUARD. The case this exists for is the one BOTH forge predicates above
+    // reject on their window: `pre` is a module-image vtable pointer, three orders of magnitude
+    // below `heap_ptr_like`'s 0x1000000000 floor. Measured on ArcRunner: the label ring at the
+    // faulting register recorded `dmaX(D):0x41700f1e8` then `relX(D):0x400000000`, so prosper's own
+    // 4-byte init and 4-byte fence composed `0x400000001` out of the vptr `eboot+0x700f1e8`, and the
+    // guest's next `call [rax+0x20]` jumped to 0.
+    //
+    // The window cases are deliberately paired with the forge table above: the same `pre` that the
+    // forge predicate must REJECT for being outside its window must be ACCEPTED here, or the two
+    // have silently collapsed into one and the blind spot is back.
+    {
+        struct Case { uint64_t pre; uint64_t width; uint64_t value; int want; const char* what; };
+        const Case cases[] = {
+            // The measured ArcRunner cases, all three composition instances.
+            {0x000000041700f1e8ull, 4, 0, 1, "a module-image vptr is a live-pointer stomp (0x400000001)"},
+            {0x00000021c1388890ull, 4, 0, 1, "a heap object pointer with a live low dword is a stomp"},
+            {0x00000021c0e182d0ull, 4, 0, 1, "the second measured heap instance is a stomp"},
+            // Free-list residue: identical SHAPE, and deliberately still reported. The census must
+            // see this population — it is what makes a zero readable — while the guard excludes it
+            // separately by window, because content cannot separate residue from a live pointer.
+            {0x0000002020e39fc0ull, 4, 0, 1, "free-list residue has the same shape and is reported"},
+            // The #1245 regression shape must NEVER match: a correctly initialised label reads
+            // {stale malloc residue high, low dword ZERO}, and suppressing those desynchronised the
+            // guest's fence protocol. This is the one case whose misclassification is destructive.
+            {0x0000000400000000ull, 4, 1, 0, "an already-initialised label ({high,0}) is NOT a stomp"},
+            {0x0000002000000000ull, 4, 1, 0, "the #1245 shape is NOT a stomp on the heap window either"},
+            // Remaining shape rules.
+            {0x0000000000000001ull, 4, 0, 0, "a small integer (no high dword) is not a pointer"},
+            {0x000000041700f1e8ull, 8, 0, 0, "a full-width write replaces the qword — not a stomp"},
+            {0x000000041700f1e8ull, 4, 0x1700f1e8ull, 0, "a write that does not change the low dword is not a stomp"},
+        };
+        for (const auto& c : cases) {
+            const int got = prosper_liveptr_shape_for_test(c.pre, c.width, c.value);
+            char msg[192];
+            snprintf(msg, sizeof msg, "liveptr shape: %s", c.what);
+            CHECK(got == c.want, msg);
+        }
+        // Cross-check against the forge predicate: the image vptr is invisible to both of its
+        // windows, which is the entire reason this predicate exists. If someone widens
+        // `heap_ptr_like` down to the image range, this fails and says why.
+        int wide = -1;
+        const int narrow = prosper_forge_predicate_for_test(0x000000041700f1e8ull, 4, 1, &wide);
+        CHECK(narrow == 0 && wide == 0,
+              "liveptr shape: the image vptr is outside BOTH forge windows (the blind spot)");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
