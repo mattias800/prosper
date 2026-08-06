@@ -385,9 +385,9 @@ each of which detects its own invalidity, in the order they were useful:
 
 # 2. Is any draw blending at all?  Per-draw enable + factors + every sampled texture.
 #    Count with a form that PRINTS a zero instead of exiting non-zero on one — see below.
-PROSPER_RTTLOG=1 … > rttlog.txt 2>&1          # bound with PROSPER_RTTLOG_{MIN,MAX}_SUBMIT
-grep -o 'blend=1' rttlog.txt | wc -l          # blend-enabled draws  (0 prints as 0)
-grep -o 'blend=[01]' rttlog.txt | wc -l       # total draws — the denominator
+PROSPER_RTTLOG=1 … > rttlog.txt 2>&1            # bound with PROSPER_RTTLOG_{MIN,MAX}_SUBMIT
+grep -o 'blend=1(' rttlog.txt | wc -l           # blend-enabled draws  (0 prints as 0)
+grep -o 'blend=[01](' rttlog.txt | wc -l        # total draws — the denominator
 
 # 3. What did the guest actually write to the blend register, and by which path?
 PROSPER_REGWATCH=Cx:0x1E0,Cx:0x1E1 …   # 0x1E0 = CB_BLEND0_CONTROL, 0x1E1 = CB_BLEND1_CONTROL
@@ -397,7 +397,10 @@ PROSPER_REGWATCH=Cx:0x1E0,Cx:0x1E1 …   # 0x1E0 = CB_BLEND0_CONTROL, 0x1E1 = CB
 `grep -c` exits 1 on zero matches — so in an `&&` chain it aborts the run that was supposed to report
 the finding, and its "failure" is indistinguishable from a real one (`CLAUDE.md`). `grep -o … | wc -l`
 prints `0` and exits 0. Take the denominator from the same file in the same way: a bare enabled-count
-is not interpretable without the total.
+is not interpretable without the total. Match the **trailing `(`** as shown: the per-draw RTTLOG line
+is the only one that prints `blend=N(src=…` (`live_renderer.cpp:4739`), while a bare `blend=N` also
+appears on the `PROSPER_GFXLOG` item line and in the target-step summary — so an unanchored
+`blend=1` over a log with either of those enabled counts lines, not draws.
 
 **`PROSPER_RTTLOG` is itself in the `live_gpu_targets` disable list**
 (`live_renderer.cpp:1008-1015`), so arming it forces the CPU-readback RTT path for the whole run. Two
