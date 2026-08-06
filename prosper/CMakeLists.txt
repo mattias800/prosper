@@ -1181,6 +1181,12 @@ if(TARGET prosper_core)
     target_link_libraries(test_rwlock_once PRIVATE prosper_core)
     add_test(NAME rwlock_once_semantics COMMAND test_rwlock_once)
 
+    # #2042: a destroyed guest sync object's storage is retired, never returned to the allocator,
+    # so a Destroy racing a handler cannot corrupt prosper's own heap.
+    add_executable(test_sync_destroy_lifetime tests/test_sync_destroy_lifetime.cpp)
+    target_link_libraries(test_sync_destroy_lifetime PRIVATE prosper_core)
+    add_test(NAME sync_destroy_lifetime COMMAND test_sync_destroy_lifetime)
+
     # __tls_get_addr per-thread DTV is purged (blocks freed) on both thread-exit paths (#68), and
     # normal return leaves guest %fs before glibc resumes host pthread cleanup (#644).
     add_executable(test_tls_dtv_purge tests/test_tls_dtv_purge.cpp)
