@@ -120,6 +120,309 @@ void prosper_ampr_advance(uint64_t cb, uint64_t bytes) {
 }
 }
 
+// ============================================================================================
+// APR completion bookkeeping — SHARED by both platform halves (#2139).
+//
+// This block used to live inside the POSIX half, so Windows registered a stub submit
+// (`k_ampr_submit`, which only reset the command buffer) and therefore never posted an
+// APREventQueue completion for an async streaming read. The engine's consumer blocks until that
+// event arrives, so it never woke and never issued another read: Blue Prince (PPSA25009) read
+// ~1.96 GB, then stopped all I/O and presentation for 20+ minutes on its loading screen.
+//
+// Nothing here is platform-specific — it is maps, a mutex, a condition variable and token
+// counters, and prosper_eq_post_apr_token already lives in hle_kernel_time.cpp for both. The one
+// place that touches guest memory goes through apr_write_result_slot, which each half defines
+// with its own fault-safety rules.
+//
+// Moved VERBATIM: this hoist changes no logic. The discriminator that decides which requests are
+// eventful stays exactly as documented below — it is load-bearing in both directions (too few
+// events hangs the guest, too many crash it), and is still CONFIDENCE: MED (#180).
+// ============================================================================================
+namespace prosper {
+
+// Both touch guest memory, so each half defines them with its own fault-safety rules: a fault in
+// host HLE code kills the emulator, not just the guest.
+static void apr_write_result_slot(uint64_t addr, uint64_t value);
+// Diagnostic-only (PROSPER_AMPRLOG): read two guest qwords, false if not safely readable.
+static bool apr_probe_guest_pair(uint64_t addr, uint64_t out[2]);
+
+namespace { bool amprlog() { static int v = getenv("PROSPER_AMPRLOG") ? 1 : 0; return v; } }
+
+static uint64_t ampr_arglog(const char* tag, uint64_t a0, uint64_t a1, uint64_t a2,
+                            uint64_t a3, uint64_t a4, uint64_t a5) {
+    if (amprlog()) {
+        fprintf(stderr, "[amprlog] %s a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+                tag, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+        for (uint64_t p : { a0, a1, a2 }) if (p > 0xffff && !(p & 7)) {
+            // Fault-safe read (#1154): a passed-in guest pointer that is aligned and > 0xffff can still
+            // be UNMAPPED — GTA V's baQO9ez2gL4 passes a2=0x302200, which clears both guards but was
+            // never mapped. A raw *(uint64_t*)p deref SIGSEGVs in host HLE code and kills the very run
+            // this diagnostic is meant to observe. process_vm_readv returns EFAULT instead of faulting
+            // (all-or-nothing per iovec, so a partially-mapped pair reports UNMAPPED — acceptable here).
+            uint64_t v[2];
+            if (apr_probe_guest_pair(p, v))
+                fprintf(stderr, "[amprlog]   [0x%llx] = 0x%016llx 0x%016llx\n", (unsigned long long)p,
+                        (unsigned long long)v[0], (unsigned long long)v[1]);
+            else
+                fprintf(stderr, "[amprlog]   [0x%llx] = UNMAPPED\n", (unsigned long long)p);
+        }
+    }
+    return 0;
+}
+
+uint64_t prosper_apr_next_token(unsigned ring);                          // hle_kernel_time.cpp
+void prosper_eq_add_apr(uint64_t eq, int64_t id);                        // "
+uint64_t prosper_eq_identity(uint64_t eq);                               // " (lifetime guard)
+void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
+                               int64_t id, uint64_t token);              // " (tag echo, #208)
+namespace {
+    // Command-buffer ctxs bound to the APR event queue via H896Pt-yB4I, with the binding's a3 TAG
+    // and target equeue. The tag IS the guest-chosen completion token for that cb ((ring<<58)|n,
+    // observed n starting at 0x3e8=1000 and incrementing per binding — live capture 2026-07-09):
+    // the guest's listener context (an eboot GLOBAL, ctx+0xa8+ring*0x28 in-flight slot, expected
+    // token at [slot+0x10] — read live at the issue-#180 stall: ring-4 slot expecting exactly
+    // 0x10000000000003e8, the first H896 tag) tracks the cb under this exact value. The submit
+    // must ECHO it through the out slots and the completion event must carry it verbatim — the
+    // pre-#180 code posted an invented per-ring counter (seq 1,2,...) that could never match, so
+    // the engine believed batch #1 was in flight forever and the whole async IO pipeline jammed
+    // behind it (the CreateGlobalShaderMap precache stall).
+    struct AprBoundCb {
+        uint64_t cb, tag, eq, eq_identity;
+        int64_t id;
+        bool deduplicate_completion;
+        bool completion_posted;
+        bool fallback_pending;
+        std::chrono::steady_clock::time_point fallback_due;
+    };
+    struct AprBoundState {
+        std::mutex mx;
+        std::condition_variable cv;
+        std::vector<AprBoundCb> cbs;
+        bool worker_started = false;
+    };
+    // The fallback worker is detached and outlives main, so its synchronization state must not run
+    // static destructors during process shutdown.
+    AprBoundState& apr_bound_state() {
+        static AprBoundState* state = new AprBoundState;
+        return *state;
+    }
+    void apr_tail_worker() {
+        AprBoundState& state = apr_bound_state();
+        std::unique_lock<std::mutex> lk(state.mx);
+        for (;;) {
+            auto next = std::chrono::steady_clock::time_point::max();
+            for (const auto& b : state.cbs)
+                if (b.fallback_pending && b.fallback_due < next) next = b.fallback_due;
+            if (next == std::chrono::steady_clock::time_point::max()) {
+                state.cv.wait(lk);
+                continue;
+            }
+            if (state.cv.wait_until(lk, next) != std::cv_status::timeout) continue;
+
+            const auto now = std::chrono::steady_clock::now();
+            std::vector<AprBoundCb> ready;
+            for (auto& b : state.cbs) {
+                if (!b.fallback_pending || b.fallback_due > now) continue;
+                b.fallback_pending = false;
+                if (!b.deduplicate_completion || b.completion_posted) continue;
+                b.completion_posted = true;
+                ready.push_back(b);
+            }
+            lk.unlock();
+            for (const auto& b : ready)
+                prosper_eq_post_apr_token(b.eq, b.eq_identity, b.id, b.tag);
+            lk.lock();
+        }
+    }
+    bool apr_cb_submit_state(uint64_t cb, AprBoundCb* out, bool* should_post) {
+        AprBoundState& state = apr_bound_state();
+        std::lock_guard<std::mutex> lk(state.mx);
+        for (auto& b : state.cbs)
+            if (b.cb == cb) {
+                if (out) *out = b;
+                if (should_post) {
+                    *should_post = !b.deduplicate_completion || !b.completion_posted;
+                    if (b.deduplicate_completion) {
+                        b.completion_posted = true;
+                        b.fallback_pending = false;
+                    }
+                }
+                return true;
+            }
+        return false;
+    }
+    void apr_cb_destroy_320_binding(uint64_t cb) {
+        AprBoundState& state = apr_bound_state();
+        std::lock_guard<std::mutex> lk(state.mx);
+        auto it = std::find_if(state.cbs.begin(), state.cbs.end(), [&](const AprBoundCb& b) {
+            return b.cb == cb && b.deduplicate_completion;
+        });
+        if (it != state.cbs.end()) state.cbs.erase(it);
+    }
+    // Per-request "eventful" marks for UNBOUND one-shot cbs (issue #180). The engine drives two
+    // flavors of sceAmprAprCommandBufferReadFile through ONE wrapper (identical guest-RA chains):
+    //   - sync reads: the caller consumes the completion RECORD inline; NO equeue event may be
+    //     posted for them (the listener's hash-miss path faults at eboot+0x229df3e reading 0x10 —
+    //     re-verified 2026-07-09: posting events for every submit crashes there within seconds);
+    //   - async streaming reads: the submitting worker returns to its pool immediately (its frame
+    //     is dead at stall time — verified live) and the ONLY completion path is the APREventQueue
+    //     event -> FAPREventQueueListener -> completion handler -> FEvent. Suppressing their event
+    //     stalls the boot forever in IAsyncReadRequest::WaitCompletion (spin RA eboot+0x22ea954).
+    // The observable that separates them (only ReadFile-level distinction found across 4 runs /
+    // 90 reads each): the async wrapper passes a live 8th argument — a pointer into its OWN stack
+    // frame just above the request object (arg8 - req == +0x94 in every capture, 3 independent
+    // runs) — while sync callsites leave frame residue there (small ints, code addresses, heap
+    // garbage). f_apr_read_submit marks each request eventful/sync at ReadFile time; the ASoW
+    // submit consumes the mark. CONFIDENCE: MED — the discriminator is empirical (single eventful
+    // specimen at implementation time, deterministic across runs; every subsequent streaming read
+    // of a full boot validates or refutes it loudly: a missed eventful read re-stalls, a false
+    // positive crashes the listener).
+    std::mutex g_apr_eventful_mx;
+    std::unordered_map<uint64_t, bool> g_apr_eventful;   // req/cb ptr -> eventful (updated per ReadFile)
+}
+void prosper_apr_mark_eventful(uint64_t req, bool eventful) {
+    std::lock_guard<std::mutex> lk(g_apr_eventful_mx);
+    g_apr_eventful[req] = eventful;   // stack frames are reused: update, don't accumulate stale marks
+    if (g_apr_eventful.size() > 4096) g_apr_eventful.clear();   // bound (frames recycle constantly)
+}
+namespace {
+    bool apr_req_eventful(uint64_t req) {
+        std::lock_guard<std::mutex> lk(g_apr_eventful_mx);
+        auto it = g_apr_eventful.find(req);
+        return it != g_apr_eventful.end() && it->second;
+    }
+}
+
+static uint64_t apr_cb_set_equeue(uint64_t command_size, bool eager_completion,
+                                 uint64_t a0, uint64_t a1, uint64_t a2,
+                                 uint64_t a3, uint64_t a4, uint64_t a5) {
+    ampr_arglog("H896Pt-yB4I(CbSetEqueue)", a0, a1, a2, a3, a4, a5);
+    if (a1) prosper_eq_add_apr(a1, (int64_t)a2);
+    bool start_worker = false;
+    if (a0) {
+        AprBoundState& state = apr_bound_state();
+        std::lock_guard<std::mutex> lk(state.mx);
+        bool seen = false;
+        for (auto& b : state.cbs)
+            if (b.cb == a0) {
+                b.tag = a3; b.eq = a1; b.id = (int64_t)a2;
+                b.eq_identity = prosper_eq_identity(a1);
+                b.deduplicate_completion = eager_completion;
+                b.completion_posted = false;
+                b.fallback_pending = eager_completion && a1 && a3;
+                b.fallback_due = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(10);
+                seen = true;
+                break;
+            }
+        if (!seen)
+            state.cbs.push_back({ a0, a3, a1, prosper_eq_identity(a1), (int64_t)a2,
+                                  eager_completion, false,
+                                  eager_completion && a1 && a3,
+                                  std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(10) });
+        if (eager_completion && !state.worker_started) {
+            state.worker_started = true;
+            start_worker = true;
+        }
+    }
+    prosper_ampr_advance(a0, command_size);
+    // prosper executes ReadFile eagerly while this completion command is appended. Normally the
+    // guest submits immediately and k_apr_submit posts the event. Pathless can drain its work queue
+    // with one partial 3.20 batch left unsent, though: no later append rechecks the flush gate and
+    // every worker sleeps waiting for that already-complete read. After a grace period, complete
+    // only a binding that still has not been claimed by submit. Rebinding replaces the buffer's tag
+    // and deadline, while completion_posted deduplicates the submit and fallback paths.
+    if (start_worker) std::thread(apr_tail_worker).detach();
+    if (eager_completion) {
+        apr_bound_state().cv.notify_one();
+    }
+    return 0;
+}
+
+static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                  bool write_result_outputs) {
+    unsigned ring = a1 ? (unsigned)(a1 - 1) & 0x3f : 0;
+    // Completion-token contract (issues #180/#208 — guest submit path eboot+0x22a02b0, handler
+    // +0x229dcb0, listener +0x22740b0, listener-ctx ctor +0x22a0670; full write-up in
+    // hle_kernel_time.cpp and docs/UE4_APR_IOSTORE_BRINGUP.md):
+    //   - H896-BOUND cb (the batched/streaming channel): the completion token IS the binding tag,
+    //     (ring<<58)|counter with the counter drawn from the guest's own per-ring sequence seeded
+    //     at 1000 ([ctx+0xc0+ring*0x28], ctor-initialized 0x3e8). The guest tracks it at
+    //     [slot+0x10] AND in a {token -> callback} hash; the listener's walk is ctor-seeded to
+    //     start exactly at 1000 (last-processed = 0x3e7). We post the tag VERBATIM (deferred) on
+    //     the binding's own equeue — nothing else. The out slots are NOT written: a2/a3 alias the
+    //     request's completion RECORD ({status@req+0x28, bytes@req+0x30}, already completed
+    //     {0,size} by ReadFile) — writing a token there marks the record FAILED (nonzero status,
+    //     checked at eboot+0x22738a5; live-verified "GEngineLoop.PreInit Failed!").
+    //   - UNBOUND cb (mount-era sync flow, ring_1b=6 async-archive flow): hand out our own
+    //     per-ring counter token through the out slots (the engine stores it verbatim where it
+    //     tracks the read) and post NO event — these flows are completion-record-polled, and any
+    //     invented-counter event would REGRESS the listener's ctor-seeded last-processed via its
+    //     unconditional last:=cnt store (+0x2274143), setting up the fatal +0x229df3e walk (the
+    //     #180 residual fault). CONFIDENCE: HIGH (static disassembly + live tag-echo runs).
+    //
+    // What makes a cb "bound" is the EQUEUE, not a nonzero tag. CRI ADX2 (cri_ware_unity.prx, first
+    // seen in Tales of Graces f Remastered PPSA19991) registers its APR id with
+    // sceKernelAddAmprEvent, binds with H896Pt-yB4I(cb, eq, id, tag=0, ...) — the tag argument is a
+    // literal `xor ecx,ecx` at cri+0x11b88f — submits with the two-argument
+    // sceKernelAprSubmitCommandBuffer at cri+0x11b90b, and then blocks in
+    // sceKernelWaitEqueue(eq, &ev, 1, &n, NULL) at cri+0x11ba65 with a NULL timeout, retrying until
+    // sceKernelGetEventId(&ev) equals its id. That wait tests the event IDENT and never the tag, so
+    // zero is a legitimate payload rather than an absent binding. Gating delivery on `bc.tag` made
+    // the submit post nothing and hung the loader thread forever on a read prosper had already
+    // completed. Binding to a real equeue IS the guest asking for completion delivery, so the
+    // equeue — not the tag — is what makes a buffer bound. The unbound rule above is unchanged;
+    // that is the one #180 forbids.
+    //
+    // The surviving `bc.eq` term is defence-in-depth, not load-bearing: a binding recorded with
+    // a1 == 0 gets eq_identity 0, and prosper_eq_post_apr_token already returns early on that, so
+    // dropping the term would produce no observable spurious post. Keep it as a cheap local
+    // statement of intent — do not add a mutation to "prove" it, since no such mutation is
+    // observable.
+    //
+    // "Echoed verbatim" is true only in the id==0 pointer dialect. prosper_eq_post_apr_token
+    // branches on the binding's id: id==0 delivers this exact token, while id!=0 delivers
+    // (ring<<58) | per-(eq,ring) high-water mark, so a zero tag there arrives as a counter value
+    // that merely happens to be 0 on a fresh queue. Harmless for CRI, whose waiter tests only the
+    // ident, but do not read this call as a guarantee that the tag reaches the guest unmodified.
+    //
+    // The 3.20 sibling names the semantics: o67gODLFpls is
+    // sceAmprCommandBufferWriteKernelEventQueueOnCompletion — the tag is the VALUE WRITTEN on
+    // completion, and zero is a legal value to write. (H896Pt-yB4I itself is not in the 3.20
+    // database; prosper still labels it "AprCbSetEventQueue?".)
+    // CONFIDENCE: HIGH (guest disassembly + live boot A/B; firmware DB for the sibling's name).
+    //
+    // Deliberately NOT changed: `fallback_pending` in apr_cb_set_equeue still requires a nonzero
+    // tag. That deferred path exists only for Pathless's unsent PS5 3.20 tail, no title is known to
+    // bind a 3.20 buffer with a zero tag and then never submit it, and firing it without evidence
+    // would post events no guest asked for.
+    AprBoundCb bc{};
+    bool should_post = false;
+    const bool bound = apr_cb_submit_state(a0, &bc, &should_post);
+    const bool tag_echo = bound && bc.eq;
+    uint64_t token = tag_echo ? bc.tag : prosper_apr_next_token(ring);
+    if (!bound && write_result_outputs) {
+        if (a2 > 0xffff) apr_write_result_slot(a2, token);
+        if (a3 > 0xffff) apr_write_result_slot(a3, token);
+    }
+    if (amprlog()) fprintf(stderr, "[amprlog] AprSubmit%s cb=0x%llx ring1b=%llu out1=0x%llx out2=0x%llx -> token=0x%llx%s%s\n",
+                           write_result_outputs ? "AndGetResult" : "",
+                           (unsigned long long)a0, (unsigned long long)a1,
+                           (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)token,
+                           bound ? " (bound)" : "", apr_req_eventful(a0) ? " (arg8-async)" : "");
+    if (tag_echo && should_post)
+        prosper_eq_post_apr_token(bc.eq, bc.eq_identity, bc.id, bc.tag);
+    // Submit consumes the encoded commands. Pathless reuses completed pool buffers without calling
+    // the public Reset/ClearBuffer NIDs between batches, so the next append must observe a fresh
+    // cursor even though the fixed capacity remains attached to the command-buffer object.
+    ampr_cb_reset(a0);
+    return 0;
+}
+
+}  // namespace prosper — end of the shared APR completion block
+
 #if defined(__linux__) || defined(__APPLE__)
 #include "../host/posix_shim.hpp"
 #include <sys/mman.h>
@@ -148,6 +451,21 @@ void prosper_ampr_advance(uint64_t cb, uint64_t bytes) {
 #include <vector>
 
 namespace prosper {
+
+// #2139: unchanged from the pre-hoist code -- a plain store, exactly as the POSIX submit path has
+// always written its result slots. The caller already rejected obviously bogus addresses (<=0xffff).
+static void apr_write_result_slot(uint64_t addr, uint64_t value) {
+    *(uint64_t*)(uintptr_t)addr = value;
+}
+
+// #2139 POSIX sibling: process_vm_readv reports EFAULT instead of faulting (all-or-nothing per
+// iovec, so a partially mapped pair reports unreadable -- acceptable for a diagnostic).
+static bool apr_probe_guest_pair(uint64_t addr, uint64_t out[2]) {
+    struct iovec l { out, sizeof(uint64_t) * 2 },
+                 r { (void*)(uintptr_t)addr, sizeof(uint64_t) * 2 };
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)(sizeof(uint64_t) * 2);
+}
+
 
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
@@ -1422,7 +1740,6 @@ HLE(k_ampr_ok) { return 0; }
 // the APR read destination from a begin-cursor we never populate (k_ampr_ok returns 0 without
 // writing outputs) — i.e. whether the stale value in *(a1)/*(a2) is where the bogus
 // req+0x20 = freed-pool-block pointer comes from.
-namespace { bool amprlog() { static int v = getenv("PROSPER_AMPRLOG") ? 1 : 0; return v; } }
 // Last Ampr command-buffer (address/size) seen at init: the APR read-submit path inits its request
 // with (req, cbSize, 0, cbBuf, poolCtx, 3) — the actual read COMMAND (file offset / dest / size)
 // lives inside cbBuf (the "CB offset 40" of the guest's error message is a byte offset into it).
@@ -1459,29 +1776,6 @@ HLE(k_ampr_init) {
 // stubs). One of these likely carries the READ RANGE: the pak reads want the FPakInfo footer at
 // filesize-0xdd (a5 of the submit = 0xdd = footer size, 0x90 = utoc header size), so a per-read
 // {offset,size} must flow through some pre-submit call. CONFIDENCE: LOW until captured.
-static uint64_t ampr_arglog(const char* tag, uint64_t a0, uint64_t a1, uint64_t a2,
-                            uint64_t a3, uint64_t a4, uint64_t a5) {
-    if (amprlog()) {
-        fprintf(stderr, "[amprlog] %s a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
-                tag, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
-                (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
-        for (uint64_t p : { a0, a1, a2 }) if (p > 0xffff && !(p & 7)) {
-            // Fault-safe read (#1154): a passed-in guest pointer that is aligned and > 0xffff can still
-            // be UNMAPPED — GTA V's baQO9ez2gL4 passes a2=0x302200, which clears both guards but was
-            // never mapped. A raw *(uint64_t*)p deref SIGSEGVs in host HLE code and kills the very run
-            // this diagnostic is meant to observe. process_vm_readv returns EFAULT instead of faulting
-            // (all-or-nothing per iovec, so a partially-mapped pair reports UNMAPPED — acceptable here).
-            uint64_t v[2];
-            struct iovec l { v, sizeof v }, r { (void*)(uintptr_t)p, sizeof v };
-            if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof v)
-                fprintf(stderr, "[amprlog]   [0x%llx] = 0x%016llx 0x%016llx\n", (unsigned long long)p,
-                        (unsigned long long)v[0], (unsigned long long)v[1]);
-            else
-                fprintf(stderr, "[amprlog]   [0x%llx] = UNMAPPED\n", (unsigned long long)p);
-        }
-    }
-    return 0;
-}
 HLE(k_ampr_x1) {
     ampr_arglog("baQO9ez2gL4", a0, a1, a2, a3, a4, a5);
     ampr_cb_reset(a0);
@@ -1610,128 +1904,6 @@ HLE(k_ampr_write_address) {   // j0+3uJMxYJY (cb, address, value, flags)
 // token through the out slots and post nothing (record-polled). Full contract write-up in
 // hle_kernel_time.cpp. CONFIDENCE: HIGH (static disassembly of the guest submit/listener/handler
 // + live tag-echo captures).
-uint64_t prosper_apr_next_token(unsigned ring);                          // hle_kernel_time.cpp
-void prosper_eq_add_apr(uint64_t eq, int64_t id);                        // "
-uint64_t prosper_eq_identity(uint64_t eq);                               // " (lifetime guard)
-void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
-                               int64_t id, uint64_t token);              // " (tag echo, #208)
-namespace {
-    // Command-buffer ctxs bound to the APR event queue via H896Pt-yB4I, with the binding's a3 TAG
-    // and target equeue. The tag IS the guest-chosen completion token for that cb ((ring<<58)|n,
-    // observed n starting at 0x3e8=1000 and incrementing per binding — live capture 2026-07-09):
-    // the guest's listener context (an eboot GLOBAL, ctx+0xa8+ring*0x28 in-flight slot, expected
-    // token at [slot+0x10] — read live at the issue-#180 stall: ring-4 slot expecting exactly
-    // 0x10000000000003e8, the first H896 tag) tracks the cb under this exact value. The submit
-    // must ECHO it through the out slots and the completion event must carry it verbatim — the
-    // pre-#180 code posted an invented per-ring counter (seq 1,2,...) that could never match, so
-    // the engine believed batch #1 was in flight forever and the whole async IO pipeline jammed
-    // behind it (the CreateGlobalShaderMap precache stall).
-    struct AprBoundCb {
-        uint64_t cb, tag, eq, eq_identity;
-        int64_t id;
-        bool deduplicate_completion;
-        bool completion_posted;
-        bool fallback_pending;
-        std::chrono::steady_clock::time_point fallback_due;
-    };
-    struct AprBoundState {
-        std::mutex mx;
-        std::condition_variable cv;
-        std::vector<AprBoundCb> cbs;
-        bool worker_started = false;
-    };
-    // The fallback worker is detached and outlives main, so its synchronization state must not run
-    // static destructors during process shutdown.
-    AprBoundState& apr_bound_state() {
-        static AprBoundState* state = new AprBoundState;
-        return *state;
-    }
-    void apr_tail_worker() {
-        AprBoundState& state = apr_bound_state();
-        std::unique_lock<std::mutex> lk(state.mx);
-        for (;;) {
-            auto next = std::chrono::steady_clock::time_point::max();
-            for (const auto& b : state.cbs)
-                if (b.fallback_pending && b.fallback_due < next) next = b.fallback_due;
-            if (next == std::chrono::steady_clock::time_point::max()) {
-                state.cv.wait(lk);
-                continue;
-            }
-            if (state.cv.wait_until(lk, next) != std::cv_status::timeout) continue;
-
-            const auto now = std::chrono::steady_clock::now();
-            std::vector<AprBoundCb> ready;
-            for (auto& b : state.cbs) {
-                if (!b.fallback_pending || b.fallback_due > now) continue;
-                b.fallback_pending = false;
-                if (!b.deduplicate_completion || b.completion_posted) continue;
-                b.completion_posted = true;
-                ready.push_back(b);
-            }
-            lk.unlock();
-            for (const auto& b : ready)
-                prosper_eq_post_apr_token(b.eq, b.eq_identity, b.id, b.tag);
-            lk.lock();
-        }
-    }
-    bool apr_cb_submit_state(uint64_t cb, AprBoundCb* out, bool* should_post) {
-        AprBoundState& state = apr_bound_state();
-        std::lock_guard<std::mutex> lk(state.mx);
-        for (auto& b : state.cbs)
-            if (b.cb == cb) {
-                if (out) *out = b;
-                if (should_post) {
-                    *should_post = !b.deduplicate_completion || !b.completion_posted;
-                    if (b.deduplicate_completion) {
-                        b.completion_posted = true;
-                        b.fallback_pending = false;
-                    }
-                }
-                return true;
-            }
-        return false;
-    }
-    void apr_cb_destroy_320_binding(uint64_t cb) {
-        AprBoundState& state = apr_bound_state();
-        std::lock_guard<std::mutex> lk(state.mx);
-        auto it = std::find_if(state.cbs.begin(), state.cbs.end(), [&](const AprBoundCb& b) {
-            return b.cb == cb && b.deduplicate_completion;
-        });
-        if (it != state.cbs.end()) state.cbs.erase(it);
-    }
-    // Per-request "eventful" marks for UNBOUND one-shot cbs (issue #180). The engine drives two
-    // flavors of sceAmprAprCommandBufferReadFile through ONE wrapper (identical guest-RA chains):
-    //   - sync reads: the caller consumes the completion RECORD inline; NO equeue event may be
-    //     posted for them (the listener's hash-miss path faults at eboot+0x229df3e reading 0x10 —
-    //     re-verified 2026-07-09: posting events for every submit crashes there within seconds);
-    //   - async streaming reads: the submitting worker returns to its pool immediately (its frame
-    //     is dead at stall time — verified live) and the ONLY completion path is the APREventQueue
-    //     event -> FAPREventQueueListener -> completion handler -> FEvent. Suppressing their event
-    //     stalls the boot forever in IAsyncReadRequest::WaitCompletion (spin RA eboot+0x22ea954).
-    // The observable that separates them (only ReadFile-level distinction found across 4 runs /
-    // 90 reads each): the async wrapper passes a live 8th argument — a pointer into its OWN stack
-    // frame just above the request object (arg8 - req == +0x94 in every capture, 3 independent
-    // runs) — while sync callsites leave frame residue there (small ints, code addresses, heap
-    // garbage). f_apr_read_submit marks each request eventful/sync at ReadFile time; the ASoW
-    // submit consumes the mark. CONFIDENCE: MED — the discriminator is empirical (single eventful
-    // specimen at implementation time, deterministic across runs; every subsequent streaming read
-    // of a full boot validates or refutes it loudly: a missed eventful read re-stalls, a false
-    // positive crashes the listener).
-    std::mutex g_apr_eventful_mx;
-    std::unordered_map<uint64_t, bool> g_apr_eventful;   // req/cb ptr -> eventful (updated per ReadFile)
-}
-void prosper_apr_mark_eventful(uint64_t req, bool eventful) {
-    std::lock_guard<std::mutex> lk(g_apr_eventful_mx);
-    g_apr_eventful[req] = eventful;   // stack frames are reused: update, don't accumulate stale marks
-    if (g_apr_eventful.size() > 4096) g_apr_eventful.clear();   // bound (frames recycle constantly)
-}
-namespace {
-    bool apr_req_eventful(uint64_t req) {
-        std::lock_guard<std::mutex> lk(g_apr_eventful_mx);
-        auto it = g_apr_eventful.find(req);
-        return it != g_apr_eventful.end() && it->second;
-    }
-}
 HLE(k_ampr_measure_write_equeue) { // sSAUCCU1dv4 = sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00
     ampr_arglog("sSAUCCU1dv4(MeasureWriteEqueue)", a0, a1, a2, a3, a4, a5);
     // DOLL's older SDK wrapper passes the live event queue and APR id here while constructing its
@@ -1750,52 +1922,6 @@ HLE(k_ampr_destruct_320) {
 // kernel-event record. Keep it separate from the older `_04_00` compatibility path above: DOLL
 // passes a live queue to that legacy sizing NID and depends on its historical 20-byte result.
 HLE(k_ampr_measure_write_equeue_on_completion) { return 0x20; }
-static uint64_t apr_cb_set_equeue(uint64_t command_size, bool eager_completion,
-                                 uint64_t a0, uint64_t a1, uint64_t a2,
-                                 uint64_t a3, uint64_t a4, uint64_t a5) {
-    ampr_arglog("H896Pt-yB4I(CbSetEqueue)", a0, a1, a2, a3, a4, a5);
-    if (a1) prosper_eq_add_apr(a1, (int64_t)a2);
-    bool start_worker = false;
-    if (a0) {
-        AprBoundState& state = apr_bound_state();
-        std::lock_guard<std::mutex> lk(state.mx);
-        bool seen = false;
-        for (auto& b : state.cbs)
-            if (b.cb == a0) {
-                b.tag = a3; b.eq = a1; b.id = (int64_t)a2;
-                b.eq_identity = prosper_eq_identity(a1);
-                b.deduplicate_completion = eager_completion;
-                b.completion_posted = false;
-                b.fallback_pending = eager_completion && a1 && a3;
-                b.fallback_due = std::chrono::steady_clock::now() +
-                                 std::chrono::milliseconds(10);
-                seen = true;
-                break;
-            }
-        if (!seen)
-            state.cbs.push_back({ a0, a3, a1, prosper_eq_identity(a1), (int64_t)a2,
-                                  eager_completion, false,
-                                  eager_completion && a1 && a3,
-                                  std::chrono::steady_clock::now() +
-                                      std::chrono::milliseconds(10) });
-        if (eager_completion && !state.worker_started) {
-            state.worker_started = true;
-            start_worker = true;
-        }
-    }
-    prosper_ampr_advance(a0, command_size);
-    // prosper executes ReadFile eagerly while this completion command is appended. Normally the
-    // guest submits immediately and k_apr_submit posts the event. Pathless can drain its work queue
-    // with one partial 3.20 batch left unsent, though: no later append rechecks the flush gate and
-    // every worker sleeps waiting for that already-complete read. After a grace period, complete
-    // only a binding that still has not been claimed by submit. Rebinding replaces the buffer's tag
-    // and deadline, while completion_posted deduplicates the submit and fallback paths.
-    if (start_worker) std::thread(apr_tail_worker).detach();
-    if (eager_completion) {
-        apr_bound_state().cv.notify_one();
-    }
-    return 0;
-}
 HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I: legacy eager path keeps zero used bytes
     return apr_cb_set_equeue(0, false, a0, a1, a2, a3, a4, a5);
 }
@@ -1812,85 +1938,6 @@ HLE(k_apr_cb_set_equeue_320) {   // o67gODLFpls: PS5 3.20 0x20-byte completion c
 // to contain. Writing a token through those would be writing through residue — and this file already
 // documents that a nonzero value landing in a request's completion record marks the read FAILED
 // (eboot+0x22738a5). That is why the plain variant is a separate entry rather than an alias.
-static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
-                                  bool write_result_outputs) {
-    unsigned ring = a1 ? (unsigned)(a1 - 1) & 0x3f : 0;
-    // Completion-token contract (issues #180/#208 — guest submit path eboot+0x22a02b0, handler
-    // +0x229dcb0, listener +0x22740b0, listener-ctx ctor +0x22a0670; full write-up in
-    // hle_kernel_time.cpp and docs/UE4_APR_IOSTORE_BRINGUP.md):
-    //   - H896-BOUND cb (the batched/streaming channel): the completion token IS the binding tag,
-    //     (ring<<58)|counter with the counter drawn from the guest's own per-ring sequence seeded
-    //     at 1000 ([ctx+0xc0+ring*0x28], ctor-initialized 0x3e8). The guest tracks it at
-    //     [slot+0x10] AND in a {token -> callback} hash; the listener's walk is ctor-seeded to
-    //     start exactly at 1000 (last-processed = 0x3e7). We post the tag VERBATIM (deferred) on
-    //     the binding's own equeue — nothing else. The out slots are NOT written: a2/a3 alias the
-    //     request's completion RECORD ({status@req+0x28, bytes@req+0x30}, already completed
-    //     {0,size} by ReadFile) — writing a token there marks the record FAILED (nonzero status,
-    //     checked at eboot+0x22738a5; live-verified "GEngineLoop.PreInit Failed!").
-    //   - UNBOUND cb (mount-era sync flow, ring_1b=6 async-archive flow): hand out our own
-    //     per-ring counter token through the out slots (the engine stores it verbatim where it
-    //     tracks the read) and post NO event — these flows are completion-record-polled, and any
-    //     invented-counter event would REGRESS the listener's ctor-seeded last-processed via its
-    //     unconditional last:=cnt store (+0x2274143), setting up the fatal +0x229df3e walk (the
-    //     #180 residual fault). CONFIDENCE: HIGH (static disassembly + live tag-echo runs).
-    //
-    // What makes a cb "bound" is the EQUEUE, not a nonzero tag. CRI ADX2 (cri_ware_unity.prx, first
-    // seen in Tales of Graces f Remastered PPSA19991) registers its APR id with
-    // sceKernelAddAmprEvent, binds with H896Pt-yB4I(cb, eq, id, tag=0, ...) — the tag argument is a
-    // literal `xor ecx,ecx` at cri+0x11b88f — submits with the two-argument
-    // sceKernelAprSubmitCommandBuffer at cri+0x11b90b, and then blocks in
-    // sceKernelWaitEqueue(eq, &ev, 1, &n, NULL) at cri+0x11ba65 with a NULL timeout, retrying until
-    // sceKernelGetEventId(&ev) equals its id. That wait tests the event IDENT and never the tag, so
-    // zero is a legitimate payload rather than an absent binding. Gating delivery on `bc.tag` made
-    // the submit post nothing and hung the loader thread forever on a read prosper had already
-    // completed. Binding to a real equeue IS the guest asking for completion delivery, so the
-    // equeue — not the tag — is what makes a buffer bound. The unbound rule above is unchanged;
-    // that is the one #180 forbids.
-    //
-    // The surviving `bc.eq` term is defence-in-depth, not load-bearing: a binding recorded with
-    // a1 == 0 gets eq_identity 0, and prosper_eq_post_apr_token already returns early on that, so
-    // dropping the term would produce no observable spurious post. Keep it as a cheap local
-    // statement of intent — do not add a mutation to "prove" it, since no such mutation is
-    // observable.
-    //
-    // "Echoed verbatim" is true only in the id==0 pointer dialect. prosper_eq_post_apr_token
-    // branches on the binding's id: id==0 delivers this exact token, while id!=0 delivers
-    // (ring<<58) | per-(eq,ring) high-water mark, so a zero tag there arrives as a counter value
-    // that merely happens to be 0 on a fresh queue. Harmless for CRI, whose waiter tests only the
-    // ident, but do not read this call as a guarantee that the tag reaches the guest unmodified.
-    //
-    // The 3.20 sibling names the semantics: o67gODLFpls is
-    // sceAmprCommandBufferWriteKernelEventQueueOnCompletion — the tag is the VALUE WRITTEN on
-    // completion, and zero is a legal value to write. (H896Pt-yB4I itself is not in the 3.20
-    // database; prosper still labels it "AprCbSetEventQueue?".)
-    // CONFIDENCE: HIGH (guest disassembly + live boot A/B; firmware DB for the sibling's name).
-    //
-    // Deliberately NOT changed: `fallback_pending` in apr_cb_set_equeue still requires a nonzero
-    // tag. That deferred path exists only for Pathless's unsent PS5 3.20 tail, no title is known to
-    // bind a 3.20 buffer with a zero tag and then never submit it, and firing it without evidence
-    // would post events no guest asked for.
-    AprBoundCb bc{};
-    bool should_post = false;
-    const bool bound = apr_cb_submit_state(a0, &bc, &should_post);
-    const bool tag_echo = bound && bc.eq;
-    uint64_t token = tag_echo ? bc.tag : prosper_apr_next_token(ring);
-    if (!bound && write_result_outputs) {
-        if (a2 > 0xffff) *(uint64_t*)(uintptr_t)a2 = token;
-        if (a3 > 0xffff) *(uint64_t*)(uintptr_t)a3 = token;
-    }
-    if (amprlog()) fprintf(stderr, "[amprlog] AprSubmit%s cb=0x%llx ring1b=%llu out1=0x%llx out2=0x%llx -> token=0x%llx%s%s\n",
-                           write_result_outputs ? "AndGetResult" : "",
-                           (unsigned long long)a0, (unsigned long long)a1,
-                           (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)token,
-                           bound ? " (bound)" : "", apr_req_eventful(a0) ? " (arg8-async)" : "");
-    if (tag_echo && should_post)
-        prosper_eq_post_apr_token(bc.eq, bc.eq_identity, bc.id, bc.tag);
-    // Submit consumes the encoded commands. Pathless reuses completed pool buffers without calling
-    // the public Reset/ClearBuffer NIDs between batches, so the next append must observe a fresh
-    // cursor even though the fixed capacity remains attached to the command-buffer object.
-    ampr_cb_reset(a0);
-    return 0;
-}
 
 HLE(k_apr_submit) {   // sceKernelAprSubmitCommandBufferAndGetResult (cb, ring_1based, out1, out2)
     return apr_submit_common(a0, a1, a2, a3, /*write_result_outputs=*/true);
@@ -2510,6 +2557,37 @@ int dmem_caller_scan_slots_for_test(const volatile uint64_t* frame, int want) {
 #include <vector>
 
 namespace prosper {
+
+// #2139: Windows sibling. Same contract, but fault-safe: this half never dereferences a guest
+// pointer it has not proven writable, because a fault here kills the emulator rather than the
+// guest (same rule as k_ampr_write_address below). A slot that is not committed and writable is
+// skipped -- the submit still posts its completion event, which is the part the guest waits on.
+static void apr_write_result_slot(uint64_t addr, uint64_t value) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), &mbi, sizeof(mbi)) &&
+        mbi.State == MEM_COMMIT && (mbi.Protect & kWritable) &&
+        static_cast<uintptr_t>(addr) + sizeof(uint64_t) <=
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize) {
+        *reinterpret_cast<uint64_t*>(static_cast<uintptr_t>(addr)) = value;
+    }
+}
+
+// #2139 Windows sibling: prove the whole pair is committed and readable before touching it.
+static bool apr_probe_guest_pair(uint64_t addr, uint64_t out[2]) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), &mbi, sizeof(mbi)) ||
+        mbi.State != MEM_COMMIT || !(mbi.Protect & kReadable) || (mbi.Protect & PAGE_GUARD) ||
+        static_cast<uintptr_t>(addr) + sizeof(uint64_t) * 2 >
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize)
+        return false;
+    memcpy(out, reinterpret_cast<const void*>(static_cast<uintptr_t>(addr)), sizeof(uint64_t) * 2);
+    return true;
+}
+
 
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
@@ -5208,9 +5286,29 @@ HLE(k_ampr_getsize) {
 }
 HLE(k_ampr_measure_write_equeue) { return 20; }
 HLE(k_ampr_measure_write_equeue_on_completion) { return 0x20; }
-HLE(k_ampr_append_equeue_legacy) { return 0; }
-HLE(k_ampr_append_equeue_320) { prosper_ampr_advance(a0, 0x20); return 0; }
-HLE(k_ampr_submit) { ampr_cb_reset(a0); return 0; }
+// #2139: these three were stubs — bind recorded nothing, submit only reset the buffer — so Windows
+// never posted an APREventQueue completion. An async streaming read's consumer blocks until that
+// event arrives, so it never woke and never issued another read (Blue Prince read ~1.96 GB, then
+// stopped all I/O and presentation for 20+ minutes). They now call the same shared implementations
+// the POSIX half has always used; `apr_cb_set_equeue` performs the 0x20 buffer advance itself, so
+// the old prosper_ampr_advance here is subsumed rather than lost.
+HLE(k_ampr_append_equeue_legacy) {   // H896Pt-yB4I: legacy eager path keeps zero used bytes
+    return apr_cb_set_equeue(0, false, a0, a1, a2, a3, a4, a5);
+}
+HLE(k_ampr_append_equeue_320) {      // o67gODLFpls: PS5 3.20 0x20-byte completion command
+    return apr_cb_set_equeue(0x20, true, a0, a1, a2, a3, a4, a5);
+}
+HLE(k_ampr_submit) {                 // ASoW5WE-UPo: …AndGetResult — writes the result slots
+    return apr_submit_common(a0, a1, a2, a3, /*write_result_outputs=*/true);
+}
+HLE(k_ampr_submit_plain) {           // eE4Szl8sil8: same submit, no result slots (#1629)
+    if (amprlog())
+        fprintf(stderr, "[amprlog] AprSubmit(plain) eE4Szl8sil8 cb=0x%llx ring1b=%llu "
+                        "unused_a2=0x%llx unused_a3=0x%llx (discarded: no result slots)\n",
+                (unsigned long long)a0, (unsigned long long)a1,
+                (unsigned long long)a2, (unsigned long long)a3);
+    return apr_submit_common(a0, a1, /*out1=*/0, /*out2=*/0, /*write_result_outputs=*/false);
+}
 HLE(k_ampr_get_current_offset) { return ampr_cb_offset(a0); }
 HLE(k_ampr_measure_write_address) { return 32; }
 
@@ -5565,7 +5663,7 @@ void register_kernel_mem_hle() {
     // binding and equeue-post machinery is POSIX-only, so AndGetResult returns success here without
     // publishing a token. Pre-existing, not widened by this change, and tracked as #1657.
     // The _TEST-suffixed NIDs are deliberately left unimplemented — see the POSIX block for why.
-    Hle::register_fn("eE4Szl8sil8", (HleFn)k_ampr_submit, "sceKernelAprSubmitCommandBuffer");
+    Hle::register_fn("eE4Szl8sil8", (HleFn)k_ampr_submit_plain, "sceKernelAprSubmitCommandBuffer");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
                      "sceAmprCommandBufferGetCurrentOffset");
     Hle::register_fn("4fgtGfXDrFc", (HleFn)k_ampr_measure_write_address,
