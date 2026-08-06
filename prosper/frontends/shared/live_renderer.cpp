@@ -6152,8 +6152,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // control that can only observe silence cannot tell "correctly declined"
                         // from "never reached" — and a decline is exactly what the Bendy
                         // (PPSA27616) reused-memory case must produce, so it has to be legible.
-                        static std::atomic<uint64_t> guest_scanout_reports{0};
-                        const uint64_t ord = guest_scanout_reports.fetch_add(1) + 1;
+                        //
+                        // Budgeted PER DECISION, which is the whole point on this line and not
+                        // ceremony (diag_ratelimit.hpp: "budget per key, or a noisy key exhausts the
+                        // log before the one under investigation gets a line"). A title that
+                        // declines on every flip would otherwise push the first PUBLISH past the
+                        // cap, and "no publish line" is exactly the reading the negative control
+                        // rests on. With its own counter the first publish is ordinal 1 and always
+                        // prints, so the absence of a `publish` line means zero publishes.
+                        static std::atomic<uint64_t>
+                            guest_scanout_reports[(size_t)
+                                prosper::frontend::GuestScanoutDecision::SkipNotAuthored + 1]{};
+                        const uint64_t ord =
+                            guest_scanout_reports[(size_t)decision].fetch_add(1) + 1;
                         if (prosper::diag_should_print(ord))
                             fprintf(stderr,
                                     "[rtt] GUEST SCANOUT #%llu: no present source and no renderer "

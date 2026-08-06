@@ -524,6 +524,55 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
 - **`pixel_crc32` for a black frame is not a fingerprint.** `666f7b3f` is just "black 3840x2160" and
   recurs on three unrelated titles, so it identifies a resolution, not a title or a defect. Do not use
   a black-frame hash as an oracle or to claim two titles share a cause. #1990.
+- **"No pass targets the flipped VideoOut buffer" is not necessarily a defect in pass selection — some
+  titles never draw into their scanout at all, and the frame is in the buffer anyway.** This kills
+  #1968 §5's framing (that a post-intro change makes Frontiers stop targeting the scanout). A
+  `PROSPER_PASS_LOG` census over a full Sonic Frontiers boot records **`vo=1` on 0 of ~3,700 passes**,
+  in every phase — including the intro, which prosper composites *correctly*. `PROSPER_DUMP_PERSISTENT`
+  agrees from the other side: `scanout=MISS` on every submit, no `g_rtt` entry at the flipped address
+  (`0x200a160000` / `0x200c140000`), and that address is not the base of a single pass. What prosper
+  publishes during the intro is an internal RTT (`0x20851c0000`) that happens to be CPU-materialized
+  and happens to hold the movie; when that stops, selection has nothing left, which is the whole of the
+  "black composite". So the question to ask of a scanout that no pass writes is not "which pass was
+  mis-selected" but **"what is in the guest's flipped buffer"** — for this title, the finished frame.
+  #1968.
+- **A registered scanout's bytes are swizzled, and every raw-scanout read took them literally.**
+  `videoout_copy_*` memcpy'd guest display memory while `VideoOutBufferSnapshot::tiling_mode` had
+  recorded the layout all along, so a TILE-mode title's `raw_scanout` present was horizontal-band
+  noise. Two things not to re-derive: (1) a `PROSPER_DUMP_SCANOUT` dump that looks like bands is a
+  **real, tiled** frame, not an empty one — Frontiers' bands de-swizzle under SW_64KB_R_X into an exact
+  SEGA logo and an exact intro shot, while `distinct_rgb_colors` in the low thousands reads as
+  "content" for something that is not an image; (2) a `width*height*4` read of a tiled surface is
+  **short** — the tail past the nominal end holds real texels of the last block row, so truncating it
+  drops part of the bottom-right (measured: the bottom-right 1024x48 of a 3840x2160 scanout loses half
+  its non-black pixels). #1968.
+- **"Not all its bytes are zero" is NOT evidence that the guest wrote a buffer, and a present path must
+  never treat it as such.** It holds only for a freshly zeroed allocation. A title that re-registers a
+  scanout over **reused** memory passes it with whatever the previous owner left there, while prosper's
+  render-target map misses precisely *because* the address is new — so the test that was meant to
+  protect a title publishes stale garbage in place of the retained good frame, which is #1990's failure
+  class through a new door. This cost #2026 a revert (#2044). The workable test is differential:
+  fingerprint the buffer when the guest registers it and require the contents to have *changed* since
+  (`videoout_read_front_linear`). Note the corollary — authorship is not brightness: a frame the guest
+  deliberately clears to opaque black is authored, and publishing black is then correct. #1968 / #2044.
+- **A page-mapped probe is not proof that a buffer owns the bytes past its nominal end.**
+  `gpu::guest_readable` answers "are these pages mapped", so an adjacent unrelated mapping passes it,
+  and two separately allocated scanouts that merely land far apart satisfy a registration-stride test
+  as well. At 3840x2160 that combination licenses a ~240 KiB silent over-read into another object,
+  surfacing as garbage texels in the bottom-right block row. Use
+  `host::guest_readable_mapping_containing` — one registered mapping spanning the whole range — *in
+  addition to* the stride, because each covers the other's blind spot. #1968 / #2044.
+- **Sonic Frontiers' post-intro black frame is not a present-path defect — the guest's own display
+  buffer is black, and prosper is now showing exactly that.** With the flipped buffer published, a
+  720 s default launch reports `[rtt] GUEST SCANOUT … publish` with ordinals reaching **2,048** (one
+  fresh read per guest flip) against **9** `PRESENT SOURCE EXTENT MISMATCH` lines, all of them during
+  boot with `fresh=0 retained=0`. That distinction is the whole point and it is easy to get wrong:
+  `rgb_nonblack=0, distinct_rgb=1` **cannot** tell "publishing black" from "declining and freezing on
+  the last logo", because it ignores alpha and both read identically — the *counters* settle it. Every
+  post-140 s frame is a fresh read of the guest buffer, so the buffer really is black; the SEGA logo,
+  Cyber Space intro, Sonic Team logo and middleware credits from the same run are exact 4K frames. Do
+  not look for a lost render target, a mis-selected pass or a dropped publish for this symptom: the
+  remaining blocker is upstream guest progression. #1968 / #2023.
 
 ## Recommended implementation order
 

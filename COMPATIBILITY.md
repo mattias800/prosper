@@ -21,7 +21,7 @@ Last updated: 2026-08-05
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 Frontend loop; no visual milestone yet | [#1871](https://github.com/mattias800/prosper/issues/1871) |
-| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🔬 4K opening logo sequence; frames stop before the title screen | [#1891](https://github.com/mattias800/prosper/issues/1891) |
+| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🔬 Full 4K opening sequence; the guest's own display buffer then goes black before the title screen | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K SEGA logo; the composite goes uniform before a title screen | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
@@ -108,12 +108,17 @@ The complete base game, update, and installed DLC reach the frontend loop, but n
 
 ## Sonic Frontiers — `PPSA03831`
 
+<p align="center"><img src="assets/screenshots/sonic-frontiers-sega-logo.png" alt="Sonic Frontiers — SEGA logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-middleware-credits.png" alt="Sonic Frontiers — middleware credits"></p>
 <p align="center"><img src="assets/screenshots/sonic-frontiers-opening-sequence.png" alt="Sonic Frontiers — opening logo sequence"></p>
 <p align="center"><img src="assets/screenshots/sonic-frontiers-sonic-team-logo.png" alt="Sonic Frontiers — Sonic Team logo"></p>
 
-A default launch reaches the game's own opening logo sequence, composited by the live renderer at
-3840×2160. Frame production then stops before a title screen is reached. See the
-[tracker](https://github.com/mattias800/prosper/issues/1891).
+A default launch reaches the game's whole opening sequence at 3840×2160 — the SEGA logo, the Cyber
+Space intro, the Sonic Team logo and the middleware credits. The title composites those into the
+display buffer it flips rather than through render passes, so publishing them needed the flipped
+buffer itself to become a present source. **No title screen is reached:** from about 140 s the
+display buffer the title keeps flipping is itself black, and prosper reads and publishes it fresh on
+every flip. See the [tracker](https://github.com/mattias800/prosper/issues/1891).
 
 ## Sonic Racing: CrossWorlds — `PPSA08804`
 
