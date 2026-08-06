@@ -505,6 +505,12 @@ if(TARGET prosper_core)
   target_include_directories(test_rtt_scale PRIVATE frontends/shared)
   add_test(NAME rtt_scale COMMAND test_rtt_scale)
 
+  # MRT-prefix truncation: which bound colour slot may join a pass, and which extent comparisons are
+  # evidence of a real conflict rather than an unmeasured 0x0. Pure integer arithmetic, no deps.
+  add_executable(test_mrt_extent frontends/shared/test_mrt_extent.cpp)
+  target_include_directories(test_mrt_extent PRIVATE frontends/shared)
+  add_test(NAME mrt_extent COMMAND test_mrt_extent)
+
   add_executable(test_rtt_injection frontends/shared/test_rtt_injection.cpp)
   target_include_directories(test_rtt_injection PRIVATE frontends/shared)
   add_test(NAME rtt_injection COMMAND test_rtt_injection)

@@ -4,6 +4,7 @@
 #include "rtt_authority.hpp"
 #include "rtt_injection.hpp"
 #include "rtt_scale.hpp"
+#include "mrt_extent.hpp"               // which MRT slot may join a pass (measured extents only)
 #include "readback_policy.hpp"
 #include "capture_renderer_policy.hpp"
 #include "write_watch_policy.hpp"
@@ -5273,9 +5274,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         for (uint32_t slot = 1; slot < mrt_count; ++slot) {
                             const auto binding = color_binding(*render_pass.front(), slot);
                             // Sparse exports retain their native Location through dummy attachments.
-                            // Only a real target whose extent differs from MRT0 truncates the prefix.
-                            if (pass_bases[slot] && (binding.width != native_w ||
-                                binding.height != native_h)) {
+                            // Only a real target whose extent is KNOWN to differ from the pass
+                            // extent truncates the prefix. A 0x0 on either side means the guest's
+                            // CB_COLORn_ATTRIB2 was never seen, not a 0-pixel surface, and an
+                            // unmeasured extent is no evidence of a conflict — comparing it for
+                            // equality dropped the whole attachment silently (#2114).
+                            if (pass_bases[slot] && prosper::frontend::mrt_extent_conflicts(
+                                    binding.width, binding.height, native_w, native_h)) {
                                 if (rtt_log)
                                     fprintf(stderr,
                                             "[rtt] truncate MRT prefix at c%u target=0x%llx "
@@ -5285,6 +5290,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 mrt_count = slot;
                                 break;
                             }
+                            // Fail-visible: name the attachment that was kept on missing extent
+                            // data, so an unmeasured extent is a reported state rather than a
+                            // silent one in either direction.
+                            if (rtt_log && pass_bases[slot] &&
+                                (!prosper::frontend::mrt_extent_known(binding.width, binding.height) ||
+                                 !prosper::frontend::mrt_extent_known(native_w, native_h)))
+                                fprintf(stderr,
+                                        "[rtt] keep MRT c%u target=0x%llx on unmeasured extent "
+                                        "%ux%u; MRT0 is %ux%u\n",
+                                        slot, (unsigned long long)pass_bases[slot],
+                                        binding.width, binding.height, native_w, native_h);
                         }
                     }
                     const bool use_color1 = mrt_count > 1;
