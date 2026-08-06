@@ -73,17 +73,33 @@ From t≈80 s the presented frame is a single colour, `RGBA(1,0,1,255)`, while `
 it is alive** (instrument trap 90). The engine itself is healthy — the AGC submission threads,
 `RHIThread`, `RenderThread 0` and `CriManaDecodeTh` all accumulate CPU time throughout.
 
-**The uniform frame is a PHASE, not a terminal state** (2026-08-06). A 270 s arm sampling every 30 s
-leaves it: `pixel_crc32` is `8bf1b518` (the uniform colour) at t=90…240 s and `666f7b3f` (pure black,
-0 non-black pixels) again at t=270 s, with `frame_seq` 945 → 2,630 and `present_count` 290 → 851. So
-the boot sequence is still advancing behind a composite that shows almost nothing, and the earlier
-"byte-identical for 300 s / the state it stays in" framing was an artifact of where the samples fell.
-Do not treat a run that ends inside the uniform window as having reached the end of the sequence.
+**How long it lasts, measured to 900 s** (2026-08-06). A clean 900 s arm sampling every 30 s stays in
+the uniform state for **810 s without a single pixel changing**: `pixel_crc32` `8bf1b518` at every
+sample from t=90 s to t=900 s, while `frame_seq` climbs 1,041 → 9,183 and `present_count` 322 → 3,035.
+`rendered_samples` is 30 of 30 and `pixel_distinct_frames` is 3 (black prefix, logo, uniform). Nothing
+in fifteen minutes of default launch leaves this state.
 
 The composite is thin rather than absent. With `PROSPER_SUBMITLOG_DIM=3840x2160`, the 10 s window
 before a uniform sample carries **53 submits targeting the 4K present extent, 89 draw items in
 total** — one to two draws per submit, the same order as during the SEGA logo (44 submits / 73 draw
 items at t=50 s). (GPU shared with two other lanes; read those as counts per interval, not as a rate.)
+
+**And the guest is running an ordinary engine loop, not waiting on one thing.** `tools/hle_calls` over
+a 400-tick window in each phase (positive control: `g_vo_flipstatus` fires in both) is the *same shape*
+during the uniform frame as during the SEGA logo — mutex/TLS/clock traffic dominates, VideoOut flip and
+vblank polling continues at the same rate, AGC register patching continues:
+
+| handler | logo phase (t≈45 s) | uniform phase (t≈75 s+) |
+|---|---|---|
+| `k_getspecific` | 4,336 | 6,837 |
+| `k_mutex_lock` / `k_mutex_unlock` | 3,938 / 3,934 | 4,784 / 4,776 |
+| `g_vo_flipstatus` / `g_vo_vblankstatus` | 236 / 236 | 222 / 222 |
+| `k_rwlock_init` / `k_rwlock_destroy` | — | 143 / 143 |
+| `agc_patch_add_registers` | — | 128 |
+
+**No `libSceVideodec2` or `libSceAvPlayer` handler appears in either window**, so the "the next thing
+after the logo is a CRI Mana movie whose video never reaches the screen" hypothesis has no support
+from the call census. The title is compositing almost nothing while doing normal work.
 
 Two measured leads, both recorded on [#2013](https://github.com/mattias800/prosper/issues/2013):
 
@@ -159,16 +175,30 @@ One line per falsified hypothesis, with the evidence that killed it.
   frame-for-frame: black to t≈20 s, SEGA logo `pixel_crc32=0d70a70a` (1,373 colours, 430,916
   non-black px) at t≈40–60 s, uniform `8bf1b518` from t≈80 s. The only `[sysmodule]` traffic is two
   first-query `IsLoaded` misses (`0xe2`, `0xba`). (This lane, 2026-08-06, two independent arms.)
-- **The uniform frame is not the end of the sequence, and a 400 s bound is not enough to see that.**
-  A 270 s arm sampled every 30 s leaves the uniform colour and returns to pure black at t=270 s
-  (`666f7b3f`, 0 non-black px). Any claim that the title "stays" in a state needs a sample cadence
-  that would have caught a change. (This lane, 2026-08-06.)
+- **RETRACTED within this lane: "the uniform frame is a phase, not a terminal state".** One 270 s arm
+  sampled every 30 s showed pure black (`666f7b3f`, 0 non-black px) at its final t=270 s sample, and
+  this doc briefly recorded that as the title leaving the uniform state. It does not reproduce: a
+  clean 900 s arm is uniform at every sample from t=90 s to t=900 s, and a second 270 s arm at the
+  same cadence is uniform at t=270 s. Two of the three arms are therefore against it, and the one
+  that showed it had `gdb` attached to the process twice earlier in the run for `hle_calls`. Treat
+  that black sample as unexplained and confounded, not as evidence of progression — and note the
+  general shape: **a single sample from an arm that carried an invasive instrument is not a
+  measurement of the subject.** (This lane, 2026-08-06.)
 - **`0x156 = v_max3_u32` is confirmed, and `0x307` is NOT `v_lshlrev_b16`.** #2013 flagged the first
   as positional inference; a round-trip through `llvm-mc -mcpu=gfx1030` of the exact logged words
   confirms it and names the other two (`0x307 = v_lshrrev_b16`, `0x54 = v_rcp_f16`). The trap is one
   opcode over: **`0x305` is `v_mul_lo_u16`, and `v_lshlrev_b16` is `0x314`** — implementing 0x305 as
   a left shift compiles, validates, and silently computes the wrong value. Caught by a bit-exact
   execution test before it shipped. (This lane, PR for #2013.)
+- **The post-logo wall is not a stalled CRI Mana movie.** `hle_calls` over 400-tick windows in both
+  the logo and the uniform phase (positive control: `g_vo_flipstatus` present in both) shows no
+  `libSceVideodec2` and no `libSceAvPlayer` handler at all, and the same mutex/TLS/flip-poll shape in
+  both. The engine is doing ordinary work while compositing almost nothing. (This lane, 2026-08-06.)
+- **`pidof <name>` selects the WRONG lane's process, and the result looks completely valid.** An
+  `hle_calls` arm here attached by `pidof screenshot` and produced a full 47-handler histogram — for
+  another worktree's title, because three lanes were running `screenshot` concurrently. The only tell
+  is the tool's own header line naming the binary path. Select by
+  `readlink /proc/<pid>/exe` and compare it against your own build directory. (This lane, 2026-08-06.)
 - **A one-frame F9 grab is not a reliable instrument on this title.** The headless
   `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE` grab armed at present 470 and reported `[grab] frame-bundle:
   window had no submits` — a real measurement (that present interval carried no GPU submit at all),

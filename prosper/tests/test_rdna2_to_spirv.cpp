@@ -187,6 +187,14 @@ int main() {
     std::vector<uint32_t> spv4c = recompile_valu(code4c, std::size(code4c), 3, 0);
     CHECK(!spv4c.empty(), "recompiled kernel 4c (v_max3_u32) -> SPIR-V");
 
+    // Kernel 4d (#2013): v_min3_u32, the other half of the pair 4c covers.
+    const uint32_t code4d[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E040F02u, 0xD5530003u, 0x040A0300u,
+        0x7E000D03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4d = recompile_valu(code4d, std::size(code4d), 3, 0);
+    CHECK(!spv4d.empty(), "recompiled kernel 4d (v_min3_u32) -> SPIR-V");
+
     std::vector<float> got4b = prosper::test::run_compute(spv4b, in4b, N, N);
     uint32_t bad4b = 0;
     for (uint32_t i = 0; i < N && got4b.size() == N; i++)
@@ -205,6 +213,17 @@ int main() {
     }
     printf("  kernel4c mismatches=%u (out[60]=%g)\n", bad4c, got4c.size()==N ? got4c[60] : -1);
     CHECK(got4c.size()==N && bad4c==0, "recompiled kernel 4c computes unsigned max-of-three correctly");
+
+    std::vector<float> got4d = prosper::test::run_compute(spv4d, in4b, N, N);
+    uint32_t bad4d = 0;
+    for (uint32_t i = 0; i < N && got4d.size() == N; i++) {
+        const uint32_t u0 = (i * 37u) % 211u;
+        const uint32_t u1 = (i * 83u + 17u) % 211u;
+        const uint32_t u2 = (i * 19u + 101u) % 211u;
+        if (got4d[i] != (float)std::min(u0, std::min(u1, u2))) bad4d++;
+    }
+    printf("  kernel4d mismatches=%u (out[60]=%g)\n", bad4d, got4d.size()==N ? got4d[60] : -1);
+    CHECK(got4d.size()==N && bad4d==0, "recompiled kernel 4d computes unsigned min-of-three correctly");
 
     // Kernel 5: unsigned min/max/sub/not/and. u=(uint)a; d=(max-min) & ~u0. out=(float)d.
     const uint32_t code5[] = {
@@ -2625,6 +2644,144 @@ int main() {
         spv32o10, std::vector<float>(1), 1, 1);
     CHECK(got32o10.size()==1 && bits_of(got32o10[0])==0x00550003u,
           "kernel 32o10 takes a SIGNED 16-bit median and a wrapping 16-bit multiply-add");
+
+    // Kernel 32o11 (#2013): v_ashrrev_i16 is the 16-bit switch's `default:` arm, so any opcode that
+    // reaches the block without its own case lands here — it needs a discriminating test of its own.
+    // The shift is ARITHMETIC over a sign-extended half: a logical shift of the same bits gives
+    // 0x0ff0, not 0xfff0. v_sub_nc_u16 wraps at 16 bits.
+    //   v0 = {lo=-256}, v1 = {lo=4}, v2 = 0x12345678
+    //   v_ashrrev_i16 v2, 4, v0                 -> v2.lo = -256 >> 4 = -16 = 0xfff0
+    //   v_sub_nc_u16  v2, v1, v0 op_sel:[0,0,1] -> v2.hi = (4 - 65280) mod 2^16 = 0x0104
+    const uint32_t code32o11[] = {
+        0x7e0002ffu, 0x0000ff00u,
+        0x7e0202ffu, 0x00000004u,
+        0x7e0402ffu, 0x12345678u,
+        0xd7080002u, 0x00020084u,
+        0xd7044002u, 0x00020101u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o11 = recompile_valu(code32o11, std::size(code32o11), 0, 2);
+    CHECK(!spv32o11.empty(), "recompiled kernel 32o11 (v_ashrrev_i16 / v_sub_nc_u16) -> SPIR-V");
+    std::vector<float> got32o11 = prosper::test::run_compute(
+        spv32o11, std::vector<float>(1), 1, 1);
+    CHECK(got32o11.size()==1 && bits_of(got32o11[0])==0x0104fff0u,
+          "kernel 32o11 shifts a 16-bit half ARITHMETICALLY and wraps a 16-bit subtract");
+
+    // Kernel 32o12 (#2013): the UNSIGNED 16-bit min/max, on exactly the inputs kernel 32o7 feeds to
+    // the signed forms. The expected word is 32o7's with its halves swapped — so a signed/unsigned
+    // crossover in either direction fails one of the two kernels.
+    //   v0 = {lo=0xfffe}, v1 = {lo=3}, v2 = 0x12345678
+    //   v_max_u16 v2, v0, v1                 -> v2.lo = max(65534,3) = 0xfffe   (signed would be 3)
+    //   v_min_u16 v2, v0, v1 op_sel:[0,0,1]  -> v2.hi = min(65534,3) = 3        (signed would be -2)
+    const uint32_t code32o12[] = {
+        0x7e0002ffu, 0x0000fffeu,
+        0x7e0202ffu, 0x00000003u,
+        0x7e0402ffu, 0x12345678u,
+        0xd7090002u, 0x00020300u,
+        0xd70b4002u, 0x00020300u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o12 = recompile_valu(code32o12, std::size(code32o12), 0, 2);
+    CHECK(!spv32o12.empty(), "recompiled kernel 32o12 (v_max_u16 / v_min_u16) -> SPIR-V");
+    std::vector<float> got32o12 = prosper::test::run_compute(
+        spv32o12, std::vector<float>(1), 1, 1);
+    CHECK(got32o12.size()==1 && bits_of(got32o12[0])==0x0003fffeu,
+          "kernel 32o12 reads 16-bit min/max operands as UNSIGNED");
+
+    // Kernel 32o13 (#2013): the three-source 16-bit min3/max3 pair, again on inputs where the
+    // signed and unsigned answers differ.
+    //   v0 = {lo=0xfffe}, v1 = {lo=3}, v3 = {lo=100}, v2 = 0x12345678
+    //   v_min3_u16 v2, v0, v1, v3                -> v2.lo = 3     (signed would be 0xfffe)
+    //   v_max3_i16 v2, v0, v1, v3 op_sel:[…,dst] -> v2.hi = 100    (unsigned would be 0xfffe)
+    const uint32_t code32o13[] = {
+        0x7e0002ffu, 0x0000fffeu,
+        0x7e0202ffu, 0x00000003u,
+        0x7e0602ffu, 0x00000064u,
+        0x7e0402ffu, 0x12345678u,
+        0xd7530002u, 0x040e0300u,
+        0xd7554002u, 0x040e0300u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o13 = recompile_valu(code32o13, std::size(code32o13), 0, 2);
+    CHECK(!spv32o13.empty(), "recompiled kernel 32o13 (v_min3_u16 / v_max3_i16) -> SPIR-V");
+    std::vector<float> got32o13 = prosper::test::run_compute(
+        spv32o13, std::vector<float>(1), 1, 1);
+    CHECK(got32o13.size()==1 && bits_of(got32o13[0])==0x00640003u,
+          "kernel 32o13 keeps min3/max3 signedness separate at 16 bits");
+
+    // Kernel 32o14 (#2013): the SATURATION RAIL of v_cvt_u16_f16. f16's finite maximum (65504) is
+    // below 0xffff, so only an infinity can reach the rail — and a lowering that saturated at the
+    // 32-bit boundary (what cvt_f2u does on its own) and then masked would produce 0xffff here by
+    // luck but 0x0000 for a value just above 65535. Checked with +Inf, which must clamp to 0xffff.
+    //   v0 = {lo = +Inf}, v2 = 0x12345678  ->  v2 = 0x1234ffff
+    const uint32_t code32o14[] = {
+        0x7e0002ffu, 0x00007c00u,
+        0x7e0402ffu, 0x12345678u,
+        0x7e04a500u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o14 = recompile_valu(code32o14, std::size(code32o14), 0, 2);
+    CHECK(!spv32o14.empty(), "recompiled kernel 32o14 (v_cvt_u16_f16 saturation) -> SPIR-V");
+    std::vector<float> got32o14 = prosper::test::run_compute(
+        spv32o14, std::vector<float>(1), 1, 1);
+    CHECK(got32o14.size()==1 && bits_of(got32o14[0])==0x1234ffffu,
+          "kernel 32o14 saturates v_cvt_u16_f16 at the 16-bit rail");
+
+    // Kernel 32o15 (#2013): the negative rail of v_cvt_i16_f16 (-Inf -> 0x8000), plus v_cvt_f16_u16
+    // and v_sqrt_f16 so the integer->float direction and a second transcendental are not
+    // untested. Each writes its own register; the assertions below check all three.
+    //   v1 = {lo = -Inf}, v3 = 0xaaaa0000  ->  v3 = 0xaaaa8000
+    const uint32_t code32o15[] = {
+        0x7e0202ffu, 0x0000fc00u,
+        0x7e0602ffu, 0xaaaa0000u,
+        0x7e06a701u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o15 = recompile_valu(code32o15, std::size(code32o15), 0, 3);
+    CHECK(!spv32o15.empty(), "recompiled kernel 32o15 (v_cvt_i16_f16 negative rail) -> SPIR-V");
+    std::vector<float> got32o15 = prosper::test::run_compute(
+        spv32o15, std::vector<float>(1), 1, 1);
+    CHECK(got32o15.size()==1 && bits_of(got32o15[0])==0xaaaa8000u,
+          "kernel 32o15 saturates v_cvt_i16_f16 at the negative 16-bit rail");
+
+    //   v0 = {lo = 5}, v1 = 0xbeef0000   v_cvt_f16_u16 v1, v0 -> v1 = 0xbeef4500 (5.0h)
+    const uint32_t code32o16[] = {
+        0x7e0002ffu, 0x00000005u,
+        0x7e0202ffu, 0xbeef0000u,
+        0x7e02a100u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o16 = recompile_valu(code32o16, std::size(code32o16), 0, 1);
+    CHECK(!spv32o16.empty(), "recompiled kernel 32o16 (v_cvt_f16_u16) -> SPIR-V");
+    std::vector<float> got32o16 = prosper::test::run_compute(
+        spv32o16, std::vector<float>(1), 1, 1);
+    CHECK(got32o16.size()==1 && bits_of(got32o16[0])==0xbeef4500u,
+          "kernel 32o16 converts u16 to f16 in the low half");
+
+    //   v0 = {lo = 4.0h}, v1 = 0xcafe0000   v_sqrt_f16 v1, v0 -> v1 = 0xcafe4000 (2.0h)
+    const uint32_t code32o17[] = {
+        0x7e0002ffu, 0x00004400u,
+        0x7e0202ffu, 0xcafe0000u,
+        0x7e02ab00u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o17 = recompile_valu(code32o17, std::size(code32o17), 0, 1);
+    CHECK(!spv32o17.empty(), "recompiled kernel 32o17 (plain v_sqrt_f16_e32) -> SPIR-V");
+    std::vector<float> got32o17 = prosper::test::run_compute(
+        spv32o17, std::vector<float>(1), 1, 1);
+    CHECK(got32o17.size()==1 && bits_of(got32o17[0])==0xcafe4000u,
+          "kernel 32o17 rounds a second f16 transcendental back into the low half");
+
+    // Kernel 32o18 (#2013, raised in review): the SDWA form of a 16-bit VOP1 must REJECT, not
+    // compile. The decoder's "trivial-or-modifier-only" SDWA admission gates neither src0 NEG/ABS
+    // nor DST_UNUSED, and the generic VOP1 source-modifier path applies abs/neg in the f32 domain
+    // to the packed dword — the wrong half for an op that reads bits[15:0]. This exact encoding is
+    // `v_cvt_u16_f16_sdwa v0, -v1 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD`, where the
+    // negate would be silently lost and the kernel would compute u16(x) instead of u16(-x).
+    // Rejecting is what master did for the whole opcode, so this is no regression.
+    const uint32_t code32o18[] = { 0x7e00a4f9u, 0x00160601u, 0xbf810000u };
+    CHECK(recompile_valu(code32o18, std::size(code32o18), 0, 0).empty(),
+          "kernel 32o18 REJECTS an SDWA 16-bit convert instead of dropping its source modifier");
 
     // Kernel 32p: exact live v_cndmask_b32_sdwa selects src1 WORD_0 through VCC, writes WORD_1,
     // and preserves the destination's low half.

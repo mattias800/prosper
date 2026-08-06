@@ -6941,22 +6941,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // 0x56 v_rsq_f16, 0x57 v_log_f16, 0x58 v_exp_f16, 0x5B v_floor_f16, 0x5C v_ceil_f16,
             // 0x5D v_trunc_f16, 0x5E v_rndne_f16, 0x5F v_fract_f16, 0x60 v_sin_f16, 0x61 v_cos_f16.
             // Trig input is in REVOLUTIONS, exactly as for the f32 forms. CONFIDENCE: HIGH.
-            // A DWORD-select SDWA form of one of these may still carry CLAMP/OMOD, which this
-            // lowering does not model (the hardware applies them in the 16-bit domain). Reject that
-            // combination fail-visibly rather than silently dropping the modifier — it is strictly
-            // no worse than the whole-opcode reject these encodings got before.
+            // PLAIN e32 ONLY (`!has_sdwa`). A DWORD-select SDWA form of one of these carries
+            // modifiers this lowering does not model, and each would be dropped SILENTLY rather
+            // than fail-visibly: the decoder's "trivial-or-modifier-only" admission at
+            // rdna2_decode.cpp:64 gates neither src0 NEG/ABS nor DST_UNUSED, the generic VOP1
+            // abs/neg at the top of this case applies them in the f32 domain to the packed dword
+            // (wrong half for a 16-bit read), and UNUSED_SEXT would need sign extension rather than
+            // the zero fill `has_sdwa` implies. CLAMP/OMOD likewise apply in the 16-bit domain.
+            // Every live encoding this title uses is plain `_e32` (`7e1ea910`, `7e08a504`), so
+            // rejecting the SDWA forms costs nothing and is strictly no worse than the whole-opcode
+            // reject they got before. (Raised in review of PR #2067.)
             if (((in.opcode >= 0x54 && in.opcode <= 0x58) ||
                  (in.opcode >= 0x5B && in.opcode <= 0x61)) &&
-                in.sdwa_dst_sel == 6 && !in.clamp && !in.omod) {
+                !in.has_sdwa && in.sdwa_dst_sel == 6 && !in.clamp && !in.omod) {
                 uint32_t raw = a;   // inline constants: f16-width encoding, not the f32 pattern
                 if (in.src[0].kind == OperandKind::InlineFloat)
-                    raw = b.uconst(inline_float_f16_bits(in.src[0].value)
-                                   << (in.sdwa_src0_sel == 5 ? 16 : 0));
+                    raw = b.uconst(inline_float_f16_bits(in.src[0].value));
                 else if (in.src[0].kind == OperandKind::InlineInt)
                     raw = b.uconst(static_cast<uint32_t>(in.src[0].value));
-                uint32_t x = b.unpack_half(raw, in.sdwa_src0_sel == 5 ? 1 : 0);
-                if (in.src_abs[0]) x = b.fext1(Glsl_FAbs, x);
-                if (in.src_neg[0]) x = b.fneg(x);
+                // Plain e32 has no source modifiers and no half select; the SDWA forms that would
+                // carry them are rejected by the `!has_sdwa` gate above.
+                const uint32_t x = b.unpack_half(raw, 0);
                 const uint32_t turns = b.uconst(fbits(6.28318530717958647692f));
                 uint32_t result;
                 switch (in.opcode) {
@@ -6974,10 +6979,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     default:   result = b.fext1(Glsl_Cos, b.fbin(Op_FMul, x, turns)); break;
                 }
                 const uint32_t r16 = b.pack_half_lo(result);
-                d = in.has_sdwa
-                        ? r16
-                        : b.ibin(Op_BitwiseOr,
-                                 b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
+                d = b.ibin(Op_BitwiseOr,
+                           b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
@@ -6993,39 +6996,32 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // is the wrong boundary here, and a bare mask would WRAP an out-of-range value instead
             // of saturating it. VERIFIED(round-trip llvm-mc gfx1030, VOP1 0x50-0x53; the live
             // encoding 7e08a504 is `v_cvt_u16_f16_e32 v4, v4`). CONFIDENCE: HIGH.
-            if (in.opcode >= 0x50 && in.opcode <= 0x53 && in.sdwa_dst_sel == 6 &&
+            // PLAIN e32 ONLY — see the `!has_sdwa` note on the transcendental block above.
+            if (in.opcode >= 0x50 && in.opcode <= 0x53 && !in.has_sdwa && in.sdwa_dst_sel == 6 &&
                 !in.clamp && !in.omod) {
                 const bool from_float = in.opcode >= 0x52;
                 uint32_t raw = a;   // inline constants: 16-bit-width encoding, not the f32 pattern
                 if (in.src[0].kind == OperandKind::InlineFloat)
-                    raw = b.uconst(inline_float_f16_bits(in.src[0].value)
-                                   << (in.sdwa_src0_sel == 5 ? 16 : 0));
+                    raw = b.uconst(inline_float_f16_bits(in.src[0].value));
                 else if (in.src[0].kind == OperandKind::InlineInt)
                     raw = b.uconst(static_cast<uint32_t>(in.src[0].value));
                 uint32_t r16;
                 if (from_float) {
-                    const uint32_t x = b.unpack_half(raw, in.sdwa_src0_sel == 5 ? 1 : 0);
+                    const uint32_t x = b.unpack_half(raw, 0);
                     r16 = in.opcode == 0x52
                               ? b.uext2(Glsl_UMin, b.cvt_f2u(x), b.uconst(0xFFFFu))
                               : b.sext2(Glsl_SMin,
                                         b.sext2(Glsl_SMax, b.cvt_f2i(x), b.uconst(0xFFFF8000u)),
                                         b.uconst(0x7FFFu));
                 } else {
-                    const uint32_t word =
-                        b.ibin(Op_BitwiseAnd,
-                               in.sdwa_src0_sel == 5
-                                   ? b.ibin(Op_ShiftRightLogical, raw, b.uconst(16))
-                                   : raw,
-                               b.uconst(0xFFFFu));
+                    const uint32_t word = b.ibin(Op_BitwiseAnd, raw, b.uconst(0xFFFFu));
                     r16 = b.pack_half_lo(in.opcode == 0x50
                                              ? b.cvt_u2f(word)
                                              : b.cvt_i2f(b.bfe_s(word, b.uconst(0), b.uconst(16))));
                 }
                 r16 = b.ibin(Op_BitwiseAnd, r16, b.uconst(0xFFFFu));
-                d = in.has_sdwa
-                        ? r16
-                        : b.ibin(Op_BitwiseOr,
-                                 b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
+                d = b.ibin(Op_BitwiseOr,
+                           b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
