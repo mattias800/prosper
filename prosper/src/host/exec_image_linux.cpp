@@ -195,7 +195,7 @@ namespace {
                              "[nullpage] #%d EMULATED-READ addr=0x%llx rip=%s+0x%llx maperr=%ld\n",
                              count, (unsigned long long)addr, gmod(rip),
                              (unsigned long long)goff(rip), map_result);
-            raw_write(2, b, (uint64_t)n);
+            raw_write_fmt(2, b, sizeof b, n);
         }
         nullpage_deep_dump(uc, rip);
         return true;
@@ -454,7 +454,9 @@ namespace {
             n = snprintf(b, sizeof b, "[hwwatch]   writer 0x%llx: no containing region\n",
                          (unsigned long long)addr);
         }
-        if (n > 0) { ssize_t w = write(2, b, (size_t)n); (void)w; }
+        // `n > 0` only rejects the encoding error; a truncating format still returns MORE than the
+        // buffer holds, so the length needs the same clamp as every other report site (#2050).
+        raw_write_fmt(2, b, sizeof b, n);
         return;
 #else
         int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
@@ -472,7 +474,7 @@ namespace {
                     char h = *p; int nib; if (h>='0'&&h<='9') nib=h-'0'; else if (h>='a'&&h<='f') nib=h-'a'+10;
                     else { ok=false; return; } v=(v<<4)|nib; d++; } out=v; if(!d) ok=false; };
                 hx(s); if (*p=='-') { p++; hx(e); }
-                if (ok && addr >= s && addr < e) { raw_write(2,pend, pn); raw_write(2,line, (size_t)li);
+                if (ok && addr >= s && addr < e) { raw_write_fmt(2, pend, sizeof pend, pn); raw_write(2,line, (size_t)li);
                     raw_write(2,"\n", 1); close(fd); return; }
                 li = 0;
             }
@@ -488,7 +490,7 @@ namespace {
         int total = g_hwbp_ring_pos < HWBP_RING ? g_hwbp_ring_pos : HWBP_RING;
         int start = g_hwbp_ring_pos < HWBP_RING ? 0 : (g_hwbp_ring_pos % HWBP_RING);
         char hdr[96]; int hn = snprintf(hdr, sizeof hdr, "[hwbp-ring] dump (%s): last %d hits:\n", why, total);
-        raw_write(2,hdr, hn);
+        raw_write_fmt(2, hdr, sizeof hdr, hn);
         unsigned long long prev_cur = 0;
         for (int i = 0; i < total; ++i) {
             const HwbpRingEnt& e = g_hwbp_ring[(start + i) % HWBP_RING];
@@ -499,7 +501,7 @@ namespace {
                 i, e.rip_mod ? e.rip_mod : "?", e.rip_off, e.cur, e.rax, e.r8, e.f8, e.f10, e.r14,
                 (e.cur == e.r8 || e.cur == e.f8) ? "<<< MATCH (skip fetch)" : "");
             (void)dcur;
-            raw_write(2,lb, ln);
+            raw_write_fmt(2, lb, sizeof lb, ln);
             prev_cur = e.cur;
         }
     }
@@ -511,7 +513,7 @@ namespace {
         char hdr[128]; int hn = snprintf(hdr, sizeof hdr,
             "[stepwin] dump (%s) after %ld steps: %d cursor advances, base=0x%llx:\n",
             why, g_stepwin_steps, total, (unsigned long long)g_stepwin_base);
-        raw_write(2,hdr, hn);
+        raw_write_fmt(2, hdr, sizeof hdr, hn);
         unsigned long long prev = 0;
         for (int i = 0; i < total; ++i) {
             const StepEnt& e = g_stepwin_ring[(start + i) % STEPWIN_RING];
@@ -519,7 +521,7 @@ namespace {
             char lb[160];
             int ln = snprintf(lb, sizeof lb, "  [%3d] rip=%s+0x%llx cur=0x%llx (off 0x%llx) delta=%+lld\n",
                 i, e.rip_mod ? e.rip_mod : "?", e.rip_off, e.cur, (unsigned long long)(e.cur - g_stepwin_base), d);
-            raw_write(2,lb, ln);
+            raw_write_fmt(2, lb, sizeof lb, ln);
             prev = e.cur;
         }
     }
@@ -527,7 +529,7 @@ namespace {
         long fd = perf_bp_open(addr, HW_BREAKPOINT_W);
         char b[160];
         if (fd < 0) { int n = snprintf(b, sizeof b, "[hwwatch] perf W-watch FAILED addr=0x%llx errno=%d\n",
-                          (unsigned long long)addr, errno); raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */ return; }
+                          (unsigned long long)addr, errno); raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */ return; }
         g_hwwatch_fd = (int)fd; g_hwwatch_addr = addr;
         fcntl(g_hwwatch_fd, F_SETFL, O_ASYNC);
         fcntl(g_hwwatch_fd, F_SETSIG, SIGTRAP);
@@ -535,7 +537,7 @@ namespace {
         fcntl(g_hwwatch_fd, F_SETOWN_EX, &ow);
         ioctl(g_hwwatch_fd, PERF_EVENT_IOC_ENABLE, 0);
         int n = snprintf(b, sizeof b, "[hwwatch] armed W-watch at 0x%llx (fd=%d)\n",
-                         (unsigned long long)addr, g_hwwatch_fd); raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+                         (unsigned long long)addr, g_hwwatch_fd); raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
     }
     // ---- #312 per-thread MallocBinned3 pool-descriptor HEAD watch (PROSPER_MB3WATCH) -----------
     // The per-run corruptor stomps poolArray[idx].head (struct +0x20, size-class idx=1) of the MB3
@@ -576,7 +578,7 @@ namespace {
             if (fd < 0) { char b[128]; int k = snprintf(b, sizeof b,
                 "[mb3watch] arm FAILED addr=0x%llx tid=%ld errno=%d\n",
                 (unsigned long long)addr, cur_tid(), errno);
-                raw_write(2, b, (size_t)k); continue; }
+                raw_write_fmt(2, b, sizeof b, k); continue; }
             fcntl((int)fd, F_SETFL, O_ASYNC);
             fcntl((int)fd, F_SETSIG, SIGTRAP);
             struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)prosper_gettid();
@@ -588,7 +590,7 @@ namespace {
                 "[mb3watch] ARMED head watch @0x%llx (base=0x%llx off=0x%x) fd=%ld tid=%ld slot=%d\n",
                 (unsigned long long)addr, (unsigned long long)base, g_mb3w_off,
                 fd, cur_tid(), slot);
-            raw_write(2, b, (size_t)k);
+            raw_write_fmt(2, b, sizeof b, k);
         }
     }
     // PROSPER_PEEK dumps offsets off registers at fault time. Supports N specs separated by ';',
@@ -709,8 +711,15 @@ namespace {
             else                snprintf(vb, sizeof vb, probe_readable(v) ? "0x%llx" : "?", (unsigned long long)(probe_readable(v) ? *(const uint64_t*)v : 0));
             on += snprintf(out+on, sizeof out-on, " %.*s=%s", slen, start, vb);
         }
+        // `on` is a running total of snprintf returns, so a truncating chain leaves it ABOVE
+        // sizeof out — which would put the newline store out of bounds and hand raw_write a
+        // length past the end of the buffer. Clamp once, then both are provably in range: the
+        // store lands at index <= sizeof out - 1 and the write covers <= sizeof out bytes (#2050).
+        const bool cut = on < 0 || (size_t)on >= sizeof out;
+        on = (int)raw_fmt_len(on, sizeof out);
         out[on] = '\n';
         raw_write(2, out, (size_t)on + 1);   /* raw syscall: no libc TLS access */
+        if (cut) raw_write_trunc_mark(2);
     }
     // PROSPER_KSCAN one-shot enumerator: scan the guest GC-heap mappings (from /proc/self/maps, in the
     // [0x20_00000000,0x28_00000000) object band) for every 8-aligned qword equal to g_kscan_klass — i.e. every
@@ -728,7 +737,7 @@ namespace {
         maps[total < 0 ? 0 : total] = 0;
         char hdr[96]; int hn = snprintf(hdr, sizeof hdr, "[kscan] klass=0x%llx max=%d\n",
                                         (unsigned long long)g_kscan_klass, g_kscan_max);
-        raw_write(2, hdr, (size_t)hn);
+        raw_write_fmt(2, hdr, sizeof hdr, hn);
         auto rdhex = [](const char** pp) -> uint64_t { uint64_t v = 0; const char* p = *pp;
             for (;; ++p) { char c=*p; uint64_t d; if(c>='0'&&c<='9')d=c-'0'; else if(c>='a'&&c<='f')d=c-'a'+10;
                 else if(c>='A'&&c<='F')d=c-'A'+10; else break; v=v*16+d; } *pp=p; return v; };
@@ -767,7 +776,7 @@ namespace {
         }
         char sum[96]; int sn = snprintf(sum, sizeof sum, "[kscan] done: %d instance(s), %llu MiB scanned\n",
                                         found, (unsigned long long)(scanned >> 20));
-        raw_write(2, sum, (size_t)sn);
+        raw_write_fmt(2, sum, sizeof sum, sn);
     }
     // PROSPER_DUMPAT="0xADDR[,0xADDR...]" — dump 0x40 bytes at each ABSOLUTE guest address at fault
     // time (up to 6). Complements the register-relative FAULTMEM/PEEK when the address of interest
@@ -778,14 +787,14 @@ namespace {
         for (int i = 0; i < g_dumpat_n; i++) {
             uint64_t a = g_dumpat[i];
             int n = snprintf(b, sizeof b, "[prosper] DUMPAT 0x%llx:\n", (unsigned long long)a);
-            raw_write(2, b, (size_t)n);
+            raw_write_fmt(2, b, sizeof b, n);
             for (int r = 0; r < 8; r++) {
                 uint64_t addr = a + (uint64_t)r * 8;
                 if (probe_readable(addr))
                     n = snprintf(b, sizeof b, "  +0x%02x = 0x%016llx\n", r * 8, (unsigned long long)*(const uint64_t*)addr);
                 else
                     n = snprintf(b, sizeof b, "  +0x%02x = <unmapped>\n", r * 8);
-                raw_write(2, b, (size_t)n);
+                raw_write_fmt(2, b, sizeof b, n);
             }
         }
     }
@@ -802,12 +811,12 @@ namespace {
         };
         char b[256];
         int n = snprintf(b, sizeof b, "[prosper] FAULTMEM dump (regs -> guest memory):\n");
-        raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+        raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
         for (auto& r : regs) {
             if (!probe_readable(r.v)) {
                 n = snprintf(b, sizeof b, "  %s=0x%llx  (unmapped/immediate)\n",
                              r.n, (unsigned long long)r.v);
-                raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+                raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                 continue;
             }
             uint64_t q[4] = {0, 0, 0, 0};
@@ -820,7 +829,7 @@ namespace {
             }
             n = snprintf(b, sizeof b, "  %s=0x%llx -> [0]=%s [8]=%s [10]=%s [18]=%s\n",
                          r.n, (unsigned long long)r.v, part[0], part[1], part[2], part[3]);
-            raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+            raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
         }
         // Deep field peek (PROSPER_PEEK, parsed once at arm time — getenv is not signal-safe): read
         // specific offsets off one or more registers to classify a large object beyond the 0x20-byte
@@ -830,7 +839,7 @@ namespace {
             uint64_t base = 0;
             for (auto& r : regs) { bool m = true; for (int i=0;i<3;i++) if (r.n[i]!=ps.reg[i]&&!(r.n[i]==' '&&ps.reg[i]==0)) { m=false; break; } if (m) { base=r.v; break; } }
             n = snprintf(b, sizeof b, "  PEEK %s=0x%llx:\n", ps.reg, (unsigned long long)base);
-            raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+            raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
             for (int k = 0; k < ps.n; k++) {
                 uint64_t obj = base;
                 if (ps.deref[k]) {   // chase one pointer level: obj = [base + pre]
@@ -847,7 +856,7 @@ namespace {
                 else
                     n = snprintf(b, sizeof b, "    %s[+0x%llx]@+0x%llx = <unmapped>\n", pfx,
                                  (unsigned long long)ps.pre[k], (unsigned long long)ps.off[k]);
-                raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+                raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
             }
         }
     }
@@ -885,7 +894,7 @@ namespace {
             n = snprintf(b, sizeof b, "[nullpage]   insn @rip:"
                          " %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
                          p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
-            raw_write(2, b, (size_t)n);
+            raw_write_fmt(2, b, sizeof b, n);
         }
         auto g = PROSPER_GREGS(uc);
         const struct { const char* nm; uint64_t v; } regs[] = {
@@ -902,7 +911,17 @@ namespace {
         for (int i = 0; i < 16; i++) {
             n += snprintf(b + n, sizeof b - (size_t)n, "%s%s=0x%llx", (i % 4) ? " " : "[nullpage]   ",
                           regs[i].nm, (unsigned long long)regs[i].v);
-            if (i % 4 == 3) { b[n++] = '\n'; raw_write(2, b, (size_t)n); n = 0; }
+            if (i % 4 == 3) {
+                // Same shape as the [il2cpp-probe] line above: `n` is a running snprintf total, so
+                // a truncating chain leaves it past the end of `b`. Clamp before the newline store
+                // so the store and the write are both provably in range (#2050).
+                const bool cut = n < 0 || (size_t)n >= sizeof b;
+                n = (int)raw_fmt_len(n, sizeof b);
+                b[n++] = '\n';
+                raw_write(2, b, (size_t)n);
+                if (cut) raw_write_trunc_mark(2);
+                n = 0;
+            }
         }
         // #1226 — is a faulting register a GPU LABEL SLOT? On ArcRunner every terminal fault carries
         // the shape {small nonzero high dword, low dword 1}, which is byte-identical to a 0x20-byte
@@ -924,9 +943,12 @@ namespace {
             // same 512 bytes as `b`. A full 16-event ring formats to ~450-500 characters, so the
             // prefix pushes the would-be length past `sizeof b` on exactly the richest labels this
             // instrument exists to print — handing that value to raw_write() reads past the end of a
-            // stack buffer. Every other raw_write in this handler is either length-bounded by its
-            // format or already uses strlen; this is the first whose format embeds a %s of comparable
-            // size to the buffer. (Reported in review of #2077.)
+            // stack buffer. This was the first site whose format embeds a %s of comparable size to
+            // the buffer, so it is where the class was caught (review of #2077, instrument trap 109);
+            // the accompanying claim that every other raw_write here was already length-bounded was
+            // wrong — the sweep in #2050 found 88 report sites handing the raw return to raw_write,
+            // and they now go through raw_write_fmt(). strlen is kept here because it is exact:
+            // snprintf NUL-terminates, so it needs no clamp and reports no truncation it did not see.
             raw_write(2, b, strlen(b));
         }
         for (int i = 0; i < 16; i++) {
@@ -948,7 +970,7 @@ namespace {
                     n += snprintf(b + n, sizeof b - (size_t)n, " ????????????????");
             }
             n += snprintf(b + n, sizeof b - (size_t)n, "\n");
-            raw_write(2, b, (size_t)n);
+            raw_write_fmt(2, b, sizeof b, n);
             // Corrupted-header hunt: the canary walk faulted following a NextFreeBlock == 0x1, so
             // the stomped FFreeBlock header is a qword equal to 0x1 somewhere in the current slab
             // (a 64 KiB-aligned guest-heap register, r13 in the observed walk). Scan the slab for
@@ -974,7 +996,7 @@ namespace {
                                  (unsigned long long)o, (unsigned long long)addr,
                                  (unsigned long long)q[0], (unsigned long long)q[1],
                                  (unsigned long long)q[2], (unsigned long long)q[3]);
-                    raw_write(2, b, (size_t)n);
+                    raw_write_fmt(2, b, sizeof b, n);
                     if (prosper_gpu_write_ring_scan) {
                         static char hit_out[1024];
                         if (prosper_gpu_write_ring_scan(addr - 8, addr + 16, hit_out, sizeof hit_out) > 0)
@@ -1124,7 +1146,7 @@ namespace {
         // timed run reveals whether the SIGILL round-trip is the throughput wall. Diagnostic only.
         if (g_sse4a_stat && (g_sse4a_emulated & 0xFFFFF) == 0) {
             char b[64]; int n = snprintf(b, sizeof b, "[sse4a] %lu emulated\n", g_sse4a_emulated);
-            if (n > 0) { ssize_t w = raw_write(2,b, (size_t)n); (void)w; }
+            raw_write_fmt(2, b, sizeof b, n);   // the old `n > 0` guard is raw_write_fmt's job now
         }
         return true;
     }
@@ -1264,7 +1286,7 @@ namespace {
             char b[96]; int n = snprintf(b, sizeof b, "[sigill] rip=0x%llx bytes:", (unsigned long long)rip);
             for (int k = 0; k < 16 && n < (int)sizeof b - 4; k++) n += snprintf(b + n, sizeof b - n, " %02x", p[k]);
             if (n < (int)sizeof b - 1) b[n++] = '\n';
-            ssize_t w = raw_write(2, b, (size_t)n); (void)w;
+            ssize_t w = raw_write_fmt(2, b, sizeof b, n); (void)w;
         }
         // #312 per-thread MB3 head watch: a hardware WRITE-watch on a poolArray head slot fired.
         // Write-watchpoints trap AFTER the store, so RIP already points past it — just log the
@@ -1319,7 +1341,7 @@ namespace {
                     (unsigned long long)addr, v, in_eboot ? gmod(wr) : "host:", in_eboot ? "+" : "",
                     (unsigned long long)(in_eboot ? goff(wr) : wr), cur_tid(),
                     shifted ? "  <<<<< CORRUPT HEAD" : "", ord);
-                raw_write(2, b, (size_t)n);
+                raw_write_fmt(2, b, sizeof b, n);
                 if (!in_eboot) classify_addr(wr);
                 if (shifted) {
                     char rb[420]; int rn = snprintf(rb, sizeof rb,
@@ -1331,7 +1353,7 @@ namespace {
                         (unsigned long long)gr2[REG_R8],  (unsigned long long)gr2[REG_R9],
                         (unsigned long long)gr2[REG_R10], (unsigned long long)gr2[REG_R11],
                         (unsigned long long)gr2[REG_RBP], (unsigned long long)gr2[REG_RSP]);
-                    raw_write(2, rb, (size_t)rn);
+                    raw_write_fmt(2, rb, sizeof rb, rn);
                     // Guest call stack: scan [rsp, rsp+0x200) for eboot-range return addresses.
                     uint64_t rsp = (uint64_t)gr2[REG_RSP];
                     char sb[320]; int sn = snprintf(sb, sizeof sb, "[mb3watch]   guest-stack:");
@@ -1346,7 +1368,7 @@ namespace {
                         }
                     }
                     sn += snprintf(sb + sn, sizeof sb - sn, "\n");
-                    raw_write(2, sb, (size_t)sn);
+                    raw_write_fmt(2, sb, sizeof sb, sn);
                 }
                 return;
             }
@@ -1417,7 +1439,7 @@ namespace {
                     int n = snprintf(b, sizeof b, "[hwwatch] #%d WRITE [0x%llx]=0x%llx by rip=%s%s0x%llx tid=%ld\n",
                         (int)g_hwwatch_count, (unsigned long long)g_hwwatch_addr, v,
                         in_eboot ? gmod(wr) : "", in_eboot ? "+" : "", (unsigned long long)(in_eboot ? goff(wr) : wr), cur_tid());
-                    raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+                    raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                     if (!in_eboot) classify_addr(wr);
                 }
                 return;
@@ -1474,11 +1496,11 @@ namespace {
                         s[k] = c;
                     }
                     s[k] = 0;
-                    if (k >= 2) { char b[128]; int n = snprintf(b, sizeof b, "[hwbp-str] %s=0x%llx -> \"%s\"\n", rn, (unsigned long long)p, s); raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */ }
+                    if (k >= 2) { char b[128]; int n = snprintf(b, sizeof b, "[hwbp-str] %s=0x%llx -> \"%s\"\n", rn, (unsigned long long)p, s); raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */ }
                 };
                 char hdr[80]; int hn = snprintf(hdr, sizeof hdr, "[hwbp-str] hit @%s+0x%llx:\n",
                     gmod((uint64_t)gr[REG_RIP]),
-                    (unsigned long long)goff((uint64_t)gr[REG_RIP])); raw_write(2,hdr, hn);
+                    (unsigned long long)goff((uint64_t)gr[REG_RIP])); raw_write_fmt(2, hdr, sizeof hdr, hn);
                 pstr("rdi", (uint64_t)gr[REG_RDI]); pstr("rsi", (uint64_t)gr[REG_RSI]);
                 pstr("rdx", (uint64_t)gr[REG_RDX]); pstr("rcx", (uint64_t)gr[REG_RCX]);
                 pstr("r8",  (uint64_t)gr[REG_R8]);  pstr("r9",  (uint64_t)gr[REG_R9]);
@@ -1497,7 +1519,7 @@ namespace {
                     if (k >= 2) { char b[160]; int n = snprintf(b, sizeof b,
                         "[hwbp-klass] %s obj=0x%llx klass=0x%llx name=\"%s\" [obj+0x40]=0x%llx\n",
                         rn, (unsigned long long)obj, (unsigned long long)klass, s,
-                        (unsigned long long)(probe_readable(obj+0x40)?*(const uint64_t*)(obj+0x40):0)); raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */ }
+                        (unsigned long long)(probe_readable(obj+0x40)?*(const uint64_t*)(obj+0x40):0)); raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */ }
                 };
                 // PROSPER_HWBP_FIELDS=1: dump rbx's object fields [0x10..0x60] + the class name of any
                 // field that is itself an object — to tell "whole object uninitialized (all null)" from
@@ -1510,7 +1532,7 @@ namespace {
                             uint64_t v = *(const uint64_t*)(o + off);
                             n += snprintf(b+n, sizeof b-n, " +0x%llx=0x%llx", (unsigned long long)off, (unsigned long long)v);
                         }
-                        n += snprintf(b+n, sizeof b-n, "\n"); raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+                        n += snprintf(b+n, sizeof b-n, "\n"); raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                         // Resolve the class name of each object-typed field (its [obj]->klass->[+0x10]=name).
                         for (uint64_t off = 0x10; off <= 0x88; off += 8) {
                             if (!probe_readable(o + off + 7)) continue;
@@ -1525,7 +1547,7 @@ namespace {
                                 if (c == 0) break; if (c < 0x20 || c > 0x7e) { k = 0; break; } s[k] = c; }
                             s[k] = 0;
                             if (k >= 2) { char fb[128]; int fn = snprintf(fb, sizeof fb,
-                                "[hwbp-field] +0x%llx -> %s\n", (unsigned long long)off, s); raw_write(2,fb, fn); }
+                                "[hwbp-field] +0x%llx -> %s\n", (unsigned long long)off, s); raw_write_fmt(2, fb, sizeof fb, fn); }
                         }
                     }
                 }
@@ -1542,7 +1564,7 @@ namespace {
                         if (c == 0) break; if (c < 0x20 || c > 0x7e) { if (k < 2) return; break; } s[k] = c; }
                     s[k] = 0;
                     if (k >= 2) { char b[128]; int n = snprintf(b, sizeof b, "[hwbp-cname] %s klass=0x%llx name=\"%s\"\n",
-                        rn, (unsigned long long)klass, s); raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */ }
+                        rn, (unsigned long long)klass, s); raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */ }
                 };
                 pcname("rdi(class)", (uint64_t)gr[REG_RDI]);
                 // PROSPER_HWBP_GLOBAL=0xADDR: also resolve the class name stored at a fixed guest global
@@ -1572,7 +1594,7 @@ namespace {
                     probe_readable((uint64_t)gr[REG_RSP])
                         ? gmod(*(const uint64_t*)(uint64_t)gr[REG_RSP]) : "?",
                     (unsigned long long)(probe_readable((uint64_t)gr[REG_RSP]) ? goff(*(const uint64_t*)(uint64_t)gr[REG_RSP]) : 0));
-                raw_write(2, b, (size_t)n);
+                raw_write_fmt(2, b, sizeof b, n);
             }
             // PROSPER_HWBP_OBJ=1: treat rdi as an il2cpp object (at a method-entry bp); print its class
             // name ([[rdi]+0x10]) and fields [rdi+0x00..+0x60], plus [rdi+0x40] chased as an object too.
@@ -1591,7 +1613,7 @@ namespace {
                     (unsigned long long)rd(rdi+8),(unsigned long long)rd(rdi+0x10),(unsigned long long)rd(rdi+0x18),
                     (unsigned long long)rd(rdi+0x20),(unsigned long long)rd(rdi+0x28),(unsigned long long)rd(rdi+0x30),
                     (unsigned long long)rd(rdi+0x38),(unsigned long long)rd(rdi+0x48));
-                raw_write(2,b, n);
+                raw_write_fmt(2, b, sizeof b, n);
             }
             // Reuse the software breakpoint's generic pointer-chain evaluator for race-free hardware
             // breakpoints. Evaluate only hits that pass every register/return gate and remain under the
@@ -1609,7 +1631,7 @@ namespace {
                     "[hwbp] MATCH r15=0x%llx rax(src)=0x%llx rbx=0x%llx | [rax-16..+24]= %llx %llx %llx %llx %llx %llx\n",
                     (unsigned long long)r15, (unsigned long long)rax, (unsigned long long)rbx,
                     rd(rax-16), rd(rax-8), rd(rax), rd(rax+8), rd(rax+16), rd(rax+24));
-                raw_write(2,b2, n2);
+                raw_write_fmt(2, b2, sizeof b2, n2);
                 classify_addr(rax);
             }
             if (cond_ok && g_hwbp_count < g_hwbp_max) {
@@ -1639,7 +1661,7 @@ namespace {
                     rd(rbx+0x38), rd(rbx+0x40), rd(rbx+0x48), nm(rd(rsp)), off(rd(rsp)),
                     nm(rd(rbp + 8)), off(rd(rbp + 8)), cur_tid());
                 (void)r15; (void)rdi; (void)rsi;
-                raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+                raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                 // PROSPER_HWBP_DIVCAP: log the typetree-vector transfer's elemSize/byteSize/count from the
                 // caller frame (rbp-relative), for the ~6 `call *0x88` array reads.
                 if (g_hwbp_divcap) {
@@ -1656,7 +1678,7 @@ namespace {
                             int fd = open("/tmp/prosper_ttnodes.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
                             if (fd >= 0) { (void)!raw_write(fd, (const void*)lo, (size_t)(hi - lo)); close(fd);
                                 char m2[96]; int mn = snprintf(m2, sizeof m2, "[ttnodes] dumped [0x%llx..0x%llx] base=0x%llx\n",
-                                    (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)node); raw_write(2,m2, mn); }
+                                    (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)node); raw_write_fmt(2, m2, sizeof m2, mn); }
                         }
                     }
                     char db[300];
@@ -1665,7 +1687,7 @@ namespace {
                         (int)g_hwbp_count, rd(crbp - 0xf0), rd(crbp - 0xe8), rd(crbp - 0xf8),
                         node, rd(node), rd(node + 8), rd(node + 0x10), rd(node + 0x18), rd(node + 0x20),
                         rd((uint64_t)gr[REG_RBX] + 0x38));
-                    raw_write(2,db, dn);
+                    raw_write_fmt(2, db, sizeof db, dn);
                 }
                 // PROSPER_HWBP_BUFDUMP: write the reader window [base..end] to a per-hit file.
                 if (g_hwbp_bufdump) {
@@ -1675,7 +1697,7 @@ namespace {
                         int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, 0644);
                         if (fd >= 0) { (void)!raw_write(fd, (const void*)base, (size_t)(end - base)); close(fd);
                             char m2[96]; int mn = snprintf(m2, sizeof m2, "[hwbp] bufdump #%d -> %s (%llu bytes)\n",
-                                (int)g_hwbp_count, fn, (unsigned long long)(end - base)); raw_write(2,m2, mn); }
+                                (int)g_hwbp_count, fn, (unsigned long long)(end - base)); raw_write_fmt(2, m2, sizeof m2, mn); }
                     }
                 }
             }
@@ -1710,7 +1732,7 @@ namespace {
                     "[stepwin] ENTER at driver hit #%d: base=0x%llx cur=0x%llx (off 0x%llx)\n",
                     (int)g_hwbp_count, (unsigned long long)g_stepwin_base, (unsigned long long)g_stepwin_prevcur,
                     (unsigned long long)(g_stepwin_prevcur - g_stepwin_base));
-                raw_write(2,sb, sn);
+                raw_write_fmt(2, sb, sizeof sb, sn);
                 PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;   // start single-stepping
                 guest_fs_restore_scoped(saved_fs);
                 return;
@@ -1781,7 +1803,7 @@ namespace {
                         }
                     }
                     if (n < (int)sizeof b - 1) b[n++] = '\n';
-                    raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+                    raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                     // PROSPER_BP_PROBE: evaluate the configured pointer/field chains at this hit (first,
                     // so it is never skipped by a KLASS-candidate issue below).
                     if (g_bp_probe) bp_eval_probes(g_bp_probe, uc, 0, "[bp-probe]");
@@ -1802,7 +1824,7 @@ namespace {
                             if (bp_il2cpp_cname(c.v, nm, sizeof nm)) {
                                 char kb[176]; int kn = snprintf(kb, sizeof kb, "[bp-klass] %s=0x%llx %s\n",
                                     c.rn, (unsigned long long)c.v, nm);
-                                raw_write(2, kb, (size_t)kn);
+                                raw_write_fmt(2, kb, sizeof kb, kn);
                             }
                         }
                     }
@@ -1837,7 +1859,7 @@ namespace {
                         n += snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
                                       (unsigned long long)goff(g_lwatch_stk[i]));
                     if (n < (int)sizeof b - 1) b[n++] = '\n';
-                    raw_write(2, b, (size_t)n);
+                    raw_write_fmt(2, b, sizeof b, n);
                     if (g_lwatch_hits >= g_lwatch_max) {   // caught enough — disarm, leave page RW
                         mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
                         g_lwatch_armed = 0; g_lwatch_stepping = false; g_lwatch_step_rip = 0;
@@ -1854,7 +1876,7 @@ namespace {
                 int n = snprintf(b, sizeof b, "[lwatch]   -> slot now [0]=0x%llx [8]=0x%llx\n",
                                  (unsigned long long)*(const uint64_t*)g_lwatch_slot,
                                  (unsigned long long)*(const uint64_t*)(g_lwatch_slot + 8));
-                raw_write(2, b, (size_t)n);
+                raw_write_fmt(2, b, sizeof b, n);
                 g_lwatch_step_rip = 0;
             }
             if (g_lwatch_armed) mprotect((void*)g_lwatch_page, 0x1000, PROT_READ);
@@ -1914,7 +1936,7 @@ namespace {
                         }
                     }
                     if (n < (int)sizeof b - 1) b[n++] = '\n';
-                    raw_write(2, b, (size_t)n);
+                    raw_write_fmt(2, b, sizeof b, n);
                     g_lwatch_step_rip = rip;
                     if (g_lwatch_hits >= g_lwatch_max) {   // bounded: disarm after enough evidence
                         mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
@@ -1939,7 +1961,7 @@ namespace {
             unsigned long long tag  = *(const uint64_t*)(g_watch_addr - 0x140);
             char b[128];
             int n = snprintf(b, sizeof b, "[watch]   -> slot now=0x%llx  obj[+0]=0x%llx\n", slot, tag);
-            raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+            raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
             mprotect((void*)g_watch_page, 0x1000, PROT_READ);
             g_watch_stepping = false;
             return;
@@ -1956,7 +1978,7 @@ namespace {
                     char b[128];
                     int n = snprintf(b, sizeof b, "[watch] armed on companion slot 0x%llx (obj r15=0x%llx) reader-tid=%ld\n",
                                      (unsigned long long)g_watch_addr, (unsigned long long)r15, cur_tid());
-                    raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+                    raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                 }
                 // Skip this (null) read so the boot proceeds; the slot's page is now watched.
                 PROSPER_GREGS(uc)[REG_RIP] = (greg_t)g_skip_target;
@@ -1976,7 +1998,7 @@ namespace {
                                      (unsigned long long)fa,
                                      (unsigned long long)PROSPER_GREGS(uc)[REG_RIP], cur_tid(),
                                      (int)g_watch_hits);
-                    raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+                    raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                 }
                 mprotect((void*)g_watch_page, 0x1000, PROT_READ | PROT_WRITE);
                 PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;   // set TF -> single-step the write
@@ -2031,9 +2053,9 @@ namespace {
                     ok = mmap(page, 0x10000, PROT_READ | PROT_WRITE,
                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page;
                 // 320, not 256: the worst-case line is ~228 bytes (max ordinal + two 16-digit
-                // addresses + rip + the FORGED-PTR-SHAPE suffix), and `n` is used unclamped as the
-                // raw_write length below — a suffix edit that pushed past the buffer would make
-                // snprintf return the would-be length and turn the write into an over-read.
+                // addresses + rip + the FORGED-PTR-SHAPE suffix). The write below is clamped, so a
+                // suffix edit that pushed past the buffer now costs a visibly truncated line rather
+                // than an over-read — keep the headroom anyway so it stays a complete line.
                 char b[320];
                 int n = snprintf(b, sizeof b,
                                  "[lazy-commit] #%u %s page=0x%llx addr=0x%llx access=%s rip=0x%llx%s\n",
@@ -2050,11 +2072,10 @@ namespace {
                 // prologue reads the TCB through %fs, and even glibc's syscall() wrapper stores errno
                 // via %fs on write failure — either is a nested SIGSEGV inside the handler that killed
                 // the process (the UE4 boot's silent exit-139; #1071/#1075).
-                // Clamp: snprintf returns the length it WOULD have written, so an unclamped `n`
-                // after truncation reads past the buffer.
-                if (n < 0) n = 0;
-                if ((size_t)n > sizeof b - 1) n = (int)(sizeof b - 1);
-                raw_write(2, b, (uint64_t)n);
+                // raw_write_fmt clamps: snprintf returns the length it WOULD have written, so an
+                // unclamped `n` after truncation reads past the buffer. This site had the clamp
+                // open-coded; it now shares the one helper every report site uses (#2050).
+                raw_write_fmt(2, b, sizeof b, n);
                 if (ok) return;   // re-execute against the now-backed page
             }
         }
@@ -2080,7 +2101,7 @@ namespace {
                     int n = snprintf(b, sizeof b, "[fault] GPU-VA %s addr=0x%llx rip=0x%llx\n",
                                      ok ? "mapped" : "MMAP-FAILED", (unsigned long long)a,
                                      (unsigned long long)rip);
-                    raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+                    raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                 }
                 if (ok) { g_lazy_pages = g_lazy_pages + 1; return; }  // re-execute against the now-mapped page
             }
@@ -2112,7 +2133,7 @@ namespace {
                     int n = snprintf(b, sizeof b, "[nullpage] #%d addr=0x%llx rip=eboot+0x%llx\n",
                                      (int)g_null_page_count, (unsigned long long)a,
                                      (unsigned long long)(rip - g_base));
-                    raw_write(2, b, (uint64_t)n);   /* raw_syscall: no errno/TLS access, %fs-safe in the handler (#1075) */
+                    raw_write_fmt(2, b, sizeof b, n);   /* raw_syscall: no errno/TLS access, %fs-safe in the handler (#1075) */
                     nullpage_deep_dump(uc, rip);   // issue-#312 attribution dump (registers + heap + GPU ring)
                     return;   // re-execute; the null read now sees zero
                 }
@@ -2132,7 +2153,7 @@ namespace {
                                  " (vm.mmap_min_addr/CAP_SYS_RAWIO)\n",
                                  (unsigned long long)a,
                                  (unsigned long long)(rip - g_base), mr);
-                raw_write(2, b, (uint64_t)n);   /* not even glibc syscall(): it stores errno via %fs on failure */
+                raw_write_fmt(2, b, sizeof b, n);   /* not even glibc syscall(): it stores errno via %fs on failure */
             }
         }
         // Null-companion skip probe (diagnostic; see g_skip_null_companion). Redirect the reader past
@@ -2152,7 +2173,7 @@ namespace {
                     "[+0x1a0]=0x%llx -> skip to 0x%llx\n",
                     (int)g_skip_count, (unsigned long long)r15, rd(r15+0xc0), rd(r15+0xe0),
                     rd(r15+0x138), rd(r15+0x140), rd(r15+0x1a0), (unsigned long long)g_skip_target);
-                raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+                raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                 PROSPER_GREGS(uc)[REG_RIP] = (greg_t)g_skip_target;
                 return;   // re-execute from the reader's skip label
             }
@@ -2174,7 +2195,7 @@ namespace {
             int n = snprintf(b, sizeof b, "[fault] sig=%d addr=%p rip=0x%llx armed=%d tid=%ld\n",
                              sig, si->si_addr, (unsigned long long)PROSPER_GREGS(uc)[REG_RIP],
                              (int)(g_armed_tid && cur_tid() == g_armed_tid), cur_tid());
-            raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+            raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
         }
         g_fault_addr = si->si_addr;
         auto* uc = (ucontext_t*)uctx;
@@ -2210,7 +2231,7 @@ namespace {
                     int n = snprintf(b, sizeof b,
                         "[int41] guest int $0x41 (debugbreak) at eboot+0x%llx -> skipped\n",
                         (unsigned long long)(g_fault_rip - g_base));
-                    raw_write(2, b, (size_t)n);
+                    raw_write_fmt(2, b, sizeof b, n);
                 }
                 g[REG_RIP] = g_fault_rip + 2;   // advance past the 2-byte int instruction
                 guest_fs_restore_scoped(saved_guest_fs);   // resume guest on its guest %fs, not host (#1155)
@@ -2278,7 +2299,7 @@ namespace {
                     fc.tid, fc.sig, (void*)(uintptr_t)fc.addr, (unsigned long long)fc.rip,
                     (unsigned long long)(g_base && fc.rip >= g_base ? fc.rip - g_base : fc.rip),
                     expected);
-                raw_write(2, cb2, (size_t)cn2);
+                raw_write_fmt(2, cb2, sizeof cb2, cn2);
                 // Wait for the owner to finish before ending the process — `_exit` here would
                 // truncate the very report this gate exists to keep whole (measured: the header
                 // line and nothing after it). BOUNDED, because the owner may itself die inside its
@@ -2307,7 +2328,7 @@ namespace {
                              fc.sig, (void*)(uintptr_t)fc.addr, (unsigned long long)fc.rip,
                              (unsigned long long)(g_base && fc.rip >= g_base ? fc.rip - g_base : fc.rip),
                              (unsigned long long)fc.rbp, fc.tid);
-            raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+            raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
             // Classify the fault rip + fault-addr regions (which mapping / module) and dump the instruction
             // bytes at rip — turns the ASLR-relocated "rip=0x...48b" into an identifiable location.
             classify_addr(fc.rip);
@@ -2318,7 +2339,7 @@ namespace {
                 rdb(fc.rip), rdb(fc.rip+1), rdb(fc.rip+2), rdb(fc.rip+3),
                 rdb(fc.rip+4), rdb(fc.rip+5), rdb(fc.rip+6), rdb(fc.rip+7),
                 (unsigned long long)(probe_readable(fc.rsp) ? *(const uint64_t*)fc.rsp : 0));
-            raw_write(2,ib, m);
+            raw_write_fmt(2, ib, sizeof ib, m);
             // Guest-%fs attribution (#1155): is the faulting thread running guest code on OUR guest TCB
             // or leaked onto the host glibc TCB? The guest loads its TCB self-pointer with `mov %fs:0x0`;
             // at a fault right after, that value is still in rax (the common landing reg) and equals the
@@ -2379,7 +2400,7 @@ namespace {
                                  "[fault] thread='%s' guest-fs=0x%llx rax=0x%llx on-guest-TCB=%s\n",
                                  nm, (unsigned long long)saved_guest_fs,
                                  (unsigned long long)fc.rax, tcb);
-                raw_write(2, tb, (size_t)t);
+                raw_write_fmt(2, tb, sizeof tb, t);
             }
             // PROSPER_FAULTOBJ (#1226): dump the leading 0xC0 bytes of the objects in rax/r15/rbx via a
             // fault-safe self-read (process_vm_readv, EFAULT-safe on unmapped guest VAs). For ArcRunner's
@@ -2410,7 +2431,7 @@ namespace {
                         on += snprintf(ob + on, sizeof ob - (size_t)on, " +%02x=%016llx",
                                        w * 8, (unsigned long long)buf[w]);
                     on += snprintf(ob + on, sizeof ob - (size_t)on, "\n");
-                    raw_write(2, ob, (size_t)on);
+                    raw_write_fmt(2, ob, sizeof ob, on);
                 }
                 // Corruption-source probe: dump rcx/rdx and scan the GPU-write ring around every
                 // guest-pointer-shaped register. If a prosper ReleaseMem/fence write landed on a
@@ -2458,7 +2479,7 @@ namespace {
                                       (unsigned long long)fc.rcx, (unsigned long long)fc.rdx,
                                       probe_page_n, probe_page_considered,
                                       probe_page_n < probe_page_considered ? " (CAPPED)" : "");
-                    raw_write(2, cb, (size_t)cn);
+                    raw_write_fmt(2, cb, sizeof cb, cn);
                     if (prosper_gpu_write_ring_scan) {
                         static char ring[8192];
                         for (unsigned i = 0; i < probe_page_n; i++) {
@@ -2468,7 +2489,7 @@ namespace {
                                 char hb[96]; int hn = snprintf(hb, sizeof hb,
                                     "[faultobj] GPU-write-ring hits in page 0x%llx:\n",
                                     (unsigned long long)pg);
-                                raw_write(2, hb, (size_t)hn);
+                                raw_write_fmt(2, hb, sizeof hb, hn);
                                 raw_write(2, ring, strlen(ring));
                             }
                         }
@@ -2487,7 +2508,7 @@ namespace {
                             char hb[112]; int hn = snprintf(hb, sizeof hb,
                                 "[faultobj] clock-fence targets in page 0x%llx: %d\n",
                                 (unsigned long long)pg, fn2);
-                            raw_write(2, hb, (size_t)hn);
+                            raw_write_fmt(2, hb, sizeof hb, hn);
                             if (fn2 > 0) raw_write(2, cfb, strlen(cfb));
                         }
                     }
@@ -2516,7 +2537,7 @@ namespace {
                             char hb[128]; int hn = snprintf(hb, sizeof hb,
                                 "[faultobj] clock-fence low32 matches for value 0x%llx (hi32=0x%x): %d\n",
                                 (unsigned long long)v, hi32, fn3);
-                            raw_write(2, hb, (size_t)hn);
+                            raw_write_fmt(2, hb, sizeof hb, hn);
                             if (fn3 > 0) raw_write(2, fb, strlen(fb));
                         }
                     }
@@ -2558,7 +2579,7 @@ namespace {
                                 bn += snprintf(bb + bn, sizeof bb - (size_t)bn, "%s%02x",
                                                (k % 8 == 0) ? " " : "", bytes[k]);
                             bn += snprintf(bb + bn, sizeof bb - (size_t)bn, "\n");
-                            raw_write(2, bb, (size_t)bn);
+                            raw_write_fmt(2, bb, sizeof bb, bn);
                         };
                         byte_dump("rdx", fc.rdx);
                         byte_dump("r8", fc.r8);
@@ -2569,7 +2590,7 @@ namespace {
                                 char cb2[96]; int cn2 = snprintf(cb2, sizeof cb2,
                                     "[faultobj] pool 0x%llx candidate=%d\n",
                                     (unsigned long long)pb, prosper_mb3_is_pool_candidate(pb));
-                                raw_write(2, cb2, (size_t)cn2);
+                                raw_write_fmt(2, cb2, sizeof cb2, cn2);
                             }
                         }
                         // #1226: cross-reference the slot pages against APR write destinations —
@@ -2584,7 +2605,7 @@ namespace {
                                 char h4[112]; int h4n = snprintf(h4, sizeof h4,
                                     "[faultobj] APR dests overlapping page 0x%llx: %d\n",
                                     (unsigned long long)pg, an);
-                                raw_write(2, h4, (size_t)h4n);
+                                raw_write_fmt(2, h4, sizeof h4, h4n);
                                 raw_write(2, ab, strlen(ab));   // unconditional: the stores/evictions header IS the zero-case confidence signal
                             }
                         }
@@ -2596,7 +2617,7 @@ namespace {
                             char pb[128]; int pn = snprintf(pb, sizeof pb,
                                 "[faultobj] POOLSHIFT candidate 0x%llx -> real ptr 0x%llx\n",
                                 (unsigned long long)v, (unsigned long long)real);
-                            raw_write(2, pb, (size_t)pn);
+                            raw_write_fmt(2, pb, sizeof pb, pn);
                             // What actually lives at the reconstructed pointer? A live free block
                             // (next-pointer residue), a pool-info record, or unrelated data —
                             // discriminates "compressed pointer misread" from coincidence.
@@ -2609,7 +2630,7 @@ namespace {
                                 char h5[112]; int h5n = snprintf(h5, sizeof h5,
                                     "[faultobj] APR dests overlapping real-ptr page 0x%llx: %d\n",
                                     (unsigned long long)rp, arn);
-                                raw_write(2, h5, (size_t)h5n);
+                                raw_write_fmt(2, h5, sizeof h5, h5n);
                                 raw_write(2, ar, strlen(ar));   // unconditional (see above)
                             }
                             uint64_t pg = real & ~0xfffull;
@@ -2619,7 +2640,7 @@ namespace {
                                 char h2[112]; int h2n = snprintf(h2, sizeof h2,
                                     "[faultobj] GPU-write-ring hits at real-ptr page 0x%llx: %d\n",
                                     (unsigned long long)pg, rn2);
-                                raw_write(2, h2, (size_t)h2n);
+                                raw_write_fmt(2, h2, sizeof h2, h2n);
                                 if (rn2 > 0) raw_write(2, rs, strlen(rs));
                             }
                             if (prosper_gpu_clockfence_scan) {
@@ -2628,7 +2649,7 @@ namespace {
                                 char h3[112]; int h3n = snprintf(h3, sizeof h3,
                                     "[faultobj] clock-fence targets at real-ptr page 0x%llx: %d\n",
                                     (unsigned long long)pg, cn2);
-                                raw_write(2, h3, (size_t)h3n);
+                                raw_write_fmt(2, h3, sizeof h3, h3n);
                                 if (cn2 > 0) raw_write(2, cs, strlen(cs));
                             }
                         }
@@ -2664,7 +2685,7 @@ namespace {
                 };
 #endif
                 ln = snprintf(lb, sizeof lb, "[prosper]   guest fp-chain (rbp=0x%llx):\n", (unsigned long long)fc.rbp);
-                if (ln > 0) raw_write(2, lb, (size_t)ln);
+                raw_write_fmt(2, lb, sizeof lb, ln);
                 uint64_t fp = fc.rbp;
                 for (int depth = 0; depth < 16; depth++) {
                     uint64_t ra = 0, nfp = 0;
@@ -2674,13 +2695,13 @@ namespace {
                                       depth, (unsigned long long)ra, (unsigned long long)(ra - g_base));
                     else
                         ln = snprintf(lb, sizeof lb, "[prosper]     #%d ra=0x%llx\n", depth, (unsigned long long)ra);
-                    if (ln > 0) raw_write(2, lb, (size_t)ln);
+                    raw_write_fmt(2, lb, sizeof lb, ln);
                     if (nfp <= fp || nfp - fp > 0x200000ull) break;   // non-increasing / implausible frame: stop
                     fp = nfp;
                 }
                 ln = snprintf(lb, sizeof lb, "[prosper]   guest ret-addr scan (rsp=0x%llx, 64 qwords):\n",
                               (unsigned long long)fc.rsp);
-                if (ln > 0) raw_write(2, lb, (size_t)ln);
+                raw_write_fmt(2, lb, sizeof lb, ln);
                 for (int i = 0, shown = 0; i < 64 && shown < 16; i++) {
                     uint64_t sa = fc.rsp + (uint64_t)i * 8;
                     uint64_t q = 0;
@@ -2688,7 +2709,7 @@ namespace {
                     if (g_base && q >= g_base && q < g_base + 0x100000000ull) {
                         ln = snprintf(lb, sizeof lb, "[prosper]     rsp+0x%03x = 0x%llx (eboot+0x%llx)\n",
                                       i * 8, (unsigned long long)q, (unsigned long long)(q - g_base));
-                        if (ln > 0) raw_write(2, lb, (size_t)ln);
+                        raw_write_fmt(2, lb, sizeof lb, ln);
                         shown++;
                     }
                 }
@@ -2704,7 +2725,7 @@ namespace {
                     if (g_base && r.v >= g_base && r.v < g_base + 0x100000000ull) {
                         ln = snprintf(lb, sizeof lb, "[prosper]     %-3s = 0x%llx (eboot+0x%llx)\n",
                                       r.nm, (unsigned long long)r.v, (unsigned long long)(r.v - g_base));
-                        if (ln > 0) raw_write(2, lb, (size_t)ln);
+                        raw_write_fmt(2, lb, sizeof lb, ln);
                     }
                 }
             }
@@ -3235,7 +3256,7 @@ void arm_bp() {
     char b[96];
     int n = snprintf(b, sizeof b, "[bp] armed int3 at eboot+0x%llx (orig=0x%02x)\n",
                      (unsigned long long)(g_bp_addr - g_base), g_bp_orig);
-    raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+    raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
 }
 
 // Open + enable the PROSPER_HWBP hardware breakpoint on a primary guest-execution thread — the perf
@@ -3254,7 +3275,7 @@ void arm_hwbp() {
                          (unsigned long long)(g_hwbp_addr - g_base), errno,
                          already_anchored ? "this primary thread not armed"
                                           : "HW bp disabled");
-        raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+        raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
         // A frontend may run module init on the process thread, then run_entry on a distinct
         // std::thread. A failure on that second primary must not disable the first valid per-TID fd.
         if (!already_anchored) g_hwbp_on = false;
@@ -3269,7 +3290,7 @@ void arm_hwbp() {
         int n = snprintf(b, sizeof b, "[hwbp] thread-state table full for tid=%ld - %s\n",
                          (long)ow.pid, already_anchored ? "this primary thread not armed"
                                                         : "HW bp disabled");
-        raw_write(2, b, (size_t)n);
+        raw_write_fmt(2, b, sizeof b, n);
         close(thread_fd);
         if (!already_anchored) g_hwbp_on = false;
         return;
@@ -3283,7 +3304,7 @@ void arm_hwbp() {
     ioctl(thread_fd, PERF_EVENT_IOC_ENABLE, 0);
     int n = snprintf(b, sizeof b, "[hwbp] armed HW execute bp at eboot+0x%llx (fd=%d tid=%ld)\n",
                      (unsigned long long)(g_hwbp_addr - g_base), thread_fd, (long)prosper_gettid());
-    raw_write(2, b, (size_t)n);   /* raw syscall: no libc TLS access */
+    raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
 }
 
 // Arm the same execute bp on the CURRENT (worker) thread, gated by PROSPER_HWBP_ALLTHREADS. Each thread
@@ -3291,11 +3312,11 @@ void arm_hwbp() {
 void arm_hwbp_this_thread() {
     if (getenv("PROSPER_HWBP_ARMLOG")) { char b[128]; int n = snprintf(b, sizeof b,
         "[hwbp] arm_this_thread tid=%ld on=%d all=%d addr=0x%llx tfd=%d\n", (long)prosper_gettid(),
-        g_hwbp_on, g_hwbp_allthreads, (unsigned long long)g_hwbp_addr, t_hwbp_fd); raw_write(2,b, n); }
+        g_hwbp_on, g_hwbp_allthreads, (unsigned long long)g_hwbp_addr, t_hwbp_fd); raw_write_fmt(2, b, sizeof b, n); }
     if (!g_hwbp_on || !g_hwbp_allthreads || !g_hwbp_addr || t_hwbp_fd >= 0) return;
     long fd = perf_bp_open(g_hwbp_addr, HW_BREAKPOINT_X);
     if (fd < 0) { char b[96]; int n = snprintf(b, sizeof b, "[hwbp] worker-arm FAILED tid=%ld errno=%d\n",
-        (long)prosper_gettid(), errno); raw_write(2,b, n); return; }
+        (long)prosper_gettid(), errno); raw_write_fmt(2, b, sizeof b, n); return; }
     t_hwbp_fd = (int)fd;
     fcntl(t_hwbp_fd, F_SETFL, O_ASYNC);
     fcntl(t_hwbp_fd, F_SETSIG, SIGTRAP);
@@ -3304,13 +3325,13 @@ void arm_hwbp_this_thread() {
     if (!hwbp_register_thread(ow.pid, t_hwbp_fd)) {
         char b[112]; int n = snprintf(b, sizeof b,
             "[hwbp] thread-state table full for worker tid=%ld - not armed\n", (long)ow.pid);
-        raw_write(2, b, n);
+        raw_write_fmt(2, b, sizeof b, n);
         close(t_hwbp_fd); t_hwbp_fd = -1; return;
     }
     ioctl(t_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
     char b[128]; int n = snprintf(b, sizeof b, "[hwbp] armed on worker tid=%ld (fd=%d) for eboot+0x%llx\n",
         (long)prosper_gettid(), t_hwbp_fd, (unsigned long long)goff(g_hwbp_addr));
-    raw_write(2,b, n);
+    raw_write_fmt(2, b, sizeof b, n);
 }
 
 void guest_execution_thread_enter(bool primary) {

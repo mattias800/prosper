@@ -14,6 +14,31 @@
 #include <cerrno>
 #include <cstdint>
 
+namespace prosper {
+
+// --- snprintf() return -> write() length: the clamp every report site needs ------------------
+// snprintf() returns the length it WOULD have written, not the length it did. Handing that value
+// straight to a write() length is an out-of-bounds READ of the caller's buffer on every format
+// that truncates, and a negative return (encoding error) converts to an enormous size_t. Both
+// matter most exactly where this is used: the fault-handler report sites run only once the
+// process is already known to be broken, so the diagnostic corrupts the evidence for the crash
+// it exists to describe, in the one situation where the output has to be trustworthy. (#2050;
+// the class is instrument trap 109, first caught in the [labelhist] fault dumper.)
+//
+// This is the whole contract: given snprintf's return `n` and the destination array's `cap`,
+// return how many bytes actually landed there. On truncation snprintf wrote cap-1 characters
+// plus the terminating NUL, so cap-1 is the readable content.
+// Async-signal-safe: integer arithmetic only — no allocation, no lock, no errno, no TLS.
+// Defined above the platform guard because it is pure arithmetic: Windows/MinGW-clean, and
+// unit-testable on any host (see tests/test_raw_syscall.cpp).
+inline uint64_t raw_fmt_len(int n, uint64_t cap) {
+    if (n < 0 || cap == 0) return 0;              // encoding error, or nowhere to have written
+    const uint64_t un = (uint64_t)n;
+    return un < cap ? un : cap - 1;               // truncated: cap-1 characters + the NUL
+}
+
+} // namespace prosper
+
 #if defined(__linux__) && defined(__x86_64__)
 
 #include <sys/mman.h>
@@ -76,3 +101,33 @@ inline long raw_write(int fd, const void* buf, uint64_t len) {
 } // namespace prosper
 
 #endif // platform
+
+#if !defined(_WIN32)
+
+namespace prosper {
+
+// A silently shortened fault report is its own trap: the reader cannot tell a complete line from
+// one that lost its tail, and the tail is where the interesting operand usually sits. So when the
+// clamp bites, say so on the same stream rather than letting the line just end early.
+// Async-signal-safe: one raw write of a static literal.
+inline void raw_write_trunc_mark(int fd) {
+    static const char mark[] = "...[prosper: diagnostic line truncated]\n";
+    (void)raw_write(fd, mark, sizeof mark - 1);
+}
+
+// Write exactly what snprintf() placed in `buf` (an array of `cap` bytes) when it returned `n`,
+// and make any loss visible. One syscall on the normal path, two only when the line truncated.
+// Returns the content write's result; report sites ignore it (best-effort logging).
+//
+// The `cap` argument is spelled `sizeof buf` at every call site on purpose: it sits directly
+// under the snprintf() that also says `sizeof buf`, so a reader can check the pair by eye and a
+// buffer resize cannot leave the write behind.
+inline long raw_write_fmt(int fd, const char* buf, uint64_t cap, int n) {
+    const long w = raw_write(fd, buf, raw_fmt_len(n, cap));
+    if (n < 0 || (uint64_t)n >= cap) raw_write_trunc_mark(fd);
+    return w;
+}
+
+} // namespace prosper
+
+#endif // !_WIN32
