@@ -102,10 +102,18 @@ int main() {
           "adaptive attr round-trips as type 4");
     attr_destroy(U(&aattr), 0, 0, 0, 0, 0);
 
-    // 5. Invalid type rejected.
+    // 5. Invalid type rejected. #2178: scePthreadMutexattrSettype is fallible, so the SONY spelling
+    //    reports the encoded form like every other fallible Sony entry point — it was handing back a
+    //    bare 22 while scePthreadMutexTrylock two lines up handed back 0x80020010. The POSIX
+    //    spelling registered on the same body still reports the bare 22, and asserting both is what
+    //    distinguishes a correct alias from either spelling drifting into the other's contract.
     void* battr = nullptr;
     attr_init(U(&battr), 0, 0, 0, 0, 0);
-    CHECK(attr_settype(U(&battr), 99, 0, 0, 0, 0) == 0x16, "settype(99) rejected EINVAL(22)");
+    CHECK(attr_settype(U(&battr), 99, 0, 0, 0, 0) == prosper::hle::kSceKernelErrorEINVAL,
+          "scePthreadMutexattrSettype(99) rejected with encoded EINVAL (0x80020016)");
+    auto p_attr_settype = Hle::lookup(nid_hash("pthread_mutexattr_settype"));
+    CHECK(p_attr_settype && p_attr_settype(U(&battr), 99, 0, 0, 0, 0) == 22,
+          "pthread_mutexattr_settype(99) keeps the bare EINVAL(22)");
     attr_destroy(U(&battr), 0, 0, 0, 0, 0);
 
     // 6. STATIC SENTINEL self-init remains non-recursive (native POSIX default; Windows ERRORCHECK):

@@ -3,6 +3,7 @@
 // as CLOCK_REALTIME and normally appeared decades in the past.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
+#include "../src/hle/sce_errno.hpp"   // #2178: the Sony spellings report the libkernel encoding
 #include "../src/hle/sync_futex.hpp"
 
 #include <cerrno>
@@ -83,21 +84,24 @@ int main() {
                   attr_getclock(U(&attr), U(&value), 0, 0, 0, 0) == 0 && value == clock,
               "supported Sony condition clock round-trips");
     }
-    CHECK(attr_setclock(U(&attr), 3, 0, 0, 0, 0) == 22,
-          "unsupported condition clock is rejected with EINVAL(22)");
+    // #2178: these are the SONY spellings, so a rejection reports the libkernel-encoded form. The
+    // POSIX spellings registered on the same bodies keep the bare 22, and test_pthread_error_encoding
+    // asserts that half — a single-spelling assertion here cannot tell the two wirings apart.
+    CHECK(attr_setclock(U(&attr), 3, 0, 0, 0, 0) == 0x80020016ull,
+          "unsupported condition clock is rejected with encoded EINVAL (0x80020016)");
     value = -1;
     CHECK(attr_getclock(U(&attr), U(&value), 0, 0, 0, 0) == 0 && value == 4,
           "rejected setclock preserves the previous clock");
-    CHECK(attr_getclock(U(&attr), 0, 0, 0, 0, 0) == 22,
-          "getclock rejects a null output pointer");
+    CHECK(attr_getclock(U(&attr), 0, 0, 0, 0, 0) == 0x80020016ull,
+          "getclock rejects a null output pointer with encoded EINVAL");
 
     value = -1;
     CHECK(attr_getpshared(U(&attr), U(&value), 0, 0, 0, 0) == 0 && value == 0,
           "fresh attribute is process-private");
     CHECK(attr_setpshared(U(&attr), 0, 0, 0, 0, 0) == 0,
           "process-private condition attribute is accepted");
-    CHECK(attr_setpshared(U(&attr), 1, 0, 0, 0, 0) == 22,
-          "unsupported process-shared condition attribute is rejected");
+    CHECK(attr_setpshared(U(&attr), 1, 0, 0, 0, 0) == 0x80020016ull,
+          "unsupported process-shared condition attribute is rejected with encoded EINVAL");
 
     // CondInit must copy the attribute. Change the reusable attr back to realtime after init, then
     // use a deadline that is far in the future for every non-realtime clock but in the past for
@@ -206,8 +210,11 @@ int main() {
     // EPERM. The bookkeeping transaction must not publish this non-owner as the mutex owner.
     CHECK(!win_guest_mutex_owned_by_current_thread_for_test(sce_mutex),
           "unlocked mutex has no current-thread owner before invalid wait");
-    CHECK(sce_cond_timedwait(U(&sce_cond), U(&sce_mutex), 1'000, 0, 0, 0) == EPERM,
-          "condition wait by a mutex non-owner returns EPERM");
+    // #2178: this entry point encoded its TIMEOUT (0x8002003c, asserted above) and left every other
+    // failure bare — the same question answered two ways eleven lines apart. Both are encoded now.
+    CHECK(sce_cond_timedwait(U(&sce_cond), U(&sce_mutex), 1'000, 0, 0, 0)
+              == prosper::hle::sce_kernel_error(prosper::hle::FreeBsdErrno::EPerm),
+          "condition wait by a mutex non-owner returns encoded EPERM (0x80020001)");
     CHECK(!win_guest_mutex_owned_by_current_thread_for_test(sce_mutex),
           "failed non-owner unlock does not invent guest mutex ownership");
     CHECK(mutex_lock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
@@ -220,8 +227,9 @@ int main() {
     CHECK(mutex_lock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
           "mutex locks before injected relock failure");
     win_set_cond_wait_failure_for_test(CondWaitFailurePointForTest::BeforeRelock, EIO);
-    CHECK(sce_cond_timedwait(U(&sce_cond), U(&sce_mutex), 1'000, 0, 0, 0) == EIO,
-          "injected relock failure is returned");
+    CHECK(sce_cond_timedwait(U(&sce_cond), U(&sce_mutex), 1'000, 0, 0, 0)
+              == prosper::hle::sce_kernel_error(prosper::hle::FreeBsdErrno::EIo),
+          "injected relock failure is returned, encoded (0x80020005)");
     CHECK(!win_guest_mutex_owned_by_current_thread_for_test(sce_mutex),
           "relock failure leaves guest mutex ownership released");
     CHECK(mutex_lock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
