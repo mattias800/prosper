@@ -271,9 +271,20 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     to catch the moment live — the human presses F9 once, then the fix is iterated on the frozen frame.
     It captures *rendered-frame* bugs (not CPU/logic/audio). See `tools/AGENTS.md` (interactive frame grab)
     and `tools/gpu_replay/README.md`.
-- **Reaching the running frame loop** needs two gated switches (off by default, so the default boot stays
-  stable): `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct`. Add `PROSPER_RENDER=1` to run the
-  live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
+- **Reaching the running frame loop:** `PROSPER_GUEST_ARGS=-force-gfx-direct`, plus `PROSPER_RENDER=1`
+  to run the live renderer and `PROSPER_GFXLOG=1` for graphics diagnostics.
+  - **`PROSPER_GUEST_FS=1` is NOT needed on Linux or Windows, and this line used to say it was.** Guest
+    initial-exec TLS is **enabled by default** there; the environment variable actually read is the
+    **opt-OUT** `PROSPER_NO_GUEST_FS`, kept for compatibility bisection (`src/host/guest_tls.cpp:58`,
+    `:240`; `src/hle/dispatch.hpp:218`). `PROSPER_GUEST_FS` is never read as an env var on those
+    platforms — setting it is harmless but does nothing, and *believing* it is required is not: it
+    turns a default-on path into one people think they are enabling, so nobody checks it when a guest
+    TLS problem is the actual cause. On **macOS/Rosetta** `PROSPER_GUEST_FS` does remain the opt-in for
+    trap emulation, which is where the confusion came from.
+  - Recorded because of how far a wrong default travelled: this line propagated into a review's wording,
+    then a briefing, then a shipped code comment, then an author-verification comment — with nobody
+    opening `guest_tls.cpp` at any step (#2049). **A default stated in this file is the kind of claim
+    every reader inherits without checking; verify against the code before restating one.**
 - **Do not reuse snapshot acceleration for interactive or performance runs.** `PROSPER_RENDER_SCALE>1`,
   `PROSPER_RENDER_EVERY>1`, and `PROSPER_RENDER_EVERY_FOR_MS` deliberately reduce resolution or skip
   graphics submits. Keep the defaults (`PROSPER_RENDER_SCALE=1`, `PROSPER_RENDER_EVERY=1`, and no timed
