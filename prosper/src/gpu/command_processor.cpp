@@ -62,6 +62,15 @@ std::vector<RegWatchEntry> parse_reg_watch(const char* setting) {
             item = item.substr(colon + 1);
             if (item.empty()) continue;
         }
+        if (item == "*") {
+            // Whole-class watch; only meaningful with an explicit class prefix (a bare "*" would
+            // not say which file to watch, so it is skipped like any other unparsable entry).
+            if (colon == std::string::npos) continue;
+            entry.all_offsets = true;
+            if (std::find(entries.begin(), entries.end(), entry) == entries.end())
+                entries.push_back(entry);
+            continue;
+        }
         char* end = nullptr;
         errno = 0;
         const unsigned long parsed = std::strtoul(item.c_str(), &end, 0);
@@ -88,16 +97,23 @@ void reg_watch_report(RegClass reg_class, uint32_t offset, uint32_t value, uint3
     if (entries.empty()) return;
     for (const auto& entry : entries) {
         if (entry.reg_class != reg_class) continue;
-        if (entry.offset < offset || entry.offset >= offset + (count ? count : 1u)) continue;
-        const uint32_t index = entry.offset - offset;
-        const uint32_t written = values && index < count ? values[index] : value;
-        static std::atomic<int> emitted{0};
-        if (emitted.fetch_add(1) >= 400000) return;
-        const char* cn = reg_class == RegClass::Cx ? "Cx"
-                       : reg_class == RegClass::Sh ? "Sh" : "Uc";
-        std::fprintf(stderr, "[regwatch] class=%s off=0x%x val=0x%08x path=%s span=0x%x+%u order=%llu\n",
-                     cn, entry.offset, written, path, offset, count,
-                     static_cast<unsigned long long>(command_order));
+        // A whole-class watch reports every offset of the reported span; a single-offset watch
+        // reports only its own dword within that span.
+        const uint32_t span = count ? count : 1u;
+        const uint32_t first = entry.all_offsets ? 0u : entry.offset - offset;
+        if (!entry.all_offsets &&
+            (entry.offset < offset || entry.offset >= offset + span)) continue;
+        for (uint32_t index = first; index < (entry.all_offsets ? span : first + 1u); ++index) {
+            const uint32_t written = values && index < count ? values[index] : value;
+            static std::atomic<int> emitted{0};
+            if (emitted.fetch_add(1) >= 400000) return;
+            const char* cn = reg_class == RegClass::Cx ? "Cx"
+                           : reg_class == RegClass::Sh ? "Sh" : "Uc";
+            std::fprintf(stderr,
+                         "[regwatch] class=%s off=0x%x val=0x%08x path=%s span=0x%x+%u order=%llu\n",
+                         cn, offset + index, written, path, offset, count,
+                         static_cast<unsigned long long>(command_order));
+        }
     }
 }
 }  // namespace
