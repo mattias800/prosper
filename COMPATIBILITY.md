@@ -49,7 +49,7 @@ Last updated: 2026-08-05
 | *The Forgotten City* | `PPSA03026` | Unreal Engine | 🚧 Title screen | [#1890](https://github.com/mattias800/prosper/issues/1890) |
 | *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
 | *Little Nightmares III* | `PPSA05143` | Unreal Engine 4 | 🚧 Boot splash sequence and title screen; most title frames carry a yellow tint | [#1893](https://github.com/mattias800/prosper/issues/1893) |
-| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Content streams and the engine submits real draws, then a declined GPU submit freezes every thread, so the display stays black | [#1894](https://github.com/mattias800/prosper/issues/1894) |
+| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Content streams and the engine submits real draws and composites frames, then a guest memory fault ends the run a few seconds in, before any title screen | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Health warning and title screen; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Title screen | [#1898](https://github.com/mattias800/prosper/issues/1898) |
@@ -319,11 +319,15 @@ to maximum, which reads as a flat yellow background under otherwise-correct cont
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
 
 The title is Unreal Engine 4.27 with IoStore packaging. It boots into a native Linux/Vulkan run, completes
-engine bootstrap, and now streams real content: 394 reads served from the 8.49 GB IoStore container, real GPU
-draws, and nine composited frames. Then prosper declines one GPU submit it cannot order safely, and because the
-whole submit is discarded the completion the guest is waiting for is never written — all ninety guest threads
-park, from the game thread's render fence down through the render and RHI threads. Every composited frame is
-black, so no screenshot is published. See the [tracker](https://github.com/mattias800/prosper/issues/1894).
+engine bootstrap, and streams real content from the 8.49 GB IoStore container. The engine reaches its frame loop:
+over a thousand draws, hundreds of compute dispatches, and composited frames delivered to the display. The
+declined-GPU-submit freeze that used to stop it here is gone, fixed by
+[#1987](https://github.com/mattias800/prosper/pull/1987). What ends the run now is a guest memory fault a few
+seconds into the boot — on the render thread, the RHI thread or a worker pool thread depending on the run, and in
+some runs the game's own allocator catches it first — far too early for a title screen, so nothing beyond the
+engine's own startup is reached. The frames delivered before the fault are a single flat colour, alternating
+black and white, while intermediate render targets do carry real image content. See the
+[tracker](https://github.com/mattias800/prosper/issues/1894).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
 

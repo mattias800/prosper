@@ -355,6 +355,12 @@ the same thing, and do not treat either as superseding the other until that is c
   `mov %fs:0x0`; at `eboot+0x14600df` `rax` is the guest allocator's per-thread bin-array base
   (`0x30209c0000` / `0x3020140000` in the two observed instances). Do not open a #1155-class
   investigation from it without an independent `%fs` witness.
+  **The independent witness now exists** (#2018): the line reports `guest_fs_to_host_scoped()`'s
+  return, which is this thread's real `%fs` base and is returned only after `TCB_MAGIC` is verified
+  there, so `on-guest-TCB` is a fact rather than an inference and `rax` is printed beside it as raw
+  evidence carrying no claim. Measured on Crisis Core (`PPSA07809`), the same `RenderThread 1` fault
+  that used to print `NO(host-%fs leak?)` now prints `on-guest-TCB=yes`. Reports from **before**
+  #2018 still carry the old heuristic and must be read the way this entry says.
 * **A guest `std::terminate` is worth one disassembly pass before it is treated as heap damage.**
   For an *uncaught* exception the C++ runtime calls `std::terminate` from `__cxa_throw` **without
   unwinding**, so prosper's own frame-pointer walk at the `ud2` still carries the throwing stack.

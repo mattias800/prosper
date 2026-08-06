@@ -36,6 +36,15 @@ insn @rip: 48 8b 01            (mov rax,[rcx])   rcx=0x30016000
 [fault] thread='RenderThread 1' on-guest-TCB=NO(host-%fs leak?)
 ```
 
+Two apparatus notes on that transcript, both from #2018 and both changing how it should be read.
+**The `on-guest-TCB` verdict in it is void**: it was inferred from `rax`, which holds the corrupt
+object pointer here rather than a TCB self-pointer (`OREGON_TRAIL_STATUS.md` § Ruled out). The line
+is now driven by the verified `%fs` base instead, and the equivalent Crisis Core fault reports
+`on-guest-TCB=yes`. **And a pre-#2018 report can be a mixture of two threads' faults** — the
+context lived in process globals, so a second faulting thread rewrote them mid-dump; any
+`insn @rip`, backtrace or `[faultobj] probe-pages` figure from an arm where more than one thread
+faulted may not belong to the header above it.
+
 `0x30016000` is far below the guest arena (`0x2000000000`–`0x9fc0000000`) and is read out of a
 structure whose neighbouring fields are ordinary guest pointers. It is the misaligned dereference
 of the tagged free-list value `0x2000000001`, not a separate poison value written directly by a
