@@ -175,14 +175,22 @@ int main() {
     // drop the wave mask with the value; s_cselect_b64 then folded to Unknown and the attribute was
     // published as shader-computed. The recompiler's faithful-address path then read record 0 for
     // every vertex AND re-added the instruction's OFFSET/SOFFSET to an already-resolved base, so the
-    // whole post-movie composite sampled one texel (#2006). Both polarities are asserted: a fix that
-    // merely defaulted the saved mask to "all lanes" would pass the vertex arm and fail this one.
+    // whole post-movie composite sampled one texel (#2006).
+    //
+    // The cndmask writes v3, not v5, exactly as the live prologue does: v5 and v8 are pre-seeded
+    // Vertex/Instance at entry, so a kernel that selects back into one of them could report the right
+    // answer without the selection being modelled at all. Writing an unseeded VGPR makes the check
+    // depend on the fold actually resolving the saved mask.
+    //
+    // The instance arm below does NOT discriminate this fix on its own — `s_cselect_b64`'s false arm
+    // is the literal zero mask, which was always resolvable — but it does fail any "fix" that
+    // defaults a saved mask to all-lanes instead of tracking it.
     const uint32_t ngg_saved_exec_fetch[] = {
         0xBE90047Eu,                // s_mov_b64 s[16:17], exec
         0xBF066A80u,                // s_cmp_eq_u32 0, s106
         0x85A08010u,                // s_cselect_b64 s[32:33], s[16:17], 0
-        0xD5010005u, 0x00820B08u,   // v_cndmask_b32_e64 v5, v8, v5, s[32:33]
-        0xE0082000u, 0x6B100E05u,   // buffer_load_format_xyz v[14:16], v5, s[64:67], 0 idxen
+        0xD5010003u, 0x00820B08u,   // v_cndmask_b32_e64 v3, v8, v5, s[32:33]
+        0xE0082000u, 0x6B100E03u,   // buffer_load_format_xyz v[14:16], v3, s[64:67], 0 idxen
         0xBF810000u,
     };
     ngg_seed[106 - 8] = 0u;                  // SCC=true -> select v5 (vertex_id)
@@ -205,8 +213,8 @@ int main() {
         0xBE940410u,                // s_mov_b64 s[20:21], s[16:17]
         0xBF066A80u,                // s_cmp_eq_u32 0, s106
         0x85A08014u,                // s_cselect_b64 s[32:33], s[20:21], 0
-        0xD5010005u, 0x00820B08u,   // v_cndmask_b32_e64 v5, v8, v5, s[32:33]
-        0xE0082000u, 0x6B100E05u,   // buffer_load_format_xyz v[14:16], v5, s[64:67], 0 idxen
+        0xD5010003u, 0x00820B08u,   // v_cndmask_b32_e64 v3, v8, v5, s[32:33]
+        0xE0082000u, 0x6B100E03u,   // buffer_load_format_xyz v[14:16], v3, s[64:67], 0 idxen
         0xBF810000u,
     };
     ngg_seed[106 - 8] = 0u;

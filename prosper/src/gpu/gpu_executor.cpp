@@ -2157,8 +2157,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         mask_state[(size_t)in.dst.value] = source_mask_state;
                 } else if (in.opcode == 0x04 &&                 // s_mov_b64 sDST, exec
                            in.dst.kind == OperandKind::SGPR &&
-                           (in.src[0].kind == OperandKind::Special ||
-                            in.src[0].kind == OperandKind::SGPR) &&
+                           in.src[0].kind == OperandKind::Special &&
                            (in.src[0].value == 126 || in.src[0].value == 127)) {
                     // Saving EXEC is not a scalar-data move — the pair's VALUE stays fail-closed —
                     // but it does carry a wave MASK the NGG fetch prologue later consumes. R-Type
@@ -2168,8 +2167,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // Losing the mask made s_cselect_b64 fold to Unknown, which classified a
                     // per-vertex attribute as shader-computed: every vertex then read record 0 and
                     // the shader's own OFFSET/SOFFSET were re-added to an already-resolved base.
-                    // EXEC is full at this fetch-prologue boundary, exactly as srcmask() already
-                    // assumes for a directly named EXEC operand. CONFIDENCE: HIGH.
+                    //
+                    // `All` is this fold's standing assumption about EXEC, not a new one: `srcmask()`
+                    // already answers `All` for a directly named EXEC operand, because this walk is a
+                    // linearised prologue scan with no EXEC model at all. The one thing that changes
+                    // here is that the assumption becomes durable in a register and copyable, so
+                    // record it: if a future prologue narrows EXEC before saving it, this fold will
+                    // still read the saved copy as all-lanes. That is tolerable for the only consumer
+                    // — selecting *which ABI register* holds the element index is a wave-uniform
+                    // question either way — and would need an explicit EXEC model to do better.
+                    // CONFIDENCE: HIGH.
                     forget(in.dst.value);
                     forget(in.dst.value + 1);
                     if (valid_reg(in.dst.value))
