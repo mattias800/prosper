@@ -21,7 +21,7 @@ int main() {
     using prosper::frontend::DiagnosticWindow;
     using prosper::frontend::parse_diagnostic_window;
 
-    // --- The ordinal form must be byte-for-byte what it was ------------------------------------
+    // --- The ordinal form must be unchanged for every reachable value ---------------------------
     {
         DiagnosticWindow w{parse_diagnostic_window("26000")};
         CHECK(!w.contains(25999, 0), "an ordinal window is closed before its first ordinal");
@@ -83,7 +83,10 @@ int main() {
     }
     {
         // A very large ordinal must not wrap when the span is added — the reason `contains()`
-        // subtracts rather than adding.
+        // subtracts rather than adding. This is the ONE place the ordinal form's answer differs
+        // from the `at >= min && at < min + 3u` test it replaced: that addition wrapped, so the top
+        // three uint64 windows could never fire. Unreachable in practice; pinned so the difference
+        // is a decision rather than a surprise.
         DiagnosticWindow w{parse_diagnostic_window("18446744073709551615")};
         CHECK(w.contains(UINT64_MAX, 0) && !w.contains(0, 0),
               "an ordinal at the top of the range does not wrap the window open");

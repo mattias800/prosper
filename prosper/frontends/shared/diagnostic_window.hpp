@@ -15,11 +15,20 @@ namespace prosper::frontend {
 // when the ordinal was estimated from a capture's submit number. `PROSPER_GPU_CAPTURE_AFTER_MS`
 // already solves exactly this for captures; this gives the two census switches the same form.
 //
-//     PROSPER_DUMP_PERSISTENT=26000     ordinal — unchanged, byte-for-byte
+//     PROSPER_DUMP_PERSISTENT=26000     ordinal — unchanged for every reachable value
 //     PROSPER_DUMP_PERSISTENT=ms:240000 the first callback at or after 240 s, and the next two
 //
+// One deliberate difference in the ordinal form, stated because "unchanged" should not be taken on
+// trust: the old test was `at >= min && at < min + 3u`, whose addition wraps for the top three
+// `uint64` values, so those windows could never fire. `contains()` subtracts instead and they do.
+// Unreachable in practice — the counter is a per-callback ordinal — and the new answer is the
+// intended one, but it is a difference and the test pins it.
+//
 // Time is measured from the first call to `contains()`, i.e. from the first renderer callback of the
-// run — the same origin `PROSPER_GPU_CAPTURE_AFTER_MS` uses, so the two can be aimed at one moment.
+// run. That is the same KIND of origin `PROSPER_GPU_CAPTURE_AFTER_MS` uses — the first armed check on
+// its own path — but it is a separate lazily-started `steady_clock` static on a separate path, so a
+// capture and a census aimed at the same millisecond agree only to within the gap between the two
+// clocks' first calls. Close enough to aim both at one phase; not a shared timebase.
 struct DiagnosticWindowSpec {
     bool by_time = false;      // `value` is milliseconds rather than an ordinal
     uint64_t value = 0;        // ordinal, or milliseconds since the first callback
