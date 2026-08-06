@@ -3206,6 +3206,58 @@ int main() {
            got32r14e.size()==1 ? bits_of(got32r14e[0]) : 0u);
     CHECK(got32r14e.size()==1 && bits_of(got32r14e[0])==0x11110044u,
           "kernel 32r14e: v_add_nc_u16's OPSEL high-half read of inline 1 is 0, not 1");
+    // Kernels 32r13v/w (#2120): the cmpx windows are not merely a decode/SDWA concern — the
+    // recompiler's own VCC liveness reads them, and a private copy there listing three of the six
+    // produced a SILENT MISCOMPILE. `dead_wave_mask_writes`'s `defs` excludes cmpx because a cmpx
+    // writes EXEC and has no VCC destination; the decoder gives every VOPC e32 `dst = 106`
+    // (VCC_LO), so a cmpx the copy did not recognise satisfied both conjuncts and recorded a
+    // PHANTOM VCC definition. The live `s_andn2_b64 vcc` before it then looked overwritten before
+    // use, was classified dead and elided — and the consumer read stale VCC with no diagnostic.
+    //
+    // Both kernels are identical except for the cmpx opcode, so the window is the only variable.
+    //   32r13v uses 0xbb (v_cmpx_le_u16), in the 0xb0-0xbe window the copy was MISSING.
+    //   32r13w uses 0xd3 (v_cmpx_le_u32), in the 0xd0-0xdf window the copy already HAD.
+    // 32r13w is the positive control, and deliberately not drawn from the same source as the null:
+    // it exercises a window the buggy code got right, so it answered 0x11110000 both before and
+    // after the fix. That is what proves the kernel shape really does elide-or-not on the cmpx
+    // classification rather than failing for some unrelated reason.
+    //   0x11110000 = correct  (s_andn2 survives -> vcc = 0 -> cndmask takes v3)
+    //   0x22220000 = the phantom definition (s_andn2 elided -> stale vcc -> cndmask takes v4)
+    const uint32_t code32r13v[] = {
+        0x7e0002ffu, 0x00000001u,            // v0 = 1
+        0x7e0202ffu, 0x00000002u,            // v1 = 2
+        0x7e0602ffu, 0x11110000u,            // v3 = the "vcc false" value
+        0x7e0802ffu, 0x22220000u,            // v4 = the "vcc true" value
+        0x7d820300u,                          // v_cmp_lt_u32 vcc_lo, v0, v1  -> vcc = all true
+        0x8aea7e6au,                          // s_andn2_b64 vcc, vcc, exec   -> vcc = 0  [candidate]
+        0x7d760300u,                          // v_cmpx_le_u16 v0, v1   (0xbb: EXEC only)
+        0x02040903u,                          // v_cndmask_b32 v2, v3, v4, vcc_lo
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r13v = recompile_valu(code32r13v, std::size(code32r13v), 0, 2);
+    CHECK(!spv32r13v.empty(), "recompiled kernel 32r13v (cmpx from a missing window) -> SPIR-V");
+    std::vector<float> got32r13v = prosper::test::run_compute(spv32r13v, std::vector<float>(1), 1, 1);
+    printf("  kernel 32r13v out=0x%08x (want 0x11110000; 0x22220000 = phantom VCC def elided the "
+           "live s_andn2_b64)\n", got32r13v.size()==1 ? bits_of(got32r13v[0]) : 0u);
+    CHECK(got32r13v.size()==1 && bits_of(got32r13v[0])==0x11110000u,
+          "kernel 32r13v: a v_cmpx_*_u16 does not define VCC, so the live s_andn2_b64 survives");
+
+    const uint32_t code32r13w[] = {
+        0x7e0002ffu, 0x00000001u,
+        0x7e0202ffu, 0x00000002u,
+        0x7e0602ffu, 0x11110000u,
+        0x7e0802ffu, 0x22220000u,
+        0x7d820300u,
+        0x8aea7e6au,
+        0x7da60300u,                          // v_cmpx_le_u32 v0, v1   (0xd3: the covered window)
+        0x02040903u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r13w = recompile_valu(code32r13w, std::size(code32r13w), 0, 2);
+    CHECK(!spv32r13w.empty(), "recompiled kernel 32r13w (cmpx from a covered window) -> SPIR-V");
+    std::vector<float> got32r13w = prosper::test::run_compute(spv32r13w, std::vector<float>(1), 1, 1);
+    CHECK(got32r13w.size()==1 && bits_of(got32r13w[0])==0x11110000u,
+          "kernel 32r13w (control): the same shape with an already-covered cmpx window was always right");
 
     // Kernel 32r12 (LIVE, exec_cs_29400bcf00 pc=23): `v_mbcnt_lo_u32_b32 v2, -1, 0` INSIDE a
     // structured region. The compute structurizer sets its wave gate to `is_fragment`, so the

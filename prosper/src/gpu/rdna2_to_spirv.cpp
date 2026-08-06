@@ -3597,10 +3597,6 @@ std::unordered_set<uint32_t> dead_wave_mask_writes(const std::vector<Rdna2Inst>&
              in.opcode == 0x1b || in.opcode == 0x1d) &&
             (in.dst.value == 106 || in.dst.value == 107);
     };
-    const auto is_cmpx = [](uint32_t op) {
-        return (op >= 0x10 && op <= 0x1f) || (op >= 0x90 && op <= 0x9f) ||
-               (op >= 0xd0 && op <= 0xdf);
-    };
     std::unordered_map<uint32_t, size_t> by_pc;
     for (size_t i = 0; i < ins.size(); ++i) by_pc[ins[i].pc] = i;
     std::vector<std::vector<size_t>> succ(ins.size());
@@ -3636,7 +3632,14 @@ std::unordered_set<uint32_t> dead_wave_mask_writes(const std::vector<Rdna2Inst>&
     };
     auto defs = [&](const Rdna2Inst& in) -> uint8_t {
         if (is_mask(in)) return 3;
-        if (in.fmt == Rdna2Format::VOPC && !is_cmpx(in.opcode) &&
+        // A cmpx writes EXEC and has NO VCC destination, so it must NOT count as defining VCC —
+        // the decoder gives every VOPC e32 dst = 106 (VCC_LO), so without this exclusion a cmpx
+        // would satisfy both conjuncts and record a phantom definition. A private copy of the
+        // windows here listed three of the six, so every v_cmpx_*_f64/_i64/_u64/_u16 was recorded
+        // as defining VCC; a preceding live `s_and_b64 vcc` then looked overwritten before use,
+        // was classified dead and ELIDED, leaving stale VCC at the real consumer with no
+        // diagnostic. Kernel 32r13v pins it. Use the one shared predicate (#2120).
+        if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
             (in.dst.value == 106 || in.dst.value == 107)) return 3;
         if (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2a)
             return 3;
