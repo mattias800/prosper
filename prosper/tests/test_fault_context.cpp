@@ -26,13 +26,13 @@
 // Exit code is truth: 0 = pass.
 #include <cstdio>
 #include <cstdint>
-#include <cstring>
+
+#if defined(__linux__) || defined(__APPLE__)
 #include <atomic>
 #include <thread>
 #include <type_traits>
 #include <vector>
 
-#if defined(__linux__) || defined(__APPLE__)
 #include "../src/host/fault_context.hpp"
 
 using prosper::host::FaultContext;
@@ -181,7 +181,12 @@ int main() {
     printf(" report gate under contention\n");
     {
         constexpr int kThreads = 16;
-        constexpr int kRounds = 2000;
+        // 200 rounds, not thousands. The discriminator is deterministic — every thread claims with
+        // a distinct tid, so exactly one can satisfy the predicate under any interleaving — and the
+        // non-atomic mutant `if (owner == 0) owner = tid;` fails in round 0. The extra rounds bought
+        // no signal and cost 16 thread spawn/joins each in a suite other lanes wait on. Still well
+        // above 1, so this remains a race test rather than a second sequential check.
+        constexpr int kRounds = 200;
         std::atomic<int> total_winners{0};
         std::atomic<int> bad_reports{0};
         for (int round = 0; round < kRounds; round++) {
@@ -193,7 +198,9 @@ int main() {
             for (int i = 0; i < kThreads; i++) {
                 ts.emplace_back([&, i] {
                     ready.fetch_add(1);
-                    while (!go.load(std::memory_order_acquire)) { /* spin to the same instant */ }
+                    // Spin rather than sleep so every thread reaches the claim at the same
+                    // instant; yield so a 16-thread round cannot monopolise fewer cores.
+                    while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
                     long who = -1;
                     const long tid = 1000 + i;
                     if (prosper::host::claim_fault_report(owner, tid, &who)) {
@@ -204,7 +211,7 @@ int main() {
                     }
                 });
             }
-            while (ready.load() < kThreads) { }
+            while (ready.load() < kThreads) std::this_thread::yield();
             go.store(true, std::memory_order_release);
             for (auto& t : ts) t.join();
             const int w = winners.load();

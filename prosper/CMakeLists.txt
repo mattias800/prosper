@@ -1008,6 +1008,10 @@ if(TARGET prosper_core)
   # #2018: a fatal worker-thread fault report must describe one fault. Header-only snapshot of the
   # handler's own siginfo/ucontext; POSIX signal contexts only (the test self-skips elsewhere).
   add_executable(test_fault_context tests/test_fault_context.cpp)
+  # The contention arm spawns real threads. This target links no library, so unlike every other
+  # thread-using test here it inherits -pthread from nothing; name Threads::Threads explicitly
+  # (found above with prosper_core, whose existence gates this block).
+  target_link_libraries(test_fault_context PRIVATE Threads::Threads)
   add_test(NAME fault_context COMMAND test_fault_context)
 
   # End-to-end AGC submit plus fixed args 7-9 in ReleaseMem/WaitRegMem. This is cross-platform so
