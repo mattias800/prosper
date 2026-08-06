@@ -1981,10 +1981,16 @@ int main() {
             // Outside the guest VA window entirely: neither predicate may claim it.
             {0x0000000000ull, 4, 1, 0, 0, "a null pre is neither narrow nor wide"},
             {0xa000000000ull, 4, 1, 0, 0, "0xa000000000 (past the arena) is neither"},
-            // Shape rules are shared by both windows and must not drift apart.
-            {0x2100000005ull, 4, 1, 0, 0, "a nonzero low dword is not a forge on either window"},
-            {0x2100000000ull, 8, 1, 0, 0, "a full-width write replaces the qword — not a forge"},
-            {0x2100000000ull, 4, 0, 0, 0, "a zero value cannot forge a nonzero low dword"},
+            // Shape rules are shared by both windows and must not drift apart. These use a pre that
+            // is INSIDE the narrow window, so each rejection is attributable to the shape rule under
+            // test; the same case with a 0x21… pre would be rejected by the window on the narrow arm
+            // and prove nothing about the rule.
+            {0x2000000005ull, 4, 1, 0, 0, "a nonzero low dword is not a forge on either window"},
+            {0x2000000000ull, 8, 1, 0, 0, "a full-width write replaces the qword — not a forge"},
+            {0x2000000000ull, 4, 0, 0, 0, "a zero value cannot forge a nonzero low dword"},
+            // …and once more above the narrow bound, so a shape rule that is accidentally applied
+            // only inside the narrow window is still caught.
+            {0x2100000005ull, 4, 1, 0, 0, "a nonzero low dword is not a forge above the narrow bound"},
         };
         for (const auto& c : cases) {
             int wide = -1;

@@ -179,13 +179,15 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     Strict mode declines the commit, so the SIGSEGV reports at the *loading* instruction with the
     real faulting address. The default-path line is also fail-visible now:
     ```text
-    [lazy-commit] #1 mapped page=0x2100000000 addr=0x2100000041 access=read rip=0x…  FORGED-PTR-SHAPE(low-dword<=1; see #1226)
+    [lazy-commit] #1 mapped page=0x2100000000 addr=0x2100000041 access=read rip=0x…  FORGED-PTR-SHAPE(low-dword<=0xffff: …)
     [lazy-commit] #1 DECLINED(strict) page=0x2100000000 addr=0x2100000041 access=read rip=0x…
     ```
     The ordinal is a whole-run census (the worker-fault path `_exit()`s, so no atexit summary can
     run), `access=` comes from the x86 page-fault error code, and `FORGED-PTR-SHAPE` marks a faulting
-    address whose high half is a heap pointer and whose low dword is 0 or 1 — i.e. a pointer that
-    lost its low dword, not a page the guest ever populated. **A repeated page is not evidence of a
+    address in the **first 64 KiB page** of a heap pointer's high half — i.e. a pointer that lost its
+    low dword and then took a small structure offset, not a page the guest ever populated. Test the
+    page, not the address: the founding case faults at `rdi+0x40` = `0x2100000041`, so a
+    `low dword <= 1` form of this marker would have been inert on its own evidence. **A repeated page is not evidence of a
     lost mapping**: every `0x21000000xx` pointer lands in page `0x2100000000`, which is why two
     different guest sites appeared to "first-touch the same page".
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
