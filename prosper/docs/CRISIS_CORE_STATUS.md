@@ -41,7 +41,7 @@ duration: a route built on a diagnostic would silently change behaviour the day 
 cheaper — and it did get 32x cheaper inside this very PR, when the scan was narrowed to one size
 class.
 
-## #1945 on this title is a race the guest wins, not a late write
+## #1945 on this title is decided by submit duration — and is not a late write
 
 Every arm of a default run ends in the guest's own MallocBinned3 bundle-list pop at
 `eboot+0x174c206` (`mov rax,[rcx]`), either as a prosper `WORKER-THREAD FAULT` or as the guest's
