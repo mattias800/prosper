@@ -928,7 +928,8 @@ static void forge_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t va
 // `forges_freelist_ptr()` and `report_suspect_write("REL1-LIVE")` both filter `pre` through
 // `ptr_like()`/`heap_ptr_like()`, whose widest window is `[0x1000000000,0xa000000000)` — the guest
 // ARENA. A C++ object's vtable pointer does not live there: it points into a loaded module IMAGE
-// (ArcRunner's eboot base is 0x410000000, three orders of magnitude below that bound). So no guard,
+// (ArcRunner's eboot base is 0x410000000, BELOW that bound -- by a factor of about four, not the
+// "three orders of magnitude" an earlier draft of this comment claimed). So no guard,
 // tripwire or census in this file can see a 4-byte write that overwrites a vptr's low dword, and the
 // `wide_only=0` / `SUSPECT-REL1-LIVE=0` negatives already recorded on this title say nothing about
 // that population. That is not a tuning gap — an arena bound is exactly what a heap predicate is for.
@@ -945,6 +946,12 @@ static void forge_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t va
 // made three earlier arms on this title void. Log-only, default OFF, no behaviour change.
 //
 // CONFIDENCE: HIGH that the blind spot is real (the window bounds are literal, above).
+// Width note (`CONFIDENCE: HIGH` for the measured population, which is entirely 4-byte writes;
+// the modelling is loose either side of it and the reported `after` below is only exact at 4).
+// `dma_data_form` constrains `dd_bytes` to [1, 0x1000000] and 4-aligns `dd_dst` but NOT `dd_bytes`,
+// so widths 1-3 and 5-7 do reach here: at 1-3 the write replaces only part of the low dword, so the
+// `pre_low != value` test can call a no-op write a stomp; at 5-7 it also clobbers part of the HIGH
+// dword, which `after` does not model. Diagnostic accuracy only — the guard arm is default OFF.
 static inline bool stomps_live_ptr_shape(uint64_t pre, uint64_t width, uint64_t value) {
     if (width >= 8) return false;              // a full-width write replaces the whole qword
     if ((pre >> 32) == 0) return false;        // no high half -> not a 64-bit pointer-shaped qword
@@ -957,6 +964,14 @@ static inline bool stomps_live_ptr_shape(uint64_t pre, uint64_t width, uint64_t 
 // rules) is the same lesson `prosper_forge_predicate_for_test` records above.
 extern "C" int prosper_liveptr_shape_for_test(uint64_t pre, uint64_t width, uint64_t value) {
     return stomps_live_ptr_shape(pre, width, value) ? 1 : 0;
+}
+// The GUARD's content decision, separately from the census shape it shares. `declines_nonheap_ptr`
+// adds `!heap_ptr_like(pre)` on top, and that one line is the whole reason the arm cannot repeat
+// #1245: without it the arm would decline the ~1,280 free-list-residue writes an ArcRunner run makes.
+// Deleting it failed no test before this existed. The liveness probe (`guest_readable`) is left to
+// the caller — it needs a live process — so this covers exactly the pure part.
+extern "C" int prosper_nonheap_guard_content_for_test(uint64_t pre, uint64_t width, uint64_t value) {
+    return (stomps_live_ptr_shape(pre, width, value) && !heap_ptr_like(pre)) ? 1 : 0;
 }
 namespace {
 struct LivePtrTotals {
@@ -973,9 +988,17 @@ struct LivePtrTotals {
 // vptr lands at some ordinal like 300 — past the first-64 window, not a power of two — and is never
 // printed even though it was counted. That happened here on the first arm and cost a run. Keyed per
 // bucket, the FIRST hit of every new `pre >> 32` class always prints.
+//
+// The same failure returns past `kBuckets` (12) distinct classes: everything beyond shares the
+// `hi_other` ordinal, so only the first of THEM gets an `ord == 1` print. That is the same trap at a
+// higher threshold, and it is why `hi=other:N` is printed on the totals line — a nonzero `hi_other`
+// means classes exist that the detail lines did not individually announce, so read it as "raise
+// kBuckets and re-run", never as "no further classes".
 std::mutex g_liveptr_mu;
 LivePtrTotals g_liveptr;
-void liveptr_totals_line(const char* why) {
+// Formats into `out` rather than printing: the caller holds `g_liveptr_mu` and prints after
+// releasing it, the same shape `forge_trip` uses.
+void liveptr_totals_line(const char* why, char* out, size_t cap) {
     char buckets[320]; int off = 0; buckets[0] = 0;
     for (int i = 0; i < g_liveptr.hi_used && off < (int)sizeof buckets - 40; ++i)
         off += snprintf(buckets + off, sizeof buckets - off, " hi=0x%llx:%llu",
@@ -983,11 +1006,11 @@ void liveptr_totals_line(const char* why) {
     if (g_liveptr.hi_other)
         snprintf(buckets + off, sizeof buckets - off, " hi=other:%llu",
                  (unsigned long long)g_liveptr.hi_other);
-    fprintf(stderr,
-            "[agc] LIVEPTR-TOTALS(%s) examined=%llu shape=%llu live=%llu t=%llums |%s\n",
-            why, (unsigned long long)g_liveptr.examined, (unsigned long long)g_liveptr.shape,
-            (unsigned long long)g_liveptr.live, (unsigned long long)now_ms(),
-            buckets[0] ? buckets : " (no live hits)");
+    snprintf(out, cap,
+             "[agc] LIVEPTR-TOTALS(%s) examined=%llu shape=%llu live=%llu t=%llums |%s\n",
+             why, (unsigned long long)g_liveptr.examined, (unsigned long long)g_liveptr.shape,
+             (unsigned long long)g_liveptr.live, (unsigned long long)now_ms(),
+             buckets[0] ? buckets : " (no live hits)");
 }
 } // namespace
 static void liveptr_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t value,
@@ -1003,7 +1026,7 @@ static void liveptr_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t 
     const bool shape = stomps_live_ptr_shape(pre, width, value);
     // `guest_readable` costs a cached syscall, so it runs only for the shape-matching minority.
     const bool live = shape && guest_readable(pre, 8);
-    uint64_t ord = 0; bool print_totals = false;
+    uint64_t ord = 0; bool print_totals = false; char totals_line[512] = {0};
     {
         std::lock_guard<std::mutex> lock(g_liveptr_mu);
         g_liveptr.examined++;
@@ -1023,8 +1046,15 @@ static void liveptr_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t 
         // publish that it inspected thousands of writes, or the zero is unreadable.
         print_totals = (g_liveptr.examined == 1) || (g_liveptr.examined & 4095) == 0 ||
                        (live && (g_liveptr.live == 1 || (g_liveptr.live & 255) == 0));
-        if (print_totals) liveptr_totals_line(live ? "hit" : "population");
+        // Formatted into a local under the lock, printed outside it — matching `forge_trip`, which
+        // copies its totals out at the same point and for the same reason: the invariant worth
+        // keeping is that stderr is never written while a totals mutex is held. Nothing here can
+        // deadlock either way (the order is always mutex -> stderr, never the reverse), but the two
+        // tripwires should not model it differently. (Reported in review of #2077.)
+        if (print_totals) liveptr_totals_line(live ? "hit" : "population", totals_line,
+                                              sizeof totals_line);
     }
+    if (print_totals) fputs(totals_line, stderr);
     if (!live || !diag_should_print(ord)) return;
     // What the write turns the pointer into, and whether the corrupted value still addresses
     // anything — the guest dereferences it next, so an unmapped result names the coming fault.
@@ -1050,12 +1080,22 @@ static void liveptr_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t 
 // leaves `{stale malloc residue, 0}`, and stale residue is a heap pointer. Content genuinely cannot
 // separate those two.
 //
-// A module-image pointer has no such twin. Nothing in a GPU label protocol and nothing in an
-// allocator free list ever holds a pointer into a loaded module's code/rodata image: an
+// A module-image pointer is a NARROWER twin, but it is not twin-free, and the difference matters.
+// Nothing a label protocol or an allocator free list *writes* is a code-image pointer: an
 // `FFreeBlock::NextFreeBlock` points at another heap block, and a fence label holds a small integer.
-// A vtable pointer is the only thing that puts a code-image address in the first qword of a
-// 0x20-byte block, so `pre` in that range means the destination is a LIVE C++ object and the write
-// is landing in memory the guest reallocated out from under a built-but-unexecuted label packet.
+// So `pre` in that range means the destination most recently held a C++ object.
+//
+// It does NOT prove that object is still LIVE, and an earlier draft of this comment claimed it did.
+// A block that held a C++ object, was freed, and was handed back out for a label still carries the
+// dead object's vptr at offset 0 until something overwrites it — residue, not a live object, and
+// declining the init in that case is #1245 transposed to the module-image half. This project's own
+// static attribution makes that twin MORE plausible rather than less: the stomped object is a
+// 24-byte `new` allocation (`eboot+0x1250720`, `eboot+0x128e4b0`), which lands in the same 32-byte
+// `FMallocBinned3` bin the 0x20-byte labels come from, so object→label recycling in that bin is
+// exactly the expected traffic. The residue window is narrower than the heap case's (a freed block's
+// first qword is heap-pointer-shaped for the whole time it sits on a free list, whereas a vptr
+// survives only until the allocator's own bookkeeping lands on it) — but "narrower" is not "absent".
+// Discriminating the two needs block ownership at write time, not content. CONFIDENCE: MED.
 //
 // Measured on ArcRunner (`PPSA21406`), the terminal `AudioMixerRende` fault, with the label ring at
 // the faulting register: `dmaX(D)@7895/f37:0x41700f1e8` then `relX(D)@7895/f37:0x400000000` — our
@@ -2251,12 +2291,16 @@ static void honor_write_data(const Pm4Command& c) {
         if (ptr_like(pre))
             report_suspect_write("WDATA", c.wd_addr, c.wd_data[0], pre, pkt_addr(c));
         forge_trip("WDATA", c.wd_addr, pre, c.wd_data[0], 4, pkt_addr(c));   // #312 session-10 tripwire
+        // #1226. Inside this branch, reusing `pre`, deliberately: as a separate statement below, the
+        // `peek_qword(c.wd_addr)` argument would be evaluated BEFORE the gated function is entered,
+        // so every WRITE_DATA packet on an UNARMED run would pay an extra 8-byte guest read. A
+        // default-off diagnostic must cost nothing when off. (Reported in review of #2077.) Only
+        // `wd_num == 1` can pass the sub-qword shape test anyway, and it is inside this branch.
+        liveptr_trip("WDATA", c.wd_addr, pre, c.wd_data[0], (uint64_t)c.wd_num * 4, pkt_addr(c));
     }
     if (write_trap_armed())
         write_trap_scan("WDATA", c.wd_addr, peek_qword(c.wd_addr), c.wd_data,
                         (uint64_t)c.wd_num * 4, pkt_addr(c));
-    liveptr_trip("WDATA", c.wd_addr, peek_qword(c.wd_addr), c.wd_data[0],   // #1226
-                 (uint64_t)c.wd_num * 4, pkt_addr(c));
     memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
     notify_guest_gpu_write(c.wd_addr, static_cast<uint64_t>(c.wd_num) * 4);
     ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));

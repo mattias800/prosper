@@ -905,9 +905,16 @@ namespace {
             char hist[512];
             prosper_label_hist_dump(v, hist, (unsigned)sizeof hist);
             if (!hist[0] || strstr(hist, "no-history")) continue;
-            n = snprintf(b, sizeof b, "[labelhist] %s=0x%llx %s\n", regs[i].nm,
-                         (unsigned long long)v, hist);
-            raw_write(2, b, (size_t)n);
+            snprintf(b, sizeof b, "[labelhist] %s=0x%llx %s\n", regs[i].nm,
+                     (unsigned long long)v, hist);
+            // strlen, NOT snprintf's return: snprintf returns the WOULD-BE length, and `hist` is the
+            // same 512 bytes as `b`. A full 16-event ring formats to ~450-500 characters, so the
+            // prefix pushes the would-be length past `sizeof b` on exactly the richest labels this
+            // instrument exists to print — handing that value to raw_write() reads past the end of a
+            // stack buffer. Every other raw_write in this handler is either length-bounded by its
+            // format or already uses strlen; this is the first whose format embeds a %s of comparable
+            // size to the buffer. (Reported in review of #2077.)
+            raw_write(2, b, strlen(b));
         }
         for (int i = 0; i < 16; i++) {
             uint64_t v = regs[i].v;

@@ -47,8 +47,10 @@ extern "C" bool prosper_rel1_forge_report_due_for_test(uint64_t candidates);
 // report verdict.
 extern "C" int prosper_forge_predicate_for_test(uint64_t pre, uint64_t width, uint64_t value,
                                                 int* wide);
-// #1226: the windowless live-pointer shape behind PROSPER_LIVEPTR_TRIP / PROSPER_NONHEAP_PTR_GUARD.
+// #1226: the windowless live-pointer shape behind PROSPER_LIVEPTR_TRIP / PROSPER_NONHEAP_PTR_GUARD,
+// and the guard's own narrower content decision (the shape PLUS `!heap_ptr_like`).
 extern "C" int prosper_liveptr_shape_for_test(uint64_t pre, uint64_t width, uint64_t value);
+extern "C" int prosper_nonheap_guard_content_for_test(uint64_t pre, uint64_t width, uint64_t value);
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -2005,8 +2007,10 @@ int main() {
 
     // #1226 — the live-pointer shape predicate behind PROSPER_LIVEPTR_TRIP and
     // PROSPER_NONHEAP_PTR_GUARD. The case this exists for is the one BOTH forge predicates above
-    // reject on their window: `pre` is a module-image vtable pointer, three orders of magnitude
-    // below `heap_ptr_like`'s 0x1000000000 floor. Measured on ArcRunner: the label ring at the
+    // reject on their window: `pre` is a module-image vtable pointer, which sits below
+    // `heap_ptr_like`'s 0x1000000000 floor (by a factor of about four -- an earlier draft said
+    // "three orders of magnitude", which is wrong; the structural fact is what matters).
+    // Measured on ArcRunner: the label ring at the
     // faulting register recorded `dmaX(D):0x41700f1e8` then `relX(D):0x400000000`, so prosper's own
     // 4-byte init and 4-byte fence composed `0x400000001` out of the vptr `eboot+0x700f1e8`, and the
     // guest's next `call [rax+0x20]` jumped to 0.
@@ -2041,13 +2045,55 @@ int main() {
             snprintf(msg, sizeof msg, "liveptr shape: %s", c.what);
             CHECK(got == c.want, msg);
         }
-        // Cross-check against the forge predicate: the image vptr is invisible to both of its
-        // windows, which is the entire reason this predicate exists. If someone widens
-        // `heap_ptr_like` down to the image range, this fails and says why.
-        int wide = -1;
-        const int narrow = prosper_forge_predicate_for_test(0x000000041700f1e8ull, 4, 1, &wide);
-        CHECK(narrow == 0 && wide == 0,
-              "liveptr shape: the image vptr is outside BOTH forge windows (the blind spot)");
+        // Cross-check against the forge predicate — the module-image blind spot this whole predicate
+        // exists for. The discriminating input MUST have a ZERO low dword. `forges_freelist_ptr`
+        // rejects on two independent grounds (`!ptr_like(pre)` AND `(uint32_t)pre != 0`), so asking
+        // it about a vptr like 0x41700f1e8 is answered by the LOW-DWORD rule and says nothing about
+        // the window: widening `heap_ptr_like` to the image range would leave such a check passing
+        // unchanged. That is a tautology with respect to its own stated purpose — the exact trap
+        // command_processor.cpp warns about beside `prosper_forge_predicate_for_test`, and it is what
+        // the first version of this block did. (Reported in review of #2077.)
+        //
+        // `0x400000000` is the post-init state of a stomped vptr and has low dword 0, so only the
+        // window can reject it. Today `heap_ptr_like(0x400000000)` is false → wide == 0; drop the
+        // floor below the image range and `forges_freelist_ptr_wide` returns true, failing this.
+        {
+            int wide = -1;
+            const int narrow = prosper_forge_predicate_for_test(0x0000000400000000ull, 4, 1, &wide);
+            CHECK(narrow == 0 && wide == 0,
+                  "liveptr shape: an image-range pre with a ZERO low dword is outside BOTH forge "
+                  "windows (the blind spot; fails if heap_ptr_like's floor is dropped)");
+        }
+        // Kept for completeness with a correct justification: the live vptr shape reaches neither
+        // forge predicate at all, here because its low dword is nonzero rather than because of any
+        // window. That is precisely why `stomps_live_ptr_shape` had to be written.
+        {
+            int wide = -1;
+            const int narrow = prosper_forge_predicate_for_test(0x000000041700f1e8ull, 4, 1, &wide);
+            CHECK(narrow == 0 && wide == 0 &&
+                      prosper_liveptr_shape_for_test(0x000000041700f1e8ull, 4, 1) == 1,
+                  "liveptr shape: a live vptr is rejected by both forge predicates (nonzero low "
+                  "dword) and caught only by the liveptr shape");
+        }
+        // The GUARD's content decision, which the census shape alone does not pin. The single line
+        // `!heap_ptr_like(pre)` in `declines_nonheap_ptr` is what stops the arm from declining the
+        // ~1,280 free-list-residue writes an ArcRunner run makes — i.e. from being #1245 again — and
+        // deleting it failed no test before this block existed. (Reported in review of #2077.)
+        {
+            struct GCase { uint64_t pre; uint64_t width; uint64_t value; int want; const char* what; };
+            const GCase gcases[] = {
+                {0x000000041700f1e8ull, 4, 0, 1, "declines a module-image vptr"},
+                {0x0000002020e39fc0ull, 4, 0, 0, "does NOT decline free-list residue (that is #1245)"},
+                {0x00000021c1388890ull, 4, 0, 0, "does NOT decline a live heap pointer either"},
+                {0x0000000400000000ull, 4, 1, 0, "does NOT decline an already-initialised label"},
+            };
+            for (const auto& g : gcases) {
+                const int got = prosper_nonheap_guard_content_for_test(g.pre, g.width, g.value);
+                char msg[192];
+                snprintf(msg, sizeof msg, "nonheap guard content: %s", g.what);
+                CHECK(got == g.want, msg);
+            }
+        }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
