@@ -2123,7 +2123,39 @@ bool eop_write_sync() {
 struct PendWrite {
     Pm4Command cmd;
     std::vector<uint32_t> wd_copy;     // owns a WriteData payload (cmd.wd_data repointed here)
+    std::chrono::steady_clock::time_point queued{};   // #1945: enqueue instant (see pend_age_note)
 };
+// #1945: how long a completion write actually sat in this queue before it landed in guest memory.
+// The model promises "post-submit plus ~1 ms of modeled pipe drain"; the WAF family this queue was
+// built to prevent only happens when a write lands after the guest has recycled its 0x20-byte
+// label, so the queue's real residency IS the exposure window and nothing measured it. Reports the
+// running max and a loud line for any write older than PROSPER_PEND_AGE_WARN_MS (default 20).
+// Default OFF, log-only, never gates a write.
+//
+// Called from EVERY site that applies a queued write — the FIFO drain, the renderer's selective
+// extraction, and the gated-span release. A residency figure taken from only one of the three would
+// bound only that path, and the conclusion drawn from this instrument ("prosper's completion writes
+// do NOT land late on PPSA07809") is exactly the kind that a partially-instrumented population
+// would falsely support.
+static void pend_age_note(std::chrono::steady_clock::time_point queued) {
+    static const int on = [] { const char* e = getenv("PROSPER_PEND_AGE");
+                               return e && strtol(e, nullptr, 0) != 0 ? 1 : 0; }();
+    if (!on || queued.time_since_epoch().count() == 0) return;
+    static const long warn_ms = [] { const char* e = getenv("PROSPER_PEND_AGE_WARN_MS");
+                                     return e ? strtol(e, nullptr, 0) : 20L; }();
+    const long age = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - queued).count();
+    static std::atomic<uint64_t> n{0};
+    static std::atomic<long> peak{0};
+    const uint64_t ord = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    long prev = peak.load(std::memory_order_relaxed);
+    while (age > prev && !peak.compare_exchange_weak(prev, age)) {}
+    const bool loud = age >= warn_ms;
+    if (loud || (ord % 512) == 0)
+        fprintf(stderr, "[agc] PEND-AGE #%llu age=%ldms peak=%ldms%s\n",
+                (unsigned long long)ord, age, peak.load(std::memory_order_relaxed),
+                loud ? "  <<<<< completion write landed long after its submit" : "");
+}
 // IMMORTAL (leaked) worker state — same pattern as the EOP-event worker (hle_kernel_time.cpp):
 // the worker is detached and outlives main; static destructors must never run for it.
 struct PendQueue {
@@ -2175,6 +2207,7 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
         // the label page (MallocBinned3, #312). apply_deferred_effect probes guest_readable before
         // the raw memcpy — without it an unmapped label SIGSEGVs here, exactly the case the deferred-
         // stream path already survives (this pend path releases asynchronously too, so it needs it).
+        pend_age_note(w.queued);
         apply_deferred_effect(w.cmd);
         lk.lock();
         p.inflight--;
@@ -2213,7 +2246,7 @@ void pend_worker() {
 }
 void pend_enqueue(const Pm4Command& c) {
     PendQueue& p = pend_q();
-    PendWrite w; w.cmd = c;
+    PendWrite w; w.cmd = c; w.queued = std::chrono::steady_clock::now();
     if (c.kind == Pm4Command::Kind::WriteData && c.wd_data && c.wd_num) {
         w.wd_copy.assign(c.wd_data, c.wd_data + c.wd_num);   // cb memory may be recycled before drain
         w.cmd.wd_data = w.wd_copy.data();
@@ -2327,6 +2360,7 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
             p.q.erase(it);
             p.inflight++;
             lk.unlock();
+            pend_age_note(w.queued);
             apply_deferred_effect(w.cmd);
             lk.lock();
             p.inflight--;
@@ -2415,8 +2449,10 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
         p.q.swap(blocked);
         p.inflight++;
         lk.unlock();
-        for (const PendWrite& write : ready)
+        for (const PendWrite& write : ready) {
+            pend_age_note(write.queued);
             apply_deferred_effect(write.cmd);
+        }
         lk.lock();
         p.inflight--;
         p.cv.notify_all();

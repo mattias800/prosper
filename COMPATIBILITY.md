@@ -49,7 +49,7 @@ Last updated: 2026-08-05
 | *The Forgotten City* | `PPSA03026` | Unreal Engine | 🚧 Title screen | [#1890](https://github.com/mattias800/prosper/issues/1890) |
 | *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
 | *Little Nightmares III* | `PPSA05143` | Unreal Engine 4 | 🚧 Boot splash sequence and title screen; most title frames carry a yellow tint | [#1893](https://github.com/mattias800/prosper/issues/1893) |
-| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🔬 Content streams and the engine submits real draws and composites frames, then a guest memory fault ends the run a few seconds in, before any title screen | [#1894](https://github.com/mattias800/prosper/issues/1894) |
+| *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🚧 Title screen, on a throttled route — a default run still dies in the guest allocator within seconds | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Health warning and title screen; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Title screen | [#1898](https://github.com/mattias800/prosper/issues/1898) |
@@ -323,15 +323,26 @@ to maximum, which reads as a flat yellow background under otherwise-correct cont
 
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
 
+<p align="center"><img src="assets/screenshots/crisis-core-title.png" alt="Crisis Core Reunion — title screen"></p>
+<p align="center"><img src="assets/screenshots/crisis-core-main-menu.png" alt="Crisis Core Reunion — main menu"></p>
+<p align="center"><img src="assets/screenshots/crisis-core-voice-language.png" alt="Crisis Core Reunion — voice-language selection"></p>
+
 The title is Unreal Engine 4.27 with IoStore packaging. It boots into a native Linux/Vulkan run, completes
-engine bootstrap, and streams real content from the 8.49 GB IoStore container. The engine reaches its frame loop:
-over a thousand draws, hundreds of compute dispatches, and composited frames delivered to the display. The
-declined-GPU-submit freeze that used to stop it here is gone, fixed by
-[#1987](https://github.com/mattias800/prosper/pull/1987). What ends the run now is a guest memory fault a few
-seconds into the boot — on the render thread, the RHI thread or a worker pool thread depending on the run, and in
-some runs the game's own allocator catches it first — far too early for a title screen, so nothing beyond the
-engine's own startup is reached. The frames delivered before the fault are a single flat colour, alternating
-black and white, while intermediate render targets do carry real image content. See the
+engine bootstrap, and streams real content from the 8.49 GB IoStore container. The declined-GPU-submit freeze
+that used to stop it here is gone, fixed by [#1987](https://github.com/mattias800/prosper/pull/1987). It now
+reaches the white splash, the autosave-notice dialog and then the **title screen** — "Press Any Button" with the
+version string and the Square Enix copyright — which holds stably. One button press opens the main menu
+(`NEW GAME` / `LOAD GAME` / `CONTINUE`, correctly greyed with no save present / `OPTIONS` / `CONVERT SAVE DATA`),
+and pressing on through it opens the new-game settings flow: voice-language selection and the "Begin game with
+selected settings?" prompt both render correctly.
+
+**This is rung 2 on a throttled route, not on a default launch.** What ends a default run is a guest memory
+fault a few seconds into the boot — on the render thread, the RHI thread or a worker pool thread depending on
+the run, and in some runs the game's own allocator catches it first. Holding the guest's own submit call for a
+few extra milliseconds avoids it, which is how the captures above were taken; that is a stopgap while the race
+is fixed. Two rendering defects remain on the reached screens: the title screen's key art never draws, and most
+published frames select a non-scanout composite source while the real screen exists. See
+[`docs/CRISIS_CORE_STATUS.md`](prosper/docs/CRISIS_CORE_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1894).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
