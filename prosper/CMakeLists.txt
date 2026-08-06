@@ -339,6 +339,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_service_getters PRIVATE prosper_core)
   add_test(NAME service_getters COMMAND test_service_getters)
 
+  # #2081 FALSE SUCCESS: an unregistered NID answers the dispatcher's 0, which for an SCE_OK
+  # contract is a success report over an out-parameter nothing wrote. Pure, no game dump.
+  add_executable(test_false_success_nids tests/test_false_success_nids.cpp)
+  target_link_libraries(test_false_success_nids PRIVATE prosper_core)
+  add_test(NAME false_success_nids COMMAND test_false_success_nids)
+
   # libSceSysmodule state query (#2002): IsLoaded answers from prosper's own load history, so a
   # title that gates its initialization on UNLOADED stops skipping that initialization.
   add_executable(test_sysmodule_state tests/test_sysmodule_state.cpp)

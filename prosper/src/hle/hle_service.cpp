@@ -7,6 +7,7 @@
 #include "hle_addcontent.hpp"
 #include "hle_json2.hpp"
 #include "nid.hpp"
+#include "sce_errno.hpp"   // libkernel error encoding (libSceRandom reject arms)
 #include "callback_fs.hpp"
 #include "ime_input.hpp"
 #include "platform_ui.hpp"
@@ -44,7 +45,11 @@
 #else
 #include <sys/stat.h>   // mkdir
 #include <sys/uio.h>    // process_vm_readv: fault-contained diagnostic snapshots
+#include <sys/random.h> // getentropy: the host CSPRNG behind sceRandomGetRandomNumber
 #include <unistd.h>
+#endif
+#ifdef _WIN32
+#include <bcrypt.h>     // BCryptGenRandom (prosper_core already links bcrypt on Windows)
 #endif
 
 namespace prosper {
@@ -4175,6 +4180,95 @@ HLE(s_syss_noticeskip) {
     return 0;
 }
 
+// ===== libSceRandom ============================================================================
+//
+// `sceRandomGetRandomNumber(void* buf, size_t size)` is the library's ONLY export (PS5 3.20
+// `libSceRandom.c` lists exactly one `sprx_dlsym` line), and 27 of the 44 local dumps import it.
+//
+// Unregistered, it reached the dispatcher's `return 0` — and for this contract 0 is SCE_OK. The
+// guest was told its buffer had been filled while nothing wrote to it, so it read back whatever
+// its own stack or heap already held and used that as entropy. The worst property of that failure
+// is that it is STABLE: a fresh stack allocation at the same call site tends to hold the same
+// residue on every call, so a "random" session id or nonce can be identical all run. Nothing
+// crashes and no diagnostic fires; only code that inspected the buffer could notice. (#2065, swept
+// under #2081.)
+//
+// The fix is a real implementation rather than a fail-visible stub, because the honest answer here
+// is cheap: the host has a CSPRNG. Returning an error instead would be strictly worse — this is a
+// *value-producing* contract, and guests do gate on it.
+//
+// How the guests actually consume it, measured with `tools/re/nid_gate_scan.py --nid PI7jIZj4pcE`
+// over the local dumps (call sites classified by what happens to eax):
+//
+//     PPSA08804  nonzero=2 ignored=1        PPSA04263  nonzero=2
+//     PPSA24651  nonzero=1                  PPSA13579  nonzero=1
+//     PPSA17942  ignored=1                  PPSA19244  forward=1 ignored=1
+//
+// So most call sites branch on "did this fail", and — the load-bearing part — NOT ONE compares the
+// result against a specific constant (no `const` / `other-cmp` site anywhere). That is what makes
+// the reject arms safe to add: the guest reads only the SIGN of the answer, never its value.
+// CONFIDENCE: HIGH that success must fill the buffer and that failure must be non-zero;
+// LOW on the exact error constant — the SCE_RANDOM error space is not in the 3.20 dump (which
+// carries names and NIDs only) and no call site discriminates it, so the libkernel encoding is
+// used per the project's default rather than an invented SCE_RANDOM_* value.
+namespace {
+
+// The published single-request cap. A guest asking for more than this gets an error on hardware, so
+// prosper must not quietly serve it: a partial fill reported as success would recreate the exact
+// bug this handler exists to remove, and an over-long fill would paper over a guest bug that real
+// hardware rejects.
+//
+// CONFIDENCE: MED — the cap is from the API documentation, not from a live capture. This is also
+// the ONLY arm of this handler that can newly FAIL a call the previous stub "succeeded", so it is
+// the one place a wrong constant costs something rather than merely being imprecise.
+//
+// What is NOT established: the request sizes local titles actually pass. `nid_gate_scan` classifies
+// what the guest does with `eax` and cannot recover an argument, so no instrument here has measured
+// the `size` operand at any call site — deliberately stated rather than left as an implied "we
+// checked". Settling it needs the argument registers read at the call, e.g. PROSPER_SVCLOG-style
+// logging on this NID or a hardware breakpoint at the import. If a title is ever found requesting
+// more, this constant is where to look first.
+constexpr uint64_t kRandomMaxBytes = 64;
+
+// Fill `bytes` from the host CSPRNG. Returns false if the host cannot supply entropy — which the
+// caller MUST surface as an error, never as a zero-filled success. Deterministic zeros presented as
+// random are the same lie in a different costume.
+bool svc_host_entropy(void* dst, size_t bytes) {
+#ifdef _WIN32
+    return BCryptGenRandom(nullptr, (PUCHAR)dst, (ULONG)bytes,
+                           BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+#else
+    auto* p = static_cast<unsigned char*>(dst);
+    while (bytes) {
+        const size_t chunk = bytes < 256 ? bytes : 256;   // getentropy's published maximum
+        if (getentropy(p, chunk) != 0) return false;
+        p += chunk;
+        bytes -= chunk;
+    }
+    return true;
+#endif
+}
+
+} // namespace
+
+HLE(s_random_get_random_number) {
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    const uint64_t buf = a0, size = a1;
+    // A zero-length request asks for nothing and trivially gets it; there is no buffer to leave
+    // stale, so this is a real success rather than the empty kind.
+    if (size == 0) return 0;
+    if (size > kRandomMaxBytes) return prosper::hle::kSceKernelErrorEINVAL;
+    if (!svc_ptrish(buf)) return prosper::hle::kSceKernelErrorEFAULT;
+
+    unsigned char tmp[kRandomMaxBytes];
+    if (!svc_host_entropy(tmp, (size_t)size))
+        return prosper::hle::sce_kernel_error(prosper::hle::FreeBsdErrno::EIo);
+    // Fault-contained: an unmapped or unwritable guest buffer must return an error, not take down
+    // the emulator, and must not report success for a write that did not land.
+    if (!svc_write_bytes(buf, tmp, (size_t)size)) return prosper::hle::kSceKernelErrorEFAULT;
+    return 0;
+}
+
 void register_service_hle() {
     register_json2_hle();
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
@@ -4199,8 +4293,19 @@ void register_service_hle() {
     Hle::register_fn("sk54bi6FtYM", (HleFn)s_npweb_create_user_context,
                      "sceNpWebApi2CreateUserContext");
     // NpTrophy2: the config/info queries whose success-with-garbage-out crashed DOLL (see above).
+    // ALL FIVE of the library's info queries must answer here, not just the two that a title
+    // happened to crash on. Each writes its result through a caller-supplied out-struct, so any one
+    // of them left unregistered returns the dispatcher's 0 — SCE_OK — over memory nothing wrote,
+    // which is the failure #213 diagnosed (a heap-garbage trophy count sized a 34 GB array). The
+    // singular/plural pairs are the trap: registering `…TrophyInfoArray` and not `…TrophyInfo`
+    // leaves the identical shape live behind a name that looks covered. #1956, swept under #2081.
     Hle::register_fn("4IzqhhUQ3nk", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameInfo");
     Hle::register_fn("y3zHpdZO6ME", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfoArray");
+    Hle::register_fn("EwNylPdWUTM", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfo");
+    Hle::register_fn("DoZWauG8mu0", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGroupInfo");
+    Hle::register_fn("+PDSI6WgPRc", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGroupInfoArray");
+    // libSceRandom's only export — see the block comment above s_random_get_random_number.
+    Hle::register_fn("PI7jIZj4pcE", (HleFn)s_random_get_random_number, "sceRandomGetRandomNumber");
     // user service
     R("sceUserServiceGetInitialUser", s_user_initial);
     Hle::register_fn("eNb53LQJmIM", (HleFn)s_user_initial, "sceUserServiceGetForegroundUser");  // was MISSING -> garbage userId
