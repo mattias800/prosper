@@ -24,6 +24,23 @@ and reviewers know what the invariants are.
   bulk read from it (used across the GPU command processor / executor / compute paths). A packet- or
   descriptor-supplied pointer is validated for exactly the bytes touched before the copy (see #1200 /
   #1202 for the two command-processor readers that were missing it).
+- **`guest_writable(addr, bytes)`** — the same question for a *store*, and the one to use in front of
+  one. **`guest_readable` is not a substitute:** it accepts a read-only mapping (Linux/macOS probe by
+  having the kernel read the byte; Windows explicitly accepts `PAGE_READONLY`/`PAGE_WRITECOPY`/
+  `PAGE_EXECUTE_READ`), so a read probe in front of a write proves the wrong property and the store
+  then faults on a page the probe just called fine — the guest module's own `.text`/`.rodata` are large
+  read-only mappings in the same address space. That was a real defect in #1637 as merged, fixed by
+  #1654.
+  **Cost, and what to do on a hot path:** `guest_writable` is **uncached**, and on Linux it `fopen`s
+  and parses `/proc/self/maps` on **every** call — unlike `guest_readable`, which has a thread-local
+  range cache. So it must not be dropped into a per-draw path. Do **not** resolve that by switching
+  back to `guest_readable` (wrong predicate, above — and its cache consults `submit_ranges` only
+  inside a renderer submit scope, which the DCB-build path is not). Prefer an **arithmetic answer to
+  the question actually being asked**: `hle_agc.cpp`'s DCB ring registry (#1650) remembers the
+  `[bottom, top)` extent each command packet was built into, so a patcher validates the pointer the
+  guest hands back by range compare, and only misses fall through to the probe. Structure such a cache
+  as a pure accelerator — a hit skips the probe, a miss falls back — so the safety argument rests on
+  the predicate and never on the cache.
 - **`rd<T>(file, off)`** (`src/self/module.cpp`) — bounded structured read: gates the `memcpy` on
   `self_read_ok` and zero-fills a `T{}` on an out-of-range offset. Every SELF/ELF header/table read goes
   through it; a raw `reinterpret_cast`/`memcpy` into `file.data() + off` is a red flag.

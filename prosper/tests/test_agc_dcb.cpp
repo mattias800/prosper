@@ -8,6 +8,11 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace prosper;
 
@@ -44,6 +49,49 @@ struct RegisterDefaults {
 };
 static_assert(offsetof(RegisterDefaults, count) == 0x38);
 extern "C" void* prosper_agc_reg_defaults(unsigned int version);
+// #1650: how many packet-patcher calls missed the DCB ring registry and paid for an OS write probe.
+// The registry exists so the per-draw path never does; without a way to observe it, "no syscall on
+// the hot path" would be an unfalsifiable claim in a comment.
+extern "C" uint64_t prosper_agc_patch_probe_count();
+
+// Capture everything written to stderr while `body` runs. A refused guest write that says nothing
+// is the failure mode #1650 was filed for, so "was it reported" is part of the contract under test,
+// not decoration. Same fd-swap shape as test_service_logging.cpp.
+template <typename F>
+static bool capture_stderr(F&& body, char* out, size_t out_size) {
+    out[0] = '\0';
+    FILE* capture = tmpfile();
+    if (!capture) return false;
+    if (fflush(stderr) != 0) { fclose(capture); return false; }
+#ifdef _WIN32
+    const int fd = _fileno(stderr), saved = _dup(fd);
+    const bool redirected = saved >= 0 && _dup2(_fileno(capture), fd) == 0;
+#else
+    const int fd = fileno(stderr), saved = dup(fd);
+    const bool redirected = saved >= 0 && dup2(fileno(capture), fd) >= 0;
+#endif
+    if (!redirected) {
+#ifdef _WIN32
+        if (saved >= 0) _close(saved);
+#else
+        if (saved >= 0) close(saved);
+#endif
+        fclose(capture);
+        return false;
+    }
+    body();
+    fflush(stderr);
+#ifdef _WIN32
+    const bool restored = _dup2(saved, fd) == 0; _close(saved);
+#else
+    const bool restored = dup2(saved, fd) >= 0; close(saved);
+#endif
+    rewind(capture);
+    const size_t n = fread(out, 1, out_size - 1, capture);
+    out[n] = '\0';
+    fclose(capture);
+    return restored;
+}
 
 int main() {
     printf("== test_agc_dcb ==\n");
@@ -115,9 +163,16 @@ int main() {
     auto p_num_uc = Hle::lookup("fRG-JOH5+sI");   // sceAgcSetUcRegIndirectPatchSetNumRegisters
     auto setsh_ind = Hle::lookup("-HOOCn0JY48");  // sceAgcDcbSetShRegistersIndirect
     auto setuc_ind = Hle::lookup("hvUfkUIQcOE");  // sceAgcDcbSetUcRegistersIndirect
-    CHECK(p_num_cx && p_num_sh && p_num_uc && setsh_ind && setuc_ind,
-          "all three PatchSetNumRegisters NIDs and the Sh/Uc indirect builders are registered");
-    if (p_num_cx && p_num_sh && p_num_uc && setsh_ind && setuc_ind) {
+    // The Sh members of the address/count family. Since #1650 each register class has its own
+    // handler and verifies the packet's sub-op, so a test — like a guest — must patch an Sh packet
+    // through the Sh NIDs. Reaching for the Cx one here used to "work" only because a single shared
+    // handler served all three classes, which is the defect.
+    auto p_addr_sh = Hle::lookup("Qrj4c+61z4A");  // sceAgcSetShRegIndirectPatchSetAddress
+    auto p_add_sh  = Hle::lookup("z2duB-hHQSM");  // sceAgcSetShRegIndirectPatchAddRegisters
+    CHECK(p_num_cx && p_num_sh && p_num_uc && setsh_ind && setuc_ind && p_addr_sh && p_add_sh,
+          "all three PatchSetNumRegisters NIDs, the Sh/Uc indirect builders and the per-class Sh "
+          "address/count patchers are registered");
+    if (p_num_cx && p_num_sh && p_num_uc && setsh_ind && setuc_ind && p_addr_sh && p_add_sh) {
         p_num_cx(rc, 2, 0, 0, 0, 0);
         CHECK(cmd[1] == 2, "Cx PatchSetNumRegisters SETS the count (8 -> 2), it does not accumulate");
         CHECK(cmd[2] == 0x00112233u && cmd[3] == 0xAABBCCDDu,
@@ -128,7 +183,7 @@ int main() {
         auto* sh_cmd = (uint32_t*)(uintptr_t)sh_rc;
         CHECK(sh_cmd && sh_cmd[0] == PM4(4, IT_NOP, R_SH_REGS_INDIRECT) && sh_cmd[1] == 0,
               "SetShRegistersIndirect reserves a packet with the placeholder count 0");
-        p_addr(sh_rc, 0x0000000340000000ull, 0, 0, 0, 0);
+        p_addr_sh(sh_rc, 0x0000000340000000ull, 0, 0, 0, 0);
         p_num_sh(sh_rc, 12, 0, 0, 0, 0);
         CHECK(sh_cmd[1] == 12, "Sh PatchSetNumRegisters turns the reserved 0-count packet into 12");
         CHECK(sh_cmd[2] == 0x40000000u && sh_cmd[3] == 0x00000003u,
@@ -144,6 +199,139 @@ int main() {
         p_num_sh(rc, 999, 0, 0, 0, 0);
         CHECK(cmd[1] == cx_num_before,
               "PatchSetNumRegisters refuses a packet of a different register class");
+    }
+
+    // ---- #1650: PatchSetAddress / PatchAddRegisters must refuse a pointer that is not one of
+    // their own packets, and must SAY SO.
+    //
+    // Both took a caller-supplied pointer behind nothing but a null check and stored through it.
+    // A wrapped, aliased or stale builder pointer therefore got a 64-bit register-array address
+    // written over two dwords of unrelated command-buffer or heap memory, with no log and no
+    // reject — corruption at a distance, attributed to whatever broke next. These are not cold
+    // paths: Sonic CrossWorlds logs 128 AddRegisters calls in a single 400-tick `hle_calls` window
+    // (docs/SONIC_CROSSWORLDS_STATUS.md), and Blue Prince builds its register arrays this way per
+    // draw (command_processor.hpp, #1264).
+    //
+    // Four arms, each naming the mutation it kills. Arm 1 is the positive control, because a fix
+    // that refuses EVERYTHING would satisfy a refusal-only test while silently dropping every
+    // register bind in those titles.
+    if (p_addr_sh && p_add_sh) {
+        // Arm 1 — POSITIVE CONTROL: a real packet, patched through its OWN class, still works.
+        // Kills a "refuse everything" fix. It also pins the performance contract: an in-ring
+        // pointer must be validated by range compare, never by an OS probe. guest_writable is
+        // uncached and fopen()s /proc/self/maps on Linux on every call, so a probe here would be a
+        // per-draw syscall on the hottest patch path — the reason this issue could not simply copy
+        // the PatchSetNumRegisters guard (#1654).
+        uint32_t ring[16];
+        memset(ring, 0xEE, sizeof ring);
+        Dcb rd{};
+        rd.bottom = ring; rd.top = ring + 16; rd.cursor_up = ring; rd.cursor_down = ring + 16;
+        const uint64_t RD = (uint64_t)(uintptr_t)&rd;
+        const uint64_t pkt_addr = setcx(RD, 0, 4, 0, 0, 0);
+        auto* pkt = (uint32_t*)(uintptr_t)pkt_addr;
+        CHECK(pkt == ring && pkt[0] == PM4(4, IT_NOP, R_CX_REGS_INDIRECT) && pkt[1] == 4,
+              "#1650 arm1: the builder reserved a Cx packet in a fresh ring");
+
+        const uint64_t probes_before_ok = prosper_agc_patch_probe_count();
+        p_addr(pkt_addr, 0x0000001200003400ull, 0, 0, 0, 0);
+        p_add(pkt_addr, 3, 0, 0, 0, 0);
+        CHECK(pkt[2] == 0x00003400u && pkt[3] == 0x00000012u,
+              "#1650 arm1: matching-class PatchSetAddress still writes the array address");
+        CHECK(pkt[1] == 7,
+              "#1650 arm1: matching-class PatchAddRegisters still accumulates (4 -> 7)");
+        CHECK(prosper_agc_patch_probe_count() == probes_before_ok,
+              "#1650 arm1: an in-ring packet is accepted by range compare, with no OS write probe");
+
+        // Arms 2-4 all REFUSE, and the refusal has to be visible in a run log. Capture stderr so
+        // "refused" and "refused silently" cannot pass the same assertions.
+        char log[4096];
+        uint32_t victim[8];
+        for (auto& v : victim) v = 0xA5A5A5A5u;      // ordinary writable memory, NOT one of our packets
+        const uint32_t pkt1 = pkt[1], pkt2 = pkt[2], pkt3 = pkt[3];
+        const uint64_t probes_before_refusals = prosper_agc_patch_probe_count();
+        const uint64_t victim_addr = (uint64_t)(uintptr_t)victim;
+        // Below the 0x1000 floor every guest-memory predicate rejects, and far below anything the
+        // process maps: dereferencing it faults. On master both handlers stored straight through a
+        // pointer like this, so without the fix this arm does not merely fail, it SIGSEGVs.
+        constexpr uint64_t unmapped_addr = 0x800ull;
+
+        const bool captured = capture_stderr([&] {
+            // Arm 2 — the silent-arbitrary-write case itself: a mapped, writable pointer that is
+            // not our packet. Kills "no header sub-op check".
+            p_addr(victim_addr, 0xDEADBEEFCAFEBABEull, 0, 0, 0, 0);
+            p_add(victim_addr, 99, 0, 0, 0, 0);
+            // Arm 3 — a REAL packet of the WRONG register class. A single shared handler for
+            // Cx/Sh/Uc cannot catch this, because the class is carried by the NID alone; kills
+            // "keep one handler registered for all three NIDs" (exactly what master did).
+            p_addr_sh(pkt_addr, 0x1111111122222222ull, 0, 0, 0, 0);
+            p_add_sh(pkt_addr, 55, 0, 0, 0, 0);
+            // Arm 4 — a pointer that cannot be dereferenced at all. Kills "no mappedness probe".
+            p_addr(unmapped_addr, 0x3333333344444444ull, 0, 0, 0, 0);
+            p_add(unmapped_addr, 77, 0, 0, 0, 0);
+        }, log, sizeof log);
+        CHECK(captured, "#1650: stderr capture around the refusal arms worked");
+
+        bool victim_intact = true;
+        for (const auto& v : victim) victim_intact &= (v == 0xA5A5A5A5u);
+        CHECK(victim_intact,
+              "#1650 arm2: a mapped non-packet pointer is left byte-for-byte alone");
+        CHECK(pkt[1] == pkt1 && pkt[2] == pkt2 && pkt[3] == pkt3,
+              "#1650 arm3: a wrong-class patcher does not touch a packet of another class");
+
+        // Which guard fired matters as much as that one did. Arm 2's target is writable, so it must
+        // be the HEADER check that refuses it — if guest_writable had wrongly rejected the stack,
+        // the message would say "not writable" and this assertion fails loudly instead of passing
+        // for the wrong reason.
+        CHECK(strstr(log, "SetCxRegIndirectPatchSetAddress: header") != nullptr &&
+              strstr(log, "SetCxRegIndirectPatchAddRegisters: header") != nullptr,
+              "#1650 arm2: the refusal names the call site and the unexpected header, on stderr");
+        CHECK(strstr(log, "SetShRegIndirectPatchSetAddress: header") != nullptr &&
+              strstr(log, "SetShRegIndirectPatchAddRegisters: header") != nullptr,
+              "#1650 arm3: the wrong-class refusal names the Sh call site, on stderr");
+        CHECK(strstr(log, "is not writable guest memory") != nullptr,
+              "#1650 arm4: an undereferenceable packet is reported, not silently skipped");
+        CHECK(prosper_agc_patch_probe_count() > probes_before_refusals,
+              "#1650: out-of-ring pointers DO reach the write probe — so arm1's zero-probe "
+              "assertion measures the registry rather than a counter stuck at zero");
+
+        // Arm 5 — the diagnostic budget is PER CALL SITE.
+        //
+        // It used to be a single 8-message counter shared by every patcher family in the
+        // translation unit, so eight refusals anywhere spent it for everyone and the first refusal
+        // of a family that started misbehaving later never printed. That is the same defect class
+        // this issue is about — prosper declining a guest write and saying nothing.
+        //
+        // This arm has to FLOOD one call site past the budget to see it, and that is the whole
+        // point: the arms above produce only eight refusals in total across the entire run, which
+        // is exactly the old shared budget, so every one of them still prints under the old code
+        // and none of them can fail if the budget change is reverted. Counting refusals is not
+        // optional here — a cheaper assertion that merely re-greps two names already checked above
+        // cannot fail independently of the header check.
+        char log2[16384];
+        const bool captured2 = capture_stderr([&] {
+            for (int i = 0; i < 16; ++i)                  // spend this one site's budget outright
+                p_addr(victim_addr, 0xDEADBEEFCAFEBABEull, 0, 0, 0, 0);
+            p_add_sh(victim_addr, 1, 0, 0, 0, 0);         // a DIFFERENT site, still owed a voice
+        }, log2, sizeof log2);
+        CHECK(captured2, "#1650 arm5: stderr capture around the budget flood worked");
+
+        auto occurrences = [](const char* hay, const char* needle) {
+            size_t n = 0;
+            for (const char* p = strstr(hay, needle); p; p = strstr(p + 1, needle)) ++n;
+            return n;
+        };
+        const size_t flooded = occurrences(log2, "SetCxRegIndirectPatchSetAddress");
+        CHECK(flooded > 0 && flooded < 16,
+              "#1650 arm5: a flooded call site is rate-limited — neither silent nor unbounded");
+        CHECK(strstr(log2, "SetShRegIndirectPatchAddRegisters") != nullptr,
+              "#1650 arm5: a DIFFERENT call site still reports after that flood — budgets are per "
+              "call site, so one patcher family can no longer silence another");
+
+        bool victim_still_intact = true;
+        for (const auto& v : victim) victim_still_intact &= (v == 0xA5A5A5A5u);
+        CHECK(victim_still_intact,
+              "#1650 arm5: seventeen refused patches still wrote nothing");
+        if (fails) printf("  captured stderr:\n%s\n  ---- flood ----\n%s", log, log2);
     }
 
     // #395 F5: all three single-register direct NIDs append the native packet opcode and preserve

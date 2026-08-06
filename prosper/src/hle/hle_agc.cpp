@@ -209,6 +209,66 @@ struct AgcDcb {
     }
 };
 
+// --- Known DCB ring extents, so a packet patcher can validate its target without a syscall (#1650).
+//
+// The Set*RegsIndirect patchers are handed a pointer the guest got back from prosper's OWN builder
+// and they STORE through it. The correct predicate for that is gpu::guest_writable — but it is
+// UNCACHED, and on Linux it fopen()s and parses /proc/self/maps on EVERY call, while these patchers
+// run per draw (Blue Prince assembles its register arrays incrementally: record num=0, then
+// PatchSetAddress + PatchAddRegisters — see command_processor.hpp's #1264 note). guest_readable is
+// cheaper but is the WRONG predicate in front of a store (#1654: a read-only mapping passes it and
+// then faults), and its thread-local range cache only consults submit_ranges while a renderer submit
+// scope is active, which the DCB-build path is not.
+//
+// So remember the ring each such packet is built into. A pointer inside a remembered [bottom, top)
+// with room for the whole packet is memory this file allocated from the guest's own command buffer
+// and has already written a header into, so it is mapped and writable and no probe is needed.
+//
+// This registry is ONLY an accelerator: a hit skips a probe, a miss falls through to guest_writable.
+// It can never cause a refusal that guest_writable would not also cause, which is what keeps the
+// safety argument on the predicate rather than on the cache. Its one false-accept mode is a STALE
+// extent — the guest freeing a ring between building a packet and patching it, which would be a
+// guest bug, since it is about to submit that ring — and on that path the behaviour is exactly what
+// master does today with no check at all, so the residual risk is a strict subset of the status quo.
+//
+// Per-thread, for the reason given above for g_dcb_diag_r: a Dcb is built by one thread, and a
+// shared global would let one thread's ring vouch for another's pointer. A cross-thread patch simply
+// misses and takes the probe path, which is correct, merely slower.
+//
+// EVICTION IS FIFO ROUND-ROBIN, NOT LRU/MRU — lookup scans all slots, but insertion overwrites the
+// oldest regardless of use. So a thread cycling through MORE than kDcbExtentSlots live rings can
+// evict a ring it is still patching into and thrash to a near-zero hit rate, paying a probe per
+// call where a smaller working set pays none. That is a PERFORMANCE cliff only — every miss still
+// gets the correct answer from guest_writable — but it is the reason this is sized above the one
+// ring the measured titles use rather than at 1, and the reason the number is stated here rather
+// than tuned silently. If a title is ever seen thrashing it, promote the policy to LRU (move a hit
+// to the front) before growing the array; the scan is linear, so the array cannot grow far.
+constexpr size_t kDcbExtentSlots = 4;
+struct DcbExtent { uintptr_t bottom = 0, top = 0; };
+inline thread_local DcbExtent g_dcb_extents[kDcbExtentSlots];
+inline thread_local uint32_t g_dcb_extent_next = 0;
+// How many patcher calls missed the registry and paid for the OS write probe. The registry's whole
+// purpose is to keep this at zero on the hot path, and a performance property nobody can observe is
+// one that regresses silently — so it is exported (prosper_agc_patch_probe_count) for tests.
+inline std::atomic<uint64_t> g_patch_probe_calls{0};
+
+inline void remember_dcb_extent(const AgcDcb* dcb) {
+    if (!dcb || !dcb->bottom || dcb->top <= dcb->bottom) return;
+    const auto bottom = (uintptr_t)dcb->bottom, top = (uintptr_t)dcb->top;
+    for (const auto& e : g_dcb_extents)
+        if (e.bottom == bottom && e.top == top) return;      // already known; the common case
+    g_dcb_extents[g_dcb_extent_next] = DcbExtent{bottom, top};
+    g_dcb_extent_next = (g_dcb_extent_next + 1u) % (uint32_t)kDcbExtentSlots;
+}
+// True when [p, p+bytes) lies wholly inside a remembered ring. The whole-packet requirement matters:
+// a pointer near the ring's end whose packet would run off the top is not one of our packets.
+inline bool in_known_dcb(uintptr_t p, size_t bytes) {
+    if (!p || !bytes) return false;
+    for (const auto& e : g_dcb_extents)
+        if (e.bottom && p >= e.bottom && p < e.top && (size_t)(e.top - p) >= bytes) return true;
+    return false;
+}
+
 const char* dcb_subop_name(uint32_t r) {
     switch (r) {
         case R_DRAW_INDEX:                 return "DrawIndex";
@@ -334,20 +394,66 @@ inline uint32_t* begin_packet(uint64_t buf, uint32_t n, uint32_t op, uint32_t r,
     return cmd;
 }
 
+// Diagnostic budget for a refused patch, keyed by CALL SITE (#1650).
+//
+// This used to be one `static std::atomic<int>` inside patch_check, i.e. a single 8-message budget
+// shared by every patcher family in this translation unit. Eight refusals anywhere spent it for
+// everyone, so the first refusal of a family that started misbehaving later was silent — and a guest
+// write prosper declines without saying so is exactly the failure the charter's fail-visible rule
+// exists to prevent. `who` is a distinct string literal per patcher, so its address identifies the
+// call site and every future call site gets its own budget without anyone remembering to add one.
+// Only reached when a patch is actually refused, so it is off every hot path.
+inline bool patch_budget_ok(const char* who) {
+    struct Slot { std::atomic<const char*> who{nullptr}; std::atomic<int> n{0}; };
+    static Slot slots[16];
+    static std::atomic<int> overflow{0};
+    for (auto& s : slots) {
+        const char* cur = s.who.load(std::memory_order_acquire);
+        if (!cur) {
+            const char* expect = nullptr;
+            // Whoever wins the CAS owns the slot; the loser reads back the winner's `who` and
+            // either matches it or moves on to the next slot.
+            cur = s.who.compare_exchange_strong(expect, who, std::memory_order_acq_rel) ? who : expect;
+        }
+        if (cur == who) return s.n.fetch_add(1, std::memory_order_relaxed) < 8;
+    }
+    return overflow.fetch_add(1, std::memory_order_relaxed) < 8;   // more call sites than slots
+}
+
 // Verify a to-be-patched packet's own header sub-op before writing — a mismatch means the RE
-// drifted, so log loudly (once) and refuse to corrupt the stream. Shared by the sync-packet
-// address patchers (#213/#222) and SetPacketPredication (#319).
+// drifted, so log loudly and refuse to corrupt the stream. Shared by the sync-packet address
+// patchers (#213/#222), SetPacketPredication (#319) and the indirect-register family (#1650).
 inline bool patch_check(uint32_t* cmd, uint32_t want_r, const char* who) {
     uint32_t r = (cmd[0] >> 2) & (R_NUM - 1u), op = (cmd[0] >> 8) & 0xffu;
     if (op == IT_NOP && r == want_r) return true;
-    static std::atomic<int> logged{0};
-    if (logged.fetch_add(1) < 8)
+    if (patch_budget_ok(who))
         fprintf(stderr, "[agc] %s: header 0x%08x is not the expected packet (op=0x%x r=0x%x want r=0x%x) — patch refused\n",
                 who, cmd[0], op, r, want_r);
     return false;
 }
 
+// May `cmd` be dereferenced AND stored to for `bytes`? Answer from the DCB ring registry first (a
+// range compare, no syscall), and only probe the OS when the pointer is not in a ring we built into.
+// The probe is the WRITE predicate deliberately: every caller of this stores, and guest_readable
+// accepts a read-only mapping that would then fault (#1654). A refusal is always reported.
+inline bool patch_target_writable(uint64_t cmd_addr, size_t bytes, const char* who) {
+    if (in_known_dcb((uintptr_t)cmd_addr, bytes)) return true;
+    g_patch_probe_calls.fetch_add(1, std::memory_order_relaxed);
+    if (gpu::guest_writable(cmd_addr, (uint32_t)bytes)) return true;
+    if (patch_budget_ok(who))
+        fprintf(stderr, "[agc] %s: packet 0x%llx (%zu bytes) is not writable guest memory — patch refused\n",
+                who, (unsigned long long)cmd_addr, bytes);
+    return false;
+}
+
 }  // namespace
+
+// Test/diagnostic accessor for the #1650 registry: how many patcher calls missed the known-ring
+// registry and paid for an OS write probe. Zero growth across a draw is the property the registry
+// exists to provide, and this is what lets a test assert it instead of assuming it.
+extern "C" uint64_t prosper_agc_patch_probe_count() {
+    return g_patch_probe_calls.load(std::memory_order_relaxed);
+}
 
 // --- Dcb append functions (a0 = Dcb*, return = the allocated packet pointer). ------------------
 HLE(agc_dcb_reset_queue) {  // (buf, op=0x3ff, state=0)
@@ -433,6 +539,10 @@ HLE(agc_dcb_set_sh_register_direct) { return set_register_direct(a0, a1, IT_SET_
 HLE(agc_dcb_set_uc_register_direct) { return set_register_direct(a0, a1, IT_SET_UCONFIG_REG); }
 static uint64_t set_regs_indirect(uint64_t buf, uint64_t regs, uint64_t num_regs, uint32_t r) {
     uint32_t* cmd; if (!begin_packet(buf, kDwSetRegsIndirect, IT_NOP, r, &cmd)) return 0;
+    // Remember which ring this packet lives in, so the matching patchers can validate the pointer
+    // the guest hands back to them by range compare instead of a per-draw /proc/self/maps parse
+    // (#1650). Recorded after begin_packet succeeded, so the extent is one we really allocated from.
+    remember_dcb_extent((const AgcDcb*)(uintptr_t)buf);
     cmd[1] = (uint32_t)num_regs; cmd[2] = (uint32_t)(regs & 0xffffffffu); cmd[3] = (uint32_t)(regs >> 32u);
     // PROSPER_REGBLOAT (#1264): record-time provenance for the register-array bloat investigation —
     // correlate each packet's ORIGINAL count with later PatchAddRegisters growth and the fold-time
@@ -2290,27 +2400,75 @@ HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, 
 
 // --- Indirect-register patch helpers: modify a packet returned by a Set*RegsIndirect call.
 // cmd = a0 (that returned pointer). Old stub returned 0 for Set*RegsIndirect -> these wrote to null. -
-HLE(agc_patch_set_address) {  // (cmd, regs): cmd[2..3] = regs vaddr
-    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+//
+// Both of these take a caller-supplied pointer and STORE through it, and both used to do so behind
+// nothing but a null check (#1650). Two things follow from what the pointer actually is:
+//
+//   * The packet layout they patch (cmd[1] = count, cmd[2..3] = array vaddr, header
+//     PM4(4, IT_NOP, R_{CX,SH,UC}_REGS_INDIRECT)) is PROSPER'S OWN. The guest can only have obtained
+//     a legitimate `cmd` as the return value of this file's Set*RegsIndirect builder, so a genuine
+//     target always carries that header and always sits in a ring we built into. Anything else is a
+//     wrapped, aliased or stale builder pointer, and writing to it corrupts unrelated
+//     command-buffer or heap memory silently — 64 bits of it, at a distance, with no log.
+//   * Which of the three register classes the guest called is only knowable from the NID, not from
+//     the arguments, so the class check needs per-class handlers. That is why these are split the
+//     way #1637 split PatchSetNumRegisters rather than left as one shared handler.
+//
+// So: probe for writability (through the ring registry, so no syscall on the per-draw path), then
+// verify the packet's own header sub-op, then write. Both refusals are logged on a per-call-site
+// budget. CONFIDENCE: HIGH — the packet layout, the builder and the patcher are all prosper's.
+static uint64_t patch_set_address(uint64_t cmd_addr, uint64_t regs, uint32_t want_r,
+                                  const char* who) {
+    auto* cmd = (uint32_t*)(uintptr_t)cmd_addr; if (!cmd) return 0;
+    if (!patch_target_writable(cmd_addr, kDwSetRegsIndirect * sizeof(uint32_t), who)) return 0;
+    // Report before the early return, and report the refusal too: an investigation into a register
+    // array that points at the wrong place most wants the case where the patch did not land.
     static const bool regbloat = getenv("PROSPER_REGBLOAT") != nullptr;
+    const bool ok = patch_check(cmd, want_r, who);
     if (regbloat) {
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 96)
-            fprintf(stderr, "[regbloat-patch] set_address cmd=%p old=0x%x%08x new=0x%llx num=%u\n",
-                    (void*)cmd, cmd[3], cmd[2], (unsigned long long)a1, cmd[1]);
+            fprintf(stderr, "[regbloat-patch] set_address cmd=%p hdr=0x%08x old=0x%x%08x new=0x%llx num=%u%s\n",
+                    (void*)cmd, cmd[0], cmd[3], cmd[2], (unsigned long long)regs, cmd[1],
+                    ok ? "" : " REFUSED");
     }
-    cmd[2] = (uint32_t)(a1 & 0xffffffffu); cmd[3] = (uint32_t)(a1 >> 32u); return 0;
+    if (!ok) return 0;
+    cmd[2] = (uint32_t)(regs & 0xffffffffu); cmd[3] = (uint32_t)(regs >> 32u);
+    return 0;
 }
-HLE(agc_patch_add_registers) {  // (cmd, num_regs): cmd[1] += num_regs
-    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+static uint64_t patch_add_registers(uint64_t cmd_addr, uint64_t num, uint32_t want_r,
+                                    const char* who) {
+    auto* cmd = (uint32_t*)(uintptr_t)cmd_addr; if (!cmd) return 0;
+    if (!patch_target_writable(cmd_addr, kDwSetRegsIndirect * sizeof(uint32_t), who)) return 0;
     static const bool regbloat = getenv("PROSPER_REGBLOAT") != nullptr;
+    const bool ok = patch_check(cmd, want_r, who);
     if (regbloat) {
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 96)
-            fprintf(stderr, "[regbloat-patch] add_registers cmd=%p old_num=%u add=%u\n",
-                    (void*)cmd, cmd[1], (uint32_t)a1);
+            fprintf(stderr, "[regbloat-patch] add_registers cmd=%p hdr=0x%08x old_num=%u add=%u%s\n",
+                    (void*)cmd, cmd[0], cmd[1], (uint32_t)num, ok ? "" : " REFUSED");
     }
-    cmd[1] += (uint32_t)a1; return 0;
+    if (!ok) return 0;
+    cmd[1] += (uint32_t)num;
+    return 0;
+}
+HLE(agc_patch_set_address_cx) {  // (cmd, regs): cmd[2..3] = regs vaddr
+    return patch_set_address(a0, a1, R_CX_REGS_INDIRECT, "SetCxRegIndirectPatchSetAddress");
+}
+HLE(agc_patch_set_address_sh) {
+    return patch_set_address(a0, a1, R_SH_REGS_INDIRECT, "SetShRegIndirectPatchSetAddress");
+}
+HLE(agc_patch_set_address_uc) {
+    return patch_set_address(a0, a1, R_UC_REGS_INDIRECT, "SetUcRegIndirectPatchSetAddress");
+}
+HLE(agc_patch_add_registers_cx) {  // (cmd, num_regs): cmd[1] += num_regs
+    return patch_add_registers(a0, a1, R_CX_REGS_INDIRECT, "SetCxRegIndirectPatchAddRegisters");
+}
+HLE(agc_patch_add_registers_sh) {
+    return patch_add_registers(a0, a1, R_SH_REGS_INDIRECT, "SetShRegIndirectPatchAddRegisters");
+}
+HLE(agc_patch_add_registers_uc) {
+    return patch_add_registers(a0, a1, R_UC_REGS_INDIRECT, "SetUcRegIndirectPatchAddRegisters");
 }
 
 // sceAgcSet{Cx,Sh,Uc}RegIndirectPatchSetNumRegisters — SET, not accumulate, the register count of a
@@ -2356,18 +2514,14 @@ static uint64_t patch_set_num_registers(uint64_t cmd_addr, uint64_t num, uint32_
     // just called fine — the module's own .text/.rodata are large read-only mappings in this same
     // address space. guest_writable covers the freed/unmapped case as well.
     //
-    // COST CAVEAT, do not copy this call verbatim onto a hot path: guest_writable is UNCACHED, and
-    // on Linux it fopen()s and parses /proc/self/maps on every call — unlike guest_readable, which
-    // has a thread-local range cache. That is harmless here because no measured title calls these
-    // NIDs at all, but the sibling patchers (#1650) run per draw on Blue Prince, and tightening
-    // those needs a cached predicate rather than this one.
-    if (!gpu::guest_writable(cmd_addr, 2 * sizeof(uint32_t))) {
-        static std::atomic<int> n{0};
-        if (n.fetch_add(1) < 8)
-            fprintf(stderr, "[agc] %s: packet 0x%llx not writable — patch skipped\n", who,
-                    (unsigned long long)cmd_addr);
-        return 0;
-    }
+    // Since #1650 that probe is reached through patch_target_writable, which answers from the DCB
+    // ring registry first and only calls guest_writable on a miss. The cost caveat that used to sit
+    // here — guest_writable is uncached and fopen()s /proc/self/maps on Linux every call — is why
+    // the whole family now shares one guard instead of this handler having a private one: the
+    // sibling patchers run per draw on Blue Prince, and two different answers to "may I write to
+    // this packet?" inside one family is how the #1650 asymmetry arose in the first place. The
+    // probed span is the whole 4-dword packet, the only shape this family's builder emits.
+    if (!patch_target_writable(cmd_addr, kDwSetRegsIndirect * sizeof(uint32_t), who)) return 0;
     // Report before the early return, and report the refusal too: an investigation into a wrong
     // register count most wants the case where the patch did not land.
     static const bool regbloat = getenv("PROSPER_REGBLOAT") != nullptr;
@@ -2719,9 +2873,11 @@ void register_agc_hle() {
     // that needed its own shifted-ABI handler, so re-check if a title ever trips the reject here).
     RN("eZ4+17OQz4Q", agc_dcb_write_data);        // sceAgcAcbWriteData
     // Indirect-register patch helpers (SetAddress patches cmd[2..3]; AddRegisters patches cmd[1]).
-    RN("vcmNN+AAXnY", agc_patch_set_address);   RN("d-6uF9sZDIU", agc_patch_add_registers);   // Cx
-    RN("Qrj4c+61z4A", agc_patch_set_address);   RN("z2duB-hHQSM", agc_patch_add_registers);   // Sh
-    RN("6lNcCp+fxi4", agc_patch_set_address);   RN("vRoArM9zaIk", agc_patch_add_registers);   // Uc
+    // Per register class, so each patcher can verify the packet's own header sub-op before writing
+    // (#1650) — a single shared handler cannot, because the class is carried by the NID alone.
+    RN("vcmNN+AAXnY", agc_patch_set_address_cx); RN("d-6uF9sZDIU", agc_patch_add_registers_cx); // Cx
+    RN("Qrj4c+61z4A", agc_patch_set_address_sh); RN("z2duB-hHQSM", agc_patch_add_registers_sh); // Sh
+    RN("6lNcCp+fxi4", agc_patch_set_address_uc); RN("vRoArM9zaIk", agc_patch_add_registers_uc); // Uc
     // ...PatchSetNumRegisters: the SET (non-accumulating) count patcher of the same family (#305).
     RN("whb1RL7K4Ss", agc_patch_set_num_registers_cx);   // sceAgcSetCxRegIndirectPatchSetNumRegisters
     RN("nCUgItdN2ms", agc_patch_set_num_registers_sh);   // sceAgcSetShRegIndirectPatchSetNumRegisters
