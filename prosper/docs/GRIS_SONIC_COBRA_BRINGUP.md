@@ -838,9 +838,11 @@ on this path are offline-consistent (`sceNetCtlGetState` -> DISCONNECTED, `sceNp
   the histogram reads exactly like "the guest never pumps its callbacks" — a conclusion this lane
   formed and then falsified against the `DELIVERED` lines above. Any `hle_calls` zero for a
   trampoline-registered handler is **void**.
-- **`hle_calls --values` is currently void on this machine**, and its own positive control says so.
+- **`hle_calls --values` is currently void on this machine** (#2075), and its own positive control says so.
   Three independent arms (60 ticks / 1500 ticks / a single-handler 40-tick arm) report
   `finish-failures` exactly equal to the call count — 20/20, 543/543, 4/4 — with
   `positive-control=VOID(0-returns-for-N-calls)` and every row `(captured 0/N)`. gdb is 17.2, the
-  version the tool documents. So no value census can be taken here until that is fixed, and any
-  value figure quoted for this title comes from an earlier arm, not from current master.
+  version the tool documents. The counting path is healthy — the same 1500-tick arm with `--values`
+  off reports `calls=257 finish-failures=0`. So no value census can be taken here until #2075 is
+  fixed, and any value figure quoted for this title comes from an earlier arm, not from current
+  master.
