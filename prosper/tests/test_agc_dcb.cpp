@@ -443,6 +443,19 @@ int main() {
           blend[0].value == 0x20010001u,
           "SDK 13 resolves the render-target-zero blend default");
 
+    // The sibling key. 0xef550356 is the record the same pipeline builder reads for render targets
+    // 1..7, deriving each one's register offset as `record.offset + rtIndex`; 0xa6d12629 is the one
+    // it reads for render target 0. They must therefore describe the SAME register and the SAME
+    // default, or RT0 would start from a different blend state than RT1..7 in a title that programs
+    // both. Pin them together so an edit to one that misses the other fails here rather than
+    // showing up as an inter-target blend mismatch on some future title.
+    ShaderRegister* blend_siblings = lookup_default(defaults, 0xef550356u);
+    CHECK(blend_siblings && blend && blend_siblings[0].offset == 0x1e0u &&
+          blend_siblings[0].value == 0x20010001u &&
+          blend_siblings[0].offset == blend[0].offset &&
+          blend_siblings[0].value == blend[0].value,
+          "the RT1..7 blend key agrees with the RT0 key on register and default");
+
     // Guard a legacy multi-register run: the pointer must begin at the first register pair, not at
     // the preceding type hash. DQ copies these exact 16 bytes into its FOV defaults block.
     ShaderRegister* fov = lookup_default(defaults, 0x88f5e915u);
@@ -450,11 +463,35 @@ int main() {
           fov[1].offset == 0xecu && fov[1].value == 0,
           "SDK 13 preserves legacy multi-register run pointers");
 
-    auto* legacy_defaults = static_cast<RegisterDefaults*>(prosper_agc_reg_defaults(8));
-    CHECK(legacy_defaults && legacy_defaults != defaults && legacy_defaults->count == 127 &&
-          legacy_defaults->unknown[0] == 0 && legacy_defaults->unknown[1] == 0 &&
-          !lookup_default(legacy_defaults, 0xa6d12629u),
-          "SDK 8 callers retain the legacy table layout and defaults");
+    // A pre-13 caller searches for the SAME render-target-zero key. This used to assert the
+    // opposite — that an older caller must NOT find 0xa6d12629 — which pinned a defect rather
+    // than a contract: the key was added while fixing DQ (which asks for 13), and the version
+    // gate around it was incidental. The Oregon Trail (PPSA19244) asks for version 12, searches
+    // this table for exactly this key at eboot+0x4ab2e00, and on a miss caches its all-ones
+    // sentinel and emits its RT0 blend write with register offset 0xffffffff — which the command
+    // processor drops, leaving CB_BLEND0_CONTROL at its blend-disabled default for every draw in
+    // the title (#1946: Slate glyphs as solid blocks, logo on an opaque black panel).
+    for (unsigned version : {0u, 8u, 12u}) {
+        auto* older = static_cast<RegisterDefaults*>(prosper_agc_reg_defaults(version));
+        ShaderRegister* older_blend = lookup_default(older, 0xa6d12629u);
+        CHECK(older && older->count == 128 && older->unknown[0] == 0 && older->unknown[1] == 0 &&
+              older_blend && older_blend[0].offset == 0x1e0u &&
+              older_blend[0].value == 0x20010001u,
+              "a pre-13 caller resolves the render-target-zero blend default too");
+        // …and it agrees with the RT1..7 key on every version too, for the reason above.
+        ShaderRegister* older_siblings = lookup_default(older, 0xef550356u);
+        CHECK(older_siblings && older_blend && older_siblings[0].offset == 0x1e0u &&
+              older_siblings[0].value == 0x20010001u &&
+              older_siblings[0].offset == older_blend[0].offset &&
+              older_siblings[0].value == older_blend[0].value,
+              "a pre-13 caller's RT1..7 and RT0 blend keys agree");
+        // The rest of the table must be untouched by that addition: same multi-register run,
+        // same pointer arithmetic, for every version.
+        ShaderRegister* older_fov = lookup_default(older, 0x88f5e915u);
+        CHECK(older_fov && older_fov[0].offset == 0xebu && older_fov[0].value == 0xff00ff00u &&
+              older_fov[1].offset == 0xecu && older_fov[1].value == 0,
+              "a pre-13 caller keeps the legacy multi-register run pointers");
+    }
 
     uint64_t interpolant_regs[32];
     memset(interpolant_regs, 0, sizeof interpolant_regs);

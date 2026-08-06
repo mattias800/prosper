@@ -245,12 +245,11 @@ The warning screen, publisher logo, title screen, and EULA render at native 3840
 
 ## The Oregon Trail — `PPSA19244`
 
-<p align="center"><img src="assets/screenshots/oregon-trail-legal-popup.png" alt="The Oregon Trail — startup legal/EULA popup"></p>
 <p align="center"><img src="assets/screenshots/oregon-trail-gameloft-splash.png" alt="The Oregon Trail — Gameloft splash"></p>
 <p align="center"><img src="assets/screenshots/oregon-trail-health-warning.png" alt="The Oregon Trail — health/epilepsy warning screen"></p>
 <p align="center"><img src="assets/screenshots/oregon-trail-title-screen.png" alt="The Oregon Trail — title screen"></p>
 
-The startup sequence renders at native 3840×2160 and now runs past the EULA stage: the legal popup, the Gameloft splash, then the health/epilepsy warning screen. It then reaches and renders the **title screen** with its "Press any button" prompt; the ordered-DMA submit that used to stall the boot there is fixed. Text glyphs still draw as solid blocks, and the title screen shows an unblended black panel behind the logo and a flat pink lower field. See the [tracker](https://github.com/mattias800/prosper/issues/1886).
+The startup sequence renders at native 3840×2160 and now runs past the EULA stage: the legal popup, the Gameloft splash, then the health/epilepsy warning screen. It then reaches and renders the **title screen** with its "Press any button" prompt; the ordered-DMA submit that used to stall the boot there is fixed. The whole UI layer used to render unblended — text drew as solid blocks, the logo sat on an opaque black panel and the sky was a flat field — because the title's render-target-0 blend state never reached the GPU; with that fixed the title screen composites correctly, including its glyphs, gradient sky and publisher logos. See the [tracker](https://github.com/mattias800/prosper/issues/1886).
 
 ## Greak: Memories of Azur — `PPSA02849`
 
