@@ -20,6 +20,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#if !defined(_WIN32)
+#  if defined(__APPLE__)
+#    include <malloc/malloc.h>
+#    define USABLE(p) malloc_size(p)
+#  else
+#    include <malloc.h>
+#    define USABLE(p) malloc_usable_size(p)
+#  endif
+#endif
 
 using namespace prosper;
 
@@ -83,6 +92,20 @@ int main() {
                 bool kept = true;
                 for (size_t i = 0; i < kNew && kept; ++i) kept = small[i] == 0xC3;
                 CHECK(kept, "the surviving prefix is intact after a shrink");
+#if !defined(_WIN32)
+                // The arm that makes an over-copy DETECTABLE rather than merely fatal-sometimes.
+                // Without it, an implementation copying the source's full readable extent instead of
+                // min(extent, new_size) is caught only by crashing — and a destination inside a large
+                // free region corrupts silently and the suite exits 0. Here the source is 8192 bytes
+                // of 0xC3 and the request is 64, so an unbounded copy necessarily writes 0xC3 into
+                // the destination's own slack. That slack is readable by the same argument the
+                // implementation relies on, so this checks a defined region.
+                const size_t usable = USABLE(small);
+                bool slack_clean = true;
+                for (size_t i = kNew; i < usable && slack_clean; ++i) slack_clean = small[i] != 0xC3;
+                CHECK(slack_clean,
+                      "the copy is capped by the NEW size — no source bytes past it (over-copy guard)");
+#endif
                 free_fn(U(small), 0, 0, 0, 0, 0);
             }
         }

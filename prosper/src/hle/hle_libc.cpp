@@ -207,6 +207,11 @@ static void* guest_realloc_portable(void* p, size_t size) {
 // as OOM. That is a false FAILURE (a title treating allocation failure as fatal aborts), the mirror
 // of #2081's false successes.
 static void* guest_reallocalign_portable(void* p, size_t size, size_t alignment) {
+    // Raise a sub-fundamental alignment rather than rejecting it: erroring on alignment==8 would
+    // reintroduce the false-failure class this registration exists to remove. Note the consequence,
+    // because the ordering matters — every value below alignof(max_align_t) is raised FIRST, so
+    // 3, 5, 6, 7 and 9..15 are silently normalised to 16 and SUCCEED. Only a non-power-of-two at or
+    // above 16 is rejected. This matches guest_windows_alloc's existing behaviour.
     if (alignment < alignof(std::max_align_t)) alignment = alignof(std::max_align_t);
     if (alignment & (alignment - 1)) { errno = EINVAL; return nullptr; }
 #ifdef _WIN32
@@ -227,7 +232,10 @@ static void* guest_reallocalign_portable(void* p, size_t size, size_t alignment)
     if (!p) return aligned_alloc_portable(alignment, size);
     if (!size) { free(p); return nullptr; }
     void* replacement = aligned_alloc_portable(alignment, size);
-    if (!replacement) return nullptr;                     // errno set by the allocator; old block kept
+    // Old block kept, per realloc's contract. NOTE: errno is NOT set here — aligned_alloc_portable
+    // wraps posix_memalign, which by spec returns its error code rather than setting errno, and the
+    // wrapper discards it. A caller reading errno after a null return sees a stale value.
+    if (!replacement) return nullptr;
     // The old request size is not recoverable here, so copy what is provably READABLE in the old
     // block, capped by the new one. malloc_usable_size is always >= the original request, so this
     // never copies less than the payload; capping at `size` is what keeps it in bounds when the
@@ -301,7 +309,24 @@ HLE(h_malloc)  { return (uint64_t)(uintptr_t)guest_malloc_portable(a0); }
 HLE(h_calloc)  { return (uint64_t)(uintptr_t)guest_calloc_portable(a0, a1); }
 HLE(h_realloc) { return (uint64_t)(uintptr_t)guest_realloc_portable(P(a0), a1); }
 HLE(h_free)    { guest_free_portable(P(a0)); return 0; }
-// reallocalign(ptr, size, alignment) — argument order follows the firmware's own signature.
+// reallocalign(ptr, size, alignment).
+//
+// CONFIDENCE: MED on the ARGUMENT ORDER, and deliberately not raised. The 3.20 library dump gives
+// NID<->name pairs and nothing else — it has no signatures, so it cannot establish an order and must
+// not be cited as though it does. The basis is the mspace sibling Sony documents,
+// `sceLibcMspaceReallocalign(msp, ptr, size, boundary)`: drop the mspace handle and (ptr, size,
+// alignment) is what remains. That is an inference from a related contract, not direct evidence.
+//
+// Nothing here can falsify it: test_reallocalign encodes the same order on both sides of the call,
+// so every arm passes whether this is right or reversed. Settling it needs a guest that imports
+// OGybVuPAhAY, traced at the call — #2185 records that none is known.
+//
+// The direction of the risk, stated because it argues against this registration rather than for it:
+// if the order IS reversed, we would read a size as an alignment and an alignment as a size, and a
+// caller asking for a large block with a power-of-two alignment would get a SMALL block back for a
+// large request — a guest heap overflow, where the unregistered status quo was a clean NULL. That is
+// worse than not registering. It is accepted here only because the mspace contract is a real basis
+// and the false-OOM it removes is a live defect; revisit the moment a title exercises this.
 HLE(h_reallocalign) { return (uint64_t)(uintptr_t)guest_reallocalign_portable(P(a0), a1, a2); }
 // memalign(alignment, size): aligned allocation. Normalize alignment to a valid
 // power-of-two >= sizeof(void*) for posix_memalign.
