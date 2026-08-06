@@ -573,6 +573,61 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   Cyber Space intro, Sonic Team logo and middleware credits from the same run are exact 4K frames. Do
   not look for a lost render target, a mis-selected pass or a dropped publish for this symptom: the
   remaining blocker is upstream guest progression. #1968 / #2023.
+- **A title's "non-draw" scanout writer is findable, and on Sonic Frontiers it is one compute
+  dispatch — so prosper is the writer, and there is no identity or aliasing failure to look for.**
+  The rows above establish that no pass ever targets the flipped buffer and that the frame is in
+  guest memory anyway; neither says *what puts it there*, and "a path that is not a draw" was as far
+  as it went. `PROSPER_PROVENANCE_ADDR=<scanout>:<span>` answers it exactly. Over a full boot the
+  only writer of either registered VideoOut buffer (`0x200a160000` / `0x200c140000`) is
+  `compute-buffer … identity=0x20002fe800 size=33423360` — the storage-image writeback of **one**
+  compute program, alternating between the two buffers, packing and tiling its result back into
+  guest memory across the padded SW_64KB_R_X footprint. **Zero** `color` (draw) and **zero**
+  `dma-data` events touch either address. So the guest composites with a compute dispatch, prosper
+  executes it, prosper writes it back, and prosper publishes it. Reach for `PROSPER_PROVENANCE_ADDR`
+  first on any title whose scanout no pass targets — it names the writer kind, the program's code
+  address and the submit, which no pass census can. #1968.
+- **Post-intro Frontiers runs a complete post-processing chain over an empty scene — the missing
+  thing is geometry, not a composite step.** A capture of the submit containing that composite
+  dispatch (selected with `PROSPER_GPU_CAPTURE_COMPUTE_ADDR=0x20002fe800`, 240 s into a default
+  launch) holds 15 draws and 2 dispatches, and **every draw is a `vcount=3 indices=0` fullscreen
+  triangle**: bloom into a 1920x1080 `R11G11B10F`, a 9-tap bloom composite into a 3840x2160
+  `RGBA16F`, a 960x540 -> 64x64 -> 16x16 -> 4x4 -> 2x1 luminance reduction, a tonemap into a
+  3840x2160 `RGBA8`, then the dispatch into the scanout. All 17 operations are `realized=yes`,
+  `failed=0`. There is no scene pass, no indexed draw and no depth geometry anywhere in it. #1968.
+- **Every renderer-owned target really is black in that phase, on the default path, measured.** A
+  `PROSPER_DUMP_PERSISTENT` census (not in the `live_gpu_targets` disable list, and taken with no
+  capture armed) enumerates **17** persistent colour targets over three consecutive black-phase
+  submits. Exactly one has content — `0x2059ea0000`, the CPU-materialised movie composite, still
+  holding the last credits frame at `rgb_nonblack=778215/8294400`, which is *stale* and not an input
+  to the post chain. Every 4K `RGBA16F` target reads `00 00 00 00 00 00 00 3c` per texel (RGB
+  bit-zero, alpha exactly 1.0) and every 4K `RGBA8` target reads `00 00 00 ff` (opaque black); the
+  bloom target and three others are entirely zero. Nothing is lost between any target and the
+  scanout because there is nothing anywhere to lose. Corroborated by a full `PROSPER_DBG=1` run:
+  **0** recompile-rejects of any kind and **0** `[compute] skip`, the only skipped dispatch in the
+  whole boot being #657's `64x64x6` layered image, twice, at boot. #1968 / #2023.
+- **`nz=0` on a `gpu_replay --inspect-only` resource marked `temporal-RTT-seed` is NOT evidence that
+  the target is empty.** That count is over the resource's *guest-memory* bytes, and a
+  renderer-owned target is legitimately all-zero there on the persistent-GPU-target path — prosper
+  renders into a Vulkan image, not into guest memory. The content is on the `rtt-seed` line for the
+  same address, and the two disagree: Frontiers' 4K `RGBA16F` post-chain buffer reports `nz=0` on
+  the `PS TEX` line while its seed hashes to `6c4969fdca4e4383`, which is **not** the all-zero hash
+  for 66,355,200 bytes — the persistent census then showed it is opaque black with alpha 1.0, a
+  different finding from empty. Read the seed, not the `nz`. A cheap decoder for the hashes: they
+  are FNV-1a 64, so the hash of *N* zero bytes (or of any repeating texel pattern) can be computed
+  offline and compared. Same family as the `px_nonblack` inversion. #1968.
+- **The census ordinal `PROSPER_DUMP_PERSISTENT` / `PROSPER_PASS_LOG` take is NOT the submit number
+  `[gpucap]` prints.** On one 360 s Frontiers route the renderer-callback ordinal reaches **6,560**
+  while the capture's submit counter reaches **26,209** — a 4x gap, in the direction that makes an
+  ordinal estimated from a capture overshoot. Overshooting produces **no census at all**, and that
+  silence is indistinguishable from "the census ran and every target was empty". Aim these windows
+  with the `ms:<millis>` form instead (`diagnostic_window.hpp`), which is the same origin
+  `PROSPER_GPU_CAPTURE_AFTER_MS` uses, so a capture and a census can be aimed at one moment. #1968.
+- **Arming `PROSPER_GPU_CAPTURE` takes the run off the default rendering path.** It is in the
+  `live_gpu_targets` disable list (`live_renderer.cpp`), alongside `PROSPER_DUMP_RTGROUPS` and the
+  rest, so every env-triggered capture run is the CPU-readback path. The guest's own command stream
+  and its resources are unaffected — which is why a capture is still the right instrument for "what
+  did the guest submit" — but do not compare a capture run's *renderer* behaviour, target residency
+  or publish provenance against a default run. #1968.
 
 ## Recommended implementation order
 

@@ -28,6 +28,7 @@
 #include "present_extent.hpp"           // the publish extent contract with the caller (#1986)
 #include "avplayer_plane_policy.hpp"    // which sampled resource is AvPlayer's NV12 chroma plane
 #include "guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
+#include "diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
 #include "gpu/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/guest_write_watch.hpp"
 #include "render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
@@ -479,6 +480,16 @@ void log_avp_chroma_candidate(const prosper::gpu::ShaderResource& r,
     fflush(stderr);
 }
 
+// Milliseconds since the first ARMED census check of this run — the origin for the `ms:` form of
+// PROSPER_PASS_LOG / PROSPER_DUMP_PERSISTENT (diagnostic_window.hpp). Lazily started, so an
+// unarmed run never reads the clock and the origin is the same first-callback moment
+// PROSPER_GPU_CAPTURE_AFTER_MS uses, letting a capture and a census be aimed at one instant.
+static uint64_t diagnostic_elapsed_ms() {
+    static const auto start = std::chrono::steady_clock::now();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count());
+}
+
 struct DecodedTexture {
     const uint8_t* pixels = nullptr;
     uint32_t output_height = 0;
@@ -654,6 +665,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     static RttCache g_rtt;   // render-to-texture cache (#167)
     // Shared final-callback ordinal for PROSPER_PASS_LOG (increments where dp_submit does).
     static std::atomic<uint64_t> g_pass_log_submit{0};
+    // The census windows those two switches open. Parsed once here rather than per callback so the
+    // `ms:` form's latch is one object: PROSPER_PASS_LOG is consulted from two places about the SAME
+    // ordinal, and a per-site window would latch them onto different callbacks. Same single-present-
+    // thread contract as `g_rtt` and the `dp_submit`/`warned` statics below.
+    static prosper::frontend::DiagnosticWindow g_pass_log_window{
+        prosper::frontend::parse_diagnostic_window(getenv("PROSPER_PASS_LOG"))};
+    static prosper::frontend::DiagnosticWindow g_persist_window{
+        prosper::frontend::parse_diagnostic_window(getenv("PROSPER_DUMP_PERSISTENT"))};
     // Match boot_trace's progression-diagnostic contract: callers may register the graphics
     // renderer while deliberately leaving compute unregistered. This keeps semantic dispatches
     // visible without letting screenshot/prosper-app registration silently undo the A/B.
@@ -5802,11 +5821,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (!converted.empty())
                             px_last = std::make_shared<const std::vector<uint8_t>>(std::move(converted));
                     }
-                    // PROSPER_PASS_LOG=<min-submit>: per-pass publish provenance for 3 submits —
-                    // which pass produced pixels, its target identity, and the defer decision.
-                    if (const char* pl = getenv("PROSPER_PASS_LOG")) {
+                    // PROSPER_PASS_LOG=<min-submit>|ms:<millis>: per-pass publish provenance for 3
+                    // submits — which pass produced pixels, its target identity, and the defer
+                    // decision. The `ms:` form aims the window by wall time (diagnostic_window.hpp).
+                    if (getenv("PROSPER_PASS_LOG")) {
                         const uint64_t at = g_pass_log_submit.load(std::memory_order_relaxed);
-                        const uint64_t pl_min = std::strtoull(pl, nullptr, 0);
+                        const bool in_window =
+                            g_pass_log_window.contains(at, diagnostic_elapsed_ms());
                         // px_nonblack must be counted in the PASS's OWN format. The original loop
                         // stepped 4 bytes and tested bytes `p`, `p+1`, `p+2` — never `p+3` — as if
                         // every target were 8-bit RGBA. Over an 8-byte FP16 texel that reads
@@ -5841,8 +5862,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // last case has to stay visible out of window: it is the one where this line
                         // cannot say whether the pass carries content, which is exactly when the
                         // reader needs to know the pass existed.
-                        if ((at >= pl_min && at < pl_min + 3u) || nz > 100 || nz < 0 ||
-                            defer_readback)
+                        if (in_window || nz > 100 || nz < 0 || defer_readback)
                             fprintf(stderr,
                                     "[pass] cb=%llu pass=%zu/%zu base=0x%llx %ux%u fmt=%d vo=%d "
                                     "seed=%d defer=%d writes=%llu px_nonblack=%lld\n",
@@ -5896,23 +5916,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 }
                 {
                     const uint64_t at = g_pass_log_submit.fetch_add(1);
-                    if (const char* pl = getenv("PROSPER_PASS_LOG")) {
-                        const uint64_t pl_min = std::strtoull(pl, nullptr, 0);
-                        if (at >= pl_min && at < pl_min + 3u)
+                    if (getenv("PROSPER_PASS_LOG")) {
+                        // The same window object and the same ordinal the per-pass report used, so
+                        // the two lines always describe one set of callbacks.
+                        if (g_pass_log_window.contains(at, diagnostic_elapsed_ms()))
                             fprintf(stderr, "[pass] cb=%llu selected=%s\n", (unsigned long long)at,
                                     prosper::frontend::present_source_name(present_choice));
                     }
                 }
-                // PROSPER_DUMP_PERSISTENT=<min-submit>: read back and dump EVERY persistent color
-                // target after this submit's passes render. Unlike PROSPER_RTT*/DUMP_*, this flag is
-                // NOT in the live_gpu_targets disable list (:480-487), so it observes the NORMAL
-                // persistent-render path (all other CPU-pixel diagnostics change that path -> #1103).
-                // readback_persistent_color_target restores the image layout, so rendering is unaffected.
-                if (const char* dp = getenv("PROSPER_DUMP_PERSISTENT")) {
+                // PROSPER_DUMP_PERSISTENT=<min-submit>|ms:<millis>: read back and dump EVERY
+                // persistent color target after this submit's passes render. Unlike
+                // PROSPER_RTT*/DUMP_*, this flag is NOT in the live_gpu_targets disable list
+                // (:480-487), so it observes the NORMAL persistent-render path (all other CPU-pixel
+                // diagnostics change that path -> #1103). readback_persistent_color_target restores
+                // the image layout, so rendering is unaffected. The `ms:` form aims the window by
+                // wall time, because the ordinal below is a renderer-internal counter with no
+                // published rate and the states worth censusing are named in seconds
+                // (diagnostic_window.hpp).
+                if (getenv("PROSPER_DUMP_PERSISTENT")) {
                     static std::atomic<uint64_t> dp_submit{0};
                     const uint64_t sub = dp_submit.fetch_add(1);
-                    const uint64_t dp_min = std::strtoull(dp, nullptr, 0);
-                    if (sub >= dp_min && sub < dp_min + 3u) {
+                    if (g_persist_window.contains(sub, diagnostic_elapsed_ms())) {
                         const char* dd = getenv("PROSPER_FRAME_DIR");
                         fprintf(stderr, "[persist] submit=%llu present: front=%d/%d front_va=0x%llx "
                                 "selected=%s vo:", (unsigned long long)sub, vo_front, vo_n,

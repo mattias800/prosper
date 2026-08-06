@@ -536,6 +536,12 @@ if(TARGET prosper_core)
   target_include_directories(test_guest_scanout_present PRIVATE frontends/shared)
   add_test(NAME guest_scanout_present COMMAND test_guest_scanout_present)
 
+  # The census window PROSPER_PASS_LOG / PROSPER_DUMP_PERSISTENT open: an ordinal (unchanged) or
+  # `ms:<millis>` (#1968). Pure predicate — no renderer, no device, and the clock is an argument.
+  add_executable(test_diagnostic_window frontends/shared/test_diagnostic_window.cpp)
+  target_include_directories(test_diagnostic_window PRIVATE frontends/shared)
+  add_test(NAME diagnostic_window COMMAND test_diagnostic_window)
+
   # boot_trace periodic BMPs are opt-in, with the legacy disable taking priority. This exercises the
   # exact environment-name lookup and registrar forwarding without constructing Vulkan or writing files.
   add_executable(test_frame_dump_policy frontends/shared/test_frame_dump_policy.cpp)
