@@ -2222,16 +2222,24 @@ namespace {
             // Zero has three causes and only one of them is a defect:
             //   (1) the thread really did run guest code on the host glibc TCB — the #1155 class,
             //       and the only reading worth alarming about;
-            //   (2) guest %fs is not enabled for this process at all. That is the DEFAULT —
-            //       `g_enabled = getenv("PROSPER_GUEST_FS") != nullptr` (guest_tls.cpp:46), opt-in,
-            //       and neither a plain prosper-app run nor most of tools/dbg/*.sh sets it — so
-            //       every thread reads zero and none of them leaked anything;
+            //   (2) guest %fs is not enabled for this process. On Linux/Windows it is enabled by
+            //       DEFAULT — `g_enabled = getenv("PROSPER_NO_GUEST_FS") == nullptr`
+            //       (guest_tls.cpp:58), an opt-OUT kept for compatibility bisection — so this arm
+            //       means either that opt-out is set, or the fault landed before
+            //       guest_tls_set_templates() ran (boot_program.cpp:252) and g_configured is still
+            //       false. Both are RARE on an ordinary boot, so do NOT reach for this cause first.
+            //       (guest_tls.cpp:46's PROSPER_GUEST_FS opt-IN is the macOS/Rosetta arm only, and
+            //       this whole three-state line is compiled out there — see the Darwin note below.)
             //   (3) the faulting thread is one of prosper's OWN host threads, which never had a
             //       guest TCB to leak off. This report is reached by any non-armed thread, host or
             //       guest, so that is not a rare case.
             // `guest_tls_enabled()` (guest_tls.cpp:79) separates (2) from (1)/(3) as fact; nothing
             // available in a signal handler separates (1) from (3), so the line says so rather than
             // asserting a leak. It is two static bool loads: no allocation, no lock, handler-safe.
+            // Practical consequence on Linux, which is where these reports are read: because guest
+            // %fs is on by default, `n/a` is the rare arm and a zero here is almost always (1) or
+            // (3) — the two the handler cannot tell apart. That is the honest state of knowledge,
+            // and it is why the string hedges instead of naming a leak.
             //
             // Darwin: `guest_fs_to_host_scoped()` returns 0 unconditionally there — the
             // `#ifdef __APPLE__` early-out inside the shared POSIX definition (guest_tls.cpp:162-164),
