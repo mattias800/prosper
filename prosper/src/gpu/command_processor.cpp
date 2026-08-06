@@ -614,8 +614,25 @@ static inline bool heap_ptr_like(uint64_t v) {
     return v >= 0x1000000000ull && v < 0xa000000000ull;
 }
 static bool ptrlike_wide() {
-    static const bool v = [] { const char* e = getenv("PROSPER_PTRLIKE_WIDE");
-                               return e && strtol(e, nullptr, 0) != 0; }();   // default OFF
+    // Self-witnessing: an A/B lever that cannot show it moved turns a hard negative into a void
+    // result, because "the guard saw nothing" and "the guard was never widened" print identically.
+    // Announce the arm once, with the exact window, and announce a malformed value as NOT ARMED
+    // rather than silently falling back to the narrow default.
+    static const bool v = [] {
+        const char* e = getenv("PROSPER_PTRLIKE_WIDE");
+        if (!e) return false;
+        char* end = nullptr;
+        const long parsed = strtol(e, &end, 0);
+        if (end == e || (end && *end)) {
+            fprintf(stderr, "[agc] PTRLIKE-WIDE NOT ARMED: PROSPER_PTRLIKE_WIDE='%s' is not a number "
+                            "— guards keep the narrow window\n", e);
+            return false;
+        }
+        if (parsed == 0) return false;
+        fprintf(stderr, "[agc] PTRLIKE-WIDE ARMED: guard window [0x1000000000,0xa000000000) "
+                        "(narrow default was [0x1000000000,0x1200000000)+[0x2000000000,0x2100000000))\n");
+        return true;
+    }();
     return v;
 }
 static bool ptr_like(uint64_t v) {

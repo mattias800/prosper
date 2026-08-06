@@ -159,9 +159,18 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     measures the *predicate* instead of the title: ArcRunner's arena is `[0x2000000000,0xa000000000)`
     and its terminal fault dereferences `0x2100000001`, one byte above the narrow bound, so "how many
     forges are there" could not be asked at all. **A `wide_only=0` is now a real negative**; before
-    the split it was unobtainable. `PROSPER_PTRLIKE_WIDE=1` additionally arms the *guards* over the
-    wide window — default OFF on purpose, because `rel1_stomp_guard()` is default-ON and widening it
-    is an unmeasured suppression over 500 GiB of addresses on every title at once.
+    the split it was unobtainable. `PROSPER_PTRLIKE_WIDE=1` additionally arms **both** guards (the forge
+    branch and the `REL1-LIVE` branch) over the wide window — default OFF on purpose, because
+    `rel1_stomp_guard()` is default-ON and widening it is an unmeasured suppression over 500 GiB of
+    addresses on every title at once. It announces itself, since an A/B lever that cannot show it
+    moved turns a hard negative into a void result:
+    ```text
+    [agc] PTRLIKE-WIDE ARMED: guard window [0x1000000000,0xa000000000) (narrow default was …)
+    [agc] PTRLIKE-WIDE NOT ARMED: PROSPER_PTRLIKE_WIDE='yes' is not a number — guards keep the narrow window
+    ```
+    Pair it with a positive control before quoting a zero: `report_suspect_write()` emits nothing at
+    all on some titles (ArcRunner, nine runs), and an emitter that never fires cannot distinguish
+    "no such write happened" from "this diagnostic is not reachable here".
   - **Is an `addr=(nil)` fault the guest's, or ours?** **`PROSPER_LAZY_COMMIT_STRICT=1`** (#1944).
     prosper backs a guest touch of a reserved-but-uncommitted VA with 64 KiB of anonymous zeros and
     resumes. When the faulting access is a *read of a pointer field* the guest gets a zero and
