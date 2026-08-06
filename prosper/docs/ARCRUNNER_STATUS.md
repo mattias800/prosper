@@ -11,18 +11,18 @@ invalidated by its own incomplete census before the corrected run answered the n
 
 ## Current state
 
-The title boots through UE4 initialisation and its `.pak` load, installs the renderer, and submits
-real GPU work, but no game frame is ever composited. The earlier async-compute submit ABI failure is
-fixed. Between about 8 and 14 seconds the guest's `RenderThread 1` instead faults at one of two
-already-recorded sibling sites.
+The title boots through UE4 initialisation and its `.pak` load, installs the renderer, submits real
+GPU work, and **starts playing its intro movie** — then dies on the #1226 terminal fault after about
+19 presented frames, having delivered 43-54 *video* frames. That is 6-17 frames short of the first
+frame the movie is not black in, and about 100 frames short of full picture. The earlier
+async-compute submit ABI failure is fixed.
 
-**The terminal fault is not the rung-1 blocker, and the sibling fault's null register is
-prosper-manufactured.** Both corrections come from the rung-1 pass recorded below, and both invalidate
-the framing this document previously used to pick discriminators:
+**Read `## 2026-08-05: the black composite is the movie, and the movie is black there` before
+anything else in this document.** It supersedes the rung-1 framing below in two ways: the composite is
+not losing content, **and the terminal fault IS the rung-1 blocker after all.**
 
-- Every recorded terminal fault happens **after** dozens of frames have already been presented
-  (19 in one ordinary arm here, 53 in the retained combined arm). Fixing the fault yields more black
-  frames, not a first frame. Rung 1 is blocked by what the presented frames contain.
+**The sibling fault's null register is prosper-manufactured**, and that correction still stands:
+
 - The `addr=(nil)` sibling class is produced by prosper's own reserved-range lazy-commit handler
   zero-filling guest page `0x2100000000` under the guest's *load*, after which the guest dereferences
   that zero on the next instruction. This is [#1944](https://github.com/mattias800/prosper/issues/1944),
@@ -190,6 +190,11 @@ were opened, not just measured:
 | eleven `0x316*` targets | 1792x1080 | 100% black RGB |
 | `0x9fc0000000`, `0x9fc2000000` | 3840x2160 | **0 of 8,294,400 non-black pixels** |
 
+**Superseded — see § 2026-08-05.** This table was taken under `PROSPER_DUMP_RTGROUPS`, i.e. on the
+CPU-readback path, and the 4K *scene-colour* target it does not list measures entirely zero on the
+default live-target path. The 1920x1080 targets below are a different surface from that scene target,
+so the two readings do not contradict each other.
+
 So real geometry does reach `0x315f4f0000`; the two bloom pyramids and the 1792x1080 series are entirely
 zero; the 1x1 auto-exposure targets hold magenta; and the final composite executes with `cwm=7` and
 writes RGB zero. The presented-frame counter agrees exactly — frames go from `nz=0` to alpha-only
@@ -199,12 +204,137 @@ The instrument is positively controlled from **inside the same run**: the same r
 zero for the scanout reports a 722-colour 32x32 image and a structured 512x512 atlas, so "black" is a
 measurement of the target, not of a broken dump path.
 
+**Superseded — see § 2026-08-05.** The bloom pyramids are zero because the scene is black, and the
+1792x1080 series is the movie surface explained there. What follows is retained as the historical
+reasoning only.
+
 **The narrowest remaining rung-1 question** is the step between the scene-colour target that has content
 (`0x315f4f0000`) and the post-process input that does not (`0x3160700000`, the root of both fully-zero
 bloom pyramids), together with the magenta 1x1 auto-exposure value. A garbage average-luminance value is
 exactly the shape that makes a UE4 tonemapper map a live scene to black, which is the failure mode the
 charter warns about for skipped exposure work — except that here nothing is skipped, so the value itself
 is wrong rather than missing.
+
+## 2026-08-05: the black composite is the movie, and the movie is black there
+
+This section **supersedes the rung-1 framing above**. The three findings below were taken on
+`c3614f51` with `boot_trace`, ordinary and unsuppressed
+(`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), three runs, exact zero pre/post process
+censuses, no suppression, skip, or shim. See [#2011](https://github.com/mattias800/prosper/issues/2011).
+
+**1. ArcRunner plays its intro movie, and prosper's AvPlayer path works.** With `PROSPER_AVPLOG=1`
+and `PROSPER_AVP_LOG=1`:
+
+```text
+[avp] add source handle=0x1 guest='file://../../../arcrunner/Content/Movies/ArcRunner_Intro_A_1080p_PS5_30fps.mp4'
+      host='<DUMP_ROOT>/PPSA21406-app0/arcrunner/content/movies/arcrunner_intro_a_1080p_ps5_30fps.mp4'
+      mode=native auto_start=0 duration=63466ms
+[avp] guest texture buffers requested=6 allocated=6 align=256 bytes=3317760
+[avp-vaapi] software (libavcodec) decode selected for '...' (yuv420p -> NV12)
+[avp] video-ex handle=0x1 result=1 data=0x... stop=0          (x43-54 per run)
+```
+
+The `file://` URL resolves, the case-corrected host path opens, VA-API declines the profile and the
+real libavcodec software fallback takes over (#320's default), and `GetVideoDataEx` returns a rotating
+6-buffer ring. The earlier "intro-movie decode" line of #1226 is **closed by observation**.
+
+**2. The staged frames are correct, and they are legitimately black.** `PROSPER_DUMP_RAWTEX=1` dumps
+the raw guest bytes of every sampled texture. The movie's luma and chroma planes read:
+
+| plane | extent | bytes | content |
+| --- | --- | --- | --- |
+| luma | 2048x1080 | 2,211,840 | every valid byte `0x10`; 2,073,600 of 2,211,840 non-zero |
+| chroma | 1024x540 | — | every valid byte `0x80` |
+
+`Y=0x10, U=V=0x80` is BT.601 limited-range **black**, and the non-zero count is exactly
+`1920 x 1080` — every valid pixel, with the 128-column pitch padding reading zero. So the staging is
+byte-correct.
+
+> **Do not re-measure this and read a difference as a regression.** These counts were taken on
+> `c3614f51`, when the pitch padding was `memset` to `0`. #2032 changed the padding fill to
+> limited-range black (`Y=0x10`, `U=V=0x80`) — because `Y=0, U=V=0` is not black but mid green
+> (~`(0, 136, 0)`), which with the coded-extent `width` would have shown as a green right-edge
+> stripe. On current master the same dump therefore reads **2,211,840 of 2,211,840** luma bytes
+> non-zero, and the padding is no longer distinguishable from the picture's own black. That is the
+> intended change, not a defect. The finding this table supports — the staged frame is legitimately
+> black — is unaffected either way.
+
+The independent control is the file itself. Decoded on the host with `ffmpeg` (nothing of prosper's in
+the path), `arcrunner_intro_a_1080p_ps5_30fps.mp4` has mean luma **0.0 with max 0** at t=0 s and
+t=1 s, first content at t=2 s (mean 9.1), and full picture by t=5 s (mean 77.5). **The movie's own
+opening two seconds are pure black.**
+
+**3. Every run stops short of the first picture, and it stops on the #1226 terminal fault.** Four runs
+delivered 43, 47, 53 and 54 *video* frames and, separately, exactly **19 presented frames** each. At
+30 fps those are 1.43-1.80 s of movie, against t=2 s (frame 60) where picture begins — so **6 to 17
+frames short**.
+
+**Every one of the four faulted.** The census is `WORKER-THREAD FAULT` occurrences per run: 2, 1, 1, 1
+(one run took both the `0x30016000` pop and an `addr=(nil)` sibling). An earlier draft of this section
+claimed one run "reached its 120 s timeout without faulting", and that was **wrong** — `rc=124` was the
+timeout killing a process that had *already* faulted and wedged, and the fault report is in its log.
+There is no evidence here of a stall independent of the fault; do not build on one.
+
+Two numbers matter and they are different. The **first** non-black frame is at t=2 s, and its mean
+luma is only 9.1 — barely above black. **Full picture** is t=5 s (mean luma 77.5), which is frame
+150, i.e. **96-107 frames** beyond where these runs stop. Rung 1 needs a real visible frame, so quote
+the second number when asking how far away rung 1 is; the first only says how close the *onset* is.
+
+**This reverses the standing conclusion that the terminal fault is not the rung-1 blocker.** That
+conclusion (recorded in `## Ruled out`) reasoned: frames are already being presented before the fault,
+and they are all black, so the fault cannot be what prevents a first frame. The missing premise was
+*why* they are black. Now that the movie is known to be black until video frame 60, the runs' 43-54
+delivered frames land **before** the picture starts, and the fault is exactly what stops them getting
+there. Fixing #1226 does not yield "more black frames" — past frame 60 it yields picture.
+
+**Therefore the black scanout is the correct rendering of a black movie frame, and rung 1 is blocked
+by the #1226 terminal fault killing the run before the movie reaches picture — not by the renderer.**
+
+## The movie surface extent, measured before and after the `AvPlayerVideoEx` fix
+
+This is the measurement the "Next discriminators" list used to ask the next agent to perform. **It is
+done** — the numbers are here so nobody re-runs it (#2032).
+
+The guest sizes its movie luma T# from the published **pitch** (`2048x1080`, chroma `1024x540` —
+exactly half) and then renders the converted frame into a target sized by `width - crop_left -
+crop_right`. Under the pre-fix contract that published the visible 1920 alongside
+`crop_right_offset=128`, that expression double-counted the padding and yielded **1792**.
+
+Ordinary unsuppressed `boot_trace`
+(`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_COLORSTATETRACE=all`), exact zero
+pre/post process censuses, no suppression, skip or shim. Movie surfaces counted by their
+`raw-format=10 resolved-format=50` signature:
+
+| arm | `1792x1080` movie surfaces | `1920x1080` movie surfaces |
+| --- | --- | --- |
+| before (`width` = visible 1920) | 17 distinct | **0** |
+| after (`width` = coded 2048) | **0** | 9 distinct |
+
+The two arms ran for different lengths, so the raw counts are not comparable to each other; the
+discriminating fact is the **category flip**, which is absolute in both directions. The before arm
+found zero `1920x1080` surfaces of that signature *despite other 1920x1080 targets existing in the
+run*, so the signature does isolate the movie surfaces. **ArcRunner therefore uses the `width`-based
+spelling**, and the coded-extent contract is the right reading.
+
+**No visible change follows from this on ArcRunner**, and that is expected: the movie is black in the
+window the guest reaches (above), so the surfaces are now the right size and still black. The value of
+the fix here is that it removes a real 128-column loss that would otherwise appear the moment #1226 is
+fixed and the movie reaches picture.
+
+**Cross-title control — the same change moves nothing on R-Type Delta** (`PPSA26414`), the other live
+`Ex` consumer, whose 1920-wide movie also discriminates because 1920 is not 256-aligned. Measured with
+`PROSPER_AVPCHROMA_LOG=1` on the deterministic `tools/dropcache.py` route, before and after the
+one-line `width` change and nothing else:
+
+| arm | luma T# | chroma T# | chroma verdict |
+| --- | --- | --- | --- |
+| before (`width` = visible 1920) | `2048x1080` | `1024x540` | `CHROMA matched-registered-pitch` |
+| after (`width` = coded 2048) | `2048x1080` | `1024x540` | `CHROMA matched-registered-pitch` |
+
+Identical, down to the guest allocation addresses. R-Type derives **both** plane descriptors from
+`pitch`, never from `width`, so the concern that a chroma plane sized `width/2` would move 960 → 1024
+and flip the resource layer's narrow-texture path selection is **falsified**: the chroma extent is
+1024 in both arms and was never 960. #2005's investigation is not disturbed by this commit.
 
 ## Reproduction
 
@@ -303,24 +433,28 @@ Do not re-derive these without contradictory new evidence.
 | A resource completed by the mapped normal construction path can have `+0x68`, `+0x78`, or `+0x88` populated while its `+0x98` side-command descriptor was never created | `eboot+0x1186a40`, reached by all ten mapped resource-creation calls, uses the same populated-field condition as the allocation-page appender, allocates the 16-byte side-command descriptor, fills `{target, dword count}`, and stores it at `+0x98` before the wrapper is published. The common teardown at `eboot+0x1187300` is a confirmed later writer of null. This rules out omission by that normal completed path; it does not rule out an unlocated foreign/incomplete constructor, teardown-after-retention, or stale/reused memory. | #1226 |
 | The `eboot+0x117811f` sibling fault is a **guest resource-lifetime bug** — a retained command item whose `+0x98` side-command descriptor was freed by teardown, or was never constructed, or belongs to reused memory. This framing drove the vptr-classification discriminator, the `PROSPER_HWBP_R14=0` probe, and the whole producer/teardown static map | The null `r14` is **prosper's own zero**. `[lazy-commit] mapped page=0x2100000000 rip=eboot+0x1178064` fires exactly once in the retained combined arm, at exactly the documented `mov r14,[rax+0x98]`, and the `addr=(nil)` fault at `eboot+0x117811f` is the next instruction. An independent ordinary run here reproduced the pattern at a **different** guest site: `[lazy-commit] ... rip=eboot+0x117e221` followed by `sig=11 addr=(nil) rip=eboot+0x117e225` — **+4 bytes**. A third ordinary run had **no** lazy-commit line and **no** null-pointer fault, terminating on the allocator chain instead. So: lazy-commit present → null deref within a few bytes (2/2); absent → no null deref (1/1). The reserved-range handler `mmap`s 64 KiB of anonymous zeros with `MAP_FIXED` and resumes, so a load of a pointer field returns 0. Both guest sites first-touch the **same** page `0x2100000000`, a round 4 GiB above the arena base — a wild pointer would not repeat that. Do not resume vptr classification, teardown-after-retention, or `r14`-gated probing of this site: they classify a value prosper wrote. The static producer/teardown map remains correct as disassembly; it is simply not what this fault is about. | #1944, #1226 |
 | The two retained non-alpha-only frames (solid yellow, solid white) are **guest clears**, and therefore evidence that the guest reaches a clear-only phase | They are `ELIMINATE_FAST_CLEAR` artifacts. Across two independent runs — the retained combined-suppression arm and an ordinary unsuppressed run here — **every** coloured frame is presented immediately after a `CB_COLOR_CONTROL.MODE=2` draw, and **no** coloured frame occurs without one (3 for 3; the combined arm's MODE=2 count reached exactly 2 for its 2 coloured frames, the ordinary run's count reached 1 for its 1). prosper runs MODE=2 as an ordinary colour draw, which blankets the target with the fast-clear colour. Do not read either frame as a phase marker or as progress. | #1588, #1226 |
-| The rung-1 blocker is the terminal render-thread fault, so bring-up should continue by attributing that fault | Every recorded terminal fault occurs **after** dozens of presented frames — 19 in an ordinary arm here, 53 in the retained combined arm — and all of those frames carry RGB 0. The fault cannot be what prevents a first frame. Separately, prosper realizes **456 of 468** submitted draws with **zero** recompile-reject/compute-skip/unsupported-format lines, so the black output is not a dropped-draw problem either. | #1226 |
+| ~~The rung-1 blocker is the terminal render-thread fault, so bring-up should continue by attributing that fault~~ — **THIS ROW IS WITHDRAWN (#2011). The fault IS the rung-1 blocker.** | The original entry read: "Every recorded terminal fault occurs **after** dozens of presented frames — 19 in an ordinary arm here, 53 in the retained combined arm — and all of those frames carry RGB 0. The fault cannot be what prevents a first frame." The inference had a hole: it never asked **why** those frames are black. They are black because ArcRunner's intro movie is black until video frame 60 (independently measured on the file with `ffmpeg`, and prosper stages it byte-correctly), and every run is killed by the fault at 43-54 delivered video frames — i.e. **before** the picture starts. Fixing #1226 does not yield "more black frames"; past frame 60 it yields picture. The row's *second* sentence stands unchanged and was always separate: prosper realizes 456 of 468 submitted draws with zero recompile-reject/compute-skip/unsupported-format lines, so the black output is not a dropped-draw problem. | #2011, #1226 |
+| The black composite needs a rendering explanation at all, in the window the guest currently reaches | **Not falsified — made unnecessary and untestable here, which is a weaker statement and the honest one.** Every input to the composite is legitimately black in this window, so a rendering defect, if one existed, would be invisible rather than absent. ArcRunner plays `arcrunner_intro_a_1080p_ps5_30fps.mp4`; prosper opens it, decodes it in the real libavcodec software fallback, and stages byte-correct BT.601 black (`Y=0x10`, `U=V=0x80`, exactly `1920x1080` non-zero bytes with the pitch padding cleared, measured with `PROSPER_DUMP_RAWTEX`). The **independent** control is the file: decoded on the host with `ffmpeg`, the mp4 has mean luma 0.0 / max 0 at t=0 s and t=1 s and no picture until t=2 s. Three runs delivered 43/53/54 video frames, so every run stops before the movie's first picture. **Re-open this question once the guest reaches a frame the movie is not black in** — do not read this row as "rendering is fine". | #2011 |
+| The narrow claim that content is **lost between the scene-colour target and the scanout** | Falsified on the **default live-target path**: the 4K scene-colour target `0x312aee0000` measures `rgb_nonblack=0/8294400` **and** `raw_nonzero_bytes=0/66355200` under `PROSPER_DUMP_PERSISTENT`, so nothing is present there to lose. Zero `[agc] PUBLISH DROPPED`, zero recompile-rejects and zero compute-skips across four runs, so the composite is neither dropped nor degraded. | #2011 |
+| The fully-zero bloom pyramids and the "step that loses the scene colour between `0x315f4f0000` and `0x3160700000`" are a defect worth a capture bundle (the previous discriminator 1) | A black scene thresholds to zero bloom; that is UE4 behaving correctly, not content being dropped. The 4K scene-colour target measures `raw_nonzero_bytes=0/66355200` on the **default live-target path** (`PROSPER_DUMP_PERSISTENT`), which is what an empty scene behind a black movie frame looks like. Do not spend a bundle on this until the guest reaches a frame the movie is not black in. | #2011 |
+| The magenta 1x1 auto-exposure targets (the previous discriminator 2) are garbage feeding a tonemapper (`(255,92,255)`) | Not a defect worth chasing: those targets are `1x1 VK_FORMAT_R32G32B32A32_SFLOAT` (`resolved-format=109`), and a 16-byte float texel converted for display is not readable as an exposure value. With the scene legitimately black there is nothing for the tonemapper to lose. | #2011 |
+| The per-target readback table in this document describes prosper's **default** rendering path | It does not. It was taken with `PROSPER_DUMP_RTGROUPS`, and `frontends/shared/live_renderer.cpp:1008-1015` lists that variable (with `_RGBA`, `PROSPER_DUMP_DRAWSTEPS`, `PROSPER_DUMP_SAMPLED_RTT`, `PROSPER_RTTLOG`, `PROSPER_RESOURCE_HASH_DIM`, `PROSPER_TARGET_STEP_HASH_DIM`, `PROSPER_GPU_REPLAY_*`) in the `live_gpu_targets` **disable** list — so the whole table describes the CPU-readback path. `PROSPER_DUMP_PERSISTENT` is the census that does observe the normal persistent-GPU-target path, and it agrees on the black scanout. Re-take any localisation on that variable before building on it. | #2011 |
 | The first three current-master ordinary diagnostic arms prove the sibling absent or identify its producer | The first title run exited through an unrelated `AudioMixerRende` null jump. The second lost to the usual allocator chain at `eboot+0x127e8eb`, with the guest reporting `Attempt to realloc an unrecognized block 2000000001`. The third used the address-filtered hardware probe, which armed on primary and worker guest boundaries, but lost to the allocator predecessor at `eboot+0x127e751` before recording any target hit. None reached `eboot+0x117811f`; the first two stack peeks sampled unrelated frames and the third correctly emitted no probe. All three arms are **void/non-discriminating**, not negative reproductions. A nearby D-queue unsatisfied wait is retained as co-occurring history only; it does not attribute any competing failure. | #1226 |
 
 ## Next discriminators
 
 Ordered for **rung 1** (any real graphics), which the terminal faults do not block.
 
-1. **Find the step that loses the scene colour.** Content exists in `0x315f4f0000` (1920x1080, real
-   geometry) and is absent from `0x3160700000`, the root of both fully-zero bloom pyramids. Take one F9 /
-   `PROSPER_CAPTURE_BUNDLE_AT_PRESENT` bundle in this window and dissect it offline with
-   `gpu_replay --inspect-only` / `--draw-steps` / `--dump-resource`, so the pass that reads
-   `0x315f4f0000` and writes `0x3160700000` can be checked draw-by-draw without another boot. Confirm
-   whether that pass samples the target it should, and at the extent and format it should.
-2. **Explain the magenta 1x1 auto-exposure targets** (`0x3153380000`, `0x3163390000`, `0x31633b0000`
-   reading `(255,92,255)`). If UE4's average-luminance value is garbage, the tonemapper maps a live scene
-   to black, which matches the observed composite writing RGB 0 with `cwm=7`. Identify the pass that
-   writes these 1x1 targets and what it samples. Nothing is being skipped here, so this is a wrong value
-   rather than a missing dispatch.
+1. **Fix #1226's terminal fault — that is now the whole of rung 1.** The movie needs 60 delivered
+   video frames for its first (barely) non-black frame and 150 for full picture; every run is killed
+   by the fault at 43-54. Nothing else stands between this title and real visible graphics, and the
+   ownership question in #1945 is the live part of it. Note this **reverses** the standing guidance
+   that redirected the lane away from the fault — see the withdrawn `## Ruled out` row.
+2. ~~Re-check the movie surface extent after the `AvPlayerVideoEx` crop fix.~~ **CONFIRMED on `b97d0bb3`
+   — do not re-run this.** The measurement and its numbers are in
+   § *The movie surface extent, measured before and after the `AvPlayerVideoEx` fix* above: the
+   `1792x1080` movie surfaces go to **zero** and `1920x1080` ones appear, so the guest does use the
+   `width`-based spelling and the coded-extent contract is the right one. Nothing further is owed here.
 3. **Resolve #1944 before spending any further arm on an `addr=(nil)` fault.** Add the default-off
    fail-visible lazy-commit mode described there, so the fault reports at the *loading* instruction with
    the real faulting address, and decide whether page `0x2100000000` is a legitimately committed guest
