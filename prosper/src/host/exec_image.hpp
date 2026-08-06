@@ -74,6 +74,18 @@ struct BootResult {
     uint64_t     rbp = 0, rsp = 0, rax = 0, rdi = 0, rsi = 0, rdx = 0, rbx = 0; // regs at fault
     std::vector<uint64_t> backtrace;   // return addresses (rbp chain) at the fault
 };
+// Describe a code address for a fault report or backtrace.
+//
+// A guest address becomes "<module>+0x<offset>" via boot_program.hpp's fixed map. A HOST address
+// becomes "prosper+0x<rva>" (or "<dll>+0x<rva>"), which is the part that matters: prosper is ASLR'd,
+// so a raw host frame is a different number every run and cannot be symbolised or even compared
+// across runs. With an RVA it can be fed straight to addr2line/nm.
+//
+// #2194 is why this exists: a guest thread faulted, and the frame that told us WHO called it was a
+// bare host address. The report named the guest side precisely and the caller not at all -- which is
+// the half that decides whether a fault is the title's bug or ours.
+std::string describe_code_address(uint64_t address);
+
 // Register the stack a guest thread runs on (main thread + workers we spawn), keyed by
 // its pthread id, so GC/thread code gets accurate bounds without pthread_getattr_np.
 void register_thread_stack(uint64_t tid, void* base, uint64_t size);

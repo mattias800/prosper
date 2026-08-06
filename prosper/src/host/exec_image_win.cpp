@@ -23,6 +23,7 @@
 #include "x86_read_decode.hpp"
 #include "../hle/nid.hpp"
 #include "../hle/dispatch.hpp"
+#include "boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -1284,6 +1285,46 @@ uint64_t hle_guest_return_address(uint64_t entry_rsp) {
 uint64_t invoke_stub(uint64_t idx) {
     if (idx >= g_nstubs) return 0;
     return ((HleFn)(uintptr_t)stub_addr(idx))(0, 0, 0, 0, 0, 0);
+}
+
+// MinGW/MSVC both provide the linker-synthesised image base, so this needs no psapi dependency.
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+std::string describe_code_address(uint64_t address) {
+    char text[160];
+    const char* module = prosper::guest_module_name(address);
+    if (std::strcmp(module, "mapped/host") != 0) {
+        std::snprintf(text, sizeof text, "%s+0x%llx", module,
+                      (unsigned long long)prosper::guest_module_offset(address));
+        return text;
+    }
+    const auto* dos = &__ImageBase;
+    const auto base = (uint64_t)(uintptr_t)dos;
+    const auto* nt = (const IMAGE_NT_HEADERS*)((const uint8_t*)dos + dos->e_lfanew);
+    if (nt->Signature == IMAGE_NT_SIGNATURE && address >= base &&
+        address < base + nt->OptionalHeader.SizeOfImage) {
+        std::snprintf(text, sizeof text, "prosper+0x%llx", (unsigned long long)(address - base));
+        return text;
+    }
+    // Some other loaded module (a system DLL, a driver shim). Name it rather than printing a bare
+    // pointer -- "which DLL" is usually the whole answer for a frame that is not ours.
+    HMODULE owner = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)(uintptr_t)address, &owner) && owner) {
+        wchar_t wide[MAX_PATH]{};
+        if (GetModuleFileNameW(owner, wide, MAX_PATH)) {
+            const wchar_t* leaf = wcsrchr(wide, L'\\');
+            leaf = leaf ? leaf + 1 : wide;
+            char narrow[96]{};
+            WideCharToMultiByte(CP_UTF8, 0, leaf, -1, narrow, sizeof narrow - 1, nullptr, nullptr);
+            std::snprintf(text, sizeof text, "%s+0x%llx", narrow,
+                          (unsigned long long)(address - (uint64_t)(uintptr_t)owner));
+            return text;
+        }
+    }
+    std::snprintf(text, sizeof text, "host:0x%llx", (unsigned long long)address);
+    return text;
 }
 
 void register_thread_stack(uint64_t tid, void* base, uint64_t size) {

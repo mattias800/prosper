@@ -515,8 +515,9 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(result.rbp),
                 static_cast<unsigned long long>(result.rsp));
         for (uint64_t address : result.backtrace)
-            fprintf(stderr, "[shot] guest backtrace: 0x%llx\n",
-                    static_cast<unsigned long long>(address));
+            fprintf(stderr, "[shot] guest backtrace: 0x%llx (%s)\n",
+                    static_cast<unsigned long long>(address),
+                    describe_code_address(address).c_str());
     });
     guest.detach();
 

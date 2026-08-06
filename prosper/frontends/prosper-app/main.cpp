@@ -966,8 +966,9 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
         if (result.kind != 0)
             dump_guest_exception_trace();
         for (uint64_t address : result.backtrace)
-            fprintf(stderr, "[app] guest backtrace: 0x%llx\n",
-                    static_cast<unsigned long long>(address));
+            fprintf(stderr, "[app] guest backtrace: 0x%llx (%s)\n",
+                    static_cast<unsigned long long>(address),
+                    describe_code_address(address).c_str());
     });   // runs the guest frame loop
     fprintf(stderr, "[app] guest booted; presenting its frames.\n");
     return true;

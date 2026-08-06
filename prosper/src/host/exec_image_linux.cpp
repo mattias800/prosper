@@ -27,6 +27,7 @@
 #endif
 #include <cstdio>
 #include <cstring>
+#include <dlfcn.h>   // dladdr: name the host object behind a backtrace frame (#2194)
 #include <cstdlib>
 #include <cstdint>
 #include <cerrno>
@@ -3400,6 +3401,32 @@ uint64_t hle_guest_return_address(uint64_t entry_rsp) {
 uint64_t invoke_stub(uint64_t idx) {
     auto fn = (uint64_t(*)())(stub_addr(idx));
     return fn();
+}
+
+std::string describe_code_address(uint64_t address) {
+    char text[160];
+    const char* module = prosper::guest_module_name(address);
+    if (std::strcmp(module, "mapped/host") != 0) {
+        std::snprintf(text, sizeof text, "%s+0x%llx", module,
+                      (unsigned long long)prosper::guest_module_offset(address));
+        return text;
+    }
+    // Host frame. dladdr resolves the containing object and, when the symbol is exported, its name.
+    Dl_info info{};
+    if (dladdr((void*)(uintptr_t)address, &info) && info.dli_fname) {
+        const char* leaf = std::strrchr(info.dli_fname, '/');
+        leaf = leaf ? leaf + 1 : info.dli_fname;
+        const auto base = (uint64_t)(uintptr_t)info.dli_fbase;
+        if (info.dli_sname)
+            std::snprintf(text, sizeof text, "%s!%s+0x%llx", leaf, info.dli_sname,
+                          (unsigned long long)(address - (uint64_t)(uintptr_t)info.dli_saddr));
+        else
+            std::snprintf(text, sizeof text, "%s+0x%llx", leaf,
+                          (unsigned long long)(address - base));
+        return text;
+    }
+    std::snprintf(text, sizeof text, "host:0x%llx", (unsigned long long)address);
+    return text;
 }
 
 void register_thread_stack(uint64_t tid, void* base, uint64_t size) {
