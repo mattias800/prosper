@@ -234,7 +234,16 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   output capture fails, so redirect stdout **and** stderr to a file on the real disk, end with `exit 0`,
   read that file, and `rm -rf` scratch that is a day or more old. Leave `/tmp/claude-*` and anything
   touched in the last few hours alone — other agents are live.
-- **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth;
+- **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth
+  **only with `--no-tests=error`** — plain `ctest` on a build directory with nothing registered prints
+  `No tests were found!!!` and **exits 0**, so "no tests ran" and "everything passed" are the same
+  exit code (measured on ctest 4.4.0: plain → 0, `--no-tests=error` → 8). This is reachable without
+  any mishap — a copy-pasted `--test-dir` pointing at the wrong build directory yields a green run
+  that executed nothing, and an agent reporting "ctest green" has then reported a fact about an empty
+  directory. `prosper/tools/vkval/vk_validation_scan.py:206` already passes the flag and its comment
+  says why; nothing else in the repo does. **Pass `--no-tests=error` whenever you quote a ctest
+  result**, and quote the test *count* alongside the exit code — a count is falsifiable, an exit code
+  alone is not;
   every SPIR-V emitter is `spirv-val`-gated in CI (`tools/spv_validate`, §4c — one representative
   module per emitter path, not per game shader); rendered frames are asserted by pixels, hashes, or routed content
   metrics. Snapshots are a **release-time regression inventory**, not a day-to-day development or merge
