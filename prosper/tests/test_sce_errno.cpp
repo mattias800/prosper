@@ -143,9 +143,19 @@ int main() {
         if (sem_init && sem_trywait && sem_destroy) {
             alignas(16) uint8_t slot[32]{};
             CHECK(sem_init((uint64_t)slot, 0, 0, 0, 0, 0) == 0, "zero-count guest semaphore initializes");
+            // #2178: this is the SONY spelling, so the FreeBSD number arrives libkernel-encoded.
+            // The two halves of the claim are independent and both matter — 0x8002_0000 is the
+            // encoding, and 0x23 (35) is the FreeBSD numbering, where the host would have said 11.
             const uint64_t rc = sem_trywait((uint64_t)slot, 0, 0, 0, 0, 0);
-            CHECK(rc == static_cast<uint64_t>(FreeBsdErrno::EAgain),
-                  "scePthreadSemTrywait on an empty semaphore reports FreeBSD EAGAIN (35), not host 11");
+            CHECK(rc == sce_kernel_error(FreeBsdErrno::EAgain),
+                  "scePthreadSemTrywait on an empty semaphore reports encoded FreeBSD EAGAIN "
+                  "(0x80020023) — not a bare 35, and not host 11");
+            // The POSIX spelling shares the body and must NOT encode. Without this line the arm
+            // above cannot distinguish a correct alias from both spellings being encoded.
+            auto posix_trywait = Hle::lookup(nid_hash("sem_trywait"));
+            CHECK(posix_trywait && posix_trywait((uint64_t)slot, 0, 0, 0, 0, 0)
+                      == static_cast<uint64_t>(FreeBsdErrno::EAgain),
+                  "sem_trywait keeps the bare FreeBSD EAGAIN (35)");
             sem_destroy((uint64_t)slot, 0, 0, 0, 0, 0);
         } else {
             std::printf("  [skip] scePthreadSem* not registered on this platform\n");

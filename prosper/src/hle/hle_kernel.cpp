@@ -193,12 +193,17 @@ struct GuestCondAttr {
     int32_t pshared = 0;  // only process-private condition variables are supported
 };
 
+// Declared here, defined with its full rationale beside the mutex handlers below: the attribute
+// handlers in this section forward host pthread failures too, and a raw host errno reaching the
+// guest is the #1612 defect regardless of which spelling it arrives through.
+namespace { inline uint64_t fbsd_errno(int host); }
+
 HLE(k_mutexattr_init) {
     if (!a0) return 0x16; // EINVAL-ish
     auto* at = (GuestMutexAttr*)calloc(1, sizeof(GuestMutexAttr));
     if (!at) return 0x0c; // ENOMEM
     int result = pthread_mutexattr_init(&at->host);
-    if (result != 0) { free(at); return (uint64_t)(unsigned)result; }
+    if (result != 0) { free(at); return fbsd_errno(result); }
     // A FRESH attr's type must be the FreeBSD/Sony DEFAULT — ERRORCHECK — not the host default
     // (glibc: NORMAL). Kyty's PthreadMutexattrInit does exactly this (settype(1) on init). The
     // #183 change covered the no-attr init path but left attr-without-settype at glibc NORMAL,
@@ -209,7 +214,7 @@ HLE(k_mutexattr_init) {
     // single-thread wedge in k_mutex_lock, mutex __owner == self, ~10 s into the DOLL boot).
     // CONFIDENCE: HIGH (FreeBSD contract + Kyty + live wedge disassembly).
     result = pthread_mutexattr_settype(&at->host, PTHREAD_MUTEX_ERRORCHECK);
-    if (result != 0) { pthread_mutexattr_destroy(&at->host); free(at); return (uint64_t)(unsigned)result; }
+    if (result != 0) { pthread_mutexattr_destroy(&at->host); free(at); return fbsd_errno(result); }
     at->sony_type = 1;
     *(void**)a0 = at;                     // store handle through caller's slot
     return 0;
@@ -240,7 +245,7 @@ HLE(k_mutexattr_settype) {
     static const bool mtxlog = getenv("PROSPER_MUTEXLOG") != nullptr;
     if (mtxlog) fprintf(stderr, "[mtx] settype attr=%p type=%d\n", *(void**)a0, (int)a1);
     int result = pthread_mutexattr_settype(&at->host, host);
-    if (result != 0) return (uint64_t)(unsigned)result;
+    if (result != 0) return fbsd_errno(result);
     at->sony_type = (int)a1;
     return 0;
 }
@@ -248,8 +253,11 @@ HLE(k_mutexattr_settype) {
 // returned 0 while leaving the caller's `int* type` (a1) unwritten, so the guest read stack garbage as
 // the mutex type (the harmful-Get-stub class the affinity/sched paths already guard against). Preserve
 // the original Sony type because host ERRORCHECK represents both Sony ERRORCHECK(1) and ADAPTIVE_NP(4).
+// scePthreadMutexattrGettype has no POSIX spelling registered, so — like scePthreadMutexTimedlock —
+// it encodes in place rather than through SCE_PTHREAD_ALIAS. Registering `pthread_mutexattr_gettype`
+// onto this body later would need the alias split instead (#2178).
 HLE(k_mutexattr_gettype) {
-    if (!a0 || !*(void**)a0 || !a1) return 0x16;   // EINVAL
+    if (!a0 || !*(void**)a0 || !a1) return prosper::hle::kSceKernelErrorEINVAL;
     auto* at = (GuestMutexAttr*)*(void**)a0;
     *(int*)(uintptr_t)a1 = at->sony_type;
     return 0;
@@ -691,6 +699,15 @@ namespace {
     HLE(sce_name) { return sce_pthread_rc(posix_body(a0, a1, a2, a3, a4, a5)); }
 SCE_PTHREAD_ALIAS(k_sce_mutex_lock,    k_mutex_lock)
 SCE_PTHREAD_ALIAS(k_sce_mutex_trylock, k_mutex_trylock)
+// #2178: Unlock belongs here as much as Lock and Trylock do. It was the sharpest instance of the
+// gap — `scePthreadMutexUnlock` reports EPERM for a mutex this thread does not hold, and it was the
+// ONLY member of the lock/trylock/timedlock/unlock quartet handing that back bare, so the encoding
+// a guest saw depended on which of the four it called. Init and the two fallible attribute setters
+// travel with them for the same reason: each has a failure path, so each needs the split.
+SCE_PTHREAD_ALIAS(k_sce_mutex_unlock,      k_mutex_unlock)
+SCE_PTHREAD_ALIAS(k_sce_mutex_init,        k_mutex_init)
+SCE_PTHREAD_ALIAS(k_sce_mutexattr_init,    k_mutexattr_init)
+SCE_PTHREAD_ALIAS(k_sce_mutexattr_settype, k_mutexattr_settype)
 
 // --- condition variables ---
 namespace {
@@ -846,11 +863,24 @@ HLE(k_cond_init) {
     auto* cond = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t));
     if (!cond) return 0x0c;
     const int result = pthread_cond_init(cond, nullptr);
-    if (result != 0) { free(cond); return (uint64_t)(unsigned)result; }
+    // #1612, not #1984: this is the BARE value both spellings report, and a raw host number is
+    // wrong through either. pthread_cond_init's EAGAIN is host 11 on Linux, which is FreeBSD's
+    // EDEADLK — "out of resources, retry" delivered to the guest as "deadlock".
+    if (result != 0) { free(cond); return fbsd_errno(result); }
     guest_cond_register(cond, attr ? attr->clock_id : kSonyClockRealtime);
     *(void**)a0 = cond;
     return 0;
 }
+// The Sony spellings of the fallible condition-variable entry points (#2178). Destroy, Signal,
+// Broadcast and Wait are deliberately absent: each returns 0 unconditionally, so an alias would
+// change nothing today and misstate the contract tomorrow. scePthreadCondTimedwait encodes in
+// place instead — it has no POSIX spelling registered on its body.
+SCE_PTHREAD_ALIAS(k_sce_cond_init,             k_cond_init)
+SCE_PTHREAD_ALIAS(k_sce_condattr_init,         k_condattr_init)
+SCE_PTHREAD_ALIAS(k_sce_condattr_setclock,     k_condattr_setclock)
+SCE_PTHREAD_ALIAS(k_sce_condattr_getclock,     k_condattr_getclock)
+SCE_PTHREAD_ALIAS(k_sce_condattr_setpshared,   k_condattr_setpshared)
+SCE_PTHREAD_ALIAS(k_sce_condattr_getpshared,   k_condattr_getpshared)
 HLE(k_cond_destroy) {
     if (a0 && !pt_static_sentinel(*(void**)a0)) {
         auto* cond = (pthread_cond_t*)*(void**)a0;
@@ -1202,6 +1232,11 @@ HLE(k_rwlockattr_destroy) {
     *slot = nullptr;
     return 0;
 }
+// Both attribute entry points reject a null slot, and Init also forwards an allocation or host
+// failure, so both are fallible and both need the split (#2178). They were left raw when the rest
+// of the rwlock family was aliased.
+SCE_PTHREAD_ALIAS(k_sce_rwlockattr_init,    k_rwlockattr_init)
+SCE_PTHREAD_ALIAS(k_sce_rwlockattr_destroy, k_rwlockattr_destroy)
 
 // scePthreadOnce(once_control*, init_routine): run init exactly once, PER CONTROL. The old
 // implementation held ONE process-global recursive mutex across the guest init routine — if init
@@ -2227,13 +2262,18 @@ HLE(k_mutex_timedlock) {
 // Sony entry point returns the encoded SCE_KERNEL_ERROR_ETIMEDOUT (0x8002003c), not the positive
 // FreeBSD errno 60. Middleware commonly compares that exact value before returning from its bounded
 // wait; returning 60 makes it retry the timed wait forever instead of running its periodic work.
+// This one encoded only its TIMEOUT, and left EINVAL and every forwarded host failure bare — the
+// same question answered two ways inside a single function (#2178). It has no POSIX spelling
+// registered on its body (pthread_cond_timedwait takes the absolute form and has its own handler),
+// so it encodes in place, exactly as k_mutex_timedlock above does.
 HLE(k_cond_timedwait_sce) {
     auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
-    if (!c || !m) return 0x16;                          // EINVAL
+    if (!c || !m) return prosper::hle::kSceKernelErrorEINVAL;
     timespec dl = abs_deadline_us(a2);
     int rc = interruptible_cond_timedwait(c, m, &dl, GuestWaitKind::ConditionSequence, 0,
                                           nullptr, kGuestMutexCondWaitBookkeeping);
-    return rc == ETIMEDOUT ? prosper::hle::kSceKernelErrorETIMEDOUT : fbsd_errno(rc);
+    // sce_pthread_rc passes the already-encoded ETIMEDOUT through untouched, and encodes the rest.
+    return sce_pthread_rc(rc == ETIMEDOUT ? prosper::hle::kSceKernelErrorETIMEDOUT : fbsd_errno(rc));
 }
 // scePthreadRwlockTimedrd/wrlock(rwlock, SceKernelUseconds usec): acquire with a RELATIVE µs timeout.
 // Were MISSING -> the generic stub returned 0 (= "lock held") without taking the lock, so the guest ran
@@ -2337,18 +2377,35 @@ namespace { bool semlog() { static const bool on = getenv("PROSPER_SEMLOG") != n
 HLE(k_sem_init)      { if (!a0) return 0x16; auto* s = (sem_t*)calloc(1, sizeof(sem_t)); sem_init(s, 0, (unsigned)a2); *(void**)(uintptr_t)a0 = s; if (semlog()) fprintf(stderr, "[sem] init slot=%p value=%u\n", (void*)(uintptr_t)a0, (unsigned)a2); return 0; }
 HLE(k_sem_wait)      { auto* s = ensure_sem(a0); if (!s) return 0x16; if (semlog()) fprintf(stderr, "[sem] wait slot=%p enter\n", (void*)(uintptr_t)a0); int rc = sem_wait(s); if (semlog()) fprintf(stderr, "[sem] wait slot=%p exit rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : fbsd_errno(errno); }
 HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem_trywait(s) == 0 ? 0 : fbsd_errno(errno); }   // EAGAIN (would block) is 11 here, 35 on the PS5
-HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return 0x16; timespec dl = abs_deadline_us(a1); int rc = sem_timedwait(s, &dl); return rc == 0 ? 0 : fbsd_errno(errno); }
+// scePthreadSemTimedwait is the one member of the family with no POSIX spelling registered on its
+// body, so it encodes in place; the other six go through SCE_PTHREAD_ALIAS below (#2178).
+HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return prosper::hle::kSceKernelErrorEINVAL; timespec dl = abs_deadline_us(a1); int rc = sem_timedwait(s, &dl); return rc == 0 ? 0 : sce_pthread_rc(fbsd_errno(errno)); }
 HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; int rc = sem_post(s); if (semlog()) fprintf(stderr, "[sem] post slot=%p rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : fbsd_errno(errno); }
 HLE(k_sem_getvalue)  { auto* s = ensure_sem(a0); if (!s) return 0x16; int v = 0; sem_getvalue(s, &v); if (a1) *(int*)(uintptr_t)a1 = v; return 0; }
 // Quarantined, not freed, and `sem_destroy` deferred to reclaim — a thread parked in `sem_wait` is
 // inside this object. See the contract block above k_mutex_destroy and sync_retire.hpp (#2042).
 HLE(k_sem_destroy)   { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { retire_sync_object(*slot, SyncObjectKind::Sem, [](void* p) { sem_destroy((sem_t*)p); }); *slot = nullptr; } } return 0; }
+// The Sony spellings of the fallible semaphore entry points (#2178). SemDestroy is absent because
+// it returns 0 unconditionally — #2042 made it quarantine its object rather than free it, which
+// changes what it does but not what it reports, so it still needs no alias. NOTE that the POSIX
+// names registered on these same bodies — sem_init/sem_wait/sem_trywait/sem_post/sem_getvalue —
+// have a separate, pre-existing problem: the C contract is "return -1, number in errno", and these
+// bodies return the number. That is not this rule and is not fixed here; the alias only stops the
+// SONY side from reporting a bare errno.
+SCE_PTHREAD_ALIAS(k_sce_sem_init,     k_sem_init)
+SCE_PTHREAD_ALIAS(k_sce_sem_wait,     k_sem_wait)
+SCE_PTHREAD_ALIAS(k_sce_sem_trywait,  k_sem_trywait)
+SCE_PTHREAD_ALIAS(k_sce_sem_post,     k_sem_post)
+SCE_PTHREAD_ALIAS(k_sce_sem_getvalue, k_sem_getvalue)
 // scePthreadBarrier* -- were MISSING -> the generic stub returned 0, so BarrierWait let every thread sail
 // past a rendezvous before its peers arrived: the barrier's downstream invariant (all-arrived) is false ->
 // reads of not-yet-produced data (the async-load race class). Back with host pthread_barrier_t; the serial
 // thread gets -1 (PTHREAD_BARRIER_SERIAL_THREAD, FreeBSD's value), the rest 0. Barrierattr are no-ops.
-HLE(k_barrier_init)    { if (!a0 || a2 == 0) return 0x16; auto* b = (pthread_barrier_t*)calloc(1, sizeof(pthread_barrier_t)); pthread_barrier_init(b, nullptr, (unsigned)a2); *(void**)(uintptr_t)a0 = b; return 0; }
-HLE(k_barrier_wait)    { auto* b = ensure_barrier(a0); if (!b) return 0x16; int rc = pthread_barrier_wait(b); return rc == PTHREAD_BARRIER_SERIAL_THREAD ? (uint64_t)(int64_t)-1 : fbsd_errno(rc); }
+// No POSIX spelling is registered on either body, so both encode in place (#2178). The serial
+// thread's -1 is NOT an errno and must survive untouched: sce_pthread_rc passes it through because
+// its high bits are set, which is exactly the case the pass-through guard exists for.
+HLE(k_barrier_init)    { if (!a0 || a2 == 0) return prosper::hle::kSceKernelErrorEINVAL; auto* b = (pthread_barrier_t*)calloc(1, sizeof(pthread_barrier_t)); pthread_barrier_init(b, nullptr, (unsigned)a2); *(void**)(uintptr_t)a0 = b; return 0; }
+HLE(k_barrier_wait)    { auto* b = ensure_barrier(a0); if (!b) return prosper::hle::kSceKernelErrorEINVAL; int rc = pthread_barrier_wait(b); return rc == PTHREAD_BARRIER_SERIAL_THREAD ? (uint64_t)(int64_t)-1 : sce_pthread_rc(fbsd_errno(rc)); }
 // Quarantined, not freed (#2042) — `pthread_barrier_wait` parks every arriving thread inside the
 // object, the widest window in the family. See the contract block above k_mutex_destroy.
 HLE(k_barrier_destroy) { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { retire_sync_object(*slot, SyncObjectKind::Barrier, [](void* p) { pthread_barrier_destroy((pthread_barrier_t*)p); }); *slot = nullptr; } } return 0; }
@@ -3890,28 +3947,31 @@ void register_kernel_hle() {
     R("sceKernelRaiseException", k_raise_exception);
     R("sceKernelDlsym", k_dlsym);
     R("sceKernelIsStack", k_is_stack);
-    R("scePthreadMutexattrInit", k_mutexattr_init);
-    R("scePthreadMutexattrSettype", k_mutexattr_settype);
-    R("scePthreadMutexattrGettype", k_mutexattr_gettype);   // was MISSING -> left *type uninitialized
-    R("scePthreadMutexattrSetprotocol", k_mutexattr_setprotocol);
-    R("scePthreadMutexattrSetpshared", k_mutexattr_setpshared);
-    R("scePthreadMutexattrDestroy", k_mutexattr_destroy);
-    R("scePthreadMutexInit", k_mutex_init);
-    R("scePthreadMutexDestroy", k_mutex_destroy);
     // Sony spellings report failure in the libkernel-encoded form; the POSIX aliases further down
-    // keep the bare errno. See sce_pthread_rc() above for the guest-side evidence (#1945).
+    // keep the bare errno. See sce_pthread_rc() above for the guest-side evidence (#1945). The rule
+    // is "alias IFF the body can fail": a k_sce_* name below means the body has a failure path, and
+    // a raw k_* name means it returns 0 unconditionally and an alias would state a contract it does
+    // not have. #2178 swept the family for spellings on the wrong side of that.
+    R("scePthreadMutexattrInit", k_sce_mutexattr_init);
+    R("scePthreadMutexattrSettype", k_sce_mutexattr_settype);
+    R("scePthreadMutexattrGettype", k_mutexattr_gettype);   // encodes in place: no POSIX spelling
+    R("scePthreadMutexattrSetprotocol", k_mutexattr_setprotocol);   // always 0
+    R("scePthreadMutexattrSetpshared", k_mutexattr_setpshared);     // always 0
+    R("scePthreadMutexattrDestroy", k_mutexattr_destroy);           // always 0
+    R("scePthreadMutexInit", k_sce_mutex_init);
+    R("scePthreadMutexDestroy", k_mutex_destroy);                   // always 0
     R("scePthreadMutexLock", k_sce_mutex_lock);
     R("scePthreadMutexTrylock", k_sce_mutex_trylock);
     R("scePthreadMutexTimedlock", k_mutex_timedlock);   // was MISSING -> faked "locked" without locking
-    R("scePthreadMutexUnlock", k_mutex_unlock);
-    R("scePthreadCondattrInit", k_condattr_init);
-    R("scePthreadCondattrDestroy", k_condattr_destroy);
-    R("scePthreadCondattrSetclock", k_condattr_setclock);
-    R("scePthreadCondattrGetclock", k_condattr_getclock);
-    R("scePthreadCondattrSetpshared", k_condattr_setpshared);
-    R("scePthreadCondattrGetpshared", k_condattr_getpshared);
-    R("scePthreadCondInit", k_cond_init);
-    R("scePthreadCondDestroy", k_cond_destroy);
+    R("scePthreadMutexUnlock", k_sce_mutex_unlock);
+    R("scePthreadCondattrInit", k_sce_condattr_init);
+    R("scePthreadCondattrDestroy", k_condattr_destroy);             // always 0
+    R("scePthreadCondattrSetclock", k_sce_condattr_setclock);
+    R("scePthreadCondattrGetclock", k_sce_condattr_getclock);
+    R("scePthreadCondattrSetpshared", k_sce_condattr_setpshared);
+    R("scePthreadCondattrGetpshared", k_sce_condattr_getpshared);
+    R("scePthreadCondInit", k_sce_cond_init);
+    R("scePthreadCondDestroy", k_cond_destroy);                     // always 0
     R("scePthreadCondSignal", k_cond_signal);
     R("scePthreadCondBroadcast", k_cond_broadcast);
     R("scePthreadCondWait", k_cond_wait);
@@ -3934,15 +3994,15 @@ void register_kernel_hle() {
     R("pthread_rwlock_reltimedwrlock_np", k_posix_rwlock_reltimedwrlock);   // RELATIVE timespec*
     R("scePthreadRwlockTimedrdlock", k_sce_rwlock_timedrdlock);   // were MISSING -> faked "locked" without locking
     R("scePthreadRwlockTimedwrlock", k_sce_rwlock_timedwrlock);
-    R("scePthreadRwlockattrInit", k_rwlockattr_init);
-    R("scePthreadRwlockattrDestroy", k_rwlockattr_destroy);
+    R("scePthreadRwlockattrInit", k_sce_rwlockattr_init);
+    R("scePthreadRwlockattrDestroy", k_sce_rwlockattr_destroy);
     R("pthread_rwlockattr_init", k_rwlockattr_init);
     R("pthread_rwlockattr_destroy", k_rwlockattr_destroy);
     // scePthreadSem* counting semaphores (were MISSING -> SemWait never blocked)
-    R("scePthreadSemInit", k_sem_init);         R("scePthreadSemDestroy", k_sem_destroy);
-    R("scePthreadSemWait", k_sem_wait);         R("scePthreadSemTrywait", k_sem_trywait);
-    R("scePthreadSemTimedwait", k_sem_timedwait); R("scePthreadSemPost", k_sem_post);
-    R("scePthreadSemGetvalue", k_sem_getvalue);
+    R("scePthreadSemInit", k_sce_sem_init);       R("scePthreadSemDestroy", k_sem_destroy);   // Destroy: always 0
+    R("scePthreadSemWait", k_sce_sem_wait);       R("scePthreadSemTrywait", k_sce_sem_trywait);
+    R("scePthreadSemTimedwait", k_sem_timedwait); R("scePthreadSemPost", k_sce_sem_post);     // Timedwait: encodes in place
+    R("scePthreadSemGetvalue", k_sce_sem_getvalue);
     // scePthreadBarrier* (were MISSING -> BarrierWait let threads pass a false rendezvous)
     R("scePthreadBarrierInit", k_barrier_init);   R("scePthreadBarrierWait", k_barrier_wait);
     R("scePthreadBarrierDestroy", k_barrier_destroy);
