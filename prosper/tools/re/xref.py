@@ -22,10 +22,19 @@
 # Runtime address = module_load_base + VA (e.g. eboot base 0x410000000; it moved from
 # 0x400000000 in #825 — see prosper/src/host/boot_program.hpp for the authoritative set).
 #
+# A SHORT string has no address to reference at all. Clang materialises a std::string built from a
+# literal of <= 22 bytes into the small-buffer with `movabs`/`mov` IMMEDIATES, and then the .rodata
+# copy of that literal can end up with zero references of every kind -- no rip-relative lea, no
+# relocation, nothing. `to <string VA>` then answers 0 for a string the guest demonstrably uses, which
+# reads as "the guest cannot be asking for this" (it cost the Sonic Origins lane a whole hypothesis:
+# `ui/ui_startup` has zero references AND is requested on every boot -- #1905). `imm` closes that hole
+# by searching the executable segments for the string's own bytes appearing as instruction operands.
+#
 # Usage:
 #   xref.py <module.elf> to   <hexaddr>     # who references this address
 #   xref.py <module.elf> from <hexaddr>     # what this function references (rip-lea/call, ~2KB window)
 #   xref.py <module.elf> reloc <hexaddr>    # data-pointer relocations targeting this address only
+#   xref.py <module.elf> imm  <string>      # who BUILDS this string from inline immediates
 
 import struct, sys
 from collections import defaultdict
@@ -141,12 +150,145 @@ class Module:
                     self.code_xref[site + 7 + disp].append((site, 'cmpb'))
 
 
+def find_immediate_builds(m, needle, span=0x60):
+    """Locate code that materialises `needle` (bytes) from instruction immediates.
+
+    Returns [(first_site_va, last_site_va, [(va, lo, hi), ...])] — one entry per cluster of nearby
+    executable-segment occurrences whose covered byte ranges together span the whole string.
+
+    The chunk sizes are the ones a compiler can encode as an immediate: 8 (movabs) and 4 (mov
+    imm32) carry the string, and at most a 3-byte tail may arrive as a 2- or 1-byte store.
+
+    Only the >= 4-byte windows form clusters, and a cluster is reported only when they cover the
+    whole string apart from such a tail. That bound is what makes the answer trustworthy: 1-byte
+    windows match constantly in a dense instruction stream, so admitting them into the cover lets
+    a stretch of code "build" any string. Requiring the 4- and 8-byte windows to do the work leaves
+    the tail as the only concession, which is the shape the compiler actually emits.
+
+    A needle shorter than 4 bytes is REFUSED (ValueError) rather than answered, because the floor
+    that makes the answer meaningful cannot exist below the needle's own length: every plain
+    occurrence of those bytes anywhere in the instruction stream would be reported as a
+    construction, in the same confident format as a real one.
+
+    Two precision limits the caller should read off the output rather than assume away:
+      * a cluster is single-linkage over CONSECUTIVE matches no more than `span` bytes apart, so it
+        can grow longer than `span` overall — the printed first..last range is what bounds it;
+      * a tail-completed hit's small window is accepted anywhere inside the cluster's span, with no
+        positional or origin relation to the strong stores, so its precision rests entirely on
+        those. The reported [lo:hi] sizes are how a reader tells the two cases apart.
+    """
+    n = len(needle)
+    if n == 0:
+        return []
+    if n < 4:
+        raise ValueError(
+            "needle %r is %d byte(s); `imm` needs at least 4. Below that the >=4-byte window floor "
+            "that makes a match meaningful cannot apply, and every plain occurrence of these bytes "
+            "in the instruction stream would be reported as a construction." % (needle, n))
+
+    def scan(sizes):
+        windows = [(lo, lo + s) for s in sizes if s <= n for lo in range(0, n - s + 1)]
+        found = []
+        for v, o, fs, fl in m.segs:
+            if not (fl & 1):                    # executable segments only
+                continue
+            seg = m.raw[o:o + fs]
+            for lo, hi in windows:
+                chunk = needle[lo:hi]
+                start = 0
+                while True:
+                    i = seg.find(chunk, start)
+                    if i < 0:
+                        break
+                    found.append((v + i, lo, hi))
+                    start = i + 1
+        return sorted(found)
+
+    strong = scan((8, 4))
+    if not strong:
+        return []
+    weak = None                                 # scanned lazily; only a <= 3-byte tail may use it
+    clusters, cur = [], [strong[0]]
+    for h in strong[1:]:
+        if h[0] - cur[-1][0] <= span:
+            cur.append(h)
+        else:
+            clusters.append(cur)
+            cur = [h]
+    clusters.append(cur)
+
+    out = []
+    for c in clusters:
+        covered = set()
+        for _, lo, hi in c:
+            covered.update(range(lo, hi))
+        missing = set(range(n)) - covered
+        parts = list(c)
+        if missing:
+            if len(missing) > 3:
+                continue                        # partial match: not a construction of this string
+            if weak is None:
+                weak = scan((3, 2, 1))
+            lo_va, hi_va = c[0][0] - span, c[-1][0] + span
+            for va, lo, hi in weak:
+                if lo_va <= va <= hi_va and missing & set(range(lo, hi)):
+                    missing -= set(range(lo, hi))
+                    parts.append((va, lo, hi))
+            if missing:
+                continue
+        # Keep the largest window at each distinct site, then drop the windows that are merely
+        # sub-ranges of a larger one at the same origin — an 8-byte movabs also matches its own
+        # 4-byte prefixes at the next four addresses, and printing those hides the real stores.
+        best = {}
+        for va, lo, hi in parts:
+            if va not in best or (hi - lo) > (best[va][1] - best[va][0]):
+                best[va] = (lo, hi)
+        cand = sorted((va, lo, hi) for va, (lo, hi) in best.items())
+        merged = [w for w in cand
+                  if not any(o is not w and o[0] - o[1] == w[0] - w[1]
+                             and o[1] <= w[1] and w[2] <= o[2] and (o[2] - o[1]) > (w[2] - w[1])
+                             for o in cand)]
+        out.append((merged[0][0], merged[-1][0], merged))
+    return out
+
+
 def main():
     if len(sys.argv) < 4:
         print(__doc__)
         return 1
     m = Module(sys.argv[1])
     mode = sys.argv[2]
+    if mode == 'imm':
+        text = sys.argv[3]
+        needle = text.encode('utf-8')
+        try:
+            builds = find_immediate_builds(m, needle)
+        except ValueError as exc:
+            print(f"refused: {exc}")
+            return 1
+        print(f"inline-immediate constructions of {text!r} ({len(needle)} bytes): {len(builds)}")
+        for first, last, parts in builds:
+            where = ", ".join(f"0x{va:x}[{lo}:{hi}]" for va, lo, hi in parts)
+            print(f"   0x{first:x}..0x{last:x}  (in func 0x{m.func_start(first):x})  {where}")
+        # The .rodata copy and its (often zero) reference count — the other half of "who uses this
+        # string", and the number that misleads on its own.
+        lits = []
+        for v, o, fs, fl in m.segs:
+            if fl & 1:
+                continue
+            start = 0
+            while True:
+                i = m.raw[o:o + fs].find(needle + b'\0', start)
+                if i < 0:
+                    break
+                if i == 0 or m.raw[o + i - 1] == 0:
+                    lits.append(v + i)
+                start = i + 1
+        print(f"literal copies in non-executable segments: {len(lits)}")
+        for va in lits[:16]:
+            print(f"   0x{va:x}: {len(m.code_xref.get(va, []))} code refs, "
+                  f"{len(m.data_xref.get(va, []))} data relocations")
+        return 0
     addr = int(sys.argv[3], 0)
     if mode in ('to', 'reloc'):
         drefs = m.data_xref.get(addr, [])

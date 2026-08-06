@@ -40,6 +40,44 @@ python3 tools/re/xref.py /tmp/eboot.elf to 0x20698a5
 `from ADDRESS` lists references made by the function window containing that address; `reloc ADDRESS`
 restricts output to relative data relocations.
 
+## Find who builds a SHORT string — `to` cannot, and its zero is misleading
+
+A short string may have **no address to reference**. Clang materialises a `std::string` built from a
+literal of 22 bytes or fewer directly into the small-buffer with `movabs`/`mov` **immediates**, and the
+`.rodata` copy of that literal is then left with zero references of every kind — no RIP-relative `lea`,
+no relocation, nothing. `to <literal VA>` answers **0** for a string the guest asks for on every boot,
+which reads as "the guest cannot be requesting this". Use `imm` for that question:
+
+```bash
+python3 tools/re/xref.py /tmp/eboot.elf imm 'ui/ui_startup'
+```
+
+```text
+inline-immediate constructions of 'ui/ui_startup' (13 bytes): 1
+   0x587628..0x587632  (in func 0x5875b0)  0x587628[0:8], 0x587632[5:13]
+literal copies in non-executable segments: 1
+   0xdd593b: 0 code refs, 0 data relocations
+```
+
+The two sites are the overlapping 8-byte immediates the compiler emits for a 13-byte string
+(`[0:8]` then `[5:13]`), and the second line is the trap itself: the literal is unreferenced, so every
+other query in this file reports nothing for it. Sonic Origins (`PPSA05325`, #1905) is the worked
+example — the package is requested on every boot from exactly this one site.
+
+The report is deliberately conservative. Only 8- and 4-byte windows form a candidate, at most a 3-byte
+tail may be completed by a smaller store, and matches cluster only while consecutive hits are no more
+than ~96 bytes apart. Single-byte matches are constant in a dense instruction stream, so admitting them
+into the cover would let a stretch of code "build" any string — on this eboot that turns the one real
+answer above into **96**. A needle shorter than 4 bytes is **refused** rather than answered, because that
+floor cannot exist below the needle's own length. A string that exists only as a referenced literal
+correctly reports **0** constructions — check both numbers, not either alone.
+
+Two precision limits are visible in the output and are not designed away. Clustering is single-linkage
+over *consecutive* matches, so a cluster can span more than ~96 bytes overall — the printed
+`first..last` range is what bounds it. And a `<= 3`-byte tail window is accepted anywhere inside the
+cluster, with no positional relation to the strong stores, so a tail-completed hit is only as precise as
+its 4- and 8-byte windows; the `[lo:hi]` sizes in the output are how you tell the two cases apart.
+
 For The Messenger, the example above identifies both sides of Unity's runtime IL2CPP API table:
 
 ```text
