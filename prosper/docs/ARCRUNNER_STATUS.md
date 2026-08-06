@@ -675,10 +675,30 @@ The counts are exact, not capped: `diag_should_print` prints the first 64 ordina
 two after, and the largest ordinal seen is 27. **The zero is positively controlled from inside the
 same runs** — the counters it differences (`dma_built_n`, `dma_exec_n`) are demonstrably live in the
 surviving arms, whose `WaitRegMem` reports carry 28–40 populated label event rings with both `dmaB`
-and `dmaX` events. So this is "armed and nothing matched", not "never armed". And it is a much
-sharper statement than the survival table alone: the tripwire is a **selector for one of the two
-terminal classes**, present in 4 of 4 allocator-pop arms and absent from 2 of 2 null-jump arms — while
-the throttle removes *both*.
+and `dmaX` events. So this is "armed and nothing matched", not "never armed".
+
+**And the reporter is not reachable-but-bypassed either**, which is the sharper form of the same
+worry: the overlap check sits at the *end* of `case 1:` of `rel_data_sel`, behind seven earlier
+`return`s, and a zero would be worthless if the surviving arms had simply been exiting sooner. All
+seven are accounted for on a default build:
+
+| early return | why it cannot explain the zero |
+| --- | --- |
+| `!c.rel_value_valid` | a short-decoded packet. `report_short_fold` is unconditional and reports **0** in all 15 arms — nothing was truncated. |
+| `mb3_suppress_release` | needs `PROSPER_MB3_FREELIST_GUARD`, default OFF, not armed |
+| `stale_release_generation` | needs `PROSPER_GENERATION_GUARD`, default OFF, not armed |
+| `waf_guard` | `PROSPER_REL1_WAF_GUARD`, default OFF, not armed |
+| `REL1-LIVE` branch | **reports before it returns**; zero `REL1-LIVE` lines in all 15 arms |
+| `rel1_forge_suppress_candidate` | `rel1_forge_decision_mode()` is 0 unless armed, so it returns false |
+| `REL1-FORGE` branch | **reports before it returns**; zero `REL1-FORGE` lines in all 15 arms |
+
+Two of the seven announce themselves and did not fire; four are default-OFF levers nobody armed; the
+one genuinely silent path is contradicted by an unconditional counter. So control reached the overlap
+check on every `RELEASE_MEM` data_sel 1 in every arm.
+
+It is also a much sharper statement than the survival table alone: the tripwire is a **selector for one
+of the two terminal classes**, present in 4 of 4 allocator-pop arms and absent from 2 of 2 null-jump
+arms — while the throttle removes *both*.
 
 **2. The throttle does not work by shortening the guest's build-to-submit gap — it lengthens it.**
 Pairing each label ring's last `dmaB` (the guest's own AGC builder call) with the following `dmaX`
