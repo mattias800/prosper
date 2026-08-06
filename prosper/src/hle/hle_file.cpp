@@ -2546,7 +2546,6 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     offset = apr_stack_arg(entry_rsp, 0);
 #else
     offset = a6;
-    (void)a7;
 #endif
     const uint64_t requested_size = a5;
     const uint64_t fallback_size = *(uint64_t*)(req + 0x30);
@@ -2583,8 +2582,18 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     // accepted). CONFIDENCE: HIGH (offset+size confirmed on 8 live reads across 3 file kinds).
     uint64_t fsize = 0;
     { struct stat st {}; if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size; }
+    // #2139: this was Linux-only because the discriminator read the guest stack directly, which the
+    // Windows import bridge makes impossible — its stub converts SysV->MS-x64 and CALLs the handler,
+    // inserting a frame plus shadow space (the #672 class of bug). But that same bridge already
+    // forwards guest stack args 7-9 as real parameters, and this handler already declares them: a6
+    // is arg7 (the file offset, used below) and a7 is arg8, which was simply discarded. No guest
+    // stack reading is needed on Windows. The heuristic itself is a property of the GUEST's own
+    // frame layout, so it is unchanged and host-independent.
 #ifndef _WIN32
-    uint64_t arg8 = apr_stack_arg(entry_rsp, 1);
+    const uint64_t arg8 = apr_stack_arg(entry_rsp, 1);
+#else
+    const uint64_t arg8 = a7;
+#endif
     // arg8 discriminates the engine's ASYNC streaming reads from its sync (record-polled) reads —
     // the ONLY ReadFile-level difference found across 90-read boots (identical guest-RA chains):
     // the async wrapper passes a live pointer into its own frame just above the request object
@@ -2603,13 +2612,17 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
         if (filelog()) {
             fprintf(stderr, "[apr]   arg8=0x%llx -> %s\n", (unsigned long long)arg8,
                     async_notify ? "ASYNC(eventful)" : "sync");
+#ifndef _WIN32
+            // Raw notify-slot dump for offline RE. Deliberately not enabled on Windows: it
+            // dereferences arg8 unvalidated, and a value that merely satisfies the bounds
+            // heuristic is not guaranteed readable. A diagnostic must not fault the run.
             if (async_notify)   // dump the notify slot region for offline RE of its real layout
                 for (int o = 0; o < 0x20; o += 8)
                     fprintf(stderr, "[apr]   notify+0x%02x = 0x%016llx\n", o,
                             (unsigned long long)*(uint64_t*)(uintptr_t)(arg8 + o));
+#endif
         }
     }
-#endif
     uint64_t size = requested_size;
     if (offset > fsize) {
         if (filelog()) fprintf(stderr, "[apr] read-submit: offset 0x%llx past EOF (file %llu) — clamped\n",
@@ -2746,6 +2759,16 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     }
     if ((uint64_t)got != size) { ::free(slot); return 0x80020016ull; }
     auto write_guest_dst = [](uint64_t dst, const void* src, uint64_t bytes) -> bool {
+        // #2139: APR is a DMA-style producer, so it must be able to write a destination page even
+        // when the renderer/compute caches currently hold it write-protected for dirty tracking —
+        // the POSIX path has always notified first, and this one never did. Two consequences on
+        // Windows: windows_prepare_guest_write REFUSES a watch-protected page (it only checks
+        // writability, it does not restore it), so the read silently published its host staging
+        // pointer instead of the guest's own buffer; and overlapping cache registrations were never
+        // marked dirty, so the renderer could keep serving stale bytes for a range APR had just
+        // rewritten. Notifying first both restores write access and dirties every overlapping
+        // registration, exactly as on POSIX.
+        host::guest_write_watch_notify_host_write(dst, bytes);
         if (!windows_prepare_guest_write(dst, bytes)) return false;
         memcpy((void*)(uintptr_t)dst, src, (size_t)bytes);
         return true;
