@@ -2184,10 +2184,20 @@ void ime_deliver(uint64_t handler, uint64_t arg, const ImeKeyEvent& ev, uint64_t
     // CONFIDENCE: HIGH -- an IL2CPP title's handler is AOT code in the eboot or a PRX, and the
     // runtime-PRX pool is labelled too; there is no observed guest handler outside a module.
 #ifdef _WIN32
-    if (std::strcmp(prosper::guest_module_name((uint64_t)(uintptr_t)handler), "mapped/host") != 0)
+    if (std::strcmp(prosper::guest_module_name((uint64_t)(uintptr_t)handler), "mapped/host") != 0) {
         prosper_call_guest_sysv4((uint64_t)(uintptr_t)handler, arg, (uint64_t)(uintptr_t)e, 0, 0);
-    else
+    } else {
+        // Unclassified target: prosper's own test double, or a guest handler somewhere this
+        // classifier does not know about. The second case would take the host ABI and silently hand
+        // the guest wrong arguments -- the exact defect this code fixes -- so say so rather than
+        // reintroduce it quietly. Bounded; a host test double trips it at most a few times.
+        static std::atomic<int> unclassified{0};
+        if (unclassified.fetch_add(1) < 4)
+            fprintf(stderr, "[ime] handler 0x%llx is outside every guest module aperture; calling it "
+                            "directly. If this is guest code it will receive MS-x64 arguments and "
+                            "misread them (#2136).\n", (unsigned long long)(uintptr_t)handler);
         ((void (PROSPER_SYSV_ABI *)(uint64_t, void*))(uintptr_t)handler)(arg, e);
+    }
 #else
     ((void (PROSPER_SYSV_ABI *)(uint64_t, void*))(uintptr_t)handler)(arg, e);
 #endif
