@@ -21,13 +21,16 @@
 # MallocBinned3 bundle-list pop (#1945), long before the dialog. The route was captured with the
 # guest's submit call throttled, which is what gets past that fault:
 #
-#   PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_MB3_POISON=1 \
+#   PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_SUBMIT_STALL_US=3000 \
 #     PROSPER_PAD_SCRIPT=@prosper/scripts/crisis-core/reach-title.pad \
-#     ./build-linux/screenshot <DUMP_ROOT>/PPSA07809-app0 --seconds 1 --count 90 --timeout 180
+#     ./build-linux/screenshot <DUMP_ROOT>/PPSA07809-app0 --seconds 2 --count 90 --timeout 220
 #
-# PROSPER_MB3_POISON is a read-only diagnostic, and using it as a throttle is a stopgap, not a fix
-# — see docs/CRISIS_CORE_STATUS.md for the measurement that shows it is the DURATION of the scan
-# and nothing it reads (PROSPER_SUBMIT_STALL_US=3000 substitutes for it; 500 us does not).
+# PROSPER_SUBMIT_STALL_US is a plain sleep in the guest's submit call and is a stopgap, not a fix.
+# It is named here rather than the deep PROSPER_MB3_POISON scan that first got past the fault,
+# because the measurement in docs/CRISIS_CORE_STATUS.md shows the scan works only through its
+# DURATION — so a route that used it would be running a diagnostic as a throttle and would silently
+# change behaviour the day that scan gets cheaper. Both reach the title screen; only one says what
+# it is doing.
 #
 # STATUS: EXPLORATORY. Verified only as far as the title screen. Cross presses beyond that point
 # open the new-game settings flow (voice language, then "Begin game with selected settings?"), so

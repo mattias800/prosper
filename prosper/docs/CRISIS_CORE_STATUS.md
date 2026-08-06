@@ -25,15 +25,21 @@ any arm that had the throttle.
 ## The route, and the one thing that is not honest about it
 
 ```bash
-PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_MB3_POISON=1 \
+PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_SUBMIT_STALL_US=3000 \
   PROSPER_PAD_SCRIPT=@prosper/scripts/crisis-core/reach-title.pad \
-  ./build-linux/screenshot <DUMP_ROOT>/PPSA07809-app0 --seconds 1 --count 90 --timeout 180
+  ./build-linux/screenshot <DUMP_ROOT>/PPSA07809-app0 --seconds 2 --count 90 --timeout 220
 ```
 
-`PROSPER_MB3_POISON=1` is a **read-only diagnostic**, and the title should not need it. It is in
-the route because it is what gets past #1945 — and understanding *why* is the substantive result
-below. **A default run still dies 5–12 s into the boot**, so this is rung 2 on a throttled route,
-not rung 2 on the default one. Say so wherever the rung is quoted.
+`PROSPER_SUBMIT_STALL_US=3000` is a plain sleep in the guest's own submit call, and the title should
+not need it. It is in the route because it is what gets past #1945 — and understanding *why* is the
+substantive result below. **A default run still dies 5–12 s into the boot**, so this is rung 2 on a
+throttled route, not rung 2 on the default one. Say so wherever the rung is quoted.
+
+The first captures were taken with `PROSPER_MB3_POISON=1` instead, which reaches the same screens.
+The route names the sleep because the measurement below shows the scan works only through its
+duration: a route built on a diagnostic would silently change behaviour the day that diagnostic gets
+cheaper — and it did get 32x cheaper inside this very PR, when the scan was narrowed to one size
+class.
 
 ## #1945 on this title is a race the guest wins, not a late write
 
@@ -46,26 +52,48 @@ and **only the 32-byte class (bin 1 — the class the consumed-marker labels are
 ever corrupt**; in two independent fault dumps every other bin in the same array held a valid
 pointer.
 
-What separates the arms is **how long the guest's own submit call takes**:
+What separates the arms is **how long the guest's own submit call takes**. The lever is a plain
+`nanosleep` at the end of the submit fold (`PROSPER_SUBMIT_STALL_US`), so the arms differ in nothing
+but duration. Twelve arms, three per dose, 60 s bound, one binary, otherwise the default route:
+
+| stall per submit | survived the bound | died (either costume) |
+| --- | --- | --- |
+| none (default) | **0 / 3** | 3 / 3 |
+| 500 us | **0 / 3** | 3 / 3 |
+| 1500 us | **3 / 3** | 0 / 3 |
+| 3000 us | **3 / 3** | 0 / 3 |
+
+**0 of 6 below the threshold, 6 of 6 above it** (Fisher exact, two-tailed, p ≈ 0.002), with the
+threshold between 500 us and 1500 us. Surviving arms reach 300-480 flips and 14,000-23,000 draws;
+dying arms never get past the engine's startup.
+
+The diagnostic arms agree and are why the lever was looked for at all:
 
 | arm | outcome |
 | --- | --- |
-| default | faults 5–12 s in (many arms, both costumes) |
-| `PROSPER_MB3_POISON=1` (deep interior chain walk, ~thousands of reads/submit) | **survives**; reaches the title screen. 2/2 |
+| `PROSPER_MB3_POISON=1` (deep interior chain walk, thousands of reads/submit) | **survives**, reaches the title screen — 2/2 |
 | `PROSPER_MB3_POISON=1 PROSPER_MB3_POISON_HOPS=1` (same probe, shallow) | faults 5 s in |
 | `PROSPER_POOLSHIFT_WINDOW=1` (the pre-existing per-submit bin scan) | faults |
-| `PROSPER_SUBMIT_STALL_US=500` (plain sleep, same call site) | faults 5 s in |
-| `PROSPER_SUBMIT_STALL_US=3000` (plain sleep) | **survives** 55 s, 422 presents |
 
-A plain 3 ms sleep reproduces the rescue and a 0.5 ms sleep does not, so **nothing the scan reads
-matters — only its duration does.** The corruption is a timing race that disappears when the guest
-is held inside its submit call for a few milliseconds. `CONFIDENCE: HIGH` (the lever is a
-one-line sleep and both directions were run).
+So **nothing any probe reads matters — only how long it takes.** The corruption is a timing race
+that disappears when the guest is held inside its submit call for one to three milliseconds.
+`CONFIDENCE: HIGH` — not because the mechanism is understood (it is not), but because the claim
+being made is only that duration decides the outcome, and that is what 12 arms across four doses
+measure, with a monotone threshold and a one-line lever.
+
+Independent corroboration from another title: `OREGON_TRAIL_STATUS.md` records nine arms of
+`PPSA19244` on the same binary as an earlier 10/10 exit-90 census producing **zero** faults and
+reaching that title's screen, and concludes "the difference is **timing, not code**". This
+dose-response is the controlled form of that observation.
 
 That also makes `PROSPER_MB3_POISON` a **confound**: any measurement taken with it armed is taken
 on a title that would otherwise have died, so it must never be used as a passive observer here.
 Use `PROSPER_SUBMIT_STALL_US` when the intent is a throttle and the probe when the intent is a
 scan, and never read a result from an arm that had both.
+
+**What this does not say.** It does not identify the race, and in particular it is not evidence for
+"the guest outruns prosper" over any other ordering story — a stall changes thread interleaving
+globally. It also does not transfer to another title without its own dose-response.
 
 ## Ruled out
 

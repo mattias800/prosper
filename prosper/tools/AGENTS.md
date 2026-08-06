@@ -289,6 +289,17 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   branches append the same row number, which merges textually clean and green. Run by the CI
   `Docs` job; `ctest -R doc_table_checker` covers the checker itself.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
+- **`PROSPER_MB3_POISON`, `PROSPER_PEND_AGE`, `PROSPER_SUBMIT_STALL_US`** — the three in-emulator
+  diagnostics for the MallocBinned3 free-list corruption family (#1945/#1226). `MB3_POISON` walks the
+  guest's own size-class-1 bundle chains after each submit and reports a poisoned link *while it is
+  still in the chain*, with the label-history of the node holding it — the only moment that node's
+  address exists anywhere. `PEND_AGE` reports how long each completion write really sat in the pend
+  queue before it landed in guest memory. `SUBMIT_STALL_US` sleeps in the guest's own submit call.
+  **Read the confound warning before using the first one as an observer**: on Crisis Core
+  (`PPSA07809`) arming `MB3_POISON` is the difference between the title dying in seconds and booting
+  to its title screen, because the walk's *duration* changes the outcome — a measurement taken with
+  it armed is taken on a title that would otherwise have died. `SUBMIT_STALL_US` is the honest lever
+  when a throttle is what you want. `prosper/docs/CRISIS_CORE_STATUS.md` has the dose-response.
 - **`hostprof/hostprof.py`** — poor-man's **native sampling profiler**: attach to a running process
   (pid or name), sample its threads via repeated `gdb` backtraces, and rank the hot leaf functions —
   the HOST-side "which C++ function is burning CPU" first look (render/submit thread, readback copy,
