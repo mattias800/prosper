@@ -1181,11 +1181,18 @@ if(TARGET prosper_core)
     target_link_libraries(test_rwlock_once PRIVATE prosper_core)
     add_test(NAME rwlock_once_semantics COMMAND test_rwlock_once)
 
-    # #2042: a destroyed guest sync object's storage is retired, never returned to the allocator,
-    # so a Destroy racing a handler cannot corrupt prosper's own heap.
+    # #2042: a destroyed guest sync object's storage is quarantined, not returned to the allocator,
+    # so a Destroy racing a handler cannot corrupt prosper's own heap. The counter-arm runs the SAME
+    # binary with the quarantine switched off (PROSPER_SYNC_RETIRE_SECONDS=0 is the pre-#2042
+    # immediate free) and requires it to FAIL — so CI keeps proving the assertions can move, without
+    # anyone having to rebuild against an older master.
     add_executable(test_sync_destroy_lifetime tests/test_sync_destroy_lifetime.cpp)
     target_link_libraries(test_sync_destroy_lifetime PRIVATE prosper_core)
     add_test(NAME sync_destroy_lifetime COMMAND test_sync_destroy_lifetime)
+    set_tests_properties(sync_destroy_lifetime PROPERTIES TIMEOUT 120)
+    add_test(NAME sync_destroy_lifetime_counter_arm COMMAND test_sync_destroy_lifetime)
+    set_tests_properties(sync_destroy_lifetime_counter_arm PROPERTIES
+        ENVIRONMENT "PROSPER_SYNC_RETIRE_SECONDS=0" WILL_FAIL TRUE TIMEOUT 120)
 
     # __tls_get_addr per-thread DTV is purged (blocks freed) on both thread-exit paths (#68), and
     # normal return leaves guest %fs before glibc resumes host pthread cleanup (#644).

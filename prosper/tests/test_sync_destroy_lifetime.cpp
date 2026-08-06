@@ -6,10 +6,10 @@
 //
 // The arms below call the handlers through the NID registry, exactly as the guest reaches them.
 //
-//   Arm 1  every *Destroy handler in the family: the destroyed object's address is never issued
-//          again. Deterministic under the fix on every allocator; RED on glibc because its tcache
-//          returns a just-freed block of the same size to the next allocation, which is precisely
-//          the reuse that turns the dangling pointer into corruption.
+//   Arm 1  every *Destroy handler in the family: within the quarantine window, a destroyed object's
+//          address is never issued again. Deterministic under the fix on every allocator; RED on
+//          glibc because its tcache returns a just-freed block of the same size to the very next
+//          allocation, which is precisely the reuse that turns the dangling pointer into corruption.
 //   Arm 2  the case the issue describes, constructed BY HAND: a thread parked inside
 //          `k_rwlock_rdlock` on a write-held lock, destroyed under it. Asserts the parked thread's
 //          object stays live and that the next Init does not alias it.
@@ -17,6 +17,15 @@
 // Arm 2 asserts its own preconditions before it asserts anything else (the write hold really
 // excludes; the reader really did not acquire), because an arm that cannot construct the state it
 // claims to test passes for the wrong reason — the harness would be testing nothing at all.
+//
+// THE COUNTER-ARM IS PART OF THE SUITE. `PROSPER_SYNC_RETIRE_SECONDS=0` restores the pre-#2042
+// immediate free on this same binary, and CMake registers that as `sync_destroy_lifetime_counter_arm`
+// with WILL_FAIL, so CI keeps proving that these assertions CAN fail. Measured: 10 do — all seven
+// spellings in arm 1 and three in arm 2, including `[rwlock] UNMATCHED unlock … holds=0` as the
+// freed object's accounting is reused by the next Init and the parked reader is never woken. The
+// retirement census below still passes under the counter-arm, and should: the objects really are
+// handed over, the window is simply zero, so they are reclaimed on the spot. Rebuilding this file
+// against pre-#2042 handlers instead fails 11 — the census too, since nothing is handed over at all.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include "../src/hle/sync_retire.hpp"
@@ -108,8 +117,8 @@ int main() {
     const uint64_t retired = retired_sync_object_count() - retired_at_start;
     char count_msg[160];
     snprintf(count_msg, sizeof count_msg,
-             "every Destroy retired its object (%llu retired, expected 56)",
-             (unsigned long long)retired);
+             "every Destroy retired its object (%llu retired, expected 56; %llu still quarantined)",
+             (unsigned long long)retired, (unsigned long long)quarantined_sync_object_count());
     CHECK(retired == 56, count_msg);
 
     // ---- Arm 2: destroy under a thread parked inside the handler ------------------------------
