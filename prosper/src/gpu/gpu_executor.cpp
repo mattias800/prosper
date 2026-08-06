@@ -1935,8 +1935,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         // descriptors before their MUBUF loads; leaving it unknown made the dynamic resource walk
         // drop otherwise valid scene-geometry fetches.
         // WARNING: this does NOT match recompile_vertex for most programs, and this comment used to
-        // claim it did.  There, s3=1 is seeded only under exact_ngg_projection (the seven
-        // whitelisted Astro Bot wrappers); every other NGG program gets
+        // claim it did.  There, s3=1 is seeded only under exact_ngg_projection, i.e. only for the
+        // seven wrappers is_astro_bot_ngg_one_lane_wrapper() admits; every other NGG program gets
         // 0x40004040|(wave<<24).  The two models differ in exactly the high bits a prologue reads
         // when it builds a SOFFSET from s3 — 0 here against 0x40000000 there.  #2072.
         set_value(3, 1u);
@@ -2172,9 +2172,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // per-vertex attribute as shader-computed. Two things then go wrong at once, and
                     // each alone still reads zero: every vertex takes the *instance* index (0 for a
                     // one-instance draw), and the recompiler retains the load's runtime SOFFSET,
-                    // which for that shader is `s3 & 0xfff80000`. This fold seeds s3 = 1 below, so
-                    // that term is 0 and fetch_off is 0; recompile_vertex seeds s3 = 1 only for the
-                    // seven whitelisted Astro Bot wrappers and otherwise 0x40004040|(wave<<24), whose
+                    // which for that shader is `s3 & 0xfff80000`. This fold seeds s3 = 1 below (see
+                    // set_value(3, 1u)), so that term is 0 and fetch_off is 0; recompile_vertex seeds
+                    // s3 = 1 only for the seven wrappers is_astro_bot_ngg_one_lane_wrapper() admits,
+                    // and otherwise 0x40004040|(wave<<24), whose
                     // masked value is 0x40000000. The shader therefore adds ~1 GiB to a 96-byte
                     // descriptor and robustBufferAccess returns 0. That s3 mismatch is #2072 (the
                     // vertex-rate bit's separate SMEM divergence is #2069); NEITHER is repaired here.

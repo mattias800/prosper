@@ -726,12 +726,15 @@ neither arm is a silent no-op, and neither term alone is the defect.
 is a *constant*, not a memory read. Comparing the bound descriptor before and after the fix,
 `unshifted_desc.base` and `with_off(desc).base` are the same address (`0x2011c0a690`), i.e. the fold
 resolves `fetch_off = 0`. That is because the fold seeds the merged-wave-info SGPR as
-`set_value(3, 1u)` for **every** NGG stage (`gpu_executor.cpp:1938`), and `1 & 0xfff80000 == 0`.
+`set_value(3, 1u)` for **every** NGG stage (`gpu_executor.cpp:1942`, in `resolve_dynamic_fetch`), and
+`1 & 0xfff80000 == 0`.
 
 The recompiler seeds the same register differently. `rs.sreg[3] = 1` runs only under
-`exact_ngg_projection` (`rdna2_to_spirv.cpp:16246`), which is `ngg && is_astro_bot_ngg_one_lane_wrapper`
-— a whitelist of **seven exact (program-dword-count, hash) pairs** from Astro Bot
-(`:15752`). R-Type's composite VS is not one of them, so the else arm at `:16336` runs:
+`exact_ngg_projection` (`rdna2_to_spirv.cpp:16246`, in `recompile_vertex`), which is
+`ngg && is_astro_bot_ngg_one_lane_wrapper(code, dwords)` (`:16072`) — and that predicate
+(`is_astro_bot_ngg_one_lane_wrapper`, `:15733`) is a whitelist of **seven exact
+(program-dword-count, FNV-1a hash) pairs** from Astro Bot (`:15742-15751`). R-Type's composite VS is
+not one of them, so the else arm at `:16336` runs:
 `rs.sreg[3] = 0x40004040u | (wave << 24)`. And `0x40004040 & 0xfff80000` is **`0x40000000`** —
 **1,073,741,824 bytes**. The shader adds a gigabyte to a 96-byte descriptor and
 `robustBufferAccess` returns 0.
