@@ -6941,9 +6941,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // 0x56 v_rsq_f16, 0x57 v_log_f16, 0x58 v_exp_f16, 0x5B v_floor_f16, 0x5C v_ceil_f16,
             // 0x5D v_trunc_f16, 0x5E v_rndne_f16, 0x5F v_fract_f16, 0x60 v_sin_f16, 0x61 v_cos_f16.
             // Trig input is in REVOLUTIONS, exactly as for the f32 forms. CONFIDENCE: HIGH.
+            // A DWORD-select SDWA form of one of these may still carry CLAMP/OMOD, which this
+            // lowering does not model (the hardware applies them in the 16-bit domain). Reject that
+            // combination fail-visibly rather than silently dropping the modifier — it is strictly
+            // no worse than the whole-opcode reject these encodings got before.
             if (((in.opcode >= 0x54 && in.opcode <= 0x58) ||
                  (in.opcode >= 0x5B && in.opcode <= 0x61)) &&
-                in.sdwa_dst_sel == 6) {
+                in.sdwa_dst_sel == 6 && !in.clamp && !in.omod) {
                 uint32_t raw = a;   // inline constants: f16-width encoding, not the f32 pattern
                 if (in.src[0].kind == OperandKind::InlineFloat)
                     raw = b.uconst(inline_float_f16_bits(in.src[0].value)
@@ -6989,7 +6993,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // is the wrong boundary here, and a bare mask would WRAP an out-of-range value instead
             // of saturating it. VERIFIED(round-trip llvm-mc gfx1030, VOP1 0x50-0x53; the live
             // encoding 7e08a504 is `v_cvt_u16_f16_e32 v4, v4`). CONFIDENCE: HIGH.
-            if (in.opcode >= 0x50 && in.opcode <= 0x53 && in.sdwa_dst_sel == 6) {
+            if (in.opcode >= 0x50 && in.opcode <= 0x53 && in.sdwa_dst_sel == 6 &&
+                !in.clamp && !in.omod) {
                 const bool from_float = in.opcode >= 0x52;
                 uint32_t raw = a;   // inline constants: 16-bit-width encoding, not the f32 pattern
                 if (in.src[0].kind == OperandKind::InlineFloat)
