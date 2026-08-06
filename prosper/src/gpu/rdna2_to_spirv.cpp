@@ -67,6 +67,7 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_Exp2=29, Glsl_Log2=30,
                   Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
                   Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62,
+                  Glsl_FindUMsb=75,   // bit index of the highest set bit (undefined at zero)
                   Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
     Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
@@ -309,6 +310,11 @@ struct SpirvCompute {
     uint32_t iun(uint32_t op, uint32_t a) { uint32_t r = id(); put(code, op, {t_u32, r, a}); return r; }
     // GLSL.std.450 uint ext-instruction (UMin/UMax) on bit-operands -> bit-result (no bitcast).
     uint32_t uext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t r = id(); putv(code, Op_ExtInst, {t_u32, r, glsl, inst, a, b}); return r; }
+    // GLSL.std.450 FindUMsb: bit index of the most significant 1. glslang emits this with a
+    // SIGNED result and an unsigned operand, which is the form drivers are exercised on, so
+    // mirror it exactly and bitcast back. The result is UNDEFINED when the operand is zero —
+    // every caller must exclude that input rather than relying on a -1 that is not specified.
+    uint32_t find_umsb(uint32_t a) { uint32_t ri = id(); putv(code, Op_ExtInst, {t_i32, ri, glsl, Glsl_FindUMsb, a}); return i2u(ri); }
     // GLSL.std.450 float ext-instructions on bit-operands -> bit-result.
     uint32_t fext1(uint32_t inst, uint32_t a) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, bcf(a)}); return bcu(r); }
     uint32_t fext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, bcf(a), bcf(b)}); return bcu(r); }
@@ -5836,6 +5842,70 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_bool_narrowed.erase(in.dst.value);
                 return true;
             }
+            if (in.opcode == 0x15 || in.opcode == 0x16) {
+                // s_flbit_i32_b32 / s_flbit_i32_b64: the count of leading zeros in the UNSIGNED
+                // 32/64-bit source, or -1 when the source is zero. Unlike s_ff1/s_bcnt above, the
+                // operand here is ordinary scalar DATA, not a wave mask — Sonic Racing:
+                // CrossWorlds' downsample kernel does `s_flbit_i32_b64 vcc_lo, s[14:15]` and
+                // immediately `s_sub_i32 vcc_lo, 64, vcc_lo`, i.e. it is computing the index of the
+                // highest set bit (a log2 / mip count), then feeds that to v_ldexp_f32 (#2013).
+                // VERIFIED(round-trip llvm-mc gfx1030): the live word `beea160e` is
+                // `s_flbit_i32_b64 vcc_lo, s[14:15]`, and 0x15 is the same operation over one word.
+                // The signed forms 0x17/0x18 (s_flbit_i32 / _i32_i64, which count leading SIGN
+                // bits) are a different operation and keep rejecting until a title exercises them.
+                if (in.dst.value == 126 || in.dst.value == 127) { ok = false; return true; }
+                auto scalar_word = [&](int reg, uint32_t& value) {
+                    auto current = rs.sreg.find(reg);
+                    if (current != rs.sreg.end()) { value = current->second; return true; }
+                    auto input = rs.sreg_input.find(reg);
+                    if (input != rs.sreg_input.end()) { value = input->second; return true; }
+                    return false;
+                };
+                const bool wide = in.opcode == 0x16;
+                uint32_t low = 0, high = b.uconst(0);
+                const Operand& source = in.src[0];
+                if (source.kind == OperandKind::SGPR ||
+                    (source.kind == OperandKind::Special &&
+                     source.value >= 106 && source.value < 124)) {
+                    if (!scalar_word(source.value, low)) { ok = false; return true; }
+                    if (wide && !scalar_word(source.value + 1, high)) { ok = false; return true; }
+                } else if (source.kind == OperandKind::InlineInt) {
+                    low = b.uconst(static_cast<uint32_t>(source.value));
+                    if (wide) high = b.uconst(source.value < 0 ? UINT32_MAX : 0u);
+                } else if (source.kind == OperandKind::Literal) {
+                    low = b.uconst(in.literal);
+                } else {
+                    ok = false; return true;
+                }
+                // FindUMsb is undefined at zero, so never hand it a zero: OR in bit 0 (which cannot
+                // change the highest set bit of a non-zero value) and select the zero answer after.
+                auto leading_zeros = [&](uint32_t word) {
+                    return b.ibin(Op_ISub, b.uconst(31),
+                                  b.find_umsb(b.ibin(Op_BitwiseOr, word, b.uconst(1))));
+                };
+                const uint32_t none = b.uconst(0xffffffffu);
+                uint32_t result;
+                if (!wide) {
+                    result = b.sel(b.ucmp(Op_INotEqual, low, b.uconst(0)),
+                                   leading_zeros(low), none);
+                } else {
+                    result = b.sel(
+                        b.ucmp(Op_INotEqual, high, b.uconst(0)), leading_zeros(high),
+                        b.sel(b.ucmp(Op_INotEqual, low, b.uconst(0)),
+                              b.ibin(Op_IAdd, b.uconst(32), leading_zeros(low)), none));
+                }
+                rs.sreg[in.dst.value] = result;
+                rs.sreg_srt.erase(in.dst.value);
+                rs.sreg_bool.erase(in.dst.value);
+                rs.sreg_bool_narrowed.erase(in.dst.value);
+                rs.sreg_bool_b32.erase(in.dst.value);
+                // The live destination is VCC_LO used purely as scalar data. Overwriting the
+                // physical register destroys whatever predicate the pair held, so drop the tracked
+                // mask instead of leaving a stale one: a later consumer of VCC then fails visibly
+                // rather than branching on a value the guest has already overwritten.
+                if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = 0;
+                return true;
+            }
             if (in.opcode == 0x1b || in.opcode == 0x1d) {
                 // s_bitset{0,1}_b32 is an in-place scalar read/modify/write. The encoded source is
                 // the bit index while SDST supplies both the old value and destination. Astro's
@@ -6519,7 +6589,93 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::VOP3P: {
-            if (in.opcode == 0x0F || in.opcode == 0x10) {  // v_pk_add_f16 / v_pk_mul_f16
+            if (in.opcode <= 0x0Du) {
+                // The packed 16-bit INTEGER family. Sonic Racing: CrossWorlds' post chain rejects on
+                // v_pk_add_u16 (#2013); the rest of the family is the same lowering behind the same
+                // half-select wrapper. Each result half k is computed from source halves selected by
+                // OPSEL[src] (low result) / OPSEL_HI[src] (high result), and BOTH halves are always
+                // written — unlike the scalar 16-bit VOP3 ops, a packed op has no preserved half.
+                //   0x00 v_pk_mad_i16      D.i16[k] = S0*S1 + S2
+                //   0x01 v_pk_mul_lo_u16   D.u16[k] = low16(S0 * S1)
+                //   0x02/0x03 v_pk_add_i16 / v_pk_sub_i16
+                //   0x04/0x05/0x06 v_pk_lshlrev_b16 / v_pk_lshrrev_b16 / v_pk_ashrrev_i16
+                //                  (REVERSED operands: D = S1 <op> (S0 & 0xf))
+                //   0x07/0x08 v_pk_max_i16 / v_pk_min_i16
+                //   0x09 v_pk_mad_u16      (identical 16-bit bit pattern to v_pk_mad_i16)
+                //   0x0a/0x0b v_pk_add_u16 / v_pk_sub_u16 (identical bit result to the i16 forms)
+                //   0x0c/0x0d v_pk_max_u16 / v_pk_min_u16
+                // VERIFIED(round-trip llvm-mc gfx1030, every opcode above); the live encoding
+                // `cc0a0002,18020504` disassembles to `v_pk_add_u16 v2, v4, v2`.
+                // CONFIDENCE: HIGH on the operations themselves.
+                //
+                // NEG_LO/NEG_HI on a packed INTEGER source: applied as a flip of bit 15 of the
+                // selected 16-bit half — physically the same shared sign-negate the packed f16 path
+                // above already models with fneg, sitting between the operand read and the ALU and
+                // indifferent to how the ALU then interprets the bits. CONFIDENCE: MED — this is
+                // derived from live evidence, not from a published statement, so here is the
+                // derivation. All FOUR sites in this title that set the bits use the same literal
+                // `0x00007fff` and set NEG_LO[0] and NEG_HI[0] together, with OPSEL/OPSEL_HI
+                // selecting that literal's LOW half:
+                //   * `v_pk_add_u16 v4, -(0x7fff), v2 op_sel:[0,1] op_sel_hi:[0,0]` produces the
+                //     base of a gather whose per-lane offsets are then +0/+2 (a 2x2 quad), so the
+                //     base must be (x-1, y-1);
+                //   * `v_pk_max_i16 v4, -(0x7fff), v3` sits beside `v_min_i16 2, …` and
+                //     `v_pk_min_i16 1, …`, i.e. an offset clamped into a small range around zero.
+                // Bit-15 flip gives 0xffff = -1, which satisfies both. The alternative reading,
+                // two's-complement negation, gives -32767 — which would make that `v_pk_max_i16` a
+                // no-op sitting next to a `min` of +1, and no compiler emits that. If a later title
+                // contradicts this, the discriminating input is any negated source whose selected
+                // half is not 0x7fff.
+                const uint32_t old_d = vreg_old(b, rs, in.dst.value);
+                // A 16-bit operand position carries the 16-bit encoding of an inline constant, not
+                // the f32 pattern val() would materialize — the same rule the scalar 16-bit VOP3
+                // family follows. The half select still applies to the sign-extended 32-bit value.
+                auto u16src = [&](int k, bool high_result) {
+                    const Operand& operand = in.src[k];
+                    const uint8_t selectors = high_result ? in.vop3p_opsel_hi : in.vop3p_opsel;
+                    const uint32_t half = (selectors >> k) & 1u;
+                    uint32_t v;
+                    if (operand.kind == OperandKind::InlineFloat)
+                        v = b.uconst(half ? 0u : inline_float_f16_bits(operand.value));
+                    else if (operand.kind == OperandKind::InlineInt)
+                        v = b.uconst((static_cast<uint32_t>(operand.value) >> (16u * half)) &
+                                     0xFFFFu);
+                    else
+                        v = b.bfe_u(val(operand), b.uconst(16u * half), b.uconst(16));
+                    const bool negate = high_result ? ((in.vop3p_neg_hi >> k) & 1u) != 0
+                                                    : in.src_neg[k];
+                    return negate ? b.ibin(Op_BitwiseXor, v, b.uconst(0x8000u)) : v;
+                };
+                auto s16 = [&](uint32_t v) { return b.bfe_s(v, b.uconst(0), b.uconst(16)); };
+                auto operation = [&](bool high) {
+                    const uint32_t s0 = u16src(0, high), s1 = u16src(1, high);
+                    uint32_t r;
+                    switch (in.opcode) {
+                        case 0x00: case 0x09:
+                            r = b.ibin(Op_IAdd, b.ibin(Op_IMul, s0, s1), u16src(2, high)); break;
+                        case 0x01:  r = b.ibin(Op_IMul, s0, s1); break;
+                        case 0x02: case 0x0A: r = b.ibin(Op_IAdd, s0, s1); break;
+                        case 0x03: case 0x0B: r = b.ibin(Op_ISub, s0, s1); break;
+                        case 0x04:  r = b.ibin(Op_ShiftLeftLogical, s1,
+                                               b.ibin(Op_BitwiseAnd, s0, b.uconst(0xFu))); break;
+                        case 0x05:  r = b.ibin(Op_ShiftRightLogical, s1,
+                                               b.ibin(Op_BitwiseAnd, s0, b.uconst(0xFu))); break;
+                        case 0x06:  r = b.sbin(Op_ShiftRightArithmetic, s16(s1),
+                                               b.ibin(Op_BitwiseAnd, s0, b.uconst(0xFu))); break;
+                        case 0x07:  r = b.sext2(Glsl_SMax, s16(s0), s16(s1)); break;
+                        case 0x08:  r = b.sext2(Glsl_SMin, s16(s0), s16(s1)); break;
+                        case 0x0C:  r = b.uext2(Glsl_UMax, s0, s1); break;
+                        default:    r = b.uext2(Glsl_UMin, s0, s1); break;     // 0x0d v_pk_min_u16
+                    }
+                    return b.ibin(Op_BitwiseAnd, r, b.uconst(0xFFFFu));
+                };
+                rs.vreg[in.dst.value] = b.ibin(
+                    Op_BitwiseOr, operation(false),
+                    b.ibin(Op_ShiftLeftLogical, operation(true), b.uconst(16)));
+                predicate_write(b, rs, in.dst.value, old_d);
+                return true;
+            }
+            if (in.opcode >= 0x0Eu && in.opcode <= 0x12u) {  // v_pk_fma/add/mul/min/max_f16
                 const uint32_t old_d = vreg_old(b, rs, in.dst.value);
                 auto half = [&](int source, bool high_result) -> uint32_t {
                     uint32_t v = val(in.src[source]);
@@ -6542,10 +6698,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         : in.src_neg[source];
                     return negate ? b.fneg(v) : v;
                 };
+                // 0x0e v_pk_fma_f16 is the only three-source form; min/max return the OTHER operand
+                // when exactly one input is NaN (ISA 12.7), which is GLSL NMin/NMax, not FMin/FMax.
+                // VERIFIED(round-trip llvm-mc gfx1030) for 0x0e/0x11/0x12.
                 auto operation = [&](bool high) {
-                    uint32_t r = in.opcode == 0x0F
-                        ? b.fbin(Op_FAdd, half(0, high), half(1, high))
-                        : b.fbin(Op_FMul, half(0, high), half(1, high));
+                    uint32_t r;
+                    switch (in.opcode) {
+                        case 0x0E: r = b.fbin(Op_FAdd,
+                                              b.fbin(Op_FMul, half(0, high), half(1, high)),
+                                              half(2, high)); break;
+                        case 0x0F: r = b.fbin(Op_FAdd, half(0, high), half(1, high)); break;
+                        case 0x10: r = b.fbin(Op_FMul, half(0, high), half(1, high)); break;
+                        case 0x11: r = b.fext2(Glsl_NMin, half(0, high), half(1, high)); break;
+                        default:   r = b.fext2(Glsl_NMax, half(0, high), half(1, high)); break;
+                    }
                     if (in.clamp) r = b.clamp01(r);
                     return r;
                 };
@@ -6899,11 +7065,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
-            // BYTE-select v_mov_b32_sdwa (#273 — DOLL's title post PSes unpack a packed dword:
-            // `v_mov_b32_sdwa v6, v15 src0_sel:BYTE_0`): dst is the whole dword (UNUSED_PAD), so the
-            // result is the selected byte zero-extended.
-            if (in.opcode == 0x01 && in.sdwa_dst_sel == 6 && in.sdwa_src0_sel <= 3) {
-                d = b.bfe_u(a, b.uconst(8u * in.sdwa_src0_sel), b.uconst(8));
+            // BYTE- or WORD-select v_mov_b32_sdwa (#273 — DOLL's title post PSes unpack a packed
+            // dword: `v_mov_b32_sdwa v6, v15 src0_sel:BYTE_0`; #2013 — Sonic Racing: CrossWorlds'
+            // `v_mov_b32_sdwa v0, v0 src0_sel:WORD_0`): dst is the whole dword (UNUSED_PAD), so the
+            // result is the selected byte/word zero-extended.
+            if (in.opcode == 0x01 && in.sdwa_dst_sel == 6 && in.sdwa_src0_sel <= 5) {
+                d = in.sdwa_src0_sel <= 3
+                    ? b.bfe_u(a, b.uconst(8u * in.sdwa_src0_sel), b.uconst(8))
+                    : b.bfe_u(a, b.uconst(16u * (in.sdwa_src0_sel - 4u)), b.uconst(16));
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
@@ -6997,14 +7166,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // of saturating it. VERIFIED(round-trip llvm-mc gfx1030, VOP1 0x50-0x53; the live
             // encoding 7e08a504 is `v_cvt_u16_f16_e32 v4, v4`). CONFIDENCE: HIGH.
             // PLAIN e32 ONLY — see the `!has_sdwa` note on the transcendental block above.
-            if (in.opcode >= 0x50 && in.opcode <= 0x53 && !in.has_sdwa && in.sdwa_dst_sel == 6 &&
-                !in.clamp && !in.omod) {
+            // The 16-bit convert family, in the plain e32 form (no SDWA control word at all) or in
+            // the WORD-destination SDWA form the decoder admits: dst WORD_0/1 + UNUSED_PRESERVE
+            // from a full-DWORD source with no modifier. A DWORD-destination SDWA form still
+            // rejects, because its control word can carry src0 NEG/ABS that the generic VOP1 path
+            // would apply in the f32 domain to the packed dword — the wrong half for an op that
+            // reads bits[15:0].
+            const bool convert16_word_sdwa =
+                in.has_sdwa && in.sdwa_dst_sel != 6 && in.sdwa_src0_sel >= 4 && in.sdwa_src0_sel <= 6;
+            if (in.opcode >= 0x50 && in.opcode <= 0x53 &&
+                (!in.has_sdwa || convert16_word_sdwa) && !in.clamp && !in.omod) {
                 const bool from_float = in.opcode >= 0x52;
                 uint32_t raw = a;   // inline constants: 16-bit-width encoding, not the f32 pattern
                 if (in.src[0].kind == OperandKind::InlineFloat)
                     raw = b.uconst(inline_float_f16_bits(in.src[0].value));
                 else if (in.src[0].kind == OperandKind::InlineInt)
                     raw = b.uconst(static_cast<uint32_t>(in.src[0].value));
+                else if (in.sdwa_src0_sel == 5)
+                    // SDWA src0_sel WORD_1: the 16-bit operand is bits [31:16]. DWORD and WORD_0
+                    // both name [15:0], which is where the reads below already look.
+                    raw = b.ibin(Op_ShiftRightLogical, raw, b.uconst(16));
                 uint32_t r16;
                 if (from_float) {
                     // Clamping the INTEGER result is correct and sufficient here, and an outer
@@ -7028,8 +7209,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                              : b.cvt_i2f(b.bfe_s(word, b.uconst(0), b.uconst(16))));
                 }
                 r16 = b.ibin(Op_BitwiseAnd, r16, b.uconst(0xFFFFu));
-                d = b.ibin(Op_BitwiseOr,
-                           b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
+                // dst_sel 6 (plain e32) and 4 (WORD_0) both write bits [15:0]; 5 writes [31:16].
+                // Either way the opposite half is preserved.
+                d = in.sdwa_dst_sel == 5
+                    ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                             b.ibin(Op_ShiftLeftLogical, r16, b.uconst(16)))
+                    : b.ibin(Op_BitwiseOr,
+                             b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
@@ -7427,6 +7613,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 default: ok = false;
             }
+            // SDWA sub-dword DESTINATION for the integer VOP2 ops (#2013). The operation itself ran
+            // on the (already sub-dword-selected) sources above and produced a full dword; DST_SEL
+            // says which byte/word of the register receives its low bits, and DST_UNUSED says what
+            // happens to the rest — UNUSED_PAD (0) zero-fills it, UNUSED_PRESERVE (2) keeps the old
+            // register bits. (Sonic Racing: CrossWorlds' `v_and_b32_sdwa v2, 6, v0 dst_sel:WORD_0
+            // dst_unused:UNUSED_PRESERVE`; the decoder admits only PAD/PRESERVE, so UNUSED_SEXT
+            // still rejects.) Without this the whole result landed in bits [31:0], silently
+            // clobbering the half the guest asked to preserve.
+            if (ok && integer_sdwa && in.sdwa_dst_sel != 6) {
+                const uint32_t width  = in.sdwa_dst_sel <= 3 ? 8u : 16u;
+                const uint32_t offset = in.sdwa_dst_sel <= 3 ? 8u * in.sdwa_dst_sel
+                                                             : 16u * (in.sdwa_dst_sel - 4u);
+                const uint32_t field_mask = ((1u << width) - 1u) << offset;
+                const uint32_t placed = b.ibin(
+                    Op_ShiftLeftLogical,
+                    b.ibin(Op_BitwiseAnd, d, b.uconst((1u << width) - 1u)), b.uconst(offset));
+                d = in.sdwa_dst_unused == 2u
+                    ? b.ibin(Op_BitwiseOr,
+                             b.ibin(Op_BitwiseAnd, old_d, b.uconst(~field_mask)), placed)
+                    : placed;
+            }
             // SDWA output modifier: OMOD scale (×2/×4/×0.5) then CLAMP saturate, on FLOAT-result opcodes
             // only (int ops never carry omod). Mirrors the VOP3 fresult path; a no-op when omod/clamp unset.
             if (ok && (in.omod || in.clamp) && !packed_f16) switch (in.opcode) {
@@ -7478,6 +7685,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // i32/i64, and u32/u64 windows.
             const bool integer_compare =
                 (eff >= 0x81u && eff <= 0x86u) ||
+                (eff >= 0x89u && eff <= 0x8Eu) ||
+                (eff >= 0xA9u && eff <= 0xAEu) ||
                 (eff >= 0xC1u && eff <= 0xC6u);
             if (integer_compare) {
                 auto sdwa_integer = [&](uint32_t raw, uint8_t sel) {
@@ -7550,6 +7759,34 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x84: cmp = b.scmp(Op_SGreaterThan, a, c); break;         // v_cmp_gt_i32
                 case 0x85: cmp = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_i32 (sign-agnostic)
                 case 0x86: cmp = b.scmp(Op_SGreaterThanEqual, a, c); break;    // v_cmp_ge_i32
+                // 16-bit integer compares (i16 0x89-0x8e, u16 0xa9-0xae) read bits [15:0] of each
+                // source; the i16 window sign-extends and the u16 window zero-extends, after which
+                // the ordinary 32-bit relational operators give the exact 16-bit answer. Both
+                // windows carry the same six operations in the same order (lt/eq/le/gt/ne/ge), so
+                // one shared body indexes them by the low three bits.
+                // VERIFIED(round-trip llvm-mc gfx1030): 0x89 is v_cmp_lt_i16 and 0xab is
+                // v_cmp_le_u16 — the encoding Sonic Racing: CrossWorlds emits (#2013).
+                case 0x89: case 0x8A: case 0x8B: case 0x8C: case 0x8D: case 0x8E:
+                case 0xA9: case 0xAA: case 0xAB: case 0xAC: case 0xAD: case 0xAE: {
+                    const bool narrow_signed = eff <= 0x8Eu;
+                    const uint32_t x = narrow_signed ? b.bfe_s(a, b.uconst(0), b.uconst(16))
+                                                     : b.bfe_u(a, b.uconst(0), b.uconst(16));
+                    const uint32_t y = narrow_signed ? b.bfe_s(c, b.uconst(0), b.uconst(16))
+                                                     : b.bfe_u(c, b.uconst(0), b.uconst(16));
+                    switch (eff & 7u) {
+                        case 1: cmp = narrow_signed ? b.scmp(Op_SLessThan, x, y)
+                                                    : b.ucmp(Op_ULessThan, x, y); break;
+                        case 2: cmp = b.ucmp(Op_IEqual, x, y); break;
+                        case 3: cmp = narrow_signed ? b.scmp(Op_SLessThanEqual, x, y)
+                                                    : b.ucmp(Op_ULessThanEqual, x, y); break;
+                        case 4: cmp = narrow_signed ? b.scmp(Op_SGreaterThan, x, y)
+                                                    : b.ucmp(Op_UGreaterThan, x, y); break;
+                        case 5: cmp = b.ucmp(Op_INotEqual, x, y); break;
+                        default: cmp = narrow_signed ? b.scmp(Op_SGreaterThanEqual, x, y)
+                                                     : b.ucmp(Op_UGreaterThanEqual, x, y); break;
+                    }
+                    break;
+                }
                 case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA5: case 0xA6: {
                     const uint32_t lhs = b.u64_from_lohi(a64.lo, a64.hi);
                     const uint32_t rhs = b.u64_from_lohi(c64.lo, c64.hi);
@@ -7965,11 +8202,42 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.clamp) bits = b.clamp01(bits);
                 return bits;
             };
-            if (in.opcode == 0x34B || in.opcode == 0x354) {
+            if (in.opcode == 0x311) {
+                // v_pack_b32_f16: D.u32 = {S1.f16, S0.f16} — S0's selected half becomes bits
+                // [15:0] and S1's becomes [31:16]. OPSEL[k] picks which half of each source is
+                // read; the destination is a whole dword, so OPSEL[3] has nothing to select.
+                // This is the instruction that re-assembles the two halves the 16-bit convert
+                // family produces, so it appears immediately behind them (Sonic Racing:
+                // CrossWorlds, `d7110020,00020500` = `v_pack_b32_f16 v32, v0, v2`, #2013).
+                // VERIFIED(round-trip llvm-mc gfx1030). It is a bit move, so ABS/NEG (which would
+                // be f16 sign operations on the selected halves) and CLAMP/OMOD are not modeled
+                // and reject rather than being silently dropped.
+                if (in.src_abs[0] || in.src_abs[1] || in.src_neg[0] || in.src_neg[1] ||
+                    in.clamp || in.omod) {
+                    ok = false;
+                } else {
+                    auto packed_half = [&](int k) {
+                        const Operand& operand = in.src[k];
+                        if (operand.kind == OperandKind::InlineFloat)
+                            return b.uconst(inline_float_f16_bits(operand.value));
+                        if (operand.kind == OperandKind::InlineInt)
+                            return b.uconst(static_cast<uint32_t>(operand.value) & 0xFFFFu);
+                        return b.bfe_u(val(operand),
+                                       b.uconst(16u * ((in.vop3p_opsel >> k) & 1u)), b.uconst(16));
+                    };
+                    vreg[in.dst.value] = b.ibin(
+                        Op_BitwiseOr, packed_half(0),
+                        b.ibin(Op_ShiftLeftLogical, packed_half(1), b.uconst(16)));
+                }
+            } else if (in.opcode == 0x34B || in.opcode == 0x351 ||
+                in.opcode == 0x354 || in.opcode == 0x357) {
                 // Scalar f16 VOP3: one selected half from each packed source and one independently
                 // selected destination half. The opposite destination half is preserved. The
                 // `v_max3_f16` occurs eight times in Syberia's nonzero 960x544 gameplay composite
-                // dispatch; llvm-mc gfx1030 identifies opcode 0x354 exactly.
+                // dispatch; llvm-mc gfx1030 identifies opcode 0x354 exactly, and the same round trip
+                // names its two siblings 0x351 v_min3_f16 and 0x357 v_med3_f16 — Sonic Racing:
+                // CrossWorlds' upscale kernel emits `d7571003,02020af2`
+                // = `v_med3_f16 v3, 1.0, v5, 0 op_sel:[0,1,0,0]` (#2013).
                 auto f16src = [&](int k) {
                     const Operand& operand = in.src[k];
                     uint32_t raw = val(operand);
@@ -7987,9 +8255,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t result = 0;
                 if (in.opcode == 0x34B) {                            // v_fma_f16
                     result = b.fbin(Op_FAdd, b.fbin(Op_FMul, f16src(0), f16src(1)), f16src(2));
-                } else {                                             // v_max3_f16
+                } else if (in.opcode == 0x351) {                     // v_min3_f16
+                    result = b.fext2(Glsl_NMin,
+                                     b.fext2(Glsl_NMin, f16src(0), f16src(1)), f16src(2));
+                } else if (in.opcode == 0x354) {                     // v_max3_f16
                     result = b.fext2(Glsl_NMax,
                                      b.fext2(Glsl_NMax, f16src(0), f16src(1)), f16src(2));
+                } else {                                             // v_med3_f16
+                    // Median of three, the same formula the f32 form uses: NaN-aware min/max so a
+                    // single NaN input yields the other operand rather than propagating.
+                    const uint32_t x = f16src(0), y = f16src(1), z = f16src(2);
+                    auto mn = [&](uint32_t p, uint32_t q) { return b.fext2(Glsl_NMin, p, q); };
+                    auto mx = [&](uint32_t p, uint32_t q) { return b.fext2(Glsl_NMax, p, q); };
+                    result = mx(mn(x, y), mx(mn(x, z), mn(y, z)));
                 }
                 result = fresult(result);
                 uint32_t r16 = b.pack_half_lo(result);
@@ -8436,6 +8714,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             : b.mbcnt(active, acc, in.opcode == 0x365));
                 }
                 else ok = false;
+            } else if ((in.opcode == 0x365 || in.opcode == 0x366) &&
+                       in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1 &&
+                       (b.is_compute || b.is_fragment)) {
+                // An ALL-ONES mask makes MBCNT a pure function of this lane's OWN index: the number
+                // of set bits below lane L in an all-ones 64-bit mask is L, so LO contributes
+                // min(L, 32) and HI contributes max(L - 32, 0). No other lane's state is read, so
+                // this form needs neither `allow_wave` nor a subgroup/LDS reduction and stays exact
+                // under divergent control flow — it is the ubiquitous "what is my lane id" idiom,
+                // and it is the scalar counterpart of the ngg_logical_lane branch above.
+                // (Sonic Racing: CrossWorlds' compute post chain emits `d7650001,000100c1` =
+                // `v_mbcnt_lo_u32_b32 v1, -1, 0` inside a structured region, where the compute
+                // structurizer sets wave_ok=false and the branch above therefore never runs; #2013.)
+                const uint32_t lane = b.ibin(Op_BitwiseAnd, b.guest_lane_id(),
+                                             b.uconst(b.wave_size - 1));
+                const uint32_t high = b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32));
+                const uint32_t count = in.opcode == 0x365
+                    ? b.sel(high, b.uconst(32), lane)
+                    : b.sel(high, b.ibin(Op_ISub, lane, b.uconst(32)), b.uconst(0));
+                vreg[in.dst.value] = b.ibin(Op_IAdd, val(in.src[1]), count);
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
             } else if (in.opcode == 0x103) {                          // v_add_f32 (VOP3 form)

@@ -103,34 +103,90 @@ from the call census. The title is compositing almost nothing while doing normal
 
 Two measured leads, both recorded on [#2013](https://github.com/mattias800/prosper/issues/2013):
 
-- **Draws are dropped because their shaders do not recompile.** `[exec-recompile-reject]` names a
-  graphics pair (`es=…`/`ps=…`) whose draws are skipped, and `PROSPER_DBG=1` gives the rejecting
-  opcodes. Two `(es, ps)` pairs are affected on every arm — `vs=4445 ena=0x20` and
-  `vs=1346 ena=0x302` — and the occurrence counter (logged on powers of two) reaches **256+** for one
-  of them, so this is hundreds of dropped draws per boot, not the 32 the first census could see.
-- **Nine distinct compute programs are skipped** (`[compute] skip unsupported program`), plus one
+- **Draws are dropped because one of their two shader stages does not recompile.**
+  `[exec-recompile-reject]` names the pair (`es=…`/`ps=…`) whose draws are skipped and reports each
+  stage's emitted SPIR-V size, so it also says *which* stage failed. **Four** `(es, ps)` pairs are
+  affected on every arm, not the two the first census recorded: `vs=4445 fs=0` and `vs=1346 fs=0`
+  fail in the **pixel** shader, and two pairs sharing one `es` at `vs=0 fs=88449` / `vs=0 fs=139235`
+  fail in the **vertex** shader. The occurrence counter (logged on powers of two) reaches **256+**
+  for one of them, so this is hundreds of dropped draws per boot.
+- **Eight distinct compute programs are skipped** (`[compute] skip unsupported program`), plus one
   3D-tile volume dispatch skipped under #590.
 
-### The reject chain, and how deep it goes
+### The reject chain — and the partition that matters more than the list
 
 `PROSPER_DBG=1` names the *first* unhandled instruction in each program, so the census is a peeled
-onion: implementing one tier reveals the next inside the same shaders. Measured on current master
-(`beeff2ab`) and after each tier landed, over identical 200 s `boot_trace` arms:
+onion: implementing one tier reveals the next inside the same shaders. Every encoding named below
+was round-tripped through `llvm-mc -mcpu=gfx1030` from the exact logged words
+(`tools/re/disasm_words.py`), never read off an opcode table — see the `0x305` trap in *Ruled out*.
 
-| tier | rejecting ops (sites/boot) | disassembly (`llvm-mc -mcpu=gfx1030` of the exact logged words) |
+**Attributing each reject to the program it came from splits the census into two populations that
+the earlier flat list had merged.** The attribution is mechanical: `PROSPER_SHADER_DUMP=<dir>` writes
+the raw bytes of every failing stage, `shader_inspect --stage …` re-runs the recompiler over each
+dump offline, and the exact logged words can be located by index inside those dumps.
+
+| population | how many | what actually fails |
 |---|---|---|
-| master | VOP3 `0x307` (30), VOP3 `0x156` (8), VOP1 `0x54` (3) | `v_lshrrev_b16` (one site with `op_sel:[0,0,1]`), `v_max3_u32`, `v_rcp_f16_e32` |
-| after those | VOP3 `0x303` (24), VOP1 `0x52` (10) | `v_add_nc_u16`, `v_cvt_u16_f16_e32` |
-| after those | VOP3 `0x358` (14), VOP3 `0x365` (5), VOP3P `0xa` (5) | `v_med3_i16`, `v_mbcnt_lo_u32_b32`, `v_pk_add_u16` |
+| the dropped **graphics** pipelines | 4 | a **descriptor resolution**, never a missing opcode |
+| the skipped **compute** programs | 8 | missing instructions, and unstructured control flow |
 
-Everything in the first three tiers is the **16-bit VALU family**, which is why it peels this way:
-one UE5 post-processing shader does its whole chain in packed 16-bit arithmetic. What survives all
-three tiers, and is *not* that family, is the real remaining list: `v_and_b32_sdwa` /
-`v_mov_b32_sdwa` in WORD-select form (VOP2 `0x1b`, VOP1 `0x1`), `v_pk_add_u16` (VOP3P `0xa`),
-`v_mbcnt_lo_u32_b32` (VOP3 `0x365`), `buffer_load_format_xyz` (MUBUF `0x2`), `s_cbranch_vccz/vccnz`
-(SOPP `0x6`/`0x7`, the #590 family), `s_flbit_i32_b64` (SOP1 `0x16`), and the two `[mimg-unresolved]`
-descriptor failures. **The two MIMG rejects are not missing opcodes** — `0x20`/`0x27` disassemble to
-`image_sample` / `image_sample_lz`, which the recompiler supports; their SRSRC does not resolve.
+Every one of the four dropped pipelines fails on an unresolved descriptor:
+
+```text
+[mimg-unresolved]  pc=80   srsrc=s0  srt_tag=NONE  (ps 4445, image_sample)
+[mimg-unresolved]  pc=654  srsrc=s8  srt_tag=0x60  (ps 1346, image_sample_lz)
+[mubuf-unresolved] pc=211  srsrc=s4  srt_tag=NONE  (the shared vs, buffer_load_format_xyz)
+```
+
+So **`buffer_load_format_xyz` was never a missing opcode.** `e0082000,6a010000` disassembles to
+`buffer_load_format_xyz v[0:2], v0, s[4:7], vcc_lo idxen`, which the recompiler has always
+supported; its V# does not resolve. It belongs with the two `[mimg-unresolved]` failures and the
+bindless-descriptor work, exactly where the two MIMG rejects were already assigned.
+
+The consequence is load-bearing: **finishing the opcode list cannot change what the four dropped
+draws do**, because not one of them is blocked on an opcode. Opcode work can only restore compute
+programs — which is still worth doing (a skipped LUT or exposure dispatch is a documented way a
+whole composite collapses), but it is not the lever for these draws.
+
+### The opcode tiers, measured
+
+Identical 220 s `boot_trace` arms, `PROSPER_DBG=1`, one arm per tier. Absence is asserted from two
+independent instruments, because a single one would not be enough: the live `[recompile-reject]`
+line, **and** an offline `shader_inspect` pass over the dumped programs, which has no rate limit and
+no cap and is therefore complete by construction over the shaders it is given.
+
+| tier | rejecting ops (sites/arm) | disassembly of the exact logged words |
+|---|---|---|
+| `beeff2ab` | VOP3 `0x307` (30), VOP3 `0x156` (8), VOP1 `0x54` (3) | `v_lshrrev_b16` (one site with `op_sel:[0,0,1]`), `v_max3_u32`, `v_rcp_f16_e32` |
+| + those (#2067) | VOP3 `0x303` (24), VOP1 `0x52` (10) | `v_add_nc_u16`, `v_cvt_u16_f16_e32` |
+| + those (#2067) | VOP3 `0x358` (14), VOP3 `0x365` (5), VOP3P `0xa` (5) | `v_med3_i16`, `v_mbcnt_lo_u32_b32`, `v_pk_add_u16` |
+| `f080fc23` (this lane's base) | VOP2 `0x1b` (4), VOP1 `0x1` (11), VOP3 `0x365` (5) | `v_and_b32_sdwa` with a WORD **destination**, `v_mov_b32_sdwa` with a WORD **source**, `v_mbcnt_lo_u32_b32` |
+| + those | VOP3P `0xa`, VOP3 `0x357` — behind the three above *inside the same programs*, so they surface offline rather than as their own arm | `v_pk_add_u16` (including the `NEG` form below), `v_med3_f16` |
+| + those | VOP1 `0x53` (5), VOP1 `0x51` (5), VOPC `0xab` (4) | the SDWA form of `v_cvt_i16_f16` / `v_cvt_f16_i16`, `v_cmp_le_u16_sdwa` |
+| + those | VOP3 `0x311` (4), VOP1 `0x51` (5, now `src0_sel:WORD_1`) | `v_pack_b32_f16`, the WORD-source form of the same convert |
+| + those (**where this lane stopped**) | VOP1 `0x1` (5) | `v_mov_b32_sdwa v14, sext(v8) src0_sel:WORD_0` — the **sign-extending** WORD move, one bit away from the zero-extending form above and a different operation |
+
+Everything in every tier so far is the **16-bit VALU family** in some encoding — scalar, packed,
+SDWA, compare, convert and pack. One UE5 post chain runs end to end in packed 16-bit arithmetic,
+which is why it peels rather than showing its whole requirement at once.
+
+**What is left after all of the above, and is not that family:**
+
+- `s_cbranch_vccz` / `s_cbranch_vccnz` (SOPP `0x6`/`0x7`) and a forward `s_cbranch_execz`
+  (SOPP `0x8`) — the #590 control-flow frontier. Two compute programs stop here, one on a
+  `[compute-struct-reject] backward else pc=36 branch=117 target=118` shape.
+- `s_flbit_i32_b64` (SOP1 `0x16`) — **implemented** by this lane, but it sits *behind* the
+  `s_cbranch_vccz` in the same program, so it changes nothing until the control flow does.
+- `v_mov_b32_sdwa` with **SEXT** on its source (`7e1c02f9,000c0608`): the zero-extending form is
+  implemented, the sign-extending one is a different operation and still rejects. This is the very
+  next tier and is small; it was left because the census had not converged and the peel had already
+  moved twice past the point where the answer to *this title's* question was settled.
+- `image_sample_lz` with `dim=SQ_RSRC_IMG_2D_ARRAY d16` (`f09c0f28,80ea003d`) and `image_atomic_add`
+  with the same dim (MIMG `0x11`) — arrayed-image sampling and atomics, the deferred MIMG features
+  already inventoried in [`RECOMPILER_REMAINING.md`](RECOMPILER_REMAINING.md).
+- The three `[mimg-unresolved]` / `[mubuf-unresolved]` descriptor failures above.
+- One "program" at `0x2d800d0000` that is **12,916 dwords of zero**. It is not a shader; treat a
+  reject at `pc=0 words=00000000,00000000` as a bad `code_addr`, not as an opcode gap.
 
 ## Unimplemented-call census (default launch, current master + #2012)
 
@@ -205,23 +261,46 @@ One line per falsified hypothesis, with the evidence that killed it.
   but not evidence that the title has stopped submitting: the same phase carries ~50 4K-target
   submits per 10 s. Use `PROSPER_CAPTURE_FRAMES>1` here. (This lane, 2026-08-06.)
 
+- **`buffer_load_format_xyz` is NOT a missing opcode, and the dropped draws are not an opcode
+  problem at all.** #2013 listed MUBUF `0x2` alongside the missing instructions. Attributing every
+  reject to its program shows all **four** dropped `(es, ps)` pipelines fail on an unresolved
+  descriptor instead — two `[mimg-unresolved]` in the pixel shader and one `[mubuf-unresolved]`
+  (`pc=211 srsrc=s4 srt_tag=NONE`) in the vertex shader that two of them share.
+  `e0082000,6a010000` round-trips to `buffer_load_format_xyz v[0:2], v0, s[4:7], vcc_lo idxen`,
+  which the recompiler has always supported. **So finishing the opcode list cannot change what those
+  draws do** — it can only restore compute programs. (This lane, 2026-08-06.)
+- **The earlier "two dropped `(es, ps)` pairs" count was low.** A 220 s arm reports **four**, and the
+  two new ones fail in the **vertex** stage (`vs=0 fs=88449` / `vs=0 fs=139235`), which the
+  `[exec-recompile-reject]` line already said in its per-stage SPIR-V sizes. Read `vs=`/`fs=` as
+  "which stage produced nothing", not as a shader identifier. (This lane, 2026-08-06.)
+- **`shader_inspect --stage` cannot see past the FIRST table-dependent instruction, so it under-reports
+  a graphics stage's real reject.** On every one of this title's failing pixel shaders it stops at the
+  `SMEM` at `pc=2`/`pc=3` with `reason=graphics-disabled` — the documented #1571 limitation — and one
+  of them reports `unsupported=0` from generic coverage, which reads like a clean bill of health.
+  The live `[recompile-reject]` from a real boot is the only instrument that names the actual failing
+  instruction in a graphics stage. It is still exact for **compute**, which passes `allow_smem=true`.
+  (This lane, 2026-08-06.)
+- **A `[recompile-reject] pc=0 words=00000000,00000000` is a bad `code_addr`, not an opcode gap.**
+  The skipped program at `0x2d800d0000` is 12,916 dwords of zero from its first word. It has been in
+  every census since the first and is not an instruction the recompiler is missing. (This lane.)
+
 ## Not verified
 
 Rung 2. Whether the post-logo uniform frame is a dropped-draw composite or a legitimate loading
-screen — a movie surface is now ruled out above, but the other two are not separated. Whether the two
-dropped `(es, ps)` pipelines are the UI layer, the post chain, or both, and therefore whether
-finishing the reject list is enough to reach a title screen. Any input route — nothing has been shown
+screen — a movie surface is now ruled out above, but the other two are not separated. Whether the
+four dropped `(es, ps)` pipelines are the UI layer, the post chain, or both. Whether resolving their
+descriptors is enough to reach a title screen: it is now known that finishing the *opcode* list is
+not, because none of the four is blocked on one. Any input route — nothing has been shown
 to respond to a pad yet. Windows or macOS. Performance figures: every arm shared the GPU with other
 lanes.
 
 ## The next step, in order
 
-1. **Finish the reject list** (#2013). The non-16-bit remainder is small and each piece is separable:
-   the SDWA WORD-select forms of `v_and_b32`/`v_mov_b32`, `v_pk_add_u16`, `v_mbcnt_lo_u32_b32`,
-   `buffer_load_format_xyz`, the #590 `s_cbranch_vcc*` family, `s_flbit_i32_b64`. The two
-   `[mimg-unresolved]` failures belong with the bindless-descriptor work instead.
-2. **Then re-measure the composite**, not before — the two pipelines reject at their *first*
-   unhandled instruction, so no partial tier can be expected to change a pixel.
-3. If the composite is still uniform with zero `[exec-recompile-reject]` lines, the cause is
-   elsewhere and the nine skipped compute programs plus the skipped 16x16x16 volume dispatch are the
-   next inventory.
+1. **The four dropped draws are a DESCRIPTOR problem** — two `[mimg-unresolved]` and one
+   `[mubuf-unresolved]`, none of them an opcode. That is where a rung-2 attempt should go, and it is
+   the bindless-descriptor frontier (#590 part B / #1607), not #2013.
+2. **The remaining opcode work is control flow**, not arithmetic: `s_cbranch_vccz`/`vccnz` and a
+   forward `s_cbranch_execz`, in two compute programs, one of them on a `backward else` shape. The
+   16-bit VALU family is otherwise complete through five tiers.
+3. **Then re-measure the composite.** It has not moved: black to t≈20 s, SEGA logo, then the uniform
+   frame, on every arm of every tier so far.

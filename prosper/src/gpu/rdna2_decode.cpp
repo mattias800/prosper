@@ -76,11 +76,13 @@ void decode_operands(Rdna2Inst& i) {
                         i.sdwa_src0_sel = (uint8_t)s0sel;
                         i.has_modifier = false;
                     }
-                    // BYTE-select move (#273 — byte unpack): dst DWORD + UNUSED_PAD, src0 BYTE_0..3,
-                    // no sext/neg/abs/clamp/omod. The recompiler zero-extends the selected byte.
+                    // BYTE- or WORD-select move into a full dword (#273/#2013 — sub-dword unpack):
+                    // dst DWORD + UNUSED_PAD, src0 BYTE_0..3 or WORD_0/1, no sext/neg/abs/clamp/
+                    // omod. The recompiler zero-extends the selected field.
                     // (llvm-mc gfx1030: 0x7e0c02f9 0x0000060f -> v_mov_b32_sdwa v6, v15
-                    // dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0.)
-                    else if (dsel == 6u && dun == 0u && s0sel <= 3u &&
+                    // dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0; Sonic Racing:
+                    // CrossWorlds' 0x7e0002f9 0x00040600 -> the same form with src0_sel:WORD_0.)
+                    else if (dsel == 6u && dun == 0u && s0sel <= 5u &&
                              !((sd >> 19) & 0x9u) && !i.clamp && !i.omod && !i.src_neg[0] && !i.src_abs[0]) {
                         i.sdwa_dst_sel = (uint8_t)dsel; i.sdwa_dst_unused = (uint8_t)dun;
                         i.sdwa_src0_sel = (uint8_t)s0sel;
@@ -150,6 +152,29 @@ void decode_operands(Rdna2Inst& i) {
                         i.has_modifier = false;
                     }
                 }
+                // The 16-bit CONVERT family (0x50-0x53) in SDWA form: the live producer writes one
+                // destination word with UNUSED_PRESERVE and reads either source word (Sonic Racing:
+                // CrossWorlds emits both `7e12a6f9,00061509` = `v_cvt_i16_f16_sdwa v9, v9
+                // dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD` and
+                // `7e20a2f9,0005140b` = `v_cvt_f16_i16_sdwa v16, v11 dst_sel:WORD_0
+                // dst_unused:UNUSED_PRESERVE src0_sel:WORD_1`, #2013). DWORD and WORD_0 name the
+                // same operand bits [15:0] for a 16-bit op; WORD_1 names [31:16]. A BYTE source
+                // select or any neg/abs/clamp/omod stays fail-visible: the generic VOP1 modifier
+                // path would apply the modifier in the f32 domain to the packed dword, which is the
+                // wrong half for an op that reads a 16-bit operand.
+                else if (((w >> 9) & 0xFFu) >= 0x50u && ((w >> 9) & 0xFFu) <= 0x53u) {
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u;
+                    if ((dsel == 4u || dsel == 5u) && dun == 2u &&
+                        (s0sel >= 4u && s0sel <= 6u) &&
+                        !((sd >> 19) & 0x9u) && !i.clamp && !i.omod &&
+                        !i.src_neg[0] && !i.src_abs[0]) {
+                        i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
+                        i.sdwa_dst_unused = static_cast<uint8_t>(dun);
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.has_modifier = false;
+                    }
+                }
                 // Packed unary f16 SDWA selects one source half, writes one destination half, and
                 // preserves the other. The producer uses rcp/sqrt/cos (0x54/0x55/0x61).
                 else if (((w >> 9) & 0xFFu) == 0x54u ||
@@ -190,13 +215,16 @@ void decode_operands(Rdna2Inst& i) {
                     !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
                     i.has_modifier = false;
                 // Integer VOP2 SDWA may select a byte/word from either source before the ALU
-                // operation.  Plucky Squire's first gameplay scene uses the four byte selectors
-                // with v_mul_u32_u24 to unpack an RGBA8 value (three times BYTE_0..3).  Admit the
-                // general no-SEXT/no-saturation integer subset: source values are zero-extended,
-                // the destination is a full dword, and the normal integer VOP2 lowering remains
-                // responsible for the operation itself.  Signed extension, integer clamp and
-                // sub-dword destinations remain fail-visible until their distinct semantics are
-                // modeled.
+                // operation, and may write the result into a byte/word of the destination.  Plucky
+                // Squire's first gameplay scene uses the four byte selectors with v_mul_u32_u24 to
+                // unpack an RGBA8 value (three times BYTE_0..3); Sonic Racing: CrossWorlds emits
+                // `360400f9,04861486` = `v_and_b32_sdwa v2, 6, v0 dst_sel:WORD_0
+                // dst_unused:UNUSED_PRESERVE src1_sel:WORD_0`, a sub-dword DESTINATION (#2013).
+                // Admit the general no-SEXT/no-saturation integer subset: source values are
+                // zero-extended, the destination field is written with the low bits of the result
+                // and the rest of the register is zero-filled (UNUSED_PAD) or kept (UNUSED_PRESERVE)
+                // as DST_UNUSED says.  Signed extension of a source, UNUSED_SEXT and integer clamp
+                // remain fail-visible until their distinct semantics are modeled.
                 else {
                     const uint32_t op = (w >> 25) & 0x3Fu;
                     const bool integer_op =
@@ -205,10 +233,12 @@ void decode_operands(Rdna2Inst& i) {
                         (op >= 0x25u && op <= 0x2Au);
                     const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     const uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
-                    if (integer_op && dsel == 6u && dun == 0u &&
+                    if (integer_op && dsel <= 6u && (dun == 0u || dun == 2u) &&
                         s0sel <= 6u && s1sel <= 6u &&
                         !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu) &&
                         !i.clamp && !i.omod) {
+                        i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
+                        i.sdwa_dst_unused = static_cast<uint8_t>(dun);
                         i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
                         i.sdwa_src1_sel = static_cast<uint8_t>(s1sel);
                         i.has_modifier = false;
@@ -308,8 +338,13 @@ void decode_operands(Rdna2Inst& i) {
                     // Astro Bot uses `v_cmp_ne_u32 1, v63 src1_sel:BYTE_0` in its visibility
                     // kernel. Admit the exact no-SEXT/no-neg/abs subset; signed extension and
                     // integer source modifiers remain fail-visible until modeled.
+                    // The 32-bit windows (i32 0x80-0x87, u32 0xc0-0xc7) and the 16-bit ones
+                    // (i16 0x88-0x8f, u16 0xa8-0xaf) — VERIFIED(round-trip llvm-mc gfx1030:
+                    // `7d5700f9,86060003` = `v_cmp_le_u16_sdwa vcc_lo, v3, 0`, opcode 0xab, #2013).
                     const bool integer_compare =
                         (eff >= 0x81u && eff <= 0x86u) ||
+                        (eff >= 0x89u && eff <= 0x8Eu) ||
+                        (eff >= 0xA9u && eff <= 0xAEu) ||
                         (eff >= 0xC1u && eff <= 0xC6u);
                     if (integer_compare && s0sel <= 6u && s1sel <= 6u &&
                         !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu)) {
@@ -361,13 +396,18 @@ void decode_operands(Rdna2Inst& i) {
             }
             // Scalar 16-bit VOP3 operations: OPSEL[2:0] selects each packed source half and OPSEL[3]
             // selects the destination half. Reuse the packed-op selector field for this family.
-            // VERIFIED(llvm-mc gfx1030): 0x354 is v_max3_f16; 0x303-0x30e (0x306 is not an
+            // VERIFIED(llvm-mc gfx1030): 0x351/0x354/0x357 are v_min3_f16/v_max3_f16/v_med3_f16
+            // (their i16 and u16 siblings sit at 0x352/0x355/0x358 and 0x353/0x356/0x359, so the
+            // three signedness variants interleave rather than forming one contiguous run —
+            // positional inference across this window is exactly how a wrong lowering gets
+            // written); 0x303-0x30e (0x306 is not an
             // instruction), 0x314, 0x340/0x35e and 0x352-0x359 are the 16-bit integer VALU family —
             // add/sub/mul, the reversed shifts, min/max, mad and min3/max3/med3 (#2013 — Sonic
             // Racing: CrossWorlds emits
             // `v_lshrrev_b16 v1, 1, v0 op_sel:[0,0,1]`, which writes the HIGH destination half;
             // dropping OPSEL there would silently write the wrong half).
-            if (i.opcode == 0x34Bu || i.opcode == 0x354u ||
+            if (i.opcode == 0x311u || i.opcode == 0x34Bu || i.opcode == 0x351u ||
+                i.opcode == 0x354u || i.opcode == 0x357u ||
                 (i.opcode >= 0x303u && i.opcode <= 0x30Eu && i.opcode != 0x306u) ||
                 i.opcode == 0x314u || i.opcode == 0x340u || i.opcode == 0x35Eu ||
                 i.opcode == 0x352u || i.opcode == 0x353u || i.opcode == 0x355u ||
@@ -392,22 +432,43 @@ void decode_operands(Rdna2Inst& i) {
             i.src[0] = decode_src_field(d1 & 0x1FFu);
             i.src[1] = decode_src_field((d1 >> 9) & 0x1FFu);
             i.src[2] = decode_src_field((d1 >> 18) & 0x1FFu); i.n_src = 3;
-            // Packed f16 add/mul (0x0f/0x10) and v_fma_mix_f32/mixlo/mixhi (0x20-0x22): every
-            // modifier bit is MODELED (#273). For packed ops OPSEL/NEG select and negate each source
-            // independently for the low result; OPSEL_HI/NEG_HI do the same for the high result.
+            // Packed f16 fma/add/mul/min/max (0x0e-0x12), the packed 16-bit integer family
+            // (0x00-0x0d) and v_fma_mix_f32/mixlo/mixhi (0x20-0x22): every modifier bit is MODELED
+            // (#273/#2013). For packed ops OPSEL/NEG select and negate each source independently
+            // for the low result; OPSEL_HI/NEG_HI do the same for the high result.
             // For the mix family:
             // OPSEL_HI[k] selects an f16-half read (which half via OPSEL[k]), NEG negates, NEG_HI
             // is ABS for the mix family, CLAMP saturates. (llvm-mc gfx1030 round-trip on the live
             // DOLL bytes: 0xcc200044 0x9a02170b = v_fma_mix_f32 v68, v11, v11, neg(0)
-            // op_sel_hi:[1,1,0].) Other VOP3P ops (v_pk_*, per-half packed semantics) still reject
-            // on any modifier bit.
-            if (i.opcode == 0x0F || i.opcode == 0x10) {
+            // op_sel_hi:[1,1,0].) VOP3P opcodes outside those ranges still reject on any modifier
+            // bit.
+            if (i.opcode == 0x0E || i.opcode == 0x0F || i.opcode == 0x10 ||
+                i.opcode == 0x11 || i.opcode == 0x12) {
+                // Packed f16 fma/add/mul/min/max. VERIFIED(round-trip llvm-mc gfx1030):
+                // 0x0e v_pk_fma_f16, 0x0f v_pk_add_f16, 0x10 v_pk_mul_f16, 0x11 v_pk_min_f16,
+                // 0x12 v_pk_max_f16.
                 const uint32_t neg = (d1 >> 29) & 7u;
                 for (int k = 0; k < 3; ++k) i.src_neg[k] = ((neg >> k) & 1u) != 0;
                 i.vop3p_neg_hi  = static_cast<uint8_t>((w >> 8) & 7u);
                 i.vop3p_opsel   = static_cast<uint8_t>((w >> 11) & 7u);
                 i.vop3p_opsel_hi = static_cast<uint8_t>(((d1 >> 27) & 3u) | (((w >> 14) & 1u) << 2));
                 i.clamp = ((w >> 15) & 1u) != 0;
+            } else if (i.opcode <= 0x0Du) {
+                // Packed 16-bit INTEGER family (0x00..0x0d — mad/mul/add/sub/shift/min/max, both
+                // signednesses). VERIFIED(round-trip llvm-mc gfx1030 for every opcode in the range;
+                // Sonic Racing: CrossWorlds emits `cc0a0002,18020504` = v_pk_add_u16 v2, v4, v2,
+                // whose DEFAULT op_sel_hi:[1,1] sets dword1[28:27] — which is why the blanket
+                // "any modifier bit rejects" rule below refused the plainest possible encoding).
+                // OPSEL/OPSEL_HI select each source's half for the low/high result exactly as they
+                // do for the packed f16 ops, and NEG/NEG_HI occupy the same fields; the emitter
+                // applies them as the sign-bit flip they physically are. CLAMP requests integer
+                // saturation the emitter does not model, so it keeps has_modifier and rejects.
+                const uint32_t neg = (d1 >> 29) & 7u;
+                for (int k = 0; k < 3; ++k) i.src_neg[k] = ((neg >> k) & 1u) != 0;
+                i.vop3p_neg_hi   = static_cast<uint8_t>((w >> 8) & 7u);
+                i.vop3p_opsel    = static_cast<uint8_t>((w >> 11) & 7u);
+                i.vop3p_opsel_hi = static_cast<uint8_t>(((d1 >> 27) & 3u) | (((w >> 14) & 1u) << 2));
+                if (((w >> 15) & 1u) != 0u) i.has_modifier = true;
             } else if (i.opcode >= 0x20 && i.opcode <= 0x22) {
                 const uint32_t neg = (d1 >> 29) & 7u, neg_hi = (w >> 8) & 7u;
                 for (int k = 0; k < 3; k++) {

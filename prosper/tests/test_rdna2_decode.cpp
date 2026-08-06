@@ -189,13 +189,24 @@ int main() {
     CHECK(dr2b.fmt == Rdna2Format::DS && dr2b.opcode == 0x37u && dr2b.literal == 0x1110u &&
           isV(dr2b.src[0], 2) && isV(dr2b.dst, 2),
           "Astro DS_READ2_B32 decodes non-zero offsets 16/17");
-    // VOP SDWA/DPP forms carry a mandatory 2nd (control) dword — the decoder must count it (miss it and
-    // the whole downstream stream mis-aligns) and flag has_modifier so the recompiler rejects it.
-    // Encodings from llvm-mc gfx1030: SDWA src0=0xf9, DPP16 src0=0xfa, DPP8 src0=0xe9.
-    const uint32_t sdwa[] = { 0x340008f9u, 0x00861682u };    // v_lshlrev_b32_sdwa v0, 2, v4 ...
+    // VOP SDWA/DPP forms carry a mandatory 2nd (control) dword — the decoder must count it, or the
+    // whole downstream stream mis-aligns. Encodings from llvm-mc gfx1030: SDWA src0=0xf9,
+    // DPP16 src0=0xfa, DPP8 src0=0xe9.
+    // `v_lshlrev_b32_sdwa v0, 2, v4 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src1_sel:BYTE_0`: a
+    // DWORD destination has no unused bits, so UNUSED_PRESERVE is a no-op there and the integer
+    // SDWA subset now admits it (#2013). It used to reject only because the admission required
+    // UNUSED_PAD exactly. The LENGTH assertion is the part that must never change.
+    const uint32_t sdwa[] = { 0x340008f9u, 0x00861682u };
     Rdna2Inst sd = rdna2_decode_one(sdwa, 2);
-    CHECK(sd.fmt == Rdna2Format::VOP2 && sd.len_dwords == 2 && sd.has_modifier,
-          "VOP2 SDWA form is 2 dwords and flagged has_modifier");
+    CHECK(sd.fmt == Rdna2Format::VOP2 && sd.len_dwords == 2 && !sd.has_modifier &&
+          sd.sdwa_dst_sel == 6u && sd.sdwa_dst_unused == 2u && sd.sdwa_src1_sel == 0u,
+          "VOP2 SDWA form is 2 dwords and a DWORD destination with UNUSED_PRESERVE is admitted");
+    // The same instruction with UNUSED_SEXT still rejects: sign-extending the unwritten bits is a
+    // distinct semantic the emitter does not model, so it must stay fail-visible.
+    const uint32_t sdwa_sext[] = { 0x340008f9u, 0x00860e82u };
+    Rdna2Inst sds = rdna2_decode_one(sdwa_sext, 2);
+    CHECK(sds.fmt == Rdna2Format::VOP2 && sds.len_dwords == 2 && sds.has_modifier,
+          "VOP2 SDWA with UNUSED_SEXT is 2 dwords and still flagged has_modifier");
     const uint32_t ngg_byte_shift[] = { 0x340018f9u, 0x02860682u };
     Rdna2Inst nbs = rdna2_decode_one(ngg_byte_shift, 2);
     CHECK(nbs.fmt == Rdna2Format::VOP2 && nbs.opcode == 0x1Au && !nbs.has_modifier &&
