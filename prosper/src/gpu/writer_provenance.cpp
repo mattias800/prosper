@@ -1,5 +1,6 @@
 #include "writer_provenance.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <cstdio>
@@ -12,6 +13,14 @@ namespace prosper::gpu {
 namespace {
 
 constexpr size_t kMaxEvents = 65536;
+// Cumulative per-kind recorded counts. Deliberately NOT evicted with the bounded event map: their
+// only job is to answer "did this recorder ever fire", which a negative overlap result has to quote
+// to be falsifiable at all.
+constexpr size_t kGuestWriterKindCount = static_cast<size_t>(GuestWriterKind::Count);
+static_assert(kGuestWriterKindCount == 4,
+              "a new GuestWriterKind needs a name in guest_writer_kind_name() before it can appear "
+              "in the recorder summary; update this bound deliberately rather than by accident");
+std::array<std::atomic<uint64_t>, kGuestWriterKindCount> g_recorded_by_kind{};
 std::mutex g_mutex;
 struct EventKey {
     GuestWriterKind kind;
@@ -60,7 +69,30 @@ const ProvenanceAddrWatch& provenance_addr_watch() {
             if (size) w.size = size;
         }
         w.active = true;
-        std::fprintf(stderr, "[provenance] watching guest range 0x%llx..0x%llx\n",
+        // Name the armed recorders in the banner (#2111). A watch that prints `compute-buffer` lines
+        // looks healthy while an entire writer class is unreachable, and the reader has no way to
+        // tell a real absence from an unarmed one. All four kinds follow writer_provenance_enabled(),
+        // which the watch itself makes true.
+        //
+        // The banner states SCOPE, not completeness, and that distinction is deliberate: this history
+        // has four kinds, and there are GPU-side writes it records under none of them (see the list on
+        // guest_write_recorder_summary() in the header). Trying to make this line exhaustive is how it
+        // becomes wrong again — the useful claim is "these four are armed", leaving "and nothing else
+        // is a kind" to the header. The residual per-kind filters are named rather than summarised as
+        // "unfiltered": the watch makes writer_provenance_full_enabled() true, lifting DmaData's
+        // 256-byte and WriteData's 64-dword floors, but NOT the compute recorders' `!host_data`
+        // condition, which is per-buffer and no switch removes.
+        //
+        // DANGER, and the reason this text is hardcoded rather than derived: computing it by calling
+        // writer_provenance_enabled() would re-enter provenance_addr_watch() from inside its own
+        // static initialiser. That is UB, and on libstdc++ it is a concrete crash —
+        // __cxa_guard_acquire detects the recursion and calls std::terminate via
+        // recursive_init_error. Anyone "improving" this line to report live state must compute it
+        // OUTSIDE this lambda.
+        std::fprintf(stderr,
+                     "[provenance] watching guest range 0x%llx..0x%llx; of the four recorded kinds, "
+                     "armed: color compute-buffer dma-data write-data "
+                     "(dma/write unfiltered; compute omits host-backed buffers)\n",
                      (unsigned long long)w.addr, (unsigned long long)(w.addr + w.size));
         return w;
     }();
@@ -91,6 +123,7 @@ const char* guest_writer_kind_name(GuestWriterKind kind) {
         case GuestWriterKind::ComputeBuffer: return "compute-buffer";
         case GuestWriterKind::DmaData: return "dma-data";
         case GuestWriterKind::WriteData: return "write-data";
+        case GuestWriterKind::Count: break;   // sentinel, never a recorded kind
     }
     return "unknown";
 }
@@ -125,6 +158,8 @@ uint64_t record_guest_write(GuestWriterKind kind, uint64_t addr, uint64_t size,
                      (unsigned long long)item, (unsigned long long)order,
                      (unsigned long long)identity, (unsigned long long)event.sequence);
     }
+    if (const size_t index = static_cast<size_t>(kind); index < kGuestWriterKindCount)
+        g_recorded_by_kind[index].fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_mutex);
     EventKey key{kind, addr};
     if (g_events.size() == kMaxEvents && !g_events.count(key)) {
@@ -153,10 +188,37 @@ std::optional<GuestWriteEvent> last_guest_write_overlap(uint64_t addr, uint64_t 
     return latest;
 }
 
+size_t guest_write_history_size() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_events.size();
+}
+
+uint64_t guest_write_recorded_count(GuestWriterKind kind) {
+    const size_t index = static_cast<size_t>(kind);
+    if (index >= kGuestWriterKindCount) return 0;
+    return g_recorded_by_kind[index].load(std::memory_order_relaxed);
+}
+
+const char* guest_write_recorder_summary() {
+    static thread_local char buffer[160];
+    int written = 0;
+    for (size_t index = 0; index < kGuestWriterKindCount; ++index) {
+        const auto kind = static_cast<GuestWriterKind>(index);
+        const int produced = std::snprintf(
+            buffer + written, sizeof buffer - static_cast<size_t>(written), "%s%s=%llu",
+            written ? " " : "", guest_writer_kind_name(kind),
+            (unsigned long long)guest_write_recorded_count(kind));
+        if (produced <= 0 || static_cast<size_t>(written + produced) >= sizeof buffer) break;
+        written += produced;
+    }
+    return buffer;
+}
+
 void reset_guest_write_history_for_test() {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_events.clear();
     g_sequence.store(0, std::memory_order_relaxed);
+    for (auto& counter : g_recorded_by_kind) counter.store(0, std::memory_order_relaxed);
 }
 
 } // namespace prosper::gpu

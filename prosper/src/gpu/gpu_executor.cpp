@@ -2521,9 +2521,34 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                 (unsigned long long)writer->order,
                                 (unsigned long long)writer->identity);
                     } else {
+                        // Quote the history's own state with every negative, because a negative can
+                        // mean "nothing wrote this" OR "the recorder that would have caught it was
+                        // never armed", and the two are otherwise identical in the log. All four
+                        // recorders now follow writer_provenance_enabled() — colour targets did not
+                        // until this diagnostic's own change (they were gated on the unrelated
+                        // PROSPER_PROVENANCE_DIM, which is what made a negative unreadable and is
+                        // why the counts are printed at all).
+                        //
+                        // Three limits the counts do NOT remove, all load-bearing:
+                        //   * a SKIPPED dispatch records nothing however this is configured, so a
+                        //     negative never rules out a skipped compute program;
+                        //   * a guest CPU write is recorded by no kind at all, so this history only
+                        //     ever describes GPU-side writers;
+                        //   * a kind can read non-zero here while still having DISCARDED the write
+                        //     that matters. Without PROSPER_WRITER_PROVENANCE (i.e. when only a
+                        //     dimension probe armed the history) DmaData keeps writes >= 256 bytes
+                        //     and WriteData >= 64 dwords, and the compute recorders skip any
+                        //     host-data buffer. A small write to a narrow window is then missing
+                        //     from a history whose summary looks healthy — set
+                        //     PROSPER_WRITER_PROVENANCE for unfiltered retention before trusting a
+                        //     negative over a span of a few dwords.
                         fprintf(stderr,
-                                "[dyntrace]   no recorded GPU writer overlaps [0x%llx,+0x%x)\n",
-                                (unsigned long long)addr, n * 4);
+                                "[dyntrace]   no recorded GPU writer overlaps [0x%llx,+0x%x) "
+                                "(history=%zu recorded: %s)%s\n",
+                                (unsigned long long)addr, n * 4,
+                                guest_write_history_size(), guest_write_recorder_summary(),
+                                guest_write_history_size() ? ""
+                                    : "  <- HISTORY EMPTY: this is VOID, not negative");
                     }
                 }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
@@ -5172,18 +5197,34 @@ void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
 }
 
 void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
+    // This function does two separable jobs: it RECORDS colour-target writes into the shared
+    // guest-write history, and it PRINTS a consumer/producer diagnostic for one target extent. Only
+    // the second needs PROSPER_PROVENANCE_DIM. Returning early for both made the history silently
+    // kind-incomplete under PROSPER_WRITER_PROVENANCE=1 — the switch documented as the explicit
+    // "retain everything" request — so every `last_guest_write_overlap` consumer answered "no
+    // writer" for a range a colour target had in fact written, with nothing in the log to say the
+    // recorder had never been armed. Measured on CrossWorlds: `color=0` recorded across a whole boot
+    // with writer provenance explicitly on, against `compute-buffer=54` and `write-data=7`.
     const char* dim_env = getenv("PROSPER_PROVENANCE_DIM");
-    if (!dim_env || !*dim_env) return;
-
     uint32_t want_w = 0, want_h = 0;
-    if (sscanf(dim_env, "%ux%u", &want_w, &want_h) != 2 || !want_w || !want_h) {
+    bool record_only = !dim_env || !*dim_env;
+    if (!record_only && (sscanf(dim_env, "%ux%u", &want_w, &want_h) != 2 || !want_w || !want_h)) {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            fprintf(stderr, "[provenance] invalid PROSPER_PROVENANCE_DIM='%s' (expected WxH)\n", dim_env);
+            fprintf(stderr, "[provenance] invalid PROSPER_PROVENANCE_DIM='%s' (expected WxH)"
+                            " — recording colour targets anyway\n", dim_env);
         }
-        return;
+        // Fall back to RECORD-ONLY instead of returning. A malformed value must not disarm the
+        // colour recorder, because the address watch's banner states unconditionally that colour is
+        // armed — and a banner that denies a void zero is worse than the void zero it replaced.
+        // The reachable spelling is `PROSPER_PROVENANCE_DIM=1`: every other switch in this project
+        // is a boolean `=1`, this one is `WxH`, `sscanf` returns 1, and before this the function
+        // returned before recording anything. See #2149 for the general shape.
+        record_only = true;
+        want_w = want_h = 0;
     }
+    if (record_only && !writer_provenance_enabled()) return;
     const size_t min_draws = [] {
         const char* e = getenv("PROSPER_PROVENANCE_MIN_DRAWS");
         return e ? static_cast<size_t>(strtoull(e, nullptr, 0)) : size_t{0};
@@ -5202,7 +5243,9 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
     static uint64_t draw_submit_ordinal = 0;
     const uint64_t this_draw_submit = st.draws.empty() ? draw_submit_ordinal : draw_submit_ordinal++;
 
-    const bool inspect_consumers = st.draws.size() >= min_draws;
+    // Record-only mode still walks every draw to capture its colour targets; it just does not
+    // inspect consumers, which is the half that needs a target extent to select on.
+    const bool inspect_consumers = !record_only && st.draws.size() >= min_draws;
     for (size_t i = 0; i < st.draws.size(); ++i) {
         const GpuState& ds = st.draws[i].state ? *st.draws[i].state : st;
         const RenderState rs = extract_render_state(ds);
@@ -5279,10 +5322,15 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
         }
 
         if (rs.color0_base) {
-            last_color_write[rs.color0_base] = {
-                submit_no, this_draw_submit, i, rs.es_addr, rs.ps_addr,
-                rs.color0_width, rs.color0_height, st.draws[i]
-            };
+            // Only the consumer diagnostic reads last_color_write, and its value retains a draw
+            // record (which pins a GpuState) for the process lifetime, one per distinct colour base.
+            // Record-only mode has no reader, so populating it there would leak that retention onto
+            // every writer-provenance run for nothing.
+            if (!record_only)
+                last_color_write[rs.color0_base] = {
+                    submit_no, this_draw_submit, i, rs.es_addr, rs.ps_addr,
+                    rs.color0_width, rs.color0_height, st.draws[i]
+                };
             // The exact-address map above retains every latest color writer. The generic overlap
             // history needs only one representative event per target range; recording every draw
             // adds millions of mutex/hash operations during Dead Cells' submit-heavy startup.
@@ -5294,10 +5342,11 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
             }
         }
         if (rs.color1_base) {
-            last_color_write[rs.color1_base] = {
-                submit_no, this_draw_submit, i, rs.es_addr, rs.ps_addr,
-                rs.color1_width, rs.color1_height, st.draws[i]
-            };
+            if (!record_only)
+                last_color_write[rs.color1_base] = {
+                    submit_no, this_draw_submit, i, rs.es_addr, rs.ps_addr,
+                    rs.color1_width, rs.color1_height, st.draws[i]
+                };
             if (recorded_color_ranges.insert(rs.color1_base).second) {
                 const uint64_t bytes = static_cast<uint64_t>(rs.color1_width) * rs.color1_height * 4;
                 record_guest_write(GuestWriterKind::ColorTarget, rs.color1_base, bytes,
