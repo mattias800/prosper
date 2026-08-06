@@ -580,9 +580,46 @@ extern "C" uint64_t prosper_gpu_write_trap_matches() {
 // #312: "pointer-like" pre-content — a freed MallocBinned3 block header holds heap pointers into
 // the 512 GiB arena (0x1000000000) or the allocator-metadata pools (0x2000000000 region, where the
 // FPoolInfo tables live — e.g. the 0x20015f0000 pool-info table of #161/#241).
-static bool ptr_like(uint64_t v) {
+//
+// #1226 — THIS WINDOW IS DOLL-ERA AND IS THE REASON ARCRUNNER'S OWN TERMINAL FORGE WAS INVISIBLE.
+// ArcRunner (PPSA21406) reserves its MallocBinned3 arena at [0x2000000000, 0xa000000000) (live:
+// `reserve ENTRY hint=0x1000000000 len=0x8000000000` -> `reserve -> 0x2000000000`, and the guest's
+// own "Memory va range 2000000000 - 9fc0000000"), so the upper bound below covers 4 GiB of a
+// 512 GiB arena. The terminal `addr=(nil)` fault that ends most ArcRunner runs dereferences
+// `rdi = 0x2100000001` — a `0x21xxxxxxxx` heap pointer whose low dword was zeroed and then set to 1,
+// i.e. exactly the forge shape this predicate exists to catch, sitting EXACTLY ONE BYTE above the
+// bound. Every `forges_freelist_ptr()` census taken on this title is therefore a lower bound over
+// 1/128th of the arena, while the INIT-side census (init_trip) already used the wide predicate — the
+// two sides were never comparable.
+//
+// The split below is deliberate:
+//   * heap_ptr_like()  — the honest "this qword is plausibly a live guest pointer" predicate, over
+//     prosper's whole guest-VA window. Used by every REPORTING path (forge_trip, init_trip,
+//     clock-fence records) so a census stops lying. Never gates or suppresses a write.
+//   * ptr_like()       — what the default GUARDS still use. It is NOT silently widened here because
+//     rel1_stomp_guard() is default-ON: widening it arms a suppression over 500 GiB of previously
+//     unreachable addresses on every title at once, and over-suppressing fences is the documented
+//     #1245 regression (thousands/min of dependency-violated WaitRegMem). `PROSPER_PTRLIKE_WIDE=1`
+//     is the A/B lever that arms the guards over the wide window, so the flip is measured before it
+//     is made. CONFIDENCE: HIGH that the narrow window is stale; MED on the right guard policy.
+static inline bool ptr_like_narrow(uint64_t v) {
     return (v >= 0x1000000000ull && v < 0x1200000000ull) ||
            (v >= 0x2000000000ull && v < 0x2100000000ull);
+}
+// prosper's guest-VA window: guest reservations, dmem and GPU VAs all land in it, which is correct
+// for a REPORT — the question a report asks is "was a plausible live pointer here", not "which
+// allocator owns it". CONFIDENCE: MED on the exact bounds (they follow map_guest_auto's placement
+// and the two arenas observed live, DOLL at 0x1000000000 and ArcRunner at 0x2000000000).
+static inline bool heap_ptr_like(uint64_t v) {
+    return v >= 0x1000000000ull && v < 0xa000000000ull;
+}
+static bool ptrlike_wide() {
+    static const bool v = [] { const char* e = getenv("PROSPER_PTRLIKE_WIDE");
+                               return e && strtol(e, nullptr, 0) != 0; }();   // default OFF
+    return v;
+}
+static bool ptr_like(uint64_t v) {
+    return ptrlike_wide() ? heap_ptr_like(v) : ptr_like_narrow(v);
 }
 // #312 POOLSHIFT tripwire: the dominant residual crash reads a BYTE-SHIFTED pool-info pointer
 // (historically `0x20015f00` == `0x20015f0000 >> 8` at eboot+0x2316c91). A qword is "byte-shifted
@@ -745,11 +782,60 @@ static inline bool forges_freelist_ptr(uint64_t pre, uint64_t width, uint64_t va
     if (width >= 8) return false;            // a full-width write replaces the whole qword (no forge)
     return (uint32_t)value != 0;             // our sub-qword write makes the low dword nonzero -> pre|value
 }
+// #1226: the same shape test over the honest heap window. `forges_freelist_ptr()` above is the
+// DECISION predicate and stays on the (default-narrow) guard window; this one is REPORT-ONLY, so a
+// forge no guard can currently see is still counted, and is labelled `window=wide-only` in the line
+// and in the terminal totals. Without this split a census silently measures the predicate instead of
+// the title: on ArcRunner the forge that composes the terminal fault's `0x2100000001` is wide-only.
+static inline bool forges_freelist_ptr_wide(uint64_t pre, uint64_t width, uint64_t value) {
+    if (!heap_ptr_like(pre)) return false;
+    if ((uint32_t)pre != 0) return false;
+    if (width >= 8) return false;
+    return (uint32_t)value != 0;
+}
+namespace {
+struct ForgeTripTotals { uint64_t seen = 0, narrow = 0, wide_only = 0; };
+std::mutex g_forge_trip_totals_mu;
+ForgeTripTotals g_forge_trip_totals;
+}
+// Whole-run census of the tripwire's own population, split by which window matched. ArcRunner's
+// worker-fault path calls `_exit(90)`, so an atexit summary can never run — the totals therefore
+// ride the printed lines (trap 51: a capped line count is not a population).
+extern "C" void prosper_forge_trip_totals(uint64_t* seen, uint64_t* narrow, uint64_t* wide_only) {
+    std::lock_guard<std::mutex> lock(g_forge_trip_totals_mu);
+    if (seen) *seen = g_forge_trip_totals.seen;
+    if (narrow) *narrow = g_forge_trip_totals.narrow;
+    if (wide_only) *wide_only = g_forge_trip_totals.wide_only;
+}
+extern "C" void prosper_forge_trip_totals_reset_for_test() {
+    std::lock_guard<std::mutex> lock(g_forge_trip_totals_mu);
+    g_forge_trip_totals = {};
+}
+// Report-only predicates, exported so a test can pin the exact bound that caused the #1226 blind
+// spot rather than re-deriving it from a log.
+extern "C" int prosper_forge_predicate_for_test(uint64_t pre, uint64_t width, uint64_t value,
+                                                int* wide) {
+    if (wide) *wide = forges_freelist_ptr_wide(pre, width, value) ? 1 : 0;
+    return forges_freelist_ptr_wide(pre, width, value) &&
+           ptr_like_narrow(pre) && (uint32_t)pre == 0 && width < 8 && (uint32_t)value != 0;
+}
 // Log-only tripwire (PROSPER_FORGE_TRIP=1): report a GPU write that forges a freelist pointer, with
 // the packet builder callsite — deciding host(GPU)-vs-guest for the root write. Default OFF (no-op).
 static void forge_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t value, uint64_t width, uint64_t pkt) {
     static const bool on = getenv("PROSPER_FORGE_TRIP") != nullptr;
-    if (!on || !forges_freelist_ptr(pre, width, value)) return;
+    if (!on || !forges_freelist_ptr_wide(pre, width, value)) return;
+    // Which window matched. `narrow` means the default guards can see (and possibly decline) this
+    // write; `wide-only` means no guard is reachable for it at all on this build's settings.
+    const bool narrow_window = forges_freelist_ptr(pre, width, value);
+    uint64_t tot_seen = 0, tot_narrow = 0, tot_wide_only = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_forge_trip_totals_mu);
+        g_forge_trip_totals.seen++;
+        if (narrow_window) g_forge_trip_totals.narrow++; else g_forge_trip_totals.wide_only++;
+        tot_seen = g_forge_trip_totals.seen;
+        tot_narrow = g_forge_trip_totals.narrow;
+        tot_wide_only = g_forge_trip_totals.wide_only;
+    }
     // #1226: print the first 64, then keep printing at every power of two, and carry the ordinal on
     // every line. The old form printed exactly 64 lines and nothing else, so "64 hits" — quoted as a
     // count on this issue — was the CAP, indistinguishable from a run with 64,000. A tripwire that
@@ -794,15 +880,20 @@ static void forge_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t va
         if (mis_ok) snprintf(mis, sizeof mis, "0x%llx", (unsigned long long)misread);
         else        snprintf(mis, sizeof mis, "unmapped");
         fprintf(stderr,
-                "[agc] FORGE-STOMP #%llu kind=%s dst=0x%llx pre=0x%llx val=0x%llx -> 0x%llx pkt=0x%llx "
-                "t=%llums cm=%d live=%d member=%d(list=%u) dmaB=%u dmaX=%u relB=%u relX=%u "
-                "misread(*forged)=%s | selftest %s | %s\n",
+                "[agc] FORGE-STOMP #%llu kind=%s window=%s dst=0x%llx pre=0x%llx val=0x%llx -> 0x%llx "
+                "pkt=0x%llx t=%llums cm=%d live=%d member=%d(list=%u) dmaB=%u dmaX=%u relB=%u relX=%u "
+                "misread(*forged)=%s | FORGE-TRIP-TOTALS seen=%llu narrow=%llu wide_only=%llu "
+                "| selftest %s | %s\n",
                 (unsigned long long)ord,
-                kind, (unsigned long long)dst, (unsigned long long)pre, (unsigned long long)value,
+                kind, narrow_window ? "narrow" : "wide-only",
+                (unsigned long long)dst, (unsigned long long)pre, (unsigned long long)value,
                 (unsigned long long)forged, (unsigned long long)pkt,
                 (unsigned long long)now_ms(), db > 0 ? 1 : 0, dx > rx ? 1 : 0,
                 (int)fmember, fmatch.list, db, dx, rb, rx,
-                mis, fself, hist);
+                mis,
+                (unsigned long long)tot_seen, (unsigned long long)tot_narrow,
+                (unsigned long long)tot_wide_only,
+                fself, hist);
     }
 }
 // #312 ROOT fix gate (default ON; PROSPER_REL1_FORGE_GUARD=0 for A/B baseline). Suppress a fence
@@ -1270,12 +1361,17 @@ struct ClockFenceRec {
 };
 constexpr uint32_t kClockFenceSlots = 8192;            // power of two
 ClockFenceRec g_clock_fences[kClockFenceSlots];
-// Diagnostic-only "looks like a heap pointer" — deliberately wider than ptr_like(): ArcRunner's
-// MallocBinned3 arena and RHI objects live in the 0x2400000000..0x3200000000 region (#1226 FAULTOBJ
-// dumps: objects at 0x2420e48000 / 0x3152b50000 / 0x316366c154), which the DOLL-era ptr_like()
-// windows predate. Flags records for the reader; never used to gate or suppress a write.
+// Diagnostic-only "looks like a heap pointer" — deliberately wider than the default ptr_like():
+// ArcRunner's MallocBinned3 arena and RHI objects live above 0x2100000000 (#1226 FAULTOBJ dumps:
+// objects at 0x2420e48000 / 0x3152b50000 / 0x316366c154), which the DOLL-era windows predate.
+// Flags records for the reader; never used to gate or suppress a write.
+//
+// #1226: this is now a thin alias of heap_ptr_like() rather than its own fourth window. The old
+// body stopped at 0x4000000000 and so still missed the top half of ArcRunner's
+// [0x2000000000, 0xa000000000) arena; `overptr` figures recorded before this change (e.g. the
+// "n=1024 overptr=926" init census) were taken through the narrower window and are LOWER BOUNDS.
 bool clockfence_heapish(uint64_t v) {
-    return ptr_like(v) || (v >= 0x2100000000ull && v < 0x4000000000ull);
+    return heap_ptr_like(v);
 }
 bool clockfence_log() {
     static const bool v = getenv("PROSPER_CLOCKFENCE_LOG") != nullptr;

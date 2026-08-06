@@ -277,6 +277,70 @@ Durable run records are in the #1226 comments for the
 [census correction](https://github.com/mattias800/prosper/issues/1226#issuecomment-5164799214), and
 [valid corrected arm](https://github.com/mattias800/prosper/issues/1226#issuecomment-5164904408).
 
+## What the `addr=(nil)` fault actually dereferences
+
+Measured on current master (`c9e2588e`), ordinary and unsuppressed
+(`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1`), with the new `PROSPER_LAZY_COMMIT_STRICT`
+discriminator. **Three terminal paths compete for the same run**, so a single run per arm cannot A/B
+anything on this title — see the `## Ruled out` row.
+
+The `addr=(nil)` class is a **masked wild read of one corrupt table entry**, and the guest instruction
+pair is now named exactly. Disassembly of the eboot (`tools/re/edis.py` over a `prx_to_elf.py`
+flattening) at the site the lazy-commit line reports:
+
+```text
+117e201:  mov  eax, DWORD PTR [r13+0x0]     ; a packed command dword; r13 walks the stream by 4
+117e20b:  shr  ecx, 0x18                    ; top byte is a tag, compared against r15d
+117e218:  bextr ecx, eax, 0x1008            ; bits 8..23 -> a table index
+117e21d:  mov  rdi, QWORD PTR [r12+rcx*8]   ; rdi := table[index]         (r12 = 0x2020e381c0)
+117e221:  mov  rcx, QWORD PTR [rdi+0x40]    ; <- lazy-commit fires here; rdi = 0x2100000001
+117e225:  vucomisd xmm0, QWORD PTR [rcx]    ; <- the reported `addr=(nil)`: rcx is OUR zero
+```
+
+With strict mode the fault reports where it belongs, once per affected run:
+
+```text
+[lazy-commit] #1 DECLINED(strict) page=0x2100000000 addr=0x2100000041 access=read rip=0x41117e221
+WORKER-THREAD FAULT: sig=11 addr=0x2100000041 rip=0x41117e221 (image+0x117e221)
+```
+
+`0x2100000041` is `rdi + 0x40` with the low bit **unmasked**, so `rdi` is used as a plain pointer:
+`0x2100000001` is garbage, not a tagged pointer. Two consequences, both of which retire earlier
+framings:
+
+- The repeated page is **not** evidence of a lost or aliased commit. Every `0x21000000xx` pointer
+  lands in page `0x2100000000`, so "two different guest sites first-touch the same page" is a
+  property of the *value*, not of the mapping. See the `## Ruled out` row and [#1944](https://github.com/mattias800/prosper/issues/1944).
+- The three recorded terminal faults all carry one value shape — `{nonzero high dword, low
+  dword ≤ 1}`: `0x2000000001` (the allocator chain), `0x2100000001` (`rdi` here), and `0x400000001`
+  (`rax` at the `AudioMixerRende` `rip=0x0` jump). Only the first is attributable to prosper's
+  init+fence composition; see the next section for the measurement that excluded the other two.
+
+## The forge census was measuring its own predicate — and now does not
+
+`forges_freelist_ptr()` gates on `ptr_like()`, whose window is `[0x1000000000,0x1200000000)` ∪
+`[0x2000000000,0x2100000000)`. ArcRunner's arena is `[0x2000000000,0xa000000000)` (live:
+`reserve ENTRY hint=0x1000000000 len=0x8000000000` → `reserve -> 0x2000000000`), so the guard window
+covers **4 GiB of 512 GiB**, and the terminal fault's `0x2100000001` sits exactly one byte above its
+upper bound. The INIT-side census already used the wide predicate, so the two sides were never
+comparable.
+
+The tripwire is now split into a *decision* predicate (unchanged; what the default guards use) and a
+*report* predicate over the whole guest-VA window, with `window=narrow|wide-only` on every
+`FORGE-STOMP` line and a running `FORGE-TRIP-TOTALS`. That makes the following a **real negative**
+rather than an unobtainable one — one bounded run on `c9e2588e` + this change,
+`PROSPER_FORGE_TRIP=1`:
+
+```text
+FORGE-TRIP-TOTALS seen=256 narrow=256 wide_only=0
+```
+
+Every forge candidate in the run has `pre=0x2000000000`; **none** has a `0x21xxxxxxxx`-shaped
+destination. So prosper's `REL1`/`WRITE_DATA` fence is **not** the author of the `0x2100000001` that
+kills the run, and the blind spot — though structurally real, and worth removing so the question can
+be asked at all — is empty on this title. `PROSPER_PTRLIKE_WIDE=1` arms the guards over the wide
+window for a future A/B; it is default OFF because `rel1_stomp_guard()` is default ON.
+
 ## Ruled out
 
 Do not re-derive these without contradictory new evidence.
@@ -296,6 +360,10 @@ Do not re-derive these without contradictory new evidence.
 | The two retained non-alpha-only frames (solid yellow, solid white) are **guest clears**, and therefore evidence that the guest reaches a clear-only phase | They are `ELIMINATE_FAST_CLEAR` artifacts. Across two independent runs — the retained combined-suppression arm and an ordinary unsuppressed run here — **every** coloured frame is presented immediately after a `CB_COLOR_CONTROL.MODE=2` draw, and **no** coloured frame occurs without one (3 for 3; the combined arm's MODE=2 count reached exactly 2 for its 2 coloured frames, the ordinary run's count reached 1 for its 1). prosper runs MODE=2 as an ordinary colour draw, which blankets the target with the fast-clear colour. Do not read either frame as a phase marker or as progress. | #1588, #1226 |
 | The rung-1 blocker is the terminal render-thread fault, so bring-up should continue by attributing that fault | Every recorded terminal fault occurs **after** dozens of presented frames — 19 in an ordinary arm here, 53 in the retained combined arm — and all of those frames carry RGB 0. The fault cannot be what prevents a first frame. Separately, prosper realizes **456 of 468** submitted draws with **zero** recompile-reject/compute-skip/unsupported-format lines, so the black output is not a dropped-draw problem either. | #1226 |
 | The first three current-master ordinary diagnostic arms prove the sibling absent or identify its producer | The first title run exited through an unrelated `AudioMixerRende` null jump. The second lost to the usual allocator chain at `eboot+0x127e8eb`, with the guest reporting `Attempt to realloc an unrecognized block 2000000001`. The third used the address-filtered hardware probe, which armed on primary and worker guest boundaries, but lost to the allocator predecessor at `eboot+0x127e751` before recording any target hit. None reached `eboot+0x117811f`; the first two stack peeks sampled unrelated frames and the third correctly emitted no probe. All three arms are **void/non-discriminating**, not negative reproductions. A nearby D-queue unsatisfied wait is retained as co-occurring history only; it does not attribute any competing failure. | #1226 |
+| The `addr=(nil)` faults show that page `0x2100000000` is a **legitimately committed guest region whose contents prosper lost** — [#1944](https://github.com/mattias800/prosper/issues/1944) reading 1, argued from "two *different* guest code sites first-touch the same 64 KiB page; a wild pointer would not repeat like that" | It is reading 2 (a wild read masked), and the repetition is a property of the value, not the mapping. `PROSPER_LAZY_COMMIT_STRICT=1` moves the fault to the loading instruction: `[lazy-commit] #1 DECLINED(strict) page=0x2100000000 addr=0x2100000041 access=read rip=0x41117e221`, then `sig=11 addr=0x2100000041 rip=eboot+0x117e221`. The load is `mov rdi,[r12+rcx*8]` / `mov rcx,[rdi+0x40]` with `rdi=0x2100000001`, and `0x40` is added **without masking the low bit**, so `rdi` is a plain corrupt pointer. **Any** `0x21000000xx` value lands in page `0x2100000000` — which is exactly the shape a heap pointer takes when its low dword is lost — so both recorded sites hitting that page is expected, not anomalous. Exactly one lazy-commit event occurs per affected run. Do not spend another arm treating the page as a commit-protocol gap on this title. | #1944, #1226 |
+| The `0x2100000001` that the terminal `addr=(nil)` fault dereferences is composed by prosper's own `RELEASE_MEM`/`WRITE_DATA` fence, the way `0x2000000001` is — and `ptr_like()`'s stale upper bound (exactly `0x2100000000`) is hiding that population from the forge tripwire | The blind spot is **real but empty on this title**. With the tripwire's report predicate widened to prosper's whole guest-VA window (the guard predicate deliberately unchanged), one bounded run on `c9e2588e` ends at `FORGE-TRIP-TOTALS seen=256 narrow=256 wide_only=0`: every forge candidate has `pre=0x2000000000`, and **none** has a `0x21xxxxxxxx`-shaped destination. So prosper's fence is excluded as the author of the value that terminates the run, and a future `wide_only=0` is now a measurable negative instead of an unaskable question. This does **not** clear the narrow window for other titles — it is still stale, and `PROSPER_PTRLIKE_WIDE=1` exists to A/B arming the guards over the wide window. | #1226 |
+| `{small nonzero high dword, low dword ≤ 1}` is by itself a prosper-forge signature, so a value of that shape found in guest memory attributes the write to us | It is also **ordinary guest data**. A fault-time dump of a live guest table (`PROSPER_FAULTMEM=1`, register `r12`) shows 16-byte `{pointer, metadata}` entries whose metadata qword is a constant `0x0000000400000002`, interleaved with live pointers `0x2000e03840` / `0x2000e03830` / `0x2100e05140`. `0x400000001` — the value at the `AudioMixerRende` `rip=0x0` jump, and the one #1945's brief quotes — has that same `{4, n}` shape. Value-shape alone therefore cannot attribute a `<high>_0000000n` qword to a GPU write; only a write-side record (the attribution ring, or the forge tripwire's `pre`) can. | #1226, #1945 |
+| A one-run-per-arm comparison can A/B a candidate fix on this title | **Three terminal paths compete for every run** and which one wins is a race: measured on `c9e2588e`, the allocator chain (`addr=0x30016000 rip=eboot+0x127e751`), the lazy-commit-masked null (`rip=eboot+0x117e225`, one lazy-commit event), and an `AudioMixerRende` jump to `rip=0x0` with `rax=0x400000001` each terminated at least one of six runs, and one run produced two faults. Consequently the `PROSPER_EOP_WRITE_SYNC=1` and `PROSPER_REL1_WAF_GUARD=1` arms run here are **non-discriminating, not negative**: each was a single run, each ended on the same `AudioMixerRende` null jump as its baseline at ~16 presented frames. Any future arm needs ≥3 runs and a quantitative progress metric (presented frames, delivered video frames, time to first fault), not the identity of the terminal fault. | #1226 |
 
 ## Next discriminators
 
