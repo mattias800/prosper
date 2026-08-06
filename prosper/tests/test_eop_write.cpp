@@ -2076,16 +2076,25 @@ int main() {
                   "dword) and caught only by the liveptr shape");
         }
         // The GUARD's content decision, which the census shape alone does not pin. The single line
-        // `!heap_ptr_like(pre)` in `declines_nonheap_ptr` is what stops the arm from declining the
-        // ~1,280 free-list-residue writes an ArcRunner run makes — i.e. from being #1245 again — and
-        // deleting it failed no test before this block existed. (Reported in review of #2077.)
+        // `!heap_ptr_like(pre)` is what stops the arm from declining the ~1,280 free-list-residue
+        // writes an ArcRunner run makes — i.e. from being #1245 again. `declines_nonheap_ptr()` calls
+        // the same `nonheap_guard_content()` this exports, so deleting that term now fails the rows
+        // below; a first version exported a private copy and the deletion passed. (Review of #2077.)
+        //
+        // Rows 1-3 are the discriminating set: they differ ONLY in whether `heap_ptr_like` holds, so
+        // each one flips when the term goes. Rows 4-5 pin the two boundaries the guard inherits from
+        // the shape predicate, both with a NON-heap `pre` so they cannot be satisfied by the window.
         {
             struct GCase { uint64_t pre; uint64_t width; uint64_t value; int want; const char* what; };
             const GCase gcases[] = {
                 {0x000000041700f1e8ull, 4, 0, 1, "declines a module-image vptr"},
                 {0x0000002020e39fc0ull, 4, 0, 0, "does NOT decline free-list residue (that is #1245)"},
                 {0x00000021c1388890ull, 4, 0, 0, "does NOT decline a live heap pointer either"},
+                // Non-heap AND zero low dword: only the shape's `pre_low == 0` line can reject it, so
+                // this stays 0 even with the window term deleted — the #1245 shape, guarded twice.
                 {0x0000000400000000ull, 4, 1, 0, "does NOT decline an already-initialised label"},
+                // Non-heap AND a no-op write: only the shape's `pre_low != value` line rejects it.
+                {0x000000041700f1e8ull, 4, 0x1700f1e8ull, 0, "does NOT decline a write that changes nothing"},
             };
             for (const auto& g : gcases) {
                 const int got = prosper_nonheap_guard_content_for_test(g.pre, g.width, g.value);
