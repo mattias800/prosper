@@ -288,6 +288,10 @@ void set_guest_thread_trace_test_hook(GuestThreadTraceTestHook hook, void* opaqu
 // Windows cooperative exception checkpoint used when a target was woken from a registered HLE wait.
 // Other hosts provide an empty implementation.
 void dispatch_pending_guest_exception();
+// Windows: publish the CALLING thread's handle for sceKernelRaiseException. Guest worker threads do
+// this in win_thread_trampoline; the primary guest thread never runs through it, so it must call
+// this itself or the IL2CPP GC cannot stop it (#2139). No-op elsewhere.
+void register_guest_execution_thread_handle();
 // Number of cooperatively queued Windows exceptions awaiting a target checkpoint (zero elsewhere).
 // Exposed for diagnostics and lifetime/withdrawal regression tests.
 uint32_t pending_guest_exception_count();

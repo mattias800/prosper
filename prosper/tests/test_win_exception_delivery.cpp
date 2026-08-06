@@ -55,6 +55,7 @@ static constexpr uint64_t kGprExpected = 0xd3a5f17c2468be90ull;
 alignas(32) static uint8_t avx_expected[32];
 alignas(32) static uint8_t avx_observed[32];
 static HleFn wait_on_address;
+static HleFn raise_fn;   // #2139: file scope so the primary-thread probers can raise
 static pthread_mutex_t wait_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wait_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t blocked_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -101,6 +102,35 @@ static void* worker(void*) {
     worker_tid = GetCurrentThreadId();
     wait_on_address((uint64_t)(uintptr_t)&wait_word, 0, 0, 0, 0, 0);
     InterlockedExchange(&resumed, 1);
+    return nullptr;
+}
+
+// #2139: the PRIMARY guest thread. It never runs through win_thread_trampoline, so it never
+// published a thread handle, and in a live title every raise at it took win_raise_exception's
+// esrch-no-handle branch -- so the IL2CPP GC could not stop it and marked the heap while it kept
+// mutating. This case covers the shape no other case here does: a raise at the thread that is
+// running the guest, rather than at a pthread_create'd worker.
+static pthread_t primary_pthread;
+static volatile DWORD primary_tid;
+static volatile LONG primary_parked;
+static volatile uint64_t primary_raise_result;
+
+static void* primary_prober(void*) {   // raise at the primary while it is NOT parked
+    primary_raise_result = raise_fn((uint64_t)primary_pthread, 0x1e, 0, 0, 0, 0);
+    return nullptr;
+}
+
+static void* primary_raiser(void*) {   // raise at the primary while it IS parked in an HLE wait
+    for (int i = 0; i < 2000 && !primary_parked; ++i) Sleep(1);
+    Sleep(20);   // let the wait register before the raise looks for a checkpoint
+    primary_raise_result = raise_fn((uint64_t)primary_pthread, 0x1e, 0, 0, 0, 0);
+    // Watchdog: a failed delivery must not hang the suite. Wake the primary so the assertions
+    // below report the failure instead of the test timing out with no diagnosis.
+    for (int i = 0; i < 3000 && !delivered; ++i) Sleep(1);
+    if (!delivered) {
+        InterlockedExchange((volatile LONG*)&wait_word, 1);
+        WakeByAddressAll((void*)&wait_word);
+    }
     return nullptr;
 }
 
@@ -592,6 +622,7 @@ int main() {
     register_builtin_hle();
     HleFn install = Hle::lookup(nid_hash("sceKernelInstallExceptionHandler"));
     HleFn raise = Hle::lookup(nid_hash("sceKernelRaiseException"));
+    raise_fn = raise;
     wait_on_address = Hle::lookup("Hc4CaR6JBL0");
     CHECK(install && raise && wait_on_address, "exception and futex HLE functions registered");
     if (!install || !raise || !wait_on_address) return 1;
@@ -1054,6 +1085,53 @@ int main() {
     check_classified_wait(GuestWaitKind::Semaphore, (uintptr_t)&semaphore_source_token,
                           "semaphore wait retains its source classification",
                           "semaphore wait is interruptible through its sequence");
+
+    // ---- #2139: sceKernelRaiseException must reach the PRIMARY guest thread ----
+    // Every other case in this file raises at a pthread_create'd worker, which win_thread_trampoline
+    // registers. That is exactly the shape that already worked, which is why this defect survived:
+    // no case here reached the guest primary thread at all.
+    {
+        primary_pthread = pthread_self();
+        primary_tid = GetCurrentThreadId();
+
+        // NOT a red/green guard, and it must not be read as one. In-process, this test's own main
+        // thread is resolved by win_raise_exception's pthread_gethandle fallback, so the live
+        // failure (esrch-no-handle) does NOT reproduce here -- measured, after an assertion of the
+        // precondition failed exactly this way. The red/green evidence for the fix is the live
+        // title: 45/45 raises at the primary refused before, 0 after. What this case does prove,
+        // and what nothing else here covered, is that once the primary IS registered the raise is
+        // accepted and the handler really runs ON the primary thread.
+        primary_raise_result = 0xffffffffull;
+        pthread_t prober = 0;
+        CHECK(pthread_create(&prober, nullptr, primary_prober, nullptr) == 0,
+              "create primary-thread prober");
+        pthread_join(prober, nullptr);
+        CHECK(primary_raise_result == 0 || primary_raise_result == 0x80020003ull,
+              "a raise at the primary either resolves or reports ESRCH, never an opaque error");
+
+        // The fix: the primary publishes its own handle, exactly as win_thread_trampoline does.
+        register_guest_execution_thread_handle();
+
+        InterlockedExchange(&delivered, 0);
+        InterlockedExchange(&resumed, 0);
+        InterlockedExchange((volatile LONG*)&wait_word, 0);
+        handler_tid = 0;
+        primary_raise_result = 0xffffffffull;
+        primary_parked = 0;
+
+        pthread_t raiser = 0;
+        CHECK(pthread_create(&raiser, nullptr, primary_raiser, nullptr) == 0,
+              "create primary-thread raiser");
+        InterlockedExchange(&primary_parked, 1);
+        wait_on_address((uint64_t)(uintptr_t)&wait_word, 0, 0, 0, 0, 0);
+        pthread_join(raiser, nullptr);
+
+        CHECK(primary_raise_result == 0,
+              "a registered primary thread accepts the raise instead of reporting ESRCH");
+        CHECK(delivered != 0, "guest handler executed for the primary thread");
+        CHECK(handler_tid == primary_tid,
+              "the primary thread's handler ran ON the primary thread");
+    }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");

@@ -130,6 +130,21 @@ namespace {
         }
         if (handle) CloseHandle(handle);
     }
+    // #2139: the ONLY caller of register_current_thread_handle was win_thread_trampoline, so the
+    // primary guest thread -- which never runs through it -- had no entry here, and in a live title
+    // win_raise_exception's pthread_gethandle fallback did not resolve it either: every raise at it
+    // took the esrch-no-handle branch. The IL2CPP GC therefore could not stop the primary thread and
+    // marked the heap while it kept mutating, which is heap corruption, not a missed suspend.
+    // Measured on Blue Prince: 45/45 raises at the primary refused, 739/739 at workers accepted;
+    // after registering it, 0 refusals and the title streams its 784 MB asset file for the first
+    // time on Windows.
+    //
+    // CONFIDENCE: HIGH that registering the primary is correct (it is exactly the symmetry the
+    // worker path already has, and the live measurement is unambiguous). CONFIDENCE: LOW on WHY the
+    // fallback fails: standalone probes on this toolchain show pthread_gethandle naming the process
+    // main thread, a pthread_create worker, AND a raw CreateThread thread, so the emulator-specific
+    // reason is NOT established. Do not repeat the retracted explanation that winpthreads cannot
+    // name a foreign thread -- that was measured false. The registry no longer depends on it.
     HANDLE duplicate_registered_thread_handle(uint64_t guest_thread) {
         HANDLE duplicate = nullptr;
         std::lock_guard<std::mutex> lk(g_thread_handle_mx);
@@ -2862,6 +2877,13 @@ bool win_init_xstate_context(void* storage, size_t storage_size, PCONTEXT* conte
     return SetXStateFeaturesMask(*context, GetEnabledXStateFeatures()) != FALSE;
 }
 
+// #2139: sceKernelRaiseException reports ESRCH for a target that is demonstrably alive (Blue Prince:
+// 45/45 refusals target one thread while 739/739 raises at every other thread succeed). Three
+// distinct branches return that one code, so the log cannot say which. Name them.
+std::atomic<uint32_t> g_win_exc_esrch_no_handle{0};
+std::atomic<uint32_t> g_win_exc_esrch_exited{0};
+std::atomic<uint32_t> g_win_exc_esrch_exited_late{0};
+
 void win_exc_log_rejected(const char* reason, std::atomic<uint32_t>& counter,
                           uint64_t target, uint64_t type, DWORD suspend_count = 0) {
     const uint32_t occurrence = counter.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -3038,10 +3060,20 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
     }
     struct OwnedHandle { HANDLE value; ~OwnedHandle() { if (value) CloseHandle(value); } }
         owned{thread};
-    if (!thread || thread == INVALID_HANDLE_VALUE) return 0x80020003ull;          // ESRCH
-    DWORD exit_code = 0;
-    if (!GetExitCodeThread(thread, &exit_code) || exit_code != STILL_ACTIVE)
+    if (!thread || thread == INVALID_HANDLE_VALUE) {
+        // Neither the trampoline registry nor winpthreads could name this thread. A guest thread
+        // that never ran through win_thread_trampoline is registry-invisible by construction.
+        win_exc_log_rejected("esrch-no-handle", g_win_exc_esrch_no_handle, target, type);
         return 0x80020003ull;                                                     // ESRCH
+    }
+    DWORD exit_code = 0;
+    if (!GetExitCodeThread(thread, &exit_code) || exit_code != STILL_ACTIVE) {
+        // A handle was found but reports a dead thread -- e.g. a stale registry entry left by an
+        // abnormal exit, reachable again once pthread ids recycle (#138).
+        win_exc_log_rejected("esrch-exited", g_win_exc_esrch_exited, target, type,
+                             (DWORD)exit_code);
+        return 0x80020003ull;                                                     // ESRCH
+    }
 
     const WinCoopQueueResult cooperative = try_queue_wait_exception(target, type, thread);
     if (cooperative == WinCoopQueueResult::Queued) return 0;
@@ -3049,8 +3081,11 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
 
     // The target may have exited during the bounded cooperative handoff. Do not allocate a delivery
     // record or turn a failed SuspendThread into an opaque Win32 error for a dead pthread.
-    if (!GetExitCodeThread(thread, &exit_code) || exit_code != STILL_ACTIVE)
+    if (!GetExitCodeThread(thread, &exit_code) || exit_code != STILL_ACTIVE) {
+        win_exc_log_rejected("esrch-exited-late", g_win_exc_esrch_exited_late, target, type,
+                             (DWORD)exit_code);
         return 0x80020003ull;                                                     // ESRCH
+    }
 
     // Do not use the process heap for delivery records. The target can be interrupted while it owns
     // that heap's lock, and freeing a record from its injected handler would then deadlock before the
@@ -3490,6 +3525,12 @@ void dispatch_pending_guest_exception() {
     win_exc_trace(WinExcTraceKind::CoopExit, self, GetCurrentThreadId(),
                   captured.Rip, captured.Rsp);
     slot->state.store(WinCoopState::Idle, std::memory_order_release);
+#endif
+}
+
+void register_guest_execution_thread_handle() {
+#ifdef _WIN32
+    register_current_thread_handle((uint64_t)pthread_self());
 #endif
 }
 
