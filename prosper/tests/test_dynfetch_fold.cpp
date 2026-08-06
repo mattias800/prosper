@@ -2306,6 +2306,64 @@ int main() {
               cached_first[0].desc.base == 0x1000u && patched[0].desc.base == 0x2000u,
           "cache invalidation preserves the real fold result after a shader literal changes");
 
+    // Kernel 6 (#2132): BRANCH-EXCLUSIVE WRITES. The fold walks straight-line, so a shader that
+    // guards its descriptor setup with a branch had the not-taken side's register writes carried
+    // into a block the hardware only ever enters FROM the branch. CrossWorlds' NGG vertex stage is
+    // this shape: `s_cbranch_vccz T`, then a `s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60` that
+    // overwrites the stage's two seeded direct pointers with float uniforms, then an unconditional
+    // `s_branch` OVER T — so T has no fall-through predecessor and exactly one branch reaches it.
+    // At T the shader dereferences s[16:17]; the walk had replaced it with 1.0f/0, which read as a
+    // "null bindless-table pointer" that no writer ever wrote.
+    //
+    // Layout mirrors the guest exactly: a 160-byte stride-16 constant buffer whose dwords at +0x60
+    // are 1.0f,0,0,0, and a descriptor table reached only through the seeded pointer at dw8.
+    alignas(16) uint32_t k6_vbuf[32] = {};                  // 8 records x 16 bytes
+    alignas(16) uint32_t k6_cbuf[40] = {};                  // 10 records x 16 bytes = 160
+    k6_cbuf[24] = 0x3F800000u;                              // +0x60 = 1.0f  (lands in s16)
+    k6_cbuf[25] = 0u; k6_cbuf[26] = 0u; k6_cbuf[27] = 0u;   // +0x64..+0x6c  (s17, s18, s19)
+    const uint64_t k6_vbuf_addr = (uint64_t)(uintptr_t)k6_vbuf;
+    alignas(16) uint32_t k6_table[4] = {
+        (uint32_t)k6_vbuf_addr,
+        (uint32_t)((k6_vbuf_addr >> 32) & 0xFFFFu) | (16u << 16),   // stride 16
+        8u, 0u,
+    };
+    const uint64_t k6_cbuf_addr = (uint64_t)(uintptr_t)k6_cbuf;
+    const uint64_t k6_table_addr = (uint64_t)(uintptr_t)k6_table;
+    uint32_t seed6[12] = {
+        (uint32_t)k6_cbuf_addr,                                          // dw0..3 -> s8..s11: cbuf V#
+        (uint32_t)((k6_cbuf_addr >> 32) & 0xFFFFu) | (16u << 16),        //   stride 16
+        10u, 0u,                                                         //   num_records 10 (160 B)
+        0u, 0u, 0u, 0u,                                                  // dw4..7 -> s12..s15
+        (uint32_t)k6_table_addr,                                         // dw8..9 -> s16:s17 table ptr
+        (uint32_t)(k6_table_addr >> 32),
+        0u, 0u,                                                          // dw10..11 -> s18:s19
+    };
+    const uint32_t k6[] = {
+        0xBF860003u,                // pc=0  s_cbranch_vccz 3      -> T (pc=4)
+        0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+        0xBF820004u,                // pc=3  s_branch 4            -> pc=8 (so T has no fall-through)
+        0xF4080108u, 0xFA000000u,   // pc=4  T: s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=6  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF810000u,                // pc=8  s_endpgm
+    };
+    auto k6_fetch = resolve_dynamic_fetch(k6, sizeof(k6)/sizeof(k6[0]), seed6, 12, 8);
+    CHECK(k6_fetch.size() == 1 &&
+              k6_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "#2132: a branch-exclusive write does not clobber the seeded pointer its target reads");
+
+    // Counter-arm — the same kernel with ONE dword changed: the unconditional s_branch at pc=3
+    // becomes s_nop, so T now HAS a fall-through predecessor and the rule must not fire. Without
+    // this arm the assertion above would also pass if the fold simply re-seeded every register at
+    // every block, which is a different (and wrong) behaviour.
+    uint32_t k6_ft[sizeof(k6)/sizeof(k6[0])];
+    std::copy(std::begin(k6), std::end(k6), std::begin(k6_ft));
+    k6_ft[3] = 0xBF800000u;         // s_nop 0
+    clear_shader_decode_cache();
+    auto k6_ft_fetch = resolve_dynamic_fetch(k6_ft, sizeof(k6_ft)/sizeof(k6_ft[0]), seed6, 12, 8);
+    CHECK(k6_ft_fetch.empty() ||
+              k6_ft_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "#2132 counter-arm: a target with a fall-through predecessor keeps the walked value");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
