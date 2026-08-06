@@ -7007,28 +7007,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     raw = b.uconst(static_cast<uint32_t>(in.src[0].value));
                 uint32_t r16;
                 if (from_float) {
-                    // Clamp in the FLOAT domain, before the convert. Clamping the integer result
-                    // instead would rest on undefined behaviour: SPIR-V leaves OpConvertFToU /
-                    // OpConvertFToS unspecified when the value is not representable, so a negative
-                    // f16 into v_cvt_u16_f16 could be 0xFFFF (wrap, then survive a UMin) on a
-                    // conforming implementation. RDNA2 specifies a clamp for both, so make it a
-                    // clamp. NaN is handled explicitly because the NaN-aware NMin/NMax would carry
-                    // it to a rail rather than to 0.
-                    // HONEST NOTE on the tests below it (32o14/32o14b/32o15/32o15b/32o15c): RADV
-                    // already saturates and already maps NaN to 0, so an A/B against the
-                    // integer-domain form passes every one of them on this hardware. Those kernels
-                    // therefore pin the CONTRACT, and would discriminate only on an implementation
-                    // that wraps. This change is a portability fix that the local GPU cannot
-                    // demonstrate — do not read their green as proof the lowering changed.
+                    // Clamping the INTEGER result is correct and sufficient here, and an outer
+                    // float-domain clamp would be redundant work on a hot path. `cvt_f2u` and
+                    // `cvt_f2i` are not thin OpConvertFToU/OpConvertFToS wrappers: they are
+                    // prosper's own saturating helpers (#135/#686, defined above in this file).
+                    // Both select NaN to 0 BEFORE converting, bound the operand so the conversion
+                    // itself is always defined, and saturate at the 32-bit rail. So every f16 a
+                    // source can hold is already mapped to a defined 32-bit value, and the only
+                    // thing left to do is narrow that rail from 32 to 16 bits.
                     const uint32_t x = b.unpack_half(raw, 0);
-                    const uint32_t nan = b.fcmp(Op_FUnordNotEqual, x, x);
-                    const bool to_unsigned = in.opcode == 0x52;
-                    const uint32_t lo = b.uconst(fbits(to_unsigned ? 0.0f : -32768.0f));
-                    const uint32_t hi = b.uconst(fbits(to_unsigned ? 65535.0f : 32767.0f));
-                    const uint32_t clamped =
-                        b.fext2(Glsl_NMin, b.fext2(Glsl_NMax, x, lo), hi);
-                    r16 = b.sel(nan, b.uconst(0),
-                                to_unsigned ? b.cvt_f2u(clamped) : b.cvt_f2i(clamped));
+                    r16 = in.opcode == 0x52
+                              ? b.uext2(Glsl_UMin, b.cvt_f2u(x), b.uconst(0xFFFFu))
+                              : b.sext2(Glsl_SMin,
+                                        b.sext2(Glsl_SMax, b.cvt_f2i(x), b.uconst(0xFFFF8000u)),
+                                        b.uconst(0x7FFFu));
                 } else {
                     const uint32_t word = b.ibin(Op_BitwiseAnd, raw, b.uconst(0xFFFFu));
                     r16 = b.pack_half_lo(in.opcode == 0x50

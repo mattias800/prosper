@@ -2709,11 +2709,11 @@ int main() {
     CHECK(got32o13.size()==1 && bits_of(got32o13[0])==0x00640003u,
           "kernel 32o13 keeps min3/max3 signedness separate at 16 bits");
 
-    // Kernel 32o14 (#2013): the NEGATIVE clamp of v_cvt_u16_f16, on a finite in-f16-range input, so
-    // the assertion does not rest on SPIR-V's undefined float->int conversion. RDNA2 specifies a
-    // clamp to [0, 65535]; handing -3.0 straight to OpConvertFToU is undefined, and a conforming
-    // implementation that wrapped would survive an integer-domain UMin and give 0xffff. The
-    // lowering therefore clamps in the FLOAT domain, and this is the arm that proves it.
+    // Kernel 32o14 (#2013): the NEGATIVE clamp of v_cvt_u16_f16, on a finite input. RDNA2 specifies
+    // a clamp to [0, 65535], so -3.0h must give 0. This PINS THE CONTRACT; it does not discriminate
+    // against any other plausible lowering, because prosper's `cvt_f2u` helper already selects NaN
+    // to 0 and saturates below at 0 before converting. Its value is as a future lever: it fails if
+    // anyone later simplifies `cvt_f2u` or this 16-bit wrapper.
     //   v0 = {lo = -3.0h}, v2 = 0x12345678  ->  v2 = 0x12340000
     const uint32_t code32o14[] = {
         0x7e0002ffu, 0x0000c200u,
@@ -2729,7 +2729,8 @@ int main() {
           "kernel 32o14 clamps a negative f16 to 0 rather than wrapping it");
 
     // Kernel 32o14b: the upper rail of the same op. f16's finite maximum is 65504 < 0xffff, so an
-    // infinity is the only input that can reach it. NaN takes the explicit zero path.
+    // infinity is the only input that can reach it — `cvt_f2u` maps it to 0xFFFFFFFF and the UMin
+    // narrows that to 0xffff.
     //   v0 = {lo = +Inf}, v2 = 0x12345678  ->  v2 = 0x1234ffff
     const uint32_t code32o14b[] = {
         0x7e0002ffu, 0x00007c00u,
@@ -2745,8 +2746,8 @@ int main() {
           "kernel 32o14b saturates v_cvt_u16_f16 at the upper 16-bit rail");
 
     // Kernel 32o15 (#2013): the POSITIVE rail of v_cvt_i16_f16 with a FINITE input — 40000.0h is
-    // exactly representable in f16 and well above 32767, so this arm is well-defined under the
-    // float-domain clamp and would fail under an integer-domain one that wrapped.
+    // exactly representable in f16 and well above 32767. Contract pin, not a discriminator: 40000 is
+    // representable in int32, so `cvt_f2i` converts it exactly and only the 16-bit narrowing acts.
     //   v1 = {lo = 40000.0h}, v3 = 0xaaaa0000  ->  v3 = 0xaaaa7fff
     const uint32_t code32o15[] = {
         0x7e0202ffu, 0x000078e2u,
@@ -2761,10 +2762,8 @@ int main() {
     CHECK(got32o15.size()==1 && bits_of(got32o15[0])==0xaaaa7fffu,
           "kernel 32o15 clamps v_cvt_i16_f16 at the positive 16-bit rail");
 
-    // Kernel 32o15b: the negative rail of the same op, and the NaN contract (RDNA2 converts a NaN
-    // to 0, which the NaN-aware clamp alone would carry to -32768 instead).
-    //   v1 = {lo = -Inf},   v3 = 0xaaaa0000  ->  v3 = 0xaaaa8000
-    //   v5 = {lo = NaN},    v6 = 0xbbbb1111  ->  v6 = 0xbbbb0000
+    // Kernel 32o15b: the negative rail of the same op.
+    //   v1 = {lo = -Inf}, v3 = 0xaaaa0000  ->  v3 = 0xaaaa8000
     const uint32_t code32o15b[] = {
         0x7e0202ffu, 0x0000fc00u,
         0x7e0602ffu, 0xaaaa0000u,
@@ -2778,7 +2777,7 @@ int main() {
     CHECK(got32o15b.size()==1 && bits_of(got32o15b[0])==0xaaaa8000u,
           "kernel 32o15b clamps v_cvt_i16_f16 at the negative 16-bit rail");
 
-    // Kernel 32o15c: NaN must convert to 0, not to a rail.
+    // Kernel 32o15c: NaN must convert to 0, not to a rail. Nothing tested this contract before.
     //   v1 = {lo = NaN (0x7e00)}, v3 = 0xaaaa1111  ->  v3 = 0xaaaa0000
     const uint32_t code32o15c[] = {
         0x7e0202ffu, 0x00007e00u,
