@@ -415,6 +415,27 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     checked.** Opening the cited file and running one `grep -rn 'getenv("…")' prosper/src` is the whole
     defence, and it is two commands. This binds on reviewers most of all — when you cite a line, you are
     asserting you read it.
+    - **The asymmetry that makes this worse: a finding you WANT to be true gets checked least.** A
+      correction that *lowers* a claim is scrutinised, because it costs the author something. A
+      correction that *raises* one is waved through, because it agrees with what the author already
+      believed — and it lands in a `## Ruled out` row wearing a citation, where nobody is motivated to
+      re-derive it. Worked example (2026-08-06): an author marked a VOP3P `NEG` semantic
+      `CONFIDENCE: MED`, a reviewer volunteered "published support you hadn't cited", and the author
+      raised it to `HIGH`. A second reviewer traced the citation: the reference says the modifier is
+      *"valid for floating-point operands only"* — a **restriction**, cutting against the inference —
+      and the LLVM fold came from a PR merged and reverted the same day, covering a different
+      instruction family. The honest label was the original one; the author had been talked *up* from it.
+    - **The multiplier is the citation itself.** A bare "I think you're being too conservative" would
+      have drawn scrutiny. A published field description plus a compiler fold read as *already checked* —
+      the same authority-transfer described above, now pointed at the thing the author hoped was true.
+      **So trace a citation in proportion to how much you want it to be true, and treat "this supports
+      raising confidence" as a trigger for verification rather than a reason to skip it.**
+    - The general shape all of these share is worth naming, because it is not "someone was wrong": it is
+      **a true statement reached by a route that does not establish it.** The claim survives casual
+      checking precisely because it is defensible; what fails is the derivation, and nobody re-runs a
+      derivation whose conclusion they already accept. Three instances landed in one day — this citation,
+      a `v_med3_f16` lowering correct only for finite inputs, and a pair of test arms asserting a property
+      their inputs could not exercise (#2130).
   - **How a verdict is expressed and detected — this is mechanical, and getting it wrong has merged a rejected
     PR.** The reviewer posts one or more **registered reviews** with `gh pr review <N> --comment --body '…'`,
     each stating a verdict as a literal **`APPROVED`** or **`REJECTED`** in the body. The author reads the
