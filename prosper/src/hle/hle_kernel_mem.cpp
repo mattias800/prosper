@@ -4136,19 +4136,6 @@ namespace {
         return true;
     }
 
-    bool tracked_slices_have_commit_state(const std::vector<TrackedMappingSlice>& slices,
-                                          uint64_t begin, uint64_t end, bool committed) {
-        uint64_t cursor = begin;
-        for (const TrackedMappingSlice& slice : slices) {
-            const uint64_t slice_end = slice.base + slice.size;
-            if (slice_end <= cursor || slice.base >= end) continue;
-            if (slice.base > cursor || slice.committed != committed) return false;
-            cursor = std::min<uint64_t>(end, slice_end);
-            if (cursor == end) return true;
-        }
-        return false;
-    }
-
     bool tracked_slices_back_host_reservation(
         const std::vector<TrackedMappingSlice>& slices, uint64_t begin, uint64_t end) {
         uint64_t cursor = begin;
@@ -4166,6 +4153,20 @@ namespace {
         return false;
     }
 
+    // True when [begin,end) lies inside the fixed guest MODULE apertures (eboot, the PRXes, the
+    // plugin/runtime pools). boot_program.hpp labels everything else "mapped/host"; the module
+    // images are mapped by the exec substrate rather than the memory HLE, so they are legitimate
+    // guest memory that g_maps never records. Both ends are checked, so a span that starts in a
+    // module and runs off its end is rejected; an interior hole would be MEM_FREE and is already
+    // refused by the region walk.
+    bool guest_module_image_span(uint64_t begin, uint64_t end) {
+        if (begin >= end) return false;
+        auto is_module = [](uint64_t a) {
+            return std::strcmp(prosper::guest_module_name(a), "mapped/host") != 0;
+        };
+        return is_module(begin) && is_module(end - 1);
+    }
+
     bool win_protect(uint64_t addr, uint64_t len, int hp, DWORD* error_out = nullptr) {
         if (error_out) *error_out = ERROR_SUCCESS;
         if (!addr || !len || addr > UINT64_MAX - len) {
@@ -4177,11 +4178,12 @@ namespace {
         // Reserved (uncommitted) pages accept a tracking-only protection change, matching the POSIX
         // PROT_NONE reservation path; MEM_FREE makes the whole operation fail (#387 F3).
         const uint64_t end = addr + len;
+        // Partial (or absent) tracker coverage is allowed; the per-region walk below decides. The
+        // authority on whether a page exists is the OS (MEM_FREE fails), not prosper's bookkeeping —
+        // g_maps records what the memory HLE allocated, and a guest may protect memory it did not
+        // get from the memory HLE at all. See the MEM_COMMIT arm.
         std::vector<TrackedMappingSlice> tracked;
-        if (!tracked_mapping_slices(addr, end, tracked)) {
-            if (error_out) *error_out = ERROR_INVALID_ADDRESS;
-            return false;
-        }
+        (void)tracked_mapping_slices(addr, end, tracked);
 
         struct CommittedRegion { uint64_t base, size; DWORD old_protection; };
         std::vector<CommittedRegion> committed;
@@ -4204,18 +4206,51 @@ namespace {
                     return false;
                 }
             } else if (mbi.State == MEM_COMMIT) {
-                if (!tracked_slices_have_commit_state(tracked, cursor, region_end, true)) {
-                    if (error_out) *error_out = ERROR_INVALID_ADDRESS;
-                    return false;
-                }
                 // Split at tracker boundaries so rollback restores the guest protection recorded
-                // before write-watch temporarily made any pages read-only.
-                for (const TrackedMappingSlice& slice : tracked) {
-                    const uint64_t overlap_begin = std::max(cursor, slice.base);
-                    const uint64_t overlap_end = std::min(region_end, slice.base + slice.size);
-                    if (overlap_begin < overlap_end)
-                        committed.push_back({overlap_begin, overlap_end - overlap_begin,
-                                             win_page_prot(slice.prot)});
+                // before write-watch temporarily made any pages read-only. A gap the tracker does
+                // not own is NOT an error: guest memory the memory HLE never allocated is still
+                // real, committed guest memory. A module image is mapped by the exec substrate
+                // (map_image's VirtualAlloc), so it is absent from g_maps, and the guest legitimately
+                // mprotects its OWN segments — POSIX mprotect accepts that, so this must too. #2101:
+                // The Messenger calls sceKernelMprotect(eboot+0x1d98000, 0x22240, CPU_WRITE|GPU_READ)
+                // during AGC device init; refusing it with EINVAL made the title abandon that init,
+                // which cost it its whole register-offset table. Rollback for an untracked gap uses
+                // the protection the pages actually had.
+                uint64_t scan = cursor;
+                while (scan < region_end) {
+                    const TrackedMappingSlice* covering = nullptr;
+                    uint64_t next_slice_base = region_end;
+                    for (const TrackedMappingSlice& slice : tracked) {
+                        const uint64_t slice_end = slice.base + slice.size;
+                        if (scan >= slice.base && scan < slice_end) { covering = &slice; break; }
+                        if (slice.base > scan && slice.base < next_slice_base)
+                            next_slice_base = slice.base;
+                    }
+                    if (covering) {
+                        // A tracked mapping that the tracker says is NOT committed, over host pages
+                        // that are, is a bookkeeping disagreement — keep refusing it as before.
+                        if (!covering->committed) {
+                            if (error_out) *error_out = ERROR_INVALID_ADDRESS;
+                            return false;
+                        }
+                        const uint64_t slice_end =
+                            std::min(region_end, covering->base + covering->size);
+                        committed.push_back({scan, slice_end - scan, win_page_prot(covering->prot)});
+                        scan = slice_end;
+                    } else {
+                        // An untracked gap is allowed ONLY inside a fixed guest MODULE image. That is
+                        // the case this exists for (map_image's VirtualAlloc never enters g_maps) and
+                        // it must not widen into "any committed page in the process": test_retrack_
+                        // reservation deliberately commits a page adjacent to a guest reservation and
+                        // requires a span crossing into it to fail, because the guest must not be able
+                        // to reprotect host memory it does not own.
+                        if (!guest_module_image_span(scan, next_slice_base)) {
+                            if (error_out) *error_out = ERROR_INVALID_ADDRESS;
+                            return false;
+                        }
+                        committed.push_back({scan, next_slice_base - scan, mbi.Protect});
+                        scan = next_slice_base;
+                    }
                 }
             }
             cursor = region_end;
@@ -4944,7 +4979,18 @@ HLE(k_mprotect) {
     if (!a0) return 0x80020016ull;
     const int prot = host_prot(a2);
     DWORD error = ERROR_SUCCESS;
-    if (!win_protect(a0, a1, prot, &error)) return sce_win_mprotect_error(error);
+    if (!win_protect(a0, a1, prot, &error)) {
+        // #2101: a refused mprotect is silent, and a guest that treats it as fatal then abandons a
+        // whole init path with no other symptom. Report the span, the requested Sony protection and
+        // the Win32 reason, bounded.
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 24)
+            fprintf(stderr, "[memhle] sceKernelMprotect REFUSED addr=0x%llx len=0x%llx prot=0x%llx "
+                            "win_error=%lu\n",
+                    (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                    (unsigned long)error);
+        return sce_win_mprotect_error(error);
+    }
     retrack_prot(a0, a1, prot, static_cast<uint32_t>(a2), "mprotect");
     return 0;
 }

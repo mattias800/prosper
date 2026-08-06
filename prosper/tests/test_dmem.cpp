@@ -9,6 +9,7 @@
 #include "../src/host/guest_write_watch.hpp"
 #ifdef _WIN32
 #include "../src/host/exec_image.hpp"
+#include "../src/host/boot_program.hpp"   // BOOT_EBOOT: the module aperture the mprotect case uses
 #include "../src/host/guest_memory_map.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include <windows.h>
@@ -506,6 +507,48 @@ int main() {
         CHECK(writable_after.State == MEM_COMMIT &&
                   (writable_after.Protect & 0xff) == PAGE_READWRITE,
               "mprotect updates an existing sparse host page");
+    }
+    // #2101: memory the guest did NOT get from the memory HLE is still real guest memory, and the
+    // guest may protect it. A module image is mapped by the exec substrate's VirtualAlloc, so it
+    // never enters g_maps; requiring tracker coverage made sceKernelMprotect refuse a title's
+    // mprotect of its OWN eboot segment with EINVAL. The Messenger treats that as fatal and
+    // abandons AGC device init, losing its register-offset table (upside-down, world-less frames).
+    // POSIX mprotect accepts this, so Windows must too. Stand in for the module image with a plain
+    // VirtualAlloc the memory HLE has never heard of.
+    // The allowance is deliberately narrow: a MODULE aperture, not "any committed page". Commit
+    // inside the eboot aperture exactly as map_image does, and separately confirm that an ordinary
+    // committed allocation outside every module aperture is still refused -- that second half is the
+    // guest-does-not-own-host-memory property test_retrack_reservation guards from the other side.
+    {
+        constexpr SIZE_T kLen = 0x4000;
+        void* image = VirtualAlloc((void*)(uintptr_t)(prosper::BOOT_EBOOT + 0x2000000ull), kLen,
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        CHECK(image != nullptr, "commit inside the eboot module aperture, as map_image does");
+        if (image) {
+            const uint64_t va = (uint64_t)(uintptr_t)image;
+            CHECK(protect(va, kLen, 0x1, 0, 0, 0) == 0,
+                  "sceKernelMprotect accepts a module image the VA tracker does not own");
+            MEMORY_BASIC_INFORMATION after{};
+            VirtualQuery(image, &after, sizeof(after));
+            CHECK(after.State == MEM_COMMIT && (after.Protect & 0xff) == PAGE_READONLY,
+                  "the module image's host protection actually changed");
+            CHECK(protect(va, kLen, 0x2, 0, 0, 0) == 0, "and it can be restored to read/write");
+            // The OS stays the authority on existence: a freed range must still be refused.
+            VirtualFree(image, 0, MEM_RELEASE);
+            CHECK(protect(va, kLen, 0x2, 0, 0, 0) != 0,
+                  "sceKernelMprotect still refuses a freed (MEM_FREE) range");
+        }
+        void* foreign = VirtualAlloc(nullptr, kLen, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        CHECK(foreign != nullptr, "commit host memory outside every module aperture");
+        if (foreign) {
+            CHECK((uint32_t)protect((uint64_t)(uintptr_t)foreign, kLen, 0x1, 0, 0, 0) == 0x80020016u,
+                  "sceKernelMprotect still refuses committed memory the guest does not own");
+            MEMORY_BASIC_INFORMATION unchanged{};
+            VirtualQuery(foreign, &unchanged, sizeof(unchanged));
+            CHECK((unchanged.Protect & 0xff) == PAGE_READWRITE,
+                  "the refused foreign page keeps its original protection");
+            VirtualFree(foreign, 0, MEM_RELEASE);
+        }
     }
     CHECK(map((uint64_t)(uintptr_t)&sparse_va2, sparse_len, 0x1, 0,
               sparse_phys, sparse_align) == 0 && sparse_va2 && sparse_va2 != sparse_va1,
