@@ -274,8 +274,11 @@ if MODE == "launch":
         # driver's memory (a PROSPER_GFXLOG/PROSPER_DBG log reaches 1.5 GB, and exhausting
         # memory on this box takes every concurrent lane's shell down with it). gdb's own
         # stdout stays on the pipe — the result block is a few hundred bytes.
-        # `set inferior-tty` takes the rest of the line as the path and does not create it;
-        # the driver rejects whitespace and creates the file.
+        # `set inferior-tty` OPENS this path and does not create it, so the driver creates and
+        # truncates it first — otherwise gdb aborts at `run` with "No such file or directory"
+        # before a single breakpoint fires. It also redirects the inferior's stdin. The path is
+        # interpolated unquoted, so the driver refuses whitespace (gdb itself handles spaces
+        # fine — see the note there; the restriction is this driver's, not gdb's).
         gdb.execute("set inferior-tty %s" % INFERIOR_TTY)
     # Every breakpoint above is already in place, so the window opens at the
     # process's first instruction — which is the whole point of this mode.

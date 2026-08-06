@@ -78,7 +78,9 @@ python3 tools/hle_calls/hle_calls.py --ticks 30 --values --filter '^s_' \
 ```
 
 The file is created and truncated before gdb starts (gdb *opens* this path, it does not create it),
-and the path may not contain whitespace — `set inferior-tty` takes the rest of its command line.
+and the path may not contain whitespace. That restriction is **this tool's, not gdb's** — gdb 17.2
+keeps a spaced path intact, and tilde-expands it — but the driver interpolates the path into a gdb
+command line unquoted, so it refuses rather than relying on that.
 The inferior's **stdin** is redirected too, so a launched program that reads stdin sees EOF.
 `--inferior-log` is rejected in `--pid` mode, where the target owns its own output and this tool has
 nothing to redirect.

@@ -200,11 +200,17 @@ def _prepare_inferior_log(path):
     else (`/dev/null`, a tty, a fifo) exactly as it is.
     """
     resolved = os.path.abspath(path or os.devnull)
-    # `set inferior-tty` takes the rest of the gdb command line as the path, so a space in it
-    # would silently truncate the name. Say so instead of writing the log somewhere unexpected.
+    # Refuse a whitespace path. NOT because gdb would mangle it — measured on gdb 17.2,
+    # `set inferior-tty` is an add_setshow_filename_cmd and keeps the whole path, spaces
+    # included (`show inferior-tty` echoes it back intact), and it tilde-expands too. The
+    # reason is this driver: it interpolates the path into a gdb command line and does not
+    # quote it, and gdb's own quoting rules for filename settings are not something to rely
+    # on silently. Rejecting is a one-line conservatism with a clear message; the day a real
+    # path needs a space, quote it here and delete this check rather than trusting the
+    # interpolation.
     if any(c.isspace() for c in resolved):
-        sys.exit("hle_calls: --inferior-log path must not contain whitespace (gdb's "
-                 "`set inferior-tty` takes the rest of the line): %s" % resolved)
+        sys.exit("hle_calls: --inferior-log path must not contain whitespace (this driver "
+                 "interpolates it into a gdb command line unquoted): %s" % resolved)
     try:
         if not os.path.exists(resolved) or os.path.isfile(resolved):
             with open(resolved, "w"):
