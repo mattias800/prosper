@@ -180,7 +180,7 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     real faulting address. The default-path line is also fail-visible now:
     ```text
     [lazy-commit] #1 mapped page=0x2100000000 addr=0x2100000041 access=read rip=0x…  FORGED-PTR-SHAPE(low-dword<=0xffff: …)
-    [lazy-commit] #1 DECLINED(strict) page=0x2100000000 addr=0x2100000041 access=read rip=0x…
+    [lazy-commit] #1 DECLINED(strict) page=0x2100000000 addr=0x2100000041 access=read rip=0x…  FORGED-PTR-SHAPE(low-dword<=0xffff: …)
     ```
     The ordinal is a whole-run census (the worker-fault path `_exit()`s, so no atexit summary can
     run), `access=` comes from the x86 page-fault error code, and `FORGED-PTR-SHAPE` marks a faulting
