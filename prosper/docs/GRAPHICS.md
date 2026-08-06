@@ -581,7 +581,12 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   only writer of either registered VideoOut buffer (`0x200a160000` / `0x200c140000`) is
   `compute-buffer … identity=0x20002fe800 size=33423360` — the storage-image writeback of **one**
   compute program, alternating between the two buffers, packing and tiling its result back into
-  guest memory across the padded SW_64KB_R_X footprint. **Zero** `dma-data` and **zero**
+  guest memory across the padded SW_64KB_R_X footprint. **Do not read that event count as a dispatch
+  rate**: `live_compute`'s "skipped identical storage writeback" fast path `continue`s *before* the
+  record, so the events count writes that **changed** something — 237 over 360 s against ~1,055
+  flips, collapsing to ~0 per sample once the frame is uniformly black and every writeback is
+  byte-identical to the last. The dispatch is still issued: a capture selected by
+  `PROSPER_GPU_CAPTURE_COMPUTE_ADDR` fires in the black phase. **Zero** `dma-data` and **zero**
   `write-data` events touch either address, and the draw half is settled independently by the pass
   census below (`vo=1` on 0 of 8,443 records). So the guest composites with a compute dispatch,
   prosper executes it, prosper writes it back, and prosper publishes it. Reach for
