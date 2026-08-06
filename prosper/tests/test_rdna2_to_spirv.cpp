@@ -3159,6 +3159,54 @@ int main() {
     CHECK(got32r14c.size()==1 && bits_of(got32r14c[0])==0x11113800u,
           "kernel 32r14c: v_max3_f16's OPSEL high-half read of inline 1.0 is 0.0h");
 
+    // 32r14d/e — the two remaining OPSEL sites, found in review of PR #2177. Both ignored the half
+    // select for BOTH inline kinds, which is the mechanism inline_16bit_operand_dword's own comment
+    // says is never a no-op. They are covered by the same evidence as the arms above: the select is
+    // VOP3 OPSEL, not an SDWA sub-dword select.
+    //
+    // 32r14d — v_pack_b32_f16 (0x311). OPSEL[0]=1 reads src0's HIGH half; OPSEL[1]=0 reads v0's
+    // LOW half, and that 0x2222 is the positive control that the pack ran and placed src1 correctly.
+    //   0x22220000 = correct     (high half of inline 1.0 is 0x0000)
+    //   0x22223c00 = select ignored (the constant read again)
+    //   0x11112222 = never ran
+    const uint32_t code32r14d[] = {
+        0x7e0202ffu, 0x11112222u,            // v1 = seed
+        0x7e0002ffu, 0x00002222u,            // v0 = {hi=0, lo=0x2222}
+        0xd7110801u, 0x000200f2u,            // v_pack_b32_f16 v1, 1.0, v0 op_sel:[1,0,0]
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r14d = recompile_valu(code32r14d, std::size(code32r14d), 0, 1);
+    CHECK(!spv32r14d.empty(), "recompiled kernel 32r14d (v_pack_b32_f16 + inline float high half) -> SPIR-V");
+    std::vector<float> got32r14d = prosper::test::run_compute(spv32r14d, std::vector<float>(1), 1, 1);
+    printf("  kernel 32r14d out=0x%08x (want 0x22220000; 0x22223c00 = OPSEL ignored, "
+           "0x11112222 = did not execute)\n",
+           got32r14d.size()==1 ? bits_of(got32r14d[0]) : 0u);
+    CHECK(got32r14d.size()==1 && bits_of(got32r14d[0])==0x22220000u,
+          "kernel 32r14d: v_pack_b32_f16's OPSEL high-half read of inline 1.0 is 0x0000");
+
+    // 32r14e — the 16-bit integer VALU family (0x303 v_add_nc_u16), and deliberately an inline INT
+    // rather than a float: it pins the other half of the same rule, that a POSITIVE inline int
+    // reads 0 from the high half because its dword is 0x0000000N. (Negative inline ints were right
+    // by accident, being sign-extended to 0xffffffff.) OPSEL[3]=0 writes the LOW destination half,
+    // so the 0x1111 marker must survive.
+    //   0x11110044 = correct        (0 + 0x44)
+    //   0x11110045 = select ignored (1 + 0x44)
+    //   0x11112222 = never ran
+    const uint32_t code32r14e[] = {
+        0x7e0202ffu, 0x11112222u,            // v1 = seed {hi=0x1111 marker, lo=0x2222 sentinel}
+        0x7e0002ffu, 0x00330044u,            // v0 = {hi=0x0033, lo=0x0044}
+        0xd7030801u, 0x00020081u,            // v_add_nc_u16 v1, 1, v0 op_sel:[1,0,0]
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r14e = recompile_valu(code32r14e, std::size(code32r14e), 0, 1);
+    CHECK(!spv32r14e.empty(), "recompiled kernel 32r14e (v_add_nc_u16 + inline int high half) -> SPIR-V");
+    std::vector<float> got32r14e = prosper::test::run_compute(spv32r14e, std::vector<float>(1), 1, 1);
+    printf("  kernel 32r14e out=0x%08x (want 0x11110044; 0x11110045 = OPSEL ignored, "
+           "0x11112222 = did not execute)\n",
+           got32r14e.size()==1 ? bits_of(got32r14e[0]) : 0u);
+    CHECK(got32r14e.size()==1 && bits_of(got32r14e[0])==0x11110044u,
+          "kernel 32r14e: v_add_nc_u16's OPSEL high-half read of inline 1 is 0, not 1");
+
     // Kernel 32r12 (LIVE, exec_cs_29400bcf00 pc=23): `v_mbcnt_lo_u32_b32 v2, -1, 0` INSIDE a
     // structured region. The compute structurizer sets its wave gate to `is_fragment`, so the
     // cross-lane MBCNT path is unavailable there and this used to reject the whole program — even

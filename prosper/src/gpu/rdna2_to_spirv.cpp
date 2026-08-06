@@ -8259,12 +8259,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else {
                     auto packed_half = [&](int k) {
                         const Operand& operand = in.src[k];
-                        if (operand.kind == OperandKind::InlineFloat)
-                            return b.uconst(inline_float_f16_bits(operand.value));
-                        if (operand.kind == OperandKind::InlineInt)
-                            return b.uconst(static_cast<uint32_t>(operand.value) & 0xFFFFu);
-                        return b.bfe_u(val(operand),
-                                       b.uconst(16u * ((in.vop3p_opsel >> k) & 1u)), b.uconst(16));
+                        // OPSEL[k] selects a half of an inline constant exactly as it does of a
+                        // register — see inline_16bit_operand_dword. Both inline branches used to
+                        // ignore it, so `1.0` read 0x3c00 and inline `1` read 1 from the HIGH half
+                        // where hardware reads 0 (#2119, kernel 32r14d).
+                        const uint32_t sel = (in.vop3p_opsel >> k) & 1u;
+                        uint32_t inline_dword;
+                        if (inline_16bit_operand_dword(operand, inline_dword))
+                            return b.uconst((inline_dword >> (16u * sel)) & 0xFFFFu);
+                        return b.bfe_u(val(operand), b.uconst(16u * sel), b.uconst(16));
                     };
                     vreg[in.dst.value] = b.ibin(
                         Op_BitwiseOr, packed_half(0),
@@ -8370,16 +8373,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     auto u16src = [&](int k) {
                         const Operand& operand = in.src[k];
                         // A 16-bit operand position carries the 16-bit encoding of an inline
-                        // constant, not the f32 pattern val() would materialize.
-                        if (operand.kind == OperandKind::InlineFloat)
-                            return b.uconst(inline_float_f16_bits(operand.value));
-                        if (operand.kind == OperandKind::InlineInt)
-                            return b.uconst(static_cast<uint32_t>(operand.value) & 0xFFFFu);
+                        // constant, not the f32 pattern val() would materialize — and OPSEL[k]
+                        // selects a half of THAT dword (see inline_16bit_operand_dword). Both
+                        // inline branches used to ignore the select, so a positive inline int read
+                        // its own value from the HIGH half where hardware reads 0 (#2119, kernel
+                        // 32r14e). Negative inline ints were already right by accident: -N is
+                        // sign-extended, so both halves are 0xffff.
+                        const uint32_t sel = (in.vop3p_opsel >> k) & 1u;
+                        uint32_t inline_dword;
+                        if (inline_16bit_operand_dword(operand, inline_dword))
+                            return b.uconst((inline_dword >> (16u * sel)) & 0xFFFFu);
                         const uint32_t raw = val(operand);
                         return b.ibin(Op_BitwiseAnd,
-                                      ((in.vop3p_opsel >> k) & 1u)
-                                          ? b.ibin(Op_ShiftRightLogical, raw, b.uconst(16))
-                                          : raw,
+                                      sel ? b.ibin(Op_ShiftRightLogical, raw, b.uconst(16)) : raw,
                                       b.uconst(0xFFFFu));
                     };
                     // Sign-extend a 16-bit value into the full 32-bit signed domain.
