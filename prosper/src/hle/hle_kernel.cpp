@@ -1010,29 +1010,48 @@ namespace {
                 (unsigned long long)rw_self_tid(),
                 (unsigned long long)(s & kRwCount), (s & kRwWrite) ? " WRITE" : "", n);
     }
-    // A lock call that FAILED records no hold, and it is worth saying so: the handlers below still
-    // report success to the guest, which is the other way an unmatched unlock can originate inside
-    // prosper rather than in the guest (#2024).
+    // A lock call that FAILED records no hold, and since #2024 it also reports that failure to the
+    // guest. Both halves matter and they are the same invariant seen from two sides: COUNT must
+    // equal the outstanding host holds, and the guest must not believe it holds what it does not.
+    // A handler that returned 0 on a refusal broke the second half, and the guest's own eventual
+    // unlock — correct from its point of view — then arrived unmatched at a lock with no hold to
+    // release, which is the #2012 corruption originating INSIDE prosper rather than in the guest.
     void rw_note_lock_result(const char* what, uint64_t slot, GuestRwlock* g, int rc) {
         if (rc == 0) { if (rwlocklog() >= 2) rw_report(RwReport::Trace, what, slot, g, 0); return; }
         rw_report(RwReport::Failed, what, slot, g, rc);
     }
 }
+// A REFUSED acquisition must be reported as one (#2024). These two returned 0 unconditionally, so a
+// guest told "the lock is yours" after a real EDEADLK/EAGAIN entered the critical section unguarded
+// and its later, entirely correct unlock arrived unmatched — the #2012 corruption manufactured by
+// prosper itself. `rc` fed only a diagnostic line.
+//
+// `fbsd_errno`, never the bare `rc`, and the reason is specific rather than stylistic: EDEADLK and
+// EAGAIN are the two values that SWAP between the host and the platform the guest was built against
+// (FreeBSD EDEADLK 11 / EAGAIN 35; Linux the mirror image). These handlers' interesting refusals are
+// exactly those two, so returning the host number would hand a guest "try again" where the host said
+// "deadlock" — the #1612 defect, on the paths that produce it most.
+//
+// The `!g` case (a null slot, or a lock object that could not be created) reports EINVAL, matching
+// `tryrdlock`, `trywrlock` and all four timed forms. It DELIBERATELY folds the out-of-memory
+// sub-case into EINVAL rather than reporting ENOMEM: `ensure_rwlock` does not distinguish them, and
+// answering one question two ways across the eight rwlock acquisition handlers would be its own
+// defect. Reachable only for a guest passing a null rwlock, where EINVAL is the platform answer.
 HLE(k_rwlock_rdlock)  {
     auto* g = ensure_rwlock(a0);
-    if (!g) return 0;
+    if (!g) return 0x16;   // EINVAL
     const int rc = pthread_rwlock_rdlock(&g->rw);
     if (rc == 0) rw_acquired(g, false);
     rw_note_lock_result("rdlock", a0, g, rc);
-    return 0;
+    return fbsd_errno(rc);
 }
 HLE(k_rwlock_wrlock)  {
     auto* g = ensure_rwlock(a0);
-    if (!g) return 0;
+    if (!g) return 0x16;   // EINVAL
     const int rc = pthread_rwlock_wrlock(&g->rw);
     if (rc == 0) rw_acquired(g, true);
     rw_note_lock_result("wrlock", a0, g, rc);
-    return 0;
+    return fbsd_errno(rc);
 }
 HLE(k_rwlock_unlock)  {
     auto* g = ensure_rwlock(a0);
@@ -1076,7 +1095,17 @@ HLE(k_rwlock_trywrlock){
 // way), and it makes the family self-consistent. CONFIDENCE: MED.
 // Init is aliased too: it can fail with ENOMEM (a failed allocation), so it is not a can't-fail
 // entry point.
+//
+// Rdlock and Wrlock are aliased as of #2024, and their previous ABSENCE from this list was not an
+// oversight — it was consistent with handlers that could not fail. Registering the Sony spelling
+// straight onto the POSIX body is only correct while that body returns nothing but 0; the moment it
+// can return a failure, the Sony spelling starts handing the guest a BARE FreeBSD errno where every
+// other libkernel entry point hands it the encoded form. Making a handler fallible and giving it its
+// alias are therefore one change, not two, and splitting them would produce exactly the #1984 defect
+// this alias exists to prevent.
 SCE_PTHREAD_ALIAS(k_sce_rwlock_init,      k_rwlock_init)
+SCE_PTHREAD_ALIAS(k_sce_rwlock_rdlock,    k_rwlock_rdlock)
+SCE_PTHREAD_ALIAS(k_sce_rwlock_wrlock,    k_rwlock_wrlock)
 SCE_PTHREAD_ALIAS(k_sce_rwlock_unlock,    k_rwlock_unlock)
 SCE_PTHREAD_ALIAS(k_sce_rwlock_tryrdlock, k_rwlock_tryrdlock)
 SCE_PTHREAD_ALIAS(k_sce_rwlock_trywrlock, k_rwlock_trywrlock)
@@ -3783,8 +3812,8 @@ void register_kernel_hle() {
     // read/write locks + once (Sony + POSIX names) — real host primitives (thread-safety fix).
     R("scePthreadRwlockInit", k_sce_rwlock_init);    R("pthread_rwlock_init", k_rwlock_init);
     R("scePthreadRwlockDestroy", k_rwlock_destroy);  R("pthread_rwlock_destroy", k_rwlock_destroy);
-    R("scePthreadRwlockRdlock", k_rwlock_rdlock);    R("pthread_rwlock_rdlock", k_rwlock_rdlock);
-    R("scePthreadRwlockWrlock", k_rwlock_wrlock);    R("pthread_rwlock_wrlock", k_rwlock_wrlock);
+    R("scePthreadRwlockRdlock", k_sce_rwlock_rdlock); R("pthread_rwlock_rdlock", k_rwlock_rdlock);
+    R("scePthreadRwlockWrlock", k_sce_rwlock_wrlock); R("pthread_rwlock_wrlock", k_rwlock_wrlock);
     R("scePthreadRwlockUnlock", k_sce_rwlock_unlock); R("pthread_rwlock_unlock", k_rwlock_unlock);
     R("scePthreadRwlockTryrdlock", k_sce_rwlock_tryrdlock);
     R("scePthreadRwlockTrywrlock", k_sce_rwlock_trywrlock);
