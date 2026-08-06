@@ -206,6 +206,25 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     `low dword <= 1` form of this marker would have been inert on its own evidence. **A repeated page is not evidence of a
     lost mapping**: every `0x21000000xx` pointer lands in page `0x2100000000`, which is why two
     different guest sites appeared to "first-touch the same page".
+  - **Which target holds content right now, and which pass wrote it?** **`PROSPER_DUMP_PERSISTENT`**
+    reads back and reports every persistent colour target **of at least 64x64** (`rgb_nonblack`,
+    `raw_nonzero_bytes`, and the first non-zero texel's own bytes, so "black" and "empty" stay
+    distinguishable) — it also `continue`s silently past a readback failure, so treat its count as a
+    lower bound and do not read it as "every target" — and
+    **`PROSPER_PASS_LOG`** reports each pass's target identity, `vo=` flag and defer decision. Both
+    open a **three-callback** window, and both accept two forms:
+    ```text
+    PROSPER_DUMP_PERSISTENT=26000       renderer-callback ordinal (unchanged)
+    PROSPER_DUMP_PERSISTENT=ms:240000   the first callback at or after 240 s, and the next two
+    ```
+    Prefer `ms:` unless you have already measured the ordinal in the same configuration. **The
+    ordinal is NOT the submit number `[gpucap]` prints** — on one 360 s route it reaches 6,560 while
+    the capture's submit counter reaches 26,209 — and overshooting it yields *no census at all*, a
+    silence that reads exactly like "every target was empty" (#1968). The `ms:` origin is the first
+    armed census check — the same *kind* of origin `PROSPER_GPU_CAPTURE_AFTER_MS` uses, on a separate
+    clock, so a capture and a census can be aimed at one phase but do not share a timebase. `PROSPER_DUMP_PERSISTENT` is deliberately **not** in the
+    `live_gpu_targets` disable list, so it observes the normal persistent-GPU-target path;
+    `PROSPER_GPU_CAPTURE` **is**, so an env-triggered capture run is on the CPU-readback path.
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
   `--seconds 1` for wall-clock sampling, warmup or `--render-every N --render-every-for-seconds S`
   for slow software rendering,
