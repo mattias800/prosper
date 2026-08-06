@@ -234,6 +234,15 @@ struct AgcDcb {
 // Per-thread, for the reason given above for g_dcb_diag_r: a Dcb is built by one thread, and a
 // shared global would let one thread's ring vouch for another's pointer. A cross-thread patch simply
 // misses and takes the probe path, which is correct, merely slower.
+//
+// EVICTION IS FIFO ROUND-ROBIN, NOT LRU/MRU — lookup scans all slots, but insertion overwrites the
+// oldest regardless of use. So a thread cycling through MORE than kDcbExtentSlots live rings can
+// evict a ring it is still patching into and thrash to a near-zero hit rate, paying a probe per
+// call where a smaller working set pays none. That is a PERFORMANCE cliff only — every miss still
+// gets the correct answer from guest_writable — but it is the reason this is sized above the one
+// ring the measured titles use rather than at 1, and the reason the number is stated here rather
+// than tuned silently. If a title is ever seen thrashing it, promote the policy to LRU (move a hit
+// to the front) before growing the array; the scan is linear, so the array cannot grow far.
 constexpr size_t kDcbExtentSlots = 4;
 struct DcbExtent { uintptr_t bottom = 0, top = 0; };
 inline thread_local DcbExtent g_dcb_extents[kDcbExtentSlots];

@@ -294,14 +294,44 @@ int main() {
               "#1650: out-of-ring pointers DO reach the write probe — so arm1's zero-probe "
               "assertion measures the registry rather than a counter stuck at zero");
 
-        // A shared 8-message budget across every patcher family in the translation unit meant a
-        // family that started misbehaving later refused in silence. Each call site now has its own
-        // budget: four distinct sites reported above even though earlier arms already logged
-        // refusals from the PatchSetNumRegisters sites.
-        CHECK(strstr(log, "SetCxRegIndirectPatchSetAddress") != nullptr &&
-              strstr(log, "SetShRegIndirectPatchAddRegisters") != nullptr,
-              "#1650: per-call-site diagnostic budgets, so one family cannot silence another");
-        if (fails) printf("  captured stderr:\n%s", log);
+        // Arm 5 — the diagnostic budget is PER CALL SITE.
+        //
+        // It used to be a single 8-message counter shared by every patcher family in the
+        // translation unit, so eight refusals anywhere spent it for everyone and the first refusal
+        // of a family that started misbehaving later never printed. That is the same defect class
+        // this issue is about — prosper declining a guest write and saying nothing.
+        //
+        // This arm has to FLOOD one call site past the budget to see it, and that is the whole
+        // point: the arms above produce only eight refusals in total across the entire run, which
+        // is exactly the old shared budget, so every one of them still prints under the old code
+        // and none of them can fail if the budget change is reverted. Counting refusals is not
+        // optional here — a cheaper assertion that merely re-greps two names already checked above
+        // cannot fail independently of the header check.
+        char log2[16384];
+        const bool captured2 = capture_stderr([&] {
+            for (int i = 0; i < 16; ++i)                  // spend this one site's budget outright
+                p_addr(victim_addr, 0xDEADBEEFCAFEBABEull, 0, 0, 0, 0);
+            p_add_sh(victim_addr, 1, 0, 0, 0, 0);         // a DIFFERENT site, still owed a voice
+        }, log2, sizeof log2);
+        CHECK(captured2, "#1650 arm5: stderr capture around the budget flood worked");
+
+        auto occurrences = [](const char* hay, const char* needle) {
+            size_t n = 0;
+            for (const char* p = strstr(hay, needle); p; p = strstr(p + 1, needle)) ++n;
+            return n;
+        };
+        const size_t flooded = occurrences(log2, "SetCxRegIndirectPatchSetAddress");
+        CHECK(flooded > 0 && flooded < 16,
+              "#1650 arm5: a flooded call site is rate-limited — neither silent nor unbounded");
+        CHECK(strstr(log2, "SetShRegIndirectPatchAddRegisters") != nullptr,
+              "#1650 arm5: a DIFFERENT call site still reports after that flood — budgets are per "
+              "call site, so one patcher family can no longer silence another");
+
+        bool victim_still_intact = true;
+        for (const auto& v : victim) victim_still_intact &= (v == 0xA5A5A5A5u);
+        CHECK(victim_still_intact,
+              "#1650 arm5: seventeen refused patches still wrote nothing");
+        if (fails) printf("  captured stderr:\n%s\n  ---- flood ----\n%s", log, log2);
     }
 
     // #395 F5: all three single-register direct NIDs append the native packet opcode and preserve
