@@ -187,8 +187,17 @@ void test_savedata_transferring_mount() {
     // code, so the title's behaviour would depend on which entry point it happened to call.
     // NOTE this is a cross-title POLICY lock, not #1873's same-question-two-libraries case:
     // PPSA03831 does not import WAzWTZm1H+I at all. It is still worth holding, because five local
-    // titles call the Ps4 form and two of them const-compare the code (PPSA03839 against
-    // 0x809F0003, PPSA07809 against 0x809F000F) — so the value is not inert across the corpus.
+    // titles call the Ps4 form and THREE of them const-compare the code — PPSA03839 against
+    // 0x809F0003, and PPSA07809 *and* PPSA08804 against 0x809F000F — so the value is not inert
+    // across the corpus. (PPSA08804's is inside its error arm past the branch, which is why a gate
+    // scan that stops at the first branch reads it as a plain non-zero test.)
+    //
+    // The strongest evidence anyone has on the precise errno, recorded so it is not re-derived: two
+    // independent titles have a DEDICATED arm for 0x809F000F and none for 0x809F0008. PPSA07809
+    // routes it to a distinct state; PPSA08804 returns 2 for it against 3 for everything else.
+    // 0x809F000F appears nowhere in prosper and the 3.20 dump carries no constants, so it is
+    // unresolved — a lead, not a conclusion. Frontiers gates on the SIGN alone, so nothing here
+    // depends on it.
     CHECK(answers[0] == answers[1], "both transferring-mount entry points give the same answer");
 }
 
