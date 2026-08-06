@@ -4116,11 +4116,20 @@ namespace {
     // Snapshot the tracker coverage for a protection transaction. VirtualQuery describes every
     // committed host allocation in the process, including allocations that do not belong to the
     // guest. A host MEM_COMMIT result therefore cannot prove that sceKernelMprotect owns the span.
+    //
+    // `slices` is ALWAYS the complete set of tracked sub-ranges of [begin,end): an untracked hole is
+    // skipped, never fatal. It used to return on the first hole, which left every tracked slice
+    // ABOVE that hole out of the vector — harmless while the caller bailed on `false`, but win_protect
+    // now reads the vector as the coverage itself, so a truncated one silently reclassifies a tracked
+    // suffix as untracked and skips the refusals that only apply to tracked slices (#2144). The return
+    // value keeps its old meaning — true iff [begin,end) is fully covered — for any future caller that
+    // needs the whole-span question rather than the slices.
     bool tracked_mapping_slices(uint64_t begin, uint64_t end,
                                 std::vector<TrackedMappingSlice>& slices) {
         slices.clear();
         if (begin >= end) return false;
         std::lock_guard<std::mutex> lk(g_mx);
+        bool complete = true;
         uint64_t cursor = begin;
         while (cursor < end) {
             const Mapping* best = nullptr;
@@ -4128,12 +4137,21 @@ namespace {
                 if (cursor < mapping.base || cursor >= mapping.base + mapping.size) continue;
                 if (!best || mapping.base > best->base) best = &mapping;
             }
-            if (!best) return false;
+            if (!best) {
+                // Untracked hole. Resume at the next tracked mapping that starts above the cursor
+                // (or at `end`), which is strictly greater than the cursor, so this terminates.
+                complete = false;
+                uint64_t resume = end;
+                for (const auto& mapping : g_maps)
+                    if (mapping.base > cursor && mapping.base < resume) resume = mapping.base;
+                cursor = resume;
+                continue;
+            }
             const uint64_t slice_end = std::min<uint64_t>(end, best->base + best->size);
             slices.push_back({cursor, slice_end - cursor, best->prot, best->committed});
             cursor = slice_end;
         }
-        return true;
+        return complete;
     }
 
     bool tracked_slices_back_host_reservation(
@@ -4153,18 +4171,21 @@ namespace {
         return false;
     }
 
-    // True when [begin,end) lies inside the fixed guest MODULE apertures (eboot, the PRXes, the
-    // plugin/runtime pools). boot_program.hpp labels everything else "mapped/host"; the module
-    // images are mapped by the exec substrate rather than the memory HLE, so they are legitimate
-    // guest memory that g_maps never records. Both ends are checked, so a span that starts in a
-    // module and runs off its end is rejected; an interior hole would be MEM_FREE and is already
-    // refused by the region walk.
+    // True when [begin,end) lies inside the fixed guest MODULE CODE apertures (eboot, the PRXes, the
+    // plugin and runtime-PRX pools). Those images are mapped by the exec substrate rather than the
+    // memory HLE, so they are legitimate guest memory that g_maps never records. Both ends are
+    // checked, so a span that starts in a module and runs off its end is rejected; an interior hole
+    // would be MEM_FREE and is already refused by the region walk.
+    //
+    // guest_va_in_module_code, not "the boot_program.hpp label is not mapped/host": the import-stub
+    // aperture [BOOT_STUB, BOOT_STUB_END) is labelled "STUB" and would pass that test, but it holds
+    // PROSPER's OWN emitted trampolines, committed by install_stubs' plain VirtualAlloc and therefore
+    // untracked exactly like a module image. It is host memory wearing a guest address, and letting
+    // the guest reprotect it would strip execute permission from every HLE entry point (#2144).
     bool guest_module_image_span(uint64_t begin, uint64_t end) {
         if (begin >= end) return false;
-        auto is_module = [](uint64_t a) {
-            return std::strcmp(prosper::guest_module_name(a), "mapped/host") != 0;
-        };
-        return is_module(begin) && is_module(end - 1);
+        return prosper::guest_va_in_module_code(begin) &&
+               prosper::guest_va_in_module_code(end - 1);
     }
 
     bool win_protect(uint64_t addr, uint64_t len, int hp, DWORD* error_out = nullptr) {

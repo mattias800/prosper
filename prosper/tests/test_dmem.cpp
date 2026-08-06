@@ -9,11 +9,12 @@
 #include "../src/host/guest_write_watch.hpp"
 #ifdef _WIN32
 #include "../src/host/exec_image.hpp"
-#include "../src/host/boot_program.hpp"   // BOOT_EBOOT: the module aperture the mprotect case uses
+#include "../src/host/boot_program.hpp"   // BOOT_EBOOT / BOOT_STUB: the apertures the mprotect cases use
 #include "../src/host/guest_memory_map.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include <windows.h>
 extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
+extern "C" int prosper_try_commit_reserved_placeholder(uint64_t addr, uint64_t len);
 #endif
 #include <cstdio>
 #include <cstdint>
@@ -548,6 +549,116 @@ int main() {
             CHECK((unchanged.Protect & 0xff) == PAGE_READWRITE,
                   "the refused foreign page keeps its original protection");
             VirtualFree(foreign, 0, MEM_RELEASE);
+        }
+    }
+    // #2144 F1: the tracker snapshot win_protect works from must be the COMPLETE coverage of the
+    // span, not the prefix before the first untracked hole. #2117 made the caller read that vector
+    // as coverage, so a span BEGINNING in an untracked page produced an EMPTY vector and every
+    // tracked slice above it was misread as an untracked gap -- which silently voided the refusals
+    // that only apply to tracked slices, and made rollback restore the raw mbi.Protect (under an
+    // armed write-watch, the transient read-only value the tracker split exists to avoid).
+    // Both #2117 arms are wholly inside or wholly outside a module image; this one is MIXED, which
+    // is the only shape that reaches the truncation. Mutation killed: restoring the `return false`
+    // on the first hole makes the refusal below turn into an accept that reprotects both halves.
+    {
+        constexpr uint64_t kGranule = 0x10000;   // Windows allocation granularity
+        const uint64_t image_va = prosper::BOOT_EBOOT + 0x3000000ull;
+        const uint64_t reserved_va = image_va + kGranule;
+        // Prefix: a module image the memory HLE has never heard of, exactly as in the #2101 arm.
+        void* image = VirtualAlloc((void*)(uintptr_t)image_va, kGranule,
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        CHECK(image != nullptr, "commit an untracked module-image prefix in the eboot aperture");
+        // Suffix: a range the tracker DOES own and calls uncommitted, over host pages that are in
+        // fact committed -- the bookkeeping disagreement the merged comment says must keep failing.
+        // The fixed reserve hands back a Windows PLACEHOLDER, which plain VirtualAlloc(MEM_COMMIT)
+        // cannot back (ERROR_INVALID_ADDRESS). prosper's own lazy-commit entry point -- the one its
+        // VEH uses when a guest first touches a reserved page -- replaces the placeholder with
+        // private pages under g_dview_mx and never touches g_maps, so the tracker keeps calling the
+        // range uncommitted. That is precisely the disagreement this arm needs.
+        uint64_t reserved = reserved_va;
+        const bool suffix_reserved =
+            image && reserve((uint64_t)(uintptr_t)&reserved, kGranule,
+                             0x10 /* SCE_KERNEL_MAP_FIXED */, kGranule, 0, 0) == 0 &&
+            reserved == reserved_va &&
+            prosper_try_commit_reserved_placeholder(reserved_va, kGranule) == 1;
+        CHECK(suffix_reserved, "track an uncommitted reservation directly above it");
+        uint8_t reserved_info[0x48]{};
+        MEMORY_BASIC_INFORMATION suffix_host{};
+        if (suffix_reserved)
+            VirtualQuery((void*)(uintptr_t)reserved_va, &suffix_host, sizeof(suffix_host));
+        // Self-invalidating precondition: without BOTH halves of the disagreement (tracker says
+        // uncommitted, host says committed) the refusal below would prove nothing.
+        const bool disagreement =
+            suffix_reserved && suffix_host.State == MEM_COMMIT &&
+            query(reserved_va, 0, (uint64_t)(uintptr_t)reserved_info, sizeof(reserved_info),
+                  0, 0) == 0 && reserved_info[0x20] == 0;
+        CHECK(disagreement, "the suffix is tracked-uncommitted over committed host pages");
+        if (disagreement) {
+            CHECK((uint32_t)protect(image_va, kGranule * 2, 0x1, 0, 0, 0) == 0x80020016u,
+                  "mprotect still refuses a tracked-uncommitted suffix behind an untracked prefix");
+            MEMORY_BASIC_INFORMATION prefix_after{}, suffix_after{};
+            VirtualQuery((void*)(uintptr_t)image_va, &prefix_after, sizeof(prefix_after));
+            VirtualQuery((void*)(uintptr_t)reserved_va, &suffix_after, sizeof(suffix_after));
+            CHECK((prefix_after.Protect & 0xff) == PAGE_READWRITE &&
+                      (suffix_after.Protect & 0xff) == PAGE_READWRITE,
+                  "the refused mixed span leaves both halves' host protection alone");
+            // Positive control for the arm itself: the untracked prefix ALONE is still accepted and
+            // still moves, so the refusal above came from the tracked suffix and not from a blanket
+            // refusal of the aperture or of this address.
+            CHECK(protect(image_va, kGranule, 0x1, 0, 0, 0) == 0,
+                  "the untracked module prefix alone is still accepted");
+            VirtualQuery((void*)(uintptr_t)image_va, &prefix_after, sizeof(prefix_after));
+            CHECK((prefix_after.Protect & 0xff) == PAGE_READONLY,
+                  "and the prefix's host protection actually changed");
+        }
+        if (suffix_reserved) unmap(reserved_va, kGranule, 0, 0, 0, 0);
+        if (image) VirtualFree(image, 0, MEM_RELEASE);
+    }
+    // #2144 F2: [BOOT_STUB, BOOT_STUB_END) is labelled "STUB" rather than "mapped/host", so the
+    // merged aperture test ("the label is not mapped/host") admitted it -- but install_stubs
+    // reserves and commits that window with a plain VirtualAlloc, so it is untracked exactly like a
+    // module image while holding PROSPER's OWN emitted trampolines. A guest could therefore
+    // reprotect every HLE entry point, which the pre-#2117 code refused. guest_va_in_module_code()
+    // already draws the line. Mutation killed: reverting to the strcmp("mapped/host") test makes
+    // both refusals below turn into accepts that strip execute from the stub table.
+    {
+        constexpr uint64_t kGranule = 0x10000;
+        // Mixed span: ONE committed host region whose low half is the real guest plugin pool and
+        // whose high half is the stub aperture, so the region walk sees a single gap spanning both.
+        const uint64_t straddle = prosper::BOOT_STUB - kGranule;
+        void* mixed = VirtualAlloc((void*)(uintptr_t)straddle, kGranule * 2,
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        CHECK(mixed != nullptr, "commit one region straddling the plugin/import-stub boundary");
+        if (mixed) {
+            CHECK((uint32_t)protect(straddle, kGranule * 2, 0x1, 0, 0, 0) == 0x80020016u,
+                  "mprotect refuses a span running out of a guest module into the stub aperture");
+            MEMORY_BASIC_INFORMATION after{};
+            VirtualQuery((void*)(uintptr_t)prosper::BOOT_STUB, &after, sizeof(after));
+            CHECK((after.Protect & 0xff) == PAGE_READWRITE,
+                  "the refused straddling span leaves the stub half's protection alone");
+            // Positive control: the guest-module half of the same allocation is still accepted, so
+            // the refusal is about the stub aperture and not about this allocation.
+            CHECK(protect(straddle, kGranule, 0x1, 0, 0, 0) == 0,
+                  "the guest-module half of the same allocation is still accepted");
+            VirtualQuery((void*)(uintptr_t)straddle, &after, sizeof(after));
+            CHECK((after.Protect & 0xff) == PAGE_READONLY,
+                  "and the guest-module half's host protection actually changed");
+            VirtualFree(mixed, 0, MEM_RELEASE);
+        }
+        // And wholly inside the aperture, committed exactly as install_stubs commits the table.
+        void* stub_table = VirtualAlloc((void*)(uintptr_t)(prosper::BOOT_STUB + 0x100000ull),
+                                        kGranule, MEM_RESERVE | MEM_COMMIT,
+                                        PAGE_EXECUTE_READWRITE);
+        CHECK(stub_table != nullptr, "commit an import-stub table page as install_stubs does");
+        if (stub_table) {
+            CHECK((uint32_t)protect((uint64_t)(uintptr_t)stub_table, kGranule, 0x1, 0, 0, 0) ==
+                      0x80020016u,
+                  "mprotect refuses prosper's own import-stub aperture");
+            MEMORY_BASIC_INFORMATION after{};
+            VirtualQuery(stub_table, &after, sizeof(after));
+            CHECK((after.Protect & 0xff) == PAGE_EXECUTE_READWRITE,
+                  "the stub table keeps execute permission, so every HLE entry point still runs");
+            VirtualFree(stub_table, 0, MEM_RELEASE);
         }
     }
     CHECK(map((uint64_t)(uintptr_t)&sparse_va2, sparse_len, 0x1, 0,
