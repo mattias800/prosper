@@ -31,6 +31,8 @@ constexpr const char* kNpTrophy2GetGroupInfo      = "DoZWauG8mu0";
 constexpr const char* kNpTrophy2GetGroupInfoArray = "+PDSI6WgPRc";
 constexpr const char* kNpTrophy2GetGameInfo       = "4IzqhhUQ3nk";  // already registered
 constexpr const char* kNpTrophy2GetTrophyInfoArray = "y3zHpdZO6ME"; // already registered
+constexpr const char* kSaveDataTransferringMount    = "WAzWTZm1H+I";
+constexpr const char* kSaveDataTransferringMountPs4 = "RjMlsR8EXrw";
 
 bool all_bytes_equal(const unsigned char* p, size_t n, unsigned char v) {
     for (size_t i = 0; i < n; ++i) if (p[i] != v) return false;
@@ -135,6 +137,53 @@ void test_nptrophy2_info_queries() {
     }
 }
 
+void test_savedata_transferring_mount() {
+    printf("-- libSceSaveData transferring-mount pair --\n");
+    // Both entry points mount a PS4-era save for import into the PS5 title. No prosper installation
+    // has a PS4 save area, so the answer is "not found" — and the FALSE SUCCESS failure here is not
+    // theoretical: `RjMlsR8EXrw` unregistered told Sonic Frontiers (PPSA03831) that the mount had
+    // succeeded, whereupon the title formatted a path out of the mount-point result nothing had
+    // written and opened `/gamedata` at filesystem root, once per frame, forever.
+    const struct { const char* nid; const char* name; } mounts[] = {
+        { kSaveDataTransferringMount,    "sceSaveDataTransferringMount" },
+        { kSaveDataTransferringMountPs4, "sceSaveDataTransferringMountPs4" },
+    };
+    uint64_t answers[2] = { 0, 0 };
+    for (size_t i = 0; i < 2; ++i) {
+        HleFn fn = Hle::lookup(mounts[i].nid);
+        char msg[160];
+        snprintf(msg, sizeof(msg), "%s is registered", mounts[i].name);
+        // Kills: leaving either sibling on the unregistered path. Registering one of a `…Ps4` pair
+        // and not the other is the exact state this arm was written against — the covered name
+        // reads as covering both.
+        CHECK(fn != nullptr, msg);
+        if (!fn) return;
+
+        // A mount-point result the caller zeroed, as the guest does. The handler must NOT write a
+        // mount point on the failure path — but note that a `return 0` stub writes nothing either,
+        // so this assertion is a discriminator only together with the non-zero return below: what
+        // makes the pair sound is "reports unavailable AND leaves the result alone".
+        unsigned char result[32];
+        memset(result, 0, sizeof(result));
+        uint64_t param[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        answers[i] = fn((uint64_t)(uintptr_t)param, (uint64_t)(uintptr_t)result, 0, 0, 0, 0);
+
+        // Kills: THE BUG — the dispatcher's `return 0`, and equally a hand-written `return 0` stub.
+        snprintf(msg, sizeof(msg), "%s reports unavailable rather than success", mounts[i].name);
+        CHECK(answers[i] != 0, msg);
+        // Kills: an error whose low 32 bits are zero. Every guest call site tests `eax`, not `rax`
+        // (nid_gate_scan --nid RjMlsR8EXrw: nonzero=5 on PPSA03831, no const compare).
+        snprintf(msg, sizeof(msg), "%s error is non-zero in its low 32 bits", mounts[i].name);
+        CHECK((uint32_t)answers[i] != 0, msg);
+        // Kills: writing a mount point the caller would then treat as a real mounted path.
+        snprintf(msg, sizeof(msg), "%s leaves the mount-point result untouched", mounts[i].name);
+        CHECK(all_bytes_equal(result, sizeof(result), 0), msg);
+    }
+    // Kills: the two siblings drifting apart — one answering NOT_FOUND and the other some other
+    // code, so the title's behaviour would depend on which entry point it happened to call.
+    CHECK(answers[0] == answers[1], "both transferring-mount entry points give the same answer");
+}
+
 } // namespace
 
 int main() {
@@ -142,6 +191,7 @@ int main() {
     register_builtin_hle();
     test_random();
     test_nptrophy2_info_queries();
+    test_savedata_transferring_mount();
     if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
