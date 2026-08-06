@@ -221,9 +221,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     ordinal is NOT the submit number `[gpucap]` prints** — on one 360 s route it reaches 6,560 while
     the capture's submit counter reaches 26,209 — and overshooting it yields *no census at all*, a
     silence that reads exactly like "every target was empty" (#1968). The `ms:` origin is the first
-    armed census check — the same *kind* of origin `PROSPER_GPU_CAPTURE_AFTER_MS` uses, on a separate
-    clock, so a capture and a census can be aimed at one phase but do not share a timebase. `PROSPER_DUMP_PERSISTENT` is deliberately **not** in the
-    `live_gpu_targets` disable list, so it observes the normal persistent-GPU-target path;
+    armed census check — the same *kind* of origin `PROSPER_GPU_CAPTURE_AFTER_MS` uses, on a
+    separate clock, so the two can be aimed at one phase but do not share a timebase.
+    `PROSPER_DUMP_PERSISTENT` is deliberately **not** in the `live_gpu_targets` disable list, so it
+    observes the normal persistent-GPU-target path;
     `PROSPER_GPU_CAPTURE` **is**, so an env-triggered capture run is on the CPU-readback path.
 - **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
   `--seconds 1` for wall-clock sampling, warmup or `--render-every N --render-every-for-seconds S`
