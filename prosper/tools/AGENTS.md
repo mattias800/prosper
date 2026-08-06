@@ -378,6 +378,13 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   to its title screen, because the walk's *duration* changes the outcome — a measurement taken with
   it armed is taken on a title that would otherwise have died. `SUBMIT_STALL_US` is the honest lever
   when a throttle is what you want. `prosper/docs/CRISIS_CORE_STATUS.md` has the dose-response.
+  **`PROSPER_SUBMIT_STALL_OUTSIDE=1`** pairs with it: the same sleep, same length, same thread, but
+  after `g_agc_state_mu` is released instead of while it is held. The stall's call site is inside the
+  submit mutex, so a rescued run has two candidate mechanisms — the delay, or the fact that prosper
+  serialises the Dcb and Acb submit entry points for its duration — and this is the arm that
+  separates them. It reports `NOT ARMED` when no stall duration is set, so a mis-typed arm cannot
+  read as an armed null. Measured on ArcRunner: 0/3 faulted either way against a 3/3 unthrottled
+  control, i.e. the rescue is the delay (`prosper/docs/ARCRUNNER_STATUS.md`).
 - **`hostprof/hostprof.py`** — poor-man's **native sampling profiler**: attach to a running process
   (pid or name), sample its threads via repeated `gdb` backtraces, and rank the hot leaf functions —
   the HOST-side "which C++ function is burning CPU" first look (render/submit thread, readback copy,

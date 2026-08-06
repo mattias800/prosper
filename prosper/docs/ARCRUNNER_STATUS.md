@@ -1,8 +1,9 @@
 # ArcRunner (`PPSA21406`) — status and evidence
 
-Unreal Engine 4.27-plus. **Rung 0 on a default launch — but the title's graphics are complete: with
-the `PROSPER_SUBMIT_STALL_US=1500` diagnostic throttle it renders its whole intro cinematic in 4K
-with no fault (2026-08-06, below). The blocker is a submit-timing race, not the renderer.**
+Unreal Engine 4.27-plus. **Rung 0 on a default launch — but with the `PROSPER_SUBMIT_STALL_US=1500`
+diagnostic throttle the title runs its whole intro cinematic in 4K *and then reaches and holds its
+title screen* (2026-08-06, below). The blocker is a submit-timing race, not the renderer, and
+nothing else is now known to stand between this title and rung 2.**
 The long-lived compatibility index is [#1817](https://github.com/mattias800/prosper/issues/1817),
 and the primary allocator, barrier, and intro-movie investigation is
 [#1226](https://github.com/mattias800/prosper/issues/1226).
@@ -1216,12 +1217,114 @@ The open question is therefore **what sets the guest's recycle margin**, not wha
 Nothing in this pass measured that, and the throughput inversion above says the cheap answers
 ("prosper is late", "the guest outruns us") are the wrong shape.
 
+## 2026-08-06 (arc6): the title screen is reached, and the throttle rescues by DELAY, not by lock hold
+
+Three results, on `8ab70b74` plus the discriminator this section adds. All three runs of every arm
+used `PROSPER_GUEST_ARGS= PROSPER_RENDER=1` with `PROSPER_RENDER_SCALE=1` and
+`PROSPER_RENDER_EVERY=1` at their defaults, and no suppression, skip, guard or shim.
+
+### 1. Past the cinematic is the title screen, and it holds
+
+![ArcRunner — the title screen, captured on the PROSPER_SUBMIT_STALL_US=1500 throttled route](../../assets/screenshots/arcrunner-title-screen.png)
+
+`assets/screenshots/arcrunner-title-screen.png` is an **unmodified** `tools/screenshot` frontend
+capture at 3840x2160 — the *ArcRunner* logo, `PRESS ✕ TO START`, the TrickJump and PQube logos and
+`VERSION 1.0.1 RELEASE`. One 288 s run, `--seconds 8 --count 36`, route
+`PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_SUBMIT_STALL_US=1500 PROSPER_AVPLOG=1`. The run
+delivered **1,926** `sceAvPlayerGetVideoDataEx` frames — past the movie's 1,908 — reached the title
+screen at sample 13 (t = 112 s) and **held it to the end of the run**: samples 13 through 35 are all
+6,880 distinct RGB colours, and the last four share one CRC across 96 s. Every image was opened.
+
+Two things this settles and one it does not.
+
+* It is **not** a `MODE=2` blanket. That failure mode presents as `distinct_rgb_colors=1`; these
+  samples are 6,880 with legible glyphs. The metric is shown to separate the two **inside this run**:
+  sample 0 reads `distinct_rgb_colors=1` and is uniform `(0,0,0)` over all 8,294,400 pixels (an empty
+  first frame, not a blanket — a blanket is a non-black uniform colour).
+* **Nothing other than #1226 is now known to stand between this title and rung 2.** Before this run
+  the throttled route was only known to reach the end of the intro cinematic, so "what is behind the
+  movie" was open. It is a title screen.
+* It is **not** rung 2, and the rung is deliberately not raised. This is the same evidentiary class
+  as the cinematic — output that exists only under a diagnostic lever — and the tracker already
+  refuses rung 1 on exactly that ground. Fix #1226 and this becomes rung 2 on the default route.
+
+No peer-process census was taken for this run; it is a progression observation rather than a timing
+measurement, and contention cannot manufacture a title screen.
+
+### 2. The throttle's mechanism is the DELAY, not the submit mutex
+
+`submit_stall()` is called **inside** `g_agc_state_mu`, so a surviving throttled run has had two
+candidate mechanisms all along and the dose-response cannot separate them: the guest's submit call
+takes 1.5 ms longer (**delay**), or prosper serialises the `SubmitDcb` and `SubmitAcb` entry points
+for 1.5 ms per submit and thereby changes the **interleaving** of the two queues' folds (**lock
+hold**). The second is not idle speculation — `hle_agc.cpp` already records for #305 that prosper's
+fold order "is a property of lock acquisition, not of the guest's program order", and the label rings
+on this title carry both `(D)` and `(A)` origins.
+
+`PROSPER_SUBMIT_STALL_OUTSIDE=1` (added here, default OFF) runs the **same** sleep, of the **same**
+length, on the **same** thread, after the mutex is released instead of while it is held. Only the
+mutex differs.
+
+| arm | stall | mutex during the sleep | runs | faulted | delivered video frames |
+| --- | --- | --- | --- | --- | --- |
+| control | none | — | 3 | **3 of 3**, exit 90 | 36 / 35 / 36 |
+| A | 1500 µs | held (current behaviour) | 3 | **0 of 3**, ran to the 70 s bound | 1,629 / 1,635 / 1,628 |
+| B | 1500 µs | released first | 3 | **0 of 3**, ran to the 70 s bound | 1,640 / 1,627 / 1,642 |
+
+**B is indistinguishable from A, so the rescue is the delay.** Moving the sleep out from under the
+submit mutex changes nothing — not survival, not the delivered-frame count, not `SUSPECT-REL1-OVERLAP`
+(0 in all six throttled arms). Any hypothesis that the defect is prosper serialising two hardware
+queues through one mutex has to explain why releasing that mutex for the whole stall costs nothing.
+
+The arms were **alternated** A, B, A, B, A, B so a time-varying confound lands on both — which
+matters here, because a peer lane held the GPU for five of the six arms (`peers_pre`/`peers_post` of
+1, disclosed rather than averaged away). Alternation is what makes the A-versus-B comparison sound
+under that contention; it does **not** license comparing either arm against a historical default one.
+
+Both levers are witnessed per run, and the control doubles as the discriminator's **mutation test**:
+`PROSPER_SUBMIT_STALL_OUTSIDE=1` with no `PROSPER_SUBMIT_STALL_US` prints
+`STALL_OUTSIDE=1 NOT ARMED — … there is no stall to move` (1 line in each of the three control runs)
+rather than reading as an armed arm that found nothing. Those same three runs fault 3 of 3 at
+`eboot+0x117e225`, which is the control that matters for the code: the `lock_guard` → `unique_lock`
+change this discriminator needed is inert when unarmed.
+
+```bash
+# A — current behaviour           # B — same sleep, mutex released first
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_AVPLOG=1 PROSPER_SUBMIT_STALL_US=1500 \
+  [PROSPER_SUBMIT_STALL_OUTSIDE=1] ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+```
+
+### 3. No false-success NID is in this title's failing path
+
+ArcRunner statically imports **all three** of the `sceAgc*GetSize` functions #1756 deliberately left
+unregistered (`sceAgcDcbWriteDataGetSize`, `sceAgcCbSetShRegisterRangeDirectGetSize`,
+`sceAgcCbSetShRegistersDirectGetSize`), and also `sceKernelWaitCommandBufferCompletion` — a set that
+reads like a ready-made explanation, since a `GetSize` answered with 0 makes the guest reserve
+nothing (`docs/AGC_PACKET_SIZES.md`) and a wait answered with 0 tells a guest that work completed.
+`tools/nid_census` lists them because it is a **static** census of imports.
+
+**None of them is called.** A full default faulting run with the runtime unimplemented-call census
+enumerates **12** distinct NIDs — `libSceCoredump`, `libScePosix`, `libSceHttp`, `libSceNpWebApi2`,
+`libSceVoiceQoS`, `libSceNet`, `libSceAjm` and four `EOSSDK-PS5-Shipping` — and **not one** is in
+`libSceAgc`, `libSceAgcDriver` or `libkernel`. Bounded honestly: that run reached 34 video frames
+before faulting, so this covers the boot and intro-movie window, which is the window the fault lives
+in. Generalise the method rather than the result: `nid_census` ranks what a title *could* call, and
+only the boot log says what it *did*.
+
+```bash
+./build-linux/nid_census <DUMP_ROOT>/PPSA21406-app0 --names <PS5_LIBS_DIR>   # static: what could
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_PROGRESS=1 PROSPER_PROGRESS_UNIMPL=1 \
+  ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0                        # runtime: what did
+```
+
 ## Ruled out
 
 Do not re-derive these without contradictory new evidence.
 
 | Hypothesis | Evidence that killed it | Ref |
 | --- | --- | --- |
+| The submit throttle rescues this title by holding `g_agc_state_mu` across the sleep — i.e. the real defect is prosper serialising the `SubmitDcb` and `SubmitAcb` entry points through one mutex, so the stall works by re-interleaving the two queues' folds rather than by delaying anything | `PROSPER_SUBMIT_STALL_OUTSIDE=1` runs the identical 1500 µs sleep on the identical thread with the mutex **released** first. Three arms each, alternated A/B/A/B/A/B: **0 of 3 faulted with the mutex held, 0 of 3 with it released**, delivering 1,629/1,635/1,628 against 1,640/1,627/1,642 video frames, with `SUSPECT-REL1-OVERLAP` 0 in all six. The rescue is therefore the **delay**. Positive control on the same binary: three unthrottled runs fault **3 of 3** at `eboot+0x117e225` with 35–36 video frames, so the `lock_guard` → `unique_lock` change the lever needed is inert unarmed; and the lever's own mutation arm (`OUTSIDE=1` with no `STALL_US`) prints `NOT ARMED` rather than passing as an armed null. A peer lane held the GPU for five of the six throttled arms — disclosed, and the reason the arms were alternated; it bears on any comparison against a *historical* arm, not on A versus B. | #1226 |
+| A `*GetSize` or wait NID that falls to the dispatcher's return-0 default is what makes this guest recycle a label block early — the FALSE SUCCESS class of #2081, and ArcRunner imports every candidate that would fit (all three `sceAgc*GetSize` gaps #1756 left open, plus `sceKernelWaitCommandBufferCompletion`) | It calls none of them. `tools/nid_census` is a **static** import census; the runtime unimplemented-call census over a full default faulting run lists **12** distinct NIDs, all in `libSceCoredump` / `libScePosix` / `libSceHttp` / `libSceNpWebApi2` / `libSceVoiceQoS` / `libSceNet` / `libSceAjm` / `EOSSDK-PS5-Shipping`, and **none** in `libSceAgc`, `libSceAgcDriver` or `libkernel`. Bounded to the boot and intro-movie window (34 delivered video frames), which is the window the fault occurs in. **The general lesson is the gap between the two censuses**: an import is what a title *may* call, and only the boot log says what it *did*. | #2081, #1226 |
 | The `addr=(nil)` / `rip=0` worker-fault class on this title is a defect distinct from the `0x30016000` free-list class (the split this doc and #1944 have tracked separately) | **Falsified — both are one forged qword, and the low-bit read artifact is only how one of them presents.** The `addr=(nil)` site disassembles (offset `0x117e21d`, via `tools/il2cpp/prx_to_elf.py` + `objdump -b binary`) to `mov (%r12,%rcx,8),%rdi` / `mov 0x40(%rdi),%rcx` / `vucomisd (%rcx),%xmm0`, and at the fault `rdi = 0x2100000001` — the same **low-dword-replaced-by-1** shape as `0x2000000001`. The intervening `[lazy-commit] mapped page=0x2100000000 rip=0x41117e221` is prosper *backing the forged pointer's page*, so the corrupt dereference succeeds, returns zeros, and the SIGSEGV surfaces one instruction later as `addr=(nil)` with the corrupt value nowhere in the report. #1944's handler is therefore **downstream** of this bug and destroys its attribution; it is still not the writer (that row stands). | #1945, #1226, #1944 |
 | The corrupt qword is computed by the guest, or is a constant prosper hands it — "a value bit-identical across four unrelated UE4 builds is more likely something prosper hands the guest" | **Falsified in both halves, by exact-address attribution.** (1) prosper's own write ring, read at the fault with the widened probe set, names the author byte-for-byte: `seq=548 kind=4 addr=0x2020e39da0 size=4 value=0x0 pkt=0x30030d5b90` immediately followed by `seq=549 kind=1 addr=0x2020e39da0 size=4 value=0x1 pkt=0x30030d5bac` — a `DMA_DATA` (`size=4 value=0x0`, i.e. the immediate form) and a `RELEASE_MEM` fence `1`, both 4 bytes at the *same* guest address — and at the fault the qword there reads `0x0000000400000001`. **The low dword is prosper's fence value, written by prosper at that exact address**; the high dword `0x00000004` is pre-existing content prosper did not write, pointer-plausible for the guest-image range (`0x4………`) though `4` is also an ordinary adjacent `int32`. So the corrupt value is **not guest-computed** — prosper authored its low dword — and the faulting `RHIThread` held that exact address in `rdi`. What this does **not** settle is *ownership*: an immediate-zero `DMA_DATA` followed by a `RELEASE_MEM` fence `1` at one address is also prosper's normal label init-then-signal sequence, so "prosper stomped a live guest pointer" and "prosper correctly fenced a label the guest had recycled under it" are both still open, and distinguishing them needs a per-address write history for that label (#1995); n=1. `CONFIDENCE: MED` on the composition, `LOW` on ownership. **A fourth arm, at the canonical `addr=0x30016000` / `eboot+0x127e751` site, returned ZERO ring hits** over `probe-pages=5/5` and zero clock-fence targets — a *partial negative*, bounded two ways: the ring retains only prosper's last 16,384 writes (#1995), and the forged node the pop misread lives at `0x2000000001`, whose page no register held, so it was never probed. That arm did yield new structure: the per-thread bin array is `{head, count}` pairs at 0x20 stride (`rax=rdi=0x3152350000`, `rdx` = the bad entry at `+0x20`), and **two independent bin arrays** (`0x3152350000+0x20` and `r14=0x300d400000+0x20`) carried head `0x30016000` at once, with counts `1` and `0x31`. (2) The constant `0x30016000` is authored by nobody: `PROSPER_FORGE_TRIP=1` on PPSA19244 reports `pre=0x2000000000 val=0x1 -> 0x2000000001` with `misread(*forged)=0x30016000` on every hit — it is the misaligned read of the qword at the arena base, which is why it is identical across titles. | #1945, #1226 |
 | The `0x30016000` "POOLSHIFT byte-shifted pool pointer" is a **structurally different artifact** from the `0x2000000001` free-list value — the two shapes this issue tracked as separate legs since #1249 | They are the same shape one dereference apart. A qword that is a pointer with its **low bit set** misreads, when dereferenced, to the target qword shifted down by 8: `*(0x2000000001) = 0x30016000`, byte-for-byte the value the terminal fault dereferences. The pop at `eboot+0x127e751` both **returns** that node — the guest's own `FMallocBinned3 Attempt to free/realloc an unrecognized block 2000000001` fatal — and **stores** the misread as the next head, which is the SIGSEGV. Confirms the session-10 "the byte-shift is a READ ARTIFACT" note with a measurement. **This is about the shape, not the author** — see the next row. | #1226, #1754 |
@@ -1342,6 +1445,20 @@ guest's faulting virtual call disassembled. What remains is **ownership**, not a
 7. **Do not quote a "zero X across N runs" coverage census on this title without saying how far the
    runs got.** Six surviving arms reach three `[compute] skip unsupported program` lines that no
    14-second run can see (#2090).
+
+**Added 2026-08-06 by the arc6 lane, without renumbering the list above:**
+
+8. **#1226 is now the whole of rung 2, not merely rung 1.** The throttled route reaches the title
+   screen and holds it for 176 s (§ *2026-08-06 (arc6)*), so the question "what is behind the intro
+   movie" is answered and nothing else is known to be in the way. Score a candidate fix against
+   reaching that screen on the **default** route.
+9. **The rescue is the delay — stop looking for a lock, an ordering, or a queue-interleaving story.**
+   Moving the whole stall out from under `g_agc_state_mu` costs nothing (0/3 either way, with an
+   unthrottled 3/3 control on the same binary). Combined with the withdrawn "it changes how fast the
+   guest runs" row, what survives is narrow and awkward: the lever's only observable effect is
+   survival, it is not the mutex, and it is not the guest's rate. The next instrument owes a
+   **per-fold** account of what 1.5 ms of wall time per submit changes — not another whole-run rate,
+   which has now produced two retracted rows on this title.
 
 *Superseded — the previous summary, kept because its provenance census is still the record:*
 

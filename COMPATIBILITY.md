@@ -36,7 +36,7 @@ Last updated: 2026-08-05
 | *Bendy and the Ink Machine* | `PPSA27616` | Unity / IL2CPP | 🚧 Chapter 1 gameplay | [#1881](https://github.com/mattias800/prosper/issues/1881) |
 | *The Plucky Squire* | `PPSA15319` | Unreal Engine 4 | 🚧 Title and save/play-style menus | [#1882](https://github.com/mattias800/prosper/issues/1882) |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🚧 Title screen | [#1883](https://github.com/mattias800/prosper/issues/1883) |
-| *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🚧 Intro cinematic, on a throttled route | [#1817](https://github.com/mattias800/prosper/issues/1817) |
+| *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🚧 Intro cinematic and title screen, on a throttled route | [#1817](https://github.com/mattias800/prosper/issues/1817) |
 | *Asterix &amp; Obelix: Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🚧 Logo movies, intro cutscene, and title menu | [#1884](https://github.com/mattias800/prosper/issues/1884) |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🚧 Title screen and attract mode | [#1810](https://github.com/mattias800/prosper/issues/1810) |
 | *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Title screen and EULA | [#1885](https://github.com/mattias800/prosper/issues/1885) |
@@ -227,10 +227,11 @@ The title screen renders at native 2560×1440. Gameplay has not yet been reached
 
 ## ArcRunner — `PPSA21406`
 
+<p align="center"><img src="assets/screenshots/arcrunner-title-screen.png" alt="ArcRunner — the title screen at 3840×2160, on the throttled route"></p>
 <p align="center"><img src="assets/screenshots/arcrunner-intro-space-station.png" alt="ArcRunner — the intro cinematic's Titan-class space station (colours are wrong: see #2094)"></p>
 <p align="center"><img src="assets/screenshots/arcrunner-intro-city.png" alt="ArcRunner — the intro cinematic's neon street (colours are wrong: see #2094)"></p>
 
-The whole intro cinematic renders at 4K — the Titan-class station against its nebula, the rainy neon street, and the population card — with 1,901 of 1,908 video frames succeeding.
+The whole intro cinematic renders at 4K — the Titan-class station against its nebula, the rainy neon street, and the population card — with 1,901 of 1,908 video frames succeeding. **Past the cinematic the title reaches its title screen and holds it**, unchanged for 176 s of a 288 s run.
 
 **The colours in these frames are wrong.** Decoding the same movie outside prosper gives an *orange* nebula with *cyan* thrusters; prosper produces green and magenta. Geometry, composition, timing and frame pacing are correct, so the images are valid evidence for those — but not for colour. Tracked in [#2094](https://github.com/mattias800/prosper/issues/2094).
 

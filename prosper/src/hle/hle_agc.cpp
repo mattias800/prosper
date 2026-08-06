@@ -1960,7 +1960,19 @@ static void mb3_poison_probe(uint64_t submit_no) {
 // two: if a plain stall of comparable length rescues the title as well, the corruption is a race
 // the guest wins by running ahead of prosper's completion writes, and nothing about the scan
 // matters. Never a fix — it throttles the guest unconditionally.
-static void submit_stall(void) {
+//
+// #1226 SECOND LEVER, also diagnostic and also default OFF: `PROSPER_SUBMIT_STALL_OUTSIDE=1` runs
+// the SAME sleep, for the same duration, but AFTER `g_agc_state_mu` is released instead of while it
+// is held. The two arms exist because the stall's call site is inside the submit mutex, so a
+// surviving throttled run has two candidate mechanisms that the dose-response cannot tell apart:
+//   (a) the DELAY — the guest's submit call takes longer, so the guest's own pipeline is re-timed;
+//   (b) the LOCK HOLD — prosper serialises the Dcb and Acb submit entry points for the duration,
+//       which changes the INTERLEAVING of the two queues' folds (the fold order is a property of
+//       lock acquisition, not of the guest's program order — see the #305 note above stamp_submit_call).
+// Both arms deliver the identical sleep to the identical thread; only the mutex differs. So a
+// surviving OUTSIDE arm attributes the rescue to (a), and a faulting one attributes it to (b).
+// Neither arm is a fix.
+static unsigned submit_stall_us(void) {
     static const unsigned us = [] {
         const char* e = getenv("PROSPER_SUBMIT_STALL_US");
         unsigned v = e ? (unsigned)strtoul(e, nullptr, 0) : 0u;
@@ -1968,9 +1980,36 @@ static void submit_stall(void) {
                                "not a fix\n", v);
         return v;
     }();
+    return us;
+}
+// Armed only when a stall duration is also set: an OUTSIDE arm with no duration is a no-op, and
+// saying so makes a mis-typed arm readable instead of silently identical to the default route.
+static bool submit_stall_outside(void) {
+    static const bool on = [] {
+        const char* e = getenv("PROSPER_SUBMIT_STALL_OUTSIDE");
+        const bool want = e && strtol(e, nullptr, 0) != 0;
+        if (want && submit_stall_us())
+            fprintf(stderr, "[agc] PROSPER_SUBMIT_STALL_OUTSIDE=1 ARMED — the %u us stall runs "
+                            "AFTER the submit mutex is released (#1226 delay-vs-lock discriminator)\n",
+                    submit_stall_us());
+        else if (want)
+            fprintf(stderr, "[agc] PROSPER_SUBMIT_STALL_OUTSIDE=1 NOT ARMED — "
+                            "PROSPER_SUBMIT_STALL_US is unset or zero, so there is no stall to move\n");
+        return want && submit_stall_us() != 0;
+    }();
+    return on;
+}
+static void submit_stall_sleep(void) {
+    const unsigned us = submit_stall_us();
     if (!us) return;
     struct timespec ts { (time_t)(us / 1000000u), (long)(us % 1000000u) * 1000L };
     nanosleep(&ts, nullptr);
+}
+// The in-lock call site. Yields to the outside-the-lock call site when that arm is armed, so
+// exactly one sleep of the configured length happens per submit either way.
+static void submit_stall(void) {
+    if (submit_stall_outside()) return;
+    submit_stall_sleep();
 }
 // #305/#1662: a fold that decodes fewer dwords than the guest declared has silently dropped the tail
 // of that submit — and if a shader bind was in the dropped tail, the NEXT submit inherits a register
@@ -2124,7 +2163,10 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     constexpr uint32_t kUnknownCap = 0x80000;   // 512 KiB of dwords — well past any real Dcb
     uint32_t walk = dw_num ? dw_num : kUnknownCap;
     const SubmitCallStamp call_stamp = stamp_submit_call();   // BEFORE the lock: see the note above
-    std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
+    // unique_lock rather than lock_guard only so the SUBMIT_STALL_OUTSIDE discriminator can release
+    // the mutex before its sleep; with that lever off the scope and the hold are exactly a
+    // lock_guard's (acquired here, released at return).
+    std::unique_lock<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
     const bool async_compute = strcmp(who, "SubmitAcb") == 0;
     const bool dcb_final = strcmp(who, "SubmitDcbFinal") == 0;
     gpu::GpuState& state = async_compute            ? agc_compute_state(queue_id)
@@ -2183,6 +2225,8 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
                 state.draws.size(), (unsigned long long)state.dispatch_count);
     progress_heartbeat(state.draws.size(), g_submit_count,
                        (uint64_t)state.dispatch_count);
+    // #1226 discriminator: same sleep, same thread, mutex released first. Inert unless armed.
+    if (submit_stall_outside()) { lk.unlock(); submit_stall_sleep(); }
     return 0;
 }
 
@@ -2276,7 +2320,8 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     const auto* p = (const Packet*)(uintptr_t)a0;
     if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
     const SubmitCallStamp call_stamp = stamp_submit_call();   // BEFORE the lock: see the note above
-    std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with submit_dcb_stream/w1KFAHVqpaU (#278)
+    // unique_lock only for the SUBMIT_STALL_OUTSIDE discriminator — see submit_dcb_stream.
+    std::unique_lock<std::mutex> lk(g_agc_state_mu);   // serialize with submit_dcb_stream/w1KFAHVqpaU (#278)
     gpu::prosper_gpu_set_fold_origin(1);   // #1226: this direct entry is the graphics SubmitDcb path
     // Reset the per-submit draw list BEFORE folding this Dcb. The folded GpuState is process-lifetime and
     // its register files (cx/sh/uc) persist across submits (as on real hardware), but its `draws` vector
@@ -2364,6 +2409,8 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     }
     progress_heartbeat(agc_gpu_state().draws.size(), g_submit_count,
                        (uint64_t)agc_gpu_state().dispatch_count);
+    // #1226 discriminator: same sleep, same thread, mutex released first. Inert unless armed.
+    if (submit_stall_outside()) { lk.unlock(); submit_stall_sleep(); }
     return 0;
 }
 
