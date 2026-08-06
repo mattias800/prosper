@@ -4204,6 +4204,34 @@ HLE(s_savedata_transfermount) {
     return SAVE_DATA_ERR_NOT_FOUND;
 }
 
+// sceSaveDataTransferringMountPs4 — the SIBLING of the call above, and the one Sonic Frontiers
+// (PPSA03831) uses. It mounts the **PS4 edition's** save data so a PS5 title can import it on first
+// run. A PS5 installation that was never upgraded from a PS4 copy has no such save area, and that
+// is every installation prosper can present: prosper has no PS4 save-data store at all, and no
+// local dump carries one, so "no PS4 save data exists here" is derived from local inventory rather
+// than assumed — the same NOT_FOUND a Mount3 of a nonexistent save returns, in the same 0x809F
+// facility.
+//
+// Unregistered, this reached `prosper_on_unimpl`'s `return 0` — the FALSE SUCCESS class (#2081) —
+// and it produced the *identical* downstream signature its sibling's comment records for DOLL.
+// Frontiers zeroes its 32-byte mount-point result, calls this, is told the mount succeeded, and
+// then formats "<mountPoint>/gamedata" out of the still-empty result and opens **`/gamedata`** at
+// filesystem root. That open fails ENOENT, the title retries it once per frame forever, and the
+// boot state machine never leaves GameModeInitialize: measured live, ~1,450 failed `/gamedata`
+// opens and 1,319 dispatcher hits on this NID in one 60 s CPU-only arm. All five guest call sites
+// gate on the result (`test eax,eax`, `tools/re/nid_gate_scan.py --nid RjMlsR8EXrw`), and the
+// error arm returns straight out of the transfer check — so an honest error is a path the title
+// already has, not one this invents.
+//
+// Nothing is written to the result: a caller that reads a mount point after an error is reading
+// its own buffer, which is exactly what must not be papered over. CONFIDENCE: HIGH that success
+// is wrong here (the guest's own use of the unwritten result is observed); MED on NOT_FOUND being
+// the precise firmware errno, LOW on the argument layout (nothing is assumed — nothing is read).
+HLE(s_savedata_transfermount_ps4) {
+    svc_log("sceSaveDataTransferringMountPs4", a0,a1,a2,a3,a4,a5);
+    return SAVE_DATA_ERR_NOT_FOUND;
+}
+
 // sceSystemServiceGetNoticeScreenSkipFlag(bool* flag) — polled from DOLL's front-end menu.
 // PS5-only (no reference). Live capture pinned the out-pointer to an ODD stack address
 // (0x...ff307), so the flag is a single byte (bool), NOT an int32 — a 4-byte write would clobber
@@ -4611,6 +4639,7 @@ void register_service_hle() {
     Hle::register_fn("5LiMEPuW0DQ", (HleFn)s_npent_getkey, "sceNpEntitlementAccessGetEntitlementKey");
     Hle::register_fn("lPDO62PpJIA", (HleFn)s_npent_skuflag, "sceNpEntitlementAccessGetSkuFlag");
     Hle::register_fn("WAzWTZm1H+I", (HleFn)s_savedata_transfermount, "sceSaveDataTransferringMount");
+    Hle::register_fn("RjMlsR8EXrw", (HleFn)s_savedata_transfermount_ps4, "sceSaveDataTransferringMountPs4");
     Hle::register_fn("3RQ5aQfnstU", (HleFn)s_syss_noticeskip, "sceSystemServiceGetNoticeScreenSkipFlag");
     // libSceNpUniversalDataSystem — inert ids (guarded LOW-confidence out-writes).
     Hle::register_fn("sjaobBgqeB4", (HleFn)s_npuds_ok,     "sceNpUniversalDataSystemInitialize");

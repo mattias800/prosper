@@ -31,6 +31,8 @@ constexpr const char* kNpTrophy2GetGroupInfo      = "DoZWauG8mu0";
 constexpr const char* kNpTrophy2GetGroupInfoArray = "+PDSI6WgPRc";
 constexpr const char* kNpTrophy2GetGameInfo       = "4IzqhhUQ3nk";  // already registered
 constexpr const char* kNpTrophy2GetTrophyInfoArray = "y3zHpdZO6ME"; // already registered
+constexpr const char* kSaveDataTransferringMount    = "WAzWTZm1H+I";
+constexpr const char* kSaveDataTransferringMountPs4 = "RjMlsR8EXrw";
 
 bool all_bytes_equal(const unsigned char* p, size_t n, unsigned char v) {
     for (size_t i = 0; i < n; ++i) if (p[i] != v) return false;
@@ -135,6 +137,70 @@ void test_nptrophy2_info_queries() {
     }
 }
 
+void test_savedata_transferring_mount() {
+    printf("-- libSceSaveData transferring-mount pair --\n");
+    // Both entry points mount a PS4-era save for import into the PS5 title. No prosper installation
+    // has a PS4 save area, so the answer is "not found" — and the FALSE SUCCESS failure here is not
+    // theoretical: `RjMlsR8EXrw` unregistered told Sonic Frontiers (PPSA03831) that the mount had
+    // succeeded, whereupon the title formatted a path out of the mount-point result nothing had
+    // written and opened `/gamedata` at filesystem root, once per frame, forever.
+    const struct { const char* nid; const char* name; } mounts[] = {
+        { kSaveDataTransferringMount,    "sceSaveDataTransferringMount" },
+        { kSaveDataTransferringMountPs4, "sceSaveDataTransferringMountPs4" },
+    };
+    uint64_t answers[2] = { 0, 0 };
+    for (size_t i = 0; i < 2; ++i) {
+        HleFn fn = Hle::lookup(mounts[i].nid);
+        char msg[160];
+        snprintf(msg, sizeof(msg), "%s is registered", mounts[i].name);
+        // Kills: leaving either sibling on the unregistered path. Registering one of a `…Ps4` pair
+        // and not the other is the exact state this arm was written against — the covered name
+        // reads as covering both.
+        CHECK(fn != nullptr, msg);
+        if (!fn) return;
+
+        // A mount-point result the caller zeroed, as the guest does. The handler must NOT write a
+        // mount point on the failure path — but note that a `return 0` stub writes nothing either,
+        // so this assertion is a discriminator only together with the non-zero return below: what
+        // makes the pair sound is "reports unavailable AND leaves the result alone".
+        unsigned char result[32];
+        memset(result, 0, sizeof(result));
+        uint64_t param[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        answers[i] = fn((uint64_t)(uintptr_t)param, (uint64_t)(uintptr_t)result, 0, 0, 0, 0);
+
+        // Kills: THE BUG — the dispatcher's `return 0`, and equally a hand-written `return 0` stub.
+        snprintf(msg, sizeof(msg), "%s reports unavailable rather than success", mounts[i].name);
+        CHECK(answers[i] != 0, msg);
+        // Kills: an error whose low 32 bits are zero, AND — the reason this is a SIGN test rather
+        // than a non-zero one — any positive low dword. The guest sites gate with `test eax,eax; js`,
+        // a SIGN test, so `return 1` is non-zero and still reads as SUCCESS at every one of them:
+        // the bug would be reinstated with this assertion green. Sony error codes are 0x8xxxxxxx, so
+        // negative-as-int32 is the property the call sites actually test.
+        snprintf(msg, sizeof(msg), "%s error is NEGATIVE as int32 (the sign the call sites test)",
+                 mounts[i].name);
+        CHECK((int32_t)(uint32_t)answers[i] < 0, msg);
+        // Kills: writing a mount point the caller would then treat as a real mounted path.
+        snprintf(msg, sizeof(msg), "%s leaves the mount-point result untouched", mounts[i].name);
+        CHECK(all_bytes_equal(result, sizeof(result), 0), msg);
+    }
+    // Kills: the two siblings drifting apart — one answering NOT_FOUND and the other some other
+    // code, so the title's behaviour would depend on which entry point it happened to call.
+    // NOTE this is a cross-title POLICY lock, not #1873's same-question-two-libraries case:
+    // PPSA03831 does not import WAzWTZm1H+I at all. It is still worth holding, because five local
+    // titles call the Ps4 form and THREE of them const-compare the code — PPSA03839 against
+    // 0x809F0003, and PPSA07809 *and* PPSA08804 against 0x809F000F — so the value is not inert
+    // across the corpus. (PPSA08804's is inside its error arm past the branch, which is why a gate
+    // scan that stops at the first branch reads it as a plain non-zero test.)
+    //
+    // The strongest evidence anyone has on the precise errno, recorded so it is not re-derived: two
+    // independent titles have a DEDICATED arm for 0x809F000F and none for 0x809F0008. PPSA07809
+    // routes it to a distinct state; PPSA08804 returns 2 for it against 3 for everything else.
+    // 0x809F000F appears nowhere in prosper and the 3.20 dump carries no constants, so it is
+    // unresolved — a lead, not a conclusion. Frontiers gates on the SIGN alone, so nothing here
+    // depends on it.
+    CHECK(answers[0] == answers[1], "both transferring-mount entry points give the same answer");
+}
+
 } // namespace
 
 int main() {
@@ -142,6 +208,7 @@ int main() {
     register_builtin_hle();
     test_random();
     test_nptrophy2_info_queries();
+    test_savedata_transferring_mount();
     if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

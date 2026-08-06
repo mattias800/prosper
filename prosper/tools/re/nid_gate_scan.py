@@ -12,6 +12,14 @@ This resolves that statically, with no boot and no GPU:
       -> every `call rel32` that reaches the stub (plus any `call *[rip+d]` straight to the slot)
       -> objdump the bytes right after each call and classify what happens to eax.
 
+CAVEAT — this tool UNDER-REPORTS const-sensitivity, and the limit is structural.
+`classify_window` stops at the first branch, so a site that tests the result generically and THEN
+const-compares it *inside its error arm* is bucketed as a plain non-zero test. Measured: PPSA08804
+compares against 0x809F000F at 0x4e41a32, past the branch, and this scan reports it as `nonzero`
+(#2023 review). So a `nonzero` verdict means "no const compare before the first branch", NOT "this
+title does not care which error code it gets". Read the error arm before concluding an errno is
+inert.
+
 Buckets (see `classify_window`):
     const        the window compares eax against --const (the gate idiom this was written for)
     nonzero      `test eax,eax` / `cmp eax,0` / sign test -> conditional branch (any error gates)

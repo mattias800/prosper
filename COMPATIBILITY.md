@@ -8,7 +8,7 @@ bugs. Different title revisions may behave differently.
 Detailed investigation notes, measurements, known defects, and next steps live in the linked
 [game-tracker issues](https://github.com/mattias800/prosper/issues?q=is%3Aissue+%22%5BGame+tracker%5D%22).
 
-Last updated: 2026-08-05
+Last updated: 2026-08-06
 
 ## Summary
 
@@ -21,7 +21,7 @@ Last updated: 2026-08-05
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 4K SEGA logo; the boot sequence then holds on a white screen before a title screen | [#1871](https://github.com/mattias800/prosper/issues/1871) |
-| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🔬 Full 4K opening sequence; the guest's own display buffer then goes black before the title screen | [#1891](https://github.com/mattias800/prosper/issues/1891) |
+| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; the menu heading draws the wrong string | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K SEGA logo; the composite goes uniform before a title screen | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
@@ -118,17 +118,29 @@ title screen is reached:** after the logo fades the composite holds on white. Se
 
 ## Sonic Frontiers — `PPSA03831`
 
+<p align="center"><img src="assets/screenshots/sonic-frontiers-title-screen.png" alt="Sonic Frontiers — title screen"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-main-menu.png" alt="Sonic Frontiers — main menu"></p>
 <p align="center"><img src="assets/screenshots/sonic-frontiers-sega-logo.png" alt="Sonic Frontiers — SEGA logo"></p>
 <p align="center"><img src="assets/screenshots/sonic-frontiers-middleware-credits.png" alt="Sonic Frontiers — middleware credits"></p>
 <p align="center"><img src="assets/screenshots/sonic-frontiers-opening-sequence.png" alt="Sonic Frontiers — opening logo sequence"></p>
 <p align="center"><img src="assets/screenshots/sonic-frontiers-sonic-team-logo.png" alt="Sonic Frontiers — Sonic Team logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-frontiers-autosave-notice.png" alt="Sonic Frontiers — auto-save notice"></p>
 
-A default launch reaches the game's whole opening sequence at 3840×2160 — the SEGA logo, the Cyber
-Space intro, the Sonic Team logo and the middleware credits. The title composites those into the
-display buffer it flips rather than through render passes, so publishing them needed the flipped
-buffer itself to become a present source. **No title screen is reached:** from about 140 s the
-display buffer the title keeps flipping is itself black, and prosper reads and publishes it fresh on
-every flip. See the [tracker](https://github.com/mattias800/prosper/issues/1891).
+A default launch with no input reaches the game's whole opening sequence at 3840×2160 — the SEGA
+logo, the Cyber Space intro, the Sonic Team logo and the middleware credits — then the auto-save
+notice, the title screen and the main menu. The title composites into the display buffer it flips
+rather than through render passes, so publishing it needs the flipped buffer itself to be a present
+source.
+
+The boot previously stopped dead after the opening sequence, at a black screen. It was waiting on
+`sceSaveDataTransferringMountPs4` — the call behind the menu's own "Carry over from PlayStation®4"
+entry. prosper did not implement it, and the unimplemented default answers `SCE_OK`, so the title
+believed a PS4 save had been mounted and spent every frame trying to open a mount point that was
+never created. **Known defects:** the menu heading draws the string "Try Again" where the game's
+logo belongs, and a panel that opens over the menu renders almost none of its text
+([#2206](https://github.com/mattias800/prosper/issues/2206)). See
+[`docs/SONIC_FRONTIERS_STATUS.md`](prosper/docs/SONIC_FRONTIERS_STATUS.md) and the
+[tracker](https://github.com/mattias800/prosper/issues/1891).
 
 ## Sonic Racing: CrossWorlds — `PPSA08804`
 
