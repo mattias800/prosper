@@ -620,9 +620,14 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   the census skips anything smaller than 64x64 and silently `continue`s on a readback failure, so
   the 16x16 / 4x4 / 2x1 tail of the luminance chain is outside it by construction. **The headline
   survives that gap transitively rather than by enumeration**, and it is worth seeing why: those
-  unseen stages are exposure *scalars*, not image content, and their consumer is the tonemap — whose
-  3840x2160 `RGBA8` output IS in the census and reads opaque black. Whatever they hold, the pass
-  that reads them produced black. The silent readback-failure path is bounded separately and weakly:
+  unseen stages are exposure *scalars*, not image content — a 2x1 luminance value cannot be the
+  missing picture however it reads — and **in the captured frame** their consumer is the tonemap,
+  whose 3840x2160 `RGBA8` output IS in the census and reads opaque black. Read that consumer as
+  *that frame's*: a one-submit capture cannot see a cross-frame read by construction, and a
+  luminance reduction is exactly the quantity a renderer adapts temporally, so "the tonemap is the
+  only consumer" is a claim this instrument cannot make. **The scalar half is what carries the
+  headline**; the tonemap corroborates it. The silent readback-failure path is bounded separately
+  and weakly:
   the enumerated count is **identical (17) in both runs**, so it is not dropping a target
   nondeterministically. Exactly one
   enumerated target has content — the CPU-materialised movie composite, still holding the last
