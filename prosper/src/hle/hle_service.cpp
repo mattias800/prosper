@@ -13,6 +13,7 @@
 #include "video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
 #include "../gpu/guest_texture_layout.hpp" // exact HLE-produced sampled-linear layouts
 #include "../host/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
+#include "../host/boot_program.hpp"  // guest_module_name: is a callback target guest code?
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -2176,8 +2177,17 @@ void ime_deliver(uint64_t handler, uint64_t arg, const ImeKeyEvent& ev, uint64_t
     // default Enter HID, as a pointer and faulted at eboot+0x137c063 (`mov eax,[rsi]`), after which
     // the title spun on `sce::Agc::suspendPoint` forever with a black screen. Use the same host->guest
     // trampoline the AvPlayer callbacks in this file already use.
+    // Only GUEST code needs the trampoline. prosper's own tests install a HOST function as the
+    // handler to observe delivery and the event shape; that address is already the host ABI and must
+    // not be entered through the guest call path (doing so segfaults ime_input). Classify by module
+    // aperture, the same way the rest of the tree names guest addresses.
+    // CONFIDENCE: HIGH -- an IL2CPP title's handler is AOT code in the eboot or a PRX, and the
+    // runtime-PRX pool is labelled too; there is no observed guest handler outside a module.
 #ifdef _WIN32
-    prosper_call_guest_sysv4((uint64_t)(uintptr_t)handler, arg, (uint64_t)(uintptr_t)e, 0, 0);
+    if (std::strcmp(prosper::guest_module_name((uint64_t)(uintptr_t)handler), "mapped/host") != 0)
+        prosper_call_guest_sysv4((uint64_t)(uintptr_t)handler, arg, (uint64_t)(uintptr_t)e, 0, 0);
+    else
+        ((void (PROSPER_SYSV_ABI *)(uint64_t, void*))(uintptr_t)handler)(arg, e);
 #else
     ((void (PROSPER_SYSV_ABI *)(uint64_t, void*))(uintptr_t)handler)(arg, e);
 #endif
