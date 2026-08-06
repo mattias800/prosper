@@ -59,6 +59,34 @@ int mb3_poolshift_window_scan(char* out, unsigned cap);
 // PROSPER_MB3_FREELIST_GUARD) will still see 100% member=0 beside a green self-test.
 int mb3_freelist_selftest(char* out, unsigned cap);
 
+// #1945 INTERIOR poison scan — what mb3_poolshift_window_scan structurally cannot see.
+//
+// The terminal fault of this family is a bundle-list POP that dereferences a head which is not an
+// FBundleNode. By then the poison has already been copied out of the chain into the bin, so the
+// node it came from is gone from every register and every log. This walks each learned per-thread
+// pool array's bundle chains (both heads of all 32 size classes) up to `max_hops` nodes deep and
+// reports any node whose `next` link is NOT a plausible FBundleNode — i.e. the poison while it is
+// still IN the chain, together with the address of the node that holds it.
+//
+// That node address is the whole point: it is the exact guest block a prosper label write would
+// have had to target to be the author, so the caller can put it straight to the label-history
+// table. Unlike a value-shape test, the predicate is structural — a head/next slot may only hold 0
+// or a 0x20-aligned pointer into mapped guest memory — so it cannot be fooled by a poison that
+// happens not to look byte-shifted (measured on PPSA07809: 0xff000000ff000000, 0x0002400100024001).
+//
+// SELF-VALIDATING: the walked-pools/heads/nodes census is written to `out` on EVERY call, so a
+// found=0 from a scan that walked nothing is never mistakable for "the chains are clean".
+// Fault-safe (process_vm_readv), read-only, never gates a write. Returns the poison count.
+struct Mb3PoisonHit {
+    uint64_t pool_base = 0;
+    uint32_t class_off = 0;    // byte offset of the size class within the pool array
+    uint8_t  list = 0;         // 1 = partial bundle head, 2 = full bundle head
+    uint32_t hops = 0;         // distance from the head
+    uint64_t node = 0;         // the node whose next-link is poisoned
+    uint64_t bad_next = 0;     // the poisoned value
+};
+int mb3_poison_scan(Mb3PoisonHit* hits, int max_hits, uint32_t max_hops, char* out, unsigned cap);
+
 // Test isolation for the process-global candidate registry.
 void mb3_reset_pool_candidates_for_test();
 

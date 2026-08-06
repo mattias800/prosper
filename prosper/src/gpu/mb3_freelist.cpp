@@ -345,6 +345,64 @@ extern "C" int prosper_mb3_is_pool_candidate(uint64_t base) {
     return 0;
 }
 
+// See mb3_freelist.hpp. Structural predicate: a bundle head / next link may only be 0 or the
+// address of a 0x20-aligned block in mapped guest memory. `plausible_node` already encodes the
+// alignment half; the region half is the same [0x20..0x40) window the rest of this family uses
+// post-#1226, and safe_read is the mappedness proof.
+static bool plausible_link(uint64_t v) {
+    if (v == 0) return true;
+    if (!plausible_node(v)) return false;
+    if (v < 0x2000000000ull || v >= 0x4000000000ull) return false;
+    uint64_t probe = 0;
+    return safe_read(v, &probe, sizeof probe);
+}
+
+int mb3_poison_scan(Mb3PoisonHit* hits, int max_hits, uint32_t max_hops, char* out, unsigned cap) {
+    if (!max_hops) max_hops = 256;
+    uint32_t pools = g_pool_candidate_count.load(std::memory_order_acquire);
+    if (pools > kMaxPoolCandidates) pools = kMaxPoolCandidates;
+    int found = 0;
+    uint32_t walked_pools = 0, walked_heads = 0, walked_nodes = 0;
+    for (uint32_t i = 0; i < pools; ++i) {
+        const uint64_t base = g_pool_candidates[i].load(std::memory_order_acquire);
+        if (!base) continue;
+        uint8_t bins[0x400];
+        if (!safe_read(base, bins, sizeof bins)) continue;
+        ++walked_pools;
+        for (uint32_t o = 0; o + 0x20 <= sizeof bins; o += 0x20) {
+            for (uint8_t list = 1; list <= 2; ++list) {
+                uint64_t head = 0;
+                memcpy(&head, bins + o + (list == 1 ? 0 : 0x10), sizeof head);
+                if (!head) continue;
+                ++walked_heads;
+                // The head itself is a link and is checked by the same rule: a bin already holding
+                // a non-node is the terminal state this family faults on, reported at hops=0.
+                uint64_t node = head, prev = base + o + (list == 1 ? 0 : 0x10);
+                for (uint32_t h = 0; h <= max_hops; ++h) {
+                    if (!plausible_link(node)) {
+                        if (found < max_hits && hits)
+                            hits[found] = {base, o, list, h, prev, node};
+                        ++found;
+                        break;
+                    }
+                    if (!node) break;               // clean end of chain
+                    uint64_t next = 0;
+                    if (!safe_read(node, &next, sizeof next)) break;
+                    ++walked_nodes;
+                    if (next == node) break;        // self-loop: stop, do not report as poison
+                    prev = node;
+                    node = next;
+                }
+            }
+        }
+    }
+    if (out && cap)
+        snprintf(out, cap, "pools=%u/%u heads=%u nodes=%u max_hops=%u found=%d%s",
+                 walked_pools, pools, walked_heads, walked_nodes, max_hops, found,
+                 walked_nodes == 0 ? "  [WALKED NOTHING — a zero here is void, not negative]" : "");
+    return found;
+}
+
 void mb3_reset_pool_candidates_for_test() {
     for (auto& base : g_pool_candidates) base.store(0, std::memory_order_relaxed);
     g_pool_candidate_count.store(0, std::memory_order_release);

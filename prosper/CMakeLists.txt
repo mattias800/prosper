@@ -775,6 +775,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_eop_write PRIVATE prosper_core)
   add_test(NAME eop_write COMMAND test_eop_write)
 
+  # #1945: the interior free-chain poison scan — its structural predicate, and the census that keeps
+  # a zero from reading as "the chains are clean" when the walk reached nothing.
+  add_executable(test_mb3_poison_scan tests/test_mb3_poison_scan.cpp)
+  target_link_libraries(test_mb3_poison_scan PRIVATE prosper_core)
+  add_test(NAME mb3_poison_scan COMMAND test_mb3_poison_scan)
+
   # #729: the synchronous (PROSPER_EOP_WRITE_SYNC=1) honor_* label writes must probe
   # guest_readable before dereferencing a guest-PM4-supplied address (own executable: the
   # env var latches process-wide on first use).
