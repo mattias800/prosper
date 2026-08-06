@@ -27,6 +27,7 @@
 #include <deque>
 #include <filesystem>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -3244,8 +3245,9 @@ HLE(s_playgo_getlang) { if (!a1) return PLAYGO_ERR_BAD_POINTER;
 // shadPS4 savedata_error.h; same 0x809F error facility on PS5) and writes NOTHING — the truthful
 // first-boot state on real hardware, which a shipped game must handle by proceeding to a fresh
 // game. This is strictly better than the previous unimpl->0 "mount succeeded" with a garbage
-// mount-result the game then reads paths from. Transaction bookkeeping calls succeed (they
-// allocate/tear down local resources only). CONFIDENCE: HIGH on Initialize3/NOT_FOUND semantics;
+// mount-result the game then reads paths from. Transaction bookkeeping calls allocate/tear down
+// local resources only, and Create returns the new resource's ID (see #1905 below).
+// CONFIDENCE: HIGH on Initialize3/NOT_FOUND semantics;
 // MED on Mount3's arg order (mount-desc in, result out — matches every PS4 Mount variant);
 // LOW on Prepare/Commit internals (no-op success; PROSPER_SVCLOG captures their real args).
 static constexpr uint64_t SAVE_DATA_ERR_PARAMETER = 0x809F0000ull;
@@ -3255,8 +3257,62 @@ static constexpr uint64_t SAVE_DATA_ERR_NO_EVENT = 0x809F0018ull;
 namespace { std::atomic<unsigned> g_savedata_umount_events{0}; }
 HLE(s_savedata_init3)   { svc_log("sceSaveDataInitialize3", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_savedata_term)    { return 0; }
-HLE(s_savedata_txres)   { svc_log("sceSaveDataCreateTransactionResource", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_savedata_txres_del) { return 0; }
+
+// --- Transaction resources (#1905). sceSaveDataCreateTransactionResource returns the NEW RESOURCE'S
+// ID, not 0-on-success. Returning 0 is the shape of the call that succeeds, so this looked correct
+// and is not: Sonic Origins' (PPSA05325) save handler at eboot+0x93fdb0 is exactly
+//     xor edi,edi; call sceSaveDataCreateTransactionResource; test eax,eax; jle <fail>
+// — a zero return is read as failure, the handler records error 3, every later save operation
+// returns that sticky error without running, and the title's boot coroutine polls the failed job
+// forever. That single wrong return value is why PPSA05325 never leaves its first boot step.
+// It really is a HANDLE and not merely "a positive number" — Sonic's full lifecycle proves it:
+//   0x93fdc7  mov [r14+0xc0],eax        Create's result is retained in a member
+//   0x9402cd  mov eax,[r14+0xc0]        ...loaded again to build the Mount3 descriptor,
+//   0x9402d4  mov [rsp+0x68],eax        ...at descriptor base (rsp+0x40) + 0x28,
+//   0x93f24e  mov edi,[rdi+0xc0]        ...and handed back as Delete's sole argument,
+//   0x93f254  cmp edi,0xffffffff        guarded by the guest's own -1 "no resource" sentinel.
+// That also independently reproduces the Mount3 +0x28 field this file documents from DQ7. The id is
+// opaque to the guest, so any positive value satisfies it; we hand out a monotonic counter and keep
+// the live set so Delete can reject one that was never created.
+// CONFIDENCE: HIGH on the polarity, on "returns the resource id", and on Delete's argument being a
+// scalar int32 in edi (the mov above precedes all four of Sonic's Delete sites and Oregon Trail's).
+// Delete's error CODE for an unknown id is the residual unknown: PARAMETER is the facility's generic
+// bad-argument code, and no title is observed passing an id Create did not return.
+namespace {
+std::mutex g_savedata_tx_mu;
+int32_t g_savedata_tx_next = 1;
+std::set<int32_t> g_savedata_tx_live;
+}   // namespace
+
+int32_t savedata_tx_resource_create() {
+    std::lock_guard<std::mutex> lk(g_savedata_tx_mu);
+    if (g_savedata_tx_next <= 0) return -1;          // counter exhausted (unreachable in practice)
+    int32_t id = g_savedata_tx_next++;
+    g_savedata_tx_live.insert(id);
+    return id;
+}
+
+bool savedata_tx_resource_destroy(int32_t id) {
+    std::lock_guard<std::mutex> lk(g_savedata_tx_mu);
+    return g_savedata_tx_live.erase(id) != 0;
+}
+
+size_t savedata_tx_resource_live_count() {
+    std::lock_guard<std::mutex> lk(g_savedata_tx_mu);
+    return g_savedata_tx_live.size();
+}
+
+HLE(s_savedata_txres) {
+    svc_log("sceSaveDataCreateTransactionResource", a0,a1,a2,a3,a4,a5);
+    int32_t id = savedata_tx_resource_create();
+    if (id <= 0) return SAVE_DATA_ERR_PARAMETER;
+    return (uint64_t)(uint32_t)id;
+}
+HLE(s_savedata_txres_del) {
+    svc_log("sceSaveDataDeleteTransactionResource", a0,a1,a2,a3,a4,a5);
+    if (!savedata_tx_resource_destroy((int32_t)(uint32_t)a0)) return SAVE_DATA_ERR_PARAMETER;
+    return 0;
+}
 
 // --- libSceSaveData "save-data memory" API (#191). A per-(user,slot) fixed-size memory block the
 // managed SaveData layer reads/writes by offset and syncs to storage; on PS5 this is how a title
