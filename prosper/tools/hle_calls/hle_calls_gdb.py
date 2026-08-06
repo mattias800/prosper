@@ -40,6 +40,11 @@ both are printed unconditionally:
   * `window=complete|SHORT` says whether the clock really reached `--ticks`.
     `run`/`continue` also return on a signal gdb stops for, which would
     otherwise print a truncated histogram that reads as a finished window.
+  * `positive-control=` states the verdict on the value-capture mechanism
+    itself, so the reader never has to derive it — and, critically, so the rule
+    is applied **per mode**. See `_positive_control()` below for the whole state
+    machine and why an absent LOGIN is normal in attach mode and a defect signal
+    in launch mode.
 
 Two limits of `--values` worth knowing before believing a number:
 
@@ -84,6 +89,14 @@ MODE = os.environ.get("HLE_CALLS_MODE", "attach")
 VALUES = os.environ.get("HLE_CALLS_VALUES", "") == "1"
 ORDER_N = int(os.environ.get("HLE_CALLS_ORDER", "24"))
 INFERIOR_TTY = os.environ.get("HLE_CALLS_INFERIOR_TTY", "")
+
+# The built-in control for the value-capture mechanism, and the two values it can answer.
+# src/hle/hle_service.cpp `HLE(s_user_getevent)`: a function-local `static` flag makes the
+# initial LOGIN event (return 0) a once-per-PROCESS delivery, and every later call answers
+# SCE_USER_SERVICE_ERROR_NO_EVENT. Everything in _positive_control() follows from that.
+CONTROL = "s_user_getevent"
+CONTROL_LOGIN = 0
+CONTROL_NO_EVENT = 0x80960007
 
 counts = {}
 values = {}                     # name -> {return value: count}
@@ -152,6 +165,85 @@ def _on_exited(event):
     state["exited"] = True
 
 
+def _positive_control():
+    """Verdict on this run's value capture — `(token, note)`, note "" when nothing is wrong.
+
+    The control is `s_user_getevent`, whose contract is derivable from the source before
+    any run: exactly one LOGIN (`0x0`) per PROCESS, `0x80960007` forever after. **The
+    expected observation is therefore mode-dependent, and that is the whole point of
+    computing it here** — an earlier revision of this tool documented the launch-mode
+    expectation as if it held everywhere, which told a reader of a perfectly good attach
+    capture to throw it away.
+
+      launch  the window opens at the first instruction, so the single LOGIN falls
+              inside it: exactly one `0x0` is required, and its absence is a signal.
+      attach  init consumed the LOGIN before gdb could attach, so a correct capture
+              has none. Zero or one is normal; only more than one is impossible.
+
+    Absence of the control is not a violation, and the two ways to have none are
+    reported apart: `not-in-filter` (never armed — `--filter` excluded it, or the binary
+    does not export it) and `not-called` (armed, but the guest never entered it in this
+    window). Either way the run carries no value-capture control at all, which the docs
+    ask for "every time" and nothing else would say.
+
+    A missing LOGIN in launch mode is only reported as VIOLATED when every one of the
+    control's calls was captured. If any return was lost (longjmp/teardown, see
+    `out_of_scope`), a miss and a loss are indistinguishable and the verdict is VOID —
+    an instrument that cannot tell those apart must not pick one.
+    """
+    if not VALUES:
+        return ("unchecked(values-off)",
+                "no return values were recorded, so this run has no value-capture control; "
+                "the call counts are unaffected. Re-run with --values to check the mechanism.")
+    if CONTROL not in counts:
+        return ("not-in-filter",
+                "%s was never armed (--filter excluded it, or this binary has no such "
+                "handler), so nothing in this run checks the value-capture mechanism. Widen "
+                "--filter to include it before believing a surprising value." % CONTROL)
+    calls = counts[CONTROL]
+    if calls == 0:
+        return ("not-called",
+                "%s was armed but never entered in this window, so nothing in this run checks "
+                "the value-capture mechanism." % CONTROL)
+
+    seen = values.get(CONTROL, {})
+    captured = sum(seen.values())
+    logins = seen.get(CONTROL_LOGIN, 0)
+    unexpected = sorted(v for v in seen if v not in (CONTROL_LOGIN, CONTROL_NO_EVENT))
+
+    if unexpected:
+        return ("VIOLATED(unexpected-ret-%#x)" % unexpected[0],
+                "%s can only answer 0x0 or %#x, so a captured %#x means the capture itself is "
+                "wrong (or the handler changed). Distrust every value in this run."
+                % (CONTROL, CONTROL_NO_EVENT, unexpected[0]))
+    if logins > 1:
+        return ("VIOLATED(login-x%d)" % logins,
+                "%s delivers LOGIN once per process, so %d captured 0x0 returns cannot all be "
+                "real. Distrust every value in this run." % (CONTROL, logins))
+    if logins == 1:
+        return ("ok", "")
+    # No LOGIN captured.
+    if MODE != "launch":
+        return ("absent(attach:login-consumed-pre-window)",
+                "expected in attach mode and NOT a defect: init consumed the once-per-process "
+                "LOGIN long before gdb could attach. Do not discard this run's values over it — "
+                "but note that nothing in it independently confirms the mechanism either; only "
+                "--launch can.")
+    # Same comparison the per-row `(captured N/M)` makes, and for the same reason: a value set
+    # that does not account for every call cannot support an inference from an ABSENT value.
+    if captured != calls:
+        return ("VOID(%d-returns-for-%d-calls)" % (captured, calls),
+                "the launch window covered init yet captured no LOGIN — but only %d returns were "
+                "recorded for %s's %d calls, so a lost value and a wrong one are indistinguishable "
+                "here. This run neither confirms nor refutes the mechanism."
+                % (captured, CONTROL, calls))
+    return ("VIOLATED(launch-window-no-login)",
+            "the window started at the first instruction and captured all %d %s returns, none of "
+            "them the once-per-process LOGIN. Distrust every value in this run — unless the guest "
+            "only ever passed a null event pointer, which returns NO_EVENT without consuming the "
+            "LOGIN." % (calls, CONTROL))
+
+
 gdb.execute("set pagination off")
 gdb.execute("set confirm off")
 # A guest fault is the emulator's business, not this tool's: pass every signal
@@ -196,10 +288,16 @@ print("HLE_CALLS_BEGIN")
 # `window=` is the difference between "the guest made no more calls" and "gdb stopped early".
 # `run`/`continue` also return on a signal gdb stops for (SIGABRT is not in the pass list above,
 # and these titles do abort), which otherwise prints a truncated histogram that looks complete.
-print("clock=%s entries=%d/%d window=%s armed=%d mode=%s calls=%d finish-failures=%d exited=%d"
+control, control_note = _positive_control()
+print("clock=%s entries=%d/%d window=%s positive-control=%s armed=%d mode=%s calls=%d "
+      "finish-failures=%d exited=%d"
       % (CLOCK, state["ticks"], TICKS, "complete" if state["ticks"] >= TICKS else "SHORT",
-         armed, MODE, state["calls"], state["finish_failures"],
+         control, armed, MODE, state["calls"], state["finish_failures"],
          1 if state["exited"] else 0))
+# Only a verdict of `ok` needs no explanation. Every other state carries the one sentence that
+# says whether the run is usable, so the reader does not have to have the README open to know.
+if control_note:
+    print("positive-control-note: " + control_note)
 if order:
     print("first-calls: " + "  ".join("%d:%s" % (n, name) for n, name in order))
 for count, name in rows:

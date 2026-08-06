@@ -41,7 +41,10 @@ entries per frame on every title observed so far), `--filter REGEX`, `--order N`
 Output:
 
 ```
-clock=prosper::k_usleep entries=400 armed=151 mode=attach calls=72 finish-failures=0 exited=0
+clock=prosper::k_usleep entries=400/400 window=complete \
+    positive-control=absent(attach:login-consumed-pre-window) \
+    armed=151 mode=attach calls=72 finish-failures=0 exited=0
+positive-control-note: expected in attach mode and NOT a defect: init consumed the …
 first-calls: 1:pad_read_state  2:s_user_getevent  3:s_syss_getstatus  …
       36  s_user_getevent
       36  s_syss_getstatus
@@ -86,6 +89,11 @@ handlers; one that opened late leads with the frame-loop pollers (`pad_read_stat
 `s_user_getevent`, `s_syss_getstatus`). A histogram cannot distinguish those two, which is exactly
 how the attach arm above looked like a negative when it was void.
 
+With `--values` there is a stronger, machine-checked form of the same question: the LOGIN event is
+delivered **once per process**, so `positive-control=ok` on a launch run is direct evidence that the
+window opened before init consumed it — where `first-calls` is a heuristic a human has to read. See
+[the positive control](#the-positive-control--and-why-it-reads-differently-in-each-mode) below.
+
 A launch run ends when the window closes (the inferior is killed) or when the guest exits first;
 `exited=1` in the header says which. On a timeout the tool kills the whole process group, so a
 launched emulator is never orphaned holding the GPU.
@@ -103,11 +111,39 @@ remaining class of bring-up blocker after every absence check comes back clean i
       36  s_user_getevent   ret 0x80960007 x35, 0x0 x1
 ```
 
-**That line is also this feature's positive control, and it is worth using every time.**
+### The positive control — and why it reads differently in each mode
+
+**That line is also this feature's positive control, and it is worth using every time** — but *what a
+correct capture looks like depends on the mode*, and getting that backwards is expensive in the
+direction that discards good data.
+
 `s_user_getevent` delivers the initial LOGIN event exactly once (returning `0`) and reports
-`SCE_USER_SERVICE_ERROR_NO_EVENT` (`0x80960007`) forever after, so a correct capture shows exactly
-one `0x0` against many `0x80960007`. If it does not, distrust every other value in that run rather
-than believing the surprising one.
+`SCE_USER_SERVICE_ERROR_NO_EVENT` (`0x80960007`) forever after. The "exactly once" is a function-local
+`static` in `src/hle/hle_service.cpp` — it is **once per process**, not once per window:
+
+| mode | correct capture | what would be wrong |
+|---|---|---|
+| `--launch` | exactly one `0x0`, then `0x80960007` — the window opens at the first instruction, so the single LOGIN falls inside it | **no `0x0` at all**: the mechanism lost it (or the handler changed) |
+| `--pid` | `0x80960007` and **no `0x0`** — init consumed the LOGIN long before gdb could attach | more than one `0x0` |
+
+So an attach run showing `s_user_getevent ret 0x80960007 x529` with no `0x0` is a **valid** capture,
+not a broken one. Do not discard it.
+
+**The tool applies this rule itself**, so nothing has to be re-derived at the point of reading. The
+header carries a `positive-control=` field, unconditionally, next to `window=`:
+
+| verdict | meaning |
+|---|---|
+| `ok` | the LOGIN was captured; the value-capture mechanism demonstrably works in this run |
+| `absent(attach:login-consumed-pre-window)` | normal and correct for `--pid`; the run's values stand, but nothing in it independently confirms the mechanism — only `--launch` can |
+| `VIOLATED(...)` | more than one LOGIN, a value the handler cannot return, or a launch window that covered init and captured no LOGIN. Distrust every value in the run |
+| `VOID(...)` | a launch window with no LOGIN *and* returns lost to non-normal exits — a wrong value and a lost one are indistinguishable, so this run neither confirms nor refutes |
+| `not-in-filter` / `not-called` | the control was never armed (e.g. `--filter '^f_'`) or never entered, so this run has **no** control at all |
+| `unchecked(values-off)` | `--values` is off, so there are no return values to check |
+
+Any verdict other than `ok` also prints a one-line `positive-control-note:` saying whether the run is
+usable. The one benign way to get `VIOLATED(launch-window-no-login)` is a guest that only ever passes
+a null event pointer, which answers `NO_EVENT` without consuming the LOGIN; the note says so.
 
 **Completeness is per row, not per run.** `finish-failures` in the header counts captures that could
 not be *armed or decoded*, and it does not see the more common loss: a handler that leaves its frame
@@ -123,6 +159,10 @@ Two limits before believing a number:
 - On a handler that longjmps back into its own caller, gdb's finish breakpoint sits at an address the
   landing pad reuses, so it can capture the *landing* value as if it were a return (measured on
   gdb 17.2). A `(captured N/M)` row's other values are therefore suspect, not merely fewer.
+  **And this one can hide from `(captured N/M)` entirely**: on a fixture that longjmps out of the
+  control on one call in three, the row read `ret 0x80960007 x13, 0x0 x7` with a complete-looking
+  20-of-20 capture, because the seven landing values were *recorded* rather than lost.
+  `positive-control=VIOLATED(login-x7)` was the only field in the run that said so.
 
 `window=complete|SHORT` in the header is the matching check for the run as a whole: `run`/`continue`
 also return on a signal gdb stops for (`SIGABRT` is not passed through, and these titles do abort),

@@ -37,7 +37,8 @@ Reading the result
 ------------------
 The header line reports the window actually observed:
 
-    clock=prosper::k_usleep entries=400/400 window=complete armed=750 mode=attach \\
+    clock=prosper::k_usleep entries=400/400 window=complete \\
+        positive-control=absent(attach:login-consumed-pre-window) armed=750 mode=attach \\
         calls=21362 finish-failures=0 exited=0
 
 An **empty histogram with a non-zero `entries`** is a real measurement: the
@@ -73,10 +74,31 @@ adds a per-handler histogram of return values, so a wrong constant is visible:
 
        36  s_user_getevent   ret 0x80960007 x35, 0x0 x1
 
-That line is also the built-in positive control for the mechanism. `s_user_getevent`
-delivers the initial LOGIN event exactly once (returning 0) and then reports
-NO_EVENT (`0x80960007`) forever, so a correct capture must show exactly one `0x0`
-against many `0x80960007`. If it does not, distrust every other value in the run.
+That line is also the built-in positive control for the mechanism — but **what it
+should show depends on the mode.** `s_user_getevent` delivers the initial LOGIN
+event exactly once *per process* (returning 0) and reports NO_EVENT
+(`0x80960007`) forever after, and that "once per process" is a function-local
+`static` in `src/hle/hle_service.cpp`, not a per-window property:
+
+  * under `--launch` the window opens at the first instruction, so the single
+    `0x0` falls inside it — a correct capture shows exactly one, and its absence
+    is a real signal;
+  * under `--pid` init consumed that `0x0` before gdb could attach, so a correct
+    capture shows `0x80960007` and **no `0x0` at all**. That is the normal
+    observation on any settled title; do not discard such a run.
+
+More than one `0x0` is impossible in either mode. Rather than leave any of this
+to be re-derived, the header states the verdict itself in `positive-control=`:
+
+    ok                                    the mechanism captured the LOGIN
+    absent(attach:login-consumed-pre-window)  normal for --pid; no control either way
+    VIOLATED(...)                         distrust every value in this run
+    VOID(...)                             returns were lost; neither confirmed nor refuted
+    not-in-filter / not-called            no control in this run at all
+    unchecked(values-off)                 --values is off, so there is nothing to check
+
+Anything other than `ok` also prints a one-line `positive-control-note:` saying
+whether the run is usable.
 
 Completeness is per row, not per run. `finish-failures` in the header counts
 captures that could not be **armed or decoded**, and it does not see the more
