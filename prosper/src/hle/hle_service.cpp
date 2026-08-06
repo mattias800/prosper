@@ -4216,8 +4216,18 @@ namespace {
 // The published single-request cap. A guest asking for more than this gets an error on hardware, so
 // prosper must not quietly serve it: a partial fill reported as success would recreate the exact
 // bug this handler exists to remove, and an over-long fill would paper over a guest bug that real
-// hardware rejects. CONFIDENCE: MED — the cap is from the API documentation, not from a live
-// capture; no local title was observed requesting more than 64 bytes.
+// hardware rejects.
+//
+// CONFIDENCE: MED — the cap is from the API documentation, not from a live capture. This is also
+// the ONLY arm of this handler that can newly FAIL a call the previous stub "succeeded", so it is
+// the one place a wrong constant costs something rather than merely being imprecise.
+//
+// What is NOT established: the request sizes local titles actually pass. `nid_gate_scan` classifies
+// what the guest does with `eax` and cannot recover an argument, so no instrument here has measured
+// the `size` operand at any call site — deliberately stated rather than left as an implied "we
+// checked". Settling it needs the argument registers read at the call, e.g. PROSPER_SVCLOG-style
+// logging on this NID or a hardware breakpoint at the import. If a title is ever found requesting
+// more, this constant is where to look first.
 constexpr uint64_t kRandomMaxBytes = 64;
 
 // Fill `bytes` from the host CSPRNG. Returns false if the host cannot supply entropy — which the
