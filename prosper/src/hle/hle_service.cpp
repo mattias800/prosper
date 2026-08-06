@@ -2874,6 +2874,41 @@ HLE(s_appcontent_addcont_mount) {
     return APP_CONTENT_ERROR_NOT_FOUND;
 }
 
+// sceAppContentAddcontUnmount(const SceAppContentMountPoint* mountPoint) — release a claim taken by
+// sceAppContentAddcontMount, identified by the 16-byte mount-point object that call handed back.
+//
+// Unregistered, this reached the dispatcher's `return 0`, which for this contract is SCE_OK: the
+// guest was told the unmount succeeded while `entry.mounted` stayed set, so the NEXT mount of the
+// same add-content returned BUSY and kept doing so forever. The title has no way to recover —
+// from its point of view it released the entry — and locally-present content becomes unreachable.
+// It presents as "the game refuses to load DLC it loaded a minute ago", arbitrarily far from here.
+//
+// This grants nothing. It clears a flag prosper itself set, and an unrecognised mount point frees
+// nothing and returns NOT_FOUND. No ownership or entitlement answer is reachable from this path.
+//
+// The argument is the mount point rather than the entitlement label, mirroring the Mount pair
+// (Mount takes serviceLabel + entitlementLabel and WRITES the mount point; Unmount takes the mount
+// point back). CONFIDENCE: MED on the argument — it is the inherited PS4 AppContent shape and no
+// local dump exercises a mount/unmount cycle, so it is not confirmed against a live guest. The
+// residual risk is bounded by direction: if a title passes something else, the lookup fails and the
+// guest gets NOT_FOUND, which is fail-visible and still strictly better than the silent success it
+// gets today. What would settle it: a boot of a title whose dump declares `dlc_emu.ini`, with the
+// argument registers traced at this NID.
+HLE(s_appcontent_addcont_unmount) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    if (!svc_ptrish(a0)) return APP_CONTENT_ERROR_PARAMETER;
+    // SceAppContentMountPoint is a 16-byte NUL-padded char array. Read it fault-contained: a bad
+    // pointer must be a parameter error, not a fault, and not a success.
+    char raw[16];
+    if (!svc_copy_bytes(a0, raw, sizeof(raw))) return APP_CONTENT_ERROR_PARAMETER;
+    const size_t len = strnlen(raw, sizeof(raw));
+    switch (addcontent_unmount(std::string_view(raw, len))) {
+    case AddcontentUnmountResult::Unmounted:  return 0;
+    case AddcontentUnmountResult::NotMounted: return APP_CONTENT_ERROR_NOT_FOUND;
+    }
+    return APP_CONTENT_ERROR_NOT_FOUND;
+}
+
 // sceSystemServiceParamGetString(paramId, char* buf, size_t bufSize): fetch a system string parameter
 // (e.g. the console/user nickname). The default unimplemented stub returned 0 (SUCCESS) but never wrote
 // the buffer, so the game read whatever uninitialized bytes were there as a "valid" string and derefed
@@ -4394,6 +4429,9 @@ void register_service_hle() {
     Hle::register_fn("m47juOmH0VE", (HleFn)s_appcontent_addcont_info,   "sceAppContentGetAddcontInfo");
     Hle::register_fn("XTWR0UXvcgs", (HleFn)s_appcontent_entitlement_key, "sceAppContentGetEntitlementKey");
     Hle::register_fn("VANhIWcqYak", (HleFn)s_appcontent_addcont_mount, "sceAppContentAddcontMount");
+    // The inverse. Unregistered it answered SCE_OK without releasing the claim, so a
+    // mount/unmount/re-mount cycle was permanently BUSY (#2004, swept under #2081).
+    Hle::register_fn("3rHWaV-1KC4", (HleFn)s_appcontent_addcont_unmount, "sceAppContentAddcontUnmount");
     R("sceCommonDialogInitialize", s_ok);
     R("sceCommonDialogIsUsed", s_ok);   // 0 = not in use (our dialogs auto-dismiss) - intentional, not an unimpl log
     R("sceSystemServiceParamGetInt", s_syss_param_int);   // language-aware (US English default), not blanket 0

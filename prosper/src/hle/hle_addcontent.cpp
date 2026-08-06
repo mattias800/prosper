@@ -698,4 +698,26 @@ AddcontentMountResult addcontent_mount(uint32_t service_label, std::string_view 
     return AddcontentMountResult::Mounted;
 }
 
+// The inverse of the claim addcontent_mount takes. Without it, `mounted` was a one-way latch: a
+// title that mounted an add-content, finished with it, and mounted it again for a new chapter or a
+// language switch got SCE_APP_CONTENT_ERROR_BUSY forever, because the unmount that should have
+// cleared the flag was unregistered and answered the dispatcher's 0 — telling the guest the release
+// had succeeded while the claim stood. Content that IS present locally then becomes permanently
+// unreachable, which is the under-reporting half of the local-inventory rule (#2004).
+//
+// Matching is by the mount point the guest was given, so an unrecognised path frees nothing and is
+// reported as such. Deliberately no wildcard or "unmount everything" fallback: guessing which claim
+// to release would trade a stuck mount for a mount released behind the guest's back.
+AddcontentUnmountResult addcontent_unmount(std::string_view guest_mount_point) {
+    std::lock_guard<std::mutex> lock(g_inventory_mutex);
+    if (guest_mount_point.empty()) return AddcontentUnmountResult::NotMounted;
+    for (InstalledAddcontent& entry : g_inventory.entries) {
+        if (entry.mounted && entry.guest_mount_point == guest_mount_point) {
+            entry.mounted = false;
+            return AddcontentUnmountResult::Unmounted;
+        }
+    }
+    return AddcontentUnmountResult::NotMounted;
+}
+
 } // namespace prosper
