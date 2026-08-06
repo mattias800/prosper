@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Validate Markdown tables that other documents cite by row number.
+r"""Validate Markdown tables that other documents cite by row number.
+
+(Raw string: this docstring quotes the `\|` escape it teaches, and in a normal string that is an
+invalid escape sequence -- a SyntaxWarning today and an error in a future Python.)
 
 Two defects landed in docs/GAME_COMPAT_ORCHESTRATION.md on 2026-08-01, and no other check
 in the pipeline could see either one:
@@ -26,10 +29,24 @@ the first data row, which orphans the entire body.
 Fenced code blocks are skipped: this repository's docs paste tool output containing pipe
 characters, and this file's own defect example would otherwise fail the check that documents it.
 
-TWO CLASSES OF CHECK, deliberately separated:
+THREE CLASSES OF CHECK, deliberately separated:
 
   STRUCTURE (always on) -- no blank line may split a table. A fact about Markdown, true of
   every table in the repository.
+
+  ARITY (always on) -- every row has exactly as many cells as its header. Also a fact about
+  GFM rather than a convention, and it caught a defect that had been rendering wrong for
+  months (#2108). GFM splits a row into cells on `|` BEFORE it parses any inline content, so a
+  pipe inside an inline CODE SPAN is a cell boundary, not text -- the spec says so explicitly
+  ("it's possible to include a pipe in a cell's content by escaping it, including inside other
+  inline spans"). A row with more cells than the header has the excess SILENTLY DISCARDED, and
+  one with fewer is silently padded. Either way the raw file looks right, the diff looks right,
+  and only the rendered page is wrong -- so an editor never sees it. Six rows of this file's own
+  instrument-trap table were truncated on GitHub this way, the sharpest being trap 40, whose
+  subject is `cmd \| tail` and which was broken by writing `cmd | tail` unescaped: it rendered as
+  an 8-column row in a 3-column table, losing most of its text. The fix is one character, `\|`.
+  The delimiter row is checked against the header too, because GFM requires those to agree or the
+  block is not a table at all and renders as a paragraph of literal pipes.
 
   SEQUENCE (--sequential, opt-in) -- the numbered column is unique, strictly ascending and
   gapless. This is a CONVENTION of the trap table ("append, never renumber"), NOT a property of
@@ -45,7 +62,7 @@ TWO CLASSES OF CHECK, deliberately separated:
     * A table qualifies only if EVERY body row is numbered. That same work list ends with a
       `| Separate | ...` row, which is legitimate content and must not be read as a gap.
 
-Validates structure, never content, so neither class can rot as a table grows.
+Validates structure, never content, so no class can rot as a table grows.
 
 WHAT THIS CANNOT SEE, and a real incident. It validates STRUCTURE. It does not read content, so it
 cannot tell that a row still says what its author meant. On 2026-08-01 a rebase silently reverted an
@@ -54,6 +71,25 @@ numbering stayed perfectly contiguous -- this check would have passed it without
 boundary is sharp and worth knowing: numbering catches a row that VANISHED (the sequence gaps), and
 nothing here catches a row that CHANGED ITS MIND. A green run means the table is well formed, never
 that it is true. Diff the region for content too.
+
+What ARITY specifically cannot see, stated so silence is not read as coverage:
+  * HTML tables (`<table>`), which this repository does not use and which are not scanned at all.
+  * Any pipe run with no delimiter row -- a fragment has no header to be measured against, so its
+    rows are unchecked. The structure class reports the fragment itself when it abuts a real table
+    above it, but an isolated delimiter-less pipe block is invisible to every class here.
+  * Tables whose rows have NO LEADING PIPE (`a | b` / `--- | ---`), and tables inside a BLOCKQUOTE
+    (`> | a | b |`). GitHub renders both as real tables and truncates them exactly the same way,
+    and `parse_tables` sees neither, because it requires a row to start with `|`. Both are real
+    false negatives rather than judgement calls; there are zero instances in the corpus today,
+    which is the only reason they are recorded here instead of fixed. Note the shape of this
+    entry: it is trap 112's own rule -- a gate's silence is only evidence about the class it
+    inspects -- applied to trap 112's own gate (#2116 review).
+  * Content INSIDE a cell. A pipe that is correctly escaped is counted as text and nothing asks
+    whether `\|` was what the author meant; equally, a cell count that matches the header proves
+    nothing about the cells being in the right ORDER or the right columns.
+  * Fenced regions, deliberately: a ``` block of shell pipes is not a table, and a checker that
+    fires on pasted tool output gets disabled. Nested/mismatched fences (``` inside ~~~) are
+    tracked as a single toggle, so a document mixing the two markers could desynchronise.
 
 A RED `Docs` JOB THAT IS THE GATE WORKING, not a defect -- read this before "fixing" it. Two
 concurrent PRs appending to a gapless table create a MERGE-ORDER DEPENDENCY. Master ends at 42;
@@ -94,6 +130,73 @@ from pathlib import Path
 FENCE = re.compile(r"^\s*(```|~~~)")
 DELIMITER = re.compile(r"^\s*\|[\s:|-]+\|?\s*$")
 LEADING_NUMBER = re.compile(r"^\s*\|\s*(\d+)\s*\|")
+
+
+ESCAPED_PIPE = re.compile(r"(?<!\\)\|")
+
+
+def delimiter_pipes(line: str) -> list[int]:
+    """Indices of every `|` in `line` that GFM treats as a CELL BOUNDARY.
+
+    The rule is exactly "a pipe is a delimiter unless the IMMEDIATELY PRECEDING character is a
+    backslash" -- no backslash counting. cmark-gfm splits table rows into cells in a pre-inline
+    pass that only looks at the one character before the pipe; CommonMark's parity rule for
+    backslash escapes belongs to the *inline* pass, which never runs on a cell boundary.
+
+    This is measured, not reasoned. Rows `b|c` through `b\\\\\\\\|c` (0 to 4 backslashes) were put
+    through GitHub's own renderer, with the 0-backslash row as a positive control:
+
+        0 backslashes  ->  splits, trailing cell discarded   (control: the instrument works)
+        1 backslash    ->  one cell, renders `b|c`
+        2 backslashes  ->  one cell, renders `b|c`      <-- a parity rule predicts a SPLIT here
+        3 backslashes  ->  one cell, renders `b\\|c`
+        4 backslashes  ->  one cell, renders `b\\|c`
+
+    So every backslash run of length >= 1 escapes the pipe for splitting purposes. Only the
+    rendered *text* differs above 2, because the inline pass then applies CommonMark escaping to
+    what the split left behind -- and cell ARITY, which is all this measures, is unaffected.
+
+    An earlier revision of this function counted parity and therefore reported `| a | b\\\\|c | d |`
+    as a truncated row, which GitHub renders perfectly (#2116 review).
+
+    Nothing else protects a pipe -- not an inline code span, not emphasis, not a link title --
+    because GFM performs this split BEFORE any inline parsing. That is the entire defect this
+    exists to catch (#2108).
+    """
+    return [m.start() for m in ESCAPED_PIPE.finditer(line)]
+
+
+def cell_bounds(line: str) -> list[int]:
+    """The delimiter pipes that actually END a cell, after dropping an optional leading pipe.
+
+    GFM treats a leading and a trailing pipe as optional decoration rather than as cell
+    boundaries, so `| a | b | c |` is three cells and not five. Cell k (1-based) therefore ends
+    at the returned index k-1, which is what lets a caller point at the FIRST pipe that should
+    not be there rather than merely reporting a count.
+    """
+    pipes = delimiter_pipes(line)
+    if not pipes:
+        return []
+    # Leading pipe: everything before the first delimiter is blank (up to 3 spaces of indent).
+    if not line[: pipes[0]].strip():
+        pipes = pipes[1:]
+    return pipes
+
+
+def cell_count(line: str) -> int:
+    """Number of cells GFM renders for this row."""
+    bounds = cell_bounds(line)
+    if not bounds:
+        return 1 if line.strip() else 0
+    # Each bound closes a cell; a trailing pipe with only blank text after it closes nothing.
+    trailing = not line[bounds[-1] + 1 :].strip()
+    return len(bounds) if trailing else len(bounds) + 1
+
+
+def excerpt(line: str, pos: int, width: int = 46) -> str:
+    """`...text|text...` around `pos`, so the message points at the offending character."""
+    lo, hi = max(0, pos - width), min(len(line), pos + width)
+    return ("..." if lo else "") + line[lo:hi].strip() + ("..." if hi < len(line) else "")
 
 
 class Table:
@@ -178,6 +281,57 @@ def parse_tables(lines: list[str]) -> tuple[list[Table], set[int], set[int]]:
     return tables, blanks, fences
 
 
+def arity_problems(path: Path, table: Table) -> list[str]:
+    """Every row of a proper table must have its header's cell count. See ARITY above.
+
+    Only PROPER tables are checked: a fragment has no header of its own, so there is nothing to
+    measure it against, and the structure class is what reports the fragment.
+    """
+    problems: list[str] = []
+    header_line, delimiter_line = table.lines[0], table.lines[1]
+    expected = cell_count(header_line)
+
+    # GFM requires the delimiter to match the header, or the block is not a table at all -- it
+    # renders as a paragraph of literal pipes. Worth its own message because the symptom (the
+    # whole table gone) looks nothing like the symptom of a bad body row (one row truncated).
+    delimiter_cells = cell_count(delimiter_line)
+    if delimiter_cells != expected:
+        problems.append(
+            f"{path}:{table.start + 1}: the delimiter row has {delimiter_cells} cell(s) but the "
+            f"header at line {table.start} has {expected} -- GFM requires them to match, so this "
+            f"block does NOT render as a table at all; it becomes a paragraph of literal pipes. "
+            f"Delimiter reads: {delimiter_line.strip()[:60]!r}"
+        )
+        return problems  # every body row would be measured against a header GFM never accepted
+
+    for line_no, text in table.body:
+        actual = cell_count(text)
+        if actual == expected:
+            continue
+        if actual > expected:
+            # Point at the pipe that closed the last legitimate cell early: in a correct row that
+            # pipe would be the trailing one, so it is exactly the character to escape or remove.
+            bounds = cell_bounds(text)
+            stray = bounds[expected - 1]
+            problems.append(
+                f"{path}:{line_no}: table row has {actual} cells but the header at line "
+                f"{table.start} has {expected} -- GitHub renders the first {expected} and "
+                f"SILENTLY DISCARDS the rest, so this row loses its last column(s) on the "
+                f"rendered page while looking correct in the file. GFM splits a row on `|` "
+                f"BEFORE parsing inline content, so a pipe inside a `code span` is a cell "
+                f"boundary; escape it as `\\|`. First stray boundary at column {stray + 1}: "
+                f"{excerpt(text, stray)}"
+            )
+        else:
+            problems.append(
+                f"{path}:{line_no}: table row has {actual} cells but the header at line "
+                f"{table.start} has {expected} -- GitHub pads the row with empty cells, so the "
+                f"missing column renders blank rather than reporting anything. Did a cell get "
+                f"dropped? Row reads: {text.strip()[:80]!r}"
+            )
+    return problems
+
+
 def check(path: Path, sequential: bool, table_header: str | None) -> list[str]:
     """Return a list of problems; empty means the tables are sound."""
     try:
@@ -256,6 +410,12 @@ def check(path: Path, sequential: bool, table_header: str | None) -> list[str]:
                 f"renders as a separate table and drops out of any sequence check. Did it lose "
                 f"its leading '|'? Line reads: {lines[interrupted_at - 1].strip()[:60]!r}"
             )
+
+    # ARITY, always on and independent of the structure loop above: a split table and a truncated
+    # row are unrelated defects, and a file can carry either without the other.
+    for table in tables:
+        if table.proper:
+            problems.extend(arity_problems(path, table))
 
     if not sequential:
         return problems
@@ -347,7 +507,7 @@ def main() -> int:
         proper = [t for t in tables if t.proper]
         rows = sum(len(t.body) for t in proper)
         detail = "contiguous and unbroken" if args.sequential else "unbroken"
-        print(f"{path}: {len(proper)} table(s), {rows} rows, {detail}")
+        print(f"{path}: {len(proper)} table(s), {rows} rows, {detail}, every row matching its header")
     return 0
 
 

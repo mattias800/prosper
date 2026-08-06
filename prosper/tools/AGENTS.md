@@ -308,14 +308,23 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   **`spirv-val` must be on `PATH`** (`spirv-tools`, `mingw-w64-ucrt-x86_64-spirv-tools`, or
   `brew install spirv-tools`); its absence fails the suite rather than skipping the gate.
 - **`docs/check_numbered_table.py`** — validate Markdown tables that other documents cite by row
-  number. Two classes: **structure** (always on) rejects a blank line that splits a table, which
-  in Markdown silently renders everything after it as a *separate* table; **`--sequential`**
+  number. Three classes: **structure** (always on) rejects a blank line that splits a table, which
+  in Markdown silently renders everything after it as a *separate* table; **arity** (always on)
+  requires every row to have its header's cell count; **`--sequential`**
   (opt-in, plus `--table-header` to select one table) additionally requires the numbered column
   to be unique, ascending and gapless. Sequence is a convention of the instrument-trap table
   ("append, never renumber"), not a property of numbered tables — most here lead with frame or
   draw ordinals where gaps are correct — so do not apply it broadly. Catches the case where two
   branches append the same row number, which merges textually clean and green. Run by the CI
   `Docs` job; `ctest -R doc_table_checker` covers the checker itself.
+  **On arity, and why it is not optional:** GFM splits a row into cells on `|` *before* it parses
+  inline content, so a pipe inside an inline `code span` is a cell boundary, and a row with more
+  cells than the header has the excess **silently discarded** on the rendered page. Write `\|`
+  inside any code span in a table cell. This is not hypothetical — six rows of the instrument-trap
+  table rendered truncated on GitHub for months, trap 40 among them, while this very tool reported
+  the file `unbroken` (#2108). What it does **not** cover, stated so silence is not read as
+  coverage: HTML tables, delimiter-less pipe blocks (no header to measure against), whether an
+  escaped pipe was what the author meant, and fenced regions, which are skipped deliberately.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`PROSPER_MB3_POISON`, `PROSPER_PEND_AGE`, `PROSPER_SUBMIT_STALL_US`** — the three in-emulator
   diagnostics for the MallocBinned3 free-list corruption family (#1945/#1226). `MB3_POISON` walks the
