@@ -268,6 +268,29 @@ that thread waits on becomes the focus, so matching signals from other threads a
   is insufficient because it may never return to guest code (#678).
 - Dynamic-fetch constant folding must reject unreadable guest ranges on every host. The native
   renderer exercises this path; an unconditional Windows readability stub caused #688.
+- **The two call directions are NOT symmetric, and only one of them is handled for you.**
+  `guest -> host` conversion happens in the emitted import-stub trampoline. **Nothing converts a call
+  going `host -> guest`.** So any host code that calls through a guest function pointer must route
+  through `prosper_call_guest_sysv` / `prosper_call_guest_sysv4` (`exec_image_win.cpp`) — a direct
+  call compiles as MS-x64 (`rcx/rdx/r8`) into guest code reading SysV (`rdi/rsi/rdx`), and the
+  arguments arrive **shifted by one position**.
+  - This is invisible at the type level, which is why it survives review: `PROSPER_SYSV_ABI` is
+    **empty on every platform today** (the attribute conflicts with MinGW's SEH unwinding, see
+    `dispatch.hpp`), so a pointer declared with it looks like it carries the convention and does not.
+  - Symptom shape: the guest dereferences one of our scalars as a pointer and dies on the primary
+    thread, taking every thread waiting on it down too — so it presents as a *total deadlock*, not as
+    an ABI bug. That is #2194 / #2200, which is what stopped Blue Prince reaching gameplay on Windows.
+  - Diagnose it by capturing **both sides of the same call**: what prosper passed, and what the guest
+    received. `[dcbfull] need=7 cb=0x… user=0x20108ddf50` against a fault report reading
+    `rdi=0x7 rsi=0x40000000 rdx=0x7` shows the shift directly — our second argument in the guest's
+    third register — rather than leaving it to inference.
+  - **Read the bool return as ONE BYTE.** SysV returns `bool` in `AL` with the upper bits of `RAX`
+    unspecified; a guest epilogue of `setbe al` leaves them dirty, so testing all 64 bits gives a
+    wrong answer intermittently.
+  - As of #2200 a sweep found no other direct `host -> guest` call in the HLE. One adjacent gap is
+    worth knowing rather than rediscovering: NGS2 `SystemRender` fires guest waveform-block callbacks
+    on Linux only — non-Linux registers the plain handler and those callbacks **do not fire at all**
+    (`hle_audio.cpp:3607`). That is a missing feature, not a mis-converted call.
 - `sceKernelMprotect` on Windows accepts guest memory the VA tracker (`g_maps`) does not own, but
   **only inside a fixed guest MODULE-CODE aperture** — the eboot, the PRXes, the plugin and
   runtime-PRX pools (`guest_va_in_module_code`). Those images are mapped by the exec substrate's
