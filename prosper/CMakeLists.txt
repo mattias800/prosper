@@ -169,6 +169,14 @@ else()
 endif()
 
 if(TARGET prosper_core)
+  # nid_census: every guest import that falls to the dispatcher's return-0 default (#2081).
+  # Links prosper_core because both of its inputs must be the real ones — `Module::load` for the
+  # imports the loader will actually try to bind, `module_export_nids` for what a sibling module
+  # already defines, and the live `Hle` registry for whether a handler exists. A source grep over
+  # register_fn() call sites cannot see any of the three.
+  add_executable(nid_census tools/nid_census/nid_census.cpp)
+  target_link_libraries(nid_census PRIVATE prosper_core)
+
   add_executable(test_module tests/test_module.cpp)
   target_link_libraries(test_module PRIVATE prosper_core)
   if(HAVE_GAME_DUMP)
