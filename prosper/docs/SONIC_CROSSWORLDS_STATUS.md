@@ -127,14 +127,14 @@ dump offline, and the exact logged words can be located by index inside those du
 
 | population | how many | what actually fails |
 |---|---|---|
-| the dropped **graphics** pipelines | 4 | a **descriptor resolution**, never a missing opcode |
+| the dropped **graphics** pipelines | 4 → **2** | a **descriptor resolution**, never a missing opcode |
 | the skipped **compute** programs | 8 | missing instructions, and unstructured control flow |
 
 Every one of the four dropped pipelines fails on an unresolved descriptor:
 
 ```text
-[mimg-unresolved]  pc=80   srsrc=s0  srt_tag=NONE  (ps 4445, image_sample)
-[mimg-unresolved]  pc=654  srsrc=s8  srt_tag=0x60  (ps 1346, image_sample_lz)
+[mimg-unresolved]  pc=80   srsrc=s0  srt_tag=NONE  (ps 4445, image_sample)     -- FIXED
+[mimg-unresolved]  pc=654  srsrc=s8  srt_tag=0x60  (ps 1346, image_sample_lz)  -- FIXED
 [mubuf-unresolved] pc=211  srsrc=s4  srt_tag=NONE  (the shared vs, buffer_load_format_xyz)
 ```
 
@@ -147,6 +147,83 @@ The consequence is load-bearing: **finishing the opcode list cannot change what 
 draws do**, because not one of them is blocked on an opcode. Opcode work can only restore compute
 programs — which is still worth doing (a skipped LUT or exposure dispatch is a documented way a
 whole composite collapses), but it is not the lever for these draws.
+
+#### The two PIXEL stages: one 4K 2D_ARRAY target sampled at BASE_ARRAY=1
+
+**Both `[mimg-unresolved]` failures were the same texture, and neither was a provenance failure.**
+`PROSPER_DYNTRACE_FAIL=1` replays a failed stage's resource build with the scalar const-fold traced;
+on both pixel shaders the fold **recovers the T# exactly**, from opposite provenance routes:
+
+```text
+PS 0x2600066500  MIMG pc=80  srsrc=s0  seed_t8=1 key=0xffffffff   (T# straight from the entry user data)
+PS 0x284015a000  MIMG pc=654 srsrc=s8  have_t8=1  key=0x60        (T# loaded through a descriptor table)
+both -> t8=41246e00 c2400000 021bc3bf d1b003ac 00010001 …
+        base=0x41246e0000 3840x2160x1 type=13 fmt=36 tile=27
+```
+
+`type=13` is `SQ_RSRC_IMG_2D_ARRAY` and word 4 `0x00010001` is `BASE_ARRAY=1, LAST_ARRAY=1` — the
+title samples **layer 1** of a 4K array target. The descriptor was resolved and then **discarded
+during materialization**: all three paths that turn a decoded T# into a `ShaderResource` carried
+`d.base_array != 0 → continue`. The recompiler then had no resource at that pc, reported an
+unresolved descriptor, and the draw was skipped — which reads exactly like a provenance failure from
+the reject line alone.
+
+That guard was added (d43d82a6) as a deliberate fail-closed measure *while the per-slice byte stride
+was unmodelled*. #5237659e then modelled it: `image_base_level_view` advances the view base by
+`BASE_ARRAY * tiled_mip_chain_bytes(...)` for cube faces and 2D-array slices, and
+`test_build_shader_resources` has pinned that 720896-byte stride since. **The three call-site guards
+were never lifted, so the descriptor never reached the code that could resolve it.** The fix gates
+the refusal on the image TYPE instead — only where the slice origin is genuinely unmodelled (1D_ARRAY,
+2D_MSAA_ARRAY, a 3D UAV view) — and routes every path through one named predicate,
+`image_descriptor_reject_reason`, which reports *why* a T# was refused.
+
+Measured, two 260 s `tools/screenshot` arms on `61cc4877`, identical switches, same session:
+
+| | before | after |
+|---|---|---|
+| `[mimg-unresolved]` lines | 10 | **0** |
+| distinct dropped `(es, ps)` pipelines | 4 | **2** (both the vertex-stage pair) |
+| `[mubuf-unresolved]` lines | 1 | 1 (unchanged) |
+| skipped compute programs | 8 | 8 (unchanged) |
+| composite | logo `0d70a70a`, then uniform `8bf1b518` | **identical** |
+
+**The composite did not move.** Both arms reproduce the tracker's recorded hashes byte-for-byte, so
+each carries its own positive control. Restoring these two pipelines is a necessary step that is not
+by itself sufficient; the title is still rung 1.
+
+#### The two VERTEX stages: the descriptor chain starts at a null pointer in guest memory
+
+The same instrument settles the vertex stage, and **the answer is not the one the static recon
+predicted**. The fold models this shader's entire "synthesized V#" idiom already — `s_bfe_u64`,
+`s_or_b32`, `s_cmp_eq_u32` and `s_cselect_b32` are all implemented, the last one explicitly as *"the
+vertex-fetch format patch's tail"*. It never gets to use them, because everything upstream is
+unknown:
+
+```text
+[dyntrace] SMEM op=0xc bufload sdst=s16 sbase=s8 base=0x4148dca410 … imm=0x60 n=16
+                                    ; s_buffer_load_dwordx16 s[16:31] <- a 160-byte cbuf, in range
+[dyntrace] SMEM op=0x0  load sdst=s20 sbase=s18 base=0x0 …
+[dyntrace]   addr 0x0 unreadable                       ; s[18:19] read back as NULL -> s20 unknown
+[dyntrace] SMEM op=0x2  load sdst=s4  sbase=s16 base=0x3f800000 soff_field=106 soff_ok=0
+                                    ; the V# load: SBASE is 0x3f800000 (the float 1.0), SOFFSET
+                                    ; is vcc_lo, itself derived from the unknown s20
+[dyntrace]   SOP2 pc=210 op=0xa dst=s7 src0=7(k0) src1=107(k0) ok=0   ; s_cselect: both arms unknown
+[dyntrace] MUBUF fetch pc=211 op=0x2 SRSRC=s4 patched=0 (k=0000) have_descr=0 soff_known=0
+[dyntrace]   MUBUF pc=211 SOFFSET untracked -> fetch left unresolved (not folded to 0)
+```
+
+Read the chain end to end: the shader loads 64 bytes of a constant buffer into `s[16:31]`, and the
+bytes that land in `s[18:19]` are **zero** while `s16` reads `0x3f800000`. It then dereferences that
+null pointer, extracts a bitfield from the result, and builds both the V#'s SOFFSET and its word-3
+select out of it. The fold reads that constant buffer successfully (`base_ok=1 soff_ok=1`, in range
+of its own `num_records=10 × stride=16`) — so this is **real guest data, correctly read, containing a
+null bindless-table pointer**, not a fold that ran out of modelled opcodes.
+
+So the question for the vertex stage is not "how do we resolve a runtime-selected descriptor". It is
+**why that constant buffer's pointer field is zero when prosper realizes the draw** — the guest
+either has not populated it through a path prosper replays, or prosper is reading the wrong buffer.
+`CONFIDENCE: HIGH` on the trace; `CONFIDENCE: LOW` on which of those two it is — nothing here
+separates them yet. Filed as [#2132](https://github.com/mattias800/prosper/issues/2132).
 
 ### The opcode tiers, measured
 
@@ -280,6 +357,30 @@ One line per falsified hypothesis, with the evidence that killed it.
   The live `[recompile-reject]` from a real boot is the only instrument that names the actual failing
   instruction in a graphics stage. It is still exact for **compute**, which passes `allow_smem=true`.
   (This lane, 2026-08-06.)
+- **The dropped draws were NOT four instances of one descriptor problem — they are two populations
+  with unrelated causes, and neither is "the descriptor cannot be resolved".** A
+  `PROSPER_DYNTRACE_FAIL=1` arm replays each failed stage's resource build with the scalar const-fold
+  traced. The two **pixel** stages resolve their T# perfectly and lose it during *materialization*
+  (`base_array != 0`, fixed here); the two **vertex** stages never resolve anything because the
+  constant-buffer dword holding their bindless-table pointer reads **zero**. Do not carry "the four
+  dropped pipelines fail on descriptor resolution" forward as one frontier — fixing the pixel half
+  changed nothing about the vertex half. (This lane, 2026-08-06.)
+- **The failing vertex `V#` is NOT blocked on being "synthesized in-shader".** The
+  [#1895 static recon](https://github.com/mattias800/prosper/issues/1895) read
+  `s_cselect_b32 s7, s7, vcc_hi` at `pc=210` as a runtime-selected word 3 that no table could
+  contain, and proposed modelling a runtime-selected V#. The const-fold **already models that
+  idiom** — `s_cselect_b32` is implemented in `gpu_executor.cpp` and commented *"the vertex-fetch
+  format patch's tail"*, alongside `s_bfe_u64`, `s_or_b32` and `s_cmp_eq_u32`. The live trace shows
+  `pc=210 ok=0` with **both** arms unknown and `scc` unknown, because a preceding
+  `s_load_dword s20, s[18:19]` hit `addr 0x0 unreadable`. The select is downstream of the real
+  failure, not the failure. Which arm is taken is therefore not a question that can be answered from
+  this shader's own state — nothing is known. (This lane, 2026-08-06.)
+- **`shader_inspect` is not the instrument for a failing graphics stage; `PROSPER_DYNTRACE_FAIL=1`
+  is.** The previous entry below records that `shader_inspect --stage` stops at the first
+  table-dependent SMEM. The replay path (`gpu_execute.hpp`, gated on `PROSPER_DYNTRACE_FAIL`) rebuilds
+  the *failed* stage's table with `[dyntrace]`/`[resdump]`/`[udmap]` forced on, once per distinct
+  shader address, and needs no address known up front. It answered both of this title's descriptor
+  questions in a single 260 s arm after two lanes had reasoned about them statically. (This lane.)
 - **A `[recompile-reject] pc=0 words=00000000,00000000` is a bad `code_addr`, not an opcode gap.**
   The skipped program at `0x2d800d0000` is 12,916 dwords of zero from its first word. It has been in
   every census since the first and is not an instruction the recompiler is missing. (This lane.)
@@ -288,19 +389,32 @@ One line per falsified hypothesis, with the evidence that killed it.
 
 Rung 2. Whether the post-logo uniform frame is a dropped-draw composite or a legitimate loading
 screen — a movie surface is now ruled out above, but the other two are not separated. Whether the
-four dropped `(es, ps)` pipelines are the UI layer, the post chain, or both. Whether resolving their
-descriptors is enough to reach a title screen: it is now known that finishing the *opcode* list is
-not, because none of the four is blocked on one. Any input route — nothing has been shown
-to respond to a pad yet. Windows or macOS. Performance figures: every arm shared the GPU with other
-lanes.
+remaining two dropped `(es, ps)` pipelines are the UI layer, the post chain, or both. Whether
+resolving their descriptors is enough to reach a title screen: it is now known that finishing the
+*opcode* list is not, because none of the four was blocked on one, **and that restoring the two
+pixel-stage pipelines is not either — the composite is byte-identical with them recompiling.** What
+the two now-restored pipelines actually draw has not been examined. Any input route — nothing has
+been shown to respond to a pad yet. Windows or macOS. Performance figures: every arm shared the GPU
+with other lanes.
 
 ## The next step, in order
 
-1. **The four dropped draws are a DESCRIPTOR problem** — two `[mimg-unresolved]` and one
-   `[mubuf-unresolved]`, none of them an opcode. That is where a rung-2 attempt should go, and it is
-   the bindless-descriptor frontier (#590 part B / #1607), not #2013.
-2. **The remaining opcode work is control flow**, not arithmetic: `s_cbranch_vccz`/`vccnz` and a
+1. **Find out why `s[18:19]` is null** — [#2132](https://github.com/mattias800/prosper/issues/2132),
+   which carries the full trace and the two candidate explanations.
+   The remaining two dropped draws share one vertex stage whose
+   descriptor chain begins by dereferencing a constant-buffer dword that reads zero (traced above).
+   The two candidate explanations — the guest fills it through a path prosper does not replay, or
+   prosper realizes the draw against the wrong/stale buffer — are separated by watching that address:
+   the cbuf is at a V# the user-data block supplies directly (`s[8:11]`), so `PROSPER_HWWATCH` on
+   `V#.base + 0x60` during the uniform phase says whether anything ever writes it. That is the
+   frontier; it is **not** a runtime-selected-V# modelling problem, which is what the earlier reading
+   implied (see *Ruled out*).
+2. **Look at what the two restored pixel pipelines now draw** before assuming the composite needs
+   more pipelines. They recompile and submit; whether their output reaches the present source is a
+   separate question, and `[rtt] PRESENT SOURCE EXTENT MISMATCH` still fires early in every arm.
+3. **The remaining opcode work is control flow**, not arithmetic: `s_cbranch_vccz`/`vccnz` and a
    forward `s_cbranch_execz`, in two compute programs, one of them on a `backward else` shape. The
    16-bit VALU family is otherwise complete through five tiers.
-3. **Then re-measure the composite.** It has not moved: black to t≈20 s, SEGA logo, then the uniform
-   frame, on every arm of every tier so far.
+4. **Then re-measure the composite.** It has not moved: black to t≈20 s, SEGA logo, then the uniform
+   frame, on every arm of every tier so far — including the arm where the two pixel pipelines were
+   restored.

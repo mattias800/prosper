@@ -181,6 +181,21 @@ uint32_t image_type_to_dim(uint8_t type);
 // cosmetic decode detail.
 inline bool valid_image_type(uint8_t type) { return type >= 8 && type <= 15; }
 
+// The image types whose per-layer byte stride image_base_level_view() models exactly: cube faces
+// (11) and 2D-array slices (13) each own a complete, independently aligned thin-2D mip chain, so a
+// selected slice's byte origin is BASE + BASE_ARRAY * chain-bytes. 3D and MSAA resources have
+// different slice semantics and stay fail-closed. Named once and consulted by both the view
+// computation and the descriptor validator so the two can never drift apart.
+inline bool image_type_has_modeled_layer_stride(uint8_t type) { return type == 11 || type == 13; }
+
+// Why a decoded T# cannot become a shader resource, or nullptr when it can. Returns a short stable
+// reason string so a dropped texture is diagnosable rather than silently absent: a sampling draw
+// whose T# never materializes is rejected by the recompiler as an unresolved descriptor, which
+// looks identical to a provenance failure from the reject line alone. Shared by every
+// materialization path (declared sharps and both const-fold descriptor-use paths) so one predicate
+// governs them all.
+const char* image_descriptor_reject_reason(const DecodedImageDescriptor& d);
+
 // A Gen5/GFX10 T# IMG_FMT (the 9-bit combined format field) decoded to sizing + conversion info.
 // bytes_per_block is the byte size of one block_width x block_height texel block — for uncompressed
 // formats block dims are 1x1 and it equals bytes-per-texel; for BCn blocks are 4x4.

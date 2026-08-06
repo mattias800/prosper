@@ -394,6 +394,33 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     return d;
 }
 
+// Plausibility gate for a candidate T#, shared by every materialization path. Descriptor tables are
+// eight-dword aligned like V# tables, so a const-fold that recovers "eight dwords used as SRSRC" can
+// hand over bytes that are not an image descriptor at all; these predicates are what separate those
+// from a real one.
+//
+// BASE_ARRAY deliberately gates on the TYPE. A nonzero first slice used to be refused outright,
+// because at the time (d43d82a6) nothing modelled the per-tile-mode slice stride and binding slice
+// zero under a nonzero BASE_ARRAY would have sampled the wrong texels. #5237659e then implemented
+// that stride for cube faces and 2D-array slices in image_base_level_view() — but the three
+// call-site guards were left in place, so a layered T# still never reached the code that could
+// resolve it. Refuse a nonzero BASE_ARRAY only where the byte origin is genuinely unmodelled (3D,
+// MSAA, 1D-array), and let image_base_level_view() decide the rest; it still fails closed when the
+// chain stride cannot be computed. CONFIDENCE: HIGH (the stride path has its own coverage, and the
+// descriptor decode of BASE_ARRAY/LAST_ARRAY is pinned by test_build_shader_resources).
+const char* image_descriptor_reject_reason(const DecodedImageDescriptor& d) {
+    if (d.base == 0) return "base-zero";
+    if (d.width == 0 || d.height == 0) return "zero-extent";
+    // depth = LAST_ARRAY - BASE_ARRAY + 1, and the decoder emits 0 for LAST_ARRAY < BASE_ARRAY —
+    // a malformed inverted range, not a single layer. It must keep failing visibly (#2005).
+    if (d.depth == 0) return "inverted-array-range";
+    if (!valid_image_type(d.type)) return "bad-image-type";
+    if (d.base_array != 0 && !image_type_has_modeled_layer_stride(d.type))
+        return "base-array-on-unmodelled-type";
+    if (d.width > 16384 || d.height > 16384) return "extent-too-large";
+    return nullptr;
+}
+
 DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
                                        const Gen5ImageFormatInfo& fi) {
     DecodedImageView view;
@@ -404,18 +431,28 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
         view.supported = false;
         return view;
     }
+    // Every early return below leaves `view.base` at the ALLOCATION base — no mip offset and, more
+    // importantly, no slice offset. Reporting such a view supported under a non-zero BASE_ARRAY would
+    // silently bind slice ZERO's texels for a descriptor that selects slice N: no error, no
+    // validation failure, just the wrong image. The slice offset is applied in exactly one place (the
+    // `thin_2d_layered` block at the bottom), so every path that does not reach it must fail closed on
+    // BASE_ARRAY. This is not hypothetical — `tiled_mip_level_layout` legitimately reports
+    // unsupported for any tile mode outside {LINEAR, 256B_S, 4KB_S, 64KB_S, 64KB_Z_X, 64KB_R_X}, and
+    // that return is reached with `base_level == 0` for a perfectly ordinary layered descriptor.
+    // CONFIDENCE: HIGH.
+    const auto unshifted_view_supported = [&] { return d.base_level == 0 && d.base_array == 0; };
     // Plain 2D, 2D-array slices, and cube faces share the thin-2D mip placement. Every array slice or
     // cube face owns a complete independently aligned mip chain; the returned stride/offset lets a
     // backend gather the selected level without pretending those levels are tightly packed. 3D and
     // MSAA resources have different slice semantics and remain fail-closed for nonzero views.
     const bool thin_2d = d.type == 9;
-    const bool thin_2d_layered = d.type == 11 || d.type == 13;
+    const bool thin_2d_layered = image_type_has_modeled_layer_stride(d.type);
     if ((!thin_2d && !thin_2d_layered) || (d.base_array != 0 && !thin_2d_layered)) {
-        view.supported = d.base_level == 0;
+        view.supported = unshifted_view_supported();
         return view;
     }
     if (!fi.bytes_per_block || !fi.block_width || !fi.block_height) {
-        view.supported = d.base_level == 0;
+        view.supported = unshifted_view_supported();
         return view;
     }
     const uint32_t element_width = (d.width + fi.block_width - 1) / fi.block_width;
@@ -435,7 +472,7 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     // valid (including the final packed-tail mip), hence the explicit status rather than an offset
     // truthiness test.
     if (!layout.supported) {
-        view.supported = d.base_level == 0;
+        view.supported = unshifted_view_supported();
         return view;
     }
     view.mip_offset = layout.byte_offset;
@@ -777,15 +814,13 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 tex_drop(slot, off, "load_sharp failed (out of block / EUD absent / unreadable)"); continue; }
             const bool tex_in_eud = (uint64_t)off + 8 > num_user_sgprs;
             DecodedImageDescriptor d = decode_image_descriptor(tv);
-            if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
-                !valid_image_type(d.type) ||
-                d.base_array != 0 ||
-                d.width > 16384 || d.height > 16384) {          // skip a garbage/degenerate T#
+            if (const char* reject = image_descriptor_reject_reason(d)) {   // garbage/degenerate T#
                 if (sharplog_on) {
-                    char buf[256];
+                    char buf[320];
                     snprintf(buf, sizeof buf,
-                             "degenerate T# base=0x%llx %ux%ux%u type=%u base_array=%u fmt=%u "
-                             "raw %08x %08x %08x %08x %08x %08x %08x %08x", (unsigned long long)d.base,
+                             "degenerate T# (%s) base=0x%llx %ux%ux%u type=%u base_array=%u fmt=%u "
+                             "raw %08x %08x %08x %08x %08x %08x %08x %08x", reject,
+                             (unsigned long long)d.base,
                              d.width, d.height, d.depth, d.type, d.base_array, d.format,
                              tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]);
                     std::string why = buf;
