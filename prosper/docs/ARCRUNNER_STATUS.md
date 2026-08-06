@@ -412,3 +412,29 @@ Ordered for **rung 1** (any real graphics), which the terminal faults do not blo
 7. Capture and inspect a real game image before advancing the tracker or adding an ArcRunner
    screenshot to `COMPATIBILITY.md`. A frame presented right after a `MODE=2` draw does not qualify —
    see the `## Ruled out` row.
+
+**Where the terminal-fault hunt actually stands after the instrument repair** (added without
+renumbering the list above, which a concurrent lane also edits):
+
+The `addr=(nil)` class is now attributed down to one slot. The guest loads
+`rdi = table[index]` from a pointer table at `r12 = 0x2020e381c0` and gets `0x2100000001` — a
+`0x21xxxxxxxx` heap pointer that lost its low dword. **prosper's ReleaseMem/WriteData label writes are
+excluded as the author** (both guard branches, lever witnessed — see `## Ruled out`), so the next
+question is not "which label write" but **which writer touches that 8-byte slot at all**.
+
+The co-location is the lead: prosper's fence destinations on this title are `0x2020e35f40 …
+0x2020e3d540`, and the guest's live pointer table is at `0x2020e381c0` — **the same 64 KiB page**. So
+the guest is holding a live object-pointer table inside the block region it also allocates its 0x20-byte
+GPU labels from. Two writers that have never been censused against that exact span:
+
+- `DMA_DATA` **copies** (`dd_bytes` > 4). `forge_trip` covers `REL1` and `WRITE_DATA` only, and
+  `PROSPER_WRITE_TRAP`'s scan is 4-byte-strided from the payload base and stops at the first 4 KiB of
+  a copy, so an unaligned or late poison inside a copy is a documented blind spot.
+- The guest itself, writing through a stale index. `bextr ecx, eax, 0x1008` takes the index from a
+  packed command dword, so a corrupt *stream* (`r13`) produces an out-of-range `rcx` and reads past
+  the table — which would make the table innocent and move the hunt one level up.
+
+`PROSPER_PROVENANCE_ADDR=0x2020e30000:0x10000` (whole-page overlap census) discriminates the first
+against "no prosper write lands there at all"; the second needs the table's own extent, which is
+recoverable from the allocation-page builder already mapped in `## Current state`. Either way,
+**do not spend another arm on the label-write path** — it is now excluded with a witnessed lever.
