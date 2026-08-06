@@ -48,6 +48,13 @@ extern "C" void prosper_label_hist_wait_built(uint64_t addr, uint64_t cb);
 
 namespace prosper {
 
+#ifdef _WIN32
+// Host -> guest call trampoline (MS-x64 -> SysV). Declared exactly as hle_service.cpp does for the
+// AvPlayer guest callbacks; see AgcDcb::invoke_full_callback for why the AGC one needs it (#2194).
+extern "C" uint64_t prosper_call_guest_sysv4(uint64_t fn, uint64_t a0, uint64_t a1,
+                                             uint64_t a2, uint64_t a3);
+#endif
+
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 #define HLE9(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
@@ -188,7 +195,7 @@ struct AgcDcb {
     uint32_t* top;          // +0x08 buffer end
     uint32_t* cursor_up;    // +0x10 current write ptr
     uint32_t* cursor_down;  // +0x18 reserve limit
-    bool (*callback)(AgcDcb*, uint32_t, void*);  // +0x20 buffer-full callback (guest fn)
+    bool (PROSPER_SYSV_ABI *callback)(AgcDcb*, uint32_t, void*);  // +0x20 buffer-full callback (guest fn)
     void*     user_data;    // +0x28
     uint32_t  reserved_dw;  // +0x30
 
@@ -196,11 +203,39 @@ struct AgcDcb {
         auto avail = (uint32_t)(cursor_down - cursor_up);
         return avail > reserved_dw ? avail - reserved_dw : 0;
     }
+    // Invoke the guest's buffer-full callback. This is a HOST -> GUEST call, and the two directions
+    // are not symmetric: guest -> host conversion happens in the emitted import stub, but nothing
+    // converts a call the other way. PROSPER_SYSV_ABI is empty on every platform today (see
+    // dispatch.hpp), so on Windows a direct call through this pointer uses MS-x64 registers
+    // (rcx/rdx/r8) while the guest reads SysV (rdi/rsi/rdx) -- the arguments arrive shifted by one
+    // position and the guest dereferences a count as a pointer.
+    //
+    // #2194: measured in Blue Prince. prosper read a perfectly valid user_data
+    // (`[dcbfull] need=7 cb=0x4113d8f80 user=0x20108ddf50`) and the guest callback received
+    // `rdi=0x7 rsi=0x40000000 rdx=0x7` -- its third SysV argument picking up our second MS-x64 one,
+    // `n + reserved_dw`. It faults on `[rdi+8]` and takes the title's primary thread down with it.
+    // Linux is unaffected because SysV is native there, which is why this only ever bit on Windows.
+    //
+    // Same treatment the AvPlayer guest callbacks already get (`avp_fire`, hle_service.cpp).
+    bool invoke_full_callback(uint32_t need) {
+#ifdef _WIN32
+        // bool is returned in AL with the upper bits of RAX unspecified -- the guest's own epilogue
+        // is `setbe al`, which leaves them as whatever was there. Read one byte, not eight.
+        const uint64_t r = prosper_call_guest_sysv4((uint64_t)(uintptr_t)callback,
+                                                    (uint64_t)(uintptr_t)this,
+                                                    (uint64_t)need,
+                                                    (uint64_t)(uintptr_t)user_data, 0);
+        return (uint8_t)r != 0;
+#else
+        return callback(this, need, user_data);
+#endif
+    }
+
     uint32_t* allocate_dw(uint32_t n) {
         if (n == 0) return nullptr;
         if (n > available_dw()) {
             dcb_report_full(this, n);          // #1756 probe; no-op unless PROSPER_DCBFULL
-            if (!callback || !callback(this, n + reserved_dw, user_data)) return nullptr;
+            if (!callback || !invoke_full_callback(n + reserved_dw)) return nullptr;
             if (available_dw() < n) return nullptr;
         }
         uint32_t* r = cursor_up;
@@ -352,10 +387,10 @@ void dcb_report_full(const AgcDcb* dcb, uint32_t need) {
     static std::atomic<uint32_t> n{0};
     const uint32_t i = n.fetch_add(1, std::memory_order_relaxed);
     if (i >= 512 && (i & 8191u) != 0) return;
-    fprintf(stderr, "[dcbfull] #%u %s op=0x%x need=%u avail=%u reserved=%u window=%u dw at +%u cb=%p\n",
+    fprintf(stderr, "[dcbfull] #%u %s op=0x%x need=%u avail=%u reserved=%u window=%u dw at +%u cb=%p user=%p dcb=%p\n",
             i, dcb_subop_name(g_dcb_diag_r), g_dcb_diag_op, need, dcb->available_dw(), dcb->reserved_dw, window,
             dcb->bottom && dcb->cursor_up ? (unsigned)(dcb->cursor_up - dcb->bottom) : 0,
-            (void*)(uintptr_t)dcb->callback);
+            (void*)(uintptr_t)dcb->callback, (void*)(uintptr_t)dcb->user_data, (const void*)dcb);
 }
 void dcb_report_window(const AgcDcb* dcb, uint32_t n, uint32_t op, uint32_t r) {
     // begin_packet is the hottest path in the HLE (millions of packets per minute), so do nothing at
