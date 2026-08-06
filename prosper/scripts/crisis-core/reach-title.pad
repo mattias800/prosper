@@ -1,0 +1,28 @@
+# Crisis Core –Final Fantasy VII– Reunion (PPSA07809, Unreal Engine 4.27 + IoStore)
+# Reach the title screen: dismiss the autosave notice, then hold still.
+#
+# The boot sequence is: black -> white splash (several seconds) -> an "This game uses an autosave
+# feature. / OK" dialog, which holds indefinitely -> the "Press Any Button" title screen with the
+# version string and the Square Enix copyright. One Cross dismisses the dialog; nothing further is
+# needed, and the title screen then holds for as long as the run lasts (verified to t=75 s).
+#
+# Anchored on DISPLAY FLIPS, not seconds: the pre-dialog load is IoStore-bound and its wall-clock
+# length varies by tens of seconds between arms, while the flip at which the dialog appears is
+# stable. Flip 120 is comfortably after it appears (~flip 100) and well before anything else.
+#
+# THIS ROUTE DOES NOT BOOT THE TITLE ON ITS OWN. A default run dies 5-12 s in, inside the guest's
+# MallocBinned3 bundle-list pop (#1945), long before the dialog. The route was captured with the
+# guest's submit call throttled, which is what gets past that fault:
+#
+#   PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_MB3_POISON=1 \
+#     PROSPER_PAD_SCRIPT=@prosper/scripts/crisis-core/reach-title.pad \
+#     ./build-linux/screenshot <DUMP_ROOT>/PPSA07809-app0 --seconds 1 --count 90 --timeout 180
+#
+# PROSPER_MB3_POISON is a read-only diagnostic, and using it as a throttle is a stopgap, not a fix
+# — see docs/CRISIS_CORE_STATUS.md for the measurement that shows it is the DURATION of the scan
+# and nothing it reads (PROSPER_SUBMIT_STALL_US=3000 substitutes for it; 500 us does not).
+#
+# STATUS: EXPLORATORY. Verified only as far as the title screen. Cross presses beyond that point
+# open the new-game settings flow (voice language, then "Begin game with selected settings?"), so
+# do not add blind presses here without re-capturing what they land on. Tracker: #1894.
+f120-140:cross
