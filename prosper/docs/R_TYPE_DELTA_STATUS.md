@@ -651,12 +651,12 @@ offscreen 1600×960 target and only the final upscale/composite draw collapses.
 <p align="center">
   <img src="../../assets/screenshots/rtype-delta-title.png" alt="R-Type Delta: HD Boosted title screen with the PRESS prompt, rendered live at 1920x1080"><br>
   <sub>Rung 2 — <code>tools/screenshot</code>, default route, unmodified binary and guest, page cache
-  evicted with <code>tools/dropcache.py</code>. Sample 07 of 22, guest frame ~1,500.</sub>
+  evicted with <code>tools/dropcache.py</code>. Sample 07 of 22 on <code>71b38ca4</code> + this fix.</sub>
 </p>
 
 <p align="center">
   <img src="../../assets/screenshots/rtype-delta-force-select.png" alt="R-Type Delta attract mode: the R-9 and its Force device on the DEMONSTRATION screen"><br>
-  <sub>The attract sequence that follows, same route, sample 12 of 22.</sub>
+  <sub>The attract sequence that follows, same route and run, sample 13 of 22.</sub>
 </p>
 
 ### How the frame was dissected
@@ -718,11 +718,18 @@ of the three checks fail.
 
 ### Live result
 
-`tools/screenshot`, default route, page cache evicted, unmodified binary and guest, 88 s / 22 samples
-4 s apart: **22 of 22 source-distinct and pixel-distinct** 1920×1080 frames, 98–37,015 distinct
-colours each, guest frame 4,697, no `guest thread ended`. There is no flat frame anywhere in the run.
-The route reaches the Clear River Games logo, the full opening movie, the title screen with its
-`PRESS` prompt, then the attract-mode demonstration and the Force-device screen.
+`tools/screenshot`, default route, page cache evicted, unmodified binary and guest, on `71b38ca4`
+plus this fix — 88 s / 22 samples 4 s apart: **22 of 22 source-distinct and pixel-distinct**
+1920×1080 frames, 344–50,692 distinct colours each, guest frame 4,374, and **no `guest thread ended`
+line**. There is no flat frame anywhere in the run. The route reaches the Clear River Games logo, the
+full opening movie, the title screen with its `PRESS` prompt, then the attract-mode demonstration and
+the Force-device screen.
+
+The `dropcache` route is not yet a *guaranteed* win of the #1746 race on a shared host: of two
+consecutive attempts at this exact head, one booted (above) and one still faulted at
+`eboot+0x24055` after a verified 98.2 → 0.0 MB eviction. That is the same product decision recorded
+above, unchanged by this fix — retry the launch. Note that the losing run still printed
+`status=ok` (#2007); read the `guest thread ended` line, not the status.
 
 Rung 3 (gameplay with real GPU draws) is the next step and needs an input route: the title screen
 waits on a button press.
