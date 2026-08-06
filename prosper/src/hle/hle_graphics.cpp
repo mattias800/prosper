@@ -300,6 +300,16 @@ uint64_t videoout_content_digest(uint64_t address, size_t bytes) {
 // The readability probe is what makes this safe to run on every registration of every title: an
 // address prosper cannot vouch for is left without a baseline, and a buffer without a baseline
 // never counts as authored.
+//
+// LOAD-BEARING INVARIANT: the byte range digested here must be the SAME range
+// videoout_buffer_authored_locked digests later. The digest is salted by `bytes` and its sample
+// offsets are derived from `bytes`, so a size drift between seed and compare changes the hash
+// without the contents changing — manufacturing a false POSITIVE, which is the one direction this
+// mechanism must never fail in. It holds because both sides compute width*height*4 from the same
+// `DisplayConfig::SetConfig`: a set is whole-assigned only at register (guarded against an occupied
+// slot) and cleared at unregister, so the geometry is immutable for the life of a generation, and
+// SetBufferAttribute(2) writes the caller's struct rather than the registry. Anything that makes a
+// registered set's dimensions mutable breaks this and must re-seed the baseline.
 void videoout_seed_authorship_locked(int slot, uint64_t address, uint32_t width, uint32_t height) {
     g_display.buffer_digest[slot] = 0;
     g_display.buffer_digest_valid[slot] = 0;

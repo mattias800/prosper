@@ -25,6 +25,14 @@ namespace prosper::frontend {
 // `Publish` is a reason the branch declined, and they are distinct so a diagnostic can say WHICH —
 // a negative control that reports only "it did not fire" cannot tell "correctly declined" from
 // "never reached".
+//
+// **Only the stage-2 reasons are currently observable at runtime.** The renderer's `[rtt] GUEST
+// SCANOUT` report sits inside the stage-1 `Publish` branch, so a stage-1 skip prints nothing and the
+// four names below it (`SkipPublishedGpu`, `SkipRendererSource`, `SkipNoPresentContract`,
+// `SkipScaledPresent`) can never appear in a log as things stand. That is why Bendy's (PPSA27616)
+// zero-line control is honestly reported as **"never reached"** rather than as a decline: the
+// instrument cannot tell those apart today, and the reused-memory case it was meant to cover is
+// asserted by unit test instead. Giving stage 1 its own low-budget report would close that gap.
 enum class GuestScanoutDecision {
     Publish,
     SkipPublishedGpu,        // prosper already published a GPU frame for this guest flip

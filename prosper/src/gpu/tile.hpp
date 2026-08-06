@@ -59,11 +59,16 @@ inline constexpr uint32_t kVideoOutTilingModeLinear = 1;
 // and `DisplayConfig::SetConfig::tiling_mode` also defaults to 0, so "the guest asked for TILE" and
 // "no attribute was parsed, or it was parsed at the wrong offset" are the SAME input here. Every
 // other value fails closed to the historical straight copy; this one value fails open into a
-// de-swizzle. The mitigation is not in this function — it is that the caller must additionally
-// prove the guest wrote the buffer before anything is published from it (see
-// videoout_read_front_linear), so a mis-parsed attribute on an untouched buffer cannot reach the
-// screen. If a title ever reads as band noise where it used to read as an image, suspect this
-// default first.
+// de-swizzle.
+//
+// The mitigation is not in this function, and it is NOT uniform across callers — be precise about
+// which one you are reading. Only the live renderer's last-resort branch additionally proves the
+// guest wrote the buffer before publishing from it (`guest_scanout_present.hpp`), so there a
+// mis-parsed attribute on an untouched buffer cannot reach the screen. `present_snapshot`'s
+// RawScanout path and `present_readback`'s fallback consume the same de-swizzled pixels with **no**
+// authorship gate — they are the pre-renderer boot path, where the alternative is showing nothing at
+// all. If a title ever reads as band noise where it used to read as an image, suspect this default
+// first.
 //
 // Returns TileMode::Linear (0) for LINEAR and for anything unrecognized or not 4 bytes/texel, which
 // reproduces the historical straight copy rather than guessing at a geometry nothing has verified.
