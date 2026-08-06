@@ -4158,6 +4158,20 @@ namespace {
         return false;
     }
 
+    // True when [begin,end) lies inside the fixed guest MODULE apertures (eboot, the PRXes, the
+    // plugin/runtime pools). boot_program.hpp labels everything else "mapped/host"; the module
+    // images are mapped by the exec substrate rather than the memory HLE, so they are legitimate
+    // guest memory that g_maps never records. Both ends are checked, so a span that starts in a
+    // module and runs off its end is rejected; an interior hole would be MEM_FREE and is already
+    // refused by the region walk.
+    bool guest_module_image_span(uint64_t begin, uint64_t end) {
+        if (begin >= end) return false;
+        auto is_module = [](uint64_t a) {
+            return std::strcmp(prosper::guest_module_name(a), "mapped/host") != 0;
+        };
+        return is_module(begin) && is_module(end - 1);
+    }
+
     bool win_protect(uint64_t addr, uint64_t len, int hp, DWORD* error_out = nullptr) {
         if (error_out) *error_out = ERROR_SUCCESS;
         if (!addr || !len || addr > UINT64_MAX - len) {
@@ -4229,6 +4243,16 @@ namespace {
                         committed.push_back({scan, slice_end - scan, win_page_prot(covering->prot)});
                         scan = slice_end;
                     } else {
+                        // An untracked gap is allowed ONLY inside a fixed guest MODULE image. That is
+                        // the case this exists for (map_image's VirtualAlloc never enters g_maps) and
+                        // it must not widen into "any committed page in the process": test_retrack_
+                        // reservation deliberately commits a page adjacent to a guest reservation and
+                        // requires a span crossing into it to fail, because the guest must not be able
+                        // to reprotect host memory it does not own.
+                        if (!guest_module_image_span(scan, next_slice_base)) {
+                            if (error_out) *error_out = ERROR_INVALID_ADDRESS;
+                            return false;
+                        }
                         committed.push_back({scan, next_slice_base - scan, mbi.Protect});
                         scan = next_slice_base;
                     }
