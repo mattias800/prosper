@@ -160,6 +160,27 @@ int main() {
     CHECK(run.find("\"min_pixel_distinct_frames\":8") != std::string::npos &&
           run.find("\"max_pixel_stale_seconds\":3.500000") != std::string::npos,
           "run header records pixel-progress assertions");
+    // Provenance: the revision the BINARY was compiled from. A lane that checks out new work and
+    // measures without rebuilding produces a confident measurement of the wrong build, and nothing
+    // else in the artifact can tell -- the source tree looks current and the run succeeds.
+    // `tools/revision/check_build_revision.py` is what compares this against a ref.
+    // Assert the SHAPE, not merely non-emptiness: a 40-char hex sha or the literal "unknown" that
+    // the generator emits outside a git checkout. Non-emptiness alone was near-vacuous, since the
+    // field can only be empty if the generator itself is broken.
+    {
+        const std::string key = "\"build_revision\":\"";
+        const size_t at = run.find(key);
+        std::string value;
+        if (at != std::string::npos) {
+            const size_t start = at + key.size();
+            const size_t end = run.find('"', start);
+            if (end != std::string::npos) value = run.substr(start, end - start);
+        }
+        const bool sha = value.size() == 40 &&
+            value.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
+        CHECK(sha || value == "unknown",
+              "run header records a 40-char revision (or \"unknown\" outside a git checkout)");
+    }
 
     const std::string summary = manifest_summary_json(3, 5, true, tracker, 1);
     CHECK(summary.find("\"timed_out\":true") != std::string::npos &&
