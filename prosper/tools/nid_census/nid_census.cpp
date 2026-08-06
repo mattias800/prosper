@@ -1,0 +1,320 @@
+// nid_census — which of a title's imports fall to the dispatcher's return-0 default?
+//
+// An import prosper does not register never reaches a handler: `prosper_on_unimpl` logs it once and
+// returns 0 (src/hle/dispatch.cpp). For a contract whose success code is 0 — i.e. most `SCE_OK`
+// functions — that 0 IS "success", so the guest is told an operation completed that never ran, and
+// any out-parameter the call was supposed to fill is left holding whatever was already there. That
+// is strictly worse than an error return: the failure is silent at the call site and surfaces
+// arbitrarily far away. Issue #2081 calls this the FALSE SUCCESS class.
+//
+// The boot log already reports each such NID ("[prosper] unimplemented: ... -> returning 0"), but
+// only for the code paths a particular run happened to execute, and only after booting the title.
+// This answers the same question STATICALLY and exhaustively: every import in the module, whether
+// or not a run reaches it, across as many titles as you point it at.
+//
+// It is deliberately built on prosper's OWN sources of truth rather than a source grep:
+//   * imports come from `Module::load` — the same parser the loader uses, so the census sees the
+//     exact NID set the loader will try to bind;
+//   * cross-module exports come from `module_export_nids`, the loader's own definition of what a
+//     module contributes to the global export table;
+//   * registration comes from `Hle::lookup` after `register_builtin_hle()` — the real runtime
+//     registry, so a NID registered from a table, a loop, or a raw literal is seen identically.
+// A grep over `register_fn(...)` call sites would miss every non-literal registration and would
+// report those as false-success candidates. Asking the registry cannot.
+//
+// The cross-module half is not cosmetic. `linker.cpp` pass 2 resolves an import against the global
+// export table FIRST — "Cross-module export beats a stub slot" — so an import that another of the
+// title's own modules defines never reaches the dispatcher at all, no matter what the HLE registry
+// says. A census that only differenced imports against the registry would report every one of those
+// as a false-success candidate. Reachability here therefore means "unregistered AND undefined by
+// any module shipped with this title", per title, which is exactly the condition under which
+// `prosper_on_unimpl` runs.
+//
+// Usage:
+//   nid_census <app0-dir|module> [more...] [--names <PS5-3.20_Libs-dir>]
+//              [--registered] [--tsv] [--lib <substr>] [--self-check]
+//
+// `<app0-dir>` is scanned recursively for eboot.bin and *.prx/*.sprx. Passing several titles ranks
+// each NID by how many of them import it, which is the reachability signal #2081 asks for: a NID
+// one title imports is a different priority from one that twelve do.
+//
+// `--names` points at the PS5 3.20 stub dump, whose loader lines carry `<NID> <-> <funcName>`
+// pairs directly. `--self-check` re-derives each pair with prosper's own `nid_hash` and reports
+// any disagreement: the name table is the instrument this tool reads the census through, so it
+// gets a control of its own rather than being trusted.
+#include "../../src/hle/dispatch.hpp"
+#include "../../src/hle/nid.hpp"
+#include "../../src/loader/linker.hpp"
+#include "../../src/self/module.hpp"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+using namespace prosper;
+namespace fs = std::filesystem;
+
+namespace {
+
+struct Row {
+    std::string nid;
+    std::string name;                 // "" when the stub dump does not name it
+    std::set<std::string> libs;       // import library names as the module declares them
+    std::set<std::string> titles;     // which inputs import it
+    size_t modules = 0;               // how many modules import it
+};
+
+// ---- the PS5 3.20 stub dump: authoritative <NID> <-> <funcName> pairs --------------------------
+// Each generated library has one loader line per export:
+//     if(sprx_dlsym(__handle, "PI7jIZj4pcE", &__ptr_sceRandomGetRandomNumber)) return;
+// so the pair is read off directly. No hashing is required to build the map, which is what makes
+// --self-check meaningful: the hash is checked AGAINST the dump rather than used to produce it.
+struct NameTable {
+    std::map<std::string, std::string> by_nid;   // nid -> function name
+    std::map<std::string, std::string> lib_of;   // nid -> library file stem
+    size_t pairs = 0, mismatches = 0;
+};
+
+bool parse_stub_line(const std::string& line, std::string* nid, std::string* name) {
+    const size_t call = line.find("sprx_dlsym(");
+    if (call == std::string::npos) return false;
+    const size_t q1 = line.find('"', call);
+    if (q1 == std::string::npos) return false;
+    const size_t q2 = line.find('"', q1 + 1);
+    if (q2 == std::string::npos) return false;
+    const size_t ptr = line.find("&__ptr_", q2);
+    if (ptr == std::string::npos) return false;
+    size_t end = ptr + 7;
+    while (end < line.size() && (isalnum((unsigned char)line[end]) || line[end] == '_')) ++end;
+    *nid = line.substr(q1 + 1, q2 - q1 - 1);
+    *name = line.substr(ptr + 7, end - (ptr + 7));
+    return !nid->empty() && !name->empty();
+}
+
+NameTable load_names(const std::string& dir, bool self_check) {
+    NameTable t;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+        if (!e.is_regular_file() || e.path().extension() != ".c") continue;
+        std::ifstream in(e.path());
+        std::string line, nid, name;
+        while (std::getline(in, line)) {
+            if (!parse_stub_line(line, &nid, &name)) continue;
+            t.pairs++;
+            t.by_nid[nid] = name;
+            t.lib_of[nid] = e.path().stem().string();
+            // The dump states the NID; prosper computes it. They must agree, and a disagreement
+            // means one of the two is wrong for that name — report it rather than silently
+            // preferring either. This is the control on the name table itself.
+            if (self_check && nid_hash(name) != nid) {
+                t.mismatches++;
+                // stderr, not stdout: under --tsv these land above the header and corrupt the
+                // stream a consumer parses. The control's result belongs with the diagnostics,
+                // and its COUNT is reported in the scope block below in both modes.
+                fprintf(stderr, "  [name-mismatch] %s: dump says %s, nid_hash() says %s\n",
+                        name.c_str(), nid.c_str(), nid_hash(name).c_str());
+            }
+        }
+    }
+    return t;
+}
+
+// ---- module discovery -------------------------------------------------------------------------
+bool is_module_file(const fs::path& p) {
+    if (p.filename() == "eboot.bin") return true;
+    const std::string ext = p.extension().string();
+    return ext == ".prx" || ext == ".sprx";
+}
+
+std::vector<fs::path> collect_modules(const std::string& input) {
+    std::vector<fs::path> out;
+    std::error_code ec;
+    const fs::path root(input);
+    if (fs::is_regular_file(root, ec)) { out.push_back(root); return out; }
+    for (const auto& e : fs::recursive_directory_iterator(
+             root, fs::directory_options::skip_permission_denied, ec)) {
+        if (e.is_regular_file(ec) && is_module_file(e.path())) out.push_back(e.path());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Every report this tool emits is an ASSERTION OF ABSENCE — "these NIDs have no handler". An
+// absence is only as trustworthy as the population it was measured over, so no output may omit
+// that population. `prefix` is "# " for --tsv (comment lines a consumer skips) and "" for the
+// human report.
+//
+// The two divergences worth stating explicitly, because they SILENTLY REMOVE ROWS:
+//   * a module that failed to parse contributes no imports, so its NIDs read as "not imported
+//     by anything" rather than "not measured";
+//   * this scans the tree for modules, while the loader links a FIXED set (boot_program.cpp) —
+//     it takes exactly two entries from sce_module/, auto-discovers only Media/Plugins/, and
+//     never auto-links .sprx. So a NID satisfied here by a sibling export the loader would not
+//     have linked is excluded from the census but WOULD reach the dispatcher at runtime.
+void print_scope(const char* prefix, size_t total, size_t modules_read, size_t modules_failed,
+                 size_t unregistered, size_t shown, size_t satisfied_cross_module,
+                 size_t mismatches, const std::string& lib_filter, bool self_check) {
+    printf("%sscope: %zu distinct imported NIDs over %zu module(s) read, %zu unreadable\n",
+           prefix, total, modules_read, modules_failed);
+    printf("%sscope: %zu unregistered, %zu shown%s%s\n", prefix, unregistered, shown,
+           lib_filter.empty() ? "" : ", --lib filter=", lib_filter.c_str());
+    printf("%sscope: %zu binding(s) excluded as satisfied by a sibling module's export\n",
+           prefix, satisfied_cross_module);
+    if (self_check)
+        printf("%sscope: name-table self-check %zu mismatch(es)\n", prefix, mismatches);
+    if (modules_failed)
+        printf("%sWARNING: %zu module(s) did not parse — their imports are ABSENT from this "
+               "census, so a NID missing below may be unmeasured rather than unimported\n",
+               prefix, modules_failed);
+    printf("%sNOTE: module set is a tree scan, not the loader's link set (boot_program.cpp): "
+           "only Media/Plugins is auto-discovered, .sprx is never auto-linked, and sce_module "
+           "contributes exactly two. Cross-module exclusions are computed over THIS set.\n",
+           prefix);
+}
+
+void usage(const char* argv0) {
+    fprintf(stderr,
+            "usage: %s <app0-dir|module> [more...] [--names <PS5-3.20_Libs-dir>]\n"
+            "         [--registered] [--tsv] [--lib <substr>] [--self-check]\n\n"
+            "  --names DIR    resolve NIDs through the PS5 3.20 stub dump\n"
+            "  --registered   also list imports that DO have a handler (default: only unregistered)\n"
+            "  --tsv          machine-readable output\n"
+            "  --lib SUBSTR   only report NIDs whose import library contains SUBSTR\n"
+            "  --self-check   verify every dump NID against prosper's nid_hash()\n",
+            argv0);
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    std::vector<std::string> inputs;
+    std::string names_dir, lib_filter;
+    bool show_registered = false, tsv = false, self_check = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--names" && i + 1 < argc) names_dir = argv[++i];
+        else if (a == "--lib" && i + 1 < argc) lib_filter = argv[++i];
+        else if (a == "--registered") show_registered = true;
+        else if (a == "--tsv") tsv = true;
+        else if (a == "--self-check") self_check = true;
+        else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
+        else if (!a.empty() && a[0] == '-') { usage(argv[0]); return 2; }
+        else inputs.push_back(a);
+    }
+    if (inputs.empty()) { usage(argv[0]); return 2; }
+
+    NameTable names;
+    if (!names_dir.empty()) {
+        names = load_names(names_dir, self_check);
+        if (!tsv)
+            printf("[names] %zu NID<->name pairs from %s%s\n", names.pairs, names_dir.c_str(),
+                   self_check ? "" : "  (pass --self-check to verify them)");
+        if (self_check && !tsv)
+            printf("[names] self-check: %zu mismatch(es) against nid_hash()\n", names.mismatches);
+    }
+
+    // The registry is the ground truth for "is there a handler?". Populate it exactly the way a
+    // boot does, then query it per NID.
+    register_builtin_hle();
+
+    std::map<std::string, Row> rows;
+    size_t modules_read = 0, modules_failed = 0, satisfied_cross_module = 0;
+
+    for (const auto& input : inputs) {
+        const std::string title = fs::path(input).filename().string();
+        const auto mods = collect_modules(input);
+        if (mods.empty()) fprintf(stderr, "[warn] no modules under %s\n", input.c_str());
+
+        // A title's modules are linked together, so its own exports are the first resolver. Parse
+        // every module once, keep them, and take the union of their exports before classifying any
+        // import — an import defined by a sibling module is bound to that definition and never
+        // reaches the dispatcher, so it is not a candidate here at all.
+        std::vector<Module> loaded;
+        std::set<std::string> title_exports;
+        for (const auto& mp : mods) {
+            std::string err;
+            auto m = Module::load(mp.string(), &err);
+            if (!m) {
+                modules_failed++;
+                fprintf(stderr, "[warn] %s: %s\n", mp.string().c_str(), err.c_str());
+                continue;
+            }
+            modules_read++;
+            for (const auto& nid : module_export_nids(*m)) title_exports.insert(nid);
+            loaded.push_back(std::move(*m));
+        }
+
+        for (const auto& m : loaded) {
+            for (const auto& im : m.imports) {
+                if (title_exports.count(im.nid)) { satisfied_cross_module++; continue; }
+                Row& r = rows[im.nid];
+                r.nid = im.nid;
+                if (!im.lib_name.empty()) r.libs.insert(im.lib_name);
+                r.titles.insert(title);
+                r.modules++;
+            }
+        }
+    }
+
+    // Classify against the live registry.
+    std::vector<Row*> selected;
+    size_t total = 0, unregistered = 0;
+    for (auto& [nid, r] : rows) {
+        total++;
+        const bool registered = Hle::lookup(nid) != nullptr;
+        if (!registered) unregistered++;
+        if (registered && !show_registered) continue;
+        if (auto it = names.by_nid.find(nid); it != names.by_nid.end()) r.name = it->second;
+        if (!lib_filter.empty()) {
+            bool hit = false;
+            for (const auto& l : r.libs) if (l.find(lib_filter) != std::string::npos) hit = true;
+            if (auto it = names.lib_of.find(nid);
+                it != names.lib_of.end() && it->second.find(lib_filter) != std::string::npos) hit = true;
+            if (!hit) continue;
+        }
+        selected.push_back(&r);
+    }
+
+    // Most-imported first: the count of distinct titles is the reachability rank.
+    std::sort(selected.begin(), selected.end(), [](const Row* a, const Row* b) {
+        if (a->titles.size() != b->titles.size()) return a->titles.size() > b->titles.size();
+        if (a->name != b->name) return a->name < b->name;
+        return a->nid < b->nid;
+    });
+
+    if (tsv) {
+        printf("nid\tname\tregistered\ttitles\tmodules\tlibs\ttitle_list\n");
+        for (const Row* r : selected) {
+            std::string libs, tl;
+            for (const auto& l : r->libs) { if (!libs.empty()) libs += ","; libs += l; }
+            for (const auto& t : r->titles) { if (!tl.empty()) tl += ","; tl += t; }
+            printf("%s\t%s\t%d\t%zu\t%zu\t%s\t%s\n", r->nid.c_str(),
+                   r->name.empty() ? "?" : r->name.c_str(),
+                   Hle::lookup(r->nid) != nullptr ? 1 : 0,
+                   r->titles.size(), r->modules, libs.c_str(), tl.c_str());
+        }
+        print_scope("# ", total, modules_read, modules_failed, unregistered, selected.size(),
+                    satisfied_cross_module, names.mismatches, lib_filter, self_check);
+        return 0;
+    }
+
+    printf("\n== imports with NO registered handler -> dispatcher returns 0 ==\n");
+    printf("%-13s %-52s %5s  %s\n", "NID", "name", "#ttl", "import library");
+    for (const Row* r : selected) {
+        std::string libs;
+        for (const auto& l : r->libs) { if (!libs.empty()) libs += ","; libs += l; }
+        printf("%-13s %-52s %5zu  %s\n", r->nid.c_str(),
+               r->name.empty() ? "?" : r->name.c_str(), r->titles.size(), libs.c_str());
+    }
+    printf("\n");
+    print_scope("", total, modules_read, modules_failed, unregistered, selected.size(),
+                satisfied_cross_module, names.mismatches, lib_filter, self_check);
+    return 0;
+}
