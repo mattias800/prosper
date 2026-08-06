@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <ctime>
+#include <cerrno>      // EDEADLK — the host's number, which is NOT the FreeBSD one the guest sees
+#include <pthread.h>   // the #2024 arm probes the host primitive directly before asserting on it
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -68,11 +70,113 @@ int main() {
     if (RWunPosix)
         CHECK(call1(RWunPosix, (uint64_t)(uintptr_t)&h) == 1,
               "unmatched pthread_rwlock_unlock returns bare EPERM");
-    // A read hold taken by THIS thread still releases normally afterwards. (The rdlock line is
-    // setup — the handler returns 0 unconditionally — the unlock is the assertion: it proves the
-    // acquisition was recorded, because an unrecorded one would be refused with EPERM.)
-    call1(RWrd, (uint64_t)(uintptr_t)&h);
+    // A read hold taken by THIS thread still releases normally afterwards. Since #2024 the rdlock
+    // line is an assertion in its own right rather than mere setup — the handler no longer returns 0
+    // unconditionally, so a 0 here means the host really granted the hold — and the unlock is the
+    // second half: it proves the acquisition was RECORDED, because an unrecorded one draws EPERM.
+    CHECK(call1(RWrd, (uint64_t)(uintptr_t)&h) == 0, "a granted rdlock reports success");
     CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0, "matched unlock still returns success");
+
+    // ===== #2024: an acquisition the host REFUSED must be reported as a failure ==================
+    //
+    // Rdlock and Wrlock used to `return 0` unconditionally — `rc` fed only a diagnostic line — so a
+    // guest handed a real EDEADLK was told "the lock is yours" and entered the critical section
+    // unguarded. Its later unlock, entirely correct from its own point of view, then arrived at a
+    // lock with no hold to release: #2012's corruption manufactured inside prosper rather than by
+    // the guest. Silent, non-deterministic, and attributable to whatever corrupts next.
+    //
+    // Two arms, because they need different things from the host.
+    //
+    //   (a) NULL SLOT — deterministic everywhere, no host cooperation needed. A null rwlock cannot
+    //       be acquired, so 0 is a lie the host was never even consulted about.
+    //   (b) HOST REFUSAL — the real lever: make the host lock refuse an acquisition the handler
+    //       forwards to it. A recursive write acquire does it; glibc, Darwin and FreeBSD all detect
+    //       it and answer EDEADLK instead of self-deadlocking.
+    //
+    // Arm (b) PROBES the host first, on a private pthread_rwlock_t of its own, and asserts nothing
+    // unless the probe proves this host really refuses. That is deliberate rather than defensive:
+    // an arm that cannot reach the failure path it exists for must SAY so instead of passing
+    // vacuously — the trap this repository keeps rediscovering is an assertion that held while the
+    // mechanism never ran. The probe is watchdog'd because a host WITHOUT deadlock detection would
+    // self-deadlock rather than answer, and a hung ctest is a worse signal than a loud skip.
+    //
+    // Both arms also assert the SONY and POSIX spellings separately, and that pairing is load-
+    // bearing: it is what distinguishes a correctly aliased handler from one wired straight to the
+    // POSIX body. Sony must report the libkernel-encoded form, POSIX the bare FreeBSD errno
+    // (#1984's split). A single-spelling arm passes under either wiring.
+    auto RWrdPosix = Hle::lookup(nid_hash("pthread_rwlock_rdlock"));
+    auto RWwrPosix = Hle::lookup(nid_hash("pthread_rwlock_wrlock"));
+    CHECK(RWrdPosix && RWwrPosix, "POSIX rdlock/wrlock spellings are registered");
+    if (RWrdPosix && RWwrPosix) {
+        // (a) A null slot: EINVAL, encoded for Sony and bare for POSIX.
+        CHECK(call1(RWrd, 0) == 0x80020016ull, "scePthreadRwlockRdlock(null) reports encoded EINVAL");
+        CHECK(call1(RWwr, 0) == 0x80020016ull, "scePthreadRwlockWrlock(null) reports encoded EINVAL");
+        CHECK(call1(RWrdPosix, 0) == 22, "pthread_rwlock_rdlock(null) reports bare EINVAL(22)");
+        CHECK(call1(RWwrPosix, 0) == 22, "pthread_rwlock_wrlock(null) reports bare EINVAL(22)");
+
+        // (b) Probe this host. Statics, not stack objects: on a host that self-deadlocks the probe
+        // thread is detached and never joined, so anything it can still touch must outlive main's
+        // frame. Each stage publishes its own result, and a stage that never returns leaves the
+        // stages after it at -1, which reads as "unknown" and skips the arm that depends on it.
+        static pthread_rwlock_t probe_rw;
+        static std::atomic<int> probe_rd{-1}, probe_wr{-1};
+        static std::atomic<bool> probe_done{false};
+        if (pthread_rwlock_init(&probe_rw, nullptr) == 0) {
+            std::thread p([]{
+                if (pthread_rwlock_wrlock(&probe_rw) != 0) { probe_done.store(true); return; }
+                probe_rd.store(pthread_rwlock_rdlock(&probe_rw));    // read while SELF write-holds
+                probe_wr.store(pthread_rwlock_wrlock(&probe_rw));    // recursive write acquire
+                probe_done.store(true);
+            });
+            for (int i = 0; i < 3000 && !probe_done.load(); i++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (probe_done.load()) p.join();
+            else                   p.detach();   // this host blocks instead of refusing
+        }
+        const int rd_rc = probe_rd.load(), wr_rc = probe_wr.load();
+        printf("  [info] host refusal probe: rdlock-while-self-write-held rc=%d, recursive wrlock"
+               " rc=%d (this host's EDEADLK=%d)\n", rd_rc, wr_rc, EDEADLK);
+
+        // FreeBSD EDEADLK is 11 and the encoded form is 0x8002000b. Neither is the host's number:
+        // EDEADLK is 35 on Linux and 36 on MinGW, and 35 is FreeBSD's EAGAIN — so a handler that
+        // returned the bare host `rc` would tell the guest "try again" where the host said
+        // "deadlock". These two literals are exactly what `fbsd_errno` exists to produce (#1612).
+        if (wr_rc == EDEADLK) {
+            CHECK(call1(RWwr, (uint64_t)(uintptr_t)&h) == 0, "wrlock granted (setup for the refusal)");
+            CHECK(call1(RWwr, (uint64_t)(uintptr_t)&h) == 0x8002000bull,
+                  "scePthreadRwlockWrlock reports encoded EDEADLK when the host REFUSED");
+            CHECK(call1(RWwrPosix, (uint64_t)(uintptr_t)&h) == 11,
+                  "pthread_rwlock_wrlock reports bare FreeBSD EDEADLK(11), not the host's number");
+            // No phantom hold: the two refusals recorded nothing, so exactly ONE hold is
+            // outstanding. The SECOND unlock being refused is the proof — had either refused
+            // acquire reached rw_acquired, COUNT would still be positive and this would return 0.
+            CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0, "the one real write hold releases");
+            CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0x80020001ull,
+                  "the refused wrlocks recorded NO hold (the next unlock is unmatched -> EPERM)");
+            CHECK(call1(RWtrywr, (uint64_t)(uintptr_t)&h) == 0,
+                  "the lock is undamaged after the refused wrlocks");
+            call1(RWun, (uint64_t)(uintptr_t)&h);
+        } else {
+            printf("  [SKIP] this host does not refuse a recursive write acquire (rc=%d) — the"
+                   " wrlock half of the #2024 arm cannot run here\n", wr_rc);
+        }
+        if (rd_rc == EDEADLK) {
+            CHECK(call1(RWwr, (uint64_t)(uintptr_t)&h) == 0, "wrlock granted (setup for the refusal)");
+            CHECK(call1(RWrd, (uint64_t)(uintptr_t)&h) == 0x8002000bull,
+                  "scePthreadRwlockRdlock reports encoded EDEADLK when the host REFUSED");
+            CHECK(call1(RWrdPosix, (uint64_t)(uintptr_t)&h) == 11,
+                  "pthread_rwlock_rdlock reports bare FreeBSD EDEADLK(11), not the host's number");
+            CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0, "the one real write hold releases");
+            CHECK(call1(RWun, (uint64_t)(uintptr_t)&h) == 0x80020001ull,
+                  "the refused rdlocks recorded NO hold (the next unlock is unmatched -> EPERM)");
+            CHECK(call1(RWtrywr, (uint64_t)(uintptr_t)&h) == 0,
+                  "the lock is undamaged after the refused rdlocks");
+            call1(RWun, (uint64_t)(uintptr_t)&h);
+        } else {
+            printf("  [SKIP] this host grants a read acquire while the caller write-holds (rc=%d) —"
+                   " the rdlock half of the #2024 arm cannot run here\n", rd_rc);
+        }
+    }
 
     // #2012: the accounting is PER LOCK, not per thread, and that distinction is load-bearing.
     // FreeBSD's umtx path refuses an unlock only when nothing is held (or when a non-owner tries to
