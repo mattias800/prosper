@@ -114,8 +114,11 @@ NameTable load_names(const std::string& dir, bool self_check) {
             // preferring either. This is the control on the name table itself.
             if (self_check && nid_hash(name) != nid) {
                 t.mismatches++;
-                printf("  [name-mismatch] %s: dump says %s, nid_hash() says %s\n",
-                       name.c_str(), nid.c_str(), nid_hash(name).c_str());
+                // stderr, not stdout: under --tsv these land above the header and corrupt the
+                // stream a consumer parses. The control's result belongs with the diagnostics,
+                // and its COUNT is reported in the scope block below in both modes.
+                fprintf(stderr, "  [name-mismatch] %s: dump says %s, nid_hash() says %s\n",
+                        name.c_str(), nid.c_str(), nid_hash(name).c_str());
             }
         }
     }
@@ -140,6 +143,39 @@ std::vector<fs::path> collect_modules(const std::string& input) {
     }
     std::sort(out.begin(), out.end());
     return out;
+}
+
+// Every report this tool emits is an ASSERTION OF ABSENCE — "these NIDs have no handler". An
+// absence is only as trustworthy as the population it was measured over, so no output may omit
+// that population. `prefix` is "# " for --tsv (comment lines a consumer skips) and "" for the
+// human report.
+//
+// The two divergences worth stating explicitly, because they SILENTLY REMOVE ROWS:
+//   * a module that failed to parse contributes no imports, so its NIDs read as "not imported
+//     by anything" rather than "not measured";
+//   * this scans the tree for modules, while the loader links a FIXED set (boot_program.cpp) —
+//     it takes exactly two entries from sce_module/, auto-discovers only Media/Plugins/, and
+//     never auto-links .sprx. So a NID satisfied here by a sibling export the loader would not
+//     have linked is excluded from the census but WOULD reach the dispatcher at runtime.
+void print_scope(const char* prefix, size_t total, size_t modules_read, size_t modules_failed,
+                 size_t unregistered, size_t shown, size_t satisfied_cross_module,
+                 size_t mismatches, const std::string& lib_filter, bool self_check) {
+    printf("%sscope: %zu distinct imported NIDs over %zu module(s) read, %zu unreadable\n",
+           prefix, total, modules_read, modules_failed);
+    printf("%sscope: %zu unregistered, %zu shown%s%s\n", prefix, unregistered, shown,
+           lib_filter.empty() ? "" : ", --lib filter=", lib_filter.c_str());
+    printf("%sscope: %zu binding(s) excluded as satisfied by a sibling module's export\n",
+           prefix, satisfied_cross_module);
+    if (self_check)
+        printf("%sscope: name-table self-check %zu mismatch(es)\n", prefix, mismatches);
+    if (modules_failed)
+        printf("%sWARNING: %zu module(s) did not parse — their imports are ABSENT from this "
+               "census, so a NID missing below may be unmeasured rather than unimported\n",
+               prefix, modules_failed);
+    printf("%sNOTE: module set is a tree scan, not the loader's link set (boot_program.cpp): "
+           "only Media/Plugins is auto-discovered, .sprx is never auto-linked, and sce_module "
+           "contributes exactly two. Cross-module exclusions are computed over THIS set.\n",
+           prefix);
 }
 
 void usage(const char* argv0) {
@@ -264,6 +300,8 @@ int main(int argc, char** argv) {
                    Hle::lookup(r->nid) != nullptr ? 1 : 0,
                    r->titles.size(), r->modules, libs.c_str(), tl.c_str());
         }
+        print_scope("# ", total, modules_read, modules_failed, unregistered, selected.size(),
+                    satisfied_cross_module, names.mismatches, lib_filter, self_check);
         return 0;
     }
 
@@ -275,11 +313,8 @@ int main(int argc, char** argv) {
         printf("%-13s %-52s %5zu  %s\n", r->nid.c_str(),
                r->name.empty() ? "?" : r->name.c_str(), r->titles.size(), libs.c_str());
     }
-    printf("\n%zu distinct imported NIDs across %zu module(s) (%zu unreadable);"
-           " %zu unregistered, %zu shown\n"
-           "%zu import binding(s) were satisfied by a sibling module's export and are excluded"
-           " — those never reach the dispatcher\n",
-           total, modules_read, modules_failed, unregistered, selected.size(),
-           satisfied_cross_module);
+    printf("\n");
+    print_scope("", total, modules_read, modules_failed, unregistered, selected.size(),
+                satisfied_cross_module, names.mismatches, lib_filter, self_check);
     return 0;
 }
