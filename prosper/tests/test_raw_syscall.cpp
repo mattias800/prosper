@@ -10,13 +10,22 @@
 // out-of-bounds read in the one code path that only runs when the process is already broken.
 // The assertions below read what the PIPE received, never the helper's own return, so a helper
 // that computed the right number and wrote the wrong one would still fail.
+//
+// raw_fmt_advance (#2161): the WRITE half of the same class. The same report sites accumulate
+// those snprintf returns into a running cursor, so a truncating chain left the cursor past the
+// end of the buffer and handed the NEXT call `sizeof b - n` (size_t: underflows to ~2^64) at
+// `b + n` (already past the end) — an out-of-bounds write onto the signal stack. Those arms put
+// the buffer against a PROT_NONE page so an overflowing append faults the test.
 #include "../src/host/raw_syscall.hpp"
 
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <csignal>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -53,6 +62,79 @@ int main() {
     return 0;
 }
 #else
+
+// ---------------------------------------------------------------------------------------------
+// #2161: accumulated snprintf offsets underflow their remaining capacity — an OOB WRITE.
+//
+// A report site builds a line by accumulating snprintf() returns. snprintf returns the WOULD-BE
+// length, so once any call truncates the cursor exceeds the buffer; the next call in the chain
+// then gets `cap - cursor` (size_t: underflows to ~2^64) at `cap + cursor` (already past the
+// end). These arms put the buffer flush against the end of a mapped page with the next page
+// PROT_NONE, so "writes past the end" is a fault rather than an assertion about silent damage.
+// ---------------------------------------------------------------------------------------------
+
+static const size_t kPage = 4096;
+
+// A `cap`-byte buffer whose LAST byte is the last byte of a mapped page; the next page is
+// PROT_NONE. `buf[cap - 1]` is the last legal store, `buf + cap` is one-past-the-end (a pointer
+// C permits forming) and every byte from there on faults.
+static char* guard_backed(size_t cap, void** region) {
+    char* r = (char*)mmap(nullptr, 2 * kPage, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (r == MAP_FAILED) return nullptr;
+    if (mprotect(r + kPage, kPage, PROT_NONE) != 0) { munmap(r, 2 * kPage); return nullptr; }
+    *region = r;
+    return r + kPage - cap;
+}
+
+// The chain under test, lifted from the [mb3watch] guest-stack dump in
+// src/host/exec_image_linux.cpp: no cursor guard at all, and its append embeds a variable-length
+// %s (guest_module_name returns names up to 25 characters), so ten captured frames format to
+// ~470 characters into 320 bytes. `cap` stands in for the `sizeof sb` of the real array; the
+// arithmetic is otherwise identical, including `cap - (size_t)sn` — which is exactly what
+// `sizeof sb - sn` computes, an int promoted into size_t.
+static const char* kModName = "AkVorbisHwAccelerator.prx";   // 25 chars: the longest real one
+static const unsigned long long kOff = 0x1122334455667788ull;  // 16 hex digits
+static const int kFrames = 10;                                 // the site's `found < 10` cap
+
+// MASTER'S SHAPE, verbatim — the red arm. Not a mutation written for this test: this is the
+// accumulation as it stands in the fault handler today.
+__attribute__((noinline)) static int chain_unclamped(char* sb, size_t cap) {
+    int sn = snprintf(sb, cap, "[mb3watch]   guest-stack:");
+    for (int i = 0; i < kFrames; i++)
+        sn += snprintf(sb + sn, cap - (size_t)sn, " %s+0x%llx", kModName, kOff);
+    sn += snprintf(sb + sn, cap - (size_t)sn, "\n");
+    return sn;
+}
+
+// The same chain with the fix: every cursor advance goes through raw_fmt_advance.
+__attribute__((noinline)) static int chain_clamped(char* sb, size_t cap) {
+    int sn = prosper::raw_fmt_advance(0, snprintf(sb, cap, "[mb3watch]   guest-stack:"), cap);
+    for (int i = 0; i < kFrames; i++)
+        sn = prosper::raw_fmt_advance(
+            sn, snprintf(sb + sn, cap - (size_t)sn, " %s+0x%llx", kModName, kOff), cap);
+    sn = prosper::raw_fmt_advance(sn, snprintf(sb + sn, cap - (size_t)sn, "\n"), cap);
+    return sn;
+}
+
+// Run `fn` in a child and report how it died. Returns the terminating signal, 0 for a clean
+// exit, or -1 if the child could not be created/reaped.
+static int signal_from_child(int (*fn)(char*, size_t), size_t cap) {
+    fflush(nullptr);
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        void* region = nullptr;
+        char* buf = guard_backed(cap, &region);
+        if (!buf) _exit(70);
+        int r = fn(buf, cap);
+        _exit(r == 0 ? 71 : 0);       // survived: the OOB write did not happen
+    }
+    int st = 0;
+    if (waitpid(pid, &st, 0) != pid) return -1;
+    return WIFSIGNALED(st) ? WTERMSIG(st) : 0;
+}
+
 // Run `body` with fd 2 redirected into a pipe, and return what the pipe received. The assertions
 // that matter are on `out.n` — the byte count the kernel actually accepted — so a regression that
 // passes an over-long length is caught by the bytes that arrive, not by any value the helper
@@ -204,6 +286,114 @@ int main() {
 
         munmap(region, pg * 2);
     }
+
+    // === #2161: the accumulation clamp ========================================================
+    {
+        const size_t cap = 320;                    // the real `char sb[320]`
+
+        // --- ARM 1 (RED, master's shape): the unclamped chain writes past the end -----------
+        // Cursor walk: 25, then +45 per frame -> 295 after six. The seventh is handed size 25
+        // for a 45-character append, so it truncates and returns 45: the cursor becomes 340,
+        // twenty bytes into the guard page. The eighth iteration stores there. This arm is
+        // master's code, not a mutation of it (the charter's positive-control rule) — it is the
+        // reason the fix exists, and it must die.
+        int sig = signal_from_child(chain_unclamped, cap);
+        CHECK(sig == SIGSEGV,
+              "unclamped accumulation did not fault: child signal %d (expected SIGSEGV=%d). "
+              "If this stops faulting the guard page is not where the test thinks it is.",
+              sig, SIGSEGV);
+        // The control for arm 1, and it is deliberately NOT drawn from the same place as the
+        // null: the identical unclamped chain over a buffer big enough for the whole line must
+        // exit cleanly. Without it, "the child died" is also consistent with a broken harness —
+        // a mismapped guard page, or a chain that faults for some reason other than capacity.
+        CHECK(signal_from_child(chain_unclamped, 1024) == 0,
+              "unclamped chain faulted even with room to spare — arm 1's fault is not the overrun");
+
+        // --- ARM 2 (GREEN): the clamped chain survives the same input ------------------------
+        CHECK(signal_from_child(chain_clamped, cap) == 0,
+              "clamped accumulation faulted or exited non-zero");
+
+        // --- ARM 3: what actually LANDED in the buffer, not what the helper returned ---------
+        // Run it in-process against the same guard page and read the bytes back.
+        void* guard_region = nullptr;
+        char* buf = guard_backed(cap, &guard_region);
+        CHECK(buf != nullptr, "guard-backed mapping failed: %s", strerror(errno));
+        if (buf) {
+            memset(buf, 0, cap);
+            int sn = chain_clamped(buf, cap);
+
+            // The untruncated line, built independently, is the oracle for the content.
+            char ref[1024];
+            int rn = snprintf(ref, sizeof ref, "[mb3watch]   guest-stack:");
+            for (int i = 0; i < kFrames; i++)
+                rn += snprintf(ref + rn, sizeof ref - (size_t)rn, " %s+0x%llx", kModName, kOff);
+            CHECK((size_t)rn > cap, "oracle line (%d bytes) must exceed cap %zu or arm 3 is vacuous",
+                  rn, cap);
+
+            CHECK(strlen(buf) == cap - 1,
+                  "truncated buffer should hold exactly cap-1 = %zu characters, holds %zu",
+                  cap - 1, strlen(buf));
+            CHECK(memcmp(buf, ref, cap - 1) == 0,
+                  "truncated content is not the prefix of the full line");
+            // The cursor SATURATES at cap — it does not stop at cap-1. That is the signal the
+            // flush reads as "this line truncated" (raw_fmt_len/raw_write_fmt, #2050): clamping
+            // to cap-1 instead would be memory-safe and SILENT.
+            CHECK(sn == (int)cap, "cursor should saturate at cap=%zu, got %d", cap, sn);
+
+            // --- ARM 4: saturation is sticky AND does not eat the last content byte ----------
+            // This is what separates the fix from the obvious alternative. With a cap-1 clamp,
+            // each further append gets size 1 and writes its NUL over buf[cap-1] — memory-safe,
+            // but it destroys the last character of the report and still reports no truncation.
+            // With the cap clamp the size is 0, so snprintf writes nothing at all.
+            char before[cap];
+            memcpy(before, buf, cap);
+            for (int i = 0; i < 3; i++)
+                sn = prosper::raw_fmt_advance(
+                    sn, snprintf(buf + sn, cap - (size_t)sn, " %s+0x%llx", kModName, kOff), cap);
+            CHECK(sn == (int)cap, "cursor must stay saturated after further appends, got %d", sn);
+            CHECK(memcmp(before, buf, cap) == 0,
+                  "appends after saturation modified the buffer — the report lost its tail");
+            munmap(guard_region, 2 * kPage);
+        }
+    }
+    {
+        // --- ARM 5: a chain that FITS must not be clamped ------------------------------------
+        // Without this, "always return cap-1" passes every arm above. The cursor has to be the
+        // true byte count so a complete line is written complete and reports no truncation.
+        const size_t cap = 64;
+        void* guard_region = nullptr;
+        char* buf = guard_backed(cap, &guard_region);
+        CHECK(buf != nullptr, "guard-backed mapping failed: %s", strerror(errno));
+        if (buf) {
+            int n = prosper::raw_fmt_advance(0, snprintf(buf, cap, "[fits]"), cap);
+            n = prosper::raw_fmt_advance(n, snprintf(buf + n, cap - (size_t)n, " a=%d", 7), cap);
+            n = prosper::raw_fmt_advance(n, snprintf(buf + n, cap - (size_t)n, " b=%d\n", 9), cap);
+            CHECK(n == (int)strlen(buf), "fitting chain: cursor %d != bytes written %zu",
+                  n, strlen(buf));
+            CHECK((size_t)n < cap, "fitting chain must not report truncation (n=%d cap=%zu)",
+                  n, cap);
+            CHECK(strcmp(buf, "[fits] a=7 b=9\n") == 0, "fitting chain content wrong: '%s'", buf);
+
+            // --- ARM 6: the exact-fit boundary --------------------------------------------
+            // cap-1 content bytes is a COMPLETE line (no truncation); one more is not. An
+            // off-by-one in the saturation test (`>` for `>=`) fails exactly here.
+            char fill[cap];
+            memset(fill, 'x', sizeof fill); fill[cap - 1] = '\0';        // 63 characters
+            int e = prosper::raw_fmt_advance(0, snprintf(buf, cap, "%s", fill), cap);
+            CHECK(e == (int)cap - 1, "exact fit should give cap-1=%zu, got %d", cap - 1, e);
+            CHECK((size_t)e < cap, "an exactly-filling line must not report truncation");
+            e = prosper::raw_fmt_advance(e, snprintf(buf + e, cap - (size_t)e, "y"), cap);
+            CHECK(e == (int)cap, "one byte past an exact fit must saturate, got %d", e);
+            munmap(guard_region, 2 * kPage);
+        }
+    }
+    // --- ARM 7: degenerate inputs are absorbed, never propagated -----------------------------
+    // A negative snprintf return (encoding error, contents indeterminate) saturates: fail-visible
+    // beats a line that silently drops an append. A zero cap has nowhere to write.
+    CHECK(prosper::raw_fmt_advance(10, -1, 64) == 64, "negative snprintf return must saturate");
+    CHECK(prosper::raw_fmt_advance(0, 5, 0) == 0, "cap 0 must stay at 0");
+    CHECK(prosper::raw_fmt_advance(-5, 3, 64) == 3, "a negative cursor must be treated as 0");
+    CHECK(prosper::raw_fmt_advance(64, 5, 64) == 64, "an already-saturated cursor must not move");
 
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     printf("raw_syscall: all checks passed\n");

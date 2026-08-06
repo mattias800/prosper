@@ -13,6 +13,57 @@
 // x86-64 asm branch; the POSIX fallback branch is plain libc (safe there, see its comment).
 #include <cerrno>
 #include <cstdint>
+#include <climits>
+
+namespace prosper {
+
+// --- accumulating a report line: clamp the CURSOR, not just the size ------------------------
+// Report sites build a diagnostic line by accumulating snprintf() returns into a running offset:
+//
+//     int n = snprintf(b, sizeof b, "...");
+//     n += snprintf(b + n, sizeof b - (size_t)n, "...");     // <-- both operands wrong on truncation
+//
+// snprintf() returns the length it WOULD have written. Once any call in the chain truncates,
+// `n > sizeof b`, and the next call in the same chain is handed `sizeof b - n` — size_t
+// arithmetic, so it underflows to roughly 2^64 — at `b + n`, which is already past the end of
+// the object. That is an out-of-bounds WRITE, and it is worse than the read-side sibling (#2050)
+// in exactly the situation these sites exist for: the fault handler corrupts its own signal
+// stack while reporting the fault it was called to describe. (#2161.)
+//
+// This is the whole contract: given the current cursor, the snprintf() return for the append
+// just made, and the destination array's `cap`, return the new cursor — SATURATED AT `cap`.
+//
+// Saturating at `cap` rather than `cap - 1` is deliberate, and it is what makes the fix compose
+// with the read side instead of fighting it:
+//   * `buf + n` stays inside [buf, buf + cap] — at worst one-past-the-end, a pointer C permits
+//     forming, and `cap - n` is >= 0 and never underflows.
+//   * At saturation `cap - n` is 0, and snprintf() with size 0 writes nothing at all (C11
+//     7.21.6.5), so every later append in the chain is a no-op rather than an overflow. The
+//     cursor is sticky: once cut, always cut.
+//   * `n == cap` is exactly the condition raw_fmt_len()/raw_write_fmt() already read as
+//     "this line truncated" (#2050), so the flush writes the `cap - 1` bytes that really landed
+//     and emits the existing truncation marker. Truncation stays visible through ONE contract;
+//     no second marker, no per-chain "did it truncate" flag to thread through nine call sites.
+// Clamping to `cap - 1` instead would be memory-safe and silent: the flush would see a
+// full-looking cursor, print no marker, and each post-saturation append would write its NUL over
+// the last content byte. A silently shortened fault report is its own trap — that is the whole
+// reason #2050 added a marker.
+//
+// A negative `written` (snprintf encoding error, which leaves the array contents indeterminate)
+// saturates too: fail-visible beats a line that silently drops an append it could not format.
+// Async-signal-safe: integer arithmetic only — no allocation, no lock, no errno, no TLS.
+// Defined above the platform guard because it is pure arithmetic: Windows/MinGW-clean, and
+// unit-testable on any host (see tests/test_raw_syscall.cpp).
+inline int raw_fmt_advance(int cursor, int written, uint64_t cap) {
+    const uint64_t lim = cap > (uint64_t)INT_MAX ? (uint64_t)INT_MAX : cap;
+    if (lim == 0) return 0;
+    const uint64_t at = cursor > 0 ? (uint64_t)cursor : 0;   // a bad cursor cannot make it worse
+    if (at >= lim || written < 0) return (int)lim;           // already cut, or nothing usable landed
+    const uint64_t next = at + (uint64_t)written;            // 64-bit: the int sum could overflow
+    return next < lim ? (int)next : (int)lim;
+}
+
+} // namespace prosper
 
 namespace prosper {
 
