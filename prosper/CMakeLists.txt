@@ -345,6 +345,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_false_success_nids PRIVATE prosper_core)
   add_test(NAME false_success_nids COMMAND test_false_success_nids)
 
+  # #2004: sceAppContentAddcontUnmount releases the claim the mount takes, so a mount/unmount/
+  # re-mount cycle works instead of being permanently BUSY. Pure, no game dump.
+  add_executable(test_addcontent_unmount tests/test_addcontent_unmount.cpp)
+  target_link_libraries(test_addcontent_unmount PRIVATE prosper_core)
+  add_test(NAME addcontent_unmount COMMAND test_addcontent_unmount)
+
   # libSceSysmodule state query (#2002): IsLoaded answers from prosper's own load history, so a
   # title that gates its initialization on UNLOADED stops skipping that initialization.
   add_executable(test_sysmodule_state tests/test_sysmodule_state.cpp)

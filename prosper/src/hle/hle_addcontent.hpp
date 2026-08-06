@@ -84,9 +84,23 @@ enum class AddcontentMountResult {
 using AddcontentMountWriter = bool (*)(uint64_t, const void*, std::size_t);
 
 // Atomically validate, write, and claim a configured mount. Successful output is the complete
-// zero-padded 16-byte SceAppContentMountPoint object; repeated mounts remain BUSY until unmount is
-// implemented. A failed guest write does not consume the mount.
+// zero-padded 16-byte SceAppContentMountPoint object. A failed guest write does not consume the
+// mount. The claim is released by addcontent_unmount below.
 AddcontentMountResult addcontent_mount(uint32_t service_label, std::string_view entitlement_label,
                                        uint64_t output_address, AddcontentMountWriter writer);
+
+enum class AddcontentUnmountResult {
+    Unmounted,
+    NotMounted,   // the path is not a currently-claimed mount point (or is not a mount point at all)
+};
+
+// Release a claim taken by addcontent_mount, identified by the mount point it handed back.
+//
+// This is the inverse of the claim and NOTHING else: it clears an entry's `mounted` flag. It grants
+// no entitlement, changes no ownership answer, and cannot make absent content present — an unknown
+// or already-free mount point is reported as NotMounted rather than quietly accepted. That
+// fail-visible direction is also what makes the handler safe under residual uncertainty about the
+// guest's argument: an argument we fail to recognise yields an error, never a false success.
+AddcontentUnmountResult addcontent_unmount(std::string_view guest_mount_point);
 
 } // namespace prosper
