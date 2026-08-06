@@ -5169,8 +5169,83 @@ int main() {
     uint32_t badT11 = 0; for (uint32_t i=0;i<N&&gotT11.size()==N;i++) if (gotT11[i]!=expT11[i]) badT11++;
     CHECK(gotT11.size()==N && badT11==0, "T11: v_cmp_gt_f32_sdwa applies |src0| before comparing");
 
+    // ---- T11b / T11c / T11b2 / T11b3: the 32-bit integer VOPC SDWA source select (#2130) ----
+    // These arms compare an inline `1` against ONE selected sub-dword field of v63. The shared `inX`
+    // they used to run on could not observe that: `inX[i] = (float)i` has a zero low byte in all 128
+    // patterns and a high word that is never 0x0001, and no pattern is the dword 1 — so BYTE_0 != 1,
+    // WORD_1 != 1 and the whole dword != 1 agreed on every single lane, and both arms stayed green
+    // with the source select deleted from the lowering outright.
+    //
+    // `inSdwa` is built from hand-written bit patterns instead, each present for a stated reason: for
+    // every candidate a wrong lowering could pick (the four bytes, the two words, the whole dword)
+    // there are lanes where that candidate's answer differs from the selected field's. Every pattern
+    // is a finite float so the value round-trips the f32 storage buffer unchanged.
+    const uint32_t sdwaPatterns[] = {
+        0x3F800001u,   // BYTE_0 = 01, dword != 1                     -> BYTE_0 vs DWORD
+        0x40000001u,   // same BYTE_0, differs ONLY outside it        -> the hand-built pair, see below
+        0x40000101u,   // BYTE_0 = 01 while WORD_0 = 0x0101           -> BYTE_0 vs WORD_0
+        0x40000102u,   // BYTE_1 = 01 while BYTE_0 = 02               -> BYTE_0 vs BYTE_1
+        0x40010002u,   // BYTE_2 = 01 while BYTE_0 = 02               -> BYTE_0 vs BYTE_2
+        0x01000002u,   // BYTE_3 = 01 while BYTE_0 = 02               -> BYTE_0 vs BYTE_3
+        0x00010002u,   // WORD_1 = 0001, dword != 1                   -> WORD_1 vs DWORD
+        0x00010000u,   // WORD_1 = 0001, differs ONLY outside it      -> the hand-built pair, see below
+        0x0001BEEFu,   // WORD_1 = 0001 while WORD_0 = 0xBEEF         -> WORD_1 vs WORD_0/BYTE_0/BYTE_1
+        0x02010000u,   // BYTE_2 = 01 while WORD_1 = 0x0201           -> WORD_1 vs BYTE_2
+        0x00000001u,   // the whole dword IS 1: the raw answer flips the OTHER way for both arms
+        0x3F800000u,   // 1.0f — no field equals 1 (the only class the old `inX` reached)
+        0x00000201u,   // BYTE_0 = 01, every other candidate != 1
+        0xC0000001u,   // BYTE_0 = 01 with the sign bit set
+        0x3F8000FFu,   // BYTE_0 = 0xFF — the sign-extension counterexample for T11b2
+        0x40000064u,   // BYTE_0 = 100 — T11b2's compare boundary
+    };
+    std::vector<float> inSdwa(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint32_t bits = sdwaPatterns[i % std::size(sdwaPatterns)];
+        std::memcpy(&inSdwa[i], &bits, 4);
+    }
+    // A fixture that cannot separate the selected field from the alternatives proves nothing about
+    // the select however green it goes, so establish the separation on the HOST first — and by hand,
+    // not from whatever produced the arms. `sdwa_field` mirrors the RDNA2 source-select encoding
+    // (0..3 = BYTE_0..BYTE_3, 4..5 = WORD_0/WORD_1, 6 = DWORD); it is used only to count how many
+    // lanes each wrong candidate would get wrong, never to compute an expected output.
+    auto sdwa_field = [](uint32_t x, uint32_t sel) -> uint32_t {
+        if (sel <= 3u) return (x >> (8u * sel)) & 0xFFu;
+        if (sel <= 5u) return (x >> (16u * (sel - 4u))) & 0xFFFFu;
+        return x;
+    };
+    auto sdwa_min_separation = [&](uint32_t truth) {
+        uint32_t worst = UINT32_MAX;
+        for (uint32_t alt = 0; alt <= 6u; ++alt) {
+            if (alt == truth) continue;
+            uint32_t differ = 0;
+            for (uint32_t i = 0; i < N; ++i) {
+                const uint32_t x = bits_of(inSdwa[i]);
+                if ((sdwa_field(x, truth) != 1u) != (sdwa_field(x, alt) != 1u)) ++differ;
+            }
+            worst = std::min(worst, differ);
+        }
+        return worst;
+    };
+    const uint32_t sepB = sdwa_min_separation(0), sepC = sdwa_min_separation(5),
+                   sepB3 = sdwa_min_separation(2);
+    printf("  SDWA fixture separation: BYTE_0 >= %u, WORD_1 >= %u, BYTE_2 >= %u lanes"
+           " (the old inX separated 0, 0, 0)\n", sepB, sepC, sepB3);
+    CHECK(sepB > 0, "T11b's inputs separate BYTE_0 from every other source select");
+    CHECK(sepC > 0, "T11c's inputs separate WORD_1 from every other source select");
+    CHECK(sepB3 > 0, "T11b3's inputs separate BYTE_2 from every other source select");
+    // The hand-built instances the separation counts above are checked against: 0x3F800001 and
+    // 0x40000001 differ only OUTSIDE BYTE_0, so the correct lowering answers `false` for both while
+    // any whole-dword lowering answers `true` for both. Same shape for WORD_1 with 0x00010000 /
+    // 0x0001BEEF, which differ only outside the selected high word.
+    CHECK(((0x3F800001u & 0xFFu) == 1u) && ((0x40000001u & 0xFFu) == 1u) &&
+          (0x3F800001u != 1u) && (0x40000001u != 1u) &&
+          (((0x00010000u >> 16) & 0xFFFFu) == 1u) && (((0x0001BEEFu >> 16) & 0xFFFFu) == 1u) &&
+          (0x00010000u != 1u) && (0x0001BEEFu != 1u),
+          "the hand-built SDWA pairs really do put 1 in the selected field and not in the dword");
+
     // Astro Bot's exact visibility-kernel compare: move the input bits to v63, compare integer 1
     // against its zero-extended low byte, then materialize the VCC result as float 0/1.
+    // (llvm-mc gfx1030: `v_cmp_ne_u32_sdwa vcc_lo, 1, v63 src0_sel:DWORD src1_sel:BYTE_0`.)
     const uint32_t codeT11b[] = {
         0x7e7e0300u,               // v_mov_b32 v63, v0
         0x7d8a7ef9u, 0x00860081u,  // v_cmp_ne_u32 vcc, 1, v63 src1_sel:BYTE_0
@@ -5179,15 +5254,20 @@ int main() {
     };
     std::vector<uint32_t> spvT11b = recompile_valu(codeT11b, sizeof(codeT11b)/4, 1, 0);
     CHECK(!spvT11b.empty(), "recompiled T11b (Astro integer VOPC SDWA BYTE_0) -> SPIR-V");
-    std::vector<float> gotT11b = prosper::test::run_compute(spvT11b, inX, N, N);
-    uint32_t badT11b = 0;
-    for (uint32_t i = 0; i < N && gotT11b.size() == N; ++i)
-        if (gotT11b[i] != (((bits_of(inX[i]) & 0xFFu) != 1u) ? 1.0f : 0.0f)) ++badT11b;
+    std::vector<float> gotT11b = prosper::test::run_compute(spvT11b, inSdwa, N, N);
+    uint32_t badT11b = 0, trueT11b = 0;
+    for (uint32_t i = 0; i < N && gotT11b.size() == N; ++i) {
+        const bool ne = (bits_of(inSdwa[i]) & 0xFFu) != 1u;
+        if (ne) ++trueT11b;
+        if (gotT11b[i] != (ne ? 1.0f : 0.0f)) ++badT11b;
+    }
+    CHECK(trueT11b > 0 && trueT11b < N, "T11b exercises both compare results");
     CHECK(gotT11b.size()==N && badT11b==0,
-          "T11b: unsigned SDWA compare zero-extends the selected source byte");
+          "T11b: the unsigned SDWA compare reads the selected source BYTE_0, not the whole dword");
 
     // Its later paired form selects WORD_1 and updates EXEC instead of VCC. Exact live words;
     // compilation proves the CMPX opcode family is normalized before the integer SDWA admission.
+    // Masked lanes never store, so they read back the zero-initialised output slot (as kernel 16).
     const uint32_t codeT11c[] = {
         0x7e7e0300u,               // v_mov_b32 v63, v0
         0x7daa7ef9u, 0x05860081u,  // v_cmpx_ne_u32 1, v63 src1_sel:WORD_1
@@ -5196,14 +5276,68 @@ int main() {
     };
     std::vector<uint32_t> spvT11c = recompile_valu(codeT11c, sizeof(codeT11c)/4, 1, 0);
     CHECK(!spvT11c.empty(), "recompiled T11c (Astro CMPX SDWA WORD_1) -> SPIR-V");
-    std::vector<float> gotT11c = prosper::test::run_compute(spvT11c, inX, N, N);
-    uint32_t badT11c = 0;
+    std::vector<float> gotT11c = prosper::test::run_compute(spvT11c, inSdwa, N, N);
+    uint32_t badT11c = 0, liveT11c = 0;
     for (uint32_t i = 0; i < N && gotT11c.size() == N; ++i) {
-        const bool active = ((bits_of(inX[i]) >> 16) & 0xFFFFu) != 1u;
-        if (gotT11c[i] != (active ? 1.0f : inX[i])) ++badT11c;
+        const bool active = ((bits_of(inSdwa[i]) >> 16) & 0xFFFFu) != 1u;
+        if (active) ++liveT11c;
+        if (gotT11c[i] != (active ? 1.0f : 0.0f)) ++badT11c;
     }
+    CHECK(liveT11c > 0 && liveT11c < N, "T11c exercises both active and EXEC-masked lanes");
     CHECK(gotT11c.size()==N && badT11c==0,
-          "T11c: CMPX compares the zero-extended high word and predicates the following write");
+          "T11c: CMPX compares the selected source WORD_1 and predicates the following write");
+
+    // T11b2 (synthesized, llvm-mc gfx1030 verified — the live Astro pair cannot reach this): the
+    // extension direction. SDWA zero-fills a selected field unless its SEXT bit is set, and the
+    // decoder refuses SEXT for integer VOPC, so the extracted byte must be 0..255 even under a
+    // SIGNED compare. `v_cmp_lt_i32_sdwa vcc_lo, v63, v62 src0_sel:BYTE_0` with v62 = 100 answers
+    // `byte < 100`; a sign-extending extract would call every byte >= 0x80 negative and answer
+    // `true` there instead. The NE-against-1 forms above cannot see this at all — sext(b) == 1 and
+    // zext(b) == 1 hold for exactly the same b — which is why this is a separate kernel.
+    const uint32_t codeT11b2[] = {
+        0x7e7e0300u,               // v_mov_b32 v63, v0
+        0x7e7c02ffu, 0x00000064u,  // v_mov_b32 v62, 100
+        0x7d027cf9u, 0x0600003fu,  // v_cmp_lt_i32_sdwa vcc_lo, v63, v62 src0_sel:BYTE_0
+        0xd5010000u, 0x01a9e480u,  // v_cndmask_b32_e64 v0, 0, 1.0, vcc_lo
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvT11b2 = recompile_valu(codeT11b2, std::size(codeT11b2), 1, 0);
+    CHECK(!spvT11b2.empty(), "recompiled T11b2 (signed integer VOPC SDWA BYTE_0) -> SPIR-V");
+    std::vector<float> gotT11b2 = prosper::test::run_compute(spvT11b2, inSdwa, N, N);
+    uint32_t badT11b2 = 0, ltT11b2 = 0, sextT11b2 = 0;
+    for (uint32_t i = 0; i < N && gotT11b2.size() == N; ++i) {
+        const uint32_t byte0 = bits_of(inSdwa[i]) & 0xFFu;
+        const bool lt = (int32_t)byte0 < 100;
+        if (lt) ++ltT11b2;
+        if (lt != ((int32_t)(int8_t)byte0 < 100)) ++sextT11b2;   // lanes a sign-extending extract breaks
+        if (gotT11b2[i] != (lt ? 1.0f : 0.0f)) ++badT11b2;
+    }
+    CHECK(ltT11b2 > 0 && ltT11b2 < N && sextT11b2 > 0,
+          "T11b2's inputs reach both compare results AND the sign-extension counterexample");
+    CHECK(gotT11b2.size()==N && badT11b2==0,
+          "T11b2: an integer SDWA source select ZERO-extends, so a selected byte is never negative");
+
+    // T11b3 (synthesized, llvm-mc gfx1030 verified): the byte OFFSET. T11b and T11b2 both select
+    // BYTE_0, whose offset is zero, so a lowering that hard-coded offset 0 for every byte select
+    // would satisfy them both. This is T11b's word with src1_sel:BYTE_2 and nothing else changed.
+    const uint32_t codeT11b3[] = {
+        0x7e7e0300u,               // v_mov_b32 v63, v0
+        0x7d8a7ef9u, 0x02860081u,  // v_cmp_ne_u32 vcc, 1, v63 src1_sel:BYTE_2
+        0xd5010000u, 0x01a9e480u,  // v_cndmask_b32_e64 v0, 0, 1.0, vcc
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvT11b3 = recompile_valu(codeT11b3, std::size(codeT11b3), 1, 0);
+    CHECK(!spvT11b3.empty(), "recompiled T11b3 (integer VOPC SDWA BYTE_2) -> SPIR-V");
+    std::vector<float> gotT11b3 = prosper::test::run_compute(spvT11b3, inSdwa, N, N);
+    uint32_t badT11b3 = 0, trueT11b3 = 0;
+    for (uint32_t i = 0; i < N && gotT11b3.size() == N; ++i) {
+        const bool ne = ((bits_of(inSdwa[i]) >> 16) & 0xFFu) != 1u;
+        if (ne) ++trueT11b3;
+        if (gotT11b3[i] != (ne ? 1.0f : 0.0f)) ++badT11b3;
+    }
+    CHECK(trueT11b3 > 0 && trueT11b3 < N, "T11b3 exercises both compare results");
+    CHECK(gotT11b3.size()==N && badT11b3==0,
+          "T11b3: a BYTE_2 select reads bits [23:16], not the byte at offset 0");
 
     // Exact Astro visibility-kernel word. Both unwritten sources are architectural undefined on
     // hardware but initialize to zero in the test shell, so XNOR(0,0) must produce all one bits.
