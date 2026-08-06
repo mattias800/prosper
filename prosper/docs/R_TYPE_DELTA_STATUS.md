@@ -1,16 +1,17 @@
 # R-Type Delta: HD Boosted status
 
-`PPSA26414` is **rung 1** — the publisher logo and the whole opening movie render as real,
-recognizable, **full-colour** frames from the live renderer. The green/magenta chroma cast the rung-1
-frames carried is fixed (#2005): the title declares both NV12 planes as one-layer 2D arrays, and the
-renderer's AvPlayer chroma test required `DIM=2D`, so the chroma plane took the coverage broadcast.
-A default launch still dies first on the title's logged-in-user startup race (#1746), which is now
-measured to be decided by how fast the host completes the asset load — host single-thread CPU speed
-and, more sharply, host page-cache state — and is a product decision rather than an open
-investigation. The reproduction is `tools/dropcache.py` before a default launch. Start from
-**`## Host page-cache state decides the race`**, **`## Rung 1 reached`** and
-**`## The chroma cast, solved`** below; everything before them is the older movie-pipeline record
-(#1753, #1807, both closed).
+`PPSA26414` is **rung 2** — the publisher logo, the whole opening movie, the **title screen** and the
+attract-mode demonstration all render as real, full-colour frames from the live renderer, on an
+unmodified binary and an unmodified guest. The green/magenta chroma cast the rung-1 frames carried is
+fixed (#2005): the title declares both NV12 planes as one-layer 2D arrays, and the renderer's
+AvPlayer chroma test required `DIM=2D`, so the chroma plane took the coverage broadcast. A default
+launch must first win the title's own logged-in-user startup race (#1746); the supported way to do
+that is to evict the dump from the host page cache with `tools/dropcache.py` before launching, which
+is measured, deterministic, and changes nothing about how the title is run. That race is a product
+decision rather than an open investigation. Start from **`## Rung 2 reached`** at the end of this
+document, then **`## Host page-cache state decides the race`**, **`## Rung 1 reached`** and
+**`## The chroma cast, solved`**; everything before those is the older movie-pipeline record (#1753,
+#1807, both closed) and the #1746 investigation.
 
 ## Movie resource failure
 
@@ -448,6 +449,11 @@ It also has two immediate practical consequences:
 | Prosper answers some call in the 13–24 ms between the INPUT worker's creation and `DLLLoadStart` (`sceKernelLoadStartModule`, the NP/Scream/audio initialisations) ~140 ms too fast, and that is where the fidelity gap lives | **Not supported, and no longer needed.** It was the leading candidate once I/O and GPU were excluded, but the CPU-contention arm accounts for the entire deficit inside the *load* itself, and it does so with an executed positive outcome. Recorded so the next reader does not chase a module-load latency model for which this repository has no oracle. | this doc, #1746 |
 | The chroma cast in the corrected movie replay is only a capture-provenance artifact, so live output may be correct | **Falsified live.** With the race won by host CPU contention, the unmodified default route renders the publisher logos and the whole opening movie with the *same* green/magenta cast as the replay. Live chroma is now verified broken, not merely unverified. Tracked in #2005. | throttled `screenshot` route on `bffa5e25`, #2005 |
 | A **synchronous** user-service API should report the already-signed-in user immediately, and prosper answering it empty/zero/error is the real defect | **Falsified by the import census, the call graph and a live breakpoint census.** The eboot imports exactly three UserService NIDs — `sceUserServiceInitialize`, `sceUserServiceGetInitialUser`, `sceUserServiceGetEvent` — and `title_Release.prx` imports none (only 21 libc + 2 libkernel). `GetLoginUserIdList`/`GetUserName`/`GetUserNumber`/`GetForegroundUser` are never imported, so their answers are unreachable. `GetInitialUser` **is** called, exactly once, and prosper answers it correctly: a gdb census records the single call with `out=0x4106f419c`, the global `eboot+0x6f419c` that `InputSystem::Init` passes it, which is read by the save-data and NP/UDS paths and never copied into the vector. The vector at `eboot+0x6f41a8` has one producer (`eboot+0x23690`) with one caller (the LOGIN arm at `eboot+0x23def`) fed by one source (`sceUserServiceGetEvent`) on one thread (`eboot+0x49070`, after its own `Sleep(400)`); the alternative caller `eboot+0x49130` is unreferenced dead code. No API answer can populate it earlier. | `self_dump --symbols`, `tools/re/xref.py`, gdb census on `4d7a2ded`, #1746 |
+| The post-movie phase submits no draws, or its correctly rendered pass is published at the wrong extent and dropped | **Falsified by the captured flat frame.** The submit carries **1,781 draws and 3 dispatches**, and the 1600×960 scene target it fills is complete, recognizable content (13,765 distinct colours). No `PUBLISH DROPPED` / `PRESENT SOURCE EXTENT MISMATCH` fires. Only the final composite draw collapses. | bundle at present 2857, `--inspect-only`, #2006 |
+| The composite samples a blank render target — the guest bytes for `0x20148b0000` are all zero (`nz=0`), so prosper never resolves it to the live RTT | **Falsified.** `PROSPER_RESOURCE_HASH_DIM=1600x960` reports `rtt=1 rgb_nonblack=840369 alpha_nonzero=843710` at both composite draws; the zero guest bytes are just an RTT prosper never writes back. The source was always correct. | replay of submit 2858 on `c9e2588e`, #2006 |
+| The `FORCE_UNNORMALIZED` texel-coordinate lowering landed for the movie (#1807) also collapses the post-movie composite | **Falsified byte-for-byte.** `PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE=1` reproduces the flat frame at the identical replay hash `1f521f254fbb8b83`; the composite's S# does not set the bit. | replay A/B on `c9e2588e`, #2006 |
+| The flat composite is a wrong sampler LOD, a wrong image view, or a degenerate/uncovered quad | **Falsified.** `PROSPER_GEOM_PROBE=1780` returns a correct full-screen quad (6/6 vertices on-screen, clip bbox exactly ±1), and `PROSPER_FS_TAP=1780:12/:13` shows the interpolated coordinate is constant at the source rect's own origin — the sample location never varies, so nothing downstream of it can be the cause. | `gpu_replay` probes on `c9e2588e`, #2006 |
+| The post-movie collapse shares #2005's cause (the AvPlayer chroma plane declared as a one-layer 2D array) | **Falsified before the fix, by a lane that landed #2037 and re-measured.** With the chroma fix on the branch the movie reaches 315,101 distinct colours while the post-movie phase stayed at exactly 1 colour for 39 consecutive samples. Two independent defects. | #2037 branch route on `e58d387c`, #2006 |
 | Prosper's guest reads are unrealistically fast because they come from the host page cache, so a storage-latency model is the missing fidelity | **Half true, and it still is not the fix.** Page-cache state really does decide this race: with only the dump's pages evicted, INPUT→`DLLInit` is 779–1158 ms across five arms and the title **boots** every time, against 289–362 ms and five SIGSEGVs warm — and the least-contended pair points the same way (warm at load 13.4 faults, cold at load 14.7 boots), so it is not peer CPU load. But the cold arm is this box's **external USB SSD** at ~0.25 GB/s, not a PS5: a PS5 internal SSD delivers the same 101.4 MB in tens of ms, i.e. it behaves like the *warm* arm. A PS5-faithful storage model would therefore add almost nothing and cannot be justified by this race. The measurable consequence is an instrument rule, not a fix: **no startup-timing number for this title is valid unless the page-cache state is recorded.** | cold/warm A/B on `4d7a2ded`, § Host page-cache state, #1746 |
 
 ## Next frontier
@@ -635,3 +641,88 @@ reached**: no title screen appears.
 | The renderer has no AvPlayer chroma contract on the live path (only replay lacks it) | **Falsified.** The contract exists and is reached; it *rejected* the plane. The live verdict log names the clause: `dim=5 -> not-narrow-linear-rg8`. | `PROSPER_AVPCHROMA_LOG`, #2005 |
 | Requiring `DIM=2D` for an AvPlayer plane is safe because planes are 2D surfaces | **Falsified by the title's own descriptors.** R-Type declares both planes `DIM=2D_ARRAY` with one layer — byte-identical to 2D, and already treated as such by the padded-row read, the source-address computation and the created 2D image view in the same function. | live `[avpchroma]` census, #2005 |
 | The `(U,U)` broadcast seen in the #1807 replay was only a capture-provenance artifact | **Superseded.** The replay's missing row-pitch provenance was real, but it was not the only way to reach the broadcast: live rendering reached it through the `img_dim` clause with full provenance present. Two independent causes, one signature. | #1807, #2005 |
+
+## Rung 2 reached (2026-08-06): the post-movie flat colour was a lost NGG saved-EXEC wave mask
+
+The title screen renders. `#2006`'s single-colour post-movie phase was **not** a missing draw, a
+dropped publish, or a blank composite source: the phase renders its whole scene correctly into an
+offscreen 1600×960 target and only the final upscale/composite draw collapses.
+
+<p align="center">
+  <img src="../../assets/screenshots/rtype-delta-title.png" alt="R-Type Delta: HD Boosted title screen with the PRESS prompt, rendered live at 1920x1080"><br>
+  <sub>Rung 2 — <code>tools/screenshot</code>, default route, unmodified binary and guest, page cache
+  evicted with <code>tools/dropcache.py</code>. Sample 07 of 22, guest frame ~1,500.</sub>
+</p>
+
+<p align="center">
+  <img src="../../assets/screenshots/rtype-delta-force-select.png" alt="R-Type Delta attract mode: the R-9 and its Force device on the DEMONSTRATION screen"><br>
+  <sub>The attract sequence that follows, same route, sample 12 of 22.</sub>
+</p>
+
+### How the frame was dissected
+
+`PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE` grabbed one flat present (submit 2858) once a lightweight
+sample proved the phase, and every step below is offline `gpu_replay` on that one bundle:
+
+| Question | Answer |
+| --- | --- |
+| Does the phase submit draws? | **1,781 draws + 3 dispatches** in the captured frame. |
+| Where do they go? | 1,779 → `0x20148b0000` (1600×960), then one → `0x20155d0000`, one → the 1920×1080 scanout. |
+| Is the scene target real? | `--output-target-after 1778:0x20148b0000` renders the complete "DEMONSTRATION" attract screen — 13,765 distinct colours, 25,616 sampled pixels above 64. |
+| Is the composite's source bound? | `PROSPER_RESOURCE_HASH_DIM=1600x960` reports `rtt=1 rgb_nonblack=840369` for the sampled resource at both composite draws. |
+| So what does the composite compute? | `PROSPER_FS_TAP=1780:12` / `:13` — the interpolated texture coordinate is **constant across the whole quad**, at exactly `(0, 16/960)`, the source rect's own origin. |
+| And the geometry? | `PROSPER_GEOM_PROBE=1780` — a correct full-screen quad, `(-1,1)…(1,-1)`, 6 of 6 vertices on-screen. |
+
+A constant varying over a correct quad means the value the VS exported never varied, so the whole
+1920×1080 output sampled one texel of a fully-rendered scene.
+
+### The mechanism
+
+R-Type's AGC fetch prologue is a merged-NGG one. For each attribute it selects between the ABI's
+vertex-id (`v5`) and instance-id (`v8`) VGPRs with a wave-uniform pair:
+
+```
+s_mov_b64    s[16:17], exec          ; saved ONCE, at the top of the prologue
+...
+s_cmp_lg_u32 0, s106                 ; s106 = bit 26 of this attribute's control word
+s_cselect_b64 s[4:5], s[16:17], 0    ; <- the saved copy, not `exec` by name
+v_cndmask_b32_e64 v3, v8, v5, s[4:5]
+buffer_load_format_x v3, v3, s[0:3], s106 idxen
+```
+
+`resolve_dynamic_fetch`'s NGG index-provenance fold (`gpu_executor.cpp`) tracked a wave mask through
+`s_cselect_b64` and `v_cndmask_b32`, but **`s_mov_b64 sDST, exec` is not a scalar-data move**, so it
+took the generic fail-closed pair erase — which also cleared `mask_state`. The `s_cselect_b64` then
+folded to `Unknown`, and the attribute was published as `VertexFetchIndexMode::Shader`.
+
+That single misclassification breaks the fetch twice over, which is why each half alone still reads
+zero and the defect looked like a blank source:
+
+1. The recompiler keeps the shader's own VADDR for `Shader` mode — and that VADDR is now the
+   *instance* index, i.e. 0 for every vertex of a one-instance draw.
+2. `Shader` mode also keeps the instruction's `OFFSET`/`SOFFSET`, which are re-added to a base the
+   fold has already resolved, pushing the read past the descriptor's 96 bytes so
+   `robustBufferAccess` returns 0.
+
+Both were confirmed by lever-verified A/B on the captured submit before the fix was written: forcing
+`v8 = gl_VertexIndex` alone left the replay hash at `1f521f254fbb8b83`; dropping `OFFSET`/`SOFFSET`
+for `Shader`-mode fetches alone left it at `1f521f254fbb8b83`; **both together** produced
+`40575baeea3a5b74` and 16,410 distinct colours — the real screen. Each lever's own effect was checked
+with `PROSPER_SHADER_TAP` at the exact PC, so neither arm is a silent no-op.
+
+The fix restores the mask lifetime on `s_mov_b64 sDST, exec` (and propagates it through a further
+`s_mov_b64 sDST, sSRC`), which makes the attribute classify as `Vertex` and take the ordinary
+`gl_VertexIndex * stride` path with the offset-folded base — identical to every other attribute in
+the same shader. `test_dynfetch_fold` asserts both polarities plus the copy chain; without the fix two
+of the three checks fail.
+
+### Live result
+
+`tools/screenshot`, default route, page cache evicted, unmodified binary and guest, 88 s / 22 samples
+4 s apart: **22 of 22 source-distinct and pixel-distinct** 1920×1080 frames, 98–37,015 distinct
+colours each, guest frame 4,697, no `guest thread ended`. There is no flat frame anywhere in the run.
+The route reaches the Clear River Games logo, the full opening movie, the title screen with its
+`PRESS` prompt, then the attract-mode demonstration and the Force-device screen.
+
+Rung 3 (gameplay with real GPU draws) is the next step and needs an input route: the title screen
+waits on a button press.

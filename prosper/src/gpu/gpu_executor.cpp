@@ -2111,6 +2111,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // Capture both source lanes before touching either destination: source and
                     // destination pairs may overlap. Only an entirely known SGPR pair is modeled;
                     // special/inline sources and partial pairs retain the previous fail-closed erase.
+                    // A saved wave MASK is a separate domain from scalar data and survives even when
+                    // the pair's value does not: `s_mov_b64 sDST, sSRC` copies it (see the EXEC form
+                    // below for why the fetch prologue depends on this).
+                    const FoldMask source_mask_state = valid_reg(in.src[0].value)
+                        ? mask_state[(size_t)in.src[0].value] : FoldMask::Unknown;
                     std::array<uint32_t, 2> source_values{};
                     std::array<uint32_t, 2> source_keys{};
                     std::array<uint32_t, 2> source_origins{};
@@ -2148,6 +2153,27 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         }
                         mark_null_origin(dst, source_null_origins[(size_t)k]);
                     }
+                    if (valid_reg(in.dst.value))
+                        mask_state[(size_t)in.dst.value] = source_mask_state;
+                } else if (in.opcode == 0x04 &&                 // s_mov_b64 sDST, exec
+                           in.dst.kind == OperandKind::SGPR &&
+                           (in.src[0].kind == OperandKind::Special ||
+                            in.src[0].kind == OperandKind::SGPR) &&
+                           (in.src[0].value == 126 || in.src[0].value == 127)) {
+                    // Saving EXEC is not a scalar-data move — the pair's VALUE stays fail-closed —
+                    // but it does carry a wave MASK the NGG fetch prologue later consumes. R-Type
+                    // Delta's AGC prologue saves EXEC once and then selects vertex-vs-instance
+                    // indexing per attribute through that saved copy
+                    // (`s_cselect_b64 sSEL, sSAVED, 0` -> `v_cndmask_b32 vIDX, v8, v5, sSEL`).
+                    // Losing the mask made s_cselect_b64 fold to Unknown, which classified a
+                    // per-vertex attribute as shader-computed: every vertex then read record 0 and
+                    // the shader's own OFFSET/SOFFSET were re-added to an already-resolved base.
+                    // EXEC is full at this fetch-prologue boundary, exactly as srcmask() already
+                    // assumes for a directly named EXEC operand. CONFIDENCE: HIGH.
+                    forget(in.dst.value);
+                    forget(in.dst.value + 1);
+                    if (valid_reg(in.dst.value))
+                        mask_state[(size_t)in.dst.value] = FoldMask::All;
                 } else if (in.dst.kind == OperandKind::SGPR) {
                     // Not a modeled scalar move -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
                     // (s_getpc_b64, s_and/or/xor/not_b64, s_*_saveexec_b64, …) write
