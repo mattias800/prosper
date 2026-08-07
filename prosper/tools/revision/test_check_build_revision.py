@@ -297,7 +297,6 @@ def main() -> int:
             check(run(str(drifted), "--against", "HEAD").returncode == 1,
                   "a drifted template makes the tool refuse, not silently certify")
 
-    coverage = f"{ran} arms" + (f", {skipped} skipped" if skipped else "")
     # --- the Windows CI failure: git's own path spelling reached a subprocess cwd -------------
     #
     # MSYS2 git -- what the Windows CI job runs -- answers `rev-parse --show-toplevel` with a POSIX
@@ -337,6 +336,30 @@ def main() -> int:
     finally:
         module._git = real_git
 
+    # A failing arm names the property that broke and nothing about why, and every host that can
+    # reproduce this tool's known failure mode is a CI runner -- so an undiagnosable failure costs
+    # one push-and-wait cycle per hypothesis. On failure, say what the tool actually printed and
+    # what git actually answered, so the next reader debugs from the log instead of from a guess.
+    if fails:
+        print("--- diagnostic: what the tool said for one case that should have been certified ---")
+        with tempfile.TemporaryDirectory() as raw:
+            probe = make_build_dir(pathlib.Path(raw) / "diag", head)
+            for label, kwargs in (("--repo passed", {}), ("discovery", {"repo": None})):
+                out = run(str(probe), "--against", "HEAD", **kwargs)
+                print(f"  [{label}] exit={out.returncode}")
+                for stream, text in (("out", out.stdout), ("err", out.stderr)):
+                    for line in (text or "").splitlines():
+                        print(f"    {stream}| {line}")
+        print("--- diagnostic: the environment that decides its behaviour ---")
+        print(f"  sys.platform={sys.platform} os.name={os.name} python={sys.version.split()[0]}")
+        print(f"  cwd={pathlib.Path.cwd()}")
+        print(f"  REPO={REPO} exists={REPO.is_dir()}")
+        print(f"  git --version -> {git('--version')!r}")
+        print(f"  rev-parse --show-toplevel -> {git('rev-parse', '--show-toplevel')!r}")
+        print(f"  rev-parse --show-cdup -> {git('rev-parse', '--show-cdup')!r}")
+        print(f"  rev-parse HEAD -> {head!r}")
+
+    coverage = f"{ran} arms" + (f", {skipped} skipped" if skipped else "")
     print(f"test_check_build_revision: "
           + (f"{fails} FAILURE(S) ({coverage})" if fails else f"all ok ({coverage})"))
     return 1 if fails else 0
