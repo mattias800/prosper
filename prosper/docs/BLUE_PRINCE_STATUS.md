@@ -217,6 +217,45 @@ were confirmed as legitimate frustum culls.
 
 ## Ruled out (do-not-redo list)
 
+**Frontend frame decomposition, 2026-08-07 (Windows / NVIDIA RTX 4090, #2266 / #2262 / #2276).**
+`pass_control` was 27% of the frame and was a *residual*, not a measurement. Partitioning it took
+four steps and three of them killed a hypothesis. Each cost a 13-minute route; none is recoverable
+from reading the code:
+
+- **The RTT store / `g_rtt` copies are not the cost.** `post = 0.08 ms/submit` across 27.5 groups.
+  This was the hypothesis ranked *first* when the issue was filed.
+- **The regions outside the group loop are not the cost.** `head = 0.01`, `tail = 1.56 ms/submit`.
+- **Per-group setup — target grouping, format/extent resolution, seed selection — is not the cost.**
+  `pre = 0.15 ms/submit` across 27.5 groups.
+- **It was the MSAA resolve**, the loop's single early exit: a full GPU pipeline flush plus a
+  63.3 MiB CPU readback, 5.1 times a submit, for a CPU mirror the renderer materialises on demand
+  everywhere else. Fixed in #2274: `pass_control` −26.5 ms/submit (−49%), frame −13.6%. **Roughly
+  half of the saving is relocation, not elimination** — the GPU copy's own required flush now drains
+  the queue the eager one used to.
+
+**The frontend texture bucket's hit path is not the cost either (#2262).** 68% of `texture_ms` is
+**31 references at 182 µs each** — cross-submit byte validation, #1040's mechanism. The 5,350
+local-reuse references cost **0.27 µs each**. A claim that #1040 did *not* explain Blue Prince was
+published and retracted the same day: it compared 40 validations against 4,449 references and called
+it small without computing the cost. `watch_reuse = 0.0` — the write watch never once returns
+`Unchanged`, so every persistent hit falls to exact comparison (26,261 validations, 79.8 GiB a run).
+
+**60 FPS is not reachable by CPU work alone on this workload (#2276).** `gpu_device` measures
+**30-45 ms/submit** against a 16.7 ms budget, so a renderer with zero CPU cost lands near 30 FPS as
+the frame is currently submitted. `PROSPER_RENDER_SCALE=2` did **not** reduce it (43.47 vs 45.24 at
+matched draw counts) while pixel-proportional `readback` halved as expected — so it is probably not
+shading cost. **`PROSPER_RENDER_SCALE` is not a clean lever for that question**: scaled runs break
+the DS-bridge exact-extent match and change the render path, which is why the result is
+`CONFIDENCE: MED` rather than settled.
+
+**Do not compare single windows of `gpu_device`.** It swung **30.26 → 45.24 ms within one run** for a
+7% draw-count difference. Quote matched pairs.
+
+**Do not quote a share of any renderer bucket without its draw count** — and for the texture bucket,
+not without `validations` and the compared MiB either. `texture` reads 22.56 ms at 1,510 draws and
+8.47 ms at 2,249 draws: it is not draw-proportional, so the draw count is necessary and not
+sufficient (instrument trap 132).
+
 **Buffer-upload performance, 2026-08-07 (#2246).** Three hypotheses closed with measurements, so the
 next lane starts after them rather than at them:
 
