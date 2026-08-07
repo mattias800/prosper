@@ -534,8 +534,27 @@ HLE(s_videodec2_create_decoder) {
     return 0;
 }
 HLE(s_videodec2_delete_decoder) {
-    std::lock_guard<std::mutex> lk(g_vdec_mx);
-    return g_vdec_codecs.erase(a0) ? 0 : VDEC_ERR_DECODER;
+    // Tear the access-unit decoder down with the guest's decoder (#2270). Without this every
+    // deleted decoder strands an AVCodecContext, two AVFrames, an AVPacket and the NV12 staging
+    // vector for the life of the process.
+    //
+    // A LEAK, not a correctness bug, and the distinction is worth keeping straight: a stale
+    // g_vdec_au_ids entry could only decode against another movie's reference frames if a handle
+    // were ever REUSED, and it is not -- g_handle is fetch_add-only and never reset (:66, :529),
+    // so the recycled-handle path is unreachable.
+    //
+    // close_decoder runs OUTSIDE g_vdec_mx: it calls into the video backend, and holding an HLE
+    // lock across a backend call is how lock-order problems get built.
+    int au_id = -1;
+    {
+        std::lock_guard<std::mutex> lk(g_vdec_mx);
+        if (!g_vdec_codecs.erase(a0)) return VDEC_ERR_DECODER;
+        auto it = g_vdec_au_ids.find(a0);
+        if (it != g_vdec_au_ids.end()) { au_id = it->second; g_vdec_au_ids.erase(it); }
+    }
+    if (au_id >= 0)
+        if (auto* vb = prosper::video::backend()) vb->close_decoder(au_id);
+    return 0;
 }
 HLE(s_videodec2_decode) {
     // This log is CAPPED at 8 access units, and it is the only Videodec2 entry point that caps.
