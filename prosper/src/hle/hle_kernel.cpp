@@ -24,6 +24,22 @@
 #include <pthread.h>
 #include <semaphore.h>   // scePthreadSem* -> host sem_t
 #include "../host/posix_shim.hpp"   // Darwin: sem/barrier/timedlock/getattr_np/sigqueue compat
+// raw_fmt_len: snprintf's would-be length clamped to what actually landed (#2050), used by the
+// [exc2] handler below.
+//
+// Guarded, and at FILE SCOPE, for two separate reasons that must both hold:
+//   * raw_syscall.hpp's non-Linux branch includes <sys/mman.h>/<unistd.h> unconditionally, so it is
+//     not MinGW-clean -- hence the guard. The [exc2] handler is POSIX-only, so Windows needs none
+//     of this.
+//   * it declares `namespace prosper`, so including it anywhere nested produces
+//     `prosper::{anonymous}::prosper` and every later `prosper::` lookup resolves into the INNER
+//     namespace and fails. The first attempt put it beside the handler, inside an anonymous
+//     namespace inside `namespace prosper`, and Linux/macOS CI rejected it with
+//     "'guest_module_name' is not a member of 'prosper::{anonymous}::prosper'". A header that opens
+//     a namespace can only be included where that namespace means what the file expects.
+#if defined(__linux__) || defined(__APPLE__)
+#include "../host/raw_syscall.hpp"
+#endif
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
@@ -2692,9 +2708,19 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
             // %fs-safe: this handler can interrupt guest code running on the GUEST %fs, where host
             // libc TLS (locale, stack canary) reads garbage — swap to host %fs for the logging.
             uint64_t sfs = guest_fs_to_host_scoped();
+            // snprintf returns the length it WOULD have written, so handing it to write() reads
+            // past the end of this stack buffer whenever the line truncates -- #2050's class, and
+            // instrument trap 109's. raw_fmt_len() is the clamp #2050 introduced for exactly this,
+            // already unit-tested (tests/test_raw_syscall.cpp), and it encodes the right choice for
+            // the truncated case: write the cap-1 bytes that really landed, so the shortening stays
+            // visible rather than being papered over.
+            //
+            // Integers only, so this one cannot truncate today -- clamped anyway, because "cannot
+            // truncate today" is a property of the format string, and the next person to add a %s
+            // will not re-derive it.
             char b[96]; int n = snprintf(b, sizeof b, "[exc2] DROPPED type=%d tid=%ld (no handler)\n",
                                          type, (long)prosper_gettid());
-            (void)!write(2, b, n);
+            (void)!write(2, b, prosper::raw_fmt_len(n, sizeof b));
             guest_fs_restore_scoped(sfs);
         }
         return;
@@ -2709,12 +2735,16 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
         // #1659: was a hand-rolled three-branch dispatcher whose eboot (0x400000000) and libc
         // (0x500000000) bases were both stale; only the il2cpp one was current. One shared,
         // module-aware call replaces all three and cannot drift again.
+        // This is the reachable one of the three (#2162): the format embeds guest_module_name(),
+        // which is NOT length-bounded at the call site, into a 160-byte buffer whose fixed part is
+        // ~50. A module label over ~90 characters truncates and the unclamped write over-reads --
+        // the same shape that made the [labelhist] site the first one caught in trap 109.
         n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=%s+0x%llx\n",
                      (long)prosper_gettid(), type, fss, prosper::guest_module_name(irip),
                      (unsigned long long)prosper::guest_module_offset(irip));
         // guest_module_name/offset already degrade to "mapped/host" + the verbatim address, so the
         // former host: fallback branch is folded into the single call above.
-        (void)!write(2, b, n);
+        (void)!write(2, b, prosper::raw_fmt_len(n, sizeof b));
         guest_fs_restore_scoped(sfs);
     }
     auto* uc = (ucontext_t*)uc_;
@@ -2750,7 +2780,7 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
         uint64_t sfs = guest_fs_to_host_scoped();   // %fs-safe logging (see ENTER)
         char b[96]; int n = snprintf(b, sizeof b, "[exc2] RESUME tid=%ld type=%d\n",
                                      (long)prosper_gettid(), type);
-        (void)!write(2, b, n);
+        (void)!write(2, b, prosper::raw_fmt_len(n, sizeof b));
         guest_fs_restore_scoped(sfs);
     }
 }
