@@ -1714,8 +1714,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             //
             // Bounded at the same 4,096 entries the shader cache itself uses. On overflow the map is
             // cleared wholesale rather than evicted by age: there is no LRU bookkeeping to pay for on
-            // a path this hot, 523 distinct per submit leaves ample headroom, and `memo_clears` in
-            // the timing report makes a thrash visible instead of silent.
+            // a path this hot, and 523 distinct shaders per submit leaves ample headroom.
+            //
+            // The overflow behaviour does NOT degrade gracefully, and `memo_clears` should be read
+            // accordingly: a title exceeding the cap would clear and refill repeatedly, paying the
+            // full reflection cost again PLUS the map churn. So a non-zero `memo_clears` means this
+            // optimisation has STOPPED WORKING, not that a threshold was brushed -- do not read a
+            // small non-zero value as benign. Observed 0 across a 13-minute Blue Prince route.
+            //
+            // The entry copies the whole DescriptorValidationReport although this path reads only
+            // `descriptors`. Deliberate: storing the subset would bound the footprint to what is
+            // used, but it would also make the entry a lie about what it holds the moment a caller
+            // reads `issues`, and at 523 entries against a 4,096 cap the footprint is not the
+            // constraint. If that ever inverts, narrow the entry rather than raising the cap.
             struct ReflectMemoEntry {
                 prosper::gpu::DescriptorValidationReport report;
                 uint32_t set = 0;
