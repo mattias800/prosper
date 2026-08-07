@@ -6338,7 +6338,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // PROSPER_PASS_LOG=<min-submit>|ms:<millis>: per-pass publish provenance for 3
                     // submits — which pass produced pixels, its target identity, and the defer
                     // decision. The `ms:` form aims the window by wall time (diagnostic_window.hpp).
-                    if (PROSPER_ENV_ON("PROSPER_PASS_LOG")) {
+                    // PROSPER_PASS_LOG_NODEFER opens this block too. It was added INSIDE it and
+                    // armed by its own switch, so setting only PROSPER_PASS_LOG_NODEFER produced
+                    // ZERO lines -- a silent run indistinguishable from "there are no such passes".
+                    // That is #2149's class, committed by the author who had been citing #2149 all
+                    // session: a diagnostic whose producer and printer are armed by different
+                    // switches reports unarmed state as a confident zero.
+                    if (PROSPER_ENV_ON("PROSPER_PASS_LOG") ||
+                        PROSPER_ENV_ON("PROSPER_PASS_LOG_NODEFER")) {
                         const uint64_t at = g_pass_log_submit.load(std::memory_order_relaxed);
                         const bool in_window =
                             g_pass_log_window.contains(at, diagnostic_elapsed_ms());
@@ -6402,12 +6409,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     // and nobody can say from this line whether those surfaces are
                                     // black or absent.
                                     "[pass] cb=%llu pass=%zu/%zu base=0x%llx %ux%u fmt=%d vo=%d "
-                                    "seed=%d defer=%d writes=%llu px_nonblack=%lld bytes=%zu\n",
+                                    // raw_fmt is CB_COLOR0_INFO.FORMAT BEFORE backend_color_format
+                                    // touches it, and it is the field that decides #2283. That
+                                    // converter falls back to R8G8B8A8_UNORM for anything it does
+                                    // not recognise -- INCLUDING 0 -- and R8G8B8A8_UNORM is itself
+                                    // enumerator 37, so the most common real format and "unknown"
+                                    // print identically. `fmt` above therefore cannot distinguish a
+                                    // live colour target from a disabled one, and I nearly published
+                                    // a correctness claim on it.
+                                    //
+                                    // raw_fmt=0 is CB_COLOR_INVALID: the target is DISABLED, the
+                                    // extent in CB_COLOR0_ATTRIB2 is stale from an earlier pass
+                                    // (context registers are sticky), and a base of 0 is correct --
+                                    // the readback is then simply waste. raw_fmt non-zero with
+                                    // base=0 is the opposite: the guest declared a live colour
+                                    // target and prosper does not have its address.
+                                    "seed=%d defer=%d writes=%llu px_nonblack=%lld bytes=%zu "
+                                    "raw_fmt=%u\n",
                                     (unsigned long long)at, pass_i, items.size(),
                                     (unsigned long long)base, gw, gh, (int)pass_format,
                                     (int)is_vo, (int)seed_rtt, (int)defer_readback,
                                     (unsigned long long)color_target_call.writes, nz,
-                                    rendered_pixels.size());
+                                    rendered_pixels.size(),
+                                    pass.empty() ? 0u : pass.front()->ps.color0_format);
                     }
                     // Everything this group did AFTER the backend call returned -- RTT store,
                     // scanout selection, per-pass diagnostics. `backend_done` is in scope only on
