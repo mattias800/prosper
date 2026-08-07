@@ -4952,6 +4952,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             std::chrono::duration<double, std::milli>(bt3 - bt2).count();
                         pending_timing.build_indices_ms +=
                             std::chrono::duration<double, std::milli>(bt4 - bt3).count();
+                        // Counted AFTER the reject, so `build_draws` is accepted draws — and the
+                        // leaves do not all share it. `build_R` and `validate` ran for
+                        // draws + rejected; `poison` and `indices` ran for draws alone. Both
+                        // numbers are printed so the reader can pick the right denominator, and
+                        // the report line says which is which — a per-draw figure divided by the
+                        // wrong one over-states silently, and with rejected=0 nobody would notice
+                        // the rule until the first run where it is not.
                         ++pending_timing.build_draws;
                     }
                     if (gfxlog) fprintf(stderr,
@@ -6802,7 +6809,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         fprintf(stderr,
                                 "[render-timing] build_resources %.2f ms/submit [build_R=%.2f "
                                 "(texture=%.2f buffer=%.2f other=%+.2f) validate=%.2f indices=%.2f "
-                                "poison=%.2f other=%+.2f] draws=%.1f rejected=%.1f\n",
+                                "poison=%.2f other=%+.2f] draws=%.1f (+%.1f rejected; build_R and validate cover both, poison and indices only the accepted)\n",
                                 totals.build_resources_ms / nsub, totals.build_r_ms / nsub,
                                 totals.texture_ms / nsub, totals.buffer_ms / nsub,
                                 // build_R's OWN residual, published for the same reason as its
@@ -6816,11 +6823,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 totals.build_poison_ms / nsub, br_other / nsub,
                                 (double)totals.build_draws / nsub,
                                 (double)totals.build_rejected / nsub);
+                        // A negative residual has one KNOWN trigger, and naming it here saves
+                        // the reader hunting a renderer defect: PROSPER_TARGET_STEP_HASH_DIM calls
+                        // build_bds() again at :5815, OUTSIDE the build_start/build_done span, so
+                        // every prefix rebuild lands in the leaves without landing in the parent --
+                        // and that loop is O(N^2) in draws. Zero occurrences on a default run.
                         if (br_other < -0.05 * nsub)
                             fprintf(stderr,
                                     "[render-timing] *** build_resources leaves EXCEED their parent "
                                     "by %.2f ms/submit -- the partition above is not trustworthy; "
-                                    "this is a defect in the instrument, not the renderer\n",
+                                    "this is a defect in the instrument, not the renderer. Known "
+                                    "trigger: PROSPER_TARGET_STEP_HASH_DIM rebuilds draws outside "
+                                    "the measured span\n",
                                     -br_other / nsub);
                     }
                     size_t persistent_source_bytes = 0;
@@ -6981,6 +6995,34 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             window.backend_res_descriptor_ms / wn,
                             (window.backend_setup_resources_ms - window.backend_res_texture_ms -
                              window.backend_res_buffer_ms - window.backend_res_descriptor_ms) / wn);
+                    // Same partition on the WINDOW path, so it is present wherever the buffer
+                    // and fixed ones are (#2246, #2252). The window path isolates a PHASE, which
+                    // for a title whose draw count swings 351 -> 2,106 between phases is the more
+                    // useful axis than a lifetime total -- and a partition visible on one path and
+                    // not the other invites exactly the cross-aggregation comparison that has cost
+                    // us two wrong numbers today.
+                    {
+                        const double br_other_w = window.build_resources_ms - window.build_r_ms -
+                                                  window.build_validate_ms - window.build_poison_ms -
+                                                  window.build_indices_ms;
+                        fprintf(stderr,
+                                "[render-window] build_resources %.2f ms/submit [build_R=%.2f "
+                                "(texture=%.2f buffer=%.2f other=%+.2f) validate=%.2f indices=%.2f "
+                                "poison=%.2f other=%+.2f] draws=%.1f (+%.1f rejected)\n",
+                                window.build_resources_ms / wn, window.build_r_ms / wn,
+                                window.texture_ms / wn, window.buffer_ms / wn,
+                                (window.build_r_ms - window.texture_ms - window.buffer_ms) / wn,
+                                window.build_validate_ms / wn, window.build_indices_ms / wn,
+                                window.build_poison_ms / wn, br_other_w / wn,
+                                (double)window.build_draws / wn,
+                                (double)window.build_rejected / wn);
+                        if (br_other_w < -0.05 * wn)
+                            fprintf(stderr,
+                                    "[render-window] *** build_resources leaves EXCEED their parent "
+                                    "by %.2f ms/submit -- instrument defect, not renderer. Known "
+                                    "trigger: PROSPER_TARGET_STEP_HASH_DIM\n",
+                                    -br_other_w / wn);
+                    }
                     fprintf(stderr,
                             "[render-window] backend-submit pipelines refs=%.1f hits=%.1f misses=%.1f "
                             "bypass=%.1f entries=%llu evictions=%.1f\n",
