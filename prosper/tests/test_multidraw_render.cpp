@@ -172,6 +172,30 @@ int main() {
         const std::vector<uint8_t> px_three = prosper::test::render_draws_rgba({three}, W, H);
         const std::vector<uint8_t> px_three_indexed =
             prosper::test::render_draws_rgba({three_indexed}, W, H);
+        // A NON-ZERO index-buffer arena offset, which nothing else in the suite reaches (#2253).
+        //
+        // Every other indexed draw here and in test_indexed_render is alone in its
+        // render_draws_rgba() call, so each gets a fresh arena and binds at offset 0 — the one
+        // value that is still correct if `v.ioffset` were dropped from the bind sites entirely.
+        // Those arms therefore cannot fail for the reason they appear to cover.
+        //
+        // Two indexed draws in ONE pass puts the second at align_storage_offset(12), non-zero by
+        // construction. The index DATA must differ for the offset to matter: identical payloads
+        // would render the same picture from either slice and the arm would be void. So the second
+        // draw is degenerate ({0,0,0} collapses the triangle to a point, contributing nothing) and
+        // the pass must match a single ordinary draw. Bind the second at offset 0 and it reads the
+        // FIRST draw's {0,1,2}, drawing a second additive triangle — visible immediately.
+        //
+        // Verified by mutation, not assumed: hardcoding 0 at both vkCmdBindIndexBuffer sites turns
+        // this arm red and leaves the rest of the file green.
+        prosper::test::BackendDraw first_indexed = one;  first_indexed.indices = {0, 1, 2};
+        prosper::test::BackendDraw second_degenerate = one; second_degenerate.indices = {0, 0, 0};
+        const std::vector<uint8_t> px_pair =
+            prosper::test::render_draws_rgba({first_indexed, second_degenerate}, W, H);
+        CHECK(px_pair == px_one,
+              "a second indexed draw in one pass reads ITS OWN slice at a non-zero arena offset "
+              "(degenerate indices contribute nothing; binding at 0 would re-draw the first)");
+
         const uint8_t* zero_center = center(px_zero);
         const uint8_t* one_center = center(px_one);
         const uint8_t* three_center = center(px_three);
@@ -285,9 +309,22 @@ int main() {
         const auto pool_after_first = prosper::test::render_host_buffer_pool_stats();
         CHECK(shared_stats.buffer_references == 4 && shared_stats.unique_buffers == 2,
               "identical guest-buffer payloads share two arena slices across draws");
-        CHECK(pool_after_first.misses == pool_before.misses + 1 &&
-                  pool_after_first.cached_buffers == pool_before.cached_buffers + 1,
-              "two logical uploads populate one persistent host-buffer arena");
+        // AT MOST one new arena buffer, not EXACTLY one. The property this asserts is that two
+        // logical uploads share a single arena rather than taking a buffer each; the old `== +1`
+        // additionally required the arena to be EMPTY on entry, which is a precondition of the
+        // fixture rather than a property of the renderer. Indexed draws take arena slices since
+        // #2253, so the indexed draws at :165/:167 leave a partially-used arena and these two
+        // uploads now fit inside it — one arena, zero new buffers, the property satisfied and the
+        // old proxy violated.
+        //
+        // The inequality keeps the discriminating power that matters: the regression this guards
+        // against is each logical upload allocating its own host buffer, which is `+2` and still
+        // fails. Verified by construction rather than assumed — `PROSPER_NO_INDEX_ARENA=1` restores
+        // the empty-arena precondition and the original `== +1` holds, which is what identified the
+        // dependency in the first place.
+        CHECK(pool_after_first.misses <= pool_before.misses + 1 &&
+                  pool_after_first.cached_buffers <= pool_before.cached_buffers + 1,
+              "two logical uploads share one persistent host-buffer arena (at most one new buffer)");
         const uint8_t* shared_center = center(shared);
         CHECK(shared_center && shared_center[0] > 0xC0 && shared_center[1] > 0xC0 &&
                   shared_center[2] < 0x40,
