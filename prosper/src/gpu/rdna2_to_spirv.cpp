@@ -10160,7 +10160,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                      in.mimg_unorm || in.mimg_dmask != 1u ||
                      (!arrayed && (res->img_dim != 1u || res->depth != 1u)) ||
                      (arrayed && (res->img_dim != SQ_DIM_2D_ARRAY || !res->depth)) ||
-                     (arrayed && !res->depth) || res->depth_compare ||
+                     res->depth_compare ||
                      res->format != DataFormat::Uint32 || components != 1u ||
                      !res->width || !res->height || res->in_mip_tail ||
                      res->compression_enabled)) {
