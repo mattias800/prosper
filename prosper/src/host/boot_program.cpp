@@ -101,11 +101,26 @@ std::vector<std::string> discover_extra_plugin_modules(
 
 namespace prosper {
 
-bool boot_program(const std::string& d, Program& p, std::string* err,
-                  const std::function<void()>& after_hle_registered) {
-    auto fail = [&](const std::string& m) { if (err) *err = m; return false; };
-
-    // libc.prx loaded last => its init_array runs first (deepest dependency), before eboot's entry.
+// The loader's ACTUAL link set, exposed so it has exactly one definition (#2199).
+//
+// nid_census used to build its own module set by scanning the file tree, and the two differed in
+// ways that silently removed rows from its report: only Media/Plugins is auto-discovered, .sprx is
+// never auto-linked, sce_module contributes exactly two named files, and modules whose file is
+// absent or that the linker refuses are dropped. The census excludes any import satisfied by a
+// SIBLING module's export -- sound only if the sibling set matches what the loader links. Where the
+// tool's set was larger, it excluded a binding that in fact falls to the dispatcher's `return 0` at
+// runtime, i.e. a FALSE ABSENCE from a report whose whole purpose is to list what reaches the
+// dispatcher. A missing row looks like nothing at all.
+//
+// Split out of boot_program() as a pure prefix: it depends only on `d`, has no early exit, and
+// boot_program now calls it, so the two cannot drift. Note it PRINTS while it works (auto-link and
+// case-correction lines) -- that output is part of the loader's existing behaviour and is now also
+// visible to any other caller.
+std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
+    // `verbose` exists only so a TOOL can call this without corrupting its own stdout: the
+    // four prints below are the loader's, and nid_census --tsv writes machine-readable rows to
+    // the same stream. boot_program passes true, so loader output is byte-identical (#2199).
+    const auto say = [&](auto&&... args) { if (verbose) printf(args...); };
     std::vector<LinkInput> in = {
         { d + "/eboot.bin", BOOT_EBOOT },
         { d + "/Media/Modules/Il2cppUserAssemblies.prx", BOOT_IL2CPP },
@@ -170,12 +185,12 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
         unsigned slot = 0;
         for (const auto& path : extra) {
             if (slot >= BOOT_PLUGIN_AUTO_SLOTS) {
-                printf("plugin auto-link: no free base slot for %s (max %u) — NOT linked\n",
+                say("plugin auto-link: no free base slot for %s (max %u) — NOT linked\n",
                        path.c_str(), BOOT_PLUGIN_AUTO_SLOTS);
                 continue;
             }
             const uint64_t base = BOOT_PLUGIN_AUTO_BASE + (uint64_t)slot * BOOT_PLUGIN_AUTO_STRIDE;
-            printf("plugin auto-link: %s @ 0x%llx\n", path.c_str(), (unsigned long long)base);
+            say("plugin auto-link: %s @ 0x%llx\n", path.c_str(), (unsigned long long)base);
             // skip_on_export_collision: never introduce a duplicate NID export. A title can ship two
             // builds of the same library (Evergate's libfmod.prx + libfmodL.prx export identical
             // NIDs); linking both would run two init_arrays and make dlsym answer differently per
@@ -198,12 +213,21 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     for (size_t i = in.size(); i-- > 1; ) {
         std::string resolved = resolve_host_path_case(in[i].path);
         if (resolved != in[i].path) {
-            printf("module path case-corrected: %s -> %s\n", in[i].path.c_str(), resolved.c_str());
+            say("module path case-corrected: %s -> %s\n", in[i].path.c_str(), resolved.c_str());
             in[i].path = std::move(resolved);
         }
         if (FILE* f = fopen(in[i].path.c_str(), "rb")) fclose(f);
-        else { printf("skipping absent module: %s\n", in[i].path.c_str()); in.erase(in.begin() + (ptrdiff_t)i); }
+        else { say("skipping absent module: %s\n", in[i].path.c_str()); in.erase(in.begin() + (ptrdiff_t)i); }
     }
+    return in;
+}
+
+bool boot_program(const std::string& d, Program& p, std::string* err,
+                  const std::function<void()>& after_hle_registered) {
+    auto fail = [&](const std::string& m) { if (err) *err = m; return false; };
+
+    // libc.prx loaded last => its init_array runs first (deepest dependency), before eboot's entry.
+    std::vector<LinkInput> in = boot_link_inputs(d);
 
     std::string e;
     if (!link_program(in, BOOT_STUB, p, &e)) return fail("link failed: " + e);

@@ -42,6 +42,7 @@
 // pairs directly. `--self-check` re-derives each pair with prosper's own `nid_hash` and reports
 // any disagreement: the name table is the instrument this tool reads the census through, so it
 // gets a control of its own rather than being trusted.
+#include "host/boot_program.hpp"
 #include "../../src/hle/dispatch.hpp"
 #include "../../src/hle/nid.hpp"
 #include "../../src/loader/linker.hpp"
@@ -132,15 +133,31 @@ bool is_module_file(const fs::path& p) {
     return ext == ".prx" || ext == ".sprx";
 }
 
+// The module set is now the LOADER'S link set, not a tree scan (#2199).
+//
+// This tool's central inference is that an import satisfied by a SIBLING module's export never
+// reaches the dispatcher, so it is excluded from the census. That is sound only if the sibling set
+// matches what the loader actually links. A tree scan is strictly larger -- it picks up .sprx (never
+// auto-linked), everything under sce_module/ (the loader takes exactly two named files), plugin
+// directories other than Media/Plugins/ (the only one auto-discovered), and modules whose file the
+// loader would drop or refuse. Every one of those made the tool exclude a binding that DOES fall to
+// the dispatcher's `return 0` at runtime.
+//
+// The direction of that error is what made it worth fixing: a FALSE ABSENCE. The row is missing
+// rather than wrong, so nothing in the output looks suspicious, in a report whose entire purpose is
+// to enumerate what reaches the dispatcher.
+//
+// A single regular file still means "just this module", which is how --lib and single-module runs
+// work; only a dump ROOT goes through the loader's set.
 std::vector<fs::path> collect_modules(const std::string& input) {
     std::vector<fs::path> out;
     std::error_code ec;
     const fs::path root(input);
     if (fs::is_regular_file(root, ec)) { out.push_back(root); return out; }
-    for (const auto& e : fs::recursive_directory_iterator(
-             root, fs::directory_options::skip_permission_denied, ec)) {
-        if (e.is_regular_file(ec) && is_module_file(e.path())) out.push_back(e.path());
-    }
+    // verbose=false: boot_link_inputs prints the loader's auto-link and case-correction lines, and
+    // --tsv writes machine-readable rows to the same stdout.
+    for (const auto& li : prosper::boot_link_inputs(input, /*verbose=*/false))
+        out.push_back(fs::path(li.path));
     std::sort(out.begin(), out.end());
     return out;
 }
