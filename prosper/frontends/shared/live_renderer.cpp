@@ -6376,7 +6376,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // last case has to stay visible out of window: it is the one where this line
                         // cannot say whether the pass carries content, which is exactly when the
                         // reader needs to know the pass existed.
-                        if (in_window || nz > 100 || nz < 0 || defer_readback)
+                        // PROSPER_PASS_LOG_NODEFER: print the NON-DEFERRED passes specifically.
+                        // They are the population #2276 needs and the only one this line cannot
+                        // currently reach: a deferred pass always prints, a content-bearing pass
+                        // prints on `nz > 100`, and the window covers three callbacks -- but a
+                        // non-deferred pass with little content satisfies none of those, so 2,999
+                        // of them a route were invisible while a classifier counted 21 GB of
+                        // readback against them.
+                        //
+                        // Opt-in and separate from PROSPER_PASS_LOG rather than widening the window,
+                        // because the window's three-callback span is deliberate (its comment says
+                        // why) and this needs the whole run, not a wider sample. ~9.7 lines a submit.
+                        static const bool pass_log_nodefer =
+                            PROSPER_ENV_ON("PROSPER_PASS_LOG_NODEFER");
+                        if (in_window || nz > 100 || nz < 0 || defer_readback ||
+                            (pass_log_nodefer && !defer_readback))
                             fprintf(stderr,
                                     // `bytes` disambiguates px_nonblack=0, which today means EITHER
                                     // "the readback returned a near-black surface" OR "the readback
