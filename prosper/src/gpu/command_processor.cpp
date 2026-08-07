@@ -2863,20 +2863,50 @@ std::atomic<bool> g_post_submit_visibility{false};
 // of the same command buffer — and ArcRunner requests SDK version 10, so the post-submit contract
 // that exists precisely to prevent that is not armed for it. Whether the contract is correct for a
 // pre-13 title is a separate question this lever does not answer; it makes the experiment runnable.
-bool post_submit_visibility_enabled() {
+// #2220: this predicate guarded TWO behaviours, and they are not the same experiment.
+//
+//   A. SUBMIT-SCOPE DEFERRAL — submit_scope_begin/_end/_active and the queue path. Holds a
+//      submit's completion writes private until the scope closes, so the guest's builder thread
+//      is not released mid-fold. This is what ArcRunner (#1226) needs.
+//   B. DRAIN SELECTION — drain_renderer_writes' selective path instead of draining everything.
+//      Its own comment says it "retains small descriptor/constant uploads used by older titles"
+//      and leaves those writes "one frame behind". Content-visible.
+//
+// Removing the version gate armed BOTH, and that regressed Sonic Frontiers: 3 faults in 12 runs
+// (all identical — last frame 8, four [nullpage] lines) against 0 in 12 on master. So they are
+// separated here, following dma_init_drift_level's convention above: ORDINAL LEVELS rather than
+// two booleans, because no combination of levels can mean nothing.
+//
+//   0 = neither (pre-#2220 behaviour for a sub-13 guest)
+//   1 = A only        — the deferral, without changing what gets drained
+//   2 = A and B       — what an SDK-13+ guest gets today, and what removing the gate would give
+//
+// CONFIDENCE: HIGH that the two are separable (drain_renderer_writes forks on this predicate and
+// nothing else). MED that A alone is what ArcRunner needs and B alone is what breaks Frontiers —
+// that is the hypothesis this lever exists to test, not a result.
+int post_submit_visibility_level() {
     static const int forced = [] {
         const char* e = getenv("PROSPER_POST_SUBMIT_VISIBILITY");
         const int v = e ? (int)strtol(e, nullptr, 0) : -1;
         if (v == 1)
-            fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY FORCED ON (#1226 A/B) — completion writes "
-                            "stay private until the submit scope closes, regardless of SDK version\n");
+            fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY LEVEL 1 (#2220 A/B) — submit-scope "
+                            "deferral only; drain selection UNCHANGED\n");
+        else if (v == 2)
+            fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY LEVEL 2 (#2220 A/B) — deferral AND "
+                            "selective drain (the full SDK-13 contract)\n");
         else if (v == 0)
-            fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY FORCED OFF (#1226 A/B)\n");
+            fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY LEVEL 0 (#2220 A/B) — neither\n");
         return v;
     }();
-    if (forced >= 0) return forced != 0;
-    return g_post_submit_visibility.load(std::memory_order_acquire);
+    if (forced >= 0) return forced;
+    return g_post_submit_visibility.load(std::memory_order_acquire) ? 2 : 0;
 }
+
+// Group A: the deferral. True at level 1 and 2.
+bool post_submit_visibility_enabled() { return post_submit_visibility_level() >= 1; }
+
+// Group B: selective drain. True only at level 2 — so level 1 keeps master's drain behaviour.
+bool post_submit_selective_drain() { return post_submit_visibility_level() >= 2; }
 
 bool eop_write_sync() {
     // #1226: announce the arm. This is an A/B lever whose whole purpose is to be compared against the
@@ -3088,7 +3118,7 @@ extern "C" bool prosper_gpu_submit_scope_active() {
 // the same label. This boundary retains small descriptor/constant uploads used by older titles;
 // size/content heuristics left those writes one frame behind.
 extern "C" void prosper_gpu_drain_renderer_writes() {
-    if (!post_submit_visibility_enabled()) {
+    if (!post_submit_selective_drain()) {   // #2220 group B — level 2 only
         prosper_gpu_drain_completion_writes();
         return;
     }
@@ -3637,7 +3667,7 @@ int flush_deferred_streams() {
     if (g_deferred.empty()) return 0;
     // Legacy SDK callers retain the original eager visibility. Modern callers consult the pending
     // scalar overlay instead, so their completion labels remain post-submit.
-    if (!post_submit_visibility_enabled()) prosper_gpu_drain_completion_writes();
+    if (!post_submit_selective_drain()) prosper_gpu_drain_completion_writes();   // #2220 group B
     int completed = 0;
     std::array<int, kDeferredQueueCount> signalable_completed{};
     std::array<bool, kDeferredQueueCount> blocked_queue{};
@@ -4694,7 +4724,7 @@ void GpuState::apply(const Pm4Command& c) {
                 }
                 // Legacy callers consume the concrete value. Modern callers keep it private to the
                 // submit and let the evaluator overlay the queued scalar value.
-                if (!post_submit_visibility_enabled()) prosper_gpu_drain_completion_writes();
+                if (!post_submit_selective_drain()) prosper_gpu_drain_completion_writes();   // #2220 group B
                 if (!ordered_wait_satisfied && !wait_regmem_satisfied(c)) {
                     // Barrier model (#312), opt-in via PROSPER_WAIT_DEFER=1: pause the queue —
                     // everything downstream defers until the condition holds (see the model
