@@ -44,6 +44,11 @@ Known gaps, stated rather than left implied
 -------------------------------------------
 * Documentation (`.md`) is not scanned. This gate is about invocations that gate a build, not about
   every place the command is quoted for a reader.
+* THIS FILE is excluded from the scan, because its selftest arms are deliberately non-compliant
+  invocation lines and the scanner would otherwise flag its own fixtures. The exclusion is by
+  resolved path, is reported in the summary line rather than applied silently, and is asserted by a
+  selftest arm. A real ctest invocation added to this file would not be gated; there is no reason
+  to add one.
 * A python invocation whose argument list spans lines, or one assembled from a variable, is not
   recognised. The repository has exactly one python invocation
   (`tools/vkval/vk_validation_scan.py`'s `run_ctest`); its list is on a single line and already
@@ -70,6 +75,11 @@ from pathlib import Path
 SCAN_SUFFIXES = (".yml", ".yaml", ".ps1", ".sh", ".bash", ".py", ".cmake")
 SCAN_NAMES = ("CMakeLists.txt",)
 SKIP_PARTS = ("third_party", ".git")
+
+# This checker's own source. Its selftest holds hand-written NON-compliant invocation lines as
+# fixtures, so scanning itself reports its own examples as findings. Excluded by resolved path, and
+# named in the summary so the exclusion is visible rather than assumed.
+SELF = Path(__file__).resolve()
 
 CTEST_SHELL = re.compile(r"""(?:^|[\s;&|(`"'])ctest\s+(?=-|@\()""")
 CTEST_PYLIST = re.compile(r"""[\[(]\s*["']ctest["']\s*,""")
@@ -163,6 +173,15 @@ def selftest() -> int:
     accept("an argparse help string",
            '                        help="extra argument forwarded to ctest (repeatable)")\n')
 
+    # The self-exclusion is asserted, not assumed. Without it this checker fails on its own
+    # fixtures -- which is exactly what CI reported the first time, while the local run said
+    # "ok: 7" because the file was still UNTRACKED, so `git ls-files` never handed it to the
+    # scanner. A repo-wide lint verified before its own file is committed has not been verified.
+    if not offending_lines(SELF.read_text(encoding="utf-8", errors="replace")):
+        print("selftest: this file no longer holds non-compliant fixtures, so the self-exclusion "
+              "is no longer load-bearing and should be reconsidered", file=sys.stderr)
+        failures += 1
+
     both = ("        run: ctest --test-dir b --output-on-failure\n"
             "        run: ctest --test-dir b --output-on-failure --no-tests=error\n")
     # Deliberately checked: the compliant line lies inside the FIRST line's continuation window, so
@@ -171,7 +190,7 @@ def selftest() -> int:
         print("selftest: the invocation counter disagrees with the matcher", file=sys.stderr)
         failures += 1
 
-    print("selftest: 15 arms, %d failed" % failures)
+    print("selftest: 16 arms, %d failed" % failures)
     return 1 if failures else 0
 
 
@@ -190,6 +209,8 @@ def tracked_files(root: Path) -> list[Path]:
         if path.suffix not in SCAN_SUFFIXES and path.name not in SCAN_NAMES:
             continue
         if any(part in SKIP_PARTS or part.startswith("build") for part in path.parts):
+            continue
+        if (root / path).resolve() == SELF:
             continue
         files.append(root / path)
     return files
@@ -236,7 +257,8 @@ def main() -> int:
               % (REQUIRED, MARKER), file=sys.stderr)
         return 1
 
-    print("ok: %d ctest invocation(s), all carrying %s" % (scanned, REQUIRED))
+    print("ok: %d ctest invocation(s), all carrying %s (this checker's own file is excluded -- its "
+          "selftest fixtures are deliberately non-compliant)" % (scanned, REQUIRED))
     return 0
 
 
