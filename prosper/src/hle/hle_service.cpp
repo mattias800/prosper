@@ -597,10 +597,21 @@ HLE(s_videodec2_decode) {
         if (k < 12) {
             const double px = 0.0;
             (void)px;
+            // The first bytes of the access unit NAME the bitstream, which the codec field does not
+            // when its value is not one we have seen before. H.264 carries a 1-byte NAL header after
+            // the start code (SPS = 0x67); HEVC carries a 2-byte one (VPS = 0x40 0x01). Printing the
+            // head is what separates "implement HEVC" from "we are reading the wrong field".
+            char head[64] = {0};
+            if (input->data && input->data_size) {
+                const auto* au = (const uint8_t*)(uintptr_t)input->data;
+                const uint64_t n = input->data_size < 16 ? input->data_size : 16;
+                for (uint64_t i = 0; i < n; ++i)
+                    snprintf(head + i * 3, 4, "%02x ", au[i]);
+            }
             fprintf(stderr,
-                    "[vdec-contract] decode#%u handle=0x%llx au_bytes=%llu frame_buf=%llu\n",
+                    "[vdec-contract] decode#%u handle=0x%llx au_bytes=%llu frame_buf=%llu head=%s\n",
                     k, (unsigned long long)a0, (unsigned long long)input->data_size,
-                    (unsigned long long)frame->data_size);
+                    (unsigned long long)frame->data_size, head);
         }
     }
     // Real decode when a backend offers the access-unit path (#2270). Opt-in while the output

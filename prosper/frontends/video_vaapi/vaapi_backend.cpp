@@ -877,6 +877,7 @@ namespace {
 
 struct AuDecoder {
     AVCodecContext* ctx = nullptr;
+    bool checked_first_au = false;    // the codec->bitstream sanity check runs once, in decode_au
     AVFrame* frame = nullptr;
     AVFrame* sw_frame = nullptr;      // hardware path: av_hwframe_transfer_data destination
     AVBufferRef* hw_device = nullptr;
@@ -920,13 +921,37 @@ int VaapiBackend::open_decoder(uint32_t codec) {
     // codec==1 is AVC/H.264: measured on two titles as codec=1 profile=100, and profile_idc 100 is
     // H.264 High Profile. 1920x1088 / 3840x2160 corroborate it -- 1088 is 1080 rounded up to an
     // H.264 16-pixel macroblock row. Anything else is refused rather than guessed at.
-    if (codec != 1) {
-        fprintf(stderr, "[vdec2] open_decoder: codec=%u is not AVC/H.264(1); refusing rather than "
-                        "guessing a bitstream format (#2270)\n", codec);
+    // codec==2382845 is VP9, and that is NOT read off the enum -- the enum value is not a small
+    // ordinal and we have no published table for it. It is read off the BITSTREAM, which is primary
+    // evidence and cannot be argued with: Sonic Racing: CrossWorlds' first access unit begins
+    //
+    //     82 49 83 42 60 ef f0 86 ...
+    //
+    // 0x82 = 1000 0010: frame_marker=0b10 (VP9 requires exactly 2), profile_low=0, profile_high=0
+    // (profile 0), show_existing_frame=0, frame_type=0 (KEY frame), show_frame=1 -- and a VP9 key
+    // frame is followed by the frame sync code 0x49 0x83 0x42, which is exactly bytes 1..3. Later
+    // access units start 0x86, the same layout with frame_type=1 (inter). There are no Annex-B start
+    // codes anywhere in the stream, so it is neither H.264 nor HEVC.
+    //
+    // The decoder contract corroborates the geometry independently: max=3840x2160 with
+    // max_frame_size=12441600, and 12441600 / (3840*2160) = 1.5 bytes/pixel = NV12.
+    //
+    // CONFIDENCE: HIGH that this title's stream is VP9 (sync code, from the guest's own buffer).
+    // CONFIDENCE: MED that the value 2382845 *means* VP9 in general -- that mapping rests on one
+    // title. A second title reporting 2382845 with a non-VP9 stream would falsify it, which is what
+    // the sync-code check in decode_au() below is for: it makes a wrong mapping LOUD rather than
+    // letting libavcodec fail somewhere downstream with an unrelated-looking error.
+    AVCodecID want = AV_CODEC_ID_NONE;
+    const char* want_name = nullptr;
+    if (codec == 1)             { want = AV_CODEC_ID_H264; want_name = "H.264"; }
+    else if (codec == 2382845)  { want = AV_CODEC_ID_VP9;  want_name = "VP9";   }
+    else {
+        fprintf(stderr, "[vdec2] open_decoder: codec=%u is not a bitstream format we have identified "
+                        "(1=AVC/H.264, 2382845=VP9); refusing rather than guessing (#2270)\n", codec);
         return -1;
     }
-    const AVCodec* av = avcodec_find_decoder(AV_CODEC_ID_H264);
-    if (!av) { fprintf(stderr, "[vdec2] no H.264 decoder in this libavcodec build\n"); return -1; }
+    const AVCodec* av = avcodec_find_decoder(want);
+    if (!av) { fprintf(stderr, "[vdec2] no %s decoder in this libavcodec build\n", want_name); return -1; }
 
     AuDecoder d;
     // VA-API FIRST, and not as an optimisation. A VA-API H.264 decoder produces NV12 surfaces
@@ -992,6 +1017,28 @@ bool VaapiBackend::decode_au(int id, const uint8_t* au, size_t bytes, VideoFrame
     auto it = g_au_decoders.find(id);
     if (it == g_au_decoders.end() || !au || !bytes) return false;
     AuDecoder& d = it->second;
+
+    // Make a WRONG codec mapping loud on the very first access unit, instead of letting libavcodec
+    // fail later with an error that reads as a corrupt stream. The VP9 mapping in open_decoder() is
+    // derived from one title's bitstream, so it is exactly the kind of inference that must announce
+    // its own falsification: a VP9 key frame carries frame_marker==0b10 in the top two bits and the
+    // sync code 0x49 0x83 0x42 immediately after the first byte. Checked once per decoder, and it
+    // only ever warns -- a stream that fails this may still decode, and refusing here would turn a
+    // diagnostic into a regression.
+    if (!d.checked_first_au) {
+        d.checked_first_au = true;
+        if (d.ctx && d.ctx->codec_id == AV_CODEC_ID_VP9 && bytes >= 4) {
+            const bool marker = (au[0] & 0xC0) == 0x80;
+            const bool sync   = au[1] == 0x49 && au[2] == 0x83 && au[3] == 0x42;
+            const bool keyfrm = (au[0] & 0x04) == 0;
+            if (!marker || (keyfrm && !sync))
+                fprintf(stderr,
+                        "[vdec2] WARNING: opened as VP9 but the first access unit does not look like "
+                        "VP9 (head=%02x %02x %02x %02x, frame_marker=%s, sync=%s). The codec->format "
+                        "mapping may be wrong for this title -- see open_decoder (#2270).\n",
+                        au[0], au[1], au[2], au[3], marker ? "ok" : "BAD", sync ? "ok" : "absent");
+        }
+    }
 
     // av_packet_from_data would take ownership of a buffer we do not own; the guest's access unit
     // lives in guest memory and must not be freed by libavcodec.
