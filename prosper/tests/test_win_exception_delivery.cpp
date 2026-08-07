@@ -935,8 +935,23 @@ int main() {
     for (int i = 0; i < 2000 && !nested_wait_ready; ++i) Sleep(1);
     CHECK(nested_wait_ready != 0, "guest handler entered its nested semaphore-style wait");
     GuestWaitSnapshot nested_waits[4]{};
-    const size_t nested_wait_count =
-        snapshot_guest_waits(worker_tid, nested_waits, sizeof(nested_waits) / sizeof(nested_waits[0]));
+    size_t nested_wait_count = 0;
+    // Gate on the REGISTRATION, not on the flag. The handler raises nested_wait_ready two statements
+    // before the interruptible_cond_wait that registers the inner wait, so the flag being set does
+    // not mean there are two waits yet -- and sampling in that window sees only the outer one, which
+    // fails the count arm below AND makes the singular snapshot succeed where it must refuse. On a
+    // loaded runner that window is wide enough to hit: the arms passed on two runs of a branch and
+    // failed on a third whose only diff was two Python files (#2237).
+    //
+    // This does not weaken the arms. snapshot_guest_waits is the instrument under test, so a genuine
+    // failure to register never reaches 2, the loop times out, and the count arm reddens exactly as
+    // it does today -- the loop removes a window, it cannot manufacture a pass.
+    for (int i = 0; i < 2000; ++i) {
+        nested_wait_count = snapshot_guest_waits(worker_tid, nested_waits,
+                                                 sizeof(nested_waits) / sizeof(nested_waits[0]));
+        if (nested_wait_count >= 2) break;
+        Sleep(1);
+    }
     bool nested_has_outer = false;
     bool nested_has_distinct_inner = false;
     for (size_t i = 0; i < nested_wait_count && i < 4; ++i) {
