@@ -1857,13 +1857,27 @@ struct SpirvCompute {
     // Compute lowers that exact 2D resource through a detiled storage-buffer view instead. The live
     // backend recognizes the reflected atomic buffer over a StorageImage resource, detiles before
     // dispatch, and tiles the result back afterwards. Graphics retains the native image-atomic path.
+    // Bindings this function itself declared, so a REPEAT use of one is a hit rather than a
+    // failure. A shader with two image atomics on the same image called here twice: the first
+    // declared cbuf_var[binding], and the second was refused by the `cbuf_var.count(binding)` guard
+    // -- which rejected the whole shader for the crime of using its own image twice. Measured on
+    // Sonic Racing: CrossWorlds, where the resource table has NO entry at the binding in question,
+    // so declare_cbufs cannot have been the declarer (#2265).
+    //
+    // Only OUR bindings are reusable. A binding declared by declare_cbufs from a
+    // ConstantBuffer/VertexBuffer resource is still refused: the types happen to match, which is
+    // exactly what would make aliasing onto someone else's buffer silent rather than loud.
+    std::set<uint32_t> atomic_img_buf_bindings;
     bool declare_compute_atomic_image_buffer(uint32_t binding) {
-        if (!is_compute || !t_ptr_sb_struct_u || cbuf_var.count(binding)) return false;
+        if (!is_compute || !t_ptr_sb_struct_u) return false;
+        if (atomic_img_buf_bindings.count(binding)) return true;   // ours already; reuse it
+        if (cbuf_var.count(binding)) return false;                 // someone else's; refuse
         const uint32_t variable = id();
         put(deco, Op_Decorate, {variable, Dec_DescriptorSet, desc_set});
         put(deco, Op_Decorate, {variable, Dec_Binding, binding});
         put(types, Op_Variable, {t_ptr_sb_struct_u, variable, SC_StorageBuffer});
         cbuf_var[binding] = variable;
+        atomic_img_buf_bindings.insert(binding);
         return true;
     }
     // LDS (Local Data Share) — a workgroup-shared u32 array for compute ds_read/ds_write. NGG shaders
