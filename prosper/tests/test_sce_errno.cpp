@@ -166,6 +166,50 @@ int main() {
         }
     }
 
+    // ===== scePthreadAttrSetstacksize: fallible, and encoded on the Sony spelling (#2183) =======
+    // It used to accept a null attr and any size, silently, reporting success -- while its sibling
+    // scePthreadAttrSetstack rejected the SAME three conditions with EINVAL. A guest asking for an
+    // 8 KiB stack was told yes by one entry point and no by the other, and its thread was then
+    // created with whatever size the attribute already carried.
+    {
+        auto attr_init    = Hle::lookup(nid_hash("scePthreadAttrInit"));
+        auto sce_setsize  = Hle::lookup(nid_hash("scePthreadAttrSetstacksize"));
+        auto pos_setsize  = Hle::lookup(nid_hash("pthread_attr_setstacksize"));
+        auto getsize      = Hle::lookup(nid_hash("scePthreadAttrGetstacksize"));
+        auto attr_destroy = Hle::lookup(nid_hash("scePthreadAttrDestroy"));
+        CHECK(attr_init && sce_setsize && pos_setsize && getsize && attr_destroy,
+              "the pthread-attr stack entry points are registered");
+        if (attr_init && sce_setsize && pos_setsize && getsize && attr_destroy) {
+            void* at = nullptr;
+            const uint64_t slot = (uint64_t)(uintptr_t)&at;
+            attr_init(slot, 0, 0, 0, 0, 0);
+            CHECK(at != nullptr, "the attribute initializes");
+
+            // The pair, on the same undersized request. Neither spelling alone can see the other
+            // drifting, which is the whole reason #2178 asserts both halves per entry point.
+            CHECK(sce_setsize(slot, 4096, 0, 0, 0, 0) == 0x80020016ull,
+                  "scePthreadAttrSetstacksize refuses a 4 KiB stack with encoded EINVAL "
+                  "(0x80020016), the same answer its scePthreadAttrSetstack sibling already gave");
+            CHECK(pos_setsize(slot, 4096, 0, 0, 0, 0) ==
+                      static_cast<uint64_t>(FreeBsdErrno::EInval),
+                  "pthread_attr_setstacksize refuses the same request with the bare errno (22)");
+            CHECK(sce_setsize(0, 256 * 1024, 0, 0, 0, 0) == 0x80020016ull,
+                  "a null attribute handle is refused even for a valid size");
+
+            // The arm that stops "reject everything" from passing: a VALID size must still be
+            // stored and must read back. Without it the three arms above are equally satisfied by a
+            // handler broken in the other direction, which is the cheaper mistake to make here.
+            CHECK(sce_setsize(slot, 256 * 1024, 0, 0, 0, 0) == 0,
+                  "a 256 KiB stack is still accepted");
+            size_t stored = 0;
+            getsize(slot, (uint64_t)(uintptr_t)&stored, 0, 0, 0, 0);
+            CHECK(stored == 256 * 1024,
+                  "scePthreadAttrGetstacksize reads back the size that was accepted");
+
+            attr_destroy(slot, 0, 0, 0, 0, 0);
+        }
+    }
+
     // ---- behavioral: scePthreadMutexTimedlock timeout --------------------------------------
     {
         auto mtx_init = Hle::lookup(nid_hash("scePthreadMutexInit"));

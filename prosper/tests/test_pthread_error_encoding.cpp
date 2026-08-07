@@ -75,6 +75,13 @@ struct Row {
 // object provokes EINVAL in all of them (each body opens with a `!a0` / `ensure_*` guard), so one
 // zero-argument call exercises every row uniformly.
 const Row kRows[] = {
+    // --- thread attributes: the two stack setters (#2183) ---
+    // scePthreadAttrSetstacksize was previously INFALLIBLE, and for the wrong reason: it swallowed
+    // a null attr and an undersized request and reported success, while scePthreadAttrSetstack
+    // rejected the same three conditions. Making it fallible and giving it its alias are one
+    // change, not two -- splitting them would have started handing the Sony spelling a bare errno.
+    {"scePthreadAttrSetstacksize",   "pthread_attr_setstacksize",   "#2183"},
+    {"scePthreadAttrSetstack",       "pthread_attr_setstack",       "#2183, alias was missing"},
     // --- mutex attributes ---
     {"scePthreadMutexattrInit",      "pthread_mutexattr_init",      "#2178"},
     {"scePthreadMutexattrSettype",   "pthread_mutexattr_settype",   "#2178"},

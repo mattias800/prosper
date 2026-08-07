@@ -1323,18 +1323,39 @@ HLE(k_attr_destroy) {
     }
     return 0;
 }
+// The guard MIRRORS k_attr_setstack below: same three rejected conditions, same answer (#2183).
+// It used to wrap the success path in `if (a0 && *a0 && a1 >= 16384)` and return 0 regardless, so a
+// guest asking for an 8 KiB stack was told YES here and NO by scePthreadAttrSetstack -- the same
+// question answered two ways (the #1873 shape) -- and the thread was then created with whatever size
+// the attribute already carried. The guest believed it had configured a stack it had not.
+//
+// Rejecting rather than clamping, because k_attr_setstack already assumes rejection and FreeBSD's
+// pthread_attr_setstacksize returns EINVAL below PTHREAD_STACK_MIN. CONFIDENCE: MED on the boundary
+// itself -- no live title evidence pins the PS5's behaviour at exactly 16 KiB, and the 16384 here is
+// inherited from the sibling rather than independently established.
+//
+// The rejection LOGS unconditionally rather than under PROSPER_SYNCLOG. This handler previously
+// could not fail, so any title relying on the silent acceptance changes behaviour here, and that
+// must not be invisible: a refused stack request is exactly the kind of thing that surfaces later as
+// an unexplained thread fault with nothing connecting it back to this call.
 HLE(k_attr_setstacksize) {
-    if (a0 && *(void**)a0 && a1 >= 16384) {
-        auto* at = (GuestPthreadAttr*)*(void**)a0;
-        int rc = pthread_attr_setstacksize(&at->host, a1);
-        if (getenv("PROSPER_SYNCLOG"))
-            fprintf(stderr, "[thread] attr setstacksize attr=%p size=0x%llx rc=%d\n",
-                    (void*)at, (unsigned long long)a1, rc);
-        if (rc == 0) {
-            at->supplied_stack = nullptr; at->supplied_stack_size = 0;
-        }
+    if (!a0 || !*(void**)(uintptr_t)a0 || a1 < 16384) {
+        static std::atomic<unsigned> refused{0};
+        if (refused.fetch_add(1) < 16)
+            fprintf(stderr, "[thread] attr setstacksize REFUSED attr=0x%llx size=0x%llx "
+                            "(null/uninitialised attr, or below the 16 KiB minimum) -- #2183\n",
+                    (unsigned long long)a0, (unsigned long long)a1);
+        return 0x16;   // bare EINVAL; the Sony spelling encodes it through the alias below
     }
-    return 0;
+    auto* at = (GuestPthreadAttr*)*(void**)a0;
+    int rc = pthread_attr_setstacksize(&at->host, a1);
+    if (getenv("PROSPER_SYNCLOG"))
+        fprintf(stderr, "[thread] attr setstacksize attr=%p size=0x%llx rc=%d\n",
+                (void*)at, (unsigned long long)a1, rc);
+    if (rc == 0) {
+        at->supplied_stack = nullptr; at->supplied_stack_size = 0;
+    }
+    return fbsd_errno(rc);
 }
 HLE(k_attr_setstack) {
     // Sony and every host backend we support require at least 16 KiB here.  MinGW's winpthreads
@@ -1359,6 +1380,17 @@ HLE(k_attr_setstack) {
     return fbsd_errno(rc);
 #endif
 }
+// Both stack-setting entry points are fallible, so both need the Sony/POSIX split (#1984, #2178).
+// setstacksize needs it because #2183 just MADE it fallible: landing that without the alias would
+// have started handing scePthreadAttrSetstacksize a bare FreeBSD errno, which is exactly the defect
+// the alias exists to prevent -- the two are one change, not two.
+//
+// setstack gets one in the same commit because it was ALREADY returning a bare errno from both its
+// 0x16 and its fbsd_errno(rc) paths. Fixing only its sibling would have left the pair still
+// disagreeing about the ENCODING, i.e. moved the "same question answered two ways" defect one step
+// rather than removing it.
+SCE_PTHREAD_ALIAS(k_sce_attr_setstacksize, k_attr_setstacksize)
+SCE_PTHREAD_ALIAS(k_sce_attr_setstack,     k_attr_setstack)
 HLE(k_attr_setguardsize) {
     if (!a0 || !*(void**)(uintptr_t)a0) return 0x16;   // SCE_KERNEL_ERROR_EINVAL
     auto* at = (GuestPthreadAttr*)*(void**)(uintptr_t)a0;
@@ -4108,8 +4140,8 @@ void register_kernel_hle() {
     R("scePthreadExit", k_pthread_exit);
     R("scePthreadAttrInit", k_attr_init);
     R("scePthreadAttrDestroy", k_attr_destroy);
-    R("scePthreadAttrSetstack", k_attr_setstack);
-    R("scePthreadAttrSetstacksize", k_attr_setstacksize);
+    R("scePthreadAttrSetstack", k_sce_attr_setstack);            // encoded (#2183)
+    R("scePthreadAttrSetstacksize", k_sce_attr_setstacksize);    // encoded (#2183)
     R("scePthreadAttrSetguardsize", k_attr_setguardsize);
     R("scePthreadAttrSetinheritsched", k_attr_noop);
     R("scePthreadAttrSetschedpolicy", k_attr_noop);
