@@ -554,13 +554,35 @@ extern "C" void* prosper_agc_reg_defaults(unsigned int version) {
     static std::atomic<bool> announced{false};
     if (!announced.exchange(true))
         std::fprintf(stderr, "[agc] register defaults requested for SDK version %u\n", version);
-    // The post-submit visibility contract is a real SDK-13 behavioural difference and
-    // stays version-gated; the register table itself does not, because the keys a
-    // guest searches for are the same on every version it may ask about.
-    if (version >= 13) prosper_gpu_enable_post_submit_visibility();
+    // The post-submit visibility contract is NOT version-dependent, and the `>= 13` gate this
+    // replaced was an artifact rather than a contract (#2220).
+    //
+    // The model holds a submit's completion writes private until the submit scope closes, so a guest
+    // can never observe a half-retired frame. Its own justification in command_processor.cpp is
+    // "completion is post-submit BY CONSTRUCTION on real HW" — a statement about hardware, which
+    // does not acquire a version boundary. The gate arrived incidentally in 474af058
+    // ("fix(gpu): reach Dragon Quest VII title", 2026-07-25), whose message never mentions version
+    // 13, the contract, or why that boundary; and Dragon Quest VII requests **SDK 13**. The boundary
+    // was the version of the one title it was developed against.
+    //
+    // Measured on both sides before removing it (#2219, #2220):
+    //   * OUTSIDE the contract corrupts. ArcRunner (PPSA21406, SDK 10) and Crisis Core (PPSA07809,
+    //     SDK 10) both fault 3 of 3 on a default route; the guest's builder thread rebuilds its
+    //     command-chunk labels while prosper is inside the fold consuming the previous generation,
+    //     because prosper applies a submit's completion writes while still executing the rest of the
+    //     same command buffer. Armed, both survive 3 of 3, and ArcRunner renders its title screen.
+    //   * INSIDE the contract costs nothing. All three snapshot-guarded pre-13 titles pass their
+    //     reviewed gameplay guards with it armed: dead-cells-gameplay (SDK 10), blasphemous2-gameplay
+    //     (SDK 10), alexkidd-gameplay (SDK 8) — control arm and armed arm both rc=0.
+    //
+    // `PROSPER_POST_SUBMIT_VISIBILITY=0` forces it back off for bisection if a title ever needs it.
+    // CONFIDENCE: HIGH that the boundary was wrong; MED that no unguarded pre-13 title depends on
+    // the old behaviour — three of the six pre-13 titles in the census carry no guard.
+    prosper_gpu_enable_post_submit_visibility();
     return prosper::agc::public_defaults();
 }
 extern "C" void* prosper_agc_reg_defaults_internal(unsigned int version) {
-    if (version >= 13) prosper_gpu_enable_post_submit_visibility();
+    (void)version;   // see the note above: the contract is not version-dependent (#2220)
+    prosper_gpu_enable_post_submit_visibility();
     return &prosper::agc::g_reg_defaults2;
 }
