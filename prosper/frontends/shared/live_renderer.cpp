@@ -644,7 +644,7 @@ uint32_t buffer_upload_bytes(uint32_t declared_bytes) {
     // PROSPER_MAX_BUFFER_UPLOAD_MB=N lowers the ceiling (1..64 MiB) so one build can reproduce the
     // #1427 collapse and its fix back to back; unset/invalid keeps the full ceiling.
     static const uint32_t ceiling = [] {
-        const char* value = PROSPER_ENV_VALUE("PROSPER_MAX_BUFFER_UPLOAD_MB");
+        const char* value = getenv("PROSPER_MAX_BUFFER_UPLOAD_MB");
         if (!value || !*value) return kMaxBufferUploadBytes;
         const unsigned long megabytes = strtoul(value, nullptr, 10);
         if (megabytes < 1 || megabytes > 64) return kMaxBufferUploadBytes;
@@ -686,7 +686,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // Resource tables are built before the submit reaches this callback. Publish the renderer's
     // default mode now so unmapped render-target descriptors remain available for RTT injection.
     // Outside a registered renderer, resource decoding retains its strict unknown-format policy.
-    if (!PROSPER_ENV_ON("PROSPER_RTT_SINGLE_TARGET") && !PROSPER_ENV_ON("PROSPER_RTT_PERTARGET")) {
+    // PROSPER_RTT_PERTARGET is read LIVE here even though this runs once: the very next lines SET
+    // it, so it is a variable this process writes to itself. Caching it would be correct today
+    // (each macro use site has its own static, and :1067 reads after this one) but it is correct by
+    // ordering rather than by construction, and it is the only thing that would put this name in
+    // the cached-vs-armed intersection below. A gate with one standing exception is a gate people
+    // stop reading. This site is init-time, so a live read costs nothing.
+    if (!PROSPER_ENV_ON("PROSPER_RTT_SINGLE_TARGET") && !getenv("PROSPER_RTT_PERTARGET")) {
 #ifdef _WIN32
         _putenv_s("PROSPER_RTT_PERTARGET", "1");
 #else
@@ -1081,7 +1087,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         !PROSPER_ENV_VALUE("PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS") && !getenv("PROSPER_GPU_CAPTURE") &&
         timeline_capture_permits_live_targets && !PROSPER_ENV_VALUE("PROSPER_GPU_REPLAY_EXPORT_RTT") &&
         !getenv("PROSPER_GPU_REPLAY_RTT_SEEDS") && !PROSPER_ENV_VALUE("PROSPER_DUMP_SAMPLED_RTT") &&
-        !PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS") && !PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS_RGBA") &&
+        !PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS") && !getenv("PROSPER_DUMP_RTGROUPS_RGBA") &&
         !PROSPER_ENV_VALUE("PROSPER_DUMP_DRAWSTEPS") &&
         !PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM") && !PROSPER_ENV_VALUE("PROSPER_TARGET_STEP_HASH_DIM") &&
         !PROSPER_ENV_VALUE("PROSPER_RTTLOG");
@@ -3317,7 +3323,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                 if (inspected[p] || inspected[p+1] || inspected[p+2]) rgbnz++;
                                                 for (int k = 0; k < 4; k++) nz += (inspected[p+k] != 0);
                                             }
-                                            const char* dd = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR");
+                                            const char* dd = getenv("PROSPER_FRAME_DIR");
                                             char fn[512]; snprintf(fn, sizeof fn, "%s/sampledrtt_%llx_%ux%u.bmp",
                                                                    dd ? dd : ".", (unsigned long long)r.gpu_addr, tw, th);
                                             prosper::test::dump_bmp(fn, inspected, tw, th);
@@ -3725,7 +3731,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 if (PROSPER_ENV_ON("PROSPER_DUMP_RAWTILE") && got >= nlin.size() && tw <= 2048 && th <= 1024) {
                                     static std::set<uint64_t> nseen;
                                     if (nseen.insert(r.gpu_addr).second) {
-                                        std::string dd = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") ? PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") : ".";
+                                        std::string dd = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
                                         char bn[512]; snprintf(bn, sizeof bn, "%s/narrowtile_%ux%u_b%u_%llx.bin",
                                                                dd.c_str(), tw, th, bpt, (unsigned long long)r.gpu_addr);
                                         if (FILE* bf = fopen(bn, "wb")) { fwrite(traw.data(), 1, traw.size(), bf); fclose(bf);
@@ -3786,7 +3792,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // PROSPER_DUMP_RAWTEX: write the raw tiled RGBA bytes (pre-detile) to a .bin for
                         // offline swizzle experimentation.
                         if (PROSPER_ENV_ON("PROSPER_DUMP_RAWTEX") && !texture_pixels.empty()) {
-                            std::string d = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") ? PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") : ".";
+                            std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
                             char fn[512]; snprintf(fn, sizeof fn, "%s/rawtex_%ux%u.bin", d.c_str(), tw, th);
                             if (FILE* f = fopen(fn, "wb")) { fwrite(texture_pixels.data(), 1, nb, f); fclose(f);
                                 fprintf(stderr, "[render] dumped raw tiled bytes -> %s (%zu)\n", fn, nb); fflush(stderr); }
@@ -3824,7 +3830,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 static std::set<uint64_t> rawseen;
                                 bool small = tw <= 2048 && th <= 1024;
                                 if (!small || rawseen.insert(r.gpu_addr).second) {
-                                    std::string dd = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") ? PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") : ".";
+                                    std::string dd = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
                                     char bn[512];
                                     if (small) snprintf(bn, sizeof bn, "%s/rawtile_%ux%u_%llx.bin", dd.c_str(), tw, th, (unsigned long long)r.gpu_addr);
                                     else snprintf(bn, sizeof bn, "%s/tiled_f%04d_b%u_%ux%u.bin", dd.c_str(), (int)frame_no, r.binding, tw, th);
@@ -3925,7 +3931,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             if (PROSPER_ENV_ON("PROSPER_DUMP_RESOURCE_VERSION")) {
                                 static std::set<std::pair<uint64_t, uint64_t>> dumped_versions;
                                 if (dumped_versions.emplace(r.gpu_addr, sample_hash).second) {
-                                    const char* dd = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR");
+                                    const char* dd = getenv("PROSPER_FRAME_DIR");
                                     char fn[512];
                                     snprintf(fn, sizeof fn, "%s/resource_%llx_%ux%u_%016llx.bmp",
                                              dd && *dd ? dd : ".", (unsigned long long)r.gpu_addr, tw, th,
@@ -4044,7 +4050,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // bypassing the shader — reveals whether the render target is tiled or linear.
                         if (PROSPER_ENV_ON("PROSPER_DUMP_TEX") && !texture_pixels.empty() && frame_no < 200 &&
                             fr.texture_format == VK_FORMAT_R8G8B8A8_UNORM) {
-                            std::string d = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") ? PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") : ".";
+                            std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
                             char fn[512]; snprintf(fn, sizeof fn, "%s/rawtex_f%04d_b%u.bmp", d.c_str(), (int)frame_no, r.binding);
                             prosper::test::dump_bmp(fn, texture_pixels, tw, th);
                             fprintf(stderr, "[render] dumped raw texture -> %s\n", fn); fflush(stderr);
@@ -4055,7 +4061,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fr.texture_format == VK_FORMAT_R8G8B8A8_UNORM) {
                             static std::unordered_map<uint64_t,int> seen; static int ndumped = 0;
                             if (seen[r.gpu_addr]++ == 0 && ndumped++ < 60) {
-                                std::string d = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") ? PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") : ".";
+                                std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
                                 char fn[512]; snprintf(fn, sizeof fn, "%s/tex_%ux%u_%llx_c%u.bmp", d.c_str(), tw, th,
                                                        (unsigned long long)r.gpu_addr, r.num_components);
                                 prosper::test::dump_bmp(fn, texture_pixels, tw, th);
@@ -5762,7 +5768,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             size_t snz = 0; for (uint8_t b : spx) snz += (b != 0);
                             fprintf(stderr, "[rtt] drawstep %zu/%zu tgt=0x%llx px_nonzero=%zu\n",
                                     k, pass.size(), (unsigned long long)base, snz);
-                            const char* dd = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR");
+                            const char* dd = getenv("PROSPER_FRAME_DIR");
                             char fn[512]; snprintf(fn, sizeof fn, "%s/drawstep_%04d_%zu.bmp",
                                                    dd ? dd : ".", frame_no.load(), k);
                             prosper::test::dump_bmp(fn, spx, gw, gh);
@@ -5777,13 +5783,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     //    format inspection) — needed to reason about premultiplied-alpha UI compositing
                     //    that samples an RT's alpha as a blend factor. Non-RGBA8 targets are skipped
                     //    visibly rather than writing native bytes under a misleading .rgba contract.
-                    if ((PROSPER_ENV_ON("PROSPER_DUMP_RTGROUPS") || PROSPER_ENV_ON("PROSPER_DUMP_RTGROUPS_RGBA")) &&
+                    if ((PROSPER_ENV_ON("PROSPER_DUMP_RTGROUPS") || (getenv("PROSPER_DUMP_RTGROUPS_RGBA") != nullptr)) &&
                         !rendered_pixels.empty()) {
                         size_t nz = 0; for (uint8_t b : rendered_pixels) nz += (b != 0);
                         const char* address_filter = PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS_ADDR");
                         const uint64_t wanted_base = address_filter && *address_filter
                             ? strtoull(address_filter, nullptr, 0) : 0;
-                        const char* dd = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR");
+                        const char* dd = getenv("PROSPER_FRAME_DIR");
                         // Identify the pass by its first..last draw index so multiple passes to the same
                         // target VA in one frame do not silently overwrite each other.
                         const uint64_t pass_d0 = render_pass.empty() ? 0u : render_pass.front()->draw_index;
@@ -5800,7 +5806,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // transparent (all-zero) group is captured too. Self-describing filename
                             // (extent + draw range) and failure-visible: a missing file must not be
                             // mistaken for a transparent/empty result.
-                            if (PROSPER_ENV_ON("PROSPER_DUMP_RTGROUPS_RGBA")) {
+                            if ((getenv("PROSPER_DUMP_RTGROUPS_RGBA") != nullptr)) {
                                 const uint64_t expected_bytes_u64 = static_cast<uint64_t>(gw) * gh * 4u;
                                 const bool rgba8_format = pass_format == VK_FORMAT_R8G8B8A8_UNORM;
                                 const bool size_valid = expected_bytes_u64 <= SIZE_MAX &&
@@ -5977,7 +5983,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     static std::atomic<uint64_t> dp_submit{0};
                     const uint64_t sub = dp_submit.fetch_add(1);
                     if (g_persist_window.contains(sub, diagnostic_elapsed_ms())) {
-                        const char* dd = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR");
+                        const char* dd = getenv("PROSPER_FRAME_DIR");
                         fprintf(stderr, "[persist] submit=%llu present: front=%d/%d front_va=0x%llx "
                                 "selected=%s vo:", (unsigned long long)sub, vo_front, vo_n,
                                 (unsigned long long)front_va,
