@@ -1433,6 +1433,10 @@ int main(int argc, char** argv) {
     // automation would mean a second set of rules for who owns a reserved file, and that is the
     // one part of this that has already been hard to get right.
     auto arm_frame_grab = [&](bool automatic, const char* why) {
+        // Every line this path emits is read by an agent, not an operator. `source` names what armed
+        // the capture, so a SCHEDULED grab reports its trigger rather than a keypress nobody made --
+        // a log line naming F9 on a run with no window sends its reader looking for an operator.
+        const char* const source = automatic ? why : "F9";
         std::fprintf(stderr, "[grab] %s bundle grab requested (%s)\n",
                      automatic ? "automatic" : "F9", why);
                 // Claim both output names now, from ONE timestamp, with an exclusive create. Doing
@@ -1443,8 +1447,8 @@ int main(int argc, char** argv) {
                 // change exists to make impossible.
                 const prosper::frontend::FrameGrabPaths grab = grabNamer.reserve();
                 if (!grab.ok) {
-                    std::fprintf(stderr, "[grab] F9 #%u: could not reserve capture files: %s\n",
-                                 grab.index, grab.error.c_str());
+                    std::fprintf(stderr, "[grab] %s #%u: could not reserve capture files: %s\n",
+                                 source, grab.index, grab.error.c_str());
                     return;
                 }
                 // This line names NO file, deliberately. A log line must assert only what is true
@@ -1456,7 +1460,7 @@ int main(int argc, char** argv) {
                 // restore a filename here.
                 std::fprintf(stderr, "%s\n",
                              prosper::frontend::frame_grab_arm_line(
-                                 grab.index, grabNamer.title_label()).c_str());
+                                 grab.index, grabNamer.title_label(), source).c_str());
                 // Honour PROSPER_CAPTURE_BUNDLE_MAX_MB here too (#1587). It was consulted only on
                 // the headless/scheduled paths, so the hotkey was pinned to the 2 GiB default with
                 // no way to raise it without editing code — and one 3840x2160 frame of a deferred
@@ -2186,7 +2190,7 @@ int main(int argc, char** argv) {
                         "  %s\n"
                         "  %s\n"
                         "  budget in force: %llu MiB — raise it with "
-                        "PROSPER_CAPTURE_BUNDLE_MAX_MB=<64..3072> and press F9 again\n"
+                        "PROSPER_CAPTURE_BUNDLE_MAX_MB=<64..3072> and re-arm the capture\n"
                         "============================================================================\n\n",
                         grab.error.c_str(), grab.bundle_path.c_str(), state.c_str(),
                         reservedHere
