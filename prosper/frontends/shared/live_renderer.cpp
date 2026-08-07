@@ -4521,8 +4521,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             pending_timing.texture_ms += elapsed;
                             const uint64_t detail_min_submit = PROSPER_ENV_VALUE("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
                                 ? strtoull(PROSPER_ENV_VALUE("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0) : 0;
-                            if (const char* mode = getenv("PROSPER_RENDER_TIMING");
-                                mode && strcmp(mode, "detail") == 0 &&
+                            // render_timing_detail is the SAME hoist #2214 introduced, already used
+                            // at the sibling site a few lines up; this one was missed. It is inside
+                            // `if (timing_enabled)`, so it costs a normal run nothing -- but it made
+                            // an F8 capture pay a getenv per resource, inflating the enclosing totals
+                            // the capture then reports. An instrument that charges for being read.
+                            if (render_timing_detail &&
                                 static_cast<uint64_t>(g_this_submit) >= detail_min_submit) {
                                 static uint64_t detail_lines = 0;
                                 if ((elapsed >= 0.5 || resource_persistent_invalidation ||
@@ -4616,11 +4620,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // Poison mode keeps the draw running while making invalid bindings visually/numerically
             // unmistakable: magenta/cyan texels for images and NaN-like dwords for buffers. Missing,
             // duplicate, wrong-type, and undersized bindings are replaced from the reflected manifest.
-            auto poison_R = [](std::vector<prosper::test::FrameResource>& resources,
+            // Read once per submit, not once per call. poison_R is invoked TWICE per draw (VS and
+            // PS), so at 2,179 draws in a submit its getenv was 4,358 calls -- and on Windows
+            // getenv takes a process-wide lock and walks the environment block, which is why #2214
+            // measured +43% from removing exactly this shape from the per-resource path.
+            //
+            // Hoisted rather than wrapped in PROSPER_ENV_VALUE, and the difference is not stylistic:
+            // test_gpu_capture_render.cpp and test_shader_resources.cpp ARM this variable at runtime
+            // between phases, and a process-lifetime cache would not observe the second write. Those
+            // tests would not fail -- they would go VACUOUS and keep printing [ok] against a stale
+            // value, which is the #2214 defect that `cached_env_arming_logic` now gates. A per-submit
+            // hoist keeps every runtime write observable from the next submit on.
+            const char* const descriptor_validate_mode = getenv("PROSPER_DESCRIPTOR_VALIDATE");
+            auto poison_R = [descriptor_validate_mode](
+                               std::vector<prosper::test::FrameResource>& resources,
                                const std::vector<uint32_t>& spirv,
                                const prosper::gpu::ShaderResourceTable* table,
                                uint32_t set, prosper::gpu::SpirvShaderStage stage) {
-                const char* mode = getenv("PROSPER_DESCRIPTOR_VALIDATE");
+                const char* mode = descriptor_validate_mode;
                 if (!mode || strcmp(mode, "poison")) return;
                 auto report = prosper::gpu::validate_spirv_descriptor_interface(spirv, table, set, stage, false);
                 static const uint8_t poison_tex[16] = {
@@ -4784,6 +4801,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             };
             auto build_bds = [&](const std::vector<const prosper::gpu::DrawItem*>& group) {
                 std::vector<prosper::test::BackendDraw> bds;
+                // Once per call, not once per draw -- see the note on descriptor_validate_mode above
+                // for why this is a hoist and not a PROSPER_ENV_* cache (test_eop_write.cpp arms
+                // PROSPER_GFXLOG at runtime, and a cached read would make its arms vacuous).
+                const bool gfxlog = getenv("PROSPER_GFXLOG") != nullptr;
                 for (const auto* itp : group) {
                     const auto& it = *itp;
                     if (draw_is_skipped(it.draw_index)) continue;
@@ -4839,7 +4860,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // Indexed draw: hand the executor-fetched index data to the backend (vkCmdDrawIndexed).
                     // Skipped under REFVS — the reference VS is a 3-vertex non-indexed fullscreen triangle.
                     if (!refvs) bd.indices = it.indices;
-                    if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
+                    if (gfxlog) fprintf(stderr,
                         "[render] item %zu: %zu resources vcount=%u instances=%u nidx=%zu topo=%u mask=0x%x blend=%d\n",
                         bds.size(), bd.R.size(), bd.vcount, bd.instance_count, bd.indices.size(), it.ps.topology,
                         it.ps.color_write_mask, (int)it.ps.blend_enable);
