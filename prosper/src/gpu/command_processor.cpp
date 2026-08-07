@@ -765,27 +765,41 @@ void label_hist_report(uint64_t addr, char* out, size_t cap) {
     // Fixed by construction rather than by correcting the constant: append FIRST, and if the
     // entry did not fit, roll the cursor back so no partial entry survives, then say how many
     // were lost. There is no reserve left to drift out of step with the format string.
+    // Room the drop marker will need, held back from the entry loop. A RESERVE is what this change
+    // set out to remove -- but the two are not the same thing and the difference is the whole point:
+    // a reserve for a VARIABLE entry drifts the moment the format changes, while this one is for a
+    // FIXED string whose maximum is fully determined by the format. " +4294967295 more" is 17 bytes
+    // plus a terminator; 24 is that with room to spare, and it cannot rot because `dropped` is a
+    // uint32_t.
+    //
+    // Held back rather than written over the tail, which is how the first version of this fix was
+    // wrong -- and it was wrong in exactly the way it was fixing. Placing the marker at
+    // min(off, cap - 24) let it land INSIDE the last complete entry when the buffer was nearly
+    // full, clipping a good entry to write the notice that entries were clipped. macOS CI caught it
+    // (the platform neither this author nor the reviewer runs); the arm that fired was the
+    // partial-entry one, which had been kept only as a regression guard.
+    constexpr size_t kDropMark = 24;
+    const size_t entry_limit = cap > kDropMark ? cap - kDropMark : 0;
     uint32_t dropped = 0;
     for (uint32_t i = first; i < n; i++) {
         const LabelEvent& e = h.ev[i & 15];
         const size_t before = off;
-        const int m = off < cap ? snprintf(out + off, cap - off, " %s%s@%llu/f%u:0x%llx",
-                                           e.type <= 8 ? nm[e.type] : "?",
-                                           e.origin <= 3 ? qn[e.origin] : "",
-                                           (unsigned long long)e.t_ms, e.fold,
-                                           (unsigned long long)e.aux)
-                                : -1;
-        if (m > 0 && before + (size_t)m < cap) { off = before + (size_t)m; continue; }
+        const int m = off < entry_limit
+            ? snprintf(out + off, entry_limit - off, " %s%s@%llu/f%u:0x%llx",
+                       e.type <= 8 ? nm[e.type] : "?",
+                       e.origin <= 3 ? qn[e.origin] : "",
+                       (unsigned long long)e.t_ms, e.fold,
+                       (unsigned long long)e.aux)
+            : -1;
+        if (m > 0 && before + (size_t)m < entry_limit) { off = before + (size_t)m; continue; }
         out[before] = '\0';                  // drop the partial entry snprintf just wrote
         dropped = n - i;
         break;
     }
-    // Written at a position that always fits, so reporting the loss cannot itself be the thing
-    // that overflows -- which is the failure class this whole change is about.
-    if (dropped && cap >= 24) {
-        const size_t at = off < cap - 24 ? off : cap - 24;
-        snprintf(out + at, cap - at, " +%u more", dropped);
-    }
+    // `off <= entry_limit == cap - kDropMark`, so the marker always fits at `off` and can never
+    // reach an entry that was admitted.
+    if (dropped && cap > kDropMark)
+        snprintf(out + off, cap - off, " +%u more", dropped);
 }
 }
 extern "C" void prosper_label_hist_dump(uint64_t addr, char* out, unsigned cap) {

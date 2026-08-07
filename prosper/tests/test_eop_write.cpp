@@ -2161,6 +2161,51 @@ int main() {
         prosper_label_hist_dump(addr, roomy, sizeof roomy);
         CHECK(strstr(roomy, "more") == nullptr,
               "label_hist_report claims no drops when everything fit");
+
+        // SWEEP the cap, rather than testing one. A single cap exercises one relationship between
+        // the marker and the last admitted entry, and WHICH one depends on how long an entry
+        // happens to be -- which depends on t_ms, a real millisecond clock. So the boundary case
+        // fires on some platforms and not others.
+        //
+        // That is not hypothetical: the first version of this fix placed the marker at
+        // min(off, cap - 24), which lands INSIDE the last complete entry when the buffer is nearly
+        // full -- clipping a good entry to write the notice that entries were clipped. Every arm
+        // above passed on Windows and the partial-entry arm FAILED on macOS CI, on a platform
+        // neither this author nor the reviewer runs. The sweep makes the boundary reachable
+        // everywhere instead of leaving it to the clock.
+        for (size_t cap = 40; cap <= 400; ++cap) {
+            std::vector<char> buf(cap, '');
+            prosper_label_hist_dump(addr, buf.data(), (unsigned)cap);
+            const size_t len = strnlen(buf.data(), cap);
+            if (len >= cap) { CHECK(false, "label_hist_report left its buffer unterminated"); break; }
+            bool bad = false;
+            for (size_t i = 0; i < len; ++i) {
+                if (buf[i] != ' ') continue;
+                const char* field = buf.data() + i + 1;
+                const char* end = strchr(field, ' ');
+                const size_t flen = end ? (size_t)(end - field) : len - (i + 1);
+                // The marker is " +N more" -- TWO space-separated tokens, so stop at the '+'
+                // rather than skipping it, or "more" is scanned as an event and reported as a
+                // partial one. The sweep caught that within seconds of being added, which is the
+                // argument for sweeping: a single cap had never produced a line with a marker AND
+                // a following token.
+                if (flen == 0) continue;
+                if (field[0] == '+') break;
+                const char* colon = (const char*)memchr(field, ':', flen);
+                if (!colon || (size_t)(colon - field) + 3 > flen ||
+                    colon[1] != '0' || colon[2] != 'x')
+                    bad = true;
+            }
+            if (bad) {
+                char msg[128];
+                snprintf(msg, sizeof msg,
+                         "label_hist_report emitted a partial entry at cap=%zu: \"%s\"",
+                         cap, buf.data());
+                CHECK(false, msg);
+                break;
+            }
+        }
+        CHECK(true, "label_hist_report keeps every entry whole across caps 40..400");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
