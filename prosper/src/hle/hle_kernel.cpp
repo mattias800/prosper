@@ -24,6 +24,22 @@
 #include <pthread.h>
 #include <semaphore.h>   // scePthreadSem* -> host sem_t
 #include "../host/posix_shim.hpp"   // Darwin: sem/barrier/timedlock/getattr_np/sigqueue compat
+// raw_fmt_len: snprintf's would-be length clamped to what actually landed (#2050), used by the
+// [exc2] handler below.
+//
+// Guarded, and at FILE SCOPE, for two separate reasons that must both hold:
+//   * raw_syscall.hpp's non-Linux branch includes <sys/mman.h>/<unistd.h> unconditionally, so it is
+//     not MinGW-clean -- hence the guard. The [exc2] handler is POSIX-only, so Windows needs none
+//     of this.
+//   * it declares `namespace prosper`, so including it anywhere nested produces
+//     `prosper::{anonymous}::prosper` and every later `prosper::` lookup resolves into the INNER
+//     namespace and fails. The first attempt put it beside the handler, inside an anonymous
+//     namespace inside `namespace prosper`, and Linux/macOS CI rejected it with
+//     "'guest_module_name' is not a member of 'prosper::{anonymous}::prosper'". A header that opens
+//     a namespace can only be included where that namespace means what the file expects.
+#if defined(__linux__) || defined(__APPLE__)
+#include "../host/raw_syscall.hpp"
+#endif
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
@@ -2659,11 +2675,6 @@ bool g_exc_log = false;               // set once (outside signal ctx) from PROS
 bool g_exc_log2 = false;
 volatile int* g_exc_counter = nullptr; // optional fork-safe raise counter (tests)
 #if defined(__linux__) || defined(__APPLE__)
-// raw_fmt_len: snprintf's would-be length clamped to what actually landed (#2050). Included INSIDE
-// the POSIX guard because raw_syscall.hpp's non-Linux branch includes <sys/mman.h>/<unistd.h>
-// unconditionally, so it is not MinGW-clean -- and the exception handler below is POSIX-only, so
-// nothing here needs it on Windows.
-#include "../host/raw_syscall.hpp"
 int  g_exc_sig = -1;
 #ifdef __APPLE__
 // Darwin has no pthread_sigqueue / RT-signal payload, so the exception TYPE travels through a
