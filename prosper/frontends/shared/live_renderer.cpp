@@ -1232,6 +1232,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // Overlap means the guest genuinely rewrote those bytes and the revalidation is
                 // CORRECT. A single zero cannot tell those apart, so count them separately.
                 uint64_t persistent_submit_unknown = 0, persistent_submit_overlap = 0;
+                // ...and WHY the Unknowns were unknown (#2289). Two structurally different
+                // causes that a single Unknown count cannot separate, and the difference
+                // decides whether the cost is addressable by the submit journal AT ALL:
+                //   unarmed  the journal is not armed on this thread -> missing instrumentation
+                //   stale    it IS armed, but the snapshot came from an EARLIER submit. That is
+                //            not a defect: the journal is intra-submit by construction, so a
+                //            cross-submit question can only ever answer Unknown through it,
+                //            and only a cross-submit WATCH can answer it at all.
+                uint64_t persistent_submit_unarmed = 0, persistent_submit_stale = 0;
                 uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                 double texture_ms = 0, buffer_ms = 0;
                 // Attribution of texture_ms by OUTCOME class (#2262). After #2259 removed the
@@ -2988,9 +2997,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 resource_texture_submit_query =
                                     static_cast<int>(submit_query);
                                 if (timing_enabled && submit_reuse_enabled) {
-                                    if (submit_query == prosper::gpu::GuestGpuWriteQuery::Unknown)
+                                    if (submit_query == prosper::gpu::GuestGpuWriteQuery::Unknown) {
                                         pending_timing.persistent_submit_unknown++;
-                                    else if (submit_query == prosper::gpu::GuestGpuWriteQuery::Overlap)
+                                        if (prosper::gpu::guest_gpu_write_tracking_active())
+                                            pending_timing.persistent_submit_stale++;
+                                        else
+                                            pending_timing.persistent_submit_unarmed++;
+                                    } else if (submit_query == prosper::gpu::GuestGpuWriteQuery::Overlap)
                                         pending_timing.persistent_submit_overlap++;
                                 }
                                 const bool submit_unchanged = submit_reuse_enabled &&
@@ -7052,6 +7065,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t persistent_watch_reuses = 0, persistent_watch_dirty = 0;
                     uint64_t persistent_watch_unknown = 0, persistent_watch_disabled = 0;
                     uint64_t persistent_submit_unknown = 0, persistent_submit_overlap = 0;
+                    uint64_t persistent_submit_unarmed = 0, persistent_submit_stale = 0;
                     uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                     double texture_ms = 0, buffer_ms = 0;
                     // Attribution of texture_ms by OUTCOME class (#2262). After #2259 removed the
@@ -7169,6 +7183,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.persistent_watch_unknown += pending_timing.persistent_watch_unknown;
                     timing.persistent_submit_unknown += pending_timing.persistent_submit_unknown;
                     timing.persistent_submit_overlap += pending_timing.persistent_submit_overlap;
+                    timing.persistent_submit_unarmed += pending_timing.persistent_submit_unarmed;
+                    timing.persistent_submit_stale += pending_timing.persistent_submit_stale;
                     timing.persistent_watch_disabled += pending_timing.persistent_watch_disabled;
                     timing.buffers += pending_timing.buffers;
                     timing.buffer_views += pending_timing.buffer_views;
@@ -7523,7 +7539,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     }
                     fprintf(stderr,
                             "[render-timing] texture_cache hits=%llu submit_reuse=%llu "
-                            "(submit_unknown=%llu submit_overlap=%llu) misses=%llu "
+                            "(submit_unknown=%llu [unarmed=%llu stale=%llu] submit_overlap=%llu) misses=%llu "
                             "watch_reuse=%llu watch_dirty=%llu watch_unknown=%llu watch_disabled=%llu "
                             "invalid=%llu "
                             "validations=%llu %.1f GiB entries=%zu %.1f MiB "
@@ -7531,6 +7547,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (unsigned long long)totals.persistent_hits,
                             (unsigned long long)totals.persistent_submit_reuses,
                             (unsigned long long)totals.persistent_submit_unknown,
+                            (unsigned long long)totals.persistent_submit_unarmed,
+                            (unsigned long long)totals.persistent_submit_stale,
                             (unsigned long long)totals.persistent_submit_overlap,
                             (unsigned long long)totals.persistent_misses,
                             (unsigned long long)totals.persistent_watch_reuses,
