@@ -92,9 +92,22 @@ def repo_root_for(path: pathlib.Path) -> pathlib.Path | None:
     from the one whose build directory is being certified, and resolving `--against` or a dirty-tree
     query against the wrong one answers a question nobody asked.
     """
-    probe = path if path.is_dir() else path.parent
-    root = _git("rev-parse", "--show-toplevel", cwd=probe)
-    return pathlib.Path(root) if root else None
+    probe = (path if path.is_dir() else path.parent).resolve()
+    # --show-cdup, not --show-toplevel: it answers with a path RELATIVE to the probe ("../../", or
+    # "" at the root), so git never gets to choose how the absolute path is spelled.
+    #
+    # --show-toplevel does choose, and under MSYS2 -- which is what the Windows CI job runs -- it
+    # prints a POSIX absolute path ("/d/a/prosper/prosper"). A native-Windows Python cannot use that
+    # as a subprocess cwd, so EVERY later git call in this tool failed and the tool refused
+    # everything it was asked to certify. The exit codes stayed plausible -- a refusal is still a
+    # refusal -- which is why it read as a build failure rather than as a broken path.
+    #
+    # "" is the repo ROOT and is a success, so it must be distinguished from None, which means no
+    # checkout owns this path. Testing the string for truthiness conflates the two.
+    cdup = _git("rev-parse", "--show-cdup", cwd=probe)
+    if cdup is None:
+        return None
+    return (probe / cdup).resolve() if cdup else probe
 
 
 def revision_from_build_dir(build_dir: pathlib.Path) -> str | None:

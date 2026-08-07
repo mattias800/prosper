@@ -23,6 +23,7 @@ would pass against a tool that always failed.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import pathlib
 import re
@@ -297,6 +298,45 @@ def main() -> int:
                   "a drifted template makes the tool refuse, not silently certify")
 
     coverage = f"{ran} arms" + (f", {skipped} skipped" if skipped else "")
+    # --- the Windows CI failure: git's own path spelling reached a subprocess cwd -------------
+    #
+    # MSYS2 git -- what the Windows CI job runs -- answers `rev-parse --show-toplevel` with a POSIX
+    # absolute path ("/d/a/prosper/prosper"). A native-Windows Python cannot use that as a cwd, so
+    # every later git call in the tool failed and it refused everything it was asked to certify:
+    # 9 arms red, all of them "should succeed" cases, while every "should refuse" arm still passed.
+    #
+    # This is a UNIT arm rather than an end-to-end one because the defect only appears with a git
+    # that spells paths that way, and the CI host is the only one here that has one. Substituting
+    # `_git` reproduces it on any host: pre-fix this returns a path that does not exist.
+    spec = importlib.util.spec_from_file_location("check_build_revision_under_test", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def msys_git(*args: str, cwd=None):
+        """git as MSYS2 spells it: POSIX absolute for --show-toplevel, relative for --show-cdup."""
+        if args[:2] == ("rev-parse", "--show-toplevel"):
+            return "/d/a/prosper/prosper"
+        if args[:2] == ("rev-parse", "--show-cdup"):
+            return ""          # the probe IS the root, which is a SUCCESS and not "no repo"
+        return None
+
+    real_git, module._git = module._git, msys_git
+    try:
+        discovered = module.repo_root_for(REPO)
+    finally:
+        module._git = real_git
+    check(discovered is not None and discovered.is_dir(),
+          "a repo root discovered through MSYS-style git output is a usable directory")
+
+    # And "no checkout owns this" must still be distinguishable from "the probe is the root",
+    # which sharing one falsy sentinel ("") would destroy.
+    module._git = lambda *a, **k: None
+    try:
+        check(module.repo_root_for(REPO) is None,
+              "a path no checkout owns still resolves to None rather than to the probe")
+    finally:
+        module._git = real_git
+
     print(f"test_check_build_revision: "
           + (f"{fails} FAILURE(S) ({coverage})" if fails else f"all ok ({coverage})"))
     return 1 if fails else 0
