@@ -319,11 +319,22 @@ HLE(h_free)    { guest_free_portable(P(a0)); return 0; }
 // CONFIDENCE: HIGH on the semantics — this is a published BSD interface with one definition, and
 // the PS5 libc lineage is FreeBSD. The argument order is realloc's, not an inference.
 //
-// The `a1` guard is not defensive noise: guest_realloc_portable(p, 0) already frees p and returns
-// NULL on both platforms, so freeing again there would be a double free. `P(a0)` guards the
-// realloc(NULL, n) case, where there is nothing to release. On Windows a pointer the header check
-// rejects reaches guest_windows_free, which re-validates the magic and refuses safely, so the BSD
-// rule needs no platform-specific exception.
+// The `a1` guard is not defensive noise, and the reason is a three-way platform split rather than
+// the two-way one an earlier revision of this comment claimed (CI on macOS corrected it):
+//
+//   glibc    realloc(p, 0) frees p and returns NULL
+//   Windows  guest_realloc_portable's `if (!size)` frees p and returns NULL, explicitly
+//   macOS    realloc(p, 0) returns a VALID minimum-size block and frees nothing
+//
+// C17 7.22.3.5 leaves the zero case implementation-defined, so all three conform. The guard is
+// correct under every one of them without a platform branch, because it keys on the RESULT rather
+// than on an assumption about it: where NULL comes back the block is already gone and `a1 == 0`
+// stops a double free; where a real block comes back `!r` is false and nothing is freed. Note this
+// means reallocf(p, 0) legitimately returns non-NULL on macOS — do not "fix" that to NULL.
+//
+// `P(a0)` guards the realloc(NULL, n) case, where there is nothing to release. On Windows a pointer
+// the header check rejects reaches guest_windows_free, which re-validates the magic and refuses
+// safely, so the BSD rule needs no platform-specific exception there either.
 HLE(h_reallocf) {
     void* p = P(a0);
     void* r = guest_realloc_portable(p, a1);

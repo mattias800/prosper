@@ -124,16 +124,35 @@ int main() {
     }
 
     // --- reallocf(p, 0) must not double-free -----------------------------------------------------
-    // guest_realloc_portable(p, 0) already frees p and returns NULL on both platforms, so the
-    // free-on-failure rule must not fire here. A double free aborts under glibc's own heap check,
-    // so reaching the assertion at all is most of the evidence; the follow-up allocation confirms
-    // the heap is still usable rather than merely un-aborted.
+    // The zero case is implementation-defined (C17 7.22.3.5) and the platforms genuinely differ, so
+    // this arm asserts the contract that holds everywhere rather than one platform's spelling of it.
+    // An earlier revision asserted `r == nullptr` and was red on macOS -- correctly, and the code was
+    // never wrong; the ASSERTION was:
+    //
+    //   glibc    realloc(p, 0) frees and returns NULL
+    //   Windows  guest_realloc_portable's `if (!size)` frees and returns NULL
+    //   macOS    realloc(p, 0) returns a VALID minimum-size block and frees nothing
+    //
+    // What must be true on all three is that the free-on-failure rule does NOT fire on top of a
+    // release that already happened. Both outcomes are checked for their own follow-through: a NULL
+    // means the block is gone and nothing more is owed, a non-NULL means the caller now owns a real
+    // block and must free it. The heap-intact probe afterwards is the double-free detector -- glibc
+    // aborts outright on a double free, so reaching the probe is most of the evidence and the
+    // successful allocation confirms the heap is usable rather than merely un-aborted.
     {
         auto* p = (void*)(uintptr_t)malloc_fn(64, 0, 0, 0, 0, 0);
         CHECK(p != nullptr, "malloc returns the block for the zero-size arm");
         if (p) {
             auto* r = (void*)(uintptr_t)reallocf_fn(U(p), 0, 0, 0, 0, 0);
-            CHECK(r == nullptr, "reallocf(p, 0) releases the block and returns NULL");
+            // Which branch runs is a platform fact, not a pass/fail condition, so it is REPORTED
+            // rather than asserted -- an assertion that cannot fail is not evidence.
+            if (r) {
+                printf("  [note] reallocf(p, 0) returned a block (macOS-style, C17-conforming)\n");
+                *(volatile unsigned char*)r = 0xA5;   // real storage, not a non-null sentinel
+                free_fn(U(r), 0, 0, 0, 0, 0);
+            } else {
+                printf("  [note] reallocf(p, 0) returned NULL, block released (glibc/Windows)\n");
+            }
             auto* after = (void*)(uintptr_t)malloc_fn(64, 0, 0, 0, 0, 0);
             CHECK(after != nullptr, "the heap is intact afterwards -- no double free on the 0 path");
             if (after) free_fn(U(after), 0, 0, 0, 0, 0);
