@@ -1183,6 +1183,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 uint64_t backend_calls = 0, backend_draws = 0;
                 uint64_t backend_command_buffers = 0, backend_queue_submits = 0;
                 uint64_t backend_fence_waits = 0;
+                // Why each of the ~16 flushes a submit happened (#2276). Exclusive and summing to
+                // the flush count, so the arithmetic is checkable from the printed line alone.
+                uint64_t flush_no_batch = 0, flush_readback = 0;
+                uint64_t flush_storage_writeback = 0, flush_explicit = 0;
                 uint64_t backend_gpu_timestamp_samples = 0;
                 double backend_target_ms = 0, backend_draw_setup_ms = 0;
                 double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
@@ -1357,6 +1361,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.backend_command_buffers += backend.command_buffers;
                 pending_timing.backend_queue_submits += backend.queue_submits;
                 pending_timing.backend_fence_waits += backend.fence_waits;
+                pending_timing.flush_no_batch += backend.flush_no_batch;
+                pending_timing.flush_readback += backend.flush_readback;
+                pending_timing.flush_storage_writeback += backend.flush_storage_writeback;
+                pending_timing.flush_explicit += backend.flush_explicit;
                 pending_timing.backend_gpu_timestamp_samples += backend.gpu_timestamp_samples;
                 pending_timing.backend_target_ms += backend.target_ms;
                 pending_timing.backend_draw_setup_ms += backend.draw_setup_ms;
@@ -6330,7 +6338,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // PROSPER_PASS_LOG=<min-submit>|ms:<millis>: per-pass publish provenance for 3
                     // submits — which pass produced pixels, its target identity, and the defer
                     // decision. The `ms:` form aims the window by wall time (diagnostic_window.hpp).
-                    if (PROSPER_ENV_ON("PROSPER_PASS_LOG")) {
+                    // PROSPER_PASS_LOG_NODEFER opens this block too. It was added INSIDE it and
+                    // armed by its own switch, so setting only PROSPER_PASS_LOG_NODEFER produced
+                    // ZERO lines -- a silent run indistinguishable from "there are no such passes".
+                    // That is #2149's class, committed by the author who had been citing #2149 all
+                    // session: a diagnostic whose producer and printer are armed by different
+                    // switches reports unarmed state as a confident zero.
+                    if (PROSPER_ENV_ON("PROSPER_PASS_LOG") ||
+                        PROSPER_ENV_ON("PROSPER_PASS_LOG_NODEFER")) {
                         const uint64_t at = g_pass_log_submit.load(std::memory_order_relaxed);
                         const bool in_window =
                             g_pass_log_window.contains(at, diagnostic_elapsed_ms());
@@ -6368,14 +6383,55 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // last case has to stay visible out of window: it is the one where this line
                         // cannot say whether the pass carries content, which is exactly when the
                         // reader needs to know the pass existed.
-                        if (in_window || nz > 100 || nz < 0 || defer_readback)
+                        // PROSPER_PASS_LOG_NODEFER: print the NON-DEFERRED passes specifically.
+                        // They are the population #2276 needs and the only one this line cannot
+                        // currently reach: a deferred pass always prints, a content-bearing pass
+                        // prints on `nz > 100`, and the window covers three callbacks -- but a
+                        // non-deferred pass with little content satisfies none of those, so 2,999
+                        // of them a route were invisible while a classifier counted 21 GB of
+                        // readback against them.
+                        //
+                        // Opt-in and separate from PROSPER_PASS_LOG rather than widening the window,
+                        // because the window's three-callback span is deliberate (its comment says
+                        // why) and this needs the whole run, not a wider sample. ~9.7 lines a submit.
+                        static const bool pass_log_nodefer =
+                            PROSPER_ENV_ON("PROSPER_PASS_LOG_NODEFER");
+                        if (in_window || nz > 100 || nz < 0 || defer_readback ||
+                            (pass_log_nodefer && !defer_readback))
                             fprintf(stderr,
+                                    // `bytes` disambiguates px_nonblack=0, which today means EITHER
+                                    // "the readback returned a near-black surface" OR "the readback
+                                    // returned nothing and the counting loop never ran". Those are
+                                    // opposite facts wearing the same number -- #2255's absent-vs-zero
+                                    // collapse, and instrument trap 116's -- and on #2276 it is
+                                    // precisely the ambiguity blocking the diagnosis: 2,999 passes a
+                                    // route take a ~7.1 MB readback and report px_nonblack under 100,
+                                    // and nobody can say from this line whether those surfaces are
+                                    // black or absent.
                                     "[pass] cb=%llu pass=%zu/%zu base=0x%llx %ux%u fmt=%d vo=%d "
-                                    "seed=%d defer=%d writes=%llu px_nonblack=%lld\n",
+                                    // raw_fmt is CB_COLOR0_INFO.FORMAT BEFORE backend_color_format
+                                    // touches it, and it is the field that decides #2283. That
+                                    // converter falls back to R8G8B8A8_UNORM for anything it does
+                                    // not recognise -- INCLUDING 0 -- and R8G8B8A8_UNORM is itself
+                                    // enumerator 37, so the most common real format and "unknown"
+                                    // print identically. `fmt` above therefore cannot distinguish a
+                                    // live colour target from a disabled one, and I nearly published
+                                    // a correctness claim on it.
+                                    //
+                                    // raw_fmt=0 is CB_COLOR_INVALID: the target is DISABLED, the
+                                    // extent in CB_COLOR0_ATTRIB2 is stale from an earlier pass
+                                    // (context registers are sticky), and a base of 0 is correct --
+                                    // the readback is then simply waste. raw_fmt non-zero with
+                                    // base=0 is the opposite: the guest declared a live colour
+                                    // target and prosper does not have its address.
+                                    "seed=%d defer=%d writes=%llu px_nonblack=%lld bytes=%zu "
+                                    "raw_fmt=%u\n",
                                     (unsigned long long)at, pass_i, items.size(),
                                     (unsigned long long)base, gw, gh, (int)pass_format,
                                     (int)is_vo, (int)seed_rtt, (int)defer_readback,
-                                    (unsigned long long)color_target_call.writes, nz);
+                                    (unsigned long long)color_target_call.writes, nz,
+                                    rendered_pixels.size(),
+                                    pass.empty() ? 0u : pass.front()->ps.color0_format);
                     }
                     // Everything this group did AFTER the backend call returned -- RTT store,
                     // scanout selection, per-pass diagnostics. `backend_done` is in scope only on
@@ -6939,6 +6995,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t backend_calls = 0, backend_draws = 0;
                     uint64_t backend_command_buffers = 0, backend_queue_submits = 0;
                     uint64_t backend_fence_waits = 0;
+                    uint64_t flush_no_batch = 0, flush_readback = 0;
+                    uint64_t flush_storage_writeback = 0, flush_explicit = 0;
                     uint64_t backend_gpu_timestamp_samples = 0;
                     double backend_target_ms = 0, backend_draw_setup_ms = 0;
                     double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
@@ -7031,6 +7089,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.backend_command_buffers += pending_timing.backend_command_buffers;
                     timing.backend_queue_submits += pending_timing.backend_queue_submits;
                     timing.backend_fence_waits += pending_timing.backend_fence_waits;
+                    timing.flush_no_batch += pending_timing.flush_no_batch;
+                    timing.flush_readback += pending_timing.flush_readback;
+                    timing.flush_storage_writeback += pending_timing.flush_storage_writeback;
+                    timing.flush_explicit += pending_timing.flush_explicit;
                     timing.backend_gpu_timestamp_samples += pending_timing.backend_gpu_timestamp_samples;
                     timing.backend_target_ms += pending_timing.backend_target_ms;
                     timing.backend_draw_setup_ms += pending_timing.backend_draw_setup_ms;
@@ -7215,11 +7277,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (totals.backend_ms - backend_detail_ms) / nsub);
                     fprintf(stderr,
                             "[render-timing] backend-submit synchronization command_buffers=%.2f "
-                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f\n",
+                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f  "
+                            "flush{readback=%.2f storage_wb=%.2f explicit=%.2f "
+                            "no_batch=%.2f}\n",
                             totals.backend_command_buffers / nsub,
                             totals.backend_queue_submits / nsub,
                             totals.backend_fence_waits / nsub,
-                            totals.backend_gpu_timestamp_samples / nsub);
+                            totals.backend_gpu_timestamp_samples / nsub,
+                            (double)totals.flush_readback / nsub,
+                            (double)totals.flush_storage_writeback / nsub,
+                            (double)totals.flush_explicit / nsub,
+                            (double)totals.flush_no_batch / nsub);
                     fprintf(stderr,
                             "[render-timing] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
                             "resources=%.2f pipeline=%.2f  fixed{index_upload=%.2f blend=%.2f "
@@ -7612,11 +7680,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (window.backend_ms - window_backend_detail_ms) / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit synchronization command_buffers=%.2f "
-                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f\n",
+                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f  "
+                            "flush{readback=%.2f storage_wb=%.2f explicit=%.2f "
+                            "no_batch=%.2f}\n",
                             window.backend_command_buffers / wn,
                             window.backend_queue_submits / wn,
                             window.backend_fence_waits / wn,
-                            window.backend_gpu_timestamp_samples / wn);
+                            window.backend_gpu_timestamp_samples / wn,
+                            (double)window.flush_readback / wn,
+                            (double)window.flush_storage_writeback / wn,
+                            (double)window.flush_explicit / wn,
+                            (double)window.flush_no_batch / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
                             "resources=%.2f pipeline=%.2f  fixed{index_upload=%.2f blend=%.2f "
