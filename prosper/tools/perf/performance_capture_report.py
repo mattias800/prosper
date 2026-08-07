@@ -108,6 +108,27 @@ def _resource_breakdown(renderer):
             "res_buffer_copy": _total(renderer, "res_buffer_copy_ms"),
             "res_descriptor": _total(renderer, "res_descriptor_ms"),
         })
+        # Same rule as have_backend, one level down and for the same reason. A capture predating the
+        # buffer leaves must report them UNAVAILABLE, never 0 -- with 0 the remainder below would
+        # absorb `create`+`index`+`hash` and print a large residual, which is precisely the false
+        # "unattributed work" reading this partition was added to stop.
+        breakdown["buffer_leaves_available"] = any("res_buffer_create_ms" in r for r in renderer)
+        # The same signed-remainder argument, one level down. res_buffer_ms had NO exhaustive
+        # partition until now -- only `copy` and (in the stderr window) `acquire`, two candidate
+        # mechanisms out of an unknown number. An unmeasured region does not read as unmeasured; it
+        # reads as the subject's cost. A diagnostic added inside it billed 305 ms/submit to the
+        # renderer and produced a confident, entirely false finding before a single-variable A/B
+        # killed it. This remainder is what makes that visible on the first run instead of the third.
+        # `acquire` is a stderr-only term, so it is folded into the remainder here rather than
+        # invented -- which is why a healthy value is a few ms, not ~0.
+        if breakdown["buffer_leaves_available"]:
+            breakdown["res_buffer_create"] = _total(renderer, "res_buffer_create_ms")
+            breakdown["res_buffer_index"] = _total(renderer, "res_buffer_index_ms")
+            breakdown["res_buffer_hash"] = _total(renderer, "res_buffer_hash_ms")
+            breakdown["res_buffer_other"] = (
+                breakdown["res_buffer"] - breakdown["res_buffer_copy"]
+                - breakdown["res_buffer_create"] - breakdown["res_buffer_index"]
+                - breakdown["res_buffer_hash"])
         # The remainder is reported as TWO numbers, and this is not fussiness -- it is this file's own
         # argument applied to sign instead of presence.
         #
@@ -354,7 +375,15 @@ def print_summary(summary):
             print("  setup_resources (backend binding):       "
                   f"{breakdown['setup_resources']:.1f}ms"
                   f"  [texture={breakdown['res_texture']:.1f}"
-                  f" buffer={breakdown['res_buffer']:.1f} (copy={breakdown['res_buffer_copy']:.1f})"
+                  f" buffer={breakdown['res_buffer']:.1f} ("
+                  + (f"copy={breakdown['res_buffer_copy']:.1f}"
+                     f" create={breakdown['res_buffer_create']:.1f}"
+                     f" index={breakdown['res_buffer_index']:.1f}"
+                     f" hash={breakdown['res_buffer_hash']:.1f}"
+                     f" other={breakdown['res_buffer_other']:+.1f}"
+                     if breakdown["buffer_leaves_available"]
+                     else f"copy={breakdown['res_buffer_copy']:.1f};"
+                          " create/index/hash UNAVAILABLE in this capture") + ")"
                   f" descriptor={breakdown['res_descriptor']:.1f}"
                   f" other={breakdown['res_other']:.1f}]")
             # Loud, and only when it is genuinely non-zero. A sub-bucket total exceeding its parent
