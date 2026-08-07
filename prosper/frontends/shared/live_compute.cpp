@@ -4494,19 +4494,47 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (bits & (1u << i)) return i;
             return UINT32_MAX;
         };
+        // The SHADER-declared side of every image decision below, reported alongside the guest
+        // resource whenever a binding declines. Without it a decline prints only the resource --
+        // and most accept conditions here are a conjunction of the two, so the message names one
+        // half of a disagreement and hides the other. "layered image deferred to #657" is the
+        // worst case: it reports the guest's dim=5 while `dim_2d_array` additionally requires the
+        // reflected OpTypeImage to be 2D AND arrayed, so the printed line is identical whether the
+        // shader declared a plain 2D view, a cube, or a multisampled image. Set once per binding
+        // so all decline sites inherit it rather than each having to pass it.
+        const SpirvDescriptorBinding* skip_decl = nullptr;
         auto skip_image = [&](const prosper::gpu::ShaderResource* r, const char* why) {
             static std::vector<uint64_t> warned;
             const uint64_t key = r ? r->gpu_addr : 0;
             if (std::find(warned.begin(), warned.end(), key) == warned.end()) {
                 warned.push_back(key);
+                // image_dim defaults to UINT32_MAX for "no OpTypeImage reflected", which is a
+                // materially different state from any real Dim and must not print as 4294967295.
+                char decl[160];
+                if (!skip_decl) {
+                    std::snprintf(decl, sizeof decl, "shader{unreflected}");
+                } else {
+                    char dim[12];
+                    if (skip_decl->image_dim == UINT32_MAX)
+                        std::snprintf(dim, sizeof dim, "?");
+                    else
+                        std::snprintf(dim, sizeof dim, "%u", skip_decl->image_dim);
+                    std::snprintf(decl, sizeof decl,
+                                  "shader{dim=%s arrayed=%u ms=%u depth=%u storage=%u atomic=%u}",
+                                  dim, skip_decl->image_arrayed ? 1u : 0u,
+                                  skip_decl->image_multisampled ? 1u : 0u,
+                                  skip_decl->image_depth ? 1u : 0u,
+                                  skip_decl->kind == SpirvDescriptorKind::StorageImage ? 1u : 0u,
+                                  skip_decl->atomic_access ? 1u : 0u);
+                }
                 std::fprintf(stderr, "[compute] program 0x%llx image 0x%llx %ux%ux%u dim=%u "
-                                     "class=%u fmt=%u comps=%u tile=%u size=%u: %s -> "
+                                     "class=%u fmt=%u comps=%u tile=%u size=%u %s: %s -> "
                                      "dispatch skipped (#590)\n",
                              (unsigned long long)item.code_addr, (unsigned long long)key,
                              r ? r->width : 0, r ? r->height : 0, r ? r->depth : 0,
                              r ? r->img_dim : 0u, r ? static_cast<unsigned>(r->cls) : 0u,
                              r ? (unsigned)r->format : 0u, r ? r->num_components : 0u,
-                             r ? r->tile_mode : 0u, r ? r->size : 0u, why);
+                             r ? r->tile_mode : 0u, r ? r->size : 0u, decl, why);
             }
             images_ready = false;
         };
@@ -4514,6 +4542,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             image_timing_requested && timing_item_selected &&
             (!timing_trace_only || trace);
         for (size_t i = 0; i < image_descriptors.size() && images_ready; i++) {
+            // Every skip_image call below is inside this loop, so the cursor is always the binding
+            // being decided.
+            skip_decl = &image_descriptors[i];
             const auto image_start = ComputeClock::now();
             double import_ms = 0.0;
             double query_ms = 0.0;
