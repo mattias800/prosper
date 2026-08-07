@@ -99,6 +99,12 @@ inline bool claim_fault_report(std::atomic<long>& owner, long tid, long* already
 // because the fatal report block never returns — its every exit is `_exit` or an unbounded park —
 // so an inner report ends the process rather than unwinding back into the outer one. If that ever
 // stops being true, this needs a depth count, not a bool.
+//
+// That property is now STRUCTURAL rather than documentary (#2163): the park and the _exit(90)
+// live INSIDE the fatal block's braces in exec_image_linux.cpp, so it has no fall-off-the-end
+// exit and an inserted early `return` is a visible change to a block that provably terminates.
+// They used to sit after the closing brace, where the invariant held only as long as every
+// future editor read this paragraph first.
 inline void release_fault_report(std::atomic<long>& owner, long tid) {
     long expected = tid;
     owner.compare_exchange_strong(expected, 0);
