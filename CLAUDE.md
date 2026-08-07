@@ -294,9 +294,56 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     that exact frame **offline and deterministically**, and `--inspect-only` / `--draw-steps` /
     `--dump-resource` (via `--bundle-extract-submit`) dissect it draw-by-draw. This answers "which draw
     wrote this pixel / why does this frame look wrong / why is it slow" without re-booting and re-routing
-    to catch the moment live — the human presses F9 once, then the fix is iterated on the frozen frame.
+    to catch the moment live — press F9 once, then iterate the fix on the frozen frame.
     It captures *rendered-frame* bugs (not CPU/logic/audio). See `tools/AGENTS.md` (interactive frame grab)
     and `tools/gpu_replay/README.md`.
+  - **You do NOT need a human at the keyboard: both captures are schedulable, and an agent can run the
+    whole thing headless.** This is written here because it was missed for months — the triggers live in
+    `prosper-app`, which is **off by default** (`-DPROSPER_APP=ON`), so an env sweep of `src/` never sees
+    them, and lanes built weaker instruments instead. Two rich diagnostics, four one-shot triggers:
+
+    | capture | after a wall-clock delay | at a host frame |
+    | --- | --- | --- |
+    | **F9** replayable `.prgbundle` + `.bmp` | `PROSPER_GRAB_BUNDLE_AFTER_MS` | `PROSPER_GRAB_BUNDLE_AT_FRAME` |
+    | **F8** bounded `.prperf` (5 s before + 5 s after) | `PROSPER_PERF_CAPTURE_AFTER_MS` | `PROSPER_PERF_CAPTURE_AT_FRAME` |
+
+    ```bash
+    cmake -S prosper -B build -DPROSPER_APP=ON          # the app is NOT built by default
+    SDL_VIDEODRIVER=offscreen \                         # LINUX ONLY -- see below
+    PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+    PROSPER_CAPTURE_DIR=$HOME/work \
+    PROSPER_GRAB_BUNDLE_AFTER_MS=18000 PROSPER_PERF_CAPTURE_AFTER_MS=18000 \
+        ./build/prosper-app <DUMP_ROOT>/<TITLE_ID>-app0
+    ```
+
+    **`SDL_VIDEODRIVER=offscreen` is Linux-only. Drop it on Windows** — the triggers themselves are
+    platform-independent and fire correctly there with an ordinary window. SDL's offscreen driver needs
+    `VK_EXT_headless_surface`, which NVIDIA's Windows Vulkan driver does not expose, so the app dies
+    before writing anything:
+
+    ```
+    Installed Vulkan doesn't implement the VK_EXT_headless_surface extension
+    [app] SDL_Vulkan_CreateSurface: VK_EXT_headless_surface extension is not enabled ...
+    terminate called without an active exception
+    ```
+
+    That signature is recorded because it does not look like what it is: no artifacts and a
+    non-graceful exit read as "the capture triggers are broken", when the triggers were never reached.
+
+    Which axis to use: **`_AFTER_MS` aims at an event you can only describe in time** ("when the movie
+    starts", "when the rate collapses"); **`_AT_FRAME` aims at an ordinal you already located** with a
+    cheap `tools/screenshot` sweep or `PROSPER_CAPTURE_SCREENSHOT_AT_FRAME`, and is the reproducible one.
+    Point both at the same moment to get the timing breakdown and the replayable frame together.
+
+    Each is **one-shot and opt-in**, and a malformed value **disables its own trigger** rather than firing
+    at an unintended moment — so a typo costs you a capture, never a wrong measurement. Read the
+    `.prperf` with `tools/perf/performance_capture_report.py` (it reports by **time**; the record counts
+    are not load), and the bundle with `tools/gpu_replay --bundle`.
+
+    **Read the F8 report before optimising anything.** Worked example (#2215, 2026-08-07): Blue Prince at
+    1 fps, and the capture said `gpu-device` was **2.2%** of the frame while `renderer-resource` was 47%
+    — and that `buffer copy`, the leaf two lanes were optimising because it dominates in *gameplay*, was
+    **2.4%** during the collapse. Two different problems that looked like one.
 - **Reaching the running frame loop:** `PROSPER_GUEST_ARGS=-force-gfx-direct`, plus `PROSPER_RENDER=1`
   to run the live renderer and `PROSPER_GFXLOG=1` for graphics diagnostics.
   - **`PROSPER_GUEST_FS=1` is NOT needed on Linux or Windows, and this line used to say it was.** Guest

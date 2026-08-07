@@ -286,11 +286,16 @@ private:
 // sanitisation, so it can contain anything — including " -> ". An arm line that parses as a write
 // line would hand a log reader a path that never existed, which is this file's whole subject, so the
 // arrow is folded out of the label rather than trusted not to appear.
-inline std::string frame_grab_arm_line(unsigned index, const std::string& title_label) {
+// `trigger` names what armed this capture. It defaults to the hotkey so existing callers and their
+// tests are unaffected, but a SCHEDULED capture must not say "F9": there is no operator on that path,
+// and a log line that names a keypress nobody made sends its reader looking for one. (#2233)
+inline std::string frame_grab_arm_line(unsigned index, const std::string& title_label,
+                                       std::string_view trigger = "F9") {
     std::string label = title_label.empty() ? std::string("an unidentified title") : title_label;
     for (size_t k = label.find(" -> "); k != std::string::npos; k = label.find(" -> ", k))
         label.replace(k, 4, " - ");
-    return "[grab] F9 #" + std::to_string(index) + ": arming a whole-frame capture for " + label;
+    return "[grab] " + std::string(trigger) + " #" + std::to_string(index) +
+           ": arming a whole-frame capture for " + label;
 }
 
 // "[grab] bundle written (312 submits) [name collision: suffix -2] -> ./frame_grab_....prgbundle"

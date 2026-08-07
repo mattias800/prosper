@@ -2259,7 +2259,12 @@ void interactive_frame_bundle_on_present() {
                     b.outcome_error = b.pending_failure_error.empty() ? std::string("grab aborted")
                                                                      : b.pending_failure_error;
                 } else {
-                    std::fprintf(stderr, "[grab] frame-bundle: window had no submits; press F9 again\n");
+                    // Names no key: this path is reached by the scheduled triggers too (#2233), where there is
+                    // no operator. It also points at the actual fix rather than at a repeat -- a
+                    // single-present window on a title that presents faster than it submits catches
+                    // zero legitimately, and re-arming the same width is a coin flip (trap 101).
+                    std::fprintf(stderr, "[grab] frame-bundle: window had no submits; widen it with "
+                                         "PROSPER_CAPTURE_FRAMES=N (1..240) or re-arm\n");
                     b.outcome_pending = true; b.outcome_ok = false; b.outcome_path = b.current_path;
                     b.outcome_error = "the capture window contained no GPU submits";
                 }

@@ -1447,6 +1447,105 @@ int main(int argc, char** argv) {
         suffix = 0;
         return false;
     };
+    // The F9 frame grab, callable from the hotkey AND from the headless triggers below (#2233).
+    // Extracted verbatim so an unattended capture takes exactly the interactive path -- the
+    // supersede accounting and the reservation bookkeeping included. A second implementation for
+    // automation would mean a second set of rules for who owns a reserved file, and that is the
+    // one part of this that has already been hard to get right.
+    auto arm_frame_grab = [&](bool automatic, const char* why) {
+        // Every line this path emits is read by an agent, not an operator. `source` names what armed
+        // the capture, so a SCHEDULED grab reports its trigger rather than a keypress nobody made --
+        // a log line naming F9 on a run with no window sends its reader looking for an operator.
+        const char* const source = automatic ? why : "F9";
+        std::fprintf(stderr, "[grab] %s bundle grab requested (%s)\n",
+                     automatic ? "automatic" : "F9", why);
+                // Claim both output names now, from ONE timestamp, with an exclusive create. Doing
+                // it here rather than at each write is what binds the two artifacts of this
+                // capture together: they are written seconds apart on two different threads, and a
+                // name derived independently at each write would let a bundle take a collision
+                // suffix its screenshot did not — which is exactly the mismatched pair this
+                // change exists to make impossible.
+                const prosper::frontend::FrameGrabPaths grab = grabNamer.reserve();
+                if (!grab.ok) {
+                    std::fprintf(stderr, "[grab] %s #%u: could not reserve capture files: %s\n",
+                                 source, grab.index, grab.error.c_str());
+                    return;
+                }
+                // This line names NO file, deliberately. A log line must assert only what is true
+                // when it is emitted: at arm time the capture may still abort, the write may fail,
+                // and a collision suffix makes the eventual path unequal to any guess. An intention
+                // written in the grammar of a result is one a reader — human or agent — cannot tell
+                // apart from a result, and this fleet's agents read these logs to find artifacts.
+                // The real paths are logged by the writes, once the files exist. Do not "helpfully"
+                // restore a filename here.
+                std::fprintf(stderr, "%s\n",
+                             prosper::frontend::frame_grab_arm_line(
+                                 grab.index, grabNamer.title_label(), source).c_str());
+                // Honour PROSPER_CAPTURE_BUNDLE_MAX_MB here too (#1587). It was consulted only on
+                // the headless/scheduled paths, so the hotkey was pinned to the 2 GiB default with
+                // no way to raise it without editing code — and one 3840x2160 frame of a deferred
+                // renderer exceeds that, which made F9 unusable on 4K UE titles.
+                // Supersede and EXPLAIN, rather than refuse. A press that lands before the
+                // previous arm was promoted replaces it, and a replaced arm never runs and never
+                // reports — so this frontend is the only thing that can account for the names it
+                // reserved. Refusing the press instead was considered and rejected: the flag that
+                // says "a grab is in flight" is cleared only by a guest PRESENT, so a hung title
+                // would leave F9 dead for the rest of the session — and a hung title is exactly
+                // when someone reaches for F9.
+                const std::string replaced =
+                    prosper::gpu::request_interactive_capture_bundle(grab.bundle, grabBundleMaxMb);
+                if (!grab.warning.empty())
+                    std::fprintf(stderr, "[grab] %s\n", grab.warning.c_str());
+                if (!replaced.empty()) {
+                    unsigned dropped = 0;
+                    const bool ours = take_bundle_reservation(replaced, dropped);
+                    std::error_code ec;
+                    // Only our own, and only while still empty: a file with bytes in it belongs
+                    // to whoever wrote them.
+                    const bool removed = ours && std::filesystem::exists(replaced, ec) && !ec &&
+                                         std::filesystem::file_size(replaced, ec) == 0 && !ec &&
+                                         std::filesystem::remove(replaced, ec) && !ec;
+                    std::fprintf(stderr,
+                                 "[grab] this press replaced an armed capture that had not started; "
+                                 "it will never report. %s: %s\n",
+                                 removed ? "its empty reserved bundle has been removed"
+                                         : (ours ? "its reserved bundle is still on disk"
+                                                 : "its output path was configured, not reserved, "
+                                                   "and was left alone"),
+                                 replaced.c_str());
+                }
+                // A pending screenshot is dropped by this press whichever kind it is, but the two
+                // kinds cannot share a sentence: one is a name this frontend reserved and can
+                // account for, the other a configured path it never created.
+                if (!pendingGrabScreenshot.empty()) {
+                    if (pendingGrabReserved) {
+                        std::error_code ec;
+                        const bool removed =
+                            std::filesystem::exists(pendingGrabScreenshot, ec) && !ec &&
+                            std::filesystem::file_size(pendingGrabScreenshot, ec) == 0 && !ec &&
+                            std::filesystem::remove(pendingGrabScreenshot, ec) && !ec;
+                        std::fprintf(stderr,
+                                     "[grab] the previous capture's screenshot was still pending and "
+                                     "is dropped by this press; %s: %s\n",
+                                     removed ? "its empty reserved file has been removed"
+                                             : "its reserved file is still on disk",
+                                     pendingGrabScreenshot.c_str());
+                    } else {
+                        std::fprintf(stderr,
+                                     "[grab] the pending scheduled screenshot is dropped by this "
+                                     "press; nothing was written to %s\n",
+                                     pendingGrabScreenshot.c_str());
+                    }
+                }
+                pendingGrabScreenshot = grab.screenshot;
+                pendingGrabGuestPresent = gpu::present_count();
+                pendingGrabSuffix = grab.suffix;
+                pendingGrabReserved = true;
+                if (grabReservedBundles.size() >= 32) grabReservedBundles.erase(grabReservedBundles.begin());
+                grabReservedBundles.emplace_back(grab.bundle, grab.suffix);
+                return;
+    };
+
     auto flushGrabScreenshot = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
         if (pendingGrabScreenshot.empty()) return;
         const bool ok = write_frame_bmp(pendingGrabScreenshot, rgba, w, h);
@@ -1488,6 +1587,35 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(scheduledScreenshotFrame),
                 scheduledScreenshotPath.c_str());
     }
+
+    // --- Headless capture triggers (#2233) -------------------------------------------------
+    // F8 and F9 are the richest diagnostics this project has, and the bundle grab could previously
+    // be reached ONLY by a human pressing a key. Every agent here runs headless, so the best
+    // instrument in the toolbox was the one nobody could aim -- and lanes built weaker ones instead.
+    // Both captures are now schedulable on either axis, because they answer different questions:
+    // "after N ms" aims at a wall-clock event (a movie starts, a frame rate collapses); "at frame N"
+    // aims at a reproducible ordinal already located with a cheap screenshot sweep.
+    //
+    // All are one-shot and opt-in, and a malformed value disables its own trigger rather than firing
+    // at an unintended moment -- see parse_* in capture_schedule.hpp / performance_capture_schedule.hpp.
+    prosper::frontend::ElapsedPerformanceCaptureTrigger automaticGrabAfter(
+        prosper::frontend::parse_performance_capture_delay_ns(getenv("PROSPER_GRAB_BUNDLE_AFTER_MS")));
+    const uint64_t scheduledGrabFrame =
+        prosper::frontend::parse_capture_frame(getenv("PROSPER_GRAB_BUNDLE_AT_FRAME"));
+    bool scheduledGrabArmed = false;
+    const uint64_t scheduledPerfFrame =
+        prosper::frontend::parse_capture_frame(getenv("PROSPER_PERF_CAPTURE_AT_FRAME"));
+    bool scheduledPerfArmed = false;
+    if (automaticGrabAfter.delay_ns())
+        std::fprintf(stderr, "[grab] automatic bundle scheduled by PROSPER_GRAB_BUNDLE_AFTER_MS "
+                             "(one attempt after %llu ms of app-loop time)\n",
+                     (unsigned long long)(automaticGrabAfter.delay_ns() / 1000000));
+    if (scheduledGrabFrame)
+        std::fprintf(stderr, "[grab] automatic bundle scheduled at host frame %llu\n",
+                     (unsigned long long)scheduledGrabFrame);
+    if (scheduledPerfFrame)
+        std::fprintf(stderr, "[perf] automatic capture scheduled at host frame %llu\n",
+                     (unsigned long long)scheduledPerfFrame);
     bool scheduledScreenshotArmed = false;
     bool timedDumpPending = timedDumpMs > 0;
     bool running = true;
@@ -1665,6 +1793,10 @@ int main(int argc, char** argv) {
             arm_performance_capture(
                 true, perfNow, (perfNow - perfLoopStartNs) / 1'000'000);
         }
+        // Same one-shot contract as the perf trigger above: the trigger is consumed before the arm is
+        // attempted, so a failed arm stays visible instead of silently retrying into a later phase.
+        if (automaticGrabAfter.take_if_due(perfLoopStartNs, perfNow))
+            arm_frame_grab(true, "PROSPER_GRAB_BUNDLE_AFTER_MS");
         openedThisBatch = rejectedThisBatch = false;
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -1706,90 +1838,7 @@ int main(int argc, char** argv) {
                 // only — near-zero cost until pressed, so it never distorts the FPS you are observing.
                 if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
                     ev.key.key == SDLK_F9) {
-                    // Claim both output names now, from ONE timestamp, with an exclusive create. Doing
-                    // it here rather than at each write is what binds the two artifacts of this
-                    // capture together: they are written seconds apart on two different threads, and a
-                    // name derived independently at each write would let a bundle take a collision
-                    // suffix its screenshot did not — which is exactly the mismatched pair this
-                    // change exists to make impossible.
-                    const prosper::frontend::FrameGrabPaths grab = grabNamer.reserve();
-                    if (!grab.ok) {
-                        std::fprintf(stderr, "[grab] F9 #%u: could not reserve capture files: %s\n",
-                                     grab.index, grab.error.c_str());
-                        continue;
-                    }
-                    // This line names NO file, deliberately. A log line must assert only what is true
-                    // when it is emitted: at arm time the capture may still abort, the write may fail,
-                    // and a collision suffix makes the eventual path unequal to any guess. An intention
-                    // written in the grammar of a result is one a reader — human or agent — cannot tell
-                    // apart from a result, and this fleet's agents read these logs to find artifacts.
-                    // The real paths are logged by the writes, once the files exist. Do not "helpfully"
-                    // restore a filename here.
-                    std::fprintf(stderr, "%s\n",
-                                 prosper::frontend::frame_grab_arm_line(
-                                     grab.index, grabNamer.title_label()).c_str());
-                    // Honour PROSPER_CAPTURE_BUNDLE_MAX_MB here too (#1587). It was consulted only on
-                    // the headless/scheduled paths, so the hotkey was pinned to the 2 GiB default with
-                    // no way to raise it without editing code — and one 3840x2160 frame of a deferred
-                    // renderer exceeds that, which made F9 unusable on 4K UE titles.
-                    // Supersede and EXPLAIN, rather than refuse. A press that lands before the
-                    // previous arm was promoted replaces it, and a replaced arm never runs and never
-                    // reports — so this frontend is the only thing that can account for the names it
-                    // reserved. Refusing the press instead was considered and rejected: the flag that
-                    // says "a grab is in flight" is cleared only by a guest PRESENT, so a hung title
-                    // would leave F9 dead for the rest of the session — and a hung title is exactly
-                    // when someone reaches for F9.
-                    const std::string replaced =
-                        prosper::gpu::request_interactive_capture_bundle(grab.bundle, grabBundleMaxMb);
-                    if (!grab.warning.empty())
-                        std::fprintf(stderr, "[grab] %s\n", grab.warning.c_str());
-                    if (!replaced.empty()) {
-                        unsigned dropped = 0;
-                        const bool ours = take_bundle_reservation(replaced, dropped);
-                        std::error_code ec;
-                        // Only our own, and only while still empty: a file with bytes in it belongs
-                        // to whoever wrote them.
-                        const bool removed = ours && std::filesystem::exists(replaced, ec) && !ec &&
-                                             std::filesystem::file_size(replaced, ec) == 0 && !ec &&
-                                             std::filesystem::remove(replaced, ec) && !ec;
-                        std::fprintf(stderr,
-                                     "[grab] this press replaced an armed capture that had not started; "
-                                     "it will never report. %s: %s\n",
-                                     removed ? "its empty reserved bundle has been removed"
-                                             : (ours ? "its reserved bundle is still on disk"
-                                                     : "its output path was configured, not reserved, "
-                                                       "and was left alone"),
-                                     replaced.c_str());
-                    }
-                    // A pending screenshot is dropped by this press whichever kind it is, but the two
-                    // kinds cannot share a sentence: one is a name this frontend reserved and can
-                    // account for, the other a configured path it never created.
-                    if (!pendingGrabScreenshot.empty()) {
-                        if (pendingGrabReserved) {
-                            std::error_code ec;
-                            const bool removed =
-                                std::filesystem::exists(pendingGrabScreenshot, ec) && !ec &&
-                                std::filesystem::file_size(pendingGrabScreenshot, ec) == 0 && !ec &&
-                                std::filesystem::remove(pendingGrabScreenshot, ec) && !ec;
-                            std::fprintf(stderr,
-                                         "[grab] the previous capture's screenshot was still pending and "
-                                         "is dropped by this press; %s: %s\n",
-                                         removed ? "its empty reserved file has been removed"
-                                                 : "its reserved file is still on disk",
-                                         pendingGrabScreenshot.c_str());
-                        } else {
-                            std::fprintf(stderr,
-                                         "[grab] the pending scheduled screenshot is dropped by this "
-                                         "press; nothing was written to %s\n",
-                                         pendingGrabScreenshot.c_str());
-                        }
-                    }
-                    pendingGrabScreenshot = grab.screenshot;
-                    pendingGrabGuestPresent = gpu::present_count();
-                    pendingGrabSuffix = grab.suffix;
-                    pendingGrabReserved = true;
-                    if (grabReservedBundles.size() >= 32) grabReservedBundles.erase(grabReservedBundles.begin());
-                    grabReservedBundles.emplace_back(grab.bundle, grab.suffix);
+                    arm_frame_grab(false, "hotkey");
                     continue;
                 }
                 // Ctrl+O opens a title in the empty window (#1469). Deliberately unavailable once a
@@ -2058,6 +2107,19 @@ int main(int argc, char** argv) {
         // frame, with no GPU command capture, so long routes can locate a visual checkpoint before
         // scheduling the replayable bundle there. Do not overwrite an interactive F9 screenshot;
         // if both coincide, the scheduled shot remains eligible for the following real present.
+        // Frame-addressed captures reuse the screenshot's due rule, so a skipped swapchain ordinal
+        // leaves the one-shot eligible for the next real present rather than missing silently.
+        if (prosper::frontend::capture_frame_due(scheduledGrabFrame, shown, scheduledGrabArmed)) {
+            scheduledGrabArmed = true;
+            arm_frame_grab(true, "PROSPER_GRAB_BUNDLE_AT_FRAME");
+        }
+        if (prosper::frontend::capture_frame_due(scheduledPerfFrame, shown, scheduledPerfArmed)) {
+            scheduledPerfArmed = true;
+            // Report the REAL elapsed time, not a placeholder: this line is read as a measurement,
+            // and "fired at 0 ms" for a capture armed 40 s in is simply false.
+            arm_performance_capture(true, perfNow,
+                                    (perfNow - perfLoopStartNs) / 1'000'000);
+        }
         if (pendingGrabScreenshot.empty() && prosper::frontend::capture_frame_due(
                 scheduledScreenshotFrame, shown, scheduledScreenshotArmed)) {
             pendingGrabScreenshot = scheduledScreenshotPath;
@@ -2148,7 +2210,7 @@ int main(int argc, char** argv) {
                         "  %s\n"
                         "  %s\n"
                         "  budget in force: %llu MiB — raise it with "
-                        "PROSPER_CAPTURE_BUNDLE_MAX_MB=<64..3072> and press F9 again\n"
+                        "PROSPER_CAPTURE_BUNDLE_MAX_MB=<64..3072> and re-arm the capture\n"
                         "============================================================================\n\n",
                         grab.error.c_str(), grab.bundle_path.c_str(), state.c_str(),
                         reservedHere
