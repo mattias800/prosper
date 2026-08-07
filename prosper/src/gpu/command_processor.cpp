@@ -362,7 +362,15 @@ extern "C" int prosper_gpu_write_ring_scan(uint64_t lo, uint64_t hi, char* out, 
 // build and freed in the build->write window (ordering: our write lands after the guest's free)?
 // Direct-mapped by packet address — collisions just replace (diagnostic-grade).
 namespace {
-struct FenceBuildRec { uint64_t pkt, addr, pre; uint64_t t_ms; };
+// #1226 (arc7): the fold counter lives HERE rather than beside the label ring below, because the
+// build journal now records the fold a packet was built in. Everything that reads it is further
+// down the file; the move is a declaration order change and nothing else.
+std::atomic<uint32_t> g_fold_seq{0};                  // top-level fold counter (submit streams)
+// `fold` is the value of g_fold_seq when the GUEST built this packet. It is what makes the
+// build->exec distance expressible in FOLDS rather than only in milliseconds: a wall-clock age is
+// not comparable between a route that adds a fixed delay per submit and one that does not, because
+// the delay changes how many submits fit in a millisecond. See fold_margin_* below.
+struct FenceBuildRec { uint64_t pkt, addr, pre; uint64_t t_ms; uint32_t fold; };
 constexpr uint32_t kJournalSize = 65536;                // power of two
 FenceBuildRec g_fence_journal[kJournalSize];
 inline uint32_t journal_slot(uint64_t pkt) { return (uint32_t)((pkt >> 2) * 2654435761u) & (kJournalSize - 1); }
@@ -373,12 +381,15 @@ extern "C" void prosper_fence_journal_record(uint64_t pkt, uint64_t addr) {
     if (addr >= 0x10000 && !(addr & 3)) memcpy(&pre, (const void*)(uintptr_t)addr, sizeof pre);
     FenceBuildRec& r = g_fence_journal[journal_slot(pkt)];
     r.pkt = pkt; r.addr = addr; r.pre = pre; r.t_ms = now_ms();
+    r.fold = g_fold_seq.load(std::memory_order_relaxed);
 }
-extern "C" int prosper_fence_journal_lookup(uint64_t pkt, uint64_t* addr, uint64_t* pre, uint64_t* t_ms) {
+extern "C" int prosper_fence_journal_lookup(uint64_t pkt, uint64_t* addr, uint64_t* pre, uint64_t* t_ms,
+                                            uint32_t* fold) {
     if (!pkt) return 0;
     const FenceBuildRec& r = g_fence_journal[journal_slot(pkt)];
     if (r.pkt != pkt) return 0;
     *addr = r.addr; *pre = r.pre; *t_ms = r.t_ms;
+    if (fold) *fold = r.fold;
     return 1;
 }
 
@@ -407,11 +418,17 @@ struct LabelHist {
     std::atomic<uint32_t> n;              // total events (ring index)
     std::atomic<uint32_t> dma_built_n, dma_exec_n, rel_built_n, rel_exec_n;   // overlap counters
     std::atomic<uint32_t> mb3_dma_suppressed_n, mb3_rel_debt_consumed_n;
+    // #1226 (arc7): the last build/exec fold for this label, kept alongside the ring so the
+    // fold_margin census never has to SCAN the ring (a scan would read entries the 16-slot ring may
+    // already have overwritten, which is precisely the population a busy label falls into).
+    // kNoFold = "not yet seen"; both are reset with the counters on a slot collision.
+    uint32_t last_build_fold, last_exec_fold;
     LabelEvent ev[16];                    // last 16 events
 };
+constexpr uint32_t kNoFold = 0xFFFFFFFFu;
 constexpr uint32_t kLabelHistSize = 16384;            // power of two
 LabelHist g_label_hist[kLabelHistSize];
-std::atomic<uint32_t> g_fold_seq{0};                  // top-level fold counter (submit streams)
+// g_fold_seq is defined above, next to the build journal that now records it.
 inline uint32_t label_hist_index(uint64_t addr) {
     return (uint32_t)((addr >> 2) * 2654435761u) & (kLabelHistSize - 1);
 }
@@ -430,6 +447,7 @@ inline LabelHist& label_hist_slot(uint64_t addr) {
         h.addr = addr; h.n.store(0, std::memory_order_relaxed);
         h.dma_built_n = h.dma_exec_n = h.rel_built_n = h.rel_exec_n = 0;
         h.mb3_dma_suppressed_n = h.mb3_rel_debt_consumed_n = 0;
+        h.last_build_fold = h.last_exec_fold = kNoFold;
         memset(h.ev, 0, sizeof h.ev);
     }
     return h;
@@ -442,10 +460,171 @@ void label_hist_event(uint64_t addr, uint8_t type, uint64_t aux, uint8_t origin 
     e.type = type; e.origin = origin; e.t_ms = now_ms(); e.aux = aux;
     e.fold = g_fold_seq.load(std::memory_order_relaxed);
 }
+
+// --- #1226 (arc7) PROSPER_FOLD_MARGIN: the per-fold account of the recycle race. ------------------
+//
+// Everything this title's investigation has measured about the submit throttle is a WHOLE-RUN
+// aggregate, and two such rows have already been retracted (`ARCRUNNER_STATUS.md` § Ruled out):
+// "the throttle shortens the guest's build-to-submit interval" and "the throttle changes how fast
+// the guest runs". Both failed the same way — a rate over a denominator the two arms do not share.
+// The mechanism, though, is stated in FOLDS: *build at fold f, exec at f+5 or f+6, rebuild at f+6;
+// when the exec lands on f+6 the two collide.* A count of folds is immune to the denominator
+// problem, because it is the same unit in which the collision is defined.
+//
+// So this census reports, in folds, the two distances that bracket the race, one measured at the
+// GUEST's action and one at PROSPER's:
+//
+//   BUILD side, at `prosper_label_hist_dma_built` (the guest's own AGC builder call):
+//     * margin  = fold_now - last_exec_fold  — how many folds prosper's execution of the PREVIOUS
+//       generation preceded this rebuild by. This is the safety margin, in the unit the mechanism
+//       is stated in. It is undefined for a label's first build (reported separately as no-exec).
+//     * REBUILD-BEFORE-EXEC: dma_built_n > dma_exec_n at build time, i.e. the guest is building a
+//       new generation while prosper has not executed the previous one at all. This is the exact
+//       precondition for a late write landing in a block the guest has since recycled, and it is
+//       the build-side twin of `label_rel_overlap()` (fence side) and of DMA-INIT-GEN's `depth>=2`
+//       (exec side). Having all three lets a claim be cross-checked from three independent points.
+//
+//   EXEC side, at the 4-byte label init prosper executes:
+//     * age_folds = fold_now - build_fold, from the build journal — the build->exec distance, in
+//       folds. Its milliseconds twin is already reported by DMA-INIT-GEN and is exactly the figure
+//       that could not discriminate: ~345 ms in BOTH arms. If the throttle changes this distance in
+//       folds while leaving it unchanged in milliseconds, that is the per-fold account, and it is
+//       also arithmetically forced — a fixed delay per submit means fewer submits fit in 345 ms.
+//
+// Log-only. It gates nothing, allocates nothing, and adds one relaxed load plus a few adds per
+// label event. Default OFF, and its arms must be scored against the same endpoint as any other:
+// instrument trap 104 records that a read-only probe's DURATION can decide whether this failure
+// happens at all, so a FOLD-MARGIN arm that stops faulting is a confound, not a result.
+struct FoldMarginTotals {
+    uint64_t builds = 0, builds_with_exec = 0, rebuild_before_exec = 0, first_builds = 0;
+    uint64_t margin_hist[13] = {};        // folds between prosper's last exec and this rebuild
+    uint64_t period_hist[13] = {};        // folds between this label's own consecutive builds
+    uint64_t execs = 0, execs_journal = 0;
+    uint64_t age_hist[13] = {};           // folds between the guest's build and prosper's exec
+    uint64_t age_fold_sum = 0, age_fold_max = 0;
+    uint64_t deep_execs = 0, deep_age_fold_sum = 0;
+};
+std::mutex g_fold_margin_mu;
+FoldMarginTotals g_fold_margin;
+// Per-FOLD counters, drained by the submit-side ledger in hle_agc.cpp so one line can carry both
+// halves: how much label protocol this individual fold carried, next to what it cost in time.
+std::atomic<uint32_t> g_fm_fold_builds{0}, g_fm_fold_execs{0}, g_fm_fold_deep{0}, g_fm_fold_rbe{0};
+bool fold_margin_on() {
+    static const bool v = [] {
+        const char* e = getenv("PROSPER_FOLD_MARGIN");
+        const bool on = e && strtol(e, nullptr, 0) != 0;
+        if (on)
+            fprintf(stderr, "[agc] FOLD-MARGIN ARMED: per-fold recycle-margin census for the #1226 "
+                            "label protocol (log-only, gates nothing)\n");
+        return on;
+    }();
+    return v;
+}
+// 0..9 exact, then 10-15, 16-31, 32+. Exact small buckets matter because the whole mechanism lives
+// between f+5 and f+6 — a log-scale histogram would put the entire population in one bin.
+inline unsigned fold_bucket(uint64_t d) {
+    if (d < 10) return (unsigned)d;
+    if (d < 16) return 10;
+    if (d < 32) return 11;
+    return 12;
+}
+void fold_hist_str(const uint64_t (&h)[13], char* out, size_t cap) {
+    static const char* kName[13] = {"0","1","2","3","4","5","6","7","8","9","10-15","16-31","32+"};
+    size_t off = 0;
+    for (unsigned i = 0; i < 13 && off + 24 < cap; i++) {
+        if (!h[i]) continue;
+        int m = snprintf(out + off, cap - off, "%s%s:%llu", off ? "," : "", kName[i],
+                         (unsigned long long)h[i]);
+        if (m > 0) off += (size_t)m;
+    }
+    if (!off && cap) { snprintf(out, cap, "(empty)"); return; }
+    if (off < cap) out[off] = 0;
+}
+void fold_margin_report(const char* why) {
+    char mh[256], ph[256], ah[256];
+    uint64_t builds, bwe, rbe, fb, execs, ej, afs, afm, de, dafs;
+    {
+        std::lock_guard<std::mutex> lk(g_fold_margin_mu);
+        const FoldMarginTotals& t = g_fold_margin;
+        fold_hist_str(t.margin_hist, mh, sizeof mh);
+        fold_hist_str(t.period_hist, ph, sizeof ph);
+        fold_hist_str(t.age_hist, ah, sizeof ah);
+        builds = t.builds; bwe = t.builds_with_exec; rbe = t.rebuild_before_exec; fb = t.first_builds;
+        execs = t.execs; ej = t.execs_journal; afs = t.age_fold_sum; afm = t.age_fold_max;
+        de = t.deep_execs; dafs = t.deep_age_fold_sum;
+    }
+    fprintf(stderr,
+            "[agc] FOLD-MARGIN-TOTALS (%s) fold=%u builds=%llu(first=%llu with-exec=%llu "
+            "REBUILD-BEFORE-EXEC=%llu) margin-folds{%s} rebuild-period-folds{%s} "
+            "execs=%llu(journal=%llu) age-folds{%s} age-fold(max=%llu mean=%.2f) "
+            "deep(execs=%llu mean-age-folds=%.2f) t=%llums\n",
+            why, g_fold_seq.load(std::memory_order_relaxed),
+            (unsigned long long)builds, (unsigned long long)fb, (unsigned long long)bwe,
+            (unsigned long long)rbe, mh, ph,
+            (unsigned long long)execs, (unsigned long long)ej, ah,
+            (unsigned long long)afm, ej ? (double)afs / (double)ej : 0.0,
+            (unsigned long long)de, de ? (double)dafs / (double)de : 0.0,
+            (unsigned long long)now_ms());
+}
+// Called from the guest's own DMA-label builder, BEFORE the built counter is bumped, so
+// `built - exec` still describes the state the guest is rebuilding into.
+void fold_margin_build(LabelHist& h) {
+    if (!fold_margin_on()) return;
+    const uint32_t fold_now = g_fold_seq.load(std::memory_order_relaxed);
+    const uint32_t db = h.dma_built_n.load(std::memory_order_relaxed);
+    const uint32_t dx = h.dma_exec_n.load(std::memory_order_relaxed);
+    const bool rebuild_before_exec = db > dx;
+    bool report;
+    uint64_t ord;
+    {
+        std::lock_guard<std::mutex> lk(g_fold_margin_mu);
+        FoldMarginTotals& t = g_fold_margin;
+        ord = ++t.builds;
+        if (h.last_exec_fold == kNoFold) t.first_builds++;
+        else {
+            t.builds_with_exec++;
+            t.margin_hist[fold_bucket(fold_now >= h.last_exec_fold ? fold_now - h.last_exec_fold : 0)]++;
+        }
+        if (h.last_build_fold != kNoFold)
+            t.period_hist[fold_bucket(fold_now >= h.last_build_fold ? fold_now - h.last_build_fold : 0)]++;
+        if (rebuild_before_exec) t.rebuild_before_exec++;
+        report = (ord == 1) || (ord & 255) == 0 || rebuild_before_exec;
+    }
+    g_fm_fold_builds.fetch_add(1, std::memory_order_relaxed);
+    if (rebuild_before_exec) g_fm_fold_rbe.fetch_add(1, std::memory_order_relaxed);
+    // The detail line is the event itself, not a sample of it: the guest is reusing a label block
+    // whose previous generation prosper has not executed. Budgeted separately from the totals so a
+    // rare event can never be starved by the common one.
+    if (rebuild_before_exec) {
+        static std::atomic<uint64_t> n_rbe{0};
+        if (diag_should_print(n_rbe.fetch_add(1) + 1, 64))
+            fprintf(stderr, "[agc] FOLD-MARGIN-REBUILD-BEFORE-EXEC #%llu [0x%llx] fold=%u built=%u "
+                            "exec=%u last-build-fold=%d last-exec-fold=%d t=%llums\n",
+                    (unsigned long long)n_rbe.load(), (unsigned long long)h.addr, fold_now, db, dx,
+                    h.last_build_fold == kNoFold ? -1 : (int)h.last_build_fold,
+                    h.last_exec_fold == kNoFold ? -1 : (int)h.last_exec_fold,
+                    (unsigned long long)now_ms());
+    }
+    h.last_build_fold = fold_now;
+    if (report) fold_margin_report(rebuild_before_exec ? "rebuild-before-exec" : "cadence");
+}
+}   // namespace
+// #1226 (arc7): drain this fold's label-protocol counters and report the fold ordinal. Called once
+// per submit from the ledger in hle_agc.cpp, so the counts belong to exactly one fold.
+extern "C" void prosper_fold_margin_take(uint32_t* builds, uint32_t* execs, uint32_t* deep,
+                                         uint32_t* rebuild_before_exec, uint32_t* fold) {
+    if (builds) *builds = g_fm_fold_builds.exchange(0, std::memory_order_relaxed);
+    if (execs)  *execs  = g_fm_fold_execs.exchange(0, std::memory_order_relaxed);
+    if (deep)   *deep   = g_fm_fold_deep.exchange(0, std::memory_order_relaxed);
+    if (rebuild_before_exec)
+        *rebuild_before_exec = g_fm_fold_rbe.exchange(0, std::memory_order_relaxed);
+    if (fold)   *fold   = g_fold_seq.load(std::memory_order_relaxed);
 }
 extern "C" void prosper_label_hist_dma_built(uint64_t addr, uint64_t cb, uint32_t /*src*/, uint8_t builder) {
     if (!addr) return;
-    label_hist_slot(addr).dma_built_n.fetch_add(1, std::memory_order_relaxed);
+    LabelHist& h = label_hist_slot(addr);
+    fold_margin_build(h);                                  // #1226 (arc7): before the bump
+    h.dma_built_n.fetch_add(1, std::memory_order_relaxed);
     label_hist_event(addr, LE_DMA_BUILT, cb | builder);   // cb object ptr | 1=Dcb 2=Acb (cb is 8-aligned)
 }
 extern "C" void prosper_label_hist_rel_built(uint64_t addr, uint64_t cb) {
@@ -465,7 +644,9 @@ uint64_t peek_qword(uint64_t addr) {
     return v;
 }
 void label_hist_dma_exec(uint64_t addr, uint64_t pre, uint8_t origin = 0) {
-    label_hist_slot(addr).dma_exec_n.fetch_add(1, std::memory_order_relaxed);
+    LabelHist& h = label_hist_slot(addr);
+    h.dma_exec_n.fetch_add(1, std::memory_order_relaxed);
+    h.last_exec_fold = g_fold_seq.load(std::memory_order_relaxed);   // #1226 (arc7) fold_margin
     label_hist_event(addr, LE_DMA_EXEC, pre, origin);
 }
 void label_hist_dma_skip(uint64_t addr)               { label_hist_event(addr, LE_DMA_SKIP, 0); }
@@ -1585,7 +1766,7 @@ static void report_suspect_write(const char* kindtag, uint64_t addr, uint64_t va
         per_kind[diag_key_slot(kindtag, kKinds, kNKinds)].fetch_add(1, std::memory_order_relaxed) + 1;
     if (!diag_should_print(ord, 192)) return;
     uint64_t baddr = 0, bpre = 0, bt = 0;
-    int have = prosper_fence_journal_lookup(pkt, &baddr, &bpre, &bt);
+    int have = prosper_fence_journal_lookup(pkt, &baddr, &bpre, &bt, nullptr);
     char hist[512]; label_hist_report(addr, hist, sizeof hist);
     fprintf(stderr, "[agc] SUSPECT-%s #%llu [0x%llx] pre=0x%llx value=0x%llx pkt=0x%llx t=%llums | "
                     "journal:%s built@%llums(age=%lldms) built-addr=0x%llx%s pre@build=0x%llx%s | %s\n",
@@ -1659,6 +1840,8 @@ struct DmaInitProvenance {
     bool     drift_lo = false;      // ...in the low dword, the 4 bytes the init writes
     uint64_t bpre = 0, age_ms = 0;
     uint32_t depth = 0, db = 0, dx = 0;
+    uint32_t build_fold = 0;        // #1226 (arc7): g_fold_seq when the guest built this packet
+    uint32_t age_folds = 0;         // ...and how many folds ago that was, at this exec
 };
 DmaInitProvenance dma_init_provenance(uint64_t dst, uint64_t pre, uint64_t pkt) {
     DmaInitProvenance p;
@@ -1670,12 +1853,39 @@ DmaInitProvenance dma_init_provenance(uint64_t dst, uint64_t pre, uint64_t pkt) 
     p.dx = h ? h->dma_exec_n.load(std::memory_order_relaxed) : 0;
     p.depth = p.db > p.dx ? p.db - p.dx : 0;   // this exec's own bump is downstream of here
     uint64_t baddr = 0, bt = 0;
-    p.have_journal = prosper_fence_journal_lookup(pkt, &baddr, &p.bpre, &bt) != 0;
+    p.have_journal = prosper_fence_journal_lookup(pkt, &baddr, &p.bpre, &bt, &p.build_fold) != 0;
     p.same_target = p.have_journal && baddr == dst;
     p.age_ms = (p.have_journal && now_ms() > bt) ? now_ms() - bt : 0;
+    const uint32_t fold_now = g_fold_seq.load(std::memory_order_relaxed);
+    p.age_folds = (p.have_journal && fold_now > p.build_fold) ? fold_now - p.build_fold : 0;
     p.drift = p.same_target && p.bpre != pre;
     p.drift_lo = p.same_target && (uint32_t)p.bpre != (uint32_t)pre;
     return p;
+}
+// #1226 (arc7): the exec half of the fold-margin census. Called at the same point as
+// dma_init_gen_trip — before every guard and before this exec's own dma_exec_n bump — so the two
+// censuses count the same population and can be cross-read line for line.
+void fold_margin_exec(uint64_t dst, uint64_t pre, uint32_t value, uint32_t width, uint64_t pkt) {
+    if (!fold_margin_on()) return;
+    if (width != 4 || value != 0) return;             // the exact consumed-marker initializer
+    const DmaInitProvenance p = dma_init_provenance(dst, pre, pkt);
+    bool report;
+    {
+        std::lock_guard<std::mutex> lk(g_fold_margin_mu);
+        FoldMarginTotals& t = g_fold_margin;
+        t.execs++;
+        if (p.have_journal) {
+            t.execs_journal++;
+            t.age_hist[fold_bucket(p.age_folds)]++;
+            t.age_fold_sum += p.age_folds;
+            if (p.age_folds > t.age_fold_max) t.age_fold_max = p.age_folds;
+            if (p.depth >= 2) { t.deep_execs++; t.deep_age_fold_sum += p.age_folds; }
+        }
+        report = (t.execs & 255) == 0 || p.depth >= 2;
+    }
+    g_fm_fold_execs.fetch_add(1, std::memory_order_relaxed);
+    if (p.depth >= 2) g_fm_fold_deep.fetch_add(1, std::memory_order_relaxed);
+    if (report) fold_margin_report(p.depth >= 2 ? "gen-overlap-exec" : "exec-cadence");
 }
 void dma_init_gen_trip(uint64_t dst, uint64_t pre, uint32_t value, uint32_t width, uint64_t pkt) {
     if (!dma_init_gen_trip_on()) return;
@@ -2434,6 +2644,7 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         // #1226 (arc5): generation depth + build->exec content drift, before any guard and before
         // this exec's own dma_exec_n bump (which is at the end of this branch).
         dma_init_gen_trip(c.dd_dst, pre_dma, v32, c.dd_bytes, packet_addr);
+        fold_margin_exec(c.dd_dst, pre_dma, v32, c.dd_bytes, packet_addr);   // #1226 (arc7)
         if (declines_drifted_init(c.dd_dst, pre_dma, v32, c.dd_bytes, packet_addr)) {  // #1226 A/B
             label_hist_dma_skip(c.dd_dst);
             label_hist_dma_free(c.dd_dst, 0);   // debt: the MB3 release leg declines the pair too
@@ -2644,7 +2855,26 @@ static void honor_write_data(const Pm4Command& c) {
 namespace {
 std::atomic<bool> g_post_submit_visibility{false};
 
+// #1226 (arc7) A/B lever, default OFF and log-only in the sense that it changes nothing unless
+// set: `PROSPER_POST_SUBMIT_VISIBILITY=1` forces this model on regardless of the SDK version the
+// guest asked for, `=0` forces it off. It exists because the per-fold census (see
+// `ARCRUNNER_STATUS.md` § arc7) localised ArcRunner's corruption to the guest's builder thread
+// being released MID-FOLD by completion writes prosper applies while it is still executing the rest
+// of the same command buffer — and ArcRunner requests SDK version 10, so the post-submit contract
+// that exists precisely to prevent that is not armed for it. Whether the contract is correct for a
+// pre-13 title is a separate question this lever does not answer; it makes the experiment runnable.
 bool post_submit_visibility_enabled() {
+    static const int forced = [] {
+        const char* e = getenv("PROSPER_POST_SUBMIT_VISIBILITY");
+        const int v = e ? (int)strtol(e, nullptr, 0) : -1;
+        if (v == 1)
+            fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY FORCED ON (#1226 A/B) — completion writes "
+                            "stay private until the submit scope closes, regardless of SDK version\n");
+        else if (v == 0)
+            fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY FORCED OFF (#1226 A/B)\n");
+        return v;
+    }();
+    if (forced >= 0) return forced != 0;
     return g_post_submit_visibility.load(std::memory_order_acquire);
 }
 
@@ -4483,7 +4713,7 @@ void GpuState::apply(const Pm4Command& c) {
                         uint64_t mem = 0; if (label_readable) memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
                         // #312 discriminator: build-journal age + freed-heap-shaped label content.
                         uint64_t baddr = 0, bpre = 0, bt = 0;
-                        int have = prosper_fence_journal_lookup(pkt_addr(c), &baddr, &bpre, &bt);
+                        int have = prosper_fence_journal_lookup(pkt_addr(c), &baddr, &bpre, &bt, nullptr);
                         char hist[512]; label_hist_report(c.wm_addr, hist, sizeof hist);
                         static const char* qn2[] = {"?", "D", "A", "F"};
                         fprintf(stderr, "[agc] WaitRegMem #%d q=%s NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s%s | %s\n",
