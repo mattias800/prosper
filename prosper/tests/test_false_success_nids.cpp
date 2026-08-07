@@ -33,6 +33,7 @@ constexpr const char* kNpTrophy2GetGameInfo       = "4IzqhhUQ3nk";  // already r
 constexpr const char* kNpTrophy2GetTrophyInfoArray = "y3zHpdZO6ME"; // already registered
 constexpr const char* kSaveDataTransferringMount    = "WAzWTZm1H+I";
 constexpr const char* kSaveDataTransferringMountPs4 = "RjMlsR8EXrw";
+constexpr const char* kSaveDataDirNameSearchPs4     = "X4MYzukPc3g";
 
 bool all_bytes_equal(const unsigned char* p, size_t n, unsigned char v) {
     for (size_t i = 0; i < n; ++i) if (p[i] != v) return false;
@@ -199,6 +200,44 @@ void test_savedata_transferring_mount() {
     // unresolved — a lead, not a conclusion. Frontiers gates on the SIGN alone, so nothing here
     // depends on it.
     CHECK(answers[0] == answers[1], "both transferring-mount entry points give the same answer");
+
+    // sceSaveDataDirNameSearchPs4 (#2210). With the mount above, these are the ONLY two
+    // PS4-namespace exports libSceSaveData has across all 275 PS5 3.20 libraries, so the pair is
+    // closed here rather than left one-registered -- which is the state that reads as covered.
+    {
+        HleFn fn = Hle::lookup(kSaveDataDirNameSearchPs4);
+        // Kills: the unregistered path, where prosper_on_unimpl returns 0 == SCE_OK for this
+        // contract and the caller is told a PS4 save-data search SUCCEEDED over a result it never
+        // wrote. Imported by 13 modules across 12 titles, including PPSA25009/PPSA24651/PPSA13579,
+        // verified with nid_census against the local dumps.
+        CHECK(fn != nullptr, "sceSaveDataDirNameSearchPs4 is registered");
+        if (fn) {
+            // POISONED, not zeroed, and that is the difference that makes this arm mean something.
+            // The mounts block above zeroes its result, so its "untouched" assertion cannot tell a
+            // handler that wrote zeros from one that wrote nothing. 0x5A can.
+            unsigned char result[64];
+            memset(result, 0x5A, sizeof(result));
+            uint64_t param[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+            const uint64_t r = fn((uint64_t)(uintptr_t)param, (uint64_t)(uintptr_t)result, 0, 0, 0, 0);
+
+            // Kills: THE BUG, and equally a hand-written `return 0` stub replacing it.
+            CHECK(r != 0, "sceSaveDataDirNameSearchPs4 reports unavailable rather than success");
+            // Sign, not merely non-zero: Sony errors are 0x8xxxxxxx and guest sites gate with
+            // `test eax,eax; js`, so `return 1` would reinstate the bug with a non-zero check green.
+            CHECK((int32_t)(uint32_t)r < 0,
+                  "sceSaveDataDirNameSearchPs4 error is NEGATIVE as int32 (the sign call sites test)");
+            // Kills: inventing a written result -- a zeroed hit count over a layout nobody has
+            // established. That is the exact MIRROR of the defect being fixed, and it is the more
+            // tempting mistake because it looks more helpful.
+            CHECK(all_bytes_equal(result, sizeof(result), 0x5A),
+                  "sceSaveDataDirNameSearchPs4 writes NOTHING to the caller's result buffer");
+            // Kills: the two PS4-namespace entry points drifting apart. Both derive their answer
+            // from the same local-inventory fact -- prosper has no PS4 save-data store -- so a
+            // title's behaviour must not depend on which of them it happened to call.
+            CHECK(r == answers[1],
+                  "both PS4-namespace savedata entry points give the same answer");
+        }
+    }
 }
 
 } // namespace
