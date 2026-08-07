@@ -99,19 +99,27 @@ SDL3 automatically uses a connected controller as pad 0. Keyboard input is compo
 
 | Host input | Guest control |
 |---|---|
-| WASD or arrows | D-pad and left stick |
-| J or Space | Cross |
-| K | Square |
-| L | Circle |
-| I | Triangle |
-| U / O | L1 / R1 |
-| Y / H | L2 / R2 |
+| WASD or arrows | D-pad |
+| T F G H | Left stick — up / left / down / right |
+| I J K L | Right stick — up / left / down / right |
+| N M , . | Square / Cross / Circle / Triangle |
+| Space | Cross |
+| Z X C V | L1 / L2 / R1 / R2 |
+| B / Slash | L3 / R3 (stick clicks) |
 | Enter | Options |
 | Pause or F10 | Pause/resume the guest and audio at a flip boundary |
 | F11 or Alt+Enter | Toggle host-window fullscreen |
 | F8 | Capture 5 seconds before and after a performance problem to `.prperf` |
 | F9 | Capture the current frame for offline replay |
 | Escape | Exit |
+
+Two clusters per hand, and a hand uses one at a time: left hand on WASD **or** TFGH, right hand on
+IJKL **or** N/M/,/. The right stick, L3 and R3 had no keyboard binding at all before this, so camera
+control needed a physical pad — in a first-person title you could walk but not look.
+
+**This changed WASD.** It used to drive the D-pad *and* the left stick together, so a stick-only
+title responded to it. The two are separate now: WASD is the D-pad, TFGH is the left stick.
+
 
 Pause/F10 is host-owned and is not forwarded to guest keyboard input. Alt+Enter is consumed by the
 host window and is not forwarded as the guest Options button. Closing the window also exits.
