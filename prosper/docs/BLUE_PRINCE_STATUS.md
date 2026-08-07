@@ -217,6 +217,43 @@ were confirmed as legitimate frustum culls.
 
 ## Ruled out (do-not-redo list)
 
+**Persistent-texture revalidation, 2026-08-07 (Windows / NVIDIA RTX 4090, #2289 / #2290 / #2295).**
+**43.6% of the frame is `memcmp` revalidating 19 cached, unchanged textures** — 233 GiB of
+comparison per ~55 s route, on a cache running 34,303 hits against 19 misses. That number stands.
+Three ways of removing it are dead, and two of them died because *I published the wrong mechanism
+first*:
+
+- **"The write journal is not armed on the renderer's path."** FALSE. `execute_ordered_and_present`
+  branches on `needs_ordered_realization` and *both* arms reach a scope — the non-ordered one via
+  `execute_ordered_items` -> `execute_ordered_items_impl`, which constructs it as its first
+  statement (`gpu_executor.cpp:5681`) and calls the renderer at `:5737`, lexically inside it and on
+  the same thread. Measured `unarmed=0 stale=33438`: every `Unknown` is a **serial mismatch**, and
+  `guest_gpu_writes_since()` is answering *correctly* — the journal is intra-submit by construction
+  and cannot answer a cross-submit question. Citing the two construction sites is not the same as
+  tracing which one the branch lands in (#2295).
+- **"In-submit reuse is worth ~9x."** FALSE, and it was a misread of the instrument. `8.9
+  refs/submit` is the total across ALL cached textures, not references to one: `33437 hits / 3875
+  submits / 19 entries = 0.47 refs per ENTRY per submit`. A texture is referenced about once every
+  *two* submits, so there is essentially no intra-submit repeat to exploit. The counters already
+  implied it — `unknown == validations` means a same-submit second reference never happens (#2295).
+- **`MEM_WRITE_WATCH` / `GetWriteWatch`.** BLOCKED, measured with a positive control. Guest dmem is
+  a sparse file + `CreateFileMappingW` section mapped as views (`hle_kernel_mem.cpp:3168`), which
+  PS5 `sceKernelMapDirectMemory` aliasing *requires*. `GetWriteWatch` on a private
+  `VirtualAlloc(MEM_WRITE_WATCH)` region works (`rc=0`, 2 dirty pages, granularity 4096); on a
+  section-backed view it returns `-1` with `GetLastError()=87`. `MEM_WRITE_WATCH` is an attribute of
+  private committed memory and a mapped view can never carry it.
+
+So this is **a Windows structural limit under the current design**, not a missing optimisation: the
+page-protection watch Linux uses is barred here by the red-zone hazard in `guest_write_watch.cpp`
+(exception-dispatch frames land in the guest's SysV 128-byte red zone), and that hazard is real.
+**Do not "fix" it by validating a prefix, validating every N submits, or trusting the GPU-write
+journal alone** — each is unsound against raw guest CPU stores, which is exactly what the exact
+compare exists to catch, and the failure mode is silently-stale texture pixels.
+
+The open measurement that would size the prize is the **Linux `watch_reuse` count** on this title:
+Linux takes the real mprotect tracker (`guest_write_watch.cpp:520`), so its reuse rate is what a
+working cross-submit watch would be worth here.
+
 **Frontend frame decomposition, 2026-08-07 (Windows / NVIDIA RTX 4090, #2266 / #2262 / #2276).**
 `pass_control` was 27% of the frame and was a *residual*, not a measurement. Partitioning it took
 four steps and three of them killed a hypothesis. Each cost a 13-minute route; none is recoverable

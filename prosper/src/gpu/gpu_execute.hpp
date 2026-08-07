@@ -611,6 +611,17 @@ GuestGpuWriteSnapshot guest_gpu_write_snapshot();
 GuestGpuWriteQuery guest_gpu_writes_since(const GuestGpuWriteSnapshot& snapshot,
                                            uint64_t addr, uint64_t size);
 
+// Whether the per-submit write journal is armed ON THIS THREAD (#2289). Diagnostic only.
+//
+// guest_gpu_writes_since() returns Unknown for two structurally different reasons and a caller
+// cannot tell them apart: the journal is not armed here at all, or it IS armed but the snapshot
+// carries a different submit serial. The second is not a defect -- the journal is intra-submit by
+// construction, so a snapshot taken in an earlier submit can only ever answer Unknown. Conflating
+// them is how a cross-submit cost gets mistaken for missing instrumentation.
+//
+// The journal is thread_local, so this answers for the calling thread and nothing else.
+bool guest_gpu_write_tracking_active();
+
 // Register the synchronous live compute backend. execute_compute_dispatches realizes every retained
 // dispatch from its state snapshot and invokes the backend in stream order.
 void set_submit_compute(LiveComputeFn fn);

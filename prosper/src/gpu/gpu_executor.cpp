@@ -6973,6 +6973,7 @@ GuestGpuWriteSnapshot guest_gpu_write_snapshot() {
     if (!g_guest_gpu_writes.active || g_guest_gpu_writes.overflowed) return {};
     return {g_guest_gpu_writes.submit_serial, g_guest_gpu_writes.writes.size()};
 }
+bool guest_gpu_write_tracking_active() { return g_guest_gpu_writes.active; }
 GuestGpuWriteQuery guest_gpu_writes_since(const GuestGpuWriteSnapshot& snapshot,
                                            uint64_t addr, uint64_t size) {
     if (!snapshot.submit_serial || !g_guest_gpu_writes.active ||
