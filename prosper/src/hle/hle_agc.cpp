@@ -1707,7 +1707,7 @@ uint64_t g_submit_count = 0;
 // Serializes every access to the shared GpuState (fold + render + stats). DOLL's UE4 RHI submits
 // from TWO guest threads concurrently (core-proven, issue #278: one thread inside
 // agc_driver_submit_dcb -> execute_and_present -> extract_render_state reading st.cx/sh/uc while
-// another is inside agc_driver_submit_dcb_variant -> run_command_buffer writing them). An
+// another is inside agc_cb_branch -> run_command_buffer writing them). An
 // unordered_map rehash under a lock-free reader tears bucket pointers -> #GP with si_addr=0 (the
 // "rip=0 / writer 0x0" steady-state crash that ended runs as the scene began). The real driver
 // serializes ring submission internally — concurrent guest submits are legal and processed one at
@@ -1890,7 +1890,7 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
 
 // Fold one raw Dcb dword stream through the CommandProcessor, fire the GPU EOP completion events, and
 // (if a live renderer is wired and the submit produced draws) execute+present. Shared by the primary
-// submit path (sceAgcDriverSubmitDcb) and the DOLL warmup-submit variant (w1KFAHVqpaU) below.
+// submit path (sceAgcDriverSubmitDcb) and sceAgcCbBranch (w1KFAHVqpaU) below.
 // `dw_num == 0` means "length unknown" — decode_pm4 self-terminates at the first non-type-3 dword, and
 // we cap the walk at kUnknownCap dwords as a runaway guard (a bounded ring can't legitimately exceed it).
 extern "C" uint64_t prosper_guest_tsc_ns();                    // shared guest clock (hle_kernel_time)
@@ -2372,7 +2372,24 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     return 0;
 }
 
-// sceAgc submit variant (NID w1KFAHVqpaU) — DOLL's UE4 RHI submits its per-frame command buffers
+// sceAgcCbBranch (NID w1KFAHVqpaU). The identity is a determination, not a guess:
+// nid_hash("sceAgcCbBranch") == w1KFAHVqpaU, from the round-trip over all 39,158 published pairs in
+// the PS5 3.20 export tables with 0 mismatches (nid_census --self-check, #2081). It was previously
+// labelled a "submit variant" here, which was wrong in a way that cost something: "submit variant"
+// implies a second submit entry point, while "CbBranch" implies a control-flow packet in a command
+// stream, and those predict different things about the arguments and about what
+// sceAgcCbBranchGetSize should return (#2173).
+//
+// The BEHAVIOUR below is right and must not be "fixed" to match the new label -- it resolved the
+// #232 wall. The two readings agree: a command-buffer chain CALLS its intermediate buffers and
+// BRANCHES to the last one (a tail-jump, so the final buffer never returns), which is exactly the
+// pattern the RE notes describe. Folding -- executing -- the stream at that address is therefore the
+// correct thing for a software command processor to do, and sceAgcCbBranch semantics EXPLAIN the
+// RE'd ABI rather than contradict it. CONFIDENCE: HIGH on the identity; MED on the chain-tail-jump
+// reading of why DOLL calls it here (it fits the recorded disassembly, but no capture was taken to
+// confirm the final buffer is entered by branch rather than by call).
+//
+// DOLL's UE4 RHI submits its per-frame command buffers
 // through TWO driver entry points: intermediate buffers via sceAgcDriverSubmitDcb (UglJIZjGssM,
 // folded above) and the FINAL buffer of a SubmitCommandBuffers batch through THIS one (the guest's
 // SubmitCommandBuffers impl at eboot+0x220a9a0 loops the buffer array, calling the indirect submit for
@@ -2394,7 +2411,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
 // logger stack-smash) — intermittent because it depends on what got reallocated under the stale fences.
 // CONFIDENCE: HIGH on the arg9=count ABI (callsite + adapter disassembly agree, and the count matches
 // the primary path's Packet.dw_num field offset).
-HLE9(agc_driver_submit_dcb_variant) {
+HLE9(agc_cb_branch) {
     // The generated return hook is attached to this import invocation even when validation rejects
     // it. Begin before every early return so nested/re-entrant tagged calls remain exactly paired.
     prosper_gpu_submit_scope_begin();
@@ -3000,6 +3017,9 @@ HLE(agc_cb_nop_get_size)          { uint32_t n = (uint32_t)a0; if (n == 0) n = 1
 void register_agc_hle() {
     #define RN(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid)
     #define RN_SUBMIT(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid, &prosper_gpu_submit_scope_end)
+    // Same, but with the real exported name for logs and hle_calls. Separate from RN_SUBMIT
+    // because the rest of this file registers the NID as its own display name by convention.
+    #define RN_SUBMIT_NAMED(nid, fn, name) Hle::register_fn(nid, (HleFn)(fn), name, &prosper_gpu_submit_scope_end)
     RN("VEGu4dixjUg", agc_dcb_jump_get_size);        // sceAgcDcbJumpGetSize (#1137)
     RN("-vnlTPPXPrw", agc_dcb_acquire_mem_get_size); // sceAgcDcbAcquireMemGetSize
     RN("ewobAQeMo5k", agc_dcb_acquire_mem_get_size); // sceAgcAcbAcquireMemGetSize (same size)
@@ -3131,7 +3151,25 @@ void register_agc_hle() {
     // trampoline. This per-NID checkpoint ends the submit scope immediately before guest return.
     RN_SUBMIT("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
     RN_SUBMIT("gSRnr79F8tQ", agc_driver_submit_acb);   // sceAgcDriverSubmitAcb -> ordered compute replay
-    RN_SUBMIT("w1KFAHVqpaU", agc_driver_submit_dcb_variant);  // final-buffer submit variant (#232, DOLL RHI batch)
+    // sceAgcCbBranch (#2173) — named, so logs and hle_calls do not report a bare NID for the one
+    // entry here whose published name is established. See the block above agc_cb_branch.
+    RN_SUBMIT_NAMED("w1KFAHVqpaU", agc_cb_branch, "sceAgcCbBranch");
+    // The rest of the branch family is KNOWN-ABSENT rather than overlooked (#2173). libSceAgc
+    // exports them together; no title has been observed calling them, and each is left
+    // unregistered so a caller faults visibly instead of getting a silent wrong answer:
+    //   uZW-mqsxkrM  sceAgcCbBranchGetSize
+    //   GXBlM-ekzrI  sceAgcBranchPatchSetCompareAddress
+    //   QmfvaYpsOcI  sceAgcBranchPatchSetElseTarget
+    //   xb8VgcXQhvI  sceAgcBranchPatchSetThenTarget
+    // nid_census flags "builder registered, GetSize unregistered" for this pair, which normally
+    // means the guest reserves 0 dwords while prosper writes N. Here it is BENIGN ONLY BECAUSE
+    // agc_cb_branch folds the target stream and appends NOTHING to the guest buffer. If it is
+    // ever changed to emit a real branch packet, sceAgcCbBranchGetSize must be registered in the
+    // SAME change or the guest reserves nothing for what prosper then writes.
+    // The three BranchPatch* entries patch a branch's then/else targets and compare address
+    // AFTER it has been written, which a fold cannot honour: prosper folds unconditionally at
+    // build time and any later patch would be dropped. Whether a title does this is open.
+    #undef RN_SUBMIT_NAMED
     #undef RN_SUBMIT
     #undef RN
 }
