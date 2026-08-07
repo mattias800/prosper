@@ -43,8 +43,21 @@ struct RendererTimingRecord {
     double gpu_device_ms = 0;
     double readback_ms = 0;
     double setup_resources_ms = 0;
-    double texture_ms = 0;
-    double buffer_ms = 0;
+    // FRONTEND resource time, accumulated in build_resources. These are NOT sub-buckets of
+    // setup_resources_ms below: that one is the BACKEND's, and the two are different layers.
+    // Subtracting these from it is a category error that produces a large, plausible, meaningless
+    // residue -- I published one (#2215) before noticing, so the names now say which layer they are.
+    double frontend_texture_ms = 0;
+    double frontend_buffer_ms = 0;
+    // BACKEND sub-buckets, which DO decompose setup_resources_ms:
+    //     setup_resources_ms = res_texture + res_buffer + res_descriptor + other
+    // `other` is deliberately not stored -- it is the remainder, and storing a number the reader can
+    // derive invites the two to disagree. Without these an F8 capture cannot attribute its own
+    // largest bucket, which is the reason both lanes spent a day reasoning from partial data.
+    double res_texture_ms = 0;
+    double res_buffer_ms = 0;
+    double res_buffer_copy_ms = 0;   // the leaf the perf work keeps landing on (#2215/#2231)
+    double res_descriptor_ms = 0;
 };
 
 // One live-compute batch. CPU-fast-path dispatches are included in `dispatches`; the cumulative
