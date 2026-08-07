@@ -11,8 +11,11 @@ by completion writes prosper applies while it is still executing the rest of the
 The contract that forbids exactly that already exists in `command_processor.cpp` and is armed by
 `if (version >= 13)`; ArcRunner requests SDK version 10. Forcing it on
 (`PROSPER_POST_SUBMIT_VISIBILITY=1`, new, default OFF) survives the **default route with no throttle**,
-3 of 3, delivering 782–838 video frames against a default arm's 29–32. That is a candidate fix, not a
-lever — but the version gate must not be removed without a cross-title snapshot pass.
+3 of 3, and a 260 s run on that route **reaches and renders the title screen** with 1,977 delivered
+video frames and zero faults. The same lever rescues *Crisis Core* (`PPSA07809`), the other title with
+this dose-response, which is also SDK 10 — 3 of 3 against a 3-of-3 faulting control. That is a
+candidate fix, not a lever; but three rung-6 guarded titles are also pre-13, so the version gate must
+not be removed without a cross-title snapshot pass and a review.
 The long-lived compatibility index is [#1817](https://github.com/mattias800/prosper/issues/1817),
 and the primary allocator, barrier, and intro-movie investigation is
 [#1226](https://github.com/mattias800/prosper/issues/1226).
@@ -1447,12 +1450,65 @@ fold move to the worker.
 **This is a candidate correctness change, not a lever in the throttle's class**, and the distinction
 is the one the throttle's own comment draws: the throttle discards nothing and models nothing, it
 just delays the guest. This arms a contract prosper already implements, already believes is
-hardware-true, and already applies to every SDK-13 title. **It is nevertheless NOT flipped on by
-default here.** Removing the version gate changes behaviour for every pre-13 title in the matrix, the
-gate's own provenance carries no recorded evidence (it arrived inside `474af058`, a large
-DQ7 commit with a one-line message; `#2031` kept it while explicitly moving the *register table* off
-the same gate), and a numeric improvement is not evidence of a correct model. **The next step is a
-cross-title snapshot pass with the gate removed** — that is what stands between this and rung 2.
+hardware-true, and already applies to every SDK-13 title.
+
+### 5a. It reaches the title screen on the default route
+
+![ArcRunner — the title screen at 3840x2160 on the DEFAULT route with no submit throttle, under PROSPER_POST_SUBMIT_VISIBILITY=1](../../assets/screenshots/arcrunner-title-screen-default-route.png)
+
+`assets/screenshots/arcrunner-title-screen-default-route.png` is an unmodified 3840x2160 presented
+frame from `boot_trace`'s live renderer (`PROSPER_FRAME_DIR`), route
+`PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_AVPLOG=1 PROSPER_POST_SUBMIT_VISIBILITY=1` with
+`PROSPER_RENDER_SCALE` and `PROSPER_RENDER_EVERY` at their defaults and **no**
+`PROSPER_SUBMIT_STALL_US`, no suppression, no guard and no skip. The 260 s run delivered **1,977**
+`sceAvPlayerGetVideoDataEx` frames — past the movie's 1,908 — with **zero** `WORKER-THREAD FAULT`
+and **zero** `FMallocBinned3`/`LowLevelFatalError` lines, and ended by timing out (`rc=124`) rather
+than dying. It carries the *ArcRunner* logo, the TrickJump and PQube logos and
+`VERSION 1.0.1 RELEASE`. The image was opened, not merely measured.
+
+A 220 s companion run on the same route delivered 1,177 video frames with zero faults and rendered
+the intro cinematic — the rainy neon street with the game's own *PRESS ANY BUTTON TO SKIP…* prompt,
+which baseline cannot reach structurally (the movie's first non-black frame is video frame 60 and a
+default arm delivers 29–32). The green/magenta cast is the already-filed chroma-plane fault
+([#2094](https://github.com/mattias800/prosper/issues/2094)), unrelated to this change.
+
+**This is not rung 2 yet**, and the rung is deliberately not raised: it needs an env var, so it is
+one gate condition away from a default launch rather than at one.
+
+### 5b. The prediction transfers to Crisis Core, the other title in this family
+
+`CRISIS_CORE_STATUS.md` records the identical `(500, 1500]` dose-response on `PPSA07809`. That title
+**also requests SDK version 10**, so the same contract is unarmed for it — which makes "forcing it on
+rescues Crisis Core too" a prediction rather than a second search. Same binary, same census method,
+alternated control/armed:
+
+| arm | runs | faulted | note |
+| --- | --- | --- | --- |
+| default | 3 | **3 of 3**, exit 90 | one arm also carries 4 `FMallocBinned3`/fatal lines |
+| `POST_SUBMIT_VISIBILITY=1` | 3 | **0 of 3**, to the 40 s bound | lever witnessed on each; zero fatals |
+
+Two independently brought-up titles, one unarmed contract, the same rescue. Peer-process censuses
+were exact zero before and after all six arms.
+
+### 5c. Why the gate is NOT removed in this pass
+
+**Removing it is not a no-op for the matrix.** A census of the SDK version each title requests
+(`[agc] register defaults requested for SDK version N`, printed unconditionally on every boot):
+
+| SDK version | titles |
+| --- | --- |
+| 13 (already armed) | *The Messenger* `PPSA24651`, *Blue Prince* `PPSA25009`, *Little Nightmares III* `PPSA05143`, *Dragon Quest VII* `PPSA17942` |
+| 12 | *The Oregon Trail* `PPSA19244` |
+| 10 | *Dead Cells* `PPSA15552`, *Blasphemous 2* `PPSA13579`, *Sonic Frontiers* `PPSA03831`, *Crisis Core* `PPSA07809`, *ArcRunner* `PPSA21406` |
+| 8 | *Alex Kidd in Miracle World DX* `PPSA02664` |
+
+Three of the pre-13 titles are **rung-6, snapshot-guarded** (Dead Cells, Blasphemous 2, Alex Kidd),
+so the gate is load-bearing for the guarded matrix and removing it must be scored against it. The
+gate's own provenance carries no recorded evidence — it arrived inside `474af058`, a large DQ7 commit
+with a one-line message, and `#2031` kept it while explicitly moving the *register table* off the
+same gate — but a numeric improvement is not evidence of a correct model. **The next step is a
+cross-title snapshot pass with the gate removed, plus review; that is what stands between this title
+and rung 2**, and it is now the only thing.
 
 ### 6. One hypothesis this pass killed with its own instrument
 
