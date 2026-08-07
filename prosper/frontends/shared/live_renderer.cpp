@@ -1318,21 +1318,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // total is PRINTED, never which calls it counts.
                     static uint64_t refs = 0, uniq = 0, memo = 0, hashed = 0, dwords = 0;
                     static uint64_t skipped_large = 0, skipped_unique = 0, fallbacks = 0, calls = 0;
+                    static uint64_t large_dwords = 0, upload_bytes = 0;
                     refs += reuse.buffer_references;      uniq += reuse.unique_buffers;
                     memo += reuse.buffer_ref_memo_hits;   hashed += reuse.buffer_hash_calls;
                     dwords += reuse.buffer_hash_dwords;   fallbacks += reuse.buffer_upload_fallbacks;
                     skipped_large += reuse.buffer_hash_skipped_large;
                     skipped_unique += reuse.buffer_hash_skipped_unique;
+                    large_dwords += reuse.buffer_skipped_large_dwords;
+                    upload_bytes += reuse.buffer_upload_bytes;
                     if (prosper::diag_should_print(++calls))
                         fprintf(stderr,
                                 "[render-timing] buffer_reuse (cumulative over %llu backend calls) "
                                 "refs=%llu unique=%llu memo_hits=%llu hashed=%llu (%.1f MiB) "
-                                "skipped_large=%llu skipped_unique=%llu upload_fallbacks=%llu\n",
+                                "skipped_large=%llu (%.1f MiB) skipped_unique=%llu "
+                                "COPIED=%.1f MiB upload_fallbacks=%llu\n",
                                 (unsigned long long)calls, (unsigned long long)refs,
                                 (unsigned long long)uniq, (unsigned long long)memo,
                                 (unsigned long long)hashed, (double)dwords * 4.0 / (1024.0 * 1024.0),
                                 (unsigned long long)skipped_large,
+                                (double)large_dwords * 4.0 / (1024.0 * 1024.0),
                                 (unsigned long long)skipped_unique,
+                                (double)upload_bytes / (1024.0 * 1024.0),
                                 (unsigned long long)fallbacks);
                 }
             };
