@@ -298,6 +298,7 @@ static_assert(sizeof(VdecInput) == 48 && sizeof(VdecFrame) == 32 && sizeof(VdecO
 
 std::mutex g_vdec_mx;
 std::unordered_map<uint64_t, uint32_t> g_vdec_codecs;
+std::unordered_map<uint64_t, int> g_vdec_au_ids;   // #2270 access-unit decoders
 
 // A rejected decoder config is a hard stop for a title's movie playback, and the guest only prints the
 // bare SCE code — 0x811d0200 covers TWO different conditions here, so "err=0x811d0200" alone cannot tell
@@ -581,6 +582,50 @@ HLE(s_videodec2_decode) {
                     "[vdec-contract] decode#%u handle=0x%llx au_bytes=%llu frame_buf=%llu\n",
                     k, (unsigned long long)a0, (unsigned long long)input->data_size,
                     (unsigned long long)frame->data_size);
+        }
+    }
+    // Real decode when a backend offers the access-unit path (#2270). Opt-in while the output
+    // FORMAT enum is still unknown: the layout is established (NV12, from max_frame_size /
+    // max_width*max_height = 1.5 bytes per pixel exactly, corroborated by VideoFrame already being
+    // the NV12 the platform delivers), but which Sony constant names it in out->format is not, and
+    // a wrong constant yields a correctly-decoded picture the guest reads wrongly.
+    static const bool vdec2_decode = getenv("PROSPER_VDEC2_DECODE") != nullptr;
+    if (vdec2_decode) {
+        if (auto* vb = prosper::video::backend()) {
+            int au_id;
+            {
+                std::lock_guard<std::mutex> lk(g_vdec_mx);
+                auto found = g_vdec_au_ids.find(a0);
+                if (found == g_vdec_au_ids.end()) {
+                    au_id = vb->open_decoder(codec);
+                    g_vdec_au_ids[a0] = au_id;
+                } else {
+                    au_id = found->second;
+                }
+            }
+            prosper::video::VideoFrame pic;
+            if (au_id >= 0 &&
+                vb->decode_au(au_id, (const uint8_t*)PW(input->data), (size_t)input->data_size,
+                              pic)) {
+                const uint64_t need = (uint64_t)pic.width * pic.height * 3 / 2;
+                auto* dst = (uint8_t*)PW(frame->data);
+                if (dst && frame->data_size >= need) {
+                    const size_t y_bytes = (size_t)pic.width * pic.height;
+                    std::memcpy(dst, pic.y, y_bytes);
+                    std::memcpy(dst + y_bytes, pic.uv, y_bytes / 2);
+                    frame->accepted = 1;
+                    out->valid = 1; out->error = 0; out->pictures = 1; out->discarded = 0;
+                    out->codec = codec;
+                    out->width = pic.width; out->height = pic.height;
+                    out->pitch = pic.y_stride; out->pitch_bytes = pic.y_stride;
+                    out->frame = frame->data; out->frame_size = frame->data_size;
+                    // The one field still unestablished. Left 0 deliberately rather than filled
+                    // with a plausible constant: a wrong value here is a correctly-decoded picture
+                    // the guest misreads, which is silent, and #2270 records it as the open item.
+                    out->format = 0;
+                    return 0;
+                }
+            }
         }
     }
     frame->accepted = 0; vdec_no_picture(frame, out, codec);

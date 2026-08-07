@@ -67,6 +67,28 @@ public:
     // waited forever for a position that never moved instead of taking its own failure branch.
     virtual bool seek(int /*id*/, uint64_t /*position_us*/) { return false; }
     virtual void close(int id) = 0;
+
+    // ---- Access-unit decoding, for sceVideodec2 (#2270) ----------------------------------------
+    //
+    // A DIFFERENT shape from open()/next_video() above, and the difference is the guest's, not ours:
+    // AvPlayer hands prosper a whole stream to demux, while Videodec2's caller demuxes ITSELF and
+    // submits one compressed access unit at a time, expecting at most one picture back. Measured on
+    // Tales of Graces f (PPSA19991): access units of 565-3,984 bytes, i.e. per-frame NALs.
+    //
+    // That is precisely libavcodec's send_packet/receive_frame contract, so this is a second entry
+    // point onto the same decoder rather than a second decoder.
+    //
+    // Defaulted to unsupported so a backend without it keeps compiling AND answers honestly -- the
+    // same reason seek() and open_memory() are defaulted. An HLE that cannot decode must be able to
+    // say so; #2270 exists because sceVideodec2Decode instead reported SCE_OK with no picture,
+    // forever, which a title cannot distinguish from "no frame ready yet".
+    virtual int  open_decoder(uint32_t /*codec*/) { return -1; }
+    // True when a picture was produced. `out` is NV12 and stays valid until the next decode_au on
+    // this id. False means "no picture yet" (a decoder legitimately needs several access units
+    // before its first frame) and is NOT an error.
+    virtual bool decode_au(int /*id*/, const uint8_t* /*au*/, size_t /*bytes*/,
+                           VideoFrame& /*out*/) { return false; }
+    virtual void close_decoder(int /*id*/) {}
 };
 
 // Registered by the app frontend. nullptr means no native decoder is available.

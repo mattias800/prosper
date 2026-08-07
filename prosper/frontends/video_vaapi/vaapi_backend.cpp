@@ -14,6 +14,9 @@ extern "C" {
 
 #include <algorithm>
 #include <atomic>
+#include <map>
+#include <mutex>
+#include <vector>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -859,5 +862,142 @@ void uninstall_vaapi_backend() {
     auto& vaapi = shared_vaapi_backend();
     if (backend() == &vaapi) set_backend(nullptr);
 }
+
+
+// ===== sceVideodec2 access-unit decoding (#2270) ==============================================
+//
+// Separate from the stream pipeline above because the guest's contract is different: it demuxes
+// itself and submits one compressed access unit at a time. That is send_packet/receive_frame, so
+// this is a second entry point onto libavcodec rather than a second decoder.
+//
+// Output is NV12 because that is what the platform delivers (VideoFrame's own comment) and what the
+// guest allocates for: measured on Tales of Graces f, max_width*max_height = 1920*1088 against a
+// max_frame_size of 3,133,440, i.e. exactly 1.5 bytes per pixel. 2.0 would be YUV422, 4.0 RGBA.
+namespace {
+
+struct AuDecoder {
+    AVCodecContext* ctx = nullptr;
+    AVFrame* frame = nullptr;
+    AVPacket* packet = nullptr;
+    std::vector<uint8_t> nv12;      // interleaved UV staging; owned so `out` stays valid to next call
+    uint32_t width = 0, height = 0;
+};
+
+std::mutex g_au_mutex;
+std::map<int, AuDecoder> g_au_decoders;
+int g_next_au_id = 1;
+
+// libavcodec's H.264 decoder yields planar YUV420P; the guest wants semi-planar NV12. Interleaving
+// is the whole conversion -- the Y plane is byte-identical, so only chroma is touched.
+void yuv420p_to_nv12(const AVFrame* src, std::vector<uint8_t>& dst,
+                     uint32_t w, uint32_t h) {
+    const size_t y_bytes = static_cast<size_t>(w) * h;
+    dst.resize(y_bytes + y_bytes / 2);
+    for (uint32_t row = 0; row < h; ++row)
+        std::memcpy(dst.data() + static_cast<size_t>(row) * w,
+                    src->data[0] + static_cast<size_t>(row) * src->linesize[0], w);
+    uint8_t* uv = dst.data() + y_bytes;
+    const uint32_t cw = w / 2, ch = h / 2;
+    for (uint32_t row = 0; row < ch; ++row) {
+        const uint8_t* u = src->data[1] + static_cast<size_t>(row) * src->linesize[1];
+        const uint8_t* v = src->data[2] + static_cast<size_t>(row) * src->linesize[2];
+        uint8_t* o = uv + static_cast<size_t>(row) * w;
+        for (uint32_t col = 0; col < cw; ++col) { o[col * 2] = u[col]; o[col * 2 + 1] = v[col]; }
+    }
+}
+
+}  // namespace
+
+int VaapiBackend::open_decoder(uint32_t codec) {
+    // codec==1 is AVC/H.264: Tales of Graces f creates its decoder with codec=1 profile=100, and
+    // profile_idc 100 is H.264 High Profile. 1920x1088 corroborates it -- 1088 is 1080 rounded up to
+    // an H.264 16-pixel macroblock row. Anything else is refused rather than guessed at.
+    if (codec != 1) {
+        fprintf(stderr, "[vdec2] open_decoder: codec=%u is not AVC/H.264(1); refusing rather than "
+                        "guessing a bitstream format (#2270)\n", codec);
+        return -1;
+    }
+    const AVCodec* av = avcodec_find_decoder(AV_CODEC_ID_H264);
+    if (!av) { fprintf(stderr, "[vdec2] no H.264 decoder in this libavcodec build\n"); return -1; }
+    AuDecoder d;
+    d.ctx = avcodec_alloc_context3(av);
+    if (!d.ctx) return -1;
+    if (avcodec_open2(d.ctx, av, nullptr) < 0) { avcodec_free_context(&d.ctx); return -1; }
+    d.frame = av_frame_alloc();
+    d.packet = av_packet_alloc();
+    if (!d.frame || !d.packet) {
+        if (d.frame) av_frame_free(&d.frame);
+        if (d.packet) av_packet_free(&d.packet);
+        avcodec_free_context(&d.ctx);
+        return -1;
+    }
+    std::lock_guard<std::mutex> lk(g_au_mutex);
+    const int id = g_next_au_id++;
+    g_au_decoders[id] = d;
+    fprintf(stderr, "[vdec2] access-unit H.264 decoder opened (id=%d)\n", id);
+    return id;
+}
+
+bool VaapiBackend::decode_au(int id, const uint8_t* au, size_t bytes, VideoFrame& out) {
+    std::lock_guard<std::mutex> lk(g_au_mutex);
+    auto it = g_au_decoders.find(id);
+    if (it == g_au_decoders.end() || !au || !bytes) return false;
+    AuDecoder& d = it->second;
+
+    // av_packet_from_data would take ownership of a buffer we do not own; the guest's access unit
+    // lives in guest memory and must not be freed by libavcodec.
+    d.packet->data = const_cast<uint8_t*>(au);
+    d.packet->size = static_cast<int>(bytes);
+    const int sent = avcodec_send_packet(d.ctx, d.packet);
+    const int got = sent >= 0 ? avcodec_receive_frame(d.ctx, d.frame) : -1;
+    {
+        // Counted, not just logged: "no picture" is the correct answer while a decoder builds its
+        // reference state, so a run with zero pictures and a run with zero SENT packets are very
+        // different failures and must not look alike.
+        static std::atomic<unsigned> sends{0}, send_fail{0}, pics{0};
+        ++sends;
+        if (sent < 0) ++send_fail;
+        if (got == 0) ++pics;
+        const unsigned n = sends.load();
+        if (n <= 4 || n % 64 == 0) {
+            char err[AV_ERROR_MAX_STRING_SIZE] = {0};
+            if (sent < 0) av_strerror(sent, err, sizeof err);
+            fprintf(stderr, "[vdec2] au#%u bytes=%zu send=%d%s%s recv=%d | pictures=%u "
+                    "send_failures=%u\n", n, bytes, sent, sent < 0 ? " " : "", sent < 0 ? err : "",
+                    got, pics.load(), send_fail.load());
+        }
+    }
+    if (sent < 0 || got < 0) return false;   // needs more input: NOT an error
+
+    if (d.frame->format != AV_PIX_FMT_YUV420P) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 8)
+            fprintf(stderr, "[vdec2] unexpected decoded pixel format %d (want YUV420P); no picture\n",
+                    d.frame->format);
+        return false;
+    }
+    d.width = static_cast<uint32_t>(d.frame->width);
+    d.height = static_cast<uint32_t>(d.frame->height);
+    yuv420p_to_nv12(d.frame, d.nv12, d.width, d.height);
+    out.y = d.nv12.data();
+    out.uv = d.nv12.data() + static_cast<size_t>(d.width) * d.height;
+    out.width = d.width;
+    out.height = d.height;
+    out.y_stride = d.width;
+    out.uv_stride = d.width;
+    out.pts_us = 0;
+    return true;
+}
+
+void VaapiBackend::close_decoder(int id) {
+    std::lock_guard<std::mutex> lk(g_au_mutex);
+    auto it = g_au_decoders.find(id);
+    if (it == g_au_decoders.end()) return;
+    if (it->second.frame) av_frame_free(&it->second.frame);
+    if (it->second.packet) av_packet_free(&it->second.packet);
+    if (it->second.ctx) avcodec_free_context(&it->second.ctx);
+    g_au_decoders.erase(it);
+}
+
 
 } // namespace prosper::video
