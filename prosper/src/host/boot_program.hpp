@@ -153,6 +153,11 @@ inline bool guest_va_in_module_code(uint64_t a) {
 //
 // Available on every platform with a guest-execution substrate (currently Linux, Windows, and macOS).
 // Other platforms return false.
+// The loader's actual link set for a dump root (#2199). boot_program() calls this, so a second
+// consumer -- nid_census, whose cross-module exclusions are only sound over the set the loader
+// really links -- cannot drift from it. Prints auto-link and case-correction lines as it works.
+std::vector<LinkInput> boot_link_inputs(const std::string& dump_root, bool verbose = true);
+
 bool boot_program(const std::string& dump_root, Program& out, std::string* err,
                   const std::function<void()>& after_hle_registered = {});
 
