@@ -625,6 +625,11 @@ struct BackendRenderTimingStats {
     // question #2254 exists to answer. Do not rename it to something that sounds like a phase until
     // it has been split into ones.
     double res_fixed_prologue_ms = 0;
+    // Leaves of res_fixed_prologue_ms (#2254). That span was 12.60 ms/submit -- 39% of `fixed`,
+    // ~6% of the frame -- and #2252 named it honestly as a positional residual with no identified
+    // cause. `subgroup_scan` is the pair of fragment_spirv_required_subgroup_{size,features} calls,
+    // each of which walks the ENTIRE SPIR-V module, per draw, unconditionally.
+    double res_prologue_subgroup_scan_ms = 0;
 
     double setup_fixed_other_ms() const {
         return setup_fixed_ms - res_fixed_index_upload_ms - res_fixed_blend_ms -
@@ -3927,6 +3932,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     double res_fixed_viewport_ms = 0.0;
     double res_fixed_stages_ms = 0.0;
     double res_fixed_prologue_ms = 0.0;
+    double res_prologue_subgroup_scan_ms = 0.0;
     double setup_resources_ms = 0.0;
     double setup_pipeline_ms = 0.0;
     // #1284 sub-attribution of setup_resources_ms; see BackendRenderTimingStats for what each covers.
@@ -4049,10 +4055,64 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         const std::vector<uint32_t>& bd_gs = bd.gs_words();
         const std::vector<uint32_t>& bd_fs = bd.fs_words();
         DV& v = dv[di];
-        const uint32_t required_fragment_subgroup_size =
-            prosper::gpu::fragment_spirv_required_subgroup_size(bd_fs);
-        const uint32_t required_fragment_subgroup_features =
-            prosper::gpu::fragment_spirv_required_subgroup_features(bd_fs);
+        const auto subgroup_scan_begin =
+            timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+        // Both of these walk the ENTIRE SPIR-V module, and build_bds calls them once per draw on a
+        // module that changes only when the shader does. Measured at 7.14 ms/submit -- 58% of the
+        // pre-index span and ~4% of a Blue Prince gameplay frame (#2254, partitioned by #2252).
+        //
+        // Memoized on fs_identity, the same key and the same argument as #2259: DrawItem identities
+        // come from the shader-recompile cache as `cache.next_identity++`
+        // (src/gpu/gpu_executor.cpp:1255 graphics, :1441 compute; sole assignment at :437), a
+        // monotonic counter that is never reset, never decremented and untouched by eviction. So an
+        // identity denotes one module for the life of the process -- an evicted shader recompiles to
+        // a NEW identity, which misses here and refills, and the stale entry is simply never looked
+        // up again. The counter starts at 1, so identity 0 is never minted and the fallthrough below
+        // cannot collide with a real module.
+        //
+        // Both memoized values are pure functions of the module bytes alone -- neither reads device
+        // state -- so a hit is exactly what the call would have returned. The device-dependent half
+        // (available_fragment_subgroup_features, from ctx.subgroup_operations) is computed BELOW and
+        // is deliberately not memoized: it is cheap, and folding it in would key device state on a
+        // shader identity.
+        struct SubgroupScanEntry { uint32_t size; uint32_t features; };
+        static thread_local std::unordered_map<uint64_t, SubgroupScanEntry> subgroup_scan_memo;
+        constexpr size_t kSubgroupScanMemoMaxEntries = 4096;
+        uint32_t required_fragment_subgroup_size = 0;
+        uint32_t required_fragment_subgroup_features = 0;
+        // PROSPER_NO_SUBGROUP_SCAN_MEMO: opt out, so the A/B for this change is single-variable on
+        // ONE binary rather than a comparison of two builds. Kept as a permanent bisection lever for
+        // the same reason PROSPER_NO_INDEX_ARENA (#2258) and the PROSPER_NO_BACKEND_* family exist.
+        static const bool no_subgroup_scan_memo = getenv("PROSPER_NO_SUBGROUP_SCAN_MEMO") != nullptr;
+        bool subgroup_scan_memoized = false;
+        if (bd.fs_identity && !no_subgroup_scan_memo) {
+            const auto found = subgroup_scan_memo.find(bd.fs_identity);
+            if (found != subgroup_scan_memo.end()) {
+                required_fragment_subgroup_size = found->second.size;
+                required_fragment_subgroup_features = found->second.features;
+                subgroup_scan_memoized = true;
+            }
+        }
+        if (!subgroup_scan_memoized) {
+            required_fragment_subgroup_size =
+                prosper::gpu::fragment_spirv_required_subgroup_size(bd_fs);
+            required_fragment_subgroup_features =
+                prosper::gpu::fragment_spirv_required_subgroup_features(bd_fs);
+            if (bd.fs_identity && !no_subgroup_scan_memo) {
+                // Cleared wholesale rather than aged: there is no LRU bookkeeping worth paying for
+                // on a path this hot. A non-zero clear count means this memo has STOPPED WORKING --
+                // the scans are being paid again in full, plus the churn -- not that a threshold was
+                // brushed. 523 distinct shaders per submit leaves ample headroom against 4,096.
+                if (subgroup_scan_memo.size() >= kSubgroupScanMemoMaxEntries)
+                    subgroup_scan_memo.clear();
+                subgroup_scan_memo.emplace(bd.fs_identity,
+                                           SubgroupScanEntry{required_fragment_subgroup_size,
+                                                             required_fragment_subgroup_features});
+            }
+        }
+        if (timing_enabled)
+            res_prologue_subgroup_scan_ms +=
+                setup_elapsed_ms(subgroup_scan_begin, TimingClock::now());
         uint32_t available_fragment_subgroup_features = 0;
         if (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT)
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupVote;
@@ -6683,6 +6743,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.res_fixed_viewport_ms = res_fixed_viewport_ms;
         call_timing.res_fixed_stages_ms = res_fixed_stages_ms;
         call_timing.res_fixed_prologue_ms = res_fixed_prologue_ms;
+        call_timing.res_prologue_subgroup_scan_ms = res_prologue_subgroup_scan_ms;
         call_timing.setup_resources_ms = setup_resources_ms;
         call_timing.res_texture_ms = res_texture_ms;
         call_timing.res_texture_upload_ms = res_texture_upload_ms;
@@ -7023,6 +7084,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(res_fixed_viewport_ms);
             PROSPER_SUM_TIMING_STAT(res_fixed_stages_ms);
             PROSPER_SUM_TIMING_STAT(res_fixed_prologue_ms);
+            PROSPER_SUM_TIMING_STAT(res_prologue_subgroup_scan_ms);
             PROSPER_SUM_TIMING_STAT(setup_resources_ms);
             PROSPER_SUM_TIMING_STAT(res_texture_ms);
             PROSPER_SUM_TIMING_STAT(res_texture_upload_ms);
