@@ -3044,8 +3044,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         SrtUse u; u.kind = 0; u.t8 = *t8;
                         u.key = tkey;
                         u.use_pc = in.pc;
+                        // image_store plus EVERY integer image atomic -- an atomic is a read-modify-write, so a
+                        // resource one targets can never be a sampled texture. This list used to be 0x08/0x0f/0x11,
+                        // which is exactly the set the RECOMPILER emitted: classifier and emitter kept in lockstep,
+                        // neither generalised. Opcodes verified with llvm-mc, positive control image_atomic_add ->
+                        // word0 0xf0440128, byte-identical to the guest's own dword (#2275).
                         u.is_storage_image = in.opcode == 0x08 || in.opcode == 0x0f ||
-                                             in.opcode == 0x11;
+                                             (in.opcode >= 0x11 && in.opcode <= 0x1a && in.opcode != 0x13);
                         u.is_depth_compare = (in.opcode >= 0x28 && in.opcode <= 0x2f) ||
                                              (in.opcode >= 0x38 && in.opcode <= 0x3f) ||
                                              (in.opcode >= 0x58 && in.opcode <= 0x5f);

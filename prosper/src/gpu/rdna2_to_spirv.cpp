@@ -10099,8 +10099,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             // Exact per-use provenance wins over table keys. A sample and store may consume the same
             // T# through a colliding offset but require different Vulkan descriptor classes.
+            // image_store plus EVERY integer image atomic. This was the THIRD copy of the 0x08/0x0f/0x11
+            // triple -- the others are the storage-image classifier in gpu_executor.cpp and the emitter's
+            // own is_atomic test -- and all three must agree for an image atomic to compile. They did
+            // agree, on the wrong set: exactly the ops the emitter happened to support.
+            //
+            // The failure mode when they DISAGREE is the instructive part. Widening the classifier alone
+            // made this gate reject harder: the resource correctly became a StorageImage, and the clause
+            // below then read "0x17 is not a storage op, so it must want a Texture; it is not a Texture"
+            // and discarded it. A half-applied fix was worse than none (#2275).
+            //
+            // Opcodes verified by assembling each with llvm-mc, positive control image_atomic_add ->
+            // word0 0xf0440128, byte-identical to the dword decoded from the guest here.
             const bool storage_only_op = in.opcode == 0x08 || in.opcode == 0x0f ||
-                                         in.opcode == 0x11;
+                                         (in.opcode >= 0x11 && in.opcode <= 0x1a && in.opcode != 0x13);
             if ((storage_only_op && res && res->cls != ResourceClass::StorageImage) ||
                 (in.opcode != 0x00 && !storage_only_op && in.opcode != 0x0e &&
                  res && res->cls != ResourceClass::Texture))
@@ -10125,13 +10137,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                       res->format == DataFormat::Uint32;
 
             // --- Storage-image path: image_load (0x00), image_store (0x08), and R32_UINT
-            // image_atomic_swap/add (0x0f/0x11), without a sampler. ---
             if (res->cls == ResourceClass::StorageImage) {
                 const bool is_ld = in.opcode == 0x00;
                 const bool is_st = in.opcode == 0x08;
-                const bool is_atomic_swap = in.opcode == 0x0f;
-                const bool is_atomic_add = in.opcode == 0x11;
-                const bool is_atomic = is_atomic_swap || is_atomic_add;
+                // Opcodes verified with llvm-mc; add/positive-control matches the guest's own word0 (#2275).
+                uint16_t spirv_atomic = 0;
+                switch (in.opcode) {
+                    case 0x0f: spirv_atomic = Op_AtomicExchange; break;
+                    case 0x11: spirv_atomic = Op_AtomicIAdd;     break;
+                    case 0x12: spirv_atomic = Op_AtomicISub;     break;
+                    case 0x14: spirv_atomic = Op_AtomicSMin;     break;
+                    case 0x15: spirv_atomic = Op_AtomicUMin;     break;
+                    case 0x16: spirv_atomic = Op_AtomicSMax;     break;
+                    case 0x17: spirv_atomic = Op_AtomicUMax;     break;
+                    case 0x18: spirv_atomic = Op_AtomicAnd;      break;
+                    case 0x19: spirv_atomic = Op_AtomicOr;       break;
+                    case 0x1a: spirv_atomic = Op_AtomicXor;      break;
+                    default: break;
+                }
+                const bool is_atomic = spirv_atomic != 0;
                 if (!is_ld && !is_st && !is_atomic) { ok = false; return true; }
                 uint32_t dim, ncoord; bool arrayed = false, ms = false;
                 switch (in.mimg_dim) {   // SQ_RSRC dim -> SPIR-V Dim + coord count (+ array layer / MSAA sample)
@@ -10156,7 +10180,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // be exactly 1 only in the non-arrayed case.
                 const bool atomic_2d_array = in.mimg_dim == SQ_DIM_2D_ARRAY && arrayed && !ms;
                 if (is_atomic &&
-                    ((in.mimg_dim != SQ_DIM_2D && !atomic_2d_array) || ms || in.len_dwords != 2 ||
+                    ((in.mimg_dim != SQ_DIM_2D && !atomic_2d_array) || ms || in.len_dwords < 2 ||
                      in.mimg_unorm || in.mimg_dmask != 1u ||
                      (!arrayed && (res->img_dim != 1u || res->depth != 1u)) ||
                      (arrayed && (res->img_dim != SQ_DIM_2D_ARRAY || !res->depth)) ||
@@ -10239,7 +10263,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // preserves the old register value for EXEC-inactive lanes.
                     const int vd = in.dst.value;
                     const uint32_t old = vreg_old(b, rs, vd);
-                    const uint16_t atomic_op = is_atomic_add ? Op_AtomicIAdd : Op_AtomicExchange;
+                    const uint16_t atomic_op = spirv_atomic;
                     uint32_t result;
                     if (compute_atomic_buffer) {
                         const uint32_t index = b.ibin(
