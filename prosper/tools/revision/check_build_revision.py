@@ -236,8 +236,28 @@ def main() -> int:
         return refuse("revision: UNKNOWN — this build recorded no revision (built outside a git\n"
                       "  checkout, or git was unavailable at build time). Provenance unestablished.")
 
-    want = _git("rev-parse", "--verify", f"{args.against}^{{commit}}", cwd=repo)
-    if want is None:
+    # `rev-list -n 1 <ref>`, not `rev-parse --verify <ref>^{commit}`. Both peel a ref to the commit
+    # it names and both fail on a ref that is not commit-ish, so they are interchangeable here --
+    # except that one of them contains braces, and an argument with braces does not survive the trip
+    # to an MSYS2 git.
+    #
+    # MSYS2 binaries do not receive the argv their caller built. They re-parse the raw Windows
+    # command line themselves and run it through glob expansion, which has brace expansion enabled,
+    # so `HEAD^{commit}` arrives as `HEAD^commit` -- a ref that does not exist. This tool then could
+    # not resolve --against and refused everything it was asked to certify, which is a plausible
+    # enough outcome that the exit codes read as a build problem rather than a mangled argument.
+    # Native-Windows git (Git for Windows is MinGW, not MSYS) does not do this, so it reproduces
+    # only on a host with both an MSYS2 git and a native Python -- i.e. the Windows CI runner.
+    #
+    # The general rule, since the next brace would fail exactly as quietly: no argument this tool
+    # hands to git may contain a glob or brace metacharacter. `test_check_build_revision` asserts it.
+    want = _git("rev-list", "-n", "1", args.against, "--", cwd=repo)
+    # Empty is unresolvable too, and this is the one place the two spellings genuinely differ:
+    # `rev-parse --verify X^{commit}` FAILS on an object that is not commit-ish, while `rev-list`
+    # succeeds and prints nothing. Testing only for None would leave want = "", which matches no
+    # build revision and so still refuses -- but as a MISMATCH, telling the reader their build is
+    # out of date when what actually happened is that they named a tree.
+    if not want:
         return refuse(f"revision: UNKNOWN — cannot resolve --against {args.against!r} in {repo}.")
     want = want.lower()
 
