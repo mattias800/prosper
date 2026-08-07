@@ -1183,6 +1183,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 uint64_t backend_calls = 0, backend_draws = 0;
                 uint64_t backend_command_buffers = 0, backend_queue_submits = 0;
                 uint64_t backend_fence_waits = 0;
+                // Why each of the ~16 flushes a submit happened (#2276). Exclusive and summing to
+                // the flush count, so the arithmetic is checkable from the printed line alone.
+                uint64_t flush_no_batch = 0, flush_readback = 0;
+                uint64_t flush_storage_writeback = 0, flush_explicit = 0;
                 uint64_t backend_gpu_timestamp_samples = 0;
                 double backend_target_ms = 0, backend_draw_setup_ms = 0;
                 double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
@@ -1357,6 +1361,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.backend_command_buffers += backend.command_buffers;
                 pending_timing.backend_queue_submits += backend.queue_submits;
                 pending_timing.backend_fence_waits += backend.fence_waits;
+                pending_timing.flush_no_batch += backend.flush_no_batch;
+                pending_timing.flush_readback += backend.flush_readback;
+                pending_timing.flush_storage_writeback += backend.flush_storage_writeback;
+                pending_timing.flush_explicit += backend.flush_explicit;
                 pending_timing.backend_gpu_timestamp_samples += backend.gpu_timestamp_samples;
                 pending_timing.backend_target_ms += backend.target_ms;
                 pending_timing.backend_draw_setup_ms += backend.draw_setup_ms;
@@ -6939,6 +6947,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t backend_calls = 0, backend_draws = 0;
                     uint64_t backend_command_buffers = 0, backend_queue_submits = 0;
                     uint64_t backend_fence_waits = 0;
+                    uint64_t flush_no_batch = 0, flush_readback = 0;
+                    uint64_t flush_storage_writeback = 0, flush_explicit = 0;
                     uint64_t backend_gpu_timestamp_samples = 0;
                     double backend_target_ms = 0, backend_draw_setup_ms = 0;
                     double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
@@ -7031,6 +7041,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.backend_command_buffers += pending_timing.backend_command_buffers;
                     timing.backend_queue_submits += pending_timing.backend_queue_submits;
                     timing.backend_fence_waits += pending_timing.backend_fence_waits;
+                    timing.flush_no_batch += pending_timing.flush_no_batch;
+                    timing.flush_readback += pending_timing.flush_readback;
+                    timing.flush_storage_writeback += pending_timing.flush_storage_writeback;
+                    timing.flush_explicit += pending_timing.flush_explicit;
                     timing.backend_gpu_timestamp_samples += pending_timing.backend_gpu_timestamp_samples;
                     timing.backend_target_ms += pending_timing.backend_target_ms;
                     timing.backend_draw_setup_ms += pending_timing.backend_draw_setup_ms;
@@ -7215,11 +7229,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (totals.backend_ms - backend_detail_ms) / nsub);
                     fprintf(stderr,
                             "[render-timing] backend-submit synchronization command_buffers=%.2f "
-                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f\n",
+                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f  "
+                            "flush{readback=%.2f storage_wb=%.2f explicit=%.2f "
+                            "no_batch=%.2f}\n",
                             totals.backend_command_buffers / nsub,
                             totals.backend_queue_submits / nsub,
                             totals.backend_fence_waits / nsub,
-                            totals.backend_gpu_timestamp_samples / nsub);
+                            totals.backend_gpu_timestamp_samples / nsub,
+                            (double)totals.flush_readback / nsub,
+                            (double)totals.flush_storage_writeback / nsub,
+                            (double)totals.flush_explicit / nsub,
+                            (double)totals.flush_no_batch / nsub);
                     fprintf(stderr,
                             "[render-timing] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
                             "resources=%.2f pipeline=%.2f  fixed{index_upload=%.2f blend=%.2f "
@@ -7612,11 +7632,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (window.backend_ms - window_backend_detail_ms) / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit synchronization command_buffers=%.2f "
-                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f\n",
+                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f  "
+                            "flush{readback=%.2f storage_wb=%.2f explicit=%.2f "
+                            "no_batch=%.2f}\n",
                             window.backend_command_buffers / wn,
                             window.backend_queue_submits / wn,
                             window.backend_fence_waits / wn,
-                            window.backend_gpu_timestamp_samples / wn);
+                            window.backend_gpu_timestamp_samples / wn,
+                            (double)window.flush_readback / wn,
+                            (double)window.flush_storage_writeback / wn,
+                            (double)window.flush_explicit / wn,
+                            (double)window.flush_no_batch / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
                             "resources=%.2f pipeline=%.2f  fixed{index_upload=%.2f blend=%.2f "

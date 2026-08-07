@@ -592,6 +592,16 @@ struct BackendRenderTimingStats {
     uint64_t command_buffers = 0;
     uint64_t queue_submits = 0;
     uint64_t fence_waits = 0;
+    // WHY each flush happened (#2276). A Blue Prince gameplay submit performs 15.68 queue submits
+    // and 15.68 fence waits -- sixteen CPU<->GPU round trips per rendered frame -- and nothing said
+    // which of the three conditions in `flush_now` was responsible. They have different fixes: a
+    // readback flush is a consumer wanting pixels, a storage-writeback flush is a compute result
+    // going back to guest memory, and an explicit flush is the caller's own sequencing. Attributed
+    // in the order the condition evaluates, so the four are exclusive and sum to the flush count.
+    uint64_t flush_no_batch = 0;
+    uint64_t flush_readback = 0;
+    uint64_t flush_storage_writeback = 0;
+    uint64_t flush_explicit = 0;
     uint64_t gpu_timestamp_samples = 0;
     double target_ms = 0;
     double draw_setup_ms = 0;
@@ -5484,6 +5494,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         readback_requested || storage_writeback_requested;
     const bool flush_now = !submission_batch || synchronous_results_requested ||
                            flush_submission_batch;
+    // Attributed in the same order the condition above evaluates, so exactly one bucket is charged
+    // per flush and their sum is the flush count -- the arithmetic a reader will check first.
+    uint64_t flush_reason_no_batch = 0, flush_reason_readback = 0;
+    uint64_t flush_reason_storage = 0, flush_reason_explicit = 0;
+    if (flush_now) {
+        if (!submission_batch) flush_reason_no_batch = 1;
+        else if (readback_requested) flush_reason_readback = 1;
+        else if (storage_writeback_requested) flush_reason_storage = 1;
+        else flush_reason_explicit = 1;
+    }
     VkBuffer rb = VK_NULL_HANDLE;
     VkDeviceMemory bmem = VK_NULL_HANDLE;
     if (readback_requested) {
@@ -6726,6 +6746,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.draws = draws.size();
         call_timing.command_buffers = batch_result.command_buffers;
         call_timing.queue_submits = batch_result.queue_submits;
+        call_timing.flush_no_batch = flush_reason_no_batch;
+        call_timing.flush_readback = flush_reason_readback;
+        call_timing.flush_storage_writeback = flush_reason_storage;
+        call_timing.flush_explicit = flush_reason_explicit;
         call_timing.fence_waits = batch_result.fence_waits;
         call_timing.gpu_timestamp_samples = batch_result.gpu_timestamp_samples;
         call_timing.target_ms = ms(timing_start, timing_target_ready);
@@ -7084,6 +7108,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(res_fixed_viewport_ms);
             PROSPER_SUM_TIMING_STAT(res_fixed_stages_ms);
             PROSPER_SUM_TIMING_STAT(res_fixed_prologue_ms);
+            PROSPER_SUM_TIMING_STAT(flush_no_batch);
+            PROSPER_SUM_TIMING_STAT(flush_readback);
+            PROSPER_SUM_TIMING_STAT(flush_storage_writeback);
+            PROSPER_SUM_TIMING_STAT(flush_explicit);
             PROSPER_SUM_TIMING_STAT(res_prologue_subgroup_scan_ms);
             PROSPER_SUM_TIMING_STAT(setup_resources_ms);
             PROSPER_SUM_TIMING_STAT(res_texture_ms);
