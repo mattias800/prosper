@@ -722,11 +722,22 @@ HLE(agc_dcb_set_predication) {  // sceAgcDcbSetPredication(dcb, 1, op, 1, cond_a
     cmd[3] = (uint32_t)a2;
     return (uint64_t)(uintptr_t)cmd;
 }
+// #2157: every patcher below dereferences a caller-supplied `cmd` behind nothing but a null check,
+// and each reads cmd[0] inside patch_check / dma_patch_ready before anything validates the pointer.
+// patch_target_writable (landed by #1650) answers from the DCB ring registry first -- a range
+// compare, no syscall -- and only probes the OS on a miss, so these families hit the registry too.
+//
+// The spans below are the dwords each handler actually TOUCHES, not the packet's nominal length.
+// Two of them have two packet shapes, so they probe the header span first and re-probe before
+// reaching the extended tail: a packet at the end of a mapping otherwise passes the header check
+// and faults on the store, which is the sharper half of this issue.
 HLE(agc_set_packet_predication) {  // sceAgcSetPacketPredication(packet, ...)
     // Marks an already-built packet as participating in the enclosing predication window. For our
     // R_JUMP encoding that is payload[3] (cmd[4]). Header-verified like the other packet patchers —
     // a different packet kind means the RE drifted, so refuse loudly rather than corrupt the stream.
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    // Writes cmd[4], five dwords in, after validating cmd[0] (#2157).
+    if (!patch_target_writable(a0, 5 * sizeof(uint32_t), "SetPacketPredication")) return 0;
     if (!patch_check(cmd, R_JUMP, "SetPacketPredication")) return 0;
     cmd[4] = 1;
     return 0;
@@ -893,12 +904,14 @@ static bool dma_patch_ready(uint32_t* cmd, const char* who) {
 }
 HLE(agc_patch_dma_data_dst) {  // (cmd, address)
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_target_writable(a0, 3 * sizeof(uint32_t), "DmaDataPatchSetDst")) return 0;
     if (!dma_patch_ready(cmd, "DmaDataPatchSetDst")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
     // Defensive tolerance for the historical 9-dword shape, not a live path: with #1756 every packet
     // reachable here at runtime is a 7-dword one this file just built.
     uint32_t len = ((cmd[0] >> 16) & 0x3fffu) + 2;
-    if (len >= 9) {
+    // Re-probe: the tail is four dwords past what the header span covered (#2157).
+    if (len >= 9 && patch_target_writable(a0, 9 * sizeof(uint32_t), "DmaDataPatchSetDst")) {
         uint64_t build_pre = label_build_pre(a1, cmd[5]);
         cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
     }
@@ -906,6 +919,7 @@ HLE(agc_patch_dma_data_dst) {  // (cmd, address)
 }
 HLE(agc_patch_dma_data_src) {  // (cmd, addressOrImmediate)
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_target_writable(a0, 5 * sizeof(uint32_t), "DmaDataPatchSetSrc")) return 0;
     if (!dma_patch_ready(cmd, "DmaDataPatchSetSrc")) return 0;
     cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
     return 0;
@@ -2815,6 +2829,7 @@ HLE(agc_patch_set_num_registers_uc) {
 // + offset arithmetic all agree).
 HLE(agc_patch_write_data_addr) {  // fPSCdQxgpSw (cmd, address): WriteData payload [1..2] = address
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_target_writable(a0, 4 * sizeof(uint32_t), "WriteDataPatchAddress")) return 0;
     if (!patch_check(cmd, R_WRITE_DATA, "WriteDataPatchAddress")) return 0;
     cmd[2] = (uint32_t)(a1 & 0xffffffffu); cmd[3] = (uint32_t)(a1 >> 32u);
     prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a1);   // #312: target set post-build
@@ -2822,6 +2837,7 @@ HLE(agc_patch_write_data_addr) {  // fPSCdQxgpSw (cmd, address): WriteData paylo
 }
 HLE(agc_patch_wait_reg_mem_addr) {  // 3KDcnM3lrcU (cmd, address): WaitRegMem payload [0..1] = address
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_target_writable(a0, 3 * sizeof(uint32_t), "WaitRegMemPatchAddress")) return 0;
     if (!patch_check(cmd, R_WAIT_MEM_64, "WaitRegMemPatchAddress")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
     prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a1);   // #312: target set post-build
@@ -2829,6 +2845,7 @@ HLE(agc_patch_wait_reg_mem_addr) {  // 3KDcnM3lrcU (cmd, address): WaitRegMem pa
 }
 HLE(agc_patch_release_mem_addr) {  // 0fWWK5uG9rQ (cmd, address): ReleaseMem payload [0..1] = address
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_target_writable(a0, 4 * sizeof(uint32_t), "ReleaseMemPatchAddress")) return 0;
     if (!patch_check(cmd, R_RELEASE_MEM, "ReleaseMemPatchAddress")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
     uint32_t len = ((cmd[0] >> 16) & 0x3fffu) + 2;
@@ -2836,10 +2853,12 @@ HLE(agc_patch_release_mem_addr) {  // 0fWWK5uG9rQ (cmd, address): ReleaseMem pay
     // at runtime is one agc_cb_release_mem just built, i.e. 8 dwords, keeping only the high half;
     // the >= 9 arm is defensive tolerance for the historical shape, not a live path (a replayed
     // capture never re-enters the HLE — gpu_replay executes recorded dwords directly).
-    if (len >= 9) {
+    // Both tails reach cmd[7]/cmd[8], past the 4-dword header span probed above (#2157).
+    if (len >= 9 && patch_target_writable(a0, 9 * sizeof(uint32_t), "ReleaseMemPatchAddress")) {
         uint64_t build_pre = label_build_pre(a1, cmd[3] == 1 ? 4 : 8);
         cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
-    } else if (len >= 8) {
+    } else if (len >= 8 && len < 9 &&
+               patch_target_writable(a0, 8 * sizeof(uint32_t), "ReleaseMemPatchAddress")) {
         cmd[7] = (uint32_t)(label_build_pre(a1, cmd[3] == 1 ? 4 : 8) >> 32);
     }
     prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a1);   // #312: target set post-build

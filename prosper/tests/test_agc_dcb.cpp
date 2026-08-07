@@ -294,6 +294,49 @@ int main() {
               "#1650: out-of-ring pointers DO reach the write probe — so arm1's zero-probe "
               "assertion measures the registry rather than a counter stuck at zero");
 
+        // Arm 4b — the SAME undereferenceable-pointer case, for the six patchers #1650 left
+        // behind (#2157): predication, the DMA dst/src pair, and the WriteData / WaitRegMem /
+        // ReleaseMem sync patchers. Each read cmd[0] inside its header check before anything
+        // validated the pointer, so on master this arm SIGSEGVs rather than failing.
+        //
+        // Two of them are the sharper ones and are why the spans are per-handler rather than one
+        // constant: SetPacketPredication validates cmd[0] and then writes **cmd[4]**, and
+        // ReleaseMem writes cmd[7]/cmd[8] on its long arm. A packet at the very end of a mapping
+        // passes a header-sized probe and faults on the store, so those re-probe before the tail.
+        {
+            const struct { const char* nid; const char* name; } late[] = {
+                { "w6Dj1VJt5qY", "SetPacketPredication"    },
+                { "IxYiarKlXxM", "DmaDataPatchSetDst"      },
+                { "cdDRpqcFGbU", "DmaDataPatchSetSrc"      },
+                { "fPSCdQxgpSw", "WriteDataPatchAddress"   },
+                { "3KDcnM3lrcU", "WaitRegMemPatchAddress"  },
+                { "0fWWK5uG9rQ", "ReleaseMemPatchAddress"  },
+            };
+            char log2[8192] = {0};
+            const bool captured2 = capture_stderr([&] {
+                for (const auto& l : late) {
+                    HleFn fn = Hle::lookup(l.nid);
+                    if (fn) fn(unmapped_addr, 0x5555555566666666ull, 0, 0, 0, 0);
+                }
+            }, log2, sizeof log2);
+            CHECK(captured2, "#2157: stderr capture around the late-patcher refusals worked");
+
+            // Reaching this line at all is the primary assertion: on master the cmd[0] read faults.
+            for (const auto& l : late) {
+                char msg[200];
+                snprintf(msg, sizeof msg, "#2157: %s is registered", l.name);
+                CHECK(Hle::lookup(l.nid) != nullptr, msg);
+                // Naming the call site matters as much as refusing: a shared message could not tell
+                // a reader WHICH patcher was handed the bad pointer, and these six are reached from
+                // different guest paths.
+                snprintf(msg, sizeof msg,
+                         "#2157: %s refuses an undereferenceable packet and names itself", l.name);
+                CHECK(strstr(log2, l.name) != nullptr, msg);
+            }
+            CHECK(strstr(log2, "is not writable guest memory") != nullptr,
+                  "#2157: the refusal is the writability probe, not an incidental header mismatch");
+        }
+
         // Arm 5 — the diagnostic budget is PER CALL SITE.
         //
         // It used to be a single 8-message counter shared by every patcher family in the
