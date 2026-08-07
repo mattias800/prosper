@@ -1447,6 +1447,24 @@ Zero `WORKER-THREAD FAULT`, zero `FMallocBinned3`/`LowLevelFatalError` in all th
 gets **4.4x cheaper**, because the synchronous completion drains the pre-13 path performs inside the
 fold move to the worker.
 
+**Those three arms had one peer `boot_trace` present, and on this title that is not a neutral bias** —
+the throttle is protective, so a peer slowing prosper could in principle manufacture the survival.
+Re-run alternated control/armed with `pgrep -x` censuses of **zero before and after all six**:
+
+| arm | rc | faults | fatals | delivered video frames | `REBUILD-BEFORE-EXEC` |
+| --- | --- | --- | --- | --- | --- |
+| control 1 | 90 | 1 | 0 | 139 | 0 |
+| control 2 | 90 | 1 | 0 | 30 | 20 |
+| control 3 | 90 | 1 | 0 | 31 | 33 |
+| `POST_SUBMIT_VISIBILITY=1` 1 | 124 | 0 | 0 | **924** | 0 |
+| `POST_SUBMIT_VISIBILITY=1` 2 | 124 | 0 | 0 | **919** | 0 |
+| `POST_SUBMIT_VISIBILITY=1` 3 | 124 | 0 | 0 | **935** | 0 |
+
+Control 1 is worth reading rather than averaging away: it lived to 139 video frames and recorded
+`REBUILD-BEFORE-EXEC=0`, i.e. it died on one of the other two terminal paths this title races. That is
+the standing reason a single run cannot A/B here, restated by a control that behaved exactly as the
+`## Ruled out` row predicts.
+
 **This is a candidate correctness change, not a lever in the throttle's class**, and the distinction
 is the one the throttle's own comment draws: the throttle discards nothing and models nothing, it
 just delays the guest. This arms a contract prosper already implements, already believes is
