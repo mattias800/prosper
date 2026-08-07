@@ -960,6 +960,120 @@ int main() {
               "SW_64KB_S3 round-trip is exact for every supported texel size");
     }
 
+    // GFX10 standard thick 3D SW_4KB_S (#2229). Its pattern is the LOW 12 BITS of the S3 table
+    // above, so these arms exist to pin the nesting rather than to re-test the pattern: if the bit
+    // count or the derived block dims drift, the golden addresses below move and the byte totals
+    // stop landing on 4096.
+    //
+    // A round trip cannot establish any of this -- it is self-consistent for an arbitrary invented
+    // swizzle -- so the load-bearing arms are the byte-address goldens and the two size checks.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw4KbS;
+        CHECK(tile_mode_supports_volume(M), "SW_4KB_S has a standard 3D pattern (#2229)");
+
+        // Every element size must fill exactly one 4 KiB block at its own derived dimensions. A
+        // wrong bit count misses 4096 on all five at once, which is what makes this a real check.
+        CHECK(tiled_volume_bytes(16, 16, 16, M, 1) == 4096 &&
+              tiled_volume_bytes(8, 16, 16, M, 2) == 4096 &&
+              tiled_volume_bytes(8, 16,  8, M, 4) == 4096 &&
+              tiled_volume_bytes(8,  8,  8, M, 8) == 4096 &&
+              tiled_volume_bytes(4,  8,  8, M, 16) == 4096,
+              "each SW_4KB_S3 texel size fills exactly one 4 KiB block at its derived dimensions");
+        CHECK(tiled_volume_bytes(0, 16, 16, M, 2) == 0,
+              "zero-width SW_4KB_S3 volumes are rejected without forming a block grid");
+
+        // The guest-corroborated case: Sonic Racing: CrossWorlds binds a 16x16x16 2-byte grading
+        // LUT and the GUEST declares size=8192. Two 8x16x16 blocks is 8192, so the derivation
+        // agrees with the title's own size field rather than only with itself.
+        CHECK(tiled_volume_bytes(16, 16, 16, M, 2) == 8192,
+              "PPSA08804's 16-cubed 2-byte LUT is 2 blocks = 8192 bytes, matching its declared size");
+
+        const uint32_t w = 16, h = 16, d = 16, bpe = 2;
+        std::vector<uint8_t> ref((size_t)w * h * d * bpe);
+        for (size_t i = 0; i < ref.size(); ++i) ref[i] = (uint8_t)((i >> 1) * 31 + i);
+        std::vector<uint8_t> tiled(tiled_volume_bytes(w, h, d, M, bpe), 0);
+        CHECK(tile_volume(tiled.data(), tiled.size(), ref.data(), w, h, d, M, bpe),
+              "PPSA08804's 16-cubed LUT tiles successfully");
+        auto at3 = [&](uint32_t x, uint32_t y, uint32_t z) {
+            return &ref[(((size_t)z * h + y) * w + x) * bpe];
+        };
+        // 2 B row, bits 1..11: x0->1, z0->2, y0->3, z1->4, y1->5, x1->6, z2->7, y2->8, x2->9,
+        // z3->10, y3->11. Block geometry is 8x16x16, so x=8 opens the next macroblock.
+        CHECK(std::memcmp(&tiled[2],   at3(1,0,0), bpe) == 0,
+              "4KB_S3 2B golden: x0 maps to byte-address bit 1");
+        CHECK(std::memcmp(&tiled[4],   at3(0,0,1), bpe) == 0,
+              "4KB_S3 2B golden: z0 maps to byte-address bit 2");
+        CHECK(std::memcmp(&tiled[8],   at3(0,1,0), bpe) == 0,
+              "4KB_S3 2B golden: y0 maps to byte-address bit 3");
+        CHECK(std::memcmp(&tiled[64],  at3(2,0,0), bpe) == 0,
+              "4KB_S3 2B golden: x1 maps to byte-address bit 6");
+        CHECK(std::memcmp(&tiled[512], at3(4,0,0), bpe) == 0,
+              "4KB_S3 2B golden: x2 maps to byte-address bit 9");
+        CHECK(std::memcmp(&tiled[2048], at3(0,8,0), bpe) == 0,
+              "4KB_S3 2B golden: y3 maps to the top in-block bit 11");
+        CHECK(std::memcmp(&tiled[4096], at3(8,0,0), bpe) == 0,
+              "4KB_S3 2B golden: x=8 starts the second macroblock, not a bit inside the first");
+
+        auto rt4k = [&](uint32_t bytes) {
+            static const uint32_t dims[5][3] = {
+                {16,16,16}, {8,16,16}, {8,16,8}, {8,8,8}, {4,8,8}
+            };
+            uint32_t el = 0; while ((1u << el) < bytes) ++el;
+            const uint32_t rw = dims[el][0] + 1;
+            const uint32_t rh = dims[el][1] + 1;
+            const uint32_t rd = dims[el][2] + 1;
+            std::vector<uint8_t> linear((size_t)rw * rh * rd * bytes);
+            for (size_t i = 0; i < linear.size(); ++i)
+                linear[i] = (uint8_t)((i * 2654435761u) >> 19);
+            std::vector<uint8_t> swizzled(tiled_volume_bytes(rw, rh, rd, M, bytes), 0);
+            std::vector<uint8_t> back(linear.size(), 0);
+            return tile_volume(swizzled.data(), swizzled.size(), linear.data(), rw, rh, rd,
+                               M, bytes) &&
+                   detile_volume(back.data(), swizzled.data(), swizzled.size(), rw, rh, rd,
+                                 M, bytes) && back == linear;
+        };
+        CHECK(rt4k(1) && rt4k(2) && rt4k(4) && rt4k(8) && rt4k(16),
+              "SW_4KB_S3 round-trip is exact for every texel size (weak on its own; see above)");
+
+        // States the block invariant directly: the address map covers one block exactly. Kept for
+        // what it SAYS, not for extra detection power -- and that distinction was measured, not
+        // assumed, because it was first added on a justification that turned out to be false.
+        //
+        // The claim was "the round trip cannot see aliasing, so this arm catches what it misses."
+        // It can. Collapsing the z contribution (`fz[z] = 0`) reddens the goldens, BOTH round trips
+        // and this arm together. The reason is arithmetic rather than incidental: one block holds
+        // exactly 4096/bpe elements writing bpe bytes each -- 4096 bytes into 4096 bytes, for every
+        // element size -- so a byte written twice forces a byte written never. **Aliasing and holes
+        // are the same defect seen from two sides.** The round trip detects the aliasing (a collision
+        // loses data); this arm detects the hole. For a single block they are equivalent.
+        //
+        // So do not add arms on the theory that this one is load-bearing where the others are not; it
+        // is a readable statement of an invariant that the round trip already enforces obliquely.
+        //
+        // Mechanically: tile_volume memsets the destination to zero first, so a byte still zero
+        // afterwards is a byte nothing wrote. The source therefore contains no zero bytes. No offset
+        // arithmetic is duplicated here, which is the point -- a test that re-implements the map
+        // agrees with itself whatever the map does.
+        auto covers_block_bijectively = [&](uint32_t bpe, uint32_t bw, uint32_t bh, uint32_t bd) {
+            const size_t elems = (size_t)bw * bh * bd;
+            std::vector<uint8_t> linear(elems * bpe);
+            for (size_t i = 0; i < linear.size(); ++i) linear[i] = (uint8_t)(i % 255u + 1u);  // never 0
+            const size_t bytes = tiled_volume_bytes(bw, bh, bd, M, bpe);
+            if (bytes != 4096 || elems * bpe != 4096) return false;
+            std::vector<uint8_t> tiled(bytes, 0);
+            if (!tile_volume(tiled.data(), tiled.size(), linear.data(), bw, bh, bd, M, bpe))
+                return false;
+            for (uint8_t b : tiled) if (b == 0) return false;   // an unwritten byte => a collision
+            return true;
+        };
+        CHECK(covers_block_bijectively(1, 16, 16, 16) &&
+              covers_block_bijectively(2,  8, 16, 16) &&
+              covers_block_bijectively(4,  8, 16,  8) &&
+              covers_block_bijectively(8,  8,  8,  8) &&
+              covers_block_bijectively(16, 4,  8,  8),
+              "SW_4KB_S3 maps one block bijectively for every texel size — full coverage, no aliasing");
+    }
+
     // GFX10 thin/view-as-2D 3D SW_64KB_R_X. Each Z slice owns a padded 2D block grid, while Z
     // participates in the pipe-XOR inside that slice; z0..z3 map to offset bits 11..8.
     if (!getenv("PROSPER_RX_PIPES")) {
