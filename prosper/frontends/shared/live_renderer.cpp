@@ -1221,6 +1221,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 uint64_t persistent_watch_unknown = 0, persistent_watch_disabled = 0;
                 uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                 double texture_ms = 0, buffer_ms = 0;
+                // Exhaustive partition of build_resources_ms, the frontend materialiser (#2215).
+                // It had two named leaves -- texture_ms and buffer_ms, both from INSIDE build_R --
+                // covering 10.2 of 48.95 ms on a Blue Prince gameplay submit, with no assertion
+                // that they were exhaustive. 38.76 ms, 21.1% of the frame, was attributable to
+                // nothing. That is not the same as being spent on nothing, and it is
+                // indistinguishable from it in a report.
+                //
+                // These four plus a SIGNED residual cover the per-draw body of build_bds. The
+                // residual is published rather than clamped for the reason #2246 records: an
+                // unmeasured region does not read as unmeasured, it reads as someone else's number.
+                double build_r_ms = 0, build_validate_ms = 0;
+                double build_poison_ms = 0, build_indices_ms = 0;
+                uint64_t build_draws = 0, build_rejected = 0;
             };
             struct RttTimingRecord {
                 int submit = 0;
@@ -4921,17 +4934,53 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     bd.instance_count = it.instance_count;
                     bd.vertex_offset = refvs ? 0 : it.vertex_offset;
                     bd.ps     = nops ? nullptr : &it.ps;
+                    // Five clock reads bounding four spans, only when timing is armed -- ~0.9% of
+                    // this bucket at 2,100 draws a submit. It inflates what it measures while
+                    // armed, as every timer here does; read the shares, not the totals.
+                    const auto bt0 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
                     bd.R      = build_R(it, it.vrt.get(), it.prt.get());
-                    if (!prosper::gpu::validate_runtime_descriptor_contract(
-                            "VS/backend", bd.vs_words(), it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex) ||
-                        !prosper::gpu::validate_runtime_descriptor_contract(
-                            "PS/backend", bd.fs_words(), it.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment))
-                        continue;
+                    const auto bt1 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
+                    // && of the positives rather than || of the negations: identical short-circuit
+                    // and identical outcome, but it puts the accounting below on a path the
+                    // `continue` cannot skip.
+                    const bool contract_ok =
+                        prosper::gpu::validate_runtime_descriptor_contract(
+                            "VS/backend", bd.vs_words(), it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex) &&
+                        prosper::gpu::validate_runtime_descriptor_contract(
+                            "PS/backend", bd.fs_words(), it.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment);
+                    const auto bt2 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
+                    if (timing_enabled) {
+                        pending_timing.build_r_ms +=
+                            std::chrono::duration<double, std::milli>(bt1 - bt0).count();
+                        pending_timing.build_validate_ms +=
+                            std::chrono::duration<double, std::milli>(bt2 - bt1).count();
+                    }
+                    // A rejected draw has already spent build_R and both validations, and they are
+                    // counted above. Dropping it without accounting would move that time into the
+                    // residual, where it reads as unattributed work -- the exact defect this
+                    // partition exists to make visible.
+                    if (!contract_ok) { if (timing_enabled) ++pending_timing.build_rejected; continue; }
                     poison_R(bd.R, bd.vs_words(), it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex);
                     poison_R(bd.R, bd.fs_words(), it.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment);
+                    const auto bt3 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
                     // Indexed draw: hand the executor-fetched index data to the backend (vkCmdDrawIndexed).
                     // Skipped under REFVS — the reference VS is a 3-vertex non-indexed fullscreen triangle.
                     if (!refvs) bd.indices = it.indices;
+                    if (timing_enabled) {
+                        const auto bt4 = RenderClock::now();
+                        pending_timing.build_poison_ms +=
+                            std::chrono::duration<double, std::milli>(bt3 - bt2).count();
+                        pending_timing.build_indices_ms +=
+                            std::chrono::duration<double, std::milli>(bt4 - bt3).count();
+                        // Counted AFTER the reject, so `build_draws` is accepted draws — and the
+                        // leaves do not all share it. `build_R` and `validate` ran for
+                        // draws + rejected; `poison` and `indices` ran for draws alone. Both
+                        // numbers are printed so the reader can pick the right denominator, and
+                        // the report line says which is which — a per-draw figure divided by the
+                        // wrong one over-states silently, and with rejected=0 nobody would notice
+                        // the rule until the first run where it is not.
+                        ++pending_timing.build_draws;
+                    }
                     if (gfxlog) fprintf(stderr,
                         "[render] item %zu: %zu resources vcount=%u instances=%u nidx=%zu topo=%u mask=0x%x blend=%d\n",
                         bds.size(), bd.R.size(), bd.vcount, bd.instance_count, bd.indices.size(), it.ps.topology,
@@ -6586,6 +6635,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t persistent_watch_unknown = 0, persistent_watch_disabled = 0;
                     uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                     double texture_ms = 0, buffer_ms = 0;
+                    double build_r_ms = 0, build_validate_ms = 0;
+                    double build_poison_ms = 0, build_indices_ms = 0;
+                    uint64_t build_draws = 0, build_rejected = 0;
                 };
                 static TimingTotals totals;
                 static TimingTotals window;
@@ -6665,6 +6717,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.buffer_bytes += pending_timing.buffer_bytes;
                     timing.buffer_materialized_bytes += pending_timing.buffer_materialized_bytes;
                     timing.texture_ms += pending_timing.texture_ms;
+                    timing.build_r_ms += pending_timing.build_r_ms;
+                    timing.build_validate_ms += pending_timing.build_validate_ms;
+                    timing.build_poison_ms += pending_timing.build_poison_ms;
+                    timing.build_indices_ms += pending_timing.build_indices_ms;
+                    timing.build_draws += pending_timing.build_draws;
+                    timing.build_rejected += pending_timing.build_rejected;
                     timing.buffer_ms += pending_timing.buffer_ms;
                 };
                 accumulate(totals);
@@ -6796,6 +6854,55 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             totals.buffer_bytes / (1024.0 * 1024.0),
                             totals.buffer_materialized_bytes / (1024.0 * 1024.0),
                             totals.buffer_ms / nsub);
+                    // build_resources, exhaustively (#2215). The leaves are per-draw spans inside
+                    // build_bds; `other` is the SIGNED residual -- everything in build_resources
+                    // that is not one of them, which on a healthy partition is the loop overhead
+                    // and the BackendDraw field copies. A large positive residual means work is
+                    // going somewhere unnamed; a NEGATIVE one means the leaves over-count their
+                    // parent, which is a defect in this instrument and not in the renderer. Both
+                    // are printed because a partition that cannot report its own incompleteness
+                    // attributes the gap to the subject -- the failure that cost #2246 two hours
+                    // and produced a 305 ms phantom.
+                    //
+                    // texture/buffer above are NOT leaves of this partition: they are measured
+                    // INSIDE build_R and are therefore a sub-split of `build_R` below. Adding them
+                    // here would double-count. That is the cross-layer subtraction #2243 fixed,
+                    // and this comment exists so nobody re-derives it from the field names.
+                    {
+                        const double br_other = totals.build_resources_ms - totals.build_r_ms -
+                                                totals.build_validate_ms - totals.build_poison_ms -
+                                                totals.build_indices_ms;
+                        fprintf(stderr,
+                                "[render-timing] build_resources %.2f ms/submit [build_R=%.2f "
+                                "(texture=%.2f buffer=%.2f other=%+.2f) validate=%.2f indices=%.2f "
+                                "poison=%.2f other=%+.2f] draws=%.1f (+%.1f rejected; build_R and validate cover both, poison and indices only the accepted)\n",
+                                totals.build_resources_ms / nsub, totals.build_r_ms / nsub,
+                                totals.texture_ms / nsub, totals.buffer_ms / nsub,
+                                // build_R's OWN residual, published for the same reason as its
+                                // parent's. texture+buffer covered 3.71 of 5.20 ms on the first run
+                                // of this instrument -- 29% of build_R with nothing naming it. A
+                                // nested partition that reports only the outer remainder just moves
+                                // the blind spot one level down, which is the mistake this whole
+                                // line exists to stop repeating.
+                                (totals.build_r_ms - totals.texture_ms - totals.buffer_ms) / nsub,
+                                totals.build_validate_ms / nsub, totals.build_indices_ms / nsub,
+                                totals.build_poison_ms / nsub, br_other / nsub,
+                                (double)totals.build_draws / nsub,
+                                (double)totals.build_rejected / nsub);
+                        // A negative residual has one KNOWN trigger, and naming it here saves
+                        // the reader hunting a renderer defect: PROSPER_TARGET_STEP_HASH_DIM calls
+                        // build_bds() again at :5815, OUTSIDE the build_start/build_done span, so
+                        // every prefix rebuild lands in the leaves without landing in the parent --
+                        // and that loop is O(N^2) in draws. Zero occurrences on a default run.
+                        if (br_other < -0.05 * nsub)
+                            fprintf(stderr,
+                                    "[render-timing] *** build_resources leaves EXCEED their parent "
+                                    "by %.2f ms/submit -- the partition above is not trustworthy; "
+                                    "this is a defect in the instrument, not the renderer. Known "
+                                    "trigger: PROSPER_TARGET_STEP_HASH_DIM rebuilds draws outside "
+                                    "the measured span\n",
+                                    -br_other / nsub);
+                    }
                     size_t persistent_source_bytes = 0;
                     size_t persistent_pixel_bytes = 0;
                     size_t persistent_watch_only_entries = 0;
@@ -6976,6 +7083,34 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             window.backend_res_descriptor_ms / wn,
                             (window.backend_setup_resources_ms - window.backend_res_texture_ms -
                              window.backend_res_buffer_ms - window.backend_res_descriptor_ms) / wn);
+                    // Same partition on the WINDOW path, so it is present wherever the buffer
+                    // and fixed ones are (#2246, #2252). The window path isolates a PHASE, which
+                    // for a title whose draw count swings 351 -> 2,106 between phases is the more
+                    // useful axis than a lifetime total -- and a partition visible on one path and
+                    // not the other invites exactly the cross-aggregation comparison that has cost
+                    // us two wrong numbers today.
+                    {
+                        const double br_other_w = window.build_resources_ms - window.build_r_ms -
+                                                  window.build_validate_ms - window.build_poison_ms -
+                                                  window.build_indices_ms;
+                        fprintf(stderr,
+                                "[render-window] build_resources %.2f ms/submit [build_R=%.2f "
+                                "(texture=%.2f buffer=%.2f other=%+.2f) validate=%.2f indices=%.2f "
+                                "poison=%.2f other=%+.2f] draws=%.1f (+%.1f rejected)\n",
+                                window.build_resources_ms / wn, window.build_r_ms / wn,
+                                window.texture_ms / wn, window.buffer_ms / wn,
+                                (window.build_r_ms - window.texture_ms - window.buffer_ms) / wn,
+                                window.build_validate_ms / wn, window.build_indices_ms / wn,
+                                window.build_poison_ms / wn, br_other_w / wn,
+                                (double)window.build_draws / wn,
+                                (double)window.build_rejected / wn);
+                        if (br_other_w < -0.05 * wn)
+                            fprintf(stderr,
+                                    "[render-window] *** build_resources leaves EXCEED their parent "
+                                    "by %.2f ms/submit -- instrument defect, not renderer. Known "
+                                    "trigger: PROSPER_TARGET_STEP_HASH_DIM\n",
+                                    -br_other_w / wn);
+                    }
                     fprintf(stderr,
                             "[render-window] backend-submit pipelines refs=%.1f hits=%.1f misses=%.1f "
                             "bypass=%.1f entries=%llu evictions=%.1f\n",
