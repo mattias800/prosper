@@ -1188,6 +1188,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 double backend_gpu_device_ms = 0;
                 double backend_readback_ms = 0, backend_cleanup_ms = 0;
                 double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
+                double backend_res_fixed_index_upload_ms = 0;
+                double backend_res_fixed_blend_ms = 0;
+                double backend_res_fixed_depth_stencil_ms = 0;
+                double backend_res_fixed_viewport_ms = 0;
+                double backend_res_fixed_stages_ms = 0;
+                double backend_res_fixed_prologue_ms = 0;
                 double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
                 // #1284: sub-attribution of backend_setup_resources_ms. res_texture/res_buffer
                 // cover the whole per-resource branch; the upload/bind pair is nested inside
@@ -1279,6 +1285,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.backend_cleanup_ms += backend.cleanup_ms;
                 pending_timing.backend_setup_shader_ms += backend.setup_shader_ms;
                 pending_timing.backend_setup_fixed_ms += backend.setup_fixed_ms;
+                pending_timing.backend_res_fixed_index_upload_ms += backend.res_fixed_index_upload_ms;
+                pending_timing.backend_res_fixed_blend_ms += backend.res_fixed_blend_ms;
+                pending_timing.backend_res_fixed_depth_stencil_ms += backend.res_fixed_depth_stencil_ms;
+                pending_timing.backend_res_fixed_viewport_ms += backend.res_fixed_viewport_ms;
+                pending_timing.backend_res_fixed_stages_ms += backend.res_fixed_stages_ms;
+                pending_timing.backend_res_fixed_prologue_ms += backend.res_fixed_prologue_ms;
                 pending_timing.backend_setup_resources_ms += backend.setup_resources_ms;
                 pending_timing.backend_res_texture_ms += backend.res_texture_ms;
                 pending_timing.backend_res_texture_upload_ms += backend.res_texture_upload_ms;
@@ -6545,6 +6557,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     double backend_gpu_device_ms = 0;
                     double backend_readback_ms = 0, backend_cleanup_ms = 0;
                     double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
+                    double backend_res_fixed_index_upload_ms = 0;
+                    double backend_res_fixed_blend_ms = 0;
+                    double backend_res_fixed_depth_stencil_ms = 0;
+                    double backend_res_fixed_viewport_ms = 0;
+                    double backend_res_fixed_stages_ms = 0;
+                    double backend_res_fixed_prologue_ms = 0;
                     double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
                     double backend_res_texture_ms = 0, backend_res_texture_upload_ms = 0;
                     double backend_res_texture_bind_ms = 0, backend_res_buffer_ms = 0;
@@ -6598,6 +6616,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.backend_cleanup_ms += pending_timing.backend_cleanup_ms;
                     timing.backend_setup_shader_ms += pending_timing.backend_setup_shader_ms;
                     timing.backend_setup_fixed_ms += pending_timing.backend_setup_fixed_ms;
+                    timing.backend_res_fixed_index_upload_ms += pending_timing.backend_res_fixed_index_upload_ms;
+                    timing.backend_res_fixed_blend_ms += pending_timing.backend_res_fixed_blend_ms;
+                    timing.backend_res_fixed_depth_stencil_ms += pending_timing.backend_res_fixed_depth_stencil_ms;
+                    timing.backend_res_fixed_viewport_ms += pending_timing.backend_res_fixed_viewport_ms;
+                    timing.backend_res_fixed_stages_ms += pending_timing.backend_res_fixed_stages_ms;
+                    timing.backend_res_fixed_prologue_ms += pending_timing.backend_res_fixed_prologue_ms;
                     timing.backend_setup_resources_ms += pending_timing.backend_setup_resources_ms;
                     timing.backend_res_texture_ms += pending_timing.backend_res_texture_ms;
                     timing.backend_res_texture_upload_ms += pending_timing.backend_res_texture_upload_ms;
@@ -6688,11 +6712,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             totals.backend_gpu_timestamp_samples / nsub);
                     fprintf(stderr,
                             "[render-timing] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
-                            "resources=%.2f pipeline=%.2f\n",
+                            "resources=%.2f pipeline=%.2f  fixed{index_upload=%.2f blend=%.2f "
+                            "depth_stencil=%.2f viewport=%.2f stages=%.2f pre_index_unsplit=%.2f "
+                            "other=%+.2f}\n",
                             totals.backend_setup_shader_ms / nsub,
                             totals.backend_setup_fixed_ms / nsub,
                             totals.backend_setup_resources_ms / nsub,
-                            totals.backend_setup_pipeline_ms / nsub);
+                            totals.backend_setup_pipeline_ms / nsub,
+                            totals.backend_res_fixed_index_upload_ms / nsub,
+                            totals.backend_res_fixed_blend_ms / nsub,
+                            totals.backend_res_fixed_depth_stencil_ms / nsub,
+                            totals.backend_res_fixed_viewport_ms / nsub,
+                            totals.backend_res_fixed_stages_ms / nsub,
+                            totals.backend_res_fixed_prologue_ms / nsub,
+                            (totals.backend_setup_fixed_ms - totals.backend_res_fixed_index_upload_ms -
+                             totals.backend_res_fixed_blend_ms - totals.backend_res_fixed_depth_stencil_ms -
+                             totals.backend_res_fixed_viewport_ms - totals.backend_res_fixed_stages_ms -
+                             totals.backend_res_fixed_prologue_ms) / nsub);
                     fprintf(stderr,
                             "[render-timing] backend-submit resources avg_ms: texture=%.2f "
                             "(upload=%.2f bind=%.2f lookup=%.2f) buffer=%.2f "
@@ -6898,11 +6934,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             window.backend_gpu_timestamp_samples / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
-                            "resources=%.2f pipeline=%.2f\n",
+                            "resources=%.2f pipeline=%.2f  fixed{index_upload=%.2f blend=%.2f "
+                            "depth_stencil=%.2f viewport=%.2f stages=%.2f pre_index_unsplit=%.2f "
+                            "other=%+.2f}\n",
                             window.backend_setup_shader_ms / wn,
                             window.backend_setup_fixed_ms / wn,
                             window.backend_setup_resources_ms / wn,
-                            window.backend_setup_pipeline_ms / wn);
+                            window.backend_setup_pipeline_ms / wn,
+                            window.backend_res_fixed_index_upload_ms / wn,
+                            window.backend_res_fixed_blend_ms / wn,
+                            window.backend_res_fixed_depth_stencil_ms / wn,
+                            window.backend_res_fixed_viewport_ms / wn,
+                            window.backend_res_fixed_stages_ms / wn,
+                            window.backend_res_fixed_prologue_ms / wn,
+                            (window.backend_setup_fixed_ms - window.backend_res_fixed_index_upload_ms -
+                             window.backend_res_fixed_blend_ms - window.backend_res_fixed_depth_stencil_ms -
+                             window.backend_res_fixed_viewport_ms - window.backend_res_fixed_stages_ms -
+                             window.backend_res_fixed_prologue_ms) / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit resources avg_ms: texture=%.2f "
                             "(upload=%.2f bind=%.2f lookup=%.2f) buffer=%.2f "

@@ -604,6 +604,33 @@ struct BackendRenderTimingStats {
     double cleanup_ms = 0;
     double setup_shader_ms = 0;
     double setup_fixed_ms = 0;
+    // Leaves of setup_fixed_ms, which had none. `fixed` is 15.9% of a Blue Prince gameplay frame
+    // (29.11 ms/submit, 13.85 us/draw) and until now was a single number, so anything inside it was
+    // indistinguishable from anything else inside it -- the condition that let a diagnostic bill
+    // 305 ms/submit to the renderer inside res_buffer_ms (instrument trap 130). index_upload is the
+    // per-indexed-draw vkCreateBuffer + vkAllocateMemory + bind + map + copy at render_runner.h's
+    // index block; the rest name the fixed-function state translation. setup_fixed_other_ms() is
+    // printed SIGNED so the partition reports its own completeness (#2246).
+    double res_fixed_index_upload_ms = 0;
+    double res_fixed_blend_ms = 0;
+    double res_fixed_depth_stencil_ms = 0;
+    double res_fixed_viewport_ms = 0;
+    double res_fixed_stages_ms = 0;
+    // Printed as `pre_index_unsplit`, NOT `prologue`, and the name is the point. This leaf is
+    // defined by where the timing region STARTS rather than by what it contains, so it is a residual
+    // with a location rather than a component. `other=+0.27` reads as unattributed and invites
+    // investigation; a component name reads as attributed and closes it, which would make the
+    // partition look complete while the blind spot had only been renamed. Keeping the position in
+    // the printed token turns "what is the prologue doing" into "what is IN that span", which is the
+    // question #2254 exists to answer. Do not rename it to something that sounds like a phase until
+    // it has been split into ones.
+    double res_fixed_prologue_ms = 0;
+
+    double setup_fixed_other_ms() const {
+        return setup_fixed_ms - res_fixed_index_upload_ms - res_fixed_blend_ms -
+               res_fixed_depth_stencil_ms - res_fixed_viewport_ms - res_fixed_stages_ms -
+               res_fixed_prologue_ms;
+    }
     double setup_resources_ms = 0;
     double setup_pipeline_ms = 0;
     // Sub-attribution of setup_resources_ms (#1284). `resources` is not descriptor bookkeeping alone:
@@ -3877,6 +3904,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     size_t persistent_texture_misses = 0;
     double setup_shader_ms = 0.0;
     double setup_fixed_ms = 0.0;
+    double res_fixed_index_upload_ms = 0.0;
+    double res_fixed_blend_ms = 0.0;
+    double res_fixed_depth_stencil_ms = 0.0;
+    double res_fixed_viewport_ms = 0.0;
+    double res_fixed_stages_ms = 0.0;
+    double res_fixed_prologue_ms = 0.0;
     double setup_resources_ms = 0.0;
     double setup_pipeline_ms = 0.0;
     // #1284 sub-attribution of setup_resources_ms; see BackendRenderTimingStats for what each covers.
@@ -4081,9 +4114,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             v.scissor.extent = {static_cast<uint32_t>(right - left),
                                 static_cast<uint32_t>(bottom - top)};
         }
+        if (timing_enabled) res_fixed_prologue_ms += setup_elapsed_ms(setup_begin, TimingClock::now());
         // Indexed draw: upload the 32-bit index data to a host-visible VkIndexBuffer now; the record
         // pass binds it and issues vkCmdDrawIndexed instead of vkCmdDraw.
         if (!bd.indices.empty()) {
+            // Per INDEXED DRAW: create a buffer, allocate memory, bind, map, copy, unmap. Six
+            // Vulkan entry points and one allocation on every draw that carries indices, and until
+            // this timer none of it was separable from fixed-function state translation.
+            const ResourcePhaseTimer phase_index_upload(timing_enabled, &res_fixed_index_upload_ms);
             VkDeviceSize isz = (VkDeviceSize)bd.indices.size() * 4;
             VkBufferCreateInfo ibci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             ibci.size = isz; ibci.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
@@ -4098,6 +4136,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::memcpy(ip, bd.indices.data(), (size_t)isz); vkUnmapMemory(dev, v.ibmem);
             v.icount = (uint32_t)bd.indices.size();
         }
+        const auto fixed_stages_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         VkPipelineShaderStageCreateInfo st[3]{};
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_fragment_subgroup{
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
@@ -4127,6 +4166,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // Default: full-target viewport. When the resolved state carries the guest's PA_CL_VPORT transform,
         // honor it — a guest yscale < 0 arrives as a negative viewport_h (Vulkan core-1.1 flipped viewport),
         // reproducing the hardware's Y orientation (#38; each draw item keeps its own resolved viewport).
+        if (timing_enabled) res_fixed_stages_ms += setup_elapsed_ms(fixed_stages_begin, TimingClock::now());
+        // viewport/scissor/raster begins here; the index upload above is timed separately.
+        const auto fixed_viewport_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         VkViewport vp{0, 0, (float)W, (float)H, 0, 1}; VkRect2D sc{{0, 0}, {W, H}};
         if (ps && ps->has_viewport)
             vp = {ps->viewport_x, ps->viewport_y, ps->viewport_w, ps->viewport_h, ps->min_depth, ps->max_depth};
@@ -4160,6 +4202,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        const auto fixed_viewport_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+        if (timing_enabled) res_fixed_viewport_ms += setup_elapsed_ms(fixed_viewport_begin, fixed_viewport_ready);
         std::array<VkPipelineColorBlendAttachmentState,
                    prosper::gpu::kColorTargetCount> cba{};
         for (uint32_t slot = 0; slot < color_count; ++slot) cba[slot].colorWriteMask = 0xF;
@@ -4215,6 +4259,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
         }
         cb.attachmentCount = color_count; cb.pAttachments = cba.data();
+        const auto fixed_blend_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+        if (timing_enabled) res_fixed_blend_ms += setup_elapsed_ms(fixed_viewport_ready, fixed_blend_ready);
         VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         if (ps && ps->depth_test_enable) {
             dss.depthTestEnable  = VK_TRUE;
@@ -4287,6 +4333,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         dss.front.reference, dss.back.reference, (unsigned)ps->cull_mode, (int)ps->depth_test_enable);
         }
         // Descriptor resources for this draw (two-set: VS=set0, PS=set1 — same layout as the single path).
+        const auto fixed_dss_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+        if (timing_enabled) res_fixed_depth_stencil_ms += setup_elapsed_ms(fixed_blend_ready, fixed_dss_ready);
         const auto setup_fixed_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_fixed_ms += setup_elapsed_ms(setup_shaders_ready, setup_fixed_ready);
         const auto& R = effective_resources[di];
@@ -6533,6 +6581,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.cleanup_ms = ms(timing_readback_done, timing_done);
         call_timing.setup_shader_ms = setup_shader_ms;
         call_timing.setup_fixed_ms = setup_fixed_ms;
+        call_timing.res_fixed_index_upload_ms = res_fixed_index_upload_ms;
+        call_timing.res_fixed_blend_ms = res_fixed_blend_ms;
+        call_timing.res_fixed_depth_stencil_ms = res_fixed_depth_stencil_ms;
+        call_timing.res_fixed_viewport_ms = res_fixed_viewport_ms;
+        call_timing.res_fixed_stages_ms = res_fixed_stages_ms;
+        call_timing.res_fixed_prologue_ms = res_fixed_prologue_ms;
         call_timing.setup_resources_ms = setup_resources_ms;
         call_timing.res_texture_ms = res_texture_ms;
         call_timing.res_texture_upload_ms = res_texture_upload_ms;
@@ -6867,6 +6921,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(cleanup_ms);
             PROSPER_SUM_TIMING_STAT(setup_shader_ms);
             PROSPER_SUM_TIMING_STAT(setup_fixed_ms);
+            PROSPER_SUM_TIMING_STAT(res_fixed_index_upload_ms);
+            PROSPER_SUM_TIMING_STAT(res_fixed_blend_ms);
+            PROSPER_SUM_TIMING_STAT(res_fixed_depth_stencil_ms);
+            PROSPER_SUM_TIMING_STAT(res_fixed_viewport_ms);
+            PROSPER_SUM_TIMING_STAT(res_fixed_stages_ms);
+            PROSPER_SUM_TIMING_STAT(res_fixed_prologue_ms);
             PROSPER_SUM_TIMING_STAT(setup_resources_ms);
             PROSPER_SUM_TIMING_STAT(res_texture_ms);
             PROSPER_SUM_TIMING_STAT(res_texture_upload_ms);
