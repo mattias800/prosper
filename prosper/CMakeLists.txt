@@ -364,6 +364,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_reallocalign PRIVATE prosper_core)
   add_test(NAME reallocalign COMMAND test_reallocalign)
 
+  add_executable(test_reallocf tests/test_reallocf.cpp)
+  target_link_libraries(test_reallocf PRIVATE prosper_core)
+  add_test(NAME reallocf COMMAND test_reallocf)
+
   # #2081 FALSE SUCCESS: an unregistered NID answers the dispatcher's 0, which for an SCE_OK
   # contract is a success report over an out-parameter nothing wrote. Pure, no game dump.
   add_executable(test_false_success_nids tests/test_false_success_nids.cpp)
