@@ -50,6 +50,23 @@ int main() {
     CHECK(state.buttons == SCE_PAD_BUTTON_CIRCLE && state.left_x == 0x90);
     CHECK(!overlay.poll(2, state));
 
+    // The right stick composes on the same rule as the left (#2234). It was not merged here at all
+    // before, so a keyboard right-stick deflection was produced by the map and then dropped on the
+    // way to the guest -- the axis stayed centred for the whole run and only a physical pad could
+    // move the camera.
+    keyboard.right_x = 0x00;                 // deflected: the keyboard is asking, so it wins
+    keyboard.right_y = 0x80;                 // centred: not asking, so the physical pad keeps it
+    overlay.set_keyboard_state(keyboard);
+    CHECK(overlay.poll(0, state));
+    CHECK(state.right_x == 0x00);
+    CHECK(state.right_y == 0x80);            // PhysicalPads leaves right_y centred
+    CHECK(state.left_x == 0x00);             // and the left stick is unaffected by the addition
+
+    keyboard.right_x = 0x80;                 // back to centred: the physical deflection returns
+    overlay.set_keyboard_state(keyboard);
+    CHECK(overlay.poll(0, state));
+    CHECK(state.right_x == 0x22);
+
     if (failures) std::printf("FAIL: %d\n", failures);
     else std::printf("PASS\n");
     return failures ? 1 : 0;

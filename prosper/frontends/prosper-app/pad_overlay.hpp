@@ -27,8 +27,15 @@ public:
         }
         if (!physical) out = {};
         out.buttons |= keyboard.buttons;
-        if (keyboard.left_x != 0x80) out.left_x = keyboard.left_x;
-        if (keyboard.left_y != 0x80) out.left_y = keyboard.left_y;
+        // A centred axis is "the keyboard is not asking", so it must not overwrite a physical
+        // stick that IS deflected -- that is what makes this an overlay rather than a replacement.
+        // The right stick had no keyboard source at all until #2234, and consequently no merge
+        // here: adding it to the map alone would have left it centred, since this is where the
+        // composed state is decided.
+        if (keyboard.left_x  != 0x80) out.left_x  = keyboard.left_x;
+        if (keyboard.left_y  != 0x80) out.left_y  = keyboard.left_y;
+        if (keyboard.right_x != 0x80) out.right_x = keyboard.right_x;
+        if (keyboard.right_y != 0x80) out.right_y = keyboard.right_y;
         if (keyboard.l2 > out.l2) out.l2 = keyboard.l2;
         if (keyboard.r2 > out.r2) out.r2 = keyboard.r2;
         out.connected = true;

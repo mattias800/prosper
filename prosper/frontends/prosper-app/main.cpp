@@ -29,6 +29,7 @@
 #include "loader/linker.hpp"           // Program
 #include "input/pad.hpp"               // keyboard -> libScePad (HostPadState / PadBackend)
 #include "pad_overlay.hpp"              // keyboard pad 0 composed over the physical controller backend
+#include "keyboard_pad_map.hpp"         // which key is which pad control (#2234)
 #include "hle/ime_input.hpp"           // #1093: forward host keyboard keys to the guest IME path
 #include "present_mode.hpp"             // explicit swapchain latency/vsync policy, pure regression seam
 #include "present_policy.hpp"           // bounded-acquire present classification (#1182), pure seam
@@ -665,39 +666,58 @@ void feed_test_pattern(uint32_t w, uint32_t h, uint64_t frame) {
 // thread; the guest's scePadReadState reads the composed keyboard/physical state on a guest thread.
 prosper::frontend::KeyboardPadOverlay g_keyboard_pad;
 
+// The only SDL-aware part of the keyboard map: which physical key each PadKey names. The mapping
+// itself is in keyboard_pad_map.hpp, where a test can reach it without linking SDL.
+static SDL_Scancode scancode_for(prosper::frontend::PadKey k) {
+    using prosper::frontend::PadKey;
+    switch (k) {
+        case PadKey::W:          return SDL_SCANCODE_W;
+        case PadKey::A:          return SDL_SCANCODE_A;
+        case PadKey::S:          return SDL_SCANCODE_S;
+        case PadKey::D:          return SDL_SCANCODE_D;
+        case PadKey::T:          return SDL_SCANCODE_T;
+        case PadKey::F:          return SDL_SCANCODE_F;
+        case PadKey::G:          return SDL_SCANCODE_G;
+        case PadKey::H:          return SDL_SCANCODE_H;
+        case PadKey::I:          return SDL_SCANCODE_I;
+        case PadKey::J:          return SDL_SCANCODE_J;
+        case PadKey::K:          return SDL_SCANCODE_K;
+        case PadKey::L:          return SDL_SCANCODE_L;
+        case PadKey::N:          return SDL_SCANCODE_N;
+        case PadKey::M:          return SDL_SCANCODE_M;
+        case PadKey::Comma:      return SDL_SCANCODE_COMMA;
+        case PadKey::Period:     return SDL_SCANCODE_PERIOD;
+        case PadKey::Z:          return SDL_SCANCODE_Z;
+        case PadKey::X:          return SDL_SCANCODE_X;
+        case PadKey::C:          return SDL_SCANCODE_C;
+        case PadKey::V:          return SDL_SCANCODE_V;
+        case PadKey::B:          return SDL_SCANCODE_B;
+        case PadKey::Slash:      return SDL_SCANCODE_SLASH;
+        case PadKey::Space:      return SDL_SCANCODE_SPACE;
+        case PadKey::ArrowUp:    return SDL_SCANCODE_UP;
+        case PadKey::ArrowDown:  return SDL_SCANCODE_DOWN;
+        case PadKey::ArrowLeft:  return SDL_SCANCODE_LEFT;
+        case PadKey::ArrowRight: return SDL_SCANCODE_RIGHT;
+        // Enter has three scancodes and is handled by the caller; Count is not a key.
+        case PadKey::Enter:
+        case PadKey::Count:      break;
+    }
+    return SDL_SCANCODE_UNKNOWN;
+}
+
 // Snapshot the current keyboard into the overlay. Call from the thread that pumps SDL events.
 void poll_keyboard(const bool* keyboard, bool enter_maps_to_options) {
-    using namespace prosper::input;
-    auto d = [&](SDL_Scancode s){ return keyboard[s]; };
-    bool up    = d(SDL_SCANCODE_UP)   || d(SDL_SCANCODE_W);
-    bool down  = d(SDL_SCANCODE_DOWN) || d(SDL_SCANCODE_S);
-    bool left  = d(SDL_SCANCODE_LEFT) || d(SDL_SCANCODE_A);
-    bool right = d(SDL_SCANCODE_RIGHT)|| d(SDL_SCANCODE_D);
-    uint32_t b = 0;
-    if (up)    b |= SCE_PAD_BUTTON_UP;
-    if (down)  b |= SCE_PAD_BUTTON_DOWN;
-    if (left)  b |= SCE_PAD_BUTTON_LEFT;
-    if (right) b |= SCE_PAD_BUTTON_RIGHT;
-    if (d(SDL_SCANCODE_SPACE) || d(SDL_SCANCODE_J)) b |= SCE_PAD_BUTTON_CROSS;    // jump
-    if (d(SDL_SCANCODE_K))     b |= SCE_PAD_BUTTON_SQUARE;                        // attack
-    if (d(SDL_SCANCODE_L))     b |= SCE_PAD_BUTTON_CIRCLE;
-    if (d(SDL_SCANCODE_I))     b |= SCE_PAD_BUTTON_TRIANGLE;
-    if (d(SDL_SCANCODE_U))     b |= SCE_PAD_BUTTON_L1;
-    if (d(SDL_SCANCODE_O))     b |= SCE_PAD_BUTTON_R1;
-    if (d(SDL_SCANCODE_Y))     b |= SCE_PAD_BUTTON_L2;
-    if (d(SDL_SCANCODE_H))     b |= SCE_PAD_BUTTON_R2;
-    const bool enter_down = d(SDL_SCANCODE_RETURN) || d(SDL_SCANCODE_RETURN2) ||
-                            d(SDL_SCANCODE_KP_ENTER);
-    if (enter_down && enter_maps_to_options)
-        b |= SCE_PAD_BUTTON_OPTIONS;   // menu/start; Alt+Enter belongs to the host window
-    HostPadState st;
-    st.buttons = b;
-    st.left_x  = left ? 0x00 : (right ? 0xff : 0x80);   // also drive the left stick, for stick-only titles
-    st.left_y  = up   ? 0x00 : (down  ? 0xff : 0x80);
-    st.l2 = d(SDL_SCANCODE_Y) ? 255 : 0;
-    st.r2 = d(SDL_SCANCODE_H) ? 255 : 0;
-    st.connected = true;
-    g_keyboard_pad.set_keyboard_state(st);
+    using prosper::frontend::PadKey;
+    const auto down = [&](PadKey k) {
+        // Return, the numeric keypad's Enter, and the ISO Return2 are all "Enter" to a player.
+        if (k == PadKey::Enter)
+            return keyboard[SDL_SCANCODE_RETURN] || keyboard[SDL_SCANCODE_RETURN2] ||
+                   keyboard[SDL_SCANCODE_KP_ENTER];
+        const SDL_Scancode s = scancode_for(k);
+        return s != SDL_SCANCODE_UNKNOWN && keyboard[s];
+    };
+    g_keyboard_pad.set_keyboard_state(
+        prosper::frontend::map_keyboard_to_pad(down, enter_maps_to_options));
 }
 
 // ---- opening a game (#1469) --------------------------------------------------------------------

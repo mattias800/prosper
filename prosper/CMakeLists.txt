@@ -480,6 +480,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_prosper_app_pad_overlay PRIVATE prosper_core)
   add_test(NAME prosper_app_pad_overlay COMMAND test_prosper_app_pad_overlay)
 
+  # Which key is which pad control (#2234). No SDL here: the frontend keeps the Key -> scancode
+  # table and the mapping itself lives in a header, so this runs in the core suite on every host.
+  add_executable(test_prosper_app_keyboard_pad_map frontends/prosper-app/test_keyboard_pad_map.cpp)
+  target_include_directories(test_prosper_app_keyboard_pad_map PRIVATE src frontends/prosper-app)
+  target_link_libraries(test_prosper_app_keyboard_pad_map PRIVATE prosper_core)
+  add_test(NAME prosper_app_keyboard_pad_map COMMAND test_prosper_app_keyboard_pad_map)
+
   add_executable(test_prosper_app_window_controls frontends/prosper-app/test_window_controls.cpp)
   target_include_directories(test_prosper_app_window_controls PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_window_controls COMMAND test_prosper_app_window_controls)
