@@ -755,13 +755,51 @@ void label_hist_report(uint64_t addr, char* out, size_t cap) {
     // Exec events carry the folding submit entry point (#1226): D=SubmitDcb A=SubmitAcb
     // F=SubmitDcbFinal, absent when unknown/build-side — the cross-queue discriminator.
     static const char* qn[] = {"", "(D)", "(A)", "(F)"};
-    for (uint32_t i = first; i < n && off + 52 < cap; i++) {
+    // #2192: the reserve was 52 while one entry can reach 63 bytes
+    // (" %s%s@%llu/f%u:0x%llx" = 1 + 7 + 3 + 1 + 20 + 2 + 10 + 3 + 16), so the last admitted
+    // iteration truncated MID-ENTRY -- a half-written field with nothing to say the remaining
+    // events were dropped rather than absent. A truncated label-event ring is exactly the
+    // evidence this instrument exists to print, and it is read from the fault handler, so
+    // "looks complete but is not" is the worst outcome available here.
+    //
+    // Fixed by construction rather than by correcting the constant: append FIRST, and if the
+    // entry did not fit, roll the cursor back so no partial entry survives, then say how many
+    // were lost. There is no reserve left to drift out of step with the format string.
+    // Room the drop marker will need, held back from the entry loop. A RESERVE is what this change
+    // set out to remove -- but the two are not the same thing and the difference is the whole point:
+    // a reserve for a VARIABLE entry drifts the moment the format changes, while this one is for a
+    // FIXED string whose maximum is fully determined by the format. " +4294967295 more" is 17 bytes
+    // plus a terminator; 24 is that with room to spare, and it cannot rot because `dropped` is a
+    // uint32_t.
+    //
+    // Held back rather than written over the tail, which is how the first version of this fix was
+    // wrong -- and it was wrong in exactly the way it was fixing. Placing the marker at
+    // min(off, cap - 24) let it land INSIDE the last complete entry when the buffer was nearly
+    // full, clipping a good entry to write the notice that entries were clipped. macOS CI caught it
+    // (the platform neither this author nor the reviewer runs); the arm that fired was the
+    // partial-entry one, which had been kept only as a regression guard.
+    constexpr size_t kDropMark = 24;
+    const size_t entry_limit = cap > kDropMark ? cap - kDropMark : 0;
+    uint32_t dropped = 0;
+    for (uint32_t i = first; i < n; i++) {
         const LabelEvent& e = h.ev[i & 15];
-        int m = snprintf(out + off, cap - off, " %s%s@%llu/f%u:0x%llx",
-                         e.type <= 8 ? nm[e.type] : "?", e.origin <= 3 ? qn[e.origin] : "",
-                         (unsigned long long)e.t_ms, e.fold, (unsigned long long)e.aux);
-        if (m > 0) off += (size_t)m;
+        const size_t before = off;
+        const int m = off < entry_limit
+            ? snprintf(out + off, entry_limit - off, " %s%s@%llu/f%u:0x%llx",
+                       e.type <= 8 ? nm[e.type] : "?",
+                       e.origin <= 3 ? qn[e.origin] : "",
+                       (unsigned long long)e.t_ms, e.fold,
+                       (unsigned long long)e.aux)
+            : -1;
+        if (m > 0 && before + (size_t)m < entry_limit) { off = before + (size_t)m; continue; }
+        out[before] = '\0';                  // drop the partial entry snprintf just wrote
+        dropped = n - i;
+        break;
     }
+    // `off <= entry_limit == cap - kDropMark`, so the marker always fits at `off` and can never
+    // reach an entry that was admitted.
+    if (dropped && cap > kDropMark)
+        snprintf(out + off, cap - off, " +%u more", dropped);
 }
 }
 extern "C" void prosper_label_hist_dump(uint64_t addr, char* out, unsigned cap) {

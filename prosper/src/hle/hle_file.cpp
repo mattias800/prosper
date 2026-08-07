@@ -982,7 +982,11 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
         deep_budget--;
         char line[1024]; int p = snprintf(line, sizeof line, "[deeptrace] blk %lld frames:", (long long)(off / 0x10000));
         int nf = 0; uint64_t last = 0;
-        for (int i = 0; i < 1600 && i < maxw && nf < 20 && p < (int)sizeof line - 24; i++) {
+        // #2192: the guard reserved 24 bytes while one frame can reach 43 (" %s+%llx" with a
+        // 25-character module name), so the last admitted frame could truncate mid-name. The
+        // append below rolls a frame that does not fit back out rather than leaving half of it.
+        bool line_full = false;
+        for (int i = 0; i < 1600 && i < maxw && nf < 20 && !line_full; i++) {
             uint64_t v = sp[i];
             // #1659: was a two-branch dispatcher whose eboot base was the stale pre-#825 literal
             // (the il2cpp one was current). This formatter already carried a per-entry module tag, so
@@ -993,7 +997,14 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
             if (prosper::guest_va_in_module_code(v)) {
                 m = prosper::guest_module_name(v); o = prosper::guest_module_offset(v);
             }
-            if (m && o != last) { p += snprintf(line + p, sizeof line - p, " %s+%llx", m, (unsigned long long)o); last = o; nf++; }
+            if (m && o != last) {
+                const int before = p;
+                const int w = p < (int)sizeof line
+                    ? snprintf(line + p, sizeof line - p, " %s+%llx", m, (unsigned long long)o)
+                    : -1;
+                if (w > 0 && before + w < (int)sizeof line) { p = before + w; last = o; nf++; }
+                else { line[before] = '\0'; line_full = true; }
+            }
         }
         fprintf(stderr, "%s\n", line);
     }

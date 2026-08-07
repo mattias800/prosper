@@ -2219,12 +2219,28 @@ static void report_submit_order(const char* who, const SubmitCallStamp& st, uint
                     (unsigned long long)(st.ns / 1000ull), dw_num, draws);
     }
     if (n <= 20 || (n % 20000) == 0) {
-        char tb[128]; int o = 0;
-        for (int i = 1; i < 8 && o < 100; ++i) {
+        // #2192: the guard was `o < 100` against a 128-byte buffer while one entry can reach 45
+        // bytes (" t%d=%llu/%llu" with two 20-digit counters), so an admitted iteration could
+        // truncate mid-entry and silently drop the threads after it. Append-then-check instead:
+        // an entry that does not fit is rolled back whole and counted, so the line never carries
+        // half a thread's counters and never implies the remaining threads were idle.
+        char tb[128]; int o = 0, tb_dropped = 0;
+        for (int i = 1; i < 8; ++i) {
             const uint64_t c = per_thread[i].load(std::memory_order_relaxed);
-            if (c) o += snprintf(tb + o, sizeof(tb) - o, " t%d=%llu/%llu", i,
-                                 (unsigned long long)c,
-                                 (unsigned long long)final_per_thread[i].load(std::memory_order_relaxed));
+            if (!c) continue;
+            const int before = o;
+            const int m = o < (int)sizeof(tb)
+                ? snprintf(tb + o, sizeof(tb) - o, " t%d=%llu/%llu", i,
+                           (unsigned long long)c,
+                           (unsigned long long)final_per_thread[i].load(std::memory_order_relaxed))
+                : -1;
+            if (m > 0 && before + m < (int)sizeof(tb)) { o = before + m; continue; }
+            tb[before] = '\0';
+            ++tb_dropped;
+        }
+        if (tb_dropped) {
+            const int at = o < (int)sizeof(tb) - 16 ? o : (int)sizeof(tb) - 16;
+            snprintf(tb + at, sizeof(tb) - at, " +%d more", tb_dropped);
         }
         fprintf(stderr, "[submitorder] %-14s call=%llu fold=%llu thread=%llu t=%lluus addr=%p dw=%u "
                         "draws=%zu | total=%llu inverted=%llu by-thread(all/final):%s\n",

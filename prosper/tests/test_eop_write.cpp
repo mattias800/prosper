@@ -34,6 +34,7 @@ using namespace prosper::gpu;
 // sceKernelReadTsc, so a GPU fence timestamp and a CPU TSC read lie on one timeline (#156).
 extern "C" uint64_t prosper_guest_tsc_ns();
 extern "C" void prosper_label_hist_dma_built(uint64_t addr, uint64_t cb, uint32_t src, uint8_t builder);
+extern "C" void prosper_label_hist_dump(uint64_t addr, char* out, unsigned cap);
 // #1226: uncapped total of PROSPER_WRITE_TRAP payload matches (see command_processor.cpp).
 extern "C" uint64_t prosper_gpu_write_trap_matches();
 extern "C" void prosper_dma_backing_write_fail_once_for_test();
@@ -2103,6 +2104,108 @@ int main() {
                 CHECK(got == g.want, msg);
             }
         }
+    }
+
+    // #2192: label_hist_report reserved 52 bytes per entry while one entry reaches 63, so the
+    // last admitted iteration truncated MID-ENTRY -- a half-written field, with nothing to tell
+    // the reader the remaining events were dropped rather than absent. This report is read from
+    // the fault handler, so "looks complete but is not" is the worst outcome available here.
+    //
+    // Two properties are asserted, and MEASURED AGAINST THE OLD CODE only one of them
+    // discriminates. Recorded here because it corrects the issue rather than confirming it:
+    //
+    //   1. no partial entry survives          -- PASSES on the unfixed code too
+    //   2. when entries are dropped, say so   -- FAILS on the unfixed code  <-- the real arm
+    //
+    // Why (1) does not fire: an entry is " %s%s@%llu/f%u:0x%llx", and reaching the 63-byte
+    // maximum needs a 20-digit `t_ms`. Through this API `t_ms` is a real millisecond clock, so an
+    // entry is ~44 bytes and the old 52-byte reserve was adequate for every REACHABLE input. The
+    // mid-entry truncation the issue describes is real arithmetic and unreachable in practice.
+    //
+    // So what this fix buys is the LEGIBILITY half, and that is worth having on its own: the old
+    // code stopped without saying it had stopped, and this report is read from the fault handler
+    // where "looks complete but is not" is the worst available outcome. (1) is kept as a
+    // regression guard for a future format that does reach the maximum -- not as a demonstration
+    // that it did.
+    {
+        const uint64_t addr = 0xdead0000ull;
+        for (int i = 0; i < 16; ++i)
+            prosper_label_hist_dma_built(addr, 0xfedcba9876543210ull, 0, 1);
+        char small[160];
+        prosper_label_hist_dump(addr, small, sizeof small);
+        const size_t len = strlen(small);
+        CHECK(len < sizeof small, "label_hist_report terminates inside its buffer");
+
+        // Every event this formatter emits carries ":0x" before its hex aux. A field cut
+        // mid-write does not -- which is exactly what a partial entry looks like.
+        bool partial = false;
+        for (size_t i = 0; i < len; ++i) {
+            if (small[i] != ' ') continue;
+            const char* field = small + i + 1;
+            const char* end = strchr(field, ' ');
+            const size_t flen = end ? (size_t)(end - field) : len - (i + 1);
+            if (flen == 0) continue;
+            if (field[0] == '+') break;      // the "+N more" marker is not an event
+            const char* colon = (const char*)memchr(field, ':', flen);
+            if (!colon || (size_t)(colon - field) + 3 > flen ||
+                colon[1] != '0' || colon[2] != 'x')
+                partial = true;
+        }
+        CHECK(!partial, "label_hist_report never emits a half-written event entry");
+        CHECK(strstr(small, "more") != nullptr,
+              "label_hist_report says how many events it dropped rather than ending silently");
+
+        // Control: with room for every entry the marker must NOT appear, so the assertion above
+        // cannot be satisfied by a formatter that always claims to have dropped something.
+        char roomy[2048];
+        prosper_label_hist_dump(addr, roomy, sizeof roomy);
+        CHECK(strstr(roomy, "more") == nullptr,
+              "label_hist_report claims no drops when everything fit");
+
+        // SWEEP the cap, rather than testing one. A single cap exercises one relationship between
+        // the marker and the last admitted entry, and WHICH one depends on how long an entry
+        // happens to be -- which depends on t_ms, a real millisecond clock. So the boundary case
+        // fires on some platforms and not others.
+        //
+        // That is not hypothetical: the first version of this fix placed the marker at
+        // min(off, cap - 24), which lands INSIDE the last complete entry when the buffer is nearly
+        // full -- clipping a good entry to write the notice that entries were clipped. Every arm
+        // above passed on Windows and the partial-entry arm FAILED on macOS CI, on a platform
+        // neither this author nor the reviewer runs. The sweep makes the boundary reachable
+        // everywhere instead of leaving it to the clock.
+        for (size_t cap = 40; cap <= 400; ++cap) {
+            std::vector<char> buf(cap, '');
+            prosper_label_hist_dump(addr, buf.data(), (unsigned)cap);
+            const size_t len = strnlen(buf.data(), cap);
+            if (len >= cap) { CHECK(false, "label_hist_report left its buffer unterminated"); break; }
+            bool bad = false;
+            for (size_t i = 0; i < len; ++i) {
+                if (buf[i] != ' ') continue;
+                const char* field = buf.data() + i + 1;
+                const char* end = strchr(field, ' ');
+                const size_t flen = end ? (size_t)(end - field) : len - (i + 1);
+                // The marker is " +N more" -- TWO space-separated tokens, so stop at the '+'
+                // rather than skipping it, or "more" is scanned as an event and reported as a
+                // partial one. The sweep caught that within seconds of being added, which is the
+                // argument for sweeping: a single cap had never produced a line with a marker AND
+                // a following token.
+                if (flen == 0) continue;
+                if (field[0] == '+') break;
+                const char* colon = (const char*)memchr(field, ':', flen);
+                if (!colon || (size_t)(colon - field) + 3 > flen ||
+                    colon[1] != '0' || colon[2] != 'x')
+                    bad = true;
+            }
+            if (bad) {
+                char msg[128];
+                snprintf(msg, sizeof msg,
+                         "label_hist_report emitted a partial entry at cap=%zu: \"%s\"",
+                         cap, buf.data());
+                CHECK(false, msg);
+                break;
+            }
+        }
+        CHECK(true, "label_hist_report keeps every entry whole across caps 40..400");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
