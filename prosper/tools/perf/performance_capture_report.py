@@ -107,13 +107,22 @@ def _resource_breakdown(renderer):
             "res_buffer": _total(renderer, "res_buffer_ms"),
             "res_buffer_copy": _total(renderer, "res_buffer_copy_ms"),
             "res_descriptor": _total(renderer, "res_descriptor_ms"),
-            # Clamped: a negative remainder would mean the sub-buckets over-count their parent, which
-            # is a defect to surface as 0 rather than to print as a negative duration.
-            "res_other": max(0.0, _total(renderer, "setup_resources_ms")
-                                  - _total(renderer, "res_texture_ms")
-                                  - _total(renderer, "res_buffer_ms")
-                                  - _total(renderer, "res_descriptor_ms")),
         })
+        # The remainder is reported as TWO numbers, and this is not fussiness -- it is this file's own
+        # argument applied to sign instead of presence.
+        #
+        # A negative remainder means the sub-buckets over-count their parent: a real defect, in the
+        # instrument rather than in the renderer. Clamping it to 0.0 does not "surface" that, it emits
+        # the single most reassuring line the tool can produce -- `other=0.0` reads as "every
+        # millisecond of setup_resources is attributed", which is the BEST possible state. So a broken
+        # instrument and a perfect one would print identically, which is exactly the collapse this
+        # module exists to prevent one level up ("absent and zero are the same number and opposite
+        # facts"). An earlier revision of this function did clamp, with a comment claiming it
+        # surfaced the defect.
+        raw_other = (breakdown["setup_resources"] - breakdown["res_texture"]
+                     - breakdown["res_buffer"] - breakdown["res_descriptor"])
+        breakdown["res_other"] = max(0.0, raw_other)
+        breakdown["res_over_attributed"] = max(0.0, -raw_other)   # 0 normally; non-zero is a defect
     return breakdown
 
 
@@ -348,6 +357,12 @@ def print_summary(summary):
                   f" buffer={breakdown['res_buffer']:.1f} (copy={breakdown['res_buffer_copy']:.1f})"
                   f" descriptor={breakdown['res_descriptor']:.1f}"
                   f" other={breakdown['res_other']:.1f}]")
+            # Loud, and only when it is genuinely non-zero. A sub-bucket total exceeding its parent
+            # is an instrument defect, and the breakdown above is untrustworthy while it holds.
+            if breakdown["res_over_attributed"] > 0.05:
+                print("  *** the sub-buckets EXCEED setup_resources by "
+                      f"{breakdown['res_over_attributed']:.1f}ms — the breakdown above is not "
+                      "trustworthy; this is a defect in the instrument, not in the renderer")
         else:
             print("  setup_resources (backend binding):       "
                   f"{breakdown['setup_resources']:.1f}ms"
