@@ -309,6 +309,38 @@ HLE(h_malloc)  { return (uint64_t)(uintptr_t)guest_malloc_portable(a0); }
 HLE(h_calloc)  { return (uint64_t)(uintptr_t)guest_calloc_portable(a0, a1); }
 HLE(h_realloc) { return (uint64_t)(uintptr_t)guest_realloc_portable(P(a0), a1); }
 HLE(h_free)    { guest_free_portable(P(a0)); return 0; }
+// reallocf(ptr, size): realloc, except that the ORIGINAL block is freed if the resize fails. BSD
+// ships it precisely because `p = realloc(p, n)` leaks `p` on failure, so a caller of reallocf has
+// **delegated** the free-on-failure to libc and will not do it itself. Returning NULL without
+// freeing therefore leaks the original block on every failure path — and unregistered it did worse
+// than that, because the dispatcher's default 0 is a NULL return the caller reads as OOM, so a
+// resize that should have succeeded reported allocation failure (#2203).
+//
+// CONFIDENCE: HIGH on the semantics — this is a published BSD interface with one definition, and
+// the PS5 libc lineage is FreeBSD. The argument order is realloc's, not an inference.
+//
+// The `a1` guard is not defensive noise, and the reason is a three-way platform split rather than
+// the two-way one an earlier revision of this comment claimed (CI on macOS corrected it):
+//
+//   glibc    realloc(p, 0) frees p and returns NULL
+//   Windows  guest_realloc_portable's `if (!size)` frees p and returns NULL, explicitly
+//   macOS    realloc(p, 0) returns a VALID minimum-size block and frees nothing
+//
+// C17 7.22.3.5 leaves the zero case implementation-defined, so all three conform. The guard is
+// correct under every one of them without a platform branch, because it keys on the RESULT rather
+// than on an assumption about it: where NULL comes back the block is already gone and `a1 == 0`
+// stops a double free; where a real block comes back `!r` is false and nothing is freed. Note this
+// means reallocf(p, 0) legitimately returns non-NULL on macOS — do not "fix" that to NULL.
+//
+// `P(a0)` guards the realloc(NULL, n) case, where there is nothing to release. On Windows a pointer
+// the header check rejects reaches guest_windows_free, which re-validates the magic and refuses
+// safely, so the BSD rule needs no platform-specific exception there either.
+HLE(h_reallocf) {
+    void* p = P(a0);
+    void* r = guest_realloc_portable(p, a1);
+    if (!r && p && a1) guest_free_portable(p);
+    return (uint64_t)(uintptr_t)r;
+}
 // reallocalign(ptr, size, alignment).
 //
 // CONFIDENCE: MED on the ARGUMENT ORDER, and deliberately not raised. The 3.20 library dump gives
@@ -804,6 +836,7 @@ void register_builtin_hle() {
     R("malloc", h_malloc);   R("calloc", h_calloc);   R("realloc", h_realloc); R("free", h_free);
     R("memalign", h_memalign); R("posix_memalign", h_posix_memalign); R("aligned_alloc", h_aligned_alloc);
     R("reallocalign", h_reallocalign);
+    R("reallocf", h_reallocf);   // YMZO9ChZb0E, libSceLibcInternal (#2203)
     // operator new / new[] (+ nothrow), and aligned variants
     R("_Znwm", h_new); R("_Znam", h_new);
     R("_ZnwmRKSt9nothrow_t", h_new_nothrow); R("_ZnamRKSt9nothrow_t", h_new_nothrow);
