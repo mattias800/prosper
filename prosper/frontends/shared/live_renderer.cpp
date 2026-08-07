@@ -1249,6 +1249,47 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // These four plus a SIGNED residual cover the per-draw body of build_bds. The
                 // residual is published rather than clamped for the reason #2246 records: an
                 // unmeasured region does not read as unmeasured, it reads as someone else's number.
+                // pass_control is a RESIDUAL, not a measurement: pass_ms - build_resources_ms -
+                // backend_ms. On a Blue Prince gameplay window it is 85.57 ms/submit -- 27% of the
+                // frame -- attributed to nothing, which is the state build_resources was in before
+                // #2250: an unmeasured region does not read as unmeasured, it reads as somebody
+                // else's cost.
+                //
+                // Two spans bound the per-group work either side of the measured pair. They are
+                // accumulated where a `continue` cannot skip past them silently: `pre` at the same
+                // place build_resources_ms is recorded, `post` at the loop's end. A group that
+                // continues before reaching the build contributes to neither and lands in the
+                // residual, which is correct -- and visible, rather than folded into a leaf.
+                double pass_pre_ms = 0, pass_post_ms = 0;
+                // pre+post measured 0.23 ms of a 43.85 ms pass_control, so the cost is NOT the
+                // per-group work either side of the measured pair. head/tail bound the two regions
+                // outside the group loop. `tail` subtracts the build_resources+backend the tail
+                // itself performs -- those are already excluded from pass_control, so counting them
+                // here would make the leaves exceed the parent.
+                double pass_head_ms = 0, pass_tail_ms = 0;
+                // head+pre+post+tail measured 1.94 ms of 60.15, so the cost is in none of them.
+                // The only region left is the group loop itself -- specifically iterations that
+                // return before reaching the render, whose time no span above can see. `loop_ms`
+                // is the whole loop; subtracting pre+post and the build/backend the loop performed
+                // leaves exactly the early-exit time, without having to instrument every `continue`
+                // (there are several, and one missed would under-report silently).
+                double pass_loop_ms = 0;
+                // The group loop has exactly ONE early exit -- the MSAA resolve at :5520 -- so the
+                // 49.4 ms difference between `loop` and pre+post+build+backend is entirely resolve
+                // work. Split into the three things a resolve does, because they have completely
+                // different fixes: `stall` is submit_and_wait (a full GPU pipeline flush), `read` is
+                // a whole-surface GPU->CPU readback, `copy` is the GPU-side destination copy that
+                // already exists and is presumably cheap.
+                double resolve_stall_ms = 0, resolve_read_ms = 0, resolve_copy_ms = 0;
+                // The GPU copy's OWN submit_and_wait (#1382 requires it). Separate from `stall`
+                // because removing the eager readback relocated cost into it rather than
+                // eliminating it -- the copy's flush now drains a queue the eager flush used to.
+                // Leaving it unmeasured would put an unmeasured region back inside `loop`, which is
+                // the exact defect this partition exists to remove.
+                double resolve_copy_stall_ms = 0;
+                uint64_t resolve_n = 0, resolve_read_n = 0, resolve_bytes = 0;
+                uint64_t pass_groups_seen = 0;
+                uint64_t pass_groups = 0;
                 double build_r_ms = 0, build_validate_ms = 0;
                 double build_poison_ms = 0, build_indices_ms = 0;
                 uint64_t build_draws = 0, build_rejected = 0;
@@ -5184,6 +5225,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             auto clear_for = [](const std::vector<const prosper::gpu::DrawItem*>& g) -> const float* {
                 return g.empty() ? nullptr : g.front()->ps.clear_color;
             };
+            // Declared beside pass_timing_start, not at the loop's end: the group loop lives in an
+            // inner scope that closes before the pass span is accumulated, so a tail marker declared
+            // there is out of scope where it is needed.
+            RenderClock::time_point pass_tail_start{};
+            double pass_tail_measured_before = 0.0;
             const auto pass_timing_start = timing_enabled
                 ? RenderClock::now() : RenderClock::time_point{};
             if (timing_enabled)
@@ -5332,7 +5378,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 };
                 size_t pass_i = 0;
                 prosper::test::BackendSubmissionBatch backend_submission;
+                if (timing_enabled)
+                    pending_timing.pass_head_ms += std::chrono::duration<double, std::milli>(
+                        RenderClock::now() - pass_timing_start).count();
+                const auto pass_loop_start = timing_enabled
+                    ? RenderClock::now() : RenderClock::time_point{};
+                const double pass_loop_measured_before = timing_enabled
+                    ? pending_timing.build_resources_ms + pending_timing.backend_ms : 0.0;
                 while (pass_i < items.size()) {
+                    const auto group_start = timing_enabled
+                        ? RenderClock::now() : RenderClock::time_point{};
+                    // Counted at the TOP, before any `continue` can skip it -- so the difference
+                    // from pass_groups is exactly the number of iterations that returned without
+                    // rendering, which is the population the missing time must belong to.
+                    if (timing_enabled) ++pending_timing.pass_groups_seen;
                     const uint64_t base = items[pass_i].color0_base;
                     const uint32_t requested_color_count = active_color_count(items[pass_i]);
                     std::array<uint64_t, prosper::gpu::kColorTargetCount> pass_bases{};
@@ -5387,6 +5446,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // cb_resolve, not a sampled resource), so materialize here: flush the pending
                         // batch first — a mid-batch readback would otherwise return stale pixels —
                         // then read the persistent image back once.
+                        // PROSPER_EAGER_RESOLVE_READBACK: restore the pre-#2266 behaviour, where the
+                        // CPU mirror was materialised here unconditionally. Kept as a permanent
+                        // bisection lever so the A/B for this change is single-variable on ONE binary,
+                        // and because this path sits on the #1334/#1382/#1287 evidence chain -- if a
+                        // title regresses, the first question is whether the lazy mirror caused it and
+                        // that has to be answerable without a rebuild.
+                        //
+                        // Measured before the change, Blue Prince gameplay window (#2266):
+                        //   resolve 5.1/submit [stall=20.76 read=20.63 copy=1.54] 63.3 MiB/submit
+                        // 63.3 MiB at 3.1 GB/s -- a PCIe readback rate -- for a CPU mirror that this
+                        // file materialises ON DEMAND everywhere else (see the readback at the compute
+                        // consumer, whose comment says intermediates "normally stay in the persistent
+                        // Vulkan target" and are materialised "only when an ordered compute dispatch
+                        // actually consumes the surface"). The resolve was doing eagerly what the rest
+                        // of the renderer does lazily, and its own comment already calls the CPU pixels
+                        // the failure case: "on failure the shared CPU pixels are the only truth".
+                        static const bool eager_resolve_readback =
+                            getenv("PROSPER_EAGER_RESOLVE_READBACK") != nullptr;
                         if (src_it != g_rtt.end() && src_it->second.gpu_valid &&
                             src_it->second.w && src_it->second.h && rdst) {
                             RttSurf& src_surface = src_it->second;
@@ -5396,17 +5473,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 prosper::test::backend_color_bytes_per_pixel(src_format);
                             const size_t src_bytes = static_cast<size_t>(src_surface.w) *
                                 src_surface.h * src_bpp;
-                            if (src_bpp &&
+                            if (src_bpp && eager_resolve_readback &&
                                 (!src_surface.rgba || src_surface.rgba->size() != src_bytes)) {
                                 const prosper::test::RenderVkCtx& ctx =
                                     prosper::test::render_vk_ctx();
+                                const auto rs0 = timing_enabled
+                                    ? RenderClock::now() : RenderClock::time_point{};
                                 if (ctx.ok && backend_submission.pending())
                                     backend_submission.submit_and_wait(ctx.dev, ctx.queue, false);
+                                const auto rs1 = timing_enabled
+                                    ? RenderClock::now() : RenderClock::time_point{};
                                 std::vector<uint8_t> materialized;
                                 std::string error;
-                                if (prosper::test::readback_persistent_color_target(
+                                const bool read_ok = prosper::test::readback_persistent_color_target(
                                         rsrc, src_surface.w, src_surface.h, src_format,
-                                        materialized, error) &&
+                                        materialized, error);
+                                if (timing_enabled) {
+                                    const auto rs2 = RenderClock::now();
+                                    pending_timing.resolve_stall_ms +=
+                                        std::chrono::duration<double, std::milli>(rs1 - rs0).count();
+                                    pending_timing.resolve_read_ms +=
+                                        std::chrono::duration<double, std::milli>(rs2 - rs1).count();
+                                    ++pending_timing.resolve_read_n;
+                                    pending_timing.resolve_bytes += src_bytes;
+                                }
+                                if (read_ok &&
                                     materialized.size() == src_bytes) {
                                     src_surface.rgba =
                                         std::make_shared<const std::vector<uint8_t>>(
@@ -5422,7 +5513,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                         }
-                        if (rsrc && rdst && src_it != g_rtt.end() && src_it->second.rgba) {
+                        // A GPU-only source is now the ordinary case, so the destination no longer
+                        // requires CPU pixels to exist before the resolve. `gpu_valid` is what the
+                        // copy below needs; `rgba` is inherited when the source happens to have it
+                        // and is otherwise materialised on demand by the consumer path, exactly as
+                        // for every other graphics-to-graphics intermediate.
+                        if (rsrc && rdst && src_it != g_rtt.end() &&
+                            (src_it->second.rgba || src_it->second.gpu_valid)) {
                             // Copy the source RttSurf out before the g_rtt[rdst] insert: operator[] may
                             // rehash and invalidate src_it before the assignment reads it.
                             RttSurf resolved = src_it->second;   // shares pixels (shared_ptr), no deep copy
@@ -5447,16 +5544,56 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 {
                                     const prosper::test::RenderVkCtx& copy_ctx =
                                         prosper::test::render_vk_ctx();
+                                    const auto cs0 = timing_enabled
+                                        ? RenderClock::now() : RenderClock::time_point{};
                                     if (copy_ctx.ok && backend_submission.pending())
                                         backend_submission.submit_and_wait(copy_ctx.dev,
                                                                            copy_ctx.queue, false);
+                                    if (timing_enabled)
+                                        pending_timing.resolve_copy_stall_ms +=
+                                            std::chrono::duration<double, std::milli>(
+                                                RenderClock::now() - cs0).count();
                                 }
                                 std::string copy_error;
-                                if (!prosper::test::copy_persistent_color_target(
+                                const auto rc0 = timing_enabled
+                                    ? RenderClock::now() : RenderClock::time_point{};
+                                const bool copy_ok = prosper::test::copy_persistent_color_target(
                                         rsrc, rdst, rw, rh,
                                         prosper::test::backend_color_format(resolved.format),
-                                        copy_error)) {
+                                        copy_error);
+                                if (timing_enabled)
+                                    pending_timing.resolve_copy_ms +=
+                                        std::chrono::duration<double, std::milli>(
+                                            RenderClock::now() - rc0).count();
+                                if (!copy_ok) {
                                     resolved.gpu_valid = false;
+                                    // The CPU mirror is the documented fallback -- "on failure the
+                                    // shared CPU pixels are the only truth" -- so with the eager
+                                    // readback gone it has to be materialised HERE, on the failure
+                                    // path it was always meant for. Without this the destination
+                                    // would have neither a valid GPU image nor pixels, which is
+                                    // strictly worse than before this change rather than merely
+                                    // slower. The flush is required for the same reason the eager
+                                    // path needed one: a mid-batch readback returns stale pixels.
+                                    if (!resolved.rgba || resolved.rgba->size() !=
+                                            static_cast<size_t>(rw) * rh *
+                                            prosper::test::backend_color_bytes_per_pixel(
+                                                prosper::test::backend_color_format(resolved.format))) {
+                                        const prosper::test::RenderVkCtx& fb_ctx =
+                                            prosper::test::render_vk_ctx();
+                                        if (fb_ctx.ok && backend_submission.pending())
+                                            backend_submission.submit_and_wait(fb_ctx.dev,
+                                                                               fb_ctx.queue, false);
+                                        std::vector<uint8_t> fallback;
+                                        std::string fb_error;
+                                        if (prosper::test::readback_persistent_color_target(
+                                                rsrc, rw, rh,
+                                                prosper::test::backend_color_format(resolved.format),
+                                                fallback, fb_error))
+                                            resolved.rgba =
+                                                std::make_shared<const std::vector<uint8_t>>(
+                                                    std::move(fallback));
+                                    }
                                     static std::atomic<int> warned{0};
                                     if (warned.fetch_add(1) < 8)
                                         fprintf(stderr,
@@ -5474,6 +5611,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     (unsigned long long)rsrc, (unsigned long long)rdst,
                                     !rsrc || !rdst ? "missing base" : "source has no rendered surface");
                         }
+                        if (timing_enabled) ++pending_timing.resolve_n;
                         continue;   // resolve is a copy, not an ordinary-draw render
                     }
 
@@ -5869,6 +6007,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             std::chrono::duration<double, std::milli>(build_done - build_start).count();
                         pending_timing.backend_ms +=
                             std::chrono::duration<double, std::milli>(backend_done - build_done).count();
+                        // Everything this group did BEFORE the measured pair -- target grouping,
+                        // format/extent resolution, resolve handling, seed selection. Recorded here
+                        // rather than at the loop head so a `continue` between the two points cannot
+                        // skip it and silently under-report (#2250's lesson, applied one level up).
+                        pending_timing.pass_pre_ms +=
+                            std::chrono::duration<double, std::milli>(build_start - group_start).count();
+                        ++pending_timing.pass_groups;
                         record_backend_timing(backend_call_timing, backend_pipeline_stats,
                                           backend_reuse_stats);
                         pending_timing.color_target_writes += color_target_call.writes;
@@ -6232,6 +6377,28 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     (int)is_vo, (int)seed_rtt, (int)defer_readback,
                                     (unsigned long long)color_target_call.writes, nz);
                     }
+                    // Everything this group did AFTER the backend call returned -- RTT store,
+                    // scanout selection, per-pass diagnostics. `backend_done` is in scope only on
+                    // the paths that reached the render, which are exactly the paths `pre` counted,
+                    // so the two spans cover the same population and their sum is comparable to
+                    // pass_groups.
+                    if (timing_enabled)
+                        pending_timing.pass_post_ms += std::chrono::duration<double, std::milli>(
+                            RenderClock::now() - backend_done).count();
+                }
+                // Everything after the group loop: present selection, scanout resolution, the final
+                // render, RTT publication. The tail performs its own build_resources+backend, and
+                // pass_control already excludes those -- so subtract what they grew by across this
+                // span, or the leaves would exceed their parent and the guard would fire on a
+                // correct run.
+                if (timing_enabled) {
+                    pending_timing.pass_loop_ms += std::chrono::duration<double, std::milli>(
+                        RenderClock::now() - pass_loop_start).count() -
+                        (pending_timing.build_resources_ms + pending_timing.backend_ms -
+                         pass_loop_measured_before);
+                    pass_tail_start = RenderClock::now();
+                    pass_tail_measured_before =
+                        pending_timing.build_resources_ms + pending_timing.backend_ms;
                 }
                 // Present priority: the flipped front buffer > any registered scanout target > the
                 // legacy "last group" fallback (unchanged behavior when no group targets a VO buffer).
@@ -6435,6 +6602,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             if (timing_enabled)
                 pending_timing.pass_ms += std::chrono::duration<double, std::milli>(
                     RenderClock::now() - pass_timing_start).count();
+            if (timing_enabled)
+                pending_timing.pass_tail_ms +=
+                    std::chrono::duration<double, std::milli>(
+                        RenderClock::now() - pass_tail_start).count() -
+                    (pending_timing.build_resources_ms + pending_timing.backend_ms -
+                     pass_tail_measured_before);
             // Ordered submits may invoke this callback for several graphics spans separated by
             // compute dispatches. Intermediate spans only update g_rtt. At the final span, recover
             // the flipped scanout from that persistent cache even when it was rendered earlier in
@@ -6818,6 +6991,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t tex_rtt_n = 0, tex_compute_n = 0, tex_local_n = 0;
                     uint64_t tex_persist_hit_n = 0, tex_persist_reuse_n = 0, tex_persist_miss_n = 0;
                     uint64_t tex_other_n = 0;
+                    double pass_pre_ms = 0, pass_post_ms = 0;
+                    double pass_head_ms = 0, pass_tail_ms = 0;
+                    double pass_loop_ms = 0;
+                    double resolve_stall_ms = 0, resolve_read_ms = 0, resolve_copy_ms = 0;
+                    double resolve_copy_stall_ms = 0;
+                    uint64_t resolve_n = 0, resolve_read_n = 0, resolve_bytes = 0;
+                    uint64_t pass_groups_seen = 0;
+                    uint64_t pass_groups = 0;
                     double build_r_ms = 0, build_validate_ms = 0;
                     double build_poison_ms = 0, build_indices_ms = 0;
                     uint64_t build_draws = 0, build_rejected = 0;
@@ -6923,6 +7104,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.tex_persist_reuse_n += pending_timing.tex_persist_reuse_n;
                     timing.tex_persist_miss_n += pending_timing.tex_persist_miss_n;
                     timing.tex_other_n += pending_timing.tex_other_n;
+                    timing.pass_pre_ms += pending_timing.pass_pre_ms;
+                    timing.pass_head_ms += pending_timing.pass_head_ms;
+                    timing.pass_loop_ms += pending_timing.pass_loop_ms;
+                    timing.resolve_stall_ms += pending_timing.resolve_stall_ms;
+                    timing.resolve_copy_stall_ms += pending_timing.resolve_copy_stall_ms;
+                    timing.resolve_read_ms += pending_timing.resolve_read_ms;
+                    timing.resolve_copy_ms += pending_timing.resolve_copy_ms;
+                    timing.resolve_n += pending_timing.resolve_n;
+                    timing.resolve_read_n += pending_timing.resolve_read_n;
+                    timing.resolve_bytes += pending_timing.resolve_bytes;
+                    timing.pass_groups_seen += pending_timing.pass_groups_seen;
+                    timing.pass_tail_ms += pending_timing.pass_tail_ms;
+                    timing.pass_post_ms += pending_timing.pass_post_ms;
+                    timing.pass_groups += pending_timing.pass_groups;
                     timing.build_r_ms += pending_timing.build_r_ms;
                     timing.build_validate_ms += pending_timing.build_validate_ms;
                     timing.build_poison_ms += pending_timing.build_poison_ms;
@@ -6958,6 +7153,49 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             totals.dcc_materialize_ms / nsub,
                             static_cast<double>(totals.dcc_materialize_surfaces) / nsub,
                             totals.dcc_materialize_bytes / (nsub * 1024.0 * 1024.0));
+                    // pass_control, split (#2266). `pre` and `post` are the per-group work either
+                    // side of build_resources+backend; `other` is the SIGNED remainder -- groups that
+                    // returned before reaching the render, the tail after the group loop, and the
+                    // loop's own overhead. Published rather than clamped, because an unmeasured
+                    // region does not read as unmeasured: it reads as somebody else's cost, which is
+                    // how 85 ms/submit sat here attributed to nothing.
+                    {
+                        const double pc_other = pass_control - totals.pass_pre_ms -
+                                                totals.pass_post_ms - totals.pass_head_ms -
+                                                totals.pass_tail_ms -
+                                                (totals.pass_loop_ms - totals.pass_pre_ms -
+                                                 totals.pass_post_ms);
+                        fprintf(stderr,
+                                "[render-timing] pass_control %.2f ms/submit [head=%.2f loop=%.2f "
+                                "(pre=%.2f post=%.2f) tail=%.2f other=%+.2f] "
+                                "groups=%.1f rendered of %.1f seen\n",
+                                pass_control / nsub, totals.pass_head_ms / nsub,
+                                totals.pass_loop_ms / nsub,
+                                totals.pass_pre_ms / nsub, totals.pass_post_ms / nsub,
+                                totals.pass_tail_ms / nsub, pc_other / nsub,
+                                (double)totals.pass_groups / nsub,
+                                (double)totals.pass_groups_seen / nsub);
+                        if (pc_other < -0.05 * nsub)
+                            fprintf(stderr,
+                                    "[render-timing] *** pass_control leaves EXCEED their parent by %.2f "
+                                    "ms/submit -- instrument defect, not renderer\n",
+                                    -pc_other / nsub);
+                    }
+                    // The group loop's ONE early exit is the MSAA resolve, so the gap between
+                    // `loop` and pre+post+build+backend is resolve work. Split by what a resolve
+                    // does, because the three have different fixes: `stall` is submit_and_wait (a
+                    // full GPU pipeline flush), `read` is a whole-surface GPU->CPU readback done
+                    // only to materialise a CPU pixel mirror, `copy` is the GPU-side destination
+                    // copy that has to happen either way.
+                    fprintf(stderr,
+                            "[render-timing] resolve %.1f/submit [stall=%.2f read=%.2f "
+                            "copy_stall=%.2f copy=%.2f] "
+                            "reads=%.1f %.1f MiB/submit\n",
+                            (double)totals.resolve_n / nsub, totals.resolve_stall_ms / nsub,
+                            totals.resolve_read_ms / nsub, totals.resolve_copy_stall_ms / nsub,
+                            totals.resolve_copy_ms / nsub,
+                            (double)totals.resolve_read_n / nsub,
+                            totals.resolve_bytes / (nsub * 1024.0 * 1024.0));
                     const double backend_detail_ms = totals.backend_target_ms +
                         totals.backend_draw_setup_ms + totals.backend_record_upload_ms +
                         totals.backend_gpu_wait_ms + totals.backend_readback_ms +
@@ -7291,6 +7529,37 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             window.buffer_bytes / (wn * 1024.0 * 1024.0),
                             window.buffer_materialized_bytes / (wn * 1024.0 * 1024.0),
                             window.buffer_ms / wn);
+                    {
+                        const double pc_other = window_pass_control - window.pass_pre_ms -
+                                                window.pass_post_ms - window.pass_head_ms -
+                                                window.pass_tail_ms -
+                                                (window.pass_loop_ms - window.pass_pre_ms -
+                                                 window.pass_post_ms);
+                        fprintf(stderr,
+                                "[render-window] pass_control %.2f ms/submit [head=%.2f loop=%.2f "
+                                "(pre=%.2f post=%.2f) tail=%.2f other=%+.2f] "
+                                "groups=%.1f rendered of %.1f seen\n",
+                                window_pass_control / wn, window.pass_head_ms / wn,
+                                window.pass_loop_ms / wn,
+                                window.pass_pre_ms / wn, window.pass_post_ms / wn,
+                                window.pass_tail_ms / wn, pc_other / wn,
+                                (double)window.pass_groups / wn,
+                                (double)window.pass_groups_seen / wn);
+                        if (pc_other < -0.05 * wn)
+                            fprintf(stderr,
+                                    "[render-window] *** pass_control leaves EXCEED their parent by "
+                                    "%.2f ms/submit -- instrument defect, not renderer\n",
+                                    -pc_other / wn);
+                    }
+                    fprintf(stderr,
+                            "[render-window] resolve %.1f/submit [stall=%.2f read=%.2f "
+                            "copy_stall=%.2f copy=%.2f] "
+                            "reads=%.1f %.1f MiB/submit\n",
+                            (double)window.resolve_n / wn, window.resolve_stall_ms / wn,
+                            window.resolve_read_ms / wn, window.resolve_copy_stall_ms / wn,
+                            window.resolve_copy_ms / wn,
+                            (double)window.resolve_read_n / wn,
+                            window.resolve_bytes / (wn * 1024.0 * 1024.0));
                     // texture_ms attributed by OUTCOME class (#2262). The classes are decided in
                     // a fixed order on the per-resource path and classified in that same order, so
                     // they are mutually exclusive and every reference lands in exactly one -- or in
