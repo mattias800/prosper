@@ -1014,6 +1014,51 @@ constexpr uint32_t kSw4kbS3Dims[5][3] = {
     {16, 16, 16}, {8, 16, 16}, {8, 16, 8}, {8, 8, 8}, {4, 8, 8},
 };
 
+// The dims above are DERIVED DATA sitting next to the derivation they come from, which is a hazard:
+// the pattern could change and the table not follow, with nothing to notice. The literal table is
+// kept anyway -- a reader of a tiling file needs the block geometry at a glance, and a loop
+// accumulating coordinate masks does not provide that -- so the drift is closed by checking it
+// instead of by deleting it.
+//
+// Compile-time rather than a test arm, because a static_assert cannot be skipped, cannot be run on
+// the wrong build directory, and reports at the point of the mistake. If the pattern changes and the
+// table does not, this file stops compiling.
+constexpr uint32_t sw4kb_s3_derived_dim(uint32_t el, uint32_t axis) {
+    uint32_t highest = 0;
+    for (uint32_t i = el; i < kSw4kbS3Bits; ++i) {
+        const uint32_t mask = axis == 0 ? kSw64kbS3[el][i].x
+                            : axis == 1 ? kSw64kbS3[el][i].y
+                                        : kSw64kbS3[el][i].z;
+        if (mask > highest) highest = mask;
+    }
+    // The masks are single coordinate bits, so the highest one addresses [0, 2*mask); an axis no bit
+    // references spans exactly one texel.
+    return highest ? highest * 2u : 1u;
+}
+static_assert(sw4kb_s3_derived_dim(0, 0) == kSw4kbS3Dims[0][0] &&
+              sw4kb_s3_derived_dim(0, 1) == kSw4kbS3Dims[0][1] &&
+              sw4kb_s3_derived_dim(0, 2) == kSw4kbS3Dims[0][2] &&
+              sw4kb_s3_derived_dim(1, 0) == kSw4kbS3Dims[1][0] &&
+              sw4kb_s3_derived_dim(1, 1) == kSw4kbS3Dims[1][1] &&
+              sw4kb_s3_derived_dim(1, 2) == kSw4kbS3Dims[1][2] &&
+              sw4kb_s3_derived_dim(2, 0) == kSw4kbS3Dims[2][0] &&
+              sw4kb_s3_derived_dim(2, 1) == kSw4kbS3Dims[2][1] &&
+              sw4kb_s3_derived_dim(2, 2) == kSw4kbS3Dims[2][2] &&
+              sw4kb_s3_derived_dim(3, 0) == kSw4kbS3Dims[3][0] &&
+              sw4kb_s3_derived_dim(3, 1) == kSw4kbS3Dims[3][1] &&
+              sw4kb_s3_derived_dim(3, 2) == kSw4kbS3Dims[3][2] &&
+              sw4kb_s3_derived_dim(4, 0) == kSw4kbS3Dims[4][0] &&
+              sw4kb_s3_derived_dim(4, 1) == kSw4kbS3Dims[4][1] &&
+              sw4kb_s3_derived_dim(4, 2) == kSw4kbS3Dims[4][2],
+              "kSw4kbS3Dims no longer matches what the low 12 bits of kSw64kbS3 can address");
+// And that each derived block is exactly 4 KiB -- the property that fails on a wrong bit count.
+static_assert(kSw4kbS3Dims[0][0] * kSw4kbS3Dims[0][1] * kSw4kbS3Dims[0][2] * 1u == 4096 &&
+              kSw4kbS3Dims[1][0] * kSw4kbS3Dims[1][1] * kSw4kbS3Dims[1][2] * 2u == 4096 &&
+              kSw4kbS3Dims[2][0] * kSw4kbS3Dims[2][1] * kSw4kbS3Dims[2][2] * 4u == 4096 &&
+              kSw4kbS3Dims[3][0] * kSw4kbS3Dims[3][1] * kSw4kbS3Dims[3][2] * 8u == 4096 &&
+              kSw4kbS3Dims[4][0] * kSw4kbS3Dims[4][1] * kSw4kbS3Dims[4][2] * 16u == 4096,
+              "a SW_4KB_S3 block no longer holds exactly 4096 bytes");
+
 // Shared by both standard-3D block sizes. `bits` is log2 of the block, so 16 -> 64 KiB (S3) and
 // 12 -> 4 KiB (4K_S3); `dims` is the matching block geometry.
 size_t s3_volume_bytes(uint32_t width, uint32_t height, uint32_t depth, uint32_t bpe,
