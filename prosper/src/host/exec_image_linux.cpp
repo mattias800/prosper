@@ -2786,12 +2786,26 @@ namespace {
             // end the process, and under PROSPER_WORKER_PARK a LATER fault can take the gate and
             // get a full report of its own.
             prosper::host::release_fault_report(dump_owner, fc.tid);
+            // These two are INSIDE the block on purpose (#2163). fault_context.hpp explains that
+            // release_fault_report is safe without a nesting count only because "the fatal report
+            // block never returns -- its every exit is _exit or an unbounded park", and that property
+            // used to be enforced by these statements sitting AFTER the block, which control flow
+            // fell off the end of. Anyone adding an early `return` above broke the invariant with no
+            // failing check and no test; the consequence is the report gate released while a report
+            // is still printing, i.e. two re-entrant reports interleaved on one stderr.
+            //
+            // Inside the brace, the block demonstrably has no fall-off-the-end exit, so the comment
+            // in fault_context.hpp is enforced by structure rather than by everyone remembering to
+            // read it. Moving them is behaviour-preserving because the block at :2311 is an
+            // UNCONDITIONAL bare block, not an `if` -- "inside, at the end" and "immediately after"
+            // run in exactly the same cases.
+            //
+            // PROSPER_WORKER_PARK=1 (diagnostic): instead of terminating the whole process on a guest
+            // worker-thread fault, park the faulting thread so the main thread can proceed to its own
+            // recoverable crash (lets CRASHPEEK/PEEK_CLASS run). May deadlock if the worker held a lock.
+            if (getenv("PROSPER_WORKER_PARK")) { for (;;) pause(); }
+            _exit(90);
         }
-        // PROSPER_WORKER_PARK=1 (diagnostic): instead of terminating the whole process on a guest
-        // worker-thread fault, park the faulting thread so the main thread can proceed to its own
-        // recoverable crash (lets CRASHPEEK/PEEK_CLASS run). May deadlock if the worker held a lock.
-        if (getenv("PROSPER_WORKER_PARK")) { for (;;) pause(); }
-        _exit(90);
     }
 
     std::string trap_detail() {
