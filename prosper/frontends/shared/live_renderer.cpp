@@ -1241,6 +1241,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 //            cross-submit question can only ever answer Unknown through it,
                 //            and only a cross-submit WATCH can answer it at all.
                 uint64_t persistent_submit_unarmed = 0, persistent_submit_stale = 0;
+                // #2283's blocking arm. publish_selected_fmt0 must stay 0 over a full route for
+                // the disabled-target readback skip to be safe by construction. `unknown` is
+                // separate so a selection whose source pass could not be identified is never
+                // silently counted as a clean one.
+                uint64_t publish_selected = 0, publish_selected_fmt0 = 0;
+                uint64_t publish_selected_unknown = 0, publish_candidate_fmt0 = 0;
                 uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                 double texture_ms = 0, buffer_ms = 0;
                 // Attribution of texture_ms by OUTCOME class (#2262). After #2259 removed the
@@ -5302,6 +5308,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             uint32_t px_vo_w = 0, px_vo_h = 0;
             uint32_t px_last_w = 0, px_last_h = 0;
             uint64_t px_front_base = 0, px_vo_base = 0, px_last_base = 0;
+            // The raw CB_COLOR0_INFO.FORMAT of the pass that produced each present candidate, so the
+            // SELECTED one's format can be reported (#2283). UINT32_MAX is "no candidate recorded",
+            // deliberately not 0: 0 is CB_COLOR_INVALID, a real and meaningful value here, and the
+            // whole question is how often it reaches the publish source. Absent and disabled must
+            // not be the same number.
+            constexpr uint32_t kNoPassFormat = UINT32_MAX;
+            uint32_t px_front_fmt = kNoPassFormat, px_vo_fmt = kNoPassFormat,
+                     px_last_fmt = kNoPassFormat;
             // Fail-visible: a submit that renders yet offers no present-extent source is exactly the
             // Frontiers wall, and before #1968's diagnostics nothing anywhere said so — the publish
             // counter simply stopped while the guest kept submitting. Never expected, so it reports
@@ -6345,17 +6359,34 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             }
                         }
                     }
+                    // The POPULATION that the publish zero is a zero OVER, counted BEFORE the
+                    // emptiness/format gates below -- so it sees every pass whose colour target
+                    // is disabled, not just those that already qualified as candidates.
+                    //
+                    // This placement is the whole point. A same-source positive control proves
+                    // the DISCRIMINATOR fires; it can never prove the DOMAIN contains the case.
+                    // Counting the population in the same run is what separates "disabled-target
+                    // passes exist and none is ever published" from "none exists, so the zero
+                    // says nothing" -- and those are opposite conclusions about whether #2283's
+                    // readback skip is safe.
+                    if (timing_enabled && !pass.empty() && pass.front()->ps.color0_format == 0)
+                        ++pending_timing.publish_candidate_fmt0;
                     if (!rendered_pixels.empty() && pass_format == VK_FORMAT_R8G8B8A8_UNORM) {
+                        // Recorded alongside each candidate rather than re-derived at selection
+                        // time: by then the pass loop has moved on and `pass` no longer refers to
+                        // the pass that produced these pixels (#2283).
+                        const uint32_t candidate_fmt =
+                            pass.empty() ? kNoPassFormat : pass.front()->ps.color0_format;
                         if (base && base == front_va) {                          // the flipped buffer
                             px_front = pass_pixels; px_front_w = gw; px_front_h = gh;
-                            px_front_base = base;
+                            px_front_base = base; px_front_fmt = candidate_fmt;
                         }
                         if (is_vo) {                                            // any registered scanout
                             px_vo = pass_pixels; px_vo_w = gw; px_vo_h = gh;
-                            px_vo_base = base;
+                            px_vo_base = base; px_vo_fmt = candidate_fmt;
                         }
                         px_last = pass_pixels;                                  // last non-empty (fallback)
-                        px_last_w = gw; px_last_h = gh; px_last_base = base;
+                        px_last_w = gw; px_last_h = gh; px_last_base = base; px_last_fmt = candidate_fmt;
                     } else if (!rendered_pixels.empty() && prefix_inspect_publish()) {
                         // #1330: under gpu_replay's ordered-prefix inspection (--draw/--draw-steps/
                         // --through-operation set PROSPER_PREFIX_INSPECT), a prefix ending on a
@@ -6508,6 +6539,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 : present_choice == PresentSourceChoice::Vo    ? px_vo
                                 : present_choice == PresentSourceChoice::Last  ? px_last
                                 : nullptr;
+                // #2283's blocking arm, measured rather than argued: is a pass whose colour target is
+                // DISABLED (CB_COLOR0_INFO.FORMAT == 0, CB_COLOR_INVALID) ever chosen as the frame
+                // that gets published? The proposed fix stops forcing a readback on such a pass, and
+                // it is safe by CONSTRUCTION only if the answer is never. Nothing checked it before,
+                // and the guard that looks like it would -- pass_format == R8G8B8A8_UNORM at the
+                // candidate site -- does NOT exclude a disabled target, because backend_color_format()
+                // FALLS BACK to R8G8B8A8_UNORM for anything it does not recognise, including 0.
+                if (timing_enabled) {
+                    const uint32_t chosen_fmt =
+                        present_choice == PresentSourceChoice::Front ? px_front_fmt
+                      : present_choice == PresentSourceChoice::Vo    ? px_vo_fmt
+                      : present_choice == PresentSourceChoice::Last  ? px_last_fmt
+                      : kNoPassFormat;
+                    if (selected_pixels) {
+                        ++pending_timing.publish_selected;
+                        if (chosen_fmt == 0) ++pending_timing.publish_selected_fmt0;
+                        else if (chosen_fmt == kNoPassFormat) ++pending_timing.publish_selected_unknown;
+                    }
+                }
                 // The one new semantic path: a non-empty higher-priority candidate was passed over on
                 // extent. Unreachable today (a VO/front-buffer pass has its extent pinned to the present
                 // extent at :5060-5063 before it renders, so those candidates always fit), which is
@@ -7066,6 +7116,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t persistent_watch_unknown = 0, persistent_watch_disabled = 0;
                     uint64_t persistent_submit_unknown = 0, persistent_submit_overlap = 0;
                     uint64_t persistent_submit_unarmed = 0, persistent_submit_stale = 0;
+                    uint64_t publish_selected = 0, publish_selected_fmt0 = 0;
+                    uint64_t publish_selected_unknown = 0, publish_candidate_fmt0 = 0;
                     uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                     double texture_ms = 0, buffer_ms = 0;
                     // Attribution of texture_ms by OUTCOME class (#2262). After #2259 removed the
@@ -7185,6 +7237,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.persistent_submit_overlap += pending_timing.persistent_submit_overlap;
                     timing.persistent_submit_unarmed += pending_timing.persistent_submit_unarmed;
                     timing.persistent_submit_stale += pending_timing.persistent_submit_stale;
+                    timing.publish_selected += pending_timing.publish_selected;
+                    timing.publish_selected_fmt0 += pending_timing.publish_selected_fmt0;
+                    timing.publish_selected_unknown += pending_timing.publish_selected_unknown;
+                    timing.publish_candidate_fmt0 += pending_timing.publish_candidate_fmt0;
                     timing.persistent_watch_disabled += pending_timing.persistent_watch_disabled;
                     timing.buffers += pending_timing.buffers;
                     timing.buffer_views += pending_timing.buffer_views;
@@ -7392,6 +7448,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             backend_buffers.cached_buffers,
                             backend_buffers.cached_bytes / (1024.0 * 1024.0),
                             (unsigned long long)backend_buffers.evictions);
+                    fprintf(stderr,
+                            "[render-timing] publish_source selected=%llu fmt0=%llu unknown=%llu passes_fmt0=%llu\n",
+                            (unsigned long long)totals.publish_selected,
+                            (unsigned long long)totals.publish_selected_fmt0,
+                            (unsigned long long)totals.publish_selected_unknown,
+                            (unsigned long long)totals.publish_candidate_fmt0);
                     fprintf(stderr,
                             "[render-timing] color_targets writes=%llu load_hits=%llu sample_hits=%llu "
                             "readbacks=%llu deferred=%llu cached=%llu %.1f MiB\n",
