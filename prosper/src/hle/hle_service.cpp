@@ -4232,6 +4232,36 @@ HLE(s_savedata_transfermount_ps4) {
     return SAVE_DATA_ERR_NOT_FOUND;
 }
 
+// sceSaveDataDirNameSearchPs4 (X4MYzukPc3g) -- the PS4 sibling of sceSaveDataDirNameSearch
+// (dyIhnXq-0SM, registered below), and with the entry point above the ONLY two PS4-namespace exports
+// libSceSaveData has across all 275 PS5 3.20 libraries. Fixing it closes the pair (#2210).
+//
+// Unregistered, this reached prosper_on_unimpl's `return 0` -- SCE_OK for this contract, the FALSE
+// SUCCESS class (#2081). The caller is told a search over PS4 save data SUCCEEDED and the result
+// struct it passed is never written. That reads as "zero hits" only because callers happen to zero
+// the struct first: right by accident, not by construction. A caller reusing a result struct, or one
+// whose hit count lands on non-zero stack residue, is handed a count over memory nothing wrote --
+// the #213 shape, where a garbage count sized a 34 GB array.
+//
+// NOT_FOUND is derived from local inventory, not assumed: prosper has no PS4 save-data store at all
+// (its two save areas are both PS5-side -- PROSPER_SAVEDATA_DIR -> save-data-memory, PROSPER_SAVE0 ->
+// the mounted /savedata0) and no local dump carries a PS4 save area, so a search over PS4 save data
+// honestly finds nothing. Same 0x809F facility, same answer a search of a nonexistent save returns.
+//
+// NOTHING is written to the result, deliberately. Returning SCE_OK with an explicitly-zeroed hit
+// count would also be defensible -- but only if the argument layout were established from live
+// evidence, and it is not. Inventing a written result is the exact mirror of the defect being fixed
+// (#2208's failure was a guest reading an unwritten result). A caller that reads a result after an
+// error is reading its own buffer, which is what must not be papered over.
+//
+// CONFIDENCE: HIGH that success is wrong here (it is SCE_OK over an unwritten out-struct by
+// construction); MED on NOT_FOUND being the precise firmware errno; LOW on the argument layout --
+// nothing is assumed about it because nothing is read or written.
+HLE(s_savedata_dirname_search_ps4) {
+    svc_log("sceSaveDataDirNameSearchPs4", a0,a1,a2,a3,a4,a5);
+    return SAVE_DATA_ERR_NOT_FOUND;
+}
+
 // sceSystemServiceGetNoticeScreenSkipFlag(bool* flag) — polled from DOLL's front-end menu.
 // PS5-only (no reference). Live capture pinned the out-pointer to an ODD stack address
 // (0x...ff307), so the flag is a single byte (bool), NOT an int32 — a 4-byte write would clobber
@@ -4640,6 +4670,7 @@ void register_service_hle() {
     Hle::register_fn("lPDO62PpJIA", (HleFn)s_npent_skuflag, "sceNpEntitlementAccessGetSkuFlag");
     Hle::register_fn("WAzWTZm1H+I", (HleFn)s_savedata_transfermount, "sceSaveDataTransferringMount");
     Hle::register_fn("RjMlsR8EXrw", (HleFn)s_savedata_transfermount_ps4, "sceSaveDataTransferringMountPs4");
+    Hle::register_fn("X4MYzukPc3g", (HleFn)s_savedata_dirname_search_ps4, "sceSaveDataDirNameSearchPs4");
     Hle::register_fn("3RQ5aQfnstU", (HleFn)s_syss_noticeskip, "sceSystemServiceGetNoticeScreenSkipFlag");
     // libSceNpUniversalDataSystem — inert ids (guarded LOW-confidence out-writes).
     Hle::register_fn("sjaobBgqeB4", (HleFn)s_npuds_ok,     "sceNpUniversalDataSystemInitialize");
