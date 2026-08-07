@@ -153,9 +153,13 @@ int main() {
             // The POSIX spelling shares the body and must NOT encode. Without this line the arm
             // above cannot distinguish a correct alias from both spellings being encoded.
             auto posix_trywait = Hle::lookup(nid_hash("sem_trywait"));
-            CHECK(posix_trywait && posix_trywait((uint64_t)slot, 0, 0, 0, 0, 0)
-                      == static_cast<uint64_t>(FreeBsdErrno::EAgain),
-                  "sem_trywait keeps the bare FreeBSD EAGAIN (35)");
+            errno = 0;
+            const uint64_t posix_rc =
+                posix_trywait ? posix_trywait((uint64_t)slot, 0, 0, 0, 0, 0) : 0;
+            CHECK(posix_trywait && posix_rc == (uint64_t)(int64_t)-1 &&
+                      errno == static_cast<int>(FreeBsdErrno::EAgain),
+                  "sem_trywait returns -1 and leaves FreeBSD EAGAIN (35) in errno (#2182) — the "
+                  "POSIX contract, and the FreeBSD numbering the guest compares against");
             sem_destroy((uint64_t)slot, 0, 0, 0, 0, 0);
         } else {
             std::printf("  [skip] scePthreadSem* not registered on this platform\n");

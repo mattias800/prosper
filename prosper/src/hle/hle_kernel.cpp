@@ -2411,15 +2411,44 @@ HLE(k_sem_destroy)   { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_st
 // The Sony spellings of the fallible semaphore entry points (#2178). SemDestroy is absent because
 // it returns 0 unconditionally — #2042 made it quarantine its object rather than free it, which
 // changes what it does but not what it reports, so it still needs no alias. NOTE that the POSIX
-// names registered on these same bodies — sem_init/sem_wait/sem_trywait/sem_post/sem_getvalue —
-// have a separate, pre-existing problem: the C contract is "return -1, number in errno", and these
-// bodies return the number. That is not this rule and is not fixed here; the alias only stops the
-// SONY side from reporting a bare errno.
+// names registered on these same bodies are handled just below, along the OTHER
+// axis (#2182): the return CONVENTION rather than the error ENCODING.
 SCE_PTHREAD_ALIAS(k_sce_sem_init,     k_sem_init)
 SCE_PTHREAD_ALIAS(k_sce_sem_wait,     k_sem_wait)
 SCE_PTHREAD_ALIAS(k_sce_sem_trywait,  k_sem_trywait)
 SCE_PTHREAD_ALIAS(k_sce_sem_post,     k_sem_post)
 SCE_PTHREAD_ALIAS(k_sce_sem_getvalue, k_sem_getvalue)
+// The same bodies under their POSIX spellings, split along the RETURN-CONVENTION axis rather than
+// the encoding one (#2182). k_sem_* return the error NUMBER, which is right for scePthreadSem* and
+// wrong for sem_*: C11 7.26 and FreeBSD sem_wait(3) both specify "return -1, number left in errno".
+//
+// The failure this fixes is quiet in both idioms. A guest writing `if (sem_wait(s) < 0)` -- the form
+// the C standard prescribes -- saw SUCCESS on every failure, because a positive errno is not
+// negative. One writing `if (sem_wait(s) != 0)` saw the failure but could not read it out of errno,
+// because nothing had been put there.
+//
+// The value published is the FreeBSD-numbered errno the body already returned, NOT the host's, and
+// that distinction is load-bearing: the guest is a FreeBSD-ABI binary comparing against FreeBSD
+// constants, and it reads this through __error, which hle_libc.cpp resolves to the host thread's
+// &errno. The two numbering schemes are not interchangeable -- EAGAIN is 35 on the PS5 and 11 here,
+// which is exactly why fbsd_errno() exists (see the k_sem_trywait comment above).
+//
+// sem_timedwait has no POSIX spelling registered, so it is absent here and encodes in place.
+// sem_destroy is absent because returning 0 unconditionally already IS its POSIX contract.
+namespace {
+    inline uint64_t posix_sem_rc(uint64_t fbsd_rc) {
+        if (fbsd_rc == 0) return 0;
+        errno = (int)(uint32_t)fbsd_rc;
+        return (uint64_t)(int64_t)-1;
+    }
+}
+#define POSIX_SEM_ALIAS(posix_name, body) HLE(posix_name) { return posix_sem_rc(body(a0, a1, a2, a3, a4, a5)); }
+POSIX_SEM_ALIAS(k_posix_sem_init,     k_sem_init)
+POSIX_SEM_ALIAS(k_posix_sem_wait,     k_sem_wait)
+POSIX_SEM_ALIAS(k_posix_sem_trywait,  k_sem_trywait)
+POSIX_SEM_ALIAS(k_posix_sem_post,     k_sem_post)
+POSIX_SEM_ALIAS(k_posix_sem_getvalue, k_sem_getvalue)
+#undef POSIX_SEM_ALIAS
 // scePthreadBarrier* -- were MISSING -> the generic stub returned 0, so BarrierWait let every thread sail
 // past a rendezvous before its peers arrived: the barrier's downstream invariant (all-arrived) is false ->
 // reads of not-yet-produced data (the async-load race class). Back with host pthread_barrier_t; the serial
@@ -4144,9 +4173,11 @@ void register_kernel_hle() {
     R("scePthreadAttrSetaffinity", k_attr_noop); R("pthread_setname_np", k_attr_noop);
     // Plain libScePosix sem_* imports use the same guest object representation as scePthreadSem*.
     // Registering only the Sony-prefixed spellings left successful no-op imports in native engines.
-    R("sem_init", k_sem_init);       R("sem_destroy", k_sem_destroy);
-    R("sem_wait", k_sem_wait);       R("sem_trywait", k_sem_trywait);
-    R("sem_post", k_sem_post);       R("sem_getvalue", k_sem_getvalue);
+    // POSIX spellings take the -1/errno wrappers (#2182). sem_destroy keeps the shared body:
+    // returning 0 unconditionally is already its POSIX contract.
+    R("sem_init", k_posix_sem_init);       R("sem_destroy", k_sem_destroy);
+    R("sem_wait", k_posix_sem_wait);       R("sem_trywait", k_posix_sem_trywait);
+    R("sem_post", k_posix_sem_post);       R("sem_getvalue", k_posix_sem_getvalue);
     // event flags + semaphores (engine thread synchronization)
     R("sceKernelCreateEventFlag", k_ef_create); R("sceKernelDeleteEventFlag", k_ef_delete);
     R("sceKernelSetEventFlag", k_ef_set);       R("sceKernelClearEventFlag", k_ef_clear);

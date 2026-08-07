@@ -63,6 +63,12 @@ struct Row {
     const char* sony;
     const char* posix;    // nullptr = Sony-only body
     const char* note;
+    // The POSIX spelling's RETURN CONVENTION, which is not uniform across these families (#2182).
+    // pthread_* genuinely returns the error number, so those rows assert a bare errno. The sem_*
+    // family does not: C11 7.26 and FreeBSD sem_wait(3) specify "return -1, number left in errno",
+    // so those rows assert -1 AND read the number back out of errno. Getting this wrong in either
+    // direction is silent at the guest, which is why it is a per-row property and not a global one.
+    bool posix_returns_minus1 = false;
 };
 
 // Every fallible entry point in the synchronisation-object families, in registration order. A null
@@ -105,12 +111,12 @@ const Row kRows[] = {
     {"scePthreadRwlockattrInit",     "pthread_rwlockattr_init",     "#2178"},
     {"scePthreadRwlockattrDestroy",  "pthread_rwlockattr_destroy",  "#2178"},
     // --- semaphores ---
-    {"scePthreadSemInit",            "sem_init",                    "#2178"},
-    {"scePthreadSemWait",            "sem_wait",                    "#2178"},
-    {"scePthreadSemTrywait",         "sem_trywait",                 "#2178"},
+    {"scePthreadSemInit",            "sem_init",                    "#2178", true},
+    {"scePthreadSemWait",            "sem_wait",                    "#2178", true},
+    {"scePthreadSemTrywait",         "sem_trywait",                 "#2178", true},
     {"scePthreadSemTimedwait",       nullptr,                       "#2178, in place"},
-    {"scePthreadSemPost",            "sem_post",                    "#2178"},
-    {"scePthreadSemGetvalue",        "sem_getvalue",                "#2178"},
+    {"scePthreadSemPost",            "sem_post",                    "#2178", true},
+    {"scePthreadSemGetvalue",        "sem_getvalue",                "#2178", true},
     // --- barriers (no POSIX spelling registered on either body) ---
     {"scePthreadBarrierInit",        nullptr,                       "#2178, in place"},
     {"scePthreadBarrierWait",        nullptr,                       "#2178, in place"},
@@ -156,10 +162,18 @@ int main() {
         }
         // The half a single-spelling test cannot do: the POSIX name on the same body must NOT
         // encode. Without this line, aliasing both spellings would look like a clean pass.
-        const uint64_t bare = call0(posix);
-        snprintf(msg, sizeof msg, "%-30s -> bare EINVAL 22 (got %llu)",
-                 r.posix, (unsigned long long)bare);
-        CHECK(bare == kBareEINVAL, msg);
+        errno = 0;
+        const uint64_t got_posix = call0(posix);
+        if (r.posix_returns_minus1) {
+            snprintf(msg, sizeof msg,
+                     "%-30s -> -1 with EINVAL 22 in errno (got %lld, errno %d)",
+                     r.posix, (long long)(int64_t)got_posix, errno);
+            CHECK(got_posix == (uint64_t)(int64_t)-1 && errno == (int)kBareEINVAL, msg);
+        } else {
+            snprintf(msg, sizeof msg, "%-30s -> bare EINVAL 22 (got %llu)",
+                     r.posix, (unsigned long long)got_posix);
+            CHECK(got_posix == kBareEINVAL, msg);
+        }
     }
 
     // ===== 2. M3: a forwarded HOST errno, where host and FreeBSD numbering disagree ============
@@ -167,7 +181,9 @@ int main() {
     // is 11, which is FreeBSD's EDEADLK. This row is the only one that can tell a correct mapping
     // from a passed-through host number, because every other row's errno is EINVAL(22), which every
     // platform agrees on. It also carries the full contract at once: Sony gets 0x80020023, POSIX
-    // gets 35, and neither gets 11.
+    // gets -1 with 35 in errno, and neither gets 11. Since #2182 the POSIX half is the strongest
+    // arm in this file: it is the only place that can show WHICH numbering reaches the guest's
+    // errno, because it is the only errno in the suite where host and FreeBSD disagree.
     printf("-- a forwarded host errno (EAGAIN: FreeBSD 35, host 11) --\n");
     {
         HleFn sem_init    = Hle::lookup(nid_hash("scePthreadSemInit"));
@@ -183,8 +199,17 @@ int main() {
             CHECK(sem_trywait((uint64_t)(uintptr_t)slot, 0, 0, 0, 0, 0) == 0x80020023ull,
                   "scePthreadSemTrywait on an empty semaphore reports encoded FreeBSD EAGAIN "
                   "(0x80020023) — not a bare 35, and not the host's 11");
-            CHECK(posix_trywait((uint64_t)(uintptr_t)slot, 0, 0, 0, 0, 0) == 35,
-                  "sem_trywait on the same semaphore reports bare FreeBSD EAGAIN (35)");
+            // The POSIX half, and the sharpest arm in the file: -1 is the C contract, and the
+            // 35 in errno is FreeBSD's EAGAIN where the host's is 11. An implementation that
+            // published the host number would still return -1 here and would still look right to
+            // any check that only tested the return value (#2182).
+            errno = 0;
+            const uint64_t posix_rc = posix_trywait((uint64_t)(uintptr_t)slot, 0, 0, 0, 0, 0);
+            CHECK(posix_rc == (uint64_t)(int64_t)-1,
+                  "sem_trywait on the same semaphore returns -1, per C11 7.26 / sem_wait(3)");
+            CHECK(errno == 35,
+                  "sem_trywait leaves FreeBSD EAGAIN (35) in errno — not the host's 11, which is "
+                  "FreeBSD's EDEADLK and would turn a retryable wait into a deadlock report");
             sem_destroy((uint64_t)(uintptr_t)slot, 0, 0, 0, 0, 0);
         }
     }
