@@ -423,6 +423,12 @@ struct BackendResourceReuseStats {
     uint64_t buffer_hash_skipped_unique = 0;
     uint64_t buffer_hash_skipped_large = 0;
     uint64_t buffer_ref_memo_hits = 0;
+    // Reference share is not byte share, and the cost here is BYTES. skipped_large at 9.3% of
+    // references says nothing on its own about how much of the copy volume those buffers are --
+    // they are large by definition, so their byte share is necessarily higher, but "higher" is not
+    // a number. These two make the conclusion readable instead of derivable (#2245 review).
+    uint64_t buffer_skipped_large_dwords = 0;   // payload that bypasses content dedup by size
+    uint64_t buffer_upload_bytes = 0;           // bytes actually memcpy'd into mapped staging
 };
 
 inline BackendResourceReuseStats& backend_resource_reuse_stats_storage() {
@@ -4828,6 +4834,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         backend_hash_stats_totals().hash_dwords += word_count;
                     } else if (shareable) {
                         ++resource_reuse_stats.buffer_hash_skipped_large;
+                        resource_reuse_stats.buffer_skipped_large_dwords += word_count;
                         ++backend_hash_stats_totals().skipped_large;
                     } else {
                         ++resource_reuse_stats.buffer_hash_skipped_unique;
@@ -4895,6 +4902,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         } else {
                             const ResourcePhaseTimer phase_copy(timing_enabled,
                                                                 &res_buffer_copy_ms);
+                            resource_reuse_stats.buffer_upload_bytes += static_cast<uint64_t>(bytes);
                             std::memcpy(static_cast<uint8_t*>(upload.mapped) + upload.offset,
                                         words, static_cast<size_t>(bytes));
                             upload.range = bytes;
@@ -6768,6 +6776,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         PROSPER_SUM_RESOURCE_STAT(buffer_hash_skipped_unique);
         PROSPER_SUM_RESOURCE_STAT(buffer_hash_skipped_large);
         PROSPER_SUM_RESOURCE_STAT(buffer_ref_memo_hits);
+        PROSPER_SUM_RESOURCE_STAT(buffer_skipped_large_dwords);
+        PROSPER_SUM_RESOURCE_STAT(buffer_upload_bytes);
 #undef PROSPER_SUM_RESOURCE_STAT
         aggregate_resources.persistent_pipeline_layout_entries =
             resources.persistent_pipeline_layout_entries;

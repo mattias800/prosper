@@ -1258,7 +1258,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 ? RenderClock::now() : RenderClock::time_point{};
             auto record_backend_timing = [&]
                 (const prosper::test::BackendRenderTimingStats& backend,
-                 const prosper::test::BackendPipelineCacheStats& pipelines) {
+                 const prosper::test::BackendPipelineCacheStats& pipelines,
+                 const prosper::test::BackendResourceReuseStats& reuse) {
                 pending_timing.backend_calls += backend.calls;
                 pending_timing.backend_draws += backend.draws;
                 pending_timing.backend_command_buffers += backend.command_buffers;
@@ -1289,6 +1290,57 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.backend_pipeline_bypasses += pipelines.bypasses;
                 pending_timing.backend_pipeline_entries = pipelines.entries;
                 pending_timing.backend_pipeline_evictions += pipelines.evictions;
+                // Buffer-copy economics. This leaf dominates the Blue Prince FMV collapse -- 539 ms
+                // of 802 ms of backend resource setup, 67% (#2215) -- and nothing could say WHY: the
+                // counters are collected per call and aggregated into the thread-local storage, and
+                // the ONLY consumers in the tree were assertions in test_multidraw_render.cpp. The
+                // sibling resource kind has reported its cache economics for ages
+                // ("[render-timing] texture_cache hits=... misses=..."), while buffers -- an order of
+                // magnitude more expensive in that regime -- reported nothing at all.
+                //
+                // Per SUBMIT rather than as a window mean, deliberately. The question is which of
+                // three mutually exclusive stories produces the copy volume, and they need different
+                // fixes, so an average across them answers none of it:
+                //   skipped_unique dominates -> buffer_identity == 0, nothing can dedup, fix upstream
+                //   skipped_large dominates  -> the 4 KiB hash-dedup cap is working as designed and
+                //                               the payloads are genuinely distinct; the fix is not
+                //                               dedup at all but not staging through a mapped copy
+                //   refs >> memo_hits        -> repeat references within one call are being missed
+                if (timing_enabled) {
+                    // CUMULATIVE, not a per-call snapshot. The first draft printed one call's
+                    // numbers at diag_should_print's ordinals (first 64, then powers of two) --
+                    // which is a UNIFORM sample of a heavily skewed distribution, so it could not
+                    // see the expensive calls by construction. The sampled calls summed to ~290 KB
+                    // per submit against 30 ms of measured copy: 290 KB cannot take 30 ms, and that
+                    // contradiction is the only reason the sampling flaw was caught.
+                    //
+                    // Totals cannot miss a call. The rate limit now controls how often the running
+                    // total is PRINTED, never which calls it counts.
+                    static uint64_t refs = 0, uniq = 0, memo = 0, hashed = 0, dwords = 0;
+                    static uint64_t skipped_large = 0, skipped_unique = 0, fallbacks = 0, calls = 0;
+                    static uint64_t large_dwords = 0, upload_bytes = 0;
+                    refs += reuse.buffer_references;      uniq += reuse.unique_buffers;
+                    memo += reuse.buffer_ref_memo_hits;   hashed += reuse.buffer_hash_calls;
+                    dwords += reuse.buffer_hash_dwords;   fallbacks += reuse.buffer_upload_fallbacks;
+                    skipped_large += reuse.buffer_hash_skipped_large;
+                    skipped_unique += reuse.buffer_hash_skipped_unique;
+                    large_dwords += reuse.buffer_skipped_large_dwords;
+                    upload_bytes += reuse.buffer_upload_bytes;
+                    if (prosper::diag_should_print(++calls))
+                        fprintf(stderr,
+                                "[render-timing] buffer_reuse (cumulative over %llu backend calls) "
+                                "refs=%llu unique=%llu memo_hits=%llu hashed=%llu (%.1f MiB) "
+                                "skipped_large=%llu (%.1f MiB) skipped_unique=%llu "
+                                "COPIED=%.1f MiB upload_fallbacks=%llu\n",
+                                (unsigned long long)calls, (unsigned long long)refs,
+                                (unsigned long long)uniq, (unsigned long long)memo,
+                                (unsigned long long)hashed, (double)dwords * 4.0 / (1024.0 * 1024.0),
+                                (unsigned long long)skipped_large,
+                                (double)large_dwords * 4.0 / (1024.0 * 1024.0),
+                                (unsigned long long)skipped_unique,
+                                (double)upload_bytes / (1024.0 * 1024.0),
+                                (unsigned long long)fallbacks);
+                }
             };
             auto append_rtt_timing = [](std::string& output, const RttTimingRecord& record) {
                 const prosper::test::BackendRenderTimingStats& timing = record.timing;
@@ -5569,12 +5621,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const prosper::test::BackendPipelineCacheStats backend_pipeline_stats = timing_enabled
                         ? prosper::test::backend_pipeline_cache_stats()
                         : prosper::test::BackendPipelineCacheStats{};
+                    // Captured HERE, beside the pipeline stats, and PASSED IN -- not read inside
+                    // record_backend_timing. These are thread_local and published by the backend call;
+                    // reading them from wherever the recorder happens to run returns a different,
+                    // nearly empty instance. The first draft did exactly that and reported refs=11 for
+                    // a 2,102-draw submit -- the kind of small plausible number that gets believed.
+                    const prosper::test::BackendResourceReuseStats backend_reuse_stats = timing_enabled
+                        ? prosper::test::backend_resource_reuse_stats()
+                        : prosper::test::BackendResourceReuseStats{};
                     if (timing_enabled) {
                         pending_timing.build_resources_ms +=
                             std::chrono::duration<double, std::milli>(build_done - build_start).count();
                         pending_timing.backend_ms +=
                             std::chrono::duration<double, std::milli>(backend_done - build_done).count();
-                        record_backend_timing(backend_call_timing, backend_pipeline_stats);
+                        record_backend_timing(backend_call_timing, backend_pipeline_stats,
+                                          backend_reuse_stats);
                         pending_timing.color_target_writes += color_target_call.writes;
                         pending_timing.color_target_write_hits += color_target_call.write_hits;
                         pending_timing.color_target_sample_hits += color_target_call.sampled_hits;
@@ -6099,12 +6160,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 const prosper::test::BackendPipelineCacheStats backend_pipeline_stats = timing_enabled
                     ? prosper::test::backend_pipeline_cache_stats()
                     : prosper::test::BackendPipelineCacheStats{};
+                // Captured HERE, beside the pipeline stats, and PASSED IN -- not read inside
+                // record_backend_timing. These are thread_local and published by the backend call;
+                // reading them from wherever the recorder happens to run returns a different,
+                // nearly empty instance. The first draft did exactly that and reported refs=11 for
+                // a 2,102-draw submit -- the kind of small plausible number that gets believed.
+                const prosper::test::BackendResourceReuseStats backend_reuse_stats = timing_enabled
+                    ? prosper::test::backend_resource_reuse_stats()
+                    : prosper::test::BackendResourceReuseStats{};
                 if (timing_enabled) {
                     pending_timing.build_resources_ms +=
                         std::chrono::duration<double, std::milli>(build_done - build_start).count();
                     pending_timing.backend_ms +=
                         std::chrono::duration<double, std::milli>(backend_done - build_done).count();
-                    record_backend_timing(backend_call_timing, backend_pipeline_stats);
+                    record_backend_timing(backend_call_timing, backend_pipeline_stats,
+                                          backend_reuse_stats);
                 }
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
