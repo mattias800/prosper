@@ -1713,8 +1713,10 @@ struct SpirvCompute {
     uint32_t image_atomic_u32(uint16_t opcode, uint32_t binding, uint32_t ncoord,
                               const uint32_t* coords, uint32_t value, bool predicated,
                               uint32_t pred, uint32_t fallback) {
-        // The decoder/resource gate currently accepts only non-arrayed 2D R32_UINT atomics.
-        if (ncoord != 2) return fallback;
+        // 2D and 2D_ARRAY R32_UINT atomics. `arrayed` is implied by ncoord==3 -- the gate below
+        // only reaches here for SQ_DIM_2D (ncoord 2) and SQ_DIM_2D_ARRAY (ncoord 3, x/y/layer).
+        const bool arrayed = ncoord == 3;
+        if (ncoord != 2 && ncoord != 3) return fallback;
         if (!t_ptr_img_u32) {
             t_ptr_img_u32 = id();
             put(types, Op_TypePointer, {t_ptr_img_u32, SC_Image, t_u32});
@@ -1726,12 +1728,25 @@ struct SpirvCompute {
         const uint32_t image = id();
         put(code, Op_Load, {stg_img_binding_type[binding], image, stg_img_var[binding]});
         const uint32_t size = id();
-        put(code, Op_ImageQuerySize, {t_v2i(), size, image});
+        // An arrayed image's OpImageQuerySize yields (width, height, layers); a plain 2D yields
+        // (width, height). Querying the wrong arity is a SPIR-V validity error rather than a silent
+        // miscompile, so spv_validate catches a mistake here.
+        put(code, Op_ImageQuerySize, {arrayed ? t_v3i() : t_v2i(), size, image});
         const uint32_t width_i = id(), height_i = id();
         put(code, Op_CompositeExtract, {t_i32, width_i, size, 0});
         put(code, Op_CompositeExtract, {t_i32, height_i, size, 1});
         uint32_t in_bounds = ucmp(Op_ULessThan, coords[0], i2u(width_i));
         in_bounds = land(in_bounds, ucmp(Op_ULessThan, coords[1], i2u(height_i)));
+        if (arrayed) {
+            // The layer bound is NOT optional. Vulkan leaves an out-of-bounds image atomic
+            // undefined -- robust image access does not cover atomics -- and the 2D case's own
+            // comment records that RADV can spend seconds in one before resetting the GPU. An
+            // unbounded layer index would be exactly that, so the layer is bounded from the image's
+            // own query rather than from a descriptor field the shader cannot see.
+            const uint32_t layers_i = id();
+            put(code, Op_CompositeExtract, {t_i32, layers_i, size, 2});
+            in_bounds = land(in_bounds, ucmp(Op_ULessThan, coords[2], i2u(layers_i)));
+        }
         const uint32_t active = predicated ? land(pred, in_bounds) : in_bounds;
         auto emit = [&]() {
             const uint32_t coord = stg_coord(ncoord, coords);
@@ -9847,6 +9862,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (!allow_smem || !rt) { ok = false; return true; }
             const uint32_t SQ_DIM_2D = 1u;
             const uint32_t SQ_DIM_3D = 2u;
+            const uint32_t SQ_DIM_2D_ARRAY = 5u;   // (x, y, layer) -- #2265
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
 
             // IMAGE_BVH_INTERSECT_RAY (GFX10 opcode 0xe6) has an image encoding but consumes a
@@ -10119,10 +10135,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // The live Astro Bot visibility image is an ordinary 2D R32_UINT surface. Keep the
                 // first atomic implementation exact and fail-visible for every other image shape;
                 // atomics require a typed integer image in Vulkan/SPIR-V rather than Format=Unknown.
+                // 2D and 2D_ARRAY. The array layer was added for #2265: Sonic Racing: CrossWorlds
+                // issues IMAGE_ATOMIC_ADD at dim=2D_ARRAY on a default launch, and the storage
+                // load/store siblings had already been generalised over the layer while the atomic
+                // had not. `res->depth` is the layer COUNT for an arrayed view, so it is required to
+                // be exactly 1 only in the non-arrayed case.
+                const bool atomic_2d_array = in.mimg_dim == SQ_DIM_2D_ARRAY && arrayed && !ms;
                 if (is_atomic &&
-                    (in.mimg_dim != SQ_DIM_2D || arrayed || ms || in.len_dwords != 2 ||
+                    ((in.mimg_dim != SQ_DIM_2D && !atomic_2d_array) || ms || in.len_dwords != 2 ||
                      in.mimg_unorm || in.mimg_dmask != 1u ||
-                     res->img_dim != 1u || res->depth != 1u || res->depth_compare ||
+                     (!arrayed && (res->img_dim != 1u || res->depth != 1u)) ||
+                     (arrayed && (res->img_dim != SQ_DIM_2D_ARRAY || !res->depth)) ||
+                     (arrayed && !res->depth) || res->depth_compare ||
                      res->format != DataFormat::Uint32 || components != 1u ||
                      !res->width || !res->height || res->in_mip_tail ||
                      res->compression_enabled)) {
