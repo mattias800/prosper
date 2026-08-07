@@ -191,9 +191,13 @@ try {
             '-d', 'Ubuntu-24.04', '-u', 'root', '--',
             'bash', '-lc', "cmake --build $QuotedLinuxBuild -j$Jobs"
         ) $Repo
+        # --no-tests=error on both ctest runs below. Plain ctest EXITS 0 when it finds no tests,
+        # so an author verification pointed at a build directory that is empty, stale, or simply
+        # the wrong one reports green having executed nothing -- and this script is what the
+        # charter tells authors to run and quote as their evidence (#2187).
         Invoke-AuthorCheck 'Linux ctest' wsl.exe @(
             '-d', 'Ubuntu-24.04', '-u', 'root', '--',
-            'bash', '-lc', "ctest --test-dir $QuotedLinuxBuild --output-on-failure"
+            'bash', '-lc', "ctest --test-dir $QuotedLinuxBuild --output-on-failure --no-tests=error"
         ) $Repo
 
         $WindowsBuildPath = (Resolve-Path (Join-Path $Repo $WindowsBuild)).Path
@@ -201,7 +205,7 @@ try {
             '--build', $WindowsBuildPath, '--parallel', $Jobs.ToString()
         ) $Repo
         Invoke-AuthorCheck 'Windows ctest' ctest @(
-            '--test-dir', $WindowsBuildPath, '--output-on-failure'
+            '--test-dir', $WindowsBuildPath, '--output-on-failure', '--no-tests=error'
         ) $Repo
     }
 

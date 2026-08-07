@@ -98,7 +98,12 @@ jobs:
       #   podman run --rm -v "$PWD:/work" ubuntu:25.10   # mesa-vulkan-drivers 25.2.8
       - name: Test
         run: |
-          ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
+          # --no-tests=error on every ctest in this file. Plain ctest EXITS 0 when it finds no
+          # tests at all, so "nothing ran" and "everything passed" are the same status and a job
+          # gating on it reports a confident green having verified nothing (#2187). This job also
+          # has the by-name registration guard above, which is the stronger check; the flag is
+          # here so the protection does not depend on remembering which job carries which guard.
+          ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error
 
       # #1704: until this step existed, no Vulkan validation layer ran anywhere in the project.
       # #1690 was an invalid descriptor binding — a VK_IMAGE_VIEW_TYPE_3D view on a descriptor whose
@@ -169,6 +174,22 @@ jobs:
       - name: Verify no Markdown table is split or mis-sized anywhere in docs
         run: |
           git ls-files '*.md' -z | xargs -0 python3 prosper/tools/docs/check_numbered_table.py --github
+
+      # Lives here, in the job that needs nothing built, for the same reason the checks above do:
+      # it is a repository-wide text scan that finishes in a second. It gates the flag that keeps
+      # the OTHER jobs' ctest steps honest -- plain ctest exits 0 on an empty suite, so a job
+      # reading only that status can report a green suite having run nothing (#2187). Four jobs in
+      # this file and both author-verification runs were exposed; they now pass --no-tests=error,
+      # and this step is what stops the next one from omitting it.
+      #
+      # --selftest first, deliberately: the scan's own failure mode is silence. A matcher that
+      # stops matching reports a clean tree forever, and this checker's first revision was 91%
+      # false positives, so its matching is the part that needs a guard. The two run as separate
+      # commands rather than a pipeline, because a pipeline's exit status is its LAST stage's.
+      - name: Verify every ctest invocation fails on an empty suite
+        run: |
+          python3 prosper/tools/ci/check_ctest_gate.py --selftest
+          python3 prosper/tools/ci/check_ctest_gate.py --root .
 
   linux-app:
     name: Linux App
@@ -314,7 +335,8 @@ jobs:
 
       - name: Test
         shell: msys2 {0}
-        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
+        # See the linux job: plain ctest exits 0 on an empty suite (#2187).
+        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error
 
   windows-app:
     name: Windows App
@@ -354,10 +376,17 @@ jobs:
           cmake --build prosper/build-windows-app
           --target prosper-app test_prosper_app_pad_overlay test_audio_sdl3 test_pad_sdl3
 
+      # See the linux job (#2187) for --no-tests=error. This job is the one it matters most for:
+      # it is the only job testing a directory other than build-ci, so a --test-dir that drifted
+      # back to the common name would find an absent or unbuilt tree, register nothing, and pass.
+      # The comment lives out here rather than inside the block below because `run: >-` is a
+      # FOLDED scalar: every line is joined into ONE command, so a `#` line would comment out the
+      # rest of it -- which is exactly what a first attempt at this edit did.
       - name: Test SDL audio and input seams
         shell: msys2 {0}
         run: >-
           ctest --test-dir prosper/build-windows-app --output-on-failure --timeout 600
+          --no-tests=error
           -R '^(prosper_app_pad_overlay|audio_sdl3|pad_sdl3)$'
 
       - name: Verify portable runtime imports
@@ -431,7 +460,11 @@ jobs:
         run: cmake --build prosper/build-ci
 
       - name: Test
-        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
+        # See the linux job: plain ctest exits 0 on an empty suite (#2187). This job configures
+        # with -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE, so its suite is DELIBERATELY the smaller
+        # non-GPU one -- which is exactly why a by-name Vulkan guard cannot be copied here and
+        # why the empty case has to be caught by the flag instead.
+        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error
 
   macos-app:
     name: macOS App (SDL3 + MoltenVK)
