@@ -82,6 +82,14 @@ bool vopc_is_cmpx(uint32_t opcode) {
            (opcode >= 0xF0u && opcode <= 0xFFu);     // u64 / f16
 }
 
+// VERIFIED(round-trip llvm-mc gfx1030, VOP1): 0x54 v_rcp_f16, 0x55 v_sqrt_f16, 0x56 v_rsq_f16,
+// 0x57 v_log_f16, 0x58 v_exp_f16, 0x59 v_frexp_mant_f16, 0x5A v_frexp_exp_i16_f16, 0x5B v_floor_f16,
+// 0x5C v_ceil_f16, 0x5D v_trunc_f16, 0x5E v_rndne_f16, 0x5F v_fract_f16, 0x60 v_sin_f16,
+// 0x61 v_cos_f16. The two holes are the FREXP pair — see the header for why they are excluded.
+bool vop1_is_f16_unary(uint32_t opcode) {
+    return (opcode >= 0x54u && opcode <= 0x58u) || (opcode >= 0x5Bu && opcode <= 0x61u);
+}
+
 namespace {
 Operand vgpr(uint32_t n) { return {OperandKind::VGPR, (int32_t)(n & 0xFFu)}; }
 Operand sgpr(uint32_t n) { return {OperandKind::SGPR, (int32_t)(n & 0x7Fu)}; }
@@ -225,16 +233,13 @@ void decode_operands(Rdna2Inst& i) {
                 }
                 // Packed unary f16 SDWA selects one source half, writes one destination half, and
                 // preserves the other. The admitted set is exactly the VOP1 f16 unary family the
-                // recompiler's plain-e32 lowering already covers — 0x54-0x58 (rcp/sqrt/rsq/log/exp)
-                // and 0x5B-0x61 (floor/ceil/trunc/rndne/fract/sin/cos) — so the two forms of one
-                // opcode can never disagree about what the operation is. 0x59/0x5A (frexp mant/exp)
-                // are deliberately outside it: they are not that one-in-one-out shape.
+                // recompiler's plain-e32 lowering already covers, named once by `vop1_is_f16_unary`
+                // so this admission and `emit_f16_unary` cannot disagree about what the family is.
                 // (Sonic Racing: CrossWorlds' compute kernels, #2013: 0x7e0cbcf9 0x00051406 ->
                 // `v_rndne_f16_sdwa v6, v6 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
                 // src0_sel:WORD_1` and 0x7e14b8f9 0x0005150a -> `v_ceil_f16_sdwa v10, v10
                 // dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1`.)
-                else if ((((w >> 9) & 0xFFu) >= 0x54u && ((w >> 9) & 0xFFu) <= 0x58u) ||
-                         (((w >> 9) & 0xFFu) >= 0x5Bu && ((w >> 9) & 0xFFu) <= 0x61u)) {
+                else if (vop1_is_f16_unary((w >> 9) & 0xFFu)) {
                     const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     const uint32_t s0sel = (sd >> 16) & 7u;
                     if ((dsel == 4u || dsel == 5u) && dun == 2u &&

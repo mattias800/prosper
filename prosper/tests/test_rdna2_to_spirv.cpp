@@ -3550,21 +3550,28 @@ int main() {
 
     // Kernel 32r22a (LIVE, exec_cs_290000eb00 pc=1157): `v_rndne_f16_sdwa`. The recompiler's plain
     // e32 lowering covers the whole VOP1 f16 unary family, but its SDWA word-select sibling admitted
-    // only rcp/sqrt/cos — so a rounder in that form rejected the program (#2013). 3.5 is the
-    // discriminating input: round-half-to-EVEN gives 4.0 (0x4400), while floor and trunc give 3.0
-    // and only ceil agrees. The untouched high half must survive, so the result is 0x43004400.
+    // only rcp/sqrt/cos — so a rounder in that form rejected the program (#2013).
+    // **Two inputs are needed to pin the rounding mode, and one is not enough.** 3.5 -> 4.0 rules out
+    // floor and trunc (both 3.0) but is satisfied by ceil AND by round-half-AWAY; 2.5 -> 2.0 rules
+    // out ceil and round-half-away (both 3.0) but is satisfied by floor and trunc. Only
+    // round-half-to-EVEN satisfies both, so the kernel runs the live encoding twice on different
+    // registers. Each also preserves its untouched high half.
     const uint32_t code32r22a[] = {
         0x7e0c02ffu, 0x4300beefu,            // v_mov_b32 v6, {hi=f16 3.5, lo=0xbeef}
+        0x7e0e02ffu, 0x4100beefu,            // v_mov_b32 v7, {hi=f16 2.5, lo=0xbeef}
         0x7e0cbcf9u, 0x00051406u,            // v_rndne_f16_sdwa v6, v6 WORD_0/PRESERVE src0_sel:WORD_1
+        0x7e0ebcf9u, 0x00051407u,            // v_rndne_f16_sdwa v7, v7 WORD_0/PRESERVE src0_sel:WORD_1
+        0x3a100f06u,                          // v_xor_b32 v8, v6, v7
         0xbf810000u,
     };
-    std::vector<uint32_t> spv32r22a = recompile_valu(code32r22a, std::size(code32r22a), 0, 6);
+    std::vector<uint32_t> spv32r22a = recompile_valu(code32r22a, std::size(code32r22a), 0, 8);
     CHECK(!spv32r22a.empty(), "recompiled kernel 32r22a (live v_rndne_f16_sdwa) -> SPIR-V");
     std::vector<float> got32r22a = spv32r22a.empty()
         ? std::vector<float>()
         : prosper::test::run_compute(spv32r22a, std::vector<float>(1), 1, 1);
-    CHECK(got32r22a.size()==1 && bits_of(got32r22a[0])==0x43004400u,
-          "kernel 32r22a rounds half to even into the selected destination word");
+    // v6 = 0x43004400 (3.5 -> 4.0), v7 = 0x41004000 (2.5 -> 2.0); xor = 0x02000400.
+    CHECK(got32r22a.size()==1 && bits_of(got32r22a[0])==0x02000400u,
+          "kernel 32r22a rounds half to EVEN in both directions and preserves each high half");
 
     // Kernel 32r22b (LIVE, exec_cs_2a80007800 pc=1765): `v_ceil_f16_sdwa`, writing the OPPOSITE
     // destination half from 32r22a so the insert/preserve pair is covered in both directions. 2.5

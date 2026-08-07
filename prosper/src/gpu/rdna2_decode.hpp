@@ -48,6 +48,14 @@ float inline_float_value(uint32_t code);
 // rdna2_decode.cpp. This is a property of the ENCODING, so it is shared: the decoder's SDWA
 // admission and the recompiler's EXEC/mask bookkeeping must not carry separate copies (#2120).
 bool vopc_is_cmpx(uint32_t opcode);
+// True for the VOP1 f16 unary family: one f16 operand in, one f16 result out, no side effects —
+// 0x54-0x58 (rcp/sqrt/rsq/log/exp) and 0x5B-0x61 (floor/ceil/trunc/rndne/fract/sin/cos). The two
+// FREXP opcodes 0x59/0x5A sit inside that numeric span and are deliberately excluded: 0x59 returns a
+// mantissa and 0x5A returns an **i16** exponent, so neither is the shape the shared lowering
+// implements. Like `vopc_is_cmpx`, this is a property of the ENCODING and is shared rather than
+// copied: the decoder's SDWA admission and the recompiler's `emit_f16_unary` must have exactly one
+// domain between them, or an opcode gains support in one form and not the other (#2013).
+bool vop1_is_f16_unary(uint32_t opcode);
 
 struct Rdna2Inst {
     Rdna2Format fmt = Rdna2Format::Unknown;

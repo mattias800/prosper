@@ -5254,12 +5254,13 @@ uint32_t ds_append_consume_index(SpirvCompute& b, uint32_t m0, uint32_t literal,
 // Both the plain e32 form and the SDWA word-select form lower through this one function, so the two
 // encodings of one opcode cannot drift apart — the SDWA path previously carried its own three-op
 // ternary, which is exactly how a family gains a member in one form and not the other.
-// VERIFIED(round-trip llvm-mc gfx1030, VOP1): 0x54 v_rcp_f16, 0x55 v_sqrt_f16, 0x56 v_rsq_f16,
-// 0x57 v_log_f16, 0x58 v_exp_f16, 0x5B v_floor_f16, 0x5C v_ceil_f16, 0x5D v_trunc_f16,
-// 0x5E v_rndne_f16, 0x5F v_fract_f16, 0x60 v_sin_f16, 0x61 v_cos_f16. Trig input is in REVOLUTIONS,
-// exactly as for the f32 forms. Callers must admit only those opcodes. CONFIDENCE: HIGH.
+// The domain is `vop1_is_f16_unary` (rdna2_decode.hpp), shared with the decoder's SDWA admission and
+// asserted below rather than assumed: a caller that widens its gate without widening this switch
+// would otherwise get `v_cos_f16` silently. Opcodes verified there by llvm-mc round-trip; trig input
+// is in REVOLUTIONS, exactly as for the f32 forms. Returns 0 (never a valid SPIR-V id) for anything
+// outside the family, which the callers treat as an unsupported instruction. CONFIDENCE: HIGH.
 uint32_t emit_f16_unary(SpirvCompute& b, uint32_t opcode, uint32_t x) {
-    const uint32_t turns = b.uconst(fbits(6.28318530717958647692f));
+    const auto turns = [&] { return b.uconst(fbits(6.28318530717958647692f)); };
     switch (opcode) {
         case 0x54: return b.frcp(x);                        // v_rcp_f16
         case 0x55: return b.fext1(Glsl_Sqrt, x);            // v_sqrt_f16
@@ -5271,8 +5272,9 @@ uint32_t emit_f16_unary(SpirvCompute& b, uint32_t opcode, uint32_t x) {
         case 0x5D: return b.fext1(Glsl_Trunc, x);           // v_trunc_f16
         case 0x5E: return b.fext1(Glsl_RoundEven, x);       // v_rndne_f16
         case 0x5F: return b.fext1(Glsl_Fract, x);           // v_fract_f16
-        case 0x60: return b.fext1(Glsl_Sin, b.fbin(Op_FMul, x, turns));    // v_sin_f16
-        default:   return b.fext1(Glsl_Cos, b.fbin(Op_FMul, x, turns));    // 0x61 v_cos_f16
+        case 0x60: return b.fext1(Glsl_Sin, b.fbin(Op_FMul, x, turns()));  // v_sin_f16
+        case 0x61: return b.fext1(Glsl_Cos, b.fbin(Op_FMul, x, turns()));  // v_cos_f16
+        default:   return 0;                                // outside the family — fail visibly
     }
 }
 
@@ -7144,9 +7146,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // whole VOP1 f16 unary family (see emit_f16_unary), matching the plain e32 lowering
             // below; the decoder gates the operand shape (WORD dst + UNUSED_PRESERVE, WORD/DWORD
             // source, no sext/neg/abs/clamp/omod).
-            if (((in.opcode >= 0x54 && in.opcode <= 0x58) ||
-                 (in.opcode >= 0x5B && in.opcode <= 0x61)) &&
-                in.sdwa_dst_sel != 6) {
+            if (vop1_is_f16_unary(in.opcode) && in.sdwa_dst_sel != 6) {
                 uint32_t raw = a;   // inline constants: f16-width encoding, not the f32 pattern
                 if (in.src[0].kind == OperandKind::InlineFloat)
                     raw = b.uconst(inline_float_f16_bits(in.src[0].value)
@@ -7155,6 +7155,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     raw = b.uconst(static_cast<uint32_t>(in.src[0].value));
                 uint32_t x = b.unpack_half(raw, in.sdwa_src0_sel == 5 ? 1 : 0);
                 uint32_t result = emit_f16_unary(b, in.opcode, x);
+                if (!result) { ok = false; return true; }
                 uint32_t r16 = b.pack_half_lo(result);
                 d = in.sdwa_dst_sel == 5
                     ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
@@ -7184,8 +7185,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Every live encoding this title uses is plain `_e32` (`7e1ea910`, `7e08a504`), so
             // rejecting the SDWA forms costs nothing and is strictly no worse than the whole-opcode
             // reject they got before. (Raised in review of PR #2067.)
-            if (((in.opcode >= 0x54 && in.opcode <= 0x58) ||
-                 (in.opcode >= 0x5B && in.opcode <= 0x61)) &&
+            if (vop1_is_f16_unary(in.opcode) &&
                 !in.has_sdwa && in.sdwa_dst_sel == 6 && !in.clamp && !in.omod) {
                 uint32_t raw = a;   // inline constants: f16-width encoding, not the f32 pattern
                 if (in.src[0].kind == OperandKind::InlineFloat)
@@ -7196,6 +7196,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // carry them are rejected by the `!has_sdwa` gate above.
                 const uint32_t x = b.unpack_half(raw, 0);
                 const uint32_t result = emit_f16_unary(b, in.opcode, x);
+                if (!result) { ok = false; return true; }
                 const uint32_t r16 = b.pack_half_lo(result);
                 d = b.ibin(Op_BitwiseOr,
                            b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
@@ -14561,7 +14562,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (getenv("PROSPER_DBG")) {
                     fprintf(stderr, "[recompile-reject] pc=%u words=%08x,%08x fmt=%d op=0x%x "
                                     "dst=%d(kind%d) src=%d(k%d),%d(k%d),%d(k%d) dmask=0x%x "
-                                    "dim=%u glc=%d len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u\n",
+                                    "dim=%u glc=%d len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u "
+                                    "sext=%d/%d\n",
                         in.pc, in.words[0], in.words[1], (int)in.fmt, in.opcode,
                         in.dst.value, (int)in.dst.kind,
                         in.src[0].value, (int)in.src[0].kind,
@@ -14569,7 +14571,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         in.src[2].value, (int)in.src[2].kind,
                         in.mimg_dmask, in.mimg_dim, (int)in.mimg_glc, in.len_dwords, (int)in.has_modifier,
                         (int)in.has_dpp, in.sdwa_dst_sel, in.sdwa_dst_unused,
-                        in.sdwa_src0_sel, in.sdwa_src1_sel);
+                        in.sdwa_src0_sel, in.sdwa_src1_sel,
+                        // The four selects alone cannot distinguish the zero- from the sign-extending
+                        // form of one encoding, and they are different operations (#2013).
+                        (int)in.sdwa_src0_sext, (int)in.sdwa_src1_sext);
                     // The primary line historically printed only the fixed MIMG pair. That hid the
                     // address VGPRs which distinguished Asterix's rejected NSA form from the accepted
                     // consecutive-vaddr form. Keep a separate MIMG-only line so an address-shape

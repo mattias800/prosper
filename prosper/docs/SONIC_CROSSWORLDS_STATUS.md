@@ -357,10 +357,15 @@ which is why it peels rather than showing its whole requirement at once.
 - `s_flbit_i32_b64 vcc_lo, s[14:15]` — **the opcode is implemented**; what fails is that the emitter
   has no value for `s14`/`s15` at that pc, so the lowering takes its `ok = false` arm. This is a
   scalar-value-tracking gap, not a missing instruction, and it is easy to mis-file as one.
-- The three `[mimg-unresolved]` / `[mubuf-unresolved]` descriptor failures above — **all now fixed.**
 - One "program" (address is run-local) that is **12,916 dwords of zero**. It is not a shader; treat a
   reject at `pc=0 words=00000000,00000000` as a bad `code_addr`, not as an opcode gap.
-- **A fourth `[mimg-unresolved]`, newly exposed.** `pc=686 srsrc=s40 srt_tag=0x60 key_res=null
+
+**Closed, and listed here only so the historical record below is readable:** the three
+`[mimg-unresolved]` / `[mubuf-unresolved]` descriptor failures, and the fourth `[mimg-unresolved]`
+described next. Every arm on current master reports **0** of each; the paragraph that follows is the
+record of how the fourth was found and attributed, not an open item.
+
+- **A fourth `[mimg-unresolved]`, exposed by the opcode work and since fixed.** `pc=686 srsrc=s40 srt_tag=0x60 key_res=null
   pc_res=null (47 res)` appears **only** on the arm taken after every tier above landed: `pc=686`
   occurs 0 times in the base, first-tier and second-tier census arms and 20 times in the last one.
   It is in a **compute** program that previously stopped at an arithmetic op long before reaching
@@ -435,6 +440,13 @@ positive control; a reference decode of the PNGs confirms 1,373 distinct colours
 non-black pixels in the logo frame and exactly **one** colour, `RGB(1,0,1)`, over all 8,294,400
 pixels of the uniform one.
 
+**The lever and the null were then re-measured in ONE run**, because a skip count taken in
+`boot_trace` and a pixel hash taken in `screenshot` are two frontends, and "the change did not reach
+the frontend that draws" is exactly the alternative a cross-frontend comparison cannot exclude. A
+single `screenshot` arm with `PROSPER_DBG=1` reports **4** skipped compute programs *and* the same
+`666f7b3f` → `0d70a70a` → `8bf1b518` at every sample. Same process, same frame loop: the four
+restored programs are dispatching in the run whose pixels did not change.
+
 ## Unimplemented-call census (default launch, current master + #2012)
 
 **21** NIDs reach the dispatcher's `-> returning 0` path, resolved against the PS5 3.20 firmware
@@ -460,19 +472,30 @@ One line per falsified hypothesis, with the evidence that killed it.
   **all seven real programs stop on one instruction each, and not one of them is a branch** —
   `v_mov_b32_sdwa … sext(…)` ×3, `v_rndne_f16_sdwa`, `v_ceil_f16_sdwa`, `image_atomic_add
   dim:2D_ARRAY`, and an `s_flbit_i32_b64` whose *opcode is implemented* and whose scalar source is
-  untracked. **The reading came from counting the wrong diagnostic.** A program that fails routes
-  through *two* emitters: `detect_forward_ifs` rejects first and prints control-flow-shaped
-  `[compute-struct-reject]` lines, then the CFG dispatcher — which **accepts** those very shapes —
-  runs and prints `[cfg-recompile-reject] pc=… fmt=… op=…`. Only the second names what actually
-  stopped the program; the first is a *superseded* path's complaint, and it is both louder (26 vs 21)
-  and the one that looks like a cause. Read `[compute-struct-reject]` as "the narrow structurizer
-  declined, falling back", never as a reject. (This lane, 2026-08-06, on `cdb40942`.)
+  untracked. **The proof is the A/B, not the reading of a diagnostic**: implementing two SDWA
+  families and nothing else restored **four of the seven**, and the branch shapes those programs
+  contain are untouched by that change.
+  **Why the wrong reading was available.** `[compute-struct-reject]` is **one tag over two roles** —
+  14 emission sites inside `detect_forward_ifs` and 7 inside the structured emitter — so counting the
+  lines merges a routing decision with a terminal failure. On these programs the
+  `detect_forward_ifs` lines are the routing decision: the recompiler then runs the CFG dispatcher,
+  which accepted those same shapes and carried on to the arithmetic op that `[cfg-recompile-reject]`
+  names. And `structured emission stopped next-pc=N next-if=…` — 12 of the 26 lines — is not a
+  control-flow complaint at all: `next-pc` is the **blocking instruction**, matching the
+  `[cfg-recompile-reject]` pc exactly, and `next-if=4294967295` says in the diagnostic's own fields
+  that no `if` is pending. **The caveat matters**: a `detect_forward_ifs` decline is only a routing
+  decision when the dispatcher is actually selected (`cfg_dispatch_safe` and either
+  `exact_compute_wave_cfg` or `cfg_branches > 2`); otherwise `cf_rejected` clears the loop list and
+  the branch genuinely does block. So ask **which emitter ran last**, and attribute a reject to a
+  *program* before attributing it to a *cause*. (This lane, 2026-08-06, on `cdb40942`.)
 - **Restoring HALF the skipped compute programs does not move the composite.** 8 → 5 → **4** skipped
   programs across three identical arms on one binary lineage, with 0 dropped graphics pipelines and 0
   unresolved descriptors throughout, and the composite is byte-identical at every step:
   `666f7b3f` → `0d70a70a` → `8bf1b518`, the uniform frame exactly one colour `RGB(1,0,1)` over all
-  8,294,400 pixels by reference decode. Since the lever demonstrably changes the skip count in the
-  same session, this is a real null and not an undelivered change. **Read the scope precisely**: what
+  8,294,400 pixels by reference decode. **The lever and the null are measured in the same run** — a
+  `screenshot` arm with `PROSPER_DBG=1` reports 4 skipped programs *and* the unchanged hashes — so
+  this is a real null rather than a change that never reached the frontend being photographed.
+  **Read the scope precisely**: what
   is falsified is *"restoring these four moves the composite"*. Four programs are still skipped —
   `image_atomic_add dim:2D_ARRAY`, `v_mov_b32_dpp row_xmask`, the untracked-scalar `s_flbit`, and the
   all-zero non-program — so "a skipped compute dispatch is the cause" is **not** ruled out.
@@ -662,8 +685,9 @@ first *Ruled out* row. Everything below is what remains.
    already gone without effect, so this is the cheapest remaining way to finish the argument:
    - `s_flbit_i32_b64 vcc_lo, s[14:15]` — a **value-tracking** gap, not a missing opcode. The
      lowering exists and takes its `ok = false` arm because `s14`/`s15` are unknown at that pc.
-   - `v_add_nc_u32_sdwa`-style SEXT is done; what is left in that program's lineage is
-     `v_mov_b32_dpp v10, v4 row_xmask:4 bound_ctrl:1` — a cross-lane DPP row control.
+   - `v_mov_b32_dpp v10, v4 row_xmask:4 bound_ctrl:1` — a cross-lane DPP row control, in the
+     **2,348-dword** program (the one that stopped on `v_ceil_f16_sdwa`), not in either of the
+     programs this lane restored.
    - `image_atomic_add … dim:SQ_RSRC_IMG_2D_ARRAY` — the deferred arrayed-image work in
      [`RECOMPILER_REMAINING.md`](RECOMPILER_REMAINING.md), shared with `image_sample_lz d16`.
    - the 12,916-dword all-zero `code_addr`, which is not a program and should not be counted as one.
