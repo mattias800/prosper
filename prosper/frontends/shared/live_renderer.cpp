@@ -1281,6 +1281,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // a whole-surface GPU->CPU readback, `copy` is the GPU-side destination copy that
                 // already exists and is presumably cheap.
                 double resolve_stall_ms = 0, resolve_read_ms = 0, resolve_copy_ms = 0;
+                // The GPU copy's OWN submit_and_wait (#1382 requires it). Separate from `stall`
+                // because removing the eager readback relocated cost into it rather than
+                // eliminating it -- the copy's flush now drains a queue the eager flush used to.
+                // Leaving it unmeasured would put an unmeasured region back inside `loop`, which is
+                // the exact defect this partition exists to remove.
+                double resolve_copy_stall_ms = 0;
                 uint64_t resolve_n = 0, resolve_read_n = 0, resolve_bytes = 0;
                 uint64_t pass_groups_seen = 0;
                 uint64_t pass_groups = 0;
@@ -5538,9 +5544,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 {
                                     const prosper::test::RenderVkCtx& copy_ctx =
                                         prosper::test::render_vk_ctx();
+                                    const auto cs0 = timing_enabled
+                                        ? RenderClock::now() : RenderClock::time_point{};
                                     if (copy_ctx.ok && backend_submission.pending())
                                         backend_submission.submit_and_wait(copy_ctx.dev,
                                                                            copy_ctx.queue, false);
+                                    if (timing_enabled)
+                                        pending_timing.resolve_copy_stall_ms +=
+                                            std::chrono::duration<double, std::milli>(
+                                                RenderClock::now() - cs0).count();
                                 }
                                 std::string copy_error;
                                 const auto rc0 = timing_enabled
@@ -6983,6 +6995,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     double pass_head_ms = 0, pass_tail_ms = 0;
                     double pass_loop_ms = 0;
                     double resolve_stall_ms = 0, resolve_read_ms = 0, resolve_copy_ms = 0;
+                    double resolve_copy_stall_ms = 0;
                     uint64_t resolve_n = 0, resolve_read_n = 0, resolve_bytes = 0;
                     uint64_t pass_groups_seen = 0;
                     uint64_t pass_groups = 0;
@@ -7095,6 +7108,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.pass_head_ms += pending_timing.pass_head_ms;
                     timing.pass_loop_ms += pending_timing.pass_loop_ms;
                     timing.resolve_stall_ms += pending_timing.resolve_stall_ms;
+                    timing.resolve_copy_stall_ms += pending_timing.resolve_copy_stall_ms;
                     timing.resolve_read_ms += pending_timing.resolve_read_ms;
                     timing.resolve_copy_ms += pending_timing.resolve_copy_ms;
                     timing.resolve_n += pending_timing.resolve_n;
@@ -7174,10 +7188,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // only to materialise a CPU pixel mirror, `copy` is the GPU-side destination
                     // copy that has to happen either way.
                     fprintf(stderr,
-                            "[render-timing] resolve %.1f/submit [stall=%.2f read=%.2f copy=%.2f] "
+                            "[render-timing] resolve %.1f/submit [stall=%.2f read=%.2f "
+                            "copy_stall=%.2f copy=%.2f] "
                             "reads=%.1f %.1f MiB/submit\n",
                             (double)totals.resolve_n / nsub, totals.resolve_stall_ms / nsub,
-                            totals.resolve_read_ms / nsub, totals.resolve_copy_ms / nsub,
+                            totals.resolve_read_ms / nsub, totals.resolve_copy_stall_ms / nsub,
+                            totals.resolve_copy_ms / nsub,
                             (double)totals.resolve_read_n / nsub,
                             totals.resolve_bytes / (nsub * 1024.0 * 1024.0));
                     const double backend_detail_ms = totals.backend_target_ms +
@@ -7536,10 +7552,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     -pc_other / wn);
                     }
                     fprintf(stderr,
-                            "[render-window] resolve %.1f/submit [stall=%.2f read=%.2f copy=%.2f] "
+                            "[render-window] resolve %.1f/submit [stall=%.2f read=%.2f "
+                            "copy_stall=%.2f copy=%.2f] "
                             "reads=%.1f %.1f MiB/submit\n",
                             (double)window.resolve_n / wn, window.resolve_stall_ms / wn,
-                            window.resolve_read_ms / wn, window.resolve_copy_ms / wn,
+                            window.resolve_read_ms / wn, window.resolve_copy_stall_ms / wn,
+                            window.resolve_copy_ms / wn,
                             (double)window.resolve_read_n / wn,
                             window.resolve_bytes / (wn * 1024.0 * 1024.0));
                     // texture_ms attributed by OUTCOME class (#2262). The classes are decided in
