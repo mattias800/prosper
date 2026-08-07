@@ -133,6 +133,16 @@ if(Python3_Interpreter_FOUND)
   # report a clean suite forever, which is the one way this guard can fail silently.
   add_test(NAME vkval_scan_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/vkval/test_vk_validation_scan.py")
+  # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
+  # runtime, the arm becomes invisible -- and the test does not fail, it goes vacuous and keeps
+  # printing [ok], which is why #2214 surfaced only as one unrelated-looking Vulkan binding error on
+  # a single CI job. The scanner carries its own self-tests because its failure mode is silence: a
+  # pattern that stops matching reports a clean tree forever. Three of those cases cover the wrapper
+  # call forms (set_env/unset_env), which the first revision missed -- it passed a tree that still
+  # contained the defect.
+  add_test(NAME cached_env_arming_logic
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/env/check_cached_env.py"
+                   "${CMAKE_SOURCE_DIR}")
   # Most cases here assert on what must NOT appear (negative time, failed dispatches summed in, an
   # image share computed against a filtered denominator, a per-binding mean over aliased folds),
   # because each is a table this tool has already produced once. Note what this gate does NOT do: it

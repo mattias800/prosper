@@ -1,6 +1,7 @@
 // live_renderer.cpp — see live_renderer.hpp. Extracted from boot_trace's PROSPER_RENDER lambda
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
 #include "live_renderer.hpp"
+#include "hle/dispatch.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "rtt_authority.hpp"
 #include "rtt_injection.hpp"
 #include "rtt_scale.hpp"
@@ -656,7 +657,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // Keep the legacy global disable authoritative for every frontend, including callers with their
     // own explicit opt-in such as PROSPER_APP_DUMP_FRAMES.
     const bool dump_bmps = frame_dump_request_allowed(
-        dump_bmps_requested, getenv("PROSPER_NO_FRAME_DUMPS"));
+        dump_bmps_requested, PROSPER_ENV_VALUE("PROSPER_NO_FRAME_DUMPS"));
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
     // dispatch before their first draw -- without this the compute device would be created first and
@@ -671,21 +672,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // ordinal, and a per-site window would latch them onto different callbacks. Same single-present-
     // thread contract as `g_rtt` and the `dp_submit`/`warned` statics below.
     static prosper::frontend::DiagnosticWindow g_pass_log_window{
-        prosper::frontend::parse_diagnostic_window(getenv("PROSPER_PASS_LOG"))};
+        prosper::frontend::parse_diagnostic_window(PROSPER_ENV_VALUE("PROSPER_PASS_LOG"))};
     static prosper::frontend::DiagnosticWindow g_persist_window{
-        prosper::frontend::parse_diagnostic_window(getenv("PROSPER_DUMP_PERSISTENT"))};
+        prosper::frontend::parse_diagnostic_window(PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT"))};
     // Match boot_trace's progression-diagnostic contract: callers may register the graphics
     // renderer while deliberately leaving compute unregistered. This keeps semantic dispatches
     // visible without letting screenshot/prosper-app registration silently undo the A/B.
-    if (!getenv("PROSPER_NO_COMPUTE")) register_live_compute();
-    const char* ds_invalidate = getenv("PROSPER_DS_GUEST_WRITE_INVALIDATE");
+    if (!PROSPER_ENV_ON("PROSPER_NO_COMPUTE")) register_live_compute();
+    const char* ds_invalidate = PROSPER_ENV_VALUE("PROSPER_DS_GUEST_WRITE_INVALIDATE");
     const bool invalidate_ds = !ds_invalidate || strcmp(ds_invalidate, "0");
     prosper::gpu::set_guest_gpu_write_observer(
         [](uint64_t addr, uint64_t size) { queue_guest_gpu_write(addr, size); });
     // Resource tables are built before the submit reaches this callback. Publish the renderer's
     // default mode now so unmapped render-target descriptors remain available for RTT injection.
     // Outside a registered renderer, resource decoding retains its strict unknown-format policy.
-    if (!getenv("PROSPER_RTT_SINGLE_TARGET") && !getenv("PROSPER_RTT_PERTARGET")) {
+    // PROSPER_RTT_PERTARGET is read LIVE here even though this runs once: the very next lines SET
+    // it, so it is a variable this process writes to itself. Caching it would be correct today
+    // (each macro use site has its own static, and :1067 reads after this one) but it is correct by
+    // ordering rather than by construction, and it is the only thing that would put this name in
+    // the cached-vs-armed intersection below. A gate with one standing exception is a gate people
+    // stop reading. This site is init-time, so a live read costs nothing.
+    if (!PROSPER_ENV_ON("PROSPER_RTT_SINGLE_TARGET") && !getenv("PROSPER_RTT_PERTARGET")) {
 #ifdef _WIN32
         _putenv_s("PROSPER_RTT_PERTARGET", "1");
 #else
@@ -862,7 +869,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // them; clear it anyway so a second registration cannot inherit counts for a cache that no
     // longer holds those entries.
     pinned_imports.clear();
-    const bool direct_bind = !getenv("PROSPER_NO_DIRECT_RTT_BIND");
+    const bool direct_bind = !PROSPER_ENV_VALUE("PROSPER_NO_DIRECT_RTT_BIND");
     prosper::gpu::set_live_target_image_importer(
         [invalidate_ds, direct_bind](uint64_t addr,
                                      const prosper::gpu::LiveTargetImageRequest& request,
@@ -1064,7 +1071,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // A real command stream renders each CB_COLOR0_BASE into its own surface. Keep the old flattened
     // compositor only as a diagnostic fallback; it cannot preserve post chains or target extents.
     static const bool pertarget = getenv("PROSPER_RTT_PERTARGET") != nullptr ||
-                                  getenv("PROSPER_RTT_SINGLE_TARGET") == nullptr;
+                                  PROSPER_ENV_VALUE("PROSPER_RTT_SINGLE_TARGET") == nullptr;
     static const bool rtt_on = getenv("PROSPER_RTT") != nullptr || pertarget;
     static const bool timeline_capture_requested =
         getenv("PROSPER_GPU_TIMELINE_CAPTURE") != nullptr;
@@ -1077,22 +1084,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // diagnostics require authoritative CPU pixels at every pass, so they retain the established
     // readback path. The explicit opt-out keeps a direct A/B and a recovery switch for driver issues.
     static const bool live_gpu_targets = pertarget &&
-        !getenv("PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS") && !getenv("PROSPER_GPU_CAPTURE") &&
-        timeline_capture_permits_live_targets && !getenv("PROSPER_GPU_REPLAY_EXPORT_RTT") &&
-        !getenv("PROSPER_GPU_REPLAY_RTT_SEEDS") && !getenv("PROSPER_DUMP_SAMPLED_RTT") &&
-        !getenv("PROSPER_DUMP_RTGROUPS") && !getenv("PROSPER_DUMP_RTGROUPS_RGBA") &&
-        !getenv("PROSPER_DUMP_DRAWSTEPS") &&
-        !getenv("PROSPER_RESOURCE_HASH_DIM") && !getenv("PROSPER_TARGET_STEP_HASH_DIM") &&
-        !getenv("PROSPER_RTTLOG");
+        !PROSPER_ENV_VALUE("PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS") && !getenv("PROSPER_GPU_CAPTURE") &&
+        timeline_capture_permits_live_targets && !PROSPER_ENV_VALUE("PROSPER_GPU_REPLAY_EXPORT_RTT") &&
+        !getenv("PROSPER_GPU_REPLAY_RTT_SEEDS") && !PROSPER_ENV_VALUE("PROSPER_DUMP_SAMPLED_RTT") &&
+        !PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS") && !getenv("PROSPER_DUMP_RTGROUPS_RGBA") &&
+        !PROSPER_ENV_VALUE("PROSPER_DUMP_DRAWSTEPS") &&
+        !PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM") && !PROSPER_ENV_VALUE("PROSPER_TARGET_STEP_HASH_DIM") &&
+        !PROSPER_ENV_VALUE("PROSPER_RTTLOG");
     if (timeline_capture_phase_gated)
         fprintf(stderr, "[render] phase-gated timeline capture retains live targets; "
                         "capture readback is on demand\n");
     static const bool defer_intermediate_scanout = live_gpu_targets &&
-        !getenv("PROSPER_NO_INTERMEDIATE_SCANOUT_DEFER");
+        !PROSPER_ENV_VALUE("PROSPER_NO_INTERMEDIATE_SCANOUT_DEFER");
     // Ordered passes share one queue and keep their attachments GPU-resident, so submit the callback's
     // command buffers in one batch by default. Keep a direct recovery/A-B switch for driver issues.
     static const bool batch_backend_submits = live_gpu_targets &&
-        !getenv("PROSPER_NO_BACKEND_BATCH_SUBMITS");
+        !PROSPER_ENV_VALUE("PROSPER_NO_BACKEND_BATCH_SUBMITS");
     if (live_gpu_targets)
         fprintf(stderr, "[render] persistent GPU color targets enabled (experimental)\n");
     if (batch_backend_submits)
@@ -1108,7 +1115,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             const prosper::gpu::LiveRenderPhase phase = prosper::gpu::live_render_phase();
             static const size_t write_watch_promotion_budget_bytes = [] {
-                const char* value = getenv("PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB");
+                const char* value = PROSPER_ENV_VALUE("PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB");
                 const uint64_t mib = value ? strtoull(value, nullptr, 10) : 8ull;
                 return static_cast<size_t>(
                     std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull)) *
@@ -1144,7 +1151,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // a variable number of submits. The guest and command decoder keep running at native speed;
             // only the synchronous Vulkan work is skipped. The clock starts at the first GPU submit.
             static const int64_t g_render_delay_ms = getenv("PROSPER_RENDER_DELAY_MS")
-                ? std::max<int64_t>(0, atoll(getenv("PROSPER_RENDER_DELAY_MS"))) : 0;
+                ? std::max<int64_t>(0, atoll(PROSPER_ENV_VALUE("PROSPER_RENDER_DELAY_MS"))) : 0;
             static const auto g_render_delay_start = std::chrono::steady_clock::now();
             static std::atomic<bool> g_render_delay_announced{false};
             // PROSPER_RENDER_LAST=<N>: stop rendering after submit N (default: unbounded). Bounds the render
@@ -1159,12 +1166,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             if (g_this_submit > g_render_last) return {};
             static const int g_rttlog_min_submit = getenv("PROSPER_RTTLOG_MIN_SUBMIT")
-                ? std::max(0, atoi(getenv("PROSPER_RTTLOG_MIN_SUBMIT"))) : 0;
+                ? std::max(0, atoi(PROSPER_ENV_VALUE("PROSPER_RTTLOG_MIN_SUBMIT"))) : 0;
             static const int g_rttlog_max_submit = getenv("PROSPER_RTTLOG_MAX_SUBMIT")
-                ? std::max(0, atoi(getenv("PROSPER_RTTLOG_MAX_SUBMIT"))) : INT_MAX;
+                ? std::max(0, atoi(PROSPER_ENV_VALUE("PROSPER_RTTLOG_MAX_SUBMIT"))) : INT_MAX;
             const bool rtt_log_in_range =
                 g_this_submit >= g_rttlog_min_submit && g_this_submit <= g_rttlog_max_submit;
-            const bool rtt_log = getenv("PROSPER_RTTLOG") && rtt_log_in_range;
+            const bool rtt_log = PROSPER_ENV_VALUE("PROSPER_RTTLOG") && rtt_log_in_range;
             using RenderClock = std::chrono::steady_clock;
             struct RenderTiming {
                 uint64_t callbacks = 0;
@@ -1225,14 +1232,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 prosper::frontend::performance_timing_mode(timing_log_enabled,
                                                             perf_capture_timing);
             const bool timing_enabled = timing_mode.measure;
+            // Read ONCE per span. The guard below sits inside the per-RESOURCE loop, where a
+            // getenv costs a locked environment scan for every resource of every draw -- it was
+            // the single hottest line in #2215's profile (26 of 349 primary-thread samples).
+            //
+            // Deliberately a LIVE read rather than PROSPER_ENV_VALUE: tests arm this variable at
+            // runtime, so it has to stay observable. Hoisting removes the per-resource cost
+            // WITHOUT changing that -- which is why it is the better fix here than caching.
+            const char* const render_timing_env = getenv("PROSPER_RENDER_TIMING");
+            const bool render_timing_detail =
+                render_timing_env && strcmp(render_timing_env, "detail") == 0;
             // render_runner.h cannot depend on the app capture singleton: it is also compiled into
             // standalone Vulkan tests. This thread-local scope activates its backend clocks only
             // inside this production callback and restores the prior state on every return path.
             prosper::frontend::ScopedInteractivePerformanceTiming scoped_perf_timing(
                 perf_capture_timing);
-            const bool lightweight_rtt_timing = timing_mode.log && getenv("PROSPER_RTT_TIMING");
+            const bool lightweight_rtt_timing = timing_mode.log && PROSPER_ENV_VALUE("PROSPER_RTT_TIMING");
             static const uint64_t rtt_timing_min_draws = getenv("PROSPER_RTT_TIMING_MIN_DRAWS")
-                ? strtoull(getenv("PROSPER_RTT_TIMING_MIN_DRAWS"), nullptr, 0) : 0;
+                ? strtoull(PROSPER_ENV_VALUE("PROSPER_RTT_TIMING_MIN_DRAWS"), nullptr, 0) : 0;
             if (timing_enabled && phase.first_span) {
                 pending_timing = {};
                 pending_rtt_timing.clear();
@@ -1314,9 +1331,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // PROSPER_SUBMITLOG: print the GPU-submit index periodically (at native speed, before the slow
             // render) so it can be correlated with guest-side log lines (e.g. a MsgDialog wait) to find the
             // exact submit at which a scene appears — for aiming PROSPER_RENDER_FIRST at it.
-            if (phase.first_span && getenv("PROSPER_SUBMITLOG") && (g_this_submit % 1000 == 0))
+            if (phase.first_span && PROSPER_ENV_ON("PROSPER_SUBMITLOG") && (g_this_submit % 1000 == 0))
                 fprintf(stderr, "[submit] index=%d (%zu draw items)\n", g_this_submit, items.size());
-            if (const char* sd = getenv("PROSPER_SUBMITLOG_DIM")) {
+            if (const char* sd = PROSPER_ENV_VALUE("PROSPER_SUBMITLOG_DIM")) {
                 uint32_t sw = 0, sh = 0;
                 if (sscanf(sd, "%ux%u", &sw, &sh) == 2)
                     for (const auto& it : items)
@@ -1327,13 +1344,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
             }
             bool force_target = false;
-            if (const char* td = getenv("PROSPER_RENDER_TARGET_DIM")) {
+            if (const char* td = PROSPER_ENV_VALUE("PROSPER_RENDER_TARGET_DIM")) {
                 uint32_t tw = 0, th = 0;
                 if (sscanf(td, "%ux%u", &tw, &th) == 2)
                     for (const auto& it : items)
                         if (it.color0_width == tw && it.color0_height == th) { force_target = true; break; }
             }
-            if (const char* rd = getenv("PROSPER_RENDER_RESOURCE_DIM")) {
+            if (const char* rd = PROSPER_ENV_VALUE("PROSPER_RENDER_RESOURCE_DIM")) {
                 uint32_t rw = 0, rh = 0;
                 if (sscanf(rd, "%ux%u", &rw, &rh) == 2)
                     for (const auto& it : items) {
@@ -1363,8 +1380,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             if ((g_this_submit < g_render_first || before_delay) && !g_force_this_submit) return {};
             // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
-            if (getenv("PROSPER_SHADER_DUMP") && !items.empty()) {
-                std::string d = getenv("PROSPER_SHADER_DUMP");
+            if (PROSPER_ENV_ON("PROSPER_SHADER_DUMP") && !items.empty()) {
+                std::string d = PROSPER_ENV_VALUE("PROSPER_SHADER_DUMP");
                 const auto& dump_vs = items[0].vs_words();
                 const auto& dump_fs = items[0].fs_words();
                 if (FILE* f = fopen((d + "/frame_vs.spv").c_str(), "wb")) { fwrite(dump_vs.data(), 4, dump_vs.size(), f); fclose(f); }
@@ -1519,8 +1536,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // with itself across builds while investigating exactly the kind of question it exists
             // for. Keep its output identical to pre-#1691 rather than make it cheaper.
             static const bool submit_decode_scope_disabled =
-                getenv("PROSPER_NO_SUBMIT_TEXTURE_DECODE_SCOPE") != nullptr ||
-                getenv("PROSPER_RESOURCE_HASH_DIM") != nullptr;
+                PROSPER_ENV_VALUE("PROSPER_NO_SUBMIT_TEXTURE_DECODE_SCOPE") != nullptr ||
+                PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM") != nullptr;
             static thread_local std::unordered_map<TextureDecodeKey, DecodedTexture,
                                                    TextureDecodeKeyHash> decoded_textures;
             static thread_local uint64_t decode_span_ordinal = 0;
@@ -1538,7 +1555,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 g_this_submit != decode_scope_submit;
             decode_scope_submit = g_this_submit;
             const bool use_direct_buffer_views =
-                getenv("PROSPER_NO_FRONTEND_BUFFER_VIEW") == nullptr;
+                PROSPER_ENV_VALUE("PROSPER_NO_FRONTEND_BUFFER_VIEW") == nullptr;
             static std::unordered_map<TextureDecodeKey, PersistentDecodedTexture, TextureDecodeKeyHash>
                 persistent_decoded_textures;
             static size_t persistent_decoded_texture_bytes = 0;
@@ -1558,7 +1575,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             static const size_t persistent_decode_limit = [] {
                 const uint64_t physical_bytes = host_physical_memory_bytes();
                 const size_t limit = texture_decode_cache_limit_bytes(
-                    getenv("PROSPER_TEXTURE_DECODE_CACHE_MB"), physical_bytes);
+                    PROSPER_ENV_VALUE("PROSPER_TEXTURE_DECODE_CACHE_MB"), physical_bytes);
                 fprintf(stderr,
                         "[render] decoded texture cache budget = %.1f MiB "
                         "(host physical %.1f GiB)\n",
@@ -1567,15 +1584,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 return limit;
             }();
             uint32_t resource_hash_w = 0, resource_hash_h = 0;
-            if (const char* dim = getenv("PROSPER_RESOURCE_HASH_DIM"))
+            if (const char* dim = PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM"))
                 if (sscanf(dim, "%ux%u", &resource_hash_w, &resource_hash_h) != 2)
                     resource_hash_w = resource_hash_h = 0;
             uint32_t target_step_w = 0, target_step_h = 0;
-            if (const char* dim = getenv("PROSPER_TARGET_STEP_HASH_DIM"))
+            if (const char* dim = PROSPER_ENV_VALUE("PROSPER_TARGET_STEP_HASH_DIM"))
                 if (sscanf(dim, "%ux%u", &target_step_w, &target_step_h) != 2)
                     target_step_w = target_step_h = 0;
-            const size_t target_step_min_draws = getenv("PROSPER_TARGET_STEP_HASH_MIN_DRAWS")
-                ? std::max<long>(2, atol(getenv("PROSPER_TARGET_STEP_HASH_MIN_DRAWS"))) : 2;
+            const size_t target_step_min_draws = PROSPER_ENV_VALUE("PROSPER_TARGET_STEP_HASH_MIN_DRAWS")
+                ? std::max<long>(2, atol(PROSPER_ENV_VALUE("PROSPER_TARGET_STEP_HASH_MIN_DRAWS"))) : 2;
             prosper::frontend::RttInjectionCache rtt_injection_cache;
             // Build one draw's set-tagged resources from its VS (set 0) + PS (set 1) tables — read the
             // bytes from 1:1-mapped guest memory, detile textures. (Each constant/vertex buffer + texture
@@ -1708,7 +1725,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // planes on the CPU separates a decode/staging defect (planes wrong) from a
                         // sampling/recognition defect (planes right, picture wrong), which is the
                         // only way to tell a chroma cast's two very different causes apart.
-                        if (const char* avp_dump_dir = getenv("PROSPER_AVPCHROMA_DUMP")) {
+                        if (const char* avp_dump_dir = PROSPER_ENV_VALUE("PROSPER_AVPCHROMA_DUMP")) {
                             if (r.cls == RC::Texture &&
                                 r.format == prosper::gpu::DataFormat::Unorm8 &&
                                 r.num_components >= 1 && r.num_components <= 2 &&
@@ -1722,7 +1739,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 // fade from black, so the first sighting is a useless all-dark
                                 // plane; sampling a series lands somewhere mid-shot without having
                                 // to guess a frame index. Capped so a long run cannot fill a disk.
-                                const char* every_env = getenv("PROSPER_AVPCHROMA_DUMP_EVERY");
+                                const char* every_env = PROSPER_ENV_VALUE("PROSPER_AVPCHROMA_DUMP_EVERY");
                                 const uint64_t every = every_env
                                     ? std::max<uint64_t>(1, strtoull(every_env, nullptr, 0)) : 0;
                                 uint64_t sighting = 0;
@@ -2052,7 +2069,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         } else {
                         auto live_rtt = rtt_on ? g_rtt.find(sampled_source_addr) : g_rtt.end();
                         static const uint32_t render_scale = [] {
-                            const char* e = std::getenv("PROSPER_RENDER_SCALE");
+                            const char* e = PROSPER_ENV_VALUE("PROSPER_RENDER_SCALE");
                             const long v = e ? std::strtol(e, nullptr, 10) : 1;
                             return v > 0 ? static_cast<uint32_t>(v) : 1u;
                         }();
@@ -2104,17 +2121,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             }
                         }
                         static const bool retain_cpu_rtt_snapshots =
-                            getenv("PROSPER_NO_RTT_SNAPSHOT_BORROW") == nullptr;
+                            PROSPER_ENV_VALUE("PROSPER_NO_RTT_SNAPSHOT_BORROW") == nullptr;
                         // Pixel-mutating/inspection diagnostics intentionally retain their owned
                         // scratch copy. Normal consumers retain exact immutable snapshots directly
                         // and share each scaled materialization within this submit callback.
                         static const bool cpu_rtt_copy_diagnostics =
-                            getenv("PROSPER_DUMP_SAMPLED_RTT") || getenv("PROSPER_DUMP_RAWTEX") ||
-                            getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESOURCE_HASH_DIM") ||
-                            getenv("PROSPER_PALETTELOG") || getenv("PROSPER_TESTTEX") ||
-                            getenv("PROSPER_TESTLUT") || getenv("PROSPER_TESTLUT32") ||
-                            getenv("PROSPER_DUMP_TEX") || getenv("PROSPER_DUMP_ATLAS") ||
-                            getenv("PROSPER_KILL_RING");
+                            PROSPER_ENV_VALUE("PROSPER_DUMP_SAMPLED_RTT") || PROSPER_ENV_VALUE("PROSPER_DUMP_RAWTEX") ||
+                            getenv("PROSPER_GFXLOG") || PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM") ||
+                            PROSPER_ENV_VALUE("PROSPER_PALETTELOG") || PROSPER_ENV_VALUE("PROSPER_TESTTEX") ||
+                            PROSPER_ENV_VALUE("PROSPER_TESTLUT") || PROSPER_ENV_VALUE("PROSPER_TESTLUT32") ||
+                            PROSPER_ENV_VALUE("PROSPER_DUMP_TEX") || PROSPER_ENV_VALUE("PROSPER_DUMP_ATLAS") ||
+                            PROSPER_ENV_VALUE("PROSPER_KILL_RING");
                         const bool uniform_cpu_diagnostic_path =
                             live_rtt != g_rtt.end() &&
                             prosper::frontend::live_rtt_uniform_uses_cpu_diagnostic_path(
@@ -2190,7 +2207,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         resource_has_ds_live = has_ds_live;
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
                         const bool is_volume = r.img_dim == 2u;
-                        const uint32_t persistent_pitch = getenv("PROSPER_PITCH")
+                        const uint32_t persistent_pitch = PROSPER_ENV_VALUE("PROSPER_PITCH")
                             ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0;
                         const uint32_t persistent_bc_block_bytes =
                             prosper::gpu::bc_block_bytes(r.format);
@@ -2262,7 +2279,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             persistent_bc_block_bytes != 0);
                         resource_persistent_candidate = persistent_sampled_texture;
                         const bool persistent_source_is_tiled =
-                            persistent_sampled_texture && !getenv("PROSPER_NODETILE") &&
+                            persistent_sampled_texture && !PROSPER_ENV_VALUE("PROSPER_NODETILE") &&
                             prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         // A sampled LINEAR (tile_mode 0) 2D surface (or the selected base slice of a
                         // 2D array) whose tight row is not 256-aligned
@@ -2298,7 +2315,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                    ? registered_linear_pitch
                                    : prosper::gpu::linear_sampled_row_pitch(
                                          linear_row_width, linear_row_element_bytes));
-                        if (const char* lp = getenv("PROSPER_LINPITCH"))
+                        if (const char* lp = PROSPER_ENV_VALUE("PROSPER_LINPITCH"))
                             linear_src_row =
                                 (size_t)strtoull(lp, nullptr, 0) * linear_row_element_bytes;
                         const bool linear_padded_read =
@@ -2376,7 +2393,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (persistent_unorm8_texture && r.num_components == 4 &&
                              !linear_padded_read &&
                              !prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
-                             (!getenv("PROSPER_DETILE") || atoi(getenv("PROSPER_DETILE")) == 0));
+                             (!PROSPER_ENV_VALUE("PROSPER_DETILE") || atoi(PROSPER_ENV_VALUE("PROSPER_DETILE")) == 0));
                         const size_t persistent_base_source_size = [&] {
                             if (!persistent_sampled_texture) return size_t{0};
                             if (persistent_bc_block_bytes) {
@@ -2474,7 +2491,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (r.img_dim == 1u && r.depth == 1u) ||
                             (r.img_dim == 2u && r.depth != 0u);
                         const bool compute_image_candidate =
-                            !getenv("PROSPER_NO_DIRECT_COMPUTE_IMAGE_BIND") &&
+                            !PROSPER_ENV_VALUE("PROSPER_NO_DIRECT_COMPUTE_IMAGE_BIND") &&
                             !has_live_rtt && !has_ds_live && r.cls == RC::Texture &&
                             compute_image_shape && !r.in_mip_tail &&
                             r.declared_mip_levels == 1u && !r.srgb &&
@@ -2506,7 +2523,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             persistent_texture_decode_cache_eligible(
                                 persistent_sampled_texture, resource_compute_image_hit,
                                 fr.is_storage_image,
-                                getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") != nullptr,
+                                PROSPER_ENV_VALUE("PROSPER_NO_TEXTURE_DECODE_CACHE") != nullptr,
                                 !r.compression_enabled || persistent_dcc_uncompressed ||
                                     persistent_dcc_fast_clear,
                                 persistent_decode_limit, persistent_source_size);
@@ -2521,14 +2538,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const uint64_t cross_span_source_size =
                             persistent_cache_eligible ? persistent_source_size : 0u;
                         static const bool cross_submit_watch_enabled =
-                            !getenv("PROSPER_NO_CROSS_SUBMIT_TEXTURE_WRITE_WATCH");
+                            !PROSPER_ENV_VALUE("PROSPER_NO_CROSS_SUBMIT_TEXTURE_WRITE_WATCH");
                         // Page-protection watches have a fixed setup/query cost and may need to
                         // resolve every alias of every covered page.  For small textures an exact
                         // byte comparison is both simpler and cheaper; reserve dirty tracking for
                         // sources large enough for it to amortize.  Keep the cutoff tunable for
                         // host/platform profiling without changing the cache's correctness policy.
                         static const size_t cross_submit_watch_min_bytes = [] {
-                            const char* value = getenv("PROSPER_TEXTURE_WRITE_WATCH_MIN_KB");
+                            const char* value = PROSPER_ENV_VALUE("PROSPER_TEXTURE_WRITE_WATCH_MIN_KB");
                             const uint64_t kib = value ? strtoull(value, nullptr, 10) : 1024ull;
                             return static_cast<size_t>(
                                 std::min<uint64_t>(kib, SIZE_MAX / 1024ull) * 1024ull);
@@ -2536,18 +2553,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const bool cross_submit_watch_eligible = cross_submit_watch_enabled &&
                             persistent_source_size >= cross_submit_watch_min_bytes;
                         static const size_t cross_submit_watch_defer_min_bytes = [] {
-                            const char* value = getenv("PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB");
+                            const char* value = PROSPER_ENV_VALUE("PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB");
                             const uint64_t kib = value ? strtoull(value, nullptr, 10) : 8192ull;
                             return static_cast<size_t>(
                                 std::min<uint64_t>(kib, SIZE_MAX / 1024ull) * 1024ull);
                         }();
                         static const uint32_t cross_submit_watch_promotion_validations = [] {
-                            const char* value = getenv("PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS");
+                            const char* value = PROSPER_ENV_VALUE("PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS");
                             const uint64_t hits = value ? strtoull(value, nullptr, 10) : 3ull;
                             return static_cast<uint32_t>(std::min<uint64_t>(hits, UINT32_MAX));
                         }();
                         static const bool audit_cross_submit_watch =
-                            getenv("PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH") != nullptr;
+                            PROSPER_ENV_VALUE("PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH") != nullptr;
                         prosper::host::GuestWriteWatch pending_source_watch;
                         // `narrow_decode_done` prevents the generic 32-bpp detiler from touching an already
                         // expanded narrow surface. `narrow_done` separately records the legacy coverage
@@ -2632,7 +2649,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             cached->second.pixels.data(), persistent_source_addr,
                                             persistent_source_size, validated_bytes) &&
                                             validated_bytes == cached->second.source_prefix_size;
-                                    } else if (!getenv("PROSPER_TEXTURE_VALIDATION_SCRATCH_COPY") &&
+                                    } else if (!PROSPER_ENV_VALUE("PROSPER_TEXTURE_VALIDATION_SCRATCH_COPY") &&
                                                cached->second.source_prefix.size() ==
                                                    persistent_source_size) {
                                         // The cached prefix owns the complete encoded texture. Compare
@@ -2667,9 +2684,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     return matches;
                                 };
                                 static const bool submit_reuse_enabled =
-                                    !getenv("PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE");
+                                    !PROSPER_ENV_VALUE("PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE");
                                 static const bool audit_submit_reuse =
-                                    getenv("PROSPER_AUDIT_SUBMIT_TEXTURE_VALIDATION_REUSE") != nullptr;
+                                    PROSPER_ENV_VALUE("PROSPER_AUDIT_SUBMIT_TEXTURE_VALIDATION_REUSE") != nullptr;
                                 const prosper::gpu::GuestGpuWriteQuery submit_query =
                                     submit_reuse_enabled
                                     ? prosper::gpu::guest_gpu_writes_since(
@@ -2773,7 +2790,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     cached->second.validation_snapshot =
                                         prosper::gpu::guest_gpu_write_snapshot();
                                     static const bool keep_source_snapshots =
-                                        getenv("PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS") != nullptr;
+                                        PROSPER_ENV_VALUE("PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS") != nullptr;
                                     if (!keep_source_snapshots &&
                                         texture_source_snapshot_can_follow_watch(
                                             cached->second.source_matches_pixels,
@@ -2888,7 +2905,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fr.th = sampled_ds.height;
                             fr.td = 1; fr.img_dim = r.img_dim;
                             resource_rtt_hit = true;
-                            if (getenv("PROSPER_DSBRIDGE_LOG")) {
+                            if (PROSPER_ENV_ON("PROSPER_DSBRIDGE_LOG")) {
                                 static int consumer_logged = 0;
                                 if (consumer_logged++ < 24)
                                     fprintf(stderr,
@@ -2919,7 +2936,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             narrow_done = decoded_reuse->narrow;
                             fr.persistent_texture_id = decoded_reuse->persistent_id;
                             fr.persistent_texture_version = decoded_reuse->persistent_version;
-                            if (getenv("PROSPER_DETILE_STATS") && resource_persistent_hit) {
+                            if (PROSPER_ENV_ON("PROSPER_DETILE_STATS") && resource_persistent_hit) {
                                 static uint64_t bc_cube_hit_total = 0;
                                 static std::unordered_map<uint64_t, uint64_t> bc_cube_hits;
                                 const uint64_t hit_footprint =
@@ -2991,7 +3008,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // question: if a handful of addresses accumulate huge counts, the same immutable
                         // surface is re-detiled every frame (a cache-key instability / live-RTT re-decode);
                         // if counts stay near 1 the cost is a large one-time working set instead.
-                        if (getenv("PROSPER_DETILE_STATS")) {
+                        if (PROSPER_ENV_ON("PROSPER_DETILE_STATS")) {
                             struct DecodeShape {
                                 uint32_t width = 0, height = 0, depth = 0;
                                 uint32_t image_dimension = 0, format = 0, components = 0;
@@ -3048,7 +3065,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             const bool compression_supported = !r.compression_enabled ||
                                 persistent_dcc_uncompressed || persistent_dcc_fast_clear;
                             const bool cache_disabled =
-                                getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") != nullptr;
+                                PROSPER_ENV_VALUE("PROSPER_NO_TEXTURE_DECODE_CACHE") != nullptr;
                             const TextureDecodeMissReason miss_reason = texture_decode_miss_reason(
                                 has_live_rtt, persistent_sampled_texture, compression_supported,
                                 persistent_source_size, cache_disabled, persistent_decode_limit,
@@ -3223,7 +3240,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // COMMITTED guest memory (the same reserved_range_state safe_copy stops at). If the
                         // level's backgrounds read ~0% committed, they're GPU-DMA'd pages the CPU never
                         // touched, so we read zeros -> the scene samples black (#300 black-gameplay probe).
-                        if (getenv("PROSPER_TEXCOMMIT")) {
+                        if (PROSPER_ENV_ON("PROSPER_TEXCOMMIT")) {
                             const size_t PG = 0x10000; size_t committed = 0;
                             for (uint64_t a = sampled_source_addr;
                                  a < sampled_source_addr + nb; a += PG)
@@ -3296,7 +3313,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     // PROSPER_DUMP_SAMPLED_RTT (#710/#320): dump the exact RTT-layer
                                     // pixels a draw samples, disambiguating a dark layer from a later
                                     // composite/tint that darkens otherwise-correct input.
-                                    if (getenv("PROSPER_DUMP_SAMPLED_RTT")) {
+                                    if (PROSPER_ENV_ON("PROSPER_DUMP_SAMPLED_RTT")) {
                                         static std::set<uint64_t> seen;
                                         if (seen.insert(sampled_source_addr).second) {
                                             const std::vector<uint8_t> inspected = inspection_rgba8(
@@ -3376,7 +3393,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (is_cube && !rtt_hit && !dcc_fast_clear_done) {
                             const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
                             const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
-                                !getenv("PROSPER_NODETILE");
+                                !PROSPER_ENV_VALUE("PROSPER_NODETILE");
                             auto face_base = [&](uint32_t face, size_t selected_span) {
                                 const uint64_t stride = r.layer_stride_bytes
                                     ? r.layer_stride_bytes : selected_span;
@@ -3516,7 +3533,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // 16-byte Vulkan representation. Detile at the real guest width first, then
                             // convert every channel into the raw VGPR dword carried by the uvec4 image.
                             const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
-                                !getenv("PROSPER_NODETILE");
+                                !PROSPER_ENV_VALUE("PROSPER_NODETILE");
                             const uint32_t materialize_tile_mode = tiled ? r.tile_mode : 0u;
                             const uint32_t materialize_depth = is_volume ? r.depth : 1u;
                             const size_t source_bytes = storage_image_raw_uvec4_source_bytes(
@@ -3549,7 +3566,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // blocks -> 16x16, 8-byte -> 32x16 — so no tile_side is passed here.
                             size_t comp_bytes = (size_t)bw * bh * bcb;
                             std::vector<uint8_t> lin(comp_bytes, 0);
-                            bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
+                            bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
                             if (tiled) {
                                 size_t tbytes = prosper::gpu::tiled_elements_bytes(bw, bh, bcb, r.tile_mode);
                                 std::vector<uint8_t> traw(tbytes, 0);
@@ -3581,7 +3598,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             const uint32_t nc = bpt / 4;
                             std::vector<uint8_t> flin(volume_texels * bpt, 0);
                             const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
-                                !getenv("PROSPER_NODETILE");
+                                !PROSPER_ENV_VALUE("PROSPER_NODETILE");
                             if (tiled) {
                                 const size_t tbytes = is_volume
                                     ? prosper::gpu::tiled_volume_bytes(
@@ -3634,7 +3651,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // textures; renderer-owned RTTs retain RGBA16F through the #773 path.
                             const uint32_t nc = bpt / 2;                    // fp16 components per texel
                             std::vector<uint8_t> hlin(volume_texels * bpt, 0);
-                            bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
+                            bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
                             if (tiled) {
                                 size_t tbytes = is_volume
                                     ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
@@ -3701,7 +3718,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // which the real T# DST_SEL is applied below. Its R component must be normalized
                             // from both bytes; selecting byte zero makes a smooth ramp a sawtooth (#1186).
                             std::vector<uint8_t> nlin(volume_texels * bpt, 0);
-                            bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
+                            bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
                             if (tiled) {
                                 size_t tbytes = is_volume
                                     ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
@@ -3711,7 +3728,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     traw.data(), sampled_source_addr, tbytes);
                                 // PROSPER_DUMP_RAWTILE (narrow path): the single/dual-channel RAW TILED bytes,
                                 // once per address, for offline 8-bpp de-swizzle sweeps (the SDF font atlas).
-                                if (getenv("PROSPER_DUMP_RAWTILE") && got >= nlin.size() && tw <= 2048 && th <= 1024) {
+                                if (PROSPER_ENV_ON("PROSPER_DUMP_RAWTILE") && got >= nlin.size() && tw <= 2048 && th <= 1024) {
                                     static std::set<uint64_t> nseen;
                                     if (nseen.insert(r.gpu_addr).second) {
                                         std::string dd = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
@@ -3774,7 +3791,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         // PROSPER_DUMP_RAWTEX: write the raw tiled RGBA bytes (pre-detile) to a .bin for
                         // offline swizzle experimentation.
-                        if (getenv("PROSPER_DUMP_RAWTEX") && !texture_pixels.empty()) {
+                        if (PROSPER_ENV_ON("PROSPER_DUMP_RAWTEX") && !texture_pixels.empty()) {
                             std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
                             char fn[512]; snprintf(fn, sizeof fn, "%s/rawtex_%ux%u.bin", d.c_str(), tw, th);
                             if (FILE* f = fopen(fn, "wb")) { fwrite(texture_pixels.data(), 1, nb, f); fclose(f);
@@ -3786,14 +3803,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // AUTO-DETILE: de-swizzle a GPU-tiled sampled surface into the linear texstore,
                         // driven by the T# tile_mode threaded through the resource table (r.tile_mode).
                         bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
-                        const char* dt = getenv("PROSPER_DETILE");
+                        const char* dt = PROSPER_ENV_VALUE("PROSPER_DETILE");
                         // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
                         if (!rtt_hit && !cube_done && !dcc_fast_clear_done && !bcb && !narrow_decode_done &&
                             !f16_done && !f32_done && !portable_raw_uvec4_storage &&
-                            !getenv("PROSPER_NODETILE") &&
+                            !PROSPER_ENV_VALUE("PROSPER_NODETILE") &&
                             (auto_tiled || (!is_volume && dt && atoi(dt) != 0))) {
                             const uint32_t tmode = auto_tiled ? r.tile_mode : (uint32_t)prosper::gpu::TileMode::Sw4KbS;
-                            const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;
+                            const uint32_t pitch = PROSPER_ENV_VALUE("PROSPER_PITCH") ? (uint32_t)atoi(PROSPER_ENV_VALUE("PROSPER_PITCH")) : 0;
                             size_t tiled_bytes = is_volume
                                 ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, tmode, 4)
                                 : prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
@@ -3807,7 +3824,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 std::memcpy(tiled.data(), texture_pixels.data(), std::min(nb, tiled_bytes));
                             // PROSPER_DUMP_RAWTILE: write the EXACT padded tiled bytes to a .bin (no lossy BMP
                             // round-trip) so the de-swizzle can be reversed offline against a known image (#101).
-                            if (getenv("PROSPER_DUMP_RAWTILE") && (frame_no < 200 || (tw <= 2048 && th <= 1024))) {
+                            if (PROSPER_ENV_ON("PROSPER_DUMP_RAWTILE") && (frame_no < 200 || (tw <= 2048 && th <= 1024))) {
                                 // Early frames by binding, PLUS small textures once per address (the font/UI
                                 // atlas can be sampled late — capture whenever first seen).
                                 static std::set<uint64_t> rawseen;
@@ -3911,7 +3928,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     (unsigned long long)(writer ? writer->item : 0),
                                     (unsigned long long)(writer ? writer->order : 0),
                                     (unsigned long long)(writer ? writer->identity : 0));
-                            if (getenv("PROSPER_DUMP_RESOURCE_VERSION")) {
+                            if (PROSPER_ENV_ON("PROSPER_DUMP_RESOURCE_VERSION")) {
                                 static std::set<std::pair<uint64_t, uint64_t>> dumped_versions;
                                 if (dumped_versions.emplace(r.gpu_addr, sample_hash).second) {
                                     const char* dd = getenv("PROSPER_FRAME_DIR");
@@ -3927,7 +3944,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // PROSPER_PALETTELOG: compact identity/provenance trace for Unity's 256x16
                         // palette textures. Unlike GFXLOG this is cheap enough for a focused render
                         // window and reveals both descriptor-address and decoded-content changes.
-                        if (getenv("PROSPER_PALETTELOG") && tw == 256 && th == 16 &&
+                        if (PROSPER_ENV_ON("PROSPER_PALETTELOG") && tw == 256 && th == 16 &&
                             fr.texture_format == VK_FORMAT_R8G8B8A8_UNORM) {
                             uint64_t hash = 1469598103934665603ull;
                             size_t rgb_nonblack = 0;
@@ -3945,9 +3962,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // Apply the synthetic texture after every decode/conversion step. Applying it before
                         // auto-detile let the real tiled bytes overwrite the checker, producing a false-negative
                         // sampling diagnosis (#522).
-                        const char* test_texture = getenv("PROSPER_TESTTEX");
-                        const char* test_texture_binding = getenv("PROSPER_TESTTEX_BINDING");
-                        const char* test_texture_draw = getenv("PROSPER_TESTTEX_DRAW");
+                        const char* test_texture = PROSPER_ENV_VALUE("PROSPER_TESTTEX");
+                        const char* test_texture_binding = PROSPER_ENV_VALUE("PROSPER_TESTTEX_BINDING");
+                        const char* test_texture_draw = PROSPER_ENV_VALUE("PROSPER_TESTTEX_DRAW");
                         const bool test_this_texture = test_texture &&
                             (!test_texture_binding ||
                              strtoul(test_texture_binding, nullptr, 0) == r.binding) &&
@@ -4006,7 +4023,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // The identity probe preserves source color through shaders using
                         // u=r/17+b*15/16, v=1-g, distinguishing lookup contents from a broken
                         // source/geometry/sample path (#522).
-                        if (getenv("PROSPER_TESTLUT") && tw == 256 && th == 16 &&
+                        if (PROSPER_ENV_ON("PROSPER_TESTLUT") && tw == 256 && th == 16 &&
                             fr.texture_format == VK_FORMAT_R8G8B8A8_UNORM) {
                             for (uint32_t y = 0; y < th; y++) for (uint32_t x = 0; x < tw; x++) {
                                 uint8_t* p = &texture_pixels[((size_t)y * tw + x) * 4];
@@ -4019,7 +4036,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // Unity's post-processing stack flattens a 32^3 grading LUT into a 1024x32
                         // strip (32 red samples per blue slice). This isolates a missing LUT producer
                         // from the persistent post shader and its healthy scene input (#522).
-                        if (getenv("PROSPER_TESTLUT32") && tw == 1024 && th == 32 &&
+                        if (PROSPER_ENV_ON("PROSPER_TESTLUT32") && tw == 1024 && th == 32 &&
                             fr.texture_format == VK_FORMAT_R8G8B8A8_UNORM) {
                             for (uint32_t y = 0; y < th; ++y) for (uint32_t x = 0; x < tw; ++x) {
                                 uint8_t* p = &texture_pixels[((size_t)y * tw + x) * 4];
@@ -4031,7 +4048,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         // PROSPER_DUMP_TEX: write the RAW texture memory (interpreted linearly) to a BMP,
                         // bypassing the shader — reveals whether the render target is tiled or linear.
-                        if (getenv("PROSPER_DUMP_TEX") && !texture_pixels.empty() && frame_no < 200 &&
+                        if (PROSPER_ENV_ON("PROSPER_DUMP_TEX") && !texture_pixels.empty() && frame_no < 200 &&
                             fr.texture_format == VK_FORMAT_R8G8B8A8_UNORM) {
                             std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
                             char fn[512]; snprintf(fn, sizeof fn, "%s/rawtex_f%04d_b%u.bmp", d.c_str(), (int)frame_no, r.binding);
@@ -4040,7 +4057,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         // PROSPER_DUMP_ATLAS: dump each SMALL sampled texture once per ADDRESS (find the caption
                         // font among same-size UI textures). Capped.
-                        if (getenv("PROSPER_DUMP_ATLAS") && !texture_pixels.empty() && tw <= 2048 && th <= 1024 &&
+                        if (PROSPER_ENV_ON("PROSPER_DUMP_ATLAS") && !texture_pixels.empty() && tw <= 2048 && th <= 1024 &&
                             fr.texture_format == VK_FORMAT_R8G8B8A8_UNORM) {
                             static std::unordered_map<uint64_t,int> seen; static int ndumped = 0;
                             if (seen[r.gpu_addr]++ == 0 && ndumped++ < 60) {
@@ -4054,7 +4071,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // (a 1024x1024 single-channel glow sprite) to A/B whether it is what draws the
                         // see-through concentric-circles pattern over the world. Run with
                         // PROSPER_NO_TEXTURE_DECODE_CACHE=1 so every sample takes this decode path.
-                        if (getenv("PROSPER_KILL_RING") && tw == 1024 && th == 1024 &&
+                        if (PROSPER_ENV_ON("PROSPER_KILL_RING") && tw == 1024 && th == 1024 &&
                             r.num_components == 1 && r.cls == RC::Texture)
                             std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
                         if (!fr.tex_rgba) {
@@ -4210,7 +4227,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         }
                         if (native_r32ui_storage && writable_storage_image) {
-                            const uint32_t writeback_pitch = getenv("PROSPER_PITCH")
+                            const uint32_t writeback_pitch = PROSPER_ENV_VALUE("PROSPER_PITCH")
                                 ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0u;
                             const size_t linear_bytes = static_cast<size_t>(tw) * th * 4u;
                             const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
@@ -4303,9 +4320,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         fr.mag_filter = r.mag_filter; fr.min_filter = r.min_filter; fr.mip_filter = r.mip_filter;
                         // Draw/binding-scoped sampler A/B. This shares TESTTEX's selectors but leaves
                         // the sampled pixels intact, isolating descriptor filtering from texture content.
-                        const char* test_filter = getenv("PROSPER_TESTTEX_FILTER");
-                        const char* test_filter_binding = getenv("PROSPER_TESTTEX_BINDING");
-                        const char* test_filter_draw = getenv("PROSPER_TESTTEX_DRAW");
+                        const char* test_filter = PROSPER_ENV_VALUE("PROSPER_TESTTEX_FILTER");
+                        const char* test_filter_binding = PROSPER_ENV_VALUE("PROSPER_TESTTEX_BINDING");
+                        const char* test_filter_draw = PROSPER_ENV_VALUE("PROSPER_TESTTEX_DRAW");
                         const bool filter_valid = test_filter &&
                             (!strcmp(test_filter, "linear") || !strcmp(test_filter, "point"));
                         if (filter_valid &&
@@ -4340,7 +4357,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // PROSPER_ALPHA1: force the sampled alpha to constant 1 (opaque). Diagnostic for a
                         // black scene whose textures decode to real RGB but composite to nothing — if the
                         // level appears with this, the alpha channel (decode or DST_SEL swizzle) is the bug (#300).
-                        if (getenv("PROSPER_ALPHA1")) fr.swizzle[3] = 1;
+                        if (PROSPER_ENV_ON("PROSPER_ALPHA1")) fr.swizzle[3] = 1;
                         }
                     } else {
                         fr.buffer_identity = r.gpu_addr;
@@ -4455,10 +4472,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (timing_enabled)
                             resource_buffer_copy_ms = std::chrono::duration<double, std::milli>(
                                 RenderClock::now() - copy_start).count();
-                        if (const char* mode = getenv("PROSPER_RENDER_TIMING");
-                            mode && strcmp(mode, "detail") == 0) {
+                        if (render_timing_detail) {
                             const uint64_t detail_min_submit =
-                                getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
+                                PROSPER_ENV_VALUE("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
                                     ? strtoull(getenv(
                                           "PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0)
                                     : 0;
@@ -4481,7 +4497,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // PROSPER_CBLOG: log each constant buffer's first 4 dwords as floats, once per
                         // address. If a scene draw's color/tint CB is (0,0,0,0), the PS outputs black
                         // regardless of the (correctly-decoded) texture — the #300 black-scene suspect.
-                        if (getenv("PROSPER_CBLOG") && r.cls == RC::ConstantBuffer) {
+                        if (PROSPER_ENV_ON("PROSPER_CBLOG") && r.cls == RC::ConstantBuffer) {
                             static std::set<uint64_t> cbseen;
                             if (cbseen.insert(r.gpu_addr).second) {
                                 const uint32_t* words = fr.buffer_words_data();
@@ -4503,8 +4519,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 fr.sample_count *
                                 prosper::test::backend_color_bytes_per_pixel(fr.texture_format);
                             pending_timing.texture_ms += elapsed;
-                            const uint64_t detail_min_submit = getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
-                                ? strtoull(getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0) : 0;
+                            const uint64_t detail_min_submit = PROSPER_ENV_VALUE("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
+                                ? strtoull(PROSPER_ENV_VALUE("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0) : 0;
                             if (const char* mode = getenv("PROSPER_RENDER_TIMING");
                                 mode && strcmp(mode, "detail") == 0 &&
                                 static_cast<uint64_t>(g_this_submit) >= detail_min_submit) {
@@ -4686,12 +4702,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             //   FS_SPV -> a caller-supplied PS SPIR-V (e.g. a UV visualizer).
             //   NOPS   -> bypass the resolved pipeline state (default state).
             #include "refvs.inc"
-            const bool refvs = getenv("PROSPER_RENDER_REFVS");
+            const bool refvs = PROSPER_ENV_VALUE("PROSPER_RENDER_REFVS");
             std::vector<uint32_t> refvs_spv(kRefVs, kRefVs + sizeof(kRefVs) / 4);
             std::vector<uint32_t> ps_override;
             bool ps_override_is_file = false;   // true only for a valid PROSPER_FS_SPV *file* override
             bool ps_override_is_test = false;
-            if (getenv("PROSPER_RENDER_TESTPS")) {
+            if (PROSPER_ENV_ON("PROSPER_RENDER_TESTPS")) {
                 static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
                     0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
                 ps_override = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
@@ -4715,7 +4731,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 fclose(f);
                 return ok;
             };
-            if (const char* fsp = getenv("PROSPER_FS_SPV")) {
+            if (const char* fsp = PROSPER_ENV_VALUE("PROSPER_FS_SPV")) {
                 std::vector<uint32_t> m;
                 if (load_spv_file(fsp, m)) { ps_override = std::move(m); ps_override_is_file = true; }
                 else fprintf(stderr, "[fs-spv] PROSPER_FS_SPV='%s' invalid/unreadable -> no file override\n", fsp);
@@ -4730,7 +4746,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             //       2 = requested but invalid (file override disabled).
             int fs_match_mode = 0;
             std::vector<uint32_t> fs_match;
-            if (const char* mp = getenv("PROSPER_FS_SPV_MATCH")) {
+            if (const char* mp = PROSPER_ENV_VALUE("PROSPER_FS_SPV_MATCH")) {
                 fs_match_mode = load_spv_file(mp, fs_match) ? 1 : 2;
                 if (fs_match_mode == 2)
                     fprintf(stderr, "[fs-match] PROSPER_FS_SPV_MATCH='%s' invalid/unreadable -> applying NO "
@@ -4741,13 +4757,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // viewport, depth and raster state. As with FS_SPV_MATCH, a bad path fails closed.
             int testps_match_mode = 0;
             std::vector<uint32_t> testps_match;
-            if (const char* mp = getenv("PROSPER_RENDER_TESTPS_MATCH")) {
+            if (const char* mp = PROSPER_ENV_VALUE("PROSPER_RENDER_TESTPS_MATCH")) {
                 testps_match_mode = load_spv_file(mp, testps_match) ? 1 : 2;
                 if (testps_match_mode == 2)
                     fprintf(stderr, "[testps-match] PROSPER_RENDER_TESTPS_MATCH='%s' invalid/unreadable -> "
                             "applying NO test fragment override (fail closed)\n", mp);
             }
-            const bool nops = getenv("PROSPER_RENDER_NOPS");
+            const bool nops = PROSPER_ENV_VALUE("PROSPER_RENDER_NOPS");
             // Assemble backend draws for a subset of the submit's items — one BackendDraw per realized
             // DrawItem with its own resources + fixed-function state (or the diagnostic overrides above).
             // build_R reads the CURRENT g_rtt, so calling this AFTER an earlier target-group has been
@@ -5142,10 +5158,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                             g_rtt[rdst] = std::move(resolved);    // dest inherits src content/extent/format
-                            if (getenv("PROSPER_MSAA_LOG"))
+                            if (PROSPER_ENV_ON("PROSPER_MSAA_LOG"))
                                 fprintf(stderr, "[msaa] resolve copy 0x%llx -> 0x%llx (%ux%u)\n",
                                         (unsigned long long)rsrc, (unsigned long long)rdst, rw, rh);
-                        } else if (getenv("PROSPER_MSAA_LOG")) {
+                        } else if (PROSPER_ENV_VALUE("PROSPER_MSAA_LOG")) {
                             fprintf(stderr, "[msaa] resolve SKIP src=0x%llx dst=0x%llx (%s)\n",
                                     (unsigned long long)rsrc, (unsigned long long)rdst,
                                     !rsrc || !rdst ? "missing base" : "source has no rendered surface");
@@ -5220,7 +5236,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const bool viewport_extent_valid = viewport_native_w && viewport_native_h &&
                             viewport_native_w <= std::max<uint64_t>(4096u, max_native_w) &&
                             viewport_native_h <= std::max<uint64_t>(4096u, max_native_h);
-                        if (getenv("PROSPER_DSLOG") && (viewport_native_w || viewport_native_h)) {
+                        if (PROSPER_ENV_ON("PROSPER_DSLOG") && (viewport_native_w || viewport_native_h)) {
                             fprintf(stderr,
                                     "[ds] viewport-derived extent %llux%llu (presentation %ux%u) -> %s\n",
                                     (unsigned long long)viewport_native_w,
@@ -5272,7 +5288,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     bool gpu_seed_available = false;
                     const VkFormat pass_format = format0;
                     uint32_t mrt_count = requested_color_count;
-                    if (getenv("PROSPER_NO_MRT1") || getenv("PROSPER_NO_MRT")) mrt_count = 1;
+                    if (PROSPER_ENV_ON("PROSPER_NO_MRT1") || PROSPER_ENV_ON("PROSPER_NO_MRT")) mrt_count = 1;
                     if (!render_pass.empty()) {
                         for (uint32_t slot = 1; slot < mrt_count; ++slot) {
                             const auto binding = color_binding(*render_pass.front(), slot);
@@ -5362,7 +5378,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         LaterTargetConsumers result;
                         if (!live_gpu_targets || !target_base) return result;
                         static const uint32_t render_scale = [] {
-                            const char* e = std::getenv("PROSPER_RENDER_SCALE");
+                            const char* e = PROSPER_ENV_VALUE("PROSPER_RENDER_SCALE");
                             const long v = e ? std::strtol(e, nullptr, 10) : 1;
                             return v > 0 ? static_cast<uint32_t>(v) : 1u;
                         }();
@@ -5407,7 +5423,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const bool feedback_later = consumers0.feedback;
                     const bool cpu_needed_same_batch = consumers0.cpu_needed;
                     static const bool defer_rtt_readback =
-                        !getenv("PROSPER_NO_RTT_READBACK_DEFER");
+                        !PROSPER_ENV_VALUE("PROSPER_NO_RTT_READBACK_DEFER");
                     const bool rtt_defer_ok = defer_rtt_readback
                         ? !cpu_needed_same_batch
                         : (sampled_exact_later && !feedback_later);
@@ -5743,7 +5759,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // PROSPER_DUMP_DRAWSTEPS: for a pass targeting a SCANOUT buffer, re-render the pass
                     // draw-by-draw (prefix 1, prefix 2, ...) and dump each cumulative result — a one-boot
                     // bisect for "which draw of the final composite blacks the screen" (#319). Diagnostic.
-                    if (getenv("PROSPER_DUMP_DRAWSTEPS") && is_vo && pass.size() > 1) {
+                    if (PROSPER_ENV_ON("PROSPER_DUMP_DRAWSTEPS") && is_vo && pass.size() > 1) {
                         for (size_t k = 1; k <= pass.size(); k++) {
                             std::vector<const prosper::gpu::DrawItem*> prefix(render_pass.begin(), render_pass.begin() + k);
                             std::vector<uint8_t> spx = prosper::test::render_draws_rgba(
@@ -5767,10 +5783,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     //    format inspection) — needed to reason about premultiplied-alpha UI compositing
                     //    that samples an RT's alpha as a blend factor. Non-RGBA8 targets are skipped
                     //    visibly rather than writing native bytes under a misleading .rgba contract.
-                    if ((getenv("PROSPER_DUMP_RTGROUPS") || getenv("PROSPER_DUMP_RTGROUPS_RGBA")) &&
+                    if ((PROSPER_ENV_ON("PROSPER_DUMP_RTGROUPS") || (getenv("PROSPER_DUMP_RTGROUPS_RGBA") != nullptr)) &&
                         !rendered_pixels.empty()) {
                         size_t nz = 0; for (uint8_t b : rendered_pixels) nz += (b != 0);
-                        const char* address_filter = getenv("PROSPER_DUMP_RTGROUPS_ADDR");
+                        const char* address_filter = PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS_ADDR");
                         const uint64_t wanted_base = address_filter && *address_filter
                             ? strtoull(address_filter, nullptr, 0) : 0;
                         const char* dd = getenv("PROSPER_FRAME_DIR");
@@ -5779,7 +5795,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const uint64_t pass_d0 = render_pass.empty() ? 0u : render_pass.front()->draw_index;
                         const uint64_t pass_d1 = render_pass.empty() ? 0u : render_pass.back()->draw_index;
                         if (!wanted_base || base == wanted_base) {
-                            if (const char* rg = getenv("PROSPER_DUMP_RTGROUPS"); rg && nz >= (size_t)atol(rg)) {
+                            if (const char* rg = PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS"); rg && nz >= (size_t)atol(rg)) {
                                 const std::vector<uint8_t> inspected = inspection_rgba8(
                                     rendered_pixels, gw, gh, pass_format);
                                 char fn[512]; snprintf(fn, sizeof fn, "%s/rtgrp_%llx_%04d.bmp",
@@ -5790,7 +5806,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // transparent (all-zero) group is captured too. Self-describing filename
                             // (extent + draw range) and failure-visible: a missing file must not be
                             // mistaken for a transparent/empty result.
-                            if (getenv("PROSPER_DUMP_RTGROUPS_RGBA")) {
+                            if ((getenv("PROSPER_DUMP_RTGROUPS_RGBA") != nullptr)) {
                                 const uint64_t expected_bytes_u64 = static_cast<uint64_t>(gw) * gh * 4u;
                                 const bool rgba8_format = pass_format == VK_FORMAT_R8G8B8A8_UNORM;
                                 const bool size_valid = expected_bytes_u64 <= SIZE_MAX &&
@@ -5852,7 +5868,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // PROSPER_PASS_LOG=<min-submit>|ms:<millis>: per-pass publish provenance for 3
                     // submits — which pass produced pixels, its target identity, and the defer
                     // decision. The `ms:` form aims the window by wall time (diagnostic_window.hpp).
-                    if (getenv("PROSPER_PASS_LOG")) {
+                    if (PROSPER_ENV_ON("PROSPER_PASS_LOG")) {
                         const uint64_t at = g_pass_log_submit.load(std::memory_order_relaxed);
                         const bool in_window =
                             g_pass_log_window.contains(at, diagnostic_elapsed_ms());
@@ -5944,7 +5960,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 }
                 {
                     const uint64_t at = g_pass_log_submit.fetch_add(1);
-                    if (getenv("PROSPER_PASS_LOG")) {
+                    if (PROSPER_ENV_ON("PROSPER_PASS_LOG")) {
                         // The same window object and the same ordinal the per-pass report used, so
                         // the two lines describe one set of callbacks — with one seam: if a `ms:`
                         // deadline is crossed between the pass loop and this site, the latching
@@ -5963,7 +5979,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // wall time, because the ordinal below is a renderer-internal counter with no
                 // published rate and the states worth censusing are named in seconds
                 // (diagnostic_window.hpp).
-                if (getenv("PROSPER_DUMP_PERSISTENT")) {
+                if (PROSPER_ENV_ON("PROSPER_DUMP_PERSISTENT")) {
                     static std::atomic<uint64_t> dp_submit{0};
                     const uint64_t sub = dp_submit.fetch_add(1);
                     if (g_persist_window.contains(sub, diagnostic_elapsed_ms())) {
@@ -6304,7 +6320,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             break;
                     }
                 }
-                if (getenv("PROSPER_DUMP_PERSISTENT")) {
+                if (PROSPER_ENV_ON("PROSPER_DUMP_PERSISTENT")) {
                     size_t nb = 0;
                     if (selected_pixels)
                         for (size_t p = 0; p + 3 < selected_pixels->size(); p += 4)
@@ -6341,7 +6357,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             int n = frame_no++;
             // PROSPER_DUMP_CONTENT=<min-nonzero-bytes>: dump ONLY frames whose framebuffer has at least
             // that many nonzero bytes — catches the intermittent content submits the periodic dump misses.
-            size_t content_thr = 0; if (const char* c = getenv("PROSPER_DUMP_CONTENT")) content_thr = (size_t)atol(c);
+            size_t content_thr = 0; if (const char* c = PROSPER_ENV_VALUE("PROSPER_DUMP_CONTENT")) content_thr = (size_t)atol(c);
             // Sparse long-route captures can override the default first-60/every-10 cadence. This is
             // particularly useful for 4K titles, where capturing itself would otherwise add gigabytes
             // of readback I/O before the scene under investigation is reached. Zero disables a phase.
