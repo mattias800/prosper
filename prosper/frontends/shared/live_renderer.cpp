@@ -5158,11 +5158,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // && of the positives rather than || of the negations: identical short-circuit
                     // and identical outcome, but it puts the accounting below on a path the
                     // `continue` cannot skip.
+                    // descriptor_validate_mode is the per-submit hoist made for poison_R above, and
+                    // it serves this pair for the same reason: without it each call re-reads getenv,
+                    // and with the variable unset that read IS the whole call. It measured
+                    // 5.77 ms/submit in the build_resources partition -- larger than the validation
+                    // it was declining to do.
                     const bool contract_ok =
                         prosper::gpu::validate_runtime_descriptor_contract(
-                            "VS/backend", bd.vs_words(), it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex) &&
+                            "VS/backend", bd.vs_words(), it.vrt.get(), 0,
+                            prosper::gpu::SpirvShaderStage::Vertex, descriptor_validate_mode) &&
                         prosper::gpu::validate_runtime_descriptor_contract(
-                            "PS/backend", bd.fs_words(), it.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment);
+                            "PS/backend", bd.fs_words(), it.prt.get(), 1,
+                            prosper::gpu::SpirvShaderStage::Fragment, descriptor_validate_mode);
                     const auto bt2 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
                     if (timing_enabled) {
                         pending_timing.build_r_ms +=

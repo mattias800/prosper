@@ -4547,7 +4547,20 @@ bool validate_runtime_descriptor_contract(const char* stage_name,
                                            const ShaderResourceTable* runtime,
                                            uint32_t expected_set,
                                            SpirvShaderStage expected_stage) {
-    const char* mode = getenv("PROSPER_DESCRIPTOR_VALIDATE");
+    // The read stays LIVE here (not PROSPER_ENV_VALUE): two tests arm this variable at runtime and
+    // a process-lifetime cache would make their arms vacuous rather than failing -- #2214. Callers
+    // on a per-draw path pass the mode in via the overload below instead of paying this per call.
+    return validate_runtime_descriptor_contract(stage_name, spirv, runtime, expected_set,
+                                                expected_stage,
+                                                getenv("PROSPER_DESCRIPTOR_VALIDATE"));
+}
+
+bool validate_runtime_descriptor_contract(const char* stage_name,
+                                           const std::vector<uint32_t>& spirv,
+                                           const ShaderResourceTable* runtime,
+                                           uint32_t expected_set,
+                                           SpirvShaderStage expected_stage,
+                                           const char* mode) {
     if (!mode || !*mode || !strcmp(mode, "off") || !strcmp(mode, "0")) return true;
 
     DescriptorValidationReport report = validate_spirv_descriptor_interface(
