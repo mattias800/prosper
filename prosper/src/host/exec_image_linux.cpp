@@ -865,7 +865,18 @@ namespace {
                 uint64_t obj = base;
                 if (ps.deref[k]) {   // chase one pointer level: obj = [base + pre]
                     uint64_t pa = base + ps.pre[k];
-                    if (!probe_readable(pa)) { n = snprintf(b, sizeof b, "    [+0x%llx]-><unmapped>\n", (unsigned long long)ps.pre[k]); write(2,b,n); continue; }
+                    // raw_write_fmt, like every other write in this dump -- including the one
+                    // eleven lines below. This site had NO guard at all: snprintf's would-be length
+                    // went straight to write(), so a truncating format over-read `b` (#2180, the
+                    // #2050 class). It also used glibc write() inside a fault handler, where the
+                    // rest of this function deliberately uses raw syscalls to avoid libc TLS on a
+                    // guest-%fs thread -- so it was two defects wearing one line.
+                    if (!probe_readable(pa)) {
+                        n = snprintf(b, sizeof b, "    [+0x%llx]-><unmapped>\n",
+                                     (unsigned long long)ps.pre[k]);
+                        raw_write_fmt(2, b, sizeof b, n);
+                        continue;
+                    }
                     obj = *(const uint64_t*)pa;
                 }
                 uint64_t addr = obj + ps.off[k];
@@ -1103,7 +1114,12 @@ namespace {
                 "[fs-emu] UNHANDLED fs insn rip=0x%llx off=%lld bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                 (unsigned long long)g[REG_RIP], (long long)off,
                 p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
-            ssize_t wr = write(2, b, (size_t)(n>0?n:0)); (void)wr;
+            // `n > 0` rejects only the ENCODING error; a truncating format returns MORE than the
+            // buffer holds and the write over-reads it. #2171's own comment at the raw_write sites
+            // says exactly that, and these two glibc sites were missed because that sweep's
+            // enumeration was scoped to `raw_write` (#2180). raw_write_fmt applies the full clamp
+            // and keeps the truncation marker.
+            raw_write_fmt(2, b, sizeof b, n);
             return false;   // fall through to the normal (fatal) fault path so the form is visible
         }
         for (int k = 0; k < 16; k++) g[kX86ToReg[k]] = (greg_t)regs[k];
@@ -1111,7 +1127,7 @@ namespace {
         g_fs_emulated++;
         if (g_fslog && (g_fs_emulated & 0x3FFF) == 0) {
             char b[64]; int n = snprintf(b, sizeof b, "[fs-emu] %lu accesses\n", g_fs_emulated);
-            ssize_t wr = write(2, b, (size_t)(n>0?n:0)); (void)wr;
+            raw_write_fmt(2, b, sizeof b, n);
         }
         return true;
     }
