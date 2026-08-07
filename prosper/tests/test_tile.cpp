@@ -1034,6 +1034,44 @@ int main() {
         };
         CHECK(rt4k(1) && rt4k(2) && rt4k(4) && rt4k(8) && rt4k(16),
               "SW_4KB_S3 round-trip is exact for every texel size (weak on its own; see above)");
+
+        // States the block invariant directly: the address map covers one block exactly. Kept for
+        // what it SAYS, not for extra detection power -- and that distinction was measured, not
+        // assumed, because it was first added on a justification that turned out to be false.
+        //
+        // The claim was "the round trip cannot see aliasing, so this arm catches what it misses."
+        // It can. Collapsing the z contribution (`fz[z] = 0`) reddens the goldens, BOTH round trips
+        // and this arm together. The reason is arithmetic rather than incidental: one block holds
+        // exactly 4096/bpe elements writing bpe bytes each -- 4096 bytes into 4096 bytes, for every
+        // element size -- so a byte written twice forces a byte written never. **Aliasing and holes
+        // are the same defect seen from two sides.** The round trip detects the aliasing (a collision
+        // loses data); this arm detects the hole. For a single block they are equivalent.
+        //
+        // So do not add arms on the theory that this one is load-bearing where the others are not; it
+        // is a readable statement of an invariant that the round trip already enforces obliquely.
+        //
+        // Mechanically: tile_volume memsets the destination to zero first, so a byte still zero
+        // afterwards is a byte nothing wrote. The source therefore contains no zero bytes. No offset
+        // arithmetic is duplicated here, which is the point -- a test that re-implements the map
+        // agrees with itself whatever the map does.
+        auto covers_block_bijectively = [&](uint32_t bpe, uint32_t bw, uint32_t bh, uint32_t bd) {
+            const size_t elems = (size_t)bw * bh * bd;
+            std::vector<uint8_t> linear(elems * bpe);
+            for (size_t i = 0; i < linear.size(); ++i) linear[i] = (uint8_t)(i % 255u + 1u);  // never 0
+            const size_t bytes = tiled_volume_bytes(bw, bh, bd, M, bpe);
+            if (bytes != 4096 || elems * bpe != 4096) return false;
+            std::vector<uint8_t> tiled(bytes, 0);
+            if (!tile_volume(tiled.data(), tiled.size(), linear.data(), bw, bh, bd, M, bpe))
+                return false;
+            for (uint8_t b : tiled) if (b == 0) return false;   // an unwritten byte => a collision
+            return true;
+        };
+        CHECK(covers_block_bijectively(1, 16, 16, 16) &&
+              covers_block_bijectively(2,  8, 16, 16) &&
+              covers_block_bijectively(4,  8, 16,  8) &&
+              covers_block_bijectively(8,  8,  8,  8) &&
+              covers_block_bijectively(16, 4,  8,  8),
+              "SW_4KB_S3 maps one block bijectively for every texel size — full coverage, no aliasing");
     }
 
     // GFX10 thin/view-as-2D 3D SW_64KB_R_X. Each Z slice owns a padded 2D block grid, while Z
