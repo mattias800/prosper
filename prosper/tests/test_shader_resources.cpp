@@ -528,6 +528,38 @@ int main() {
     CHECK(!dr.ok() && has_issue(dr, DescriptorIssueCode::DuplicateBinding),
           "duplicate runtime binding is rejected as ambiguous");
 
+    // --- validate_runtime_descriptor_contract: the mode-carrying overload (#2239 candidate 3) ---
+    //
+    // The per-draw form takes its mode from the caller so a hot loop can hoist the getenv to submit
+    // scope. These four arms pin the property that makes that split safe, in both directions: the
+    // overload must honour the mode it is GIVEN and ignore the environment, while the original
+    // signature must keep reading the environment LIVE -- this file and test_gpu_capture_render.cpp
+    // both arm the variable at runtime, and a cached read would make those arms vacuous rather than
+    // failing (#2214, gated by cached_env_arming_logic).
+    //
+    // `missing` is an empty table against a module that statically uses binding 9, so strict
+    // validation must REJECT it. That is what makes each arm falsifiable: without a table that
+    // genuinely fails, an arm returning true because validation was switched off would be
+    // indistinguishable from one returning true because validation ran and passed.
+    set_descriptor_mode("");                         // environment says: validation off
+    CHECK(!validate_runtime_descriptor_contract("test", spv, &missing, 0,
+                                                SpirvShaderStage::Vertex, "strict"),
+          "overload validates on the mode it is passed, with the environment cleared");
+    set_descriptor_mode("strict");                   // environment says: validation on
+    CHECK(validate_runtime_descriptor_contract("test", spv, &missing, 0,
+                                               SpirvShaderStage::Vertex, nullptr),
+          "overload ignores the environment: a null mode stays off even when the env says strict");
+    // The two arms above would both still pass if the overload read the environment AND the
+    // environment happened to agree with the argument. They cannot both pass in that case, which is
+    // the point of running them with the env and the argument set to OPPOSITE values.
+    CHECK(!validate_runtime_descriptor_contract("test", spv, &missing, 0,
+                                                SpirvShaderStage::Vertex),
+          "env-reading signature still rejects while the environment says strict");
+    set_descriptor_mode("");
+    CHECK(validate_runtime_descriptor_contract("test", spv, &missing, 0,
+                                               SpirvShaderStage::Vertex),
+          "env-reading signature still observes a runtime write that clears the mode");
+
     ShaderResource short_buffer = good; short_buffer.size = 16;
     ShaderResourceTable short_table; short_table.resources.push_back(short_buffer);
     auto sr = validate_spirv_descriptor_interface(spv, &short_table, 0, SpirvShaderStage::Vertex);

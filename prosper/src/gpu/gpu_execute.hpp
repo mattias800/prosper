@@ -804,6 +804,28 @@ bool validate_runtime_descriptor_contract(const char* stage_name,
                                            uint32_t expected_set,
                                            SpirvShaderStage expected_stage);
 
+// Same, with the mode string supplied by the caller instead of read here.
+//
+// For per-draw callers only, and the reason is measured rather than assumed. The form above reads
+// getenv on EVERY call and is invoked twice per draw, so the read is the entire cost of the fast
+// path: when the variable is unset the function returns on the very next line. On this Windows host
+// one missing getenv costs 1.26 us (86 environ entries, ~15 ns each on a linear scan), so at the
+// 2,179 draws/submit recorded beside the poison_R hoist in live_renderer.cpp that is 2 x 2,179 x
+// 1.26 us = 5.49 ms/submit spent discovering that a diagnostic is switched off. The renderer's own
+// build_resources partition measured this leaf at 5.77 ms/submit -- a 5% agreement with a number
+// derived independently, which is what established that the leaf is the read and not the work.
+//
+// `mode` must come from a live getenv hoisted to submit scope, NOT from PROSPER_ENV_VALUE:
+// test_gpu_capture_render.cpp and test_shader_resources.cpp arm PROSPER_DESCRIPTOR_VALIDATE at
+// runtime, and a process-lifetime cache would leave their second write unobserved -- the #2214
+// defect that `cached_env_arming_logic` gates. Passing nullptr means "unset", i.e. validation off.
+bool validate_runtime_descriptor_contract(const char* stage_name,
+                                           const std::vector<uint32_t>& spirv,
+                                           const ShaderResourceTable* runtime,
+                                           uint32_t expected_set,
+                                           SpirvShaderStage expected_stage,
+                                           const char* mode);
+
 // Byte size of one index element for a GpuState::index_type (the last SetIndexType value).
 // 0 -> 16-bit, 1 -> 32-bit, exactly Kyty's index_type_and_size switch (GraphicsRender.cpp:4724) and
 // the hardware VGT_INDEX_TYPE encoding; 0 is also the reset default, matching this title, which never
