@@ -118,12 +118,22 @@ int main() {
                 // while still printing [ok]. It is genuinely empty on macOS (malloc_size(64) == 64),
                 // on musl, and under ASan (which intercepts and returns the REQUESTED size) — so on
                 // those configurations this arm reports nothing and must say so rather than pass.
-                CHECK(usable > kNew,
-                      "the over-copy guard has a non-empty window (else the arm below is vacuous)");
-                bool slack_clean = true;
-                for (size_t i = kNew; i < usable && slack_clean; ++i) slack_clean = small[i] != 0xC3;
-                CHECK(slack_clean,
-                      "the copy is capped by the NEW size — no source bytes past it (over-copy guard)");
+                // An empty window is a property of the host allocator, NOT a defect in
+                // reallocalign, so it is reported and skipped rather than failed — macOS, musl and
+                // ASan are all legitimate configurations where no slack is inspectable, and failing
+                // there makes the suite red on a correct implementation. It must still be LOUD:
+                // running the loop anyway would print [ok] for an arm whose body never executed,
+                // which is precisely the vacuous pass this guard exists to prevent.
+                if (usable > kNew) {
+                    bool slack_clean = true;
+                    for (size_t i = kNew; i < usable && slack_clean; ++i) slack_clean = small[i] != 0xC3;
+                    CHECK(slack_clean,
+                          "the copy is capped by the NEW size — no source bytes past it (over-copy guard)");
+                } else {
+                    printf("  [skip] over-copy guard did NOT run: this allocator reports usable=%zu "
+                           "for a %zu-byte request, so there is no readable slack to inspect\n",
+                           usable, kNew);
+                }
 #endif
                 free_fn(U(small), 0, 0, 0, 0, 0);
             }
