@@ -1888,6 +1888,37 @@ int main() {
     CHECK(got32b.size()==1 && std::fabs(got32b[0]-10.0f)<1e-3f,
           "kernel 32b wide LDS stores and loads preserve both dwords of both VGPR pairs");
 
+    // Kernel 32b64eq: DS_WRITE2_B64 with OFFSET0 == OFFSET1 selects ONE address, so the hardware
+    // performs a single write and uses DATA0 only (RDNA2 ISA 70648 §10.4.3). The lowering used to
+    // store both pairs unconditionally, leaving DATA1 as the later write and therefore the winner --
+    // a subsequent read observes DATA1 where hardware preserves DATA0. Silent wrong data, no fault.
+    // The DS_WRITE2_B32 sibling above already had this guard; the 64-bit variant did not (#1473).
+    //
+    // The two pairs are chosen so the defect and the fix cannot produce the same answer:
+    //   DATA0 = v[1:2] = (1.0,  2.0)  -> read back and summed = 3.0   (correct)
+    //   DATA1 = v[3:4] = (4.0, -4.0)  -> read back and summed = 0.0   (the defect)
+    // A pair summing to the same value either way would pass whatever the lowering did.
+    const uint32_t code32b64eq[] = {
+        0x7e000280u,                // v_mov_b32 v0, 0        LDS address
+        0x7e0202f2u,                // v_mov_b32 v1, 1.0      DATA0 lo
+        0x7e0402f4u,                // v_mov_b32 v2, 2.0      DATA0 hi
+        0x7e0602f6u,                // v_mov_b32 v3, 4.0      DATA1 lo
+        0x7e0802f7u,                // v_mov_b32 v4, -4.0     DATA1 hi
+        0xd9380000u, 0x00030100u,   // ds_write2_b64 v0, v[1:2], v[3:4] offset0:0 offset1:0
+        0xbf8a0000u,                // s_waitcnt lgkmcnt(0)
+        0xd9d80000u, 0x05000000u,   // ds_read_b64 v[5:6], v0
+        0x060a0d05u,                // v_add_f32 v5, v5, v6
+        0xbf810000u,                // s_endpgm
+    };
+    std::vector<uint32_t> spv32b64eq = recompile_valu(
+        code32b64eq, sizeof(code32b64eq)/sizeof(code32b64eq[0]), 0, 5);
+    CHECK(!spv32b64eq.empty(),
+          "recompiled kernel 32b64eq (DS_WRITE2_B64 equal offsets) -> SPIR-V");
+    std::vector<float> got32b64eq = prosper::test::run_compute(
+        spv32b64eq, std::vector<float>(1), 1, 1);
+    CHECK(got32b64eq.size()==1 && std::fabs(got32b64eq[0]-3.0f)<1e-3f,
+          "kernel 32b64eq DS_WRITE2_B64 equal offsets keep DATA0, not DATA1");
+
     // Kernel 32b2: Astro Bot's loading-surface producer uses DS_READ2_B32 twice, first with
     // offset0/1=(0,1) and then (16,17). Populate those exact LDS locations with integers 1..4,
     // execute the two live instruction words, and make both return pairs observable as sum=10.
