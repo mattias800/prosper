@@ -34,6 +34,7 @@ using namespace prosper::gpu;
 // sceKernelReadTsc, so a GPU fence timestamp and a CPU TSC read lie on one timeline (#156).
 extern "C" uint64_t prosper_guest_tsc_ns();
 extern "C" void prosper_label_hist_dma_built(uint64_t addr, uint64_t cb, uint32_t src, uint8_t builder);
+extern "C" void prosper_label_hist_dump(uint64_t addr, char* out, unsigned cap);
 // #1226: uncapped total of PROSPER_WRITE_TRAP payload matches (see command_processor.cpp).
 extern "C" uint64_t prosper_gpu_write_trap_matches();
 extern "C" void prosper_dma_backing_write_fail_once_for_test();
@@ -2103,6 +2104,63 @@ int main() {
                 CHECK(got == g.want, msg);
             }
         }
+    }
+
+    // #2192: label_hist_report reserved 52 bytes per entry while one entry reaches 63, so the
+    // last admitted iteration truncated MID-ENTRY -- a half-written field, with nothing to tell
+    // the reader the remaining events were dropped rather than absent. This report is read from
+    // the fault handler, so "looks complete but is not" is the worst outcome available here.
+    //
+    // Two properties are asserted, and MEASURED AGAINST THE OLD CODE only one of them
+    // discriminates. Recorded here because it corrects the issue rather than confirming it:
+    //
+    //   1. no partial entry survives          -- PASSES on the unfixed code too
+    //   2. when entries are dropped, say so   -- FAILS on the unfixed code  <-- the real arm
+    //
+    // Why (1) does not fire: an entry is " %s%s@%llu/f%u:0x%llx", and reaching the 63-byte
+    // maximum needs a 20-digit `t_ms`. Through this API `t_ms` is a real millisecond clock, so an
+    // entry is ~44 bytes and the old 52-byte reserve was adequate for every REACHABLE input. The
+    // mid-entry truncation the issue describes is real arithmetic and unreachable in practice.
+    //
+    // So what this fix buys is the LEGIBILITY half, and that is worth having on its own: the old
+    // code stopped without saying it had stopped, and this report is read from the fault handler
+    // where "looks complete but is not" is the worst available outcome. (1) is kept as a
+    // regression guard for a future format that does reach the maximum -- not as a demonstration
+    // that it did.
+    {
+        const uint64_t addr = 0xdead0000ull;
+        for (int i = 0; i < 16; ++i)
+            prosper_label_hist_dma_built(addr, 0xfedcba9876543210ull, 0, 1);
+        char small[160];
+        prosper_label_hist_dump(addr, small, sizeof small);
+        const size_t len = strlen(small);
+        CHECK(len < sizeof small, "label_hist_report terminates inside its buffer");
+
+        // Every event this formatter emits carries ":0x" before its hex aux. A field cut
+        // mid-write does not -- which is exactly what a partial entry looks like.
+        bool partial = false;
+        for (size_t i = 0; i < len; ++i) {
+            if (small[i] != ' ') continue;
+            const char* field = small + i + 1;
+            const char* end = strchr(field, ' ');
+            const size_t flen = end ? (size_t)(end - field) : len - (i + 1);
+            if (flen == 0) continue;
+            if (field[0] == '+') break;      // the "+N more" marker is not an event
+            const char* colon = (const char*)memchr(field, ':', flen);
+            if (!colon || (size_t)(colon - field) + 3 > flen ||
+                colon[1] != '0' || colon[2] != 'x')
+                partial = true;
+        }
+        CHECK(!partial, "label_hist_report never emits a half-written event entry");
+        CHECK(strstr(small, "more") != nullptr,
+              "label_hist_report says how many events it dropped rather than ending silently");
+
+        // Control: with room for every entry the marker must NOT appear, so the assertion above
+        // cannot be satisfied by a formatter that always claims to have dropped something.
+        char roomy[2048];
+        prosper_label_hist_dump(addr, roomy, sizeof roomy);
+        CHECK(strstr(roomy, "more") == nullptr,
+              "label_hist_report claims no drops when everything fit");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

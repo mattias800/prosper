@@ -675,7 +675,21 @@ namespace {
         // still read `on >= sizeof out` as "this line truncated".
         char out[400]; int on = raw_fmt_advance(0, snprintf(out, sizeof out, "%s", tag), sizeof out);
         const char* p = spec;
-        while (*p && on < (int)sizeof out - 64) {
+        // #2192: the reserve was 64 while one append can reach 81 (" %.*s=%s" with slen capped at
+        // 40 and a 40-byte value buffer), so an admitted iteration could truncate mid-field.
+        //
+        // This site differs from the other three the issue lists, and the difference is worth
+        // stating because it changes what the defect IS: every cursor advance here goes through
+        // raw_fmt_advance, which saturates at `sizeof out`, and the flush below emits
+        // raw_write_trunc_mark() when it did. So truncation here was never SILENT -- the marker
+        // has always fired. The defect is only that the reserve did not match the format, so the
+        // loop admitted an entry it could not hold.
+        //
+        // Corrected to the true maximum rather than removed: the marker is the backstop, not the
+        // primary mechanism, and keeping the reserve means whole entries in the ordinary case
+        // instead of a marked partial one. If the format ever grows past this, the marker still
+        // catches it -- which is why 96 is safe to state as a number rather than fragile.
+        while (*p && on < (int)sizeof out - 96) {
             while (*p==';'||*p==','||*p==' ') p++;
             if (!*p) break;
             const char* start = p; uint64_t v = 0; bool have = false;

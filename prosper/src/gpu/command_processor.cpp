@@ -755,12 +755,36 @@ void label_hist_report(uint64_t addr, char* out, size_t cap) {
     // Exec events carry the folding submit entry point (#1226): D=SubmitDcb A=SubmitAcb
     // F=SubmitDcbFinal, absent when unknown/build-side — the cross-queue discriminator.
     static const char* qn[] = {"", "(D)", "(A)", "(F)"};
-    for (uint32_t i = first; i < n && off + 52 < cap; i++) {
+    // #2192: the reserve was 52 while one entry can reach 63 bytes
+    // (" %s%s@%llu/f%u:0x%llx" = 1 + 7 + 3 + 1 + 20 + 2 + 10 + 3 + 16), so the last admitted
+    // iteration truncated MID-ENTRY -- a half-written field with nothing to say the remaining
+    // events were dropped rather than absent. A truncated label-event ring is exactly the
+    // evidence this instrument exists to print, and it is read from the fault handler, so
+    // "looks complete but is not" is the worst outcome available here.
+    //
+    // Fixed by construction rather than by correcting the constant: append FIRST, and if the
+    // entry did not fit, roll the cursor back so no partial entry survives, then say how many
+    // were lost. There is no reserve left to drift out of step with the format string.
+    uint32_t dropped = 0;
+    for (uint32_t i = first; i < n; i++) {
         const LabelEvent& e = h.ev[i & 15];
-        int m = snprintf(out + off, cap - off, " %s%s@%llu/f%u:0x%llx",
-                         e.type <= 8 ? nm[e.type] : "?", e.origin <= 3 ? qn[e.origin] : "",
-                         (unsigned long long)e.t_ms, e.fold, (unsigned long long)e.aux);
-        if (m > 0) off += (size_t)m;
+        const size_t before = off;
+        const int m = off < cap ? snprintf(out + off, cap - off, " %s%s@%llu/f%u:0x%llx",
+                                           e.type <= 8 ? nm[e.type] : "?",
+                                           e.origin <= 3 ? qn[e.origin] : "",
+                                           (unsigned long long)e.t_ms, e.fold,
+                                           (unsigned long long)e.aux)
+                                : -1;
+        if (m > 0 && before + (size_t)m < cap) { off = before + (size_t)m; continue; }
+        out[before] = '\0';                  // drop the partial entry snprintf just wrote
+        dropped = n - i;
+        break;
+    }
+    // Written at a position that always fits, so reporting the loss cannot itself be the thing
+    // that overflows -- which is the failure class this whole change is about.
+    if (dropped && cap >= 24) {
+        const size_t at = off < cap - 24 ? off : cap - 24;
+        snprintf(out + at, cap - at, " +%u more", dropped);
     }
 }
 }
