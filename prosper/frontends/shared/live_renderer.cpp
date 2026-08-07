@@ -7358,10 +7358,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         totals.backend_gpu_wait_ms + totals.backend_readback_ms +
                         totals.backend_cleanup_ms;
                     fprintf(stderr,
+                            // detail is the SIX-term partition (target draw_setup record_upload
+                            // gpu_wait readback cleanup) and `other` is measured - detail, so the
+                            // row IS exhaustive. What it used to invite was summing NINE terms:
+                            // gpu_device and gpu_overhead are printed here too, and
+                            // gpu_overhead is COMPUTED as gpu_wait - gpu_device, so those two
+                            // add up to gpu_wait exactly and a nine-term sum double-counts it.
+                            // That is why the residual equalled gpu_wait to the hundredth
+                            // (#2248) -- not because gpu_wait was nested in a neighbour, but
+                            // because its own two CHILDREN were printed as its siblings.
+                            //
+                            // Parenthesised now, so the nesting is in the syntax rather than
+                            // recoverable only by arithmetic, and `other` is signed so the row
+                            // states whether it balances instead of leaving that to be derived.
                             "[render-timing] backend-submit calls=%.2f draws=%.1f avg_ms: measured=%.2f "
                             "detail=%.2f target=%.2f draw_setup=%.2f record_upload=%.2f "
-                            "gpu_wait=%.2f gpu_device=%.2f gpu_overhead=%.2f readback=%.2f "
-                            "cleanup=%.2f other=%.2f\n",
+                            "gpu_wait=%.2f (device=%.2f overhead=%.2f) readback=%.2f "
+                            "cleanup=%.2f other=%+.2f\n",
                             totals.backend_calls / nsub, totals.backend_draws / nsub,
                             totals.backend_ms / nsub, backend_detail_ms / nsub,
                             totals.backend_target_ms / nsub, totals.backend_draw_setup_ms / nsub,
@@ -7384,14 +7397,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (double)totals.flush_explicit / nsub,
                             (double)totals.flush_no_batch / nsub);
                     fprintf(stderr,
+                            // draw_setup is the PARENT one line above; these four are its leaves
+                            // and they did not add up to it -- 75.16 against 82.46 in the window
+                            // that found this, a 7.30 ms gap nothing named (#2249). An unmeasured
+                            // region does not read as unmeasured, it reads as somebody else's
+                            // cost, and 7.30 ms is small enough that nobody chases it and large
+                            // enough to hide an instrument -- which is exactly how trap 130's
+                            // 305 ms/submit got billed to the renderer.
                             "[render-timing] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
-                            "resources=%.2f pipeline=%.2f  fixed{index_upload=%.2f blend=%.2f "
+                            "resources=%.2f pipeline=%.2f other=%+.2f  fixed{index_upload=%.2f blend=%.2f "
                             "depth_stencil=%.2f viewport=%.2f stages=%.2f pre_index_unsplit=%.2f "
                             "other=%+.2f} pre_index{subgroup_scan=%.2f other=%+.2f}\n",
                             totals.backend_setup_shader_ms / nsub,
                             totals.backend_setup_fixed_ms / nsub,
                             totals.backend_setup_resources_ms / nsub,
                             totals.backend_setup_pipeline_ms / nsub,
+                            (totals.backend_draw_setup_ms - totals.backend_setup_shader_ms -
+                             totals.backend_setup_fixed_ms - totals.backend_setup_resources_ms -
+                             totals.backend_setup_pipeline_ms) / nsub,
                             totals.backend_res_fixed_index_upload_ms / nsub,
                             totals.backend_res_fixed_blend_ms / nsub,
                             totals.backend_res_fixed_depth_stencil_ms / nsub,
@@ -7772,10 +7795,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         window.backend_gpu_wait_ms + window.backend_readback_ms +
                         window.backend_cleanup_ms;
                     fprintf(stderr,
+                            // detail is the SIX-term partition (target draw_setup record_upload
+                            // gpu_wait readback cleanup) and `other` is measured - detail, so the
+                            // row IS exhaustive. What it used to invite was summing NINE terms:
+                            // gpu_device and gpu_overhead are printed here too, and
+                            // gpu_overhead is COMPUTED as gpu_wait - gpu_device, so those two
+                            // add up to gpu_wait exactly and a nine-term sum double-counts it.
+                            // That is why the residual equalled gpu_wait to the hundredth
+                            // (#2248) -- not because gpu_wait was nested in a neighbour, but
+                            // because its own two CHILDREN were printed as its siblings.
+                            //
+                            // Parenthesised now, so the nesting is in the syntax rather than
+                            // recoverable only by arithmetic, and `other` is signed so the row
+                            // states whether it balances instead of leaving that to be derived.
                             "[render-window] backend-submit calls=%.2f draws=%.1f avg_ms: measured=%.2f "
                             "detail=%.2f target=%.2f draw_setup=%.2f record_upload=%.2f "
-                            "gpu_wait=%.2f gpu_device=%.2f gpu_overhead=%.2f readback=%.2f "
-                            "cleanup=%.2f other=%.2f\n",
+                            "gpu_wait=%.2f (device=%.2f overhead=%.2f) readback=%.2f "
+                            "cleanup=%.2f other=%+.2f\n",
                             window.backend_calls / wn, window.backend_draws / wn,
                             window.backend_ms / wn, window_backend_detail_ms / wn,
                             window.backend_target_ms / wn, window.backend_draw_setup_ms / wn,
@@ -7799,13 +7835,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (double)window.flush_no_batch / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
-                            "resources=%.2f pipeline=%.2f  fixed{index_upload=%.2f blend=%.2f "
+                            "resources=%.2f pipeline=%.2f other=%+.2f  fixed{index_upload=%.2f blend=%.2f "
                             "depth_stencil=%.2f viewport=%.2f stages=%.2f pre_index_unsplit=%.2f "
                             "other=%+.2f} pre_index{subgroup_scan=%.2f other=%+.2f}\n",
                             window.backend_setup_shader_ms / wn,
                             window.backend_setup_fixed_ms / wn,
                             window.backend_setup_resources_ms / wn,
                             window.backend_setup_pipeline_ms / wn,
+                            (window.backend_draw_setup_ms - window.backend_setup_shader_ms -
+                             window.backend_setup_fixed_ms - window.backend_setup_resources_ms -
+                             window.backend_setup_pipeline_ms) / wn,
                             window.backend_res_fixed_index_upload_ms / wn,
                             window.backend_res_fixed_blend_ms / wn,
                             window.backend_res_fixed_depth_stencil_ms / wn,
