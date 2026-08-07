@@ -172,6 +172,30 @@ int main() {
         const std::vector<uint8_t> px_three = prosper::test::render_draws_rgba({three}, W, H);
         const std::vector<uint8_t> px_three_indexed =
             prosper::test::render_draws_rgba({three_indexed}, W, H);
+        // A NON-ZERO index-buffer arena offset, which nothing else in the suite reaches (#2253).
+        //
+        // Every other indexed draw here and in test_indexed_render is alone in its
+        // render_draws_rgba() call, so each gets a fresh arena and binds at offset 0 — the one
+        // value that is still correct if `v.ioffset` were dropped from the bind sites entirely.
+        // Those arms therefore cannot fail for the reason they appear to cover.
+        //
+        // Two indexed draws in ONE pass puts the second at align_storage_offset(12), non-zero by
+        // construction. The index DATA must differ for the offset to matter: identical payloads
+        // would render the same picture from either slice and the arm would be void. So the second
+        // draw is degenerate ({0,0,0} collapses the triangle to a point, contributing nothing) and
+        // the pass must match a single ordinary draw. Bind the second at offset 0 and it reads the
+        // FIRST draw's {0,1,2}, drawing a second additive triangle — visible immediately.
+        //
+        // Verified by mutation, not assumed: hardcoding 0 at both vkCmdBindIndexBuffer sites turns
+        // this arm red and leaves the rest of the file green.
+        prosper::test::BackendDraw first_indexed = one;  first_indexed.indices = {0, 1, 2};
+        prosper::test::BackendDraw second_degenerate = one; second_degenerate.indices = {0, 0, 0};
+        const std::vector<uint8_t> px_pair =
+            prosper::test::render_draws_rgba({first_indexed, second_degenerate}, W, H);
+        CHECK(px_pair == px_one,
+              "a second indexed draw in one pass reads ITS OWN slice at a non-zero arena offset "
+              "(degenerate indices contribute nothing; binding at 0 would re-draw the first)");
+
         const uint8_t* zero_center = center(px_zero);
         const uint8_t* one_center = center(px_one);
         const uint8_t* three_center = center(px_three);

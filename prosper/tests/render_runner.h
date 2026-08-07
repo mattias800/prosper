@@ -1942,9 +1942,15 @@ inline RenderHostBuffer acquire_render_host_buffer(const RenderVkCtx& ctx,
     info.size = capacity;
     // INDEX as well as STORAGE, so one pool serves both. Index data used to take a dedicated
     // vkCreateBuffer + vkAllocateMemory per indexed draw -- 55% of setup_fixed_ms and ~9% of a Blue
-    // Prince gameplay frame (#2253, measured by #2252's partition). Usage flags are capability
-    // declarations, so widening them does not change how existing storage users bind or write these
-    // buffers; it only makes the same memory legal for vkCmdBindIndexBuffer.
+    // Prince gameplay frame (#2253, measured by #2252's partition).
+    //
+    // Widening the usage does not change how existing storage users BIND or WRITE these buffers; it
+    // only makes the same memory legal for vkCmdBindIndexBuffer. It is not entirely free of the
+    // storage path, though, and the honest statement is about ALLOCATION rather than binding: an
+    // added usage bit can only narrow memoryRequirements.memoryTypeBits, so on a hypothetical device
+    // with no HOST_VISIBLE type accepting INDEX usage the arena would fail to allocate and the
+    // STORAGE path would fall back with it. That is a performance regression rather than a
+    // correctness one -- the dedicated-buffer fallback covers both -- and no such device is known.
     info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     if (vkCreateBuffer(ctx.dev, &info, nullptr, &buffer.buffer) != VK_SUCCESS)
         return {};
@@ -4176,9 +4182,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             //
             // Alignment: arena slices are aligned to storage_buffer_alignment, which is a
             // power of two >= 16 on every device prosper runs on and therefore a multiple of the 4
-            // bytes vkCmdBindIndexBuffer requires for VK_INDEX_TYPE_UINT32. Asserted below rather
-            // than assumed, because a violated bind offset is undefined behaviour and not a
-            // validation-visible failure on every driver.
+            // bytes vkCmdBindIndexBuffer requires for VK_INDEX_TYPE_UINT32. The `(offset % 4) == 0`
+            // term below is a GUARD, not an assertion: a violation quietly takes the dedicated-buffer
+            // fallback rather than failing, which is the safer behaviour because a bad bind offset is
+            // undefined behaviour rather than a reliably reported error. It must NOT become an
+            // assert -- when the guard rejects, acquire_buffer_arena_slice has already advanced
+            // arena.used, so the slice is leaked for the remainder of the pass. Unreachable while
+            // storage_buffer_alignment >= 4, i.e. on every real device.
             // PROSPER_NO_INDEX_ARENA: opt out of the index arena ONLY, leaving the storage
             // arena on. Without it the single-variable A/B for this change does not exist:
             // PROSPER_NO_BACKEND_BUFFER_ARENA disables both, so it measures "arena vs no arena"
