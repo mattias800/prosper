@@ -1225,6 +1225,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 uint64_t persistent_validation_bytes = 0;
                 uint64_t persistent_watch_reuses = 0, persistent_watch_dirty = 0;
                 uint64_t persistent_watch_unknown = 0, persistent_watch_disabled = 0;
+                // WHY in-submit reuse never fires (#2289). persistent_submit_reuses is 0 across
+                // 55,820 hits on PPSA25009, and the two ways that happens have OPPOSITE prospects:
+                // Unknown means prosper is not tracking guest writes on this path at all (fixable,
+                // and worth ~9x, since the same texture is referenced 9.5 times per submit), while
+                // Overlap means the guest genuinely rewrote those bytes and the revalidation is
+                // CORRECT. A single zero cannot tell those apart, so count them separately.
+                uint64_t persistent_submit_unknown = 0, persistent_submit_overlap = 0;
                 uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                 double texture_ms = 0, buffer_ms = 0;
                 // Attribution of texture_ms by OUTCOME class (#2262). After #2259 removed the
@@ -2980,6 +2987,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     : prosper::gpu::GuestGpuWriteQuery::Unknown;
                                 resource_texture_submit_query =
                                     static_cast<int>(submit_query);
+                                if (timing_enabled && submit_reuse_enabled) {
+                                    if (submit_query == prosper::gpu::GuestGpuWriteQuery::Unknown)
+                                        pending_timing.persistent_submit_unknown++;
+                                    else if (submit_query == prosper::gpu::GuestGpuWriteQuery::Overlap)
+                                        pending_timing.persistent_submit_overlap++;
+                                }
                                 const bool submit_unchanged = submit_reuse_enabled &&
                                     submit_query == prosper::gpu::GuestGpuWriteQuery::Unchanged;
                                 prosper::host::GuestWriteWatchQuery watch_query =
@@ -7038,6 +7051,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t persistent_validation_bytes = 0;
                     uint64_t persistent_watch_reuses = 0, persistent_watch_dirty = 0;
                     uint64_t persistent_watch_unknown = 0, persistent_watch_disabled = 0;
+                    uint64_t persistent_submit_unknown = 0, persistent_submit_overlap = 0;
                     uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                     double texture_ms = 0, buffer_ms = 0;
                     // Attribution of texture_ms by OUTCOME class (#2262). After #2259 removed the
@@ -7153,6 +7167,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.persistent_watch_reuses += pending_timing.persistent_watch_reuses;
                     timing.persistent_watch_dirty += pending_timing.persistent_watch_dirty;
                     timing.persistent_watch_unknown += pending_timing.persistent_watch_unknown;
+                    timing.persistent_submit_unknown += pending_timing.persistent_submit_unknown;
+                    timing.persistent_submit_overlap += pending_timing.persistent_submit_overlap;
                     timing.persistent_watch_disabled += pending_timing.persistent_watch_disabled;
                     timing.buffers += pending_timing.buffers;
                     timing.buffer_views += pending_timing.buffer_views;
@@ -7506,13 +7522,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                     }
                     fprintf(stderr,
-                            "[render-timing] texture_cache hits=%llu submit_reuse=%llu misses=%llu "
+                            "[render-timing] texture_cache hits=%llu submit_reuse=%llu "
+                            "(submit_unknown=%llu submit_overlap=%llu) misses=%llu "
                             "watch_reuse=%llu watch_dirty=%llu watch_unknown=%llu watch_disabled=%llu "
                             "invalid=%llu "
                             "validations=%llu %.1f GiB entries=%zu %.1f MiB "
                             "(source=%.1f pixels=%.1f MiB watch-only=%zu saved=%.1f MiB)\n",
                             (unsigned long long)totals.persistent_hits,
                             (unsigned long long)totals.persistent_submit_reuses,
+                            (unsigned long long)totals.persistent_submit_unknown,
+                            (unsigned long long)totals.persistent_submit_overlap,
                             (unsigned long long)totals.persistent_misses,
                             (unsigned long long)totals.persistent_watch_reuses,
                             (unsigned long long)totals.persistent_watch_dirty,
