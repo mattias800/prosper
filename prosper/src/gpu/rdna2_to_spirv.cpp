@@ -10712,9 +10712,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
                 b.lds_store(b.ibin(Op_IAdd, idx0, b.uconst(1)), vread(in.src[1].value + 1),
                             rs.exec_narrowed, rs.exec);
-                b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
-                b.lds_store(b.ibin(Op_IAdd, idx1, b.uconst(1)), vread(in.src[2].value + 1),
-                            rs.exec_narrowed, rs.exec);
+                // OFFSET0 == OFFSET1 selects ONE address: the hardware performs a single write and
+                // uses DATA0 only (RDNA2 ISA 70648 §10.4.3). Writing DATA1 as well leaves the later
+                // store winning, so a subsequent LDS read observes DATA1 where hardware preserves
+                // DATA0 -- silent wrong data rather than a fault. The ds_write2_b32 case above
+                // already guards this; the 64-bit variant did not (#1473).
+                if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu)) {
+                    b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
+                    b.lds_store(b.ibin(Op_IAdd, idx1, b.uconst(1)), vread(in.src[2].value + 1),
+                                rs.exec_narrowed, rs.exec);
+                }
                 return true;
             }
             if (in.opcode == 0x0e) {                    // ds_write2_b32: two dwords at offset0/offset1
