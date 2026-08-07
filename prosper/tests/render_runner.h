@@ -633,8 +633,15 @@ struct BackendRenderTimingStats {
     // create_transient_storage_buffer_upload — the fallback taken when a payload gets neither an
     // arena slice nor a pooled buffer. Timed by neither acquire nor copy before this.
     double res_buffer_create_ms = 0;
-    // shared_buffer_indices find + emplace, shared_buffers push_back, buffer_ref_memo emplace.
-    double res_buffer_index_ms = 0;
+    // Split rather than one `index` bucket, because the two run over populations that differ by
+    // ~5x and imply opposite fixes. `find` and the memo emplace are per REFERENCE (8.0M on the
+    // #2245 run); the insert is per UNIQUE BUFFER (1.56M). If lookup dominates, the fix is the key
+    // or the container; if insert dominates, there are simply many unique buffers and the fix is
+    // upstream of the index entirely — the same distinction #2245 exists to draw between
+    // skipped_unique and skipped_large. Summing them would be one more conflated bucket read as an
+    // exhaustive one, which is the failure this whole change is about.
+    double res_buffer_index_find_ms = 0;
+    double res_buffer_index_insert_ms = 0;
     // hash_buffer_words over payloads <= 4 KiB (large ones take a unique tag and skip it).
     double res_buffer_hash_ms = 0;
     double res_descriptor_ms = 0;
@@ -644,7 +651,7 @@ struct BackendRenderTimingStats {
     // Clamping this to zero would make a broken instrument print identically to a correct one.
     double res_buffer_other_ms() const {
         return res_buffer_ms - res_buffer_acquire_ms - res_buffer_copy_ms - res_buffer_create_ms -
-               res_buffer_index_ms - res_buffer_hash_ms;
+               res_buffer_index_find_ms - res_buffer_index_insert_ms - res_buffer_hash_ms;
     }
 
     double total_ms() const {
@@ -3882,7 +3889,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     double res_buffer_acquire_ms = 0.0;
     double res_buffer_copy_ms = 0.0;
     double res_buffer_create_ms = 0.0;
-    double res_buffer_index_ms = 0.0;
+    double res_buffer_index_find_ms = 0.0;
+    double res_buffer_index_insert_ms = 0.0;
     double res_buffer_hash_ms = 0.0;
     double res_descriptor_ms = 0.0;
     auto setup_elapsed_ms = [](auto begin, auto end) {
@@ -4872,7 +4880,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         hash_dedup ? 0 : ++resource_unique_tag};
                     auto buffer_found = shared_buffer_indices.end();
                     {
-                        const ResourcePhaseTimer phase_index(timing_enabled, &res_buffer_index_ms);
+                        const ResourcePhaseTimer phase_index(timing_enabled,
+                                                             &res_buffer_index_find_ms);
                         buffer_found = shared_buffer_indices.find(buffer_key);
                     }
                     if (buffer_found != shared_buffer_indices.end()) {
@@ -4945,7 +4954,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         }
                         {
                             const ResourcePhaseTimer phase_index(timing_enabled,
-                                                                 &res_buffer_index_ms);
+                                                                 &res_buffer_index_insert_ms);
                             shared_buffers.push_back(upload);
                             shared_buffer_indices.emplace(buffer_key, buffer_index);
                         }
@@ -4953,7 +4962,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         ++backend_hash_stats_totals().unique_buffers;
                     }
                     if (shareable) {
-                        const ResourcePhaseTimer phase_index(timing_enabled, &res_buffer_index_ms);
+                        const ResourcePhaseTimer phase_index(timing_enabled,
+                                                             &res_buffer_index_find_ms);
                         buffer_ref_memo.emplace(memo_key, buffer_index);
                     }
                     }
@@ -6531,7 +6541,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.res_buffer_acquire_ms = res_buffer_acquire_ms;
         call_timing.res_buffer_copy_ms = res_buffer_copy_ms;
         call_timing.res_buffer_create_ms = res_buffer_create_ms;
-        call_timing.res_buffer_index_ms = res_buffer_index_ms;
+        call_timing.res_buffer_index_find_ms = res_buffer_index_find_ms;
+        call_timing.res_buffer_index_insert_ms = res_buffer_index_insert_ms;
         call_timing.res_buffer_hash_ms = res_buffer_hash_ms;
         call_timing.res_descriptor_ms = res_descriptor_ms;
         call_timing.setup_pipeline_ms = setup_pipeline_ms;
@@ -6864,7 +6875,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(res_buffer_acquire_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_copy_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_create_ms);
-            PROSPER_SUM_TIMING_STAT(res_buffer_index_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_index_find_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_index_insert_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_hash_ms);
             PROSPER_SUM_TIMING_STAT(res_descriptor_ms);
             PROSPER_SUM_TIMING_STAT(setup_pipeline_ms);

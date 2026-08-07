@@ -65,7 +65,8 @@ struct RendererTimingRecord {
     // clamping it would make a broken partition look like a complete one (#2245).
     double res_buffer_copy_ms = 0;
     double res_buffer_create_ms = 0;
-    double res_buffer_index_ms = 0;
+    double res_buffer_index_find_ms = 0;
+    double res_buffer_index_insert_ms = 0;
     double res_buffer_hash_ms = 0;
     double res_descriptor_ms = 0;
 };
