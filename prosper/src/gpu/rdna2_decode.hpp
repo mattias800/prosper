@@ -48,6 +48,14 @@ float inline_float_value(uint32_t code);
 // rdna2_decode.cpp. This is a property of the ENCODING, so it is shared: the decoder's SDWA
 // admission and the recompiler's EXEC/mask bookkeeping must not carry separate copies (#2120).
 bool vopc_is_cmpx(uint32_t opcode);
+// True for the VOP1 f16 unary family: one f16 operand in, one f16 result out, no side effects —
+// 0x54-0x58 (rcp/sqrt/rsq/log/exp) and 0x5B-0x61 (floor/ceil/trunc/rndne/fract/sin/cos). The two
+// FREXP opcodes 0x59/0x5A sit inside that numeric span and are deliberately excluded: 0x59 returns a
+// mantissa and 0x5A returns an **i16** exponent, so neither is the shape the shared lowering
+// implements. Like `vopc_is_cmpx`, this is a property of the ENCODING and is shared rather than
+// copied: the decoder's SDWA admission and the recompiler's `emit_f16_unary` must have exactly one
+// domain between them, or an opcode gains support in one form and not the other (#2013).
+bool vop1_is_f16_unary(uint32_t opcode);
 
 struct Rdna2Inst {
     Rdna2Format fmt = Rdna2Format::Unknown;
@@ -83,6 +91,15 @@ struct Rdna2Inst {
     // `v_mov_b32_sdwa … dst_sel:WORD_0 src0_sel:WORD_1`). 6 = DWORD (the default / no select);
     // 4/5 = WORD_0/WORD_1. Only combos the recompiler models clear has_modifier.
     uint8_t     sdwa_dst_sel = 6, sdwa_dst_unused = 0, sdwa_src0_sel = 6, sdwa_src1_sel = 6;
+    // SDWA S0_SEXT / S1_SEXT (dword1 bits 19 and 27): the selected sub-dword source field is
+    // SIGN-extended to 32 bits rather than zero-extended. A different operation from the
+    // zero-extending form, so these are only set for encodings whose lowering honours them —
+    // `v_mov_b32_sdwa` into a full DWORD destination and the integer VOP2 SDWA ops (Sonic Racing:
+    // CrossWorlds' compute kernels, #2013). Every other SDWA admission still requires the bits
+    // clear, which keeps an unmodelled sign extension fail-visible. A set bit is only ever admitted
+    // alongside a real sub-dword select: SEXT of a full DWORD field is not exercised by any live
+    // encoding here, so it stays rejected rather than assumed to be a no-op.
+    bool        sdwa_src0_sext = false, sdwa_src1_sext = false;
 
     // Decoded operands. `opcode` is the format-local opcode; `dst` the destination (or VDATA source
     // base for memory stores); `src[0..n_src-1]` the remaining sources. simm16 holds the signed

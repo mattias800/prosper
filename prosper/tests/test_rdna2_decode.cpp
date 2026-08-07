@@ -224,6 +224,48 @@ int main() {
           fc.sdwa_src0_sel == 5u && fc.sdwa_src1_sel == 6u,
           "VOPC f16 SDWA WORD_1 source select is decoded for recompilation");
 
+    // #2013: SDWA S0_SEXT / S1_SEXT (dword1 bits 19 and 27) — sign-extending the selected sub-dword
+    // source is a DIFFERENT operation from zero-extending it, so the bit must reach the recompiler
+    // rather than be folded into the select. Asserted at the DECODE level because the execution
+    // kernels in test_rdna2_to_spirv observe only the composed result: a decoder that dropped the
+    // flag and a lowering that ignored it are indistinguishable there.
+    // Sonic Racing: CrossWorlds, `v_mov_b32_sdwa v14, sext(v8) dst_sel:DWORD dst_unused:UNUSED_PAD
+    // src0_sel:WORD_0` and the same instruction with the SEXT bit cleared.
+    const uint32_t mov_sext[] = { 0x7e1c02f9u, 0x000c0608u };
+    Rdna2Inst ms = rdna2_decode_one(mov_sext, 2);
+    CHECK(ms.fmt == Rdna2Format::VOP1 && ms.opcode == 0x01u && !ms.has_modifier &&
+          ms.sdwa_dst_sel == 6u && ms.sdwa_src0_sel == 4u && ms.sdwa_src0_sext,
+          "VOP1 v_mov_b32_sdwa carries S0_SEXT alongside its WORD source select");
+    const uint32_t mov_zext[] = { 0x7e1c02f9u, 0x00040608u };
+    Rdna2Inst mz = rdna2_decode_one(mov_zext, 2);
+    CHECK(mz.fmt == Rdna2Format::VOP1 && mz.opcode == 0x01u && !mz.has_modifier &&
+          mz.sdwa_src0_sel == 4u && !mz.sdwa_src0_sext,
+          "the same encoding without bit 19 decodes as the zero-extending form");
+    // `v_add_nc_u32_sdwa v4, 8, sext(v5) src0_sel:DWORD src1_sel:WORD_0`: SEXT on the SECOND source
+    // only, which is the field the two per-source flags exist to keep apart.
+    const uint32_t add_s1_sext[] = { 0x4a080af9u, 0x0c860688u };
+    Rdna2Inst as1 = rdna2_decode_one(add_s1_sext, 2);
+    CHECK(as1.fmt == Rdna2Format::VOP2 && as1.opcode == 0x25u && !as1.has_modifier &&
+          as1.sdwa_src1_sel == 4u && as1.sdwa_src1_sext && !as1.sdwa_src0_sext,
+          "VOP2 SDWA carries S1_SEXT independently of S0_SEXT");
+    // SEXT on a full-DWORD source select is a combination no live encoding produces, so it stays
+    // fail-visible rather than being admitted as a no-op. Same instruction, src1_sel:DWORD.
+    const uint32_t add_sext_dword[] = { 0x4a080af9u, 0x0e860688u };
+    Rdna2Inst asd = rdna2_decode_one(add_sext_dword, 2);
+    CHECK(asd.fmt == Rdna2Format::VOP2 && asd.len_dwords == 2 && asd.has_modifier,
+          "VOP2 SDWA with SEXT on a DWORD source select is 2 dwords and still has_modifier");
+    // The f16 unary family's two holes: 0x59/0x5A return a mantissa and an i16 exponent, so they are
+    // outside the shared one-in-one-out lowering and their SDWA form must not decode as admitted.
+    CHECK(vop1_is_f16_unary(0x54u) && vop1_is_f16_unary(0x58u) && vop1_is_f16_unary(0x5Bu) &&
+          vop1_is_f16_unary(0x61u) && !vop1_is_f16_unary(0x59u) && !vop1_is_f16_unary(0x5Au) &&
+          !vop1_is_f16_unary(0x53u) && !vop1_is_f16_unary(0x62u),
+          "vop1_is_f16_unary spans 0x54-0x58 and 0x5B-0x61 and excludes the FREXP pair");
+    const uint32_t frexp_sdwa[] = { 0x7e0cb2f9u, 0x00051406u };
+    Rdna2Inst fx = rdna2_decode_one(frexp_sdwa, 2);
+    CHECK(fx.fmt == Rdna2Format::VOP1 && fx.opcode == 0x59u && fx.len_dwords == 2 &&
+          fx.has_modifier,
+          "v_frexp_mant_f16_sdwa is 2 dwords and stays fail-visible");
+
     // #2120: the cmpx opcode windows, which the decoder's SDWA admission and the recompiler's
     // EXEC/mask bookkeeping used to define separately. The decoder listed three of the six, so
     // `v_cmpx_*_u16` worked in its plain e32 form and REJECTED in SDWA. Boundaries are asserted

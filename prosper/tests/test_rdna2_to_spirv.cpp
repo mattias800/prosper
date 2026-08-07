@@ -3512,6 +3512,125 @@ int main() {
     CHECK(got32r20.size()==1 && bits_of(got32r20[0])==0xaaaabbbbu,
           "kernel 32r20 composes the SDWA source select with the 16-bit compare narrowing");
 
+    // Kernel 32r21a (LIVE, exec_cs_29400bcf00 pc=1242 and exec_cs_298009d800 pc=1319): the
+    // SIGN-EXTENDING sub-dword move. #2115 implemented the zero-extending form (kernel 32r4); this
+    // is the same opcode with SDWA S0_SEXT set, which master rejected — the first unhandled
+    // instruction in two of Sonic Racing: CrossWorlds' eight skipped compute programs (#2013).
+    // 0x1234fffe's WORD_0 is 0xfffe = -2, so the whole destination dword must read 0xfffffffe. A
+    // zero-extending lowering yields 0x0000fffe, which is the discriminating value: this kernel
+    // fails on master (empty SPIR-V) and would fail again on any lowering that ignored the bit.
+    const uint32_t code32r21a[] = {
+        0x7e1002ffu, 0x1234fffeu,            // v_mov_b32 v8, 0x1234fffe
+        0x7e1c02ffu, 0x11111111u,            // v_mov_b32 v14, 0x11111111 (UNUSED_PAD must discard)
+        0x7e1c02f9u, 0x000c0608u,            // v_mov_b32_sdwa v14, sext(v8) DWORD/PAD src0_sel:WORD_0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r21a = recompile_valu(code32r21a, std::size(code32r21a), 0, 14);
+    CHECK(!spv32r21a.empty(), "recompiled kernel 32r21a (live v_mov_b32_sdwa sext WORD_0) -> SPIR-V");
+    std::vector<float> got32r21a = spv32r21a.empty()
+        ? std::vector<float>()
+        : prosper::test::run_compute(spv32r21a, std::vector<float>(1), 1, 1);
+    CHECK(got32r21a.size()==1 && bits_of(got32r21a[0])==0xfffffffeu,
+          "kernel 32r21a sign-extends the selected source word across the whole destination");
+
+    // Kernel 32r21b (LIVE, exec_cs_27c0183000 pc=364): the same instruction selecting a BYTE rather
+    // than a WORD, so the extension width is exercised too. BYTE_1 of 0x0000ab00 is 0xab = -85.
+    const uint32_t code32r21b[] = {
+        0x7e3202ffu, 0x0000ab00u,            // v_mov_b32 v25, 0xab00
+        0x7e3202f9u, 0x00090619u,            // v_mov_b32_sdwa v25, sext(v25) DWORD/PAD src0_sel:BYTE_1
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r21b = recompile_valu(code32r21b, std::size(code32r21b), 0, 25);
+    CHECK(!spv32r21b.empty(), "recompiled kernel 32r21b (live v_mov_b32_sdwa sext BYTE_1) -> SPIR-V");
+    std::vector<float> got32r21b = spv32r21b.empty()
+        ? std::vector<float>()
+        : prosper::test::run_compute(spv32r21b, std::vector<float>(1), 1, 1);
+    CHECK(got32r21b.size()==1 && bits_of(got32r21b[0])==0xffffffabu,
+          "kernel 32r21b sign-extends a selected source BYTE, not just a word");
+
+    // Kernel 32r22a (LIVE, exec_cs_290000eb00 pc=1157): `v_rndne_f16_sdwa`. The recompiler's plain
+    // e32 lowering covers the whole VOP1 f16 unary family, but its SDWA word-select sibling admitted
+    // only rcp/sqrt/cos — so a rounder in that form rejected the program (#2013).
+    // **Two inputs are needed to pin the rounding mode, and one is not enough.** 3.5 -> 4.0 rules out
+    // floor and trunc (both 3.0) but is satisfied by ceil AND by round-half-AWAY; 2.5 -> 2.0 rules
+    // out ceil and round-half-away (both 3.0) but is satisfied by floor and trunc. Only
+    // round-half-to-EVEN satisfies both, so the kernel runs the live encoding twice on different
+    // registers. Each also preserves its untouched high half.
+    const uint32_t code32r22a[] = {
+        0x7e0c02ffu, 0x4300beefu,            // v_mov_b32 v6, {hi=f16 3.5, lo=0xbeef}
+        0x7e0e02ffu, 0x4100beefu,            // v_mov_b32 v7, {hi=f16 2.5, lo=0xbeef}
+        0x7e0cbcf9u, 0x00051406u,            // v_rndne_f16_sdwa v6, v6 WORD_0/PRESERVE src0_sel:WORD_1
+        0x7e0ebcf9u, 0x00051407u,            // v_rndne_f16_sdwa v7, v7 WORD_0/PRESERVE src0_sel:WORD_1
+        0x3a100f06u,                          // v_xor_b32 v8, v6, v7
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r22a = recompile_valu(code32r22a, std::size(code32r22a), 0, 8);
+    CHECK(!spv32r22a.empty(), "recompiled kernel 32r22a (live v_rndne_f16_sdwa) -> SPIR-V");
+    std::vector<float> got32r22a = spv32r22a.empty()
+        ? std::vector<float>()
+        : prosper::test::run_compute(spv32r22a, std::vector<float>(1), 1, 1);
+    // v6 = 0x43004400 (3.5 -> 4.0), v7 = 0x41004000 (2.5 -> 2.0); xor = 0x02000400.
+    CHECK(got32r22a.size()==1 && bits_of(got32r22a[0])==0x02000400u,
+          "kernel 32r22a rounds half to EVEN in both directions and preserves each high half");
+
+    // Kernel 32r22b (LIVE, exec_cs_2a80007800 pc=1765): `v_ceil_f16_sdwa`, writing the OPPOSITE
+    // destination half from 32r22a so the insert/preserve pair is covered in both directions. 2.5
+    // discriminates ceil (3.0 = 0x4200) from rndne, floor and trunc, which all give 2.0.
+    const uint32_t code32r22b[] = {
+        0x7e1402ffu, 0x4100cafeu,            // v_mov_b32 v10, {hi=f16 2.5, lo=0xcafe}
+        0x7e14b8f9u, 0x0005150au,            // v_ceil_f16_sdwa v10, v10 WORD_1/PRESERVE src0_sel:WORD_1
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r22b = recompile_valu(code32r22b, std::size(code32r22b), 0, 10);
+    CHECK(!spv32r22b.empty(), "recompiled kernel 32r22b (live v_ceil_f16_sdwa) -> SPIR-V");
+    std::vector<float> got32r22b = spv32r22b.empty()
+        ? std::vector<float>()
+        : prosper::test::run_compute(spv32r22b, std::vector<float>(1), 1, 1);
+    CHECK(got32r22b.size()==1 && bits_of(got32r22b[0])==0x4200cafeu,
+          "kernel 32r22b ceils into the high destination word and preserves the low one");
+
+    // Kernel 32r22c: the fail-visible arm of the family extension. 0x59 (v_frexp_mant_f16) sits
+    // INSIDE the numeric span 0x54..0x61 but is deliberately outside the admitted set, because it
+    // is not the one-in-one-out shape emit_f16_unary implements. Widening the decoder's range check
+    // without this arm is exactly how a wrong lowering would ship silently.
+    const uint32_t code32r22c[] = {
+        0x7e0c02ffu, 0x4300beefu,            // v_mov_b32 v6, {hi=f16 3.5, lo=0xbeef}
+        0x7e0cb2f9u, 0x00051406u,            // v_frexp_mant_f16_sdwa v6, v6 WORD_0/PRESERVE src0_sel:WORD_1
+        0xbf810000u,
+    };
+    CHECK(recompile_valu(code32r22c, std::size(code32r22c), 0, 6).empty(),
+          "kernel 32r22c leaves v_frexp_mant_f16_sdwa fail-visible rather than lowering it as a rounder");
+
+    // Kernel 32r23 (LIVE, exec_cs_290000eb00 pc=1166): SEXT on an integer VOP2 SDWA source. The
+    // sub-dword source select was already modelled; the sign-extending variant of it was refused
+    // outright, and it is the instruction that stopped this program once the f16 rounder above it
+    // was implemented. v5's WORD_0 is 0xfff6 = -10, so `8 + sext(v5.lo)` is -2 = 0xfffffffe. A
+    // zero-extending lowering computes 8 + 65526 = 0x0000fffe, and an implementation that ignored
+    // the source select entirely computes 8 + 0x0007fff6.
+    const uint32_t code32r23[] = {
+        0x7e0a02ffu, 0x0007fff6u,            // v_mov_b32 v5, {hi=7, lo=0xfff6}
+        0x4a080af9u, 0x0c860688u,            // v_add_nc_u32_sdwa v4, 8, sext(v5) src1_sel:WORD_0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r23 = recompile_valu(code32r23, std::size(code32r23), 0, 4);
+    CHECK(!spv32r23.empty(), "recompiled kernel 32r23 (live v_add_nc_u32_sdwa sext source) -> SPIR-V");
+    std::vector<float> got32r23 = spv32r23.empty()
+        ? std::vector<float>()
+        : prosper::test::run_compute(spv32r23, std::vector<float>(1), 1, 1);
+    CHECK(got32r23.size()==1 && bits_of(got32r23[0])==0xfffffffeu,
+          "kernel 32r23 sign-extends the selected VOP2 source word before the integer add");
+
+    // Kernel 32r23b: the fail-visible arm. SEXT on a full-DWORD source select is a combination no
+    // live encoding here produces, so it must stay rejected rather than be waved through as a
+    // no-op. Same instruction as 32r23 with src1_sel:DWORD (0x0c860688 -> 0x0e860688).
+    const uint32_t code32r23b[] = {
+        0x7e0a02ffu, 0x0007fff6u,            // v_mov_b32 v5, {hi=7, lo=0xfff6}
+        0x4a080af9u, 0x0e860688u,            // v_add_nc_u32_sdwa v4, 8, sext(v5) src1_sel:DWORD
+        0xbf810000u,
+    };
+    CHECK(recompile_valu(code32r23b, std::size(code32r23b), 0, 4).empty(),
+          "kernel 32r23b keeps SEXT on a DWORD source select fail-visible");
+
     // Kernel 32p: exact live v_cndmask_b32_sdwa selects src1 WORD_0 through VCC, writes WORD_1,
     // and preserves the destination's low half.
     const uint32_t code32p[] = {

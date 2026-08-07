@@ -111,8 +111,10 @@ Two measured leads, both recorded on [#2013](https://github.com/mattias800/prosp
   shader. Those numbers are per-stage SPIR-V word counts, so a zero names the stage that produced
   nothing; they are not shader identifiers, and the non-zero one is not a name for the pipeline. The occurrence counter (logged on powers of two) reaches **256+**
   for one of them, so this is hundreds of dropped draws per boot.
-- **Eight distinct compute programs are skipped** (`[compute] skip unsupported program`), plus one
-  3D-tile volume dispatch skipped under #590.
+- **Eight distinct compute programs were skipped** (`[compute] skip unsupported program`), plus one
+  3D-tile volume dispatch skipped under #590. **Four of the eight now recompile and dispatch** — see
+  *The eight skipped compute programs, one by one* below, which names every one of them and its exact
+  blocking instruction. The composite did not move.
 
 ### The reject chain — and the partition that matters more than the list
 
@@ -336,7 +338,9 @@ no cap and is therefore complete by construction over the shaders it is given.
 | + those | VOP3P `0xa`, VOP3 `0x357` — behind the three above *inside the same programs*, so they surface offline rather than as their own arm | `v_pk_add_u16` (including the `NEG` form below), `v_med3_f16` |
 | + those | VOP1 `0x53` (5), VOP1 `0x51` (5), VOPC `0xab` (4) | the SDWA form of `v_cvt_i16_f16` / `v_cvt_f16_i16`, `v_cmp_le_u16_sdwa` |
 | + those | VOP3 `0x311` (4), VOP1 `0x51` (5, now `src0_sel:WORD_1`) | `v_pack_b32_f16`, the WORD-source form of the same convert |
-| + those (**where this lane stopped**) | VOP1 `0x1` (5) | `v_mov_b32_sdwa v14, sext(v8) src0_sel:WORD_0` — the **sign-extending** WORD move, one bit away from the zero-extending form above and a different operation |
+| + those | VOP1 `0x1` (5) | `v_mov_b32_sdwa v14, sext(v8) src0_sel:WORD_0` — the **sign-extending** WORD move, one bit away from the zero-extending form above and a different operation |
+| `cdb40942` + those (this lane) | VOP1 `0x1` (9), VOP1 `0x5e` (4), VOP1 `0x5c` (3) | `v_mov_b32_sdwa … sext(…)` in **both** the WORD and BYTE source forms, `v_rndne_f16_sdwa`, `v_ceil_f16_sdwa` |
+| + those (**where this lane stopped**) | VOP2 `0x25` (4), VOP1 `0x1` DPP (3) | `v_add_nc_u32_sdwa v4, 8, sext(v5) src1_sel:WORD_0` — SEXT one operand position over, on a VOP2; and `v_mov_b32_dpp v10, v4 row_xmask:4`, which is a cross-lane frontier, not an SDWA one |
 
 Everything in every tier so far is the **16-bit VALU family** in some encoding — scalar, packed,
 SDWA, compare, convert and pack. One UE5 post chain runs end to end in packed 16-bit arithmetic,
@@ -344,22 +348,24 @@ which is why it peels rather than showing its whole requirement at once.
 
 **What is left after all of the above, and is not that family:**
 
-- `s_cbranch_vccz` / `s_cbranch_vccnz` (SOPP `0x6`/`0x7`) and a forward `s_cbranch_execz`
-  (SOPP `0x8`) — the #590 control-flow frontier. Two compute programs stop here, one on a
-  `[compute-struct-reject] backward else pc=36 branch=117 target=118` shape.
-- `s_flbit_i32_b64` (SOP1 `0x16`) — **implemented** by this lane, but it sits *behind* the
-  `s_cbranch_vccz` in the same program, so it changes nothing until the control flow does.
-- `v_mov_b32_sdwa` with **SEXT** on its source (`7e1c02f9,000c0608`): the zero-extending form is
-  implemented, the sign-extending one is a different operation and still rejects. This is the very
-  next tier and is small; it was left because the census had not converged and the peel had already
-  moved twice past the point where the answer to *this title's* question was settled.
 - `image_sample_lz` with `dim=SQ_RSRC_IMG_2D_ARRAY d16` (`f09c0f28,80ea003d`) and `image_atomic_add`
   with the same dim (MIMG `0x11`) — arrayed-image sampling and atomics, the deferred MIMG features
   already inventoried in [`RECOMPILER_REMAINING.md`](RECOMPILER_REMAINING.md).
-- The three `[mimg-unresolved]` / `[mubuf-unresolved]` descriptor failures above.
+- `v_mov_b32_dpp v10, v4 row_xmask:4 bound_ctrl:1` (`7e1402fa,ff096404`) — a cross-lane DPP row
+  control, not an SDWA one. It is the first instruction outside both the 16-bit VALU family and the
+  descriptor frontier that this title has produced.
+- `s_flbit_i32_b64 vcc_lo, s[14:15]` — **the opcode is implemented**; what fails is that the emitter
+  has no value for `s14`/`s15` at that pc, so the lowering takes its `ok = false` arm. This is a
+  scalar-value-tracking gap, not a missing instruction, and it is easy to mis-file as one.
 - One "program" (address is run-local) that is **12,916 dwords of zero**. It is not a shader; treat a
   reject at `pc=0 words=00000000,00000000` as a bad `code_addr`, not as an opcode gap.
-- **A fourth `[mimg-unresolved]`, newly exposed.** `pc=686 srsrc=s40 srt_tag=0x60 key_res=null
+
+**Closed, and listed here only so the historical record below is readable:** the three
+`[mimg-unresolved]` / `[mubuf-unresolved]` descriptor failures, and the fourth `[mimg-unresolved]`
+described next. Every arm on current master reports **0** of each; the paragraph that follows is the
+record of how the fourth was found and attributed, not an open item.
+
+- **A fourth `[mimg-unresolved]`, exposed by the opcode work and since fixed.** `pc=686 srsrc=s40 srt_tag=0x60 key_res=null
   pc_res=null (47 res)` appears **only** on the arm taken after every tier above landed: `pc=686`
   occurs 0 times in the base, first-tier and second-tier census arms and 20 times in the last one.
   It is in a **compute** program that previously stopped at an arithmetic op long before reaching
@@ -376,6 +382,70 @@ which is why it peels rather than showing its whole requirement at once.
   inside the retained `PROSPER_SHADER_DUMP` binaries: `word[686] == 0xf09c0f28` lands in an
   `exec_cs_*.bin` — the same 2,348-dword compute shader in every arm that contains it (the addresses
   in those filenames are run-local).
+
+### The eight skipped compute programs, one by one
+
+The flat reject census above answers "which instructions reject"; it does **not** answer "what stops
+each program", and those are different questions whenever one program can reject at several pcs. The
+attribution is mechanical and worth repeating rather than re-deriving:
+
+```bash
+# 1. one 240 s arm writes every failing compute program's raw bytes and the live reject lines
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER_DBG=1 \
+PROSPER_SHADER_DUMP=~/shaders PROSPER_NO_FRAME_DUMPS=1 \
+  timeout -s TERM -k 5s 240s ./build-linux/boot_trace <DUMP_ROOT>/PPSA08804-app0 > ~/census.log 2>&1
+grep -E 'compute\] skip|cfg-recompile-reject|compute-struct-reject' ~/census.log
+
+# 2. shader_inspect's per-instruction listing gives pc -> (fmt, op, words) for each dump, so every
+#    live `[cfg-recompile-reject] pc=N fmt=F op=0xX` matches exactly one program
+./build-linux/shader_inspect ~/shaders/exec_cs_<addr>.bin
+
+# 3. name the instruction from its bytes, never from an opcode table
+python3 prosper/tools/re/disasm_words.py <word0>,<word1>
+```
+
+On `cdb40942` that gives a **1:1** attribution — every live reject pc occurs in exactly one of the
+eight dumps, with matching format and opcode. Addresses are run-local; the dword counts are not.
+
+| dwords | blocking instruction (disassembled from the exact logged words) | state |
+|---|---|---|
+| 224 | `s_flbit_i32_b64 vcc_lo, s[14:15]` (`beea160e`) — opcode implemented, `s14`/`s15` untracked | still skipped |
+| 636 | `v_mov_b32_sdwa v25, sext(v25) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1` | **restored** |
+| 1128 | `image_atomic_add v19, v[28:30], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY` | still skipped |
+| 1296 | `v_rndne_f16_sdwa v6, v6 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1`, then `v_add_nc_u32_sdwa v4, 8, sext(v5) src1_sel:WORD_0` behind it | **restored** |
+| 1368 | `v_mov_b32_sdwa v14, sext(v8) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0` | **restored** |
+| 1448 | `v_mov_b32_sdwa v16, sext(v11) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0` | **restored** |
+| 2348 | `v_ceil_f16_sdwa v10, v10 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1`, then `v_mov_b32_dpp v10, v4 row_xmask:4 bound_ctrl:1` behind it | still skipped |
+| 12916 | all zero from `pc=0` — a bad `code_addr`, not a shader | not a program |
+
+**Every one of the seven real programs is stopped by a single instruction, and none of those
+instructions is a branch.** That contradicts what this document previously recorded — see the
+*Ruled out* row below — and it is the reason the remaining work is an instruction inventory rather
+than the #590 structurizer.
+
+Measured across three identical arms on one binary lineage, `PROSPER_DBG=1`, 240 s each:
+
+| | `cdb40942` | + the SDWA/f16 tier | + VOP2 source SEXT |
+| --- | --- | --- | --- |
+| `[compute] skip unsupported program` | 8 | 5 | **4** |
+| distinct `[cfg-recompile-reject]` sites | 7 | 4 | 3 |
+| `[exec-recompile-reject]` (graphics) | 0 | 0 | 0 |
+| `[mimg-unresolved]` / `[mubuf-unresolved]` | 0 / 0 | 0 / 0 | 0 / 0 |
+| composite | `666f7b3f` → `0d70a70a` → `8bf1b518` | **identical** | **identical** |
+
+The composite row is a `tools/screenshot` arm (`--seconds 30 --count 9`, default switches, no
+diagnostics) rather than the `boot_trace` arm, so the pixels are measured on a run that carries no
+instrument at all. It reproduces the recorded hash sequence byte for byte, which is the arm's own
+positive control; a reference decode of the PNGs confirms 1,373 distinct colours and 430,916
+non-black pixels in the logo frame and exactly **one** colour, `RGB(1,0,1)`, over all 8,294,400
+pixels of the uniform one.
+
+**The lever and the null were then re-measured in ONE run**, because a skip count taken in
+`boot_trace` and a pixel hash taken in `screenshot` are two frontends, and "the change did not reach
+the frontend that draws" is exactly the alternative a cross-frontend comparison cannot exclude. A
+single `screenshot` arm with `PROSPER_DBG=1` reports **4** skipped compute programs *and* the same
+`666f7b3f` → `0d70a70a` → `8bf1b518` at every sample. Same process, same frame loop: the four
+restored programs are dispatching in the run whose pixels did not change.
 
 ## Unimplemented-call census (default launch, current master + #2012)
 
@@ -394,6 +464,42 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 ## Ruled out
 
 One line per falsified hypothesis, with the evidence that killed it.
+
+- **THE SKIPPED COMPUTE PROGRAMS DO NOT FAIL ON CONTROL FLOW.** This document and #2013 both recorded
+  "they fail on **control flow**, not arithmetic: 21 `[cfg-recompile-reject]` and 26
+  `[compute-struct-reject]` lines per boot, on `s_cbranch_vccz`/`vccnz` and a forward
+  `s_cbranch_execz`". Attributing every live reject to the program it came from shows the opposite:
+  **all seven real programs stop on one instruction each, and not one of them is a branch** —
+  `v_mov_b32_sdwa … sext(…)` ×3, `v_rndne_f16_sdwa`, `v_ceil_f16_sdwa`, `image_atomic_add
+  dim:2D_ARRAY`, and an `s_flbit_i32_b64` whose *opcode is implemented* and whose scalar source is
+  untracked. **The proof is the A/B, not the reading of a diagnostic**: implementing two SDWA
+  families and nothing else restored **four of the seven**, and the branch shapes those programs
+  contain are untouched by that change.
+  **Why the wrong reading was available.** `[compute-struct-reject]` is **one tag over two roles** —
+  14 emission sites inside `detect_forward_ifs` and 7 inside the structured emitter — so counting the
+  lines merges a routing decision with a terminal failure. On these programs the
+  `detect_forward_ifs` lines are the routing decision: the recompiler then runs the CFG dispatcher,
+  which accepted those same shapes and carried on to the arithmetic op that `[cfg-recompile-reject]`
+  names. And `structured emission stopped next-pc=N next-if=…` — 12 of the 26 lines — is not a
+  control-flow complaint at all: `next-pc` is the **blocking instruction**, matching the
+  `[cfg-recompile-reject]` pc exactly, and `next-if=4294967295` says in the diagnostic's own fields
+  that no `if` is pending. **The caveat matters**: a `detect_forward_ifs` decline is only a routing
+  decision when the dispatcher is actually selected (`cfg_dispatch_safe` and either
+  `exact_compute_wave_cfg` or `cfg_branches > 2`); otherwise `cf_rejected` clears the loop list and
+  the branch genuinely does block. So ask **which emitter ran last**, and attribute a reject to a
+  *program* before attributing it to a *cause*. (This lane, 2026-08-06, on `cdb40942`.)
+- **Restoring HALF the skipped compute programs does not move the composite.** 8 → 5 → **4** skipped
+  programs across three identical arms on one binary lineage, with 0 dropped graphics pipelines and 0
+  unresolved descriptors throughout, and the composite is byte-identical at every step:
+  `666f7b3f` → `0d70a70a` → `8bf1b518`, the uniform frame exactly one colour `RGB(1,0,1)` over all
+  8,294,400 pixels by reference decode. **The lever and the null are measured in the same run** — a
+  `screenshot` arm with `PROSPER_DBG=1` reports 4 skipped programs *and* the unchanged hashes — so
+  this is a real null rather than a change that never reached the frontend being photographed.
+  **Read the scope precisely**: what
+  is falsified is *"restoring these four moves the composite"*. Four programs are still skipped —
+  `image_atomic_add dim:2D_ARRAY`, `v_mov_b32_dpp row_xmask`, the untracked-scalar `s_flbit`, and the
+  all-zero non-program — so "a skipped compute dispatch is the cause" is **not** ruled out.
+  (This lane, 2026-08-06.)
 
 - **APR same-size container collisions are not the startup blocker.** 274/274 reads resolved
   `OK method=id`, 0 size-fallbacks, 0 refusals — the 49 registration warnings are noise here.
@@ -552,10 +658,10 @@ One line per falsified hypothesis, with the evidence that killed it.
 
 Rung 2. Whether the post-logo uniform frame is a legitimate loading screen — the movie surface and
 the dropped-draw composite are both now ruled out above, which leaves that reading and "content the
-skipped compute programs were supposed to produce" unseparated. What the four now-restored pipelines
-actually draw has not been examined; that they submit and recompile is established, that their output
-reaches the present source is not. Whether restoring the 8 skipped **compute** programs moves the
-composite — untested, and now the only population left. Any input route — nothing has
+skipped compute programs were supposed to produce" unseparated. What the four now-restored **graphics
+pipelines** actually draw has not been examined; that they submit and recompile is established, that
+their output reaches the present source is not. Whether restoring the **remaining four** skipped
+compute programs moves the composite — the first four did not. Any input route — nothing has
 been shown to respond to a pad yet. Windows or macOS. Performance figures: every arm shared the GPU
 with other lanes.
 
@@ -563,19 +669,29 @@ with other lanes.
 
 **The graphics-descriptor frontier is closed — do not reopen it.** 0 dropped pipelines, 0
 `[mimg-unresolved]`, 0 `[mubuf-unresolved]` (#2131 + #2132), and the composite is byte-identical
-before and after. Everything below is what remains.
+before and after. **The #590 control-flow frontier is not this title's blocker either** — see the
+first *Ruled out* row. Everything below is what remains.
 
-1. **Establish whether the four now-restored pipelines reach the present source at all.** Ordered
-   first because it is the cheapest way to tell a *delivery* defect from a *content* one, and
+1. **Establish whether the four now-restored graphics pipelines reach the present source at all.**
+   Ordered first because it is the cheapest way to tell a *delivery* defect from a *content* one, and
    because the counters above cannot: they prove these stages recompile and submit, not that their
    draws executed, wrote anything, or contributed a pixel. A byte-identical composite while four
    more pipelines submit is itself weak evidence for a delivery problem, and
-   `[rtt] PRESENT SOURCE EXTENT MISMATCH` still fires once early in every arm.
-2. **The 8 skipped compute programs**, and the charter names
-   a skipped LUT/exposure dispatch as a documented way a whole composite collapses. They fail on
-   **control flow**, not arithmetic: 21 `[cfg-recompile-reject]` and 26 `[compute-struct-reject]`
-   lines per boot, on `s_cbranch_vccz`/`vccnz` and a forward `s_cbranch_execz`, one of them a
-   `backward else` shape (#590). The 16-bit VALU family is complete through five tiers.
+   `[rtt] PRESENT SOURCE EXTENT MISMATCH` still fires once early in every arm. The same argument now
+   applies to the four restored **compute** programs, and with more force: restoring them changed the
+   skip count and not one pixel.
+2. **The four compute programs still skipped**, in ascending cost — the charter names a skipped
+   LUT/exposure dispatch as a documented way a whole composite collapses, and half the population is
+   already gone without effect, so this is the cheapest remaining way to finish the argument:
+   - `s_flbit_i32_b64 vcc_lo, s[14:15]` — a **value-tracking** gap, not a missing opcode. The
+     lowering exists and takes its `ok = false` arm because `s14`/`s15` are unknown at that pc.
+   - `v_mov_b32_dpp v10, v4 row_xmask:4 bound_ctrl:1` — a cross-lane DPP row control, in the
+     **2,348-dword** program (the one that stopped on `v_ceil_f16_sdwa`), not in either of the
+     programs this lane restored.
+   - `image_atomic_add … dim:SQ_RSRC_IMG_2D_ARRAY` — the deferred arrayed-image work in
+     [`RECOMPILER_REMAINING.md`](RECOMPILER_REMAINING.md), shared with `image_sample_lz d16`.
+   - the 12,916-dword all-zero `code_addr`, which is not a program and should not be counted as one.
 3. **Then re-measure the composite.** It has not moved through any change so far: black to t≈20 s,
    SEGA logo (`0d70a70a`, 1,373 colours), then a single-colour `RGB(1,0,1)` frame (`8bf1b518`) —
-   including both arms of the #2132 A/B, where the reject counts differ and the pixels do not.
+   including both arms of the #2132 A/B and all three arms of this lane's compute work, where the
+   reject and skip counts differ and the pixels do not.
