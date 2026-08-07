@@ -576,9 +576,11 @@ predict a submit index with `PROSPER_GPU_CAPTURE_AT`.
 > **Agents: you do not need the hotkey.** Both F9 and F8 are schedulable, so a headless run can take
 > them itself — see the trigger table in `CLAUDE.md` (`PROSPER_GRAB_BUNDLE_AFTER_MS` /
 > `PROSPER_GRAB_BUNDLE_AT_FRAME`, `PROSPER_PERF_CAPTURE_AFTER_MS` / `PROSPER_PERF_CAPTURE_AT_FRAME`).
-> Build with `-DPROSPER_APP=ON` (off by default, which is why these were long assumed human-only) and
-> run under `SDL_VIDEODRIVER=offscreen` for no window at all. The scheduled path calls exactly the same
-> code as the keypress, reservation accounting included.
+> Build with `-DPROSPER_APP=ON` (off by default, which is why these were long assumed human-only). On
+> **Linux** add `SDL_VIDEODRIVER=offscreen` for no window at all; on **Windows** leave it off — SDL's
+> offscreen driver needs `VK_EXT_headless_surface`, which the NVIDIA Windows driver does not expose, and
+> the app terminates before writing any artifact. The triggers work with an ordinary window on either.
+> The scheduled path calls exactly the same code as the keypress, reservation accounting included.
 
 F9 arms a one-shot capture of the next frame
 (default 1, `PROSPER_CAPTURE_FRAMES=1..240` to grab an animation over several frames) and writes two

@@ -309,12 +309,26 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
 
     ```bash
     cmake -S prosper -B build -DPROSPER_APP=ON          # the app is NOT built by default
-    SDL_VIDEODRIVER=offscreen \                         # no window; works over ssh/in a container
+    SDL_VIDEODRIVER=offscreen \                         # LINUX ONLY -- see below
     PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
     PROSPER_CAPTURE_DIR=$HOME/work \
     PROSPER_GRAB_BUNDLE_AFTER_MS=18000 PROSPER_PERF_CAPTURE_AFTER_MS=18000 \
         ./build/prosper-app <DUMP_ROOT>/<TITLE_ID>-app0
     ```
+
+    **`SDL_VIDEODRIVER=offscreen` is Linux-only. Drop it on Windows** — the triggers themselves are
+    platform-independent and fire correctly there with an ordinary window. SDL's offscreen driver needs
+    `VK_EXT_headless_surface`, which NVIDIA's Windows Vulkan driver does not expose, so the app dies
+    before writing anything:
+
+    ```
+    Installed Vulkan doesn't implement the VK_EXT_headless_surface extension
+    [app] SDL_Vulkan_CreateSurface: VK_EXT_headless_surface extension is not enabled ...
+    terminate called without an active exception
+    ```
+
+    That signature is recorded because it does not look like what it is: no artifacts and a
+    non-graceful exit read as "the capture triggers are broken", when the triggers were never reached.
 
     Which axis to use: **`_AFTER_MS` aims at an event you can only describe in time** ("when the movie
     starts", "when the rate collapses"); **`_AT_FRAME` aims at an ordinal you already located** with a
