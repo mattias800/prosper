@@ -83,6 +83,15 @@ struct Rdna2Inst {
     // `v_mov_b32_sdwa … dst_sel:WORD_0 src0_sel:WORD_1`). 6 = DWORD (the default / no select);
     // 4/5 = WORD_0/WORD_1. Only combos the recompiler models clear has_modifier.
     uint8_t     sdwa_dst_sel = 6, sdwa_dst_unused = 0, sdwa_src0_sel = 6, sdwa_src1_sel = 6;
+    // SDWA S0_SEXT / S1_SEXT (dword1 bits 19 and 27): the selected sub-dword source field is
+    // SIGN-extended to 32 bits rather than zero-extended. A different operation from the
+    // zero-extending form, so these are only set for encodings whose lowering honours them —
+    // `v_mov_b32_sdwa` into a full DWORD destination and the integer VOP2 SDWA ops (Sonic Racing:
+    // CrossWorlds' compute kernels, #2013). Every other SDWA admission still requires the bits
+    // clear, which keeps an unmodelled sign extension fail-visible. A set bit is only ever admitted
+    // alongside a real sub-dword select: SEXT of a full DWORD field is not exercised by any live
+    // encoding here, so it stays rejected rather than assumed to be a no-op.
+    bool        sdwa_src0_sext = false, sdwa_src1_sext = false;
 
     // Decoded operands. `opcode` is the format-local opcode; `dst` the destination (or VDATA source
     // base for memory stores); `src[0..n_src-1]` the remaining sources. simm16 holds the signed

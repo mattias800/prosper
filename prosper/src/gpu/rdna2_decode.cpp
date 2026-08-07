@@ -119,15 +119,21 @@ void decode_operands(Rdna2Inst& i) {
                         i.has_modifier = false;
                     }
                     // BYTE- or WORD-select move into a full dword (#273/#2013 — sub-dword unpack):
-                    // dst DWORD + UNUSED_PAD, src0 BYTE_0..3 or WORD_0/1, no sext/neg/abs/clamp/
-                    // omod. The recompiler zero-extends the selected field.
+                    // dst DWORD + UNUSED_PAD, src0 BYTE_0..3 or WORD_0/1, no neg/abs/clamp/omod.
+                    // The recompiler zero- or sign-extends the selected field as S0_SEXT (bit 19)
+                    // says; the two are different operations and `sdwa_src0_sext` carries which.
+                    // DST_UNUSED is immaterial here because a DWORD destination select writes all
+                    // 32 bits, so UNUSED_SEXT (dun==1) is still refused rather than treated as PAD.
                     // (llvm-mc gfx1030: 0x7e0c02f9 0x0000060f -> v_mov_b32_sdwa v6, v15
                     // dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0; Sonic Racing:
-                    // CrossWorlds' 0x7e0002f9 0x00040600 -> the same form with src0_sel:WORD_0.)
+                    // CrossWorlds' 0x7e0002f9 0x00040600 -> the same form with src0_sel:WORD_0, and
+                    // 0x7e1c02f9 0x000c0608 -> `v_mov_b32_sdwa v14, sext(v8) src0_sel:WORD_0`,
+                    // 0x7e3202f9 0x00090619 -> `v_mov_b32_sdwa v25, sext(v25) src0_sel:BYTE_1`.)
                     else if (dsel == 6u && dun == 0u && s0sel <= 5u &&
-                             !((sd >> 19) & 0x9u) && !i.clamp && !i.omod && !i.src_neg[0] && !i.src_abs[0]) {
+                             !((sd >> 22) & 1u) && !i.clamp && !i.omod && !i.src_neg[0] && !i.src_abs[0]) {
                         i.sdwa_dst_sel = (uint8_t)dsel; i.sdwa_dst_unused = (uint8_t)dun;
                         i.sdwa_src0_sel = (uint8_t)s0sel;
+                        i.sdwa_src0_sext = ((sd >> 19) & 1u) != 0;
                         i.has_modifier = false;
                     }
                 }
@@ -218,10 +224,17 @@ void decode_operands(Rdna2Inst& i) {
                     }
                 }
                 // Packed unary f16 SDWA selects one source half, writes one destination half, and
-                // preserves the other. The producer uses rcp/sqrt/cos (0x54/0x55/0x61).
-                else if (((w >> 9) & 0xFFu) == 0x54u ||
-                         ((w >> 9) & 0xFFu) == 0x55u ||
-                         ((w >> 9) & 0xFFu) == 0x61u) {
+                // preserves the other. The admitted set is exactly the VOP1 f16 unary family the
+                // recompiler's plain-e32 lowering already covers — 0x54-0x58 (rcp/sqrt/rsq/log/exp)
+                // and 0x5B-0x61 (floor/ceil/trunc/rndne/fract/sin/cos) — so the two forms of one
+                // opcode can never disagree about what the operation is. 0x59/0x5A (frexp mant/exp)
+                // are deliberately outside it: they are not that one-in-one-out shape.
+                // (Sonic Racing: CrossWorlds' compute kernels, #2013: 0x7e0cbcf9 0x00051406 ->
+                // `v_rndne_f16_sdwa v6, v6 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
+                // src0_sel:WORD_1` and 0x7e14b8f9 0x0005150a -> `v_ceil_f16_sdwa v10, v10
+                // dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1`.)
+                else if ((((w >> 9) & 0xFFu) >= 0x54u && ((w >> 9) & 0xFFu) <= 0x58u) ||
+                         (((w >> 9) & 0xFFu) >= 0x5Bu && ((w >> 9) & 0xFFu) <= 0x61u)) {
                     const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     const uint32_t s0sel = (sd >> 16) & 7u;
                     if ((dsel == 4u || dsel == 5u) && dun == 2u &&
@@ -262,11 +275,16 @@ void decode_operands(Rdna2Inst& i) {
                 // unpack an RGBA8 value (three times BYTE_0..3); Sonic Racing: CrossWorlds emits
                 // `360400f9,04861486` = `v_and_b32_sdwa v2, 6, v0 dst_sel:WORD_0
                 // dst_unused:UNUSED_PRESERVE src1_sel:WORD_0`, a sub-dword DESTINATION (#2013).
-                // Admit the general no-SEXT/no-saturation integer subset: source values are
-                // zero-extended, the destination field is written with the low bits of the result
-                // and the rest of the register is zero-filled (UNUSED_PAD) or kept (UNUSED_PRESERVE)
-                // as DST_UNUSED says.  Signed extension of a source, UNUSED_SEXT and integer clamp
-                // remain fail-visible until their distinct semantics are modeled.
+                // Admit the general no-saturation integer subset: each source field is zero- or
+                // sign-extended as its SEXT bit says (19 for S0, 27 for S1), the destination field
+                // is written with the low bits of the result and the rest of the register is
+                // zero-filled (UNUSED_PAD) or kept (UNUSED_PRESERVE) as DST_UNUSED says.
+                // (Sonic Racing: CrossWorlds' compute kernels, #2013: 0x4a080af9 0x0c860688 ->
+                // `v_add_nc_u32_sdwa v4, 8, sext(v5) dst_sel:DWORD dst_unused:UNUSED_PAD
+                // src0_sel:DWORD src1_sel:WORD_0`.) SEXT is admitted only together with a real
+                // sub-dword select: no live encoding here sets it on a DWORD source, so that
+                // combination stays fail-visible rather than assumed to be a no-op. UNUSED_SEXT and
+                // integer clamp likewise remain fail-visible until their semantics are modeled.
                 else {
                     const uint32_t op = (w >> 25) & 0x3Fu;
                     const bool integer_op =
@@ -275,14 +293,18 @@ void decode_operands(Rdna2Inst& i) {
                         (op >= 0x25u && op <= 0x2Au);
                     const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     const uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
+                    const bool s0_sext = ((sd >> 19) & 1u) != 0, s1_sext = ((sd >> 27) & 1u) != 0;
                     if (integer_op && dsel <= 6u && (dun == 0u || dun == 2u) &&
                         s0sel <= 6u && s1sel <= 6u &&
-                        !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu) &&
+                        !(s0_sext && s0sel == 6u) && !(s1_sext && s1sel == 6u) &&
+                        !((sd >> 20) & 0x7u) && !((sd >> 28) & 0x7u) &&
                         !i.clamp && !i.omod) {
                         i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
                         i.sdwa_dst_unused = static_cast<uint8_t>(dun);
                         i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
                         i.sdwa_src1_sel = static_cast<uint8_t>(s1sel);
+                        i.sdwa_src0_sext = s0_sext;
+                        i.sdwa_src1_sext = s1_sext;
                         i.has_modifier = false;
                     }
                 }

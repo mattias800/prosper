@@ -5250,6 +5250,32 @@ uint32_t ds_append_consume_index(SpirvCompute& b, uint32_t m0, uint32_t literal,
     return b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
 }
 
+// The VOP1 f16 unary family's operation, given its already-unpacked f16 operand as an f32 value.
+// Both the plain e32 form and the SDWA word-select form lower through this one function, so the two
+// encodings of one opcode cannot drift apart — the SDWA path previously carried its own three-op
+// ternary, which is exactly how a family gains a member in one form and not the other.
+// VERIFIED(round-trip llvm-mc gfx1030, VOP1): 0x54 v_rcp_f16, 0x55 v_sqrt_f16, 0x56 v_rsq_f16,
+// 0x57 v_log_f16, 0x58 v_exp_f16, 0x5B v_floor_f16, 0x5C v_ceil_f16, 0x5D v_trunc_f16,
+// 0x5E v_rndne_f16, 0x5F v_fract_f16, 0x60 v_sin_f16, 0x61 v_cos_f16. Trig input is in REVOLUTIONS,
+// exactly as for the f32 forms. Callers must admit only those opcodes. CONFIDENCE: HIGH.
+uint32_t emit_f16_unary(SpirvCompute& b, uint32_t opcode, uint32_t x) {
+    const uint32_t turns = b.uconst(fbits(6.28318530717958647692f));
+    switch (opcode) {
+        case 0x54: return b.frcp(x);                        // v_rcp_f16
+        case 0x55: return b.fext1(Glsl_Sqrt, x);            // v_sqrt_f16
+        case 0x56: return b.fext1(Glsl_InverseSqrt, x);     // v_rsq_f16
+        case 0x57: return b.fext1(Glsl_Log2, x);            // v_log_f16
+        case 0x58: return b.fext1(Glsl_Exp2, x);            // v_exp_f16
+        case 0x5B: return b.fext1(Glsl_Floor, x);           // v_floor_f16
+        case 0x5C: return b.fext1(Glsl_Ceil, x);            // v_ceil_f16
+        case 0x5D: return b.fext1(Glsl_Trunc, x);           // v_trunc_f16
+        case 0x5E: return b.fext1(Glsl_RoundEven, x);       // v_rndne_f16
+        case 0x5F: return b.fext1(Glsl_Fract, x);           // v_fract_f16
+        case 0x60: return b.fext1(Glsl_Sin, b.fbin(Op_FMul, x, turns));    // v_sin_f16
+        default:   return b.fext1(Glsl_Cos, b.fbin(Op_FMul, x, turns));    // 0x61 v_cos_f16
+    }
+}
+
 // Emit one ALU instruction (VOP1/2/C/3 or SOP1/2) into `b`, updating `rs`. Returns true if `in` is an
 // ALU format handled here; sets ok=false if it is an ALU op this stage doesn't support yet. Non-ALU
 // formats (EXP/memory/...) return false so the stage-specific caller can handle them.
@@ -7099,17 +7125,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // BYTE- or WORD-select v_mov_b32_sdwa (#273 — DOLL's title post PSes unpack a packed
             // dword: `v_mov_b32_sdwa v6, v15 src0_sel:BYTE_0`; #2013 — Sonic Racing: CrossWorlds'
             // `v_mov_b32_sdwa v0, v0 src0_sel:WORD_0`): dst is the whole dword (UNUSED_PAD), so the
-            // result is the selected byte/word zero-extended.
+            // result is the selected byte/word extended to 32 bits. S0_SEXT selects which extension:
+            // sign for `v_mov_b32_sdwa v14, sext(v8) src0_sel:WORD_0`, zero otherwise. These are two
+            // different operations on the same opcode, so the bit is read rather than assumed — a
+            // zero-extending lowering of the sext form silently produces a large positive value
+            // where the guest computed a negative one.
             if (in.opcode == 0x01 && in.sdwa_dst_sel == 6 && in.sdwa_src0_sel <= 5) {
-                d = in.sdwa_src0_sel <= 3
-                    ? b.bfe_u(a, b.uconst(8u * in.sdwa_src0_sel), b.uconst(8))
-                    : b.bfe_u(a, b.uconst(16u * (in.sdwa_src0_sel - 4u)), b.uconst(16));
+                const uint32_t offset = in.sdwa_src0_sel <= 3
+                    ? 8u * in.sdwa_src0_sel : 16u * (in.sdwa_src0_sel - 4u);
+                const uint32_t width = in.sdwa_src0_sel <= 3 ? 8u : 16u;
+                d = in.sdwa_src0_sext ? b.bfe_s(a, b.uconst(offset), b.uconst(width))
+                                      : b.bfe_u(a, b.uconst(offset), b.uconst(width));
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
             // Packed unary f16 SDWA: select one source half, compute in f32, round back to f16, and
-            // insert while preserving the opposite destination half. Trig input is in revolutions.
-            if ((in.opcode == 0x54 || in.opcode == 0x55 || in.opcode == 0x61) &&
+            // insert while preserving the opposite destination half. The admitted opcode set is the
+            // whole VOP1 f16 unary family (see emit_f16_unary), matching the plain e32 lowering
+            // below; the decoder gates the operand shape (WORD dst + UNUSED_PRESERVE, WORD/DWORD
+            // source, no sext/neg/abs/clamp/omod).
+            if (((in.opcode >= 0x54 && in.opcode <= 0x58) ||
+                 (in.opcode >= 0x5B && in.opcode <= 0x61)) &&
                 in.sdwa_dst_sel != 6) {
                 uint32_t raw = a;   // inline constants: f16-width encoding, not the f32 pattern
                 if (in.src[0].kind == OperandKind::InlineFloat)
@@ -7118,10 +7154,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else if (in.src[0].kind == OperandKind::InlineInt)
                     raw = b.uconst(static_cast<uint32_t>(in.src[0].value));
                 uint32_t x = b.unpack_half(raw, in.sdwa_src0_sel == 5 ? 1 : 0);
-                uint32_t result = in.opcode == 0x54 ? b.frcp(x)
-                                : in.opcode == 0x55 ? b.fext1(Glsl_Sqrt, x)
-                                : b.fext1(Glsl_Cos,
-                                          b.fbin(Op_FMul, x, b.uconst(fbits(6.28318530717958647692f))));
+                uint32_t result = emit_f16_unary(b, in.opcode, x);
                 uint32_t r16 = b.pack_half_lo(result);
                 d = in.sdwa_dst_sel == 5
                     ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
@@ -7162,22 +7195,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Plain e32 has no source modifiers and no half select; the SDWA forms that would
                 // carry them are rejected by the `!has_sdwa` gate above.
                 const uint32_t x = b.unpack_half(raw, 0);
-                const uint32_t turns = b.uconst(fbits(6.28318530717958647692f));
-                uint32_t result;
-                switch (in.opcode) {
-                    case 0x54: result = b.frcp(x); break;                        // v_rcp_f16
-                    case 0x55: result = b.fext1(Glsl_Sqrt, x); break;            // v_sqrt_f16
-                    case 0x56: result = b.fext1(Glsl_InverseSqrt, x); break;     // v_rsq_f16
-                    case 0x57: result = b.fext1(Glsl_Log2, x); break;            // v_log_f16
-                    case 0x58: result = b.fext1(Glsl_Exp2, x); break;            // v_exp_f16
-                    case 0x5B: result = b.fext1(Glsl_Floor, x); break;           // v_floor_f16
-                    case 0x5C: result = b.fext1(Glsl_Ceil, x); break;            // v_ceil_f16
-                    case 0x5D: result = b.fext1(Glsl_Trunc, x); break;           // v_trunc_f16
-                    case 0x5E: result = b.fext1(Glsl_RoundEven, x); break;       // v_rndne_f16
-                    case 0x5F: result = b.fext1(Glsl_Fract, x); break;           // v_fract_f16
-                    case 0x60: result = b.fext1(Glsl_Sin, b.fbin(Op_FMul, x, turns)); break;
-                    default:   result = b.fext1(Glsl_Cos, b.fbin(Op_FMul, x, turns)); break;
-                }
+                const uint32_t result = emit_f16_unary(b, in.opcode, x);
                 const uint32_t r16 = b.pack_half_lo(result);
                 d = b.ibin(Op_BitwiseOr,
                            b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
@@ -7486,13 +7504,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                  (in.opcode >= 0x1A && in.opcode <= 0x1E) ||
                  (in.opcode >= 0x25 && in.opcode <= 0x2A));
             if (integer_sdwa) {
-                auto select = [&](uint32_t raw, uint8_t sel) {
-                    if (sel <= 3u) return b.bfe_u(raw, b.uconst(8u * sel), b.uconst(8));
-                    if (sel <= 5u) return b.bfe_u(raw, b.uconst(16u * (sel - 4u)), b.uconst(16));
-                    return raw;
+                // SEXT sign-extends the selected field instead of zero-extending it (#2013's
+                // `v_add_nc_u32_sdwa v4, 8, sext(v5) src1_sel:WORD_0`). The decoder only sets the
+                // flag alongside a real sub-dword select, so a DWORD source never reaches bfe_s.
+                auto select = [&](uint32_t raw, uint8_t sel, bool sext) {
+                    if (sel > 5u) return raw;
+                    const uint32_t offset = sel <= 3u ? 8u * sel : 16u * (sel - 4u);
+                    const uint32_t width = sel <= 3u ? 8u : 16u;
+                    return sext ? b.bfe_s(raw, b.uconst(offset), b.uconst(width))
+                                : b.bfe_u(raw, b.uconst(offset), b.uconst(width));
                 };
-                a = select(a, in.sdwa_src0_sel);
-                c = select(c, in.sdwa_src1_sel);
+                a = select(a, in.sdwa_src0_sel, in.sdwa_src0_sext);
+                c = select(c, in.sdwa_src1_sel, in.sdwa_src1_sext);
             } else if (!packed_f16) {
                 if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
                 if (in.src_neg[0]) a = b.fneg(a);
