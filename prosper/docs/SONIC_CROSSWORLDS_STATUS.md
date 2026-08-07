@@ -465,6 +465,16 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 
 One line per falsified hypothesis, with the evidence that killed it.
 
+- **THE UNIFORM COMPOSITE IS NOT THE UNAUTHORED 16³ GRADING LUT.** The title binds a 16x16x16 2-byte
+  storage image whose authoring dispatch was skipped (`3D tile mode has no volume address pattern` --
+  `Sw4KbS`, tile mode 5), and the frozen composite is a single colour, so the LUT looked like the
+  cause. #2229 implements `SW_4KB_S3` volume addressing and the dispatch now runs -- **verified by the
+  lever**: the skip count goes 1 -> 0 between arms. The rendered output does not move. Same route
+  (`screenshot --count 3 --every 60`), master vs fix, both arms give `(25,25,25)` then `(0,0,0)` twice,
+  all 8,294,400 pixels, one distinct colour each; on a shorter route the two builds' PNGs are
+  byte-identical (same SHA-256). Authoring that image changes nothing observable, so the uniform
+  composite has another cause. #2229 is still a real gap and is fixed on its own merits.
+
 - **THE SKIPPED COMPUTE PROGRAMS DO NOT FAIL ON CONTROL FLOW.** This document and #2013 both recorded
   "they fail on **control flow**, not arithmetic: 21 `[cfg-recompile-reject]` and 26
   `[compute-struct-reject]` lines per boot, on `s_cbranch_vccz`/`vccnz` and a forward
