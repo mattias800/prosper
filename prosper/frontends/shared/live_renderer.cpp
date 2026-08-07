@@ -1242,6 +1242,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 double build_reflect_ms = 0;
                 uint64_t build_reflect_calls = 0, build_reflect_words = 0;
                 uint64_t build_reflect_unidentified = 0;
+                uint64_t build_reflect_memo_hits = 0, build_reflect_memo_clears = 0;
+                uint64_t build_reflect_memo_mismatch = 0;
                 std::unordered_set<uint64_t> build_reflect_identities;
             };
             struct RttTimingRecord {
@@ -1691,6 +1693,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // Build one draw's set-tagged resources from its VS (set 0) + PS (set 1) tables — read the
             // bytes from 1:1-mapped guest memory, detile textures. (Each constant/vertex buffer + texture
             // gets its own binding; the recompiler declared a storage buffer / image sampler at each.)
+            // #2256. `validate_spirv_descriptor_interface` is memoized inside shader_resources.cpp,
+            // but its HIT path is O(module size) twice -- an FNV-1a walk of every word to build the
+            // key, then a full vector equality compare to confirm it -- under a process-global lock,
+            // and build_R calls it twice per draw. Measured on a Blue Prince gameplay submit
+            // (PPSA25009, 2,103 draws): 30.37 ms/submit, 53% of build_R and 9.3% of the frame,
+            // traversing 27.2 million words. 3,231 calls served 523 distinct shaders, so 84% of that
+            // work was re-deriving a key for a module already reflected.
+            //
+            // The caller already holds a cheap stable key. DrawItem::vs_identity/fs_identity come
+            // from the exact shader-recompile cache as `cache.next_identity++`
+            // (src/gpu/gpu_executor.cpp:1255) -- a monotonic counter that is NEVER reused, so an
+            // identity denotes one module for the life of the process even across cache eviction
+            // (an evicted shader recompiles to a NEW identity, which misses here and is refilled).
+            //
+            // This changes no semantics. The upstream cache already returns its stored report for a
+            // matching module regardless of which runtime table was passed, so the report was
+            // already a pure function of the SPIR-V; and this call site reads only
+            // `report.descriptors` (via find_spirv_descriptor_binding), never `report.issues`.
+            //
+            // Bounded at the same 4,096 entries the shader cache itself uses. On overflow the map is
+            // cleared wholesale rather than evicted by age: there is no LRU bookkeeping to pay for on
+            // a path this hot, 523 distinct per submit leaves ample headroom, and `memo_clears` in
+            // the timing report makes a thrash visible instead of silent.
+            struct ReflectMemoEntry {
+                prosper::gpu::DescriptorValidationReport report;
+                uint32_t set = 0;
+                prosper::gpu::SpirvShaderStage stage = prosper::gpu::SpirvShaderStage::Unknown;
+            };
+            static thread_local std::unordered_map<uint64_t, ReflectMemoEntry> reflect_memo;
+            constexpr size_t kReflectMemoMaxEntries = 4096;
             auto build_R = [&](const prosper::gpu::DrawItem& draw,
                                const prosper::gpu::ShaderResourceTable* vrt,
                                const prosper::gpu::ShaderResourceTable* prt) {
@@ -1713,11 +1745,46 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // faith. `distinct` is the memo's CEILING and is deliberately UNCAPPED -- the last
                 // attempt on this path (#2239) died because its justifying probe hit a 4,096-entry
                 // cap on precisely this count, and a truncated ceiling reads as a small one.
-                const auto rt0 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
-                const prosper::gpu::DescriptorValidationReport reflected =
-                    prosper::gpu::validate_spirv_descriptor_interface(
+                const prosper::gpu::DescriptorValidationReport* memoized = nullptr;
+                if (shader_identity) {
+                    const auto found = reflect_memo.find(shader_identity);
+                    // set/stage are checked rather than assumed. They are fixed per module on this
+                    // path today (VS -> set 0, PS -> set 1), so a mismatch cannot occur -- but the
+                    // key is the identity alone, and a silent wrong answer here would be a wrong
+                    // descriptor contract rather than a slow one. A mismatch falls through to the
+                    // real call and is counted.
+                    if (found != reflect_memo.end() &&
+                        found->second.set == set && found->second.stage == stage)
+                        memoized = &found->second.report;
+                    else if (found != reflect_memo.end()) {
+                        ++pending_timing.build_reflect_memo_mismatch;
+                        // Loud and unconditional on first occurrence, NOT gated on timing: this
+                        // path is unreachable by the argument above, and if the argument is wrong
+                        // the consequence is a wrong descriptor contract rather than a slow frame.
+                        // A counter only a timing run prints would hide exactly the case that
+                        // matters. The fallback is correct either way -- it re-reflects -- so this
+                        // reports rather than fails.
+                        static thread_local bool warned = false;
+                        if (!warned) {
+                            warned = true;
+                            fprintf(stderr,
+                                    "[render] *** shader identity %llu was reflected for set=%u "
+                                    "stage=%u and is now asked for set=%u stage=%u -- identity is "
+                                    "not stage-unique after all (#2256). Re-reflecting; the "
+                                    "descriptor contract is unaffected%s",
+                                    (unsigned long long)shader_identity, found->second.set,
+                                    (unsigned)found->second.stage, set, (unsigned)stage, "\n");
+                        }
+                    }
+                }
+                if (memoized && timing_enabled) ++pending_timing.build_reflect_memo_hits;
+                const auto rt0 = (timing_enabled && !memoized)
+                    ? RenderClock::now() : RenderClock::time_point{};
+                prosper::gpu::DescriptorValidationReport computed;
+                if (!memoized)
+                    computed = prosper::gpu::validate_spirv_descriptor_interface(
                         spirv, t, set, stage, false);
-                if (timing_enabled) {
+                if (!memoized && timing_enabled) {
                     pending_timing.build_reflect_ms +=
                         std::chrono::duration<double, std::milli>(
                             RenderClock::now() - rt0).count();
@@ -1732,6 +1799,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     else
                         ++pending_timing.build_reflect_unidentified;
                 }
+                if (!memoized && shader_identity) {
+                    if (reflect_memo.size() >= kReflectMemoMaxEntries) {
+                        reflect_memo.clear();
+                        if (timing_enabled) ++pending_timing.build_reflect_memo_clears;
+                    }
+                    ReflectMemoEntry entry;
+                    entry.report = computed;
+                    entry.set = set;
+                    entry.stage = stage;
+                    memoized = &reflect_memo.emplace(shader_identity, std::move(entry))
+                                   .first->second.report;
+                }
+                // Bound to the memo entry when there is one and to the local otherwise. Both outlive
+                // the per-resource loop below, and the loop does not touch the map.
+                const prosper::gpu::DescriptorValidationReport& reflected =
+                    memoized ? *memoized : computed;
                 for (auto& r : t->resources) {
                     const prosper::gpu::SpirvDescriptorBinding* reflected_binding =
                         prosper::gpu::find_spirv_descriptor_binding(
@@ -6686,6 +6769,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     double build_reflect_ms = 0;
                     uint64_t build_reflect_calls = 0, build_reflect_words = 0;
                     uint64_t build_reflect_unidentified = 0, build_reflect_distinct = 0;
+                    uint64_t build_reflect_memo_hits = 0, build_reflect_memo_clears = 0;
+                    uint64_t build_reflect_memo_mismatch = 0;
                 };
                 static TimingTotals totals;
                 static TimingTotals window;
@@ -6776,6 +6861,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.build_reflect_words += pending_timing.build_reflect_words;
                     timing.build_reflect_unidentified += pending_timing.build_reflect_unidentified;
                     timing.build_reflect_distinct += pending_timing.build_reflect_identities.size();
+                    timing.build_reflect_memo_hits += pending_timing.build_reflect_memo_hits;
+                    timing.build_reflect_memo_clears += pending_timing.build_reflect_memo_clears;
+                    timing.build_reflect_memo_mismatch += pending_timing.build_reflect_memo_mismatch;
                     timing.buffer_ms += pending_timing.buffer_ms;
                 };
                 accumulate(totals);
@@ -6964,12 +7052,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // building however large the ms turns out to be.
                         fprintf(stderr,
                                 "[render-timing] build_R reflect %.3f ms/submit calls=%.1f "
-                                "distinct=%.1f unidentified=%.1f words=%.0f/submit\n",
+                                "distinct=%.1f unidentified=%.1f words=%.0f/submit "
+                                "memo_hits=%.1f clears=%.1f mismatch=%.1f\n",
                                 totals.build_reflect_ms / nsub,
                                 (double)totals.build_reflect_calls / nsub,
                                 (double)totals.build_reflect_distinct / nsub,
                                 (double)totals.build_reflect_unidentified / nsub,
-                                (double)totals.build_reflect_words / nsub);
+                                (double)totals.build_reflect_words / nsub,
+                                (double)totals.build_reflect_memo_hits / nsub,
+                                (double)totals.build_reflect_memo_clears / nsub,
+                                (double)totals.build_reflect_memo_mismatch / nsub);
                         if (br_other < -0.05 * nsub)
                             fprintf(stderr,
                                     "[render-timing] *** build_resources leaves EXCEED their parent "
@@ -7185,12 +7277,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 (double)window.build_rejected / wn);
                         fprintf(stderr,
                                 "[render-window] build_R reflect %.3f ms/submit calls=%.1f "
-                                "distinct=%.1f unidentified=%.1f words=%.0f/submit\n",
+                                "distinct=%.1f unidentified=%.1f words=%.0f/submit "
+                                "memo_hits=%.1f clears=%.1f mismatch=%.1f\n",
                                 window.build_reflect_ms / wn,
                                 (double)window.build_reflect_calls / wn,
                                 (double)window.build_reflect_distinct / wn,
                                 (double)window.build_reflect_unidentified / wn,
-                                (double)window.build_reflect_words / wn);
+                                (double)window.build_reflect_words / wn,
+                                (double)window.build_reflect_memo_hits / wn,
+                                (double)window.build_reflect_memo_clears / wn,
+                                (double)window.build_reflect_memo_mismatch / wn);
                         if (br_other_w < -0.05 * wn)
                             fprintf(stderr,
                                     "[render-window] *** build_resources leaves EXCEED their parent "
