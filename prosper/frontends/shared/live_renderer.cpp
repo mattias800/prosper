@@ -6378,12 +6378,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // reader needs to know the pass existed.
                         if (in_window || nz > 100 || nz < 0 || defer_readback)
                             fprintf(stderr,
+                                    // `bytes` disambiguates px_nonblack=0, which today means EITHER
+                                    // "the readback returned a near-black surface" OR "the readback
+                                    // returned nothing and the counting loop never ran". Those are
+                                    // opposite facts wearing the same number -- #2255's absent-vs-zero
+                                    // collapse, and instrument trap 116's -- and on #2276 it is
+                                    // precisely the ambiguity blocking the diagnosis: 2,999 passes a
+                                    // route take a ~7.1 MB readback and report px_nonblack under 100,
+                                    // and nobody can say from this line whether those surfaces are
+                                    // black or absent.
                                     "[pass] cb=%llu pass=%zu/%zu base=0x%llx %ux%u fmt=%d vo=%d "
-                                    "seed=%d defer=%d writes=%llu px_nonblack=%lld\n",
+                                    "seed=%d defer=%d writes=%llu px_nonblack=%lld bytes=%zu\n",
                                     (unsigned long long)at, pass_i, items.size(),
                                     (unsigned long long)base, gw, gh, (int)pass_format,
                                     (int)is_vo, (int)seed_rtt, (int)defer_readback,
-                                    (unsigned long long)color_target_call.writes, nz);
+                                    (unsigned long long)color_target_call.writes, nz,
+                                    rendered_pixels.size());
                     }
                     // Everything this group did AFTER the backend call returned -- RTT store,
                     // scanout selection, per-pass diagnostics. `backend_done` is in scope only on
