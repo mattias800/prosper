@@ -50,6 +50,7 @@
 #include <set>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -1234,6 +1235,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 double build_r_ms = 0, build_validate_ms = 0;
                 double build_poison_ms = 0, build_indices_ms = 0;
                 uint64_t build_draws = 0, build_rejected = 0;
+                // One level deeper, into build_R's own residual (#2256). `identities` is a SET and
+                // not a counter on purpose: its size is how many distinct shaders a submit-scoped
+                // memo would have to hold, which is the ceiling on what such a memo could save.
+                // It is cleared per submit with the rest of this struct.
+                double build_reflect_ms = 0;
+                uint64_t build_reflect_calls = 0, build_reflect_words = 0;
+                uint64_t build_reflect_unidentified = 0;
+                std::unordered_set<uint64_t> build_reflect_identities;
             };
             struct RttTimingRecord {
                 int submit = 0;
@@ -1688,11 +1697,41 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
               std::vector<prosper::test::FrameResource> R;
               auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set,
                              const std::vector<uint32_t>& spirv,
-                             prosper::gpu::SpirvShaderStage stage){
+                             prosper::gpu::SpirvShaderStage stage,
+                             uint64_t shader_identity){
                 if (!t) return;
+                // #2256. This call is memoized inside shader_resources.cpp, but the memo's HIT path
+                // is O(module size) three times over -- an FNV-1a walk to build the key, a full
+                // vector equality compare to confirm it, and a copy of the report -- under a
+                // process-global lock, twice per draw. Time it as its own leaf of build_R rather
+                // than guessing: build_R's residual is the largest unexplained bucket in the
+                // renderer (+6.16 of 8.02 ms/submit on RADV, #2250) and this is the biggest fixed
+                // per-draw cost inside it.
+                //
+                // `words` is the falsifiable magnitude: it is exactly what the hash and the memcmp
+                // each traverse, so a reader can check the ms against it instead of taking it on
+                // faith. `distinct` is the memo's CEILING and is deliberately UNCAPPED -- the last
+                // attempt on this path (#2239) died because its justifying probe hit a 4,096-entry
+                // cap on precisely this count, and a truncated ceiling reads as a small one.
+                const auto rt0 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
                 const prosper::gpu::DescriptorValidationReport reflected =
                     prosper::gpu::validate_spirv_descriptor_interface(
                         spirv, t, set, stage, false);
+                if (timing_enabled) {
+                    pending_timing.build_reflect_ms +=
+                        std::chrono::duration<double, std::milli>(
+                            RenderClock::now() - rt0).count();
+                    ++pending_timing.build_reflect_calls;
+                    pending_timing.build_reflect_words += spirv.size();
+                    // Identity 0 means the module came from an external/replay path, so no memo
+                    // keyed on identity could serve it. Counted separately: folding those into
+                    // `distinct` would inflate the ceiling, folding them into the hit population
+                    // would inflate the saving. They are neither.
+                    if (shader_identity)
+                        pending_timing.build_reflect_identities.insert(shader_identity);
+                    else
+                        ++pending_timing.build_reflect_unidentified;
+                }
                 for (auto& r : t->resources) {
                     const prosper::gpu::SpirvDescriptorBinding* reflected_binding =
                         prosper::gpu::find_spirv_descriptor_binding(
@@ -4697,8 +4736,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     R.push_back(std::move(fr));
                 }
               };
-              add(vrt, 0, draw.vs_words(), prosper::gpu::SpirvShaderStage::Vertex);
-              add(prt, 1, draw.fs_words(), prosper::gpu::SpirvShaderStage::Fragment);
+              add(vrt, 0, draw.vs_words(), prosper::gpu::SpirvShaderStage::Vertex,
+                  draw.vs_identity);
+              add(prt, 1, draw.fs_words(), prosper::gpu::SpirvShaderStage::Fragment,
+                  draw.fs_identity);
               // VS resources -> descriptor set 0, PS -> set 1
               return R;
             };
@@ -6638,6 +6679,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     double build_r_ms = 0, build_validate_ms = 0;
                     double build_poison_ms = 0, build_indices_ms = 0;
                     uint64_t build_draws = 0, build_rejected = 0;
+                    // A COUNT here, not a set: the aggregate sums each submit's distinct count so
+                    // the report can divide by submits. A lifetime union would answer a different
+                    // question (how many shaders the title has) and would over-state the ceiling
+                    // for a memo whose scope is one submit.
+                    double build_reflect_ms = 0;
+                    uint64_t build_reflect_calls = 0, build_reflect_words = 0;
+                    uint64_t build_reflect_unidentified = 0, build_reflect_distinct = 0;
                 };
                 static TimingTotals totals;
                 static TimingTotals window;
@@ -6723,6 +6771,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.build_indices_ms += pending_timing.build_indices_ms;
                     timing.build_draws += pending_timing.build_draws;
                     timing.build_rejected += pending_timing.build_rejected;
+                    timing.build_reflect_ms += pending_timing.build_reflect_ms;
+                    timing.build_reflect_calls += pending_timing.build_reflect_calls;
+                    timing.build_reflect_words += pending_timing.build_reflect_words;
+                    timing.build_reflect_unidentified += pending_timing.build_reflect_unidentified;
+                    timing.build_reflect_distinct += pending_timing.build_reflect_identities.size();
                     timing.buffer_ms += pending_timing.buffer_ms;
                 };
                 accumulate(totals);
@@ -6869,22 +6922,30 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // here would double-count. That is the cross-layer subtraction #2243 fixed,
                     // and this comment exists so nobody re-derives it from the field names.
                     {
+                        // build_reflect_ms is INSIDE build_r_ms, so it is a sub-split of the
+                        // build_R leaf and must not be subtracted from build_resources here --
+                        // only from build_R's own residual above. Subtracting it at both levels
+                        // would drive the outer residual negative and trip the guard on a run
+                        // where nothing is wrong.
                         const double br_other = totals.build_resources_ms - totals.build_r_ms -
                                                 totals.build_validate_ms - totals.build_poison_ms -
                                                 totals.build_indices_ms;
                         fprintf(stderr,
                                 "[render-timing] build_resources %.2f ms/submit [build_R=%.2f "
-                                "(texture=%.2f buffer=%.2f other=%+.2f) validate=%.2f indices=%.2f "
+                                "(texture=%.2f buffer=%.2f reflect=%.2f other=%+.2f) "
+                                "validate=%.2f indices=%.2f "
                                 "poison=%.2f other=%+.2f] draws=%.1f (+%.1f rejected; build_R and validate cover both, poison and indices only the accepted)\n",
                                 totals.build_resources_ms / nsub, totals.build_r_ms / nsub,
                                 totals.texture_ms / nsub, totals.buffer_ms / nsub,
+                                totals.build_reflect_ms / nsub,
                                 // build_R's OWN residual, published for the same reason as its
                                 // parent's. texture+buffer covered 3.71 of 5.20 ms on the first run
                                 // of this instrument -- 29% of build_R with nothing naming it. A
                                 // nested partition that reports only the outer remainder just moves
                                 // the blind spot one level down, which is the mistake this whole
                                 // line exists to stop repeating.
-                                (totals.build_r_ms - totals.texture_ms - totals.buffer_ms) / nsub,
+                                (totals.build_r_ms - totals.texture_ms - totals.buffer_ms -
+                                 totals.build_reflect_ms) / nsub,
                                 totals.build_validate_ms / nsub, totals.build_indices_ms / nsub,
                                 totals.build_poison_ms / nsub, br_other / nsub,
                                 (double)totals.build_draws / nsub,
@@ -6894,6 +6955,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // build_bds() again at :5815, OUTSIDE the build_start/build_done span, so
                         // every prefix rebuild lands in the leaves without landing in the parent --
                         // and that loop is O(N^2) in draws. Zero occurrences on a default run.
+                        // The reflect leaf's own supporting numbers (#2256). `words` is what
+                        // the memo's key derivation and its equality check each traverse, so the
+                        // ms is checkable against it rather than merely assertable. `distinct` is
+                        // the per-submit ceiling on what an identity-keyed memo could remove:
+                        // calls - distinct - unidentified is the number of calls it could serve
+                        // from cache, and if that difference is small the memo is not worth
+                        // building however large the ms turns out to be.
+                        fprintf(stderr,
+                                "[render-timing] build_R reflect %.3f ms/submit calls=%.1f "
+                                "distinct=%.1f unidentified=%.1f words=%.0f/submit\n",
+                                totals.build_reflect_ms / nsub,
+                                (double)totals.build_reflect_calls / nsub,
+                                (double)totals.build_reflect_distinct / nsub,
+                                (double)totals.build_reflect_unidentified / nsub,
+                                (double)totals.build_reflect_words / nsub);
                         if (br_other < -0.05 * nsub)
                             fprintf(stderr,
                                     "[render-timing] *** build_resources leaves EXCEED their parent "
@@ -7095,15 +7171,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                   window.build_indices_ms;
                         fprintf(stderr,
                                 "[render-window] build_resources %.2f ms/submit [build_R=%.2f "
-                                "(texture=%.2f buffer=%.2f other=%+.2f) validate=%.2f indices=%.2f "
+                                "(texture=%.2f buffer=%.2f reflect=%.2f other=%+.2f) "
+                                "validate=%.2f indices=%.2f "
                                 "poison=%.2f other=%+.2f] draws=%.1f (+%.1f rejected)\n",
                                 window.build_resources_ms / wn, window.build_r_ms / wn,
                                 window.texture_ms / wn, window.buffer_ms / wn,
-                                (window.build_r_ms - window.texture_ms - window.buffer_ms) / wn,
+                                window.build_reflect_ms / wn,
+                                (window.build_r_ms - window.texture_ms - window.buffer_ms -
+                                 window.build_reflect_ms) / wn,
                                 window.build_validate_ms / wn, window.build_indices_ms / wn,
                                 window.build_poison_ms / wn, br_other_w / wn,
                                 (double)window.build_draws / wn,
                                 (double)window.build_rejected / wn);
+                        fprintf(stderr,
+                                "[render-window] build_R reflect %.3f ms/submit calls=%.1f "
+                                "distinct=%.1f unidentified=%.1f words=%.0f/submit\n",
+                                window.build_reflect_ms / wn,
+                                (double)window.build_reflect_calls / wn,
+                                (double)window.build_reflect_distinct / wn,
+                                (double)window.build_reflect_unidentified / wn,
+                                (double)window.build_reflect_words / wn);
                         if (br_other_w < -0.05 * wn)
                             fprintf(stderr,
                                     "[render-window] *** build_resources leaves EXCEED their parent "
