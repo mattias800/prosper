@@ -19,14 +19,46 @@ static int fails = 0;
 
 static std::atomic<bool> worker_started{false};
 static std::atomic<bool> worker_release{false};
+// The body lives OUTSIDE the ABI shim, and on Windows that is load-bearing rather than tidy (#2142).
+//
+// WinLibs MinGW-w64 UCRT gcc 16.1.0 fails to ASSEMBLE a `sysv_abi` function that contains a call
+// needing unwind info:
+//
+//     ccXXXX.s: Error: .seh_handlerdata used outside of .seh_proc block
+//
+// gcc emits `.seh_handlerdata` for the EH region while the non-native-ABI prologue opens no
+// `.seh_proc`. That aborted `cmake --build all`, so every target after this one was skipped and a
+// full local ctest needed `-k 0` -- while CI stayed green, because its Windows job uses MSYS2's gcc.
+//
+// Reduced to two lines by hand, outside this file, so the trigger is named rather than guessed:
+//
+//     #include <thread>
+//     extern "C" __attribute__((sysv_abi)) void* f(void*) {
+//         std::this_thread::yield(); return nullptr; }
+//
+// Fails at -O2, compiles at -O0. `sysv_abi` alone is NOT enough -- an empty one assembles fine --
+// so the attribute is not the thing to remove.
+//
+// Two workarounds were tried and rejected before this one:
+//   * -fno-asynchronous-unwind-tables on the target: assembles, then fails to LINK with
+//     `undefined reference to __gxx_personality_v0`. It trades one toolchain error for another.
+//   * -O0 on the target: works, but silently un-optimises a test to dodge a codegen bug.
+// Moving the work out of the shim needs no flags at all and leaves the ABI boundary trivially
+// correct: a shim that only forwards has nothing to unwind, which is what the ABI already requires.
+//
+// `noinline` is the part that must not be removed -- without it -O2 merges the body back in and the
+// assembler error returns.
+static __attribute__((noinline)) void* named_worker_body() {
+    worker_started.store(true, std::memory_order_release);
+    while (!worker_release.load(std::memory_order_acquire)) std::this_thread::yield();
+    return (void*)0x386;
+}
 #ifdef _WIN32
 extern "C" __attribute__((sysv_abi)) void* named_worker(void*) {
 #else
 static void* named_worker(void*) {
 #endif
-    worker_started.store(true, std::memory_order_release);
-    while (!worker_release.load(std::memory_order_acquire)) std::this_thread::yield();
-    return (void*)0x386;
+    return named_worker_body();
 }
 
 int main() {
