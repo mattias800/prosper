@@ -1508,7 +1508,8 @@ gate's own provenance carries no recorded evidence — it arrived inside `474af0
 with a one-line message, and `#2031` kept it while explicitly moving the *register table* off the
 same gate — but a numeric improvement is not evidence of a correct model. **The next step is a
 cross-title snapshot pass with the gate removed, plus review; that is what stands between this title
-and rung 2**, and it is now the only thing.
+and rung 2**, and it is now the only thing. Tracked as
+[#2220](https://github.com/mattias800/prosper/issues/2220).
 
 ### 6. One hypothesis this pass killed with its own instrument
 
@@ -1691,7 +1692,8 @@ guest's faulting virtual call disassembled. What remains is **ownership**, not a
 **Added 2026-08-07 by the arc7 lane, without renumbering the list above:**
 
 10. **The next step is a cross-title snapshot pass with the `version >= 13` gate on post-submit
-    visibility removed** (`agc_reg_defaults.cpp`). That single condition is what stands between this
+    visibility removed** (`agc_reg_defaults.cpp`), tracked as
+    [#2220](https://github.com/mattias800/prosper/issues/2220). That single condition is what stands between this
     title and rung 2: with the model forced on, the default route survives 3 of 3 with no throttle
     and delivers 782–838 video frames (§ *2026-08-07 (arc7)* §5). Removing it changes behaviour for
     every pre-13 title in the matrix, and the gate's own provenance carries no recorded evidence, so

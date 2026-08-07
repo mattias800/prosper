@@ -126,7 +126,8 @@ PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_POST_SUBMIT_VISIBILITY=1 \
 
 Read the scope narrowly. This is a 40 s survival endpoint, not a progression claim for this title,
 and the gate is **not** removed — three rung-6 snapshot-guarded titles are also pre-13 (*Dead Cells*
-10, *Blasphemous 2* 10, *Alex Kidd* 8), so removing it needs the matrix. What it does settle is that
+10, *Blasphemous 2* 10, *Alex Kidd* 8), so removing it needs the matrix
+([#2220](https://github.com/mattias800/prosper/issues/2220)). What it does settle is that
 the `(500, 1500]` dose-response this document records is not a Crisis Core peculiarity: two
 independently brought-up titles, both outside one unarmed contract, both rescued by arming it.
 
