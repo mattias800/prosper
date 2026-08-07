@@ -616,6 +616,14 @@ struct BackendRenderTimingStats {
     double res_fixed_depth_stencil_ms = 0;
     double res_fixed_viewport_ms = 0;
     double res_fixed_stages_ms = 0;
+    // Printed as `pre_index_unsplit`, NOT `prologue`, and the name is the point. This leaf is
+    // defined by where the timing region STARTS rather than by what it contains, so it is a residual
+    // with a location rather than a component. `other=+0.27` reads as unattributed and invites
+    // investigation; a component name reads as attributed and closes it, which would make the
+    // partition look complete while the blind spot had only been renamed. Keeping the position in
+    // the printed token turns "what is the prologue doing" into "what is IN that span", which is the
+    // question #2254 exists to answer. Do not rename it to something that sounds like a phase until
+    // it has been split into ones.
     double res_fixed_prologue_ms = 0;
 
     double setup_fixed_other_ms() const {

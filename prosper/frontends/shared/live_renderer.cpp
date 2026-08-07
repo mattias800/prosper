@@ -6713,7 +6713,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     fprintf(stderr,
                             "[render-timing] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
                             "resources=%.2f pipeline=%.2f  fixed{index_upload=%.2f blend=%.2f "
-                            "depth_stencil=%.2f viewport=%.2f stages=%.2f prologue=%.2f "
+                            "depth_stencil=%.2f viewport=%.2f stages=%.2f pre_index_unsplit=%.2f "
                             "other=%+.2f}\n",
                             totals.backend_setup_shader_ms / nsub,
                             totals.backend_setup_fixed_ms / nsub,
@@ -6935,7 +6935,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     fprintf(stderr,
                             "[render-window] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
                             "resources=%.2f pipeline=%.2f  fixed{index_upload=%.2f blend=%.2f "
-                            "depth_stencil=%.2f viewport=%.2f stages=%.2f prologue=%.2f "
+                            "depth_stencil=%.2f viewport=%.2f stages=%.2f pre_index_unsplit=%.2f "
                             "other=%+.2f}\n",
                             window.backend_setup_shader_ms / wn,
                             window.backend_setup_fixed_ms / wn,
