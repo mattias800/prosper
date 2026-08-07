@@ -23,6 +23,7 @@ would pass against a tool that always failed.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import pathlib
 import re
@@ -47,6 +48,18 @@ def check(condition: bool, message: str) -> None:
     else:
         print(f"  [FAIL] {message}")
         fails += 1
+
+
+def coverage() -> str:
+    """How many arms ran, read AT THE MOMENT OF ASKING.
+
+    Deliberately a function. As a local assigned partway down `main()` it snapshotted the
+    counters mid-run, so every arm added below the assignment went uncounted -- and "just above
+    the summary print" is exactly where a new arm gets added. The stale total then reads as "the
+    new arms did not run", which is a specific and expensive way to be wrong about a suite whose
+    whole claim is that its coverage is falsifiable from a log.
+    """
+    return f"{ran} arms" + (f", {skipped} skipped" if skipped else "")
 
 
 def skip(arms: int, reason: str) -> None:
@@ -202,9 +215,9 @@ def main() -> int:
             subprocess.run(["git", *cmd], cwd=scratch, capture_output=True, check=False)
         scratch_head = git("rev-parse", "HEAD", cwd=scratch)
         if not scratch_head:
-            skip(6, "scratch git repo unavailable — discovery and --strict-dirty arms")
+            skip(7, "scratch git repo unavailable — discovery and --strict-dirty arms")
         elif scratch_head == head:
-            skip(6, "scratch HEAD equals this checkout's — discovery cannot discriminate")
+            skip(7, "scratch HEAD equals this checkout's — discovery cannot discriminate")
         else:
             sbuild = make_build_dir(scratch, scratch_head)
             # No --repo, invoked from THIS checkout: only target-following resolution can pass.
@@ -215,6 +228,16 @@ def main() -> int:
             # identical invocation must disagree.
             check(run(str(sbuild), "--against", "HEAD", cwd=REPO, repo=REPO).returncode == 1,
                   "and --repo overrides discovery: the same build dir MISMATCHes this checkout")
+
+            # A ref whose name also names a file is "ambiguous argument" unless the revision list is
+            # terminated with `--`. `git rev-parse --verify` cannot take a path so it never needed
+            # one; `rev-list` can. An UNTRACKED file is enough to trigger it, so `release`, `stable`
+            # or any branch sharing a name with a directory would refuse. Done in the scratch repo,
+            # and with no commit, so this checkout and `scratch_head` are both untouched.
+            subprocess.run(["git", "branch", "amb"], cwd=scratch, capture_output=True, check=False)
+            (scratch / "amb").write_text("also a filename\n", encoding="utf-8")
+            check(run(str(sbuild), "--against", "amb", cwd=REPO, repo=scratch).returncode == 0,
+                  "a ref that also names a file resolves: the revision list is terminated with --")
 
             # --- --strict-dirty must work from any cwd, which is how it is documented ------------
             # In the SCRATCH repo, not this one: dirtying a tracked file in the real checkout would
@@ -266,6 +289,24 @@ def main() -> int:
               "and does so without a raw traceback")
         check(run("--manifest", str(exact), "--against", "no/such/ref").returncode == 1,
               "an unresolvable --against ref fails rather than passing")
+        # A ref that resolves to something that is NOT commit-ish -- `--against <tree-sha>` -- must
+        # refuse as unresolvable, not as a mismatch: `git rev-list -n 1 <tree>` exits 0 and prints
+        # nothing, so treating only a failed call as unresolvable would tell the reader their build
+        # is out of date when what actually happened is that they named a tree. No braces in the
+        # lookup either -- this test runs against the same MSYS2 git the tool does, and `HEAD^{tree}`
+        # would be brace-mangled there exactly as it was in the tool.
+        tree = ""
+        for line in git("cat-file", "-p", "HEAD").splitlines():
+            if line.startswith("tree "):
+                tree = line.split()[1]
+                break
+        if tree:
+            against_tree = run("--manifest", str(exact), "--against", tree)
+            check(against_tree.returncode == 1, "--against a tree sha refuses")
+            check("cannot resolve" in against_tree.stderr,
+                  "and refuses it as unresolvable rather than as a revision mismatch")
+        else:
+            skip(2, "HEAD's tree could not be read — the not-commit-ish arms")
 
         # --- argument contract -------------------------------------------------------------------
         check(run("--against", "HEAD").returncode == 2,
@@ -296,9 +337,111 @@ def main() -> int:
             check(run(str(drifted), "--against", "HEAD").returncode == 1,
                   "a drifted template makes the tool refuse, not silently certify")
 
-    coverage = f"{ran} arms" + (f", {skipped} skipped" if skipped else "")
+    # --- the Windows CI failure: git's own path spelling reached a subprocess cwd -------------
+    #
+    # MSYS2 git -- what the Windows CI job runs -- answers `rev-parse --show-toplevel` with a POSIX
+    # absolute path ("/d/a/prosper/prosper"). A native-Windows Python cannot use that as a cwd, so
+    # every later git call in the tool failed and it refused everything it was asked to certify:
+    # 9 arms red, all of them "should succeed" cases, while every "should refuse" arm still passed.
+    #
+    # This is a UNIT arm rather than an end-to-end one because the defect only appears with a git
+    # that spells paths that way, and the CI host is the only one here that has one. Substituting
+    # `_git` reproduces it on any host: pre-fix this returns a path that does not exist.
+    spec = importlib.util.spec_from_file_location("check_build_revision_under_test", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def msys_git(*args: str, cwd=None):
+        """git as MSYS2 spells it: POSIX absolute for --show-toplevel, relative for --show-cdup."""
+        if args[:2] == ("rev-parse", "--show-toplevel"):
+            return "/d/a/prosper/prosper"
+        if args[:2] == ("rev-parse", "--show-cdup"):
+            return ""          # the probe IS the root, which is a SUCCESS and not "no repo"
+        return None
+
+    real_git, module._git = module._git, msys_git
+    try:
+        discovered = module.repo_root_for(REPO)
+    finally:
+        module._git = real_git
+    check(discovered is not None and discovered.is_dir(),
+          "a repo root discovered through MSYS-style git output is a usable directory")
+
+    # And "no checkout owns this" must still be distinguishable from "the probe is the root",
+    # which sharing one falsy sentinel ("") would destroy.
+    module._git = lambda *a, **k: None
+    try:
+        check(module.repo_root_for(REPO) is None,
+              "a path no checkout owns still resolves to None rather than to the probe")
+    finally:
+        module._git = real_git
+
+    # A failing arm names the property that broke and nothing about why, and every host that can
+    # reproduce this tool's known failure mode is a CI runner -- so an undiagnosable failure costs
+    # one push-and-wait cycle per hypothesis. On failure, say what the tool actually printed and
+    # what git actually answered, so the next reader debugs from the log instead of from a guess.
+    if fails:
+        print("--- diagnostic: what the tool said for one case that should have been certified ---")
+        with tempfile.TemporaryDirectory() as raw:
+            probe = make_build_dir(pathlib.Path(raw) / "diag", head)
+            for label, kwargs in (("--repo passed", {}), ("discovery", {"repo": None})):
+                out = run(str(probe), "--against", "HEAD", **kwargs)
+                print(f"  [{label}] exit={out.returncode}")
+                for stream, text in (("out", out.stdout), ("err", out.stderr)):
+                    for line in (text or "").splitlines():
+                        print(f"    {stream}| {line}")
+        print("--- diagnostic: the environment that decides its behaviour ---")
+        print(f"  sys.platform={sys.platform} os.name={os.name} python={sys.version.split()[0]}")
+        print(f"  cwd={pathlib.Path.cwd()}")
+        print(f"  REPO={REPO} exists={REPO.is_dir()}")
+        print(f"  git --version -> {git('--version')!r}")
+        print(f"  rev-parse --show-toplevel -> {git('rev-parse', '--show-toplevel')!r}")
+        print(f"  rev-parse --show-cdup -> {git('rev-parse', '--show-cdup')!r}")
+        print(f"  rev-parse HEAD -> {head!r}")
+
+    # --- no git argument may carry a shell metacharacter (the Windows CI failure) ----------------
+    #
+    # MSYS2 git re-globs the command line it is handed, so `HEAD^{commit}` reached git as
+    # `HEAD^commit`, `--against` could not be resolved, and the tool refused everything.
+    #
+    # This arm is host-agnostic on purpose. The defect only FIRES where an MSYS2 git meets a native
+    # Python, and no host here is one -- but the property that prevents it, "never hand git a brace
+    # or a glob", is checkable anywhere. Asserting the property rather than reproducing the symptom
+    # is what lets the guard run on every host instead of only on the one that already broke.
+    spec = importlib.util.spec_from_file_location("check_build_revision_argv_probe", TOOL)
+    argv_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(argv_module)
+
+    seen_args = []
+    real_argv_git = argv_module._git
+
+    def recording_git(*args: str, cwd=None):
+        seen_args.append(args)
+        return real_argv_git(*args, cwd=cwd)
+
+    argv_module._git = recording_git
+    saved_argv = sys.argv
+    try:
+        with tempfile.TemporaryDirectory() as raw:
+            probe = make_build_dir(pathlib.Path(raw) / "argv", head)
+            sys.argv = ["check_build_revision.py", str(probe),
+                        "--against", "HEAD", "--repo", str(REPO), "--strict-dirty"]
+            argv_module.main()
+    finally:
+        sys.argv = saved_argv
+        argv_module._git = real_argv_git
+
+    check(bool(seen_args), "the argv probe observed git calls at all")
+    offenders = [a for a in seen_args if any(c in part for part in a for c in "{}*?[]")]
+    check(not offenders,
+          f"no git argument carries a glob/brace metacharacter (offending: {offenders})")
+    # Pinned separately so the arm above cannot be satisfied by a tool that stopped resolving refs.
+    check(any(a and a[0] in ("rev-list", "rev-parse") for a in seen_args),
+          "and the tool still asks git to resolve the ref")
+
+    counted = coverage()
     print(f"test_check_build_revision: "
-          + (f"{fails} FAILURE(S) ({coverage})" if fails else f"all ok ({coverage})"))
+          + (f"{fails} FAILURE(S) ({counted})" if fails else f"all ok ({counted})"))
     return 1 if fails else 0
 
 

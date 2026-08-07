@@ -92,9 +92,22 @@ def repo_root_for(path: pathlib.Path) -> pathlib.Path | None:
     from the one whose build directory is being certified, and resolving `--against` or a dirty-tree
     query against the wrong one answers a question nobody asked.
     """
-    probe = path if path.is_dir() else path.parent
-    root = _git("rev-parse", "--show-toplevel", cwd=probe)
-    return pathlib.Path(root) if root else None
+    probe = (path if path.is_dir() else path.parent).resolve()
+    # --show-cdup, not --show-toplevel: it answers with a path RELATIVE to the probe ("../../", or
+    # "" at the root), so git never gets to choose how the absolute path is spelled.
+    #
+    # --show-toplevel does choose, and under MSYS2 -- which is what the Windows CI job runs -- it
+    # prints a POSIX absolute path ("/d/a/prosper/prosper"). A native-Windows Python cannot use that
+    # as a subprocess cwd, so EVERY later git call in this tool failed and the tool refused
+    # everything it was asked to certify. The exit codes stayed plausible -- a refusal is still a
+    # refusal -- which is why it read as a build failure rather than as a broken path.
+    #
+    # "" is the repo ROOT and is a success, so it must be distinguished from None, which means no
+    # checkout owns this path. Testing the string for truthiness conflates the two.
+    cdup = _git("rev-parse", "--show-cdup", cwd=probe)
+    if cdup is None:
+        return None
+    return (probe / cdup).resolve() if cdup else probe
 
 
 def revision_from_build_dir(build_dir: pathlib.Path) -> str | None:
@@ -223,8 +236,28 @@ def main() -> int:
         return refuse("revision: UNKNOWN — this build recorded no revision (built outside a git\n"
                       "  checkout, or git was unavailable at build time). Provenance unestablished.")
 
-    want = _git("rev-parse", "--verify", f"{args.against}^{{commit}}", cwd=repo)
-    if want is None:
+    # `rev-list -n 1 <ref>`, not `rev-parse --verify <ref>^{commit}`. Both peel a ref to the commit
+    # it names and both fail on a ref that is not commit-ish, so they are interchangeable here --
+    # except that one of them contains braces, and an argument with braces does not survive the trip
+    # to an MSYS2 git.
+    #
+    # MSYS2 binaries do not receive the argv their caller built. They re-parse the raw Windows
+    # command line themselves and run it through glob expansion, which has brace expansion enabled,
+    # so `HEAD^{commit}` arrives as `HEAD^commit` -- a ref that does not exist. This tool then could
+    # not resolve --against and refused everything it was asked to certify, which is a plausible
+    # enough outcome that the exit codes read as a build problem rather than a mangled argument.
+    # Native-Windows git (Git for Windows is MinGW, not MSYS) does not do this, so it reproduces
+    # only on a host with both an MSYS2 git and a native Python -- i.e. the Windows CI runner.
+    #
+    # The general rule, since the next brace would fail exactly as quietly: no argument this tool
+    # hands to git may contain a glob or brace metacharacter. `test_check_build_revision` asserts it.
+    want = _git("rev-list", "-n", "1", args.against, "--", cwd=repo)
+    # Empty is unresolvable too, and this is the one place the two spellings genuinely differ:
+    # `rev-parse --verify X^{commit}` FAILS on an object that is not commit-ish, while `rev-list`
+    # succeeds and prints nothing. Testing only for None would leave want = "", which matches no
+    # build revision and so still refuses -- but as a MISMATCH, telling the reader their build is
+    # out of date when what actually happened is that they named a tree.
+    if not want:
         return refuse(f"revision: UNKNOWN — cannot resolve --against {args.against!r} in {repo}.")
     want = want.lower()
 
