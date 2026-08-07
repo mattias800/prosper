@@ -365,6 +365,10 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"res_texture_ms\":" << record.res_texture_ms
                 << ",\"res_buffer_ms\":" << record.res_buffer_ms
                 << ",\"res_buffer_copy_ms\":" << record.res_buffer_copy_ms
+                << ",\"res_buffer_create_ms\":" << record.res_buffer_create_ms
+                << ",\"res_buffer_index_find_ms\":" << record.res_buffer_index_find_ms
+                << ",\"res_buffer_index_insert_ms\":" << record.res_buffer_index_insert_ms
+                << ",\"res_buffer_hash_ms\":" << record.res_buffer_hash_ms
                 << ",\"res_descriptor_ms\":" << record.res_descriptor_ms << "}\n";
         }
         for (const ComputeTimingRecord& record : capture->compute) {

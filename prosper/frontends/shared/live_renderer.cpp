@@ -1196,6 +1196,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 double backend_res_texture_ms = 0, backend_res_texture_upload_ms = 0;
                 double backend_res_texture_bind_ms = 0, backend_res_buffer_ms = 0;
                 double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
+                double backend_res_buffer_create_ms = 0;
+                double backend_res_buffer_index_find_ms = 0;
+                double backend_res_buffer_index_insert_ms = 0;
+                double backend_res_buffer_hash_ms = 0;
                 double backend_res_descriptor_ms = 0;
                 uint64_t backend_pipeline_refs = 0, backend_pipeline_hits = 0;
                 uint64_t backend_pipeline_misses = 0, backend_pipeline_bypasses = 0;
@@ -1282,6 +1286,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.backend_res_buffer_ms += backend.res_buffer_ms;
                 pending_timing.backend_res_buffer_acquire_ms += backend.res_buffer_acquire_ms;
                 pending_timing.backend_res_buffer_copy_ms += backend.res_buffer_copy_ms;
+                pending_timing.backend_res_buffer_create_ms += backend.res_buffer_create_ms;
+                pending_timing.backend_res_buffer_index_find_ms += backend.res_buffer_index_find_ms;
+                pending_timing.backend_res_buffer_index_insert_ms += backend.res_buffer_index_insert_ms;
+                pending_timing.backend_res_buffer_hash_ms += backend.res_buffer_hash_ms;
                 pending_timing.backend_res_descriptor_ms += backend.res_descriptor_ms;
                 pending_timing.backend_setup_pipeline_ms += backend.setup_pipeline_ms;
                 pending_timing.backend_pipeline_refs += pipelines.references;
@@ -6506,6 +6514,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.res_texture_ms = pending_timing.backend_res_texture_ms;
                     record.res_buffer_ms = pending_timing.backend_res_buffer_ms;
                     record.res_buffer_copy_ms = pending_timing.backend_res_buffer_copy_ms;
+                    record.res_buffer_create_ms = pending_timing.backend_res_buffer_create_ms;
+                    record.res_buffer_index_find_ms = pending_timing.backend_res_buffer_index_find_ms;
+                    record.res_buffer_index_insert_ms = pending_timing.backend_res_buffer_index_insert_ms;
+                    record.res_buffer_hash_ms = pending_timing.backend_res_buffer_hash_ms;
                     record.res_descriptor_ms = pending_timing.backend_res_descriptor_ms;
                     prosper::perf::interactive_performance_capture().record_renderer(record);
                 }
@@ -6537,6 +6549,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     double backend_res_texture_ms = 0, backend_res_texture_upload_ms = 0;
                     double backend_res_texture_bind_ms = 0, backend_res_buffer_ms = 0;
                     double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
+                    double backend_res_buffer_create_ms = 0;
+                    double backend_res_buffer_index_find_ms = 0;
+                    double backend_res_buffer_index_insert_ms = 0;
+                    double backend_res_buffer_hash_ms = 0;
                     double backend_res_descriptor_ms = 0;
                     uint64_t backend_pipeline_refs = 0, backend_pipeline_hits = 0;
                     uint64_t backend_pipeline_misses = 0, backend_pipeline_bypasses = 0;
@@ -6589,6 +6605,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.backend_res_buffer_ms += pending_timing.backend_res_buffer_ms;
                     timing.backend_res_buffer_acquire_ms += pending_timing.backend_res_buffer_acquire_ms;
                     timing.backend_res_buffer_copy_ms += pending_timing.backend_res_buffer_copy_ms;
+                    timing.backend_res_buffer_create_ms += pending_timing.backend_res_buffer_create_ms;
+                    timing.backend_res_buffer_index_find_ms += pending_timing.backend_res_buffer_index_find_ms;
+                    timing.backend_res_buffer_index_insert_ms += pending_timing.backend_res_buffer_index_insert_ms;
+                    timing.backend_res_buffer_hash_ms += pending_timing.backend_res_buffer_hash_ms;
                     timing.backend_res_descriptor_ms += pending_timing.backend_res_descriptor_ms;
                     timing.backend_setup_pipeline_ms += pending_timing.backend_setup_pipeline_ms;
                     timing.backend_pipeline_refs += pending_timing.backend_pipeline_refs;
@@ -6676,7 +6696,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     fprintf(stderr,
                             "[render-timing] backend-submit resources avg_ms: texture=%.2f "
                             "(upload=%.2f bind=%.2f lookup=%.2f) buffer=%.2f "
-                            "(acquire=%.2f copy=%.2f) descriptor=%.2f other=%.2f\n",
+                            "(acquire=%.2f copy=%.2f create=%.2f index_find=%.2f "
+                            "index_insert=%.2f hash=%.2f "
+                            "other=%+.2f) descriptor=%.2f other=%.2f\n",
                             totals.backend_res_texture_ms / nsub,
                             totals.backend_res_texture_upload_ms / nsub,
                             totals.backend_res_texture_bind_ms / nsub,
@@ -6685,6 +6707,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             totals.backend_res_buffer_ms / nsub,
                             totals.backend_res_buffer_acquire_ms / nsub,
                             totals.backend_res_buffer_copy_ms / nsub,
+                            totals.backend_res_buffer_create_ms / nsub,
+                            totals.backend_res_buffer_index_find_ms / nsub,
+                            totals.backend_res_buffer_index_insert_ms / nsub,
+                            totals.backend_res_buffer_hash_ms / nsub,
+                            (totals.backend_res_buffer_ms - totals.backend_res_buffer_acquire_ms -
+                             totals.backend_res_buffer_copy_ms - totals.backend_res_buffer_create_ms -
+                             totals.backend_res_buffer_index_find_ms -
+                             totals.backend_res_buffer_index_insert_ms - totals.backend_res_buffer_hash_ms) / nsub,
                             totals.backend_res_descriptor_ms / nsub,
                             (totals.backend_setup_resources_ms - totals.backend_res_texture_ms -
                              totals.backend_res_buffer_ms - totals.backend_res_descriptor_ms) / nsub);
@@ -6876,7 +6906,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     fprintf(stderr,
                             "[render-window] backend-submit resources avg_ms: texture=%.2f "
                             "(upload=%.2f bind=%.2f lookup=%.2f) buffer=%.2f "
-                            "(acquire=%.2f copy=%.2f) descriptor=%.2f other=%.2f\n",
+                            "(acquire=%.2f copy=%.2f create=%.2f index_find=%.2f "
+                            "index_insert=%.2f hash=%.2f "
+                            "other=%+.2f) descriptor=%.2f other=%.2f\n",
                             window.backend_res_texture_ms / wn,
                             window.backend_res_texture_upload_ms / wn,
                             window.backend_res_texture_bind_ms / wn,
@@ -6885,6 +6917,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             window.backend_res_buffer_ms / wn,
                             window.backend_res_buffer_acquire_ms / wn,
                             window.backend_res_buffer_copy_ms / wn,
+                            window.backend_res_buffer_create_ms / wn,
+                            window.backend_res_buffer_index_find_ms / wn,
+                            window.backend_res_buffer_index_insert_ms / wn,
+                            window.backend_res_buffer_hash_ms / wn,
+                            (window.backend_res_buffer_ms - window.backend_res_buffer_acquire_ms -
+                             window.backend_res_buffer_copy_ms - window.backend_res_buffer_create_ms -
+                             window.backend_res_buffer_index_find_ms -
+                             window.backend_res_buffer_index_insert_ms - window.backend_res_buffer_hash_ms) / wn,
                             window.backend_res_descriptor_ms / wn,
                             (window.backend_setup_resources_ms - window.backend_res_texture_ms -
                              window.backend_res_buffer_ms - window.backend_res_descriptor_ms) / wn);

@@ -619,9 +619,40 @@ struct BackendRenderTimingStats {
     double res_texture_upload_ms = 0;
     double res_texture_bind_ms = 0;
     double res_buffer_ms = 0;
+    // Nested INSIDE res_buffer_ms. acquire+copy were added as two CANDIDATE mechanisms, never as a
+    // partition, and reading them as one hid the dominant term for months: measured on Blue Prince
+    // gameplay, buffer=332.08 ms/submit against acquire=1.50 + copy=25.82, so 91.8% of the buffer
+    // branch — 60.9% of the whole frame — was attributed to nothing. The enclosing `resources` line
+    // self-checks to +0.00, which is exactly why nobody looked inside it: a partition that balances
+    // at one scale says nothing about the scale below it. These four cover the remaining branches,
+    // and res_buffer_other_ms() is printed SIGNED so an incomplete partition reports itself instead
+    // of looking finished (#2245).
     double res_buffer_acquire_ms = 0;
     double res_buffer_copy_ms = 0;
+    // vkCreateBuffer + vkAllocateMemory + the copy performed inside
+    // create_transient_storage_buffer_upload — the fallback taken when a payload gets neither an
+    // arena slice nor a pooled buffer. Timed by neither acquire nor copy before this.
+    double res_buffer_create_ms = 0;
+    // Split rather than one `index` bucket, because the two run over populations that differ by
+    // ~5x and imply opposite fixes. `find` and the memo emplace are per REFERENCE (8.0M on the
+    // #2245 run); the insert is per UNIQUE BUFFER (1.56M). If lookup dominates, the fix is the key
+    // or the container; if insert dominates, there are simply many unique buffers and the fix is
+    // upstream of the index entirely — the same distinction #2245 exists to draw between
+    // skipped_unique and skipped_large. Summing them would be one more conflated bucket read as an
+    // exhaustive one, which is the failure this whole change is about.
+    double res_buffer_index_find_ms = 0;
+    double res_buffer_index_insert_ms = 0;
+    // hash_buffer_words over payloads <= 4 KiB (large ones take a unique tag and skip it).
+    double res_buffer_hash_ms = 0;
     double res_descriptor_ms = 0;
+
+    // Signed by construction: a negative value means the nested timers over-attribute (double
+    // counting or a re-entered scope) and a large positive one means a branch is still unmeasured.
+    // Clamping this to zero would make a broken instrument print identically to a correct one.
+    double res_buffer_other_ms() const {
+        return res_buffer_ms - res_buffer_acquire_ms - res_buffer_copy_ms - res_buffer_create_ms -
+               res_buffer_index_find_ms - res_buffer_index_insert_ms - res_buffer_hash_ms;
+    }
 
     double total_ms() const {
         return target_ms + draw_setup_ms + record_upload_ms + gpu_wait_ms + readback_ms + cleanup_ms;
@@ -3853,11 +3884,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     double res_texture_upload_ms = 0.0;
     double res_texture_bind_ms = 0.0;
     double res_buffer_ms = 0.0;
-    // Nested INSIDE res_buffer_ms, splitting the two candidate mechanisms apart: Vulkan object churn
-    // (pool/arena acquisition, which on a miss is create+allocate+bind+map) versus staging memcpy
-    // bandwidth. They imply completely different fixes, so the split is what selects between them.
+    // Nested INSIDE res_buffer_ms. See BackendRenderTimingStats for why these five exist rather than
+    // the original two, and why the remainder is reported signed.
     double res_buffer_acquire_ms = 0.0;
     double res_buffer_copy_ms = 0.0;
+    double res_buffer_create_ms = 0.0;
+    double res_buffer_index_find_ms = 0.0;
+    double res_buffer_index_insert_ms = 0.0;
+    double res_buffer_hash_ms = 0.0;
     double res_descriptor_ms = 0.0;
     auto setup_elapsed_ms = [](auto begin, auto end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
@@ -4827,6 +4861,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         shareable && word_count <= kSharedBufferHashDedupMaxDwords;
                     uint64_t content_hash = 0;
                     if (hash_dedup) {
+                        const ResourcePhaseTimer phase_hash(timing_enabled, &res_buffer_hash_ms);
                         content_hash = hash_buffer_words(words, word_count);
                         ++resource_reuse_stats.buffer_hash_calls;
                         resource_reuse_stats.buffer_hash_dwords += word_count;
@@ -4843,7 +4878,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     SharedBufferKey buffer_key{
                         words, word_count, r.buffer_identity, content_hash,
                         hash_dedup ? 0 : ++resource_unique_tag};
-                    auto buffer_found = shared_buffer_indices.find(buffer_key);
+                    auto buffer_found = shared_buffer_indices.end();
+                    {
+                        const ResourcePhaseTimer phase_index(timing_enabled,
+                                                             &res_buffer_index_find_ms);
+                        buffer_found = shared_buffer_indices.find(buffer_key);
+                    }
                     if (buffer_found != shared_buffer_indices.end()) {
                         buffer_index = buffer_found->second;
                     } else {
@@ -4867,6 +4907,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             upload.pooled = upload.buffer && upload.memory && upload.mapped;
                         }
                         if (!upload.arena && !upload.pooled) {
+                            // create+allocate+map+copy, all of it. Neither `acquire` nor `copy` saw
+                            // this branch, so a payload that misses both the arena and the pool cost
+                            // a full Vulkan allocation that read as free.
+                            const ResourcePhaseTimer phase_create(timing_enabled,
+                                                                  &res_buffer_create_ms);
                             RenderBufferUploadFailureStep failure =
                                 create_transient_storage_buffer_upload(
                                     ctx, words, bytes, upload.buffer, upload.memory);
@@ -4907,12 +4952,20 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                         words, static_cast<size_t>(bytes));
                             upload.range = bytes;
                         }
-                        shared_buffers.push_back(upload);
-                        shared_buffer_indices.emplace(buffer_key, buffer_index);
+                        {
+                            const ResourcePhaseTimer phase_index(timing_enabled,
+                                                                 &res_buffer_index_insert_ms);
+                            shared_buffers.push_back(upload);
+                            shared_buffer_indices.emplace(buffer_key, buffer_index);
+                        }
                         ++resource_reuse_stats.unique_buffers;
                         ++backend_hash_stats_totals().unique_buffers;
                     }
-                    if (shareable) buffer_ref_memo.emplace(memo_key, buffer_index);
+                    if (shareable) {
+                        const ResourcePhaseTimer phase_index(timing_enabled,
+                                                             &res_buffer_index_find_ms);
+                        buffer_ref_memo.emplace(memo_key, buffer_index);
+                    }
                     }
                     dbi[i] = {shared_buffers[buffer_index].buffer,
                               shared_buffers[buffer_index].offset,
@@ -6487,6 +6540,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.res_buffer_ms = res_buffer_ms;
         call_timing.res_buffer_acquire_ms = res_buffer_acquire_ms;
         call_timing.res_buffer_copy_ms = res_buffer_copy_ms;
+        call_timing.res_buffer_create_ms = res_buffer_create_ms;
+        call_timing.res_buffer_index_find_ms = res_buffer_index_find_ms;
+        call_timing.res_buffer_index_insert_ms = res_buffer_index_insert_ms;
+        call_timing.res_buffer_hash_ms = res_buffer_hash_ms;
         call_timing.res_descriptor_ms = res_descriptor_ms;
         call_timing.setup_pipeline_ms = setup_pipeline_ms;
         // The live F8 caller consumes call_timing above. Only the explicit environment switch owns
@@ -6817,6 +6874,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(res_buffer_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_acquire_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_copy_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_create_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_index_find_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_index_insert_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_hash_ms);
             PROSPER_SUM_TIMING_STAT(res_descriptor_ms);
             PROSPER_SUM_TIMING_STAT(setup_pipeline_ms);
 #undef PROSPER_SUM_TIMING_STAT

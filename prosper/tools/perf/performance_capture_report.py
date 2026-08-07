@@ -108,6 +108,36 @@ def _resource_breakdown(renderer):
             "res_buffer_copy": _total(renderer, "res_buffer_copy_ms"),
             "res_descriptor": _total(renderer, "res_descriptor_ms"),
         })
+        # Same rule as have_backend, one level down and for the same reason. A capture predating the
+        # buffer leaves must report them UNAVAILABLE, never 0 -- with 0 the remainder below would
+        # absorb every leaf it is missing and print a large residual, which is precisely the false
+        # "unattributed work" reading this partition was added to stop.
+        #
+        # all(), not any(). Only one site emits these fields today and it sets them together, so the
+        # two are equivalent right now -- but they differ exactly when that stops being true, and
+        # they fail in opposite directions. any() would report a breakdown for a partially-populated
+        # capture, in which _total's .get(field, 0.0) silently contributes 0 for every record missing
+        # the field: under-counted, and indistinguishable from a real measurement. all() reports
+        # UNAVAILABLE instead. Fail closed, which is this whole function's thesis.
+        breakdown["buffer_leaves_available"] = all("res_buffer_create_ms" in r for r in renderer)
+        # The same signed-remainder argument, one level down. res_buffer_ms had NO exhaustive
+        # partition until now -- only `copy` and (in the stderr window) `acquire`, two candidate
+        # mechanisms out of an unknown number. An unmeasured region does not read as unmeasured; it
+        # reads as the subject's cost. A diagnostic added inside it billed 305 ms/submit to the
+        # renderer and produced a confident, entirely false finding before a single-variable A/B
+        # killed it. This remainder is what makes that visible on the first run instead of the third.
+        # `acquire` is a stderr-only term, so it is folded into the remainder here rather than
+        # invented -- which is why a healthy value is a few ms, not ~0.
+        if breakdown["buffer_leaves_available"]:
+            breakdown["res_buffer_create"] = _total(renderer, "res_buffer_create_ms")
+            breakdown["res_buffer_index_find"] = _total(renderer, "res_buffer_index_find_ms")
+            breakdown["res_buffer_index_insert"] = _total(renderer, "res_buffer_index_insert_ms")
+            breakdown["res_buffer_hash"] = _total(renderer, "res_buffer_hash_ms")
+            breakdown["res_buffer_other"] = (
+                breakdown["res_buffer"] - breakdown["res_buffer_copy"]
+                - breakdown["res_buffer_create"] - breakdown["res_buffer_index_find"]
+                - breakdown["res_buffer_index_insert"]
+                - breakdown["res_buffer_hash"])
         # The remainder is reported as TWO numbers, and this is not fussiness -- it is this file's own
         # argument applied to sign instead of presence.
         #
@@ -354,7 +384,16 @@ def print_summary(summary):
             print("  setup_resources (backend binding):       "
                   f"{breakdown['setup_resources']:.1f}ms"
                   f"  [texture={breakdown['res_texture']:.1f}"
-                  f" buffer={breakdown['res_buffer']:.1f} (copy={breakdown['res_buffer_copy']:.1f})"
+                  f" buffer={breakdown['res_buffer']:.1f} ("
+                  + (f"copy={breakdown['res_buffer_copy']:.1f}"
+                     f" create={breakdown['res_buffer_create']:.1f}"
+                     f" index_find={breakdown['res_buffer_index_find']:.1f}"
+                     f" index_insert={breakdown['res_buffer_index_insert']:.1f}"
+                     f" hash={breakdown['res_buffer_hash']:.1f}"
+                     f" other={breakdown['res_buffer_other']:+.1f}"
+                     if breakdown["buffer_leaves_available"]
+                     else f"copy={breakdown['res_buffer_copy']:.1f};"
+                          " create/index_find/index_insert/hash UNAVAILABLE") + ")"
                   f" descriptor={breakdown['res_descriptor']:.1f}"
                   f" other={breakdown['res_other']:.1f}]")
             # Loud, and only when it is genuinely non-zero. A sub-bucket total exceeding its parent

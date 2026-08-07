@@ -56,7 +56,18 @@ struct RendererTimingRecord {
     // largest bucket, which is the reason both lanes spent a day reasoning from partial data.
     double res_texture_ms = 0;
     double res_buffer_ms = 0;
-    double res_buffer_copy_ms = 0;   // the leaf the perf work keeps landing on (#2215/#2231)
+    // Leaves of res_buffer_ms. `copy` is the one the perf work kept landing on (#2215/#2231), and on
+    // its own it is badly misleading: measured on Blue Prince gameplay it was 25.82 ms against a
+    // res_buffer_ms of 332.08 — 5.2% of the frame, while 60.9% of the frame sat in the branch
+    // unattributed. The other three name the branches that were previously timed by nothing, so a
+    // reader of an F8 capture cannot repeat that. `other` stays underived here for the same reason
+    // as above, but the report prints it SIGNED: a negative remainder is over-attribution, and
+    // clamping it would make a broken partition look like a complete one (#2245).
+    double res_buffer_copy_ms = 0;
+    double res_buffer_create_ms = 0;
+    double res_buffer_index_find_ms = 0;
+    double res_buffer_index_insert_ms = 0;
+    double res_buffer_hash_ms = 0;
     double res_descriptor_ms = 0;
 };
 

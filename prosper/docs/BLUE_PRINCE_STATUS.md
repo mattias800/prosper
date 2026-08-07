@@ -217,6 +217,25 @@ were confirmed as legitimate frustum culls.
 
 ## Ruled out (do-not-redo list)
 
+**Buffer-upload performance, 2026-08-07 (#2246).** Three hypotheses closed with measurements, so the
+next lane starts after them rather than at them:
+
+- **A content cache for storage-buffer uploads is not the fix.** `PROSPER_BUFFER_CHURN` classified
+  2.4M uploads on a default Linux gameplay run: 55.5% are content-unchanged **by count** but only
+  **11.0% by bytes** (50,076 MiB unchanged against 402,538 MiB changed). Unchanged payloads average
+  36.7 KiB and changed ones 452 KiB — the large buffers that carry 99.88% of the copied bytes
+  genuinely differ every call. A perfect content cache removes at most ~11% of the copy volume. The
+  count figure is the tempting one and it is the wrong axis: the cost is bytes.
+- **`create_transient_storage_buffer_upload` never fires.** It was the leading candidate for
+  untimed Vulkan allocation churn; `create=0.00 ms` in every window of two full runs. The arena and
+  pool paths cover every upload.
+- **There is no large hidden term inside `res_buffer_ms`.** Once partitioned exhaustively it closes
+  to `other=+3.23` (8%). `copy` is the dominant leaf at ~78% of the buffer branch — but the buffer
+  branch is ~20% of the frame, not the ~66% an earlier reading claimed. That reading was an
+  instrument artefact and is recorded as instrument trap 130; **do not cite `buffer=332` or
+  "60.9% of the frame is unattributed" — both are the churn diagnostic measuring itself.**
+
+
 Exonerated with evidence (do not re-chase without new contradictory evidence): present staleness,
 capture transposition, texture/descriptor decode for the Day One hold (#1287/#1334/#1335 record);
 mips/CBR/checkerboard, shadow acne, caster bias, and sampler filtering for the ring family
