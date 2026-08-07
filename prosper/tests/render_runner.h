@@ -4060,18 +4060,53 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             static std::mutex log_mutex;
             static std::unordered_set<uint64_t> logged;
             std::lock_guard<std::mutex> lock(log_mutex);
-            if (logged.insert(shader_key).second)
+            if (logged.insert(shader_key).second) {
+                // WHY the width was required, decoded (#2147). `required-ops` cannot answer it:
+                // those are Vote/Arithmetic/Shuffle CAPABILITY bits, and the lane-id path declares
+                // none of them — so a shader needing 64 for lane IDENTITY (which can never run at
+                // 32, since SubgroupLocalInvocationId IS the guest lane id) printed identically to
+                // one needing it only for a branch-guard vote (which may be width-agnostic). Those
+                // have opposite prospects under a wave32 lowering, and without this field the
+                // census that decides whether such a lowering is worth writing cannot be taken.
+                //
+                // Inside the dedupe guard, so it costs once per distinct shader, not per draw.
+                const uint32_t why =
+                    prosper::gpu::fragment_spirv_required_subgroup_reasons(bd_fs);
+                char why_text[160];
+                if (why == UINT32_MAX) {
+                    // Absent, not none. A module built before #2147 carries no marker, and printing
+                    // that as 0 would assert nothing required the width — impossible for a module
+                    // that requires one.
+                    std::snprintf(why_text, sizeof why_text, "unrecorded (pre-#2147 module)");
+                } else {
+                    int n = std::snprintf(why_text, sizeof why_text, "0x%x", why);
+                    const struct { uint32_t bit; const char* name; } kReasonNames[] = {
+                        {prosper::gpu::kFragmentWaveReasonLaneId,     " lane-id"},
+                        {prosper::gpu::kFragmentWaveReasonWaveAny,    " wave-any"},
+                        {prosper::gpu::kFragmentWaveReasonDppRow16,   " dpp16"},
+                        {prosper::gpu::kFragmentWaveReasonPermLane32, " permlane32"},
+                        {prosper::gpu::kFragmentWaveReasonReadLane64, " readlane64"},
+                        {prosper::gpu::kFragmentWaveReasonShuffle,    " shuffle"},
+                    };
+                    for (const auto& entry : kReasonNames)
+                        if ((why & entry.bit) && n > 0 && n < static_cast<int>(sizeof why_text))
+                            n += std::snprintf(why_text + n, sizeof why_text - n, "%s", entry.name);
+                    if (!why && n > 0 && n < static_cast<int>(sizeof why_text))
+                        std::snprintf(why_text + n, sizeof why_text - n, " none");
+                }
                 std::fprintf(stderr,
                              "[render] skip draw: fragment shader requires subgroup size %u "
                              "(device range %u..%u required-stages=0x%x subgroup-stages=0x%x "
-                             "ops=0x%x required-ops=0x%x control=%d gds=%d fragment-atomics=%d)\n",
+                             "ops=0x%x required-ops=0x%x control=%d gds=%d fragment-atomics=%d "
+                             "why=%s)\n",
                              required_fragment_subgroup_size, ctx.min_subgroup_size,
                              ctx.max_subgroup_size, ctx.required_subgroup_size_stages,
                              ctx.subgroup_stages, ctx.subgroup_operations,
                              required_fragment_subgroup_features,
                              static_cast<int>(ctx.subgroup_size_control),
                              static_cast<int>(uses_internal_gds),
-                             static_cast<int>(ctx.fragment_stores_atomics));
+                             static_cast<int>(ctx.fragment_stores_atomics), why_text);
+            }
             continue;
         }
         if (uses_internal_gds && !render_internal_gds_buffer().buffer) {

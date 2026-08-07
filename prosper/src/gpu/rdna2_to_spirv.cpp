@@ -281,6 +281,12 @@ struct SpirvCompute {
     bool packed_r11_storage=true;
     uint32_t compute_min_subgroup_size=0;             // non-semantic backend contract (4/16/32/64)
     uint32_t fragment_required_subgroup_size=0;       // exact guest-wave contract (32 or 64)
+    // WHY that width was required, as a bitmask (#2147). The size alone is not actionable: a
+    // shader needing 64 for lane IDENTITY can never run at 32, while one needing it only for a
+    // width-agnostic branch vote might. The skip diagnostic reported neither, because its
+    // `required-ops` field scans for Vote/Arithmetic/Shuffle CAPABILITIES and the lane-id path
+    // declares none of them -- so the two cases printed identically.
+    uint32_t fragment_wave_reasons=0;
     uint32_t v_subgroupid=0, v_subgroup_localid=0, t_ptr_in_u32=0;
     uint32_t v_helper_invocation=0, t_ptr_in_bool=0;
     uint32_t v_internal_gds=0, t_ptr_gds_u32=0;
@@ -527,7 +533,8 @@ struct SpirvCompute {
         }
         // Fragment lane ids model the guest RDNA wave, not the implementation's default subgroup.
         // Record that exact-width contract as non-semantic module metadata in finish().
-        if (is_fragment) fragment_required_subgroup_size = wave_size;
+        if (is_fragment) fragment_required_subgroup_size = wave_size,
+                         fragment_wave_reasons |= kFragmentWaveReasonLaneId;
         uint32_t lane = id();
         put(code, Op_Load, {t_u32, lane, v_subgroup_localid});
         return lane;
@@ -548,6 +555,7 @@ struct SpirvCompute {
             declared_subgroup_vote = true;
         }
         fragment_required_subgroup_size = wave_size;
+        fragment_wave_reasons |= kFragmentWaveReasonWaveAny;
         uint32_t result = id();
         put(code, Op_GroupNonUniformAny,
             {t_bool, result, uconst(Scope_Subgroup), active_bit});
@@ -754,23 +762,27 @@ struct SpirvCompute {
         // DPP rows contain 16 contiguous lanes. Keep width metadata independent of SPIR-V
         // capabilities: declaring an unused operation merely as a marker over-requires the host and
         // confuses shaders that genuinely use that capability for unrelated work.
-        if (is_fragment) fragment_required_subgroup_size = wave_size;
+        if (is_fragment) fragment_required_subgroup_size = wave_size,
+                         fragment_wave_reasons |= kFragmentWaveReasonDppRow16;
         else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 16u);
     }
     void mark_subgroup_min32() {
         // PERMLANEX16 crosses a pair of 16-lane rows.
-        if (is_fragment) fragment_required_subgroup_size = wave_size;
+        if (is_fragment) fragment_required_subgroup_size = wave_size,
+                         fragment_wave_reasons |= kFragmentWaveReasonPermLane32;
         else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 32u);
     }
     void mark_subgroup_min64() {
         // V_READLANE_B32 may address every lane of a wave64.
-        if (is_fragment) fragment_required_subgroup_size = wave_size;
+        if (is_fragment) fragment_required_subgroup_size = wave_size,
+                         fragment_wave_reasons |= kFragmentWaveReasonReadLane64;
         else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 64u);
     }
     uint32_t subgroup_shuffle(uint32_t value, uint32_t lane) {
         // Every supported native shuffle at least addresses an architectural quad. Wider row/wave
         // operations raise this contract before calling the common helper.
-        if (is_fragment) fragment_required_subgroup_size = wave_size;
+        if (is_fragment) fragment_required_subgroup_size = wave_size,
+                         fragment_wave_reasons |= kFragmentWaveReasonShuffle;
         else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 4u);
         if (!declared_subgroup) {
             put(caps, Op_Capability, {Cap_GroupNonUniform});
@@ -2810,6 +2822,15 @@ struct SpirvCompute {
             std::snprintf(marker, sizeof marker, "Prosper.FragmentSubgroupSize=%u",
                           fragment_required_subgroup_size);
             std::vector<uint32_t> words;
+            pstr(words, marker);
+            putv(debug, Op_ModuleProcessed, words);
+            // A SEPARATE marker, not a wider one: a module cached or captured before #2147
+            // carries the size and not this, and a reader must be able to tell 'reasons
+            // unknown' from 'reasons none'. Absent and zero are the same number and opposite
+            // facts -- a zero would assert that nothing required a width this module demands.
+            std::snprintf(marker, sizeof marker, "Prosper.FragmentSubgroupWhy=%u",
+                          fragment_wave_reasons);
+            words.clear();
             pstr(words, marker);
             putv(debug, Op_ModuleProcessed, words);
         }
@@ -16270,6 +16291,36 @@ uint32_t compute_spirv_min_subgroup_size(const std::vector<uint32_t>& spirv) {
         offset += words;
     }
     return required;
+}
+
+uint32_t fragment_spirv_required_subgroup_reasons(const std::vector<uint32_t>& spirv) {
+    if (spirv.size() < 5 || spirv[0] != 0x07230203u) return UINT32_MAX;
+    constexpr char prefix[] = "Prosper.FragmentSubgroupWhy=";
+    for (size_t offset = 5; offset < spirv.size();) {
+        const uint32_t instruction = spirv[offset];
+        const uint32_t words = instruction >> 16;
+        const uint32_t opcode = instruction & 0xffffu;
+        if (!words || words > spirv.size() - offset) return UINT32_MAX;
+        if (opcode == Op_ModuleProcessed && words > 1) {
+            const char* text = reinterpret_cast<const char*>(&spirv[offset + 1]);
+            const size_t bytes = static_cast<size_t>(words - 1) * sizeof(uint32_t);
+            const void* terminator = std::memchr(text, '\0', bytes);
+            if (terminator) {
+                const size_t length = static_cast<const char*>(terminator) - text;
+                if (length > sizeof(prefix) - 1 &&
+                    std::memcmp(text, prefix, sizeof(prefix) - 1) == 0) {
+                    char* end = nullptr;
+                    const unsigned long value =
+                        std::strtoul(text + sizeof(prefix) - 1, &end, 10);
+                    if (end == text + length) return static_cast<uint32_t>(value);
+                }
+            }
+        }
+        offset += words;
+    }
+    // No marker: the module predates #2147. UINT32_MAX rather than 0, so a caller cannot read
+    // 'unknown' as 'nothing required it'.
+    return UINT32_MAX;
 }
 
 uint32_t fragment_spirv_required_subgroup_features(const std::vector<uint32_t>& spirv) {
