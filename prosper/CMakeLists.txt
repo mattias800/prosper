@@ -133,6 +133,16 @@ if(Python3_Interpreter_FOUND)
   # report a clean suite forever, which is the one way this guard can fail silently.
   add_test(NAME vkval_scan_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/vkval/test_vk_validation_scan.py")
+  # ctest EXITS 0 when it finds no tests, so "nothing ran" and "everything passed" share a status
+  # (#2187). Four CI jobs and both author-verification runs were reading that status. They now pass
+  # --no-tests=error; this registers the checker that keeps the next one from omitting it. The
+  # --selftest arm is what is registered rather than the repository scan, because a scan needs the
+  # checkout root and this test must run from any build directory -- CI runs the scan itself, in
+  # the Docs job. Its own failure mode is silence: a matcher that stops matching reports a clean
+  # tree forever, which is why the selftest carries the prose lines an earlier revision got wrong.
+  add_test(NAME ctest_gate_checker
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_ctest_gate.py"
+                   --selftest)
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
   # runtime, the arm becomes invisible -- and the test does not fail, it goes vacuous and keeps
   # printing [ok], which is why #2214 surfaced only as one unrelated-looking Vulkan binding error on
