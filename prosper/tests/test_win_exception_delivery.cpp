@@ -14,6 +14,40 @@
 
 using namespace prosper;
 
+// A wall-clock bound for the spin-waits below, because the iteration counts they replaced did not
+// mean what they read (#2242).
+//
+// `for (WaitDeadline deadline(kWaitEventMs); !flag && deadline.pending();) Sleep(1);` reads as two seconds and is not. Windows
+// quantises Sleep to the system timer resolution, and nothing in this tree raises it -- measured on
+// this host with QueryPerformanceCounter over 200 iterations:
+//
+//     default                     Sleep(1) = 15.554 ms  ->  2000 iterations = 31.1 s
+//     after timeBeginPeriod(1)    Sleep(1) =  1.930 ms  ->  2000 iterations =  3.9 s
+//
+//     $ grep -rn 'timeBeginPeriod\|NtSetTimerResolution' prosper/src prosper/tests prosper/frontends
+//       (nothing)
+//
+// So the default arm is the live one and every bound in this file was ~15.6x longer than written.
+// That was never a correctness problem -- these are all timeouts on a wait for a state transition,
+// and a too-generous timeout cannot manufacture a pass, only delay reporting a genuine failure.
+// It is a READABILITY problem, and an unusually bad one: the intent is unrecoverable from the
+// source, because the answer depends on a process-wide setting declared nowhere in the file.
+//
+// The deadlines below are chosen to leave the REAL timeouts where they already are (1000 iterations
+// ~= 15 s, 2000 ~= 31 s, 3000 ~= 47 s), so this conversion changes no wall-clock behaviour on any
+// runner -- it only makes the number honest, and makes it independent of a timer resolution some
+// future code might raise. They are deliberately enormous: the registrations they wait for take
+// microseconds when healthy, and the only thing a shorter bound could buy is a faster report of a
+// failure that is already red.
+struct WaitDeadline {
+    ULONGLONG end;
+    explicit WaitDeadline(unsigned ms) : end(GetTickCount64() + ms) {}
+    bool pending() const { return GetTickCount64() < end; }
+};
+static constexpr unsigned kWaitReadyMs = 15000;      // was `i < 1000`
+static constexpr unsigned kWaitEventMs = 30000;      // was `i < 2000`
+static constexpr unsigned kWaitDeliveryMs = 45000;   // was `i < 3000`
+
 static volatile LONG delivered;
 static volatile LONG resumed;
 static volatile DWORD worker_tid;
@@ -121,12 +155,12 @@ static void* primary_prober(void*) {   // raise at the primary while it is NOT p
 }
 
 static void* primary_raiser(void*) {   // raise at the primary while it IS parked in an HLE wait
-    for (int i = 0; i < 2000 && !primary_parked; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !primary_parked && deadline.pending();) Sleep(1);
     Sleep(20);   // let the wait register before the raise looks for a checkpoint
     primary_raise_result = raise_fn((uint64_t)primary_pthread, 0x1e, 0, 0, 0, 0);
     // Watchdog: a failed delivery must not hang the suite. Wake the primary so the assertions
     // below report the failure instead of the test timing out with no diagnosis.
-    for (int i = 0; i < 3000 && !delivered; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitDeliveryMs); !delivered && deadline.pending();) Sleep(1);
     if (!delivered) {
         InterlockedExchange((volatile LONG*)&wait_word, 1);
         WakeByAddressAll((void*)&wait_word);
@@ -198,7 +232,7 @@ static void* pin_boundary_worker(void*) {
 static void pin_boundary_hook(uint32_t native_id, void*) {
     if (native_id != pin_boundary_tid) return;
     InterlockedExchange(&pin_boundary_transition, 1);
-    for (int i = 0; i < 2000 && !pin_boundary_republished; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !pin_boundary_republished && deadline.pending();) Sleep(1);
 }
 
 static void* mutex_worker(void*) {
@@ -637,7 +671,7 @@ int main() {
     registry_observations = 0;
     CHECK(pthread_create(&thread, nullptr, registry_worker, nullptr) == 0,
           "create lifecycle-registry publication stress thread");
-    for (int i = 0; i < 1000 && !registry_tid; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !registry_tid && deadline.pending();) Sleep(1);
     while (!registry_done) {
         GuestThreadSnapshot snapshot{};
         if (!snapshot_guest_thread_registration(registry_tid, snapshot)) continue;
@@ -669,7 +703,7 @@ int main() {
     CHECK(pin_create == 0,
           "create deterministic sampler generation-boundary target");
     if (pin_create == 0) {
-        for (int i = 0; i < 2000 && !pin_boundary_ready; ++i) Sleep(1);
+        for (WaitDeadline deadline(kWaitEventMs); !pin_boundary_ready && deadline.pending();) Sleep(1);
         set_guest_thread_trace_test_hook(&pin_boundary_hook);
         dump_guest_thread_trace(pin_trace_path);
         set_guest_thread_trace_test_hook(nullptr);
@@ -699,12 +733,12 @@ int main() {
     if (executable_page) VirtualFree(executable_page, 0, MEM_RELEASE);
 
     CHECK(pthread_create(&thread, nullptr, worker, nullptr) == 0, "create target thread");
-    for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     CHECK(worker_tid != 0, "target thread entered blocking HLE futex");
 
     uint64_t result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "raise exception to target thread");
-    for (int i = 0; i < 2000 && !resumed; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
     if (!resumed) {
         InterlockedExchange((volatile LONG*)&wait_word, 1);
         WakeByAddressAll((void*)&wait_word);
@@ -723,9 +757,9 @@ int main() {
     pthread_mutex_lock(&wait_mutex);
     CHECK(pthread_create(&thread, nullptr, cond_worker, nullptr) == 0,
           "create pthread-condition target thread");
-    for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     pthread_mutex_unlock(&wait_mutex);
-    for (int i = 0; i < 1000 && !cond_ready; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !cond_ready && deadline.pending();) Sleep(1);
     // The worker holds wait_mutex until interruptible_cond_wait has registered its pthread handle
     // and atomically released the mutex inside pthread_cond_wait. Acquiring it here closes the race
     // between the ready marker and the actual blocking wait.
@@ -735,7 +769,7 @@ int main() {
 
     result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "raise exception to pthread-condition target");
-    for (int i = 0; i < 2000 && !resumed; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
     if (!resumed) interruptible_cond_broadcast(&wait_cond);
     pthread_join(thread, nullptr);
 
@@ -749,13 +783,13 @@ int main() {
     pthread_mutex_lock(&blocked_mutex);
     CHECK(pthread_create(&thread, nullptr, mutex_worker, nullptr) == 0,
           "create pthread-mutex target thread");
-    for (int i = 0; i < 1000 && !mutex_ready; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !mutex_ready && deadline.pending();) Sleep(1);
     CHECK(worker_tid != 0 && mutex_ready != 0, "target entered contended pthread-mutex lock");
     Sleep(10);
 
     result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "raise exception to pthread-mutex target");
-    for (int i = 0; i < 2000 && !delivered; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !delivered && deadline.pending();) Sleep(1);
     CHECK(delivered != 0, "guest handler interrupted contended pthread-mutex lock");
     CHECK(handler_tid == worker_tid, "pthread-mutex handler ran on requested target");
     pthread_mutex_unlock(&blocked_mutex);
@@ -766,16 +800,16 @@ int main() {
     hold_handler = 1;
     CHECK(pthread_create(&thread, nullptr, worker, nullptr) == 0,
           "create nested-delivery target thread");
-    for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     CHECK(worker_tid != 0, "nested-delivery target entered blocking wait");
     result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "start first exception delivery");
-    for (int i = 0; i < 2000 && !delivered; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !delivered && deadline.pending();) Sleep(1);
     CHECK(delivered != 0, "first handler is active on its exception stack");
     result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0x80020010ull, "overlapping delivery to one target is rejected as EBUSY");
     InterlockedExchange(&release_handler, 1);
-    for (int i = 0; i < 2000 && !resumed; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
     if (!resumed) WakeByAddressAll((void*)&wait_word);
     pthread_join(thread, nullptr);
     CHECK(resumed != 0, "target resumes cleanly after serialized delivery");
@@ -783,16 +817,16 @@ int main() {
     reset_delivery_state();
     CHECK(pthread_create(&thread, nullptr, repeat_worker, nullptr) == 0,
           "create repeated-delivery target thread");
-    for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     CHECK(worker_tid != 0, "repeated-delivery target entered first wait");
     result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "start first serialized delivery");
-    for (int i = 0; i < 2000 && !repeat_stage; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !repeat_stage && deadline.pending();) Sleep(1);
     CHECK(repeat_stage == 1, "first delivery restored the target's original context");
     Sleep(10);
     result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "reuse exception stack after restored context is observed");
-    for (int i = 0; i < 2000 && !resumed; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
     if (!resumed) WakeByAddressAll((void*)&wait_word);
     pthread_join(thread, nullptr);
     CHECK(delivered == 2, "both serialized exception handlers executed");
@@ -805,11 +839,11 @@ int main() {
         avx_test_active = 1;
         CHECK(pthread_create(&thread, nullptr, avx_worker, nullptr) == 0,
               "create AVX-state target thread");
-        for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
+        for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
         CHECK(worker_tid != 0, "AVX-state target entered register-live loop");
         result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
         CHECK(result == 0, "deliver exception while YMM register is live");
-        for (int i = 0; i < 2000 && !delivered; ++i) Sleep(1);
+        for (WaitDeadline deadline(kWaitEventMs); !delivered && deadline.pending();) Sleep(1);
         InterlockedExchange(&avx_stop, 1);
         pthread_join(thread, nullptr);
         CHECK(memcmp(avx_expected, avx_observed, sizeof avx_expected) == 0,
@@ -822,7 +856,7 @@ int main() {
     reset_delivery_state();
     CHECK(pthread_create(&thread, nullptr, gpr_worker, nullptr) == 0,
           "create nonvolatile-register target thread");
-    for (int i = 0; i < 1000 && !gpr_ready; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !gpr_ready && deadline.pending();) Sleep(1);
     CHECK(worker_tid != 0 && gpr_ready != 0, "nonvolatile R12 pattern is live");
     bool all_deliveries = true;
     for (LONG i = 1; i <= 100; ++i) {
@@ -832,7 +866,7 @@ int main() {
         // Only this target's restored normal-context loop can copy that generation to gpr_ack,
         // so the acknowledgment proves the prior delivery has left the exception stack before
         // the next raise tries to reclaim it. R12 stays live across that exact observation.
-        for (int spin = 0; spin < 2000 && gpr_ack < i; ++spin) Sleep(1);
+        for (WaitDeadline deadline(kWaitEventMs); gpr_ack < i && deadline.pending();) Sleep(1);
         if (gpr_ack < i) { all_deliveries = false; break; }
     }
     InterlockedExchange(&gpr_stop, 1);
@@ -853,12 +887,12 @@ int main() {
     // restored normal execution outside its exception stack and the global queued counter did not leak.
     CHECK(pthread_create(&thread, nullptr, gpr_worker, nullptr) == 0,
           "create CPU-bound default-delivery target thread");
-    for (int i = 0; i < 1000 && !gpr_ready; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !gpr_ready && deadline.pending();) Sleep(1);
     bool cpu_fallback_ok = worker_tid != 0 && gpr_ready != 0;
     for (LONG expected_deliveries = 1; expected_deliveries <= 2 && cpu_fallback_ok;
          ++expected_deliveries) {
         result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
-        for (int spin = 0; spin < 2000 && gpr_ack < expected_deliveries; ++spin) Sleep(1);
+        for (WaitDeadline deadline(kWaitEventMs); gpr_ack < expected_deliveries && deadline.pending();) Sleep(1);
         cpu_fallback_ok = result == 0 && delivered == expected_deliveries &&
                           gpr_ack == expected_deliveries &&
                           pending_guest_exception_count() == 0;
@@ -880,9 +914,9 @@ int main() {
     pthread_mutex_lock(&wait_mutex);
     CHECK(pthread_create(&thread, nullptr, cond_worker, nullptr) == 0,
           "create cooperative-delivery target thread");
-    for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     pthread_mutex_unlock(&wait_mutex);
-    for (int i = 0; i < 1000 && !cond_ready; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !cond_ready && deadline.pending();) Sleep(1);
     pthread_mutex_lock(&wait_mutex);
     pthread_mutex_unlock(&wait_mutex);
     CHECK(worker_tid != 0 && cond_ready != 0,
@@ -896,7 +930,7 @@ int main() {
 
     result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "queue cooperative exception delivery");
-    for (int i = 0; i < 2000 && !resumed; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
     if (!resumed) interruptible_cond_broadcast(&wait_cond);
     pthread_join(thread, nullptr);
     _putenv_s("PROSPER_WIN_COOPERATIVE_EXC", "");
@@ -920,9 +954,9 @@ int main() {
     pthread_mutex_lock(&wait_mutex);
     CHECK(pthread_create(&thread, nullptr, cond_worker, nullptr) == 0,
           "create nested-wait cooperative target thread");
-    for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     pthread_mutex_unlock(&wait_mutex);
-    for (int i = 0; i < 1000 && !cond_ready; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !cond_ready && deadline.pending();) Sleep(1);
     pthread_mutex_lock(&wait_mutex);
     pthread_mutex_unlock(&wait_mutex);
     GuestWaitSnapshot nested_outer_wait{};
@@ -932,7 +966,7 @@ int main() {
           "nested-delivery target begins with one stable outer wait");
     result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "deliver cooperative exception whose handler performs a nested wait");
-    for (int i = 0; i < 2000 && !nested_wait_ready; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !nested_wait_ready && deadline.pending();) Sleep(1);
     CHECK(nested_wait_ready != 0, "guest handler entered its nested semaphore-style wait");
     GuestWaitSnapshot nested_waits[4]{};
     size_t nested_wait_count = 0;
@@ -946,7 +980,7 @@ int main() {
     // This does not weaken the arms. snapshot_guest_waits is the instrument under test, so a genuine
     // failure to register never reaches 2, the loop times out, and the count arm reddens exactly as
     // it does today -- the loop removes a window, it cannot manufacture a pass.
-    for (int i = 0; i < 2000; ++i) {
+    for (WaitDeadline deadline(kWaitEventMs); deadline.pending();) {
         nested_wait_count = snapshot_guest_waits(worker_tid, nested_waits,
                                                  sizeof(nested_waits) / sizeof(nested_waits[0]));
         if (nested_wait_count >= 2) break;
@@ -966,7 +1000,7 @@ int main() {
           "singular wait snapshot rejects nested ambiguity");
     InterlockedExchange(&nested_wait_release, 1);
     interruptible_cond_broadcast(&nested_wait_cond);
-    for (int i = 0; i < 2000 && !nested_wait_returned; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !nested_wait_returned && deadline.pending();) Sleep(1);
     CHECK(nested_wait_returned != 0, "nested wait returned while handler remains active");
     GuestWaitSnapshot remaining_outer_wait{};
     CHECK(snapshot_guest_wait(worker_tid, remaining_outer_wait) &&
@@ -975,7 +1009,7 @@ int main() {
     CHECK(interrupt_guest_wait((uint64_t)thread),
           "outer wait remains registered after nested wait unregisters");
     InterlockedExchange(&nested_wait_finish, 1);
-    for (int i = 0; i < 2000 && !resumed; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
     if (!resumed) interruptible_cond_broadcast(&wait_cond);
     pthread_join(thread, nullptr);
     CHECK(delivered == 1, "nested-wait cooperative handler executed exactly once");
@@ -984,14 +1018,14 @@ int main() {
     reset_delivery_state();
     CHECK(pthread_create(&thread, nullptr, prewait_worker, nullptr) == 0,
           "create queue-before-wait target thread");
-    for (int i = 0; i < 1000 && !prewait_ready; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitReadyMs); !prewait_ready && deadline.pending();) Sleep(1);
     CHECK(prewait_ready != 0, "target paused before registering its wait");
     result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "queue cooperative delivery before wait registration");
     InterlockedExchange(&prewait_release, 1);
-    for (int i = 0; i < 2000 && !delivered; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !delivered && deadline.pending();) Sleep(1);
     interruptible_cond_broadcast(&wait_cond);
-    for (int i = 0; i < 2000 && !resumed; ++i) Sleep(1);
+    for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
     if (!resumed) interruptible_cond_broadcast(&wait_cond);
     pthread_join(thread, nullptr);
 
@@ -1022,7 +1056,7 @@ int main() {
             cond_destroy_race_ok = false;
             break;
         }
-        for (int spin = 0; spin < 1000 && !race.ready; ++spin) Sleep(1);
+        for (WaitDeadline deadline(kWaitReadyMs); !race.ready && deadline.pending();) Sleep(1);
         // The worker registers its wait before unlocking this mutex. Acquiring it proves publication
         // completed before the exception and natural signal are raced.
         pthread_mutex_lock(&race.mutex);
@@ -1060,11 +1094,11 @@ int main() {
                            (uint64_t)(uintptr_t)&detached_guest_worker, 0, 0, 0) == 0,
               "create detached guest worker through HLE trampoline");
         attr_destroy((uint64_t)(uintptr_t)&detached_attr, 0, 0, 0, 0, 0);
-        for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
+        for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
         CHECK(worker_tid != 0, "detached guest worker entered blocking HLE futex");
         result = raise(detached_thread, 0x1e, 0, 0, 0, 0);
         CHECK(result == 0, "raise exception to live detached guest worker");
-        for (int i = 0; i < 2000 && !resumed; ++i) Sleep(1);
+        for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
         CHECK(delivered == 1 && handler_tid == worker_tid,
               "detached worker received one exception on its native target thread");
         CHECK(resumed != 0, "detached worker resumed and exited normally");
@@ -1078,16 +1112,16 @@ int main() {
         pthread_mutex_lock(&wait_mutex);
         CHECK(pthread_create(&thread, nullptr, classified_cond_worker, nullptr) == 0,
               "create classified wait target thread");
-        for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
+        for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
         pthread_mutex_unlock(&wait_mutex);
-        for (int i = 0; i < 1000 && !cond_ready; ++i) Sleep(1);
+        for (WaitDeadline deadline(kWaitReadyMs); !cond_ready && deadline.pending();) Sleep(1);
         pthread_mutex_lock(&wait_mutex);
         pthread_mutex_unlock(&wait_mutex);
         GuestWaitSnapshot wait{};
         CHECK(snapshot_guest_wait(worker_tid, wait) && wait.kind == kind &&
               wait.source == source && wait.object != 0, stable_message);
         CHECK(interrupt_guest_wait((uint64_t)thread), wake_message);
-        for (int i = 0; i < 2000 && !resumed; ++i) Sleep(1);
+        for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
         if (!resumed) interruptible_cond_broadcast(&wait_cond);
         pthread_join(thread, nullptr);
         CHECK(resumed != 0, "classified wait target resumed after registry wake");
