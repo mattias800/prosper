@@ -72,6 +72,60 @@ def _total(records, field):
                if math.isfinite(float(record.get(field, 0.0))))
 
 
+def _resource_breakdown(renderer):
+    """Decompose renderer-resource, or say the capture cannot support it.
+
+    `renderer-resource` is the largest component in every capture taken so far, and it is TWO LAYERS
+    added together: `build_resources_ms` (the frontend materializer) and `setup_resources_ms` (the
+    backend binder). Their sub-buckets belong to one layer each and are not parts of one another.
+    Subtracting a frontend bucket from the backend total yields a large, plausible, meaningless
+    residue -- a mistake made and published once (#2215), which is why this function exists.
+
+    A capture written before the backend sub-buckets were recorded must report them **unavailable**,
+    never 0. Absent and zero are the same number and opposite facts: a 0 here reads as "the backend
+    did no descriptor work", and the remainder then reads as unattributed work -- exactly the wrong
+    conclusion, now printed with authority by a tool. So the presence of the field is what decides,
+    not its value.
+    """
+    if not renderer:
+        return None
+    have_backend = any("res_texture_ms" in record for record in renderer)
+    # The frontend pair was renamed when the layers were separated; accept the old spelling so an
+    # older capture still reports the half it does carry.
+    def frontend(new, old):
+        return _total(renderer, new) if any(new in r for r in renderer) else _total(renderer, old)
+    breakdown = {
+        "build_resources": _total(renderer, "build_resources_ms"),
+        "frontend_texture": frontend("frontend_texture_ms", "texture_ms"),
+        "frontend_buffer": frontend("frontend_buffer_ms", "buffer_ms"),
+        "setup_resources": _total(renderer, "setup_resources_ms"),
+        "backend_available": have_backend,
+    }
+    if have_backend:
+        breakdown.update({
+            "res_texture": _total(renderer, "res_texture_ms"),
+            "res_buffer": _total(renderer, "res_buffer_ms"),
+            "res_buffer_copy": _total(renderer, "res_buffer_copy_ms"),
+            "res_descriptor": _total(renderer, "res_descriptor_ms"),
+        })
+        # The remainder is reported as TWO numbers, and this is not fussiness -- it is this file's own
+        # argument applied to sign instead of presence.
+        #
+        # A negative remainder means the sub-buckets over-count their parent: a real defect, in the
+        # instrument rather than in the renderer. Clamping it to 0.0 does not "surface" that, it emits
+        # the single most reassuring line the tool can produce -- `other=0.0` reads as "every
+        # millisecond of setup_resources is attributed", which is the BEST possible state. So a broken
+        # instrument and a perfect one would print identically, which is exactly the collapse this
+        # module exists to prevent one level up ("absent and zero are the same number and opposite
+        # facts"). An earlier revision of this function did clamp, with a comment claiming it
+        # surfaced the defect.
+        raw_other = (breakdown["setup_resources"] - breakdown["res_texture"]
+                     - breakdown["res_buffer"] - breakdown["res_descriptor"])
+        breakdown["res_other"] = max(0.0, raw_other)
+        breakdown["res_over_attributed"] = max(0.0, -raw_other)   # 0 normally; non-zero is a defect
+    return breakdown
+
+
 def _hex64(value):
     return f"0x{value:016x}"
 
@@ -227,6 +281,7 @@ def summarize(records):
         "gpu_timestamp_samples": gpu_timestamp_samples,
         "gpu_timestamps_available": gpu_timestamps_available,
         "components": components,
+        "resource_breakdown": _resource_breakdown(renderer),
         "classification": classification,
         "reason": reason,
         "pacing_note": pacing_note,
@@ -285,6 +340,34 @@ def print_summary(summary):
     print("components: " + " ".join(
         f"{key}=unavailable" if value is None else f"{key}={value:.1f}ms"
         for key, value in summary["components"].items()))
+    breakdown = summary.get("resource_breakdown")
+    if breakdown:
+        # renderer-resource is the largest component in every capture taken so far, and it is two
+        # layers added together. Print the decomposition rather than leaving a reader to subtract:
+        # the frontend and backend buckets are NOT parts of one another, and subtracting across them
+        # yields a large plausible residue that looks like unattributed work. That mistake has been
+        # made once already and published (#2215).
+        print("  build_resources (frontend materializer): "
+              f"{breakdown['build_resources']:.1f}ms"
+              f"  [texture={breakdown['frontend_texture']:.1f} buffer={breakdown['frontend_buffer']:.1f}]")
+        if breakdown["backend_available"]:
+            print("  setup_resources (backend binding):       "
+                  f"{breakdown['setup_resources']:.1f}ms"
+                  f"  [texture={breakdown['res_texture']:.1f}"
+                  f" buffer={breakdown['res_buffer']:.1f} (copy={breakdown['res_buffer_copy']:.1f})"
+                  f" descriptor={breakdown['res_descriptor']:.1f}"
+                  f" other={breakdown['res_other']:.1f}]")
+            # Loud, and only when it is genuinely non-zero. A sub-bucket total exceeding its parent
+            # is an instrument defect, and the breakdown above is untrustworthy while it holds.
+            if breakdown["res_over_attributed"] > 0.05:
+                print("  *** the sub-buckets EXCEED setup_resources by "
+                      f"{breakdown['res_over_attributed']:.1f}ms — the breakdown above is not "
+                      "trustworthy; this is a defect in the instrument, not in the renderer")
+        else:
+            print("  setup_resources (backend binding):       "
+                  f"{breakdown['setup_resources']:.1f}ms"
+                  "  [breakdown UNAVAILABLE — this capture predates the backend sub-buckets;"
+                  " do NOT subtract the frontend figures above from it, they are a different layer]")
     print(f"primary evidence: {summary['classification']} — {summary['reason']}")
     if summary["pacing_note"]:
         print(f"pacing: {summary['pacing_note']}")

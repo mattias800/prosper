@@ -6427,8 +6427,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.gpu_device_ms = pending_timing.backend_gpu_device_ms;
                     record.readback_ms = pending_timing.backend_readback_ms;
                     record.setup_resources_ms = pending_timing.backend_setup_resources_ms;
-                    record.texture_ms = pending_timing.texture_ms;
-                    record.buffer_ms = pending_timing.buffer_ms;
+                    // Frontend and backend, kept apart by name. These two are build_resources' own
+                    // texture/buffer time and are NOT parts of setup_resources_ms above.
+                    record.frontend_texture_ms = pending_timing.texture_ms;
+                    record.frontend_buffer_ms = pending_timing.buffer_ms;
+                    // These four DO decompose setup_resources_ms, so an offline report can attribute
+                    // the largest bucket in the capture instead of leaving a plausible residue.
+                    record.res_texture_ms = pending_timing.backend_res_texture_ms;
+                    record.res_buffer_ms = pending_timing.backend_res_buffer_ms;
+                    record.res_buffer_copy_ms = pending_timing.backend_res_buffer_copy_ms;
+                    record.res_descriptor_ms = pending_timing.backend_res_descriptor_ms;
                     prosper::perf::interactive_performance_capture().record_renderer(record);
                 }
                 if (!timing_mode.log) {

@@ -360,8 +360,12 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"gpu_device_ms\":" << record.gpu_device_ms
                 << ",\"readback_ms\":" << record.readback_ms
                 << ",\"setup_resources_ms\":" << record.setup_resources_ms
-                << ",\"texture_ms\":" << record.texture_ms
-                << ",\"buffer_ms\":" << record.buffer_ms << "}\n";
+                << ",\"frontend_texture_ms\":" << record.frontend_texture_ms
+                << ",\"frontend_buffer_ms\":" << record.frontend_buffer_ms
+                << ",\"res_texture_ms\":" << record.res_texture_ms
+                << ",\"res_buffer_ms\":" << record.res_buffer_ms
+                << ",\"res_buffer_copy_ms\":" << record.res_buffer_copy_ms
+                << ",\"res_descriptor_ms\":" << record.res_descriptor_ms << "}\n";
         }
         for (const ComputeTimingRecord& record : capture->compute) {
             out << "{\"type\":\"compute\",\"t_ns\":"
