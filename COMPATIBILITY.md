@@ -36,7 +36,7 @@ Last updated: 2026-08-06
 | *Bendy and the Ink Machine* | `PPSA27616` | Unity / IL2CPP | 🚧 Chapter 1 gameplay | [#1881](https://github.com/mattias800/prosper/issues/1881) |
 | *The Plucky Squire* | `PPSA15319` | Unreal Engine 4 | 🚧 Title and save/play-style menus | [#1882](https://github.com/mattias800/prosper/issues/1882) |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🚧 Title screen | [#1883](https://github.com/mattias800/prosper/issues/1883) |
-| *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🚧 Intro cinematic and title screen, on a throttled route | [#1817](https://github.com/mattias800/prosper/issues/1817) |
+| *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🚧 Intro cinematic and title screen; needs one default-off switch, not the throttle | [#1817](https://github.com/mattias800/prosper/issues/1817) |
 | *Asterix &amp; Obelix: Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🚧 Logo movies, intro cutscene, and title menu | [#1884](https://github.com/mattias800/prosper/issues/1884) |
 | *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🚧 Title screen and attract mode | [#1810](https://github.com/mattias800/prosper/issues/1810) |
 | *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Title screen and EULA | [#1885](https://github.com/mattias800/prosper/issues/1885) |
@@ -248,6 +248,12 @@ The whole intro cinematic renders at 4K — the Titan-class station against its 
 **The colours in these frames are wrong.** Decoding the same movie outside prosper gives an *orange* nebula with *cyan* thrusters; prosper produces green and magenta. Geometry, composition, timing and frame pacing are correct, so the images are valid evidence for those — but not for colour. Tracked in [#2094](https://github.com/mattias800/prosper/issues/2094).
 
 **This needs `PROSPER_SUBMIT_STALL_US=1500`, and that is a diagnostic lever rather than a fix.** On the default route the title faults before the cinematic: 17 runs out of 17, against 0 out of 4 with the stall applied. Every graphics subsystem the cinematic exercises works; what remains is a submit-timing race, tracked as [#1226](https://github.com/mattias800/prosper/issues/1226) with a dose-response experiment in [#2084](https://github.com/mattias800/prosper/issues/2084). See the [tracker](https://github.com/mattias800/prosper/issues/1817).
+
+<p align="center"><img src="assets/screenshots/arcrunner-title-screen-default-route.png" alt="ArcRunner — the title screen at 3840×2160 on the default route, with the post-submit visibility contract armed"></p>
+
+**The race is now named, and the throttle is no longer needed to get past it.** prosper's post-submit completion-visibility contract — which holds a submit's completion writes private until the submit call returns, so a guest can never observe a half-retired frame — is armed only for titles that request SDK version 13 or later. ArcRunner requests version 10, so on this title prosper's own label writes become visible *in the middle of the fold that produced them*, and the guest's command-chunk recycler is released early: it rebuilds labels whose initialisation packets prosper has not executed yet. With the contract forced on and **no** throttle, the default route runs 260 s, delivers 1,977 of the movie's 1,908 video frames, faults zero times, and renders the title screen above. The same change rescues *Crisis Core*, the other title with this failure, which is also SDK 10.
+
+This is not yet counted as a title screen on a default launch, because it still needs `PROSPER_POST_SUBMIT_VISIBILITY=1`. Removing the version gate is a one-line change, and three titles already at full snapshot coverage are also pre-13 — so it is scheduled behind a cross-title regression pass rather than taken on this title's evidence alone.
 
 ## Asterix &amp; Obelix: Babylon Mission — `PPSA30490`
 

@@ -2011,6 +2011,129 @@ static void submit_stall(void) {
     if (submit_stall_outside()) return;
     submit_stall_sleep();
 }
+
+// --- #1226 (arc7) PROSPER_FOLD_MARGIN, timing half: the per-fold ledger. -------------------------
+//
+// The census in command_processor.cpp counts the recycle race in FOLDS. This half accounts for
+// where a fold's wall time goes, which is the other thing a per-fold account owes and the thing
+// every retracted whole-run rate on this title was a bad proxy for. Per submit it separates:
+//
+//   gap   — from the previous submit's return to this one's HLE entry: the guest's OWN time, the
+//           only interval prosper is not inside. If a 1500 us stall leaves the guest's frame rate
+//           unchanged (measured: it does), the stall must be coming out of this, and by how much
+//           is the whole question.
+//   lock  — waiting for g_agc_state_mu. Nonzero only when two guest threads submit concurrently,
+//           so it is also the direct measure of how much the two queues actually contend.
+//   work  — decode, fold and execute. prosper's real cost per submit.
+//   stall — the diagnostic throttle itself, measured rather than assumed (a nanosleep is a floor,
+//           not a duration: the arms must be scored on what the sleep COST, not on what was asked
+//           for, and on a loaded machine those differ).
+//
+// Same env var as the fold census, so one arm produces both halves and they cannot disagree about
+// which run they describe. Log-only; it takes four clock reads per submit and holds no lock while
+// reading them.
+extern "C" void prosper_fold_margin_take(uint32_t* builds, uint32_t* execs, uint32_t* deep,
+                                         uint32_t* rebuild_before_exec, uint32_t* fold);
+namespace {
+struct FoldLedgerTotals {
+    uint64_t folds = 0;
+    uint64_t gap_sum = 0, gap_max = 0;
+    uint64_t lock_sum = 0, lock_max = 0;
+    uint64_t work_sum = 0, work_max = 0;
+    uint64_t stall_sum = 0, stall_max = 0;
+    uint64_t t_first_ns = 0, t_last_ns = 0, prev_exit_ns = 0;
+};
+std::mutex g_fold_ledger_mu;
+FoldLedgerTotals g_fold_ledger;
+int fold_ledger_level() {
+    static const int lvl = [] {
+        const char* e = getenv("PROSPER_FOLD_MARGIN");
+        const int v = e ? (int)strtol(e, nullptr, 0) : 0;
+        if (v)
+            fprintf(stderr, "[agc] FOLD-MARGIN ledger ARMED (level %d): per-submit "
+                            "gap/lock/work/stall accounting%s (log-only, gates nothing)\n",
+                    v, v >= 2 ? ", one line PER FOLD" : "");
+        return v;
+    }();
+    return lvl;
+}
+bool fold_ledger_on() { return fold_ledger_level() != 0; }
+uint64_t fold_ledger_now_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// Scoped so every return path from a submit handler — including the early ones — closes the record.
+class FoldLedgerScope {
+public:
+    explicit FoldLedgerScope(const char* who)
+        : who_(who), on_(fold_ledger_on()) { if (on_) t_enter_ = fold_ledger_now_ns(); }
+    void locked()    { if (on_) t_locked_ = fold_ledger_now_ns(); }
+    void work_done() { if (on_) t_work_ = fold_ledger_now_ns(); }
+    ~FoldLedgerScope() {
+        if (!on_) return;
+        const uint64_t t_exit = fold_ledger_now_ns();
+        // An early return before locked()/work_done() leaves those zero; attribute the whole
+        // interval to `work` rather than inventing a lock or stall figure for it.
+        if (!t_locked_) t_locked_ = t_enter_;
+        if (!t_work_)   t_work_   = t_exit;
+        uint64_t folds; char line[320];
+        bool report;
+        // Drained BEFORE the totals lock so the per-fold counts belong to this fold even when a
+        // peer thread is queued behind the submit mutex.
+        uint32_t lb = 0, lx = 0, ldeep = 0, lrbe = 0, fseq = 0;
+        prosper_fold_margin_take(&lb, &lx, &ldeep, &lrbe, &fseq);
+        {
+            std::lock_guard<std::mutex> lk(g_fold_ledger_mu);
+            FoldLedgerTotals& t = g_fold_ledger;
+            if (!t.folds) { t.t_first_ns = t_enter_; t.prev_exit_ns = t_enter_; }
+            const uint64_t gap   = t_enter_ > t.prev_exit_ns ? t_enter_ - t.prev_exit_ns : 0;
+            const uint64_t lock  = t_locked_ - t_enter_;
+            const uint64_t work  = t_work_ - t_locked_;
+            const uint64_t stall = t_exit > t_work_ ? t_exit - t_work_ : 0;
+            t.folds++;
+            t.gap_sum += gap;     if (gap > t.gap_max) t.gap_max = gap;
+            t.lock_sum += lock;   if (lock > t.lock_max) t.lock_max = lock;
+            t.work_sum += work;   if (work > t.work_max) t.work_max = work;
+            t.stall_sum += stall; if (stall > t.stall_max) t.stall_max = stall;
+            t.prev_exit_ns = t_exit;
+            t.t_last_ns = t_exit;
+            folds = t.folds;
+            if (fold_ledger_level() >= 2)
+                fprintf(stderr, "[agc] FOLD #%llu seq=%u %-14s us(gap=%llu lock=%llu work=%llu "
+                                "stall=%llu) labels(built=%u init-exec=%u deep=%u rbe=%u) t=%llums\n",
+                        (unsigned long long)t.folds, fseq, who_ ? who_ : "?",
+                        (unsigned long long)(gap / 1000), (unsigned long long)(lock / 1000),
+                        (unsigned long long)(work / 1000), (unsigned long long)(stall / 1000),
+                        lb, lx, ldeep, lrbe,
+                        (unsigned long long)((t_exit - t.t_first_ns) / 1000000));
+            // Every 8. A whole ArcRunner default run contains only ~40 folds, so the usual
+            // first-64-then-powers cadence prints exactly once and reports a single sample as
+            // though it were a run.
+            report = (folds == 1) || (folds & 7) == 0;
+            if (report) {
+                const double span_s = (double)(t.t_last_ns - t.t_first_ns) / 1e9;
+                snprintf(line, sizeof line,
+                         "[agc] FOLD-LEDGER folds=%llu rate=%.1f/s mean-us(gap=%.1f lock=%.1f "
+                         "work=%.1f stall=%.1f) max-us(gap=%llu lock=%llu work=%llu stall=%llu) "
+                         "span=%.2fs\n",
+                         (unsigned long long)folds, span_s > 0 ? (double)folds / span_s : 0.0,
+                         (double)t.gap_sum / (double)folds / 1000.0,
+                         (double)t.lock_sum / (double)folds / 1000.0,
+                         (double)t.work_sum / (double)folds / 1000.0,
+                         (double)t.stall_sum / (double)folds / 1000.0,
+                         (unsigned long long)(t.gap_max / 1000), (unsigned long long)(t.lock_max / 1000),
+                         (unsigned long long)(t.work_max / 1000), (unsigned long long)(t.stall_max / 1000),
+                         span_s);
+            }
+        }
+        if (report) fputs(line, stderr);
+    }
+private:
+    const char* who_;
+    bool on_;
+    uint64_t t_enter_ = 0, t_locked_ = 0, t_work_ = 0;
+};
+}   // namespace
 // #305/#1662: a fold that decodes fewer dwords than the guest declared has silently dropped the tail
 // of that submit — and if a shader bind was in the dropped tail, the NEXT submit inherits a register
 // file hardware never had, which is exactly the "user-data block larger than the bound pipeline's
@@ -2162,11 +2285,13 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     if (!addr) return 0;
     constexpr uint32_t kUnknownCap = 0x80000;   // 512 KiB of dwords — well past any real Dcb
     uint32_t walk = dw_num ? dw_num : kUnknownCap;
+    FoldLedgerScope ledger(who);   // #1226 (arc7): entry stamp BEFORE the lock, like call_stamp
     const SubmitCallStamp call_stamp = stamp_submit_call();   // BEFORE the lock: see the note above
     // unique_lock rather than lock_guard only so the SUBMIT_STALL_OUTSIDE discriminator can release
     // the mutex before its sleep; with that lever off the scope and the hold are exactly a
     // lock_guard's (acquired here, released at return).
     std::unique_lock<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
+    ledger.locked();
     const bool async_compute = strcmp(who, "SubmitAcb") == 0;
     const bool dcb_final = strcmp(who, "SubmitDcbFinal") == 0;
     gpu::GpuState& state = async_compute            ? agc_compute_state(queue_id)
@@ -2218,6 +2343,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     if (gpu::deferred_pending()) start_defer_watchdog();
     poolshift_window_probe(g_submit_count);
     mb3_poison_probe(g_submit_count);
+    ledger.work_done();   // #1226 (arc7): everything after this is the diagnostic stall
     submit_stall();
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc] %s #%llu: %u dwords (walk=%u) -> %zu packets applied (draws: %zu, dispatches: %llu)\n",
@@ -2319,9 +2445,11 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; };
     const auto* p = (const Packet*)(uintptr_t)a0;
     if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
+    FoldLedgerScope ledger("SubmitDcb");   // #1226 (arc7): entry stamp BEFORE the lock
     const SubmitCallStamp call_stamp = stamp_submit_call();   // BEFORE the lock: see the note above
     // unique_lock only for the SUBMIT_STALL_OUTSIDE discriminator — see submit_dcb_stream.
     std::unique_lock<std::mutex> lk(g_agc_state_mu);   // serialize with submit_dcb_stream/w1KFAHVqpaU (#278)
+    ledger.locked();
     gpu::prosper_gpu_set_fold_origin(1);   // #1226: this direct entry is the graphics SubmitDcb path
     // Reset the per-submit draw list BEFORE folding this Dcb. The folded GpuState is process-lifetime and
     // its register files (cx/sh/uc) persist across submits (as on real hardware), but its `draws` vector
@@ -2359,6 +2487,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     if (gpu::deferred_pending()) start_defer_watchdog();
     poolshift_window_probe(g_submit_count);
     mb3_poison_probe(g_submit_count);
+    ledger.work_done();   // #1226 (arc7): everything after this is the diagnostic stall
     submit_stall();
     if (getenv("PROSPER_GFXLOG")) {
         fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu, dispatches total: %llu)\n",

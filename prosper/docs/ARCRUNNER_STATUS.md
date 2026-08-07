@@ -4,6 +4,18 @@ Unreal Engine 4.27-plus. **Rung 0 on a default launch — but with the `PROSPER_
 diagnostic throttle the title runs its whole intro cinematic in 4K *and then reaches and holds its
 title screen* (2026-08-06, below). The blocker is a submit-timing race, not the renderer, and
 nothing else is now known to stand between this title and rung 2.**
+
+**Read `## 2026-08-07 (arc7)` before anything else about the race.** It is the per-fold account arc6
+asked for, and it localises the corruption to the guest's builder thread being released **mid-fold**
+by completion writes prosper applies while it is still executing the rest of the same command buffer.
+The contract that forbids exactly that already exists in `command_processor.cpp` and is armed by
+`if (version >= 13)`; ArcRunner requests SDK version 10. Forcing it on
+(`PROSPER_POST_SUBMIT_VISIBILITY=1`, new, default OFF) survives the **default route with no throttle**,
+3 of 3, and a 260 s run on that route **reaches and renders the title screen** with 1,977 delivered
+video frames and zero faults. The same lever rescues *Crisis Core* (`PPSA07809`), the other title with
+this dose-response, which is also SDK 10 — 3 of 3 against a 3-of-3 faulting control. That is a
+candidate fix, not a lever; but three rung-6 guarded titles are also pre-13, so the version gate must
+not be removed without a cross-title snapshot pass and a review.
 The long-lived compatibility index is [#1817](https://github.com/mattias800/prosper/issues/1817),
 and the primary allocator, barrier, and intro-movie investigation is
 [#1226](https://github.com/mattias800/prosper/issues/1226).
@@ -1317,12 +1329,247 @@ PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_PROGRESS=1 PROSPER_PROGRESS_UNIMPL=
   ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0                        # runtime: what did
 ```
 
+## 2026-08-07 (arc7): the per-fold account — the guest's builder is released MID-FOLD, and the contract that prevents it is version-gated off
+
+arc6 left one thing owed: *"the next instrument owes a **per-fold** account of what 1.5 ms of wall
+time per submit changes — not another whole-run rate, which has now produced two retracted rows on
+this title."* This section is that account, and it ends with a candidate fix that survives the
+default route.
+
+`PROSPER_FOLD_MARGIN` (new, default OFF, log-only, gates nothing) has two halves that arm together:
+
+* a **per-submit ledger** in `hle_agc.cpp` splitting every fold into `gap` (the guest's own time
+  between prosper's return and its next submit entry), `lock` (waiting for `g_agc_state_mu`), `work`
+  (decode + fold + execute) and `stall` (the diagnostic throttle, *measured* rather than assumed);
+* a **fold-margin census** in `command_processor.cpp` counting the recycle race in FOLDS rather than
+  milliseconds — the unit the mechanism is stated in. The build journal now records the fold a packet
+  was built in, so build->exec distance is expressible in folds; `REBUILD-BEFORE-EXEC` fires at the
+  guest's own builder call when it rebuilds a label whose previous generation prosper has not
+  executed.
+
+At level 2 it prints one line per fold. **Level 2 is not timing-neutral** — a control run lives
+~9 s at level 1 and ~13 s at level 2 — so compare level-2 arms only against level-2 arms. Every arm
+below still faults or survives as its level-1 twin does.
+
+### 1. prosper's fold is the bottleneck, and the throttle is 1.7% of it
+
+Steady state, both arms, from the ledger: **`work` = 64–67 ms per submit**, `gap` = **5–50 µs**.
+Excluding the single ~5.3 s boot-prefix gap, the guest spends essentially no time outside prosper —
+its RHI thread returns from one submit and calls the next within tens of microseconds, so
+**prosper's synchronous fold is the pacer for this title and the guest is inside it ~84% of wall
+time.** A 1500 µs stall is 1.7% of one fold and drops the fold rate ~8% (15.0 -> 13.8 folds/s after
+boot). Whatever the throttle does, it is not a large re-timing.
+
+The steady state is a repeating three-fold cycle, one per frame:
+
+| fold | entry point | `work` | label builds | label inits executed |
+| --- | --- | --- | --- | --- |
+| consume | `SubmitDcb` | ~110 ms | 0 | 58–59 |
+| build | `SubmitDcb` | ~85 ms | 46 | 26–30 |
+| compute | `SubmitAcb` | ~0.6 ms | 0 | 0–1 |
+
+### 2. The exposure window is LONGER under the throttle, not shorter
+
+Build->exec distance in folds, from the journal, over the population both arms have:
+
+| arm | age-folds histogram | mode | mean |
+| --- | --- | --- | --- |
+| default (n = 506) | 1:11 2:42 3:53 4:48 **5:239** 6:75 7:38 | 5 | 4.66 |
+| `SUBMIT_STALL_US=1500` (n = 7,854) | 1:18 2:197 3:37 4:1129 5:375 **6:4664** 7:818 32+:616 | 6 | 20.4 |
+
+In milliseconds it is longer too (~5 x 66 ms vs ~6 x 72 ms). So the throttle does **not** shorten the
+build-to-exec window — it lengthens it, and the corruption still vanishes. This is the third and
+strongest form of that falsification: the two earlier attempts were retracted for sampling from a
+population only one arm has, and this one is drawn from every journal-matched init in both arms.
+It also kills the reading the arc5 mechanism sentence invites — *"exec at f+5 is safe, exec at f+6
+collides"* — because f+6 is the surviving arm's **mode**.
+
+### 3. `REBUILD-BEFORE-EXEC` is the discriminator, and it is a single-fold burst
+
+| arm | runs | faulted | delivered video frames | `REBUILD-BEFORE-EXEC` |
+| --- | --- | --- | --- | --- |
+| default | 3 | **3 of 3**, exit 90 | 29 / 30 / 32 | **16 / 31 / 14** of ~380 builds-with-exec |
+| `SUBMIT_STALL_US=1500` | 3 | 0 of 3, to the 40 s bound | 861 / 858 / 856 | **0 / 0 / 0** of ~6,700 |
+
+The three instruments agree exactly and independently: in every default arm the
+`REBUILD-BEFORE-EXEC` count (build side), the `depth>=2` exec count (init side) and the
+`SUSPECT-REL1-OVERLAP` population (fence side) are the **same number**.
+
+It is not a trickle. Every event of a run lands in **one fold**, at one millisecond, across 13–21
+*different* labels of one command-buffer chunk, each exactly one generation behind:
+
+```text
+[agc] FOLD-MARGIN-REBUILD-BEFORE-EXEC #1  [0x2020f395e0] fold=37 built=5 exec=4
+      last-build-fold=31 last-exec-fold=30 t=7593ms
+... 15 more, same fold, same millisecond, 15 other addresses ...
+```
+
+### 4. What the failing fold actually looks like — the guest builds INTO the consuming fold
+
+The per-fold trace localises it to one deviation from the three-fold cycle. Reproduced in 3 of 3
+default arms and absent from 3 of 3 throttled ones:
+
+```text
+default (dies)                                  throttled (survives)
+#35 Dcb  work=74ms  built=46 ex=26              #35 Dcb  work=73ms  built=46 ex=26
+#36 Acb  work=0.7ms built=0  ex=0               #36 Acb  work=0.6ms built=0  ex=1
+#37 Dcb  work=91ms  built=46 ex=57  rbe=16  <<  #37 Dcb  work=87ms  built=0  ex=56
+#38 Dcb  work=97ms  built=0  ex=28              #38 Dcb  work=100ms built=46 ex=28
+```
+
+`built` is drained per fold, so it counts what the guest's **builder thread** did while prosper was
+inside that fold. Normally the 46 rebuilds are concurrent with the *build* fold, which executes 26–30
+inits. In the failing arm they are concurrent with the *consume* fold, which executes 57 — including
+the previous generation of those same 46 labels — and the builder beats prosper to 16 of them.
+
+**So the guest's builder thread is released mid-fold.** prosper applies a submit's completion writes
+while it is still executing the rest of the same command buffer, the guest's chunk recycler sees its
+consumed markers, and it rebuilds labels whose init packets prosper has not reached yet. The race is
+not between frames; it is *inside one fold*.
+
+### 5. The contract that forbids exactly this exists, and ArcRunner is version-gated out of it
+
+`command_processor.cpp`'s post-submit visibility model holds completion writes private until the
+submit scope closes, with its own comment recording *"CONFIDENCE: HIGH on the invariant (completion
+is post-submit by construction on real HW …)"*. It is armed from `agc_reg_defaults.cpp` by
+`if (version >= 13)`. **ArcRunner requests SDK version 10**, so on this title fence writes become
+visible in the middle of the fold that produced them — which is the mechanism in §4.
+
+`PROSPER_POST_SUBMIT_VISIBILITY=1` (new, default OFF) forces the model on regardless of version.
+Three arms, **default route, no throttle**, lever witnessed on every one:
+
+| arm | runs | faulted | delivered video frames | `REBUILD-BEFORE-EXEC` | mean fold `work` |
+| --- | --- | --- | --- | --- | --- |
+| default | 3 | **3 of 3** | 29 / 30 / 32 | 16 / 31 / 14 | 64–66 ms |
+| `POST_SUBMIT_VISIBILITY=1` | 3 | **0 of 3**, to the 40 s bound | **788 / 782 / 838** | **0 / 0 / 0** | **14.7–15.0 ms** |
+
+Zero `WORKER-THREAD FAULT`, zero `FMallocBinned3`/`LowLevelFatalError` in all three. The fold also
+gets **4.4x cheaper**, because the synchronous completion drains the pre-13 path performs inside the
+fold move to the worker.
+
+**Those three arms had one peer `boot_trace` present, and on this title that is not a neutral bias** —
+the throttle is protective, so a peer slowing prosper could in principle manufacture the survival.
+Re-run alternated control/armed with `pgrep -x` censuses of **zero before and after all six**:
+
+| arm | rc | faults | fatals | delivered video frames | `REBUILD-BEFORE-EXEC` |
+| --- | --- | --- | --- | --- | --- |
+| control 1 | 90 | 1 | 0 | 139 | 0 |
+| control 2 | 90 | 1 | 0 | 30 | 20 |
+| control 3 | 90 | 1 | 0 | 31 | 33 |
+| `POST_SUBMIT_VISIBILITY=1` 1 | 124 | 0 | 0 | **924** | 0 |
+| `POST_SUBMIT_VISIBILITY=1` 2 | 124 | 0 | 0 | **919** | 0 |
+| `POST_SUBMIT_VISIBILITY=1` 3 | 124 | 0 | 0 | **935** | 0 |
+
+Control 1 is worth reading rather than averaging away: it lived to 139 video frames and recorded
+`REBUILD-BEFORE-EXEC=0`, i.e. it died on one of the other two terminal paths this title races. That is
+the standing reason a single run cannot A/B here, restated by a control that behaved exactly as the
+`## Ruled out` row predicts.
+
+**This is a candidate correctness change, not a lever in the throttle's class**, and the distinction
+is the one the throttle's own comment draws: the throttle discards nothing and models nothing, it
+just delays the guest. This arms a contract prosper already implements, already believes is
+hardware-true, and already applies to every SDK-13 title.
+
+### 5a. It reaches the title screen on the default route
+
+![ArcRunner — the title screen at 3840x2160 on the DEFAULT route with no submit throttle, under PROSPER_POST_SUBMIT_VISIBILITY=1](../../assets/screenshots/arcrunner-title-screen-default-route.png)
+
+`assets/screenshots/arcrunner-title-screen-default-route.png` is an unmodified 3840x2160 presented
+frame from `boot_trace`'s live renderer (`PROSPER_FRAME_DIR`), route
+`PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_AVPLOG=1 PROSPER_POST_SUBMIT_VISIBILITY=1` with
+`PROSPER_RENDER_SCALE` and `PROSPER_RENDER_EVERY` at their defaults and **no**
+`PROSPER_SUBMIT_STALL_US`, no suppression, no guard and no skip. The 260 s run delivered **1,977**
+`sceAvPlayerGetVideoDataEx` frames — past the movie's 1,908 — with **zero** `WORKER-THREAD FAULT`
+and **zero** `FMallocBinned3`/`LowLevelFatalError` lines, and ended by timing out (`rc=124`) rather
+than dying. It carries the *ArcRunner* logo, the TrickJump and PQube logos and
+`VERSION 1.0.1 RELEASE`. The image was opened, not merely measured.
+
+A 220 s companion run on the same route delivered 1,177 video frames with zero faults and rendered
+the intro cinematic — the rainy neon street with the game's own *PRESS ANY BUTTON TO SKIP…* prompt,
+which baseline cannot reach structurally (the movie's first non-black frame is video frame 60 and a
+default arm delivers 29–32). The green/magenta cast is the already-filed chroma-plane fault
+([#2094](https://github.com/mattias800/prosper/issues/2094)), unrelated to this change.
+
+**This is not rung 2 yet**, and the rung is deliberately not raised: it needs an env var, so it is
+one gate condition away from a default launch rather than at one.
+
+### 5b. The prediction transfers to Crisis Core, the other title in this family
+
+`CRISIS_CORE_STATUS.md` records the identical `(500, 1500]` dose-response on `PPSA07809`. That title
+**also requests SDK version 10**, so the same contract is unarmed for it — which makes "forcing it on
+rescues Crisis Core too" a prediction rather than a second search. Same binary, same census method,
+alternated control/armed:
+
+| arm | runs | faulted | note |
+| --- | --- | --- | --- |
+| default | 3 | **3 of 3**, exit 90 | one arm also carries 4 `FMallocBinned3`/fatal lines |
+| `POST_SUBMIT_VISIBILITY=1` | 3 | **0 of 3**, to the 40 s bound | lever witnessed on each; zero fatals |
+
+Two independently brought-up titles, one unarmed contract, the same rescue. Peer-process censuses
+were exact zero before and after all six arms.
+
+### 5c. Why the gate is NOT removed in this pass
+
+**Removing it is not a no-op for the matrix.** A census of the SDK version each title requests
+(`[agc] register defaults requested for SDK version N`, printed unconditionally on every boot):
+
+| SDK version | titles |
+| --- | --- |
+| 13 (already armed) | *The Messenger* `PPSA24651`, *Blue Prince* `PPSA25009`, *Little Nightmares III* `PPSA05143`, *Dragon Quest VII* `PPSA17942` |
+| 12 | *The Oregon Trail* `PPSA19244` |
+| 10 | *Dead Cells* `PPSA15552`, *Blasphemous 2* `PPSA13579`, *Sonic Frontiers* `PPSA03831`, *Crisis Core* `PPSA07809`, *ArcRunner* `PPSA21406` |
+| 8 | *Alex Kidd in Miracle World DX* `PPSA02664` |
+
+Three of the pre-13 titles are **rung-6, snapshot-guarded** (Dead Cells, Blasphemous 2, Alex Kidd),
+so the gate is load-bearing for the guarded matrix and removing it must be scored against it. The
+gate's own provenance carries no recorded evidence — it arrived inside `474af058`, a large DQ7 commit
+with a one-line message, and `#2031` kept it while explicitly moving the *register table* off the
+same gate — but a numeric improvement is not evidence of a correct model. **The next step is a
+cross-title snapshot pass with the gate removed, plus review; that is what stands between this title
+and rung 2**, and it is now the only thing. Tracked as
+[#2220](https://github.com/mattias800/prosper/issues/2220).
+
+### 6. One hypothesis this pass killed with its own instrument
+
+The per-fold trace shows the ACB queue's single label init landing **one fold earlier** in a default
+arm than in a throttled one (27 of 33 ACB folds carry zero against 156 of 156 carrying exactly one),
+which reads as a sub-fold phase shift of prosper's own writes — the ~1 ms pend-drain latency against
+the measured `(500, 1500]` threshold. `PROSPER_EOP_WRITE_SYNC=1` reproduces the shift exactly (ACB
+folds carry their init 33/33, 11/11, 12/12; the big Dcb fold drops 59 -> 58, the same one init moving)
+and **still faults 3 of 3**, with `REBUILD-BEFORE-EXEC` at 8 / 0 / 21. The shift is real and not
+causal. See the `## Ruled out` row.
+
+### Reproduction
+
+```bash
+# level 1: totals only, timing-neutral enough to compare against a default arm
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_AVPLOG=1 PROSPER_FOLD_MARGIN=1 \
+  timeout 40 ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+
+# level 2: one line per fold. NOT timing-neutral -- level-2 arms compare only to level-2 arms.
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_AVPLOG=1 PROSPER_FOLD_MARGIN=2 \
+  timeout 40 ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+
+# the candidate: default route, no throttle, post-submit visibility forced on
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_AVPLOG=1 PROSPER_POST_SUBMIT_VISIBILITY=1 \
+  timeout 40 ./build-linux/boot_trace <DUMP_ROOT>/PPSA21406-app0
+```
+
+Score exactly as the dose-response does: SURVIVED = `rc=124` **and** zero `WORKER-THREAD FAULT`
+**and** zero `unrecognized block|LowLevelFatalError`. Peer-process censuses (`pgrep -x` over
+`boot_trace`/`prosper-app`/`screenshot`/`gpu_replay`) were exact zero before and after every arm in
+§1–§4 and §6; the three `POST_SUBMIT_VISIBILITY` arms in §5 ran with **one** peer `boot_trace`
+present, disclosed rather than averaged away — it bears on their fold timings, not on whether they
+faulted.
+
 ## Ruled out
 
 Do not re-derive these without contradictory new evidence.
 
 | Hypothesis | Evidence that killed it | Ref |
 | --- | --- | --- |
+| The throttle rescues the title by shortening the guest's build-to-submit exposure window — the reading the arc5 mechanism sentence invites (*build at f, exec at f+5 or f+6, rebuild at f+6; when the exec lands on f+6 the two collide*), which makes "exec at f+5 is safe, f+6 collides" the thing a fix has to restore | **Falsified for the third time, and this time on a population both arms share and in the unit the mechanism is stated in.** With the build journal recording the fold a packet was built in (`PROSPER_FOLD_MARGIN`), the build->exec distance in FOLDS is **longer** under the throttle, not shorter: default mode **5** (239 of 506 journal-matched inits, mean 4.66), throttled mode **6** (4,664 of 7,854, mean 20.4) — and longer in milliseconds too (~5 x 66 ms against ~6 x 72 ms). So f+6 is the **surviving** arm's mode. The two earlier attempts at this question were retracted for sampling only from diagnostics a dying arm prints; this one is every journal-matched init in both arms, at n = 506 against 7,854. | #1226 |
+| prosper's own writes landing a fold late is what the throttle fixes — the sub-fold phase shift the per-fold trace shows directly, with the ~1 ms pend-drain latency sitting inside the measured `(500, 1500]` threshold | **Real, reproduced, and not causal.** The per-fold trace shows the ACB queue's single label init executing one fold EARLIER in a default arm than in a throttled one (27 of 33 ACB folds carry zero inits against 156 of 156 carrying exactly one; the big `SubmitDcb` fold carries 59 against 58 — the same one init moving between adjacent folds). `PROSPER_EOP_WRITE_SYNC=1`, which removes the pend queue entirely, **reproduces the shift exactly** — ACB folds carry their init 33/33, 11/11, 12/12 and the big Dcb fold drops to 58 — and **still faults 3 of 3** (`REBUILD-BEFORE-EXEC` 8 / 0 / 21, lever witnessed by `EOP-WRITE-SYNC ARMED` in each). A discriminator whose lever is visible in the same census as its endpoint, returning a witnessed null. | #1226 |
 | The submit throttle rescues this title by holding `g_agc_state_mu` across the sleep — i.e. the real defect is prosper serialising the `SubmitDcb` and `SubmitAcb` entry points through one mutex, so the stall works by re-interleaving the two queues' folds rather than by delaying anything | `PROSPER_SUBMIT_STALL_OUTSIDE=1` runs the identical 1500 µs sleep on the identical thread with the mutex **released** first. Three arms each, alternated A/B/A/B/A/B: **0 of 3 faulted with the mutex held, 0 of 3 with it released**, delivering 1,629/1,635/1,628 against 1,640/1,627/1,642 video frames, with `SUSPECT-REL1-OVERLAP` 0 in all six. The rescue is therefore the **delay**. Positive control on the same binary: three unthrottled runs fault **3 of 3** at `eboot+0x117e225` with 35–36 video frames, so the `lock_guard` → `unique_lock` change the lever needed is inert unarmed; and the lever's own mutation arm (`OUTSIDE=1` with no `STALL_US`) prints `NOT ARMED` rather than passing as an armed null. A peer lane held the GPU for five of the six throttled arms — disclosed, and the reason the arms were alternated; it bears on any comparison against a *historical* arm, not on A versus B. | #1226 |
 | A `*GetSize` or wait NID that falls to the dispatcher's return-0 default is what makes this guest recycle a label block early — the FALSE SUCCESS class of #2081, and ArcRunner imports every candidate that would fit (all three `sceAgc*GetSize` gaps #1756 left open, plus `sceKernelWaitCommandBufferCompletion`) | It calls none of them. `tools/nid_census` is a **static** import census; the runtime unimplemented-call census over a full default faulting run lists **12** distinct NIDs, all in `libSceCoredump` / `libScePosix` / `libSceHttp` / `libSceNpWebApi2` / `libSceVoiceQoS` / `libSceNet` / `libSceAjm` / `EOSSDK-PS5-Shipping`, and **none** in `libSceAgc`, `libSceAgcDriver` or `libkernel`. Bounded to the boot and intro-movie window (34 delivered video frames), which is the window the fault occurs in. **The general lesson is the gap between the two censuses**: an import is what a title *may* call, and only the boot log says what it *did*. | #2081, #1226 |
 | The `addr=(nil)` / `rip=0` worker-fault class on this title is a defect distinct from the `0x30016000` free-list class (the split this doc and #1944 have tracked separately) | **Falsified — both are one forged qword, and the low-bit read artifact is only how one of them presents.** The `addr=(nil)` site disassembles (offset `0x117e21d`, via `tools/il2cpp/prx_to_elf.py` + `objdump -b binary`) to `mov (%r12,%rcx,8),%rdi` / `mov 0x40(%rdi),%rcx` / `vucomisd (%rcx),%xmm0`, and at the fault `rdi = 0x2100000001` — the same **low-dword-replaced-by-1** shape as `0x2000000001`. The intervening `[lazy-commit] mapped page=0x2100000000 rip=0x41117e221` is prosper *backing the forged pointer's page*, so the corrupt dereference succeeds, returns zeros, and the SIGSEGV surfaces one instruction later as `addr=(nil)` with the corrupt value nowhere in the report. #1944's handler is therefore **downstream** of this bug and destroys its attribution; it is still not the writer (that row stands). | #1945, #1226, #1944 |
@@ -1459,6 +1706,26 @@ guest's faulting virtual call disassembled. What remains is **ownership**, not a
    survival, it is not the mutex, and it is not the guest's rate. The next instrument owes a
    **per-fold** account of what 1.5 ms of wall time per submit changes — not another whole-run rate,
    which has now produced two retracted rows on this title.
+
+**Added 2026-08-07 by the arc7 lane, without renumbering the list above:**
+
+10. **The next step is a cross-title snapshot pass with the `version >= 13` gate on post-submit
+    visibility removed** (`agc_reg_defaults.cpp`), tracked as
+    [#2220](https://github.com/mattias800/prosper/issues/2220). That single condition is what stands between this
+    title and rung 2: with the model forced on, the default route survives 3 of 3 with no throttle
+    and delivers 782–838 video frames (§ *2026-08-07 (arc7)* §5). Removing it changes behaviour for
+    every pre-13 title in the matrix, and the gate's own provenance carries no recorded evidence, so
+    it needs the matrix and a review — not another ArcRunner arm.
+11. **`tools/screenshot` is NOT interchangeable with `boot_trace` on this lever.** Two 300 s
+    `screenshot` runs with `PROSPER_POST_SUBMIT_VISIBILITY=1` and no throttle died at 35 and 42
+    delivered video frames, both `AgcCleanupThrea` at `rip=0x5c00048e0`, *before* their first sample
+    interval elapsed — so it is not the 4K readback. The same lever on the same head survives 3 of 3
+    under `boot_trace`. Establish which frontend a claim is about before quoting it; filed as
+    [#2217](https://github.com/mattias800/prosper/issues/2217).
+12. **Score a candidate against `REBUILD-BEFORE-EXEC`, not only against survival.** It is the
+    build-side twin of `SUSPECT-REL1-OVERLAP` and of DMA-INIT-GEN's `depth>=2`, all three report the
+    same number in every default arm, and it fires at the guest's own action rather than at one of
+    prosper's — so it says whether a change moved the *guest's* margin or only prosper's writes.
 
 *Superseded — the previous summary, kept because its provenance census is still the record:*
 

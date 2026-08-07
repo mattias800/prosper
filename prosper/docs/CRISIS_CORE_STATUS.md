@@ -100,6 +100,37 @@ scan, and never read a result from an arm that had both.
 "the guest outruns prosper" over any other ordering story — a stall changes thread interleaving
 globally. It also does not transfer to another title without its own dose-response.
 
+## 2026-08-07: the race is named, and it is a version-gated contract this title is outside
+
+The ArcRunner lane's per-fold census (`ARCRUNNER_STATUS.md` § *2026-08-07 (arc7)*) localised the same
+family's corruption on `PPSA21406` to the guest's builder thread being released **mid-fold**: prosper
+applies a submit's completion writes while it is still executing the rest of the same command buffer,
+so the guest's chunk recycler sees its consumed markers and rebuilds labels whose init packets prosper
+has not reached yet. prosper's post-submit visibility model exists to make exactly that impossible —
+and it is armed by `if (version >= 13)` in `agc_reg_defaults.cpp`.
+
+**This title requests SDK version 10**, so the contract is unarmed for it. That made "forcing it on
+rescues Crisis Core too" a *prediction* rather than a second search, and it holds. Same binary,
+alternated control/armed, `PROSPER_GUEST_ARGS= PROSPER_RENDER=1`, 40 s bound, exact zero peer-process
+censuses before and after all six arms:
+
+| arm | runs | faulted | notes |
+| --- | --- | --- | --- |
+| default | 3 | **3 of 3**, exit 90 | one arm also carries 4 `FMallocBinned3`/fatal lines |
+| `PROSPER_POST_SUBMIT_VISIBILITY=1` | 3 | **0 of 3**, `rc=124` at the bound | lever witnessed on each (`POST-SUBMIT-VISIBILITY FORCED ON`); zero faults, zero fatals |
+
+```bash
+PROSPER_GUEST_ARGS= PROSPER_RENDER=1 PROSPER_POST_SUBMIT_VISIBILITY=1 \
+  timeout 40 ./build-linux/boot_trace <DUMP_ROOT>/PPSA07809-app0
+```
+
+Read the scope narrowly. This is a 40 s survival endpoint, not a progression claim for this title,
+and the gate is **not** removed — three rung-6 snapshot-guarded titles are also pre-13 (*Dead Cells*
+10, *Blasphemous 2* 10, *Alex Kidd* 8), so removing it needs the matrix
+([#2220](https://github.com/mattias800/prosper/issues/2220)). What it does settle is that
+the `(500, 1500]` dose-response this document records is not a Crisis Core peculiarity: two
+independently brought-up titles, both outside one unarmed contract, both rescued by arming it.
+
 ## Ruled out
 
 - **"prosper's completion writes land late, so they hit a recycled label."** Measured directly:

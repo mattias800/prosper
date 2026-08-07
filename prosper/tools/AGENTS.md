@@ -385,6 +385,29 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   separates them. It reports `NOT ARMED` when no stall duration is set, so a mis-typed arm cannot
   read as an armed null. Measured on ArcRunner: 0/3 faulted either way against a 3/3 unthrottled
   control, i.e. the rescue is the delay (`prosper/docs/ARCRUNNER_STATUS.md`).
+- **`PROSPER_FOLD_MARGIN`** — the **per-fold** account of that same family, and the instrument to
+  reach for when a whole-run rate has stopped discriminating. Two halves arm together:
+  a per-submit ledger (`hle_agc.cpp`) splitting each fold into `gap` (the guest's own time between
+  prosper's return and its next submit), `lock`, `work` and `stall` — the stall **measured**, not
+  assumed — and a label-protocol census (`command_processor.cpp`) counting the recycle race in
+  **folds** rather than milliseconds. Set `=1` for totals, `=2` for one line per fold. Why folds: a
+  wall-clock age is not comparable between a route that adds a fixed delay per submit and one that
+  does not, and two ArcRunner `## Ruled out` rows were retracted for exactly that. Three
+  practicalities. **Level 2 is not timing-neutral** — an ArcRunner control run lives ~9 s at level 1
+  and ~13 s at level 2, so compare level-2 arms only with level-2 arms. **`REBUILD-BEFORE-EXEC` is
+  the number to score a candidate fix against**: it fires at the *guest's* own builder call when it
+  rebuilds a label whose previous generation prosper has not executed, and it agrees exactly with
+  `SUSPECT-REL1-OVERLAP` (fence side) and DMA-INIT-GEN's `depth>=2` (init side) in every arm — three
+  points in one protocol, so a claim can be cross-checked rather than trusted. And the per-fold
+  `built` column counts what the guest's **builder thread** did *while prosper was inside that fold*,
+  which is how the ArcRunner mechanism became visible at all.
+- **`PROSPER_POST_SUBMIT_VISIBILITY`** — `=1` forces prosper's post-submit completion-visibility
+  model on regardless of the SDK version the guest requested, `=0` forces it off; unset leaves the
+  `version >= 13` gate in `agc_reg_defaults.cpp` alone. The model holds a submit's completion writes
+  private until the submit scope closes, so the guest cannot observe a half-retired frame. It is an
+  A/B lever for whether that gate is right for a pre-13 title: ArcRunner requests version 10, and
+  forcing the model on takes its default route from 3-of-3 faulting to 3-of-3 surviving
+  (`prosper/docs/ARCRUNNER_STATUS.md` § 2026-08-07).
 - **`hostprof/hostprof.py`** — poor-man's **native sampling profiler**: attach to a running process
   (pid or name), sample its threads via repeated `gdb` backtraces, and rank the hot leaf functions —
   the HOST-side "which C++ function is burning CPU" first look (render/submit thread, readback copy,
