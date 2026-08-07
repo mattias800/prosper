@@ -1223,6 +1223,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 uint64_t persistent_watch_unknown = 0, persistent_watch_disabled = 0;
                 uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                 double texture_ms = 0, buffer_ms = 0;
+                // Attribution of texture_ms by OUTCOME class (#2262). After #2259 removed the
+                // reflection cost this is the largest leaf of build_R -- 22.56 ms/submit on a Blue
+                // Prince gameplay window, 55% of build_R -- and it is one span with nothing inside
+                // it, so "4,449 references at an 89% reuse rate cost 22.56 ms" is as far as anyone
+                // can currently get.
+                //
+                // An attribution rather than a phase partition, deliberately: these classes are
+                // already computed as locals on the per-resource path and are decided in a fixed
+                // order, so classifying in that same order makes them mutually exclusive by
+                // construction -- whereas carving a 2,800-line branch into timed phases invites the
+                // double-counting #2246 and #2250 had to be careful about.
+                double tex_rtt_ms = 0, tex_compute_ms = 0, tex_local_ms = 0;
+                double tex_persist_hit_ms = 0, tex_persist_reuse_ms = 0, tex_persist_miss_ms = 0;
+                uint64_t tex_rtt_n = 0, tex_compute_n = 0, tex_local_n = 0;
+                uint64_t tex_persist_hit_n = 0, tex_persist_reuse_n = 0, tex_persist_miss_n = 0;
+                uint64_t tex_other_n = 0;
                 // Exhaustive partition of build_resources_ms, the frontend materialiser (#2215).
                 // It had two named leaves -- texture_ms and buffer_ms, both from INSIDE build_R --
                 // covering 10.2 of 48.95 ms on a Blue Prince gameplay submit, with no assertion
@@ -4734,6 +4750,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const double elapsed = std::chrono::duration<double, std::milli>(
                             RenderClock::now() - resource_timing_start).count();
                         if (fr.is_texture()) {
+                            // Classified in the SAME order the path decides them, and exclusively:
+                            // a reference satisfied by an earlier class never reaches a later one,
+                            // so every reference lands in exactly one bucket or in `other`. The
+                            // residual is therefore two independent numbers -- a COUNT of references
+                            // nothing above claimed, and a signed remainder of ms -- and they
+                            // disagree only if the classification is wrong.
+                            if (resource_rtt_hit)                      { pending_timing.tex_rtt_ms += elapsed;           ++pending_timing.tex_rtt_n; }
+                            else if (resource_compute_image_hit)       { pending_timing.tex_compute_ms += elapsed;       ++pending_timing.tex_compute_n; }
+                            else if (resource_persistent_submit_reuse) { pending_timing.tex_persist_reuse_ms += elapsed; ++pending_timing.tex_persist_reuse_n; }
+                            else if (resource_persistent_hit)          { pending_timing.tex_persist_hit_ms += elapsed;   ++pending_timing.tex_persist_hit_n; }
+                            else if (resource_persistent_miss)         { pending_timing.tex_persist_miss_ms += elapsed;  ++pending_timing.tex_persist_miss_n; }
+                            else if (resource_local_reuse)             { pending_timing.tex_local_ms += elapsed;         ++pending_timing.tex_local_n; }
+                            else                                       { ++pending_timing.tex_other_n; }
                             pending_timing.textures++;
                             pending_timing.texture_bytes += static_cast<uint64_t>(fr.tw) * fr.th * fr.td *
                                 fr.sample_count *
@@ -6773,6 +6802,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t persistent_watch_unknown = 0, persistent_watch_disabled = 0;
                     uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                     double texture_ms = 0, buffer_ms = 0;
+                    // Attribution of texture_ms by OUTCOME class (#2262). After #2259 removed the
+                    // reflection cost this is the largest leaf of build_R -- 22.56 ms/submit on a Blue
+                    // Prince gameplay window, 55% of build_R -- and it is one span with nothing inside
+                    // it, so "4,449 references at an 89% reuse rate cost 22.56 ms" is as far as anyone
+                    // can currently get.
+                    //
+                    // An attribution rather than a phase partition, deliberately: these classes are
+                    // already computed as locals on the per-resource path and are decided in a fixed
+                    // order, so classifying in that same order makes them mutually exclusive by
+                    // construction -- whereas carving a 2,800-line branch into timed phases invites the
+                    // double-counting #2246 and #2250 had to be careful about.
+                    double tex_rtt_ms = 0, tex_compute_ms = 0, tex_local_ms = 0;
+                    double tex_persist_hit_ms = 0, tex_persist_reuse_ms = 0, tex_persist_miss_ms = 0;
+                    uint64_t tex_rtt_n = 0, tex_compute_n = 0, tex_local_n = 0;
+                    uint64_t tex_persist_hit_n = 0, tex_persist_reuse_n = 0, tex_persist_miss_n = 0;
+                    uint64_t tex_other_n = 0;
                     double build_r_ms = 0, build_validate_ms = 0;
                     double build_poison_ms = 0, build_indices_ms = 0;
                     uint64_t build_draws = 0, build_rejected = 0;
@@ -6865,6 +6910,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.buffer_bytes += pending_timing.buffer_bytes;
                     timing.buffer_materialized_bytes += pending_timing.buffer_materialized_bytes;
                     timing.texture_ms += pending_timing.texture_ms;
+                    timing.tex_rtt_ms += pending_timing.tex_rtt_ms;
+                    timing.tex_compute_ms += pending_timing.tex_compute_ms;
+                    timing.tex_local_ms += pending_timing.tex_local_ms;
+                    timing.tex_persist_hit_ms += pending_timing.tex_persist_hit_ms;
+                    timing.tex_persist_reuse_ms += pending_timing.tex_persist_reuse_ms;
+                    timing.tex_persist_miss_ms += pending_timing.tex_persist_miss_ms;
+                    timing.tex_rtt_n += pending_timing.tex_rtt_n;
+                    timing.tex_compute_n += pending_timing.tex_compute_n;
+                    timing.tex_local_n += pending_timing.tex_local_n;
+                    timing.tex_persist_hit_n += pending_timing.tex_persist_hit_n;
+                    timing.tex_persist_reuse_n += pending_timing.tex_persist_reuse_n;
+                    timing.tex_persist_miss_n += pending_timing.tex_persist_miss_n;
+                    timing.tex_other_n += pending_timing.tex_other_n;
                     timing.build_r_ms += pending_timing.build_r_ms;
                     timing.build_validate_ms += pending_timing.build_validate_ms;
                     timing.build_poison_ms += pending_timing.build_poison_ms;
@@ -7012,6 +7070,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             totals.buffer_bytes / (1024.0 * 1024.0),
                             totals.buffer_materialized_bytes / (1024.0 * 1024.0),
                             totals.buffer_ms / nsub);
+                    // texture_ms attributed by OUTCOME class (#2262). The classes are decided in
+                    // a fixed order on the per-resource path and classified in that same order, so
+                    // they are mutually exclusive and every reference lands in exactly one -- or in
+                    // `unclassified`, which is a COUNT of references nothing above claimed. `other`
+                    // is the SIGNED millisecond remainder, published rather than clamped for the
+                    // reason #2246 records. The two residuals are independent: a non-zero `other`
+                    // with `unclassified=0` means the classification is losing time that a claimed
+                    // class should hold, which is a defect in this instrument and not in the
+                    // renderer.
+                    {
+                        const double tex_other = totals.texture_ms - totals.tex_rtt_ms -
+                                                 totals.tex_compute_ms - totals.tex_local_ms -
+                                                 totals.tex_persist_hit_ms - totals.tex_persist_reuse_ms -
+                                                 totals.tex_persist_miss_ms;
+                        fprintf(stderr,
+                                "[render-timing] texture %.2f ms/submit [rtt=%.2f/%.1f compute=%.2f/%.1f "
+                                "persist_reuse=%.2f/%.1f persist_hit=%.2f/%.1f "
+                                "persist_miss=%.2f/%.1f local=%.2f/%.1f] other=%+.2f "
+                                "unclassified=%.1f  (ms/submit per class, refs/submit after the slash)\n",
+                                totals.texture_ms / nsub,
+                                totals.tex_rtt_ms / nsub, (double)totals.tex_rtt_n / nsub,
+                                totals.tex_compute_ms / nsub, (double)totals.tex_compute_n / nsub,
+                                totals.tex_persist_reuse_ms / nsub, (double)totals.tex_persist_reuse_n / nsub,
+                                totals.tex_persist_hit_ms / nsub, (double)totals.tex_persist_hit_n / nsub,
+                                totals.tex_persist_miss_ms / nsub, (double)totals.tex_persist_miss_n / nsub,
+                                totals.tex_local_ms / nsub, (double)totals.tex_local_n / nsub,
+                                tex_other / nsub, (double)totals.tex_other_n / nsub);
+                        if (tex_other < -0.05 * nsub)
+                            fprintf(stderr,
+                                    "[render-timing] *** texture classes EXCEED their parent by %.2f "
+                                    "ms/submit -- the classification double-counts; instrument "
+                                    "defect, not renderer\n", -tex_other / nsub);
+                    }
                     // build_resources, exhaustively (#2215). The leaves are per-draw spans inside
                     // build_bds; `other` is the SIGNED residual -- everything in build_resources
                     // that is not one of them, which on a healthy partition is the loop overhead
@@ -7200,6 +7291,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             window.buffer_bytes / (wn * 1024.0 * 1024.0),
                             window.buffer_materialized_bytes / (wn * 1024.0 * 1024.0),
                             window.buffer_ms / wn);
+                    // texture_ms attributed by OUTCOME class (#2262). The classes are decided in
+                    // a fixed order on the per-resource path and classified in that same order, so
+                    // they are mutually exclusive and every reference lands in exactly one -- or in
+                    // `unclassified`, which is a COUNT of references nothing above claimed. `other`
+                    // is the SIGNED millisecond remainder, published rather than clamped for the
+                    // reason #2246 records. The two residuals are independent: a non-zero `other`
+                    // with `unclassified=0` means the classification is losing time that a claimed
+                    // class should hold, which is a defect in this instrument and not in the
+                    // renderer.
+                    {
+                        const double tex_other = window.texture_ms - window.tex_rtt_ms -
+                                                 window.tex_compute_ms - window.tex_local_ms -
+                                                 window.tex_persist_hit_ms - window.tex_persist_reuse_ms -
+                                                 window.tex_persist_miss_ms;
+                        fprintf(stderr,
+                                "[render-window] texture %.2f ms/submit [rtt=%.2f/%.1f compute=%.2f/%.1f "
+                                "persist_reuse=%.2f/%.1f persist_hit=%.2f/%.1f "
+                                "persist_miss=%.2f/%.1f local=%.2f/%.1f] other=%+.2f "
+                                "unclassified=%.1f  (ms/submit per class, refs/submit after the slash)\n",
+                                window.texture_ms / wn,
+                                window.tex_rtt_ms / wn, (double)window.tex_rtt_n / wn,
+                                window.tex_compute_ms / wn, (double)window.tex_compute_n / wn,
+                                window.tex_persist_reuse_ms / wn, (double)window.tex_persist_reuse_n / wn,
+                                window.tex_persist_hit_ms / wn, (double)window.tex_persist_hit_n / wn,
+                                window.tex_persist_miss_ms / wn, (double)window.tex_persist_miss_n / wn,
+                                window.tex_local_ms / wn, (double)window.tex_local_n / wn,
+                                tex_other / wn, (double)window.tex_other_n / wn);
+                        if (tex_other < -0.05 * wn)
+                            fprintf(stderr,
+                                    "[render-window] *** texture classes EXCEED their parent by %.2f "
+                                    "ms/submit -- the classification double-counts; instrument "
+                                    "defect, not renderer\n", -tex_other / wn);
+                    }
                     const double window_backend_detail_ms = window.backend_target_ms +
                         window.backend_draw_setup_ms + window.backend_record_upload_ms +
                         window.backend_gpu_wait_ms + window.backend_readback_ms +
