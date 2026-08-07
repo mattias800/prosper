@@ -92,14 +92,11 @@ const Row kRows[] = {
     {"scePthreadRwlockInit",         "pthread_rwlock_init",         "#1984"},
     {"scePthreadRwlockRdlock",       "pthread_rwlock_rdlock",       "#2158"},
     {"scePthreadRwlockWrlock",       "pthread_rwlock_wrlock",       "#2158"},
-    // scePthreadRwlockUnlock is DELIBERATELY not probed with a null slot: it answers 0 there rather
-    // than EINVAL, which is the separate open defect #2159 (`k_rwlock_unlock` reaches
-    // `ensure_rwlock`'s null return and falls through to success) and NOT a gap in this rule. This
-    // sweep found that independently, on `a136bb93`, and must not paper over it — an arm asserting
-    // the current 0 would enshrine the bug, and an arm asserting EINVAL would fail for a reason this
-    // file is not about. Its Sony/POSIX encoding pairing is already guarded on a real failure, by
-    // test_rwlock_once.cpp's unmatched-unlock arms (encoded EPERM vs bare EPERM). Re-add the row
-    // here once #2159 lands.
+    // Re-added as the note above instructed: #2159 has landed, so a null slot now answers EINVAL
+    // here as it already did at every sibling entry point, and the row asserts the pairing on a real
+    // failure rather than enshrining the old 0. Before the fix this row is red for exactly the right
+    // reason — the Sony spelling returned 0 instead of the encoded 0x80020016.
+    {"scePthreadRwlockUnlock",       "pthread_rwlock_unlock",       "#2159"},
     {"scePthreadRwlockTryrdlock",    "pthread_rwlock_tryrdlock",    "#1984"},
     {"scePthreadRwlockTrywrlock",    "pthread_rwlock_trywrlock",    "#1984"},
     {"scePthreadRwlockTimedrdlock",  "pthread_rwlock_timedrdlock",  "#1984, separate POSIX body"},

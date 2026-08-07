@@ -1163,7 +1163,13 @@ HLE(k_rwlock_wrlock)  {
 }
 HLE(k_rwlock_unlock)  {
     auto* g = ensure_rwlock(a0);
-    if (!g) return 0;
+    // EINVAL, matching every sibling rwlock entry point (rd/wr/tryrd/trywr and all four timed
+    // forms). ensure_rwlock returns null only for a null slot address or a failed allocation;
+    // neither is a successful unlock, and FreeBSD answers EINVAL for the first. Reporting 0 here
+    // told a guest that an unlock of a null handle had succeeded, hiding its bug behind ours —
+    // and made this the one rwlock call whose answer depended on which entry point was used.
+    // The two causes fold together because ensure_rwlock does not distinguish them (#2159).
+    if (!g) return 0x16;
     const int rc = rw_release(g);
     if (rc != 0) {
         if (rwlocklog() || !rwlock_unsafe_unlock())
