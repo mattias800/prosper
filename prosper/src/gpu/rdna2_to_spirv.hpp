@@ -285,6 +285,26 @@ uint32_t fragment_effective_wave_size_for_test(uint32_t requested_wave_size,
 // Recompiled fragment wave operations use native Vulkan subgroup instructions and therefore require
 // an exact guest-wave subgroup. Returns zero for ordinary modules and 32/64 for that contract.
 uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv);
+// WHY a fragment module requires its exact guest-wave width (#2147). The width alone is not
+// actionable: a shader needing 64 for lane IDENTITY can never run at 32, because
+// SubgroupLocalInvocationId IS the guest lane id and 32 lanes silently renumber it. One needing
+// 64 only for a branch-guard vote may be width-agnostic, since two 32-lane votes union to the
+// same executed-pixel set. Those have opposite prospects under a wave32 lowering, and the skip
+// diagnostic could not tell them apart: kFragmentSubgroup* below are CAPABILITY bits, and the
+// lane-id path declares only base GroupNonUniform, so it reported required-ops=0.
+//
+// These name the emitter path that raised the contract. A module may set several.
+inline constexpr uint32_t kFragmentWaveReasonLaneId     = 1u << 0;  // lane id from SubgroupLocalInvocationId
+inline constexpr uint32_t kFragmentWaveReasonWaveAny    = 1u << 1;  // OpGroupNonUniformAny (guard AND reduce)
+inline constexpr uint32_t kFragmentWaveReasonDppRow16   = 1u << 2;  // DPP row, needs >= 16
+inline constexpr uint32_t kFragmentWaveReasonPermLane32 = 1u << 3;  // PERMLANEX16, needs >= 32
+inline constexpr uint32_t kFragmentWaveReasonReadLane64 = 1u << 4;  // V_READLANE_B32 across a wave64
+inline constexpr uint32_t kFragmentWaveReasonShuffle    = 1u << 5;  // lane-addressed shuffle
+
+// Reasons recorded by the emitter, or UINT32_MAX when the module carries no reason marker at
+// all (built, cached or captured before #2147). Absent must not read as none.
+uint32_t fragment_spirv_required_subgroup_reasons(const std::vector<uint32_t>& spirv);
+
 inline constexpr uint32_t kFragmentSubgroupVote = 1u << 0;
 inline constexpr uint32_t kFragmentSubgroupArithmetic = 1u << 1;
 inline constexpr uint32_t kFragmentSubgroupShuffle = 1u << 2;
