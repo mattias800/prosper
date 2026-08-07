@@ -508,6 +508,19 @@ HLE(s_videodec2_create_decoder) {
     // Building a decoder DOES need a queue to build it on, and a caller that reaches here without one
     // must fail visibly rather than be handed a decoder handle backed by no queue (#1658).
     uint64_t valid = vdec_validate_config(config, /*require_queue=*/true); if (valid) return valid;
+    // The other half of the #2270 contract capture: what the title asked the decoder to BE.
+    // codec/profile name the bitstream a real decoder must accept; max_width/height and
+    // VdecMemory::max_frame_size together pin the output layout arithmetically -- max_frame_size
+    // divided by max_width*max_height is bytes-per-pixel, and 1.5 vs 4 is YUV420 vs packed 32-bit.
+    if (getenv("PROSPER_VDEC2_CONTRACT"))
+        fprintf(stderr,
+                "[vdec-contract] create codec=%u profile=%u max=%dx%d dpb=%d input_depth=%u | "
+                "mem cpu=%llu gpu=%llu shared=%llu max_frame=%llu align=%u\n",
+                config->codec, config->profile, config->max_width, config->max_height,
+                config->max_dpb, config->input_depth,
+                (unsigned long long)memory->cpu_size, (unsigned long long)memory->gpu_size,
+                (unsigned long long)memory->shared_size,
+                (unsigned long long)memory->max_frame_size, memory->frame_alignment);
     if (memory->cpu_size < VDEC_MIN_MEMORY || memory->gpu_size < VDEC_MIN_MEMORY ||
         memory->shared_size < VDEC_MIN_MEMORY || memory->max_frame_size < VDEC_MIN_MEMORY)
         return VDEC_ERR_MEMORY_SIZE;
@@ -549,6 +562,27 @@ HLE(s_videodec2_decode) {
     if (input->data_size && !input->data) return VDEC_ERR_ARG;
     if (!frame->data_size) return VDEC_ERR_FRAME_SIZE;
     if (!frame->data) return VDEC_ERR_FRAME_PTR;
+    // PROSPER_VDEC2_CONTRACT: what a title actually asks this decoder for (#2270). prosper has no
+    // Videodec2 decoder, and the two facts a fix needs -- the output pixel FORMAT enum and the
+    // LAYOUT to write into frame->data -- are the two that cannot be read off a struct definition.
+    //
+    // There is a catch-22 in the middle of it: what the guest does with a DECODED picture cannot be
+    // observed while every decode returns no-picture. What CAN be observed is what the guest asked
+    // for and what it allocated, and the allocation constrains the layout arithmetically -- a
+    // frame buffer of w*h*3/2 is a YUV420/NV12 request, w*h*4 is a packed 32-bit one. That is a
+    // derivation from bytes the guest wrote, not an inference from what seems likely.
+    if (getenv("PROSPER_VDEC2_CONTRACT")) {
+        static std::atomic<unsigned> seq{0};
+        const unsigned k = seq.fetch_add(1);
+        if (k < 12) {
+            const double px = 0.0;
+            (void)px;
+            fprintf(stderr,
+                    "[vdec-contract] decode#%u handle=0x%llx au_bytes=%llu frame_buf=%llu\n",
+                    k, (unsigned long long)a0, (unsigned long long)input->data_size,
+                    (unsigned long long)frame->data_size);
+        }
+    }
     frame->accepted = 0; vdec_no_picture(frame, out, codec);
     return 0;
 }
