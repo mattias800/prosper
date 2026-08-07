@@ -314,6 +314,32 @@ HLE(k_mutexattr_destroy)     { if (a0 && *(void**)a0) { auto* at = (GuestMutexAt
 namespace {
     inline bool pt_static_sentinel(void* v) { return (uintptr_t)v < 0x1000; }  // NULL/1/2/3... = static initializer
 
+    // A DESTROYED slot, distinct from an uninitialised one (#2170). FreeBSD writes its own poison
+    // through the caller's handle on *_destroy -- THR_MUTEX_DESTROYED (2), THR_COND_DESTROYED and
+    // THR_RWLOCK_DESTROYED (1) -- and every later operation on it returns EINVAL, loudly. prosper
+    // wrote NULL, which pt_static_sentinel above reads as "statically initialised, self-init me", so
+    // ensure_mutex/cond/rwlock SILENTLY MANUFACTURED a fresh, unheld object and the operation
+    // succeeded. Thread A holds rwlock R, thread B destroys it, A's next rdlock gets a brand-new
+    // lock and enters the critical section alongside A -- no error, no log line. Same silent-unsync
+    // class as #2012, through a different door.
+    //
+    // FreeBSD's own poison values cannot be reused as-is: 1 and 2 are both below the 0x1000
+    // threshold, so pt_static_sentinel swallows them exactly as it swallowed NULL. This needs a
+    // value of its own. Sub-page so it can never be mistaken for a real object pointer, and not
+    // 0/1/2/3 so it cannot collide with an initializer the guest legitimately writes.
+    inline constexpr uintptr_t kPtDestroyed = 0xDEA;
+    inline bool pt_destroyed_sentinel(void* v) { return (uintptr_t)v == kPtDestroyed; }
+
+    // Loud, because this is a BEHAVIOUR CHANGE: the operation used to succeed. A guest that
+    // use-after-destroys is buggy, but it was buggy silently, and a title that somehow depended on
+    // the old self-init must announce itself rather than fail somewhere else later.
+    inline void pt_report_destroyed(const char* what) {
+        static std::atomic<unsigned> seen{0};
+        if (seen.fetch_add(1) < 16)
+            fprintf(stderr, "[pthread] use-after-destroy on a %s: refused with EINVAL "
+                            "(it used to self-initialise a fresh object and succeed) -- #2170\n", what);
+    }
+
     struct GuestCondState {
         int32_t clock_id = 0;
         uint64_t generation = 0;
@@ -409,6 +435,7 @@ namespace {
         void** slot = (void**)(uintptr_t)slot_addr;
         void* cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
         if (!pt_static_sentinel(cur)) return (pthread_mutex_t*)cur;
+        if (pt_destroyed_sentinel(cur)) { pt_report_destroyed("mutex"); return nullptr; }
         auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t));
         pthread_mutexattr_t at; pthread_mutexattr_init(&at);
 #ifdef _WIN32
@@ -438,6 +465,7 @@ namespace {
         void** slot = (void**)(uintptr_t)slot_addr;
         void* cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
         if (!pt_static_sentinel(cur)) return (pthread_cond_t*)cur;
+        if (pt_destroyed_sentinel(cur)) { pt_report_destroyed("condition variable"); return nullptr; }
         auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t));
         if (!c) return nullptr;
         if (pthread_cond_init(c, nullptr) != 0) { free(c); return nullptr; }
@@ -506,6 +534,7 @@ namespace {
         void** slot = (void**)(uintptr_t)slot_addr;
         void* cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
         if (!pt_static_sentinel(cur)) return (GuestRwlock*)cur;
+        if (pt_destroyed_sentinel(cur)) { pt_report_destroyed("rwlock"); return nullptr; }
         auto* g = guest_rwlock_create();
         if (!g) return nullptr;
         if (__atomic_compare_exchange_n(slot, &cur, (void*)g, false,
@@ -611,7 +640,7 @@ namespace { inline uint64_t fbsd_errno(int host) {
 // CONFIDENCE: MED that Sony's libkernel did not re-write these bodies, which no evidence in the
 // corpus can currently settle either way — a title observed testing a Destroy result would.
 HLE(k_mutex_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { auto* m = (pthread_mutex_t*)*(void**)a0; guest_mutex_unregister(m); retire_sync_object(m, SyncObjectKind::Mutex,
-                                    [](void* p) { pthread_mutex_destroy((pthread_mutex_t*)p); }); } if (a0) *(void**)a0 = nullptr; return 0; }
+                                    [](void* p) { pthread_mutex_destroy((pthread_mutex_t*)p); }); } if (a0) *(void**)a0 = (void*)kPtDestroyed; return 0; }   // #2170: destroyed != uninitialised
 // PROSPER_MUTEX_FAILLOG: report any mutex op that returns a non-zero (EINVAL/EDEADLK/...) result,
 // with the guest slot address and the host object it resolved to. Diagnostic for the macOS
 // guest-side "std::mutex lock failed: Invalid argument" terminate — a host EINVAL(22) surfaces as
@@ -909,7 +938,7 @@ HLE(k_cond_destroy) {
         retire_sync_object(cond, SyncObjectKind::Cond,
                            [](void* p) { pthread_cond_destroy((pthread_cond_t*)p); });
     }
-    if (a0) *(void**)a0 = nullptr;
+    if (a0) *(void**)a0 = (void*)kPtDestroyed;   // #2170: destroyed != uninitialised
     return 0;
 }
 HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_signal(c); } return 0; }
@@ -971,7 +1000,7 @@ HLE(k_rwlock_init) {
 HLE(k_rwlock_destroy) {
     if (a0 && !pt_static_sentinel(*(void**)a0)) retire_sync_object(*(void**)a0, SyncObjectKind::Rwlock,
             [](void* p) { auto* g = (GuestRwlock*)p; pthread_rwlock_destroy(&g->rw); g->~GuestRwlock(); });
-    if (a0) *(void**)a0 = nullptr;
+    if (a0) *(void**)a0 = (void*)kPtDestroyed;   // #2170: destroyed != uninitialised
     return 0;
 }
 // An UNMATCHED unlock must never reach the host lock (#2012).

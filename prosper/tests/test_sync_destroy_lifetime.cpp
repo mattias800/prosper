@@ -158,7 +158,16 @@ int main() {
           "precondition: the reader is parked INSIDE k_rwlock_rdlock on this object");
 
     call(RWdes, (uint64_t)(uintptr_t)&slot_a);             // the guest bug: destroy under the waiter
-    CHECK(slot_a == nullptr, "Destroy cleared the guest slot (unchanged behaviour)");
+    // #2170 changed the VALUE written here from NULL to the DESTROYED sentinel, so this waypoint
+    // now asserts the PROPERTY it always meant rather than the literal it happened to be: after
+    // destroy the guest can no longer reach the object through its own slot.
+    //
+    // The property is strictly better served than before. Under NULL, the next operation on this
+    // slot self-initialised a brand-new unheld rwlock and SUCCEEDED -- so "the guest cannot reach
+    // the object" was true while "the guest gets a working lock it should not have" was also true.
+    CHECK(slot_a != parked_object, "Destroy detached the guest slot from the object");
+    CHECK(call(RWrd, (uint64_t)(uintptr_t)&slot_a) != 0,
+          "a destroyed slot reports an error instead of self-initialising a fresh rwlock (#2170)");
 
     void* slot_b = nullptr;
     call(RWinit, (uint64_t)(uintptr_t)&slot_b);
@@ -169,7 +178,7 @@ int main() {
     CHECK(slot_b != parked_object,
           "a new rwlock does not alias the object a thread is parked in");
 
-    // The destroy cleared slot A, so the guest can no longer reach the object it is holding — but
+    // The destroy poisoned slot A, so the guest can no longer reach the object it is holding — but
     // the object itself must still be a live rwlock. Reach it through a slot holding the same
     // pointer (which is exactly what an in-flight handler holds) and release the write hold: the
     // parked reader must then wake. Under the fix this is an ordinary operation on a retired object;

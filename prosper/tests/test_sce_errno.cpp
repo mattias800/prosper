@@ -210,6 +210,57 @@ int main() {
         }
     }
 
+    // ===== use-after-destroy is EINVAL, not a silently fresh object (#2170) ====================
+    // FreeBSD writes a DESTROYED poison through the caller's handle and every later operation on it
+    // returns EINVAL. prosper wrote NULL, which pt_static_sentinel reads as "statically initialised,
+    // self-init me" -- so ensure_mutex/cond/rwlock manufactured a brand-new UNHELD object and the
+    // operation SUCCEEDED. Thread A holds rwlock R, thread B destroys it, A's next rdlock gets a
+    // fresh lock and enters the critical section alongside A. No error, no log line.
+    //
+    // Each arm below is destroy-then-USE. A test that only checked destroy's own return value could
+    // not see this at all: destroy returned 0 before and returns 0 now.
+    {
+        struct { const char* init; const char* destroy; const char* use; const char* what; } objs[] = {
+            { "scePthreadMutexInit",  "scePthreadMutexDestroy",  "scePthreadMutexLock",   "mutex"  },
+            { "scePthreadRwlockInit", "scePthreadRwlockDestroy", "scePthreadRwlockRdlock","rwlock" },
+        };
+        for (const auto& o : objs) {
+            auto init = Hle::lookup(nid_hash(o.init));
+            auto destroy = Hle::lookup(nid_hash(o.destroy));
+            auto use = Hle::lookup(nid_hash(o.use));
+            char msg[220];
+            snprintf(msg, sizeof msg, "%s / %s / %s are registered", o.init, o.destroy, o.use);
+            CHECK(init && destroy && use, msg);
+            if (!init || !destroy || !use) continue;
+
+            alignas(16) uint8_t slot[32]{};
+            const uint64_t h = (uint64_t)(uintptr_t)slot;
+            snprintf(msg, sizeof msg, "a guest %s initialises", o.what);
+            CHECK(init(h, 0, 0, 0, 0, 0) == 0, msg);
+
+            // Positive control, and it is the arm that stops "reject everything" from passing: the
+            // object must WORK before it is destroyed. Without it, an ensure_* broken to always
+            // return nullptr would satisfy every assertion below.
+            snprintf(msg, sizeof msg, "the %s is usable before destroy", o.what);
+            CHECK(use(h, 0, 0, 0, 0, 0) == 0, msg);
+
+            CHECK(destroy(h, 0, 0, 0, 0, 0) == 0, "destroy succeeds");
+            // THE BUG: this used to return 0, having silently built a fresh unheld object.
+            snprintf(msg, sizeof msg,
+                     "using a destroyed %s reports encoded EINVAL rather than self-initialising",
+                     o.what);
+            CHECK(use(h, 0, 0, 0, 0, 0) == 0x80020016ull, msg);
+
+            // The interaction #2170 flags: re-Init on a destroyed slot must be ACCEPTED. A poison
+            // that made the slot permanently unusable would break every guest that reuses storage.
+            snprintf(msg, sizeof msg, "a destroyed %s slot can be re-initialised", o.what);
+            CHECK(init(h, 0, 0, 0, 0, 0) == 0, msg);
+            snprintf(msg, sizeof msg, "the re-initialised %s works again", o.what);
+            CHECK(use(h, 0, 0, 0, 0, 0) == 0, msg);
+            destroy(h, 0, 0, 0, 0, 0);
+        }
+    }
+
     // ---- behavioral: scePthreadMutexTimedlock timeout --------------------------------------
     {
         auto mtx_init = Hle::lookup(nid_hash("scePthreadMutexInit"));
