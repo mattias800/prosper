@@ -285,9 +285,22 @@ int main() {
         const auto pool_after_first = prosper::test::render_host_buffer_pool_stats();
         CHECK(shared_stats.buffer_references == 4 && shared_stats.unique_buffers == 2,
               "identical guest-buffer payloads share two arena slices across draws");
-        CHECK(pool_after_first.misses == pool_before.misses + 1 &&
-                  pool_after_first.cached_buffers == pool_before.cached_buffers + 1,
-              "two logical uploads populate one persistent host-buffer arena");
+        // AT MOST one new arena buffer, not EXACTLY one. The property this asserts is that two
+        // logical uploads share a single arena rather than taking a buffer each; the old `== +1`
+        // additionally required the arena to be EMPTY on entry, which is a precondition of the
+        // fixture rather than a property of the renderer. Indexed draws take arena slices since
+        // #2253, so the indexed draws at :165/:167 leave a partially-used arena and these two
+        // uploads now fit inside it — one arena, zero new buffers, the property satisfied and the
+        // old proxy violated.
+        //
+        // The inequality keeps the discriminating power that matters: the regression this guards
+        // against is each logical upload allocating its own host buffer, which is `+2` and still
+        // fails. Verified by construction rather than assumed — `PROSPER_NO_INDEX_ARENA=1` restores
+        // the empty-arena precondition and the original `== +1` holds, which is what identified the
+        // dependency in the first place.
+        CHECK(pool_after_first.misses <= pool_before.misses + 1 &&
+                  pool_after_first.cached_buffers <= pool_before.cached_buffers + 1,
+              "two logical uploads share one persistent host-buffer arena (at most one new buffer)");
         const uint8_t* shared_center = center(shared);
         CHECK(shared_center && shared_center[0] > 0xC0 && shared_center[1] > 0xC0 &&
                   shared_center[2] < 0x40,

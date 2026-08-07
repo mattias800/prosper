@@ -1940,7 +1940,12 @@ inline RenderHostBuffer acquire_render_host_buffer(const RenderVkCtx& ctx,
     buffer.bytes = capacity;
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = capacity;
-    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    // INDEX as well as STORAGE, so one pool serves both. Index data used to take a dedicated
+    // vkCreateBuffer + vkAllocateMemory per indexed draw -- 55% of setup_fixed_ms and ~9% of a Blue
+    // Prince gameplay frame (#2253, measured by #2252's partition). Usage flags are capability
+    // declarations, so widening them does not change how existing storage users bind or write these
+    // buffers; it only makes the same memory legal for vkCmdBindIndexBuffer.
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     if (vkCreateBuffer(ctx.dev, &info, nullptr, &buffer.buffer) != VK_SUCCESS)
         return {};
     VkMemoryRequirements requirements{};
@@ -3628,6 +3633,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         std::vector<VkDescriptorSet> dsets;
         VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipe = VK_NULL_HANDLE;
         VkBuffer ibuf = VK_NULL_HANDLE; VkDeviceMemory ibmem = VK_NULL_HANDLE;   // index buffer (indexed draws)
+        // Non-zero when the index data lives in a shared arena slice rather than a dedicated
+        // allocation. `iarena` decides ownership at teardown: an arena slice is owned by the arena
+        // and must NOT be destroyed per draw, which is the one way this optimisation corrupts
+        // rather than merely slows (#2253). Mirrors SharedBufferUpload::arena on the storage path.
+        VkDeviceSize ioffset = 0;
+        bool iarena = false;
         VkRect2D scissor{};
         uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
         int32_t vertex_offset = 0;
@@ -4158,6 +4169,41 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             // this timer none of it was separable from fixed-function state translation.
             const ResourcePhaseTimer phase_index_upload(timing_enabled, &res_fixed_index_upload_ms);
             VkDeviceSize isz = (VkDeviceSize)bd.indices.size() * 4;
+            // Prefer a slice of the shared host-buffer arena. The storage path next door has used
+            // this since #1284 and #2246's partition measured what it is worth there: `create=0.00`
+            // in every window of every run, because the arena absorbs the transient path entirely.
+            // Index buffers were the one per-draw allocation left, at ~7.8 us/draw (#2253).
+            //
+            // Alignment: arena slices are aligned to storage_buffer_alignment, which is a
+            // power of two >= 16 on every device prosper runs on and therefore a multiple of the 4
+            // bytes vkCmdBindIndexBuffer requires for VK_INDEX_TYPE_UINT32. Asserted below rather
+            // than assumed, because a violated bind offset is undefined behaviour and not a
+            // validation-visible failure on every driver.
+            // PROSPER_NO_INDEX_ARENA: opt out of the index arena ONLY, leaving the storage
+            // arena on. Without it the single-variable A/B for this change does not exist:
+            // PROSPER_NO_BACKEND_BUFFER_ARENA disables both, so it measures "arena vs no arena"
+            // rather than "index arena vs dedicated allocation" -- in the first attempt it moved
+            // `resources` from 43.70 to 69.92 ms alongside the index term, which is a different
+            // change. Kept as a permanent bisection lever for the same reason PROSPER_NO_BACKEND_*
+            // exist.
+            static const bool no_index_arena = getenv("PROSPER_NO_INDEX_ARENA") != nullptr;
+            if (use_buffer_arena && !no_index_arena) {
+                SharedBufferUpload islice;
+                if (acquire_buffer_arena_slice(isz, islice) && islice.arena && islice.mapped &&
+                    (islice.offset % 4) == 0) {
+                    std::memcpy(static_cast<uint8_t*>(islice.mapped) + islice.offset,
+                                bd.indices.data(), (size_t)isz);
+                    v.ibuf = islice.buffer;
+                    v.ioffset = islice.offset;
+                    v.iarena = true;
+                    v.icount = (uint32_t)bd.indices.size();
+                }
+            }
+            // Fallback: a dedicated buffer, exactly as before. Reached when the arena is disabled
+            // (PROSPER_NO_BACKEND_BUFFER_ARENA, which is therefore still a working A/B lever) or
+            // when a slice could not be obtained. Keeping it means an arena failure degrades to the
+            // old cost rather than dropping the draw.
+            if (!v.iarena) {
             VkBufferCreateInfo ibci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             ibci.size = isz; ibci.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
             vkCreateBuffer(dev, &ibci, nullptr, &v.ibuf);
@@ -4170,6 +4216,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             void* ip = nullptr; vkMapMemory(dev, v.ibmem, 0, isz, 0, &ip);
             std::memcpy(ip, bd.indices.data(), (size_t)isz); vkUnmapMemory(dev, v.ibmem);
             v.icount = (uint32_t)bd.indices.size();
+            }
         }
         const auto fixed_stages_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         VkPipelineShaderStageCreateInfo st[3]{};
@@ -5838,7 +5885,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             p_beginxfb(cmd, 0, 0, nullptr, nullptr);
         }
         if (v.icount) {
-            vkCmdBindIndexBuffer(cmd, v.ibuf, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdBindIndexBuffer(cmd, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cmd, v.icount, v.instance_count, 0, v.vertex_offset, 0);
         } else {
             vkCmdDraw(cmd, v.vcount, v.instance_count,
@@ -6419,7 +6466,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 for (size_t di = 0; di < dv.size(); di++) { auto& v = dv[di]; if (!v.ok) continue; if ((int)di == kk) continue;
                     vkCmdBindPipeline(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
                     if (v.use_desc) vkCmdBindDescriptorSets(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
-                    if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, 0, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
+                    if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
                     else vkCmdDraw(c2, v.vcount, v.instance_count, static_cast<uint32_t>(v.vertex_offset), 0);
                 }
                 vkCmdEndRenderPass(c2);
@@ -6515,8 +6562,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (geom_counter_mem) vkFreeMemory(dev, geom_counter_mem, nullptr);
             for (auto& v : dv) {
                 if (v.pipe && !v.pipeline_cached) vkDestroyPipeline(dev, v.pipe, nullptr);
-                if (v.ibuf) vkDestroyBuffer(dev, v.ibuf, nullptr);
-                if (v.ibmem) release_transient_render_memory(dev, v.ibmem);
+                // An arena slice is owned by the arena and released with it; destroying the
+                // shared buffer here would free storage still referenced by other draws.
+                if (!v.iarena) {
+                    if (v.ibuf) vkDestroyBuffer(dev, v.ibuf, nullptr);
+                    if (v.ibmem) release_transient_render_memory(dev, v.ibmem);
+                }
                 if (v.vs) vkDestroyShaderModule(dev, v.vs, nullptr);
                 if (v.gs) vkDestroyShaderModule(dev, v.gs, nullptr);
                 if (v.fs) vkDestroyShaderModule(dev, v.fs, nullptr);
