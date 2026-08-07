@@ -87,12 +87,26 @@ bool notifier_republishes(const FormatCase& c, uint64_t base, uint32_t width, ui
     return republished;
 }
 
+// setenv() does not exist in the MinGW UCRT headers, so this file failed to COMPILE on the
+// toolchain docs/WINDOWS_PORT_HANDOFF.md prescribes -- aborting `cmake --build all` and skipping
+// every target after it (#2142's second instance; CI's MSYS2 gcc has the same gap and the job
+// never reached this file because the SEH abort came first). Same shape as the helper
+// test_apr_registry.cpp:38 already uses; kept local rather than shared because a two-line
+// platform shim in a test is cheaper to read where it is used than to chase to a header.
+static bool set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    return _putenv_s(name, value) == 0;
+#else
+    return setenv(name, value, 1) == 0;
+#endif
+}
+
 } // namespace
 
 int main() {
     // The renderer's replay seed writer is the only public way to publish an RTT identity, and it is
     // registered only when this is set at registration time.
-    setenv("PROSPER_GPU_REPLAY_RTT_SEEDS", "1", 1);
+    set_test_env("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
     prosper::frontend::register_live_renderer(std::string(), false);
 
     // The mapping itself. VK_FORMAT_UNDEFINED would mean "unnamed", which the notifier treats as a
