@@ -2659,6 +2659,11 @@ bool g_exc_log = false;               // set once (outside signal ctx) from PROS
 bool g_exc_log2 = false;
 volatile int* g_exc_counter = nullptr; // optional fork-safe raise counter (tests)
 #if defined(__linux__) || defined(__APPLE__)
+// raw_fmt_len: snprintf's would-be length clamped to what actually landed (#2050). Included INSIDE
+// the POSIX guard because raw_syscall.hpp's non-Linux branch includes <sys/mman.h>/<unistd.h>
+// unconditionally, so it is not MinGW-clean -- and the exception handler below is POSIX-only, so
+// nothing here needs it on Windows.
+#include "../host/raw_syscall.hpp"
 int  g_exc_sig = -1;
 #ifdef __APPLE__
 // Darwin has no pthread_sigqueue / RT-signal payload, so the exception TYPE travels through a
@@ -2692,9 +2697,19 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
             // %fs-safe: this handler can interrupt guest code running on the GUEST %fs, where host
             // libc TLS (locale, stack canary) reads garbage — swap to host %fs for the logging.
             uint64_t sfs = guest_fs_to_host_scoped();
+            // snprintf returns the length it WOULD have written, so handing it to write() reads
+            // past the end of this stack buffer whenever the line truncates -- #2050's class, and
+            // instrument trap 109's. raw_fmt_len() is the clamp #2050 introduced for exactly this,
+            // already unit-tested (tests/test_raw_syscall.cpp), and it encodes the right choice for
+            // the truncated case: write the cap-1 bytes that really landed, so the shortening stays
+            // visible rather than being papered over.
+            //
+            // Integers only, so this one cannot truncate today -- clamped anyway, because "cannot
+            // truncate today" is a property of the format string, and the next person to add a %s
+            // will not re-derive it.
             char b[96]; int n = snprintf(b, sizeof b, "[exc2] DROPPED type=%d tid=%ld (no handler)\n",
                                          type, (long)prosper_gettid());
-            (void)!write(2, b, n);
+            (void)!write(2, b, prosper::raw_fmt_len(n, sizeof b));
             guest_fs_restore_scoped(sfs);
         }
         return;
@@ -2709,12 +2724,16 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
         // #1659: was a hand-rolled three-branch dispatcher whose eboot (0x400000000) and libc
         // (0x500000000) bases were both stale; only the il2cpp one was current. One shared,
         // module-aware call replaces all three and cannot drift again.
+        // This is the reachable one of the three (#2162): the format embeds guest_module_name(),
+        // which is NOT length-bounded at the call site, into a 160-byte buffer whose fixed part is
+        // ~50. A module label over ~90 characters truncates and the unclamped write over-reads --
+        // the same shape that made the [labelhist] site the first one caught in trap 109.
         n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=%s+0x%llx\n",
                      (long)prosper_gettid(), type, fss, prosper::guest_module_name(irip),
                      (unsigned long long)prosper::guest_module_offset(irip));
         // guest_module_name/offset already degrade to "mapped/host" + the verbatim address, so the
         // former host: fallback branch is folded into the single call above.
-        (void)!write(2, b, n);
+        (void)!write(2, b, prosper::raw_fmt_len(n, sizeof b));
         guest_fs_restore_scoped(sfs);
     }
     auto* uc = (ucontext_t*)uc_;
@@ -2750,7 +2769,7 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
         uint64_t sfs = guest_fs_to_host_scoped();   // %fs-safe logging (see ENTER)
         char b[96]; int n = snprintf(b, sizeof b, "[exc2] RESUME tid=%ld type=%d\n",
                                      (long)prosper_gettid(), type);
-        (void)!write(2, b, n);
+        (void)!write(2, b, prosper::raw_fmt_len(n, sizeof b));
         guest_fs_restore_scoped(sfs);
     }
 }
