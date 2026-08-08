@@ -3514,14 +3514,17 @@ int main() {
             0xf0442128u, 0x00000900u,
             0xbf810000u,
         };
-        // Distinct width and height so "did the layer stride enter the index" is decidable from the
-        // constant pool: the 2D index is x + y*width and never needs `height`, while the arrayed
-        // index is x + (z*height + y)*width and must multiply by it.
+        // Height is 97 -- prime, and chosen so its appearance in the constant pool CANNOT be
+        // incidental. The first version of this arm used height 3 and was VOID: a 3 occurs in the
+        // module for unrelated reasons, so deleting the layer from the index left the arm passing.
+        // The discriminator is only as good as the improbability of the constant it looks for.
+        // The 2D index is x + y*width and never needs `height`; the arrayed index is
+        // x + (z*height + y)*width and cannot avoid it.
         ShaderResourceTable rt_layered;
-        std::vector<uint32_t> layered_backing(4u * 3u * 2u, 0u);
+        std::vector<uint32_t> layered_backing(5u * 97u * 2u, 0u);
         { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
           image.format = DataFormat::Uint32; image.num_components = 1;
-          image.binding = 4; image.img_dim = 5; image.width = 4; image.height = 3;
+          image.binding = 4; image.img_dim = 5; image.width = 5; image.height = 97;
           image.depth = 2; image.sgpr_base = 0;
           image.size = layered_backing.size() * sizeof(uint32_t);
           image.host_data = reinterpret_cast<uint8_t*>(layered_backing.data());
@@ -3557,12 +3560,12 @@ int main() {
         // x + y*width for every layer, every layer aliases layer 0, and the dispatch produces a
         // silently wrong result rather than being skipped: strictly worse than the bug it replaces.
         // `height` (3) appears only if the layer was multiplied in.
-        if (!has_u32_constant(layered_spv, 3u)) {
+        if (!has_u32_constant(layered_spv, 97u)) {
             printf("  [FAIL] the 2D_ARRAY atomic index does not multiply by height -- every layer "
                    "aliases layer 0\n");
             return 1;
         }
-        if (has_u32_constant(atomic_add_spv, 3u)) {
+        if (has_u32_constant(atomic_add_spv, 97u)) {
             printf("  [FAIL] the discriminator is void: the NON-arrayed module also carries the "
                    "height constant, so its presence proves nothing\n");
             return 1;
@@ -3572,7 +3575,7 @@ int main() {
         // MUTATION ARM 2 -- the layer must reach the SIZE BOUND. A backing sized for one layer must
         // be rejected; the pre-#2265 check was width*height*4 <= size and would accept it.
         ShaderResourceTable one_layer_backing = rt_layered;
-        one_layer_backing.resources[0].size = 4u * 3u * sizeof(uint32_t);
+        one_layer_backing.resources[0].size = 5u * 97u * sizeof(uint32_t);
         if (validate_spirv_descriptor_interface(layered_spv, &one_layer_backing, 0,
                                                 SpirvShaderStage::Compute, false).ok()) {
             printf("  [FAIL] a two-layer atomic image was accepted against one layer of backing\n");
