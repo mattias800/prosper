@@ -3178,7 +3178,7 @@ void install_trap_handler() {
     }
     // UNCONDITIONAL (#2078). This used to be gated on
     // `g_faultmem || g_skip_null_companion || g_null_page`, and the gate was wrong because it does
-    // not cover every consumer: `nullpage_deep_dump` also runs from the WORKER-FAULT path (:2752),
+    // not cover every consumer: `nullpage_deep_dump` also runs from the WORKER-FAULT path (:2782),
     // which no flag guards -- that call site exists precisely because those faults "land here, not
     // on the nullpage path".
     //
