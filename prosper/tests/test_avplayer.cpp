@@ -107,6 +107,50 @@ public:
     void close(int id) override { if (id == 17) ++close_count; }
 };
 
+// A 256-ALIGNED width, which every other case in this file lacks (#2051). FakeVideoBackend is 1920,
+// so `pitch != width` and `crop_right == 128` in every existing assertion -- and the reviewer who
+// found this put the consequence precisely: a refactor that unconditionally padded, or that set
+// crop_right to a constant 128, would pass the entire file.
+//
+// Both are plausible edits. The first is what "simplify the pitch logic" looks like; the second is
+// what a copy-paste of the 1920 case looks like. Both would silently break every title whose movie
+// is 1280x720 or 3840x2160 -- which is the majority of real content, and exactly the set #2032
+// established its own change is a bit-for-bit no-op over.
+//
+// 1280 % 256 == 0, so the contract here is the OPPOSITE of the padded one: width == pitch == visible
+// and crop_right == 0, with no padding bytes existing at all.
+class AlignedVideoBackend final : public video::VideoBackend {
+public:
+    static constexpr uint32_t kWidth = 1280;          // 1280 % 256 == 0
+    static constexpr uint32_t kHeight = 720;
+    static constexpr uint32_t kStride = kWidth;       // no padding: the decoder's stride IS the width
+    static constexpr size_t kUvRows = (kHeight + 1u) / 2u;
+    static constexpr uint32_t kPitch = (kWidth + 255u) & ~255u;   // == kWidth, and the arm proves it
+    static_assert(kPitch == kWidth, "1280 must be 256-aligned for this to be the aligned case");
+    bool delivered = false;
+    std::vector<uint8_t> nv12 =
+        std::vector<uint8_t>(static_cast<size_t>(kStride) * (kHeight + kUvRows), 0x5a);
+
+    int open(const std::string&) override { delivered = false; return 21; }
+    bool info(int id, video::StreamInfo& out) override {
+        if (id != 21) return false;
+        out.width = kWidth; out.height = kHeight; out.fps = 60.0f;
+        out.has_audio = false; out.duration_us = 2'000'000;
+        return true;
+    }
+    bool next_video(int id, video::VideoFrame& out) override {
+        if (id != 21 || delivered) return false;
+        out.y = nv12.data();
+        out.uv = nv12.data() + static_cast<size_t>(kStride) * kHeight;
+        out.width = kWidth; out.height = kHeight; out.y_stride = kStride; out.uv_stride = kStride;
+        out.pts_us = 16'667; delivered = true;
+        return true;
+    }
+    bool next_audio(int, video::AudioFrame&) override { return false; }
+    bool eof(int id) override { return id != 21 || delivered; }
+    void close(int) override {}
+};
+
 // A backend with a real timeline, so a seek can be observed as a CHANGE OF POSITION rather than as
 // "the call returned zero" (#1949). Frame i sits at i * kFrameUs; a seek lands on the first frame at
 // or after the requested time, exactly as an accurate container seek does.
@@ -770,6 +814,58 @@ int main() {
         CHECK(timeless_stayed_active && event_count == 2,
               "a source whose duration is unknown is never clocked out, and fires no STOP");
         close(timeless, 0, 0, 0, 0, 0);
+        prosper::video::set_backend(nullptr);
+    }
+
+    // ---- the 256-ALIGNED width, which nothing else in this file covers (#2051) -----------------
+    // Every assertion above runs against FakeVideoBackend at 1920, so pitch != width and
+    // crop_right == 128 everywhere. This is the other half of the contract: at 1280 the padding
+    // does not exist, so width == pitch == visible and crop_right == 0.
+    //
+    // What it kills is specific, and both edits are plausible: a refactor that pads
+    // UNCONDITIONALLY, and one that hardcodes crop_right = 128. Either passes the entire rest of
+    // this file and breaks every 1280x720 or 3840x2160 movie -- the majority of real content, and
+    // exactly the set over which #2032 established its change is a bit-for-bit no-op.
+    {
+        AlignedVideoBackend aligned;
+        prosper::video::set_backend(&aligned);
+        AvpInitData aligned_data{};
+        aligned_data.memory.obj = texture_expected_object;
+        aligned_data.memory.allocate_texture = (void*)&on_avplayer_texture_allocate;
+        aligned_data.memory.deallocate_texture = (void*)&on_avplayer_texture_deallocate;
+        aligned_data.num_fb = 3;
+        uint64_t ah = init((uint64_t)(uintptr_t)&aligned_data, 0, 0, 0, 0, 0);
+        const char aligned_source[] = "aligned.mp4";
+        CHECK(add(ah, (uint64_t)(uintptr_t)aligned_source, 0, 0, 0, 0) == 0,
+              "aligned-width source opens through the registered backend");
+
+        AvpStreamInfoEx ai{}; ai.size = sizeof(ai);
+        uint32_t aw = 0, acl = 0, acr = 0, act = 0, acb = 0, ap = 0;
+        CHECK(infoex(ah, 0, (uint64_t)(uintptr_t)&ai, 0, 0, 0) == 0 && ai.type == 1,
+              "aligned-width stream metadata comes from the backend");
+        memcpy(&aw,  ai.details + 0,  sizeof(aw));
+        memcpy(&acl, ai.details + 20, sizeof(acl));
+        memcpy(&acr, ai.details + 24, sizeof(acr));
+        memcpy(&act, ai.details + 28, sizeof(act));
+        memcpy(&acb, ai.details + 32, sizeof(acb));
+        memcpy(&ap,  ai.details + 36, sizeof(ap));
+
+        // THE ARM. crop_right == 0 is what a hardcoded 128 fails; width == pitch is what an
+        // unconditional pad fails. Neither is expressible against the 1920 backend.
+        CHECK(acr == 0, "aligned width crops NOTHING on the right (a hardcoded 128 fails here)");
+        CHECK(aw == AlignedVideoBackend::kWidth && ap == AlignedVideoBackend::kWidth &&
+                  aw == ap,
+              "aligned width publishes width == pitch == visible (an unconditional pad fails here)");
+        CHECK(ap - acl - acr == AlignedVideoBackend::kWidth,
+              "the pitch-based crop spelling yields the full visible width when nothing is padded");
+
+        // The height half, unpinned until now and asymmetric on purpose: prosper never stages padded
+        // ROWS, and the code comment warns a future editor not to "finish the job" by making height
+        // a macroblock-aligned 1088. This documents that intent where an edit would trip on it.
+        CHECK(act == 0 && acb == 0,
+              "height is not cropped: prosper stages no padded rows (720 stays 720, not 1088)");
+
+        close(ah, 0, 0, 0, 0, 0);
         prosper::video::set_backend(nullptr);
     }
 
