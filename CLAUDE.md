@@ -276,6 +276,16 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
      `tools/snapshot`, so regressions are caught without a human.
   Only after step 6 is a title considered **"done"**, and work moves to the next game. Earlier rungs
   are milestones worth recording (issue/`COMPATIBILITY.md`), not stopping points.
+- **Reach for free vendor/open-source tooling BEFORE building a `PROSPER_*` switch.** prosper is an
+  ordinary Vulkan application, so AMD's and Khronos' own tools work on it directly and need no
+  per-title work. Verified on Linux/AMD 2026-08-08 with **no change to prosper's code**: a one-variable
+  RGP capture (`MESA_VK_TRACE=rgp MESA_VK_TRACE_FRAME=<n>`) yields per-draw *hardware* timing,
+  wavefront occupancy, instruction timing, cache counters and **queue/barrier events** — the last of
+  which no `PROSPER_*` switch measures at all. RenderDoc installs here and `renderdoccmd convert -c
+  chrome.json` is the headless export path. **`docs/GPU_PROFILING_EXTERNAL.md` has the recipes, what
+  each tool answers, and the traps** (RGP writes to `/tmp`; the Fedora RenderDoc package ships no
+  Python bindings). Build a `PROSPER_*` switch only for something the guest-facing layer knows and the
+  GPU vendor cannot see.
 - **Build tools — don't avoid them.** This project is a long reverse-engineering effort, and getting
   progressively more complicated games running will keep demanding new instrumentation. When you hit a
   question the existing tools can't answer — "who references this address in the unsymbolicated eboot?",
