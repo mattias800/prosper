@@ -639,6 +639,23 @@ HLE(s_videodec2_decode) {
                               pic)) {
                 const uint64_t need = (uint64_t)pic.width * pic.height * 3 / 2;
                 auto* dst = (uint8_t*)PW(frame->data);
+                // A decoded picture that does not fit is the shape a WRONG LAYOUT takes, so it must
+                // not be silent. `need` is the 1.5-bytes-per-pixel NV12 derivation the whole output
+                // rests on; if that derivation is wrong, what you observe is exactly this -- a
+                // buffer the guest sized correctly and we think is too small. Falling through to
+                // vdec_no_picture without a word makes it indistinguishable from a decoder that
+                // merely needs more input, which is the benign case it looks like. Rate-limited, and
+                // it names both numbers so the ratio is checkable on sight (#2270).
+                if (dst && frame->data_size < need) {
+                    static std::atomic<unsigned> warned{0};
+                    if (warned.fetch_add(1) < 8)
+                        fprintf(stderr,
+                                "[vdec2] frame buffer too small: need=%llu (%ux%u NV12) but "
+                                "frame->data_size=%llu -- reporting NO PICTURE. If this fires, "
+                                "suspect the bytes-per-pixel derivation before the decoder (#2270)\n",
+                                (unsigned long long)need, pic.width, pic.height,
+                                (unsigned long long)frame->data_size);
+                }
                 if (dst && frame->data_size >= need) {
                     const size_t y_bytes = (size_t)pic.width * pic.height;
                     std::memcpy(dst, pic.y, y_bytes);
